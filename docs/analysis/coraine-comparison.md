@@ -16,6 +16,7 @@ Both brokers run the ETSI test suite, each its own copy, and each states complia
 | Concern | Coraine | Antares |
 |---|---|---|
 | Specification it states against | TS 104 175/176 (the commits and `testsuite-doubts.md` cite them) | CIM 009 V1.9.1, one ledger file per clause (`docs/spec/`, 947 sections: 476 implemented, 3 partial, 468 informative); the TS 104 175 family checked clause by clause in [ts104175-delta.md](ts104175-delta.md) |
+| TS 104 243 and TS 104 179 | MQTT notifications by the bridge plugin, written to TS 104 243 (`doc/mqtt-bridge.md:9`); TS 104 179 is named nowhere in the repository (`grep -rI '104.179\|ngsildProof'`: no hit) | MQTT is built in (ledger 7.2, TS 104 243 5.2 unchanged in substance); TS 104 179 is outside the ledger and tracked in delta 3.9 (T-3454) |
 | Statement matrix | `doc/coverage.md`: 2314 statements of TS 104 175, 1051 asserted by a test | every implemented clause names its evidence and its robot test cases; `python3 dev/spec.py check` fails a clause without them |
 | ETSI suite | the forge branch `integration/all-fixes` at `3f772fd`, develop `5c39851` plus 109 commits; `robot TP/NGSI-LD/`, 1106 cases, all pass | vendored from develop `196d184e` (2026-06-20), 1537 TP plus 286 IOP_TP, 1823 cases, all pass (`dev/etsi-baseline.json`) |
 | Overlap of the two runs | 981 identical cases. 51 cases share a file and an id but test different things, so a TP id alone names no test across the two | 35 cases develop added after 2026-06-20 are missing; 527 cases are Antares' own |
