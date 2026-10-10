@@ -245,7 +245,7 @@ impl ApiSurface for Admin {
     fn router(&self, _st: AppState) -> Router<AppState> {
         let [health_p, ready_p, metrics_p, tenants_p, tenant_p, dl_p, dl_id_p, replay_p] =
             Self::PATHS;
-        Router::new()
+        let routes = Router::new()
             .route(health_p, get(health))
             .route(ready_p, get(ready))
             // Prometheus text format. 404 until the broker installs the
@@ -255,7 +255,15 @@ impl ApiSurface for Admin {
             .route(tenant_p, get(tenant_get).delete(tenant_purge))
             .route(dl_p, get(dead_letters_list))
             .route(dl_id_p, delete(dead_letter_delete))
-            .route(replay_p, post(dead_letter_replay))
+            .route(replay_p, post(dead_letter_replay));
+        // `/q/views` (ADR-0023 rule 10), when a loader set it: the admin
+        // surface is the gateway's to protect, and views are written here.
+        #[cfg(feature = "views")]
+        let routes = match _st.views.admin() {
+            Some(views) => routes.merge(views.with_state(())),
+            None => routes,
+        };
+        routes
     }
 
     fn version_info(&self) -> serde_json::Value {
@@ -930,6 +938,11 @@ async fn health(
     body["notificationSchemes"] = state.sinks.schemes().into();
     // Notifications the delivery policy gave up on (this process, since start).
     body["deadLetters"] = notify::dead_letters_written().into();
+    // Each stored view, loaded or invalid with the reason (ADR-0023 rule 10).
+    #[cfg(feature = "views")]
+    {
+        body["views"] = state.views.report();
+    }
     // Changes the bounded matcher queue dropped (this process, since start).
     body["changesDropped"] = notify::changes_dropped().into();
     // Panics absorbed at the notification-task boundary, each one a change

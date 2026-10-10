@@ -314,7 +314,18 @@ pub async fn list_contexts(
             String,
             Option<antares_jsonld::CtxUsage>,
         )> = Vec::new();
-        for c in st.store.context_list_meta(Some(&tenant)).await? {
+        // ADR-0023 rule 5: a stored @context is the tenant's and may define
+        // a term for an Attribute a view hides, so through a view the list
+        // is the core @context alone (the pinned entries below).
+        #[cfg(feature = "views")]
+        let stored = if st.view.is_some() {
+            Vec::new()
+        } else {
+            st.store.context_list_meta(Some(&tenant)).await?
+        };
+        #[cfg(not(feature = "views"))]
+        let stored = st.store.context_list_meta(Some(&tenant)).await?;
+        for c in stored {
             let kind = c["kind"].as_str().unwrap_or("Hosted").to_owned();
             if !keep(&kind) || !row_visible(&c, &tenant) {
                 continue;
