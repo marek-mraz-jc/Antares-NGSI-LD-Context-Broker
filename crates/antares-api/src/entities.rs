@@ -373,9 +373,12 @@ async fn retrieve_entity_inner(
     if !crate::repr::policy_admits(st, &tenant, &ctx, repr.policy_reach.as_deref(), &doc).await {
         return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
     }
-    // 5.7.1: attrs projection with no matching attribute ⇒ 404
+    // 5.7.1: attrs projection with no matching attribute ⇒ 404, read on the
+    // Entity as the narrowing shows it: a hidden Attribute is absent, or
+    // the 404 would tell the caller it is there (ADR-0023 rule 2)
     if let Some(want) = &repr.attrs {
-        if !want.iter().any(|a| doc.get(a).is_some()) {
+        let shown = crate::repr::policy_view(&doc, &repr);
+        if !want.iter().any(|a| shown.get(a).is_some()) {
             return Err(NgsiError::ResourceNotFound(format!(
                 "entity {id} has none of the requested attributes"
             ))
@@ -882,26 +885,11 @@ async fn query_entities_inner(
         Some(&repr),
     )
     .await?;
-    if !filtered.hidden_types.is_empty() {
-        // ADR-0023 rule 11: say which types the query could not be asked
-        // of, so an honest client tells "none" from "not filterable here"
-        let named: Vec<String> = filtered
-            .hidden_types
-            .iter()
-            .map(|t| ctx.compact_iri(t))
-            .collect();
-        warnings.push(crate::federation::warning(
-            199,
-            &crate::federation::alias_for(&st.host_alias, &tenant),
-            &format!(
-                "Entities of type {} were left out: the query reads an Attribute this answer does not show for them",
-                named.join(", ")
-            ),
-        ));
-    }
     let mut matches = filtered.docs;
     if let Some(spec) = params.get("orderBy") {
-        order_entities(&mut matches, spec, params, &ctx)?;
+        crate::repr::order_as_shown(&mut matches, Some(&repr), |m| {
+            order_entities(m, spec, params, &ctx)
+        })?;
     }
     let (page, count_hdr, links) = if filtered.paged {
         let total = filtered.total.unwrap_or(matches.len());
@@ -1045,10 +1033,6 @@ pub struct Filtered {
     /// which is what a chunked walk has to step over, since `docs` undercounts
     /// it whenever idPattern (invisible to the store filter) removed rows.
     pub rows: usize,
-    /// The types whose Entities were left out because the client's query
-    /// reads an Attribute those types may not show (ADR-0023 rule 11), as
-    /// stored (expanded); named in the answer's warning.
-    pub hidden_types: std::collections::BTreeSet<String>,
 }
 
 /// Whether the store may be asked to project members away. Only when its
@@ -1201,18 +1185,15 @@ pub async fn filter_entities_paged(
     // and neither can a pushed projection: the store's answer is only the
     // final answer when nothing downstream still needs the stripped members
     let proj = proj.filter(|_| proj_pushdown_allowed(fed.is_empty(), params));
-    // ADR-0023 rule 11, rule 2 per type: an Entity whose types may not show
-    // an Attribute the client filters, orders or picks on is left out. The
-    // store cannot see that rule, so no page is cut before it is applied.
-    let read_rules = narrow
-        .and_then(|r| {
-            r.policy_types
-                .as_deref()
-                .map(|t| (t, r.policy_reads.as_slice()))
-        })
-        .filter(|(_, reads)| !reads.is_empty());
-    let page = if read_rules.is_some() { None } else { page };
-    let mut hidden_types = std::collections::BTreeSet::new();
+    // ADR-0023 rule 11: under rules the store answers the policy's own
+    // predicates over the stored Entity, and the loop below decides which
+    // rules hold and evaluates the client's predicates on the Entity as it
+    // is shown, so no page and no projection is cut before that.
+    // ponytail: a scan of what the policy admits; compile the rules' OR and
+    // the shown-set predicates to SQL if it shows up
+    let rules = narrow.and_then(|r| r.policy_types.as_deref());
+    let page = if rules.is_some() { None } else { page };
+    let proj = if rules.is_some() { None } else { proj };
     let ids: Option<Vec<&str>> = params.get("id").map(|s| s.split(',').collect());
     if let Some(ids) = &ids {
         for id in ids {
@@ -1258,6 +1239,27 @@ pub async fn filter_entities_paged(
         .and_then(|r| r.policy_reach.as_deref())
         .and_then(|reach| reach.geo_q.as_deref());
     let geos: Vec<&antares_ql::geo::GeoQuery> = own_geo.iter().chain(policy_geo).collect();
+    // under rules the client's q, attrs and geoQ read the shown Entity, and
+    // only the engine's own q and area reach the store and the stored one
+    let client_q = narrow.and_then(|r| r.policy_client_q.as_ref());
+    let engine_q = narrow
+        .and_then(|r| r.policy_reach.as_deref())
+        .and_then(|reach| reach.q.as_ref());
+    let (q_ast, shown_q) = if rules.is_some() {
+        (engine_q.cloned(), client_q)
+    } else {
+        (q_ast, None)
+    };
+    let (geos, shown_geos): (Vec<_>, Vec<_>) = if rules.is_some() {
+        (policy_geo.into_iter().collect(), own_geo.iter().collect())
+    } else {
+        (geos, Vec::new())
+    };
+    let (attr_filter, shown_attrs) = if rules.is_some() {
+        (None, attr_filter)
+    } else {
+        (attr_filter, None)
+    };
 
     // Hand the store what it can filter on. A backend that can push
     // the predicate down (postgres/timescale) returns fewer rows — and says
@@ -1371,13 +1373,6 @@ pub async fn filter_entities_paged(
                 }
             }
         }
-        if let Some((rules, reads)) = read_rules {
-            let hidden = crate::repr::hidden_read_types(rules, reads, &doc);
-            if !hidden.is_empty() {
-                hidden_types.extend(hidden.into_iter().map(str::to_owned));
-                continue;
-            }
-        }
         if !decided {
             if let Some(sel) = &type_sel {
                 let etypes: Vec<&str> = doc["type"]
@@ -1415,6 +1410,28 @@ pub async fn filter_entities_paged(
                 continue;
             }
         }
+        if let (Some(rules), Some(r)) = (rules, narrow) {
+            if crate::repr::shown(Some(rules), &doc).is_none() {
+                continue;
+            }
+            let view = crate::repr::policy_view(&doc, r);
+            if let Some(attrs) = &shown_attrs {
+                if !attrs.iter().any(|a| view.get(a).is_some()) {
+                    continue;
+                }
+            }
+            if !shown_geos.iter().all(|g| g.matches(&view, ctx)) {
+                continue;
+            }
+            if let Some(ast) = shown_q {
+                let narrow = narrow.map(|r| (r, ctx));
+                if !crate::notify::linked_eval(st, tenant, narrow, |l| eval_q(ast, &view, ctx, l))
+                    .await
+                {
+                    continue;
+                }
+            }
+        }
         out.push(doc);
     }
     Ok(Filtered {
@@ -1422,7 +1439,6 @@ pub async fn filter_entities_paged(
         paged,
         total,
         rows,
-        hidden_types,
     })
 }
 

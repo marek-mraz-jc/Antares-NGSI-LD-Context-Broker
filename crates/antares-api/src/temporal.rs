@@ -1647,6 +1647,122 @@ fn type_and_attrs_match(
 /// 5.7.4.4 S2/S3: the values filter and the geoquery are judged on the
 /// Attribute instances WITHIN the temporal-query interval, so an
 /// out-of-window instance must not satisfy either.
+/// ADR-0023 rule 11, temporal per instance: an instance of an Attribute
+/// is kept only where a rule showing the Attribute held at the instance's
+/// time (`observedAt`, else `modifiedAt`). A rule without a condition holds
+/// at every time; a conditional one is read on the Entity's state at that
+/// time ([`state_at`]) and does not hold where a member its condition reads
+/// has no instance yet, or where it reads `scope`, which keeps no history:
+/// a state that cannot be rebuilt hides the instance (fail closed). `None`
+/// when no rule names one of the Entity's types.
+pub(crate) fn rules_per_instance(doc: &Value, rules: &crate::policy::Filter) -> Option<Value> {
+    let ctx = crate::repr::policy_context();
+    let types = crate::policy::entity_types(doc);
+    let typed: Vec<&crate::policy::Rule> = rules
+        .rules
+        .iter()
+        .filter(|r| r.types.iter().any(|t| types.contains(&t.as_str())))
+        .collect();
+    if !rules.rules.is_empty() && typed.is_empty() {
+        return None;
+    }
+    let omitted: std::collections::BTreeSet<&str> = types
+        .iter()
+        .filter_map(|t| rules.omit_by_type.get(*t))
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    let always: std::collections::BTreeSet<&str> = typed
+        .iter()
+        .filter(|r| !r.is_conditional())
+        .flat_map(|r| r.attributes.iter().map(String::as_str))
+        .collect();
+    let conditional: Vec<(&crate::policy::Rule, Vec<String>)> = typed
+        .iter()
+        .filter(|r| r.is_conditional() && r.scope_q.is_none())
+        .map(|r| (*r, r.reads(ctx)))
+        .collect();
+    let Some(obj) = doc.as_object() else {
+        return Some(doc.clone());
+    };
+    let mut out = Map::new();
+    for (k, v) in obj {
+        if is_meta(k) {
+            out.insert(k.clone(), v.clone());
+            continue;
+        }
+        if omitted.contains(k.as_str()) {
+            continue;
+        }
+        if rules.rules.is_empty() || always.contains(k.as_str()) {
+            out.insert(k.clone(), v.clone());
+            continue;
+        }
+        let deciding: Vec<&(&crate::policy::Rule, Vec<String>)> = conditional
+            .iter()
+            .filter(|(r, _)| r.attributes.iter().any(|a| a == k))
+            .collect();
+        let Some(instances) = v.as_array().filter(|_| !deciding.is_empty()) else {
+            continue;
+        };
+        // ponytail: the state is rebuilt per instance, O(instances x history);
+        // sort each Attribute's history once if long histories show up
+        let kept: Vec<Value> = instances
+            .iter()
+            .filter(|inst| {
+                instant(inst).is_some_and(|t| {
+                    let state = state_at(doc, t);
+                    deciding.iter().any(|(r, reads)| {
+                        reads.iter().all(|a| state.get(a).is_some()) && r.holds(&state, ctx)
+                    })
+                })
+            })
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            out.insert(k.clone(), Value::Array(kept));
+        }
+    }
+    Some(Value::Object(out))
+}
+
+/// When an instance holds: its `observedAt`, else its `modifiedAt`.
+fn instant(inst: &Value) -> Option<&str> {
+    inst.get("observedAt")
+        .or_else(|| inst.get("modifiedAt"))
+        .and_then(Value::as_str)
+}
+
+/// The Entity as it stood at `t`, rebuilt from its history: the frame, and
+/// for each Attribute the latest instance at or before `t`, if any.
+fn state_at(doc: &Value, t: &str) -> Value {
+    let at = dt_key(t);
+    let Some(obj) = doc.as_object() else {
+        return Value::Null;
+    };
+    let mut out = Map::new();
+    for (k, v) in obj {
+        if is_meta(k) {
+            if k == "id" || k == "type" {
+                out.insert(k.clone(), v.clone());
+            }
+            continue;
+        }
+        let latest = v
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|inst| instant(inst).map(|i| (dt_key(i), inst)))
+            .filter(|(i, _)| *i <= at)
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .map(|(_, inst)| inst.clone());
+        if let Some(inst) = latest {
+            out.insert(k.clone(), Value::Array(vec![inst]));
+        }
+    }
+    Value::Object(out)
+}
+
 fn window_conditions_match(
     doc: &Value,
     tq: Option<&TemporalQ>,
@@ -1804,12 +1920,14 @@ pub(crate) async fn query_temporal_collected(
     // ADR-0020: the engine's narrowing joins the request's own filters after
     // 5.7.4.4's "too wide" judgement, which is about what the client asked
     // for. Everything below reads the narrowed query, the forward included.
-    // ADR-0023 rule 11: the per-type rules, and what the client's own query
-    // reads before the engine's q joins it (rule 2 per type)
+    // ADR-0023 rule 11: the rules, and the client's own q apart from the
+    // engine's, read on each Entity as its rules show it
     let types_rule = crate::repr::type_rules(filter);
-    let client_reads = match &types_rule {
-        Some(_) => crate::repr::client_reads(params, &ctx)?,
-        None => Vec::new(),
+    let ruled = types_rule.is_some();
+    let client_q = if ruled {
+        crate::repr::client_q(params, &ctx)?
+    } else {
+        None
     };
     let narrowed = filter.narrow_params(params)?;
     let params = &narrowed;
@@ -1824,6 +1942,13 @@ pub(crate) async fn query_temporal_collected(
             &ctx,
         )
     });
+    // under rules only the engine's own q reaches the store and the stored
+    // history; the client's waits for the shown one
+    let q_ast = if ruled {
+        filter.q.as_deref().cloned()
+    } else {
+        q_ast
+    };
     let scope_q = params.get("scopeQ").map(String::as_str);
     let tq = TemporalQ::from_params(params, true)?;
     let mut trepr = parse_trepr(params, &ctx)?;
@@ -1853,12 +1978,29 @@ pub(crate) async fn query_temporal_collected(
     });
     let attrs_filter = selection(&trepr);
     // only the attrs= param excludes entities; pick is projection-only
-    let entity_attr_filter = trepr.attrs.clone();
+    let (entity_attr_filter, shown_attrs) = if ruled {
+        (None, trepr.attrs.clone())
+    } else {
+        (trepr.attrs.clone(), None)
+    };
     // the request's own geoquery and the narrowing's area, all of which
-    // must hold (ADR-0023 rule 1)
+    // must hold (ADR-0023 rule 1); under rules the request's reads the
+    // shown history
     let own_geo = antares_ql::geo::GeoQuery::from_params(params)?;
-    let geos: Vec<&antares_ql::geo::GeoQuery> =
-        own_geo.iter().chain(filter.geo_q.as_deref()).collect();
+    let (geos, shown_geos): (
+        Vec<&antares_ql::geo::GeoQuery>,
+        Vec<&antares_ql::geo::GeoQuery>,
+    ) = if ruled {
+        (
+            filter.geo_q.as_deref().into_iter().collect(),
+            own_geo.iter().collect(),
+        )
+    } else {
+        (
+            own_geo.iter().chain(filter.geo_q.as_deref()).collect(),
+            Vec::new(),
+        )
+    };
 
     // Push entity narrowing (ids/types/attrs) and instance-window
     // pruning (range + RANK()-capped lastN) into the store. The loop below
@@ -1894,7 +2036,7 @@ pub(crate) async fn query_temporal_collected(
     // the store may only pre-page when nothing will federate — otherwise
     // page 1 is local-page + every remote row (matrix-9 IOP_EXT_TMP_03_04).
     let push_page = (exact_push || (geos.is_empty() && scope_q.is_none() && q_page_exact))
-        && client_reads.is_empty()
+        && !ruled
         && id_pattern.is_none()
         && params.get("orderBy").is_none()
         && params.get("datasetId").is_none()
@@ -1927,13 +2069,17 @@ pub(crate) async fn query_temporal_collected(
             ids: ids.as_deref(),
             types: types.as_deref(),
             attrs: entity_attr_filter.as_deref(),
-            range: tq.as_ref().map(|t| antares_store::filter::InstanceRange {
-                timerel: &t.timerel,
-                time_at: &t.time_at,
-                end_time_at: t.end_time_at.as_deref(),
-                timeproperty: &t.timeproperty,
-            }),
-            last_n: match (last_n, exact_push) {
+            // rules rebuild each instance's state from the whole history
+            range: tq
+                .as_ref()
+                .filter(|_| !ruled)
+                .map(|t| antares_store::filter::InstanceRange {
+                    timerel: &t.timerel,
+                    time_at: &t.time_at,
+                    end_time_at: t.end_time_at.as_deref(),
+                    timeproperty: &t.timeproperty,
+                }),
+            last_n: match (last_n, exact_push && !ruled) {
                 (Some(n), true) => Some(n as i64),
                 _ => None,
             },
@@ -2044,11 +2190,6 @@ pub(crate) async fn query_temporal_collected(
                 }
             }
         }
-        if let Some(rules) = types_rule.as_deref().filter(|_| !client_reads.is_empty()) {
-            if !crate::repr::hidden_read_types(rules, &client_reads, &doc).is_empty() {
-                continue;
-            }
-        }
         if !type_and_attrs_match(&doc, types.as_ref(), entity_attr_filter.as_ref()) {
             continue;
         }
@@ -2059,6 +2200,20 @@ pub(crate) async fn query_temporal_collected(
         }
         if let Some(sq) = scope_q {
             if !scope_window_retain(&mut doc, sq, tq.as_ref(), timeprop.as_str()) {
+                continue;
+            }
+        }
+        if let Some(rules) = types_rule.as_deref() {
+            let Some(shown) = rules_per_instance(&doc, rules) else {
+                continue;
+            };
+            doc = shown;
+            if !type_and_attrs_match(&doc, None, shown_attrs.as_ref()) {
+                continue;
+            }
+            if (client_q.is_some() || !shown_geos.is_empty())
+                && !window_conditions_match(&doc, tq.as_ref(), client_q.as_ref(), &shown_geos, &ctx)
+            {
                 continue;
             }
         }
@@ -2092,17 +2247,10 @@ pub(crate) async fn query_temporal_collected(
     let core_only_pick = attrs_filter.as_ref().is_some_and(Vec::is_empty);
     let mut payload: Vec<Value> = Vec::new();
     let (mut g_trunc, mut g_min, mut g_maxts) = (false, None::<String>, None::<String>);
-    // ADR-0023 rule 11: each Entity's history is narrowed by its own types
-    // before the window, so lastN counts only what may be seen (rule 8)
+    // ADR-0023 rule 11: each Entity's history was narrowed by its rules in
+    // the loop above, before the window, so lastN counts only what may be
+    // seen (rule 8)
     for d in &page {
-        let typed;
-        let d = match &types_rule {
-            Some(r) => {
-                typed = crate::repr::type_project(d, r);
-                &typed
-            }
-            None => d,
-        };
         let mut w = window(
             d,
             tq.as_ref(),
@@ -2250,16 +2398,23 @@ async fn retrieve_temporal_inner(
         reject_linked_projection(&trepr, "5.7.3.4")?;
         let last_n = trepr.last_n;
         antares_model::EntityId::new(id)?;
+        // ADR-0023 rule 11: rules rebuild each instance's state from the
+        // whole history, so nothing is pruned in the store under them
+        let types_rule = crate::repr::type_rules(&filter);
+        let ruled = types_rule.is_some();
         // Instance pruning pushed into the store (no q=/geo on retrieve,
         // so it is always safe here); window() below stays the arbiter.
         let tf = antares_store::filter::TemporalFilter {
-            range: tq.as_ref().map(|t| antares_store::filter::InstanceRange {
-                timerel: &t.timerel,
-                time_at: &t.time_at,
-                end_time_at: t.end_time_at.as_deref(),
-                timeproperty: &t.timeproperty,
-            }),
-            last_n: last_n.map(|n| n as i64),
+            range: tq
+                .as_ref()
+                .filter(|_| !ruled)
+                .map(|t| antares_store::filter::InstanceRange {
+                    timerel: &t.timerel,
+                    time_at: &t.time_at,
+                    end_time_at: t.end_time_at.as_deref(),
+                    timeproperty: &t.timeproperty,
+                }),
+            last_n: last_n.filter(|_| !ruled).map(|n| n as i64),
             timeproperty: tq
                 .as_ref()
                 .map_or("observedAt", |t| t.timeproperty.as_str()),
@@ -2325,6 +2480,14 @@ async fn retrieve_temporal_inner(
                 NgsiError::ResourceNotFound(format!("temporal entity {id} not found"))
             })?
         };
+        // ADR-0023 rule 11: the history its rules show, before anything
+        // reads it; no rule for its types is the 404 of an absent Entity
+        let doc = match types_rule.as_deref() {
+            Some(r) => rules_per_instance(&doc, r).ok_or_else(|| {
+                NgsiError::ResourceNotFound(format!("temporal entity {id} not found"))
+            })?,
+            None => doc,
+        };
         let attrs_filter = selection(&trepr);
         // 5.7.3: attrs matching nothing ⇒ 404. A `pick` may name core members
         // instead — 5.7.3.3 admits "id", "type", "scope" or an Attribute name
@@ -2342,11 +2505,6 @@ async fn retrieve_temporal_inner(
                 .into());
             }
         }
-        // ADR-0023 rule 11, as in the query above
-        let doc = match crate::repr::type_rules(&filter) {
-            Some(r) => crate::repr::type_project(&doc, &r),
-            None => doc,
-        };
         let mut w = window(
             &doc,
             tq.as_ref(),

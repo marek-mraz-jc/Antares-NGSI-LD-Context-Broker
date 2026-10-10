@@ -39,16 +39,15 @@ pub struct Repr {
     /// policy projection: a Linked Entity is read the way the Linking Entity
     /// was (5.7.1.4), so one outside the narrowing is not embedded.
     pub policy_reach: Option<std::sync::Arc<PolicyReach>>,
-    /// The narrowing's per-type allowlists (ADR-0023 rule 11), names
-    /// expanded ([`type_rules`]). Each document is judged by its own types,
-    /// so this too travels down the join walk unchanged.
+    /// The narrowing's rules (ADR-0023 rule 11), names expanded
+    /// ([`type_rules`]). Each document is judged by its own rules, so this
+    /// too travels down the join walk unchanged.
     pub policy_types: Option<std::sync::Arc<crate::policy::Filter>>,
-    /// The Attributes the client's own request filters, orders or picks
-    /// on ([`client_reads`]), expanded. Under per-type rules an Entity whose
-    /// types do not allow all of them is left out of a query (ADR-0023
-    /// rule 11, rule 2 per type), so no type is read through another
-    /// type's allowlist. Empty unless `policy_types` is set.
-    pub policy_reads: Vec<String>,
+    /// The client's own `q`, apart from the engine's ([`note_reads`]): under
+    /// rules it is evaluated on each Entity as it is shown, so an Attribute
+    /// a matched rule does not show is absent to it (ADR-0023 rule 11, rule
+    /// 2 per Entity). `None` unless `policy_types` is set.
+    pub policy_client_q: Option<antares_ql::QNode>,
     pub lang: Option<String>,
     /// datasetId= instance filter; entry "@none" selects default instances.
     pub dataset_id: Option<Vec<String>>,
@@ -196,11 +195,13 @@ pub fn narrow_projection(
 /// the Entity, and a document without them is not one — which is why the
 /// policy pick is applied to Attributes and never to the core members.
 pub fn narrow_repr(r: &mut Repr, f: &crate::policy::Filter) {
-    if f.q.is_some() || f.scope_q.is_some() || f.geo_q.is_some() {
+    let rules = type_rules(f);
+    if f.q.is_some() || f.scope_q.is_some() || f.geo_q.is_some() || rules.is_some() {
         r.policy_reach = Some(std::sync::Arc::new(PolicyReach {
             q: f.q.as_deref().cloned(),
             scope_q: f.scope_q.clone(),
             geo_q: f.geo_q.clone(),
+            rules: rules.clone(),
         }));
     }
     if !f.omit.is_empty() {
@@ -209,83 +210,77 @@ pub fn narrow_repr(r: &mut Repr, f: &crate::policy::Filter) {
     if !f.pick.is_empty() {
         r.policy_pick = Some(policy_nodes(&f.pick));
     }
-    r.policy_types = type_rules(f);
+    r.policy_types = rules;
 }
 
-/// The narrowing's per-type rules with every type and Attribute name
-/// expanded against [`POLICY_CONTEXT`], the form an internal document's
-/// keys and `type` values are in; `None` when the narrowing has none.
+/// The narrowing's rules with every type and Attribute name expanded
+/// against [`POLICY_CONTEXT`], the form an internal document's keys and
+/// `type` values are in; `None` when the narrowing has none. Conditions
+/// stay as written: [`shown`] reads them through the same context.
 pub(crate) fn type_rules(
     f: &crate::policy::Filter,
 ) -> Option<std::sync::Arc<crate::policy::Filter>> {
-    if !f.has_type_rules() {
+    if !f.has_rules() {
         return None;
     }
-    let expand = |m: &std::collections::BTreeMap<String, Vec<String>>| {
-        m.iter()
-            .map(|(t, attrs)| {
-                (
-                    POLICY_CONTEXT.expand_key(t),
-                    attrs.iter().map(|a| POLICY_CONTEXT.expand_key(a)).collect(),
-                )
-            })
-            .collect()
+    let expand = |names: &[String]| -> Vec<String> {
+        names.iter().map(|n| POLICY_CONTEXT.expand_key(n)).collect()
     };
     Some(std::sync::Arc::new(crate::policy::Filter {
-        pick_by_type: expand(&f.pick_by_type),
-        omit_by_type: expand(&f.omit_by_type),
+        rules: f
+            .rules
+            .iter()
+            .map(|r| crate::policy::Rule {
+                types: expand(&r.types),
+                attributes: expand(&r.attributes),
+                ..r.clone()
+            })
+            .collect(),
+        omit_by_type: f
+            .omit_by_type
+            .iter()
+            .map(|(t, attrs)| (POLICY_CONTEXT.expand_key(t), expand(attrs)))
+            .collect(),
         ..crate::policy::Filter::default()
     }))
 }
 
-/// The Attributes the client's own query reads: the top-level Attribute of
-/// every `q` term, the `attrs` list, the `orderBy` members and the `pick`
-/// heads, expanded against the request `@context`, core members left out.
-/// Read from the request as sent, before a narrowing conjoins the engine's
-/// own `q`: the engine may test what it hides, the caller may not.
-pub(crate) fn client_reads(
-    params: &HashMap<String, String>,
-    ctx: &Context,
-) -> Result<Vec<String>, NgsiError> {
-    let mut terms: Vec<String> = Vec::new();
-    if let Some(q) = params.get("q") {
-        terms.extend(
-            antares_ql::parse_q(q)?
-                .attribute_paths()
-                .into_iter()
-                .map(str::to_owned),
-        );
+/// What the expanded `rules` let the INTERNAL document `doc` show: every
+/// member without rules, `None` when no rule holds for it.
+pub(crate) fn shown(
+    rules: Option<&crate::policy::Filter>,
+    doc: &Value,
+) -> Option<crate::policy::Shown> {
+    match rules {
+        None => Some(crate::policy::Shown::default()),
+        Some(f) => f.shown(doc, &POLICY_CONTEXT),
     }
-    if let Some(attrs) = params.get("attrs") {
-        terms.extend(attrs.split(',').map(|a| a.trim().to_owned()));
-    }
-    if let Some(order) = params.get("orderBy") {
-        terms.extend(
-            order
-                .split(',')
-                .filter_map(|m| m.split([';', '.', '[']).next().map(|h| h.trim().to_owned())),
-        );
-    }
-    let mut out: Vec<String> = terms
-        .iter()
-        .filter(|t| !t.is_empty() && !ENTITY_META.contains(&t.as_str()))
-        .map(|t| ctx.expand_key(t))
-        .collect();
-    if let Some(pick) = params.get("pick") {
-        out.extend(
-            parse_projection(pick, ctx)?
-                .into_iter()
-                .filter(|n| !ENTITY_META.contains(&n.raw.as_str()))
-                .map(|n| n.iri),
-        );
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
 }
 
-/// [`narrowing`] holding the client's reads as well, for a caller that
-/// runs a query under the narrowing ([`client_reads`]).
+/// The client's own `q` as the query path reads it (4.9 `expandValues`
+/// applied), from the request as sent.
+pub(crate) fn client_q(
+    params: &HashMap<String, String>,
+    ctx: &Context,
+) -> Result<Option<antares_ql::QNode>, NgsiError> {
+    params
+        .get("q")
+        .map(|q| {
+            Ok(antares_ql::eval::apply_expand_values(
+                antares_ql::parse_q(q)?,
+                antares_ql::eval::expansion_list(
+                    params.get("expandValues").map(String::as_str),
+                    params.get("jsonKeys").map(String::as_str),
+                )
+                .as_deref(),
+                ctx,
+            ))
+        })
+        .transpose()
+}
+
+/// [`narrowing`] holding the client's own `q` as well, for a caller that
+/// runs a query under the narrowing ([`note_reads`]).
 pub(crate) fn narrowing_reading(
     f: &crate::policy::Filter,
     client_params: &HashMap<String, String>,
@@ -296,60 +291,55 @@ pub(crate) fn narrowing_reading(
     Ok(r)
 }
 
-/// Record the client's reads on a narrowed representation; nothing to do
-/// without per-type rules.
+/// Record the client's own `q` on a narrowed representation, before the
+/// engine's is conjoined into the parameters; nothing to do without rules.
 pub(crate) fn note_reads(
     r: &mut Repr,
     client_params: &HashMap<String, String>,
     ctx: &Context,
 ) -> Result<(), NgsiError> {
     if r.policy_types.is_some() {
-        r.policy_reads = client_reads(client_params, ctx)?;
+        r.policy_client_q = client_q(client_params, ctx)?;
     }
     Ok(())
 }
 
-/// ADR-0023 rule 11, rule 2 per type: the types of `doc` that may not show
-/// one of `reads`; empty when the Entity may be answered. A type is named
-/// when it alone does not allow a read; an Entity whose types together do
-/// allow every read is kept.
-pub(crate) fn hidden_read_types<'d>(
-    rules: &crate::policy::Filter,
-    reads: &[String],
-    doc: &'d Value,
-) -> Vec<&'d str> {
-    let types = crate::policy::entity_types(doc);
-    if reads.iter().all(|r| rules.type_allows(&types, r)) {
-        return Vec::new();
-    }
-    types
-        .into_iter()
-        .filter(|t| reads.iter().any(|r| !rules.type_allows(&[t], r)))
-        .collect()
-}
-
-/// Whether the per-type rules let `doc` show the member `k`; no rules, yes.
-fn type_projected(rules: Option<&crate::policy::Filter>, doc: &Value, k: &str) -> bool {
-    rules.is_none_or(|r| r.type_allows(&crate::policy::entity_types(doc), k))
-}
-
-/// An INTERNAL document less the Attributes its types may not show
-/// (ADR-0023 rule 11): the temporal answers, which do not go through
-/// [`apply`], are narrowed by this before their instances are windowed, so
-/// `lastN` counts only what may be seen (ADR-0023 rule 8).
-pub(crate) fn type_project(doc: &Value, rules: &crate::policy::Filter) -> Value {
-    match doc.as_object() {
-        Some(obj) => {
-            let types = crate::policy::entity_types(doc);
-            Value::Object(
-                obj.iter()
-                    .filter(|(k, _)| is_meta(k) || rules.type_allows(&types, k))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            )
-        }
-        None => doc.clone(),
-    }
+/// Order `docs` by what each one shows, so `orderBy` on an Attribute the
+/// narrowing hides orders as if it were absent (ADR-0023 rule 2, 7.6.2.2)
+/// and never by the hidden value. Without a projecting narrowing, `order`
+/// runs on `docs` as they are.
+pub(crate) fn order_as_shown<E>(
+    docs: &mut Vec<Value>,
+    narrow: Option<&Repr>,
+    order: impl FnOnce(&mut Vec<Value>) -> Result<(), E>,
+) -> Result<(), E> {
+    let Some(r) = narrow
+        .filter(|r| r.policy_pick.is_some() || r.policy_omit.is_some() || r.policy_types.is_some())
+    else {
+        return order(docs);
+    };
+    // the position travels under a key no expanded IRI or core member can
+    // take, and comes back off the ordered views
+    const AT: &str = " position";
+    let mut views: Vec<Value> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let mut v = policy_view(d, r);
+            if let Some(o) = v.as_object_mut() {
+                o.insert(AT.to_owned(), Value::from(i));
+            }
+            v
+        })
+        .collect();
+    order(&mut views)?;
+    let mut slots: Vec<Option<Value>> = std::mem::take(docs).into_iter().map(Some).collect();
+    *docs = views
+        .iter()
+        .filter_map(|v| v.get(AT).and_then(Value::as_u64))
+        .filter_map(|i| slots.get_mut(usize::try_from(i).ok()?)?.take())
+        .collect();
+    Ok(())
 }
 
 /// The rows a narrowing admits (ADR-0020 `Filter::q`, `scope_q` and
@@ -359,6 +349,9 @@ pub struct PolicyReach {
     pub q: Option<antares_ql::QNode>,
     pub scope_q: Option<String>,
     pub geo_q: Option<Box<antares_ql::geo::GeoQuery>>,
+    /// The narrowing's expanded rules: an Entity none of them holds for is
+    /// not admitted (ADR-0023 rule 11).
+    pub rules: Option<std::sync::Arc<crate::policy::Filter>>,
 }
 
 /// Whether the narrowing admits the INTERNAL document `doc`; no narrowing
@@ -374,6 +367,9 @@ pub(crate) async fn policy_admits(
     let Some(reach) = reach else {
         return true;
     };
+    if shown(reach.rules.as_deref(), doc).is_none() {
+        return false;
+    }
     if let Some(scope) = &reach.scope_q {
         if !crate::scope_matches(scope, doc) {
             return false;
@@ -401,13 +397,14 @@ pub(crate) fn policy_view(doc: &Value, r: &Repr) -> Value {
     if r.policy_pick.is_none() && r.policy_omit.is_none() && r.policy_types.is_none() {
         return doc.clone();
     }
+    let shown = shown(r.policy_types.as_deref(), doc).unwrap_or_else(crate::policy::Shown::nothing);
     match doc.as_object() {
         Some(obj) => Value::Object(
             obj.iter()
                 .filter(|(k, _)| {
                     is_meta(k)
                         || (policy_projected(r.policy_pick.as_deref(), r.policy_omit.as_deref(), k)
-                            && type_projected(r.policy_types.as_deref(), doc, k))
+                            && shown.allows(k))
                 })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
@@ -445,10 +442,12 @@ pub fn compacted_filter(f: &crate::policy::Filter, ctx: &Context) -> crate::poli
             .map(|(t, attrs)| (ctx.compact_iri(&POLICY_CONTEXT.expand_key(t)), names(attrs)))
             .collect()
     };
+    // the rules' conditions read the stored Entity, not this compacted
+    // one: the notification path evaluates them itself (`notify::shown_now`)
     crate::policy::Filter {
         pick: names(&f.pick),
         omit: names(&f.omit),
-        pick_by_type: by_type(&f.pick_by_type),
+        rules: Vec::new(),
         omit_by_type: by_type(&f.omit_by_type),
         ..f.clone()
     }
@@ -463,6 +462,11 @@ pub fn compacted_filter(f: &crate::policy::Filter, ctx: &Context) -> crate::poli
 /// the caller sends. ADR-0020 asks an engine to write its rules as IRIs and
 /// those pass through unchanged; a short name is read here the way a name a
 /// request does not define is read anywhere else.
+/// [`POLICY_CONTEXT`], for the rule conditions read outside this module.
+pub(crate) fn policy_context() -> &'static Context {
+    &POLICY_CONTEXT
+}
+
 static POLICY_CONTEXT: std::sync::LazyLock<Context> =
     std::sync::LazyLock::new(antares_jsonld::core_context);
 
@@ -659,6 +663,9 @@ pub fn apply(doc: &Value, r: &Repr) -> Value {
     let Some(obj) = doc.as_object() else {
         return doc.clone();
     };
+    // an Entity no rule holds for was left out before it got here; one that
+    // arrives anyway shows its frame only
+    let shown = shown(r.policy_types.as_deref(), doc).unwrap_or_else(crate::policy::Shown::nothing);
     let mut out = Map::new();
     for (k, v) in obj {
         let is_meta = ENTITY_META.contains(&k.as_str());
@@ -696,7 +703,7 @@ pub fn apply(doc: &Value, r: &Repr) -> Value {
             }
         }
         if !policy_projected(r.policy_pick.as_deref(), r.policy_omit.as_deref(), k)
-            || !type_projected(r.policy_types.as_deref(), doc, k)
+            || !shown.allows(k)
         {
             continue;
         }
@@ -1251,6 +1258,8 @@ async fn collect_flat_walk(
     let Some(obj) = internal_doc.as_object() else {
         return;
     };
+    let shown = shown(repr.policy_types.as_deref(), internal_doc)
+        .unwrap_or_else(crate::policy::Shown::nothing);
     for (k, v) in obj {
         if is_meta(k) {
             continue;
@@ -1271,7 +1280,7 @@ async fn collect_flat_walk(
         }
         // a Relationship the subject may not see is not a road either
         if !policy_projected(repr.policy_pick.as_deref(), repr.policy_omit.as_deref(), k)
-            || !type_projected(repr.policy_types.as_deref(), internal_doc, k)
+            || !shown.allows(k)
         {
             continue;
         }

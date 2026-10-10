@@ -603,6 +603,105 @@ where
     eval(&|uri: &str| cache.get(uri).cloned().flatten())
 }
 
+/// What each Entity of a notification's `data` (and each one it embeds)
+/// shows under the expanded `rules`, read on its stored state now, names
+/// compacted the way `data` is. An Entity the store no longer holds, or
+/// that no rule holds for, maps to `None`.
+async fn shown_now(
+    st: &AppState,
+    tenant: &TenantId,
+    rules: &crate::policy::Filter,
+    data: &Value,
+    ctx: &Context,
+) -> HashMap<String, Option<crate::policy::Shown>> {
+    fn ids<'a>(v: &'a Value, out: &mut std::collections::BTreeSet<&'a str>) {
+        match v {
+            Value::Object(o) => {
+                if let (Some(id), Some(_)) = (o.get("id").and_then(Value::as_str), o.get("type")) {
+                    out.insert(id);
+                }
+                o.values().for_each(|v| ids(v, out));
+            }
+            Value::Array(a) => a.iter().for_each(|v| ids(v, out)),
+            _ => {}
+        }
+    }
+    let mut wanted = std::collections::BTreeSet::new();
+    ids(data, &mut wanted);
+    let mut out = HashMap::new();
+    for id in wanted {
+        let stored = st.store.get(tenant, Kind::Entity, id).await.ok().flatten();
+        let shown = stored
+            .and_then(|d| crate::repr::shown(Some(rules), &d))
+            .map(|s| s.map_names(|n| ctx.compact_iri(n)));
+        out.insert(id.to_owned(), shown);
+    }
+    out
+}
+
+/// The entry of `shown` for the Entity `e`; `None` when `e` is no Entity.
+fn entity_shown<'a>(
+    shown: &'a HashMap<String, Option<crate::policy::Shown>>,
+    e: &Value,
+) -> Option<Option<&'a crate::policy::Shown>> {
+    let id = e.get("id").and_then(Value::as_str)?;
+    Some(shown.get(id).and_then(Option::as_ref))
+}
+
+/// Strip a compacted notified Entity to what [`shown_now`] says it shows,
+/// and every Entity it embeds the same way: an embedded one no rule holds
+/// for is not embedded (ADR-0023 rule 6), its Relationship stays.
+fn project_shown(
+    shown: &HashMap<String, Option<crate::policy::Shown>>,
+    e: &mut Value,
+    key_values: bool,
+) {
+    let allowed = entity_shown(shown, e).flatten().cloned();
+    let Some(obj) = e.as_object_mut() else {
+        return;
+    };
+    let allowed = allowed.unwrap_or_else(crate::policy::Shown::nothing);
+    obj.retain(|k, _| k == "@context" || antares_model::is_meta(k) || allowed.allows(k));
+    for v in obj.values_mut() {
+        let instances: Vec<&mut Value> = match v {
+            Value::Array(a) => a.iter_mut().collect(),
+            other => vec![other],
+        };
+        for inst in instances {
+            if key_values {
+                if inst.get("id").is_some() && inst.get("type").is_some() {
+                    match entity_shown(shown, inst) {
+                        Some(Some(_)) => project_shown(shown, inst, key_values),
+                        _ => {
+                            let id = inst.get("id").cloned().unwrap_or(Value::Null);
+                            *inst = id;
+                        }
+                    }
+                }
+                continue;
+            }
+            let Some(o) = inst.as_object_mut() else {
+                continue;
+            };
+            if let Some(j) = o.get("entity") {
+                if matches!(entity_shown(shown, j), Some(Some(_))) {
+                    if let Some(j) = o.get_mut("entity") {
+                        project_shown(shown, j, key_values);
+                    }
+                } else {
+                    o.remove("entity");
+                }
+            }
+            if let Some(Value::Array(a)) = o.get_mut("entityList") {
+                a.retain(|j| matches!(entity_shown(shown, j), Some(Some(_))));
+                for j in a.iter_mut() {
+                    project_shown(shown, j, key_values);
+                }
+            }
+        }
+    }
+}
+
 /// ADR-0020: a narrowing reaches every document the answer carries, so the
 /// projection runs on each Entity `join=inline` embedded (4.5.23.2): under
 /// `entity`/`entityList` normalized, in place of the object URI simplified.
@@ -2179,7 +2278,7 @@ async fn deliver_as(
                 }
                 // a linked condition already read the target unprojected
                 // (T-3474): the narrowing came too late to apply to it
-                if (!f.omit.is_empty() || !f.pick.is_empty() || f.has_type_rules())
+                if (!f.omit.is_empty() || !f.pick.is_empty() || f.has_rules())
                     && linked_condition(sub)
                 {
                     tracing::debug!(
@@ -2187,6 +2286,7 @@ async fn deliver_as(
                     );
                     return;
                 }
+                let rules = crate::repr::type_rules(&f).filter(|r| !r.rules.is_empty());
                 let f = crate::repr::compacted_filter(&f, ctx);
                 let n = sub.get("notification");
                 let key_values = matches!(
@@ -2196,6 +2296,25 @@ async fn deliver_as(
                 if let Some(arr) = body.get_mut("data").and_then(Value::as_array_mut) {
                     for e in arr.iter_mut() {
                         project_joined(&f, e, key_values);
+                    }
+                }
+                // ADR-0023 rule 11: the rules read each Entity's stored state
+                // now, so one that left zone A carries no `speed`, nor a
+                // `previousValue` of it, and one no rule holds for is not
+                // notified at all
+                if let Some(rules) = rules {
+                    let shown = shown_now(st, tenant, &rules, &body["data"], ctx).await;
+                    if let Some(arr) = body.get_mut("data").and_then(Value::as_array_mut) {
+                        arr.retain(|e| matches!(entity_shown(&shown, e), Some(Some(_))));
+                        for e in arr.iter_mut() {
+                            project_shown(&shown, e, key_values);
+                        }
+                        if arr.is_empty() {
+                            tracing::debug!(
+                                "subscription {sub_id}: no notified Entity is in the narrowing now; dropping"
+                            );
+                            return;
+                        }
                     }
                 }
             }
