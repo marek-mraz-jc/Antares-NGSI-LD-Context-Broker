@@ -210,66 +210,10 @@ async fn upsert_temporal_local(
                         }
                         target.insert("type".into(), Value::Array(cur));
                     }
-                    for (k, v) in antares_jsonld::expanded_object(&expanded)? {
-                        if is_meta(k) {
-                            continue;
-                        }
-                        let incoming = v.as_array().cloned().unwrap_or_default();
-                        match target.get_mut(k).and_then(Value::as_array_mut) {
-                            Some(cur) => {
-                                // 5.6.11: instances merge by (datasetId, observedAt)
-                                for ni in incoming {
-                                    let key = (
-                                        ni.get("datasetId")
-                                            .and_then(Value::as_str)
-                                            .map(String::from),
-                                        ni.get("observedAt")
-                                            .and_then(Value::as_str)
-                                            .map(String::from),
-                                    );
-                                    let pos = cur.iter().position(|ci| {
-                                        (
-                                            ci.get("datasetId")
-                                                .and_then(Value::as_str)
-                                                .map(String::from),
-                                            ci.get("observedAt")
-                                                .and_then(Value::as_str)
-                                                .map(String::from),
-                                        ) == key
-                                            && key.1.is_some()
-                                    });
-                                    match pos {
-                                        // A correction, not a new instance: it
-                                        // keeps the instanceId its client was
-                                        // handed and the createdAt it was created
-                                        // at, which is 5.6.14.4's rule for the
-                                        // same kind of in-place change ("The
-                                        // createdAt property of the concerned
-                                        // instance shall remain unchanged").
-                                        // `stamp_temporal_instances` has already put a
-                                        // fresh pair on the incoming instance.
-                                        Some(p) => {
-                                            let mut ni = ni;
-                                            for keep in ["instanceId", "createdAt"] {
-                                                let Some(had) = cur[p].get(keep).cloned() else {
-                                                    continue;
-                                                };
-                                                if let Some(o) = ni.as_object_mut() {
-                                                    o.insert(keep.to_owned(), had);
-                                                }
-                                            }
-                                            cur[p] = ni;
-                                        }
-                                        None => cur.push(ni),
-                                    }
-                                }
-                            }
-                            None => {
-                                target.insert(k.clone(), Value::Array(incoming));
-                            }
-                        }
-                    }
-                    target.insert("modifiedAt".into(), Value::String(ts.clone()));
+                    // 5.6.11.4: the instances "shall be added" as 5.6.12
+                    // mandates; identity is the instanceId, never observedAt
+                    antares_jsonld::expanded_object(&expanded)?;
+                    add_temporal_instances(doc, &expanded, &ts);
                     Ok::<(), NgsiError>(())
                 })
                 .await?;

@@ -4,8 +4,18 @@
       "speed":[
          {
             "type":"Property",
+            "value":120,
+            "observedAt":"2020-09-01T12:03:00Z"
+         },
+         {
+            "type":"Property",
             "value":121,
             "observedAt":"2020-09-01T12:03:00Z"
+         },
+         {
+            "type":"Property",
+            "value":80,
+            "observedAt":"2020-09-01T12:05:00Z"
          },
          {
             "type":"Property",
@@ -23,6 +33,16 @@
             "type":"Property",
             "value":67,
             "observedAt":"2020-09-01T12:03:00Z"
+         },
+         {
+            "type":"Property",
+            "value":67,
+            "observedAt":"2020-09-01T12:03:00Z"
+         },
+         {
+            "type":"Property",
+            "value":53,
+            "observedAt":"2020-09-01T13:05:00Z"
          },
          {
             "type":"Property",

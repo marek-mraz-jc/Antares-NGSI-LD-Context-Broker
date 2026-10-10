@@ -507,3 +507,22 @@ with `reload=true` and expects 400 BadRequestData. Suggest 404
 ResourceNotFound, as the corrected fork does (forge commit 39921641);
 Antares carries that fix
 (`contexts_5_13.rs::clause_5_13_5_delete_and_reload_errors`).
+
+---
+
+## 21. [suite] 008_01 expects a second temporal upsert to overwrite instances at the same observedAt
+
+**Title:** the 008_01 expectation drops instances that the second
+`POST /temporal/entities` must add
+
+**Body:**
+
+CIM 009 5.6.11.4: for a known Temporal Evolution "all the Attribute
+instances included by the Temporal Evolution shall be added to the existing
+Entity as mandated by clause 5.6.12". An instance is identified by its
+system-generated instanceId, not by observedAt. The 008_01 expectation reuses
+the update payload, so instances that share an observedAt with the first
+POST are replaced and duplicates collapse. Suggest the union of both
+payloads, as the corrected fork does (forge commit 167fa185); Antares
+carries that fix
+(`temporal_dedup.rs::a_second_temporal_upsert_at_the_same_instant_appends`).
