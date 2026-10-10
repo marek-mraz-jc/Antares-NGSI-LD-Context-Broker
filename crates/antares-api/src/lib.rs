@@ -154,7 +154,7 @@ pub use antares_notifier::http::page_sink;
 use antares_model::{NgsiError, TenantId, API_ROOT};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, MethodRouter};
 use axum::Router;
 use negotiate::{echo_tenant, respond, tenant_from, ApiError};
 
@@ -327,153 +327,165 @@ pub async fn wired_state(host_alias: &str) -> AppState {
     st
 }
 
-pub fn router(state: AppState) -> Router {
-    let api = Router::new()
+/// The NGSI-LD API, path by path: `router()` mounts exactly these under the
+/// API root, and the policy seam's own test walks the same list, asking the
+/// router (OPTIONS, the Allow set) which methods each path serves.
+pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
+    vec![
         // entities (6.4/6.5)
-        .route(
+        (
             "/entities",
             post(entities::create_entity)
                 .get(entities::query_entities)
                 .delete(entities::purge_entities)
                 .patch(missing_entity_id)
                 .put(missing_entity_id),
-        )
-        .route(
+        ),
+        (
             "/entities/{id}",
             get(entities::retrieve_entity)
                 .patch(entities::merge_entity)
                 .put(entities::replace_entity)
                 .delete(entities::delete_entity),
-        )
+        ),
         // attrs (6.6/6.7)
-        .route(
+        (
             "/entities/{id}/attrs",
             post(attrs::append_attrs).patch(attrs::update_attrs),
-        )
-        .route(
+        ),
+        (
             "/entities/{id}/attrs/{attr}",
             // GET is the 2.0 #14 pre-adoption
             get(entities::retrieve_entity_attr)
                 .patch(attrs::partial_update_attr)
                 .put(attrs::replace_attr)
                 .delete(attrs::delete_attr),
-        )
+        ),
         // 2.0 #15 pre-adoption: the bare attribute value, and PUT is Set
         // Attribute Value (TS 104 176 7.6.3.2)
-        .route(
+        (
             "/entities/{id}/attrs/{attr}/value",
             get(entities::retrieve_entity_attr_value).put(attrs::set_attr_value),
-        )
+        ),
         // batch (6.14–6.17, 6.23, 6.31)
-        .route("/entityOperations/create", post(batch::batch_create))
-        .route("/entityOperations/upsert", post(batch::batch_upsert))
-        .route("/entityOperations/update", post(batch::batch_update))
-        .route("/entityOperations/delete", post(batch::batch_delete))
-        .route("/entityOperations/merge", post(batch::batch_merge))
-        .route("/entityOperations/query", post(batch::batch_query))
+        ("/entityOperations/create", post(batch::batch_create)),
+        ("/entityOperations/upsert", post(batch::batch_upsert)),
+        ("/entityOperations/update", post(batch::batch_update)),
+        ("/entityOperations/delete", post(batch::batch_delete)),
+        ("/entityOperations/merge", post(batch::batch_merge)),
+        ("/entityOperations/query", post(batch::batch_query)),
         // EntityMaps (5.14; 6.32/6.34/6.35)
-        .route(
+        (
             "/entityMaps",
             get(entity_maps::create_entity_map).post(entity_maps::create_entity_map_post),
-        )
-        .route(
+        ),
+        (
             "/entityMaps/{id}",
             get(entity_maps::retrieve_entity_map)
                 .patch(entity_maps::update_entity_map)
                 .delete(entity_maps::delete_entity_map),
-        )
-        .route(
+        ),
+        (
             "/temporal/entityMaps",
             get(entity_maps::create_temporal_entity_map)
                 .post(entity_maps::create_temporal_entity_map_post),
-        )
+        ),
         // subscriptions (6.10/6.11)
-        .route(
+        (
             "/subscriptions",
             post(subscriptions::create_subscription).get(subscriptions::query_subscriptions),
-        )
-        .route(
+        ),
+        (
             "/subscriptions/{id}",
             get(subscriptions::retrieve_subscription)
                 .patch(subscriptions::update_subscription)
                 .delete(subscriptions::delete_subscription),
-        )
+        ),
         // csourceRegistrations (6.8/6.9)
-        .route(
+        (
             "/csourceRegistrations",
             post(csource::create_registration).get(csource::query_registrations),
-        )
-        .route(
+        ),
+        (
             "/csourceRegistrations/{id}",
             get(csource::retrieve_registration)
                 .patch(csource::update_registration)
                 .delete(csource::delete_registration),
-        )
+        ),
         // csourceSubscriptions (6.12/6.13)
-        .route(
+        (
             "/csourceSubscriptions",
             post(subscriptions::create_csource_subscription)
                 .get(subscriptions::query_csource_subscriptions),
-        )
-        .route(
+        ),
+        (
             "/csourceSubscriptions/{id}",
             get(subscriptions::retrieve_csource_subscription)
                 .patch(subscriptions::update_csource_subscription)
                 .delete(subscriptions::delete_csource_subscription),
-        )
+        ),
         // temporal (6.18–6.22, 6.24)
-        .route(
+        (
             "/temporal/entities",
             post(temporal::upsert_temporal).get(temporal::query_temporal),
-        )
-        .route(
+        ),
+        (
             "/temporal/entities/{id}",
             get(temporal::retrieve_temporal).delete(temporal::delete_temporal),
-        )
-        .route(
+        ),
+        (
             "/temporal/entities/{id}/attrs",
             post(temporal::add_temporal_attrs),
-        )
-        .route(
+        ),
+        (
             "/temporal/entities/{id}/attrs/{attr}",
             delete(temporal::delete_temporal_attr),
-        )
-        .route(
+        ),
+        (
             "/temporal/entities/{id}/attrs/{attr}/{instance}",
             patch(temporal::modify_temporal_instance).delete(temporal::delete_temporal_instance),
-        )
-        .route(
+        ),
+        (
             "/temporal/entityOperations/query",
             post(temporal::batch_temporal_query),
-        )
+        ),
         // discovery (6.25–6.28)
-        .route("/types", get(types_attrs::entity_types))
-        .route("/types/{type}", get(types_attrs::entity_type_info))
-        .route("/attributes", get(types_attrs::attributes))
-        .route("/attributes/{attr}", get(types_attrs::attribute_info))
+        ("/types", get(types_attrs::entity_types)),
+        ("/types/{type}", get(types_attrs::entity_type_info)),
+        ("/attributes", get(types_attrs::attributes)),
+        ("/attributes/{attr}", get(types_attrs::attribute_info)),
         // jsonldContexts (6.29/6.30)
-        .route(
+        (
             "/jsonldContexts",
             post(contexts::add_context).get(contexts::list_contexts),
-        )
-        .route(
+        ),
+        (
             "/jsonldContexts/{id}",
             get(contexts::serve_context).delete(contexts::delete_context),
-        )
+        ),
         // snapshots (5.16; 6.36-6.38, optional API group — offered)
-        .route(
+        (
             "/snapshots",
             post(snapshots::create_snapshot).delete(snapshots::purge_snapshots),
-        )
-        .route(
+        ),
+        (
             "/snapshots/{id}",
             get(snapshots::retrieve_snapshot)
                 .patch(snapshots::update_snapshot)
                 .delete(snapshots::delete_snapshot),
-        )
-        .route("/snapshots/{id}/clone", post(snapshots::clone_snapshot))
+        ),
+        ("/snapshots/{id}/clone", post(snapshots::clone_snapshot)),
         // info (6.33)
-        .route("/info/sourceIdentity", get(source_identity));
+        ("/info/sourceIdentity", get(source_identity)),
+    ]
+}
+
+pub fn router(state: AppState) -> Router {
+    let api = api_routes()
+        .into_iter()
+        .fold(Router::new(), |api, (path, methods)| {
+            api.route(path, methods)
+        });
 
     // 5.8.1.4 consumer half: where forwarded subscription copies point their
     // notifications; remapped to the original subscriber. CIM 009 defines no
