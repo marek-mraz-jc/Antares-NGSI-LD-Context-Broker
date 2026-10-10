@@ -204,6 +204,19 @@ fn check_context_source_info(v: &Value) -> Result<(), NgsiError> {
         // first forward
         let sval = value.as_str();
         match key.to_ascii_lowercase().as_str() {
+            // TS 104 175 9.5.1: "As Tenant information, if applicable, is
+            // directly specified in the CSourceRegistration, it shall not
+            // be part of contextSourceInfo." A forward never sends it
+            // (`federation::CSI_SKIP`); refusing it here tells the client
+            // its routing would not happen, instead of forwarding silently
+            // to the default tenant.
+            "ngsild-tenant" => {
+                return Err(bad(
+                    "contextSourceInfo must not carry NGSILD-Tenant: set the \
+                     registration's tenant member instead (9.5.1)"
+                        .into(),
+                ));
+            }
             "accept" | "contenttype" => {
                 if !matches!(sval, Some("application/json" | "application/ld+json")) {
                     return Err(bad(format!(
