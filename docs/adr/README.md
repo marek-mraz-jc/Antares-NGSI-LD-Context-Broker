@@ -28,6 +28,7 @@ One file per irreversible decision, numbered, never rewritten.
 | [ADR-0020](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0020-policy-seam.md) | The policy seam: one trait, one built-in engine, every engine an addon | accepted, amended (the narrowing marker header) |
 | [ADR-0021](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0021-jsonld-context-tenancy.md) | A stored `@context` belongs to the Tenant that stored it, a Cached copy to none | accepted, implemented |
 | [ADR-0022](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0022-async-storage-drivers.md) | The storage drivers are async; nothing blocks on a store call | accepted, implemented; supersedes the sync-facade half of ADR-0005 |
+| [ADR-0023](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0023-endpoint-views.md) | Endpoint views: one policy-narrowed NGSI-LD endpoint that stays compliant | accepted (owner may override) |
 
 ## Format
 
