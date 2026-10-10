@@ -257,27 +257,49 @@ struct Windowed {
 const TEMPORAL_INSTANCE_LIMIT: usize = 9;
 
 /// 6.3.10: the ceiling is a CUT, not a label. An Attribute holding more
-/// instances than the broker serves at once is cut to the ceiling in the
-/// page order, and the 206 + Content-Range then describes the instances
-/// actually returned. This is what caps a lastN above the ceiling and what
-/// caps a request naming no temporal window at all. Aggregated
+/// instances than the broker serves at once is truncated to the ceiling in
+/// the query direction, and the 206 + Content-Range then describes the
+/// instances actually returned. This is what caps a lastN above the ceiling
+/// and what caps a request naming no temporal window at all. Aggregated
 /// representations (5.7.4.4) are computed over the whole evolution and are
 /// complete by construction, so they are never cut.
 ///
-/// The cut is a count per Attribute (TS 104 176 6.4.7.3: the page "limits
-/// the number of Attribute instances for any Attribute in a response"), so
-/// the next page is exactly offsetN plus the page size for every Attribute
-/// at once and the interval Links never skip or repeat an instance.
-fn truncate(w: &mut Windowed, timeprop: &str) {
+/// The cut is ONE time boundary for the whole entity, not a per-attribute
+/// count: the partial content "shall" be the representation the
+/// Content-Range describes, so every attribute is trimmed to the tightest
+/// ceiling instant among the over-full ones (ties at that instant kept),
+/// and a client continuing from the advertised range-end misses no instance
+/// of any attribute. An attribute lying entirely beyond the boundary comes
+/// back empty on this page. ETSI 020_14 checks exactly that (T-3612; the
+/// per-Attribute count of T-3456 failed it on every store).
+///
+/// ponytail: the offsetN Links step by the ceiling, the count the boundary
+/// Attribute served; an Attribute the boundary cut shorter skips its cut
+/// instances on the next offsetN page. Continuing from the Content-Range end
+/// misses none. A boundary-aware next Link is T-3613.
+fn truncate(w: &mut Windowed, timeprop: &str, descending: bool) {
     if w.max_per_attr <= TEMPORAL_INSTANCE_LIMIT {
         return;
     }
     w.truncated = true;
     w.more = true;
     w.max_per_attr = TEMPORAL_INSTANCE_LIMIT;
+    let key = |inst: &Value| inst.get(timeprop).and_then(Value::as_str).map(dt_key);
+    // the tightest ceiling instant: earliest forwards, latest backwards
+    let boundary = w
+        .attrs
+        .values()
+        .filter(|insts| insts.len() > TEMPORAL_INSTANCE_LIMIT)
+        .filter_map(|insts| key(&insts[TEMPORAL_INSTANCE_LIMIT - 1]))
+        .reduce(|a, b| if (b < a) != descending { b } else { a });
     let (mut ts_min, mut ts_max) = (None::<String>, None::<String>);
     for instances in w.attrs.values_mut() {
-        instances.truncate(TEMPORAL_INSTANCE_LIMIT);
+        match &boundary {
+            Some(bd) => instances.retain(|inst| {
+                key(inst).is_none_or(|k| if descending { k >= *bd } else { k <= *bd })
+            }),
+            None => instances.truncate(TEMPORAL_INSTANCE_LIMIT),
+        }
         for inst in instances.iter() {
             if let Some(t) = inst.get(timeprop).and_then(Value::as_str) {
                 if ts_min.as_deref().is_none_or(|m| dt_key(t) < dt_key(m)) {
@@ -2408,7 +2430,7 @@ pub(crate) async fn query_temporal_collected(
             &timeprop,
         );
         if !trepr.aggregated {
-            truncate(&mut w, &timeprop);
+            truncate(&mut w, &timeprop, page_n.desc);
         }
         g_trunc |= w.truncated;
         g_more |= w.more;
@@ -2685,7 +2707,7 @@ async fn retrieve_temporal_inner(
             &timeprop,
         );
         if !trepr.aggregated {
-            truncate(&mut w, &timeprop);
+            truncate(&mut w, &timeprop, page_n.desc);
         }
         let cr = if trepr.aggregated {
             None
@@ -3702,7 +3724,7 @@ mod clause_6_3_10 {
 
     async fn windowed(doc: &Value, tq: Option<&TemporalQ>, last_n: Option<usize>) -> Windowed {
         let mut w = window(doc, tq, page(last_n), None, None, None, "observedAt");
-        truncate(&mut w, "observedAt");
+        truncate(&mut w, "observedAt", last_n.is_some());
         w
     }
 
@@ -3778,31 +3800,46 @@ mod clause_6_3_10 {
             .max()
     }
 
-    /// TS 104 176 6.4.7.3: the page "limits the number of Attribute
-    /// instances for any Attribute", so the ceiling cuts each Attribute to
-    /// the same COUNT in the page order and the next page starts at the same
-    /// offsetN for all of them. The Content-Range bounds what the body holds.
+    /// 6.3.10: the partial content IS the representation the Content-Range
+    /// describes — so the cut is one time boundary for the whole entity.
+    /// With `speed` over-full first, `heading` is trimmed to the same last
+    /// instant, and nothing of either attribute lies past the advertised
+    /// range-end (a client continuing from it misses no instance).
     #[tokio::test]
-    async fn the_cut_is_one_count_per_attribute() {
+    async fn the_cut_is_one_time_boundary_across_attributes() {
         let w = windowed(&evolution2(21, 31), None, None).await;
-        assert!(w.truncated && w.more);
+        assert!(w.truncated);
+        let end = at(TEMPORAL_INSTANCE_LIMIT - 1);
         assert_eq!(w.attrs["speed"].len(), TEMPORAL_INSTANCE_LIMIT);
-        assert_eq!(w.attrs["heading"].len(), TEMPORAL_INSTANCE_LIMIT);
-        assert_eq!(w.attrs["heading"][0]["observedAt"], json!(at(5)));
-        let end = at(5 + TEMPORAL_INSTANCE_LIMIT - 1);
-        assert_eq!(last_observed(&w, "heading").as_deref(), Some(end.as_str()));
-        assert_eq!(w.ts_min.as_deref(), Some(at(0).as_str()));
+        assert_eq!(last_observed(&w, "speed").as_deref(), Some(end.as_str()));
+        assert_eq!(
+            last_observed(&w, "heading").as_deref(),
+            Some(end.as_str()),
+            "heading must stop at speed's boundary, not at its own ninth instance"
+        );
+        assert_eq!(w.attrs["heading"].len(), TEMPORAL_INSTANCE_LIMIT - 5);
         assert_eq!(w.ts_max.as_deref(), Some(end.as_str()));
-        // backwards (lastN): each Attribute's newest nine
+        for inst in w.attrs["heading"].iter().chain(w.attrs["speed"].iter()) {
+            assert!(
+                inst["observedAt"].as_str().expect("t") <= end.as_str(),
+                "no instance may lie past the advertised range-end: {inst}"
+            );
+        }
+        // backwards (lastN): the boundary is the LATEST ninth instant, so the
+        // page covers [heading's ninth-newest, newest] and `speed`, which ends
+        // before that, is empty on this page rather than incoherently present
         let w = windowed(&evolution2(21, 31), None, Some(20)).await;
         assert!(w.truncated);
         assert_eq!(w.attrs["heading"].len(), TEMPORAL_INSTANCE_LIMIT);
         assert_eq!(w.attrs["heading"][0]["observedAt"], json!(at(30)));
-        assert_eq!(w.attrs["speed"].len(), TEMPORAL_INSTANCE_LIMIT);
-        assert_eq!(w.attrs["speed"][0]["observedAt"], json!(at(20)));
         assert_eq!(
             w.ts_min.as_deref(),
-            Some(at(21 - TEMPORAL_INSTANCE_LIMIT).as_str())
+            Some(at(30 - TEMPORAL_INSTANCE_LIMIT + 1).as_str())
+        );
+        assert!(
+            w.attrs["speed"].is_empty(),
+            "speed lies entirely before the page boundary: {:?}",
+            w.attrs["speed"]
         );
     }
 
