@@ -205,8 +205,14 @@ pub fn index_rows(reg: &Value) -> Vec<Value> {
                 })
                 .unwrap_or_default()
         };
-        let props = names("propertyNames");
-        let rels = names("relationshipNames");
+        // TS 104 175 9.4.2: attributeNames, else the deprecated pair. The
+        // table has no column for a name of either kind, so an
+        // attributeNames entry is indexed as a property_name: the index is
+        // a flattened copy, the matchers read the registration itself.
+        let (props, rels) = match info.get("attributeNames") {
+            Some(_) => (names("attributeNames"), Vec::new()),
+            None => (names("propertyNames"), names("relationshipNames")),
+        };
         let entities: Vec<Option<&Value>> = match info.get("entities").and_then(Value::as_array) {
             Some(a) if !a.is_empty() => a.iter().map(Some).collect(),
             _ => vec![None],
@@ -1110,5 +1116,24 @@ mod tests {
         let rows = index_rows(&bare);
         assert_eq!(rows.len(), 1);
         assert!(rows[0]["property_name"].is_null() && rows[0]["relationship_name"].is_null());
+    }
+
+    /// TS 104 175 9.4.2 (T-3451): `attributeNames` scopes the rows, and the
+    /// deprecated pair beside it is not indexed.
+    #[test]
+    fn attribute_names_are_indexed_and_the_old_pair_beside_them_is_not() {
+        let reg = json!({
+            "endpoint": "e",
+            "information": [{"entities": [{"type": "T"}],
+                             "attributeNames": ["speed", "owner"],
+                             "propertyNames": ["brand"]}]
+        });
+        let rows = index_rows(&reg);
+        let mut names: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r["property_name"].as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["owner", "speed"]);
     }
 }

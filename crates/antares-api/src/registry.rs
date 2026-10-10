@@ -61,7 +61,7 @@ pub fn present_registration(doc: &Value, ctx: &Context, sys_attrs: bool) -> Valu
                                 .collect();
                             ni.insert("entities".into(), Value::Array(nes));
                         }
-                        for names_key in ["propertyNames", "relationshipNames"] {
+                        for names_key in antares_model::REGISTRATION_ATTRIBUTE_MEMBERS {
                             if let Some(names) = ni.get(names_key).and_then(Value::as_array) {
                                 let nn: Vec<Value> = names
                                     .iter()
@@ -196,19 +196,11 @@ fn attrs_match_info(attrs: &Option<Vec<String>>, info: &Value) -> bool {
     if attrs.is_empty() {
         return true;
     }
-    let props = info.get("propertyNames").and_then(Value::as_array);
-    let rels = info.get("relationshipNames").and_then(Value::as_array);
-    if props.is_none() && rels.is_none() {
-        return true;
+    // TS 104 175 9.4.2: attributeNames, else the deprecated pair
+    match antares_model::registration_attribute_names(info) {
+        None => true,
+        Some(names) => names.iter().any(|n| attrs.iter().any(|w| w == n)),
     }
-    let has = |list: Option<&Vec<Value>>| {
-        list.is_some_and(|l| {
-            l.iter()
-                .filter_map(Value::as_str)
-                .any(|n| attrs.iter().any(|w| w == n))
-        })
-    };
-    has(props) || has(rels)
 }
 
 /// 5.12: the RegistrationInfo elements of `doc.information` that match `spec`.

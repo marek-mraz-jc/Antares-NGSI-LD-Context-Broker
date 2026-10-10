@@ -55,6 +55,40 @@ pub fn ordered_vec(v: &serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&SpecOrder(v)).unwrap_or_default()
 }
 
+/// TS 104 175 Table 5.2.6.6.5-1: the RegistrationInfo members that name
+/// the Attributes a registration scopes. `attributeNames` replaces the
+/// deprecated pair, which is "only used if attributeNames is not present".
+pub const REGISTRATION_ATTRIBUTE_MEMBERS: [&str; 3] =
+    ["attributeNames", "propertyNames", "relationshipNames"];
+
+/// The Attribute names one RegistrationInfo scopes (TS 104 175 9.4.2):
+/// `attributeNames` when present, else `propertyNames` and
+/// `relationshipNames` together; `None` when it names none, so the
+/// registration scopes every Attribute of its entities. The one reading
+/// every matcher shares: a matcher that reads only the old pair treats an
+/// `attributeNames`-only registration as unscoped and forwards it every
+/// query.
+pub fn registration_attribute_names(info: &serde_json::Value) -> Option<Vec<&str>> {
+    fn strings(list: &[serde_json::Value]) -> Vec<&str> {
+        list.iter().filter_map(serde_json::Value::as_str).collect()
+    }
+    let names = |key: &str| info.get(key).and_then(serde_json::Value::as_array);
+    if let Some(attributes) = names("attributeNames") {
+        return Some(strings(attributes));
+    }
+    let (properties, relationships) = (names("propertyNames"), names("relationshipNames"));
+    if properties.is_none() && relationships.is_none() {
+        return None;
+    }
+    Some(
+        properties
+            .into_iter()
+            .chain(relationships)
+            .flat_map(|list| strings(list))
+            .collect(),
+    )
+}
+
 /// 5.2.4 Entity, Table 5.2.4-1, with the common members of Table 5.2.2-1:
 /// the members of an Entity document that are not Attributes. Every other
 /// member is a Property or a Relationship (`location` and the two other
@@ -246,6 +280,23 @@ pub fn has_dot_segment(attr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::dt_key;
+
+    #[test]
+    fn attribute_names_come_first_and_the_old_pair_only_without_them() {
+        use super::registration_attribute_names as names;
+        use serde_json::json;
+        let both = json!({"attributeNames": ["speed"], "propertyNames": ["brand"],
+                          "relationshipNames": ["owner"]});
+        assert_eq!(names(&both), Some(vec!["speed"]));
+        let old = json!({"propertyNames": ["brand"], "relationshipNames": ["owner"]});
+        assert_eq!(names(&old), Some(vec!["brand", "owner"]));
+        assert_eq!(
+            names(&json!({"relationshipNames": ["owner"]})),
+            Some(vec!["owner"])
+        );
+        assert_eq!(names(&json!({"entities": []})), None);
+        assert_eq!(names(&json!({"attributeNames": []})), Some(vec![]));
+    }
     #[test]
     fn meta_members_are_the_non_attribute_members_of_an_entity() {
         for k in [

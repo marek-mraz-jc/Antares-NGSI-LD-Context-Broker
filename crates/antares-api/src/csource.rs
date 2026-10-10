@@ -55,7 +55,12 @@ fn norm_registration_info(v: &Value, ctx: &Context) -> Result<Value, NgsiError> 
         let io = info
             .as_object()
             .ok_or_else(|| bad("information entries must be objects".into()))?;
-        for key in ["entities", "propertyNames", "relationshipNames"] {
+        for key in [
+            "entities",
+            "attributeNames",
+            "propertyNames",
+            "relationshipNames",
+        ] {
             if let Some(n) = io.get(key).and_then(Value::as_array).map(Vec::len) {
                 if n > MAX_INFO_MEMBERS {
                     return Err(bad(format!(
@@ -136,8 +141,9 @@ fn norm_registration_info(v: &Value, ctx: &Context) -> Result<Value, NgsiError> 
                     }
                     ni.insert("entities".into(), Value::Array(nes));
                 }
-                "propertyNames" | "relationshipNames" => {
-                    // 5.2.10: "Empty array is not allowed"
+                "attributeNames" | "propertyNames" | "relationshipNames" => {
+                    // 5.2.10, TS 104 175 Table 5.2.6.6.5-1: "Empty array is
+                    // not allowed"
                     let names = iv
                         .as_array()
                         .filter(|a| !a.is_empty())
@@ -609,10 +615,9 @@ async fn check_entity_conflict(
         .map(Vec::as_slice)
         .unwrap_or_default();
     for info in infos {
-        let attrs: Vec<String> = ["propertyNames", "relationshipNames"]
-            .iter()
-            .flat_map(|k| info.get(*k).and_then(Value::as_array).into_iter().flatten())
-            .filter_map(Value::as_str)
+        let attrs: Vec<String> = antares_model::registration_attribute_names(info)
+            .unwrap_or_default()
+            .into_iter()
             .map(str::to_owned)
             .collect();
         let ents = info
@@ -791,11 +796,8 @@ pub fn validate_exclusive(doc: &Map<String, Value>) -> Result<(), NgsiError> {
         .map(Vec::as_slice)
         .unwrap_or_default();
     for info in infos {
-        let has_attrs = ["propertyNames", "relationshipNames"].iter().any(|k| {
-            info.get(*k)
-                .and_then(Value::as_array)
-                .is_some_and(|a| !a.is_empty())
-        });
+        let has_attrs = antares_model::registration_attribute_names(info)
+            .is_some_and(|names| !names.is_empty());
         if !has_attrs {
             return Err(bad("an exclusive registration shall define Attributes"));
         }
@@ -869,11 +871,9 @@ pub async fn check_proxied_overlap(
             return Ok(());
         }
         for info in infos {
-            let attrs: Vec<String> = ["propertyNames", "relationshipNames"]
-                .iter()
-                .filter_map(|k| info.get(*k).and_then(Value::as_array))
-                .flatten()
-                .filter_map(Value::as_str)
+            let attrs: Vec<String> = antares_model::registration_attribute_names(info)
+                .unwrap_or_default()
+                .into_iter()
                 .map(str::to_owned)
                 .collect();
             let empty = Vec::new();
@@ -987,7 +987,9 @@ fn info_members(norm: &Map<String, Value>) -> (Vec<String>, Vec<String>) {
         {
             add(&mut types, e.get("type"));
         }
-        for k in ["propertyNames", "relationshipNames"] {
+        // every name the request carries, the deprecated pair beside
+        // attributeNames included: the engine judges what was sent
+        for k in antares_model::REGISTRATION_ATTRIBUTE_MEMBERS {
             add(&mut attrs, info.get(k));
         }
     }

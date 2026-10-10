@@ -682,11 +682,9 @@ fn reduced_copy(
         .into_iter()
         .flatten()
         .flat_map(|i| {
-            ["propertyNames", "relationshipNames"]
+            antares_model::registration_attribute_names(i)
+                .unwrap_or_default()
                 .into_iter()
-                .filter_map(|k| i.get(k).and_then(Value::as_array))
-                .flatten()
-                .filter_map(Value::as_str)
                 .map(|n| ctx.expand_key(n))
         })
         .collect();
