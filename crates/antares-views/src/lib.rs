@@ -8,7 +8,14 @@
 //! This crate serves the reads: Retrieve and Query Entities (10.4.2, 10.4.3,
 //! the batch query), Retrieve Attribute Value (10.4.4), discovery (10.6.3 to
 //! 10.6.8), the temporal reads (11.3.2, 11.3.3) and List @contexts (13.3,
-//! the core one alone, rule 5). Any other operation answers 405 with the
+//! the core one alone, rule 5), and the writes (10.2.2 to 10.2.11 but
+//! Purge; 10.3.2, 10.3.4 to 10.3.6 member by member, with the
+//! `BatchOperationResult` of 207 when mixed): the Entity is in the view
+//! before the write and after
+//! it, every Attribute the write names is one the view shows, and every
+//! Relationship it writes points at an Entity the view shows (rule 7), or
+//! the write is refused and the store keeps what it held. Any other
+//! operation answers 405 with the
 //! `Allow` the view serves on that resource, 422 when the view serves the
 //! method there but not this operation of it (rule 4), and 404 where it
 //! serves nothing at all. Entity maps (14.x) are not served through a
@@ -33,10 +40,26 @@ use axum::Router;
 /// Where the view root mounts.
 pub const PREFIX: &str = "/x/views";
 
-/// The operations this crate serves through a view (the reads, ADR-0023
-/// rules 1 to 3, 5, 6 and 8). Writes and Subscriptions are T-3498 and
-/// T-3499; until then a view that allows one answers it with 405 or 422.
-pub const SERVED: [OperationId; 14] = [
+/// The operations this crate serves through a view: the reads (ADR-0023
+/// rules 1 to 3, 5, 6 and 8) and the writes the broker checks on the stored
+/// Entity (rule 7), batches member by member. A view that allows any other
+/// operation (Purge, Batch Upsert, the temporal writes) answers it with 405
+/// or 422.
+pub const SERVED: [OperationId; 28] = [
+    OperationId::BatchCreate,
+    OperationId::BatchUpdate,
+    OperationId::BatchMerge,
+    OperationId::BatchDelete,
+    OperationId::CreateEntity,
+    OperationId::UpdateAttributes,
+    OperationId::AppendAttributes,
+    OperationId::PartialAttributeUpdate,
+    OperationId::SetAttributeValue,
+    OperationId::DeleteAttribute,
+    OperationId::DeleteEntity,
+    OperationId::MergeEntity,
+    OperationId::ReplaceEntity,
+    OperationId::ReplaceAttribute,
     OperationId::RetrieveEntity,
     OperationId::QueryEntities,
     OperationId::QueryEntitiesPost,

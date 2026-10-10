@@ -119,6 +119,11 @@ async fn create_entity_inner(
         body: Some(&expanded),
     )
     .await?;
+    // ADR-0023 rule 7: a create through a view writes an Entity the view
+    // selects, with Attributes it shows and Relationships to Entities it
+    // shows, or nothing at all.
+    #[cfg(feature = "views")]
+    crate::views::admits_new(st, &tenant, &expanded).await?;
     let regs = match crate::federation::write_plan(st, &tenant, &spec, &parsed.ctx, params, headers)
         .await?
     {
@@ -1489,7 +1494,16 @@ pub async fn delete_entity(
         // tested inside the delete, under the row lock: read first and delete
         // after, and the document that answered the test is not necessarily
         // the one the delete removes.
-        let keep = |d: &Value| crate::negotiate::matches_type_param(d, &params, &ctx);
+        #[cfg(feature = "views")]
+        let guard = crate::views::WriteGuard::of(&st, std::iter::empty());
+        let keep = |d: &Value| {
+            // ADR-0023 rule 7: an Entity out of the view is not found
+            #[cfg(feature = "views")]
+            if guard.as_ref().is_some_and(|g| !g.sees(d)) {
+                return false;
+            }
+            crate::negotiate::matches_type_param(d, &params, &ctx)
+        };
         if !regs.is_empty() {
             let proxy_match = regs.iter().any(|r| r.is_proxy());
             let mut parts = Vec::new();
@@ -1937,6 +1951,17 @@ async fn merge_entity_inner(
         body: Some(&fragment),
     )
     .await?;
+    #[cfg(feature = "views")]
+    let guard = crate::views::WriteGuard::of(
+        st,
+        crate::attrs::attr_iris_of(&fragment)
+            .iter()
+            .map(String::as_str),
+    );
+    #[cfg(feature = "views")]
+    if let Some(g) = &guard {
+        g.targets(st, &tenant, &fragment).await?;
+    }
     // 5.6.17.3: a common observedAt timestamp to use across merged
     // Attributes, and a common language tag for merged LanguageMaps.
     let observed_at = params.get("observedAt").map(String::as_str);
@@ -2052,6 +2077,10 @@ async fn merge_entity_inner(
     let res = st
         .store
         .mutate(&tenant, Kind::Entity, id, |doc| {
+            #[cfg(feature = "views")]
+            if let Some(g) = &guard {
+                g.pre(id, doc)?;
+            }
             // 5.6.17.4: the ?type selector narrows the merge target
             if !crate::negotiate::matches_type_param(doc, params, &parsed.ctx) {
                 return Err(NgsiError::ResourceNotFound(format!(
@@ -2061,9 +2090,17 @@ async fn merge_entity_inner(
             let mut frag = fragment.clone();
             apply_common_lang(doc, &mut frag, lang);
             merge_into(doc, &frag, &ts);
+            #[cfg(feature = "views")]
+            if let Some(g) = &guard {
+                g.post(doc)?;
+            }
             Ok::<(), NgsiError>(())
         })
         .await?;
+    #[cfg(feature = "views")]
+    if let Some(g) = &guard {
+        g.verdict()?;
+    }
     match res {
         None => Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into()),
         Some(Err(e)) => Err(e.into()),
@@ -2320,6 +2357,12 @@ pub async fn replace_entity(
             .get(&tenant, Kind::Entity, &id)
             .await?
             .filter(|d| crate::negotiate::matches_type_param(d, &params, &ctx0));
+        // ADR-0023 rule 3: out of the view is not found, before the body is
+        // read, as an absent target is (057_03)
+        #[cfg(feature = "views")]
+        let local_doc = local_doc.filter(|d| {
+            crate::views::WriteGuard::of(&st, std::iter::empty()).is_none_or(|g| g.sees(d))
+        });
         let spec = crate::registry::CsrSpec {
             ids: Some(vec![id.clone()]),
             ..Default::default()
@@ -2349,9 +2392,24 @@ pub async fn replace_entity(
             }
             let ts = now_iso();
             stamp_new(&mut expanded, &ts);
+            #[cfg(feature = "views")]
+            let guard = crate::views::WriteGuard::of(
+                &st,
+                crate::attrs::attr_iris_of(&expanded)
+                    .iter()
+                    .map(String::as_str),
+            );
+            #[cfg(feature = "views")]
+            if let Some(g) = &guard {
+                g.targets(&st, &tenant, &expanded).await?;
+            }
             let res = st
                 .store
                 .mutate(&tenant, Kind::Entity, &id, |doc| {
+                    #[cfg(feature = "views")]
+                    if let Some(g) = &guard {
+                        g.pre_whole(&id, doc)?;
+                    }
                     // 5.6.18.4: the ?type selector narrows the target here too —
                     // the type of the row being written is the one that counts
                     if !crate::negotiate::matches_type_param(doc, &params, &ctx0) {
@@ -2369,9 +2427,17 @@ pub async fn replace_entity(
                         o.insert("createdAt".into(), created);
                     }
                     *doc = expanded.clone();
+                    #[cfg(feature = "views")]
+                    if let Some(g) = &guard {
+                        g.post(doc)?;
+                    }
                     Ok::<(), NgsiError>(())
                 })
                 .await?;
+            #[cfg(feature = "views")]
+            if let Some(g) = &guard {
+                g.verdict()?;
+            }
             return match res {
                 None => Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into()),
                 Some(Err(e)) => Err(e.into()),

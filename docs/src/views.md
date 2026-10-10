@@ -25,9 +25,12 @@ Tenant:
 | 10.6.3 to 10.6.8 | Entity types and Attributes |
 | 11.3.2, 11.3.3 | Temporal Retrieve and Query |
 | 13.3 | List @contexts: the core context only |
+| 10.2.2 to 10.2.11, but 10.2.12 Purge | Create, Update, Append, Partial Update, Set Value, Delete Attribute, Delete, Merge, Replace Entity, Replace Attribute |
+| 10.3.2, 10.3.4 to 10.3.6 | Batch create, update, merge and delete, member by member |
 
 A view serves an operation only when its `operations` list names it.
-Writes and Subscriptions through a view come with T-3498 and T-3499.
+Batch Upsert, Purge and the temporal writes are not served through a
+view; Subscriptions through a view come with T-3499.
 
 ## 2. What a client sees
 
@@ -42,7 +45,32 @@ Writes and Subscriptions through a view come with T-3498 and T-3499.
 - `Link`, `Location` and `Content-Location` name the view root, so a next
   page stays inside the view.
 
-## 3. Refusals
+## 3. Writes
+
+A write through a view runs on the local store only, never forwarded to a
+Context Source, and the broker checks it on the stored Entity inside the
+same store operation (ADR-0023 rule 7):
+
+- The Entity must be in the view before the write. One out of the view
+  answers `404`, byte for byte as an absent one, before any type selector
+  or body check.
+- Every Attribute the write names must be one a rule holding for the
+  Entity shows, or the whole write is `403`. The answer is the same
+  whether the Entity holds that Attribute or not. A Replace Entity also
+  counts every Attribute the stored Entity holds, so a replace cannot
+  delete what the view hides.
+- The Entity must still be in the view after the write, or the write is
+  `403` ("the write would move the Entity out of this view").
+- A create must produce an Entity the view selects. An id taken out of
+  the view is `409`, the same body an id taken in the view gets.
+- A Relationship must point at an Entity the view shows. A hidden target
+  and an absent one both answer `403`.
+- A batch applies these checks to each member and answers the
+  `BatchOperationResult`, `207` when mixed.
+
+A refused write leaves the store as it was.
+
+## 4. Refusals
 
 | Answer | When |
 |---|---|

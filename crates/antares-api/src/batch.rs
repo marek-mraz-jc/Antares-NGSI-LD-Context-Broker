@@ -216,6 +216,38 @@ fn whole_refusal(refused: &[Option<String>]) -> Option<String> {
     }
 }
 
+/// The members of a batch round a view lets through its Relationship check,
+/// each with the guard its store closure applies (ADR-0023 rule 7); the
+/// others land in E. Without a view every member goes, with no guard.
+#[cfg(feature = "views")]
+async fn view_guards(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    round: Vec<(String, Value)>,
+    out: &mut BatchOutcome,
+) -> (
+    Vec<(String, Value)>,
+    HashMap<String, crate::views::WriteGuard>,
+) {
+    let mut guards = HashMap::new();
+    let mut kept = Vec::with_capacity(round.len());
+    for (id, doc) in round {
+        let names = crate::attrs::attr_iris_of(&doc);
+        let Some(g) = crate::views::WriteGuard::of(st, names.iter().map(String::as_str)) else {
+            kept.push((id, doc));
+            continue;
+        };
+        match g.targets(st, tenant, &doc).await {
+            Ok(()) => {
+                guards.insert(id.clone(), g);
+                kept.push((id, doc));
+            }
+            Err(crate::policy::Denied(why)) => out.errors.push(denied_entry(Some(&id), &why)),
+        }
+    }
+    (kept, guards)
+}
+
 fn err_entry(id: Option<&str>, e: &NgsiError) -> Value {
     json!({
         "entityId": id.unwrap_or("unknown"),
@@ -705,6 +737,15 @@ async fn batch_write(
     // problem and the rest are applied (207); a batch refused whole is the
     // 403 it always was. An entry that does not expand is shown by its id
     // alone and left to the local arm to report.
+    // ADR-0023 rule 7 under an endpoint view: Batch Upsert is refused whole
+    // as `gate!` refuses a narrowed write; the others are decided per member
+    // on the stored Entities below.
+    #[cfg(feature = "views")]
+    crate::views::with_view(
+        st.view.as_deref(),
+        mode.clause(),
+        Ok(crate::policy::Filter::default()),
+    )?;
     if let Some(engine) = &st.policy {
         let mut shown: Vec<(Option<String>, crate::policy::PreImage, Option<Value>)> = Vec::new();
         for (item, ctx) in &items {
@@ -939,6 +980,8 @@ async fn batch_write(
                 }
             }
             BatchMode::Update | BatchMode::Merge => {
+                #[cfg(feature = "views")]
+                let (round, guards) = view_guards(st, &tenant, round, &mut out).await;
                 let ids: Vec<String> = round.iter().map(|(id, _)| id.clone()).collect();
                 let docs: HashMap<&str, &Value> =
                     round.iter().map(|(id, d)| (id.as_str(), d)).collect();
@@ -949,6 +992,12 @@ async fn batch_write(
                 let res = st
                     .store
                     .batch_mutate(&tenant, &ids, |id, doc| {
+                        #[cfg(feature = "views")]
+                        let guard = guards.get(id);
+                        #[cfg(feature = "views")]
+                        if let Some(g) = guard {
+                            g.pre(id, doc)?;
+                        }
                         let expanded = docs[id];
                         if mode == BatchMode::Update && no_overwrite {
                             // noOverwrite is instance-level: only instances
@@ -985,10 +1034,21 @@ async fn batch_write(
                         } else {
                             merge_into(doc, expanded, &ts);
                         }
+                        #[cfg(feature = "views")]
+                        if let Some(g) = guard {
+                            g.post(doc)?;
+                        }
                         Ok::<(), NgsiError>(())
                     })
                     .await?;
                 for ((id, _), r) in round.iter().zip(res) {
+                    #[cfg(feature = "views")]
+                    if let Some(crate::policy::Denied(why)) =
+                        guards.get(id).and_then(|g| g.verdict().err())
+                    {
+                        out.errors.push(denied_entry(Some(id), &why));
+                        continue;
+                    }
                     match r {
                         None => out.errors.push(err_entry(
                             Some(id),
@@ -1011,6 +1071,18 @@ async fn batch_write(
                 }
             }
         }
+    }
+    // ADR-0023 rule 7 per member: a create through a view lands in it.
+    #[cfg(feature = "views")]
+    if st.view.is_some() {
+        let mut kept = Vec::with_capacity(pending_creates.len());
+        for (id, doc) in pending_creates {
+            match crate::views::admits_new(st, &tenant, &doc).await {
+                Ok(()) => kept.push((id, doc)),
+                Err(crate::policy::Denied(why)) => out.errors.push(denied_entry(Some(&id), &why)),
+            }
+        }
+        pending_creates = kept;
     }
     // The collected creates, one multi-row statement, one transaction.
     if !pending_creates.is_empty() {
@@ -1236,6 +1308,12 @@ pub async fn batch_delete(
         // sits behind the parse the way the single-Entity delete sits behind
         // its path parameter. A refused id lands in E, the rest are deleted.
         let mut ids: Vec<&Value> = ids.iter().collect();
+        #[cfg(feature = "views")]
+        crate::views::with_view(
+            st.view.as_deref(),
+            "5.6.10",
+            Ok(crate::policy::Filter::default()),
+        )?;
         if let Some(engine) = &st.policy {
             let mut pres: Vec<crate::policy::PreImage> = Vec::new();
             for id in &ids {
@@ -1301,7 +1379,27 @@ pub async fn batch_delete(
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect();
-        let mut flags = st.store.batch_delete(&tenant, &id_strs).await?.into_iter();
+        // Under an endpoint view each delete reads its Entity under the lock
+        // and leaves one out of the view, which then answers as absent
+        // (ADR-0023 rule 7).
+        #[cfg(feature = "views")]
+        let flags = match crate::views::WriteGuard::of(&st, std::iter::empty()) {
+            Some(g) => {
+                let mut flags = Vec::with_capacity(id_strs.len());
+                for id in &id_strs {
+                    flags.push(
+                        st.store
+                            .delete_entity_if(&tenant, id, &|d| g.sees(d))
+                            .await?,
+                    );
+                }
+                flags
+            }
+            None => st.store.batch_delete(&tenant, &id_strs).await?,
+        };
+        #[cfg(not(feature = "views"))]
+        let flags = st.store.batch_delete(&tenant, &id_strs).await?;
+        let mut flags = flags.into_iter();
         let mut local_ok: std::collections::HashSet<String> = Default::default();
         let mut local_miss: Vec<String> = Vec::new();
         for id in ids {
