@@ -38,7 +38,7 @@ Antares:
 |---|---|---|
 | `odata-url` | resource path and system query options to a typed AST; optional feature `edm` resolves names and type-checks against a model | `percent-encoding`, `thiserror`; `odata-csdl` only under `edm` |
 | `odata-csdl` | EDM model, CSDL XML and CSDL JSON writers (readers under feature `read`), model validation | `regex` (amended by T-3502: both writers are hand-written over `std::io::Write`, so `quick-xml`, `serde_json`, `indexmap` and `thiserror` are not needed; `regex` holds the exact `TSimpleIdentifier` classes of `edm.xsd`) |
-| `odata-json` | JSON format: context URL, entity and collection writers, `@odata.bind` and deep-insert body reader, `If-Match`, `Prefer`, version negotiation, the error body | `serde_json`, `odata-csdl`, `odata-url` |
+| `odata-json` | JSON format: context URL, entity and collection writers, `@odata.bind` and deep-insert body reader, `If-Match`, `Prefer`, version negotiation, the error body | `serde_json`, `odata-csdl`, `odata-url` (amended by T-3504: plus `serde` for the reader that counts `BodyLimits` while it reads; `serde_json` with `float_roundtrip`, so an `Edm.Double` reads back to the same bits; no `indexmap`, the writers stream members in the caller's order; `If-Match` is not parsed, the surface answers 501 on its presence, W32) |
 | `odata-batch` | multipart (Protocol 4.01 11.7.7) and JSON batch (JSON Format 4.01 section 19) parsers and writers, `dependsOn` ordering | `memchr`, `serde_json` |
 | `odata-axum` | HTTP to library types and back, `$metadata` router; behind feature `axum` | `axum`, `http`, the four above |
 

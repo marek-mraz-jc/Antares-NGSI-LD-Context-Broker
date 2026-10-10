@@ -476,6 +476,25 @@ jobs:
       - name: Schemas, converter and vocabulary terms
         run: python3 dev/odata-csdl-conformance.py
 
+  odata-url-abnf:
+    # odata_url_abnf_testcases: the 840 OASIS ABNF test cases (odata-abnf at the
+    # commit ADR-0024 decision 3 pins, fetched with a checksum, never vendored)
+    # through odata-url, counted per rule and outcome (T-3503).
+    name: OData URLs against the OASIS ABNF test cases
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+          key: odata-url-abnf
+      - run: pip install --quiet --disable-pip-version-check pyyaml==6.0.3
+      - name: odata_url_abnf_testcases
+        run: python3 dev/odata-url-abnf.py
+
   msrv:
     # The declared rust-version stays PROVEN as stable moves on.
     name: MSRV check (1.97)

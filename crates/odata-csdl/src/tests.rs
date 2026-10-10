@@ -429,3 +429,53 @@ fn errors_read_as_fixed_text() {
     let io: CsdlError = std::io::Error::other("x").into();
     assert!(std::error::Error::source(&io).is_none());
 }
+
+#[test]
+fn lookups_resolve_aliases_bases_and_references() {
+    let mut city = Schema::new("City");
+    city.alias = Some("c".into());
+    let mut tower = EntityType::new("Tower");
+    tower.base_type = Some("c.Building".into());
+    let mut building = EntityType::new("Building");
+    building.base_type = Some("City.Address".into());
+    let mut looped = EntityType::new("Loop");
+    looped.base_type = Some("City.Loop".into());
+    city.entity_types = vec![tower, building, looped];
+    city.complex_types.push(ComplexType::new("Address"));
+    let mut service = EntityContainer::new("Service");
+    service
+        .entity_sets
+        .push(EntitySet::new("Towers", "City.Tower"));
+    city.entity_container = Some(service);
+    let model = Model {
+        version: CsdlVersion::V4_01,
+        references: vec![core()],
+        schemas: vec![Schema::new("Empty"), city],
+    };
+    assert_eq!(model.namespace("Core"), Some("Org.OData.Core.V1"));
+    assert_eq!(
+        model.namespace("Org.OData.Core.V1"),
+        Some("Org.OData.Core.V1")
+    );
+    assert_eq!(
+        model.full_name("Core.Computed").as_deref(),
+        Some("Org.OData.Core.V1.Computed")
+    );
+    assert_eq!(model.full_name("Computed"), None);
+    assert!(model.entity_type("Tower").is_none());
+    assert!(model.entity_type("Nowhere.Tower").is_none());
+    assert!(model.complex_type("Address").is_none());
+    assert!(model.entity_type("c.Address").is_none());
+    assert!(model.complex_type("c.Tower").is_none());
+    assert!(model.complex_type("c.Address").is_some());
+    assert!(model.entity_set("Towers").is_some());
+    let names = |ty: &str| -> Vec<String> {
+        model
+            .entity_type(ty)
+            .map(|t| model.lineage(t).iter().map(|t| t.name.clone()).collect())
+            .unwrap_or_default()
+    };
+    // A complex base ends the walk; a cycle stops after as many steps as there are types.
+    assert_eq!(names("c.Tower"), ["Tower", "Building"]);
+    assert_eq!(names("City.Loop"), ["Loop", "Loop", "Loop"]);
+}
