@@ -511,10 +511,6 @@ pub fn subject_of(tenant: &antares_model::TenantId, headers: &HeaderMap) -> Subj
 /// instead of a new list to forget.
 pub(crate) const SUBJECT_MEMBER: &str = "__subject";
 
-/// The stored form of a subject: only the headers a deployment named, since
-/// the tenant is where the subscription already lives. `None` when the
-/// subject carries nothing, so a deployment that named no header stores no
-/// member at all.
 /// The expanded types a write by id lands on: the stored Entity's, joined
 /// with the ones the request body names (ADR-0020: an engine judging by
 /// type judges the Entity the write changes and what it changes it to).
@@ -549,6 +545,10 @@ pub(crate) async fn write_types(
     out
 }
 
+/// The stored form of a subject: only the headers a deployment named, since
+/// the tenant is where the subscription already lives. `None` when the
+/// subject carries nothing, so a deployment that named no header stores no
+/// member at all.
 pub(crate) fn subject_member(subject: &Subject) -> Option<Value> {
     (!subject.headers.is_empty())
         .then(|| serde_json::to_value(&subject.headers).ok())
