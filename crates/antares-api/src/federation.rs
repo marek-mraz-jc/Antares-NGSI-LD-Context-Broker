@@ -1555,16 +1555,18 @@ pub async fn fed_retrieve_temporal(
     Ok(out)
 }
 
-/// The DateTime 4.5.5.3 arbitrates on, as a comparable key: 4.6.3 admits the
+/// The rank 4.5.5.3 arbitrates on: TS 104 175 8.5.3 has any instance with
+/// an observedAt take precedence over every instance without one, the most
+/// recent observedAt among them; modifiedAt decides only between instances
+/// that observed nothing. The DateTime is a comparable key: 4.6.3 admits the
 /// same instant with or without a fraction, so a raw string compare would
 /// rank `…:01.500Z` below `…:01Z`.
-fn recency(inst: &Value) -> String {
-    antares_model::dt_key(
-        inst.get("observedAt")
-            .or_else(|| inst.get("modifiedAt"))
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-    )
+fn recency(inst: &Value) -> (bool, String) {
+    let at = |k| inst.get(k).and_then(Value::as_str);
+    match at("observedAt") {
+        Some(observed) => (true, antares_model::dt_key(observed)),
+        None => (false, antares_model::dt_key(at("modifiedAt").unwrap_or(""))),
+    }
 }
 
 /// 4.5.5.2 Processing of Conflicting Transient Entities: for each received
@@ -3411,6 +3413,46 @@ mod tests {
         });
         merge_docs(&mut base2, &add2, false);
         assert_eq!(base2[attr][0]["value"], 2, "live instance replaces expired");
+    }
+
+    /// TS 104 175 8.5.3: "any attribute data where an observedAt DateTime is
+    /// present shall take precedence ... If no observedAt is present, the
+    /// attribute data with the most recent modifiedAt DateTime shall be
+    /// provided": an old observation beats a newer write that observed
+    /// nothing, whichever source answered first.
+    #[test]
+    fn merge_prefers_an_observed_instance_over_a_newer_unobserved_one() {
+        let attr = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+        let observed = json!({
+            "id": "urn:x", "type": ["T"],
+            attr: [{"type": "Property", "value": "observed",
+                    "observedAt": "2020-01-01T00:00:00Z",
+                    "modifiedAt": "2020-01-01T00:00:00Z"}]
+        });
+        let unobserved = json!({
+            "id": "urn:x", "type": ["T"],
+            attr: [{"type": "Property", "value": "unobserved",
+                    "modifiedAt": "2026-01-01T00:00:00Z"}]
+        });
+        for (first, second) in [(&observed, &unobserved), (&unobserved, &observed)] {
+            let mut base = first.clone();
+            merge_docs(&mut base, second, false);
+            assert_eq!(base[attr][0]["value"], "observed", "{first} then {second}");
+        }
+        // between two observations the later one wins, between two
+        // unobserved instances the later write
+        let mut later = observed.clone();
+        later[attr][0]["observedAt"] = json!("2021-01-01T00:00:00Z");
+        later[attr][0]["value"] = json!("later");
+        let mut base = observed.clone();
+        merge_docs(&mut base, &later, false);
+        assert_eq!(base[attr][0]["value"], "later");
+        let mut newer = unobserved.clone();
+        newer[attr][0]["modifiedAt"] = json!("2027-01-01T00:00:00Z");
+        newer[attr][0]["value"] = json!("newer");
+        let mut base = unobserved.clone();
+        merge_docs(&mut base, &newer, false);
+        assert_eq!(base[attr][0]["value"], "newer");
     }
 
     /// 4.5.5.3: entity-level expiresAt — missing from at least one received

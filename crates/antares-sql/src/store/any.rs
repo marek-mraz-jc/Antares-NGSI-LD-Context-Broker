@@ -1588,14 +1588,17 @@ impl antares_store::TemporalDriver for AnyStore {
                     crate::store::pg::set_tenant(&mut tx, tenant)
                         .await
                         .map_err(db)?;
-                    for table in ["attr_instances", "temporal_entities"] {
-                        sqlx::query(sqlx::AssertSqlSafe(format!(
-                            "DELETE FROM {table} WHERE tenant_id = $1"
-                        )))
-                        .bind(tenant.as_str())
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(db)?;
+                    // whole statements, not a spliced table name: the
+                    // attr_instances tenant-predicate check reads literals
+                    for sql in [
+                        "DELETE FROM attr_instances WHERE tenant_id = $1",
+                        "DELETE FROM temporal_entities WHERE tenant_id = $1",
+                    ] {
+                        sqlx::query(sql)
+                            .bind(tenant.as_str())
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(db)?;
                     }
                     tx.commit().await.map_err(db)
                 }
