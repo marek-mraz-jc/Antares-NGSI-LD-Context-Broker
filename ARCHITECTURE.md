@@ -267,7 +267,14 @@ Stated so they are not rediscovered. Each is measured, not guessed.
   and not field types, so the source-level count is the one to measure: `dev/module-graph.py` prints
   it per crate and `xray.yml` ratchets the largest component of every
   crate against `dev/module-baseline.json` (`antares-jsonld` holds a
-  second one, `context` ↔ `loader`, of two).
+  second one, `context` ↔ `loader`, of two). Three numbers in it are
+  measured, not chosen (T-3602): the gate had never run on this fork, and
+  `antares-api` already held a component of 7 when the baseline said 1; it
+  holds 21 now (`admin_auth` to `views`, the handlers reaching each other
+  through `state` and back), recorded so that it can only shrink.
+  `odata-csdl` holds 3 (`error`, `model`, `validate`) through two doc
+  links alone, `model` and `error` naming `validate` for the reader; its
+  code edges are acyclic.
 - `antares-api` names no storage backend in a normal build: `antares-sql`
   is an optional dependency behind the dev-only `test-kit` and `postgres`
   features (`AppState::new` over the built-in store, the Postgres-backed
@@ -328,9 +335,15 @@ Stated so they are not rediscovered. Each is measured, not guessed.
   rows per federated query on a 10 000-registration registry; the
   `csource_index` needs a type-first shape.
 - Duplication has a measured floor rather than a target of zero.
-  `dev/dup-check.sh` ratchets the workspace at 68 token clones over 805
-  lines (`dev/dup-baseline.json`), 610 of them in `antares-api`, and at 14
-  groups of functions sharing one signature. What the ratchet still allows:
+  `dev/dup-check.sh` ratchets the workspace at 79 token clones over 958
+  lines (`dev/dup-baseline.json`), 727 of them in `antares-api`, at 16
+  groups of functions sharing one signature and at 6 names defined in more
+  than one crate (`from_env`, `from_params`, `of`, `parse`, `parse_q`,
+  `serve`: same word, different job). The floor was 68 over 805 in
+  September; `xray.yml` had no run on this fork since, and once
+  `odata-csdl` landed nightly rustdoc refused its ambiguous `validate`
+  links, so the gate stopped before it measured. T-3602 fixed the links
+  and recorded the numbers as found; from here they can only shrink. What the ratchet still allows:
   - 35 lines are `use` blocks in files serving neighbouring clauses. A
     `use` list is not logic, and a shared prelude would hide what each
     module depends on.

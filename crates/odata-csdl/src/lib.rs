@@ -3,7 +3,7 @@
 //! `odata-csdl`).
 //!
 //! A service builds one [`Model`] and writes it as `$metadata` in either representation; both
-//! writers [`validate`] first, under the caller's [`Limits`], so an invalid or oversized model
+//! writers [`validate`](fn@validate) first, under the caller's [`Limits`], so an invalid or oversized model
 //! is never half written. The subset is ADR-0024 decision 5: entity types (with one abstract
 //! base), complex types, structural and navigation properties, terms, one entity container with
 //! entity sets and navigation property bindings, and annotations whose values are constants,

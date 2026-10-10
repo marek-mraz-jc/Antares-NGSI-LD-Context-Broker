@@ -8,7 +8,6 @@
 use crate::cursor::{count, Cursor};
 use crate::literal::literal;
 use crate::model::{Member, Model};
-use crate::query::annotation;
 use crate::{
     CompareOp, Expr, Feature, LimitKind, Limits, Literal, MemberPath, Method, UrlError,
     UrlErrorKind,
@@ -552,4 +551,35 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
             lambda: Some((variable, Box::new(body))),
         })
     }
+}
+
+/// `annotationInQuery` with its `AT` at `start` already consumed: `@namespace.term`, an
+/// optional `#qualifier` (written `%23`), returned with the `@`.
+pub(crate) fn annotation(c: &mut Cursor<'_>, start: usize) -> Result<String, UrlError> {
+    let mut name = String::from("@");
+    let mut parts = 0_u8;
+    loop {
+        let Some(part) = c.identifier()? else {
+            return Err(c.syntax("annotationInQuery"));
+        };
+        name.push_str(part);
+        parts = parts.saturating_add(1);
+        if !c.eat(".") {
+            break;
+        }
+        name.push('.');
+    }
+    if parts < 2 {
+        // A term without its namespace cannot be told apart; refused like an unknown name.
+        c.reset(start);
+        return Err(c.error(UrlErrorKind::Unresolved));
+    }
+    if c.eat_ci("%23") {
+        let Some(qualifier) = c.identifier()? else {
+            return Err(c.syntax("annotationQualifier"));
+        };
+        name.push('#');
+        name.push_str(qualifier);
+    }
+    Ok(name)
 }

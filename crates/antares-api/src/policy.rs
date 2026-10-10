@@ -1113,7 +1113,7 @@ pub async fn gate(
     }
 }
 
-/// [`gate`] for a batch: the refusal reason of each member, `None` where
+/// [`gate`](fn@gate) for a batch: the refusal reason of each member, `None` where
 /// the member is allowed. A batch writes its members whole, so a `Filter`
 /// on a member is a refusal ([`resolve`]: no batch clause is FILTERABLE).
 pub async fn gate_each(
