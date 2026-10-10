@@ -37,6 +37,9 @@ pub const MAX_COMPOSED_RULES: usize = 4096;
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledView {
     narrowing: Filter,
+    /// The view's id, recorded on what is made through it (a
+    /// Subscription's `__view`, rule 9).
+    id: String,
 }
 
 impl CompiledView {
@@ -87,7 +90,20 @@ impl CompiledView {
                 rules,
                 ..Filter::default()
             },
+            id: String::new(),
         })
+    }
+
+    /// The same view under the id the table serves it as.
+    #[must_use]
+    pub fn named(mut self, id: &str) -> Self {
+        id.clone_into(&mut self.id);
+        self
+    }
+
+    /// The id the table serves the view as; empty for a view never named.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     /// The narrowing this view adds to every operation served through it.
@@ -115,7 +131,7 @@ pub fn with_view(
         // so the view has nothing of its own to narrow there.
         return engine;
     }
-    if CHECKED_WRITES.contains(&clause) {
+    if CHECKED_WRITES.contains(&clause) || SUBSCRIPTIONS.contains(&clause) {
         // Rule 7: the handler checks the view on the stored Entity before
         // and after the write (`WriteGuard`); the engine's own answer
         // still refuses a narrowed write, as it does without a view.
@@ -388,6 +404,60 @@ pub const CHECKED_WRITES: [&str; 13] = [
     "5.6.1", "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.17", "5.6.18", "5.6.19", "5.6.7",
     "5.6.9", "5.6.20", "5.6.10",
 ];
+
+/// The Subscription operations a view serves (rule 9, 5.8.1 to 5.8.5): run
+/// as the root runs them, on the view's own Subscriptions alone, each
+/// stored with the view's id in [`VIEW_MEMBER`].
+pub const SUBSCRIPTIONS: [&str; 5] = ["5.8.1", "5.8.2", "5.8.3", "5.8.4", "5.8.5"];
+
+/// The member a Subscription made through a view records the view's id in,
+/// beside the subject (rule 9). Under the `__` prefix the broker reserves
+/// (ADR-0020): never set by a client, never served.
+pub const VIEW_MEMBER: &str = "__view";
+
+/// Whether the stored Subscription `sub` is the view's own: made through
+/// `view` when there is one, at the root when there is none.
+pub(crate) fn owns(view: Option<&CompiledView>, sub: &serde_json::Value) -> bool {
+    sub.get(VIEW_MEMBER).and_then(serde_json::Value::as_str) == view.map(CompiledView::id)
+}
+
+/// The view a stored Subscription was made through, as the table serves it
+/// to `tenant` now: `None` for one made at the root, `Some(None)` when its
+/// view is no longer loaded for that Tenant (a removed view stops delivery).
+pub(crate) fn of_subscription(
+    st: &crate::state::AppState,
+    tenant: &antares_model::TenantId,
+    sub: &serde_json::Value,
+) -> Option<Option<Arc<CompiledView>>> {
+    let id = sub.get(VIEW_MEMBER)?.as_str().unwrap_or_default();
+    Some(match st.views.snapshot().get(id) {
+        Some(ViewEntry::Loaded {
+            view, tenant: t, ..
+        }) if t == tenant.as_str() => Some(view.clone()),
+        _ => None,
+    })
+}
+
+/// `watchedAttributes` (expanded) as a Subscription through `view` keeps
+/// them: the ones some rule of the view shows (rule 9); `Err` when none is.
+pub(crate) fn watched_in(
+    view: &CompiledView,
+    watched: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, String> {
+    let shown: Vec<String> = crate::repr::type_rules(view.narrowing())
+        .map(|f| f.rules.iter().flat_map(|r| r.attributes.clone()).collect())
+        .unwrap_or_default();
+    let kept: Vec<serde_json::Value> = watched
+        .iter()
+        .filter(|w| w.as_str().is_some_and(|w| shown.iter().any(|s| s == w)))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        Err("watchedAttributes names no Attribute this view shows".into())
+    } else {
+        Ok(kept)
+    }
+}
 
 /// Why a write through a view whose post-image the view would not select is
 /// refused (rule 7). The caller saw the pre-image, so it learns nothing new.

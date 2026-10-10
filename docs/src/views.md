@@ -27,10 +27,11 @@ Tenant:
 | 13.3 | List @contexts: the core context only |
 | 10.2.2 to 10.2.11, but 10.2.12 Purge | Create, Update, Append, Partial Update, Set Value, Delete Attribute, Delete, Merge, Replace Entity, Replace Attribute |
 | 10.3.2, 10.3.4 to 10.3.6 | Batch create, update, merge and delete, member by member |
+| 10.5.2 to 10.5.6 | Create, Update, Retrieve, Query and Delete Subscription |
 
 A view serves an operation only when its `operations` list names it.
 Batch Upsert, Purge and the temporal writes are not served through a
-view; Subscriptions through a view come with T-3499.
+view.
 
 ## 2. What a client sees
 
@@ -69,6 +70,26 @@ same store operation (ADR-0023 rule 7):
   `BatchOperationResult`, `207` when mixed.
 
 A refused write leaves the store as it was.
+
+## 3a. Subscriptions
+
+A Subscription made through a view is stored as the client sent it, with
+the view beside it, and the broker applies the view each time it matches
+and notifies (ADR-0023 rule 9). Narrowing or removing the view takes
+effect on the Subscriptions already made:
+
+- Its conditions read only what the view shows of the Entity now, and an
+  Entity the view does not select does not match.
+- A change only to hidden Attributes sends nothing and leaves `timesSent`
+  and `lastNotification` as they were.
+- A notification carries the shown Attributes only; a hidden Attribute's
+  `previousValue` goes with it.
+- A removed view delivers nothing.
+- `watchedAttributes` keeps only the Attributes the view shows, at create
+  and at update; none left is `400`.
+- Only the view a Subscription was made through reads, lists, updates or
+  deletes it; another view answers `404`. The root sees every
+  Subscription of its Tenant.
 
 ## 4. Refusals
 
