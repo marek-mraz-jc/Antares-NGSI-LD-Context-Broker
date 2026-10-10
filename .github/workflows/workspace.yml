@@ -305,13 +305,15 @@ jobs:
     # antares-api test run 165 s x 7 features, one antares-broker run 69 s x
     # 4): a single job would pass 15 minutes on a runner, a split one stays
     # well under.
-    name: Each feature alone (${{ matrix.crate }})
+    name: Each feature alone (${{ matrix.package }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        crate: [workspace, antares-api, antares-broker, antares-notifier, antares-sql]
+        # `package`, not `crate`: dev/spec.py reads the first `crate:` matrix
+        # as the shared-crates one
+        package: [workspace, antares-api, antares-broker, antares-notifier, antares-sql]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -321,19 +323,19 @@ jobs:
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
-          key: features-${{ matrix.crate }}
+          key: features-${{ matrix.package }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack
       - name: Every crate builds with each of its features alone
-        if: matrix.crate == 'workspace'
+        if: matrix.package == 'workspace'
         run: cargo hack check --locked --workspace --exclude antares-wasm --each-feature --exclude-features console
       - name: Clippy with each feature alone
-        if: matrix.crate != 'workspace'
-        run: cargo hack clippy --locked --each-feature --exclude-features console -p ${{ matrix.crate }} --all-targets -- -D warnings
+        if: matrix.package != 'workspace'
+        run: cargo hack clippy --locked --each-feature --exclude-features console -p ${{ matrix.package }} --all-targets -- -D warnings
       - name: Tests with each feature alone
-        if: matrix.crate != 'workspace'
-        run: cargo hack test --locked --each-feature --exclude-features console -p ${{ matrix.crate }}
+        if: matrix.package != 'workspace'
+        run: cargo hack test --locked --each-feature --exclude-features console -p ${{ matrix.package }}
 
   msrv:
     # The declared rust-version stays PROVEN as stable moves on.
