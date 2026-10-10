@@ -96,6 +96,9 @@ impl CompiledView {
     }
 }
 
+/// List @contexts (13.3, CIM 009 5.13.3).
+const LIST_CONTEXTS: &str = "5.13.3";
+
 /// What `gate!` hands the handler: the engine's answer for `clause`
 /// composed with the view the state carries, if it carries one. Without a
 /// view the answer is the engine's, unchanged.
@@ -107,6 +110,11 @@ pub fn with_view(
     let Some(view) = view else {
         return engine;
     };
+    if clause == LIST_CONTEXTS {
+        // Rule 5: the handler lists the core @context alone under a view,
+        // so the view has nothing of its own to narrow there.
+        return engine;
+    }
     let composed = compose(view.narrowing(), engine?)?;
     match resolve(clause, Decision::Filter(composed)) {
         Decision::Allow => Ok(Filter::default()),
@@ -400,6 +408,19 @@ mod tests {
             attributes: attributes.iter().map(|a| (*a).to_owned()).collect(),
             ..Rule::default()
         }
+    }
+
+    #[test]
+    fn the_context_list_is_the_one_read_a_view_does_not_narrow() {
+        let view = cars();
+        assert_eq!(
+            with_view(Some(&view), LIST_CONTEXTS, Ok(Filter::default())),
+            Ok(Filter::default())
+        );
+        assert!(
+            with_view(Some(&view), "5.13.4", Ok(Filter::default())).is_err(),
+            "serving a stored @context is refused under a view"
+        );
     }
 
     /// Cars only, showing `speed` and `colour`, never `secret`.

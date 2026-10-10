@@ -458,6 +458,8 @@ type SurfaceCtor = fn() -> Box<dyn antares_api::ApiSurface>;
 /// surface would drop out here.
 const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("admin", || Box::new(antares_api::Admin)),
+    #[cfg(feature = "views")]
+    ("views", || antares_ops::mount(antares_views::Views)),
     #[cfg(feature = "plugin-example")]
     ("example", || {
         Box::new(antares_plugin_example::ExampleSurface)
@@ -1650,6 +1652,15 @@ mod api_surface_tests {
         );
     }
 
+    /// The view root is on the shelf of a `views` build, under `/x/views`.
+    #[cfg(feature = "views")]
+    #[test]
+    fn a_views_build_shelves_the_view_root() {
+        assert_eq!(names(Some("admin,views")), vec!["admin", "views"]);
+        let root = api_surfaces(Some("views")).expect("selection")[0].1();
+        assert_eq!(root.prefix(), "/x/views");
+    }
+
     /// An empty selection is fatal too: readiness, health and metrics are
     /// the admin surface, so a pod without one can never report itself up.
     #[test]
@@ -1664,7 +1675,7 @@ mod api_surface_tests {
     /// surface feature the shelf is the admin surface alone, and a path of
     /// every surface prefix (ADR-0023 to ADR-0027) is unrouted. A surface
     /// that lands without its feature gate turns this red.
-    #[cfg(not(any(feature = "plugin-example")))]
+    #[cfg(not(any(feature = "plugin-example", feature = "views")))]
     #[tokio::test]
     async fn the_vanilla_shelf_is_admin_alone() {
         use tower::ServiceExt;

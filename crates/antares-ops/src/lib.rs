@@ -49,7 +49,9 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The policy seam's public types (ADR-0020), so a surface names no
 /// `antares-api` item.
@@ -82,6 +84,20 @@ const LOGGED_DETAIL_BYTES: usize = 4096;
 #[derive(Clone)]
 pub struct Ops {
     state: AppState,
+    /// The narrowed handle of each view served so far, so a request does
+    /// not build the narrowed state and its in-process router anew.
+    views: Arc<Mutex<BTreeMap<String, ViewOps>>>,
+}
+
+/// The operations of one loaded view (ADR-0023): every one runs composed
+/// with the view's narrowing, in the view's one Tenant, and only when the
+/// view allows it. Made by [`Ops::view`].
+#[derive(Clone)]
+pub struct ViewOps {
+    inner: Ops,
+    view: Arc<antares_api::views::CompiledView>,
+    tenant: String,
+    operations: Vec<OperationId>,
 }
 
 /// The headers of the request a surface is answering, as the HTTP layer
@@ -159,6 +175,48 @@ impl OpsRequest {
 }
 
 impl Ops {
+    fn new(state: AppState) -> Self {
+        Self {
+            state,
+            views: Arc::default(),
+        }
+    }
+
+    /// The operations of the loaded view `id`, or `None` when no view of
+    /// that id is loaded: an unknown id, a view that failed validation and
+    /// a removed one are the same answer.
+    #[must_use]
+    pub fn view(&self, id: &str) -> Option<ViewOps> {
+        let table = self.state.views.snapshot();
+        let Some(antares_api::views::ViewEntry::Loaded {
+            view,
+            tenant,
+            operations,
+            ..
+        }) = table.get(id)
+        else {
+            return None;
+        };
+        let mut cache = self.views.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hit) = cache.get(id).filter(|c| Arc::ptr_eq(&c.view, view)) {
+            return Some(hit.clone());
+        }
+        let made = ViewOps {
+            inner: Self::new(self.state.with_view(view.clone())),
+            view: view.clone(),
+            tenant: tenant.clone(),
+            operations: operations
+                .iter()
+                .filter_map(|o| OperationId::from_id(o))
+                .collect(),
+        };
+        // Only views loaded now stay cached: a removed one goes with the
+        // first view served after its removal.
+        cache.retain(|k, _| table.contains_key(k));
+        cache.insert(id.to_owned(), made.clone());
+        Some(made)
+    }
+
     /// Run `op` as the caller of the outer request.
     ///
     /// The request must be the operation it names: its method, path and
@@ -205,6 +263,62 @@ impl Ops {
             });
         }
         Err(inner_failure(op, answer).await)
+    }
+}
+
+impl ViewOps {
+    /// Whether the view allows `op`.
+    #[must_use]
+    pub fn allows(&self, op: OperationId) -> bool {
+        self.operations.contains(&op)
+    }
+
+    /// Run `op` through the view, as [`Ops::run`] does, in the view's
+    /// Tenant (ADR-0023 rule 10): a caller's `NGSILD-Tenant` naming another
+    /// Tenant is refused, never a switch, and the answer names the Tenant
+    /// only to a caller who named it (threat F4/V18).
+    ///
+    /// # Errors
+    /// [`Refusal::NotAllowed`] when the view does not allow `op`,
+    /// [`Refusal::Malformed`] when the caller names another Tenant, and
+    /// everything [`Ops::run`] refuses.
+    pub async fn run(
+        &self,
+        op: OperationId,
+        caller: &Caller,
+        req: OpsRequest,
+    ) -> Result<Response, Refusal> {
+        const TENANT: HeaderName = HeaderName::from_static("ngsild-tenant");
+        const OTHER: &str = "a view serves one tenant";
+        if !self.allows(op) {
+            return Err(Refusal::NotAllowed { allow: Vec::new() });
+        }
+        let mut sent = caller.0.get_all(&TENANT).iter();
+        let named = match (sent.next(), sent.next()) {
+            (None, _) => false,
+            (Some(one), None) => {
+                let same = one
+                    .to_str()
+                    .ok()
+                    .and_then(|t| antares_model::TenantId::new(t).ok())
+                    .is_some_and(|t| t.as_str() == self.tenant);
+                if !same {
+                    return Err(Refusal::Malformed(OTHER));
+                }
+                true
+            }
+            (Some(_), Some(_)) => return Err(Refusal::Malformed(OTHER)),
+        };
+        let mut headers = caller.0.clone();
+        headers.insert(
+            TENANT,
+            HeaderValue::from_str(&self.tenant).map_err(|_| Refusal::Malformed(OTHER))?,
+        );
+        let mut answer = self.inner.run(op, &Caller(headers), req).await?;
+        if !named {
+            answer.headers_mut().remove(TENANT);
+        }
+        Ok(answer)
     }
 }
 
@@ -287,7 +401,7 @@ impl<S: Surface> antares_api::ApiSurface for Mounted<S> {
         // The first state it is mounted on is the one /q/health reports.
         let _ = self.views.set(table.clone());
         self.surface
-            .router(Ops { state: st })
+            .router(Ops::new(st))
             .layer(axum::middleware::from_fn(
                 move |req: axum::extract::Request, next: axum::middleware::Next| {
                     let open = table.any_loaded();

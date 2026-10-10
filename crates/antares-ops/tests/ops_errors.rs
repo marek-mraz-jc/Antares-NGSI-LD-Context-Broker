@@ -266,6 +266,7 @@ fn every_refusal_renders_with_its_status_and_no_echo() {
             },
             405,
         ),
+        (Refusal::NotSupported, 422),
         (Refusal::Denied("no".into()), 403),
         (Refusal::Malformed("bad"), 400),
         (Refusal::Limit("too many"), 413),
