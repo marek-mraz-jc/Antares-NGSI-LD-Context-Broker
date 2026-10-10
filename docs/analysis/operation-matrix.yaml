@@ -1,4 +1,4 @@
-# Generated for T-3437; schema in operation-matrix.md section 3.
+# Generated for T-3437; schema in operation-matrix.md section 3. Revised with T-3441 section 11.
 schema_version: 1
 generated_for: T-3437
 sources:
@@ -63,7 +63,8 @@ operations:
       gate_site: crates/antares-api/src/entities.rs:114
     odata:
       status: supported
-      binding: POST /x/views/{view}/odata/v4/{EntitySet} (Protocol 11.4.2); deep insert 11.4.2.2
+      binding: POST /x/views/{view}/odata/v4/{EntitySet} (Protocol 11.4.2), with single-valued binds (11.4.2.1,
+        T-3441 W1, W2); deep insert (11.4.2.2) is rejected 501 (W3)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -75,9 +76,6 @@ operations:
         filterable: false
         whole_tenant: false
         linked_entity_checks:
-        - 'deep insert: each nested Entity is its own Create Entity (10.2.2) under the view, the parent''s relationship
-          attribute is a relationship write; OData 11.4.2.2 is all-or-nothing, so every gate is decided before the
-          first write'
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: the id does not exist in the tenant; the engine allows the expanded body (types, attrs); a Filter
@@ -185,7 +183,9 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:140
     odata:
       status: supported
-      binding: POST|PUT|DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref (Protocol 11.4.6.1-11.4.6.3)
+      binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3); collection-valued $ref add/remove
+        rejected 501 (T-3441 W18, W19); single-valued $ref moved to append_attributes/delete_attribute, replace-all
+        to replace_attribute
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -298,14 +298,17 @@ operations:
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.4.3.1.md
       gate_site: crates/antares-api/src/attrs.rs:140
     odata:
-      status: not_offered
-      binding: null
+      status: supported
+      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref, single-valued (Protocol 11.4.6.3, T-3441
+        W16)
       checks:
         adr0020_phase: none
         operation_fields: []
         filterable: false
         whole_tenant: false
-        linked_entity_checks: []
+        linked_entity_checks:
+        - 'relationship write: the target named by @id is visible under the view AND the relationship attribute
+          is writable under the view'
     mcp:
       status: supported
       binding: append_attributes (proposal)
@@ -507,8 +510,8 @@ operations:
         no CIM 009 clause and no gate clause string yet'
     odata:
       status: not_offered
-      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property}/$value (Protocol 11.4.9) would map here once the HTTP
-        route exists
+      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property}/$value (Protocol 11.4.9) would map here
+        once the HTTP route exists
       checks:
         adr0020_phase: none
         operation_fields: []
@@ -588,8 +591,9 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:1081
     odata:
       status: supported
-      binding: DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9; OData sets it to null, the mapping
-        to Delete Attribute is a proposal)
+      binding: DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9; OData sets it to
+        null, the mapping to Delete Attribute is a proposal); also DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{prop}/$value
+        and single-valued DELETE .../{nav}/$ref (T-3441 W13, W17)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -804,8 +808,8 @@ operations:
       gate_site: crates/antares-api/src/entities.rs:1760
     odata:
       status: supported
-      binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3); upsert on a missing key (11.4.4) is refused,
-        not a create
+      binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3); upsert on a missing key (11.4.4)
+        is refused, not a create
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1051,7 +1055,8 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:934
     odata:
       status: supported
-      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9)
+      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9); also PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref
+        replacing the whole collection (T-3441 W20)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1256,8 +1261,8 @@ operations:
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.7.3.1.md
       gate_site: crates/antares-api/src/batch.rs:672
     odata:
-      status: supported
-      binding: POST /x/views/{view}/odata/v4/$batch (Protocol 11.7) with one POST per member, each mapped to create_entity
+      status: not_offered
+      binding: OData $batch members map to the single-Entity rows, each its own gate (T-3441 W24)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1721,8 +1726,8 @@ operations:
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.11.3.1.md
       gate_site: crates/antares-api/src/batch.rs:1146
     odata:
-      status: supported
-      binding: POST /x/views/{view}/odata/v4/$batch with one DELETE per member (Protocol 11.7)
+      status: not_offered
+      binding: OData $batch members map to the single-Entity rows, each its own gate (T-3441 W24)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1825,7 +1830,8 @@ operations:
       gate_site: crates/antares-api/src/entities.rs:270
     odata:
       status: supported
-      binding: GET /x/views/{view}/odata/v4/{EntitySet}('{id}') with $select (URL 5.1.4) and $expand (URL 5.1.3)
+      binding: GET /x/views/{view}/odata/v4/{EntitySet}('{id}') with $select (URL 5.1.4) and $expand (URL 5.1.3);
+        also /x/views/{view}/odata/v4/$entity?$id= (Q23), related entities (Q32) and $ref reads (Q33)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1914,8 +1920,9 @@ operations:
       gate_site: crates/antares-api/src/entities.rs:567
     odata:
       status: supported
-      binding: GET /x/views/{view}/odata/v4/{EntitySet} with $filter (5.1.2), $select (5.1.4), $orderby (5.1.5), $top/$skip (5.1.6),
-        $count (5.1.7), $expand (5.1.3); GET /{EntitySet}/$count (URL 4.8)
+      binding: GET /x/views/{view}/odata/v4/{EntitySet} with $filter (5.1.2), $select (5.1.4), $orderby (5.1.5),
+        $top/$skip (5.1.6), $count (5.1.7), $expand (5.1.3); GET /{EntitySet}/$count (URL 4.8); also POST /x/views/{view}/odata/v4/{EntitySet}/$query
+        run as GET /entities (T-3441 Q22); $expand gated on T-3470, navigation paths in $filter on T-3474
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -5962,8 +5969,9 @@ odata_without_ngsi_ld_operation:
   kind: read
   surfaces:
     odata:
-      status: rejected
-      binding: query option $schemaversion
+      status: supported
+      binding: $schemaversion=* or the current Core.SchemaVersion is accepted (no-op); any other value 501 (T-3441
+        Q18)
       http_status: 501
       odata_error:
         code: NotImplemented
@@ -6174,10 +6182,10 @@ odata_without_ngsi_ld_operation:
     odata:
       status: rejected
       binding: PATCH|PUT /{EntitySet}('{new-id}')
-      http_status: 501
+      http_status: 404
       odata_error:
-        code: NotImplemented
-        message: 'upsert by PATCH/PUT on a missing key is not offered: no NGSI-LD operation stands behind it'
+        code: NotFound
+        message: no entity with this key in the view
       checks:
         adr0020_phase: none
         operation_fields: []
@@ -6199,6 +6207,297 @@ odata_without_ngsi_ld_operation:
       odata_error:
         code: NotImplemented
         message: 'derived type cast segments is not offered: no NGSI-LD operation stands behind it'
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_expand_options
+  odata_feature: options inside $expand(...) other than $select and $expand
+  odata_section: URL Conventions 5.1.3
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: options inside $expand(...) other than $select and $expand
+      http_status: 501
+      odata_error:
+        code: NotImplemented
+        message: options inside $expand(...) other than $select and $expand is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_deltatoken
+  odata_feature: $deltatoken
+  odata_section: Protocol 11.3
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: $deltatoken
+      http_status: 501
+      odata_error:
+        code: NotImplemented
+        message: $deltatoken is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_root
+  odata_feature: $root
+  odata_section: URL Conventions 5.1.1.14.5
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: $root
+      http_status: 501
+      odata_error:
+        code: NotImplemented
+        message: $root is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_it_this
+  odata_feature: $it, $this
+  odata_section: URL Conventions 5.1.1.14.4, 5.1.1.14.6
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: $it, $this
+      http_status: 501
+      odata_error:
+        code: NotImplemented
+        message: $it, $this is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_custom_option
+  odata_feature: custom query options
+  odata_section: URL Conventions 5.2
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: custom query options
+      http_status: 400
+      odata_error:
+        code: BadRequest
+        message: custom query options is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_filter_segment
+  odata_feature: /$filter(...) path segment
+  odata_section: URL Conventions 4.12
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: /$filter(...) path segment
+      http_status: 501
+      odata_error:
+        code: NotImplemented
+        message: /$filter(...) path segment is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_ordinal
+  odata_feature: member of an ordered collection /{prop}/{n}
+  odata_section: URL Conventions 4.10
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: member of an ordered collection /{prop}/{n}
+      http_status: 501
+      odata_error:
+        code: NotImplemented
+        message: member of an ordered collection /{prop}/{n} is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_deep_update
+  odata_feature: deep update (nested entities or delta in PATCH/PUT)
+  odata_section: Protocol 11.4.3.1
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: deep update (nested entities or delta in PATCH/PUT)
+      http_status: 501
+      odata_error:
+        code: NotImplemented
+        message: deep update (nested entities or delta in PATCH/PUT) is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_collection_append
+  odata_feature: POST to a collection property, positional insert
+  odata_section: Protocol 11.4.10, 11.4.11
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: POST to a collection property, positional insert
+      http_status: 501
+      odata_error:
+        code: NotImplemented
+        message: POST to a collection property, positional insert is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_delete_collection
+  odata_feature: DELETE /{EntitySet} without a key
+  odata_section: Protocol 11.4.5
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: DELETE /{EntitySet} without a key
+      http_status: 405
+      odata_error:
+        code: MethodNotAllowed
+        message: DELETE /{EntitySet} without a key is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_batch_references
+  odata_feature: Content-ID references in $batch
+  odata_section: Protocol 11.7.7.2
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: Content-ID references in $batch
+      http_status: 501
+      odata_error:
+        code: NotImplemented
+        message: Content-ID references in $batch is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_conditional_write
+  odata_feature: If-Match / If-None-Match on a write
+  odata_section: Protocol 11.4.1.1
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: If-Match / If-None-Match on a write
+      http_status: 501
+      odata_error:
+        code: NotImplemented
+        message: If-Match / If-None-Match on a write is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_write_readonly
+  odata_feature: a write method on /, /$metadata, /$count, /$query
+  odata_section: Protocol 11.1
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: rejected
+      binding: a write method on /, /$metadata, /$count, /$query
+      http_status: 405
+      odata_error:
+        code: MethodNotAllowed
+        message: a write method on /, /$metadata, /$count, /$query is not offered (T-3441)
+      checks:
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
+        whole_tenant: false
+        linked_entity_checks: []
+      note: refused before any gate or store access
+- id: odata_query_segment
+  odata_feature: POST <resource>/$query
+  odata_section: URL Conventions 4.17
+  ts104175: null
+  cim009: null
+  kind: read
+  surfaces:
+    odata:
+      status: supported
+      binding: POST /x/views/{view}/odata/v4/{EntitySet}/$query, body parsed as the query string, executed as query_entities
+        (GET form)
       checks:
         adr0020_phase: none
         operation_fields: []
