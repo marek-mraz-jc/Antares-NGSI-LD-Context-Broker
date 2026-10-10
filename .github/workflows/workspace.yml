@@ -445,6 +445,29 @@ jobs:
       - name: 100 % lines and branches, minus the listed exclusions
         run: python3 dev/coverage-gate.py
 
+  odata-csdl-conformance:
+    # The `$metadata` odata-csdl writes, against the OASIS artefacts pinned by
+    # ADR-0024 decision 6 (fetched with a checksum, never vendored): edmx.xsd
+    # via xmllint, csdl.schema.json via ajv, the OASIS xml2json converter, and
+    # every annotation term against the pinned vocabularies (T-3502).
+    name: OData CSDL against the OASIS schemas
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+          key: odata-csdl-conformance
+      - name: xmllint
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libxml2-utils
+      - name: Schemas, converter and vocabulary terms
+        run: python3 dev/odata-csdl-conformance.py
+
   msrv:
     # The declared rust-version stays PROVEN as stable moves on.
     name: MSRV check (1.97)
