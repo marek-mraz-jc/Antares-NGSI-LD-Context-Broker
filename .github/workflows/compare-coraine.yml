@@ -1,0 +1,66 @@
+name: compare-coraine
+
+# Antares against Coraine (SEAMWARE/coraine) on one GitHub-hosted runner:
+# footprint, start to first answer and the T-3467 request shapes, both
+# brokers measured by the same script in the same job (T-3548,
+# docs/analysis/coraine-comparison.md). A hosted runner swings 20-30 % run
+# to run, so the numbers are read side by side within one run, never across
+# runs. The repository is public, so the minutes are free and no shared
+# host is loaded.
+#
+# Runs when the rig changes, and by hand (another Coraine tag via input).
+
+on:
+  workflow_dispatch:
+    inputs:
+      coraine_image:
+        description: Coraine image to compare against (pinned tag, no latest exists)
+        default: quay.io/seamware/coraine:0.5.0@sha256:a102b7c7992f60e4b9f2885d4bef9099acf73613b489c4254cc5b7a32de93a6e
+  push:
+    paths:
+      - dev/perf/compare-coraine.sh
+      - dev/perf/k6-shapes.js
+      - .github/workflows/compare-coraine.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compare-coraine-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: always
+      CORAINE_IMAGE: ${{ inputs.coraine_image || 'quay.io/seamware/coraine:0.5.0@sha256:a102b7c7992f60e4b9f2885d4bef9099acf73613b489c4254cc5b7a32de93a6e' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install k6
+        run: |
+          curl -sL https://github.com/grafana/k6/releases/download/v0.54.0/k6-v0.54.0-linux-amd64.tar.gz \
+            | tar xz --strip-components=1
+          sudo mv k6 /usr/local/bin/
+      - name: Build Antares (release, default features)
+        run: cargo build --locked --release -p antares-broker
+      - name: Pull Coraine
+        run: docker pull "$CORAINE_IMAGE" && docker image inspect "$CORAINE_IMAGE" --format '{{.Id}} {{.Size}}'
+      - name: Compare
+        run: BIN=$PWD/target/release/antares OUT=results/coraine dev/perf/compare-coraine.sh
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Antares ${GITHUB_SHA::7} vs $CORAINE_IMAGE on $(nproc) vCPU, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2)"
+            cat results/coraine/footprint.md results/coraine/shapes.md 2>/dev/null || echo "(no results)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: compare-coraine
+          path: results/coraine
+          retention-days: 90
