@@ -67,12 +67,14 @@ pub struct CompiledSql {
     pub binds: Vec<String>,
 }
 
-/// Compile `node` into a SQL predicate over column `col` (a `jsonb`).
+/// Compile `node` into a SQL predicate over column `col` (a `jsonb`). `col`
+/// is SQL text, so it is `'static`: a column the caller names in its own
+/// code, never a string a request carried (T-3464).
 /// `first_bind` is the 1-based number of the next free placeholder.
 /// `None` = this expression is outside the exact subset; filter in memory.
 pub fn compile_q(
     node: &QNode,
-    col: &str,
+    col: &'static str,
     first_bind: usize,
     expand: &dyn Fn(&str) -> String,
 ) -> Option<CompiledSql> {
@@ -88,7 +90,7 @@ pub fn compile_q(
 /// `cmp = None` is the existence form.
 pub fn compile_instance_leaf(
     cmp: Option<(CmpOp, &QValue)>,
-    col: &str,
+    col: &'static str,
     first: usize,
 ) -> Option<CompiledSql> {
     let mut binds = Vec::new();
@@ -98,7 +100,7 @@ pub fn compile_instance_leaf(
 
 fn emit(
     node: &QNode,
-    col: &str,
+    col: &'static str,
     first: usize,
     expand: &dyn Fn(&str) -> String,
     binds: &mut Vec<String>,
@@ -136,7 +138,7 @@ fn emit(
 fn join(
     items: &[QNode],
     sep: &str,
-    col: &str,
+    col: &'static str,
     first: usize,
     expand: &dyn Fn(&str) -> String,
     binds: &mut Vec<String>,
@@ -157,7 +159,7 @@ fn join(
 fn value_or(
     prefix: &str,
     cmp: Option<(CmpOp, &QValue)>,
-    col: &str,
+    col: &'static str,
     first: usize,
     binds: &mut Vec<String>,
 ) -> Option<String> {
@@ -179,7 +181,7 @@ fn value_or(
 pub fn value_or_filter(
     prefix: &str,
     filter: Option<&str>,
-    col: &str,
+    col: &'static str,
     first: usize,
     binds: &mut Vec<String>,
 ) -> String {

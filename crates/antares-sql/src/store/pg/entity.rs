@@ -499,36 +499,47 @@ impl PgEntityStore {
         let mut decided = true;
 
         if let Some(ids) = f.ids {
-            binds.push(Bind::TextArr(ids.iter().map(|s| s.to_string()).collect()));
+            binds.push(Bind::TextArr(super::storable(ids)));
             wheres.push(format!("id = ANY(${})", binds.len()));
         }
         // 5.2.33 idPattern: the literal the regex forces is a plain string
         // test on the id column, exact as a narrowing; the regex itself stays
         // with the caller, so `decided` is untouched.
         if let Some(l) = f.id_literal {
-            binds.push(Bind::Text(l.text.to_owned()));
-            wheres.push(if l.anchored {
-                format!("starts_with(id, ${})", binds.len())
+            if l.text.contains('\0') {
+                // no stored id holds a NUL (`storable`)
+                wheres.push("false".to_owned());
             } else {
-                format!("position(${} in id) > 0", binds.len())
-            });
+                binds.push(Bind::Text(l.text.to_owned()));
+                wheres.push(if l.anchored {
+                    format!("starts_with(id, ${})", binds.len())
+                } else {
+                    format!("position(${} in id) > 0", binds.len())
+                });
+            }
         }
         // OR of AND-groups, mirroring the Entity Type Selection Language
         // (4.17) the caller already parsed: `types @> ARRAY[…]` per group.
         if let Some(groups) = f.types {
             let mut ors = Vec::with_capacity(groups.len());
-            for g in groups {
+            // a group naming a type with a NUL needs a type no entity has
+            for g in groups
+                .iter()
+                .filter(|g| super::storable(g).len() == g.len())
+            {
                 binds.push(Bind::TextArr(g.clone()));
                 ors.push(format!("types @> ${}", binds.len()));
             }
             if !ors.is_empty() {
                 wheres.push(format!("({})", ors.join(" OR ")));
+            } else if !groups.is_empty() {
+                wheres.push("false".to_owned());
             }
         }
         // `attrs`: the entity carries at least one of them — jsonb `?|`,
         // exactly the evaluator's `any(|a| doc.get(a).is_some())`.
         if let Some(attrs) = f.attrs {
-            binds.push(Bind::TextArr(attrs.to_vec()));
+            binds.push(Bind::TextArr(super::storable(attrs)));
             wheres.push(format!("entity ?| ${}", binds.len()));
         }
         if let Some(node) = f.q {
@@ -581,7 +592,7 @@ impl PgEntityStore {
         let mut select = "entity".to_owned();
         if decided {
             if let Some(keep) = f.keep_attrs {
-                binds.push(Bind::TextArr(keep.to_vec()));
+                binds.push(Bind::TextArr(super::storable(keep)));
                 select = format!(
                     "(SELECT COALESCE(jsonb_object_agg(t.k, t.v), '{{}}'::jsonb) \
                       FROM jsonb_each(entity) AS t(k, v) \
@@ -589,7 +600,7 @@ impl PgEntityStore {
                     binds.len()
                 );
             } else if let Some(drop) = f.drop_attrs {
-                binds.push(Bind::TextArr(drop.to_vec()));
+                binds.push(Bind::TextArr(super::storable(drop)));
                 select = format!(
                     "(SELECT COALESCE(jsonb_object_agg(t.k, t.v), '{{}}'::jsonb) \
                       FROM jsonb_each(entity) AS t(k, v) \

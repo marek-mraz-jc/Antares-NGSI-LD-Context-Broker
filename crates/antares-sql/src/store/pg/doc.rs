@@ -805,10 +805,10 @@ impl PgDocStore {
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.clone())).bind(tenant.as_str());
         if let Some(types) = types {
-            q = q.bind(types);
+            q = q.bind(super::storable(types));
         }
         if let Some(ids) = ids {
-            q = q.bind(ids);
+            q = q.bind(super::storable(ids));
         }
         let rows = q.bind(MAX_UNDECIDED_ROWS).fetch_all(&mut *tx).await?;
         tx.commit().await?;

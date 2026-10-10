@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [parse_q, scope_q, geo_params, expand_entity]
+        target: [parse_q, scope_q, geo_params, expand_entity, q_to_sql]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly

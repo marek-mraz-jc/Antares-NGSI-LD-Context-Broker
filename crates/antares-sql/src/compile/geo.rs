@@ -49,7 +49,11 @@ pub use antares_store::filter::{GeoSpec, Rel, LOCATION_IRI};
 /// A `geoproperty` other than the default `location` has no extracted column,
 /// so it returns `None` and the evaluator does the work (the documented
 /// fallback). `first_bind` numbers the geo binds; numeric binds follow them.
-pub fn compile_geo(spec: &GeoSpec<'_>, col: &str, first_bind: usize) -> Option<CompiledGeo> {
+pub fn compile_geo(
+    spec: &GeoSpec<'_>,
+    col: &'static str,
+    first_bind: usize,
+) -> Option<CompiledGeo> {
     if !spec.geoproperty_iri.is_empty() && spec.geoproperty_iri != LOCATION_IRI {
         return None;
     }
@@ -70,7 +74,7 @@ pub fn compile_geo(spec: &GeoSpec<'_>, col: &str, first_bind: usize) -> Option<C
 /// restriction: the caller binds the attr IRI itself.
 pub fn compile_geo_instance(
     spec: &GeoSpec<'_>,
-    col: &str,
+    col: &'static str,
     first_bind: usize,
 ) -> Option<CompiledGeo> {
     let mut c = predicate(spec, col, first_bind)?;
