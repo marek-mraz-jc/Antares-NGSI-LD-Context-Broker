@@ -1325,11 +1325,11 @@ operations:
           one per-entity error)'
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
-      pre_image: 'per Entity: as create_entity; one gate call for the whole array today (ids of every member)'
+      pre_image: 'per Entity: as create_entity; one decision per member (decide_each), a refused member is a 403 in E (T-3480)'
       post_image: 'per Entity: as create_entity [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.7.3.1.md
-      gate_site: crates/antares-api/src/batch.rs:687
+      gate_site: crates/antares-api/src/batch.rs:747
     odata:
       status: not_offered
       binding: OData $batch members map to the single-Entity rows, each its own gate (T-3441 W24)
@@ -1412,10 +1412,9 @@ operations:
       pre_image: 'per Entity: as create_entity; one gate call for the whole array today (ids of every member)'
       post_image: 'per Entity: as create_entity [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
-  pre_image: 'per Entity: as create_entity; one gate call for the whole array today (ids of every member)'
+  pre_image: 'per Entity: as create_entity; one decision per member (decide_each), a refused member is a 403 in E (T-3480)'
   post_image: 'per Entity: as create_entity [not enforced today: the Operation carries no stored image, the engine
     decides on clause, ids, types (stored and named), attrs, body]'
-  gaps: one decision covers all members, so an engine cannot deny one member and allow the rest (T-3480)
 - id: batch_upsert
   ts104175: 10.3.3
   cim009: 5.6.8
@@ -1439,6 +1438,7 @@ operations:
         - ids
         - types
         - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1452,7 +1452,7 @@ operations:
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.8.3.1.md
-      gate_site: crates/antares-api/src/batch.rs:687
+      gate_site: crates/antares-api/src/batch.rs:747
     odata:
       status: not_offered
       binding: null
@@ -1555,6 +1555,7 @@ operations:
         - ids
         - types
         - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1568,7 +1569,7 @@ operations:
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.9.3.1.md
-      gate_site: crates/antares-api/src/batch.rs:687
+      gate_site: crates/antares-api/src/batch.rs:747
     odata:
       status: not_offered
       binding: null
@@ -1668,6 +1669,7 @@ operations:
         - ids
         - types
         - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1681,7 +1683,7 @@ operations:
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.10.3.1.md
-      gate_site: crates/antares-api/src/batch.rs:687
+      gate_site: crates/antares-api/src/batch.rs:747
     odata:
       status: rejected
       binding: 'PATCH /x/views/{view}/odata/v4/{EntitySet} with a delta payload (Protocol 11.4.12): 501'
@@ -1786,6 +1788,7 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1797,7 +1800,7 @@ operations:
         decides on ids/clause only]'
       post_image: 'per Entity: absent'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.11.3.1.md
-      gate_site: crates/antares-api/src/batch.rs:1146
+      gate_site: crates/antares-api/src/batch.rs:1252
     odata:
       status: not_offered
       binding: OData $batch members map to the single-Entity rows, each its own gate (T-3441 W24)
@@ -2106,7 +2109,7 @@ operations:
           repr.rs:841-846 lookup_joined and repr.rs:1047 collect_flat_walk read the target with store.get); the
           policy projection (omit/pick) travels down the walk (enforced, ADR-0020; test a_join_does_not_carry_a_narrowed_member_out_of_the_answer)'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.12.3.1.md
-      gate_site: crates/antares-api/src/batch.rs:1377
+      gate_site: crates/antares-api/src/batch.rs:1481
     odata:
       status: not_offered
       binding: null

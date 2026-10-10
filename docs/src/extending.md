@@ -156,9 +156,15 @@ projecting the entities it carries.
 The `Operation` an engine is given names the clause, the ids, types and
 attributes the request selects, its `q`, `scopeQ` and geo query, and a
 write's body — every name already expanded, so an engine never has to
-carry a JSON-LD context. A batch is one operation carrying every Entity id
-its array names, asked once before any item is written, so a rule written
-over ids reaches the same verdict whichever surface the caller used. The
+carry a JSON-LD context. A batch is decided member by member through
+`decide_each`, before any item is written: each member is the Operation its
+single-Entity write would be (its id, its stored and named types, its
+Attributes, its body), so a rule reaches the same verdict whichever surface
+the caller used. A refused member is reported in the batch's `errors` with
+the AccessDenied problem and the others are applied (`207`); a batch refused
+whole is a `403`. The default `decide_each` calls `decide` per member; an
+engine that asks a server overrides it to ask once, and an answer of the
+wrong length denies the whole batch. The
 same holds for the resources that are not Entities: a Subscription, a
 Context Source Registration, a Snapshot, an EntityMap or a stored
 `@context` is named by its own id, whether the request carries it in the

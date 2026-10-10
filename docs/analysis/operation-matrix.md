@@ -169,14 +169,14 @@ Paths are relative to `/ngsi-ld/v1`; HEAD is served by every GET route (axum `ge
 | `replace_entity` | 10.2.10 | 5.6.18 | write | `PUT /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.3.md) | 5.6.18 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/entities.rs:2233 |
 | `replace_attribute` | 10.2.11 | 5.6.19 | write | `PUT /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}` (ts-104176-ngsi-ld-http-binding/7/7.5.3.3.md) | 5.6.19 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/attrs.rs:970 |
 | `purge_entities` | 10.2.12 | 5.6.21 | write | `DELETE /ngsi-ld/v1/entities` (ts-104176-ngsi-ld-http-binding/7/7.2.3.3.md) | 5.6.21 | clause, scope_q | on_request | no | yes | crates/antares-api/src/entities.rs:1579 |
-| `batch_create` | 10.3.2 | 5.6.7 | write | `POST /ngsi-ld/v1/entityOperations/create` (ts-104176-ngsi-ld-http-binding/7/7.7.3.1.md) | 5.6.7 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/batch.rs:687 |
-| `batch_upsert` | 10.3.3 | 5.6.8 | write | `POST /ngsi-ld/v1/entityOperations/upsert` (ts-104176-ngsi-ld-http-binding/7/7.8.3.1.md) | 5.6.8 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/batch.rs:687 |
-| `batch_update` | 10.3.4 | 5.6.9 | write | `POST /ngsi-ld/v1/entityOperations/update` (ts-104176-ngsi-ld-http-binding/7/7.9.3.1.md) | 5.6.9 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/batch.rs:687 |
-| `batch_merge` | 10.3.5 | 5.6.20 | write | `POST /ngsi-ld/v1/entityOperations/merge` (ts-104176-ngsi-ld-http-binding/7/7.10.3.1.md) | 5.6.20 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/batch.rs:687 |
-| `batch_delete` | 10.3.6 | 5.6.10 | write | `POST /ngsi-ld/v1/entityOperations/delete` (ts-104176-ngsi-ld-http-binding/7/7.11.3.1.md) | 5.6.10 | clause, ids | on_request | no | no | crates/antares-api/src/batch.rs:1146 |
+| `batch_create` | 10.3.2 | 5.6.7 | write | `POST /ngsi-ld/v1/entityOperations/create` (ts-104176-ngsi-ld-http-binding/7/7.7.3.1.md) | 5.6.7 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/batch.rs:747 |
+| `batch_upsert` | 10.3.3 | 5.6.8 | write | `POST /ngsi-ld/v1/entityOperations/upsert` (ts-104176-ngsi-ld-http-binding/7/7.8.3.1.md) | 5.6.8 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/batch.rs:747 |
+| `batch_update` | 10.3.4 | 5.6.9 | write | `POST /ngsi-ld/v1/entityOperations/update` (ts-104176-ngsi-ld-http-binding/7/7.9.3.1.md) | 5.6.9 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/batch.rs:747 |
+| `batch_merge` | 10.3.5 | 5.6.20 | write | `POST /ngsi-ld/v1/entityOperations/merge` (ts-104176-ngsi-ld-http-binding/7/7.10.3.1.md) | 5.6.20 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/batch.rs:747 |
+| `batch_delete` | 10.3.6 | 5.6.10 | write | `POST /ngsi-ld/v1/entityOperations/delete` (ts-104176-ngsi-ld-http-binding/7/7.11.3.1.md) | 5.6.10 | clause, ids, types | on_request | no | no | crates/antares-api/src/batch.rs:1252 |
 | `retrieve_entity` | 10.4.2 | 5.7.1 | read | `GET /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.1.md) | 5.7.1 | clause, ids, types, attrs | on_request | yes | no | crates/antares-api/src/entities.rs:271 |
 | `query_entities` | 10.4.3 | 5.7.2 | read | `GET /ngsi-ld/v1/entities` (ts-104176-ngsi-ld-http-binding/7/7.2.3.1.md) | 5.7.2 | clause, types, attrs, q, scope_q, geo | on_request | yes | no | crates/antares-api/src/entities.rs:565 |
-| `query_entities_post` | 10.4.3 | 5.7.2 | read | `POST /ngsi-ld/v1/entityOperations/query` (ts-104176-ngsi-ld-http-binding/7/7.12.3.1.md) | 5.7.2 | clause, types, attrs, q, scope_q, geo | on_request | yes | no | crates/antares-api/src/batch.rs:1377 |
+| `query_entities_post` | 10.4.3 | 5.7.2 | read | `POST /ngsi-ld/v1/entityOperations/query` (ts-104176-ngsi-ld-http-binding/7/7.12.3.1.md) | 5.7.2 | clause, types, attrs, q, scope_q, geo | on_request | yes | no | crates/antares-api/src/batch.rs:1481 |
 | `retrieve_attribute_value` | 10.4.4 | null | read | `GET /ngsi-ld/v1/entities/{entityId}/attrs/{attrId} and .../attrs/{attrId}/value` (ts-104176-ngsi-ld-http-binding/7/7.5.3.1.md, 7/7.6.3.1.md) | 5.7.1 | clause, ids, attrs | on_request | yes | no | crates/antares-api/src/entities.rs:2441 |
 | `create_subscription` | 10.5.2 | 5.8.1 | subscription | `POST /ngsi-ld/v1/subscriptions` (ts-104176-ngsi-ld-http-binding/7/7.13.3.2.md) | 5.8.1 | clause, ids, types, attrs, q, scope_q, geo | on_request | no | no | crates/antares-api/src/subscriptions.rs:820 |
 | `update_subscription` | 10.5.3 | 5.8.2 | subscription | `PATCH /ngsi-ld/v1/subscriptions/{subscriptionId}` (ts-104176-ngsi-ld-http-binding/7/7.14.3.2.md) | 5.8.2 | clause, ids | on_request | no | no | crates/antares-api/src/subscriptions.rs:962 |
@@ -327,12 +327,11 @@ The seam can only judge what it is given. These handlers leave members empty tha
 | id | TS 104 175 | gap |
 |---|---|---|
 | `create_entity` | 10.2.2 | 409 AlreadyExists on an id that exists but is out of view is an existence oracle |
-| `batch_create` | 10.3.2 | one decision covers all members, so an engine cannot deny one member and allow the rest (T-3480) |
 | `batch_upsert` | 10.3.3 | an upsert on an existing out-of-view id must not become an overwrite: the engine needs the pre-image to decide |
 | `query_subscriptions` | 10.5.5 | not FILTERABLE: an engine cannot narrow the list to the caller's own Subscriptions, only allow or deny all |
 | `query_registrations` | 12.3.3 | not FILTERABLE |
 
-`batch_create` to `batch_merge` share one gate call for the whole array (`crates/antares-api/src/batch.rs:687`, `ids: &gate_ids`), so an engine answers once for every member: it cannot deny one member and let the others through. The yaml's `batch` linked check ("each Entity of the array is its own single-Entity operation") is the target, not the current behaviour.
+`batch_create` to `batch_delete` ask the engine once per member through `PolicyEngine::decide_each` (`crates/antares-api/src/batch.rs:747`, `:1252`): each member is shown its id, its types (stored and named), its Attributes and its expanded body, a refused member is reported in E with the AccessDenied problem and the others are applied (207); a batch refused whole is answered 403 (T-3480).
 
 ## 6. Write rows: pre-image, post-image and linked-entity checks
 
