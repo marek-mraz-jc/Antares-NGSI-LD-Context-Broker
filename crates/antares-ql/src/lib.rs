@@ -609,9 +609,12 @@ impl<'a> Parser<'a> {
         match raw {
             "true" => Ok(QValue::Bool(true)),
             "false" => Ok(QValue::Bool(false)),
+            // RFC 8259 section 6 lets a receiver limit the range: a Number
+            // past f64 is refused, as serde_json refuses it in a body, so no
+            // comparison runs against a value no Entity can hold
             _ if is_json_number(raw) => match raw.parse::<f64>() {
-                Ok(n) => Ok(QValue::Num(n)),
-                Err(_) => Ok(QValue::Str(raw.to_owned())),
+                Ok(n) if n.is_finite() => Ok(QValue::Num(n)),
+                _ => Err(bad(raw, "Number is out of range (RFC 8259 section 6)")),
             },
             // the other unquoted alternatives: a URI, a dateTime, a date or a
             // time, all of them compared as text
@@ -690,6 +693,28 @@ mod tests {
             };
             assert_eq!(value, want, "{q}");
         }
+    }
+
+    /// RFC 8259 section 6: "This specification allows implementations to
+    /// set limits on the range and precision of numbers accepted." A Number
+    /// past f64 is refused, as an entity body holding it is (serde_json);
+    /// read as infinity it would compare against values no Entity can hold
+    /// and render as `inf`, which parses back as a String (found by the
+    /// parse_q fuzz target, fuzz/regressions/parse_q).
+    #[test]
+    fn a_number_past_the_float_range_is_refused() {
+        for q in ["A>8e44444", "x==-1e400", "x==1e309..2", "x==1..1E+999"] {
+            assert!(
+                matches!(parse_q(q), Err(NgsiError::BadRequestData(_))),
+                "{q}: {:?}",
+                parse_q(q)
+            );
+        }
+        // below the range is not past it: an underflow is the nearest value
+        assert_eq!(
+            parse_q("x==1e-400").expect("underflow"),
+            parse_q("x==0").expect("zero")
+        );
     }
 
     #[test]
