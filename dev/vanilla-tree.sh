@@ -8,7 +8,8 @@
 #
 # One target, so an x86 and an arm host print the same tree; workspace paths
 # are dropped, so the checkout's location is not part of it.
+# --color never: CI sets CARGO_TERM_COLOR=always, which would put ANSI codes in the tree.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cargo tree --locked -e features -p antares-broker --target x86_64-unknown-linux-gnu \
+cargo tree --locked --color never -e features -p antares-broker --target x86_64-unknown-linux-gnu \
   | sed -E 's# \(/[^)]*\)##'
