@@ -30,6 +30,7 @@ One file per irreversible decision, numbered, never rewritten.
 | [ADR-0022](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0022-async-storage-drivers.md) | The storage drivers are async; nothing blocks on a store call | accepted, implemented; supersedes the sync-facade half of ADR-0005 |
 | [ADR-0023](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0023-endpoint-views.md) | Endpoint views: one policy-narrowed NGSI-LD endpoint that stays compliant | accepted (owner may override) |
 | [ADR-0024](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0024-odata-library.md) | OData 4.01 for Rust: build our own standalone `odata-*` crates | accepted (owner may override) |
+| [ADR-0025](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0025-internal-context-sources.md) | Internal context sources: a registration that names this broker is served in process | accepted (owner may override) |
 
 ## Format
 
