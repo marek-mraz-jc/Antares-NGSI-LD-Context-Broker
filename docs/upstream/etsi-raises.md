@@ -427,3 +427,29 @@ expectation files carry `"value": []` (and `[]` in `temporalValues`).
 Suggest `"urn:ngsi-ld:null"`, as the corrected fork does (forge commit
 fad5ab03); Antares carries that fix
 (`temporal_autorecord.rs::deleted_scope_is_the_ngsi_ld_null_in_the_temporal_representation`).
+
+---
+
+## 17. [spec] TS 104 176 answers Create and Clone Snapshot with 202, CIM 009 with 201, and gives no version to ask for either
+
+**Title:** TS 104 176 13.2.3.1 and 13.4.3.1 change 201 Created to 202
+Accepted with no migration rule
+
+**Body:**
+
+CIM 009 V1.9.1 6.36.3.1 and 6.38.3.1 answer "201 Created" with the
+Location of the created snapshot. TS 104 176 13.2.3.1 and 13.4.3.1 answer
+"202 Accepted" with "the relative path of the snapshot being created". The
+snapshot fills after the answer in both texts (5.16.1.4: the status moves
+to `ready` when every query has run), so 202 fits the operation, but a
+client written against CIM 009 reads 202 as a different outcome, and the
+Snapshot TPs assert 201.
+
+A broker could serve both through `Prefer: ngsi-ld=<version>` (4.3.6.8,
+TS 104 175 9.5.3), except that TS 104 175 states no `major.minor` of its
+own, so no client can prefer it.
+
+Antares answers 201, the CIM 009 status it states conformance to, and
+records the conflict here (T-3555). Suggest giving the TS 104 175 family a
+version a `Prefer` header can name, or keeping 201 for a snapshot created
+synchronously and 202 only where the creation itself is deferred.

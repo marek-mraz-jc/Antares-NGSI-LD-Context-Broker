@@ -215,7 +215,7 @@ The 121 implemented or partial clauses of chapter 6 carry their TS 104 176 verdi
 | Ledger clause | TS 104 176 | What changed | Verdict |
 |---|---|---|---|
 | 6.3.2 | 6.3.2 | an unrecognised or unimplemented verb is 501, 405 only for a recognised one | compliant since T-3554 |
-| 6.36.3.1, 6.38.3.1 | 13.2.3.1, 13.4.3.1 | Create and Clone Snapshot answer 202 Accepted, CIM 009 answers 201 | version conflict, Antares follows CIM 009; T-3555 |
+| 6.36.3.1, 6.38.3.1 | 13.2.3.1, 13.4.3.1 | Create and Clone Snapshot answer 202 Accepted, CIM 009 answers 201 | version conflict, Antares keeps 201; T-3555, raise 17 |
 | 6.2, every GET | 5, x.x.3.1 | OPTIONS answers 204; HEAD is GET without a body | compliant; the HEAD status is T-3460 (3.8) |
 | 6.3.10 | 6.4.7.2, 6.4.7.3 | temporal pagination in a clause of its own, firstN and offsetN | 3.2 (T-3456) |
 | 6.12.3.1, 6.12.3.2 | 9.4.3.1, 9.4.3.2 | the published headings GET/HEAD and POST are swapped against their text | editorial, paired by text |
@@ -232,7 +232,7 @@ The 121 implemented or partial clauses of chapter 6 carry their TS 104 176 verdi
 |---|---|---|
 | T-3553 | Serve @context `core` parameter (4.2) | compliant (fixed) |
 | T-3554 | 501 for an unrecognised HTTP verb (4.3) | compliant (fixed) |
-| T-3555 | Create and Clone Snapshot 202 or 201 (4.3) | version conflict, owner decision |
+| T-3555 | Create and Clone Snapshot 202 or 201 (4.3) | decided: 201, raise 17 |
 | T-3450 | Set Attribute Value `PUT …/attrs/{attrId}/value` (3.10) | compliant |
 | T-3451 | `RegistrationInfo.attributeNames` not matched (3.6) | non-compliant, security (over-forwarding) |
 | T-3452 | CSR subscription ignores `geoQ.geoproperty`; ignore list untested (3.7) | non-compliant |
