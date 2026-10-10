@@ -40,8 +40,18 @@ use std::sync::{Arc, Weak};
 /// open, change or close on another.
 pub const RELOAD_ENV: &str = "ANTARES_VIEWS_RELOAD_MS";
 
-/// The largest view document `/q/views` accepts, in bytes.
+/// The largest view document `/q/views` accepts, in bytes, without its
+/// `linkml` member.
 pub const MAX_VIEW_BYTES: usize = 64 * 1024;
+
+/// The largest `LinkML` schema a view carries, in bytes as stored (threat
+/// LK7, decision D12): a view whose schema is larger loads with its `LinkML`
+/// surface closed and a note naming why, and its other surfaces serve.
+pub const MAX_LINKML_BYTES: usize = 1024 * 1024;
+
+/// The largest view document `/q/views` reads, its `linkml` member
+/// included: past it the body is refused before it is parsed.
+pub const MAX_DOC_BYTES: usize = MAX_VIEW_BYTES + MAX_LINKML_BYTES;
 
 /// The most rules one view holds (V23: the predicate is bounded at load;
 /// every request through the view evaluates each of them).
@@ -94,6 +104,11 @@ pub struct View {
     pub rules: Vec<ViewRule>,
     /// The operations it allows, as `operation-matrix.yaml` ids.
     pub operations: Vec<String>,
+    /// The authoritative schema of what it serves: `LinkML` in its resolved
+    /// JSON form (odata-linkml-mapping.md section 3.1), read by the `LinkML`
+    /// surface, which refuses a metaslot outside its subset (threat LK4).
+    #[serde(default)]
+    pub linkml: Option<Value>,
 }
 
 /// One allowlist of a [`View`]: the Entities of `types` for which the
@@ -144,10 +159,13 @@ pub struct Loaded {
     /// Attribute they do not show, a temporal view keyed on a mutable
     /// member.
     pub notes: Vec<String>,
+    /// The `linkml` member as stored bytes; `None` when the view names none
+    /// or one over [`MAX_LINKML_BYTES`].
+    pub linkml: Option<Arc<[u8]>>,
 }
 
 impl View {
-    /// A view from the bytes of its document: at most [`MAX_VIEW_BYTES`],
+    /// A view from the bytes of its document: at most [`MAX_DOC_BYTES`],
     /// and no member the view does not define.
     ///
     /// ```
@@ -157,10 +175,10 @@ impl View {
     /// # Errors
     /// Why the bytes are not a view.
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() > MAX_VIEW_BYTES {
-            return Err(format!("a view document is at most {MAX_VIEW_BYTES} bytes"));
-        }
-        serde_json::from_slice(bytes).map_err(|e| format!("not a view: {e}"))
+        too_large(bytes)?;
+        let doc: Value = serde_json::from_slice(bytes).map_err(|e| format!("not a view: {e}"))?;
+        beside_linkml(bytes.len(), &doc)?;
+        serde_json::from_value(doc).map_err(|e| format!("not a view: {e}"))
     }
 
     /// Validate the view and compile it (ADR-0023 rule 10): its id, its
@@ -214,7 +232,19 @@ impl View {
             tenant: tenant.as_str().to_owned(),
             operations,
             notes,
+            linkml: None,
         };
+        if let Some(schema) = &self.linkml {
+            let bytes = serde_json::to_vec(schema).map_err(|e| format!("linkml: {e}"))?;
+            if bytes.len() > MAX_LINKML_BYTES {
+                loaded.notes.push(format!(
+                    "the LinkML schema is over {MAX_LINKML_BYTES} bytes: the view's LinkML \
+                     surface is closed (LK7)"
+                ));
+            } else {
+                loaded.linkml = Some(bytes.into());
+            }
+        }
         if self.q.is_some()
             && loaded
                 .operations
@@ -231,6 +261,33 @@ impl View {
         }
         Ok(loaded)
     }
+}
+
+/// Refuses a document past [`MAX_DOC_BYTES`], and past [`MAX_VIEW_BYTES`]
+/// when no `linkml` member can account for the rest, before it is parsed.
+fn too_large(bytes: &[u8]) -> Result<(), String> {
+    let names_linkml = bytes.windows(8).any(|w| w == b"\"linkml\"");
+    if bytes.len() > MAX_DOC_BYTES || (bytes.len() > MAX_VIEW_BYTES && !names_linkml) {
+        return Err(format!(
+            "a view document is at most {MAX_VIEW_BYTES} bytes beside its linkml member"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a parsed document whose members other than `linkml` take more
+/// than [`MAX_VIEW_BYTES`] of its `len` bytes.
+fn beside_linkml(len: usize, doc: &Value) -> Result<(), String> {
+    let linkml = doc
+        .get("linkml")
+        .and_then(|l| serde_json::to_vec(l).ok())
+        .map_or(0, |b| b.len());
+    if len.saturating_sub(linkml) > MAX_VIEW_BYTES {
+        return Err(format!(
+            "a view document is at most {MAX_VIEW_BYTES} bytes beside its linkml member"
+        ));
+    }
+    Ok(())
 }
 
 fn valid_id(id: &str) -> bool {
@@ -359,6 +416,7 @@ fn entry(doc: &Value) -> ViewEntry {
             tenant: l.tenant,
             operations: l.operations.iter().map(|op| op.id().to_owned()).collect(),
             notes: l.notes,
+            linkml: l.linkml,
         },
         Err(reason) => ViewEntry::Invalid { reason },
     }
@@ -531,23 +589,28 @@ async fn delete_one(r: Arc<Reloader>, id: String) -> Result<Response, String> {
 
 /// Validate, store, and answer once this pod's table holds the write.
 async fn put_one(r: Arc<Reloader>, id: String, body: Bytes) -> Result<Response, String> {
-    if body.len() > MAX_VIEW_BYTES {
-        return Ok(problem(
+    let too_big = |why: String| {
+        Ok(problem(
             StatusCode::PAYLOAD_TOO_LARGE,
             "BadRequestData",
-            &format!("a view document is at most {MAX_VIEW_BYTES} bytes"),
-        ));
+            &why,
+        ))
+    };
+    if let Err(why) = too_large(&body) {
+        return too_big(why);
     }
-    let checked = serde_json::from_slice::<Value>(&body)
-        .map_err(|e| format!("not a view: {e}"))
-        .and_then(|doc| {
-            let view: View =
-                serde_json::from_value(doc.clone()).map_err(|e| format!("not a view: {e}"))?;
-            if view.id != id {
-                return Err("the document's id names another view than the path".into());
-            }
-            view.load().map(|_| doc)
-        });
+    let parsed = serde_json::from_slice::<Value>(&body).map_err(|e| format!("not a view: {e}"));
+    if let Some(Err(why)) = parsed.as_ref().ok().map(|d| beside_linkml(body.len(), d)) {
+        return too_big(why);
+    }
+    let checked = parsed.and_then(|doc| {
+        let view: View =
+            serde_json::from_value(doc.clone()).map_err(|e| format!("not a view: {e}"))?;
+        if view.id != id {
+            return Err("the document's id names another view than the path".into());
+        }
+        view.load().map(|_| doc)
+    });
     let doc = match checked {
         Ok(doc) => doc,
         Err(why) => return Ok(problem(StatusCode::BAD_REQUEST, "BadRequestData", &why)),
@@ -606,6 +669,45 @@ mod tests {
         let mut v = base();
         v[member] = value;
         v
+    }
+
+    #[test]
+    fn a_linkml_schema_is_kept_as_bytes_and_one_past_its_bound_closes_only_linkml() {
+        let schema = json!({"id": "https://e.org/s", "name": "s"});
+        let loaded = load(&with("linkml", schema.clone())).expect("loads");
+        assert_eq!(
+            loaded.linkml.as_deref(),
+            Some(serde_json::to_vec(&schema).expect("bytes").as_slice())
+        );
+        assert_eq!(loaded.notes, Vec::<String>::new());
+
+        // LK7: past the bound the view still loads, its LinkML surface closed.
+        let big = json!({"id": "https://e.org/s", "name": "s",
+                         "description": "x".repeat(MAX_LINKML_BYTES)});
+        let doc: View = serde_json::from_value(with("linkml", big)).expect("a view");
+        let loaded = doc.load().expect("the view loads");
+        assert_eq!(loaded.linkml, None);
+        assert!(
+            loaded.notes.iter().any(|n| n.contains("LK7")),
+            "{:?}",
+            loaded.notes
+        );
+    }
+
+    #[test]
+    fn a_document_is_bounded_beside_its_linkml_member() {
+        let pad = "x".repeat(MAX_VIEW_BYTES);
+        let schema = json!({"id": "https://e.org/s", "name": "s", "description": pad});
+        assert!(
+            load(&with("linkml", schema)).is_ok(),
+            "the schema has its own bound"
+        );
+        let e = load(&with("q", json!(pad))).err().unwrap_or_default();
+        assert!(e.contains("beside its linkml member"), "{e}");
+        let mut both = with("linkml", json!({"id": "https://e.org/s", "name": "s"}));
+        both["scopeQ"] = json!(pad);
+        let e = load(&both).err().unwrap_or_default();
+        assert!(e.contains("beside its linkml member"), "{e}");
     }
 
     #[test]

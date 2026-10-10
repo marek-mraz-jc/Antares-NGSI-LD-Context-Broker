@@ -52,6 +52,7 @@ antares-plugin-example = { workspace = true, optional = true }
 antares-ops = { workspace = true, optional = true }
 antares-views = { workspace = true, optional = true }
 antares-mcp = { workspace = true, optional = true }
+antares-linkml = { workspace = true, optional = true }
 
 [features]
 # tokio-console in dev — build with RUSTFLAGS="--cfg tokio_unstable"
@@ -81,6 +82,10 @@ views = ["dep:antares-ops", "dep:antares-views"]
 # view's read operations as tools and resources
 # (`ANTARES_API_SURFACES=admin,views,mcp`).
 mcp = ["views", "dep:antares-mcp"]
+# The LinkML surface of a view (ADR-0027, T-3511): `/x/views/{view}/linkml`,
+# the view's schema narrowed to what the caller may see
+# (`ANTARES_API_SURFACES=admin,views,linkml`).
+linkml = ["views", "dep:antares-linkml"]
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
 # Unix-only: the wasm target keeps the default allocator.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]

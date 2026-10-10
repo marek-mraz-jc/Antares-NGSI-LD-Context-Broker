@@ -321,6 +321,10 @@ pub enum ViewEntry {
         /// condition reads an Attribute it does not show (ADR-0023 rule
         /// 11), a temporal view keyed on a mutable member (rule 8).
         notes: Vec<String>,
+        /// The view's resolved LinkML JSON, as the view document names it,
+        /// for the LinkML surface to read and narrow; `None` when the view
+        /// names none or names one past its bound (threat LK7).
+        linkml: Option<Arc<[u8]>>,
     },
     /// A stored view that failed validation: never served, named in
     /// `/q/health` with the reason.

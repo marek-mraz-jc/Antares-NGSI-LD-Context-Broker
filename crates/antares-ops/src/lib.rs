@@ -49,7 +49,7 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -98,6 +98,101 @@ pub struct ViewOps {
     view: Arc<antares_api::views::CompiledView>,
     tenant: String,
     operations: Vec<OperationId>,
+    linkml: Option<Arc<[u8]>>,
+}
+
+/// The Entity types a caller may see through a view and the Attributes
+/// each may show, as IRIs (ADR-0023 rule 5): made by [`ViewOps::visible`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Visible {
+    /// Each rule's types and the Attributes it shows, `pick` and `omit`
+    /// applied: an Attribute is shown when a rule of its type shows it.
+    rules: Vec<(BTreeSet<String>, BTreeSet<String>)>,
+    /// Attributes removed per type, on top of the rules.
+    omit_by_type: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Visible {
+    /// Whether an Entity of type `name` (an IRI or a core-context term) may
+    /// be seen.
+    ///
+    /// ```
+    /// assert!(!antares_ops::Visible::default().shows_type("Car"));
+    /// ```
+    #[must_use]
+    pub fn shows_type(&self, name: &str) -> bool {
+        let ty = expand(name);
+        self.rules.iter().any(|(types, _)| types.contains(&ty))
+    }
+
+    /// Whether an Entity of type `ty` may show Attribute `attr`.
+    ///
+    /// ```
+    /// assert!(!antares_ops::Visible::default().shows_attribute("Car", "speed"));
+    /// ```
+    #[must_use]
+    pub fn shows_attribute(&self, ty: &str, attr: &str) -> bool {
+        let (ty, attr) = (expand(ty), expand(attr));
+        !self
+            .omit_by_type
+            .get(&ty)
+            .is_some_and(|gone| gone.contains(&attr))
+            && self
+                .rules
+                .iter()
+                .any(|(types, attrs)| types.contains(&ty) && attrs.contains(&attr))
+    }
+
+    /// What `filter`'s rules show: each rule's types with its Attributes,
+    /// less what `pick` leaves out and `omit` and `omit_by_type` remove. A
+    /// rule's condition is not read: it decides which Entities show the
+    /// Attributes, not which Attributes there are.
+    ///
+    /// ```
+    /// use antares_ops::policy::{Filter, Rule};
+    /// let visible = antares_ops::Visible::from_filter(&Filter {
+    ///     rules: vec![Rule {
+    ///         types: vec!["https://e.org/Car".into()],
+    ///         attributes: vec!["https://e.org/speed".into(), "https://e.org/vin".into()],
+    ///         ..Rule::default()
+    ///     }],
+    ///     omit: vec!["https://e.org/vin".into()],
+    ///     ..Filter::default()
+    /// });
+    /// assert!(visible.shows_attribute("https://e.org/Car", "https://e.org/speed"));
+    /// assert!(!visible.shows_attribute("https://e.org/Car", "https://e.org/vin"));
+    /// ```
+    #[must_use]
+    pub fn from_filter(filter: &policy::Filter) -> Self {
+        let set =
+            |names: &[String]| -> BTreeSet<String> { names.iter().map(|n| expand(n)).collect() };
+        let (pick, omit) = (set(&filter.pick), set(&filter.omit));
+        let rules = filter
+            .rules
+            .iter()
+            .map(|rule| {
+                let mut attrs = set(&rule.attributes);
+                attrs.retain(|a| (pick.is_empty() || pick.contains(a)) && !omit.contains(a));
+                (set(&rule.types), attrs)
+            })
+            .collect();
+        let omit_by_type = filter
+            .omit_by_type
+            .iter()
+            .map(|(t, attrs)| (expand(t), set(attrs)))
+            .collect();
+        Self {
+            rules,
+            omit_by_type,
+        }
+    }
+}
+
+/// `name` as an IRI under the core @context, as a view's names are kept.
+fn expand(name: &str) -> String {
+    static CORE: std::sync::LazyLock<antares_jsonld::Context> =
+        std::sync::LazyLock::new(antares_jsonld::core_context);
+    CORE.expand_key(name)
 }
 
 /// The headers of the request a surface is answering, as the HTTP layer
@@ -192,6 +287,7 @@ impl Ops {
             view,
             tenant,
             operations,
+            linkml,
             ..
         }) = table.get(id)
         else {
@@ -209,6 +305,7 @@ impl Ops {
                 .iter()
                 .filter_map(|o| OperationId::from_id(o))
                 .collect(),
+            linkml: linkml.clone(),
         };
         // Only views loaded now stay cached: a removed one goes with the
         // first view served after its removal.
@@ -278,6 +375,55 @@ impl ViewOps {
     #[must_use]
     pub fn shown_names(&self) -> (Vec<String>, Vec<String>) {
         self.view.shown_names()
+    }
+
+    /// The view's `LinkML` schema as its document names it (resolved `LinkML`
+    /// JSON), `None` when it names none or one past its bound.
+    #[must_use]
+    pub fn linkml(&self) -> Option<&Arc<[u8]>> {
+        self.linkml.as_ref()
+    }
+
+    /// What `caller` may see through the view for `op`, a read the view
+    /// allows: the view's rules composed with the engine's answer for the
+    /// operation's clause and the expanded `types` and `attrs` it names
+    /// (`effective = view ∧ engine`, ADR-0023 rule 5), asked once, in the
+    /// view's Tenant, failing closed as every gate does.
+    ///
+    /// # Errors
+    /// [`Refusal::NotAllowed`] when the view does not allow `op`,
+    /// [`Refusal::Denied`] when the engine refuses it.
+    pub async fn visible(
+        &self,
+        caller: &Caller,
+        op: OperationId,
+        types: &[String],
+        attrs: &[String],
+    ) -> Result<Visible, Refusal> {
+        let Some(clause) = op.gate_clause().filter(|_| self.allows(op)) else {
+            return Err(Refusal::NotAllowed { allow: Vec::new() });
+        };
+        let tenant = antares_model::TenantId::new(&self.tenant)
+            .map_err(|_| Refusal::Denied("the view's tenant is not valid".into()))?;
+        let engine = match self.inner.state.policy.as_deref() {
+            None => Ok(policy::Filter::default()),
+            Some(engine) => {
+                let subject = antares_api::policy::subject_of(&tenant, &caller.0);
+                let asked = policy::Operation {
+                    types,
+                    attrs,
+                    ..policy::Operation::new(clause)
+                };
+                match antares_api::policy::decide(engine, &subject, &asked).await {
+                    policy::Decision::Allow => Ok(policy::Filter::default()),
+                    policy::Decision::Filter(f) => Ok(f),
+                    policy::Decision::Deny(why) => Err(antares_api::policy::Denied(why)),
+                }
+            }
+        };
+        antares_api::views::with_view(Some(&self.view), clause, engine)
+            .map(|f| Visible::from_filter(&f))
+            .map_err(|d| Refusal::Denied(d.0))
     }
 
     /// For each of `ops`, whether the view allows it and the policy engine
@@ -564,6 +710,63 @@ pub mod test_kit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_names_are_the_rules_less_pick_omit_and_omit_by_type() {
+        let rule = |types: &[&str], attrs: &[&str]| policy::Rule {
+            types: types.iter().map(|t| (*t).to_owned()).collect(),
+            attributes: attrs.iter().map(|a| (*a).to_owned()).collect(),
+            ..policy::Rule::default()
+        };
+        let iri = |n: &str| format!("https://e.org/{n}");
+        let filter = policy::Filter {
+            rules: vec![
+                rule(&[&iri("Car")], &[&iri("speed"), &iri("owner"), &iri("vin")]),
+                rule(&[&iri("Bus")], &[&iri("speed"), &iri("vin")]),
+                rule(&[&iri("Car")], &[&iri("colour")]),
+            ],
+            pick: vec![iri("speed"), iri("owner"), iri("colour"), iri("vin")],
+            omit: vec![iri("owner")],
+            omit_by_type: BTreeMap::from([(iri("Bus"), vec![iri("vin")])]),
+            ..policy::Filter::default()
+        };
+        let v = Visible::from_filter(&filter);
+        assert!(v.shows_type(&iri("Car")) && v.shows_type(&iri("Bus")));
+        assert!(!v.shows_type(&iri("Tram")));
+        assert!(v.shows_attribute(&iri("Car"), &iri("speed")));
+        assert!(
+            v.shows_attribute(&iri("Car"), &iri("colour")),
+            "rules add up"
+        );
+        assert!(
+            !v.shows_attribute(&iri("Car"), &iri("owner")),
+            "omit removes"
+        );
+        assert!(v.shows_attribute(&iri("Car"), &iri("vin")));
+        assert!(
+            !v.shows_attribute(&iri("Bus"), &iri("vin")),
+            "omit_by_type removes"
+        );
+        assert!(!v.shows_attribute(&iri("Tram"), &iri("speed")));
+
+        let picked = Visible::from_filter(&policy::Filter {
+            pick: vec![iri("speed")],
+            ..filter
+        });
+        assert!(
+            !picked.shows_attribute(&iri("Car"), &iri("colour")),
+            "pick keeps"
+        );
+        // A core-context term is the IRI it expands to.
+        let core = Visible::from_filter(&policy::Filter {
+            rules: vec![rule(&["Car"], &["location"])],
+            ..policy::Filter::default()
+        });
+        assert!(core.shows_attribute(
+            "https://uri.etsi.org/ngsi-ld/default-context/Car",
+            "https://uri.etsi.org/ngsi-ld/location"
+        ));
+    }
 
     #[test]
     fn a_request_keeps_its_own_headers_and_body_and_drops_the_outer_ones() {
