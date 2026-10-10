@@ -14,15 +14,23 @@
 
 use std::path::{Path, PathBuf};
 
-/// Files allowed to call `set_service`, relative to the crate source root.
-const CALLERS: &[&str] = &["store/pg/maintenance.rs", "store/pg/outbox.rs"];
+/// Files allowed to name `set_service`, relative to the `crates/` directory.
+const CALLERS: &[&str] = &[
+    "antares-sql/src/store/pg/maintenance.rs",
+    "antares-sql/src/store/pg/outbox.rs",
+];
 
 /// Where the function itself is defined — its own body and doc comment
 /// name it without calling it.
-const DEFINITION: &str = "store/pg/mod.rs";
+const DEFINITION: &str = "antares-sql/src/store/pg/mod.rs";
 
-fn src_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+/// Every crate of the workspace: `set_service` is `pub`, so a crate that
+/// depends on this one can reach it as easily as a module inside it.
+fn crates_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates/")
+        .to_path_buf()
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -38,12 +46,20 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 #[test]
 fn only_the_two_cross_tenant_jobs_arm_the_service_escape() {
-    let root = src_root();
+    let root = crates_root();
     let mut files = Vec::new();
-    rust_files(&root, &mut files);
+    for krate in std::fs::read_dir(&root)
+        .expect("readable crates/")
+        .flatten()
+    {
+        let src = krate.path().join("src");
+        if src.is_dir() {
+            rust_files(&src, &mut files);
+        }
+    }
     assert!(
-        files.len() > 10,
-        "the walk found {} source files, so it is not walking the crate",
+        files.len() > 50,
+        "the walk found {} source files, so it is not walking the workspace",
         files.len()
     );
 
@@ -58,7 +74,10 @@ fn only_the_two_cross_tenant_jobs_arm_the_service_escape() {
             continue;
         }
         let src = std::fs::read_to_string(path).expect("readable source file");
-        if src.contains("set_service(") {
+        // the name, not the call: `use …::set_service as arm;` then
+        // `arm(&mut tx)` is a call this would otherwise never see, and a
+        // stray mention in a comment fails loudly rather than silently
+        if src.contains("set_service") {
             callers.push(rel);
         }
     }
@@ -79,7 +98,7 @@ fn only_the_two_cross_tenant_jobs_arm_the_service_escape() {
 /// request picks that connection up next.
 #[test]
 fn the_escape_is_transaction_scoped() {
-    let def = std::fs::read_to_string(src_root().join(DEFINITION)).expect("readable");
+    let def = std::fs::read_to_string(crates_root().join(DEFINITION)).expect("readable");
     let line = def
         .lines()
         .find(|l| l.contains("set_config('antares.service'"))
