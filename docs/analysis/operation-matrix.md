@@ -199,7 +199,7 @@ Paths are relative to `/ngsi-ld/v1`; HEAD is served by every GET route (axum `ge
 | `temporal_retrieve` | 11.3.2 | 5.7.3 | read | `GET /ngsi-ld/v1/temporal/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/8/8.3.3.1.md) | 5.7.3 | clause, ids | on_request | yes | no | crates/antares-api/src/temporal.rs:2211 |
 | `temporal_query` | 11.3.3 | 5.7.4 | read | `GET /ngsi-ld/v1/temporal/entities` (ts-104176-ngsi-ld-http-binding/8/8.2.3.1.md) | 5.7.4 | clause, types, attrs, q, scope_q, geo | on_request | yes | no | crates/antares-api/src/temporal.rs:1393 |
 | `temporal_query_post` | 11.3.3 | 5.7.4 | read | `POST /ngsi-ld/v1/temporal/entityOperations/query` (ts-104176-ngsi-ld-http-binding/8/8.7.3.1.md) | 5.7.4 | clause, types, attrs, q, scope_q, geo | on_request | yes | no | crates/antares-api/src/temporal.rs:3092 |
-| `register_context_source` | 12.2.2 | 5.9.2 | registration | `POST /ngsi-ld/v1/csourceRegistrations` (ts-104176-ngsi-ld-http-binding/9/9.2.3.2.md) | 5.9.2 | clause, ids | on_request | no | no | crates/antares-api/src/csource.rs:965 |
+| `register_context_source` | 12.2.2 | 5.9.2 | registration | `POST /ngsi-ld/v1/csourceRegistrations` (ts-104176-ngsi-ld-http-binding/9/9.2.3.2.md) | 5.9.2 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/csource.rs:1017 |
 | `update_registration` | 12.2.3 | 5.9.3 | registration | `PATCH /ngsi-ld/v1/csourceRegistrations/{registrationId}` (ts-104176-ngsi-ld-http-binding/9/9.3.3.2.md) | 5.9.3 | clause, ids | on_request | no | no | crates/antares-api/src/csource.rs:1327 |
 | `delete_registration` | 12.2.4 | 5.9.4 | registration | `DELETE /ngsi-ld/v1/csourceRegistrations/{registrationId}` (ts-104176-ngsi-ld-http-binding/9/9.3.3.3.md) | 5.9.4 | clause, ids | on_request | no | no | crates/antares-api/src/csource.rs:1397 |
 | `retrieve_registration` | 12.3.2 | 5.10.1 | registration | `GET /ngsi-ld/v1/csourceRegistrations/{registrationId}` (ts-104176-ngsi-ld-http-binding/9/9.3.3.1.md) | 5.10.1 | clause, ids | on_request | no | no | crates/antares-api/src/csource.rs:1022 |
@@ -217,8 +217,8 @@ Paths are relative to `/ngsi-ld/v1`; HEAD is served by every GET route (axum `ge
 | `retrieve_entity_map` | 14.2 | 5.14.1 | entitymap | `GET /ngsi-ld/v1/entityMaps/{entityMapId}` (ts-104176-ngsi-ld-http-binding/11/11.4.3.1.md) | 5.14.1 | clause, ids | on_request | no | no | crates/antares-api/src/entity_maps.rs:50 |
 | `update_entity_map` | 14.3 | 5.14.2 | entitymap | `PATCH /ngsi-ld/v1/entityMaps/{entityMapId}` (ts-104176-ngsi-ld-http-binding/11/11.4.3.2.md) | 5.14.2 | clause, ids | on_request | no | no | crates/antares-api/src/entity_maps.rs:73 |
 | `delete_entity_map` | 14.4 | 5.14.3 | entitymap | `DELETE /ngsi-ld/v1/entityMaps/{entityMapId}` (ts-104176-ngsi-ld-http-binding/11/11.4.3.3.md) | 5.14.3 | clause, ids | on_request | no | no | crates/antares-api/src/entity_maps.rs:104 |
-| `create_entity_map` | 14.5 | 5.14.4 | entitymap | `GET\|POST /ngsi-ld/v1/entityMaps` (ts-104176-ngsi-ld-http-binding/11/11.2.3.1.md, 11/11.2.3.2.md) | 5.14.4 | clause | on_request | yes | no | crates/antares-api/src/entity_maps.rs:153 |
-| `create_temporal_entity_map` | 14.6 | 5.14.5 | entitymap | `GET\|POST /ngsi-ld/v1/temporal/entityMaps` (ts-104176-ngsi-ld-http-binding/11/11.3.3.1.md, 11/11.3.3.2.md) | 5.14.5 | clause | on_request | yes | no | crates/antares-api/src/entity_maps.rs:153 |
+| `create_entity_map` | 14.5 | 5.14.4 | entitymap | `GET\|POST /ngsi-ld/v1/entityMaps` (ts-104176-ngsi-ld-http-binding/11/11.2.3.1.md, 11/11.2.3.2.md) | 5.14.4 | clause, types, attrs, q, scope_q, geo | on_request | yes | no | crates/antares-api/src/entity_maps.rs:167 |
+| `create_temporal_entity_map` | 14.6 | 5.14.5 | entitymap | `GET\|POST /ngsi-ld/v1/temporal/entityMaps` (ts-104176-ngsi-ld-http-binding/11/11.3.3.1.md, 11/11.3.3.2.md) | 5.14.5 | clause, types, attrs, q, scope_q, geo | on_request | yes | no | crates/antares-api/src/entity_maps.rs:167 |
 | `source_identity` | 15.2 | 5.15.1 | identity | `GET /ngsi-ld/v1/info/sourceIdentity` (ts-104176-ngsi-ld-http-binding/12/12.2.3.1.md) | 5.15.1 | clause | on_request | no | no | crates/antares-api/src/lib.rs:1300 |
 | `create_snapshot` | 16.2 | 5.16.1 | snapshot | `POST /ngsi-ld/v1/snapshots` (ts-104176-ngsi-ld-http-binding/13/13.2.3.1.md) | 5.16.1 | clause | on_request | no | yes | crates/antares-api/src/snapshots.rs:544 |
 | `clone_snapshot` | 16.3 | 5.16.2 | snapshot | `POST /ngsi-ld/v1/snapshots/{snapshotId}/clone` (ts-104176-ngsi-ld-http-binding/13/13.4.3.1.md) | 5.16.2 | clause, ids | on_request | no | yes | crates/antares-api/src/snapshots.rs:1127 |
@@ -334,10 +334,7 @@ The seam can only judge what it is given. These handlers leave members empty tha
 | `retrieve_entity_type_details` | 10.6.4 | not FILTERABLE |
 | `retrieve_attributes` | 10.6.6 | not FILTERABLE |
 | `retrieve_attribute_details` | 10.6.7 | not FILTERABLE |
-| `register_context_source` | 12.2.2 | types and attrs of the registration information are not filled |
 | `query_registrations` | 12.3.3 | not FILTERABLE |
-| `create_entity_map` | 14.5 | q, scope_q, types, attrs and geo are not filled |
-| `create_temporal_entity_map` | 14.6 | q, scope_q, types, attrs and geo are not filled |
 
 `batch_create` to `batch_merge` share one gate call for the whole array (`crates/antares-api/src/batch.rs:687`, `ids: &gate_ids`), so an engine answers once for every member: it cannot deny one member and let the others through. The yaml's `batch` linked check ("each Entity of the array is its own single-Entity operation") is the target, not the current behaviour.
 

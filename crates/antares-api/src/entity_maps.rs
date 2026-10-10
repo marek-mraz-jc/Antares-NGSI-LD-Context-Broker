@@ -150,13 +150,6 @@ async fn create_map(
 ) -> Response {
     let go = async {
         let tenant = tenant_from(&headers)?;
-        let filter = gate!(
-            st,
-            &tenant,
-            &headers,
-            if temporal { "5.14.5" } else { "5.14.4" }
-        )
-        .await?;
         let allowed = if temporal {
             allowed_temporal_create_params()
         } else {
@@ -168,6 +161,17 @@ async fn create_map(
             Some(b) => query_body_params(b, &params, temporal)?,
             None => params,
         };
+        // ADR-0020: the engine is shown the query the map pages
+        let named = crate::entities::ReadMembers::of(&st, &headers, &vp).await;
+        let filter = gate!(
+            st, &tenant, &headers, if temporal { "5.14.5" } else { "5.14.4" },
+            q: named.q.as_ref(),
+            scope_q: vp.get("scopeQ").map(String::as_str),
+            types: &named.types,
+            attrs: &named.attrs,
+            geo: named.geo.as_ref(),
+        )
+        .await?;
         check_params(&vp, &allowed)?;
         let accept = parse_accept(&headers)?;
         let ctx = request_context(&st.loader, &headers).await?;
