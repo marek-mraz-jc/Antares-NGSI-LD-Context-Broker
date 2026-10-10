@@ -24,6 +24,7 @@ linkml-model = { path = "../crates/linkml-model" }
 odata-url = { path = "../crates/odata-url" }
 odata-csdl = { path = "../crates/odata-csdl" }
 odata-json = { path = "../crates/odata-json" }
+odata-batch = { path = "../crates/odata-batch" }
 
 [[bin]]
 name = "parse_q"
@@ -161,6 +162,20 @@ bench = false
 [[bin]]
 name = "odata_json_body"
 path = "fuzz_targets/odata_json_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "odata_batch_multipart"
+path = "fuzz_targets/odata_batch_multipart.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "odata_batch_json"
+path = "fuzz_targets/odata_batch_json.rs"
 test = false
 doc = false
 bench = false
