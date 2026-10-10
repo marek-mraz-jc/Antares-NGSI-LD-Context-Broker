@@ -361,3 +361,32 @@ members as ignored (`csource_subscription_ignored_members.rs`, T-3452).
 
 Suggest removing `timeInterval` from the table's not-applicable list, or, if
 the table is meant, removing the periodic paragraphs of 12.4.2.4 and 12.4.7.
+
+## 14. [spec] TS 104 176 clause 5 answers a successful HEAD with 204, its 7.x operation tables with 200
+
+**Title:** TS 104 176: clause 5 and the GET/HEAD tables of clause 7 give a
+successful HEAD two different status codes
+
+**Body:**
+
+Clause 5 (p. 22): "Where defined, a HEAD request shall function in the same
+manner as a GET request, but shall omit the body in the response. The
+response code 204 No Content shall be used on success."
+
+Every GET/HEAD operation table of clause 7 lists one response set for both
+verbs. For example, 7.3.3.1 "GET/HEAD" (p. 42-44) answers `200 OK` (and
+`201 Created` when an EntityMap was (re)created), with no separate row for
+HEAD.
+
+An implementation that follows clause 5 answers HEAD with 204, one that
+follows the tables answers 200. RFC 9110 9.3.2 expects the server to "send
+the same header fields in response to a HEAD request as it would have sent
+if the request method had been GET", so 204 also changes what a cache or a
+client probing a resource reads from the status line.
+
+Antares answers 200 (owner decision on T-3460), the status the tables and
+RFC 9110 give, and takes the HEAD request's @context from its Link header as
+6.2.4 requires (`contexts_5_13.rs::ts104176_6_2_4_head_takes_context_from_link`).
+
+Suggest dropping the 204 sentence from clause 5, or, if 204 is meant, adding
+a HEAD row with 204 to each GET/HEAD table of clause 7.
