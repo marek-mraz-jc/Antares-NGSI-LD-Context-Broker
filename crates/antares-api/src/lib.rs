@@ -589,6 +589,9 @@ pub fn router(state: AppState) -> Router {
         // Router itself, above any nested layer — only a layer wrapping the
         // WHOLE router sees it.
         .layer(axum::middleware::from_fn(options_204))
+        // TS 104 176 6.3.2: an unrecognised verb is 501 before any routing,
+        // so the method router's 405 stays the answer for a recognised one.
+        .layer(axum::middleware::from_fn(unrecognised_method_501))
         // Outermost so the duration covers the full stack.
         .layer(axum::middleware::from_fn(http_metrics_layer))
         // absent knob = no layer at all: a bare OPTIONS keeps its 204 + Allow
@@ -804,6 +807,21 @@ async fn http_metrics_layer(
     metrics::histogram!("antares_http_request_duration_seconds", "method" => method)
         .record(start.elapsed().as_secs_f64());
     resp
+}
+
+/// TS 104 176 6.3.2: "Not Implemented (501) ... when a client invokes an
+/// HTTP verb that is unrecognized or not implemented". The recognised set is
+/// the one [`metric_method`] names; CONNECT, TRACE and every extension
+/// method are 501. A bare status like 6.3.4's 411 and 415: the error table
+/// names no error type for it.
+async fn unrecognised_method_501(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    if metric_method(req.method().as_str()) == "OTHER" {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
+    next.run(req).await
 }
 
 /// 2.0 #59 pre-adoption: OPTIONS → 204 No Content + the Allow set the
@@ -1420,6 +1438,39 @@ mod tests {
         assert_eq!(metric_method("BAZQUX"), "OTHER");
         // methods are case-sensitive tokens (RFC 9110 9.1)
         assert_eq!(metric_method("get"), "OTHER");
+    }
+
+    /// TS 104 176 6.3.2: a verb the broker does not recognise or implement
+    /// is 501; a recognised verb a resource does not serve stays 405 with
+    /// its Allow set, and OPTIONS stays 204.
+    #[tokio::test]
+    async fn an_unrecognised_verb_is_501_and_an_unserved_one_405() {
+        let send = |method: &'static str, uri: &'static str| {
+            app().oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("req"),
+            )
+        };
+        for (method, uri) in [
+            ("FOO", "/ngsi-ld/v1/entities"),
+            ("FOO", "/ngsi-ld/v1/entities/urn:ngsi-ld:X:1"),
+            ("TRACE", "/ngsi-ld/v1/entities"),
+            ("CONNECT", "/ngsi-ld/v1/entities"),
+            ("get", "/ngsi-ld/v1/entities"),
+        ] {
+            let resp = send(method, uri).await.expect("resp");
+            assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{method} {uri}");
+        }
+        let resp = send("GET", "/ngsi-ld/v1/entityOperations/create")
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(resp.headers().get("allow").is_some(), "405 keeps Allow");
+        let resp = send("OPTIONS", "/ngsi-ld/v1/entities").await.expect("resp");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
