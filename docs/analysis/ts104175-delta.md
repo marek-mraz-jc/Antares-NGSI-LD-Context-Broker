@@ -222,6 +222,10 @@ The 121 implemented or partial clauses of chapter 6 carry their TS 104 176 verdi
 | 6.5.3.4 | 7.3.3.2 | 207 Multi Status for a distributed merge named in the table | compliant, 6.3.17 already required it |
 | 6.4.3.3, 6.8.3.2 | 7.2.3.3, 9.2.3.1 | a should-rule on a configurable default; geoproperty and timeproperty rows corrected | compliant |
 
+### 4.4 Chapter 7 and the annexes
+
+7.2 (TS 104 243 5.2) is unchanged in substance. A.2 and A.3 lost sentences and gained none: the lowercase-namespace rule and the identifier structure are gone, which removes obligations and adds none. Annex B is the core @context, non-compliant until T-3458 (3.4). With this, every implemented or partial clause of the ledger carries its TS 104 175, 176 or 243 verdict.
+
 ## 5. Gaps and their tasks
 
 | Task | Gap | Kind |
@@ -240,7 +244,7 @@ The 121 implemented or partial clauses of chapter 6 carry their TS 104 176 verdi
 | T-3458 | core @context content and scoped terms (3.4) | non-compliant, owner decision |
 | T-3459 | 9.7 loop error for inclusive or no registration (3.5) | non-compliant, owner decision |
 | T-3460 | HEAD 204 or 200 (3.8) | spec contradiction, owner decision |
-| T-3461 | re-audit of the 266 changed clauses (section 4) | backlog |
+| T-3461 | re-audit of every implemented clause (section 4) | done, gaps filed |
 | T-3545 | conflicting attributes: observedAt does not take precedence (4.1) | non-compliant |
 
 The ICS ([ics-ts104187.md](ics-ts104187.md)) answers against CIM 009 as TS 104 187 A.3 asks; these gaps reach it when the ledger records them.
