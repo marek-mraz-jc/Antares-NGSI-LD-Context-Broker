@@ -412,7 +412,11 @@ impl<'a> Parser<'a> {
             path.push(self.name()?);
         }
         let bracket = if self.eat('[') {
+            // spacing inside the bracket is insignificant, so `[ *a]` is
+            // `[*a]` (refused) and never the member name `*a`
+            self.rest = self.rest.trim_start();
             let b = if self.eat('*') {
+                self.rest = self.rest.trim_start();
                 vec!["*".to_owned()]
             } else {
                 let mut b = vec![self.name_token()?];
@@ -701,6 +705,21 @@ mod tests {
     /// read as infinity it would compare against values no Entity can hold
     /// and render as `inf`, which parses back as a String (found by the
     /// parse_q fuzz target, fuzz/regressions/parse_q).
+    /// 4.9 `[*]` is the whole bracket, never the start of a member name,
+    /// and spacing inside the bracket is insignificant: `m[ *a]` was read
+    /// as the member `*a` and rendered as `m[*a]`, which is refused (found
+    /// by the parse_q fuzz target, fuzz/regressions/parse_q).
+    #[test]
+    fn a_star_in_a_bracket_is_the_whole_bracket_whatever_the_spacing() {
+        for q in ["m[*a]!=c", "m[ *a]!=c", "m[\t*a]!=c"] {
+            assert!(parse_q(q).is_err(), "{q:?}");
+        }
+        for q in ["m[*]==\"x\"", "m[ * ]==\"x\"", "m[\t*\t]==\"x\""] {
+            let node = parse_q(q).expect(q);
+            assert_eq!(node.to_string(), "m[*]==\"x\"", "{q:?}");
+        }
+    }
+
     #[test]
     fn a_number_past_the_float_range_is_refused() {
         for q in ["A>8e44444", "x==-1e400", "x==1e309..2", "x==1..1E+999"] {
