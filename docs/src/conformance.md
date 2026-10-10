@@ -178,6 +178,9 @@ carries the fix. The current list:
 | 11 | spec | Annex B maps `attributeCount`/`attributeDetails` to bare terms |
 | 13 | spec | TS 104 175 Table 5.2.6.5.2-1 calls `timeInterval` not applicable to CSR subscriptions; 12.4.2.4/12.4.7 define periodic CSR notification |
 | 14 | spec | TS 104 176 clause 5 answers a successful HEAD with 204, its 7.x GET/HEAD tables with 200 (Antares: 200) |
+| 15 | suite | 020_17 to 020_20 delete an Attribute of an Entity held only as a temporal evolution; 5.6.5.4 answers 404 |
+| 16 | suite | 020_19 and 020_20 expect a deleted scope as `[]`; 4.18 makes it `urn:ngsi-ld:null` |
+| 17 | spec | TS 104 176 answers Create and Clone Snapshot with 202, CIM 009 with 201, and names no version a client can prefer (Antares: 201) |
 
 Filing is manual; each entry carries the clause quotation and the
 proposed fix so it can be pasted into the ETSI tracker as is.

@@ -50,11 +50,25 @@ Delete Temporal Attribute and Retrieve Temporal Evolution of Attribute
 
 Create Temporal Entity
     ${temporal_entity_representation_id}=    Generate Random Vehicle Entity Id
+    # DELETE /entities/{id}/attrs/{name} is a current-state operation
+    # (TS 104-175 § 10.2.7) — it needs the entity to exist in the
+    # current-state representation. A POST /temporal/entities alone (per
+    # TS 104-175 § 11.2.2) creates only the temporal evolution. Mirror it
+    # on the current-state side so the DELETE under test can produce its
+    # `deletedAt` tombstone. See testsuite-doubts.md #9.
+    ${current_state_response}=    Create Entity
+    ...    vehicle-with-scope.jsonld
+    ...    ${temporal_entity_representation_id}
+    Check Response Status Code    201    ${current_state_response.status_code}
     ${create_response}=    Create Temporal Representation Of Entity
     ...    ${vehicle_payload_file}
     ...    ${temporal_entity_representation_id}
-    Check Response Status Code    201    ${create_response.status_code}
+    Should Be True    "${create_response.status_code}" in ["201", "204"]    msg=POST /temporal/entities expected 201 (created) or 204 (appended to existing), got ${create_response.status_code}
     Set Suite Variable    ${temporal_entity_representation_id}
 
 Delete Initial Temporal Entity
+    # The setup mirrors the temporal entity on the current-state side (see
+    # testsuite-doubts.md #9) — remove that twin too, or it pollutes every
+    # later type=Vehicle query (exact-set assertions in the dist-ops tests).
+    Delete Entity    ${temporal_entity_representation_id}
     Delete Temporal Representation Of Entity    ${temporal_entity_representation_id}

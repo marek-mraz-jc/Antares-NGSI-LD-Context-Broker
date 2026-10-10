@@ -12,6 +12,8 @@ name: perf-baseline
 on:
   workflow_dispatch:
   push:
+    # dev only: a worker branch's push queued hours of runners ahead of ci.yml (2026-10-10)
+    branches: [dev]
     paths:
       - dev/perf/baseline.sh
       - dev/perf/fanout.py

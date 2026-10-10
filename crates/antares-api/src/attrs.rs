@@ -1420,12 +1420,12 @@ async fn delete_attr_inner(
                 Ok::<(), NgsiError>(())
             })
             .await?;
-        // The temporal representation records the deletion (4.8 deletedAt) — and
-        // the entity may exist ONLY temporally (created via 5.6.11), so a
-        // missing current-state entity still records. A REFUSED delete (the
-        // 5.6.5.4 type selector did not match) deleted nothing and must leave
-        // the attribute history untouched.
-        let temporal_had = !matches!(res, Some(Err(_)))
+        // The temporal representation records the deletion (4.8 deletedAt).
+        // An Entity held only temporally is not "held locally" (5.6.5.4): it
+        // answers ResourceNotFound and its evolution is left to 5.6.13. A
+        // REFUSED delete (the 5.6.5.4 type selector did not match) deleted
+        // nothing and leaves the attribute history untouched too.
+        let temporal_had = matches!(res, Some(Ok(_)))
             && crate::history::mirror_delete_attr(
                 st,
                 &tenant,
@@ -1435,13 +1435,13 @@ async fn delete_attr_inner(
                 &ts,
             )
             .await;
-        // An entity that exists only temporally still answers 204: the
-        // deletion was recorded even though there was no current state.
-        Some(if res.is_none() && temporal_had {
-            Ok(no_content(&tenant))
-        } else {
-            single_attr_local(res, found || temporal_had, id, attr, &tenant)
-        })
+        Some(single_attr_local(
+            res,
+            found || temporal_had,
+            id,
+            attr,
+            &tenant,
+        ))
     };
     if regs.is_empty() {
         // the local half is skipped only while registrations cover the

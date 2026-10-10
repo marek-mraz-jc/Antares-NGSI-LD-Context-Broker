@@ -394,3 +394,62 @@ RFC 9110 give, and takes the HEAD request's @context from its Link header as
 
 Suggest dropping the 204 sentence from clause 5, or, if 204 is meant, adding
 a HEAD row with 204 to each GET/HEAD table of clause 7.
+
+---
+
+## 15. [suite] 020_17 to 020_20 delete an Attribute of an Entity that exists only as a temporal evolution
+
+**Title:** 020_17..020_20 set up with `POST /temporal/entities` alone, then
+call `DELETE /entities/{id}/attrs/{attrId}`
+
+**Body:**
+
+Delete Attribute (CIM 009 5.6.5.4) raises ResourceNotFound when no Entity
+is held locally; a temporal evolution created by 5.6.11 is not one, and
+5.6.13 is the operation that deletes from it. The setup creates only the
+temporal evolution, so a compliant broker answers 404 and writes no
+`deletedAt` instance. Suggest creating the current-state Entity in the
+setup and deleting it in the teardown, as the corrected fork does (forge
+commits f7c78f94 and 94789a66); Antares carries that fix and answers 404
+(`temporal_autorecord.rs::delete_attribute_of_a_temporal_only_entity_is_not_found`).
+
+---
+
+## 16. [suite] 020_19 and 020_20 expect a deleted scope as an empty array
+
+**Title:** the 020_19/020_20 expectations show a deleted scope as `[]`
+
+**Body:**
+
+CIM 009 4.18 reserves `urn:ngsi-ld:null` for deleted scopes, and 4.5.0
+uses it for every deleted element of the temporal representation. The
+expectation files carry `"value": []` (and `[]` in `temporalValues`).
+Suggest `"urn:ngsi-ld:null"`, as the corrected fork does (forge commit
+fad5ab03); Antares carries that fix
+(`temporal_autorecord.rs::deleted_scope_is_the_ngsi_ld_null_in_the_temporal_representation`).
+
+---
+
+## 17. [spec] TS 104 176 answers Create and Clone Snapshot with 202, CIM 009 with 201, and gives no version to ask for either
+
+**Title:** TS 104 176 13.2.3.1 and 13.4.3.1 change 201 Created to 202
+Accepted with no migration rule
+
+**Body:**
+
+CIM 009 V1.9.1 6.36.3.1 and 6.38.3.1 answer "201 Created" with the
+Location of the created snapshot. TS 104 176 13.2.3.1 and 13.4.3.1 answer
+"202 Accepted" with "the relative path of the snapshot being created". The
+snapshot fills after the answer in both texts (5.16.1.4: the status moves
+to `ready` when every query has run), so 202 fits the operation, but a
+client written against CIM 009 reads 202 as a different outcome, and the
+Snapshot TPs assert 201.
+
+A broker could serve both through `Prefer: ngsi-ld=<version>` (4.3.6.8,
+TS 104 175 9.5.3), except that TS 104 175 states no `major.minor` of its
+own, so no client can prefer it.
+
+Antares answers 201, the CIM 009 status it states conformance to, and
+records the conflict here (T-3555). Suggest giving the TS 104 175 family a
+version a `Prefer` header can name, or keeping 201 for a snapshot created
+synchronously and 202 only where the creation itself is deferred.
