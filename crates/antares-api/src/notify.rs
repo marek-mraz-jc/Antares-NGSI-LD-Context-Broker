@@ -743,10 +743,8 @@ fn project_joined(f: &crate::policy::Filter, e: &mut Value, key_values: bool) {
 /// Whether the Subscription's q follows a Relationship (4.9
 /// LinkedEntityRelation).
 fn linked_condition(sub: &Value) -> bool {
-    sub_str(sub, "q").is_some_and(|q| {
-        antares_ql::regex::q_node(&antares_ql::percent_decode(q.as_bytes()))
-            .is_some_and(|n| n.has_linked_paths())
-    })
+    sub_str(sub, "q")
+        .is_some_and(|q| antares_ql::regex::q_node(q).is_some_and(|n| n.has_linked_paths()))
 }
 
 pub(crate) use antares_matcher::{
@@ -1648,12 +1646,10 @@ pub async fn interval_tick(st: &AppState) {
             let rows = {
                 let expand = |t: &str| ctx.expand_key(t);
                 let id_refs: Vec<&str> = ids.iter().flatten().map(String::as_str).collect();
-                // q values in subscription bodies may be percent-encoded (4.9);
-                // parses shared per distinct expression text, as in
-                // conditions_match — the sweep re-runs per due subscription
-                let q_ast = sub_str(&sub, "q").and_then(|q| {
-                    antares_ql::regex::q_node(&crate::negotiate::percent_decode(q.as_bytes()))
-                });
+                // q is read as written (5.2.12); parses shared per distinct
+                // expression text, as in conditions_match — the sweep
+                // re-runs per due subscription
+                let q_ast = sub_str(&sub, "q").and_then(antares_ql::regex::q_node);
                 let geo = sub.get("geoQ").and_then(Value::as_object).and_then(|g| {
                     let key = serde_json::to_string(g).unwrap_or_default();
                     antares_ql::regex::geo_query(&key, || {

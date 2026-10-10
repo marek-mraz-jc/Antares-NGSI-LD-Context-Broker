@@ -544,3 +544,19 @@ The assertion indexes a single object. Suggest asserting three instances,
 each `urn:ngsi-ld:null`, as the corrected fork does (forge commit
 75ba471d); Antares carries that fix
 (`notify.rs::whole_attribute_versus_per_instance_deletion`).
+
+---
+
+## 23. [suite] 046_05 percent-encodes the q of a Subscription body
+
+**Title:** the 046_05 Subscription carries `q` as `name=="Eiffel%20Tower"`
+
+**Body:**
+
+CIM 009 Table 5.2.12-1 types a Subscription's `q` as a string holding a
+4.9 query, and the Subscription travels as a JSON body, not in a URI, so
+4.9's percent-encoding rule for query strings does not apply. Read as
+written, the q matches only an Entity whose name is the literal
+`Eiffel%20Tower`. Suggest `name=="Eiffel Tower"`, as the corrected fork
+does (forge commit cd2ef2ba); Antares carries that fix and reads the q as
+written (`antares-matcher::a_subscription_q_is_not_percent_decoded`).

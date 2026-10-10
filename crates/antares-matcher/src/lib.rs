@@ -132,10 +132,9 @@ pub fn geo_params(g: &Map<String, Value>) -> std::collections::HashMap<String, S
 /// conditions must hold.
 pub fn conditions_match(sub: &Value, doc: &Value, ctx: &Context, lookup: EntityLookup) -> bool {
     if let Some(q) = sub_str(sub, "q") {
-        // q values in subscription bodies may be percent-encoded (4.9, 046_05)
-        let q = antares_ql::percent_decode(q.as_bytes());
+        // a JSON string, read as written: no percent-decoding (5.2.12, 046_05)
         // parsed once per distinct q text, not once per event per candidate
-        match antares_ql::regex::q_node(&q) {
+        match antares_ql::regex::q_node(q) {
             Some(node) => {
                 // Table 5.2.12-1 gives the Subscription the `expandValues`
                 // and `jsonKeys` pair 4.9 gives the query, and this
@@ -393,19 +392,39 @@ mod tests {
         );
     }
 
-    /// 4.19: `scopeQ` is a condition like `q`; a percent-encoded `q` (as a
-    /// subscription body may carry it) decodes before evaluation.
+    /// 4.19: `scopeQ` is a condition like `q`.
     #[test]
-    fn scope_q_and_percent_encoded_q() {
+    fn scope_q_is_a_condition() {
         let c = ctx();
         let mut doc = vehicle(30.0, -3.7);
         doc["scope"] = json!(["/Madrid/Centre"]);
         let mut s = sub();
         s["scopeQ"] = json!("/Madrid/#");
-        s["q"] = json!("speed%3E25");
         assert!(conditions_match(&s, &doc, &c, &|_| None));
         s["scopeQ"] = json!("/Paris/#");
         assert!(!conditions_match(&s, &doc, &c, &|_| None));
+    }
+
+    /// Table 5.2.12-1: a Subscription's `q` is a JSON string, not part of a
+    /// URI, so it is read as written: `%20` is three characters (forge
+    /// cd2ef2ba, 046_05).
+    #[test]
+    fn a_subscription_q_is_not_percent_decoded() {
+        let c = ctx();
+        let named = |name: &str| {
+            expand(json!({
+                "id": "urn:ngsi-ld:Vehicle:A1",
+                "type": "Vehicle",
+                "name": {"type": "Property", "value": name}
+            }))
+        };
+        let mut s = sub();
+        s.as_object_mut().expect("object").remove("geoQ");
+        s["q"] = json!("name==\"Eiffel%20Tower\"");
+        assert!(conditions_match(&s, &named("Eiffel%20Tower"), &c, &|_| {
+            None
+        }));
+        assert!(!conditions_match(&s, &named("Eiffel Tower"), &c, &|_| None));
     }
 
     /// Table 5.2.33-1 `type`: "A valid type selection string as per clause

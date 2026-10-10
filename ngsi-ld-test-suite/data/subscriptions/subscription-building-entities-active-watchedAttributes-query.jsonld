@@ -3,7 +3,7 @@
    "type":"Subscription",
    "isActive": true,
    "watchedAttributes": ["airQualityLevel"],
-   "q": "name==\"Eiffel%20Tower\"",
+   "q": "name==\"Eiffel Tower\"",
    "entities":[
       {
          "type":"Building"

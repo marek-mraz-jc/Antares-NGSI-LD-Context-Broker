@@ -421,14 +421,9 @@ fn norm_member(
         }
         "q" => {
             let q = v.as_str().ok_or_else(|| bad("q must be a string".into()))?;
-            // Validate the string the MATCHER will parse. `conditions_match`
-            // percent-decodes first (4.9, 046_05), so validating the raw
-            // form would let `%28%28%28…` through create-time checks and
-            // only become thousands of real parens at notification time —
-            // inside a spawned task, where the parser's own limits are the
-            // last line of defence.
-            let decoded = crate::negotiate::percent_decode(q.as_bytes());
-            antares_ql::parse_q(&decoded)?;
+            // Validate the string the MATCHER will parse: a JSON string,
+            // read as written (5.2.12, 046_05), never percent-decoded.
+            antares_ql::parse_q(q)?;
             out.insert("q".into(), v.clone());
         }
         "geoQ" => {
@@ -792,7 +787,7 @@ fn sub_members(norm: &Map<String, Value>) -> crate::entities::ReadMembers {
         q: norm
             .get("q")
             .and_then(Value::as_str)
-            .and_then(|q| antares_ql::parse_q(&antares_ql::percent_decode(q.as_bytes())).ok()),
+            .and_then(|q| antares_ql::parse_q(q).ok()),
         geo: norm
             .get("geoQ")
             .and_then(Value::as_object)
@@ -1686,17 +1681,16 @@ mod tests {
         }
     }
 
-    /// Table 5.2.12-1: q is "A valid query string as per clause 4.9". The
-    /// matcher percent-decodes before parsing (4.9), so the DECODED form is
-    /// what must be validated here — otherwise an encoded paren bomb passes
-    /// creation and only unfolds inside the notification task.
+    /// Table 5.2.12-1: q is "A valid query string as per clause 4.9", the
+    /// same string the matcher parses — read as written, so an encoded form
+    /// is not a query the matcher could ever run.
     #[test]
-    fn clause_5_2_12_q_is_validated_in_its_decoded_form() {
+    fn clause_5_2_12_q_is_validated_as_written() {
         assert!(norm(&sub(json!({"q": "temperature>20"}))).is_ok());
         assert!(norm(&sub(json!({"q": "(("}))).is_err());
         assert!(
             norm(&sub(json!({"q": "%28%28%28"}))).is_err(),
-            "a percent-encoded unbalanced expression must be rejected at creation"
+            "percent signs are not part of the 4.9 grammar"
         );
         assert!(norm(&sub(json!({"q": 5}))).is_err());
     }
