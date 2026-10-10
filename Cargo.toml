@@ -15,6 +15,7 @@ members = [
     "crates/antares-ops",
     "crates/linkml-model",
     "crates/odata-csdl",
+    "crates/odata-url",
     # The reference plugin: built and tested with the workspace so the
     # driver, routing and notification seams cannot drift from it.
     "examples/plugin-example",
@@ -157,6 +158,9 @@ overflow-checks = true
 overflow-checks = true
 
 [profile.release.package.odata-csdl]
+overflow-checks = true
+
+[profile.release.package.odata-url]
 overflow-checks = true
 
 [profile.wasm-release]

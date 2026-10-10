@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: ${{ fromJSON(inputs.targets || '["parse_q", "scope_q", "geo_params", "expand_entity", "q_to_sql", "type_selection", "projection", "representation", "join", "temporal", "order_by", "link_header", "tenant_header", "accept_header", "id_pattern", "datetime", "linkml_read"]') }}
+        target: ${{ fromJSON(inputs.targets || '["parse_q", "scope_q", "geo_params", "expand_entity", "q_to_sql", "type_selection", "projection", "representation", "join", "temporal", "order_by", "link_header", "tenant_header", "accept_header", "id_pattern", "datetime", "linkml_read", "odata_url_parse"]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -42,6 +42,9 @@ jobs:
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Seed odata_url_parse from the OASIS ABNF test cases (fetched, digest-checked)
+        if: matrix.target == 'odata_url_parse'
+        run: pip install --quiet pyyaml==6.0.3 && python3 dev/odata-url-abnf.py --seeds fuzz/corpus/odata_url_parse
       - name: Fuzz ${{ matrix.target }}
         # bounded allocation is part of the property (T-3463): one allocation
         # past 512 MB, or a process past 2 GB, is a finding like a panic
