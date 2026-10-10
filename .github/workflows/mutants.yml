@@ -43,8 +43,9 @@ jobs:
           - name: policy
             shards: 6
             # lib tests plus the policy_* integration files: a mutant only
-            # an integration test kills is not a survivor
-            args: -p antares-api -f crates/antares-api/src/policy.rs -- --lib --test 'policy_*'
+            # an integration test kills is not a survivor. `Slow` is the
+            # test-kit wrapper the engine contract sleeps in, not seam code.
+            args: -p antares-api -f crates/antares-api/src/policy.rs --exclude-re 'for Slow' -- --lib --test 'policy_*'
         shard: [0, 1, 2, 3, 4, 5]
     env:
       CARGO_TERM_COLOR: never

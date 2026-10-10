@@ -47,13 +47,16 @@ pub type DecisionsFuture<'a> = Pin<Box<dyn Future<Output = Vec<Decision>> + Send
 /// either way — failing closed at 250 ms is the difference between a 403
 /// and a broker that stops accepting.
 pub static TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
-    let ms = std::env::var("ANTARES_POLICY_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n: &u64| *n > 0)
-        .unwrap_or(250);
-    Duration::from_millis(ms)
+    let env = std::env::var("ANTARES_POLICY_TIMEOUT_MS").ok();
+    Duration::from_millis(timeout_ms(env.as_deref()))
 });
+
+/// `ANTARES_POLICY_TIMEOUT_MS` in milliseconds: a positive integer, else 250.
+fn timeout_ms(env: Option<&str>) -> u64 {
+    env.and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(250)
+}
 
 /// The reasons the seam denies on its own, rather than on an engine's word.
 /// Fixed strings: they reach the client in a ProblemDetails `detail`, and
@@ -1738,5 +1741,68 @@ mod tests {
             }
         );
         assert!(!printed.contains("BB-123-XY"), "{printed}");
+    }
+
+    /// T-3552: the policy survivors of mutants run 38073511508.
+    #[test]
+    fn the_timeout_takes_a_positive_integer_or_falls_back() {
+        assert_eq!(timeout_ms(None), 250);
+        assert_eq!(timeout_ms(Some("0")), 250, "zero would deny every request");
+        assert_eq!(timeout_ms(Some("x")), 250);
+        assert_eq!(timeout_ms(Some("1")), 1);
+        assert_eq!(timeout_ms(Some("300")), 300);
+    }
+
+    #[test]
+    fn a_single_string_counts_as_a_one_element_list() {
+        let doc = json!({"type": "T", "scope": "/a"});
+        assert_eq!(entity_types(&doc), ["T"]);
+        assert_eq!(StoredImage::of(&doc).scope, ["/a"]);
+        let listed = json!({"type": ["T", "U"], "scope": ["/a", "/b"]});
+        assert_eq!(entity_types(&listed), ["T", "U"]);
+        assert_eq!(StoredImage::of(&listed).scope, ["/a", "/b"]);
+    }
+
+    #[test]
+    fn an_operation_logs_its_shape_and_never_its_payload() {
+        let op = Operation::new("5.6.1");
+        let shown = format!("{op:?}");
+        assert!(shown.starts_with("Operation {"), "{shown}");
+        assert!(shown.contains("clause: \"5.6.1\""), "{shown}");
+        assert!(shown.contains("ids: 0"), "{shown}");
+    }
+
+    #[test]
+    fn a_rule_is_conditional_on_any_one_of_its_conditions() {
+        let plain = rule("Car", &["speed"]);
+        assert!(!plain.is_conditional());
+        let q = Rule {
+            q: Some(Box::new(antares_ql::parse_q("speed>1").expect("q"))),
+            ..plain.clone()
+        };
+        let scope = Rule {
+            scope_q: Some("/a".to_owned()),
+            ..plain.clone()
+        };
+        assert!(q.is_conditional() && scope.is_conditional());
+    }
+
+    #[test]
+    fn shown_nothing_admits_no_attribute() {
+        let nothing = Shown::nothing();
+        assert_eq!(nothing.only, Some(Default::default()));
+        assert!(!nothing.allows(&iri("name")));
+    }
+
+    #[test]
+    fn a_write_is_refused_only_for_the_attribute_its_type_omits() {
+        let ctx = ctx();
+        let f = Filter {
+            omit_by_type: BTreeMap::from([(iri("User"), vec![iri("status")])]),
+            ..Filter::default()
+        };
+        let user = json!({"id": "urn:x", "type": [iri("User")]});
+        assert!(f.admits_write(&user, &[iri("name").as_str()], &ctx));
+        assert!(!f.admits_write(&user, &[iri("status").as_str()], &ctx));
     }
 }
