@@ -2,7 +2,7 @@
 //! `queryOptions` (ABNF section 2): system query options, parameter aliases and custom options.
 
 use crate::cursor::{count, Cursor};
-use crate::expr::{common_expr, Budget, Scope};
+use crate::expr::{annotation, common_expr, Budget, Scope};
 use crate::literal::{literal, pct_encoded};
 use crate::model::{Member, Model};
 use crate::{
@@ -640,35 +640,4 @@ fn custom(c: &mut Cursor<'_>, options: &mut QueryOptions) -> Result<(), UrlError
     };
     options.custom.push((name, value));
     Ok(())
-}
-
-/// `annotationInQuery` with its `AT` at `start` already consumed: `@namespace.term`, an
-/// optional `#qualifier` (written `%23`), returned with the `@`.
-pub(crate) fn annotation(c: &mut Cursor<'_>, start: usize) -> Result<String, UrlError> {
-    let mut name = String::from("@");
-    let mut parts = 0_u8;
-    loop {
-        let Some(part) = c.identifier()? else {
-            return Err(c.syntax("annotationInQuery"));
-        };
-        name.push_str(part);
-        parts = parts.saturating_add(1);
-        if !c.eat(".") {
-            break;
-        }
-        name.push('.');
-    }
-    if parts < 2 {
-        // A term without its namespace cannot be told apart; refused like an unknown name.
-        c.reset(start);
-        return Err(c.error(UrlErrorKind::Unresolved));
-    }
-    if c.eat_ci("%23") {
-        let Some(qualifier) = c.identifier()? else {
-            return Err(c.syntax("annotationQualifier"));
-        };
-        name.push('#');
-        name.push_str(qualifier);
-    }
-    Ok(name)
 }

@@ -17,6 +17,7 @@ members = [
     "crates/odata-csdl",
     "crates/odata-url",
     "crates/odata-json",
+    "crates/odata-batch",
     "crates/antares-views",
     "crates/antares-mcp",
     # The reference plugin: built and tested with the workspace so the
@@ -155,6 +156,9 @@ debug = "line-tables-only"
 # .dep-v0 section survives), thin LTO for smaller + slightly faster code.
 strip = "symbols"
 lto = "thin"
+# Integer overflow panics instead of wrapping: within 3 % of unchecked on
+# the stable perf-baseline shapes (docs/src/perf-baseline.md, T-3552).
+overflow-checks = true
 
 # surfaces-threat-model 10.1: the new crates keep overflow checks in release.
 [profile.release.package.antares-ops]
@@ -170,6 +174,9 @@ overflow-checks = true
 overflow-checks = true
 
 [profile.release.package.odata-json]
+overflow-checks = true
+
+[profile.release.package.odata-batch]
 overflow-checks = true
 
 [profile.release.package.antares-views]

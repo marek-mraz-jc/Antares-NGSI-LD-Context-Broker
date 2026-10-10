@@ -2245,6 +2245,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "odata-batch"
+version = "0.1.3"
+dependencies = [
+ "memchr",
+ "proptest",
+ "serde_json",
+]
+
+[[package]]
 name = "odata-csdl"
 version = "0.1.3"
 dependencies = [

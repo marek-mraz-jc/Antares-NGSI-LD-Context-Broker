@@ -48,7 +48,7 @@ broker nor a storage backend (`antares-api`, `antares-broker`,
 | `antares-sql` | 10 600 | AST → SQL compiler (`compile/`), migrations, the sqlx drivers (`store/pg/`), the memory/redb drivers (`store/mem/`), `AnyStore` facade (`store/any.rs`) | be called from handlers directly (see §7) |
 | `antares-bus` | 760 | `ChangeEvent`, the JetStream bus, subjects | decide who consumes |
 | `antares-notifier` | 1 700 | `NotificationSink` (schemes, `parse_endpoint`, `deliver`, `network`) chosen from `SinkRegistry` by endpoint scheme: http (`http.rs`), mqtt behind the feature, delivery policy, `Outbound` | match or store |
-| `antares-api` | 49 500 | the HTTP binding: routers, handlers, negotiation, federation, notification pipeline, snapshots, bounds | own a backend or a transport |
+| `antares-api` | 55 000 | the HTTP binding: routers, handlers, negotiation, federation, notification pipeline, snapshots, bounds | own a backend or a transport |
 | `antares-broker` | 3 800 | composition root: env → config, roles, bus wiring (`wiring.rs`), telemetry, shutdown | contain clause logic |
 | `antares-wasm` | 500 | the router under a Service Worker, OPFS-backed file store | diverge from the native router |
 | `antares-ops` | 1 880 | the operation layer every surface serves through (ADR-0027 section 1): `Ops` over `AppState::call`, `OperationId` (the matrix rows), `Refusal`, `Surface`; the view table (`views.rs`: `View`, load and validation, `/q/views`, reload, rule M4 closing a surface with no view) | be linked by a vanilla build, name the store, SQL, bus or notifier |
@@ -57,6 +57,7 @@ broker nor a storage backend (`antares-api`, `antares-broker`,
 | `odata-csdl` | 3 640 | OData 4.01 EDM model, CSDL XML and CSDL JSON writers, model validation under caller `Limits` (ADR-0024) | know its host (no `antares-*` dependency, rule M1) or read CSDL |
 | `odata-url` | 5 150 | OData 4.01 relative URLs (resource path, system query options, `$filter`) to a typed AST under caller `Limits`, against a `Model` the caller supplies; canonical writer; the subset of T-3441, the rest `NotImplemented` (ADR-0024) | know its host (no `antares-*` dependency, rule M1) or decide a status code |
 | `odata-json` | 2 250 | OData 4.01 JSON format: entity, collection, reference, service-document and error writers at `metadata=none\|minimal\|full` in 4.0 or 4.01 spelling; the body reader of the mapped writes (W1, W2, W4, W6, W10, W11, W16, W20) under caller `BodyLimits`; `Prefer` and version negotiation; the rest `NotImplemented` (ADR-0024) | know its host (no `antares-*` dependency, rule M1), decide a status beyond `BodyError::status`, or echo a request value in an error |
+| `odata-batch` | 1 070 | OData 4.01 `$batch`: `multipart/mixed` (Protocol 11.7.7) and JSON (JSON Format 19) request parsers to one `Batch` under caller `Limits`, strict framing (CRLF only, no preamble, epilogue or folding), `dependsOn` as indices of earlier members, the response writers; change sets, `atomicityGroup`, Content-ID references and media bodies `NotImplemented` (ADR-0024) | know its host (no `antares-*` dependency, rule M1), drop or trust a member header (the surface keeps the OData ones, O9), or run a member |
 
 ## 3. Module map of `antares-api/src`
 
@@ -267,7 +268,14 @@ Stated so they are not rediscovered. Each is measured, not guessed.
   and not field types, so the source-level count is the one to measure: `dev/module-graph.py` prints
   it per crate and `xray.yml` ratchets the largest component of every
   crate against `dev/module-baseline.json` (`antares-jsonld` holds a
-  second one, `context` ↔ `loader`, of two).
+  second one, `context` ↔ `loader`, of two). Three numbers in it are
+  measured, not chosen (T-3602): the gate had never run on this fork, and
+  `antares-api` already held a component of 7 when the baseline said 1; it
+  holds 21 now (`admin_auth` to `views`, the handlers reaching each other
+  through `state` and back), recorded so that it can only shrink.
+  `odata-csdl` holds 3 (`error`, `model`, `validate`) through two doc
+  links alone, `model` and `error` naming `validate` for the reader; its
+  code edges are acyclic.
 - `antares-api` names no storage backend in a normal build: `antares-sql`
   is an optional dependency behind the dev-only `test-kit` and `postgres`
   features (`AppState::new` over the built-in store, the Postgres-backed
@@ -328,9 +336,15 @@ Stated so they are not rediscovered. Each is measured, not guessed.
   rows per federated query on a 10 000-registration registry; the
   `csource_index` needs a type-first shape.
 - Duplication has a measured floor rather than a target of zero.
-  `dev/dup-check.sh` ratchets the workspace at 68 token clones over 805
-  lines (`dev/dup-baseline.json`), 610 of them in `antares-api`, and at 14
-  groups of functions sharing one signature. What the ratchet still allows:
+  `dev/dup-check.sh` ratchets the workspace at 79 token clones over 958
+  lines (`dev/dup-baseline.json`), 727 of them in `antares-api`, at 16
+  groups of functions sharing one signature and at 6 names defined in more
+  than one crate (`from_env`, `from_params`, `of`, `parse`, `parse_q`,
+  `serve`: same word, different job). The floor was 68 over 805 in
+  September; `xray.yml` had no run on this fork since, and once
+  `odata-csdl` landed nightly rustdoc refused its ambiguous `validate`
+  links, so the gate stopped before it measured. T-3602 fixed the links
+  and recorded the numbers as found; from here they can only shrink. What the ratchet still allows:
   - 35 lines are `use` blocks in files serving neighbouring clauses. A
     `use` list is not logic, and a shared prelude would hide what each
     module depends on.
