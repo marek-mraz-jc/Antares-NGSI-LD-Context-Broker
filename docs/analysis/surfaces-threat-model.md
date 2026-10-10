@@ -253,7 +253,7 @@ Assets: A1 to A3, A6, A8.
 | W8 | E | a view is narrowed or removed while a connection still holds Subscriptions made through it | ADR-0023 rule 9: the view is applied at match time; a removed view stops delivery and closes its connections | `ws_views.rs::ws_a_removed_view_stops_delivery` |
 | W9 | D | a flood of subscribe messages on one connection | a per-connection Subscription cap (proposed `MAX_WS_SUBSCRIPTIONS_PER_CONNECTION`); each create is an ordinary gated 10.5.2 through `Ops` | `ws_bounds.rs::ws_subscriptions_per_connection_are_capped` |
 | W10 | R | connections cannot be traced | open and close logged with view, tenant, connection id and close reason; no subject value in the log (ADR-0020) | `ws_log.rs::ws_open_and_close_are_logged_without_the_subject` |
-| W11 | T | a client message parser fed crafted input | bounded serde parse of a closed message enum with `deny_unknown_fields` | fuzz target `fuzz/fuzz_targets/ws_client_message.rs` (proposed, T-3517) |
+| W11 | T | a client message parser fed crafted input | bounded serde parse of a closed message enum with `deny_unknown_fields` | fuzz target `fuzz/fuzz_targets/ws_client_message.rs` |
 
 ## 8. Internal (in-process) Context Source registrations (`internal-csr`)
 
