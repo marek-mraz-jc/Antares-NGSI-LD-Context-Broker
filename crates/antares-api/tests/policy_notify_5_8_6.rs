@@ -331,7 +331,7 @@ async fn a_pick_leaves_the_entity_frame_and_nothing_it_did_not_name() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_notification_filter_that_carries_a_query_is_dropped() {
     let (st, _) = state(NotifyDecision::Filter(Filter {
-        q: Some(antares_ql::parse_q("speed<50").expect("q")),
+        q: Some(Box::new(antares_ql::parse_q("speed<50").expect("q"))),
         ..Filter::default()
     }))
     .await;
@@ -459,7 +459,7 @@ async fn a_joined_notification_does_not_carry_a_target_the_narrowing_hides() {
         (NotifyDecision::Deliver, true),
         (
             NotifyDecision::Filter(Filter {
-                q: Some(antares_ql::parse_q("public==true").expect("q")),
+                q: Some(Box::new(antares_ql::parse_q("public==true").expect("q"))),
                 ..Filter::default()
             }),
             false,

@@ -2179,7 +2179,9 @@ async fn deliver_as(
                 }
                 // a linked condition already read the target unprojected
                 // (T-3474): the narrowing came too late to apply to it
-                if (!f.omit.is_empty() || !f.pick.is_empty()) && linked_condition(sub) {
+                if (!f.omit.is_empty() || !f.pick.is_empty() || f.has_type_rules())
+                    && linked_condition(sub)
+                {
                     tracing::debug!(
                         "subscription {sub_id} has a linked q under a projecting narrowing; dropping"
                     );

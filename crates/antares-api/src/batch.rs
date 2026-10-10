@@ -1517,6 +1517,9 @@ async fn batch_query_inner(
     // after the "too wide" judgement — which is about what the client asked
     // for. Everything below reads the narrowed query, the forwarded one
     // included.
+    // what the client's own Query reads, before the engine's q joins it
+    // (ADR-0023 rule 11)
+    let narrow = crate::repr::narrowing_reading(&filter, &vp, &parsed.ctx)?;
     let vp = filter.narrow_params(&vp)?;
     let fed = if crate::federation::active(&vp)
         && !crate::federation::via_loop(
@@ -1536,15 +1539,9 @@ async fn batch_query_inner(
     } else {
         Vec::new()
     };
-    let mut matches = crate::entities::filter_entities_fed(
-        st,
-        &tenant,
-        &vp,
-        &parsed.ctx,
-        fed,
-        Some(&crate::repr::narrowing(&filter)),
-    )
-    .await?;
+    let mut matches =
+        crate::entities::filter_entities_fed(st, &tenant, &vp, &parsed.ctx, fed, Some(&narrow))
+            .await?;
     let mut page_params = params.clone();
     page_params.extend(vp.clone());
     // 5.2.43 ordering: same 4.23 keys as the GET twin, applied pre-pagination

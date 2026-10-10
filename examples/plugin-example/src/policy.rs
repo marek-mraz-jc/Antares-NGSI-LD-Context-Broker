@@ -58,7 +58,7 @@ impl Rule {
 
     fn filter(&self) -> Option<Filter> {
         (!self.omit.is_empty() || self.q.is_some()).then(|| Filter {
-            q: self.q.clone(),
+            q: self.q.clone().map(Box::new),
             omit: self.omit.clone(),
             // the caller is told the answer was narrowed; ADR-0020 leaves
             // this to the engine, and an engine that hides a row silently
