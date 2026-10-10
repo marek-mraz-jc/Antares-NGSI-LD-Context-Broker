@@ -241,7 +241,7 @@ async fn compiled_sql_never_drops_a_row_the_evaluator_keeps() {
             .query_entities(
                 &t,
                 &EntityFilter {
-                    geo: spec.as_ref(),
+                    geo: spec.as_slice(),
                     ..Default::default()
                 },
             )
@@ -338,7 +338,7 @@ async fn compiled_sql_never_drops_a_row_the_evaluator_keeps() {
         .query_entities(
             &t,
             &EntityFilter {
-                geo: spec.as_ref(),
+                geo: spec.as_slice(),
                 ..Default::default()
             },
         )
@@ -1258,7 +1258,7 @@ async fn temporal_geo_prefilter_narrows_but_never_drops() {
     for (n, (spec, iri, keep, drop)) in cases.iter().enumerate() {
         let tf = antares_sql::store::filter::TemporalFilter {
             range: Some(antares_sql::compile::temporal::InstanceRange { ..range }),
-            geo: Some((spec, iri)),
+            geo: &[((*spec).clone(), (*iri).to_owned())],
             expand: &expand,
             ..Default::default()
         };

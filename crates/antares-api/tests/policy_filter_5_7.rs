@@ -981,3 +981,200 @@ async fn a_linked_q_term_does_not_read_an_attribute_the_narrowing_omits() {
         "a visible linked Attribute still selects"
     );
 }
+
+/// Four Vehicles on the equator, one per degree of longitude 0..3.
+async fn seed_placed(st: &AppState) {
+    for lon in 0..4 {
+        let id = format!("urn:ngsi-ld:Vehicle:at{lon}");
+        let (code, _) = send(
+            st,
+            "POST",
+            "/ngsi-ld/v1/entities",
+            Some(json!({
+                "id": id, "type": "Vehicle",
+                "location": {"type": "GeoProperty",
+                             "value": {"type": "Point", "coordinates": [lon, 0]}},
+            })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "seed {id}");
+    }
+}
+
+/// A `within` box from longitude `west` to `east`, 1 degree either side of
+/// the equator, as the three 4.10 query parameters.
+fn within_box(west: f64, east: f64) -> [(&'static str, String); 3] {
+    [
+        ("georel", "within".to_owned()),
+        ("geometry", "Polygon".to_owned()),
+        (
+            "coordinates",
+            json!([[
+                [west, -1.0],
+                [east, -1.0],
+                [east, 1.0],
+                [west, 1.0],
+                [west, -1.0]
+            ]])
+            .to_string(),
+        ),
+    ]
+}
+
+fn box_query(west: f64, east: f64) -> String {
+    within_box(west, east)
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlencoding(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn urlencoding(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// ADR-0023 rule 1: a narrowing by area joins the request's own geoquery.
+/// 7.2.5 lets a request carry one, so the store query holds both and every
+/// one of them must hold: the caller's area cannot move the policy's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filter_geo_q_narrows_and_a_request_geo_q_still_applies() {
+    let area = |west, east| {
+        let params = within_box(west, east)
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        antares_ql::geo::GeoQuery::from_params(&params)
+            .expect("valid geoquery")
+            .expect("a geoquery")
+    };
+    let at = |lons: &[u8]| -> Vec<String> {
+        lons.iter()
+            .map(|l| format!("urn:ngsi-ld:Vehicle:at{l}"))
+            .collect()
+    };
+
+    // the request's area alone
+    let wide = state(Filter::default()).await;
+    seed_placed(&wide).await;
+    let request = box_query(0.5, 2.5);
+    assert_eq!(
+        sorted_ids(
+            &wide,
+            &format!("/ngsi-ld/v1/entities?type=Vehicle&{request}")
+        )
+        .await,
+        at(&[1, 2])
+    );
+
+    // the policy's area alone: longitudes 0 and 1
+    let st = state(Filter {
+        geo_q: Some(Box::new(area(-0.5, 1.5))),
+        ..Filter::default()
+    })
+    .await;
+    seed_placed(&st).await;
+    assert_eq!(
+        sorted_ids(&st, "/ngsi-ld/v1/entities?type=Vehicle").await,
+        at(&[0, 1])
+    );
+
+    // both: only longitude 1, and the count says so
+    let uri = format!("/ngsi-ld/v1/entities?type=Vehicle&count=true&{request}");
+    assert_eq!(sorted_ids(&st, &uri).await, at(&[1]));
+    let count = antares_api::router(st.clone())
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .headers()
+        .get("NGSILD-Results-Count")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    assert_eq!(count.as_deref(), Some("1"));
+
+    // an area of the caller's own outside the policy's widens nothing
+    assert!(sorted_ids(
+        &st,
+        &format!("/ngsi-ld/v1/entities?type=Vehicle&{}", box_query(1.5, 3.5))
+    )
+    .await
+    .is_empty());
+
+    // the batch query and the retrieve are narrowed alike
+    let (code, list) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/query",
+        Some(json!({"type": "Query", "entities": [{"type": "Vehicle"}],
+                    "geoQ": {"geometry": "Polygon", "georel": "within",
+                             "coordinates": [[[0.5, -1.0], [2.5, -1.0], [2.5, 1.0], [0.5, 1.0], [0.5, -1.0]]]}})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list), at(&[1]), "{list}");
+    let (code, _) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:at1",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, pd) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:at2",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{pd}");
+}
+
+/// 5.7.4 reads the same Entities over time under the same area.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filter_geo_q_narrows_the_temporal_query() {
+    let params = within_box(-0.5, 1.5)
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+    let st = state(Filter {
+        geo_q: antares_ql::geo::GeoQuery::from_params(&params)
+            .expect("valid geoquery")
+            .map(Box::new),
+        ..Filter::default()
+    })
+    .await;
+    for lon in 0..4 {
+        let id = format!("urn:ngsi-ld:Vehicle:at{lon}");
+        let (code, _) = send(
+            &st,
+            "POST",
+            "/ngsi-ld/v1/temporal/entities",
+            Some(json!({
+                "id": id, "type": "Vehicle",
+                "location": [{"type": "GeoProperty",
+                              "value": {"type": "Point", "coordinates": [lon, 0]},
+                              "observedAt": "2026-01-01T00:00:00Z"}],
+            })),
+        )
+        .await;
+        assert!(
+            code == StatusCode::CREATED || code == StatusCode::NO_CONTENT,
+            "seed {id}: {code}"
+        );
+    }
+    let base =
+        "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after&timeAt=1970-01-01T00:00:00Z";
+    assert_eq!(
+        sorted_ids(&st, base).await,
+        ["urn:ngsi-ld:Vehicle:at0", "urn:ngsi-ld:Vehicle:at1"]
+    );
+    assert_eq!(
+        sorted_ids(&st, &format!("{base}&{}", box_query(0.5, 3.5))).await,
+        ["urn:ngsi-ld:Vehicle:at1"]
+    );
+}

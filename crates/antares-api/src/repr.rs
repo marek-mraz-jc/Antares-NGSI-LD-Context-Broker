@@ -186,10 +186,11 @@ pub fn narrow_projection(
 /// the Entity, and a document without them is not one — which is why the
 /// policy pick is applied to Attributes and never to the core members.
 pub fn narrow_repr(r: &mut Repr, f: &crate::policy::Filter) {
-    if f.q.is_some() || f.scope_q.is_some() {
+    if f.q.is_some() || f.scope_q.is_some() || f.geo_q.is_some() {
         r.policy_reach = Some(std::sync::Arc::new(PolicyReach {
             q: f.q.clone(),
             scope_q: f.scope_q.clone(),
+            geo_q: f.geo_q.clone(),
         }));
     }
     if !f.omit.is_empty() {
@@ -200,11 +201,13 @@ pub fn narrow_repr(r: &mut Repr, f: &crate::policy::Filter) {
     }
 }
 
-/// The rows a narrowing admits (ADR-0020 `Filter::q` and `scope_q`).
+/// The rows a narrowing admits (ADR-0020 `Filter::q`, `scope_q` and
+/// `geo_q`).
 #[derive(Debug, Clone)]
 pub struct PolicyReach {
     pub q: Option<antares_ql::QNode>,
     pub scope_q: Option<String>,
+    pub geo_q: Option<Box<antares_ql::geo::GeoQuery>>,
 }
 
 /// Whether the narrowing admits the INTERNAL document `doc`; no narrowing
@@ -222,6 +225,11 @@ pub(crate) async fn policy_admits(
     };
     if let Some(scope) = &reach.scope_q {
         if !crate::scope_matches(scope, doc) {
+            return false;
+        }
+    }
+    if let Some(geo) = &reach.geo_q {
+        if !geo.matches(doc, ctx) {
             return false;
         }
     }

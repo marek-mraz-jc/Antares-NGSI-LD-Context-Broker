@@ -65,10 +65,11 @@ on the conjoined query, so `NGSILD-Results-Count` and the `Link`
 requires the count to be "the number of expected resulting elements", and
 the expected elements of a view are the in-view ones.
 
-`geo_q` has no member in `policy::Filter` today and a request may carry its
-own `geoQ`; 7.2.5 allows one geoQ per query. The store query takes a list
-of geo predicates, all of which must hold (the view's and the request's).
-That is an `antares-ql`/`antares-store` change, filed by T-3445.
+`policy::Filter` carries a `geo_q` and a request may carry its own `geoQ`;
+7.2.5 allows one geoQ per query. The store query takes a list of geo
+predicates, all of which must hold (the view's and the request's): the
+`antares-store` filters hold a slice of them, the Postgres arms conjoin
+one predicate per entry, and the evaluator requires every one (T-3484).
 
 ### 2. A hidden attribute does not exist while `q` is evaluated
 

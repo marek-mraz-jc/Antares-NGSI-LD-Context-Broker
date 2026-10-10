@@ -29,7 +29,7 @@ pub const LOCATION_IRI: &str = "https://uri.etsi.org/ngsi-ld/location";
 pub const MAX_GEO_VERTICES: usize = 1024;
 
 /// `georel` as parsed from the request (4.10), distances in metres.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Rel {
     /// `near;maxDistance==…` / `near;minDistance==…` — either bound may be absent.
     Near {
@@ -57,6 +57,7 @@ pub type Georel = Rel;
 
 /// A geoquery in the borrowed shape the SQL compilers take (4.10 params
 /// as the API already validated them).
+#[derive(Clone)]
 pub struct GeoSpec<'a> {
     /// The relation.
     pub rel: Rel,
@@ -69,7 +70,7 @@ pub struct GeoSpec<'a> {
 }
 
 /// A parsed 4.10 geoquery: the query geometry is parsed once at construction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GeoQuery {
     /// The relation.
     pub rel: Georel,

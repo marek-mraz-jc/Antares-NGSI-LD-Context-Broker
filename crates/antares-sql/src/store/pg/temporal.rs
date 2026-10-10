@@ -626,7 +626,7 @@ impl PgTemporalStore {
         // of the geoproperty possibly satisfying the geoquery are never
         // reconstructed. NULL geo_value (rows with no extracted geometry) always
         // survives; GeoQuery::matches stays the arbiter.
-        if let Some((spec, iri)) = f.geo {
+        for (spec, iri) in f.geo {
             let attr_bind = binds.len() + 1;
             let mut win_binds: Vec<String> = Vec::new();
             let mut window = String::new();
