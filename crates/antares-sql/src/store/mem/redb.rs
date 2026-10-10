@@ -58,7 +58,7 @@ pub(super) fn table_for(kind: Kind) -> TableDefinition<'static, &'static [u8], &
 /// as the plain string the maps are keyed by, so a persisted removal can
 /// never be skipped for want of a re-parse.
 pub(super) fn key_bytes(tenant: &str, id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(tenant.len() + 1 + id.len());
+    let mut k = Vec::with_capacity(tenant.len().saturating_add(1).saturating_add(id.len()));
     k.extend_from_slice(tenant.as_bytes());
     k.push(0);
     k.extend_from_slice(id.as_bytes());
@@ -67,9 +67,10 @@ pub(super) fn key_bytes(tenant: &str, id: &str) -> Vec<u8> {
 
 pub(super) fn split_key(key: &[u8]) -> Option<(String, String)> {
     let pos = key.iter().position(|&b| b == 0)?;
+    let (tenant, rest) = key.split_at_checked(pos)?;
     Some((
-        String::from_utf8(key[..pos].to_vec()).ok()?,
-        String::from_utf8(key[pos + 1..].to_vec()).ok()?,
+        String::from_utf8(tenant.to_vec()).ok()?,
+        String::from_utf8(rest.get(1..)?.to_vec()).ok()?,
     ))
 }
 

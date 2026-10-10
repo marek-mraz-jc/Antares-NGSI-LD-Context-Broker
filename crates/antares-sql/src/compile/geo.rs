@@ -114,7 +114,7 @@ fn predicate(spec: &GeoSpec<'_>, col: &str, first_bind: usize) -> Option<Compile
             // Numeric binds are numbered after ALL geo binds; there is exactly
             // one geo bind here, hence the +1 base.
             if let Some(m) = max {
-                let n = first_bind + 1 + num_binds.len();
+                let n = first_bind.saturating_add(1).saturating_add(num_binds.len());
                 // widen: spheroid-vs-sphere slack, plus a metre of absolute
                 // slack so a 0 m radius still behaves
                 num_binds.push(m * 1.005 + 1.0);
@@ -123,7 +123,7 @@ fn predicate(spec: &GeoSpec<'_>, col: &str, first_bind: usize) -> Option<Compile
                 ));
             }
             if let Some(m) = min {
-                let n = first_bind + 1 + num_binds.len();
+                let n = first_bind.saturating_add(1).saturating_add(num_binds.len());
                 num_binds.push((m * 0.995 - 1.0).max(0.0));
                 parts.push(format!(
                     "ST_Distance({col}::geography, {g}::geography) >= ${n}"
@@ -155,8 +155,10 @@ fn predicate(spec: &GeoSpec<'_>, col: &str, first_bind: usize) -> Option<Compile
 pub fn extract_location(doc: &Value) -> Option<String> {
     let instances = doc.get(LOCATION_IRI)?;
     let inst = match instances {
-        Value::Array(a) if a.len() == 1 => &a[0],
-        Value::Array(_) => return None, // multi-instance: let the evaluator judge
+        Value::Array(a) => match a.as_slice() {
+            [one] => one,
+            _ => return None, // multi-instance: let the evaluator judge
+        },
         v => v,
     };
     let value = inst.get("value").or_else(|| inst.get("object"))?;

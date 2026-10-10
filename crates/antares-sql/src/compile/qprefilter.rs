@@ -82,7 +82,7 @@ fn emit_prefilter(
             let mut exact = true;
             for it in items {
                 if let Some((s, b, e)) =
-                    emit_prefilter(it, range, entity, first + binds.len(), expand)
+                    emit_prefilter(it, range, entity, first.saturating_add(binds.len()), expand)
                 {
                     sqls.push(s);
                     binds.extend(b);
@@ -100,7 +100,8 @@ fn emit_prefilter(
             let mut binds = Vec::new();
             let mut exact = true;
             for it in items {
-                let (s, b, e) = emit_prefilter(it, range, entity, first + binds.len(), expand)?;
+                let (s, b, e) =
+                    emit_prefilter(it, range, entity, first.saturating_add(binds.len()), expand)?;
                 sqls.push(s);
                 binds.extend(b);
                 exact &= e;
@@ -144,10 +145,12 @@ fn leaf(
         // without an end) is refused by `column_range_bound` too, so there is
         // no widened bound to fall back on: the EXISTS then keeps the
         // attribute predicate alone — unwindowed, which only widens.
-        if let Some(c) =
-            crate::compile::temporal::compile_instance_range(r, "qi.data", first + binds.len())
-        {
-            let time_bind = first + binds.len() + 1;
+        if let Some(c) = crate::compile::temporal::compile_instance_range(
+            r,
+            "qi.data",
+            first.saturating_add(binds.len()),
+        ) {
+            let time_bind = first.saturating_add(binds.len()).saturating_add(1);
             window = format!(" AND {}", c.sql);
             binds.extend(c.binds);
             if let Some(cb) = column_range_bound(r, "qi", time_bind) {
@@ -196,7 +199,7 @@ fn instance_predicate(
             Some(f) => format!("$.\"languageMap\".*{f}"),
             None => "$.\"languageMap\".*".to_owned(),
         };
-        let n = first + binds.len();
+        let n = first.saturating_add(binds.len());
         binds.push(jp);
         let lang = format!("qi.data @? ${n}::jsonpath");
         // `[*]` is only ever the language wildcard. A NAMED bracket is
@@ -227,7 +230,7 @@ fn instance_predicate(
         let sql = q::value_or_filter("$", Some(&f), "qi.data", first, binds);
         return Some((format!("NOT {sql}"), false));
     }
-    if let Some(l) = compile_instance_leaf(cmp, "qi.data", first + binds.len()) {
+    if let Some(l) = compile_instance_leaf(cmp, "qi.data", first.saturating_add(binds.len())) {
         binds.extend(l.binds);
         // existence leaves stay inexact: deletion-instance semantics differ
         return Some((l.sql, cmp.is_some()));
@@ -248,7 +251,7 @@ fn instance_predicate(
             "valueList",
             "objectList",
         ] {
-            let n = first + binds.len();
+            let n = first.saturating_add(binds.len());
             binds.push(sv.clone());
             parts.push(format!(
                 "(jsonb_typeof(qi.data->'{key}') = 'string' \
