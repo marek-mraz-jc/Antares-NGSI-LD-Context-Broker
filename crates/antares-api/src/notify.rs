@@ -1623,6 +1623,12 @@ pub async fn interval_tick(st: &AppState) {
             } else {
                 None
             };
+            // a stored q that no longer parses (one percent-encoded before
+            // 5.2.12's read-as-written) matches nothing, as conditions_match
+            // decides: no Entity to read and no Notification to send
+            if sub_str(&sub, "q").is_some_and(|q| antares_ql::regex::q_node(q).is_none()) {
+                continue;
+            }
             let ctx = sub_context(st, &tenant, &sub).await;
             let now = now_iso();
             // 5.8.6: the periodic Notification "shall include all the
