@@ -1,6 +1,9 @@
 # ADR-0016 — Notification bindings behind the sink registry
 
-Date: 2026-08-30. Status: accepted, implemented.
+Date: 2026-08-30. Status: accepted, implemented; rule 5 amended by ADR-0026
+(Consequences): the WebSocket sink declares `network() == false` and writes to an
+inbound connection, so "every binding shipped here is policed" reads "every
+binding shipped here that opens an outbound connection is policed".
 Supersedes the notification-sink paragraph of ADR-0014.
 
 ## Context

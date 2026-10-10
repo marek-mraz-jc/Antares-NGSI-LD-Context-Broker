@@ -62,6 +62,13 @@ here).
 | `ANTARES_MCP_ALLOWED_HOSTS` | unset (loopback names) | Builds with the `mcp` feature only: the `Host` names the [MCP endpoint](mcp.md) answers, comma-separated. Set it to the names clients reach the broker by; any other `Host` is refused, which stops DNS rebinding (MC8). |
 | `ANTARES_MCP_ALLOWED_ORIGINS` | unset (no browser origin) | Builds with the `mcp` feature only: the browser origins the MCP endpoint answers, comma-separated. Origin validation is always on: unset, a request that carries any `Origin` is `403`. |
 | `ANTARES_MCP_MAX_RESULT_BYTES` | `65536` (64 KiB) | Builds with the `mcp` feature only: the most bytes of structured content one tool result carries; a list past it comes a page at a time. Values outside 1 KiB to 16 MiB are ignored. |
+| `ANTARES_WS_ALLOWED_ORIGINS` | unset (no browser origin) | Builds with the `ws` feature only: the browser origins that may open a [WebSocket](websocket.md), comma-separated. An upgrade carrying any other `Origin` is `403`; a client that sends no `Origin` (not a browser) is admitted (W1). |
+| `ANTARES_WS_MAX_CONNECTIONS` | `10000` | Builds with the `ws` feature only: sockets one process holds, those waiting out their resume grace included; past it an upgrade is `503` (W2). |
+| `ANTARES_WS_MAX_CONNECTIONS_PER_TENANT` | `1000` | Builds with the `ws` feature only: the same per Tenant, so one Tenant cannot take the whole process (W2). |
+| `ANTARES_WS_MAX_SUBSCRIPTIONS` | `64` | Builds with the `ws` feature only: Subscriptions one connection makes; past it `x-subscribe` answers `400` (W9). |
+| `ANTARES_WS_QUEUE` | `256` | Builds with the `ws` feature only: notifications queued per connection, and the resume ring's length. A consumer that falls past it gets `x-gap` and is closed with 1013, never buffered further (W4). |
+| `ANTARES_WS_RESUME_GRACE_SECS` | `30` | Builds with the `ws` feature only: how long a connection with Subscriptions outlives its socket for `x-resume`; after it its Subscriptions are deleted. |
+| `ANTARES_WS_MAX_LIFETIME_SECS` | `300` | Builds with the `ws` feature only: a socket ends at this age with `x-closing` `lifetime` and 1000, and the client resumes on a new one, so a revoked credential stops at the next reconnect (W7). |
 | `ANTARES_EXTRA_CA_FILE` | unset | PEM bundle of ADDITIONAL trust anchors for egress TLS (private CAs). Egress TLS trusts the host's certificate store (`/etc/ssl/certs` on Linux; the shipped image carries one), and this widens it. Verification itself is never disableable. |
 
 ## Notification delivery

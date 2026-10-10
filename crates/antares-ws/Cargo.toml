@@ -32,6 +32,10 @@ tokio = { version = "1", default-features = false, features = ["macros", "net", 
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 tracing-subscriber = { workspace = true }
 
+[[bench]]
+name = "fanout"
+harness = false
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "deny"

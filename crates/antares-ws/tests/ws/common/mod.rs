@@ -20,8 +20,20 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 /// How long a test waits for a message it expects.
 pub const WAIT: Duration = Duration::from_secs(10);
 
+/// Tests take a shared turn; one that pushes megabytes through a debug
+/// broker takes it alone, so the others' waits do not depend on its load.
+static TURN: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// A test's turn on the host: one of the guards, held until it ends.
+pub struct Turn {
+    _shared: Option<tokio::sync::RwLockReadGuard<'static, ()>>,
+    _alone: Option<tokio::sync::RwLockWriteGuard<'static, ()>>,
+}
+
 /// A broker serving both surfaces on `addr`.
 pub struct Broker {
+    /// Held for the test's run.
+    pub _turn: Turn,
     /// Kept alive: its reload loop serves `/q/views`.
     pub _kept: TestBroker,
     /// The hub the surfaces and the sink share.
@@ -40,10 +52,31 @@ pub async fn broker(limits: Limits) -> Result<Broker, String> {
     broker_asking(limits, None).await
 }
 
+/// Start a broker under `limits` once no other test runs.
+pub async fn broker_alone(limits: Limits) -> Result<Broker, String> {
+    let turn = Turn {
+        _shared: None,
+        _alone: Some(TURN.write().await),
+    };
+    start(limits, None, turn).await
+}
+
 /// Start a broker under `limits` asking `engine`.
 pub async fn broker_asking(
     limits: Limits,
     engine: Option<Arc<dyn antares_ops::policy::PolicyEngine>>,
+) -> Result<Broker, String> {
+    let turn = Turn {
+        _shared: Some(TURN.read().await),
+        _alone: None,
+    };
+    start(limits, engine, turn).await
+}
+
+async fn start(
+    limits: Limits,
+    engine: Option<Arc<dyn antares_ops::policy::PolicyEngine>>,
+    turn: Turn,
 ) -> Result<Broker, String> {
     // read once by the broker at first use, before any broker of this
     // binary starts
@@ -63,6 +96,7 @@ pub async fn broker_asking(
         let _served = axum::serve(listener, app).await;
     });
     Ok(Broker {
+        _turn: turn,
         _kept: broker,
         hub,
         addr,
@@ -205,6 +239,30 @@ pub async fn open(
         Err(tokio_tungstenite::tungstenite::Error::Http(refused)) => return Ok(Err(*refused)),
         Err(e) => return Err(e.to_string()),
     };
+    welcomed(ws).await.map(Ok)
+}
+
+/// Open the root with a receive buffer of `bytes` fixed before the
+/// connect, which turns the kernel's autotuning off: a client that stops
+/// reading then stalls the server's writes after about that much, whatever
+/// the host's `tcp_rmem` ceiling.
+pub async fn connect_small(addr: SocketAddr, bytes: u32) -> Result<Client, String> {
+    let socket = tokio::net::TcpSocket::new_v4().map_err(|e| e.to_string())?;
+    socket
+        .set_recv_buffer_size(bytes)
+        .map_err(|e| e.to_string())?;
+    let stream = socket.connect(addr).await.map_err(|e| e.to_string())?;
+    let req = format!("ws://{addr}/x/ws/ngsi-ld/v1")
+        .into_client_request()
+        .map_err(|e| e.to_string())?;
+    let (ws, _) = tokio_tungstenite::client_async(req, MaybeTlsStream::Plain(stream))
+        .await
+        .map_err(|e| e.to_string())?;
+    welcomed(ws).await
+}
+
+/// A client on `ws` once its welcome is read.
+async fn welcomed(ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Result<Client, String> {
     let mut client = Client {
         ws,
         connection: String::new(),
@@ -216,7 +274,7 @@ pub async fn open(
     }
     client.connection = text(&welcome, "/metadata/x-connection");
     client.token = text(&welcome, "/metadata/x-resume-token");
-    Ok(Ok(client))
+    Ok(client)
 }
 
 /// Open `path`, which must be admitted.

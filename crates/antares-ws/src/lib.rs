@@ -263,13 +263,20 @@ fn upgrade(
         }
     };
     let (failed_hub, failed_id) = (hub.clone(), conn.id.clone());
-    ws.max_message_size(envelope::MAX_MESSAGE_BYTES)
+    // tungstenite reads into a 128 KiB buffer by default, four times the
+    // budget of an idle connection (ADR-0027 section 6); client messages
+    // are small, and a large one is read in more chunks.
+    ws.read_buffer_size(READ_BUFFER_BYTES)
+        .max_message_size(envelope::MAX_MESSAGE_BYTES)
         .max_frame_size(envelope::MAX_FRAME_BYTES)
         .write_buffer_size(0)
         .max_write_buffer_size(MAX_NOTIFICATION_BYTES.saturating_mul(2))
         .on_failed_upgrade(move |_| failed_hub.close(&failed_id))
         .on_upgrade(move |socket| socket::serve(hub, conn, socket))
 }
+
+/// The read buffer of one socket.
+const READ_BUFFER_BYTES: usize = 4 * 1024;
 
 /// The binding of `urn:antares:ws:` endpoints (rule 4): registered with the
 /// broker's sink registry beside HTTP and MQTT.

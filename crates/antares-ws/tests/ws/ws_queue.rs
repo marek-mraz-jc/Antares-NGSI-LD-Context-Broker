@@ -4,7 +4,9 @@
 //! single-entity notification without `showChanges` replaces its queued
 //! predecessor.
 
-use crate::common::{broker, connect, status, until, with, Client, WAIT};
+use crate::common::{
+    broker, broker_alone, connect, connect_small, status, until, with, Client, WAIT,
+};
 use antares_ws::Limits;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -33,19 +35,20 @@ async fn speeds(c: &mut Client, count: usize) -> Result<Vec<Value>, String> {
 }
 
 /// A client that stops reading while 120 Cars of 200 KiB each are created
-/// is closed within `pong_within` of the stuck write, the overflow is
-/// counted, and it reads far fewer notifications than were matched: the
-/// queue held at most `queue` of them.
+/// loses its socket, either because its queue overflowed (`x-gap`, 1013)
+/// or because a write stayed stuck for `pong_within`, whichever comes
+/// first; and it reads far fewer notifications than were matched: the
+/// server held at most `queue` of them beyond what the socket took.
 #[tokio::test(flavor = "multi_thread")]
 async fn ws_a_slow_consumer_is_disconnected_not_buffered() -> Result<(), String> {
     const CARS: usize = 120;
-    let b = broker(Limits {
+    let b = broker_alone(Limits {
         queue: 4,
         pong_within: Duration::from_secs(2),
         ..Limits::default()
     })
     .await?;
-    let mut c = connect(b.addr, ROOT, &[]).await?;
+    let mut c = connect_small(b.addr, 16 * 1024).await?;
     let sub = json!({"type": "Subscription", "entities": [{"type": "Car"}], "watchedAttributes": ["blob"]});
     assert_eq!(status(&c.subscribe(sub).await?), 201);
     let blob = "b".repeat(200 * 1024);
@@ -58,7 +61,6 @@ async fn ws_a_slow_consumer_is_disconnected_not_buffered() -> Result<(), String>
             .await?;
         assert_eq!(code, 201, "{answer}");
     }
-    until(&b.hub, |h| h.overflows() >= 1).await?;
     until(&b.hub, |h| h.attached() == 0).await?;
     let mut read = 0usize;
     loop {
