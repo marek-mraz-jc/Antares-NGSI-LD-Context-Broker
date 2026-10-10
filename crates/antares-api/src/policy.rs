@@ -557,6 +557,16 @@ impl Filter {
             Ok(own) => own.map(|own| self.hide_terms(own, ctx)),
             Err(_) => return Err(Denied(ENGINE_FAILED.to_owned())),
         };
+        // threat V23: the policy part is held to its share of the narrowed
+        // caps on its own, so whether it fits never depends on the caller's
+        // `q` (see `antares_ql::parse_narrowed_q`)
+        if self
+            .q
+            .as_deref()
+            .is_some_and(|q| !antares_ql::fits_policy_q(q))
+        {
+            return Err(Denied(ENGINE_FAILED.to_owned()));
+        }
         let narrowed = match (own, &self.q) {
             (Some(own), Some(extra)) => Some(QNode::And(vec![own, (**extra).clone()])),
             (own, extra) => own.or_else(|| extra.as_deref().cloned()),

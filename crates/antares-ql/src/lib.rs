@@ -274,17 +274,57 @@ pub fn parse_q(input: &str) -> Result<QNode, NgsiError> {
             "q expression exceeds {MAX_Q_BYTES} bytes"
         )));
     }
+    parse_capped(input, MAX_Q_DEPTH, MAX_Q_NODES)
+}
+
+/// Paren depth a narrowed `q` may reach: the caller's [`MAX_Q_DEPTH`], one
+/// more where a hidden term becomes `(a;!a)`, one more for the conjunction,
+/// and a policy part held below it by [`fits_policy_q`].
+const MAX_NARROWED_Q_DEPTH: usize = 2 * MAX_Q_DEPTH;
+
+/// Nodes a narrowed `q` may hold: the caller's [`MAX_Q_NODES`], each term of
+/// it at most three once a hidden-Attribute rewrite has turned it into
+/// `(a;!a)`, the conjunction, and a policy part held below the rest by
+/// [`fits_policy_q`].
+pub const MAX_NARROWED_Q_NODES: usize = 8 * MAX_Q_NODES;
+
+/// Nodes the policy part of a narrowed `q` (an engine's, a view's, or both
+/// joined) may hold: what [`MAX_NARROWED_Q_NODES`] leaves after the
+/// rewritten caller part and the conjunction.
+const MAX_POLICY_Q_NODES: usize = MAX_NARROWED_Q_NODES - 3 * MAX_Q_NODES - 1;
+
+/// Parse a `q` the broker wrote by joining the caller's own `q` (already
+/// through [`parse_q`]) with a policy part that passed [`fits_policy_q`]
+/// (threat V23). The caps are the sum of the two, so a caller `q` that
+/// [`parse_q`] accepts is never refused here: the size of a predicate the
+/// caller cannot see changes no answer. No byte cap: the text is rendered
+/// from those two trees, and a rendered number is longer than the one
+/// written (`1e300`), so bytes would count the renderer, not the caller.
+pub fn parse_narrowed_q(input: &str) -> Result<QNode, NgsiError> {
+    parse_capped(input, MAX_NARROWED_Q_DEPTH, MAX_NARROWED_Q_NODES)
+}
+
+/// Whether a policy `q` stays inside the share of the narrowed caps the
+/// caller's part leaves it, so [`parse_narrowed_q`] accepts every join of
+/// it with a caller `q` that [`parse_q`] accepts. Judged on the tree alone,
+/// so the verdict is the same for every caller.
+pub fn fits_policy_q(node: &QNode) -> bool {
+    q_nodes(node) <= MAX_POLICY_Q_NODES && paren_depth(node) < MAX_NARROWED_Q_DEPTH
+}
+
+fn parse_capped(input: &str, depth: usize, nodes: usize) -> Result<QNode, NgsiError> {
     let mut p = Parser {
         rest: input.trim(),
         depth: 0,
+        max_depth: depth,
     };
     let node = p.or_expr()?;
     if !p.rest.is_empty() {
         return Err(bad(input, "trailing input"));
     }
-    if q_nodes(&node) > MAX_Q_NODES {
+    if q_nodes(&node) > nodes {
         return Err(NgsiError::TooComplexQuery(format!(
-            "q expression exceeds {MAX_Q_NODES} nodes"
+            "q expression exceeds {nodes} nodes"
         )));
     }
     Ok(node)
@@ -328,6 +368,22 @@ fn q_nodes(n: &QNode) -> usize {
     }
 }
 
+/// The parentheses `n` renders with at its deepest, as `render.rs` writes
+/// them: a group inside `;` and an `|` inside `|` are parenthesised.
+fn paren_depth(n: &QNode) -> usize {
+    let deepest = |xs: &[QNode], wrapped: fn(&QNode) -> bool| {
+        xs.iter()
+            .map(|x| paren_depth(x).saturating_add(usize::from(wrapped(x))))
+            .max()
+            .unwrap_or(0)
+    };
+    match n {
+        QNode::And(xs) => deepest(xs, |x| matches!(x, QNode::And(_) | QNode::Or(_))),
+        QNode::Or(xs) => deepest(xs, |x| matches!(x, QNode::Or(_))),
+        _ => 0,
+    }
+}
+
 fn bad(input: &str, why: &str) -> NgsiError {
     NgsiError::BadRequestData(format!("invalid q expression {input:?}: {why}"))
 }
@@ -336,6 +392,8 @@ struct Parser<'a> {
     rest: &'a str,
     /// open parentheses currently on the stack (see `MAX_Q_DEPTH`)
     depth: usize,
+    /// the ceiling on `depth`: `MAX_Q_DEPTH` for a caller's `q`
+    max_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -369,9 +427,10 @@ impl<'a> Parser<'a> {
         if self.eat('(') {
             // refuse BEFORE recursing — an overflow here aborts the process
             self.depth = self.depth.saturating_add(1);
-            if self.depth > MAX_Q_DEPTH {
+            if self.depth > self.max_depth {
                 return Err(NgsiError::TooComplexQuery(format!(
-                    "q expression nests deeper than {MAX_Q_DEPTH}"
+                    "q expression nests deeper than {}",
+                    self.max_depth
                 )));
             }
             let node = self.or_expr()?;
@@ -1270,6 +1329,103 @@ mod complexity_tests {
         assert!(parse_q(&chain(MAX_Q_NODES - 1)).is_ok());
         assert!(matches!(
             parse_q(&chain(MAX_Q_NODES)),
+            Err(NgsiError::TooComplexQuery(_))
+        ));
+    }
+
+    /// Threat V23: the narrowed caps are the caller's and the policy's
+    /// summed. The largest, the deepest and the longest-rendering `q` a
+    /// caller may send, each term rewritten as a hidden one (`(a;!a)`) and
+    /// joined with the largest and the deepest policy `q` that fits, still
+    /// parse, so the policy's size decides no caller's answer.
+    #[test]
+    fn every_join_of_an_accepted_q_and_a_fitting_policy_parses() {
+        fn hidden(n: QNode) -> QNode {
+            match n {
+                QNode::And(xs) => QNode::And(xs.into_iter().map(hidden).collect()),
+                QNode::Or(xs) => QNode::Or(xs.into_iter().map(hidden).collect()),
+                _ => QNode::And(vec![parse_q("a").expect("a"), parse_q("!a").expect("!a")]),
+            }
+        }
+        let leaf = || parse_q("b==1").expect("leaf");
+        let mut deep = "a==1".to_owned();
+        for i in 0..MAX_Q_DEPTH {
+            deep = format!("a==1{}({deep})", if i % 2 == 0 { ';' } else { '|' });
+        }
+        let callers = [
+            vec!["a==1"; MAX_Q_NODES - 1].join(";"),
+            deep,
+            vec!["a==1e300"; MAX_Q_BYTES / 9].join(";"),
+        ];
+        let wide = QNode::Or(vec![leaf(); MAX_POLICY_Q_NODES - 1]);
+        let mut tall = QNode::And(vec![leaf(), leaf()]);
+        while paren_depth(&tall) < MAX_NARROWED_Q_DEPTH - 1 {
+            tall = QNode::And(vec![leaf(), tall]);
+        }
+        for policy in [&wide, &tall] {
+            assert!(fits_policy_q(policy));
+            for caller in &callers {
+                let own = parse_q(caller).expect("an accepted q");
+                for own in [hidden(own.clone()), own] {
+                    let joined = QNode::And(vec![own, policy.clone()]).to_string();
+                    assert!(parse_narrowed_q(&joined).is_ok(), "{}", &joined[..64]);
+                }
+            }
+        }
+        // the last rendering is past the caller's byte cap, which does not
+        // apply to the broker's own text
+        assert!(callers[2].len() <= MAX_Q_BYTES);
+        assert!(parse_q(&callers[2]).expect("q").to_string().len() > MAX_Q_BYTES);
+        // one node or one level more is a policy that does not fit
+        assert!(!fits_policy_q(&QNode::Or(vec![leaf(); MAX_POLICY_Q_NODES])));
+        assert!(!fits_policy_q(&QNode::And(vec![leaf(), tall])));
+    }
+
+    /// `paren_depth` counts the parentheses the renderer writes: a group
+    /// inside `;`, an `|` inside `|`, never a `;` inside `|`.
+    #[test]
+    fn paren_depth_is_the_rendered_one() {
+        for (q, depth) in [
+            ("a", 0),
+            ("a|b;c", 0),
+            ("a;(b|c)", 1),
+            ("a|(b|c)", 1),
+            ("a;(b;(c|d))", 2),
+        ] {
+            let node = parse_q(q).expect("q");
+            assert_eq!(paren_depth(&node), depth, "{q}");
+            let rendered = node.to_string();
+            let mut open = 0usize;
+            let deepest = rendered.chars().fold(0, |deepest, c| {
+                open = match c {
+                    '(' => open + 1,
+                    ')' => open - 1,
+                    _ => open,
+                };
+                deepest.max(open)
+            });
+            assert_eq!(deepest, depth, "{rendered}");
+        }
+    }
+
+    /// The narrowed caps are ceilings too: past them a narrowed `q` is
+    /// TooComplexQuery, as a caller's is past [`MAX_Q_NODES`].
+    #[test]
+    fn a_narrowed_q_past_its_caps_is_too_complex() {
+        let chain = |n: usize| vec!["a==1"; n].join(";");
+        assert!(parse_narrowed_q(&chain(MAX_NARROWED_Q_NODES - 1)).is_ok());
+        assert!(matches!(
+            parse_narrowed_q(&chain(MAX_NARROWED_Q_NODES)),
+            Err(NgsiError::TooComplexQuery(_))
+        ));
+        let nested = |d: usize| format!("{}a==1{}", "(".repeat(d), ")".repeat(d));
+        assert!(parse_narrowed_q(&nested(MAX_NARROWED_Q_DEPTH)).is_ok());
+        assert!(matches!(
+            parse_narrowed_q(&nested(MAX_NARROWED_Q_DEPTH + 1)),
+            Err(NgsiError::TooComplexQuery(_))
+        ));
+        assert!(matches!(
+            parse_q(&nested(MAX_Q_DEPTH + 1)),
             Err(NgsiError::TooComplexQuery(_))
         ));
     }
