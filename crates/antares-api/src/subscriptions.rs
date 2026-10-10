@@ -325,6 +325,23 @@ fn check_endpoint_params(ep: &Map<String, Value>) -> Result<(), NgsiError> {
         {
             return Err(bad(format!("invalid endpoint accept {acc:?}")));
         }
+        // TS 104 243 5.2, Table 5.2-2: an MQTT message's metadata
+        // Content-Type is "application/json" or "application/ld+json"; the
+        // binding has no GeoJSON. Refused here, at create and at update,
+        // rather than published under a Content-Type the table forbids.
+        let scheme = ep
+            .get("uri")
+            .and_then(Value::as_str)
+            .and_then(|uri| uri.split_once("://"))
+            .map(|(scheme, _)| scheme.to_ascii_lowercase());
+        if acc == "application/geo+json" && matches!(scheme.as_deref(), Some("mqtt" | "mqtts")) {
+            return Err(bad(format!(
+                "endpoint.accept {acc:?} is not available for an {} endpoint: the MQTT \
+                 binding sends \"application/json\" or \"application/ld+json\" \
+                 (TS 104 243 Table 5.2-2)",
+                scheme.as_deref().unwrap_or_default()
+            )));
+        }
     }
     Ok(())
 }
@@ -1750,6 +1767,36 @@ mod tests {
     }
 
     // ---------- 5.2.14 / 5.2.15 notification parameters ----------
+
+    /// TS 104 243 5.2, Table 5.2-2: an MQTT notification's
+    /// `metadata.Content-Type` is "application/json" or
+    /// "application/ld+json", taken from `endpoint.accept`. A Subscription
+    /// asking an mqtt[s] endpoint for GeoJSON is refused at create and at
+    /// update (a fragment replaces `notification` whole); an HTTP endpoint
+    /// keeps it (TS 104 175 5.2.15).
+    #[test]
+    fn ts104243_5_2_mqtt_endpoint_refuses_geojson_accept() {
+        let doc = |uri: &str, accept: &str| {
+            sub(json!({"notification": {"endpoint": {"uri": uri, "accept": accept}}}))
+        };
+        for uri in ["mqtt://broker:1883/topic", "MQTTS://broker/t/sub"] {
+            for normalize in [norm, frag] {
+                let err = normalize(&doc(uri, "application/geo+json"))
+                    .expect_err("an mqtt endpoint cannot carry GeoJSON");
+                assert!(
+                    matches!(&err, NgsiError::BadRequestData(why)
+                        if why.contains("application/json") && why.contains("application/ld+json")),
+                    "{err:?}"
+                );
+                for accept in ["application/json", "application/ld+json"] {
+                    assert!(normalize(&doc(uri, accept)).is_ok(), "{uri} {accept}");
+                }
+            }
+        }
+        for normalize in [norm, frag] {
+            assert!(normalize(&doc("http://a/x", "application/geo+json")).is_ok());
+        }
+    }
 
     /// Table 5.2.15-1 Endpoint: uri is mandatory and a valid URI; cooldown
     /// and timeout are Numbers "Greater than 0"; accept is one of the three

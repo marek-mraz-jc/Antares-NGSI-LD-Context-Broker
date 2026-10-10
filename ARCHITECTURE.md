@@ -68,7 +68,7 @@ module's header comment.
 | `temporal.rs` | 4 100 | 5.6.11–5.6.16, 5.7.3–5.7.4 `/temporal/entities` |
 | `temporalq.rs` | 200 | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |
 | `types_attrs.rs` | 900 | 5.7.5–5.7.10 `/types`, `/attributes` |
-| `subscriptions.rs` | 1 900 | 5.8, 5.11 `/subscriptions`, `/csourceSubscriptions` |
+| `subscriptions.rs` | 2 100 | 5.8, 5.11 `/subscriptions`, `/csourceSubscriptions` |
 | `notify.rs` | 5 300 | 5.8.6 matching and delivery, the subscription mirror, interval sweeps, csource notifications |
 | `distsub.rs` | 1 750 | 5.8.1.4 distributed subscriptions, consumer half |
 | `csource.rs` | 2 200 | 5.9, 5.10 registrations, `csource_index` maintenance |
@@ -79,7 +79,7 @@ module's header comment.
 | `snapshots.rs` | 2 000 | 5.16 snapshots under synthetic `snap-…` tenants |
 | `contexts.rs` | 880 | 5.13 `/jsonldContexts` |
 | `conformance.rs` | 855 | 6.3.21 version negotiation |
-| `repr.rs` | 1 800 | 6.3.7, 4.5.4 representations: normalized, concise, keyValues, sysAttrs; 4.5.23 Linked Entity Retrieval (inline and flat, the lookup budget) and the 4.5.16 GeoJSON Feature/FeatureCollection shapes — what every module needs to render a document |
+| `repr.rs` | 2 050 | 6.3.7, 4.5.4 representations: normalized, concise, keyValues, sysAttrs; 4.5.23 Linked Entity Retrieval (inline and flat, the lookup budget) and the 4.5.16 GeoJSON Feature/FeatureCollection shapes — what every module needs to render a document |
 | `history.rs` | 260 | the producer side of temporal recording: the per-request change buffer and the 4.5.7/4.5.8 delete mirrors that record a deleted Entity or Attribute in history |
 | `stamp.rs` | 50 | 4.8, 5.2.4 system attributes of a write: `createdAt`/`modifiedAt` on the entity and on every attribute instance |
 | `mirror.rs` | 530 | the change event and the two document mirrors (`Change`, `DocMirror`, `SubMirror`, `TenantIndex`) that state, notify and history share, with the registration index (`reg_keys`, `bucketed`, `matching`) the federation read path selects candidates through; names no other module |

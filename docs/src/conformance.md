@@ -167,6 +167,7 @@ carries the fix. The current list:
 | 10 | spec | 4.5.19.0's unbounded period count contradicts the aggregation fixtures |
 | 11 | spec | Annex B maps `attributeCount`/`attributeDetails` to bare terms |
 | 13 | spec | TS 104 175 Table 5.2.6.5.2-1 calls `timeInterval` not applicable to CSR subscriptions; 12.4.2.4/12.4.7 define periodic CSR notification |
+| 14 | spec | TS 104 176 clause 5 answers a successful HEAD with 204, its 7.x GET/HEAD tables with 200 (Antares: 200) |
 
 Filing is manual; each entry carries the clause quotation and the
 proposed fix so it can be pasted into the ETSI tracker as is.
