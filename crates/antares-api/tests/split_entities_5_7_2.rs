@@ -170,7 +170,7 @@ async fn clause_5_7_2_4_split_aggregate_filter_memory() {
 /// IS selected the missing URL is a hard failure, not a vacuous pass.
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a live PostGIS in ANTARES_TEST_DATABASE_URL: cargo test -p antares-api --test split_entities_5_7_2 -- --ignored"]
+#[ignore = "needs a live PostGIS in ANTARES_TEST_DATABASE_URL: cargo test -p antares-api --test it split_entities_5_7_2:: -- --ignored"]
 async fn clause_5_7_2_4_split_aggregate_filter_postgres() {
     let url = std::env::var("ANTARES_TEST_DATABASE_URL")
         .expect("ANTARES_TEST_DATABASE_URL must point at a live PostGIS");

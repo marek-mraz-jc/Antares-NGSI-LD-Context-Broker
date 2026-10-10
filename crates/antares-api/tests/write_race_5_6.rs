@@ -10,7 +10,7 @@
 //! the interleaving a racing client produces and a test cannot otherwise
 //! reach on purpose.
 
-mod common;
+use crate::common;
 
 use antares_api::AppState;
 use axum::body::Body;

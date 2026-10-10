@@ -126,7 +126,7 @@ jobs:
       # timing assertion: it belongs on dedicated hardware, where the numbers
       # measure the index rather than the neighbours on a shared runner.
       - name: Subscription index shape
-        run: cargo test --release -q -p antares-api --test sub_index -- --ignored --nocapture
+        run: "cargo test --release -q -p antares-api --test it sub_index:: -- --ignored --nocapture"
       - name: Benchmark passes
         run: REPEATS=${{ inputs.repeats || 10 }} DURATION=1m ./dev/perf/run-bench.sh
       # The published shapes (memory store, this box): startup, throughput
