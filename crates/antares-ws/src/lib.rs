@@ -33,7 +33,10 @@ mod random;
 mod socket;
 
 pub use hub::{Answer, Forwarded, Hub, Refused, Relay, ENDPOINT_PREFIX, MAX_NOTIFICATION_BYTES};
-pub use limits::Limits;
+pub use limits::{
+    Limits, ALLOWED_ORIGINS_ENV, MAX_CONNECTIONS_ENV, MAX_CONNECTIONS_PER_TENANT_ENV,
+    MAX_LIFETIME_ENV, MAX_SUBSCRIPTIONS_ENV, QUEUE_ENV, RESUME_GRACE_ENV,
+};
 
 use antares_ops::{
     Caller, DeliveryError, DeliveryFuture, NgsiError, NotificationSink, Ops, Outbound, Surface,

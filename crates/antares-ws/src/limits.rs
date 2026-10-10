@@ -4,6 +4,21 @@
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// The variable of the bound of the same name (the broker knows it as a config key).
+pub const QUEUE_ENV: &str = "ANTARES_WS_QUEUE";
+/// The variable of the bound of the same name (the broker knows it as a config key).
+pub const RESUME_GRACE_ENV: &str = "ANTARES_WS_RESUME_GRACE_SECS";
+/// The variable of the bound of the same name (the broker knows it as a config key).
+pub const MAX_LIFETIME_ENV: &str = "ANTARES_WS_MAX_LIFETIME_SECS";
+/// The variable of the bound of the same name (the broker knows it as a config key).
+pub const MAX_CONNECTIONS_ENV: &str = "ANTARES_WS_MAX_CONNECTIONS";
+/// The variable of the bound of the same name (the broker knows it as a config key).
+pub const MAX_CONNECTIONS_PER_TENANT_ENV: &str = "ANTARES_WS_MAX_CONNECTIONS_PER_TENANT";
+/// The variable of the bound of the same name (the broker knows it as a config key).
+pub const MAX_SUBSCRIPTIONS_ENV: &str = "ANTARES_WS_MAX_SUBSCRIPTIONS";
+/// The variable of the bound of the same name (the broker knows it as a config key).
+pub const ALLOWED_ORIGINS_ENV: &str = "ANTARES_WS_ALLOWED_ORIGINS";
+
 /// Every bound a connection is held to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
@@ -78,16 +93,16 @@ impl Limits {
             Ok(set(name)?.map_or(default, Duration::from_secs))
         };
         Ok(Self {
-            queue: count("ANTARES_WS_QUEUE", d.queue)?,
-            resume_grace: secs("ANTARES_WS_RESUME_GRACE_SECS", d.resume_grace)?,
-            max_lifetime: secs("ANTARES_WS_MAX_LIFETIME_SECS", d.max_lifetime)?,
-            max_connections: count("ANTARES_WS_MAX_CONNECTIONS", d.max_connections)?,
+            queue: count(QUEUE_ENV, d.queue)?,
+            resume_grace: secs(RESUME_GRACE_ENV, d.resume_grace)?,
+            max_lifetime: secs(MAX_LIFETIME_ENV, d.max_lifetime)?,
+            max_connections: count(MAX_CONNECTIONS_ENV, d.max_connections)?,
             max_connections_per_tenant: count(
-                "ANTARES_WS_MAX_CONNECTIONS_PER_TENANT",
+                MAX_CONNECTIONS_PER_TENANT_ENV,
                 d.max_connections_per_tenant,
             )?,
-            max_subscriptions: count("ANTARES_WS_MAX_SUBSCRIPTIONS", d.max_subscriptions)?,
-            allowed_origins: var("ANTARES_WS_ALLOWED_ORIGINS")
+            max_subscriptions: count(MAX_SUBSCRIPTIONS_ENV, d.max_subscriptions)?,
+            allowed_origins: var(ALLOWED_ORIGINS_ENV)
                 .map(|v| {
                     v.split(',')
                         .map(str::trim)

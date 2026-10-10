@@ -39,6 +39,21 @@ const KNOWN_KEYS: &[&str] = &[
     antares_mcp::ALLOWED_ORIGINS_ENV,
     #[cfg(feature = "mcp")]
     antares_mcp::MAX_RESULT_BYTES_ENV,
+    // The WebSocket channel's bounds (ADR-0026 rules 6 to 10).
+    #[cfg(feature = "ws")]
+    antares_ws::QUEUE_ENV,
+    #[cfg(feature = "ws")]
+    antares_ws::RESUME_GRACE_ENV,
+    #[cfg(feature = "ws")]
+    antares_ws::MAX_LIFETIME_ENV,
+    #[cfg(feature = "ws")]
+    antares_ws::MAX_CONNECTIONS_ENV,
+    #[cfg(feature = "ws")]
+    antares_ws::MAX_CONNECTIONS_PER_TENANT_ENV,
+    #[cfg(feature = "ws")]
+    antares_ws::MAX_SUBSCRIPTIONS_ENV,
+    #[cfg(feature = "ws")]
+    antares_ws::ALLOWED_ORIGINS_ENV,
     "ANTARES_DATABASE_URL",
     "ANTARES_STORE",
     // Temporal driver: a store mode, or `none` — history off (temporal
@@ -1738,7 +1753,7 @@ mod api_surface_tests {
     /// surface feature the shelf is the admin surface alone, and a path of
     /// every surface prefix (ADR-0023 to ADR-0027) is unrouted. A surface
     /// that lands without its feature gate turns this red.
-    #[cfg(not(any(feature = "plugin-example", feature = "views")))]
+    #[cfg(not(any(feature = "plugin-example", feature = "views", feature = "ws")))]
     #[tokio::test]
     async fn the_vanilla_shelf_is_admin_alone() {
         use tower::ServiceExt;

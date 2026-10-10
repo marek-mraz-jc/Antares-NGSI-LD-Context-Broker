@@ -164,14 +164,30 @@ impl Socket {
 
 /// One process, the default store and bus: the accept loop hands the
 /// upgraded stream to the surface, and a Subscription made over the socket
-/// is notified over it.
+/// is notified over it. A bound set in the environment is a known config
+/// key (unknown keys are fatal).
 #[test]
 fn ws_the_broker_binary_serves_a_socket_end_to_end() -> Result<(), String> {
     let port = free_port();
-    let _broker = start(port, &[])?;
+    let _broker = start(port, &[("ANTARES_WS_QUEUE", "64")])?;
     healthy(port)?;
     let run = run_id()?;
     notified(port, &format!("ws{run}"), run)
+}
+
+/// A bound that is not a positive whole number stops the broker at startup
+/// instead of falling back to a default the operator did not choose.
+#[test]
+fn ws_an_invalid_bound_stops_the_broker() -> Result<(), String> {
+    let mut broker = start(free_port(), &[("ANTARES_WS_MAX_SUBSCRIPTIONS", "0")])?;
+    for _ in 0..150 {
+        if let Some(status) = broker.0.try_wait().map_err(|e| e.to_string())? {
+            assert!(!status.success(), "{status}");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err("the broker kept running on ANTARES_WS_MAX_SUBSCRIPTIONS=0".into())
 }
 
 #[test]
