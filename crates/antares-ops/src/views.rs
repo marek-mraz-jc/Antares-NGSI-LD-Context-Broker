@@ -207,7 +207,8 @@ impl View {
             scope_q("scopeQ", self.scope_q.as_deref())?,
             geo_q("geoQ", self.geo_q.as_ref())?,
             rules,
-        )?;
+        )?
+        .named(&self.id);
         let mut loaded = Loaded {
             view: Arc::new(view),
             tenant: tenant.as_str().to_owned(),

@@ -47,6 +47,15 @@ pub const WRITES: [&str; 14] = [
     "replace_attribute",
 ];
 
+/// Every Subscription operation the view root serves, by its matrix id.
+pub const SUBSCRIPTIONS: [&str; 5] = [
+    "create_subscription",
+    "update_subscription",
+    "retrieve_subscription",
+    "query_subscriptions",
+    "delete_subscription",
+];
+
 /// Every read the view root serves, by its matrix id.
 pub const READS: [&str; 14] = [
     "retrieve_entity",
@@ -245,7 +254,8 @@ pub fn history_view() -> Value {
     })
 }
 
-/// The view `fleet`: `cars`' rules, every read and every write it serves.
+/// The view `fleet`: `cars`' rules, every read, write and Subscription
+/// operation it serves.
 #[must_use]
 pub fn fleet_view() -> Value {
     let mut v = cars_view();
@@ -253,7 +263,11 @@ pub fn fleet_view() -> Value {
         o.insert("id".into(), json!("fleet"));
         o.insert(
             "operations".into(),
-            json!(READS.iter().chain(&WRITES).collect::<Vec<_>>()),
+            json!(READS
+                .iter()
+                .chain(&WRITES)
+                .chain(&SUBSCRIPTIONS)
+                .collect::<Vec<_>>()),
         );
     }
     v
