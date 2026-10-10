@@ -36,10 +36,18 @@ ${entity_expectation_file_path}=        entity-deleted-name-attribute-instance-n
     Should be Equal    ${subscription_id}    ${notification}[subscriptionId]
     Length Should Be    ${notification}[data]    ${1}
     Should be Equal    ${entity_id}    ${notification}[data][0][id]
-    Check JSON Value In Response Body
-    ...    json_path_expr=['name']['value']
-    ...    value_to_check=urn:ngsi-ld:null
-    ...    response_body=${notification}[data][0]
+
+    # `name` has three instances in building-multi-instances-attributes (the
+    # default one plus two datasetIds) and deleteAll=true removed all three, so
+    # the notification carries one NGSI-LD Null marker PER removed instance:
+    # a multi-instance Attribute is an Array, deleted or not (TS 104-175
+    # § 10.5.7 / § 8.5). Asserting a single ['name']['value'] only holds for a
+    # single-instance Attribute — see testsuite-doubts.md #103.
+    ${deleted_name_instances}=    Set Variable    ${notification}[data][0][name]
+    Length Should Be    ${deleted_name_instances}    ${3}
+    FOR    ${name_instance}    IN    @{deleted_name_instances}
+        Should Be Equal    ${name_instance}[value]    urn:ngsi-ld:null
+    END
 
 
 *** Keywords ***

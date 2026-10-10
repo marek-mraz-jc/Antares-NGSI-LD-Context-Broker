@@ -1032,24 +1032,12 @@ async fn build_data(
                     if gone.is_empty() {
                         continue;
                     }
-                    let attr_absent = doc.get(attr).is_none();
-                    let tss: Vec<Value> = if attr_absent {
-                        // whole attribute deleted at once: ONE tombstone,
-                        // no datasetId (046_22_08)
-                        let base = gone
-                            .iter()
-                            .find(|i| instance_ds(i).is_none())
-                            .unwrap_or(&gone[0]);
-                        let mut ts = tombstone(base, sys, show, now);
-                        if let Some(o) = ts.as_object_mut() {
-                            o.remove("datasetId");
-                        }
-                        vec![ts]
-                    } else {
-                        gone.iter()
-                            .map(|di| tombstone(di, sys, show, now))
-                            .collect()
-                    };
+                    // one tombstone per deleted instance, each with its
+                    // datasetId, deleteAll included (046_22_08)
+                    let tss: Vec<Value> = gone
+                        .iter()
+                        .map(|di| tombstone(di, sys, show, now))
+                        .collect();
                     let Some(target) = doc.as_object_mut() else {
                         continue;
                     };
@@ -3711,9 +3699,10 @@ mod clause_5_8_6_deletion_payload {
         }
     }
 
-    /// 5.8.6: a whole Attribute deleted at once is ONE tombstone with no
-    /// datasetId, while losing individual instances tombstones each lost
-    /// datasetId and leaves the survivors untouched.
+    /// 5.8.6: every deleted instance is its own tombstone carrying its
+    /// datasetId, whether the whole Attribute went at once (deleteAll, forge
+    /// 75ba471d, 046_22_08) or single instances did, and survivors stay
+    /// untouched. A multi-instance Attribute is an Array, deleted or not.
     #[tokio::test]
     async fn whole_attribute_versus_per_instance_deletion() {
         let three = json!([
@@ -3742,10 +3731,18 @@ mod clause_5_8_6_deletion_payload {
         )
         .await;
         let got = insts(&entry, "speed");
-        assert_eq!(got.len(), 1, "a whole-attribute deletion is one tombstone");
+        assert_eq!(got.len(), 3, "one tombstone per deleted instance: {got:?}");
+        let mut ds: Vec<Option<&Value>> = got.iter().map(|i| i.get("datasetId")).collect();
+        ds.sort_by_key(|d| d.and_then(Value::as_str));
+        assert_eq!(
+            ds,
+            [None, Some(&json!("urn:ds:a")), Some(&json!("urn:ds:b"))],
+            "each tombstone keeps its datasetId"
+        );
         assert!(
-            got[0].get("datasetId").is_none(),
-            "the single tombstone carries no datasetId"
+            got.iter()
+                .all(|i| i.get("value") == Some(&json!("urn:ngsi-ld:null"))),
+            "{got:?}"
         );
 
         // one instance gone, two survive

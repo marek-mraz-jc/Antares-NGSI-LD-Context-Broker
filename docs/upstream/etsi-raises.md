@@ -526,3 +526,21 @@ POST are replaced and duplicates collapse. Suggest the union of both
 payloads, as the corrected fork does (forge commit 167fa185); Antares
 carries that fix
 (`temporal_dedup.rs::a_second_temporal_upsert_at_the_same_instant_appends`).
+
+---
+
+## 22. [suite] 046_22_08 reads a deleted three-instance Attribute as one object
+
+**Title:** 046_22_08 asserts `['name']['value']` on an Attribute whose three
+instances were deleted
+
+**Body:**
+
+`name` in building-multi-instances-attributes has the default instance and
+two datasetIds, and 046_22_08 deletes all of them. CIM 009 5.8.6 represents
+each deleted instance with the NGSI-LD Null and its datasetId, so the
+notification carries an Array of three, as it would for the live Attribute.
+The assertion indexes a single object. Suggest asserting three instances,
+each `urn:ngsi-ld:null`, as the corrected fork does (forge commit
+75ba471d); Antares carries that fix
+(`notify.rs::whole_attribute_versus_per_instance_deletion`).
