@@ -696,7 +696,11 @@ async fn run_query(
             &vp,
             ctx,
             std::mem::take(&mut fed),
-            Some((offset, st.max_limit)),
+            crate::entities::Pushdown {
+                page: Some((offset, st.max_limit)),
+                proj: None,
+            },
+            // a snapshot under a narrowing is refused at its gate
             None,
         )
         .await

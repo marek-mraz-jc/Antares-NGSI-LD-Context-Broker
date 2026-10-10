@@ -1406,8 +1406,15 @@ async fn batch_query_inner(
     } else {
         Vec::new()
     };
-    let mut matches =
-        crate::entities::filter_entities_fed(st, &tenant, &vp, &parsed.ctx, fed).await?;
+    let mut matches = crate::entities::filter_entities_fed(
+        st,
+        &tenant,
+        &vp,
+        &parsed.ctx,
+        fed,
+        Some(&crate::repr::narrowing(&filter)),
+    )
+    .await?;
     let mut page_params = params.clone();
     page_params.extend(vp.clone());
     // 5.2.43 ordering: same 4.23 keys as the GET twin, applied pre-pagination

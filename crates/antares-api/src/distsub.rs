@@ -832,7 +832,7 @@ async fn split_merge(
                 }
             }
         }
-        if crate::notify::linked_eval(st, tenant, |l| {
+        if crate::notify::linked_eval(st, tenant, None, |l| {
             crate::notify::conditions_match(sub, &merged, &ctx, l)
         })
         .await
