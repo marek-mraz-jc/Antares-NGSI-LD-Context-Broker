@@ -116,7 +116,11 @@ fn evict_lru_half<V>(map: &mut HashMap<Box<str>, Entry<V>>) {
 type Cache<V> = LazyLock<RwLock<HashMap<Box<str>, Entry<V>>>>;
 
 static CACHE: Cache<(Outcome, usize)> = LazyLock::new(|| RwLock::new(HashMap::new()));
-static COMPILES: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// Compilations on this thread. Per thread, so a test counts its own cache misses and never
+    /// those of a test running beside it (T-3534); a compile runs on the caller's thread.
+    static COMPILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 static BYTES: AtomicUsize = AtomicUsize::new(0);
 
 fn build(pattern: &str, limit: usize) -> Result<regex::Regex, regex::Error> {
@@ -136,7 +140,7 @@ pub fn compile(pattern: &str) -> Result<Arc<regex::Regex>, String> {
     {
         return hit.map_err(String::from);
     }
-    COMPILES.fetch_add(1, Ordering::Relaxed);
+    COMPILES.with(|n| n.set(n.get() + 1));
     // Compiled OUTSIDE the lock — a pattern compile must never serialize the
     // matcher — and a poisoned lock degrades to "compile every time", never
     // to a failed request.
@@ -175,9 +179,9 @@ pub fn cached(pattern: &str) -> Option<Arc<regex::Regex>> {
     })
 }
 
-/// Compilations performed since process start (i.e. cache misses).
+/// Compilations performed on the calling thread (i.e. its cache misses).
 pub fn compiles() -> u64 {
-    COMPILES.load(Ordering::Relaxed)
+    COMPILES.with(std::cell::Cell::get)
 }
 
 /// Patterns currently retained — never above `MAX_REGEX_CACHE`.
