@@ -63,9 +63,9 @@ pub mod policy {
 
 /// The notification sink contract (ADR-0027 section 1), for a surface that
 /// delivers notifications (WebSocket).
-pub use antares_api::{
-    build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
-};
+pub use antares_api::{build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound};
+/// The error a sink's endpoint check answers with.
+pub use antares_model::NgsiError;
 
 /// The request bounds a surface applies to what it parses itself (a
 /// WebSocket message never passes the HTTP bounds layer).
@@ -113,6 +113,25 @@ pub struct ViewOps {
 /// the tenant or the subject an operation runs as.
 #[derive(Debug, Clone)]
 pub struct Caller(HeaderMap);
+
+impl Caller {
+    /// The policy subject headers the caller sent, in the order
+    /// `ANTARES_POLICY_SUBJECT_HEADERS` names them, each with every value:
+    /// what a surface compares when it binds something to one subject
+    /// (a resumed WebSocket connection, ADR-0026 rule 7).
+    #[must_use]
+    pub fn subject(&self) -> Vec<(String, Vec<u8>)> {
+        antares_api::policy::SUBJECT_HEADERS
+            .iter()
+            .flat_map(|name| {
+                self.0
+                    .get_all(name.as_str())
+                    .iter()
+                    .map(move |v| (name.clone(), v.as_bytes().to_vec()))
+            })
+            .collect()
+    }
+}
 
 impl<S: Send + Sync> FromRequestParts<S> for Caller {
     type Rejection = std::convert::Infallible;
@@ -279,6 +298,12 @@ impl ViewOps {
     #[must_use]
     pub fn allows(&self, op: OperationId) -> bool {
         self.operations.contains(&op)
+    }
+
+    /// The one Tenant the view serves (ADR-0023 rule 10).
+    #[must_use]
+    pub fn tenant(&self) -> &str {
+        &self.tenant
     }
 
     /// The Entity types and the Attributes the view shows, compacted under
