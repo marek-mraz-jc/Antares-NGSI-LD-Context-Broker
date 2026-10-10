@@ -382,6 +382,7 @@ async fn purge_tenant_empties_every_tenant_table() {
             Kind::EntityMap,
             Kind::DistSub,
             Kind::DeadLetter,
+            Kind::View,
         ] {
             let id = "urn:x:1";
             let d = if kind == Kind::Registration {
