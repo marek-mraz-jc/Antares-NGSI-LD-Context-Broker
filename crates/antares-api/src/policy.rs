@@ -25,6 +25,10 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::LazyLock;
+
+/// The `@context` [`Filter::project`] reads rule conditions with.
+static CORE_CONTEXT: LazyLock<antares_jsonld::Context> =
+    LazyLock::new(antares_jsonld::core_context);
 use std::time::Duration;
 
 /// What [`PolicyEngine::decide`] hands back. Boxed because an engine that
@@ -192,20 +196,129 @@ pub struct Filter {
     pub omit: Vec<String>,
     /// If non-empty, the only members served beside the document frame.
     pub pick: Vec<String>,
-    /// Attributes allowed per Entity type (ADR-0023 rule 11, gap G4):
-    /// expanded type IRI to expanded Attribute IRIs. When non-empty, an
-    /// Entity keeps the Attributes its own types allow (the union over its
-    /// types that have an entry), and an Entity none of whose types has an
-    /// entry keeps its frame only. Applied to every document the answer
+    /// Attributes allowed per rule (ADR-0023 rule 11, gap G4): when
+    /// non-empty, an Entity is served only if at least one [`Rule`] holds
+    /// for it, and it keeps the union of the `attributes` of the rules that
+    /// hold, nothing else beside its frame. An Entity no rule holds for is
+    /// left out of the answer. Applied to every document the answer
     /// carries, joined targets and notified Entities included, each by its
-    /// own types. It intersects with `pick`: both narrow.
-    pub pick_by_type: BTreeMap<String, Vec<String>>,
+    /// own rules. It intersects with `pick`: both narrow.
+    pub rules: Vec<Rule>,
     /// Attributes removed per Entity type: an Entity loses every Attribute
     /// any of its types omits.
     pub omit_by_type: BTreeMap<String, Vec<String>>,
     /// Answer [`RESTRICTED_HEADER`]`: true`, so a client can know the
     /// answer was narrowed. Narrowing is otherwise silent.
     pub restricted: bool,
+}
+
+/// One allowlist of a [`Filter`] (ADR-0023 rule 11): the Entities of
+/// `types` for which the condition holds show `attributes`. The condition
+/// (`q`, `scope_q`, `geo_q`, each optional) is the policy's: it is read on
+/// the stored Entity, which may carry Attributes the caller cannot see.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Rule {
+    /// Type names, at least one; a rule naming none holds for nothing.
+    pub types: Vec<String>,
+    /// On the Entity's own members. A linked path (4.9
+    /// `LinkedEntityRelation`) never holds: the visible set of one Entity
+    /// must not depend on another Entity the caller may not read.
+    pub q: Option<Box<QNode>>,
+    pub scope_q: Option<String>,
+    pub geo_q: Option<Box<GeoQuery>>,
+    /// The Attributes an Entity this rule holds for shows.
+    pub attributes: Vec<String>,
+}
+
+impl Rule {
+    /// Whether the rule has a condition beside its types.
+    pub fn is_conditional(&self) -> bool {
+        self.q.is_some() || self.scope_q.is_some() || self.geo_q.is_some()
+    }
+
+    /// Whether the rule holds for `doc`, an Entity in the form `ctx`
+    /// expands names to (the broker's internal form: expanded keys, each
+    /// Attribute an array of instances).
+    pub fn holds(&self, doc: &Value, ctx: &antares_jsonld::Context) -> bool {
+        let types = entity_types(doc);
+        types.iter().any(|t| self.types.iter().any(|r| r == t))
+            && self
+                .scope_q
+                .as_deref()
+                .is_none_or(|s| antares_ql::scope::scope_matches(s, doc))
+            && self.geo_q.as_deref().is_none_or(|g| g.matches(doc, ctx))
+            && self.q.as_deref().is_none_or(|q| {
+                !q.has_linked_paths() && antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
+            })
+    }
+
+    /// The Attributes the condition reads, expanded through `ctx`: the head
+    /// of every `q` term and the geoquery's GeoProperty.
+    pub fn reads(&self, ctx: &antares_jsonld::Context) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .q
+            .as_deref()
+            .map(|q| {
+                q.attribute_paths()
+                    .into_iter()
+                    .filter_map(|p| p.split(['.', '[', '{']).next())
+                    .map(|h| ctx.expand_key(h))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(g) = &self.geo_q {
+            out.push(if g.geoproperty.is_empty() {
+                antares_ql::geo::LOCATION_IRI.to_owned()
+            } else {
+                ctx.expand_key(&g.geoproperty)
+            });
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// ADR-0023 rule 11 disclosure: the Attributes the condition reads that
+    /// the rule does not show. Seeing the rule's Attributes tells the
+    /// caller the condition held, so these are what the visible set
+    /// discloses; the view loader reports them.
+    pub fn discloses(&self, ctx: &antares_jsonld::Context) -> Vec<String> {
+        self.reads(ctx)
+            .into_iter()
+            .filter(|r| !self.attributes.iter().any(|a| ctx.expand_key(a) == *r))
+            .collect()
+    }
+}
+
+/// What a [`Filter`]'s rules let one Entity show: `only` (when set) is the
+/// union of the matched rules' Attributes, `omitted` what its types omit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Shown {
+    pub only: Option<std::collections::BTreeSet<String>>,
+    pub omitted: std::collections::BTreeSet<String>,
+}
+
+impl Shown {
+    /// Nothing beside the frame: what a projection falls back to for an
+    /// Entity no rule holds for, should one reach it.
+    pub fn nothing() -> Self {
+        Shown {
+            only: Some(Default::default()),
+            omitted: Default::default(),
+        }
+    }
+
+    pub fn allows(&self, k: &str) -> bool {
+        self.only.as_ref().is_none_or(|o| o.contains(k)) && !self.omitted.contains(k)
+    }
+
+    /// The same set with every name mapped, for a document in another form.
+    pub fn map_names(&self, f: impl Fn(&str) -> String) -> Self {
+        Shown {
+            only: self.only.as_ref().map(|o| o.iter().map(|n| f(n)).collect()),
+            omitted: self.omitted.iter().map(|n| f(n)).collect(),
+        }
+    }
 }
 
 /// The types of an Entity document: its `type` member, a string or an
@@ -224,13 +337,19 @@ pub fn entity_types(doc: &Value) -> Vec<&str> {
 const FRAME: [&str; 3] = ["id", "type", "@context"];
 
 impl Filter {
-    /// Apply `pick`/`omit` to one document by member name. This is the
-    /// reference semantics `run_policy_contract` holds an engine's answer
-    /// against; a served document is projected through the request's own
-    /// 5.5.2 representation instead (`repr::narrow_projection`), where the
-    /// names are expanded against the request `@context` first.
+    /// Apply `pick`/`omit` and the rules to one document by member name.
+    /// This is the reference semantics `run_policy_contract` holds an
+    /// engine's answer against; a served document is projected through the
+    /// request's own 5.5.2 representation instead
+    /// (`repr::narrow_projection`), where the names are expanded against
+    /// the request `@context` first. Rule conditions are read with the core
+    /// `@context`; a document no rule holds for keeps its frame here, while
+    /// the served paths leave it out.
     pub fn project(&self, doc: &mut Value) {
-        let doc_types: Vec<String> = entity_types(doc).into_iter().map(str::to_owned).collect();
+        let shown = self.has_rules().then(|| {
+            self.shown(doc, &CORE_CONTEXT)
+                .unwrap_or_else(Shown::nothing)
+        });
         let Some(obj) = doc.as_object_mut() else {
             return;
         };
@@ -243,9 +362,8 @@ impl Filter {
             }
             obj.remove(name);
         }
-        if self.has_type_rules() {
-            let types: Vec<&str> = doc_types.iter().map(String::as_str).collect();
-            obj.retain(|k, _| FRAME.contains(&k.as_str()) || self.type_allows(&types, k));
+        if let Some(shown) = shown {
+            obj.retain(|k, _| FRAME.contains(&k.as_str()) || shown.allows(k));
         }
     }
 
@@ -257,30 +375,62 @@ impl Filter {
             && self.geo_q.is_none()
             && self.omit.is_empty()
             && self.pick.is_empty()
-            && !self.has_type_rules()
+            && !self.has_rules()
     }
 
-    /// Whether the filter carries a per-type rule (ADR-0023 rule 11).
-    pub fn has_type_rules(&self) -> bool {
-        !self.pick_by_type.is_empty() || !self.omit_by_type.is_empty()
+    /// Whether the filter carries rules or per-type omits (ADR-0023 rule 11).
+    pub fn has_rules(&self) -> bool {
+        !self.rules.is_empty() || !self.omit_by_type.is_empty()
     }
 
-    /// ADR-0023 rule 11: may the member `k` of an Entity typed `types` be
-    /// served under the per-type rules? An Entity none of whose types has a
-    /// `pick_by_type` entry is allowed nothing (fail closed); one with
-    /// several types is allowed the union of its types' entries, less
-    /// whatever any of its types omits. Names compare as written: the
-    /// caller brings rule and document into one form first
-    /// (`repr::type_rules` expands both, `repr::compacted_filter` compacts
-    /// both).
-    pub fn type_allows(&self, types: &[&str], k: &str) -> bool {
-        let listed = |rules: &BTreeMap<String, Vec<String>>| {
+    /// ADR-0023 rule 11: what `doc` may show, or `None` when `rules` is
+    /// non-empty and none holds for it (the Entity is out). An Entity sees
+    /// the union of the Attributes of the rules that hold for it, less what
+    /// any of its types omits. Names compare as written: the caller brings
+    /// rules and document into one form first (`repr::type_rules` expands
+    /// both), and `ctx` is the one the conditions' names expand through.
+    pub fn shown(&self, doc: &Value, ctx: &antares_jsonld::Context) -> Option<Shown> {
+        let only = if self.rules.is_empty() {
+            None
+        } else {
+            let mut held = self.rules.iter().filter(|r| r.holds(doc, ctx)).peekable();
+            held.peek()?;
+            Some(held.flat_map(|r| r.attributes.iter().cloned()).collect())
+        };
+        let omitted = entity_types(doc)
+            .into_iter()
+            .filter_map(|t| self.omit_by_type.get(t))
+            .flatten()
+            .cloned()
+            .collect();
+        Some(Shown { only, omitted })
+    }
+
+    /// ADR-0023 rule 7 per rule (K22): a write is allowed only when its
+    /// post-image falls whole inside one rule that holds for it and shows
+    /// every Attribute the write names, none of which its types omit. The
+    /// check a view's engine runs before it allows a write.
+    pub fn admits_write(
+        &self,
+        post_image: &Value,
+        written: &[&str],
+        ctx: &antares_jsonld::Context,
+    ) -> bool {
+        let types = entity_types(post_image);
+        let omitted = |w: &str| {
             types
                 .iter()
-                .filter_map(|t| rules.get(*t))
-                .any(|attrs| attrs.iter().any(|a| a == k))
+                .filter_map(|t| self.omit_by_type.get(*t))
+                .any(|o| o.iter().any(|a| a == w))
         };
-        (self.pick_by_type.is_empty() || listed(&self.pick_by_type)) && !listed(&self.omit_by_type)
+        if written.iter().any(|w| omitted(w)) {
+            return false;
+        }
+        self.rules.is_empty()
+            || self.rules.iter().any(|r| {
+                r.holds(post_image, ctx)
+                    && written.iter().all(|w| r.attributes.iter().any(|a| a == w))
+            })
     }
 
     /// Say the answer was narrowed, when the engine asked for it to be
@@ -942,51 +1092,200 @@ mod tests {
     use super::*;
     use futures_util::FutureExt as _;
 
-    /// ADR-0023 rule 11 on the reference semantics: union over the types
-    /// with an entry, nothing for a type without one, and an omit on any
-    /// type wins.
+    const NS: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+
+    fn iri(n: &str) -> String {
+        format!("{NS}{n}")
+    }
+
+    /// Zone A: the square (0,0)-(1,1).
+    fn zone_a() -> Box<GeoQuery> {
+        let params = std::collections::HashMap::from([
+            ("georel".to_owned(), "within".to_owned()),
+            ("geometry".to_owned(), "Polygon".to_owned()),
+            (
+                "coordinates".to_owned(),
+                "[[[0,0],[1,0],[1,1],[0,1],[0,0]]]".to_owned(),
+            ),
+        ]);
+        Box::new(
+            GeoQuery::from_params(&params)
+                .expect("geoquery")
+                .expect("present"),
+        )
+    }
+
+    fn rule(t: &str, attrs: &[&str]) -> Rule {
+        Rule {
+            types: vec![iri(t)],
+            attributes: attrs.iter().map(|a| iri(a)).collect(),
+            ..Rule::default()
+        }
+    }
+
+    /// `{Car in zone A: speed, location, status}`, `{Car: status}`,
+    /// `{User: name}`, in the internal form `repr::type_rules` produces.
+    fn zones() -> Filter {
+        Filter {
+            rules: vec![
+                Rule {
+                    geo_q: Some(zone_a()),
+                    attributes: vec![
+                        iri("speed"),
+                        antares_ql::geo::LOCATION_IRI.to_owned(),
+                        iri("status"),
+                    ],
+                    ..rule("Car", &[])
+                },
+                rule("Car", &["status"]),
+                rule("User", &["name"]),
+            ],
+            ..Filter::default()
+        }
+    }
+
+    fn car(lon: f64) -> Value {
+        json!({"id": "urn:ngsi-ld:Car:1", "type": [iri("Car")],
+               (iri("speed")): [{"type": "Property", "value": 80}],
+               (iri("status")): [{"type": "Property", "value": "ok"}],
+               "https://uri.etsi.org/ngsi-ld/location": [{"type": "GeoProperty",
+                   "value": {"type": "Point", "coordinates": [lon, 0.5]}}]})
+    }
+
+    fn ctx() -> antares_jsonld::Context {
+        antares_jsonld::core_context()
+    }
+
+    /// ADR-0023 rule 11: the union over the rules that hold, nothing for an
+    /// Entity none holds for, and an omit on any type wins.
     #[test]
-    fn type_allows_is_the_union_of_entries_fails_closed_and_any_omit_wins() {
+    fn shown_is_the_union_of_the_rules_that_hold_and_any_omit_wins() {
+        let f = zones();
+        let ctx = ctx();
+        let inside = f.shown(&car(0.5), &ctx).expect("in view");
+        let outside = f.shown(&car(5.0), &ctx).expect("in view");
+        assert!(inside.allows(&iri("speed")) && inside.allows(&iri("status")));
+        assert!(!outside.allows(&iri("speed")), "speed only in zone A");
+        assert!(outside.allows(&iri("status")));
+        let robot = json!({"id": "urn:ngsi-ld:Robot:1", "type": [iri("Robot")]});
+        assert_eq!(f.shown(&robot, &ctx), None, "no rule holds: out");
+        let both = json!({"id": "urn:x", "type": [iri("Car"), iri("User")],
+                          (iri("name")): [{"type": "Property", "value": "n"}]});
+        let shown = f.shown(&both, &ctx).expect("in view");
+        assert!(
+            shown.allows(&iri("name")) && shown.allows(&iri("status")),
+            "union"
+        );
+        let omitting = Filter {
+            omit_by_type: BTreeMap::from([(iri("User"), vec![iri("status")])]),
+            ..zones()
+        };
+        let shown = omitting.shown(&both, &ctx).expect("in view");
+        assert!(!shown.allows(&iri("status")), "an omit on any type wins");
+        let only_omit = Filter {
+            omit_by_type: omitting.omit_by_type.clone(),
+            ..Filter::default()
+        };
+        let shown = only_omit.shown(&robot, &ctx).expect("no rules: in");
+        assert!(shown.allows(&iri("serial")), "no rules: omit alone");
+    }
+
+    /// A rule whose `q` follows a link never holds (fail closed), and a
+    /// rule naming no type holds for nothing.
+    #[test]
+    fn a_rule_reading_a_link_or_naming_no_type_never_holds() {
+        let ctx = ctx();
+        let linked = Rule {
+            q: Some(Box::new(
+                antares_ql::parse_q("ownedBy{name}==\"x\"").expect("q"),
+            )),
+            ..rule("Car", &["speed"])
+        };
+        assert!(linked.q.as_deref().is_some_and(QNode::has_linked_paths));
+        assert!(!linked.holds(&car(0.5), &ctx));
+        let negated = Rule {
+            q: Some(Box::new(antares_ql::parse_q("!ownedBy{name}").expect("q"))),
+            ..rule("Car", &["speed"])
+        };
+        assert!(!negated.holds(&car(0.5), &ctx), "not even negated");
+        assert!(!Rule::default().holds(&car(0.5), &ctx));
+        let local = Rule {
+            q: Some(Box::new(antares_ql::parse_q("speed>50").expect("q"))),
+            ..rule("Car", &["status"])
+        };
+        assert!(local.holds(&car(0.5), &ctx));
+    }
+
+    /// ADR-0023 rule 7 per rule (K22): a write must fall whole inside one
+    /// rule that shows every Attribute it names.
+    #[test]
+    fn write_that_adds_speed_outside_zone_a_is_refused() {
+        let f = zones();
+        let ctx = ctx();
+        let speed = iri("speed");
+        let status = iri("status");
+        assert!(f.admits_write(&car(0.5), &[&speed, &status], &ctx));
+        assert!(
+            !f.admits_write(&car(5.0), &[&speed], &ctx),
+            "speed outside A"
+        );
+        assert!(f.admits_write(&car(5.0), &[&status], &ctx));
+        let name = iri("name");
+        assert!(
+            !f.admits_write(&car(0.5), &[&speed, &name], &ctx),
+            "no one rule shows both"
+        );
+        let robot = json!({"id": "urn:ngsi-ld:Robot:1", "type": [iri("Robot")]});
+        assert!(!f.admits_write(&robot, &[], &ctx), "outside every rule");
+    }
+
+    /// The loader's disclosure report: zone A's rule reads `location` and
+    /// shows it, so it discloses nothing; a rule on `speed>100` showing only
+    /// `status` discloses `speed`.
+    #[test]
+    fn discloses_names_what_the_condition_reads_and_the_rule_does_not_show() {
+        let ctx = ctx();
+        assert!(zones().rules[0].discloses(&ctx).is_empty());
+        let fast = Rule {
+            q: Some(Box::new(antares_ql::parse_q("speed>100").expect("q"))),
+            geo_q: Some(zone_a()),
+            ..rule("Car", &["status"])
+        };
+        assert_eq!(
+            fast.discloses(&ctx),
+            vec![
+                iri("speed"),
+                "https://uri.etsi.org/ngsi-ld/location".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn project_keeps_the_union_and_the_frame() {
         let f = Filter {
-            pick_by_type: BTreeMap::from([
-                (
-                    "Car".to_owned(),
-                    vec!["speed".to_owned(), "email".to_owned()],
-                ),
-                ("User".to_owned(), vec!["name".to_owned()]),
-            ]),
+            rules: vec![
+                Rule {
+                    types: vec!["Car".to_owned()],
+                    attributes: vec!["speed".to_owned(), "email".to_owned()],
+                    ..Rule::default()
+                },
+                Rule {
+                    types: vec!["User".to_owned()],
+                    attributes: vec!["name".to_owned()],
+                    ..Rule::default()
+                },
+            ],
             omit_by_type: BTreeMap::from([("User".to_owned(), vec!["email".to_owned()])]),
             ..Filter::default()
         };
-        assert!(f.type_allows(&["Car"], "speed"));
-        assert!(!f.type_allows(&["Car"], "name"));
-        assert!(f.type_allows(&["Car", "User"], "name"), "union");
-        assert!(
-            !f.type_allows(&["Car", "User"], "email"),
-            "an omit on any type wins"
-        );
-        assert!(f.type_allows(&["Car", "Robot"], "speed"));
-        assert!(!f.type_allows(&["Robot"], "speed"), "no entry: nothing");
-        assert!(!f.type_allows(&[], "speed"), "no type: nothing");
-
         let mut doc = json!({"id": "urn:x", "type": ["Car", "User"], "@context": "c",
                              "speed": 1, "name": 2, "email": 3, "serial": 4});
         f.project(&mut doc);
         assert_eq!(
             doc,
             json!({"id": "urn:x", "type": ["Car", "User"], "@context": "c",
-                               "speed": 1, "name": 2})
+                   "speed": 1, "name": 2})
         );
-
-        let only_omit = Filter {
-            omit_by_type: f.omit_by_type.clone(),
-            ..Filter::default()
-        };
-        assert!(
-            only_omit.type_allows(&["Robot"], "serial"),
-            "no pick rules: omit alone"
-        );
-        assert!(!only_omit.type_allows(&["User"], "email"));
     }
     use serde_json::json;
 

@@ -1546,7 +1546,9 @@ async fn batch_query_inner(
     page_params.extend(vp.clone());
     // 5.2.43 ordering: same 4.23 keys as the GET twin, applied pre-pagination
     if let Some(spec) = page_params.get("orderBy") {
-        crate::paging::order_entities(&mut matches, spec, &page_params, &parsed.ctx)?;
+        crate::repr::order_as_shown(&mut matches, Some(&narrow), |m| {
+            crate::paging::order_entities(m, spec, &page_params, &parsed.ctx)
+        })?;
     }
     let (page, count_hdr, _links) = paginate(
         st,
