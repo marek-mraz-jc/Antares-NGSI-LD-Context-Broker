@@ -49,10 +49,19 @@ pub(crate) fn check_prefix(prefix: &str) -> Result<(), String> {
     ))
 }
 
+/// The view root of ADR-0023 rule 10, the one prefix surfaces share: each
+/// view surface serves its own sub-root after `{view}` (ADR-0027 section 1).
+pub const VIEW_ROOT: &str = "/x/views";
+
 /// Two prefixes claim the same ground when they are equal or one nests
 /// inside the other. Merging both would leave the winner to route-matching
-/// order, so it is refused where it can still be a startup error.
+/// order, so it is refused where it can still be a startup error. The view
+/// root is the exception: its surfaces merge into one nest, where two equal
+/// routes stop the broker when its router is built.
 pub(crate) fn overlaps(a: &str, b: &str) -> bool {
+    if a == VIEW_ROOT && b == VIEW_ROOT {
+        return false;
+    }
     a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
 }
 
@@ -97,5 +106,9 @@ mod tests {
         assert!(!overlaps("/x/a", "/x/b"));
         // a shared text prefix is not a shared path segment
         assert!(!overlaps("/x/ab", "/x/abc"));
+        // the view root is shared, never nested into
+        assert!(!overlaps(VIEW_ROOT, VIEW_ROOT));
+        assert!(overlaps(VIEW_ROOT, "/x/views/deeper"));
+        assert!(overlaps("/x", VIEW_ROOT));
     }
 }

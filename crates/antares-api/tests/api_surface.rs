@@ -110,6 +110,56 @@ async fn overlapping_surfaces_are_refused() {
     assert!(err.contains("/q"), "{err}");
 }
 
+/// A surface on the view root `/x/views`, answering `/{view}/{sub}`.
+struct ViewSub(&'static str, &'static str);
+
+impl ApiSurface for ViewSub {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn prefix(&self) -> &str {
+        "/x/views"
+    }
+    fn router(&self, _st: AppState) -> Router<AppState> {
+        let answer = self.1;
+        Router::new().route(
+            &format!("/{{view}}/{}", self.1),
+            get(move || async move { answer }),
+        )
+    }
+    fn version_info(&self) -> Value {
+        Value::Null
+    }
+}
+
+/// ADR-0027 section 1: the view surfaces share `/x/views`, each on its own
+/// sub-root after `{view}`; nothing else shares a prefix, and nothing nests
+/// under the view root.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_view_surfaces_share_the_view_root() {
+    let st = AppState::new("surfaces".into())
+        .with_surface(Box::new(ViewSub("views", "ngsi-ld")))
+        .and_then(|st| st.with_surface(Box::new(ViewSub("mcp", "mcp"))))
+        .expect("two view surfaces share /x/views");
+    assert_eq!(
+        get_path(&st, "/x/views/cars/ngsi-ld").await,
+        (StatusCode::OK, "ngsi-ld".into())
+    );
+    assert_eq!(
+        get_path(&st, "/x/views/cars/mcp").await,
+        (StatusCode::OK, "mcp".into())
+    );
+    assert_eq!(
+        get_path(&st, "/x/views/cars/odata").await.0,
+        StatusCode::NOT_FOUND
+    );
+    let err = st
+        .with_surface(Box::new(Ping("/x/views/deeper")))
+        .err()
+        .expect("a surface nested under the view root must be refused");
+    assert!(err.contains("/x/views"), "{err}");
+}
+
 /// `/q/health` names every mounted surface, so an operator can see what a
 /// binary serves beyond the NGSI-LD API.
 #[tokio::test(flavor = "multi_thread")]

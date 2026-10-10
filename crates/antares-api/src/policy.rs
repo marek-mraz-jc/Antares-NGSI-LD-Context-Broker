@@ -895,6 +895,45 @@ pub async fn decide_each(
         .collect()
 }
 
+/// Whether any request of each of `clauses` could be allowed for the caller
+/// of `headers`: one batch-shaped probe a surface lists its operations by
+/// (MCP D-3), never a decision on a request. Each clause is asked as an
+/// Operation that names nothing, through [`decide_each`], so it fails
+/// closed the same way (a panic, a timeout or a short answer hides every
+/// clause), and a narrowing on a clause that cannot be narrowed hides it.
+/// With no engine attached every clause is offered.
+// ponytail: no `PolicyEngine::offers` hook; an engine that has to answer a
+// probe differently from an empty Operation gets one when it exists.
+pub async fn offers(
+    engine: Option<&dyn PolicyEngine>,
+    tenant: &antares_model::TenantId,
+    headers: &HeaderMap,
+    clauses: &[&'static str],
+) -> Vec<bool> {
+    let Some(engine) = engine else {
+        return vec![true; clauses.len()];
+    };
+    let ops: Vec<Operation<'_>> = clauses
+        .iter()
+        .map(|clause| Operation {
+            clause,
+            ids: &[],
+            types: &[],
+            attrs: &[],
+            q: None,
+            scope_q: None,
+            geo: None,
+            body: None,
+            stored: None,
+        })
+        .collect();
+    decide_each(engine, &subject_of(tenant, headers), &ops)
+        .await
+        .into_iter()
+        .map(|d| !matches!(d, Decision::Deny(_)))
+        .collect()
+}
+
 /// Ask the engine about one notification, and fail closed: an engine that
 /// panics drops the notification. The document it was handed may already be
 /// half-edited, and the broker cannot know which half — so it is not sent.

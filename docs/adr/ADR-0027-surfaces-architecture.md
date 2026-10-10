@@ -75,6 +75,20 @@ Decided (worker-2, owner may override): the threat model's feature names
 those rules name these features in their CI checks; options: plain names
 (chosen), `surface-` prefixes.
 
+Decided (worker-4, owner may override, T-3513): the four view surfaces
+share one prefix, `/x/views`, the view root of ADR-0023 rule 10; each
+serves its own sub-root after `{view}` (`ngsi-ld/v1`, `odata/v4`, `mcp`,
+`linkml`). A surface whose prefix is exactly `/x/views` is merged with
+the others of that prefix under one nest, so `/x/views/{view}/mcp` sits
+beside `/x/views/{view}/ngsi-ld/v1` as this table names them; two such
+surfaces declaring the same route stop the broker at start. Every other
+prefix keeps the refusal of an equal or nested one
+(`crates/antares-api/src/surface.rs`, `overlaps`). Options: one shared
+view root (chosen), a prefix per surface (`/x/mcp/{view}`, which breaks
+the paths of this table and of ADR-0023 rule 10), one surface that
+dispatches to the others (a surface depending on a surface, against
+module rule M1).
+
 No surface touches `antares-store` or `antares-sql`: every operation goes
 through `Ops::run`, i.e. through the handler that serves the same
 operation over NGSI-LD, with its `gate!` call and the ADR-0020 seam. The

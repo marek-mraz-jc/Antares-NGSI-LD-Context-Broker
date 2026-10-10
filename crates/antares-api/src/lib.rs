@@ -527,14 +527,28 @@ pub fn router(state: AppState) -> Router {
 
     // Every registered surface, each under its own reserved prefix — the
     // admin one by default. `with_surface` already refused a prefix outside
-    // /q and /x and any overlap, so the merge here cannot shadow a route.
+    // /q and /x and any overlap, so the merge here cannot shadow a route;
+    // the view surfaces share the view root (ADR-0027 section 1), where
+    // axum's merge refuses two equal routes.
     // The caps are the broker's, not the API nest's: these routes carry the
     // bounds wall and the body limit for the same reason the peer-facing
     // notification endpoint above does — /q deletes Tenants and replays dead
     // letters, and a deployment's own /x routes are no less a way in.
     let mut surfaces = Router::new();
+    let mut view_root: Option<Router<AppState>> = None;
     for s in state.surfaces.iter() {
-        surfaces = surfaces.nest(s.prefix(), s.router(state.clone()));
+        let routes = s.router(state.clone());
+        if s.prefix() == surface::VIEW_ROOT {
+            view_root = Some(match view_root {
+                Some(shared) => shared.merge(routes),
+                None => routes,
+            });
+        } else {
+            surfaces = surfaces.nest(s.prefix(), routes);
+        }
+    }
+    if let Some(shared) = view_root {
+        surfaces = surfaces.nest(surface::VIEW_ROOT, shared);
     }
     let surfaces = surfaces
         .layer(axum::extract::DefaultBodyLimit::max(

@@ -30,6 +30,13 @@ const KNOWN_KEYS: &[&str] = &[
     // rule 10); only a build with views has one.
     #[cfg(feature = "views")]
     antares_ops::views::RELOAD_ENV,
+    // The MCP surface's hosts, origins and result budget (MC8, D-10).
+    #[cfg(feature = "mcp")]
+    antares_mcp::ALLOWED_HOSTS_ENV,
+    #[cfg(feature = "mcp")]
+    antares_mcp::ALLOWED_ORIGINS_ENV,
+    #[cfg(feature = "mcp")]
+    antares_mcp::MAX_RESULT_BYTES_ENV,
     "ANTARES_DATABASE_URL",
     "ANTARES_STORE",
     // Temporal driver: a store mode, or `none` — history off (temporal
@@ -464,6 +471,8 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("admin", || Box::new(antares_api::Admin)),
     #[cfg(feature = "views")]
     ("views", || antares_ops::mount(antares_views::Views)),
+    #[cfg(feature = "mcp")]
+    ("mcp", || antares_ops::mount(antares_mcp::Mcp)),
     #[cfg(feature = "plugin-example")]
     ("example", || {
         Box::new(antares_plugin_example::ExampleSurface)
@@ -1678,6 +1687,15 @@ mod api_surface_tests {
         assert_eq!(names(Some("admin,views")), vec!["admin", "views"]);
         let root = api_surfaces(Some("views")).expect("selection")[0].1();
         assert_eq!(root.prefix(), "/x/views");
+    }
+
+    /// The MCP surface shares the view root (ADR-0027 section 1).
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn an_mcp_build_shelves_the_mcp_surface_on_the_view_root() {
+        assert_eq!(names(Some("views,mcp")), vec!["views", "mcp"]);
+        let mcp = api_surfaces(Some("mcp")).expect("selection")[0].1();
+        assert_eq!(mcp.prefix(), "/x/views");
     }
 
     /// An empty selection is fatal too: readiness, health and metrics are
