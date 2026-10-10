@@ -12,6 +12,7 @@ members = [
     "crates/antares-notifier",
     "crates/antares-broker",
     "crates/antares-wasm",
+    "crates/antares-ops",
     # The reference plugin: built and tested with the workspace so the
     # driver, routing and notification seams cannot drift from it.
     "examples/plugin-example",
@@ -145,6 +146,10 @@ debug = "line-tables-only"
 # .dep-v0 section survives), thin LTO for smaller + slightly faster code.
 strip = "symbols"
 lto = "thin"
+
+# surfaces-threat-model 10.1: the new crates keep overflow checks in release.
+[profile.release.package.antares-ops]
+overflow-checks = true
 
 [profile.wasm-release]
 inherits = "release"
