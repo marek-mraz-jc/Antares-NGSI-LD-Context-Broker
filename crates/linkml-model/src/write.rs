@@ -409,6 +409,9 @@ fn refined_iri(model: &Model, name: &str, slot: &Slot) -> String {
         .map_or_else(|| model.slot_iri(name), |u| model.expand(u))
 }
 
+/// One level of Turtle indentation.
+const IN: &str = "  ";
+
 /// A name as an IRI segment: every byte outside RFC 3986's unreserved set
 /// percent-encoded.
 fn percent(name: &str) -> String {
@@ -450,18 +453,18 @@ pub fn shacl(model: &Model) -> String {
         for (slot_name, slot) in model.class_slots(name) {
             let _ = write!(
                 out,
-                " ;\n  sh:property [\n    sh:path <{}> ;\n    sh:name {}",
+                " ;\n  sh:property [\n{IN}{IN}sh:path <{}> ;\n{IN}{IN}sh:name {}",
                 refined_iri(model, slot_name, &slot),
                 lit(slot_name)
             );
             match model.range(&slot) {
                 Range::Type(b) => {
-                    let _ = write!(out, " ;\n    sh:datatype {}", b.xsd());
+                    let _ = write!(out, " ;\n{IN}{IN}sh:datatype {}", b.xsd());
                 }
                 Range::Class(c) => {
                     let _ = write!(
                         out,
-                        " ;\n    sh:nodeKind sh:IRI ;\n    sh:class <{}>",
+                        " ;\n{IN}{IN}sh:nodeKind sh:IRI ;\n{IN}{IN}sh:class <{}>",
                         model.class_iri(c)
                     );
                 }
@@ -472,17 +475,17 @@ pub fn shacl(model: &Model) -> String {
                         .get(e)
                         .map(|e| e.permissible_values.keys().map(|v| lit(v)).collect())
                         .unwrap_or_default();
-                    let _ = write!(out, " ;\n    sh:in ( {} )", values.join(" "));
+                    let _ = write!(out, " ;\n{IN}{IN}sh:in ( {} )", values.join(" "));
                 }
             }
             if slot.required == Some(true) {
-                out.push_str(" ;\n    sh:minCount 1");
+                let _ = write!(out, " ;\n{IN}{IN}sh:minCount 1");
             }
             if slot.multivalued != Some(true) {
-                out.push_str(" ;\n    sh:maxCount 1");
+                let _ = write!(out, " ;\n{IN}{IN}sh:maxCount 1");
             }
             if let Some(d) = &slot.description {
-                let _ = write!(out, " ;\n    rdfs:comment {}", lit(d));
+                let _ = write!(out, " ;\n{IN}{IN}rdfs:comment {}", lit(d));
             }
             out.push_str("\n  ]");
         }
