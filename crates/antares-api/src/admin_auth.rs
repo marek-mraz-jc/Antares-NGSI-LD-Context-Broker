@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: EUPL-1.2
+//! The `/q` admin credential (T-3569): one bearer secret a deployment
+//! configures. Configured, every `/q` route except `/q/health` and
+//! `/q/ready` (and `/q/metrics` when the deployment leaves it open) answers
+//! `401` without it; unconfigured, `/q` serves as it always did and the
+//! broker says so once at start. A network position is then no longer the
+//! only thing between a caller and a tenant purge.
+
+use crate::state::AppState;
+use axum::{
+    extract::{Request, State},
+    http::{header, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
+
+/// The shortest secret accepted, in bytes: a random token of 256 bits.
+pub const MIN_LEN: usize = 32;
+
+/// The ProblemDetails type a refused admin call answers with: the broker's
+/// own namespace, as for `AccessDenied`, since no ETSI error covers `/q`.
+pub const UNAUTHORIZED_TYPE: &str = "urn:antares:error:Unauthorized";
+
+/// The admin secret and whether `/q/metrics` is served without it.
+pub struct AdminAuth {
+    token: Box<[u8]>,
+    /// `/q/metrics` answers without the credential (a scraper that cannot
+    /// send one); `false` puts it behind the credential like the rest.
+    pub metrics_open: bool,
+}
+
+/// Never prints the secret, so a state dump or a panic message cannot leak it.
+impl std::fmt::Debug for AdminAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminAuth")
+            .field("metrics_open", &self.metrics_open)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdminAuth {
+    /// The secret as a file or an environment value holds it: one trailing
+    /// line break is dropped, anything shorter than [`MIN_LEN`] is refused.
+    /// The error names the length only, never the content.
+    pub fn new(secret: &str, metrics_open: bool) -> Result<Self, String> {
+        let secret = secret
+            .strip_suffix('\n')
+            .map_or(secret, |s| s.strip_suffix('\r').unwrap_or(s));
+        if secret.len() < MIN_LEN {
+            return Err(format!(
+                "the admin token has {} bytes; at least {MIN_LEN} are required",
+                secret.len()
+            ));
+        }
+        Ok(Self {
+            token: secret.as_bytes().into(),
+            metrics_open,
+        })
+    }
+
+    /// The credential a deployment configured: `file` is
+    /// `ANTARES_ADMIN_TOKEN_FILE` (the secret, mounted from a Secret), and
+    /// `metrics` is `ANTARES_ADMIN_METRICS`, `token` (default) or `open`.
+    /// No file is no credential (`Ok(None)`); a file that cannot be read
+    /// or holds too short a secret, or an unknown `metrics` value, is an
+    /// error, so a configured credential never silently becomes none.
+    pub fn from_config(file: Option<&str>, metrics: Option<&str>) -> Result<Option<Self>, String> {
+        let metrics_open = match metrics.map(str::trim).filter(|v| !v.is_empty()) {
+            None | Some("token") => false,
+            Some("open") => true,
+            Some(other) => {
+                return Err(format!(
+                    "ANTARES_ADMIN_METRICS: {other:?} is neither token nor open"
+                ))
+            }
+        };
+        let Some(path) = file.map(str::trim).filter(|p| !p.is_empty()) else {
+            return Ok(None);
+        };
+        let secret = std::fs::read_to_string(path)
+            .map_err(|e| format!("ANTARES_ADMIN_TOKEN_FILE {path}: unreadable ({e})"))?;
+        Self::new(&secret, metrics_open)
+            .map(Some)
+            .map_err(|e| format!("ANTARES_ADMIN_TOKEN_FILE {path}: {e}"))
+    }
+
+    /// `Authorization: Bearer <secret>` (scheme case-insensitive, RFC 9110
+    /// 11.1), compared without an early exit on the first differing byte.
+    fn admits(&self, authorization: Option<&[u8]>) -> bool {
+        let Some(value) = authorization else {
+            return false;
+        };
+        let Some(space) = value.iter().position(|b| *b == b' ') else {
+            return false;
+        };
+        let (scheme, rest) = value.split_at(space);
+        let presented = rest.get(1..).unwrap_or_default();
+        scheme.eq_ignore_ascii_case(b"bearer") && constant_time_eq(&self.token, presented)
+    }
+}
+
+/// Equal length and equal bytes, every byte visited: the time taken tells
+/// a caller the length at most, which the configured minimum makes public
+/// anyway.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    a.len() == b.len() && std::hint::black_box(diff) == 0
+}
+
+/// The route layer on every guarded `/q` route: passes through when no
+/// credential is configured, refuses `401` without the right one.
+pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    let Some(auth) = st.admin_auth.as_deref() else {
+        return next.run(req).await;
+    };
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .map(axum::http::HeaderValue::as_bytes);
+    if auth.admits(presented) {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [
+            (header::WWW_AUTHENTICATE, "Bearer realm=\"antares-admin\""),
+            (header::CONTENT_TYPE, "application/json"),
+        ],
+        axum::Json(serde_json::json!({
+            "type": UNAUTHORIZED_TYPE,
+            "title": "Unauthorized",
+            "status": StatusCode::UNAUTHORIZED.as_u16(),
+            "detail": "this admin route requires the broker's admin bearer token",
+        })),
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    fn auth() -> AdminAuth {
+        AdminAuth::new(SECRET, false).expect("a 32-byte secret is accepted")
+    }
+
+    #[test]
+    fn a_short_secret_is_refused_and_the_error_holds_no_secret() {
+        let short = "0123456789abcdef0123456789abcde";
+        let err = AdminAuth::new(short, false).expect_err("31 bytes");
+        assert!(err.contains("31 bytes"), "{err}");
+        assert!(!err.contains(short), "{err}");
+        assert!(AdminAuth::new("", true).is_err());
+        // a trailing line break is not part of the secret
+        assert!(AdminAuth::new(&format!("{short}\n"), false).is_err());
+    }
+
+    #[test]
+    fn one_trailing_line_break_is_dropped() {
+        for raw in [format!("{SECRET}\n"), format!("{SECRET}\r\n")] {
+            let a = AdminAuth::new(&raw, false).expect("secret");
+            assert!(a.admits(Some(format!("Bearer {SECRET}").as_bytes())));
+        }
+    }
+
+    #[test]
+    fn only_the_exact_bearer_secret_is_admitted() {
+        let a = auth();
+        assert!(a.admits(Some(format!("Bearer {SECRET}").as_bytes())));
+        assert!(a.admits(Some(format!("bearer {SECRET}").as_bytes())));
+        for refused in [
+            String::new(),
+            "Bearer".into(),
+            "Bearer ".into(),
+            format!("Basic {SECRET}"),
+            format!("Bearer {SECRET}x"),
+            format!("Bearer {}", &SECRET[1..]),
+            format!("Bearer  {SECRET}"),
+            format!("Bearer {}0", &SECRET[..31]),
+            SECRET.into(),
+        ] {
+            assert!(!a.admits(Some(refused.as_bytes())), "{refused:?}");
+        }
+        assert!(!a.admits(None));
+    }
+
+    #[test]
+    fn constant_time_eq_needs_equal_length_and_bytes() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"ab", b"abc"));
+    }
+
+    #[test]
+    fn the_config_reads_the_file_and_refuses_what_it_cannot_use() {
+        let dir = std::env::temp_dir().join(format!("antares-admin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).expect("temp dir");
+        let good = dir.join("token");
+        std::fs::write(&good, format!("{SECRET}\n")).expect("write");
+        let short = dir.join("short");
+        std::fs::write(&short, "0123").expect("write");
+        let good_s = good.to_str().expect("utf-8 path");
+
+        assert!(AdminAuth::from_config(None, None).expect("unset").is_none());
+        assert!(AdminAuth::from_config(Some(" "), Some("open"))
+            .expect("blank")
+            .is_none());
+        let a = AdminAuth::from_config(Some(good_s), None)
+            .expect("ok")
+            .expect("some");
+        assert!(!a.metrics_open);
+        assert!(a.admits(Some(format!("Bearer {SECRET}").as_bytes())));
+        let open = AdminAuth::from_config(Some(good_s), Some("open"))
+            .expect("ok")
+            .expect("some");
+        assert!(open.metrics_open);
+        assert!(
+            !AdminAuth::from_config(Some(good_s), Some("token"))
+                .expect("ok")
+                .expect("some")
+                .metrics_open
+        );
+
+        let err = AdminAuth::from_config(Some(good_s), Some("public")).expect_err("unknown");
+        assert!(err.contains("ANTARES_ADMIN_METRICS"), "{err}");
+        let err =
+            AdminAuth::from_config(Some(short.to_str().expect("path")), None).expect_err("short");
+        assert!(err.contains("4 bytes") && !err.contains("0123\""), "{err}");
+        let missing = dir.join("absent");
+        let err = AdminAuth::from_config(missing.to_str(), None).expect_err("absent");
+        assert!(err.contains("unreadable"), "{err}");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn debug_never_prints_the_secret() {
+        let shown = format!("{:?}", auth());
+        assert!(!shown.contains(SECRET), "{shown}");
+        assert!(shown.contains("metrics_open"), "{shown}");
+    }
+}

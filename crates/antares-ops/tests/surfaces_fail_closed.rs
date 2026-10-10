@@ -257,3 +257,64 @@ fn there_is_no_allow_all_view() {
         );
     }
 }
+
+/// T-3569: `/q/views` is written through the admin surface, so a broker with
+/// an admin secret refuses a view read or write without it, and takes one
+/// with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn views_sit_behind_the_admin_secret() {
+    const SECRET: &str = "views-are-written-with-the-admin-secret";
+    let auth = antares_api::admin_auth::AdminAuth::new(SECRET, false).expect("secret");
+    let app = TestBroker::new()
+        .await
+        .expect("broker")
+        .with_admin_auth(auth)
+        .serve(Probe)
+        .expect("mounts");
+    let call = |method: Method, uri: &'static str, body: Option<Value>, bearer: Option<&str>| {
+        let bytes = body.as_ref().map(Value::to_string).unwrap_or_default();
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Content-Length", bytes.len());
+        if body.is_some() {
+            req = req.header("Content-Type", "application/json");
+        }
+        if let Some(token) = bearer {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        let app = app.clone();
+        async move {
+            let Ok(resp) = app
+                .oneshot(req.body(Body::from(bytes)).unwrap_or_default())
+                .await;
+            resp.status()
+        }
+    };
+    for bearer in [None, Some("not-the-admin-secret")] {
+        assert_eq!(
+            call(Method::PUT, "/q/views/cars", Some(view("cars")), bearer).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(Method::GET, "/q/views", None, bearer).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_closed(&app).await;
+    assert_eq!(
+        call(
+            Method::PUT,
+            "/q/views/cars",
+            Some(view("cars")),
+            Some(SECRET)
+        )
+        .await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        call(Method::GET, "/q/views", None, Some(SECRET)).await,
+        StatusCode::OK
+    );
+    assert_open(&app).await;
+}

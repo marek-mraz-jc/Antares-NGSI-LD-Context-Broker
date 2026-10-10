@@ -140,6 +140,9 @@ pub struct AppState {
     /// boxing a future or arming a timer, so a broker with no engine pays
     /// nothing for the seam.
     pub policy: Option<Arc<dyn crate::policy::PolicyEngine>>,
+    /// The `/q` admin credential ([`AppState::with_admin_auth`]); `None`
+    /// serves `/q` without one, as the broker did before T-3569.
+    pub admin_auth: Option<Arc<crate::admin_auth::AdminAuth>>,
     /// Set the moment SIGTERM arrives, BEFORE the listener stops
     /// accepting — `/q/health` then answers 503 DRAINING so the load balancer
     /// takes this instance out while its socket still works.
@@ -447,6 +450,7 @@ impl AppState {
             bus_stats: None,
             egress: Arc::new(crate::egress::Egress::new(egress_policy)),
             policy: None,
+            admin_auth: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_changes: Arc::default(),
             sub_sync: None,
@@ -472,6 +476,15 @@ impl AppState {
     #[must_use]
     pub fn with_policy(mut self, engine: Arc<dyn crate::policy::PolicyEngine>) -> Self {
         self.policy = Some(engine);
+        self
+    }
+
+    /// Puts every `/q` route except health and readiness (and metrics, when
+    /// `auth` leaves them open) behind `auth`'s bearer secret. Set before
+    /// the router is built: the admin surface reads it when it mounts.
+    #[must_use]
+    pub fn with_admin_auth(mut self, auth: crate::admin_auth::AdminAuth) -> Self {
+        self.admin_auth = Some(Arc::new(auth));
         self
     }
 

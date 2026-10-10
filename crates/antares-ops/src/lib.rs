@@ -513,6 +513,15 @@ pub mod test_kit {
             }
         }
 
+        /// The same broker with `/q` behind the admin credential (T-3569).
+        #[must_use]
+        pub fn with_admin_auth(self, auth: antares_api::admin_auth::AdminAuth) -> Self {
+            Self {
+                state: self.state.with_admin_auth(auth),
+                reload: self.reload,
+            }
+        }
+
         /// Store a view document as it is, past `/q/views`' validation (what
         /// another version or a hand edit may have left in the store), and
         /// reload this broker's table.

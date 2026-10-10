@@ -51,6 +51,7 @@ macro_rules! gate {
     };
 }
 
+pub mod admin_auth;
 pub(crate) mod attrs;
 pub(crate) mod batch;
 pub mod bounds;
@@ -212,8 +213,10 @@ pub fn ops_router(state: AppState) -> Router {
 }
 
 /// The broker's own operational surface: health, readiness, metrics, the
-/// tenant list and purge, and the dead-letter admin. Gateway-protected like
-/// every `/q` route — the broker adds no authentication of its own.
+/// tenant list and purge, and the dead-letter admin. Health and readiness
+/// are always open; the rest sits behind the admin credential when the
+/// state carries one (`admin_auth.rs`, T-3569), `/q/metrics` unless the
+/// deployment left it open for a scraper.
 pub struct Admin;
 
 impl Admin {
@@ -242,28 +245,37 @@ impl ApiSurface for Admin {
         "/q"
     }
 
-    fn router(&self, _st: AppState) -> Router<AppState> {
+    fn router(&self, st: AppState) -> Router<AppState> {
         let [health_p, ready_p, metrics_p, tenants_p, tenant_p, dl_p, dl_id_p, replay_p] =
             Self::PATHS;
+        let guard = axum::middleware::from_fn_with_state(st.clone(), admin_auth::require);
+        // Prometheus text format. 404 until the broker installs the
+        // renderer — the api crate never depends on an exporter.
+        let metrics = Router::new().route(metrics_p, get(metrics_endpoint));
+        let metrics = if st.admin_auth.as_ref().is_some_and(|a| !a.metrics_open) {
+            metrics.route_layer(guard.clone())
+        } else {
+            metrics
+        };
         let routes = Router::new()
-            .route(health_p, get(health))
-            .route(ready_p, get(ready))
-            // Prometheus text format. 404 until the broker installs the
-            // renderer — the api crate never depends on an exporter.
-            .route(metrics_p, get(metrics_endpoint))
             .route(tenants_p, get(tenants_list))
             .route(tenant_p, get(tenant_get).delete(tenant_purge))
             .route(dl_p, get(dead_letters_list))
             .route(dl_id_p, delete(dead_letter_delete))
             .route(replay_p, post(dead_letter_replay));
-        // `/q/views` (ADR-0023 rule 10), when a loader set it: the admin
-        // surface is the gateway's to protect, and views are written here.
+        // `/q/views` (ADR-0023 rule 10), when a loader set it: views are
+        // written here, so they sit behind the admin credential with the
+        // rest of /q.
         #[cfg(feature = "views")]
-        let routes = match _st.views.admin() {
+        let routes = match st.views.admin() {
             Some(views) => routes.merge(views.with_state(())),
             None => routes,
         };
         routes
+            .route_layer(guard)
+            .route(health_p, get(health))
+            .route(ready_p, get(ready))
+            .merge(metrics)
     }
 
     fn version_info(&self) -> serde_json::Value {
