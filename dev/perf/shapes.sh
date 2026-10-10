@@ -7,7 +7,8 @@
 #   DATABASE_URL=postgres://… dev/perf/shapes.sh   # + postgres
 #
 # Env: BIN (target/release/antares), OUT (results/perf), PORT (9471),
-#      DATABASE_URL, RUNS (3), DURATION (5s), SPECS ("query 50,query 200,
+#      DATABASE_URL, RUNS (3), DURATION (5s), ENTITIES (100, seeded per
+#      store), SPECS ("query 50,query 200,
 #      retrieve 50": shape and closed-loop clients per row).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -26,7 +27,8 @@ run() {  # run <shape> <vus>: prints "<req/s> <p99 ms>" (median over RUNS by req
   local rows=()
   for _ in $(seq "$RUNS"); do
     k6 run --quiet --summary-export "$OUT/shape.json" -e BROKER_URL="http://127.0.0.1:$PORT" \
-      -e SHAPE="$1" -e VUS="$2" -e DURATION="$DURATION" dev/perf/k6-shapes.js >/dev/null
+      -e SHAPE="$1" -e VUS="$2" -e DURATION="$DURATION" -e ENTITIES="${ENTITIES:-100}" \
+      dev/perf/k6-shapes.js >/dev/null
     rows+=("$(python3 -c "
 import json; s=json.load(open('$OUT/shape.json'))['metrics']
 print(f\"{s['http_reqs']['rate']:.0f} {s['http_req_duration']['p(99)']:.2f}\")")")
