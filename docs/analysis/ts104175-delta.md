@@ -208,11 +208,27 @@ The 266 implemented or partial clauses of chapter 5 carry their verdict the same
 | 5.8.6 | 10.5.7 | notification bookkeeping and formats restated, ngsildConformance amendment | compliant |
 | 5.14.1.5, 5.16.7.5 | 14.2.5, 16.7.5 | the script paired them wrongly; placed by hand | unchanged |
 
+### 4.3 Chapter 6
+
+The 121 implemented or partial clauses of chapter 6 carry their TS 104 176 verdict the same way (`grep -h 'TS 104 176' docs/spec/6/*.md`). The resources moved from 6.4 to 6.38 into chapters 7 to 13, and the common behaviours split over 6.2 to 6.5; the script paired nineteen resource definitions and two methods to the wrong resource, so the pairs follow the resource path and the method. Every GET became GET/HEAD. Two clauses are non-compliant with TS 104 176.
+
+| Ledger clause | TS 104 176 | What changed | Verdict |
+|---|---|---|---|
+| 6.3.2 | 6.3.2 | an unrecognised or unimplemented verb is 501, 405 only for a recognised one | non-compliant: axum answers 405 to both; T-3554 |
+| 6.36.3.1, 6.38.3.1 | 13.2.3.1, 13.4.3.1 | Create and Clone Snapshot answer 202 Accepted, CIM 009 answers 201 | version conflict, Antares follows CIM 009; T-3555 |
+| 6.2, every GET | 5, x.x.3.1 | OPTIONS answers 204; HEAD is GET without a body | compliant; the HEAD status is T-3460 (3.8) |
+| 6.3.10 | 6.4.7.2, 6.4.7.3 | temporal pagination in a clause of its own, firstN and offsetN | 3.2 (T-3456) |
+| 6.12.3.1, 6.12.3.2 | 9.4.3.1, 9.4.3.2 | the published headings GET/HEAD and POST are swapped against their text | editorial, paired by text |
+| 6.5.3.4 | 7.3.3.2 | 207 Multi Status for a distributed merge named in the table | compliant, 6.3.17 already required it |
+| 6.4.3.3, 6.8.3.2 | 7.2.3.3, 9.2.3.1 | a should-rule on a configurable default; geoproperty and timeproperty rows corrected | compliant |
+
 ## 5. Gaps and their tasks
 
 | Task | Gap | Kind |
 |---|---|---|
 | T-3553 | Serve @context `core` parameter (4.2) | non-compliant |
+| T-3554 | 501 for an unrecognised HTTP verb (4.3) | non-compliant |
+| T-3555 | Create and Clone Snapshot 202 or 201 (4.3) | version conflict, owner decision |
 | T-3450 | Set Attribute Value `PUT …/attrs/{attrId}/value` (3.10) | compliant |
 | T-3451 | `RegistrationInfo.attributeNames` not matched (3.6) | non-compliant, security (over-forwarding) |
 | T-3452 | CSR subscription ignores `geoQ.geoproperty`; ignore list untested (3.7) | non-compliant |
