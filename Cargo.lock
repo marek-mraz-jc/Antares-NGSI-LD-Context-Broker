@@ -111,6 +111,7 @@ dependencies = [
  "antares-sql",
  "antares-store",
  "antares-views",
+ "antares-ws",
  "async-trait",
  "axum",
  "console-subscriber",

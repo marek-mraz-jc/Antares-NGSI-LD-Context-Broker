@@ -128,6 +128,11 @@ impl Surface for Ws {
         health(&self.0, "/x/ws/ngsi-ld/v1")
     }
 
+    /// The channel of a Tenant serves with the feature alone (rule 2).
+    fn needs_view(&self) -> bool {
+        false
+    }
+
     fn router(&self, ops: Ops) -> Router {
         let hub = self.0.clone();
         Router::new().route(

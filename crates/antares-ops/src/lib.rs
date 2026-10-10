@@ -427,6 +427,13 @@ pub trait Surface: Send + Sync + 'static {
     fn router(&self, ops: Ops) -> Router;
     /// What `/q/health` reports about it.
     fn version_info(&self) -> serde_json::Value;
+    /// Whether it serves only while a view is loaded (fail-closed, T-3496).
+    /// A surface of the NGSI-LD root itself, which runs every operation
+    /// through the policy seam unnarrowed (the WebSocket channel of a
+    /// Tenant, ADR-0026 rule 2), answers `false`.
+    fn needs_view(&self) -> bool {
+        true
+    }
 }
 
 /// `surface` as the broker mounts it.
@@ -471,8 +478,11 @@ impl<S: Surface> antares_api::ApiSurface for Mounted<S> {
         let table = st.views.clone();
         // The first state it is mounted on is the one /q/health reports.
         let _ = self.views.set(table.clone());
-        self.surface
-            .router(Ops::new(st))
+        let routes = self.surface.router(Ops::new(st));
+        if !self.surface.needs_view() {
+            return routes.with_state(());
+        }
+        routes
             .layer(axum::middleware::from_fn(
                 move |req: axum::extract::Request, next: axum::middleware::Next| {
                     let open = table.any_loaded();
@@ -490,7 +500,7 @@ impl<S: Surface> antares_api::ApiSurface for Mounted<S> {
 
     fn version_info(&self) -> serde_json::Value {
         let info = self.surface.version_info();
-        if self.views.get().is_some_and(|t| t.any_loaded()) {
+        if !self.surface.needs_view() || self.views.get().is_some_and(|t| t.any_loaded()) {
             serde_json::json!({"state": "open", "info": info})
         } else {
             serde_json::json!({"state": "closed", "reason": "no view is loaded", "info": info})
@@ -518,7 +528,27 @@ pub mod test_kit {
         /// # Errors
         /// The view table's.
         pub async fn new() -> Result<Self, String> {
+            Self::with_sinks(Vec::new(), None).await
+        }
+
+        /// [`TestBroker::new`] delivering through `sinks` too (a surface's
+        /// own notification binding, ADR-0026) and asking `engine`, both
+        /// set before the notifier is wired, as the broker sets them, so
+        /// `pre_notify` runs on every notification.
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn with_sinks(
+            sinks: Vec<Box<dyn super::NotificationSink>>,
+            engine: Option<Arc<dyn super::policy::PolicyEngine>>,
+        ) -> Result<Self, String> {
             let mut state = AppState::new("antares-test".into());
+            for sink in sinks {
+                state = state.with_sink(sink);
+            }
+            if let Some(engine) = engine {
+                state = state.with_policy(engine);
+            }
             antares_api::wire(&mut state).await;
             let reload = crate::views::install(&state).await?;
             Ok(Self { state, reload })
@@ -578,6 +608,20 @@ pub mod test_kit {
                 }
                 _ => Err(format!("{id:?} is not a loaded view")),
             }
+        }
+
+        /// The broker's router with every surface `mounted` (each made by
+        /// [`mount`]) beside the NGSI-LD API.
+        ///
+        /// # Errors
+        /// The broker's refusal of a surface's prefix.
+        pub fn serve_mounted(
+            &self,
+            mounted: Vec<Box<dyn antares_api::ApiSurface>>,
+        ) -> Result<axum::Router, String> {
+            let mut all: Vec<Box<dyn antares_api::ApiSurface>> = vec![Box::new(antares_api::Admin)];
+            all.extend(mounted);
+            Ok(antares_api::router(self.state.clone().with_surfaces(all)?))
         }
 
         /// The broker's router with `surface` mounted beside the NGSI-LD API.

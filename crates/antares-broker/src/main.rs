@@ -473,6 +473,12 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("views", || antares_ops::mount(antares_views::Views)),
     #[cfg(feature = "mcp")]
     ("mcp", || antares_ops::mount(antares_mcp::Mcp)),
+    #[cfg(feature = "ws")]
+    ("ws", || antares_ops::mount(antares_ws::Ws::process())),
+    #[cfg(all(feature = "ws", feature = "views"))]
+    ("ws-views", || {
+        antares_ops::mount(antares_ws::ViewWs::process())
+    }),
     #[cfg(feature = "plugin-example")]
     ("example", || {
         Box::new(antares_plugin_example::ExampleSurface)
@@ -920,6 +926,13 @@ async fn run(
     // so the shipped binary serves network schemes only.
     #[cfg(feature = "plugin-example")]
     let mut state = state.with_sink(Box::new(antares_plugin_example::MemorySink::new()));
+    // The WebSocket channel (ADR-0026): its sink beside HTTP and MQTT, over
+    // the hub its two surfaces share. A mistyped bound stops the broker.
+    #[cfg(feature = "ws")]
+    let mut state = {
+        antares_ws::Limits::from_env(|k| std::env::var(k).ok())?;
+        state.with_sink(Box::new(antares_ws::Sink::new(antares_ws::Hub::process())))
+    };
     // /q/metrics renders through this closure (None without the
     // `telemetry` feature — the endpoint answers 404); the sampler feeds
     // the process-level gauges the whole run.
