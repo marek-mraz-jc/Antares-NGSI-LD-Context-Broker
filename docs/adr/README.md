@@ -32,6 +32,7 @@ One file per irreversible decision, numbered, never rewritten.
 | [ADR-0024](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0024-odata-library.md) | OData 4.01 for Rust: build our own standalone `odata-*` crates | accepted (owner may override) |
 | [ADR-0025](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0025-internal-context-sources.md) | Internal context sources: a registration that names this broker is served in process | accepted (owner may override) |
 | [ADR-0026](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0026-websocket-notification-channel.md) | WebSocket notification channel: one more sink, the TS 104 243 envelope, bounded and resumable | accepted (owner may override); supersedes ADR-0003 |
+| [ADR-0027](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0027-surfaces-architecture.md) | Surfaces architecture: the vanilla binary, plus feature-gated surface crates in one binary | accepted (owner may override); amends ADR-0025 rule 8 and ADR-0026 rule 1 |
 
 ## Format
 
