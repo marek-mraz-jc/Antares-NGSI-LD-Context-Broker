@@ -57,6 +57,9 @@ here).
 | `ANTARES_CORS_ORIGINS` | unset (no CORS headers) | Browser origins allowed, comma-separated, or `*`. Preflights are answered for every method and header; `Link`, `NGSILD-Tenant` and `NGSILD-Results-Count` are exposed. |
 | `ANTARES_API_SURFACES` | `admin` | Comma list of HTTP surfaces mounted beside the NGSI-LD API root, each under its own reserved prefix (`admin` serves `/q`). An unknown name is fatal at startup and names the shelf the binary was built with; a selection that leaves out `admin` serves no `/q` at all, probes included. |
 | `ANTARES_VIEWS_RELOAD_MS` | `5000` | Builds with the `views` feature only (ADR-0023): how often, in milliseconds, every pod rebuilds its view table from the store, which bounds how long a view written through `/q/views` on one pod takes to open, change or close on another. The pod that took the write reloads before it answers. |
+| `ANTARES_MCP_ALLOWED_HOSTS` | unset (loopback names) | Builds with the `mcp` feature only: the `Host` names the [MCP endpoint](mcp.md) answers, comma-separated. Set it to the names clients reach the broker by; any other `Host` is refused, which stops DNS rebinding (MC8). |
+| `ANTARES_MCP_ALLOWED_ORIGINS` | unset (no browser origin) | Builds with the `mcp` feature only: the browser origins the MCP endpoint answers, comma-separated. Origin validation is always on: unset, a request that carries any `Origin` is `403`. |
+| `ANTARES_MCP_MAX_RESULT_BYTES` | `65536` (64 KiB) | Builds with the `mcp` feature only: the most bytes of structured content one tool result carries; a list past it comes a page at a time. Values outside 1 KiB to 16 MiB are ignored. |
 | `ANTARES_EXTRA_CA_FILE` | unset | PEM bundle of ADDITIONAL trust anchors for egress TLS (private CAs). Egress TLS trusts the host's certificate store (`/etc/ssl/certs` on Linux; the shipped image carries one), and this widens it. Verification itself is never disableable. |
 
 ## Notification delivery

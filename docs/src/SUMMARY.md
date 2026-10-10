@@ -12,6 +12,7 @@
 - [Subscriptions and notifications](subscriptions.md)
 - [Temporal API](temporal.md)
 - [Endpoint views](views.md)
+- [MCP endpoint of a view](mcp.md)
 - [Federation](federation.md)
 - [Operations](operations.md)
 - [Browser & WebAssembly](wasm.md)
