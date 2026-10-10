@@ -2,7 +2,7 @@
 //! binding is handed, after `pre_notify` under the subscriber, and only the
 //! socket that made the Subscription receives it.
 
-use crate::common::{broker, broker_asking, cars, connect, status, text, Client, USER};
+use crate::common::{broker, broker_asking, cars, connect, status, text, with, Client, USER};
 use antares_ops::policy::{
     Decision, DecisionFuture, NotifyDecision, Operation, PolicyEngine, Subject,
 };
@@ -55,7 +55,7 @@ async fn ws_a_subscription_made_over_the_socket_notifies_over_it() -> Result<(),
 struct NotForEve;
 
 impl PolicyEngine for NotForEve {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "not-for-eve"
     }
 
@@ -100,13 +100,16 @@ async fn ws_throttling_and_cooldown_are_honoured() -> Result<(), String> {
     for (member, second) in [("throttling", false), ("cooldown", true)] {
         let mut c = connect(b.addr, "/x/ws/ngsi-ld/v1", &[]).await?;
         let id = format!("urn:ngsi-ld:Car:{member}");
-        let mut sub = cars();
-        sub["entities"] = json!([{"type": "Car", "id": id}]);
-        if second {
-            sub["notification"]["endpoint"] = json!({"cooldown": 30_000});
+        let sub = with(cars(), &["entities"], json!([{"type": "Car", "id": id}]));
+        let sub = if second {
+            with(
+                sub,
+                &["notification", "endpoint"],
+                json!({"cooldown": 30_000}),
+            )
         } else {
-            sub[member] = json!(30);
-        }
+            with(sub, &[member], json!(30))
+        };
         let made = c.subscribe(sub).await?;
         assert_eq!(status(&made), 201, "{made}");
         b.http.car(None, &id, 1).await?;
@@ -114,7 +117,11 @@ async fn ws_throttling_and_cooldown_are_honoured() -> Result<(), String> {
         b.http.speed(None, &id, 2).await?;
         if second {
             let n = c.notification().await?;
-            assert_eq!(n["body"]["data"][0]["speed"]["value"], 2, "{member}: {n}");
+            assert_eq!(
+                n.pointer("/body/data/0/speed/value"),
+                Some(&json!(2)),
+                "{member}: {n}"
+            );
         } else {
             silent(&mut c, Duration::from_millis(800)).await?;
         }
@@ -188,8 +195,11 @@ fn shared(n: &Value) -> Value {
 async fn ws_notification_body_equals_the_http_body() -> Result<(), String> {
     let b = broker(Limits::default()).await?;
     let (uri, posted) = http_receiver().await?;
-    let mut http_sub = cars();
-    http_sub["notification"]["endpoint"] = json!({"uri": uri, "accept": "application/json"});
+    let http_sub = with(
+        cars(),
+        &["notification", "endpoint"],
+        json!({"uri": uri, "accept": "application/json"}),
+    );
     let (code, answer) = b
         .http
         .call("POST", "/ngsi-ld/v1/subscriptions", &[], Some(&http_sub))
@@ -215,8 +225,11 @@ async fn ws_notification_body_equals_the_http_body() -> Result<(), String> {
 async fn ws_metadata_equals_the_mqtt_metadata() -> Result<(), String> {
     let b = broker(Limits::default()).await?;
     let mut c = connect(b.addr, "/x/ws/ngsi-ld/v1", &[("NGSILD-Tenant", "city")]).await?;
-    let mut sub = cars();
-    sub["notification"]["endpoint"] = json!({"receiverInfo": [{"key": "K", "value": "V"}]});
+    let sub = with(
+        cars(),
+        &["notification", "endpoint"],
+        json!({"receiverInfo": [{"key": "K", "value": "V"}]}),
+    );
     assert_eq!(status(&c.subscribe(sub).await?), 201);
     b.http.car(Some("city"), "urn:ngsi-ld:Car:1", 10).await?;
     let n = c.notification().await?;
@@ -252,9 +265,11 @@ async fn ws_a_subscription_is_delivered_only_to_the_connection_that_created_it(
     let mut other = connect(b.addr, "/x/ws/ngsi-ld/v1", &[]).await?;
     assert_eq!(status(&maker.subscribe(cars()).await?), 201);
     // the other socket naming the maker's endpoint is refused
-    let mut stolen = cars();
-    stolen["notification"]["endpoint"] =
-        json!({"uri": format!("urn:antares:ws:{}", maker.connection)});
+    let stolen = with(
+        cars(),
+        &["notification", "endpoint"],
+        json!({"uri": format!("urn:antares:ws:{}", maker.connection)}),
+    );
     let refused = other.subscribe(stolen).await?;
     assert_eq!(status(&refused), 400, "{refused}");
     b.http.car(None, "urn:ngsi-ld:Car:1", 10).await?;
@@ -275,8 +290,7 @@ async fn ws_an_http_create_naming_a_ws_endpoint_is_refused() -> Result<(), Strin
         "urn:antares:ws:nobody".to_owned(),
         "urn:example:other".to_owned(),
     ] {
-        let mut sub = cars();
-        sub["notification"]["endpoint"] = json!({"uri": uri});
+        let sub = with(cars(), &["notification", "endpoint"], json!({"uri": uri}));
         let (code, answer) = b
             .http
             .call("POST", "/ngsi-ld/v1/subscriptions", &[], Some(&sub))

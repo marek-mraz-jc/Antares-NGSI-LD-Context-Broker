@@ -7,6 +7,7 @@ use antares_ops::test_kit::TestBroker;
 use antares_ws::{Hub, Limits, Sink, ViewWs, Ws};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +23,7 @@ pub const WAIT: Duration = Duration::from_secs(10);
 /// A broker serving both surfaces on `addr`.
 pub struct Broker {
     /// Kept alive: its reload loop serves `/q/views`.
-    pub broker: TestBroker,
+    pub _kept: TestBroker,
     /// The hub the surfaces and the sink share.
     pub hub: Arc<Hub>,
     /// Where it listens.
@@ -62,7 +63,7 @@ pub async fn broker_asking(
         let _served = axum::serve(listener, app).await;
     });
     Ok(Broker {
-        broker,
+        _kept: broker,
         hub,
         addr,
         http: Http { addr },
@@ -90,15 +91,12 @@ impl Http {
         let mut req =
             format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
         for (k, v) in headers {
-            req.push_str(&format!("{k}: {v}\r\n"));
+            let _w = write!(req, "{k}: {v}\r\n");
         }
         if body.is_some() {
             req.push_str("Content-Type: application/json\r\n");
         }
-        req.push_str(&format!(
-            "Content-Length: {}\r\n\r\n{payload}",
-            payload.len()
-        ));
+        let _w = write!(req, "Content-Length: {}\r\n\r\n{payload}", payload.len());
         let mut s = TcpStream::connect(self.addr)
             .await
             .map_err(|e| e.to_string())?;
@@ -167,7 +165,10 @@ fn dechunk(mut rest: &str) -> Result<String, String> {
             return Ok(out);
         }
         out.push_str(tail.get(..size).ok_or("a chunk shorter than its size")?);
-        rest = tail.get(size + 2..).ok_or("a chunk without its CRLF")?;
+        rest = tail
+            .get(size..)
+            .and_then(|t| t.strip_prefix("\r\n"))
+            .ok_or("a chunk without its CRLF")?;
     }
 }
 
@@ -344,4 +345,54 @@ pub fn status(result: &Value) -> u64 {
         .pointer("/metadata/x-status")
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+/// `v` with `x` at `path`, making the objects on the way.
+#[must_use]
+pub fn with(mut v: Value, path: &[&str], x: Value) -> Value {
+    let Some((last, parents)) = path.split_last() else {
+        return x;
+    };
+    let mut cur = &mut v;
+    for k in parents {
+        let Some(o) = cur.as_object_mut() else {
+            return v;
+        };
+        cur = o.entry(*k).or_insert_with(|| json!({}));
+    }
+    if let Some(o) = cur.as_object_mut() {
+        o.insert((*last).to_owned(), x);
+    }
+    v
+}
+
+/// Wait until `what` of the hub holds, within [`WAIT`].
+pub async fn until(hub: &Hub, what: impl Fn(&Hub) -> bool) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !what(hub) {
+        if tokio::time::Instant::now() > deadline {
+            return Err(format!(
+                "not within the wait: {} connections, {} attached, {} overflows",
+                hub.connections(),
+                hub.attached(),
+                hub.overflows()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+impl Client {
+    /// `x-resume` of `connection` with `token` after `seq`; the `x-result`.
+    pub async fn resume(
+        &mut self,
+        connection: &str,
+        token: &str,
+        seq: u64,
+    ) -> Result<Value, String> {
+        let m = json!({"x-op": "x-resume", "x-id": "r", "x-connection": connection, "x-resume-token": token, "x-seq": seq});
+        self.send(m, None).await?;
+        self.result().await
+    }
 }

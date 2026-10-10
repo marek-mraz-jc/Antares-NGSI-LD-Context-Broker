@@ -9,7 +9,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use serde_json::{Map, Value};
 use std::sync::Arc;
-use tokio::time::{interval_at, sleep_until, Instant, MissedTickBehavior};
+use tokio::time::{interval_at, sleep_until, timeout, Instant, MissedTickBehavior};
 
 tokio::task_local! {
     /// The connection a Subscription is being made for (rule 4, W6): the
@@ -222,19 +222,6 @@ pub(crate) async fn unsubscribe(conn: &Conn, id: &str) -> (u16, Option<Value>) {
     (status, answer)
 }
 
-async fn send(socket: &mut WebSocket, text: String) -> bool {
-    socket.send(Message::Text(text.into())).await.is_ok()
-}
-
-async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
-    let _closed = socket
-        .send(Message::Close(Some(CloseFrame {
-            code,
-            reason: reason.into(),
-        })))
-        .await;
-}
-
 /// One attached socket and what it has seen.
 struct Session {
     hub: Arc<Hub>,
@@ -246,21 +233,43 @@ struct Session {
     first: bool,
 }
 
-/// Write each message in order; false when the socket broke.
-async fn send_all(socket: &mut WebSocket, texts: Vec<String>) -> bool {
-    for t in texts {
-        if !send(socket, t).await {
-            return false;
-        }
-    }
-    true
-}
-
 impl Session {
+    /// Write one frame. A peer that does not take it within `pong_within`
+    /// is gone (rule 6): a client that stops reading cannot hold the
+    /// session in a write while its queue overflows.
+    async fn write(&mut self, message: Message) -> bool {
+        let within = self.hub.limits.pong_within;
+        matches!(timeout(within, self.socket.send(message)).await, Ok(Ok(())))
+    }
+
+    /// Write one text frame.
+    async fn send(&mut self, text: String) -> bool {
+        self.write(Message::Text(text.into())).await
+    }
+
+    /// Write each message in order; false when the socket broke.
+    async fn send_all(&mut self, texts: Vec<String>) -> bool {
+        for t in texts {
+            if !self.send(t).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Write the close frame.
+    async fn close(&mut self, code: u16, reason: &'static str) {
+        let frame = CloseFrame {
+            code,
+            reason: reason.into(),
+        };
+        let _closed = self.write(Message::Close(Some(frame))).await;
+    }
+
     /// The server closes: `x-closing`, then the close frame.
     async fn closing(&mut self, code: u16, reason: &'static str) -> End {
-        let _closing = send(&mut self.socket, envelope::closing(reason)).await;
-        close(&mut self.socket, code, reason).await;
+        let _closing = self.send(envelope::closing(reason)).await;
+        self.close(code, reason).await;
         End::Closed(reason)
     }
 
@@ -274,12 +283,8 @@ impl Session {
             }
             Some(Ok(Message::Ping(_))) => return None,
             Some(Ok(Message::Binary(_))) => {
-                close(
-                    &mut self.socket,
-                    code::UNSUPPORTED,
-                    "binary frames are not read",
-                )
-                .await;
+                self.close(code::UNSUPPORTED, "binary frames are not read")
+                    .await;
                 return Some(End::Closed("binary"));
             }
             Some(Ok(Message::Close(_)) | Err(_)) | None => return Some(End::Gone),
@@ -289,12 +294,12 @@ impl Session {
         let message = match envelope::read(text.as_str()) {
             Ok(m) => m,
             Err(Unread::Close(why)) => {
-                close(&mut self.socket, code::TOO_BIG, why).await;
+                self.close(code::TOO_BIG, why).await;
                 return Some(End::Closed("bound"));
             }
             Err(Unread::Bad(why)) => {
                 let r = envelope::result(None, 400, Some(envelope::bad_request(&why)));
-                return (!send(&mut self.socket, r).await).then_some(End::Gone);
+                return (!self.send(r).await).then_some(End::Gone);
             }
         };
         let id = message.id;
@@ -318,7 +323,7 @@ impl Session {
             }
         };
         let r = envelope::result(id.as_deref(), status, body);
-        (!send(&mut self.socket, r).await).then_some(End::Gone)
+        (!self.send(r).await).then_some(End::Gone)
     }
 
     /// `x-resume` (rule 7): the first message of a new socket takes over a
@@ -336,14 +341,14 @@ impl Session {
             .flatten();
         let Some(old) = resumed else {
             let r = envelope::result(id, 404, Some(envelope::not_found()));
-            return (!send(&mut self.socket, r).await).then_some(End::Gone);
+            return (!self.send(r).await).then_some(End::Gone);
         };
         self.hub.close(&self.conn.id);
         self.conn = old;
         self.generation = self.conn.attach();
         let mut replay = vec![envelope::result(id, 200, None)];
         replay.extend(self.conn.replay(seq));
-        if !send_all(&mut self.socket, replay).await {
+        if !self.send_all(replay).await {
             return Some(End::Gone);
         }
         // what was queued while the socket was away follows
@@ -357,12 +362,10 @@ impl Session {
         match self.conn.next(self.generation, self.hub.limits.queue) {
             None => Some(End::TakenOver),
             Some(Next::Overflow(from, to)) => {
-                let _gap = send(&mut self.socket, envelope::gap(from, to)).await;
+                let _gap = self.send(envelope::gap(from, to)).await;
                 Some(self.closing(code::TRY_AGAIN, "overflow").await)
             }
-            Some(Next::Send(texts)) => {
-                (!send_all(&mut self.socket, texts).await).then_some(End::Gone)
-            }
+            Some(Next::Send(texts)) => (!self.send_all(texts).await).then_some(End::Gone),
         }
     }
 
@@ -385,16 +388,14 @@ impl Session {
         if self.conn.subscription_count() == 0 && now.duration_since(self.heard) > limits.idle {
             return Some(self.closing(code::NORMAL, "idle").await);
         }
-        let ping = self.socket.send(Message::Ping(Vec::new().into())).await;
-        ping.is_err().then_some(End::Gone)
+        let ping = self.write(Message::Ping(Vec::new().into())).await;
+        (!ping).then_some(End::Gone)
     }
 
     async fn run(&mut self) -> End {
-        if !send(
-            &mut self.socket,
-            envelope::welcome(&self.conn.id, Hub::token(&self.conn)),
-        )
-        .await
+        if !self
+            .send(envelope::welcome(&self.conn.id, Hub::token(&self.conn)))
+            .await
         {
             return End::Gone;
         }

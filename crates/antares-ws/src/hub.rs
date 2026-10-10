@@ -379,6 +379,22 @@ impl Hub {
         lock(&self.conns).len()
     }
 
+    /// The connections a socket holds now: [`Hub::connections`] less those
+    /// waiting out their grace period.
+    ///
+    /// ```
+    /// let hub = antares_ws::Hub::new(antares_ws::Limits::default());
+    /// assert_eq!(hub.attached(), 0);
+    /// ```
+    #[must_use]
+    pub fn attached(&self) -> usize {
+        let conns: Vec<Arc<Conn>> = lock(&self.conns).values().cloned().collect();
+        conns
+            .iter()
+            .filter(|c| lock(&c.state).attached.is_some())
+            .count()
+    }
+
     /// Connections closed for overflow since start (`/q/metrics`).
     #[must_use]
     pub fn overflows(&self) -> u64 {
