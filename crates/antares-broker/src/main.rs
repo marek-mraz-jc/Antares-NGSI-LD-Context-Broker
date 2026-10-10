@@ -65,6 +65,10 @@ const KNOWN_KEYS: &[&str] = &[
     // The HTTP surfaces mounted beside the NGSI-LD API root, comma-separated;
     // default `admin` (/q). An unknown name is fatal and names the shelf.
     "ANTARES_API_SURFACES",
+    // The /q admin credential (T-3569): a file holding the bearer secret,
+    // and whether /q/metrics answers without it (token | open).
+    "ANTARES_ADMIN_TOKEN_FILE",
+    "ANTARES_ADMIN_METRICS",
     // Drain: the LB notice window, and the ceiling on waiting for
     // in-flight requests once the listener has closed.
     "ANTARES_DRAIN_DELAY_MS",
@@ -873,6 +877,21 @@ async fn run(
     // rather than boxing a future that always answers allow.
     if policy_name != antares_api::policy::BUILT_IN_NAME {
         state = state.with_policy(build_policy());
+    }
+    // The /q admin credential, before the router mounts the admin surface.
+    // Unconfigured, /q serves as before and says so once, here.
+    match antares_api::admin_auth::AdminAuth::from_config(
+        std::env::var("ANTARES_ADMIN_TOKEN_FILE").ok().as_deref(),
+        std::env::var("ANTARES_ADMIN_METRICS").ok().as_deref(),
+    )? {
+        Some(auth) => {
+            tracing::info!("/q admin routes require the admin token ({auth:?})");
+            state = state.with_admin_auth(auth);
+        }
+        None => tracing::warn!(
+            "/q admin routes (tenants, dead letters, metrics) answer without a credential: \
+             ANTARES_ADMIN_TOKEN_FILE is unset"
+        ),
     }
     // A notification binding compiled in from outside the workspace mounts
     // exactly like the two shipped ones: one registration, no core-crate

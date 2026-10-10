@@ -10,6 +10,20 @@ deployment mounted. Everything else the broker answers is CIM 009, and the
 pod (`ANTARES_ROLES` without `api`) serves only these routes. Errors use the
 same problem-details shape as the NGSI-LD API.
 
+A deployment can also put `/q/` behind a secret of the broker's own, so a
+network position is not the only thing between a caller and a tenant purge.
+`ANTARES_ADMIN_TOKEN_FILE` names a file holding it (a mounted Secret, at
+least 32 bytes, one trailing line break ignored). With it set, every `/q/`
+route except `GET /q/health` and `GET /q/ready` answers `401` with
+`WWW-Authenticate: Bearer realm="antares-admin"` and the problem type
+`urn:antares:error:Unauthorized` unless the request carries
+`Authorization: Bearer <secret>`; the comparison does not stop at the first
+differing byte. `GET /q/metrics` is guarded too unless
+`ANTARES_ADMIN_METRICS=open`, for a scraper that cannot send a header. The
+broker reads the file once at start, refuses to start when it is unreadable
+or too short, and never logs the secret. Unset, `/q/` asks for nothing and
+the broker logs one warning at start saying so.
+
 The same routes as an OpenAPI document, with every status code and response
 schema: `docs/openapi/antares-admin.yaml`, rendered at
 <https://antaresbroker.joinedcontext.com/openapi/admin.html> (see the
@@ -220,6 +234,11 @@ Subscription id, so a Context Source learns nothing about the subscriber and
 cannot address any other subscription. That key resolves through the stored
 mapping to the tenant and the local subscription; the request's
 `NGSILD-Tenant` header is not read on this route at all.
+
+Who may post: whoever holds a key. Each key is a random UUID minted for one
+subscription copy and sent only to the Context Source that copy went to, so
+the key is the peer's credential for that one subscription. A caller without
+one gets `404` before any store write or delivery (ADR-0019).
 
 `200` when the notification was accepted — including when the mapping
 resolves but nothing was left to deliver. `400` for a body that is not JSON,

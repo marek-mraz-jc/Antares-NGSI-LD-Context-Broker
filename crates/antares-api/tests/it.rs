@@ -10,6 +10,7 @@
 
 mod common;
 
+mod admin_auth;
 mod api_surface;
 mod attr_path_name_5_6_4;
 mod bounded_reads_5_14_5_16;
