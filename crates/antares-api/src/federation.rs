@@ -572,13 +572,13 @@ pub async fn matching_regs(
             let mut ent_patterns = Vec::new();
             let mut ent_unrestricted = false;
             for info in &infos {
-                let props = info.get("propertyNames").and_then(Value::as_array);
-                let rels = info.get("relationshipNames").and_then(Value::as_array);
-                if props.is_none() && rels.is_none() {
-                    attrs = None; // an unscoped info covers everything
-                } else if let Some(list) = &mut attrs {
-                    for src in [props, rels].into_iter().flatten() {
-                        list.extend(src.iter().filter_map(Value::as_str).map(str::to_owned));
+                // TS 104 175 9.4.2: attributeNames, else the deprecated pair
+                match antares_model::registration_attribute_names(info) {
+                    None => attrs = None, // an unscoped info covers everything
+                    Some(names) => {
+                        if let Some(list) = &mut attrs {
+                            list.extend(names.into_iter().map(str::to_owned));
+                        }
                     }
                 }
                 if let Some(es) = info.get("entities").and_then(Value::as_array) {
