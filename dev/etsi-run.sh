@@ -54,7 +54,10 @@ trap 'git -C "$SUITE" checkout -- resources/variables.py 2>/dev/null || true' EX
   sed -i "s|^temporal_api_url = .*|temporal_api_url = '$BROKER_URL'|" variables.py
   sed -i "s|^notification_server_host = .*|notification_server_host = '$CALLBACK_HOST'|" variables.py
   sed -i "s|^context_source_host = .*|context_source_host = '$CALLBACK_HOST'|" variables.py
-  sed -i "s|^context_server_host = .*|context_server_host = '$CALLBACK_HOST'|" variables.py )
+  sed -i "s|^context_server_host = .*|context_server_host = '$CALLBACK_HOST'|" variables.py
+  # the suite context the pipeline serves from this checkout (T-3550)
+  [ -z "${SUITE_CONTEXT:-}" ] \
+    || sed -i "s|^ngsild_test_suite_context = .*|ngsild_test_suite_context = '$SUITE_CONTEXT'|" variables.py )
 
 mkdir -p "$RESULTS_DIR"
 EXTRA=()
