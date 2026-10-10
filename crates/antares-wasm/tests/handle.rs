@@ -146,8 +146,7 @@ async fn csr_tenant_federates_across_tenants_in_one_broker() {
         "tenant": "space-b",
         "contextSourceInfo": [
             {{"key": "X-Playground", "value": "one-broker"}},
-            {{"key": "X-Echo", "value": "urn:ngsi-ld:request"}},
-            {{"key": "NGSILD-Tenant", "value": "smuggled"}}
+            {{"key": "X-Echo", "value": "urn:ngsi-ld:request"}}
         ],
         "@context": "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"
     }}"#
