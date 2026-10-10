@@ -1389,9 +1389,16 @@ async fn query_temporal_outer(
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
-    let filter =
-        gate!(st, &tenant, headers, "5.7.4", scope_q: params.get("scopeQ").map(String::as_str))
-            .await?;
+    let named = crate::entities::ReadMembers::of(st, headers, &params).await;
+    let filter = gate!(
+        st, &tenant, headers, "5.7.4",
+        scope_q: params.get("scopeQ").map(String::as_str),
+        q: named.q.as_ref(),
+        types: &named.types,
+        attrs: &named.attrs,
+        geo: named.geo.as_ref(),
+    )
+    .await?;
     let Some(map_ref) = single_header(headers, "NGSILD-EntityMap")? else {
         return query_temporal_inner(st, &params, headers, &filter).await;
     };
@@ -3068,8 +3075,6 @@ pub async fn batch_temporal_query(
             &["limit", "offset", "count", "options", "format", "local"],
         )?;
         parse_accept(&headers)?;
-        let filter = gate!(st, &tenant, &headers, "5.7.4").await?;
-
         let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
         let q = parsed.object(NgsiError::BadRequestData(
             "query body must be an object".into(),
@@ -3082,6 +3087,17 @@ pub async fn batch_temporal_query(
         // and aggrParams (5.2.44).
         let mut vp: HashMap<String, String> = params.clone();
         crate::paging::query_doc_params(q, true, &mut vp)?;
+        // ADR-0020: the engine is shown every member of the Query body
+        let named = crate::entities::ReadMembers::with_ctx(&st, &vp, &parsed.ctx);
+        let filter = gate!(
+            st, &tenant, &headers, "5.7.4",
+            q: named.q.as_ref(),
+            scope_q: vp.get("scopeQ").map(String::as_str),
+            types: &named.types,
+            attrs: &named.attrs,
+            geo: named.geo.as_ref(),
+        )
+        .await?;
         query_temporal_inner(&st, &vp, &headers, &filter).await
     };
     go.await.unwrap_or_else(|e| e.into_response())

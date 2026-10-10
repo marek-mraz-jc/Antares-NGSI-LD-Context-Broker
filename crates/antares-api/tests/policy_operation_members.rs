@@ -30,6 +30,9 @@ struct Seen {
     types: Vec<String>,
     attrs: Vec<String>,
     body: Option<Value>,
+    q: bool,
+    scope_q: Option<String>,
+    geo: bool,
 }
 
 /// Records every operation; refuses any but a create that names the type
@@ -48,6 +51,9 @@ impl PolicyEngine for Recording {
                 types: op.types.to_vec(),
                 attrs: op.attrs.to_vec(),
                 body: op.body.cloned(),
+                q: op.q.is_some(),
+                scope_q: op.scope_q.map(str::to_owned),
+                geo: op.geo.is_some(),
             });
         }
         let secret = format!("{DC}Secret");
@@ -258,6 +264,185 @@ async fn a_rule_on_the_stored_type_refuses_every_write_to_it() {
         ),
         ("DELETE", s.to_owned(), None),
     ] {
+        assert_eq!(
+            send(&st, method, &path, body).await,
+            StatusCode::FORBIDDEN,
+            "{method} {path}"
+        );
+    }
+}
+
+const GEO: &str = "georel=near%3BmaxDistance%3D%3D10&geometry=Point&coordinates=%5B1,2%5D";
+
+fn geo_q() -> Value {
+    json!({"georel": "near;maxDistance==10", "geometry": "Point", "coordinates": [1, 2]})
+}
+
+/// One read and the members its gate must carry: a space-separated subset
+/// of `types attrs q scopeQ geo`, the same members, expanded, that the
+/// store query runs on (T-3477).
+struct Read {
+    method: &'static str,
+    path: String,
+    body: Option<Value>,
+    clause: &'static str,
+    named: &'static str,
+}
+
+fn read(
+    method: &'static str,
+    path: String,
+    body: Option<Value>,
+    clause: &'static str,
+    named: &'static str,
+) -> Read {
+    Read {
+        method,
+        path,
+        body,
+        clause,
+        named,
+    }
+}
+
+fn reads() -> Vec<Read> {
+    let v = "/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:v";
+    let tq = "timerel=after&timeAt=2020-01-01T00:00:00Z";
+    vec![
+        read(
+            "GET",
+            format!("{v}?type=Vehicle&attrs=speed"),
+            None,
+            "5.7.1",
+            "types attrs",
+        ),
+        read("GET", format!("{v}/attrs/speed"), None, "5.7.1", "attrs"),
+        read(
+            "GET",
+            format!("/ngsi-ld/v1/entities?type=Vehicle&attrs=speed&q=speed%3E0&{GEO}"),
+            None,
+            "5.7.2",
+            "types attrs q geo",
+        ),
+        read(
+            "POST",
+            "/ngsi-ld/v1/entityOperations/query".into(),
+            Some(json!({"type": "Query",
+            "entities": [{"type": "Vehicle"}], "attrs": ["speed"], "q": "speed>0",
+            "scopeQ": "/a", "geoQ": geo_q()})),
+            "5.7.2",
+            "types attrs q scopeQ geo",
+        ),
+        read(
+            "GET",
+            format!(
+                "/ngsi-ld/v1/temporal/entities?type=Vehicle&attrs=speed&q=speed%3E0&{tq}&{GEO}"
+            ),
+            None,
+            "5.7.4",
+            "types attrs q geo",
+        ),
+        read(
+            "POST",
+            "/ngsi-ld/v1/temporal/entityOperations/query".into(),
+            Some(json!({"type": "Query",
+            "entities": [{"type": "Vehicle"}], "attrs": ["speed"], "q": "speed>0", "scopeQ": "/a",
+            "geoQ": geo_q(),
+            "temporalQ": {"timerel": "after", "timeAt": "2020-01-01T00:00:00Z"}})),
+            "5.7.4",
+            "types attrs q scopeQ geo",
+        ),
+        read(
+            "POST",
+            "/ngsi-ld/v1/subscriptions".into(),
+            Some(json!({"type": "Subscription",
+            "entities": [{"type": "Vehicle"}], "watchedAttributes": ["speed"], "q": "speed>0",
+            "scopeQ": "/a", "geoQ": geo_q(),
+            "notification": {"endpoint": {"uri": "https://example.org/notify"}}})),
+            "5.8.1",
+            "types attrs q scopeQ geo",
+        ),
+        read(
+            "GET",
+            "/ngsi-ld/v1/types/Vehicle".into(),
+            None,
+            "5.7.7",
+            "types",
+        ),
+        read(
+            "GET",
+            "/ngsi-ld/v1/attributes/speed".into(),
+            None,
+            "5.7.10",
+            "attrs",
+        ),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_read_names_its_types_attributes_query_and_geo() {
+    let (st, seen) = state().await;
+    seed(&st).await;
+    for Read {
+        method,
+        path,
+        body,
+        clause,
+        named,
+    } in reads()
+    {
+        let has = |m: &str| named.split(' ').any(|n| n == m);
+        let code = send(&st, method, &path, body).await;
+        assert!(code.is_success(), "{method} {path}: {code}");
+        let s = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|s| s.clause == clause)
+            .cloned()
+            .expect("the engine was asked");
+        let want_types: Vec<String> = if has("types") {
+            vec![iri("Vehicle")]
+        } else {
+            vec![]
+        };
+        let want_attrs: Vec<String> = if has("attrs") {
+            vec![iri("speed")]
+        } else {
+            vec![]
+        };
+        assert_eq!(s.types, want_types, "{method} {path}: types");
+        assert_eq!(s.attrs, want_attrs, "{method} {path}: attrs");
+        assert_eq!(s.q, has("q"), "{method} {path}: q");
+        assert_eq!(
+            s.scope_q.is_some(),
+            has("scopeQ"),
+            "{method} {path}: scopeQ"
+        );
+        assert_eq!(s.geo, has("geo"), "{method} {path}: geo");
+    }
+}
+
+/// A rule on a type holds on every read that names the type.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_on_a_named_type_refuses_the_reads_that_name_it() {
+    let (st, _) = state().await;
+    seed(&st).await;
+    for Read {
+        method,
+        path,
+        body,
+        named,
+        ..
+    } in reads()
+    {
+        if !named.contains("types") {
+            continue;
+        }
+        let path = path.replace("Vehicle", "Secret");
+        let body = body
+            .map(|b| serde_json::from_str(&b.to_string().replace("Vehicle", "Secret")).unwrap());
         assert_eq!(
             send(&st, method, &path, body).await,
             StatusCode::FORBIDDEN,

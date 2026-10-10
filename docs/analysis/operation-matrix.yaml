@@ -736,7 +736,7 @@ operations:
         stored image, the engine decides on clause, ids, types (stored and named)]'
       post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.3.3.4.md
-      gate_site: crates/antares-api/src/entities.rs:1314
+      gate_site: crates/antares-api/src/entities.rs:1395
     odata:
       status: supported
       binding: DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.5)
@@ -847,7 +847,7 @@ operations:
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.3.3.2.md
-      gate_site: crates/antares-api/src/entities.rs:1778
+      gate_site: crates/antares-api/src/entities.rs:1859
     odata:
       status: supported
       binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3); upsert on a missing key (11.4.4)
@@ -978,7 +978,7 @@ operations:
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.3.3.3.md
-      gate_site: crates/antares-api/src/entities.rs:2152
+      gate_site: crates/antares-api/src/entities.rs:2233
     odata:
       status: supported
       binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3)
@@ -1893,6 +1893,8 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -1900,7 +1902,7 @@ operations:
           repr.rs:841-846 lookup_joined and repr.rs:1047 collect_flat_walk read the target with store.get); the
           policy projection (omit/pick) travels down the walk (enforced, ADR-0020; test a_join_does_not_carry_a_narrowed_member_out_of_the_answer)'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.3.3.1.md
-      gate_site: crates/antares-api/src/entities.rs:270
+      gate_site: crates/antares-api/src/entities.rs:271
     odata:
       status: supported
       binding: GET /x/views/{view}/odata/v4/{EntitySet}('{id}') with $select (URL 5.1.4) and $expand (URL 5.1.3);
@@ -1910,6 +1912,8 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -1923,6 +1927,8 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -1955,13 +1961,14 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
         filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'join/joinLevel: every joined target Entity visible under the Filter q and scopeQ (NOT enforced today:
           repr.rs:841-846 lookup_joined and repr.rs:1047 collect_flat_walk read the target with store.get); the
           policy projection (omit/pick) travels down the walk (enforced, ADR-0020; test a_join_does_not_carry_a_narrowed_member_out_of_the_answer)'
-  gaps: types and attrs are not filled although the request may name them
 - id: query_entities
   ts104175: 10.4.3
   cim009: 5.7.2
@@ -1981,8 +1988,11 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
         - q
         - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -1990,7 +2000,7 @@ operations:
           repr.rs:841-846 lookup_joined and repr.rs:1047 collect_flat_walk read the target with store.get); the
           policy projection (omit/pick) travels down the walk (enforced, ADR-0020; test a_join_does_not_carry_a_narrowed_member_out_of_the_answer)'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.2.3.1.md
-      gate_site: crates/antares-api/src/entities.rs:567
+      gate_site: crates/antares-api/src/entities.rs:565
     odata:
       status: supported
       binding: GET /x/views/{view}/odata/v4/{EntitySet} with $filter (5.1.2), $select (5.1.4), $orderby (5.1.5),
@@ -2000,8 +2010,11 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
         - q
         - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -2015,8 +2028,11 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
         - q
         - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -2048,15 +2064,17 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
         - q
         - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'join/joinLevel: every joined target Entity visible under the Filter q and scopeQ (NOT enforced today:
           repr.rs:841-846 lookup_joined and repr.rs:1047 collect_flat_walk read the target with store.get); the
           policy projection (omit/pick) travels down the walk (enforced, ADR-0020; test a_join_does_not_carry_a_narrowed_member_out_of_the_answer)'
-  gaps: types, attrs and geo are not filled although the request carries them
 - id: query_entities_post
   ts104175: 10.4.3
   cim009: 5.7.2
@@ -2076,6 +2094,11 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -2083,7 +2106,7 @@ operations:
           repr.rs:841-846 lookup_joined and repr.rs:1047 collect_flat_walk read the target with store.get); the
           policy projection (omit/pick) travels down the walk (enforced, ADR-0020; test a_join_does_not_carry_a_narrowed_member_out_of_the_answer)'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.12.3.1.md
-      gate_site: crates/antares-api/src/batch.rs:1346
+      gate_site: crates/antares-api/src/batch.rs:1377
     odata:
       status: not_offered
       binding: null
@@ -2100,6 +2123,11 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -2131,13 +2159,17 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'join/joinLevel: every joined target Entity visible under the Filter q and scopeQ (NOT enforced today:
           repr.rs:841-846 lookup_joined and repr.rs:1047 collect_flat_walk read the target with store.get); the
           policy projection (omit/pick) travels down the walk (enforced, ADR-0020; test a_join_does_not_carry_a_narrowed_member_out_of_the_answer)'
-  gaps: 'no member but the clause is filled: q, scopeQ, types, attrs and geo of the Query body never reach the engine'
 - id: retrieve_attribute_value
   ts104175: 10.4.4
   cim009: null
@@ -2156,12 +2188,13 @@ operations:
         operation_fields:
         - clause
         - ids
+        - attrs
         filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: one Attribute of one Entity, no join'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.5.3.1.md, 7/7.6.3.1.md
-      gate_site: crates/antares-api/src/entities.rs:2314
+      gate_site: crates/antares-api/src/entities.rs:2441
     odata:
       status: supported
       binding: GET /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (URL 4.6) and .../$value (URL 4.7)
@@ -2170,6 +2203,7 @@ operations:
         operation_fields:
         - clause
         - ids
+        - attrs
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -2182,6 +2216,7 @@ operations:
         operation_fields:
         - clause
         - ids
+        - attrs
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -2212,12 +2247,12 @@ operations:
         operation_fields:
         - clause
         - ids
+        - attrs
         filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: one Attribute of one Entity, no join'
   note: gated as 5.7.1 (Retrieve Entity), so FILTERABLE applies; new in TS 104 175, no CIM 009 clause
-  gaps: attrs is not filled although the path names the Attribute
 - id: create_subscription
   ts104175: 10.5.2
   cim009: 5.8.1
@@ -2237,6 +2272,11 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -2246,7 +2286,7 @@ operations:
         stored in __subject
       post_image: every notification of it passes pre_notify under the stored subject (notify.rs:2084)
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.13.3.2.md
-      gate_site: crates/antares-api/src/subscriptions.rs:776
+      gate_site: crates/antares-api/src/subscriptions.rs:820
     odata:
       status: not_offered
       binding: null
@@ -2264,6 +2304,11 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -2289,6 +2334,11 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -2305,6 +2355,11 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -2316,7 +2371,6 @@ operations:
   pre_image: the engine allows the subscription (the ids it names); a Filter answer is Deny; the subject is stored
     in __subject
   post_image: every notification of it passes pre_notify under the stored subject (notify.rs:2084)
-  gaps: types, attrs (watchedAttributes), q and geo of the Subscription are not filled
 - id: update_subscription
   ts104175: 10.5.3
   cim009: 5.8.2
@@ -2889,12 +2943,13 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
         filterable: false
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.16.3.1.md
-      gate_site: crates/antares-api/src/types_attrs.rs:270
+      gate_site: crates/antares-api/src/types_attrs.rs:271
     odata:
       status: not_offered
       binding: null
@@ -2911,6 +2966,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -2922,6 +2978,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -2944,7 +3001,6 @@ operations:
         filterable: false
         whole_tenant: false
         linked_entity_checks: []
-  gaps: types is not filled although the path names the type
 - id: retrieve_attributes
   ts104175: 10.6.6
   cim009: 5.7.8
@@ -3109,12 +3165,13 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.18.3.1.md
-      gate_site: crates/antares-api/src/types_attrs.rs:382
+      gate_site: crates/antares-api/src/types_attrs.rs:388
     odata:
       status: not_offered
       binding: null
@@ -3131,6 +3188,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -3142,6 +3200,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -3164,7 +3223,6 @@ operations:
         filterable: false
         whole_tenant: false
         linked_entity_checks: []
-  gaps: attrs is not filled although the path names the Attribute
 - id: temporal_upsert
   ts104175: 11.2.2
   cim009: 5.6.11
@@ -3791,7 +3849,11 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
         - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -3814,7 +3876,11 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
         - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -3844,12 +3910,15 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
         - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: temporal defines no join'
-  gaps: q, types, attrs and geo are not filled
 - id: temporal_query_post
   ts104175: 11.3.3
   cim009: 5.7.4
@@ -3867,12 +3936,17 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: temporal defines no join'
       binding_clause: ts-104176-ngsi-ld-http-binding/8/8.7.3.1.md
-      gate_site: crates/antares-api/src/temporal.rs:3071
+      gate_site: crates/antares-api/src/temporal.rs:3092
     odata:
       status: not_offered
       binding: null
@@ -3889,6 +3963,11 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -3918,11 +3997,15 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: temporal defines no join'
-  gaps: no member but the clause is filled
 - id: register_context_source
   ts104175: 12.2.2
   cim009: 5.9.2
