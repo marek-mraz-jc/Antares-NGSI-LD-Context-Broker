@@ -25,13 +25,13 @@ Surfaces, one column each:
 | column | surface | state at `7185e1a` |
 |---|---|---|
 | `ngsi_ld_http` | NGSI-LD HTTP binding under `/ngsi-ld/v1` | implemented, `crates/antares-api/src/lib.rs:315` `router` |
-| `odata` | OData v4.01 under `/x/odata/v4` | proposal |
-| `mcp` | MCP under `/x/mcp` | proposal; the tool names marked "exists" are the platform gateway's (`joinedcontext-platform crates/context-gateway/src/mcp/endpoint_facade.rs:108-426`, `TOOLS`); every other name is a proposal |
-| `linkml` | LinkML schema surface under `/x/linkml`, read-only | proposal |
-| `websocket` | WebSocket notifications under `/x/ws` | proposal; no binding exists in the specs (section 2.4) |
+| `odata` | OData v4.01 under `/x/views/{view}/odata/v4` | proposal |
+| `mcp` | MCP under `/x/views/{view}/mcp` | proposal; the tool names marked "exists" are the platform gateway's (`joinedcontext-platform crates/context-gateway/src/mcp/endpoint_facade.rs:108-426`, `TOOLS`); every other name is a proposal |
+| `linkml` | LinkML schema surface under `/x/views/{view}/linkml`, read-only | proposal |
+| `websocket` | WebSocket notifications under `/x/views/{view}/ws` | proposal; no binding exists in the specs (section 2.4) |
 | `internal_csr` | in-process Context Source registrations between tenants | proposal; the forward is `AppState::call` (`crates/antares-api/src/state.rs:571`) instead of HTTP |
 
-The prefixes follow `crates/antares-api/src/surface.rs:42-48` `check_prefix`: a surface mounts under `/q`, `/x` or below `/x`, "never under the NGSI-LD API root".
+Every surface beside the vanilla NGSI-LD root hangs off a view, `/x/views/{view}/...`, as ADR-0023 rule 10 decides (the view's own NGSI-LD root is `/x/views/{view}/ngsi-ld/v1`). The prefixes follow `crates/antares-api/src/surface.rs:42-48` `check_prefix`: a surface mounts under `/q`, `/x` or below `/x`, "never under the NGSI-LD API root".
 
 ## 2. Method
 
@@ -238,42 +238,42 @@ Notes on this table:
 
 ## 5. The other five columns
 
-`exists` marks a platform MCP tool (file `joinedcontext-platform crates/context-gateway/src/mcp/endpoint_facade.rs`, line of its `name:`); every other tool name, every OData URL under `/x/odata/v4`, every LinkML path and every WebSocket op is a proposal.
+`exists` marks a platform MCP tool (file `joinedcontext-platform crates/context-gateway/src/mcp/endpoint_facade.rs`, line of its `name:`); every other tool name, every OData URL under `/x/views/{view}/odata/v4`, every LinkML path and every WebSocket op is a proposal.
 
 | id | TS 104 175 | OData v4 | MCP | LinkML | WebSocket | internal CSR |
 |---|---|---|---|---|---|---|
-| `create_entity` | 10.2.2 | supported: POST /x/odata/v4/{EntitySet} (Protocol 11.4.2); deep insert 11.4.2.2 | supported: create_entity (proposal) | not offered | not offered | supported: Create Entity forwarded to the registered tenant via AppState::call |
-| `update_attributes` | 10.2.3 | supported: POST\|PUT\|DELETE /x/odata/v4/{EntitySet}('{id}')/{nav}/$ref (Protocol 11.4.6.1-11.4.6.3) | supported: update_attributes (proposal) | not offered | not offered | supported: Update Attributes forwarded |
+| `create_entity` | 10.2.2 | supported: POST /x/views/{view}/odata/v4/{EntitySet} (Protocol 11.4.2); deep insert 11.4.2.2 | supported: create_entity (proposal) | not offered | not offered | supported: Create Entity forwarded to the registered tenant via AppState::call |
+| `update_attributes` | 10.2.3 | supported: POST\|PUT\|DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref (Protocol 11.4.6.1-11.4.6.3) | supported: update_attributes (proposal) | not offered | not offered | supported: Update Attributes forwarded |
 | `append_attributes` | 10.2.4 | not offered | supported: append_attributes (proposal) | not offered | not offered | supported: Append Attributes forwarded |
-| `partial_attribute_update` | 10.2.5 | supported: PATCH /x/odata/v4/{EntitySet}('{id}')/{complexProperty} (Protocol 11.4.9) | supported: update_attribute (proposal) | not offered | not offered | supported: Partial Attribute update forwarded |
+| `partial_attribute_update` | 10.2.5 | supported: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}')/{complexProperty} (Protocol 11.4.9) | supported: update_attribute (proposal) | not offered | not offered | supported: Partial Attribute update forwarded |
 | `set_attribute_value` | 10.2.6 | not offered | not offered | not offered | not offered | not offered |
-| `delete_attribute` | 10.2.7 | supported: DELETE /x/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9; OData sets it to null, the mapping to Delete Attribute is a proposal) | supported: delete_attribute (proposal) | not offered | not offered | supported: Delete Attribute forwarded |
-| `delete_entity` | 10.2.8 | supported: DELETE /x/odata/v4/{EntitySet}('{id}') (Protocol 11.4.5) | supported: delete_entity (proposal) | not offered | not offered | supported: Delete Entity forwarded |
-| `merge_entity` | 10.2.9 | supported: PATCH /x/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3); upsert on a missing key (11.4.4) is refused, not a create | supported: merge_entity (proposal) | not offered | not offered | supported: Merge Entity forwarded |
-| `replace_entity` | 10.2.10 | supported: PUT /x/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3) | supported: replace_entity (proposal) | not offered | not offered | supported: Replace Entity forwarded |
-| `replace_attribute` | 10.2.11 | supported: PUT /x/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9) | supported: replace_attribute (proposal) | not offered | not offered | supported: Replace Attribute forwarded |
-| `purge_entities` | 10.2.12 | rejected: DELETE /x/odata/v4/{EntitySet}/$each (Protocol 11.4.14): 501 | rejected: no tool; a whole-tenant delete is not offered to an agent | not offered | not offered | supported: Purge Entities forwarded (entities.rs purge_inner calls federation) |
-| `batch_create` | 10.3.2 | supported: POST /x/odata/v4/$batch (Protocol 11.7) with one POST per member, each mapped to create_entity | supported: batch_create (proposal) | not offered | not offered | supported: Batch Entity creation forwarded per registration (batch.rs forward_batch) |
+| `delete_attribute` | 10.2.7 | supported: DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9; OData sets it to null, the mapping to Delete Attribute is a proposal) | supported: delete_attribute (proposal) | not offered | not offered | supported: Delete Attribute forwarded |
+| `delete_entity` | 10.2.8 | supported: DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.5) | supported: delete_entity (proposal) | not offered | not offered | supported: Delete Entity forwarded |
+| `merge_entity` | 10.2.9 | supported: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3); upsert on a missing key (11.4.4) is refused, not a create | supported: merge_entity (proposal) | not offered | not offered | supported: Merge Entity forwarded |
+| `replace_entity` | 10.2.10 | supported: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3) | supported: replace_entity (proposal) | not offered | not offered | supported: Replace Entity forwarded |
+| `replace_attribute` | 10.2.11 | supported: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9) | supported: replace_attribute (proposal) | not offered | not offered | supported: Replace Attribute forwarded |
+| `purge_entities` | 10.2.12 | rejected: DELETE /x/views/{view}/odata/v4/{EntitySet}/$each (Protocol 11.4.14): 501 | rejected: no tool; a whole-tenant delete is not offered to an agent | not offered | not offered | supported: Purge Entities forwarded (entities.rs purge_inner calls federation) |
+| `batch_create` | 10.3.2 | supported: POST /x/views/{view}/odata/v4/$batch (Protocol 11.7) with one POST per member, each mapped to create_entity | supported: batch_create (proposal) | not offered | not offered | supported: Batch Entity creation forwarded per registration (batch.rs forward_batch) |
 | `batch_upsert` | 10.3.3 | not offered | supported: upsert_entity (exists: joinedcontext-platform crates/context-gateway/src/mcp/endpoint_facade.rs:320, Operation::UpsertBatch, one entity) | not offered | not offered | supported: Batch upsert forwarded |
 | `batch_update` | 10.3.4 | not offered | supported: batch_update (proposal) | not offered | not offered | supported: Batch update forwarded |
-| `batch_merge` | 10.3.5 | rejected: PATCH /x/odata/v4/{EntitySet} with a delta payload (Protocol 11.4.12): 501 | supported: batch_merge (proposal) | not offered | not offered | supported: Batch merge forwarded |
-| `batch_delete` | 10.3.6 | supported: POST /x/odata/v4/$batch with one DELETE per member (Protocol 11.7) | supported: batch_delete (proposal) | not offered | not offered | supported: Batch delete forwarded |
-| `retrieve_entity` | 10.4.2 | supported: GET /x/odata/v4/{EntitySet}('{id}') with $select (URL 5.1.4) and $expand (URL 5.1.3) | supported: get_entity (exists: endpoint_facade.rs:136, Operation::RetrieveEntity) | not offered | not offered | supported: Retrieve Entity forwarded and merged (federation fed_retrieve) |
-| `query_entities` | 10.4.3 | supported: GET /x/odata/v4/{EntitySet} with $filter (5.1.2), $select (5.1.4), $orderby (5.1.5), $top/$skip (5.1.6), $count (5.1.7), $expand (5.1.3); GET /{EntitySet}/$count (URL 4.8) | supported: query_entities (exists: endpoint_facade.rs:110, Operation::QueryEntity) | not offered | not offered | supported: Query Entities forwarded with the narrowed q/scopeQ (fed_query) |
+| `batch_merge` | 10.3.5 | rejected: PATCH /x/views/{view}/odata/v4/{EntitySet} with a delta payload (Protocol 11.4.12): 501 | supported: batch_merge (proposal) | not offered | not offered | supported: Batch merge forwarded |
+| `batch_delete` | 10.3.6 | supported: POST /x/views/{view}/odata/v4/$batch with one DELETE per member (Protocol 11.7) | supported: batch_delete (proposal) | not offered | not offered | supported: Batch delete forwarded |
+| `retrieve_entity` | 10.4.2 | supported: GET /x/views/{view}/odata/v4/{EntitySet}('{id}') with $select (URL 5.1.4) and $expand (URL 5.1.3) | supported: get_entity (exists: endpoint_facade.rs:136, Operation::RetrieveEntity) | not offered | not offered | supported: Retrieve Entity forwarded and merged (federation fed_retrieve) |
+| `query_entities` | 10.4.3 | supported: GET /x/views/{view}/odata/v4/{EntitySet} with $filter (5.1.2), $select (5.1.4), $orderby (5.1.5), $top/$skip (5.1.6), $count (5.1.7), $expand (5.1.3); GET /{EntitySet}/$count (URL 4.8) | supported: query_entities (exists: endpoint_facade.rs:110, Operation::QueryEntity) | not offered | not offered | supported: Query Entities forwarded with the narrowed q/scopeQ (fed_query) |
 | `query_entities_post` | 10.4.3 | not offered | supported: batch_query (exists: endpoint_facade.rs:212, Operation::QueryBatch) | not offered | not offered | supported: forwarded as Query Entities (batch_query_inner calls federation) |
-| `retrieve_attribute_value` | 10.4.4 | supported: GET /x/odata/v4/{EntitySet}('{id}')/{property} (URL 4.6) and .../$value (URL 4.7) | supported: get_attribute_value (proposal) | not offered | not offered | supported: forwarded as Retrieve Entity with attrs |
+| `retrieve_attribute_value` | 10.4.4 | supported: GET /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (URL 4.6) and .../$value (URL 4.7) | supported: get_attribute_value (proposal) | not offered | not offered | supported: forwarded as Retrieve Entity with attrs |
 | `create_subscription` | 10.5.2 | not offered | supported: create_subscription (exists: endpoint_facade.rs:411, Operation::CreateSubscription) | not offered | supported: subscribe (proposal): creates a Subscription whose endpoint is the socket | supported: forwarded subscription copy, subject stripped (distsub forward_sub) |
 | `update_subscription` | 10.5.3 | not offered | supported: update_subscription (proposal) | not offered | supported: subscription.update (proposal) | supported: forwarded copy updated (distsub on_subscription_updated) |
 | `retrieve_subscription` | 10.5.4 | not offered | supported: get_subscription (exists: endpoint_facade.rs:391, Operation::RetrieveSubscription) | not offered | not offered | not offered |
 | `query_subscriptions` | 10.5.5 | not offered | supported: list_subscriptions (exists: endpoint_facade.rs:238, Operation::QuerySubscription) | not offered | not offered | not offered |
 | `delete_subscription` | 10.5.6 | not offered | supported: delete_subscription (proposal) | not offered | supported: unsubscribe (proposal) | supported: forwarded copy deleted (distsub on_subscription_deleted) |
 | `notification` | 10.5.7 | not offered | not offered | not offered | supported: notification (proposal): server push of the Notification document | supported: notification of a forwarded copy remapped to the original subscriber at /ex/v1/remote-notify |
-| `retrieve_entity_types` | 10.6.3 | supported: GET /x/odata/v4/ (service document, entity sets = visible types) | supported: list_types (exists: endpoint_facade.rs:154, Operation::RetrieveEntityTypes) | supported: GET /x/linkml/schema (proposal): class list | not offered | not offered |
-| `retrieve_entity_type_details` | 10.6.4 | supported: GET /x/odata/v4/$metadata (CSDL built from the visible types and their attributes) | supported: list_types (exists: endpoint_facade.rs:154, Operation::RetrieveEntityTypeDetails) | supported: GET /x/linkml/schema (proposal): classes with slots | not offered | not offered |
-| `retrieve_entity_type_info` | 10.6.5 | not offered | supported: get_type (exists: endpoint_facade.rs:354, Operation::RetrieveEntityTypeInfo) | supported: GET /x/linkml/classes/{type} (proposal) | not offered | not offered |
-| `retrieve_attributes` | 10.6.6 | not offered | supported: list_attributes (exists: endpoint_facade.rs:172, Operation::RetrieveAttrTypes) | supported: GET /x/linkml/schema (proposal): slot list | not offered | not offered |
-| `retrieve_attribute_details` | 10.6.7 | not offered | supported: list_attributes (exists: endpoint_facade.rs:172, Operation::RetrieveAttrTypeDetails) | supported: GET /x/linkml/schema (proposal): slots with ranges | not offered | not offered |
-| `retrieve_attribute_info` | 10.6.8 | not offered | supported: get_attribute (exists: endpoint_facade.rs:371, Operation::RetrieveAttrTypeInfo) | supported: GET /x/linkml/slots/{attr} (proposal) | not offered | not offered |
+| `retrieve_entity_types` | 10.6.3 | supported: GET /x/views/{view}/odata/v4/ (service document, entity sets = visible types) | supported: list_types (exists: endpoint_facade.rs:154, Operation::RetrieveEntityTypes) | supported: GET /x/views/{view}/linkml/schema (proposal): class list | not offered | not offered |
+| `retrieve_entity_type_details` | 10.6.4 | supported: GET /x/views/{view}/odata/v4/$metadata (CSDL built from the visible types and their attributes) | supported: list_types (exists: endpoint_facade.rs:154, Operation::RetrieveEntityTypeDetails) | supported: GET /x/views/{view}/linkml/schema (proposal): classes with slots | not offered | not offered |
+| `retrieve_entity_type_info` | 10.6.5 | not offered | supported: get_type (exists: endpoint_facade.rs:354, Operation::RetrieveEntityTypeInfo) | supported: GET /x/views/{view}/linkml/classes/{type} (proposal) | not offered | not offered |
+| `retrieve_attributes` | 10.6.6 | not offered | supported: list_attributes (exists: endpoint_facade.rs:172, Operation::RetrieveAttrTypes) | supported: GET /x/views/{view}/linkml/schema (proposal): slot list | not offered | not offered |
+| `retrieve_attribute_details` | 10.6.7 | not offered | supported: list_attributes (exists: endpoint_facade.rs:172, Operation::RetrieveAttrTypeDetails) | supported: GET /x/views/{view}/linkml/schema (proposal): slots with ranges | not offered | not offered |
+| `retrieve_attribute_info` | 10.6.8 | not offered | supported: get_attribute (exists: endpoint_facade.rs:371, Operation::RetrieveAttrTypeInfo) | supported: GET /x/views/{view}/linkml/slots/{attr} (proposal) | not offered | not offered |
 | `temporal_upsert` | 11.2.2 | not offered | not offered | not offered | not offered | supported: forwarded (temporal write_plan) |
 | `temporal_add_attributes` | 11.2.3 | not offered | not offered | not offered | not offered | supported: forwarded |
 | `temporal_delete_attribute` | 11.2.4 | not offered | not offered | not offered | not offered | supported: forwarded |
@@ -452,7 +452,7 @@ Reachable today or in the platform, and not one of the 69 rows:
 | `MCP describe_schema` | endpoint_facade.rs:275 (operations QueryEntity, RetrieveEntity, RetrieveEntityTypes) | maps to the LinkML surface: 10.6.4 + 10.6.7 under the view |
 | `MCP list_endpoints (hub)` | joinedcontext-platform crates/context-gateway/src/mcp/hub.rs:447 | platform-side endpoint directory, not a broker operation: stays in the platform (T-3436 decides) |
 | `MCP initialize, tools/list, ping (protocol methods)` | joinedcontext-platform crates/context-gateway/src/mcp/server.rs | protocol only; tools/list lists only tools whose operation the view allows (proposal) |
-| `OData GET /x/odata/v4/ and /$metadata` | proposal | mapped to retrieve_entity_types and retrieve_entity_type_details |
+| `OData GET /x/views/{view}/odata/v4/ and /$metadata` | proposal | mapped to retrieve_entity_types and retrieve_entity_type_details |
 
 Coverage: the 68 method and path pairs (36 paths) of `router()` (`crates/antares-api/src/lib.rs:315-460`) each map to a row of section 4 or of this table (checked by a script that parses the router and the yaml: only `PATCH` and `PUT /entities` fall to this table); the admin surface and `/ex/v1/remote-notify` are here. A follow-up test (filed by T-3445) reads the yaml and asserts that every route of `router()` and of every surface `ApiSurface::router` has a row.
 
