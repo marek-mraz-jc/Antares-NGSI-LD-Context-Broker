@@ -50,7 +50,7 @@ jobs:
       - name: Pull Coraine
         run: docker pull "$CORAINE_IMAGE" && docker image inspect "$CORAINE_IMAGE" --format '{{.Id}} {{.Size}}'
       - name: Compare
-        run: ANTARES_BIN=$PWD/target/release/antares OUT=results/coraine dev/perf/compare-coraine.sh
+        run: BIN=$PWD/target/release/antares OUT=results/coraine dev/perf/compare-coraine.sh
       - name: Summary
         if: always()
         run: |

@@ -6,7 +6,7 @@
 # brokers get the identical load). Each broker is pinned to CPU 0 and k6
 # runs on the others.
 #
-#   ANTARES_BIN=target/release/antares CORAINE_IMAGE=quay.io/seamware/coraine:0.5.0 \
+#   BIN=target/release/antares CORAINE_IMAGE=quay.io/seamware/coraine:0.5.0 \
 #     OUT=results/coraine dev/perf/compare-coraine.sh
 #
 # Runs on a GitHub-hosted runner (compare-coraine.yml), never on a shared
@@ -15,7 +15,7 @@
 # belongs to root, so its /proc entries are read through sudo.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-ANTARES_BIN="${ANTARES_BIN:-target/release/antares}"
+BIN="${BIN:-target/release/antares}"
 CORAINE_IMAGE="${CORAINE_IMAGE:?name the coraine image tag}"
 OUT="${OUT:-results/coraine}"
 PORT=9473
@@ -23,7 +23,7 @@ RUNS="${RUNS:-3}"
 DURATION="${DURATION:-5s}"
 mkdir -p "$OUT"
 command -v k6 >/dev/null || { echo "k6 missing"; exit 1; }
-[ -x "$ANTARES_BIN" ] || { echo "missing $ANTARES_BIN"; exit 1; }
+[ -x "$BIN" ] || { echo "missing $BIN"; exit 1; }
 URL="http://127.0.0.1:$PORT"
 LOAD_CPUS="1-$(( $(nproc) - 1 ))"
 PID=
@@ -40,7 +40,7 @@ start() {  # start <broker>: sets PID to the broker's own process
   case $1 in
     antares)
       ANTARES_STORE=memory ANTARES_HTTP_PORT=$PORT ANTARES_ALLOW_SHARED_LOCAL=1 \
-        taskset -c 0 "$ANTARES_BIN" > "$OUT/antares.log" 2>&1 &
+        taskset -c 0 "$BIN" > "$OUT/antares.log" 2>&1 &
       PID=$!
       ;;
     coraine)
@@ -129,6 +129,7 @@ print(f\"{s['http_reqs']['rate']:.0f} {s['http_req_duration']['p(99)']:.2f}\")")
 for broker in antares coraine; do
   start "$broker"
   ms=$(first_answer_ms)
+  rd "/proc/$PID/status" > /dev/null || { echo "$broker exited:"; tail -5 "$OUT/$broker.log" 2>/dev/null; exit 1; }
   sleep 2
   idle=$(rss_kib)
   maps=$(mapped "$broker")
