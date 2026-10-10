@@ -14,8 +14,6 @@
 //! no tenant header, and the copies a Snapshot leaves behind.
 #![allow(clippy::unwrap_used)] // an unwrap here is the assertion
 
-mod common;
-
 use antares_api::AppState;
 use antares_store::Kind;
 use axum::body::Body;

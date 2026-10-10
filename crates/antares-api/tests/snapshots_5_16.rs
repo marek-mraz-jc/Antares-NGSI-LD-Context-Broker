@@ -6,7 +6,7 @@
 //! 5.3.4 SnapshotNotification.
 #![allow(clippy::unwrap_used)] // an unwrap here is the assertion
 
-mod common;
+use crate::common;
 
 use antares_api::AppState;
 use axum::body::Body;

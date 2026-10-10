@@ -169,9 +169,9 @@ jobs:
       # --run-ignored all: that would also pull in the release-only timing gate.
       - name: Tests that need a live database
         run: |
-          dev/unit-junit.sh ignored-db-api -p antares-api \
-            --test split_entities_5_7_2 --test temporal_fed_paging_5_7_4 \
-            --run-ignored ignored-only
+          dev/unit-junit.sh ignored-db-api -p antares-api --test it \
+            --run-ignored ignored-only \
+            -E 'test(/^(split_entities_5_7_2|temporal_fed_paging_5_7_4)::/)'
           dev/unit-junit.sh ignored-db-broker -p antares-broker --bin antares \
             --run-ignored ignored-only outbox_flush_waits
       # The API tests once more on the on-disk redb store: AppState::new
@@ -383,7 +383,7 @@ jobs:
     # antares-api test run 165 s x 7 features, one antares-broker run 69 s x
     # 4): a single job would pass 15 minutes on a runner, a split one stays
     # well under.
-    name: Each feature alone (${{ matrix.package }})
+    name: Each feature alone (${{ matrix.package }}${{ matrix.partition && format(' {0}', matrix.partition) || '' }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -391,7 +391,15 @@ jobs:
       matrix:
         # `package`, not `crate`: dev/spec.py reads the first `crate:` matrix
         # as the shared-crates one
-        package: [workspace, antares-api, antares-broker, antares-notifier, antares-sql]
+        package: [workspace, antares-broker, antares-notifier, antares-sql]
+        # antares-api's seven feature runs took 24 min in one job (run
+        # 38064052714): cargo-hack's --partition deals them to four runners
+        # (T-3540).
+        include:
+          - { package: antares-api, partition: 1/4 }
+          - { package: antares-api, partition: 2/4 }
+          - { package: antares-api, partition: 3/4 }
+          - { package: antares-api, partition: 4/4 }
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -401,7 +409,7 @@ jobs:
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
-          key: features-${{ matrix.package }}
+          key: features-${{ matrix.package }}-${{ strategy.job-index }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-hack
@@ -410,10 +418,10 @@ jobs:
         run: cargo hack check --locked --workspace --exclude antares-wasm --each-feature --exclude-features console
       - name: Clippy with each feature alone
         if: matrix.package != 'workspace'
-        run: cargo hack clippy --locked --each-feature --exclude-features console -p ${{ matrix.package }} --all-targets -- -D warnings
+        run: cargo hack clippy --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }} --all-targets -- -D warnings
       - name: Tests with each feature alone
         if: matrix.package != 'workspace'
-        run: cargo hack test --locked --each-feature --exclude-features console -p ${{ matrix.package }}
+        run: cargo hack test --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }}
 
   coverage-surfaces:
     # Every new crate of the surfaces epic (metadata.antares.role ops,

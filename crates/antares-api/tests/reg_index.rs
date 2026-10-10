@@ -276,7 +276,7 @@ fn matching_is_a_superset_of_the_naive_reference() {
 /// broker's stated target shape; the 1 000-vs-100 000 ratio is what proves
 /// the index is answering instead of a scan wearing an index's name.
 #[test]
-#[ignore = "release-mode perf gate: cargo test --release -p antares-api --test reg_index -- --ignored"]
+#[ignore = "release-mode perf gate: cargo test --release -p antares-api --test it reg_index:: -- --ignored"]
 fn a_lookup_does_not_scale_with_the_registration_count() {
     let lookup_time = |total: usize| {
         let m = DocMirror::default();
