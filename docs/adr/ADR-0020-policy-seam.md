@@ -61,7 +61,8 @@ clause, ids, types, attrs, `q`, `scopeQ`, geo, body, and for a write by
 id the stored Entity's image (`stored`: types, scope, Attribute names;
 ADR-0023 rule 7). `Decision` is
 `Allow`, `Deny(String)` or `Filter(Filter)`; `Filter` carries a `q`, a
-`scopeQ`, a `geo_q`, `omit`, `pick` and `restricted`.
+`scopeQ`, a list of areas (`geo_q` and `geo_also`, all of which must hold;
+T-3543), `omit`, `pick` and `restricted`.
 
 **Two phases**, both already in ADR-0014's table:
 

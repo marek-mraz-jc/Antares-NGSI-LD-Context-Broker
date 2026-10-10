@@ -17,6 +17,7 @@
 //! module only composes one.
 
 use crate::policy::{resolve, Decision, Denied, Filter, Rule};
+use antares_ql::geo::GeoQuery;
 use antares_ql::QNode;
 
 /// How many rules a composed narrowing may hold: the pairs of a view's
@@ -24,12 +25,6 @@ use antares_ql::QNode;
 /// product is bounded again so neither side can make the other's allocation
 /// grow without limit.
 pub const MAX_COMPOSED_RULES: usize = 4096;
-
-/// The refusal when a view and the engine each narrow by an area at the same
-/// level: a narrowing holds one area (`Filter::geo_q`, `Rule::geo_q`), and
-/// dropping either would widen the answer.
-pub const TWO_AREAS: &str =
-    "the view and the policy each narrow by an area; one narrowing holds one area";
 
 /// A view as `gate!` applies it: the predicate `selector ∧ q ∧ scope_q ∧
 /// geo_q` and the per-rule allowlists (ADR-0023 rule 11), compiled once.
@@ -122,6 +117,7 @@ pub fn with_view(
 /// paired: an Entity a pair holds for matches a rule of each side, and shows
 /// what both show.
 pub fn compose(a: &Filter, b: Filter) -> Result<Filter, Denied> {
+    let (geo_q, geo_also) = and_geo(a.areas(), b.areas());
     let rules = pair_rules(&a.rules, b.rules)?;
     let mut omit = b.omit;
     for name in &a.omit {
@@ -141,7 +137,8 @@ pub fn compose(a: &Filter, b: Filter) -> Result<Filter, Denied> {
     Ok(Filter {
         q: and_q(a.q.as_deref(), b.q.map(|q| *q)).map(Box::new),
         scope_q: and_scope(a.scope_q.as_deref(), b.scope_q)?,
-        geo_q: and_geo(a.geo_q.as_ref(), b.geo_q)?,
+        geo_q,
+        geo_also,
         pick: and_pick(&a.pick, b.pick),
         omit,
         rules,
@@ -168,12 +165,14 @@ fn and_scope(a: Option<&str>, b: Option<String>) -> Result<Option<String>, Denie
     }
 }
 
-fn and_geo<G: Clone>(a: Option<&G>, b: Option<G>) -> Result<Option<G>, Denied> {
-    match (a, b) {
-        (Some(_), Some(_)) => Err(Denied(TWO_AREAS.to_owned())),
-        (Some(a), None) => Ok(Some(a.clone())),
-        (None, b) => Ok(b),
-    }
+/// Every area of both sides, the first in `geo_q` and the rest in
+/// `geo_also`: each must hold, so none is dropped (dropping one widens).
+fn and_geo<'g>(
+    a: impl Iterator<Item = &'g GeoQuery>,
+    b: impl Iterator<Item = &'g GeoQuery>,
+) -> (Option<Box<GeoQuery>>, Vec<GeoQuery>) {
+    let mut all = a.chain(b).cloned();
+    (all.next().map(Box::new), all.collect())
 }
 
 /// Names compared as expanded IRIs, kept in `b`'s written form.
@@ -226,11 +225,13 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
             if types.is_empty() {
                 continue;
             }
+            let (geo_q, geo_also) = and_geo(x.areas(), y.areas());
             out.push(Rule {
                 types,
                 q: and_q(x.q.as_deref(), y.q.as_deref().cloned()).map(Box::new),
                 scope_q: and_scope(x.scope_q.as_deref(), y.scope_q.clone())?,
-                geo_q: and_geo(x.geo_q.as_ref(), y.geo_q.clone())?,
+                geo_q,
+                geo_also,
                 attributes: shared(&x.attributes, y.attributes.clone()),
             });
         }
@@ -596,29 +597,146 @@ mod tests {
         );
     }
 
+    /// A `within` box from longitude `west` to `east`, 1 degree either side
+    /// of the equator.
+    fn band(west: f64, east: f64) -> antares_ql::geo::GeoQuery {
+        let params = std::collections::HashMap::from([
+            ("georel".to_owned(), "within".to_owned()),
+            ("geometry".to_owned(), "Polygon".to_owned()),
+            (
+                "coordinates".to_owned(),
+                json!([[
+                    [west, -1.0],
+                    [east, -1.0],
+                    [east, 1.0],
+                    [west, 1.0],
+                    [west, -1.0]
+                ]])
+                .to_string(),
+            ),
+        ]);
+        antares_ql::geo::GeoQuery::from_params(&params)
+            .expect("parses")
+            .expect("present")
+    }
+
+    /// A Car at longitude `lon` in the internal form `Rule::holds` reads.
+    fn car_at(lon: f64) -> Value {
+        let ctx = crate::repr::policy_context();
+        json!({"id": "urn:ngsi-ld:Car:x", "type": [ctx.expand_key("Car")],
+               (antares_ql::geo::LOCATION_IRI): [{"type": "GeoProperty",
+                   "value": {"type": "Point", "coordinates": [lon, 0.0]}}]})
+    }
+
+    /// ADR-0023 rule 1: a view's area and an engine's area at the same level
+    /// compose, and every one holds. Dropping either would widen.
     #[test]
-    fn two_areas_or_too_many_rules_are_refused() {
-        let area = || {
-            let params = std::collections::HashMap::from([
-                ("georel".to_owned(), "near;maxDistance==10".to_owned()),
-                ("geometry".to_owned(), "Point".to_owned()),
-                ("coordinates".to_owned(), "[1,2]".to_owned()),
-            ]);
-            antares_ql::geo::GeoQuery::from_params(&params)
-                .expect("parses")
-                .expect("present")
-        };
+    fn two_areas_compose_and_both_hold() {
+        let ctx = crate::repr::policy_context();
+        let car = ctx.expand_key("Car");
         let a = Filter {
-            geo_q: Some(Box::new(area())),
+            geo_q: Some(Box::new(band(0.0, 2.0))),
+            rules: vec![Rule {
+                geo_q: Some(Box::new(band(0.0, 2.0))),
+                ..rule(&[&car], None, &["speed"])
+            }],
             ..Filter::default()
         };
         let b = Filter {
-            geo_q: Some(Box::new(area())),
+            geo_q: Some(Box::new(band(1.0, 3.0))),
+            rules: vec![Rule {
+                geo_q: Some(Box::new(band(1.0, 3.0))),
+                ..rule(&[&car], None, &["speed"])
+            }],
             ..Filter::default()
         };
-        assert_eq!(compose(&a, b), Err(Denied(TWO_AREAS.into())));
+        let both = compose(&a, b).expect("two areas compose");
+        assert_eq!(both.areas().count(), 2, "{both:?}");
+        assert_eq!(both.rules.len(), 1);
+        let pair = &both.rules[0];
+        assert_eq!(pair.areas().count(), 2);
+        assert!(pair.holds(&car_at(1.5), ctx), "inside both");
+        assert!(!pair.holds(&car_at(0.5), ctx), "inside the view's only");
+        assert!(!pair.holds(&car_at(2.5), ctx), "inside the engine's only");
+        // three levels deep: a composed narrowing composes again
+        let again = compose(
+            &both,
+            Filter {
+                geo_q: Some(Box::new(band(1.4, 1.6))),
+                ..Filter::default()
+            },
+        )
+        .expect("three areas compose");
+        assert_eq!(again.areas().count(), 3);
+    }
+
+    #[test]
+    fn too_many_rules_are_refused() {
         let many: Vec<Rule> = (0..65).map(|_| rule(&["Car"], None, &["a"])).collect();
         assert!(pair_rules(&many, many.clone()).is_err());
+    }
+
+    /// A view's area and an engine's area both narrow a query, its count
+    /// and its pages; the request's own area still applies on top.
+    #[tokio::test]
+    async fn a_view_area_and_an_engine_area_both_narrow_the_query() {
+        let mut st = AppState::new("me".into()).with_policy(Arc::new(Narrowing(Filter {
+            geo_q: Some(Box::new(band(-0.5, 1.5))),
+            ..Filter::default()
+        })));
+        crate::wire(&mut st).await;
+        for lon in 0..4 {
+            let car = json!({"id": format!("urn:ngsi-ld:Car:at{lon}"), "type": "Car",
+                "speed": {"type": "Property", "value": lon},
+                "location": {"type": "GeoProperty",
+                             "value": {"type": "Point", "coordinates": [lon, 0]}}});
+            let (s, b, _) = send(&st, "POST", "/ngsi-ld/v1/entities", Some(car)).await;
+            assert_eq!(s, StatusCode::CREATED, "{s} {b}");
+        }
+        let view = CompiledView::new(
+            &["Car".into()],
+            None,
+            None,
+            Some(band(0.5, 3.5)),
+            vec![rule(&["Car"], None, &["speed", "location"])],
+        )
+        .expect("view");
+        let view = st.with_view(Arc::new(view));
+        let (s, body, headers) = send(
+            &view,
+            "GET",
+            "/ngsi-ld/v1/entities?type=Car&count=true&limit=1",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(ids(&body), vec!["urn:ngsi-ld:Car:at1"], "only inside both");
+        assert_eq!(
+            headers
+                .get("NGSILD-Results-Count")
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let (_, body, _) = send(
+            &view,
+            "GET",
+            "/ngsi-ld/v1/entities?type=Car&limit=1&offset=1",
+            None,
+        )
+        .await;
+        assert_eq!(ids(&body), Vec::<String>::new(), "no second page");
+        let (_, body, _) = send(
+            &view,
+            "GET",
+            "/ngsi-ld/v1/entities?type=Car&georel=within&geometry=Polygon&coordinates=%5B%5B%5B1.5%2C-1%5D%2C%5B3.5%2C-1%5D%2C%5B3.5%2C1%5D%2C%5B1.5%2C1%5D%2C%5B1.5%2C-1%5D%5D%5D",
+            None,
+        )
+        .await;
+        assert_eq!(
+            ids(&body),
+            Vec::<String>::new(),
+            "the request's area on top"
+        );
     }
 
     #[test]

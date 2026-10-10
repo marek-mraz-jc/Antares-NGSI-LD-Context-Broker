@@ -246,6 +246,11 @@ pub struct Filter {
     /// it like a request's. Boxed: a parsed geometry is large, and every
     /// [`Decision`] would carry its size.
     pub geo_q: Option<Box<GeoQuery>>,
+    /// Further areas, every one of which must hold as well: a view and an
+    /// engine that both narrow by area compose into `geo_q` and these
+    /// (ADR-0023 rule 1). An engine with one area leaves this empty; read
+    /// them all through [`Filter::areas`].
+    pub geo_also: Vec<GeoQuery>,
     /// Members removed from every document served.
     pub omit: Vec<String>,
     /// If non-empty, the only members served beside the document frame.
@@ -280,14 +285,21 @@ pub struct Rule {
     pub q: Option<Box<QNode>>,
     pub scope_q: Option<String>,
     pub geo_q: Option<Box<GeoQuery>>,
+    /// Further areas the Entity must lie in, as [`Filter::geo_also`].
+    pub geo_also: Vec<GeoQuery>,
     /// The Attributes an Entity this rule holds for shows.
     pub attributes: Vec<String>,
 }
 
 impl Rule {
+    /// Every area the Entity must lie in: `geo_q` and `geo_also`.
+    pub fn areas(&self) -> impl Iterator<Item = &GeoQuery> {
+        self.geo_q.as_deref().into_iter().chain(&self.geo_also)
+    }
+
     /// Whether the rule has a condition beside its types.
     pub fn is_conditional(&self) -> bool {
-        self.q.is_some() || self.scope_q.is_some() || self.geo_q.is_some()
+        self.q.is_some() || self.scope_q.is_some() || self.areas().next().is_some()
     }
 
     /// Whether the rule holds for `doc`, an Entity in the form `ctx`
@@ -300,7 +312,7 @@ impl Rule {
                 .scope_q
                 .as_deref()
                 .is_none_or(|s| antares_ql::scope::scope_matches(s, doc))
-            && self.geo_q.as_deref().is_none_or(|g| g.matches(doc, ctx))
+            && self.areas().all(|g| g.matches(doc, ctx))
             && self.q.as_deref().is_none_or(|q| {
                 !q.has_linked_paths() && antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
             })
@@ -320,7 +332,7 @@ impl Rule {
                     .collect()
             })
             .unwrap_or_default();
-        if let Some(g) = &self.geo_q {
+        for g in self.areas() {
             out.push(if g.geoproperty.is_empty() {
                 antares_ql::geo::LOCATION_IRI.to_owned()
             } else {
@@ -391,6 +403,11 @@ pub fn entity_types(doc: &Value) -> Vec<&str> {
 const FRAME: [&str; 3] = ["id", "type", "@context"];
 
 impl Filter {
+    /// Every area the Entity must lie in: `geo_q` and `geo_also`.
+    pub fn areas(&self) -> impl Iterator<Item = &GeoQuery> {
+        self.geo_q.as_deref().into_iter().chain(&self.geo_also)
+    }
+
     /// Apply `pick`/`omit` and the rules to one document by member name.
     /// This is the reference semantics `run_policy_contract` holds an
     /// engine's answer against; a served document is projected through the
@@ -426,7 +443,7 @@ impl Filter {
     pub fn is_empty(&self) -> bool {
         self.q.is_none()
             && self.scope_q.is_none()
-            && self.geo_q.is_none()
+            && self.areas().next().is_none()
             && self.omit.is_empty()
             && self.pick.is_empty()
             && !self.has_rules()
