@@ -783,15 +783,15 @@ impl PgDocStore {
         // statement to one — measured as a sequential scan of csource_index,
         // exactly the read this function exists to avoid.
         let mut wheres = String::new();
-        let mut n = 1; // $1 = tenant_id
+        let mut n: usize = 1; // $1 = tenant_id
         if types.is_some() {
-            n += 1;
+            n = n.saturating_add(1);
             wheres.push_str(&format!(
                 " AND (x.entity_type IS NULL OR x.entity_type = ANY(${n}))"
             ));
         }
         if ids.is_some() {
-            n += 1;
+            n = n.saturating_add(1);
             wheres.push_str(&format!(
                 " AND (x.entity_id IS NULL OR x.id_pattern IS NOT NULL \
                    OR x.entity_id = ANY(${n}))"
@@ -805,7 +805,7 @@ impl PgDocStore {
                  ON x.tenant_id = r.tenant_id AND x.registration_id = r.id
               WHERE r.tenant_id = $1{wheres}
               ORDER BY r.id LIMIT ${}",
-            n + 1
+            n.saturating_add(1)
         );
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;

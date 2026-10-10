@@ -51,8 +51,9 @@ fn oldest_cached(contexts: &BTreeMap<String, Value>) -> Vec<String> {
         return Vec::new();
     }
     cached.sort_unstable_by(|(a_id, a_ts), (b_id, b_ts)| (a_ts, a_id).cmp(&(b_ts, b_id)));
-    cached[..cached.len() - MAX_CACHED_CONTEXTS]
+    cached
         .iter()
+        .take(cached.len().saturating_sub(MAX_CACHED_CONTEXTS))
         .map(|(id, _)| (*id).to_owned())
         .collect()
 }
@@ -331,7 +332,10 @@ impl Store {
     /// Consistency holds because mutations work on a clone and swap last.
     fn write_inner(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
         use std::sync::atomic::Ordering;
-        let depth = self.write_waiters.fetch_add(1, Ordering::Relaxed) + 1;
+        let depth = self
+            .write_waiters
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         self.write_waiters_peak.fetch_max(depth, Ordering::Relaxed);
         let guard = self
             .inner
@@ -416,7 +420,7 @@ impl Store {
             if let Some(docs) = inner.entities.get_mut(&tenant) {
                 self.persist(T_ENTITIES, &key_bytes(&tenant, &id), None);
                 docs.remove(&id);
-                reaped += 1;
+                reaped = reaped.saturating_add(1);
             }
         }
         let Inner {
@@ -432,7 +436,7 @@ impl Store {
             for (tenant, docs) in map.iter_mut() {
                 for (id, doc) in docs.iter_mut() {
                     if prune_expired_instances(doc, now) {
-                        reaped += 1;
+                        reaped = reaped.saturating_add(1);
                         self.persist(table, &key_bytes(tenant, id), Some(doc));
                     }
                 }

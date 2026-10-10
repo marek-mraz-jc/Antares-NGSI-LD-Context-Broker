@@ -64,7 +64,7 @@ axum = "0.8"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "http1", "http2", "tokio"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["normalize-path", "cors"] }
+tower-http = { version = "0.7", features = ["normalize-path", "cors", "catch-panic"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 redb = "4.1"

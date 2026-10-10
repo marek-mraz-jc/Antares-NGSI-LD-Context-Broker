@@ -193,6 +193,22 @@ jobs:
             cat api-cov.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           cargo llvm-cov report --lcov --output-path api.lcov || true
           exit $rc
+      # T-3468: every request surface calls straight into these three, so
+      # each carries its own floor over its own tests (`-p` reports only the
+      # package's files). Measured 2026-10-10: ql 97.2 % lines / 95.7 %
+      # functions, matcher 96.0 / 97.0, model 99.4 / 97.3. Ratchet up only.
+      - name: Request-path crate floors (ql, matcher, model)
+        if: always()
+        run: |
+          set -eo pipefail
+          rc=0
+          for c in antares-ql antares-matcher antares-model; do
+            cargo llvm-cov --locked -p "$c" --summary-only \
+              --fail-under-lines 95 --fail-under-functions 95 > "$c-cov.txt" || rc=1
+            { echo "### Coverage floor — $c"; echo '```'
+              tail -n 1 "$c-cov.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit $rc
       # The two lcov files say WHICH lines and functions no test reached, so
       # the next test can be written against a name instead of a percentage.
       # They are a map, never the gated number: `report` totals every object

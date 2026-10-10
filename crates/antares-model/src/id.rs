@@ -466,4 +466,16 @@ mod tests {
         }
         assert!(TenantId::new(&"x".repeat(64)).is_ok(), "64 is the boundary");
     }
+
+    /// The string conversions round-trip the original text.
+    #[test]
+    fn ids_convert_to_and_from_their_string() {
+        let t = TenantId::new("city").expect("tenant");
+        assert_eq!(t.to_string(), "city");
+        assert_eq!(String::from(t), "city");
+        let e = EntityId::try_from("urn:ngsi-ld:Car:1".to_owned()).expect("entity id");
+        assert_eq!(e.to_string(), "urn:ngsi-ld:Car:1");
+        assert_eq!(String::from(e), "urn:ngsi-ld:Car:1");
+        assert!(EntityId::try_from("no uri".to_owned()).is_err());
+    }
 }

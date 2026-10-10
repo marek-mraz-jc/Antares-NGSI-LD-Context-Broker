@@ -68,11 +68,11 @@ pub fn compile_instance_range(
         "any" => present,
         "before" => {
             binds.push(antares_store::filter::canonical_datetime(r.time_at).into_owned());
-            format!("{present} AND {ts} < {}", at(first_bind + 1))
+            format!("{present} AND {ts} < {}", at(first_bind.saturating_add(1)))
         }
         "after" => {
             binds.push(antares_store::filter::canonical_datetime(r.time_at).into_owned());
-            format!("{present} AND {ts} >= {}", at(first_bind + 1))
+            format!("{present} AND {ts} >= {}", at(first_bind.saturating_add(1)))
         }
         "between" => {
             let end = r.end_time_at?;
@@ -80,8 +80,8 @@ pub fn compile_instance_range(
             binds.push(antares_store::filter::canonical_datetime(end).into_owned());
             format!(
                 "{present} AND {ts} >= {} AND {ts} < {}",
-                at(first_bind + 1),
-                at(first_bind + 2)
+                at(first_bind.saturating_add(1)),
+                at(first_bind.saturating_add(2))
             )
         }
         _ => return None,
@@ -125,7 +125,7 @@ pub fn column_range_bound(
             format!(
                 "{alias}.{col} >= ${time_bind}::timestamptz - interval '48 hours' \
                  AND {alias}.{col} < ${}::timestamptz + interval '48 hours'",
-                time_bind + 1
+                time_bind.saturating_add(1)
             )
         }
         _ => return None,

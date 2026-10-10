@@ -8,7 +8,19 @@
 //! and `Clone`, and renders back to `q=` syntax through `Display`, so a
 //! gateway can inspect or rewrite a query (strip an attribute, AND in an
 //! authorization predicate) and forward it with the broker's own semantics.
-#![cfg_attr(not(test), warn(clippy::expect_used))]
+// T-3468: every surface calls into this crate on a request path, where a
+// panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
+// index out of bounds or overflow.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
 #![deny(missing_docs)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
@@ -37,22 +49,26 @@ pub fn type_selection_matches(sel: &str, types: &[&str], ctx: &antares_jsonld::C
 /// subscription body may arrive encoded, 4.9).
 pub fn percent_decode(input: &[u8]) -> String {
     let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        if input[i] == b'%' && i + 2 < input.len() {
-            // from_str_radix accepts a leading sign, so "%+1" would decode as
-            // 0x01. RFC 3986 clause 2.1 admits two hex digits and nothing else.
-            let hex = std::str::from_utf8(&input[i + 1..i + 3])
-                .ok()
-                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
-            if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+    let mut rest = input;
+    while let Some((&b, tail)) = rest.split_first() {
+        // from_str_radix accepts a leading sign, so "%+1" would decode as
+        // 0x01. RFC 3986 clause 2.1 admits two hex digits and nothing else.
+        let decoded = (b == b'%')
+            .then(|| tail.get(..2))
+            .flatten()
+            .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match decoded {
+            Some(v) => {
+                out.push(v);
+                rest = tail.get(2..).unwrap_or_default();
+            }
+            None => {
                 out.push(b);
-                i += 3;
-                continue;
+                rest = tail;
             }
         }
-        out.push(input[i]);
-        i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -283,7 +299,7 @@ pub fn parse_q(input: &str) -> Result<QNode, NgsiError> {
 /// would compare against a number where the term named text.
 fn is_json_number(s: &str) -> bool {
     let s = s.strip_prefix('-').unwrap_or(s);
-    let digits = |t: &str| t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let digits = |t: &str| t.bytes().take_while(u8::is_ascii_digit).count();
     let int = digits(s);
     if int == 0 || (int > 1 && s.starts_with('0')) {
         return false;
@@ -307,7 +323,7 @@ fn is_json_number(s: &str) -> bool {
 
 fn q_nodes(n: &QNode) -> usize {
     match n {
-        QNode::And(xs) | QNode::Or(xs) => 1 + xs.iter().map(q_nodes).sum::<usize>(),
+        QNode::And(xs) | QNode::Or(xs) => xs.iter().map(q_nodes).fold(1, usize::saturating_add),
         _ => 1,
     }
 }
@@ -352,14 +368,14 @@ impl<'a> Parser<'a> {
     fn term(&mut self) -> Result<QNode, NgsiError> {
         if self.eat('(') {
             // refuse BEFORE recursing — an overflow here aborts the process
-            self.depth += 1;
+            self.depth = self.depth.saturating_add(1);
             if self.depth > MAX_Q_DEPTH {
                 return Err(NgsiError::TooComplexQuery(format!(
                     "q expression nests deeper than {MAX_Q_DEPTH}"
                 )));
             }
             let node = self.or_expr()?;
-            self.depth -= 1;
+            self.depth = self.depth.saturating_sub(1);
             if !self.eat(')') {
                 return Err(bad(self.rest, "expected ')'"));
             }
@@ -386,7 +402,7 @@ impl<'a> Parser<'a> {
         let mut name = self.name()?;
         // LinkedEntityRelation: AttrName{ [EntityType(,EntityType)*:] … }
         while self.eat('{') {
-            braces += 1;
+            braces = braces.saturating_add(1);
             if braces > 8 {
                 return Err(NgsiError::TooComplexQuery(
                     "q linked-entity path nests deeper than 8".into(),
@@ -634,12 +650,12 @@ impl<'a> Parser<'a> {
     /// way that reads as either.
     fn json_string_end(s: &str) -> Option<usize> {
         let b = s.as_bytes();
-        let mut i = 1;
-        while i < b.len() {
-            match b[i] {
-                b'\\' => i += 2,
-                b'"' => return Some(i + 1),
-                _ => i += 1,
+        let mut i = 1usize;
+        while let Some(&c) = b.get(i) {
+            match c {
+                b'\\' => i = i.saturating_add(2),
+                b'"' => return i.checked_add(1),
+                _ => i = i.saturating_add(1),
             }
         }
         None
@@ -658,6 +674,26 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 3986 2.1: "%" and exactly two hex digits; anything shorter or
+    /// signed stays as written, at the end of the input too (T-3468: the
+    /// decoder walks the bytes without indexing past them).
+    #[test]
+    fn percent_decode_takes_two_hex_digits_and_nothing_else() {
+        for (input, want) in [
+            ("", ""),
+            ("%", "%"),
+            ("%4", "%4"),
+            ("a%41", "aA"),
+            ("%41%", "A%"),
+            ("%+1", "%+1"),
+            ("%zz%2", "%zz%2"),
+            ("%C3%A9", "\u{e9}"),
+            ("\u{e9}%20x", "\u{e9} x"),
+        ] {
+            assert_eq!(percent_decode(input.as_bytes()), want, "{input:?}");
+        }
+    }
 
     /// 4.9 p.85: "`Number` shall be a number as mandated by the JSON
     /// Specification, following the ABNF Grammar, production rule named
@@ -1158,6 +1194,52 @@ mod complexity_tests {
         assert!(matches!(
             parse_q("a!=1"),
             Ok(QNode::Cmp { op: CmpOp::Ne, .. })
+        ));
+    }
+
+    /// 4.17: `,`/`|` is OR, `(a;b)` is AND inside one alternative; names are
+    /// expanded against the @context before they are compared.
+    #[test]
+    fn type_selection_or_and_and() {
+        let ctx = antares_jsonld::core_context();
+        let d = |t: &str| format!("https://uri.etsi.org/ngsi-ld/default-context/{t}");
+        let (car, bus) = (d("Car"), d("Bus"));
+        let both = [car.as_str(), bus.as_str()];
+        let car_only = [car.as_str()];
+        assert!(type_selection_matches("Car", &car_only, &ctx));
+        assert!(type_selection_matches("Bus,Car", &car_only, &ctx));
+        assert!(type_selection_matches("Bus|Car", &car_only, &ctx));
+        assert!(type_selection_matches("(Car;Bus)", &both, &ctx));
+        assert!(!type_selection_matches("(Car;Bus)", &car_only, &ctx));
+        assert!(!type_selection_matches("Bus", &[], &ctx));
+    }
+
+    /// 5.6.21.4: the referenced top-level names in source order, whether any
+    /// path hops a Linked Entity, and the deepest hop chain.
+    #[test]
+    fn referenced_paths_and_link_depth() {
+        let q = parse_q("speed>1;(brand==\"x\"|sensor{humidity}==2);!owner").expect("parse");
+        assert_eq!(q.attribute_paths(), ["speed", "brand", "sensor", "owner"]);
+        assert!(q.has_linked_paths());
+        assert_eq!(q.max_link_depth(), 1);
+        let flat = parse_q("speed>1|brand==\"x\"").expect("parse");
+        assert!(!flat.has_linked_paths());
+        assert_eq!(flat.max_link_depth(), 0);
+        assert!(is_non_system_attr("speed"));
+        for sys in SYSTEM_ATTRS {
+            assert!(!is_non_system_attr(sys), "{sys}");
+        }
+    }
+
+    /// The node budget: a flat chain within the depth limit but past
+    /// MAX_Q_NODES is 400 TooComplexQuery, one node fewer parses.
+    #[test]
+    fn a_query_past_the_node_budget_is_too_complex() {
+        let chain = |n: usize| vec!["a==1"; n].join(";");
+        assert!(parse_q(&chain(MAX_Q_NODES - 1)).is_ok());
+        assert!(matches!(
+            parse_q(&chain(MAX_Q_NODES)),
+            Err(NgsiError::TooComplexQuery(_))
         ));
     }
 }
