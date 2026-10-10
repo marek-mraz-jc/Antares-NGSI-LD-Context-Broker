@@ -12,16 +12,16 @@ surfaces:
     prefix: /ngsi-ld/v1
     status: implemented
   odata:
-    prefix: /x/odata/v4
+    prefix: /x/views/{view}/odata/v4
     status: proposal
   mcp:
-    prefix: /x/mcp
+    prefix: /x/views/{view}/mcp
     status: proposal; tool names marked 'exists' are the platform gateway's
   linkml:
-    prefix: /x/linkml
+    prefix: /x/views/{view}/linkml
     status: proposal, read-only
   websocket:
-    prefix: /x/ws
+    prefix: /x/views/{view}/ws
     status: proposal; TS 104 175/176 define no WebSocket binding
   internal_csr:
     prefix: null
@@ -63,7 +63,7 @@ operations:
       gate_site: crates/antares-api/src/entities.rs:114
     odata:
       status: supported
-      binding: POST /x/odata/v4/{EntitySet} (Protocol 11.4.2); deep insert 11.4.2.2
+      binding: POST /x/views/{view}/odata/v4/{EntitySet} (Protocol 11.4.2); deep insert 11.4.2.2
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -185,7 +185,7 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:140
     odata:
       status: supported
-      binding: POST|PUT|DELETE /x/odata/v4/{EntitySet}('{id}')/{nav}/$ref (Protocol 11.4.6.1-11.4.6.3)
+      binding: POST|PUT|DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref (Protocol 11.4.6.1-11.4.6.3)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -403,7 +403,7 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:789
     odata:
       status: supported
-      binding: PATCH /x/odata/v4/{EntitySet}('{id}')/{complexProperty} (Protocol 11.4.9)
+      binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}')/{complexProperty} (Protocol 11.4.9)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -507,7 +507,7 @@ operations:
         no CIM 009 clause and no gate clause string yet'
     odata:
       status: not_offered
-      binding: PUT /x/odata/v4/{EntitySet}('{id}')/{property}/$value (Protocol 11.4.9) would map here once the HTTP
+      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property}/$value (Protocol 11.4.9) would map here once the HTTP
         route exists
       checks:
         adr0020_phase: none
@@ -588,7 +588,7 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:1081
     odata:
       status: supported
-      binding: DELETE /x/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9; OData sets it to null, the mapping
+      binding: DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9; OData sets it to null, the mapping
         to Delete Attribute is a proposal)
       checks:
         adr0020_phase: on_request
@@ -697,7 +697,7 @@ operations:
       gate_site: crates/antares-api/src/entities.rs:1305
     odata:
       status: supported
-      binding: DELETE /x/odata/v4/{EntitySet}('{id}') (Protocol 11.4.5)
+      binding: DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.5)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -804,7 +804,7 @@ operations:
       gate_site: crates/antares-api/src/entities.rs:1760
     odata:
       status: supported
-      binding: PATCH /x/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3); upsert on a missing key (11.4.4) is refused,
+      binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3); upsert on a missing key (11.4.4) is refused,
         not a create
       checks:
         adr0020_phase: on_request
@@ -927,7 +927,7 @@ operations:
       gate_site: crates/antares-api/src/entities.rs:2113
     odata:
       status: supported
-      binding: PUT /x/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3)
+      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1051,7 +1051,7 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:934
     odata:
       status: supported
-      binding: PUT /x/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9)
+      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1161,7 +1161,7 @@ operations:
       gate_site: crates/antares-api/src/entities.rs:1579
     odata:
       status: rejected
-      binding: 'DELETE /x/odata/v4/{EntitySet}/$each (Protocol 11.4.14): 501'
+      binding: 'DELETE /x/views/{view}/odata/v4/{EntitySet}/$each (Protocol 11.4.14): 501'
       checks:
         adr0020_phase: none
         operation_fields: []
@@ -1257,7 +1257,7 @@ operations:
       gate_site: crates/antares-api/src/batch.rs:672
     odata:
       status: supported
-      binding: POST /x/odata/v4/$batch (Protocol 11.7) with one POST per member, each mapped to create_entity
+      binding: POST /x/views/{view}/odata/v4/$batch (Protocol 11.7) with one POST per member, each mapped to create_entity
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1606,7 +1606,7 @@ operations:
       gate_site: crates/antares-api/src/batch.rs:672
     odata:
       status: rejected
-      binding: 'PATCH /x/odata/v4/{EntitySet} with a delta payload (Protocol 11.4.12): 501'
+      binding: 'PATCH /x/views/{view}/odata/v4/{EntitySet} with a delta payload (Protocol 11.4.12): 501'
       checks:
         adr0020_phase: none
         operation_fields: []
@@ -1722,7 +1722,7 @@ operations:
       gate_site: crates/antares-api/src/batch.rs:1146
     odata:
       status: supported
-      binding: POST /x/odata/v4/$batch with one DELETE per member (Protocol 11.7)
+      binding: POST /x/views/{view}/odata/v4/$batch with one DELETE per member (Protocol 11.7)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1825,7 +1825,7 @@ operations:
       gate_site: crates/antares-api/src/entities.rs:270
     odata:
       status: supported
-      binding: GET /x/odata/v4/{EntitySet}('{id}') with $select (URL 5.1.4) and $expand (URL 5.1.3)
+      binding: GET /x/views/{view}/odata/v4/{EntitySet}('{id}') with $select (URL 5.1.4) and $expand (URL 5.1.3)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1914,7 +1914,7 @@ operations:
       gate_site: crates/antares-api/src/entities.rs:567
     odata:
       status: supported
-      binding: GET /x/odata/v4/{EntitySet} with $filter (5.1.2), $select (5.1.4), $orderby (5.1.5), $top/$skip (5.1.6),
+      binding: GET /x/views/{view}/odata/v4/{EntitySet} with $filter (5.1.2), $select (5.1.4), $orderby (5.1.5), $top/$skip (5.1.6),
         $count (5.1.7), $expand (5.1.3); GET /{EntitySet}/$count (URL 4.8)
       checks:
         adr0020_phase: on_request
@@ -2084,7 +2084,7 @@ operations:
       gate_site: crates/antares-api/src/entities.rs:2314
     odata:
       status: supported
-      binding: GET /x/odata/v4/{EntitySet}('{id}')/{property} (URL 4.6) and .../$value (URL 4.7)
+      binding: GET /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (URL 4.6) and .../$value (URL 4.7)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2666,7 +2666,7 @@ operations:
       gate_site: crates/antares-api/src/types_attrs.rs:220
     odata:
       status: supported
-      binding: GET /x/odata/v4/ (service document, entity sets = visible types)
+      binding: GET /x/views/{view}/odata/v4/ (service document, entity sets = visible types)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2688,7 +2688,7 @@ operations:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
       status: supported
-      binding: 'GET /x/linkml/schema (proposal): class list'
+      binding: 'GET /x/views/{view}/linkml/schema (proposal): class list'
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2741,7 +2741,7 @@ operations:
       gate_site: crates/antares-api/src/types_attrs.rs:220
     odata:
       status: supported
-      binding: GET /x/odata/v4/$metadata (CSDL built from the visible types and their attributes)
+      binding: GET /x/views/{view}/odata/v4/$metadata (CSDL built from the visible types and their attributes)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2763,7 +2763,7 @@ operations:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
       status: supported
-      binding: 'GET /x/linkml/schema (proposal): classes with slots'
+      binding: 'GET /x/views/{view}/linkml/schema (proposal): classes with slots'
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2837,7 +2837,7 @@ operations:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
       status: supported
-      binding: GET /x/linkml/classes/{type} (proposal)
+      binding: GET /x/views/{view}/linkml/classes/{type} (proposal)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2910,7 +2910,7 @@ operations:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
       status: supported
-      binding: 'GET /x/linkml/schema (proposal): slot list'
+      binding: 'GET /x/views/{view}/linkml/schema (proposal): slot list'
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2983,7 +2983,7 @@ operations:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
       status: supported
-      binding: 'GET /x/linkml/schema (proposal): slots with ranges'
+      binding: 'GET /x/views/{view}/linkml/schema (proposal): slots with ranges'
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3057,7 +3057,7 @@ operations:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
       status: supported
-      binding: GET /x/linkml/slots/{attr} (proposal)
+      binding: GET /x/views/{view}/linkml/slots/{attr} (proposal)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -6242,7 +6242,7 @@ non_operation_routes:
   handler: joinedcontext-platform crates/context-gateway/src/mcp/server.rs
   answer: protocol only; tools/list lists only tools whose operation the view allows (proposal)
   needs_row_because: protocol methods
-- route: OData GET /x/odata/v4/ and /$metadata
+- route: OData GET /x/views/{view}/odata/v4/ and /$metadata
   handler: proposal
   answer: mapped to retrieve_entity_types and retrieve_entity_type_details
   needs_row_because: service and metadata documents
