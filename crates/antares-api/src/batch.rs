@@ -669,11 +669,27 @@ async fn batch_write(
     // type or Attribute has to reach the same verdict whether the request
     // came one Entity at a time or as one array.
     let gate_ids: Vec<&str> = spec.ids.iter().flatten().map(String::as_str).collect();
+    // A create is shown the Entities it creates, expanded as 5.6.1 shows
+    // its one (ADR-0020). An entry that does not expand is left out: the
+    // local arm reports it as before.
+    let shown = match (&st.policy, mode) {
+        (Some(_), BatchMode::Create) => Some(Value::Array(
+            items
+                .iter()
+                .filter_map(|(item, ctx)| {
+                    let (o, c) = (item.as_object()?, ctx.as_ref().ok()?);
+                    expand_entity(o, c, ExpandOpts::default()).ok()
+                })
+                .collect(),
+        )),
+        _ => None,
+    };
     gate!(
         st, &tenant, headers, mode.clause(),
         ids: &gate_ids,
         types: spec.types.as_deref().unwrap_or(&[]),
         attrs: spec.attrs.as_deref().unwrap_or(&[]),
+        body: shown.as_ref(),
     )
     .await?;
     let fed_regs =
@@ -1343,7 +1359,6 @@ async fn batch_query_inner(
     )?;
     // POST query IS Query Entities: geo+json is a valid Accept here (6.3.15)
     let accept = parse_accept_geo(headers)?;
-    let filter = gate!(st, &tenant, headers, "5.7.2").await?;
     let parsed = parse_body(&st.loader, headers, body, BodyKind::Standard).await?;
     let q = parsed.object(NgsiError::BadRequestData(
         "query body must be an object".into(),
@@ -1357,6 +1372,17 @@ async fn batch_query_inner(
     if let Some(l) = params.get("local") {
         vp.insert("local".into(), l.clone());
     }
+    // ADR-0020: the engine is shown every member of the Query body
+    let named = crate::entities::ReadMembers::with_ctx(st, &vp, &parsed.ctx);
+    let filter = gate!(
+        st, &tenant, headers, "5.7.2",
+        q: named.q.as_ref(),
+        scope_q: vp.get("scopeQ").map(String::as_str),
+        types: &named.types,
+        attrs: &named.attrs,
+        geo: named.geo.as_ref(),
+    )
+    .await?;
     // 5.7.2.4 (p. 201): "At least one of the following input data shall be
     // provided: a) selector of Entity Types; b) list of Attribute names,
     // including at least one non-system Attribute; c) NGSI-LD Query,
@@ -1406,8 +1432,15 @@ async fn batch_query_inner(
     } else {
         Vec::new()
     };
-    let mut matches =
-        crate::entities::filter_entities_fed(st, &tenant, &vp, &parsed.ctx, fed).await?;
+    let mut matches = crate::entities::filter_entities_fed(
+        st,
+        &tenant,
+        &vp,
+        &parsed.ctx,
+        fed,
+        Some(&crate::repr::narrowing(&filter)),
+    )
+    .await?;
     let mut page_params = params.clone();
     page_params.extend(vp.clone());
     // 5.2.43 ordering: same 4.23 keys as the GET twin, applied pre-pagination
@@ -1466,6 +1499,7 @@ async fn batch_query_inner(
                     crate::repr::collect_flat_beyond(
                         st,
                         &tenant,
+                        &parsed.ctx,
                         &repr,
                         doc,
                         *level,

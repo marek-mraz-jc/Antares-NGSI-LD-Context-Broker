@@ -808,3 +808,373 @@ async fn a_join_does_not_carry_a_narrowed_member_out_of_the_answer() {
         "the narrowed member is gone from BOTH documents: {text}"
     );
 }
+
+/// A Vehicle linking one visible and one hidden Person, and the visible
+/// Person linking a hidden Organization one level further.
+async fn seed_linked(st: &AppState, hidden: Value, shown: Value) {
+    let docs = [
+        json!({"id": "urn:ngsi-ld:Vehicle:v", "type": "Vehicle",
+               "owner": {"type": "Relationship", "object": "urn:ngsi-ld:Person:hidden"},
+               "driver": {"type": "Relationship", "object": "urn:ngsi-ld:Person:shown"}}),
+        json!({"id": "urn:ngsi-ld:Person:hidden", "type": "Person", "name": {"type": "Property", "value": "Hid"}}),
+        json!({"id": "urn:ngsi-ld:Person:shown", "type": "Person", "name": {"type": "Property", "value": "Sho"},
+               "employer": {"type": "Relationship", "object": "urn:ngsi-ld:Org:hidden"}}),
+        json!({"id": "urn:ngsi-ld:Org:hidden", "type": "Org", "name": {"type": "Property", "value": "Acme"}}),
+    ];
+    for mut doc in docs {
+        let marks = if doc["id"].as_str().is_some_and(|i| i.ends_with(":hidden")) {
+            &hidden
+        } else {
+            &shown
+        };
+        for (k, v) in marks.as_object().into_iter().flatten() {
+            doc[k] = v.clone();
+        }
+        let (code, body) = send(st, "POST", "/ngsi-ld/v1/entities", Some(doc)).await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+    }
+}
+
+/// 5.7.1.4/5.7.2.4 and 4.5.23: a joined Entity is read the way the
+/// Entity itself is, so one outside the narrowing is absent from the join
+/// exactly as it is absent from a query; the Relationship stays.
+async fn assert_join_hides(st: &AppState) {
+    for path in [
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:v",
+        "/ngsi-ld/v1/entities?type=Vehicle",
+    ] {
+        for join in ["inline", "flat"] {
+            for level in [1, 2] {
+                let sep = if path.contains('?') { '&' } else { '?' };
+                let uri = format!("{path}{sep}join={join}&joinLevel={level}");
+                let (status, body) = send(st, "GET", &uri, None).await;
+                assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+                let text = body.to_string();
+                assert!(
+                    text.contains("Sho"),
+                    "{uri}: allowed target embedded: {text}"
+                );
+                assert!(
+                    text.contains("urn:ngsi-ld:Person:hidden"),
+                    "{uri}: the Relationship itself stays: {text}"
+                );
+                assert!(!text.contains("Hid"), "{uri}: hidden target leaked: {text}");
+                assert!(
+                    !text.contains("Acme"),
+                    "{uri}: hidden level-2 target leaked: {text}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_does_not_embed_a_target_the_q_narrowing_hides() {
+    let st = state(Filter {
+        q: Some(antares_ql::parse_q("public==true").expect("q")),
+        ..Filter::default()
+    })
+    .await;
+    seed_linked(
+        &st,
+        json!({"public": {"type": "Property", "value": false}}),
+        json!({"public": {"type": "Property", "value": true}}),
+    )
+    .await;
+    assert_join_hides(&st).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_does_not_embed_a_target_the_scope_narrowing_hides() {
+    let st = state(Filter {
+        scope_q: Some("/open/#".into()),
+        ..Filter::default()
+    })
+    .await;
+    seed_linked(
+        &st,
+        json!({"scope": "/closed"}),
+        json!({"scope": "/open/a"}),
+    )
+    .await;
+    assert_join_hides(&st).await;
+}
+
+/// Two Assets owned by two People: one public and one not, both earning.
+async fn seed_owned(st: &AppState) {
+    for doc in [
+        json!({"id": "urn:ngsi-ld:Person:open", "type": "Person",
+               "public": {"type": "Property", "value": true},
+               "name": {"type": "Property", "value": "x"},
+               "salary": {"type": "Property", "value": 90000}}),
+        json!({"id": "urn:ngsi-ld:Person:shut", "type": "Person",
+               "public": {"type": "Property", "value": false},
+               "name": {"type": "Property", "value": "x"},
+               "salary": {"type": "Property", "value": 90000}}),
+        json!({"id": "urn:ngsi-ld:Asset:a", "type": "Asset",
+               "public": {"type": "Property", "value": true},
+               "owner": {"type": "Relationship", "object": "urn:ngsi-ld:Person:open"}}),
+        json!({"id": "urn:ngsi-ld:Asset:b", "type": "Asset",
+               "public": {"type": "Property", "value": true},
+               "owner": {"type": "Relationship", "object": "urn:ngsi-ld:Person:shut"}}),
+        json!({"id": "urn:ngsi-ld:Asset:dangling", "type": "Asset",
+               "public": {"type": "Property", "value": true},
+               "owner": {"type": "Relationship", "object": "urn:ngsi-ld:Person:gone"}}),
+    ] {
+        let (code, body) = send(st, "POST", "/ngsi-ld/v1/entities", Some(doc)).await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+    }
+}
+
+fn asset_query(q: &str) -> String {
+    format!(
+        "/ngsi-ld/v1/entities?type=Asset&join=inline&joinLevel=1&q={}",
+        q.replace('{', "%7B")
+            .replace('}', "%7D")
+            .replace('"', "%22")
+            .replace('>', "%3E")
+    )
+}
+
+/// 7.2.3.2 lets a Query Term follow a Relationship; a hop into an Entity
+/// the narrowing hides reads the way a hop into a missing one does, so the
+/// term cannot test a value the subject may not see (T-3474).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_linked_q_term_does_not_read_an_entity_the_narrowing_hides() {
+    let st = state(Filter {
+        q: Some(antares_ql::parse_q("public==true").expect("q")),
+        ..Filter::default()
+    })
+    .await;
+    seed_owned(&st).await;
+    assert_eq!(
+        sorted_ids(&st, &asset_query("owner{salary}>0")).await,
+        ["urn:ngsi-ld:Asset:a"],
+        "the hidden owner's salary selected its Asset"
+    );
+    // hidden reads as absent: the dangling and the hidden hop answer alike
+    assert_eq!(
+        sorted_ids(&st, &asset_query("!owner{name}")).await,
+        ["urn:ngsi-ld:Asset:b", "urn:ngsi-ld:Asset:dangling"],
+    );
+}
+
+/// ADR-0023 rule 2: an Attribute the narrowing omits does not exist while
+/// q is evaluated, one hop away as much as on the Entity itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_linked_q_term_does_not_read_an_attribute_the_narrowing_omits() {
+    let st = state(Filter {
+        omit: vec!["https://uri.etsi.org/ngsi-ld/default-context/salary".into()],
+        ..Filter::default()
+    })
+    .await;
+    seed_owned(&st).await;
+    assert!(
+        sorted_ids(&st, &asset_query("owner{salary}>0"))
+            .await
+            .is_empty(),
+        "an omitted Attribute was tested through a Relationship"
+    );
+    assert_eq!(
+        sorted_ids(&st, &asset_query("owner{name}==%22x%22")).await,
+        ["urn:ngsi-ld:Asset:a", "urn:ngsi-ld:Asset:b"],
+        "a visible linked Attribute still selects"
+    );
+}
+
+/// Four Vehicles on the equator, one per degree of longitude 0..3.
+async fn seed_placed(st: &AppState) {
+    for lon in 0..4 {
+        let id = format!("urn:ngsi-ld:Vehicle:at{lon}");
+        let (code, _) = send(
+            st,
+            "POST",
+            "/ngsi-ld/v1/entities",
+            Some(json!({
+                "id": id, "type": "Vehicle",
+                "location": {"type": "GeoProperty",
+                             "value": {"type": "Point", "coordinates": [lon, 0]}},
+            })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "seed {id}");
+    }
+}
+
+/// A `within` box from longitude `west` to `east`, 1 degree either side of
+/// the equator, as the three 4.10 query parameters.
+fn within_box(west: f64, east: f64) -> [(&'static str, String); 3] {
+    [
+        ("georel", "within".to_owned()),
+        ("geometry", "Polygon".to_owned()),
+        (
+            "coordinates",
+            json!([[
+                [west, -1.0],
+                [east, -1.0],
+                [east, 1.0],
+                [west, 1.0],
+                [west, -1.0]
+            ]])
+            .to_string(),
+        ),
+    ]
+}
+
+fn box_query(west: f64, east: f64) -> String {
+    within_box(west, east)
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlencoding(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn urlencoding(v: &str) -> String {
+    v.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// ADR-0023 rule 1: a narrowing by area joins the request's own geoquery.
+/// 7.2.5 lets a request carry one, so the store query holds both and every
+/// one of them must hold: the caller's area cannot move the policy's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filter_geo_q_narrows_and_a_request_geo_q_still_applies() {
+    let area = |west, east| {
+        let params = within_box(west, east)
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect();
+        antares_ql::geo::GeoQuery::from_params(&params)
+            .expect("valid geoquery")
+            .expect("a geoquery")
+    };
+    let at = |lons: &[u8]| -> Vec<String> {
+        lons.iter()
+            .map(|l| format!("urn:ngsi-ld:Vehicle:at{l}"))
+            .collect()
+    };
+
+    // the request's area alone
+    let wide = state(Filter::default()).await;
+    seed_placed(&wide).await;
+    let request = box_query(0.5, 2.5);
+    assert_eq!(
+        sorted_ids(
+            &wide,
+            &format!("/ngsi-ld/v1/entities?type=Vehicle&{request}")
+        )
+        .await,
+        at(&[1, 2])
+    );
+
+    // the policy's area alone: longitudes 0 and 1
+    let st = state(Filter {
+        geo_q: Some(Box::new(area(-0.5, 1.5))),
+        ..Filter::default()
+    })
+    .await;
+    seed_placed(&st).await;
+    assert_eq!(
+        sorted_ids(&st, "/ngsi-ld/v1/entities?type=Vehicle").await,
+        at(&[0, 1])
+    );
+
+    // both: only longitude 1, and the count says so
+    let uri = format!("/ngsi-ld/v1/entities?type=Vehicle&count=true&{request}");
+    assert_eq!(sorted_ids(&st, &uri).await, at(&[1]));
+    let count = antares_api::router(st.clone())
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .headers()
+        .get("NGSILD-Results-Count")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    assert_eq!(count.as_deref(), Some("1"));
+
+    // an area of the caller's own outside the policy's widens nothing
+    assert!(sorted_ids(
+        &st,
+        &format!("/ngsi-ld/v1/entities?type=Vehicle&{}", box_query(1.5, 3.5))
+    )
+    .await
+    .is_empty());
+
+    // the batch query and the retrieve are narrowed alike
+    let (code, list) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/query",
+        Some(json!({"type": "Query", "entities": [{"type": "Vehicle"}],
+                    "geoQ": {"geometry": "Polygon", "georel": "within",
+                             "coordinates": [[[0.5, -1.0], [2.5, -1.0], [2.5, 1.0], [0.5, 1.0], [0.5, -1.0]]]}})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list), at(&[1]), "{list}");
+    let (code, _) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:at1",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, pd) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:at2",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{pd}");
+}
+
+/// 5.7.4 reads the same Entities over time under the same area.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filter_geo_q_narrows_the_temporal_query() {
+    let params = within_box(-0.5, 1.5)
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+    let st = state(Filter {
+        geo_q: antares_ql::geo::GeoQuery::from_params(&params)
+            .expect("valid geoquery")
+            .map(Box::new),
+        ..Filter::default()
+    })
+    .await;
+    for lon in 0..4 {
+        let id = format!("urn:ngsi-ld:Vehicle:at{lon}");
+        let (code, _) = send(
+            &st,
+            "POST",
+            "/ngsi-ld/v1/temporal/entities",
+            Some(json!({
+                "id": id, "type": "Vehicle",
+                "location": [{"type": "GeoProperty",
+                              "value": {"type": "Point", "coordinates": [lon, 0]},
+                              "observedAt": "2026-01-01T00:00:00Z"}],
+            })),
+        )
+        .await;
+        assert!(
+            code == StatusCode::CREATED || code == StatusCode::NO_CONTENT,
+            "seed {id}: {code}"
+        );
+    }
+    let base =
+        "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after&timeAt=1970-01-01T00:00:00Z";
+    assert_eq!(
+        sorted_ids(&st, base).await,
+        ["urn:ngsi-ld:Vehicle:at0", "urn:ngsi-ld:Vehicle:at1"]
+    );
+    assert_eq!(
+        sorted_ids(&st, &format!("{base}&{}", box_query(0.5, 3.5))).await,
+        ["urn:ngsi-ld:Vehicle:at1"]
+    );
+}

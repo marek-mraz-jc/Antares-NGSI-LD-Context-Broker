@@ -267,7 +267,14 @@ async fn retrieve_entity_inner(
         .into());
     }
     let ctx = request_context(&st.loader, headers).await?;
-    let filter = gate!(st, &tenant, headers, "5.7.1", ids: &[id]).await?;
+    let named = ReadMembers::with_ctx(st, params, &ctx);
+    let filter = gate!(
+        st, &tenant, headers, "5.7.1",
+        ids: &[id],
+        types: &named.types,
+        attrs: &named.attrs,
+    )
+    .await?;
     let mut repr = parse_repr(params, &ctx)?;
     crate::repr::narrow_repr(&mut repr, &filter);
     let join = parse_join(params)?;
@@ -363,19 +370,8 @@ async fn retrieve_entity_inner(
     // 5.7.1.4 answers an absent one — "If the NGSI-LD Entity does not
     // exist, an error of type ResourceNotFound shall be raised" — because a
     // refusal here would tell the caller the Entity is there.
-    if let Some(ast) = &filter.q {
-        if !crate::notify::linked_eval(st, &tenant, |l| {
-            antares_ql::eval::eval_q(ast, &doc, &ctx, l)
-        })
-        .await
-        {
-            return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
-        }
-    }
-    if let Some(scope) = &filter.scope_q {
-        if !crate::scope_matches(scope, &doc) {
-            return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
-        }
+    if !crate::repr::policy_admits(st, &tenant, &ctx, repr.policy_reach.as_deref(), &doc).await {
+        return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
     }
     // 5.7.1: attrs projection with no matching attribute ⇒ 404
     if let Some(want) = &repr.attrs {
@@ -417,6 +413,7 @@ async fn retrieve_entity_inner(
                 let complete = collect_flat_beyond(
                     st,
                     &tenant,
+                    &ctx,
                     &repr,
                     &doc,
                     *level,
@@ -564,10 +561,14 @@ async fn query_entities_outer(
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     let q_ast = params.get("q").map(|q| parse_q(q)).transpose()?;
+    let named = ReadMembers::of(st, headers, &params).await;
     let filter = gate!(
         st, &tenant, headers, "5.7.2",
         q: q_ast.as_ref(),
         scope_q: params.get("scopeQ").map(String::as_str),
+        types: &named.types,
+        attrs: &named.attrs,
+        geo: named.geo.as_ref(),
     )
     .await?;
     let Some(map_ref) = single_header(headers, "NGSILD-EntityMap")? else {
@@ -610,6 +611,7 @@ async fn query_entities_outer(
     // EntityMaps exist for the distributed case. count=true walks every
     // candidate (the total needs each id checked), still chunk-bounded.
     let ids: Vec<String> = crate::entity_map::candidate_ids(&map, &params);
+    let narrow = crate::repr::narrowing(&filter);
     let looped = crate::federation::via_loop(
         headers,
         &crate::federation::alias_for(&st.host_alias, &tenant),
@@ -631,7 +633,7 @@ async fn query_entities_outer(
         } else {
             Vec::new()
         };
-        let docs = filter_entities_fed(st, &tenant, &p, &ctx, fed).await?;
+        let docs = filter_entities_fed(st, &tenant, &p, &ctx, fed, Some(&narrow)).await?;
         let matched: std::collections::HashSet<&str> = docs
             .iter()
             .filter_map(|d| d.get("id").and_then(Value::as_str))
@@ -869,8 +871,11 @@ async fn query_entities_inner(
         params,
         &ctx,
         fed,
-        push_page.then_some((p_offset, p_limit)),
-        push_proj.then_some(&repr),
+        Pushdown {
+            page: push_page.then_some((p_offset, p_limit)),
+            proj: push_proj.then_some(&repr),
+        },
+        Some(&repr),
     )
     .await?;
     let mut matches = filtered.docs;
@@ -918,6 +923,7 @@ async fn query_entities_inner(
                     complete &= collect_flat_beyond(
                         st,
                         &tenant,
+                        &ctx,
                         &repr,
                         doc,
                         *level,
@@ -997,9 +1003,10 @@ pub async fn filter_entities_fed(
     params: &HashMap<String, String>,
     ctx: &antares_jsonld::Context,
     fed: Vec<(bool, Value)>,
+    narrow: Option<&crate::repr::Repr>,
 ) -> ApiResult<Vec<Value>> {
     Ok(
-        filter_entities_paged(st, tenant, params, ctx, fed, None, None)
+        filter_entities_paged(st, tenant, params, ctx, fed, Pushdown::default(), narrow)
             .await?
             .docs,
     )
@@ -1051,21 +1058,118 @@ fn page_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -
     fed_is_empty && !params.contains_key("idPattern") && !params.contains_key("orderBy")
 }
 
-/// The full filtering path (5.7.2). `page` = (offset, limit) to push into the
+/// Entity Type Selection Language (4.17): `,`/`|` = OR, `(a;b)` = AND.
+/// Table 6.4.3.2-1: `"*"` selects every Entity Type, i.e. no type predicate
+/// at all. Expanding it as a term yields an IRI nothing matches, which is
+/// how `type=*` silently returned an empty array.
+fn type_selection(
+    params: &HashMap<String, String>,
+    ctx: &antares_jsonld::Context,
+) -> Option<Vec<Vec<String>>> {
+    params.get("type").filter(|s| *s != "*").map(|s| {
+        s.split([',', '|'])
+            .map(|alt| {
+                alt.trim()
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+                    .split(';')
+                    .map(|t| ctx.expand_key(t.trim()))
+                    .collect()
+            })
+            .collect()
+    })
+}
+
+/// The expanded `attrs` list of a query.
+fn attr_list(
+    params: &HashMap<String, String>,
+    ctx: &antares_jsonld::Context,
+) -> Option<Vec<String>> {
+    params
+        .get("attrs")
+        .map(|s| s.split(',').map(|t| ctx.expand_key(t.trim())).collect())
+}
+
+/// What a read names, for the policy gate (ADR-0020: "`Operation` is the
+/// expanded request"): the types of its type selector, its `attrs`, its
+/// `q` and its GeoQuery, expanded with the request @context exactly as the
+/// store query uses them. Built only with an engine attached. A member
+/// that does not parse is left out, and the read refuses it after the gate
+/// as before.
+#[derive(Default)]
+pub(crate) struct ReadMembers {
+    pub types: Vec<String>,
+    pub attrs: Vec<String>,
+    pub q: Option<antares_ql::QNode>,
+    pub geo: Option<antares_ql::geo::GeoQuery>,
+}
+
+impl ReadMembers {
+    pub(crate) fn with_ctx(
+        st: &AppState,
+        params: &HashMap<String, String>,
+        ctx: &antares_jsonld::Context,
+    ) -> Self {
+        if st.policy.is_none() {
+            return Self::default();
+        }
+        let mut types: Vec<String> = Vec::new();
+        for t in type_selection(params, ctx).into_iter().flatten().flatten() {
+            if !types.contains(&t) {
+                types.push(t);
+            }
+        }
+        Self {
+            types,
+            attrs: attr_list(params, ctx).unwrap_or_default(),
+            q: params.get("q").and_then(|q| parse_q(q).ok()),
+            geo: antares_ql::geo::GeoQuery::from_params(params)
+                .ok()
+                .flatten(),
+        }
+    }
+
+    /// Same, for a gate taken before the request @context is resolved.
+    pub(crate) async fn of(
+        st: &AppState,
+        headers: &HeaderMap,
+        params: &HashMap<String, String>,
+    ) -> Self {
+        if st.policy.is_none() {
+            return Self::default();
+        }
+        match request_context(&st.loader, headers).await {
+            Ok(ctx) => Self::with_ctx(st, params, &ctx),
+            Err(_) => Self::default(),
+        }
+    }
+}
+
+/// What the store may be asked to do beyond filtering; see
+/// [`filter_entities_paged`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Pushdown<'a> {
+    pub page: Option<(usize, usize)>,
+    pub proj: Option<&'a crate::repr::Repr>,
+}
+
+/// The full filtering path (5.7.2). `push.page` = (offset, limit) to push into the
 /// store — pass it ONLY when every filter the store cannot see is absent
 /// (idPattern, federation, orderBy); the store still refuses unless its own
-/// predicates compiled exactly. `proj` = the parsed representation, offered
-/// for projection pushdown (pick/omit/attrs top-level heads) under the same
-/// exactness gate.
+/// predicates compiled exactly. `push.proj` = the parsed representation,
+/// offered for projection pushdown (pick/omit/attrs top-level heads) under
+/// the same exactness gate. `narrow` = the caller's policy narrowing, which
+/// a linked q term reads its targets through (ADR-0020, T-3474).
 pub async fn filter_entities_paged(
     st: &AppState,
     tenant: &TenantId,
     params: &HashMap<String, String>,
     ctx: &antares_jsonld::Context,
     fed: Vec<(bool, Value)>,
-    page: Option<(usize, usize)>,
-    proj: Option<&crate::repr::Repr>,
+    push: Pushdown<'_>,
+    narrow: Option<&crate::repr::Repr>,
 ) -> ApiResult<Filtered> {
+    let Pushdown { page, proj } = push;
     // a pushed page over local rows cannot be merged with federated
     // candidates — refuse here so no caller can create that page
     let page = if fed.is_empty() { page } else { None };
@@ -1090,25 +1194,8 @@ pub async fn filter_entities_paged(
         }
         None => None,
     };
-    // Entity Type Selection Language (4.17): `,`/`|` = OR, `(a;b)` = AND.
-    // Table 6.4.3.2-1: `"*"` selects every Entity Type, i.e. no type predicate
-    // at all. Expanding it as a term yields an IRI nothing matches, which is
-    // how `type=*` silently returned an empty array.
-    let type_sel: Option<Vec<Vec<String>>> = params.get("type").filter(|s| *s != "*").map(|s| {
-        s.split([',', '|'])
-            .map(|alt| {
-                alt.trim()
-                    .trim_start_matches('(')
-                    .trim_end_matches(')')
-                    .split(';')
-                    .map(|t| ctx.expand_key(t.trim()))
-                    .collect()
-            })
-            .collect()
-    });
-    let attr_filter: Option<Vec<String>> = params
-        .get("attrs")
-        .map(|s| s.split(',').map(|t| ctx.expand_key(t.trim())).collect());
+    let type_sel = type_selection(params, ctx);
+    let attr_filter = attr_list(params, ctx);
     let q_ast = match params.get("q") {
         // 4.9 expandValues: "attributes whose values should be expanded
         // against the supplied @context using JSON-LD type coercion prior to
@@ -1126,7 +1213,14 @@ pub async fn filter_entities_paged(
         None => None,
     };
     let scope_q = params.get("scopeQ");
-    let geo = antares_ql::geo::GeoQuery::from_params(params)?;
+    // The request's own geoquery (7.2.5 allows one) and the narrowing's
+    // area: every one must hold (ADR-0023 rule 1), so a caller's area
+    // cannot widen the policy's.
+    let own_geo = antares_ql::geo::GeoQuery::from_params(params)?;
+    let policy_geo = narrow
+        .and_then(|r| r.policy_reach.as_deref())
+        .and_then(|reach| reach.geo_q.as_deref());
+    let geos: Vec<&antares_ql::geo::GeoQuery> = own_geo.iter().chain(policy_geo).collect();
 
     // Hand the store what it can filter on. A backend that can push
     // the predicate down (postgres/timescale) returns fewer rows — and says
@@ -1135,13 +1229,14 @@ pub async fn filter_entities_paged(
     // skip re-deciding. A backend that cannot (memory/file) returns the
     // snapshot and the loop stays the arbiter.
     let expand = |t: &str| ctx.expand_key(t);
-    let geo_spec = geo.as_ref().and_then(|g| g.to_sql_spec(ctx));
+    let geo_specs: Vec<_> = geos.iter().filter_map(|g| g.to_sql_spec(ctx)).collect();
     // A geo query whose spec declined to compile (non-default geoproperty) is
     // INVISIBLE to the store — the store would truthfully claim `decided`
     // about what it saw, projection would strip the very member the evaluator
     // still needs, and a pushed page would page over the wrong set. Forfeit
-    // every pushdown up front and mask `decided` after.
-    let geo_uncompiled = geo.is_some() && geo_spec.is_none();
+    // every pushdown up front and mask `decided` after. The specs that did
+    // compile still narrow the rows.
+    let geo_uncompiled = geo_specs.len() < geos.len();
     let page = if geo_uncompiled { None } else { page };
     let proj = proj.filter(|_| !geo_uncompiled);
     // pick (or attrs) heads to keep / whole-attr omit heads to drop; core
@@ -1198,7 +1293,7 @@ pub async fn filter_entities_paged(
                 } else {
                     scope_q.map(String::as_str)
                 },
-                geo: if split_agg { None } else { geo_spec.as_ref() },
+                geo: if split_agg { &[] } else { &geo_specs },
                 expand: &expand,
                 page: page.map(|(offset, limit)| antares_store::filter::Page {
                     offset: offset as i64,
@@ -1259,8 +1354,11 @@ pub async fn filter_entities_paged(
             }
             if let Some(ast) = &q_ast {
                 // 4.9 linked-entity subqueries (attr{path}) resolve through
-                // the local store, same tenant.
-                if !crate::notify::linked_eval(st, tenant, |l| eval_q(ast, &doc, ctx, l)).await {
+                // the local store, same tenant, under the caller's narrowing
+                let narrow = narrow.map(|r| (r, ctx));
+                if !crate::notify::linked_eval(st, tenant, narrow, |l| eval_q(ast, &doc, ctx, l))
+                    .await
+                {
                     continue;
                 }
             }
@@ -1269,10 +1367,8 @@ pub async fn filter_entities_paged(
                     continue;
                 }
             }
-            if let Some(g) = &geo {
-                if !g.matches(&doc, ctx) {
-                    continue;
-                }
+            if !geos.iter().all(|g| g.matches(&doc, ctx)) {
+                continue;
             }
         }
         out.push(doc);
@@ -1302,7 +1398,12 @@ pub async fn delete_entity(
         // the client meant, and the delete then removes an Entity the
         // client's selector excluded.
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.6.6", ids: &[&id]).await?;
+        gate!(
+            st, &tenant, &headers, "5.6.6",
+            ids: &[&id],
+            types: &crate::policy::write_types(&st, &tenant, &id, None).await,
+        )
+        .await?;
         // 4.17/5.6.6.4: the type selector gates the target — a registration
         // for a different type must not receive the forwarded delete.
         let spec = crate::registry::CsrSpec {
@@ -1471,7 +1572,11 @@ async fn purge_locally(
             params,
             ctx,
             Vec::new(),
-            Some((offset, PURGE_CHUNK)),
+            Pushdown {
+                page: Some((offset, PURGE_CHUNK)),
+                proj: None,
+            },
+            // 5.6.21.4 refuses linked q terms before a purge runs
             None,
         )
         .await?;
@@ -1757,7 +1862,14 @@ async fn merge_entity_inner(
             ..Default::default()
         },
     )?;
-    gate!(st, &tenant, headers, "5.6.17", ids: &[id], body: Some(&fragment)).await?;
+    gate!(
+        st, &tenant, headers, "5.6.17",
+        ids: &[id],
+        types: &crate::policy::write_types(st, &tenant, id, Some(&fragment)).await,
+        attrs: &crate::attrs::attr_iris_of(&fragment),
+        body: Some(&fragment),
+    )
+    .await?;
     // 5.6.17.3: a common observedAt timestamp to use across merged
     // Attributes, and a common language tag for merged LanguageMaps.
     let observed_at = params.get("observedAt").map(String::as_str);
@@ -2110,7 +2222,28 @@ pub async fn replace_entity(
         // (5.6.18: an unknown target is 404 before body validation), so the
         // header context is resolved on its own here.
         let ctx0 = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.6.18", ids: &[&id]).await?;
+        // The engine is shown the replacement. The body is read for it
+        // leniently: a body that does not parse is not the engine's to
+        // judge, and the replace below refuses it as before, after the
+        // 404 an unknown target answers first (057_03).
+        let shown = match &st.policy {
+            Some(_) => parse_body(&st.loader, &headers, &body, BodyKind::Standard)
+                .await
+                .ok()
+                .and_then(|p| {
+                    let obj = p.object(NgsiError::BadRequestData(String::new())).ok()?;
+                    expand_entity(obj, &p.ctx, ExpandOpts::default()).ok()
+                }),
+            None => None,
+        };
+        gate!(
+            st, &tenant, &headers, "5.6.18",
+            ids: &[&id],
+            types: &crate::policy::write_types(&st, &tenant, &id, shown.as_ref()).await,
+            attrs: &shown.as_ref().map(crate::attrs::attr_iris_of).unwrap_or_default(),
+            body: shown.as_ref(),
+        )
+        .await?;
         // 5.6.18.4: the ?type selector narrows the target — a non-matching
         // entity is "not known" for this replace.
         let local_doc = st
@@ -2311,7 +2444,12 @@ async fn retrieve_attr_inner(
     let tenant = tenant_from(headers)?;
     check_params(params, &["options", "format", "lang", "datasetId", "local"])?;
     let ctx = request_context(&st.loader, headers).await?;
-    let filter = gate!(st, &tenant, headers, "5.7.1", ids: &[id]).await?;
+    let filter = gate!(
+        st, &tenant, headers, "5.7.1",
+        ids: &[id],
+        attrs: &antares_jsonld::expand_attr_name(attr, &ctx).ok().into_iter().collect::<Vec<_>>(),
+    )
+    .await?;
     let mut repr = parse_repr(params, &ctx)?;
     crate::repr::narrow_repr(&mut repr, &filter);
     antares_model::EntityId::new(id)?;
@@ -2400,6 +2538,7 @@ pub(crate) async fn build_query_map(
     }
     // the candidate set is the NARROWED query's (ADR-0020)
     let narrowed = filter.narrow_params(params)?;
+    let narrow = crate::repr::narrowing(filter);
     let params = &narrowed;
     // 5.14.4.4: invalid entity ids / csf are BadRequestData
     if let Some(ids) = params.get("id") {
@@ -2437,8 +2576,11 @@ pub(crate) async fn build_query_map(
             &eff,
             ctx,
             Vec::new(),
-            Some((offset, st.max_limit)),
-            None,
+            Pushdown {
+                page: Some((offset, st.max_limit)),
+                proj: None,
+            },
+            Some(&narrow),
         )
         .await?;
         for d in &batch.docs {

@@ -35,6 +35,10 @@ pub struct Repr {
     /// not.
     pub policy_pick: Option<Vec<ProjNode>>,
     pub policy_omit: Option<Vec<ProjNode>>,
+    /// The narrowing's row predicate, carried down the join walk like the
+    /// policy projection: a Linked Entity is read the way the Linking Entity
+    /// was (5.7.1.4), so one outside the narrowing is not embedded.
+    pub policy_reach: Option<std::sync::Arc<PolicyReach>>,
     pub lang: Option<String>,
     /// datasetId= instance filter; entry "@none" selects default instances.
     pub dataset_id: Option<Vec<String>>,
@@ -182,12 +186,90 @@ pub fn narrow_projection(
 /// the Entity, and a document without them is not one — which is why the
 /// policy pick is applied to Attributes and never to the core members.
 pub fn narrow_repr(r: &mut Repr, f: &crate::policy::Filter) {
+    if f.q.is_some() || f.scope_q.is_some() || f.geo_q.is_some() {
+        r.policy_reach = Some(std::sync::Arc::new(PolicyReach {
+            q: f.q.clone(),
+            scope_q: f.scope_q.clone(),
+            geo_q: f.geo_q.clone(),
+        }));
+    }
     if !f.omit.is_empty() {
         r.policy_omit = Some(policy_nodes(&f.omit));
     }
     if !f.pick.is_empty() {
         r.policy_pick = Some(policy_nodes(&f.pick));
     }
+}
+
+/// The rows a narrowing admits (ADR-0020 `Filter::q`, `scope_q` and
+/// `geo_q`).
+#[derive(Debug, Clone)]
+pub struct PolicyReach {
+    pub q: Option<antares_ql::QNode>,
+    pub scope_q: Option<String>,
+    pub geo_q: Option<Box<antares_ql::geo::GeoQuery>>,
+}
+
+/// Whether the narrowing admits the INTERNAL document `doc`; no narrowing
+/// admits everything. The one check the retrieve answer and every joined
+/// Entity go through, so a join cannot reach a row the retrieve hides.
+pub(crate) async fn policy_admits(
+    st: &AppState,
+    tenant: &TenantId,
+    ctx: &Context,
+    reach: Option<&PolicyReach>,
+    doc: &Value,
+) -> bool {
+    let Some(reach) = reach else {
+        return true;
+    };
+    if let Some(scope) = &reach.scope_q {
+        if !crate::scope_matches(scope, doc) {
+            return false;
+        }
+    }
+    if let Some(geo) = &reach.geo_q {
+        if !geo.matches(doc, ctx) {
+            return false;
+        }
+    }
+    match &reach.q {
+        Some(ast) => {
+            crate::notify::linked_eval(st, tenant, None, |l| {
+                antares_ql::eval::eval_q(ast, doc, ctx, l)
+            })
+            .await
+        }
+        None => true,
+    }
+}
+
+/// The INTERNAL document `doc` as the narrowing lets it be read: the
+/// Entity frame and the Attributes the policy projection keeps.
+pub(crate) fn policy_view(doc: &Value, r: &Repr) -> Value {
+    if r.policy_pick.is_none() && r.policy_omit.is_none() {
+        return doc.clone();
+    }
+    match doc.as_object() {
+        Some(obj) => Value::Object(
+            obj.iter()
+                .filter(|(k, _)| {
+                    is_meta(k)
+                        || policy_projected(r.policy_pick.as_deref(), r.policy_omit.as_deref(), k)
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        None => doc.clone(),
+    }
+}
+
+/// The narrowing half of a representation alone, for a caller that holds
+/// the Filter but builds no representation of its own.
+pub fn narrowing(f: &crate::policy::Filter) -> Repr {
+    let mut r = Repr::default();
+    narrow_repr(&mut r, f);
+    r
 }
 
 /// The same `pick`/`omit` names in the form an already-compacted document
@@ -699,6 +781,7 @@ fn joined_repr(parent: &crate::repr::Repr, key_compact: &str, key_iri: &str) -> 
         // travels to every document the answer carries
         policy_pick: parent.policy_pick.clone(),
         policy_omit: parent.policy_omit.clone(),
+        policy_reach: parent.policy_reach.clone(),
         ..Default::default()
     };
     if let Some(pick) = &parent.pick {
@@ -844,6 +927,10 @@ async fn lookup_joined(
         .await
         .ok()
         .flatten()?;
+    // a target outside the narrowing reads as absent, like a dangling link
+    if !policy_admits(st, tenant, ctx, child.policy_reach.as_deref(), &target).await {
+        return None;
+    }
     let shaped = apply(&target, child);
     let mut c = compact_for(child, &shaped, ctx);
     if level > 1 {
@@ -951,12 +1038,13 @@ async fn inline_join_value(
 pub async fn collect_flat(
     st: &AppState,
     tenant: &TenantId,
+    ctx: &Context,
     repr: &crate::repr::Repr,
     internal_doc: &Value,
     level: usize,
     out: &mut std::collections::BTreeMap<String, (Value, crate::repr::Repr)>,
 ) -> bool {
-    collect_flat_beyond(st, tenant, repr, internal_doc, level, out, &[], &mut {
+    collect_flat_beyond(st, tenant, ctx, repr, internal_doc, level, out, &[], &mut {
         MAX_JOIN_LOOKUPS
     })
     .await
@@ -968,6 +1056,7 @@ pub async fn collect_flat(
 pub async fn collect_flat_beyond(
     st: &AppState,
     tenant: &TenantId,
+    ctx: &Context,
     repr: &crate::repr::Repr,
     internal_doc: &Value,
     level: usize,
@@ -981,7 +1070,7 @@ pub async fn collect_flat_beyond(
         *budget,
     );
     walk.seen.extend(out.keys().cloned());
-    collect_flat_walk(st, tenant, repr, internal_doc, level, out, &mut walk).await;
+    collect_flat_walk(st, tenant, ctx, repr, internal_doc, level, out, &mut walk).await;
     *budget = walk.budget;
     walk.complete
 }
@@ -990,6 +1079,7 @@ pub async fn collect_flat_beyond(
 async fn collect_flat_walk(
     st: &AppState,
     tenant: &TenantId,
+    ctx: &Context,
     repr: &crate::repr::Repr,
     internal_doc: &Value,
     level: usize,
@@ -1044,7 +1134,12 @@ async fn collect_flat_walk(
                     return;
                 }
                 walk.budget -= 1;
-                if let Some(target) = st.store.get(tenant, Kind::Entity, id).await.ok().flatten() {
+                let target = st.store.get(tenant, Kind::Entity, id).await.ok().flatten();
+                if let Some(target) = target {
+                    if !policy_admits(st, tenant, ctx, child.policy_reach.as_deref(), &target).await
+                    {
+                        continue;
+                    }
                     walk.seen.insert(id.to_owned());
                     out.insert(id.to_owned(), (target.clone(), child.clone()));
                     if level > 1 {
@@ -1052,6 +1147,7 @@ async fn collect_flat_walk(
                         Box::pin(collect_flat_walk(
                             st,
                             tenant,
+                            ctx,
                             &child,
                             &target,
                             level - 1,

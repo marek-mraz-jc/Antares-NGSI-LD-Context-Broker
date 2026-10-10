@@ -59,7 +59,7 @@ PolicyEngine: Send + Sync {
 credential and validates no token. `Operation` is the expanded request:
 clause, ids, types, attrs, `q`, `scopeQ`, geo, body. `Decision` is
 `Allow`, `Deny(String)` or `Filter(Filter)`; `Filter` carries a `q`, a
-`scopeQ`, `omit`, `pick` and `restricted`.
+`scopeQ`, a `geo_q`, `omit`, `pick` and `restricted`.
 
 **Two phases**, both already in ADR-0014's table:
 
@@ -74,7 +74,7 @@ clause, ids, types, attrs, `q`, `scopeQ`, geo, body. `Decision` is
 |---|---|
 | `Allow` | nothing |
 | `Deny` | 403 with ProblemDetails whose `type` is an Antares URI — Table 6.3.2-1 has no access-denied type, so this is an Antares decision with its own `AntaresSpecificTests` and a 6.3.2 ledger note |
-| `Filter` | narrows: the `q` and the `scopeQ` are conjoined into the query the store runs and travel on forwards, `omit`/`pick` go through the 5.2.14.1 projection the notification path already has, and a merged federated result is filtered after the merge |
+| `Filter` | narrows: the `q` and the `scopeQ` are conjoined into the query the store runs and travel on forwards; the `geo_q` joins the request's own geoquery in the store query's list of geo predicates, all of which must hold (ADR-0023 rule 1, T-3484), and is checked again after a federated merge; `omit`/`pick` go through the 5.2.14.1 projection the notification path already has, and a merged federated result is filtered after the merge |
 | `Filter { restricted: true }` | the same, plus `Antares-Results-Restricted: true` (see the amendment) |
 | `Filter` on anything outside `policy::FILTERABLE` | answered as `Deny` — there is no narrowed form of "delete everything", and no handler outside that list reads the filter at all |
 
@@ -243,6 +243,20 @@ the engine sets `restricted`, and a narrowing is otherwise silent.
 
 ## Confirmation
 
+- Every Notification body passes `pre_notify` once, in
+  `notify::deliver_as`, its only caller outside tests (cg: `MATCH
+  (c:Symbol)-[:CALLS]->(f:Symbol {path:'antares_api::policy::pre_notify'})
+  WHERE NOT c.is_test RETURN c.path`). The 5.8.6 inbound path
+  (`distsub::remote_notify`) delivers through it under the ORIGINAL
+  Subscription's stored subject
+  (`distsub::tests::a_remote_notification_is_narrowed_for_the_original_subscriber`).
+  Two sends stay outside the seam on purpose, because neither carries an
+  Entity: the `urn:antares:distsub:` endpoint, which hands Context Source
+  Notification data to the broker's own handler and reaches no receiver,
+  and the 5.16.6 SnapshotNotification (`snapshots::send_notification`),
+  whose body is the snapshot's status and the per-query details of the
+  creator's own gated request, sent to the endpoint that creator named
+  (operation matrix section 8, items 11 and 13).
 - `run_policy_contract` (behind `test-kit`, the contract an addon
   engine's own tests call): a `Filter` never widens — the engine's answer
   is run through the projection and asserted a subset of the unfiltered

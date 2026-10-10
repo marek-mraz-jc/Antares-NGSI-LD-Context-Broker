@@ -158,8 +158,8 @@ pub enum Decision {
     Filter(Filter),
 }
 
-/// How much less. Every member narrows and none widens: the `q` and
-/// `scopeQ` are conjoined with the caller's own, `pick` keeps a subset of
+/// How much less. Every member narrows and none widens: the `q`, `scopeQ`
+/// and `geo_q` are conjoined with the caller's own, `pick` keeps a subset of
 /// the members, `omit` removes some.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Filter {
@@ -169,6 +169,13 @@ pub struct Filter {
     pub q: Option<QNode>,
     /// Conjoined the same way with the request's own `scopeQ` (4.18).
     pub scope_q: Option<String>,
+    /// An area the Entity must lie in (4.10), held beside the request's own
+    /// geoquery and never in its place: 7.2.5 lets a request carry one, so
+    /// the store query takes both and every one must hold (ADR-0023 rule 1).
+    /// A [`GeoQuery`] is only built by `GeoQuery::from_params`, which bounds
+    /// it like a request's. Boxed: a parsed geometry is large, and every
+    /// [`Decision`] would carry its size.
+    pub geo_q: Option<Box<GeoQuery>>,
     /// Members removed from every document served.
     pub omit: Vec<String>,
     /// If non-empty, the only members served beside the document frame.
@@ -207,7 +214,23 @@ impl Filter {
     /// True when the filter would change nothing, which is how an engine
     /// that means "allow" can say so with an empty `Filter`.
     pub fn is_empty(&self) -> bool {
-        self.q.is_none() && self.scope_q.is_none() && self.omit.is_empty() && self.pick.is_empty()
+        self.q.is_none()
+            && self.scope_q.is_none()
+            && self.geo_q.is_none()
+            && self.omit.is_empty()
+            && self.pick.is_empty()
+    }
+
+    /// Say the answer was narrowed, when the engine asked for it to be
+    /// said. Narrowing is otherwise silent: a caller cannot tell an Entity
+    /// it may not see from one that is not there.
+    pub fn mark_restricted(&self, headers: &mut HeaderMap) {
+        if self.restricted {
+            headers.insert(
+                RESTRICTED_HEADER,
+                axum::http::HeaderValue::from_static("true"),
+            );
+        }
     }
 
     /// The request's own query parameters, narrowed by this decision.
@@ -226,18 +249,10 @@ impl Filter {
     /// Query — `antares_ql::scope::intersect_scope_q` writes it. Where the
     /// product cannot be written down the seam answers the only way that is
     /// not wider than the engine decided: it refuses.
-    /// Say the answer was narrowed, when the engine asked for it to be
-    /// said. Narrowing is otherwise silent: a caller cannot tell an Entity
-    /// it may not see from one that is not there.
-    pub fn mark_restricted(&self, headers: &mut HeaderMap) {
-        if self.restricted {
-            headers.insert(
-                RESTRICTED_HEADER,
-                axum::http::HeaderValue::from_static("true"),
-            );
-        }
-    }
-
+    ///
+    /// `geo_q` stays out of the parameters: they hold one geoquery (7.2.5)
+    /// and it is the request's. The narrowing's area reaches the store
+    /// query beside it through `repr::narrowing`.
     pub fn narrow_params(
         &self,
         params: &std::collections::HashMap<String, String>,
@@ -510,6 +525,40 @@ pub fn subject_of(tenant: &antares_model::TenantId, headers: &HeaderMap) -> Subj
 /// broker's, so a member added later inherits every one of those rules
 /// instead of a new list to forget.
 pub(crate) const SUBJECT_MEMBER: &str = "__subject";
+
+/// The expanded types a write by id lands on: the stored Entity's, joined
+/// with the ones the request body names (ADR-0020: an engine judging by
+/// type judges the Entity the write changes and what it changes it to).
+/// The gate reads the store once per request, and only with an engine
+/// attached; an absent Entity or a store error adds nothing, and the write
+/// answers it as before.
+pub(crate) async fn write_types(
+    st: &crate::state::AppState,
+    tenant: &antares_model::TenantId,
+    id: &str,
+    body: Option<&Value>,
+) -> Vec<String> {
+    let stored = st
+        .store
+        .get(tenant, antares_store::Kind::Entity, id)
+        .await
+        .ok()
+        .flatten();
+    let mut out: Vec<String> = Vec::new();
+    for doc in stored.as_ref().into_iter().chain(body) {
+        let names: Vec<&str> = match doc.get("type") {
+            Some(Value::String(t)) => vec![t.as_str()],
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        for t in names {
+            if !out.iter().any(|o| o == t) {
+                out.push(t.to_owned());
+            }
+        }
+    }
+    out
+}
 
 /// The stored form of a subject: only the headers a deployment named, since
 /// the tenant is where the subscription already lives. `None` when the

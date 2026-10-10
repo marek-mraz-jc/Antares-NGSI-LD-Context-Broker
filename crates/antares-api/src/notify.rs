@@ -545,7 +545,17 @@ fn sub_str<'a>(sub: &'a Value, key: &str) -> Option<&'a str> {
 /// one. The first pass that misses nothing is the answer. Every miss of a
 /// pass is fetched together, so the pass count is the depth of the link
 /// chain rather than the number of entities it touches.
-pub(crate) async fn linked_eval<F>(st: &AppState, tenant: &TenantId, mut eval: F) -> bool
+///
+/// `narrow` is the caller's narrowing (ADR-0020) with the @context its
+/// policy q is read against: a hop into an Entity it does not admit reads
+/// as a hop into a missing one, and a resolved target loses the Attributes
+/// its projection hides before the evaluator sees it (ADR-0023 rule 2).
+pub(crate) async fn linked_eval<F>(
+    st: &AppState,
+    tenant: &TenantId,
+    narrow: Option<(&crate::repr::Repr, &Context)>,
+    mut eval: F,
+) -> bool
 where
     F: for<'a> FnMut(antares_ql::eval::EntityLookup<'a>) -> bool,
 {
@@ -568,16 +578,76 @@ where
             return out;
         }
         for uri in missed {
-            let doc = st
+            let mut doc = st
                 .store
                 .get(tenant, Kind::Entity, &uri)
                 .await
                 .ok()
                 .flatten();
+            if let (Some(d), Some((r, ctx))) = (&doc, narrow) {
+                // boxed: the admission check evaluates the policy's own q,
+                // which comes back here
+                let admitted = Box::pin(crate::repr::policy_admits(
+                    st,
+                    tenant,
+                    ctx,
+                    r.policy_reach.as_deref(),
+                    d,
+                ))
+                .await;
+                doc = admitted.then(|| crate::repr::policy_view(d, r));
+            }
             cache.insert(uri, doc);
         }
     }
     eval(&|uri: &str| cache.get(uri).cloned().flatten())
+}
+
+/// ADR-0020: a narrowing reaches every document the answer carries, so the
+/// projection runs on each Entity `join=inline` embedded (4.5.23.2): under
+/// `entity`/`entityList` normalized, in place of the object URI simplified.
+fn project_joined(f: &crate::policy::Filter, e: &mut Value, key_values: bool) {
+    f.project(e);
+    let Some(obj) = e.as_object_mut() else {
+        return;
+    };
+    for v in obj.values_mut() {
+        let instances: Vec<&mut Value> = match v {
+            Value::Array(a) => a.iter_mut().collect(),
+            other => vec![other],
+        };
+        for inst in instances {
+            if key_values {
+                if inst.get("id").is_some() && inst.get("type").is_some() {
+                    project_joined(f, inst, key_values);
+                }
+                continue;
+            }
+            let Some(o) = inst.as_object_mut() else {
+                continue;
+            };
+            for m in ["entity", "entityList"] {
+                match o.get_mut(m) {
+                    Some(Value::Array(a)) => {
+                        for j in a {
+                            project_joined(f, j, key_values);
+                        }
+                    }
+                    Some(j @ Value::Object(_)) => project_joined(f, j, key_values),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Whether the Subscription's q follows a Relationship (4.9
+/// LinkedEntityRelation).
+fn linked_condition(sub: &Value) -> bool {
+    sub_str(sub, "q").is_some_and(|q| {
+        antares_ql::regex::q_node(&antares_ql::percent_decode(q.as_bytes()))
+            .is_some_and(|n| n.has_linked_paths())
+    })
 }
 
 pub(crate) use antares_matcher::{
@@ -946,7 +1016,7 @@ async fn build_data(
         Some((mode, level)) if mode == "flat" => {
             let main_id = internal.get("id").and_then(Value::as_str).unwrap_or("");
             let mut linked = std::collections::BTreeMap::new();
-            crate::repr::collect_flat(st, tenant, &shape.repr, &internal, *level, &mut linked)
+            crate::repr::collect_flat(st, tenant, ctx, &shape.repr, &internal, *level, &mut linked)
                 .await;
             data.push(main);
             for (id, (ldoc, lrepr)) in linked {
@@ -1190,7 +1260,11 @@ async fn matches_for(
         if !selector_match(&sub, eval_doc, &ctx) {
             continue;
         }
-        if !linked_eval(st, &tenant, |l| conditions_match(&sub, eval_doc, &ctx, l)).await {
+        if !linked_eval(st, &tenant, None, |l| {
+            conditions_match(&sub, eval_doc, &ctx, l)
+        })
+        .await
+        {
             continue;
         }
         if throttled(&sub) {
@@ -1507,7 +1581,7 @@ pub async fn interval_tick(st: &AppState) {
                     types: (!type_groups.is_empty()).then_some(type_groups.as_slice()),
                     q: q_ast.as_deref(),
                     scope_q: sub_str(&sub, "scopeQ"),
-                    geo: geo_spec.as_ref(),
+                    geo: geo_spec.as_slice(),
                     expand: &expand,
                     ..Default::default()
                 };
@@ -1522,7 +1596,8 @@ pub async fn interval_tick(st: &AppState) {
             let mut matching: Vec<Value> = Vec::new();
             for d in rows {
                 if !selector_match(&sub, &d, &ctx)
-                    || !linked_eval(st, &tenant, |l| conditions_match(&sub, &d, &ctx, l)).await
+                    || !linked_eval(st, &tenant, None, |l| conditions_match(&sub, &d, &ctx, l))
+                        .await
                 {
                     continue;
                 }
@@ -2095,17 +2170,30 @@ async fn deliver_as(
             crate::policy::NotifyDecision::Filter(f) => {
                 // a condition the notification path cannot re-run is not a
                 // narrowing it can claim to have applied
-                if f.q.is_some() || f.scope_q.is_some() {
+                if f.q.is_some() || f.scope_q.is_some() || f.geo_q.is_some() {
                     tracing::error!(
                         "policy engine {} narrowed a notification with a query; dropping it",
                         engine.name()
                     );
                     return;
                 }
+                // a linked condition already read the target unprojected
+                // (T-3474): the narrowing came too late to apply to it
+                if (!f.omit.is_empty() || !f.pick.is_empty()) && linked_condition(sub) {
+                    tracing::debug!(
+                        "subscription {sub_id} has a linked q under a projecting narrowing; dropping"
+                    );
+                    return;
+                }
                 let f = crate::repr::compacted_filter(&f, ctx);
+                let n = sub.get("notification");
+                let key_values = matches!(
+                    n.and_then(|n| n.get("format")).and_then(Value::as_str),
+                    Some("keyValues" | "simplified")
+                );
                 if let Some(arr) = body.get_mut("data").and_then(Value::as_array_mut) {
                     for e in arr.iter_mut() {
-                        f.project(e);
+                        project_joined(&f, e, key_values);
                     }
                 }
             }

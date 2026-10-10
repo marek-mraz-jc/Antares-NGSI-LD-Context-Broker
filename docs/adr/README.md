@@ -8,7 +8,7 @@ One file per irreversible decision, numbered, never rewritten.
 |---|---|---|
 | [ADR-0001](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0001-shared-schema-tenancy.md) | Shared-schema multi-tenancy (tenant_id + RLS) | accepted, amended (tenant inventory) |
 | [ADR-0002](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0002-nats-jetstream-bus.md) | NATS JetStream as the change bus (with a local mode) | accepted |
-| [ADR-0003](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0003-websocket-deferred.md) | WebSocket binding deferred out of v1 | accepted |
+| [ADR-0003](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0003-websocket-deferred.md) | WebSocket binding deferred out of v1 | accepted, superseded by ADR-0026 |
 | [ADR-0004](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0004-store-ladder-redb-file-mode.md) | Store ladder, redb as the `file`-mode durability shadow | accepted |
 | [ADR-0005](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0005-anystore-sync-facade.md) | AnyStore enum + synchronous Pg facade | accepted · enum seam superseded by ADR-0013, sync facade by ADR-0022 |
 | [ADR-0006](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0006-rls-vs-timescale-compression.md) | RLS and Timescale compression collide on attr_instances | accepted |
@@ -28,6 +28,11 @@ One file per irreversible decision, numbered, never rewritten.
 | [ADR-0020](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0020-policy-seam.md) | The policy seam: one trait, one built-in engine, every engine an addon | accepted, amended (the narrowing marker header) |
 | [ADR-0021](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0021-jsonld-context-tenancy.md) | A stored `@context` belongs to the Tenant that stored it, a Cached copy to none | accepted, implemented |
 | [ADR-0022](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0022-async-storage-drivers.md) | The storage drivers are async; nothing blocks on a store call | accepted, implemented; supersedes the sync-facade half of ADR-0005 |
+| [ADR-0023](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0023-endpoint-views.md) | Endpoint views: one policy-narrowed NGSI-LD endpoint that stays compliant | accepted (owner may override) |
+| [ADR-0024](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0024-odata-library.md) | OData 4.01 for Rust: build our own standalone `odata-*` crates | accepted (owner may override) |
+| [ADR-0025](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0025-internal-context-sources.md) | Internal context sources: a registration that names this broker is served in process | accepted (owner may override) |
+| [ADR-0026](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0026-websocket-notification-channel.md) | WebSocket notification channel: one more sink, the TS 104 243 envelope, bounded and resumable | accepted (owner may override); supersedes ADR-0003 |
+| [ADR-0027](https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker/blob/main/docs/adr/ADR-0027-surfaces-architecture.md) | Surfaces architecture: the vanilla binary, plus feature-gated surface crates in one binary | accepted (owner may override); amends ADR-0025 rule 8 and ADR-0026 rule 1 |
 
 ## Format
 

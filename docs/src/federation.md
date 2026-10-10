@@ -5,7 +5,7 @@ Antares implements the CIM 009 distributed-operations model (4.3.6,
 routing table: a broker holding CSRs forwards matching requests to the
 registered sources, merges the answers and reports per-source problems
 without failing the request. The DistributedOperations and IOP suites
-(134 + 286 tests) cover this surface in every CI cell.
+(135 + 286 tests) cover this surface in every CI cell.
 
 Every example below uses two brokers, `broker-a` on 9090 and `broker-b`
 on 9091, as in `examples/federation/compose.yml`:

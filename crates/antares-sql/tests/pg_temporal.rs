@@ -1018,7 +1018,7 @@ async fn a_temporal_query_never_reads_another_tenants_history() {
         ids: Some(&[geo_id]),
         range: Some(window()),
         timeproperty: "observedAt",
-        geo: Some((&spec, location)),
+        geo: &[(spec.clone(), location.to_owned())],
         expand: &expand,
         ..TemporalFilter::default()
     };
@@ -1114,7 +1114,7 @@ async fn a_comma_seconds_fraction_survives_the_geo_prefilter() {
                 timeproperty: "observedAt",
             }),
             timeproperty: "observedAt",
-            geo: Some((&spec, location)),
+            geo: &[(spec.clone(), location.to_owned())],
             expand: &expand,
             ..TemporalFilter::default()
         };

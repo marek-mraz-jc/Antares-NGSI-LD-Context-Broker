@@ -152,13 +152,13 @@ fn request_for(method: &str, path: &str) -> Request<Body> {
             "?type=Vehicle&timerel=after&timeAt=1970-01-01T00:00:00Z",
             Value::Null,
         ),
-        ("GET", "/entityMap") => ("?type=Vehicle", Value::Null),
-        ("GET", "/temporal/entityMap") => (
+        ("GET", "/entityMaps") => ("?type=Vehicle", Value::Null),
+        ("GET", "/temporal/entityMaps") => (
             "?type=Vehicle&timerel=after&timeAt=1970-01-01T00:00:00Z",
             Value::Null,
         ),
         ("DELETE", "/snapshots") => ("?q=status==%22completed%22", Value::Null),
-        ("POST", "/entityMap") | ("POST", "/temporal/entityMap") => (
+        ("POST", "/entityMaps") | ("POST", "/temporal/entityMaps") => (
             "",
             json!({"type": "Query", "entities": [{"type": "Vehicle"}]}),
         ),

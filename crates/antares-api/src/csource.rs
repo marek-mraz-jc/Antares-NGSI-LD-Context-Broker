@@ -204,6 +204,19 @@ fn check_context_source_info(v: &Value) -> Result<(), NgsiError> {
         // first forward
         let sval = value.as_str();
         match key.to_ascii_lowercase().as_str() {
+            // TS 104 175 9.5.1: "As Tenant information, if applicable, is
+            // directly specified in the CSourceRegistration, it shall not
+            // be part of contextSourceInfo." A forward never sends it
+            // (`federation::CSI_SKIP`); refusing it here tells the client
+            // its routing would not happen, instead of forwarding silently
+            // to the default tenant.
+            "ngsild-tenant" => {
+                return Err(bad(
+                    "contextSourceInfo must not carry NGSILD-Tenant: set the \
+                     registration's tenant member instead (9.5.1)"
+                        .into(),
+                ));
+            }
             "accept" | "contenttype" => {
                 if !matches!(sval, Some("application/json" | "application/ld+json")) {
                     return Err(bad(format!(
@@ -944,6 +957,43 @@ async fn registration_write_lock(tenant: &TenantId) -> tokio::sync::OwnedMutexGu
     lock.lock_owned().await
 }
 
+/// The expanded types and Attribute names a registration's information
+/// names, for the policy gate (ADR-0020), each once.
+fn info_members(norm: &Map<String, Value>) -> (Vec<String>, Vec<String>) {
+    let (mut types, mut attrs): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let add = |out: &mut Vec<String>, v: Option<&Value>| {
+        let names: Vec<&str> = match v {
+            Some(Value::String(s)) => vec![s.as_str()],
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        for n in names {
+            if !out.iter().any(|o| o == n) {
+                out.push(n.to_owned());
+            }
+        }
+    };
+    for info in norm
+        .get("information")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for e in info
+            .get("entities")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            add(&mut types, e.get("type"));
+        }
+        for k in ["propertyNames", "relationshipNames"] {
+            add(&mut attrs, info.get(k));
+        }
+    }
+    (types, attrs)
+}
+
 // ---------- handlers ----------
 
 pub async fn create_registration(
@@ -962,8 +1012,15 @@ pub async fn create_registration(
         // ADR-0020: 5.9.2 lets the client choose the registration id, and
         // it is in hand here — see the same note on subscription create.
         let named = obj.get("id").and_then(Value::as_str);
-        gate!(st, &tenant, &headers, "5.9.2", ids: named.as_slice()).await?;
         let mut norm = normalize_registration(obj, &parsed.ctx, false)?;
+        let (types, attrs) = info_members(&norm);
+        gate!(
+            st, &tenant, &headers, "5.9.2",
+            ids: named.as_slice(),
+            types: &types,
+            attrs: &attrs,
+        )
+        .await?;
         let id = match norm.get("id").and_then(Value::as_str) {
             Some(id) => id.to_owned(),
             None => {

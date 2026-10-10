@@ -6,8 +6,9 @@ Documentation       Verify the 4.3.6.5 contextSourceInfo conveyance rules on for
 ...                 Context Source [...] using headers in the case of HTTP." The
 ...                 special value "urn:ngsi-ld:request" copies the value "from the
 ...                 request that triggered the given request, if present." Tenant
-...                 information "shall not be part of contextSourceInfo" and
-...                 binding-specific interaction information "shall be ignored."
+...                 information "shall not be part of contextSourceInfo" (TS 104 175
+...                 V1.1.1 9.5.1: refused at registration) and binding-specific
+...                 interaction information "shall be ignored."
 ...
 ...                 Antares extension TP — no official TP touches contextSourceInfo.
 
@@ -68,13 +69,11 @@ ${registration_payload_file_path}       csourceRegistrations/context-source-regi
     ${user}=    Evaluate    $headers.get('user')
     Should Be Equal    ${user}    ${None}
 
-436_05_03 Tenant And Connection Headers Cannot Be Overridden
-    [Documentation]    4.3.6.5: Tenant information "shall not be part of
-    ...    contextSourceInfo" and binding-specific interaction information (Via,
+436_05_03 Connection Headers Cannot Be Overridden
+    [Documentation]    4.3.6.5: binding-specific interaction information (Via,
     ...    Content-Length, ...) "shall be ignored" — such pairs never reach the wire.
     [Tags]    dist-ops    4_3_6_5    5_7_1    since_v1.9.1
-    ${csi}=    Evaluate
-    ...    [{"key": "NGSILD-Tenant", "value": "hacker"}, {"key": "Via", "value": "1.1 evil"}]
+    ${csi}=    Evaluate    [{"key": "Via", "value": "1.1 evil"}]
     Setup Registration With ContextSourceInfo And Start Mock    ${csi}
     Stub Entity And Retrieve    ${entity_id}
     Wait For Request
@@ -83,6 +82,27 @@ ${registration_payload_file_path}       csourceRegistrations/context-source-regi
     Should Be Equal    ${tenant}    ${None}
     ${via}=    Evaluate    str($headers.get('Via'))
     Should Not Contain    ${via}    evil
+
+436_05_04 Tenant Information In ContextSourceInfo Is Refused
+    [Documentation]    TS 104 175 V1.1.1 9.5.1: "As Tenant information, if applicable,
+    ...    is directly specified in the CSourceRegistration, it shall not be part of
+    ...    contextSourceInfo." A registration carrying it is refused with 400.
+    [Tags]    dist-ops    4_3_6_5    5_7_1    since_v1.9.1
+    # nothing is stored and no mock is started
+    [Teardown]    NONE
+    ${registration_id}=    Generate Random CSR Id
+    ${registration_payload}=    Prepare Context Source Registration From File
+    ...    ${registration_id}
+    ...    ${registration_payload_file_path}
+    ...    entity_id=urn:ngsi-ld:Vehicle:tenant-in-csi
+    ${csi}=    Evaluate    [{"key": "NGSILD-Tenant", "value": "hacker"}]
+    ${csi_dict}=    Create Dictionary    contextSourceInfo=${csi}
+    ${registration_payload}=    Add Object To JSON
+    ...    ${registration_payload}
+    ...    $
+    ...    ${csi_dict}
+    ${response}=    Create Context Source Registration With Return    ${registration_payload}
+    Check Response Status Code    400    ${response.status_code}
 
 
 *** Keywords ***

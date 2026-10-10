@@ -1,0 +1,299 @@
+# ADR-0023 — Endpoint views: one policy-narrowed NGSI-LD endpoint that stays compliant
+
+Date: 2026-10-10. Status: accepted. Decided by worker-2 under the owner
+order of 2026-10-10 ("a design decision is yours: pick the recommended
+option"); the owner may override any rule below. Builds on ADR-0020 (the
+policy seam) and ADR-0014 (fixed phases); supersedes neither. Task T-3438.
+
+## Context
+
+The joinedcontext platform serves one filtered endpoint per data product
+today from a gateway in front of the broker (`joinedcontext-platform`
+`crates/context-gateway`): an endpoint slug names a Context Space and its
+policies, the gateway rewrites the query, and it projects the answer
+(`docs/analysis/gateway-to-broker-map.md`). The owner wants that endpoint
+inside the broker (`tasks/GOAL-antares-surfaces.md`, points 1 to 3), as an
+NGSI-LD endpoint that a stock client reads like any other.
+
+ADR-0020 already narrows inside the broker: an engine's `Filter` is
+conjoined into the query the store runs, on the `antares-ql` AST, and its
+`pick`/`omit` go through the projection. What it does not have is a named,
+configured endpoint: a fixed predicate and allowlists that hold for every
+caller of one address, whatever engine is installed. The operation matrix
+(`docs/analysis/operation-matrix.md`) shows where the seam stops today:
+discovery (10.6.x) is not in `policy::FILTERABLE`, writes are judged
+without the stored Entity, a batch is decided once, and a join target is
+fetched without a visibility check (T-3470).
+
+Clause numbers below are TS 104 175 V1.1.1 and TS 104 176 V1.1.1
+(`/workspace/etsi-specs/`); the code names CIM 009 clauses, translated in
+`docs/analysis/cim009-to-ts104175.md`.
+
+## Decision
+
+A **view** is configuration, not an engine:
+
+```
+View {
+    id:          a name, [a-z0-9-]{1,63}
+    tenant:      the one Tenant it serves
+    selector:    entity types (expanded IRIs), at least one
+    q:           Option<QNode>        // antares-ql AST, parsed once at load
+    scope_q:     Option<String>       // 7.2.4 scopeQ
+    geo_q:       Option<GeoQuery>     // 7.2.5 geoQ
+    attributes:  allowlist of Attribute names (expanded IRIs)
+    operations:  allowlist of TS 104 175 operations (operation-matrix.yaml ids)
+}
+```
+
+A request to a view runs the ordinary NGSI-LD handler with one more
+conjunct: the view's predicate (`selector ∧ q ∧ scope_q ∧ geo_q`) and its
+attribute allowlist, composed with whatever the installed engine answers
+(`effective = view ∧ engine`, both narrowing, neither widening). The view
+is applied before the engine is asked, so `AllowAll` behind a view still
+serves only the view. Without the `views` cargo feature none of this is
+compiled; with it and no view configured, `/x/views` answers 404 for
+every id (fail closed: no view means nothing served, never everything).
+
+### 1. Conjunction on the AST, before paging, ordering and count
+
+The view predicate is conjoined into the store query exactly as an
+ADR-0020 `Filter` is: on the `antares-ql` AST, never on the query string.
+Paging (7.4), ordering (7.6) and counting (7.5) are computed by the store
+on the conjoined query, so `NGSILD-Results-Count` and the `Link`
+`rel="next"` pages describe the narrowed result set and nothing else. 7.5
+requires the count to be "the number of expected resulting elements", and
+the expected elements of a view are the in-view ones.
+
+`policy::Filter` carries a `geo_q` and a request may carry its own `geoQ`;
+7.2.5 allows one geoQ per query. The store query takes a list of geo
+predicates, all of which must hold (the view's and the request's): the
+`antares-store` filters hold a slice of them, the Postgres arms conjoin
+one predicate per entry, and the evaluator requires every one (T-3484).
+
+### 2. A hidden attribute does not exist while `q` is evaluated
+
+TS 104 175 7.2.3.3 states every operator in terms of containment:
+"Existence (only attribute is specified). A matching entity shall contain
+the target element", and each comparison begins "A matching Entity shall
+contain the target element". 7.2.3.2 already uses the notion for an
+undefined trailing path: "the target element shall be considered as
+non-existent for the purpose of query resolution". A view applies the same
+notion to every Attribute outside its allowlist: in the caller's `q`, a
+term whose Attribute path starts at a hidden Attribute (at any hop of a
+`LinkedEntityRelation`) is evaluated as if the Entity did not contain it.
+
+So `q=secret>5`, `q=secret==1`, `q=secret!=1` and `q=secret~="x"` select
+nothing, and `q=!secret` selects every in-view Entity, exactly what they
+select over Entities that never had the Attribute. No answer differs
+between "hidden" and "absent", which is the property that closes the
+inference channel. The rewrite is done on the AST before the store sees
+it (a hidden term becomes the constant `false`, its negation `true`), so no
+store plan, index use or timing depends on the hidden values. `orderBy` on
+a hidden Attribute orders as if it were absent (7.6.2.2 puts "Attribute
+does not exist" last in the comparison order), and `attrs`/`pick`
+naming one yield nothing for it.
+
+Recorded spec defect: 7.2.3.2's ABNF reads `notOp = %x7E ; !`, but `%x7E`
+is `~`, while Example 6 is `?q=!isMonitoredBy` (`!` is `%x21`). The broker
+keeps accepting `!`; the defect is reported to ETSI with the TS 104 176
+heading swap the matrix records (section 8, item 9).
+
+### 3. An out-of-view Entity is not found: 404 ResourceNotFound
+
+Decided (worker-2, owner may override): **404**, because ADR-0020 already
+answers a hidden retrieve that way ("a caller cannot tell a hidden entity
+from an absent one, and a retrieve of a hidden entity is 404"), because 404
+is what a smaller store returns, and because 403 tells the caller the id
+exists. Options: 404, or ADR-0020's 403 `AccessDenied`. The 403 stays for
+what it is in ADR-0020: the engine's refusal of an operation, about the
+caller and not about one Entity. The same 404 answers a retrieve of a
+temporal Entity, an Attribute (10.4.4) and a write naming an out-of-view id
+(rule 7). A create of an id that exists out of view is the one exception:
+409, as decided in the operation matrix (section 8, item 4), since
+TS 104 175 10.2.2.4 fixes that status ("If the Entity already exists
+locally this shall result in an error of type AlreadyExists").
+
+### 4. A disallowed operation: 405 with `Allow`, 422 only when the method stays
+
+TS 104 176 6.3.2 names the HTTP-level answer: "'Method Not Allowed' (405)
+which shall be raised when a client invokes a recognized but unsupported
+HTTP verb over a resource. Implementations shall provide the allowed HTTP
+methods". A view that does not offer Create Entity does not support `POST`
+on `/entities`; 405 with the `Allow` header is the answer a stock HTTP
+client understands, and `Allow` lets the client discover the view's shape.
+
+Where one method and path serve several operations and the view allows
+some of them (`PATCH /entities/{id}/attrs` is Update Attributes; `DELETE
+/entities` with and without the purge parameters), the method stays
+allowed and the disallowed variant answers 422 `OperationNotSupported`
+(TS 104 175 8.3.2: "The operation is not supported"; 422 per TS 104 176
+Table 6.3.2-1, read from the PDF, the clause file lost the status
+column). `GET` and `HEAD` are never removed from a resource the view
+serves at all: TS 104 176 6.3.2 says "a Context broker shall recognize the
+methods GET and HEAD on all endpoints". 501 stays what 6.3.2 makes it, an
+unrecognized verb.
+
+### 5. Discovery is computed from the view
+
+`/types`, `/types/{type}`, `/attributes`, `/attributes/{attr}` (10.6.3 to
+10.6.8) answer from the Entities the view selects, with the attribute
+allowlist applied: a type the selector does not name is absent from the
+list and `/types/{t}` answers 404; a hidden Attribute is absent from
+`attributeNames`, from `attributeDetails` and from `/attributes`. These
+clauses join `policy::FILTERABLE` (CIM 009 5.7.5 to 5.7.10), so an engine
+can narrow them too, with `pick`/`omit` read as type and Attribute names.
+
+`/jsonldContexts` (13.3) lists the core `@context` and the contexts the
+view's configuration names. A stored `@context` is the tenant's
+(ADR-0021), and one may define a term for a hidden Attribute, so a view
+does not list the tenant's contexts by default; Add, Delete and Reload
+@context (13.2, 13.5) are writes and are offered only when allowlisted.
+
+### 6. Joins: an out-of-view target is not embedded, its Relationship stays
+
+`join=inline|flat` and `joinLevel` (7.7) embed a target only if the view
+and the engine would select it. A target that fails is treated exactly as
+a target that is not stored locally (7.7.1: "Only Relationships targeting a
+locally stored Entity ... are considered to be retrievable in this
+manner"): not embedded, no error. The Relationship and its `object` URI
+stay in the linking Entity unless the Relationship itself is a hidden
+Attribute. The check is one shared function over both walks; T-3470 fixes
+it for ADR-0020 today, and a view reuses it.
+
+### 7. Writes: pre-image visible, post-image still in view, allowlist only
+
+Every write that names a stored Entity loads it first and evaluates the
+view on that pre-image: out of view is 404, as for a read (rule 3). The
+proposed result (the stored Entity with the write applied, as the handler
+computes it for 10.2.3/10.2.4/10.2.9/10.2.10) is evaluated again before the
+commit: a write whose post-image the view would not select is refused with
+403 `AccessDenied` ("the write would move the Entity out of this view").
+The caller saw the pre-image, so the refusal tells them nothing new, and
+nobody can launder an Entity into another view by changing the member the
+view keys on.
+
+A write that names an Attribute outside the allowlist is refused whole
+(403, never a silent drop of that Attribute: the platform's GW17 rule).
+Creation (10.2.2, 10.3.2, the create half of 10.3.3) must produce an
+Entity the view selects, or it is refused with 403 before anything is
+written. A batch (10.3.x) is decided per Entity and answered with the
+`BatchOperationResult` (207 when mixed): every member is its own
+single-Entity operation under these rules, which needs the one-`Operation`-
+per-member call the matrix recommends (section 8, item 6) inside one engine
+call (ADR-0014 rule 1). A Relationship write (any write of a Relationship
+Attribute) requires the target Entity to be visible in the view as well.
+
+### 8. Temporal: membership by current state, limits after the allowlist
+
+A temporal request (11.3.2, 11.3.3) serves the history of the Entities the
+view selects **now**, with hidden Attributes removed from every instance.
+`lastN` (and `firstN`, T-3456) are applied per Attribute after the
+allowlist, so a hidden Attribute never uses up a caller's instance budget,
+and aggregated values are computed over visible instances only.
+
+Decided (worker-2, owner may override): current state, because a view is a
+predicate over Entities and the store can evaluate it in the same query
+that selects the Entities; evaluating it per instant would need every
+member the predicate reads to be recorded temporally. Options: current
+state, membership per instant. The residual: an Entity that enters the
+view brings its earlier history of visible Attributes along. A view whose
+history must not leak that way keys its predicate on members that do not
+change (type, id pattern, `scope`), and the view loader warns when a
+temporal-enabled view's `q` names a mutable Property.
+
+### 9. Subscriptions: stored as sent, the view applied at match time
+
+A Subscription created through a view is stored as the client sent it,
+with the view id recorded beside the subject (`__view`, under the `__`
+prefix ADR-0020 reserves for broker members). At match time the
+notification condition is `view ∧ subscription`, so a narrowed or removed
+view takes effect on existing Subscriptions without a rewrite. Before
+`pre_notify`:
+
+- hidden Attributes are removed from the notified Entities, including
+  `previousValue` (`showChanges`, 5.2.6.4.x) and any `join` target (rule 6);
+- a notification whose only change was to hidden Attributes is not sent
+  at all, and counts as not triggered (no `timesSent`, no
+  `lastNotification`, the reading ADR-0020 gives a dropped notification):
+  sending an empty notification would leak the timing of hidden writes;
+- `watchedAttributes` is intersected with the allowlist at creation; an
+  empty intersection is 400 `BadRequestData`, and no `watchedAttributes`
+  means the visible Attributes.
+
+### 10. Where views live, how they reload, how one is addressed
+
+Views are data (ADR-0014 rule 3): stored as an internal doc kind under the
+reserved tenant (ADR-0012), written through `/q` (the admin surface, the
+gateway's to protect, ADR-0020), and loaded at start. A change is
+published on the change bus (ADR-0002) and every pod swaps its view table
+atomically; no restart. A view that fails validation at load (unknown
+type, unparsable `q`, an operation id the matrix does not have) is not
+served and `/q/health` names it: never served without its predicate.
+
+A view is addressed by path: `/x/views/{view}/ngsi-ld/v1/...`. TS 104 176
+clause 5: "All resource URIs of this API shall have the following root:
+{apiRoot}/{apiName}/{apiVersion}/ ... The apiRoot includes the scheme
+("http" or "https"), host and optional port, and an optional prefix
+string". `/x/views/{view}` is that optional prefix, so a view is a
+compliant NGSI-LD API root, and `/x` is where `surface.rs` lets a
+deployment mount anything. Per-host addressing is not adopted: hostnames
+are DNS and certificate work outside the broker. A view pins its tenant: a
+request on a view path that carries `NGSILD-Tenant` naming another tenant
+is 400 `BadRequestData` ("a view serves one tenant"), never a silent switch.
+
+## Threats and the rule that answers each
+
+| threat | example | rule |
+|---|---|---|
+| inference through `q` on hidden Attributes | `q=salary>50000` returns a subset | 2 |
+| enumeration of hidden Entities | `GET /entities/{id}` for guessed ids | 3 (404), 6 |
+| count and paging leaks | `count=true&limit=0`, `Link` pages | 1 |
+| ordering leak | `orderBy=hidden` reorders | 2 |
+| discovery leak | `/types`, `/attributes`, `@context` terms | 5 |
+| join leak | `join=inline` reaches an out-of-view target | 6, T-3470 |
+| write laundering | PATCH `scope` moves an Entity into another view; write to a hidden Attribute | 7 |
+| existence oracle on create | 409 on an out-of-view id | 3 (decided 409, matrix item 4) |
+| notification timing leak | a notification fires when only a hidden Attribute changed | 9 |
+| notification content leak | `previousValue`, joined targets | 9, 6 |
+| temporal history leak | history before the Entity entered the view | 8 (residual, documented) |
+| tenant switch | `NGSILD-Tenant` on a view path | 10 |
+| misconfiguration served wide | a view with a broken predicate | 10 (not served), fail closed |
+
+## Consequences
+
+- The broker gains a `views` cargo feature, off by default; the vanilla
+  build and its ETSI result are unchanged (GOAL point 1), proven by the
+  same `dev/check-no-addon.sh` style gate the ADR-0020 addons use.
+- `policy::FILTERABLE` grows by the six discovery clauses; `Operation`
+  gains the pre-image the matrix recommends (section 8, item 2); the
+  batch handlers decide per member; the store query takes a list of geo
+  predicates. Each is its own implementation task (T-3445).
+- The platform gateway's NGSI-LD representation is replaced by a view per
+  endpoint slug, and its code is removed once every caller uses the view
+  (GOAL point 11; the inventory is `gateway-to-broker-map.md`).
+- A view and an engine compose; neither replaces the other. A deployment
+  may run views with `AllowAll`, an engine without views, or both.
+
+## Confirmation
+
+Each rule has one named test, filed by T-3445 from the T-3444 plan, in
+`crates/antares-api/tests/views_*.rs` beside the ADR-0020 ones:
+
+| rule | test |
+|---|---|
+| 1 | `views_count_and_paging_describe_the_narrowed_set` |
+| 2 | `views_a_hidden_attribute_does_not_exist_for_q` (every operator, `!`, linked paths, `orderBy`) |
+| 3 | `views_an_out_of_view_entity_is_not_found` (entity, temporal, attribute, write) |
+| 4 | `views_a_disallowed_operation_answers_405_with_allow` and `..._422_when_the_method_stays` |
+| 5 | `views_discovery_is_computed_from_the_view` |
+| 6 | `views_join_omits_out_of_view_targets_and_keeps_the_relationship` |
+| 7 | `views_writes_check_pre_and_post_image_and_the_allowlist`, `views_batch_is_decided_per_entity` |
+| 8 | `views_temporal_serves_current_members_and_limits_after_the_allowlist` |
+| 9 | `views_notifications_drop_hidden_changes_and_strip_previous_value` |
+| 10 | `views_reload_without_restart`, `views_a_broken_view_is_not_served`, `views_pin_their_tenant` |
+
+Plus, for the whole: the ETSI suite run against `/x/views/{all}/ngsi-ld/v1`
+where `{all}` selects every type and hides nothing must give the vanilla
+result (a view that narrows nothing is the vanilla broker), and the
+default build links no view code (`cargo tree` gate).
