@@ -38,6 +38,10 @@ on:
     # this workflow on dev, or flip the PR to draft and back.
     types: [opened, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      soak_minutes:
+        description: soak length per store, minutes (soak.yml)
+        default: "120"
 
 # The default for every job here; the ones that publish an image, cut a
 # release or file an issue declare their own wider set.
@@ -215,6 +219,14 @@ jobs:
             cell, or a wasm tier. The Pages report and badges will show the
             red cells; the run's ETSI-matrix-results bundle has every
             failure with expected-vs-got.
+
+  soak:
+    # T-3551: hours on one broker, before a release and by hand; not on the
+    # twice-weekly schedule or the promotion PR, which it would hold 2 h.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/soak.yml
+    with:
+      minutes: ${{ fromJSON(inputs.soak_minutes || '120') }}
 
   build-arm:
     # The arm64 half of the released manifest — BUILT, never tested; the
