@@ -2194,6 +2194,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "odata-json"
+version = "0.1.3"
+dependencies = [
+ "odata-csdl",
+ "odata-url",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "odata-url"
 version = "0.1.3"
 dependencies = [

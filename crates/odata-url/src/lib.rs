@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! OData 4.01 relative URLs to a typed AST: the resource path and the system query options
 //! (ADR-0024 decision 1, row `odata-url`).
 //!

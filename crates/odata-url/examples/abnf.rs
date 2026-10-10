@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! `odata_url_abnf_testcases`: the OASIS ABNF test cases (`odata-abnf-testcases.yaml` at
 //! `a31c8db`, converted to JSON by `dev/odata-url-abnf.py`, which checks its digest) run
 //! through [`odata_url::parse`].

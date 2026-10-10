@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! The bounds a parse runs under (ADR-0024 decision 4). The caller passes them; there is no
 //! default on a request path.
 

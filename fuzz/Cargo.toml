@@ -21,6 +21,8 @@ antares-jsonld = { path = "../crates/antares-jsonld" }
 antares-sql = { path = "../crates/antares-sql", default-features = false }
 linkml-model = { path = "../crates/linkml-model" }
 odata-url = { path = "../crates/odata-url" }
+odata-csdl = { path = "../crates/odata-csdl" }
+odata-json = { path = "../crates/odata-json" }
 
 [[bin]]
 name = "parse_q"
@@ -144,6 +146,13 @@ bench = false
 [[bin]]
 name = "odata_url_parse"
 path = "fuzz_targets/odata_url_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "odata_json_body"
+path = "fuzz_targets/odata_json_body.rs"
 test = false
 doc = false
 bench = false

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! Unit tests: every rule of the subset, its errors, its limits and the canonical writer.
 
 use super::*;

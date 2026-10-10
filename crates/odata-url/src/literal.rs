@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! `primitiveLiteral` (ABNF section 7): the subset of T-3441 F26 and F29 as values, the other
 //! literal kinds recognised and answered as not implemented.
 

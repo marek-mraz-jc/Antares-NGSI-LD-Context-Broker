@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! The EDM model: the subset of CSDL 4.01 this crate writes (ADR-0024 decision 5).
 //!
 //! Everything is plain data with public fields; [`crate::validate`] decides whether a value is a
@@ -49,6 +50,160 @@ pub struct Model {
     pub references: Vec<Reference>,
     /// `Schema`, in order; at most one carries the entity container.
     pub schemas: Vec<Schema>,
+}
+
+impl Model {
+    /// The namespace a qualifier names: a schema's namespace or alias, or a namespace included
+    /// from a reference, by itself or by its alias.
+    ///
+    /// ```
+    /// use odata_csdl::{CsdlVersion, Include, Model, Reference, Schema};
+    /// let mut city = Schema::new("City");
+    /// city.alias = Some("c".into());
+    /// let core = Include { namespace: "Org.OData.Core.V1".into(), alias: Some("Core".into()) };
+    /// let model = Model {
+    ///     version: CsdlVersion::V4_01,
+    ///     references: vec![Reference { uri: "core.xml".into(), includes: vec![core] }],
+    ///     schemas: vec![city],
+    /// };
+    /// assert_eq!(model.namespace("c"), Some("City"));
+    /// assert_eq!(model.namespace("Core"), Some("Org.OData.Core.V1"));
+    /// assert_eq!(model.namespace("Other"), None);
+    /// ```
+    #[must_use]
+    pub fn namespace(&self, qualifier: &str) -> Option<&str> {
+        let local = self
+            .schemas
+            .iter()
+            .map(|s| (s.namespace.as_str(), s.alias.as_deref()));
+        let included = self
+            .references
+            .iter()
+            .flat_map(|r| &r.includes)
+            .map(|i| (i.namespace.as_str(), i.alias.as_deref()));
+        local
+            .chain(included)
+            .find(|(namespace, alias)| *namespace == qualifier || *alias == Some(qualifier))
+            .map(|(namespace, _)| namespace)
+    }
+
+    /// A qualified name (`Qualifier.Name`) with its qualifier replaced by the namespace it
+    /// names: how two spellings of one type or term compare.
+    ///
+    /// ```
+    /// # use odata_csdl::{CsdlVersion, Model, Schema};
+    /// # let mut city = Schema::new("City");
+    /// # city.alias = Some("c".into());
+    /// # let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![city] };
+    /// assert_eq!(model.full_name("c.Building").as_deref(), Some("City.Building"));
+    /// assert_eq!(model.full_name("Edm.String"), None);
+    /// ```
+    #[must_use]
+    pub fn full_name(&self, qualified: &str) -> Option<String> {
+        let (prefix, local) = qualified.rsplit_once('.')?;
+        self.namespace(prefix)
+            .map(|namespace| format!("{namespace}.{local}"))
+    }
+
+    /// The schema of a qualified name and the name in it.
+    fn declared<'q>(&self, qualified: &'q str) -> Option<(&Schema, &'q str)> {
+        let (prefix, local) = qualified.rsplit_once('.')?;
+        let schema = self
+            .schemas
+            .iter()
+            .find(|s| s.namespace == prefix || s.alias.as_deref() == Some(prefix))?;
+        Some((schema, local))
+    }
+
+    /// The entity type a qualified name (namespace or alias) names.
+    ///
+    /// ```
+    /// # use odata_csdl::{CsdlVersion, EntityType, Model, Schema};
+    /// # let mut city = Schema::new("City");
+    /// # city.entity_types.push(EntityType::new("Building"));
+    /// # let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![city] };
+    /// assert!(model.entity_type("City.Building").is_some());
+    /// assert!(model.entity_type("City.Tower").is_none());
+    /// ```
+    #[must_use]
+    pub fn entity_type(&self, qualified: &str) -> Option<&EntityType> {
+        let (schema, name) = self.declared(qualified)?;
+        schema.entity_types.iter().find(|t| t.name == name)
+    }
+
+    /// The complex type a qualified name (namespace or alias) names.
+    ///
+    /// ```
+    /// # use odata_csdl::{ComplexType, CsdlVersion, Model, Schema};
+    /// # let mut city = Schema::new("City");
+    /// # city.complex_types.push(ComplexType::new("Address"));
+    /// # let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![city] };
+    /// assert!(model.complex_type("City.Address").is_some());
+    /// assert!(model.complex_type("Nowhere.Address").is_none());
+    /// ```
+    #[must_use]
+    pub fn complex_type(&self, qualified: &str) -> Option<&ComplexType> {
+        let (schema, name) = self.declared(qualified)?;
+        schema.complex_types.iter().find(|t| t.name == name)
+    }
+
+    /// The entity set `name` of the model's entity container.
+    ///
+    /// ```
+    /// # use odata_csdl::{CsdlVersion, EntityContainer, EntitySet, Model, Schema};
+    /// # let mut city = Schema::new("City");
+    /// # let mut service = EntityContainer::new("Service");
+    /// # service.entity_sets.push(EntitySet::new("Buildings", "City.Building"));
+    /// # city.entity_container = Some(service);
+    /// # let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![city] };
+    /// assert_eq!(model.entity_set("Buildings").map(|s| s.entity_type.as_str()), Some("City.Building"));
+    /// assert!(model.entity_set("Towers").is_none());
+    /// ```
+    #[must_use]
+    pub fn entity_set(&self, name: &str) -> Option<&EntitySet> {
+        self.schemas
+            .iter()
+            .filter_map(|s| s.entity_container.as_ref())
+            .flat_map(|c| &c.entity_sets)
+            .find(|set| set.name == name)
+    }
+
+    /// `ty` and its base types, most derived first. The walk stops at a base type this model
+    /// does not declare as an entity type, and after as many steps as there are entity types
+    /// (a base-type cycle is a validation error of the model).
+    ///
+    /// ```
+    /// # use odata_csdl::{CsdlVersion, EntityType, Model, Schema};
+    /// # let mut city = Schema::new("City");
+    /// # let mut tower = EntityType::new("Tower");
+    /// # tower.base_type = Some("City.Building".into());
+    /// # city.entity_types = vec![EntityType::new("Building"), tower];
+    /// # let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![city] };
+    /// let tower = model.entity_type("City.Tower").ok_or("no tower")?;
+    /// let names: Vec<&str> = model.lineage(tower).iter().map(|t| t.name.as_str()).collect();
+    /// assert_eq!(names, ["Tower", "Building"]);
+    /// # Ok::<(), &str>(())
+    /// ```
+    #[must_use]
+    pub fn lineage<'m>(&'m self, ty: &'m EntityType) -> Vec<&'m EntityType> {
+        let types: usize = self.schemas.iter().map(|s| s.entity_types.len()).sum();
+        let mut lineage = vec![ty];
+        let mut current = ty;
+        while lineage.len() < types {
+            match current
+                .base_type
+                .as_deref()
+                .and_then(|base| self.entity_type(base))
+            {
+                Some(base) => {
+                    lineage.push(base);
+                    current = base;
+                }
+                None => break,
+            }
+        }
+        lineage
+    }
 }
 
 /// A reference to another CSDL document and the namespaces taken from it.

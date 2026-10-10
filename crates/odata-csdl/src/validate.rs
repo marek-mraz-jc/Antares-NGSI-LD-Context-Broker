@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! Model validation: the CSDL rules the writers rely on, under the caller's limits.
 
 use std::collections::{HashMap, HashSet};

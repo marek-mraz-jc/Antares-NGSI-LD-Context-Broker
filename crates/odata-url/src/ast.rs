@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! The typed result of a parse. Names stay strings: the [`Model`](crate::Model) placed each one,
 //! the caller decides what it means.
 

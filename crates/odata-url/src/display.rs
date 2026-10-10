@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! The canonical form of an [`ODataUri`]: what [`parse`](crate::parse) reads back to the same
 //! tree. Spaces are written `%20`, system options in a fixed order with their `$`, and
 //! parentheses only where the precedence needs them.

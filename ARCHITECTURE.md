@@ -53,6 +53,7 @@ broker nor a storage backend (`antares-api`, `antares-broker`,
 | `antares-wasm` | 500 | the router under a Service Worker, OPFS-backed file store | diverge from the native router |
 | `odata-csdl` | 3 640 | OData 4.01 EDM model, CSDL XML and CSDL JSON writers, model validation under caller `Limits` (ADR-0024) | know its host (no `antares-*` dependency, rule M1) or read CSDL |
 | `odata-url` | 5 150 | OData 4.01 relative URLs (resource path, system query options, `$filter`) to a typed AST under caller `Limits`, against a `Model` the caller supplies; canonical writer; the subset of T-3441, the rest `NotImplemented` (ADR-0024) | know its host (no `antares-*` dependency, rule M1) or decide a status code |
+| `odata-json` | 2 250 | OData 4.01 JSON format: entity, collection, reference, service-document and error writers at `metadata=none\|minimal\|full` in 4.0 or 4.01 spelling; the body reader of the mapped writes (W1, W2, W4, W6, W10, W11, W16, W20) under caller `BodyLimits`; `Prefer` and version negotiation; the rest `NotImplemented` (ADR-0024) | know its host (no `antares-*` dependency, rule M1), decide a status beyond `BodyError::status`, or echo a request value in an error |
 
 ## 3. Module map of `antares-api/src`
 

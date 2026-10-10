@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! What the parser asks about names. The OData URL grammar depends on the model: after
 //! `Orders` a `(1)` is a key only when `Orders` is a collection, and `/Customer/` continues with
 //! the members of the customer's type. The parser asks as it goes, so it parses one pass and

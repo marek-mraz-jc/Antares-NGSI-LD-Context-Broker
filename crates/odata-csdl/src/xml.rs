@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! CSDL XML (OData CSDL XML Representation 4.01).
 
 use std::io::Write;
