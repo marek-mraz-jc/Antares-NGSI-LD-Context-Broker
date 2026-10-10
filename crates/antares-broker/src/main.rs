@@ -1649,6 +1649,47 @@ mod api_surface_tests {
             assert!(err.contains("ANTARES_API_SURFACES"), "{err}");
         }
     }
+
+    /// Rule M3, the route half (surfaces-threat-model 9.5 item 4): with no
+    /// surface feature the shelf is the admin surface alone, and a path of
+    /// every surface prefix (ADR-0023 to ADR-0027) is unrouted. A surface
+    /// that lands without its feature gate turns this red.
+    #[cfg(not(any(feature = "plugin-example")))]
+    #[tokio::test]
+    async fn the_vanilla_shelf_is_admin_alone() {
+        use tower::ServiceExt;
+
+        let shelf: Vec<&str> = SURFACE_SHELF.iter().map(|(n, _)| *n).collect();
+        assert_eq!(shelf, vec!["admin"]);
+        let surfaces = api_surfaces(None)
+            .expect("selection")
+            .iter()
+            .map(|(_, build)| build())
+            .collect();
+        let state = antares_api::AppState::new("antares-test".into())
+            .with_surfaces(surfaces)
+            .expect("the admin surface mounts");
+        let app = antares_api::router(state);
+        for path in [
+            "/x/views",
+            "/x/views/all/ngsi-ld/v1/entities",
+            "/x/views/all/odata/v4/$metadata",
+            "/x/views/all/mcp",
+            "/x/views/all/linkml",
+            "/x/views/all/ws",
+            "/x/example/v1",
+        ] {
+            let request = axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let response = app.clone().oneshot(request).await.expect("answered");
+            assert_eq!(
+                response.status(),
+                404,
+                "{path} is routed in the vanilla build"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

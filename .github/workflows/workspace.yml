@@ -147,7 +147,9 @@ jobs:
               docker stats --no-stream --format '  {{.Name}} {{.MemUsage}}' 2>/dev/null
             done ) &
           SAMPLER=$!
-          cargo clippy --locked --workspace --all-targets -- -D warnings
+          # --all-features: code behind a feature (policy addons, mqtt, the
+          # plugin example) is held to the same wall (finding F7, T-3490).
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
           kill $SAMPLER
       # `fuzz/` is not a workspace member (its targets need libFuzzer's
       # sanitizer flags to LINK), so the wall above never looks at it and a
@@ -256,6 +258,17 @@ jobs:
       # clean one.
       - name: No addon in the shipped build
         run: ./dev/check-no-addon.sh
+      # Rule M3 proven twice more (ADR-0027 section 3, surfaces-threat-model
+      # 9.5): what the default build compiles is a committed file, so a
+      # change to vanilla shows in the diff of the commit that makes it
+      # (refresh: dev/vanilla-tree.sh > ci/vanilla-tree.txt); and the
+      # vanilla debug binary carries no symbol of a surface, ops or protocol
+      # crate and refuses a surface it was not built with. Both self-test
+      # against a build with an addon.
+      - name: Vanilla feature tree is committed
+        run: dev/vanilla-tree.sh | diff -u ci/vanilla-tree.txt -
+      - name: Vanilla binary links no surface
+        run: ./dev/check-vanilla-symbols.sh
       # Module rules M1 and M2 (ADR-0027, surfaces-threat-model 9.3/9.4):
       # every package declares its role, a surface reaches the store only
       # through antares-ops, a protocol crate knows nothing of antares-*.
@@ -344,6 +357,36 @@ jobs:
       - name: Tests with each feature alone
         if: matrix.package != 'workspace'
         run: cargo hack test --locked --each-feature --exclude-features console -p ${{ matrix.package }}
+
+  coverage-surfaces:
+    # Every new crate of the surfaces epic (metadata.antares.role ops,
+    # surface or protocol) covers 100 % of its lines and branches, minus
+    # what ci/coverage-exclusions.toml lists with a reason; an entry that
+    # is covered now or names a gone function is red too (surfaces-test-plan
+    # section 1, T-3491). A new crate joins by its role, without a YAML
+    # edit; with none yet the gate says so and passes. Existing crates keep
+    # T-3468's 95 % floor. Nightly for llvm-cov's --branch.
+    name: Coverage of the new crates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+          key: coverage-surfaces
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Coverage gate self-test
+        run: python3 dev/coverage-gate.py --self-test
+      - name: 100 % lines and branches, minus the listed exclusions
+        run: python3 dev/coverage-gate.py
 
   msrv:
     # The declared rust-version stays PROVEN as stable moves on.

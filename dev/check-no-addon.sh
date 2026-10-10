@@ -19,7 +19,8 @@ cd "$(dirname "$0")/.."
 # under `examples/` is an addon by construction; the names are the addon
 # crates this repository knows about, so a rename that dodges the path rule
 # is still caught.
-FORBIDDEN='examples/|antares-plugin-|antares-policy-|antares-facade-|antares-sensorthings|antares-ogcapi|antares-wfs|antares-odata'
+# The surfaces epic adds its ops, surface and protocol crates (surfaces-threat-model 9.5, rule M3).
+FORBIDDEN='examples/|antares-plugin-|antares-policy-|antares-facade-|antares-sensorthings|antares-ogcapi|antares-wfs|antares-odata|antares-ops|antares-views|antares-mcp|antares-linkml|antares-ws|antares-icsr|odata-|linkml-model|rmcp|tungstenite'
 
 tree() { cargo tree -p antares-broker -e normal --locked "$@"; }
 
