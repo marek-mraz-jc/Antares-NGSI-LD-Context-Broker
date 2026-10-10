@@ -1804,6 +1804,13 @@ pub(crate) async fn query_temporal_collected(
     // ADR-0020: the engine's narrowing joins the request's own filters after
     // 5.7.4.4's "too wide" judgement, which is about what the client asked
     // for. Everything below reads the narrowed query, the forward included.
+    // ADR-0023 rule 11: the per-type rules, and what the client's own query
+    // reads before the engine's q joins it (rule 2 per type)
+    let types_rule = crate::repr::type_rules(filter);
+    let client_reads = match &types_rule {
+        Some(_) => crate::repr::client_reads(params, &ctx)?,
+        None => Vec::new(),
+    };
     let narrowed = filter.narrow_params(params)?;
     let params = &narrowed;
     let q_ast = params.get("q").map(|q| parse_q(q)).transpose()?.map(|ast| {
@@ -1887,6 +1894,7 @@ pub(crate) async fn query_temporal_collected(
     // the store may only pre-page when nothing will federate — otherwise
     // page 1 is local-page + every remote row (matrix-9 IOP_EXT_TMP_03_04).
     let push_page = (exact_push || (geos.is_empty() && scope_q.is_none() && q_page_exact))
+        && client_reads.is_empty()
         && id_pattern.is_none()
         && params.get("orderBy").is_none()
         && params.get("datasetId").is_none()
@@ -2036,6 +2044,11 @@ pub(crate) async fn query_temporal_collected(
                 }
             }
         }
+        if let Some(rules) = types_rule.as_deref().filter(|_| !client_reads.is_empty()) {
+            if !crate::repr::hidden_read_types(rules, &client_reads, &doc).is_empty() {
+                continue;
+            }
+        }
         if !type_and_attrs_match(&doc, types.as_ref(), entity_attr_filter.as_ref()) {
             continue;
         }
@@ -2081,7 +2094,6 @@ pub(crate) async fn query_temporal_collected(
     let (mut g_trunc, mut g_min, mut g_maxts) = (false, None::<String>, None::<String>);
     // ADR-0023 rule 11: each Entity's history is narrowed by its own types
     // before the window, so lastN counts only what may be seen (rule 8)
-    let types_rule = crate::repr::type_rules(filter);
     for d in &page {
         let typed;
         let d = match &types_rule {

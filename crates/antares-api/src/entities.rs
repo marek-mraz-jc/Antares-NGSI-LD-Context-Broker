@@ -611,7 +611,7 @@ async fn query_entities_outer(
     // EntityMaps exist for the distributed case. count=true walks every
     // candidate (the total needs each id checked), still chunk-bounded.
     let ids: Vec<String> = crate::entity_map::candidate_ids(&map, &params);
-    let narrow = crate::repr::narrowing(&filter);
+    let narrow = crate::repr::narrowing_reading(&filter, &params, &ctx)?;
     let looped = crate::federation::via_loop(
         headers,
         &crate::federation::alias_for(&st.host_alias, &tenant),
@@ -756,6 +756,9 @@ async fn query_entities_inner(
         params,
         params.get("q").map(|q| parse_q(q)).transpose()?.as_ref(),
     );
+    // what the client's own query reads, before the engine's q joins it
+    // (ADR-0023 rule 11)
+    let client_params = params;
     // Everything below reads the narrowed query: the store push-down, the
     // local re-check 5.7.2.4 runs over merged results, and the query the
     // request is forwarded with.
@@ -805,6 +808,7 @@ async fn query_entities_inner(
 
     let mut repr = parse_repr(params, &ctx)?;
     crate::repr::narrow_repr(&mut repr, filter);
+    crate::repr::note_reads(&mut repr, client_params, &ctx)?;
     let join = parse_join(params)?;
     check_linked_projection(&repr, &join)?;
     // 5.7.2.4: filter conditions using Linked Entity attributes need join,
@@ -878,6 +882,23 @@ async fn query_entities_inner(
         Some(&repr),
     )
     .await?;
+    if !filtered.hidden_types.is_empty() {
+        // ADR-0023 rule 11: say which types the query could not be asked
+        // of, so an honest client tells "none" from "not filterable here"
+        let named: Vec<String> = filtered
+            .hidden_types
+            .iter()
+            .map(|t| ctx.compact_iri(t))
+            .collect();
+        warnings.push(crate::federation::warning(
+            199,
+            &crate::federation::alias_for(&st.host_alias, &tenant),
+            &format!(
+                "Entities of type {} were left out: the query reads an Attribute this answer does not show for them",
+                named.join(", ")
+            ),
+        ));
+    }
     let mut matches = filtered.docs;
     if let Some(spec) = params.get("orderBy") {
         order_entities(&mut matches, spec, params, &ctx)?;
@@ -1024,6 +1045,10 @@ pub struct Filtered {
     /// which is what a chunked walk has to step over, since `docs` undercounts
     /// it whenever idPattern (invisible to the store filter) removed rows.
     pub rows: usize,
+    /// The types whose Entities were left out because the client's query
+    /// reads an Attribute those types may not show (ADR-0023 rule 11), as
+    /// stored (expanded); named in the answer's warning.
+    pub hidden_types: std::collections::BTreeSet<String>,
 }
 
 /// Whether the store may be asked to project members away. Only when its
@@ -1176,6 +1201,18 @@ pub async fn filter_entities_paged(
     // and neither can a pushed projection: the store's answer is only the
     // final answer when nothing downstream still needs the stripped members
     let proj = proj.filter(|_| proj_pushdown_allowed(fed.is_empty(), params));
+    // ADR-0023 rule 11, rule 2 per type: an Entity whose types may not show
+    // an Attribute the client filters, orders or picks on is left out. The
+    // store cannot see that rule, so no page is cut before it is applied.
+    let read_rules = narrow
+        .and_then(|r| {
+            r.policy_types
+                .as_deref()
+                .map(|t| (t, r.policy_reads.as_slice()))
+        })
+        .filter(|(_, reads)| !reads.is_empty());
+    let page = if read_rules.is_some() { None } else { page };
+    let mut hidden_types = std::collections::BTreeSet::new();
     let ids: Option<Vec<&str>> = params.get("id").map(|s| s.split(',').collect());
     if let Some(ids) = &ids {
         for id in ids {
@@ -1334,6 +1371,13 @@ pub async fn filter_entities_paged(
                 }
             }
         }
+        if let Some((rules, reads)) = read_rules {
+            let hidden = crate::repr::hidden_read_types(rules, reads, &doc);
+            if !hidden.is_empty() {
+                hidden_types.extend(hidden.into_iter().map(str::to_owned));
+                continue;
+            }
+        }
         if !decided {
             if let Some(sel) = &type_sel {
                 let etypes: Vec<&str> = doc["type"]
@@ -1378,6 +1422,7 @@ pub async fn filter_entities_paged(
         paged,
         total,
         rows,
+        hidden_types,
     })
 }
 
@@ -2538,7 +2583,7 @@ pub(crate) async fn build_query_map(
     }
     // the candidate set is the NARROWED query's (ADR-0020)
     let narrowed = filter.narrow_params(params)?;
-    let narrow = crate::repr::narrowing(filter);
+    let narrow = crate::repr::narrowing_reading(filter, params, ctx)?;
     let params = &narrowed;
     // 5.14.4.4: invalid entity ids / csf are BadRequestData
     if let Some(ids) = params.get("id") {

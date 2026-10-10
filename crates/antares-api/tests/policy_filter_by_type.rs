@@ -450,3 +450,209 @@ async fn notification_previous_value_projected_per_type() {
         "an Attribute allowed only on Car travelled on the User: {last}"
     );
 }
+
+/// The `NGSILD-Warning` of a GET, a header [`send`] does not return.
+async fn warning(st: &AppState, uri: &str) -> Option<String> {
+    antares_api::router(st.clone())
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .headers()
+        .get("NGSILD-Warning")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn ids(list: &Value) -> Vec<String> {
+    members(list).into_keys().collect()
+}
+
+/// ADR-0023 rule 2 per type (T-1862): `colour` is visible on Car and hidden
+/// on User, so a `q`, `attrs` or `orderBy` on it may not select, test or
+/// order Users. The Users are left out, not the whole answer, and the
+/// warning names their type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn q_on_an_attribute_hidden_for_user_drops_user_not_car() {
+    let st = state(picks(&[("Car", &["speed", "colour"]), ("User", &["name"])])).await;
+    seed(&st).await;
+    for query in [
+        "q=colour!=%22green%22",
+        "q=colour",
+        "q=!colour",
+        "attrs=colour",
+        "orderBy=colour",
+        "pick=id,colour",
+    ] {
+        let uri = format!("/ngsi-ld/v1/entities?type=Car,User&{query}");
+        let (code, list) = send(&st, "GET", &uri, None).await;
+        assert_eq!(code, StatusCode::OK, "{query}: {list}");
+        let got = ids(&list);
+        assert!(
+            !got.contains(&"urn:ngsi-ld:User:1".to_owned()),
+            "{query}: a User was read through Car's allowlist: {list}"
+        );
+        if query != "q=!colour" {
+            assert_eq!(got, ["urn:ngsi-ld:Car:1"], "{query}: {list}");
+        }
+        let said = warning(&st, &uri).await.unwrap_or_default();
+        assert!(
+            said.starts_with("199 ") && said.contains("User"),
+            "{query}: warning {said:?}"
+        );
+        assert!(
+            !said.contains("Car,") && !said.contains(" Car "),
+            "{query}: Car named: {said:?}"
+        );
+    }
+
+    // count and the batch query see the same set
+    let (_, list) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Car,User&q=colour&count=true&limit=0",
+        None,
+    )
+    .await;
+    assert_eq!(list, json!([]));
+    let count = antares_api::router(st.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/ngsi-ld/v1/entities?type=Car,User&q=colour&count=true&limit=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .headers()
+        .get("NGSILD-Results-Count")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    assert_eq!(count.as_deref(), Some("1"));
+    let (code, list) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/query",
+        Some(json!({"type": "Query", "entities": [{"type": "Car"}, {"type": "User"}], "q": "colour"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list), ["urn:ngsi-ld:Car:1"], "{list}");
+
+    // a query on what each type shows answers both, with no warning
+    let uri = "/ngsi-ld/v1/entities?type=Car,User";
+    assert_eq!(ids(&send(&st, "GET", uri, None).await.1).len(), 2);
+    assert_eq!(warning(&st, uri).await, None);
+}
+
+/// The engine may condition on what it hides: its own `q` is not the
+/// client's read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_engines_own_q_on_a_hidden_attribute_drops_nothing() {
+    let st = state(Filter {
+        q: Some(Box::new(antares_ql::parse_q("colour").unwrap())),
+        ..picks(&[("Car", &["speed"]), ("User", &["name"])])
+    })
+    .await;
+    seed(&st).await;
+    let (_, list) = send(&st, "GET", "/ngsi-ld/v1/entities?type=Car,User", None).await;
+    let got = members(&list);
+    assert_eq!(
+        got["urn:ngsi-ld:Car:1"],
+        keys(&["id", "type", "speed"]),
+        "{list}"
+    );
+    assert_eq!(
+        got["urn:ngsi-ld:User:1"],
+        keys(&["id", "type", "name"]),
+        "{list}"
+    );
+}
+
+/// 5.7.4: the temporal query applies the same rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_temporal_q_on_an_attribute_hidden_for_user_drops_user() {
+    let st = state(picks(&[("Car", &["colour"]), ("User", &["name"])])).await;
+    for (id, ty) in [("urn:ngsi-ld:Car:t", "Car"), ("urn:ngsi-ld:User:t", "User")] {
+        let (code, body) = send(
+            &st,
+            "POST",
+            "/ngsi-ld/v1/temporal/entities",
+            Some(json!({"id": id, "type": ty,
+                        "colour": [{"type": "Property", "value": "red", "observedAt": "2026-01-01T00:00:00Z"}],
+                        "name": [{"type": "Property", "value": "n", "observedAt": "2026-01-01T00:00:00Z"}]})),
+        )
+        .await;
+        assert!(code.is_success(), "{body}");
+    }
+    let (code, list) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities?type=Car,User&q=colour==%22red%22&timerel=after&timeAt=1970-01-01T00:00:00Z",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list), ["urn:ngsi-ld:Car:t"], "{list}");
+}
+
+/// The property, exhaustively over a small universe: for every allowlist
+/// map over two types and three Attributes, and every Entity typed with a
+/// subset of the two, no answer holds an Attribute outside the union of
+/// its types' entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_answer_holds_a_type_attribute_pair_outside_the_map() {
+    let attrs = ["a1", "a2", "a3"];
+    let subsets = |n: usize| (0..1u8 << n).collect::<Vec<u8>>();
+    for car in subsets(3) {
+        for user in subsets(3) {
+            let pick = |mask: u8| -> Vec<&str> {
+                attrs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, a)| *a)
+                    .collect()
+            };
+            let (car_l, user_l) = (pick(car), pick(user));
+            let st = state(picks(&[("Car", &car_l), ("User", &user_l)])).await;
+            for (i, types) in [
+                vec!["Car"],
+                vec!["User"],
+                vec!["Car", "User"],
+                vec!["Robot"],
+            ]
+            .iter()
+            .enumerate()
+            {
+                let mut doc = json!({"id": format!("urn:ngsi-ld:T:{i}"), "type": types});
+                for a in attrs {
+                    doc[a] = prop(json!(1));
+                }
+                create(&st, doc).await;
+            }
+            let (code, list) =
+                send(&st, "GET", "/ngsi-ld/v1/entities?type=Car,User,Robot", None).await;
+            assert_eq!(code, StatusCode::OK, "{list}");
+            for e in list.as_array().unwrap() {
+                let types: Vec<&str> = match &e["type"] {
+                    Value::String(t) => vec![t.as_str()],
+                    Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+                    _ => Vec::new(),
+                };
+                for k in e
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .filter(|k| !["id", "type"].contains(&k.as_str()))
+                {
+                    let allowed = (types.contains(&"Car") && car_l.contains(&k.as_str()))
+                        || (types.contains(&"User") && user_l.contains(&k.as_str()));
+                    assert!(
+                        allowed,
+                        "car={car_l:?} user={user_l:?}: {k} served on {types:?}: {e}"
+                    );
+                }
+            }
+        }
+    }
+}
