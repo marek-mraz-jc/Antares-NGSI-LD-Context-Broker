@@ -2,7 +2,19 @@
 //! JSON-LD layer — hand-rolled NGSI-LD-subset processor: context processing,
 //! expansion with structural validation, compaction, caching loader with
 //! pinned core contexts.
-#![cfg_attr(not(test), warn(clippy::expect_used))]
+// T-3468: every surface calls into this crate on a request path, where a
+// panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
+// index out of bounds or overflow.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
 #![deny(missing_docs)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 

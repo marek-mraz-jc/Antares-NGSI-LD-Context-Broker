@@ -246,7 +246,7 @@ impl EgressPolicy {
     /// name is resolved once, and any private address in the answer denies
     /// the fetch.
     pub async fn check_host(&self, host: &str, port: u16) -> Result<(), String> {
-        self.check_host_within(host, port, DNS_TIMEOUT * slow_factor() as u32)
+        self.check_host_within(host, port, DNS_TIMEOUT.saturating_mul(slow_factor() as u32))
             .await
     }
 
@@ -587,7 +587,9 @@ fn ttl_from_headers(
     if let Some(exp) = expires {
         // HTTP-date (RFC 7231); an unparsable or past Expires means "stale".
         let when = chrono::DateTime::parse_from_rfc2822(exp).ok()?;
-        let delta = when.with_timezone(&chrono::Utc) - chrono::Utc::now();
+        let delta = when
+            .with_timezone(&chrono::Utc)
+            .signed_duration_since(chrono::Utc::now());
         return Some(
             delta
                 .to_std()
@@ -818,8 +820,8 @@ impl Loader {
         // here; without it no @context can ever be fetched.
         let client = with_timeouts(
             client_builder(policy),
-            std::time::Duration::from_secs(5 * slow_factor()),
-            std::time::Duration::from_secs(10 * slow_factor()),
+            std::time::Duration::from_secs(5u64.saturating_mul(slow_factor())),
+            std::time::Duration::from_secs(10u64.saturating_mul(slow_factor())),
         )
         .build()
         .expect("reqwest client");
@@ -944,7 +946,7 @@ impl Loader {
         {
             let mut map = self.usage.write().await;
             if let Some(u) = map.get_mut(url) {
-                u.hits += 1;
+                u.hits = u.hits.saturating_add(1);
                 u.last_usage = now;
             } else {
                 // hold the size bound: admitting a new URL past the cap
@@ -1206,8 +1208,15 @@ impl Loader {
             match entry {
                 Value::Array(items) => {
                     for item in items {
-                        self.merge_entry(ctx, item, depth + 1, urls, base.clone(), tenant)
-                            .await?;
+                        self.merge_entry(
+                            ctx,
+                            item,
+                            depth.saturating_add(1),
+                            urls,
+                            base.clone(),
+                            tenant,
+                        )
+                        .await?;
                     }
                     Ok(())
                 }
@@ -1244,7 +1253,7 @@ impl Loader {
                     self.merge_entry(
                         ctx,
                         &doc,
-                        depth + 1,
+                        depth.saturating_add(1),
                         urls,
                         Some(std::sync::Arc::new(resolved)),
                         tenant,
@@ -1402,7 +1411,7 @@ impl Loader {
                     .await
                     .map_err(|e| err(format!("reading {url}: {e}")))?
                 {
-                    if buf.len() + chunk.len() > MAX_CONTEXT_BYTES {
+                    if buf.len().saturating_add(chunk.len()) > MAX_CONTEXT_BYTES {
                         return Err(err(format!("{url}: @context document too large")));
                     }
                     buf.extend_from_slice(&chunk);
@@ -1447,7 +1456,11 @@ impl Loader {
             url.to_owned(),
             FetchedDoc {
                 value: Arc::clone(&arc),
-                stale_at: ttl.map(|d| Instant::now() + d),
+                // past the clock's range the copy is stale at once, not never
+                stale_at: ttl.map(|d| {
+                    let now = Instant::now();
+                    now.checked_add(d).unwrap_or(now)
+                }),
                 // 5.13.1 "Cached": downloaded from a public URL, no Tenant
                 owner: None,
             },
