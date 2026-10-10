@@ -77,6 +77,9 @@ sonic = ["dep:sonic-rs"]
 # under fuzz/ (T-3463). Adds no dependency and no route; no broker build
 # turns it on.
 fuzzing = []
+# Endpoint views (ADR-0023): the composition hook `gate!` applies when a
+# state carries a view. Off in the vanilla build; pulled by antares-ops.
+views = []
 
 [dev-dependencies]
 # the storage seams are object-safe AND asynchronous: a test double

@@ -114,6 +114,10 @@ pub struct AppState {
     /// costs about 1.5 ms, which is worth memoizing per state and not worth
     /// paying in a host that never makes an in-process call.
     pub(crate) inbound: Arc<std::sync::OnceLock<axum::Router>>,
+    /// The endpoint view every operation through this state is narrowed to
+    /// (ADR-0023); `None` serves the NGSI-LD API as it is.
+    #[cfg(feature = "views")]
+    pub view: Option<Arc<crate::views::CompiledView>>,
     /// Bounds-wall rejection counters (exported by /q/health).
     pub limits: Arc<crate::bounds::LimitStats>,
     /// Allocator stats provider (set by the broker; None in tests/wasm).
@@ -430,6 +434,8 @@ impl AppState {
             ),
             sinks: Arc::new(sinks),
             inbound: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "views")]
+            view: None,
             surfaces: Arc::new(vec![Box::new(crate::Admin)]),
             limits: Arc::new(crate::bounds::LimitStats::default()),
             mem_stats: None,
@@ -462,6 +468,19 @@ impl AppState {
     pub fn with_policy(mut self, engine: Arc<dyn crate::policy::PolicyEngine>) -> Self {
         self.policy = Some(engine);
         self
+    }
+
+    /// This state narrowed to `view`: every operation served through the
+    /// returned state, and everything it spawns or calls in-process, is
+    /// composed with the view (ADR-0023). It shares the store and every
+    /// other handle; the in-process router memo is its own, so a call
+    /// through it never reuses a router built without the view.
+    #[cfg(feature = "views")]
+    pub fn with_view(&self, view: Arc<crate::views::CompiledView>) -> Self {
+        let mut st = self.clone();
+        st.view = Some(view);
+        st.inbound = Arc::new(std::sync::OnceLock::new());
+        st
     }
 
     /// The engine `/q/health` reports. No engine reports the built-in name:
