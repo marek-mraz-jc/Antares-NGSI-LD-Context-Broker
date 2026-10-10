@@ -117,6 +117,9 @@ pub struct TemporalFilter<'a> {
     /// `lastN`: per-(attr, datasetId) RANK() cap — ties all kept, so the
     /// per-attr lastN the API applies afterwards always finds its instances
     pub last_n: Option<i64>,
+    /// the cap keeps the OLDEST instances instead (firstN, TS 104 176
+    /// 6.4.7.3); same RANK() semantics, ascending
+    pub oldest_first: bool,
     /// ordering key for the lastN cap (the request's timeproperty)
     pub timeproperty: &'a str,
     /// Entity-level LIMIT/OFFSET pushdown (without it a temporal query
@@ -183,6 +186,7 @@ impl Default for TemporalFilter<'_> {
             attrs: None,
             range: None,
             last_n: None,
+            oldest_first: false,
             timeproperty: "observedAt",
             page: None,
             q: None,

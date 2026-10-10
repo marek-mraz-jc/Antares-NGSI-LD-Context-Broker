@@ -101,8 +101,14 @@ the seed value shows up:
   {"type": "Property", "observedAt": "2026-08-26T09:00:00Z", "value": 24.1, ...}]
 ```
 
-`lastN` must be a positive integer; `pick`/`omit` and `sysAttrs` apply as
-on the entity endpoints.
+`firstN=2` keeps the two oldest, oldest first. `offsetN` skips that many
+instances in the chosen order, so `lastN=2&offsetN=2` is the third and
+fourth newest; an `offsetN` past the end returns the last instance in that
+order (TS 104 176 Table 6.4.7.3-2). `firstN` and `lastN` must be positive
+integers, `offsetN` zero or more, and `firstN` with `lastN` together is a
+400 because one page cannot run both ways. A `temporalQ` object in a
+POST query carries the same three members. `pick`/`omit` and `sysAttrs`
+apply as on the entity endpoints.
 
 ### Aggregation
 
@@ -149,28 +155,35 @@ with 150k instances.
 
 ### Pagination
 
-One response carries at most nine instances per attribute. Beyond that
-the broker cuts the whole entity at one instant, answers `206 Partial
-Content` and names the window it served in `Content-Range`. Twelve hourly
-instances of a sensor:
+One response carries at most nine instances per attribute, and fewer
+when `firstN` or `lastN` asks for fewer. Every attribute is cut to the
+same count in the page order (oldest first, newest first with `lastN`),
+and the response links to its neighbours with `offsetN` moved by one page
+(TS 104 176 6.4.7.3). Twelve hourly instances of a sensor:
 
 ```text
 HTTP/1.1 206 Partial Content
+Link: </ngsi-ld/v1/temporal/entities/urn:ngsi-ld:TemperatureSensor:qs:2?attrs=temperature&format=temporalValues&offsetN=9>; rel="intervalafter";type="application/json"
 Content-Range: date-time 2026-08-25T00:00:00Z-2026-08-25T08:00:00Z/*
 {"id": "urn:ngsi-ld:TemperatureSensor:qs:2", "type": "TemperatureSensor",
  "temperature": {"type": "Property", "values": [[20.0, "2026-08-25T00:00:00Z"], ..., [28.0, "2026-08-25T08:00:00Z"]]}}
 ```
 
-Continue from the instant after the range end; the last page answers 200:
+Following `intervalafter` serves the rest and links back with
+`intervalbefore`; the last page has no forward link:
 
 ```text
-GET …?timerel=after&timeAt=2026-08-25T09:00:00Z&attrs=temperature&format=temporalValues
+GET …?attrs=temperature&format=temporalValues&offsetN=9
 HTTP/1.1 200 OK
+Link: <…&offsetN=0>; rel="intervalbefore";type="application/json"
 "values": [[29.0, "2026-08-25T09:00:00Z"], [30.0, "2026-08-25T10:00:00Z"], [31.0, "2026-08-25T11:00:00Z"]]
 ```
 
-Every attribute is trimmed to the same boundary, so no instance of any
-attribute falls between two pages. Aggregated representations are
+A `lastN` page runs backwards in time, so its next (older) page is
+`intervalbefore` and the one before it `intervalafter`. The `206` and
+`Content-Range` of a page cut by the nine-instance ceiling stay while the
+ETSI suite (020_13, 021_27) still asserts them; the range bounds the
+instants the body holds. Aggregated representations are
 computed over the whole evolution and are never cut. Entity-level paging
 of `GET /temporal/entities` uses `limit`/`offset` and `Link rel="next"`
 as the entity endpoints do.

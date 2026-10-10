@@ -1280,12 +1280,27 @@ fn scope_attrs(reg: &FedReg, ctx: &Context) -> Option<(String, String)> {
 /// winner would be arrival order.
 fn temporal_window(params: &HashMap<String, String>) -> Vec<(String, String)> {
     let mut query: Vec<(String, String)> = vec![("options".into(), "sysAttrs".into())];
-    for k in ["timerel", "timeAt", "endTimeAt", "timeproperty", "lastN"] {
+    for k in ["timerel", "timeAt", "endTimeAt", "timeproperty"] {
         if let Some(v) = params.get(k) {
             query.push((k.into(), v.clone()));
         }
     }
+    query.extend(instance_cap(params));
     query
+}
+
+/// firstN/lastN forwarded to a peer: every instance up to the end of the
+/// asked page, never offsetN. The merged evolution is paged here, so a peer
+/// that skipped offsetN itself would have this broker skip them twice.
+fn instance_cap(params: &HashMap<String, String>) -> Option<(String, String)> {
+    let offset: usize = params
+        .get("offsetN")
+        .and_then(|o| o.parse().ok())
+        .unwrap_or(0);
+    ["firstN", "lastN"].into_iter().find_map(|k| {
+        let n: usize = params.get(k)?.parse().ok()?;
+        Some((k.to_owned(), n.saturating_add(offset).to_string()))
+    })
 }
 
 /// 5.2.9 `attrs` again, on the way back: the scope narrows ATTRIBUTES, so the
@@ -2118,12 +2133,12 @@ pub(crate) async fn fed_entity_maps(
             "timeAt",
             "endTimeAt",
             "timeproperty",
-            "lastN",
         ] {
             if let Some(v) = params.get(k) {
                 query.push((k.to_owned(), v.clone()));
             }
         }
+        query.extend(instance_cap(params));
         if !split {
             for k in [
                 "attrs",

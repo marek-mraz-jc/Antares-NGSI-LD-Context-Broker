@@ -346,10 +346,11 @@ pub fn router(state: AppState) -> Router {
                 .put(attrs::replace_attr)
                 .delete(attrs::delete_attr),
         )
-        // 2.0 #15 pre-adoption: the bare attribute value
+        // 2.0 #15 pre-adoption: the bare attribute value; PUT is Set
+        // Attribute Value (TS 104 176 7.6.3.2)
         .route(
             "/entities/{id}/attrs/{attr}/value",
-            get(entities::retrieve_entity_attr_value),
+            get(entities::retrieve_entity_attr_value).put(attrs::set_attr_value),
         )
         // batch (6.14–6.17, 6.23, 6.31)
         .route("/entityOperations/create", post(batch::batch_create))

@@ -301,6 +301,9 @@ struct Windowed {
     ts_min: Option<String>,
     ts_max: Option<String>,
     truncated: bool,
+    /// some Attribute holds instances past this page in its order: the
+    /// response links to the next page (6.4.7.3)
+    more: bool,
 }
 
 /// NGSI-LD 6.3.10: the most instances of one Attribute the broker serves in
@@ -310,42 +313,27 @@ struct Windowed {
 const TEMPORAL_INSTANCE_LIMIT: usize = 9;
 
 /// 6.3.10: the ceiling is a CUT, not a label. An Attribute holding more
-/// instances than the broker serves at once is truncated to the ceiling in
-/// the query direction, and the 206 + Content-Range then describes the
-/// instances actually returned. This is what caps a lastN above the ceiling
-/// and what caps a request naming no temporal window at all. Aggregated
+/// instances than the broker serves at once is cut to the ceiling in the
+/// page order, and the 206 + Content-Range then describes the instances
+/// actually returned. This is what caps a lastN above the ceiling and what
+/// caps a request naming no temporal window at all. Aggregated
 /// representations (5.7.4.4) are computed over the whole evolution and are
 /// complete by construction, so they are never cut.
 ///
-/// The cut is ONE time boundary for the whole entity, not a per-attribute
-/// count: the partial content "shall" be the representation the
-/// Content-Range describes, so every attribute is trimmed to the tightest
-/// ceiling instant among the over-full ones (ties at that instant kept),
-/// and a client continuing from the advertised range-end misses no instance
-/// of any attribute. An attribute lying entirely beyond the boundary comes
-/// back empty on this page.
-fn truncate(w: &mut Windowed, timeprop: &str, descending: bool) {
+/// The cut is a count per Attribute (TS 104 176 6.4.7.3: the page "limits
+/// the number of Attribute instances for any Attribute in a response"), so
+/// the next page is exactly offsetN plus the page size for every Attribute
+/// at once and the interval Links never skip or repeat an instance.
+fn truncate(w: &mut Windowed, timeprop: &str) {
     if w.max_per_attr <= TEMPORAL_INSTANCE_LIMIT {
         return;
     }
     w.truncated = true;
+    w.more = true;
     w.max_per_attr = TEMPORAL_INSTANCE_LIMIT;
-    let key = |inst: &Value| inst.get(timeprop).and_then(Value::as_str).map(dt_key);
-    // the tightest ceiling instant: earliest forwards, latest backwards
-    let boundary = w
-        .attrs
-        .values()
-        .filter(|insts| insts.len() > TEMPORAL_INSTANCE_LIMIT)
-        .filter_map(|insts| key(&insts[TEMPORAL_INSTANCE_LIMIT - 1]))
-        .reduce(|a, b| if (b < a) != descending { b } else { a });
     let (mut ts_min, mut ts_max) = (None::<String>, None::<String>);
     for instances in w.attrs.values_mut() {
-        match &boundary {
-            Some(bd) => instances.retain(|inst| {
-                key(inst).is_none_or(|k| if descending { k >= *bd } else { k <= *bd })
-            }),
-            None => instances.truncate(TEMPORAL_INSTANCE_LIMIT),
-        }
+        instances.truncate(TEMPORAL_INSTANCE_LIMIT);
         for inst in instances.iter() {
             if let Some(t) = inst.get(timeprop).and_then(Value::as_str) {
                 if ts_min.as_deref().is_none_or(|m| dt_key(t) < dt_key(m)) {
@@ -413,7 +401,7 @@ fn scope_set_time(i: &Value) -> Option<&str> {
 fn window(
     doc: &Value,
     tq: Option<&TemporalQ>,
-    last_n: Option<usize>,
+    page: InstancePage,
     attrs_filter: Option<&Vec<String>>,
     omit: Option<&Vec<crate::repr::ProjNode>>,
     dataset: Option<&Vec<String>>,
@@ -425,6 +413,7 @@ fn window(
         ts_min: None,
         ts_max: None,
         truncated: false,
+        more: false,
     };
     let Some(obj) = doc.as_object() else { return w };
     for (k, v) in obj {
@@ -491,12 +480,20 @@ fn window(
             let tb = b.get(timeprop).and_then(Value::as_str).unwrap_or("");
             dt_key(ta).cmp(&dt_key(tb))
         });
-        if let Some(n) = last_n {
-            if instances.len() > n {
-                instances = instances.split_off(instances.len() - n);
-            }
-            // lastN delivers newest-first (DESC), Scorpio parity
+        // 6.4.7.3: lastN pages newest first, firstN and neither oldest first
+        if page.desc {
             instances.reverse();
+        }
+        // Table 6.4.7.3-2: an offsetN past the end "should be assumed to be
+        // equal to the size of the result set, i.e. only the last element
+        // of the result set is to be returned"
+        let skip = page.offset.min(instances.len().saturating_sub(1));
+        instances.drain(..skip);
+        if let Some(n) = page.n {
+            if instances.len() > n {
+                instances.truncate(n);
+                w.more = true;
+            }
         }
         if instances.is_empty() {
             continue;
@@ -523,7 +520,7 @@ fn content_range(
     ts_min: Option<&str>,
     ts_max: Option<&str>,
     tq: Option<&TemporalQ>,
-    last_n: Option<usize>,
+    page: InstancePage,
 ) -> Option<String> {
     if !truncated {
         return None;
@@ -533,7 +530,7 @@ fn content_range(
     // on the pair keeps the timerel and the query that produced it together,
     // so no arm can reach for a query that is not there.
     let named = tq.filter(|t| t.timerel != "any");
-    let (start, end) = if last_n.is_none() {
+    let (start, end) = if !page.desc {
         let start = match named.map(|t| (t.timerel.as_str(), t)) {
             Some(("after" | "between", t)) => t.time_at.clone(),
             _ => data_min.to_owned(),
@@ -549,9 +546,50 @@ fn content_range(
     };
     // start/end bound the instances actually returned; the size is the length
     // of the complete representation the client asked for — the requested
-    // lastN, or "*" when the window leaves it unknown.
-    let size = last_n.map_or_else(|| "*".to_owned(), |n| n.to_string());
+    // firstN or lastN, or "*" when the window leaves it unknown.
+    let size = page.n.map_or_else(|| "*".to_owned(), |n| n.to_string());
     Some(format!("date-time {start}-{end}/{size}"))
+}
+
+/// TS 104 176 6.4.7.3: the Links to the neighbouring instance pages, each
+/// the request with offsetN moved by one page and typed with the response
+/// media type. Ascending pages run forward in time, so their next page is
+/// `intervalafter` and their previous one `intervalbefore`; lastN pages run
+/// backward and swap the two. `step` is the page size served per Attribute.
+fn interval_links(
+    params: &HashMap<String, String>,
+    path: &str,
+    accept: Accept,
+    page: InstancePage,
+    more: bool,
+    step: usize,
+) -> Vec<String> {
+    let (forward, back) = match page.desc {
+        false => ("intervalafter", "intervalbefore"),
+        true => ("intervalbefore", "intervalafter"),
+    };
+    let link = |offset: usize, rel: &str| {
+        let mut qp: Vec<String> = params
+            .iter()
+            .filter(|(k, _)| k.as_str() != "offsetN")
+            .map(|(k, v)| format!("{k}={}", crate::paging::query_value(v)))
+            .collect();
+        qp.push(format!("offsetN={offset}"));
+        qp.sort();
+        format!(
+            "<{path}?{}>; rel=\"{rel}\";type=\"{}\"",
+            qp.join("&"),
+            crate::paging::link_media_type(accept)
+        )
+    };
+    let mut links = Vec::new();
+    if more {
+        links.push(link(page.offset.saturating_add(step), forward));
+    }
+    if page.offset > 0 {
+        links.push(link(page.offset.saturating_sub(step), back));
+    }
+    links
 }
 
 /// Render one temporal entity from its windowed data.
@@ -743,6 +781,78 @@ fn present_temporal(
     Ok(Value::Object(out))
 }
 
+/// TS 104 176 6.4.7.3: which instances of each Attribute one response
+/// carries. firstN pages oldest first, lastN newest first, neither oldest
+/// first; offsetN skips that many in the chosen order.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+pub(crate) struct InstancePage {
+    /// lastN: newest first
+    desc: bool,
+    /// the firstN or lastN asked for
+    n: Option<usize>,
+    /// offsetN
+    offset: usize,
+}
+
+impl InstancePage {
+    /// firstN, lastN and offsetN, validated: N positive (5.2.21), offsetN
+    /// not negative (Table 6.4.7.3-2), both at most i64::MAX (bound as a
+    /// `bigint` they would wrap negative and silently select nothing).
+    /// firstN asks for ascending order and lastN for descending; one page
+    /// cannot be both, so the pair is BadRequestData.
+    fn parse(params: &HashMap<String, String>) -> Result<Self, NgsiError> {
+        let count = |name: &str, min: usize| -> Result<Option<usize>, NgsiError> {
+            params
+                .get(name)
+                .map(|v| {
+                    v.parse::<usize>()
+                        .ok()
+                        .filter(|n| *n >= min && *n <= i64::MAX as usize)
+                        .ok_or_else(|| NgsiError::BadRequestData(format!("invalid {name} {v:?}")))
+                })
+                .transpose()
+        };
+        let (first, last) = (count("firstN", 1)?, count("lastN", 1)?);
+        if first.is_some() && last.is_some() {
+            return Err(NgsiError::BadRequestData(
+                "firstN pages ascending and lastN descending: give one of them (6.4.7.3)".into(),
+            ));
+        }
+        Ok(Self {
+            desc: last.is_some(),
+            n: first.or(last),
+            offset: count("offsetN", 0)?.unwrap_or(0),
+        })
+    }
+
+    /// The most instances of one Attribute a page holds: N, or the broker's
+    /// ceiling when N is above it or absent (6.4.7.3 "whichever is smaller").
+    fn size(&self) -> usize {
+        self.n
+            .map_or(TEMPORAL_INSTANCE_LIMIT, |n| n.min(TEMPORAL_INSTANCE_LIMIT))
+    }
+
+    /// How far one page moves offsetN: its size, or N itself for an
+    /// aggregated representation, which the ceiling never cuts.
+    fn step(&self, aggregated: bool) -> usize {
+        match (aggregated, self.n) {
+            (true, Some(n)) => n,
+            _ => self.size(),
+        }
+    }
+
+    /// The per-Attribute cap a store may apply before the window: every
+    /// instance up to the end of this page in its order, and one more, so
+    /// the window still sees whether a next page exists.
+    fn store_cap(&self) -> Option<i64> {
+        self.n.map(|n| {
+            n.saturating_add(self.offset)
+                .saturating_add(1)
+                .min(i64::MAX as usize) as i64
+        })
+    }
+}
+
 /// Parsed temporal representation params (options/format/lastN/pick/omit/
 /// datasetId/aggregation), fully validated up front.
 #[derive(Default, Clone)]
@@ -750,7 +860,7 @@ pub(crate) struct TRepr {
     temporal_values: bool,
     aggregated: bool,
     sys: bool,
-    last_n: Option<usize>,
+    page: InstancePage,
     pick: Option<Vec<crate::repr::ProjNode>>,
     omit: Option<Vec<crate::repr::ProjNode>>,
     dataset_id: Option<Vec<String>>,
@@ -880,26 +990,7 @@ pub(crate) fn parse_trepr(
     r.dataset_id = params
         .get("datasetId")
         .map(|s| s.split(',').map(|d| d.trim().to_owned()).collect());
-    r.last_n = match params.get("lastN") {
-        Some(n) => {
-            // 5.2.21: lastN is a POSITIVE integer — 0 is outside the value
-            // space.
-            let v = n
-                .parse::<usize>()
-                .ok()
-                .filter(|v| *v >= 1)
-                .ok_or_else(|| NgsiError::BadRequestData(format!("invalid lastN {n:?}")))?;
-            // Above i64::MAX it wraps negative when bound as the RANK cap
-            // (`rk <= $n::bigint`), silently returning an empty set.
-            if v > i64::MAX as usize {
-                return Err(NgsiError::BadRequestData(format!(
-                    "lastN {v} is out of range"
-                )));
-            }
-            Some(v)
-        }
-        None => None,
-    };
+    r.page = InstancePage::parse(params)?;
     if let Some(m) = params.get("aggrMethods") {
         for method in m.split(',') {
             let method = method.trim();
@@ -1592,6 +1683,7 @@ fn respond_aggregated(
         ts_min: None,
         ts_max: None,
         truncated: false,
+        more: false,
     };
     let mut payload: Vec<Value> = Vec::new();
     for d in &page {
@@ -1877,6 +1969,8 @@ pub(crate) async fn query_temporal_collected(
             "aggrMethods",
             "aggrPeriodDuration",
             "lastN",
+            "firstN",
+            "offsetN",
             "limit",
             "offset",
             "count",
@@ -1955,7 +2049,7 @@ pub(crate) async fn query_temporal_collected(
     crate::repr::narrow_projection(&mut trepr.pick, &mut trepr.omit, filter, &ctx)?;
     // 5.7.4.4: {…} projection is Linked Entity retrieval — unconditional 400
     reject_linked_projection(&trepr, "5.7.4.4")?;
-    let last_n = trepr.last_n;
+    let page_n = trepr.page;
 
     let ids: Option<Vec<&str>> = params.get("id").map(|s| s.split(',').collect());
     // 5.7.4.4: an invalid URI in the id list is BadRequestData
@@ -2053,7 +2147,7 @@ pub(crate) async fn query_temporal_collected(
         && exact_push
         && push_page
         && trepr.omit.is_none()
-        && last_n.is_none()
+        && page_n == InstancePage::default()
         && !matches!(trepr.aggr_period, AggrPeriod::Months(..))
         && params.get("entityMap").map(String::as_str) != Some("true")
         && trepr
@@ -2079,10 +2173,8 @@ pub(crate) async fn query_temporal_collected(
                     end_time_at: t.end_time_at.as_deref(),
                     timeproperty: &t.timeproperty,
                 }),
-            last_n: match (last_n, exact_push && !ruled) {
-                (Some(n), true) => Some(n as i64),
-                _ => None,
-            },
+            last_n: page_n.store_cap().filter(|_| exact_push && !ruled),
+            oldest_first: !page_n.desc,
             timeproperty: tq
                 .as_ref()
                 .map_or("observedAt", |t| t.timeproperty.as_str()),
@@ -2247,6 +2339,7 @@ pub(crate) async fn query_temporal_collected(
     let core_only_pick = attrs_filter.as_ref().is_some_and(Vec::is_empty);
     let mut payload: Vec<Value> = Vec::new();
     let (mut g_trunc, mut g_min, mut g_maxts) = (false, None::<String>, None::<String>);
+    let mut g_more = false;
     // ADR-0023 rule 11: each Entity's history was narrowed by its rules in
     // the loop above, before the window, so lastN counts only what may be
     // seen (rule 8)
@@ -2254,16 +2347,17 @@ pub(crate) async fn query_temporal_collected(
         let mut w = window(
             d,
             tq.as_ref(),
-            last_n,
+            page_n,
             attrs_filter.as_ref(),
             trepr.omit.as_ref(),
             trepr.dataset_id.as_ref(),
             &timeprop,
         );
         if !trepr.aggregated {
-            truncate(&mut w, &timeprop, last_n.is_some());
+            truncate(&mut w, &timeprop);
         }
         g_trunc |= w.truncated;
+        g_more |= w.more;
         if let Some(m) = &w.ts_min {
             if g_min.as_deref().is_none_or(|c| dt_key(m) < dt_key(c)) {
                 g_min = Some(m.clone());
@@ -2295,7 +2389,7 @@ pub(crate) async fn query_temporal_collected(
             g_min.as_deref(),
             g_maxts.as_deref(),
             tq.as_ref(),
-            last_n,
+            page_n,
         )
     };
     let status = if cr.is_some() {
@@ -2311,6 +2405,18 @@ pub(crate) async fn query_temporal_collected(
         }
     }
     attach_paging(&mut resp, count_hdr, &links);
+    attach_paging(
+        &mut resp,
+        None,
+        &interval_links(
+            params,
+            "/ngsi-ld/v1/temporal/entities",
+            accept,
+            page_n,
+            g_more,
+            page_n.step(trepr.aggregated),
+        ),
+    );
     // 6.18.3.2: entityMap=true — the temporal EntityMap for this query is
     // (re)created; the response carries NGSILD-EntityMap and 201 Created.
     if params.get("entityMap").map(String::as_str) == Some("true") {
@@ -2373,6 +2479,8 @@ async fn retrieve_temporal_inner(
                 "endTimeAt",
                 "timeproperty",
                 "lastN",
+                "firstN",
+                "offsetN",
                 "aggrMethods",
                 "aggrPeriodDuration",
                 "options",
@@ -2396,7 +2504,7 @@ async fn retrieve_temporal_inner(
         // use of Linked Entity retrieval, an error of type BadRequestData
         // shall be raised" — unconditional, temporal defines no join.
         reject_linked_projection(&trepr, "5.7.3.4")?;
-        let last_n = trepr.last_n;
+        let page_n = trepr.page;
         antares_model::EntityId::new(id)?;
         // ADR-0023 rule 11: rules rebuild each instance's state from the
         // whole history, so nothing is pruned in the store under them
@@ -2414,7 +2522,8 @@ async fn retrieve_temporal_inner(
                     end_time_at: t.end_time_at.as_deref(),
                     timeproperty: &t.timeproperty,
                 }),
-            last_n: last_n.filter(|_| !ruled).map(|n| n as i64),
+            last_n: page_n.store_cap().filter(|_| !ruled),
+            oldest_first: !page_n.desc,
             timeproperty: tq
                 .as_ref()
                 .map_or("observedAt", |t| t.timeproperty.as_str()),
@@ -2508,14 +2617,14 @@ async fn retrieve_temporal_inner(
         let mut w = window(
             &doc,
             tq.as_ref(),
-            last_n,
+            page_n,
             attrs_filter.as_ref(),
             trepr.omit.as_ref(),
             trepr.dataset_id.as_ref(),
             &timeprop,
         );
         if !trepr.aggregated {
-            truncate(&mut w, &timeprop, last_n.is_some());
+            truncate(&mut w, &timeprop);
         }
         let cr = if trepr.aggregated {
             None
@@ -2525,7 +2634,7 @@ async fn retrieve_temporal_inner(
                 w.ts_min.as_deref(),
                 w.ts_max.as_deref(),
                 tq.as_ref(),
-                last_n,
+                page_n,
             )
         };
         let payload = present_temporal(&doc, &w, &ctx, &trepr, tq.as_ref(), &timeprop)?;
@@ -2543,6 +2652,21 @@ async fn retrieve_temporal_inner(
             StatusCode::OK
         };
         let mut resp = respond(status, payload, &ctx, accept, &tenant);
+        attach_paging(
+            &mut resp,
+            None,
+            &interval_links(
+                params,
+                &format!(
+                    "/ngsi-ld/v1/temporal/entities/{}",
+                    crate::federation::path_segment(id)
+                ),
+                accept,
+                page_n,
+                w.more,
+                page_n.step(trepr.aggregated),
+            ),
+        );
         if let Some(cr) = cr {
             if let Ok(v) = cr.parse() {
                 resp.headers_mut().insert("Content-Range", v);
@@ -3516,9 +3640,18 @@ mod clause_6_3_10 {
     }
 
     async fn windowed(doc: &Value, tq: Option<&TemporalQ>, last_n: Option<usize>) -> Windowed {
-        let mut w = window(doc, tq, last_n, None, None, None, "observedAt");
-        truncate(&mut w, "observedAt", last_n.is_some());
+        let mut w = window(doc, tq, page(last_n), None, None, None, "observedAt");
+        truncate(&mut w, "observedAt");
         w
+    }
+
+    /// The page of a request naming lastN, or neither firstN nor lastN.
+    fn page(last_n: Option<usize>) -> InstancePage {
+        InstancePage {
+            desc: last_n.is_some(),
+            n: last_n,
+            offset: 0,
+        }
     }
 
     fn observed(w: &Windowed) -> Vec<&str> {
@@ -3559,7 +3692,7 @@ mod clause_6_3_10 {
                 w.ts_min.as_deref(),
                 w.ts_max.as_deref(),
                 Some(&q),
-                None
+                page(None)
             ),
             Some(format!(
                 "date-time 2019-01-01T00:00:00Z-{}/*",
@@ -3584,46 +3717,31 @@ mod clause_6_3_10 {
             .max()
     }
 
-    /// 6.3.10: the partial content IS the representation the Content-Range
-    /// describes — so the cut is one time boundary for the whole entity.
-    /// With `speed` over-full first, `heading` is trimmed to the same last
-    /// instant, and nothing of either attribute lies past the advertised
-    /// range-end (a client continuing from it misses no instance).
+    /// TS 104 176 6.4.7.3: the page "limits the number of Attribute
+    /// instances for any Attribute", so the ceiling cuts each Attribute to
+    /// the same COUNT in the page order and the next page starts at the same
+    /// offsetN for all of them. The Content-Range bounds what the body holds.
     #[tokio::test]
-    async fn the_cut_is_one_time_boundary_across_attributes() {
+    async fn the_cut_is_one_count_per_attribute() {
         let w = windowed(&evolution2(21, 31), None, None).await;
-        assert!(w.truncated);
-        let end = at(TEMPORAL_INSTANCE_LIMIT - 1);
+        assert!(w.truncated && w.more);
         assert_eq!(w.attrs["speed"].len(), TEMPORAL_INSTANCE_LIMIT);
-        assert_eq!(last_observed(&w, "speed").as_deref(), Some(end.as_str()));
-        assert_eq!(
-            last_observed(&w, "heading").as_deref(),
-            Some(end.as_str()),
-            "heading must stop at speed's boundary, not at its own ninth instance"
-        );
-        assert_eq!(w.attrs["heading"].len(), TEMPORAL_INSTANCE_LIMIT - 5);
+        assert_eq!(w.attrs["heading"].len(), TEMPORAL_INSTANCE_LIMIT);
+        assert_eq!(w.attrs["heading"][0]["observedAt"], json!(at(5)));
+        let end = at(5 + TEMPORAL_INSTANCE_LIMIT - 1);
+        assert_eq!(last_observed(&w, "heading").as_deref(), Some(end.as_str()));
+        assert_eq!(w.ts_min.as_deref(), Some(at(0).as_str()));
         assert_eq!(w.ts_max.as_deref(), Some(end.as_str()));
-        for inst in w.attrs["heading"].iter().chain(w.attrs["speed"].iter()) {
-            assert!(
-                inst["observedAt"].as_str().expect("t") <= end.as_str(),
-                "no instance may lie past the advertised range-end: {inst}"
-            );
-        }
-        // backwards (lastN): the boundary is the LATEST ninth instant, so the
-        // page covers [heading's ninth-newest, newest] and `speed`, which ends
-        // before that, is empty on this page rather than incoherently present
+        // backwards (lastN): each Attribute's newest nine
         let w = windowed(&evolution2(21, 31), None, Some(20)).await;
         assert!(w.truncated);
         assert_eq!(w.attrs["heading"].len(), TEMPORAL_INSTANCE_LIMIT);
         assert_eq!(w.attrs["heading"][0]["observedAt"], json!(at(30)));
+        assert_eq!(w.attrs["speed"].len(), TEMPORAL_INSTANCE_LIMIT);
+        assert_eq!(w.attrs["speed"][0]["observedAt"], json!(at(20)));
         assert_eq!(
             w.ts_min.as_deref(),
-            Some(at(30 - TEMPORAL_INSTANCE_LIMIT + 1).as_str())
-        );
-        assert!(
-            w.attrs["speed"].is_empty(),
-            "speed lies entirely before the page boundary: {:?}",
-            w.attrs["speed"]
+            Some(at(21 - TEMPORAL_INSTANCE_LIMIT).as_str())
         );
     }
 
@@ -3650,7 +3768,7 @@ mod clause_6_3_10 {
                 w.ts_min.as_deref(),
                 w.ts_max.as_deref(),
                 None,
-                Some(20)
+                page(Some(20))
             ),
             Some(format!(
                 "date-time {}-{}/20",
@@ -3679,7 +3797,7 @@ mod clause_6_3_10 {
                 w.ts_min.as_deref(),
                 w.ts_max.as_deref(),
                 None,
-                None
+                page(None)
             ),
             Some(format!(
                 "date-time {}-{}/*",
@@ -3703,7 +3821,7 @@ mod clause_6_3_10 {
                 w.ts_min.as_deref(),
                 w.ts_max.as_deref(),
                 None,
-                None
+                page(None)
             ),
             None
         );
@@ -3966,6 +4084,7 @@ mod clause_4_5_19 {
             ts_min: times.first().map(|s| (*s).to_owned()),
             ts_max: times.last().map(|s| (*s).to_owned()),
             truncated: false,
+            more: false,
         }
     }
 
@@ -4134,6 +4253,7 @@ mod clause_4_5_19 {
             ts_min: times.first().cloned(),
             ts_max: times.last().cloned(),
             truncated: false,
+            more: false,
         }
     }
 

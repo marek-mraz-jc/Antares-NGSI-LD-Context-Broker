@@ -174,11 +174,19 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
             // on the same canonical key the window compares on — raw bytes
             // put "…00.000Z" after "…00Z" and kept the wrong N.
             let order_key = crate::compile::temporal::dt_key_sql(&format!("(ai.data ->> ${tp})"));
+            // firstN keeps the N oldest (TS 104 176 6.4.7.3), the exact
+            // reverse: the API window sorts an instance without the
+            // timeproperty before every instant, so it ranks first ascending
+            let dir = if f.oldest_first {
+                "ASC NULLS FIRST"
+            } else {
+                "DESC NULLS LAST"
+            };
             format!(
                 "COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (\
                    SELECT s.attr_id, jsonb_agg(s.data ORDER BY s.created_at, s.observed_at, s.instance_id) AS insts \
                    FROM (SELECT ai.*, rank() OVER (PARTITION BY ai.attr_id, ai.data ->> 'datasetId' \
-                             ORDER BY {order_key} DESC NULLS LAST) AS rk \
+                             ORDER BY {order_key} {dir}) AS rk \
                          FROM attr_instances ai \
                          WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{range_and}) s \
                    WHERE s.rk <= ${n_bind}::bigint GROUP BY s.attr_id) g), '{{}}'::jsonb)"
@@ -1063,6 +1071,19 @@ mod tests {
             "{expr}"
         );
         assert!(expr.contains("COLLATE \"C\" DESC NULLS LAST"), "{expr}");
+        assert_eq!(binds, vec!["observedAt", "5"]);
+    }
+
+    #[test]
+    fn first_n_ranks_the_oldest_first() {
+        let f = TemporalFilter {
+            last_n: Some(5),
+            oldest_first: true,
+            ..Default::default()
+        };
+        let (expr, binds) = attr_object_expr(&f, 1).expect("compiles");
+        assert!(expr.contains("COLLATE \"C\" ASC NULLS FIRST"), "{expr}");
+        assert!(!expr.contains("DESC"), "{expr}");
         assert_eq!(binds, vec!["observedAt", "5"]);
     }
 

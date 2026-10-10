@@ -63,7 +63,7 @@ module's header comment.
 | `negotiate.rs` | 2 000 | 6.3.4–6.3.6: tenant, Accept, Content-Type, `@context` resolution, parameter allow-lists (the query set of 6.4.3.2 included) and the RFC 7230 header-syntax checks. Every handler passes through `tenant_from`, `check_params`, `parse_body`, `request_context` |
 | `entities.rs` | 3 700 | 5.6.1–5.6.6, 5.7.1–5.7.2 `/entities`, distributed write fan-out |
 | `paging.rs` | 1 400 | 4.12, 6.3.10 limit/offset/count and the next/prev links, 4.23 ordering and ICU collation, 6.3.17 `NGSILD-Warning`, the query body of 5.2.23 lifted into parameters; every list operation pages through it |
-| `attrs.rs` | 1 900 | 5.6.2–5.6.5 attribute operations |
+| `attrs.rs` | 2 200 | 5.6.2–5.6.5 attribute operations, 10.2.6 Set Attribute Value |
 | `batch.rs` | 2 240 | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
 | `temporal.rs` | 4 100 | 5.6.11–5.6.16, 5.7.3–5.7.4 `/temporal/entities` |
 | `temporalq.rs` | 200 | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |
@@ -73,7 +73,7 @@ module's header comment.
 | `distsub.rs` | 1 750 | 5.8.1.4 distributed subscriptions, consumer half |
 | `csource.rs` | 2 200 | 5.9, 5.10 registrations, `csource_index` maintenance |
 | `registry.rs` | 530 | matching over a registration document: `CsrSpec`, the 4.3.6.1 information match, csf and scope filters, the temporal interval and expiry of a registration, the 5.11.2 subscription match; named by federation, notify, csource and every resource module that forwards |
-| `federation.rs` | 3 500 | 4.3.6, 5.12, 6.3.17–6.3.19 forwarding, fan-out, result merge |
+| `federation.rs` | 3 900 | 4.3.6, 5.12, 6.3.17–6.3.19 forwarding, fan-out, result merge |
 | `entity_maps.rs` | 370 | 5.14 the `/entityMaps` resources (6.32, 6.34, 6.35): create from a query, retrieve, update, delete |
 | `entity_map.rs` | 850 | one EntityMap document (5.2.39): store it under its tenant with a lifetime, read it back while it lives, take a page's candidate ids from it, merge what a distributed query reached, and serve a retrieve through a presented map |
 | `snapshots.rs` | 2 000 | 5.16 snapshots under synthetic `snap-…` tenants |

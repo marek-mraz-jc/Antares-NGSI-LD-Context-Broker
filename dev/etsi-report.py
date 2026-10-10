@@ -10,6 +10,8 @@ Writes  $RESULTS/resource-samples.csv  same rows + a `test` column: every
                                        traceable to a test, not just a suite
         $RESULTS/resource-by-test.csv  per test × container rollup
                                        (samples, cpu avg/peak, rss avg/peak)
+        $RESULTS/tp-status.csv         EVERY TP that ran, with its status:
+                                       what dev/etsi-baseline.py gates on
         $RESULTS/failures.csv          EVERY failing TP with its message —
                                        the markdown only shows the first 50
         $RESULTS/run-summary.md        the human view, incl. the spike tables
@@ -47,7 +49,7 @@ def epoch(stamp):
 
 
 # ---------------------------------------------------------------- suites
-suites, failures, intervals, suite_spans = [], [], [], []
+suites, failures, intervals, suite_spans, tp_rows = [], [], [], [], []
 total_pass = total_fail = 0
 
 for path in sorted(glob.glob(f"{RESULTS}/*/output.xml")):
@@ -113,10 +115,16 @@ for path in sorted(glob.glob(f"{RESULTS}/*/output.xml")):
                 msgs.append(" ".join(m.text.split()))
         return ran, " | ".join(dict.fromkeys(msgs))
 
+    # a TP is named by its file and its name: two files may share a name
+    source_of = {t: (s.get("source") or "").split("ngsi-ld-test-suite/")[-1]
+                 for s in root.iter("suite") for t in s.findall("test")}
     for test in root.iter("test"):
         st = test.find("status")
         if st is None:
             continue
+        tp_rows.append({"suite": name, "source": source_of.get(test, ""),
+                        "test": test.get("name") or "?", "status": st.get("status") or "?",
+                        "tags": ";".join(t.text or "" for t in test.iter("tag"))})
         msg = (st.text or "").strip()
         start, end = span(test)
         if start is not None and end is not None:
@@ -162,6 +170,11 @@ def label(ts):
             return name, "(between tests)"
     return "", ""
 
+
+with open(f"{RESULTS}/tp-status.csv", "w", newline="") as fh:
+    w = csv.DictWriter(fh, ["suite", "source", "test", "status", "tags"])
+    w.writeheader()
+    w.writerows(tp_rows)
 
 with open(f"{RESULTS}/failures.csv", "w", newline="") as fh:
     w = csv.DictWriter(fh, ["suite", "test", "tags", "start", "elapsed_s",

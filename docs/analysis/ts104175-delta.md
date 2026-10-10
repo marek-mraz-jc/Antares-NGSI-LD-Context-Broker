@@ -102,9 +102,9 @@ Each entry: what the old and new texts say (quotes kept to the deciding sentence
 - Old: CIM 009 has `lastN` only (6.18.3.2, `docs/spec/6/6.18.3.2.md`) and pages a truncated answer with 206 and `Content-Range` (6.3.10, `docs/spec/6/6.3.10.md`).
 - New: TS 104 175 7.4.2.5 "Temporal pagination can be done in ascending order using the firstN parameter and in descending order using the lastN parameter … offsetN is used to select the respective page in the chosen order"; TS 104 176 6.4.7.3: pages are Links `rel="intervalafter"` / `"intervalbefore"`. Neither document mentions 206 or `Content-Range`. `limit`/`offset` still page Entities; `firstN`/`lastN` cap instances per Attribute.
 - Code: `crates/antares-api/src/temporal.rs` `lastN` :880, `window` :413, `content_range` :526, allowlist `check_params` :1738-1777; `paging.rs:898` (`temporalQ.lastN`); `antares_store::filter::TemporalFilter::last_n` (`crates/antares-store/src/filter.rs:116`). Cypher: `MATCH (s:Symbol) WHERE s.lang='rust' AND NOT s.external AND (lower(s.name) CONTAINS 'lastn' OR lower(s.name) CONTAINS 'firstn' OR lower(s.name) CONTAINS 'offsetn' OR lower(s.name) CONTAINS 'last_n' OR lower(s.name) CONTAINS 'first_n') RETURN s.path, s.kind, s.file, s.line, s.is_test LIMIT 60`
-- Behaviour: `?firstN=` and `?offsetN=` answer 400 unknown parameter; a `temporalQ` body reads `lastN` only; truncation answers `Content-Range: date-time …` and no interval Link.
-- Compliant: `lastN` yes; `firstN`, `offsetN` and the interval Links **no**.
-- Tests: `clause_6_3_10::last_n_above_the_ceiling_is_clamped_to_it` (temporal.rs), `last_n_caps_with_rank_per_attr_and_dataset_never_row_number` (antares-sql), robot 020_05_*, 020_13_*, 021_27_*. Nothing exercises `firstN`/`offsetN`. Gap: **T-3456** (with an owner decision on 206).
+- Behaviour (T-3456): `firstN` pages oldest first, `lastN` newest first, neither oldest first; `offsetN` skips in that order and past the end returns the last instance (Table 6.4.7.3-2); `firstN` with `lastN` is 400 BadRequestData. The query string and the `temporalQ` body read all three. Each Attribute is cut to the same count (`min(N, 9)`), and the response carries `Link` `rel="intervalafter"`/`"intervalbefore"` with `offsetN` moved by one page and `type` equal to the response media type. The pg store ranks per Attribute and datasetId, ascending for `firstN`, capped at `N + offsetN + 1`. Federation forwards `firstN`/`lastN` as `N + offsetN` and never `offsetN`. Owner decision (2026-10-10): `206` + `Content-Range` stay on a page cut by the ceiling while robot 020_13/021_27 assert them.
+- Compliant: yes.
+- Tests: `tests/temporal_pagination_7_4_2_5.rs` (6, memory and pg), `clause_6_3_10::the_cut_is_one_count_per_attribute` and `last_n_above_the_ceiling_is_clamped_to_it` (temporal.rs), `first_n_ranks_the_oldest_first` and `last_n_caps_with_rank_per_attr_and_dataset_never_row_number` (antares-sql), robot 020_05_*, 020_13_*, 021_27_*.
 
 ### 3.3 `join`, `joinLevel`, `containedBy`
 
@@ -166,7 +166,7 @@ New matter: requirements INT-1 to INT-4 (clause 4) and the Atomic Entity / Seale
 ### 3.10 New attribute operations
 
 - Retrieve Attribute Value (TS 104 175 10.4.4; TS 104 176 7.5.3.1 GET/HEAD on `…/attrs/{attrId}`, 7.6.3.1 on `…/attrs/{attrId}/value`): Antares serves both as pre-adoptions (`crates/antares-api/src/lib.rs:338-349`, `entities::retrieve_entity_attr` / `retrieve_entity_attr_value` → `retrieve_attr_inner` :2303). Compliant yes for the routes; test `preadoptions_attr_get_value_options_head` (lib.rs:2703). Each 10.4.4.4 behaviour bullet is not audited one by one here: part of T-3461.
-- Set Attribute Value (TS 104 175 10.2.6; TS 104 176 7.6.3.2 PUT `…/attrs/{attrId}/value`): **missing**; the route has GET only (lib.rs:346-349), PUT answers 405. Gap: **T-3450**.
+- Set Attribute Value (TS 104 175 10.2.6; TS 104 176 7.6.3.2 PUT `…/attrs/{attrId}/value`): served since T-3450 (`attrs::set_attr_value`). The stored instance keeps its type and sub-Attributes; the type's value member is replaced after term expansion; observedAt follows the `observedAt` parameter or is removed; `datasetId` and `type` select the instance and Entity. Every 10.2.6.4 error bullet answers as written (BadRequestData, InvalidRequest for null except in a JsonProperty, ResourceNotFound). Gated as Replace Attribute (5.6.19). Forwarded to exclusive, redirect and inclusive sources supporting `replaceAttrs` on their own value resource (9.2 names no operation for 10.2.6). Compliant yes; tests `tests/set_attribute_value_10_2_6.rs` (3) and `policy_pre_image` (two PUT …/value cases).
 - Attribute fragments (TS 104 175 5.4.2) are the payload of both; audited with them.
 - Cypher: `MATCH (s:Symbol) WHERE s.lang='rust' AND NOT s.external AND (s.name CONTAINS 'retrieve_attr' OR s.name CONTAINS 'attribute_value' OR s.name CONTAINS 'set_attr' OR s.name CONTAINS 'attr_value') RETURN s.path, s.file, s.line LIMIT 20`
 
@@ -180,13 +180,13 @@ List them: `python3 dev/clause-map.py | awk -F'\t' '$3!="informative" && ($9>0 |
 
 | Task | Gap | Kind |
 |---|---|---|
-| T-3450 | Set Attribute Value `PUT …/attrs/{attrId}/value` missing (3.10) | non-compliant |
+| T-3450 | Set Attribute Value `PUT …/attrs/{attrId}/value` (3.10) | compliant |
 | T-3451 | `RegistrationInfo.attributeNames` not matched (3.6) | non-compliant, security (over-forwarding) |
 | T-3452 | CSR subscription ignores `geoQ.geoproperty`; ignore list untested (3.7) | non-compliant |
 | T-3453 | mqtt endpoint accepts geo+json (3.8) | non-compliant |
 | T-3454 | nested Sealed Attribute untested (3.9) | unknown, test first |
 | T-3455 | q trailing path over an array of JSON objects (3.1) | non-compliant |
-| T-3456 | `firstN`, `offsetN`, interval Links (3.2) | non-compliant, owner decision on 206 |
+| T-3456 | `firstN`, `offsetN`, interval Links (3.2) | compliant (206 kept while the robots assert it) |
 | T-3457 | join depth-first, not shallowest depth (3.3) | non-compliant |
 | T-3458 | core @context content and scoped terms (3.4) | non-compliant, owner decision |
 | T-3459 | 9.7 loop error for inclusive or no registration (3.5) | non-compliant, owner decision |
