@@ -9,7 +9,7 @@
 
 use antares_jsonld::loader::EgressPolicy;
 use antares_model::NgsiError;
-use serde_json::{Map, Value};
+use crate::build_message;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -131,36 +131,6 @@ impl MqttParams {
         }
         Ok(p)
     }
-}
-
-/// The 7.2 message: `{"metadata": {...}, "body": notification}`.
-/// `link` is the HTTP-Link-header-formatted @context reference; per Table
-/// 7.2-2 it is included only when the Content-Type is application/json
-/// (with ld+json the @context travels in the body).
-pub fn build_message(
-    body: &Value,
-    content_type: &str,
-    link: Option<&str>,
-    receiver_info: &[(String, String)],
-) -> Value {
-    let mut metadata = Map::new();
-    // receiverInfo goes in first: 7.2 adds its entries "additionally", while
-    // Table 7.2-2 names endpoint.accept as the source of Content-Type and
-    // the served @context as the source of Link. A pair keyed like one of
-    // those two is an entry, never that parameter's value.
-    for (k, v) in receiver_info {
-        metadata.insert(k.clone(), Value::String(v.clone()));
-    }
-    metadata.insert("Content-Type".into(), Value::String(content_type.into()));
-    if content_type == "application/json" {
-        if let Some(l) = link {
-            metadata.insert("Link".into(), Value::String(l.to_owned()));
-        }
-    }
-    let mut msg = Map::new();
-    msg.insert("metadata".into(), Value::Object(metadata));
-    msg.insert("body".into(), body.clone());
-    Value::Object(msg)
 }
 
 /// The key a pooled MQTT connection is shared under. Everything that changes

@@ -63,7 +63,15 @@ pub mod policy {
 
 /// The notification sink contract (ADR-0027 section 1), for a surface that
 /// delivers notifications (WebSocket).
-pub use antares_api::{DeliveryError, DeliveryFuture, NotificationSink, Outbound};
+pub use antares_api::{
+    build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
+};
+
+/// The request bounds a surface applies to what it parses itself (a
+/// WebSocket message never passes the HTTP bounds layer).
+pub mod bounds {
+    pub use antares_api::bounds::{json_depth, MAX_JSON_DEPTH};
+}
 
 /// The headers a surface may never set on an operation: the tenant, the
 /// snapshot and the policy subject come from the outer request alone (G2).
