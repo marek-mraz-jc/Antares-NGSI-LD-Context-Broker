@@ -101,6 +101,9 @@ antares-api = { workspace = true, features = ["test-kit"] }
 # mqtt e2e: sync rumqttc client against a live mosquitto
 rumqttc = { workspace = true }
 serde_json = { workspace = true }
+# ws_nats: a WebSocket client against the api pod
+futures-util = { workspace = true, features = ["sink"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 
 [lints]
 workspace = true

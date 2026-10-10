@@ -8,6 +8,8 @@
 mod shutdown;
 mod telemetry;
 mod wiring;
+#[cfg(feature = "ws")]
+mod ws_relay;
 
 use antares_api::AppState;
 
@@ -960,7 +962,13 @@ async fn run(
         // consumers per role, topology asserted before traffic.
         let url = std::env::var("ANTARES_NATS_URL")
             .map_err(|_| "ANTARES_BUS=nats requires ANTARES_NATS_URL")?;
-        wiring::wire_nats(&mut state, &url, roles).await?;
+        let bus = wiring::wire_nats(&mut state, &url, roles).await?;
+        // ADR-0026 rule 5: a notifier pod reaches the socket another pod
+        // holds over core NATS request/reply.
+        #[cfg(feature = "ws")]
+        antares_ws::Hub::process().set_relay(std::sync::Arc::new(ws_relay::NatsRelay::new(bus)));
+        #[cfg(not(feature = "ws"))]
+        drop(bus);
     } else {
         antares_api::wire(&mut state).await; // in-process matcher + notifier + interval firing
     }
@@ -1281,7 +1289,10 @@ fn serve(
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(header_read_timeout)
             .title_case_headers(true);
-        let conn = builder.serve_connection(hyper_util::rt::TokioIo::new(stream), svc);
+        // With upgrades: a WebSocket surface answers 101 and takes the
+        // stream (ADR-0026); without an upgrading route nothing changes.
+        let conn =
+            builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), svc);
         let mut conn = std::pin::pin!(conn);
         // On drain, close an IDLE keep-alive connection immediately —
         // hyper finishes any active request first, then closes. Without this
