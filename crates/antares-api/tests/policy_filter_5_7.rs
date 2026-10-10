@@ -981,3 +981,78 @@ async fn a_linked_q_term_does_not_read_an_attribute_the_narrowing_omits() {
         "a visible linked Attribute still selects"
     );
 }
+
+/// ADR-0023 rule 5: discovery (5.7.5 to 5.7.10) answers from the Entities
+/// the narrowing selects, with `omit` read as type and Attribute names. A
+/// hidden type is absent from every list and `/types/{t}` is 404; a hidden
+/// Attribute is absent from the lists, from attributeDetails, and
+/// `/attributes/{a}` is 404 (T-3479).
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_answers_from_what_the_narrowing_selects() {
+    const DC: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+    let st = state(Filter {
+        q: Some(antares_ql::parse_q("public==true").expect("q")),
+        omit: vec![format!("{DC}Secret"), format!("{DC}salary")],
+        restricted: true,
+        ..Filter::default()
+    })
+    .await;
+    for doc in [
+        json!({"id": "urn:ngsi-ld:Vehicle:a", "type": "Vehicle",
+               "public": {"type": "Property", "value": true},
+               "speed": {"type": "Property", "value": 1},
+               "salary": {"type": "Property", "value": 2}}),
+        json!({"id": "urn:ngsi-ld:Secret:s", "type": "Secret",
+               "public": {"type": "Property", "value": true},
+               "code": {"type": "Property", "value": 3}}),
+        json!({"id": "urn:ngsi-ld:Car:c", "type": "Car",
+               "public": {"type": "Property", "value": false},
+               "colour": {"type": "Property", "value": "red"}}),
+    ] {
+        let (code, body) = send(&st, "POST", "/ngsi-ld/v1/entities", Some(doc)).await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+    }
+    let get = |uri: &'static str| {
+        let st = st.clone();
+        async move { send(&st, "GET", uri, None).await }
+    };
+    let (code, body) = get("/ngsi-ld/v1/types").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["typeList"], json!(["Vehicle"]), "{body}");
+    let (_, body) = get("/ngsi-ld/v1/types?details=true").await;
+    assert_eq!(body.as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(
+        body[0]["attributeNames"],
+        json!(["public", "speed"]),
+        "{body}"
+    );
+    let (code, body) = get("/ngsi-ld/v1/types/Vehicle").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert!(!body.to_string().contains("salary"), "{body}");
+    for hidden in ["/ngsi-ld/v1/types/Secret", "/ngsi-ld/v1/types/Car"] {
+        assert_eq!(get(hidden).await.0, StatusCode::NOT_FOUND, "{hidden}");
+    }
+    let (_, body) = get("/ngsi-ld/v1/attributes").await;
+    assert_eq!(body["attributeList"], json!(["public", "speed"]), "{body}");
+    let (_, body) = get("/ngsi-ld/v1/attributes?details=true").await;
+    let text = body.to_string();
+    assert!(
+        !text.contains("salary") && !text.contains("Secret") && !text.contains("Car"),
+        "{text}"
+    );
+    let (code, body) = get("/ngsi-ld/v1/attributes/speed").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["typeNames"], json!(["Vehicle"]), "{body}");
+    for hidden in [
+        "/ngsi-ld/v1/attributes/salary",
+        "/ngsi-ld/v1/attributes/colour",
+        "/ngsi-ld/v1/attributes/code",
+    ] {
+        assert_eq!(get(hidden).await.0, StatusCode::NOT_FOUND, "{hidden}");
+    }
+    assert_eq!(
+        restricted(&st, "/ngsi-ld/v1/types").await.as_deref(),
+        Some("true"),
+        "a narrowed list says so"
+    );
+}

@@ -2792,12 +2792,12 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.15.3.1.md
-      gate_site: crates/antares-api/src/types_attrs.rs:220
+      gate_site: crates/antares-api/src/types_attrs.rs:264
     odata:
       status: supported
       binding: GET /x/views/{view}/odata/v4/ (service document, entity sets = visible types)
@@ -2805,7 +2805,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - none
@@ -2816,7 +2816,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
@@ -2827,7 +2827,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
@@ -2837,7 +2837,7 @@ operations:
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
     internal_csr:
@@ -2846,10 +2846,9 @@ operations:
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
-  gaps: 'not FILTERABLE: a view that hides a type can only deny the whole list'
 - id: retrieve_entity_type_details
   ts104175: 10.6.4
   cim009: 5.7.6
@@ -2867,12 +2866,12 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.15.3.1.md
-      gate_site: crates/antares-api/src/types_attrs.rs:220
+      gate_site: crates/antares-api/src/types_attrs.rs:264
     odata:
       status: supported
       binding: GET /x/views/{view}/odata/v4/$metadata (CSDL built from the visible types and their attributes)
@@ -2880,7 +2879,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - none
@@ -2891,7 +2890,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
@@ -2902,7 +2901,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
@@ -2912,7 +2911,7 @@ operations:
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
     internal_csr:
@@ -2921,11 +2920,10 @@ operations:
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
   note: the handler gates with clause 5.7.5 for both details=false and details=true; 5.7.6 is never passed
-  gaps: not FILTERABLE
 - id: retrieve_entity_type_info
   ts104175: 10.6.5
   cim009: 5.7.7
@@ -2944,19 +2942,19 @@ operations:
         operation_fields:
         - clause
         - types
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.16.3.1.md
-      gate_site: crates/antares-api/src/types_attrs.rs:271
+      gate_site: crates/antares-api/src/types_attrs.rs:324
     odata:
       status: not_offered
       binding: null
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
     mcp:
@@ -2967,7 +2965,7 @@ operations:
         operation_fields:
         - clause
         - types
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
@@ -2979,7 +2977,7 @@ operations:
         operation_fields:
         - clause
         - types
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
@@ -2989,7 +2987,7 @@ operations:
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
     internal_csr:
@@ -2998,7 +2996,7 @@ operations:
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
 - id: retrieve_attributes
@@ -3018,19 +3016,19 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.17.3.1.md
-      gate_site: crates/antares-api/src/types_attrs.rs:333
+      gate_site: crates/antares-api/src/types_attrs.rs:389
     odata:
       status: not_offered
       binding: null
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
     mcp:
@@ -3040,7 +3038,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
@@ -3051,7 +3049,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
@@ -3061,7 +3059,7 @@ operations:
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
     internal_csr:
@@ -3070,10 +3068,9 @@ operations:
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
-  gaps: not FILTERABLE
 - id: retrieve_attribute_details
   ts104175: 10.6.7
   cim009: 5.7.9
@@ -3091,19 +3088,19 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.17.3.1.md
-      gate_site: crates/antares-api/src/types_attrs.rs:333
+      gate_site: crates/antares-api/src/types_attrs.rs:389
     odata:
       status: not_offered
       binding: null
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
     mcp:
@@ -3113,7 +3110,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
@@ -3124,7 +3121,7 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
@@ -3134,7 +3131,7 @@ operations:
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
     internal_csr:
@@ -3143,11 +3140,10 @@ operations:
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
   note: gated with clause 5.7.8 for both forms
-  gaps: not FILTERABLE
 - id: retrieve_attribute_info
   ts104175: 10.6.8
   cim009: 5.7.10
@@ -3166,19 +3162,19 @@ operations:
         operation_fields:
         - clause
         - attrs
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.18.3.1.md
-      gate_site: crates/antares-api/src/types_attrs.rs:388
+      gate_site: crates/antares-api/src/types_attrs.rs:453
     odata:
       status: not_offered
       binding: null
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
     mcp:
@@ -3189,7 +3185,7 @@ operations:
         operation_fields:
         - clause
         - attrs
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
@@ -3201,7 +3197,7 @@ operations:
         operation_fields:
         - clause
         - attrs
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
@@ -3211,7 +3207,7 @@ operations:
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
     internal_csr:
@@ -3220,7 +3216,7 @@ operations:
       checks:
         adr0020_phase: none
         operation_fields: []
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks: []
 - id: temporal_upsert

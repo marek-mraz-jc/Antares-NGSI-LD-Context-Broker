@@ -168,8 +168,10 @@ process: the seam strips those headers from every forwarded request and
 keeps them out of notifications, logs and dead letters.
 
 A `Filter` is only honoured where the broker can serve less than it was
-asked for: retrieve and query Entities, the two temporal reads, and the
-EntityMap creations behind them (`policy::FILTERABLE`). Return one on any
+asked for: retrieve and query Entities, the two temporal reads, the
+EntityMap creations behind them, and the `/types` and `/attributes`
+discovery reads, where `omit` names a type or an Attribute to hide
+(`policy::FILTERABLE`). Return one on any
 other operation — a create, a delete, a subscription, a registration — and
 the seam answers 403 rather than dropping it; decide those with `Allow` or
 `Deny`.

@@ -65,7 +65,12 @@ pub const WHOLE_TENANT: [&str; 4] = ["5.6.21", "5.16.1", "5.16.2", "5.16.7"];
 /// would perform in full an operation the engine believed it had narrowed.
 /// That is the one direction the seam may not fail in, so those clauses
 /// answer a narrowing as a deny ([`resolve`]).
-pub const FILTERABLE: [&str; 6] = ["5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.14.4", "5.14.5"];
+/// Discovery (5.7.5 to 5.7.10) is among them: ADR-0023 rule 5 computes it
+/// from the Entities the narrowing selects.
+pub const FILTERABLE: [&str; 12] = [
+    "5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.7.5", "5.7.6", "5.7.7", "5.7.8", "5.7.9", "5.7.10",
+    "5.14.4", "5.14.5",
+];
 
 /// Who is asking. The headers are the ones a deployment names for the
 /// seam to carry, copied verbatim and never interpreted: the broker does
@@ -920,7 +925,7 @@ mod tests {
         }
         // and every other clause outside FILTERABLE, because the handler
         // there never reads the Filter
-        for clause in ["5.6.1", "5.6.6", "5.8.1", "5.9.2", "5.13.2", "5.7.5"] {
+        for clause in ["5.6.1", "5.6.6", "5.8.1", "5.9.2", "5.13.2", "5.8.4"] {
             assert!(
                 matches!(resolve(clause, narrowed.clone()), Decision::Deny(_)),
                 "{clause} dropped a narrowing instead of refusing it"
