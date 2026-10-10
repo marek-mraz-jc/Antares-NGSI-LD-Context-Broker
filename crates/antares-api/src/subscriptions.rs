@@ -747,6 +747,45 @@ async fn check_jsonld_context(
 /// clauses: 5.8 for Subscriptions, 5.11 for Context Source Registration
 /// Subscriptions. The seam is asked about the operation the caller actually
 /// made.
+/// What a Subscription names, for the policy gate (ADR-0020): the types of
+/// its entity selectors, its watchedAttributes, its q and its geoQ, as
+/// normalization expanded them.
+fn sub_members(norm: &Map<String, Value>) -> crate::entities::ReadMembers {
+    let strings = |key: &str, member: Option<&str>| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for v in norm
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let s = match member {
+                Some(m) => v.get(m).and_then(Value::as_str),
+                None => v.as_str(),
+            };
+            if let Some(s) = s.filter(|s| !out.iter().any(|o| o == s)) {
+                out.push(s.to_owned());
+            }
+        }
+        out
+    };
+    crate::entities::ReadMembers {
+        types: strings("entities", Some("type")),
+        attrs: strings("watchedAttributes", None),
+        q: norm
+            .get("q")
+            .and_then(Value::as_str)
+            .and_then(|q| antares_ql::parse_q(&antares_ql::percent_decode(q.as_bytes())).ok()),
+        geo: norm
+            .get("geoQ")
+            .and_then(Value::as_object)
+            .and_then(|g| {
+                antares_ql::geo::GeoQuery::from_params(&crate::notify::geo_params(g)).ok()
+            })
+            .flatten(),
+    }
+}
+
 fn clause_of(kind: Kind, sub: &'static str, csub: &'static str) -> &'static str {
     if kind == Kind::CSourceSubscription {
         csub
@@ -773,12 +812,21 @@ pub async fn create(
     // told which one is being claimed. A body that names none leaves the
     // list empty, which is right: there is no client choice to decide about.
     let named = obj.get("id").and_then(Value::as_str);
+    let mut norm = normalize_subscription(obj, &parsed.ctx, false)?;
+    let shown = match &st.policy {
+        Some(_) => sub_members(&norm),
+        None => crate::entities::ReadMembers::default(),
+    };
     gate!(
         st, &tenant, headers, clause_of(kind, "5.8.1", "5.11.2"),
         ids: named.as_slice(),
+        types: &shown.types,
+        attrs: &shown.attrs,
+        q: shown.q.as_ref(),
+        scope_q: norm.get("scopeQ").and_then(Value::as_str),
+        geo: shown.geo.as_ref(),
     )
     .await?;
-    let mut norm = normalize_subscription(obj, &parsed.ctx, false)?;
     check_endpoint(st, &norm)?;
     check_jsonld_context(st, &tenant, &norm).await?;
     let id = match norm.get("id").and_then(Value::as_str) {

@@ -164,9 +164,9 @@ Paths are relative to `/ngsi-ld/v1`; HEAD is served by every GET route (axum `ge
 | `partial_attribute_update` | 10.2.5 | 5.6.4 | write | `PATCH /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}` (ts-104176-ngsi-ld-http-binding/7/7.5.3.2.md) | 5.6.4 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/attrs.rs:803 |
 | `set_attribute_value` | 10.2.6 | null | write | `PUT /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}/value` (no route, see note) **not_offered** | none | - | none | no | no | - |
 | `delete_attribute` | 10.2.7 | 5.6.5 | write | `DELETE /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}` (ts-104176-ngsi-ld-http-binding/7/7.5.3.4.md) | 5.6.5 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/attrs.rs:1115 |
-| `delete_entity` | 10.2.8 | 5.6.6 | write | `DELETE /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.4.md) | 5.6.6 | clause, ids, types | on_request | no | no | crates/antares-api/src/entities.rs:1314 |
-| `merge_entity` | 10.2.9 | 5.6.17 | write | `PATCH /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.2.md) | 5.6.17 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/entities.rs:1778 |
-| `replace_entity` | 10.2.10 | 5.6.18 | write | `PUT /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.3.md) | 5.6.18 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/entities.rs:2152 |
+| `delete_entity` | 10.2.8 | 5.6.6 | write | `DELETE /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.4.md) | 5.6.6 | clause, ids, types | on_request | no | no | crates/antares-api/src/entities.rs:1395 |
+| `merge_entity` | 10.2.9 | 5.6.17 | write | `PATCH /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.2.md) | 5.6.17 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/entities.rs:1859 |
+| `replace_entity` | 10.2.10 | 5.6.18 | write | `PUT /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.3.md) | 5.6.18 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/entities.rs:2233 |
 | `replace_attribute` | 10.2.11 | 5.6.19 | write | `PUT /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}` (ts-104176-ngsi-ld-http-binding/7/7.5.3.3.md) | 5.6.19 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/attrs.rs:970 |
 | `purge_entities` | 10.2.12 | 5.6.21 | write | `DELETE /ngsi-ld/v1/entities` (ts-104176-ngsi-ld-http-binding/7/7.2.3.3.md) | 5.6.21 | clause, scope_q | on_request | no | yes | crates/antares-api/src/entities.rs:1579 |
 | `batch_create` | 10.3.2 | 5.6.7 | write | `POST /ngsi-ld/v1/entityOperations/create` (ts-104176-ngsi-ld-http-binding/7/7.7.3.1.md) | 5.6.7 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/batch.rs:687 |
@@ -174,11 +174,11 @@ Paths are relative to `/ngsi-ld/v1`; HEAD is served by every GET route (axum `ge
 | `batch_update` | 10.3.4 | 5.6.9 | write | `POST /ngsi-ld/v1/entityOperations/update` (ts-104176-ngsi-ld-http-binding/7/7.9.3.1.md) | 5.6.9 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/batch.rs:687 |
 | `batch_merge` | 10.3.5 | 5.6.20 | write | `POST /ngsi-ld/v1/entityOperations/merge` (ts-104176-ngsi-ld-http-binding/7/7.10.3.1.md) | 5.6.20 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/batch.rs:687 |
 | `batch_delete` | 10.3.6 | 5.6.10 | write | `POST /ngsi-ld/v1/entityOperations/delete` (ts-104176-ngsi-ld-http-binding/7/7.11.3.1.md) | 5.6.10 | clause, ids | on_request | no | no | crates/antares-api/src/batch.rs:1146 |
-| `retrieve_entity` | 10.4.2 | 5.7.1 | read | `GET /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.1.md) | 5.7.1 | clause, ids | on_request | yes | no | crates/antares-api/src/entities.rs:270 |
-| `query_entities` | 10.4.3 | 5.7.2 | read | `GET /ngsi-ld/v1/entities` (ts-104176-ngsi-ld-http-binding/7/7.2.3.1.md) | 5.7.2 | clause, q, scope_q | on_request | yes | no | crates/antares-api/src/entities.rs:567 |
-| `query_entities_post` | 10.4.3 | 5.7.2 | read | `POST /ngsi-ld/v1/entityOperations/query` (ts-104176-ngsi-ld-http-binding/7/7.12.3.1.md) | 5.7.2 | clause | on_request | yes | no | crates/antares-api/src/batch.rs:1346 |
-| `retrieve_attribute_value` | 10.4.4 | null | read | `GET /ngsi-ld/v1/entities/{entityId}/attrs/{attrId} and .../attrs/{attrId}/value` (ts-104176-ngsi-ld-http-binding/7/7.5.3.1.md, 7/7.6.3.1.md) | 5.7.1 | clause, ids | on_request | yes | no | crates/antares-api/src/entities.rs:2314 |
-| `create_subscription` | 10.5.2 | 5.8.1 | subscription | `POST /ngsi-ld/v1/subscriptions` (ts-104176-ngsi-ld-http-binding/7/7.13.3.2.md) | 5.8.1 | clause, ids | on_request | no | no | crates/antares-api/src/subscriptions.rs:776 |
+| `retrieve_entity` | 10.4.2 | 5.7.1 | read | `GET /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.1.md) | 5.7.1 | clause, ids, types, attrs | on_request | yes | no | crates/antares-api/src/entities.rs:271 |
+| `query_entities` | 10.4.3 | 5.7.2 | read | `GET /ngsi-ld/v1/entities` (ts-104176-ngsi-ld-http-binding/7/7.2.3.1.md) | 5.7.2 | clause, types, attrs, q, scope_q, geo | on_request | yes | no | crates/antares-api/src/entities.rs:565 |
+| `query_entities_post` | 10.4.3 | 5.7.2 | read | `POST /ngsi-ld/v1/entityOperations/query` (ts-104176-ngsi-ld-http-binding/7/7.12.3.1.md) | 5.7.2 | clause, types, attrs, q, scope_q, geo | on_request | yes | no | crates/antares-api/src/batch.rs:1377 |
+| `retrieve_attribute_value` | 10.4.4 | null | read | `GET /ngsi-ld/v1/entities/{entityId}/attrs/{attrId} and .../attrs/{attrId}/value` (ts-104176-ngsi-ld-http-binding/7/7.5.3.1.md, 7/7.6.3.1.md) | 5.7.1 | clause, ids, attrs | on_request | yes | no | crates/antares-api/src/entities.rs:2441 |
+| `create_subscription` | 10.5.2 | 5.8.1 | subscription | `POST /ngsi-ld/v1/subscriptions` (ts-104176-ngsi-ld-http-binding/7/7.13.3.2.md) | 5.8.1 | clause, ids, types, attrs, q, scope_q, geo | on_request | no | no | crates/antares-api/src/subscriptions.rs:820 |
 | `update_subscription` | 10.5.3 | 5.8.2 | subscription | `PATCH /ngsi-ld/v1/subscriptions/{subscriptionId}` (ts-104176-ngsi-ld-http-binding/7/7.14.3.2.md) | 5.8.2 | clause, ids | on_request | no | no | crates/antares-api/src/subscriptions.rs:962 |
 | `retrieve_subscription` | 10.5.4 | 5.8.3 | read | `GET /ngsi-ld/v1/subscriptions/{subscriptionId}` (ts-104176-ngsi-ld-http-binding/7/7.14.3.1.md) | 5.8.3 | clause, ids | on_request | no | no | crates/antares-api/src/subscriptions.rs:892 |
 | `query_subscriptions` | 10.5.5 | 5.8.4 | read | `GET /ngsi-ld/v1/subscriptions` (ts-104176-ngsi-ld-http-binding/7/7.13.3.1.md) | 5.8.4 | clause | on_request | no | no | crates/antares-api/src/subscriptions.rs:918 |
@@ -186,10 +186,10 @@ Paths are relative to `/ngsi-ld/v1`; HEAD is served by every GET route (axum `ge
 | `notification` | 10.5.7 | 5.8.6 | subscription | `POST {notification.endpoint.uri} (broker-initiated)` (ts-104176-ngsi-ld-http-binding/6/6.5.2.md) | none | - | pre_notify | no | no | crates/antares-api/src/notify.rs:2084 |
 | `retrieve_entity_types` | 10.6.3 | 5.7.5 | read | `GET /ngsi-ld/v1/types` (ts-104176-ngsi-ld-http-binding/7/7.15.3.1.md) | 5.7.5 | clause | on_request | no | no | crates/antares-api/src/types_attrs.rs:220 |
 | `retrieve_entity_type_details` | 10.6.4 | 5.7.6 | read | `GET /ngsi-ld/v1/types?details=true` (ts-104176-ngsi-ld-http-binding/7/7.15.3.1.md) | 5.7.5 | clause | on_request | no | no | crates/antares-api/src/types_attrs.rs:220 |
-| `retrieve_entity_type_info` | 10.6.5 | 5.7.7 | read | `GET /ngsi-ld/v1/types/{type}` (ts-104176-ngsi-ld-http-binding/7/7.16.3.1.md) | 5.7.7 | clause | on_request | no | no | crates/antares-api/src/types_attrs.rs:270 |
+| `retrieve_entity_type_info` | 10.6.5 | 5.7.7 | read | `GET /ngsi-ld/v1/types/{type}` (ts-104176-ngsi-ld-http-binding/7/7.16.3.1.md) | 5.7.7 | clause, types | on_request | no | no | crates/antares-api/src/types_attrs.rs:271 |
 | `retrieve_attributes` | 10.6.6 | 5.7.8 | read | `GET /ngsi-ld/v1/attributes` (ts-104176-ngsi-ld-http-binding/7/7.17.3.1.md) | 5.7.8 | clause | on_request | no | no | crates/antares-api/src/types_attrs.rs:333 |
 | `retrieve_attribute_details` | 10.6.7 | 5.7.9 | read | `GET /ngsi-ld/v1/attributes?details=true` (ts-104176-ngsi-ld-http-binding/7/7.17.3.1.md) | 5.7.8 | clause | on_request | no | no | crates/antares-api/src/types_attrs.rs:333 |
-| `retrieve_attribute_info` | 10.6.8 | 5.7.10 | read | `GET /ngsi-ld/v1/attributes/{attrId}` (ts-104176-ngsi-ld-http-binding/7/7.18.3.1.md) | 5.7.10 | clause | on_request | no | no | crates/antares-api/src/types_attrs.rs:382 |
+| `retrieve_attribute_info` | 10.6.8 | 5.7.10 | read | `GET /ngsi-ld/v1/attributes/{attrId}` (ts-104176-ngsi-ld-http-binding/7/7.18.3.1.md) | 5.7.10 | clause, attrs | on_request | no | no | crates/antares-api/src/types_attrs.rs:388 |
 | `temporal_upsert` | 11.2.2 | 5.6.11 | write | `POST /ngsi-ld/v1/temporal/entities` (ts-104176-ngsi-ld-http-binding/8/8.2.3.2.md) | 5.6.11 | clause, ids | on_request | no | no | crates/antares-api/src/temporal.rs:79 |
 | `temporal_add_attributes` | 11.2.3 | 5.6.12 | write | `POST /ngsi-ld/v1/temporal/entities/{entityId}/attrs` (ts-104176-ngsi-ld-http-binding/8/8.4.3.1.md) | 5.6.12 | clause, ids | on_request | no | no | crates/antares-api/src/temporal.rs:2502 |
 | `temporal_delete_attribute` | 11.2.4 | 5.6.13 | write | `DELETE /ngsi-ld/v1/temporal/entities/{entityId}/attrs/{attrId}` (ts-104176-ngsi-ld-http-binding/8/8.5.3.1.md) | 5.6.13 | clause, ids | on_request | no | no | crates/antares-api/src/temporal.rs:2671 |
@@ -197,8 +197,8 @@ Paths are relative to `/ngsi-ld/v1`; HEAD is served by every GET route (axum `ge
 | `temporal_delete_instance` | 11.2.6 | 5.6.15 | write | `DELETE /ngsi-ld/v1/temporal/entities/{entityId}/attrs/{attrId}/{instanceId}` (ts-104176-ngsi-ld-http-binding/8/8.6.3.2.md) | 5.6.15 | clause, ids | on_request | no | no | crates/antares-api/src/temporal.rs:2997 |
 | `temporal_delete` | 11.2.7 | 5.6.16 | write | `DELETE /ngsi-ld/v1/temporal/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/8/8.3.3.2.md) | 5.6.16 | clause, ids | on_request | no | no | crates/antares-api/src/temporal.rs:2456 |
 | `temporal_retrieve` | 11.3.2 | 5.7.3 | read | `GET /ngsi-ld/v1/temporal/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/8/8.3.3.1.md) | 5.7.3 | clause, ids | on_request | yes | no | crates/antares-api/src/temporal.rs:2211 |
-| `temporal_query` | 11.3.3 | 5.7.4 | read | `GET /ngsi-ld/v1/temporal/entities` (ts-104176-ngsi-ld-http-binding/8/8.2.3.1.md) | 5.7.4 | clause, scope_q | on_request | yes | no | crates/antares-api/src/temporal.rs:1393 |
-| `temporal_query_post` | 11.3.3 | 5.7.4 | read | `POST /ngsi-ld/v1/temporal/entityOperations/query` (ts-104176-ngsi-ld-http-binding/8/8.7.3.1.md) | 5.7.4 | clause | on_request | yes | no | crates/antares-api/src/temporal.rs:3071 |
+| `temporal_query` | 11.3.3 | 5.7.4 | read | `GET /ngsi-ld/v1/temporal/entities` (ts-104176-ngsi-ld-http-binding/8/8.2.3.1.md) | 5.7.4 | clause, types, attrs, q, scope_q, geo | on_request | yes | no | crates/antares-api/src/temporal.rs:1393 |
+| `temporal_query_post` | 11.3.3 | 5.7.4 | read | `POST /ngsi-ld/v1/temporal/entityOperations/query` (ts-104176-ngsi-ld-http-binding/8/8.7.3.1.md) | 5.7.4 | clause, types, attrs, q, scope_q, geo | on_request | yes | no | crates/antares-api/src/temporal.rs:3092 |
 | `register_context_source` | 12.2.2 | 5.9.2 | registration | `POST /ngsi-ld/v1/csourceRegistrations` (ts-104176-ngsi-ld-http-binding/9/9.2.3.2.md) | 5.9.2 | clause, ids | on_request | no | no | crates/antares-api/src/csource.rs:965 |
 | `update_registration` | 12.2.3 | 5.9.3 | registration | `PATCH /ngsi-ld/v1/csourceRegistrations/{registrationId}` (ts-104176-ngsi-ld-http-binding/9/9.3.3.2.md) | 5.9.3 | clause, ids | on_request | no | no | crates/antares-api/src/csource.rs:1327 |
 | `delete_registration` | 12.2.4 | 5.9.4 | registration | `DELETE /ngsi-ld/v1/csourceRegistrations/{registrationId}` (ts-104176-ngsi-ld-http-binding/9/9.3.3.3.md) | 5.9.4 | clause, ids | on_request | no | no | crates/antares-api/src/csource.rs:1397 |
@@ -329,20 +329,11 @@ The seam can only judge what it is given. These handlers leave members empty tha
 | `create_entity` | 10.2.2 | 409 AlreadyExists on an id that exists but is out of view is an existence oracle |
 | `batch_create` | 10.3.2 | one decision covers all members, so an engine cannot deny one member and allow the rest (T-3480) |
 | `batch_upsert` | 10.3.3 | an upsert on an existing out-of-view id must not become an overwrite: the engine needs the pre-image to decide |
-| `retrieve_entity` | 10.4.2 | types and attrs are not filled although the request may name them |
-| `query_entities` | 10.4.3 | types, attrs and geo are not filled although the request carries them |
-| `query_entities_post` | 10.4.3 | no member but the clause is filled: q, scopeQ, types, attrs and geo of the Query body never reach the engine |
-| `retrieve_attribute_value` | 10.4.4 | attrs is not filled although the path names the Attribute |
-| `create_subscription` | 10.5.2 | types, attrs (watchedAttributes), q and geo of the Subscription are not filled |
 | `query_subscriptions` | 10.5.5 | not FILTERABLE: an engine cannot narrow the list to the caller's own Subscriptions, only allow or deny all |
 | `retrieve_entity_types` | 10.6.3 | not FILTERABLE: a view that hides a type can only deny the whole list |
 | `retrieve_entity_type_details` | 10.6.4 | not FILTERABLE |
-| `retrieve_entity_type_info` | 10.6.5 | types is not filled although the path names the type |
 | `retrieve_attributes` | 10.6.6 | not FILTERABLE |
 | `retrieve_attribute_details` | 10.6.7 | not FILTERABLE |
-| `retrieve_attribute_info` | 10.6.8 | attrs is not filled although the path names the Attribute |
-| `temporal_query` | 11.3.3 | q, types, attrs and geo are not filled |
-| `temporal_query_post` | 11.3.3 | no member but the clause is filled |
 | `register_context_source` | 12.2.2 | types and attrs of the registration information are not filled |
 | `query_registrations` | 12.3.3 | not FILTERABLE |
 | `create_entity_map` | 14.5 | q, scope_q, types, attrs and geo are not filled |

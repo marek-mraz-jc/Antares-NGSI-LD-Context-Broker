@@ -267,7 +267,14 @@ async fn retrieve_entity_inner(
         .into());
     }
     let ctx = request_context(&st.loader, headers).await?;
-    let filter = gate!(st, &tenant, headers, "5.7.1", ids: &[id]).await?;
+    let named = ReadMembers::with_ctx(st, params, &ctx);
+    let filter = gate!(
+        st, &tenant, headers, "5.7.1",
+        ids: &[id],
+        types: &named.types,
+        attrs: &named.attrs,
+    )
+    .await?;
     let mut repr = parse_repr(params, &ctx)?;
     crate::repr::narrow_repr(&mut repr, &filter);
     let join = parse_join(params)?;
@@ -554,10 +561,14 @@ async fn query_entities_outer(
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     let q_ast = params.get("q").map(|q| parse_q(q)).transpose()?;
+    let named = ReadMembers::of(st, headers, &params).await;
     let filter = gate!(
         st, &tenant, headers, "5.7.2",
         q: q_ast.as_ref(),
         scope_q: params.get("scopeQ").map(String::as_str),
+        types: &named.types,
+        attrs: &named.attrs,
+        geo: named.geo.as_ref(),
     )
     .await?;
     let Some(map_ref) = single_header(headers, "NGSILD-EntityMap")? else {
@@ -1047,6 +1058,93 @@ fn page_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -
     fed_is_empty && !params.contains_key("idPattern") && !params.contains_key("orderBy")
 }
 
+/// Entity Type Selection Language (4.17): `,`/`|` = OR, `(a;b)` = AND.
+/// Table 6.4.3.2-1: `"*"` selects every Entity Type, i.e. no type predicate
+/// at all. Expanding it as a term yields an IRI nothing matches, which is
+/// how `type=*` silently returned an empty array.
+fn type_selection(
+    params: &HashMap<String, String>,
+    ctx: &antares_jsonld::Context,
+) -> Option<Vec<Vec<String>>> {
+    params.get("type").filter(|s| *s != "*").map(|s| {
+        s.split([',', '|'])
+            .map(|alt| {
+                alt.trim()
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+                    .split(';')
+                    .map(|t| ctx.expand_key(t.trim()))
+                    .collect()
+            })
+            .collect()
+    })
+}
+
+/// The expanded `attrs` list of a query.
+fn attr_list(
+    params: &HashMap<String, String>,
+    ctx: &antares_jsonld::Context,
+) -> Option<Vec<String>> {
+    params
+        .get("attrs")
+        .map(|s| s.split(',').map(|t| ctx.expand_key(t.trim())).collect())
+}
+
+/// What a read names, for the policy gate (ADR-0020: "`Operation` is the
+/// expanded request"): the types of its type selector, its `attrs`, its
+/// `q` and its GeoQuery, expanded with the request @context exactly as the
+/// store query uses them. Built only with an engine attached. A member
+/// that does not parse is left out, and the read refuses it after the gate
+/// as before.
+#[derive(Default)]
+pub(crate) struct ReadMembers {
+    pub types: Vec<String>,
+    pub attrs: Vec<String>,
+    pub q: Option<antares_ql::QNode>,
+    pub geo: Option<antares_ql::geo::GeoQuery>,
+}
+
+impl ReadMembers {
+    pub(crate) fn with_ctx(
+        st: &AppState,
+        params: &HashMap<String, String>,
+        ctx: &antares_jsonld::Context,
+    ) -> Self {
+        if st.policy.is_none() {
+            return Self::default();
+        }
+        let mut types: Vec<String> = Vec::new();
+        for t in type_selection(params, ctx).into_iter().flatten().flatten() {
+            if !types.contains(&t) {
+                types.push(t);
+            }
+        }
+        Self {
+            types,
+            attrs: attr_list(params, ctx).unwrap_or_default(),
+            q: params.get("q").and_then(|q| parse_q(q).ok()),
+            geo: antares_ql::geo::GeoQuery::from_params(params)
+                .ok()
+                .flatten(),
+        }
+    }
+
+    /// Same, for a gate taken before the request @context is resolved.
+    pub(crate) async fn of(
+        st: &AppState,
+        headers: &HeaderMap,
+        params: &HashMap<String, String>,
+    ) -> Self {
+        if st.policy.is_none() {
+            return Self::default();
+        }
+        match request_context(&st.loader, headers).await {
+            Ok(ctx) => Self::with_ctx(st, params, &ctx),
+            Err(_) => Self::default(),
+        }
+    }
+}
+
 /// What the store may be asked to do beyond filtering; see
 /// [`filter_entities_paged`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -1096,25 +1194,8 @@ pub async fn filter_entities_paged(
         }
         None => None,
     };
-    // Entity Type Selection Language (4.17): `,`/`|` = OR, `(a;b)` = AND.
-    // Table 6.4.3.2-1: `"*"` selects every Entity Type, i.e. no type predicate
-    // at all. Expanding it as a term yields an IRI nothing matches, which is
-    // how `type=*` silently returned an empty array.
-    let type_sel: Option<Vec<Vec<String>>> = params.get("type").filter(|s| *s != "*").map(|s| {
-        s.split([',', '|'])
-            .map(|alt| {
-                alt.trim()
-                    .trim_start_matches('(')
-                    .trim_end_matches(')')
-                    .split(';')
-                    .map(|t| ctx.expand_key(t.trim()))
-                    .collect()
-            })
-            .collect()
-    });
-    let attr_filter: Option<Vec<String>> = params
-        .get("attrs")
-        .map(|s| s.split(',').map(|t| ctx.expand_key(t.trim())).collect());
+    let type_sel = type_selection(params, ctx);
+    let attr_filter = attr_list(params, ctx);
     let q_ast = match params.get("q") {
         // 4.9 expandValues: "attributes whose values should be expanded
         // against the supplied @context using JSON-LD type coercion prior to
@@ -2357,7 +2438,12 @@ async fn retrieve_attr_inner(
     let tenant = tenant_from(headers)?;
     check_params(params, &["options", "format", "lang", "datasetId", "local"])?;
     let ctx = request_context(&st.loader, headers).await?;
-    let filter = gate!(st, &tenant, headers, "5.7.1", ids: &[id]).await?;
+    let filter = gate!(
+        st, &tenant, headers, "5.7.1",
+        ids: &[id],
+        attrs: &antares_jsonld::expand_attr_name(attr, &ctx).ok().into_iter().collect::<Vec<_>>(),
+    )
+    .await?;
     let mut repr = parse_repr(params, &ctx)?;
     crate::repr::narrow_repr(&mut repr, &filter);
     antares_model::EntityId::new(id)?;

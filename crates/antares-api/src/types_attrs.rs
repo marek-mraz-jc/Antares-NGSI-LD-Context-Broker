@@ -267,8 +267,8 @@ pub async fn entity_type_info(
         check_params(&params, &["local"])?;
         let accept = parse_accept(&headers)?;
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.7.7").await?;
         let iri = ctx.expand_key(&type_name);
+        gate!(st, &tenant, &headers, "5.7.7", types: std::slice::from_ref(&iri)).await?;
         // Only instances of this type carry its entityCount and its
         // attributeDetails (5.2.26), so the fold asks the datastore for those
         // and the ceiling applies to them — a tenant of 100M entities with 50
@@ -379,13 +379,13 @@ pub async fn attribute_info(
         check_params(&params, &["local"])?;
         let accept = parse_accept(&headers)?;
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.7.10").await?;
         // 5.7.10 / Table 6.28.2-1: the FQN or a shortname the request
         // @context defines. Discovery reads the tenant's attribute
         // inventory and touches no stored document, so a name that
         // expands to nothing an Entity carries is simply absent —
         // ResourceNotFound below, not a rejected name.
         let iri = ctx.expand_key(&attr);
+        gate!(st, &tenant, &headers, "5.7.10", attrs: std::slice::from_ref(&iri)).await?;
         // attributeCount, attributeTypes and typeNames (5.2.28) are all
         // properties of the entities that CARRY this attribute; the rest of
         // the tenant is not read.
