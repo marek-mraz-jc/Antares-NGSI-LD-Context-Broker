@@ -45,8 +45,9 @@ jobs:
           - name: policy
             shards: 6
             # lib tests plus the policy_* integration files: a mutant only
-            # an integration test kills is not a survivor
-            args: -p antares-api -f crates/antares-api/src/policy.rs -- --lib --test 'policy_*'
+            # an integration test kills is not a survivor. `Slow` is the
+            # test-kit wrapper the engine contract sleeps in, not seam code.
+            args: -p antares-api -f crates/antares-api/src/policy.rs --exclude-re 'for Slow' -- --lib --test 'policy_*'
         shard: [0, 1, 2, 3, 4, 5]
     env:
       CARGO_TERM_COLOR: never
@@ -59,12 +60,11 @@ jobs:
           tool: cargo-mutants
       - name: Mutate
         run: |
-          set -uo pipefail
+          rc=0
           # word splitting of the matrix args is intended
           # shellcheck disable=SC2086
           cargo mutants --no-shuffle --shard ${{ matrix.shard }}/${{ matrix.target.shards }} \
-            ${{ matrix.target.args }}
-          rc=$?
+            ${{ matrix.target.args }} || rc=$?
           # 0 all caught, 2 survivors, 3 timeouts: judged below. Anything
           # else (the unmutated tree fails, a usage error) is the run failing.
           case $rc in 0|2|3) ;; *) exit $rc;; esac

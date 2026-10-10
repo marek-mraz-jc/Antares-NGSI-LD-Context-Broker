@@ -374,6 +374,25 @@ mod tests {
         json!({"type": gtype, "coordinates": coords})
     }
 
+    /// 4.10 minDistance: farther than the minimum matches, nearer does not
+    /// (T-3531).
+    #[test]
+    fn min_distance_keeps_only_the_farther_side() {
+        let g = q("near;minDistance==1000", "Point", "[10,60]");
+        assert!(g.matches_geometry(&geoval("Point", json!([10.0, 61.0]))));
+        assert!(!g.matches_geometry(&geoval("Point", json!([10.0, 60.001]))));
+    }
+
+    /// equals: a literally identical geometry is equal even where DE-9IM is
+    /// undefined, as for a self-intersecting (bow-tie) ring.
+    #[test]
+    fn equals_holds_for_a_literally_identical_invalid_ring() {
+        let ring = "[[[0,0],[2,2],[2,0],[0,2],[0,0]]]";
+        let g = q("equals", "Polygon", ring);
+        let same: Value = serde_json::from_str(ring).expect("ring");
+        assert!(g.matches_geometry(&geoval("Polygon", same)));
+    }
+
     /// 4.10 near with an EXTENDED reference geometry: "near;maxDistance==x
     /// (in meters)" is the distance to the reference GEOMETRY — measured
     /// from its closest point, not from its first coordinate.

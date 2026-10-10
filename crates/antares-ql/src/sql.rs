@@ -616,4 +616,21 @@ mod tests {
         assert!(lang_filter(CmpOp::Ne, &QValue::Range(n(1.0), n(2.0))).is_none());
         assert_eq!(lang_filter(CmpOp::Eq, &list), eq_filter(&list));
     }
+
+    /// Linked-entity hops and trailing brackets stay in memory, for an
+    /// existence test as for a comparison; a control character in a
+    /// literal is escaped, a space is not (T-3531).
+    #[test]
+    fn hops_and_brackets_stay_in_memory_and_controls_are_escaped() {
+        for q in [
+            "sensor{humidity}==40",
+            "sensor{humidity}",
+            "a[b]==1",
+            "a[b]",
+        ] {
+            assert!(c(q).is_none(), "{q}");
+        }
+        let got = c(r#"a=="x\u0001 y""#).expect("compiles");
+        assert!(got.binds[0].contains(r#""x\u0001 y""#), "{}", got.binds[0]);
+    }
 }
