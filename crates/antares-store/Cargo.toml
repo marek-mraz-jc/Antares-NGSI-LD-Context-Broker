@@ -12,6 +12,7 @@ rust-version.workspace = true
 role = "core"
 
 [dependencies]
+antares-jsonld = { workspace = true }
 antares-model = { workspace = true }
 antares-ql = { workspace = true }
 async-trait = { workspace = true }
