@@ -37,7 +37,7 @@ Antares:
 | crate | does | depends on |
 |---|---|---|
 | `odata-url` | resource path and system query options to a typed AST; optional feature `edm` resolves names and type-checks against a model | `percent-encoding`, `thiserror`; `odata-csdl` only under `edm` |
-| `odata-csdl` | EDM model, CSDL XML and CSDL JSON writers (readers under feature `read`), model validation | `quick-xml`, `serde_json`, `indexmap`, `thiserror` |
+| `odata-csdl` | EDM model, CSDL XML and CSDL JSON writers (readers under feature `read`), model validation | `regex` (amended by T-3502: both writers are hand-written over `std::io::Write`, so `quick-xml`, `serde_json`, `indexmap` and `thiserror` are not needed; `regex` holds the exact `TSimpleIdentifier` classes of `edm.xsd`) |
 | `odata-json` | JSON format: context URL, entity and collection writers, `@odata.bind` and deep-insert body reader, `If-Match`, `Prefer`, version negotiation, the error body | `serde_json`, `odata-csdl`, `odata-url` |
 | `odata-batch` | multipart (Protocol 4.01 11.7.7) and JSON batch (JSON Format 4.01 section 19) parsers and writers, `dependsOn` ordering | `memchr`, `serde_json` |
 | `odata-axum` | HTTP to library types and back, `$metadata` router; behind feature `axum` | `axum`, `http`, the four above |
@@ -124,7 +124,9 @@ proptest round trips (AST to URL to AST, model to CSDL XML to model, model to
 CSDL JSON to model); criterion benches for `parse` and `$metadata` build;
 Miri on the parser crates' unit tests; a compiling example on every public
 item. Dependencies with `unsafe` in their own source that the crates keep:
-`memchr` (SIMD) and `serde_json`, both already in `Cargo.lock`.
+`memchr` (SIMD), `serde_json` and `regex` (`odata-csdl`, T-3502), all already in `Cargo.lock`.
+Amended (T-3502): criterion is not in `Cargo.lock`, so the `$metadata` bench is a `harness = false`
+bench on `std::time::Instant`; criterion replaces it when `bench-surfaces` brings criterion in.
 
 ## Consequences
 
