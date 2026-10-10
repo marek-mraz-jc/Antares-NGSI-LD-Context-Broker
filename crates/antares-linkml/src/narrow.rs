@@ -22,6 +22,9 @@ pub(crate) const LIMITS: Limits = Limits {
     max_elements: 20_000,
 };
 
+/// A class's slots a caller may see, each as the class refines it.
+type Shown = Vec<(String, Slot)>;
+
 /// The source schema narrowed to `visible`, under the id
 /// `<source id>/views/<view>`, so a narrowed document never claims to be the
 /// full model (section 8 decision). The second value is whether anything of
@@ -38,7 +41,7 @@ pub(crate) fn narrow(
         .filter(|c| visible.shows_type(&source.class_iri(c)))
         .map(String::as_str)
         .collect();
-    let shown = |class: &str| -> Vec<(String, Slot)> {
+    let shown = |class: &str| -> Shown {
         let iri = source.class_iri(class);
         source
             .class_slots(class)
@@ -47,21 +50,22 @@ pub(crate) fn narrow(
             .map(|(name, slot)| (name.to_owned(), slot))
             .collect()
     };
-    let per_class: BTreeMap<&str, Vec<(String, Slot)>> =
-        kept.iter().map(|c| (*c, shown(c))).collect();
+    let per_class: BTreeMap<&str, (&Class, Shown)> = s
+        .classes
+        .iter()
+        .filter(|(c, _)| kept.contains(c.as_str()))
+        .map(|(c, class)| (c.as_str(), (class, shown(c))))
+        .collect();
     let slot_names: BTreeSet<&str> = per_class
         .values()
-        .flatten()
+        .flat_map(|(_, slots)| slots)
         .map(|(n, _)| n.as_str())
         .collect();
 
     let rewrite = |slot: &Slot| rewrite(source, &kept, &slot_names, slot);
 
     let mut classes = BTreeMap::new();
-    for (name, slots) in &per_class {
-        let Some(class) = s.classes.get(*name) else {
-            continue;
-        };
+    for (name, (class, slots)) in &per_class {
         // `is_a` holds only when the parent is visible and shows nothing the
         // child does not: LinkML would otherwise hand the child the
         // parent's slots back.
@@ -69,7 +73,7 @@ pub(crate) fn narrow(
         let is_a = class.is_a.clone().filter(|p| {
             per_class
                 .get(p.as_str())
-                .is_some_and(|ps| ps.iter().all(|(n, _)| own.contains(n.as_str())))
+                .is_some_and(|(_, ps)| ps.iter().all(|(n, _)| own.contains(n.as_str())))
         });
         let slot_usage = slots
             .iter()
@@ -98,11 +102,12 @@ pub(crate) fn narrow(
 
     let enums = used_enums(source, &slots, &classes);
 
+    // Left out: a hidden class, or a slot a kept class does not show. A slot
+    // no class uses goes too; it names nothing a caller could see.
     let left_out = classes.len() != s.classes.len()
-        || slots.len() != s.slots.len()
         || per_class
-            .keys()
-            .any(|c| per_class.get(c).map(Vec::len) != Some(source.class_slots(c).len()));
+            .iter()
+            .any(|(c, (_, slots))| slots.len() != source.class_slots(c).len());
     let mut narrowed = Schema {
         id: format!("{}/views/{view}", s.id.trim_end_matches(['/', '#'])),
         name: s.name.clone(),
@@ -222,7 +227,8 @@ mod tests {
       "id": "https://e.org/city", "name": "city", "version": "2.1.0",
       "prefixes": {
         "city": {"prefix_prefix": "city", "prefix_reference": "https://e.org/city/"},
-        "secret": {"prefix_prefix": "secret", "prefix_reference": "https://hidden.e.org/"}
+        "secret": {"prefix_prefix": "secret", "prefix_reference": "https://hidden.e.org/"},
+        "unece": {"prefix_prefix": "unece", "prefix_reference": "http://unece.org/rec20/"}
       },
       "default_prefix": "city",
       "classes": {
@@ -232,7 +238,8 @@ mod tests {
         "Person": {"class_uri": "secret:Person", "slots": ["name", "car"]}
       },
       "slots": {
-        "name": {}, "speed": {"range": "float"},
+        "name": {},
+        "speed": {"range": "float", "unit": {"ucum_code": "km/h", "exact_mappings": ["unece:KMH"]}},
         "owner": {"range": "Person", "inverse": "car"},
         "car": {"range": "Car", "inverse": "owner"},
         "fuel": {"range": "Fuel"}, "vin": {}
@@ -267,12 +274,17 @@ mod tests {
         assert_eq!(s.id, "https://e.org/city/views/cars");
         assert_eq!(s.version.as_deref(), Some("2.1.0"));
         assert_eq!(s.classes.keys().collect::<Vec<_>>(), ["Car", "Thing"]);
-        assert_eq!(s.prefixes.keys().collect::<Vec<_>>(), ["city"], "LK6");
+        assert_eq!(
+            s.prefixes.keys().collect::<Vec<_>>(),
+            ["city", "unece"],
+            "LK6: the unit's prefix stays, the hidden class's goes"
+        );
         let owner = &s.slots["owner"];
         assert_eq!(owner.range.as_deref(), Some("uriorcurie"), "LK1");
         assert_eq!(owner.inverse, None);
         assert_eq!(m.kind(owner), "Relationship", "the kind survives the range");
-        assert!(!s.slots.contains_key("vin") && !s.slots.contains_key("car"));
+        assert!(!s.slots.contains_key("vin"));
+        assert!(!s.slots.contains_key("car"));
         assert_eq!(s.enums.keys().collect::<Vec<_>>(), ["Fuel"]);
         let car = &s.classes["Car"];
         assert_eq!(car.is_a.as_deref(), Some("Thing"));
@@ -332,6 +344,49 @@ mod tests {
     #[test]
     fn nothing_visible_is_an_empty_schema_not_an_error() {
         let (m, left_out) = narrow(&model(SOURCE), &Visible::default(), "none").expect("ok");
-        assert!(left_out && m.schema().classes.is_empty() && m.schema().slots.is_empty());
+        assert!(left_out);
+        assert!(m.schema().classes.is_empty());
+        assert!(m.schema().slots.is_empty());
+    }
+
+    /// Every class and every slot, Person's under its own namespace.
+    fn everything(attrs: &[&str]) -> Visible {
+        antares_ops::Visible::from_filter(&Filter {
+            rules: vec![Rule {
+                types: [
+                    "https://e.org/city/Thing",
+                    "https://e.org/city/Car",
+                    "https://hidden.e.org/Person",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+                attributes: attrs
+                    .iter()
+                    .map(|a| format!("https://e.org/city/{a}"))
+                    .collect(),
+                ..Rule::default()
+            }],
+            ..Filter::default()
+        })
+    }
+
+    #[test]
+    fn everything_visible_leaves_nothing_out() {
+        let all = ["name", "speed", "owner", "car", "fuel", "vin"];
+        let (m, left_out) = narrow(&model(SOURCE), &everything(&all), "all").expect("narrowed");
+        assert!(!left_out);
+        assert_eq!(m.schema().classes.len(), 3);
+        let (_, left_out) =
+            narrow(&model(SOURCE), &everything(&all[..5]), "all").expect("narrowed");
+        assert!(left_out, "every class kept, one slot hidden");
+    }
+
+    #[test]
+    fn an_inverse_to_a_hidden_slot_goes_and_the_range_stays() {
+        let (m, _) =
+            narrow(&model(SOURCE), &everything(&["owner", "name"]), "v").expect("narrowed");
+        let owner = &m.schema().slots["owner"];
+        assert_eq!(owner.range.as_deref(), Some("Person"));
+        assert_eq!(owner.inverse, None);
     }
 }

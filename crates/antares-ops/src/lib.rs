@@ -96,7 +96,7 @@ pub struct Ops {
 pub struct ViewOps {
     inner: Ops,
     view: Arc<antares_api::views::CompiledView>,
-    tenant: String,
+    tenant: antares_model::TenantId,
     operations: Vec<OperationId>,
     linkml: Option<Arc<[u8]>>,
 }
@@ -293,6 +293,8 @@ impl Ops {
         else {
             return None;
         };
+        // The loader stored the tenant it validated, so this never refuses.
+        let tenant = antares_model::TenantId::new(tenant).ok()?;
         let mut cache = self.views.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(hit) = cache.get(id).filter(|c| Arc::ptr_eq(&c.view, view)) {
             return Some(hit.clone());
@@ -300,7 +302,7 @@ impl Ops {
         let made = ViewOps {
             inner: Self::new(self.state.with_view(view.clone())),
             view: view.clone(),
-            tenant: tenant.clone(),
+            tenant,
             operations: operations
                 .iter()
                 .filter_map(|o| OperationId::from_id(o))
@@ -403,12 +405,10 @@ impl ViewOps {
         let Some(clause) = op.gate_clause().filter(|_| self.allows(op)) else {
             return Err(Refusal::NotAllowed { allow: Vec::new() });
         };
-        let tenant = antares_model::TenantId::new(&self.tenant)
-            .map_err(|_| Refusal::Denied("the view's tenant is not valid".into()))?;
         let engine = match self.inner.state.policy.as_deref() {
             None => Ok(policy::Filter::default()),
             Some(engine) => {
-                let subject = antares_api::policy::subject_of(&tenant, &caller.0);
+                let subject = antares_api::policy::subject_of(&self.tenant, &caller.0);
                 let asked = policy::Operation {
                     types,
                     attrs,
@@ -431,30 +431,24 @@ impl ViewOps {
     /// view's Tenant (MCP D-3). The probe fails closed: an engine that fails
     /// it offers nothing.
     pub async fn offered(&self, caller: &Caller, ops: &[OperationId]) -> Vec<bool> {
-        let Ok(tenant) = antares_model::TenantId::new(&self.tenant) else {
-            return vec![false; ops.len()];
-        };
-        let asked: Vec<(usize, &'static str)> = ops
+        let asked = |op: &OperationId| self.allows(*op) && op.gate_clause().is_some();
+        let clauses: Vec<&'static str> = ops
             .iter()
-            .enumerate()
-            .filter(|(_, op)| self.allows(**op))
-            .filter_map(|(i, op)| op.gate_clause().map(|c| (i, c)))
+            .filter(|op| asked(op))
+            .filter_map(|op| op.gate_clause())
             .collect();
-        let clauses: Vec<&'static str> = asked.iter().map(|(_, c)| *c).collect();
-        let answers = antares_api::policy::offers(
+        let mut answers = antares_api::policy::offers(
             self.inner.state.policy.as_deref(),
-            &tenant,
+            &self.tenant,
             &caller.0,
             &clauses,
         )
-        .await;
-        let mut out = vec![false; ops.len()];
-        for ((i, _), yes) in asked.iter().zip(answers) {
-            if let Some(slot) = out.get_mut(*i) {
-                *slot = yes;
-            }
-        }
-        out
+        .await
+        .into_iter();
+        // The answers come in the order asked; a short answer offers nothing.
+        ops.iter()
+            .map(|op| asked(op) && answers.next().unwrap_or(false))
+            .collect()
     }
 
     /// Run `op` through the view, as [`Ops::run`] does, in the view's
@@ -485,7 +479,7 @@ impl ViewOps {
                     .to_str()
                     .ok()
                     .and_then(|t| antares_model::TenantId::new(t).ok())
-                    .is_some_and(|t| t.as_str() == self.tenant);
+                    .is_some_and(|t| t.as_str() == self.tenant.as_str());
                 if !same {
                     return Err(Refusal::Malformed(OTHER));
                 }
@@ -496,7 +490,7 @@ impl ViewOps {
         let mut headers = caller.0.clone();
         headers.insert(
             TENANT,
-            HeaderValue::from_str(&self.tenant).map_err(|_| Refusal::Malformed(OTHER))?,
+            HeaderValue::from_str(self.tenant.as_str()).map_err(|_| Refusal::Malformed(OTHER))?,
         );
         let mut answer = self.inner.run(op, &Caller(headers), req).await?;
         if !named {
@@ -731,7 +725,8 @@ mod tests {
             ..policy::Filter::default()
         };
         let v = Visible::from_filter(&filter);
-        assert!(v.shows_type(&iri("Car")) && v.shows_type(&iri("Bus")));
+        assert!(v.shows_type(&iri("Car")));
+        assert!(v.shows_type(&iri("Bus")));
         assert!(!v.shows_type(&iri("Tram")));
         assert!(v.shows_attribute(&iri("Car"), &iri("speed")));
         assert!(

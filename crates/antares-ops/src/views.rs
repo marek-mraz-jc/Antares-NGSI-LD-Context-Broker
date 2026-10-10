@@ -708,6 +708,12 @@ mod tests {
         both["scopeQ"] = json!(pad);
         let e = load(&both).err().unwrap_or_default();
         assert!(e.contains("beside its linkml member"), "{e}");
+        let over = format!("{{\"linkml\": \"{}\"}}", "x".repeat(MAX_DOC_BYTES));
+        let e = View::parse(over.as_bytes()).err().unwrap_or_default();
+        assert!(
+            e.contains("at most"),
+            "past the whole bound, linkml or not: {e}"
+        );
     }
 
     #[test]

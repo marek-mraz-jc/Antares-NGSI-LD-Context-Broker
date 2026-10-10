@@ -462,3 +462,23 @@ async fn a_class_or_slot_request_names_it_to_the_engine() {
     // A name the schema lacks never reaches the engine: the same 404.
     assert_eq!(get(&app, "classes/Nothing").await.0, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn model_answers_the_formalism_accept_names() {
+    let app = broker(None, &view(&READS, &schema()))
+        .await
+        .expect("a broker");
+    let uri = "/x/views/cars/linkml/schema/v2/model";
+    for (accept, media_type) in [
+        (
+            "text/turtle; profile=\"owl\"",
+            "text/turtle; profile=\"owl\"",
+        ),
+        ("text/yaml", "text/yaml"),
+        ("application/json", "application/schema+json"),
+    ] {
+        let (s, h, _) = send(&app, "GET", uri, &[("Accept", accept)], None).await;
+        assert_eq!(s, StatusCode::OK, "{accept}");
+        assert_eq!(h[header::CONTENT_TYPE], media_type, "{accept}");
+    }
+}

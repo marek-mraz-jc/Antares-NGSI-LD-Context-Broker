@@ -195,6 +195,13 @@ async fn a_view_is_refused_before_it_is_stored() {
     let big = "x".repeat(MAX_VIEW_BYTES + 1);
     let (s, _) = send_raw(&app, Method::PUT, "/q/views/v", None, Some(big)).await;
     assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
+    // A `linkml` member has its own bound; the rest of the document keeps
+    // the view's.
+    let mut padded = view("v");
+    padded["linkml"] = json!({"id": "https://e.org/s", "name": "s"});
+    padded["scopeQ"] = json!("x".repeat(MAX_VIEW_BYTES));
+    let (s, body) = put(&app, "v", &padded).await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     let (s, _) = send_raw(&app, Method::PUT, "/q/views/v", None, Some("{".into())).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }

@@ -179,18 +179,17 @@ impl Rendered {
             })
             .collect();
         let s = model.schema();
-        let mut described = json!({
-            "name": s.name,
-            "version": major,
-            "semver": s.version,
-            "types": s.classes.keys().collect::<Vec<_>>(),
-            "artifacts": artifacts,
-        });
+        let mut described = Map::new();
+        described.insert("name".into(), json!(s.name));
+        described.insert("version".into(), json!(major));
+        described.insert("semver".into(), json!(s.version));
+        described.insert("types".into(), json!(s.classes.keys().collect::<Vec<_>>()));
+        described.insert("artifacts".into(), Value::Object(artifacts));
         if left_out {
             // Whether anything was left out, never what (the platform's EP-47).
-            insert(&mut described, "redacted", Value::Bool(true));
+            described.insert("redacted".into(), Value::Bool(true));
         }
-        let index = json!({"endpoint": view, "models": [described]});
+        let index = json!({"endpoint": view, "models": [Value::Object(described)]});
         Self {
             index: Arc::from(index.to_string().into_bytes()),
             model,
@@ -213,16 +212,19 @@ impl Rendered {
         let slots: Vec<Value> = m
             .class_slots(name)
             .iter()
-            .map(|(n, s)| self.slot_json(n, s))
+            .map(|(n, s)| Value::Object(self.slot_json(n, s)))
             .collect();
-        let mut doc = json!({"name": name, "iri": m.class_iri(name), "slots": slots});
+        let mut doc = Map::new();
+        doc.insert("name".into(), json!(name));
+        doc.insert("iri".into(), json!(m.class_iri(name)));
+        doc.insert("slots".into(), Value::Array(slots));
         if let Some(parent) = &class.is_a {
-            insert(&mut doc, "is_a", json!(parent));
+            doc.insert("is_a".into(), json!(parent));
         }
         if let Some(d) = &class.description {
-            insert(&mut doc, "description", json!(d));
+            doc.insert("description".into(), json!(d));
         }
-        Some(Arc::from(doc.to_string().into_bytes()))
+        Some(Arc::from(Value::Object(doc).to_string().into_bytes()))
     }
 
     /// One visible slot with the visible classes that use it (L9).
@@ -236,35 +238,30 @@ impl Rendered {
             .filter(|c| m.class_slots(c).iter().any(|(n, _)| *n == name))
             .collect();
         let mut doc = self.slot_json(name, slot);
-        insert(&mut doc, "classes", json!(classes));
-        Some(Arc::from(doc.to_string().into_bytes()))
+        doc.insert("classes".into(), json!(classes));
+        Some(Arc::from(Value::Object(doc).to_string().into_bytes()))
     }
 
-    fn slot_json(&self, name: &str, slot: &linkml_model::Slot) -> Value {
+    fn slot_json(&self, name: &str, slot: &linkml_model::Slot) -> Map<String, Value> {
         let m = &self.model;
         let range = match m.range(slot) {
             Range::Type(b) => b.name(),
             Range::Class(c) | Range::Enum(c) => c,
         };
-        let mut doc = json!({
-            "name": name,
-            "iri": m.slot_iri(name),
-            "range": range,
-            "kind": m.kind(slot),
-            "required": slot.required.unwrap_or(false),
-            "multivalued": slot.multivalued.unwrap_or(false),
-        });
+        let mut doc = Map::new();
+        doc.insert("name".into(), json!(name));
+        doc.insert("iri".into(), json!(m.slot_iri(name)));
+        doc.insert("range".into(), json!(range));
+        doc.insert("kind".into(), json!(m.kind(slot)));
+        doc.insert("required".into(), json!(slot.required.unwrap_or(false)));
+        doc.insert(
+            "multivalued".into(),
+            json!(slot.multivalued.unwrap_or(false)),
+        );
         if let Some(d) = &slot.description {
-            insert(&mut doc, "description", json!(d));
+            doc.insert("description".into(), json!(d));
         }
         doc
-    }
-}
-
-/// `value` as member `key` of the object `doc`.
-fn insert(doc: &mut Value, key: &str, value: Value) {
-    if let Some(o) = doc.as_object_mut() {
-        o.insert(key.to_owned(), value);
     }
 }
 
@@ -369,6 +366,14 @@ impl Cache {
     }
 
     #[cfg(test)]
+    fn sources(&self) -> usize {
+        self.sources
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries
             .lock()
@@ -405,6 +410,7 @@ mod tests {
         assert_eq!(major(Some("3.0.1")), "3");
         assert_eq!(major(Some("12")), "12");
         assert_eq!(major(Some("v3")), "1");
+        assert_eq!(major(Some(".1")), "1");
         assert_eq!(major(None), "1");
     }
 
@@ -441,8 +447,12 @@ mod tests {
         let schema: Arc<[u8]> = Arc::from(SCHEMA);
         for i in 0..=crate::CACHE_ENTRIES {
             cache.get(&format!("v{i}"), &schema, &visible(&[]));
+            let own: Arc<[u8]> =
+                Arc::from(format!(r#"{{"id": "https://e.org/s{i}", "name": "s"}}"#).into_bytes());
+            cache.source("v", &own);
         }
         assert_eq!(cache.len(), crate::CACHE_ENTRIES);
+        assert_eq!(cache.sources(), crate::CACHE_ENTRIES);
     }
 
     #[test]
@@ -471,5 +481,85 @@ mod tests {
         );
         assert_eq!(model["artifacts"]["model.linkml.yaml"]["bytes"], yaml.len());
         assert_eq!(model["artifacts"].as_object().map(Map::len), Some(7));
+    }
+
+    #[test]
+    fn model_picks_the_formalism_accept_names() {
+        for (accept, artifact) in [
+            ("text/turtle", Artifact::Shacl),
+            ("text/turtle; profile=\"owl\"", Artifact::Owl),
+            ("text/turtle; profile=\"rdf\"", Artifact::Rdf),
+            ("text/yaml", Artifact::LinkMl),
+            ("text/markdown", Artifact::Markdown),
+            ("application/ld+json", Artifact::Context),
+            ("application/json", Artifact::JsonSchema),
+            ("", Artifact::JsonSchema),
+        ] {
+            assert_eq!(Artifact::of("model", accept), Some(artifact), "{accept}");
+        }
+    }
+
+    #[test]
+    fn a_schema_is_read_once_per_bytes_and_each_view_schema_pair_rendered_apart() {
+        let cache = Cache::default();
+        let a = cache.source("v", &Arc::from(SCHEMA)).expect("reads");
+        let again = cache.source("v", &Arc::from(SCHEMA)).expect("hit");
+        assert!(Arc::ptr_eq(&a, &again), "equal bytes, one read");
+        assert_eq!(cache.sources(), 1);
+        let other: Arc<[u8]> = Arc::from(&br#"{"id": "https://e.org/t", "name": "t"}"#[..]);
+        let first = cache
+            .get("v", &Arc::from(SCHEMA), &visible(&[]))
+            .expect("renders");
+        let second = cache.get("v", &other, &visible(&[])).expect("renders");
+        assert!(!Arc::ptr_eq(&first, &second), "same view, another schema");
+    }
+
+    #[test]
+    fn a_class_and_a_slot_carry_what_they_state() {
+        let schema: Arc<[u8]> = Arc::from(
+            &br#"{"id": "https://e.org/s", "name": "s",
+              "classes": {"Thing": {"slots": ["label"], "description": "Anything."},
+                          "Room": {"is_a": "Thing", "slots": ["temperature"]}},
+              "slots": {"label": {"description": "What it is called."}, "temperature": {}}}"#[..],
+        );
+        let all = Visible::from_filter(&Filter {
+            rules: vec![Rule {
+                types: vec![
+                    "https://e.org/s/Thing".into(),
+                    "https://e.org/s/Room".into(),
+                ],
+                attributes: vec![
+                    "https://e.org/s/label".into(),
+                    "https://e.org/s/temperature".into(),
+                ],
+                ..Rule::default()
+            }],
+            ..Filter::default()
+        });
+        let r = Cache::default().get("v", &schema, &all).expect("renders");
+        let json = |b: Option<Arc<[u8]>>| -> Value {
+            serde_json::from_slice(&b.expect("served")).expect("json")
+        };
+        let room = json(r.class("Room"));
+        assert_eq!(
+            (room["is_a"].as_str(), room.get("description")),
+            (Some("Thing"), None)
+        );
+        let thing = json(r.class("Thing"));
+        assert_eq!(
+            (thing.get("is_a"), thing["description"].as_str()),
+            (None, Some("Anything."))
+        );
+        assert_eq!(json(r.slot("label"))["description"], "What it is called.");
+        assert_eq!(json(r.slot("temperature")).get("description"), None);
+        assert_eq!(json(r.slot("temperature"))["classes"], json!(["Room"]));
+        let index: Value = serde_json::from_slice(&r.index).expect("json");
+        assert_eq!(
+            index["models"][0].get("redacted"),
+            None,
+            "nothing was left out"
+        );
+        assert!(r.class("Nothing").is_none());
+        assert!(r.slot("nothing").is_none());
     }
 }

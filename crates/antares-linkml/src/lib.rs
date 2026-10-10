@@ -107,8 +107,9 @@ impl Wanted {
                 major: version.strip_prefix('v')?.to_owned(),
                 artifact: Artifact::of(name, accept)?,
             }),
-            ["classes", name] if !name.is_empty() => Some(Self::Class((*name).to_owned())),
-            ["slots", name] if !name.is_empty() => Some(Self::Slot((*name).to_owned())),
+            // An empty name is a class or slot no schema holds: 404 below.
+            ["classes", name] => Some(Self::Class((*name).to_owned())),
+            ["slots", name] => Some(Self::Slot((*name).to_owned())),
             _ => None,
         }
     }
@@ -185,9 +186,7 @@ async fn answer(
     let visible = view
         .visible(caller, wanted.operation(), &types, &attrs)
         .await?;
-    let Some(rendered) = cache.get(id, schema, &visible) else {
-        return Err(Refusal::NotFound);
-    };
+    let rendered = cache.get(id, schema, &visible).ok_or(Refusal::NotFound)?;
     let found = match wanted {
         Wanted::Index => Some((render::JSON, rendered.index.clone())),
         Wanted::Document { major, artifact } => (*major == rendered.major)
@@ -202,7 +201,12 @@ async fn answer(
 
 /// `body` as `GET` or `HEAD` answers it: a strong `ETag` of the bytes,
 /// `Cache-Control: private, no-cache`, 304 when `If-None-Match` names it.
-fn respond(method: &Method, headers: &HeaderMap, media_type: &str, body: &[u8]) -> Response {
+fn respond(
+    method: &Method,
+    headers: &HeaderMap,
+    media_type: &'static str,
+    body: &[u8],
+) -> Response {
     let etag = format!("\"{}\"", render::sha256(body));
     let matched = headers
         .get_all(header::IF_NONE_MATCH)
@@ -222,17 +226,18 @@ fn respond(method: &Method, headers: &HeaderMap, media_type: &str, body: &[u8]) 
         (status, axum::body::Body::from(body.to_vec())).into_response()
     };
     let h = response.headers_mut();
-    if let Ok(v) = HeaderValue::from_str(&etag) {
-        h.insert(header::ETAG, v);
-    }
+    // A quoted hex digest is always a header value; the fallback is never
+    // sent.
+    h.insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("\"\"")),
+    );
     h.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-cache"),
     );
     if !matched {
-        if let Ok(v) = HeaderValue::from_str(media_type) {
-            h.insert(header::CONTENT_TYPE, v);
-        }
+        h.insert(header::CONTENT_TYPE, HeaderValue::from_static(media_type));
         h.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
     }
     response
@@ -263,11 +268,11 @@ mod tests {
             Wanted::of("classes/Car", ""),
             Some(Wanted::Class("Car".into()))
         );
+        assert_eq!(Wanted::of("slots/", ""), Some(Wanted::Slot(String::new())));
         for other in [
             "schema",
             "schema/2/model.md",
             "schema/v2/model.xml",
-            "classes/",
             "classes/Car/x",
             "slots",
             "",
@@ -286,6 +291,10 @@ mod tests {
             HeaderValue::from_str(&format!("\"x\", W/{etag}")).expect("a value"),
         );
         let r = respond(&Method::GET, &headers, "text/yaml", &body);
+        assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
+        let mut any = HeaderMap::new();
+        any.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        let r = respond(&Method::GET, &any, "text/yaml", &body);
         assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(r.headers()[header::ETAG], etag.as_str());
         let r = respond(&Method::HEAD, &HeaderMap::new(), "text/yaml", &body);

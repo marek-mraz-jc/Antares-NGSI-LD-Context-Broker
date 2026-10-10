@@ -59,3 +59,11 @@ function = "Server::call" # v0 mangling puts the impl between the crate and the 
 lines = 5
 branches = 0
 reason = "tracing::info! repeats the fields in its `log` fallback, which runs only with no subscriber set; tests/mcp_log.rs covers the subscriber path and asserts what it logs"
+
+[[exclusion]]
+crate = "antares-linkml"
+file = "src/render.rs"
+function = "Cache::get" # v0 mangling puts the impl between the crate and the type
+lines = 2
+branches = 0
+reason = "Model::new refusing a narrowing of a model that loaded: narrow keeps every name the kept elements use (a range to a hidden class becomes uriorcurie, enums and prefixes are kept by use), so no test schema reaches it; the arm keeps a narrowing defect from being served"
