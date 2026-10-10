@@ -34,7 +34,8 @@ pub use expand::{
     RESERVED_MEMBERS,
 };
 pub use loader::{
-    allow_private_egress, client_builder, core_context, http_interaction, install_crypto_provider,
-    io_deadline, slow_factor, with_timeouts, wrap_client, CtxUsage, EgressPolicy, HttpClient,
-    Loader, CORE_CONTEXT, INTERNAL_FETCH_HEADER, MAX_CONTEXT_URLS, MAX_REDIRECTS,
+    allow_private_egress, client_builder, core_context, core_context_url, http_interaction,
+    install_crypto_provider, io_deadline, slow_factor, with_timeouts, wrap_client, CtxUsage,
+    EgressPolicy, HttpClient, Loader, CORE_CONTEXT, INTERNAL_FETCH_HEADER, MAX_CONTEXT_URLS,
+    MAX_REDIRECTS,
 };
