@@ -1004,6 +1004,29 @@ pub(crate) async fn pre_image(
         .await
         .ok()
         .flatten();
+    image(stored, body)
+}
+
+/// The [`PreImage`] of a temporal write by id (5.6.12 to 5.6.16, T-3607):
+/// the Entity's temporal evolution, which a history-only Entity has
+/// without a current state, else its current state. Read only with an
+/// engine attached, as [`pre_image`].
+pub(crate) async fn temporal_pre_image(
+    st: &crate::state::AppState,
+    tenant: &antares_model::TenantId,
+    id: &str,
+) -> PreImage {
+    if st.policy.is_none() {
+        return PreImage::default();
+    }
+    match st.temporal.get(tenant, id).await.ok().flatten() {
+        Some(evolution) => image(Some(evolution), None),
+        None => pre_image(st, tenant, id, None).await,
+    }
+}
+
+/// The image of a stored document, with the types the body adds.
+fn image(stored: Option<Value>, body: Option<&Value>) -> PreImage {
     let mut types: Vec<String> = Vec::new();
     for doc in stored.as_ref().into_iter().chain(body) {
         for t in entity_types(doc) {
