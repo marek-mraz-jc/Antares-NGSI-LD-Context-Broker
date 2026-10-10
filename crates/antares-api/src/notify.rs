@@ -2269,7 +2269,7 @@ async fn deliver_as(
             crate::policy::NotifyDecision::Filter(f) => {
                 // a condition the notification path cannot re-run is not a
                 // narrowing it can claim to have applied
-                if f.q.is_some() || f.scope_q.is_some() || f.geo_q.is_some() {
+                if f.q.is_some() || f.scope_q.is_some() || f.areas().next().is_some() {
                     tracing::error!(
                         "policy engine {} narrowed a notification with a query; dropping it",
                         engine.name()

@@ -188,7 +188,11 @@ caller filtering by Scope of its own is served the Scopes both select and
 never a Scope the engine ruled out — and `pick`/`omit` project members out
 of every document the answer carries, the Entities `join=` reaches over a
 Relationship included; there is no member it can add and no row it can
-widen the answer to. A `pick`/`omit` name is read in the core `@context`,
+widen the answer to. Its areas, `geo_q` and the list `geo_also`, each
+narrow too: the store query holds them beside the request's own geoquery
+and every one must hold, so a view and an engine that both narrow by area
+compose into one `Filter` with both (`Filter::areas()` reads them all). An
+engine with one area sets `geo_q` and leaves `geo_also` empty. A `pick`/`omit` name is read in the core `@context`,
 never in the caller's, so a request cannot rebind the term a rule names
 and step out from under it; write the rule as an IRI and it is used as written, write it
 as a short name and it means what the default `@context` says. Set

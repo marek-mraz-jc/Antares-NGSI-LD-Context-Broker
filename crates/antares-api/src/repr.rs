@@ -196,11 +196,11 @@ pub fn narrow_projection(
 /// policy pick is applied to Attributes and never to the core members.
 pub fn narrow_repr(r: &mut Repr, f: &crate::policy::Filter) {
     let rules = type_rules(f);
-    if f.q.is_some() || f.scope_q.is_some() || f.geo_q.is_some() || rules.is_some() {
+    if f.q.is_some() || f.scope_q.is_some() || f.areas().next().is_some() || rules.is_some() {
         r.policy_reach = Some(std::sync::Arc::new(PolicyReach {
             q: f.q.as_deref().cloned(),
             scope_q: f.scope_q.clone(),
-            geo_q: f.geo_q.clone(),
+            areas: f.areas().cloned().collect(),
             rules: rules.clone(),
         }));
     }
@@ -342,13 +342,14 @@ pub(crate) fn order_as_shown<E>(
     Ok(())
 }
 
-/// The rows a narrowing admits (ADR-0020 `Filter::q`, `scope_q` and
-/// `geo_q`).
+/// The rows a narrowing admits (ADR-0020 `Filter::q`, `scope_q` and its
+/// areas).
 #[derive(Debug, Clone)]
 pub struct PolicyReach {
     pub q: Option<antares_ql::QNode>,
     pub scope_q: Option<String>,
-    pub geo_q: Option<Box<antares_ql::geo::GeoQuery>>,
+    /// Every area the narrowing holds; each must hold (ADR-0023 rule 1).
+    pub areas: Vec<antares_ql::geo::GeoQuery>,
     /// The narrowing's expanded rules: an Entity none of them holds for is
     /// not admitted (ADR-0023 rule 11).
     pub rules: Option<std::sync::Arc<crate::policy::Filter>>,
@@ -375,10 +376,8 @@ pub(crate) async fn policy_admits(
             return false;
         }
     }
-    if let Some(geo) = &reach.geo_q {
-        if !geo.matches(doc, ctx) {
-            return false;
-        }
+    if !reach.areas.iter().all(|geo| geo.matches(doc, ctx)) {
+        return false;
     }
     match &reach.q {
         Some(ast) => {
