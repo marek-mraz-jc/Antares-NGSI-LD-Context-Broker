@@ -386,12 +386,40 @@ pub async fn serve_context(
 ) -> Response {
     let go = async {
         let tenant = tenant_from(&headers)?;
-        check_params(&params, &["details", "local"])?;
+        check_params(&params, &["details", "local", "core"])?;
         gate!(st, &tenant, &headers, "5.13.4", ids: &[&id]).await?;
         let details = details_param(&params)?;
+        // TS 104 175 13.4.4: `core` with `details` is a BadRequest, and so is
+        // a `core` that names no NGSI-LD version this build has a core for
+        let core = match params.get("core") {
+            Some(_) if details => {
+                return Err(NgsiError::BadRequestData("core and details together".into()).into())
+            }
+            Some(v) => Some(antares_jsonld::core_context_url(v).ok_or_else(|| {
+                NgsiError::BadRequestData(format!("core {v:?} is not a known major.minor version"))
+            })?),
+            None => None,
+        };
         let entry = find_entry(&st, &tenant, &id)
             .await?
             .ok_or_else(|| NgsiError::ResourceNotFound(format!("@context {id} not found")))?;
+        // the user @context's location and the core one, for every kind: the
+        // pair is two URLs, not the content a Cached entry never serves
+        if let Some(core) = core {
+            let user = match &entry {
+                CtxEntry::Stored(doc) => doc["url"].as_str().unwrap_or_default().to_owned(),
+                CtxEntry::Cached(u) => u.url.clone(),
+                CtxEntry::Core(url) => url.clone(),
+            };
+            let mut resp = (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                axum::Json(json!([user, core])),
+            )
+                .into_response();
+            echo_tenant(&tenant, &mut resp);
+            return Ok(resp);
+        }
         let payload = match &entry {
             CtxEntry::Stored(doc) => {
                 let kind = doc["kind"].as_str().unwrap_or("Hosted");
@@ -478,31 +506,33 @@ pub async fn delete_context(
         gate!(st, &tenant, &headers, "5.13.5", ids: &[&id]).await?;
 
         let reload = reload_param(&params)?;
-        let entry = find_entry(&st, &tenant, &id).await?;
+        // an unknown id is 404 before any reload bullet (5.13.5.4, 051_04_01)
+        let Some(entry) = find_entry(&st, &tenant, &id).await? else {
+            return Err(NgsiError::ResourceNotFound(format!("@context {id} not found")).into());
+        };
         if reload {
             // reload is only meaningful for Cached @contexts (5.13.5.4);
-            // unknown ids and non-Cached kinds are 400 (051_04_01/05)
+            // other kinds are 400 (051_04_05)
             return match entry {
-                Some(CtxEntry::Core(url)) => {
+                CtxEntry::Core(url) => {
                     st.loader.refetch(&url).await.map_err(ApiError::from)?;
                     Ok(no_content(&tenant))
                 }
-                Some(CtxEntry::Cached(u)) => {
+                CtxEntry::Cached(u) => {
                     st.loader.refetch(&u.url).await.map_err(ApiError::from)?;
                     Ok(no_content(&tenant))
                 }
-                _ => Err(NgsiError::BadRequestData(
+                CtxEntry::Stored(_) => Err(NgsiError::BadRequestData(
                     "reload is only valid for Cached @contexts (5.13.5)".into(),
                 )
                 .into()),
             };
         }
         match entry {
-            None => Err(NgsiError::ResourceNotFound(format!("@context {id} not found")).into()),
-            Some(CtxEntry::Core(_)) => {
+            CtxEntry::Core(_) => {
                 Err(NgsiError::BadRequestData("the core @context cannot be deleted".into()).into())
             }
-            Some(CtxEntry::Cached(u)) => {
+            CtxEntry::Cached(u) => {
                 st.loader.usage_remove(&u.url).await;
                 // The write-through row shares the deterministic local id —
                 // deleting the API entry must delete the persisted copy too,
@@ -510,7 +540,7 @@ pub async fn delete_context(
                 let _ = st.store.context_delete(Some(&tenant), &u.local_id).await;
                 Ok(no_content(&tenant))
             }
-            Some(CtxEntry::Stored(doc)) => {
+            CtxEntry::Stored(doc) => {
                 let lid = doc["localId"].as_str().unwrap_or(&id);
                 st.store.context_delete(Some(&tenant), lid).await?;
                 if let Some(url) = doc.get("url").and_then(Value::as_str) {

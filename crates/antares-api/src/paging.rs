@@ -146,9 +146,8 @@ fn paginate_impl(
     };
     let mut links = Vec::new();
     // csource resources: the suite string-compares links against
-    // `?other…&limit=N&offset=M` order with an unconditional ld+json type
-    // suffix (037_11, 041_03); entity lists keep sorted params + accept-based
-    // suffix (031_02).
+    // `?other…&limit=N&offset=M` order (037_11, 041_03); entity lists keep
+    // sorted params (031_02). The type suffix follows Accept for both.
     let csource_style = path.contains("csource");
     let mut mk = |off: usize, rel: &str| {
         let mut qp: Vec<String>;
@@ -175,10 +174,7 @@ fn paginate_impl(
         // 6.3.10: "At least, the type Link Target Attribute shall be included
         // ... and its value shall be exactly equal to the media type resulting
         // from the original request" — for EVERY media type, not just ld+json.
-        let ty = match csource_style {
-            true => "application/ld+json",
-            false => link_media_type(accept),
-        };
+        let ty = link_media_type(accept);
         links.push(format!(
             "<{path}?{}>; rel=\"{rel}\";type=\"{ty}\"",
             qp.join("&")

@@ -285,7 +285,7 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly miri test -p antares-model -p antares-ql -p antares-matcher
+      - run: cargo +nightly miri test -p antares-model -p antares-ql -p antares-matcher -p linkml-model -p odata-csdl
 
   alarm:
     # A red scheduled wall auto-files a deduped issue (the shared

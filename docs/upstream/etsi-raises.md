@@ -427,3 +427,83 @@ expectation files carry `"value": []` (and `[]` in `temporalValues`).
 Suggest `"urn:ngsi-ld:null"`, as the corrected fork does (forge commit
 fad5ab03); Antares carries that fix
 (`temporal_autorecord.rs::deleted_scope_is_the_ngsi_ld_null_in_the_temporal_representation`).
+
+---
+
+## 17. [spec] TS 104 176 answers Create and Clone Snapshot with 202, CIM 009 with 201, and gives no version to ask for either
+
+**Title:** TS 104 176 13.2.3.1 and 13.4.3.1 change 201 Created to 202
+Accepted with no migration rule
+
+**Body:**
+
+CIM 009 V1.9.1 6.36.3.1 and 6.38.3.1 answer "201 Created" with the
+Location of the created snapshot. TS 104 176 13.2.3.1 and 13.4.3.1 answer
+"202 Accepted" with "the relative path of the snapshot being created". The
+snapshot fills after the answer in both texts (5.16.1.4: the status moves
+to `ready` when every query has run), so 202 fits the operation, but a
+client written against CIM 009 reads 202 as a different outcome, and the
+Snapshot TPs assert 201.
+
+A broker could serve both through `Prefer: ngsi-ld=<version>` (4.3.6.8,
+TS 104 175 9.5.3), except that TS 104 175 states no `major.minor` of its
+own, so no client can prefer it.
+
+Antares answers 201, the CIM 009 status it states conformance to, and
+records the conflict here (T-3555). Suggest giving the TS 104 175 family a
+version a `Prefer` header can name, or keeping 201 for a snapshot created
+synchronously and 202 only where the creation itself is deferred.
+
+---
+
+## 18. [suite] 021_08 expects speed instances that fail the query
+
+**Title:** the 021_08 expectation keeps every instance of the selected
+Entity, including those that fail `q`
+
+**Body:**
+
+CIM 009 5.7.4.4, last step: "include in their temporal representation only
+the Attribute instances ... which meet the temporal, query and geoquery
+restrictions". 021_08 queries `q=speed>90` and its expectation still lists
+the speed instances below 90. Suggest dropping them, as the corrected fork
+does (forge commit 9ca4213e); Antares carries that fix
+(`temporal_autorecord.rs::temporal_query_keeps_only_the_instances_that_meet_q`).
+The clause does not say how an instance meets a `q` over several
+Attributes; Antares keeps an instance when `q` holds on the Entity with that
+Attribute narrowed to that one instance.
+
+---
+
+## 19. [suite] 037_11 and 041_03 ask without Accept and expect ld+json pagination Links
+
+**Title:** 037_11/041_03 expect `type="application/ld+json"` on the
+pagination Links of an `application/json` response
+
+**Body:**
+
+CIM 009 6.3.10: the type Link Target Attribute "shall be exactly equal to
+the media type resulting from the original request". Both test points query
+without an Accept header, so the response is `application/json`, and still
+expect `type="application/ld+json"`. Suggest sending
+`Accept: application/ld+json`, as the corrected fork does (forge commit
+c4cdb0cf, and the same line in its 037_11); Antares carries that fix and
+types every pagination Link after the response media type
+(`registration_listing_5_10_2.rs::a_registration_page_link_carries_the_requested_media_type`).
+
+---
+
+## 20. [suite] 051_04_01 expects BadRequestData for an unknown @context id with reload=true
+
+**Title:** 051_04_01 expects 400 where 5.13.5.4 raises ResourceNotFound
+
+**Body:**
+
+CIM 009 5.13.5.4, second bullet: "If the @context identifier does not
+correspond to any existing entry in the @context storage, then an error of
+type ResourceNotFound shall be raised." The reload bullets that follow
+describe an existing @context by its kind. 051_04_01 deletes an unknown id
+with `reload=true` and expects 400 BadRequestData. Suggest 404
+ResourceNotFound, as the corrected fork does (forge commit 39921641);
+Antares carries that fix
+(`contexts_5_13.rs::clause_5_13_5_delete_and_reload_errors`).

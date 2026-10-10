@@ -45,13 +45,14 @@ broker nor a storage backend (`antares-api`, `antares-broker`,
 | `antares-jsonld` | 9 040 | `@context` loader with caches and pinned core contexts, expansion/compaction, structural validation, the one outbound `client_builder` | do business logic |
 | `antares-matcher` | 432 | subscription vs entity: selector, conditions, activity, throttling | touch a store |
 | `antares-store` | 3 000 | `CurrentStateDriver`, `TemporalDriver` (object-safe, `lib.rs:140`, `:385`), `Kind`, filters/paging (`filter.rs`) | pull a backend |
-| `antares-sql` | 10 400 | AST → SQL compiler (`compile/`), migrations, the sqlx drivers (`store/pg/`), the memory/redb drivers (`store/mem/`), `AnyStore` facade (`store/any.rs`) | be called from handlers directly (see §7) |
+| `antares-sql` | 10 600 | AST → SQL compiler (`compile/`), migrations, the sqlx drivers (`store/pg/`), the memory/redb drivers (`store/mem/`), `AnyStore` facade (`store/any.rs`) | be called from handlers directly (see §7) |
 | `antares-bus` | 760 | `ChangeEvent`, the JetStream bus, subjects | decide who consumes |
 | `antares-notifier` | 1 700 | `NotificationSink` (schemes, `parse_endpoint`, `deliver`, `network`) chosen from `SinkRegistry` by endpoint scheme: http (`http.rs`), mqtt behind the feature, delivery policy, `Outbound` | match or store |
 | `antares-api` | 49 500 | the HTTP binding: routers, handlers, negotiation, federation, notification pipeline, snapshots, bounds | own a backend or a transport |
 | `antares-broker` | 3 800 | composition root: env → config, roles, bus wiring (`wiring.rs`), telemetry, shutdown | contain clause logic |
 | `antares-wasm` | 500 | the router under a Service Worker, OPFS-backed file store | diverge from the native router |
 | `antares-ops` | 1 600 | the operation layer every surface serves through (ADR-0027 section 1): `Ops` over `AppState::call`, `OperationId` (the matrix rows), `Refusal`, `Surface`; the view table (`views.rs`: `View`, load and validation, `/q/views`, reload, rule M4 closing a surface with no view) | be linked by a vanilla build, name the store, SQL, bus or notifier |
+| `odata-csdl` | 3 640 | OData 4.01 EDM model, CSDL XML and CSDL JSON writers, model validation under caller `Limits` (ADR-0024) | know its host (no `antares-*` dependency, rule M1) or read CSDL |
 
 ## 3. Module map of `antares-api/src`
 

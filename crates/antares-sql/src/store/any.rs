@@ -686,23 +686,17 @@ impl AnyStore {
     }
 
     /// Query Entities with the filter pushed down where the backend
-    /// can take it. `memory`/`file` have nothing to push into — their
-    /// entities are already in RAM — so they return the same snapshot `list`
-    /// does (never `decided`, never `paged`). Either way the caller applies
-    /// the exact filter afterwards unless the outcome says SQL already did.
+    /// can take it: SQL for Postgres, the borrowed documents for
+    /// `memory`/`file` (`Store::query_entities`). Either way the caller
+    /// applies the exact filter afterwards unless the outcome says the store
+    /// already did.
     pub async fn query_entities(
         &self,
         tenant: &TenantId,
-        #[cfg_attr(not(feature = "postgres"), allow(unused_variables))]
         f: &crate::store::filter::EntityFilter<'_>,
     ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
         let mut outcome = match self {
-            AnyStore::Mem(s) => crate::store::filter::QueryOutcome {
-                rows: s.list(tenant, Kind::Entity),
-                decided: false,
-                paged: false,
-                total: None,
-            },
+            AnyStore::Mem(s) => s.query_entities(tenant, f),
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => p.entities.query(tenant, f).await.map_err(db)?,
         };

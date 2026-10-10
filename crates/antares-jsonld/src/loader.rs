@@ -1544,6 +1544,19 @@ impl Loader {
     }
 }
 
+/// The core @context URL of NGSI-LD version `major.minor` (TS 104 175
+/// 13.4.3 `core`), for the versions whose core is pinned in this build;
+/// `None` for anything else, a malformed version included.
+pub fn core_context_url(version: &str) -> Option<&'static str> {
+    let (major, minor) = version.split_once('.')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(major) || !digits(minor) {
+        return None;
+    }
+    let want = format!("https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v{version}.jsonld");
+    PINNED.iter().map(|(u, _)| *u).find(|u| *u == want)
+}
+
 /// The `@context` of a compiled-in document, or `None` for a URL that is not
 /// pinned. The bodies are `include_str!`-ed at build time, so a body that
 /// does not parse or carries no `@context` is a build defect rather than
