@@ -168,6 +168,13 @@ async fn every_write_by_id_shows_the_engine_the_stored_entity() {
             format!("/ngsi-ld/v1/entities/{VEHICLE}"),
             Some(json!({"id": VEHICLE, "type": "Vehicle", "speed": property(json!(7))})),
         ),
+        // Set Attribute Value (TS 104 175 10.2.6) is judged as Replace Attribute
+        (
+            "5.6.19",
+            "PUT",
+            format!("{attrs}/speed/value"),
+            Some(json!(8)),
+        ),
         ("5.6.5", "DELETE", format!("{attrs}/colour"), None),
         (
             "5.6.6",
@@ -214,6 +221,16 @@ async fn an_engine_refusing_on_the_stored_type_leaves_the_store_unchanged() {
     );
     assert_eq!(
         send(&st, "DELETE", &format!("{entity}/attrs/code"), None).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(
+            &st,
+            "PUT",
+            &format!("{entity}/attrs/code/value"),
+            Some(json!(0))
+        )
+        .await,
         StatusCode::FORBIDDEN
     );
     assert_eq!(

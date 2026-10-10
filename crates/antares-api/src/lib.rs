@@ -346,10 +346,11 @@ pub fn router(state: AppState) -> Router {
                 .put(attrs::replace_attr)
                 .delete(attrs::delete_attr),
         )
-        // 2.0 #15 pre-adoption: the bare attribute value
+        // 2.0 #15 pre-adoption: the bare attribute value, and PUT is Set
+        // Attribute Value (TS 104 176 7.6.3.2)
         .route(
             "/entities/{id}/attrs/{attr}/value",
-            get(entities::retrieve_entity_attr_value),
+            get(entities::retrieve_entity_attr_value).put(attrs::set_attr_value),
         )
         // batch (6.14–6.17, 6.23, 6.31)
         .route("/entityOperations/create", post(batch::batch_create))
@@ -557,6 +558,9 @@ pub fn router(state: AppState) -> Router {
                 .layer(axum::middleware::from_fn(echo_tenant_layer)),
         )
         .fallback(not_found)
+        // T-3531: a panicking handler answers 500 instead of unwinding the
+        // connection task; inside the metrics layer so the 500 is counted.
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_500))
         // outermost on purpose: axum attaches the 405 Allow header in the
         // Router itself, above any nested layer — only a layer wrapping the
         // WHOLE router sees it.
@@ -566,6 +570,13 @@ pub fn router(state: AppState) -> Router {
         // absent knob = no layer at all: a bare OPTIONS keeps its 204 + Allow
         .layer(tower::util::option_layer(cors_layer()))
         .with_state(state)
+}
+
+/// A handler that panicked: 500 InternalError, and the broker goes on
+/// serving. The panic message stays in the log (the default hook prints it),
+/// never in the body, where it could carry a stored value.
+fn panic_500(_: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    ApiError::from(NgsiError::InternalError("the request failed".into())).into_response()
 }
 
 /// Browser access is off unless ANTARES_CORS_ORIGINS names the origins
@@ -2700,6 +2711,95 @@ mod tests {
             .await
             .expect("resp");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// TS 104 179 5.2.3/5.2.4: a Sealed Attribute is an Attribute with an
+    /// `ngsildproof` sub-property (entityIdSealed, entityTypeSealed, value =
+    /// the W3C proof). Nested under a Property it survives create, a merge
+    /// that adds a second Sealed Attribute, and retrieval, untouched: a
+    /// relaying broker altering it breaks the proof (INT-4).
+    #[tokio::test]
+    async fn ts104179_5_2_3_nested_sealed_attribute_round_trips_through_merge() {
+        let id = "urn:ngsi-ld:Car:sealed1";
+        let proof = |member: &str, value: &str| {
+            serde_json::json!({
+                "type": "Property",
+                "entityIdSealed": id,
+                "entityTypeSealed": "Car",
+                "value": {
+                    "type": "DataIntegrityProof",
+                    "cryptosuite": "eddsa-rdfc-2022",
+                    "created": "2026-10-10T17:00:00Z",
+                    "verificationMethod": format!("did:web:a.example#{member}"),
+                    "proofPurpose": "assertionMethod",
+                    "proofValue": value
+                }
+            })
+        };
+        let color = proof(
+            "color",
+            "z3FXQjecWufY46yg5abdVZsXqLhxhueuSoZgNSARiKBk9czhSePTF",
+        );
+        let parked = proof(
+            "parkedAt",
+            "z58DAdFfa9SkqZMVPxAQpic7ndSayn1PzZs6ZjWp1CktyGesjuTSw",
+        );
+        let send = |method: &str, uri: &str, doc: serde_json::Value| {
+            let body = doc.to_string();
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len())
+                .body(Body::from(body))
+                .expect("req")
+        };
+        let app = app();
+        let created = serde_json::json!({
+            "id": id, "type": "Car",
+            "color": {"type": "Property", "value": "red", "ngsildproof": color}
+        });
+        let resp = app
+            .clone()
+            .oneshot(send("POST", "/ngsi-ld/v1/entities", created))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let merge = serde_json::json!({
+            "parkedAt": {"type": "Property", "value": "P1", "ngsildproof": parked}
+        });
+        let resp = app
+            .clone()
+            .oneshot(send("PATCH", &format!("/ngsi-ld/v1/entities/{id}"), merge))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ngsi-ld/v1/entities/{id}?options=normalized"))
+                    .body(Body::empty())
+                    .expect("req"),
+            )
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let doc = body_json(resp).await;
+        for (attribute, sealed) in [("color", &color), ("parkedAt", &parked)] {
+            let served = &doc[attribute]["ngsildproof"];
+            assert_eq!(
+                served, sealed,
+                "{attribute}: the Sealed Attribute changed: {doc}"
+            );
+            assert_eq!(
+                served["value"].to_string(),
+                sealed["value"].to_string(),
+                "{attribute}: the proof is not byte-equal"
+            );
+            assert_eq!(served["entityTypeSealed"], "Car", "the original term");
+        }
+        assert_eq!(doc["color"]["value"], "red");
+        assert_eq!(doc["parkedAt"]["value"], "P1");
     }
 
     #[tokio::test]

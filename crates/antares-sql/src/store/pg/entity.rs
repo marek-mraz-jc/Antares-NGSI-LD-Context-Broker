@@ -543,7 +543,12 @@ impl PgEntityStore {
             wheres.push(format!("entity ?| ${}", binds.len()));
         }
         if let Some(node) = f.q {
-            match crate::compile::q::compile_q(node, "entity", binds.len() + 1, f.expand) {
+            match crate::compile::q::compile_q(
+                node,
+                "entity",
+                binds.len().saturating_add(1),
+                f.expand,
+            ) {
                 Some(c) => {
                     wheres.push(c.sql);
                     binds.extend(c.binds.into_iter().map(Bind::Path));
@@ -553,7 +558,9 @@ impl PgEntityStore {
         }
         if let Some(sq) = f.scope_q {
             decided = false;
-            if let Some(c) = crate::compile::scope::compile_scope_q(sq, "scopes", binds.len() + 1) {
+            if let Some(c) =
+                crate::compile::scope::compile_scope_q(sq, "scopes", binds.len().saturating_add(1))
+            {
                 wheres.push(c.sql);
                 binds.extend(c.binds.into_iter().map(Bind::Text));
             }
@@ -567,8 +574,11 @@ impl PgEntityStore {
             // identical: invalid ⇒ no pushdown, evaluator decides. Stored
             // geometries can't be invalid — the write path NULLs those.
             if self.geometry_is_valid(spec).await {
-                if let Some(c) = crate::compile::geo::compile_geo(spec, "location", binds.len() + 1)
-                {
+                if let Some(c) = crate::compile::geo::compile_geo(
+                    spec,
+                    "location",
+                    binds.len().saturating_add(1),
+                ) {
                     wheres.push(c.sql);
                     // geo binds first, then the numeric ones — the order
                     // `compile_geo` numbered its placeholders in.
@@ -656,7 +666,11 @@ impl PgEntityStore {
         if let Some(p) = f.page.as_ref().filter(|_| paged && !counted) {
             let more = docs.len() as i64 > p.limit;
             docs.truncate(p.limit as usize);
-            total = Some(p.offset + docs.len() as i64 + i64::from(more));
+            total = Some(
+                p.offset
+                    .saturating_add(docs.len() as i64)
+                    .saturating_add(i64::from(more)),
+            );
         }
         // an off-the-end counted page returns zero rows and no window
         // total — count the match set separately so links/count stay correct

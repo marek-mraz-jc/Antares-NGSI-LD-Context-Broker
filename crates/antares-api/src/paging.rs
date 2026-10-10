@@ -120,6 +120,16 @@ pub fn paginate_accept(
     paginate_impl(st, params, matches, path, accept, None)
 }
 
+/// The media type a page Link names: "exactly equal to the media type
+/// resulting from the original request" (6.3.10, TS 104 176 6.4.7.3).
+pub(crate) fn link_media_type(accept: Accept) -> &'static str {
+    match accept {
+        Accept::LdJson => "application/ld+json",
+        Accept::Json => "application/json",
+        Accept::GeoJson => "application/geo+json",
+    }
+}
+
 fn paginate_impl(
     st: &AppState,
     params: &HashMap<String, String>,
@@ -165,13 +175,14 @@ fn paginate_impl(
         // 6.3.10: "At least, the type Link Target Attribute shall be included
         // ... and its value shall be exactly equal to the media type resulting
         // from the original request" — for EVERY media type, not just ld+json.
-        let ty = match accept {
-            _ if csource_style => ";type=\"application/ld+json\"",
-            Accept::LdJson => ";type=\"application/ld+json\"",
-            Accept::Json => ";type=\"application/json\"",
-            Accept::GeoJson => ";type=\"application/geo+json\"",
+        let ty = match csource_style {
+            true => "application/ld+json",
+            false => link_media_type(accept),
         };
-        links.push(format!("<{path}?{}>; rel=\"{rel}\"{ty}", qp.join("&")));
+        links.push(format!(
+            "<{path}?{}>; rel=\"{rel}\";type=\"{ty}\"",
+            qp.join("&")
+        ));
     };
     if offset + limit < total && limit > 0 {
         mk(offset + limit, "next");
@@ -895,12 +906,20 @@ pub(crate) fn temporal_q_params(
             Some(_) => return Err(bad(format!("temporalQ {k} must be a string (5.2.21)"))),
         }
     }
-    if let Some(n) = tq.get("lastN") {
-        let v = n
-            .as_u64()
-            .filter(|v| *v >= 1)
-            .ok_or_else(|| bad("temporalQ lastN must be a positive integer (5.2.21)".into()))?;
-        out.insert("lastN".into(), v.to_string());
+    // TS 104 175 5.2.5: firstN, lastN and offsetN are TemporalParams
+    // scoped within temporalQ; the query-string parser judges the pair
+    for (k, min, what) in [
+        ("lastN", 1, "a positive"),
+        ("firstN", 1, "a positive"),
+        ("offsetN", 0, "a non-negative"),
+    ] {
+        if let Some(n) = tq.get(k) {
+            let v = n
+                .as_u64()
+                .filter(|v| *v >= min)
+                .ok_or_else(|| bad(format!("temporalQ {k} must be {what} integer (5.2.21)")))?;
+            out.insert(k.into(), v.to_string());
+        }
     }
     match tq.get("aggrMethods") {
         None => {}

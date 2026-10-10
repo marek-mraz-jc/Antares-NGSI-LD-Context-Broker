@@ -1879,6 +1879,8 @@ paths:
         - $ref: '#/components/parameters/Query.timeAt'
         - $ref: '#/components/parameters/Query.endTimeAt'
         - $ref: '#/components/parameters/Query.lastN'
+        - $ref: '#/components/parameters/Query.firstN'
+        - $ref: '#/components/parameters/Query.offsetN'
         - $ref: '#/components/parameters/Query.lang'
         - $ref: '#/components/parameters/Query.aggrMethods'
         - $ref: '#/components/parameters/Query.aggrPeriodDuration'
@@ -1955,6 +1957,8 @@ paths:
         - $ref: '#/components/parameters/Query.timeAt'
         - $ref: '#/components/parameters/Query.endTimeAt'
         - $ref: '#/components/parameters/Query.lastN'
+        - $ref: '#/components/parameters/Query.firstN'
+        - $ref: '#/components/parameters/Query.offsetN'
         - $ref: '#/components/parameters/Query.lang'
         - $ref: '#/components/parameters/Query.aggrMethods'
         - $ref: '#/components/parameters/Query.aggrPeriodDuration'
@@ -3349,6 +3353,30 @@ components:
       schema:
         type: integer
         minimum: 1
+      required: false
+    Query.firstN:
+      name: firstN
+      in: query
+      description: |
+        Only the first n instances, per Attribute, per Entity (under the specified time interval) shall be retrieved,
+        oldest first (TS 104 176 Table 6.4.7.3-1). Not together with lastN.
+      style: form
+      explode: true
+      schema:
+        type: integer
+        minimum: 1
+      required: false
+    Query.offsetN:
+      name: offsetN
+      in: query
+      description: |
+        Instances skipped, per Attribute, in the order firstN or lastN chose (TS 104 176 Table 6.4.7.3-2). Past the end,
+        the last instance is returned.
+      style: form
+      explode: true
+      schema:
+        type: integer
+        minimum: 0
       required: false
     Query.limit:
       name: limit

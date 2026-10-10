@@ -204,6 +204,15 @@ pub fn expand_entity(
         None if opts.fragment => {}
         None => return Err(bad("entity type is required")),
     }
+    // TS 104 175 Annex B: the type-scoped core contexts of the Entity's
+    // types name its own members. A fragment without a type has none in
+    // force, as a JSON-LD processor sees the same body.
+    let types: Vec<&str> = out
+        .get("type")
+        .and_then(Value::as_array)
+        .map(|ts| ts.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let members = ctx.within_types(&types);
 
     // scope
     if let Some(v) = doc.get("scope") {
@@ -309,7 +318,7 @@ pub fn expand_entity(
         if key.is_empty() {
             return Err(bad("empty attribute name"));
         }
-        let iri = expand_attr_name(key, ctx)?;
+        let iri = expand_attr_name(key, &members)?;
         // 4.5.1: core non-reified terms shall not be used as Attribute names.
         if iri
             .strip_prefix(crate::context::NGSI_LD_BASE)
@@ -319,7 +328,7 @@ pub fn expand_entity(
                 "{key} is a core non-reified term and cannot be used as an Attribute name (4.5.1)"
             )));
         }
-        let instances = expand_attribute(key, v, ctx, opts, 0)?;
+        let instances = expand_attribute(key, v, &ctx.within(&iri), opts, 0)?;
         if GEO_ENTITY_MEMBERS.contains(&iri.as_str()) {
             for inst in &instances {
                 let t = inst.get("type").and_then(Value::as_str);
@@ -511,9 +520,7 @@ pub fn is_ngsi_null_langmap(v: &Value) -> bool {
 /// 4.5.21.2/4.5.22.2: a List deletion is "an array consisting of a single
 /// NGSI-LD Null" as the valueList/objectList (bare null tolerated too).
 pub fn is_ngsi_null_list(v: &Value) -> bool {
-    is_ngsi_null(v)
-        || v.as_array()
-            .is_some_and(|a| a.len() == 1 && is_ngsi_null(&a[0]))
+    is_ngsi_null(v) || matches!(v.as_array().map(Vec::as_slice), Some([only]) if is_ngsi_null(only))
 }
 
 /// Whole-instance deletion marker (merge patch, 5.5.12).
@@ -1097,7 +1104,7 @@ fn expand_instance(
             return Err(bad(format!("attribute {name}: empty sub-attribute name")));
         }
         let iri = expand_attr_name(k, ctx)?;
-        let instances = expand_attribute(k, sub, ctx, opts, depth + 1)?;
+        let instances = expand_attribute(k, sub, &ctx.within(&iri), opts, depth.saturating_add(1))?;
         // 4.5.5.1 again, one level down: two sub-attribute names expanding to
         // one IRI would drop whichever the map orders first.
         if out.insert(iri.clone(), Value::Array(instances)).is_some() {
@@ -1215,7 +1222,7 @@ pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<V
                 let instances = expand_attribute(
                     k,
                     v,
-                    ctx,
+                    &ctx.within(&iri),
                     ExpandOpts {
                         fragment: true,
                         allow_null: true,
@@ -1255,7 +1262,7 @@ fn validate_dataset_ids(name: &str, instances: &[Value]) -> Result<(), NgsiError
                     )));
                 }
             }
-            None => default_count += 1,
+            None => default_count = default_count.saturating_add(1),
         }
     }
     if default_count > 1 {
@@ -1379,28 +1386,26 @@ pub fn validate_geojson(name: &str, v: &Value) -> Result<(), NgsiError> {
 /// the right places, and letting it through let one write make every later
 /// temporal query in that tenant fail on the `::timestamptz` cast.
 pub fn parse_datetime(s: &str) -> bool {
-    let b = s.as_bytes();
-    // shortest legal form is 19 chars + the mandatory Z
-    if b.len() < 20 || b.last() != Some(&b'Z') {
+    // the mandatory Z, then at least YYYY-MM-DDThh:mm:ss
+    let Some(body) = s.strip_suffix('Z') else {
+        return false;
+    };
+    let [y0, y1, y2, y3, b'-', mo0, mo1, b'-', d0, d1, b'T', h0, h1, b':', mi0, mi1, b':', s0, s1, ..] =
+        body.as_bytes()
+    else {
+        return false;
+    };
+    if ![y0, y1, y2, y3, mo0, mo1, d0, d1, h0, h1, mi0, mi1, s0, s1]
+        .iter()
+        .all(|c| c.is_ascii_digit())
+    {
         return false;
     }
-    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
-    let shape = digits(0..4)
-        && b[4] == b'-'
-        && digits(5..7)
-        && b[7] == b'-'
-        && digits(8..10)
-        && b[10] == b'T'
-        && digits(11..13)
-        && b[13] == b':'
-        && digits(14..16)
-        && b[16] == b':'
-        && digits(17..19);
-    if !shape {
+    // the 19 bytes matched above are ASCII, so both cuts are char boundaries
+    let (Some(seconds), Some(frac)) = (body.get(..19), body.get(19..)) else {
         return false;
-    }
+    };
     // between second 19 and the trailing Z: nothing, or a fraction of 1..=6
-    let frac = &s[19..s.len() - 1];
     if !frac.is_empty() {
         let Some(rest) = frac.strip_prefix('.').or_else(|| frac.strip_prefix(',')) else {
             return false;
@@ -1410,7 +1415,7 @@ pub fn parse_datetime(s: &str) -> bool {
         }
     }
     // real calendar date/time, not just digits in the right slots
-    let normalized = format!("{}Z", &s[..19]);
+    let normalized = format!("{seconds}Z");
     chrono::DateTime::parse_from_rfc3339(&normalized).is_ok()
 }
 

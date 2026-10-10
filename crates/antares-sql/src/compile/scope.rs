@@ -54,7 +54,7 @@ pub fn compile_scope_q(scope_q: &str, col: &'static str, first_bind: usize) -> O
             // empty list is false.
             and_parts.push(format!(
                 "EXISTS (SELECT 1 FROM unnest({col}) AS s WHERE s ~ ${})",
-                first_bind + binds.len()
+                first_bind.saturating_add(binds.len())
             ));
             binds.push(re);
         }
@@ -82,7 +82,7 @@ fn pattern_regex(pat: &str) -> Option<String> {
     }
     let mut out = String::from("^/*");
     for (i, seg) in segs.iter().enumerate() {
-        let last = i == segs.len() - 1;
+        let last = i.saturating_add(1) == segs.len();
         if *seg == "#" {
             if !last {
                 return None; // non-terminal `#` never matches; refuse to guess

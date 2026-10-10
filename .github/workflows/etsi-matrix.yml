@@ -161,6 +161,7 @@ jobs:
             results/${{ matrix.cell }}/run-summary.md
             results/${{ matrix.cell }}/gate-status.txt
             results/${{ matrix.cell }}/failures.csv
+            results/${{ matrix.cell }}/tp-status.csv
             results/${{ matrix.cell }}/resource-samples.csv
             results/${{ matrix.cell }}/resource-by-test.csv
             results/${{ matrix.cell }}/roll-loop.log
@@ -206,6 +207,23 @@ jobs:
             || 'memory file postgres timescale postgres-nats timescale-nats wasm-file' }}
         run: ./dev/etsi-matrix-summary.py cells || echo "RED_CELLS=$?" >> "$GITHUB_ENV"
 
+      # T-3466: per TP, not per total — every cell runs every TP of
+      # dev/etsi-baseline.json and each passes; a TP that stops running is
+      # red too. A new passing TP prints "ratchet: update baseline".
+      - name: Per-TP baseline (dev/etsi-baseline.json)
+        env:
+          # dev/etsi-pipeline.sh forces MQTT=0 for WASM: the 058 TPs never run there
+          MQTT_OFF: wasm-file
+          STORES: >-
+            ${{ inputs.preset == 'quick'
+            && 'file postgres timescale'
+            || 'memory file postgres timescale postgres-nats timescale-nats wasm-file' }}
+        run: |
+          rc=0
+          ./dev/etsi-baseline.py check cells > cells/_combined/baseline-check.txt || rc=$?
+          cat cells/_combined/baseline-check.txt
+          [ "$rc" = 0 ] || echo "RED_BASELINE=1" >> "$GITHUB_ENV"
+
       - name: Upload the ONE results bundle
         id: bundle
         uses: actions/upload-artifact@v6
@@ -239,5 +257,5 @@ jobs:
             gh api --method DELETE "repos/${{ github.repository }}/actions/artifacts/$id"
           done
 
-      - name: Gate — all stores green
-        run: test -z "${RED_CELLS:-}"
+      - name: Gate — all stores green, every baseline TP ran and passed
+        run: test -z "${RED_CELLS:-}" && test -z "${RED_BASELINE:-}"

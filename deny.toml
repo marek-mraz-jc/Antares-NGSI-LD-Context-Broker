@@ -45,6 +45,10 @@ wildcards = "deny"
 # internal path dependencies carry no version by design; the wildcard wall
 # is for registry deps, where a `*` really is unpinned drift
 allow-wildcard-paths = true
+# one TLS stack, rustls on ring (Cargo.toml: "aws-lc-sys (C + cmake) never
+# enters the build"); a crate pulling OpenSSL or aws-lc back in is red per
+# change, not a week later (threat model F5, T-3475)
+deny = [{ name = "openssl-sys" }, { name = "native-tls" }, { name = "aws-lc-sys" }]
 
 [sources]
 unknown-registry = "deny"

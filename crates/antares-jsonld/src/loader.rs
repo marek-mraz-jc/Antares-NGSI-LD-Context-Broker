@@ -246,7 +246,7 @@ impl EgressPolicy {
     /// name is resolved once, and any private address in the answer denies
     /// the fetch.
     pub async fn check_host(&self, host: &str, port: u16) -> Result<(), String> {
-        self.check_host_within(host, port, DNS_TIMEOUT * slow_factor() as u32)
+        self.check_host_within(host, port, DNS_TIMEOUT.saturating_mul(slow_factor() as u32))
             .await
     }
 
@@ -587,7 +587,9 @@ fn ttl_from_headers(
     if let Some(exp) = expires {
         // HTTP-date (RFC 7231); an unparsable or past Expires means "stale".
         let when = chrono::DateTime::parse_from_rfc2822(exp).ok()?;
-        let delta = when.with_timezone(&chrono::Utc) - chrono::Utc::now();
+        let delta = when
+            .with_timezone(&chrono::Utc)
+            .signed_duration_since(chrono::Utc::now());
         return Some(
             delta
                 .to_std()
@@ -818,8 +820,8 @@ impl Loader {
         // here; without it no @context can ever be fetched.
         let client = with_timeouts(
             client_builder(policy),
-            std::time::Duration::from_secs(5 * slow_factor()),
-            std::time::Duration::from_secs(10 * slow_factor()),
+            std::time::Duration::from_secs(5u64.saturating_mul(slow_factor())),
+            std::time::Duration::from_secs(10u64.saturating_mul(slow_factor())),
         )
         .build()
         .expect("reqwest client");
@@ -944,7 +946,7 @@ impl Loader {
         {
             let mut map = self.usage.write().await;
             if let Some(u) = map.get_mut(url) {
-                u.hits += 1;
+                u.hits = u.hits.saturating_add(1);
                 u.last_usage = now;
             } else {
                 // hold the size bound: admitting a new URL past the cap
@@ -1206,8 +1208,15 @@ impl Loader {
             match entry {
                 Value::Array(items) => {
                     for item in items {
-                        self.merge_entry(ctx, item, depth + 1, urls, base.clone(), tenant)
-                            .await?;
+                        self.merge_entry(
+                            ctx,
+                            item,
+                            depth.saturating_add(1),
+                            urls,
+                            base.clone(),
+                            tenant,
+                        )
+                        .await?;
                     }
                     Ok(())
                 }
@@ -1244,7 +1253,7 @@ impl Loader {
                     self.merge_entry(
                         ctx,
                         &doc,
-                        depth + 1,
+                        depth.saturating_add(1),
                         urls,
                         Some(std::sync::Arc::new(resolved)),
                         tenant,
@@ -1402,7 +1411,7 @@ impl Loader {
                     .await
                     .map_err(|e| err(format!("reading {url}: {e}")))?
                 {
-                    if buf.len() + chunk.len() > MAX_CONTEXT_BYTES {
+                    if buf.len().saturating_add(chunk.len()) > MAX_CONTEXT_BYTES {
                         return Err(err(format!("{url}: @context document too large")));
                     }
                     buf.extend_from_slice(&chunk);
@@ -1447,7 +1456,11 @@ impl Loader {
             url.to_owned(),
             FetchedDoc {
                 value: Arc::clone(&arc),
-                stale_at: ttl.map(|d| Instant::now() + d),
+                // past the clock's range the copy is stale at once, not never
+                stale_at: ttl.map(|d| {
+                    let now = Instant::now();
+                    now.checked_add(d).unwrap_or(now)
+                }),
                 // 5.13.1 "Cached": downloaded from a public URL, no Tenant
                 owner: None,
             },
@@ -2969,11 +2982,10 @@ mod tests {
         let core = Loader::new().core();
         for (term, iri) in [
             ("Snapshot", "https://uri.etsi.org/ngsi-ld/Snapshot"),
-            ("orderBy", "https://uri.etsi.org/ngsi-ld/orderBy"),
-            ("collation", "https://uri.etsi.org/ngsi-ld/collation"),
+            ("EntityMap", "https://uri.etsi.org/ngsi-ld/EntityMap"),
             ("valueType", "https://uri.etsi.org/ngsi-ld/hasValueType"),
             ("objectLists", "https://uri.etsi.org/ngsi-ld/hasObjectLists"),
-            ("aggrMethods", "https://uri.etsi.org/ngsi-ld/aggrMethods"),
+            ("notifiedAt", "https://uri.etsi.org/ngsi-ld/notifiedAt"),
         ] {
             assert_eq!(
                 core.expand_key(term),
@@ -2981,6 +2993,93 @@ mod tests {
                 "{term} must expand to its Annex B IRI, not through @vocab"
             );
         }
+        // TS 104 175 Annex B scopes these, so at top level they are not core
+        // terms and expand through @vocab like any other name.
+        for term in [
+            "orderBy",
+            "collation",
+            "aggrMethods",
+            "status",
+            "format",
+            "data",
+        ] {
+            assert_eq!(
+                core.expand_key(term),
+                format!("https://uri.etsi.org/ngsi-ld/default-context/{term}"),
+                "{term} is not a top-level core term"
+            );
+        }
+    }
+
+    /// TS 104 175 Annex B is the document the v1.9 URL resolves to (5.3.2.1
+    /// keeps the URL): 149 top-level members, 23 of them carrying a scoped
+    /// context, and the 61 CIM 009 top-level terms it scopes are gone from
+    /// the top level.
+    #[test]
+    fn pinned_v1_9_core_matches_ts_104175_annex_b() {
+        let core = pinned(CORE_CONTEXT).expect("pinned core");
+        let top = core.as_object().expect("an object @context");
+        assert_eq!(top.len(), 149, "Annex B top-level members");
+        let mut scoped: Vec<&str> = top
+            .iter()
+            .filter(|(_, d)| d.get("@context").is_some())
+            .map(|(t, _)| t.as_str())
+            .collect();
+        scoped.sort_unstable();
+        assert_eq!(
+            scoped,
+            [
+                "Attribute",
+                "AttributeList",
+                "ContextSourceIdentity",
+                "ContextSourceNotification",
+                "ContextSourceRegistration",
+                "EntityType",
+                "EntityTypeInfo",
+                "EntityTypeList",
+                "Feature",
+                "FeatureCollection",
+                "Notification",
+                "Query",
+                "Subscription",
+                "endpoint",
+                "geoQ",
+                "information",
+                "management",
+                "managementInterval",
+                "ngsildproof",
+                "notUpdated",
+                "notification",
+                "observationInterval",
+                "temporalQ",
+            ]
+        );
+        for term in [
+            "status", "format", "data", "attrs", "join", "timerel", "geometry", "accept",
+        ] {
+            assert!(!top.contains_key(term), "{term} is scoped only in Annex B");
+        }
+    }
+
+    /// TS 104 175 5.2.5: a term the core @context defines only inside a
+    /// scope may be redefined by a user @context ("still discouraged"); the
+    /// top-level core terms stay protected (4.4).
+    #[tokio::test]
+    async fn a_scoped_core_term_may_be_redefined_by_a_user_context() {
+        let ctx = Loader::new()
+            .resolve(&serde_json::json!({
+                "status": "https://example.org/status",
+                "location": "https://example.org/location"
+            }))
+            .await
+            .expect("resolve");
+        assert_eq!(ctx.expand_key("status"), "https://example.org/status");
+        assert_eq!(ctx.compact_iri("https://example.org/status"), "status");
+        assert_eq!(
+            ctx.expand_key("location"),
+            "https://uri.etsi.org/ngsi-ld/location",
+            "a top-level core term stays protected"
+        );
     }
 
     /// Annex B (normative), V1.9.1: the core @context served for the v1.9
@@ -3001,14 +3100,11 @@ mod tests {
             "Snapshot",
             "SnapshotNotification",
             "ExecutionResultDetails",
-            "aggrMethods",
-            "aggrParams",
-            "aggrPeriodDuration",
-            "collation",
+            // aggrMethods, aggrParams, aggrPeriodDuration, ordering: scoped
+            // under temporalQ and Query by TS 104 175 Annex B; collation and
+            // orderBy: gone from it
             "lastUsedAt",
             "ngsildproof",
-            "orderBy",
-            "ordering",
             "problemDetails",
             "resultStatus",
             "snapshotId",

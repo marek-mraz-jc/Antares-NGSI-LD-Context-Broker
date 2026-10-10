@@ -107,7 +107,9 @@ fn evict_lru_half<V>(map: &mut HashMap<Box<str>, Entry<V>>) {
     stamps.sort_unstable();
     // `keep` newest survive; a tie on the boundary stamp keeps both, which
     // costs at most a few entries over the half and never a bound.
-    let cut = stamps[stamps.len() - keep];
+    let Some(&cut) = stamps.len().checked_sub(keep).and_then(|i| stamps.get(i)) else {
+        return;
+    };
     map.retain(|_, e| e.1.load(Ordering::Relaxed) >= cut);
 }
 
@@ -140,7 +142,7 @@ pub fn compile(pattern: &str) -> Result<Arc<regex::Regex>, String> {
     {
         return hit.map_err(String::from);
     }
-    COMPILES.with(|n| n.set(n.get() + 1));
+    COMPILES.with(|n| n.set(n.get().saturating_add(1)));
     // Compiled OUTSIDE the lock — a pattern compile must never serialize the
     // matcher — and a poisoned lock degrades to "compile every time", never
     // to a failed request.

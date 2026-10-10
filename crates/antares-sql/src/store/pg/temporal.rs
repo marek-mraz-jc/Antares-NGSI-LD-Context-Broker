@@ -168,17 +168,25 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
     let tp = first_bind;
     let expr = match f.last_n {
         Some(n) => {
-            let n_bind = first_bind + binds.len();
+            let n_bind = first_bind.saturating_add(binds.len());
             binds.push(n.to_string());
             // 4.11 lastN keeps the N most recent INSTANTS, so the rank orders
             // on the same canonical key the window compares on — raw bytes
             // put "…00.000Z" after "…00Z" and kept the wrong N.
             let order_key = crate::compile::temporal::dt_key_sql(&format!("(ai.data ->> ${tp})"));
+            // firstN keeps the N oldest (TS 104 176 6.4.7.3), the exact
+            // reverse: the API window sorts an instance without the
+            // timeproperty before every instant, so it ranks first ascending
+            let dir = if f.oldest_first {
+                "ASC NULLS FIRST"
+            } else {
+                "DESC NULLS LAST"
+            };
             format!(
                 "COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (\
                    SELECT s.attr_id, jsonb_agg(s.data ORDER BY s.created_at, s.observed_at, s.instance_id) AS insts \
                    FROM (SELECT ai.*, rank() OVER (PARTITION BY ai.attr_id, ai.data ->> 'datasetId' \
-                             ORDER BY {order_key} DESC NULLS LAST) AS rk \
+                             ORDER BY {order_key} {dir}) AS rk \
                          FROM attr_instances ai \
                          WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{range_and}) s \
                    WHERE s.rk <= ${n_bind}::bigint GROUP BY s.attr_id) g), '{{}}'::jsonb)"
@@ -215,12 +223,14 @@ fn window_sql(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String, Vec<
     if let Some(r) = &f.range {
         let c = crate::compile::temporal::compile_instance_range(r, "ai.data", first_bind)?;
         range_and = format!(" AND {}", c.sql);
-        debug_assert_eq!(c.binds[0], f.timeproperty);
+        debug_assert_eq!(c.binds.first().map(String::as_str), Some(f.timeproperty));
         binds.extend(c.binds.into_iter().skip(1));
         // widened COLUMN bound on the SAME binds ($first_bind+1 = timeAt):
         // lets the (tenant, entity, attr, observed_at) btree serve the range;
         // the byte-exact text predicate above still decides membership
-        if let Some(cb) = crate::compile::temporal::column_range_bound(r, "ai", first_bind + 1) {
+        if let Some(cb) =
+            crate::compile::temporal::column_range_bound(r, "ai", first_bind.saturating_add(1))
+        {
             range_and.push_str(&format!(" AND {cb}"));
         }
     }
@@ -258,7 +268,10 @@ fn aggregate_expr(
     let anchor = match agg.anchor {
         Some(a) => {
             binds.push(antares_store::filter::canonical_datetime(a).into_owned());
-            format!("${}::timestamptz", first_bind + binds.len() - 1)
+            format!(
+                "${}::timestamptz",
+                first_bind.saturating_add(binds.len()).saturating_sub(1)
+            )
         }
         None => format!("min(ai.{col}) OVER (PARTITION BY ai.attr_id)"),
     };
@@ -277,14 +290,20 @@ fn aggregate_expr(
             let start = match qs {
                 Some(v) => {
                     binds.push(antares_store::filter::canonical_datetime(v).into_owned());
-                    format!("${}::timestamptz", first_bind + binds.len() - 1)
+                    format!(
+                        "${}::timestamptz",
+                        first_bind.saturating_add(binds.len()).saturating_sub(1)
+                    )
                 }
                 None => "s0.first_ts".to_owned(),
             };
             let end = match qe {
                 Some(v) => {
                     binds.push(antares_store::filter::canonical_datetime(v).into_owned());
-                    format!("${}::timestamptz", first_bind + binds.len() - 1)
+                    format!(
+                        "${}::timestamptz",
+                        first_bind.saturating_add(binds.len()).saturating_sub(1)
+                    )
                 }
                 None => "s0.last + interval '1 second'".to_owned(),
             };
@@ -292,7 +311,7 @@ fn aggregate_expr(
         }
         Some(sc) => {
             binds.push(sc.to_string());
-            let n = first_bind + binds.len() - 1;
+            let n = first_bind.saturating_add(binds.len()).saturating_sub(1);
             let start = format!("date_bin(make_interval(secs => ${n}::bigint), s0.ts, s0.anchor)");
             (
                 start.clone(),
@@ -582,7 +601,11 @@ impl PgTemporalStore {
         // compile, which is the case page pushdown must not take — the SQL
         // would qualify entities on a window it cannot express.
         let compiled_range = f.range.as_ref().map(|r| {
-            crate::compile::temporal::compile_instance_range(r, "ai.data", binds.len() + 1)
+            crate::compile::temporal::compile_instance_range(
+                r,
+                "ai.data",
+                binds.len().saturating_add(1),
+            )
         });
         let mut paged = false;
         if f.page.is_some() && !matches!(compiled_range, Some(None)) {
@@ -590,13 +613,15 @@ impl PgTemporalStore {
                             ai.tenant_id = m.tenant_id AND ai.entity_id = m.id"
                 .to_owned();
             if let (Some(r), Some(Some(c))) = (&f.range, compiled_range) {
-                let n = binds.len() + 1;
+                let n = binds.len().saturating_add(1);
                 for b in c.binds {
                     binds.push(B::Text(b));
                 }
                 qual.push_str(&format!(" AND {}", c.sql));
                 // index-serving widened bound on the same binds ($n+1 = timeAt)
-                if let Some(cb) = crate::compile::temporal::column_range_bound(r, "ai", n + 1) {
+                if let Some(cb) =
+                    crate::compile::temporal::column_range_bound(r, "ai", n.saturating_add(1))
+                {
                     qual.push_str(&format!(" AND {cb}"));
                 }
             }
@@ -613,7 +638,7 @@ impl PgTemporalStore {
                 qn,
                 f.range.as_ref(),
                 "m",
-                binds.len() + 1,
+                binds.len().saturating_add(1),
                 f.expand,
             ) {
                 for b in c.binds {
@@ -627,13 +652,15 @@ impl PgTemporalStore {
         // reconstructed. NULL geo_value (rows with no extracted geometry) always
         // survives; GeoQuery::matches stays the arbiter.
         for (spec, iri) in f.geo {
-            let attr_bind = binds.len() + 1;
+            let attr_bind = binds.len().saturating_add(1);
             let mut win_binds: Vec<String> = Vec::new();
             let mut window = String::new();
             if let Some(r) = &f.range {
-                if let Some(cb) =
-                    crate::compile::temporal::column_range_bound(r, "gi", attr_bind + 1)
-                {
+                if let Some(cb) = crate::compile::temporal::column_range_bound(
+                    r,
+                    "gi",
+                    attr_bind.saturating_add(1),
+                ) {
                     // 4.6.3 lets a request spell the seconds fraction with a
                     // comma; the bound lands in a `::timestamptz` cast, which
                     // takes only the point form. Every other range bind is
@@ -652,7 +679,7 @@ impl PgTemporalStore {
             if let Some(c) = crate::compile::geo::compile_geo_instance(
                 spec,
                 "gi.geo_value",
-                attr_bind + 1 + win_binds.len(),
+                attr_bind.saturating_add(1).saturating_add(win_binds.len()),
             ) {
                 binds.push(B::Text(iri.to_owned()));
                 for b in win_binds {
@@ -677,21 +704,21 @@ impl PgTemporalStore {
         let agg = if push_agg {
             f.aggregate
                 .as_ref()
-                .and_then(|a| aggregate_expr(f, a, n_where + 1))
+                .and_then(|a| aggregate_expr(f, a, n_where.saturating_add(1)))
         } else {
             None
         };
         let aggregated = agg.is_some();
         let (attr_expr, extra) = match agg {
             Some((e, b)) => (format!("jsonb_build_object('$agg', {e})"), b),
-            None => match attr_object_expr(f, n_where + 1) {
+            None => match attr_object_expr(f, n_where.saturating_add(1)) {
                 Some(v) => v,
                 // refused range shape: reconstruct unpruned, window arbitrates.
                 // The default filter has neither range nor lastN, the two
                 // shapes the compiler can refuse: pinned by
                 // `the_unpruned_fallback_always_compiles`.
                 #[allow(clippy::expect_used)]
-                None => attr_object_expr(&TemporalFilter::default(), n_where + 1)
+                None => attr_object_expr(&TemporalFilter::default(), n_where.saturating_add(1))
                     .expect("no range/lastN always compiles"),
             },
         };
@@ -1063,6 +1090,19 @@ mod tests {
             "{expr}"
         );
         assert!(expr.contains("COLLATE \"C\" DESC NULLS LAST"), "{expr}");
+        assert_eq!(binds, vec!["observedAt", "5"]);
+    }
+
+    #[test]
+    fn first_n_ranks_the_oldest_first() {
+        let f = TemporalFilter {
+            last_n: Some(5),
+            oldest_first: true,
+            ..Default::default()
+        };
+        let (expr, binds) = attr_object_expr(&f, 1).expect("compiles");
+        assert!(expr.contains("COLLATE \"C\" ASC NULLS FIRST"), "{expr}");
+        assert!(!expr.contains("DESC"), "{expr}");
         assert_eq!(binds, vec!["observedAt", "5"]);
     }
 

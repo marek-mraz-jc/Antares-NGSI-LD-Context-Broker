@@ -33,9 +33,9 @@ Current counts (`python3 dev/spec.py status`):
 
 ```text
 947 sections
-  implemented       477
+  implemented       476
   informative       468
-  partial             2
+  partial             3
   robot-tagged       193
 ```
 
@@ -100,6 +100,15 @@ A native cell passes at 1823/1823, `wasm-file` at 1811/1811.
 lists every failure across the matrix; a release requires that list to be
 empty.
 
+A smaller green run is still green, so the matrix also gates per TP.
+`dev/etsi-baseline.json` names every TP a cell runs, keyed by file and
+name, with the vendored suite's tree hash and the spec version it covers.
+`dev/etsi-baseline.py check` fails a cell where a baseline TP did not pass
+or did not run, and names it. `wasm-file` may lack only the 12 MQTT TPs. A
+TP that passes and is not yet listed prints `ratchet: update baseline`;
+regenerate the file with `dev/etsi-baseline.py write <results-dir>` from a
+green run, or from a `robot --dryrun` folded by `dev/etsi-report.py`.
+
 ## Running a suite locally
 
 One store mode per run, the one the change touches:
@@ -158,6 +167,7 @@ carries the fix. The current list:
 | 10 | spec | 4.5.19.0's unbounded period count contradicts the aggregation fixtures |
 | 11 | spec | Annex B maps `attributeCount`/`attributeDetails` to bare terms |
 | 13 | spec | TS 104 175 Table 5.2.6.5.2-1 calls `timeInterval` not applicable to CSR subscriptions; 12.4.2.4/12.4.7 define periodic CSR notification |
+| 14 | spec | TS 104 176 clause 5 answers a successful HEAD with 204, its 7.x GET/HEAD tables with 200 (Antares: 200) |
 
 Filing is manual; each entry carries the clause quotation and the
 proposed fix so it can be pasted into the ETSI tracker as is.

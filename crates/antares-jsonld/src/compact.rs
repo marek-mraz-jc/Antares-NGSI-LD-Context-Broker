@@ -4,6 +4,7 @@
 
 use crate::context::Context;
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 
 /// Entity-instance members whose values stay verbatim during compaction.
 const VERBATIM: &[&str] = &[
@@ -39,6 +40,7 @@ pub fn compact_entity(internal: &Value, ctx: &Context) -> Value {
     let Some(obj) = internal.as_object() else {
         return internal.clone();
     };
+    let members = within_types(obj, ctx);
     let mut out = Map::new();
     for (k, v) in obj {
         match k.as_str() {
@@ -55,8 +57,8 @@ pub fn compact_entity(internal: &Value, ctx: &Context) -> Value {
                 out.insert(k.clone(), v.clone());
             }
             _ => {
-                let term = ctx.compact_iri(k);
-                out.insert(term, compact_attr_value(v, ctx));
+                let term = members.compact_iri(k);
+                out.insert(term, compact_attr_value(v, &ctx.within(k)));
             }
         }
     }
@@ -140,7 +142,7 @@ pub fn compact_instance(inst: &Value, ctx: &Context) -> Value {
             out.insert(k.clone(), v.clone());
         } else {
             // sub-attribute
-            out.insert(ctx.compact_iri(k), compact_attr_value(v, ctx));
+            out.insert(ctx.compact_iri(k), compact_attr_value(v, &ctx.within(k)));
         }
     }
     Value::Object(out)
@@ -153,6 +155,7 @@ pub fn compact_entity_shallow(internal: &Value, ctx: &Context) -> Value {
     let Some(obj) = internal.as_object() else {
         return internal.clone();
     };
+    let members = within_types(obj, ctx);
     let mut out = Map::new();
     for (k, v) in obj {
         match k.as_str() {
@@ -163,7 +166,10 @@ pub fn compact_entity_shallow(internal: &Value, ctx: &Context) -> Value {
                 out.insert("type".into(), compact_types(v, ctx));
             }
             _ => {
-                out.insert(ctx.compact_iri(k), compact_simplified_value(v, ctx));
+                out.insert(
+                    members.compact_iri(k),
+                    compact_simplified_value(v, &ctx.within(k)),
+                );
             }
         }
     }
@@ -216,6 +222,17 @@ fn compact_simplified_value(v: &Value, ctx: &Context) -> Value {
     v.clone()
 }
 
+/// `ctx` with the type-scoped core contexts of the Entity's types in force
+/// for its own members (TS 104 175 Annex B), the reverse of expansion.
+fn within_types<'a>(entity: &Map<String, Value>, ctx: &'a Context) -> Cow<'a, Context> {
+    let types: Vec<&str> = match entity.get("type") {
+        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        Some(Value::String(t)) => vec![t.as_str()],
+        _ => Vec::new(),
+    };
+    ctx.within_types(&types)
+}
+
 fn unwrap_single(v: Value) -> Value {
     match v {
         Value::Array(mut items) if items.len() == 1 => items.remove(0),
@@ -229,6 +246,68 @@ mod tests {
     use crate::expand::{expand_entity, ExpandOpts};
     use crate::loader::Loader;
     use serde_json::json;
+
+    const DEFAULT: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+
+    /// TS 104 175 Annex B: a type-scoped core context applies to the
+    /// members of a node of that type and not below it (type-scoped
+    /// contexts do not propagate, JSON-LD 1.1 4.1.8); outside the type the
+    /// same name expands through @vocab. Compaction is the reverse.
+    #[test]
+    fn a_type_scoped_term_expands_inside_its_type_only() {
+        let ctx = Loader::new().core();
+        let feature = json!({
+            "id": "urn:ngsi-ld:Feature:1",
+            "type": "Feature",
+            "geometry": {"type": "Property", "value": "point",
+                "geometry": {"type": "Property", "value": "nested"}}
+        });
+        let out = expand_entity(feature.as_object().unwrap(), &ctx, ExpandOpts::default())
+            .expect("expand");
+        let attr = &out["https://purl.org/geojson/vocab#geometry"];
+        assert!(attr.is_array(), "Feature scope: {out}");
+        assert!(
+            attr[0].get(&format!("{DEFAULT}geometry")).is_some(),
+            "a sub-attribute is below the type scope: {out}"
+        );
+        assert_eq!(compact_entity(&out, &ctx), feature);
+
+        let vehicle = json!({
+            "id": "urn:ngsi-ld:Vehicle:1",
+            "type": "Vehicle",
+            "geometry": {"type": "Property", "value": "point"}
+        });
+        let out = expand_entity(vehicle.as_object().unwrap(), &ctx, ExpandOpts::default())
+            .expect("expand");
+        assert!(out.get(&format!("{DEFAULT}geometry")).is_some(), "{out}");
+        assert_eq!(compact_entity(&out, &ctx), vehicle);
+    }
+
+    /// A property-scoped core context applies to everything inside the
+    /// property, sub-attributes included (property-scoped contexts
+    /// propagate), and compacts back to the scoped term.
+    #[test]
+    fn a_property_scoped_term_expands_inside_its_property() {
+        let ctx = Loader::new().core();
+        let doc = json!({
+            "id": "urn:ngsi-ld:Device:1",
+            "type": "Device",
+            "endpoint": {"type": "Property", "value": "x",
+                "uri": {"type": "Property", "value": "http://a.example",
+                    "uri": {"type": "Property", "value": "deeper"}}},
+            "uri": {"type": "Property", "value": "top"}
+        });
+        let out =
+            expand_entity(doc.as_object().unwrap(), &ctx, ExpandOpts::default()).expect("expand");
+        let inner = &out["https://uri.etsi.org/ngsi-ld/endpoint"][0];
+        let uri = &inner["https://uri.etsi.org/ngsi-ld/uri"][0];
+        assert!(
+            uri.get("https://uri.etsi.org/ngsi-ld/uri").is_some(),
+            "{out}"
+        );
+        assert!(out.get(&format!("{DEFAULT}uri")).is_some(), "{out}");
+        assert_eq!(compact_entity(&out, &ctx), doc);
+    }
 
     #[test]
     fn round_trip_under_core_context() {

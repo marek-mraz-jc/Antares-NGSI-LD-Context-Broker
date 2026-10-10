@@ -1079,6 +1079,245 @@ pub async fn replace_attr(
     go.await.unwrap_or_else(|e: ApiError| e.into_response())
 }
 
+// ---------- PUT /entities/{id}/attrs/{attrId}/value (TS 104 175 10.2.6) ----------
+
+/// Set Attribute Value (TS 104 175 10.2.6, TS 104 176 7.6.3.2): the body
+/// is the bare value. The stored instance keeps its type and every other
+/// sub-Attribute; only the member that type carries its value in changes.
+/// The policy engine judges it as Replace Attribute (5.6.19), the write it
+/// is, so no rule written for that clause can be stepped around here.
+pub async fn set_attr_value(
+    State(st): State<AppState>,
+    Path((id, attr)): Path<(String, String)>,
+    CleanParams(params): CleanParams,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    set_attr_value_inner(&st, &id, &attr, &params, &headers, &body)
+        .await
+        .unwrap_or_else(|e: ApiError| e.into_response())
+}
+
+async fn set_attr_value_inner(
+    st: &AppState,
+    id: &str,
+    attr: &str,
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> ApiResult<Response> {
+    let tenant = tenant_from(headers)?;
+    antares_model::EntityId::new(id)?;
+    check_attr_name(attr)?;
+    check_params(params, &["datasetId", "observedAt", "local", "type"])?;
+    let ctx = request_context(&st.loader, headers).await?;
+    let attr_iri = antares_jsonld::expand_attr_name(attr, &ctx)?;
+    if attr == "scope" || attr_iri == SCOPE_IRI {
+        return Err(NgsiError::BadRequestData(
+            "scope cannot be the target of Set Attribute Value (10.2.6)".into(),
+        )
+        .into());
+    }
+    let observed = params.get("observedAt").map(String::as_str);
+    if observed.is_some_and(|t| !antares_jsonld::parse_datetime(t)) {
+        return Err(NgsiError::BadRequestData("observedAt must be a DateTime (4.8)".into()).into());
+    }
+    let want_ds = crate::repr::target_dataset_id(params).map(String::from);
+    if let Some(ds) = &want_ds {
+        antares_model::EntityId::new(ds)
+            .map_err(|_| NgsiError::BadRequestData(format!("datasetId {ds:?} is not a URI")))?;
+    }
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|e| NgsiError::InvalidRequest(format!("the body is not a JSON value: {e}")))?;
+    // 10.2.6.4: null and the NGSI-LD Null are refused except in a
+    // JsonProperty; without a local instance the type is unknown, so a
+    // null is refused before it can be forwarded
+    let stored = st.store.get(&tenant, Kind::Entity, id).await?;
+    let stored_inst = stored
+        .as_ref()
+        .and_then(|d| d.get(&attr_iri))
+        .and_then(|a| instance_with_dataset(a, want_ds.as_deref()))
+        .cloned();
+    refuse_null(stored_inst.as_ref(), &value)?;
+    // what the engine judges is the instance as it would be stored
+    let judged = stored_inst
+        .as_ref()
+        .map(|si| with_value(si, attr, &attr_iri, &value, &ctx, observed))
+        .transpose()?
+        .map(|i| serde_json::json!({ attr_iri.clone(): [i] }));
+    let pre = crate::policy::pre_image(st, &tenant, id, None).await;
+    gate!(
+        st, &tenant, headers, "5.6.19",
+        ids: &[id],
+        types: &pre.types,
+        stored: pre.stored.as_ref(),
+        attrs: std::slice::from_ref(&attr_iri),
+        body: judged.as_ref(),
+    )
+    .await?;
+    let (regs, loop_answer) =
+        attr_regs_or_loop(st, &tenant, id, &attr_iri, &ctx, params, headers).await?;
+    if let Some(r) = loop_answer {
+        return Ok(r);
+    }
+    let local_covered = proxies_cover_all(&regs, std::slice::from_ref(&attr_iri));
+    let ts = now_iso();
+    let mut found = false;
+    let local_resp: Option<ApiResult<Response>> = if local_covered {
+        None
+    } else {
+        let res = st
+            .store
+            .mutate(&tenant, Kind::Entity, id, |doc| {
+                if !matches_type_param(doc, params, &ctx) {
+                    return Err(NgsiError::ResourceNotFound(format!(
+                        "entity {id} does not match the type selector"
+                    )));
+                }
+                let target = antares_store::stored_object(doc)?;
+                let Some(existing) = target.get_mut(&attr_iri).and_then(Value::as_array_mut) else {
+                    return Ok(());
+                };
+                let Some(p) = existing.iter().position(|ci| {
+                    ci.get("datasetId").and_then(Value::as_str) == want_ds.as_deref()
+                }) else {
+                    return Ok(());
+                };
+                // from the instance under the lock, not the read above: a
+                // write in between must not be lost
+                refuse_null(Some(&existing[p]), &value)?;
+                let mut ni = with_value(&existing[p], attr, &attr_iri, &value, &ctx, observed)?;
+                if let Some(o) = ni.as_object_mut() {
+                    o.insert("modifiedAt".into(), Value::String(ts.clone()));
+                }
+                existing[p] = ni;
+                found = true;
+                target.insert("modifiedAt".into(), Value::String(ts.clone()));
+                Ok::<(), NgsiError>(())
+            })
+            .await?;
+        Some(single_attr_local(res, found, id, attr, &tenant))
+    };
+    if regs.is_empty() {
+        return local_resp
+            .unwrap_or_else(|| Err(NgsiError::InternalError("no local result".into()).into()));
+    }
+    // Decided (T-3450): 9.2 names no operation for 10.2.6, so a source is
+    // asked when it supports replaceAttrs, and on its own value resource
+    let fed_parts = crate::federation::fed_attr_parts(
+        st,
+        headers,
+        &tenant,
+        &ctx.source,
+        &regs,
+        "replaceAttrs",
+        reqwest::Method::PUT,
+        &format!(
+            "/entities/{}/attrs/{}/value",
+            path_segment(id),
+            path_segment(attr)
+        ),
+        &fwd_query(params, &["type", "datasetId", "observedAt"]),
+        Some(value),
+    )
+    .await;
+    Ok(combine_single_attr(
+        &tenant,
+        &attr_iri,
+        local_covered,
+        &local_resp,
+        &regs,
+        &fed_parts,
+    ))
+}
+
+/// The instance of a stored Attribute with this datasetId (`None` = the
+/// default instance).
+fn instance_with_dataset<'a>(attr: &'a Value, ds: Option<&str>) -> Option<&'a Value> {
+    attr.as_array()?
+        .iter()
+        .find(|i| i.get("datasetId").and_then(Value::as_str) == ds)
+}
+
+/// 10.2.6.4: "the payload body contains "urn:ngsi-ld:null" or contains null
+/// (excepting for Attribute fragments representing a JsonProperty)" is
+/// InvalidRequest, wherever in the value it sits.
+fn refuse_null(stored: Option<&Value>, value: &Value) -> Result<(), NgsiError> {
+    fn holds_null(v: &Value) -> bool {
+        match v {
+            Value::Null => true,
+            Value::String(s) => s == "urn:ngsi-ld:null",
+            Value::Array(a) => a.iter().any(holds_null),
+            Value::Object(o) => o.values().any(holds_null),
+            _ => false,
+        }
+    }
+    let json_property = stored.is_some_and(|i| i.get("type") == Some(&Value::from("JsonProperty")));
+    if !json_property && holds_null(value) {
+        return Err(NgsiError::InvalidRequest(
+            "a value may hold no null and no urn:ngsi-ld:null (10.2.6.4)".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The stored instance `si` with its value replaced: the member its type
+/// carries the value in, expanded and validated as that type would be in a
+/// fragment (8.2.4); observedAt follows the request when the instance had
+/// one, and goes otherwise (10.2.6.4).
+fn with_value(
+    si: &Value,
+    attr: &str,
+    attr_iri: &str,
+    value: &Value,
+    ctx: &antares_jsonld::Context,
+    observed: Option<&str>,
+) -> Result<Value, NgsiError> {
+    let ty = si.get("type").and_then(Value::as_str).unwrap_or("Property");
+    let member = match ty {
+        "Relationship" => "object",
+        "LanguageProperty" => "languageMap",
+        "JsonProperty" => "json",
+        "VocabProperty" => "vocab",
+        "ListProperty" => "valueList",
+        "ListRelationship" => "objectList",
+        _ => "value",
+    };
+    let mut wrapper = Map::new();
+    wrapper.insert(
+        attr.to_owned(),
+        serde_json::json!({ "type": ty, member: value }),
+    );
+    let expanded = expand_entity(
+        &wrapper,
+        ctx,
+        ExpandOpts {
+            fragment: true,
+            allow_null: false,
+            temporal: false,
+            ..Default::default()
+        },
+    )?;
+    let new_value = expanded
+        .get(attr_iri)
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|i| i.get(member))
+        .cloned()
+        .ok_or_else(|| NgsiError::BadRequestData(format!("not a {ty} value")))?;
+    let mut out = si.clone();
+    if let Some(o) = out.as_object_mut() {
+        o.insert(member.into(), new_value);
+        if o.contains_key("observedAt") {
+            match observed {
+                Some(t) => o.insert("observedAt".into(), Value::String(t.to_owned())),
+                None => o.remove("observedAt"),
+            };
+        }
+    }
+    Ok(out)
+}
+
 // ---------- DELETE /entities/{id}/attrs/{attrId} (5.6.5) ----------
 
 pub async fn delete_attr(

@@ -133,6 +133,8 @@ fn allowed_temporal_create_params() -> Vec<&'static str> {
         "aggrMethods",
         "aggrPeriodDuration",
         "lastN",
+        "firstN",
+        "offsetN",
     ]);
     v
 }
