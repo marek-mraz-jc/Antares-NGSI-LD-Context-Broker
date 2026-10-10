@@ -813,6 +813,118 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// Query Entities (T-3556) on the stored documents, under the read
+    /// lock: ids, the idPattern literal, types and attrs are tested on the
+    /// borrowed documents and only what the answer holds is copied, where a
+    /// snapshot of the tenant used to be. ids, types and attrs are exact
+    /// here, so without a `q`, `scopeQ` or geo query the outcome is
+    /// `decided`: the projection applies and a page is cut in id order (the
+    /// map's order), counted when asked. Otherwise the caller stays the
+    /// arbiter over the narrowed rows. 4.22: an expired Entity is not a
+    /// match, before any cut; its expired instances are the caller's.
+    pub fn query_entities(
+        &self,
+        tenant: &TenantId,
+        f: &filter::EntityFilter<'_>,
+    ) -> filter::QueryOutcome {
+        let now = crate::store::any::now_utc();
+        let decided = f.q.is_none() && f.scope_q.is_none() && f.geo.is_empty();
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(m) = Self::map(&inner, Kind::Entity).get(tenant.as_str()) else {
+            return filter::QueryOutcome {
+                rows: Vec::new(),
+                decided,
+                paged: decided && f.page.is_some(),
+                total: f.page.as_ref().filter(|_| decided).map(|_| 0),
+            };
+        };
+        let matches = |id: &str, doc: &Value| {
+            !filter::expired_at(doc, &now)
+                && f.id_literal.is_none_or(|l| {
+                    if l.anchored {
+                        id.starts_with(l.text)
+                    } else {
+                        id.contains(l.text)
+                    }
+                })
+                && f.types.is_none_or(|sel| {
+                    let held: Vec<&str> = doc["type"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    sel.iter()
+                        .any(|group| group.iter().all(|w| held.contains(&w.as_str())))
+                })
+                && f.attrs
+                    .is_none_or(|attrs| attrs.iter().any(|a| has_live_attr(doc, a, &now)))
+        };
+        // ids name at most what the client sent: look each up, in id order
+        let candidates: Box<dyn Iterator<Item = (&String, &Value)>> = match f.ids {
+            Some(ids) => {
+                let mut want: Vec<&str> = ids.to_vec();
+                want.sort_unstable();
+                want.dedup();
+                Box::new(want.into_iter().filter_map(|id| m.get_key_value(id)))
+            }
+            None => Box::new(m.iter()),
+        };
+        let hits = candidates
+            .filter(|(id, doc)| matches(id, doc))
+            .map(|(_, d)| d);
+        let project = |doc: &Value| {
+            let mut v = doc.clone();
+            if decided {
+                if let Some(o) = v.as_object_mut() {
+                    if let Some(keep) = f.keep_attrs {
+                        o.retain(|k, _| !k.starts_with("http") || keep.contains(k));
+                    } else if let Some(drop) = f.drop_attrs {
+                        o.retain(|k, _| !drop.contains(k));
+                    }
+                }
+            }
+            v
+        };
+        let Some(p) = f.page.as_ref().filter(|_| decided) else {
+            return filter::QueryOutcome {
+                rows: hits.map(project).collect(),
+                decided,
+                paged: false,
+                total: None,
+            };
+        };
+        let offset = usize::try_from(p.offset).unwrap_or(0);
+        let limit = usize::try_from(p.limit).unwrap_or(usize::MAX);
+        let mut rows: Vec<Value> = Vec::new();
+        let (mut matched, mut more) = (0usize, false);
+        for doc in hits {
+            if matched >= offset && rows.len() < limit {
+                rows.push(project(doc));
+            } else if rows.len() == limit && !p.count {
+                more = true;
+                break;
+            }
+            // the rest is counted, never copied
+            matched = matched.saturating_add(1);
+        }
+        let total = if p.count {
+            matched
+        } else {
+            // the smallest total consistent with "a next page exists"
+            offset
+                .saturating_add(rows.len())
+                .saturating_add(usize::from(more))
+        };
+        filter::QueryOutcome {
+            rows,
+            decided,
+            paged: true,
+            total: Some(i64::try_from(total).unwrap_or(i64::MAX)),
+        }
+    }
+
     /// One id-ordered window of docs and the size of the whole set. The
     /// per-tenant map is a `BTreeMap` keyed by id, so the window is a skip
     /// over an already-ordered iterator.
@@ -976,6 +1088,19 @@ impl Store {
                 row
             })
             .collect()
+    }
+}
+
+/// Whether `doc` holds Attribute `iri` once 4.22 has stripped its expired
+/// instances: an instance array keeps it while one instance is live, as
+/// `filter::strip_expired` decides.
+fn has_live_attr(doc: &Value, iri: &str, now: &str) -> bool {
+    match doc.get(iri) {
+        Some(Value::Array(arr)) if iri.contains(':') => {
+            arr.is_empty() || arr.iter().any(|i| !filter::expired_at(i, now))
+        }
+        Some(_) => true,
+        None => false,
     }
 }
 
