@@ -157,6 +157,13 @@ async fn write_attrs(
         body: Some(&fragment),
     )
     .await?;
+    #[cfg(feature = "views")]
+    let guard =
+        crate::views::WriteGuard::of(st, attr_iris_of(&fragment).iter().map(String::as_str));
+    #[cfg(feature = "views")]
+    if let Some(g) = &guard {
+        g.targets(st, &tenant, &fragment).await?;
+    }
     let (plan, all_attr_iris) =
         attr_fed_plan(st, &tenant, id, &fragment, &parsed.ctx, params, headers).await?;
     let regs = match plan {
@@ -175,6 +182,10 @@ async fn write_attrs(
         let res = st
             .store
             .mutate(&tenant, Kind::Entity, id, |doc| {
+                #[cfg(feature = "views")]
+                if let Some(g) = &guard {
+                    g.pre(id, doc)?;
+                }
                 // 5.6.2.4 / 5.6.3.4: the ?type selector narrows the target — a
                 // mismatch means the entity is not known for this operation.
                 if !matches_type_param(doc, params, &parsed.ctx) {
@@ -209,9 +220,17 @@ async fn write_attrs(
                     return Err(Unwritten::Untouched);
                 }
                 target.insert("modifiedAt".into(), Value::String(ts.clone()));
+                #[cfg(feature = "views")]
+                if let Some(g) = &guard {
+                    g.post(doc)?;
+                }
                 Ok::<(), Unwritten>(())
             })
             .await?;
+        #[cfg(feature = "views")]
+        if let Some(g) = &guard {
+            g.verdict()?;
+        }
         Some(match res {
             None => Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into()),
             Some(Err(Unwritten::Failed(e))) => Err(e.into()),
@@ -812,6 +831,17 @@ async fn partial_update_inner(
         body: Some(&frag_inst),
     )
     .await?;
+    #[cfg(feature = "views")]
+    let guard = crate::views::WriteGuard::of(st, [attr_iri.as_str()]);
+    #[cfg(feature = "views")]
+    if let Some(g) = &guard {
+        g.targets(
+            st,
+            &tenant,
+            &serde_json::json!({ attr_iri.clone(): [frag_inst.clone()] }),
+        )
+        .await?;
+    }
     // 5.6.4.4: "If the target Attribute is scope, then an error of type
     // BadRequestData shall be raised."
     if attr == "scope" || attr_iri == SCOPE_IRI {
@@ -839,6 +869,10 @@ async fn partial_update_inner(
         let res = st
             .store
             .mutate(&tenant, Kind::Entity, id, |doc| {
+                #[cfg(feature = "views")]
+                if let Some(g) = &guard {
+                    g.pre(id, doc)?;
+                }
                 // 5.6.4.4: the ?type selector narrows the target entity
                 if !matches_type_param(doc, params, &parsed.ctx) {
                     return Err(NgsiError::ResourceNotFound(format!(
@@ -887,9 +921,17 @@ async fn partial_update_inner(
                 if found {
                     target.insert("modifiedAt".into(), Value::String(ts.clone()));
                 }
+                #[cfg(feature = "views")]
+                if let Some(g) = &guard {
+                    g.post(doc)?;
+                }
                 Ok::<(), NgsiError>(())
             })
             .await?;
+        #[cfg(feature = "views")]
+        if let Some(g) = &guard {
+            g.verdict()?;
+        }
         Some(single_attr_local(res, found, id, attr, &tenant))
     };
     if regs.is_empty() {
@@ -981,6 +1023,12 @@ pub async fn replace_attr(
             body: Some(&fragment),
         )
         .await?;
+        #[cfg(feature = "views")]
+        let guard = crate::views::WriteGuard::of(&st, [attr_iri.as_str()]);
+        #[cfg(feature = "views")]
+        if let Some(g) = &guard {
+            g.targets(&st, &tenant, &fragment).await?;
+        }
         let incoming_arr = fragment
             .get(&attr_iri)
             .cloned()
@@ -1008,6 +1056,10 @@ pub async fn replace_attr(
             let res = st
                 .store
                 .mutate(&tenant, Kind::Entity, &id, |doc| {
+                    #[cfg(feature = "views")]
+                    if let Some(g) = &guard {
+                        g.pre(&id, doc)?;
+                    }
                     // 5.6.19.4: the ?type selector narrows the target entity
                     if !matches_type_param(doc, &params, &parsed.ctx) {
                         return Err(NgsiError::ResourceNotFound(format!(
@@ -1039,9 +1091,17 @@ pub async fn replace_attr(
                     if found {
                         target.insert("modifiedAt".into(), Value::String(ts.clone()));
                     }
+                    #[cfg(feature = "views")]
+                    if let Some(g) = &guard {
+                        g.post(doc)?;
+                    }
                     Ok::<(), NgsiError>(())
                 })
                 .await?;
+            #[cfg(feature = "views")]
+            if let Some(g) = &guard {
+                g.verdict()?;
+            }
             Some(single_attr_local(res, found, &id, &attr, &tenant))
         };
         if regs.is_empty() {
@@ -1155,6 +1215,12 @@ async fn set_attr_value_inner(
         body: judged.as_ref(),
     )
     .await?;
+    #[cfg(feature = "views")]
+    let guard = crate::views::WriteGuard::of(st, [attr_iri.as_str()]);
+    #[cfg(feature = "views")]
+    if let (Some(g), Some(j)) = (&guard, &judged) {
+        g.targets(st, &tenant, j).await?;
+    }
     let (regs, loop_answer) =
         attr_regs_or_loop(st, &tenant, id, &attr_iri, &ctx, params, headers).await?;
     if let Some(r) = loop_answer {
@@ -1169,6 +1235,10 @@ async fn set_attr_value_inner(
         let res = st
             .store
             .mutate(&tenant, Kind::Entity, id, |doc| {
+                #[cfg(feature = "views")]
+                if let Some(g) = &guard {
+                    g.pre(id, doc)?;
+                }
                 if !matches_type_param(doc, params, &ctx) {
                     return Err(NgsiError::ResourceNotFound(format!(
                         "entity {id} does not match the type selector"
@@ -1193,9 +1263,17 @@ async fn set_attr_value_inner(
                 existing[p] = ni;
                 found = true;
                 target.insert("modifiedAt".into(), Value::String(ts.clone()));
+                #[cfg(feature = "views")]
+                if let Some(g) = &guard {
+                    g.post(doc)?;
+                }
                 Ok::<(), NgsiError>(())
             })
             .await?;
+        #[cfg(feature = "views")]
+        if let Some(g) = &guard {
+            g.verdict()?;
+        }
         Some(single_attr_local(res, found, id, attr, &tenant))
     };
     if regs.is_empty() {
@@ -1366,6 +1444,9 @@ async fn delete_attr_inner(
         attrs: std::slice::from_ref(&attr_iri),
     )
     .await?;
+    #[cfg(feature = "views")]
+    let guard =
+        crate::views::WriteGuard::of(st, (attr_iri != "scope").then_some(attr_iri.as_str()));
     let delete_all = params.get("deleteAll").map(String::as_str) == Some("true");
     let want_ds = crate::repr::target_dataset_id(params).map(String::from);
     let (regs, loop_answer) =
@@ -1382,6 +1463,10 @@ async fn delete_attr_inner(
         let res = st
             .store
             .mutate(&tenant, Kind::Entity, id, |doc| {
+                #[cfg(feature = "views")]
+                if let Some(g) = &guard {
+                    g.pre(id, doc)?;
+                }
                 // 5.6.5.4: the ?type selector narrows the target entity
                 if !matches_type_param(doc, params, &ctx) {
                     return Err(NgsiError::ResourceNotFound(format!(
@@ -1393,6 +1478,10 @@ async fn delete_attr_inner(
                     found = target.remove("scope").is_some();
                     if found {
                         target.insert("modifiedAt".into(), Value::String(ts.clone()));
+                    }
+                    #[cfg(feature = "views")]
+                    if let Some(g) = &guard {
+                        g.post(doc)?;
                     }
                     return Ok(());
                 }
@@ -1417,9 +1506,17 @@ async fn delete_attr_inner(
                 if found {
                     target.insert("modifiedAt".into(), Value::String(ts.clone()));
                 }
+                #[cfg(feature = "views")]
+                if let Some(g) = &guard {
+                    g.post(doc)?;
+                }
                 Ok::<(), NgsiError>(())
             })
             .await?;
+        #[cfg(feature = "views")]
+        if let Some(g) = &guard {
+            g.verdict()?;
+        }
         // The temporal representation records the deletion (4.8 deletedAt).
         // An Entity held only temporally is not "held locally" (5.6.5.4): it
         // answers ResourceNotFound and its evolution is left to 5.6.13. A

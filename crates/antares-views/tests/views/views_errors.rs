@@ -5,7 +5,7 @@
 //! serve gets 405 with `Allow`, 422 when the method stays, 404 where the
 //! view serves nothing.
 
-use crate::common::{fixture, get, put_view, send, CARS};
+use crate::common::{fixture, get, put_view, send, CARS, FLEET};
 use antares_ops::INNER_DETAIL;
 use axum::http::{Method, StatusCode};
 use serde_json::json;
@@ -95,6 +95,54 @@ async fn views_a_disallowed_operation_answers_405_with_allow() -> Result<(), Str
         StatusCode::NOT_FOUND,
         "nothing was written: {}",
         made.text
+    );
+    // a view that writes: the methods it serves beside the reads, and none
+    // the allowlist did not name (V25)
+    for (method, uri, allow) in [
+        (Method::DELETE, "/entities?type=Car", "GET, HEAD, POST"),
+        (Method::PUT, "/entities", "GET, HEAD, POST"),
+    ] {
+        let body = (method == Method::PUT).then(|| json!({}));
+        let a = send(
+            &f.app,
+            method.clone(),
+            &format!("{FLEET}{uri}"),
+            &[],
+            body.as_ref(),
+        )
+        .await;
+        assert_eq!(
+            a.status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {uri}: {}",
+            a.text
+        );
+        assert_eq!(a.header("allow").as_deref(), Some(allow), "{method} {uri}");
+    }
+    // OPTIONS is the 405 the broker answers 204, Allow kept (2.0 #59)
+    let a = send(
+        &f.app,
+        Method::OPTIONS,
+        &format!("{FLEET}/entities"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.text);
+    assert_eq!(a.header("allow").as_deref(), Some("GET, HEAD, POST"));
+    assert_eq!(
+        send(
+            &f.app,
+            Method::GET,
+            "/ngsi-ld/v1/entities?type=Car",
+            &[("NGSILD-Tenant", "city")],
+            None
+        )
+        .await
+        .ids()
+        .len(),
+        3,
+        "no purge ran"
     );
     let head = send(
         &f.app,

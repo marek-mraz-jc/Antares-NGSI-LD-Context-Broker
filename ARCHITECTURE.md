@@ -52,7 +52,7 @@ broker nor a storage backend (`antares-api`, `antares-broker`,
 | `antares-broker` | 3 800 | composition root: env → config, roles, bus wiring (`wiring.rs`), telemetry, shutdown | contain clause logic |
 | `antares-wasm` | 500 | the router under a Service Worker, OPFS-backed file store | diverge from the native router |
 | `antares-ops` | 1 880 | the operation layer every surface serves through (ADR-0027 section 1): `Ops` over `AppState::call`, `OperationId` (the matrix rows), `Refusal`, `Surface`; the view table (`views.rs`: `View`, load and validation, `/q/views`, reload, rule M4 closing a surface with no view) | be linked by a vanilla build, name the store, SQL, bus or notifier |
-| `antares-views` | 290 | the NGSI-LD view root `/x/views/{view}/ngsi-ld/v1` (ADR-0023, role surface, feature `views`): the reads through `ViewOps` in the view's Tenant, 405/422/404 by rule 4, `Link`/`Location` rebased to the view root, no entity maps | name the store, the policy engine or any crate but `antares-ops` |
+| `antares-views` | 310 | the NGSI-LD view root `/x/views/{view}/ngsi-ld/v1` (ADR-0023, role surface, feature `views`): the reads and the rule-7 writes through `ViewOps` in the view's Tenant, 405/422/404 by rule 4, `Link`/`Location` rebased to the view root, no entity maps | name the store, the policy engine or any crate but `antares-ops` |
 | `odata-csdl` | 3 640 | OData 4.01 EDM model, CSDL XML and CSDL JSON writers, model validation under caller `Limits` (ADR-0024) | know its host (no `antares-*` dependency, rule M1) or read CSDL |
 
 ## 3. Module map of `antares-api/src`
@@ -66,8 +66,8 @@ module's header comment.
 | `negotiate.rs` | 2 000 | 6.3.4–6.3.6: tenant, Accept, Content-Type, `@context` resolution, parameter allow-lists (the query set of 6.4.3.2 included) and the RFC 7230 header-syntax checks. Every handler passes through `tenant_from`, `check_params`, `parse_body`, `request_context` |
 | `entities.rs` | 3 900 | 5.6.1–5.6.6, 5.7.1–5.7.2 `/entities`, distributed write fan-out |
 | `paging.rs` | 1 400 | 4.12, 6.3.10 limit/offset/count and the next/prev links, 4.23 ordering and ICU collation, 6.3.17 `NGSILD-Warning`, the query body of 5.2.23 lifted into parameters; every list operation pages through it |
-| `attrs.rs` | 2 200 | 5.6.2–5.6.5 attribute operations, 10.2.6 Set Attribute Value |
-| `batch.rs` | 2 240 | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
+| `attrs.rs` | 2 350 | 5.6.2–5.6.5 attribute operations, 10.2.6 Set Attribute Value |
+| `batch.rs` | 2 360 | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
 | `temporal.rs` | 4 600 | 5.6.11–5.6.16, 5.7.3–5.7.4 `/temporal/entities` |
 | `temporalq.rs` | 200 | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |
 | `types_attrs.rs` | 900 | 5.7.5–5.7.10 `/types`, `/attributes` |
@@ -92,7 +92,7 @@ module's header comment.
 | `policy.rs` | 1 825 | the policy seam (ADR-0020): `PolicyEngine`, `Subject`/`Operation`/`Decision`/`Filter` (per-rule allowlists, ADR-0023 rule 11), the built-in `AllowAll` engine, the clauses a narrowing can reach and the refusal everywhere else, the fail-closed calls that deny on a panic or a timeout, and the stored subject a notification is decided under |
 | `state.rs` | 1 050 | `AppState`: store, bus flag, mirror, HTTP clients, delivery policy, sinks, surfaces, hooks, and the endpoint view a state is narrowed to (feature `views`) |
 | `fuzzing.rs` | 84 | the request parsers the `fuzz/` targets drive, behind the `fuzzing` feature that no broker build enables (T-3463) |
-| `views.rs` | 890 | feature `views` (ADR-0023, ADR-0027 section 5): `CompiledView` and the composition `gate!` applies after the engine answers, effective = view ∧ engine, neither side widening; the `ViewTable` a pod serves from and the `Kind::View` documents under `antares-views`; never in a vanilla build |
+| `views.rs` | 1 190 | feature `views` (ADR-0023, ADR-0027 section 5): `CompiledView` and the composition `gate!` applies after the engine answers, effective = view ∧ engine, neither side widening; `WriteGuard`, rule 7 checked inside the store's read-modify-write; the `ViewTable` a pod serves from and the `Kind::View` documents under `antares-views`; never in a vanilla build |
 Geoquery evaluation, the `q=` evaluator and the caches of compiled client
 query text are not in that table because they are not this crate's: they are
 `antares_ql::geo`, `::eval` and `::regex`, named by those paths at every call

@@ -26,6 +26,26 @@ use tower::ServiceExt;
 pub const CARS: &str = "/x/views/cars/ngsi-ld/v1";
 /// The root of view `history`.
 pub const HISTORY: &str = "/x/views/history/ngsi-ld/v1";
+/// The root of view `fleet`.
+pub const FLEET: &str = "/x/views/fleet/ngsi-ld/v1";
+
+/// Every write the view root serves, by its matrix id.
+pub const WRITES: [&str; 14] = [
+    "batch_create",
+    "batch_update",
+    "batch_merge",
+    "batch_delete",
+    "create_entity",
+    "update_attributes",
+    "append_attributes",
+    "partial_attribute_update",
+    "set_attribute_value",
+    "delete_attribute",
+    "delete_entity",
+    "merge_entity",
+    "replace_entity",
+    "replace_attribute",
+];
 
 /// Every read the view root serves, by its matrix id.
 pub const READS: [&str; 14] = [
@@ -146,11 +166,15 @@ pub async fn get(app: &Router, uri: &str) -> Answer {
     send(app, Method::GET, uri, &[], None).await
 }
 
-fn prop(v: &Value) -> Value {
+/// A Property of value `v`.
+#[must_use]
+pub fn prop(v: &Value) -> Value {
     json!({"type": "Property", "value": v})
 }
 
-fn rel(target: &str) -> Value {
+/// A Relationship to `target`.
+#[must_use]
+pub fn rel(target: &str) -> Value {
     json!({"type": "Relationship", "object": target})
 }
 
@@ -221,6 +245,32 @@ pub fn history_view() -> Value {
     })
 }
 
+/// The view `fleet`: `cars`' rules, every read and every write it serves.
+#[must_use]
+pub fn fleet_view() -> Value {
+    let mut v = cars_view();
+    if let Some(o) = v.as_object_mut() {
+        o.insert("id".into(), json!("fleet"));
+        o.insert(
+            "operations".into(),
+            json!(READS.iter().chain(&WRITES).collect::<Vec<_>>()),
+        );
+    }
+    v
+}
+
+/// The Entity `id` as tenant `city` stores it, through the NGSI-LD root.
+pub async fn stored(app: &Router, id: &str) -> Answer {
+    send(
+        app,
+        Method::GET,
+        &format!("/ngsi-ld/v1/entities/{id}"),
+        &[("NGSILD-Tenant", "city")],
+        None,
+    )
+    .await
+}
+
 /// Load `view` through `/q/views`.
 ///
 /// # Errors
@@ -246,6 +296,7 @@ pub async fn fixture() -> Result<Fixture, String> {
     seed(&app).await?;
     put_view(&app, &cars_view()).await?;
     put_view(&app, &history_view()).await?;
+    put_view(&app, &fleet_view()).await?;
     Ok(Fixture {
         _broker: broker,
         app,
