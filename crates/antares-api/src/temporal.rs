@@ -1884,6 +1884,57 @@ fn window_conditions_match(
     geos.iter().all(|g| g.matches(&eval_doc, ctx))
 }
 
+/// 5.7.4.4 S9: of each Attribute `q` reads, keep the instances that meet
+/// the query: an instance meets it when `q` holds on the Entity with that
+/// Attribute narrowed to the one instance (the other Attributes in the
+/// window), so a term on another Attribute still acts at Entity level.
+fn retain_q_instances(
+    doc: &mut Value,
+    tq: Option<&TemporalQ>,
+    ast: &antares_ql::QNode,
+    ctx: &Context,
+) {
+    let mut heads: Vec<String> = ast
+        .attribute_paths()
+        .into_iter()
+        .filter_map(|p| p.split(['.', '[', '{']).next().map(|h| ctx.expand_key(h)))
+        .collect();
+    heads.sort();
+    heads.dedup();
+    let mut eval_doc = doc.clone();
+    if let (Some(tqv), Some(o)) = (tq, eval_doc.as_object_mut()) {
+        for (k, v) in o.iter_mut() {
+            if !is_meta(k) {
+                if let Some(arr) = v.as_array_mut() {
+                    arr.retain(|inst| tqv.instance_matches(inst));
+                }
+            }
+        }
+    }
+    let (Some(obj), Value::Object(eval)) = (doc.as_object_mut(), &mut eval_doc) else {
+        return;
+    };
+    for head in heads {
+        let Some(arr) = obj.get_mut(&head).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let windowed = eval.get(&head).cloned();
+        arr.retain(|inst| {
+            eval.insert(head.clone(), Value::Array(vec![inst.clone()]));
+            // `eval` is lent back as a document for the one evaluation
+            let probe = Value::Object(std::mem::take(eval));
+            let holds = antares_ql::eval::eval_q(ast, &probe, ctx, &|_| None);
+            if let Value::Object(m) = probe {
+                *eval = m;
+            }
+            holds
+        });
+        if let Some(w) = windowed {
+            eval.insert(head, w);
+        }
+    }
+}
+
 /// 5.7.4.4 S4 — and S7: the federation merge precedes this check, so
 /// split and aggregated entities are re-filtered here too. The entity
 /// qualifies if one of its scope's 4.18 validity intervals intersects
@@ -2085,15 +2136,9 @@ pub(crate) async fn query_temporal_collected(
         Vec<&antares_ql::geo::GeoQuery>,
         Vec<&antares_ql::geo::GeoQuery>,
     ) = if ruled {
-        (
-            filter.geo_q.as_deref().into_iter().collect(),
-            own_geo.iter().collect(),
-        )
+        (filter.areas().collect(), own_geo.iter().collect())
     } else {
-        (
-            own_geo.iter().chain(filter.geo_q.as_deref()).collect(),
-            Vec::new(),
-        )
+        (own_geo.iter().chain(filter.areas()).collect(), Vec::new())
     };
 
     // Push entity narrowing (ids/types/attrs) and instance-window
@@ -2290,6 +2335,9 @@ pub(crate) async fn query_temporal_collected(
         {
             continue;
         }
+        if let Some(ast) = &q_ast {
+            retain_q_instances(&mut doc, tq.as_ref(), ast, &ctx);
+        }
         if let Some(sq) = scope_q {
             if !scope_window_retain(&mut doc, sq, tq.as_ref(), timeprop.as_str()) {
                 continue;
@@ -2307,6 +2355,9 @@ pub(crate) async fn query_temporal_collected(
                 && !window_conditions_match(&doc, tq.as_ref(), client_q.as_ref(), &shown_geos, &ctx)
             {
                 continue;
+            }
+            if let Some(ast) = &client_q {
+                retain_q_instances(&mut doc, tq.as_ref(), ast, &ctx);
             }
         }
         // entity qualifies only if some instance falls in the window

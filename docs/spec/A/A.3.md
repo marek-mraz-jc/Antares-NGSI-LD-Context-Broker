@@ -6,7 +6,8 @@ status: implemented
 evidence: 'all broker-generated identifiers use the lowercase urn:ngsi-ld: namespace prefix (notification
   ids, EntityMap ids urn:ngsi-ld:entitymap:…, ContextSourceIdentity ids) — the annex''s one broker-facing
   SHALL; the URN scheme itself is accepted like any URI'
-notes: namespace IANA registration is ETSI's action, not broker surface.
+notes: 'namespace IANA registration is ETSI''s action, not broker surface. TS 104 175 A.3: the sentence
+  pointing to the core @context moved to Annex B; unchanged in substance.'
 robot: []
 ---
 

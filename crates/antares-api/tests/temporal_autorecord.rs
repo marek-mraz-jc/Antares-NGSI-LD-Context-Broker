@@ -514,3 +514,136 @@ async fn absurd_aggr_period_duration_is_400_not_a_panic() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+fn req(method: &str, uri: &str, body: Option<&str>) -> Request<Body> {
+    let b = Request::builder().method(method).uri(uri);
+    match body {
+        Some(s) => b
+            .header("Content-Type", "application/json")
+            .header("Content-Length", s.len())
+            .body(Body::from(s.to_owned())),
+        None => b.body(Body::empty()),
+    }
+    .expect("request")
+}
+
+/// 5.6.5.4: an Entity held only in the temporal store is not held locally,
+/// so Delete Attribute answers ResourceNotFound and records nothing; its
+/// evolution belongs to 5.6.13 (forge suite fix f7c78f94, TP 020_17).
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_attribute_of_a_temporal_only_entity_is_not_found() {
+    let mut st = AppState::new("test".into());
+    antares_api::wire(&mut st).await;
+    let body = r#"{"id":"urn:ngsi-ld:Rec:t1","type":"Rec",
+        "speed":[{"type":"Property","value":1,"observedAt":"2020-01-01T00:00:00Z"}]}"#;
+    let (s, b) = send(
+        &st,
+        req("POST", "/ngsi-ld/v1/temporal/entities", Some(body)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let (s, b) = send(
+        &st,
+        req(
+            "DELETE",
+            "/ngsi-ld/v1/entities/urn:ngsi-ld:Rec:t1/attrs/speed",
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
+    let (s, b) = send(
+        &st,
+        req(
+            "GET",
+            "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Rec:t1",
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert!(!b.contains("deletedAt"), "nothing recorded: {b}");
+}
+
+/// 4.18 and 4.5.0: a deleted scope reads as the NGSI-LD Null in the
+/// temporal representation, not as an empty array (forge fix fad5ab03,
+/// TP 020_19 and 020_20).
+#[tokio::test(flavor = "multi_thread")]
+async fn deleted_scope_is_the_ngsi_ld_null_in_the_temporal_representation() {
+    let mut st = AppState::new("test".into());
+    antares_api::wire(&mut st).await;
+    let body = r#"{"id":"urn:ngsi-ld:Rec:s1","type":"Rec","scope":"/A",
+        "speed":{"type":"Property","value":1}}"#;
+    let (s, b) = send(&st, req("POST", "/ngsi-ld/v1/entities", Some(body))).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let (s, b) = send(
+        &st,
+        req(
+            "DELETE",
+            "/ngsi-ld/v1/entities/urn:ngsi-ld:Rec:s1/attrs/scope",
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{b}");
+    let (s, b) = send(
+        &st,
+        req(
+            "GET",
+            "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Rec:s1?timeproperty=deletedAt",
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let doc: serde_json::Value = serde_json::from_str(&b).expect("json");
+    let deleted: Vec<&serde_json::Value> = doc["scope"]
+        .as_array()
+        .map(|a| a.iter().filter(|i| i.get("deletedAt").is_some()).collect())
+        .unwrap_or_default();
+    assert_eq!(deleted.len(), 1, "{b}");
+    assert_eq!(deleted[0]["value"], "urn:ngsi-ld:null", "{b}");
+}
+
+/// 5.7.4.4, S9: the temporal representation holds only the instances that
+/// meet the query, not every instance of an Entity the query selected
+/// (forge fix 9ca4213e, TP 021_08). An instance meets `q` when `q` holds on
+/// the Entity with that Attribute narrowed to that instance, so a term on
+/// another Attribute keeps acting at Entity level.
+#[tokio::test(flavor = "multi_thread")]
+async fn temporal_query_keeps_only_the_instances_that_meet_q() {
+    let mut st = AppState::new("test".into());
+    antares_api::wire(&mut st).await;
+    let body = r#"{"id":"urn:ngsi-ld:Rec:q1","type":"Rec",
+        "speed":[{"type":"Property","value":120,"observedAt":"2020-07-01T12:05:00Z"},
+                 {"type":"Property","value":80,"observedAt":"2020-07-01T12:07:00Z"},
+                 {"type":"Property","value":100,"observedAt":"2020-07-01T12:09:00Z"}],
+        "brand":[{"type":"Property","value":"x","observedAt":"2020-07-01T12:05:00Z"}]}"#;
+    let (s, b) = send(
+        &st,
+        req("POST", "/ngsi-ld/v1/temporal/entities", Some(body)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let values = |b: &str, attr: &str| -> Vec<i64> {
+        let list: serde_json::Value = serde_json::from_str(b).expect("json");
+        let mut v: Vec<i64> = list[0][attr]
+            .as_array()
+            .map(|a| a.iter().filter_map(|i| i["value"].as_i64()).collect())
+            .unwrap_or_default();
+        v.sort_unstable();
+        v
+    };
+    let uri = "/ngsi-ld/v1/temporal/entities?type=Rec&q=speed%3E90\
+               &timerel=after&timeAt=2020-07-01T12:00:00Z";
+    let (s, b) = send(&st, req("GET", uri, None)).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(values(&b, "speed"), [100, 120], "80 fails q: {b}");
+    // an OR with a term on another Attribute: that term holds for the
+    // Entity, so every speed instance meets the query
+    let uri = "/ngsi-ld/v1/temporal/entities?type=Rec&q=speed%3E90%7Cbrand%3D%3D%22x%22\
+               &timerel=after&timeAt=2020-07-01T12:00:00Z";
+    let (s, b) = send(&st, req("GET", uri, None)).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(values(&b, "speed"), [80, 100, 120], "{b}");
+}

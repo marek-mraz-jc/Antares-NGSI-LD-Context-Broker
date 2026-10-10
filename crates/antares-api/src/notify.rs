@@ -957,8 +957,8 @@ pub(crate) fn notif_shape(sub: &Value, ctx: &Context) -> NotifShape {
             let level = (n
                 .and_then(|n| n.get("joinLevel"))
                 .and_then(Value::as_u64)
-                .unwrap_or(1) as usize)
-                .min(crate::bounds::MAX_JOIN_LEVEL);
+                .map_or(1, |n| usize::try_from(n).unwrap_or(usize::MAX)))
+            .min(crate::bounds::MAX_JOIN_LEVEL);
             (j.to_owned(), level)
         });
     NotifShape {
@@ -2269,7 +2269,7 @@ async fn deliver_as(
             crate::policy::NotifyDecision::Filter(f) => {
                 // a condition the notification path cannot re-run is not a
                 // narrowing it can claim to have applied
-                if f.q.is_some() || f.scope_q.is_some() || f.geo_q.is_some() {
+                if f.q.is_some() || f.scope_q.is_some() || f.areas().next().is_some() {
                     tracing::error!(
                         "policy engine {} narrowed a notification with a query; dropping it",
                         engine.name()
@@ -2719,11 +2719,20 @@ fn dead_letter(
     doc
 }
 
+/// The deadline a dead letter was written with. It is read back from
+/// storage, so a value past u32 caps at the 30 s ceiling of
+/// [`endpoint_timeout_ms`] instead of wrapping to a short deadline.
+fn letter_timeout_ms(letter: &Value) -> u32 {
+    letter["timeoutMs"]
+        .as_u64()
+        .map_or(5_000, |t| u32::try_from(t.min(30_000)).unwrap_or(30_000))
+}
+
 /// Replay one dead letter through the same binding, once. `Ok` = delivered
 /// (the caller deletes the letter); `Err` carries the failure text.
 pub(crate) async fn replay_dead_letter(st: &AppState, letter: &Value) -> Result<(), String> {
     let uri = letter["uri"].as_str().ok_or("dead letter without uri")?;
-    let timeout_ms = letter["timeoutMs"].as_u64().unwrap_or(5_000) as u32;
+    let timeout_ms = letter_timeout_ms(letter);
     let outbound = Outbound::from_dead_letter(letter)?;
     // the egress policy of the moment applies, exactly as for a fresh send
     if st.sinks.sink_for_uri(uri).is_some_and(|s| s.network()) {
@@ -3223,6 +3232,18 @@ mod change_pipeline {
         assert_eq!(
             stored["notification"]["lastNotification"],
             mirrored["notification"]["lastNotification"]
+        );
+    }
+
+    /// T-3531: a stored deadline past u32 caps instead of wrapping.
+    #[test]
+    fn a_dead_letter_deadline_caps_instead_of_wrapping() {
+        use serde_json::json;
+        assert_eq!(letter_timeout_ms(&json!({})), 5_000);
+        assert_eq!(letter_timeout_ms(&json!({"timeoutMs": 2_000})), 2_000);
+        assert_eq!(
+            letter_timeout_ms(&json!({"timeoutMs": 4_294_967_396u64})),
+            30_000
         );
     }
 

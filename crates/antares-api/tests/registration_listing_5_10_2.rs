@@ -11,7 +11,7 @@
 //! store-side window 5.8.4's can.
 #![allow(clippy::unwrap_used)] // an unwrap here is the assertion
 
-mod common;
+use crate::common;
 
 use antares_api::AppState;
 use antares_model::TenantId;

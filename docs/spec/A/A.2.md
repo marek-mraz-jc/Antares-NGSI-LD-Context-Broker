@@ -5,7 +5,9 @@ pages: '364'
 status: implemented
 evidence: antares-model EntityId::new enforces URI-ness of every element id (entities, subscriptions,
   registrations, entity maps); dereferenceability is a SHOULD for linked-data scenarios (client concern)
-notes: ''
+notes: 'TS 104 175 A.2: the shall-rule on lowercase namespaces and the should-rule on dereferenceable
+  URIs left the annex, and so did the Type-and-nss structure of an identifier; no new obligation, and
+  nothing in Antares reads a URN segment (ADR-N-041).'
 robot: []
 ---
 

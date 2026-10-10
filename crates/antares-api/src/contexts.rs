@@ -386,12 +386,40 @@ pub async fn serve_context(
 ) -> Response {
     let go = async {
         let tenant = tenant_from(&headers)?;
-        check_params(&params, &["details", "local"])?;
+        check_params(&params, &["details", "local", "core"])?;
         gate!(st, &tenant, &headers, "5.13.4", ids: &[&id]).await?;
         let details = details_param(&params)?;
+        // TS 104 175 13.4.4: `core` with `details` is a BadRequest, and so is
+        // a `core` that names no NGSI-LD version this build has a core for
+        let core = match params.get("core") {
+            Some(_) if details => {
+                return Err(NgsiError::BadRequestData("core and details together".into()).into())
+            }
+            Some(v) => Some(antares_jsonld::core_context_url(v).ok_or_else(|| {
+                NgsiError::BadRequestData(format!("core {v:?} is not a known major.minor version"))
+            })?),
+            None => None,
+        };
         let entry = find_entry(&st, &tenant, &id)
             .await?
             .ok_or_else(|| NgsiError::ResourceNotFound(format!("@context {id} not found")))?;
+        // the user @context's location and the core one, for every kind: the
+        // pair is two URLs, not the content a Cached entry never serves
+        if let Some(core) = core {
+            let user = match &entry {
+                CtxEntry::Stored(doc) => doc["url"].as_str().unwrap_or_default().to_owned(),
+                CtxEntry::Cached(u) => u.url.clone(),
+                CtxEntry::Core(url) => url.clone(),
+            };
+            let mut resp = (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                axum::Json(json!([user, core])),
+            )
+                .into_response();
+            echo_tenant(&tenant, &mut resp);
+            return Ok(resp);
+        }
         let payload = match &entry {
             CtxEntry::Stored(doc) => {
                 let kind = doc["kind"].as_str().unwrap_or("Hosted");

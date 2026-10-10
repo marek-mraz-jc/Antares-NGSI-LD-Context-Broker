@@ -49,7 +49,7 @@ async fn body_json(res: axum::http::Response<Body>) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs a live PostGIS in ANTARES_TEST_DATABASE_URL: cargo test -p antares-api --test temporal_fed_paging_5_7_4 -- --ignored"]
+#[ignore = "needs a live PostGIS in ANTARES_TEST_DATABASE_URL: cargo test -p antares-api --test it temporal_fed_paging_5_7_4:: -- --ignored"]
 async fn clause_5_7_4_pages_partition_the_federated_union_on_pg() {
     let url = std::env::var("ANTARES_TEST_DATABASE_URL")
         .expect("ANTARES_TEST_DATABASE_URL must point at a live PostGIS");

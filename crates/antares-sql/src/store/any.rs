@@ -685,23 +685,17 @@ impl AnyStore {
     }
 
     /// Query Entities with the filter pushed down where the backend
-    /// can take it. `memory`/`file` have nothing to push into — their
-    /// entities are already in RAM — so they return the same snapshot `list`
-    /// does (never `decided`, never `paged`). Either way the caller applies
-    /// the exact filter afterwards unless the outcome says SQL already did.
+    /// can take it: SQL for Postgres, the borrowed documents for
+    /// `memory`/`file` (`Store::query_entities`). Either way the caller
+    /// applies the exact filter afterwards unless the outcome says the store
+    /// already did.
     pub async fn query_entities(
         &self,
         tenant: &TenantId,
-        #[cfg_attr(not(feature = "postgres"), allow(unused_variables))]
         f: &crate::store::filter::EntityFilter<'_>,
     ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
         let mut outcome = match self {
-            AnyStore::Mem(s) => crate::store::filter::QueryOutcome {
-                rows: s.list(tenant, Kind::Entity),
-                decided: false,
-                paged: false,
-                total: None,
-            },
+            AnyStore::Mem(s) => s.query_entities(tenant, f),
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => p.entities.query(tenant, f).await.map_err(db)?,
         };
@@ -1586,14 +1580,17 @@ impl antares_store::TemporalDriver for AnyStore {
                     crate::store::pg::set_tenant(&mut tx, tenant)
                         .await
                         .map_err(db)?;
-                    for table in ["attr_instances", "temporal_entities"] {
-                        sqlx::query(sqlx::AssertSqlSafe(format!(
-                            "DELETE FROM {table} WHERE tenant_id = $1"
-                        )))
-                        .bind(tenant.as_str())
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(db)?;
+                    // whole statements, not a spliced table name: the
+                    // attr_instances tenant-predicate check reads literals
+                    for sql in [
+                        "DELETE FROM attr_instances WHERE tenant_id = $1",
+                        "DELETE FROM temporal_entities WHERE tenant_id = $1",
+                    ] {
+                        sqlx::query(sql)
+                            .bind(tenant.as_str())
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(db)?;
                     }
                     tx.commit().await.map_err(db)
                 }
