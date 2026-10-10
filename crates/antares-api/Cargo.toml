@@ -7,6 +7,10 @@ publish = false
 license.workspace = true
 rust-version.workspace = true
 
+# ADR-0027 / surfaces-threat-model 9.1: checked by dev/check-module-rules.py.
+[package.metadata.antares]
+role = "core"
+
 [dependencies]
 tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true }

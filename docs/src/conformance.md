@@ -146,7 +146,7 @@ carries the fix. The current list:
 
 | # | target | finding |
 |---|---|---|
-| 1 | suite | `D018_01` asserts 508 Loop Detected for an inclusive registration |
+| 1 | spec | CIM 009 6.3.17 scopes 508 to a single exclusive or redirect source; TS 104 175 9.7 makes every detected loop an error (`D018_01`) |
 | 2 | suite | nine official `_exc` TPs create exclusive registrations that 4.3.6.3 forbids |
 | 3 | suite | `LdContextNotAvailable` fixtures assert 503; V1.9.1 mandates 504 |
 | 4 | spec | 5.3.4 SnapshotNotification: member naming conflict and a phantom `snapshotReady` |
@@ -157,6 +157,7 @@ carries the fix. The current list:
 | 9 | suite | three temporal TPs assert `Content-Range` unit `date-time`; 6.3.10 mandates `DateTime` |
 | 10 | spec | 4.5.19.0's unbounded period count contradicts the aggregation fixtures |
 | 11 | spec | Annex B maps `attributeCount`/`attributeDetails` to bare terms |
+| 13 | spec | TS 104 175 Table 5.2.6.5.2-1 calls `timeInterval` not applicable to CSR subscriptions; 12.4.2.4/12.4.7 define periodic CSR notification |
 
 Filing is manual; each entry carries the clause quotation and the
 proposed fix so it can be pasted into the ETSI tracker as is.

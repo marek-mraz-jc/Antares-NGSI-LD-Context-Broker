@@ -313,9 +313,23 @@ fn terminal(
         }
         (Some(b), _) => {
             // MemberExpression into the compound value; undefined result =
-            // "the target element shall be considered as non-existent"
-            if let Some(nested) = navigate(v, b) {
-                push_target(kind, nested, out);
+            // "the target element shall be considered as non-existent".
+            // Several reached (through an array of JSON objects) are ONE
+            // array target, so == holds when one equals and != when none
+            // does, as over [*] above (TS 104 175 7.2.3.4 conditions 8, 9)
+            match reach(v, b).as_slice() {
+                [] => {}
+                [one] => push_target(kind, one, out),
+                several => {
+                    let mut all = Vec::new();
+                    for val in several {
+                        match val {
+                            Value::Array(a) => all.extend(a.iter().cloned()),
+                            other => all.push((*other).clone()),
+                        }
+                    }
+                    push_target(kind, &Value::Array(all), out);
+                }
             }
         }
     }
@@ -336,6 +350,24 @@ fn navigate<'a>(v: &'a Value, path: &[String]) -> Option<&'a Value> {
         cur = cur.get(seg)?;
     }
     Some(cur)
+}
+
+/// The values a trailing `[path]` reaches inside `v`. Through an array it
+/// reaches into each JSON object of it (TS 104 175 7.2.3.4 conditions 8 and
+/// 9), so one path may reach several values; none reached is a non-existent
+/// target.
+fn reach<'a>(v: &'a Value, path: &[String]) -> Vec<&'a Value> {
+    let mut cur = vec![v];
+    for seg in path {
+        cur = cur
+            .into_iter()
+            .flat_map(|c| match c {
+                Value::Array(items) => items.iter().filter_map(|i| i.get(seg)).collect(),
+                other => other.get(seg).into_iter().collect::<Vec<_>>(),
+            })
+            .collect();
+    }
+    cur
 }
 
 /// 4.9 target value: annex C.6 lets a Property value be written as a JSON-LD
@@ -621,6 +653,32 @@ mod clause_4_9_extensions {
         // existence through the bracket: defined member exists, missing not
         assert!(q(&e, "address[city]"));
         assert!(!q(&e, "address[postcode]"));
+    }
+
+    /// TS 104 175 7.2.3.4 conditions 8 and 9: a trailing path into a value
+    /// that is an array of JSON objects matches if one of the objects holds
+    /// it (its example: `address[city]==Berlin` over London and Berlin), and
+    /// `!=` then needs none of them to equal; the same over a ListProperty
+    /// and a JsonProperty.
+    #[test]
+    fn trailing_path_matches_inside_an_array_of_json_objects() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "address": {"type": "Property",
+                "value": [{"city": "London"}, {"city": "Berlin", "zip": "10115"}]},
+            "stops": {"type": "ListProperty",
+                "valueList": [{"city": "Rome"}, {"city": "Oslo"}]},
+            "raw": {"type": "JsonProperty",
+                "json": [{"to": {"city": "Kyiv"}}, {"to": {"city": "Lima"}}]}}));
+        assert!(q(&e, r#"address[city]=="Berlin""#));
+        assert!(q(&e, r#"address[city]=="Berlin","Tokyo""#));
+        assert!(!q(&e, r#"address[city]=="Rome""#));
+        assert!(!q(&e, r#"address[city]!="Berlin""#), "one element equals");
+        assert!(q(&e, r#"address[city]!="Rome""#));
+        assert!(q(&e, "address[zip]"), "held by one object");
+        assert!(!q(&e, "address[street]"));
+        assert!(q(&e, r#"stops[city]=="Oslo""#));
+        assert!(q(&e, r#"raw[to.city]=="Lima""#));
+        assert!(!q(&e, r#"raw[to.city]=="Rome""#));
     }
 
     /// 4.9 Equal/Unequal languageMap semantics: [lang] targets one language,

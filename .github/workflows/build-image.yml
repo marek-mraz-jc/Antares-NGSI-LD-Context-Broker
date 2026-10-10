@@ -67,6 +67,18 @@ jobs:
           cache-from: ${{ !startsWith(github.ref, 'refs/tags/') && format('type=gha{0}', inputs.arch == 'arm64' && ',scope=arm64' || '') || '' }}
           cache-to: ${{ github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/') && format('type=gha,mode=max{0}', inputs.arch == 'arm64' && ',scope=arm64' || '') || '' }}
 
+      # Rule M3 on the shipped artefact (surfaces-threat-model 9.5 item 3):
+      # /antares is stripped, so its symbols say nothing; the package list
+      # `cargo auditable` embeds (Dockerfile) does, and no surface, ops or
+      # protocol crate may be in it.
+      - name: The image's /antares links no surface
+        run: |
+          cargo install --locked rust-audit-info@0.5.4
+          id=$(docker create "antares-local:$TAG")
+          docker cp "$id:/antares" ./antares-image-bin
+          docker rm "$id"
+          ./dev/check-vanilla-symbols.sh --audit-info ./antares-image-bin
+
       - name: Export it for the downstream jobs
         run: docker save "antares-local:$TAG" | gzip > "$ART.tgz"
 

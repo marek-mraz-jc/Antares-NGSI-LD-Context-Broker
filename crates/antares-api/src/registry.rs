@@ -304,7 +304,15 @@ pub fn csr_matches_subscription(sub: &Value, reg: &Value, ctx: &Context) -> bool
         if let Ok(Some(gq)) =
             antares_ql::geo::GeoQuery::from_params(&antares_matcher::geo_params(g))
         {
-            match reg.get("location") {
+            // Table 5.2.6.5.2-1: matched against the registration GeoJSON
+            // member `geoproperty` names (location, observationSpace,
+            // operationSpace), stored by its compacted name
+            let member = if gq.geoproperty.is_empty() {
+                "location".to_owned()
+            } else {
+                ctx.compact_iri(&ctx.expand_key(&gq.geoproperty))
+            };
+            match reg.get(&member) {
                 Some(geom) => {
                     if !gq.matches_geometry(geom) {
                         return false;
@@ -423,6 +431,58 @@ mod tests {
     use super::*;
     use antares_jsonld::Loader;
     use serde_json::json;
+
+    /// TS 104 175 Table 5.2.6.5.2-1: a CSR subscription's geoQ "is matched
+    /// against the specified Context Source Registration GeoJSON attributes,
+    /// e.g. location, observationSpace or operationSpace": `geoproperty`
+    /// names which one, `location` when it names none (12.4.2).
+    #[test]
+    fn clause_12_4_2_geoq_geoproperty_matches_observation_space() {
+        let ctx = Loader::new().core();
+        let point = |x: f64| json!({"type": "Point", "coordinates": [x, 0.5]});
+        let reg = json!({
+            "id": "urn:ngsi-ld:ContextSourceRegistration:geo",
+            "type": "ContextSourceRegistration",
+            "information": [{"entities": [{"type": "Building"}]}],
+            "endpoint": "http://a.example.com",
+            "location": point(5.0),
+            "observationSpace": point(0.5)
+        });
+        let sub = |geoproperty: Option<&str>| {
+            let mut geo = json!({"georel": "within", "geometry": "Polygon",
+                "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]});
+            if let Some(p) = geoproperty {
+                geo["geoproperty"] = json!(p);
+            }
+            json!({"entities": [{"type": "Building"}], "geoQ": geo})
+        };
+        assert!(csr_matches_subscription(
+            &sub(Some("observationSpace")),
+            &reg,
+            &ctx
+        ));
+        assert!(
+            csr_matches_subscription(
+                &sub(Some("https://uri.etsi.org/ngsi-ld/observationSpace")),
+                &reg,
+                &ctx
+            ),
+            "the expanded name names the same member"
+        );
+        assert!(
+            !csr_matches_subscription(&sub(None), &reg, &ctx),
+            "location is outside"
+        );
+        assert!(!csr_matches_subscription(
+            &sub(Some("location")),
+            &reg,
+            &ctx
+        ));
+        assert!(
+            !csr_matches_subscription(&sub(Some("operationSpace")), &reg, &ctx),
+            "a member the registration lacks matches nothing"
+        );
+    }
 
     /// 5.11.2.4: a csource subscription's csf matches the registration's
     /// own Context Source Properties, and its scopeQ matches the
