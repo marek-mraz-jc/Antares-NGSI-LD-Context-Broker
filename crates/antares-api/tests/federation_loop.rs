@@ -184,27 +184,67 @@ async fn single_redirect_source_looping_back_is_508() {
     assert_eq!(res.status(), StatusCode::LOOP_DETECTED);
 }
 
-/// The same loop through an **inclusive** registration: Table 6.3.18-2 makes
-/// the Via listing amend matching, so the forward is dropped and the
-/// operation proceeds locally. (ETSI D018_01 registers `mode=inclusive` and
-/// still asserts 508 — a known suite defect.)
+/// TS 104 175 9.7: "If the requested endpoint is also listed as previously
+/// encountered when a Context Source receives a call to that endpoint, this is
+/// an indication that a new loop has been detected. A suitable error shall be
+/// returned". Owner decision (2026-10-10, T-3459): a write whose `Via` names
+/// this broker is answered 508 whatever the registration's mode, and nothing
+/// is forwarded; a read with the same chain is served from the local store
+/// and says so in a 199 warning (6.3.17).
 #[tokio::test(flavor = "multi_thread")]
-async fn inclusive_source_looping_back_runs_locally() {
+async fn clause_9_7_self_in_via_with_inclusive_registration_is_a_detected_loop() {
     let st = state();
+    let body = serde_json::json!({"id": ENTITY, "type": "Vehicle"}).to_string();
+    let res = send(
+        &st,
+        Request::builder()
+            .method("POST")
+            .uri("/ngsi-ld/v1/entities")
+            .header("Content-Type", "application/json")
+            .header("Content-Length", body.len())
+            .body(Body::from(body))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "local entity");
     let (port, hits) = mock_source();
     register(&st, None, "inclusive", port, None).await;
 
     let res = send(&st, delete_with_via(None, "1.1 antares1")).await;
-    assert_ne!(
-        res.status(),
-        StatusCode::LOOP_DETECTED,
-        "508 is scoped to a single exclusive/redirect source"
-    );
+    assert_eq!(res.status(), StatusCode::LOOP_DETECTED);
     assert_eq!(
         hits.load(Ordering::SeqCst),
         0,
         "the looping registration must not be forwarded to"
     );
+
+    let res = send(
+        &st,
+        Request::builder()
+            .uri(format!("/ngsi-ld/v1/entities/{ENTITY}"))
+            .header("Via", "1.1 antares1")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK, "a read is served locally");
+    let warning = res
+        .headers()
+        .get("NGSILD-Warning")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(warning.starts_with("199 "), "the read says so: {warning:?}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "nor is the read forwarded");
+}
+
+/// The same rule with no registration at all: the call came back to this
+/// broker, which is the loop 9.7 describes.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_9_7_self_in_via_without_a_registration_is_a_loop_on_writes() {
+    let st = state();
+    let res = send(&st, delete_with_via(None, "1.1 antares1")).await;
+    assert_eq!(res.status(), StatusCode::LOOP_DETECTED);
 }
 
 /// Table 5.2.40-1: "In the multi-tenancy use case … this id shall be

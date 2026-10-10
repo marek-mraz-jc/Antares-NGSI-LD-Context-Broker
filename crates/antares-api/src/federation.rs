@@ -266,13 +266,15 @@ pub fn via_loop(headers: &HeaderMap, alias: &str) -> bool {
     via_hops(headers) > MAX_VIA_HOPS || via_tokens(headers).iter().any(|t| t == alias)
 }
 
-/// 6.3.17/6.3.18 loop handling for operations with matching registrations.
-/// 508 Loop Detected is mandated ONLY "in the case of an exclusive or
-/// redirect registration, where all of the data is held outside of the
-/// Context Broker and held in a single registered source ... registered to
-/// redirect back on to the Context Broker". Any other loop clears `regs` —
-/// the Via listing "is used when determining matching registrations"
-/// (Table 6.3.18-2), so the operation proceeds locally without re-forwarding.
+/// Loop handling for a distributed write (6.3.17, 6.3.18, TS 104 175 9.7).
+/// 9.7: "If the requested endpoint is also listed as previously encountered
+/// when a Context Source receives a call to that endpoint, this is an
+/// indication that a new loop has been detected. A suitable error shall be
+/// returned". Owner decision (2026-10-10, T-3459): a write whose `Via`
+/// already names this broker in this tenant is answered 508 Loop Detected
+/// whatever its registrations, the single exclusive or redirect source of
+/// TS 104 176 6.3.5 included, and nothing is forwarded; a read with the same
+/// chain is served locally with a 199 warning by its own handler.
 pub fn handle_via_loop(
     headers: &HeaderMap,
     alias: &str,
@@ -286,14 +288,11 @@ pub fn handle_via_loop(
         regs.clear();
         return Some(loop_508(tenant));
     }
-    if regs.is_empty() || !via_loop(headers, alias) {
+    if !via_loop(headers, alias) {
         return None;
     }
-    if regs.len() == 1 && regs[0].is_proxy() {
-        return Some(loop_508(tenant));
-    }
     regs.clear();
-    None
+    Some(loop_508(tenant))
 }
 
 /// One `NGSILD-Warning` header value (6.3.17), in RFC 7234 warn form:
@@ -2983,27 +2982,24 @@ mod tests {
         );
     }
 
-    /// 6.3.17 p.278 scopes 508 to "an exclusive or redirect registration,
-    /// where all of the data is held ... in a single registered source";
-    /// any other loop clears the forward set and proceeds locally
-    /// (Table 6.3.18-2: the Via listing amends registration matching).
+    /// TS 104 175 9.7 (T-3459): a write whose Via names this broker is a
+    /// detected loop whatever its registrations; nothing is forwarded.
     #[test]
-    fn loop_508_only_for_a_single_proxy_registration() {
+    fn a_write_looping_back_is_508_whatever_its_registrations() {
         let t = antares_model::TenantId::new("default").expect("tenant");
         let h = hdrs(Some("1.1 me"));
-        // single exclusive source looping back → 508
-        let mut regs = vec![reg("exclusive")];
-        assert!(handle_via_loop(&h, "me", &t, &mut regs).is_some());
-        let mut regs = vec![reg("redirect")];
-        assert!(handle_via_loop(&h, "me", &t, &mut regs).is_some());
-        // inclusive loop → no 508, forwards cleared, local execution proceeds
-        let mut regs = vec![reg("inclusive")];
-        assert!(handle_via_loop(&h, "me", &t, &mut regs).is_none());
-        assert!(regs.is_empty(), "looping forwards must be dropped");
-        // a mixed set is not "a single registered source"
-        let mut regs = vec![reg("exclusive"), reg("inclusive")];
-        assert!(handle_via_loop(&h, "me", &t, &mut regs).is_none());
-        assert!(regs.is_empty());
+        for set in [
+            vec![reg("exclusive")],
+            vec![reg("redirect")],
+            vec![reg("inclusive")],
+            vec![reg("exclusive"), reg("inclusive")],
+            Vec::new(),
+        ] {
+            let mut regs = set;
+            let resp = handle_via_loop(&h, "me", &t, &mut regs).expect("a loop");
+            assert_eq!(resp.status(), StatusCode::LOOP_DETECTED);
+            assert!(regs.is_empty(), "looping forwards must be dropped");
+        }
         // no loop → untouched
         let mut regs = vec![reg("exclusive")];
         assert!(handle_via_loop(&hdrs(None), "me", &t, &mut regs).is_none());
