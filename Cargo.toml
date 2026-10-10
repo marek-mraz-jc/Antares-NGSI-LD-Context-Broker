@@ -58,6 +58,8 @@ icu_collator = "2"
 icu_locale_core = "2"
 uuid = { version = "1", features = ["v4", "v5"] }
 regex = "1"
+# Property tests (T-3462): the q/scopeQ/geoQ pushdown against the evaluator.
+proptest = { version = "1", default-features = false, features = ["std"] }
 axum = "0.8"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "http1", "http2", "tokio"] }

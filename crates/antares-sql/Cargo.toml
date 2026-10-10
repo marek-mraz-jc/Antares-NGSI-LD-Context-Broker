@@ -37,6 +37,10 @@ antares-store = { workspace = true, features = ["test-kit"] }
 # integration tests below make read columns no operation of the broker
 # reads, and those readers are compiled for a test build only.
 antares-sql = { workspace = true, features = ["test-kit"] }
+# T-3462: generated entities are expanded the way a request is, and the
+# pushdown is checked against the evaluator over them.
+antares-jsonld = { workspace = true }
+proptest = { workspace = true }
 
 [features]
 # The Pg arm is the only part of this crate that cannot cross to wasm32
