@@ -24,6 +24,7 @@ linkml-model = { path = "../crates/linkml-model" }
 odata-url = { path = "../crates/odata-url" }
 odata-csdl = { path = "../crates/odata-csdl" }
 odata-json = { path = "../crates/odata-json" }
+antares-mcp = { path = "../crates/antares-mcp", features = ["fuzzing"] }
 
 [[bin]]
 name = "parse_q"
@@ -161,6 +162,20 @@ bench = false
 [[bin]]
 name = "odata_json_body"
 path = "fuzz_targets/odata_json_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_tool_arguments"
+path = "fuzz_targets/mcp_tool_arguments.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_cursor"
+path = "fuzz_targets/mcp_cursor.rs"
 test = false
 doc = false
 bench = false
