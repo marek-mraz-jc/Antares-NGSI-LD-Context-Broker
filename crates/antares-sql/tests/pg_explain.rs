@@ -10,6 +10,10 @@
 //! Literal values are inlined (EXPLAIN cannot carry extended-protocol binds);
 //! this is test-only SQL, never a pattern for request paths.
 
+// Every test here talks to the Postgres store, which only exists with the
+// `postgres` feature; without it the file builds to nothing (T-3465).
+#![cfg(feature = "postgres")]
+
 use antares_sql::store::pg;
 
 macro_rules! require_db {

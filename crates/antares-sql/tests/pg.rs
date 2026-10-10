@@ -9,6 +9,10 @@
 //!         ANTARES_TEST_DATABASE_URL=postgresql://antares:antares@localhost:15432/antares \
 //!           cargo test -p antares-sql --test pg
 
+// Every test here talks to the Postgres store, which only exists with the
+// `postgres` feature; without it the file builds to nothing (T-3465).
+#![cfg(feature = "postgres")]
+
 use antares_model::TenantId;
 use antares_sql::store::pg;
 use sqlx::Row;

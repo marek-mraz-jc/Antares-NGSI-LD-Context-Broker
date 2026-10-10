@@ -383,7 +383,7 @@ impl<'a> Parser<'a> {
     fn qpath(&mut self) -> Result<QPath, NgsiError> {
         let mut links = Vec::new();
         let mut braces = 0usize;
-        let mut name = self.name_token()?;
+        let mut name = self.name()?;
         // LinkedEntityRelation: AttrName{ [EntityType(,EntityType)*:] … }
         while self.eat('{') {
             braces += 1;
@@ -393,26 +393,30 @@ impl<'a> Parser<'a> {
                 ));
             }
             let mut types = Vec::new();
-            let mut inner = self.name_token()?;
+            let mut inner = self.name()?;
             if self.rest.starts_with(',') || self.rest.starts_with(':') {
                 types.push(inner);
                 while self.eat(',') {
-                    types.push(self.name_token()?);
+                    types.push(self.name()?);
                 }
                 if !self.eat(':') {
                     return Err(bad(self.rest, "expected ':' after EntityType hints"));
                 }
-                inner = self.name_token()?;
+                inner = self.name()?;
             }
             links.push(Link { attr: name, types });
             name = inner;
         }
         let mut path = vec![name];
         while self.eat('.') {
-            path.push(self.name_token()?);
+            path.push(self.name()?);
         }
         let bracket = if self.eat('[') {
+            // spacing inside the bracket is insignificant, so `[ *a]` is
+            // `[*a]` (refused) and never the member name `*a`
+            self.rest = self.rest.trim_start();
             let b = if self.eat('*') {
+                self.rest = self.rest.trim_start();
                 vec!["*".to_owned()]
             } else {
                 let mut b = vec![self.name_token()?];
@@ -440,12 +444,13 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// One path segment: everything up to a structural delimiter.
+    /// One path segment: everything up to a structural delimiter or a
+    /// space of any kind.
     fn name_token(&mut self) -> Result<String, NgsiError> {
         self.rest = self.rest.trim_start();
         let end = self
             .rest
-            .find(|c: char| "=!<>~;|(),.{}[]: ".contains(c))
+            .find(|c: char| c.is_whitespace() || "=!<>~;|(),.{}[]:".contains(c))
             .unwrap_or(self.rest.len());
         let (raw, rest) = self.rest.split_at(end);
         if raw.is_empty() {
@@ -454,6 +459,21 @@ impl<'a> Parser<'a> {
         // spacing around the segment is insignificant (`a ==1`, `a ; b`)
         self.rest = rest.trim_start();
         Ok(raw.to_owned())
+    }
+
+    /// A segment that is a name in the 7.2.3.2 grammar (`AttrName`,
+    /// `EntityType`): the 5.2.2.3 rule every stored name already obeys, so a
+    /// query never names what no entity can hold.
+    fn name(&mut self) -> Result<String, NgsiError> {
+        let at = self.rest;
+        let name = self.name_token()?;
+        if !antares_jsonld::valid_name(&name) {
+            return Err(bad(
+                at,
+                "an attribute or type name is a letter followed by letters, digits or '_'",
+            ));
+        }
+        Ok(name)
     }
 
     fn cmp_op(&mut self) -> Option<CmpOp> {
@@ -593,9 +613,12 @@ impl<'a> Parser<'a> {
         match raw {
             "true" => Ok(QValue::Bool(true)),
             "false" => Ok(QValue::Bool(false)),
+            // RFC 8259 section 6 lets a receiver limit the range: a Number
+            // past f64 is refused, as serde_json refuses it in a body, so no
+            // comparison runs against a value no Entity can hold
             _ if is_json_number(raw) => match raw.parse::<f64>() {
-                Ok(n) => Ok(QValue::Num(n)),
-                Err(_) => Ok(QValue::Str(raw.to_owned())),
+                Ok(n) if n.is_finite() => Ok(QValue::Num(n)),
+                _ => Err(bad(raw, "Number is out of range (RFC 8259 section 6)")),
             },
             // the other unquoted alternatives: a URI, a dateTime, a date or a
             // time, all of them compared as text
@@ -676,6 +699,43 @@ mod tests {
         }
     }
 
+    /// RFC 8259 section 6: "This specification allows implementations to
+    /// set limits on the range and precision of numbers accepted." A Number
+    /// past f64 is refused, as an entity body holding it is (serde_json);
+    /// read as infinity it would compare against values no Entity can hold
+    /// and render as `inf`, which parses back as a String (found by the
+    /// parse_q fuzz target, fuzz/regressions/parse_q).
+    /// 4.9 `[*]` is the whole bracket, never the start of a member name,
+    /// and spacing inside the bracket is insignificant: `m[ *a]` was read
+    /// as the member `*a` and rendered as `m[*a]`, which is refused (found
+    /// by the parse_q fuzz target, fuzz/regressions/parse_q).
+    #[test]
+    fn a_star_in_a_bracket_is_the_whole_bracket_whatever_the_spacing() {
+        for q in ["m[*a]!=c", "m[ *a]!=c", "m[\t*a]!=c"] {
+            assert!(parse_q(q).is_err(), "{q:?}");
+        }
+        for q in ["m[*]==\"x\"", "m[ * ]==\"x\"", "m[\t*\t]==\"x\""] {
+            let node = parse_q(q).expect(q);
+            assert_eq!(node.to_string(), "m[*]==\"x\"", "{q:?}");
+        }
+    }
+
+    #[test]
+    fn a_number_past_the_float_range_is_refused() {
+        for q in ["A>8e44444", "x==-1e400", "x==1e309..2", "x==1..1E+999"] {
+            assert!(
+                matches!(parse_q(q), Err(NgsiError::BadRequestData(_))),
+                "{q}: {:?}",
+                parse_q(q)
+            );
+        }
+        // below the range is not past it: an underflow is the nearest value
+        assert_eq!(
+            parse_q("x==1e-400").expect("underflow"),
+            parse_q("x==0").expect("zero")
+        );
+    }
+
     #[test]
     fn simple_comparison() {
         let q = parse_q(r#"brandName=="Mercedes""#).expect("parse");
@@ -713,6 +773,50 @@ mod tests {
                 value: QValue::Num(80.5)
             }
         );
+    }
+
+    /// TS 104 175 7.2.3.2 / 5.2.2.3: an attribute path, a linked-entity
+    /// attribute and an EntityType hint are names (`unicodeLetter
+    /// *(unicodeLetter / unicodeNumber / "_")`); anything else is
+    /// BadRequestData rather than a name no entity can hold. Found by the
+    /// parse_q fuzz target's render round-trip (T-3463):
+    /// `(?\n<&3|$$\t)` parsed as the attributes "?\n" and "$$", and the
+    /// tab before `)` was dropped where the one at the end was kept.
+    #[test]
+    fn attribute_names_follow_the_name_grammar() {
+        for refused in [
+            "(?\n<&3|$$\t)",
+            "$$",
+            "brand-name==1",
+            "1st==1",
+            "a\tb==1",
+            "speed.$x==1",
+            "rel{T-1:name}==1",
+            "rel-x{name}==1",
+        ] {
+            assert!(
+                matches!(parse_q(refused), Err(NgsiError::BadRequestData(_))),
+                "{refused:?} parsed"
+            );
+        }
+        for accepted in [
+            "speed==1",
+            "speed\t==1",
+            "(speed\t)",
+            "temperature_2==1",
+            "größe>1",
+            "owner{works{name}}==\"x\"",
+            "rel{Building,Room:name}",
+            "color[en-GB]==\"red\"",
+            "address[city]==\"Berlin\"",
+            "speed.observedAt>\"2020-01-01T00:00:00Z\"",
+        ] {
+            assert!(
+                parse_q(accepted).is_ok(),
+                "{accepted:?} refused: {:?}",
+                parse_q(accepted)
+            );
+        }
     }
 
     #[test]

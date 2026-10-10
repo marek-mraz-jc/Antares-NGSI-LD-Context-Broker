@@ -17,6 +17,10 @@
 //! `ANTARES_TEST_DATABASE_URL`. `PROPTEST_CASES` sets the case count (256
 //! by default, 10 000 in strict.yml).
 
+// Every test here talks to the Postgres store, which only exists with the
+// `postgres` feature; without it the file builds to nothing (T-3465).
+#![cfg(feature = "postgres")]
+
 use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
