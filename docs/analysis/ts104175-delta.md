@@ -185,7 +185,7 @@ The 88 implemented or partial clauses of chapter 4 carry their TS 104 175 verdic
 | 4.3.6.4 | 9.7 | every detected loop is an error | compliant since T-3459 (3.5) |
 | 4.3.6.7 | 9.6 | the Entity Map rules of CIM 009 5.5.14, 5.7.1.4, 5.7.2.4 gathered into one clause | compliant, no new obligation |
 | 4.5.4, 4.5.16.2 | 5.3.2.4, 5.3.3.3.1 | scope, and in GeoJSON expiresAt, named as members | compliant, entity-level members pass through |
-| 4.5.5.3 | 8.5.3 | an instance with observedAt wins over every instance without one | non-compliant: `recency()` ranks observedAt and modifiedAt as one key; T-3545 |
+| 4.5.5.3 | 8.5.3 | an instance with observedAt wins over every instance without one | compliant since T-3545: `recency()` ranks observed instances first |
 | 4.5.6 to 4.5.8 | 5.3.2.5 | one text for every attribute type, scope rules stated | compliant |
 | 4.6.5, 4.7.2 | 5.2.6.4.6, 5.2.6.4.5 | data-type tables with an `ngsildProof` member | TS 104 179, outside the ledger (3.9) |
 | 4.6.6 | 10.3.x | chronological order became a note | compliant |
@@ -245,7 +245,7 @@ The 121 implemented or partial clauses of chapter 6 carry their TS 104 176 verdi
 | T-3459 | 9.7 loop error for inclusive or no registration (3.5) | non-compliant, owner decision |
 | T-3460 | HEAD 204 or 200 (3.8) | spec contradiction, owner decision |
 | T-3461 | re-audit of every implemented clause (section 4) | done, gaps filed |
-| T-3545 | conflicting attributes: observedAt does not take precedence (4.1) | non-compliant |
+| T-3545 | conflicting attributes: observedAt did not take precedence (4.1) | compliant (fixed) |
 
 The ICS ([ics-ts104187.md](ics-ts104187.md)) answers against CIM 009 as TS 104 187 A.3 asks; these gaps reach it when the ledger records them.
 
