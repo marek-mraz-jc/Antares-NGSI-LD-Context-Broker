@@ -376,6 +376,40 @@ fn reads() -> Vec<Read> {
             "5.7.10",
             "attrs",
         ),
+        read(
+            "GET",
+            format!("/ngsi-ld/v1/entityMaps?type=Vehicle&attrs=speed&q=speed%3E0&{GEO}"),
+            None,
+            "5.14.4",
+            "types attrs q geo",
+        ),
+        read(
+            "POST",
+            "/ngsi-ld/v1/entityMaps".into(),
+            Some(json!({"type": "Query",
+            "entities": [{"type": "Vehicle"}], "attrs": ["speed"], "q": "speed>0",
+            "scopeQ": "/a", "geoQ": geo_q()})),
+            "5.14.4",
+            "types attrs q scopeQ geo",
+        ),
+        read(
+            "GET",
+            format!(
+                "/ngsi-ld/v1/temporal/entityMaps?type=Vehicle&attrs=speed&q=speed%3E0&{tq}&{GEO}"
+            ),
+            None,
+            "5.14.5",
+            "types attrs q geo",
+        ),
+        read(
+            "POST",
+            "/ngsi-ld/v1/csourceRegistrations".into(),
+            Some(json!({"type": "ContextSourceRegistration",
+            "information": [{"entities": [{"type": "Vehicle"}], "propertyNames": ["speed"]}],
+            "endpoint": "https://example.org/cs"})),
+            "5.9.2",
+            "types attrs",
+        ),
     ]
 }
 

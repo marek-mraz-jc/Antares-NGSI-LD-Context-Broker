@@ -4025,6 +4025,8 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -4033,7 +4035,7 @@ operations:
       pre_image: the engine allows the registration; the registrant may claim only Entity types/ids it may write
       post_image: forwards built from it carry the caller's narrowing and no subject header (ADR-0020)
       binding_clause: ts-104176-ngsi-ld-http-binding/9/9.2.3.2.md
-      gate_site: crates/antares-api/src/csource.rs:965
+      gate_site: crates/antares-api/src/csource.rs:1017
     odata:
       status: not_offered
       binding: null
@@ -4079,6 +4081,8 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -4088,7 +4092,6 @@ operations:
       post_image: forwards built from it carry the caller's narrowing and no subject header (ADR-0020)
   pre_image: the engine allows the registration; the registrant may claim only Entity types/ids it may write
   post_image: forwards built from it carry the caller's narrowing and no subject header (ADR-0020)
-  gaps: types and attrs of the registration information are not filled
 - id: update_registration
   ts104175: 12.2.3
   cim009: 5.9.3
@@ -5328,12 +5331,17 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
         - the candidate set is narrowed by the Filter (FILTERABLE); remote maps merged (fed_entity_maps)
       binding_clause: ts-104176-ngsi-ld-http-binding/11/11.2.3.1.md, 11/11.2.3.2.md
-      gate_site: crates/antares-api/src/entity_maps.rs:153
+      gate_site: crates/antares-api/src/entity_maps.rs:166
     odata:
       status: supported
       binding: server-driven paging of GET /{EntitySet} (@odata.nextLink) may use a map internally (proposal)
@@ -5341,6 +5349,11 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -5352,6 +5365,11 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
@@ -5381,11 +5399,15 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
         - the candidate set is narrowed by the Filter (FILTERABLE); remote maps merged (fed_entity_maps)
-  gaps: q, scope_q, types, attrs and geo are not filled
 - id: create_temporal_entity_map
   ts104175: '14.6'
   cim009: 5.14.5
@@ -5403,12 +5425,17 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
         - the candidate set is narrowed by the Filter (FILTERABLE)
       binding_clause: ts-104176-ngsi-ld-http-binding/11/11.3.3.1.md, 11/11.3.3.2.md
-      gate_site: crates/antares-api/src/entity_maps.rs:153
+      gate_site: crates/antares-api/src/entity_maps.rs:166
     odata:
       status: not_offered
       binding: null
@@ -5452,11 +5479,15 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
+        - types
+        - attrs
+        - q
+        - scope_q
+        - geo
         filterable: true
         whole_tenant: false
         linked_entity_checks:
         - the candidate set is narrowed by the Filter (FILTERABLE)
-  gaps: q, scope_q, types, attrs and geo are not filled
 - id: source_identity
   ts104175: '15.2'
   cim009: 5.15.1
