@@ -102,9 +102,9 @@ Each entry: what the old and new texts say (quotes kept to the deciding sentence
 - Old: CIM 009 has `lastN` only (6.18.3.2, `docs/spec/6/6.18.3.2.md`) and pages a truncated answer with 206 and `Content-Range` (6.3.10, `docs/spec/6/6.3.10.md`).
 - New: TS 104 175 7.4.2.5 "Temporal pagination can be done in ascending order using the firstN parameter and in descending order using the lastN parameter … offsetN is used to select the respective page in the chosen order"; TS 104 176 6.4.7.3: pages are Links `rel="intervalafter"` / `"intervalbefore"`. Neither document mentions 206 or `Content-Range`. `limit`/`offset` still page Entities; `firstN`/`lastN` cap instances per Attribute.
 - Code: `crates/antares-api/src/temporal.rs` `lastN` :880, `window` :413, `content_range` :526, allowlist `check_params` :1738-1777; `paging.rs:898` (`temporalQ.lastN`); `antares_store::filter::TemporalFilter::last_n` (`crates/antares-store/src/filter.rs:116`). Cypher: `MATCH (s:Symbol) WHERE s.lang='rust' AND NOT s.external AND (lower(s.name) CONTAINS 'lastn' OR lower(s.name) CONTAINS 'firstn' OR lower(s.name) CONTAINS 'offsetn' OR lower(s.name) CONTAINS 'last_n' OR lower(s.name) CONTAINS 'first_n') RETURN s.path, s.kind, s.file, s.line, s.is_test LIMIT 60`
-- Behaviour: `?firstN=` and `?offsetN=` answer 400 unknown parameter; a `temporalQ` body reads `lastN` only; truncation answers `Content-Range: date-time …` and no interval Link.
-- Compliant: `lastN` yes; `firstN`, `offsetN` and the interval Links **no**.
-- Tests: `clause_6_3_10::last_n_above_the_ceiling_is_clamped_to_it` (temporal.rs), `last_n_caps_with_rank_per_attr_and_dataset_never_row_number` (antares-sql), robot 020_05_*, 020_13_*, 021_27_*. Nothing exercises `firstN`/`offsetN`. Gap: **T-3456** (with an owner decision on 206).
+- Behaviour (T-3456): `firstN` pages oldest first, `lastN` newest first, neither oldest first; `offsetN` skips in that order and past the end returns the last instance (Table 6.4.7.3-2); `firstN` with `lastN` is 400 BadRequestData. The query string and the `temporalQ` body read all three. Each Attribute is cut to the same count (`min(N, 9)`), and the response carries `Link` `rel="intervalafter"`/`"intervalbefore"` with `offsetN` moved by one page and `type` equal to the response media type. The pg store ranks per Attribute and datasetId, ascending for `firstN`, capped at `N + offsetN + 1`. Federation forwards `firstN`/`lastN` as `N + offsetN` and never `offsetN`. Owner decision (2026-10-10): `206` + `Content-Range` stay on a page cut by the ceiling while robot 020_13/021_27 assert them.
+- Compliant: yes.
+- Tests: `tests/temporal_pagination_7_4_2_5.rs` (6, memory and pg), `clause_6_3_10::the_cut_is_one_count_per_attribute` and `last_n_above_the_ceiling_is_clamped_to_it` (temporal.rs), `first_n_ranks_the_oldest_first` and `last_n_caps_with_rank_per_attr_and_dataset_never_row_number` (antares-sql), robot 020_05_*, 020_13_*, 021_27_*.
 
 ### 3.3 `join`, `joinLevel`, `containedBy`
 
@@ -186,7 +186,7 @@ List them: `python3 dev/clause-map.py | awk -F'\t' '$3!="informative" && ($9>0 |
 | T-3453 | mqtt endpoint accepts geo+json (3.8) | non-compliant |
 | T-3454 | nested Sealed Attribute untested (3.9) | unknown, test first |
 | T-3455 | q trailing path over an array of JSON objects (3.1) | non-compliant |
-| T-3456 | `firstN`, `offsetN`, interval Links (3.2) | non-compliant, owner decision on 206 |
+| T-3456 | `firstN`, `offsetN`, interval Links (3.2) | compliant (206 kept while the robots assert it) |
 | T-3457 | join depth-first, not shallowest depth (3.3) | non-compliant |
 | T-3458 | core @context content and scoped terms (3.4) | non-compliant, owner decision |
 | T-3459 | 9.7 loop error for inclusive or no registration (3.5) | non-compliant, owner decision |
