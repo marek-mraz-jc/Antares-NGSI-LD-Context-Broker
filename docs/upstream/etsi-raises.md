@@ -394,3 +394,36 @@ RFC 9110 give, and takes the HEAD request's @context from its Link header as
 
 Suggest dropping the 204 sentence from clause 5, or, if 204 is meant, adding
 a HEAD row with 204 to each GET/HEAD table of clause 7.
+
+---
+
+## 15. [suite] 020_17 to 020_20 delete an Attribute of an Entity that exists only as a temporal evolution
+
+**Title:** 020_17..020_20 set up with `POST /temporal/entities` alone, then
+call `DELETE /entities/{id}/attrs/{attrId}`
+
+**Body:**
+
+Delete Attribute (CIM 009 5.6.5.4) raises ResourceNotFound when no Entity
+is held locally; a temporal evolution created by 5.6.11 is not one, and
+5.6.13 is the operation that deletes from it. The setup creates only the
+temporal evolution, so a compliant broker answers 404 and writes no
+`deletedAt` instance. Suggest creating the current-state Entity in the
+setup and deleting it in the teardown, as the corrected fork does (forge
+commits f7c78f94 and 94789a66); Antares carries that fix and answers 404
+(`temporal_autorecord.rs::delete_attribute_of_a_temporal_only_entity_is_not_found`).
+
+---
+
+## 16. [suite] 020_19 and 020_20 expect a deleted scope as an empty array
+
+**Title:** the 020_19/020_20 expectations show a deleted scope as `[]`
+
+**Body:**
+
+CIM 009 4.18 reserves `urn:ngsi-ld:null` for deleted scopes, and 4.5.0
+uses it for every deleted element of the temporal representation. The
+expectation files carry `"value": []` (and `[]` in `temporalValues`).
+Suggest `"urn:ngsi-ld:null"`, as the corrected fork does (forge commit
+fad5ab03); Antares carries that fix
+(`temporal_autorecord.rs::deleted_scope_is_the_ngsi_ld_null_in_the_temporal_representation`).
