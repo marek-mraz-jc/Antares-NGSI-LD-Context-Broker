@@ -57,7 +57,9 @@ PolicyEngine: Send + Sync {
 `Subject { tenant, headers }` carries the identity headers named by
 `ANTARES_POLICY_SUBJECT_HEADERS`, opaque to the broker — it parses no
 credential and validates no token. `Operation` is the expanded request:
-clause, ids, types, attrs, `q`, `scopeQ`, geo, body. `Decision` is
+clause, ids, types, attrs, `q`, `scopeQ`, geo, body, and for a write by
+id the stored Entity's image (`stored`: types, scope, Attribute names;
+ADR-0023 rule 7). `Decision` is
 `Allow`, `Deny(String)` or `Filter(Filter)`; `Filter` carries a `q`, a
 `scopeQ`, a `geo_q`, `omit`, `pick` and `restricted`.
 

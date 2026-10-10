@@ -1459,10 +1459,12 @@ pub async fn delete_entity(
         // the client meant, and the delete then removes an Entity the
         // client's selector excluded.
         let ctx = request_context(&st.loader, &headers).await?;
+        let pre = crate::policy::pre_image(&st, &tenant, &id, None).await;
         gate!(
             st, &tenant, &headers, "5.6.6",
             ids: &[&id],
-            types: &crate::policy::write_types(&st, &tenant, &id, None).await,
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
         )
         .await?;
         // 4.17/5.6.6.4: the type selector gates the target — a registration
@@ -1923,10 +1925,12 @@ async fn merge_entity_inner(
             ..Default::default()
         },
     )?;
+    let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await;
     gate!(
         st, &tenant, headers, "5.6.17",
         ids: &[id],
-        types: &crate::policy::write_types(st, &tenant, id, Some(&fragment)).await,
+        types: &pre.types,
+        stored: pre.stored.as_ref(),
         attrs: &crate::attrs::attr_iris_of(&fragment),
         body: Some(&fragment),
     )
@@ -2297,10 +2301,12 @@ pub async fn replace_entity(
                 }),
             None => None,
         };
+        let pre = crate::policy::pre_image(&st, &tenant, &id, shown.as_ref()).await;
         gate!(
             st, &tenant, &headers, "5.6.18",
             ids: &[&id],
-            types: &crate::policy::write_types(&st, &tenant, &id, shown.as_ref()).await,
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
             attrs: &shown.as_ref().map(crate::attrs::attr_iris_of).unwrap_or_default(),
             body: shown.as_ref(),
         )

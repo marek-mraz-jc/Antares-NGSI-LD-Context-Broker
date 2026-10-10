@@ -121,6 +121,58 @@ pub struct Operation<'a> {
     pub geo: Option<&'a GeoQuery>,
     /// The request body of a write, expanded. `None` for a read.
     pub body: Option<&'a Value>,
+    /// What a write by id lands on, as stored (ADR-0023 rule 7): `None`
+    /// for a read, a create, or an id the tenant does not hold.
+    pub stored: Option<&'a StoredImage>,
+}
+
+/// The stored Entity a write by id changes, as an engine judges it
+/// (ADR-0023 rule 7, operation matrix item 2, T-3483): what the Entity is,
+/// not what the request says it is. Names only, expanded; never a value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredImage {
+    pub types: Vec<String>,
+    pub scope: Vec<String>,
+    pub attribute_names: Vec<String>,
+}
+
+impl StoredImage {
+    /// The image of one stored, expanded Entity document.
+    pub fn of(doc: &Value) -> Self {
+        let strings = |v: Option<&Value>| match v {
+            Some(Value::String(s)) => vec![s.clone()],
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        };
+        Self {
+            types: strings(doc.get("type")),
+            scope: strings(doc.get("scope")),
+            attribute_names: doc
+                .as_object()
+                .map(|o| {
+                    o.keys()
+                        .filter(|k| {
+                            !k.starts_with("__")
+                                && !k.starts_with('@')
+                                && !matches!(
+                                    k.as_str(),
+                                    "id" | "type"
+                                        | "scope"
+                                        | "createdAt"
+                                        | "modifiedAt"
+                                        | "deletedAt"
+                                )
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// Shape and counts, never the payload: an `Operation` carries the
@@ -136,6 +188,7 @@ impl std::fmt::Debug for Operation<'_> {
             .field("scope_q", &self.scope_q.is_some())
             .field("geo", &self.geo.is_some())
             .field("body", &self.body.is_some())
+            .field("stored", &self.stored.is_some())
             .finish()
     }
 }
@@ -154,6 +207,7 @@ impl Operation<'_> {
             scope_q: None,
             geo: None,
             body: None,
+            stored: None,
         }
     }
 }
@@ -894,38 +948,54 @@ pub fn subject_of(tenant: &antares_model::TenantId, headers: &HeaderMap) -> Subj
 /// instead of a new list to forget.
 pub(crate) const SUBJECT_MEMBER: &str = "__subject";
 
-/// The expanded types a write by id lands on: the stored Entity's, joined
-/// with the ones the request body names (ADR-0020: an engine judging by
-/// type judges the Entity the write changes and what it changes it to).
-/// The gate reads the store once per request, and only with an engine
-/// attached; an absent Entity or a store error adds nothing, and the write
+/// What a write by id hands the engine about the Entity it lands on.
+#[derive(Debug, Default)]
+pub(crate) struct PreImage {
+    /// The stored Entity's types joined with the ones the request body
+    /// names: an engine judging by type judges the Entity the write changes
+    /// and what it changes it to (ADR-0020).
+    pub types: Vec<String>,
+    /// The stored Entity itself ([`Operation::stored`]).
+    pub stored: Option<StoredImage>,
+}
+
+/// The [`PreImage`] of a write by id. The store is read once per request,
+/// and only with an engine attached, so vanilla reads nothing more. An
+/// absent Entity or a store error gives no stored image, and the write
 /// answers it as before.
-pub(crate) async fn write_types(
+///
+/// Decided (worker-2, T-3483, owner may override): the write still reads
+/// the Entity again inside its own store operation. Handing it this image,
+/// read outside the store's transaction, would turn a concurrent write
+/// into a lost update; the gate's read is the one the type lookup already
+/// made, so no read is added.
+pub(crate) async fn pre_image(
     st: &crate::state::AppState,
     tenant: &antares_model::TenantId,
     id: &str,
     body: Option<&Value>,
-) -> Vec<String> {
+) -> PreImage {
+    if st.policy.is_none() {
+        return PreImage::default();
+    }
     let stored = st
         .store
         .get(tenant, antares_store::Kind::Entity, id)
         .await
         .ok()
         .flatten();
-    let mut out: Vec<String> = Vec::new();
+    let mut types: Vec<String> = Vec::new();
     for doc in stored.as_ref().into_iter().chain(body) {
-        let names: Vec<&str> = match doc.get("type") {
-            Some(Value::String(t)) => vec![t.as_str()],
-            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
-            _ => Vec::new(),
-        };
-        for t in names {
-            if !out.iter().any(|o| o == t) {
-                out.push(t.to_owned());
+        for t in entity_types(doc) {
+            if !types.iter().any(|o| o == t) {
+                types.push(t.to_owned());
             }
         }
     }
-    out
+    PreImage {
+        types,
+        stored: stored.as_ref().map(StoredImage::of),
+    }
 }
 
 /// The stored form of a subject: only the headers a deployment named, since
@@ -982,7 +1052,7 @@ pub(crate) fn belongs_to(doc: &Value, subject: &Subject) -> bool {
 pub struct Denied(pub String);
 
 /// The one call a handler makes. Every operation passes through it exactly
-/// once, which is what `every_route_asks_the_policy_engine_once` asserts by
+/// once, which is what `every_route_asks_the_policy_engine_exactly_once` asserts by
 /// walking the router with a counting engine.
 ///
 /// The returned [`Filter`] is what the answer has to be narrowed by; an
