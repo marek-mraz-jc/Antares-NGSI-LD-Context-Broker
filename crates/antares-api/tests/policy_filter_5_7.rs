@@ -899,3 +899,85 @@ async fn a_join_does_not_embed_a_target_the_scope_narrowing_hides() {
     .await;
     assert_join_hides(&st).await;
 }
+
+/// Two Assets owned by two People: one public and one not, both earning.
+async fn seed_owned(st: &AppState) {
+    for doc in [
+        json!({"id": "urn:ngsi-ld:Person:open", "type": "Person",
+               "public": {"type": "Property", "value": true},
+               "name": {"type": "Property", "value": "x"},
+               "salary": {"type": "Property", "value": 90000}}),
+        json!({"id": "urn:ngsi-ld:Person:shut", "type": "Person",
+               "public": {"type": "Property", "value": false},
+               "name": {"type": "Property", "value": "x"},
+               "salary": {"type": "Property", "value": 90000}}),
+        json!({"id": "urn:ngsi-ld:Asset:a", "type": "Asset",
+               "public": {"type": "Property", "value": true},
+               "owner": {"type": "Relationship", "object": "urn:ngsi-ld:Person:open"}}),
+        json!({"id": "urn:ngsi-ld:Asset:b", "type": "Asset",
+               "public": {"type": "Property", "value": true},
+               "owner": {"type": "Relationship", "object": "urn:ngsi-ld:Person:shut"}}),
+        json!({"id": "urn:ngsi-ld:Asset:dangling", "type": "Asset",
+               "public": {"type": "Property", "value": true},
+               "owner": {"type": "Relationship", "object": "urn:ngsi-ld:Person:gone"}}),
+    ] {
+        let (code, body) = send(st, "POST", "/ngsi-ld/v1/entities", Some(doc)).await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+    }
+}
+
+fn asset_query(q: &str) -> String {
+    format!(
+        "/ngsi-ld/v1/entities?type=Asset&join=inline&joinLevel=1&q={}",
+        q.replace('{', "%7B")
+            .replace('}', "%7D")
+            .replace('"', "%22")
+            .replace('>', "%3E")
+    )
+}
+
+/// 7.2.3.2 lets a Query Term follow a Relationship; a hop into an Entity
+/// the narrowing hides reads the way a hop into a missing one does, so the
+/// term cannot test a value the subject may not see (T-3474).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_linked_q_term_does_not_read_an_entity_the_narrowing_hides() {
+    let st = state(Filter {
+        q: Some(antares_ql::parse_q("public==true").expect("q")),
+        ..Filter::default()
+    })
+    .await;
+    seed_owned(&st).await;
+    assert_eq!(
+        sorted_ids(&st, &asset_query("owner{salary}>0")).await,
+        ["urn:ngsi-ld:Asset:a"],
+        "the hidden owner's salary selected its Asset"
+    );
+    // hidden reads as absent: the dangling and the hidden hop answer alike
+    assert_eq!(
+        sorted_ids(&st, &asset_query("!owner{name}")).await,
+        ["urn:ngsi-ld:Asset:b", "urn:ngsi-ld:Asset:dangling"],
+    );
+}
+
+/// ADR-0023 rule 2: an Attribute the narrowing omits does not exist while
+/// q is evaluated, one hop away as much as on the Entity itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_linked_q_term_does_not_read_an_attribute_the_narrowing_omits() {
+    let st = state(Filter {
+        omit: vec!["https://uri.etsi.org/ngsi-ld/default-context/salary".into()],
+        ..Filter::default()
+    })
+    .await;
+    seed_owned(&st).await;
+    assert!(
+        sorted_ids(&st, &asset_query("owner{salary}>0"))
+            .await
+            .is_empty(),
+        "an omitted Attribute was tested through a Relationship"
+    );
+    assert_eq!(
+        sorted_ids(&st, &asset_query("owner{name}==%22x%22")).await,
+        ["urn:ngsi-ld:Asset:a", "urn:ngsi-ld:Asset:b"],
+        "a visible linked Attribute still selects"
+    );
+}

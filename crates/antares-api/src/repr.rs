@@ -227,11 +227,41 @@ pub(crate) async fn policy_admits(
     }
     match &reach.q {
         Some(ast) => {
-            crate::notify::linked_eval(st, tenant, |l| antares_ql::eval::eval_q(ast, doc, ctx, l))
-                .await
+            crate::notify::linked_eval(st, tenant, None, |l| {
+                antares_ql::eval::eval_q(ast, doc, ctx, l)
+            })
+            .await
         }
         None => true,
     }
+}
+
+/// The INTERNAL document `doc` as the narrowing lets it be read: the
+/// Entity frame and the Attributes the policy projection keeps.
+pub(crate) fn policy_view(doc: &Value, r: &Repr) -> Value {
+    if r.policy_pick.is_none() && r.policy_omit.is_none() {
+        return doc.clone();
+    }
+    match doc.as_object() {
+        Some(obj) => Value::Object(
+            obj.iter()
+                .filter(|(k, _)| {
+                    is_meta(k)
+                        || policy_projected(r.policy_pick.as_deref(), r.policy_omit.as_deref(), k)
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        None => doc.clone(),
+    }
+}
+
+/// The narrowing half of a representation alone, for a caller that holds
+/// the Filter but builds no representation of its own.
+pub fn narrowing(f: &crate::policy::Filter) -> Repr {
+    let mut r = Repr::default();
+    narrow_repr(&mut r, f);
+    r
 }
 
 /// The same `pick`/`omit` names in the form an already-compacted document

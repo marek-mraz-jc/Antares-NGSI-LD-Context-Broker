@@ -600,6 +600,7 @@ async fn query_entities_outer(
     // EntityMaps exist for the distributed case. count=true walks every
     // candidate (the total needs each id checked), still chunk-bounded.
     let ids: Vec<String> = crate::entity_map::candidate_ids(&map, &params);
+    let narrow = crate::repr::narrowing(&filter);
     let looped = crate::federation::via_loop(
         headers,
         &crate::federation::alias_for(&st.host_alias, &tenant),
@@ -621,7 +622,7 @@ async fn query_entities_outer(
         } else {
             Vec::new()
         };
-        let docs = filter_entities_fed(st, &tenant, &p, &ctx, fed).await?;
+        let docs = filter_entities_fed(st, &tenant, &p, &ctx, fed, Some(&narrow)).await?;
         let matched: std::collections::HashSet<&str> = docs
             .iter()
             .filter_map(|d| d.get("id").and_then(Value::as_str))
@@ -859,8 +860,11 @@ async fn query_entities_inner(
         params,
         &ctx,
         fed,
-        push_page.then_some((p_offset, p_limit)),
-        push_proj.then_some(&repr),
+        Pushdown {
+            page: push_page.then_some((p_offset, p_limit)),
+            proj: push_proj.then_some(&repr),
+        },
+        Some(&repr),
     )
     .await?;
     let mut matches = filtered.docs;
@@ -988,9 +992,10 @@ pub async fn filter_entities_fed(
     params: &HashMap<String, String>,
     ctx: &antares_jsonld::Context,
     fed: Vec<(bool, Value)>,
+    narrow: Option<&crate::repr::Repr>,
 ) -> ApiResult<Vec<Value>> {
     Ok(
-        filter_entities_paged(st, tenant, params, ctx, fed, None, None)
+        filter_entities_paged(st, tenant, params, ctx, fed, Pushdown::default(), narrow)
             .await?
             .docs,
     )
@@ -1042,21 +1047,31 @@ fn page_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -
     fed_is_empty && !params.contains_key("idPattern") && !params.contains_key("orderBy")
 }
 
-/// The full filtering path (5.7.2). `page` = (offset, limit) to push into the
+/// What the store may be asked to do beyond filtering; see
+/// [`filter_entities_paged`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Pushdown<'a> {
+    pub page: Option<(usize, usize)>,
+    pub proj: Option<&'a crate::repr::Repr>,
+}
+
+/// The full filtering path (5.7.2). `push.page` = (offset, limit) to push into the
 /// store — pass it ONLY when every filter the store cannot see is absent
 /// (idPattern, federation, orderBy); the store still refuses unless its own
-/// predicates compiled exactly. `proj` = the parsed representation, offered
-/// for projection pushdown (pick/omit/attrs top-level heads) under the same
-/// exactness gate.
+/// predicates compiled exactly. `push.proj` = the parsed representation,
+/// offered for projection pushdown (pick/omit/attrs top-level heads) under
+/// the same exactness gate. `narrow` = the caller's policy narrowing, which
+/// a linked q term reads its targets through (ADR-0020, T-3474).
 pub async fn filter_entities_paged(
     st: &AppState,
     tenant: &TenantId,
     params: &HashMap<String, String>,
     ctx: &antares_jsonld::Context,
     fed: Vec<(bool, Value)>,
-    page: Option<(usize, usize)>,
-    proj: Option<&crate::repr::Repr>,
+    push: Pushdown<'_>,
+    narrow: Option<&crate::repr::Repr>,
 ) -> ApiResult<Filtered> {
+    let Pushdown { page, proj } = push;
     // a pushed page over local rows cannot be merged with federated
     // candidates — refuse here so no caller can create that page
     let page = if fed.is_empty() { page } else { None };
@@ -1250,8 +1265,11 @@ pub async fn filter_entities_paged(
             }
             if let Some(ast) = &q_ast {
                 // 4.9 linked-entity subqueries (attr{path}) resolve through
-                // the local store, same tenant.
-                if !crate::notify::linked_eval(st, tenant, |l| eval_q(ast, &doc, ctx, l)).await {
+                // the local store, same tenant, under the caller's narrowing
+                let narrow = narrow.map(|r| (r, ctx));
+                if !crate::notify::linked_eval(st, tenant, narrow, |l| eval_q(ast, &doc, ctx, l))
+                    .await
+                {
                     continue;
                 }
             }
@@ -1462,7 +1480,11 @@ async fn purge_locally(
             params,
             ctx,
             Vec::new(),
-            Some((offset, PURGE_CHUNK)),
+            Pushdown {
+                page: Some((offset, PURGE_CHUNK)),
+                proj: None,
+            },
+            // 5.6.21.4 refuses linked q terms before a purge runs
             None,
         )
         .await?;
@@ -2391,6 +2413,7 @@ pub(crate) async fn build_query_map(
     }
     // the candidate set is the NARROWED query's (ADR-0020)
     let narrowed = filter.narrow_params(params)?;
+    let narrow = crate::repr::narrowing(filter);
     let params = &narrowed;
     // 5.14.4.4: invalid entity ids / csf are BadRequestData
     if let Some(ids) = params.get("id") {
@@ -2428,8 +2451,11 @@ pub(crate) async fn build_query_map(
             &eff,
             ctx,
             Vec::new(),
-            Some((offset, st.max_limit)),
-            None,
+            Pushdown {
+                page: Some((offset, st.max_limit)),
+                proj: None,
+            },
+            Some(&narrow),
         )
         .await?;
         for d in &batch.docs {
