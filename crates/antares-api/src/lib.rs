@@ -27,7 +27,7 @@
 macro_rules! gate {
     ($st:expr, $tenant:expr, $headers:expr, $clause:expr $(, $field:ident: $value:expr)* $(,)?) => {
         async {
-            match &$st.policy {
+            let answer = match &$st.policy {
                 None => Ok($crate::policy::Filter::default()),
                 Some(engine) => {
                     $crate::policy::gate(
@@ -41,7 +41,12 @@ macro_rules! gate {
                     )
                     .await
                 }
-            }
+            };
+            // A state served through an endpoint view adds the view's
+            // narrowing to the engine's (ADR-0023, T-3494).
+            #[cfg(feature = "views")]
+            let answer = $crate::views::with_view($st.view.as_deref(), $clause, answer);
+            answer
         }
     };
 }
@@ -76,8 +81,15 @@ pub(crate) mod subscriptions;
 pub(crate) mod temporal;
 pub(crate) mod temporalq;
 pub(crate) mod types_attrs;
+// The composition hook of endpoint views (ADR-0023, ADR-0027 section 5);
+// never in a vanilla build.
+#[cfg(feature = "views")]
+pub mod views;
 
 pub use antares_notifier::DeliveryPolicy;
+// The sink contract, so a surface reaches it through this crate and names no
+// antares-notifier (ADR-0027 section 1, rule M2).
+pub use antares_notifier::{DeliveryError, DeliveryFuture, NotificationSink, Outbound};
 pub use state::{AppState, TemporalRecord};
 
 /// Spawn for both targets — tokio natively, the JS microtask queue on
