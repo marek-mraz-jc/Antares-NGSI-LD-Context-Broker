@@ -157,6 +157,7 @@ carries the fix. The current list:
 | 9 | suite | three temporal TPs assert `Content-Range` unit `date-time`; 6.3.10 mandates `DateTime` |
 | 10 | spec | 4.5.19.0's unbounded period count contradicts the aggregation fixtures |
 | 11 | spec | Annex B maps `attributeCount`/`attributeDetails` to bare terms |
+| 13 | spec | TS 104 175 Table 5.2.6.5.2-1 calls `timeInterval` not applicable to CSR subscriptions; 12.4.2.4/12.4.7 define periodic CSR notification |
 
 Filing is manual; each entry carries the clause quotation and the
 proposed fix so it can be pasted into the ETSI tracker as is.

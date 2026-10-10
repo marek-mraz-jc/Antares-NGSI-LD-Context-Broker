@@ -332,3 +332,29 @@ disclose different sets of Entities for the same narrowed request.
 Suggest either extending `OrScopeQ` with an unparenthesized
 `ScopeQ *(andOp ScopeQ)` alternative and stating that `andOp` binds tighter
 than `orOp`, or parenthesizing the conjunction in `019_01_06`.
+
+## 13. [spec] TS 104 175 Table 5.2.6.5.2-1 calls `timeInterval` not applicable to CSR subscriptions; 12.4.2.4 and 12.4.7 define periodic CSR notification on it
+
+**Title:** TS 104 175: Table 5.2.6.5.2-1 and clauses 12.4.2.4/12.4.7 disagree on
+`timeInterval` for Context Source Registration subscriptions
+
+**Body:**
+
+Table 5.2.6.5.2-1 lists the Subscription members that "are not applicable and
+shall be ignored" when the Subscription is about Context Source Registrations
+(`notificationTrigger`, `q`, `expandValues`, `jsonKeys`, `lang`, `localOnly`,
+`splitEntities`, `throttling`) and counts `timeInterval` among the members
+that do not apply. Clause 12.4.2.4 and clause 12.4.7 nevertheless define a
+periodic Context Source Notification sent every `timeInterval` seconds for
+such a Subscription, the same way 5.8.x does for an Entity Subscription.
+
+An implementation that follows the table ignores `timeInterval` and sends
+change-driven notifications; one that follows 12.4.x sends periodic ones. A
+client cannot tell from the text which it gets.
+
+Antares follows 12.4.7 (periodic notification on `timeInterval`), since the
+behaviour clause is the more specific one, and pins the table's other
+members as ignored (`csource_subscription_ignored_members.rs`, T-3452).
+
+Suggest removing `timeInterval` from the table's not-applicable list, or, if
+the table is meant, removing the periodic paragraphs of 12.4.2.4 and 12.4.7.

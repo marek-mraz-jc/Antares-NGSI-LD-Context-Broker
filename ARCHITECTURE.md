@@ -72,7 +72,7 @@ module's header comment.
 | `notify.rs` | 5 300 | 5.8.6 matching and delivery, the subscription mirror, interval sweeps, csource notifications |
 | `distsub.rs` | 1 750 | 5.8.1.4 distributed subscriptions, consumer half |
 | `csource.rs` | 2 200 | 5.9, 5.10 registrations, `csource_index` maintenance |
-| `registry.rs` | 470 | matching over a registration document: `CsrSpec`, the 4.3.6.1 information match, csf and scope filters, the temporal interval and expiry of a registration, the 5.11.2 subscription match; named by federation, notify, csource and every resource module that forwards |
+| `registry.rs` | 530 | matching over a registration document: `CsrSpec`, the 4.3.6.1 information match, csf and scope filters, the temporal interval and expiry of a registration, the 5.11.2 subscription match; named by federation, notify, csource and every resource module that forwards |
 | `federation.rs` | 3 500 | 4.3.6, 5.12, 6.3.17–6.3.19 forwarding, fan-out, result merge |
 | `entity_maps.rs` | 370 | 5.14 the `/entityMaps` resources (6.32, 6.34, 6.35): create from a query, retrieve, update, delete |
 | `entity_map.rs` | 850 | one EntityMap document (5.2.39): store it under its tenant with a lifetime, read it back while it lives, take a page's candidate ids from it, merge what a distributed query reached, and serve a retrieve through a presented map |
