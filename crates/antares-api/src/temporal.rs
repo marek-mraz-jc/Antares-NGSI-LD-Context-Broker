@@ -2833,7 +2833,14 @@ pub async fn delete_temporal(
         // 5.6.16.4: forward to registrations supporting the operation;
         // unsupported proxy modes are Conflict.
         let ctx = st.loader.core();
-        gate!(st, &tenant, &headers, "5.6.16", ids: &[&id]).await?;
+        let pre = crate::policy::temporal_pre_image(&st, &tenant, &id).await;
+        gate!(
+            st, &tenant, &headers, "5.6.16",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+        )
+        .await?;
         let regs = match temporal_write_regs(&st, &tenant, &headers, &ctx, &params, &id).await {
             Ok(regs) => regs,
             Err(refused) => return Ok(*refused),
@@ -2879,7 +2886,14 @@ pub async fn add_temporal_attrs(
         let obj = parsed.object(NgsiError::BadRequestData(
             "fragment must be a JSON object".into(),
         ))?;
-        gate!(st, &tenant, &headers, "5.6.12", ids: &[&id]).await?;
+        let pre = crate::policy::temporal_pre_image(&st, &tenant, &id).await;
+        gate!(
+            st, &tenant, &headers, "5.6.12",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+        )
+        .await?;
         // 5.6.12 input is pushed history — the 4.5.7 deleted-instance
         // representation is legal (5.5.4 temporal exception), hence
         // allow_null (mirrors 5.6.11).
@@ -3048,7 +3062,14 @@ pub async fn delete_temporal_attr(
         antares_model::check_attr_name(&attr)?;
         check_params(&params, &["datasetId", "deleteAll", "local"])?;
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.6.13", ids: &[&id]).await?;
+        let pre = crate::policy::temporal_pre_image(&st, &tenant, &id).await;
+        gate!(
+            st, &tenant, &headers, "5.6.13",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+        )
+        .await?;
         let attr_iri = antares_jsonld::expand_attr_name(&attr, &ctx)?;
         let delete_all = params.get("deleteAll").map(String::as_str) == Some("true");
         let want_ds = crate::repr::target_dataset_id(&params).map(String::from);
@@ -3264,7 +3285,14 @@ pub async fn modify_temporal_instance(
         antares_model::EntityId::new(&instance_id)
             .map_err(|_| NgsiError::BadRequestData("invalid instance id".into()))?;
         check_params(&params, &["local"])?;
-        gate!(st, &tenant, &headers, "5.6.14", ids: &[&id]).await?;
+        let pre = crate::policy::temporal_pre_image(&st, &tenant, &id).await;
+        gate!(
+            st, &tenant, &headers, "5.6.14",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+        )
+        .await?;
         let parsed = parse_body(&st.loader, &headers, &body, BodyKind::MergePatch).await?;
         let obj = parsed.object(NgsiError::BadRequestData(
             "fragment must be a JSON object".into(),
@@ -3374,7 +3402,14 @@ pub async fn delete_temporal_instance(
             .map_err(|_| NgsiError::BadRequestData("invalid instance id".into()))?;
         check_params(&params, &["local"])?;
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.6.15", ids: &[&id]).await?;
+        let pre = crate::policy::temporal_pre_image(&st, &tenant, &id).await;
+        gate!(
+            st, &tenant, &headers, "5.6.15",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+        )
+        .await?;
         let attr_iri = antares_jsonld::expand_attr_name(&attr, &ctx)?;
         let regs = match temporal_write_regs(&st, &tenant, &headers, &ctx, &params, &id).await {
             Ok(regs) => regs,
