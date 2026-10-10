@@ -273,6 +273,7 @@ dependencies = [
 name = "antares-store"
 version = "0.1.3"
 dependencies = [
+ "antares-jsonld",
  "antares-model",
  "antares-ql",
  "async-trait",

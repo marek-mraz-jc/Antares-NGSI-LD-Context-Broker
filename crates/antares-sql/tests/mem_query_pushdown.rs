@@ -2,8 +2,10 @@
 //! T-3556: the memory and file stores filter a query on the stored documents
 //! and copy only what the answer holds. ids, types and attrs are exact there,
 //! so with nothing else asked the outcome is `decided` and a page is cut in
-//! id order, the store's default, with its total; a `q`, `scopeQ` or geo
-//! query leaves the caller the arbiter over the type-narrowed rows.
+//! id order, the store's default, with its total. A `q` is decided there
+//! too when the request @context comes along and it has no linked term
+//! (T-3572); a linked `q`, a `scopeQ` or a geo query leaves the caller the
+//! arbiter over the type-narrowed rows.
 
 use antares_model::TenantId;
 use antares_sql::store::any::AnyStore;
@@ -163,4 +165,76 @@ async fn a_q_leaves_the_caller_the_arbiter_over_the_narrowed_rows() {
         ["urn:ngsi-ld:T:1", "urn:ngsi-ld:T:2", "urn:ngsi-ld:T:3"],
         "type-narrowed, unpaged, the expired one left out"
     );
+}
+
+/// T-3572: with the request @context the store runs the evaluator the API
+/// runs (`antares_ql::eval::eval_q`) on the borrowed documents, so a `q`
+/// without linked-entity terms is decided in the store and only the page is
+/// copied. A linked term reads other Entities through the caller's narrowing
+/// and stays with the caller.
+#[tokio::test]
+async fn a_q_with_the_context_is_decided_in_the_store() {
+    const DC: &str = "https://uri.etsi.org/ngsi-ld/default-context";
+    let s = AnyStore::Mem(Store::default());
+    let t = TenantId::new("mempushq").expect("tenant");
+    for (i, v) in [1, 50, 99].into_iter().enumerate() {
+        let id = format!("urn:ngsi-ld:Vehicle:{i}");
+        let doc = json!({"id": id, "type": [format!("{DC}/Vehicle")],
+            format!("{DC}/speed"): [{"type": "Property", "value": v}]});
+        assert!(s.create(&t, Kind::Entity, &id, doc).await.expect("create"));
+    }
+    let ctx = antares_jsonld::core_context();
+    let types = vec![vec![format!("{DC}/Vehicle")]];
+    let query = |q: &str| antares_ql::parse_q(q).expect("q");
+    let page = Some(Page {
+        offset: 0,
+        limit: 1,
+        count: true,
+    });
+
+    let q = query("speed>10");
+    let out = s
+        .query_entities(
+            &t,
+            &EntityFilter {
+                types: Some(&types),
+                q: Some(&q),
+                ctx: Some(&ctx),
+                page,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query");
+    assert!(out.decided && out.paged, "a flat q is exact in the store");
+    assert_eq!(
+        ids(&out.rows),
+        ["urn:ngsi-ld:Vehicle:1"],
+        "the first match only"
+    );
+    assert_eq!(out.total, Some(2), "50 and 99 match");
+
+    let q = query("driver{speed}>10");
+    let out = s
+        .query_entities(
+            &t,
+            &EntityFilter {
+                types: Some(&types),
+                q: Some(&q),
+                ctx: Some(&ctx),
+                page: Some(Page {
+                    offset: 0,
+                    limit: 1,
+                    count: true,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query");
+    assert!(
+        !out.decided && !out.paged,
+        "a linked term stays with the caller"
+    );
+    assert_eq!(out.rows.len(), 3, "type-narrowed, unpaged");
 }

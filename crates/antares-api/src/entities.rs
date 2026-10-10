@@ -1335,6 +1335,7 @@ pub async fn filter_entities_paged(
                 },
                 geo: if split_agg { &[] } else { &geo_specs },
                 expand: &expand,
+                ctx: Some(ctx),
                 page: page.map(|(offset, limit)| antares_store::filter::Page {
                     offset: offset as i64,
                     limit: limit as i64,
