@@ -346,7 +346,7 @@ pub fn router(state: AppState) -> Router {
                 .put(attrs::replace_attr)
                 .delete(attrs::delete_attr),
         )
-        // 2.0 #15 pre-adoption: the bare attribute value; PUT is Set
+        // 2.0 #15 pre-adoption: the bare attribute value, and PUT is Set
         // Attribute Value (TS 104 176 7.6.3.2)
         .route(
             "/entities/{id}/attrs/{attr}/value",
