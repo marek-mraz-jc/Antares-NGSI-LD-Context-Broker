@@ -1805,4 +1805,131 @@ mod tests {
             "wire installs the consumer half"
         );
     }
+
+    /// 5.8.6 forwards an inbound notification to the original subscriber,
+    /// and that delivery is a notification like any other: it passes
+    /// `pre_notify` once, under the subject stored with the ORIGINAL
+    /// Subscription, so a narrowing the subscriber is under holds for data a
+    /// remote source sent (operation matrix section 8 item 13, T-3486).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remote_notification_is_narrowed_for_the_original_subscriber() {
+        use crate::policy::{
+            Decision, DecisionFuture, NotifyDecision, Operation, PolicyEngine, Subject,
+        };
+        use std::sync::{Arc, Mutex};
+
+        /// Strips `secret` from every notified Entity and records the
+        /// subject it was asked about.
+        struct OmitSecret(Mutex<Vec<Vec<(String, String)>>>);
+        impl PolicyEngine for OmitSecret {
+            fn name(&self) -> &str {
+                "omit-secret"
+            }
+            fn decide<'a>(&'a self, _s: &'a Subject, _op: &'a Operation<'a>) -> DecisionFuture<'a> {
+                Box::pin(std::future::ready(Decision::Allow))
+            }
+            fn pre_notify(&self, s: &Subject, _sub: &Value, n: &mut Value) -> NotifyDecision {
+                self.0.lock().expect("subjects").push(s.headers.clone());
+                for e in n
+                    .get_mut("data")
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(o) = e.as_object_mut() {
+                        o.remove("secret");
+                    }
+                }
+                NotifyDecision::Deliver
+            }
+        }
+
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let sink = seen.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/notify",
+            axum::routing::post(move |body: String| {
+                let sink = sink.clone();
+                async move {
+                    if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                        sink.lock().expect("bodies").push(v);
+                    }
+                    StatusCode::OK
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+
+        let engine = Arc::new(OmitSecret(Mutex::default()));
+        let st = AppState::new("antares-ds-narrow".into()).with_policy(engine.clone());
+        let t = TenantId::new("alpha").expect("tenant");
+        let own = "urn:ngsi-ld:Subscription:own-narrowed";
+        st.store
+            .create(
+                &t,
+                Kind::Subscription,
+                own,
+                json!({
+                    "id": own,
+                    "type": "Subscription",
+                    "entities": [{"type": format!("{DC}Vehicle")}],
+                    "notification": {"endpoint": {
+                        "uri": format!("http://{addr}/notify"),
+                        "accept": "application/json",
+                    }},
+                    crate::policy::SUBJECT_MEMBER: [["x-user", "alice"]],
+                }),
+            )
+            .await
+            .expect("subscription row");
+        let remote = "urn:ngsi-ld:Subscription:remote-narrowed";
+        inbound_put(&st, remote, &t, own).await;
+
+        let body = json!({
+            "type": "Notification",
+            "subscriptionId": remote,
+            "data": [{
+                "id": "urn:ngsi-ld:Vehicle:1",
+                "type": "Vehicle",
+                "speed": {"type": "Property", "value": 50},
+                "secret": {"type": "Property", "value": "hidden"},
+            }],
+        })
+        .to_string();
+        let resp = remote_notify(State(st.clone()), Bytes::from(body)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut delivered = None;
+        for _ in 0..100 {
+            if let Some(b) = seen.lock().expect("bodies").first().cloned() {
+                delivered = Some(b);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let delivered = delivered.expect("the original subscriber was notified");
+        let entity = &delivered["data"][0];
+        assert_eq!(entity["id"], "urn:ngsi-ld:Vehicle:1");
+        assert!(
+            entity.get("speed").is_some(),
+            "visible data travels: {delivered}"
+        );
+        assert!(
+            entity.get("secret").is_none(),
+            "the subscriber's narrowing holds for remote data: {delivered}"
+        );
+        assert_eq!(
+            delivered["subscriptionId"], own,
+            "delivered under the subscriber's own id"
+        );
+        assert_eq!(
+            *engine.0.lock().expect("subjects"),
+            vec![vec![("x-user".to_owned(), "alice".to_owned())]],
+            "asked once, about the original subscriber"
+        );
+    }
 }
