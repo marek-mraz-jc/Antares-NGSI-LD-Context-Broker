@@ -59,7 +59,7 @@ impl PolicyEngine for Narrowing {
 
 fn slow() -> Filter {
     Filter {
-        q: Some(antares_ql::parse_q("speed<50").expect("q")),
+        q: Some(Box::new(antares_ql::parse_q("speed<50").expect("q"))),
         ..Filter::default()
     }
 }
@@ -871,7 +871,7 @@ async fn assert_join_hides(st: &AppState) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_join_does_not_embed_a_target_the_q_narrowing_hides() {
     let st = state(Filter {
-        q: Some(antares_ql::parse_q("public==true").expect("q")),
+        q: Some(Box::new(antares_ql::parse_q("public==true").expect("q"))),
         ..Filter::default()
     })
     .await;
@@ -942,7 +942,7 @@ fn asset_query(q: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_linked_q_term_does_not_read_an_entity_the_narrowing_hides() {
     let st = state(Filter {
-        q: Some(antares_ql::parse_q("public==true").expect("q")),
+        q: Some(Box::new(antares_ql::parse_q("public==true").expect("q"))),
         ..Filter::default()
     })
     .await;

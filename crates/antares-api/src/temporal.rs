@@ -2079,7 +2079,18 @@ pub(crate) async fn query_temporal_collected(
     let core_only_pick = attrs_filter.as_ref().is_some_and(Vec::is_empty);
     let mut payload: Vec<Value> = Vec::new();
     let (mut g_trunc, mut g_min, mut g_maxts) = (false, None::<String>, None::<String>);
+    // ADR-0023 rule 11: each Entity's history is narrowed by its own types
+    // before the window, so lastN counts only what may be seen (rule 8)
+    let types_rule = crate::repr::type_rules(filter);
     for d in &page {
+        let typed;
+        let d = match &types_rule {
+            Some(r) => {
+                typed = crate::repr::type_project(d, r);
+                &typed
+            }
+            None => d,
+        };
         let mut w = window(
             d,
             tq.as_ref(),
@@ -2319,6 +2330,11 @@ async fn retrieve_temporal_inner(
                 .into());
             }
         }
+        // ADR-0023 rule 11, as in the query above
+        let doc = match crate::repr::type_rules(&filter) {
+            Some(r) => crate::repr::type_project(&doc, &r),
+            None => doc,
+        };
         let mut w = window(
             &doc,
             tq.as_ref(),

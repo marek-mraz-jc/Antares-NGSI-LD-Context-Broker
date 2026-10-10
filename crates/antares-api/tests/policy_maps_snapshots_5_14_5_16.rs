@@ -327,7 +327,7 @@ async fn a_served_map_carries_no_record_of_whose_it_is() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_narrowing_answer_to_a_whole_tenant_operation_is_a_refusal() {
     let st = state(Decision::Filter(Filter {
-        q: Some(antares_ql::parse_q("speed<50").expect("q")),
+        q: Some(Box::new(antares_ql::parse_q("speed<50").expect("q"))),
         ..Filter::default()
     }));
     // no seed: the gate answers before the operation reads anything, and

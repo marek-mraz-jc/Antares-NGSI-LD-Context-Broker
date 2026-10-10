@@ -21,6 +21,7 @@ use antares_ql::geo::GeoQuery;
 use antares_ql::QNode;
 use axum::http::HeaderMap;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::LazyLock;
@@ -165,8 +166,10 @@ pub enum Decision {
 pub struct Filter {
     /// Conjoined into the query the store runs, on the AST — never on the
     /// query string, where the 4.9 precedence of `;` against `|` would have
-    /// to be re-derived by whoever writes the rule.
-    pub q: Option<QNode>,
+    /// to be re-derived by whoever writes the rule. Boxed, like `geo_q`: a
+    /// parsed query is half the size of the struct, and every [`Decision`]
+    /// and [`NotifyDecision`] would carry it inline.
+    pub q: Option<Box<QNode>>,
     /// Conjoined the same way with the request's own `scopeQ` (4.18).
     pub scope_q: Option<String>,
     /// An area the Entity must lie in (4.10), held beside the request's own
@@ -180,9 +183,30 @@ pub struct Filter {
     pub omit: Vec<String>,
     /// If non-empty, the only members served beside the document frame.
     pub pick: Vec<String>,
+    /// Attributes allowed per Entity type (ADR-0023 rule 11, gap G4):
+    /// expanded type IRI to expanded Attribute IRIs. When non-empty, an
+    /// Entity keeps the Attributes its own types allow (the union over its
+    /// types that have an entry), and an Entity none of whose types has an
+    /// entry keeps its frame only. Applied to every document the answer
+    /// carries, joined targets and notified Entities included, each by its
+    /// own types. It intersects with `pick`: both narrow.
+    pub pick_by_type: BTreeMap<String, Vec<String>>,
+    /// Attributes removed per Entity type: an Entity loses every Attribute
+    /// any of its types omits.
+    pub omit_by_type: BTreeMap<String, Vec<String>>,
     /// Answer [`RESTRICTED_HEADER`]`: true`, so a client can know the
     /// answer was narrowed. Narrowing is otherwise silent.
     pub restricted: bool,
+}
+
+/// The types of an Entity document: its `type` member, a string or an
+/// array of strings (5.2.4), in whatever form the document is in.
+pub fn entity_types(doc: &Value) -> Vec<&str> {
+    match doc.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// What identifies the document rather than describing it: 5.2.4 makes
@@ -197,6 +221,7 @@ impl Filter {
     /// 5.5.2 representation instead (`repr::narrow_projection`), where the
     /// names are expanded against the request `@context` first.
     pub fn project(&self, doc: &mut Value) {
+        let doc_types: Vec<String> = entity_types(doc).into_iter().map(str::to_owned).collect();
         let Some(obj) = doc.as_object_mut() else {
             return;
         };
@@ -209,6 +234,10 @@ impl Filter {
             }
             obj.remove(name);
         }
+        if self.has_type_rules() {
+            let types: Vec<&str> = doc_types.iter().map(String::as_str).collect();
+            obj.retain(|k, _| FRAME.contains(&k.as_str()) || self.type_allows(&types, k));
+        }
     }
 
     /// True when the filter would change nothing, which is how an engine
@@ -219,6 +248,30 @@ impl Filter {
             && self.geo_q.is_none()
             && self.omit.is_empty()
             && self.pick.is_empty()
+            && !self.has_type_rules()
+    }
+
+    /// Whether the filter carries a per-type rule (ADR-0023 rule 11).
+    pub fn has_type_rules(&self) -> bool {
+        !self.pick_by_type.is_empty() || !self.omit_by_type.is_empty()
+    }
+
+    /// ADR-0023 rule 11: may the member `k` of an Entity typed `types` be
+    /// served under the per-type rules? An Entity none of whose types has a
+    /// `pick_by_type` entry is allowed nothing (fail closed); one with
+    /// several types is allowed the union of its types' entries, less
+    /// whatever any of its types omits. Names compare as written: the
+    /// caller brings rule and document into one form first
+    /// (`repr::type_rules` expands both, `repr::compacted_filter` compacts
+    /// both).
+    pub fn type_allows(&self, types: &[&str], k: &str) -> bool {
+        let listed = |rules: &BTreeMap<String, Vec<String>>| {
+            types
+                .iter()
+                .filter_map(|t| rules.get(*t))
+                .any(|attrs| attrs.iter().any(|a| a == k))
+        };
+        (self.pick_by_type.is_empty() || listed(&self.pick_by_type)) && !listed(&self.omit_by_type)
     }
 
     /// Say the answer was narrowed, when the engine asked for it to be
@@ -260,8 +313,8 @@ impl Filter {
         let mut out = params.clone();
         if let Some(extra) = &self.q {
             let narrowed = match out.get("q").map(|q| antares_ql::parse_q(q)).transpose() {
-                Ok(Some(own)) => QNode::And(vec![own, extra.clone()]),
-                Ok(None) => extra.clone(),
+                Ok(Some(own)) => QNode::And(vec![own, (**extra).clone()]),
+                Ok(None) => (**extra).clone(),
                 // the request's own `q` is parsed and refused long before a
                 // filter reaches it; an unparsable one here is a caller that
                 // narrowed something it never validated
@@ -779,6 +832,53 @@ impl PolicyEngine for Slow<'_> {
 mod tests {
     use super::*;
     use futures_util::FutureExt as _;
+
+    /// ADR-0023 rule 11 on the reference semantics: union over the types
+    /// with an entry, nothing for a type without one, and an omit on any
+    /// type wins.
+    #[test]
+    fn type_allows_is_the_union_of_entries_fails_closed_and_any_omit_wins() {
+        let f = Filter {
+            pick_by_type: BTreeMap::from([
+                (
+                    "Car".to_owned(),
+                    vec!["speed".to_owned(), "email".to_owned()],
+                ),
+                ("User".to_owned(), vec!["name".to_owned()]),
+            ]),
+            omit_by_type: BTreeMap::from([("User".to_owned(), vec!["email".to_owned()])]),
+            ..Filter::default()
+        };
+        assert!(f.type_allows(&["Car"], "speed"));
+        assert!(!f.type_allows(&["Car"], "name"));
+        assert!(f.type_allows(&["Car", "User"], "name"), "union");
+        assert!(
+            !f.type_allows(&["Car", "User"], "email"),
+            "an omit on any type wins"
+        );
+        assert!(f.type_allows(&["Car", "Robot"], "speed"));
+        assert!(!f.type_allows(&["Robot"], "speed"), "no entry: nothing");
+        assert!(!f.type_allows(&[], "speed"), "no type: nothing");
+
+        let mut doc = json!({"id": "urn:x", "type": ["Car", "User"], "@context": "c",
+                             "speed": 1, "name": 2, "email": 3, "serial": 4});
+        f.project(&mut doc);
+        assert_eq!(
+            doc,
+            json!({"id": "urn:x", "type": ["Car", "User"], "@context": "c",
+                               "speed": 1, "name": 2})
+        );
+
+        let only_omit = Filter {
+            omit_by_type: f.omit_by_type.clone(),
+            ..Filter::default()
+        };
+        assert!(
+            only_omit.type_allows(&["Robot"], "serial"),
+            "no pick rules: omit alone"
+        );
+        assert!(!only_omit.type_allows(&["User"], "email"));
+    }
     use serde_json::json;
 
     fn subject() -> Subject {
