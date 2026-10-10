@@ -26,6 +26,10 @@ const KNOWN_KEYS: &[&str] = &[
     // other key it has no code for.
     #[cfg(feature = "plugin-example")]
     antares_plugin_example::RULES_ENV,
+    // How often every pod reloads the view table from the store (ADR-0023
+    // rule 10); only a build with views has one.
+    #[cfg(feature = "views")]
+    antares_ops::views::RELOAD_ENV,
     "ANTARES_DATABASE_URL",
     "ANTARES_STORE",
     // Temporal driver: a store mode, or `none` — history off (temporal
@@ -458,6 +462,8 @@ type SurfaceCtor = fn() -> Box<dyn antares_api::ApiSurface>;
 /// surface would drop out here.
 const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("admin", || Box::new(antares_api::Admin)),
+    #[cfg(feature = "views")]
+    ("views", || antares_ops::mount(antares_views::Views)),
     #[cfg(feature = "plugin-example")]
     ("example", || {
         Box::new(antares_plugin_example::ExampleSurface)
@@ -866,6 +872,12 @@ async fn run(
     // default mounting put there, before the state is shared.
     let selected = api_surfaces(std::env::var("ANTARES_API_SURFACES").ok().as_deref())?;
     state = state.with_surfaces(selected.iter().map(|(_, build)| build()).collect())?;
+    // Endpoint views (ADR-0023 rule 10): the stored views loaded into the
+    // table every surface that serves through views opens on, `/q/views`
+    // on the admin surface, and the reload that keeps every pod's table
+    // within one interval of the store.
+    #[cfg(feature = "views")]
+    antares_ops::views::install(&state).await?;
     // The policy engine, from configuration and from the shelf this binary
     // was built with. Without one the broker asks `allow-all` and behaves
     // exactly as it did before the seam existed.
@@ -1659,6 +1671,15 @@ mod api_surface_tests {
         );
     }
 
+    /// The view root is on the shelf of a `views` build, under `/x/views`.
+    #[cfg(feature = "views")]
+    #[test]
+    fn a_views_build_shelves_the_view_root() {
+        assert_eq!(names(Some("admin,views")), vec!["admin", "views"]);
+        let root = api_surfaces(Some("views")).expect("selection")[0].1();
+        assert_eq!(root.prefix(), "/x/views");
+    }
+
     /// An empty selection is fatal too: readiness, health and metrics are
     /// the admin surface, so a pod without one can never report itself up.
     #[test]
@@ -1673,7 +1694,7 @@ mod api_surface_tests {
     /// surface feature the shelf is the admin surface alone, and a path of
     /// every surface prefix (ADR-0023 to ADR-0027) is unrouted. A surface
     /// that lands without its feature gate turns this red.
-    #[cfg(not(any(feature = "plugin-example")))]
+    #[cfg(not(any(feature = "plugin-example", feature = "views")))]
     #[tokio::test]
     async fn the_vanilla_shelf_is_admin_alone() {
         use tower::ServiceExt;

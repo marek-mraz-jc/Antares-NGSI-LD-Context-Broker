@@ -270,4 +270,23 @@ mod clause_4_19 {
             .join(",");
         assert_eq!(intersect_scope_q(&wide, &wide), None, "200x200 groups");
     }
+
+    /// A Scope stored as a bare string (a registration kept verbatim) is
+    /// matched like a one-element array; the intersection may be exactly
+    /// MAX_SCOPE_Q_BYTES long, one byte more is refused (T-3531).
+    #[test]
+    fn bare_string_scope_and_the_intersection_ceiling() {
+        use serde_json::json;
+        assert!(scope_matches("/a", &json!({"scope": "/a"})));
+        assert!(!scope_matches("/b", &json!({"scope": "/a"})));
+        let at = |n: usize| format!("/{}", "s".repeat(n - 1));
+        assert_eq!(
+            intersect_scope_q("/#", &at(super::MAX_SCOPE_Q_BYTES)).map(|s| s.len()),
+            Some(super::MAX_SCOPE_Q_BYTES)
+        );
+        assert_eq!(
+            intersect_scope_q("/#", &at(super::MAX_SCOPE_Q_BYTES + 1)),
+            None
+        );
+    }
 }

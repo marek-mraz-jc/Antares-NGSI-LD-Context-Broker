@@ -20,6 +20,9 @@ pub enum Refusal {
         /// The methods the view allows on the resource.
         allow: Vec<Method>,
     },
+    /// The view serves the method on the resource but not this operation
+    /// of it (ADR-0023 rule 4: the method stays, 422).
+    NotSupported,
     /// The policy engine refused, or a write would leave the view. The
     /// reason is the engine's fixed string (ADR-0020) or the view's own.
     Denied(String),
@@ -58,6 +61,7 @@ impl Refusal {
         match self {
             Self::NotFound | Self::Closed => StatusCode::NOT_FOUND,
             Self::NotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
+            Self::NotSupported => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Denied(_) => StatusCode::FORBIDDEN,
             Self::Malformed(_) => StatusCode::BAD_REQUEST,
             Self::Limit(_) => StatusCode::PAYLOAD_TOO_LARGE,
@@ -82,7 +86,7 @@ impl Refusal {
                 "ResourceNotFound",
                 "the resource does not exist".to_owned(),
             ),
-            Self::NotAllowed { .. } => (
+            Self::NotAllowed { .. } | Self::NotSupported => (
                 "https://uri.etsi.org/ngsi-ld/errors/OperationNotSupported",
                 "OperationNotSupported",
                 "the operation is not allowed here".to_owned(),

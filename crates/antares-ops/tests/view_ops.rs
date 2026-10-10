@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: EUPL-1.2
+//! `Ops::view` and `ViewOps::run` (ADR-0023 rules 4 and 10): a loaded view
+//! by id and nothing else, its allowlist, its one Tenant, and the narrowed
+//! handle following a reload.
+
+use antares_ops::test_kit::TestBroker;
+use antares_ops::{Caller, OperationId, Ops, OpsRequest, Surface};
+use axum::body::Body;
+use axum::extract::Path;
+use axum::http::{HeaderValue, Method, Request, StatusCode};
+use axum::routing::get;
+use axum::Router;
+use http_body_util::BodyExt;
+use serde_json::{json, Value};
+use tower::ServiceExt;
+
+/// `/x/probe/{view}/types` lists the types through the view;
+/// `/x/probe/{view}/entities` queries the Cars through it.
+struct Probe;
+
+impl Surface for Probe {
+    fn name(&self) -> &'static str {
+        "probe"
+    }
+    fn prefix(&self) -> &'static str {
+        "/x/probe"
+    }
+    fn version_info(&self) -> Value {
+        Value::Null
+    }
+    fn router(&self, ops: Ops) -> Router {
+        let run = |ops: Ops, op: OperationId, path: &'static str| {
+            move |Path(id): Path<String>, caller: Caller| async move {
+                let Some(view) = ops.view(&id) else {
+                    return antares_ops::Refusal::NotFound.ngsi_ld();
+                };
+                match view
+                    .run(op, &caller, OpsRequest::new(Method::GET, path))
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(refusal) => refusal.ngsi_ld(),
+                }
+            }
+        };
+        Router::new()
+            .route(
+                "/{view}/types",
+                get(run(
+                    ops.clone(),
+                    OperationId::RetrieveEntityTypes,
+                    "/ngsi-ld/v1/types",
+                )),
+            )
+            .route(
+                "/{view}/entities",
+                get(run(
+                    ops,
+                    OperationId::QueryEntities,
+                    "/ngsi-ld/v1/entities?type=Car",
+                )),
+            )
+    }
+}
+
+struct Answer {
+    status: StatusCode,
+    tenant: Option<HeaderValue>,
+    json: Value,
+}
+
+async fn send(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    tenants: &[HeaderValue],
+    body: Option<&Value>,
+) -> Answer {
+    let bytes = body.map(Value::to_string).unwrap_or_default();
+    let mut req = Request::builder().method(method).uri(uri);
+    for t in tenants {
+        req = req.header("NGSILD-Tenant", t.clone());
+    }
+    if body.is_some() {
+        req = req
+            .header("Content-Type", "application/json")
+            .header("Content-Length", bytes.len());
+    }
+    let Ok(resp) = app
+        .clone()
+        .oneshot(req.body(Body::from(bytes)).unwrap_or_default())
+        .await;
+    let status = resp.status();
+    let tenant = resp.headers().get("ngsild-tenant").cloned();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .unwrap_or_default();
+    Answer {
+        status,
+        tenant,
+        json: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    }
+}
+
+fn view(attributes: &[&str], operations: &[&str]) -> Value {
+    json!({
+        "id": "cars", "tenant": "city", "selector": ["Car"],
+        "rules": [{"types": ["Car"], "attributes": attributes}],
+        "operations": operations
+    })
+}
+
+async fn broker() -> Result<(TestBroker, Router), String> {
+    let b = TestBroker::new().await?;
+    let app = b.serve(Probe)?;
+    for (tenant, id) in [
+        ("city", "urn:ngsi-ld:Car:1"),
+        ("other", "urn:ngsi-ld:Car:9"),
+    ] {
+        let car = json!({"id": id, "type": "Car",
+            "speed": {"type": "Property", "value": 1}, "colour": {"type": "Property", "value": "red"}});
+        let a = send(
+            &app,
+            Method::POST,
+            "/ngsi-ld/v1/entities",
+            &[HeaderValue::from_static(tenant)],
+            Some(&car),
+        )
+        .await;
+        assert_eq!(a.status, StatusCode::CREATED);
+    }
+    let a = send(
+        &app,
+        Method::PUT,
+        "/q/views/cars",
+        &[],
+        Some(&view(
+            &["speed"],
+            &["retrieve_entity_types", "query_entities"],
+        )),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.json);
+    Ok((b, app))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_runs_in_its_one_tenant() {
+    let (_b, app) = broker().await.expect("broker");
+    let city = HeaderValue::from_static("city");
+    let none = send(&app, Method::GET, "/x/probe/cars/entities", &[], None).await;
+    assert_eq!(none.status, StatusCode::OK, "{}", none.json);
+    assert_eq!(
+        none.json.pointer("/0/id"),
+        Some(&json!("urn:ngsi-ld:Car:1")),
+        "{}",
+        none.json
+    );
+    assert_eq!(
+        none.tenant, None,
+        "the pinned tenant is named to a caller who never sent it"
+    );
+    let same = send(
+        &app,
+        Method::GET,
+        "/x/probe/cars/entities",
+        std::slice::from_ref(&city),
+        None,
+    )
+    .await;
+    assert_eq!(same.status, StatusCode::OK);
+    assert_eq!(same.tenant, Some(city.clone()));
+    for tenants in [
+        vec![HeaderValue::from_static("other")],
+        vec![HeaderValue::from_static("not a tenant")],
+        vec![HeaderValue::from_bytes(b"\xffcity").expect("opaque bytes")],
+        vec![city.clone(), city],
+    ] {
+        let a = send(&app, Method::GET, "/x/probe/cars/entities", &tenants, None).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{tenants:?}: {}", a.json);
+        assert_eq!(
+            a.json.get("detail"),
+            Some(&json!("a view serves one tenant"))
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_loaded_view_and_its_allowed_operations_run() {
+    let (b, app) = broker().await.expect("broker");
+    let a = send(&app, Method::GET, "/x/probe/nosuch/types", &[], None).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND);
+    // a view that allows types but not the query
+    let a = send(
+        &app,
+        Method::PUT,
+        "/q/views/cars",
+        &[],
+        Some(&view(&["speed"], &["retrieve_entity_types"])),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.json);
+    let a = send(&app, Method::GET, "/x/probe/cars/types", &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.json);
+    let a = send(&app, Method::GET, "/x/probe/cars/entities", &[], None).await;
+    assert_eq!(a.status, StatusCode::METHOD_NOT_ALLOWED, "{}", a.json);
+    // a view that failed validation is no view
+    let mut broken = view(&["speed"], &["query_entities"]);
+    broken["operations"] = json!(["drop_tables"]);
+    b.store_view_doc("broken", broken).await.expect("stored");
+    let a = send(&app, Method::GET, "/x/probe/broken/types", &[], None).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND);
+}
+
+/// The narrowed handle is kept per view and follows a reload: a changed
+/// view serves its new narrowing, a removed one nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_handle_follows_the_view_table() {
+    let (_b, app) = broker().await.expect("broker");
+    let shows = |a: &Answer, attr: &str| a.json.pointer(&format!("/0/{attr}")).is_some();
+    let a = send(&app, Method::GET, "/x/probe/cars/entities", &[], None).await;
+    assert!(shows(&a, "speed") && !shows(&a, "colour"), "{}", a.json);
+    let again = send(&app, Method::GET, "/x/probe/cars/entities", &[], None).await;
+    assert_eq!(again.json, a.json, "served from the kept handle");
+
+    let changed = view(&["colour"], &["retrieve_entity_types", "query_entities"]);
+    let put = send(&app, Method::PUT, "/q/views/cars", &[], Some(&changed)).await;
+    assert_eq!(put.status, StatusCode::NO_CONTENT);
+    let a = send(&app, Method::GET, "/x/probe/cars/entities", &[], None).await;
+    assert!(
+        shows(&a, "colour") && !shows(&a, "speed"),
+        "the old narrowing is still served: {}",
+        a.json
+    );
+
+    let mut other = changed.clone();
+    other["id"] = json!("trucks");
+    let put = send(&app, Method::PUT, "/q/views/trucks", &[], Some(&other)).await;
+    assert_eq!(put.status, StatusCode::CREATED);
+    let del = send(&app, Method::DELETE, "/q/views/cars", &[], None).await;
+    assert_eq!(del.status, StatusCode::NO_CONTENT);
+    let a = send(&app, Method::GET, "/x/probe/cars/entities", &[], None).await;
+    assert_eq!(
+        a.status,
+        StatusCode::NOT_FOUND,
+        "a removed view is served: {}",
+        a.json
+    );
+    let a = send(&app, Method::GET, "/x/probe/trucks/entities", &[], None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.json);
+}

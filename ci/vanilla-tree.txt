@@ -1201,6 +1201,7 @@ antares-broker v0.1.3
 │   │   │               └── regex-syntax feature "unicode" (*)
 │   │   ├── antares-store feature "default"
 │   │   │   └── antares-store v0.1.3
+│   │   │       ├── antares-jsonld feature "default" (*)
 │   │   │       ├── antares-model feature "default" (*)
 │   │   │       ├── serde_json feature "default" (*)
 │   │   │       ├── chrono feature "default" (*)

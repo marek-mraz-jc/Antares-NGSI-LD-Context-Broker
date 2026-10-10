@@ -27,3 +27,19 @@ function = "antares_ops::inner_failure"
 lines = 2
 branches = 0
 reason = "tracing::warn! repeats the fields in its `log` fallback, which runs only with no subscriber set; ops_errors covers the subscriber path and asserts what it logs"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/views.rs"
+function = "antares_ops::views::inner"
+lines = 8
+branches = 0
+reason = "the view store failing: the built-in store under test_kit does not fail, and antares-ops may not name the store to put one that does in its place (module rule M2)"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/views.rs"
+function = "Reloader::reload_or_log" # v0 mangling puts the impl between the crate and the type
+lines = 3
+branches = 1
+reason = "the periodic reload failing on the store, which the built-in store does not (see antares_ops::views::inner)"

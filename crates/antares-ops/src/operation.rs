@@ -404,17 +404,31 @@ impl OperationId {
         }
     }
 
+    /// The operation whose matrix row id is `id`.
+    ///
+    /// ```
+    /// use antares_ops::OperationId;
+    /// assert_eq!(OperationId::from_id("query_entities"), Some(OperationId::QueryEntities));
+    /// assert_eq!(OperationId::from_id("drop_tables"), None);
+    /// ```
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|op| op.id() == id)
+    }
+
     /// The operation a request is, when it is one a surface may run: the
     /// method and path match the binding, every segment in braces standing
     /// for one non-empty segment, and a binding with a query (`?details=true`)
-    /// is preferred over the same path without it. Broker-initiated
-    /// deliveries are never matched.
+    /// is preferred over the same path without it, and `HEAD` is the `GET`
+    /// operation. Broker-initiated deliveries are never matched.
     ///
     /// ```
     /// use antares_ops::OperationId;
     /// assert_eq!(OperationId::of("GET", "/ngsi-ld/v1/types", Some("details=true")),
     ///            Some(OperationId::RetrieveEntityTypeDetails));
     /// assert_eq!(OperationId::of("GET", "/ngsi-ld/v1/types", None),
+    ///            Some(OperationId::RetrieveEntityTypes));
+    /// assert_eq!(OperationId::of("HEAD", "/ngsi-ld/v1/types", None),
     ///            Some(OperationId::RetrieveEntityTypes));
     /// assert_eq!(OperationId::of("GET", "/q/health", None), None);
     /// ```
@@ -474,7 +488,10 @@ impl<'a> Binding<'a> {
     }
 
     fn matches(&self, method: &str, path: &str, query: Option<&str>) -> bool {
-        self.methods.split('|').any(|m| m == method)
+        // TS 104 176 6.3.2: HEAD is recognised wherever GET is.
+        self.methods
+            .split('|')
+            .any(|m| m == method || (m == "GET" && method == "HEAD"))
             && self
                 .paths
                 .iter()

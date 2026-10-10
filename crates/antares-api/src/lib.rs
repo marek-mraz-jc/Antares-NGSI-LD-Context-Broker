@@ -257,12 +257,21 @@ impl ApiSurface for Admin {
         } else {
             metrics
         };
-        Router::new()
+        let routes = Router::new()
             .route(tenants_p, get(tenants_list))
             .route(tenant_p, get(tenant_get).delete(tenant_purge))
             .route(dl_p, get(dead_letters_list))
             .route(dl_id_p, delete(dead_letter_delete))
-            .route(replay_p, post(dead_letter_replay))
+            .route(replay_p, post(dead_letter_replay));
+        // `/q/views` (ADR-0023 rule 10), when a loader set it: views are
+        // written here, so they sit behind the admin credential with the
+        // rest of /q.
+        #[cfg(feature = "views")]
+        let routes = match st.views.admin() {
+            Some(views) => routes.merge(views.with_state(())),
+            None => routes,
+        };
+        routes
             .route_layer(guard)
             .route(health_p, get(health))
             .route(ready_p, get(ready))
@@ -941,6 +950,11 @@ async fn health(
     body["notificationSchemes"] = state.sinks.schemes().into();
     // Notifications the delivery policy gave up on (this process, since start).
     body["deadLetters"] = notify::dead_letters_written().into();
+    // Each stored view, loaded or invalid with the reason (ADR-0023 rule 10).
+    #[cfg(feature = "views")]
+    {
+        body["views"] = state.views.report();
+    }
     // Changes the bounded matcher queue dropped (this process, since start).
     body["changesDropped"] = notify::changes_dropped().into();
     // Panics absorbed at the notification-task boundary, each one a change

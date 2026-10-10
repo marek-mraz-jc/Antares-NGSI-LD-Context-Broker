@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! The EDM model: the subset of CSDL 4.01 this crate writes (ADR-0024 decision 5).
 //!
 //! Everything is plain data with public fields; [`crate::validate`] decides whether a value is a
