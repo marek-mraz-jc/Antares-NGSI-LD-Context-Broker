@@ -102,7 +102,14 @@ After T-3556 (run 38078752333, same rig, Antares at 905da4e): the memory store f
 | 100 000 | query with `q` | 12 | 29.1 s | 1172 | 21 ms |
 | 100 000 | retrieve by id | 4629 | 11 ms | 8285 | 12 ms |
 
-A query with `q` still takes the old path: the memory arm leaves `q` undecided, hands the API a copy of the tenant and lets it filter (T-3572).
+A query with `q` took the old path: the memory arm left `q` undecided, handed the API a copy of the tenant and let it filter. T-3572 runs the API's own evaluator on the borrowed documents for a `q` without linked terms (run 38081147511, same rig, Antares 3385b28):
+
+| Entities | Shape (k6, 50 VUs) | Antares req/s | p99 | Coraine req/s | p99 |
+|---:|---|---:|---:|---:|---:|
+| 1 000 | query with `q` | 1758 | 31 ms | 2523 | 21 ms |
+| 100 000 | query with `q` | 923 | 37 ms | 1125 | 21 ms |
+
+The shape's `q` (`speed>100;brand=="Tesla"`) is selective, so a page of 20 walks many documents; each walk resolves the query's terms against the @context again per document.
 - Antares holds 3.6 times Coraine's memory per entity: the expanded JSON-LD form with IRI keys and instance arrays, in `serde_json` values.
 - The first run kept Antares' history on (`ANTARES_TEMPORAL_RECORD=all`, the default) against Coraine without one: RSS at 100 000 entities was 2355 MiB, twice the parity figure. A comparison with history needs Coraine's `--troe` driver and is not done here.
 
