@@ -1,6 +1,6 @@
 # ADR-0025 — Internal context sources: a registration that names this broker is served in process
 
-Date: 2026-10-10. Status: accepted. Decided by worker-2 under the owner
+Date: 2026-10-10. Status: accepted, rule 8 amended by ADR-0027 (section 9). Decided by worker-2 under the owner
 order of 2026-10-10 ("a design decision is yours: pick the recommended
 option"); the owner may override any rule below. Builds on ADR-0011 (the
 tenant-qualified Via alias), ADR-0016 (bindings behind the sink registry)

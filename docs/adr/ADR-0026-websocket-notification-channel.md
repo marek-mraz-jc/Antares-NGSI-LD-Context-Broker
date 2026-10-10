@@ -1,6 +1,6 @@
 # ADR-0026 — WebSocket notification channel: one more sink, the TS 104 243 envelope, bounded and resumable
 
-Date: 2026-10-10. Status: accepted. Decided by worker-2 under the owner
+Date: 2026-10-10. Status: accepted, rule 1 amended by ADR-0027 (section 9). Decided by worker-2 under the owner
 order of 2026-10-10 ("a design decision is yours: pick the recommended
 option"); the owner may override any rule below. Supersedes ADR-0003.
 Builds on ADR-0016 (bindings behind the sink registry), ADR-0020 (the
