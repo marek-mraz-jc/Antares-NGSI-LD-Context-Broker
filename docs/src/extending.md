@@ -219,6 +219,18 @@ crate under `examples/` or any engine or façade crate; `k8s-smoke` then
 asserts the deployed image reports `allow-all` and no surface beyond
 `admin`.
 
+Every workspace package names its place in that layering in
+`[package.metadata.antares] role`: `core`, `ops`, `surface`, `protocol` or
+`addon` (ADR-0027). `dev/check-module-rules.py` reads `cargo metadata` and
+refuses a package without one, a protocol crate that depends on an
+`antares-*` crate, a surface that is not its own optional feature of
+`antares-broker` or reaches past `antares-ops` and its protocols, an
+`antares-ops` that depends on or re-exports the store, a broker `default`
+that links any of them, and an ops, surface or protocol crate without the
+full `[lints]` table or with a default-featured registry dependency it gives
+no reason for. Its `--self-test` runs first, on a synthetic workspace with
+each violation planted once.
+
 Adding one is a struct implementing the trait plus an entry in
 `POLICY_SHELF` (`crates/antares-broker/src/main.rs`); no core crate
 changes. Hold it to `antares_api::policy::run_policy_contract` (behind the

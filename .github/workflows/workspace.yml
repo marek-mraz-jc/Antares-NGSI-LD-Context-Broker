@@ -256,6 +256,14 @@ jobs:
       # clean one.
       - name: No addon in the shipped build
         run: ./dev/check-no-addon.sh
+      # Module rules M1 and M2 (ADR-0027, surfaces-threat-model 9.3/9.4):
+      # every package declares its role, a surface reaches the store only
+      # through antares-ops, a protocol crate knows nothing of antares-*.
+      # The self-test plants each violation once before the real check runs.
+      - name: Module rules
+        run: |
+          python3 dev/check-module-rules.py --self-test
+          python3 dev/check-module-rules.py
       # SQL-injection guard: dynamically assembled SQL (AssertSqlSafe, or an
       # sqlx query built with format!) belongs to the antares-sql backend
       # source and nowhere else. Everything a request supplies reaches the
