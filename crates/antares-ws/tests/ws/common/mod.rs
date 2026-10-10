@@ -368,19 +368,20 @@ pub fn with(mut v: Value, path: &[&str], x: Value) -> Value {
 
 /// Wait until `what` of the hub holds, within [`WAIT`].
 pub async fn until(hub: &Hub, what: impl Fn(&Hub) -> bool) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while !what(hub) {
-        if tokio::time::Instant::now() > deadline {
-            return Err(format!(
-                "not within the wait: {} connections, {} attached, {} overflows",
-                hub.connections(),
-                hub.attached(),
-                hub.overflows()
-            ));
+    let waited = tokio::time::timeout(WAIT, async {
+        while !what(hub) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    Ok(())
+    })
+    .await;
+    waited.map_err(|_| {
+        format!(
+            "not within the wait: {} connections, {} attached, {} overflows",
+            hub.connections(),
+            hub.attached(),
+            hub.overflows()
+        )
+    })
 }
 
 impl Client {

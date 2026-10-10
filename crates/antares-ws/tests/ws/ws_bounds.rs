@@ -2,11 +2,10 @@
 //! Rules 6 and 9: what a socket may be opened from, how many there are, and
 //! what one client message may weigh.
 
-use crate::common::{broker, cars, connect, open, status, Client, WAIT};
+use crate::common::{broker, cars, connect, open, status, until, Client};
 use antares_ws::Limits;
 use futures_util::SinkExt;
 use serde_json::json;
-use std::time::Duration;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::Message;
@@ -61,13 +60,7 @@ async fn ws_connections_are_capped_per_tenant_and_per_process() -> Result<(), St
     let _b1 = connect(b.addr, ROOT, &[("NGSILD-Tenant", "b")]).await?;
     assert_eq!(refused("b").await?, Some(503), "the fourth in the process");
     a1.close().await;
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while b.hub.connections() > 2 {
-        if tokio::time::Instant::now() > deadline {
-            return Err("a closed socket kept its place".into());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    until(&b.hub, |h| h.connections() <= 2).await?;
     connect(b.addr, ROOT, &[("NGSILD-Tenant", "a")]).await?;
     Ok(())
 }
@@ -131,13 +124,7 @@ async fn ws_an_oversized_or_too_deep_client_message_closes_the_connection() -> R
     .await?;
     assert_eq!(ends(&mut c).await?, Some(1009));
 
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while b.hub.connections() > 1 {
-        if tokio::time::Instant::now() > deadline {
-            return Err(format!("{} connections left open", b.hub.connections()));
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    until(&b.hub, |h| h.connections() <= 1).await?;
     Ok(())
 }
 

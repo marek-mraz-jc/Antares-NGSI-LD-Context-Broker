@@ -7,3 +7,4 @@ mod ws_bounds;
 mod ws_delivery;
 mod ws_queue;
 mod ws_resume;
+mod ws_views;
