@@ -103,3 +103,12 @@ effect on the Subscriptions already made:
 The view id is the raw path segment: `CARS`, `ca%72s` or `x/../cars` never
 reach the view `cars`. No refusal names a hidden Attribute or an inner
 failure; a broker error inside the view is a `500` with a request id only.
+
+## 5. The Tenant's schema
+
+A surface that needs the data model of a view's Tenant (OData's Edm types
+and navigation properties, the LinkML surface) reads the Tenant's `LinkML`
+schema, written to [`/q/schemas/{tenant}`](admin-api.md#schemas). Every view
+of that Tenant sees the same schema and no view sees another Tenant's. The
+surface gets the bytes and a revision through `ViewOps::schema`, parses
+them under its own limits, and parses again only when the revision changes.
