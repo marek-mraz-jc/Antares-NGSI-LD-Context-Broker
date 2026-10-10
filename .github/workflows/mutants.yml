@@ -57,12 +57,11 @@ jobs:
           tool: cargo-mutants
       - name: Mutate
         run: |
-          set -uo pipefail
+          rc=0
           # word splitting of the matrix args is intended
           # shellcheck disable=SC2086
           cargo mutants --no-shuffle --shard ${{ matrix.shard }}/${{ matrix.target.shards }} \
-            ${{ matrix.target.args }}
-          rc=$?
+            ${{ matrix.target.args }} || rc=$?
           # 0 all caught, 2 survivors, 3 timeouts: judged below. Anything
           # else (the unmutated tree fails, a usage error) is the run failing.
           case $rc in 0|2|3) ;; *) exit $rc;; esac

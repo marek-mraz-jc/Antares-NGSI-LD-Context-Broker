@@ -353,6 +353,14 @@ mod tests {
             !throttled(&s),
             "an old lastNotification is outside the window"
         );
+        // the window is in seconds: 10 s ago is inside 60 s and outside 5 s
+        let ago = (chrono::Utc::now() - chrono::Duration::seconds(10))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        s["notification"]["lastNotification"] = json!(ago);
+        s["throttling"] = json!(60);
+        assert!(throttled(&s), "10 s ago, 60 s window");
+        s["throttling"] = json!(5);
+        assert!(!throttled(&s), "10 s ago, 5 s window");
     }
 
     /// 5.2.33 Table 5.2.33-1: `id` takes precedence over `idPattern`, and a
