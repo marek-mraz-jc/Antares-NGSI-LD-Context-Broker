@@ -58,10 +58,11 @@ jobs:
       - name: Build vanilla and overflow-checked binaries
         run: |
           set -euo pipefail
-          cargo build --locked --release -p antares-broker
+          # Release checks overflow (T-3552); "vanilla" is the unchecked build it is measured against.
+          CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=false \
+            cargo build --locked --release -p antares-broker
           cp target/release/antares antares-vanilla
-          CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true \
-            cargo build --locked --release -p antares-broker --target-dir target-ovf
+          cargo build --locked --release -p antares-broker --target-dir target-ovf
           cp target-ovf/release/antares antares-overflow
       - name: Baseline (vanilla)
         run: BIN=$PWD/antares-vanilla OUT=results/baseline/vanilla dev/perf/baseline.sh

@@ -905,6 +905,45 @@ pub async fn decide_each(
         .collect()
 }
 
+/// Whether any request of each of `clauses` could be allowed for the caller
+/// of `headers`: one batch-shaped probe a surface lists its operations by
+/// (MCP D-3), never a decision on a request. Each clause is asked as an
+/// Operation that names nothing, through [`decide_each`], so it fails
+/// closed the same way (a panic, a timeout or a short answer hides every
+/// clause), and a narrowing on a clause that cannot be narrowed hides it.
+/// With no engine attached every clause is offered.
+// ponytail: no `PolicyEngine::offers` hook; an engine that has to answer a
+// probe differently from an empty Operation gets one when it exists.
+pub async fn offers(
+    engine: Option<&dyn PolicyEngine>,
+    tenant: &antares_model::TenantId,
+    headers: &HeaderMap,
+    clauses: &[&'static str],
+) -> Vec<bool> {
+    let Some(engine) = engine else {
+        return vec![true; clauses.len()];
+    };
+    let ops: Vec<Operation<'_>> = clauses
+        .iter()
+        .map(|clause| Operation {
+            clause,
+            ids: &[],
+            types: &[],
+            attrs: &[],
+            q: None,
+            scope_q: None,
+            geo: None,
+            body: None,
+            stored: None,
+        })
+        .collect();
+    decide_each(engine, &subject_of(tenant, headers), &ops)
+        .await
+        .into_iter()
+        .map(|d| !matches!(d, Decision::Deny(_)))
+        .collect()
+}
+
 /// Ask the engine about one notification, and fail closed: an engine that
 /// panics drops the notification. The document it was handed may already be
 /// half-edited, and the broker cannot know which half — so it is not sent.
@@ -1854,5 +1893,174 @@ mod tests {
         let user = json!({"id": "urn:x", "type": [iri("User")]});
         assert!(f.admits_write(&user, &[iri("name").as_str()], &ctx));
         assert!(!f.admits_write(&user, &[iri("status").as_str()], &ctx));
+    }
+
+    /// T-3552 (mutants run 38081990103): the image of a stored Entity names
+    /// its Attributes, never what frames, dates or annotates it.
+    #[test]
+    fn a_stored_image_names_attributes_only() {
+        let doc = json!({"id": "urn:ngsi-ld:Car:1", "type": [iri("Car")], "scope": ["/a"],
+                         "createdAt": "t", "modifiedAt": "t", "deletedAt": "t",
+                         "@context": [], "__tenant": "acme",
+                         (iri("speed")): [{"type": "Property", "value": 1}]});
+        let image = StoredImage::of(&doc);
+        assert_eq!(image.types, vec![iri("Car")]);
+        assert_eq!(image.scope, vec!["/a".to_owned()]);
+        assert_eq!(image.attribute_names, vec![iri("speed")]);
+    }
+
+    #[test]
+    fn mapping_the_names_maps_both_sets() {
+        let shown = Shown {
+            only: Some(std::collections::BTreeSet::from(["a".to_owned()])),
+            omitted: std::collections::BTreeSet::from(["b".to_owned()]),
+        };
+        let mapped = shown.map_names(str::to_uppercase);
+        assert_eq!(
+            mapped.only,
+            Some(std::collections::BTreeSet::from(["A".to_owned()]))
+        );
+        assert_eq!(
+            mapped.omitted,
+            std::collections::BTreeSet::from(["B".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_filter_says_its_areas_its_rules_and_its_restriction() {
+        let both = Filter {
+            geo_q: Some(zone_a()),
+            geo_also: vec![*zone_a()],
+            ..Filter::default()
+        };
+        assert_eq!(both.areas().count(), 2);
+        let also = Filter {
+            geo_also: vec![*zone_a()],
+            ..Filter::default()
+        };
+        assert_eq!(also.areas().count(), 1);
+        assert!(!also.is_empty());
+
+        assert!(!Filter::default().has_rules());
+        assert!(zones().has_rules(), "rules alone");
+        let omits = Filter {
+            omit_by_type: BTreeMap::from([(iri("User"), vec![iri("status")])]),
+            ..Filter::default()
+        };
+        assert!(omits.has_rules(), "per-type omits alone");
+
+        let mut headers = HeaderMap::new();
+        Filter::default().mark_restricted(&mut headers);
+        assert!(headers.get(RESTRICTED_HEADER).is_none());
+        Filter {
+            restricted: true,
+            ..Filter::default()
+        }
+        .mark_restricted(&mut headers);
+        assert_eq!(
+            headers.get(RESTRICTED_HEADER).and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn only_a_pick_or_an_omit_hides_a_term() {
+        let speed = iri("speed");
+        assert!(!Filter::default().hides("speed", &speed));
+        let pick = Filter {
+            pick: vec!["status".into()],
+            ..Filter::default()
+        };
+        assert!(pick.hides("speed", &speed));
+        assert!(!pick.hides("status", &iri("status")));
+        let omit = Filter {
+            omit: vec!["speed".into()],
+            ..Filter::default()
+        };
+        assert!(omit.hides("speed", &speed));
+    }
+
+    /// Refuses upserts, allows the rest; `short` answers one decision
+    /// fewer than it was asked for.
+    struct Batch {
+        short: bool,
+    }
+
+    impl PolicyEngine for Batch {
+        fn name(&self) -> &str {
+            "batch"
+        }
+        fn decide<'a>(&'a self, _s: &'a Subject, o: &'a Operation<'a>) -> DecisionFuture<'a> {
+            Box::pin(std::future::ready(if o.clause == "5.6.8" {
+                Decision::Deny("no upserts".into())
+            } else {
+                Decision::Allow
+            }))
+        }
+        fn decide_each<'a>(
+            &'a self,
+            s: &'a Subject,
+            ops: &'a [Operation<'a>],
+        ) -> DecisionsFuture<'a> {
+            Box::pin(async move {
+                let mut out = Vec::new();
+                for op in ops {
+                    out.push(self.decide(s, op).await);
+                }
+                if self.short {
+                    out.pop();
+                }
+                out
+            })
+        }
+        fn pre_notify(&self, _s: &Subject, _sub: &Value, _n: &mut Value) -> NotifyDecision {
+            NotifyDecision::Deliver
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_answered_member_by_member_and_a_short_answer_denies_all() {
+        let ops = [Operation::new("5.6.7"), Operation::new("5.6.8")];
+        let each = decide_each(&Batch { short: false }, &subject(), &ops).await;
+        assert_eq!(
+            each,
+            vec![Decision::Allow, Decision::Deny("no upserts".into())]
+        );
+        let short = decide_each(&Batch { short: true }, &subject(), &ops).await;
+        assert_eq!(short, vec![Decision::Deny(ENGINE_FAILED.to_owned()); 2]);
+        let gated = gate_each(
+            &Batch { short: false },
+            &antares_model::TenantId::default(),
+            &HeaderMap::new(),
+            &ops,
+        )
+        .await;
+        assert_eq!(gated, vec![None, Some("no upserts".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn the_pre_image_joins_stored_and_written_types_once_each() {
+        let tenant = antares_model::TenantId::default();
+        let id = "urn:ngsi-ld:Car:pre";
+        let stored = json!({"id": id, "type": [iri("Car")],
+                            (iri("speed")): [{"type": "Property", "value": 1}]});
+        let body = json!({"type": [iri("Car"), iri("Vehicle")]});
+        let bare = crate::state::AppState::new("pre-image".into());
+        bare.store
+            .create(&tenant, antares_store::Kind::Entity, id, stored)
+            .await
+            .expect("create");
+        let none = pre_image(&bare, &tenant, id, Some(&body)).await;
+        assert!(
+            none.types.is_empty() && none.stored.is_none(),
+            "no engine, no read"
+        );
+        let st = bare.with_policy(std::sync::Arc::new(AllowAll));
+        let image = pre_image(&st, &tenant, id, Some(&body)).await;
+        assert_eq!(image.types, vec![iri("Car"), iri("Vehicle")]);
+        assert_eq!(
+            image.stored.map(|s| s.attribute_names),
+            Some(vec![iri("speed")])
+        );
     }
 }
