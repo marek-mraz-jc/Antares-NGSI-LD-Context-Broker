@@ -151,6 +151,13 @@ Integration tests that need services are env-gated and skip loudly:
   week and on `v*` tags.
 - `cargo fmt` on touched crates; clippy is a CI wall
   (`unwrap_used`/`expect_used` denied outside tests, `unsafe_code` forbidden).
+- **Each feature alone.** A cargo feature has to build, lint and test with
+  no other feature on: the `Each feature alone` jobs of `workspace.yml` run
+  `cargo hack --each-feature` (one per feature-carrying crate) and are
+  required checks. A new feature is
+  covered by declaring it in its crate's `[features]`; only a debugging
+  hook that cannot build in CI (today `console`) is excluded there, with the
+  reason beside it.
 - Naming comes from the spec: types verbatim from CIM 009 §5.2, one public
   fn per spec operation; `Manager`/`Service`/`Util`/`Helper` are banned
   suffixes.

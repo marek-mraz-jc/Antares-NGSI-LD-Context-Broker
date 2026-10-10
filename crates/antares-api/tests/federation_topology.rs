@@ -339,13 +339,13 @@ async fn tenantless_registration_targets_the_peer_default_tenant() {
 /// the CSourceRegistration, it shall not be part of contextSourceInfo", and
 /// 6.3.19: "Headers derived from other elements of the CSourceRegistration,
 /// e.g. NGSILD-Tenant, take precedence and cannot be overridden using
-/// contextSourceInfo." The key is a valid RFC 7230 header name, so the
-/// registration is accepted at the door and the forward is the only place
-/// left to ignore it. A broker that passed it through would hand anyone who
-/// may create a registration every tenant of the source: the source answers
+/// contextSourceInfo." TS 104 175 9.5.1 makes the first sentence a refusal
+/// (T-3485): the registration is a 400 at the door, so no forward ever names
+/// the tenant. A broker that passed it through would hand anyone who may
+/// create a registration every tenant of the source: the source answers
 /// whichever tenant the header names. The pair is spelled in lower case
 /// because a header name is case-insensitive (RFC 7230 clause 3.2) and a
-/// skip list that matched only the canonical spelling would be no list.
+/// check that matched only the canonical spelling would be no check.
 #[tokio::test(flavor = "multi_thread")]
 async fn context_source_info_cannot_name_the_tenant_the_forward_targets() {
     allow_private();
@@ -396,15 +396,6 @@ async fn context_source_info_cannot_name_the_tenant_the_forward_targets() {
     )
     .body(Body::from(doc))
     .expect("request");
-    assert_eq!(send(&hub, req).await.status(), StatusCode::CREATED);
-
-    let ids = query_ids(&hub, Some("town-a")).await;
-    assert!(
-        !ids.contains(&HIDDEN.to_owned()),
-        "contextSourceInfo re-tenanted the forward and read the peer's town-b, got {ids:?}"
-    );
-    assert!(
-        ids.contains(&ENTITY.to_owned()),
-        "the forward must still reach the peer's default tenant, got {ids:?}"
-    );
+    // refused at the door: no registration, so no forward ever names town-b
+    assert_eq!(send(&hub, req).await.status(), StatusCode::BAD_REQUEST);
 }

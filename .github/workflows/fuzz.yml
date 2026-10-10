@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [parse_q, scope_q, geo_params, expand_entity, q_to_sql]
+        target: [parse_q, scope_q, geo_params, expand_entity, q_to_sql, type_selection, projection, representation, join, temporal, order_by, link_header, tenant_header, accept_header, id_pattern, datetime]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -34,7 +34,9 @@ jobs:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Fuzz ${{ matrix.target }}
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
+        # bounded allocation is part of the property (T-3463): one allocation
+        # past 512 MB, or a process past 2 GB, is a finding like a panic
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300 -malloc_limit_mb=512 -rss_limit_mb=2048
       - name: A crash leaves its input behind
         # `cargo fuzz run` builds and runs under one command, so a target that
         # fails to compile exits exactly like one that crashed. Only a crash

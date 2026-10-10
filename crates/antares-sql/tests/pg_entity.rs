@@ -2,6 +2,10 @@
 //! PgEntityStore integration, including the concurrency guarantees.
 //! Skips loudly without ANTARES_TEST_DATABASE_URL (see tests/pg.rs recipe).
 
+// Every test here talks to the Postgres store, which only exists with the
+// `postgres` feature; without it the file builds to nothing (T-3465).
+#![cfg(feature = "postgres")]
+
 use antares_model::TenantId;
 use antares_sql::store::pg;
 use antares_sql::store::pg::entity::PgEntityStore;

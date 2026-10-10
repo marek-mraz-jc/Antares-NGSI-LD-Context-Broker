@@ -14,7 +14,8 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 serde_json = "1"
 antares-ql = { path = "../crates/antares-ql" }
-antares-api = { path = "../crates/antares-api", default-features = false }
+antares-api = { path = "../crates/antares-api", default-features = false, features = ["fuzzing"] }
+antares-model = { path = "../crates/antares-model" }
 antares-jsonld = { path = "../crates/antares-jsonld" }
 # q_to_sql: the SQL compilers alone; the Postgres store is not linked.
 antares-sql = { path = "../crates/antares-sql", default-features = false }
@@ -50,6 +51,83 @@ bench = false
 [[bin]]
 name = "q_to_sql"
 path = "fuzz_targets/q_to_sql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "type_selection"
+path = "fuzz_targets/type_selection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "projection"
+path = "fuzz_targets/projection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "representation"
+path = "fuzz_targets/representation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "join"
+path = "fuzz_targets/join.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "temporal"
+path = "fuzz_targets/temporal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "order_by"
+path = "fuzz_targets/order_by.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "link_header"
+path = "fuzz_targets/link_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tenant_header"
+path = "fuzz_targets/tenant_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "accept_header"
+path = "fuzz_targets/accept_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "id_pattern"
+path = "fuzz_targets/id_pattern.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "datetime"
+path = "fuzz_targets/datetime.rs"
 test = false
 doc = false
 bench = false

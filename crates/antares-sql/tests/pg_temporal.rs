@@ -2,6 +2,10 @@
 //! PgTemporalStore integration (the temporal bridge). Skips
 //! loudly without ANTARES_TEST_DATABASE_URL (see tests/pg.rs recipe).
 
+// Every test here talks to the Postgres store, which only exists with the
+// `postgres` feature; without it the file builds to nothing (T-3465).
+#![cfg(feature = "postgres")]
+
 use antares_model::TenantId;
 use antares_sql::store::pg;
 use antares_sql::store::pg::temporal::PgTemporalStore;
@@ -1014,7 +1018,7 @@ async fn a_temporal_query_never_reads_another_tenants_history() {
         ids: Some(&[geo_id]),
         range: Some(window()),
         timeproperty: "observedAt",
-        geo: Some((&spec, location)),
+        geo: &[(spec.clone(), location.to_owned())],
         expand: &expand,
         ..TemporalFilter::default()
     };
@@ -1110,7 +1114,7 @@ async fn a_comma_seconds_fraction_survives_the_geo_prefilter() {
                 timeproperty: "observedAt",
             }),
             timeproperty: "observedAt",
-            geo: Some((&spec, location)),
+            geo: &[(spec.clone(), location.to_owned())],
             expand: &expand,
             ..TemporalFilter::default()
         };

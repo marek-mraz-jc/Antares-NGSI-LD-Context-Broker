@@ -548,7 +548,7 @@ pub fn valid_scope_value(s: &str) -> bool {
 /// (the spec's prefix:name production) and is outside the term grammar.
 // Known ceiling: colon-keys are exempt wholesale — a malformed "pre fix:x" slips
 // through as an IRI; tighten to per-part validation if it ever matters.
-pub(crate) fn valid_name(s: &str) -> bool {
+pub fn valid_name(s: &str) -> bool {
     if s.contains(':') {
         return true;
     }

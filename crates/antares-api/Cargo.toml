@@ -69,6 +69,10 @@ postgres = ["test-kit", "antares-sql/postgres"]
 # sonic-rs on the batch-ingest hot path (x86_64/aarch64); serde_json is
 # always the compiled fallback.
 sonic = ["dep:sonic-rs"]
+# `antares_api::fuzzing`: the request parsers, reachable by the fuzz targets
+# under fuzz/ (T-3463). Adds no dependency and no route; no broker build
+# turns it on.
+fuzzing = []
 
 [dev-dependencies]
 # the storage seams are object-safe AND asynchronous: a test double

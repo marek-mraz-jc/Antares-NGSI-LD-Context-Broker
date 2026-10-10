@@ -1213,7 +1213,14 @@ pub async fn filter_entities_paged(
         None => None,
     };
     let scope_q = params.get("scopeQ");
-    let geo = antares_ql::geo::GeoQuery::from_params(params)?;
+    // The request's own geoquery (7.2.5 allows one) and the narrowing's
+    // area: every one must hold (ADR-0023 rule 1), so a caller's area
+    // cannot widen the policy's.
+    let own_geo = antares_ql::geo::GeoQuery::from_params(params)?;
+    let policy_geo = narrow
+        .and_then(|r| r.policy_reach.as_deref())
+        .and_then(|reach| reach.geo_q.as_deref());
+    let geos: Vec<&antares_ql::geo::GeoQuery> = own_geo.iter().chain(policy_geo).collect();
 
     // Hand the store what it can filter on. A backend that can push
     // the predicate down (postgres/timescale) returns fewer rows — and says
@@ -1222,13 +1229,14 @@ pub async fn filter_entities_paged(
     // skip re-deciding. A backend that cannot (memory/file) returns the
     // snapshot and the loop stays the arbiter.
     let expand = |t: &str| ctx.expand_key(t);
-    let geo_spec = geo.as_ref().and_then(|g| g.to_sql_spec(ctx));
+    let geo_specs: Vec<_> = geos.iter().filter_map(|g| g.to_sql_spec(ctx)).collect();
     // A geo query whose spec declined to compile (non-default geoproperty) is
     // INVISIBLE to the store — the store would truthfully claim `decided`
     // about what it saw, projection would strip the very member the evaluator
     // still needs, and a pushed page would page over the wrong set. Forfeit
-    // every pushdown up front and mask `decided` after.
-    let geo_uncompiled = geo.is_some() && geo_spec.is_none();
+    // every pushdown up front and mask `decided` after. The specs that did
+    // compile still narrow the rows.
+    let geo_uncompiled = geo_specs.len() < geos.len();
     let page = if geo_uncompiled { None } else { page };
     let proj = proj.filter(|_| !geo_uncompiled);
     // pick (or attrs) heads to keep / whole-attr omit heads to drop; core
@@ -1285,7 +1293,7 @@ pub async fn filter_entities_paged(
                 } else {
                     scope_q.map(String::as_str)
                 },
-                geo: if split_agg { None } else { geo_spec.as_ref() },
+                geo: if split_agg { &[] } else { &geo_specs },
                 expand: &expand,
                 page: page.map(|(offset, limit)| antares_store::filter::Page {
                     offset: offset as i64,
@@ -1359,10 +1367,8 @@ pub async fn filter_entities_paged(
                     continue;
                 }
             }
-            if let Some(g) = &geo {
-                if !g.matches(&doc, ctx) {
-                    continue;
-                }
+            if !geos.iter().all(|g| g.matches(&doc, ctx)) {
+                continue;
             }
         }
         out.push(doc);

@@ -24,8 +24,8 @@ broker running in your browser, yes in the browser 😅
 - **Small.** About 35 MiB average RSS while the complete ETSI suite runs,
   about 9 MiB idle. The whole store ladder fits where a JVM heap alone
   would not.
-- **Conformant.** 1822/1822 ETSI CIM 009 V1.9.1 test cases green in every
-  native store mode, and 1810/1810 in the browser build, where the MQTT
+- **Conformant.** 1823/1823 ETSI CIM 009 V1.9.1 test cases green in every
+  native store mode, and 1811/1811 in the browser build, where the MQTT
   cases have no socket to run against
   ([per-store report with Robot drill-down](https://antaresbroker.joinedcontext.com/reports/latest/)).
   The ledger covers the whole spec text, one file per clause, in `docs/spec/`.
