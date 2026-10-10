@@ -105,6 +105,24 @@ async fn send(app: &Router, req: Request<Body>) -> (StatusCode, serde_json::Valu
     )
 }
 
+/// Rule M4 keeps every surface closed until a view loads: one over Cars.
+async fn open(app: &Router) {
+    let doc = r#"{"id":"cars","tenant":"good","selector":["Car"],
+        "rules":[{"types":["Car"],"attributes":["colour"]}],
+        "operations":["retrieve_entity","query_entities"]}"#;
+    let Ok(resp) = app
+        .clone()
+        .oneshot(
+            Request::put("/q/views/cars")
+                .header("Content-Type", "application/json")
+                .header("Content-Length", doc.len())
+                .body(Body::from(doc))
+                .unwrap_or_default(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "the view loads");
+}
+
 fn create(tenant: &str, colour: &str) -> Result<Request<Body>, axum::http::Error> {
     let body = format!(
         r#"{{"id":"urn:ngsi-ld:Car:1","type":"Car","colour":{{"type":"Property","value":"{colour}"}}}}"#
@@ -122,8 +140,12 @@ async fn a_surface_cannot_set_tenant_snapshot_or_subject() {
     // Before anything reads the list: the broker carries `x-subject` to the engine.
     std::env::set_var("ANTARES_POLICY_SUBJECT_HEADERS", "x-subject");
     let witness = Arc::new(Witness::default());
-    let broker = TestBroker::new().await.with_policy(witness.clone());
+    let broker = TestBroker::new()
+        .await
+        .expect("broker")
+        .with_policy(witness.clone());
     let app = broker.serve(Forger).expect("mounts");
+    open(&app).await;
 
     for (tenant, colour) in [("good", "green"), ("evil", "black")] {
         let (s, b) = send(&app, create(tenant, colour).expect("request")).await;

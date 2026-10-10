@@ -96,7 +96,7 @@ fn now_stamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-const ALL_KINDS: [Kind; 9] = [
+const ALL_KINDS: [Kind; 10] = [
     Kind::Entity,
     Kind::Subscription,
     Kind::Registration,
@@ -106,6 +106,7 @@ const ALL_KINDS: [Kind; 9] = [
     Kind::EntityMap,
     Kind::DistSub,
     Kind::DeadLetter,
+    Kind::View,
 ];
 
 /// Run `f` off the tokio worker pool when called from a multi-thread runtime:
@@ -171,6 +172,7 @@ struct Inner {
     entity_map_docs: HashMap<String, BTreeMap<String, Value>>,
     dist_subs: HashMap<String, BTreeMap<String, Value>>,
     dead_letters: HashMap<String, BTreeMap<String, Value>>,
+    views: HashMap<String, BTreeMap<String, Value>>,
     /// tenant → entity id → temporal doc (attr IRI → instance array).
     temporal: HashMap<String, BTreeMap<String, Value>>,
     /// hosted/cached @context documents, shared across tenants by design.
@@ -265,6 +267,7 @@ impl Store {
                 Kind::EntityMap => &mut inner.entity_map_docs,
                 Kind::DistSub => &mut inner.dist_subs,
                 Kind::DeadLetter => &mut inner.dead_letters,
+                Kind::View => &mut inner.views,
             };
             for row in ::redb::ReadableTable::iter(&table).map_err(|e| e.to_string())? {
                 let (k, v) = row.map_err(|e| e.to_string())?;
@@ -593,6 +596,7 @@ impl Store {
             Kind::EntityMap => &inner.entity_map_docs,
             Kind::DistSub => &inner.dist_subs,
             Kind::DeadLetter => &inner.dead_letters,
+            Kind::View => &inner.views,
         }
     }
 
@@ -607,6 +611,7 @@ impl Store {
             Kind::EntityMap => &mut inner.entity_map_docs,
             Kind::DistSub => &mut inner.dist_subs,
             Kind::DeadLetter => &mut inner.dead_letters,
+            Kind::View => &mut inner.views,
         }
     }
 

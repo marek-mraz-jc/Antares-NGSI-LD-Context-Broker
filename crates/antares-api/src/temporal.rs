@@ -1680,6 +1680,49 @@ fn type_and_attrs_match(
     true
 }
 
+/// ADR-0023 rule 8, for every narrowing: a history is served while the
+/// narrowing's own predicates (its `q`, `scopeQ` and areas) hold for the
+/// Entity as it is now, so an Entity that left the narrowing takes its
+/// history with it. Its rules' conditions are not read here: rule 11 reads
+/// them per instance. An Entity held only temporally (11.2.2) has no state
+/// now, and its history `held` is the only state it has: the predicates
+/// hold when some instance satisfies them, as the query's window check
+/// reads them; `held` absent leaves that to the caller's own check.
+async fn member_now(
+    st: &AppState,
+    tenant: &TenantId,
+    ctx: &Context,
+    filter: &crate::policy::Filter,
+    id: &str,
+    held: Option<&Value>,
+) -> ApiResult<bool> {
+    let Some(reach) = crate::repr::narrowing(filter).policy_reach else {
+        return Ok(true);
+    };
+    if reach.q.is_none() && reach.scope_q.is_none() && reach.areas.is_empty() {
+        return Ok(true);
+    }
+    let reach = crate::repr::PolicyReach {
+        rules: None,
+        ..(*reach).clone()
+    };
+    match st
+        .store
+        .get(tenant, antares_store::Kind::Entity, id)
+        .await?
+    {
+        Some(doc) => Ok(crate::repr::policy_admits(st, tenant, ctx, Some(&reach), &doc).await),
+        None => Ok(held.is_none_or(|h| {
+            let areas: Vec<&antares_ql::geo::GeoQuery> = reach.areas.iter().collect();
+            window_conditions_match(h, None, reach.q.as_ref(), &areas, ctx)
+                && reach
+                    .scope_q
+                    .as_deref()
+                    .is_none_or(|sq| scope_window_retain(&mut h.clone(), sq, None, "observedAt"))
+        })),
+    }
+}
+
 /// 5.7.4.4 S2/S3: the values filter and the geoquery are judged on the
 /// Attribute instances WITHIN the temporal-query interval, so an
 /// out-of-window instance must not satisfy either.
@@ -2115,6 +2158,11 @@ pub(crate) async fn query_temporal_collected(
             .q_pushdown_exact(ast, r.as_ref(), &|t| ctx.expand_key(t))
     });
     let (p_offset, p_limit, _) = crate::paging::page_params(st, params)?;
+    // rule 8 drops Entities after the store answered, so the store may not
+    // page under a narrowing that reads the state now (`ponytail:` one read
+    // per Entity; push it into the store query when it shows up)
+    let narrowed_now =
+        filter.q.is_some() || filter.scope_q.is_some() || filter.areas().next().is_some();
     // 5.7.4.4 + 5.5.9: pagination applies to the MERGED federated union, so
     // the store may only pre-page when nothing will federate — otherwise
     // page 1 is local-page + every remote row (matrix-9 IOP_EXT_TMP_03_04).
@@ -2125,6 +2173,7 @@ pub(crate) async fn query_temporal_collected(
         && params.get("datasetId").is_none()
         && params.get("pick").is_none()
         && p_limit > 0
+        && !narrowed_now
         && !crate::federation::would_federate(st, &tenant, &ctx, params, headers).await?;
     // 4.5.19 computed by the store: the numeric bucket matrix per attribute
     // comes back aggregated when nothing after the store call could change
@@ -2316,6 +2365,16 @@ pub(crate) async fn query_temporal_collected(
         });
         if !any_instance {
             continue;
+        }
+        if narrowed_now {
+            let id = doc
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if !member_now(st, &tenant, &ctx, filter, &id, None).await? {
+                continue;
+            }
         }
         matches.push(doc);
     }
@@ -2584,6 +2643,13 @@ async fn retrieve_temporal_inner(
                 NgsiError::ResourceNotFound(format!("temporal entity {id} not found"))
             })?
         };
+        // ADR-0020, ADR-0023 rules 3 and 8: an Entity outside the
+        // narrowing now is the 404 of an absent one
+        if !member_now(st, &tenant, &ctx, &filter, id, Some(&doc)).await? {
+            return Err(
+                NgsiError::ResourceNotFound(format!("temporal entity {id} not found")).into(),
+            );
+        }
         // ADR-0023 rule 11: the history its rules show, before anything
         // reads it; no rule for its types is the 404 of an absent Entity
         let doc = match types_rule.as_deref() {

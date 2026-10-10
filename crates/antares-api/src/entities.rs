@@ -2528,10 +2528,17 @@ async fn retrieve_attr_inner(
         .get(&tenant, Kind::Entity, id)
         .await?
         .ok_or_else(|| NgsiError::ResourceNotFound(format!("entity {id} not found")))?;
+    // ADR-0020, ADR-0023 rule 3: the Attribute of an Entity outside the
+    // narrowing is the Attribute of an absent one, as Retrieve Entity
+    // answers it, whatever the Attribute's own visibility.
+    if !crate::repr::policy_admits(st, &tenant, &ctx, repr.policy_reach.as_deref(), &doc).await {
+        return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
+    }
     let attr_iri = antares_jsonld::expand_attr_name(attr, &ctx)?;
-    let node = doc.get(&attr_iri).ok_or_else(|| {
-        NgsiError::ResourceNotFound(format!("entity {id} has no attribute {attr}"))
-    })?;
+    // One answer for an Attribute the Entity lacks and one the narrowing
+    // hides (ADR-0023 rule 2).
+    let lacks = || NgsiError::ResourceNotFound(format!("entity {id} has no attribute {attr}"));
+    let node = doc.get(&attr_iri).ok_or_else(lacks)?;
     // Compact through the entity pipeline so the attribute serializes exactly
     // as it would inside a full retrieve.
     let mini = serde_json::json!({
@@ -2542,10 +2549,7 @@ async fn retrieve_attr_inner(
     let shaped = crate::repr::apply(&mini, &repr);
     let compacted = compact_for(&repr, &shaped, &ctx);
     let key = ctx.compact_iri(&attr_iri);
-    let member = compacted
-        .get(&key)
-        .cloned()
-        .ok_or_else(|| NgsiError::ResourceNotFound(format!("attribute {attr} not present")))?;
+    let member = compacted.get(&key).cloned().ok_or_else(lacks)?;
     let body = if value_only {
         // #15: the bare value — value / object / languageMap, whichever the
         // attribute type carries; multi-instance attributes yield an array.
