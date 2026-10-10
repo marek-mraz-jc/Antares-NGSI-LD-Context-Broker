@@ -404,6 +404,18 @@ impl OperationId {
         }
     }
 
+    /// The operation whose matrix row id is `id`.
+    ///
+    /// ```
+    /// use antares_ops::OperationId;
+    /// assert_eq!(OperationId::from_id("query_entities"), Some(OperationId::QueryEntities));
+    /// assert_eq!(OperationId::from_id("drop_tables"), None);
+    /// ```
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|op| op.id() == id)
+    }
+
     /// The operation a request is, when it is one a surface may run: the
     /// method and path match the binding, every segment in braces standing
     /// for one non-empty segment, and a binding with a query (`?details=true`)

@@ -39,6 +39,7 @@ antares-api = { path = "crates/antares-api", default-features = false }
 antares-matcher = { path = "crates/antares-matcher" }
 antares-notifier = { path = "crates/antares-notifier", default-features = false }
 antares-plugin-example = { path = "examples/plugin-example" }
+antares-ops = { path = "crates/antares-ops" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 # The storage driver seams are object-safe AND asynchronous, which no

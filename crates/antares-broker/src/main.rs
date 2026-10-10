@@ -26,6 +26,10 @@ const KNOWN_KEYS: &[&str] = &[
     // other key it has no code for.
     #[cfg(feature = "plugin-example")]
     antares_plugin_example::RULES_ENV,
+    // How often every pod reloads the view table from the store (ADR-0023
+    // rule 10); only a build with views has one.
+    #[cfg(feature = "views")]
+    antares_ops::views::RELOAD_ENV,
     "ANTARES_DATABASE_URL",
     "ANTARES_STORE",
     // Temporal driver: a store mode, or `none` — history off (temporal
@@ -862,6 +866,12 @@ async fn run(
     // default mounting put there, before the state is shared.
     let selected = api_surfaces(std::env::var("ANTARES_API_SURFACES").ok().as_deref())?;
     state = state.with_surfaces(selected.iter().map(|(_, build)| build()).collect())?;
+    // Endpoint views (ADR-0023 rule 10): the stored views loaded into the
+    // table every surface that serves through views opens on, `/q/views`
+    // on the admin surface, and the reload that keeps every pod's table
+    // within one interval of the store.
+    #[cfg(feature = "views")]
+    antares_ops::views::install(&state).await?;
     // The policy engine, from configuration and from the shelf this binary
     // was built with. Without one the broker asks `allow-all` and behaves
     // exactly as it did before the seam existed.

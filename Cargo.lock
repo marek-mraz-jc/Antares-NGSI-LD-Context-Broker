@@ -88,6 +88,7 @@ dependencies = [
  "antares-bus",
  "antares-jsonld",
  "antares-model",
+ "antares-ops",
  "antares-plugin-example",
  "antares-sql",
  "antares-store",
@@ -184,9 +185,14 @@ name = "antares-ops"
 version = "0.1.3"
 dependencies = [
  "antares-api",
+ "antares-jsonld",
+ "antares-model",
  "antares-ops",
+ "antares-ql",
  "axum",
  "http-body-util",
+ "proptest",
+ "serde",
  "serde_json",
  "tokio",
  "tower",

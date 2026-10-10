@@ -49,6 +49,7 @@ tracing-opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
 console-subscriber = { workspace = true, optional = true }
 antares-plugin-example = { workspace = true, optional = true }
+antares-ops = { workspace = true, optional = true }
 
 [features]
 # tokio-console in dev — build with RUSTFLAGS="--cfg tokio_unstable"
@@ -68,6 +69,11 @@ mqtt = ["antares-api/mqtt"]
 # and a non-network notification binding, none of which belong in a release
 # image. It exists so the seams are proven from outside, not documented.
 plugin-example = ["dep:antares-plugin-example"]
+# Endpoint views (ADR-0023): the view table, `/q/views` on the admin surface
+# and its reload. Off by default: a vanilla broker links no ops crate (rule
+# M3), and the surfaces that serve through views each bring their own
+# feature on top of this one.
+views = ["dep:antares-ops"]
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
 # Unix-only: the wasm target keeps the default allocator.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]

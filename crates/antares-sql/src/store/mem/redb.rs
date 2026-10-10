@@ -34,6 +34,7 @@ pub(super) const T_ENTITY_MAP_DOCS: TableDefinition<&[u8], &[u8]> =
 pub(super) const T_DIST_SUBS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dist_subs");
 pub(super) const T_DEAD_LETTERS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("dead_letters");
+pub(super) const T_VIEWS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("views");
 pub(super) const T_META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 /// On-disk format version: bump on any key/value shape change; an older
 /// or newer file refuses to load rather than being misread as valid data.
@@ -50,6 +51,7 @@ pub(super) fn table_for(kind: Kind) -> TableDefinition<'static, &'static [u8], &
         Kind::EntityMap => T_ENTITY_MAP_DOCS,
         Kind::DistSub => T_DIST_SUBS,
         Kind::DeadLetter => T_DEAD_LETTERS,
+        Kind::View => T_VIEWS,
     }
 }
 

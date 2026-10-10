@@ -33,10 +33,12 @@ def mangled(path: str) -> str:
     return "".join(f"{len(seg)}{seg}" for seg in path.split("::"))
 
 
-def uncovered_in(functions: list[dict]) -> tuple[int, int]:
-    """Uncovered lines and branch sides of one function across all its records: each test binary
-    carries its own instance (and closures their own), so a line or a branch side is covered when
-    any instance covered it."""
+def merged(functions: list[dict]) -> dict[str, tuple[int, int]]:
+    """`{"lines": (count, uncovered), "branches": (sides, uncovered)}` of functions across all their
+    records: each test binary carries its own instance of a function (and of every generic or
+    closure in it), so a line or a branch side is covered when any instance covered it. llvm's
+    per-file summary does not merge that way (a line of a generic one instance missed counts as
+    missed), so the totals are computed here, the same way as each exclusion's counts."""
     hit, missed, sides = set(), set(), {}
     for function in functions:
         for region in function.get("regions", []):
@@ -48,7 +50,16 @@ def uncovered_in(functions: list[dict]) -> tuple[int, int]:
             seen = sides.setdefault(tuple(b[:4]), [False, False])
             seen[0] |= b[4] > 0
             seen[1] |= b[5] > 0
-    return len(missed - hit), sum((not t) + (not f) for t, f in sides.values())
+    return {
+        "lines": (len(hit | missed), len(missed - hit)),
+        "branches": (2 * len(sides), sum((not t) + (not f) for t, f in sides.values())),
+    }
+
+
+def uncovered_in(functions: list[dict]) -> tuple[int, int]:
+    """Uncovered lines and branch sides of one function across all its records."""
+    m = merged(functions)
+    return m["lines"][1], m["branches"][1]
 
 
 def check(crate: str, crate_dir: str, report: dict, entries: list[dict]) -> list[str]:
@@ -58,12 +69,13 @@ def check(crate: str, crate_dir: str, report: dict, entries: list[dict]) -> list
     files = [f for f in data.get("files", []) if f["filename"].startswith(prefix)]
     if not files:
         return [f"{crate}: the report has no file under {prefix}"]
+    functions = [fn for fn in data.get("functions", []) if any(n.startswith(prefix) for n in fn.get("filenames", []))]
     totals = {k: [0, 0] for k in ("lines", "branches")}
     for f in files:
-        for k in totals:
-            totals[k][0] += f["summary"][k]["count"]
-            totals[k][1] += f["summary"][k]["covered"]
-    functions = [fn for fn in data.get("functions", []) if any(n.startswith(prefix) for n in fn.get("filenames", []))]
+        per_file = merged([fn for fn in functions if fn["filenames"][0] == f["filename"]])
+        for k, (count, uncovered) in per_file.items():
+            totals[k][0] += count
+            totals[k][1] += count - uncovered
 
     errors = []
     listed = {"lines": 0, "branches": 0}

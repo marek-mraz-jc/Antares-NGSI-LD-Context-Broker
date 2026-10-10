@@ -45,12 +45,13 @@ broker nor a storage backend (`antares-api`, `antares-broker`,
 | `antares-jsonld` | 9 040 | `@context` loader with caches and pinned core contexts, expansion/compaction, structural validation, the one outbound `client_builder` | do business logic |
 | `antares-matcher` | 432 | subscription vs entity: selector, conditions, activity, throttling | touch a store |
 | `antares-store` | 3 000 | `CurrentStateDriver`, `TemporalDriver` (object-safe, `lib.rs:140`, `:385`), `Kind`, filters/paging (`filter.rs`) | pull a backend |
-| `antares-sql` | 9 400 | AST → SQL compiler (`compile/`), migrations, the sqlx drivers (`store/pg/`), the memory/redb drivers (`store/mem/`), `AnyStore` facade (`store/any.rs`) | be called from handlers directly (see §7) |
+| `antares-sql` | 10 400 | AST → SQL compiler (`compile/`), migrations, the sqlx drivers (`store/pg/`), the memory/redb drivers (`store/mem/`), `AnyStore` facade (`store/any.rs`) | be called from handlers directly (see §7) |
 | `antares-bus` | 760 | `ChangeEvent`, the JetStream bus, subjects | decide who consumes |
 | `antares-notifier` | 1 700 | `NotificationSink` (schemes, `parse_endpoint`, `deliver`, `network`) chosen from `SinkRegistry` by endpoint scheme: http (`http.rs`), mqtt behind the feature, delivery policy, `Outbound` | match or store |
 | `antares-api` | 49 500 | the HTTP binding: routers, handlers, negotiation, federation, notification pipeline, snapshots, bounds | own a backend or a transport |
 | `antares-broker` | 3 800 | composition root: env → config, roles, bus wiring (`wiring.rs`), telemetry, shutdown | contain clause logic |
 | `antares-wasm` | 500 | the router under a Service Worker, OPFS-backed file store | diverge from the native router |
+| `antares-ops` | 1 600 | the operation layer every surface serves through (ADR-0027 section 1): `Ops` over `AppState::call`, `OperationId` (the matrix rows), `Refusal`, `Surface`; the view table (`views.rs`: `View`, load and validation, `/q/views`, reload, rule M4 closing a surface with no view) | be linked by a vanilla build, name the store, SQL, bus or notifier |
 
 ## 3. Module map of `antares-api/src`
 
@@ -89,7 +90,7 @@ module's header comment.
 | `policy.rs` | 1 570 | the policy seam (ADR-0020): `PolicyEngine`, `Subject`/`Operation`/`Decision`/`Filter` (per-rule allowlists, ADR-0023 rule 11), the built-in `AllowAll` engine, the clauses a narrowing can reach and the refusal everywhere else, the fail-closed calls that deny on a panic or a timeout, and the stored subject a notification is decided under |
 | `state.rs` | 1 050 | `AppState`: store, bus flag, mirror, HTTP clients, delivery policy, sinks, surfaces, hooks, and the endpoint view a state is narrowed to (feature `views`) |
 | `fuzzing.rs` | 84 | the request parsers the `fuzz/` targets drive, behind the `fuzzing` feature that no broker build enables (T-3463) |
-| `views.rs` | 640 | feature `views` (ADR-0023, ADR-0027 section 5): `CompiledView` and the composition `gate!` applies after the engine answers, effective = view ∧ engine, neither side widening; never in a vanilla build |
+| `views.rs` | 750 | feature `views` (ADR-0023, ADR-0027 section 5): `CompiledView` and the composition `gate!` applies after the engine answers, effective = view ∧ engine, neither side widening; the `ViewTable` a pod serves from and the `Kind::View` documents under `antares-views`; never in a vanilla build |
 
 Geoquery evaluation, the `q=` evaluator and the caches of compiled client
 query text are not in that table because they are not this crate's: they are
@@ -168,7 +169,8 @@ diff against. The maintenance pass frees stamped rows 24 hours on.
 `ANTARES_STORE=memory|file|postgres|timescale` (ADR-0004), one trait
 pair, one schema (`crates/antares-sql/migrations/`: `0001_init.sql`,
 `0002_dead_letters.sql`, `0003_comma_seconds_fraction.sql`,
-`0004_drop_entity_maps.sql`, `0005_service_escape_by_command.sql`).
+`0004_drop_entity_maps.sql`, `0005_service_escape_by_command.sql`,
+`0006_context_tenant.sql`, `0007_outbox_claim_check.sql`, `0008_views.sql`).
 
 - Tenancy: one shared schema, `tenant_id` on every row, Row-Level
   Security with `FORCE` on every tenant table (ADR-0001). RLS is a belt

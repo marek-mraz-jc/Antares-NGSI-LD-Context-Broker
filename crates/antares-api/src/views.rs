@@ -14,10 +14,14 @@
 //! view exactly as it is under a narrowing engine.
 //!
 //! Loading, validating and addressing views is `antares-ops`' (T-3496); this
-//! module only composes one.
+//! module composes one, and holds the table of the views a pod serves
+//! ([`ViewTable`]) with the store seam the loader writes through, so the
+//! operation layer never names the store (threat F1).
 
 use crate::policy::{resolve, Decision, Denied, Filter, Rule};
 use antares_ql::QNode;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// How many rules a composed narrowing may hold: the pairs of a view's
 /// rules and an engine's are the product of two bounded lists, and the
@@ -242,6 +246,117 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
         out.push(Rule::default());
     }
     Ok(out)
+}
+
+/// The reserved tenant the view documents live under (ADR-0012, ADR-0023
+/// rule 10). No client may name it, and no NGSI-LD route reads the
+/// document kind they are stored as.
+pub const VIEW_TENANT: &str = "antares-views";
+
+/// One view of the table.
+#[derive(Debug, Clone)]
+pub enum ViewEntry {
+    /// A view that loaded: its narrowing, and what `/q/health` says of it.
+    Loaded {
+        /// The narrowing every operation through the view is composed with.
+        view: Arc<CompiledView>,
+        /// The one Tenant it serves.
+        tenant: String,
+        /// The operations it allows, as `operation-matrix.yaml` ids.
+        operations: Vec<String>,
+        /// What the loader found worth an operator's eye: a rule whose
+        /// condition reads an Attribute it does not show (ADR-0023 rule
+        /// 11), a temporal view keyed on a mutable member (rule 8).
+        notes: Vec<String>,
+    },
+    /// A stored view that failed validation: never served, named in
+    /// `/q/health` with the reason.
+    Invalid {
+        /// Why it did not load.
+        reason: String,
+    },
+}
+
+/// The views this pod serves, swapped whole on every reload so a request
+/// sees one table or the next, never half of each (ADR-0023 rule 10). Empty
+/// until a view loads: no view means nothing served (rule M4).
+#[derive(Debug, Default)]
+pub struct ViewTable {
+    entries: std::sync::RwLock<Arc<BTreeMap<String, ViewEntry>>>,
+    admin: std::sync::OnceLock<axum::Router>,
+}
+
+impl ViewTable {
+    /// The table as it is now.
+    pub fn snapshot(&self) -> Arc<BTreeMap<String, ViewEntry>> {
+        self.entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace the whole table.
+    pub fn replace(&self, entries: BTreeMap<String, ViewEntry>) {
+        *self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(entries);
+    }
+
+    /// Whether at least one view loaded: a surface that serves through views
+    /// is closed until one has (rule M4).
+    pub fn any_loaded(&self) -> bool {
+        self.snapshot()
+            .values()
+            .any(|e| matches!(e, ViewEntry::Loaded { .. }))
+    }
+
+    /// What `/q/health` lists: each view, `loaded` with its tenant,
+    /// operations and notes, or `invalid` with the reason.
+    pub fn report(&self) -> serde_json::Value {
+        let views = self.snapshot();
+        serde_json::Value::Object(
+            views
+                .iter()
+                .map(|(id, e)| {
+                    let v = match e {
+                        ViewEntry::Loaded {
+                            tenant,
+                            operations,
+                            notes,
+                            ..
+                        } => serde_json::json!({
+                            "state": "loaded",
+                            "tenant": tenant,
+                            "operations": operations.len(),
+                            "notes": notes,
+                        }),
+                        ViewEntry::Invalid { reason } => {
+                            serde_json::json!({"state": "invalid", "reason": reason})
+                        }
+                    };
+                    (id.clone(), v)
+                })
+                .collect(),
+        )
+    }
+
+    /// The `/q/views` routes the loader serves, merged into the admin
+    /// surface and so relative to `/q` (`/views`, `/views/{id}`). Set once,
+    /// before the router is built.
+    ///
+    /// # Errors
+    /// When routes were set already.
+    pub fn set_admin(&self, routes: axum::Router) -> Result<(), String> {
+        self.admin
+            .set(routes)
+            .map_err(|_| "the /q/views routes are set already".to_owned())
+    }
+
+    /// The `/q/views` routes, if a loader set them.
+    pub fn admin(&self) -> Option<axum::Router> {
+        self.admin.get().cloned()
+    }
 }
 
 #[cfg(test)]

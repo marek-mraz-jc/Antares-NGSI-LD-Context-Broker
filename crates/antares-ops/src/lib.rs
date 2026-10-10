@@ -37,6 +37,7 @@
 
 mod error;
 mod operation;
+pub mod views;
 
 pub use error::{Refusal, INNER_DETAIL};
 pub use operation::OperationId;
@@ -258,26 +259,57 @@ pub trait Surface: Send + Sync + 'static {
 /// assert_eq!(mounted.name(), "empty");
 /// ```
 pub fn mount<S: Surface>(surface: S) -> Box<dyn antares_api::ApiSurface> {
-    Box::new(Mounted(surface))
+    Box::new(Mounted {
+        surface,
+        views: std::sync::OnceLock::new(),
+    })
 }
 
-struct Mounted<S>(S);
+/// A surface as the broker mounts it: closed, every route 404, while no
+/// view is loaded (rule M4), and reported so in `/q/health`.
+struct Mounted<S> {
+    surface: S,
+    /// The table of the state it was mounted on, for `version_info`.
+    views: std::sync::OnceLock<std::sync::Arc<antares_api::views::ViewTable>>,
+}
 
 impl<S: Surface> antares_api::ApiSurface for Mounted<S> {
     fn name(&self) -> &str {
-        self.0.name()
+        self.surface.name()
     }
 
     fn prefix(&self) -> &str {
-        self.0.prefix()
+        self.surface.prefix()
     }
 
     fn router(&self, st: AppState) -> Router<AppState> {
-        self.0.router(Ops { state: st }).with_state(())
+        let table = st.views.clone();
+        // The first state it is mounted on is the one /q/health reports.
+        let _ = self.views.set(table.clone());
+        self.surface
+            .router(Ops { state: st })
+            .layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let open = table.any_loaded();
+                    async move {
+                        if open {
+                            next.run(req).await
+                        } else {
+                            Refusal::Closed.ngsi_ld()
+                        }
+                    }
+                },
+            ))
+            .with_state(())
     }
 
     fn version_info(&self) -> serde_json::Value {
-        self.0.version_info()
+        let info = self.surface.version_info();
+        if self.views.get().is_some_and(|t| t.any_loaded()) {
+            serde_json::json!({"state": "open", "info": info})
+        } else {
+            serde_json::json!({"state": "closed", "reason": "no view is loaded", "info": info})
+        }
     }
 }
 
@@ -291,14 +323,33 @@ pub mod test_kit {
     /// test mounts, over one in-memory store.
     pub struct TestBroker {
         state: AppState,
+        reload: crate::views::Reload,
     }
 
     impl TestBroker {
-        /// A wired broker with no policy engine.
-        pub async fn new() -> Self {
+        /// A wired broker with no policy engine, its view table loaded and
+        /// `/q/views` served.
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn new() -> Result<Self, String> {
             let mut state = AppState::new("antares-test".into());
             antares_api::wire(&mut state).await;
-            Self { state }
+            let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
+        }
+
+        /// Another pod over the same store: its own view table, loaded and
+        /// reloaded from the store like this one's.
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn sibling(&self) -> Result<Self, String> {
+            let mut state = AppState::new("antares-test".into());
+            state.store = self.state.store.clone();
+            antares_api::wire(&mut state).await;
+            let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
         }
 
         /// The same broker asking `engine` (ADR-0020).
@@ -306,6 +357,32 @@ pub mod test_kit {
         pub fn with_policy(self, engine: Arc<dyn super::policy::PolicyEngine>) -> Self {
             Self {
                 state: self.state.with_policy(engine),
+                reload: self.reload,
+            }
+        }
+
+        /// Store a view document as it is, past `/q/views`' validation (what
+        /// another version or a hand edit may have left in the store), and
+        /// reload this broker's table.
+        ///
+        /// # Errors
+        /// The store's.
+        pub async fn store_view_doc(&self, id: &str, doc: serde_json::Value) -> Result<(), String> {
+            self.state.put_view_doc(id, doc).await?;
+            self.reload.now().await
+        }
+
+        /// The NGSI-LD API narrowed by the loaded view `id`: every operation
+        /// composed with it as the view root will serve it (ADR-0023).
+        ///
+        /// # Errors
+        /// When `id` is not a loaded view.
+        pub fn serve_view(&self, id: &str) -> Result<axum::Router, String> {
+            match self.state.views.snapshot().get(id) {
+                Some(antares_api::views::ViewEntry::Loaded { view, .. }) => {
+                    Ok(antares_api::router(self.state.with_view(view.clone())))
+                }
+                _ => Err(format!("{id:?} is not a loaded view")),
             }
         }
 
