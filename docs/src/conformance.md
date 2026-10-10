@@ -100,6 +100,15 @@ A native cell passes at 1823/1823, `wasm-file` at 1811/1811.
 lists every failure across the matrix; a release requires that list to be
 empty.
 
+A smaller green run is still green, so the matrix also gates per TP.
+`dev/etsi-baseline.json` names every TP a cell runs, keyed by file and
+name, with the vendored suite's tree hash and the spec version it covers.
+`dev/etsi-baseline.py check` fails a cell where a baseline TP did not pass
+or did not run, and names it. `wasm-file` may lack only the 12 MQTT TPs. A
+TP that passes and is not yet listed prints `ratchet: update baseline`;
+regenerate the file with `dev/etsi-baseline.py write <results-dir>` from a
+green run, or from a `robot --dryrun` folded by `dev/etsi-report.py`.
+
 ## Running a suite locally
 
 One store mode per run, the one the change touches:

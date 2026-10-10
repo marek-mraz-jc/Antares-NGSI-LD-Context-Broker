@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-check for the ETSI resource-sampling pair.
+"""Self-check for the ETSI resource-sampling pair and the per-TP baseline gate.
 
 The two pieces with real logic in them: the sampler's /proc parsing, and the
 report's sample↔TP interval join. Both fail silently if they break — an empty
@@ -9,6 +9,7 @@ check. std-only, no framework.
 Run: python3 dev/etsi-selftest.py
 """
 import csv
+import json
 import os
 import subprocess
 import sys
@@ -90,6 +91,9 @@ def check_join():
         rollup = list(csv.DictReader(open(f"{tmp}/resource-by-test.csv")))
         assert any(r["test"] == "001_01 First" and r["samples"] == "1" for r in rollup), rollup
 
+        tps = {r["test"]: r["status"] for r in csv.DictReader(open(f"{tmp}/tp-status.csv"))}
+        assert tps == {"001_01 First": "PASS", "002_01 Second": "FAIL"}, tps
+
         summary = open(f"{tmp}/run-summary.md").read()
         assert "002_01 Second" in summary, "the failure must reach the summary"
         assert open(f"{tmp}/gate-status.txt").read().strip() == "FAIL", \
@@ -97,8 +101,50 @@ def check_join():
         print(f"  join ok ({len(got)} samples labelled, gate FAIL on a red suite)")
 
 
+def check_baseline():
+    """dev/etsi-baseline.py: a TP that flips red or stops running fails the
+    gate and is named; a new passing TP only asks for a baseline update."""
+    tps = ["TP/a.robot::001_01 First", "TP/a.robot::002_01 Second"]
+    with tempfile.TemporaryDirectory() as tmp:
+        base = f"{tmp}/baseline.json"
+        with open(base, "w") as fh:
+            json.dump({"tps": tps, "mqtt_tps": tps[1:]}, fh)
+
+        def gate(rows, stores="memory", mqtt_off=""):
+            cell = f"{tmp}/cells/ETSI-cell-memory"
+            os.makedirs(cell, exist_ok=True)
+            with open(f"{cell}/tp-status.csv", "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["suite", "source", "test", "status"])
+                for key, status in rows:
+                    source, name = key.split("::")
+                    w.writerow(["Demo", source, name, status])
+            env = {**os.environ, "BASELINE": base, "STORES": stores, "MQTT_OFF": mqtt_off}
+            return subprocess.run([sys.executable, f"{HERE}/etsi-baseline.py", "check",
+                                   f"{tmp}/cells"], env=env, capture_output=True, text=True)
+
+        green = gate([(t, "PASS") for t in tps])
+        assert green.returncode == 0, green.stdout
+        flipped = gate([(tps[0], "PASS"), (tps[1], "FAIL")])
+        assert flipped.returncode != 0, "a flipped TP must fail the gate"
+        assert "FAIL: TP/a.robot::002_01 Second" in flipped.stdout, flipped.stdout
+        gone = gate([(tps[0], "PASS")])
+        assert gone.returncode != 0, "a TP that stopped running must fail the gate"
+        assert "did not run: TP/a.robot::002_01 Second" in gone.stdout, gone.stdout
+        new = gate([(t, "PASS") for t in tps] + [("TP/b.robot::003_01 Third", "PASS")])
+        assert new.returncode == 0, new.stdout
+        assert "ratchet: update baseline: TP/b.robot::003_01 Third" in new.stdout, new.stdout
+        # a cell running with MQTT=0 may lack the MQTT TPs, and only those
+        assert gate([(tps[0], "PASS")], mqtt_off="memory").returncode == 0
+        assert gate([(tps[1], "PASS")], mqtt_off="memory").returncode != 0
+        absent = gate([(t, "PASS") for t in tps], stores="memory file")
+        assert absent.returncode != 0 and "file: no tp-status.csv" in absent.stdout, absent.stdout
+    print("  baseline ok (flip and vanish fail, a new pass asks for a ratchet)")
+
+
 if __name__ == "__main__":
     print("etsi sampling self-check")
     check_proc_parsing()
     check_join()
+    check_baseline()
     print("OK")
