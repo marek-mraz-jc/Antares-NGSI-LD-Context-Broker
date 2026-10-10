@@ -41,14 +41,14 @@ View {
     q:           Option<QNode>        // antares-ql AST, parsed once at load
     scope_q:     Option<String>       // 7.2.4 scopeQ
     geo_q:       Option<GeoQuery>     // 7.2.5 geoQ
-    attributes:  Map<type IRI, Set<Attribute IRI>>   // per type, rule 11
+    rules:       [Rule]               // types, condition, attributes; rule 11
     operations:  allowlist of TS 104 175 operations (operation-matrix.yaml ids)
 }
 ```
 
 A request to a view runs the ordinary NGSI-LD handler with one more
 conjunct: the view's predicate (`selector ∧ q ∧ scope_q ∧ geo_q`) and its
-per-type attribute allowlists (rule 11), composed with whatever the installed engine answers
+per-rule attribute allowlists (rule 11), composed with whatever the installed engine answers
 (`effective = view ∧ engine`, both narrowing, neither widening). The view
 is applied before the engine is asked, so `AllowAll` behind a view still
 serves only the view. Without the `views` cargo feature none of this is
@@ -202,6 +202,11 @@ history must not leak that way keys its predicate on members that do not
 change (type, id pattern, `scope`), and the view loader warns when a
 temporal-enabled view's `q` names a mutable Property.
 
+For a rule with a condition, rule 11 replaces current-state membership by a
+check per instance: an instance is served only where the rule held at its
+time, so an Entity entering zone A does not bring its earlier `speed`
+along.
+
 ### 9. Subscriptions: stored as sent, the view applied at match time
 
 A Subscription created through a view is stored as the client sent it,
@@ -242,57 +247,114 @@ are DNS and certificate work outside the broker. A view pins its tenant: a
 request on a view path that carries `NGSILD-Tenant` naming another tenant
 is 400 `BadRequestData` ("a view serves one tenant"), never a silent switch.
 
-### 11. Attributes are allowed per type, keyed by expanded IRIs
+### 11. Attributes are allowed per rule: types and a condition, expanded IRIs
 
-Amended 2026-10-10 (T-3528, owner finding: "from cars only these
-attributes, from vehicles and users totally different attributes, with
-different names"). The first version of this ADR gave a view one flat
-`attributes` list. One list for the whole answer is the platform's T-1862
-leak: an Attribute allowed on `Car` is served on `User` because it is in
-the one list, and a query over two types leaks (gap G4,
-`docs/analysis/gateway-to-broker-map.md`).
+Amended 2026-10-10 (T-3528), twice. The owner's first finding: "from cars
+only these attributes, from vehicles and users totally different
+attributes, with different names". The first version of this ADR gave a
+view one flat `attributes` list, which is the platform's T-1862 leak: an
+Attribute allowed on `Car` is served on `User` because it is in the one
+list, and a query over two types leaks (gap G4,
+`docs/analysis/gateway-to-broker-map.md`). The second: "one entity in a
+specific filtered area like specific GPS can have different attributes
+than entities of the same type elsewhere". So the allowlist is not per
+type but per rule, the way the platform's grants already carry their own
+types, `q`/scopes (K10), area (K12) and attribute list (K9).
 
-So `attributes` is a map from an expanded type IRI to the set of expanded
-Attribute IRIs that type may show:
+A view's `rules` is a list of at least one rule:
 
-- Keys and values are expanded through the view's `@context` at load. The
-  same short name with two meanings (`Car` `name` from one vocabulary,
-  `User` `name` from another) is two IRIs and two different Attributes; the
-  same IRI may be visible on one type and hidden on another.
-- A type the selector names without an entry in the map serves the Entity
-  frame only (`id`, `type` and the core members ADR-0020 never removes),
-  never "everything". A missing entry fails closed.
-- An Entity with several types sees the union of the allowlists of its
-  types that the view selects. A type the view does not select adds
-  nothing.
-- The rule holds at every join level (rule 6: a target is projected by its
-  own types, not the linking Entity's), in notifications including
-  `previousValue` (rule 9), in temporal answers (rule 8), and in discovery
-  (rule 5: `/types/{t}` lists only that type's allowed Attributes).
-- Rule 2 per type: a `q`, `orderBy` or `pick` naming an Attribute hidden for
-  a type drops the Entities of that type from the answer, not the whole
-  answer, and the answer carries `NGSILD-Warning: 199` naming the types it
-  dropped (TS 104 176 6.3.17), so no type is read through another type's
-  allowlist. Rule 7 per type: a write naming an Attribute hidden for the
-  target's type is refused whole.
+```
+Rule {
+    types:       Set<type IRI>, at least one
+    q:           Option<QNode>      // on the Entity's own members, no linked path
+    scope_q:     Option<String>
+    geo_q:       Option<GeoQuery>
+    attributes:  Set<Attribute IRI>
+}
+```
 
-The engine's `policy::Filter` gets the same shape (G4): `pick_by_type` and
-`omit_by_type`, maps from type IRI to Attribute IRIs, beside the flat
-`pick`/`omit`, which still apply to every Entity. Both narrow, so they
-intersect. An Entity none of whose types has a `pick_by_type` entry keeps
-its frame only.
+Example: `{Car, geoQ: within zone A, [speed, location, status]}`,
+`{Car, [status]}`, `{User, [name, role]}`. The per-type map of the first
+amendment is the special case "one rule per type, no condition".
 
-Decided (worker-1, owner may override): union of the selected types'
-allowlists for a multi-typed Entity, because it is the owner's wording and
-a multi-typed Entity is, to a reader, each of its types; options: union,
-intersection. For `omit_by_type` the safe reading is the opposite one: an
-Attribute any of the Entity's types omits is removed (an omit is a promise
-that the Attribute is never served on that type, and the union would break
-it). Decided (worker-1, owner may override): a dropped type under rule 2 is
-named in a 199 warning, because silence would make "no such Entities" and
-"Entities you may not filter on" indistinguishable to an honest client
-while telling an attacker nothing the allowlist itself does not; options:
-warn, drop silently (open question O-4 of the gateway map).
+- **Membership and projection per Entity, on the stored Entity.** An Entity
+  is in the view when it matches at least one rule: one of its types is in
+  the rule's `types` and the rule's condition holds. It shows the union of
+  the `attributes` of the rules it matches and nothing else besides the
+  Entity frame (`id`, `type` and the core members ADR-0020 never removes).
+  An Entity no rule matches is out of the view (rule 3: 404 on a retrieve,
+  absent from a query), never "frame only".
+- **Conditions are the policy's, not the caller's.** A rule's condition is
+  evaluated on the full stored Entity (it may read an Attribute the caller
+  cannot see), with its names expanded against the core `@context`, never
+  the request's, so a caller's `@context` cannot change what a rule means.
+  A rule `q` with a `LinkedEntityRelation` path never matches: the visible
+  set of one Entity must not depend on another Entity the caller may not
+  read, and failing closed shows less, never more.
+- **Keys are expanded IRIs.** Types and Attributes are expanded through the
+  view's `@context` at load. The same short name with two meanings (`Car`
+  `name` from one vocabulary, `User` `name` from another) is two IRIs and
+  two different Attributes; the same IRI may be visible under one rule and
+  hidden under another.
+- **Rule 2 per Entity.** The caller's own `q`, `geoQ`, `attrs` and
+  `orderBy` are evaluated against the Entity as it is shown, so an
+  Attribute a matched rule does not show is absent there (7.2.3.3, as in
+  rule 2): `q=speed>100` never finds a Car outside zone A, and `q=!speed`
+  finds it. The view's predicate (the OR of its rules) is evaluated on the
+  stored Entity and the caller's on the shown one, before paging and count
+  (rule 1), so `NGSILD-Results-Count` and the pages describe the same set.
+  No warning is added: a warning that appears only when a hidden value
+  matched would itself be the oracle rule 2 closes.
+- **Every surface.** The rule holds at every join level (rule 6: a target
+  by its own rules), in discovery (rule 5: a type lists only the
+  Attributes some of its Entities show), in notifications (rule 9: the
+  rules are evaluated on the notified state; a notification carries only
+  the Attributes visible now, `previousValue` only for those; an Entity
+  that left every rule is not notified), and in temporal answers (below).
+- **Moving across a boundary.** A read uses the current state: a Car that
+  drives out of zone A loses `speed` and `location` from that moment.
+- **Temporal, per instance (amends rule 8 for conditional rules).** An
+  instance of an Attribute at time `t` (its `observedAt`, else
+  `modifiedAt`) is served only if a rule that allows the Attribute held at
+  `t`: its condition is evaluated on the Entity's state at `t`,
+  reconstructed from the history as the latest instance at or before `t`
+  of every Attribute. Where a member the condition reads has no instance at
+  or before `t`, or the condition reads `scope`, which has no history, the
+  rule does not hold for that instance: the instance is hidden, never
+  served. A rule without a condition holds at every `t`. An Entity is
+  answered when at least one instance survives.
+- **Writes (rule 7 per rule, K22).** The post-image must fall inside at
+  least one rule that allows every Attribute the write names; a write that
+  would move an Entity into a zone where it shows more is allowed only if
+  the writer's rule allows those Attributes.
+- **Disclosure, documented.** The attribute set reveals which rule matched:
+  seeing `speed` means "in zone A". The view loader reports, in `/q/health`
+  and the view's describe output, every rule whose condition reads an
+  Attribute that rule does not show, so the admin sees what the visible
+  set discloses.
+
+The engine's `policy::Filter` gets the same shape: `rules`, a list of
+`policy::Rule`, beside the flat `pick`/`omit` (which still apply to every
+Entity; both narrow, so they intersect) and `omit_by_type` (an Attribute
+any of the Entity's types omits is removed whatever rule matched: an omit
+is a promise that the Attribute is never served on that type). A View
+compiles into these rules; `Filter::admits_write` is rule 7's check and
+`Rule::discloses` the loader's report.
+
+Decided (worker-1, owner may override): an Entity no rule matches is out
+of the view, because the owner's rule reads "in the view if it matches at
+least one rule" and an identity-only answer would still disclose that the
+Entity exists; options: out of view, frame only (the first amendment).
+Decided (worker-1, owner may override): absence for the caller's
+predicates instead of dropping the Entity with a 199 warning (the first
+amendment's choice), because rule 2 already states absence and the warning
+appeared only when a hidden value matched, an oracle; options: absence,
+drop with warning, drop silently. Decided (worker-1, owner may override):
+no pushdown while rules are live: the store answers the policy's own
+predicates and the broker evaluates the rules and the caller's predicates
+over that set, so paging and projection pushdown are forfeited
+(`ponytail:` a scan; compile the rules' OR to SQL when it shows up);
+options: scan, SQL compilation of per-Entity visibility now.
 
 ## Threats and the rule that answers each
 
@@ -311,7 +373,8 @@ warn, drop silently (open question O-4 of the gateway map).
 | temporal history leak | history before the Entity entered the view | 8 (residual, documented) |
 | tenant switch | `NGSILD-Tenant` on a view path | 10 |
 | misconfiguration served wide | a view with a broken predicate | 10 (not served), fail closed |
-| cross-type attribute leak (T-1862) | an Attribute allowed on `Car` served on `User`; `q` on it over both types | 11 (per-type map, missing entry = frame only) |
+| cross-type attribute leak (T-1862) | an Attribute allowed on `Car` served on `User`; `q` on it over both types | 11 (per-rule allowlists, no matching rule = out of view) |
+| cross-zone attribute leak | `speed` allowed on Cars in zone A served on a Car elsewhere; `q=speed>100` finds it; its history after it left | 11 (union over the matched rules only, rule 2 per Entity, temporal per instance) |
 
 ## Consequences
 
@@ -345,7 +408,7 @@ Each rule has one named test, filed by T-3445 from the T-3444 plan, in
 | 8 | `views_temporal_serves_current_members_and_limits_after_the_allowlist` |
 | 9 | `views_notifications_drop_hidden_changes_and_strip_previous_value` |
 | 10 | `views_reload_without_restart`, `views_a_broken_view_is_not_served`, `views_pin_their_tenant` |
-| 11 | `two_types_one_view_each_sees_only_its_own_attributes`, `same_short_name_two_vocabularies_are_different_attributes`, `same_iri_visible_on_car_hidden_on_user`, `q_on_an_attribute_hidden_for_user_drops_user_not_car`, `join_target_projected_by_its_own_type`, `notification_previous_value_projected_per_type`, `multi_typed_entity_gets_union_of_selected_types_only`, `type_without_entry_serves_id_and_type_only` (T-3528; the engine half in `policy_filter_by_type.rs`) |
+| 11 | `two_types_one_view_each_sees_only_its_own_attributes`, `same_short_name_two_vocabularies_are_different_attributes`, `same_iri_visible_on_car_hidden_on_user`, `same_type_two_zones_two_attribute_sets`, `entity_matching_two_rules_gets_the_union`, `entity_matching_no_rule_is_not_served`, `q_on_speed_never_matches_cars_outside_zone_a`, `count_and_paging_consistent_with_rule_union`, `car_leaving_zone_a_loses_speed_on_next_read`, `notification_after_zone_exit_has_no_hidden_previous_value`, `temporal_speed_history_only_while_in_zone_a`, `join_target_projected_by_its_own_rules`, `discovery_lists_each_types_own_attributes_only`, `no_answer_holds_an_entity_attribute_pair_no_matching_rule_allows` (T-3528; the engine half in `policy_filter_by_type.rs`), `write_that_adds_speed_outside_zone_a_is_refused` (`policy::tests`) |
 
 Plus, for the whole: the ETSI suite run against `/x/views/{all}/ngsi-ld/v1`
 where `{all}` selects every type and hides nothing must give the vanilla
