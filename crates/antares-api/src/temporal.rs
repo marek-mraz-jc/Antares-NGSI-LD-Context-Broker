@@ -2085,15 +2085,9 @@ pub(crate) async fn query_temporal_collected(
         Vec<&antares_ql::geo::GeoQuery>,
         Vec<&antares_ql::geo::GeoQuery>,
     ) = if ruled {
-        (
-            filter.geo_q.as_deref().into_iter().collect(),
-            own_geo.iter().collect(),
-        )
+        (filter.areas().collect(), own_geo.iter().collect())
     } else {
-        (
-            own_geo.iter().chain(filter.geo_q.as_deref()).collect(),
-            Vec::new(),
-        )
+        (own_geo.iter().chain(filter.areas()).collect(), Vec::new())
     };
 
     // Push entity narrowing (ids/types/attrs) and instance-window

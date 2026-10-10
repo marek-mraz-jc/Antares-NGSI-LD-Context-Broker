@@ -70,6 +70,10 @@ the expected elements of a view are the in-view ones.
 predicates, all of which must hold (the view's and the request's): the
 `antares-store` filters hold a slice of them, the Postgres arms conjoin
 one predicate per entry, and the evaluator requires every one (T-3484).
+A narrowing holds a list of areas too (`geo_q` and `geo_also`, T-3543), so
+a view and an engine that both narrow by area at the same level compose
+into both areas, in the `Filter` and in each paired rule, instead of
+refusing.
 
 ### 2. A hidden attribute does not exist while `q` is evaluated
 

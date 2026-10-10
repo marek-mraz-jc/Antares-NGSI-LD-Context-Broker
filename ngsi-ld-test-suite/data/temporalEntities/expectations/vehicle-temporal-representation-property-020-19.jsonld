@@ -4,7 +4,7 @@
   "scope": [
     {
       "type": "Property",
-      "value": [],
+      "value": "urn:ngsi-ld:null",
       "deletedAt": "2024-12-19T08:43:32.422444Z"
     }
   ]

@@ -1237,7 +1237,8 @@ pub async fn filter_entities_paged(
     let own_geo = antares_ql::geo::GeoQuery::from_params(params)?;
     let policy_geo = narrow
         .and_then(|r| r.policy_reach.as_deref())
-        .and_then(|reach| reach.geo_q.as_deref());
+        .map(|reach| reach.areas.as_slice())
+        .unwrap_or_default();
     let geos: Vec<&antares_ql::geo::GeoQuery> = own_geo.iter().chain(policy_geo).collect();
     // under rules the client's q, attrs and geoQ read the shown Entity, and
     // only the engine's own q and area reach the store and the stored one
@@ -1251,7 +1252,7 @@ pub async fn filter_entities_paged(
         (q_ast, None)
     };
     let (geos, shown_geos): (Vec<_>, Vec<_>) = if rules.is_some() {
-        (policy_geo.into_iter().collect(), own_geo.iter().collect())
+        (policy_geo.iter().collect(), own_geo.iter().collect())
     } else {
         (geos, Vec::new())
     };

@@ -5,7 +5,7 @@
     "type": "Property",
     "values": [
       [
-        [],
+        "urn:ngsi-ld:null",
         "2024-12-19T08:48:50.936936Z"
       ]
     ]
