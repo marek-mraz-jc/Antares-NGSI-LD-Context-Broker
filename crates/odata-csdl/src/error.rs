@@ -137,7 +137,7 @@ impl fmt::Display for ValidationError {
     }
 }
 
-/// The CSDL rules [`crate::validate`] checks.
+/// The CSDL rules [`validate`](fn@crate::validate) checks.
 ///
 /// ```
 /// assert_eq!(odata_csdl::Problem::MissingKey.as_str(), "entity type without a key");
