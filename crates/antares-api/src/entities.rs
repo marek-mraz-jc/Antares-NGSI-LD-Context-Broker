@@ -363,19 +363,8 @@ async fn retrieve_entity_inner(
     // 5.7.1.4 answers an absent one — "If the NGSI-LD Entity does not
     // exist, an error of type ResourceNotFound shall be raised" — because a
     // refusal here would tell the caller the Entity is there.
-    if let Some(ast) = &filter.q {
-        if !crate::notify::linked_eval(st, &tenant, |l| {
-            antares_ql::eval::eval_q(ast, &doc, &ctx, l)
-        })
-        .await
-        {
-            return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
-        }
-    }
-    if let Some(scope) = &filter.scope_q {
-        if !crate::scope_matches(scope, &doc) {
-            return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
-        }
+    if !crate::repr::policy_admits(st, &tenant, &ctx, repr.policy_reach.as_deref(), &doc).await {
+        return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
     }
     // 5.7.1: attrs projection with no matching attribute ⇒ 404
     if let Some(want) = &repr.attrs {
@@ -417,6 +406,7 @@ async fn retrieve_entity_inner(
                 let complete = collect_flat_beyond(
                     st,
                     &tenant,
+                    &ctx,
                     &repr,
                     &doc,
                     *level,
@@ -918,6 +908,7 @@ async fn query_entities_inner(
                     complete &= collect_flat_beyond(
                         st,
                         &tenant,
+                        &ctx,
                         &repr,
                         doc,
                         *level,

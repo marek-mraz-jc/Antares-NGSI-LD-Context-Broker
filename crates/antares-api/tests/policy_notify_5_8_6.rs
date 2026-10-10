@@ -447,3 +447,68 @@ async fn the_stored_subject_is_in_no_representation_and_no_client_can_set_it() {
         "a client body rewrote the stored subject"
     );
 }
+
+/// A joined notification (5.2.14.1 `join`) under a narrowing that hides
+/// rows: the joined target is not delivered. A row predicate is refused on
+/// this path (ADR-0020), so the whole notification goes, which hides the
+/// target and does not tell hidden from absent. `Deliver` sends the
+/// joined target, so the drop is the narrowing's doing (T-3470).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joined_notification_does_not_carry_a_target_the_narrowing_hides() {
+    for (answer, delivered) in [
+        (NotifyDecision::Deliver, true),
+        (
+            NotifyDecision::Filter(Filter {
+                q: Some(antares_ql::parse_q("public==true").expect("q")),
+                ..Filter::default()
+            }),
+            false,
+        ),
+    ] {
+        let (st, _) = state(answer).await;
+        let (uri, mut rx) = capture().await;
+        let (code, body) = call(
+            &st,
+            "POST",
+            "entities",
+            None,
+            Some(json!({"id": "urn:ngsi-ld:Person:hidden", "type": "Person",
+                        "name": {"type": "Property", "value": "Hid"}})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        let (code, body) = call(
+            &st,
+            "POST",
+            "subscriptions",
+            Some("alice"),
+            Some(
+                json!({"type": "Subscription", "entities": [{"type": "Vehicle"}],
+                        "notification": {"endpoint": {"uri": uri},
+                                         "join": "inline", "joinLevel": 1}}),
+            ),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        let (code, body) = call(
+            &st,
+            "POST",
+            "entities",
+            None,
+            Some(json!({"id": "urn:ngsi-ld:Vehicle:j", "type": "Vehicle",
+                        "public": {"type": "Property", "value": true},
+                        "owner": {"type": "Relationship",
+                                  "object": "urn:ngsi-ld:Person:hidden"}})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        let got = tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv()).await;
+        match got {
+            Ok(Some(n)) => {
+                assert!(delivered, "a narrowed join was delivered: {n}");
+                assert!(n.to_string().contains("Hid"), "join not rendered: {n}");
+            }
+            _ => assert!(!delivered, "the allowed joined notification never came"),
+        }
+    }
+}
