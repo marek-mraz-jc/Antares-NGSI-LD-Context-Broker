@@ -526,3 +526,37 @@ POST are replaced and duplicates collapse. Suggest the union of both
 payloads, as the corrected fork does (forge commit 167fa185); Antares
 carries that fix
 (`temporal_dedup.rs::a_second_temporal_upsert_at_the_same_instant_appends`).
+
+---
+
+## 22. [suite] 046_22_08 reads a deleted three-instance Attribute as one object
+
+**Title:** 046_22_08 asserts `['name']['value']` on an Attribute whose three
+instances were deleted
+
+**Body:**
+
+`name` in building-multi-instances-attributes has the default instance and
+two datasetIds, and 046_22_08 deletes all of them. CIM 009 5.8.6 represents
+each deleted instance with the NGSI-LD Null and its datasetId, so the
+notification carries an Array of three, as it would for the live Attribute.
+The assertion indexes a single object. Suggest asserting three instances,
+each `urn:ngsi-ld:null`, as the corrected fork does (forge commit
+75ba471d); Antares carries that fix
+(`notify.rs::whole_attribute_versus_per_instance_deletion`).
+
+---
+
+## 23. [suite] 046_05 percent-encodes the q of a Subscription body
+
+**Title:** the 046_05 Subscription carries `q` as `name=="Eiffel%20Tower"`
+
+**Body:**
+
+CIM 009 Table 5.2.12-1 types a Subscription's `q` as a string holding a
+4.9 query, and the Subscription travels as a JSON body, not in a URI, so
+4.9's percent-encoding rule for query strings does not apply. Read as
+written, the q matches only an Entity whose name is the literal
+`Eiffel%20Tower`. Suggest `name=="Eiffel Tower"`, as the corrected fork
+does (forge commit cd2ef2ba); Antares carries that fix and reads the q as
+written (`antares-matcher::a_subscription_q_is_not_percent_decoded`).
