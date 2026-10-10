@@ -472,3 +472,91 @@ does (forge commit 9ca4213e); Antares carries that fix
 The clause does not say how an instance meets a `q` over several
 Attributes; Antares keeps an instance when `q` holds on the Entity with that
 Attribute narrowed to that one instance.
+
+---
+
+## 19. [suite] 037_11 and 041_03 ask without Accept and expect ld+json pagination Links
+
+**Title:** 037_11/041_03 expect `type="application/ld+json"` on the
+pagination Links of an `application/json` response
+
+**Body:**
+
+CIM 009 6.3.10: the type Link Target Attribute "shall be exactly equal to
+the media type resulting from the original request". Both test points query
+without an Accept header, so the response is `application/json`, and still
+expect `type="application/ld+json"`. Suggest sending
+`Accept: application/ld+json`, as the corrected fork does (forge commit
+c4cdb0cf, and the same line in its 037_11); Antares carries that fix and
+types every pagination Link after the response media type
+(`registration_listing_5_10_2.rs::a_registration_page_link_carries_the_requested_media_type`).
+
+---
+
+## 20. [suite] 051_04_01 expects BadRequestData for an unknown @context id with reload=true
+
+**Title:** 051_04_01 expects 400 where 5.13.5.4 raises ResourceNotFound
+
+**Body:**
+
+CIM 009 5.13.5.4, second bullet: "If the @context identifier does not
+correspond to any existing entry in the @context storage, then an error of
+type ResourceNotFound shall be raised." The reload bullets that follow
+describe an existing @context by its kind. 051_04_01 deletes an unknown id
+with `reload=true` and expects 400 BadRequestData. Suggest 404
+ResourceNotFound, as the corrected fork does (forge commit 39921641);
+Antares carries that fix
+(`contexts_5_13.rs::clause_5_13_5_delete_and_reload_errors`).
+
+---
+
+## 21. [suite] 008_01 expects a second temporal upsert to overwrite instances at the same observedAt
+
+**Title:** the 008_01 expectation drops instances that the second
+`POST /temporal/entities` must add
+
+**Body:**
+
+CIM 009 5.6.11.4: for a known Temporal Evolution "all the Attribute
+instances included by the Temporal Evolution shall be added to the existing
+Entity as mandated by clause 5.6.12". An instance is identified by its
+system-generated instanceId, not by observedAt. The 008_01 expectation reuses
+the update payload, so instances that share an observedAt with the first
+POST are replaced and duplicates collapse. Suggest the union of both
+payloads, as the corrected fork does (forge commit 167fa185); Antares
+carries that fix
+(`temporal_dedup.rs::a_second_temporal_upsert_at_the_same_instant_appends`).
+
+---
+
+## 22. [suite] 046_22_08 reads a deleted three-instance Attribute as one object
+
+**Title:** 046_22_08 asserts `['name']['value']` on an Attribute whose three
+instances were deleted
+
+**Body:**
+
+`name` in building-multi-instances-attributes has the default instance and
+two datasetIds, and 046_22_08 deletes all of them. CIM 009 5.8.6 represents
+each deleted instance with the NGSI-LD Null and its datasetId, so the
+notification carries an Array of three, as it would for the live Attribute.
+The assertion indexes a single object. Suggest asserting three instances,
+each `urn:ngsi-ld:null`, as the corrected fork does (forge commit
+75ba471d); Antares carries that fix
+(`notify.rs::whole_attribute_versus_per_instance_deletion`).
+
+---
+
+## 23. [suite] 046_05 percent-encodes the q of a Subscription body
+
+**Title:** the 046_05 Subscription carries `q` as `name=="Eiffel%20Tower"`
+
+**Body:**
+
+CIM 009 Table 5.2.12-1 types a Subscription's `q` as a string holding a
+4.9 query, and the Subscription travels as a JSON body, not in a URI, so
+4.9's percent-encoding rule for query strings does not apply. Read as
+written, the q matches only an Entity whose name is the literal
+`Eiffel%20Tower`. Suggest `name=="Eiffel Tower"`, as the corrected fork
+does (forge commit cd2ef2ba); Antares carries that fix and reads the q as
+written (`antares-matcher::a_subscription_q_is_not_percent_decoded`).

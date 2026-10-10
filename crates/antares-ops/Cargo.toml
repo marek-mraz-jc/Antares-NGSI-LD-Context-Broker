@@ -17,13 +17,19 @@ test-kit = ["antares-api/test-kit"]
 
 [dependencies]
 antares-api = { workspace = true, features = ["views"] }
-axum = { version = "0.8", default-features = false }
+antares-jsonld = { workspace = true }
+antares-model = { workspace = true }
+antares-ql = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["json"] }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 antares-ops = { path = ".", features = ["test-kit"] }
 http-body-util = { version = "0.1", default-features = false }
+proptest = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 
@@ -48,3 +54,7 @@ print_stderr = "deny"
 
 [lints.rustdoc]
 broken_intra_doc_links = "deny"
+
+[[bench]]
+name = "views"
+harness = false

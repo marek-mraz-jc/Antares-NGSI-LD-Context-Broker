@@ -1231,6 +1231,37 @@ mod complexity_tests {
         }
     }
 
+    /// The unquoted value: `false` is a Boolean, an empty value is refused,
+    /// and a `..` past the next separator belongs to the next term.
+    #[test]
+    fn unquoted_scalars_and_where_a_range_stops() {
+        let QNode::Cmp { value, .. } = parse_q("a==false").expect("parse") else {
+            unreachable!("a comparison")
+        };
+        assert_eq!(value, QValue::Bool(false));
+        assert!(parse_q("a==").is_err());
+        assert!(parse_q("a==;b==1").is_err());
+        let range = parse_q("a==1;b==2..3").expect("parse");
+        assert_eq!(range, parse_q("(a==1);(b==2..3)").expect("parse"));
+        let QNode::And(terms) = range else {
+            unreachable!("an And")
+        };
+        assert_eq!(terms.len(), 2);
+    }
+
+    /// The byte ceiling is inclusive: MAX_Q_BYTES parses, one more is
+    /// TooComplexQuery (T-3531 mutant: `>` → `>=`).
+    #[test]
+    fn a_query_of_exactly_the_byte_ceiling_parses() {
+        let at = |n: usize| format!("a==\"{}\"", "x".repeat(n - 5));
+        assert_eq!(at(MAX_Q_BYTES).len(), MAX_Q_BYTES);
+        assert!(parse_q(&at(MAX_Q_BYTES)).is_ok());
+        assert!(matches!(
+            parse_q(&at(MAX_Q_BYTES + 1)),
+            Err(NgsiError::TooComplexQuery(_))
+        ));
+    }
+
     /// The node budget: a flat chain within the depth limit but past
     /// MAX_Q_NODES is 400 TooComplexQuery, one node fewer parses.
     #[test]

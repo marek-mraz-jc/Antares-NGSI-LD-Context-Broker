@@ -41,7 +41,7 @@ broker nor a storage backend (`antares-api`, `antares-broker`,
 | Crate | Lines | Owns | Must not |
 |---|---|---|---|
 | `antares-model` | 1 370 | CIM 009 types verbatim (`Entity`, `NgsiError` = Table 6.3.2-1), publishable | depend on anything Antares |
-| `antares-ql` | 5 000 | `q=`, `scopeQ`, `geoQ` parsers → typed AST; the in-memory evaluator (`eval`) | know HTTP or SQL |
+| `antares-ql` | 5 600 | `q=`, `scopeQ`, `geoQ` parsers → typed AST; the in-memory evaluator (`eval`) | know HTTP or SQL |
 | `antares-jsonld` | 9 040 | `@context` loader with caches and pinned core contexts, expansion/compaction, structural validation, the one outbound `client_builder` | do business logic |
 | `antares-matcher` | 432 | subscription vs entity: selector, conditions, activity, throttling | touch a store |
 | `antares-store` | 3 000 | `CurrentStateDriver`, `TemporalDriver` (object-safe, `lib.rs:140`, `:385`), `Kind`, filters/paging (`filter.rs`) | pull a backend |
@@ -51,6 +51,8 @@ broker nor a storage backend (`antares-api`, `antares-broker`,
 | `antares-api` | 49 500 | the HTTP binding: routers, handlers, negotiation, federation, notification pipeline, snapshots, bounds | own a backend or a transport |
 | `antares-broker` | 3 800 | composition root: env → config, roles, bus wiring (`wiring.rs`), telemetry, shutdown | contain clause logic |
 | `antares-wasm` | 500 | the router under a Service Worker, OPFS-backed file store | diverge from the native router |
+| `antares-ops` | 1 880 | the operation layer every surface serves through (ADR-0027 section 1): `Ops` over `AppState::call`, `OperationId` (the matrix rows), `Refusal`, `Surface`; the view table (`views.rs`: `View`, load and validation, `/q/views`, reload, rule M4 closing a surface with no view) | be linked by a vanilla build, name the store, SQL, bus or notifier |
+| `antares-views` | 310 | the NGSI-LD view root `/x/views/{view}/ngsi-ld/v1` (ADR-0023, role surface, feature `views`): the reads and the rule-7 writes through `ViewOps` in the view's Tenant, 405/422/404 by rule 4, `Link`/`Location` rebased to the view root, no entity maps | name the store, the policy engine or any crate but `antares-ops` |
 | `odata-csdl` | 3 640 | OData 4.01 EDM model, CSDL XML and CSDL JSON writers, model validation under caller `Limits` (ADR-0024) | know its host (no `antares-*` dependency, rule M1) or read CSDL |
 | `odata-url` | 5 150 | OData 4.01 relative URLs (resource path, system query options, `$filter`) to a typed AST under caller `Limits`, against a `Model` the caller supplies; canonical writer; the subset of T-3441, the rest `NotImplemented` (ADR-0024) | know its host (no `antares-*` dependency, rule M1) or decide a status code |
 | `odata-json` | 2 250 | OData 4.01 JSON format: entity, collection, reference, service-document and error writers at `metadata=none\|minimal\|full` in 4.0 or 4.01 spelling; the body reader of the mapped writes (W1, W2, W4, W6, W10, W11, W16, W20) under caller `BodyLimits`; `Prefer` and version negotiation; the rest `NotImplemented` (ADR-0024) | know its host (no `antares-*` dependency, rule M1), decide a status beyond `BodyError::status`, or echo a request value in an error |
@@ -64,11 +66,11 @@ module's header comment.
 |---|---|---|
 | `lib.rs` | 6 100 | the router (`/ngsi-ld/v1` nest, `/q/*` admin, `/info`), tenant purge, shared helpers |
 | `negotiate.rs` | 2 000 | 6.3.4–6.3.6: tenant, Accept, Content-Type, `@context` resolution, parameter allow-lists (the query set of 6.4.3.2 included) and the RFC 7230 header-syntax checks. Every handler passes through `tenant_from`, `check_params`, `parse_body`, `request_context` |
-| `entities.rs` | 3 700 | 5.6.1–5.6.6, 5.7.1–5.7.2 `/entities`, distributed write fan-out |
+| `entities.rs` | 3 900 | 5.6.1–5.6.6, 5.7.1–5.7.2 `/entities`, distributed write fan-out |
 | `paging.rs` | 1 400 | 4.12, 6.3.10 limit/offset/count and the next/prev links, 4.23 ordering and ICU collation, 6.3.17 `NGSILD-Warning`, the query body of 5.2.23 lifted into parameters; every list operation pages through it |
-| `attrs.rs` | 2 200 | 5.6.2–5.6.5 attribute operations, 10.2.6 Set Attribute Value |
-| `batch.rs` | 2 240 | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
-| `temporal.rs` | 4 100 | 5.6.11–5.6.16, 5.7.3–5.7.4 `/temporal/entities` |
+| `attrs.rs` | 2 350 | 5.6.2–5.6.5 attribute operations, 10.2.6 Set Attribute Value |
+| `batch.rs` | 2 360 | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
+| `temporal.rs` | 4 600 | 5.6.11–5.6.16, 5.7.3–5.7.4 `/temporal/entities` |
 | `temporalq.rs` | 200 | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |
 | `types_attrs.rs` | 900 | 5.7.5–5.7.10 `/types`, `/attributes` |
 | `subscriptions.rs` | 2 100 | 5.8, 5.11 `/subscriptions`, `/csourceSubscriptions` |
@@ -80,7 +82,7 @@ module's header comment.
 | `entity_maps.rs` | 370 | 5.14 the `/entityMaps` resources (6.32, 6.34, 6.35): create from a query, retrieve, update, delete |
 | `entity_map.rs` | 850 | one EntityMap document (5.2.39): store it under its tenant with a lifetime, read it back while it lives, take a page's candidate ids from it, merge what a distributed query reached, and serve a retrieve through a presented map |
 | `snapshots.rs` | 2 000 | 5.16 snapshots under synthetic `snap-…` tenants |
-| `contexts.rs` | 880 | 5.13 `/jsonldContexts` |
+| `contexts.rs` | 920 | 5.13 `/jsonldContexts` |
 | `conformance.rs` | 855 | 6.3.21 version negotiation |
 | `repr.rs` | 2 050 | 6.3.7, 4.5.4 representations: normalized, concise, keyValues, sysAttrs; 4.5.23 Linked Entity Retrieval (inline and flat, the lookup budget) and the 4.5.16 GeoJSON Feature/FeatureCollection shapes — what every module needs to render a document |
 | `history.rs` | 260 | the producer side of temporal recording: the per-request change buffer and the 4.5.7/4.5.8 delete mirrors that record a deleted Entity or Attribute in history |
@@ -89,11 +91,10 @@ module's header comment.
 | `bounds.rs` | 718 | every cap: body, URI, JSON depth, batch, fan-out, in-flight, regex program size, and the notification pipeline's queue depth and delivery widths; all reported by `/q/health`, which a test over this module's own source keeps true |
 | `egress.rs` | 470 | SSRF wall and per-destination circuit breakers for notifications, forwards, `@context` fetches |
 | `surface.rs` | 100 | `ApiSurface`: HTTP surfaces mounted beside the API root, on the reserved prefixes `/q` and `/x` |
-| `policy.rs` | 1 759 | the policy seam (ADR-0020): `PolicyEngine`, `Subject`/`Operation`/`Decision`/`Filter` (per-rule allowlists, ADR-0023 rule 11), the built-in `AllowAll` engine, the clauses a narrowing can reach and the refusal everywhere else, the fail-closed calls that deny on a panic or a timeout, and the stored subject a notification is decided under |
+| `policy.rs` | 1 825 | the policy seam (ADR-0020): `PolicyEngine`, `Subject`/`Operation`/`Decision`/`Filter` (per-rule allowlists, ADR-0023 rule 11), the built-in `AllowAll` engine, the clauses a narrowing can reach and the refusal everywhere else, the fail-closed calls that deny on a panic or a timeout, and the stored subject a notification is decided under |
 | `state.rs` | 1 050 | `AppState`: store, bus flag, mirror, HTTP clients, delivery policy, sinks, surfaces, hooks, and the endpoint view a state is narrowed to (feature `views`) |
 | `fuzzing.rs` | 84 | the request parsers the `fuzz/` targets drive, behind the `fuzzing` feature that no broker build enables (T-3463) |
-| `views.rs` | 754 | feature `views` (ADR-0023, ADR-0027 section 5): `CompiledView` and the composition `gate!` applies after the engine answers, effective = view ∧ engine, neither side widening; never in a vanilla build |
-
+| `views.rs` | 1 190 | feature `views` (ADR-0023, ADR-0027 section 5): `CompiledView` and the composition `gate!` applies after the engine answers, effective = view ∧ engine, neither side widening; `WriteGuard`, rule 7 checked inside the store's read-modify-write; the `ViewTable` a pod serves from and the `Kind::View` documents under `antares-views`; never in a vanilla build |
 Geoquery evaluation, the `q=` evaluator and the caches of compiled client
 query text are not in that table because they are not this crate's: they are
 `antares_ql::geo`, `::eval` and `::regex`, named by those paths at every call
@@ -171,7 +172,8 @@ diff against. The maintenance pass frees stamped rows 24 hours on.
 `ANTARES_STORE=memory|file|postgres|timescale` (ADR-0004), one trait
 pair, one schema (`crates/antares-sql/migrations/`: `0001_init.sql`,
 `0002_dead_letters.sql`, `0003_comma_seconds_fraction.sql`,
-`0004_drop_entity_maps.sql`, `0005_service_escape_by_command.sql`).
+`0004_drop_entity_maps.sql`, `0005_service_escape_by_command.sql`,
+`0006_context_tenant.sql`, `0007_outbox_claim_check.sql`, `0008_views.sql`).
 
 - Tenancy: one shared schema, `tenant_id` on every row, Row-Level
   Security with `FORCE` on every tenant table (ADR-0001). RLS is a belt

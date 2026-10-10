@@ -382,6 +382,7 @@ async fn purge_tenant_empties_every_tenant_table() {
             Kind::EntityMap,
             Kind::DistSub,
             Kind::DeadLetter,
+            Kind::View,
         ] {
             let id = "urn:x:1";
             let d = if kind == Kind::Registration {
@@ -424,7 +425,7 @@ async fn purge_tenant_empties_every_tenant_table() {
             .await
             .expect("append");
     }
-    const TABLES: [&str; 13] = [
+    const TABLES: [&str; 14] = [
         "entities",
         "jsonld_contexts",
         "subscriptions",
@@ -436,6 +437,7 @@ async fn purge_tenant_empties_every_tenant_table() {
         "entity_map_docs",
         "dist_subs",
         "dead_letters",
+        "views",
         "temporal_entities",
         "attr_instances",
     ];

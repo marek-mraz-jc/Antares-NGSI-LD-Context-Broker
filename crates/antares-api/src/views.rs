@@ -14,11 +14,15 @@
 //! view exactly as it is under a narrowing engine.
 //!
 //! Loading, validating and addressing views is `antares-ops`' (T-3496); this
-//! module only composes one.
+//! module composes one, and holds the table of the views a pod serves
+//! ([`ViewTable`]) with the store seam the loader writes through, so the
+//! operation layer never names the store (threat F1).
 
 use crate::policy::{resolve, Decision, Denied, Filter, Rule};
 use antares_ql::geo::GeoQuery;
 use antares_ql::QNode;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// How many rules a composed narrowing may hold: the pairs of a view's
 /// rules and an engine's are the product of two bounded lists, and the
@@ -92,6 +96,9 @@ impl CompiledView {
     }
 }
 
+/// List @contexts (13.3, CIM 009 5.13.3).
+const LIST_CONTEXTS: &str = "5.13.3";
+
 /// What `gate!` hands the handler: the engine's answer for `clause`
 /// composed with the view the state carries, if it carries one. Without a
 /// view the answer is the engine's, unchanged.
@@ -103,6 +110,20 @@ pub fn with_view(
     let Some(view) = view else {
         return engine;
     };
+    if clause == LIST_CONTEXTS {
+        // Rule 5: the handler lists the core @context alone under a view,
+        // so the view has nothing of its own to narrow there.
+        return engine;
+    }
+    if CHECKED_WRITES.contains(&clause) {
+        // Rule 7: the handler checks the view on the stored Entity before
+        // and after the write (`WriteGuard`); the engine's own answer
+        // still refuses a narrowed write, as it does without a view.
+        return match resolve(clause, Decision::Filter(engine?)) {
+            Decision::Deny(why) => Err(Denied(why)),
+            _ => Ok(Filter::default()),
+        };
+    }
     let composed = compose(view.narrowing(), engine?)?;
     match resolve(clause, Decision::Filter(composed)) {
         Decision::Allow => Ok(Filter::default()),
@@ -245,6 +266,363 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
     Ok(out)
 }
 
+/// The reserved tenant the view documents live under (ADR-0012, ADR-0023
+/// rule 10). No client may name it, and no NGSI-LD route reads the
+/// document kind they are stored as.
+pub const VIEW_TENANT: &str = "antares-views";
+
+/// One view of the table.
+#[derive(Debug, Clone)]
+pub enum ViewEntry {
+    /// A view that loaded: its narrowing, and what `/q/health` says of it.
+    Loaded {
+        /// The narrowing every operation through the view is composed with.
+        view: Arc<CompiledView>,
+        /// The one Tenant it serves.
+        tenant: String,
+        /// The operations it allows, as `operation-matrix.yaml` ids.
+        operations: Vec<String>,
+        /// What the loader found worth an operator's eye: a rule whose
+        /// condition reads an Attribute it does not show (ADR-0023 rule
+        /// 11), a temporal view keyed on a mutable member (rule 8).
+        notes: Vec<String>,
+    },
+    /// A stored view that failed validation: never served, named in
+    /// `/q/health` with the reason.
+    Invalid {
+        /// Why it did not load.
+        reason: String,
+    },
+}
+
+/// The views this pod serves, swapped whole on every reload so a request
+/// sees one table or the next, never half of each (ADR-0023 rule 10). Empty
+/// until a view loads: no view means nothing served (rule M4).
+#[derive(Debug, Default)]
+pub struct ViewTable {
+    entries: std::sync::RwLock<Arc<BTreeMap<String, ViewEntry>>>,
+    admin: std::sync::OnceLock<axum::Router>,
+}
+
+impl ViewTable {
+    /// The table as it is now.
+    pub fn snapshot(&self) -> Arc<BTreeMap<String, ViewEntry>> {
+        self.entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace the whole table.
+    pub fn replace(&self, entries: BTreeMap<String, ViewEntry>) {
+        *self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(entries);
+    }
+
+    /// Whether at least one view loaded: a surface that serves through views
+    /// is closed until one has (rule M4).
+    pub fn any_loaded(&self) -> bool {
+        self.snapshot()
+            .values()
+            .any(|e| matches!(e, ViewEntry::Loaded { .. }))
+    }
+
+    /// What `/q/health` lists: each view, `loaded` with its tenant,
+    /// operations and notes, or `invalid` with the reason.
+    pub fn report(&self) -> serde_json::Value {
+        let views = self.snapshot();
+        serde_json::Value::Object(
+            views
+                .iter()
+                .map(|(id, e)| {
+                    let v = match e {
+                        ViewEntry::Loaded {
+                            tenant,
+                            operations,
+                            notes,
+                            ..
+                        } => serde_json::json!({
+                            "state": "loaded",
+                            "tenant": tenant,
+                            "operations": operations.len(),
+                            "notes": notes,
+                        }),
+                        ViewEntry::Invalid { reason } => {
+                            serde_json::json!({"state": "invalid", "reason": reason})
+                        }
+                    };
+                    (id.clone(), v)
+                })
+                .collect(),
+        )
+    }
+
+    /// The `/q/views` routes the loader serves, merged into the admin
+    /// surface and so relative to `/q` (`/views`, `/views/{id}`). Set once,
+    /// before the router is built.
+    ///
+    /// # Errors
+    /// When routes were set already.
+    pub fn set_admin(&self, routes: axum::Router) -> Result<(), String> {
+        self.admin
+            .set(routes)
+            .map_err(|_| "the /q/views routes are set already".to_owned())
+    }
+
+    /// The `/q/views` routes, if a loader set them.
+    pub fn admin(&self) -> Option<axum::Router> {
+        self.admin.get().cloned()
+    }
+}
+
+/// The writes whose handlers check ADR-0023 rule 7 on the stored Entity
+/// (the crate's write guard): Create Entity, Update and Append Attributes, Partial
+/// Attribute Update, Delete Attribute, Delete Entity, Merge, Replace Entity,
+/// Replace Attribute and Set Attribute Value, and the batch create, update,
+/// merge and delete, member by member. Every other write is refused under a
+/// view, as a narrowed write is ([`resolve`]): Batch Upsert among them,
+/// whose replace half writes without reading the stored Entity.
+pub const CHECKED_WRITES: [&str; 13] = [
+    "5.6.1", "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.17", "5.6.18", "5.6.19", "5.6.7",
+    "5.6.9", "5.6.20", "5.6.10",
+];
+
+/// Why a write through a view whose post-image the view would not select is
+/// refused (rule 7). The caller saw the pre-image, so it learns nothing new.
+pub const MOVES_OUT: &str = "the write would move the Entity out of this view";
+/// Why a write naming an Attribute the view does not show is refused whole
+/// (rule 7, never a silent drop).
+pub const NOT_WRITABLE: &str = "the write names an Attribute this view does not let it write";
+/// Why a Relationship write through a view is refused when its target is
+/// not shown: hidden and absent answer alike (threat-model D7).
+pub const TARGET_NOT_SHOWN: &str =
+    "a Relationship written through this view must point at an Entity it shows";
+
+/// ADR-0023 rule 7 for one write through a view: the stored Entity must be
+/// in the view before the write (else it is not found, rule 3) and after it,
+/// and every Attribute the write names must be one a rule holding for the
+/// Entity shows, before and after. The checks run inside the store's own
+/// read-modify-write, on the document it is about to commit, so no
+/// concurrent write slips between check and commit. The names are judged on
+/// the pre-image too, so a hidden Attribute answers the same 403 whether the
+/// Entity holds it or not.
+///
+/// A refusal inside the store closure has only the closure's error type to
+/// travel in, so the guard records it and aborts the commit, and the handler
+/// turns the record into the 403 with [`WriteGuard::verdict`] right after
+/// the store call.
+#[derive(Debug)]
+pub(crate) struct WriteGuard {
+    q: Option<QNode>,
+    scope_q: Option<String>,
+    areas: Vec<GeoQuery>,
+    /// The rules with type and Attribute names expanded, the form a stored
+    /// document is in.
+    rules: Option<Arc<Filter>>,
+    /// The expanded names of the Attributes the write sets or removes.
+    written: Vec<String>,
+    refused: std::sync::OnceLock<&'static str>,
+}
+
+impl WriteGuard {
+    /// The guard of the view `st` serves through for a write naming
+    /// `written` (expanded Attribute names), or `None` without a view.
+    /// `scope` is the Entity's own member and no Attribute (4.18): the
+    /// allowlist does not govern it, the post-image check does.
+    pub(crate) fn of<'a>(
+        st: &crate::state::AppState,
+        written: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Self> {
+        let narrowing = st.view.as_deref()?.narrowing();
+        Some(Self {
+            q: narrowing.q.as_deref().cloned(),
+            scope_q: narrowing.scope_q.clone(),
+            areas: narrowing.areas().cloned().collect(),
+            rules: crate::repr::type_rules(narrowing),
+            written: written.into_iter().map(str::to_owned).collect(),
+            refused: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Whether the view selects the stored document `doc`. A linked path in
+    /// the view's `q` never holds here, as in a rule (ADR-0023 rule 11): the
+    /// check runs inside the store's write and reads no other Entity.
+    pub(crate) fn sees(&self, doc: &serde_json::Value) -> bool {
+        let ctx = crate::repr::policy_context();
+        crate::repr::shown(self.rules.as_deref(), doc).is_some()
+            && self
+                .scope_q
+                .as_deref()
+                .is_none_or(|s| crate::scope_matches(s, doc))
+            && self.areas.iter().all(|g| g.matches(doc, ctx))
+            && self.q.as_ref().is_none_or(|q| {
+                !q.has_linked_paths() && antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
+            })
+    }
+
+    /// Why the view refuses `doc` with the written names on it, if it does.
+    fn judge(&self, doc: &serde_json::Value) -> Option<&'static str> {
+        self.judge_names(doc, self.written.iter().map(String::as_str).collect())
+    }
+
+    fn judge_names(&self, doc: &serde_json::Value, written: Vec<&str>) -> Option<&'static str> {
+        if !self.sees(doc) {
+            Some(MOVES_OUT)
+        } else if !self
+            .rules
+            .as_deref()
+            .is_none_or(|r| r.admits_write(doc, &written, crate::repr::policy_context()))
+        {
+            Some(NOT_WRITABLE)
+        } else {
+            None
+        }
+    }
+
+    fn refuse(&self, why: &'static str) -> antares_model::NgsiError {
+        let _ = self.refused.set(why);
+        antares_model::NgsiError::InternalError(why.into())
+    }
+
+    /// The pre-image check on the stored document: an Entity out of the
+    /// view is not found, the answer an absent one gets; a name the view
+    /// does not let the write set is refused (recorded).
+    pub(crate) fn pre(
+        &self,
+        id: &str,
+        doc: &serde_json::Value,
+    ) -> Result<(), antares_model::NgsiError> {
+        match self.judge(doc) {
+            None => Ok(()),
+            Some(MOVES_OUT) => Err(antares_model::NgsiError::ResourceNotFound(format!(
+                "entity {id} not found"
+            ))),
+            Some(why) => Err(self.refuse(why)),
+        }
+    }
+
+    /// [`Self::pre`] for a write that replaces the whole Entity: every
+    /// Attribute the stored Entity holds counts as written, since a replace
+    /// deletes the ones it omits (threat-model D6).
+    pub(crate) fn pre_whole(
+        &self,
+        id: &str,
+        doc: &serde_json::Value,
+    ) -> Result<(), antares_model::NgsiError> {
+        let held = doc
+            .as_object()
+            .into_iter()
+            .flat_map(|o| o.keys())
+            .map(String::as_str)
+            .filter(|k| !antares_model::is_meta(k) && !k.starts_with("__"));
+        let names = self
+            .written
+            .iter()
+            .map(String::as_str)
+            .chain(held)
+            .collect();
+        match self.judge_names(doc, names) {
+            None => Ok(()),
+            Some(MOVES_OUT) => Err(antares_model::NgsiError::ResourceNotFound(format!(
+                "entity {id} not found"
+            ))),
+            Some(why) => Err(self.refuse(why)),
+        }
+    }
+
+    /// The post-image check on `doc` as the write leaves it. A refusal is
+    /// recorded for [`Self::verdict`] and aborts the commit.
+    pub(crate) fn post(&self, doc: &serde_json::Value) -> Result<(), antares_model::NgsiError> {
+        match self.judge(doc) {
+            None => Ok(()),
+            Some(why) => Err(self.refuse(why)),
+        }
+    }
+
+    /// A document no store closure holds yet, as a create writes it.
+    pub(crate) fn admits(&self, doc: &serde_json::Value) -> Result<(), Denied> {
+        match self.judge(doc) {
+            None => Ok(()),
+            Some(why) => Err(Denied(why.to_owned())),
+        }
+    }
+
+    /// The refusal [`Self::pre`] or [`Self::post`] recorded, as the 403 the
+    /// handler answers.
+    pub(crate) fn verdict(&self) -> Result<(), Denied> {
+        match self.refused.get() {
+            Some(why) => Err(Denied((*why).to_owned())),
+            None => Ok(()),
+        }
+    }
+
+    /// Every Relationship target an expanded fragment writes must be an
+    /// Entity this view shows; an absent target answers as a hidden one.
+    pub(crate) async fn targets(
+        &self,
+        st: &crate::state::AppState,
+        tenant: &antares_model::TenantId,
+        fragment: &serde_json::Value,
+    ) -> Result<(), Denied> {
+        for target in relationship_targets(fragment) {
+            let doc = st
+                .store
+                .get(tenant, antares_store::Kind::Entity, target)
+                .await
+                .ok()
+                .flatten();
+            if !doc.is_some_and(|d| self.sees(&d)) {
+                return Err(Denied(TARGET_NOT_SHOWN.to_owned()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Rule 7 for an Entity a create writes, outside any store closure: in the
+/// view, with Attributes it shows and Relationships to Entities it shows.
+pub(crate) async fn admits_new(
+    st: &crate::state::AppState,
+    tenant: &antares_model::TenantId,
+    doc: &serde_json::Value,
+) -> Result<(), Denied> {
+    let Some(g) = WriteGuard::of(
+        st,
+        crate::attrs::attr_iris_of(doc).iter().map(String::as_str),
+    ) else {
+        return Ok(());
+    };
+    g.admits(doc)?;
+    g.targets(st, tenant, doc).await
+}
+
+/// The ids every Relationship and ListRelationship instance of an expanded
+/// Entity or fragment points at.
+fn relationship_targets(doc: &serde_json::Value) -> Vec<&str> {
+    let instances = doc
+        .as_object()
+        .into_iter()
+        .flat_map(|o| o.values())
+        .filter_map(serde_json::Value::as_array)
+        .flatten();
+    let mut out = Vec::new();
+    for inst in instances {
+        for member in ["object", "objectList"] {
+            match inst.get(member) {
+                Some(serde_json::Value::String(id)) => out.push(id.as_str()),
+                Some(serde_json::Value::Array(a)) => out.extend(a.iter().filter_map(|e| {
+                    e.as_str()
+                        .or_else(|| e.get("object").and_then(serde_json::Value::as_str))
+                })),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +663,19 @@ mod tests {
             attributes: attributes.iter().map(|a| (*a).to_owned()).collect(),
             ..Rule::default()
         }
+    }
+
+    #[test]
+    fn the_context_list_is_the_one_read_a_view_does_not_narrow() {
+        let view = cars();
+        assert_eq!(
+            with_view(Some(&view), LIST_CONTEXTS, Ok(Filter::default())),
+            Ok(Filter::default())
+        );
+        assert!(
+            with_view(Some(&view), "5.13.4", Ok(Filter::default())).is_err(),
+            "serving a stored @context is refused under a view"
+        );
     }
 
     /// Cars only, showing `speed` and `colour`, never `secret`.
@@ -514,15 +905,63 @@ mod tests {
         }
     }
 
-    /// A write under a view is a narrowed write, which the seam refuses
-    /// until writes through a view exist (ADR-0023 rule 7, T-3498).
+    /// Under a view, a write [`CHECKED_WRITES`] names runs and is judged on
+    /// the stored Entity (rule 7), a batch member by member; any other write
+    /// is a narrowed write and refused, and an engine's narrowing still
+    /// refuses a checked one.
     #[tokio::test]
-    async fn a_write_under_a_view_is_refused() {
+    async fn a_write_under_a_view_is_checked_or_refused() {
         let st = seeded(None).await;
         let view = st.with_view(Arc::new(cars()));
         let car = json!({"id": "urn:ngsi-ld:Car:9", "type": "Car"});
-        let (s, body, _) = send(&view, "POST", "/ngsi-ld/v1/entities", Some(car)).await;
+        let (s, body, _) = send(&view, "POST", "/ngsi-ld/v1/entities", Some(car.clone())).await;
+        assert_eq!(s, StatusCode::CREATED, "{body}");
+        let bike = json!({"id": "urn:ngsi-ld:Bike:9", "type": "Bike"});
+        let (s, body, _) = send(&view, "POST", "/ngsi-ld/v1/entities", Some(bike)).await;
         assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.to_string().contains(MOVES_OUT), "{body}");
+        let batch = json!([{"id": "urn:ngsi-ld:Car:8", "type": "Car"}]);
+        let (s, body, _) = send(
+            &view,
+            "POST",
+            "/ngsi-ld/v1/entityOperations/upsert",
+            Some(batch),
+        )
+        .await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+        let batch = json!([
+            {"id": "urn:ngsi-ld:Car:8", "type": "Car"},
+            {"id": "urn:ngsi-ld:Bike:8", "type": "Bike"}
+        ]);
+        let (s, body, _) = send(
+            &view,
+            "POST",
+            "/ngsi-ld/v1/entityOperations/create",
+            Some(batch),
+        )
+        .await;
+        assert_eq!(s, StatusCode::MULTI_STATUS, "{body}");
+        assert_eq!(body["success"], json!(["urn:ngsi-ld:Car:8"]), "{body}");
+        assert_eq!(body["errors"][0]["error"]["detail"], MOVES_OUT, "{body}");
+        let ids = json!(["urn:ngsi-ld:Car:9", "urn:ngsi-ld:Bike:8"]);
+        let (s, body, _) = send(
+            &view,
+            "POST",
+            "/ngsi-ld/v1/entityOperations/delete",
+            Some(ids),
+        )
+        .await;
+        assert_eq!(s, StatusCode::MULTI_STATUS, "{body}");
+        assert_eq!(body["success"], json!(["urn:ngsi-ld:Car:9"]), "{body}");
+        let narrowed = Filter {
+            pick: vec!["speed".into()],
+            ..Filter::default()
+        };
+        assert!(with_view(Some(&cars()), "5.6.1", Ok(narrowed)).is_err());
+        assert_eq!(
+            with_view(Some(&cars()), "5.6.1", Ok(Filter::default())),
+            Ok(Filter::default())
+        );
     }
 
     #[test]

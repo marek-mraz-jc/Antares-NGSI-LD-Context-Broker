@@ -769,6 +769,70 @@ mod clause_4_9_extensions {
         }
     }
 
+    /// T-3531 mutants: every ordering operator at its own boundary, on
+    /// numbers, plain strings and DateTimes — equal is outside `<`/`>` and
+    /// inside `<=`/`>=`.
+    #[test]
+    fn ordering_operators_at_the_boundary() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "n": {"type": "Property", "value": 5},
+            "s": {"type": "Property", "value": "m"},
+            "t": {"type": "Property", "value": "2020-01-01T00:00:00Z"}}));
+        for (query, want) in [
+            ("n>5", false),
+            ("n<5", false),
+            ("n>4", true),
+            ("n<=5", true),
+            (r#"s>"m""#, false),
+            (r#"s<"m""#, false),
+            ("t<2020-01-01T00:00:00Z", false),
+            ("t<2020-01-01T00:00:00.5Z", true),
+            ("t>2020-01-01T00:00:00Z", false),
+            ("t<=2020-01-01T00:00:00Z", true),
+        ] {
+            assert_eq!(q(&e, query), want, "{query}");
+        }
+    }
+
+    /// 4.9 p.90: a Range includes both ends. A string range orders as
+    /// strings; a temporal one only when all three are one shape, so a
+    /// mixed range falls back to string order (`.5Z` sorts before `Z`).
+    #[test]
+    fn ranges_include_both_ends_and_mix_shapes_as_strings() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "s": {"type": "Property", "value": "m"},
+            "t": {"type": "Property", "value": "2020-01-01T00:00:00.5Z"}}));
+        for (query, want) in [
+            (r#"s=="a".."z""#, true),
+            (r#"s=="n".."z""#, false),
+            (r#"s=="a".."l""#, false),
+            (r#"s=="m".."m""#, true),
+            ("t==2020-01-01T00:00:00Z..2020-01-02T00:00:00Z", true),
+            ("t==2020-01-01T00:00:00Z..23:59:59Z", false),
+        ] {
+            assert_eq!(q(&e, query), want, "{query}");
+        }
+    }
+
+    /// The legacy dotted step into a Property's object value, and a
+    /// Relationship whose `object` is an array of URIs (each one followed).
+    #[test]
+    fn value_paths_and_object_arrays() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "address": {"type": "Property", "value": {"city": "Berlin"}}}));
+        assert!(q(&e, r#"address.city=="Berlin""#));
+        assert!(!q(&e, r#"address.city=="Rome""#));
+        let d = |t: &str| format!("https://uri.etsi.org/ngsi-ld/default-context/{t}");
+        let station = json!({"id": "urn:ngsi-ld:WS:1", "type": [d("WeatherStation")],
+            d("sensor"): [{"type": "Relationship",
+                "object": ["urn:ngsi-ld:Device:0", "urn:ngsi-ld:Device:345"]}]});
+        let device = expand(json!({"id": "urn:ngsi-ld:Device:345", "type": "Device",
+            "humidity": {"type": "Property", "value": 40}}));
+        let lookup = |id: &str| (id == "urn:ngsi-ld:Device:345").then(|| device.clone());
+        let ast = parse_q("sensor{humidity}==40").expect("parse");
+        assert!(eval_q(&ast, &station, &ctx(), &lookup));
+    }
+
     /// 4.9: "If the target element corresponds to a Relationship or
     /// ListRelationship, the combination of such target element with any
     /// operator different than equal or unequal shall result in not matching."

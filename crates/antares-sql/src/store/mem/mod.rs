@@ -96,7 +96,7 @@ fn now_stamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-const ALL_KINDS: [Kind; 9] = [
+const ALL_KINDS: [Kind; 10] = [
     Kind::Entity,
     Kind::Subscription,
     Kind::Registration,
@@ -106,6 +106,7 @@ const ALL_KINDS: [Kind; 9] = [
     Kind::EntityMap,
     Kind::DistSub,
     Kind::DeadLetter,
+    Kind::View,
 ];
 
 /// Run `f` off the tokio worker pool when called from a multi-thread runtime:
@@ -171,6 +172,7 @@ struct Inner {
     entity_map_docs: HashMap<String, BTreeMap<String, Value>>,
     dist_subs: HashMap<String, BTreeMap<String, Value>>,
     dead_letters: HashMap<String, BTreeMap<String, Value>>,
+    views: HashMap<String, BTreeMap<String, Value>>,
     /// tenant → entity id → temporal doc (attr IRI → instance array).
     temporal: HashMap<String, BTreeMap<String, Value>>,
     /// hosted/cached @context documents, shared across tenants by design.
@@ -265,6 +267,7 @@ impl Store {
                 Kind::EntityMap => &mut inner.entity_map_docs,
                 Kind::DistSub => &mut inner.dist_subs,
                 Kind::DeadLetter => &mut inner.dead_letters,
+                Kind::View => &mut inner.views,
             };
             for row in ::redb::ReadableTable::iter(&table).map_err(|e| e.to_string())? {
                 let (k, v) = row.map_err(|e| e.to_string())?;
@@ -593,6 +596,7 @@ impl Store {
             Kind::EntityMap => &inner.entity_map_docs,
             Kind::DistSub => &inner.dist_subs,
             Kind::DeadLetter => &inner.dead_letters,
+            Kind::View => &inner.views,
         }
     }
 
@@ -607,6 +611,7 @@ impl Store {
             Kind::EntityMap => &mut inner.entity_map_docs,
             Kind::DistSub => &mut inner.dist_subs,
             Kind::DeadLetter => &mut inner.dead_letters,
+            Kind::View => &mut inner.views,
         }
     }
 
@@ -817,18 +822,26 @@ impl Store {
     /// lock: ids, the idPattern literal, types and attrs are tested on the
     /// borrowed documents and only what the answer holds is copied, where a
     /// snapshot of the tenant used to be. ids, types and attrs are exact
-    /// here, so without a `q`, `scopeQ` or geo query the outcome is
-    /// `decided`: the projection applies and a page is cut in id order (the
-    /// map's order), counted when asked. Otherwise the caller stays the
-    /// arbiter over the narrowed rows. 4.22: an expired Entity is not a
-    /// match, before any cut; its expired instances are the caller's.
+    /// here, and so is a `q` without linked-entity terms when the request
+    /// @context comes along: it runs through the API's own evaluator
+    /// (T-3572). Without anything else (`scopeQ`, a geo query, a linked
+    /// term) the outcome is `decided`: the projection applies and a page is
+    /// cut in id order (the map's order), counted when asked. Otherwise the
+    /// caller stays the arbiter over the narrowed rows. 4.22: an expired
+    /// Entity is not a match, before any cut; its expired instances are the
+    /// caller's.
     pub fn query_entities(
         &self,
         tenant: &TenantId,
         f: &filter::EntityFilter<'_>,
     ) -> filter::QueryOutcome {
         let now = crate::store::any::now_utc();
-        let decided = f.q.is_none() && f.scope_q.is_none() && f.geo.is_empty();
+        // a linked term reads other Entities under the caller's narrowing
+        let q = match (f.q, f.ctx) {
+            (Some(q), Some(ctx)) if !q.has_linked_paths() => Some((q, ctx)),
+            _ => None,
+        };
+        let decided = (f.q.is_none() || q.is_some()) && f.scope_q.is_none() && f.geo.is_empty();
         let inner = self
             .inner
             .read()
@@ -860,6 +873,7 @@ impl Store {
                 })
                 && f.attrs
                     .is_none_or(|attrs| attrs.iter().any(|a| has_live_attr(doc, a, &now)))
+                && q.is_none_or(|(q, ctx)| antares_ql::eval::eval_q(q, doc, ctx, &|_| None))
         };
         // ids name at most what the client sent: look each up, in id order
         let candidates: Box<dyn Iterator<Item = (&String, &Value)>> = match f.ids {

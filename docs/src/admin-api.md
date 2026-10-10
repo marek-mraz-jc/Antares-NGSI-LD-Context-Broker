@@ -202,6 +202,55 @@ letter kept, `404` when the tenant holds no such letter.
 
 `?tenant=` — `204`, or `404` when the tenant holds no such letter.
 
+## Views
+
+Only in a broker built with the `views` feature (ADR-0023 rule 10); a
+vanilla broker answers `404` here. A view is configuration: these routes
+validate it, store it under the reserved tenant `antares-views` and reload
+the pod's view table before they answer; every other pod reloads within
+`ANTARES_VIEWS_RELOAD_MS` (default 5000). `/q/health` lists each view
+(`loaded` with its tenant, operation count and loader notes, or `invalid`
+with the reason) under `views`, and each surface that serves through views
+as `open` or `closed` under `surfaces`: no view loaded, every route of such
+a surface answers `404`.
+
+```json
+{
+  "id": "cars", "tenant": "city",
+  "@context": {"a": "https://a.example/"},
+  "selector": ["Car"],
+  "q": "speed>0", "scopeQ": "/city/#",
+  "geoQ": {"georel": "within", "geometry": "Polygon", "coordinates": [[[0,0],[1,0],[1,1],[0,0]]]},
+  "rules": [{"types": ["Car"], "q": "status==\"moving\"", "attributes": ["speed", "a:name"]}],
+  "operations": ["query_entities", "retrieve_entity"]
+}
+```
+
+`id` is `[a-z0-9-]{1,63}`; `tenant` is a client tenant; `selector`,
+`rules[].types` and `rules[].attributes` expand through the view's own
+`@context` (inline, over the core context); every `q` is read against the
+core context; `operations` are row ids of `docs/analysis/operation-matrix.yaml`.
+No member has a default that serves more: an empty selector, rule list or
+operation list is refused. Bounds: 64 KiB per document, 64 rules, 256 names
+per list, 4096 bytes per `q` or `scopeQ`.
+
+### GET /q/views
+
+The table, as `/q/health` lists it.
+
+### GET /q/views/{id}
+
+The stored document, or `404`.
+
+### PUT /q/views/{id}
+
+`201` created, `204` replaced; `400` with the first reason the view cannot
+be served (nothing is stored), `413` over 64 KiB.
+
+### DELETE /q/views/{id}
+
+`204`, or `404` when there is no such view.
+
 ## The peer-facing wire
 
 ### POST /ex/v1/remote-notify

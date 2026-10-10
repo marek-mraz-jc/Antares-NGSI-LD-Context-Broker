@@ -113,6 +113,24 @@ async fn get_body(app: &Router, uri: &str) -> (StatusCode, String, axum::http::H
     )
 }
 
+/// Rule M4 keeps every surface closed until a view loads: one over Cars.
+async fn open(app: &Router) {
+    let doc = r#"{"id":"cars","tenant":"good","selector":["Car"],
+        "rules":[{"types":["Car"],"attributes":["colour"]}],
+        "operations":["retrieve_entity","query_entities"]}"#;
+    let Ok(resp) = app
+        .clone()
+        .oneshot(
+            Request::put("/q/views/cars")
+                .header("Content-Type", "application/json")
+                .header("Content-Length", doc.len())
+                .body(Body::from(doc))
+                .unwrap_or_default(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::CREATED, "the view loads");
+}
+
 /// A `@context` nobody serves: the NGSI-LD answer is a 5xx naming it
 /// (`LdContextNotAvailable`); the surface gets a fixed detail and an id,
 /// and the log carries the detail under the same id. Current-thread, so the
@@ -121,7 +139,12 @@ async fn get_body(app: &Router, uri: &str) -> (StatusCode, String, axum::http::H
 async fn an_inner_5xx_detail_never_reaches_the_surface() {
     let log = Log::default();
     let _guard = tracing::subscriber::set_default(log.clone());
-    let app = TestBroker::new().await.serve(Probe).expect("mounts");
+    let app = TestBroker::new()
+        .await
+        .expect("broker")
+        .serve(Probe)
+        .expect("mounts");
+    open(&app).await;
     let ctx = "http://127.0.0.1:9/nowhere-7f3a.jsonld";
 
     // the same request straight to the NGSI-LD API: a 5xx that names the context
@@ -130,6 +153,7 @@ async fn an_inner_5xx_detail_never_reaches_the_surface() {
     );
     let direct = TestBroker::new()
         .await
+        .expect("broker")
         .serve(Probe)
         .expect("mounts")
         .oneshot(
@@ -170,7 +194,12 @@ async fn an_inner_5xx_detail_never_reaches_the_surface() {
 /// path are refused before the broker sees them.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_request_that_is_not_its_operation_is_refused() {
-    let app = TestBroker::new().await.serve(Probe).expect("mounts");
+    let app = TestBroker::new()
+        .await
+        .expect("broker")
+        .serve(Probe)
+        .expect("mounts");
+    open(&app).await;
     for path in [
         "/q/health",
         "/x/probe",
@@ -191,7 +220,12 @@ async fn a_request_that_is_not_its_operation_is_refused() {
 /// the id) is malformed, before the broker sees it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_target_that_is_no_uri_is_malformed() {
-    let app = TestBroker::new().await.serve(Probe).expect("mounts");
+    let app = TestBroker::new()
+        .await
+        .expect("broker")
+        .serve(Probe)
+        .expect("mounts");
+    open(&app).await;
     let (s, body, _) = get_body(&app, "/x/probe?op=retrieve&path=/ngsi-ld/v1/entities/a%20b").await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "{body}");
     assert!(!body.contains("a b"), "no echo: {body}");
@@ -201,13 +235,22 @@ async fn a_target_that_is_no_uri_is_malformed() {
 /// own version info.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_health_report_names_the_surface() {
-    let app = TestBroker::new().await.serve(Probe).expect("mounts");
+    let app = TestBroker::new()
+        .await
+        .expect("broker")
+        .serve(Probe)
+        .expect("mounts");
     let (s, body, _) = get_body(&app, "/q/health").await;
     assert_eq!(s, StatusCode::OK, "{body}");
     let health: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(
         health["surfaces"]["probe"],
-        serde_json::json!({"info": null, "prefix": "/x/probe"}),
+        serde_json::json!({
+            "state": "closed",
+            "reason": "no view is loaded",
+            "info": null,
+            "prefix": "/x/probe"
+        }),
         "{body}"
     );
 }
@@ -223,6 +266,7 @@ fn every_refusal_renders_with_its_status_and_no_echo() {
             },
             405,
         ),
+        (Refusal::NotSupported, 422),
         (Refusal::Denied("no".into()), 403),
         (Refusal::Malformed("bad"), 400),
         (Refusal::Limit("too many"), 413),
