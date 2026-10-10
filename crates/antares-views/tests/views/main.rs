@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! The view root's integration tests, one binary: the reads per ADR-0023
 //! rule (`views_read`), the caller's `q` (`views_q`), snapshots
-//! (`views_tenant`) and what it answers when it does not serve
-//! (`views_errors`), over the fixture in `common`.
+//! (`views_tenant`), the writes per rule 7 (`views_writes`) and what it
+//! answers when it does not serve (`views_errors`), over the fixture in
+//! `common`.
 
 mod common;
 mod views_errors;
@@ -11,3 +12,4 @@ mod views_q;
 mod views_read;
 mod views_routing;
 mod views_tenant;
+mod views_writes;
