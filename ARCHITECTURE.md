@@ -64,7 +64,7 @@ module's header comment.
 | `entities.rs` | 3 700 | 5.6.1–5.6.6, 5.7.1–5.7.2 `/entities`, distributed write fan-out |
 | `paging.rs` | 1 400 | 4.12, 6.3.10 limit/offset/count and the next/prev links, 4.23 ordering and ICU collation, 6.3.17 `NGSILD-Warning`, the query body of 5.2.23 lifted into parameters; every list operation pages through it |
 | `attrs.rs` | 1 900 | 5.6.2–5.6.5 attribute operations |
-| `batch.rs` | 2 000 | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
+| `batch.rs` | 2 240 | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
 | `temporal.rs` | 4 100 | 5.6.11–5.6.16, 5.7.3–5.7.4 `/temporal/entities` |
 | `temporalq.rs` | 200 | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |
 | `types_attrs.rs` | 900 | 5.7.5–5.7.10 `/types`, `/attributes` |
@@ -86,8 +86,9 @@ module's header comment.
 | `bounds.rs` | 718 | every cap: body, URI, JSON depth, batch, fan-out, in-flight, regex program size, and the notification pipeline's queue depth and delivery widths; all reported by `/q/health`, which a test over this module's own source keeps true |
 | `egress.rs` | 470 | SSRF wall and per-destination circuit breakers for notifications, forwards, `@context` fetches |
 | `surface.rs` | 100 | `ApiSurface`: HTTP surfaces mounted beside the API root, on the reserved prefixes `/q` and `/x` |
-| `policy.rs` | 1 160 | the policy seam (ADR-0020): `PolicyEngine`, `Subject`/`Operation`/`Decision`/`Filter` (per-type allowlists, ADR-0023 rule 11), the built-in `AllowAll` engine, the clauses a narrowing can reach and the refusal everywhere else, the fail-closed calls that deny on a panic or a timeout, and the stored subject a notification is decided under |
+| `policy.rs` | 1 270 | the policy seam (ADR-0020): `PolicyEngine`, `Subject`/`Operation`/`Decision`/`Filter` (per-type allowlists, ADR-0023 rule 11), the built-in `AllowAll` engine, the clauses a narrowing can reach and the refusal everywhere else, the fail-closed calls that deny on a panic or a timeout, and the stored subject a notification is decided under |
 | `state.rs` | 930 | `AppState`: store, bus flag, mirror, HTTP clients, delivery policy, sinks, surfaces, hooks |
+| `fuzzing.rs` | 84 | the request parsers the `fuzz/` targets drive, behind the `fuzzing` feature that no broker build enables (T-3463) |
 
 Geoquery evaluation, the `q=` evaluator and the caches of compiled client
 query text are not in that table because they are not this crate's: they are

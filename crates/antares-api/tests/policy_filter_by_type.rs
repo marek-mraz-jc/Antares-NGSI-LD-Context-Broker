@@ -656,3 +656,55 @@ async fn no_answer_holds_a_type_attribute_pair_outside_the_map() {
         }
     }
 }
+
+/// Discovery (6.25-6.27, FILTERABLE since T-3479) reads the per-type rule:
+/// a type lists only its own Attributes, and an Attribute names only the
+/// types it is visible on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovery_lists_each_types_own_attributes_only() {
+    let st = state(picks(&[("Car", &["speed", "colour"]), ("User", &["name"])])).await;
+    seed(&st).await;
+    let get = |uri: &'static str| {
+        let st = st.clone();
+        async move { send(&st, "GET", uri, None).await }
+    };
+    let (code, body) = get("/ngsi-ld/v1/types?details=true").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let names: BTreeMap<String, Value> = body
+        .as_array()
+        .unwrap_or_else(|| panic!("not a list: {body}"))
+        .iter()
+        .map(|t| {
+            (
+                t["typeName"].as_str().unwrap_or_default().to_owned(),
+                t["attributeNames"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(names["Car"], json!(["colour", "speed"]), "{body}");
+    assert_eq!(names["User"], json!(["name"]), "{body}");
+    let (code, body) = get("/ngsi-ld/v1/types/User").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let text = body.to_string();
+    assert!(
+        !text.contains("colour") && !text.contains("email"),
+        "{text}"
+    );
+    let (_, body) = get("/ngsi-ld/v1/types/Car").await;
+    assert!(!body.to_string().contains("ownedBy"), "{body}");
+    let (code, body) = get("/ngsi-ld/v1/attributes/colour").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["typeNames"], json!(["Car"]), "{body}");
+    let (_, body) = get("/ngsi-ld/v1/attributes?details=true").await;
+    let text = body.to_string();
+    assert!(
+        !text.contains("email") && !text.contains("ownedBy"),
+        "{text}"
+    );
+    for hidden in [
+        "/ngsi-ld/v1/attributes/email",
+        "/ngsi-ld/v1/attributes/ownedBy",
+    ] {
+        assert_eq!(get(hidden).await.0, StatusCode::NOT_FOUND, "{hidden}");
+    }
+}

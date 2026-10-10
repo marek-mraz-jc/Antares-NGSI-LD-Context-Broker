@@ -32,6 +32,10 @@ use std::time::Duration;
 /// the broker holds one `Arc<dyn PolicyEngine>` chosen at startup.
 pub type DecisionFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>>;
 
+/// What [`PolicyEngine::decide_each`] hands back: one [`Decision`] per
+/// Operation it was given, in the same order.
+pub type DecisionsFuture<'a> = Pin<Box<dyn Future<Output = Vec<Decision>> + Send + 'a>>;
+
 /// How long an engine has to answer before the broker stops waiting and
 /// denies. Deployment knob (`ANTARES_POLICY_TIMEOUT_MS`), read once at
 /// first use. The default is short on purpose: the seam sits in front of
@@ -66,7 +70,12 @@ pub const WHOLE_TENANT: [&str; 4] = ["5.6.21", "5.16.1", "5.16.2", "5.16.7"];
 /// would perform in full an operation the engine believed it had narrowed.
 /// That is the one direction the seam may not fail in, so those clauses
 /// answer a narrowing as a deny ([`resolve`]).
-pub const FILTERABLE: [&str; 6] = ["5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.14.4", "5.14.5"];
+/// Discovery (5.7.5 to 5.7.10) is among them: ADR-0023 rule 5 computes it
+/// from the Entities the narrowing selects.
+pub const FILTERABLE: [&str; 12] = [
+    "5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.7.5", "5.7.6", "5.7.7", "5.7.8", "5.7.9", "5.7.10",
+    "5.14.4", "5.14.5",
+];
 
 /// Who is asking. The headers are the ones a deployment names for the
 /// seam to carry, copied verbatim and never interpreted: the broker does
@@ -379,6 +388,26 @@ pub trait PolicyEngine: Send + Sync {
     /// operation and before any fan-out (ADR-0014 `on_request`).
     fn decide<'a>(&'a self, subject: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a>;
 
+    /// Fires once per batch (5.6.7 to 5.6.10, 5.6.20) with one Operation
+    /// per member, so a batch is refused member by member and the allowed
+    /// members are applied (207). The answer holds one Decision per
+    /// Operation, in order; an answer of any other length denies the whole
+    /// batch. The default asks [`decide`](Self::decide) once per member; an
+    /// engine that asks a server overrides it to ask once.
+    fn decide_each<'a>(
+        &'a self,
+        subject: &'a Subject,
+        ops: &'a [Operation<'a>],
+    ) -> DecisionsFuture<'a> {
+        Box::pin(async move {
+            let mut out = Vec::with_capacity(ops.len());
+            for op in ops {
+                out.push(self.decide(subject, op).await);
+            }
+            out
+        })
+    }
+
     /// Fires once per notification document per subscription, before the
     /// egress check and the send (ADR-0014 `pre_notify`). Synchronous: it
     /// sits inside the delivery the broker is about to make, and an engine
@@ -504,6 +533,67 @@ pub async fn decide(engine: &dyn PolicyEngine, subject: &Subject, op: &Operation
     {
         resolve(op.clause, engine.decide(subject, op).await)
     }
+}
+
+/// [`decide`] for a batch: one answer per Operation, failing closed the
+/// same way. A panic, a timeout (one [`TIMEOUT`] for the whole batch) or an
+/// answer whose length does not match the batch denies every member, and
+/// each answer passes [`resolve`] for its own clause.
+pub async fn decide_each(
+    engine: &dyn PolicyEngine,
+    subject: &Subject,
+    ops: &[Operation<'_>],
+) -> Vec<Decision> {
+    let all = |why: &str| vec![Decision::Deny(why.to_owned()); ops.len()];
+    #[cfg(not(target_arch = "wasm32"))]
+    let answer = {
+        use futures_util::FutureExt as _;
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.decide_each(subject, ops)
+        }));
+        let Ok(fut) = built else {
+            tracing::error!("policy engine {} panicked; denying", engine.name());
+            metrics::counter!("antares_policy_failures_total", "reason" => "panic").increment(1);
+            return all(ENGINE_FAILED);
+        };
+        let guarded = std::panic::AssertUnwindSafe(fut).catch_unwind();
+        match tokio::time::timeout(*TIMEOUT, guarded).await {
+            Ok(Ok(d)) => d,
+            Ok(Err(_)) => {
+                tracing::error!("policy engine {} panicked; denying", engine.name());
+                metrics::counter!("antares_policy_failures_total", "reason" => "panic")
+                    .increment(1);
+                return all(ENGINE_FAILED);
+            }
+            Err(_) => {
+                tracing::error!(
+                    "policy engine {} did not answer within {:?}; denying",
+                    engine.name(),
+                    *TIMEOUT
+                );
+                metrics::counter!("antares_policy_failures_total", "reason" => "timeout")
+                    .increment(1);
+                return all(ENGINE_TIMED_OUT);
+            }
+        }
+    };
+    #[cfg(target_arch = "wasm32")]
+    let answer = engine.decide_each(subject, ops).await;
+    if answer.len() != ops.len() {
+        tracing::error!(
+            "policy engine {} answered {} decisions for {} operations; denying",
+            engine.name(),
+            answer.len(),
+            ops.len()
+        );
+        metrics::counter!("antares_policy_failures_total", "reason" => "length").increment(1);
+        return all(ENGINE_FAILED);
+    }
+    answer
+        .into_iter()
+        .zip(ops)
+        .map(|(d, op)| resolve(op.clause, d))
+        .collect()
 }
 
 /// Ask the engine about one notification, and fail closed: an engine that
@@ -683,6 +773,25 @@ pub async fn gate(
         Decision::Filter(f) => Ok(f),
         Decision::Deny(why) => Err(Denied(why)),
     }
+}
+
+/// [`gate`] for a batch: the refusal reason of each member, `None` where
+/// the member is allowed. A batch writes its members whole, so a `Filter`
+/// on a member is a refusal ([`resolve`]: no batch clause is FILTERABLE).
+pub async fn gate_each(
+    engine: &dyn PolicyEngine,
+    tenant: &antares_model::TenantId,
+    headers: &HeaderMap,
+    ops: &[Operation<'_>],
+) -> Vec<Option<String>> {
+    decide_each(engine, &subject_of(tenant, headers), ops)
+        .await
+        .into_iter()
+        .map(|d| match d {
+            Decision::Deny(why) => Some(why),
+            Decision::Allow | Decision::Filter(_) => None,
+        })
+        .collect()
 }
 
 /// The members of a JSON object, or nothing when it is not one.
@@ -1035,7 +1144,7 @@ mod tests {
         }
         // and every other clause outside FILTERABLE, because the handler
         // there never reads the Filter
-        for clause in ["5.6.1", "5.6.6", "5.8.1", "5.9.2", "5.13.2", "5.7.5"] {
+        for clause in ["5.6.1", "5.6.6", "5.8.1", "5.9.2", "5.13.2", "5.8.4"] {
             assert!(
                 matches!(resolve(clause, narrowed.clone()), Decision::Deny(_)),
                 "{clause} dropped a narrowing instead of refusing it"

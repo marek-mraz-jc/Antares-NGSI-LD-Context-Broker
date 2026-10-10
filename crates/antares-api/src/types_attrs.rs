@@ -56,6 +56,7 @@ async fn scan(
     tenant: &antares_model::TenantId,
     max: usize,
     only: Narrow<'_>,
+    view: View<'_>,
 ) -> Result<(Vec<Value>, bool), NgsiError> {
     let groups: Vec<Vec<String>> = match only {
         Narrow::Type(t) => vec![vec![t.to_owned()]],
@@ -84,7 +85,48 @@ async fn scan(
         t > i64::try_from(max).unwrap_or(i64::MAX)
     });
     rows.truncate(max);
+    // ADR-0023 rule 5: discovery answers from what the narrowing selects
+    // ponytail: the ceiling counts rows before the narrowing, so a narrowed
+    // fold can stop short of `max` visible rows; push q into the filter if
+    // that shows up
+    if let Some((r, ctx)) = view {
+        let mut kept = Vec::with_capacity(rows.len());
+        for d in rows {
+            if hides_a_type(r, &d)
+                || !crate::repr::policy_admits(st, tenant, ctx, r.policy_reach.as_deref(), &d).await
+            {
+                continue;
+            }
+            kept.push(crate::repr::policy_view(&d, r));
+        }
+        rows = kept;
+    }
     Ok((rows, more))
+}
+
+/// The caller's narrowing and the @context its q is read with; `None` when
+/// the engine narrowed nothing.
+type View<'a> = Option<(&'a crate::repr::Repr, &'a antares_jsonld::Context)>;
+
+/// Whether `omit` names one of the Entity's types. ADR-0023 rule 5 reads
+/// `pick`/`omit` as type and Attribute names here. `omit` hides the
+/// Entities of a type it names. `pick` keeps the Attributes it names, and,
+/// as on a read, never hides the Entity frame.
+fn hides_a_type(r: &crate::repr::Repr, doc: &Value) -> bool {
+    let Some(omit) = &r.policy_omit else {
+        return false;
+    };
+    doc["type"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|t| omit.iter().any(|n| n.iri == t || n.raw == t))
+}
+
+/// The narrowing a discovery handler applies, from the engine's Filter.
+fn view_of(filter: &crate::policy::Filter) -> Option<crate::repr::Repr> {
+    (!filter.is_empty()).then(|| crate::repr::narrowing(filter))
 }
 
 /// A fold that hit the scan ceiling answered from a prefix of the tenant's
@@ -118,9 +160,10 @@ async fn type_stats(
     tenant: &antares_model::TenantId,
     max: usize,
     only: Narrow<'_>,
+    view: View<'_>,
 ) -> Result<(TypeStats, bool), NgsiError> {
     let mut map: TypeStats = BTreeMap::new();
-    let (rows, partial) = scan(st, tenant, max, only).await?;
+    let (rows, partial) = scan(st, tenant, max, only, view).await?;
     for doc in rows {
         let mut attrs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         if let Some(o) = doc.as_object() {
@@ -164,9 +207,10 @@ async fn attr_stats(
     tenant: &antares_model::TenantId,
     max: usize,
     only: Narrow<'_>,
+    view: View<'_>,
 ) -> Result<(AttrStats, bool), NgsiError> {
     let mut map: AttrStats = BTreeMap::new();
-    let (rows, partial) = scan(st, tenant, max, only).await?;
+    let (rows, partial) = scan(st, tenant, max, only, view).await?;
     for doc in rows {
         let etypes: Vec<String> = doc["type"]
             .as_array()
@@ -217,9 +261,16 @@ pub async fn entity_types(
         check_params(&params, &["details", "local", "count"])?;
         let accept = parse_accept(&headers)?;
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.7.5").await?;
-        let (stats, partial) =
-            type_stats(&st, &tenant, *crate::bounds::MAX_FOLD_DOCS, Narrow::Tenant).await?;
+        let filter = gate!(st, &tenant, &headers, "5.7.5").await?;
+        let view = view_of(&filter);
+        let (stats, partial) = type_stats(
+            &st,
+            &tenant,
+            *crate::bounds::MAX_FOLD_DOCS,
+            Narrow::Tenant,
+            view.as_ref().map(|r| (r, &*ctx)),
+        )
+        .await?;
         let details = params.get("details").map(String::as_str) == Some("true");
         let payload = if details {
             Value::Array(
@@ -244,6 +295,7 @@ pub async fn entity_types(
         };
         let mut resp = respond(StatusCode::OK, payload, &ctx, accept, &tenant);
         mark_partial(&mut resp, partial, &st.host_alias);
+        filter.mark_restricted(resp.headers_mut());
         Ok::<_, ApiError>(resp)
     };
     go.await.unwrap_or_else(|e| e.into_response())
@@ -268,7 +320,9 @@ pub async fn entity_type_info(
         let accept = parse_accept(&headers)?;
         let ctx = request_context(&st.loader, &headers).await?;
         let iri = ctx.expand_key(&type_name);
-        gate!(st, &tenant, &headers, "5.7.7", types: std::slice::from_ref(&iri)).await?;
+        let filter =
+            gate!(st, &tenant, &headers, "5.7.7", types: std::slice::from_ref(&iri)).await?;
+        let view = view_of(&filter);
         // Only instances of this type carry its entityCount and its
         // attributeDetails (5.2.26), so the fold asks the datastore for those
         // and the ceiling applies to them — a tenant of 100M entities with 50
@@ -278,6 +332,7 @@ pub async fn entity_type_info(
             &tenant,
             *crate::bounds::MAX_FOLD_DOCS,
             Narrow::Type(&iri),
+            view.as_ref().map(|r| (r, &*ctx)),
         )
         .await?;
         let Some((count, attrs)) = stats.get(&iri) else {
@@ -308,6 +363,7 @@ pub async fn entity_type_info(
         });
         let mut resp = respond(StatusCode::OK, payload, &ctx, accept, &tenant);
         mark_partial(&mut resp, partial, &st.host_alias);
+        filter.mark_restricted(resp.headers_mut());
         Ok::<_, ApiError>(resp)
     };
     go.await.unwrap_or_else(|e| e.into_response())
@@ -330,9 +386,16 @@ pub async fn attributes(
         check_params(&params, &["details", "local", "count"])?;
         let accept = parse_accept(&headers)?;
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.7.8").await?;
-        let (stats, partial) =
-            attr_stats(&st, &tenant, *crate::bounds::MAX_FOLD_DOCS, Narrow::Tenant).await?;
+        let filter = gate!(st, &tenant, &headers, "5.7.8").await?;
+        let view = view_of(&filter);
+        let (stats, partial) = attr_stats(
+            &st,
+            &tenant,
+            *crate::bounds::MAX_FOLD_DOCS,
+            Narrow::Tenant,
+            view.as_ref().map(|r| (r, &*ctx)),
+        )
+        .await?;
         let details = params.get("details").map(String::as_str) == Some("true");
         let payload = if details {
             Value::Array(
@@ -357,6 +420,7 @@ pub async fn attributes(
         };
         let mut resp = respond(StatusCode::OK, payload, &ctx, accept, &tenant);
         mark_partial(&mut resp, partial, &st.host_alias);
+        filter.mark_restricted(resp.headers_mut());
         Ok::<_, ApiError>(resp)
     };
     go.await.unwrap_or_else(|e| e.into_response())
@@ -385,7 +449,9 @@ pub async fn attribute_info(
         // expands to nothing an Entity carries is simply absent —
         // ResourceNotFound below, not a rejected name.
         let iri = ctx.expand_key(&attr);
-        gate!(st, &tenant, &headers, "5.7.10", attrs: std::slice::from_ref(&iri)).await?;
+        let filter =
+            gate!(st, &tenant, &headers, "5.7.10", attrs: std::slice::from_ref(&iri)).await?;
+        let view = view_of(&filter);
         // attributeCount, attributeTypes and typeNames (5.2.28) are all
         // properties of the entities that CARRY this attribute; the rest of
         // the tenant is not read.
@@ -394,6 +460,7 @@ pub async fn attribute_info(
             &tenant,
             *crate::bounds::MAX_FOLD_DOCS,
             Narrow::Attr(&iri),
+            view.as_ref().map(|r| (r, &*ctx)),
         )
         .await?;
         let Some((count, attr_types, etypes)) = stats.get(&iri) else {
@@ -414,6 +481,7 @@ pub async fn attribute_info(
         });
         let mut resp = respond(StatusCode::OK, payload, &ctx, accept, &tenant);
         mark_partial(&mut resp, partial, &st.host_alias);
+        filter.mark_restricted(resp.headers_mut());
         Ok::<_, ApiError>(resp)
     };
     go.await.unwrap_or_else(|e| e.into_response())
@@ -479,7 +547,7 @@ mod discovery_folds {
             }),
         )
         .await;
-        let (stats, partial) = type_stats(&st, &tid("ta"), ALL, Narrow::Tenant)
+        let (stats, partial) = type_stats(&st, &tid("ta"), ALL, Narrow::Tenant, None)
             .await
             .expect("stats");
         assert!(!partial, "two entities are under any sane ceiling");
@@ -516,7 +584,7 @@ mod discovery_folds {
         for other in ["tb", TenantId::DEFAULT] {
             let t = tid(other);
             assert!(
-                type_stats(&st, &t, ALL, Narrow::Tenant)
+                type_stats(&st, &t, ALL, Narrow::Tenant, None)
                     .await
                     .expect("stats")
                     .0
@@ -524,7 +592,7 @@ mod discovery_folds {
                 "{other} must not see another tenant's types"
             );
             assert!(
-                attr_stats(&st, &t, ALL, Narrow::Tenant)
+                attr_stats(&st, &t, ALL, Narrow::Tenant, None)
                     .await
                     .expect("stats")
                     .0
@@ -532,7 +600,7 @@ mod discovery_folds {
                 "{other} must not see another tenant's attributes"
             );
         }
-        assert!(type_stats(&st, &tid("ta"), ALL, Narrow::Tenant)
+        assert!(type_stats(&st, &tid("ta"), ALL, Narrow::Tenant, None)
             .await
             .expect("stats")
             .0
@@ -572,7 +640,7 @@ mod discovery_folds {
             }),
         )
         .await;
-        let (stats, _) = attr_stats(&st, &tid("ta"), ALL, Narrow::Tenant)
+        let (stats, _) = attr_stats(&st, &tid("ta"), ALL, Narrow::Tenant, None)
             .await
             .expect("stats");
         let (count, atypes, etypes) = stats.get(V).expect("v");
@@ -615,7 +683,7 @@ mod discovery_folds {
             }),
         )
         .await;
-        let (stats, _) = type_stats(&st, &tid("ta"), ALL, Narrow::Tenant)
+        let (stats, _) = type_stats(&st, &tid("ta"), ALL, Narrow::Tenant, None)
             .await
             .expect("stats");
         assert!(
@@ -629,7 +697,7 @@ mod discovery_folds {
             "the expired attribute instance must not appear"
         );
         assert!(attrs.contains_key(R));
-        assert!(!attr_stats(&st, &tid("ta"), ALL, Narrow::Tenant)
+        assert!(!attr_stats(&st, &tid("ta"), ALL, Narrow::Tenant, None)
             .await
             .expect("stats")
             .0
@@ -642,15 +710,17 @@ mod discovery_folds {
     async fn empty_tenant_folds_to_nothing() {
         let st = AppState::new("test".into());
         for t in ["ta", TenantId::DEFAULT] {
-            let (types, partial) = type_stats(&st, &tid(t), ALL, Narrow::Tenant)
+            let (types, partial) = type_stats(&st, &tid(t), ALL, Narrow::Tenant, None)
                 .await
                 .expect("stats");
             assert!(types.is_empty() && !partial);
-            let (attrs, partial) = attr_stats(&st, &tid(t), ALL, Narrow::Tenant)
+            let (attrs, partial) = attr_stats(&st, &tid(t), ALL, Narrow::Tenant, None)
                 .await
                 .expect("stats");
             assert!(attrs.is_empty() && !partial);
-            let (rows, partial) = scan(&st, &tid(t), ALL, Narrow::Tenant).await.expect("scan");
+            let (rows, partial) = scan(&st, &tid(t), ALL, Narrow::Tenant, None)
+                .await
+                .expect("scan");
             assert!(rows.is_empty() && !partial);
         }
     }
@@ -669,25 +739,25 @@ mod discovery_folds {
             seed(&st, "ta", &id, Value::Object(doc)).await;
         }
         for (max, want) in [(1, 1), (4, 4), (5, 5), (6, 5)] {
-            let (rows, partial) = scan(&st, &tid("ta"), max, Narrow::Tenant)
+            let (rows, partial) = scan(&st, &tid("ta"), max, Narrow::Tenant, None)
                 .await
                 .expect("scan");
             assert_eq!(rows.len(), want, "max {max}");
             assert_eq!(partial, max < 5, "max {max} incompleteness");
         }
         // the folds inherit the bound: one entity read, one type, one attr
-        let (types, partial) = type_stats(&st, &tid("ta"), 1, Narrow::Tenant)
+        let (types, partial) = type_stats(&st, &tid("ta"), 1, Narrow::Tenant, None)
             .await
             .expect("stats");
         assert_eq!(types.len(), 1, "the fold read past its ceiling");
         assert!(partial, "a truncated type fold must report itself");
-        let (attrs, partial) = attr_stats(&st, &tid("ta"), 1, Narrow::Tenant)
+        let (attrs, partial) = attr_stats(&st, &tid("ta"), 1, Narrow::Tenant, None)
             .await
             .expect("stats");
         assert_eq!(attrs.len(), 1, "the fold read past its ceiling");
         assert!(partial, "a truncated attribute fold must report itself");
         // at the exact size the answer is complete, so nothing is flagged
-        let (types, partial) = type_stats(&st, &tid("ta"), 5, Narrow::Tenant)
+        let (types, partial) = type_stats(&st, &tid("ta"), 5, Narrow::Tenant, None)
             .await
             .expect("stats");
         assert_eq!(types.len(), 5);
@@ -751,14 +821,14 @@ mod discovery_folds {
         let last_attr = format!("{V}4");
 
         // tenant-wide, ceiling 1: the last entity is not read at all
-        let (wide, partial) = type_stats(&st, &tid("ta"), 1, Narrow::Tenant)
+        let (wide, partial) = type_stats(&st, &tid("ta"), 1, Narrow::Tenant, None)
             .await
             .expect("stats");
         assert!(!wide.contains_key(&last_type), "the ceiling hid the type");
         assert!(partial);
 
         // narrowed to that type, same ceiling: found, exact, complete
-        let (stats, partial) = type_stats(&st, &tid("ta"), 1, Narrow::Type(&last_type))
+        let (stats, partial) = type_stats(&st, &tid("ta"), 1, Narrow::Type(&last_type), None)
             .await
             .expect("stats");
         let (count, attrs) = stats.get(&last_type).expect("the narrowed type");
@@ -773,12 +843,12 @@ mod discovery_folds {
         }
 
         // and the same for one attribute (5.7.10)
-        let (wide, partial) = attr_stats(&st, &tid("ta"), 1, Narrow::Tenant)
+        let (wide, partial) = attr_stats(&st, &tid("ta"), 1, Narrow::Tenant, None)
             .await
             .expect("stats");
         assert!(!wide.contains_key(&last_attr), "the ceiling hid the attr");
         assert!(partial);
-        let (stats, partial) = attr_stats(&st, &tid("ta"), 1, Narrow::Attr(&last_attr))
+        let (stats, partial) = attr_stats(&st, &tid("ta"), 1, Narrow::Attr(&last_attr), None)
             .await
             .expect("stats");
         let (count, atypes, etypes) = stats.get(&last_attr).expect("the narrowed attr");
@@ -795,11 +865,11 @@ mod discovery_folds {
 
         // a narrowing that matches nothing is an empty fold, not a prefix of
         // the tenant — this is what makes 5.7.7 answer ResourceNotFound
-        let (stats, partial) = type_stats(&st, &tid("ta"), 1, Narrow::Type(SENSOR))
+        let (stats, partial) = type_stats(&st, &tid("ta"), 1, Narrow::Type(SENSOR), None)
             .await
             .expect("stats");
         assert!(stats.is_empty() && !partial);
-        let (stats, partial) = attr_stats(&st, &tid("ta"), 1, Narrow::Attr(R))
+        let (stats, partial) = attr_stats(&st, &tid("ta"), 1, Narrow::Attr(R), None)
             .await
             .expect("stats");
         assert!(stats.is_empty() && !partial);
@@ -824,7 +894,7 @@ mod discovery_folds {
         for other in ["tb", TenantId::DEFAULT] {
             let t = tid(other);
             assert!(
-                type_stats(&st, &t, ALL, Narrow::Type(BUILDING))
+                type_stats(&st, &t, ALL, Narrow::Type(BUILDING), None)
                     .await
                     .expect("stats")
                     .0
@@ -832,7 +902,7 @@ mod discovery_folds {
                 "{other} must not see another tenant's type"
             );
             assert!(
-                attr_stats(&st, &t, ALL, Narrow::Attr(V))
+                attr_stats(&st, &t, ALL, Narrow::Attr(V), None)
                     .await
                     .expect("stats")
                     .0
@@ -841,7 +911,7 @@ mod discovery_folds {
             );
         }
         assert_eq!(
-            type_stats(&st, &tid("ta"), ALL, Narrow::Type(BUILDING))
+            type_stats(&st, &tid("ta"), ALL, Narrow::Type(BUILDING), None)
                 .await
                 .expect("stats")
                 .0
@@ -859,7 +929,7 @@ mod discovery_folds {
     async fn a_freshly_created_type_is_in_the_very_next_fold() {
         let st = AppState::new("test".into());
         let t = tid("ta");
-        assert!(type_stats(&st, &t, ALL, Narrow::Tenant)
+        assert!(type_stats(&st, &t, ALL, Narrow::Tenant, None)
             .await
             .expect("stats")
             .0
@@ -872,12 +942,12 @@ mod discovery_folds {
                    V: [{"type": "Property", "value": 1}]}),
         )
         .await;
-        let (stats, _) = type_stats(&st, &t, ALL, Narrow::Tenant)
+        let (stats, _) = type_stats(&st, &t, ALL, Narrow::Tenant, None)
             .await
             .expect("stats");
         assert!(stats.contains_key(BUILDING), "the new type must be visible");
         assert!(!stats.contains_key(SENSOR));
-        assert!(attr_stats(&st, &t, ALL, Narrow::Tenant)
+        assert!(attr_stats(&st, &t, ALL, Narrow::Tenant, None)
             .await
             .expect("stats")
             .0
@@ -891,16 +961,16 @@ mod discovery_folds {
                    R: [{"type": "Relationship", "object": "urn:ngsi-ld:B:1"}]}),
         )
         .await;
-        let (stats, _) = type_stats(&st, &t, ALL, Narrow::Tenant)
+        let (stats, _) = type_stats(&st, &t, ALL, Narrow::Tenant, None)
             .await
             .expect("stats");
         assert!(stats.contains_key(BUILDING) && stats.contains_key(SENSOR));
-        assert!(type_stats(&st, &t, ALL, Narrow::Type(SENSOR))
+        assert!(type_stats(&st, &t, ALL, Narrow::Type(SENSOR), None)
             .await
             .expect("stats")
             .0
             .contains_key(SENSOR));
-        assert!(attr_stats(&st, &t, ALL, Narrow::Attr(R))
+        assert!(attr_stats(&st, &t, ALL, Narrow::Attr(R), None)
             .await
             .expect("stats")
             .0
@@ -911,7 +981,7 @@ mod discovery_folds {
             .delete(&t, Kind::Entity, "urn:ngsi-ld:B:2")
             .await
             .expect("delete"));
-        let (stats, _) = type_stats(&st, &t, ALL, Narrow::Tenant)
+        let (stats, _) = type_stats(&st, &t, ALL, Narrow::Tenant, None)
             .await
             .expect("stats");
         assert!(
