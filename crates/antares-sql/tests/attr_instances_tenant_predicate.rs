@@ -12,10 +12,11 @@
 //! `attr_instances` either compares `tenant_id`, or is named below with the
 //! reason it does not. A new statement is neither until someone says which.
 //!
-//! ponytail: plain string scanning over `#[cfg(test)]`-free source, not a
-//! Rust parser — it reads ordinary `"…"` literals and would miss a raw
-//! string or a table name assembled at runtime. Both are absent here, and
-//! `EXEMPT` is what a future one would have to be added to.
+//! ponytail: a small lexer over `#[cfg(test)]`-free source, not a Rust
+//! parser. It reads plain and raw string literals and skips char literals
+//! and comments; a table name assembled at runtime is the one shape it
+//! cannot judge, so the name appearing outside a literal fails the test
+//! instead of slipping past it.
 
 use std::path::{Path, PathBuf};
 
@@ -56,45 +57,91 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every `"…"` literal in `src`, with `\"` respected. Runs over the source
-/// ahead of the first `#[cfg(test)]` only: an assertion about a statement is
-/// not a statement.
-fn literals(src: &str) -> Vec<String> {
+/// The string literals of `src` and the code around them, comments
+/// dropped, read the way rustc reads them: `"…"` with its escapes, raw
+/// strings `r"…"` and `r#"…"#`, char literals (`'"'` is a quote, not the
+/// start of a string) and lifetimes. Runs over the source ahead of the first
+/// `#[cfg(test)]` only: an assertion about a statement is not a statement.
+fn lex(src: &str) -> (Vec<String>, String) {
     let src = match src.find("#[cfg(test)]") {
         Some(at) => &src[..at],
         None => src,
     };
-    let mut out = Vec::new();
-    let bytes: Vec<char> = src.chars().collect();
+    let c: Vec<char> = src.chars().collect();
+    let (mut lits, mut code) = (Vec::new(), String::new());
     let mut i = 0;
-    while i < bytes.len() {
-        // a `//` comment can hold an unbalanced quote; skip the line
-        if bytes[i] == '/' && bytes.get(i + 1) == Some(&'/') {
-            while i < bytes.len() && bytes[i] != '\n' {
+    while i < c.len() {
+        let next = c.get(i + 1).copied();
+        if c[i] == '/' && next == Some('/') {
+            while i < c.len() && c[i] != '\n' {
                 i += 1;
             }
-            continue;
-        }
-        if bytes[i] != '"' {
-            i += 1;
-            continue;
-        }
-        let mut lit = String::new();
-        i += 1;
-        while i < bytes.len() && bytes[i] != '"' {
-            if bytes[i] == '\\' {
+        } else if c[i] == '/' && next == Some('*') {
+            i += 2;
+            while i < c.len() && !(c[i] == '*' && c.get(i + 1) == Some(&'/')) {
                 i += 1;
-                if i >= bytes.len() {
-                    break;
+            }
+            i += 2;
+        } else if c[i] == '\'' {
+            // a char literal ('x', '\'', '\u{..}') or a lifetime ('a)
+            if next == Some('\\') {
+                // past the backslash and the escaped char, to the close
+                i += 3;
+                while i < c.len() && c[i] != '\'' {
+                    i += 1;
                 }
+                i += 1;
+            } else if c.get(i + 2) == Some(&'\'') {
+                i += 3;
+            } else {
+                code.push(c[i]);
+                i += 1;
             }
-            lit.push(bytes[i]);
+        } else if c[i] == 'r'
+            && (i == 0 || !(c[i - 1].is_alphanumeric() || c[i - 1] == '_'))
+            && matches!(next, Some('"' | '#'))
+        {
+            let mut j = i + 1;
+            while c.get(j) == Some(&'#') {
+                j += 1;
+            }
+            if c.get(j) != Some(&'"') {
+                code.push(c[i]);
+                i += 1;
+                continue;
+            }
+            let hashes = j - i - 1;
+            let close: Vec<char> = std::iter::once('"')
+                .chain(std::iter::repeat_n('#', hashes))
+                .collect();
+            let start = j + 1;
+            let mut end = start;
+            while end < c.len() && !c[end..].starts_with(&close) {
+                end += 1;
+            }
+            lits.push(c[start..end.min(c.len())].iter().collect());
+            i = end + close.len();
+        } else if c[i] == '"' {
+            let mut lit = String::new();
+            i += 1;
+            while i < c.len() && c[i] != '"' {
+                if c[i] == '\\' {
+                    i += 1;
+                    if i >= c.len() {
+                        break;
+                    }
+                }
+                lit.push(c[i]);
+                i += 1;
+            }
+            i += 1;
+            lits.push(lit);
+        } else {
+            code.push(c[i]);
             i += 1;
         }
-        i += 1;
-        out.push(lit);
     }
-    out
+    (lits, code)
 }
 
 /// Does this literal read or write the table, as opposed to naming it? The
@@ -127,28 +174,54 @@ fn names_its_tenant(lit: &str) -> bool {
     }
 }
 
+/// What one source file gets wrong: the statements on the table with no
+/// tenant and no exemption, and whether the table is named somewhere the
+/// scan cannot follow it into a statement — in code (a format argument, a
+/// macro) or as a bare-name literal a statement is assembled from at
+/// runtime. `used` marks the exemptions the file accounts for.
+fn findings(src: &str, used: &mut [bool]) -> (Vec<String>, bool) {
+    let (lits, code) = lex(src);
+    let mut unread = code.contains("attr_instances");
+    let mut naked = Vec::new();
+    for lit in lits {
+        if lit.trim().starts_with("attr_instances") && !lit.trim().contains(' ') {
+            unread = true;
+        }
+        if !touches_rows(&lit) {
+            continue;
+        }
+        if let Some(i) = EXEMPT.iter().position(|(frag, _)| lit.contains(frag)) {
+            used[i] = true;
+            continue;
+        }
+        if !names_its_tenant(&lit) {
+            naked.push(lit);
+        }
+    }
+    (naked, unread)
+}
+
 #[test]
 fn every_statement_on_attr_instances_carries_its_tenant() {
     let mut files = Vec::new();
     sources(&store_dir(), &mut files);
     assert!(!files.is_empty(), "no store sources found");
     let mut naked = Vec::new();
+    let mut unread = Vec::new();
     let mut used = vec![false; EXEMPT.len()];
     for file in &files {
         let src = std::fs::read_to_string(file).expect("read source");
-        for lit in literals(&src) {
-            if !touches_rows(&lit) {
-                continue;
-            }
-            if let Some(i) = EXEMPT.iter().position(|(frag, _)| lit.contains(frag)) {
-                used[i] = true;
-                continue;
-            }
-            if !names_its_tenant(&lit) {
-                naked.push(format!("{}: {lit}", file.display()));
-            }
+        let (lits, blind) = findings(&src, &mut used);
+        if blind {
+            unread.push(file.display().to_string());
         }
+        naked.extend(lits.into_iter().map(|l| format!("{}: {l}", file.display())));
     }
+    assert!(
+        unread.is_empty(),
+        "attr_instances named where this check cannot see the statement it \
+         ends up in (code, or a bare-name literal): {unread:?}"
+    );
     assert!(
         naked.is_empty(),
         "attr_instances statements with no tenant predicate and no written \
@@ -162,4 +235,29 @@ fn every_statement_on_attr_instances_carries_its_tenant() {
             "stale exemption: no statement contains {frag:?} any more"
         );
     }
+}
+
+/// The shapes that used to walk past the scan: a `'"'` char literal that
+/// threw the old quote counting out of step for the rest of the file, a raw
+/// string holding quotes, and the table name kept in a const or in code and
+/// spliced into the statement at runtime.
+#[test]
+fn the_scan_is_not_blinded_by_lexical_shapes() {
+    let judge = |src: &str| findings(src, &mut vec![false; EXEMPT.len()]);
+    let after_quote_char =
+        "fn f() { let q = '\"'; query(\"SELECT v FROM attr_instances WHERE id = $1\"); }";
+    assert_eq!(judge(after_quote_char).0.len(), 1, "{after_quote_char}");
+    let raw = "fn f() { query(r#\"SELECT \"v\" FROM attr_instances WHERE id = $1\"#); }";
+    assert_eq!(judge(raw).0.len(), 1, "{raw}");
+    let tenant = "fn f() { query(r#\"SELECT v FROM attr_instances WHERE tenant_id = $1\"#); }";
+    assert_eq!(judge(tenant), (vec![], false), "{tenant}");
+    let lifetime =
+        "fn f<'a>(x: &'a str) { query(\"SELECT v FROM attr_instances WHERE id = $1\"); }";
+    assert_eq!(judge(lifetime).0.len(), 1, "{lifetime}");
+    let spliced = "const T: &str = \"attr_instances\"; fn f() { format!(\"SELECT v FROM {T}\"); }";
+    assert!(judge(spliced).1, "{spliced}");
+    let in_code = "fn f() { sql!(SELECT v FROM attr_instances); }";
+    assert!(judge(in_code).1, "{in_code}");
+    let commented = "// FROM attr_instances, said in a comment\nfn f() {}";
+    assert_eq!(judge(commented), (vec![], false), "{commented}");
 }
