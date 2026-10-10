@@ -41,14 +41,14 @@ View {
     q:           Option<QNode>        // antares-ql AST, parsed once at load
     scope_q:     Option<String>       // 7.2.4 scopeQ
     geo_q:       Option<GeoQuery>     // 7.2.5 geoQ
-    attributes:  allowlist of Attribute names (expanded IRIs)
+    attributes:  Map<type IRI, Set<Attribute IRI>>   // per type, rule 11
     operations:  allowlist of TS 104 175 operations (operation-matrix.yaml ids)
 }
 ```
 
 A request to a view runs the ordinary NGSI-LD handler with one more
 conjunct: the view's predicate (`selector ∧ q ∧ scope_q ∧ geo_q`) and its
-attribute allowlist, composed with whatever the installed engine answers
+per-type attribute allowlists (rule 11), composed with whatever the installed engine answers
 (`effective = view ∧ engine`, both narrowing, neither widening). The view
 is applied before the engine is asked, so `AllowAll` behind a view still
 serves only the view. Without the `views` cargo feature none of this is
@@ -242,6 +242,58 @@ are DNS and certificate work outside the broker. A view pins its tenant: a
 request on a view path that carries `NGSILD-Tenant` naming another tenant
 is 400 `BadRequestData` ("a view serves one tenant"), never a silent switch.
 
+### 11. Attributes are allowed per type, keyed by expanded IRIs
+
+Amended 2026-10-10 (T-3528, owner finding: "from cars only these
+attributes, from vehicles and users totally different attributes, with
+different names"). The first version of this ADR gave a view one flat
+`attributes` list. One list for the whole answer is the platform's T-1862
+leak: an Attribute allowed on `Car` is served on `User` because it is in
+the one list, and a query over two types leaks (gap G4,
+`docs/analysis/gateway-to-broker-map.md`).
+
+So `attributes` is a map from an expanded type IRI to the set of expanded
+Attribute IRIs that type may show:
+
+- Keys and values are expanded through the view's `@context` at load. The
+  same short name with two meanings (`Car` `name` from one vocabulary,
+  `User` `name` from another) is two IRIs and two different Attributes; the
+  same IRI may be visible on one type and hidden on another.
+- A type the selector names without an entry in the map serves the Entity
+  frame only (`id`, `type` and the core members ADR-0020 never removes),
+  never "everything". A missing entry fails closed.
+- An Entity with several types sees the union of the allowlists of its
+  types that the view selects. A type the view does not select adds
+  nothing.
+- The rule holds at every join level (rule 6: a target is projected by its
+  own types, not the linking Entity's), in notifications including
+  `previousValue` (rule 9), in temporal answers (rule 8), and in discovery
+  (rule 5: `/types/{t}` lists only that type's allowed Attributes).
+- Rule 2 per type: a `q`, `orderBy` or `pick` naming an Attribute hidden for
+  a type drops the Entities of that type from the answer, not the whole
+  answer, and the answer carries `NGSILD-Warning: 199` naming the types it
+  dropped (TS 104 176 6.3.17), so no type is read through another type's
+  allowlist. Rule 7 per type: a write naming an Attribute hidden for the
+  target's type is refused whole.
+
+The engine's `policy::Filter` gets the same shape (G4): `pick_by_type` and
+`omit_by_type`, maps from type IRI to Attribute IRIs, beside the flat
+`pick`/`omit`, which still apply to every Entity. Both narrow, so they
+intersect. An Entity none of whose types has a `pick_by_type` entry keeps
+its frame only.
+
+Decided (worker-1, owner may override): union of the selected types'
+allowlists for a multi-typed Entity, because it is the owner's wording and
+a multi-typed Entity is, to a reader, each of its types; options: union,
+intersection. For `omit_by_type` the safe reading is the opposite one: an
+Attribute any of the Entity's types omits is removed (an omit is a promise
+that the Attribute is never served on that type, and the union would break
+it). Decided (worker-1, owner may override): a dropped type under rule 2 is
+named in a 199 warning, because silence would make "no such Entities" and
+"Entities you may not filter on" indistinguishable to an honest client
+while telling an attacker nothing the allowlist itself does not; options:
+warn, drop silently (open question O-4 of the gateway map).
+
 ## Threats and the rule that answers each
 
 | threat | example | rule |
@@ -259,6 +311,7 @@ is 400 `BadRequestData` ("a view serves one tenant"), never a silent switch.
 | temporal history leak | history before the Entity entered the view | 8 (residual, documented) |
 | tenant switch | `NGSILD-Tenant` on a view path | 10 |
 | misconfiguration served wide | a view with a broken predicate | 10 (not served), fail closed |
+| cross-type attribute leak (T-1862) | an Attribute allowed on `Car` served on `User`; `q` on it over both types | 11 (per-type map, missing entry = frame only) |
 
 ## Consequences
 
@@ -292,6 +345,7 @@ Each rule has one named test, filed by T-3445 from the T-3444 plan, in
 | 8 | `views_temporal_serves_current_members_and_limits_after_the_allowlist` |
 | 9 | `views_notifications_drop_hidden_changes_and_strip_previous_value` |
 | 10 | `views_reload_without_restart`, `views_a_broken_view_is_not_served`, `views_pin_their_tenant` |
+| 11 | `two_types_one_view_each_sees_only_its_own_attributes`, `same_short_name_two_vocabularies_are_different_attributes`, `same_iri_visible_on_car_hidden_on_user`, `q_on_an_attribute_hidden_for_user_drops_user_not_car`, `join_target_projected_by_its_own_type`, `notification_previous_value_projected_per_type`, `multi_typed_entity_gets_union_of_selected_types_only`, `type_without_entry_serves_id_and_type_only` (T-3528; the engine half in `policy_filter_by_type.rs`) |
 
 Plus, for the whole: the ETSI suite run against `/x/views/{all}/ngsi-ld/v1`
 where `{all}` selects every type and hides nothing must give the vanilla
