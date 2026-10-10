@@ -490,3 +490,20 @@ expect `type="application/ld+json"`. Suggest sending
 c4cdb0cf, and the same line in its 037_11); Antares carries that fix and
 types every pagination Link after the response media type
 (`registration_listing_5_10_2.rs::a_registration_page_link_carries_the_requested_media_type`).
+
+---
+
+## 20. [suite] 051_04_01 expects BadRequestData for an unknown @context id with reload=true
+
+**Title:** 051_04_01 expects 400 where 5.13.5.4 raises ResourceNotFound
+
+**Body:**
+
+CIM 009 5.13.5.4, second bullet: "If the @context identifier does not
+correspond to any existing entry in the @context storage, then an error of
+type ResourceNotFound shall be raised." The reload bullets that follow
+describe an existing @context by its kind. 051_04_01 deletes an unknown id
+with `reload=true` and expects 400 BadRequestData. Suggest 404
+ResourceNotFound, as the corrected fork does (forge commit 39921641);
+Antares carries that fix
+(`contexts_5_13.rs::clause_5_13_5_delete_and_reload_errors`).

@@ -173,6 +173,7 @@ carries the fix. The current list:
 | 17 | spec | TS 104 176 answers Create and Clone Snapshot with 202, CIM 009 with 201, and names no version a client can prefer (Antares: 201) |
 | 18 | suite | 021_08 expects temporal instances that fail `q`; 5.7.4.4 keeps only those that meet it |
 | 19 | suite | 037_11 and 041_03 query without Accept and expect ld+json pagination Links; 6.3.10 types them after the response |
+| 20 | suite | 051_04_01 expects 400 for an unknown @context id with `reload=true`; 5.13.5.4 raises ResourceNotFound first |
 
 Filing is manual; each entry carries the clause quotation and the
 proposed fix so it can be pasted into the ETSI tracker as is.

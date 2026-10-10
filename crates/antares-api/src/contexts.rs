@@ -506,31 +506,33 @@ pub async fn delete_context(
         gate!(st, &tenant, &headers, "5.13.5", ids: &[&id]).await?;
 
         let reload = reload_param(&params)?;
-        let entry = find_entry(&st, &tenant, &id).await?;
+        // an unknown id is 404 before any reload bullet (5.13.5.4, 051_04_01)
+        let Some(entry) = find_entry(&st, &tenant, &id).await? else {
+            return Err(NgsiError::ResourceNotFound(format!("@context {id} not found")).into());
+        };
         if reload {
             // reload is only meaningful for Cached @contexts (5.13.5.4);
-            // unknown ids and non-Cached kinds are 400 (051_04_01/05)
+            // other kinds are 400 (051_04_05)
             return match entry {
-                Some(CtxEntry::Core(url)) => {
+                CtxEntry::Core(url) => {
                     st.loader.refetch(&url).await.map_err(ApiError::from)?;
                     Ok(no_content(&tenant))
                 }
-                Some(CtxEntry::Cached(u)) => {
+                CtxEntry::Cached(u) => {
                     st.loader.refetch(&u.url).await.map_err(ApiError::from)?;
                     Ok(no_content(&tenant))
                 }
-                _ => Err(NgsiError::BadRequestData(
+                CtxEntry::Stored(_) => Err(NgsiError::BadRequestData(
                     "reload is only valid for Cached @contexts (5.13.5)".into(),
                 )
                 .into()),
             };
         }
         match entry {
-            None => Err(NgsiError::ResourceNotFound(format!("@context {id} not found")).into()),
-            Some(CtxEntry::Core(_)) => {
+            CtxEntry::Core(_) => {
                 Err(NgsiError::BadRequestData("the core @context cannot be deleted".into()).into())
             }
-            Some(CtxEntry::Cached(u)) => {
+            CtxEntry::Cached(u) => {
                 st.loader.usage_remove(&u.url).await;
                 // The write-through row shares the deterministic local id —
                 // deleting the API entry must delete the persisted copy too,
@@ -538,7 +540,7 @@ pub async fn delete_context(
                 let _ = st.store.context_delete(Some(&tenant), &u.local_id).await;
                 Ok(no_content(&tenant))
             }
-            Some(CtxEntry::Stored(doc)) => {
+            CtxEntry::Stored(doc) => {
                 let lid = doc["localId"].as_str().unwrap_or(&id);
                 st.store.context_delete(Some(&tenant), lid).await?;
                 if let Some(url) = doc.get("url").and_then(Value::as_str) {
