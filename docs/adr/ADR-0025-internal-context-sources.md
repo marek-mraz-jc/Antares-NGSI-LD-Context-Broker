@@ -155,10 +155,14 @@ exactly as over HTTP. `MAX_VIA_HOPS = 32` (`federation.rs:249`) holds the
 chain length.
 
 In-process depth has its own ceiling, `MAX_IN_PROCESS_CALL_DEPTH = 8`,
-held per task by `AppState::call`. A forward that would exceed it does
-not fail: it goes over HTTP to the same self URL, so a chain longer than
-eight in-process hops behaves as it does today. The depth bound protects
-the stack; it does not change what a client sees.
+held per task by `AppState::call`. A forward that would exceed it is not
+made, and it is answered the way 6.3.5 answers a loop: code 199 ("No
+response was received from the registration endpoint within the specified
+timeout period or a registration loop has been detected") on the merged
+answer, or 508 when that registration is the single `exclusive` or
+`redirect` source (`handle_via_loop`'s case). It never falls back to
+HTTP: an HTTP hop to a self URL would arrive without the subject and
+without the grant check of rule 5.
 
 ### 4. Tenant B's policy decides, about the caller who asked
 
@@ -172,31 +176,81 @@ B's handler builds `Subject { tenant: B, headers }` from them. Tenant B's
 engine therefore decides about the real caller, under tenant B, exactly
 as it would for a direct request to tenant B.
 
-This is the security property the task asks for: a registration in
-tenant A pointing at tenant B (anyone allowed to register in A can write
-one) reads nothing from B unless B's engine grants the caller. A refusal
-in B is a 403 to the forward; the merge reports it as 6.3.5's code 299
-("An error response (such as 403 - Forbidden) was received from the
-registration endpoint") and serves tenant A's own data. Over HTTP the
-same registration reaches B with no subject at all, which an engine that
-fails closed refuses and `AllowAll` serves. Under `AllowAll` (vanilla,
-every ETSI cell) both transports give the same answer, and tenancy is not
-an access control there anyway: any client can send `NGSILD-Tenant: B`.
+A refusal in B is a 403 to the forward; the merge reports it as 6.3.5's
+code 299 ("An error response (such as 403 - Forbidden) was received from
+the registration endpoint") without B's `detail` (threat C10) and serves
+tenant A's own data. Over HTTP the same registration reaches B with no
+subject at all, which an engine that fails closed refuses and `AllowAll`
+serves.
+
+The subject headers of the forward are always overwritten from the
+caller, never taken from the registration: `AppState::call` keeps a value
+the inner request already carries (`state.rs:604-622`), so the transport
+removes every subject header from the built request before the call, and
+a `contextSourceInfo` key naming `NGSILD-Tenant` is refused at 12.2.2
+with 400 `BadRequestData`, as TS 104 175 9.5.1 states: "As Tenant
+information, if applicable, is directly specified in the
+CSourceRegistration, it shall not be part of contextSourceInfo" (threat
+C3).
 
 Decided (worker-2, owner may override): the subject travels in process,
 because the target tenant's engine has to decide about someone, and the
 caller is the only honest answer; deciding about nobody either refuses a
 legitimate grant or serves an anonymous one. Options: carry the subject
-in process; strip it as over HTTP; require a per-pair allowlist
-(`A→B`) in configuration as well. The allowlist is not adopted: it
-duplicates what B's engine already decides and moves a data-access rule
-out of the policy seam into broker configuration.
+in process; strip it as over HTTP.
 
-Views (ADR-0023) compose without a new rule: a view pins tenant A, and
-the merged answer passes the view's predicate and allowlist after the
-merge, as every federated answer does (ADR-0020's post-merge filter).
+### 5. The target tenant consents: an export grant
 
-### 5. Modes and operation lists: unchanged by construction
+The engine alone is not enough. Under `AllowAll` nothing judges the
+forward, and in the platform the gateway is what keeps a client out of
+other tenants (it refuses Context Source registration through an
+Endpoint, `docs/analysis/gateway-to-broker-map.md` S16); in process there
+is no gateway between A and B. A registration is tenant A's data (12.2.2),
+so the broker reading B on A's behalf is a confused deputy unless B has
+agreed (`docs/analysis/surfaces-threat-model.md`, C1).
+
+This ADR adopts the threat model's decision C1 and C6 to C8: an
+internal forward into tenant B needs an **export grant** held by B.
+
+```
+ExportGrant {
+    target:  B (the tenant that holds the grant)
+    source:  A (the tenant whose registrations may read B)
+    view:    Option<view id>   // ADR-0023 view of B narrowing what B exports
+    access:  read | read-write // read unless it says read-write (C6)
+}
+```
+
+- A grant is an internal doc kind under the reserved tenant (ADR-0012),
+  written and removed through `/q` (the operator surface; ADR-0020 leaves
+  `/q` to the deployment to protect), never by a tenant-A request.
+- It is checked when a registration with an internal endpoint is created
+  or updated (12.2.2, 12.2.4: no grant is 403 `AccessDenied`, before
+  anything is stored) and again on every forward and every csource
+  notification, so a revoked grant stops data at once (C7). A forward
+  without a grant is not made and is reported as 299.
+- A write forward (create, update, append, merge, delete, the batch
+  forms) needs `read-write`; with `read` it is refused like an engine
+  refusal (C6).
+- The grant's view narrows on top of B's engine:
+  `effective = grant view ∧ B's engine` (ADR-0023), and B's view rules
+  (pre-image, post-image, allowlist) judge a forwarded write.
+- An internal tenant (`snap-<uuid>`, the reserved tenant) is never a
+  target; only a client-addressable tenant can hold a grant (C8).
+- B's log line for a forwarded request names the registration id and the
+  source tenant, never the subject (C9).
+
+Decided (worker-2, owner may override, carried over from T-3447 C1): the
+grant is held by the target, because only B can consent to B's data
+leaving B. Options: grant held by the target (chosen); trust the
+registrant (today's HTTP behaviour); admin-only registrations.
+
+Views (ADR-0023) on the source side compose without a new rule: a view
+pins tenant A, and the merged answer passes the view's predicate and
+allowlist after the merge, as every federated answer does (ADR-0020's
+post-merge filter).
+
+### 6. Modes and operation lists: unchanged by construction
 
 `inclusive`, `exclusive`, `redirect` and `auxiliary` (9.3.2, 9.3.3), the
 `operations` list (`FedReg::supports`, 4.3.6.1), `localOnly`, the
@@ -205,59 +259,96 @@ decided before `forward` is called and do not know the transport. No
 branch on "internal" exists outside `forward`; a `cg` query in CI holds
 that (Confirmation).
 
-### 6. Distributed subscriptions and their notifications
+### 7. Distributed subscriptions and their notifications
 
 `distsub::forward_sub` sends the 5.8.1.4 subscription copy through
-`forward`, so the copy is created in tenant B in process. Its
-notification endpoint is `ANTARES_PUBLIC_URL` plus the ADR-0019 receiver
-path. When that URL is a self URL, the HTTP sink delivers the
-notification through `AppState::call` as well, with the same
-recognition function; the 5.8.6 retry and dead-letter policy
+`forward`, so the copy is created in tenant B in process, under the
+grant check of rule 5. Its notification endpoint is `ANTARES_PUBLIC_URL`
+plus the ADR-0019 receiver path. When that URL is a self URL, the HTTP
+sink delivers the notification through the same transport, after the
+grant is read again (C7); the 5.8.6 retry and dead-letter policy
 (ADR-0015) is unchanged, since a delivery attempt is still one call that
 answers a status. Notification delivery never carries a subject (it is
 broker-initiated, ADR-0020), in process or not.
 
-### 7. Feature `internal-csr`
+### 8. Crate `antares-icsr`, feature `internal-csr`
 
-`antares-api` gains the cargo feature `internal-csr`, off by default and
-in no default feature set. Off: `ANTARES_SELF_URLS` is not read (a set
-value logs one warning at start naming the missing feature), and
-`forward` compiles to today's code. On with an empty list: identical to
-off at runtime. The transport is one module
-(`antares-api::federation::internal`), the only place that calls
-`AppState::call` from federation.
+GOAL point 6 puts every surface in its own crate. `antares-api` gains one
+core trait and no implementation:
+
+```rust
+/// A transport that can serve some forwards without a socket.
+pub trait ForwardTransport: Send + Sync {
+    /// `Some(answer)` when this transport serves `url`; `None` sends the
+    /// forward over HTTP as before.
+    fn forward<'a>(&'a self, st: &'a AppState, req: BuiltForward<'a>)
+        -> Option<ForwardFuture<'a>>;
+}
+```
+
+`AppState` holds `Option<Arc<dyn ForwardTransport>>`, `None` by default,
+set by `with_forward_transport` at the composition root exactly as
+`with_sink` adds a binding (ADR-0016). `federation::forward` asks it after
+building the request and before the egress check; `None` or a `None`
+answer is today's HTTP path. `BuiltForward` is the request `forward`
+built (method, URL, query, headers, body, the `FedReg`, the tenant and
+the caller's subject headers), so the transport cannot change what is
+sent, only how.
+
+The crate `antares-icsr` implements it: self-URL parsing and matching
+(rule 1), the export grant doc kind, its `/q` routes and its checks
+(rule 5), the call through `AppState::call` with the subject-only caller
+map (rules 2 and 4), the depth rule (rule 3). `antares-broker` depends on
+it behind the cargo feature `internal-csr`, off by default and in no
+default feature set, and registers it when `ANTARES_SELF_URLS` is
+non-empty. Without the feature `ANTARES_SELF_URLS` is not read (a set
+value logs one warning at start naming the missing feature). With the
+feature and an empty list nothing is registered, and every forward is
+HTTP.
+
+Decided (worker-2, owner may override): a trait in `antares-api` and the
+logic in `antares-icsr`, because a module inside `antares-api` would put
+grant storage and self-URL parsing into the vanilla crate behind `cfg`,
+which the vanilla-proof gate of GOAL point 1 would have to see through;
+options: crate behind a core trait (chosen), `cfg` module in
+`antares-api`.
 
 ## Consequences
 
 - One binary serves Context Spaces that federate with each other without
   a socket per hop; HTTP federation with other brokers is unchanged.
-- A deployment must list its self URLs. Forgetting one costs only the
-  socket: that forward goes over HTTP as it does today.
+- A deployment lists its self URLs and writes one grant per
+  (target, source) pair it allows. A missing self URL costs only the
+  socket (that forward goes over HTTP as today); a missing grant stops
+  the internal forward with a 299 warning.
 - Under a subject-aware engine an internal forward can return data an
   HTTP forward to the same broker would not (the caller holds a grant in
-  B), and it can refuse what `AllowAll` behind an HTTP hop served. Both
-  are the target tenant's policy deciding; the difference is documented,
-  not hidden.
+  B's engine), and it can refuse what `AllowAll` behind an HTTP hop
+  served. Both are the target tenant deciding; the difference is
+  documented, not hidden.
 - The egress guard no longer sees self-forwards. A self URL is the
   deployment's own address, which ADR-0010 already allows as private.
+- `antares-api` gains `ForwardTransport` and one optional `AppState`
+  member, and `12.2.2` refuses a `contextSourceInfo` key naming
+  `NGSILD-Tenant` in every build (a 9.5.1 conformance fix, not a feature).
 
 ## Equivalence test plan
 
 Three layers, each a named test filed by T-3445:
 
-1. **Same request.** `internal_csr_builds_the_http_request`
-   (`crates/antares-api/src/federation/internal.rs` unit test): for one
+1. **Same request.** `icsr_builds_the_http_request`
+   (`antares-icsr` unit test over `BuiltForward`): for one
    `FedReg` per mode, with and without `tenant`, `localOnly`,
    `jsonldContext`, `contentType`, `urn:ngsi-ld:request` copies, an inline
    `@context` and an inbound Via chain, the `http::Request` handed to
    `AppState::call` equals the `reqwest::Request` the HTTP branch builds:
    method, path after the self prefix, query, every header except `Host`,
    `Content-Length` and the subject headers, and body bytes.
-2. **Same answer.** `crates/antares-api/tests/internal_csr_equivalence.rs`
+2. **Same answer.** `crates/antares-icsr/tests/icsr_equivalence.rs`
    runs every scenario below twice against one broker: once with tenant B
    reached over a bound loopback listener (feature on, `ANTARES_SELF_URLS`
    empty, so HTTP) and once in process (the listener URL listed as a self
-   URL). Status, body (after `@context` normalisation), `NGSILD-Warning`
+   URL, and a read-write grant in B for A). Status, body (after `@context` normalisation), `NGSILD-Warning`
    values and the state left in both tenants must be equal. The scenarios
    are the federated ETSI test purposes, rebuilt as tenant-to-tenant
    cases because the suite's own Context Source is a mock HTTP server
@@ -284,7 +375,7 @@ Three layers, each a named test filed by T-3445:
    | D016_01_exc, D016_01_inc, D016_01_red | Merge Batch |
    | D017_01_exc, D017_01_inc, D017_01_red | Purge Entities |
    | D018_01, D018_02, D018_03 | Loop detection (D018_01 keeps its recorded suite defect, ADR-0011) |
-   | 5814_01, 5814_02 | Distributed subscription and its notification (rule 6) |
+   | 5814_01, 5814_02 | Distributed subscription and its notification (rule 7) |
 
    The TP ids come from `find ngsi-ld-test-suite/TP/NGSI-LD/DistributedOperations -name '*.robot'`
    at `4c3610cd5b`; a CI step diffs that list against the test's scenario
@@ -297,25 +388,33 @@ Three layers, each a named test filed by T-3445:
 
 ## Security
 
+Threat ids are those of `docs/analysis/surfaces-threat-model.md` section 8.
+
 | threat | rule | named test |
 |---|---|---|
-| a registration in A reads tenant B without a grant | 4 | `internal_csr_cross_tenant_read_without_grant_is_refused`: a test engine grants subject `alice` tenant A only; A registers B (inclusive, internal); `alice` queries A and gets A's Entities, no B Entity, and a 299 `NGSILD-Warning` |
-| the forward inherits the caller's tenant or snapshot | 2 | `internal_csr_without_tenant_targets_the_default_tenant`, `internal_csr_never_forwards_a_snapshot` |
-| a spoofed self URL (userinfo, other port, prefix trick `https://self.example.evil`) | 1 | `internal_csr_self_url_matching_is_exact` (equal or `self + "/"` only; userinfo never internal) |
-| an A → B → A chain loops in memory | 3 | `internal_csr_cycle_terminates_like_http` (ADR-0011's `cross_tenant_cycle_terminates_with_the_data`, in process) |
-| stack exhaustion by a deep chain | 3 | `internal_csr_falls_back_to_http_past_the_depth_bound` |
-| the subject leaves the process | 4, 6 | `policy_subject_on_the_wire_p6.rs` keeps passing for HTTP forwards; `internal_csr_notification_carries_no_subject` |
+| C1: a registration in A reads tenant B without B's consent | 5 | `crates/antares-icsr/tests/icsr_grant.rs::icsr_a_registration_into_a_tenant_that_granted_nothing_is_refused` (403 at 12.2.2, and a forward of a row written around the API is not made: 299) |
+| C1, C2: cross-tenant read without a grant in B's engine | 4 | `icsr_gate.rs::icsr_cross_tenant_read_without_an_engine_grant_is_refused`: grant present, a test engine allows subject `alice` in tenant A only; `alice` queries A and gets A's Entities, no B Entity, and a 299 `NGSILD-Warning` |
+| C2: the forward is judged under someone else | 4 | `icsr_gate.rs::icsr_the_target_engine_is_asked_about_the_caller` |
+| C3: the tenant or subject comes from registration data | 2, 4 | `icsr_gate.rs::icsr_the_subject_is_the_callers_and_never_comes_from_the_registration`; `csource_tenant_in_csi_9_5_1.rs::a_tenant_key_in_context_source_info_is_refused` |
+| the forward inherits the caller's tenant or snapshot | 2 | `icsr_gate.rs::icsr_without_tenant_targets_the_default_tenant`, `icsr_gate.rs::icsr_never_forwards_a_snapshot` |
+| a spoofed self URL (userinfo, other port, prefix trick `https://self.example.evil`) | 1 | `antares-icsr` unit test `self_url_matching_is_exact` (equal or `self + "/"` only; userinfo never internal; no DNS) |
+| C4: an A → B → A chain, stack exhaustion | 3 | `icsr_loops.rs::icsr_a_two_tenant_cycle_terminates_like_http`, `icsr_loops.rs::icsr_past_the_depth_bound_no_forward_is_made_and_none_goes_over_http` |
+| C5: fan-out amplification | 2 | `icsr_loops.rs::icsr_in_process_forwards_count_against_the_federation_bounds` |
+| C6: a write forwarded on a read grant | 5 | `icsr_grant.rs::icsr_a_write_forward_needs_a_read_write_grant` |
+| C7: data after revocation | 5, 7 | `icsr_grant.rs::icsr_a_revoked_grant_stops_forwards_and_notifications` |
+| C8: an internal tenant as a target | 5 | `icsr_grant.rs::icsr_an_internal_tenant_is_not_a_target` |
+| C9: B cannot tell what A read | 5 | `icsr_gate.rs::icsr_a_forward_is_logged_in_the_target_with_the_registration_id` |
+| C10: B's error text reaches A | 4 | `icsr_gate.rs::icsr_a_target_error_reaches_the_source_without_its_detail` |
+| the subject leaves the process | 4, 7 | `policy_subject_on_the_wire_p6.rs` keeps passing for HTTP forwards; `icsr_gate.rs::icsr_a_notification_carries_no_subject` |
 
 ## Confirmation
 
-- The tests above, in `crates/antares-api/tests/internal_csr_*.rs` and
-  the `federation::internal` unit module, under `--features internal-csr`.
-- CI `cg` gate (T-3447 module rules): no symbol outside
-  `antares_api::federation::internal` calls `AppState::call` from
-  `antares_api::federation` or `antares_api::batch`:
-  `MATCH (c:Symbol)-[:CALLS]->(f:Symbol {path:'antares_api::state::AppState::call'}) WHERE c.path STARTS WITH 'antares_api::' AND NOT c.path STARTS WITH 'antares_api::federation::internal' AND NOT c.is_test RETURN c.path`
-  must return no row.
-- The default build links no `federation::internal` symbol (the vanilla
-  `cargo tree -e features` / symbol gate of the surfaces architecture
-  ADR), and the ETSI DistributedOperations verdicts of the default build
-  are unchanged.
+- The tests above, in `crates/antares-icsr/tests/` and the crate's unit
+  modules, run by the feature-matrix job with `--features internal-csr`.
+- CI `cg` gate (T-3447 module rules): `AppState::call` is reached from
+  federation only through the transport trait; this query must return no
+  row:
+  `MATCH (c:Symbol)-[:CALLS]->(f:Symbol {path:'antares_api::state::AppState::call'}) WHERE (c.path STARTS WITH 'antares_api::federation' OR c.path STARTS WITH 'antares_api::batch' OR c.path STARTS WITH 'antares_api::distsub') AND NOT c.is_test RETURN c.path`
+- The default build links no `antares_icsr::` symbol (the vanilla symbol
+  gate of the surfaces architecture ADR), and the ETSI
+  DistributedOperations verdicts of the default build are unchanged.
