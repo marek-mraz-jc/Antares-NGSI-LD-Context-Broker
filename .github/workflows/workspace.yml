@@ -206,15 +206,19 @@ jobs:
           name: unit-junit
           path: unit-junit/
           if-no-files-found: warn
-      # License gate (nothing links TSL — Timescale is talked to
-      # over SQL only) + advisories. A pinned release binary, not the
-      # cargo-deny-action, so the job stays portable across runner archs.
-      - name: cargo-deny (licenses + advisories)
+      # Every deny.toml check on every change (T-3475): licenses (nothing
+      # links TSL — Timescale is talked to over SQL only), advisories, bans
+      # (wildcards, banned crates) and sources (crates.io only, no unknown
+      # git or registry). bans and sources ran only in the weekly sweep, so
+      # a dependency from an unlisted git source merged green. A pinned
+      # release binary, not the cargo-deny-action, so the job stays portable
+      # across runner archs.
+      - name: cargo-deny (licenses, advisories, bans, sources)
         run: |
           V=0.20.2
           curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${V}/cargo-deny-${V}-$(uname -m)-unknown-linux-musl.tar.gz" \
             | tar xz -C "$HOME/.cargo/bin" --strip-components=1 --wildcards '*/cargo-deny'
-          cargo deny --log-level warn check licenses advisories
+          cargo deny --log-level warn check all
       # The ETSI resource sampler + its sample↔TP join fail silently when
       # broken (an empty column reads as "nothing happened") — check them here.
       - name: ETSI sampling self-check
