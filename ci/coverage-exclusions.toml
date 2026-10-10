@@ -1,0 +1,13 @@
+# Lines and branches of the surfaces epic's new crates that no test covers, and why
+# (surfaces-test-plan section 1, dev/coverage-gate.py). One entry per function:
+#
+# [[exclusion]]
+# crate = "antares-ops"                 # the package name
+# file = "src/parse.rs"                 # relative to the crate's folder
+# function = "antares_ops::parse::depth" # the Rust path of the function
+# lines = 1                             # uncovered lines in it
+# branches = 1                          # uncovered branch sides in it
+# reason = "unreachable after a checked conversion the type system cannot see"
+#
+# The gate is red when a crate is below 100 % minus what is listed, and when an entry's function
+# is gone or its counts differ from what is measured, so a fixed gap must leave this file too.
