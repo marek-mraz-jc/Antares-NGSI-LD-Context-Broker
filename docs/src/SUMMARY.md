@@ -23,6 +23,7 @@
 - [Storage drivers](storage.md)
 - [Conformance](conformance.md)
 - [Performance](performance.md)
+- [Performance baseline](perf-baseline.md)
 - [Coverage](coverage.md)
 - [Shared crates](shared-crates.md)
 - [API reference](api.md)
