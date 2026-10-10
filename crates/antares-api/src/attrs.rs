@@ -137,7 +137,6 @@ async fn write_attrs(
     let obj = parsed.object(NgsiError::BadRequestData(
         "fragment must be a JSON object".into(),
     ))?;
-    gate!(st, &tenant, headers, mode.clause, ids: &[id]).await?;
     let fragment = expand_entity(
         obj,
         &parsed.ctx,
@@ -148,6 +147,14 @@ async fn write_attrs(
             ..Default::default()
         },
     )?;
+    gate!(
+        st, &tenant, headers, mode.clause,
+        ids: &[id],
+        types: &crate::policy::write_types(st, &tenant, id, Some(&fragment)).await,
+        attrs: &attr_iris_of(&fragment),
+        body: Some(&fragment),
+    )
+    .await?;
     let (plan, all_attr_iris) =
         attr_fed_plan(st, &tenant, id, &fragment, &parsed.ctx, params, headers).await?;
     let regs = match plan {
@@ -466,7 +473,7 @@ fn fwd_query(params: &HashMap<String, String>, keys: &[&str]) -> Vec<(String, St
 }
 
 /// Attribute IRIs of an expanded fragment (entity meta members excluded).
-fn attr_iris_of(fragment: &Value) -> Vec<String> {
+pub(crate) fn attr_iris_of(fragment: &Value) -> Vec<String> {
     fragment
         .as_object()
         .map(|o| {
@@ -786,7 +793,6 @@ async fn partial_update_inner(
     let obj = parsed.object(NgsiError::BadRequestData(
         "fragment must be a JSON object".into(),
     ))?;
-    gate!(st, &tenant, headers, "5.6.4", ids: &[id]).await?;
     let frag_inst = antares_jsonld::expand_attr_fragment(obj, &parsed.ctx)?;
     // 5.6.4.4: "Apply term expansion as mandated by clause 5.5.7, so that
     // the fully qualified name (URI) associated to the target Attribute is
@@ -794,6 +800,14 @@ async fn partial_update_inner(
     // valid Attribute name, and lands on a member of the stored document
     // that is not an Attribute.
     let attr_iri = antares_jsonld::expand_attr_name(attr, &parsed.ctx)?;
+    gate!(
+        st, &tenant, headers, "5.6.4",
+        ids: &[id],
+        types: &crate::policy::write_types(st, &tenant, id, None).await,
+        attrs: std::slice::from_ref(&attr_iri),
+        body: Some(&frag_inst),
+    )
+    .await?;
     // 5.6.4.4: "If the target Attribute is scope, then an error of type
     // BadRequestData shall be raised."
     if attr == "scope" || attr_iri == SCOPE_IRI {
@@ -931,7 +945,6 @@ pub async fn replace_attr(
         // 5.5.7 term expansion first, then 5.6.19.4: "If the target Attribute
         // is scope, then an error of type BadRequestData shall be raised" —
         // the target is the expanded name, so the IRI spelling counts too.
-        gate!(st, &tenant, &headers, "5.6.19", ids: &[&id]).await?;
         let attr_iri = antares_jsonld::expand_attr_name(&attr, &parsed.ctx)?;
         if attr == "scope" || attr_iri == SCOPE_IRI {
             return Err(NgsiError::BadRequestData(
@@ -954,6 +967,14 @@ pub async fn replace_attr(
                 ..Default::default()
             },
         )?;
+        gate!(
+            st, &tenant, &headers, "5.6.19",
+            ids: &[&id],
+            types: &crate::policy::write_types(&st, &tenant, &id, None).await,
+            attrs: std::slice::from_ref(&attr_iri),
+            body: Some(&fragment),
+        )
+        .await?;
         let incoming_arr = fragment
             .get(&attr_iri)
             .cloned()
@@ -1078,7 +1099,6 @@ async fn delete_attr_inner(
     check_attr_name(attr)?;
     check_params(params, &["datasetId", "deleteAll", "local", "type"])?;
     let ctx = request_context(&st.loader, headers).await?;
-    gate!(st, &tenant, headers, "5.6.5", ids: &[id]).await?;
     // 5.6.5.4 expands the path name the same way 5.6.4.4 does, and then
     // addresses `scope` as itself rather than as an Attribute. The target is
     // what the name expands to, so both spellings — the reserved short name
@@ -1092,6 +1112,13 @@ async fn delete_attr_inner(
             iri => iri,
         }
     };
+    gate!(
+        st, &tenant, headers, "5.6.5",
+        ids: &[id],
+        types: &crate::policy::write_types(st, &tenant, id, None).await,
+        attrs: std::slice::from_ref(&attr_iri),
+    )
+    .await?;
     let delete_all = params.get("deleteAll").map(String::as_str) == Some("true");
     let want_ds = crate::repr::target_dataset_id(params).map(String::from);
     let (regs, loop_answer) =

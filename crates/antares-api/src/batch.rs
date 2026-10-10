@@ -669,11 +669,27 @@ async fn batch_write(
     // type or Attribute has to reach the same verdict whether the request
     // came one Entity at a time or as one array.
     let gate_ids: Vec<&str> = spec.ids.iter().flatten().map(String::as_str).collect();
+    // A create is shown the Entities it creates, expanded as 5.6.1 shows
+    // its one (ADR-0020). An entry that does not expand is left out: the
+    // local arm reports it as before.
+    let shown = match (&st.policy, mode) {
+        (Some(_), BatchMode::Create) => Some(Value::Array(
+            items
+                .iter()
+                .filter_map(|(item, ctx)| {
+                    let (o, c) = (item.as_object()?, ctx.as_ref().ok()?);
+                    expand_entity(o, c, ExpandOpts::default()).ok()
+                })
+                .collect(),
+        )),
+        _ => None,
+    };
     gate!(
         st, &tenant, headers, mode.clause(),
         ids: &gate_ids,
         types: spec.types.as_deref().unwrap_or(&[]),
         attrs: spec.attrs.as_deref().unwrap_or(&[]),
+        body: shown.as_ref(),
     )
     .await?;
     let fed_regs =

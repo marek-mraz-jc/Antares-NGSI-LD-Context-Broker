@@ -159,20 +159,20 @@ Paths are relative to `/ngsi-ld/v1`; HEAD is served by every GET route (axum `ge
 | id | TS 104 175 | CIM 009 | kind | HTTP method + path (TS 104 176 clause file) | gate clause | `Operation` fields filled | phase | FILTERABLE | WHOLE_TENANT | gate site |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `create_entity` | 10.2.2 | 5.6.1 | write | `POST /ngsi-ld/v1/entities` (ts-104176-ngsi-ld-http-binding/7/7.2.3.2.md) | 5.6.1 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/entities.rs:114 |
-| `update_attributes` | 10.2.3 | 5.6.2 | write | `PATCH /ngsi-ld/v1/entities/{entityId}/attrs` (ts-104176-ngsi-ld-http-binding/7/7.4.3.2.md) | 5.6.2 | clause, ids | on_request | no | no | crates/antares-api/src/attrs.rs:140 |
-| `append_attributes` | 10.2.4 | 5.6.3 | write | `POST /ngsi-ld/v1/entities/{entityId}/attrs` (ts-104176-ngsi-ld-http-binding/7/7.4.3.1.md) | 5.6.3 | clause, ids | on_request | no | no | crates/antares-api/src/attrs.rs:140 |
-| `partial_attribute_update` | 10.2.5 | 5.6.4 | write | `PATCH /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}` (ts-104176-ngsi-ld-http-binding/7/7.5.3.2.md) | 5.6.4 | clause, ids | on_request | no | no | crates/antares-api/src/attrs.rs:789 |
+| `update_attributes` | 10.2.3 | 5.6.2 | write | `PATCH /ngsi-ld/v1/entities/{entityId}/attrs` (ts-104176-ngsi-ld-http-binding/7/7.4.3.2.md) | 5.6.2 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/attrs.rs:150 |
+| `append_attributes` | 10.2.4 | 5.6.3 | write | `POST /ngsi-ld/v1/entities/{entityId}/attrs` (ts-104176-ngsi-ld-http-binding/7/7.4.3.1.md) | 5.6.3 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/attrs.rs:150 |
+| `partial_attribute_update` | 10.2.5 | 5.6.4 | write | `PATCH /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}` (ts-104176-ngsi-ld-http-binding/7/7.5.3.2.md) | 5.6.4 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/attrs.rs:803 |
 | `set_attribute_value` | 10.2.6 | null | write | `PUT /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}/value` (no route, see note) **not_offered** | none | - | none | no | no | - |
-| `delete_attribute` | 10.2.7 | 5.6.5 | write | `DELETE /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}` (ts-104176-ngsi-ld-http-binding/7/7.5.3.4.md) | 5.6.5 | clause, ids | on_request | no | no | crates/antares-api/src/attrs.rs:1081 |
-| `delete_entity` | 10.2.8 | 5.6.6 | write | `DELETE /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.4.md) | 5.6.6 | clause, ids | on_request | no | no | crates/antares-api/src/entities.rs:1305 |
-| `merge_entity` | 10.2.9 | 5.6.17 | write | `PATCH /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.2.md) | 5.6.17 | clause, ids, body | on_request | no | no | crates/antares-api/src/entities.rs:1760 |
-| `replace_entity` | 10.2.10 | 5.6.18 | write | `PUT /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.3.md) | 5.6.18 | clause, ids | on_request | no | no | crates/antares-api/src/entities.rs:2113 |
-| `replace_attribute` | 10.2.11 | 5.6.19 | write | `PUT /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}` (ts-104176-ngsi-ld-http-binding/7/7.5.3.3.md) | 5.6.19 | clause, ids | on_request | no | no | crates/antares-api/src/attrs.rs:934 |
+| `delete_attribute` | 10.2.7 | 5.6.5 | write | `DELETE /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}` (ts-104176-ngsi-ld-http-binding/7/7.5.3.4.md) | 5.6.5 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/attrs.rs:1115 |
+| `delete_entity` | 10.2.8 | 5.6.6 | write | `DELETE /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.4.md) | 5.6.6 | clause, ids, types | on_request | no | no | crates/antares-api/src/entities.rs:1314 |
+| `merge_entity` | 10.2.9 | 5.6.17 | write | `PATCH /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.2.md) | 5.6.17 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/entities.rs:1778 |
+| `replace_entity` | 10.2.10 | 5.6.18 | write | `PUT /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.3.md) | 5.6.18 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/entities.rs:2152 |
+| `replace_attribute` | 10.2.11 | 5.6.19 | write | `PUT /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}` (ts-104176-ngsi-ld-http-binding/7/7.5.3.3.md) | 5.6.19 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/attrs.rs:970 |
 | `purge_entities` | 10.2.12 | 5.6.21 | write | `DELETE /ngsi-ld/v1/entities` (ts-104176-ngsi-ld-http-binding/7/7.2.3.3.md) | 5.6.21 | clause, scope_q | on_request | no | yes | crates/antares-api/src/entities.rs:1579 |
-| `batch_create` | 10.3.2 | 5.6.7 | write | `POST /ngsi-ld/v1/entityOperations/create` (ts-104176-ngsi-ld-http-binding/7/7.7.3.1.md) | 5.6.7 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/batch.rs:672 |
-| `batch_upsert` | 10.3.3 | 5.6.8 | write | `POST /ngsi-ld/v1/entityOperations/upsert` (ts-104176-ngsi-ld-http-binding/7/7.8.3.1.md) | 5.6.8 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/batch.rs:672 |
-| `batch_update` | 10.3.4 | 5.6.9 | write | `POST /ngsi-ld/v1/entityOperations/update` (ts-104176-ngsi-ld-http-binding/7/7.9.3.1.md) | 5.6.9 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/batch.rs:672 |
-| `batch_merge` | 10.3.5 | 5.6.20 | write | `POST /ngsi-ld/v1/entityOperations/merge` (ts-104176-ngsi-ld-http-binding/7/7.10.3.1.md) | 5.6.20 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/batch.rs:672 |
+| `batch_create` | 10.3.2 | 5.6.7 | write | `POST /ngsi-ld/v1/entityOperations/create` (ts-104176-ngsi-ld-http-binding/7/7.7.3.1.md) | 5.6.7 | clause, ids, types, attrs, body | on_request | no | no | crates/antares-api/src/batch.rs:687 |
+| `batch_upsert` | 10.3.3 | 5.6.8 | write | `POST /ngsi-ld/v1/entityOperations/upsert` (ts-104176-ngsi-ld-http-binding/7/7.8.3.1.md) | 5.6.8 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/batch.rs:687 |
+| `batch_update` | 10.3.4 | 5.6.9 | write | `POST /ngsi-ld/v1/entityOperations/update` (ts-104176-ngsi-ld-http-binding/7/7.9.3.1.md) | 5.6.9 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/batch.rs:687 |
+| `batch_merge` | 10.3.5 | 5.6.20 | write | `POST /ngsi-ld/v1/entityOperations/merge` (ts-104176-ngsi-ld-http-binding/7/7.10.3.1.md) | 5.6.20 | clause, ids, types, attrs | on_request | no | no | crates/antares-api/src/batch.rs:687 |
 | `batch_delete` | 10.3.6 | 5.6.10 | write | `POST /ngsi-ld/v1/entityOperations/delete` (ts-104176-ngsi-ld-http-binding/7/7.11.3.1.md) | 5.6.10 | clause, ids | on_request | no | no | crates/antares-api/src/batch.rs:1146 |
 | `retrieve_entity` | 10.4.2 | 5.7.1 | read | `GET /ngsi-ld/v1/entities/{entityId}` (ts-104176-ngsi-ld-http-binding/7/7.3.3.1.md) | 5.7.1 | clause, ids | on_request | yes | no | crates/antares-api/src/entities.rs:270 |
 | `query_entities` | 10.4.3 | 5.7.2 | read | `GET /ngsi-ld/v1/entities` (ts-104176-ngsi-ld-http-binding/7/7.2.3.1.md) | 5.7.2 | clause, q, scope_q | on_request | yes | no | crates/antares-api/src/entities.rs:567 |
@@ -327,15 +327,7 @@ The seam can only judge what it is given. These handlers leave members empty tha
 | id | TS 104 175 | gap |
 |---|---|---|
 | `create_entity` | 10.2.2 | 409 AlreadyExists on an id that exists but is out of view is an existence oracle |
-| `update_attributes` | 10.2.3 | types and attrs are not filled: an engine cannot judge the type or the attributes written |
-| `append_attributes` | 10.2.4 | types and attrs are not filled |
-| `partial_attribute_update` | 10.2.5 | attrs is not filled although the path names the Attribute |
-| `delete_attribute` | 10.2.7 | attrs is not filled although the path names the Attribute |
-| `delete_entity` | 10.2.8 | types is not filled |
-| `merge_entity` | 10.2.9 | types and attrs are not filled |
-| `replace_entity` | 10.2.10 | types, attrs and body are not filled |
-| `replace_attribute` | 10.2.11 | attrs and body are not filled |
-| `batch_create` | 10.3.2 | body is not filled; one decision covers all members, so an engine cannot deny one member and allow the rest |
+| `batch_create` | 10.3.2 | one decision covers all members, so an engine cannot deny one member and allow the rest (T-3480) |
 | `batch_upsert` | 10.3.3 | an upsert on an existing out-of-view id must not become an overwrite: the engine needs the pre-image to decide |
 | `retrieve_entity` | 10.4.2 | types and attrs are not filled although the request may name them |
 | `query_entities` | 10.4.3 | types, attrs and geo are not filled although the request carries them |
@@ -356,7 +348,7 @@ The seam can only judge what it is given. These handlers leave members empty tha
 | `create_entity_map` | 14.5 | q, scope_q, types, attrs and geo are not filled |
 | `create_temporal_entity_map` | 14.6 | q, scope_q, types, attrs and geo are not filled |
 
-`batch_create` to `batch_merge` share one gate call for the whole array (`crates/antares-api/src/batch.rs:672`, `ids: &gate_ids`), so an engine answers once for every member: it cannot deny one member and let the others through. The yaml's `batch` linked check ("each Entity of the array is its own single-Entity operation") is the target, not the current behaviour.
+`batch_create` to `batch_merge` share one gate call for the whole array (`crates/antares-api/src/batch.rs:687`, `ids: &gate_ids`), so an engine answers once for every member: it cannot deny one member and let the others through. The yaml's `batch` linked check ("each Entity of the array is its own single-Entity operation") is the target, not the current behaviour.
 
 ## 6. Write rows: pre-image, post-image and linked-entity checks
 
