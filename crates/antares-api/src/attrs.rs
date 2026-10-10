@@ -147,10 +147,12 @@ async fn write_attrs(
             ..Default::default()
         },
     )?;
+    let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await;
     gate!(
         st, &tenant, headers, mode.clause,
         ids: &[id],
-        types: &crate::policy::write_types(st, &tenant, id, Some(&fragment)).await,
+        types: &pre.types,
+        stored: pre.stored.as_ref(),
         attrs: &attr_iris_of(&fragment),
         body: Some(&fragment),
     )
@@ -800,10 +802,12 @@ async fn partial_update_inner(
     // valid Attribute name, and lands on a member of the stored document
     // that is not an Attribute.
     let attr_iri = antares_jsonld::expand_attr_name(attr, &parsed.ctx)?;
+    let pre = crate::policy::pre_image(st, &tenant, id, None).await;
     gate!(
         st, &tenant, headers, "5.6.4",
         ids: &[id],
-        types: &crate::policy::write_types(st, &tenant, id, None).await,
+        types: &pre.types,
+        stored: pre.stored.as_ref(),
         attrs: std::slice::from_ref(&attr_iri),
         body: Some(&frag_inst),
     )
@@ -967,10 +971,12 @@ pub async fn replace_attr(
                 ..Default::default()
             },
         )?;
+        let pre = crate::policy::pre_image(&st, &tenant, &id, None).await;
         gate!(
             st, &tenant, &headers, "5.6.19",
             ids: &[&id],
-            types: &crate::policy::write_types(&st, &tenant, &id, None).await,
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
             attrs: std::slice::from_ref(&attr_iri),
             body: Some(&fragment),
         )
@@ -1112,10 +1118,12 @@ async fn delete_attr_inner(
             iri => iri,
         }
     };
+    let pre = crate::policy::pre_image(st, &tenant, id, None).await;
     gate!(
         st, &tenant, headers, "5.6.5",
         ids: &[id],
-        types: &crate::policy::write_types(st, &tenant, id, None).await,
+        types: &pre.types,
+        stored: pre.stored.as_ref(),
         attrs: std::slice::from_ref(&attr_iri),
     )
     .await?;

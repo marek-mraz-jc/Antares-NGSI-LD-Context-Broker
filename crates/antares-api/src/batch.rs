@@ -696,7 +696,7 @@ async fn batch_write(
     // 403 it always was. An entry that does not expand is shown by its id
     // alone and left to the local arm to report.
     if let Some(engine) = &st.policy {
-        let mut shown: Vec<(Option<String>, Vec<String>, Option<Value>)> = Vec::new();
+        let mut shown: Vec<(Option<String>, crate::policy::PreImage, Option<Value>)> = Vec::new();
         for (item, ctx) in &items {
             let id = item.get("id").and_then(Value::as_str).map(str::to_owned);
             let body = match (item.as_object(), ctx.as_ref()) {
@@ -705,11 +705,11 @@ async fn batch_write(
             };
             // ponytail: one store read per member, only with an engine
             // attached; a batched read when large batches meet an engine.
-            let types = match &id {
-                Some(id) => crate::policy::write_types(st, &tenant, id, body.as_ref()).await,
-                None => Vec::new(),
+            let pre = match &id {
+                Some(id) => crate::policy::pre_image(st, &tenant, id, body.as_ref()).await,
+                None => crate::policy::PreImage::default(),
             };
-            shown.push((id, types, body));
+            shown.push((id, pre, body));
         }
         let attrs: Vec<Vec<String>> = shown
             .iter()
@@ -733,15 +733,14 @@ async fn batch_write(
             .iter()
             .zip(&ids)
             .zip(&attrs)
-            .map(
-                |(((_, types, body), ids), attrs)| crate::policy::Operation {
-                    ids,
-                    types,
-                    attrs,
-                    body: body.as_ref(),
-                    ..crate::policy::Operation::new(mode.clause())
-                },
-            )
+            .map(|(((_, pre, body), ids), attrs)| crate::policy::Operation {
+                ids,
+                types: &pre.types,
+                attrs,
+                body: body.as_ref(),
+                stored: pre.stored.as_ref(),
+                ..crate::policy::Operation::new(mode.clause())
+            })
             .collect();
         let asking = crate::snapshots::asking_tenant(st, &tenant).await;
         let refused = crate::policy::gate_each(engine.as_ref(), &asking, headers, &ops).await;
@@ -1228,11 +1227,11 @@ pub async fn batch_delete(
         // its path parameter. A refused id lands in E, the rest are deleted.
         let mut ids: Vec<&Value> = ids.iter().collect();
         if let Some(engine) = &st.policy {
-            let mut types: Vec<Vec<String>> = Vec::new();
+            let mut pres: Vec<crate::policy::PreImage> = Vec::new();
             for id in &ids {
-                types.push(match id.as_str() {
-                    Some(id) => crate::policy::write_types(&st, &tenant, id, None).await,
-                    None => Vec::new(),
+                pres.push(match id.as_str() {
+                    Some(id) => crate::policy::pre_image(&st, &tenant, id, None).await,
+                    None => crate::policy::PreImage::default(),
                 });
             }
             let one: Vec<Vec<&str>> = ids
@@ -1241,10 +1240,11 @@ pub async fn batch_delete(
                 .collect();
             let ops: Vec<crate::policy::Operation<'_>> = one
                 .iter()
-                .zip(&types)
-                .map(|(ids, types)| crate::policy::Operation {
+                .zip(&pres)
+                .map(|(ids, pre)| crate::policy::Operation {
                     ids,
-                    types,
+                    types: &pre.types,
+                    stored: pre.stored.as_ref(),
                     ..crate::policy::Operation::new("5.6.10")
                 })
                 .collect();

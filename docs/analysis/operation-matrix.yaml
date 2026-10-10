@@ -178,7 +178,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -204,7 +204,7 @@ operations:
           visibility of the target Entity under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -226,7 +226,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -266,13 +266,13 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-    the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+    the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
     an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
     decides on clause, ids, types (stored and named), attrs, body]'
@@ -305,7 +305,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -341,7 +341,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -381,13 +381,13 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-    the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+    the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
     an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
     decides on clause, ids, types (stored and named), attrs, body]'
@@ -419,8 +419,7 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -443,8 +442,7 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -465,8 +463,7 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -505,14 +502,12 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-    Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced today:
-    the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+    Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
     an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
     decides on clause, ids, types (stored and named), attrs, body]'
@@ -615,8 +610,7 @@ operations:
         - 'relationship delete: removing a Relationship needs the relationship attribute writable; the target is
           not read, so its visibility is not required'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
         lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.5.3.4.md
@@ -639,8 +633,7 @@ operations:
         - 'relationship delete: removing a Relationship needs the relationship attribute writable; the target is
           not read, so its visibility is not required'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
         lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
     mcp:
@@ -659,8 +652,7 @@ operations:
         - 'relationship delete: removing a Relationship needs the relationship attribute writable; the target is
           not read, so its visibility is not required'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
         lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
     linkml:
@@ -697,13 +689,11 @@ operations:
         - 'relationship delete: removing a Relationship needs the relationship attribute writable; the target is
           not read, so its visibility is not required'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
         lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-    Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced today:
-    the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
+    Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would lose
     it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
 - id: delete_entity
@@ -732,8 +722,7 @@ operations:
         - 'delete entity: Relationships in other Entities that point at the deleted one are not touched (NGSI-LD
           has no referential integrity), so no linked check'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no
-        stored image, the engine decides on clause, ids, types (stored and named)]'
+        Entity is indistinguishable from an absent one, ADR-0020) [the engine decides on clause, ids, types (stored and named) and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.3.3.4.md
       gate_site: crates/antares-api/src/entities.rs:1395
@@ -752,8 +741,7 @@ operations:
         - 'delete entity: Relationships in other Entities that point at the deleted one are not touched (NGSI-LD
           has no referential integrity), so no linked check'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no
-        stored image, the engine decides on clause, ids, types (stored and named)]'
+        Entity is indistinguishable from an absent one, ADR-0020) [the engine decides on clause, ids, types (stored and named) and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
     mcp:
       status: supported
@@ -770,8 +758,7 @@ operations:
         - 'delete entity: Relationships in other Entities that point at the deleted one are not touched (NGSI-LD
           has no referential integrity), so no linked check'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no
-        stored image, the engine decides on clause, ids, types (stored and named)]'
+        Entity is indistinguishable from an absent one, ADR-0020) [the engine decides on clause, ids, types (stored and named) and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
     linkml:
       status: not_offered
@@ -806,12 +793,10 @@ operations:
         - 'delete entity: Relationships in other Entities that point at the deleted one are not touched (NGSI-LD
           has no referential integrity), so no linked check'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no
-        stored image, the engine decides on clause, ids, types (stored and named)]'
+        Entity is indistinguishable from an absent one, ADR-0020) [the engine decides on clause, ids, types (stored and named) and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-    Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no stored
-    image, the engine decides on clause, ids, types (stored and named)]'
+    Entity is indistinguishable from an absent one, ADR-0020) [the engine decides on clause, ids, types (stored and named) and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
 - id: merge_entity
   ts104175: 10.2.9
@@ -842,7 +827,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -867,7 +852,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -889,7 +874,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -929,13 +914,13 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-    the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+    the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
     an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
     decides on clause, ids, types (stored and named), attrs, body]'
@@ -972,8 +957,7 @@ operations:
           not read, so its visibility is not required'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
-        one the body names is writable (a replace deletes the ones it omits) [not enforced today: the Operation
-        carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        one the body names is writable (a replace deletes the ones it omits) [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -999,8 +983,7 @@ operations:
           not read, so its visibility is not required'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
-        one the body names is writable (a replace deletes the ones it omits) [not enforced today: the Operation
-        carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        one the body names is writable (a replace deletes the ones it omits) [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -1024,8 +1007,7 @@ operations:
           not read, so its visibility is not required'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
-        one the body names is writable (a replace deletes the ones it omits) [not enforced today: the Operation
-        carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        one the body names is writable (a replace deletes the ones it omits) [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -1067,15 +1049,13 @@ operations:
           not read, so its visibility is not required'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
-        one the body names is writable (a replace deletes the ones it omits) [not enforced today: the Operation
-        carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        one the body names is writable (a replace deletes the ones it omits) [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
-    one the body names is writable (a replace deletes the ones it omits) [not enforced today: the Operation carries
-    no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+    one the body names is writable (a replace deletes the ones it omits) [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
     an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
     decides on clause, ids, types (stored and named), attrs, body]'
@@ -1107,8 +1087,7 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -1132,8 +1111,7 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -1154,8 +1132,7 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -1194,14 +1171,12 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-    Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced today:
-    the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
+    Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
     an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
     decides on clause, ids, types (stored and named), attrs, body]'
@@ -1447,7 +1422,7 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: create_entity pre-image when absent, update pre-image (visible, attrs writable) when
-        present [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        present [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
@@ -1481,7 +1456,7 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: create_entity pre-image when absent, update pre-image (visible, attrs writable) when
-        present [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        present [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
@@ -1521,17 +1496,15 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: create_entity pre-image when absent, update pre-image (visible, attrs writable) when
-        present [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        present [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
   pre_image: 'per Entity: create_entity pre-image when absent, update pre-image (visible, attrs writable) when present
-    [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+    [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a write
     cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image,
     the engine decides on ids/clause only]'
-  gaps: 'an upsert on an existing out-of-view id must not become an overwrite: the engine needs the pre-image to
-    decide'
 - id: batch_update
   ts104175: 10.3.4
   cim009: 5.6.9
@@ -1563,8 +1536,7 @@ operations:
           one per-entity error)'
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
-      pre_image: 'per Entity: as update_attributes [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+      pre_image: 'per Entity: as update_attributes [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
@@ -1596,8 +1568,7 @@ operations:
           one per-entity error)'
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
-      pre_image: 'per Entity: as update_attributes [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+      pre_image: 'per Entity: as update_attributes [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
@@ -1636,13 +1607,11 @@ operations:
           one per-entity error)'
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
-      pre_image: 'per Entity: as update_attributes [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+      pre_image: 'per Entity: as update_attributes [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
-  pre_image: 'per Entity: as update_attributes [not enforced today: the Operation carries no stored image, the engine
-    decides on ids/clause only]'
+  pre_image: 'per Entity: as update_attributes [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a write
     cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image,
     the engine decides on ids/clause only]'
@@ -1677,8 +1646,7 @@ operations:
           one per-entity error)'
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
-      pre_image: 'per Entity: as merge_entity [not enforced today: the Operation carries no stored image, the engine
-        decides on ids/clause only]'
+      pre_image: 'per Entity: as merge_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
@@ -1695,8 +1663,7 @@ operations:
         linked_entity_checks:
         - 'batch: each Entity of the array is its own single-Entity operation under the view (one decision per entity,
           one per-entity error)'
-      pre_image: 'per Entity: as merge_entity [not enforced today: the Operation carries no stored image, the engine
-        decides on ids/clause only]'
+      pre_image: 'per Entity: as merge_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
@@ -1717,8 +1684,7 @@ operations:
           one per-entity error)'
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
-      pre_image: 'per Entity: as merge_entity [not enforced today: the Operation carries no stored image, the engine
-        decides on ids/clause only]'
+      pre_image: 'per Entity: as merge_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
@@ -1757,13 +1723,11 @@ operations:
           one per-entity error)'
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
-      pre_image: 'per Entity: as merge_entity [not enforced today: the Operation carries no stored image, the engine
-        decides on ids/clause only]'
+      pre_image: 'per Entity: as merge_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
-  pre_image: 'per Entity: as merge_entity [not enforced today: the Operation carries no stored image, the engine
-    decides on ids/clause only]'
+  pre_image: 'per Entity: as merge_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a write
     cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image,
     the engine decides on ids/clause only]'
@@ -1796,8 +1760,7 @@ operations:
           one per-entity error)'
         - 'delete entity: Relationships in other Entities that point at the deleted one are not touched (NGSI-LD
           has no referential integrity), so no linked check'
-      pre_image: 'per Entity: as delete_entity [not enforced today: the Operation carries no stored image, the engine
-        decides on ids/clause only]'
+      pre_image: 'per Entity: as delete_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: absent'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.11.3.1.md
       gate_site: crates/antares-api/src/batch.rs:1252
@@ -1816,8 +1779,7 @@ operations:
           one per-entity error)'
         - 'delete entity: Relationships in other Entities that point at the deleted one are not touched (NGSI-LD
           has no referential integrity), so no linked check'
-      pre_image: 'per Entity: as delete_entity [not enforced today: the Operation carries no stored image, the engine
-        decides on ids/clause only]'
+      pre_image: 'per Entity: as delete_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: absent'
     mcp:
       status: supported
@@ -1834,8 +1796,7 @@ operations:
           one per-entity error)'
         - 'delete entity: Relationships in other Entities that point at the deleted one are not touched (NGSI-LD
           has no referential integrity), so no linked check'
-      pre_image: 'per Entity: as delete_entity [not enforced today: the Operation carries no stored image, the engine
-        decides on ids/clause only]'
+      pre_image: 'per Entity: as delete_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: absent'
     linkml:
       status: not_offered
@@ -1870,11 +1831,9 @@ operations:
           one per-entity error)'
         - 'delete entity: Relationships in other Entities that point at the deleted one are not touched (NGSI-LD
           has no referential integrity), so no linked check'
-      pre_image: 'per Entity: as delete_entity [not enforced today: the Operation carries no stored image, the engine
-        decides on ids/clause only]'
+      pre_image: 'per Entity: as delete_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'per Entity: absent'
-  pre_image: 'per Entity: as delete_entity [not enforced today: the Operation carries no stored image, the engine
-    decides on ids/clause only]'
+  pre_image: 'per Entity: as delete_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'per Entity: absent'
 - id: retrieve_entity
   ts104175: 10.4.2
