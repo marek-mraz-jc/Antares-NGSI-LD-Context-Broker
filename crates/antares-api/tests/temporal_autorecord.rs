@@ -604,3 +604,46 @@ async fn deleted_scope_is_the_ngsi_ld_null_in_the_temporal_representation() {
     assert_eq!(deleted.len(), 1, "{b}");
     assert_eq!(deleted[0]["value"], "urn:ngsi-ld:null", "{b}");
 }
+
+/// 5.7.4.4, S9: the temporal representation holds only the instances that
+/// meet the query, not every instance of an Entity the query selected
+/// (forge fix 9ca4213e, TP 021_08). An instance meets `q` when `q` holds on
+/// the Entity with that Attribute narrowed to that instance, so a term on
+/// another Attribute keeps acting at Entity level.
+#[tokio::test(flavor = "multi_thread")]
+async fn temporal_query_keeps_only_the_instances_that_meet_q() {
+    let mut st = AppState::new("test".into());
+    antares_api::wire(&mut st).await;
+    let body = r#"{"id":"urn:ngsi-ld:Rec:q1","type":"Rec",
+        "speed":[{"type":"Property","value":120,"observedAt":"2020-07-01T12:05:00Z"},
+                 {"type":"Property","value":80,"observedAt":"2020-07-01T12:07:00Z"},
+                 {"type":"Property","value":100,"observedAt":"2020-07-01T12:09:00Z"}],
+        "brand":[{"type":"Property","value":"x","observedAt":"2020-07-01T12:05:00Z"}]}"#;
+    let (s, b) = send(
+        &st,
+        req("POST", "/ngsi-ld/v1/temporal/entities", Some(body)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let values = |b: &str, attr: &str| -> Vec<i64> {
+        let list: serde_json::Value = serde_json::from_str(b).expect("json");
+        let mut v: Vec<i64> = list[0][attr]
+            .as_array()
+            .map(|a| a.iter().filter_map(|i| i["value"].as_i64()).collect())
+            .unwrap_or_default();
+        v.sort_unstable();
+        v
+    };
+    let uri = "/ngsi-ld/v1/temporal/entities?type=Rec&q=speed%3E90\
+               &timerel=after&timeAt=2020-07-01T12:00:00Z";
+    let (s, b) = send(&st, req("GET", uri, None)).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(values(&b, "speed"), [100, 120], "80 fails q: {b}");
+    // an OR with a term on another Attribute: that term holds for the
+    // Entity, so every speed instance meets the query
+    let uri = "/ngsi-ld/v1/temporal/entities?type=Rec&q=speed%3E90%7Cbrand%3D%3D%22x%22\
+               &timerel=after&timeAt=2020-07-01T12:00:00Z";
+    let (s, b) = send(&st, req("GET", uri, None)).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(values(&b, "speed"), [80, 100, 120], "{b}");
+}

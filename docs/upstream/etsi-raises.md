@@ -453,3 +453,22 @@ Antares answers 201, the CIM 009 status it states conformance to, and
 records the conflict here (T-3555). Suggest giving the TS 104 175 family a
 version a `Prefer` header can name, or keeping 201 for a snapshot created
 synchronously and 202 only where the creation itself is deferred.
+
+---
+
+## 18. [suite] 021_08 expects speed instances that fail the query
+
+**Title:** the 021_08 expectation keeps every instance of the selected
+Entity, including those that fail `q`
+
+**Body:**
+
+CIM 009 5.7.4.4, last step: "include in their temporal representation only
+the Attribute instances ... which meet the temporal, query and geoquery
+restrictions". 021_08 queries `q=speed>90` and its expectation still lists
+the speed instances below 90. Suggest dropping them, as the corrected fork
+does (forge commit 9ca4213e); Antares carries that fix
+(`temporal_autorecord.rs::temporal_query_keeps_only_the_instances_that_meet_q`).
+The clause does not say how an instance meets a `q` over several
+Attributes; Antares keeps an instance when `q` holds on the Entity with that
+Attribute narrowed to that one instance.
