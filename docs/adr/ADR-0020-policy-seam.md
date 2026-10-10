@@ -94,8 +94,10 @@ either.
 
 A narrowing is refused where it cannot be applied. Only the reads in
 `policy::FILTERABLE` hand the `Filter` to the code that serves the answer:
-retrieve and query Entities, their two temporal twins, and the EntityMap
-creations those queries page through. Every other operation is performed
+retrieve and query Entities, their two temporal twins, the EntityMap
+creations those queries page through, and discovery (5.7.5 to 5.7.10,
+which ADR-0023 rule 5 computes from the Entities the narrowing selects).
+Every other operation is performed
 whole — a create writes its Entity or does not — so a `Filter` there would
 be dropped, and the broker would do in full what the engine believed it had
 narrowed. That is the one direction the seam may not fail in, so those

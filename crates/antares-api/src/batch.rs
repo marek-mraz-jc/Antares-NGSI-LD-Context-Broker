@@ -192,6 +192,30 @@ impl BatchOutcome {
     }
 }
 
+/// 5.2.17 BatchEntityError for a member the policy engine refused: the
+/// AccessDenied problem a refused single-Entity write answers with (ADR-0020).
+fn denied_entry(id: Option<&str>, why: &str) -> Value {
+    json!({
+        "entityId": id.unwrap_or("unknown"),
+        "error": {
+            "type": crate::policy::ACCESS_DENIED_TYPE,
+            "title": crate::policy::ACCESS_DENIED_TITLE,
+            "status": StatusCode::FORBIDDEN.as_u16(),
+            "detail": why,
+        },
+    })
+}
+
+/// The reason a batch is refused whole: every member was refused, so the
+/// answer is the 403 a single refusal gives, carrying the first reason.
+fn whole_refusal(refused: &[Option<String>]) -> Option<String> {
+    if refused.iter().all(Option::is_some) {
+        refused.first().cloned().flatten()
+    } else {
+        None
+    }
+}
+
 fn err_entry(id: Option<&str>, e: &NgsiError) -> Value {
     json!({
         "entityId": id.unwrap_or("unknown"),
@@ -659,39 +683,82 @@ async fn batch_write(
     };
     let update_mode = has_option("update");
     let no_overwrite = has_option("noOverwrite");
-    let items = parse_batch(st, &tenant, headers, body).await?;
-    let (spec, fwd_items) = batch_spec(&items);
-    // ADR-0020: one verdict for the whole array, before any item is written
-    // and before any forward — the batch is one operation (5.6.7 to 5.6.20)
-    // and a per-item gate would let half of it land on a refusal. The
-    // engine is given what the array names, the same members the
-    // single-Entity write hands it: an engine that decides by Entity id,
-    // type or Attribute has to reach the same verdict whether the request
-    // came one Entity at a time or as one array.
-    let gate_ids: Vec<&str> = spec.ids.iter().flatten().map(String::as_str).collect();
-    // A create is shown the Entities it creates, expanded as 5.6.1 shows
-    // its one (ADR-0020). An entry that does not expand is left out: the
-    // local arm reports it as before.
-    let shown = match (&st.policy, mode) {
-        (Some(_), BatchMode::Create) => Some(Value::Array(
-            items
-                .iter()
-                .filter_map(|(item, ctx)| {
-                    let (o, c) = (item.as_object()?, ctx.as_ref().ok()?);
-                    expand_entity(o, c, ExpandOpts::default()).ok()
-                })
-                .collect(),
-        )),
-        _ => None,
+    let mut items = parse_batch(st, &tenant, headers, body).await?;
+    let mut out = BatchOutcome {
+        success: vec![],
+        errors: vec![],
     };
-    gate!(
-        st, &tenant, headers, mode.clause(),
-        ids: &gate_ids,
-        types: spec.types.as_deref().unwrap_or(&[]),
-        attrs: spec.attrs.as_deref().unwrap_or(&[]),
-        body: shown.as_ref(),
-    )
-    .await?;
+    // ADR-0020 per member (T-3480): before any item is written and before
+    // any forward, the engine decides each member as the single-Entity write
+    // would — its id, its types (stored and written), its Attributes and its
+    // expanded body. A refused member lands in E with the AccessDenied
+    // problem and the rest are applied (207); a batch refused whole is the
+    // 403 it always was. An entry that does not expand is shown by its id
+    // alone and left to the local arm to report.
+    if let Some(engine) = &st.policy {
+        let mut shown: Vec<(Option<String>, Vec<String>, Option<Value>)> = Vec::new();
+        for (item, ctx) in &items {
+            let id = item.get("id").and_then(Value::as_str).map(str::to_owned);
+            let body = match (item.as_object(), ctx.as_ref()) {
+                (Some(o), Ok(c)) => expand_entity(o, c, ExpandOpts::default()).ok(),
+                _ => None,
+            };
+            // ponytail: one store read per member, only with an engine
+            // attached; a batched read when large batches meet an engine.
+            let types = match &id {
+                Some(id) => crate::policy::write_types(st, &tenant, id, body.as_ref()).await,
+                None => Vec::new(),
+            };
+            shown.push((id, types, body));
+        }
+        let attrs: Vec<Vec<String>> = shown
+            .iter()
+            .map(|(_, _, b)| {
+                b.as_ref()
+                    .and_then(Value::as_object)
+                    .map(|o| {
+                        o.keys()
+                            .filter(|k| !matches!(k.as_str(), "id" | "type" | "scope" | "@context"))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        let ids: Vec<Vec<&str>> = shown
+            .iter()
+            .map(|(id, _, _)| id.as_deref().into_iter().collect())
+            .collect();
+        let ops: Vec<crate::policy::Operation<'_>> = shown
+            .iter()
+            .zip(&ids)
+            .zip(&attrs)
+            .map(
+                |(((_, types, body), ids), attrs)| crate::policy::Operation {
+                    ids,
+                    types,
+                    attrs,
+                    body: body.as_ref(),
+                    ..crate::policy::Operation::new(mode.clause())
+                },
+            )
+            .collect();
+        let asking = crate::snapshots::asking_tenant(st, &tenant).await;
+        let refused = crate::policy::gate_each(engine.as_ref(), &asking, headers, &ops).await;
+        drop(ops);
+        if let Some(why) = whole_refusal(&refused) {
+            return Err(crate::policy::Denied(why).into());
+        }
+        let mut verdicts = refused.into_iter().zip(shown);
+        items.retain(|_| match verdicts.next() {
+            Some((Some(why), (id, _, _))) => {
+                out.errors.push(denied_entry(id.as_deref(), &why));
+                false
+            }
+            _ => true,
+        });
+    }
+    let (spec, fwd_items) = batch_spec(&items);
     let fed_regs =
         match crate::federation::write_plan(st, &tenant, &spec, &st.loader.core(), params, headers)
             .await?
@@ -699,10 +766,6 @@ async fn batch_write(
             crate::federation::WritePlan::Answered(r) => return Ok(*r),
             crate::federation::WritePlan::Forward(regs) => regs,
         };
-    let mut out = BatchOutcome {
-        success: vec![],
-        errors: vec![],
-    };
     let mut created_ids: Vec<String> = vec![];
     let mut any_created = false;
     let proxies: Vec<&crate::federation::FedReg> =
@@ -1154,14 +1217,58 @@ pub async fn batch_delete(
             ))
             .into());
         }
-        // ADR-0020, as for the write batches: one verdict for the whole
-        // array, carrying the Entity ids it names. The body has to be read
-        // to know them, so the gate sits behind the parse the way the
-        // single-Entity delete sits behind its path parameter.
-        let gate_ids: Vec<&str> = ids.iter().filter_map(Value::as_str).collect();
-        gate!(st, &tenant, &headers, "5.6.10", ids: &gate_ids).await?;
+        let mut out = BatchOutcome {
+            success: vec![],
+            errors: vec![],
+        };
+        // ADR-0020 per member, as for the write batches (T-3480): each id
+        // is decided as the single-Entity delete decides it, with the types
+        // stored under it. The body has to be read to know them, so the gate
+        // sits behind the parse the way the single-Entity delete sits behind
+        // its path parameter. A refused id lands in E, the rest are deleted.
+        let mut ids: Vec<&Value> = ids.iter().collect();
+        if let Some(engine) = &st.policy {
+            let mut types: Vec<Vec<String>> = Vec::new();
+            for id in &ids {
+                types.push(match id.as_str() {
+                    Some(id) => crate::policy::write_types(&st, &tenant, id, None).await,
+                    None => Vec::new(),
+                });
+            }
+            let one: Vec<Vec<&str>> = ids
+                .iter()
+                .map(|v| v.as_str().into_iter().collect())
+                .collect();
+            let ops: Vec<crate::policy::Operation<'_>> = one
+                .iter()
+                .zip(&types)
+                .map(|(ids, types)| crate::policy::Operation {
+                    ids,
+                    types,
+                    ..crate::policy::Operation::new("5.6.10")
+                })
+                .collect();
+            let asking = crate::snapshots::asking_tenant(&st, &tenant).await;
+            let refused = crate::policy::gate_each(engine.as_ref(), &asking, &headers, &ops).await;
+            if let Some(why) = whole_refusal(&refused) {
+                return Err(crate::policy::Denied(why).into());
+            }
+            let mut verdicts = refused.into_iter();
+            ids.retain(|id| match verdicts.next().flatten() {
+                Some(why) => {
+                    out.errors.push(denied_entry(id.as_str(), &why));
+                    false
+                }
+                None => true,
+            });
+        }
         let spec = crate::registry::CsrSpec {
-            ids: Some(gate_ids.iter().map(|id| (*id).to_owned()).collect()),
+            ids: Some(
+                ids.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_owned)
+                    .collect(),
+            ),
             ..Default::default()
         };
         let regs = match crate::federation::write_plan(
@@ -1177,13 +1284,10 @@ pub async fn batch_delete(
             crate::federation::WritePlan::Answered(r) => return Ok(*r),
             crate::federation::WritePlan::Forward(regs) => regs,
         };
-        let mut out = BatchOutcome {
-            success: vec![],
-            errors: vec![],
-        };
         // One multi-row DELETE for the whole batch; flags in input order.
         let id_strs: Vec<String> = ids
             .iter()
+            .copied()
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect();

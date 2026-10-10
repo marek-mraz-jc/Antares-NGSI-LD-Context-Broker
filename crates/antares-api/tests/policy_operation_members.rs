@@ -211,7 +211,7 @@ async fn each_write_names_its_types_attributes_and_body() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_batch_create_shows_the_engine_its_body() {
+async fn a_batch_create_shows_the_engine_each_member_body() {
     let (st, seen) = state().await;
     let code = send(
         &st,
@@ -226,12 +226,170 @@ async fn a_batch_create_shows_the_engine_its_body() {
     assert_eq!(code, StatusCode::CREATED);
     let s = last(&seen);
     assert_eq!(s.clause, "5.6.7");
-    let body = s.body.expect("the batch body reaches the engine");
-    assert_eq!(body.as_array().map(Vec::len), Some(2), "{body}");
-    assert!(
-        body.to_string().contains(&iri("colour")),
-        "expanded: {body}"
+    assert_eq!(s.types, vec![iri("Vehicle")]);
+    assert_eq!(s.attrs, vec![iri("colour")]);
+    let body = s.body.expect("the member body reaches the engine");
+    assert_eq!(
+        body.get("id"),
+        Some(&json!("urn:ngsi-ld:Vehicle:b2")),
+        "{body}"
     );
+    assert!(body.get(iri("colour")).is_some(), "expanded: {body}");
+}
+
+/// The answer and its body.
+async fn call(st: &AppState, uri: &str, body: Value) -> (StatusCode, Value) {
+    let payload = body.to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("Content-Type", "application/json")
+        .header("Content-Length", payload.len())
+        .body(Body::from(payload))
+        .expect("request");
+    let resp = antares_api::router(st.clone())
+        .oneshot(req)
+        .await
+        .expect("response");
+    let code = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+async fn exists(st: &AppState, id: &str) -> bool {
+    send(st, "GET", &format!("/ngsi-ld/v1/entities/{id}"), None).await == StatusCode::OK
+}
+
+/// T-3480: a batch is decided member by member. The engine refuses the
+/// Secret; the Vehicle beside it is applied and the Secret is reported in
+/// E with the AccessDenied problem (207). A batch of Secrets alone is the
+/// 403 a single refusal gives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_member_is_reported_and_the_rest_applied() {
+    let (st, _) = state().await;
+    seed(&st).await;
+    let ops = "/ngsi-ld/v1/entityOperations";
+    let vehicle = |n: u32| {
+        json!({"id": format!("urn:ngsi-ld:Vehicle:m{n}"), "type": "Vehicle",
+                                  "speed": {"type": "Property", "value": n}})
+    };
+    let secret = json!({"id": "urn:ngsi-ld:Secret:s", "type": "Secret",
+                        "code": {"type": "Property", "value": 9}});
+    // the update and merge members name Vehicle: the Secret type is stored
+    let to_secret = json!({"id": "urn:ngsi-ld:Secret:s", "type": "Vehicle", "code": {"type": "Property", "value": 9}});
+    let to_vehicle = json!({"id": "urn:ngsi-ld:Vehicle:m1", "type": "Vehicle", "speed": {"type": "Property", "value": 5}});
+    let cases = [
+        (
+            "create",
+            json!([
+                vehicle(1),
+                json!({"id": "urn:ngsi-ld:Secret:new", "type": "Secret"})
+            ]),
+            "urn:ngsi-ld:Secret:new",
+        ),
+        (
+            "upsert",
+            json!([vehicle(2), secret.clone()]),
+            "urn:ngsi-ld:Secret:s",
+        ),
+        (
+            "update",
+            json!([to_vehicle.clone(), to_secret.clone()]),
+            "urn:ngsi-ld:Secret:s",
+        ),
+        (
+            "merge",
+            json!([to_vehicle, to_secret]),
+            "urn:ngsi-ld:Secret:s",
+        ),
+        (
+            "delete",
+            json!(["urn:ngsi-ld:Vehicle:m2", "urn:ngsi-ld:Secret:s"]),
+            "urn:ngsi-ld:Secret:s",
+        ),
+    ];
+    for (op, body, refused) in cases {
+        let (code, answer) = call(&st, &format!("{ops}/{op}"), body).await;
+        assert_eq!(code, StatusCode::MULTI_STATUS, "{op}: {answer}");
+        let errors = answer["errors"].as_array().expect("E");
+        assert_eq!(errors.len(), 1, "{op}: {answer}");
+        assert_eq!(errors[0]["entityId"], json!(refused), "{op}");
+        assert_eq!(errors[0]["error"]["status"], json!(403), "{op}");
+        assert_eq!(
+            errors[0]["error"]["type"],
+            json!(antares_api::policy::ACCESS_DENIED_TYPE),
+            "{op}"
+        );
+        assert_eq!(errors[0]["error"]["detail"], json!("a Secret"), "{op}");
+        assert_eq!(
+            answer["success"].as_array().map(Vec::len),
+            Some(1),
+            "{op}: {answer}"
+        );
+    }
+    assert!(
+        exists(&st, "urn:ngsi-ld:Vehicle:m1").await,
+        "create applied"
+    );
+    assert!(
+        !exists(&st, "urn:ngsi-ld:Secret:new").await,
+        "refused create not applied"
+    );
+    assert!(
+        !exists(&st, "urn:ngsi-ld:Vehicle:m2").await,
+        "delete applied"
+    );
+    assert!(
+        exists(&st, "urn:ngsi-ld:Secret:s").await,
+        "refused delete not applied"
+    );
+    let (code, _) = call(
+        &st,
+        &format!("{ops}/delete"),
+        json!(["urn:ngsi-ld:Secret:s"]),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN, "a batch refused whole");
+}
+
+/// An engine answering a batch with the wrong number of decisions denies
+/// the whole batch: the seam fails closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrong_length_answer_denies_the_batch() {
+    struct Short;
+    impl PolicyEngine for Short {
+        fn name(&self) -> &str {
+            "short"
+        }
+        fn decide<'a>(&'a self, _s: &'a Subject, _o: &'a Operation<'a>) -> DecisionFuture<'a> {
+            Box::pin(std::future::ready(Decision::Allow))
+        }
+        fn decide_each<'a>(
+            &'a self,
+            _s: &'a Subject,
+            _ops: &'a [Operation<'a>],
+        ) -> antares_api::policy::DecisionsFuture<'a> {
+            Box::pin(std::future::ready(vec![Decision::Allow]))
+        }
+        fn pre_notify(&self, _s: &Subject, _sub: &Value, _n: &mut Value) -> NotifyDecision {
+            NotifyDecision::Deliver
+        }
+    }
+    let mut st = AppState::new("me".into()).with_policy(Arc::new(Short));
+    antares_api::wire(&mut st).await;
+    let (code, _) = call(
+        &st,
+        "/ngsi-ld/v1/entityOperations/create",
+        json!([
+            {"id": "urn:ngsi-ld:Vehicle:w1", "type": "Vehicle"},
+            {"id": "urn:ngsi-ld:Vehicle:w2", "type": "Vehicle"},
+        ]),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    assert!(!exists(&st, "urn:ngsi-ld:Vehicle:w1").await);
 }
 
 /// The rule on a type holds on every write: the Secret's type comes from
