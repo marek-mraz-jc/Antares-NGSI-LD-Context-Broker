@@ -1050,6 +1050,111 @@ pub async fn inline_join_beyond(
     walk.complete
 }
 
+/// One place in a compacted document where Linked Entities join: the JSON
+/// pointer of a Relationship instance (or, simplified, of its URI string),
+/// the representation its targets take, how they are written, and their ids.
+struct Slot {
+    at: String,
+    child: crate::repr::Repr,
+    kind: SlotKind,
+    targets: Vec<String>,
+}
+
+enum SlotKind {
+    /// 4.5.23.2 normalized: the targets go under "entity".
+    Entity,
+    /// 4.5.22.2: a ListRelationship's targets go under "entityList".
+    EntityList,
+    /// simplified: the URI string itself is replaced by the target.
+    Replace,
+}
+
+/// A key as one JSON pointer segment (RFC 6901: `~` and `/` escaped).
+fn segment(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// The join slots of one compacted document, in document order.
+fn slots_of(
+    ctx: &antares_jsonld::Context,
+    repr: &crate::repr::Repr,
+    doc: &Value,
+    at: &str,
+) -> Vec<Slot> {
+    let mut out = Vec::new();
+    let Some(obj) = doc.as_object() else {
+        return out;
+    };
+    let metas = ["id", "type", "scope", "createdAt", "modifiedAt", "@context"];
+    for (k, v) in obj {
+        if metas.contains(&k.as_str()) {
+            continue;
+        }
+        let child = joined_repr(repr, k, &ctx.expand_key(k));
+        slots_in(repr, &child, v, format!("{at}/{}", segment(k)), &mut out);
+    }
+    out
+}
+
+fn slots_in(
+    repr: &crate::repr::Repr,
+    child: &crate::repr::Repr,
+    v: &Value,
+    at: String,
+    out: &mut Vec<Slot>,
+) {
+    let slot = |kind, targets| Slot {
+        at: at.clone(),
+        child: child.clone(),
+        kind,
+        targets,
+    };
+    match v {
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                slots_in(repr, child, item, format!("{at}/{i}"), out);
+            }
+        }
+        Value::Object(_) if repr.key_values => {}
+        Value::Object(inst) => {
+            // 4.5.22.2: the compacted objectList carries {"object": URI}
+            // entries (or bare URIs).
+            if let Some(Value::Array(ol)) = inst.get("objectList") {
+                let targets = ol
+                    .iter()
+                    .filter_map(|e| match e {
+                        Value::String(id) => Some(id.clone()),
+                        Value::Object(o) => {
+                            o.get("object").and_then(Value::as_str).map(str::to_owned)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                out.push(slot(SlotKind::EntityList, targets));
+                return;
+            }
+            let targets = match inst.get("object") {
+                Some(Value::String(id)) => vec![id.clone()],
+                Some(Value::Array(a)) => a
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                _ => return,
+            };
+            out.push(slot(SlotKind::Entity, targets));
+        }
+        Value::String(id) if repr.key_values => out.push(slot(SlotKind::Replace, vec![id.clone()])),
+        _ => {}
+    }
+}
+
+/// TS 104 175 7.7.4 Depth of retrieval: the walk goes breadth-first, one
+/// depth at a time, so the first time an Entity is met is at its shallowest
+/// depth, and that is where its own Linked Entities expand; every later
+/// encounter embeds it without walking it again (4.5.23.1). Depth-first, an
+/// Entity met first deep spent its one expansion there and stayed bare at
+/// depth 1. The lookup budget and the `seen` set are the same ones.
 async fn inline_join_walk(
     st: &AppState,
     tenant: &TenantId,
@@ -1059,23 +1164,79 @@ async fn inline_join_walk(
     level: usize,
     walk: &mut JoinWalk,
 ) {
-    let Some(obj) = compacted.as_object_mut() else {
-        return;
-    };
-    let metas = ["id", "type", "scope", "createdAt", "modifiedAt", "@context"];
-    for (k, v) in obj.iter_mut() {
-        if metas.contains(&k.as_str()) {
-            continue;
+    let mut frontier = vec![(String::new(), repr.clone(), level)];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for (at, repr, level) in frontier {
+            let slots = match compacted.pointer(&at) {
+                Some(doc) => slots_of(ctx, &repr, doc, &at),
+                None => continue,
+            };
+            for slot in slots {
+                let mut joined = Vec::new();
+                for id in &slot.targets {
+                    if let Some(found) =
+                        lookup_joined(st, tenant, ctx, &slot.child, id, level, walk).await
+                    {
+                        joined.push(found);
+                    }
+                }
+                if joined.is_empty() {
+                    continue;
+                }
+                let Some(place) = compacted.pointer_mut(&slot.at) else {
+                    continue;
+                };
+                let single = joined.len() == 1;
+                let (docs, expand): (Vec<Value>, Vec<bool>) = joined.into_iter().unzip();
+                let at = match slot.kind {
+                    SlotKind::Replace => {
+                        *place = docs.into_iter().next().unwrap_or(Value::Null);
+                        vec![slot.at.clone()]
+                    }
+                    SlotKind::EntityList => {
+                        let count = docs.len();
+                        if let Some(inst) = place.as_object_mut() {
+                            inst.insert("entityList".into(), Value::Array(docs));
+                        }
+                        (0..count)
+                            .map(|i| format!("{}/entityList/{i}", slot.at))
+                            .collect()
+                    }
+                    SlotKind::Entity if single => {
+                        if let Some(inst) = place.as_object_mut() {
+                            inst.insert(
+                                "entity".into(),
+                                docs.into_iter().next().unwrap_or(Value::Null),
+                            );
+                        }
+                        vec![format!("{}/entity", slot.at)]
+                    }
+                    SlotKind::Entity => {
+                        let count = docs.len();
+                        if let Some(inst) = place.as_object_mut() {
+                            inst.insert("entity".into(), Value::Array(docs));
+                        }
+                        (0..count)
+                            .map(|i| format!("{}/entity/{i}", slot.at))
+                            .collect()
+                    }
+                };
+                for (child_at, expand) in at.into_iter().zip(expand) {
+                    if expand {
+                        next.push((child_at, slot.child.clone(), level - 1));
+                    }
+                }
+            }
         }
-        let child = joined_repr(repr, k, &ctx.expand_key(k));
-        // boxed: an async fn cannot recurse inline
-        Box::pin(inline_join_value(
-            st, tenant, ctx, repr, &child, v, level, walk,
-        ))
-        .await;
+        frontier = next;
     }
 }
 
+/// One Linked Entity read under the walk's budget and the narrowing: the
+/// compacted target, and whether its own links are expanded (the first time
+/// it is met, while depth remains). A target outside the narrowing reads as
+/// absent, like a dangling link.
 async fn lookup_joined(
     st: &AppState,
     tenant: &TenantId,
@@ -1084,7 +1245,7 @@ async fn lookup_joined(
     id: &str,
     level: usize,
     walk: &mut JoinWalk,
-) -> Option<Value> {
+) -> Option<(Value, bool)> {
     if walk.budget == 0 {
         walk.complete = false;
         return None;
@@ -1096,107 +1257,22 @@ async fn lookup_joined(
         .await
         .ok()
         .flatten()?;
-    // a target outside the narrowing reads as absent, like a dangling link
     if !policy_admits(st, tenant, ctx, child.policy_reach.as_deref(), &target).await {
         return None;
     }
     let shaped = apply(&target, child);
-    let mut c = compact_for(child, &shaped, ctx);
+    let c = compact_for(child, &shaped, ctx);
+    let mut expand = false;
     if level > 1 {
         if walk.seen.insert(id.to_owned()) {
-            inline_join_walk(st, tenant, ctx, child, &mut c, level - 1, walk).await;
+            expand = true;
         } else {
             // 4.5.23.1: an already-resolved target is a loop or a duplicate —
             // it is still embedded, but its own links are not walked again.
             walk.complete = false;
         }
     }
-    Some(c)
-}
-
-#[allow(clippy::too_many_arguments)] // one param per piece of the traversal's state
-async fn inline_join_value(
-    st: &AppState,
-    tenant: &TenantId,
-    ctx: &antares_jsonld::Context,
-    repr: &crate::repr::Repr,
-    child: &crate::repr::Repr,
-    v: &mut Value,
-    level: usize,
-    walk: &mut JoinWalk,
-) {
-    match v {
-        Value::Array(items) => {
-            for i in items {
-                // boxed: an async fn cannot recurse inline
-                Box::pin(inline_join_value(
-                    st, tenant, ctx, repr, child, i, level, walk,
-                ))
-                .await;
-            }
-        }
-        Value::Object(inst) => {
-            if repr.key_values {
-                return;
-            }
-            // 4.5.22.2: a ListRelationship's targets join under the
-            // output-only "entityList" member (always an array). The
-            // compacted objectList carries {"object": URI} entries.
-            if let Some(Value::Array(ol)) = inst.get("objectList") {
-                let targets: Vec<String> = ol
-                    .iter()
-                    .filter_map(|e| match e {
-                        Value::String(id) => Some(id.clone()),
-                        Value::Object(o) => {
-                            o.get("object").and_then(Value::as_str).map(str::to_owned)
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let mut joined: Vec<Value> = Vec::new();
-                for id in &targets {
-                    if let Some(j) = lookup_joined(st, tenant, ctx, child, id, level, walk).await {
-                        joined.push(j);
-                    }
-                }
-                if !joined.is_empty() {
-                    inst.insert("entityList".into(), Value::Array(joined));
-                }
-                return;
-            }
-            let targets: Vec<String> = match inst.get("object") {
-                Some(Value::String(id)) => vec![id.clone()],
-                Some(Value::Array(a)) => a
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect(),
-                _ => return,
-            };
-            let mut joined: Vec<Value> = Vec::new();
-            for id in &targets {
-                if let Some(j) = lookup_joined(st, tenant, ctx, child, id, level, walk).await {
-                    joined.push(j);
-                }
-            }
-            if joined.is_empty() {
-                return;
-            }
-            let e = if joined.len() == 1 {
-                joined.remove(0)
-            } else {
-                Value::Array(joined)
-            };
-            inst.insert("entity".into(), e);
-        }
-        // simplified: relationship value is the object URI string
-        Value::String(id) if repr.key_values => {
-            if let Some(joined) = lookup_joined(st, tenant, ctx, child, id, level, walk).await {
-                *v = joined;
-            }
-        }
-        _ => {}
-    }
+    Some((c, expand))
 }
 
 /// Linked Entity Retrieval, flattened form (4.5.23.3): collect targets with
@@ -1244,6 +1320,10 @@ pub async fn collect_flat_beyond(
     walk.complete
 }
 
+/// Breadth-first like [`inline_join_walk`] (TS 104 175 7.7.4): every Entity
+/// of one depth is collected before the next depth is read, so an Entity is
+/// walked from its shallowest occurrence and its Linked Entities get the
+/// depth that occurrence leaves.
 #[allow(clippy::too_many_arguments)] // one param per piece of the traversal's state
 async fn collect_flat_walk(
     st: &AppState,
@@ -1255,83 +1335,84 @@ async fn collect_flat_walk(
     out: &mut std::collections::BTreeMap<String, (Value, crate::repr::Repr)>,
     walk: &mut JoinWalk,
 ) {
-    let Some(obj) = internal_doc.as_object() else {
-        return;
-    };
-    let shown = shown(repr.policy_types.as_deref(), internal_doc)
-        .unwrap_or_else(crate::policy::Shown::nothing);
-    for (k, v) in obj {
-        if is_meta(k) {
-            continue;
-        }
-        // only traverse relationships that survive THIS doc's projection
-        if let Some(pick) = &repr.pick {
-            if !pick.iter().any(|n| n.iri == *k || n.raw == *k) {
+    let mut frontier = vec![(internal_doc.clone(), repr.clone(), level)];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for (doc, repr, level) in &frontier {
+            let Some(obj) = doc.as_object() else {
                 continue;
-            }
-        }
-        if let Some(omit) = &repr.omit {
-            if omit
-                .iter()
-                .any(|n| (n.iri == *k || n.raw == *k) && n.children.is_none())
-            {
-                continue;
-            }
-        }
-        // a Relationship the subject may not see is not a road either
-        if !policy_projected(repr.policy_pick.as_deref(), repr.policy_omit.as_deref(), k)
-            || !shown.allows(k)
-        {
-            continue;
-        }
-        let Some(instances) = v.as_array() else {
-            continue;
-        };
-        let child = joined_repr(repr, k, k);
-        for inst in instances {
-            // Relationship objects plus ListRelationship objectList targets
-            // (internal form stores bare URIs) — 4.5.23.3 appends both kinds
-            // of Linked Entities to the flattened array.
-            let targets: Vec<&str> = match (inst.get("object"), inst.get("objectList")) {
-                (Some(Value::String(id)), _) => vec![id.as_str()],
-                (Some(Value::Array(a)), _) => a.iter().filter_map(Value::as_str).collect(),
-                (None, Some(Value::Array(a))) => a.iter().filter_map(Value::as_str).collect(),
-                _ => continue,
             };
-            for id in targets {
-                if walk.seen.contains(id) {
+            let shown = shown(repr.policy_types.as_deref(), doc)
+                .unwrap_or_else(crate::policy::Shown::nothing);
+            for (k, v) in obj {
+                if is_meta(k) {
                     continue;
                 }
-                if walk.budget == 0 {
-                    walk.complete = false;
-                    return;
+                // only traverse relationships that survive THIS doc's projection
+                if let Some(pick) = &repr.pick {
+                    if !pick.iter().any(|n| n.iri == *k || n.raw == *k) {
+                        continue;
+                    }
                 }
-                walk.budget -= 1;
-                let target = st.store.get(tenant, Kind::Entity, id).await.ok().flatten();
-                if let Some(target) = target {
-                    if !policy_admits(st, tenant, ctx, child.policy_reach.as_deref(), &target).await
+                if let Some(omit) = &repr.omit {
+                    if omit
+                        .iter()
+                        .any(|n| (n.iri == *k || n.raw == *k) && n.children.is_none())
                     {
                         continue;
                     }
-                    walk.seen.insert(id.to_owned());
-                    out.insert(id.to_owned(), (target.clone(), child.clone()));
-                    if level > 1 {
-                        // boxed: an async fn cannot recurse inline
-                        Box::pin(collect_flat_walk(
-                            st,
-                            tenant,
-                            ctx,
-                            &child,
-                            &target,
-                            level - 1,
-                            out,
-                            walk,
-                        ))
-                        .await;
+                }
+                // a Relationship the subject may not see is not a road either
+                if !policy_projected(repr.policy_pick.as_deref(), repr.policy_omit.as_deref(), k)
+                    || !shown.allows(k)
+                {
+                    continue;
+                }
+                let Some(instances) = v.as_array() else {
+                    continue;
+                };
+                let child = joined_repr(repr, k, k);
+                for inst in instances {
+                    // Relationship objects plus ListRelationship objectList targets
+                    // (internal form stores bare URIs) — 4.5.23.3 appends both kinds
+                    // of Linked Entities to the flattened array.
+                    let targets: Vec<&str> = match (inst.get("object"), inst.get("objectList")) {
+                        (Some(Value::String(id)), _) => vec![id.as_str()],
+                        (Some(Value::Array(a)), _) => a.iter().filter_map(Value::as_str).collect(),
+                        (None, Some(Value::Array(a))) => {
+                            a.iter().filter_map(Value::as_str).collect()
+                        }
+                        _ => continue,
+                    };
+                    for id in targets {
+                        if walk.seen.contains(id) {
+                            continue;
+                        }
+                        if walk.budget == 0 {
+                            walk.complete = false;
+                            return;
+                        }
+                        walk.budget -= 1;
+                        let Some(target) =
+                            st.store.get(tenant, Kind::Entity, id).await.ok().flatten()
+                        else {
+                            continue;
+                        };
+                        if !policy_admits(st, tenant, ctx, child.policy_reach.as_deref(), &target)
+                            .await
+                        {
+                            continue;
+                        }
+                        walk.seen.insert(id.to_owned());
+                        out.insert(id.to_owned(), (target.clone(), child.clone()));
+                        if *level > 1 {
+                            next.push((target, child.clone(), level - 1));
+                        }
                     }
                 }
             }
         }
+        frontier = next;
     }
 }
 
