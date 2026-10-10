@@ -1466,6 +1466,7 @@ async fn batch_query_inner(
                     crate::repr::collect_flat_beyond(
                         st,
                         &tenant,
+                        &parsed.ctx,
                         &repr,
                         doc,
                         *level,

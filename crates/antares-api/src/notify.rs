@@ -946,7 +946,7 @@ async fn build_data(
         Some((mode, level)) if mode == "flat" => {
             let main_id = internal.get("id").and_then(Value::as_str).unwrap_or("");
             let mut linked = std::collections::BTreeMap::new();
-            crate::repr::collect_flat(st, tenant, &shape.repr, &internal, *level, &mut linked)
+            crate::repr::collect_flat(st, tenant, ctx, &shape.repr, &internal, *level, &mut linked)
                 .await;
             data.push(main);
             for (id, (ldoc, lrepr)) in linked {

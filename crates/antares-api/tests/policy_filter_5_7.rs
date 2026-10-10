@@ -808,3 +808,94 @@ async fn a_join_does_not_carry_a_narrowed_member_out_of_the_answer() {
         "the narrowed member is gone from BOTH documents: {text}"
     );
 }
+
+/// A Vehicle linking one visible and one hidden Person, and the visible
+/// Person linking a hidden Organization one level further.
+async fn seed_linked(st: &AppState, hidden: Value, shown: Value) {
+    let docs = [
+        json!({"id": "urn:ngsi-ld:Vehicle:v", "type": "Vehicle",
+               "owner": {"type": "Relationship", "object": "urn:ngsi-ld:Person:hidden"},
+               "driver": {"type": "Relationship", "object": "urn:ngsi-ld:Person:shown"}}),
+        json!({"id": "urn:ngsi-ld:Person:hidden", "type": "Person", "name": {"type": "Property", "value": "Hid"}}),
+        json!({"id": "urn:ngsi-ld:Person:shown", "type": "Person", "name": {"type": "Property", "value": "Sho"},
+               "employer": {"type": "Relationship", "object": "urn:ngsi-ld:Org:hidden"}}),
+        json!({"id": "urn:ngsi-ld:Org:hidden", "type": "Org", "name": {"type": "Property", "value": "Acme"}}),
+    ];
+    for mut doc in docs {
+        let marks = if doc["id"].as_str().is_some_and(|i| i.ends_with(":hidden")) {
+            &hidden
+        } else {
+            &shown
+        };
+        for (k, v) in marks.as_object().into_iter().flatten() {
+            doc[k] = v.clone();
+        }
+        let (code, body) = send(st, "POST", "/ngsi-ld/v1/entities", Some(doc)).await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+    }
+}
+
+/// 5.7.1.4/5.7.2.4 and 4.5.23: a joined Entity is read the way the
+/// Entity itself is, so one outside the narrowing is absent from the join
+/// exactly as it is absent from a query; the Relationship stays.
+async fn assert_join_hides(st: &AppState) {
+    for path in [
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:v",
+        "/ngsi-ld/v1/entities?type=Vehicle",
+    ] {
+        for join in ["inline", "flat"] {
+            for level in [1, 2] {
+                let sep = if path.contains('?') { '&' } else { '?' };
+                let uri = format!("{path}{sep}join={join}&joinLevel={level}");
+                let (status, body) = send(st, "GET", &uri, None).await;
+                assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+                let text = body.to_string();
+                assert!(
+                    text.contains("Sho"),
+                    "{uri}: allowed target embedded: {text}"
+                );
+                assert!(
+                    text.contains("urn:ngsi-ld:Person:hidden"),
+                    "{uri}: the Relationship itself stays: {text}"
+                );
+                assert!(!text.contains("Hid"), "{uri}: hidden target leaked: {text}");
+                assert!(
+                    !text.contains("Acme"),
+                    "{uri}: hidden level-2 target leaked: {text}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_does_not_embed_a_target_the_q_narrowing_hides() {
+    let st = state(Filter {
+        q: Some(antares_ql::parse_q("public==true").expect("q")),
+        ..Filter::default()
+    })
+    .await;
+    seed_linked(
+        &st,
+        json!({"public": {"type": "Property", "value": false}}),
+        json!({"public": {"type": "Property", "value": true}}),
+    )
+    .await;
+    assert_join_hides(&st).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_does_not_embed_a_target_the_scope_narrowing_hides() {
+    let st = state(Filter {
+        scope_q: Some("/open/#".into()),
+        ..Filter::default()
+    })
+    .await;
+    seed_linked(
+        &st,
+        json!({"scope": "/closed"}),
+        json!({"scope": "/open/a"}),
+    )
+    .await;
+    assert_join_hides(&st).await;
+}
