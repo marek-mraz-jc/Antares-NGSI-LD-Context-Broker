@@ -51,6 +51,7 @@ broker nor a storage backend (`antares-api`, `antares-broker`,
 | `antares-api` | 49 500 | the HTTP binding: routers, handlers, negotiation, federation, notification pipeline, snapshots, bounds | own a backend or a transport |
 | `antares-broker` | 3 800 | composition root: env → config, roles, bus wiring (`wiring.rs`), telemetry, shutdown | contain clause logic |
 | `antares-wasm` | 500 | the router under a Service Worker, OPFS-backed file store | diverge from the native router |
+| `odata-csdl` | 3 640 | OData 4.01 EDM model, CSDL XML and CSDL JSON writers, model validation under caller `Limits` (ADR-0024) | know its host (no `antares-*` dependency, rule M1) or read CSDL |
 
 ## 3. Module map of `antares-api/src`
 
