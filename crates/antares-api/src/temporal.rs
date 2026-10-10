@@ -2085,17 +2085,21 @@ pub(crate) async fn query_temporal_collected(
     };
     let narrowed = filter.narrow_params(params, &ctx)?;
     let params = &narrowed;
-    let q_ast = params.get("q").map(|q| parse_q(q)).transpose()?.map(|ast| {
-        antares_ql::eval::apply_expand_values(
-            ast,
-            antares_ql::eval::expansion_list(
-                params.get("expandValues").map(String::as_str),
-                params.get("jsonKeys").map(String::as_str),
+    let q_ast = params
+        .get("q")
+        .map(|q| antares_ql::parse_narrowed_q(q))
+        .transpose()?
+        .map(|ast| {
+            antares_ql::eval::apply_expand_values(
+                ast,
+                antares_ql::eval::expansion_list(
+                    params.get("expandValues").map(String::as_str),
+                    params.get("jsonKeys").map(String::as_str),
+                )
+                .as_deref(),
+                &ctx,
             )
-            .as_deref(),
-            &ctx,
-        )
-    });
+        });
     // under rules only the engine's own q reaches the store and the stored
     // history; the client's waits for the shown one
     let q_ast = if ruled {

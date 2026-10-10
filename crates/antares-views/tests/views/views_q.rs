@@ -3,7 +3,7 @@
 //! (surfaces-test-plan section 6, V1, V2, V4, V9): a hidden Attribute does
 //! not exist for the caller's `q`, its `orderBy` or a linked path.
 
-use crate::common::{fixture, get, send, Answer, CARS};
+use crate::common::{fixture, get, send, Answer, CARS, HISTORY};
 use axum::http::{Method, StatusCode};
 use serde_json::json;
 
@@ -146,5 +146,48 @@ async fn a_linked_q_path_does_not_cross_into_an_out_of_view_entity() -> Result<(
         "the owner's hidden salary was read"
     );
     assert_eq!(ids("!owner{salary}").await, ids("!owner{nothere}").await);
+    Ok(())
+}
+
+/// `MAX_Q_NODES` (512) counts the caller's `q` alone (threat V23): the
+/// longest chain the NGSI-LD root accepts is accepted through a view
+/// whatever the view's own predicate holds, and one term more is refused
+/// alike, so the cap tells a caller nothing about the predicate's size.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_q_node_cap_counts_the_callers_q_alone() -> Result<(), String> {
+    const MAX_Q_NODES: usize = 512;
+    let f = fixture().await?;
+    let chain = |k: usize| vec!["a==1"; k].join("|");
+    for (terms, ok) in [(MAX_Q_NODES - 1, true), (MAX_Q_NODES, false)] {
+        let q = enc(&chain(terms));
+        let direct = send(
+            &f.app,
+            Method::GET,
+            &format!("/ngsi-ld/v1/entities?type=Car&q={q}"),
+            &[("NGSILD-Tenant", "city")],
+            None,
+        )
+        .await;
+        assert_eq!(
+            direct.status.is_success(),
+            ok,
+            "{terms} terms at the root: {}",
+            direct.text
+        );
+        for root in [CARS, HISTORY] {
+            let through = get(&f.app, &format!("{root}/entities?type=Car&q={q}")).await;
+            assert_eq!(
+                through.status, direct.status,
+                "{terms} terms through {root}: {}",
+                through.text
+            );
+            assert_eq!(
+                through.json.get("title"),
+                direct.json.get("title"),
+                "{}",
+                through.text
+            );
+        }
+    }
     Ok(())
 }

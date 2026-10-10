@@ -1485,3 +1485,103 @@ async fn a_q_term_on_a_visible_attribute_answers_as_before() {
         ["urn:ngsi-ld:Person:open", "urn:ngsi-ld:Person:shut"],
     );
 }
+
+fn enc(q: &str) -> String {
+    q.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// The status and the problem title a caller `q` meets on the entity, the
+/// temporal and the batch query.
+async fn verdicts(st: &AppState, q: &str) -> Vec<(StatusCode, Value)> {
+    let mut out = Vec::new();
+    for uri in [
+        format!("/ngsi-ld/v1/entities?type=Vehicle&q={}", enc(q)),
+        format!(
+            "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after&timeAt=1970-01-01T00:00:00Z&q={}",
+            enc(q)
+        ),
+    ] {
+        let (code, doc) = send(st, "GET", &uri, None).await;
+        out.push((code, doc.get("title").cloned().unwrap_or(Value::Null)));
+    }
+    let (code, doc) = send(
+        st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/query",
+        Some(json!({"type": "Query", "entities": [{"type": "Vehicle"}], "q": q})),
+    )
+    .await;
+    out.push((code, doc.get("title").cloned().unwrap_or(Value::Null)));
+    out
+}
+
+/// `MAX_Q_NODES` (512) counts the caller's `q` alone through a narrowing
+/// engine (threat V23): with the engine's own `q` joined and a term on the
+/// Attribute it omits rewritten as `(colour;!colour)`, a `q` meets the
+/// verdict it meets with no engine at all, at the cap and one past it, so
+/// the cap is an oracle neither on the engine's predicate nor on "hidden".
+#[tokio::test]
+async fn the_q_node_cap_counts_the_callers_q_alone() {
+    const MAX_Q_NODES: usize = 512;
+    let open = AppState::new("me".into());
+    let narrowed = state(Filter {
+        omit: vec!["colour".into()],
+        ..slow()
+    })
+    .await;
+    seed(&open).await;
+    seed(&narrowed).await;
+    for (term, terms) in [
+        ("a==1", MAX_Q_NODES - 1),
+        ("a==1", MAX_Q_NODES),
+        ("colour==\"red\"", 170),
+        ("colour==\"red\"", 270),
+    ] {
+        let q = vec![term; terms].join("|");
+        let want = verdicts(&open, &q).await;
+        let ok = terms < MAX_Q_NODES;
+        assert!(
+            want.iter().all(|(code, _)| code.is_success() == ok),
+            "{terms} x {term} with no engine: {want:?}"
+        );
+        assert_eq!(verdicts(&narrowed, &q).await, want, "{terms} x {term}");
+    }
+}
+
+/// The share of the narrowed caps an engine's `q` may take is judged on
+/// the engine's `q` alone: past it every caller meets the same refusal,
+/// the one with no `q` as much as the one with the longest.
+#[tokio::test]
+async fn an_engine_q_past_its_share_is_refused_whatever_the_caller_asks() {
+    let leaf = antares_ql::parse_q("speed<50").expect("q");
+    let st = state(Filter {
+        q: Some(Box::new(antares_ql::QNode::Or(vec![leaf; 4096]))),
+        ..Filter::default()
+    })
+    .await;
+    let none = send(&st, "GET", "/ngsi-ld/v1/entities?type=Vehicle", None).await;
+    assert!(!none.0.is_success(), "{none:?}");
+    for q in ["speed==1".to_owned(), vec!["a==1"; 511].join("|")] {
+        let (code, doc) = send(
+            &st,
+            "GET",
+            &format!("/ngsi-ld/v1/entities?type=Vehicle&q={}", enc(&q)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            (code, doc.get("title")),
+            (none.0, none.1.get("title")),
+            "{doc} vs {}",
+            none.1
+        );
+    }
+}

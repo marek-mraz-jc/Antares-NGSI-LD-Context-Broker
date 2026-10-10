@@ -772,7 +772,10 @@ async fn query_entities_inner(
     // request is forwarded with.
     let narrowed = filter.narrow_params(params, &ctx)?;
     let params = &narrowed;
-    let q_ast = params.get("q").map(|q| parse_q(q)).transpose()?;
+    let q_ast = params
+        .get("q")
+        .map(|q| antares_ql::parse_narrowed_q(q))
+        .transpose()?;
     // 5.7.2.4 validation bullets (p.201), in the spec's own order.
     if params.get("type").map(String::as_str) == Some("*")
         && params.get("local").map(String::as_str) == Some("false")
@@ -1136,7 +1139,9 @@ impl ReadMembers {
         Self {
             types,
             attrs: attr_list(params, ctx).unwrap_or_default(),
-            q: params.get("q").and_then(|q| parse_q(q).ok()),
+            q: params
+                .get("q")
+                .and_then(|q| antares_ql::parse_narrowed_q(q).ok()),
             geo: antares_ql::geo::GeoQuery::from_params(params)
                 .ok()
                 .flatten(),
@@ -1224,8 +1229,10 @@ pub async fn filter_entities_paged(
         // against the supplied @context using JSON-LD type coercion prior to
         // executing the query" (EXAMPLE 12), less the Attributes jsonKeys
         // declares uninterpretable as JSON-LD.
+        // the query may be narrowed: every caller parsed its own `q` with
+        // `parse_q` before (threat V23)
         Some(q) => Some(antares_ql::eval::apply_expand_values(
-            parse_q(q)?,
+            antares_ql::parse_narrowed_q(q)?,
             antares_ql::eval::expansion_list(
                 params.get("expandValues").map(String::as_str),
                 params.get("jsonKeys").map(String::as_str),
