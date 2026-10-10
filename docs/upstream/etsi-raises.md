@@ -299,6 +299,10 @@ not recover the NGSI-LD names.
 Suggest defining both as `"ngsi-ld:attributeCount"` and
 `"ngsi-ld:attributeDetails"`, the form the rest of the annex uses.
 
+Status: TS 104 175 V1.1.1 Annex B defines both that way, inside the
+`Attribute` and `EntityTypeInfo` scoped contexts; Antares pins that
+document for the v1.9 URL since T-3458.
+
 ## 12. [spec+suite] 4.19's ABNF derives no unparenthesized conjunction, but a test point sends one
 
 Clause 4.19 (V1.9.1 p. 98) defines the Scope Query Language as
