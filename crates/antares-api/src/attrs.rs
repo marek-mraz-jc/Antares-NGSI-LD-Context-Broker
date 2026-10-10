@@ -1609,12 +1609,11 @@ mod attr_name_and_via_paths {
         }
     }
 
-    /// 6.3.17/6.3.18 (Table 6.3.18-2): a Via chain naming this broker leaves
-    /// the matching registrations out of the operation, which then runs
-    /// locally. 508 is reserved for a SINGLE exclusive/redirect source, so two
-    /// registrations must produce an answer — never a 500.
+    /// TS 104 175 9.7 (T-3459): a write whose Via chain names this broker is
+    /// a detected loop, 508 whatever its registrations, neither forwarded nor
+    /// applied locally; two registrations change nothing about that.
     #[tokio::test(flavor = "multi_thread")]
-    async fn self_via_with_two_registrations_answers_locally() {
+    async fn self_via_with_two_registrations_is_a_detected_loop() {
         const ENTITY: &str = "urn:ngsi-ld:Vehicle:attrs-via";
         let st = state();
         create_entity(&st, ENTITY).await;
@@ -1633,7 +1632,7 @@ mod attr_name_and_via_paths {
             .header("Via", via.as_str())
             .body(Body::from(body))
             .expect("request");
-        assert_eq!(send(&st, req).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(send(&st, req).await.status(), StatusCode::LOOP_DETECTED);
 
         // 5.6.5 Delete Attribute — the single-attribute plan
         let req = Request::builder()
@@ -1642,13 +1641,27 @@ mod attr_name_and_via_paths {
             .header("Via", via.as_str())
             .body(Body::empty())
             .expect("request");
-        assert_eq!(send(&st, req).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(send(&st, req).await.status(), StatusCode::LOOP_DETECTED);
 
         assert_eq!(
             hits.load(Ordering::SeqCst),
             0,
             "registrations dropped by the Via chain must not be contacted"
         );
+        // a read with the same chain is served locally: the write never landed
+        let req = Request::builder()
+            .uri(format!("/ngsi-ld/v1/entities/{ENTITY}"))
+            .header("Via", via.as_str())
+            .body(Body::empty())
+            .expect("request");
+        let resp = send(&st, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let entity: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(entity["speed"]["value"], 1, "{entity}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 }
 

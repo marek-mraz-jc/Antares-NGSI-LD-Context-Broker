@@ -10,37 +10,40 @@ Issue texts prepared for filing. Two targets:
 
 ---
 
-## 1. [suite] D018_01 asserts 508 Loop Detected for an *inclusive* registration
+## 1. [spec] CIM 009 6.3.17 and TS 104 175 9.7 disagree on a loop through an inclusive registration
 
-**Title:** D018_01 uses mode=inclusive but asserts the exclusive/redirect
-508 loop behaviour
+**Title:** 508 Loop Detected is scoped to a single exclusive or redirect
+source in 6.3.17, while TS 104 175 9.7 makes every detected loop an error
 
 **Body:**
 
 Test `D018_01 Loop Detection With Via Header` registers its Context Source
 with `mode=inclusive` (fixture
-`context-source-registration-vehicle-redirection-ops.jsonld` — note its
-`operations: ["redirectionOps"]` names an operation *group*, not a mode),
-replays the broker's own `Via` pseudonym on `DELETE /entities/{id}`, and
-asserts **508**.
+`context-source-registration-vehicle-redirection-ops.jsonld`), replays the
+broker's own `Via` pseudonym on `DELETE /entities/{id}`, and asserts
+**508**.
 
-GS CIM 009 V1.9.1 clause 6.3.17 (p. 278) scopes 508 to the case where
-"all of the data is held outside of the Context Broker and held in a
-single registered source" — i.e. **exclusive or redirect** registrations.
-For an inclusive registration, Table 6.3.18-2 (p. 279) makes the Via
-listing an input to registration *matching*: the looping source drops out
-of matching and the DELETE executes locally, so **204** is the conformant
-answer. A broker that returns 508 here refuses an operation it can serve
-from its own store.
+GS CIM 009 V1.9.1 clause 6.3.17 (p. 278), repeated in TS 104 176 6.3.5,
+scopes 508 to the case where "all of the data is held outside of the
+Context Broker and held in a single registered source", and Table 6.3.18-2
+(p. 279) makes the Via listing an input to registration matching, which
+reads as: drop the looping source, execute locally, answer 204.
 
-Corroborating: siblings D018_02/D018_03 carry the `additive-inclusive`
-tag; D018_01 does not, yet is the only one hardcoding `mode=inclusive` —
-the mode looks like a slip in a test whose assertion belongs to the
-redirect path.
+TS 104 175 clause 9.7 adds: "If the requested endpoint is also listed as
+previously encountered when a Context Source receives a call to that
+endpoint, this is an indication that a new loop has been detected. A
+suitable error shall be returned, indicating that the loop has been
+detected." Under 9.7 the 508 that D018_01 asserts is right whatever the
+registration mode, and the 6.3.17 scoping is the outdated text.
 
-**Proposed fix (in our fork):** switch D018_01's setup to `mode=redirect`,
-which puts the scenario inside the clause its assertion cites and keeps
-the subject of the test (Via replay ⇒ loop detected) intact.
+Antares follows 9.7 for writes (508 whenever the `Via` already names the
+broker, T-3459) and serves reads locally with a `199` warning, so a
+query that crosses its own registration still answers with local data.
+
+**Proposed fix (spec):** align 6.3.17 and TS 104 176 6.3.5 with TS 104 175
+9.7, and say whether a read that detects a loop may be served locally.
+Our fork's D018_01 setup uses `mode=redirect`, which passes under either
+reading.
 
 ---
 

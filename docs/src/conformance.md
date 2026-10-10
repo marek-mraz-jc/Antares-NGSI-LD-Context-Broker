@@ -146,7 +146,7 @@ carries the fix. The current list:
 
 | # | target | finding |
 |---|---|---|
-| 1 | suite | `D018_01` asserts 508 Loop Detected for an inclusive registration |
+| 1 | spec | CIM 009 6.3.17 scopes 508 to a single exclusive or redirect source; TS 104 175 9.7 makes every detected loop an error (`D018_01`) |
 | 2 | suite | nine official `_exc` TPs create exclusive registrations that 4.3.6.3 forbids |
 | 3 | suite | `LdContextNotAvailable` fixtures assert 503; V1.9.1 mandates 504 |
 | 4 | spec | 5.3.4 SnapshotNotification: member naming conflict and a phantom `snapshotReady` |
