@@ -515,6 +515,40 @@ pub(crate) const SUBJECT_MEMBER: &str = "__subject";
 /// the tenant is where the subscription already lives. `None` when the
 /// subject carries nothing, so a deployment that named no header stores no
 /// member at all.
+/// The expanded types a write by id lands on: the stored Entity's, joined
+/// with the ones the request body names (ADR-0020: an engine judging by
+/// type judges the Entity the write changes and what it changes it to).
+/// The gate reads the store once per request, and only with an engine
+/// attached; an absent Entity or a store error adds nothing, and the write
+/// answers it as before.
+pub(crate) async fn write_types(
+    st: &crate::state::AppState,
+    tenant: &antares_model::TenantId,
+    id: &str,
+    body: Option<&Value>,
+) -> Vec<String> {
+    let stored = st
+        .store
+        .get(tenant, antares_store::Kind::Entity, id)
+        .await
+        .ok()
+        .flatten();
+    let mut out: Vec<String> = Vec::new();
+    for doc in stored.as_ref().into_iter().chain(body) {
+        let names: Vec<&str> = match doc.get("type") {
+            Some(Value::String(t)) => vec![t.as_str()],
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        for t in names {
+            if !out.iter().any(|o| o == t) {
+                out.push(t.to_owned());
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn subject_member(subject: &Subject) -> Option<Value> {
     (!subject.headers.is_empty())
         .then(|| serde_json::to_value(&subject.headers).ok())

@@ -168,6 +168,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -175,12 +178,12 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.4.3.2.md
-      gate_site: crates/antares-api/src/attrs.rs:140
+      gate_site: crates/antares-api/src/attrs.rs:150
     odata:
       status: supported
       binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3); collection-valued $ref add/remove
@@ -191,6 +194,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -198,7 +204,7 @@ operations:
           visibility of the target Entity under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -210,6 +216,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -217,7 +226,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -247,6 +256,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -254,17 +266,16 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-    the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+    the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
     an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on ids/clause only]'
-  gaps: 'types and attrs are not filled: an engine cannot judge the type or the attributes written'
+    decides on clause, ids, types (stored and named), attrs, body]'
 - id: append_attributes
   ts104175: 10.2.4
   cim009: 5.6.3
@@ -284,6 +295,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -291,12 +305,12 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.4.3.1.md
-      gate_site: crates/antares-api/src/attrs.rs:140
+      gate_site: crates/antares-api/src/attrs.rs:150
     odata:
       status: supported
       binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref, single-valued (Protocol 11.4.6.3, T-3441
@@ -317,6 +331,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -324,7 +341,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -354,6 +371,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -361,17 +381,16 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-    the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+    the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
     an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on ids/clause only]'
-  gaps: types and attrs are not filled
+    decides on clause, ids, types (stored and named), attrs, body]'
 - id: partial_attribute_update
   ts104175: 10.2.5
   cim009: 5.6.4
@@ -391,6 +410,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -398,12 +420,12 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.5.3.2.md
-      gate_site: crates/antares-api/src/attrs.rs:789
+      gate_site: crates/antares-api/src/attrs.rs:803
     odata:
       status: supported
       binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}')/{complexProperty} (Protocol 11.4.9)
@@ -412,6 +434,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -419,7 +444,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -431,6 +456,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -438,7 +466,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -468,6 +496,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -475,17 +506,16 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced today:
-    the Operation carries no stored image, the engine decides on ids/clause only]'
+    the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
     an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on ids/clause only]'
-  gaps: attrs is not filled although the path names the Attribute
+    decides on clause, ids, types (stored and named), attrs, body]'
 - id: set_attribute_value
   ts104175: 10.2.6
   cim009: null
@@ -577,6 +607,8 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -584,11 +616,11 @@ operations:
           not read, so its visibility is not required'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
-        lose it) [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.5.3.4.md
-      gate_site: crates/antares-api/src/attrs.rs:1081
+      gate_site: crates/antares-api/src/attrs.rs:1115
     odata:
       status: supported
       binding: DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9; OData sets it to
@@ -599,6 +631,8 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -606,9 +640,9 @@ operations:
           not read, so its visibility is not required'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
-        lose it) [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
     mcp:
       status: supported
       binding: delete_attribute (proposal)
@@ -617,6 +651,8 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -624,9 +660,9 @@ operations:
           not read, so its visibility is not required'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
-        lose it) [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
     linkml:
       status: not_offered
       binding: null
@@ -653,6 +689,8 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -660,15 +698,14 @@ operations:
           not read, so its visibility is not required'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
-        lose it) [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced today:
-    the Operation carries no stored image, the engine decides on ids/clause only]'
+    the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
   post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would lose
-    it) [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
-  gaps: attrs is not filled although the path names the Attribute
+    it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
 - id: delete_entity
   ts104175: 10.2.8
   cim009: 5.6.6
@@ -688,6 +725,7 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -695,10 +733,10 @@ operations:
           has no referential integrity), so no linked check'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no
-        stored image, the engine decides on ids/clause only]'
+        stored image, the engine decides on clause, ids, types (stored and named)]'
       post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.3.3.4.md
-      gate_site: crates/antares-api/src/entities.rs:1305
+      gate_site: crates/antares-api/src/entities.rs:1314
     odata:
       status: supported
       binding: DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.5)
@@ -707,6 +745,7 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -714,7 +753,7 @@ operations:
           has no referential integrity), so no linked check'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no
-        stored image, the engine decides on ids/clause only]'
+        stored image, the engine decides on clause, ids, types (stored and named)]'
       post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
     mcp:
       status: supported
@@ -724,6 +763,7 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -731,7 +771,7 @@ operations:
           has no referential integrity), so no linked check'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no
-        stored image, the engine decides on ids/clause only]'
+        stored image, the engine decides on clause, ids, types (stored and named)]'
       post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
     linkml:
       status: not_offered
@@ -759,6 +799,7 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -766,13 +807,12 @@ operations:
           has no referential integrity), so no linked check'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no
-        stored image, the engine decides on ids/clause only]'
+        stored image, the engine decides on clause, ids, types (stored and named)]'
       post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no stored
-    image, the engine decides on ids/clause only]'
+    image, the engine decides on clause, ids, types (stored and named)]'
   post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
-  gaps: types is not filled
 - id: merge_entity
   ts104175: 10.2.9
   cim009: 5.6.17
@@ -793,6 +833,8 @@ operations:
         - clause
         - ids
         - body
+        - types
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -800,12 +842,12 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.3.3.2.md
-      gate_site: crates/antares-api/src/entities.rs:1760
+      gate_site: crates/antares-api/src/entities.rs:1778
     odata:
       status: supported
       binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3); upsert on a missing key (11.4.4)
@@ -816,6 +858,8 @@ operations:
         - clause
         - ids
         - body
+        - types
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -823,7 +867,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -836,6 +880,8 @@ operations:
         - clause
         - ids
         - body
+        - types
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -843,7 +889,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -874,6 +920,8 @@ operations:
         - clause
         - ids
         - body
+        - types
+        - attrs
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -881,17 +929,16 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-    the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+    the view [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
     an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on ids/clause only]'
-  gaps: types and attrs are not filled
+    decides on clause, ids, types (stored and named), attrs, body]'
 - id: replace_entity
   ts104175: 10.2.10
   cim009: 5.6.18
@@ -913,6 +960,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -923,12 +973,12 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
         one the body names is writable (a replace deletes the ones it omits) [not enforced today: the Operation
-        carries no stored image, the engine decides on ids/clause only]'
+        carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.3.3.3.md
-      gate_site: crates/antares-api/src/entities.rs:2113
+      gate_site: crates/antares-api/src/entities.rs:2152
     odata:
       status: supported
       binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3)
@@ -937,6 +987,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -947,7 +1000,7 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
         one the body names is writable (a replace deletes the ones it omits) [not enforced today: the Operation
-        carries no stored image, the engine decides on ids/clause only]'
+        carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -959,6 +1012,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -969,7 +1025,7 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
         one the body names is writable (a replace deletes the ones it omits) [not enforced today: the Operation
-        carries no stored image, the engine decides on ids/clause only]'
+        carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -999,6 +1055,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1009,18 +1068,17 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
         one the body names is writable (a replace deletes the ones it omits) [not enforced today: the Operation
-        carries no stored image, the engine decides on ids/clause only]'
+        carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
     one the body names is writable (a replace deletes the ones it omits) [not enforced today: the Operation carries
-    no stored image, the engine decides on ids/clause only]'
+    no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
     an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on ids/clause only]'
-  gaps: types, attrs and body are not filled
+    decides on clause, ids, types (stored and named), attrs, body]'
 - id: replace_attribute
   ts104175: 10.2.11
   cim009: 5.6.19
@@ -1040,6 +1098,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1047,12 +1108,12 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.5.3.3.md
-      gate_site: crates/antares-api/src/attrs.rs:934
+      gate_site: crates/antares-api/src/attrs.rs:970
     odata:
       status: supported
       binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9); also PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref
@@ -1062,6 +1123,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1069,7 +1133,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -1081,6 +1145,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1088,7 +1155,7 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
@@ -1118,6 +1185,9 @@ operations:
         operation_fields:
         - clause
         - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1125,17 +1195,16 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+        today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced today:
-    the Operation carries no stored image, the engine decides on ids/clause only]'
+    the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs, body]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
     an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on ids/clause only]'
-  gaps: attrs and body are not filled
+    decides on clause, ids, types (stored and named), attrs, body]'
 - id: purge_entities
   ts104175: 10.2.12
   cim009: 5.6.21
@@ -1248,6 +1317,7 @@ operations:
         - ids
         - types
         - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1259,7 +1329,7 @@ operations:
       post_image: 'per Entity: as create_entity [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.7.3.1.md
-      gate_site: crates/antares-api/src/batch.rs:672
+      gate_site: crates/antares-api/src/batch.rs:687
     odata:
       status: not_offered
       binding: OData $batch members map to the single-Entity rows, each its own gate (T-3441 W24)
@@ -1270,6 +1340,7 @@ operations:
         - ids
         - types
         - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1291,6 +1362,7 @@ operations:
         - ids
         - types
         - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1329,6 +1401,7 @@ operations:
         - ids
         - types
         - attrs
+        - body
         filterable: false
         whole_tenant: false
         linked_entity_checks:
@@ -1341,8 +1414,8 @@ operations:
         engine decides on ids/clause only]'
   pre_image: 'per Entity: as create_entity; one gate call for the whole array today (ids of every member)'
   post_image: 'per Entity: as create_entity [not enforced today: the Operation carries no stored image, the engine
-    decides on ids/clause only]'
-  gaps: body is not filled; one decision covers all members, so an engine cannot deny one member and allow the rest
+    decides on clause, ids, types (stored and named), attrs, body]'
+  gaps: one decision covers all members, so an engine cannot deny one member and allow the rest (T-3480)
 - id: batch_upsert
   ts104175: 10.3.3
   cim009: 5.6.8
@@ -1379,7 +1452,7 @@ operations:
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.8.3.1.md
-      gate_site: crates/antares-api/src/batch.rs:672
+      gate_site: crates/antares-api/src/batch.rs:687
     odata:
       status: not_offered
       binding: null
@@ -1495,7 +1568,7 @@ operations:
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.9.3.1.md
-      gate_site: crates/antares-api/src/batch.rs:672
+      gate_site: crates/antares-api/src/batch.rs:687
     odata:
       status: not_offered
       binding: null
@@ -1608,7 +1681,7 @@ operations:
         a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.10.3.1.md
-      gate_site: crates/antares-api/src/batch.rs:672
+      gate_site: crates/antares-api/src/batch.rs:687
     odata:
       status: rejected
       binding: 'PATCH /x/views/{view}/odata/v4/{EntitySet} with a delta payload (Protocol 11.4.12): 501'

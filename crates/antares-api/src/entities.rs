@@ -1311,7 +1311,12 @@ pub async fn delete_entity(
         // the client meant, and the delete then removes an Entity the
         // client's selector excluded.
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.6.6", ids: &[&id]).await?;
+        gate!(
+            st, &tenant, &headers, "5.6.6",
+            ids: &[&id],
+            types: &crate::policy::write_types(&st, &tenant, &id, None).await,
+        )
+        .await?;
         // 4.17/5.6.6.4: the type selector gates the target — a registration
         // for a different type must not receive the forwarded delete.
         let spec = crate::registry::CsrSpec {
@@ -1770,7 +1775,14 @@ async fn merge_entity_inner(
             ..Default::default()
         },
     )?;
-    gate!(st, &tenant, headers, "5.6.17", ids: &[id], body: Some(&fragment)).await?;
+    gate!(
+        st, &tenant, headers, "5.6.17",
+        ids: &[id],
+        types: &crate::policy::write_types(st, &tenant, id, Some(&fragment)).await,
+        attrs: &crate::attrs::attr_iris_of(&fragment),
+        body: Some(&fragment),
+    )
+    .await?;
     // 5.6.17.3: a common observedAt timestamp to use across merged
     // Attributes, and a common language tag for merged LanguageMaps.
     let observed_at = params.get("observedAt").map(String::as_str);
@@ -2123,7 +2135,28 @@ pub async fn replace_entity(
         // (5.6.18: an unknown target is 404 before body validation), so the
         // header context is resolved on its own here.
         let ctx0 = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.6.18", ids: &[&id]).await?;
+        // The engine is shown the replacement. The body is read for it
+        // leniently: a body that does not parse is not the engine's to
+        // judge, and the replace below refuses it as before, after the
+        // 404 an unknown target answers first (057_03).
+        let shown = match &st.policy {
+            Some(_) => parse_body(&st.loader, &headers, &body, BodyKind::Standard)
+                .await
+                .ok()
+                .and_then(|p| {
+                    let obj = p.object(NgsiError::BadRequestData(String::new())).ok()?;
+                    expand_entity(obj, &p.ctx, ExpandOpts::default()).ok()
+                }),
+            None => None,
+        };
+        gate!(
+            st, &tenant, &headers, "5.6.18",
+            ids: &[&id],
+            types: &crate::policy::write_types(&st, &tenant, &id, shown.as_ref()).await,
+            attrs: &shown.as_ref().map(crate::attrs::attr_iris_of).unwrap_or_default(),
+            body: shown.as_ref(),
+        )
+        .await?;
         // 5.6.18.4: the ?type selector narrows the target — a non-matching
         // entity is "not known" for this replace.
         let local_doc = st
