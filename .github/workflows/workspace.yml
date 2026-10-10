@@ -291,6 +291,50 @@ jobs:
             | grep -v 'crates/antares-jsonld/src/loader.rs:'
 
 
+  features:
+    # GOAL point 2 (T-3465): every cargo feature builds, lints and tests on
+    # its own. The workspace job checks no-default and all-features, where a
+    # feature that only compiles next to another one passes unseen; this one
+    # takes each feature alone. A new feature joins it by being declared:
+    # cargo-hack enumerates them from the manifests.
+    # Excluded: `console` (antares-broker), the tokio-console hook for local
+    # debugging, which needs RUSTFLAGS="--cfg tokio_unstable" and is never in
+    # a release (crates/antares-broker/Cargo.toml).
+    # One entry per feature-carrying crate (measured 2026-10-10, 8 jobs:
+    # check of all 26 combinations 144 s, clippy of the 18 140 s, one
+    # antares-api test run 165 s x 7 features, one antares-broker run 69 s x
+    # 4): a single job would pass 15 minutes on a runner, a split one stays
+    # well under.
+    name: Each feature alone (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [workspace, antares-api, antares-broker, antares-notifier, antares-sql]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+          key: features-${{ matrix.crate }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: Every crate builds with each of its features alone
+        if: matrix.crate == 'workspace'
+        run: cargo hack check --locked --workspace --exclude antares-wasm --each-feature --exclude-features console
+      - name: Clippy with each feature alone
+        if: matrix.crate != 'workspace'
+        run: cargo hack clippy --locked --each-feature --exclude-features console -p ${{ matrix.crate }} --all-targets -- -D warnings
+      - name: Tests with each feature alone
+        if: matrix.crate != 'workspace'
+        run: cargo hack test --locked --each-feature --exclude-features console -p ${{ matrix.crate }}
+
   msrv:
     # The declared rust-version stays PROVEN as stable moves on.
     name: MSRV check (1.97)
