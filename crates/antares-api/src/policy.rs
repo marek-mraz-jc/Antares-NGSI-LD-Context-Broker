@@ -465,20 +465,29 @@ impl Filter {
     /// `geo_q` stays out of the parameters: they hold one geoquery (7.2.5)
     /// and it is the request's. The narrowing's area reaches the store
     /// query beside it through `repr::narrowing`.
+    ///
+    /// ADR-0023 rule 2: a term of the request's own `q` on an Attribute
+    /// this `pick`/`omit` hides reads as a term on an Attribute the Entity
+    /// does not have (see [`Filter::hide_terms`]). `ctx` is the request's,
+    /// the one its `q` terms expand through.
     pub fn narrow_params(
         &self,
         params: &std::collections::HashMap<String, String>,
+        ctx: &antares_jsonld::Context,
     ) -> Result<std::collections::HashMap<String, String>, Denied> {
         let mut out = params.clone();
-        if let Some(extra) = &self.q {
-            let narrowed = match out.get("q").map(|q| antares_ql::parse_q(q)).transpose() {
-                Ok(Some(own)) => QNode::And(vec![own, (**extra).clone()]),
-                Ok(None) => (**extra).clone(),
-                // the request's own `q` is parsed and refused long before a
-                // filter reaches it; an unparsable one here is a caller that
-                // narrowed something it never validated
-                Err(_) => return Err(Denied(ENGINE_FAILED.to_owned())),
-            };
+        // the request's own `q` is parsed and refused long before a filter
+        // reaches it; an unparsable one here is a caller that narrowed
+        // something it never validated
+        let own = match out.get("q").map(|q| antares_ql::parse_q(q)).transpose() {
+            Ok(own) => own.map(|own| self.hide_terms(own, ctx)),
+            Err(_) => return Err(Denied(ENGINE_FAILED.to_owned())),
+        };
+        let narrowed = match (own, &self.q) {
+            (Some(own), Some(extra)) => Some(QNode::And(vec![own, (**extra).clone()])),
+            (own, extra) => own.or_else(|| extra.as_deref().cloned()),
+        };
+        if let Some(narrowed) = narrowed {
             out.insert("q".to_owned(), narrowed.to_string());
         }
         if let Some(scope) = &self.scope_q {
@@ -490,6 +499,72 @@ impl Filter {
             out.insert("scopeQ".to_owned(), narrowed);
         }
         Ok(out)
+    }
+}
+
+impl Filter {
+    /// Whether this `pick`/`omit` hides the Attribute a q term names as
+    /// `written`, `iri` once expanded. A pick narrows Attributes only: the
+    /// system members it never names stay readable, as in the projection.
+    fn hides(&self, written: &str, iri: &str) -> bool {
+        let named = |names: &[String]| {
+            names
+                .iter()
+                .any(|n| crate::repr::policy_context().expand_key(n) == iri)
+        };
+        named(&self.omit)
+            || (!self.pick.is_empty()
+                && antares_ql::is_non_system_attr(written)
+                && !named(&self.pick))
+    }
+
+    /// ADR-0023 rule 2 (T-3482): a term on an Attribute this narrowing
+    /// hides reads as a term on one the Entity does not have — a
+    /// comparison or `attr` is false, `!attr` is true — so the hidden value
+    /// is never compared, on the store path or in memory. The q grammar
+    /// has no constants, so false is written `a;!a` and true `a|!a`, on
+    /// the hidden name itself: both hold whatever the Entity carries. The
+    /// path's top Attribute decides, so a sub-attribute or a hop through a
+    /// hidden Relationship is as hidden as the Attribute. Per-type rules
+    /// are not read here: their q is read on what the rules show
+    /// (`repr::client_q`).
+    pub fn hide_terms(&self, node: QNode, ctx: &antares_jsonld::Context) -> QNode {
+        if self.omit.is_empty() && self.pick.is_empty() {
+            return node;
+        }
+        let constant = |top: &str, holds: bool| {
+            let is = |negated| QNode::Exists {
+                path: antares_ql::QPath::dotted(vec![top.to_owned()]),
+                negated,
+            };
+            let pair = vec![is(false), is(true)];
+            if holds {
+                QNode::Or(pair)
+            } else {
+                QNode::And(pair)
+            }
+        };
+        let hidden = |path: &antares_ql::QPath| {
+            path.top()
+                .filter(|top| self.hides(top, &ctx.expand_key(top)))
+                .map(str::to_owned)
+        };
+        match node {
+            QNode::And(nodes) => {
+                QNode::And(nodes.into_iter().map(|n| self.hide_terms(n, ctx)).collect())
+            }
+            QNode::Or(nodes) => {
+                QNode::Or(nodes.into_iter().map(|n| self.hide_terms(n, ctx)).collect())
+            }
+            QNode::Cmp { path, op, value } => match hidden(&path) {
+                Some(top) => constant(&top, false),
+                None => QNode::Cmp { path, op, value },
+            },
+            QNode::Exists { path, negated } => match hidden(&path) {
+                Some(top) => constant(&top, negated),
+                None => QNode::Exists { path, negated },
+            },
+        }
     }
 }
 
@@ -1090,6 +1165,32 @@ impl PolicyEngine for Slow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-3482: only the caller's own q is rewritten; the engine's
+    /// condition may read what it hides from the caller.
+    #[test]
+    fn a_hidden_term_is_rewritten_and_the_engines_own_q_is_not() {
+        let filter = Filter {
+            omit: vec!["salary".into()],
+            q: Some(Box::new(antares_ql::parse_q("salary>0").expect("q"))),
+            ..Filter::default()
+        };
+        let ctx = antares_jsonld::core_context();
+        let params = std::collections::HashMap::from([(
+            "q".to_owned(),
+            "salary==1|!salary|name==\"x\"".to_owned(),
+        )]);
+        let out = filter.narrow_params(&params, &ctx).expect("narrowed");
+        assert_eq!(
+            out["q"],
+            "(salary;!salary|(salary|!salary)|name==\"x\");salary>0"
+        );
+        let nothing_hidden = Filter::default();
+        let out = nothing_hidden
+            .narrow_params(&params, &ctx)
+            .expect("narrowed");
+        assert_eq!(out["q"], params["q"]);
+    }
     use futures_util::FutureExt as _;
 
     const NS: &str = "https://uri.etsi.org/ngsi-ld/default-context/";

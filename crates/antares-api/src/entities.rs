@@ -765,7 +765,7 @@ async fn query_entities_inner(
     // Everything below reads the narrowed query: the store push-down, the
     // local re-check 5.7.2.4 runs over merged results, and the query the
     // request is forwarded with.
-    let narrowed = filter.narrow_params(params)?;
+    let narrowed = filter.narrow_params(params, &ctx)?;
     let params = &narrowed;
     let q_ast = params.get("q").map(|q| parse_q(q)).transpose()?;
     // 5.7.2.4 validation bullets (p.201), in the spec's own order.
@@ -2598,7 +2598,7 @@ pub(crate) async fn build_query_map(
         .into());
     }
     // the candidate set is the NARROWED query's (ADR-0020)
-    let narrowed = filter.narrow_params(params)?;
+    let narrowed = filter.narrow_params(params, ctx)?;
     let narrow = crate::repr::narrowing_reading(filter, params, ctx)?;
     let params = &narrowed;
     // 5.14.4.4: invalid entity ids / csf are BadRequestData

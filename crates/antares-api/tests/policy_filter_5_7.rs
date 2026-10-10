@@ -1253,3 +1253,142 @@ async fn a_filter_geo_q_narrows_the_temporal_query() {
         ["urn:ngsi-ld:Vehicle:at1"]
     );
 }
+
+const SALARY: &str = "https://uri.etsi.org/ngsi-ld/default-context/salary";
+
+/// ADR-0023 rule 2 on the Entity itself (T-3482): an Attribute the
+/// narrowing omits does not exist while q is evaluated, so a comparison on
+/// it selects nothing and its absence selects every Entity. The caller
+/// cannot learn the hidden value one comparison at a time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_q_term_does_not_read_an_attribute_the_narrowing_omits() {
+    let st = state(Filter {
+        omit: vec![SALARY.into()],
+        ..Filter::default()
+    })
+    .await;
+    seed_owned(&st).await;
+    let persons = ["urn:ngsi-ld:Person:open", "urn:ngsi-ld:Person:shut"];
+    for q in [
+        "salary%3E0",
+        "salary==90000",
+        "salary",
+        "salary%3E0|salary%3C0",
+    ] {
+        assert!(
+            sorted_ids(&st, &format!("/ngsi-ld/v1/entities?type=Person&q={q}"))
+                .await
+                .is_empty(),
+            "q={q} read an omitted Attribute"
+        );
+    }
+    assert_eq!(
+        sorted_ids(&st, "/ngsi-ld/v1/entities?type=Person&q=!salary").await,
+        persons,
+        "an omitted Attribute is absent from every Entity"
+    );
+    assert_eq!(
+        sorted_ids(
+            &st,
+            "/ngsi-ld/v1/entities?type=Person&q=salary%3E0|name==%22x%22"
+        )
+        .await,
+        persons,
+        "a visible term beside a hidden one still selects"
+    );
+    assert!(
+        sorted_ids(
+            &st,
+            "/ngsi-ld/v1/entities?type=Person&q=name==%22x%22;salary.amount%3E0"
+        )
+        .await
+        .is_empty(),
+        "a sub-attribute path of an omitted Attribute is as hidden as the Attribute"
+    );
+}
+
+/// The same under a pick that leaves the Attribute out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_q_term_does_not_read_an_attribute_the_narrowing_does_not_pick() {
+    let st = state(Filter {
+        pick: vec!["name".into(), "public".into()],
+        ..Filter::default()
+    })
+    .await;
+    seed_owned(&st).await;
+    assert!(
+        sorted_ids(&st, "/ngsi-ld/v1/entities?type=Person&q=salary%3E0")
+            .await
+            .is_empty(),
+        "an Attribute the pick leaves out was compared"
+    );
+    assert_eq!(
+        sorted_ids(&st, "/ngsi-ld/v1/entities?type=Person&q=public==true").await,
+        ["urn:ngsi-ld:Person:open"],
+        "a picked Attribute still selects"
+    );
+}
+
+/// The batch query (5.7.2 over POST) and the temporal query read the same
+/// rewritten q.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hidden_q_term_selects_nothing_in_the_batch_and_temporal_queries() {
+    let st = state(Filter {
+        omit: vec!["colour".into()],
+        ..Filter::default()
+    })
+    .await;
+    seed(&st).await;
+    let (code, list) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/query",
+        Some(json!({"type": "Query", "entities": [{"type": "Vehicle"}], "q": "colour==\"red\""})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert!(
+        ids(&list).is_empty(),
+        "the batch query compared an omitted Attribute: {list}"
+    );
+
+    let st = state(Filter {
+        omit: vec!["colour".into()],
+        ..Filter::default()
+    })
+    .await;
+    seed_history(&st).await;
+    let (code, list) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities?type=Vehicle&q=colour==%22red%22&timerel=after&timeAt=1970-01-01T00:00:00Z",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert!(
+        ids(&list).is_empty(),
+        "the temporal query compared an omitted Attribute: {list}"
+    );
+}
+
+/// AllowAll and a narrowing that hides nothing the q names answer as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_q_term_on_a_visible_attribute_answers_as_before() {
+    let st = state(Filter {
+        omit: vec!["name".into()],
+        ..Filter::default()
+    })
+    .await;
+    seed_owned(&st).await;
+    assert_eq!(
+        sorted_ids(&st, "/ngsi-ld/v1/entities?type=Person&q=salary%3E0").await,
+        ["urn:ngsi-ld:Person:open", "urn:ngsi-ld:Person:shut"],
+    );
+    let st = state(Filter::default()).await;
+    seed_owned(&st).await;
+    assert_eq!(
+        sorted_ids(&st, "/ngsi-ld/v1/entities?type=Person&q=salary%3E0").await,
+        ["urn:ngsi-ld:Person:open", "urn:ngsi-ld:Person:shut"],
+    );
+}

@@ -1520,7 +1520,7 @@ async fn batch_query_inner(
     // what the client's own Query reads, before the engine's q joins it
     // (ADR-0023 rule 11)
     let narrow = crate::repr::narrowing_reading(&filter, &vp, &parsed.ctx)?;
-    let vp = filter.narrow_params(&vp)?;
+    let vp = filter.narrow_params(&vp, &parsed.ctx)?;
     let fed = if crate::federation::active(&vp)
         && !crate::federation::via_loop(
             headers,

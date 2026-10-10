@@ -1929,7 +1929,7 @@ pub(crate) async fn query_temporal_collected(
     } else {
         None
     };
-    let narrowed = filter.narrow_params(params)?;
+    let narrowed = filter.narrow_params(params, &ctx)?;
     let params = &narrowed;
     let q_ast = params.get("q").map(|q| parse_q(q)).transpose()?.map(|ast| {
         antares_ql::eval::apply_expand_values(
