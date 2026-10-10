@@ -54,7 +54,7 @@ pub fn dt_key_sql(e: &str) -> String {
 /// window stays the arbiter.
 pub fn compile_instance_range(
     r: &InstanceRange<'_>,
-    el: &str,
+    el: &'static str,
     first_bind: usize,
 ) -> Option<CompiledSql> {
     let tp = format!("${first_bind}");
@@ -101,7 +101,11 @@ pub fn compile_instance_range(
 /// jsonb text extraction the exact predicate runs on never uses an index.
 /// Only timeproperties with a parsed column compile; others prune by text
 /// alone (`None`).
-pub fn column_range_bound(r: &InstanceRange<'_>, alias: &str, time_bind: usize) -> Option<String> {
+pub fn column_range_bound(
+    r: &InstanceRange<'_>,
+    alias: &'static str,
+    time_bind: usize,
+) -> Option<String> {
     // `deleted_at` is the one nullable column of the four (0001_init.sql):
     // its bound must let NULL rows through to the text predicate, which
     // decides membership either way. `observed_at`, `created_at` and

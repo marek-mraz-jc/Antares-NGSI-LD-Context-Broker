@@ -29,7 +29,7 @@ const MAX_SCOPE_Q_BYTES: usize = 4096;
 
 /// Compile `scope_q` into a predicate over `col` (a `text[]`).
 /// `None` = outside the exact subset; the caller filters in memory.
-pub fn compile_scope_q(scope_q: &str, col: &str, first_bind: usize) -> Option<CompiledSql> {
+pub fn compile_scope_q(scope_q: &str, col: &'static str, first_bind: usize) -> Option<CompiledSql> {
     // A NUL has no representation in a `text` value, so binding one raises in
     // the database — a 500 in `postgres` mode for a query `memory` mode
     // answers (`antares_ql::sql::literal` refuses one for the same reason).

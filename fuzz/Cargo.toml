@@ -16,6 +16,8 @@ serde_json = "1"
 antares-ql = { path = "../crates/antares-ql" }
 antares-api = { path = "../crates/antares-api", default-features = false }
 antares-jsonld = { path = "../crates/antares-jsonld" }
+# q_to_sql: the SQL compilers alone; the Postgres store is not linked.
+antares-sql = { path = "../crates/antares-sql", default-features = false }
 
 [[bin]]
 name = "parse_q"
@@ -41,6 +43,13 @@ bench = false
 [[bin]]
 name = "expand_entity"
 path = "fuzz_targets/expand_entity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "q_to_sql"
+path = "fuzz_targets/q_to_sql.rs"
 test = false
 doc = false
 bench = false

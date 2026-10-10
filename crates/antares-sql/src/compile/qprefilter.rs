@@ -40,7 +40,7 @@ use super::temporal::{column_range_bound, InstanceRange};
 pub fn compile_prefilter(
     node: &QNode,
     range: Option<&InstanceRange<'_>>,
-    entity: &str,
+    entity: &'static str,
     first_bind: usize,
     expand: &dyn Fn(&str) -> String,
 ) -> Option<CompiledSql> {

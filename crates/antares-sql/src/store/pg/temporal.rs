@@ -304,15 +304,17 @@ fn aggregate_expr(
     let mut rows = String::new();
     let mut pairs = String::new();
     for (i, m) in agg.methods.iter().enumerate() {
-        let sql = match m.as_str() {
-            "totalCount" => "count(*)",
-            "distinctCount" => "count(DISTINCT s.v)",
-            "min" => "min(s.v)",
-            "max" => "max(s.v)",
-            "sum" => "sum(s.v)",
-            "avg" => "avg(s.v)",
-            "stddev" => "stddev_pop(s.v)",
-            "sumsq" => "sum(s.v * s.v)",
+        // The SQL and the member name both come out of this table, so the
+        // request's own string never reaches the statement (T-3464).
+        let (name, sql) = match m.as_str() {
+            "totalCount" => ("totalCount", "count(*)"),
+            "distinctCount" => ("distinctCount", "count(DISTINCT s.v)"),
+            "min" => ("min", "min(s.v)"),
+            "max" => ("max", "max(s.v)"),
+            "sum" => ("sum", "sum(s.v)"),
+            "avg" => ("avg", "avg(s.v)"),
+            "stddev" => ("stddev", "stddev_pop(s.v)"),
+            "sumsq" => ("sumsq", "sum(s.v * s.v)"),
             _ => return None,
         };
         aggs.push_str(&format!(", {sql} AS m{i}"));
@@ -321,8 +323,7 @@ fn aggregate_expr(
             BUCKET_TS.replace("{}", "g.bs"),
             BUCKET_TS.replace("{}", "g.be")
         ));
-        // method names are the allowlist above, never request text
-        pairs.push_str(&format!(", '{m}', b.r{i}"));
+        pairs.push_str(&format!(", '{name}', b.r{i}"));
     }
     let expr = format!(
         "(SELECT jsonb_build_object('bad', bool_or(b.bad), 'attrs', \
@@ -556,16 +557,16 @@ impl PgTemporalStore {
         // fallback count query too.
         let mut wheres = vec!["m.tenant_id = $1".to_owned(), NOT_EXPIRED.to_owned()];
         if let Some(ids) = f.ids {
-            binds.push(B::Arr(ids.iter().map(|s| s.to_string()).collect()));
+            binds.push(B::Arr(super::storable(ids)));
             wheres.push(format!("m.id = ANY(${})", binds.len()));
         }
         if let Some(types) = f.types {
             // overlap: entity has ANY of the wanted types (flat OR list)
-            binds.push(B::Arr(types.to_vec()));
+            binds.push(B::Arr(super::storable(types)));
             wheres.push(format!("m.types && ${}", binds.len()));
         }
         if let Some(attrs) = f.attrs {
-            binds.push(B::Arr(attrs.to_vec()));
+            binds.push(B::Arr(super::storable(attrs)));
             wheres.push(format!(
                 "EXISTS (SELECT 1 FROM attr_instances x WHERE x.tenant_id = m.tenant_id \
                  AND x.entity_id = m.id AND x.attr_id = ANY(${}))",
