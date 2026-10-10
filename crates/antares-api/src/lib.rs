@@ -558,6 +558,9 @@ pub fn router(state: AppState) -> Router {
                 .layer(axum::middleware::from_fn(echo_tenant_layer)),
         )
         .fallback(not_found)
+        // T-3531: a panicking handler answers 500 instead of unwinding the
+        // connection task; inside the metrics layer so the 500 is counted.
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_500))
         // outermost on purpose: axum attaches the 405 Allow header in the
         // Router itself, above any nested layer — only a layer wrapping the
         // WHOLE router sees it.
@@ -567,6 +570,13 @@ pub fn router(state: AppState) -> Router {
         // absent knob = no layer at all: a bare OPTIONS keeps its 204 + Allow
         .layer(tower::util::option_layer(cors_layer()))
         .with_state(state)
+}
+
+/// A handler that panicked: 500 InternalError, and the broker goes on
+/// serving. The panic message stays in the log (the default hook prints it),
+/// never in the body, where it could carry a stored value.
+fn panic_500(_: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    ApiError::from(NgsiError::InternalError("the request failed".into())).into_response()
 }
 
 /// Browser access is off unless ANTARES_CORS_ORIGINS names the origins
