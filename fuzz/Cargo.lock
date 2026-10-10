@@ -61,6 +61,7 @@ dependencies = [
  "antares-sql",
  "libfuzzer-sys",
  "linkml-model",
+ "odata-batch",
  "odata-csdl",
  "odata-json",
  "odata-url",
@@ -1189,6 +1190,14 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "odata-batch"
+version = "0.1.3"
+dependencies = [
+ "memchr",
+ "serde_json",
 ]
 
 [[package]]

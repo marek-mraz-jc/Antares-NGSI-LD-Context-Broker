@@ -17,6 +17,7 @@ members = [
     "crates/odata-csdl",
     "crates/odata-url",
     "crates/odata-json",
+    "crates/odata-batch",
     "crates/antares-views",
     # The reference plugin: built and tested with the workspace so the
     # driver, routing and notification seams cannot drift from it.
@@ -168,6 +169,9 @@ overflow-checks = true
 overflow-checks = true
 
 [profile.release.package.odata-json]
+overflow-checks = true
+
+[profile.release.package.odata-batch]
 overflow-checks = true
 
 [profile.release.package.antares-views]
