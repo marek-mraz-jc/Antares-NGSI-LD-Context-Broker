@@ -46,6 +46,9 @@ export const options = {
     },
   },
   summaryTrendStats: ["med", "p(99)", "max"],
+  // seeding ENTITIES=100000 in upserts of 500 outlasts k6's 60 s default
+  setupTimeout: "15m",
+  teardownTimeout: "15m",
 };
 
 const brands = ["Mercedes", "Skoda", "Volvo", "Toyota", "Tesla"];
