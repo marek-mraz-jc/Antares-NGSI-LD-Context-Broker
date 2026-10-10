@@ -172,6 +172,7 @@ carries the fix. The current list:
 | 16 | suite | 020_19 and 020_20 expect a deleted scope as `[]`; 4.18 makes it `urn:ngsi-ld:null` |
 | 17 | spec | TS 104 176 answers Create and Clone Snapshot with 202, CIM 009 with 201, and names no version a client can prefer (Antares: 201) |
 | 18 | suite | 021_08 expects temporal instances that fail `q`; 5.7.4.4 keeps only those that meet it |
+| 19 | suite | 037_11 and 041_03 query without Accept and expect ld+json pagination Links; 6.3.10 types them after the response |
 
 Filing is manual; each entry carries the clause quotation and the
 proposed fix so it can be pasted into the ETSI tracker as is.

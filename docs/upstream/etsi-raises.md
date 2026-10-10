@@ -472,3 +472,21 @@ does (forge commit 9ca4213e); Antares carries that fix
 The clause does not say how an instance meets a `q` over several
 Attributes; Antares keeps an instance when `q` holds on the Entity with that
 Attribute narrowed to that one instance.
+
+---
+
+## 19. [suite] 037_11 and 041_03 ask without Accept and expect ld+json pagination Links
+
+**Title:** 037_11/041_03 expect `type="application/ld+json"` on the
+pagination Links of an `application/json` response
+
+**Body:**
+
+CIM 009 6.3.10: the type Link Target Attribute "shall be exactly equal to
+the media type resulting from the original request". Both test points query
+without an Accept header, so the response is `application/json`, and still
+expect `type="application/ld+json"`. Suggest sending
+`Accept: application/ld+json`, as the corrected fork does (forge commit
+c4cdb0cf, and the same line in its 037_11); Antares carries that fix and
+types every pagination Link after the response media type
+(`registration_listing_5_10_2.rs::a_registration_page_link_carries_the_requested_media_type`).

@@ -308,3 +308,45 @@ async fn a_percent_escape_inside_q_is_not_decoded_a_second_time() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
+
+/// 6.3.10: the type of a pagination Link "shall be exactly equal to the
+/// media type resulting from the original request", for registrations as for
+/// entities. The vendored 037_11/041_03 asked without Accept and expected
+/// ld+json; the forge fixed the TPs to ask for ld+json (c4cdb0cf).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registration_page_link_carries_the_requested_media_type() {
+    let st = AppState::new("me".into());
+    seed(&st, 3, "Vehicle").await;
+
+    for (accept, want) in [
+        ("application/json", "type=\"application/json\""),
+        ("application/ld+json", "type=\"application/ld+json\""),
+    ] {
+        let resp = antares_api::router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/ngsi-ld/v1/csourceRegistrations?type=Vehicle&limit=1")
+                    .header("Accept", accept)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let next: Vec<&str> = resp
+            .headers()
+            .get_all("Link")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(", <"))
+            .filter(|l| l.contains("rel=\"next\""))
+            .collect();
+        assert_eq!(next.len(), 1, "one next link for Accept {accept}: {next:?}");
+        assert!(
+            next[0].ends_with(want),
+            "Accept {accept} must give {want}: {}",
+            next[0]
+        );
+    }
+}
