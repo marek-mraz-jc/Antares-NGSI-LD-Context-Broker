@@ -54,7 +54,13 @@ fn db() -> Option<&'static Db> {
         let pool = runtime
             .block_on(pg::connect(&url, 8))
             .expect("connect and migrate");
-        for name in ["pgparityq", "pgparityexact", "pgparityscope", "pgparitygeo"] {
+        for name in [
+            "pgparityq",
+            "pgparityexact",
+            "pgparityscope",
+            "pgparitygeo",
+            "pgparitygeo2",
+        ] {
             let tenant = TenantId::new(name).expect("tenant");
             runtime
                 .block_on(pg::ensure_tenant(&pool, &tenant))
@@ -403,7 +409,32 @@ proptest! {
             .filter_map(|doc| doc["id"].as_str().map(str::to_owned))
             .collect();
         let spec = geo.to_sql_spec(ctx());
-        let (got, _) = query(db, &tenant, &EntityFilter { geo: spec.as_ref(), expand: &expand, ..Default::default() });
+        let (got, _) = query(db, &tenant, &EntityFilter { geo: spec.as_slice(), expand: &expand, ..Default::default() });
         prop_assert!(got.is_superset(&want), "geoQ={:?} dropped {:?}", params, want.difference(&got).collect::<Vec<_>>());
+    }
+
+    /// ADR-0023 rule 1 (T-3484): two geoqueries in one store query, the
+    /// request's and a policy narrowing's, are conjoined. The store keeps
+    /// every entity the evaluator keeps under both, and nothing either one
+    /// alone would have dropped.
+    #[test]
+    fn two_geo_qs_are_conjoined_like_the_evaluator(docs in entities(), a in geo_q(), b in geo_q()) {
+        let Some(db) = db() else { return Ok(()) };
+        let (Ok(Some(ga)), Ok(Some(gb))) = (GeoQuery::from_params(&a), GeoQuery::from_params(&b)) else { return Ok(()) };
+        let tenant = TenantId::new("pgparitygeo2").expect("tenant");
+        let stored = seed(db, &tenant, &docs);
+        let want: BTreeSet<String> = stored
+            .iter()
+            .filter(|doc| ga.matches(doc, ctx()) && gb.matches(doc, ctx()))
+            .filter_map(|doc| doc["id"].as_str().map(str::to_owned))
+            .collect();
+        let specs: Vec<_> = [&ga, &gb].iter().filter_map(|g| g.to_sql_spec(ctx())).collect();
+        prop_assert_eq!(specs.len(), 2, "both default-geoproperty queries compile");
+        let (got, decided) = query(db, &tenant, &EntityFilter { geo: &specs, expand: &expand, ..Default::default() });
+        prop_assert!(!decided, "geo never claims decided");
+        prop_assert!(got.is_superset(&want), "a={:?} b={:?} dropped {:?}", a, b, want.difference(&got).collect::<Vec<_>>());
+        let (only_a, _) = query(db, &tenant, &EntityFilter { geo: &specs[..1], expand: &expand, ..Default::default() });
+        let (only_b, _) = query(db, &tenant, &EntityFilter { geo: &specs[1..], expand: &expand, ..Default::default() });
+        prop_assert!(got.is_subset(&only_a) && got.is_subset(&only_b), "a={:?} b={:?}: the pair kept {:?}, more than one alone", a, b, got);
     }
 }

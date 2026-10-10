@@ -558,7 +558,7 @@ impl PgEntityStore {
                 binds.extend(c.binds.into_iter().map(Bind::Text));
             }
         }
-        if let Some(spec) = f.geo {
+        for spec in f.geo {
             decided = false;
             // A client may send a self-intersecting polygon. GEOS raises on
             // one (`side location conflict`), which would turn a query into a

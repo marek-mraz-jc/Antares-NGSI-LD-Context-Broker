@@ -1581,7 +1581,7 @@ pub async fn interval_tick(st: &AppState) {
                     types: (!type_groups.is_empty()).then_some(type_groups.as_slice()),
                     q: q_ast.as_deref(),
                     scope_q: sub_str(&sub, "scopeQ"),
-                    geo: geo_spec.as_ref(),
+                    geo: geo_spec.as_slice(),
                     expand: &expand,
                     ..Default::default()
                 };
@@ -2170,7 +2170,7 @@ async fn deliver_as(
             crate::policy::NotifyDecision::Filter(f) => {
                 // a condition the notification path cannot re-run is not a
                 // narrowing it can claim to have applied
-                if f.q.is_some() || f.scope_q.is_some() {
+                if f.q.is_some() || f.scope_q.is_some() || f.geo_q.is_some() {
                     tracing::error!(
                         "policy engine {} narrowed a notification with a query; dropping it",
                         engine.name()

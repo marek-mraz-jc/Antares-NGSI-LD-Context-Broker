@@ -1648,7 +1648,7 @@ fn window_conditions_match(
     doc: &Value,
     tq: Option<&TemporalQ>,
     q_ast: Option<&antares_ql::QNode>,
-    geo: Option<&antares_ql::geo::GeoQuery>,
+    geos: &[&antares_ql::geo::GeoQuery],
     ctx: &Context,
 ) -> bool {
     // 5.7.4.4 S2/S3: the values filter and geoquery are checked against
@@ -1670,12 +1670,7 @@ fn window_conditions_match(
             return false;
         }
     }
-    if let Some(g) = geo {
-        if !g.matches(&eval_doc, ctx) {
-            return false;
-        }
-    }
-    true
+    geos.iter().all(|g| g.matches(&eval_doc, ctx))
 }
 
 /// 5.7.4.4 S4 — and S7: the federation merge precedes this check, so
@@ -1849,7 +1844,11 @@ pub(crate) async fn query_temporal_collected(
     let attrs_filter = selection(&trepr);
     // only the attrs= param excludes entities; pick is projection-only
     let entity_attr_filter = trepr.attrs.clone();
-    let geo = antares_ql::geo::GeoQuery::from_params(params)?;
+    // the request's own geoquery and the narrowing's area, all of which
+    // must hold (ADR-0023 rule 1)
+    let own_geo = antares_ql::geo::GeoQuery::from_params(params)?;
+    let geos: Vec<&antares_ql::geo::GeoQuery> =
+        own_geo.iter().chain(filter.geo_q.as_deref()).collect();
 
     // Push entity narrowing (ids/types/attrs) and instance-window
     // pruning (range + RANK()-capped lastN) into the store. The loop below
@@ -1862,7 +1861,7 @@ pub(crate) async fn query_temporal_collected(
     // (q/geo still drop entities after SQL) wait for exactness.
     // scopeQ joins q/geo here: the 4.18 validity filter drops entities and
     // instances AFTER SQL, so a pushed page/lastN cap would under-return.
-    let exact_push = q_ast.is_none() && geo.is_none() && scope_q.is_none();
+    let exact_push = q_ast.is_none() && geos.is_empty() && scope_q.is_none();
     // Entity-page pushdown: a temporal query used to materialize the
     // tenant's ENTIRE history. Pushed only when every filter the store
     // cannot see is absent — same gate family as the entity-query pushdown.
@@ -1884,7 +1883,7 @@ pub(crate) async fn query_temporal_collected(
     // 5.7.4.4 + 5.5.9: pagination applies to the MERGED federated union, so
     // the store may only pre-page when nothing will federate — otherwise
     // page 1 is local-page + every remote row (matrix-9 IOP_EXT_TMP_03_04).
-    let push_page = (exact_push || (geo.is_none() && scope_q.is_none() && q_page_exact))
+    let push_page = (exact_push || (geos.is_empty() && scope_q.is_none() && q_page_exact))
         && id_pattern.is_none()
         && params.get("orderBy").is_none()
         && params.get("datasetId").is_none()
@@ -1912,7 +1911,7 @@ pub(crate) async fn query_temporal_collected(
     // futures are Send; the store call itself is synchronous)
     let outcome = {
         let expand = |t: &str| ctx.expand_key(t);
-        let geo_pre = geo.as_ref().map(|g| g.to_instance_spec(&ctx));
+        let geo_pre: Vec<_> = geos.iter().map(|g| g.to_instance_spec(&ctx)).collect();
         let tf = antares_store::filter::TemporalFilter {
             ids: ids.as_deref(),
             types: types.as_deref(),
@@ -1937,7 +1936,7 @@ pub(crate) async fn query_temporal_collected(
             }),
             q: q_ast.as_ref(),
             expand: &expand,
-            geo: geo_pre.as_ref().map(|(s, iri)| (s, iri.as_str())),
+            geo: &geo_pre,
             aggregate: push_agg.then_some(antares_store::filter::Aggregate {
                 methods: &trepr.aggr_methods,
                 period_secs: match trepr.aggr_period {
@@ -2037,8 +2036,8 @@ pub(crate) async fn query_temporal_collected(
         if !type_and_attrs_match(&doc, types.as_ref(), entity_attr_filter.as_ref()) {
             continue;
         }
-        if (q_ast.is_some() || geo.is_some())
-            && !window_conditions_match(&doc, tq.as_ref(), q_ast.as_ref(), geo.as_ref(), &ctx)
+        if (q_ast.is_some() || !geos.is_empty())
+            && !window_conditions_match(&doc, tq.as_ref(), q_ast.as_ref(), &geos, &ctx)
         {
             continue;
         }
