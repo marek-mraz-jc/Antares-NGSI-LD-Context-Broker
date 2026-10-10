@@ -1,0 +1,694 @@
+// SPDX-License-Identifier: EUPL-1.2
+//! The writers for odata-linkml-mapping.md rows L2 to L6: same model, same
+//! bytes. Maps are printed in key order, lists in schema order. Every name,
+//! IRI and text the schema supplies is quoted and escaped for the format it
+//! lands in, so no value can change a document's structure (threat LK3).
+
+use std::fmt::Write as _;
+
+use serde_json::{json, Map, Value};
+
+use crate::model::{Builtin, Model, Range};
+use crate::schema::Slot;
+
+// ---------------------------------------------------------------- YAML (L2)
+
+/// A YAML node of the emitted document; the shape is fixed, so its depth is.
+enum Node {
+    Str(String),
+    Bool(bool),
+    /// Never empty: an empty list is left out, as LinkML reads a missing
+    /// list (the round-trip property test fails on a `null` here).
+    List(Vec<String>),
+    Map(Vec<(String, Node)>),
+}
+
+/// A double-quoted YAML scalar: `\`, `"`, control characters and the YAML
+/// line breaks are escaped, nothing else can end or restructure it.
+fn yaml_quote(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().saturating_add(2));
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{feff}') => {
+                let _ = write!(out, "\\u{:04X}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn render(out: &mut String, indent: usize, map: &[(String, Node)]) {
+    let pad = " ".repeat(indent);
+    for (key, node) in map {
+        let _ = write!(out, "{pad}{}:", yaml_quote(key));
+        match node {
+            Node::Str(s) => {
+                let _ = writeln!(out, " {}", yaml_quote(s));
+            }
+            Node::Bool(b) => {
+                let _ = writeln!(out, " {b}");
+            }
+            Node::List(items) => {
+                out.push('\n');
+                for item in items {
+                    let _ = writeln!(out, "{pad}  - {}", yaml_quote(item));
+                }
+            }
+            Node::Map(m) if m.is_empty() => out.push_str(" {}\n"),
+            Node::Map(m) => {
+                out.push('\n');
+                render(out, indent.saturating_add(2), m);
+            }
+        }
+    }
+}
+
+/// Pushes `key: value` when the value is there.
+fn opt(map: &mut Vec<(String, Node)>, key: &str, value: Option<&String>) {
+    if let Some(v) = value {
+        map.push((key.to_owned(), Node::Str(v.clone())));
+    }
+}
+
+fn flag(map: &mut Vec<(String, Node)>, key: &str, value: Option<bool>) {
+    if let Some(v) = value {
+        map.push((key.to_owned(), Node::Bool(v)));
+    }
+}
+
+fn slot_node(slot: &Slot) -> Node {
+    let mut m = Vec::new();
+    opt(&mut m, "name", slot.name.as_ref());
+    opt(&mut m, "slot_uri", slot.slot_uri.as_ref());
+    opt(&mut m, "range", slot.range.as_ref());
+    flag(&mut m, "required", slot.required);
+    flag(&mut m, "multivalued", slot.multivalued);
+    flag(&mut m, "inlined", slot.inlined);
+    opt(&mut m, "inverse", slot.inverse.as_ref());
+    if let Some(u) = &slot.unit {
+        let mut unit = Vec::new();
+        opt(&mut unit, "ucum_code", u.ucum_code.as_ref());
+        opt(&mut unit, "symbol", u.symbol.as_ref());
+        if !u.exact_mappings.is_empty() {
+            unit.push((
+                "exact_mappings".to_owned(),
+                Node::List(u.exact_mappings.clone()),
+            ));
+        }
+        m.push(("unit".to_owned(), Node::Map(unit)));
+    }
+    if !slot.annotations.is_empty() {
+        let annotations = slot
+            .annotations
+            .iter()
+            .map(|(k, a)| {
+                let body = vec![
+                    ("tag".to_owned(), Node::Str(a.tag.clone())),
+                    ("value".to_owned(), Node::Str(a.value.clone())),
+                ];
+                (k.clone(), Node::Map(body))
+            })
+            .collect();
+        m.push(("annotations".to_owned(), Node::Map(annotations)));
+    }
+    opt(&mut m, "description", slot.description.as_ref());
+    Node::Map(m)
+}
+
+/// The LinkML YAML of the model (row L2), in LinkML's expanded forms
+/// (`prefix_prefix`/`prefix_reference`, `tag`/`value`), every key and every
+/// string double-quoted.
+///
+/// ```
+/// # let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "a: b\n- c"}"#,
+/// #     &linkml_model::Limits { max_bytes: 999, max_depth: 4, max_elements: 9 });
+/// # assert!(m.is_err(), "a newline in a name is refused at load");
+/// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "a: b #c"}"#,
+///     &linkml_model::Limits { max_bytes: 999, max_depth: 4, max_elements: 9 }).unwrap();
+/// assert_eq!(linkml_model::yaml(&m), "\"id\": \"https://e.org/s\"\n\"name\": \"a: b #c\"\n");
+/// ```
+#[must_use]
+pub fn yaml(model: &Model) -> String {
+    let s = model.schema();
+    let mut top = vec![
+        ("id".to_owned(), Node::Str(s.id.clone())),
+        ("name".to_owned(), Node::Str(s.name.clone())),
+    ];
+    opt(&mut top, "version", s.version.as_ref());
+    if !s.prefixes.is_empty() {
+        let prefixes = s
+            .prefixes
+            .iter()
+            .map(|(k, p)| {
+                let body = vec![
+                    (
+                        "prefix_prefix".to_owned(),
+                        Node::Str(p.prefix_prefix.clone()),
+                    ),
+                    (
+                        "prefix_reference".to_owned(),
+                        Node::Str(p.prefix_reference.clone()),
+                    ),
+                ];
+                (k.clone(), Node::Map(body))
+            })
+            .collect();
+        top.push(("prefixes".to_owned(), Node::Map(prefixes)));
+    }
+    opt(&mut top, "default_prefix", s.default_prefix.as_ref());
+    if !s.classes.is_empty() {
+        let classes = s
+            .classes
+            .iter()
+            .map(|(k, c)| {
+                let mut m = Vec::new();
+                opt(&mut m, "name", c.name.as_ref());
+                opt(&mut m, "class_uri", c.class_uri.as_ref());
+                opt(&mut m, "is_a", c.is_a.as_ref());
+                if !c.slots.is_empty() {
+                    m.push(("slots".to_owned(), Node::List(c.slots.clone())));
+                }
+                if !c.slot_usage.is_empty() {
+                    let usage = c
+                        .slot_usage
+                        .iter()
+                        .map(|(n, u)| (n.clone(), slot_node(u)))
+                        .collect();
+                    m.push(("slot_usage".to_owned(), Node::Map(usage)));
+                }
+                opt(&mut m, "description", c.description.as_ref());
+                (k.clone(), Node::Map(m))
+            })
+            .collect();
+        top.push(("classes".to_owned(), Node::Map(classes)));
+    }
+    if !s.slots.is_empty() {
+        let slots = s
+            .slots
+            .iter()
+            .map(|(k, v)| (k.clone(), slot_node(v)))
+            .collect();
+        top.push(("slots".to_owned(), Node::Map(slots)));
+    }
+    if !s.enums.is_empty() {
+        let enums = s
+            .enums
+            .iter()
+            .map(|(k, e)| {
+                let mut m = Vec::new();
+                opt(&mut m, "name", e.name.as_ref());
+                opt(&mut m, "description", e.description.as_ref());
+                if !e.permissible_values.is_empty() {
+                    let values = e
+                        .permissible_values
+                        .iter()
+                        .map(|(t, v)| {
+                            let mut pv = Vec::new();
+                            opt(&mut pv, "text", v.text.as_ref());
+                            opt(&mut pv, "description", v.description.as_ref());
+                            opt(&mut pv, "meaning", v.meaning.as_ref());
+                            (t.clone(), Node::Map(pv))
+                        })
+                        .collect();
+                    m.push(("permissible_values".to_owned(), Node::Map(values)));
+                }
+                (k.clone(), Node::Map(m))
+            })
+            .collect();
+        top.push(("enums".to_owned(), Node::Map(enums)));
+    }
+    let mut out = String::new();
+    render(&mut out, 0, &top);
+    out
+}
+
+// --------------------------------------------------------- JSON Schema (L3)
+
+fn typed(kind: &str, format: Option<&str>) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("type".to_owned(), Value::String(kind.to_owned()));
+    if let Some(f) = format {
+        m.insert("format".to_owned(), Value::String(f.to_owned()));
+    }
+    m
+}
+
+fn builtin_schema(b: Builtin) -> Map<String, Value> {
+    match b {
+        Builtin::String | Builtin::Uriorcurie => typed("string", None),
+        Builtin::Integer => typed("integer", None),
+        Builtin::Float | Builtin::Double | Builtin::Decimal => typed("number", None),
+        Builtin::Boolean => typed("boolean", None),
+        Builtin::Date => typed("string", Some("date")),
+        Builtin::Datetime => typed("string", Some("date-time")),
+        Builtin::Time => typed("string", Some("time")),
+        Builtin::Uri => typed("string", Some("uri")),
+    }
+}
+
+fn slot_schema(model: &Model, slot: &Slot) -> Value {
+    let base = match model.range(slot) {
+        Range::Type(b) => builtin_schema(b),
+        // A relationship holds the target entity's id.
+        Range::Class(_) => typed("string", Some("uri")),
+        Range::Enum(e) => {
+            let values = model
+                .schema()
+                .enums
+                .get(e)
+                .map(|e| {
+                    e.permissible_values
+                        .keys()
+                        .cloned()
+                        .map(Value::String)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut m = typed("string", None);
+            m.insert("enum".to_owned(), Value::Array(values));
+            m
+        }
+    };
+    let mut out = if slot.multivalued == Some(true) {
+        let mut m = typed("array", None);
+        m.insert("items".to_owned(), Value::Object(base));
+        m
+    } else {
+        base
+    };
+    out.insert(
+        "x-ngsi-ld-kind".to_owned(),
+        Value::String(model.kind(slot).to_owned()),
+    );
+    if let Some(d) = &slot.description {
+        out.insert("description".to_owned(), Value::String(d.clone()));
+    }
+    Value::Object(out)
+}
+
+/// JSON Schema draft-07 (row L3): one definition per class with its
+/// inherited slots folded in, each property carrying `x-ngsi-ld-kind`
+/// (DM-05).
+///
+/// ```
+/// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "s",
+///     "classes": {"Room": {"slots": ["size"]}}, "slots": {"size": {"range": "integer"}}}"#,
+///     &linkml_model::Limits { max_bytes: 999, max_depth: 8, max_elements: 9 }).unwrap();
+/// let v: serde_json::Value = serde_json::from_str(&linkml_model::json_schema(&m)).unwrap();
+/// assert_eq!(v["definitions"]["Room"]["properties"]["size"]["type"], "integer");
+/// ```
+#[must_use]
+pub fn json_schema(model: &Model) -> String {
+    let s = model.schema();
+    let mut definitions = Map::new();
+    for (name, class) in &s.classes {
+        let slots = model.class_slots(name);
+        let mut properties = Map::new();
+        let mut required = Vec::new();
+        for (slot_name, slot) in &slots {
+            properties.insert((*slot_name).to_owned(), slot_schema(model, slot));
+            if slot.required == Some(true) {
+                required.push(Value::String((*slot_name).to_owned()));
+            }
+        }
+        let mut def = Map::new();
+        def.insert("type".to_owned(), json!("object"));
+        def.insert("properties".to_owned(), Value::Object(properties));
+        if !required.is_empty() {
+            def.insert("required".to_owned(), Value::Array(required));
+        }
+        if let Some(d) = &class.description {
+            def.insert("description".to_owned(), Value::String(d.clone()));
+        }
+        definitions.insert(name.clone(), Value::Object(def));
+    }
+    let doc = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "$id": s.id,
+        "title": s.name,
+        "definitions": definitions,
+    });
+    format!("{doc:#}\n")
+}
+
+// ------------------------------------------------------- JSON-LD context (L4)
+
+/// The JSON-LD `@context` (row L4): every class and slot name mapped to its
+/// full IRI, and nothing else: no prefixes, so no term outside the model is
+/// named (threat LK6).
+///
+/// ```
+/// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "s",
+///     "slots": {"size": {}}}"#,
+///     &linkml_model::Limits { max_bytes: 999, max_depth: 8, max_elements: 9 }).unwrap();
+/// let v: serde_json::Value = serde_json::from_str(&linkml_model::context(&m)).unwrap();
+/// assert_eq!(v["@context"]["size"], "https://e.org/s/size");
+/// ```
+#[must_use]
+pub fn context(model: &Model) -> String {
+    let s = model.schema();
+    let mut terms = Map::new();
+    for name in s.slots.keys() {
+        terms.insert(name.clone(), Value::String(model.slot_iri(name)));
+    }
+    for name in s.classes.keys() {
+        terms.insert(name.clone(), Value::String(model.class_iri(name)));
+    }
+    let doc = json!({ "@context": terms });
+    format!("{doc:#}\n")
+}
+
+// --------------------------------------------------------- Turtle (L5, L6)
+
+/// A Turtle string literal.
+fn lit(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().saturating_add(2));
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04X}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn turtle_header(what: &str, extra: &[(&str, &str)]) -> String {
+    let mut out = format!(
+        "# {what}, rendered from the LinkML model.\n\
+         @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
+    );
+    for (p, iri) in extra {
+        let _ = writeln!(out, "@prefix {p}: <{iri}> .");
+    }
+    out
+}
+
+/// The IRI of a slot as refined in a class (`slot_usage` may set `slot_uri`).
+fn refined_iri(model: &Model, name: &str, slot: &Slot) -> String {
+    slot.slot_uri
+        .as_deref()
+        .map_or_else(|| model.slot_iri(name), |u| model.expand(u))
+}
+
+/// A name as an IRI segment: every byte outside RFC 3986's unreserved set
+/// percent-encoded.
+fn percent(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// SHACL shapes (row L5): one open node shape per class, named in the
+/// schema's namespace (never minted under a foreign class IRI), one property shape
+/// per slot with its inherited ones and `slot_usage` applied. Never
+/// `sh:closed`: a view narrows what is described, not what exists.
+///
+/// ```
+/// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "s",
+///     "classes": {"Room": {"slots": ["size"]}}, "slots": {"size": {"range": "integer", "required": true}}}"#,
+///     &linkml_model::Limits { max_bytes: 999, max_depth: 8, max_elements: 9 }).unwrap();
+/// let ttl = linkml_model::shacl(&m);
+/// assert!(ttl.contains("sh:datatype xsd:integer"));
+/// assert!(ttl.contains("sh:minCount 1"));
+/// ```
+#[must_use]
+pub fn shacl(model: &Model) -> String {
+    let mut out = turtle_header("SHACL shapes", &[("sh", "http://www.w3.org/ns/shacl#")]);
+    for name in model.schema().classes.keys() {
+        let _ = write!(
+            out,
+            "\n<{}{}Shape>\n  a sh:NodeShape ;\n  sh:targetClass <{}> ;\n  sh:closed false",
+            model.namespace(),
+            percent(name),
+            model.class_iri(name)
+        );
+        for (slot_name, slot) in model.class_slots(name) {
+            let _ = write!(
+                out,
+                " ;\n  sh:property [\n    sh:path <{}> ;\n    sh:name {}",
+                refined_iri(model, slot_name, &slot),
+                lit(slot_name)
+            );
+            match model.range(&slot) {
+                Range::Type(b) => {
+                    let _ = write!(out, " ;\n    sh:datatype {}", b.xsd());
+                }
+                Range::Class(c) => {
+                    let _ = write!(
+                        out,
+                        " ;\n    sh:nodeKind sh:IRI ;\n    sh:class <{}>",
+                        model.class_iri(c)
+                    );
+                }
+                Range::Enum(e) => {
+                    let values: Vec<String> = model
+                        .schema()
+                        .enums
+                        .get(e)
+                        .map(|e| e.permissible_values.keys().map(|v| lit(v)).collect())
+                        .unwrap_or_default();
+                    let _ = write!(out, " ;\n    sh:in ( {} )", values.join(" "));
+                }
+            }
+            if slot.required == Some(true) {
+                out.push_str(" ;\n    sh:minCount 1");
+            }
+            if slot.multivalued != Some(true) {
+                out.push_str(" ;\n    sh:maxCount 1");
+            }
+            if let Some(d) = &slot.description {
+                let _ = write!(out, " ;\n    rdfs:comment {}", lit(d));
+            }
+            out.push_str("\n  ]");
+        }
+        out.push_str(" .\n");
+    }
+    out
+}
+
+/// The `rdfs:range` of a slot: an `xsd:` datatype, a class IRI, or
+/// `xsd:string` for an enum.
+fn rdf_range(model: &Model, slot: &Slot) -> String {
+    match model.range(slot) {
+        Range::Type(b) => b.xsd().to_owned(),
+        Range::Class(c) => format!("<{}>", model.class_iri(c)),
+        Range::Enum(_) => "xsd:string".to_owned(),
+    }
+}
+
+/// The OWL ontology (row L6, `model.owl.ttl`): the schema as an
+/// `owl:Ontology`, classes with `rdfs:subClassOf`, slots as object or
+/// datatype properties with `owl:inverseOf`.
+///
+/// ```
+/// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "s",
+///     "classes": {"Room": {}}, "slots": {"in": {"range": "Room"}}}"#,
+///     &linkml_model::Limits { max_bytes: 999, max_depth: 8, max_elements: 9 }).unwrap();
+/// assert!(linkml_model::owl(&m).contains("<https://e.org/s/in> a owl:ObjectProperty"));
+/// ```
+#[must_use]
+pub fn owl(model: &Model) -> String {
+    let s = model.schema();
+    let mut out = turtle_header("OWL ontology", &[("owl", "http://www.w3.org/2002/07/owl#")]);
+    let _ = write!(
+        out,
+        "\n<{}> a owl:Ontology ;\n  rdfs:label {}",
+        s.id,
+        lit(&s.name)
+    );
+    if let Some(v) = &s.version {
+        let _ = write!(out, " ;\n  owl:versionInfo {}", lit(v));
+    }
+    out.push_str(" .\n");
+    for (name, class) in &s.classes {
+        let _ = write!(
+            out,
+            "\n<{}> a owl:Class ;\n  rdfs:label {}",
+            model.class_iri(name),
+            lit(name)
+        );
+        if let Some(p) = &class.is_a {
+            let _ = write!(out, " ;\n  rdfs:subClassOf <{}>", model.class_iri(p));
+        }
+        if let Some(d) = &class.description {
+            let _ = write!(out, " ;\n  rdfs:comment {}", lit(d));
+        }
+        out.push_str(" .\n");
+    }
+    for (name, slot) in &s.slots {
+        let kind = if matches!(model.range(slot), Range::Class(_)) {
+            "owl:ObjectProperty"
+        } else {
+            "owl:DatatypeProperty"
+        };
+        let _ = write!(
+            out,
+            "\n<{}> a {kind} ;\n  rdfs:label {} ;\n  rdfs:range {}",
+            model.slot_iri(name),
+            lit(name),
+            rdf_range(model, slot)
+        );
+        if let Some(inv) = &slot.inverse {
+            let _ = write!(out, " ;\n  owl:inverseOf <{}>", model.slot_iri(inv));
+        }
+        if let Some(d) = &slot.description {
+            let _ = write!(out, " ;\n  rdfs:comment {}", lit(d));
+        }
+        out.push_str(" .\n");
+    }
+    out
+}
+
+/// The RDFS rendering (row L6, `model.rdf.ttl`): classes, subclasses,
+/// properties and their ranges.
+///
+/// ```
+/// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "s",
+///     "classes": {"Room": {}}}"#,
+///     &linkml_model::Limits { max_bytes: 999, max_depth: 8, max_elements: 9 }).unwrap();
+/// assert!(linkml_model::rdfs(&m).contains("<https://e.org/s/Room> a rdfs:Class"));
+/// ```
+#[must_use]
+pub fn rdfs(model: &Model) -> String {
+    let s = model.schema();
+    let mut out = turtle_header("RDF Schema", &[]);
+    for (name, class) in &s.classes {
+        let _ = write!(
+            out,
+            "\n<{}> a rdfs:Class ;\n  rdfs:label {}",
+            model.class_iri(name),
+            lit(name)
+        );
+        if let Some(p) = &class.is_a {
+            let _ = write!(out, " ;\n  rdfs:subClassOf <{}>", model.class_iri(p));
+        }
+        out.push_str(" .\n");
+    }
+    for (name, slot) in &s.slots {
+        let _ = write!(
+            out,
+            "\n<{}> a rdf:Property ;\n  rdfs:label {} ;\n  rdfs:range {} .\n",
+            model.slot_iri(name),
+            lit(name),
+            rdf_range(model, slot)
+        );
+    }
+    out
+}
+
+// ------------------------------------------------------------ Markdown (L6)
+
+/// Text as inert Markdown: punctuation that opens a link, an emphasis, a
+/// code span, an HTML tag or a table cell is backslash-escaped, a line
+/// break becomes a space.
+fn md(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() {
+            out.push(' ');
+        } else {
+            if "\\`*_[]()<>|#!&".contains(c) {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn yes(v: Option<bool>) -> &'static str {
+    if v == Some(true) {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+/// The Markdown description (row L6, `model.md`): one section per class
+/// with a table of its slots, then the enums.
+///
+/// ```
+/// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "s",
+///     "classes": {"Room": {"description": "see [x](javascript:y)"}}}"#,
+///     &linkml_model::Limits { max_bytes: 999, max_depth: 8, max_elements: 9 }).unwrap();
+/// assert!(linkml_model::markdown(&m).contains("see \\[x\\]\\(javascript:y\\)"));
+/// ```
+#[must_use]
+pub fn markdown(model: &Model) -> String {
+    let s = model.schema();
+    let mut out = format!("# {}\n\n`{}`", md(&s.name), s.id);
+    if let Some(v) = &s.version {
+        let _ = write!(out, ", version {}", md(v));
+    }
+    out.push('\n');
+    for (name, class) in &s.classes {
+        let _ = write!(out, "\n## {}\n\n", md(name));
+        if let Some(d) = &class.description {
+            let _ = write!(out, "{}\n\n", md(d));
+        }
+        if let Some(p) = &class.is_a {
+            let _ = write!(out, "Is a: {}\n\n", md(p));
+        }
+        let slots = model.class_slots(name);
+        if slots.is_empty() {
+            out.push_str("No slots.\n");
+            continue;
+        }
+        out.push_str("| Slot | Range | Kind | Required | Multivalued | Description |\n|---|---|---|---|---|---|\n");
+        for (slot_name, slot) in &slots {
+            let range = match model.range(slot) {
+                Range::Type(b) => b.name(),
+                Range::Class(c) | Range::Enum(c) => c,
+            };
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} | {} |",
+                md(slot_name),
+                md(range),
+                md(model.kind(slot)),
+                yes(slot.required),
+                yes(slot.multivalued),
+                md(slot.description.as_deref().unwrap_or(""))
+            );
+        }
+    }
+    for (name, e) in &s.enums {
+        let _ = write!(out, "\n## {} (enum)\n\n", md(name));
+        if let Some(d) = &e.description {
+            let _ = write!(out, "{}\n\n", md(d));
+        }
+        for (text, v) in &e.permissible_values {
+            let _ = write!(out, "- {}", md(text));
+            if let Some(d) = &v.description {
+                let _ = write!(out, ": {}", md(d));
+            }
+            out.push('\n');
+        }
+    }
+    out
+}

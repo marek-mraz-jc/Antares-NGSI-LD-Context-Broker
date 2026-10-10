@@ -1,0 +1,85 @@
+# SHACL shapes, rendered from the LinkML model.
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+
+<https://example.org/building#AssetShape>
+  a sh:NodeShape ;
+  sh:targetClass <https://example.org/building#Asset> ;
+  sh:closed false ;
+  sh:property [
+    sh:path <https://schema.org/name> ;
+    sh:name "name" ;
+    sh:datatype xsd:string ;
+    sh:maxCount 1
+  ] ;
+  sh:property [
+    sh:path <https://example.org/building#status> ;
+    sh:name "status" ;
+    sh:in ( "active" "retired" ) ;
+    sh:maxCount 1
+  ] .
+
+<https://example.org/building#RoomShape>
+  a sh:NodeShape ;
+  sh:targetClass <https://schema.org/Room> ;
+  sh:closed false ;
+  sh:property [
+    sh:path <https://schema.org/name> ;
+    sh:name "name" ;
+    sh:datatype xsd:string ;
+    sh:minCount 1 ;
+    sh:maxCount 1 ;
+    rdfs:comment "The room's \"label\"."
+  ] ;
+  sh:property [
+    sh:path <https://example.org/building#status> ;
+    sh:name "status" ;
+    sh:in ( "active" "retired" ) ;
+    sh:maxCount 1
+  ] ;
+  sh:property [
+    sh:path <https://example.org/building#temperature> ;
+    sh:name "temperature" ;
+    sh:datatype xsd:float ;
+    sh:maxCount 1
+  ] ;
+  sh:property [
+    sh:path <https://example.org/building#floor> ;
+    sh:name "floor" ;
+    sh:datatype xsd:integer ;
+    sh:minCount 1 ;
+    sh:maxCount 1
+  ] ;
+  sh:property [
+    sh:path <https://example.org/building#sensors> ;
+    sh:name "sensors" ;
+    sh:nodeKind sh:IRI ;
+    sh:class <https://example.org/building#Sensor>
+  ] .
+
+<https://example.org/building#SensorShape>
+  a sh:NodeShape ;
+  sh:targetClass <https://example.org/building#Sensor> ;
+  sh:closed false ;
+  sh:property [
+    sh:path <https://schema.org/name> ;
+    sh:name "name" ;
+    sh:datatype xsd:string ;
+    sh:maxCount 1
+  ] ;
+  sh:property [
+    sh:path <https://example.org/building#status> ;
+    sh:name "status" ;
+    sh:in ( "active" "retired" ) ;
+    sh:maxCount 1
+  ] ;
+  sh:property [
+    sh:path <https://example.org/building#location> ;
+    sh:name "location" ;
+    sh:nodeKind sh:IRI ;
+    sh:class <https://schema.org/Room> ;
+    sh:maxCount 1 ;
+    rdfs:comment "Where the sensor hangs.\nSecond line."
+  ] .

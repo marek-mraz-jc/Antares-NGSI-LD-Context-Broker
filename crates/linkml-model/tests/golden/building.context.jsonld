@@ -1,0 +1,13 @@
+{
+  "@context": {
+    "Asset": "https://example.org/building#Asset",
+    "Room": "https://schema.org/Room",
+    "Sensor": "https://example.org/building#Sensor",
+    "floor": "https://example.org/building#floor",
+    "location": "https://example.org/building#location",
+    "name": "https://schema.org/name",
+    "sensors": "https://example.org/building#sensors",
+    "status": "https://example.org/building#status",
+    "temperature": "https://example.org/building#temperature"
+  }
+}
