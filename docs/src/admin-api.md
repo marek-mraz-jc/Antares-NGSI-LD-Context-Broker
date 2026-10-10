@@ -245,8 +245,14 @@ a surface answers `404`.
 `@context` (inline, over the core context); every `q` is read against the
 core context; `operations` are row ids of `docs/analysis/operation-matrix.yaml`.
 No member has a default that serves more: an empty selector, rule list or
-operation list is refused. Bounds: 64 KiB per document, 64 rules, 256 names
-per list, 4096 bytes per `q` or `scopeQ`.
+operation list is refused. Bounds: 64 KiB per document beside its `linkml`
+member, 64 rules, 256 names per list, 4096 bytes per `q` or `scopeQ`.
+
+An optional `linkml` member holds the schema of what the view serves:
+LinkML in its resolved JSON form (imports and `is_a` folded, as LinkML's
+JSON serialisation writes it), read by the [LinkML surface](linkml.md).
+It may take up to 1 MiB; a stored view whose schema is larger still loads,
+with its LinkML surface closed and a loader note saying why (LK7).
 
 ### GET /q/views
 
@@ -259,7 +265,8 @@ The stored document, or `404`.
 ### PUT /q/views/{id}
 
 `201` created, `204` replaced; `400` with the first reason the view cannot
-be served (nothing is stored), `413` over 64 KiB.
+be served (nothing is stored), `413` over 64 KiB beside the `linkml`
+member or over 1 MiB + 64 KiB in all.
 
 ### DELETE /q/views/{id}
 

@@ -13,6 +13,7 @@
 - [Temporal API](temporal.md)
 - [Endpoint views](views.md)
 - [MCP endpoint of a view](mcp.md)
+- [LinkML schema of a view](linkml.md)
 - [Federation](federation.md)
 - [Operations](operations.md)
 - [Browser & WebAssembly](wasm.md)

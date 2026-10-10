@@ -19,7 +19,7 @@ surfaces:
     status: proposal; tool names marked 'exists' are the platform gateway's
   linkml:
     prefix: /x/views/{view}/linkml
-    status: proposal, read-only
+    status: implemented (T-3511), read-only
   websocket:
     prefix: /x/views/{view}/ws
     status: proposal; TS 104 175/176 define no WebSocket binding
@@ -2798,16 +2798,14 @@ operations:
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
-      status: supported
-      binding: 'GET /x/views/{view}/linkml/schema (proposal): class list'
+      status: not_offered
+      binding: null
       checks:
-        adr0020_phase: on_request
-        operation_fields:
-        - clause
-        filterable: true
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
         whole_tenant: false
-        linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        linked_entity_checks: []
     websocket:
       status: not_offered
       binding: null
@@ -2873,7 +2871,7 @@ operations:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
       status: supported
-      binding: 'GET /x/views/{view}/linkml/schema (proposal): classes with slots'
+      binding: GET /x/views/{view}/linkml/schema/index.json and GET /x/views/{view}/linkml/schema/v{major}/{document}
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2881,7 +2879,7 @@ operations:
         filterable: true
         whole_tenant: false
         linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        - 'none: schema only, no Entity data; class and slot names narrowed by the composed rules and the Filter pick/omit/omit_by_type'
     websocket:
       status: not_offered
       binding: null
@@ -2948,7 +2946,7 @@ operations:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
       status: supported
-      binding: GET /x/views/{view}/linkml/classes/{type} (proposal)
+      binding: GET /x/views/{view}/linkml/classes/{type}
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2957,7 +2955,7 @@ operations:
         filterable: true
         whole_tenant: false
         linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        - 'none: schema only, no Entity data; class and slot names narrowed by the composed rules and the Filter pick/omit/omit_by_type'
     websocket:
       status: not_offered
       binding: null
@@ -3020,16 +3018,14 @@ operations:
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
-      status: supported
-      binding: 'GET /x/views/{view}/linkml/schema (proposal): slot list'
+      status: not_offered
+      binding: null
       checks:
-        adr0020_phase: on_request
-        operation_fields:
-        - clause
-        filterable: true
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
         whole_tenant: false
-        linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        linked_entity_checks: []
     websocket:
       status: not_offered
       binding: null
@@ -3092,16 +3088,14 @@ operations:
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
-      status: supported
-      binding: 'GET /x/views/{view}/linkml/schema (proposal): slots with ranges'
+      status: not_offered
+      binding: null
       checks:
-        adr0020_phase: on_request
-        operation_fields:
-        - clause
-        filterable: true
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
         whole_tenant: false
-        linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        linked_entity_checks: []
     websocket:
       status: not_offered
       binding: null
@@ -3168,7 +3162,7 @@ operations:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
       status: supported
-      binding: GET /x/views/{view}/linkml/slots/{attr} (proposal)
+      binding: GET /x/views/{view}/linkml/slots/{attr}
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3177,7 +3171,7 @@ operations:
         filterable: true
         whole_tenant: false
         linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        - 'none: schema only, no Entity data; class and slot names narrowed by the composed rules and the Filter pick/omit/omit_by_type'
     websocket:
       status: not_offered
       binding: null
@@ -4940,17 +4934,14 @@ operations:
         whole_tenant: false
         linked_entity_checks: []
     linkml:
-      status: supported
-      binding: the LinkML schema's prefixes are read from the served @context (proposal)
+      status: not_offered
+      binding: null
       checks:
-        adr0020_phase: on_request
-        operation_fields:
-        - clause
-        - ids
+        adr0020_phase: none
+        operation_fields: []
         filterable: false
         whole_tenant: false
-        linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        linked_entity_checks: []
     websocket:
       status: not_offered
       binding: null

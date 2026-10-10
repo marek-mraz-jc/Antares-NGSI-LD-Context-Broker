@@ -27,7 +27,7 @@ Surfaces, one column each:
 | `ngsi_ld_http` | NGSI-LD HTTP binding under `/ngsi-ld/v1` | implemented, `crates/antares-api/src/lib.rs:315` `router` |
 | `odata` | OData v4.01 under `/x/views/{view}/odata/v4` | proposal |
 | `mcp` | MCP under `/x/views/{view}/mcp` | proposal; the tool names marked "exists" are the platform gateway's (`joinedcontext-platform crates/context-gateway/src/mcp/endpoint_facade.rs:108-426`, `TOOLS`); every other name is a proposal |
-| `linkml` | LinkML schema surface under `/x/views/{view}/linkml`, read-only | proposal |
+| `linkml` | LinkML schema surface under `/x/views/{view}/linkml`, read-only | implemented (T-3511) |
 | `websocket` | WebSocket notifications under `/x/views/{view}/ws` | proposal; no binding exists in the specs (section 2.4) |
 | `internal_csr` | in-process Context Source registrations between tenants | proposal; the forward is `AppState::call` (`crates/antares-api/src/state.rs:571`) instead of HTTP |
 
@@ -268,12 +268,12 @@ Notes on this table:
 | `query_subscriptions` | 10.5.5 | not offered | supported: list_subscriptions (exists: endpoint_facade.rs:238, Operation::QuerySubscription) | not offered | not offered | not offered |
 | `delete_subscription` | 10.5.6 | not offered | supported: delete_subscription (proposal) | not offered | supported: unsubscribe (proposal) | supported: forwarded copy deleted (distsub on_subscription_deleted) |
 | `notification` | 10.5.7 | not offered | not offered | not offered | supported: notification (proposal): server push of the Notification document | supported: notification of a forwarded copy remapped to the original subscriber at /ex/v1/remote-notify |
-| `retrieve_entity_types` | 10.6.3 | supported: GET /x/views/{view}/odata/v4/ (service document, entity sets = visible types) | supported: list_types (exists: endpoint_facade.rs:154, Operation::RetrieveEntityTypes) | supported: GET /x/views/{view}/linkml/schema (proposal): class list | not offered | not offered |
-| `retrieve_entity_type_details` | 10.6.4 | supported: GET /x/views/{view}/odata/v4/$metadata (CSDL built from the visible types and their attributes) | supported: list_types (exists: endpoint_facade.rs:154, Operation::RetrieveEntityTypeDetails) | supported: GET /x/views/{view}/linkml/schema (proposal): classes with slots | not offered | not offered |
-| `retrieve_entity_type_info` | 10.6.5 | not offered | supported: get_type (exists: endpoint_facade.rs:354, Operation::RetrieveEntityTypeInfo) | supported: GET /x/views/{view}/linkml/classes/{type} (proposal) | not offered | not offered |
-| `retrieve_attributes` | 10.6.6 | not offered | supported: list_attributes (exists: endpoint_facade.rs:172, Operation::RetrieveAttrTypes) | supported: GET /x/views/{view}/linkml/schema (proposal): slot list | not offered | not offered |
-| `retrieve_attribute_details` | 10.6.7 | not offered | supported: list_attributes (exists: endpoint_facade.rs:172, Operation::RetrieveAttrTypeDetails) | supported: GET /x/views/{view}/linkml/schema (proposal): slots with ranges | not offered | not offered |
-| `retrieve_attribute_info` | 10.6.8 | not offered | supported: get_attribute (exists: endpoint_facade.rs:371, Operation::RetrieveAttrTypeInfo) | supported: GET /x/views/{view}/linkml/slots/{attr} (proposal) | not offered | not offered |
+| `retrieve_entity_types` | 10.6.3 | supported: GET /x/views/{view}/odata/v4/ (service document, entity sets = visible types) | supported: list_types (exists: endpoint_facade.rs:154, Operation::RetrieveEntityTypes) | not offered (the index of 10.6.4 lists the classes) | not offered | not offered |
+| `retrieve_entity_type_details` | 10.6.4 | supported: GET /x/views/{view}/odata/v4/$metadata (CSDL built from the visible types and their attributes) | supported: list_types (exists: endpoint_facade.rs:154, Operation::RetrieveEntityTypeDetails) | supported: GET /x/views/{view}/linkml/schema/index.json and .../schema/v{major}/{document} | not offered | not offered |
+| `retrieve_entity_type_info` | 10.6.5 | not offered | supported: get_type (exists: endpoint_facade.rs:354, Operation::RetrieveEntityTypeInfo) | supported: GET /x/views/{view}/linkml/classes/{type} | not offered | not offered |
+| `retrieve_attributes` | 10.6.6 | not offered | supported: list_attributes (exists: endpoint_facade.rs:172, Operation::RetrieveAttrTypes) | not offered (the documents of 10.6.4 list the slots) | not offered | not offered |
+| `retrieve_attribute_details` | 10.6.7 | not offered | supported: list_attributes (exists: endpoint_facade.rs:172, Operation::RetrieveAttrTypeDetails) | not offered (the documents of 10.6.4 list the slots with ranges) | not offered | not offered |
+| `retrieve_attribute_info` | 10.6.8 | not offered | supported: get_attribute (exists: endpoint_facade.rs:371, Operation::RetrieveAttrTypeInfo) | supported: GET /x/views/{view}/linkml/slots/{attr} | not offered | not offered |
 | `temporal_upsert` | 11.2.2 | not offered | not offered | not offered | not offered | supported: forwarded (temporal write_plan) |
 | `temporal_add_attributes` | 11.2.3 | not offered | not offered | not offered | not offered | supported: forwarded |
 | `temporal_delete_attribute` | 11.2.4 | not offered | not offered | not offered | not offered | supported: forwarded |
@@ -296,7 +296,7 @@ Notes on this table:
 | `csource_notification` | 12.4.7 | not offered | not offered | not offered | not offered | not offered |
 | `add_context` | 13.2 | not offered | not offered | not offered | not offered | not offered |
 | `list_contexts` | 13.3 | not offered | not offered | not offered | not offered | not offered |
-| `serve_context` | 13.4 | not offered | not offered | supported: the LinkML schema's prefixes are read from the served @context (proposal) | not offered | not offered |
+| `serve_context` | 13.4 | not offered | not offered | not offered (the narrowed schema names its own prefixes) | not offered | not offered |
 | `delete_context` | 13.5 | not offered | not offered | not offered | not offered | not offered |
 | `retrieve_entity_map` | 14.2 | not offered | not offered | not offered | not offered | not offered |
 | `update_entity_map` | 14.3 | not offered | not offered | not offered | not offered | not offered |
