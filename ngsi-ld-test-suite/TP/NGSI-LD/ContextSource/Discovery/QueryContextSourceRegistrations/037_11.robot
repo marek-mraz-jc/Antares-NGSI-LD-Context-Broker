@@ -39,6 +39,7 @@ Query Context Source Registration With Limit And Offset Parameters
     ...    type=Building
     ...    limit=${limit}
     ...    offset=${offset}
+    ...    accept=${CONTENT_TYPE_LD_JSON}
     Check Response Status Code    200    ${response.status_code}
     Check Response Body Containing Number Of Entities
     ...    ContextSourceRegistration
