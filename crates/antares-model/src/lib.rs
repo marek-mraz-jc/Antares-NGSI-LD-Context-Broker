@@ -451,4 +451,45 @@ mod tests {
             assert!(!super::ENTITY_META_KEYS.contains(&k), "{k:?}");
         }
     }
+
+    /// Egress order: `id` then `type` lead every object, at every depth,
+    /// arrays included; scalars pass through untouched.
+    #[test]
+    fn spec_order_leads_with_id_and_type_at_every_depth() {
+        use serde_json::json;
+        let v =
+            json!({"z": 1, "type": "T", "a": [{"value": 2, "type": "Property"}], "id": "urn:x"});
+        let out = String::from_utf8(super::ordered_vec(&v)).expect("utf-8");
+        assert_eq!(
+            out,
+            r#"{"id":"urn:x","type":"T","a":[{"type":"Property","value":2}],"z":1}"#
+        );
+        assert_eq!(super::ordered_vec(&json!(null)), b"null");
+        assert_eq!(super::ordered_vec(&json!({})), b"{}");
+    }
+
+    /// 4.6.2: a name is non-empty, from the allowed characters, and never a
+    /// dot-segment however it is percent-spelled.
+    #[test]
+    fn attribute_names_and_dot_segments() {
+        use super::{check_attr_name, has_dot_segment};
+        for ok in ["speed", "ngsi-ld:x", "https://e.org/a#b", "a%20b", "a.b"] {
+            assert!(check_attr_name(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "", "@id", "a b", "a(b)", "..", "a/./b", "%2E%2e", "a%2F..", "ü",
+        ] {
+            assert!(check_attr_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(has_dot_segment("x/%2e"));
+        assert!(!has_dot_segment("..a"));
+    }
+
+    /// A magnitude that overflows f64 is not a duration.
+    #[test]
+    fn a_duration_too_large_for_f64_is_refused() {
+        let huge = format!("P{}Y", "9".repeat(400));
+        assert!(super::parse_iso_duration(&huge).is_none());
+        assert!(super::parse_iso_duration("P1Y").is_some());
+    }
 }

@@ -731,6 +731,44 @@ mod clause_4_9_extensions {
         );
     }
 
+    /// A vocab list expands term by term; any member equal to the URI matches.
+    #[test]
+    fn vocab_list_expands_every_term() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "category": {"type": "VocabProperty", "vocab": ["commercial", "public"]}}));
+        assert!(q(
+            &e,
+            r#"category=="https://uri.etsi.org/ngsi-ld/default-context/public""#
+        ));
+        assert!(!q(&e, r#"category=="public""#));
+    }
+
+    /// Every 4.9 operator on a number, a boolean and a string: booleans
+    /// answer only `==`/`!=`, a pattern never matches a number.
+    #[test]
+    fn every_operator_on_numbers_booleans_and_strings() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "n": {"type": "Property", "value": 5},
+            "b": {"type": "Property", "value": true},
+            "s": {"type": "Property", "value": "m"}}));
+        for (query, want) in [
+            ("n!=4", true),
+            ("n!=5", false),
+            ("n>=5", true),
+            ("n<=4", false),
+            ("n<6", true),
+            (r#"n~="5""#, false),
+            ("b==true", true),
+            ("b!=false", true),
+            ("b!=true", false),
+            (r#"s>="m""#, true),
+            (r#"s<"n""#, true),
+            (r#"s<="l""#, false),
+        ] {
+            assert_eq!(q(&e, query), want, "{query}");
+        }
+    }
+
     /// 4.9: "If the target element corresponds to a Relationship or
     /// ListRelationship, the combination of such target element with any
     /// operator different than equal or unequal shall result in not matching."
@@ -1477,5 +1515,36 @@ mod temporal_keys {
             temporal_key("2020-01-01T00:00:00.500000Z")
         );
         assert!(temporal_key("2020-01-01T00:00:00Z") < temporal_key("2020-01-01T00:00:00.5Z"));
+    }
+
+    /// 4.9 expandValues: only the named top-level attributes' values are
+    /// expanded, inside And/Or and lists; others and non-strings stay.
+    #[test]
+    fn expand_values_rewrites_only_the_named_attributes() {
+        let ctx = antares_jsonld::core_context();
+        let male = "https://uri.etsi.org/ngsi-ld/default-context/Male";
+        let q = crate::parse_q(
+            "gender==\"Male\";(kind==\"Male\"|gender==\"Male\",\"Female\");gender==1",
+        )
+        .expect("parse");
+        assert_eq!(apply_expand_values(q.clone(), None, &ctx), q);
+        let want = crate::parse_q(&format!(
+            "gender==\"{male}\";(kind==\"Male\"|gender==\"{male}\",\"{female}\");gender==1",
+            female = male.replace("Male", "Female")
+        ))
+        .expect("parse");
+        assert_eq!(apply_expand_values(q, Some("gender, other"), &ctx), want);
+    }
+
+    /// 4.9: a name in jsonKeys is never expanded; nothing left is None.
+    #[test]
+    fn expansion_list_drops_json_keys() {
+        assert_eq!(expansion_list(None, Some("a")), None);
+        assert_eq!(expansion_list(Some("a,b"), None).as_deref(), Some("a,b"));
+        assert_eq!(
+            expansion_list(Some("a, b"), Some("b")).as_deref(),
+            Some("a")
+        );
+        assert_eq!(expansion_list(Some("a"), Some(" a ")), None);
     }
 }

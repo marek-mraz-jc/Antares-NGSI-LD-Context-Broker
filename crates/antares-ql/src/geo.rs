@@ -901,4 +901,15 @@ mod clause_4_10_grammar {
             assert!(ask(gtype, coords).is_ok(), "{gtype} {coords}");
         }
     }
+
+    /// 4.10: no georel is no geo query, unless geometry or coordinates
+    /// came without it.
+    #[test]
+    fn geometry_without_georel_is_refused() {
+        assert!(matches!(GeoQuery::from_params(&HashMap::new()), Ok(None)));
+        for k in ["geometry", "coordinates"] {
+            let params = HashMap::from([(k.to_owned(), "Point".to_owned())]);
+            assert!(GeoQuery::from_params(&params).is_err(), "{k}");
+        }
+    }
 }

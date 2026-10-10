@@ -600,4 +600,20 @@ mod tests {
         // !~= is a regex — dialect mismatch, in-memory
         assert!(c(r#"name!~="^ab""#).is_none());
     }
+
+    /// The equality and `[lang]` building blocks share Eq's table: a list
+    /// is an OR, a numeric range a closed interval, a string range and an
+    /// ordering on a list stay in memory.
+    #[test]
+    fn eq_and_lang_filters_follow_the_eq_table() {
+        let n = |x: f64| Box::new(QValue::Num(x));
+        let list = QValue::List(vec![QValue::Num(1.0), QValue::Num(2.0)]);
+        assert!(eq_filter(&list).is_some_and(|f| f.contains("||")));
+        assert!(eq_filter(&QValue::Range(n(1.0), n(2.0))).is_some_and(|f| f.contains(">=")));
+        let s = |x: &str| Box::new(QValue::Str(x.into()));
+        assert!(eq_filter(&QValue::Range(s("a"), s("b"))).is_none());
+        assert!(lang_filter(CmpOp::Ne, &list).is_none());
+        assert!(lang_filter(CmpOp::Ne, &QValue::Range(n(1.0), n(2.0))).is_none());
+        assert_eq!(lang_filter(CmpOp::Eq, &list), eq_filter(&list));
+    }
 }

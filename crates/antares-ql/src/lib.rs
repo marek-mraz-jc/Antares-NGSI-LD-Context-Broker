@@ -1196,4 +1196,50 @@ mod complexity_tests {
             Ok(QNode::Cmp { op: CmpOp::Ne, .. })
         ));
     }
+
+    /// 4.17: `,`/`|` is OR, `(a;b)` is AND inside one alternative; names are
+    /// expanded against the @context before they are compared.
+    #[test]
+    fn type_selection_or_and_and() {
+        let ctx = antares_jsonld::core_context();
+        let d = |t: &str| format!("https://uri.etsi.org/ngsi-ld/default-context/{t}");
+        let (car, bus) = (d("Car"), d("Bus"));
+        let both = [car.as_str(), bus.as_str()];
+        let car_only = [car.as_str()];
+        assert!(type_selection_matches("Car", &car_only, &ctx));
+        assert!(type_selection_matches("Bus,Car", &car_only, &ctx));
+        assert!(type_selection_matches("Bus|Car", &car_only, &ctx));
+        assert!(type_selection_matches("(Car;Bus)", &both, &ctx));
+        assert!(!type_selection_matches("(Car;Bus)", &car_only, &ctx));
+        assert!(!type_selection_matches("Bus", &[], &ctx));
+    }
+
+    /// 5.6.21.4: the referenced top-level names in source order, whether any
+    /// path hops a Linked Entity, and the deepest hop chain.
+    #[test]
+    fn referenced_paths_and_link_depth() {
+        let q = parse_q("speed>1;(brand==\"x\"|sensor{humidity}==2);!owner").expect("parse");
+        assert_eq!(q.attribute_paths(), ["speed", "brand", "sensor", "owner"]);
+        assert!(q.has_linked_paths());
+        assert_eq!(q.max_link_depth(), 1);
+        let flat = parse_q("speed>1|brand==\"x\"").expect("parse");
+        assert!(!flat.has_linked_paths());
+        assert_eq!(flat.max_link_depth(), 0);
+        assert!(is_non_system_attr("speed"));
+        for sys in SYSTEM_ATTRS {
+            assert!(!is_non_system_attr(sys), "{sys}");
+        }
+    }
+
+    /// The node budget: a flat chain within the depth limit but past
+    /// MAX_Q_NODES is 400 TooComplexQuery, one node fewer parses.
+    #[test]
+    fn a_query_past_the_node_budget_is_too_complex() {
+        let chain = |n: usize| vec!["a==1"; n].join(";");
+        assert!(parse_q(&chain(MAX_Q_NODES - 1)).is_ok());
+        assert!(matches!(
+            parse_q(&chain(MAX_Q_NODES)),
+            Err(NgsiError::TooComplexQuery(_))
+        ));
+    }
 }
