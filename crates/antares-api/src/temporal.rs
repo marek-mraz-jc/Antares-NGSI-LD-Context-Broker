@@ -746,7 +746,7 @@ fn present_temporal(
 /// Parsed temporal representation params (options/format/lastN/pick/omit/
 /// datasetId/aggregation), fully validated up front.
 #[derive(Default, Clone)]
-struct TRepr {
+pub(crate) struct TRepr {
     temporal_values: bool,
     aggregated: bool,
     sys: bool,
@@ -761,7 +761,7 @@ struct TRepr {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-enum AggrPeriod {
+pub(crate) enum AggrPeriod {
     /// PT0S / absent: one bucket over the whole range
     #[default]
     Whole,
@@ -772,7 +772,7 @@ enum AggrPeriod {
     Months(u32, i64),
 }
 
-fn parse_aggr_period(s: &str) -> Option<AggrPeriod> {
+pub(crate) fn parse_aggr_period(s: &str) -> Option<AggrPeriod> {
     let d = antares_model::parse_iso_duration(s)?;
     // saturating: an absurd magnitude must not panic (debug) or wrap
     // (release) — f64→int `as` casts already saturate, guard the ops.
@@ -822,7 +822,10 @@ fn reject_linked_projection(trepr: &TRepr, clause: &str) -> Result<(), NgsiError
     Ok(())
 }
 
-fn parse_trepr(params: &HashMap<String, String>, ctx: &Context) -> Result<TRepr, NgsiError> {
+pub(crate) fn parse_trepr(
+    params: &HashMap<String, String>,
+    ctx: &Context,
+) -> Result<TRepr, NgsiError> {
     let mut r = TRepr {
         lang: params.get("lang").cloned(),
         ..TRepr::default()

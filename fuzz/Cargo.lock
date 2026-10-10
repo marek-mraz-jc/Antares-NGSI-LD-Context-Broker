@@ -55,6 +55,7 @@ version = "0.0.0"
 dependencies = [
  "antares-api",
  "antares-jsonld",
+ "antares-model",
  "antares-ql",
  "antares-sql",
  "libfuzzer-sys",
