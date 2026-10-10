@@ -17,6 +17,8 @@ on:
         description: Coraine image to compare against (pinned tag, no latest exists)
         default: quay.io/seamware/coraine:0.5.0@sha256:a102b7c7992f60e4b9f2885d4bef9099acf73613b489c4254cc5b7a32de93a6e
   push:
+    # dev only: a worker branch's push queued hours of runners ahead of ci.yml (2026-10-10)
+    branches: [dev]
     paths:
       - dev/perf/compare-coraine.sh
       - dev/perf/k6-shapes.js

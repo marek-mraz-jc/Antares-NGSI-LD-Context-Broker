@@ -14,6 +14,8 @@ on:
   schedule:
     - cron: "41 2 * * 0"
   push:
+    # dev only: a worker branch's push queued hours of runners ahead of ci.yml (2026-10-10)
+    branches: [dev]
     paths:
       - .github/workflows/mutants.yml
       - dev/mutants-survivors.txt

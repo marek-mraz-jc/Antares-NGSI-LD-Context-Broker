@@ -18,6 +18,8 @@ on:
         description: soak length per store, minutes
         default: "120"
   push:
+    # dev only: a worker branch's push queued hours of runners ahead of ci.yml (2026-10-10)
+    branches: [dev]
     paths:
       - dev/soak.py
       - .github/workflows/soak.yml
