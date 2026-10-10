@@ -114,6 +114,13 @@ pub struct AppState {
     /// costs about 1.5 ms, which is worth memoizing per state and not worth
     /// paying in a host that never makes an in-process call.
     pub(crate) inbound: Arc<std::sync::OnceLock<axum::Router>>,
+    /// The endpoint view every operation through this state is narrowed to
+    /// (ADR-0023); `None` serves the NGSI-LD API as it is.
+    #[cfg(feature = "views")]
+    pub view: Option<Arc<crate::views::CompiledView>>,
+    /// The views this pod serves (ADR-0023 rule 10), shared by every clone.
+    #[cfg(feature = "views")]
+    pub views: Arc<crate::views::ViewTable>,
     /// Bounds-wall rejection counters (exported by /q/health).
     pub limits: Arc<crate::bounds::LimitStats>,
     /// Allocator stats provider (set by the broker; None in tests/wasm).
@@ -430,6 +437,10 @@ impl AppState {
             ),
             sinks: Arc::new(sinks),
             inbound: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "views")]
+            view: None,
+            #[cfg(feature = "views")]
+            views: Arc::default(),
             surfaces: Arc::new(vec![Box::new(crate::Admin)]),
             limits: Arc::new(crate::bounds::LimitStats::default()),
             mem_stats: None,
@@ -462,6 +473,68 @@ impl AppState {
     pub fn with_policy(mut self, engine: Arc<dyn crate::policy::PolicyEngine>) -> Self {
         self.policy = Some(engine);
         self
+    }
+
+    /// This state narrowed to `view`: every operation served through the
+    /// returned state, and everything it spawns or calls in-process, is
+    /// composed with the view (ADR-0023). It shares the store and every
+    /// other handle; the in-process router memo is its own, so a call
+    /// through it never reuses a router built without the view.
+    #[cfg(feature = "views")]
+    pub fn with_view(&self, view: Arc<crate::views::CompiledView>) -> Self {
+        let mut st = self.clone();
+        st.view = Some(view);
+        st.inbound = Arc::new(std::sync::OnceLock::new());
+        st
+    }
+
+    /// Every stored view document (ADR-0023 rule 10), as written.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn view_docs(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.store
+            .list(&view_tenant()?, antares_store::Kind::View)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The stored view document `id`, if there is one.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn view_doc(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
+        self.store
+            .get(&view_tenant()?, antares_store::Kind::View, id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Store view document `id`; `true` when it replaced one. The caller
+    /// validated it: the store keeps what it is given.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn put_view_doc(&self, id: &str, doc: serde_json::Value) -> Result<bool, String> {
+        self.store
+            .upsert(&view_tenant()?, antares_store::Kind::View, id, doc)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove view document `id`; `false` when there was none.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn delete_view_doc(&self, id: &str) -> Result<bool, String> {
+        self.store
+            .delete(&view_tenant()?, antares_store::Kind::View, id)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// The engine `/q/health` reports. No engine reports the built-in name:
@@ -761,6 +834,11 @@ async fn hosted_row_id(
 /// Server-managed timestamp, ISO 8601 UTC with milliseconds.
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[cfg(feature = "views")]
+fn view_tenant() -> Result<antares_model::TenantId, String> {
+    antares_model::TenantId::new_internal(crate::views::VIEW_TENANT).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

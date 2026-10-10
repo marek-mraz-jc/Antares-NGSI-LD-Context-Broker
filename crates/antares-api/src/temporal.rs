@@ -210,66 +210,10 @@ async fn upsert_temporal_local(
                         }
                         target.insert("type".into(), Value::Array(cur));
                     }
-                    for (k, v) in antares_jsonld::expanded_object(&expanded)? {
-                        if is_meta(k) {
-                            continue;
-                        }
-                        let incoming = v.as_array().cloned().unwrap_or_default();
-                        match target.get_mut(k).and_then(Value::as_array_mut) {
-                            Some(cur) => {
-                                // 5.6.11: instances merge by (datasetId, observedAt)
-                                for ni in incoming {
-                                    let key = (
-                                        ni.get("datasetId")
-                                            .and_then(Value::as_str)
-                                            .map(String::from),
-                                        ni.get("observedAt")
-                                            .and_then(Value::as_str)
-                                            .map(String::from),
-                                    );
-                                    let pos = cur.iter().position(|ci| {
-                                        (
-                                            ci.get("datasetId")
-                                                .and_then(Value::as_str)
-                                                .map(String::from),
-                                            ci.get("observedAt")
-                                                .and_then(Value::as_str)
-                                                .map(String::from),
-                                        ) == key
-                                            && key.1.is_some()
-                                    });
-                                    match pos {
-                                        // A correction, not a new instance: it
-                                        // keeps the instanceId its client was
-                                        // handed and the createdAt it was created
-                                        // at, which is 5.6.14.4's rule for the
-                                        // same kind of in-place change ("The
-                                        // createdAt property of the concerned
-                                        // instance shall remain unchanged").
-                                        // `stamp_temporal_instances` has already put a
-                                        // fresh pair on the incoming instance.
-                                        Some(p) => {
-                                            let mut ni = ni;
-                                            for keep in ["instanceId", "createdAt"] {
-                                                let Some(had) = cur[p].get(keep).cloned() else {
-                                                    continue;
-                                                };
-                                                if let Some(o) = ni.as_object_mut() {
-                                                    o.insert(keep.to_owned(), had);
-                                                }
-                                            }
-                                            cur[p] = ni;
-                                        }
-                                        None => cur.push(ni),
-                                    }
-                                }
-                            }
-                            None => {
-                                target.insert(k.clone(), Value::Array(incoming));
-                            }
-                        }
-                    }
-                    target.insert("modifiedAt".into(), Value::String(ts.clone()));
+                    // 5.6.11.4: the instances "shall be added" as 5.6.12
+                    // mandates; identity is the instanceId, never observedAt
+                    antares_jsonld::expanded_object(&expanded)?;
+                    add_temporal_instances(doc, &expanded, &ts);
                     Ok::<(), NgsiError>(())
                 })
                 .await?;
@@ -1736,6 +1680,49 @@ fn type_and_attrs_match(
     true
 }
 
+/// ADR-0023 rule 8, for every narrowing: a history is served while the
+/// narrowing's own predicates (its `q`, `scopeQ` and areas) hold for the
+/// Entity as it is now, so an Entity that left the narrowing takes its
+/// history with it. Its rules' conditions are not read here: rule 11 reads
+/// them per instance. An Entity held only temporally (11.2.2) has no state
+/// now, and its history `held` is the only state it has: the predicates
+/// hold when some instance satisfies them, as the query's window check
+/// reads them; `held` absent leaves that to the caller's own check.
+async fn member_now(
+    st: &AppState,
+    tenant: &TenantId,
+    ctx: &Context,
+    filter: &crate::policy::Filter,
+    id: &str,
+    held: Option<&Value>,
+) -> ApiResult<bool> {
+    let Some(reach) = crate::repr::narrowing(filter).policy_reach else {
+        return Ok(true);
+    };
+    if reach.q.is_none() && reach.scope_q.is_none() && reach.areas.is_empty() {
+        return Ok(true);
+    }
+    let reach = crate::repr::PolicyReach {
+        rules: None,
+        ..(*reach).clone()
+    };
+    match st
+        .store
+        .get(tenant, antares_store::Kind::Entity, id)
+        .await?
+    {
+        Some(doc) => Ok(crate::repr::policy_admits(st, tenant, ctx, Some(&reach), &doc).await),
+        None => Ok(held.is_none_or(|h| {
+            let areas: Vec<&antares_ql::geo::GeoQuery> = reach.areas.iter().collect();
+            window_conditions_match(h, None, reach.q.as_ref(), &areas, ctx)
+                && reach
+                    .scope_q
+                    .as_deref()
+                    .is_none_or(|sq| scope_window_retain(&mut h.clone(), sq, None, "observedAt"))
+        })),
+    }
+}
+
 /// 5.7.4.4 S2/S3: the values filter and the geoquery are judged on the
 /// Attribute instances WITHIN the temporal-query interval, so an
 /// out-of-window instance must not satisfy either.
@@ -1882,6 +1869,57 @@ fn window_conditions_match(
         }
     }
     geos.iter().all(|g| g.matches(&eval_doc, ctx))
+}
+
+/// 5.7.4.4 S9: of each Attribute `q` reads, keep the instances that meet
+/// the query: an instance meets it when `q` holds on the Entity with that
+/// Attribute narrowed to the one instance (the other Attributes in the
+/// window), so a term on another Attribute still acts at Entity level.
+fn retain_q_instances(
+    doc: &mut Value,
+    tq: Option<&TemporalQ>,
+    ast: &antares_ql::QNode,
+    ctx: &Context,
+) {
+    let mut heads: Vec<String> = ast
+        .attribute_paths()
+        .into_iter()
+        .filter_map(|p| p.split(['.', '[', '{']).next().map(|h| ctx.expand_key(h)))
+        .collect();
+    heads.sort();
+    heads.dedup();
+    let mut eval_doc = doc.clone();
+    if let (Some(tqv), Some(o)) = (tq, eval_doc.as_object_mut()) {
+        for (k, v) in o.iter_mut() {
+            if !is_meta(k) {
+                if let Some(arr) = v.as_array_mut() {
+                    arr.retain(|inst| tqv.instance_matches(inst));
+                }
+            }
+        }
+    }
+    let (Some(obj), Value::Object(eval)) = (doc.as_object_mut(), &mut eval_doc) else {
+        return;
+    };
+    for head in heads {
+        let Some(arr) = obj.get_mut(&head).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let windowed = eval.get(&head).cloned();
+        arr.retain(|inst| {
+            eval.insert(head.clone(), Value::Array(vec![inst.clone()]));
+            // `eval` is lent back as a document for the one evaluation
+            let probe = Value::Object(std::mem::take(eval));
+            let holds = antares_ql::eval::eval_q(ast, &probe, ctx, &|_| None);
+            if let Value::Object(m) = probe {
+                *eval = m;
+            }
+            holds
+        });
+        if let Some(w) = windowed {
+            eval.insert(head, w);
+        }
+    }
 }
 
 /// 5.7.4.4 S4 — and S7: the federation merge precedes this check, so
@@ -2085,15 +2123,9 @@ pub(crate) async fn query_temporal_collected(
         Vec<&antares_ql::geo::GeoQuery>,
         Vec<&antares_ql::geo::GeoQuery>,
     ) = if ruled {
-        (
-            filter.geo_q.as_deref().into_iter().collect(),
-            own_geo.iter().collect(),
-        )
+        (filter.areas().collect(), own_geo.iter().collect())
     } else {
-        (
-            own_geo.iter().chain(filter.geo_q.as_deref()).collect(),
-            Vec::new(),
-        )
+        (own_geo.iter().chain(filter.areas()).collect(), Vec::new())
     };
 
     // Push entity narrowing (ids/types/attrs) and instance-window
@@ -2126,6 +2158,11 @@ pub(crate) async fn query_temporal_collected(
             .q_pushdown_exact(ast, r.as_ref(), &|t| ctx.expand_key(t))
     });
     let (p_offset, p_limit, _) = crate::paging::page_params(st, params)?;
+    // rule 8 drops Entities after the store answered, so the store may not
+    // page under a narrowing that reads the state now (`ponytail:` one read
+    // per Entity; push it into the store query when it shows up)
+    let narrowed_now =
+        filter.q.is_some() || filter.scope_q.is_some() || filter.areas().next().is_some();
     // 5.7.4.4 + 5.5.9: pagination applies to the MERGED federated union, so
     // the store may only pre-page when nothing will federate — otherwise
     // page 1 is local-page + every remote row (matrix-9 IOP_EXT_TMP_03_04).
@@ -2136,6 +2173,7 @@ pub(crate) async fn query_temporal_collected(
         && params.get("datasetId").is_none()
         && params.get("pick").is_none()
         && p_limit > 0
+        && !narrowed_now
         && !crate::federation::would_federate(st, &tenant, &ctx, params, headers).await?;
     // 4.5.19 computed by the store: the numeric bucket matrix per attribute
     // comes back aggregated when nothing after the store call could change
@@ -2290,6 +2328,9 @@ pub(crate) async fn query_temporal_collected(
         {
             continue;
         }
+        if let Some(ast) = &q_ast {
+            retain_q_instances(&mut doc, tq.as_ref(), ast, &ctx);
+        }
         if let Some(sq) = scope_q {
             if !scope_window_retain(&mut doc, sq, tq.as_ref(), timeprop.as_str()) {
                 continue;
@@ -2308,6 +2349,9 @@ pub(crate) async fn query_temporal_collected(
             {
                 continue;
             }
+            if let Some(ast) = &client_q {
+                retain_q_instances(&mut doc, tq.as_ref(), ast, &ctx);
+            }
         }
         // entity qualifies only if some instance falls in the window
         let any_instance = doc.as_object().is_some_and(|o| {
@@ -2321,6 +2365,16 @@ pub(crate) async fn query_temporal_collected(
         });
         if !any_instance {
             continue;
+        }
+        if narrowed_now {
+            let id = doc
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if !member_now(st, &tenant, &ctx, filter, &id, None).await? {
+                continue;
+            }
         }
         matches.push(doc);
     }
@@ -2589,6 +2643,13 @@ async fn retrieve_temporal_inner(
                 NgsiError::ResourceNotFound(format!("temporal entity {id} not found"))
             })?
         };
+        // ADR-0020, ADR-0023 rules 3 and 8: an Entity outside the
+        // narrowing now is the 404 of an absent one
+        if !member_now(st, &tenant, &ctx, &filter, id, Some(&doc)).await? {
+            return Err(
+                NgsiError::ResourceNotFound(format!("temporal entity {id} not found")).into(),
+            );
+        }
         // ADR-0023 rule 11: the history its rules show, before anything
         // reads it; no rule for its types is the 404 of an absent Entity
         let doc = match types_rule.as_deref() {

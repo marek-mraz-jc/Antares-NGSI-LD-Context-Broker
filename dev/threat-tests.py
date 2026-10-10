@@ -15,6 +15,10 @@ after it (`a`, `b`, `c`); a span after other words ("doc test `Ops` with a `comp
 block") is prose.
 
 When a name is checked:
+  - an item marked `(proposed, T-nnnn` is owned by that task, whose crate may already exist while
+    the task is still open (a crate is built in rounds): it waits until its test exists, and
+    once the test exists the tag is a problem until it is dropped, so the row then guards the
+    test like any other and a later deletion is caught;
   - an item marked `(proposed` is owned by a crate that may not exist yet: its path's crate when
     that is one of the new crates of ADR-0027 section 1, else the crate of the row's section
     (2 antares-ops, 3 antares-views, 4 antares-odata, 5 antares-mcp, 6 antares-linkml,
@@ -52,6 +56,7 @@ NEW_CRATES = set(SECTION_CRATE.values()) | {
     "linkml-model",
 }
 NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
+TASK_TAG = re.compile(r"\(proposed,\s*(T-\d+)\b")
 
 
 def top_level_items(cell):
@@ -169,6 +174,14 @@ def check(root):
             if owner and not (root / "crates" / owner / "Cargo.toml").is_file():
                 pending += 1
                 continue
+            tag = TASK_TAG.search(item)
+            if tag and missing:
+                pending += 1
+                continue
+            if tag:
+                checked += 1
+                problems.append(f"{row}: {name} exists; drop the {tag.group(1)} tag so the row guards it")
+                continue
             checked += 1
             if missing:
                 why = f"crate {owner} exists" if owner else "named as an existing test"
@@ -208,6 +221,8 @@ def self_test():
 | V4 | I | script present | m | `dev/check.py --self-test` (proposed) |
 | V5 | I | script missing | m | `dev/missing.sh --self-test` (proposed) |
 | V6 | I | path crate is an existing core crate | m | `crates/antares-broker/tests/fail_closed.rs::closed` (proposed) |
+| V7 | I | owned by an open task, not written yet | m | `views_writes.rs::later` (proposed, T-0001) |
+| V8 | I | owned by a task, written, tag left | m | `views.rs::views_present` (proposed, T-0002: a note) |
 """
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
@@ -232,8 +247,9 @@ def self_test():
         "V3: fuzz target fuzz/fuzz_targets/view_load.rs does not exist (crate antares-views exists)",
         "V5: file dev/missing.sh does not exist (crate antares-views exists)",
         "V6: fn closed in crates/antares-broker/tests/fail_closed.rs does not exist (crate antares-views exists)",
+        "V8: views.rs::views_present exists; drop the T-0002 tag so the row guards it",
     ]
-    ok = problems == expected and count == 11 and pending == 2 and checked == 10
+    ok = problems == expected and count == 13 and pending == 3 and checked == 11
     if not ok:
         print(f"threat-tests self-test FAILED: rows {count}, checked {checked}, pending {pending}")
         print("\n".join(problems))
@@ -252,7 +268,7 @@ def main(argv):
     problems, checked, pending, count = check(root)
     print(
         f"threat-tests: {count} STRIDE rows, {checked} named tests checked, "
-        f"{pending} waiting for their crate"
+        f"{pending} waiting for their crate or task"
     )
     for problem in problems:
         print(f"  MISSING  {problem}")

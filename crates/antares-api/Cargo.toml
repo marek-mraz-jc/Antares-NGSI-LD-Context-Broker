@@ -6,6 +6,8 @@ edition.workspace = true
 publish = false
 license.workspace = true
 rust-version.workspace = true
+# One integration-test binary, tests/it.rs, plus the [[test]] entries below (T-3540).
+autotests = false
 
 # ADR-0027 / surfaces-threat-model 9.1: checked by dev/check-module-rules.py.
 [package.metadata.antares]
@@ -77,6 +79,9 @@ sonic = ["dep:sonic-rs"]
 # under fuzz/ (T-3463). Adds no dependency and no route; no broker build
 # turns it on.
 fuzzing = []
+# Endpoint views (ADR-0023): the composition hook `gate!` applies when a
+# state carries a view. Off in the vanilla build; pulled by antares-ops.
+views = []
 
 [dev-dependencies]
 # the storage seams are object-safe AND asynchronous: a test double
@@ -89,3 +94,57 @@ tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
+[[test]]
+# own process: sets ANTARES_MAX_BODY_BYTES
+name = "csource_notification_bound"
+path = "tests/csource_notification_bound.rs"
+
+[[test]]
+# own process: installs the global tracing subscriber
+name = "csi_credential_4_3_6_5"
+path = "tests/csi_credential_4_3_6_5.rs"
+
+[[test]]
+# own process: sets ANTARES_PUBLIC_URL
+name = "dist_sub_through_proxies_5_8_1"
+path = "tests/dist_sub_through_proxies_5_8_1.rs"
+
+[[test]]
+# own process: sets ANTARES_PUBLIC_URL
+name = "dist_subs_5_8"
+path = "tests/dist_subs_5_8.rs"
+
+[[test]]
+# own process: sets ANTARES_MAX_FED_RESPONSE_BYTES
+name = "fed_bounds_5_7"
+path = "tests/fed_bounds_5_7.rs"
+
+[[test]]
+# own process: sets ANTARES_POLICY_SUBJECT_HEADERS
+name = "facade_seam_f0"
+path = "tests/facade_seam_f0.rs"
+
+[[test]]
+# own process: sets ANTARES_POLICY_SUBJECT_HEADERS
+name = "policy_maps_snapshots_5_14_5_16"
+path = "tests/policy_maps_snapshots_5_14_5_16.rs"
+
+[[test]]
+# own process: sets ANTARES_POLICY_SUBJECT_HEADERS
+name = "policy_notify_5_8_6"
+path = "tests/policy_notify_5_8_6.rs"
+
+[[test]]
+# own process: sets ANTARES_POLICY_SUBJECT_HEADERS and ANTARES_PUBLIC_URL
+name = "policy_subject_on_the_wire_p6"
+path = "tests/policy_subject_on_the_wire_p6.rs"
+
+[[test]]
+# own process: sets and removes ANTARES_PUBLIC_URL and ANTARES_HTTP_PORT
+name = "public_url_default_5_8_1"
+path = "tests/public_url_default_5_8_1.rs"

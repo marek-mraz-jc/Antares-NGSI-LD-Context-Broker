@@ -17,8 +17,10 @@ antares-ql = { path = "../crates/antares-ql" }
 antares-api = { path = "../crates/antares-api", default-features = false, features = ["fuzzing"] }
 antares-model = { path = "../crates/antares-model" }
 antares-jsonld = { path = "../crates/antares-jsonld" }
+antares-ops = { path = "../crates/antares-ops" }
 # q_to_sql: the SQL compilers alone; the Postgres store is not linked.
 antares-sql = { path = "../crates/antares-sql", default-features = false }
+linkml-model = { path = "../crates/linkml-model" }
 
 [[bin]]
 name = "parse_q"
@@ -128,6 +130,20 @@ bench = false
 [[bin]]
 name = "datetime"
 path = "fuzz_targets/datetime.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "view_config_load"
+path = "fuzz_targets/view_config_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "linkml_read"
+path = "fuzz_targets/linkml_read.rs"
 test = false
 doc = false
 bench = false

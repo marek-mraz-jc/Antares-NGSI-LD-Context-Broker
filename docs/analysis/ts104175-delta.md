@@ -176,10 +176,63 @@ New matter: requirements INT-1 to INT-4 (clause 4) and the Atomic Entity / Seale
 
 List them: `python3 dev/clause-map.py | awk -F'\t' '$3!="informative" && ($9>0 || $10>0)'`.
 
+### 4.1 Chapter 4
+
+The 88 implemented or partial clauses of chapter 4 carry their TS 104 175 verdict at the end of `notes` (`grep -h 'TS 104 175' docs/spec/4/*.md`). 87 hold under the new text: most changes are renames and new clause numbers, and the rest move a rule without changing it.
+
+| Ledger clause | TS 104 175 | What changed | Verdict |
+|---|---|---|---|
+| 4.3.6.4 | 9.7 | every detected loop is an error | compliant since T-3459 (3.5) |
+| 4.3.6.7 | 9.6 | the Entity Map rules of CIM 009 5.5.14, 5.7.1.4, 5.7.2.4 gathered into one clause | compliant, no new obligation |
+| 4.5.4, 4.5.16.2 | 5.3.2.4, 5.3.3.3.1 | scope, and in GeoJSON expiresAt, named as members | compliant, entity-level members pass through |
+| 4.5.5.3 | 8.5.3 | an instance with observedAt wins over every instance without one | compliant since T-3545: `recency()` ranks observed instances first |
+| 4.5.6 to 4.5.8 | 5.3.2.5 | one text for every attribute type, scope rules stated | compliant |
+| 4.6.5, 4.7.2 | 5.2.6.4.6, 5.2.6.4.5 | data-type tables with an `ngsildProof` member | TS 104 179, outside the ledger (3.9) |
+| 4.6.6 | 10.3.x | chronological order became a note | compliant |
+| 4.2.2, 4.2.3, 4.4, 4.15 | 4.2.2, 4.2.3, 5.3.2.1, 7.2.7 | shall sentences removed | nothing to do |
+| 4.16 | 5.2.3 | two should-rules for @context authors | not a broker rule |
+| 4.22, 4.8 | 5.2.4 | expiresAt restated; a Context Source omits an unknown TemporalProperty | compliant |
+
+### 4.2 Chapter 5
+
+The 266 implemented or partial clauses of chapter 5 carry their verdict the same way (`grep -h 'TS 104 175' docs/spec/5/*.md`). 131 have a changed sentence; most are the new clause numbers, "follow" become "comply with", and the operation behaviours restating the exclusive and redirect forwarding per operation. One is non-compliant.
+
+| Ledger clause | TS 104 175 | What changed | Verdict |
+|---|---|---|---|
+| 5.13.4.4 | 13.4.3, 13.4.4 | Serve @context takes `core` (major.minor): a [user URL, core URL] array; BadRequest when malformed or with `details` | compliant since T-3553 |
+| 5.2.5 to 5.2.7, 5.2.32, 5.2.35 to 5.2.38 | 5.2.6.4.x | the prohibited members of CIM 009 4.5.x moved into the data-type tables; `ngsildProof` added | compliant (`check_prohibited_members`); `ngsildProof` is TS 104 179 (3.9) |
+| 5.2.12, 5.2.14.1, 5.2.14.2 | 5.2.6.5.2, 5.2.6.7.3 | members a CSourceSubscription and its notification ignore | 3.7 (T-3452) |
+| 5.2.10, 5.10.2.4 | 5.2.6.6.5, 12.3.3.4 | attributeNames before propertyNames and relationshipNames | 3.6 (T-3451) |
+| 5.12, 5.5.14 | 9.4, 9.6 | matching rules regrouped; Entity Map rules gathered in 9.6 | compliant (4.1) |
+| 5.7.3.3, 5.7.4.3 | 11.3.2.3, 11.3.3.3 | firstN | 3.2 (T-3456) |
+| 5.8.6 | 10.5.7 | notification bookkeeping and formats restated, ngsildConformance amendment | compliant |
+| 5.14.1.5, 5.16.7.5 | 14.2.5, 16.7.5 | the script paired them wrongly; placed by hand | unchanged |
+
+### 4.3 Chapter 6
+
+The 121 implemented or partial clauses of chapter 6 carry their TS 104 176 verdict the same way (`grep -h 'TS 104 176' docs/spec/6/*.md`). The resources moved from 6.4 to 6.38 into chapters 7 to 13, and the common behaviours split over 6.2 to 6.5; the script paired nineteen resource definitions and two methods to the wrong resource, so the pairs follow the resource path and the method. Every GET became GET/HEAD. Two clauses are non-compliant with TS 104 176.
+
+| Ledger clause | TS 104 176 | What changed | Verdict |
+|---|---|---|---|
+| 6.3.2 | 6.3.2 | an unrecognised or unimplemented verb is 501, 405 only for a recognised one | compliant since T-3554 |
+| 6.36.3.1, 6.38.3.1 | 13.2.3.1, 13.4.3.1 | Create and Clone Snapshot answer 202 Accepted, CIM 009 answers 201 | version conflict, Antares keeps 201; T-3555, raise 17 |
+| 6.2, every GET | 5, x.x.3.1 | OPTIONS answers 204; HEAD is GET without a body | compliant; the HEAD status is T-3460 (3.8) |
+| 6.3.10 | 6.4.7.2, 6.4.7.3 | temporal pagination in a clause of its own, firstN and offsetN | 3.2 (T-3456) |
+| 6.12.3.1, 6.12.3.2 | 9.4.3.1, 9.4.3.2 | the published headings GET/HEAD and POST are swapped against their text | editorial, paired by text |
+| 6.5.3.4 | 7.3.3.2 | 207 Multi Status for a distributed merge named in the table | compliant, 6.3.17 already required it |
+| 6.4.3.3, 6.8.3.2 | 7.2.3.3, 9.2.3.1 | a should-rule on a configurable default; geoproperty and timeproperty rows corrected | compliant |
+
+### 4.4 Chapter 7 and the annexes
+
+7.2 (TS 104 243 5.2) is unchanged in substance. A.2 and A.3 lost sentences and gained none: the lowercase-namespace rule and the identifier structure are gone, which removes obligations and adds none. Annex B is the core @context, non-compliant until T-3458 (3.4). With this, every implemented or partial clause of the ledger carries its TS 104 175, 176 or 243 verdict.
+
 ## 5. Gaps and their tasks
 
 | Task | Gap | Kind |
 |---|---|---|
+| T-3553 | Serve @context `core` parameter (4.2) | compliant (fixed) |
+| T-3554 | 501 for an unrecognised HTTP verb (4.3) | compliant (fixed) |
+| T-3555 | Create and Clone Snapshot 202 or 201 (4.3) | decided: 201, raise 17 |
 | T-3450 | Set Attribute Value `PUT …/attrs/{attrId}/value` (3.10) | compliant |
 | T-3451 | `RegistrationInfo.attributeNames` not matched (3.6) | non-compliant, security (over-forwarding) |
 | T-3452 | CSR subscription ignores `geoQ.geoproperty`; ignore list untested (3.7) | non-compliant |
@@ -191,7 +244,8 @@ List them: `python3 dev/clause-map.py | awk -F'\t' '$3!="informative" && ($9>0 |
 | T-3458 | core @context content and scoped terms (3.4) | non-compliant, owner decision |
 | T-3459 | 9.7 loop error for inclusive or no registration (3.5) | non-compliant, owner decision |
 | T-3460 | HEAD 204 or 200 (3.8) | spec contradiction, owner decision |
-| T-3461 | re-audit of the 266 changed clauses (section 4) | backlog |
+| T-3461 | re-audit of every implemented clause (section 4) | done, gaps filed |
+| T-3545 | conflicting attributes: observedAt did not take precedence (4.1) | compliant (fixed) |
 
 The ICS ([ics-ts104187.md](ics-ts104187.md)) answers against CIM 009 as TS 104 187 A.3 asks; these gaps reach it when the ledger records them.
 

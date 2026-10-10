@@ -1,0 +1,890 @@
+// SPDX-License-Identifier: EUPL-1.2
+//! The composition hook of endpoint views (ADR-0023, ADR-0027 section 5,
+//! T-3494): a request served through a view runs the ordinary handler with
+//! one more conjunct, the view's narrowing, composed with whatever the
+//! installed engine answers (`effective = view ∧ engine`, both narrowing,
+//! neither widening).
+//!
+//! The view travels on the [`AppState`](crate::AppState)
+//! ([`AppState::with_view`](crate::AppState::with_view)), not on the task:
+//! everything a request spawns, every in-process call and every join walk
+//! clones that state, so no path can lose the view and serve wider than it.
+//! `gate!` reads it after the engine has answered and before [`resolve`], so
+//! a clause that cannot be narrowed (a write, a purge) is refused under a
+//! view exactly as it is under a narrowing engine.
+//!
+//! Loading, validating and addressing views is `antares-ops`' (T-3496); this
+//! module composes one, and holds the table of the views a pod serves
+//! ([`ViewTable`]) with the store seam the loader writes through, so the
+//! operation layer never names the store (threat F1).
+
+use crate::policy::{resolve, Decision, Denied, Filter, Rule};
+use antares_ql::geo::GeoQuery;
+use antares_ql::QNode;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// How many rules a composed narrowing may hold: the pairs of a view's
+/// rules and an engine's are the product of two bounded lists, and the
+/// product is bounded again so neither side can make the other's allocation
+/// grow without limit.
+pub const MAX_COMPOSED_RULES: usize = 4096;
+
+/// A view as `gate!` applies it: the predicate `selector ∧ q ∧ scope_q ∧
+/// geo_q` and the per-rule allowlists (ADR-0023 rule 11), compiled once.
+/// Built only through [`CompiledView::new`], which refuses a view that
+/// would serve everything.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledView {
+    narrowing: Filter,
+}
+
+impl CompiledView {
+    /// The view's narrowing. `selector` is its Entity types; every rule is
+    /// kept to the types it shares with the selector, and a rule that shares
+    /// none is dropped. A view with no selector, or with no rule left, is
+    /// refused: a view that names nothing would otherwise read as a
+    /// narrowing that narrows nothing.
+    ///
+    /// An Entity with several types is matched by a rule when one of its
+    /// types is both in the selector and in the rule, which can show less
+    /// than the two conditions read apart, never more.
+    pub fn new(
+        selector: &[String],
+        q: Option<QNode>,
+        scope_q: Option<String>,
+        geo_q: Option<antares_ql::geo::GeoQuery>,
+        rules: Vec<Rule>,
+    ) -> Result<Self, String> {
+        if selector.is_empty() {
+            return Err("a view selects at least one Entity type".into());
+        }
+        let in_selector = |t: &String| {
+            let iri = crate::repr::policy_context().expand_key(t);
+            selector
+                .iter()
+                .any(|s| crate::repr::policy_context().expand_key(s) == iri)
+        };
+        let rules: Vec<Rule> = rules
+            .into_iter()
+            .map(|r| Rule {
+                types: r.types.iter().filter(|t| in_selector(t)).cloned().collect(),
+                ..r
+            })
+            .filter(|r| !r.types.is_empty())
+            .collect();
+        if rules.is_empty() {
+            return Err(
+                "a view shows its Entities through at least one rule of its selector's types"
+                    .into(),
+            );
+        }
+        Ok(Self {
+            narrowing: Filter {
+                q: q.map(Box::new),
+                scope_q,
+                geo_q: geo_q.map(Box::new),
+                rules,
+                ..Filter::default()
+            },
+        })
+    }
+
+    /// The narrowing this view adds to every operation served through it.
+    pub fn narrowing(&self) -> &Filter {
+        &self.narrowing
+    }
+}
+
+/// List @contexts (13.3, CIM 009 5.13.3).
+const LIST_CONTEXTS: &str = "5.13.3";
+
+/// What `gate!` hands the handler: the engine's answer for `clause`
+/// composed with the view the state carries, if it carries one. Without a
+/// view the answer is the engine's, unchanged.
+pub fn with_view(
+    view: Option<&CompiledView>,
+    clause: &str,
+    engine: Result<Filter, Denied>,
+) -> Result<Filter, Denied> {
+    let Some(view) = view else {
+        return engine;
+    };
+    if clause == LIST_CONTEXTS {
+        // Rule 5: the handler lists the core @context alone under a view,
+        // so the view has nothing of its own to narrow there.
+        return engine;
+    }
+    let composed = compose(view.narrowing(), engine?)?;
+    match resolve(clause, Decision::Filter(composed)) {
+        Decision::Allow => Ok(Filter::default()),
+        Decision::Filter(f) => Ok(f),
+        Decision::Deny(why) => Err(Denied(why)),
+    }
+}
+
+/// `a ∧ b` as one [`Filter`]: every member narrows and none widens. The
+/// queries are conjoined on the AST, the `scopeQ`s intersected, the
+/// projections intersected (`pick`) and joined (`omit`), and the rules
+/// paired: an Entity a pair holds for matches a rule of each side, and shows
+/// what both show.
+pub fn compose(a: &Filter, b: Filter) -> Result<Filter, Denied> {
+    let (geo_q, geo_also) = and_geo(a.areas(), b.areas());
+    let rules = pair_rules(&a.rules, b.rules)?;
+    let mut omit = b.omit;
+    for name in &a.omit {
+        if !omit.contains(name) {
+            omit.push(name.clone());
+        }
+    }
+    let mut omit_by_type = b.omit_by_type;
+    for (t, attrs) in &a.omit_by_type {
+        let into = omit_by_type.entry(t.clone()).or_default();
+        for name in attrs {
+            if !into.contains(name) {
+                into.push(name.clone());
+            }
+        }
+    }
+    Ok(Filter {
+        q: and_q(a.q.as_deref(), b.q.map(|q| *q)).map(Box::new),
+        scope_q: and_scope(a.scope_q.as_deref(), b.scope_q)?,
+        geo_q,
+        geo_also,
+        pick: and_pick(&a.pick, b.pick),
+        omit,
+        rules,
+        omit_by_type,
+        restricted: a.restricted || b.restricted,
+    })
+}
+
+fn and_q(a: Option<&QNode>, b: Option<QNode>) -> Option<QNode> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(QNode::And(vec![a.clone(), b])),
+        (Some(a), None) => Some(a.clone()),
+        (None, b) => b,
+    }
+}
+
+fn and_scope(a: Option<&str>, b: Option<String>) -> Result<Option<String>, Denied> {
+    match (a, b) {
+        (Some(a), Some(b)) => antares_ql::scope::intersect_scope_q(a, &b)
+            .map(Some)
+            .ok_or_else(|| Denied(crate::policy::SCOPE_NOT_NARROWABLE.to_owned())),
+        (Some(a), None) => Ok(Some(a.to_owned())),
+        (None, b) => Ok(b),
+    }
+}
+
+/// Every area of both sides, the first in `geo_q` and the rest in
+/// `geo_also`: each must hold, so none is dropped (dropping one widens).
+fn and_geo<'g>(
+    a: impl Iterator<Item = &'g GeoQuery>,
+    b: impl Iterator<Item = &'g GeoQuery>,
+) -> (Option<Box<GeoQuery>>, Vec<GeoQuery>) {
+    let mut all = a.chain(b).cloned();
+    (all.next().map(Box::new), all.collect())
+}
+
+/// Names compared as expanded IRIs, kept in `b`'s written form.
+fn shared(a: &[String], b: Vec<String>) -> Vec<String> {
+    let ctx = crate::repr::policy_context();
+    let a: Vec<String> = a.iter().map(|n| ctx.expand_key(n)).collect();
+    b.into_iter()
+        .filter(|n| a.contains(&ctx.expand_key(n)))
+        .collect()
+}
+
+/// An empty `pick` keeps everything, so it is the other side's; two lists
+/// keep what both name. Two lists that share nothing keep the frame alone,
+/// which `pick` cannot say with an empty list: the one member it keeps is
+/// one no Entity carries.
+fn and_pick(a: &[String], b: Vec<String>) -> Vec<String> {
+    match (a.is_empty(), b.is_empty()) {
+        (true, _) => b,
+        (false, true) => a.to_vec(),
+        (false, false) => {
+            let both = shared(a, b);
+            if both.is_empty() {
+                vec![NOTHING.to_owned()]
+            } else {
+                both
+            }
+        }
+    }
+}
+
+/// A member name no Entity carries: an expanded IRI under a scheme of its
+/// own, so no `@context` can map a term onto it.
+const NOTHING: &str = "urn:antares:views:nothing";
+
+fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
+    match (a.is_empty(), b.is_empty()) {
+        (true, _) => return Ok(b),
+        (false, true) => return Ok(a.to_vec()),
+        (false, false) => {}
+    }
+    if a.len().saturating_mul(b.len()) > MAX_COMPOSED_RULES {
+        return Err(Denied(format!(
+            "the view and the policy compose to more than {MAX_COMPOSED_RULES} rules"
+        )));
+    }
+    let mut out = Vec::new();
+    for x in a {
+        for y in &b {
+            let types = shared(&x.types, y.types.clone());
+            if types.is_empty() {
+                continue;
+            }
+            let (geo_q, geo_also) = and_geo(x.areas(), y.areas());
+            out.push(Rule {
+                types,
+                q: and_q(x.q.as_deref(), y.q.as_deref().cloned()).map(Box::new),
+                scope_q: and_scope(x.scope_q.as_deref(), y.scope_q.clone())?,
+                geo_q,
+                geo_also,
+                attributes: shared(&x.attributes, y.attributes.clone()),
+            });
+        }
+    }
+    // No pair shares a type: nothing is shown. An empty list would read as
+    // "no rules", which shows everything; a rule naming no type holds for
+    // nothing.
+    if out.is_empty() {
+        out.push(Rule::default());
+    }
+    Ok(out)
+}
+
+/// The reserved tenant the view documents live under (ADR-0012, ADR-0023
+/// rule 10). No client may name it, and no NGSI-LD route reads the
+/// document kind they are stored as.
+pub const VIEW_TENANT: &str = "antares-views";
+
+/// One view of the table.
+#[derive(Debug, Clone)]
+pub enum ViewEntry {
+    /// A view that loaded: its narrowing, and what `/q/health` says of it.
+    Loaded {
+        /// The narrowing every operation through the view is composed with.
+        view: Arc<CompiledView>,
+        /// The one Tenant it serves.
+        tenant: String,
+        /// The operations it allows, as `operation-matrix.yaml` ids.
+        operations: Vec<String>,
+        /// What the loader found worth an operator's eye: a rule whose
+        /// condition reads an Attribute it does not show (ADR-0023 rule
+        /// 11), a temporal view keyed on a mutable member (rule 8).
+        notes: Vec<String>,
+    },
+    /// A stored view that failed validation: never served, named in
+    /// `/q/health` with the reason.
+    Invalid {
+        /// Why it did not load.
+        reason: String,
+    },
+}
+
+/// The views this pod serves, swapped whole on every reload so a request
+/// sees one table or the next, never half of each (ADR-0023 rule 10). Empty
+/// until a view loads: no view means nothing served (rule M4).
+#[derive(Debug, Default)]
+pub struct ViewTable {
+    entries: std::sync::RwLock<Arc<BTreeMap<String, ViewEntry>>>,
+    admin: std::sync::OnceLock<axum::Router>,
+}
+
+impl ViewTable {
+    /// The table as it is now.
+    pub fn snapshot(&self) -> Arc<BTreeMap<String, ViewEntry>> {
+        self.entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace the whole table.
+    pub fn replace(&self, entries: BTreeMap<String, ViewEntry>) {
+        *self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(entries);
+    }
+
+    /// Whether at least one view loaded: a surface that serves through views
+    /// is closed until one has (rule M4).
+    pub fn any_loaded(&self) -> bool {
+        self.snapshot()
+            .values()
+            .any(|e| matches!(e, ViewEntry::Loaded { .. }))
+    }
+
+    /// What `/q/health` lists: each view, `loaded` with its tenant,
+    /// operations and notes, or `invalid` with the reason.
+    pub fn report(&self) -> serde_json::Value {
+        let views = self.snapshot();
+        serde_json::Value::Object(
+            views
+                .iter()
+                .map(|(id, e)| {
+                    let v = match e {
+                        ViewEntry::Loaded {
+                            tenant,
+                            operations,
+                            notes,
+                            ..
+                        } => serde_json::json!({
+                            "state": "loaded",
+                            "tenant": tenant,
+                            "operations": operations.len(),
+                            "notes": notes,
+                        }),
+                        ViewEntry::Invalid { reason } => {
+                            serde_json::json!({"state": "invalid", "reason": reason})
+                        }
+                    };
+                    (id.clone(), v)
+                })
+                .collect(),
+        )
+    }
+
+    /// The `/q/views` routes the loader serves, merged into the admin
+    /// surface and so relative to `/q` (`/views`, `/views/{id}`). Set once,
+    /// before the router is built.
+    ///
+    /// # Errors
+    /// When routes were set already.
+    pub fn set_admin(&self, routes: axum::Router) -> Result<(), String> {
+        self.admin
+            .set(routes)
+            .map_err(|_| "the /q/views routes are set already".to_owned())
+    }
+
+    /// The `/q/views` routes, if a loader set them.
+    pub fn admin(&self) -> Option<axum::Router> {
+        self.admin.get().cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{
+        DecisionFuture, NotifyDecision, Operation, PolicyEngine, Subject, FILTERABLE,
+    };
+    use crate::AppState;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    struct Narrowing(Filter);
+
+    impl PolicyEngine for Narrowing {
+        fn name(&self) -> &str {
+            "narrowing"
+        }
+        fn decide<'a>(&'a self, _s: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+            let answer = if FILTERABLE.contains(&op.clause) {
+                Decision::Filter(self.0.clone())
+            } else {
+                Decision::Allow
+            };
+            Box::pin(std::future::ready(answer))
+        }
+        fn pre_notify(&self, _s: &Subject, _sub: &Value, _n: &mut Value) -> NotifyDecision {
+            NotifyDecision::Deliver
+        }
+    }
+
+    fn rule(types: &[&str], q: Option<&str>, attributes: &[&str]) -> Rule {
+        Rule {
+            types: types.iter().map(|t| (*t).to_owned()).collect(),
+            q: q.map(|q| Box::new(antares_ql::parse_q(q).expect("q"))),
+            attributes: attributes.iter().map(|a| (*a).to_owned()).collect(),
+            ..Rule::default()
+        }
+    }
+
+    #[test]
+    fn the_context_list_is_the_one_read_a_view_does_not_narrow() {
+        let view = cars();
+        assert_eq!(
+            with_view(Some(&view), LIST_CONTEXTS, Ok(Filter::default())),
+            Ok(Filter::default())
+        );
+        assert!(
+            with_view(Some(&view), "5.13.4", Ok(Filter::default())).is_err(),
+            "serving a stored @context is refused under a view"
+        );
+    }
+
+    /// Cars only, showing `speed` and `colour`, never `secret`.
+    fn cars() -> CompiledView {
+        CompiledView::new(
+            &["Car".into()],
+            None,
+            None,
+            None,
+            vec![rule(&["Car"], None, &["speed", "colour"])],
+        )
+        .expect("view")
+    }
+
+    async fn send(
+        st: &AppState,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value, axum::http::HeaderMap) {
+        let req = Request::builder().method(method).uri(uri);
+        let req = match body {
+            Some(v) => {
+                let payload = v.to_string();
+                req.header("Content-Type", "application/json")
+                    .header("Content-Length", payload.len())
+                    .body(Body::from(payload))
+            }
+            None => req.body(Body::empty()),
+        }
+        .expect("request");
+        let resp = crate::router(st.clone())
+            .oneshot(req)
+            .await
+            .expect("response");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            headers,
+        )
+    }
+
+    /// Five Cars (two with `secret`), two Bikes; seeded through a state
+    /// without a view, which shares its store with every view state.
+    async fn seeded(engine: Option<Filter>) -> AppState {
+        let mut st = AppState::new("me".into());
+        if let Some(f) = engine {
+            st = st.with_policy(Arc::new(Narrowing(f)));
+        }
+        crate::wire(&mut st).await;
+        for i in 0..5 {
+            let mut car = json!({"id": format!("urn:ngsi-ld:Car:{i}"), "type": "Car",
+                "speed": {"type": "Property", "value": i * 10},
+                "colour": {"type": "Property", "value": if i % 2 == 0 { "red" } else { "blue" }}});
+            if i < 2 {
+                car["secret"] = json!({"type": "Property", "value": 7});
+            }
+            let (s, b, _) = send(&st, "POST", "/ngsi-ld/v1/entities", Some(car)).await;
+            assert_eq!(s, StatusCode::CREATED, "{s} {b}");
+        }
+        for i in 0..2 {
+            let bike = json!({"id": format!("urn:ngsi-ld:Bike:{i}"), "type": "Bike",
+                "speed": {"type": "Property", "value": 5}});
+            let (s, b, _) = send(&st, "POST", "/ngsi-ld/v1/entities", Some(bike)).await;
+            assert_eq!(s, StatusCode::CREATED, "{s} {b}");
+        }
+        st
+    }
+
+    fn ids(body: &Value) -> Vec<String> {
+        let mut v: Vec<String> = body
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e["id"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    /// Rule 1: `NGSILD-Results-Count` and the `Link` pages describe the
+    /// narrowed set, the Cars, and nothing the view does not select.
+    #[tokio::test]
+    async fn count_and_pages_describe_the_view() {
+        let st = seeded(None).await;
+        let view = st.with_view(Arc::new(cars()));
+        let uri = "/ngsi-ld/v1/entities?type=Car,Bike&count=true&limit=2";
+        let (s, body, headers) = send(&view, "GET", uri, None).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(headers["NGSILD-Results-Count"], "5");
+        assert_eq!(ids(&body).len(), 2);
+        let mut seen = ids(&body);
+        let next_of = |h: &axum::http::HeaderMap| {
+            h.get_all("Link")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(", <"))
+                .find(|l| l.contains("rel=\"next\""))
+                .and_then(|l| l.trim_start_matches('<').split_once('>'))
+                .map(|(target, _)| target)
+                .map(str::to_owned)
+        };
+        let mut next = next_of(&headers);
+        assert!(next.is_some(), "a first page of 2 out of 5 links the next");
+        while let Some(path) = next {
+            let (_, page, h) = send(&view, "GET", &path, None).await;
+            seen.extend(ids(&page));
+            next = next_of(&h);
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            (0..5)
+                .map(|i| format!("urn:ngsi-ld:Car:{i}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Rule 2: `q` and `orderBy` over an Attribute the view hides answer as
+    /// they do over Entities that never had it.
+    #[tokio::test]
+    async fn a_hidden_attribute_reads_as_absent() {
+        let st = seeded(None).await;
+        let view = st.with_view(Arc::new(cars()));
+        for (q, expect) in [
+            ("secret%3D%3D7", 0),
+            ("secret", 0),
+            ("!secret", 5),
+            ("secret%3E1", 0),
+        ] {
+            let (s, body, _) = send(
+                &view,
+                "GET",
+                &format!("/ngsi-ld/v1/entities?type=Car&q={q}"),
+                None,
+            )
+            .await;
+            assert_eq!(s, StatusCode::OK, "{q}: {body}");
+            assert_eq!(ids(&body).len(), expect, "{q}: {body}");
+        }
+        let (_, body, _) = send(
+            &view,
+            "GET",
+            "/ngsi-ld/v1/entities?type=Car&orderBy=secret,speed",
+            None,
+        )
+        .await;
+        let (_, plain, _) = send(
+            &view,
+            "GET",
+            "/ngsi-ld/v1/entities?type=Car&orderBy=speed",
+            None,
+        )
+        .await;
+        let order = |b: &Value| {
+            b.as_array()
+                .expect("list")
+                .iter()
+                .map(|e| e["id"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(&body), order(&plain), "secret does not order");
+        assert!(
+            body.as_array()
+                .expect("list")
+                .iter()
+                .all(|e| e.get("secret").is_none()),
+            "{body}"
+        );
+    }
+
+    /// The view applies with no engine and with `AllowAll`: the default
+    /// engine behind a view serves only the view.
+    #[tokio::test]
+    async fn allow_all_behind_a_view_serves_only_the_view() {
+        let st = seeded(None)
+            .await
+            .with_policy(Arc::new(crate::policy::AllowAll));
+        let view = st.with_view(Arc::new(cars()));
+        let (_, body, _) = send(&view, "GET", "/ngsi-ld/v1/entities?type=Bike", None).await;
+        assert_eq!(ids(&body), Vec::<String>::new());
+        let (s, _, _) = send(
+            &view,
+            "GET",
+            "/ngsi-ld/v1/entities/urn:ngsi-ld:Bike:0",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "out of view reads as not found");
+        let (s, body, _) = send(&view, "GET", "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:0", None).await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert!(body.get("secret").is_none(), "{body}");
+        // without the view, the same state serves everything
+        let (_, body, _) = send(&st, "GET", "/ngsi-ld/v1/entities?type=Bike", None).await;
+        assert_eq!(ids(&body).len(), 2);
+    }
+
+    /// An engine `Filter` and a view both narrow, neither widens: the engine
+    /// keeps the slow Cars, the view keeps the Cars, the answer is both.
+    #[tokio::test]
+    async fn the_engine_and_the_view_both_narrow() {
+        let slow = Filter {
+            q: Some(Box::new(antares_ql::parse_q("speed<30").expect("q"))),
+            pick: vec!["speed".into(), "secret".into()],
+            ..Filter::default()
+        };
+        let st = seeded(Some(slow)).await;
+        let view = st.with_view(Arc::new(cars()));
+        let (_, body, _) = send(&view, "GET", "/ngsi-ld/v1/entities?type=Car,Bike", None).await;
+        assert_eq!(
+            ids(&body),
+            vec![
+                "urn:ngsi-ld:Car:0",
+                "urn:ngsi-ld:Car:1",
+                "urn:ngsi-ld:Car:2"
+            ]
+        );
+        for e in body.as_array().expect("list") {
+            assert!(e.get("speed").is_some(), "both show speed: {e}");
+            assert!(e.get("colour").is_none(), "the engine hides colour: {e}");
+            assert!(e.get("secret").is_none(), "the view hides secret: {e}");
+        }
+    }
+
+    /// A write under a view is a narrowed write, which the seam refuses
+    /// until writes through a view exist (ADR-0023 rule 7, T-3498).
+    #[tokio::test]
+    async fn a_write_under_a_view_is_refused() {
+        let st = seeded(None).await;
+        let view = st.with_view(Arc::new(cars()));
+        let car = json!({"id": "urn:ngsi-ld:Car:9", "type": "Car"});
+        let (s, body, _) = send(&view, "POST", "/ngsi-ld/v1/entities", Some(car)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+    }
+
+    #[test]
+    fn a_view_that_names_nothing_is_refused() {
+        assert!(
+            CompiledView::new(&[], None, None, None, vec![rule(&["Car"], None, &["a"])]).is_err()
+        );
+        assert!(CompiledView::new(&["Car".into()], None, None, None, vec![]).is_err());
+        assert!(
+            CompiledView::new(
+                &["Car".into()],
+                None,
+                None,
+                None,
+                vec![rule(&["Bike"], None, &["a"])]
+            )
+            .is_err(),
+            "a rule outside the selector shows nothing"
+        );
+    }
+
+    #[test]
+    fn rules_pair_and_disjoint_types_show_nothing() {
+        let view = vec![rule(&["Car"], Some("speed>1"), &["speed", "colour"])];
+        let engine = vec![rule(
+            &["Car", "Bike"],
+            Some("colour==\"red\""),
+            &["speed", "secret"],
+        )];
+        let both = pair_rules(&view, engine).expect("pairs");
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].types, vec!["Car"]);
+        assert_eq!(both[0].attributes, vec!["speed"]);
+        assert!(matches!(both[0].q.as_deref(), Some(QNode::And(v)) if v.len() == 2));
+
+        let none = pair_rules(&view, vec![rule(&["Bike"], None, &["speed"])]).expect("pairs");
+        assert_eq!(
+            none,
+            vec![Rule::default()],
+            "a rule with no type holds for nothing"
+        );
+        let doc = json!({"id": "urn:ngsi-ld:Car:1", "type": "Car", "speed": {"type": "Property", "value": 9}});
+        let f = Filter {
+            rules: none,
+            ..Filter::default()
+        };
+        assert!(f.shown(&doc, crate::repr::policy_context()).is_none());
+    }
+
+    #[test]
+    fn neither_side_widens() {
+        let a = Filter {
+            pick: vec!["speed".into()],
+            omit: vec!["x".into()],
+            scope_q: Some("/a".into()),
+            ..Filter::default()
+        };
+        let b = Filter {
+            pick: vec!["colour".into()],
+            omit: vec!["y".into()],
+            scope_q: Some("/a/b".into()),
+            restricted: true,
+            ..Filter::default()
+        };
+        let f = compose(&a, b).expect("composes");
+        assert_eq!(f.pick, vec![NOTHING], "disjoint picks keep the frame alone");
+        assert_eq!(f.omit, vec!["y", "x"]);
+        assert!(f.scope_q.is_some() && f.restricted);
+        assert_eq!(
+            compose(&Filter::default(), Filter::default()).expect("empty"),
+            Filter::default()
+        );
+    }
+
+    /// A `within` box from longitude `west` to `east`, 1 degree either side
+    /// of the equator.
+    fn band(west: f64, east: f64) -> antares_ql::geo::GeoQuery {
+        let params = std::collections::HashMap::from([
+            ("georel".to_owned(), "within".to_owned()),
+            ("geometry".to_owned(), "Polygon".to_owned()),
+            (
+                "coordinates".to_owned(),
+                json!([[
+                    [west, -1.0],
+                    [east, -1.0],
+                    [east, 1.0],
+                    [west, 1.0],
+                    [west, -1.0]
+                ]])
+                .to_string(),
+            ),
+        ]);
+        antares_ql::geo::GeoQuery::from_params(&params)
+            .expect("parses")
+            .expect("present")
+    }
+
+    /// A Car at longitude `lon` in the internal form `Rule::holds` reads.
+    fn car_at(lon: f64) -> Value {
+        let ctx = crate::repr::policy_context();
+        json!({"id": "urn:ngsi-ld:Car:x", "type": [ctx.expand_key("Car")],
+               (antares_ql::geo::LOCATION_IRI): [{"type": "GeoProperty",
+                   "value": {"type": "Point", "coordinates": [lon, 0.0]}}]})
+    }
+
+    /// ADR-0023 rule 1: a view's area and an engine's area at the same level
+    /// compose, and every one holds. Dropping either would widen.
+    #[test]
+    fn two_areas_compose_and_both_hold() {
+        let ctx = crate::repr::policy_context();
+        let car = ctx.expand_key("Car");
+        let a = Filter {
+            geo_q: Some(Box::new(band(0.0, 2.0))),
+            rules: vec![Rule {
+                geo_q: Some(Box::new(band(0.0, 2.0))),
+                ..rule(&[&car], None, &["speed"])
+            }],
+            ..Filter::default()
+        };
+        let b = Filter {
+            geo_q: Some(Box::new(band(1.0, 3.0))),
+            rules: vec![Rule {
+                geo_q: Some(Box::new(band(1.0, 3.0))),
+                ..rule(&[&car], None, &["speed"])
+            }],
+            ..Filter::default()
+        };
+        let both = compose(&a, b).expect("two areas compose");
+        assert_eq!(both.areas().count(), 2, "{both:?}");
+        assert_eq!(both.rules.len(), 1);
+        let pair = &both.rules[0];
+        assert_eq!(pair.areas().count(), 2);
+        assert!(pair.holds(&car_at(1.5), ctx), "inside both");
+        assert!(!pair.holds(&car_at(0.5), ctx), "inside the view's only");
+        assert!(!pair.holds(&car_at(2.5), ctx), "inside the engine's only");
+        // three levels deep: a composed narrowing composes again
+        let again = compose(
+            &both,
+            Filter {
+                geo_q: Some(Box::new(band(1.4, 1.6))),
+                ..Filter::default()
+            },
+        )
+        .expect("three areas compose");
+        assert_eq!(again.areas().count(), 3);
+    }
+
+    #[test]
+    fn too_many_rules_are_refused() {
+        let many: Vec<Rule> = (0..65).map(|_| rule(&["Car"], None, &["a"])).collect();
+        assert!(pair_rules(&many, many.clone()).is_err());
+    }
+
+    /// A view's area and an engine's area both narrow a query, its count
+    /// and its pages; the request's own area still applies on top.
+    #[tokio::test]
+    async fn a_view_area_and_an_engine_area_both_narrow_the_query() {
+        let mut st = AppState::new("me".into()).with_policy(Arc::new(Narrowing(Filter {
+            geo_q: Some(Box::new(band(-0.5, 1.5))),
+            ..Filter::default()
+        })));
+        crate::wire(&mut st).await;
+        for lon in 0..4 {
+            let car = json!({"id": format!("urn:ngsi-ld:Car:at{lon}"), "type": "Car",
+                "speed": {"type": "Property", "value": lon},
+                "location": {"type": "GeoProperty",
+                             "value": {"type": "Point", "coordinates": [lon, 0]}}});
+            let (s, b, _) = send(&st, "POST", "/ngsi-ld/v1/entities", Some(car)).await;
+            assert_eq!(s, StatusCode::CREATED, "{s} {b}");
+        }
+        let view = CompiledView::new(
+            &["Car".into()],
+            None,
+            None,
+            Some(band(0.5, 3.5)),
+            vec![rule(&["Car"], None, &["speed", "location"])],
+        )
+        .expect("view");
+        let view = st.with_view(Arc::new(view));
+        let (s, body, headers) = send(
+            &view,
+            "GET",
+            "/ngsi-ld/v1/entities?type=Car&count=true&limit=1",
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        assert_eq!(ids(&body), vec!["urn:ngsi-ld:Car:at1"], "only inside both");
+        assert_eq!(
+            headers
+                .get("NGSILD-Results-Count")
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let (_, body, _) = send(
+            &view,
+            "GET",
+            "/ngsi-ld/v1/entities?type=Car&limit=1&offset=1",
+            None,
+        )
+        .await;
+        assert_eq!(ids(&body), Vec::<String>::new(), "no second page");
+        let (_, body, _) = send(
+            &view,
+            "GET",
+            "/ngsi-ld/v1/entities?type=Car&georel=within&geometry=Polygon&coordinates=%5B%5B%5B1.5%2C-1%5D%2C%5B3.5%2C-1%5D%2C%5B3.5%2C1%5D%2C%5B1.5%2C1%5D%2C%5B1.5%2C-1%5D%5D%5D",
+            None,
+        )
+        .await;
+        assert_eq!(
+            ids(&body),
+            Vec::<String>::new(),
+            "the request's area on top"
+        );
+    }
+
+    #[test]
+    fn without_a_view_the_engines_answer_is_unchanged() {
+        let f = Filter {
+            pick: vec!["a".into()],
+            ..Filter::default()
+        };
+        assert_eq!(with_view(None, "5.6.1", Ok(f.clone())), Ok(f));
+        assert_eq!(
+            with_view(Some(&cars()), "5.7.2", Err(Denied("no".into()))),
+            Err(Denied("no".into()))
+        );
+    }
+}

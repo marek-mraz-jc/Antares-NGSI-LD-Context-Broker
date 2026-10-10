@@ -49,6 +49,7 @@ fn slot(kind: Kind) -> u8 {
         Kind::EntityMap => 6,
         Kind::DistSub => 7,
         Kind::DeadLetter => 8,
+        Kind::View => 9,
     }
 }
 

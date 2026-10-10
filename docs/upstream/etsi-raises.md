@@ -394,3 +394,169 @@ RFC 9110 give, and takes the HEAD request's @context from its Link header as
 
 Suggest dropping the 204 sentence from clause 5, or, if 204 is meant, adding
 a HEAD row with 204 to each GET/HEAD table of clause 7.
+
+---
+
+## 15. [suite] 020_17 to 020_20 delete an Attribute of an Entity that exists only as a temporal evolution
+
+**Title:** 020_17..020_20 set up with `POST /temporal/entities` alone, then
+call `DELETE /entities/{id}/attrs/{attrId}`
+
+**Body:**
+
+Delete Attribute (CIM 009 5.6.5.4) raises ResourceNotFound when no Entity
+is held locally; a temporal evolution created by 5.6.11 is not one, and
+5.6.13 is the operation that deletes from it. The setup creates only the
+temporal evolution, so a compliant broker answers 404 and writes no
+`deletedAt` instance. Suggest creating the current-state Entity in the
+setup and deleting it in the teardown, as the corrected fork does (forge
+commits f7c78f94 and 94789a66); Antares carries that fix and answers 404
+(`temporal_autorecord.rs::delete_attribute_of_a_temporal_only_entity_is_not_found`).
+
+---
+
+## 16. [suite] 020_19 and 020_20 expect a deleted scope as an empty array
+
+**Title:** the 020_19/020_20 expectations show a deleted scope as `[]`
+
+**Body:**
+
+CIM 009 4.18 reserves `urn:ngsi-ld:null` for deleted scopes, and 4.5.0
+uses it for every deleted element of the temporal representation. The
+expectation files carry `"value": []` (and `[]` in `temporalValues`).
+Suggest `"urn:ngsi-ld:null"`, as the corrected fork does (forge commit
+fad5ab03); Antares carries that fix
+(`temporal_autorecord.rs::deleted_scope_is_the_ngsi_ld_null_in_the_temporal_representation`).
+
+---
+
+## 17. [spec] TS 104 176 answers Create and Clone Snapshot with 202, CIM 009 with 201, and gives no version to ask for either
+
+**Title:** TS 104 176 13.2.3.1 and 13.4.3.1 change 201 Created to 202
+Accepted with no migration rule
+
+**Body:**
+
+CIM 009 V1.9.1 6.36.3.1 and 6.38.3.1 answer "201 Created" with the
+Location of the created snapshot. TS 104 176 13.2.3.1 and 13.4.3.1 answer
+"202 Accepted" with "the relative path of the snapshot being created". The
+snapshot fills after the answer in both texts (5.16.1.4: the status moves
+to `ready` when every query has run), so 202 fits the operation, but a
+client written against CIM 009 reads 202 as a different outcome, and the
+Snapshot TPs assert 201.
+
+A broker could serve both through `Prefer: ngsi-ld=<version>` (4.3.6.8,
+TS 104 175 9.5.3), except that TS 104 175 states no `major.minor` of its
+own, so no client can prefer it.
+
+Antares answers 201, the CIM 009 status it states conformance to, and
+records the conflict here (T-3555). Suggest giving the TS 104 175 family a
+version a `Prefer` header can name, or keeping 201 for a snapshot created
+synchronously and 202 only where the creation itself is deferred.
+
+---
+
+## 18. [suite] 021_08 expects speed instances that fail the query
+
+**Title:** the 021_08 expectation keeps every instance of the selected
+Entity, including those that fail `q`
+
+**Body:**
+
+CIM 009 5.7.4.4, last step: "include in their temporal representation only
+the Attribute instances ... which meet the temporal, query and geoquery
+restrictions". 021_08 queries `q=speed>90` and its expectation still lists
+the speed instances below 90. Suggest dropping them, as the corrected fork
+does (forge commit 9ca4213e); Antares carries that fix
+(`temporal_autorecord.rs::temporal_query_keeps_only_the_instances_that_meet_q`).
+The clause does not say how an instance meets a `q` over several
+Attributes; Antares keeps an instance when `q` holds on the Entity with that
+Attribute narrowed to that one instance.
+
+---
+
+## 19. [suite] 037_11 and 041_03 ask without Accept and expect ld+json pagination Links
+
+**Title:** 037_11/041_03 expect `type="application/ld+json"` on the
+pagination Links of an `application/json` response
+
+**Body:**
+
+CIM 009 6.3.10: the type Link Target Attribute "shall be exactly equal to
+the media type resulting from the original request". Both test points query
+without an Accept header, so the response is `application/json`, and still
+expect `type="application/ld+json"`. Suggest sending
+`Accept: application/ld+json`, as the corrected fork does (forge commit
+c4cdb0cf, and the same line in its 037_11); Antares carries that fix and
+types every pagination Link after the response media type
+(`registration_listing_5_10_2.rs::a_registration_page_link_carries_the_requested_media_type`).
+
+---
+
+## 20. [suite] 051_04_01 expects BadRequestData for an unknown @context id with reload=true
+
+**Title:** 051_04_01 expects 400 where 5.13.5.4 raises ResourceNotFound
+
+**Body:**
+
+CIM 009 5.13.5.4, second bullet: "If the @context identifier does not
+correspond to any existing entry in the @context storage, then an error of
+type ResourceNotFound shall be raised." The reload bullets that follow
+describe an existing @context by its kind. 051_04_01 deletes an unknown id
+with `reload=true` and expects 400 BadRequestData. Suggest 404
+ResourceNotFound, as the corrected fork does (forge commit 39921641);
+Antares carries that fix
+(`contexts_5_13.rs::clause_5_13_5_delete_and_reload_errors`).
+
+---
+
+## 21. [suite] 008_01 expects a second temporal upsert to overwrite instances at the same observedAt
+
+**Title:** the 008_01 expectation drops instances that the second
+`POST /temporal/entities` must add
+
+**Body:**
+
+CIM 009 5.6.11.4: for a known Temporal Evolution "all the Attribute
+instances included by the Temporal Evolution shall be added to the existing
+Entity as mandated by clause 5.6.12". An instance is identified by its
+system-generated instanceId, not by observedAt. The 008_01 expectation reuses
+the update payload, so instances that share an observedAt with the first
+POST are replaced and duplicates collapse. Suggest the union of both
+payloads, as the corrected fork does (forge commit 167fa185); Antares
+carries that fix
+(`temporal_dedup.rs::a_second_temporal_upsert_at_the_same_instant_appends`).
+
+---
+
+## 22. [suite] 046_22_08 reads a deleted three-instance Attribute as one object
+
+**Title:** 046_22_08 asserts `['name']['value']` on an Attribute whose three
+instances were deleted
+
+**Body:**
+
+`name` in building-multi-instances-attributes has the default instance and
+two datasetIds, and 046_22_08 deletes all of them. CIM 009 5.8.6 represents
+each deleted instance with the NGSI-LD Null and its datasetId, so the
+notification carries an Array of three, as it would for the live Attribute.
+The assertion indexes a single object. Suggest asserting three instances,
+each `urn:ngsi-ld:null`, as the corrected fork does (forge commit
+75ba471d); Antares carries that fix
+(`notify.rs::whole_attribute_versus_per_instance_deletion`).
+
+---
+
+## 23. [suite] 046_05 percent-encodes the q of a Subscription body
+
+**Title:** the 046_05 Subscription carries `q` as `name=="Eiffel%20Tower"`
+
+**Body:**
+
+CIM 009 Table 5.2.12-1 types a Subscription's `q` as a string holding a
+4.9 query, and the Subscription travels as a JSON body, not in a URI, so
+4.9's percent-encoding rule for query strings does not apply. Read as
+written, the q matches only an Entity whose name is the literal
+`Eiffel%20Tower`. Suggest `name=="Eiffel Tower"`, as the corrected fork
+does (forge commit cd2ef2ba); Antares carries that fix and reads the q as
+written (`antares-matcher::a_subscription_q_is_not_percent_decoded`).

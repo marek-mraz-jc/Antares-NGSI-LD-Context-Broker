@@ -96,7 +96,7 @@ fn now_stamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-const ALL_KINDS: [Kind; 9] = [
+const ALL_KINDS: [Kind; 10] = [
     Kind::Entity,
     Kind::Subscription,
     Kind::Registration,
@@ -106,6 +106,7 @@ const ALL_KINDS: [Kind; 9] = [
     Kind::EntityMap,
     Kind::DistSub,
     Kind::DeadLetter,
+    Kind::View,
 ];
 
 /// Run `f` off the tokio worker pool when called from a multi-thread runtime:
@@ -171,6 +172,7 @@ struct Inner {
     entity_map_docs: HashMap<String, BTreeMap<String, Value>>,
     dist_subs: HashMap<String, BTreeMap<String, Value>>,
     dead_letters: HashMap<String, BTreeMap<String, Value>>,
+    views: HashMap<String, BTreeMap<String, Value>>,
     /// tenant → entity id → temporal doc (attr IRI → instance array).
     temporal: HashMap<String, BTreeMap<String, Value>>,
     /// hosted/cached @context documents, shared across tenants by design.
@@ -265,6 +267,7 @@ impl Store {
                 Kind::EntityMap => &mut inner.entity_map_docs,
                 Kind::DistSub => &mut inner.dist_subs,
                 Kind::DeadLetter => &mut inner.dead_letters,
+                Kind::View => &mut inner.views,
             };
             for row in ::redb::ReadableTable::iter(&table).map_err(|e| e.to_string())? {
                 let (k, v) = row.map_err(|e| e.to_string())?;
@@ -593,6 +596,7 @@ impl Store {
             Kind::EntityMap => &inner.entity_map_docs,
             Kind::DistSub => &inner.dist_subs,
             Kind::DeadLetter => &inner.dead_letters,
+            Kind::View => &inner.views,
         }
     }
 
@@ -607,6 +611,7 @@ impl Store {
             Kind::EntityMap => &mut inner.entity_map_docs,
             Kind::DistSub => &mut inner.dist_subs,
             Kind::DeadLetter => &mut inner.dead_letters,
+            Kind::View => &mut inner.views,
         }
     }
 
@@ -813,6 +818,127 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// Query Entities (T-3556) on the stored documents, under the read
+    /// lock: ids, the idPattern literal, types and attrs are tested on the
+    /// borrowed documents and only what the answer holds is copied, where a
+    /// snapshot of the tenant used to be. ids, types and attrs are exact
+    /// here, and so is a `q` without linked-entity terms when the request
+    /// @context comes along: it runs through the API's own evaluator
+    /// (T-3572). Without anything else (`scopeQ`, a geo query, a linked
+    /// term) the outcome is `decided`: the projection applies and a page is
+    /// cut in id order (the map's order), counted when asked. Otherwise the
+    /// caller stays the arbiter over the narrowed rows. 4.22: an expired
+    /// Entity is not a match, before any cut; its expired instances are the
+    /// caller's.
+    pub fn query_entities(
+        &self,
+        tenant: &TenantId,
+        f: &filter::EntityFilter<'_>,
+    ) -> filter::QueryOutcome {
+        let now = crate::store::any::now_utc();
+        // a linked term reads other Entities under the caller's narrowing
+        let q = match (f.q, f.ctx) {
+            (Some(q), Some(ctx)) if !q.has_linked_paths() => Some((q, ctx)),
+            _ => None,
+        };
+        let decided = (f.q.is_none() || q.is_some()) && f.scope_q.is_none() && f.geo.is_empty();
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(m) = Self::map(&inner, Kind::Entity).get(tenant.as_str()) else {
+            return filter::QueryOutcome {
+                rows: Vec::new(),
+                decided,
+                paged: decided && f.page.is_some(),
+                total: f.page.as_ref().filter(|_| decided).map(|_| 0),
+            };
+        };
+        let matches = |id: &str, doc: &Value| {
+            !filter::expired_at(doc, &now)
+                && f.id_literal.is_none_or(|l| {
+                    if l.anchored {
+                        id.starts_with(l.text)
+                    } else {
+                        id.contains(l.text)
+                    }
+                })
+                && f.types.is_none_or(|sel| {
+                    let held: Vec<&str> = doc["type"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    sel.iter()
+                        .any(|group| group.iter().all(|w| held.contains(&w.as_str())))
+                })
+                && f.attrs
+                    .is_none_or(|attrs| attrs.iter().any(|a| has_live_attr(doc, a, &now)))
+                && q.is_none_or(|(q, ctx)| antares_ql::eval::eval_q(q, doc, ctx, &|_| None))
+        };
+        // ids name at most what the client sent: look each up, in id order
+        let candidates: Box<dyn Iterator<Item = (&String, &Value)>> = match f.ids {
+            Some(ids) => {
+                let mut want: Vec<&str> = ids.to_vec();
+                want.sort_unstable();
+                want.dedup();
+                Box::new(want.into_iter().filter_map(|id| m.get_key_value(id)))
+            }
+            None => Box::new(m.iter()),
+        };
+        let hits = candidates
+            .filter(|(id, doc)| matches(id, doc))
+            .map(|(_, d)| d);
+        let project = |doc: &Value| {
+            let mut v = doc.clone();
+            if decided {
+                if let Some(o) = v.as_object_mut() {
+                    if let Some(keep) = f.keep_attrs {
+                        o.retain(|k, _| !k.starts_with("http") || keep.contains(k));
+                    } else if let Some(drop) = f.drop_attrs {
+                        o.retain(|k, _| !drop.contains(k));
+                    }
+                }
+            }
+            v
+        };
+        let Some(p) = f.page.as_ref().filter(|_| decided) else {
+            return filter::QueryOutcome {
+                rows: hits.map(project).collect(),
+                decided,
+                paged: false,
+                total: None,
+            };
+        };
+        let offset = usize::try_from(p.offset).unwrap_or(0);
+        let limit = usize::try_from(p.limit).unwrap_or(usize::MAX);
+        let mut rows: Vec<Value> = Vec::new();
+        let (mut matched, mut more) = (0usize, false);
+        for doc in hits {
+            if matched >= offset && rows.len() < limit {
+                rows.push(project(doc));
+            } else if rows.len() == limit && !p.count {
+                more = true;
+                break;
+            }
+            // the rest is counted, never copied
+            matched = matched.saturating_add(1);
+        }
+        let total = if p.count {
+            matched
+        } else {
+            // the smallest total consistent with "a next page exists"
+            offset
+                .saturating_add(rows.len())
+                .saturating_add(usize::from(more))
+        };
+        filter::QueryOutcome {
+            rows,
+            decided,
+            paged: true,
+            total: Some(i64::try_from(total).unwrap_or(i64::MAX)),
+        }
+    }
+
     /// One id-ordered window of docs and the size of the whole set. The
     /// per-tenant map is a `BTreeMap` keyed by id, so the window is a skip
     /// over an already-ordered iterator.
@@ -976,6 +1102,19 @@ impl Store {
                 row
             })
             .collect()
+    }
+}
+
+/// Whether `doc` holds Attribute `iri` once 4.22 has stripped its expired
+/// instances: an instance array keeps it while one instance is live, as
+/// `filter::strip_expired` decides.
+fn has_live_attr(doc: &Value, iri: &str, now: &str) -> bool {
+    match doc.get(iri) {
+        Some(Value::Array(arr)) if iri.contains(':') => {
+            arr.is_empty() || arr.iter().any(|i| !filter::expired_at(i, now))
+        }
+        Some(_) => true,
+        None => false,
     }
 }
 

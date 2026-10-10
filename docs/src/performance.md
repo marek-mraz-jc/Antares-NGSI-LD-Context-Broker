@@ -370,6 +370,28 @@ What the run says:
   path components, so a later run carries a broker CPU column for every
   stage; the rows above are left as they were measured.
 
+## Soak (`soak`)
+
+`dev/soak.py` holds one broker for hours at a fixed low rate: 4 workers at
+2 cycles a second each. Every worker owns its Entities, so the expected
+state is known exactly. A cycle creates an Entity, PATCHes it, reads it
+back, counts the worker's live Entities, batch creates, updates and deletes
+three more, creates and deletes a throwaway Subscription, and deletes the
+Entity. A Subscription per worker makes each PATCH one notification due at
+the script's own receiver. The run fails on:
+
+- an answer other than the operation's own status;
+- a read-back or a count off what was written;
+- a notification not received;
+- RssAnon growing more than max(25 %, 16 MiB) past its value at the end of
+  the warm-up (a tenth of the run);
+- an ERROR or a panic in the broker log.
+
+`soak.yml` runs it per store (memory, file, postgres) on a hosted runner,
+120 minutes by default. `full.yml` calls it on `v*` tags and by hand, and
+it runs by itself when the soak changes. `python3 dev/soak.py --selftest`
+plants a failure in each judge.
+
 ## How each measurement works
 
 No rig script is a unit test. Every one starts a real broker, drives it
