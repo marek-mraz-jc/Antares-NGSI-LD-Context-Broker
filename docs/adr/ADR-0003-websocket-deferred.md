@@ -1,6 +1,6 @@
 # ADR-0003: WebSocket binding deferred out of v1
 
-Date: 2026-08-03 · Status: accepted
+Date: 2026-08-03 · Status: accepted, superseded by ADR-0026
 
 The draft ngsi-ld-ws binding is NOT implemented in v1. Structural: the
 whole binding is scoped to a future `antares-ws` crate behind cargo feature
