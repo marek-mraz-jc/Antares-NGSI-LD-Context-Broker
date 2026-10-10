@@ -193,10 +193,26 @@ The 88 implemented or partial clauses of chapter 4 carry their TS 104 175 verdic
 | 4.16 | 5.2.3 | two should-rules for @context authors | not a broker rule |
 | 4.22, 4.8 | 5.2.4 | expiresAt restated; a Context Source omits an unknown TemporalProperty | compliant |
 
+### 4.2 Chapter 5
+
+The 266 implemented or partial clauses of chapter 5 carry their verdict the same way (`grep -h 'TS 104 175' docs/spec/5/*.md`). 131 have a changed sentence; most are the new clause numbers, "follow" become "comply with", and the operation behaviours restating the exclusive and redirect forwarding per operation. One is non-compliant.
+
+| Ledger clause | TS 104 175 | What changed | Verdict |
+|---|---|---|---|
+| 5.13.4.4 | 13.4.3, 13.4.4 | Serve @context takes `core` (major.minor): a [user URL, core URL] array; BadRequest when malformed or with `details` | non-compliant: `contexts.rs` refuses `core` with 400; T-3553 |
+| 5.2.5 to 5.2.7, 5.2.32, 5.2.35 to 5.2.38 | 5.2.6.4.x | the prohibited members of CIM 009 4.5.x moved into the data-type tables; `ngsildProof` added | compliant (`check_prohibited_members`); `ngsildProof` is TS 104 179 (3.9) |
+| 5.2.12, 5.2.14.1, 5.2.14.2 | 5.2.6.5.2, 5.2.6.7.3 | members a CSourceSubscription and its notification ignore | 3.7 (T-3452) |
+| 5.2.10, 5.10.2.4 | 5.2.6.6.5, 12.3.3.4 | attributeNames before propertyNames and relationshipNames | 3.6 (T-3451) |
+| 5.12, 5.5.14 | 9.4, 9.6 | matching rules regrouped; Entity Map rules gathered in 9.6 | compliant (4.1) |
+| 5.7.3.3, 5.7.4.3 | 11.3.2.3, 11.3.3.3 | firstN | 3.2 (T-3456) |
+| 5.8.6 | 10.5.7 | notification bookkeeping and formats restated, ngsildConformance amendment | compliant |
+| 5.14.1.5, 5.16.7.5 | 14.2.5, 16.7.5 | the script paired them wrongly; placed by hand | unchanged |
+
 ## 5. Gaps and their tasks
 
 | Task | Gap | Kind |
 |---|---|---|
+| T-3553 | Serve @context `core` parameter (4.2) | non-compliant |
 | T-3450 | Set Attribute Value `PUT …/attrs/{attrId}/value` (3.10) | compliant |
 | T-3451 | `RegistrationInfo.attributeNames` not matched (3.6) | non-compliant, security (over-forwarding) |
 | T-3452 | CSR subscription ignores `geoQ.geoproperty`; ignore list untested (3.7) | non-compliant |
