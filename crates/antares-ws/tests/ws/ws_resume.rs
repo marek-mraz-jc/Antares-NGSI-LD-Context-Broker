@@ -34,6 +34,9 @@ async fn seen_then_dropped(
     b.http.car(None, "urn:ngsi-ld:Car:r", 0).await?;
     let mut c = connect(b.addr, ROOT, headers).await?;
     assert_eq!(status(&c.subscribe(cars()).await?), 201);
+    // each read before the next change: two changes queued together
+    // would coalesce into one notification (rule 6)
+    let mut got = Vec::new();
     for v in 1..=seen {
         b.http
             .speed(
@@ -42,8 +45,8 @@ async fn seen_then_dropped(
                 i64::try_from(v).map_err(|e| e.to_string())?,
             )
             .await?;
+        got.extend(seqs(&mut c, 1).await?);
     }
-    let got = seqs(&mut c, usize::try_from(seen).map_err(|e| e.to_string())?).await?;
     assert_eq!(got, (1..=seen).collect::<Vec<_>>());
     let ids = (c.connection.clone(), c.token.clone());
     c.close().await;

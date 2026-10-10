@@ -390,6 +390,28 @@ impl Client {
     }
 }
 
+/// A notification of `subscription` as the notifier hands it to a sink.
+pub fn outbound(subscription: Option<&str>, tenant: Option<&str>) -> antares_ops::Outbound {
+    let mut body = json!({
+        "id": "urn:ngsi-ld:Notification:1", "type": "Notification",
+        "notifiedAt": "2026-10-10T00:00:00Z",
+        "data": [{"id": "urn:ngsi-ld:Car:r", "type": "Car", "speed": {"type": "Property", "value": 7}}]
+    });
+    if let (Some(s), Some(o)) = (subscription, body.as_object_mut()) {
+        o.insert("subscriptionId".into(), s.into());
+    }
+    antares_ops::Outbound {
+        body,
+        accept: "application/json".into(),
+        link: String::new(),
+        receiver_info: tenant
+            .map(|t| ("NGSILD-Tenant".to_owned(), t.to_owned()))
+            .into_iter()
+            .collect(),
+        notifier_info: Vec::new(),
+    }
+}
+
 /// A Subscription to Cars' `speed`.
 #[must_use]
 pub fn cars() -> Value {

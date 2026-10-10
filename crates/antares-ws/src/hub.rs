@@ -523,9 +523,9 @@ impl Hub {
         let Some(relay) = self.relay() else {
             return Answer::Unknown;
         };
-        let Ok(payload) = serde_json::to_vec(&n) else {
-            return Answer::Unknown;
-        };
+        // a Forwarded always serializes; an empty payload would be Unknown
+        // on the other side
+        let payload = serde_json::to_vec(&n).unwrap_or_default();
         relay
             .request(id, payload)
             .await

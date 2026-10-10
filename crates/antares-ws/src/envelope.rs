@@ -270,9 +270,19 @@ mod tests {
             r#"{"metadata":{"x-op":"x-subscribe","x-id":"1"},"body":{"type":"Subscription"}}"#,
         )?;
         assert_eq!(sub.id.as_deref(), Some("1"));
-        assert!(matches!(sub.op, ClientOp::Subscribe(ref b) if b.contains_key("type")));
+        let mut body = Map::new();
+        body.insert("type".into(), Value::String("Subscription".into()));
+        assert_eq!(sub.op, ClientOp::Subscribe(body));
         let up = read(r#"{"metadata":{"x-op":"x-update","x-subscription":"s"},"body":{"q":"a"}}"#)?;
-        assert!(matches!(up.op, ClientOp::Update { ref subscription, .. } if subscription == "s"));
+        let mut fragment = Map::new();
+        fragment.insert("q".into(), Value::String("a".into()));
+        assert_eq!(
+            up.op,
+            ClientOp::Update {
+                subscription: "s".into(),
+                fragment
+            }
+        );
         let resume = read(
             r#"{"metadata":{"x-op":"x-resume","x-connection":"c","x-resume-token":"t","x-seq":7}}"#,
         )?;

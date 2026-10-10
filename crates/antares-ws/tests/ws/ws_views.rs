@@ -44,6 +44,9 @@ async fn ws_a_removed_view_stops_delivery() -> Result<(), String> {
         "{n}"
     );
 
+    // a few heartbeats while the view stands and the socket holds a
+    // Subscription
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let (code, answer) = b.http.call("DELETE", "/q/views/cars", &[], None).await?;
     assert_eq!(code, 204, "{answer}");
     b.http.speed(city, "urn:ngsi-ld:Car:v", 2).await?;

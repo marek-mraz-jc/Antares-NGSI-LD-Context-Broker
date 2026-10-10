@@ -59,3 +59,67 @@ function = "Server::call" # v0 mangling puts the impl between the crate and the 
 lines = 5
 branches = 0
 reason = "tracing::info! repeats the fields in its `log` fallback, which runs only with no subscriber set; tests/mcp_log.rs covers the subscriber path and asserts what it logs"
+
+[[exclusion]]
+crate = "antares-ws"
+file = "src/random.rs"
+function = "antares_ws::random::bytes"
+lines = 1
+branches = 1
+reason = "the operating system refusing randomness: getrandom cannot be made to fail from a test, and the process aborts there by design (an all-zero id would be guessable)"
+
+[[exclusion]]
+crate = "antares-ws"
+file = "src/hub.rs"
+function = "Hub::open"
+lines = 1
+branches = 1
+reason = "two 128-bit random connection ids colliding: the retry loop is the guard, no test can draw a collision"
+
+[[exclusion]]
+crate = "antares-ws"
+file = "src/hub.rs"
+function = "Conn::detach"
+lines = 1
+branches = 1
+reason = "a socket that ends by itself (Gone, a close) in the instant after a resume took its connection over: the resume wakes the old session first, which then always ends as TakenOver (ws_a_resume_takes_over_an_attached_connection covers that path)"
+
+[[exclusion]]
+crate = "antares-ws"
+file = "src/lib.rs"
+function = "antares_ws::upgrade"
+lines = 1
+branches = 0
+reason = "on_failed_upgrade runs when hyper fails the upgrade after the 101 was sent, an I/O failure inside hyper no client request produces"
+
+[[exclusion]]
+crate = "antares-ws"
+file = "src/socket.rs"
+function = "Session::resume"
+lines = 1
+branches = 1
+reason = "the socket breaking while the replay is written, in the instant between reading x-resume and writing its answer; the write deadline itself is covered by ws_a_slow_consumer_is_disconnected_not_buffered"
+
+[[exclusion]]
+crate = "antares-ws"
+file = "src/socket.rs"
+function = "Session::tick"
+lines = 1
+branches = 1
+reason = "a heartbeat that finds its connection taken over: a resume wakes the old session, whose drain sees the takeover first (covered), so the tick is a backstop for a wake the new session consumed"
+
+[[exclusion]]
+crate = "antares-ws"
+file = "src/socket.rs"
+function = "Session::run"
+lines = 1
+branches = 1
+reason = "the welcome write failing: it is the first frame on a socket the upgrade just opened, with an empty send buffer"
+
+[[exclusion]]
+crate = "antares-ws"
+file = "src/socket.rs"
+function = "antares_ws::socket::serve"
+lines = 8
+branches = 1
+reason = "tracing::info! repeats the fields in its `log` fallback, which runs only with no subscriber set (ws_log covers the subscriber path and asserts what it logs); and the branch where detach finds the connection taken over, see Conn::detach"

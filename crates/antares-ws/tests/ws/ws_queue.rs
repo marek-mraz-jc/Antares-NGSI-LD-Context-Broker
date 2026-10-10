@@ -5,9 +5,11 @@
 //! predecessor.
 
 use crate::common::{
-    broker, broker_alone, connect, connect_small, status, until, with, Client, WAIT,
+    broker, broker_alone, cars, connect, connect_small, outbound, status, text, until, with,
+    Client, WAIT,
 };
-use antares_ws::Limits;
+use antares_ops::NotificationSink;
+use antares_ws::{Limits, Sink, ENDPOINT_PREFIX};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -34,14 +36,16 @@ async fn speeds(c: &mut Client, count: usize) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
-/// A client that stops reading while 120 Cars of 200 KiB each are created
-/// loses its socket, either because its queue overflowed (`x-gap`, 1013)
-/// or because a write stayed stuck for `pong_within`, whichever comes
-/// first; and it reads far fewer notifications than were matched: the
-/// server held at most `queue` of them beyond what the socket took.
+/// A client that stops reading while 120 notifications of 200 KiB each
+/// are offered loses its socket, either because its queue overflowed
+/// (`x-gap`, 1013) or because a write stayed stuck for `pong_within`,
+/// whichever comes first; and it reads far fewer notifications than were
+/// offered: the server held at most `queue` of them beyond what the socket
+/// took. The offers go through the sink, as the notifier makes them, so
+/// how fast the notifier matches does not decide the outcome.
 #[tokio::test(flavor = "multi_thread")]
 async fn ws_a_slow_consumer_is_disconnected_not_buffered() -> Result<(), String> {
-    const CARS: usize = 120;
+    const OFFERS: usize = 120;
     let b = broker_alone(Limits {
         queue: 4,
         pong_within: Duration::from_secs(2),
@@ -49,19 +53,27 @@ async fn ws_a_slow_consumer_is_disconnected_not_buffered() -> Result<(), String>
     })
     .await?;
     let mut c = connect_small(b.addr, 16 * 1024).await?;
-    let sub = json!({"type": "Subscription", "entities": [{"type": "Car"}], "watchedAttributes": ["blob"]});
-    assert_eq!(status(&c.subscribe(sub).await?), 201);
-    let blob = "b".repeat(200 * 1024);
-    for i in 0..CARS {
-        let body = json!({"id": format!("urn:ngsi-ld:Car:slow{i}"), "type": "Car",
-                          "blob": {"type": "Property", "value": blob}});
-        let (code, answer) = b
-            .http
-            .call("POST", "/ngsi-ld/v1/entities", &[], Some(&body))
-            .await?;
-        assert_eq!(code, 201, "{answer}");
+    let made = c.subscribe(cars()).await?;
+    assert_eq!(status(&made), 201, "{made}");
+    let mut out = outbound(Some(&text(&made, "/body/id")), None);
+    // two Entities, so no offer replaces a queued one
+    out.body = with(
+        out.body,
+        &["data"],
+        json!([{"id": "urn:ngsi-ld:Car:s1", "type": "Car", "blob": {"type": "Property", "value": "b".repeat(200 * 1024)}},
+               {"id": "urn:ngsi-ld:Car:s2", "type": "Car"}]),
+    );
+    let sink = Sink::new(b.hub.clone());
+    let endpoint = format!("{ENDPOINT_PREFIX}{}", c.connection);
+    let mut refused = 0usize;
+    for _ in 0..OFFERS {
+        if sink.deliver(&endpoint, &out, WAIT).await.is_err() {
+            refused = refused.saturating_add(1);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     until(&b.hub, |h| h.attached() == 0).await?;
+    assert!(refused > 0, "every offer was taken");
     let mut read = 0usize;
     loop {
         match tokio::time::timeout(WAIT, c.next()).await {
@@ -73,7 +85,7 @@ async fn ws_a_slow_consumer_is_disconnected_not_buffered() -> Result<(), String>
             Err(_) => return Err("the socket stayed open".into()),
         }
     }
-    assert!(read < CARS, "all {read} notifications were buffered");
+    assert!(read < OFFERS, "all {read} notifications were buffered");
     Ok(())
 }
 
