@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! CSDL names (CSDL XML 15.1 to 15.3): simple identifiers, namespaces and qualified names.
 
 use std::sync::LazyLock;

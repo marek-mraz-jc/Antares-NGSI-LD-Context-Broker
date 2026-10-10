@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! OData 4.01 EDM model with CSDL XML and CSDL JSON writers (ADR-0024 decision 1, row
 //! `odata-csdl`).
 //!

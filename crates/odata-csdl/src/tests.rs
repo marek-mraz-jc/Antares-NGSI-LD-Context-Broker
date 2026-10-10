@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! Both writers on one small model that reaches every branch of each: the outputs are pinned
 //! byte for byte, so a change to either representation is a reviewed change.
 
