@@ -63,7 +63,7 @@ module's header comment.
 | `negotiate.rs` | 2 000 | 6.3.4–6.3.6: tenant, Accept, Content-Type, `@context` resolution, parameter allow-lists (the query set of 6.4.3.2 included) and the RFC 7230 header-syntax checks. Every handler passes through `tenant_from`, `check_params`, `parse_body`, `request_context` |
 | `entities.rs` | 3 700 | 5.6.1–5.6.6, 5.7.1–5.7.2 `/entities`, distributed write fan-out |
 | `paging.rs` | 1 400 | 4.12, 6.3.10 limit/offset/count and the next/prev links, 4.23 ordering and ICU collation, 6.3.17 `NGSILD-Warning`, the query body of 5.2.23 lifted into parameters; every list operation pages through it |
-| `attrs.rs` | 1 900 | 5.6.2–5.6.5 attribute operations |
+| `attrs.rs` | 2 200 | 5.6.2–5.6.5 attribute operations, 10.2.6 Set Attribute Value |
 | `batch.rs` | 2 240 | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
 | `temporal.rs` | 4 100 | 5.6.11–5.6.16, 5.7.3–5.7.4 `/temporal/entities` |
 | `temporalq.rs` | 200 | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |

@@ -166,7 +166,7 @@ New matter: requirements INT-1 to INT-4 (clause 4) and the Atomic Entity / Seale
 ### 3.10 New attribute operations
 
 - Retrieve Attribute Value (TS 104 175 10.4.4; TS 104 176 7.5.3.1 GET/HEAD on `…/attrs/{attrId}`, 7.6.3.1 on `…/attrs/{attrId}/value`): Antares serves both as pre-adoptions (`crates/antares-api/src/lib.rs:338-349`, `entities::retrieve_entity_attr` / `retrieve_entity_attr_value` → `retrieve_attr_inner` :2303). Compliant yes for the routes; test `preadoptions_attr_get_value_options_head` (lib.rs:2703). Each 10.4.4.4 behaviour bullet is not audited one by one here: part of T-3461.
-- Set Attribute Value (TS 104 175 10.2.6; TS 104 176 7.6.3.2 PUT `…/attrs/{attrId}/value`): **missing**; the route has GET only (lib.rs:346-349), PUT answers 405. Gap: **T-3450**.
+- Set Attribute Value (TS 104 175 10.2.6; TS 104 176 7.6.3.2 PUT `…/attrs/{attrId}/value`): served since T-3450 (`attrs::set_attr_value`). The stored instance keeps its type and sub-Attributes; the type's value member is replaced after term expansion; observedAt follows the `observedAt` parameter or is removed; `datasetId` and `type` select the instance and Entity. Every 10.2.6.4 error bullet answers as written (BadRequestData, InvalidRequest for null except in a JsonProperty, ResourceNotFound). Gated as Replace Attribute (5.6.19). Forwarded to exclusive, redirect and inclusive sources supporting `replaceAttrs` on their own value resource (9.2 names no operation for 10.2.6). Compliant yes; tests `tests/set_attribute_value_10_2_6.rs` (3) and `policy_pre_image` (two PUT …/value cases).
 - Attribute fragments (TS 104 175 5.4.2) are the payload of both; audited with them.
 - Cypher: `MATCH (s:Symbol) WHERE s.lang='rust' AND NOT s.external AND (s.name CONTAINS 'retrieve_attr' OR s.name CONTAINS 'attribute_value' OR s.name CONTAINS 'set_attr' OR s.name CONTAINS 'attr_value') RETURN s.path, s.file, s.line LIMIT 20`
 
@@ -180,7 +180,7 @@ List them: `python3 dev/clause-map.py | awk -F'\t' '$3!="informative" && ($9>0 |
 
 | Task | Gap | Kind |
 |---|---|---|
-| T-3450 | Set Attribute Value `PUT …/attrs/{attrId}/value` missing (3.10) | non-compliant |
+| T-3450 | Set Attribute Value `PUT …/attrs/{attrId}/value` (3.10) | compliant |
 | T-3451 | `RegistrationInfo.attributeNames` not matched (3.6) | non-compliant, security (over-forwarding) |
 | T-3452 | CSR subscription ignores `geoQ.geoproperty`; ignore list untested (3.7) | non-compliant |
 | T-3453 | mqtt endpoint accepts geo+json (3.8) | non-compliant |

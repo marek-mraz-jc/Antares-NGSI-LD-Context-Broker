@@ -516,23 +516,38 @@ operations:
   cim009: null
   title: Set Attribute Value
   kind: write
-  gate_clause: null
+  gate_clause: 5.6.19
   write: true
   linked_entity_checks:
   - 'relationship write: for each Relationship in the body, the object target Entity is visible under the view AND
     the relationship attribute is writable under the view'
   surfaces:
     ngsi_ld_http:
-      status: not_offered
+      status: supported
       binding: PUT /ngsi-ld/v1/entities/{entityId}/attrs/{attrId}/value
       checks:
-        adr0020_phase: none
-        operation_fields: []
+        adr0020_phase: on_request
+        operation_fields:
+        - clause
+        - ids
+        - types
+        - attrs
+        - body
         filterable: false
         whole_tenant: false
-        linked_entity_checks: []
-      note: 'no route: lib.rs:348 mounts GET only on /attrs/{attr}/value, so PUT answers 405; new in TS 104 175,
-        no CIM 009 clause and no gate clause string yet'
+        linked_entity_checks:
+        - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
+          view AND the relationship attribute is writable under the view'
+      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
+        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
+      post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
+        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
+        engine decides on ids/clause only]'
+      binding_clause: ts-104176-ngsi-ld-http-binding/7/7.6.3.2.md
+      gate_site: crates/antares-api/src/attrs.rs:1149
+      note: 'T-3450: gated as Replace Attribute (5.6.19), the write it is; the body the engine sees is the stored
+        instance with the value replaced. Forwarded to sources supporting replaceAttrs (9.2 names no operation for
+        10.2.6) on their own value resource'
     odata:
       status: not_offered
       binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property}/$value (Protocol 11.4.9) would map here
@@ -614,7 +629,7 @@ operations:
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
         lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.5.3.4.md
-      gate_site: crates/antares-api/src/attrs.rs:1115
+      gate_site: crates/antares-api/src/attrs.rs:1361
     odata:
       status: supported
       binding: DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9; OData sets it to
@@ -1092,7 +1107,7 @@ operations:
         move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
         engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.5.3.3.md
-      gate_site: crates/antares-api/src/attrs.rs:970
+      gate_site: crates/antares-api/src/attrs.rs:975
     odata:
       status: supported
       binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9); also PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref
