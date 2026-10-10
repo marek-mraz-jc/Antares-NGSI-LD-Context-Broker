@@ -335,13 +335,11 @@ impl ViewOps {
             &clauses,
         )
         .await;
-        let mut out = vec![false; ops.len()];
-        for ((i, _), yes) in asked.iter().zip(answers) {
-            if let Some(slot) = out.get_mut(*i) {
-                *slot = yes;
-            }
-        }
-        out
+        let given: std::collections::HashMap<usize, bool> =
+            asked.iter().map(|(i, _)| *i).zip(answers).collect();
+        (0..ops.len())
+            .map(|i| given.get(&i).copied().unwrap_or(false))
+            .collect()
     }
 
     /// Run `op` through the view, as [`Ops::run`] does, in the view's
