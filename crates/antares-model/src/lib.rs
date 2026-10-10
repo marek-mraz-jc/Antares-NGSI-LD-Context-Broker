@@ -2,7 +2,19 @@
 //! NGSI-LD data model (ETSI CIM 009 V1.9.1).
 //!
 //! Shapes and invariants only: no I/O, no clocks, no config.
-#![cfg_attr(not(test), warn(clippy::expect_used))]
+// T-3468: every surface calls into this crate on a request path, where a
+// panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
+// index out of bounds or overflow.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
 #![deny(missing_docs)]
 
 pub mod error;
@@ -190,8 +202,12 @@ pub fn parse_iso_duration(s: &str) -> Option<IsoDuration> {
             let i = p.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == ','))?;
             let (num, rest) = p.split_at(i);
             let unit = rest.chars().next()?;
-            let slot = units.iter().skip(next).position(|u| *u == unit)? + next;
-            next = slot + 1;
+            let (slot, _) = units
+                .iter()
+                .enumerate()
+                .skip(next)
+                .find(|(_, u)| **u == unit)?;
+            next = slot.saturating_add(1);
             if !num.bytes().any(|b| b.is_ascii_digit()) {
                 return None;
             }
@@ -201,7 +217,7 @@ pub fn parse_iso_duration(s: &str) -> Option<IsoDuration> {
             if !value.is_finite() {
                 return None;
             }
-            out[slot] = value;
+            *out.get_mut(slot)? = value;
             any = true;
             p = &rest[unit.len_utf8()..];
         }

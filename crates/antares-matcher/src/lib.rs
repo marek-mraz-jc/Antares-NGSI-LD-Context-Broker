@@ -11,7 +11,19 @@
 //! index-shaped in the broker (candidate lookup by (tenant, type) /
 //! (tenant, watched attribute)); every predicate here evaluates one
 //! candidate self-contained.
-#![cfg_attr(not(test), warn(clippy::expect_used))]
+// T-3468: every surface calls into this crate on a request path, where a
+// panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
+// index out of bounds or overflow.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
 #![deny(missing_docs)]
 
 use antares_jsonld::Context;
@@ -195,7 +207,9 @@ pub fn throttled(sub: &Value) -> bool {
         return false;
     };
     chrono::DateTime::parse_from_rfc3339(last).is_ok_and(|t| {
-        (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_milliseconds()
+        chrono::Utc::now()
+            .signed_duration_since(t.with_timezone(&chrono::Utc))
+            .num_milliseconds()
             < (secs * 1000.0) as i64
     })
 }
