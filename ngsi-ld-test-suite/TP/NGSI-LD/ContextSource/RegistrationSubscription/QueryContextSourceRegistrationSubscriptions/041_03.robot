@@ -37,6 +37,7 @@ Query Context Source Registration Subscriptions With Limit And Offset Parameters
     ...    context=${ngsild_test_suite_context}
     ...    limit=${limit}
     ...    offset=${offset}
+    ...    accept=${CONTENT_TYPE_LD_JSON}
     Check Response Status Code    200    ${response.status_code}
     Check Response Body Containing Number Of Entities
     ...    Subscription
