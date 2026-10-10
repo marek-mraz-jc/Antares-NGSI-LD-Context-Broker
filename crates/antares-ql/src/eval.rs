@@ -191,7 +191,7 @@ fn resolve_qpath(
         }
     }
     let rest = QPath {
-        links: qp.links[1..].to_vec(),
+        links: qp.links.get(1..).unwrap_or_default().to_vec(),
         path: qp.path.clone(),
         bracket: qp.bracket.clone(),
     };
@@ -204,11 +204,14 @@ fn resolve_qpath(
         let Some(linked) = lookup(uri) else { continue };
         // EXAMPLE 14 type hint: only consider target entities of these types
         if !link.types.is_empty() {
-            let matched = linked["type"].as_array().is_some_and(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .any(|t| link.types.iter().any(|hint| ctx.expand_key(hint) == t))
-            });
+            let matched = linked
+                .get("type")
+                .and_then(Value::as_array)
+                .is_some_and(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .any(|t| link.types.iter().any(|hint| ctx.expand_key(hint) == t))
+                });
             if !matched {
                 continue;
             }
@@ -230,7 +233,13 @@ fn resolve_targets(entity: &Value, qp: &QPath, ctx: &Context) -> Vec<(TargetKind
     };
     let mut out = Vec::new();
     for inst in instances {
-        collect(inst, &qp.path[1..], qp.bracket.as_deref(), ctx, &mut out);
+        collect(
+            inst,
+            qp.path.get(1..).unwrap_or_default(),
+            qp.bracket.as_deref(),
+            ctx,
+            &mut out,
+        );
     }
     out
 }
@@ -242,16 +251,15 @@ fn collect(
     ctx: &Context,
     out: &mut Vec<(TargetKind, Value)>,
 ) {
-    if rest.is_empty() {
+    let Some((seg, tail)) = rest.split_first() else {
         terminal(inst, bracket, ctx, out);
         return;
-    }
-    let seg = &rest[0];
+    };
     // 1. sub-attribute step (expanded key)
     let iri = ctx.expand_key(seg);
     if let Some(subs) = inst.get(&iri).and_then(Value::as_array) {
         for s in subs {
-            collect(s, &rest[1..], bracket, ctx, out);
+            collect(s, tail, bracket, ctx, out);
         }
         return;
     }
@@ -293,10 +301,8 @@ fn terminal(
         (None, _) => push_target(kind, v, out),
         (Some(b), TargetKind::LanguageMap) => {
             let Some(map) = v.as_object() else { return };
-            if b.len() != 1 {
-                return;
-            }
-            if b[0] == "*" {
+            let [lang] = b else { return };
+            if lang == "*" {
                 // any language: ONE array target so that != requires no
                 // matching value in ANY language (4.9 Unequal, color[*])
                 let mut all = Vec::new();
@@ -307,7 +313,7 @@ fn terminal(
                     }
                 }
                 out.push((kind, Value::Array(all)));
-            } else if let Some(val) = map.get(&b[0]) {
+            } else if let Some(val) = map.get(lang) {
                 out.push((kind, val.clone()));
             }
         }
@@ -542,10 +548,7 @@ fn compare(target: &Value, op: CmpOp, want: &QValue, re: Option<&regex::Regex>) 
 /// why the two are not one function.
 fn temporal_key(s: &str) -> Option<String> {
     let body = s.strip_suffix('Z')?;
-    let (base, frac) = match body.find(['.', ',']) {
-        Some(i) => (&body[..i], &body[i + 1..]),
-        None => (body, ""),
-    };
+    let (base, frac) = body.split_once(['.', ',']).unwrap_or((body, ""));
     // hh:mm:ss (Time) or YYYY-MM-DDThh:mm:ss (DateTime). What counts as a
     // DateTime is 4.6.3's shape, and it is decided by the one function every
     // other layer asks: a length of nineteen is not a date, and treating an

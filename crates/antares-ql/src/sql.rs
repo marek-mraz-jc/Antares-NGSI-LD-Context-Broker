@@ -203,7 +203,10 @@ pub fn value_or_filter(
         // the OPERATOR form of jsonb_path_exists: identical lax semantics,
         // but the planner can match `@?` against the GIN jsonb_path_ops
         // index — the function form never uses it
-        parts.push(format!("{col} @? ${}::jsonpath", first + binds.len()));
+        parts.push(format!(
+            "{col} @? ${}::jsonpath",
+            first.saturating_add(binds.len())
+        ));
         binds.push(jp);
     }
     format!("({})", parts.join(" OR "))
@@ -347,7 +350,7 @@ pub fn quoted(s: &str) -> String {
 }
 
 fn jsonpath_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    let mut out = String::with_capacity(s.len().saturating_add(2));
     out.push('"');
     for c in s.chars() {
         match c {

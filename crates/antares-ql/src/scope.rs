@@ -107,13 +107,13 @@ fn scope_pattern_matches(pat: &str, scope: &str) -> bool {
     for (pi, p) in pseg.iter().enumerate() {
         if *p == "#" {
             // multi-level wildcard: matches the rest (including nothing)
-            return pi == pseg.len() - 1;
+            return pi.saturating_add(1) == pseg.len();
         }
         let Some(sv) = sseg.get(i) else { return false };
         if *p != "+" && p != sv {
             return false;
         }
-        i += 1;
+        i = i.saturating_add(1);
     }
     i == sseg.len()
 }
