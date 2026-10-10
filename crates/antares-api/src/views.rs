@@ -110,6 +110,25 @@ impl CompiledView {
     pub fn narrowing(&self) -> &Filter {
         &self.narrowing
     }
+
+    /// The Entity types and the Attributes the view shows, each compacted
+    /// under the core @context, sorted, once each: a name the core context
+    /// does not define stays the IRI, which expands to itself.
+    pub fn shown_names(&self) -> (Vec<String>, Vec<String>) {
+        let ctx = crate::repr::policy_context();
+        let compact = |names: &mut dyn Iterator<Item = &String>| {
+            names
+                .map(|n| ctx.compact_iri(n))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let rules = &self.narrowing.rules;
+        (
+            compact(&mut rules.iter().flat_map(|r| &r.types)),
+            compact(&mut rules.iter().flat_map(|r| &r.attributes)),
+        )
+    }
 }
 
 /// List @contexts (13.3, CIM 009 5.13.3).

@@ -273,6 +273,44 @@ impl ViewOps {
         self.operations.contains(&op)
     }
 
+    /// The Entity types and the Attributes the view shows, compacted under
+    /// the core @context, sorted: the names a surface may offer the caller.
+    #[must_use]
+    pub fn shown_names(&self) -> (Vec<String>, Vec<String>) {
+        self.view.shown_names()
+    }
+
+    /// For each of `ops`, whether the view allows it and the policy engine
+    /// could allow a request of it for `caller`, asked in one probe in the
+    /// view's Tenant (MCP D-3). The probe fails closed: an engine that fails
+    /// it offers nothing.
+    pub async fn offered(&self, caller: &Caller, ops: &[OperationId]) -> Vec<bool> {
+        let Ok(tenant) = antares_model::TenantId::new(&self.tenant) else {
+            return vec![false; ops.len()];
+        };
+        let asked: Vec<(usize, &'static str)> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| self.allows(**op))
+            .filter_map(|(i, op)| op.gate_clause().map(|c| (i, c)))
+            .collect();
+        let clauses: Vec<&'static str> = asked.iter().map(|(_, c)| *c).collect();
+        let answers = antares_api::policy::offers(
+            self.inner.state.policy.as_deref(),
+            &tenant,
+            &caller.0,
+            &clauses,
+        )
+        .await;
+        let mut out = vec![false; ops.len()];
+        for ((i, _), yes) in asked.iter().zip(answers) {
+            if let Some(slot) = out.get_mut(*i) {
+                *slot = yes;
+            }
+        }
+        out
+    }
+
     /// Run `op` through the view, as [`Ops::run`] does, in the view's
     /// Tenant (ADR-0023 rule 10): a caller's `NGSILD-Tenant` naming another
     /// Tenant is refused, never a switch, and the answer names the Tenant
