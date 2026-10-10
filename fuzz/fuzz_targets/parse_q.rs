@@ -4,14 +4,18 @@
 //! text that escaping grows past the 4096-byte input cap (a NUL becomes
 //! `\u0000`), which the parser refuses by size and nothing else.
 #![no_main]
-use antares_ql::{CmpOp, QNode, QValue};
 use antares_model::NgsiError;
+use antares_ql::{CmpOp, QNode, QValue};
 use libfuzzer_sys::fuzz_target;
 
 fn pattern_with_quote(node: &QNode) -> bool {
     match node {
         QNode::And(items) | QNode::Or(items) => items.iter().any(pattern_with_quote),
-        QNode::Cmp { op: CmpOp::Pattern | CmpOp::NotPattern, value: QValue::Str(s), .. } => s.contains('"'),
+        QNode::Cmp {
+            op: CmpOp::Pattern | CmpOp::NotPattern,
+            value: QValue::Str(s),
+            ..
+        } => s.contains('"'),
         _ => false,
     }
 }
