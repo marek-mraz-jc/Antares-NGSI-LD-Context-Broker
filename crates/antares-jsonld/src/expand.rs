@@ -204,6 +204,15 @@ pub fn expand_entity(
         None if opts.fragment => {}
         None => return Err(bad("entity type is required")),
     }
+    // TS 104 175 Annex B: the type-scoped core contexts of the Entity's
+    // types name its own members. A fragment without a type has none in
+    // force, as a JSON-LD processor sees the same body.
+    let types: Vec<&str> = out
+        .get("type")
+        .and_then(Value::as_array)
+        .map(|ts| ts.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let members = ctx.within_types(&types);
 
     // scope
     if let Some(v) = doc.get("scope") {
@@ -309,7 +318,7 @@ pub fn expand_entity(
         if key.is_empty() {
             return Err(bad("empty attribute name"));
         }
-        let iri = expand_attr_name(key, ctx)?;
+        let iri = expand_attr_name(key, &members)?;
         // 4.5.1: core non-reified terms shall not be used as Attribute names.
         if iri
             .strip_prefix(crate::context::NGSI_LD_BASE)
@@ -319,7 +328,7 @@ pub fn expand_entity(
                 "{key} is a core non-reified term and cannot be used as an Attribute name (4.5.1)"
             )));
         }
-        let instances = expand_attribute(key, v, ctx, opts, 0)?;
+        let instances = expand_attribute(key, v, &ctx.within(&iri), opts, 0)?;
         if GEO_ENTITY_MEMBERS.contains(&iri.as_str()) {
             for inst in &instances {
                 let t = inst.get("type").and_then(Value::as_str);
@@ -1095,7 +1104,7 @@ fn expand_instance(
             return Err(bad(format!("attribute {name}: empty sub-attribute name")));
         }
         let iri = expand_attr_name(k, ctx)?;
-        let instances = expand_attribute(k, sub, ctx, opts, depth.saturating_add(1))?;
+        let instances = expand_attribute(k, sub, &ctx.within(&iri), opts, depth.saturating_add(1))?;
         // 4.5.5.1 again, one level down: two sub-attribute names expanding to
         // one IRI would drop whichever the map orders first.
         if out.insert(iri.clone(), Value::Array(instances)).is_some() {
@@ -1213,7 +1222,7 @@ pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<V
                 let instances = expand_attribute(
                     k,
                     v,
-                    ctx,
+                    &ctx.within(&iri),
                     ExpandOpts {
                         fragment: true,
                         allow_null: true,

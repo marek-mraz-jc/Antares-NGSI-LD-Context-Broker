@@ -683,3 +683,68 @@ async fn clause_5_5_10_a_batch_does_not_resolve_another_tenants_context() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "nothing was stored: {body}");
 }
+
+/// TS 104 176 6.2.4: "If the request verb is GET, HEAD or DELETE, then the
+/// associated JSON-LD @context shall be obtained from a Link header". A HEAD
+/// naming a user @context resolves its terms through it (the attribute `A1`
+/// of that @context is found, and is not found under the core context), and
+/// the answer names the same @context in its own Link header, with no body.
+/// The status stays 200, the 7.3.3.1 table's (owner decision on T-3460;
+/// clause 5's 204 is raise 14 in docs/upstream/etsi-raises.md).
+#[tokio::test(flavor = "multi_thread")]
+async fn ts104176_6_2_4_head_takes_context_from_link() {
+    let st = state();
+    let loc = add_hosted(&st).await;
+    let (_, _, meta) = get(&st, &format!("{loc}?details=true")).await;
+    let url = meta["URL"]
+        .as_str()
+        .expect("stored @context URL")
+        .to_owned();
+    let link = format!(
+        "<{url}>; rel=\"http://www.w3.org/ns/json-ld#context\"; type=\"application/ld+json\""
+    );
+    let body = json!({"id": "urn:ngsi-ld:Device:head", "type": "Device",
+                      "A1": {"type": "Property", "value": 1}})
+    .to_string();
+    let (status, _, created) = send(
+        &st,
+        Request::builder()
+            .method("POST")
+            .uri("/ngsi-ld/v1/entities")
+            .header("Content-Type", "application/json")
+            .header("Content-Length", body.len())
+            .header("Link", &link)
+            .body(Body::from(body))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let head = |link: Option<&str>| {
+        let mut req = Request::builder()
+            .method("HEAD")
+            .uri("/ngsi-ld/v1/entities/urn:ngsi-ld:Device:head/attrs/A1");
+        if let Some(link) = link {
+            req = req.header("Link", link);
+        }
+        req.body(Body::empty()).expect("request")
+    };
+    let (status, headers, body) = send(&st, head(Some(&link))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, Value::Null, "a HEAD answer has no body");
+    let echoed = headers
+        .get("Link")
+        .and_then(|l| l.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        echoed.contains(&url),
+        "the answer names the @context it used: {echoed:?}"
+    );
+
+    let (status, _, _) = send(&st, head(None)).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "under the core @context `A1` is another attribute, which the Entity does not hold"
+    );
+}

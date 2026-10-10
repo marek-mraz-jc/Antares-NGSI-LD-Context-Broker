@@ -281,6 +281,14 @@ jobs:
         run: |
           python3 dev/check-module-rules.py --self-test
           python3 dev/check-module-rules.py
+      # Every STRIDE row of the surfaces threat model names a test, and the
+      # test exists once the crate that owns it does (surfaces-test-plan.md
+      # section 8, T-3492): a threat cannot lose its test silently. The
+      # self-test plants each red case first.
+      - name: Threat-model tests exist
+        run: |
+          python3 dev/threat-tests.py --self-test
+          python3 dev/threat-tests.py
       # SQL-injection guard: dynamically assembled SQL (AssertSqlSafe, or an
       # sqlx query built with format!) belongs to the antares-sql backend
       # source and nowhere else. Everything a request supplies reaches the
@@ -315,6 +323,51 @@ jobs:
               crates/ examples/ --include='*.rs' \
             | grep -v 'crates/antares-jsonld/src/loader.rs:'
 
+
+  fuzz-smoke:
+    # surfaces-test-plan.md section 5 (T-3492): a parser change does not merge
+    # unfuzzed. Every fuzz target the pull request touches (its source, its
+    # crash corpus, or a crate it reaches through the manifests; a manifest
+    # or lock change touches all) replays its committed crashes and fuzzes
+    # for 30 s with a 512 MB malloc cap. A dispatch run has no base and runs
+    # every target. fuzz.yml keeps the long twice-weekly runs.
+    name: Fuzz smoke (touched targets, 30 s each)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Target selection self-test
+        run: python3 dev/fuzz-smoke.py --self-test
+      - name: Targets this change touches
+        id: pick
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          targets=$(python3 dev/fuzz-smoke.py --list ${BASE:+--base "$BASE"} | paste -sd' ')
+          echo "touched: ${targets:-none}"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+      - if: steps.pick.outputs.targets != ''
+        uses: dtolnay/rust-toolchain@nightly
+      - if: steps.pick.outputs.targets != ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - if: steps.pick.outputs.targets != ''
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Replay and fuzz the touched targets
+        if: steps.pick.outputs.targets != ''
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: python3 dev/fuzz-smoke.py --run ${BASE:+--base "$BASE"}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fuzz-smoke-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
 
   features:
     # GOAL point 2 (T-3465): every cargo feature builds, lints and tests on

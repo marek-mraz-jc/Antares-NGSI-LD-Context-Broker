@@ -2982,11 +2982,10 @@ mod tests {
         let core = Loader::new().core();
         for (term, iri) in [
             ("Snapshot", "https://uri.etsi.org/ngsi-ld/Snapshot"),
-            ("orderBy", "https://uri.etsi.org/ngsi-ld/orderBy"),
-            ("collation", "https://uri.etsi.org/ngsi-ld/collation"),
+            ("EntityMap", "https://uri.etsi.org/ngsi-ld/EntityMap"),
             ("valueType", "https://uri.etsi.org/ngsi-ld/hasValueType"),
             ("objectLists", "https://uri.etsi.org/ngsi-ld/hasObjectLists"),
-            ("aggrMethods", "https://uri.etsi.org/ngsi-ld/aggrMethods"),
+            ("notifiedAt", "https://uri.etsi.org/ngsi-ld/notifiedAt"),
         ] {
             assert_eq!(
                 core.expand_key(term),
@@ -2994,6 +2993,93 @@ mod tests {
                 "{term} must expand to its Annex B IRI, not through @vocab"
             );
         }
+        // TS 104 175 Annex B scopes these, so at top level they are not core
+        // terms and expand through @vocab like any other name.
+        for term in [
+            "orderBy",
+            "collation",
+            "aggrMethods",
+            "status",
+            "format",
+            "data",
+        ] {
+            assert_eq!(
+                core.expand_key(term),
+                format!("https://uri.etsi.org/ngsi-ld/default-context/{term}"),
+                "{term} is not a top-level core term"
+            );
+        }
+    }
+
+    /// TS 104 175 Annex B is the document the v1.9 URL resolves to (5.3.2.1
+    /// keeps the URL): 149 top-level members, 23 of them carrying a scoped
+    /// context, and the 61 CIM 009 top-level terms it scopes are gone from
+    /// the top level.
+    #[test]
+    fn pinned_v1_9_core_matches_ts_104175_annex_b() {
+        let core = pinned(CORE_CONTEXT).expect("pinned core");
+        let top = core.as_object().expect("an object @context");
+        assert_eq!(top.len(), 149, "Annex B top-level members");
+        let mut scoped: Vec<&str> = top
+            .iter()
+            .filter(|(_, d)| d.get("@context").is_some())
+            .map(|(t, _)| t.as_str())
+            .collect();
+        scoped.sort_unstable();
+        assert_eq!(
+            scoped,
+            [
+                "Attribute",
+                "AttributeList",
+                "ContextSourceIdentity",
+                "ContextSourceNotification",
+                "ContextSourceRegistration",
+                "EntityType",
+                "EntityTypeInfo",
+                "EntityTypeList",
+                "Feature",
+                "FeatureCollection",
+                "Notification",
+                "Query",
+                "Subscription",
+                "endpoint",
+                "geoQ",
+                "information",
+                "management",
+                "managementInterval",
+                "ngsildproof",
+                "notUpdated",
+                "notification",
+                "observationInterval",
+                "temporalQ",
+            ]
+        );
+        for term in [
+            "status", "format", "data", "attrs", "join", "timerel", "geometry", "accept",
+        ] {
+            assert!(!top.contains_key(term), "{term} is scoped only in Annex B");
+        }
+    }
+
+    /// TS 104 175 5.2.5: a term the core @context defines only inside a
+    /// scope may be redefined by a user @context ("still discouraged"); the
+    /// top-level core terms stay protected (4.4).
+    #[tokio::test]
+    async fn a_scoped_core_term_may_be_redefined_by_a_user_context() {
+        let ctx = Loader::new()
+            .resolve(&serde_json::json!({
+                "status": "https://example.org/status",
+                "location": "https://example.org/location"
+            }))
+            .await
+            .expect("resolve");
+        assert_eq!(ctx.expand_key("status"), "https://example.org/status");
+        assert_eq!(ctx.compact_iri("https://example.org/status"), "status");
+        assert_eq!(
+            ctx.expand_key("location"),
+            "https://uri.etsi.org/ngsi-ld/location",
+            "a top-level core term stays protected"
+        );
     }
 
     /// Annex B (normative), V1.9.1: the core @context served for the v1.9
@@ -3014,14 +3100,11 @@ mod tests {
             "Snapshot",
             "SnapshotNotification",
             "ExecutionResultDetails",
-            "aggrMethods",
-            "aggrParams",
-            "aggrPeriodDuration",
-            "collation",
+            // aggrMethods, aggrParams, aggrPeriodDuration, ordering: scoped
+            // under temporalQ and Query by TS 104 175 Annex B; collation and
+            // orderBy: gone from it
             "lastUsedAt",
             "ngsildproof",
-            "orderBy",
-            "ordering",
             "problemDetails",
             "resultStatus",
             "snapshotId",

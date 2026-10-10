@@ -197,3 +197,89 @@ async fn the_post_query_spends_one_allowance_across_its_page() {
     );
     assert!(returned > 2, "the join returned nothing at all: {returned}");
 }
+
+/// R links A and B; A links B; B links C; C links D. Met first through A,
+/// B sits at depth 2; through R it sits at depth 1, its shallowest.
+async fn diamond(st: &AppState) {
+    let rel = |id: &str| json!({"type": "Relationship", "object": format!("urn:ngsi-ld:N:{id}")});
+    create(st, json!({"id": "urn:ngsi-ld:N:d", "type": "N"})).await;
+    create(
+        st,
+        json!({"id": "urn:ngsi-ld:N:c", "type": "N", "next": rel("d")}),
+    )
+    .await;
+    create(
+        st,
+        json!({"id": "urn:ngsi-ld:N:b", "type": "N", "next": rel("c")}),
+    )
+    .await;
+    create(
+        st,
+        json!({"id": "urn:ngsi-ld:N:a", "type": "N", "next": rel("b")}),
+    )
+    .await;
+    create(
+        st,
+        json!({"id": "urn:ngsi-ld:N:r", "type": "N", "first": rel("a"), "second": rel("b")}),
+    )
+    .await;
+}
+
+async fn get(st: &AppState, uri: &str) -> Value {
+    let (status, _, body) = send(st, Request::get(uri).body(Body::empty()).expect("request")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+/// TS 104 175 7.7.4: "whenever a Linked Entity has already been previously
+/// encountered during graph traversal at a shallower depth, its Linked
+/// Entities shall not undergo further expansion for a second time" — so an
+/// Entity is expanded where it is shallowest. A depth-first walk meets B under
+/// A first (depth 2), spends its expansion there, and leaves the depth-1 B
+/// under R unexpanded, so D (depth 3 through R → B → C) never arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn join_expands_an_entity_at_its_shallowest_depth() {
+    let st = AppState::new("antares-join-shallowest".into());
+    diamond(&st).await;
+
+    let inline = get(
+        &st,
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:N:r?join=inline&joinLevel=3",
+    )
+    .await;
+    let b = &inline["second"]["entity"];
+    assert_eq!(b["id"], "urn:ngsi-ld:N:b", "{inline}");
+    assert_eq!(
+        b["next"]["entity"]["next"]["entity"]["id"], "urn:ngsi-ld:N:d",
+        "B at depth 1 carries C and C's D: {inline}"
+    );
+    // Under A, B is depth 2 and already expanded elsewhere: embedded, not
+    // walked a second time.
+    let b_under_a = &inline["first"]["entity"]["next"]["entity"];
+    assert_eq!(b_under_a["id"], "urn:ngsi-ld:N:b", "{inline}");
+    assert!(b_under_a["next"].get("entity").is_none(), "{inline}");
+
+    let flat = get(
+        &st,
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:N:r?join=flat&joinLevel=3",
+    )
+    .await;
+    let mut ids: Vec<&str> = flat
+        .as_array()
+        .expect("a flattened graph is an array")
+        .iter()
+        .filter_map(|e| e["id"].as_str())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        [
+            "urn:ngsi-ld:N:a",
+            "urn:ngsi-ld:N:b",
+            "urn:ngsi-ld:N:c",
+            "urn:ngsi-ld:N:d",
+            "urn:ngsi-ld:N:r"
+        ],
+        "{flat}"
+    );
+}
