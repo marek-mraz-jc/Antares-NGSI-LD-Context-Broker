@@ -226,6 +226,20 @@ fn err_entry(id: Option<&str>, e: &NgsiError) -> Value {
 /// 5.2.17 BatchEntityError for a failed forwarded part — the remote status
 /// and detail travel inside the ProblemDetails (5.6.7.4/5.6.10.4: remote
 /// error results merge into E).
+/// The status a Context Source put in a batch error entry, when it is an
+/// HTTP error status; anything else (absent, not a number, outside 400..=599,
+/// past u16) is the status its response came back with. A plain `as u16`
+/// wrapped 65 736 to 200 and reported the failure as a success.
+fn remote_status(entry: &Value, fallback: u16) -> u16 {
+    entry
+        .get("error")
+        .and_then(|p| p.get("status"))
+        .and_then(Value::as_u64)
+        .and_then(|s| u16::try_from(s).ok())
+        .filter(|s| (400..=599).contains(s))
+        .unwrap_or(fallback)
+}
+
 fn err_remote(id: Option<&str>, status: u16, detail: &str) -> Value {
     let etype = match status {
         400 => "BadRequestData",
@@ -287,11 +301,7 @@ fn merge_remote_batch(
                     else {
                         continue;
                     };
-                    let remote = e
-                        .get("error")
-                        .and_then(|p| p.get("status"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(u64::from(status)) as u16;
+                    let remote = remote_status(e, status);
                     err.push(err_remote(
                         Some(id),
                         remote,
@@ -1643,6 +1653,18 @@ async fn batch_query_inner(
 
 #[cfg(test)]
 mod tests {
+    /// T-3531: a remote error status is taken only when it is one.
+    #[test]
+    fn remote_status_takes_only_an_http_error_status() {
+        use serde_json::json;
+        let e = |s: Value| json!({"error": {"status": s}});
+        assert_eq!(super::remote_status(&e(json!(404)), 207), 404);
+        assert_eq!(super::remote_status(&e(json!(65_736)), 207), 207);
+        assert_eq!(super::remote_status(&e(json!(200)), 207), 207);
+        assert_eq!(super::remote_status(&e(json!("404")), 207), 207);
+        assert_eq!(super::remote_status(&json!({}), 500), 500);
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
