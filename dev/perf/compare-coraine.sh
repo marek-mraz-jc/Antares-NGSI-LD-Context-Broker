@@ -39,7 +39,8 @@ rss_kib() { rd "/proc/$PID/status" | awk '/^VmRSS/ {print $2}'; }
 start() {  # start <broker>: sets PID to the broker's own process
   case $1 in
     antares)
-      ANTARES_STORE=memory ANTARES_HTTP_PORT=$PORT ANTARES_ALLOW_SHARED_LOCAL=1 \
+      # no history on either side: Coraine runs with --troe none below
+      ANTARES_STORE=memory ANTARES_TEMPORAL=none ANTARES_HTTP_PORT=$PORT ANTARES_ALLOW_SHARED_LOCAL=1 \
         taskset -c 0 "$BIN" > "$OUT/antares.log" 2>&1 &
       PID=$!
       ;;
