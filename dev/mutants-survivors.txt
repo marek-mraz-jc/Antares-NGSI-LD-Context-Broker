@@ -1,0 +1,5 @@
+# Surviving mutants that carry a written reason (T-3531, .github/workflows/mutants.yml).
+# One line per mutant as cargo-mutants prints it in mutants.out/missed.txt;
+# line:col may be left in, the check drops it. After the mutant, " # " and
+# the reason it needs no test. A survivor not listed here fails the run:
+# the default answer is a test that kills it, not a line here.
