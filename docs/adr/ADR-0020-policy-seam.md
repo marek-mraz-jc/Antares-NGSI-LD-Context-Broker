@@ -243,6 +243,20 @@ the engine sets `restricted`, and a narrowing is otherwise silent.
 
 ## Confirmation
 
+- Every Notification body passes `pre_notify` once, in
+  `notify::deliver_as`, its only caller outside tests (cg: `MATCH
+  (c:Symbol)-[:CALLS]->(f:Symbol {path:'antares_api::policy::pre_notify'})
+  WHERE NOT c.is_test RETURN c.path`). The 5.8.6 inbound path
+  (`distsub::remote_notify`) delivers through it under the ORIGINAL
+  Subscription's stored subject
+  (`distsub::tests::a_remote_notification_is_narrowed_for_the_original_subscriber`).
+  Two sends stay outside the seam on purpose, because neither carries an
+  Entity: the `urn:antares:distsub:` endpoint, which hands Context Source
+  Notification data to the broker's own handler and reaches no receiver,
+  and the 5.16.6 SnapshotNotification (`snapshots::send_notification`),
+  whose body is the snapshot's status and the per-query details of the
+  creator's own gated request, sent to the endpoint that creator named
+  (operation matrix section 8, items 11 and 13).
 - `run_policy_contract` (behind `test-kit`, the contract an addon
   engine's own tests call): a `Filter` never widens — the engine's answer
   is run through the projection and asserted a subset of the unfiltered
