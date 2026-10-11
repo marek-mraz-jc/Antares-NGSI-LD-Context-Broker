@@ -113,7 +113,12 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
     };
     let state = Arc::new(ODataState {
         model: csdl,
-        service_root: format!("{PREFIX}/{id}/odata/v4/"),
+        // Absolute: a path-only context URL is read as a file path by
+        // Microsoft.OData.Core on Linux (T-3688).
+        service_root: format!(
+            "{}{PREFIX}/{id}/odata/v4/",
+            antares_ops::public_base(req.headers())
+        ),
         url_limits: odata_url::Limits::strict(),
         csdl_limits: odata_csdl::Limits::strict(),
         max_header_len: MAX_HEADER_LEN,
@@ -146,7 +151,8 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
     let inner_root = format!("/{id}/odata/v4/");
     let routed = Router::new().nest_service(&format!("/{id}/odata/v4"), api);
     if req.method() == Method::POST && req.uri().path() == format!("{inner_root}$batch") {
-        let roots = (state.service_root.as_str(), inner_root.as_str());
+        let path_root = format!("{PREFIX}{inner_root}");
+        let roots = (path_root.as_str(), inner_root.as_str());
         return batch::serve(&routed, roots, req, state.url_limits.max_query_len).await;
     }
     let Ok(resp) = routed.oneshot(req).await;

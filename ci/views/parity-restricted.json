@@ -12,7 +12,8 @@
       ],
       "attributes": [
         "temperature",
-        "location"
+        "location",
+        "nearest"
       ]
     }
   ],
