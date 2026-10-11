@@ -2,7 +2,7 @@
 //! Rules 6 and 9: what a socket may be opened from, how many there are, and
 //! what one client message may weigh.
 
-use crate::common::{broker, cars, connect, open, status, until, Client};
+use crate::common::{broker, cars, connect, open, status, text, until, Client};
 use antares_ws::Limits;
 use futures_util::SinkExt;
 use serde_json::json;
@@ -184,13 +184,11 @@ async fn ws_a_request_that_is_no_websocket_handshake_is_refused() -> Result<(), 
         let (code, body) = b.http.call("GET", ROOT, &headers, None).await?;
         assert_eq!(code, 400, "{headers:?}: {body}");
         assert_eq!(
-            body["type"], "https://uri.etsi.org/ngsi-ld/errors/BadRequestData",
+            text(&body, "/type"),
+            "https://uri.etsi.org/ngsi-ld/errors/BadRequestData",
             "{headers:?}"
         );
-        assert!(
-            body["detail"].as_str().is_some_and(|d| d.contains(said)),
-            "{headers:?}: {body}"
-        );
+        assert!(text(&body, "/detail").contains(said), "{headers:?}: {body}");
     }
     assert_eq!(b.hub.connections(), 0);
     let _upgraded = connect(b.addr, ROOT, &[]).await?;
