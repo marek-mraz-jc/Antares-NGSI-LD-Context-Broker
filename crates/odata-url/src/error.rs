@@ -124,8 +124,8 @@ pub enum LimitKind {
 /// #     }
 /// # }
 /// use odata_url::{parse, Feature, Limits, UrlErrorKind};
-/// let e = parse("Buildings?$filter=height add 1 gt 2", &Service, &Limits::strict()).unwrap_err();
-/// assert_eq!((e.kind, e.offset), (UrlErrorKind::NotImplemented(Feature::Arithmetic), 25));
+/// let e = parse("Buildings?$filter=height has 1", &Service, &Limits::strict()).unwrap_err();
+/// assert_eq!((e.kind, e.offset), (UrlErrorKind::NotImplemented(Feature::Has), 25));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Feature {
@@ -166,17 +166,13 @@ pub enum Feature {
     NestedCount,
     /// Key predicates and `$filter` segments inside an expression path.
     PathInExpression,
-    /// `add`, `sub`, `mul`, `div`, `divby`, `mod` and negation (F14).
-    Arithmetic,
     /// `has` (F13).
     Has,
-    /// Method calls other than `contains`, `startswith`, `endswith`, `geo.intersects` (F16 to
-    /// F19, F30).
+    /// `totalseconds`, `geo.distance`, `geo.length`, `hassubset`, `hassubsequence`, `case`
+    /// (F18, F19, F30).
     Method,
     /// `cast`, `isof` (F19).
     CastIsOf,
-    /// `all` lambdas (F23).
-    AllLambda,
     /// `in` against anything but a literal list.
     InExpression,
     /// JSON arrays and objects in a URL.
@@ -282,11 +278,9 @@ impl Feature {
             Self::NestedOption => "nested query option",
             Self::NestedCount => "nested $count",
             Self::PathInExpression => "key or filter in an expression path",
-            Self::Arithmetic => "arithmetic operator",
             Self::Has => "has operator",
             Self::Method => "method call",
             Self::CastIsOf => "cast and isof",
-            Self::AllLambda => "all lambda",
             Self::InExpression => "in over a non-literal",
             Self::JsonLiteral => "JSON literal",
             Self::Literal => "literal type",

@@ -54,9 +54,9 @@ mod query;
 use std::borrow::Cow;
 
 pub use ast::{
-    CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key, KeyValue, Levels,
-    Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions, Segment, SelectItem,
-    Shape,
+    ArithOp, CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key, KeyValue,
+    Levels, Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions, Segment,
+    SelectItem, Shape,
 };
 #[cfg(feature = "edm")]
 pub use edm::EdmModel;

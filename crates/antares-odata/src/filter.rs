@@ -238,7 +238,13 @@ impl<'a> Terms<'a> {
                 collection,
                 lambda: Some((variable, body)),
             } => self.any(collection, variable, body),
-            Expr::Literal(_) | Expr::Alias(_) | Expr::Any { .. } => Err(Refused::Later),
+            // Arithmetic and `all` have no `q` form (F14, F23).
+            Expr::Literal(_)
+            | Expr::Alias(_)
+            | Expr::Any { .. }
+            | Expr::All { .. }
+            | Expr::Arith(..)
+            | Expr::Neg(_) => Err(Refused::Later),
         }
     }
 
