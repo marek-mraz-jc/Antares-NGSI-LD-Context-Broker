@@ -627,7 +627,7 @@ mod clause_4_9_extensions {
     use serde_json::json;
 
     fn ctx() -> std::sync::Arc<Context> {
-        antares_jsonld::core_context().into()
+        crate::test_core()
     }
 
     fn expand(doc: serde_json::Value) -> Value {
@@ -1015,7 +1015,7 @@ mod bounds_and_patterns {
     const DC: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
 
     fn ctx() -> std::sync::Arc<Context> {
-        antares_jsonld::core_context().into()
+        crate::test_core()
     }
 
     fn with_value(attr: &str, v: Value) -> Value {
@@ -1275,7 +1275,7 @@ mod tests {
 
     #[test]
     fn comparisons_and_paths() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let e = entity();
         for (q, want) in [
             ("speed>80", true),
@@ -1301,7 +1301,7 @@ mod tests {
     /// (`?q=temperature.observedAt>=2017-12-24T12:00:00Z`).
     #[test]
     fn dates_and_times_order_temporally_across_fraction_spellings() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let at = |v: &str| {
             json!({
                 "id": "urn:ngsi-ld:Vehicle:3",
@@ -1397,7 +1397,7 @@ mod tests {
         // type of the Query Term value are different, then they shall be
         // considered unequal" — so `!=` MATCHES. Equal carries the mirror rule
         // ("considered as not matching"); the asymmetry is deliberate.
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let e = json!({
             "id": "urn:ngsi-ld:Vehicle:2",
             "type": ["https://uri.etsi.org/ngsi-ld/default-context/Vehicle"],
@@ -1426,7 +1426,7 @@ mod tests {
         // 4.9 Unequal, p.91: "The target value does not include any of the list
         // values, if the target value is an array (e.g. matches
         // ["blue","black","green"], but not ["blue","red","green"])."
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let mk = |vals: Value| {
             json!({
                 "id": "urn:ngsi-ld:Vehicle:3",
@@ -1453,7 +1453,7 @@ mod tests {
     /// array examples verbatim.
     #[test]
     fn value_list_semantics() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let mk = |v: Value| {
             json!({
                 "id": "urn:ngsi-ld:Vehicle:4",
@@ -1498,7 +1498,7 @@ mod tests {
     /// 4.9 Range — Equal p.90 ("both included") and Unequal p.91.
     #[test]
     fn range_semantics() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let mk = |v: Value| {
             json!({
                 "id": "urn:ngsi-ld:Vehicle:5",
@@ -1544,7 +1544,7 @@ mod tests {
     /// matching" — deliberately NOT the `!=` type-mismatch rule.
     #[test]
     fn not_pattern_semantics() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let mk = |v: Value| {
             json!({
                 "id": "urn:ngsi-ld:Vehicle:7",
@@ -1620,7 +1620,7 @@ mod temporal_keys {
     /// expanded, inside And/Or and lists; others and non-strings stay.
     #[test]
     fn expand_values_rewrites_only_the_named_attributes() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let male = "https://uri.etsi.org/ngsi-ld/default-context/Male";
         let q = crate::parse_q(
             "gender==\"Male\";(kind==\"Male\"|gender==\"Male\",\"Female\");gender==1",
