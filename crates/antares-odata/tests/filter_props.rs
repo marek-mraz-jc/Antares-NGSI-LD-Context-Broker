@@ -205,7 +205,7 @@ async fn put(app: &Router, method: &str, uri: &str, body: String) -> Result<(), 
 }
 
 async fn broker() -> Result<(TestBroker, Router), String> {
-    std::env::set_var("ANTARES_SCHEMA_MAX_BYTES", "65536");
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
     let b = TestBroker::new().await?;
     let app = b.serve(antares_odata::OData)?;
     let view = json!({

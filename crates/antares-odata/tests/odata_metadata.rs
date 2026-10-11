@@ -123,7 +123,7 @@ async fn put_view(app: &Router, id: &str, attrs: &[&str]) -> Result<(), String> 
 }
 
 async fn broker(views: &[(&str, &[&str])]) -> Result<(TestBroker, Router), String> {
-    std::env::set_var("ANTARES_SCHEMA_MAX_BYTES", "65536");
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
     let b = TestBroker::new().await?;
     let app = b.serve(antares_odata::OData)?;
     for (id, attrs) in views {

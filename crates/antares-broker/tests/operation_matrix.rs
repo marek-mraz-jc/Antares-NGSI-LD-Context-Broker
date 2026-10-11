@@ -334,7 +334,7 @@ async fn broker(engine: Clauses, writes: &HashSet<String>) -> (Router, antares_o
     if cfg!(feature = "odata") {
         // The OData model is the Tenant's schema; a broker takes none
         // without a size limit.
-        std::env::set_var("ANTARES_SCHEMA_MAX_BYTES", "65536");
+        std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
     }
     let mut state = AppState::new("matrix".into());
     antares_api::wire(&mut state).await;
