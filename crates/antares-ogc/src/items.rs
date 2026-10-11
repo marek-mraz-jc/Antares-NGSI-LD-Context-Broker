@@ -503,7 +503,7 @@ pub(crate) async fn page(
     };
     let terms = Terms::of(c);
     let targets = targets(c, &terms, p);
-    let (start, mut offset) = match &p.next {
+    let (start, offset) = match &p.next {
         None => (0, 0),
         Some(t) => read_token(t, digest, targets.len())
             .ok_or_else(|| bad("the next token does not belong to this request"))?,
@@ -537,7 +537,6 @@ pub(crate) async fn page(
         if part >= start && out.next.is_none() && at.saturating_add(got) < count {
             out.next = Some(token(part, at.saturating_add(got), digest));
         }
-        offset = 0;
     }
     Ok(out)
 }
