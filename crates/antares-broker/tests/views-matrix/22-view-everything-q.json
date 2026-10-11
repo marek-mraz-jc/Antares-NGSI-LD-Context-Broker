@@ -32,5 +32,6 @@
  },
  "caller": {
   "x-jc-roles": "public"
- }
+ },
+ "linkml": {"Parking": ["availableSpots", "location", "name", "operator"], "Sensor": ["location", "operator", "temperature"], "Vehicle": ["location", "operator", "speed", "vehicleType"]}
 }

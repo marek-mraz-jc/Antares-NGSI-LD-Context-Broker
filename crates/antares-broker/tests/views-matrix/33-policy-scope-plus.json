@@ -92,5 +92,6 @@
    "vehicleType"
   ]
  },
- "temporal": {}
+ "temporal": {},
+ "known": {"LinkML": "T-3798"}
 }

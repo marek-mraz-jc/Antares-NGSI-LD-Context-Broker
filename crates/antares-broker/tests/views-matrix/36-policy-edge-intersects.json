@@ -90,5 +90,6 @@
    "speed",
    "vehicleType"
   ]
- }
+ },
+ "known": {"LinkML": "T-3798"}
 }

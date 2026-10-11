@@ -22,5 +22,6 @@
  "expect": {},
  "caller": {
   "x-jc-roles": "public"
- }
+ },
+ "linkml": {"Vehicle": ["location", "operator", "speed", "vehicleType"]}
 }

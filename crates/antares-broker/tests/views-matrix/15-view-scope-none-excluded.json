@@ -68,5 +68,6 @@
  },
  "caller": {
   "x-jc-roles": "public"
- }
+ },
+ "linkml": {"Sensor": ["location", "operator", "temperature"], "Vehicle": ["location", "operator", "speed", "vehicleType"]}
 }

@@ -120,6 +120,10 @@ CI jobs named below (all in Antares `.github/workflows/`):
   Vehicles without a shown `location` (`bbox` keeps them, Part 1 Req 24 C). A surface may refuse a
   name the view hides with `400` where NGSI-LD omits it. Every pager stops after 50 pages, so a
   next link without end is a mismatch, not a hang.
+- LinkML (a build with `linkml`, as CI's all-features): `classes/{class}` of each type through the
+  view as the caller, each kept class with its slot names. By default each admitted type with the
+  names its admitted Entities show, and none for a denied caller; a scenario states `linkml` where a
+  rule's condition drops the Entities but not the class (linkml.md 2).
 - A mismatch with a fix task filed is listed in the scenario's `known` (surface to task id) and
   must still fail, so the fix removes the entry; the test prints the list.
 - Job: `workspace-tests` (all-features).

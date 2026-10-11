@@ -60,5 +60,6 @@
    "scopeQ": "/Zilina/police"
   }
  ],
- "expect": {}
+ "expect": {},
+ "linkml": {"Vehicle": ["location", "speed"]}
 }

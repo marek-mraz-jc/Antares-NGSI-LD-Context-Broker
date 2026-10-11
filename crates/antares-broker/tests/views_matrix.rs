@@ -209,6 +209,12 @@ async fn broker() -> (Router, antares_ops::views::Reload) {
         antares_ops::mount(antares_mcp::Mcp),
         antares_ops::mount(antares_ws::ViewWs::process()),
     ];
+    #[cfg(feature = "linkml")]
+    let surfaces = {
+        let mut all = surfaces;
+        all.push(antares_ops::mount(antares_linkml::Linkml));
+        all
+    };
     let state = state.with_surfaces(surfaces).expect("the surfaces mount");
     let reload = antares_ops::views::install(&state)
         .await
@@ -781,6 +787,48 @@ async fn rows(app: &Router, s: &Scenario, want: &Expect, failures: &mut Vec<Stri
     );
 }
 
+/// The LinkML class of each type through the view (`classes/{class}`):
+/// the type's name with its slot names, a class the caller may not see
+/// (`404`, LK1) holding nothing.
+#[cfg(feature = "linkml")]
+async fn linkml(app: &Router, s: &Scenario) -> Read {
+    let mut out = Answer::new();
+    for t in TYPES {
+        let uri = format!("/x/views/{}/linkml/classes/{t}", s.view());
+        let (status, _, body) = send(app, "GET", &uri, &with_tenant(s), None).await;
+        match status {
+            StatusCode::OK => {
+                let slots = body["slots"].as_array().into_iter().flatten();
+                out.insert(t.to_owned(), slots.map(|slot| text(slot, "name")).collect());
+            }
+            StatusCode::NOT_FOUND => {}
+            _ => return Read::Refused(status, body),
+        }
+    }
+    let n = u64::try_from(out.len()).ok();
+    Read::Entities(out, n)
+}
+
+/// The classes LinkML serves where NGSI-LD answers `want`: each admitted
+/// type with the names its admitted Entities show, unless the scenario
+/// states `linkml` (a rule's condition is not read, linkml.md 2, so a
+/// class whose Entities a condition drops still shows). A denied caller
+/// sees no class.
+#[cfg(feature = "linkml")]
+fn classes(want: &Expect, stated: &Value) -> Expect {
+    if let Some(stated) = stated.as_object() {
+        return expect(&Value::Object(stated.clone()));
+    }
+    let mut out = Answer::new();
+    if let Expect::Admitted(want) = want {
+        for (id, names) in want {
+            let t = id.split(':').nth(2).unwrap_or_default().to_owned();
+            out.entry(t).or_default().extend(names.iter().cloned());
+        }
+    }
+    Expect::Admitted(out)
+}
+
 /// What a temporal query answers where the snapshot answers `want`: an
 /// Entity shows in it only through an instance of a shown Attribute, so one
 /// shown with its frame alone is absent (ADR-0023 rule 11, temporal);
@@ -1019,6 +1067,13 @@ async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
         }
         check(&app, s, &want, &s.doc["temporal"], &mut failures).await;
         rows(&app, s, &want, &mut failures).await;
+        #[cfg(feature = "linkml")]
+        judge(
+            "LinkML",
+            linkml(&app, s).await,
+            &classes(&want, &s.doc["linkml"]),
+            &mut failures,
+        );
         for (n, st) in s.doc["steps"].as_array().into_iter().flatten().enumerate() {
             let mut after = Vec::new();
             step(&app, s, st, &mut after).await;
@@ -1036,6 +1091,10 @@ async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
         let of =
             |f: &str, surface: &str| f.starts_with(surface) || f.contains(&format!(": {surface}"));
         for (surface, task) in &known {
+            // a surface this build does not serve has nothing to match
+            if surface == "LinkML" && !cfg!(feature = "linkml") {
+                continue;
+            }
             let hits = failures.iter().filter(|f| of(f, surface)).count();
             if hits == 0 {
                 report.push(format!(
