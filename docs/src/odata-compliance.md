@@ -111,7 +111,8 @@ A deliberate break proved the gate: the error response stopped sending the
 The pass rate counts passed and failed tests; skipped tests stay out of it.
 The baseline was first recorded on dev `f0da234` (T-3714) and raised by
 T-3719, which reads a form-encoded query, T-3723, which declares `$batch`
-and serves `HEAD`, T-3720, which keys a set by its LinkML identifier and
+and serves `HEAD`, T-3731, which answers an empty path segment with 400,
+T-3720, which keys a set by its LinkML identifier and
 serves `$entity`, and T-3722, which narrows Edm types and writes the Core
 and Capabilities terms the schema states (section 6):
 
