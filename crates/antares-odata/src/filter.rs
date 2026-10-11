@@ -268,9 +268,9 @@ impl Terms<'_> {
         // `_types`, the system members) are F22, F28 and F33.
         let member = self.set.members.get(name).ok_or(Refused::Later)?;
         match &member.shape {
-            Shape::Value {
-                collection: false, ..
-            } => {}
+            // The same test the model's NonFilterableProperties and
+            // NonSortableProperties are written from (C11, C12).
+            s if s.scalar() => {}
             Shape::Json => return Err(Refused::Bad),
             _ => return Err(Refused::Later),
         }

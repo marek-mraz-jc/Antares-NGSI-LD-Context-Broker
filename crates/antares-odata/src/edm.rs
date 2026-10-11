@@ -70,6 +70,19 @@ impl Shape {
         )
     }
 
+    /// Whether this round's `$filter` and `$orderby` take it: a
+    /// single-valued value, the one form a `q` term compares today.
+    #[must_use]
+    pub fn scalar(&self) -> bool {
+        matches!(
+            self,
+            Self::Value {
+                collection: false,
+                ..
+            }
+        )
+    }
+
     /// Whether `$orderby` may name it (C12).
     #[must_use]
     pub fn sortable(&self) -> bool {
@@ -143,7 +156,6 @@ pub fn build(
         ty.base_type = Some(BASE.into());
         ty.annotations.push(iri(&schema.class_iri(class)));
         let mut set = EntitySet::new(name.clone(), format!("{namespace}.{name}"));
-        set.annotations = capabilities();
         let mut members = BTreeMap::new();
         for (slot_name, slot) in schema.class_slots(class) {
             let slot_iri = schema.slot_iri(slot_name);
@@ -195,6 +207,7 @@ pub fn build(
                 },
             );
         }
+        set.annotations = capabilities(&members);
         container.entity_sets.push(set);
         types.push(ty);
         sets.insert(
@@ -341,21 +354,65 @@ fn core(term: &str) -> Annotation {
     Annotation::new(format!("Core.{term}"), Expr::Bool(true))
 }
 
-/// C2 to C16 for a read-only round: no write, counting, filtering and
-/// sorting on.
-fn capabilities() -> Vec<Annotation> {
-    let restriction = |term: &str, member: &str, value: bool| {
+/// C2 to C16 for a read-only round: no write; counting; filtering and
+/// sorting on the members [`Shape::scalar`] admits and `id` (C11, C12);
+/// expanding one level (C13). Advisory: every request is still gated (O25).
+fn capabilities(members: &BTreeMap<String, Member>) -> Vec<Annotation> {
+    let flag = |value: bool| Expr::Bool(value);
+    let restriction = |term: &str, record: Vec<(&str, Expr)>| {
         Annotation::new(
             format!("Capabilities.{term}"),
-            Expr::Record(vec![(member.into(), Expr::Bool(value))]),
+            Expr::Record(record.into_iter().map(|(m, v)| (m.into(), v)).collect()),
         )
     };
+    let unserved: Vec<Expr> = ["_types", "scope", "createdAt", "modifiedAt"]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(
+            members
+                .iter()
+                .filter(|(_, m)| !m.shape.scalar() && !matches!(m.shape, Shape::Nav { .. }))
+                .map(|(name, _)| name.clone()),
+        )
+        .map(Expr::PropertyPath)
+        .collect();
     vec![
-        restriction("InsertRestrictions", "Insertable", false),
-        restriction("UpdateRestrictions", "Updatable", false),
-        restriction("DeleteRestrictions", "Deletable", false),
-        restriction("CountRestrictions", "Countable", true),
-        restriction("SearchRestrictions", "Searchable", false),
+        restriction("InsertRestrictions", vec![("Insertable", flag(false))]),
+        restriction(
+            "UpdateRestrictions",
+            vec![
+                ("Updatable", flag(false)),
+                ("Upsertable", flag(false)),
+                ("DeltaUpdateSupported", flag(false)),
+            ],
+        ),
+        restriction("DeleteRestrictions", vec![("Deletable", flag(false))]),
+        restriction("CountRestrictions", vec![("Countable", flag(true))]),
+        restriction("SearchRestrictions", vec![("Searchable", flag(false))]),
+        restriction(
+            "FilterRestrictions",
+            vec![
+                ("Filterable", flag(true)),
+                ("MaxLevels", Expr::Int(1)),
+                (
+                    "NonFilterableProperties",
+                    Expr::Collection(unserved.clone()),
+                ),
+            ],
+        ),
+        restriction(
+            "SortRestrictions",
+            vec![
+                ("Sortable", flag(true)),
+                ("NonSortableProperties", Expr::Collection(unserved)),
+            ],
+        ),
+        restriction(
+            "ExpandRestrictions",
+            vec![("Expandable", flag(true)), ("MaxLevels", Expr::Int(1))],
+        ),
+        restriction("DeepInsertSupport", vec![("Supported", flag(false))]),
+        restriction("DeepUpdateSupport", vec![("Supported", flag(false))]),
     ]
 }
 
@@ -373,6 +430,7 @@ fn container_capabilities() -> Vec<Annotation> {
             },
         ),
         flag("BatchSupported", false),
+        flag("QuerySegmentSupported", false),
         flag("CrossJoinSupported", false),
         flag("ComputeSupported", false),
         flag("KeyAsSegmentSupported", false),
