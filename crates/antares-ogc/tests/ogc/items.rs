@@ -2,7 +2,10 @@
 //! Part 1 Core: `/items` and `/items/{featureId}` (mapping rows C8, C10 to C14, C16, C18,
 //! C19), through the view and through a narrowing engine.
 
-use crate::common::{fixture, get, href, ids, local, narrowed, send, SCHEMA};
+use crate::common::{
+    fixture, fixture_with, get, href, ids, local, narrowed, schemas_on, send, SCHEMA,
+};
+use antares_ops::test_kit::TestBroker;
 use axum::http::StatusCode;
 use serde_json::{json, Value};
 
@@ -365,5 +368,25 @@ async fn a_tenant_that_holds_nothing_is_an_empty_collection() -> Result<(), Stri
         ),
         (StatusCode::OK, Some(&json!(0)), Some(&json!([])))
     );
+    Ok(())
+}
+
+/// T-3773: an NGSI-LD answer past the broker's buffer bound is a 413 problem, never a 200
+/// holding the whole body or an empty collection; `HEAD` measures its `GET` under the same bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_past_the_buffer_bound_is_413() -> Result<(), String> {
+    schemas_on();
+    let f = fixture_with(TestBroker::with_max_answer_bytes(128).await?).await?;
+    let a = get(&f.app, CARS).await;
+    assert_eq!(a.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", a.body);
+    assert_eq!(a.body.get("status"), Some(&json!(413)), "{}", a.body);
+    assert!(
+        !a.body.to_string().contains("urn:ngsi-ld:Car"),
+        "{}",
+        a.body
+    );
+    let head = send(&f.app, "HEAD", "/x/views/city/ogc/features/api", "", &[]).await;
+    assert_eq!(head.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(head.bytes, 0, "HEAD sends no body");
     Ok(())
 }

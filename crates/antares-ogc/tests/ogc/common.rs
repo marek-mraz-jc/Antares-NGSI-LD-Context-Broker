@@ -100,7 +100,7 @@ pub async fn fixture() -> Result<Fixture, String> {
 }
 
 /// The broker takes schemas only when their bound is set, read when it starts.
-fn schemas_on() {
+pub fn schemas_on() {
     std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
 }
 

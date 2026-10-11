@@ -354,9 +354,10 @@ async fn query(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
+    let bytes = view
+        .read_answer(answer.into_body())
         .await
-        .unwrap_or_default();
+        .map_err(|r| Problem(r.status(), antares_ops::bounds::ANSWER_TOO_LARGE))?;
     let docs = serde_json::from_slice::<Vec<Value>>(&bytes).unwrap_or_default();
     Ok((docs, total))
 }

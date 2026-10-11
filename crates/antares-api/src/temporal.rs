@@ -1568,9 +1568,9 @@ async fn query_temporal_outer(
         eff.insert("limit".into(), st.max_limit.to_string());
         eff.insert("id".into(), chunk.join(","));
         let resp = query_temporal_inner(st, &eff, headers, &filter).await?;
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
             .await
-            .map_err(|_| NgsiError::InternalError("entityMap recheck read".into()))?;
+            .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;
         matching.extend(
             serde_json::from_slice::<Value>(&bytes)
                 .ok()
@@ -3709,9 +3709,9 @@ pub(crate) async fn build_temporal_map(
     // Box::pin: build_temporal_map is reachable from query_temporal_inner
     // (entityMap=true), so this recursive edge needs indirection.
     let resp = Box::pin(query_temporal_inner(st, &eff, headers, filter)).await?;
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
         .await
-        .map_err(|e| NgsiError::InternalError(format!("temporal candidate read: {e}")))?;
+        .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;
     // 5.5.14: the map FIXES the Entities considered by every later request, so
     // an unreadable candidate set must fail rather than become "no candidates".
     let candidates: Value = serde_json::from_slice(&bytes)

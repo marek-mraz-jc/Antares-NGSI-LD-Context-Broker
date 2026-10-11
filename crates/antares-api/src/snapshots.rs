@@ -804,9 +804,9 @@ async fn run_temporal_query(
             ApiError::Ngsi(n) => n,
             other => opaque("temporal query execution", &other),
         })?;
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
             .await
-            .map_err(|e| opaque("temporal result read", &e))?;
+            .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;
         let arr: Vec<Value> = serde_json::from_slice::<Value>(&bytes)
             .ok()
             .and_then(|v| v.as_array().cloned())
@@ -1738,6 +1738,44 @@ mod clause_5_16 {
     /// potentially exhaust client or server resources … implementations
     /// shall raise an error of type TooManyResults." A fill copies its
     /// results, so the ceiling is enforced before anything is copied.
+    /// 5.5.6 and T-3773: a temporal fill page larger than the broker buffers
+    /// for one request is TooManyResults, not held whole in memory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clause_5_5_6_fill_stops_at_the_answer_byte_bound() {
+        let mut st = state().await;
+        let ent = json!({"id": "urn:ngsi-ld:Vehicle:big", "type": "Vehicle",
+            "speed": {"type": "Property", "value": 80}});
+        let (status, _, b) = post_json(&st, "/ngsi-ld/v1/entities", &ent).await;
+        assert_eq!(status, StatusCode::CREATED, "{b}");
+        st.max_answer_bytes = 16;
+        let doc = json!({"type": "Snapshot",
+            "snapshotTemporalQueries": [{"type": "Query", "entities": [{"type": "Vehicle"}],
+                "temporalQ": {"timerel": "after", "timeAt": "2000-01-01T00:00:00Z",
+                    "timeproperty": "createdAt"}}]});
+        let (status, headers, body) = post_json(&st, "/ngsi-ld/v1/snapshots", &doc).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let loc = header(&headers, "Location").expect("Location").to_owned();
+        let mut ready = Value::Null;
+        for _ in 0..200 {
+            let (_, _, b) = send(&st, "GET", &loc, None, &[]).await;
+            if b["snapshotStatus"] != "preparing" {
+                ready = b;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(ready["snapshotStatus"], "failure", "{ready}");
+        let detail = ready["snapshotTemporalQueriesDetails"][0]["problemDetails"].clone();
+        assert!(
+            detail["type"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("TooManyResults"),
+            "{ready}"
+        );
+        assert_eq!(detail["detail"], crate::bounds::ANSWER_TOO_LARGE, "{ready}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn clause_5_5_6_fill_stops_at_the_result_ceiling() {
         let mut st = state().await;

@@ -461,6 +461,29 @@ async fn odata_batch_member_is_refused_like_the_request_alone() {
     );
 }
 
+/// T-3773: a member whose answer is past the broker's buffer bound answers
+/// 413 inside the batch; the members under it still answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_batch_member_past_the_buffer_bound_is_413() {
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
+    let b = TestBroker::with_max_answer_bytes(512)
+        .await
+        .expect("broker");
+    let (_b, app) = city_on(b).await.expect("city");
+    let members = json!([
+        {"id": "1", "method": "get", "url": "$metadata"},
+        {"id": "2", "method": "get", "url": "Car?$top=1&$select=speed"}
+    ]);
+    let go_on = [("Prefer", "odata.continue-on-error")];
+    let (status, _, answer) = json_batch(&app, &members, &go_on).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(statuses(&answer), [413, 200], "{answer}");
+    assert_eq!(
+        answer["responses"][0]["body"]["error"]["code"], "PayloadTooLarge",
+        "{answer}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn odata_batch_itself_is_refused_whole() {
     let (_b, app, engine) = broker().await.expect("broker");

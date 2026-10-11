@@ -27,6 +27,15 @@ pub static MAX_BODY_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new
 });
 pub const MAX_URI_BYTES: usize = 8 * 1024; // → bare 414
 pub const MAX_JSON_DEPTH: usize = 64; // → 400 BadRequestData
+/// → 403 TooManyResults (5.5.6) on the NGSI-LD API, 413 on a surface
+/// (`antares_ops::Refusal::Limit`). The most bytes of one in-process answer
+/// a handler buffers before reading it (a temporal candidate set, a
+/// snapshot fill page, a surface's query): the page size bounds the Entity
+/// count, not the bytes, and every concurrent request holds its buffer.
+/// `AppState::max_answer_bytes` carries it, so a test can lower it.
+pub const MAX_ANSWER_BYTES: usize = 64 * 1024 * 1024;
+/// The fixed detail of an answer past [`MAX_ANSWER_BYTES`].
+pub const ANSWER_TOO_LARGE: &str = "the answer is larger than the broker buffers for one request";
 /// → 400 BadRequestData. Maximum coordinate positions in a QUERY geometry
 /// (4.10 geoQ, 4.23 ordering reference). The spec sets no ceiling, and the
 /// geometry is not bounded by the URI length on the POST query path — the

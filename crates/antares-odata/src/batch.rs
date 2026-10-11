@@ -16,6 +16,7 @@
 
 use crate::query_in_body;
 use antares_ops::bounds::{MAX_BATCH_ITEMS, MAX_BODY_BYTES};
+use antares_ops::Ops;
 use axum::extract::Request;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
@@ -55,6 +56,7 @@ const BATCH_ONLY: [&str; 6] = [
 /// (`inner_root`); `service_root` is the root a client writes.
 pub(crate) async fn serve(
     routed: &Router,
+    ops: &Ops,
     (service_root, inner_root): (&str, &str),
     req: Request,
     max_query_len: usize,
@@ -143,7 +145,15 @@ pub(crate) async fn serve(
             failed.push(true);
             continue;
         }
-        let answer = run(routed, &parts, member, (&target, headers), max_query_len).await;
+        let answer = run(
+            routed,
+            ops,
+            &parts,
+            member,
+            (&target, headers),
+            max_query_len,
+        )
+        .await;
         let failure = answer.status >= 400;
         answers.push(odata_batch::Response { id, ..answer });
         failed.push(failure);
@@ -159,6 +169,7 @@ pub(crate) async fn serve(
 /// over them.
 async fn run(
     routed: &Router,
+    ops: &Ops,
     outer: &axum::http::request::Parts,
     member: odata_batch::Request,
     (target, own): (&str, Vec<(HeaderName, HeaderValue)>),
@@ -200,9 +211,24 @@ async fn run(
         }
         Err(_) => bad("a batch member URL is not a URL").into_response(),
     };
-    let status = answer.status().as_u16();
-    let headers = answer
-        .headers()
+    // A member's answer is buffered to be framed; past the broker's bound
+    // the member answers 413 instead.
+    let (parts, body) = answer.into_parts();
+    let (parts, body) = if let Ok(body) = ops.read_answer(body).await {
+        (parts, body)
+    } else {
+        let (parts, body) = ODataErrorResponse::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "PayloadTooLarge",
+            antares_ops::bounds::ANSWER_TOO_LARGE,
+        )
+        .into_response()
+        .into_parts();
+        (parts, ops.read_answer(body).await.unwrap_or_default())
+    };
+    let status = parts.status.as_u16();
+    let headers = parts
+        .headers
         .iter()
         .filter(|(name, _)| *name != CONTENT_LENGTH)
         .map(|(name, value)| {
@@ -210,12 +236,7 @@ async fn run(
             (name.as_str().to_owned(), value)
         })
         .collect();
-    // ponytail: a member's answer is buffered whole; its size is bounded by
-    // the page size a read is cut to.
-    let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
-        .await
-        .map(|b| b.to_vec())
-        .unwrap_or_default();
+    let body = body.to_vec();
     odata_batch::Response {
         id: None,
         status,
