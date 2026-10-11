@@ -9,6 +9,7 @@ mod service;
 mod w1_to_w20 {
 
     use crate::service::{minimal, model, resource, ROOT};
+    use odata_csdl::{Annotation, EntitySet, EntityType, Expr, Property, TypeRef};
     use odata_json::{
         read_entity_body, read_property_body, read_reference_body, BodyError, BodyLimit,
         BodyLimits, EntityPayload, Feature, Resource, Target, WriteKind,
@@ -213,6 +214,84 @@ mod w1_to_w20 {
             assert_eq!(update(&body), Err(error), "{body}");
         }
         assert_eq!(create(&json!([])), Err(BodyError::NotAnObject));
+    }
+
+    /// The City model plus `Minted` (key `Core.ComputedDefaultValue`) and
+    /// `Sealed` (key `Core.Computed`): keys the service computes.
+    fn read_service_keyed(set: &str, body: &Value) -> Result<EntityPayload, BodyError> {
+        let mut model = model();
+        let city = model
+            .schemas
+            .first_mut()
+            .ok_or(BodyError::UnknownProperty)?;
+        for (name, term) in [
+            ("Minted", "Core.ComputedDefaultValue"),
+            ("Sealed", "Org.OData.Core.V1.Computed"),
+        ] {
+            let mut ty = EntityType::new(name);
+            ty.key.push("id".into());
+            let mut id = Property::new("id", TypeRef::single("Edm.Guid")).required();
+            id.annotations.push(Annotation::new(term, Expr::Bool(true)));
+            ty.properties = vec![id, Property::new("name", TypeRef::single("Edm.String"))];
+            city.entity_types.push(ty);
+            let mut set = EntitySet::new(name, format!("City.{name}"));
+            set.annotations.push(Annotation::new(
+                "Capabilities.InsertRestrictions",
+                Expr::Record(vec![(
+                    "RequiredProperties".into(),
+                    Expr::Collection(vec![Expr::PropertyPath("name".into())]),
+                )]),
+            ));
+            if let Some(service) = city.entity_container.as_mut() {
+                service.entity_sets.push(set);
+            }
+        }
+        read_entity_body(
+            &minimal(),
+            &resource(&model, set),
+            WriteKind::Create,
+            body.to_string().as_bytes(),
+            &BodyLimits::strict(),
+        )
+    }
+
+    #[test]
+    fn a_create_leaves_out_a_key_the_service_computes() {
+        const GUID: &str = "0f9e8d7c-6b5a-4938-8271-605f4e3d2c1b";
+        // Core.ComputedDefaultValue: left out, or named by the client
+        let minted = read_service_keyed("Minted", &json!({"name": "a"}));
+        assert_eq!(
+            minted.map(|p| (p.key.len(), p.properties.len())),
+            Ok((0, 1))
+        );
+        let named = read_service_keyed("Minted", &json!({"id": GUID, "name": "a"}));
+        assert_eq!(named.map(|p| p.key), Ok(vec![("id".into(), json!(GUID))]));
+        // Core.Computed: left out, and never in a body
+        assert!(read_service_keyed("Sealed", &json!({"name": "a"})).is_ok());
+        assert_eq!(
+            read_service_keyed("Sealed", &json!({"id": GUID})),
+            Err(read_only("id"))
+        );
+        // a key the client names is still required
+        assert_eq!(
+            read("People", WriteKind::Create, &json!({})),
+            Err(BodyError::MissingKey {
+                property: "id".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_create_names_every_required_property() {
+        let missing = Err(BodyError::MissingProperty {
+            property: "name".into(),
+        });
+        assert_eq!(read_service_keyed("Minted", &json!({})), missing);
+        assert_eq!(
+            read_service_keyed("Minted", &json!({"name": null})),
+            missing
+        );
+        assert!(read_service_keyed("Minted", &json!({"name": ""})).is_ok());
     }
 
     #[test]

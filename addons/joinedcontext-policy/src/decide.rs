@@ -323,6 +323,143 @@ mod tests {
         decide(Some(table), &caller(), &op, Utc::now())
     }
 
+    fn iri(name: &str) -> String {
+        context().expand_key(name)
+    }
+
+    /// `on`, with the request's types, Attributes and the caller's
+    /// restriction given.
+    fn with(
+        table: &Table,
+        clause: &'static str,
+        types: &[String],
+        attrs: &[String],
+        body: Option<&Value>,
+        restricted: bool,
+    ) -> Decision {
+        let op = Operation {
+            types,
+            attrs,
+            body,
+            ..Operation::new(clause)
+        };
+        let caller = Caller::Platform(Platform {
+            roles: ["r".to_owned()].into(),
+            restricted,
+            ..Platform::default()
+        });
+        decide(Some(table), &caller, &op, Utc::now())
+    }
+
+    /// T-3729: a prohibition naming no type covers a typed operation, and
+    /// one naming types covers an operation that names none.
+    #[test]
+    fn a_prohibition_covers_what_its_types_do_not_tell_apart() -> Result<(), String> {
+        let prohibited = Decision::Deny(PROHIBITED.into());
+        let every_type = table(&json!({"effect": "prohibit", "information": [],
+                                       "operations": ["5.7.2"]}))?;
+        assert_eq!(
+            with(&every_type, "5.7.2", &car(), &[], None, false),
+            prohibited
+        );
+        let cars = table(&json!({"effect": "prohibit", "operations": ["5.7.2"]}))?;
+        assert_eq!(with(&cars, "5.7.2", &[], &[], None, false), prohibited);
+        assert_eq!(
+            with(&cars, "5.7.2", &[iri("Bus")], &[], None, false),
+            Decision::Deny(NOT_GRANTED.into()),
+            "another type is not prohibited, nor granted"
+        );
+        Ok(())
+    }
+
+    /// T-3729: a narrowed read carries the caller's wish to be told.
+    #[test]
+    fn a_read_carries_the_callers_restriction() -> Result<(), String> {
+        let t = table(&json!({"operations": ["5.7.2"]}))?;
+        for restricted in [true, false] {
+            let Decision::Filter(f) = with(&t, "5.7.2", &car(), &[], None, restricted) else {
+                return Err("a read by selector is a filter".into());
+            };
+            assert_eq!(f.restricted, restricted);
+        }
+        Ok(())
+    }
+
+    /// T-3729: the condition a write by id is held to is the selector's
+    /// condition alone, never what it shows or a window of its history.
+    #[test]
+    fn a_held_write_carries_the_condition_alone() -> Result<(), String> {
+        let speed = [iri("speed")];
+        let mut t = table(&json!({"q": "speed>1", "operations": ["5.6.3"],
+            "information": [{"entities": [{"type": "Car"}], "propertyNames": ["speed"]}]}))?;
+        let whole = table(&json!({"q": "speed>1", "operations": ["5.6.3"]}))?;
+        let window = table(&json!({"temporalQ": "timerel=after;timeAt=P-1D"}))?
+            .policies
+            .first()
+            .map(|p| p.conditions.temporal.clone())
+            .filter(|w| !w.is_empty())
+            .ok_or("no window")?;
+        // a selector given a window of its own still admits no history
+        if let Some(s) = t.policies.first_mut().and_then(|p| p.selectors.first_mut()) {
+            s.temporal = window;
+        }
+        for t in [&t, &whole] {
+            let Decision::AllowIf(held) = with(t, "5.6.3", &car(), &speed, None, false) else {
+                return Err("a conditioned write by id is held".into());
+            };
+            let rule = held.rules.first().ok_or("no rule")?;
+            assert!(rule.q.is_some() && rule.types == car());
+            assert!(
+                rule.attributes.is_empty() && !rule.every_attribute && rule.temporal.is_empty()
+            );
+        }
+        Ok(())
+    }
+
+    /// T-3729: a write by id whose body moves the Entity out of the granted
+    /// scope is refused before it is held to any condition.
+    #[test]
+    fn a_write_by_id_into_another_scope_is_refused() -> Result<(), String> {
+        let t = table(&json!({"scopeQ": "/city", "operations": ["5.6.3"]}))?;
+        let body = |s: &str| json!({ "scope": s });
+        assert!(matches!(
+            with(&t, "5.6.3", &car(), &[], Some(&body("/city/a")), false),
+            Decision::AllowIf(_)
+        ));
+        assert_eq!(
+            with(&t, "5.6.3", &car(), &[], Some(&body("/town")), false),
+            Decision::Deny(NOT_GRANTED.into())
+        );
+        Ok(())
+    }
+
+    /// T-3729: access control written into the data is refused in each
+    /// place it can hide: an Attribute named short or expanded, a body
+    /// member short or expanded.
+    #[test]
+    fn access_control_in_the_data_is_refused_in_every_form() -> Result<(), String> {
+        let t = table(&json!({}))?;
+        let plain = json!({ "type": car() });
+        assert_eq!(
+            with(&t, "5.6.1", &car(), &[], Some(&plain), false),
+            Decision::Allow
+        );
+        let member = |k: String| json!({ "type": car(), (k): 1 });
+        for (attrs, body) in [
+            (vec!["owner".to_owned()], plain.clone()),
+            (vec![iri("owner")], plain.clone()),
+            (Vec::new(), member("acl".into())),
+            (Vec::new(), member(iri("acl"))),
+        ] {
+            let d = with(&t, "5.6.1", &car(), &attrs, Some(&body), false);
+            assert!(
+                matches!(&d, Decision::Deny(why) if why.contains("is access control")),
+                "{attrs:?} {body}: {d:?}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn a_granted_clause_outside_the_entity_operations_is_allowed() -> Result<(), String> {
         let t = table(&json!({"q": "speed>1"}))?;

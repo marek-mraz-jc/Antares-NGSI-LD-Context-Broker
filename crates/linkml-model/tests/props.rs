@@ -205,6 +205,15 @@ fn classes_of(s: &Shape, names: &[String], slot_names: &[String]) -> BTreeMap<St
                 is_a,
                 slots: own,
                 slot_usage,
+                // the class annotations round-trip as the slot ones do
+                annotations: even(i)
+                    .then(|| {
+                        let tag = "odata_deletable".to_owned();
+                        let value = "false".to_owned();
+                        (tag.clone(), Annotation { tag, value })
+                    })
+                    .into_iter()
+                    .collect(),
                 description: shape.description.clone(),
             };
             (name.clone(), class)

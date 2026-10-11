@@ -90,8 +90,8 @@ mod round_trips {
         #[test]
         fn multipart_batches_read_back(members in members()) {
             let (body, expected) = multipart(&members);
-            // A body that starts with `--b` or holds `\r\n--b` is a delimiter; the writer refuses both.
-            prop_assume!(!members.iter().any(|m| [&b"\r\n"[..], &m.4].concat().windows(5).any(|w| w == b"\r\n--b")));
+            // A body that starts with `--b` or holds `\n--b` is a delimiter; the writer refuses both.
+            prop_assume!(!members.iter().any(|m| [&b"\n"[..], &m.4].concat().windows(4).any(|w| w == b"\n--b")));
             prop_assert_eq!(parse_multipart(&body, "b", &Limits::strict()).map(|b| b.requests), Ok(expected));
         }
 

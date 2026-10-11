@@ -64,8 +64,7 @@ fn any_literal(c: &mut Cursor<'_>) -> Result<Option<Literal>, UrlError> {
         return string_body(c).map(|s| Some(Literal::String(s)));
     }
     if guid(c) {
-        c.reset(start);
-        return Err(c.not_implemented(Feature::Literal));
+        return Ok(Some(Literal::Guid(c.slice(start).to_ascii_lowercase())));
     }
     c.reset(start);
     if let Some(text) = date_time_offset(c) {
@@ -719,7 +718,6 @@ mod tests {
             "binary'T0RhdGE'",
             "duration'P12DT23H59M59.999999999999S'",
             "Namespace.Pattern'Yellow'",
-            "01234567-89ab-cdef-0123-456789abcdef",
         ] {
             assert_eq!(
                 read(other).unwrap_err().kind,
@@ -730,6 +728,26 @@ mod tests {
         // A dotted name without a quote is a path, not an enum.
         assert_eq!(read("Namespace.Pattern").unwrap(), None);
         assert_eq!(read("Name").unwrap(), None);
+    }
+
+    #[test]
+    fn a_guid_is_read_lower_cased() {
+        // T-3720: the key of a set whose model names a GUID key.
+        assert_eq!(
+            ok("01234567-89AB-cdef-0123-456789abcdef"),
+            Literal::Guid("01234567-89ab-cdef-0123-456789abcdef".into())
+        );
+        assert_eq!(
+            Literal::Guid("01234567-89ab-cdef-0123-456789abcdef".into()).to_string(),
+            "01234567-89ab-cdef-0123-456789abcdef"
+        );
+        // A short group or a non-hex digit is no GUID.
+        for other in [
+            "01234567-89ab-cdef-456789abcdef",
+            "01234g67-89ab-cdef-0123-456789abcdef",
+        ] {
+            assert!(!matches!(first(other).0, Some(Literal::Guid(_))), "{other}");
+        }
     }
 
     #[test]

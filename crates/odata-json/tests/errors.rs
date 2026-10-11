@@ -137,6 +137,15 @@ mod o20 {
                 "the key property is missing",
             ),
             (
+                BodyError::MissingProperty {
+                    property: named("name"),
+                },
+                400,
+                "MissingProperty",
+                Some("name"),
+                "a required property is missing",
+            ),
+            (
                 BodyError::ReadOnly {
                     property: named("c"),
                 },

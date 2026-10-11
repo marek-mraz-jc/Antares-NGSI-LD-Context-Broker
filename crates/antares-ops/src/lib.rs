@@ -36,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+pub mod mapping;
 mod operation;
 pub mod views;
 
@@ -118,6 +119,7 @@ pub struct ViewOps {
     view: Arc<antares_api::views::CompiledView>,
     tenant: String,
     operations: Vec<OperationId>,
+    mapping: Option<Arc<mapping::Mapping>>,
 }
 
 /// The headers of the request a surface is answering, as the HTTP layer
@@ -243,16 +245,35 @@ impl Ops {
     /// that id is loaded: an unknown id, a view that failed validation and
     /// a removed one are the same answer.
     #[must_use]
+    ///
+    /// A view of another model (one with a `mapping`) is `None` here too:
+    /// only the NGSI-LD view root rebuilds its answers, so every other
+    /// surface answers it as an unknown view ([`Self::mapped_view`]).
     pub fn view(&self, id: &str) -> Option<ViewOps> {
+        self.mapped_view(id).filter(|v| v.mapping.is_none())
+    }
+
+    /// [`Self::view`], a view of another model included: for the NGSI-LD
+    /// view root, which inverts each request and rebuilds each answer
+    /// through [`ViewOps::mapping`].
+    #[must_use]
+    pub fn mapped_view(&self, id: &str) -> Option<ViewOps> {
         let table = self.state.views.snapshot();
         let Some(antares_api::views::ViewEntry::Loaded {
             view,
             tenant,
             operations,
+            mapping,
             ..
         }) = table.get(id)
         else {
             return None;
+        };
+        // the loader attaches nothing else, so a failed downcast is a view
+        // no surface serves
+        let mapping = match mapping {
+            None => None,
+            Some(a) => Some(a.0.clone().downcast::<mapping::Mapping>().ok()?),
         };
         let mut cache = self.views.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(hit) = cache.get(id).filter(|c| Arc::ptr_eq(&c.view, view)) {
@@ -266,6 +287,7 @@ impl Ops {
                 .iter()
                 .filter_map(|o| OperationId::from_id(o))
                 .collect(),
+            mapping,
         };
         // Only views loaded now stay cached: a removed one goes with the
         // first view served after its removal.
@@ -360,6 +382,13 @@ impl Ops {
 }
 
 impl ViewOps {
+    /// The compiled Mapping of a view of another model, `None` for a view
+    /// of the store's own model.
+    #[must_use]
+    pub fn mapping(&self) -> Option<&mapping::Mapping> {
+        self.mapping.as_deref()
+    }
+
     /// Whether the view allows `op`.
     #[must_use]
     pub fn allows(&self, op: OperationId) -> bool {
