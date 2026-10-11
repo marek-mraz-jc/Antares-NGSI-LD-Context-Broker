@@ -139,6 +139,9 @@ async fn broker() -> Result<(TestBroker, Router), String> {
 }
 
 const ROOT: &str = "/x/views/cars/odata/v4";
+/// The base a request without `Host` is answered under (no
+/// `ANTARES_PUBLIC_URL` in tests): context URLs are absolute.
+const PUBLIC: &str = "http://localhost:9090";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_entity_set_is_the_narrowed_query_mapped_through_the_model() {
@@ -152,7 +155,7 @@ async fn an_entity_set_is_the_narrowed_query_mapped_through_the_model() {
     let body = got.json();
     assert_eq!(
         body["@odata.context"],
-        format!("{ROOT}/$metadata#Car"),
+        format!("{PUBLIC}{ROOT}/$metadata#Car"),
         "{body}"
     );
     let cars = body["value"].as_array().cloned().unwrap_or_default();
@@ -180,6 +183,28 @@ async fn an_entity_set_is_the_narrowed_query_mapped_through_the_model() {
         "{}",
         got.body
     );
+}
+
+/// A path-only context URL is read as a file path by Microsoft.OData.Core
+/// on Linux (T-3688): the documents name the service by absolute URL.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_context_and_next_links_are_absolute_under_the_requests_host() {
+    let (_b, app) = broker().await.expect("broker");
+    let headers = [
+        ("Host", "broker.example:8443"),
+        ("Prefer", "odata.maxpagesize=1"),
+    ];
+    let got = send(&app, Method::GET, &format!("{ROOT}/Car"), None, &headers).await;
+    assert_eq!(got.status, StatusCode::OK, "{}", got.body);
+    let body = got.json();
+    let root = format!("http://broker.example:8443{ROOT}");
+    assert_eq!(
+        body["@odata.context"],
+        format!("{root}/$metadata#Car"),
+        "{body}"
+    );
+    let next = body["@odata.nextLink"].as_str().unwrap_or_default();
+    assert!(next.starts_with(&format!("{root}/Car?")), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -221,7 +246,7 @@ async fn top_and_skip_page_and_the_next_link_carries_the_rest() {
         .to_owned();
     assert!(
         next.starts_with(&format!(
-            "{ROOT}/Car?$filter=speed%20gt%201&$skiptoken=1.1."
+            "{PUBLIC}{ROOT}/Car?$filter=speed%20gt%201&$skiptoken=1.1."
         )),
         "{next}"
     );
@@ -295,7 +320,7 @@ async fn one_entity_by_key_and_hidden_answers_like_absent() {
         let body = got.json();
         assert_eq!(
             body["@context"],
-            format!("{ROOT}/$metadata#Car/$entity"),
+            format!("{PUBLIC}{ROOT}/$metadata#Car/$entity"),
             "{body}"
         );
         assert_eq!(body["speed"], 30.0, "{body}");
@@ -364,7 +389,7 @@ async fn select_projects_and_asks_only_for_what_it_names() {
     let body = got.json();
     assert_eq!(
         body["@odata.context"],
-        format!("{ROOT}/$metadata#Car(speed,createdAt)/$entity"),
+        format!("{PUBLIC}{ROOT}/$metadata#Car(speed,createdAt)/$entity"),
         "{body}"
     );
     let mut names: Vec<&str> = body

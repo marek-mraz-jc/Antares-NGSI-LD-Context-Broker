@@ -20,7 +20,7 @@ sbom() { # <name> [cargo-cyclonedx feature flags]
   mv "crates/antares-broker/antares-$name.cdx.json" "$out/"
   # cargo-cyclonedx writes one file per workspace member; the broker's is
   # the shipped binary's, the others go.
-  find crates examples -name "antares-$name.cdx.json" -type f -delete
+  find crates examples addons -name "antares-$name.cdx.json" -type f -delete
   # cargo-cyclonedx resolves features as `cargo metadata` does, for the
   # whole workspace: antares-ws's axum `ws` lands on the broker's one axum
   # although `-p antares-broker` builds none (T-3694), and optional crates

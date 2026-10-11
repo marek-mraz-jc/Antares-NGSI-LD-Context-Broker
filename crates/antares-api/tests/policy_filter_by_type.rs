@@ -1155,3 +1155,185 @@ async fn a_rule_over_every_attribute_shows_the_whole_entity() {
         keys(&["id", "type", "speed", "colour"])
     );
 }
+
+/// The ids of a GET page and whether its `Link` names a next page.
+async fn page(st: &AppState, uri: &str) -> (Vec<String>, bool) {
+    let resp = antares_api::router(st.clone())
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+    let next = resp
+        .headers()
+        .get_all("Link")
+        .iter()
+        .any(|l| l.to_str().unwrap_or_default().contains("rel=\"next\""));
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let list: Value = serde_json::from_slice(&bytes).unwrap();
+    (
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_owned())
+            .collect(),
+        next,
+    )
+}
+
+/// Every page of `uri` (`limit` 2), in order: each page's ids and whether
+/// it links a next one.
+async fn pages(st: &AppState, uri: &str) -> Vec<(Vec<String>, bool)> {
+    let mut out = Vec::new();
+    for offset in (0..).step_by(2) {
+        let got = page(st, &format!("{uri}&limit=2&offset={offset}")).await;
+        let last = !got.1;
+        out.push(got);
+        if last {
+            return out;
+        }
+    }
+    out
+}
+
+/// Five Cars (speed 0..4), two Users and two Bikes no rule names.
+async fn fleet(st: &AppState) {
+    for n in 0..5 {
+        create(
+            st,
+            json!({"id": format!("urn:ngsi-ld:Car:{n}"), "type": "Car",
+                   "speed": prop(json!(n)), "colour": prop(json!("red"))}),
+        )
+        .await;
+    }
+    for n in 0..2 {
+        create(
+            st,
+            json!({"id": format!("urn:ngsi-ld:User:{n}"), "type": "User",
+                   "name": prop(json!("Ana")), "email": prop(json!("a@example.org"))}),
+        )
+        .await;
+        create(
+            st,
+            json!({"id": format!("urn:ngsi-ld:Bike:{n}"), "type": "Bike",
+                   "speed": prop(json!(n))}),
+        )
+        .await;
+    }
+}
+
+fn id_list(kind: &str, ns: &[u8]) -> Vec<String> {
+    ns.iter()
+        .map(|n| format!("urn:ngsi-ld:{kind}:{n}"))
+        .collect()
+}
+
+/// T-3667: rules that select by type alone page in the store, so a page
+/// is the page of what the rules admit, `Link` says whether one follows,
+/// the count is theirs and a hidden Attribute stays hidden.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_under_type_rules_is_a_page_of_what_they_admit() {
+    let st = state(picks(&[("Car", &["speed"]), ("User", &["name"])])).await;
+    fleet(&st).await;
+    let uri = "/ngsi-ld/v1/entities?type=Car,User,Bike";
+    let got = pages(&st, uri).await;
+    let seen: Vec<String> = got.iter().flat_map(|p| p.0.clone()).collect();
+    let mut all = id_list("Car", &[0, 1, 2, 3, 4]);
+    all.extend(id_list("User", &[0, 1]));
+    assert_eq!(
+        {
+            let mut s = seen.clone();
+            s.sort();
+            s
+        },
+        all
+    );
+    assert_eq!(got.len(), 4, "{got:?}");
+    assert!(got[..3].iter().all(|p| p.0.len() == 2 && p.1), "{got:?}");
+    assert_eq!(got[3], (seen[6..].to_vec(), false));
+    assert_eq!(
+        count(&st, &format!("{uri}&count=true&limit=0")).await,
+        Some(7)
+    );
+    assert_eq!(
+        count(&st, "/ngsi-ld/v1/entities?type=Bike&count=true&limit=0").await,
+        Some(0)
+    );
+    assert_eq!(
+        page(&st, "/ngsi-ld/v1/entities?type=Bike&limit=1").await,
+        (vec![], false)
+    );
+    let (_, list) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Car&limit=1&offset=3",
+        None,
+    )
+    .await;
+    assert_eq!(
+        members(&list).into_values().collect::<Vec<_>>(),
+        [keys(&["id", "speed", "type"])]
+    );
+}
+
+/// A conditional rule is judged on the Entity, a page at a time: the page
+/// still holds only what the rule admits, and the last one links nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_under_a_conditional_rule_is_a_page_of_what_holds() {
+    let st = state(Filter {
+        rules: vec![Rule {
+            q: Some(Box::new(antares_ql::parse_q("speed>=2").unwrap())),
+            ..rule("Car", &["speed"])
+        }],
+        ..Filter::default()
+    })
+    .await;
+    fleet(&st).await;
+    let uri = "/ngsi-ld/v1/entities?type=Car,User,Bike";
+    let got = pages(&st, uri).await;
+    let mut seen: Vec<String> = got.iter().flat_map(|p| p.0.clone()).collect();
+    seen.sort();
+    assert_eq!(seen, id_list("Car", &[2, 3, 4]));
+    assert_eq!(
+        got.iter().map(|p| (p.0.len(), p.1)).collect::<Vec<_>>(),
+        [(2, true), (1, false)]
+    );
+    assert_eq!(
+        count(&st, &format!("{uri}&count=true&limit=0")).await,
+        Some(3)
+    );
+    let (one, next) = page(&st, &format!("{uri}&limit=1&offset=2")).await;
+    assert_eq!((one.len(), next), (1, false));
+}
+
+/// A rule naming ids is not judged by type: the page is cut after the ids
+/// are checked, so it never fills with Entities the rule refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_under_a_rule_naming_ids_holds_only_those() {
+    let st = state(Filter {
+        rules: vec![Rule {
+            ids: id_list("Car", &[1, 4]),
+            ..rule("Car", &["speed"])
+        }],
+        ..Filter::default()
+    })
+    .await;
+    fleet(&st).await;
+    let got = pages(&st, "/ngsi-ld/v1/entities?type=Car").await;
+    assert_eq!(got, [(id_list("Car", &[1, 4]), false)]);
+    let (one, next) = page(&st, "/ngsi-ld/v1/entities?type=Car&limit=1").await;
+    assert_eq!((one, next), (id_list("Car", &[1]), true));
+}
+
+/// A client `q` on an Attribute the rules hide reads it as absent, so the
+/// store never pages on it: `q=colour` finds no Car though each holds one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_q_under_type_rules_reads_the_entity_as_shown() {
+    let st = state(picks(&[("Car", &["speed"])])).await;
+    fleet(&st).await;
+    assert_eq!(
+        page(&st, "/ngsi-ld/v1/entities?type=Car&q=colour&limit=1").await,
+        (vec![], false)
+    );
+    let (one, next) = page(&st, "/ngsi-ld/v1/entities?type=Car&q=speed%3E=3&limit=1").await;
+    assert_eq!((one.len(), next), (1, true));
+}

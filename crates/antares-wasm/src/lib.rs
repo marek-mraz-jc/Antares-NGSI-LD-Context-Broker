@@ -95,7 +95,11 @@ impl Broker {
         // would ever delete them.
         #[cfg(target_arch = "wasm32")]
         {
-            let store = state.store.clone();
+            // both sweeps of the native loop: the store's 4.22 GC, then the
+            // documents with their own expiry (Registrations, Snapshots,
+            // EntityMaps). The store sweep was a future never awaited, so
+            // nothing was reaped (T-3698).
+            let sweeper = state.clone();
             let sweep_ms = js_sys::Reflect::get(&js_sys::global(), &"ANTARES_SWEEP_SECS".into())
                 .ok()
                 .and_then(|v| v.as_f64())
@@ -105,7 +109,8 @@ impl Broker {
             wasm_bindgen_futures::spawn_local(async move {
                 loop {
                     gloo_timers::future::TimeoutFuture::new(sweep_ms).await;
-                    store.sweep_expired();
+                    sweeper.store.sweep_expired().await;
+                    antares_api::sweep_expired_docs(&sweeper).await;
                 }
             });
         }

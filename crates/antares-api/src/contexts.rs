@@ -28,8 +28,22 @@ pub(crate) fn base_url(headers: &HeaderMap) -> String {
     context_base(std::env::var("ANTARES_PUBLIC_URL").ok().as_deref(), headers)
 }
 
-fn context_base(configured: Option<&str>, headers: &HeaderMap) -> String {
-    let base = match configured.map(str::trim).filter(|u| !u.is_empty()) {
+/// The URL this broker is reached at, with no trailing slash, for a
+/// document that names the broker's own resources by absolute URL (an
+/// OData context URL): `ANTARES_PUBLIC_URL`, else `http://{Host}` of the
+/// request, the same fallback as the JSON-LD context URL.
+///
+/// ```
+/// let headers = axum::http::HeaderMap::new();
+/// assert!(antares_api::public_base(&headers).starts_with("http"));
+/// ```
+#[must_use]
+pub fn public_base(headers: &HeaderMap) -> String {
+    broker_base(std::env::var("ANTARES_PUBLIC_URL").ok().as_deref(), headers)
+}
+
+fn broker_base(configured: Option<&str>, headers: &HeaderMap) -> String {
+    match configured.map(str::trim).filter(|u| !u.is_empty()) {
         Some(url) => url.trim_end_matches('/').to_owned(),
         None => {
             let host = headers
@@ -38,8 +52,14 @@ fn context_base(configured: Option<&str>, headers: &HeaderMap) -> String {
                 .unwrap_or("localhost:9090");
             format!("http://{host}")
         }
-    };
-    format!("{base}/ngsi-ld/v1/jsonldContexts")
+    }
+}
+
+fn context_base(configured: Option<&str>, headers: &HeaderMap) -> String {
+    format!(
+        "{}/ngsi-ld/v1/jsonldContexts",
+        broker_base(configured, headers)
+    )
 }
 
 /// Validate the `details` query param: absent | true | false (053_05 sends
