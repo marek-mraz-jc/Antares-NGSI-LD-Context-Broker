@@ -91,6 +91,7 @@ pub use antares_notifier::DeliveryPolicy;
 // The sink contract, so a surface reaches it through this crate and names no
 // antares-notifier (ADR-0027 section 1, rule M2).
 pub use antares_notifier::{DeliveryError, DeliveryFuture, NotificationSink, Outbound};
+pub use federation::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 pub use state::{AppState, TemporalRecord};
 
 /// Spawn for both targets — tokio natively, the JS microtask queue on

@@ -120,6 +120,11 @@ name = "dist_subs_5_8"
 path = "tests/dist_subs_5_8.rs"
 
 [[test]]
+# own process: sets ANTARES_PUBLIC_URL
+name = "forward_transport_adr0025"
+path = "tests/forward_transport_adr0025.rs"
+
+[[test]]
 # own process: sets ANTARES_MAX_FED_RESPONSE_BYTES
 name = "fed_bounds_5_7"
 path = "tests/fed_bounds_5_7.rs"
