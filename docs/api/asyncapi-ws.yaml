@@ -189,6 +189,7 @@ components:
             required: [x-op, x-connection, x-resume-token, x-seq]
             properties:
               x-op: { const: x-resume }
+              x-id: { $ref: '#/components/schemas/correlationId' }
               x-connection: { $ref: '#/components/schemas/connectionId' }
               x-resume-token: { type: string, pattern: '^[a-z2-7]{52}$' }
               x-seq:

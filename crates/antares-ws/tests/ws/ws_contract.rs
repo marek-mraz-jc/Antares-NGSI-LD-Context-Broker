@@ -171,6 +171,11 @@ fn read_and_the_document_agree_on_client_messages() {
             json!({"metadata": {"x-op": "x-resume", "x-connection": CONNECTION, "x-resume-token": TOKEN, "x-seq": 0}}),
         ),
         (
+            true,
+            "resume",
+            json!({"metadata": {"x-op": "x-resume", "x-id": "r", "x-connection": CONNECTION, "x-resume-token": TOKEN, "x-seq": 3}}),
+        ),
+        (
             false,
             "resume",
             json!({"metadata": {"x-op": "x-resume", "x-connection": CONNECTION, "x-resume-token": TOKEN}}),
