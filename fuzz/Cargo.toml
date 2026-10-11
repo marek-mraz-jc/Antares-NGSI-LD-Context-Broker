@@ -27,6 +27,7 @@ odata-json = { path = "../crates/odata-json" }
 antares-mcp = { path = "../crates/antares-mcp", features = ["fuzzing"] }
 odata-batch = { path = "../crates/odata-batch" }
 antares-ws = { path = "../crates/antares-ws" }
+antares-residual = { path = "../crates/antares-residual" }
 
 [[bin]]
 name = "parse_q"
@@ -199,6 +200,13 @@ bench = false
 [[bin]]
 name = "ws_client_message"
 path = "fuzz_targets/ws_client_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "residual_compile"
+path = "fuzz_targets/residual_compile.rs"
 test = false
 doc = false
 bench = false

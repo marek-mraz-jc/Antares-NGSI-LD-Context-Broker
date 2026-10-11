@@ -323,6 +323,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "antares-residual"
+version = "0.1.3"
+dependencies = [
+ "proptest",
+ "regex",
+ "serde_json",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "antares-sql"
 version = "0.1.3"
 dependencies = [

@@ -20,6 +20,7 @@ members = [
     "crates/odata-batch",
     "crates/odata-axum",
     "crates/ogc-cql2",
+    "crates/antares-residual",
     "crates/antares-views",
     "crates/antares-mcp",
     "crates/antares-linkml",
@@ -200,6 +201,10 @@ overflow-checks = true
 codegen-units = 1
 
 [profile.release.package.ogc-cql2]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-residual]
 overflow-checks = true
 codegen-units = 1
 

@@ -54,6 +54,7 @@ NEW_CRATES = set(SECTION_CRATE.values()) | {
     "odata-batch",
     "odata-axum",
     "linkml-model",
+    "antares-residual",
 }
 NAME = re.compile(r"^[a-z_][a-z0-9_]*$")
 TASK_TAG = re.compile(r"\(proposed,\s*(T-\d+)\b")

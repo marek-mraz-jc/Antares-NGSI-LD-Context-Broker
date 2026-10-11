@@ -62,6 +62,7 @@ Adopted from the threat model section 9.1 without change:
 | `antares-icsr` | internal context sources (ADR-0025) | `internal-csr` | `antares-ops` |
 | `odata-url`, `odata-csdl`, `odata-json`, `odata-batch`, `odata-axum` | protocol libraries (ADR-0024 decision 1) | none of their own | each other only; never an `antares-*` crate |
 | `linkml-model` | protocol library | none of its own | none in the workspace |
+| `antares-residual` | role `ops`: the residual evaluator of ADR-0028 (rule 2), pure, re-exported by `antares-ops` | none of its own | none in the workspace |
 
 `full = ["views", "odata", "mcp", "linkml", "ws", "internal-csr"]`;
 `default` stays `["mqtt"]` (`crates/antares-broker/Cargo.toml:56`), so
