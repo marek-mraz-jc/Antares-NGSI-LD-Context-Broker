@@ -1,7 +1,7 @@
 {
  "counts": {
-  "FAIL": 660,
-  "PASS": 456,
+  "FAIL": 658,
+  "PASS": 458,
   "SKIP": 71
  },
  "results": {
@@ -455,10 +455,10 @@
   "[V4] 11.2.6_query_format :: $format=xml on metadata returns XML": "PASS",
   "[V4] 11.2.6_query_format :: Accept: application/atom+xml returns Atom/XML, or 406 if Atom is unsupported": "PASS",
   "[V4] 11.2.6_query_format :: Invalid $format value returns error": "PASS",
-  "[V4] 11.2.7_metadata_levels :: Collection with metadata=full includes @odata.context and per-item @odata.id": "FAIL",
+  "[V4] 11.2.7_metadata_levels :: Collection with metadata=full includes @odata.context and per-item @odata.id": "PASS",
   "[V4] 11.2.7_metadata_levels :: Invalid odata.metadata value handling": "FAIL",
   "[V4] 11.2.7_metadata_levels :: odata.metadata=full includes type annotations": "FAIL",
-  "[V4] 11.2.7_metadata_levels :: odata.metadata=minimal includes @odata.context": "FAIL",
+  "[V4] 11.2.7_metadata_levels :: odata.metadata=minimal includes @odata.context": "PASS",
   "[V4] 11.2.7_metadata_levels :: odata.metadata=none excludes @odata.context": "FAIL",
   "[V4] 11.2.7_metadata_levels :: odata.metadata=none still returns entity data": "FAIL",
   "[V4] 11.2.8_delta_links :: Delta feed includes newly created entity": "FAIL",

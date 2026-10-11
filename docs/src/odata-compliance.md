@@ -111,15 +111,15 @@ A deliberate break proved the gate: the error response stopped sending the
 The pass rate counts passed and failed tests; skipped tests stay out of it.
 The baseline was first recorded on dev `f0da234` (T-3714) and raised by
 T-3719, which reads a form-encoded query, T-3723, which declares
-`$batch` and serves `HEAD` (section 6), and T-3731, which answers an empty
-path segment with 400:
+`$batch` and serves `HEAD` (section 6), T-3731, which answers an empty path
+segment with 400, and T-3742, which reads a percent-encoded `$format`:
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
 | Minimal | 155 | 113 | 25 | 57.8 % |
-| Intermediate | 170 | 174 | 6 | 49.4 % |
+| Intermediate | 172 | 172 | 6 | 50.0 % |
 | Advanced | 131 | 373 | 63 | 26.0 % |
-| **All** (suite summary) | 456 | 660 | 94 | 40.9 % |
+| **All** (suite summary) | 458 | 658 | 94 | 41.0 % |
 
 The first baseline (T-3714) stood at Minimal 37.5 %, Intermediate 28.2 % and
 Advanced 11.7 % (254 passed, 840 failed, 116 skipped).
@@ -140,6 +140,7 @@ Each failing area is a task, or a decision with its reason:
 | A create without a key is refused (`MissingKey`); the service does not mint one | 11.4.2 to 11.4.5, 11.4.12 to 11.4.15, 8.1.5, 8.2.3, 8.2.5, 8.2.8 | T-3721 |
 | Edm types beyond String, Double and Int64, enums, Core and Capabilities annotations from the LinkML schema | 4.4, 5.1.1.x, 5.1.4 to 5.1.8, 5.3, 14.1, vocab_* | T-3722 |
 | `BatchSupported` was declared false while `$batch` is served; HEAD on a collection or an Entity answered 501 | 11.4.9.x, 11.4.11 | T-3723: declared and served; the batch scripts run, their failures are in the baseline |
+| A `$format` media type written percent-encoded (Go `url.QueryEscape`: `application%2Fjson%3Bodata.metadata%3Dminimal`) is 400 or 406 | 11.2.7 | T-3742: read decoded, `%2F` as the separator when no `/` is written; the three tests that address `Products(<guid>)` pass with T-3720's key |
 | Multipart `$batch` framed with bare LF line ends; a JSON batch under `OData-MaxVersion: 4.0`; independent requests and `dependsOn` after a failure | 11.4.9, 11.4.9.1, 11.4.9.3, 19_json_batch | T-3726 |
 | Change sets and atomicity groups, Content-ID references | 11.4.9.1, 11.4.9.3, 19_json_batch | not supported, by design: ADR-0024 section 5 (W26), mapping row C18 |
 | A comparison or `in` between a property and a literal of another type answers 200 with no rows; an Int64 literal past its range is accepted | 11.3.6, 11.2.5.1, 5.1.1.5 | T-3725 |
