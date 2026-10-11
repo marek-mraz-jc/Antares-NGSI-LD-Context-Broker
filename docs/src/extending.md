@@ -208,7 +208,12 @@ widen the answer to. Its areas, `geo_q` and the list `geo_also`, each
 narrow too: the store query holds them beside the request's own geoquery
 and every one must hold, so a view and an engine that both narrow by area
 compose into one `Filter` with both (`Filter::areas()` reads them all). An
-engine with one area sets `geo_q` and leaves `geo_also` empty. A `pick`/`omit` name is read in the core `@context`,
+engine with one area sets `geo_q` and leaves `geo_also` empty. Its `rules`
+allow Attributes per rule (ADR-0023 rule 11): an Entity is served only when
+a rule selects it by one of its `types` and, if the rule lists `ids` or
+`id_patterns`, by its id (an id pattern is anchored at both ends, and one
+that does not compile matches nothing), and the rule's condition holds; it
+keeps the union of those rules' `attributes`. A `pick`/`omit` name is read in the core `@context`,
 never in the caller's, so a request cannot rebind the term a rule names
 and step out from under it; write the rule as an IRI and it is used as written, write it
 as a short name and it means what the default `@context` says. Set

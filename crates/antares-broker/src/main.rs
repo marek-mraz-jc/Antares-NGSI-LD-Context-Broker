@@ -885,12 +885,6 @@ async fn run(
     // default mounting put there, before the state is shared.
     let selected = api_surfaces(std::env::var("ANTARES_API_SURFACES").ok().as_deref())?;
     state = state.with_surfaces(selected.iter().map(|(_, build)| build()).collect())?;
-    // Endpoint views (ADR-0023 rule 10): the stored views loaded into the
-    // table every surface that serves through views opens on, `/q/views`
-    // on the admin surface, and the reload that keeps every pod's table
-    // within one interval of the store.
-    #[cfg(feature = "views")]
-    antares_ops::views::install(&state).await?;
     // The policy engine, from configuration and from the shelf this binary
     // was built with. Without one the broker asks `allow-all` and behaves
     // exactly as it did before the seam existed.
@@ -903,6 +897,13 @@ async fn run(
     if policy_name != antares_api::policy::BUILT_IN_NAME {
         state = state.with_policy(build_policy());
     }
+    // Endpoint views (ADR-0023 rule 10): the stored views loaded into the
+    // table every surface that serves through views opens on, `/q/views`
+    // and `/q/policy` on the admin surface, and the reload that keeps every
+    // pod's table within one interval of the store. After the engine: the
+    // reload hands it its rule documents (ADR-0020 amendment).
+    #[cfg(feature = "views")]
+    antares_ops::views::install(&state).await?;
     // The /q admin credential, before the router mounts the admin surface.
     // Unconfigured, /q serves as before and says so once, here.
     match antares_api::admin_auth::AdminAuth::from_config(

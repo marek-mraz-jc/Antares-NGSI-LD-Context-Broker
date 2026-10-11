@@ -268,6 +268,39 @@ fn and_pick(a: &[String], b: Vec<String>) -> Vec<String> {
     }
 }
 
+/// A rule's `ids` and `id_patterns`.
+type IdNarrowing = (Vec<String>, Vec<String>);
+
+/// The id narrowing of two rules that must both hold: one side's own when
+/// the other narrows no id; else the explicit ids of each side the other
+/// side selects, `None` when none is left (the pair holds for nothing).
+/// Two pattern lists have no conjunction a single list can say, so they
+/// refuse the composition rather than widen it.
+fn and_ids(x: &Rule, y: &Rule) -> Result<Option<IdNarrowing>, Denied> {
+    let narrows = |r: &Rule| !r.ids.is_empty() || !r.id_patterns.is_empty();
+    if !narrows(x) {
+        return Ok(Some((y.ids.clone(), y.id_patterns.clone())));
+    }
+    if !narrows(y) {
+        return Ok(Some((x.ids.clone(), x.id_patterns.clone())));
+    }
+    if !x.id_patterns.is_empty() && !y.id_patterns.is_empty() {
+        return Err(Denied(
+            "the view and the policy both narrow ids by pattern".into(),
+        ));
+    }
+    let mut ids: Vec<String> = x
+        .ids
+        .iter()
+        .filter(|i| y.selects_id(i))
+        .chain(y.ids.iter().filter(|i| x.selects_id(i)))
+        .cloned()
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok((!ids.is_empty()).then_some((ids, Vec::new())))
+}
+
 /// A member name no Entity carries: an expanded IRI under a scheme of its
 /// own, so no `@context` can map a term onto it.
 const NOTHING: &str = "urn:antares:views:nothing";
@@ -290,6 +323,9 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
             if types.is_empty() {
                 continue;
             }
+            let Some((ids, id_patterns)) = and_ids(x, y)? else {
+                continue;
+            };
             let (geo_q, geo_also) = and_geo(x.areas(), y.areas());
             out.push(Rule {
                 types,
@@ -297,6 +333,8 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
                 scope_q: and_scope(x.scope_q.as_deref(), y.scope_q.clone())?,
                 geo_q,
                 geo_also,
+                ids,
+                id_patterns,
                 attributes: shared(&x.attributes, y.attributes.clone()),
                 temporal: [x.temporal.as_slice(), y.temporal.as_slice()].concat(),
             });
@@ -315,6 +353,10 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
 /// rule 10). No client may name it, and no NGSI-LD route reads the
 /// document kind they are stored as.
 pub const VIEW_TENANT: &str = "antares-views";
+
+/// The reserved tenant the policy engine's rule documents live under
+/// (ADR-0020 amendment), one document per Tenant, keyed by its name.
+pub const POLICY_TENANT: &str = "antares-policy";
 
 /// One view of the table.
 #[derive(Debug, Clone)]
@@ -347,6 +389,7 @@ pub enum ViewEntry {
 pub struct ViewTable {
     entries: std::sync::RwLock<Arc<BTreeMap<String, ViewEntry>>>,
     admin: std::sync::OnceLock<axum::Router>,
+    policy: std::sync::RwLock<serde_json::Value>,
     schemas: std::sync::RwLock<Arc<BTreeMap<String, Schema>>>,
 }
 
@@ -472,6 +515,24 @@ impl ViewTable {
                 })
                 .collect(),
         )
+    }
+
+    /// What `/q/health` lists of the policy rule documents (ADR-0020
+    /// amendment): set by the loader on every reload, `null` until it runs
+    /// with an engine that reads documents. Tenant and revision only.
+    pub fn policy_report(&self) -> serde_json::Value {
+        self.policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace what [`policy_report`](Self::policy_report) answers.
+    pub fn set_policy_report(&self, report: serde_json::Value) {
+        *self
+            .policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = report;
     }
 
     /// The `/q/views` routes the loader serves, merged into the admin
@@ -1177,6 +1238,50 @@ mod tests {
             )
             .is_err(),
             "a rule outside the selector shows nothing"
+        );
+    }
+
+    /// Gap G2: both rules' id narrowings hold in the pair, and a pair no id
+    /// is left for holds for nothing.
+    #[test]
+    fn a_pair_keeps_both_id_narrowings() {
+        let by = |ids: &[&str], patterns: &[&str]| Rule {
+            ids: ids.iter().map(|i| (*i).to_owned()).collect(),
+            id_patterns: patterns.iter().map(|p| (*p).to_owned()).collect(),
+            ..rule(&["Car"], None, &["speed"])
+        };
+        let ids_of = |a: Rule, b: Rule| {
+            let pair = pair_rules(&[a], vec![b]).expect("pairs");
+            (pair[0].ids.clone(), pair[0].id_patterns.clone())
+        };
+        let (c1, c2, c10) = ("urn:Car:1", "urn:Car:2", "urn:Car:10");
+        let s = |v: &[&str]| v.iter().map(|i| (*i).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            ids_of(by(&[], &[]), by(&[c1], &["urn:Car:.*"])),
+            (s(&[c1]), s(&["urn:Car:.*"]))
+        );
+        assert_eq!(ids_of(by(&[c2], &[]), by(&[], &[])), (s(&[c2]), s(&[])));
+        assert_eq!(
+            ids_of(by(&[c1, c2], &[]), by(&[c2, c10], &[])),
+            (s(&[c2]), s(&[]))
+        );
+        assert_eq!(
+            ids_of(by(&[], &["urn:Car:1.*"]), by(&[c1, c2, c10], &[])),
+            (s(&[c1, c10]), s(&[])),
+            "explicit ids through the other side's pattern"
+        );
+        assert_eq!(
+            ids_of(by(&[c2], &[]), by(&[c1], &[])),
+            (s(&[]), s(&[])),
+            "nothing left: the pair holds for nothing"
+        );
+        assert_eq!(
+            pair_rules(&[by(&[c2], &[])], vec![by(&[c1], &[])]),
+            Ok(vec![Rule::default()])
+        );
+        assert!(
+            pair_rules(&[by(&[], &["a"])], vec![by(&[], &["b"])]).is_err(),
+            "two pattern lists refuse rather than widen"
         );
     }
 

@@ -1759,11 +1759,7 @@ async fn member_now(
 pub(crate) fn rules_per_instance(doc: &Value, rules: &crate::policy::Filter) -> Option<Value> {
     let ctx = crate::repr::policy_context();
     let types = crate::policy::entity_types(doc);
-    let typed: Vec<&crate::policy::Rule> = rules
-        .rules
-        .iter()
-        .filter(|r| r.types.iter().any(|t| types.contains(&t.as_str())))
-        .collect();
+    let typed: Vec<&crate::policy::Rule> = rules.rules.iter().filter(|r| r.selects(doc)).collect();
     if !rules.rules.is_empty() && typed.is_empty() {
         return None;
     }
