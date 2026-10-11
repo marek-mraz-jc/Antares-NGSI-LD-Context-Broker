@@ -297,6 +297,14 @@ impl ViewOps {
         self.view.shown_names()
     }
 
+    /// Whether the view shows every type and Attribute (ADR-0023 rule 12):
+    /// [`Self::shown_names`] is then empty and a surface offers a name by
+    /// its syntax alone.
+    #[must_use]
+    pub fn shows_every_name(&self) -> bool {
+        self.view.shows_every_name()
+    }
+
     /// For each of `ops`, whether the view allows it and the policy engine
     /// could allow a request of it for `caller`, asked in one probe in the
     /// view's Tenant (MCP D-3). The probe fails closed: an engine that fails

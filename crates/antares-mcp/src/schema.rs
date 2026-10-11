@@ -78,6 +78,9 @@ pub(crate) const fn req(name: &'static str, kind: Kind) -> Arg {
 pub(crate) struct Names {
     pub types: Vec<String>,
     pub attributes: Vec<String>,
+    /// The view shows every name (ADR-0023 rule 12): a name is offered and
+    /// taken by its pattern alone.
+    pub every: bool,
 }
 
 impl Names {
@@ -88,6 +91,24 @@ impl Names {
         Self {
             types: types.into_iter().filter(|t| is_type_name(t)).collect(),
             attributes: attributes.into_iter().filter(|a| is_attr_name(a)).collect(),
+            every: false,
+        }
+    }
+
+    /// Every name its pattern admits (ADR-0023 rule 12).
+    pub(crate) fn every() -> Self {
+        Self {
+            every: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether `t` is a type this view offers.
+    pub(crate) fn has_type(&self, t: &str) -> bool {
+        if self.every {
+            is_type_name(t)
+        } else {
+            self.types.iter().any(|n| n == t)
         }
     }
 }
@@ -113,8 +134,8 @@ fn is_entity_id(s: &str) -> bool {
 
 /// A name schema: the view's names as an enum while they are few, else
 /// the pattern alone.
-fn named(names: &[String], pattern: &str, max_len: usize) -> Value {
-    if names.len() <= MAX_ENUM {
+fn named(names: &[String], every: bool, pattern: &str, max_len: usize) -> Value {
+    if !every && names.len() <= MAX_ENUM {
         json!({"type": "string", "enum": names})
     } else {
         json!({"type": "string", "pattern": pattern, "maxLength": max_len})
@@ -127,11 +148,11 @@ fn schema_of(kind: Kind, names: &Names) -> Value {
         Kind::Ids => {
             json!({"type": "array", "maxItems": MAX_ITEMS, "items": schema_of(Kind::Id, names)})
         }
-        Kind::Type => named(&names.types, TYPE_NAME, 256),
+        Kind::Type => named(&names.types, names.every, TYPE_NAME, 256),
         Kind::Types => {
             json!({"type": "array", "minItems": 1, "maxItems": MAX_TYPES, "items": schema_of(Kind::Type, names)})
         }
-        Kind::Attr => named(&names.attributes, ATTR_NAME, 256),
+        Kind::Attr => named(&names.attributes, names.every, ATTR_NAME, 256),
         Kind::Attrs => {
             json!({"type": "array", "minItems": 1, "maxItems": MAX_ITEMS, "items": schema_of(Kind::Attr, names)})
         }
@@ -171,12 +192,12 @@ fn broken(arg: &str, rule: &str) -> Broken {
 fn one_name(
     arg: &str,
     v: &Value,
-    names: &[String],
+    (names, every): (&[String], bool),
     valid: fn(&str) -> bool,
     what: &str,
 ) -> Result<String, Broken> {
     let s = v.as_str().ok_or_else(|| broken(arg, "must be a string"))?;
-    let known = if names.len() <= MAX_ENUM {
+    let known = if !every && names.len() <= MAX_ENUM {
         names.iter().any(|n| n == s)
     } else {
         valid(s)
@@ -232,24 +253,38 @@ fn check(arg: &Arg, v: &Value, names: &Names) -> Result<Checked, Broken> {
                 })
                 .collect::<Result<_, _>>()?,
         ),
-        Kind::Type => Checked::One(one_name(name, v, &names.types, is_type_name, "types")?),
+        Kind::Type => Checked::One(one_name(
+            name,
+            v,
+            (&names.types, names.every),
+            is_type_name,
+            "types",
+        )?),
         Kind::Types => Checked::Many(
             list(name, v, 1, MAX_TYPES)?
                 .iter()
-                .map(|t| one_name(name, t, &names.types, is_type_name, "types"))
+                .map(|t| one_name(name, t, (&names.types, names.every), is_type_name, "types"))
                 .collect::<Result<_, _>>()?,
         ),
         Kind::Attr => Checked::One(one_name(
             name,
             v,
-            &names.attributes,
+            (&names.attributes, names.every),
             is_attr_name,
             "attributes",
         )?),
         Kind::Attrs => Checked::Many(
             list(name, v, 1, MAX_ITEMS)?
                 .iter()
-                .map(|a| one_name(name, a, &names.attributes, is_attr_name, "attributes"))
+                .map(|a| {
+                    one_name(
+                        name,
+                        a,
+                        (&names.attributes, names.every),
+                        is_attr_name,
+                        "attributes",
+                    )
+                })
                 .collect::<Result<_, _>>()?,
         ),
         Kind::Text(max) => {

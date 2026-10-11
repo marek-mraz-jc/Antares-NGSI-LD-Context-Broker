@@ -7,6 +7,7 @@
 //! `common`.
 
 mod common;
+mod views_all;
 mod views_errors;
 mod views_maps;
 mod views_q;

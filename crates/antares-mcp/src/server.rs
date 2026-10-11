@@ -98,6 +98,9 @@ impl Server {
     }
 
     fn names(&self) -> Names {
+        if self.view.shows_every_name() {
+            return Names::every();
+        }
         let (types, attributes) = self.view.shown_names();
         Names::new(types, attributes)
     }
@@ -435,7 +438,7 @@ impl ServerHandler for Server {
             Some(("types", t)) => (
                 OperationId::RetrieveEntityTypeInfo,
                 "type",
-                Some(t.to_owned()).filter(|t| names.types.contains(t)),
+                Some(t.to_owned()).filter(|t| names.has_type(t)),
             ),
             _ => (OperationId::RetrieveEntity, "id", None),
         };

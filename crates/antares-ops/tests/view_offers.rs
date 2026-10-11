@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! `ViewOps::offered` and `ViewOps::shown_names` (MCP D-3, D-4): what a
+//! `ViewOps::offered`, `ViewOps::shown_names` and
+//! `ViewOps::shows_every_name` (MCP D-3, D-4, ADR-0023 rule 12): what a
 //! surface may list for a caller is the view's allowlist filtered by one
-//! fail-closed engine probe, and the names it may offer are the view's.
+//! fail-closed engine probe, and the names it may offer are the view's, or
+//! every name for a view of `*`.
 
 use antares_ops::policy::{
     Decision, DecisionFuture, NotifyDecision, Operation, PolicyEngine, Subject,
@@ -27,7 +29,8 @@ const ASKED: [OperationId; 4] = [
 ];
 
 /// `/x/offers/{view}/offered` answers `ViewOps::offered` for [`ASKED`],
-/// `/x/offers/{view}/names` answers `ViewOps::shown_names`.
+/// `/x/offers/{view}/names` answers `ViewOps::shown_names` and
+/// `/x/offers/{view}/every` `ViewOps::shows_every_name`.
 struct Offers;
 
 impl Surface for Offers {
@@ -42,7 +45,14 @@ impl Surface for Offers {
     }
     fn router(&self, ops: Ops) -> Router {
         let names = ops.clone();
+        let every = ops.clone();
         Router::new()
+            .route(
+                "/{view}/every",
+                get(move |Path(id): Path<String>| async move {
+                    axum::Json(json!(every.view(&id).map(|v| v.shows_every_name())))
+                }),
+            )
             .route(
                 "/{view}/offered",
                 get(move |Path(id): Path<String>, caller: Caller| async move {
@@ -123,22 +133,29 @@ async fn broker(engine: Option<Arc<dyn PolicyEngine>>) -> Result<(TestBroker, Ro
         b = b.with_policy(engine);
     }
     let app = b.serve(Offers)?;
-    let view = json!({
+    let cars = json!({
         "id": "cars", "tenant": "city", "selector": ["Car", "Bike"],
         "rules": [{"types": ["Car"], "attributes": ["speed", "https://example.org/odd", "speed"]}],
         "operations": ["retrieve_entity_types", "query_entities", "notification"]
     });
-    let body = view.to_string();
-    let req = Request::builder()
-        .method(Method::PUT)
-        .uri("/q/views/cars")
-        .header("Content-Type", "application/json")
-        .header("Content-Length", body.len())
-        .body(Body::from(body))
-        .map_err(|e| e.to_string())?;
-    let Ok(resp) = app.clone().oneshot(req).await;
-    if resp.status() != StatusCode::CREATED {
-        return Err(format!("view: {}", resp.status()));
+    let all = json!({
+        "id": "all", "tenant": "city", "selector": ["*"],
+        "rules": [{"types": ["*"], "attributes": ["*"]}],
+        "operations": ["query_entities"]
+    });
+    for (id, view) in [("cars", cars), ("all", all)] {
+        let body = view.to_string();
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/q/views/{id}"))
+            .header("Content-Type", "application/json")
+            .header("Content-Length", body.len())
+            .body(Body::from(body))
+            .map_err(|e| e.to_string())?;
+        let Ok(resp) = app.clone().oneshot(req).await;
+        if resp.status() != StatusCode::CREATED {
+            return Err(format!("view: {}", resp.status()));
+        }
     }
     Ok((b, app))
 }
@@ -180,6 +197,13 @@ async fn the_names_offered_are_the_ones_the_view_shows() -> Result<(), String> {
         get_json(&app, "/x/offers/cars/names").await,
         json!([["Car"], ["https://example.org/odd", "speed"]]),
         "a type no rule shows is not offered; names once each, sorted"
+    );
+    assert_eq!(get_json(&app, "/x/offers/cars/every").await, json!(false));
+    assert_eq!(get_json(&app, "/x/offers/all/every").await, json!(true));
+    assert_eq!(
+        get_json(&app, "/x/offers/all/names").await,
+        json!([[], []]),
+        "a view of `*` lists no name: a surface offers every one by its syntax"
     );
     Ok(())
 }

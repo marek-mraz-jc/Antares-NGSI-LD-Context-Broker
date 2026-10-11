@@ -53,6 +53,10 @@ pub const MAX_VIEW_BYTES: usize = 64 * 1024;
 /// every request through the view evaluates each of them).
 pub const MAX_RULES: usize = 64;
 
+/// The one name that is no name: a view of every type and every
+/// Attribute writes it alone (ADR-0023 rule 12).
+pub const EVERY: &str = "*";
+
 /// The most names in one list of a view: its selector, a rule's types or
 /// Attributes, its operations.
 pub const MAX_NAMES: usize = 256;
@@ -169,6 +173,39 @@ impl View {
         serde_json::from_slice(bytes).map_err(|e| format!("not a view: {e}"))
     }
 
+    /// Whether this is ADR-0023 rule 12's view of every type and every
+    /// Attribute: `selector ["*"]` and the one rule `{types ["*"],
+    /// attributes ["*"]}` with no condition of its own. `*` anywhere else is
+    /// an error, before any name is expanded, so no `@context` turns it into
+    /// a name.
+    fn is_every(&self) -> Result<bool, String> {
+        let star = |names: &[String]| names.iter().any(|n| n == EVERY);
+        let only = |names: &[String]| names.len() == 1 && star(names);
+        if !star(&self.selector)
+            && !self
+                .rules
+                .iter()
+                .any(|r| star(&r.types) || star(&r.attributes))
+        {
+            return Ok(false);
+        }
+        match self.rules.as_slice() {
+            [r] if only(&self.selector)
+                && only(&r.types)
+                && only(&r.attributes)
+                && r.q.is_none()
+                && r.scope_q.is_none()
+                && r.geo_q.is_none() =>
+            {
+                Ok(true)
+            }
+            _ => Err(format!(
+                "`{EVERY}` stands alone (ADR-0023 rule 12): selector [\"{EVERY}\"] and the one \
+                 rule {{\"types\": [\"{EVERY}\"], \"attributes\": [\"{EVERY}\"]}}"
+            )),
+        }
+    }
+
     /// Validate the view and compile it (ADR-0023 rule 10): its id, its
     /// tenant, its names expanded, every query parsed within its bounds,
     /// every operation a row of the matrix.
@@ -195,26 +232,29 @@ impl View {
             ctx.merge_object(local)
                 .map_err(|e| format!("the view's @context: {e}"))?;
         }
-        let selector = expand_all("selector", &self.selector, &ctx)?;
-        if self.rules.len() > MAX_RULES {
-            return Err(format!("a view holds at most {MAX_RULES} rules"));
-        }
-        let rules = self
-            .rules
-            .iter()
-            .enumerate()
-            .map(|(i, r)| compile_rule(i, r, &ctx))
-            .collect::<Result<Vec<_>, _>>()?;
-        let notes = disclosures(&rules);
-        let operations = operations(&self.operations)?;
-        let view = CompiledView::new(
-            &selector,
+        let (q, scope, geo) = (
             parse_q("q", self.q.as_deref())?,
             scope_q("scopeQ", self.scope_q.as_deref())?,
             geo_q("geoQ", self.geo_q.as_ref())?,
-            rules,
-        )?
-        .named(&self.id);
+        );
+        let operations = operations(&self.operations)?;
+        let (view, notes) = if self.is_every()? {
+            (CompiledView::every(q, scope, geo), Vec::new())
+        } else {
+            let selector = expand_all("selector", &self.selector, &ctx)?;
+            if self.rules.len() > MAX_RULES {
+                return Err(format!("a view holds at most {MAX_RULES} rules"));
+            }
+            let rules = self
+                .rules
+                .iter()
+                .enumerate()
+                .map(|(i, r)| compile_rule(i, r, &ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            let notes = disclosures(&rules);
+            (CompiledView::new(&selector, q, scope, geo, rules)?, notes)
+        };
+        let view = view.named(&self.id);
         let mut loaded = Loaded {
             view: Arc::new(view),
             tenant: tenant.as_str().to_owned(),
