@@ -98,5 +98,8 @@
    "speed",
    "vehicleType"
   ]
+ },
+ "known": {
+  "internal CSR": "T-3935"
  }
 }
