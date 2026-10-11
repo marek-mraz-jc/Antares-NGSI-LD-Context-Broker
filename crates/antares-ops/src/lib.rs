@@ -77,6 +77,11 @@ pub mod bounds {
 /// for a crate that serves some forwards in process.
 pub use antares_api::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 
+/// The URL this broker is reached at (`ANTARES_PUBLIC_URL`, else the
+/// request's `Host`), for a surface whose documents name its resources by
+/// absolute URL.
+pub use antares_api::public_base;
+
 /// The headers a surface may never set on an operation: the tenant, the
 /// snapshot and the policy subject come from the outer request alone (G2).
 const OUTER_ONLY: [&str; 2] = ["ngsild-tenant", "ngsild-snapshot"];
@@ -813,6 +818,11 @@ pub mod test_kit {
         /// The store's.
         pub async fn reload_now(&self) -> Result<(), String> {
             self.reload.now().await
+        }
+
+        /// The broker's router: the NGSI-LD API and `/q`.
+        pub fn router(&self) -> axum::Router {
+            antares_api::router(self.state.clone())
         }
 
         /// The NGSI-LD API narrowed by the loaded view `id`: every operation

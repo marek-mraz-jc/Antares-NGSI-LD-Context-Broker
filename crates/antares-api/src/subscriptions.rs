@@ -1025,7 +1025,8 @@ pub async fn list(
     )?;
     let accept = parse_accept(headers)?;
     let ctx = request_context(&st.loader, headers).await?;
-    gate!(st, &tenant, headers, clause_of(kind, "5.8.4", "5.11.5")).await?;
+    let narrowing = gate!(st, &tenant, headers, clause_of(kind, "5.8.4", "5.11.5")).await?;
+    let cond = crate::policy::Condition::of(&narrowing);
     // 5.5.9.1: "only up to a maximum of L NGSI-LD Elements are RETRIEVED
     // and returned". 5.8.4 takes no filter parameters — `check_params`
     // above is the whole list — so the tenant IS the match set and the
@@ -1033,24 +1034,23 @@ pub async fn list(
     // here made a tenant at the document ceiling unable to list at all,
     // because that read is the one carrying the ceiling for client queries.
     let (offset, limit, _) = crate::paging::page_params(st, params)?;
-    #[cfg(feature = "views")]
-    let (page_docs, total) = if through_a_view(st) {
-        // ponytail: a scan of the tenant's Subscriptions for the view's own;
-        // a `__view` column with an index when views hold many.
+    // A view or a policy narrowing selects among the tenant's Subscriptions,
+    // so the count and the window are over that selection (T-3673).
+    let (page_docs, total) = if through_a_view(st) || cond.is_some() {
+        // ponytail: a scan of the tenant's Subscriptions; a `__view` column
+        // with an index when views or narrowings hold many.
         let own: Vec<Value> = st
             .store
             .list(&tenant, kind)
             .await?
             .into_iter()
-            .filter(|d| own(st, d))
+            .filter(|d| own(st, d) && cond.as_ref().is_none_or(|c| c.holds_for_record(d)))
             .collect();
         let total = own.len();
         (own.into_iter().skip(offset).take(limit).collect(), total)
     } else {
         st.store.list_slice(&tenant, kind, offset, limit).await?
     };
-    #[cfg(not(feature = "views"))]
-    let (page_docs, total) = st.store.list_slice(&tenant, kind, offset, limit).await?;
     let (page, count_hdr, links) = crate::paging::paginate_pre_accept(
         st,
         params,
