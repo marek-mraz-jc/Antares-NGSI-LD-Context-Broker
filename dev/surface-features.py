@@ -126,12 +126,13 @@ def sizes():
 def self_test():
     vanilla = 30 * MIB
     budget = budgets(ADR.read_text())
-    if budget != ({"full": 6 * MIB, "mcp": 4.5 * MIB}, 2 * MIB):
+    if budget != ({"full": 6 * MIB, "mcp": 4.5 * MIB, "odata": 3.5 * MIB}, 2 * MIB):
         sys.exit(f"self-test: the ADR's budget reads as {budget}")
-    rows = verdicts(vanilla, {"views": vanilla + 2 * MIB, "odata": vanilla + 2 * MIB + 1,
+    rows = verdicts(vanilla, {"views": vanilla + 2 * MIB, "ws": vanilla + 2 * MIB + 1,
+                              "odata": vanilla + 3.5 * MIB + 1,
                               "mcp": vanilla + 4.5 * MIB, "full": vanilla + 6 * MIB + 1}, budget)
     got = {r[0]: r[4] for r in rows}
-    if got != {"views": True, "odata": False, "mcp": True, "full": False}:
+    if got != {"views": True, "ws": False, "odata": False, "mcp": True, "full": False}:
         sys.exit(f"self-test: verdicts {got}")
     if "4.5 MiB" not in report(vanilla, rows):
         sys.exit("self-test: a fractional budget is not reported as it is")
