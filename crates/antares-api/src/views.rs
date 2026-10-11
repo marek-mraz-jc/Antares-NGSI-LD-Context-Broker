@@ -18,7 +18,7 @@
 //! ([`ViewTable`]) with the store seam the loader writes through, so the
 //! operation layer never names the store (threat F1).
 
-use crate::policy::{resolve, Decision, Denied, Filter, Rule};
+use crate::policy::{resolve, Decision, Denied, Filter, Rule, Warning};
 use antares_ql::geo::GeoQuery;
 use antares_ql::QNode;
 use std::collections::BTreeMap;
@@ -150,6 +150,12 @@ pub fn with_view(
         // so the view has nothing of its own to narrow there.
         return engine;
     }
+    if crate::policy::WRITE_BY_ID.contains(&clause) {
+        // Rule 7 as below, and the engine's answer is the condition its
+        // write holds the stored Entity to (`gate`), which the handler
+        // checks beside the view's own.
+        return engine;
+    }
     if CHECKED_WRITES.contains(&clause) || SUBSCRIPTIONS.contains(&clause) {
         // Rule 7: the handler checks the view on the stored Entity before
         // and after the write (`WriteGuard`); the engine's own answer
@@ -162,7 +168,8 @@ pub fn with_view(
     let composed = compose(view.narrowing(), engine?)?;
     match resolve(clause, Decision::Filter(composed)) {
         Decision::Allow => Ok(Filter::default()),
-        Decision::Filter(f) => Ok(f),
+        // `resolve` makes no condition of a filter
+        Decision::Filter(f) | Decision::AllowIf(f) => Ok(f),
         Decision::Deny(why) => Err(Denied(why)),
     }
 }
@@ -200,6 +207,8 @@ pub fn compose(a: &Filter, b: Filter) -> Result<Filter, Denied> {
         rules,
         omit_by_type,
         restricted: a.restricted || b.restricted,
+        warning: Warning::join(a.warning.as_ref(), b.warning),
+        temporal: [&a.temporal[..], &b.temporal[..]].concat().into(),
     })
 }
 
@@ -259,6 +268,39 @@ fn and_pick(a: &[String], b: Vec<String>) -> Vec<String> {
     }
 }
 
+/// A rule's `ids` and `id_patterns`.
+type IdNarrowing = (Vec<String>, Vec<String>);
+
+/// The id narrowing of two rules that must both hold: one side's own when
+/// the other narrows no id; else the explicit ids of each side the other
+/// side selects, `None` when none is left (the pair holds for nothing).
+/// Two pattern lists have no conjunction a single list can say, so they
+/// refuse the composition rather than widen it.
+fn and_ids(x: &Rule, y: &Rule) -> Result<Option<IdNarrowing>, Denied> {
+    let narrows = |r: &Rule| !r.ids.is_empty() || !r.id_patterns.is_empty();
+    if !narrows(x) {
+        return Ok(Some((y.ids.clone(), y.id_patterns.clone())));
+    }
+    if !narrows(y) {
+        return Ok(Some((x.ids.clone(), x.id_patterns.clone())));
+    }
+    if !x.id_patterns.is_empty() && !y.id_patterns.is_empty() {
+        return Err(Denied(
+            "the view and the policy both narrow ids by pattern".into(),
+        ));
+    }
+    let mut ids: Vec<String> = x
+        .ids
+        .iter()
+        .filter(|i| y.selects_id(i))
+        .chain(y.ids.iter().filter(|i| x.selects_id(i)))
+        .cloned()
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok((!ids.is_empty()).then_some((ids, Vec::new())))
+}
+
 /// A member name no Entity carries: an expanded IRI under a scheme of its
 /// own, so no `@context` can map a term onto it.
 const NOTHING: &str = "urn:antares:views:nothing";
@@ -281,6 +323,9 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
             if types.is_empty() {
                 continue;
             }
+            let Some((ids, id_patterns)) = and_ids(x, y)? else {
+                continue;
+            };
             let (geo_q, geo_also) = and_geo(x.areas(), y.areas());
             out.push(Rule {
                 types,
@@ -288,7 +333,10 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
                 scope_q: and_scope(x.scope_q.as_deref(), y.scope_q.clone())?,
                 geo_q,
                 geo_also,
+                ids,
+                id_patterns,
                 attributes: shared(&x.attributes, y.attributes.clone()),
+                temporal: [x.temporal.as_slice(), y.temporal.as_slice()].concat(),
             });
         }
     }
@@ -305,6 +353,10 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
 /// rule 10). No client may name it, and no NGSI-LD route reads the
 /// document kind they are stored as.
 pub const VIEW_TENANT: &str = "antares-views";
+
+/// The reserved tenant the policy engine's rule documents live under
+/// (ADR-0020 amendment), one document per Tenant, keyed by its name.
+pub const POLICY_TENANT: &str = "antares-policy";
 
 /// One view of the table.
 #[derive(Debug, Clone)]
@@ -336,7 +388,11 @@ pub enum ViewEntry {
 #[derive(Debug, Default)]
 pub struct ViewTable {
     entries: std::sync::RwLock<Arc<BTreeMap<String, ViewEntry>>>,
+    /// The digest of the view documents the entries were loaded from
+    /// (threat V26): pods over one store report the same value.
+    revision: std::sync::atomic::AtomicU64,
     admin: std::sync::OnceLock<axum::Router>,
+    policy: std::sync::RwLock<serde_json::Value>,
     schemas: std::sync::RwLock<Arc<BTreeMap<String, Schema>>>,
 }
 
@@ -379,12 +435,24 @@ impl ViewTable {
             .clone()
     }
 
-    /// Replace the whole table.
-    pub fn replace(&self, entries: BTreeMap<String, ViewEntry>) {
+    /// Replace the whole table, loaded from the documents whose digest is
+    /// `revision`.
+    pub fn replace(&self, entries: BTreeMap<String, ViewEntry>, revision: u64) {
         *self
             .entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(entries);
+        self.revision
+            .store(revision, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The revision `/q/health` reports as `viewsRevision`: sixteen hex
+    /// digits, the same on every pod that loaded the same documents.
+    pub fn revision(&self) -> String {
+        format!(
+            "{:016x}",
+            self.revision.load(std::sync::atomic::Ordering::Acquire)
+        )
     }
 
     /// Replace every Tenant's schema.
@@ -464,6 +532,24 @@ impl ViewTable {
         )
     }
 
+    /// What `/q/health` lists of the policy rule documents (ADR-0020
+    /// amendment): set by the loader on every reload, `null` until it runs
+    /// with an engine that reads documents. Tenant and revision only.
+    pub fn policy_report(&self) -> serde_json::Value {
+        self.policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace what [`policy_report`](Self::policy_report) answers.
+    pub fn set_policy_report(&self, report: serde_json::Value) {
+        *self
+            .policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = report;
+    }
+
     /// The `/q/views` routes the loader serves, merged into the admin
     /// surface and so relative to `/q` (`/views`, `/views/{id}`). Set once,
     /// before the router is built.
@@ -485,13 +571,12 @@ impl ViewTable {
 /// The writes whose handlers check ADR-0023 rule 7 on the stored Entity
 /// (the crate's write guard): Create Entity, Update and Append Attributes, Partial
 /// Attribute Update, Delete Attribute, Delete Entity, Merge, Replace Entity,
-/// Replace Attribute and Set Attribute Value, and the batch create, update,
-/// merge and delete, member by member. Every other write is refused under a
-/// view, as a narrowed write is ([`resolve`]): Batch Upsert among them,
-/// whose replace half writes without reading the stored Entity.
-pub const CHECKED_WRITES: [&str; 13] = [
+/// Replace Attribute and Set Attribute Value, and the batch create, upsert,
+/// update, merge and delete, member by member. Every other write is refused
+/// under a view, as a narrowed write is ([`resolve`]).
+pub const CHECKED_WRITES: [&str; 14] = [
     "5.6.1", "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.17", "5.6.18", "5.6.19", "5.6.7",
-    "5.6.9", "5.6.20", "5.6.10",
+    "5.6.8", "5.6.9", "5.6.20", "5.6.10",
 ];
 
 /// The Subscription operations a view serves (rule 9, 5.8.1 to 5.8.5): run
@@ -574,12 +659,8 @@ pub const TARGET_NOT_SHOWN: &str =
 /// the store call.
 #[derive(Debug)]
 pub(crate) struct WriteGuard {
-    q: Option<QNode>,
-    scope_q: Option<String>,
-    areas: Vec<GeoQuery>,
-    /// The rules with type and Attribute names expanded, the form a stored
-    /// document is in.
-    rules: Option<Arc<Filter>>,
+    /// The view's selection, as an engine's write condition is held.
+    sel: crate::policy::Condition,
     /// The expanded names of the Attributes the write sets or removes.
     written: Vec<String>,
     refused: std::sync::OnceLock<&'static str>,
@@ -596,10 +677,7 @@ impl WriteGuard {
     ) -> Option<Self> {
         let narrowing = st.view.as_deref()?.narrowing();
         Some(Self {
-            q: narrowing.q.as_deref().cloned(),
-            scope_q: narrowing.scope_q.clone(),
-            areas: narrowing.areas().cloned().collect(),
-            rules: crate::repr::type_rules(narrowing),
+            sel: crate::policy::Condition::new(narrowing),
             written: written.into_iter().map(str::to_owned).collect(),
             refused: std::sync::OnceLock::new(),
         })
@@ -609,16 +687,7 @@ impl WriteGuard {
     /// the view's `q` never holds here, as in a rule (ADR-0023 rule 11): the
     /// check runs inside the store's write and reads no other Entity.
     pub(crate) fn sees(&self, doc: &serde_json::Value) -> bool {
-        let ctx = crate::repr::policy_context();
-        crate::repr::shown(self.rules.as_deref(), doc).is_some()
-            && self
-                .scope_q
-                .as_deref()
-                .is_none_or(|s| crate::scope_matches(s, doc))
-            && self.areas.iter().all(|g| g.matches(doc, ctx))
-            && self.q.as_ref().is_none_or(|q| {
-                !q.has_linked_paths() && antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
-            })
+        self.sel.holds(doc)
     }
 
     /// Why the view refuses `doc` with the written names on it, if it does.
@@ -630,6 +699,7 @@ impl WriteGuard {
         if !self.sees(doc) {
             Some(MOVES_OUT)
         } else if !self
+            .sel
             .rules
             .as_deref()
             .is_none_or(|r| r.admits_write(doc, &written, crate::repr::policy_context()))
@@ -920,6 +990,49 @@ mod tests {
         v
     }
 
+    /// G8: a view alone sends no `NGSILD-Warning`; an engine's warning
+    /// reaches every read it narrows, directly and through a view, once.
+    #[tokio::test]
+    async fn only_the_engine_warns_and_its_warning_survives_the_view() {
+        let warnings = |h: &axum::http::HeaderMap| -> Vec<String> {
+            h.get_all("NGSILD-Warning")
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(str::to_owned))
+                .collect()
+        };
+        let reads = [
+            "/ngsi-ld/v1/entities?type=Car",
+            "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:3",
+            "/ngsi-ld/v1/types",
+            "/ngsi-ld/v1/attributes",
+        ];
+        let st = seeded(None).await;
+        let view = st.with_view(Arc::new(cars()));
+        for uri in reads {
+            let (s, body, headers) = send(&view, "GET", uri, None).await;
+            assert_eq!(s, StatusCode::OK, "{uri}: {body}");
+            assert!(warnings(&headers).is_empty(), "{uri}: a view alone");
+        }
+
+        let warned = Filter {
+            warning: Some(Warning::new("types left out by the filter: Bike").expect("text")),
+            ..Filter::default()
+        };
+        let st = seeded(Some(warned)).await;
+        let view = st.with_view(Arc::new(cars()));
+        for (who, st) in [("engine", &st), ("view and engine", &view)] {
+            for uri in reads {
+                let (s, body, headers) = send(st, "GET", uri, None).await;
+                assert_eq!(s, StatusCode::OK, "{who} {uri}: {body}");
+                assert_eq!(
+                    warnings(&headers),
+                    ["199 me \"types left out by the filter: Bike\""],
+                    "{who} {uri}"
+                );
+            }
+        }
+    }
+
     /// Rule 1: `NGSILD-Results-Count` and the `Link` pages describe the
     /// narrowed set, the Cars, and nothing the view does not select.
     #[tokio::test]
@@ -1079,7 +1192,7 @@ mod tests {
         let (s, body, _) = send(&view, "POST", "/ngsi-ld/v1/entities", Some(bike)).await;
         assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
         assert!(body.to_string().contains(MOVES_OUT), "{body}");
-        let batch = json!([{"id": "urn:ngsi-ld:Car:8", "type": "Car"}]);
+        let batch = json!([{"id": "urn:ngsi-ld:Car:7", "type": "Car"}]);
         let (s, body, _) = send(
             &view,
             "POST",
@@ -1087,7 +1200,7 @@ mod tests {
             Some(batch),
         )
         .await;
-        assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(s, StatusCode::CREATED, "{body}");
         let batch = json!([
             {"id": "urn:ngsi-ld:Car:8", "type": "Car"},
             {"id": "urn:ngsi-ld:Bike:8", "type": "Bike"}
@@ -1139,6 +1252,50 @@ mod tests {
             )
             .is_err(),
             "a rule outside the selector shows nothing"
+        );
+    }
+
+    /// Gap G2: both rules' id narrowings hold in the pair, and a pair no id
+    /// is left for holds for nothing.
+    #[test]
+    fn a_pair_keeps_both_id_narrowings() {
+        let by = |ids: &[&str], patterns: &[&str]| Rule {
+            ids: ids.iter().map(|i| (*i).to_owned()).collect(),
+            id_patterns: patterns.iter().map(|p| (*p).to_owned()).collect(),
+            ..rule(&["Car"], None, &["speed"])
+        };
+        let ids_of = |a: Rule, b: Rule| {
+            let pair = pair_rules(&[a], vec![b]).expect("pairs");
+            (pair[0].ids.clone(), pair[0].id_patterns.clone())
+        };
+        let (c1, c2, c10) = ("urn:Car:1", "urn:Car:2", "urn:Car:10");
+        let s = |v: &[&str]| v.iter().map(|i| (*i).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            ids_of(by(&[], &[]), by(&[c1], &["urn:Car:.*"])),
+            (s(&[c1]), s(&["urn:Car:.*"]))
+        );
+        assert_eq!(ids_of(by(&[c2], &[]), by(&[], &[])), (s(&[c2]), s(&[])));
+        assert_eq!(
+            ids_of(by(&[c1, c2], &[]), by(&[c2, c10], &[])),
+            (s(&[c2]), s(&[]))
+        );
+        assert_eq!(
+            ids_of(by(&[], &["urn:Car:1.*"]), by(&[c1, c2, c10], &[])),
+            (s(&[c1, c10]), s(&[])),
+            "explicit ids through the other side's pattern"
+        );
+        assert_eq!(
+            ids_of(by(&[c2], &[]), by(&[c1], &[])),
+            (s(&[]), s(&[])),
+            "nothing left: the pair holds for nothing"
+        );
+        assert_eq!(
+            pair_rules(&[by(&[c2], &[])], vec![by(&[c1], &[])]),
+            Ok(vec![Rule::default()])
+        );
+        assert!(
+            pair_rules(&[by(&[], &["a"])], vec![by(&[], &["b"])]).is_err(),
+            "two pattern lists refuse rather than widen"
         );
     }
 

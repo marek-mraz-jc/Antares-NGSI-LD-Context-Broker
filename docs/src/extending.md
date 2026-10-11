@@ -182,6 +182,22 @@ other operation — a create, a delete, a subscription, a registration — and
 the seam answers 403 rather than dropping it; decide those with `Allow` or
 `Deny`.
 
+A write by id whose grant depends on what the stored Entity holds (a zone,
+a status, an owner) is answered `AllowIf(filter)`: the `Operation` shows
+the engine the stored types, scope and Attribute names, never the values,
+so the engine hands the condition to the store instead. The write is
+applied only if the stored Entity matches the filter's `q`, `scopeQ`, areas
+and the types and conditions of its rules, judged inside the store's own
+read-modify-write on the very document it changes, so a concurrent write
+between the decision and the commit cannot carry it onto an Entity the
+condition no longer selects. An Entity it does not select answers `404`
+exactly as an absent one does; a batch judges each member by its own
+Entity and reports the others in `errors`; a conditioned write that would
+be forwarded to a Context Source is refused (`403`). `AllowIf` holds on the
+clauses in `policy::WRITE_BY_ID` and selects only: on any other clause, or
+with a `pick`, `omit`, `omit_by_type`, `temporal` or a rule's Attribute
+list or windows, the seam answers 403.
+
 A `Filter` may only narrow. Its `q` and `scopeQ` are conjoined into the
 condition the store already had — a `scopeQ` by the 4.19 distribution, so a
 caller filtering by Scope of its own is served the Scopes both select and
@@ -192,12 +208,30 @@ widen the answer to. Its areas, `geo_q` and the list `geo_also`, each
 narrow too: the store query holds them beside the request's own geoquery
 and every one must hold, so a view and an engine that both narrow by area
 compose into one `Filter` with both (`Filter::areas()` reads them all). An
-engine with one area sets `geo_q` and leaves `geo_also` empty. A `pick`/`omit` name is read in the core `@context`,
+engine with one area sets `geo_q` and leaves `geo_also` empty. Its `rules`
+allow Attributes per rule (ADR-0023 rule 11): an Entity is served only when
+a rule selects it by one of its `types` and, if the rule lists `ids` or
+`id_patterns`, by its id (an id pattern is anchored at both ends, and one
+that does not compile matches nothing), and the rule's condition holds; it
+keeps the union of those rules' `attributes`. A `pick`/`omit` name is read in the core `@context`,
 never in the caller's, so a request cannot rebind the term a rule names
 and step out from under it; write the rule as an IRI and it is used as written, write it
 as a short name and it means what the default `@context` says. Set
 `restricted` and a narrowed read answers `Antares-Results-Restricted: true`,
-so an operator can tell a short answer from an empty one. Three limits are the seam's, not the engine's: an
+so an operator can tell a short answer from an empty one. Set `warning`
+(a `Warning::new(text)`: printable ASCII on one line, at most 256 bytes, no
+`"` or `\`, refused otherwise) and every read it narrows answers
+`NGSILD-Warning: 199 {alias} "{text}"`, for instance to name the types a
+filter on an Attribute the caller may not filter on left out; the text is the
+engine's, names only what the caller may already see, and a view composed
+with the engine keeps it. Set `temporal` (windows of `observedAt`, each end a
+`TimeBound::At(instant)` or a `TimeBound::Ago(duration)` resolved when the
+request is decided) and a temporal read (5.7.3, 5.7.4) has its own 4.11
+window clamped to every one of them before the store runs, the forward to a
+Context Source included; a window the grant does not reach answers nothing,
+not a refusal, and a request on another `timeproperty` answers nothing. A
+`Rule` may carry windows too: its Attributes' instances outside them are not
+shown through it. Three limits are the seam's, not the engine's: an
 operation over everything the tenant holds — delete-by-type, purge, the
 whole-tenant snapshot clauses — is `Allow` or `Deny` and never a `Filter`,
 because doing it to less than it says is a data-loss bug; a `Filter` on a

@@ -1358,10 +1358,16 @@ mod complexity_tests {
             vec!["a==1e300"; MAX_Q_BYTES / 9].join(";"),
         ];
         let wide = QNode::Or(vec![leaf(); MAX_POLICY_Q_NODES - 1]);
+        // bounded, so a `paren_depth` that stops counting fails here rather
+        // than loop (T-3684: the mutants that did timed out)
         let mut tall = QNode::And(vec![leaf(), leaf()]);
-        while paren_depth(&tall) < MAX_NARROWED_Q_DEPTH - 1 {
+        for _ in 0..MAX_NARROWED_Q_DEPTH {
+            if paren_depth(&tall) >= MAX_NARROWED_Q_DEPTH - 1 {
+                break;
+            }
             tall = QNode::And(vec![leaf(), tall]);
         }
+        assert_eq!(paren_depth(&tall), MAX_NARROWED_Q_DEPTH - 1);
         for policy in [&wide, &tall] {
             assert!(fits_policy_q(policy));
             for caller in &callers {
@@ -1406,6 +1412,21 @@ mod complexity_tests {
             });
             assert_eq!(deepest, depth, "{rendered}");
         }
+    }
+
+    /// How the narrowed caps are made up (T-3684): the depth is the
+    /// caller's twice over, half for the caller's part and its rewrite,
+    /// half for the policy; the nodes are the caller's rewritten part (each
+    /// term at most three), the conjunction, and the policy share, to the
+    /// node. Each cap is used symbolically everywhere else, so only these
+    /// equations notice one drifting.
+    #[test]
+    fn the_narrowed_caps_add_up() {
+        assert_eq!(MAX_NARROWED_Q_DEPTH, 2 * MAX_Q_DEPTH);
+        assert_eq!(
+            3 * MAX_Q_NODES + 1 + MAX_POLICY_Q_NODES,
+            MAX_NARROWED_Q_NODES
+        );
     }
 
     /// The narrowed caps are ceilings too: past them a narrowed `q` is

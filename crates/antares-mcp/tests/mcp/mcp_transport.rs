@@ -2,8 +2,59 @@
 //! The transport (MCP 6.3; MC6, MC8, MC13, MC14).
 
 use crate::common::{endpoint, fixture, post_raw, rpc, rpc_with, tool_names, MODERN};
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{header, Method, Request, StatusCode};
 use serde_json::{json, Value};
+use tower::ServiceExt as _;
+
+/// JSON-RPC 2.0 section 5.1: a body that is no JSON answers -32700 and a
+/// message of another version -32600, each as an error frame, not rmcp's
+/// bare 415.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_that_is_no_json_rpc_message_gets_an_error_frame() -> Result<(), String> {
+    let f = fixture().await?;
+    let header = [("MCP-Protocol-Version", MODERN)];
+    for (body, code) in [
+        (r#"{"jsonrpc": "2.0", broken"#, -32700),
+        (r#"{"jsonrpc": "1.0", "id": 1, "method": "ping"}"#, -32600),
+        (r#"{"id": 1, "method": "ping"}"#, -32600),
+        ("7", -32600),
+    ] {
+        let a = post_raw(&f.app, &endpoint("cars"), &header, body).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{body}: {}", a.text);
+        assert_eq!(
+            a.error().get("code"),
+            Some(&json!(code)),
+            "{body}: {}",
+            a.text
+        );
+    }
+    Ok(())
+}
+
+/// D-8: the endpoint keeps no session, so it opens no standalone stream; a
+/// GET is not read as JSON-RPC and answers 405, naming POST.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_get_opens_no_stream() -> Result<(), String> {
+    let f = fixture().await?;
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(endpoint("cars"))
+        .header(header::HOST, "localhost")
+        .header(header::ACCEPT, "text/event-stream")
+        .header("MCP-Protocol-Version", MODERN)
+        .body(Body::empty())
+        .map_err(|e| e.to_string())?;
+    let Ok(resp) = f.app.clone().oneshot(req).await;
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        resp.headers()
+            .get(header::ALLOW)
+            .map(axum::http::HeaderValue::as_bytes),
+        Some(&b"POST"[..])
+    );
+    Ok(())
+}
 
 /// MC6: a JSON-RPC batch array is refused whole.
 #[tokio::test(flavor = "multi_thread")]

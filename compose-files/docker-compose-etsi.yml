@@ -82,6 +82,8 @@ services:
       # endpoint; host-networked stack => container names do not resolve
       ANTARES_PUBLIC_URL: http://localhost:9090
       ANTARES_STORE: ${STORE:-memory}
+      # the all-features cells (external-suites.yml) mount every surface the image has
+      ANTARES_API_SURFACES: ${API_SURFACES:-admin}
       # Each broker owns its own database, so one process per store is the
       # deployment shape the default bus assumes.
       ANTARES_ALLOW_SHARED_LOCAL: "1"
@@ -103,6 +105,8 @@ services:
       # endpoint; host-networked stack => container names do not resolve
       ANTARES_PUBLIC_URL: http://localhost:9091
       ANTARES_STORE: ${STORE:-memory}
+      # the all-features cells (external-suites.yml) mount every surface the image has
+      ANTARES_API_SURFACES: ${API_SURFACES:-admin}
       # Each broker owns its own database, so one process per store is the
       # deployment shape the default bus assumes.
       ANTARES_ALLOW_SHARED_LOCAL: "1"
@@ -124,6 +128,8 @@ services:
       # endpoint; host-networked stack => container names do not resolve
       ANTARES_PUBLIC_URL: http://localhost:9092
       ANTARES_STORE: ${STORE:-memory}
+      # the all-features cells (external-suites.yml) mount every surface the image has
+      ANTARES_API_SURFACES: ${API_SURFACES:-admin}
       # Each broker owns its own database, so one process per store is the
       # deployment shape the default bus assumes.
       ANTARES_ALLOW_SHARED_LOCAL: "1"
@@ -145,6 +151,8 @@ services:
       # endpoint; host-networked stack => container names do not resolve
       ANTARES_PUBLIC_URL: http://localhost:9093
       ANTARES_STORE: ${STORE:-memory}
+      # the all-features cells (external-suites.yml) mount every surface the image has
+      ANTARES_API_SURFACES: ${API_SURFACES:-admin}
       # Each broker owns its own database, so one process per store is the
       # deployment shape the default bus assumes.
       ANTARES_ALLOW_SHARED_LOCAL: "1"
@@ -166,6 +174,8 @@ services:
       # endpoint; host-networked stack => container names do not resolve
       ANTARES_PUBLIC_URL: http://localhost:9094
       ANTARES_STORE: ${STORE:-memory}
+      # the all-features cells (external-suites.yml) mount every surface the image has
+      ANTARES_API_SURFACES: ${API_SURFACES:-admin}
       # Each broker owns its own database, so one process per store is the
       # deployment shape the default bus assumes.
       ANTARES_ALLOW_SHARED_LOCAL: "1"

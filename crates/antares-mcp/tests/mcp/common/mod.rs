@@ -15,6 +15,11 @@
 //! | `few` | `city` | the same | `query_entities` only |
 //! | `elsewhere` | `other` | Cars: `speed` | every read |
 //! | `big` | `big` | Cars: `speed`, `note` | every read |
+//! | `watch` | `city` | the same as `cars` | reading an Entity, making and deleting a Subscription |
+//! | `writes`, `writes2` | `w` | Cars: `speed`, `colour` | every read and [`WRITES`] |
+//!
+//! Tenant `w` holds `Car:w1` (speed 1). A subscription made through a tool
+//! may notify below [`HOOKS`] only.
 
 use antares_ops::policy::PolicyEngine;
 use antares_ops::test_kit::TestBroker;
@@ -45,6 +50,30 @@ pub const READS: [&str; 13] = [
     "temporal_query",
     "temporal_query_post",
 ];
+
+/// Every write operation a tool offers, by its matrix id.
+pub const WRITES: [&str; 17] = [
+    "create_entity",
+    "update_attributes",
+    "append_attributes",
+    "partial_attribute_update",
+    "delete_attribute",
+    "delete_entity",
+    "merge_entity",
+    "replace_entity",
+    "replace_attribute",
+    "batch_create",
+    "batch_upsert",
+    "batch_update",
+    "batch_merge",
+    "batch_delete",
+    "create_subscription",
+    "update_subscription",
+    "delete_subscription",
+];
+
+/// The endpoint prefix the fixture lets a subscription notify.
+pub const HOOKS: &str = "https://hooks.example/";
 
 /// How many 10 000-character Cars tenant `big` holds.
 pub const BIG: usize = 12;
@@ -136,14 +165,19 @@ pub fn endpoint(view: &str) -> String {
 }
 
 /// `params` with the per-request metadata of a 2026-07-28 client.
-fn modern(mut params: Value) -> Value {
+fn modern(params: Value) -> Value {
+    modern_with(params, &json!({}))
+}
+
+/// `params` with the metadata of a 2026-07-28 client of `capabilities`.
+fn modern_with(mut params: Value, capabilities: &Value) -> Value {
     if let Some(o) = params.as_object_mut() {
         o.insert(
             "_meta".into(),
             json!({
                 "io.modelcontextprotocol/protocolVersion": MODERN,
                 "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
-                "io.modelcontextprotocol/clientCapabilities": {}
+                "io.modelcontextprotocol/clientCapabilities": capabilities
             }),
         );
     }
@@ -159,7 +193,55 @@ pub async fn rpc_with(
     params: Value,
     extra: &[(&str, &str)],
 ) -> Answer {
-    let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": modern(params)});
+    send_rpc(app, view, method, modern(params), extra).await
+}
+
+/// `tools/call` of `tool` with `arguments` on `view` by a client that can
+/// ask the person, with `more` params (`requestState`, `inputResponses`).
+pub async fn confirmable(
+    app: &Router,
+    view: &str,
+    tool: &str,
+    arguments: Value,
+    more: Value,
+) -> Answer {
+    let mut params = json!({"name": tool, "arguments": arguments});
+    if let (Some(p), Value::Object(more)) = (params.as_object_mut(), more) {
+        p.extend(more);
+    }
+    let capabilities = json!({"elicitation": {"form": {}}});
+    call_as(app, view, params, &capabilities).await
+}
+
+/// `tools/call` with `params` on `view` by a client of `capabilities`.
+pub async fn call_as(app: &Router, view: &str, params: Value, capabilities: &Value) -> Answer {
+    send_rpc(
+        app,
+        view,
+        "tools/call",
+        modern_with(params, capabilities),
+        &[],
+    )
+    .await
+}
+
+/// The answer the person gives: accept with `confirm` set to `yes`.
+#[must_use]
+pub fn answered(state: &str, yes: bool) -> Value {
+    json!({
+        "requestState": state,
+        "inputResponses": {"confirm": {"action": "accept", "content": {"confirm": yes}}}
+    })
+}
+
+async fn send_rpc(
+    app: &Router,
+    view: &str,
+    method: &str,
+    params: Value,
+    extra: &[(&str, &str)],
+) -> Answer {
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
     let name = body
         .pointer("/params/name")
         .or_else(|| body.pointer("/params/uri"))
@@ -259,10 +341,10 @@ fn car_rules() -> Value {
 /// # Errors
 /// The broker's, or a write that did not land.
 pub async fn fixture_with(engine: Option<Arc<dyn PolicyEngine>>) -> Result<Fixture, String> {
-    let mut broker = TestBroker::new().await?;
-    if let Some(engine) = engine {
-        broker = broker.with_policy(engine);
-    }
+    // ponytail: the allowlist is read once per process; every test shares it
+    std::env::set_var(antares_mcp::SUBSCRIPTION_ENDPOINTS_ENV, HOOKS);
+    // the surface's own sink, as a broker built with `mcp` registers it
+    let broker = TestBroker::with_sinks(vec![Box::new(antares_mcp::Sink)], engine).await?;
     let app = broker.serve(antares_mcp::Mcp)?;
     for (id, speed, note) in [("1", 10, "3"), ("2", 50, "1"), ("3", 90, "1")] {
         create(
@@ -307,10 +389,27 @@ pub async fn fixture_with(engine: Option<Arc<dyn PolicyEngine>>) -> Result<Fixtu
         &json!({"id": "urn:ngsi-ld:Car:9", "type": "Car", "speed": prop(&json!(1))}),
     )
     .await?;
+    views(&app).await?;
+    Ok(Fixture {
+        _broker: broker,
+        app,
+    })
+}
+
+/// The views of this module.
+async fn views(app: &Router) -> Result<(), String> {
+    let app = app.clone();
     put_view(
         &app,
         &json!({"id": "cars", "tenant": "city", "selector": ["Car", "Bike"],
                 "rules": car_rules(), "operations": READS}),
+    )
+    .await?;
+    put_view(
+        &app,
+        &json!({"id": "watch", "tenant": "city", "selector": ["Car", "Bike"],
+                "rules": car_rules(),
+                "operations": ["retrieve_entity", "create_subscription", "delete_subscription"]}),
     )
     .await?;
     put_view(
@@ -325,16 +424,29 @@ pub async fn fixture_with(engine: Option<Arc<dyn PolicyEngine>>) -> Result<Fixtu
                 "rules": [{"types": ["Car"], "attributes": ["speed"]}], "operations": READS}),
     )
     .await?;
+    create(
+        &app,
+        "w",
+        &json!({"id": "urn:ngsi-ld:Car:w1", "type": "Car", "speed": prop(&json!(1))}),
+    )
+    .await?;
+    let every: Vec<&str> = READS.iter().chain(WRITES.iter()).copied().collect();
+    for id in ["writes", "writes2"] {
+        put_view(
+            &app,
+            &json!({"id": id, "tenant": "w", "selector": ["Car"],
+                    "rules": [{"types": ["Car"], "attributes": ["speed", "colour"]}],
+                    "operations": every}),
+        )
+        .await?;
+    }
     put_view(
         &app,
         &json!({"id": "big", "tenant": "big", "selector": ["Car"],
                 "rules": [{"types": ["Car"], "attributes": ["speed", "note"]}], "operations": READS}),
     )
     .await?;
-    Ok(Fixture {
-        _broker: broker,
-        app,
-    })
+    Ok(())
 }
 
 /// [`fixture_with`] and no engine.

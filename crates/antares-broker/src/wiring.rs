@@ -118,12 +118,13 @@ fn kv_key(tenant: &str, kind: Kind, id: &str) -> String {
 /// Wire everything bus=nats needs onto the state. Async: connects, hydrates
 /// mirrors, creates consumers, asserts topology — all before the broker
 /// starts accepting traffic, so a mis-shapen topology is a startup failure,
-/// never a silent runtime drift.
+/// never a silent runtime drift. The bus is handed back for the channels
+/// that ride its core request/reply (the WebSocket relay).
 pub async fn wire_nats(
     state: &mut AppState,
     url: &str,
     roles: Roles,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Arc<NatsBus>, Box<dyn std::error::Error>> {
     let bus = Arc::new(NatsBus::connect(url).await?);
     // /q/health `bus` member: live connection state + reconnect count.
     // Installed HERE so bus=local never carries the member at all.
@@ -527,7 +528,7 @@ pub async fn wire_nats(
     // The server must agree these are shared durables.
     bus.assert_topology(&durables).await?;
     tracing::info!(?roles, "bus=nats wired");
-    Ok(())
+    Ok(bus)
 }
 
 /// Hydrate a mirror from the system of record (Postgres) at startup.

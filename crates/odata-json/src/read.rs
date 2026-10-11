@@ -494,7 +494,7 @@ fn object(input: &[u8], limits: &BodyLimits) -> Result<Map<String, Value>, BodyE
 /// city.entity_container = Some(service);
 /// let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![city] };
 ///
-/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_01 };
+/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_01, metadata_etag: None };
 /// let buildings = Resource::new(&model, "Buildings").ok_or(BodyError::UnknownProperty)?;
 /// let body = br#"{"id":"b2","height":12,"owner@odata.bind":"Buildings('b1')"}"#;
 /// let payload = read_entity_body(&ctx, &buildings, WriteKind::Create, body, &BodyLimits::strict())?;
@@ -591,7 +591,7 @@ pub fn read_property_body(
 /// # service.entity_sets.push(EntitySet::new("Buildings", "City.Building"));
 /// # city.entity_container = Some(service);
 /// # let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![city] };
-/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_0 };
+/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_0, metadata_etag: None };
 /// let buildings = Resource::new(&model, "Buildings").ok_or(BodyError::UnknownProperty)?;
 /// let body = br#"{"@odata.id":"https://example.org/odata/Buildings('b1')"}"#;
 /// let targets = read_reference_body(&ctx, &buildings, "owner", body, &BodyLimits::strict())?;

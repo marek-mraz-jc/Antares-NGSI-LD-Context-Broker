@@ -157,6 +157,17 @@ Runs: `--requirements 2026-07-28` (the revision `mcp-surface.md` D-8 pins) and
 `--requirements 2025-11-25` (the legacy era the surface accepts), each against
 `/x/views/all/mcp` of `full`. Pinned as `npx --yes @modelcontextprotocol/conformance@0.1.16`.
 
+As run (T-3516, 2026-10-11): the 0.1.16 binary has no `--requirements`; its flag is
+`--spec-version`, which knows `2025-03-26`, `2025-06-18`, `2025-11-25`, `draft` and `extension`
+(`draft` holds no server scenario). The job runs `--spec-version 2025-11-25` and `2025-06-18`;
+the 2026-07-28 era is covered by the crate's own tests until a release carries it. With
+`--expected-failures`, exit 1 is defined as the README says. Most server scenarios call the
+fixture tools, prompts and resources of the SDKs' conformance test server (`test_simple_text`,
+`test://static-text`), which a product server does not have: `ci/mcp-baseline.yaml` lists each
+with its reason and upstream source, so it is not empty. The scenarios that test the surface
+itself (`server-initialize`, `ping`, `tools-list`, `resources-list`, `prompts-list`,
+`completion-complete`, `dns-rebinding-protection`) pass.
+
 ## 4. OData (new suite `tests/odata/`)
 
 Pins from `odata-library.md` section 4 (T-3448), fetched at the SHA with a checksum, never
@@ -224,8 +235,8 @@ pytest junit). Required checks are the merge-request subset; the rest runs night
 | `etsi-full-direct` | full | none | E3 | no | `file` cell |
 | `etsi-full-restricted` | full | `etsi-restricted` | E4 with `expected_view_refusals.json` | no | `file` cell |
 | `etsi-iop` | vanilla, full | none | `IOP_TP` through `dev/run-five.sh` | no | yes |
-| `mcp-conformance` | full | `all` | `npx --yes @modelcontextprotocol/conformance@0.1.16 server --url <root>/x/views/all/mcp --requirements 2026-07-28 --expected-failures ci/mcp-baseline.yaml`, then `--requirements 2025-11-25` | yes | yes |
-| `mcp-suites` | full | `all`, `parity-restricted` | `jc-conformance mcp` (the three suites, `-m "not platform_only"`) | `test_mcp_read_parity.py` with `MCP_PARITY_CASES=5` | all three |
+| `mcp-conformance` | `mcp` | `all` | `npx --yes @modelcontextprotocol/conformance@0.1.16 server --url <root>/x/views/all/mcp --spec-version 2025-11-25 --expected-failures ci/mcp-baseline.yaml`, then `--spec-version 2025-06-18` (section 3.2) | yes | yes |
+| `mcp-suites` | `mcp` | `all`, `parity-restricted`, `other` | the three suites of `tests/mcp` with `MCP_SURFACE=broker`, `-m "not platform_only"` | `test_mcp_read_parity.py` with `MCP_PARITY_CASES=5` | all three |
 | `odata-conformance` | full | `all`, `parity-restricted` | `jc-conformance odata` | `test_abnf_cases_live`, both `$metadata` validations | all, both client jobs |
 | `odata-clients-dotnet`, `odata-clients-sap` | full | `all` | section 4 rows | no | yes |
 | `linkml-conformance` | full | `all`, `parity-restricted` | `jc-conformance linkml` | yes | yes |
@@ -245,6 +256,7 @@ versions are the ones `requirements.txt` pins.
 |---|---|
 | joinedcontext-conformance | `requirements.in`: `linkml==1.12.0`, `websockets` (version pinned at implementation); `Dockerfile`: `libxml2-utils` (xmllint), npm `ajv-cli`, `ajv-formats`, `@asyncapi/cli@2.16.0`, `@modelcontextprotocol/conformance@0.1.16` installed in the node stage; new `tests/odata/`, `tests/linkml/`, `tests/ws/` and their `jc-conformance` subcommands; marker `platform_only` in `tests/mcp/`; `tests/etsi/expected_view_refusals.json` |
 | Antares | `dev/etsi-pipeline.sh`: `NGSILD_BASE` (API root prefix) and `SETUP_URL` (fixture seeding outside a view) variables; checkout of the mirror at `TTF_REF`; `surfaces-conformance.yml`; view fixtures `ci/views/{all,etsi-restricted,parity-restricted}.json`; `ci/mcp-baseline.yaml` (empty) |
+| Antares, as built (T-3516) | the MCP jobs build `--features mcp` (no `full` feature yet); `ci/views/{all,parity-restricted,other}.json` with their seed `ci/views/seed/<tenant>.json`, loaded by `dev/views-rig.sh` (`other` is a second Tenant for the isolation suite); the suites come from a checkout of the public joinedcontext-conformance at a pinned commit, because the runner image is not pullable without a credential; `ci/mcp-baseline.yaml` lists the fixture-server scenarios (section 3.2) |
 | ngsi-ld-test-suite mirror | `SETUP_URL` support in the fixture keywords of `resources/ApiUtils/*.resource` (a branch of the mirror, offered upstream) |
 
 ## Related
