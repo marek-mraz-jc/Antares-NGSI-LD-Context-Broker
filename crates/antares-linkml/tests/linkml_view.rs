@@ -428,6 +428,50 @@ async fn a_schema_outside_the_subset_or_none_closes_the_surface() {
     );
 }
 
+/// One LinkML source (T-3658): a view serves the schema stored for its own
+/// Tenant, never another Tenant's, whichever schemas the broker holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_of_another_tenant_never_renders_this_tenants_schema() {
+    let app = broker(None, &view(&READS), Some(&schema()))
+        .await
+        .expect("a broker");
+    let mut town = view(&READS);
+    town["id"] = json!("trucks");
+    town["tenant"] = json!("town");
+    let (status, _, body) = send(&app, "PUT", "/q/views/trucks", &[], Some(&town)).await;
+    assert!(status.is_success(), "the town view loads: {status} {body}");
+    let trucks = |path: &str| format!("/x/views/trucks/linkml/{path}");
+    let (status, _, body) = send(&app, "GET", &trucks("schema/index.json"), &[], None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "town holds no schema: {body}"
+    );
+    assert!(!body.contains("Car") && !body.contains("speed"), "{body}");
+
+    let mut own = schema();
+    own["id"] = json!("https://e.org/town/schema");
+    own["name"] = json!("town");
+    own["version"] = json!("9.0.0");
+    let (status, _, body) = send(&app, "PUT", "/q/schemas/town", &[], Some(&own)).await;
+    assert!(
+        status.is_success(),
+        "the town schema loads: {status} {body}"
+    );
+    let (status, _, body) = send(&app, "GET", &trucks("schema/index.json"), &[], None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains(r#""name":"town""#) && body.contains(r#""semver":"9.0.0""#),
+        "town's own schema: {body}"
+    );
+    let (status, _, body) = get(&app, "schema/index.json").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains(r#""name":"city""#) && !body.contains("9.0.0"),
+        "city's view keeps city's schema: {body}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn linkml_a_relationship_to_a_hidden_class_is_uriorcurie() {
     let app = broker(None, &view(&READS), Some(&schema()))
