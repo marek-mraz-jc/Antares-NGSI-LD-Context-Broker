@@ -132,7 +132,6 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tower",
- "tower-http 0.7.1",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
