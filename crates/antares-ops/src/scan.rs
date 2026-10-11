@@ -28,7 +28,8 @@ pub struct Pushdown {
     /// The `orderBy` keys the store applies (TS 104 176 7.2.3.1); with a residual the scan ends
     /// them with `id`, so the upstream order is total.
     pub order: Vec<String>,
-    /// The Attributes the standard selects; `None` selects every one.
+    /// The Attributes the standard selects; `None` selects every one. The scan projects with
+    /// `pick` (TS 104 175 4.21), never `attrs`, which would also drop the Entities holding none.
     pub attrs: Option<Vec<String>>,
     /// Whether the standard asks for `createdAt` and `modifiedAt`.
     pub sys_attrs: bool,
@@ -111,17 +112,21 @@ impl ViewOps {
         page: Page,
     ) -> Result<Scanned, Refusal> {
         let count = if page.whole { "&count=true" } else { "" };
+        let local = unpicked(pushdown, &[]);
         let query = format!(
             "{}{}&limit={}&offset={}{count}",
             pushdown.query,
-            params(pushdown, &pushdown.order, &[], false),
+            params(pushdown, &pushdown.order, &[], false, local.is_none()),
             page.size,
             page.start
         );
-        let (batch, total) = match read(self.query(caller, pushdown, &query).await?).await? {
+        let (mut batch, total) = match read(self.query(caller, pushdown, &query).await?).await? {
             Ok(read) => read,
             Err(answer) => return Ok(Scanned::Answer(answer)),
         };
+        for entity in &mut batch {
+            strip(entity, &[], false, local);
+        }
         let next = (!page.whole && batch.len() == page.size && page.size > 0)
             .then(|| page.start.saturating_add(batch.len()));
         Ok(Scanned::Page {
@@ -154,10 +159,11 @@ impl ViewOps {
             None => Vec::new(),
         };
         let system = program.reads_system_members() && !pushdown.sys_attrs;
+        let local = unpicked(pushdown, &extra);
         let fixed = format!(
             "{}{}",
             pushdown.query,
-            params(pushdown, &order, &extra, system)
+            params(pushdown, &order, &extra, system, local.is_none())
         );
         // a whole answer reads what the count announced, a page what the budget allows
         let mut cap = budget;
@@ -204,7 +210,7 @@ impl ViewOps {
                     Ok(_) => continue,
                     Err(_) => return Err(Refusal::Malformed(TOO_COMPLEX)),
                 }
-                strip(&mut entity, &extra, system);
+                strip(&mut entity, &extra, system, local);
                 entities.push(entity);
                 if entities.len() == size {
                     let more = !(ended && i.saturating_add(1) == last);
@@ -249,26 +255,63 @@ fn served(
     )
 }
 
-/// `orderBy`, `attrs` and `options` of a pushdown, each `&`-prefixed.
-fn params(pushdown: &Pushdown, order: &[String], extra: &[&str], system: bool) -> String {
+/// `orderBy`, `pick` and `options` of a pushdown, each `&`-prefixed. `pick` keeps the
+/// Entity's own members (4.21 drops what it does not name) and the system ones when read.
+fn params(
+    pushdown: &Pushdown,
+    order: &[String],
+    extra: &[&str],
+    system: bool,
+    pick: bool,
+) -> String {
     let mut out = String::new();
     if !order.is_empty() {
         out.push_str("&orderBy=");
         out.push_str(&join(order.iter().map(String::as_str)));
     }
-    if let Some(selected) = &pushdown.attrs {
-        out.push_str("&attrs=");
+    let sys = pushdown.sys_attrs || system;
+    if let Some(selected) = pushdown.attrs.as_ref().filter(|_| pick) {
+        let own = ["id", "type", "scope"].into_iter().chain(
+            sys.then_some(["createdAt", "modifiedAt"])
+                .into_iter()
+                .flatten(),
+        );
+        out.push_str("&pick=");
         out.push_str(&join(
-            selected
-                .iter()
-                .map(String::as_str)
+            own.chain(selected.iter().map(String::as_str))
                 .chain(extra.iter().copied()),
         ));
     }
-    if pushdown.sys_attrs || system {
+    if sys {
         out.push_str("&options=sysAttrs");
     }
     out
+}
+
+/// The standard's selection when one of its names, or of those the residual adds, is not
+/// [`pickable`]: nothing is projected upstream and the scan projects to it itself.
+fn unpicked<'p>(pushdown: &'p Pushdown, extra: &[&str]) -> Option<&'p [String]> {
+    pushdown.attrs.as_deref().filter(|selected| {
+        !selected
+            .iter()
+            .map(String::as_str)
+            .chain(extra.iter().copied())
+            .all(pickable)
+    })
+}
+
+/// Whether `pick` (TS 104 175 4.21) reads `name` as the one Attribute it is: a short name
+/// without a dot (a dot is its sub-Attribute path) or an IRI (a `:` before any dot), in the
+/// characters the projection grammar takes.
+#[must_use]
+pub fn pickable(name: &str) -> bool {
+    let iri = name
+        .find(':')
+        .is_some_and(|colon| name.find('.').is_none_or(|dot| colon < dot));
+    name.starts_with(|c: char| c.is_ascii_alphanumeric() || "_:@#".contains(c))
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_:#/%-+@".contains(c) || (c == '.' && iri))
 }
 
 /// Comma-joined and percent-encoded but for RFC 3986 unreserved characters.
@@ -322,15 +365,19 @@ const VALUES: [&str; 7] = [
     "vocab",
 ];
 
-/// Removes what only the residual asked for: the Attributes it added to `attrs`, and
+/// Removes what only the residual asked for: the Attributes it added to `pick`, and
 /// `createdAt`/`modifiedAt` of the Entity, its Attributes and their sub-Attributes when the
 /// standard did not ask for them (a value's own members stay; the scan reads
-/// `application/json`, so no `@context` member is there to keep).
-fn strip(entity: &mut Value, extra: &[&str], system: bool) {
+/// `application/json`, so no `@context` member is there to keep). With `local`, nothing was
+/// projected upstream and every Attribute it does not name goes.
+fn strip(entity: &mut Value, extra: &[&str], system: bool, local: Option<&[String]>) {
     // a Query Entities answer holds objects only
     entity.as_object_mut().into_iter().for_each(|members| {
         for name in extra {
             members.remove(*name);
+        }
+        if let Some(keep) = local {
+            members.retain(|k, _| antares_model::is_meta(k) || keep.iter().any(|s| s == k));
         }
         if system {
             unsystem(members);

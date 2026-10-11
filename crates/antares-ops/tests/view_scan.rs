@@ -499,3 +499,71 @@ async fn scan_without_residual_is_one_page_and_store_errors_pass_through() {
         .unwrap_or_default();
     assert_eq!(send(&rig.app, req).await.0, StatusCode::NOT_FOUND);
 }
+
+/// The sorted member names of each served Entity.
+fn members(page: &Value) -> Vec<Vec<String>> {
+    page["entities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            let mut names: Vec<String> = e
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            names.sort_unstable();
+            names
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_selection_projects_and_never_selects() {
+    // T-3822: `attrs` also drops the Entities holding none of the names; `pick` only projects
+    let rig = rig().await.expect("rig");
+    let seen = Pushdown {
+        attrs: Some(vec!["seen".into()]),
+        ..pushdown()
+    };
+    let frame = vec!["id".to_owned(), "type".to_owned()];
+    let (s, b) = rig.scan((seen.clone(), None), "size=1000&whole=1").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(
+        (ids(&b), b["count"].clone()),
+        (expected(|_| true), json!(15))
+    );
+    assert!(members(&b).iter().all(|m| *m == frame), "{b}");
+    // under a residual, which reads speed and serves it not
+    let (_, b) = rig.scan((seen, Some(odd())), "size=1000&whole=1").await;
+    assert_eq!(ids(&b), expected(|n| n % 2 == 1));
+    assert!(members(&b).iter().all(|m| *m == frame), "{b}");
+    // a name `pick` would read as another member is not pushed: the scan projects itself
+    let odd_name = Pushdown {
+        attrs: Some(vec!["colour".into(), "a-b.c_d~".into()]),
+        ..pushdown()
+    };
+    let shown = vec!["colour".to_owned(), "id".to_owned(), "type".to_owned()];
+    for residual in [None, Some(odd())] {
+        let (s, b) = rig.scan((odd_name.clone(), residual), "size=1000").await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert!(!ids(&b).is_empty(), "{b}");
+        assert!(members(&b).iter().all(|m| *m == shown), "{b}");
+    }
+}
+
+#[test]
+fn pickable_names_are_one_member() {
+    use antares_ops::pickable;
+    for name in [
+        "speed",
+        "a_b",
+        "https://uri.etsi.org/ngsi-ld/v1.8#x",
+        "urn:a.b",
+        "@id",
+    ] {
+        assert!(pickable(name), "{name}");
+    }
+    for name in ["", "a.b", "colour name", "a~", "-x", "a,b", "a{b}", "a|b"] {
+        assert!(!pickable(name), "{name}");
+    }
+}

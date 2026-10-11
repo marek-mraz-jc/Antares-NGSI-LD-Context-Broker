@@ -13,8 +13,8 @@ use crate::filter::{mint, order, program, translate, Refused, SortBy, SortKey, T
 use crate::paths;
 use antares_ops::residual::{DateTime, Expr as RExpr, Program};
 use antares_ops::{
-    core_name, Caller, OperationId, OpsRequest, Page as ScanPage, Pushdown, Refusal, Scanned,
-    ViewOps, RESIDUAL_SCAN,
+    core_name, pickable, Caller, OperationId, OpsRequest, Page as ScanPage, Pushdown, Refusal,
+    Scanned, ViewOps, RESIDUAL_SCAN,
 };
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -379,8 +379,10 @@ fn listed(picked: Option<&[&str]>, expansions: &[Expansion], version: ODataVersi
 }
 
 /// The NGSI-LD query of an EntitySet: its type, the Attributes selected
-/// (`attrs`, which takes IRIs; the core members always come, and the
-/// expanded Relationships), the system members only when selected (E6),
+/// (`pick`, a projection that keeps every Entity, unlike `attrs`; by IRI,
+/// with the core members and the expanded Relationships; none when an IRI
+/// is no 4.21 member name, and the surface projects), the system members
+/// only when selected (E6),
 /// `join=inline` one level deep for an expansion of entities or a `q` that
 /// follows a Relationship (5.7.2.4). A join
 /// follows every Relationship it is given (4.5.23), so it names the
@@ -415,23 +417,32 @@ pub(crate) fn query(
         q.push_str("&orderBy=");
         q.push_str(&encode(keys));
     }
+    let system = |names: Option<&[&str]>| {
+        names.is_some_and(|n| n.iter().any(|m| matches!(*m, "createdAt" | "modifiedAt")))
+    };
+    let sys = system(picked) || nested.clone().any(system);
     if let Some(names) = picked {
-        let attrs: Vec<String> = names
+        let iris: Vec<&str> = names
             .iter()
             .filter_map(|name| set.members.get(*name))
             .map(|m| m.iri.as_str())
             .chain(expansions.iter().map(|e| e.iri))
-            .map(encode)
             .collect();
-        if !attrs.is_empty() {
-            q.push_str("&attrs=");
-            q.push_str(&attrs.join(","));
+        // ponytail: an unpickable IRI reads the whole Entity, and a join then
+        // walks every Relationship; mint terms (as `pushdown` does) if one is
+        // ever seen
+        if !iris.is_empty() && iris.iter().all(|iri| pickable(iri)) {
+            let own = ["id", "type", "scope"].into_iter().chain(
+                sys.then_some(["createdAt", "modifiedAt"])
+                    .into_iter()
+                    .flatten(),
+            );
+            let pick: Vec<String> = own.chain(iris).map(encode).collect();
+            q.push_str("&pick=");
+            q.push_str(&pick.join(","));
         }
     }
-    let system = |names: Option<&[&str]>| {
-        names.is_some_and(|n| n.iter().any(|m| matches!(*m, "createdAt" | "modifiedAt")))
-    };
-    if system(picked) || nested.clone().any(system) {
+    if sys {
         q.push_str("&options=sysAttrs");
     }
     if joined {
@@ -1723,6 +1734,26 @@ mod tests {
         assert_eq!(objects(None), Vec::<String>::new());
         let relationship = json!({"object": ["a", 1], "objectList": [{"object": "b"}, "c", 2]});
         assert_eq!(objects(Some(&relationship)), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn select_is_a_pick_of_the_frame_and_none_when_an_iri_is_no_member_name() {
+        // T-3822: `pick`, never `attrs`, which drops the Entities holding none
+        let mut set = set();
+        let none = Translated::default();
+        let q = query(&set, Some(&["geo", "createdAt"]), &[], &none);
+        assert!(
+            q.ends_with(
+                "&pick=id,type,scope,createdAt,modifiedAt,https%3A%2F%2Fe.org%2Fm&options=sysAttrs"
+            ),
+            "{q}"
+        );
+        assert!(!q.contains("attrs="), "{q}");
+        if let Some(geo) = set.members.get_mut("geo") {
+            geo.iri = "https://e.org/~m".into();
+        }
+        let q = query(&set, Some(&["geo"]), &[], &none);
+        assert!(!q.contains("pick=") && !q.contains("attrs="), "{q}");
     }
 
     #[test]

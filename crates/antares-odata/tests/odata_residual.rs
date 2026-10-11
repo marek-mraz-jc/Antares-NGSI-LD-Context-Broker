@@ -678,3 +678,55 @@ async fn a_scanned_read_of_an_empty_tenant_or_a_refused_view_answers_as_a_pushed
     assert_eq!(empty.status, StatusCode::OK, "{}", empty.body);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_select_projects_and_never_selects() -> Result<(), String> {
+    // T-3822, URL 5.1.4: `$select` (and `ngsild.pick`/`ngsild.omit`) narrow members, never
+    // Entities: no Car holds `seen`, 6 hold no `speed`
+    let (_b, app) = broker(CARS).await?;
+    let all = expected(|_| true);
+    let unfiltered = expected(|n| speed(n).is_none_or(|s| s <= 20));
+    let cases = [
+        ("$select=seen", &all, Some("seen")),
+        ("$select=speed", &all, Some("speed")),
+        ("$select=seen,createdAt", &all, Some("seen")),
+        ("ngsild.pick=seen", &all, None),
+        ("ngsild.omit=speed,label,seen", &all, None),
+        ("$select=seen&$expand=follows", &all, Some("seen")),
+        (
+            "$select=seen&$filter=not%20(speed%20gt%2020)",
+            &unfiltered,
+            Some("seen"),
+        ),
+        (
+            "ngsild.pick=seen&$filter=not%20(speed%20gt%2020)",
+            &unfiltered,
+            None,
+        ),
+    ];
+    for (query, want, null) in cases {
+        let page = get(
+            &app,
+            &format!("{ROOT}/Car?{query}&$count=true&$top=1000"),
+            &[],
+        )
+        .await;
+        assert_eq!(page.status, StatusCode::OK, "{query}: {}", page.body);
+        assert_eq!(page.body["@odata.count"], json!(want.len()), "{query}");
+        assert_eq!(ids(&page.body), *want, "{query}");
+        if let Some(member) = null {
+            let first = &page.body["value"][0];
+            assert!(first.get(member).is_some(), "{query}: {first}");
+            assert!(first.get("label").is_none(), "{query}: {first}");
+        }
+    }
+    let no_speed = get(
+        &app,
+        &format!("{ROOT}/Car('urn:ngsi-ld:Car:005')?$select=speed"),
+        &[],
+    )
+    .await;
+    assert_eq!(no_speed.status, StatusCode::OK, "{}", no_speed.body);
+    assert_eq!(no_speed.body["speed"], Value::Null, "{}", no_speed.body);
+    Ok(())
+}
