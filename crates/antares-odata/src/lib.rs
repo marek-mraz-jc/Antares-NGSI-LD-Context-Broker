@@ -102,10 +102,8 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
         return respond(ops, req).await;
     }
     *req.method_mut() = Method::GET;
-    let (mut parts, body) = respond(ops, req).await.into_parts();
-    if let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await {
-        parts.headers.insert(CONTENT_LENGTH, bytes.len().into());
-    }
+    // The GET's headers already carry its Content-Length (T-3737).
+    let (parts, _) = respond(ops, req).await.into_parts();
     Response::from_parts(parts, axum::body::Body::empty())
 }
 

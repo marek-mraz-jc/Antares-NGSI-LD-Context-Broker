@@ -512,8 +512,91 @@ pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
 /// and 5.6.3 forwards are sent in (T-3701).
 pub fn router(state: AppState) -> Router {
     let served = routes(state);
-    Router::new()
-        .fallback_service(tower_http::normalize_path::NormalizePath::trim_trailing_slash(served))
+    Router::new().fallback_service(tower::util::MapRequest::new(
+        served,
+        trim_trailing_slash::<axum::body::Body>,
+    ))
+}
+
+/// tower-http's `NormalizePath::trim_trailing_slash`, except below a view's
+/// OData service (`/x/views/{view}/odata/`): OData 4.01 Part 2 section 4 has
+/// no empty path segment, so `Products/` is a malformed URL there and not a
+/// spelling of `Products` (T-3731), and the path reaches the OData parser as
+/// sent. Anywhere else, trailing slashes and a leading `//` collapse to one
+/// path, `/` alone for a path of slashes.
+pub fn trim_trailing_slash<B>(mut req: axum::http::Request<B>) -> axum::http::Request<B> {
+    let path = req.uri().path();
+    if !path.ends_with('/') && !path.starts_with("//") {
+        return req;
+    }
+    let below_odata = path
+        .strip_prefix(surface::VIEW_ROOT)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, rest)| rest.starts_with("odata/"));
+    if below_odata {
+        return req;
+    }
+    let trimmed = format!("/{}", path.trim_matches('/'));
+    let path_and_query = match req.uri().query() {
+        Some(query) => format!("{trimmed}?{query}"),
+        None => trimmed,
+    };
+    let mut parts = req.uri().clone().into_parts();
+    // A path cut from a valid one stays valid; were it ever not, the request
+    // goes on as sent rather than failing here.
+    if let Ok(pq) = path_and_query.parse() {
+        parts.path_and_query = Some(pq);
+        if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+            *req.uri_mut() = uri;
+        }
+    }
+    req
+}
+
+#[cfg(test)]
+mod trim_trailing_slash_tests {
+    use super::trim_trailing_slash;
+
+    fn trimmed(uri: &str) -> String {
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(())
+            .unwrap_or_default();
+        trim_trailing_slash(req).uri().to_string()
+    }
+
+    /// The NGSI-LD API and every other surface: tower-http's trim, the query
+    /// kept. A view's OData service: as sent (T-3731).
+    #[test]
+    fn trims_everywhere_but_a_views_odata_service() {
+        for (sent, served) in [
+            ("/ngsi-ld/v1/entities/", "/ngsi-ld/v1/entities"),
+            (
+                "/ngsi-ld/v1/entities//?type=Car",
+                "/ngsi-ld/v1/entities?type=Car",
+            ),
+            ("//ngsi-ld/v1/entities", "/ngsi-ld/v1/entities"),
+            ("/", "/"),
+            ("///", "/"),
+            ("/x/views/", "/x/views"),
+            ("/x/views/a/", "/x/views/a"),
+            (
+                "/x/views/a/ngsi-ld/v1/entities/",
+                "/x/views/a/ngsi-ld/v1/entities",
+            ),
+            ("/x/views/a/odata", "/x/views/a/odata"),
+            ("/x/views/a/odata/v4/", "/x/views/a/odata/v4/"),
+            ("/x/views/a/odata/v4/Car/", "/x/views/a/odata/v4/Car/"),
+            (
+                "/x/views/a/odata/v4/Car//?$top=1",
+                "/x/views/a/odata/v4/Car//?$top=1",
+            ),
+            ("/q/views/odata/", "/q/views/odata"),
+        ] {
+            assert_eq!(trimmed(sent), served, "{sent}");
+        }
+    }
 }
 
 fn routes(state: AppState) -> Router {
