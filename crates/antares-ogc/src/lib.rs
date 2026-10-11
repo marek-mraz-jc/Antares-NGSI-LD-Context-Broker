@@ -589,9 +589,10 @@ mod tests {
             OperationId::MergeEntity,
             OperationId::DeleteEntity,
         );
-        assert!(part_4(&[OperationId::QueryEntities]).is_empty());
-        assert!(part_4(&[create]).is_empty(), "create alone is no class");
-        assert!(part_4(&[create, replace]).is_empty(), "nor without delete");
+        let none: [&str; 0] = [];
+        assert_eq!(part_4(&[OperationId::QueryEntities]), none);
+        assert_eq!(part_4(&[create]), none, "create alone is no class");
+        assert_eq!(part_4(&[create, replace]), none, "nor without delete");
         assert_eq!(part_4(&[merge]), ["update", "features"]);
         assert_eq!(
             part_4(&[create, replace, delete]),
