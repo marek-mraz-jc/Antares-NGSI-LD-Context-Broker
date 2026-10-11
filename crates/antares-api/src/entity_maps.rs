@@ -186,7 +186,7 @@ async fn create_map(
             crate::entities::build_query_map(&st, &tenant, &headers, &ctx, &vp, &filter).await?
         };
         let mut resp = created_response(doc, &ctx, accept, &tenant);
-        filter.mark_restricted(resp.headers_mut());
+        filter.mark(&st.host_alias, resp.headers_mut());
         Ok::<_, ApiError>(resp)
     };
     go.await.unwrap_or_else(|e| e.into_response())

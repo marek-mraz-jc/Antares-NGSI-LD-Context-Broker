@@ -1769,16 +1769,19 @@ pub(crate) fn rules_per_instance(doc: &Value, rules: &crate::policy::Filter) -> 
         .flatten()
         .map(String::as_str)
         .collect();
+    // a rule with windows decides per instance too (gap G6)
+    let per_instance = |r: &crate::policy::Rule| r.is_conditional() || !r.temporal.is_empty();
     let always: std::collections::BTreeSet<&str> = typed
         .iter()
-        .filter(|r| !r.is_conditional())
+        .filter(|r| !per_instance(r))
         .flat_map(|r| r.attributes.iter().map(String::as_str))
         .collect();
     let conditional: Vec<(&crate::policy::Rule, Vec<String>)> = typed
         .iter()
-        .filter(|r| r.is_conditional() && r.scope_q.is_none())
+        .filter(|r| per_instance(r) && r.scope_q.is_none())
         .map(|r| (*r, r.reads(ctx)))
         .collect();
+    let now = chrono::Utc::now();
     let Some(obj) = doc.as_object() else {
         return Some(doc.clone());
     };
@@ -1809,8 +1812,13 @@ pub(crate) fn rules_per_instance(doc: &Value, rules: &crate::policy::Filter) -> 
             .filter(|inst| {
                 instant(inst).is_some_and(|t| {
                     let state = state_at(doc, t);
+                    let observed = inst.get("observedAt").and_then(Value::as_str);
                     deciding.iter().any(|(r, reads)| {
-                        reads.iter().all(|a| state.get(a).is_some()) && r.holds(&state, ctx)
+                        reads.iter().all(|a| state.get(a).is_some())
+                            && r.holds(&state, ctx)
+                            && r.temporal
+                                .iter()
+                                .all(|w| observed.is_some_and(|o| w.admits(o, now)))
                     })
                 })
             })
@@ -2079,7 +2087,7 @@ pub(crate) async fn query_temporal_collected(
     } else {
         None
     };
-    let narrowed = filter.narrow_params(params, &ctx)?;
+    let narrowed = filter.narrow_window(&filter.narrow_params(params, &ctx)?, true)?;
     let params = &narrowed;
     let q_ast = params
         .get("q")
@@ -2504,7 +2512,7 @@ pub(crate) async fn query_temporal_collected(
             }
         }
     }
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 
@@ -2573,6 +2581,9 @@ async fn retrieve_temporal_inner(
         let accept = parse_accept(headers)?;
         let ctx = request_context(&st.loader, headers).await?;
         let filter = gate!(st, &tenant, headers, "5.7.3", ids: &[id]).await?;
+        // gap G6: every reader below takes the window clamped to the grant
+        let windowed = filter.narrow_window(params, false)?;
+        let params = &windowed;
         let tq = TemporalQ::from_params(params, false)?;
         let mut trepr = parse_trepr(params, &ctx)?;
         crate::repr::narrow_projection(&mut trepr.pick, &mut trepr.omit, &filter, &ctx)?;
@@ -2756,7 +2767,7 @@ async fn retrieve_temporal_inner(
             }
         }
         crate::paging::attach_warnings(&mut resp, &warnings);
-        filter.mark_restricted(resp.headers_mut());
+        filter.mark(&st.host_alias, resp.headers_mut());
         Ok(resp)
     }
 }

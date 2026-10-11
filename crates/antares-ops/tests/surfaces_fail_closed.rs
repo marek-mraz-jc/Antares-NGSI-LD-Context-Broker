@@ -318,3 +318,46 @@ async fn views_sit_behind_the_admin_secret() {
     );
     assert_open(&app).await;
 }
+
+/// `Probe` on the NGSI-LD root itself: every operation runs unnarrowed
+/// through the policy seam, as the root does, so no view gates it.
+struct RootProbe;
+
+impl Surface for RootProbe {
+    fn name(&self) -> &'static str {
+        "probe"
+    }
+    fn prefix(&self) -> &'static str {
+        "/x/probe"
+    }
+    fn version_info(&self) -> Value {
+        Value::Null
+    }
+    fn router(&self, ops: Ops) -> Router {
+        Probe.router(ops)
+    }
+    fn needs_view(&self) -> bool {
+        false
+    }
+}
+
+/// A surface that answers `needs_view() == false` (the WebSocket channel
+/// of a Tenant, ADR-0026 rule 2) is open with no view loaded, and stays
+/// open while views come and go; an unknown route under it is still 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_surface_of_the_root_is_open_without_a_view() {
+    let app = TestBroker::new()
+        .await
+        .expect("broker")
+        .serve(RootProbe)
+        .expect("mounts");
+    assert_open(&app).await;
+    let (s, _) = send(&app, Method::GET, "/x/probe/nowhere", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = send(&app, Method::PUT, "/q/views/cars", Some(&view("cars"))).await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_open(&app).await;
+    let (s, _) = send(&app, Method::DELETE, "/q/views/cars", None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_open(&app).await;
+}

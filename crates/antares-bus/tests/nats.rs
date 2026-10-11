@@ -347,3 +347,49 @@ async fn subscription_kv_survives_a_watch_gap() {
     .expect("reopened watch replays within 10s");
     assert_eq!(seen["v"], 2, "a reopened watch must see the gap write");
 }
+
+/// Core request/reply (the WebSocket relay's channel): a request reaches
+/// the pod replying on its subject and carries the reply back; with no
+/// replier, after the replier is aborted, or once it declines, the request
+/// is `None` instead of hanging.
+#[tokio::test(flavor = "multi_thread")]
+async fn core_request_reaches_the_replier_and_is_none_without_one() {
+    let url = require_nats!();
+    let holder = NatsBus::connect(&url).await.expect("holder");
+    let asker = NatsBus::connect(&url).await.expect("asker");
+    let subject = format!("antares.ws.test{}", nonce());
+    let within = Duration::from_secs(2);
+    assert_eq!(
+        asker.request(subject.clone(), b"x".to_vec(), within).await,
+        None
+    );
+
+    let task = holder.reply(subject.clone(), |p| {
+        (p != b"stop").then(|| [b"seen:".as_slice(), p].concat())
+    });
+    let mut answered = None;
+    for _ in 0..50 {
+        answered = asker
+            .request(subject.clone(), b"hello".to_vec(), within)
+            .await;
+        if answered.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(answered.as_deref(), Some(b"seen:hello".as_slice()));
+
+    assert_eq!(
+        asker
+            .request(subject.clone(), b"stop".to_vec(), within)
+            .await,
+        None
+    );
+    task.await.expect("the replier ends when it declines");
+
+    let task = holder.reply(subject.clone(), |p| Some(p.to_vec()));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    task.abort();
+    let _aborted = task.await;
+    assert_eq!(asker.request(subject, b"late".to_vec(), within).await, None);
+}

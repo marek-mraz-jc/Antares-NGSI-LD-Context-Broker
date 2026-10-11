@@ -245,7 +245,7 @@ impl LimitStats {
 
 /// Maximum brace/bracket nesting of a JSON byte stream, string-aware.
 /// A scan, not a parse — depth is checked before serde ever runs.
-pub(crate) fn json_depth(bytes: &[u8]) -> usize {
+pub fn json_depth(bytes: &[u8]) -> usize {
     let (mut depth, mut max, mut in_str, mut esc) = (0usize, 0usize, false, false);
     for &b in bytes {
         if in_str {
