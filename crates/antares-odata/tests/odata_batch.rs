@@ -56,7 +56,7 @@ impl PolicyEngine for Recording {
 
 async fn broker() -> Result<(TestBroker, Router, Arc<Recording>), String> {
     std::env::set_var("ANTARES_POLICY_SUBJECT_HEADERS", "x-subject");
-    std::env::set_var("ANTARES_SCHEMA_MAX_BYTES", "65536");
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
     let engine = Arc::new(Recording::default());
     let b = TestBroker::new().await?.with_policy(engine.clone());
     let (b, app) = city_on(b).await?;
