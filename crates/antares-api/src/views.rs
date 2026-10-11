@@ -394,6 +394,16 @@ pub const POLICY_TENANT: &str = "antares-policy";
 /// under (ADR-0025 rule 5), one document per (target, source) pair.
 pub const GRANT_TENANT: &str = "antares-grants";
 
+/// What a surface crate attached to a loaded view, opaque to the broker.
+#[derive(Clone)]
+pub struct Attached(pub Arc<dyn std::any::Any + Send + Sync>);
+
+impl std::fmt::Debug for Attached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Attached(..)")
+    }
+}
+
 /// One view of the table.
 #[derive(Debug, Clone)]
 pub enum ViewEntry {
@@ -409,6 +419,10 @@ pub enum ViewEntry {
         /// condition reads an Attribute it does not show (ADR-0023 rule
         /// 11), a temporal view keyed on a mutable member (rule 8).
         notes: Vec<String>,
+        /// The compiled Mapping of a view of another model (gap G18), which
+        /// only the view root reads; the broker carries it and never looks
+        /// inside.
+        mapping: Option<Attached>,
     },
     /// A stored view that failed validation: never served, named in
     /// `/q/health` with the reason.

@@ -2649,9 +2649,6 @@ antares-broker v0.1.3
 ├── antares-store feature "default" (*)
 ├── metrics feature "default" (*)
 ├── axum feature "default" (*)
-├── tower-http feature "catch-panic" (*)
-├── tower-http feature "cors" (*)
-├── tower-http feature "default" (*)
 ├── antares-bus feature "default"
 │   └── antares-bus v0.1.3
 │       ├── futures-util v0.3.34 (*)
