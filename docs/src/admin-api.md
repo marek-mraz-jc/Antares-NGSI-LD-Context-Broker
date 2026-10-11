@@ -226,7 +226,10 @@ the pod's view table before they answer; every other pod reloads within
 (`loaded` with its tenant, operation count and loader notes, or `invalid`
 with the reason) under `views`, and each surface that serves through views
 as `open` or `closed` under `surfaces`: no view loaded, every route of such
-a surface answers `404`.
+a surface answers `404`. `viewsRevision` is sixteen hex digits, a digest of
+the stored view documents the table was loaded from: every pod over one
+store reports the same value once it has reloaded, so two values mean two
+pods serving two predicates.
 
 ```json
 {
