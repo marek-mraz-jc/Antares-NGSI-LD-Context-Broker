@@ -760,8 +760,11 @@ impl<'a> Terms<'a> {
                     item,
                 ))
             }
-            Expr::Member(_) => {
-                let (path, edm) = self.residual_member(e)?;
+            Expr::Member(MemberPath {
+                variable: None,
+                path,
+            }) => {
+                let (path, edm) = self.residual_member(path)?;
                 Ok((RExpr::Path(path), edm))
             }
             Expr::Call(method, args) => {
@@ -815,12 +818,19 @@ impl<'a> Terms<'a> {
     /// value or one of another type compares false (URL 5.1.1.1.2, 5.1.1.1.3)
     /// and `ne` holds on it.
     fn residual_compare(&mut self, l: &Expr, op: CompareOp, r: &Expr) -> Result<RExpr, Refused> {
-        let plain = |e: &Expr| matches!(e, Expr::Member(MemberPath { variable: None, .. }));
-        let (member, op, lit) = match (literal(l, self.aliases), literal(r, self.aliases)) {
-            (Err(_), Ok(lit)) if plain(l) => (l, op, lit),
-            (Ok(lit), Err(_)) if plain(r) => (r, mirrored(op), lit),
-            // F25 and F14: two values of any kind.
-            _ => return self.residual_values(l, op, r),
+        let split = match (
+            plain(l),
+            literal(r, self.aliases),
+            plain(r),
+            literal(l, self.aliases),
+        ) {
+            (Some(member), Ok(lit), ..) => Some((member, op, lit)),
+            (.., Some(member), Ok(lit)) => Some((member, mirrored(op), lit)),
+            _ => None,
+        };
+        // F25 and F14: two values of any kind.
+        let Some((member, op, lit)) = split else {
+            return self.residual_values(l, op, r);
         };
         let (path, edm) = self.residual_member(member)?;
         typed(edm, std::slice::from_ref(lit))?;
@@ -882,15 +892,8 @@ impl<'a> Terms<'a> {
 
     /// [`Self::typed_member`] as a residual path: a scalar member of the set
     /// or its `observedAt` (F21); a hop is gated (F24) and stays `Later`.
-    fn residual_member(&mut self, e: &Expr) -> Result<(Path, &'static str), Refused> {
-        let Expr::Member(MemberPath {
-            variable: None,
-            path,
-        }) = e
-        else {
-            return Err(Refused::Later);
-        };
-        if let [name, annotation] = path.as_slice() {
+    fn residual_member(&mut self, path: &[String]) -> Result<(Path, &'static str), Refused> {
+        if let [name, annotation] = path {
             if annotation == OBSERVED_AT {
                 let member = self.set.members.get(name).ok_or(Refused::Later)?;
                 let term = self.term_of(&member.iri);
@@ -926,6 +929,17 @@ fn typed(edm: &str, literals: &[Literal]) -> Result<(), Refused> {
         Ok(())
     } else {
         Err(Refused::Bad)
+    }
+}
+
+/// The path of a member of the set, not of a lambda variable.
+fn plain(e: &Expr) -> Option<&[String]> {
+    match e {
+        Expr::Member(MemberPath {
+            variable: None,
+            path,
+        }) => Some(path),
+        _ => None,
     }
 }
 
@@ -1235,6 +1249,11 @@ mod tests {
                     member("https://e.org/tags", value("Edm.String", true)),
                 ),
                 ("doc".into(), member("https://e.org/doc", Shape::Json)),
+                // a type this surface does not check
+                (
+                    "span".into(),
+                    member("https://e.org/span", value("Edm.Duration", false)),
+                ),
                 (
                     "label".into(),
                     member("https://e.org/label", Shape::Language),
@@ -1585,6 +1604,68 @@ mod tests {
                 m("on"),
             ),
             call_of(Method::MatchesPattern, vec![m("name"), s("^a+$")]),
+        ];
+        for e in evaluated {
+            evaluated_alone(&e);
+        }
+    }
+
+    #[test]
+    fn literals_arithmetic_corners_and_unchecked_types_are_evaluated() {
+        let int = |n| lit(Literal::Int(n));
+        let s = |t: &str| lit(Literal::String(t.into()));
+        let evaluated = [
+            cmp(arith(int(1), ArithOp::Add, int(2)), CompareOp::Eq, int(3)),
+            cmp(
+                arith(m("speed"), ArithOp::Div, int(2)),
+                CompareOp::Gt,
+                int(1),
+            ),
+            cmp(
+                arith(m("speed"), ArithOp::Mod, int(2)),
+                CompareOp::Eq,
+                int(0),
+            ),
+            cmp(
+                int(1),
+                CompareOp::Lt,
+                arith(m("speed"), ArithOp::Sub, int(1)),
+            ),
+            cmp(
+                lit(Literal::Null),
+                CompareOp::Eq,
+                arith(m("speed"), ArithOp::Add, int(1)),
+            ),
+            cmp(m("name"), CompareOp::Ne, m("name")),
+            // a type this surface does not check compares with any
+            cmp(m("span"), CompareOp::Eq, m("name")),
+            cmp(m("name"), CompareOp::Eq, m("span")),
+            cmp(
+                call_of(Method::Year, vec![lit(Literal::Date("2026-01-02".into()))]),
+                CompareOp::Eq,
+                int(2026),
+            ),
+            cmp(
+                call_of(
+                    Method::Hour,
+                    vec![lit(Literal::DateTimeOffset("2026-01-02T03:04:05Z".into()))],
+                ),
+                CompareOp::Eq,
+                int(3),
+            ),
+            cmp(
+                call_of(
+                    Method::Minute,
+                    vec![lit(Literal::TimeOfDay("03:04:05".into()))],
+                ),
+                CompareOp::Eq,
+                int(4),
+            ),
+            cmp(
+                lit(Literal::Guid("01234567-89ab-cdef-0123-456789abcdef".into())),
+                CompareOp::Eq,
+                lit(Literal::Guid("01234567-89ab-cdef-0123-456789abcdef".into())),
+            ),
             Expr::All {
                 collection: MemberPath {
                     variable: None,
@@ -1606,18 +1687,23 @@ mod tests {
             },
         ];
         for e in evaluated {
-            let t = translate(&e, &set(), &BTreeMap::new(), &[]);
-            assert_eq!(
-                t.as_ref().map(|t| (t.q.is_none(), t.residual.len())),
-                Ok((true, 1)),
-                "{e:?}"
-            );
-            let now = DateTime::parse("2026-10-11T12:00:00Z");
-            assert!(
-                t.is_ok_and(|t| now.is_some_and(|now| program(&t, now).is_ok_and(|p| p.is_some()))),
-                "the evaluator takes {e:?}"
-            );
+            evaluated_alone(&e);
         }
+    }
+
+    /// `e` goes whole to the residual, and the evaluator takes it.
+    fn evaluated_alone(e: &Expr) {
+        let t = translate(e, &set(), &BTreeMap::new(), &[]);
+        assert_eq!(
+            t.as_ref().map(|t| (t.q.is_none(), t.residual.len())),
+            Ok((true, 1)),
+            "{e:?}"
+        );
+        let now = DateTime::parse("2026-10-11T12:00:00Z");
+        assert!(
+            t.is_ok_and(|t| now.is_some_and(|now| program(&t, now).is_ok_and(|p| p.is_some()))),
+            "the evaluator takes {e:?}"
+        );
     }
 
     #[test]
@@ -1648,6 +1734,7 @@ mod tests {
                 int(2),
             ),
             cmp(m("speed"), CompareOp::Eq, m("name")),
+            cmp(m("name"), CompareOp::Eq, m("speed")),
             cmp(m("on"), CompareOp::Gt, m("on")),
             call_of(Method::Length, vec![m("name")]),
             arith(m("speed"), ArithOp::Add, int(1)),
@@ -1668,6 +1755,33 @@ mod tests {
                 CompareOp::Gt,
                 arith(lit(Literal::Null), ArithOp::Add, int(1)),
             ),
+            // an ordered comparison with null is no row
+            cmp(
+                arith(m("speed"), ArithOp::Add, int(1)),
+                CompareOp::Gt,
+                lit(Literal::Null),
+            ),
+            // a geography as a value, a value of an unchecked type as a predicate
+            cmp(
+                lit(Literal::Geography(Geography {
+                    srid: 4326,
+                    shape: odata_url::Shape::Point(odata_url::Position(vec![
+                        "0".into(),
+                        "0".into(),
+                    ])),
+                })),
+                CompareOp::Eq,
+                int(1),
+            ),
+            call_of(Method::Round, vec![m("span")]),
+            // a lambda over a Relationship's object
+            Expr::Any {
+                collection: MemberPath {
+                    variable: None,
+                    path: vec!["owner".into()],
+                },
+                lambda: None,
+            },
         ];
         for e in later {
             assert_eq!(q(&e), Err(Refused::Later), "{e:?}");
@@ -1781,6 +1895,10 @@ mod tests {
             any(&["tags"], cmp(x(), CompareOp::Ne, a())),
             any(&["tags"], cmp(x(), CompareOp::Eq, lit(Literal::Null))),
             any(&["tags"], cmp(m("name"), CompareOp::Eq, a())),
+            any(
+                &["tags"],
+                Expr::In(Box::new(m("name")), vec![Literal::String("a".into())]),
+            ),
         ] {
             let t = translate(&evaluated, &set(), &BTreeMap::new(), &[]);
             assert_eq!(

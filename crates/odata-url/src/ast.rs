@@ -378,7 +378,6 @@ pub enum CompareOp {
 /// use odata_url::{Expr, Literal, Method};
 /// let call = Expr::Call(Method::StartsWith, vec![Expr::Alias("n".into()), Expr::Literal(Literal::String("a".into()))]);
 /// assert_eq!(call.to_string(), "startswith(@n,'a')");
-/// assert_eq!(Method::named("TOLOWER"), Some(Method::ToLower));
 /// assert_eq!(Method::Substring.arity(), (2, 3));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,16 +476,6 @@ impl Method {
     /// Every method, in the order of [`Method`].
     pub fn all() -> impl Iterator<Item = Self> {
         METHODS.iter().map(|(m, ..)| *m)
-    }
-
-    /// The method a name calls, matched ASCII case-insensitively as the parser reads every
-    /// keyword.
-    #[must_use]
-    pub fn named(name: &str) -> Option<Self> {
-        METHODS
-            .iter()
-            .find(|(_, n, ..)| n.eq_ignore_ascii_case(name))
-            .map(|(m, ..)| *m)
     }
 
     /// The canonical name.

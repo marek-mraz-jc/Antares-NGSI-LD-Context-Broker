@@ -1204,6 +1204,15 @@ fn methods_parse_with_their_arity() {
             1 => "name".into(),
             _ => "name,name".into(),
         };
+        // a method's name with no `(` after it is a member's name, here an unknown one; a
+        // dotted one reads as a qualified cast
+        let bare = err(&format!("Buildings?$filter={}%20eq%201", method.name()));
+        let want = if method.name().contains('.') {
+            "not implemented at byte 18: type cast"
+        } else {
+            "unknown name at byte 18"
+        };
+        assert_eq!(bare.to_string(), want, "{method:?}");
         let text = format!("{}({args}) eq null", method.name().to_uppercase());
         let parsed = filter(&text);
         let Expr::Compare(call, CompareOp::Eq, _) = parsed else {
@@ -1213,6 +1222,11 @@ fn methods_parse_with_their_arity() {
             matches!(call.as_ref(), Expr::Call(m, a) if *m == method && a.len() == method.arity().0),
             "{text}: {call:?}"
         );
+    }
+    // so is the bare name of a method that stays 501, and of cast and isof
+    for name in ["totalseconds", "cast", "isof"] {
+        let bare = err(&format!("Buildings?$filter={name}%20eq%201"));
+        assert_eq!(bare.to_string(), "unknown name at byte 18", "{name}");
     }
     assert_eq!(
         filter("substring(name,1,2) eq 'x'"),
