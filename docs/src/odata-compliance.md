@@ -112,15 +112,15 @@ The pass rate counts passed and failed tests; skipped tests stay out of it.
 The baseline was first recorded on dev `f0da234` (T-3714) and raised by
 T-3719, which reads a form-encoded query, T-3723, which declares `$batch`
 and serves `HEAD`, T-3720, which keys a set by its LinkML identifier
-and serves `$entity`, and T-3725, which answers a literal of another type
-than its property 400 (section 6):
+and serves `$entity`, and T-3730, which serves the entity references of a
+set and of one Entity (section 6):
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| Minimal | 166 | 103 | 24 | 61.7 % |
-| Intermediate | 223 | 113 | 14 | 66.4 % |
-| Advanced | 162 | 342 | 63 | 32.1 % |
-| **All** (suite summary) | 551 | 558 | 101 | 49.7 % |
+| Minimal | 165 | 104 | 24 | 61.3 % |
+| Intermediate | 233 | 103 | 14 | 69.3 % |
+| Advanced | 159 | 345 | 63 | 31.5 % |
+| **All** (suite summary) | 557 | 552 | 101 | 50.2 % |
 
 Before T-3720 the baseline stood at 455 passed, 661 failed and 94 skipped
 (Minimal 57.8 %, Intermediate 49.1 %, Advanced 26.0 %).
@@ -142,14 +142,14 @@ Each failing area is a task, or a decision with its reason:
 | A form-encoded query (Go `url.Values`, Java `URLEncoder`): `%24` before an option name, `+` for a space, `%2F` and `%3D` for the query's `/` and `=` | 11.2.5.x, 11.3.x, 5.1.x, 11.2.9, 11.2.14 | T-3719: read as plain. A `+` reads as a space only where the grammar requires whitespace (`RWS`); inside a literal and in optional whitespace (`BWS`) it stays a `+`, by design: OData writes a space as `%20` (Part 2, the note under Example 32) and gives `+` its own meanings (a sign, a time zone offset), so `'a+b'` keeps its plus |
 | The key was always `id` (the URN); the model's own key (`ID`, Edm.Guid) did not address an Entity, and `$entity?$id=` answered 501 | 11.1, 11.2.1 to 11.2.3, 11.2.11, 11.4.11, 8.2.7 | T-3720: the schema marks `ID` `identifier: true` with `edm_type: Edm.Guid` (`ci/odata-compliance/schema.json`); the set is keyed by it and `$entity` is served |
 | `@odata.id URL is dereferenceable` (11.2.2) appends the relative `@odata.id` to the service URL without a `/`, and keeps the whole path of an absolute one; under a service root with a path neither form reaches the Entity | 11.2.2 | a limit of the suite: JSON Format 4.01 section 4.5.8 lets `@odata.id` be relative to the context URL, and `$entity?$id=` with the same value passes |
-| Entity references of a set or an Entity (`{Set}/$ref`, `{Set}(key)/$ref`) answer 501 | 11.2.15 | T-3730 |
+| Entity references of a set or an Entity (`{Set}/$ref`, `{Set}(key)/$ref`) answer 501 | 11.2.15 | T-3730: served (mapping rows Q33a, Q33b); `$select` and `$expand` on a reference are 400 |
 | `{Set}/` and `{Set}//` read as `{Set}` | 11.1 | T-3731 |
 | A create without a key is refused (`MissingKey`); the service does not mint one | 11.4.2 to 11.4.5, 11.4.12 to 11.4.15, 8.1.5, 8.2.3, 8.2.5, 8.2.8 | T-3721 |
 | Edm types beyond String, Double and Int64, enums, Core and Capabilities annotations from the LinkML schema | 4.4, 5.1.1.x, 5.1.4 to 5.1.8, 5.3, 14.1, vocab_* | T-3722 |
 | `BatchSupported` was declared false while `$batch` is served; HEAD on a collection or an Entity answered 501 | 11.4.9.x, 11.4.11 | T-3723: declared and served; the batch scripts run, their failures are in the baseline |
 | Multipart `$batch` framed with bare LF line ends; a JSON batch under `OData-MaxVersion: 4.0`; independent requests and `dependsOn` after a failure | 11.4.9, 11.4.9.1, 11.4.9.3, 19_json_batch | T-3726 |
 | Change sets and atomicity groups, Content-ID references | 11.4.9.1, 11.4.9.3, 19_json_batch | not supported, by design: ADR-0024 section 5 (W26), mapping row C18 |
-| A comparison or `in` between a property and a literal of another type answers 200 with no rows; an Int64 literal past its range is accepted | 11.3.6, 11.2.5.1, 5.1.1.5 | T-3725: 400 `BadRequest`; a numeric literal still promotes to a wider numeric type (Part 2 section 5.1.1.1.1) and `null` compares with every type |
+| A comparison or `in` between a property and a literal of another type answers 200 with no rows; an Int64 literal past its range is accepted | 11.3.6, 11.2.5.1, 5.1.1.5 | T-3725 |
 | Options inside `$expand(...)` other than `$select` and `$expand` (Q5) | 11.2.5.9, 11.3.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
 | `$apply`, `$compute`, `$index`, `$search`, `$deltatoken` and delta links | 11.2.5.4.x, 11.2.5.13, 11.2.4.1, 11.2.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
 | Filter functions outside the F-row subset (date and time, arithmetic, `length`, `indexof`, `substring`, `divby`, `matchesPattern`, `isof`, `cast`) | 11.3.1 to 11.3.4, 11.3.9, 11.5.x | not supported, by design: ADR-0024 section 5; the mapped rows still at 501 are T-3686 |

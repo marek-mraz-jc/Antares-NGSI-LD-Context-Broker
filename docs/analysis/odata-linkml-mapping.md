@@ -226,6 +226,8 @@ The list of system query options is the ABNF `systemQueryOption` rule (`$compute
 | Q31 | `GET /{Set}('{id}')/{prop}`, `.../{prop}/$value` | URL 4.6, 4.7 | mapped | `retrieve_attribute_value` | `GET /entities/{id}/attrs/{attr}` | hidden or absent attribute: 404, the answer ADR-0023 rule 3 gives the NGSI-LD view and the one OData gives a path that does not resolve |
 | Q32 | `GET /{Set}('{id}')/{nav}` (related entities) | Protocol 11.2.7 | mapped | `retrieve_entity` (source, `pick=<nav>`), then `retrieve_entity` or `query_entities` (`id=` list) on the targets | each target read is its own gated operation, so no join is needed and Q3's gate does not apply | a hidden target is absent from the answer (collection) or 404 (single) |
 | Q33 | `GET /{Set}('{id}')/{nav}/$ref` | Protocol 11.2.8 | mapped | `retrieve_entity` | `pick=<nav>`; the object URIs as entity references | |
+| Q33a | `GET /{Set}/$ref` | URL 4.4, Protocol 11.2.8, JSON Format 14 | mapped (T-3730) | `query_entities` | the page of Q3 with `$filter`, `$orderby`, `$top`, `$skip`, `$count` and `$skiptoken` as on `/{Set}`; each returned Entity written as its reference `{Set}(key)` | `$select` or `$expand`: 400 (URL 4.4: a reference has no properties); a hidden Entity is absent |
+| Q33b | `GET /{Set}('{id}')/$ref` | URL 4.4, Protocol 11.2.8, JSON Format 14 | mapped (T-3730) | `retrieve_entity` | the Entity read as Q30, written as its reference | hidden or absent: 404; `$select` or `$expand`: 400; another option: 501 |
 | Q34 | `GET /` (service document) | Protocol 11.1.1 | mapped | `retrieve_entity_types` | the visible EntitySets (C1) | |
 | Q35 | `GET /$metadata` | Protocol 11.1.2 | mapped | `retrieve_entity_type_details` | section 7 | |
 | Q36 | `$crossjoin`, `$all` | URL 4.15, 4.16 | rejected | `odata_crossjoin`, `odata_all` | | 501 |
@@ -505,8 +507,8 @@ To be applied to `operation-matrix.yaml` by the task that owns it (this page doe
 | `delete_attribute` | odata | `DELETE .../{property}` | also `.../{prop}/$value` and single-valued `DELETE .../{nav}/$ref` | W13, W17 |
 | `replace_attribute` | odata | `PUT .../{property}` | also `PUT .../{nav}/$ref` replace-all | W20 |
 | `batch_create`, `batch_delete` | odata | `$batch` members map here | `$batch` members map to the single-Entity rows | W24 |
-| `query_entities` | odata | `GET /{EntitySet}` with options | also `POST .../$query`; `$expand` gated on T-3470 | Q3, Q22 |
-| `retrieve_entity` | odata | with `$select`, `$expand` | also `$entity?$id=`, related entities and `$ref` reads | Q23, Q32, Q33 |
+| `query_entities` | odata | `GET /{EntitySet}` with options | also `POST .../$query` and `{Set}/$ref`; `$expand` gated on T-3470 | Q3, Q22, Q33a |
+| `retrieve_entity` | odata | with `$select`, `$expand` | also `$entity?$id=`, related entities and `$ref` reads | Q23, Q32, Q33, Q33b |
 | `odata_upsert` | (rejected) | 501 | 404 `NotFound` | W7 |
 | `odata_schemaversion` | (rejected) | 501 | mapped for `*` and the current version, 501 otherwise | Q18 |
 | new rejected rows | | | `odata_expand_options`, `odata_deltatoken`, `odata_root`, `odata_it_this`, `odata_custom_option` (400), `odata_filter_segment`, `odata_ordinal`, `odata_deep_update`, `odata_collection_append`, `odata_delete_collection` (405), `odata_batch_references`, `odata_conditional_write`, `odata_write_readonly` (405) | 5.1, 6 |

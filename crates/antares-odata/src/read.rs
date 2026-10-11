@@ -15,7 +15,10 @@ use antares_ops::{core_name, Caller, OperationId, OpsRequest, Refusal, ViewOps};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use odata_axum::{json_level, json_response, ODataErrorResponse, ODataRequest, ODataState};
-use odata_json::{write_collection, write_entity, Ctx, EntityValue, ODataVersion, Page, Resource};
+use odata_json::{
+    write_collection, write_entity, write_entity_references, Ctx, EntityValue, ODataVersion, Page,
+    Resource,
+};
 use odata_url::{
     EdmModel, ExpandKind, ExpandPath, Key, KeyValue, Literal, ODataUri, QueryOptions, Segment,
     SelectItem,
@@ -69,7 +72,8 @@ pub(crate) async fn serve(
         return not_implemented(version).into_response();
     };
     let answer = match path.as_slice() {
-        [Segment::EntitySet(set)] => {
+        [_, Segment::Ref] | [_, _, Segment::Ref] if shaped(options) => Err(no_properties(version)),
+        [Segment::EntitySet(set)] | [Segment::EntitySet(set), Segment::Ref] => {
             collection(reads, caller, &ctx, set, path, options, headers).await
         }
         [Segment::EntitySet(set), Segment::Count] => {
@@ -77,6 +81,9 @@ pub(crate) async fn serve(
         }
         [Segment::EntitySet(set), Segment::Key(key)] => {
             entity(reads, caller, &ctx, set, key, options).await
+        }
+        [Segment::EntitySet(set), Segment::Key(key), Segment::Ref] if only_select(options) => {
+            paths::reference(reads, caller, &ctx, (set, key), options).await
         }
         // Below one Entity only `$select` applies (Q31 to Q33).
         [_, _, ..] if !only_select(options) => Err(not_implemented(version)),
@@ -158,6 +165,21 @@ fn percent_decoded(text: &str) -> Option<String> {
 
 /// Whether no option but `$select` (and `$format`, `$schemaversion=*`,
 /// read before) is asked.
+/// Whether `$select` or `$expand` asks for properties.
+fn shaped(options: &QueryOptions) -> bool {
+    options.select.is_some() || options.expand.is_some()
+}
+
+/// A reference has no properties to select or expand (URL 4.4).
+fn no_properties(version: ODataVersion) -> ODataErrorResponse {
+    ODataErrorResponse::new(
+        StatusCode::BAD_REQUEST,
+        "BadRequest",
+        "an entity reference has no properties to $select or $expand",
+    )
+    .with_version(version)
+}
+
 fn only_select(options: &QueryOptions) -> bool {
     options.filter.is_none()
         && options.expand.is_none()
@@ -486,7 +508,17 @@ async fn collection(
         next_link: next_link.as_deref(),
     };
     let mut body = Vec::new();
-    // A Vec takes every byte: the write cannot fail.
+    // A Vec takes every byte: the writes cannot fail.
+    if path.last() == Some(&Segment::Ref) {
+        let ids: Vec<String> = docs
+            .iter()
+            .filter_map(|doc| doc.get("id")?.as_str())
+            .map(|urn| format!("{set_name}{}", key_segment(set, urn)))
+            .collect();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let _ = write_entity_references(ctx, &ids, &page, &mut body);
+        return Ok(json_response(version, ctx.level, body));
+    }
     let _ = write_collection(ctx, &resource, &entities, &page, &mut body);
     Ok(json_response(version, ctx.level, body))
 }
