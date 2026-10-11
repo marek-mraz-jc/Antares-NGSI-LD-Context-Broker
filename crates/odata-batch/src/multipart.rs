@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! `multipart/mixed` batches (Protocol 4.01 section 11.7.7, RFC 2046 section 5.1) over a byte
 //! slice already bounded by `max_body_bytes`. Strict where a lenient reader would let two parsers
-//! disagree about where a member ends (threat model O10): CRLF line ends only, no preamble, no
-//! epilogue, no header folding, a delimiter followed by anything but `--` or CRLF refused, a
+//! disagree about where a member ends (threat model O10): no preamble, no epilogue, no header
+//! folding, a delimiter followed by anything but `--` or a line end refused, a lone CR refused, a
 //! `Content-Length` that must match, and change sets (the second multipart level) refused whole.
+//! A line end of the framing is CRLF or a bare LF (clients that write the body as text send LF);
+//! a part's body keeps its bytes, and a CR before the delimiter's LF belongs to the delimiter.
 
 use memchr::memmem;
 
@@ -12,6 +14,36 @@ use crate::{
 };
 
 const CRLF: &[u8] = b"\r\n";
+
+/// The length of the line end (CRLF or LF) `bytes` starts with, if it starts with one.
+fn line_end(bytes: &[u8]) -> Option<usize> {
+    if bytes.starts_with(CRLF) {
+        Some(2)
+    } else if bytes.starts_with(b"\n") {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// `bytes` without one trailing CR.
+fn chomp(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\r").unwrap_or(bytes)
+}
+
+/// The first empty line: where the lines before it end (their last line end excluded) and where
+/// the bytes after it start. `bytes` starting with a line end is an empty first line.
+fn blank_line(bytes: &[u8]) -> Option<(usize, usize)> {
+    if let Some(n) = line_end(bytes) {
+        return Some((0, n));
+    }
+    memchr::memchr_iter(b'\n', bytes).find_map(|i| {
+        let after = i.saturating_add(1);
+        let n = line_end(at(bytes, after))?;
+        let head = chomp(bytes.get(..i).unwrap_or_default()).len();
+        Some((head, after.saturating_add(n)))
+    })
+}
 
 /// The characters RFC 2046 section 5.1.1 allows in a boundary (`bchars`).
 fn is_bchar(c: char) -> bool {
@@ -70,7 +102,7 @@ fn at(bytes: &[u8], from: usize) -> &[u8] {
     bytes.get(from..).unwrap_or_default()
 }
 
-/// Header lines `name: value`, CRLF-separated, under the per-block bounds. `offset` is where
+/// Header lines `name: value`, separated by CRLF or LF, under the per-block bounds. `offset` is where
 /// `block` starts in the body.
 fn headers(
     block: &[u8],
@@ -89,7 +121,8 @@ fn headers(
     }
     let text = std::str::from_utf8(block).map_err(|_| framing.clone())?;
     let mut out = Vec::new();
-    for line in text.split("\r\n") {
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
         if out.len() >= limits.max_headers_per_part {
             return Err(BatchError::limit(
                 BatchLimit::Headers,
@@ -111,7 +144,7 @@ fn headers(
 
 /// One `application/http` part starting at body offset `offset`.
 fn part(content: &[u8], offset: usize, limits: &Limits) -> Result<Request, BatchError> {
-    let Some(end) = memmem::find(content, b"\r\n\r\n") else {
+    let Some((end, inner_at)) = blank_line(content).filter(|&(end, _)| end > 0) else {
         return Err(BatchError::Framing { offset });
     };
     let mime = headers(content.get(..end).unwrap_or_default(), offset, limits)?;
@@ -127,27 +160,22 @@ fn part(content: &[u8], offset: usize, limits: &Limits) -> Result<Request, Batch
     {
         return Err(BatchError::PartType { offset });
     }
-    let inner_at = end.saturating_add(4);
     let inner = at(content, inner_at);
     let request_offset = offset.saturating_add(inner_at);
-    let (line, rest) = match memmem::find(inner, CRLF) {
+    let (line, rest) = match memchr::memchr(b'\n', inner) {
         Some(i) => (
-            inner.get(..i).unwrap_or_default(),
-            at(inner, i.saturating_add(2)),
+            chomp(inner.get(..i).unwrap_or_default()),
+            at(inner, i.saturating_add(1)),
         ),
         None => (inner, &b""[..]),
     };
     let (method, url) = request_line(line, request_offset)?;
-    // Headers, then an empty line and the body; or headers up to the end of the part (no body).
-    let (head, body) = match memmem::find(rest, b"\r\n\r\n") {
-        _ if rest.starts_with(CRLF) => (&b""[..], at(rest, 2)),
-        Some(i) => (
-            rest.get(..i).unwrap_or_default(),
-            at(rest, i.saturating_add(4)),
-        ),
-        // No empty line: the part ends after the headers (Protocol 11.7.7 examples).
-        None => (rest.strip_suffix(CRLF).unwrap_or(rest), &b""[..]),
-    };
+    // Headers, then an empty line and the body; or, without an empty line, headers up to the end
+    // of the part and no body (Protocol 11.7.7 examples).
+    let (head, body) = blank_line(rest).map_or_else(
+        || (rest.strip_suffix(b"\n").map_or(rest, chomp), &b""[..]),
+        |(end, start)| (rest.get(..end).unwrap_or_default(), at(rest, start)),
+    );
     let request_headers = headers(head, request_offset, limits)?;
     if let Some(length) = header(&request_headers, "Content-Length") {
         if length.parse::<usize>().ok() != Some(body.len()) {
@@ -210,7 +238,7 @@ pub fn parse_multipart(body: &[u8], boundary: &str, limits: &Limits) -> Result<B
         return Err(BatchError::ContentType);
     }
     let dash = format!("--{boundary}");
-    let delimiter = format!("\r\n--{boundary}");
+    let delimiter = format!("\n--{boundary}");
     let finder = memmem::Finder::new(delimiter.as_bytes());
     if !body.starts_with(dash.as_bytes()) {
         return Err(BatchError::Framing { offset: 0 });
@@ -221,15 +249,15 @@ pub fn parse_multipart(body: &[u8], boundary: &str, limits: &Limits) -> Result<B
         pos = pos.saturating_add(padding(at(body, pos)));
         let rest = at(body, pos);
         if let Some(after) = rest.strip_prefix(b"--") {
-            if after.is_empty() || after == CRLF {
+            if after.is_empty() || line_end(after) == Some(after.len()) {
                 return Ok(batch);
             }
             return Err(BatchError::Framing { offset: pos });
         }
-        if !rest.starts_with(CRLF) {
+        let Some(n) = line_end(rest) else {
             return Err(BatchError::Framing { offset: pos });
-        }
-        pos = pos.saturating_add(2);
+        };
+        pos = pos.saturating_add(n);
         let content = at(body, pos);
         let end = finder
             .find(content)
@@ -237,7 +265,8 @@ pub fn parse_multipart(body: &[u8], boundary: &str, limits: &Limits) -> Result<B
         if batch.requests.len() >= limits.max_requests {
             return Err(BatchError::limit(BatchLimit::Requests, limits.max_requests));
         }
-        let request = part(content.get(..end).unwrap_or_default(), pos, limits)?;
+        // A CR before the delimiter's LF belongs to the delimiter (RFC 2046 section 5.1.1).
+        let request = part(chomp(content.get(..end).unwrap_or_default()), pos, limits)?;
         check_member(&request, &batch.requests, limits)?;
         batch.requests.push(request);
         pos = pos.saturating_add(end).saturating_add(delimiter.len());

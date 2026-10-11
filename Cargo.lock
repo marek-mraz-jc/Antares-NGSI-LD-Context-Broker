@@ -133,7 +133,6 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tower",
- "tower-http 0.7.1",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -238,6 +237,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -348,6 +348,7 @@ dependencies = [
  "antares-ops",
  "axum",
  "http-body-util",
+ "proptest",
  "serde_json",
  "tokio",
  "tower",

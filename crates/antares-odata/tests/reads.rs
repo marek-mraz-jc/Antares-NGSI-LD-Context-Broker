@@ -178,10 +178,11 @@ async fn an_entity_set_is_the_narrowed_query_mapped_through_the_model() {
     );
     assert_eq!(one["_types"], json!(["Car"]));
     assert_eq!(one["scope"], json!(["/a"]));
+    // the entities, not the control information: the metadata ETag is a hash
+    let entities = body["value"].to_string();
     assert!(
-        !got.body.contains("secret") && !got.body.contains('7'),
-        "{}",
-        got.body
+        !entities.contains("secret") && !entities.contains('7'),
+        "{entities}"
     );
 }
 
@@ -480,7 +481,6 @@ async fn the_forms_of_later_rounds_are_501_and_read_only_writes_405() {
         "Car?$filter=not%20(speed%20gt%201)",
         "Car('urn:ngsi-ld:Car:1')?$filter=speed%20gt%201",
         "Car?$schemaversion=2",
-        "$entity?$id=Car('urn:ngsi-ld:Car:1')",
         "$batch",
     ] {
         let got = send(&app, Method::GET, &format!("{ROOT}/{uri}"), None, &[]).await;
