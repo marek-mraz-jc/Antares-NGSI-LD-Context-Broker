@@ -252,6 +252,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "tikv-jemallocator",
  "tokio",
  "tower",
  "tracing",
