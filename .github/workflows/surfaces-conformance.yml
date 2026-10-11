@@ -1,8 +1,8 @@
 name: surfaces-conformance
 
 # The surfaces' conformance jobs (docs/analysis/surfaces-conformance.md
-# section 7). This file holds the MCP pair (T-3516), the OData suite
-# (T-3510), etsi-iop (T-3675) and ws-conformance (T-3518); the other
+# section 7). This file holds the MCP pair (T-3516), the OData suites
+# (T-3510, T-3714), etsi-iop (T-3675) and ws-conformance (T-3518); the other
 # surfaces add their jobs here.
 #
 #   mcp-conformance  the official @modelcontextprotocol/conformance 0.1.16
@@ -17,6 +17,10 @@ name: surfaces-conformance
 #                    live, both $metadata validations, $filter/q parity,
 #                    Capabilities, linked-entity checks) against views
 #                    `all` and `parity-restricted`
+#   odata-compliance-external  the independent NLstn odata-compliance-suite
+#                    v1.0.3 (pinned by checksum) against view `compliance`
+#                    (its reference model, ci/odata-compliance), red on any
+#                    test ci/odata-compliance-baseline.json passes (T-3714)
 #   ws-conformance   docs/api/asyncapi-ws.yaml validated by @asyncapi/cli
 #                    2.16.0, then joinedcontext-conformance tests/ws: the
 #                    scripted sessions of /x/views/all/ws, every message
@@ -245,6 +249,80 @@ jobs:
           title: odata-conformance went red
           body: The joinedcontext-conformance OData suite against /x/views/all/odata/v4 failed.
           log-file: broker.log
+
+  odata-compliance-external:
+    name: odata-compliance-external
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+    env:
+      OCS_URL: https://github.com/NLstn/odata-compliance-suite/releases/download/v1.0.3/odata-compliance-suite_linux_amd64
+      OCS_SHA256: c89dd48bf58623b2b651a750a4c8ba7d1179cf4257b23464dbf508afe0a7cec6
+      ROOT: /x/views/compliance/odata/v4
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: broker-surfaces
+      - name: Fetch the pinned suite
+        run: |
+          curl -fsSL -o ocs "$OCS_URL"
+          echo "$OCS_SHA256  ocs" | sha256sum -c -
+          chmod +x ocs
+      - name: Start the broker, the reference model and the Reseed harness
+        run: |
+          chmod +x antares
+          # The job's own admin token, outside the workspace and the artifact;
+          # curl reads the header from a file so it is never an argument.
+          umask 077
+          token=$(openssl rand -hex 32)
+          echo "::add-mask::$token"
+          printf '%s' "$token" > "$RUNNER_TEMP/admin-token"
+          printf 'Authorization: Bearer %s\n' "$token" > "$RUNNER_TEMP/admin-header"
+          ANTARES_HTTP_PORT=8080 ANTARES_API_SURFACES=admin,views,odata \
+            ANTARES_ADMIN_TOKEN_FILE="$RUNNER_TEMP/admin-token" \
+            ANTARES_SCHEMA_MAX_BYTES=1048576 ./antares > broker.log 2>&1 &
+          for _ in $(seq 1 100); do curl -sf -o /dev/null localhost:8080/q/health && break; sleep 0.2; done
+          tenant=$(jq -r .tenant ci/odata-compliance/view.json)
+          curl -fsS -X PUT -H @"$RUNNER_TEMP/admin-header" -H 'Content-Type: application/json' \
+            --data-binary @ci/odata-compliance/view.json localhost:8080/q/views/compliance
+          curl -fsS -X PUT -H @"$RUNNER_TEMP/admin-header" -H 'Content-Type: application/json' \
+            --data-binary @ci/odata-compliance/schema.json "localhost:8080/q/schemas/$tenant"
+          dev/odata-compliance/reseed-proxy.py 8081 http://localhost:8080 "$ROOT" > proxy.log 2>&1 &
+          for _ in $(seq 1 50); do curl -sf -o /dev/null "localhost:8081$ROOT/" && break; sleep 0.2; done
+          curl -fsS -X POST "localhost:8081$ROOT/Reseed"
+      - name: The suite, gated by ci/odata-compliance-baseline.json
+        run: |
+          dev/odata-compliance/baseline.py --self-test
+          ./ocs -server "http://localhost:8081$ROOT" -verbose -format junit -output ocs-junit.xml \
+            > ocs-run.txt 2>&1 || true
+          set +e
+          dev/odata-compliance/baseline.py check ocs-run.txt ci/odata-compliance-baseline.json > gate.md
+          rc=$?
+          { echo "## OData compliance (NLstn odata-compliance-suite v1.0.3)"; cat gate.md; } >> "$GITHUB_STEP_SUMMARY"
+          cat gate.md
+          exit $rc
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: odata-compliance-external
+          path: |
+            ocs-run.txt
+            ocs-junit.xml
+            gate.md
+            broker.log
+            proxy.log
+          retention-days: 14
+      - name: File an issue on nightly failure
+        if: failure() && github.event_name == 'schedule'
+        uses: ./.github/actions/failure-issue
+        with:
+          title: odata-compliance-external went red
+          body: A test the NLstn OData compliance suite passed in ci/odata-compliance-baseline.json fails now.
+          log-file: gate.md
 
   ws-conformance:
     name: ws-conformance

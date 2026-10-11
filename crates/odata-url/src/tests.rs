@@ -822,6 +822,73 @@ fn normalisation() {
 }
 
 #[test]
+fn a_form_encoded_query_reads_as_written_plain() {
+    // T-3719: `%24` names a system option, `+` is whitespace where `RWS` stands, `%2F` and
+    // `%3D` are the query's `/` and `=`.
+    let o = options("Buildings?%24top=1&%24Skip=2&%24filter=height+gt+5&%24orderby=height+desc");
+    assert_eq!((o.top, o.skip), (Some(1), Some(2)));
+    assert_eq!(o.filter, Some(filter("height gt 5")));
+    assert_eq!(o.orderby, options("Buildings?$orderby=height desc").orderby);
+    assert!(o.custom.is_empty(), "{:?}", o.custom);
+    assert_eq!(
+        filter("height+gt+5+and+name+eq+%27x%27"),
+        filter("height gt 5 and name eq 'x'")
+    );
+    let sensors = options("Buildings?$expand=sensors(%24select%3Dvalue)").expand;
+    assert_eq!(
+        sensors,
+        options("Buildings?$expand=sensors($select=value)").expand
+    );
+    assert_eq!(
+        filter("address%2Fcity+eq+%27Bonn%27"),
+        filter("address/city eq 'Bonn'")
+    );
+    let o = options("Buildings?%24select=address%2Fcity&%24expand=address%2Fsensors");
+    assert_eq!((o.select, o.expand), {
+        let plain = options("Buildings?$select=address/city&$expand=address/sensors");
+        (plain.select, plain.expand)
+    });
+    assert_eq!(
+        options("Buildings?@h%3D10").aliases,
+        vec![("h".to_owned(), Literal::Int(10))]
+    );
+    // A custom option keeps its `=` as written, and a key keeps its `%2F`.
+    assert_eq!(
+        options("Buildings?mode%3Dfast").custom,
+        vec![("mode%3Dfast".to_owned(), None)]
+    );
+    let key = ok("Buildings('a%2Fb')").to_string();
+    assert!(key.contains("a%2Fb"), "{key}");
+    // Encoded twice is a custom option; a duplicate across both spellings is one.
+    assert_eq!(
+        options("Buildings?%2524top=1").custom,
+        vec![("%2524top".to_owned(), Some("1".to_owned()))]
+    );
+    let dup = err("Buildings?%24top=1&$top=2");
+    assert_eq!(dup.kind, UrlErrorKind::DuplicateOption("$top"));
+    // Where `RWS` stands a `+` could only be a sign, which means nothing.
+    assert_eq!(filter("height gt +5"), filter("height gt 5"));
+    assert_eq!(filter("height+gt+%2B5"), filter("height gt 5"));
+    assert_eq!(filter("height+gt+-5"), filter("height gt -5"));
+    // A literal keeps its `+`, and a decoded `&` or `=` never splits an option.
+    assert_eq!(
+        filter("name+eq+'a+b'"),
+        Expr::Compare(
+            Box::new(member(&["name"])),
+            CompareOp::Eq,
+            Box::new(Expr::Literal(string("a+b")))
+        )
+    );
+    let o = options("Buildings?$filter=name+eq+'a%26top%3D1'");
+    assert_eq!(o.top, None);
+    assert_eq!(o.filter, Some(filter("name eq 'a&top=1'")));
+    // `BWS` is not `RWS`: a `+` after a comma is no whitespace.
+    syntax("Buildings?$select=name,+height", 23);
+    // No whitespace after `gt` is still none: the error stands at the `5`.
+    syntax("Buildings?$filter=height+gt5", 27);
+}
+
+#[test]
 fn the_canonical_form_parses_back() {
     for uri in [
         "",

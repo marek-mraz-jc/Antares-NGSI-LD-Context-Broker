@@ -179,8 +179,14 @@ Create, Merge or Replace, and Delete Entity, with the members no write
 names; `Countable`, `Filterable` and `Sortable` with the members they
 refuse (`NonFilterableProperties`, `NonSortableProperties`), `Expandable`
 one level, no upsert, deep insert, deep update or search, and
-`QuerySegmentSupported`. The annotations are advisory: every request is
-still gated, and a read the engine denies is `403` whatever they say.
+`QuerySegmentSupported`. The container declares `BatchSupported` and
+`BatchSupport` (`multipart/mixed` and `application/json`, continue on
+error, no Content-ID references; T-3723). The annotations are advisory:
+every request is still gated, and a read the engine denies is `403`
+whatever they say.
+
+Every `GET` answers `HEAD` too: the same status and headers, with the
+`Content-Length` of the `GET` and no body, through the same gate (T-3723).
 
 ## 7. Refusals and errors
 
@@ -190,7 +196,10 @@ actions, functions, `$crossjoin`, `$all`, delta, media, and the rest) are
 refused with the status the matrix names, before any gate or store access.
 An upsert is the exception: it is the Merge or Replace Entity it names,
 gated, and answers that operation's `404`. A custom query option is
-`400`; a write method where it has no meaning (`/`, `$metadata`,
+`400`. A query a form encoder wrote reads as its plain form (T-3719):
+`%24filter` is `$filter`, `%2F` and `%3D` are the query's `/` and `=`, and
+`+` is a space where the grammar requires whitespace (`Price+gt+5`), never
+inside a literal; a write method where it has no meaning (`/`, `$metadata`,
 `$count`, a `POST` to one Entity, a `DELETE` of a set) is `405`, and the
 write forms of later rounds are `501`.
 
@@ -202,5 +211,6 @@ carries no NGSI-LD `ProblemDetails`.
 
 - [Endpoint views](views.md)
 - [MCP endpoint of a view](mcp.md)
+- [OData compliance](odata-compliance.md): the independent suite, its baseline and pass rate per level
 - `docs/analysis/odata-linkml-mapping.md`, `docs/analysis/surfaces-threat-model.md` (O1 to O27)
 - ADR-0024 (the OData crates)

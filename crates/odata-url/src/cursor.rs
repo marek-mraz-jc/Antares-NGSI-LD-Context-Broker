@@ -149,6 +149,18 @@ impl<'a> Cursor<'a> {
         self.token("@", "%40")
     }
 
+    /// `/` inside a query option, or `%2F` as a form encoder writes it (T-3719): there the ABNF
+    /// has no other reading of `%2F`. A resource path keeps `%2F` as part of a key.
+    pub(crate) fn slash(&mut self) -> bool {
+        self.token("/", "%2F")
+    }
+
+    /// `EQ` after an option or alias name, or `%3D` as a form encoder writes it inside
+    /// `$expand(...)` (T-3719). A custom option's `=` stays as written.
+    pub(crate) fn eq_sign(&mut self) -> bool {
+        self.token("=", "%3D")
+    }
+
     /// `SIGN`, read as `+` or `-`.
     pub(crate) fn sign(&mut self) -> Option<char> {
         if self.eat("+") || self.eat_ci("%2B") {
@@ -170,10 +182,14 @@ impl<'a> Cursor<'a> {
         while self.space() {}
     }
 
-    /// `RWS`: required whitespace.
+    /// `RWS`: required whitespace, where `+` also counts (T-3719): a form encoder (Go's
+    /// `url.Values`, Java's `URLEncoder`) writes a space as `+`. Where `RWS` stands, a literal
+    /// `+` can only be the sign of the next number, and that sign means nothing (`gt +5` is
+    /// `gt 5`), so no valid URL reads differently; `BWS` and literals keep `+` as written.
     pub(crate) fn rws(&mut self) -> bool {
-        let found = self.space();
-        self.bws();
+        let unit = |c: &mut Self| c.space() || c.eat("+");
+        let found = unit(self);
+        while found && unit(self) {}
         found
     }
 

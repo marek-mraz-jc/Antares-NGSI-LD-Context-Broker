@@ -94,10 +94,25 @@ impl Surface for OData {
     }
 }
 
+/// `HEAD` is the `GET` of the same resource, through the same gate, with
+/// its status and headers and no body (RFC 9110 9.3.2, T-3723); the
+/// `Content-Length` is the one the `GET` would send.
+async fn serve(ops: &Ops, mut req: Request) -> Response {
+    if req.method() != Method::HEAD {
+        return respond(ops, req).await;
+    }
+    *req.method_mut() = Method::GET;
+    let (mut parts, body) = respond(ops, req).await.into_parts();
+    if let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await {
+        parts.headers.insert(CONTENT_LENGTH, bytes.len().into());
+    }
+    Response::from_parts(parts, axum::body::Body::empty())
+}
+
 /// One request to a view's endpoint. The path is read as sent, below the
 /// prefix (`/{view}/odata/v4...`): a view id is `[a-z0-9-]`, so its raw
 /// segment is its id, and `ca%72s` never reaches the view `cars`.
-async fn serve(ops: &Ops, mut req: Request) -> Response {
+async fn respond(ops: &Ops, mut req: Request) -> Response {
     let id = req
         .uri()
         .path()
