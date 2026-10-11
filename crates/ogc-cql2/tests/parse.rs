@@ -408,6 +408,32 @@ fn json_refuses_what_the_schema_does_not_define() {
     assert_eq!(text(&tree.to_string()), tree);
 }
 
+/// `n` intervals, each the start of the one around it.
+fn intervals(n: usize) -> String {
+    format!(
+        "T_INTERSECTS(t, {}'..'{})",
+        "INTERVAL(".repeat(n),
+        ", '..')".repeat(n)
+    )
+}
+
+/// A filter of `MAX_LEN` bytes nesting intervals is refused on the stack of a tokio worker
+/// (2 MiB), where unbounded recursion would abort the process.
+#[test]
+fn nested_intervals_of_max_len_are_refused_on_a_small_stack() {
+    let n = (MAX_LEN - 32) / ", '..')INTERVAL(".len();
+    let deep = intervals(n);
+    assert!(deep.len() <= MAX_LEN, "{}", deep.len());
+    let what = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || parse(Lang::Text, &deep).map_err(|e| e.what))
+        .map(std::thread::JoinHandle::join);
+    assert!(
+        matches!(what, Ok(Ok(Err("the filter nests deeper than the limit")))),
+        "{what:?}"
+    );
+}
+
 #[test]
 fn depth_and_size_bounded() {
     let nested = |n: usize| format!("{}pm10>50{}", "(".repeat(n), ")".repeat(n));
@@ -420,6 +446,14 @@ fn depth_and_size_bounded() {
         nested(5_000),
         format!("{}pm10>50", "NOT ".repeat(1_000)),
         format!("a = {}1", "-".repeat(1_000)),
+        intervals(40),
+        format!("{}1{}", "abs(".repeat(40), ")".repeat(40)),
+        format!(
+            "S_INTERSECTS(g, {}POINT(1 2){})",
+            "GEOMETRYCOLLECTION(".repeat(40),
+            ")".repeat(40)
+        ),
+        format!("a IN {}1{}", "(".repeat(40), ")".repeat(40)),
     ] {
         assert_eq!(
             refused(Lang::Text, &deep).what,

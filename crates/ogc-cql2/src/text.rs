@@ -457,10 +457,12 @@ impl Parser {
             }
             "INTERVAL" => {
                 self.expect_sym("(", "(")?;
+                self.budget.enter(at)?;
                 let start = self.interval_end()?;
                 self.expect_sym(",", ", of an interval")?;
                 let end = self.interval_end()?;
                 self.expect_sym(")", ")")?;
+                self.budget.leave();
                 self.node(Expr::Interval(Box::new(start), Box::new(end)))
             }
             "BBOX" => {
