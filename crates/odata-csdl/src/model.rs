@@ -505,8 +505,37 @@ pub struct NavigationProperty {
     pub nullable: bool,
     /// The navigation property of the target type that leads back here.
     pub partner: Option<String>,
+    /// The dependent properties whose values key the target (CSDL XML 8.5).
+    pub referential_constraints: Vec<ReferentialConstraint>,
     /// Annotations on the navigation property.
     pub annotations: Vec<Annotation>,
+}
+
+/// A referential constraint of a single-valued navigation property (CSDL XML 8.5): `property`
+/// of the declaring type holds the value of `referenced_property` of the target type.
+///
+/// ```
+/// use odata_csdl::ReferentialConstraint;
+/// let c = ReferentialConstraint::new("ProductID", "ID");
+/// assert_eq!((c.property.as_str(), c.referenced_property.as_str()), ("ProductID", "ID"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferentialConstraint {
+    /// The dependent property: a primitive property of the declaring type.
+    pub property: String,
+    /// The principal property of the target type, of the same type.
+    pub referenced_property: String,
+}
+
+impl ReferentialConstraint {
+    /// `property` references `referenced_property`.
+    #[must_use]
+    pub fn new(property: impl Into<String>, referenced_property: impl Into<String>) -> Self {
+        Self {
+            property: property.into(),
+            referenced_property: referenced_property.into(),
+        }
+    }
 }
 
 impl NavigationProperty {
@@ -523,6 +552,7 @@ impl NavigationProperty {
             ty,
             nullable: true,
             partner: None,
+            referential_constraints: Vec::new(),
             annotations: Vec::new(),
         }
     }

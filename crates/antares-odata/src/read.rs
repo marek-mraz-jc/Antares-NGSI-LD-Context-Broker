@@ -1185,6 +1185,7 @@ mod tests {
         Set {
             type_iri: "https://e.org/T".into(),
             identifier: None,
+            references: BTreeMap::new(),
             writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 ("geo".into(), member(Shape::Geo)),

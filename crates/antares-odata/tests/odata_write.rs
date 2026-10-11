@@ -153,6 +153,120 @@ async fn odata_bind_to_hidden_or_missing_target_is_400_and_writes_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn odata_a_reference_to_a_hidden_or_missing_entity_is_400_and_writes_nothing() {
+    // Protocol 11.4.2 SHOULD, mapping row R6 (T-3761): `ownerRef` keys the
+    // target of `owner`; Person:2 is hidden, Person:9 absent, Car:1 of
+    // another type, and all three answer the same 400.
+    let (_b, app) = city().await.expect("broker");
+    let (_, metadata) = send(&app, Method::GET, &format!("{ROOT}/$metadata"), None).await;
+    let metadata = metadata.as_str().unwrap_or_default();
+    assert!(
+        metadata
+            .contains(r#"<ReferentialConstraint Property="ownerRef" ReferencedProperty="id"/>"#),
+        "{metadata}"
+    );
+    let mut answers = Vec::new();
+    for (n, missing) in [
+        (20, "urn:ngsi-ld:Person:2"),
+        (21, "urn:ngsi-ld:Person:9"),
+        (22, "urn:ngsi-ld:Car:1"),
+    ] {
+        let named = json!({"ownerRef": missing});
+        let create =
+            json!({"id": format!("urn:ngsi-ld:Car:{n}"), "scope": ["/a"], "ownerRef": missing});
+        let replace = json!({"id": "urn:ngsi-ld:Car:1", "scope": ["/a"], "ownerRef": missing});
+        let mut refused = Vec::new();
+        for (method, path, body) in [
+            (Method::POST, "Car".to_owned(), create),
+            (
+                Method::PATCH,
+                "Car('urn:ngsi-ld:Car:1')".to_owned(),
+                named.clone(),
+            ),
+            (Method::PUT, "Car('urn:ngsi-ld:Car:1')".to_owned(), replace),
+            (
+                Method::PUT,
+                "Car('urn:ngsi-ld:Car:1')/ownerRef".to_owned(),
+                json!({"value": missing}),
+            ),
+            (
+                Method::PATCH,
+                "Car('urn:ngsi-ld:Car:1')/ownerRef".to_owned(),
+                json!({"value": missing}),
+            ),
+        ] {
+            let (status, body) = odata(&app, method.clone(), &path, Some(&body.to_string())).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{method} {path} {missing}: {body}"
+            );
+            assert_eq!(body["error"]["target"], "ownerRef", "{body}");
+            refused.push(body);
+        }
+        assert_eq!(
+            stored(&app, &format!("urn:ngsi-ld:Car:{n}")).await.0,
+            StatusCode::NOT_FOUND,
+            "{missing}: nothing created"
+        );
+        answers.push(refused);
+    }
+    assert_eq!(
+        answers[0], answers[1],
+        "a hidden Person answers like an absent one"
+    );
+    assert_eq!(answers[1], answers[2], "an Entity of another type too");
+    let (_, car) = stored(&app, "urn:ngsi-ld:Car:1").await;
+    assert!(
+        car.get(format!("{CITY}ownerRef")).is_none() && car[format!("{CITY}speed")]["value"] == 1.0,
+        "nothing written: {car}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_a_reference_to_a_visible_entity_or_null_is_written() {
+    // A visible Person is referenced; null references nothing and reads nothing.
+    let (_b, app) = city().await.expect("broker");
+    let create =
+        r#"{"id": "urn:ngsi-ld:Car:23", "scope": ["/a"], "ownerRef": "urn:ngsi-ld:Person:1"}"#;
+    let (status, body) = odata(&app, Method::POST, "Car", Some(create)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["ownerRef"], "urn:ngsi-ld:Person:1", "{body}");
+    for (method, path, body) in [
+        (
+            Method::PATCH,
+            "Car('urn:ngsi-ld:Car:1')",
+            r#"{"ownerRef": "urn:ngsi-ld:Person:1"}"#,
+        ),
+        (
+            Method::PUT,
+            "Car('urn:ngsi-ld:Car:1')/ownerRef",
+            r#"{"value": "urn:ngsi-ld:Person:1"}"#,
+        ),
+        (
+            Method::PATCH,
+            "Car('urn:ngsi-ld:Car:1')",
+            r#"{"ownerRef": null}"#,
+        ),
+    ] {
+        let (status, answer) = odata(&app, method.clone(), path, Some(body)).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "{method} {path} {body}: {answer}"
+        );
+    }
+    let (_, car) = stored(&app, "urn:ngsi-ld:Car:1").await;
+    assert!(
+        car.get(format!("{CITY}ownerRef")).is_none(),
+        "null deletes: {car}"
+    );
+    let create = r#"{"id": "urn:ngsi-ld:Car:24", "scope": ["/a"], "ownerRef": null}"#;
+    let (status, body) = odata(&app, Method::POST, "Car", Some(create)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn odata_upsert_on_absent_and_on_hidden_id_answer_the_same_404() {
     let (_b, app) = city().await.expect("broker");
     let mut answers = Vec::new();
