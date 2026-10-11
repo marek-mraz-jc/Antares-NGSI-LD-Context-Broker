@@ -20,7 +20,7 @@ sbom() { # <name> [cargo-cyclonedx feature flags]
   mv "crates/antares-broker/antares-$name.cdx.json" "$out/"
   # cargo-cyclonedx writes one file per workspace member; the broker's is
   # the shipped binary's, the others go.
-  find crates examples -name "antares-$name.cdx.json" -type f -delete
+  find crates examples addons -name "antares-$name.cdx.json" -type f -delete
   jq -e '.components | length > 0' "$out/antares-$name.cdx.json" >/dev/null || {
     echo "antares-$name.cdx.json lists no component"
     exit 1
