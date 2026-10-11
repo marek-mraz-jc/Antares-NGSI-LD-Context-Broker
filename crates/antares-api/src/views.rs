@@ -104,12 +104,12 @@ impl CompiledView {
         geo_q: Option<antares_ql::geo::GeoQuery>,
     ) -> Self {
         Self {
-            narrowing: Filter {
+            narrowing: Arc::new(Filter {
                 q: q.map(Box::new),
                 scope_q,
                 geo_q: geo_q.map(Box::new),
                 ..Filter::default()
-            },
+            }),
             id: String::new(),
         }
     }
