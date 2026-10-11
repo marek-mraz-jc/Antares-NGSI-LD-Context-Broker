@@ -153,6 +153,11 @@ async fn a_view_is_refused_before_it_is_stored() {
             with("tenant", json!("a b")),
         ),
         ("an unknown member", "v", with("allowAll", json!(true))),
+        (
+            "a linkml member: the schema is the Tenant's, /q/schemas (T-3658)",
+            "v",
+            with("linkml", json!({"id": "https://e.org/s", "name": "s"})),
+        ),
         ("an unparsable q", "v", with("q", json!("(speed>1"))),
         ("an empty scopeQ", "v", with("scopeQ", json!(""))),
         (

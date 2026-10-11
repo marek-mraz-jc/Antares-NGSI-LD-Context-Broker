@@ -108,7 +108,11 @@ fn document(
     };
     let table = engine.table(view.tenant());
     let who = caller_of(caller);
-    let grants = Grants::of(table.as_deref(), &who, chrono::Utc::now());
+    let grants = Grants::of(
+        table.as_deref().map(|t| t.through(Some(id))),
+        &who,
+        chrono::Utc::now(),
+    );
     let served = serves(&view);
     let accept = headers.get(ACCEPT).and_then(|v| v.to_str().ok());
     match representation(accept) {
@@ -155,7 +159,11 @@ fn decide(
     let entity_type = query.pointer("/resource/type").and_then(Value::as_str);
     let table = engine.table(view.tenant());
     let who = caller_of(caller);
-    let grants = Grants::of(table.as_deref(), &who, chrono::Utc::now());
+    let grants = Grants::of(
+        table.as_deref().map(|t| t.through(Some(id))),
+        &who,
+        chrono::Utc::now(),
+    );
     let answer = check(&grants, action, entity_type, &serves(&view));
     typed(&answer.to_string(), "application/json")
 }

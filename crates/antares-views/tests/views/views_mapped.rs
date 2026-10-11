@@ -8,14 +8,14 @@ use crate::common::{fixture, get, put_view, send, Answer, Fixture};
 use axum::http::{Method, StatusCode};
 use serde_json::{json, Value};
 
-const ROOT: &str = "/x/views/vehicles/ngsi-ld/v1";
+pub const ROOT: &str = "/x/views/vehicles/ngsi-ld/v1";
 
 /// `vehicles`: Cars below 80 show `speed`, `colour` and `owner`, mapped.
 pub fn vehicles_view() -> Value {
     json!({
         "id": "vehicles", "tenant": "city", "selector": ["Car"],
         "rules": [{"types": ["Car"], "q": "speed<80", "attributes": ["speed", "colour", "owner"]}],
-        "operations": ["retrieve_entity", "query_entities", "retrieve_attribute_value"],
+        "operations": antares_ops::mapping::READS.iter().map(|op| op.id()).collect::<Vec<_>>(),
         "mapping": {
             "version": 2, "sourceClass": "Car", "targetClass": "Vehicle",
             "slots": [
@@ -32,7 +32,7 @@ pub fn vehicles_view() -> Value {
     })
 }
 
-async fn vehicles() -> Result<Fixture, String> {
+pub async fn vehicles() -> Result<Fixture, String> {
     let f = fixture().await?;
     put_view(&f.app, &vehicles_view()).await?;
     Ok(f)
@@ -40,7 +40,7 @@ async fn vehicles() -> Result<Fixture, String> {
 
 /// No answer of a mapped view names a source Attribute or the view's
 /// generated terms, whatever it says.
-fn speaks_the_target_model(a: &Answer) {
+pub fn speaks_the_target_model(a: &Answer) {
     for leak in ["speed", "colour", "secret", "owner\"", "jcSrc", "Car\""] {
         assert!(!a.text.contains(leak), "{leak} in {}", a.text);
     }

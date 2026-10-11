@@ -504,8 +504,12 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("views", || antares_ops::mount(antares_views::Views)),
     #[cfg(feature = "mcp")]
     ("mcp", || antares_ops::mount(antares_mcp::Mcp)),
+    #[cfg(feature = "linkml")]
+    ("linkml", || antares_ops::mount(antares_linkml::Linkml)),
     #[cfg(feature = "odata")]
     ("odata", || antares_ops::mount(antares_odata::OData)),
+    #[cfg(feature = "ogc")]
+    ("ogc", || antares_ops::mount(antares_ogc::Ogc)),
     #[cfg(feature = "ws")]
     ("ws", || antares_ops::mount(antares_ws::Ws::process())),
     #[cfg(all(feature = "ws", feature = "views"))]
@@ -1799,6 +1803,15 @@ mod api_surface_tests {
         assert_eq!(names(Some("admin,views")), vec!["admin", "views"]);
         let root = api_surfaces(Some("views")).expect("selection")[0].1();
         assert_eq!(root.prefix(), "/x/views");
+    }
+
+    /// The LinkML surface shares the view root (ADR-0027 section 1).
+    #[cfg(feature = "linkml")]
+    #[test]
+    fn a_linkml_build_shelves_the_linkml_surface_on_the_view_root() {
+        assert_eq!(names(Some("views,linkml")), vec!["views", "linkml"]);
+        let linkml = api_surfaces(Some("linkml")).expect("selection")[0].1();
+        assert_eq!(linkml.prefix(), "/x/views");
     }
 
     /// The MCP surface shares the view root (ADR-0027 section 1).

@@ -54,18 +54,20 @@ impl Caller {
         if HEADERS.iter().all(|h| get(h).is_none()) {
             return Caller::Internal;
         }
-        let one = |name| get(name).filter(|v| !v.is_empty()).map(str::to_owned);
+        let named = |name| get(name).is_some_and(|v| !v.is_empty());
+        let one = |name| get(name).filter(|v| !v.is_empty()).and_then(decode);
         let list = |name| -> BTreeSet<String> {
             get(name)
                 .into_iter()
                 .flat_map(|v| v.split(','))
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
-                .map(str::to_owned)
+                .filter_map(decode)
                 .collect()
         };
+        // A name that does not decode is nobody, never the anonymous caller.
+        let anonymous = !named("x-jc-subject") && !named("x-jc-client");
         let (user, client) = (one("x-jc-subject"), one("x-jc-client"));
-        let anonymous = user.is_none() && client.is_none();
         Caller::Platform(Platform {
             groups: if anonymous {
                 BTreeSet::new()
@@ -82,6 +84,21 @@ impl Caller {
             client,
         })
     }
+}
+
+/// One percent-encoded UTF-8 value (README section 1), or `None` when an escape is broken or
+/// the bytes are not UTF-8: the caller then holds that name not at all.
+fn decode(value: &str) -> Option<String> {
+    let mut parts = value.split('%');
+    let mut bytes = parts.next().unwrap_or_default().as_bytes().to_vec();
+    for part in parts {
+        let hex = part
+            .get(..2)
+            .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))?;
+        bytes.push(u8::from_str_radix(hex, 16).ok()?);
+        bytes.extend_from_slice(part.get(2..).unwrap_or_default().as_bytes());
+    }
+    String::from_utf8(bytes).ok()
 }
 
 impl Platform {
@@ -170,6 +187,58 @@ mod tests {
         }
         let p = platform(caller(&[("x-jc-subject", "a"), ("x-jc-restricted", "yes")]))?;
         assert!(!p.restricted && p.roles.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn percent_encoded_names_decode_per_member() -> Result<(), String> {
+        let p = platform(caller(&[
+            ("x-jc-subject", "jo%C5%BEo"),
+            ("x-jc-groups", "doprava%2Fspr%C3%A1va,city"),
+            ("x-jc-roles", "steward"),
+        ]))?;
+        assert_eq!(p.user.as_deref(), Some("jožo"));
+        assert!(p.is(&assignee(Kind::Group, "doprava/správa")));
+        assert!(p.is(&assignee(Kind::Group, "city")));
+        assert!(p.is(&assignee(Kind::User, "jožo")));
+        Ok(())
+    }
+
+    #[test]
+    fn an_encoded_comma_stays_inside_one_name() -> Result<(), String> {
+        let p = platform(caller(&[
+            ("x-jc-subject", "a"),
+            ("x-jc-groups", "x%2Cadmins"),
+        ]))?;
+        assert_eq!(p.groups, BTreeSet::from(["x,admins".to_owned()]));
+        assert!(!p.is(&assignee(Kind::Group, "admins")));
+        Ok(())
+    }
+
+    #[test]
+    fn a_member_that_does_not_decode_is_dropped_alone() -> Result<(), String> {
+        let p = platform(caller(&[
+            ("x-jc-subject", "a"),
+            ("x-jc-groups", "ops,bad%2,worse%ZZ,nonutf%C5,city"),
+            ("x-jc-roles", "steward,%"),
+        ]))?;
+        assert_eq!(
+            p.groups,
+            BTreeSet::from(["city".to_owned(), "ops".to_owned()])
+        );
+        assert_eq!(p.roles, BTreeSet::from(["steward".to_owned()]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_name_that_does_not_decode_is_nobody_and_never_anonymous() -> Result<(), String> {
+        let p = platform(caller(&[
+            ("x-jc-subject", "jo%C5"),
+            ("x-jc-roles", "steward"),
+        ]))?;
+        assert_eq!(p.user, None);
+        assert_eq!(p.roles, BTreeSet::from(["steward".to_owned()]));
+        assert!(!p.is(&assignee(Kind::Role, "public")));
         Ok(())
     }
 }
