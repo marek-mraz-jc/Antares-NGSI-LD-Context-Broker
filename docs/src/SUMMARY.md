@@ -18,6 +18,7 @@
 - [OGC API - Features endpoint of a view](ogc.md)
 - [WebSocket notifications](websocket.md)
 - [Federation](federation.md)
+- [Internal context sources](internal-context-sources.md)
 - [Operations](operations.md)
 - [Browser & WebAssembly](wasm.md)
 
