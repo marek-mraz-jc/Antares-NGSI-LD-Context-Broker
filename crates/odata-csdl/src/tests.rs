@@ -105,10 +105,13 @@ pub(crate) fn every_branch() -> Model {
         at,
         Property::new("raw", TypeRef::single("Edm.Untyped")).required(),
         Property::new("where", TypeRef::single("t.Place")),
+        Property::new("ownerId", TypeRef::single("Edm.Guid")).required(),
+        Property::new("nextId", TypeRef::single("Edm.Guid")),
     ];
     let mut owner = NavigationProperty::new("owner", TypeRef::single("t.Thing"));
     owner.nullable = false;
     owner.partner = Some("parts".into());
+    owner.referential_constraints = vec![ReferentialConstraint::new("ownerId", "id")];
     let mut parts = NavigationProperty::new("parts", TypeRef::collection("t.Thing"));
     parts.nullable = false;
     parts.partner = Some("owner".into());
@@ -117,6 +120,7 @@ pub(crate) fn every_branch() -> Model {
         "Core.Description",
         Expr::String("tab\there".into()),
     )];
+    next.referential_constraints = vec![ReferentialConstraint::new("nextId", "id")];
     thing.navigation_properties = vec![owner, parts, next];
     let mut described = Annotation::new("Core.Description", Expr::String("thing".into()));
     described.qualifier = Some("en".into());
@@ -383,6 +387,7 @@ fn errors_read_as_fixed_text() {
         Problem::BaseTypeNotFound,
         Problem::NullableCollectionNavigation,
         Problem::InvalidPartner,
+        Problem::InvalidReferentialConstraint,
         Problem::InvalidBindingPath,
         Problem::UnknownBindingTarget,
         Problem::UnknownEntitySetType,

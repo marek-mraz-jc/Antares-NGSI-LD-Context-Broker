@@ -117,7 +117,7 @@ internal-csr = ["views", "dep:antares-icsr"]
 
 # Every surface the broker serves (ADR-0027 Consequences, T-3636): what
 # `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
-# sets it; the platform image builds `full,jc-policy` (image-jc.yml).
+# sets it; the platform image builds `full,jc-policy,linkml` (image-jc.yml).
 full = ["views", "mcp", "odata", "ogc", "ws"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
@@ -135,6 +135,8 @@ antares-api = { workspace = true, features = ["test-kit"] }
 # mqtt e2e: sync rumqttc client against a live mosquitto
 rumqttc = { workspace = true }
 serde_json = { workspace = true }
+# the views differential (T-3777): generated views and policies
+proptest = { workspace = true }
 
 [lints]
 workspace = true

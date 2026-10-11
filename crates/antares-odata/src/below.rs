@@ -13,7 +13,9 @@
 use crate::edm::Set;
 use crate::paths::nav_of;
 use crate::read::{encode, resource, set_of, Reads};
-use crate::write::{attribute, body_error, id_of, no_content, send, typed, visible, NGSI_LD_NULL};
+use crate::write::{
+    attribute, body_error, id_of, no_content, referenced, send, typed, visible, NGSI_LD_NULL,
+};
 use antares_ops::{Caller, OperationId};
 use axum::http::Method;
 use axum::response::Response;
@@ -61,6 +63,9 @@ pub(crate) async fn property(
     let resource = resource(reads, set_name, version)?;
     let value = read_property_body(&resource, name, body, &BodyLimits::strict())
         .map_err(|e| body_error(&e, version))?;
+    let named = [(name.to_owned(), value)];
+    referenced(reads, caller, set, &named, version).await?;
+    let [(_, value)] = named;
     // `null` sets the property to null: the NGSI-LD Null in its member.
     let value = if value.is_null() {
         Value::from(NGSI_LD_NULL)
