@@ -33,7 +33,11 @@ not anonymous. Unencoded ASCII names read as before.
 
 A request with at least one of these headers is a platform caller. One with
 no `x-jc-subject` and no `x-jc-client` is anonymous and holds the role
-`public`, whatever `x-jc-roles` says beside it.
+`public` and, of what `x-jc-roles` says beside it, only the Endpoint caller
+roles `endpoint:{project}/{name}` (AP-97): the gateway resolves that role
+for every caller a public Endpoint admits, the anonymous one included, and
+it names that one Endpoint only. Any other role and every group the
+anonymous caller claims is dropped.
 
 A request with none of them comes from inside the cluster (the Portal's
 registration sync, plan 5.2 M22; nothing else reaches the broker, the
