@@ -28,7 +28,7 @@ Surfaces, one column each:
 | `odata` | OData v4.01 under `/x/views/{view}/odata/v4` | proposal |
 | `mcp` | MCP under `/x/views/{view}/mcp` | served by `antares-mcp` (T-3442, T-3514): one tool per row, `crates/antares-mcp/src/tools.rs` `TOOLS`; the platform gateway's tools (`endpoint_facade.rs`) were the proposal's source (T-3656) |
 | `linkml` | LinkML schema surface under `/x/views/{view}/linkml`, read-only | proposal |
-| `websocket` | WebSocket notifications under `/x/views/{view}/ws` | proposal; no binding exists in the specs (section 2.4) |
+| `websocket` | WebSocket notifications under `/x/views/{view}/ws` and `/x/ws/ngsi-ld/v1` | implemented (ADR-0026, T-3517); no binding exists in the specs (section 2.4) |
 | `internal_csr` | in-process Context Source registrations between tenants | proposal; the forward is `AppState::call` (`crates/antares-api/src/state.rs:571`) instead of HTTP |
 
 Every surface beside the vanilla NGSI-LD root hangs off a view, `/x/views/{view}/...`, as ADR-0023 rule 10 decides (the view's own NGSI-LD root is `/x/views/{view}/ngsi-ld/v1`). The prefixes follow `crates/antares-api/src/surface.rs:42-48` `check_prefix`: a surface mounts under `/q`, `/x` or below `/x`, "never under the NGSI-LD API root".
@@ -99,7 +99,7 @@ Two OData rules decide a design here:
 
 ### 2.4 WebSocket
 
-`grep -rli websocket /workspace/etsi-specs` finds one hit: `ts-104178-ngsi-ld-information-model/4/4.1.md:45`, a passing mention of transports ("using HTTP, WebSockets, etc."). TS 104 175, TS 104 176 and TS 104 243 define no WebSocket binding. `docs/adr/ADR-0003-websocket-deferred.md` keeps it out of v1 and scopes it to a future `antares-ws` crate behind feature `ws`, plugged into the notification sink registry. Every envelope op in the `websocket` column (`subscribe`, `subscription.update`, `unsubscribe`, `notification`) is therefore a proposal, and the column offers subscriptions and their notifications only.
+`grep -rli websocket /workspace/etsi-specs` finds one hit: `ts-104178-ngsi-ld-information-model/4/4.1.md:45`, a passing mention of transports ("using HTTP, WebSockets, etc."). TS 104 175, TS 104 176 and TS 104 243 define no WebSocket binding. `docs/adr/ADR-0003-websocket-deferred.md` keeps it out of v1 and scopes it to a future `antares-ws` crate behind feature `ws`, plugged into the notification sink registry. ADR-0026 (T-3517) built it: the `websocket` column's binding is the `x-op` of the TS 104 243 envelope `antares-ws` reads (`crates/antares-ws/src/envelope.rs`, `OpName`): `x-subscribe`, `x-update`, `x-unsubscribe`, plus the server push of a notification. `x-subscribe` and `x-update` answer with the stored Subscription, so each also asks Retrieve Subscription (5.8.3). `x-resume` (ADR-0026 rule 7) is no operation and asks no engine; the yaml lists it under `surfaces.websocket.session_messages`. The column offers subscriptions and their notifications only.
 
 ### 2.5 What a cell means
 
@@ -238,7 +238,7 @@ Notes on this table:
 
 ## 5. The other five columns
 
-The MCP column names the tool `antares-mcp` serves for the row (`crates/antares-mcp/src/tools.rs`, `TOOLS`; T-3656), and `crates/antares-broker/tests/operation_matrix.rs` holds the two to each other. Every LinkML path and every WebSocket op is a proposal.
+The MCP column names the tool `antares-mcp` serves for the row (`crates/antares-mcp/src/tools.rs`, `TOOLS`; T-3656), and `crates/antares-broker/tests/operation_matrix.rs` holds the two to each other. The WebSocket column names the envelope `x-op` (T-3696); the same test holds every `x-op` `antares-ws` parses to a row or to `session_messages`, and each to its row's gate clause. Every LinkML path is a proposal.
 
 | id | TS 104 175 | OData v4 | MCP | LinkML | WebSocket | internal CSR |
 |---|---|---|---|---|---|---|
@@ -262,12 +262,12 @@ The MCP column names the tool `antares-mcp` serves for the row (`crates/antares-
 | `query_entities` | 10.4.3 | supported: GET /x/views/{view}/odata/v4/{EntitySet} with $filter (5.1.2), $select (5.1.4), $orderby (5.1.5), $top/$skip (5.1.6), $count (5.1.7), $expand (5.1.3); GET /{EntitySet}/$count (URL 4.8) | supported: query_entities | not offered | not offered | supported: Query Entities forwarded with the narrowed q/scopeQ (fed_query) |
 | `query_entities_post` | 10.4.3 | not offered | supported: batch_query | not offered | not offered | supported: forwarded as Query Entities (batch_query_inner calls federation) |
 | `retrieve_attribute_value` | 10.4.4 | supported: GET /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (URL 4.6) and .../$value (URL 4.7) | supported: get_attribute_value | not offered | not offered | supported: forwarded as Retrieve Entity with attrs |
-| `create_subscription` | 10.5.2 | not offered | supported: create_subscription | not offered | supported: subscribe (proposal): creates a Subscription whose endpoint is the socket | supported: forwarded subscription copy, subject stripped (distsub forward_sub) |
-| `update_subscription` | 10.5.3 | not offered | supported: update_subscription | not offered | supported: subscription.update (proposal) | supported: forwarded copy updated (distsub on_subscription_updated) |
+| `create_subscription` | 10.5.2 | not offered | supported: create_subscription | not offered | supported: `x-subscribe`, the socket as endpoint; answers after Retrieve Subscription (5.8.3) | supported: forwarded subscription copy, subject stripped (distsub forward_sub) |
+| `update_subscription` | 10.5.3 | not offered | supported: update_subscription | not offered | supported: `x-update` of a Subscription this connection made; answers after Retrieve Subscription (5.8.3) | supported: forwarded copy updated (distsub on_subscription_updated) |
 | `retrieve_subscription` | 10.5.4 | not offered | supported: get_subscription | not offered | not offered | not offered |
 | `query_subscriptions` | 10.5.5 | not offered | supported: list_subscriptions | not offered | not offered | not offered |
-| `delete_subscription` | 10.5.6 | not offered | supported: delete_subscription | not offered | supported: unsubscribe (proposal) | supported: forwarded copy deleted (distsub on_subscription_deleted) |
-| `notification` | 10.5.7 | not offered | not offered | not offered | supported: notification (proposal): server push of the Notification document | supported: notification of a forwarded copy remapped to the original subscriber at /ex/v1/remote-notify |
+| `delete_subscription` | 10.5.6 | not offered | supported: delete_subscription | not offered | supported: `x-unsubscribe` of a Subscription this connection made | supported: forwarded copy deleted (distsub on_subscription_deleted) |
+| `notification` | 10.5.7 | not offered | not offered | not offered | supported: server push of the Notification document in the envelope, after pre_notify | supported: notification of a forwarded copy remapped to the original subscriber at /ex/v1/remote-notify |
 | `retrieve_entity_types` | 10.6.3 | supported: GET /x/views/{view}/odata/v4/ (service document, entity sets = visible types) | supported: list_types | supported: GET /x/views/{view}/linkml/schema (proposal): class list | not offered | not offered |
 | `retrieve_entity_type_details` | 10.6.4 | supported: GET /x/views/{view}/odata/v4/$metadata (CSDL built from the visible types and their attributes) | supported: list_type_details | supported: GET /x/views/{view}/linkml/schema (proposal): classes with slots | not offered | not offered |
 | `retrieve_entity_type_info` | 10.6.5 | not offered | supported: get_type | supported: GET /x/views/{view}/linkml/classes/{type} (proposal) | not offered | not offered |

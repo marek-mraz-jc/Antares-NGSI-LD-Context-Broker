@@ -19,6 +19,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod common;
 use common::free_port;
+#[path = "common/ws_client.rs"]
+mod ws_client;
+use ws_client::Socket;
 
 struct Broker(Child);
 
@@ -85,83 +88,6 @@ fn run_id() -> Result<u128, String> {
         .as_millis())
 }
 
-/// A client socket after a 101.
-struct Socket(TcpStream);
-
-impl Socket {
-    fn open(port: u16, tenant: &str) -> Result<Self, String> {
-        let mut s = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
-        s.set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|e| e.to_string())?;
-        let req = format!(
-            "GET /x/ws/ngsi-ld/v1 HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\
-             NGSILD-Tenant: {tenant}\r\n\r\n"
-        );
-        s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
-        // the answer's head, a byte at a time so no frame is read with it
-        let mut head = Vec::new();
-        let mut byte = [0u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
-            s.read_exact(&mut byte)
-                .map_err(|e| format!("upgrade: {e}"))?;
-            head.extend_from_slice(&byte);
-        }
-        if !head.starts_with(b"HTTP/1.1 101") {
-            return Err(format!("upgrade: {}", String::from_utf8_lossy(&head)));
-        }
-        Ok(Self(s))
-    }
-
-    /// One masked text frame (RFC 6455 5.2: a client masks).
-    fn send(&mut self, v: &Value) -> Result<(), String> {
-        let payload = v.to_string().into_bytes();
-        let key = [0x12u8, 0x34, 0x56, 0x78];
-        let mut frame = vec![0x81u8];
-        match u8::try_from(payload.len()) {
-            Ok(n) if n < 126 => frame.push(0x80 | n),
-            _ => {
-                let n = u16::try_from(payload.len()).map_err(|e| e.to_string())?;
-                frame.push(0x80 | 126);
-                frame.extend_from_slice(&n.to_be_bytes());
-            }
-        }
-        frame.extend_from_slice(&key);
-        frame.extend(payload.iter().zip(key.iter().cycle()).map(|(b, k)| b ^ k));
-        self.0.write_all(&frame).map_err(|e| e.to_string())
-    }
-
-    /// The next text message as JSON; `None` on silence (2 s) or an end.
-    /// Control frames (Ping) are skipped; the server sends unmasked frames.
-    fn next(&mut self) -> Option<Value> {
-        loop {
-            let mut h = [0u8; 2];
-            self.0.read_exact(&mut h).ok()?;
-            let [first, second] = h;
-            let len = match second & 0x7f {
-                126 => {
-                    let mut n = [0u8; 2];
-                    self.0.read_exact(&mut n).ok()?;
-                    u64::from(u16::from_be_bytes(n))
-                }
-                127 => {
-                    let mut n = [0u8; 8];
-                    self.0.read_exact(&mut n).ok()?;
-                    u64::from_be_bytes(n)
-                }
-                n => u64::from(n),
-            };
-            let mut payload = vec![0u8; usize::try_from(len).ok()?];
-            self.0.read_exact(&mut payload).ok()?;
-            match first & 0x0f {
-                0x1 => return serde_json::from_slice(&payload).ok(),
-                0x8 => return None,
-                _ => {}
-            }
-        }
-    }
-}
-
 /// One process, the default store and bus: the accept loop hands the
 /// upgraded stream to the surface, and a Subscription made over the socket
 /// is notified over it. A bound set in the environment is a known config
@@ -213,7 +139,7 @@ fn ws_cross_pod_delivery_reaches_the_holding_pod() -> Result<(), String> {
 /// worker pod learns the Subscription through the KV mirror, and until it
 /// does a change matches nothing.
 fn notified(port: u16, tenant: &str, run: u128) -> Result<(), String> {
-    let mut ws = Socket::open(port, tenant)?;
+    let mut ws = Socket::open(port, "/x/ws/ngsi-ld/v1", Some(tenant))?;
     let welcome = ws.next().ok_or("no welcome")?;
     assert_eq!(welcome.pointer("/metadata/x-op"), Some(&json!("x-welcome")));
     ws.send(&json!({"metadata": {"x-op": "x-subscribe", "x-id": "s"},

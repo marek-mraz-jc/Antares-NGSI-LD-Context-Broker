@@ -124,7 +124,10 @@ async fn views_a_broken_view_is_not_served() {
     assert_eq!(
         list, h["views"],
         "GET /q/views is the table /q/health lists"
-    );
+    ); // the broker's own router, no surface mounted, serves the same table
+    let (s, root) = send_raw(&b.router(), Method::GET, "/q/views", None, None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(root, list);
 }
 
 #[tokio::test(flavor = "multi_thread")]

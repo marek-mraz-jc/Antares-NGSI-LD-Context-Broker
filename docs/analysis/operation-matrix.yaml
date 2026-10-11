@@ -22,7 +22,11 @@ surfaces:
     status: proposal, read-only
   websocket:
     prefix: /x/views/{view}/ws
-    status: proposal; TS 104 175/176 define no WebSocket binding
+    status: implemented (ADR-0026, T-3517, feature ws; the Tenant root /x/ws/ngsi-ld/v1 serves the same messages);
+      TS 104 175/176 define no WebSocket binding; a binding is the x-op of the TS 104 243 envelope
+    session_messages:
+      x-resume: 'ADR-0026 rule 7: the first message of a new socket takes over a connection within its grace
+        period; no operation, asks no engine (crates/antares-ws/src/socket.rs resume)'
   internal_csr:
     prefix: null
     status: proposal; in-process forward through AppState::call (state.rs:571)
@@ -2352,7 +2356,8 @@ operations:
         linked_entity_checks: []
     websocket:
       status: supported
-      binding: 'subscribe (proposal): creates a Subscription whose endpoint is the socket'
+      binding: 'x-subscribe: Create Subscription with the socket as its endpoint, then Retrieve Subscription (5.8.3)
+        for the answer (crates/antares-ws/src/socket.rs subscribe)'
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2460,7 +2465,8 @@ operations:
         linked_entity_checks: []
     websocket:
       status: supported
-      binding: subscription.update (proposal)
+      binding: 'x-update: Update Subscription of one this connection made, then Retrieve Subscription (5.8.3) for
+        the answer (crates/antares-ws/src/socket.rs update)'
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2696,7 +2702,8 @@ operations:
         linked_entity_checks: []
     websocket:
       status: supported
-      binding: unsubscribe (proposal)
+      binding: 'x-unsubscribe: Delete Subscription of one this connection made (crates/antares-ws/src/socket.rs
+        unsubscribe)'
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2777,7 +2784,8 @@ operations:
         linked_entity_checks: []
     websocket:
       status: supported
-      binding: 'notification (proposal): server push of the Notification document'
+      binding: 'server push: the Notification document in the TS 104 243 envelope, after pre_notify (antares-ws
+        Sink)'
       checks:
         adr0020_phase: pre_notify
         operation_fields: []

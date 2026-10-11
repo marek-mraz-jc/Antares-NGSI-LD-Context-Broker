@@ -88,8 +88,32 @@ tokio::task_local! {
     static INPROCESS_DEPTH: usize;
 }
 
+/// The broker's state as every handler and layer receives it. Cloned at
+/// every middleware layer and extractor of every request, so a clone is
+/// three reference counts: the per-process part sits behind one `Arc`
+/// ([`Shared`], read through `Deref`), and only what a narrowed state
+/// changes, the view and its in-process router memo, is held per state.
+/// Writing a shared field (`DerefMut`) copies the shared part when another
+/// state holds it, so a write made before serving is never seen by a state
+/// cloned earlier, as it was when every field was copied.
 #[derive(Clone)]
 pub struct AppState {
+    shared: Arc<Shared>,
+    /// The endpoint view every operation through this state is narrowed to
+    /// (ADR-0023); `None` serves the NGSI-LD API as it is.
+    #[cfg(feature = "views")]
+    pub view: Option<Arc<crate::views::CompiledView>>,
+    /// The router [`AppState::call`] serves in-process requests through,
+    /// built on first use. Empty until a façade actually calls: building it
+    /// costs about 1.5 ms, which is worth memoizing per state and not worth
+    /// paying in a host that never makes an in-process call.
+    pub(crate) inbound: Arc<std::sync::OnceLock<axum::Router>>,
+}
+
+/// The per-process part of [`AppState`]: every handle and setting a state
+/// and its narrowed copies share.
+#[derive(Clone)]
+pub struct Shared {
     pub store: Arc<dyn CurrentStateDriver>,
     /// The temporal driver — by default the same backend instance as
     /// `store`; a deployment may load a different one (or none).
@@ -124,20 +148,11 @@ pub struct AppState {
     /// own reserved prefix; `with_surface` adds one. The admin surface is
     /// here by default.
     pub surfaces: Arc<Vec<Box<dyn crate::ApiSurface>>>,
-    /// The router [`AppState::call`] serves in-process requests through,
-    /// built on first use. Empty until a façade actually calls: building it
-    /// costs about 1.5 ms, which is worth memoizing per state and not worth
-    /// paying in a host that never makes an in-process call.
-    pub(crate) inbound: Arc<std::sync::OnceLock<axum::Router>>,
     /// The transport every federation forward asks before the socket
     /// (ADR-0025 rule 8): shared by every clone, so a state made before the
     /// transport was registered (the one an `Ops` holds) forwards through it
     /// too. Empty in vanilla: every forward is HTTP.
     pub(crate) forward_transport: Arc<std::sync::OnceLock<Arc<dyn crate::ForwardTransport>>>,
-    /// The endpoint view every operation through this state is narrowed to
-    /// (ADR-0023); `None` serves the NGSI-LD API as it is.
-    #[cfg(feature = "views")]
-    pub view: Option<Arc<crate::views::CompiledView>>,
     /// The views this pod serves (ADR-0023 rule 10), shared by every clone.
     #[cfg(feature = "views")]
     pub views: Arc<crate::views::ViewTable>,
@@ -240,6 +255,20 @@ pub struct AppState {
     /// How a notification is delivered: attempts, backoff, age ceiling.
     /// Default = one attempt (5.8.6 as written).
     pub delivery: antares_notifier::DeliveryPolicy,
+}
+
+impl std::ops::Deref for AppState {
+    type Target = Shared;
+
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
+}
+
+impl std::ops::DerefMut for AppState {
+    fn deref_mut(&mut self) -> &mut Shared {
+        Arc::make_mut(&mut self.shared)
+    }
 }
 
 impl AppState {
@@ -443,50 +472,52 @@ impl AppState {
         #[cfg(feature = "mqtt")]
         sinks.register(Box::new(antares_notifier::mqtt::MqttSink::default()));
         Self {
-            store,
-            temporal,
-            store_name: store_name.to_owned(),
-            temporal_name,
-            loader,
-            started: Instant::now(),
-            started_at: now_iso(),
-            host_alias,
-            default_limit: 1000,
-            max_limit: 1000,
-            http: http.clone(),
-            fed_http: outbound_client(
-                egress_policy,
-                std::time::Duration::from_secs(8 * slow_factor()),
-            ),
-            sinks: Arc::new(sinks),
-            inbound: Arc::new(std::sync::OnceLock::new()),
-            forward_transport: Arc::new(std::sync::OnceLock::new()),
             #[cfg(feature = "views")]
             view: None,
-            #[cfg(feature = "views")]
-            views: Arc::default(),
-            surfaces: Arc::new(vec![Box::new(crate::Admin)]),
-            limits: Arc::new(crate::bounds::LimitStats::default()),
-            mem_stats: None,
-            bus_stats: None,
-            egress: Arc::new(crate::egress::Egress::new(egress_policy)),
-            policy: None,
-            admin_auth: None,
-            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pending_changes: Arc::default(),
-            sub_sync: None,
-            sub_mirror: None,
-            change_flush: None,
-            reg_sync: None,
-            reg_fail_sync: None,
-            reg_mirror: None,
-            metrics_render: None,
-            csource_notification: None,
-            nats: false,
-            temporal_record: TemporalRecord::All,
-            public_url,
-            snapshot_cap: 1024,
-            delivery: antares_notifier::DeliveryPolicy::default(),
+            inbound: Arc::new(std::sync::OnceLock::new()),
+            shared: Arc::new(Shared {
+                store,
+                temporal,
+                store_name: store_name.to_owned(),
+                temporal_name,
+                loader,
+                started: Instant::now(),
+                started_at: now_iso(),
+                host_alias,
+                default_limit: 1000,
+                max_limit: 1000,
+                http: http.clone(),
+                fed_http: outbound_client(
+                    egress_policy,
+                    std::time::Duration::from_secs(8 * slow_factor()),
+                ),
+                sinks: Arc::new(sinks),
+                forward_transport: Arc::new(std::sync::OnceLock::new()),
+                #[cfg(feature = "views")]
+                views: Arc::default(),
+                surfaces: Arc::new(vec![Box::new(crate::Admin)]),
+                limits: Arc::new(crate::bounds::LimitStats::default()),
+                mem_stats: None,
+                bus_stats: None,
+                egress: Arc::new(crate::egress::Egress::new(egress_policy)),
+                policy: None,
+                admin_auth: None,
+                draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pending_changes: Arc::default(),
+                sub_sync: None,
+                sub_mirror: None,
+                change_flush: None,
+                reg_sync: None,
+                reg_fail_sync: None,
+                reg_mirror: None,
+                metrics_render: None,
+                csource_notification: None,
+                nats: false,
+                temporal_record: TemporalRecord::All,
+                public_url,
+                snapshot_cap: 1024,
+                delivery: antares_notifier::DeliveryPolicy::default(),
+            }),
         }
     }
 
@@ -1236,5 +1267,33 @@ mod jsonld_context_locality_5_13 {
             serde_json::json!("Cached"),
             "the fetched document is this broker's Cached copy (5.13.1)"
         );
+    }
+}
+
+#[cfg(all(test, feature = "test-kit"))]
+mod clone_cost {
+    use super::*;
+
+    /// T-3689: every middleware layer and extractor of a request clones the
+    /// state; a clone copies no String, no client and no handle.
+    #[test]
+    fn a_clone_shares_the_per_process_part() {
+        let a = AppState::new("antares-test".into());
+        let b = a.clone();
+        assert!(std::ptr::eq(&a.http, &b.http), "the HTTP client is copied");
+        assert!(std::ptr::eq(&a.fed_http, &b.fed_http));
+        assert!(std::ptr::eq(a.public_url.as_ptr(), b.public_url.as_ptr()));
+        assert!(std::ptr::eq(a.store_name.as_ptr(), b.store_name.as_ptr()));
+    }
+
+    /// A setting written before serving is the writer's own: a state cloned
+    /// earlier keeps what it had, as it did when every field was copied.
+    #[test]
+    fn a_write_after_a_clone_is_not_seen_by_the_clone() {
+        let a = AppState::new("antares-test".into());
+        let mut c = a.clone();
+        c.max_limit = 7;
+        assert_eq!((a.max_limit, c.max_limit), (1000, 7));
+        assert!(!std::ptr::eq(&a.http, &c.http));
     }
 }
