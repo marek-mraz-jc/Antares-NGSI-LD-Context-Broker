@@ -50,7 +50,9 @@ ADR-0023 rule 5), never from the stored schema (LK1):
 
 Each path is one discovery operation of the view, asked through
 `antares-ops` with its own clause; a view whose `operations` leave it out
-answers `405`, and an engine that denies it `403`.
+answers `405`, and an engine that denies it `403`. A denied
+`classes/{name}` or `slots/{name}` answers the `404` of an absent name, so a
+refusal never tells that the name is there (LK1).
 
 | Path | Content | Operation |
 |---|---|---|
