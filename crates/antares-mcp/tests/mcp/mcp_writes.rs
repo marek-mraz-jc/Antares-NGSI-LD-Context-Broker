@@ -113,16 +113,11 @@ async fn every_write_tool_runs_once_the_person_confirmed() -> Result<(), String>
         let a = confirmed(&f.app, "writes", tool, &args).await?;
         assert!(!a.is_error(), "{tool}: {}", a.text);
     }
-    // a view refuses an upsert, whose pre-image it cannot check (ADR-0023
-    // rule 7, `CHECKED_WRITES`): asked, confirmed, and still the gate's 403
+    // a view decides an upsert member by member (ADR-0023 rule 7, T-3594):
+    // the absent w3 is created in the view
     let upsert = json!({"entities": [car("w3", 2)], "options": "update"});
     let a = confirmed(&f.app, "writes", "batch_upsert", &upsert).await?;
-    assert_eq!(
-        a.structured().pointer("/error/status"),
-        Some(&json!(403)),
-        "{}",
-        a.text
-    );
+    assert!(!a.is_error(), "{}", a.text);
     let a = confirmed(&f.app, "writes", "get_entity", &json!({"id": w2})).await;
     assert!(a.is_err(), "a read is never asked");
     let speed = call(&f.app, "writes", "get_entity", json!({"id": w2})).await;
@@ -130,7 +125,7 @@ async fn every_write_tool_runs_once_the_person_confirmed() -> Result<(), String>
         speed.structured().pointer("/entity/speed/value"),
         Some(&json!(9))
     );
-    assert!(!exists(&f.app, "urn:ngsi-ld:Car:w3").await);
+    assert!(exists(&f.app, "urn:ngsi-ld:Car:w3").await);
     let deleted = confirmed(&f.app, "writes", "delete_entity", &json!({"id": w2})).await?;
     assert_eq!(deleted.structured(), &json!({}), "{}", deleted.text);
     assert!(!exists(&f.app, w2).await);
@@ -362,15 +357,38 @@ async fn write_tools_are_offered_only_where_the_view_allows_them() -> Result<(),
         .cloned()
         .unwrap_or_default();
     assert_eq!(tools.len(), 30, "{}", listed.text);
-    let read_only = |name: &str| {
+    let hint = |name: &str, hint: &str| {
         tools
             .iter()
             .find(|t| t.get("name") == Some(&json!(name)))
-            .and_then(|t| t.pointer("/annotations/readOnlyHint"))
+            .and_then(|t| t.pointer(&format!("/annotations/{hint}")))
             .cloned()
     };
-    assert_eq!(read_only("create_entity"), Some(json!(false)));
-    assert_eq!(read_only("get_entity"), Some(json!(true)));
+    assert_eq!(hint("create_entity", "readOnlyHint"), Some(json!(false)));
+    assert_eq!(hint("get_entity", "readOnlyHint"), Some(json!(true)));
+    // MCP: a write that only adds is not destructive; one that removes or
+    // overwrites says so, a read says nothing
+    for additive in ["create_entity", "create_subscription", "batch_create"] {
+        assert_eq!(
+            hint(additive, "destructiveHint"),
+            Some(json!(false)),
+            "{additive}"
+        );
+    }
+    for destructive in [
+        "delete_entity",
+        "delete_attribute",
+        "replace_entity",
+        "update_attributes",
+        "batch_delete",
+    ] {
+        assert_eq!(
+            hint(destructive, "destructiveHint"),
+            Some(json!(true)),
+            "{destructive}"
+        );
+    }
+    assert_eq!(hint("get_entity", "destructiveHint"), None);
     Ok(())
 }
 

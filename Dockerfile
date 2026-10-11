@@ -30,12 +30,16 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS build
 COPY --from=planner /src/recipe.json recipe.json
+# Cargo features of the broker (empty = the default, vanilla build). The
+# all-features cells of external-suites.yml build with
+# --build-arg FEATURES=mqtt,views,mcp; a shipped image never sets it.
+ARG FEATURES=""
 # Cook scoped to the shipped package so feature unification matches the real
 # build below — a workspace-wide cook can resolve different features and
 # quietly recompile deps anyway.
-RUN cargo chef cook --release -p antares-broker --recipe-path recipe.json --locked
+RUN cargo chef cook --release -p antares-broker ${FEATURES:+--features "$FEATURES"} --recipe-path recipe.json --locked
 COPY . .
-RUN cargo auditable build --release --locked -p antares-broker \
+RUN cargo auditable build --release --locked -p antares-broker ${FEATURES:+--features "$FEATURES"} \
  && mkdir /data-init
 
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2

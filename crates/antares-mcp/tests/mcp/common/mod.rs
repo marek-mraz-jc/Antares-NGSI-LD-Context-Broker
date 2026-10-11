@@ -15,6 +15,7 @@
 //! | `few` | `city` | the same | `query_entities` only |
 //! | `elsewhere` | `other` | Cars: `speed` | every read |
 //! | `big` | `big` | Cars: `speed`, `note` | every read |
+//! | `watch` | `city` | the same as `cars` | reading an Entity, making and deleting a Subscription |
 //! | `writes`, `writes2` | `w` | Cars: `speed`, `colour` | every read and [`WRITES`] |
 //!
 //! Tenant `w` holds `Car:w1` (speed 1). A subscription made through a tool
@@ -342,10 +343,8 @@ fn car_rules() -> Value {
 pub async fn fixture_with(engine: Option<Arc<dyn PolicyEngine>>) -> Result<Fixture, String> {
     // ponytail: the allowlist is read once per process; every test shares it
     std::env::set_var(antares_mcp::SUBSCRIPTION_ENDPOINTS_ENV, HOOKS);
-    let mut broker = TestBroker::new().await?;
-    if let Some(engine) = engine {
-        broker = broker.with_policy(engine);
-    }
+    // the surface's own sink, as a broker built with `mcp` registers it
+    let broker = TestBroker::with_sinks(vec![Box::new(antares_mcp::Sink)], engine).await?;
     let app = broker.serve(antares_mcp::Mcp)?;
     for (id, speed, note) in [("1", 10, "3"), ("2", 50, "1"), ("3", 90, "1")] {
         create(
@@ -390,10 +389,27 @@ pub async fn fixture_with(engine: Option<Arc<dyn PolicyEngine>>) -> Result<Fixtu
         &json!({"id": "urn:ngsi-ld:Car:9", "type": "Car", "speed": prop(&json!(1))}),
     )
     .await?;
+    views(&app).await?;
+    Ok(Fixture {
+        _broker: broker,
+        app,
+    })
+}
+
+/// The views of this module.
+async fn views(app: &Router) -> Result<(), String> {
+    let app = app.clone();
     put_view(
         &app,
         &json!({"id": "cars", "tenant": "city", "selector": ["Car", "Bike"],
                 "rules": car_rules(), "operations": READS}),
+    )
+    .await?;
+    put_view(
+        &app,
+        &json!({"id": "watch", "tenant": "city", "selector": ["Car", "Bike"],
+                "rules": car_rules(),
+                "operations": ["retrieve_entity", "create_subscription", "delete_subscription"]}),
     )
     .await?;
     put_view(
@@ -430,10 +446,7 @@ pub async fn fixture_with(engine: Option<Arc<dyn PolicyEngine>>) -> Result<Fixtu
                 "rules": [{"types": ["Car"], "attributes": ["speed", "note"]}], "operations": READS}),
     )
     .await?;
-    Ok(Fixture {
-        _broker: broker,
-        app,
-    })
+    Ok(())
 }
 
 /// [`fixture_with`] and no engine.

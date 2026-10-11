@@ -456,7 +456,7 @@ async fn retrieve_entity_inner(
     };
     let mut resp = respond_prefer(StatusCode::OK, payload, &ctx, accept, &tenant, headers);
     attach_warnings(&mut resp, &warnings);
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 
@@ -986,7 +986,7 @@ async fn query_entities_inner(
             }
         }
     }
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 
@@ -1581,13 +1581,14 @@ pub async fn delete_entity(
         // client's selector excluded.
         let ctx = request_context(&st.loader, &headers).await?;
         let pre = crate::policy::pre_image(&st, &tenant, &id, None).await;
-        gate!(
+        let granted = gate!(
             st, &tenant, &headers, "5.6.6",
             ids: &[&id],
             types: &pre.types,
             stored: pre.stored.as_ref(),
         )
         .await?;
+        let cond = crate::policy::Condition::of(&granted);
         // 4.17/5.6.6.4: the type selector gates the target — a registration
         // for a different type must not receive the forwarded delete.
         let spec = crate::registry::CsrSpec {
@@ -1603,6 +1604,7 @@ pub async fn delete_entity(
             crate::federation::WritePlan::Answered(r) => return Ok(*r),
             crate::federation::WritePlan::Forward(regs) => regs,
         };
+        crate::policy::Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
         // 5.6.6.4: the ?type selector narrows the target — an entity of a
         // non-matching type is "not known" for this delete. The selector is
         // tested inside the delete, under the row lock: read first and delete
@@ -1611,6 +1613,11 @@ pub async fn delete_entity(
         #[cfg(feature = "views")]
         let guard = crate::views::WriteGuard::of(&st, std::iter::empty());
         let keep = |d: &Value| {
+            // gap G12: an Entity the engine's condition does not select is
+            // not found
+            if cond.as_ref().is_some_and(|c| !c.holds(d)) {
+                return false;
+            }
             // ADR-0023 rule 7: an Entity out of the view is not found
             #[cfg(feature = "views")]
             if guard.as_ref().is_some_and(|g| !g.sees(d)) {
@@ -2056,7 +2063,7 @@ async fn merge_entity_inner(
         },
     )?;
     let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await;
-    gate!(
+    let granted = gate!(
         st, &tenant, headers, "5.6.17",
         ids: &[id],
         types: &pre.types,
@@ -2065,6 +2072,7 @@ async fn merge_entity_inner(
         body: Some(&fragment),
     )
     .await?;
+    let cond = crate::policy::Condition::of(&granted);
     #[cfg(feature = "views")]
     let guard = crate::views::WriteGuard::of(
         st,
@@ -2100,6 +2108,7 @@ async fn merge_entity_inner(
         crate::federation::WritePlan::Answered(r) => return Ok(*r),
         crate::federation::WritePlan::Forward(regs) => regs,
     };
+    crate::policy::Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
     if !regs.is_empty() {
         let proxies: Vec<&crate::federation::FedReg> =
             regs.iter().filter(|r| r.is_proxy()).collect();
@@ -2191,6 +2200,7 @@ async fn merge_entity_inner(
     let res = st
         .store
         .mutate(&tenant, Kind::Entity, id, |doc| {
+            crate::policy::Condition::pre(cond.as_ref(), id, doc)?;
             #[cfg(feature = "views")]
             if let Some(g) = &guard {
                 g.pre(id, doc)?;
@@ -2455,7 +2465,7 @@ pub async fn replace_entity(
             None => None,
         };
         let pre = crate::policy::pre_image(&st, &tenant, &id, shown.as_ref()).await;
-        gate!(
+        let granted = gate!(
             st, &tenant, &headers, "5.6.18",
             ids: &[&id],
             types: &pre.types,
@@ -2464,13 +2474,17 @@ pub async fn replace_entity(
             body: shown.as_ref(),
         )
         .await?;
+        let cond = crate::policy::Condition::of(&granted);
         // 5.6.18.4: the ?type selector narrows the target — a non-matching
         // entity is "not known" for this replace.
         let local_doc = st
             .store
             .get(&tenant, Kind::Entity, &id)
             .await?
-            .filter(|d| crate::negotiate::matches_type_param(d, &params, &ctx0));
+            .filter(|d| crate::negotiate::matches_type_param(d, &params, &ctx0))
+            // gap G12: an Entity the engine's condition does not select is
+            // not found, before the body is read, as an absent target is
+            .filter(|d| cond.as_ref().is_none_or(|c| c.holds(d)));
         // ADR-0023 rule 3: out of the view is not found, before the body is
         // read, as an absent target is (057_03)
         #[cfg(feature = "views")]
@@ -2488,6 +2502,7 @@ pub async fn replace_entity(
                 crate::federation::WritePlan::Answered(r) => return Ok(*r),
                 crate::federation::WritePlan::Forward(regs) => regs,
             };
+        crate::policy::Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
         if regs.is_empty() {
             // 5.6.18: an unknown target is 404 before body validation (057_03).
             // The read above answers that; the write below decides again
@@ -2520,6 +2535,7 @@ pub async fn replace_entity(
             let res = st
                 .store
                 .mutate(&tenant, Kind::Entity, &id, |doc| {
+                    crate::policy::Condition::pre(cond.as_ref(), &id, doc)?;
                     #[cfg(feature = "views")]
                     if let Some(g) = &guard {
                         g.pre_whole(&id, doc)?;
@@ -2755,7 +2771,7 @@ async fn retrieve_attr_inner(
     };
     let accept = parse_accept(headers)?;
     let mut resp = respond(StatusCode::OK, body, &ctx, accept, &tenant);
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 

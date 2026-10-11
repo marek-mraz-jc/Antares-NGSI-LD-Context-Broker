@@ -107,7 +107,11 @@ impl Writer<'_> {
         if self.ctx.level == MetadataLevel::None {
             return Ok(());
         }
-        members.member(&self.control("", "context"), &context_url(self.ctx, target))
+        members.member(&self.control("", "context"), &context_url(self.ctx, target))?;
+        match self.ctx.metadata_etag {
+            Some(tag) => members.member(&self.control("", "metadataEtag"), tag),
+            None => Ok(()),
+        }
     }
 
     /// The type name a full-metadata `@odata.type` names for a property, or `None` when a client
@@ -264,7 +268,7 @@ impl Writer<'_> {
 /// city.entity_container = Some(service);
 /// let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![city] };
 ///
-/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Full, version: ODataVersion::V4_01 };
+/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Full, version: ODataVersion::V4_01, metadata_etag: None };
 /// let b1 = EntityValue { id: "Buildings('b1')".into(), properties: vec![("height".into(), json!(42))] };
 /// let mut body = Vec::new();
 /// write_entity(&ctx, &Resource::new(&model, "Buildings").ok_or("no set")?, &b1, &mut body).map_err(|_| "io")?;
@@ -311,7 +315,7 @@ pub fn write_entity<W: Write>(
 /// # service.entity_sets.push(EntitySet::new("Buildings", "City.Building"));
 /// # city.entity_container = Some(service);
 /// # let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![city] };
-/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::None, version: ODataVersion::V4_0 };
+/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::None, version: ODataVersion::V4_0, metadata_etag: None };
 /// let page = Page { count: Some(1), next_link: None };
 /// let mut body = Vec::new();
 /// let b1 = EntityValue { id: "Buildings('b1')".into(), properties: vec![] };
@@ -353,7 +357,7 @@ pub fn write_collection<W: Write>(
 ///
 /// ```
 /// use odata_json::{write_entity_reference, Ctx, MetadataLevel, ODataVersion};
-/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_0 };
+/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_0, metadata_etag: None };
 /// let mut body = Vec::new();
 /// write_entity_reference(&ctx, "People('p1')", &mut body)?;
 /// assert_eq!(
@@ -382,7 +386,7 @@ pub fn write_entity_reference<W: Write>(ctx: &Ctx<'_>, id: &str, mut out: W) -> 
 ///
 /// ```
 /// use odata_json::{write_entity_references, Ctx, MetadataLevel, ODataVersion, Page};
-/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::None, version: ODataVersion::V4_01 };
+/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::None, version: ODataVersion::V4_01, metadata_etag: None };
 /// let mut body = Vec::new();
 /// write_entity_references(&ctx, &["People('p1')"], &Page::default(), &mut body)?;
 /// assert_eq!(String::from_utf8_lossy(&body), r#"{"value":[{"@id":"https://example.org/odata/People('p1')"}]}"#);
@@ -430,7 +434,7 @@ static EMPTY: Model = Model {
 /// city.entity_container = Some(service);
 /// let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![city] };
 ///
-/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_01 };
+/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_01, metadata_etag: None };
 /// let mut body = Vec::new();
 /// write_service_document(&ctx, &model, &mut body)?;
 /// assert_eq!(

@@ -63,7 +63,15 @@ pub mod policy {
 
 /// The notification sink contract (ADR-0027 section 1), for a surface that
 /// delivers notifications (WebSocket).
-pub use antares_api::{DeliveryError, DeliveryFuture, NotificationSink, Outbound};
+pub use antares_api::{build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound};
+/// The error a sink's endpoint check answers with.
+pub use antares_model::NgsiError;
+
+/// The request bounds a surface applies to what it parses itself (a
+/// WebSocket message never passes the HTTP bounds layer).
+pub mod bounds {
+    pub use antares_api::bounds::{json_depth, MAX_BATCH_ITEMS, MAX_BODY_BYTES, MAX_JSON_DEPTH};
+}
 
 /// The federation transport contract (ADR-0025 rule 8, ADR-0027 section 9),
 /// for a crate that serves some forwards in process.
@@ -153,6 +161,7 @@ pub struct OpsRequest {
     path_and_query: String,
     headers: HeaderMap,
     body: Body,
+    context: Option<Arc<serde_json::Value>>,
 }
 
 impl OpsRequest {
@@ -168,6 +177,7 @@ impl OpsRequest {
             path_and_query: path_and_query.into(),
             headers: HeaderMap::new(),
             body: Body::empty(),
+            context: None,
         }
     }
 
@@ -184,6 +194,21 @@ impl OpsRequest {
         if !outer_only(&name) {
             self.headers.append(name, value);
         }
+        self
+    }
+
+    /// The @context the request's names are read under, in place of the
+    /// outer request's `Link` header (a read's `q`, `attrs`, `type`): a
+    /// surface that names Attributes outside the core @context defines its
+    /// own terms, and the outer client cannot redefine them.
+    ///
+    /// ```
+    /// let req = antares_ops::OpsRequest::new(axum::http::Method::GET, "/ngsi-ld/v1/entities?type=Car&q=speed>1")
+    ///     .context(serde_json::json!({"Car": "https://example.org/Car", "speed": "https://example.org/speed"}));
+    /// ```
+    #[must_use]
+    pub fn context(mut self, context: serde_json::Value) -> Self {
+        self.context = Some(Arc::new(context));
         self
     }
 
@@ -288,7 +313,10 @@ impl Ops {
             .body(req.body)
             .map_err(|_| Refusal::Malformed("the operation's target is not a URI"))?;
         *inner.headers_mut() = req.headers;
-        let answer = self.state.call(&caller.0, inner).await;
+        let answer = match req.context {
+            Some(context) => self.state.call_in_context(&caller.0, inner, context).await,
+            None => self.state.call(&caller.0, inner).await,
+        };
         if let Some(surface) = &self.surface {
             // Threat G10: which surface and view ran it; never the subject
             // or an argument (ADR-0020).
@@ -333,6 +361,12 @@ impl ViewOps {
         self.operations.contains(&op)
     }
 
+    /// The one Tenant the view serves (ADR-0023 rule 10).
+    #[must_use]
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
     /// The `LinkML` schema of the view's Tenant as written to
     /// `/q/schemas/{tenant}`, with its revision, if one is stored (T-3628).
     /// The surface parses it under its own limits and caches the parse per
@@ -351,6 +385,25 @@ impl ViewOps {
     #[must_use]
     pub fn shown_names(&self) -> (Vec<String>, Vec<String>) {
         self.view.shown_names()
+    }
+
+    /// Each Entity type the view shows with the Attributes it shows of it,
+    /// as expanded IRIs: the union of the view's rules, type by type. A
+    /// surface that builds a model from a schema intersects it with this.
+    #[must_use]
+    pub fn shown_by_type(
+        &self,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for rule in &self.view.narrowing().rules {
+            for ty in &rule.types {
+                out.entry(ty.clone())
+                    .or_default()
+                    .extend(rule.attributes.iter().cloned());
+            }
+        }
+        out
     }
 
     /// For each of `ops`, whether the view allows it and the policy engine
@@ -473,6 +526,29 @@ pub trait Surface: Send + Sync + 'static {
     fn router(&self, ops: Ops) -> Router;
     /// What `/q/health` reports about it.
     fn version_info(&self) -> serde_json::Value;
+    /// Whether it serves only while a view is loaded (fail-closed, T-3496).
+    /// A surface of the NGSI-LD root itself, which runs every operation
+    /// through the policy seam unnarrowed (the WebSocket channel of a
+    /// Tenant, ADR-0026 rule 2), answers `false`.
+    fn needs_view(&self) -> bool {
+        true
+    }
+}
+
+/// The name an NGSI-LD answer gives the expanded IRI `iri` when the
+/// request names no `@context`: its compaction under the core context, the
+/// IRI itself when the core context has no term for it. A surface that
+/// reads an answer by IRI maps its keys through this.
+///
+/// ```
+/// assert_eq!(antares_ops::core_name("https://uri.etsi.org/ngsi-ld/location"), "location");
+/// assert_eq!(antares_ops::core_name("https://example.org/speed"), "https://example.org/speed");
+/// ```
+#[must_use]
+pub fn core_name(iri: &str) -> String {
+    static CORE: std::sync::LazyLock<antares_jsonld::Context> =
+        std::sync::LazyLock::new(antares_jsonld::core_context);
+    CORE.compact_iri(iri)
 }
 
 /// `surface` as the broker mounts it.
@@ -609,8 +685,13 @@ impl<S: Surface> antares_api::ApiSurface for Mounted<S> {
         let table = st.views.clone();
         // The first state it is mounted on is the one /q/health reports.
         let _ = self.views.set(table.clone());
-        self.surface
-            .router(Ops::new(st, Some(Arc::from(self.surface.name()))))
+        let routes = self
+            .surface
+            .router(Ops::new(st, Some(Arc::from(self.surface.name()))));
+        if !self.surface.needs_view() {
+            return routes.with_state(());
+        }
+        routes
             .layer(axum::middleware::from_fn(
                 move |req: axum::extract::Request, next: axum::middleware::Next| {
                     let open = table.any_loaded();
@@ -628,7 +709,7 @@ impl<S: Surface> antares_api::ApiSurface for Mounted<S> {
 
     fn version_info(&self) -> serde_json::Value {
         let info = self.surface.version_info();
-        if self.views.get().is_some_and(|t| t.any_loaded()) {
+        if !self.surface.needs_view() || self.views.get().is_some_and(|t| t.any_loaded()) {
             serde_json::json!({"state": "open", "info": info})
         } else {
             serde_json::json!({"state": "closed", "reason": "no view is loaded", "info": info})
@@ -656,7 +737,27 @@ pub mod test_kit {
         /// # Errors
         /// The view table's.
         pub async fn new() -> Result<Self, String> {
+            Self::with_sinks(Vec::new(), None).await
+        }
+
+        /// [`TestBroker::new`] delivering through `sinks` too (a surface's
+        /// own notification binding, ADR-0026) and asking `engine`, both
+        /// set before the notifier is wired, as the broker sets them, so
+        /// `pre_notify` runs on every notification.
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn with_sinks(
+            sinks: Vec<Box<dyn super::NotificationSink>>,
+            engine: Option<Arc<dyn super::policy::PolicyEngine>>,
+        ) -> Result<Self, String> {
             let mut state = AppState::new("antares-test".into());
+            for sink in sinks {
+                state = state.with_sink(sink);
+            }
+            if let Some(engine) = engine {
+                state = state.with_policy(engine);
+            }
             antares_api::wire(&mut state).await;
             let reload = crate::views::install(&state).await?;
             Ok(Self { state, reload })
@@ -733,6 +834,20 @@ pub mod test_kit {
             }
         }
 
+        /// The broker's router with every surface `mounted` (each made by
+        /// [`mount`]) beside the NGSI-LD API.
+        ///
+        /// # Errors
+        /// The broker's refusal of a surface's prefix.
+        pub fn serve_mounted(
+            &self,
+            mounted: Vec<Box<dyn antares_api::ApiSurface>>,
+        ) -> Result<axum::Router, String> {
+            let mut all: Vec<Box<dyn antares_api::ApiSurface>> = vec![Box::new(antares_api::Admin)];
+            all.extend(mounted);
+            Ok(antares_api::router(self.state.clone().with_surfaces(all)?))
+        }
+
         /// The broker's router with `surface` mounted beside the NGSI-LD API.
         ///
         /// # Errors
@@ -750,6 +865,18 @@ pub mod test_kit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_iri_is_named_as_an_answer_without_a_context_names_it() {
+        assert_eq!(
+            core_name("https://uri.etsi.org/ngsi-ld/location"),
+            "location"
+        );
+        assert_eq!(
+            core_name("https://example.org/speed"),
+            "https://example.org/speed"
+        );
+    }
 
     #[test]
     fn a_request_keeps_its_own_headers_and_body_and_drops_the_outer_ones() {
