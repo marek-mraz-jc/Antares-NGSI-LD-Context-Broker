@@ -85,6 +85,47 @@ pub(crate) async fn property(
     ))
 }
 
+/// `{Set}('{id}')/$ref` (Q33b): the Entity by Retrieve Entity, gated as
+/// its read (Q30), and its reference; hidden or absent is 404.
+pub(crate) async fn reference(
+    reads: &Reads,
+    caller: &Caller,
+    ctx: &Ctx<'_>,
+    (set_name, key): (&str, &Key),
+    options: &QueryOptions,
+) -> Result<Response, ODataErrorResponse> {
+    let version = ctx.version;
+    let set = set_of(reads, set_name, version)?;
+    let id = key_id(set, key, options).ok_or_else(|| not_found(version))?;
+    let target = format!(
+        "/ngsi-ld/v1/entities/{}?type={}",
+        encode(&id),
+        encode(&set.type_iri)
+    );
+    let none = Translated::default();
+    let (docs, _) = run(
+        reads,
+        caller,
+        OperationId::RetrieveEntity,
+        target,
+        &none,
+        version,
+    )
+    .await?;
+    let urn = docs
+        .first()
+        .and_then(|doc| doc.get("id")?.as_str())
+        .ok_or_else(|| not_found(version))?;
+    let mut body = Vec::new();
+    // A Vec takes every byte: the write cannot fail.
+    let _ = write_entity_reference(
+        ctx,
+        &format!("{set_name}{}", key_segment(set, urn)),
+        &mut body,
+    );
+    Ok(json_response(version, ctx.level, body))
+}
+
 /// `{Set}('{id}')/{nav}` (Q32) and `.../{nav}/$ref` (Q33): the source's
 /// Relationship by Retrieve Entity, then the targets, each read its own
 /// gated operation, so a hidden target is absent from a collection and a
