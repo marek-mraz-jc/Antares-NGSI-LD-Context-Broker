@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! `$filter` to NGSI-LD `q` and `id` (odata-linkml-mapping.md 5.2). The
+//! `$filter` to NGSI-LD `q` and `id` (odata-linkml-mapping.md 5.2), and
+//! `$orderby` to `orderBy` (Q9: `id` and scalar Attributes). The
 //! subset of this round: comparisons of a scalar member with a literal
 //! (F1 to F6, F26), `and`/`or` (F7, F8), `null` (F2, F4, F10), `in` (F12),
 //! `contains`/`startswith`/`endswith` and their `not` (F9, F15), and `id`
@@ -7,12 +8,13 @@
 //! `Bad` (400) before any operation runs.
 //!
 //! A `q` names Attributes by term, and a term is a letter followed by
-//! letters, digits or `_` (7.2.3.2): a schema IRI is not one. Each IRI the
-//! filter names gets the term `t{n}`, and the request carries the
+//! letters, digits or `_` (7.2.3.2), and `orderBy` reads a `.` as a path
+//! (4.23): a schema IRI is neither. Each IRI the request names gets the
+//! term `t{n}`, and the request carries the
 //! `@context` that defines them (`OpsRequest::context`).
 
 use crate::edm::{Set, Shape};
-use odata_url::{CompareOp, Expr, Literal, MemberPath, Method};
+use odata_url::{CompareOp, Expr, Literal, MemberPath, Method, OrderBy};
 use serde_json::{Map, Value};
 
 /// The broker's bound on a `q` (`antares_ql::MAX_Q_BYTES`): a longer
@@ -41,7 +43,9 @@ pub(crate) struct Translated {
     pub(crate) q: Option<String>,
     /// The ids of an `id` conjunct.
     pub(crate) ids: Option<Vec<String>>,
-    /// The terms `q` uses, term to IRI.
+    /// The `orderBy`, if the request orders.
+    pub(crate) order: Option<String>,
+    /// The terms `q` and `orderBy` use, term to IRI.
     pub(crate) context: Map<String, Value>,
 }
 
@@ -75,6 +79,44 @@ pub(crate) fn translate(
         out.q = Some(q);
     }
     Ok(out)
+}
+
+/// Adds `$orderby` to `out` as `orderBy` (Q9) over the same terms: `id`, or
+/// a scalar Attribute; a member the model marks not sortable (C12) is 400,
+/// the base members and the other shapes are a later round's.
+pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Result<(), Refused> {
+    let mut terms = Terms {
+        set,
+        aliases: &[],
+        context: &mut out.context,
+    };
+    let mut keys = Vec::new();
+    for item in items {
+        let single = match &item.expr {
+            Expr::Member(MemberPath {
+                variable: None,
+                path,
+            }) => match path.as_slice() {
+                [name] => Some(name.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let key = match single {
+            Some("id") => "id".to_owned(),
+            Some(name) if set.members.get(name).is_some_and(|m| !m.shape.sortable()) => {
+                return Err(Refused::Bad)
+            }
+            _ => terms.scalar(&item.expr)?,
+        };
+        keys.push(if item.descending {
+            format!("{key};desc")
+        } else {
+            key
+        });
+    }
+    out.order = Some(keys.join(","));
+    Ok(())
 }
 
 /// The operands of the top-level `and`s.
@@ -560,6 +602,59 @@ mod tests {
             (Literal::TimeOfDay("08:00:00".into()), "08:00:00Z"),
         ] {
             assert_eq!(value(&lit), Ok(want.to_owned()), "{lit:?}");
+        }
+    }
+
+    #[test]
+    fn orderby_names_id_and_scalar_terms() {
+        let by = |name: &str, descending| OrderBy {
+            expr: m(name),
+            descending,
+        };
+        let mut t = translate(
+            &cmp(m("name"), CompareOp::Eq, lit(Literal::Int(1))),
+            &set(),
+            &[],
+        )
+        .unwrap_or_default();
+        assert_eq!(
+            order(
+                &[by("speed", true), by("id", false), by("name", false)],
+                &set(),
+                &mut t
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            t.order.as_deref(),
+            Some("t1;desc,id,t0"),
+            "one IRI, one term, shared with q"
+        );
+        let mut t = Translated::default();
+        for (items, refused) in [
+            (vec![by("tags", false)], Refused::Bad),
+            (vec![by("doc", false)], Refused::Bad),
+            (vec![by("owner", false)], Refused::Later),
+            (vec![by("scope", false)], Refused::Later),
+            (
+                vec![OrderBy {
+                    expr: lit(Literal::Int(1)),
+                    descending: false,
+                }],
+                Refused::Later,
+            ),
+            (
+                vec![OrderBy {
+                    expr: Expr::Member(MemberPath {
+                        variable: None,
+                        path: vec!["speed".into(), "x".into()],
+                    }),
+                    descending: false,
+                }],
+                Refused::Later,
+            ),
+        ] {
+            assert_eq!(order(&items, &set(), &mut t), Err(refused), "{items:?}");
         }
     }
 

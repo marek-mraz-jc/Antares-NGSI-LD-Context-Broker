@@ -435,7 +435,6 @@ async fn the_forms_of_later_rounds_are_501_and_writes_405() {
     for uri in [
         "Car?$filter=not%20(speed%20gt%201)",
         "Car('urn:ngsi-ld:Car:1')?$filter=speed%20gt%201",
-        "Car?$orderby=speed",
         "Car?$expand=*",
         "Car?$skiptoken=x",
         "Car?$schemaversion=2",
@@ -724,4 +723,110 @@ async fn odata_filter_ne_doubling_is_checked_on_the_translated_tree() {
         vec!["urn:ngsi-ld:Car:1", "urn:ngsi-ld:Car:2"],
         "5 is one of 0..30"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn orderby_sorts_through_order_by_and_pages_keep_the_order() {
+    let (_b, app) = broker().await.expect("broker");
+    let order = |answer: &Answer| -> Vec<String> {
+        answer
+            .json()
+            .get("value")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    };
+    let car = |n: u32| format!("urn:ngsi-ld:Car:{n}");
+    for (orderby, want) in [
+        ("speed%20desc", vec![car(2), car(1), car(3)]),
+        ("speed", vec![car(3), car(1), car(2)]),
+        ("label%20desc", vec![car(3), car(2), car(1)]),
+        ("id%20desc", vec![car(3), car(2), car(1)]),
+        ("seen,speed%20desc", vec![car(2), car(1), car(3)]),
+    ] {
+        let got = send(
+            &app,
+            Method::GET,
+            &format!("{ROOT}/Car?$orderby={orderby}"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::OK, "{orderby}: {}", got.body);
+        assert_eq!(order(&got), want, "{orderby}");
+    }
+    let first = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$orderby=speed%20desc&$filter=speed%20gt%201"),
+        None,
+        &[("Prefer", "odata.maxpagesize=1")],
+    )
+    .await;
+    assert_eq!(order(&first), vec![car(2)], "{}", first.body);
+    let next = first.json()["@odata.nextLink"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(next.contains("$orderby=speed%20desc"), "{next}");
+    let second = send(
+        &app,
+        Method::GET,
+        &next,
+        None,
+        &[("Prefer", "odata.maxpagesize=1")],
+    )
+    .await;
+    assert_eq!(order(&second), vec![car(1)], "{}", second.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_orderby_hidden_is_400_like_unknown() {
+    let (_b, app) = broker().await.expect("broker");
+    let hidden = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$orderby=secret"),
+        None,
+        &[],
+    )
+    .await;
+    let unknown = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$orderby=nosuch"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(hidden.status, StatusCode::BAD_REQUEST, "{}", hidden.body);
+    assert_eq!(
+        (hidden.status, &hidden.body),
+        (unknown.status, &unknown.body)
+    );
+    let collection = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$orderby=tags"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        collection.status,
+        StatusCode::BAD_REQUEST,
+        "C12: {}",
+        collection.body
+    );
+    let later = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$orderby=owner"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(later.status, StatusCode::NOT_IMPLEMENTED, "{}", later.body);
 }

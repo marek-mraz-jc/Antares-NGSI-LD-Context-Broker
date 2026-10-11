@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Reads (odata-linkml-mapping.md 5.1): an EntitySet (Q29) as Query
 //! Entities, one Entity by key (Q30) as Retrieve Entity, `/$count` (Q13),
-//! with `$filter` ([`crate::filter`]), `$select`, `$top`, `$skip` and
-//! `$count`. Each request is one
+//! with `$filter` and `$orderby` ([`crate::filter`]), `$select`, `$top`,
+//! `$skip` and `$count`. Each request is one
 //! operation through `ViewOps::run`; the NGSI-LD answer is mapped back
 //! through the model, so a member the model does not hold is never written.
 //! The options and forms of later rounds answer `501` before any operation
 //! runs.
 
 use crate::edm::{base_member, Edm, Set, Shape};
-use crate::filter::{translate, Refused, Translated};
+use crate::filter::{order, translate, Refused, Translated};
 use antares_ops::{core_name, Caller, OperationId, OpsRequest, Refusal, ViewOps};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -79,7 +79,6 @@ fn later(uri: &ODataUri) -> Option<&'static str> {
         return Some("this resource is not served");
     };
     let refused = [
-        (options.orderby.is_some(), "$orderby"),
         (options.expand.is_some(), "$expand"),
         (options.skiptoken.is_some(), "$skiptoken"),
         (options.id.is_some(), "$id"),
@@ -136,6 +135,10 @@ fn query(set: &Set, picked: Option<&[&str]>, filter: &Translated) -> String {
     if let Some(text) = &filter.q {
         q.push_str("&q=");
         q.push_str(&encode(text));
+    }
+    if let Some(keys) = &filter.order {
+        q.push_str("&orderBy=");
+        q.push_str(&encode(keys));
     }
     if let Some(names) = picked {
         let attrs: Vec<String> = names
@@ -302,21 +305,30 @@ async fn entity(
     Ok(json_response(version, ctx.level, body))
 }
 
-/// The request's `$filter` as `q` and `id` (5.2), empty without one.
+/// The request's `$filter` as `q` and `id` (5.2) and its `$orderby` as
+/// `orderBy` (Q9), empty without them.
 fn filtered(
     set: &Set,
     options: &QueryOptions,
     version: ODataVersion,
 ) -> Result<Translated, ODataErrorResponse> {
-    let Some(filter) = &options.filter else {
-        return Ok(Translated::default());
-    };
-    translate(filter, set, &options.aliases).map_err(|refused| match refused {
+    let translated = options
+        .filter
+        .as_ref()
+        .map_or_else(
+            || Ok(Translated::default()),
+            |f| translate(f, set, &options.aliases),
+        )
+        .and_then(|mut t| match &options.orderby {
+            Some(items) => order(items, set, &mut t).map(|()| t),
+            None => Ok(t),
+        });
+    translated.map_err(|refused| match refused {
         Refused::Later => not_implemented(version),
         Refused::Bad => ODataErrorResponse::new(
             StatusCode::BAD_REQUEST,
             "BadRequest",
-            "the filter cannot hold for this model",
+            "the query options cannot hold for this model",
         )
         .with_version(version),
         Refused::TooComplex => ODataErrorResponse::new(
