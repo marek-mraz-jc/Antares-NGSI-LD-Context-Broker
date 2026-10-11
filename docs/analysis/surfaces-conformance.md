@@ -197,14 +197,29 @@ Suite `tests/odata/` (pytest, in the conformance runner image), every case again
 
 ## 5. LinkML
 
-Suite `tests/linkml/` (pytest), against `<broker>/x/views/{view}/linkml` of `full`:
+Suite `tests/linkml/` (pytest), against `<broker>/x/views/{view}/linkml` of `full` with `linkml`,
+as built (T-3512):
 
 | case | check | tool and pin |
 |---|---|---|
-| `test_served_schema_loads` | the served `schema/v{major}/model.linkml.yaml` loads with `SchemaView` and passes `linkml-lint` without errors | `linkml==1.12.0` (latest on PyPI 2026-10-10), added to `requirements.in` |
-| `test_generated_json_schema_validates_the_view` | `gen-json-schema` of the served schema validates every entity the view's NGSI-LD root returns in `keyValues` | `linkml==1.12.0`, `jsonschema==4.26.0` (already in `requirements.txt`) |
-| `test_generated_shacl_validates_the_view` | `gen-shacl` of the served schema validates the same entities as JSON-LD | `pyshacl==0.40.1` (already in `requirements.txt`) |
-| `test_hidden_attributes_are_absent_from_the_schema` | an attribute outside the view's allowlist is in no class of the served schema | pytest, view `parity-restricted` |
+| `test_served_schema_loads` | views `all` and `parity-restricted`: the served `schema/v{major}/model.linkml.yaml` loads with `SchemaView`, holds the classes the catalogue names (at least one), and `linkml-lint` reports no error | `linkml==1.12.0` (latest on PyPI 2026-10-10), added to `requirements.in` |
+| `test_reference_generators_accept_the_schema` | both views: `gen-json-schema` and `gen-shacl` run on the served schema and describe every class | `linkml==1.12.0` |
+| `test_served_json_schema_validates_the_view` | view `all`: every Entity of every visible type, in `keyValues` from the view's NGSI-LD root, validates against the served `model.schema.json` | `jsonschema==4.26.0` (already in `requirements.txt`) |
+| `test_served_shacl_validates_the_view` | view `all`: the same Entities, read as JSON-LD through the core `id`/`type` terms and the served `context.jsonld`, conform to the served `model.shacl.ttl`, every target class has a focus node, and the shapes pass SHACL-SHACL | `pyshacl==0.40.1` (already in `requirements.txt`) |
+| `test_hidden_attributes_are_absent_from_the_schema` | view `parity-restricted`: an attribute outside the view's allowlist (`NO2`, which view `all` shows) is in no class, slot, property, term or shape of the served documents, and the catalogue says `redacted` | pytest |
+
+Decided (worker-1, owner may override): the data checks judge the served JSON Schema and SHACL,
+and the generators only have to accept the schema, because LinkML inlines a class range without
+an identifier (an NGSI-LD Relationship holds the target's id) and gives a GeoProperty its default
+range `string` (only the broker's `ngsi_ld_kind` annotation says it is a geometry); options: the
+generated documents as judges, which needs an identifier slot and a geometry type the subset does
+not have. The SHACL check runs on view `all`, whose Entities include every Relationship target,
+because `sh:class` cannot hold for a target the view's scope hides. A view that shows no class
+fails every case instead of passing it vacuously. The first run against the served documents
+found three defects in `linkml-model`'s writers, fixed by T-3780: the YAML did not declare
+`imports: [linkml:types]` and `default_range: string` (two `no_undeclared_ranges` errors), the
+`@context` did not coerce a Relationship to `@id` nor a typed value to its datatype, and a
+GeoProperty was a string in L3 and L5.
 
 ## 6. WebSocket and internal context sources
 
@@ -240,7 +255,7 @@ pytest junit). Required checks are the merge-request subset; the rest runs night
 | `mcp-suites` | `mcp` | `all`, `parity-restricted`, `other` | the three suites of `tests/mcp` with `MCP_SURFACE=broker`, `-m "not platform_only"` | `test_mcp_read_parity.py` with `MCP_PARITY_CASES=5` | all three |
 | `odata-conformance` | full | `all`, `parity-restricted` | `jc-conformance odata` | `test_abnf_cases_live`, both `$metadata` validations | all, both client jobs |
 | `odata-clients-dotnet`, `odata-clients-sap` | full | `all` | section 4 rows | no | yes |
-| `linkml-conformance` | full | `all`, `parity-restricted` | `jc-conformance linkml` | yes | yes |
+| `linkml-conformance` | full with `linkml` | `all`, `parity-restricted` | `jc-conformance linkml` (`tests/linkml/run.sh`) | yes | yes |
 | `ws-conformance` | full | `all` | `jc-conformance ws` + AsyncAPI validation | yes | yes |
 | `vanilla-has-no-surfaces` | vanilla | none | the symbol gate of the threat model section 9 (`dev/check-vanilla-symbols.sh`) | yes | yes |
 
@@ -261,6 +276,7 @@ versions are the ones `requirements.txt` pins.
 | Antares, as built (T-3510) | the build job builds `--features mcp,odata` (artifact `broker-surfaces`); `ci/views/schemas/<tenant>.json` holds each Tenant's LinkML schema, which `dev/views-rig.sh` loads through `PUT /q/schemas/<tenant>` (every job starts the broker with `ANTARES_SCHEMA_MAX_BYTES`); the seed gives `bb-1` a Relationship `nearest` to `ba-1`, which `parity-restricted` hides by scope (the `$expand` case); job `odata-conformance` runs `tests/odata/run.sh`, `-k "abnf or metadata"` on pull requests. Decided (worker-3, owner may override): the ABNF cases run are those of `odataRelativeUri` and `resourcePath` (195), and a `FailAt` case may answer 404, because the cases name their own model (`Categories`), which the service resolves before the syntax; the exact failure offset is `odata_url_abnf_testcases`. The JSON `$metadata` validates with `jsonschema-rs` (pinned in `requirements.txt`) rather than `ajv-cli`, because it reads the `\p{L}` patterns and adds no npm install; options: ajv-cli and ajv-formats from npm. The nightly matrix `odata-clients` runs `tests/odata/clients/{dotnet,sap}/run.sh` (jobs `odata-clients-dotnet`, `odata-clients-sap`): Microsoft.OData.Client 9.0.0 parses and validates `$metadata` and materializes one page; the SAP Cloud SDK generator 4.9.1 builds a client from `$metadata` and its `odata-v4` 4.9.1 runtime reads one page; both then fail when the `parity-restricted` model holds `NO2`. Microsoft.OData.Core refuses a path-only context URL, so the service root is absolute (T-3688). python-odata 0.8.1 (non-blocking in ADR-0024) is not run |
 | Antares, as built (T-3518) | the build job builds `--features full` (views, mcp, odata, ws). Job `ws-conformance` (merge requests and nightly) validates `docs/api/asyncapi-ws.yaml` with `npx @asyncapi/cli@2.16.0 validate` on the runner, then runs `tests/ws/run.sh` of joinedcontext-conformance (`c897b11`, websockets 17.1) against `/x/views/all/ws`, the broker started with `ANTARES_WS_QUEUE=4`, `ANTARES_WS_MAX_LIFETIME_SECS=45` and `ANTARES_EGRESS_ALLOW_PRIVATE=true`; every message the broker sends is validated against the document's message schemas, and the crate's own `tests/ws` read the same file (`common/asyncapi.rs`, `ws_contract.rs`), so a drift fails both. Decided (worker-3, owner may override): the document is validated by the job, not inside the runner image, because the image removes npm after `npm ci` and `@asyncapi/cli` would add its dependency tree for one check; options: `@asyncapi/cli` in the image's `package.json`. The closing reasons `overflow` and `idle` stay with the crate tests (a slow socket, a minute of silence); the suite closes by `view-removed` and `lifetime` |
 | ngsi-ld-test-suite mirror | `SETUP_URL` support in the fixture keywords of `resources/ApiUtils/*.resource` (a branch of the mirror, offered upstream) |
+| Antares, as built (T-3512) | the build job builds `--features full,linkml` (`full` has no `linkml` yet). Job `linkml-conformance` (merge requests and nightly) starts the broker with `ANTARES_API_SURFACES=admin,views,linkml` and runs `tests/linkml/run.sh` of joinedcontext-conformance (`5e3722f`: `linkml==1.12.0` in `requirements.in`, the lock recompiled on Python 3.12 with every existing pin kept; `jc-conformance --selftest` reports `linkml-lint`) with `LINKML_URL` and `LINKML_RESTRICTED_URL` the surfaces of views `all` and `parity-restricted` |
 
 ## Related
 

@@ -2,8 +2,8 @@ name: surfaces-conformance
 
 # The surfaces' conformance jobs (docs/analysis/surfaces-conformance.md
 # section 7). This file holds the MCP pair (T-3516), the OData suites
-# (T-3510, T-3714), etsi-iop (T-3675) and ws-conformance (T-3518); the other
-# surfaces add their jobs here.
+# (T-3510, T-3714), etsi-iop (T-3675), ws-conformance (T-3518) and
+# linkml-conformance (T-3512); the other surfaces add their jobs here.
 #
 #   mcp-conformance  the official @modelcontextprotocol/conformance 0.1.16
 #                    against /x/views/all/mcp, both revisions it knows that
@@ -25,6 +25,11 @@ name: surfaces-conformance
 #                    2.16.0, then joinedcontext-conformance tests/ws: the
 #                    scripted sessions of /x/views/all/ws, every message
 #                    held against that document
+#   linkml-conformance joinedcontext-conformance tests/linkml: the schema
+#                    views `all` and `parity-restricted` serve, judged by
+#                    linkml 1.12.0 (lint, gen-json-schema, gen-shacl) and
+#                    pyshacl 0.40.1, the view's Entities validated against
+#                    the served JSON Schema and SHACL
 #   etsi-icsr        the ETSI DistributedOperations directory on broker1 of
 #                    the internal-csr image with ANTARES_SELF_URLS set to
 #                    its own URL, compared TP by TP with the vanilla image
@@ -39,7 +44,8 @@ name: surfaces-conformance
 # Pull requests to dev run the merge-request subset (both official
 # revisions, the parity suite trimmed to MCP_PARITY_CASES=5, the OData ABNF
 # and $metadata cases); the nightly run, v* tags and dispatch run
-# everything. The broker is the `full` build (views, mcp, odata, ws),
+# everything. The broker is the `full` build (views, mcp, odata, ws) with
+# `linkml`,
 # loaded with ci/views (views, LinkML schemas, seed) by dev/views-rig.sh.
 on:
   pull_request:
@@ -60,9 +66,9 @@ permissions:
 env:
   # joinedcontext-conformance (public) at the commit that carries the
   # broker's MCP parity table, the platform_only marker, tests/odata and
-  # its client checks, tests/ws, the F21/F29 parity rows (T-3686) and
-  # the bind-to-an-absent-target 400 (T-3760)
-  CONFORMANCE_REF: e77fa00765d291dc89bffd37b30986e66e77bbc3
+  # its client checks, tests/ws, the F21/F29 parity rows (T-3686), the
+  # bind-to-an-absent-target 400 (T-3760) and tests/linkml (T-3512)
+  CONFORMANCE_REF: 5e3722f143ede3cf768574acb050388044e9aa45
   NIGHTLY: ${{ github.event_name != 'pull_request' }}
 
 jobs:
@@ -77,7 +83,7 @@ jobs:
         with:
           key: surfaces-conformance
           save-if: ${{ github.event_name != 'pull_request' }}
-      - run: cargo build --locked -p antares-broker --features full
+      - run: cargo build --locked -p antares-broker --features full,linkml
       - uses: actions/upload-artifact@v6
         with:
           name: broker-surfaces
@@ -389,6 +395,59 @@ jobs:
         with:
           title: ws-conformance went red
           body: The AsyncAPI validation or the joinedcontext-conformance WebSocket suite against /x/views/all/ws failed.
+          log-file: broker.log
+
+  linkml-conformance:
+    name: linkml-conformance
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: marek-mraz-jc/joinedcontext-conformance
+          ref: ${{ env.CONFORMANCE_REF }}
+          path: conformance
+      - uses: actions/download-artifact@v7
+        with:
+          name: broker-surfaces
+      - name: Install the suite's pinned Python (linkml, pyshacl)
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --require-hashes -r conformance/requirements.txt
+      - name: Start the broker and load the views
+        run: |
+          chmod +x antares
+          ANTARES_HTTP_PORT=8080 ANTARES_API_SURFACES=admin,views,linkml \
+            ANTARES_SCHEMA_MAX_BYTES=1048576 ./antares > broker.log 2>&1 &
+          for _ in $(seq 1 100); do curl -sf -o /dev/null localhost:8080/q/health && break; sleep 0.2; done
+          dev/views-rig.sh http://localhost:8080
+      - name: The LinkML suite
+        env:
+          LINKML_URL: http://localhost:8080/x/views/all/linkml
+          LINKML_RESTRICTED_URL: http://localhost:8080/x/views/parity-restricted/linkml
+          JC_REPORTS_DIR: reports
+        run: |
+          export PATH="$PWD/.venv/bin:$PATH"
+          conformance/tests/linkml/run.sh
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: linkml-conformance
+          path: |
+            reports/
+            broker.log
+          retention-days: 14
+      - name: File an issue on nightly failure
+        if: failure() && github.event_name == 'schedule'
+        uses: ./.github/actions/failure-issue
+        with:
+          title: linkml-conformance went red
+          body: The joinedcontext-conformance LinkML suite against /x/views/{all,parity-restricted}/linkml failed.
           log-file: broker.log
 
   # ADR-0024 decision 7: the two required OData clients read $metadata and
