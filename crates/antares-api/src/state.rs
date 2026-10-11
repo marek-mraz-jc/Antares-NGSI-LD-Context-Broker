@@ -571,6 +571,60 @@ impl AppState {
             .map_err(|e| e.to_string())
     }
 
+    /// Every stored policy rule document (ADR-0020 amendment), as written.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn policy_docs(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.store
+            .list(&policy_tenant()?, antares_store::Kind::View)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The stored policy rule document of `tenant`, if there is one.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn policy_doc(&self, tenant: &str) -> Result<Option<serde_json::Value>, String> {
+        self.store
+            .get(&policy_tenant()?, antares_store::Kind::View, tenant)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Store the policy rule document of `tenant`; `true` when it replaced
+    /// one. The caller bounded it and the engine took it.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn put_policy_doc(
+        &self,
+        tenant: &str,
+        doc: serde_json::Value,
+    ) -> Result<bool, String> {
+        self.store
+            .upsert(&policy_tenant()?, antares_store::Kind::View, tenant, doc)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove the policy rule document of `tenant`; `false` when there was
+    /// none.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn delete_policy_doc(&self, tenant: &str) -> Result<bool, String> {
+        self.store
+            .delete(&policy_tenant()?, antares_store::Kind::View, tenant)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// The engine `/q/health` reports. No engine reports the built-in name:
     /// the decision an operator reads is the one the broker takes.
     pub fn policy_name(&self) -> &str {
@@ -911,6 +965,11 @@ pub fn now_iso() -> String {
 #[cfg(feature = "views")]
 fn view_tenant() -> Result<antares_model::TenantId, String> {
     antares_model::TenantId::new_internal(crate::views::VIEW_TENANT).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "views")]
+fn policy_tenant() -> Result<antares_model::TenantId, String> {
+    antares_model::TenantId::new_internal(crate::views::POLICY_TENANT).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
