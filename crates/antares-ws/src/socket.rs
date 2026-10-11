@@ -6,7 +6,15 @@
 use crate::envelope::{self, ClientOp, Unread};
 use crate::hub::{Conn, Hub, Next, Runner};
 use antares_ops::{Caller, OperationId, OpsRequest};
-use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+
+/// The socket of one connection: tungstenite on the connection hyper
+/// upgraded (T-3704).
+pub(crate) type WebSocket =
+    tokio_tungstenite::WebSocketStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>>;
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -261,7 +269,7 @@ impl Session {
     /// Write the close frame.
     async fn close(&mut self, code: u16, reason: &'static str) {
         let frame = CloseFrame {
-            code,
+            code: CloseCode::from(code),
             reason: reason.into(),
         };
         let _closed = self.write(Message::Close(Some(frame))).await;
@@ -275,14 +283,14 @@ impl Session {
     }
 
     /// A frame from the client.
-    async fn incoming(&mut self, frame: Option<Result<Message, axum::Error>>) -> Option<End> {
+    async fn incoming(&mut self, frame: Option<Result<Message, WsError>>) -> Option<End> {
         let text = match frame {
             Some(Ok(Message::Text(t))) => t,
             Some(Ok(Message::Pong(_))) => {
                 self.ponged = Instant::now();
                 return None;
             }
-            Some(Ok(Message::Ping(_))) => return None,
+            Some(Ok(Message::Ping(_) | Message::Frame(_))) => return None,
             Some(Ok(Message::Binary(_))) => {
                 self.close(code::UNSUPPORTED, "binary frames are not read")
                     .await;
@@ -411,7 +419,7 @@ impl Session {
         loop {
             let conn = self.conn.clone();
             let end = tokio::select! {
-                frame = self.socket.recv() => self.incoming(frame).await,
+                frame = self.socket.next() => self.incoming(frame).await,
                 () = conn.wake.notified() => self.drain().await,
                 _ = ping.tick() => self.tick().await,
                 () = sleep_until(deadline) => Some(self.closing(code::NORMAL, "lifetime").await),
