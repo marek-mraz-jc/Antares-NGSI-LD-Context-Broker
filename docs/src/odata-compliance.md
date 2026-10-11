@@ -118,9 +118,9 @@ and T-3730, which serves the entity references of a set and of one Entity (secti
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
 | Minimal | 165 | 104 | 24 | 61.3 % |
-| Intermediate | 222 | 114 | 14 | 66.1 % |
+| Intermediate | 234 | 102 | 14 | 69.6 % |
 | Advanced | 159 | 345 | 63 | 31.5 % |
-| **All** (suite summary) | 546 | 563 | 101 | 49.2 % |
+| **All** (suite summary) | 558 | 551 | 101 | 50.3 % |
 
 Before T-3720 the baseline stood at 456 passed, 660 failed and 94 skipped
 (Minimal 57.8 %, Intermediate 49.4 %, Advanced 26.0 %).
