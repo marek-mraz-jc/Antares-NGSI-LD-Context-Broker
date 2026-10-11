@@ -1011,10 +1011,9 @@ mod tests {
         assert!(every.contains_key(&s.class_iri("Person")));
         let edm = build("all", &s, &every, Writable::default(), CsdlVersion::V4_01).unwrap();
         let xml = xml(&edm);
-        assert!(
-            xml.contains("<EntitySet Name=\"Car\"") && xml.contains("<EntitySet Name=\"Person\""),
-            "{xml}"
-        );
+        for set in ["Car", "Person"] {
+            assert!(xml.contains(&format!("<EntitySet Name=\"{set}\"")), "{xml}");
+        }
     }
 
     #[test]
