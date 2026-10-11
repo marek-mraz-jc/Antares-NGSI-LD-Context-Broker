@@ -219,10 +219,11 @@ async fn main() -> Result<(), Error> {
     let mut out = std::io::stdout();
     writeln!(
         out,
-        "latency over {ROUNDS} changes: socket p50 {:?} p99 {ws99:?}; HTTP p50 {:?} p99 {http99:?}; socket p99 within HTTP p99: {}",
+        "latency over {ROUNDS} changes: socket p50 {:?} p99 {ws99:?}; HTTP p50 {:?} p99 {http99:?}; socket p99 within 1.10× HTTP p99: {}",
         percentile(&over_ws, 50),
         percentile(&over_http, 50),
-        ws99 <= http99
+        // ADR-0027 section 6: the socket's one queue hop is allowed 10 %
+        ws99.as_nanos().saturating_mul(10) <= http99.as_nanos().saturating_mul(11)
     )?;
 
     let before = vm_rss_kib();
