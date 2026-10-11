@@ -312,7 +312,10 @@ conformance suite on `allow-all` and that folder on the engine, in one job.
 production: the joinedcontext platform loads each Tenant's Policy rules
 through `/q/policy/{tenant}` and the engine decides on the caller the
 gateway forwards. Its README is the rule document contract, and
-`addons/joinedcontext-policy/tests/engine.rs` holds it through the router.
+`addons/joinedcontext-policy/tests/engine.rs` holds it through the router. The
+same addon ships the `access` surface (`/x/views/{view}/access`, README
+section 4): the caller's grants and the AuthZEN check, read from the table
+the engine decides with.
 
 ### Façades for another standard
 
