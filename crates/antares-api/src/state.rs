@@ -129,6 +129,11 @@ pub struct AppState {
     /// costs about 1.5 ms, which is worth memoizing per state and not worth
     /// paying in a host that never makes an in-process call.
     pub(crate) inbound: Arc<std::sync::OnceLock<axum::Router>>,
+    /// The transport every federation forward asks before the socket
+    /// (ADR-0025 rule 8): shared by every clone, so a state made before the
+    /// transport was registered (the one an `Ops` holds) forwards through it
+    /// too. Empty in vanilla: every forward is HTTP.
+    pub(crate) forward_transport: Arc<std::sync::OnceLock<Arc<dyn crate::ForwardTransport>>>,
     /// The endpoint view every operation through this state is narrowed to
     /// (ADR-0023); `None` serves the NGSI-LD API as it is.
     #[cfg(feature = "views")]
@@ -455,6 +460,7 @@ impl AppState {
             ),
             sinks: Arc::new(sinks),
             inbound: Arc::new(std::sync::OnceLock::new()),
+            forward_transport: Arc::new(std::sync::OnceLock::new()),
             #[cfg(feature = "views")]
             view: None,
             #[cfg(feature = "views")]
@@ -591,6 +597,27 @@ impl AppState {
             None => tracing::warn!("sink registry already shared; binding not registered"),
         }
         self
+    }
+
+    /// Register the transport every federation forward asks before the
+    /// socket (ADR-0025 rule 8, as amended by ADR-0027 section 9). A
+    /// forward it answers `None` for goes over HTTP as before. Every clone
+    /// of this state shares the one slot, before or after this call. The
+    /// transport usually holds such a clone, so it lives as long as the
+    /// state's last clone does: register it in a host that keeps its state
+    /// for the life of the process, as the broker does.
+    ///
+    /// # Errors
+    /// When a transport is already registered: a second one would leave
+    /// the choice between them to registration order.
+    pub fn with_forward_transport(
+        self,
+        transport: Arc<dyn crate::ForwardTransport>,
+    ) -> Result<Self, String> {
+        self.forward_transport
+            .set(transport)
+            .map_err(|_| "a forward transport is already registered".to_owned())?;
+        Ok(self)
     }
 
     /// Mount one more HTTP surface (`/q`, `/x`, or below `/x`). A prefix

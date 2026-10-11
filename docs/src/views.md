@@ -9,8 +9,9 @@ each loaded view as an NGSI-LD API root of its own:
 
 Mount it with `ANTARES_API_SURFACES=admin,views` and load views through
 [`/q/views`](admin-api.md#get-qviews). Until the first view loads, every
-path under `/x/views` answers `503` (ADR-0023 rule M4); a vanilla build has
-no `/x/views` at all.
+path under `/x/views` answers `404` and `/q/health` reports the surface
+`closed` (ADR-0027 rule M4, ADR-0023: "no view means nothing served"); a
+vanilla build has no `/x/views` at all.
 
 ## 1. What a view serves
 
