@@ -305,6 +305,7 @@ impl Display for Literal {
             | Literal::Date(text)
             | Literal::DateTimeOffset(text)
             | Literal::TimeOfDay(text) => f.write_str(&text.replace('+', "%2B")),
+            Literal::Guid(text) => f.write_str(text),
             Literal::String(text) => {
                 f.write_char('\'')?;
                 for byte in text.bytes() {

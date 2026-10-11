@@ -93,6 +93,7 @@ pub(crate) fn narrow(
                 slots: slots.iter().map(|(n, _)| n.clone()).collect(),
                 slot_usage,
                 description: class.description.clone(),
+                annotations: class.annotations.clone(),
             },
         );
     }

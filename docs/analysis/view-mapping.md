@@ -145,3 +145,24 @@ The broker refuses at load what the gateway refuses per request (section 2.5): a
 | T-3672 | platform | the defects of section 2.6, fixed only if the gateway path still serves when it is taken | none |
 
 T-3669, T-3670 and T-3671 go into T-3446's and T-3644's `depends-on:`.
+
+## 9. As built (T-3669)
+
+T-3669 implements sections 3 to 7 in `crates/antares-ops/src/mapping.rs` and `crates/antares-views/src/mapped.rs`. It decides the following beyond the text above, or against it.
+
+- **Names.** IR names are expanded through the view's `@context` over the core at load, and the target model's terms are the view's own. A request to a mapped view that sends a `Link` header is 400.
+- **The inner request.** The inner request runs under an inline `@context` (`OpsRequest::context`) of generated terms (`jcSrc0`, …, `jcSrcClass`), one per source IRI. A `q` name is a 7.2.3.2 name, so no IRI can appear in it. The rebuild reads each source Attribute under the key the broker compacts it to under that context.
+- **Other surfaces.** `Ops::view` returns `None` for a mapped view, so OData, MCP and WebSocket answer it as an unknown view. Only the view root takes it, through `Ops::mapped_view`.
+- **Selector.** A mapped view's `selector` is the mapping's `sourceClass` and nothing else, which is stricter than section 3. Any other type would be served rebuilt as the target class.
+- **`valueMappings` inversion.** `==x` inverts to every key whose forward value is x, plus x itself when x is no key of the table. This is the precise form of the 4.2 cell: a value outside the table passes unchanged.
+- **`geoproperty` and `orderBy`.**
+  - `geoproperty` and `geometryProperty` name a filterable `rename` slot only. A geometry has no unit and no value table.
+  - `orderBy` names a `rename` slot, or a `unitConversion` slot by `asc` or `desc`. `dist-*` applies to `rename` only.
+- **`pick` and `omit`.** These two apply to the rebuilt answer and are never forwarded. `attrs` also restricts the rebuilt answer to the slots it names, so an input fetched for an expression is not served as an attribute of its own.
+- **Unlisted parameters.** A parameter section 4.1 does not list, and that names no attribute (`id`, `limit`, `options`, …), passes through as written. Every other parameter, a parameter named twice, `format=geojson` and `Accept: application/geo+json` are 400.
+- **Refusals.** Every refusal is a fixed text (`Refusal::Malformed`). The broker's own refusals (a 404 naming an attribute) are reworded from generated terms into the target names before they leave the root.
+- **Retrieve Attribute Value.** Through a mapped view it serves a slot with a source Attribute. A constant or computed slot there is 400, and is read through Retrieve Entity.
+- **Tests.**
+  - `mapping/tests.rs` holds the gateway's cases, ported, and every cell of 4.2.
+  - `views_mapped.rs` runs the root end to end.
+  - `views_mapped_props.rs` is the section 6 property: a mapped view serves no id, value or Attribute the same view without its mapping does not.

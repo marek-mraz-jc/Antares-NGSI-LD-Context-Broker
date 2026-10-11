@@ -124,19 +124,57 @@ mod o10 {
     }
 
     #[test]
+    fn bare_lf_framing_reads_and_bodies_keep_their_bytes() {
+        // The NLstn compliance suite's body: Go text with LF line ends.
+        let suite = "--b\nContent-Type: application/http\nContent-Transfer-Encoding: binary\n\n\
+                     GET Products HTTP/1.1\nAccept: application/json\n\n\n--b--";
+        let batch = parse(suite).unwrap();
+        assert_eq!(batch.requests[0].url, "Products");
+        assert_eq!(
+            batch.requests[0].headers,
+            [("Accept".to_owned(), "application/json".to_owned())]
+        );
+        assert_eq!(batch.requests[0].body, b"");
+        let bodies = |body: &str| -> Vec<Vec<u8>> {
+            parse(body)
+                .unwrap()
+                .requests
+                .into_iter()
+                .map(|r| r.body)
+                .collect()
+        };
+        // LF framing, CRLF framing and both in one batch read the same parts; a body keeps its
+        // CRLF and LF, and only the line end before the delimiter belongs to the framing.
+        assert_eq!(
+            bodies("--b\n{HTTP}\n\nPOST x\n\na\r\nb\nc\n--b\nContent-Type: application/http\r\n\r\nPOST y\r\nContent-Length: 2\n\nd\n\r\n--b--\n"
+                .replace("{HTTP}", "Content-Type: application/http")
+                .as_str()),
+            [b"a\r\nb\nc".to_vec(), b"d\n".to_vec()]
+        );
+        assert_eq!(parse("--b--\n"), Ok(odata_batch::Batch::default()));
+        // A bare LF before the boundary in a body is a delimiter now: the part is cut there.
+        assert_eq!(
+            parse(&format!(
+                "--b\r\n{HTTP}\r\nPOST x\r\n\r\nab\n--b\r\ncd\r\n--b--"
+            )),
+            Err(BatchError::Framing { offset: 57 })
+        );
+    }
+
+    #[test]
     fn ambiguous_framing_is_refused() {
         let framing = |offset| Err(BatchError::Framing { offset });
         for (body, refused) in [
-            // LF-only line ends, in the framing and in a header block.
+            // A lone CR, in the framing and in a header block.
             (
-                "--b\nContent-Type: application/http\n\nGET x\n\n--b--".to_owned(),
+                "--b\rContent-Type: application/http\r\n\r\nGET x\r\n--b--".to_owned(),
                 framing(3),
             ),
             (
-                one("Content-Type: application/http\nContent-ID: 1\r\n", "GET x"),
+                one("Content-Type: application/http\rContent-ID: 1\r\n", "GET x"),
                 framing(5),
             ),
-            (one(HTTP, "GET x HTTP/1.1\r\nA: 1\nB: 2\r\n"), framing(39)),
+            (one(HTTP, "GET x HTTP/1.1\r\nA: 1\rB: 2\r\n"), framing(39)),
             // Text outside the parts: a preamble, an epilogue, an unterminated body.
             ("preamble\r\n--b--".to_owned(), framing(0)),
             ("--b--\r\nepilogue".to_owned(), framing(3)),

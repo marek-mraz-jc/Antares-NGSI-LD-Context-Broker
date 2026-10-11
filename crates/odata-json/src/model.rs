@@ -161,8 +161,19 @@ fn is_term(model: &Model, annotation: &Annotation, namespace: &str, name: &str) 
 
 /// `Core.Computed` with the value `true`: the service computes the property.
 pub(crate) fn computed(model: &Model, property: &Property) -> bool {
+    annotated(model, property, "Computed")
+}
+
+/// `Core.ComputedDefaultValue` with the value `true`: a client may set the
+/// property on insert, and the service computes it when the client does not.
+pub(crate) fn computed_default(model: &Model, property: &Property) -> bool {
+    annotated(model, property, "ComputedDefaultValue")
+}
+
+/// `Core.{term}` with the value `true` on `property`.
+fn annotated(model: &Model, property: &Property, term: &str) -> bool {
     property
         .annotations
         .iter()
-        .any(|a| is_term(model, a, CORE, "Computed") && a.value == Expr::Bool(true))
+        .any(|a| is_term(model, a, CORE, term) && a.value == Expr::Bool(true))
 }

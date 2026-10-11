@@ -13,8 +13,8 @@ use crate::below;
 use crate::edm::{Member, Set, Shape};
 use crate::filter::Translated;
 use crate::read::{
-    encode, entity, not_found, not_implemented, refused, resource, run, run_request, set_of,
-    written, Reads,
+    body_id, canonical_key, encode, entity, key_id, not_found, not_implemented, refused, resource,
+    run, run_request, set_of, written, Reads,
 };
 use antares_ops::{Caller, OperationId, OpsRequest};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, IF_MATCH, IF_NONE_MATCH, LOCATION};
@@ -24,7 +24,7 @@ use odata_axum::{json_level, ODataErrorResponse, ODataRequest};
 use odata_json::{
     read_entity_body, Bind, BodyError, BodyLimits, Ctx, ODataError, ODataVersion, Target, WriteKind,
 };
-use odata_url::{Key, KeyValue, Literal, ODataUri, QueryOptions, Segment};
+use odata_url::{Key, ODataUri, QueryOptions, Segment};
 use serde_json::{json, Map, Value};
 
 /// The NGSI-LD Null (8.4.2, 8.4.3): an update or a merge that names it
@@ -73,7 +73,7 @@ pub(crate) async fn serve(
     };
     // Rule 4: a write the view does not offer is refused before its body
     // is read, whatever the body holds.
-    if !reads.view.allows(op) {
+    if !reads.view.allows(op) || !form.taken(reads) {
         return refused(StatusCode::METHOD_NOT_ALLOWED, version).into_response();
     }
     // W32: the broker has no conditional write; options shape a read's
@@ -120,6 +120,23 @@ enum Form<'u> {
 }
 
 impl Form<'_> {
+    /// Whether the set's class takes this write (C10a): a create, a delete,
+    /// or an update of the Entity, a property or a reference.
+    fn taken(&self, reads: &Reads) -> bool {
+        let (Self::Create(set)
+        | Self::Change(set, ..)
+        | Self::Delete(set, _)
+        | Self::Attribute(set, ..)
+        | Self::Reference(set, ..)) = self;
+        // An unknown set is the write's own 404 (the path resolves against
+        // the same model first, so it does not get here).
+        reads.edm.sets.get(*set).is_none_or(|s| match self {
+            Self::Create(_) => s.writable.insert,
+            Self::Delete(..) => s.writable.delete,
+            _ => s.writable.update,
+        })
+    }
+
     /// The operation the write is; `None` for a form none is (W19).
     fn op(&self, reads: &Reads) -> Option<OperationId> {
         Some(match self {
@@ -149,7 +166,7 @@ impl Form<'_> {
 }
 
 /// `POST {Set}` (W1, W2): Create Entity of the set's type with the body's
-/// id; `201` with the Entity as the view reads it and its `Location`, or
+/// id, or a minted one when the body leaves out the key; `201` with the Entity as the view reads it and its `Location`, or
 /// `204` under `Prefer: return=minimal`.
 async fn create(
     reads: &Reads,
@@ -170,14 +187,22 @@ async fn create(
         &BodyLimits::strict(),
     )
     .map_err(|e| body_error(&e, version))?;
-    // The reader requires the key and types it `Edm.String`.
-    let id = payload
-        .key
-        .first()
-        .and_then(|(_, id)| id.as_str())
-        .unwrap_or_default()
-        .to_owned();
+    // The reader checks a key against its Edm type, and leaves one out
+    // only where `$metadata` says the service computes it (W1).
+    let (id, own) = match payload.key.first() {
+        Some((_, value)) => (
+            body_id(set, value).ok_or_else(|| body_error(&invalid_key(), version))?,
+            value.clone(),
+        ),
+        None => minted(set, set_name),
+    };
     let mut doc = attributes(set, &payload.properties, WriteKind::Create);
+    // E2a: the identifier is an Attribute of its own too.
+    let identifier = set
+        .identifier
+        .as_ref()
+        .and_then(|i| set.members.get(&i.member));
+    doc.extend(identifier.and_then(|m| Some((m.iri.clone(), attribute(m, &own)?))));
     bind(reads, caller, set, &payload.binds, &mut doc, version).await?;
     doc.insert("id".into(), Value::from(id.as_str()));
     doc.insert("type".into(), Value::from(set.type_iri.as_str()));
@@ -191,7 +216,7 @@ async fn create(
         version,
     )
     .await?;
-    let key = Key::Single(KeyValue::Literal(Literal::String(id)));
+    let key = canonical_key(set, &id);
     let location = format!(
         "{}{set_name}{}",
         ctx.service_root,
@@ -221,6 +246,18 @@ async fn create(
     Ok(answer)
 }
 
+/// W1: the URN of a create that names no key and the key value it is
+/// under: `urn:ngsi-ld:{Set}:{uuid}`, or the E2a identifier's prefix and
+/// the uuid as its value.
+fn minted(set: &Set, set_name: &str) -> (String, Value) {
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let prefix = set
+        .identifier
+        .as_ref()
+        .map_or_else(|| format!("urn:ngsi-ld:{set_name}:"), |i| i.prefix.clone());
+    (format!("{prefix}{uuid}"), Value::from(uuid))
+}
+
 /// `PATCH` (W4) and `PUT` (W6) of an Entity: Merge or Replace Entity of
 /// the set's type, `204`. A key in the body must be the URL's; an Entity
 /// that is absent, of another type or hidden is `404`, never created
@@ -235,14 +272,14 @@ async fn change(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
-    let id = id_of(key, version)?;
+    let id = id_of(set, key, version)?;
     let resource = resource(reads, set_name, version)?;
     let payload = read_entity_body(ctx, &resource, kind, body, &BodyLimits::strict())
         .map_err(|e| body_error(&e, version))?;
     if payload
         .key
         .iter()
-        .any(|(_, value)| value.as_str() != Some(id.as_str()))
+        .any(|(_, value)| body_id(set, value).as_deref() != Some(id.as_str()))
     {
         return Err(body_error(&invalid_key(), version));
     }
@@ -277,7 +314,7 @@ async fn delete(
     version: ODataVersion,
 ) -> Result<Response, ODataErrorResponse> {
     let set = set_of(reads, set_name, version)?;
-    let id = id_of(key, version)?;
+    let id = id_of(set, key, version)?;
     send(
         reads,
         caller,
@@ -332,7 +369,9 @@ pub(crate) fn attribute(member: &Member, value: &Value) -> Option<Value> {
 
 /// Each bind as a Relationship, after its target is read under the view
 /// (W2): a target the view or the engine hides, an absent one and one of
-/// another type are the same `404`, and nothing is written.
+/// another type are the same `400` naming the navigation, because the bind
+/// is the request body's (Protocol 11.4.2.1, T-3760), and nothing is
+/// written.
 async fn bind(
     reads: &Reads,
     caller: &Caller,
@@ -347,13 +386,31 @@ async fn bind(
             .members
             .get(&bind.navigation)
             .ok_or(not_found(version))?;
-        let urn = visible(reads, caller, &bind.target, version).await?;
+        let urn = visible(reads, caller, &bind.target, version)
+            .await
+            .map_err(|e| unbound(e, &bind.navigation, version))?;
         doc.insert(
             member.iri.clone(),
             json!({"type": "Relationship", "object": urn}),
         );
     }
     Ok(())
+}
+
+/// A bind target that is not there, as the body error it is; any other
+/// refusal stays as the operation answered it.
+fn unbound(e: ODataErrorResponse, navigation: &str, version: ODataVersion) -> ODataErrorResponse {
+    if e.status != StatusCode::NOT_FOUND {
+        return e;
+    }
+    let mut bad = ODataErrorResponse::new(
+        StatusCode::BAD_REQUEST,
+        "BadRequest",
+        "the bound Entity does not exist",
+    )
+    .with_version(version);
+    bad.error.target = Some(navigation.to_owned());
+    bad
 }
 
 /// The id of a bound Entity, after Retrieve Entity of the target's set
@@ -366,7 +423,7 @@ pub(crate) async fn visible(
     version: ODataVersion,
 ) -> Result<String, ODataErrorResponse> {
     let set = set_of(reads, &target.set, version)?;
-    let urn = id_of(&target.key, version)?;
+    let urn = id_of(set, &target.key, version)?;
     run(
         reads,
         caller,
@@ -406,9 +463,13 @@ pub(crate) fn typed(target: &str, set: &Set) -> String {
     format!("{target}?type={}", encode(&set.type_iri))
 }
 
-/// The id a key names; another key form names no Entity.
-pub(crate) fn id_of(key: &Key, version: ODataVersion) -> Result<String, ODataErrorResponse> {
-    crate::read::key_id(key, &QueryOptions::default()).ok_or_else(|| not_found(version))
+/// The id a key names in `set`; another key form names no Entity.
+pub(crate) fn id_of(
+    set: &Set,
+    key: &Key,
+    version: ODataVersion,
+) -> Result<String, ODataErrorResponse> {
+    key_id(set, key, &QueryOptions::default()).ok_or_else(|| not_found(version))
 }
 
 fn invalid_key() -> BodyError {
@@ -445,9 +506,12 @@ mod tests {
             iri: iri.into(),
             shape,
             list: false,
+            written: crate::edm::Written::Always,
         };
         let set = Set {
             type_iri: "https://e.org/T".into(),
+            identifier: None,
+            writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 (
                     "url".into(),
