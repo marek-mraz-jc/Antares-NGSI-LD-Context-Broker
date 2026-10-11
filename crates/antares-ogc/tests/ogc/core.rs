@@ -100,6 +100,12 @@ async fn unknown_and_invalid_parameters_are_400() -> Result<(), String> {
         format!("{ROOT}/collections/Car/items?datetime=yesterday"),
         format!("{ROOT}/collections/Car/items?limit=1&limit=2"),
         format!("{ROOT}/collections/Car/items?next=garbage"),
+        format!("{ROOT}/collections/Car/schema?f=json"),
+        format!("{ROOT}/collections/Car/sortables?limit=1"),
+        format!("{ROOT}/collections/Car/items/urn:ngsi-ld:Car:1?sortby=speed"),
+        format!("{ROOT}/collections/Car/items?sortby=wheels"),
+        format!("{ROOT}/collections/Car/items?properties=wheels"),
+        format!("{ROOT}/collections/Car/items?profile=rel-as-none"),
     ] {
         let a = get(&f.app, &uri).await;
         assert_eq!(a.status, StatusCode::BAD_REQUEST, "{uri}: {}", a.body);
@@ -177,7 +183,7 @@ async fn an_unknown_view_a_view_without_schema_and_an_unknown_path_are_404() -> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_write_method_is_405_with_allow() -> Result<(), String> {
+async fn a_write_the_view_does_not_offer_is_405_with_allow() -> Result<(), String> {
     let f = fixture().await?;
     for method in ["POST", "PUT", "PATCH", "DELETE"] {
         let a = send(
@@ -193,7 +199,7 @@ async fn a_write_method_is_405_with_allow() -> Result<(), String> {
             a.headers
                 .get("allow")
                 .map(axum::http::HeaderValue::as_bytes),
-            Some(&b"GET, HEAD"[..]),
+            Some(&b"GET, HEAD, OPTIONS"[..]),
             "{method}"
         );
     }
