@@ -439,3 +439,28 @@ async fn the_clusters_own_caller_holds_nothing() -> Res {
     assert_eq!(no, json!({"decision": false}));
     Ok(())
 }
+
+/// T-3702: through a view the document lists, the access document is the
+/// view's policies alone, as the engine decides there.
+#[tokio::test]
+async fn a_view_bound_to_policies_describes_those_alone() -> Res {
+    let (_broker, app, engine) = setup().await?;
+    let before = document(&app, &STEWARD, None).await?;
+    assert!(before.contains("InternalIncident"), "{before}");
+
+    let mut bound = doc();
+    if let Some(o) = bound.as_object_mut() {
+        o.insert("views".into(), json!({"air": ["ovzdusie/public-read"]}));
+    }
+    engine.load("city", &bound)?;
+    let after = document(&app, &STEWARD, None).await?;
+    assert!(!after.contains("InternalIncident"), "{after}");
+    let decision = check(
+        &app,
+        &STEWARD,
+        &json!({"action": {"name": "createEntity"}, "resource": {"type": "InternalIncident"}}),
+    )
+    .await?;
+    assert_eq!(at(&decision, "/decision"), json!(false), "{decision}");
+    Ok(())
+}

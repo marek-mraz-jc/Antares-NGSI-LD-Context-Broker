@@ -8,11 +8,15 @@ use antares_ql::geo::GeoQuery;
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Document {
     policies: Vec<PolicyDoc>,
+    /// The policies each listed view is decided by (README section 2).
+    #[serde(default)]
+    views: HashMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -180,6 +184,17 @@ impl Policy {
 pub struct Table {
     /// In document order.
     pub policies: Vec<Policy>,
+    /// Per listed view, the table of its policies alone, in document order.
+    pub views: HashMap<String, Arc<Table>>,
+}
+
+impl Table {
+    /// The table a request through `view` is decided by: the view's own
+    /// when the document lists it, this one otherwise.
+    #[must_use]
+    pub fn through(&self, view: Option<&str>) -> &Table {
+        view.and_then(|v| self.views.get(v)).map_or(self, |t| t)
+    }
 }
 
 /// The core `@context` every name is expanded by: the broker hands the
@@ -205,7 +220,33 @@ pub fn compile(doc: &serde_json::Value) -> Result<Table, String> {
         }
         policies.push(policy(p)?);
     }
-    Ok(Table { policies })
+    let mut views = HashMap::with_capacity(doc.views.len());
+    for (view, ids) in doc.views {
+        let mut listed = BTreeSet::new();
+        for id in &ids {
+            if !seen.contains(id) {
+                return Err(format!(
+                    "view {view:?} names policy {id:?}, which is not in the document"
+                ));
+            }
+            if !listed.insert(id.as_str()) {
+                return Err(format!("view {view:?} names policy {id:?} twice"));
+            }
+        }
+        let own = policies
+            .iter()
+            .filter(|p| listed.contains(p.id.as_str()))
+            .cloned()
+            .collect();
+        views.insert(
+            view,
+            Arc::new(Table {
+                policies: own,
+                views: HashMap::new(),
+            }),
+        );
+    }
+    Ok(Table { policies, views })
 }
 
 fn policy(p: PolicyDoc) -> Result<Policy, String> {
