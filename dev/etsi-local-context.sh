@@ -6,7 +6,9 @@
 # run on any other commit therefore tested dev's context file, and a GitHub
 # outage failed every TP that names it. For the length of a run this
 # script rewrites that URL prefix to a static server on CONTEXT_PORT
-# (8089; the suite's own 8085-8087 servers start and stop per TP) that
+# (8079: no suite file names it; the suite's own 8085-8087 servers and the
+# IOP mocks on 8089 start and stop per TP, and a clash hung IOP_EXT_MSC_01)
+# that
 # serves resources/jsonld-contexts/ from the checkout, and puts it back.
 #
 #   dev/etsi-local-context.sh start    rewrite + serve; prints SUITE_CONTEXT
@@ -22,7 +24,7 @@ cd "$(dirname "$0")/.."
 
 SUITE=ngsi-ld-test-suite
 RAW=https://raw.githubusercontent.com/joinedcontext/Antares-NGSI-LD-Context-Broker/dev/ngsi-ld-test-suite/resources/jsonld-contexts/
-PORT="${CONTEXT_PORT:-8089}"
+PORT="${CONTEXT_PORT:-8079}"
 LOCAL="http://localhost:$PORT/"
 STATE="${CONTEXT_STATE:-$PWD/${RESULTS:-results}/local-context}"
 
@@ -33,6 +35,9 @@ case "${1:-}" in
   start)
     mkdir -p "$STATE"
     [ -s "$STATE/files" ] && { echo "already started: $STATE/files exists" >&2; exit 1; }
+    # a TP that binds this port waits forever on a server it cannot start
+    clash=$(grep -rlw --include=*.robot --include=*.resource --include=*.py "$PORT" "$SUITE" || true)
+    [ -z "$clash" ] || { printf 'CONTEXT_PORT %s is used by:\n%s\n' "$PORT" "$clash" >&2; exit 1; }
     named "$RAW" > "$STATE/files"
     xargs -r -d '\n' sed -i "s|$RAW|$LOCAL|g" < "$STATE/files"
     python3 -m http.server "$PORT" --bind 127.0.0.1 \

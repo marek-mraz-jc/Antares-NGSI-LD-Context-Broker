@@ -132,7 +132,8 @@ with Robot's own `log.html` per suite.
 The suite names its own `@context` by a raw.githubusercontent.com URL on
 `dev`, in `variables.py` and in 331 data and expectation files. A pipeline
 run instead serves `resources/jsonld-contexts/` from the checkout on port
-8089 (`dev/etsi-local-context.sh`). It rewrites that URL for the length of
+8079 (`dev/etsi-local-context.sh`; it refuses a port a suite file names, the
+IOP mocks own 8089). It rewrites that URL for the length of
 the run and puts the files back in teardown, so a commit is tested with its
 own context file and a GitHub outage fails nothing. The cell fails when a
 file still names the GitHub URL, or when no broker fetched the context from
