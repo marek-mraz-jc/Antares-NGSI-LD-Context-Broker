@@ -55,8 +55,9 @@ permissions:
 env:
   # joinedcontext-conformance (public) at the commit that carries the
   # broker's MCP parity table, the platform_only marker, tests/odata and
-  # its client checks, tests/ws and the F21/F29 parity rows (T-3686)
-  CONFORMANCE_REF: bbbd7551237968c3bce4729e97dde735348a6c52
+  # its client checks, tests/ws, the F21/F29 parity rows (T-3686) and
+  # the bind-to-an-absent-target 400 (T-3760)
+  CONFORMANCE_REF: e77fa00765d291dc89bffd37b30986e66e77bbc3
   NIGHTLY: ${{ github.event_name != 'pull_request' }}
 
 jobs:
