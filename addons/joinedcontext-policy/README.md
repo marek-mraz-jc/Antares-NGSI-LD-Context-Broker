@@ -88,14 +88,17 @@ refused:
 | `q`, `scopeQ` | NGSI-LD query and scope query, on the Entity |
 | `geoQ` | `georel=…;geometry=…;coordinates=…[;geoproperty=…]` |
 | `temporalQ` | `timerel=before|after|between;timeAt=…[;endTimeAt=…]`, an instant or an ISO 8601 duration before now (`P-1D`) |
+| `views` | optional, beside `policies`: `{"{viewId}": ["policy id", …]}`. A request through a listed view (the subject's `@view`, ADR-0020 amendment) is decided by those policies alone; a view not listed, and the plain NGSI-LD root, by every policy. Each id must name a policy of the document, at most once per view; a view may list none (it then grants nothing) |
 
 A document that does not parse is refused and the previous one keeps
 deciding; a Tenant with no document denies every platform caller.
 
 ## 3. Decisions
 
-1. The policies that apply: the assignee is the caller, the clause is
-   listed, now is inside the validity.
+1. The policies that apply: those of the request's view when the document
+   lists it (`views`), every policy otherwise; of those, the ones whose
+   assignee is the caller, whose clause is listed and whose validity holds
+   now.
 2. A prohibition that applies and names no type, or a type the operation
    names, or applies to an operation naming no type: `Deny`.
 3. No permission applies: `Deny` (default deny).
@@ -134,7 +137,8 @@ deciding; a Tenant with no document denies every platform caller.
 `ANTARES_API_SURFACES=...,access` mounts `/x/views/{view}/access`, built
 with `jc-policy` and `views` (the platform image's `full,jc-policy`; plan
 section 5.6). It answers "what may I do through this
-view" from the same compiled table the engine decides with, so the
+view" from the same compiled table the engine decides with, narrowed to
+the view's policies when `views` lists it, so the
 description and the enforcement cannot drift (platform EP-60). The view
 names the Tenant; an unknown view is 404, the same as on every view
 surface.
