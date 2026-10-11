@@ -942,6 +942,12 @@ async fn run(
         antares_ws::Limits::from_env(|k| std::env::var(k).ok())?;
         state = state.with_sink(Box::new(antares_ws::Sink::new(antares_ws::Hub::process())));
     }
+    // The MCP surface's resource subscriptions (MCP section 5): an
+    // in-process sink that flags a URI on a stream this process holds.
+    #[cfg(feature = "mcp")]
+    {
+        state = state.with_sink(Box::new(antares_mcp::Sink));
+    }
     // Endpoint views (ADR-0023 rule 10): the stored views loaded into the
     // table every surface that serves through views opens on, `/q/views`
     // and `/q/policy` on the admin surface, and the reload that keeps every

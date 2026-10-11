@@ -147,3 +147,11 @@ function = "Server::write" # v0 mangling puts the impl between the crate and the
 lines = 2
 branches = 1
 reason = "a deployment key file that cannot be used: the codec is a process static, so a test run with a working key never reaches the refusal; confirm::codec_of's refusals are unit-tested"
+
+[[exclusion]]
+crate = "antares-mcp"
+file = "src/server.rs"
+function = "Drop::drop" # the one Drop in server.rs, Closing's
+lines = 1
+branches = 1
+reason = "a listen stream dropped outside any tokio runtime: rmcp polls and drops the listen future inside the runtime that serves it, so only a process ending reaches this side, and expiresAt removes the subscriptions then"

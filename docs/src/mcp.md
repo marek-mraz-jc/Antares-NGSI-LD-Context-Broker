@@ -10,11 +10,12 @@ POST /x/views/{view}/mcp
 Mount it with `ANTARES_API_SURFACES=admin,views,mcp`. It shares the view
 root with the `views` surface (ADR-0027 section 1) and answers `404` for a
 view that is not loaded. The design is `docs/analysis/mcp-surface.md`
-(T-3442); this page is what the build serves today (T-3513, T-3514).
+(T-3442); this page is what the build serves today (T-3513 to T-3515).
 
 ## 1. Protocol
 
-- Streamable HTTP, JSON answers, no sessions and no server-sent stream.
+- Streamable HTTP, JSON answers, no sessions; only `subscriptions/listen`
+  answers a server-sent stream (section 6).
 - Revision `2026-07-28` first: every request carries its own protocol
   metadata in `_meta`, and `server/discover` answers the versions served.
 - The legacy `initialize` of `2025-11-25` and `2025-06-18` works without a
@@ -174,13 +175,50 @@ A URI of another view, a malformed one and one whose Entity is out of view
 or absent all answer `-32602 unknown resource` (MC10). An Entity past the
 result budget is `-32000`; read it with `get_entity` and `pick`.
 
-## 6. Caching
+## 6. Resource subscriptions
+
+A 2026-07-28 client watches Entities with `subscriptions/listen` and
+`notifications.resourceSubscriptions` (D-7). The answer is a server-sent
+stream: the acknowledgment, then `notifications/resources/updated` with
+the URI alone each time a watched Entity changes. The client reads it
+again with `resources/read`, through the gate. No other notification type
+is acknowledged, and a legacy `initialize` client cannot listen (D-8).
+
+- **What is acknowledged.** `ngsi-ld://{view}/entities/{id}` URIs of this
+  view, at most 64 distinct ones, and only when the view's `operations`
+  allow `retrieve_entity`, `create_subscription` and
+  `delete_subscription`; otherwise none. A `types/` URI or another view's
+  is left out. Whether the Entity exists or is visible plays no part.
+- **What is watched.** Each acknowledged Entity the caller can read is
+  backed by one NGSI-LD Subscription the surface makes through the view as
+  the caller (ADR-0023 rule 9): `watchedAttributes` and
+  `notification.attributes` are the view's Attributes, `throttling` 1 s,
+  `expiresAt` one hour on. An Entity that is absent or out of view is
+  never watched and sends nothing. A change to an Attribute the view hides
+  is no change in a watched one, so it sends no event (MC17).
+- **Delivery.** The Subscription's endpoint is `x-antares-mcp:{stream}`,
+  served by an in-process sink that opens no socket. Nobody can name that
+  endpoint over HTTP or a tool: it is accepted only while the stream makes
+  its own Subscription (MC7). A burst of changes to one Entity is one event
+  until the stream has sent it.
+- **Bounds.** A stream lasts at most one hour. One process holds at most
+  4 streams per subject and Tenant (callers that send no subject header
+  share one subject), 64 per Tenant and 256 in all; past a bound the
+  stream is acknowledged and then ended with error `-32000` naming the
+  bound.
+- **Closing.** When the stream ends (the client goes away, the hour is
+  over, the server stops), the surface deletes its Subscriptions; a
+  process that dies leaves them to their `expiresAt`. A stream is held by
+  the process that opened it: with several pods, a change notified on
+  another pod is lost (mcp-surface 5.4).
+
+## 7. Caching
 
 `server/discover` is `cacheScope: public` (one hour); every other result
 is `private`: the tool list for a minute, the resource templates for five,
 resource lists and reads not at all (MC9).
 
-## 7. Logging
+## 8. Logging
 
 Each tool call logs one line with the view, the tool, the operation id and
 the status; a write that was not confirmed logs the view and the tool. The
