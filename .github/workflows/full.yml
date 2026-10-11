@@ -432,6 +432,14 @@ jobs:
           format: spdx-json
           output-file: antares-${{ github.ref_name }}.sbom.spdx.json
           upload-artifact: false
+      # The CycloneDX SBOMs of the broker beside the image's SPDX one:
+      # vanilla, and full once that feature exists (dev/sbom.sh).
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx@0.5.9
+      - name: SBOM (vanilla and full)
+        run: dev/sbom.sh sbom
       - name: Sign the image (cosign keyless)
         uses: sigstore/cosign-installer@v3
       - env:
@@ -456,4 +464,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER="${GITHUB_REF#refs/tags/}"
-          gh release create "$VER"             --title "Antares $VER" --notes-file notes.md             antares-*.tar.gz "antares-wasm-$VER.zip" "antares-$VER.sbom.spdx.json"
+          gh release create "$VER"             --title "Antares $VER" --notes-file notes.md             antares-*.tar.gz "antares-wasm-$VER.zip" "antares-$VER.sbom.spdx.json" sbom/*.cdx.json

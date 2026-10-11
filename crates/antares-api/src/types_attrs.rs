@@ -295,7 +295,7 @@ pub async fn entity_types(
         };
         let mut resp = respond(StatusCode::OK, payload, &ctx, accept, &tenant);
         mark_partial(&mut resp, partial, &st.host_alias);
-        filter.mark_restricted(resp.headers_mut());
+        filter.mark(&st.host_alias, resp.headers_mut());
         Ok::<_, ApiError>(resp)
     };
     go.await.unwrap_or_else(|e| e.into_response())
@@ -363,7 +363,7 @@ pub async fn entity_type_info(
         });
         let mut resp = respond(StatusCode::OK, payload, &ctx, accept, &tenant);
         mark_partial(&mut resp, partial, &st.host_alias);
-        filter.mark_restricted(resp.headers_mut());
+        filter.mark(&st.host_alias, resp.headers_mut());
         Ok::<_, ApiError>(resp)
     };
     go.await.unwrap_or_else(|e| e.into_response())
@@ -420,7 +420,7 @@ pub async fn attributes(
         };
         let mut resp = respond(StatusCode::OK, payload, &ctx, accept, &tenant);
         mark_partial(&mut resp, partial, &st.host_alias);
-        filter.mark_restricted(resp.headers_mut());
+        filter.mark(&st.host_alias, resp.headers_mut());
         Ok::<_, ApiError>(resp)
     };
     go.await.unwrap_or_else(|e| e.into_response())
@@ -481,7 +481,7 @@ pub async fn attribute_info(
         });
         let mut resp = respond(StatusCode::OK, payload, &ctx, accept, &tenant);
         mark_partial(&mut resp, partial, &st.host_alias);
-        filter.mark_restricted(resp.headers_mut());
+        filter.mark(&st.host_alias, resp.headers_mut());
         Ok::<_, ApiError>(resp)
     };
     go.await.unwrap_or_else(|e| e.into_response())

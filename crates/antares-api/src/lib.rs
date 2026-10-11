@@ -90,7 +90,9 @@ pub mod views;
 pub use antares_notifier::DeliveryPolicy;
 // The sink contract, so a surface reaches it through this crate and names no
 // antares-notifier (ADR-0027 section 1, rule M2).
-pub use antares_notifier::{DeliveryError, DeliveryFuture, NotificationSink, Outbound};
+pub use antares_notifier::{
+    build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
+};
 pub use federation::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 pub use state::{AppState, TemporalRecord};
 
@@ -969,6 +971,9 @@ async fn health(
     #[cfg(feature = "views")]
     {
         body["views"] = state.views.report();
+        // Which documents the table was loaded from (threat V26): two pods
+        // reporting two values serve two predicates.
+        body["viewsRevision"] = state.views.revision().into();
         // The engine's rule documents by tenant and revision, loaded or
         // refused (ADR-0020 amendment); never the documents themselves.
         body["policy"]["documents"] = state.views.policy_report();

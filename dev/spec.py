@@ -18,6 +18,7 @@ Commands:
     python3 dev/spec.py robot     # refresh the robot: field from suite tags
     python3 dev/spec.py status    # counts + per-chapter rollup
     python3 dev/spec.py gaps      # leaves with status not-implemented and no TPs
+    python3 dev/spec.py --write-sizes  # rewrite stale ARCHITECTURE.md size rows
     python3 dev/spec.py check     # ledger integrity gate (exit 1 on violation):
                                   #   every clause file parses, status is in the
                                   #   enum, partial/staged carry notes, robot
@@ -717,7 +718,30 @@ def robot_recipe_violations():
     return out
 
 
-def architecture_size_violations():
+SIZE_ROW = re.compile(r"^\| `([a-z_0-9.-]+)` \| ([\d ]+) \|", re.M)
+
+
+def architecture_sizes(root=ROOT):
+    """Lines of every crate's `src/` and of every `antares-api` module, by the
+    name its ARCHITECTURE.md row uses."""
+
+    def lines_of(paths):
+        return sum(len(f.read_bytes().split(b"\n")) - 1 for f in paths)
+
+    sizes = {}
+    for d in sorted((root / "crates").iterdir()):
+        if (d / "src").is_dir():
+            sizes[d.name] = lines_of(sorted((d / "src").rglob("*.rs")))
+    for f in sorted((root / "crates/antares-api/src").glob("*.rs")):
+        sizes[f.name] = lines_of([f])
+    return sizes
+
+
+def size_is_stale(stated, actual):
+    return abs(stated - actual) > max(0.10 * actual, 2)
+
+
+def architecture_size_violations(root=ROOT):
     """ARCHITECTURE.md sizes every crate and every `antares-api` module so a
     reader can tell where the weight sits before opening anything. Typed by
     hand they drift with the code and stop meaning anything: the sql crate was
@@ -725,40 +749,62 @@ def architecture_size_violations():
     its size, which sends a reader to the wrong file for the biggest change in
     the workspace. Rounding is the author's business — the check only refuses a
     number that is no longer the right size."""
-    doc = ROOT / "ARCHITECTURE.md"
+    doc = root / "ARCHITECTURE.md"
     if not doc.exists():
         return [f"{doc}: the code map is missing"]
-    out, tolerance = [], 0.10
-
-    def lines_of(paths):
-        n = 0
-        for f in paths:
-            n += len(f.read_bytes().split(b"\n")) - 1
-        return n
-
-    sizes = {}
-    for d in sorted((ROOT / "crates").iterdir()):
-        if (d / "src").is_dir():
-            sizes[d.name] = lines_of(sorted((d / "src").rglob("*.rs")))
-    for f in sorted((ROOT / "crates/antares-api/src").glob("*.rs")):
-        sizes[f.name] = lines_of([f])
-
-    for line in doc.read_text(encoding="utf-8").splitlines():
-        row = re.match(r"\| `([a-z_0-9.-]+)` \| ([\d ]+) \|", line)
-        if not row or row.group(1) not in sizes:
-            continue
-        name, stated = row.group(1), int(row.group(2).replace(" ", ""))
-        actual = sizes[name]
-        if abs(stated - actual) > max(tolerance * actual, 2):
-            out.append(
-                f"ARCHITECTURE.md: sizes {name} at {stated} lines, it holds {actual}"
-            )
+    out, sizes = [], architecture_sizes(root)
     text = doc.read_text(encoding="utf-8")
+    for row in SIZE_ROW.finditer(text):
+        name, stated = row.group(1), int(row.group(2).replace(" ", ""))
+        if name in sizes and size_is_stale(stated, sizes[name]):
+            out.append(
+                f"ARCHITECTURE.md: sizes {name} at {stated} lines, it holds {sizes[name]}"
+            )
     for name in sorted(sizes):
         if name.endswith(".rs"):
             if not re.search(rf"^\| `{re.escape(name)}` \|", text, re.M):
                 out.append(f"ARCHITECTURE.md: the module table has no row for {name}")
     return out
+
+
+def rounded(n):
+    """A size as the table writes it: exact below 100, then to the ten, the
+    fifty and the hundred, each step inside the check's tolerance."""
+    step = 1 if n < 100 else 10 if n < 1000 else 50 if n < 10000 else 100
+    return f"{(n + step // 2) // step * step:,}".replace(",", " ")
+
+
+def write_sizes(root=ROOT):
+    """Rewrite the number of every stale size row of ARCHITECTURE.md (T-3664),
+    so a conflict in that table is resolved by taking either side and running
+    this. A row within tolerance keeps the author's rounding; a row for a name
+    that is no crate or module, and the prose, stay byte for byte; a missing
+    row is not added. The names rewritten, in order."""
+    doc = root / "ARCHITECTURE.md"
+    sizes, changed = architecture_sizes(root), []
+
+    def fix(row):
+        name, stated = row.group(1), int(row.group(2).replace(" ", ""))
+        if name not in sizes or not size_is_stale(stated, sizes[name]):
+            return row.group(0)
+        changed.append(name)
+        return f"| `{name}` | {rounded(sizes[name])} |"
+
+    text = doc.read_text(encoding="utf-8")
+    new = SIZE_ROW.sub(fix, text)
+    if new != text:
+        doc.write_text(new, encoding="utf-8")
+    return changed
+
+
+def cmd_write_sizes():
+    for name in write_sizes():
+        print(f"write-sizes: {name}")
+    left = architecture_size_violations()
+    for e in left:
+        print(f"CHECK {e}")
+    if left:
+        sys.exit(1)
 
 
 def shared_crate_violations():
@@ -1063,4 +1109,5 @@ if __name__ == "__main__":
         "gaps": cmd_gaps,
         "check": cmd_check,
         "statements": cmd_statements,
+        "--write-sizes": cmd_write_sizes,
     }.get(cmd, cmd_status)()

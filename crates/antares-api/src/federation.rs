@@ -2103,6 +2103,19 @@ fn admits_import(reg: &FedReg, spec: &crate::registry::CsrSpec, id: &str) -> boo
             .is_some_and(|p| antares_ql::regex::compile(p).is_ok_and(|re| re.find(id).is_some()))
 }
 
+/// Whether a query parameter travels on a forward. A narrowed `q` (the
+/// caller's joined with a policy's, `antares_ql::parse_narrowed_q`) can be
+/// past the caps a peer counts it with, `antares_ql::parse_q`'s; the peer's
+/// TooComplexQuery would then tell the caller that a policy predicate is
+/// there and how large (threat V23, T-3621). Such a `q` stays home: the
+/// local re-check applies it to the aggregate (5.7.2.4, 5.7.4.4), as it
+/// does for split entities.
+// ponytail: the peer is modelled with our own caps; a peer with smaller ones
+// can still refuse the conjunction. Forward only the caller's own q then.
+fn forwardable(k: &str, v: &str) -> bool {
+    k != "q" || antares_ql::parse_q(v).is_ok()
+}
+
 pub async fn fed_query(
     st: &AppState,
     tenant: &TenantId,
@@ -2169,6 +2182,7 @@ pub async fn fed_query(
             push_filters
                 .then(|| params.get(k))
                 .flatten()
+                .filter(|v| forwardable(k, v))
                 .map(String::to_owned)
         };
         let (status, body, peer_warns) = if op == "queryBatch" {
@@ -2433,7 +2447,7 @@ pub async fn fed_query_temporal(
                 "geoproperty",
                 "scopeQ",
             ] {
-                if let Some(v) = params.get(k) {
+                if let Some(v) = params.get(k).filter(|v| forwardable(k, v)) {
                     query.push((k.into(), v.clone()));
                 }
             }

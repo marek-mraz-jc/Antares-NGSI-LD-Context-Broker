@@ -1,0 +1,101 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 5e162a2..b79ef9a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -306,6 +306,7 @@ name = "antares-views"
+ version = "0.1.3"
+ dependencies = [
+  "antares-ops",
++ "antares-store",
+  "axum",
+  "http-body-util",
+  "serde_json",
+@@ -2299,6 +2300,7 @@ dependencies = [
+ name = "odata-url"
+ version = "0.1.3"
+ dependencies = [
++ "antares-model",
+  "odata-csdl",
+  "proptest",
+  "serde_json",
+diff --git a/crates/antares-api/src/lib.rs b/crates/antares-api/src/lib.rs
+index f4c9124..382362a 100644
+--- a/crates/antares-api/src/lib.rs
++++ b/crates/antares-api/src/lib.rs
+@@ -395,6 +395,7 @@ pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
+         ("/entityOperations/delete", post(batch::batch_delete)),
+         ("/entityOperations/merge", post(batch::batch_merge)),
+         ("/entityOperations/query", post(batch::batch_query)),
++        ("/cg-fixture", get(cg_fixture_route)),
+         // EntityMaps (5.14; 6.32/6.34/6.35)
+         (
+             "/entityMaps",
+@@ -6576,3 +6577,18 @@ mod clause_6_3_11 {
+ pub(crate) fn allow_private() {
+     antares_jsonld::allow_private_egress(true);
+ }
++
++/// cg-invariants fixture: a route that reaches no policy decision.
++async fn cg_fixture_route() -> axum::http::StatusCode {
++    axum::http::StatusCode::OK
++}
++
++/// cg-invariants fixture: a reqwest client built outside client_builder.
++pub fn cg_fixture_client() -> reqwest::Client {
++    reqwest::Client::builder().build().unwrap_or_default()
++}
++
++/// cg-invariants fixture: the Tenant header named outside its owners.
++pub fn cg_fixture_tenant() -> &'static str {
++    "NGSILD-Tenant"
++}
+diff --git a/crates/antares-sql/src/lib.rs b/crates/antares-sql/src/lib.rs
+index 6f5ffb5..dc8951f 100644
+--- a/crates/antares-sql/src/lib.rs
++++ b/crates/antares-sql/src/lib.rs
+@@ -30,3 +30,8 @@ pub use antares_store::StoreMode;
+ /// The transaction preamble that makes RLS effective: always SET LOCAL,
+ /// never session-level SET.
+ pub const SET_TENANT_SQL: &str = "SELECT set_config('antares.tenant', $1, true)";
++
++/// cg-invariants fixture: dynamic SQL from text.
++pub fn cg_fixture_sql(table: &str) -> sqlx::AssertSqlSafe<String> {
++    sqlx::AssertSqlSafe(format!("SELECT * FROM {table}"))
++}
+diff --git a/crates/antares-views/Cargo.toml b/crates/antares-views/Cargo.toml
+index 3c40da2..da2fb44 100644
+--- a/crates/antares-views/Cargo.toml
++++ b/crates/antares-views/Cargo.toml
+@@ -14,6 +14,7 @@ feature = "views"
+ 
+ [dependencies]
+ antares-ops = { workspace = true }
++antares-store = { workspace = true }
+ axum = { version = "0.8", default-features = false, features = ["query"] }
+ serde_json = { version = "1", default-features = false, features = ["std"] }
+ 
+diff --git a/crates/antares-views/src/lib.rs b/crates/antares-views/src/lib.rs
+index 543d8a7..f1c7206 100644
+--- a/crates/antares-views/src/lib.rs
++++ b/crates/antares-views/src/lib.rs
+@@ -314,3 +314,8 @@ mod tests {
+         assert!(!h.contains_key(header::LOCATION));
+     }
+ }
++
++/// cg-invariants fixture: a surface calling the store past antares-ops.
++pub fn cg_fixture_store(doc: &mut serde_json::Value) -> bool {
++    antares_store::stored_object(doc).is_ok()
++}
+diff --git a/crates/odata-url/Cargo.toml b/crates/odata-url/Cargo.toml
+index 83a72c2..5ba80ff 100644
+--- a/crates/odata-url/Cargo.toml
++++ b/crates/odata-url/Cargo.toml
+@@ -16,6 +16,7 @@ role = "protocol"
+ edm = ["dep:odata-csdl"]
+ 
+ [dependencies]
++antares-model = { workspace = true }
+ odata-csdl = { path = "../odata-csdl", optional = true }
+ 
+ [dev-dependencies]

@@ -15,6 +15,9 @@
 # The second mode reads the package list `cargo auditable` embeds
 # (Dockerfile) with `rust-audit-info`; that checks the image's /antares
 # itself, which has no symbols left to read.
+#
+# The third mode, `--sbom <cdx.json>`, reads the component names of a
+# CycloneDX SBOM of the broker (dev/sbom.sh) the same way.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -22,6 +25,19 @@ cd "$(dirname "$0")/.."
 SYMBOLS='(^|[^A-Za-z0-9_])(antares_(ops|views|odata|mcp|linkml|ws|icsr|plugin_[a-z_]+)|odata_(url|csdl|json|batch|axum)|linkml_model|rmcp|tungstenite)::'
 # The same crates as package names, as the auditable list carries them.
 PACKAGES='^(antares-(ops|views|odata|mcp|linkml|ws|icsr|plugin-.+)|odata-.+|linkml-model|rmcp|tungstenite)$'
+
+if [ "${1:-}" = --sbom ]; then
+  sbom=${2:?usage: --sbom <cdx.json>}
+  names=$(jq -r '.components[]?.name' "$sbom")
+  [ -n "$names" ] || { echo "no component in $sbom: the check would pass vacuously"; exit 1; }
+  if found=$(printf '%s\n' "$names" | grep -E "$PACKAGES"); then
+    echo "SURFACE IN THE VANILLA SBOM $sbom:"
+    printf '%s\n' "$found"
+    exit 1
+  fi
+  echo "vanilla SBOM: OK ($(printf '%s\n' "$names" | wc -l) components, none a surface)"
+  exit 0
+fi
 
 if [ "${1:-}" = --audit-info ]; then
   bin=${2:?usage: --audit-info <binary>}

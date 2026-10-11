@@ -137,6 +137,40 @@ mod writers {
         }
     }
 
+    fn prefix(version: ODataVersion) -> &'static str {
+        match version {
+            ODataVersion::V4_0 => "@odata.",
+            ODataVersion::V4_01 => "@",
+        }
+    }
+
+    #[test]
+    fn the_metadata_etag_follows_the_context_url() {
+        let tag = "\"5bbd\"";
+        for (ctx, suffix) in every_ctx() {
+            let tagged = Ctx {
+                metadata_etag: Some(tag),
+                ..ctx
+            };
+            let body = String::from_utf8(written(|out| {
+                write_entity_reference(&tagged, "People('p1')", out)
+            }))
+            .unwrap();
+            let want = match tagged.level {
+                MetadataLevel::None => None,
+                _ => Some(format!(
+                    r#""{}context":"https://example.org/odata/$metadata#$ref","{}metadataEtag":"\"5bbd\"","#,
+                    prefix(tagged.version),
+                    prefix(tagged.version)
+                )),
+            };
+            match want {
+                Some(head) => assert!(body.starts_with(&format!("{{{head}")), "{suffix}: {body}"),
+                None => assert!(!body.contains("metadataEtag"), "{suffix}: {body}"),
+            }
+        }
+    }
+
     /// One writer on the failing sink.
     type Writer<'w> = &'w dyn Fn(&mut Failing) -> io::Result<()>;
 

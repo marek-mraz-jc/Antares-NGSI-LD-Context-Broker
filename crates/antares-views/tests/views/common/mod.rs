@@ -30,8 +30,9 @@ pub const HISTORY: &str = "/x/views/history/ngsi-ld/v1";
 pub const FLEET: &str = "/x/views/fleet/ngsi-ld/v1";
 
 /// Every write the view root serves, by its matrix id.
-pub const WRITES: [&str; 14] = [
+pub const WRITES: [&str; 15] = [
     "batch_create",
+    "batch_upsert",
     "batch_update",
     "batch_merge",
     "batch_delete",

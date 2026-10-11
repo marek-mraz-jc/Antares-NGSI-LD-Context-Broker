@@ -576,8 +576,18 @@ pub(crate) fn parse_projection(s: &str, ctx: &Context) -> Result<Vec<ProjNode>, 
                 }
                 None => (t, None),
             };
-            let head = head_part.split('.').next().unwrap_or(head_part);
-            if head.is_empty() || head_part.split('.').any(str::is_empty) {
+            // An IRI (a `:` before any `.`) is one Attribute name (5.5.7):
+            // the dotted path is a short name's syntax only.
+            let iri = match (head_part.find(':'), head_part.find('.')) {
+                (Some(colon), Some(dot)) => colon < dot,
+                (colon, _) => colon.is_some(),
+            };
+            let head = if iri {
+                head_part
+            } else {
+                head_part.split('.').next().unwrap_or(head_part)
+            };
+            if head.is_empty() || (!iri && head_part.split('.').any(str::is_empty)) {
                 return Err(bad("empty path segment"));
             }
             if !head

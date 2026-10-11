@@ -481,7 +481,7 @@ Tests: `metadata_never_names_a_hidden_type_or_attribute` (for each of XML, JSON,
 
 | Id | Risk | Rule | Test |
 |---|---|---|---|
-| S5.1 | `$batch` amplification | member count ≤ min(`max_requests`, `MAX_BATCH_ITEMS`); body ≤ `MAX_BODY_BYTES` (`bounds.rs:21`); no nesting; no foreign host; each member gated alone (W24 to W26) | `odata_batch_member_count_over_limit_is_400`, `odata_batch_member_for_another_host_is_400`, `odata_batch_members_are_gated_one_by_one` |
+| S5.1 | `$batch` amplification | member count ≤ min(`max_requests`, `MAX_BATCH_ITEMS`); body ≤ `MAX_BODY_BYTES` (`bounds.rs:21`); no nesting; no foreign host; each member gated alone (W24 to W26) | `odata_batch_part_count_is_capped`, `odata_batch_member_for_another_host_is_400`, `odata_batch_members_are_gated_one_by_one` |
 | S5.2 | `$skiptoken` tampering | the token holds offset, remaining `$top` and a SHA-256 digest of the normalised query plus view id; a mismatch is 400; with offset only inside, a forged token can do no more than `$skip` | `odata_skiptoken_from_another_query_is_400` |
 | S5.3 | `/$query` body bypassing the engine | `/$query` runs as `GET /entities`, never `entityOperations/query` (Q22; operation-matrix 5.1 gap of `query_entities_post`) | `odata_query_segment_reaches_the_engine_with_q` |
 | S5.4 | Relationship write to an invisible target | target read under the view first (section 6); R5 properties read-only (W15) | `odata_bind_to_hidden_target_is_404_and_writes_nothing` |

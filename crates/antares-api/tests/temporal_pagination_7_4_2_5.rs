@@ -342,3 +342,105 @@ async fn temporal_q_carries_first_n_and_offset_n() {
         }
     }
 }
+
+/// Every instant served per (Entity, Attribute) following `rel` Links from
+/// `uri` to the last page, and how many pages that took.
+async fn follow(
+    b: &Broker,
+    uri: &str,
+    rel: &str,
+) -> (
+    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    usize,
+) {
+    let mut seen = std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    let mut next = Some(uri.to_owned());
+    let mut pages = 0;
+    while let Some(uri) = next {
+        pages += 1;
+        assert!(pages <= 40, "the Links do not end: {uri}");
+        let (code, body, links) = b.send("GET", &uri, None).await;
+        assert!(code.is_success(), "{uri}: {code} {body}");
+        let docs = match body {
+            Value::Array(docs) => docs,
+            doc => vec![doc],
+        };
+        for doc in &docs {
+            for (attr, instances) in doc.as_object().into_iter().flatten() {
+                for t in instances.as_array().into_iter().flatten() {
+                    if let Some(t) = t["observedAt"].as_str() {
+                        seen.entry(format!("{} {attr}", doc["id"].as_str().unwrap_or("")))
+                            .or_default()
+                            .insert(t.to_owned());
+                    }
+                }
+            }
+        }
+        next = link_with(&links, rel).map(|l| target(&l).to_owned());
+    }
+    (seen, pages)
+}
+
+/// T-3613: the ceiling cuts every Attribute at one time boundary (T-3612),
+/// so an Attribute sparser than the boundary one serves fewer instances.
+/// Following the next Links to the end still serves every instance of every
+/// Attribute, ascending and descending, on one Entity and on a query: the
+/// offsetN Link moves by the fewest instances a cut Attribute served, and
+/// when one served none it continues by time from the boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn following_the_links_serves_every_instance_of_every_attribute() {
+    let series = |minutes: &mut dyn Iterator<Item = usize>| -> Vec<Value> {
+        minutes
+            .map(|i| json!({"type": "Property", "value": i, "observedAt": at(i)}))
+            .collect()
+    };
+    // speed every minute, fuel every other, late only after the first
+    // boundary: cut to nothing on the first ascending page
+    let sparse = json!({
+        "id": "urn:ngsi-ld:Car:sparse", "type": "Car",
+        "speed": series(&mut (0..20)),
+        "fuel": series(&mut (1..40).step_by(2)),
+    });
+    let late = json!({
+        "id": "urn:ngsi-ld:Car:late", "type": "Car",
+        "speed": series(&mut (0..20)),
+        "late": series(&mut (30..36)),
+    });
+    for b in brokers().await {
+        let mut want = std::collections::BTreeMap::new();
+        for doc in [&sparse, &late] {
+            let (code, body, _) = b
+                .send("POST", "/ngsi-ld/v1/temporal/entities", Some(doc.clone()))
+                .await;
+            assert_eq!(code, StatusCode::CREATED, "{body}");
+            for (attr, instances) in doc.as_object().into_iter().flatten() {
+                for t in instances.as_array().into_iter().flatten() {
+                    want.entry(format!("{} {attr}", doc["id"].as_str().unwrap_or("")))
+                        .or_insert_with(std::collections::BTreeSet::new)
+                        .insert(t["observedAt"].as_str().unwrap_or("").to_owned());
+                }
+            }
+        }
+        let single = |id: &str| {
+            want.iter()
+                .filter(|(k, _)| k.starts_with(id))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        for id in ["urn:ngsi-ld:Car:sparse", "urn:ngsi-ld:Car:late"] {
+            for (query, rel) in [("", "intervalafter"), ("lastN=50", "intervalbefore")] {
+                let uri = format!("/ngsi-ld/v1/temporal/entities/{id}?{query}");
+                let (seen, pages) = follow(&b, &uri, rel).await;
+                assert_eq!(seen, single(id), "{uri}");
+                assert!(pages > 2, "{uri}: the ceiling never cut, {pages} page(s)");
+            }
+        }
+        for (query, rel) in [("", "intervalafter"), ("&lastN=50", "intervalbefore")] {
+            let uri = format!(
+                "/ngsi-ld/v1/temporal/entities?type=Car&timerel=after&timeAt=1970-01-01T00:00:00Z{query}"
+            );
+            let (seen, _) = follow(&b, &uri, rel).await;
+            assert_eq!(seen, want, "{uri}");
+        }
+    }
+}

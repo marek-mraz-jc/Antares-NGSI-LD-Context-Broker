@@ -226,7 +226,10 @@ the pod's view table before they answer; every other pod reloads within
 (`loaded` with its tenant, operation count and loader notes, or `invalid`
 with the reason) under `views`, and each surface that serves through views
 as `open` or `closed` under `surfaces`: no view loaded, every route of such
-a surface answers `404`.
+a surface answers `404`. `viewsRevision` is sixteen hex digits, a digest of
+the stored view documents the table was loaded from: every pod over one
+store reports the same value once it has reloaded, so two values mean two
+pods serving two predicates.
 
 ```json
 {
@@ -264,6 +267,22 @@ be served (nothing is stored), `413` over 64 KiB.
 ### DELETE /q/views/{id}
 
 `204`, or `404` when there is no such view.
+
+### POST /q/views/{id}/preview
+
+What a draft would serve, before it is stored (the Portal's view writer).
+The body is the candidate view document, checked as a PUT checks it; the
+request's query string is a Query Entities query (5.7.2), run in the
+draft's tenant through its narrowing with no caller subject, so a policy
+engine is asked as for an anonymous caller. `limit` is at most 100
+(default 20) and any `count` is replaced by `count=true`. The answer is
+`{"count": 2, "entities": [...]}`, the count of the whole narrowed set and
+one page. Nothing is stored and no table reloads. `400` with the loader's
+reason for a draft that cannot be served or a `limit` over 100, `413` over
+64 KiB; a refusal of the query itself (no `type`, `attrs`, `q` or `georel`,
+an unknown tenant, the engine's denial) comes back as the API gave it. No
+view root reaches this route: a view serves only the operations of the
+matrix.
 
 ## Policy rule documents
 

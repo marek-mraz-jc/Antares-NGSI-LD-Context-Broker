@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode};
 use axum::routing;
 use axum::Router;
 use http_body_util::BodyExt;
-use odata_axum::{metadata_router, ODataRequest, ODataState};
+use odata_axum::{json_level, json_response, metadata_router, ODataRequest, ODataState};
 use odata_csdl::{
     CsdlVersion, EntityContainer, EntitySet, EntityType, Model, Property, Schema, TypeRef,
 };
@@ -47,6 +47,7 @@ fn state() -> ODataState {
         url_limits: odata_url::Limits::strict(),
         csdl_limits: odata_csdl::Limits::strict(),
         max_header_len: 64,
+        metadata_etag: None,
     }
 }
 
@@ -445,6 +446,220 @@ async fn the_extractor_parses_below_the_service_root_and_answers_refusals_with_t
         answer.body.contains(r#""code":"LimitExceeded""#),
         "{}",
         answer.body
+    );
+    Ok(())
+}
+
+async fn level(request: ODataRequest, headers: axum::http::HeaderMap) -> axum::response::Response {
+    match json_level(&request, &headers, 64) {
+        Ok(level) => json_response(request.version, level, b"{}".to_vec()),
+        Err(refused) => axum::response::IntoResponse::into_response(refused),
+    }
+}
+
+/// A surface's own resource: JSON at the level `$format` or `Accept` asks, never XML.
+#[tokio::test]
+async fn a_resource_is_json_at_the_level_asked_and_xml_is_406() -> Result<(), String> {
+    let routes = Router::new()
+        .route("/{*rest}", routing::get(level))
+        .with_state(Arc::new(state()));
+    let app = || Router::new().nest("/odata", routes.clone());
+    for (uri, headers, status, content_type) in [
+        (
+            "/odata/Buildings",
+            &[][..],
+            StatusCode::OK,
+            "application/json;odata.metadata=minimal",
+        ),
+        (
+            "/odata/Buildings",
+            &[V401][..],
+            StatusCode::OK,
+            "application/json;metadata=minimal",
+        ),
+        (
+            "/odata/Buildings?$format=application/json;metadata=full",
+            &[V401][..],
+            StatusCode::OK,
+            "application/json;metadata=full",
+        ),
+        (
+            "/odata/Buildings",
+            &[("Accept", "application/json;odata.metadata=none")][..],
+            StatusCode::OK,
+            "application/json;odata.metadata=none",
+        ),
+        (
+            "/odata/Buildings?$format=xml",
+            &[][..],
+            StatusCode::NOT_ACCEPTABLE,
+            "application/json",
+        ),
+        (
+            "/odata/Buildings",
+            &[("Accept", "application/xml")][..],
+            StatusCode::NOT_ACCEPTABLE,
+            "application/json",
+        ),
+        (
+            "/odata/Buildings",
+            &[("Accept", "text/plain")][..],
+            StatusCode::NOT_ACCEPTABLE,
+            "application/json",
+        ),
+    ] {
+        let answer = get_with(app(), uri, headers).await?;
+        assert_eq!(answer.status, status, "{uri} {headers:?}: {}", answer.body);
+        assert_eq!(answer.content_type, content_type, "{uri} {headers:?}");
+        assert!(
+            answer.version.is_some(),
+            "{uri}: OData-Version on every answer"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_write_on_the_documents_is_an_odata_405() -> Result<(), String> {
+    for (method, uri) in [
+        ("POST", "/odata/"),
+        ("PUT", "/odata/$metadata"),
+        ("DELETE", "/odata/$metadata"),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("OData-MaxVersion", "4.01")
+            .body(Body::empty())
+            .map_err(|e| e.to_string())?;
+        let response = app(state())
+            .oneshot(request)
+            .await
+            .map_err(|e| e.to_string())?;
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {uri}"
+        );
+        assert_eq!(response.headers()["allow"], "GET", "{method} {uri}");
+        assert_eq!(
+            response.headers()["odata-version"],
+            "4.01",
+            "{method} {uri}"
+        );
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| e.to_string())?
+            .to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains(r#""code":"MethodNotAllowed""#),
+            "{method} {uri}: {body}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_carries_a_strong_etag_per_serialisation_and_revalidates() -> Result<(), String> {
+    let head = |uri: &'static str, headers: Vec<(&'static str, String)>| async move {
+        let mut request = Request::get(uri).header("OData-MaxVersion", "4.01");
+        for (k, v) in headers {
+            request = request.header(k, v);
+        }
+        let request = request.body(Body::empty()).map_err(|e| e.to_string())?;
+        let response = app(state())
+            .oneshot(request)
+            .await
+            .map_err(|e| e.to_string())?;
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let (status, etag, cache) = (response.status(), header("etag"), header("cache-control"));
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| e.to_string())?
+            .to_bytes();
+        Ok::<_, String>((status, etag, cache, bytes.len()))
+    };
+    let (status, xml_tag, cache, _) = head("/odata/$metadata", vec![]).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        xml_tag.starts_with('"') && xml_tag.ends_with('"') && xml_tag.len() == 18,
+        "{xml_tag}"
+    );
+    assert_eq!(cache, "private, no-cache");
+    let (_, again, ..) = head("/odata/$metadata", vec![]).await?;
+    assert_eq!(again, xml_tag, "the same bytes, the same tag");
+    let (_, json_tag, ..) = head("/odata/$metadata?$format=json", vec![]).await?;
+    assert_ne!(json_tag, xml_tag, "one tag per serialisation");
+    for matching in [
+        xml_tag.clone(),
+        format!("W/{xml_tag}"),
+        format!("\"x\", {xml_tag}"),
+        "*".to_owned(),
+    ] {
+        let (status, tag, cache, len) = head(
+            "/odata/$metadata",
+            vec![("If-None-Match", matching.clone())],
+        )
+        .await?;
+        assert_eq!((status, len), (StatusCode::NOT_MODIFIED, 0), "{matching}");
+        assert_eq!(
+            (tag.as_str(), cache.as_str()),
+            (xml_tag.as_str(), "private, no-cache")
+        );
+    }
+    let (status, ..) = head("/odata/$metadata", vec![("If-None-Match", json_tag)]).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "another document's tag does not match"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_service_document_names_the_metadata_documents_tag() -> Result<(), String> {
+    let tag = odata_axum::metadata_etag(&model(), &odata_csdl::Limits::strict());
+    let tagged = ODataState {
+        metadata_etag: tag.clone(),
+        ..state()
+    };
+    let xml = get_with(app(tagged.clone()), "/odata/$metadata", &[]).await?;
+    let request = Request::get("/odata/$metadata")
+        .body(Body::empty())
+        .map_err(|e| e.to_string())?;
+    let response = app(tagged.clone())
+        .oneshot(request)
+        .await
+        .map_err(|e| e.to_string())?;
+    let header = response.headers().get("etag").and_then(|v| v.to_str().ok());
+    assert_eq!(header, tag.as_deref(), "the XML document's own tag");
+    assert_eq!(xml.status, StatusCode::OK);
+    let service = get_with(app(tagged), "/odata/", &[]).await?;
+    let written = format!(
+        r#""@odata.metadataEtag":"{}""#,
+        tag.as_deref().unwrap_or("none").replace('"', "\\\"")
+    );
+    assert!(service.body.contains(&written), "{}", service.body);
+    let past_limits = odata_csdl::Limits {
+        max_elements: 1,
+        ..odata_csdl::Limits::strict()
+    };
+    assert_eq!(
+        odata_axum::metadata_etag(&model(), &past_limits),
+        None,
+        "no document, no tag"
     );
     Ok(())
 }

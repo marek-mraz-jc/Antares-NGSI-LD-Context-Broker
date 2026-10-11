@@ -105,6 +105,49 @@ impl NatsBus {
         self.client.connection_state() == async_nats::connection::State::Connected
     }
 
+    /// Core NATS request/reply, no JetStream: `payload` to `subject`, the
+    /// reply within `within`; `None` when nobody answered in time (no
+    /// subscriber is an immediate `None`).
+    pub async fn request(
+        &self,
+        subject: String,
+        payload: Vec<u8>,
+        within: std::time::Duration,
+    ) -> Option<Vec<u8>> {
+        let req = async_nats::Request::new()
+            .payload(payload.into())
+            .timeout(Some(within));
+        let reply = self.client.send_request(subject, req).await.ok()?;
+        Some(reply.payload.to_vec())
+    }
+
+    /// Answer every core request on `subject` with `answer` of its payload,
+    /// until the returned task is aborted or `answer` returns `None`.
+    pub fn reply<F>(&self, subject: String, answer: F) -> tokio::task::JoinHandle<()>
+    where
+        F: Fn(&[u8]) -> Option<Vec<u8>> + Send + 'static,
+    {
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let mut requests = match client.subscribe(subject.clone()).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("reply subscription on {subject} failed: {e}");
+                    return;
+                }
+            };
+            while let Some(msg) = requests.next().await {
+                let Some(to) = msg.reply else { continue };
+                let Some(bytes) = answer(&msg.payload) else {
+                    return;
+                };
+                if let Err(e) = client.publish(to, bytes.into()).await {
+                    tracing::warn!("reply on {subject} failed: {e}");
+                }
+            }
+        })
+    }
+
     /// Successful reconnects since startup. `Event::Connected` fires on
     /// EVERY successful connect including the initial one (connector.rs
     /// emits it unconditionally), so the first event is subtracted.

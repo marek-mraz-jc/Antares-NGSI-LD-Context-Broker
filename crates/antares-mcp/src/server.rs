@@ -2,19 +2,24 @@
 //! The MCP server of one view, for one request: discovery, the tool list
 //! and calls, and the resources (MCP sections 3, 4, 6 and 8).
 
+use crate::confirm;
+use crate::listen::{self, LIFETIME, MAX_URIS, SCHEME};
 use crate::schema::{self, Checked, Names};
 use crate::tools::{self, Built, ToolDef, TOOLS};
 use crate::{cursor, MAX_RESULT_BYTES_ENV};
 use antares_ops::{Caller, OperationId, OpsRequest, ViewOps};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-    DiscoverResult, ErrorCode, Implementation, ListResourceTemplatesResult, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
-    ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
+    DiscoverResult, ElicitRequest, ElicitRequestParams, ElicitationSchema, ErrorCode,
+    Implementation, InputRequest, InputRequiredResult, ListResourceTemplatesResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResourceTemplate, ResourceUpdatedNotification,
+    ResourceUpdatedNotificationParam, ServerCapabilities, ServerConfig, ServerNotification,
+    SubscriptionFilter, Tool, ToolAnnotations,
 };
-use rmcp::service::RequestContext;
+use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{json, Value};
 use std::borrow::Cow;
@@ -77,6 +82,8 @@ struct Answer {
     status: StatusCode,
     /// `NGSILD-Results-Count`, when the broker sent one.
     count: Option<u64>,
+    /// The id a `Location` header names, when the broker sent one.
+    created: Option<String>,
     body: Value,
 }
 
@@ -140,6 +147,12 @@ impl Server {
             .get("ngsild-results-count")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok());
+        let created = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit('/').next())
+            .and_then(percent_decoded);
         let body = match axum::body::to_bytes(response.into_body(), MAX_INNER_BYTES).await {
             // an empty body (a 204) is no JSON: `null`
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
@@ -147,6 +160,7 @@ impl Server {
                 return Answer {
                     status: StatusCode::PAYLOAD_TOO_LARGE,
                     count: None,
+                    created: None,
                     body: Value::Null,
                 }
             }
@@ -154,8 +168,101 @@ impl Server {
         Answer {
             status,
             count,
+            created,
             body,
         }
+    }
+
+    /// Watch the Entity `uri` names for `stream` (MCP 5.2 steps 2 and 3):
+    /// read it through the gate, then make one internal Subscription on it
+    /// through the view as the caller. An Entity the caller cannot read, or
+    /// a Subscription the gate refuses, is never watched and never said so.
+    async fn watch(&self, stream: &str, uri: &str, attributes: &[String]) {
+        let prefix = format!("ngsi-ld://{}/entities/", self.id);
+        let Some(id) = uri.strip_prefix(&prefix).and_then(percent_decoded) else {
+            return;
+        };
+        if !schema::is_entity_id(&id) {
+            return;
+        }
+        let read = Built {
+            method: Method::GET,
+            target: format!("/ngsi-ld/v1/entities/{}", tools::encode(&id)),
+            body: None,
+        };
+        let read = self.run(OperationId::RetrieveEntity, read).await;
+        let Some(kind) = read.body.get("type").filter(|_| read.status.is_success()) else {
+            return;
+        };
+        let sub = format!(
+            "urn:ngsi-ld:Subscription:mcp-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let endpoint = json!({"uri": format!("{SCHEME}:{stream}"), "accept": "application/json"});
+        let expires = listen::date_time_after(std::time::SystemTime::now(), LIFETIME);
+        // a view names at least one Attribute (its rules must), so the
+        // Subscription never watches every Attribute
+        let body = json!({"id": sub, "type": "Subscription", "entities": [{"id": id, "type": kind}],
+               "watchedAttributes": attributes,
+               "notification": {"attributes": attributes, "endpoint": endpoint},
+               "expiresAt": expires, "throttling": 1});
+        // known before it exists, so a change the moment it is made finds it
+        listen::streams().watch(stream, &sub, uri);
+        let made = Built {
+            method: Method::POST,
+            target: "/ngsi-ld/v1/subscriptions".into(),
+            body: Some(body),
+        };
+        let answer =
+            listen::creating(stream, self.run(OperationId::CreateSubscription, made)).await;
+        if !answer.status.is_success() {
+            listen::streams().unwatch(stream, &sub);
+        }
+    }
+
+    /// A write tool's call (MCP 3.4): checked, then the person is asked
+    /// when the client `asks`, then the confirmed retry runs once.
+    async fn write(
+        &self,
+        tool: &'static ToolDef,
+        request: CallToolRequestParams,
+        asks: bool,
+    ) -> CallToolResponse {
+        let given = request.arguments.unwrap_or_default();
+        if let Err(why) = schema::check_all(tool.args, &given, &self.names()) {
+            return refused(&why).into();
+        }
+        if !asks {
+            return refused("this tool needs a client that can ask the person").into();
+        }
+        let bound = confirm::bound_to(&self.id, &self.caller.subject(), tool.name, &given);
+        let Some(state) = request.request_state else {
+            let Some(state) = confirm::seal(&bound) else {
+                return refused("this endpoint cannot ask the person now; nothing was written")
+                    .into();
+            };
+            let ask = ElicitRequest::new(ElicitRequestParams::FormElicitationParams {
+                meta: None,
+                message: confirm::question(tool.name, tool.op.id(), &given),
+                requested_schema: ElicitationSchema::builder()
+                    .required_bool(confirm::ANSWER)
+                    .build_unchecked(),
+            });
+            let asked = [(confirm::ANSWER.to_owned(), InputRequest::Elicitation(ask))];
+            return InputRequiredResult::new(Some(asked.into_iter().collect()), Some(state)).into();
+        };
+        let confirmed = if !confirm::redeem(&state, &bound) {
+            Err("the requestState does not answer this call; call the tool again without it")
+        } else if !confirm::accepted(request.input_responses.as_ref()) {
+            Err("the person did not confirm; nothing was written")
+        } else {
+            Ok(())
+        };
+        if let Err(why) = confirmed {
+            tracing::info!(view = %self.id, tool = tool.name, "mcp write not confirmed");
+            return refused(why).into();
+        }
+        self.call(tool, &given).await.into()
     }
 
     async fn call(
@@ -195,6 +302,11 @@ impl Server {
         if !answer.status.is_success() {
             return failed(&answer);
         }
+        if tool.write && answer.body.is_null() {
+            // a write answered without a body: the id it made, if any
+            let out = answer.created.map(|id| json!({ tool.key: id }));
+            return CallToolResult::structured(out.unwrap_or_else(|| json!({})));
+        }
         let rows = match answer.body {
             Value::Array(rows) if tool.paged => rows,
             body => return whole(tool, &body),
@@ -217,6 +329,50 @@ impl Server {
             );
         }
         CallToolResult::structured(Value::Object(out))
+    }
+}
+
+/// Ends a stream however its `listen` ends: forgets it and deletes its
+/// internal Subscriptions through the view as the caller (MCP 5.2 step 5).
+struct Closing {
+    stream: String,
+    view: ViewOps,
+    caller: Caller,
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        let made = listen::streams().close(&self.stream);
+        let (view, caller) = (self.view.clone(), self.caller.clone());
+        // without a runtime the process is ending: expiresAt deletes them
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                for id in made {
+                    let target = format!("/ngsi-ld/v1/subscriptions/{}", tools::encode(&id));
+                    let req = OpsRequest::new(Method::DELETE, target);
+                    let deleted = view
+                        .run(OperationId::DeleteSubscription, &caller, req)
+                        .await;
+                    let status = deleted.map_or(0, |r| r.status().as_u16());
+                    tracing::debug!(status, "mcp stream subscription deleted");
+                }
+            });
+        }
+    }
+}
+
+/// A read is read-only; a write is destructive unless it only adds (MCP
+/// `destructiveHint`: a create cannot remove or overwrite what is there).
+fn annotations(t: &tools::ToolDef) -> ToolAnnotations {
+    let hints = ToolAnnotations::new().read_only(!t.write).open_world(false);
+    let additive = matches!(
+        t.name,
+        "create_entity" | "create_subscription" | "batch_create"
+    );
+    if t.write {
+        hints.destructive(!additive)
+    } else {
+        hints
     }
 }
 
@@ -314,6 +470,7 @@ impl ServerHandler for Server {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                .enable_resources_subscribe()
                 .build(),
         )
         .with_instructions(INSTRUCTIONS)
@@ -338,6 +495,81 @@ impl ServerHandler for Server {
         std::future::ready(Ok(found))
     }
 
+    /// Resource subscriptions only (MCP 5.2 step 1): the Entity URIs of
+    /// this view, at most [`MAX_URIS`] distinct ones, and none when the view
+    /// does not let a caller read an Entity and make and delete a
+    /// Subscription, which a watch is. Whether an Entity exists or is
+    /// visible is no part of the acknowledgment (MC7).
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        let prefix = format!("ngsi-ld://{}/entities/", self.id);
+        let watches = [
+            OperationId::RetrieveEntity,
+            OperationId::CreateSubscription,
+            OperationId::DeleteSubscription,
+        ]
+        .into_iter()
+        .all(|op| self.view.allows(op));
+        let mut uris: Vec<String> = Vec::new();
+        for uri in requested.resource_subscriptions.iter().flatten() {
+            let fits = watches && uris.len() < MAX_URIS;
+            if fits && uri.starts_with(&prefix) && !uris.contains(uri) {
+                uris.push(uri.clone());
+            }
+        }
+        let mut accepted = SubscriptionFilter::new();
+        accepted.resource_subscriptions = Some(uris);
+        Some(accepted)
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let (stream, wake) = listen::streams()
+            .open(self.view.tenant(), self.caller.subject(), listen::CAPS)
+            .map_err(|why| ErrorData::new(ErrorCode(-32000), why, None))?;
+        let _closing = Closing {
+            stream: stream.clone(),
+            view: self.view.clone(),
+            caller: self.caller.clone(),
+        };
+        // every Attribute the view shows, whether or not a schema may name
+        // it: a name left out here would make a change to it no event, but
+        // one left out of `watchedAttributes` would make every change one
+        let (_, attributes) = self.view.shown_names();
+        // rmcp acknowledges what was asked, repeats included: one watch each
+        let uris: std::collections::BTreeSet<&String> = context
+            .accepted()
+            .resource_subscriptions
+            .iter()
+            .flatten()
+            .collect();
+        for uri in uris {
+            self.watch(&stream, uri, &attributes).await;
+        }
+        let lifetime = tokio::time::sleep(LIFETIME);
+        tokio::pin!(lifetime);
+        loop {
+            tokio::select! {
+                () = context.cancelled() => return Ok(()),
+                () = &mut lifetime => return Ok(()),
+                () = wake.notified() => {
+                    for uri in listen::streams().take(&stream) {
+                        let updated = ResourceUpdatedNotification::new(
+                            ResourceUpdatedNotificationParam::new(uri),
+                        );
+                        // it fails only once the stream closed, which
+                        // `cancelled` ends on the next turn
+                        let _closed = context
+                            .sink()
+                            .send(ServerNotification::ResourceUpdatedNotification(updated))
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -354,7 +586,7 @@ impl ServerHandler for Server {
                     t.description,
                     Arc::new(schema::input_schema(t.args, &names)),
                 )
-                .annotate(ToolAnnotations::new().read_only(true).open_world(false))
+                .annotate(annotations(t))
             })
             .collect();
         Ok(ListToolsResult::with_all_items(tools)
@@ -365,13 +597,21 @@ impl ServerHandler for Server {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let Some(tool) = tools::named(&request.name) else {
             return Err(unknown_tool());
         };
         if !self.offers(tool.op).await {
             return Err(unknown_tool());
+        }
+        if tool.write {
+            // a form, which an empty `elicitation` declares too (2025-11-25)
+            let asks = context
+                .client_capabilities()
+                .and_then(|c| c.elicitation)
+                .is_some_and(|e| e.form.is_some() || e.url.is_none());
+            return Ok(self.write(tool, request, asks).await);
         }
         let given = request.arguments.unwrap_or_default();
         Ok(self.call(tool, &given).await.into())
@@ -506,6 +746,7 @@ mod tests {
         let a = Answer {
             status: StatusCode::BAD_REQUEST,
             count: None,
+            created: None,
             body: json!({"title": "BadRequestData", "detail": "secret speed<80"}),
         };
         let r = failed(&a);
