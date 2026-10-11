@@ -85,7 +85,8 @@ every DE-9IM geometry (`crates/antares-ql/src/geo.rs`), orders
 8. **Slices.** T-3744 Part 1 Core; T-3753 `ogc-cql2`; T-3745 Part 3 and
    CQL2 (depends on T-3744, T-3753, T-3748); T-3746 Part 4 and Part 2;
    T-3754 Part 5 schemas, sortables, `sortby`, `properties`, feature
-   references; T-3747 the CITE ETS job; T-3751 the SDK and App sample;
+   references; T-3759 items through `ViewOps::scan` with the `ngsild.*`
+   options (ADR-0028); T-3747 the CITE ETS job; T-3751 the SDK and App sample;
    T-3752 the gateway switch. T-3446 depends on each.
 
 Decided (worker-4, owner may override): a new surface crate plus a
