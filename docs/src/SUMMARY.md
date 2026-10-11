@@ -26,6 +26,7 @@
 - [Admin API](admin-api.md)
 - [Storage drivers](storage.md)
 - [Conformance](conformance.md)
+- [OData compliance](odata-compliance.md)
 - [Performance](performance.md)
 - [Performance baseline](perf-baseline.md)
 - [Coverage](coverage.md)

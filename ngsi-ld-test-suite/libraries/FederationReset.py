@@ -10,12 +10,16 @@ scripts — keeping the ETSI suite compact and reusable.
 Exposed keyword:  Reset Federation Brokers    ${b1_url}    ${b2_url}    ...
 (each URL is a broker base, e.g. http://host:9090/ngsi-ld/v1)
 """
+import os
+
 import requests
 
 # The test-suite context defines the IOP entity types, so a `type` filter expands to the same IRI the
 # entities were stored under. Listing entities/registrations requires a filter (id alone is not
 # allowed), so we sweep the known IOP types.
-_CONTEXT = (
+# The runners serve the suite's own copy and export SUITE_CONTEXT (dev/etsi-local-context.sh), so a
+# reset never reaches forge at run time; the forge URL is the default only outside them.
+_CONTEXT = os.environ.get("SUITE_CONTEXT") or (
     "https://forge.etsi.org/rep/cim/ngsi-ld-test-suite/-/raw/develop/"
     "resources/jsonld-contexts/ngsi-ld-test-suite-compound.jsonld"
 )

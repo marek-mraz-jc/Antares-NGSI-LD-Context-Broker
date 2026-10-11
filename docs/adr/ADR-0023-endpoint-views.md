@@ -288,6 +288,7 @@ Rule {
     scope_q:     Option<String>
     geo_q:       Option<GeoQuery>
     attributes:  Set<Attribute IRI>
+    every_attribute: bool           // engine rules only, see below
 }
 ```
 
@@ -373,6 +374,23 @@ predicates and the broker evaluates the rules and the caller's predicates
 over that set, so paging and projection pushdown are forfeited
 (`ponytail:` a scan; compile the rules' OR to SQL when it shows up);
 options: scan, SQL compilation of per-Entity visibility now.
+
+Amended 2026-10-11 (T-3637): an engine's rule may show the whole Entity.
+The platform's grant without an attribute list is the whole Entity (map
+K9, `no_whitelist_anywhere_means_the_whole_entity`), and a rule with an
+empty `attributes` shows its frame alone, so the joinedcontext engine could
+not say it. `Rule::every_attribute` set means the rule shows every
+Attribute and its `attributes` are not read: an Entity it holds for keeps
+everything the stored Entity carries (minus `omit`, `omit_by_type` and
+`pick`, which still narrow), a write under it may name any Attribute, it
+discloses nothing (it shows what its condition reads), and a temporal
+answer keeps every Attribute's instances at the times it holds. Composed
+with a view's rule (rule 1), the pair shows the view rule's Attributes.
+A view never sets it: a view states every Attribute with rule 12's `*`.
+Decided (worker-1, owner may override): a flag beside the list, because a
+reserved name in the list would be compared as an Attribute IRI wherever
+the list is read; options: a flag, a reserved `*` member, an
+`Option<Set>`, which would change every reader of the list.
 
 ## Threats and the rule that answers each
 

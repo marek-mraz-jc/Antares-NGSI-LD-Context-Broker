@@ -77,6 +77,11 @@ pub mod bounds {
 /// for a crate that serves some forwards in process.
 pub use antares_api::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 
+/// The URL this broker is reached at (`ANTARES_PUBLIC_URL`, else the
+/// request's `Host`), for a surface whose documents name its resources by
+/// absolute URL.
+pub use antares_api::public_base;
+
 /// The headers a surface may never set on an operation: the tenant, the
 /// snapshot and the policy subject come from the outer request alone (G2).
 const OUTER_ONLY: [&str; 2] = ["ngsild-tenant", "ngsild-snapshot"];
@@ -942,6 +947,11 @@ pub mod test_kit {
             self.reload.now().await
         }
 
+        /// The broker's router: the NGSI-LD API and `/q`.
+        pub fn router(&self) -> axum::Router {
+            antares_api::router(self.state.clone())
+        }
+
         /// The NGSI-LD API narrowed by the loaded view `id`: every operation
         /// composed with it as the view root will serve it (ADR-0023).
         ///
@@ -982,11 +992,37 @@ pub mod test_kit {
             Ok(antares_api::router(state))
         }
     }
+
+    /// A policy [`Filter`](super::policy::Filter) conditioned on `q` (4.9),
+    /// for a test engine's `AllowIf`: a surface reaches the query language
+    /// through this crate alone (ADR-0027 rule M1).
+    ///
+    /// # Errors
+    /// `q` does not parse.
+    pub fn q_filter(q: &str) -> Result<super::policy::Filter, String> {
+        let q = antares_ql::parse_q(q).map_err(|e| e.to_string())?;
+        Ok(super::policy::Filter {
+            q: Some(Box::new(q)),
+            ..super::policy::Filter::default()
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "test-kit")]
+    #[test]
+    fn a_test_engine_condition_is_parsed_or_refused() {
+        let f = test_kit::q_filter("colour==\"red\"").unwrap_or_default();
+        assert!(f.q.is_some(), "{f:?}");
+        assert_eq!(
+            f.q.map(|q| q.to_string()).as_deref(),
+            Some("colour==\"red\"")
+        );
+        assert!(test_kit::q_filter("colour==").is_err());
+    }
 
     #[test]
     fn visible_names_are_the_rules_less_pick_omit_and_omit_by_type() {

@@ -475,7 +475,30 @@ fn container_capabilities() -> Vec<Annotation> {
                 members: vec!["Minimal".into()],
             },
         ),
-        flag("BatchSupported", false),
+        // C18: the surface serves `$batch` (T-3723); Content-ID references are 501.
+        flag("BatchSupported", true),
+        Annotation::new(
+            "Capabilities.BatchSupport",
+            Expr::Record(vec![
+                ("Supported".into(), Expr::Bool(true)),
+                ("ContinueOnErrorSupported".into(), Expr::Bool(true)),
+                (
+                    "ReferencesInRequestBodiesSupported".into(),
+                    Expr::Bool(false),
+                ),
+                (
+                    "ReferencesAcrossChangeSetsSupported".into(),
+                    Expr::Bool(false),
+                ),
+                (
+                    "SupportedFormats".into(),
+                    Expr::Collection(vec![
+                        Expr::String("multipart/mixed".into()),
+                        Expr::String("application/json".into()),
+                    ]),
+                ),
+            ]),
+        ),
         flag("QuerySegmentSupported", true),
         flag("CrossJoinSupported", false),
         flag("ComputeSupported", false),

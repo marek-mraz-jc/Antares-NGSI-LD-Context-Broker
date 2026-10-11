@@ -194,15 +194,63 @@ pub fn narrow_projection(
 /// The Entity frame survives a policy pick — 5.2.4 makes `id` and `type`
 /// the Entity, and a document without them is not one — which is why the
 /// policy pick is applied to Attributes and never to the core members.
-pub fn narrow_repr(r: &mut Repr, f: &crate::policy::Filter) {
+pub fn narrow_repr(r: &mut Repr, f: &std::sync::Arc<crate::policy::Filter>) {
+    // A view or an engine answers every request with the same narrowing,
+    // and the gate hands it out as one shared `Arc`: its reach is built
+    // once and handed out again while that `Arc` comes back. The memo
+    // holds the `Arc` itself, so its address cannot be reused by another
+    // Filter while it is kept, and `ptr_eq` never answers for rules other
+    // than its own (O16).
+    type Reached = (
+        std::sync::Arc<crate::policy::Filter>,
+        Option<std::sync::Arc<PolicyReach>>,
+        Option<std::sync::Arc<crate::policy::Filter>>,
+    );
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<Reached>> = const { std::cell::RefCell::new(None) };
+    }
+    let hit = LAST.with_borrow(|last| {
+        last.as_ref()
+            .filter(|l| std::sync::Arc::ptr_eq(&l.0, f))
+            .map(|l| (l.1.clone(), l.2.clone()))
+    });
+    let (reach, rules) = hit.unwrap_or_else(|| {
+        let built = reach_of(f);
+        LAST.set(Some((f.clone(), built.0.clone(), built.1.clone())));
+        built
+    });
+    fill(r, f, reach, rules);
+}
+
+/// The reach of `f` and its expanded rules, built afresh.
+fn reach_of(
+    f: &crate::policy::Filter,
+) -> (
+    Option<std::sync::Arc<PolicyReach>>,
+    Option<std::sync::Arc<crate::policy::Filter>>,
+) {
     let rules = type_rules(f);
-    if f.q.is_some() || f.scope_q.is_some() || f.areas().next().is_some() || rules.is_some() {
-        r.policy_reach = Some(std::sync::Arc::new(PolicyReach {
-            q: f.q.as_deref().cloned(),
-            scope_q: f.scope_q.clone(),
-            areas: f.areas().cloned().collect(),
-            rules: rules.clone(),
-        }));
+    let reach =
+        (f.q.is_some() || f.scope_q.is_some() || f.areas().next().is_some() || rules.is_some())
+            .then(|| {
+                std::sync::Arc::new(PolicyReach {
+                    q: f.q.as_deref().cloned(),
+                    scope_q: f.scope_q.clone(),
+                    areas: f.areas().cloned().collect(),
+                    rules: rules.clone(),
+                })
+            });
+    (reach, rules)
+}
+
+fn fill(
+    r: &mut Repr,
+    f: &crate::policy::Filter,
+    reach: Option<std::sync::Arc<PolicyReach>>,
+    rules: Option<std::sync::Arc<crate::policy::Filter>>,
+) {
+    if reach.is_some() {
+        r.policy_reach = reach;
     }
     if !f.omit.is_empty() {
         r.policy_omit = Some(policy_nodes(&f.omit));
@@ -223,17 +271,41 @@ pub(crate) fn type_rules(
     if !f.has_rules() {
         return None;
     }
+    // The expansion is a function of the rules alone, and a view or an
+    // engine answers every request with the same ones: the last expansion
+    // is kept per thread and handed out again while its rules come back
+    // (T-3667). It is keyed by the whole input, so it never answers for
+    // rules other than its own (O16).
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(crate::policy::Filter, std::sync::Arc<crate::policy::Filter>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let hit = LAST.with_borrow(|last| {
+        last.as_ref()
+            .filter(|l| l.0.rules == f.rules && l.0.omit_by_type == f.omit_by_type)
+            .map(|l| l.1.clone())
+    });
+    if hit.is_some() {
+        return hit;
+    }
     let expand = |names: &[String]| -> Vec<String> {
         names.iter().map(|n| POLICY_CONTEXT.expand_key(n)).collect()
     };
-    Some(std::sync::Arc::new(crate::policy::Filter {
+    let expanded = std::sync::Arc::new(crate::policy::Filter {
         rules: f
             .rules
             .iter()
             .map(|r| crate::policy::Rule {
                 types: expand(&r.types),
                 attributes: expand(&r.attributes),
-                ..r.clone()
+                q: r.q.clone(),
+                scope_q: r.scope_q.clone(),
+                geo_q: r.geo_q.clone(),
+                geo_also: r.geo_also.clone(),
+                ids: r.ids.clone(),
+                id_patterns: r.id_patterns.clone(),
+                every_attribute: r.every_attribute,
+                temporal: r.temporal.clone(),
             })
             .collect(),
         omit_by_type: f
@@ -242,15 +314,22 @@ pub(crate) fn type_rules(
             .map(|(t, attrs)| (POLICY_CONTEXT.expand_key(t), expand(attrs)))
             .collect(),
         ..crate::policy::Filter::default()
-    }))
+    });
+    let key = crate::policy::Filter {
+        rules: f.rules.clone(),
+        omit_by_type: f.omit_by_type.clone(),
+        ..crate::policy::Filter::default()
+    };
+    LAST.set(Some((key, expanded.clone())));
+    Some(expanded)
 }
 
 /// What the expanded `rules` let the INTERNAL document `doc` show: every
 /// member without rules, `None` when no rule holds for it.
-pub(crate) fn shown(
-    rules: Option<&crate::policy::Filter>,
+pub(crate) fn shown<'a>(
+    rules: Option<&'a crate::policy::Filter>,
     doc: &Value,
-) -> Option<crate::policy::Shown> {
+) -> Option<crate::policy::Shown<'a>> {
     match rules {
         None => Some(crate::policy::Shown::default()),
         Some(f) => f.shown(doc, &POLICY_CONTEXT),
@@ -416,7 +495,8 @@ pub(crate) fn policy_view(doc: &Value, r: &Repr) -> Value {
 /// the Filter but builds no representation of its own.
 pub fn narrowing(f: &crate::policy::Filter) -> Repr {
     let mut r = Repr::default();
-    narrow_repr(&mut r, f);
+    let (reach, rules) = reach_of(f);
+    fill(&mut r, f, reach, rules);
     r
 }
 
@@ -2067,5 +2147,92 @@ mod clause_6_3_7 {
         let empty = to_geojson_collection(vec![], None);
         assert_eq!(empty["type"], "FeatureCollection");
         assert_eq!(empty["features"], json!([]));
+    }
+}
+
+#[cfg(test)]
+mod type_rules_memo_tests {
+    use super::type_rules;
+    use crate::policy::{Filter, Rule};
+    use std::collections::BTreeMap;
+
+    fn filter(t: &str, attr: &str) -> Filter {
+        Filter {
+            rules: vec![Rule {
+                types: vec![t.to_owned()],
+                attributes: vec![attr.to_owned()],
+                ..Rule::default()
+            }],
+            ..Filter::default()
+        }
+    }
+
+    const DEFAULT: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+
+    /// The memo answers only for the rules it was made from: alternating
+    /// filters (two views, two subjects) each get their own expansion.
+    #[test]
+    fn the_memo_answers_only_for_its_own_rules() {
+        let (car, user) = (filter("Car", "speed"), filter("User", "name"));
+        for f in [&car, &user, &car, &car, &user] {
+            let got = type_rules(f).unwrap();
+            let r = &f.rules[0];
+            assert_eq!(got.rules[0].types, vec![format!("{DEFAULT}{}", r.types[0])]);
+            assert_eq!(
+                got.rules[0].attributes,
+                vec![format!("{DEFAULT}{}", r.attributes[0])]
+            );
+        }
+        let omitting = Filter {
+            omit_by_type: BTreeMap::from([("Car".to_owned(), vec!["speed".to_owned()])]),
+            ..car.clone()
+        };
+        let got = type_rules(&omitting).unwrap();
+        assert_eq!(
+            got.omit_by_type.get(&format!("{DEFAULT}Car")),
+            Some(&vec![format!("{DEFAULT}speed")])
+        );
+        assert!(type_rules(&car).unwrap().omit_by_type.is_empty());
+        assert!(type_rules(&Filter::default()).is_none());
+    }
+
+    /// T-3697: the reach memo answers for the one `Arc` it holds. The same
+    /// `Arc` gets the same reach back; another `Arc`, even one with equal
+    /// content, or a narrowing that was dropped and rebuilt, gets its own,
+    /// so a reach never outlives the Filter it was made from.
+    #[test]
+    fn the_reach_memo_answers_only_for_its_own_arc() {
+        use std::sync::Arc;
+        let reach = |f: &Arc<Filter>| {
+            let mut r = super::Repr::default();
+            super::narrow_repr(&mut r, f);
+            r
+        };
+        let car = Arc::new(filter("Car", "speed"));
+        let user = Arc::new(filter("User", "name"));
+        let (a, b) = (reach(&car), reach(&car));
+        let (ra, rb) = (a.policy_reach.unwrap(), b.policy_reach.unwrap());
+        assert!(Arc::ptr_eq(&ra, &rb), "the same Arc reuses its reach");
+        for (f, t) in [(&user, "User"), (&car, "Car"), (&user, "User")] {
+            let got = reach(f).policy_reach.unwrap();
+            let rules = got.rules.as_ref().unwrap();
+            assert_eq!(rules.rules[0].types, vec![format!("{DEFAULT}{t}")]);
+        }
+        let twin = Arc::new(filter("Car", "speed"));
+        let own = reach(&twin).policy_reach.unwrap();
+        assert!(
+            !Arc::ptr_eq(&own, &ra),
+            "an equal Filter in another Arc builds its own"
+        );
+        assert_eq!(own.rules, ra.rules);
+        let narrowed = Arc::new(Filter {
+            q: Some(Box::new(antares_ql::parse_q("speed>1").expect("q"))),
+            ..Filter::default()
+        });
+        assert!(reach(&narrowed).policy_reach.unwrap().q.is_some());
+        let open = crate::policy::unnarrowed();
+        let none = reach(&open);
+        assert!(none.policy_reach.is_none() && none.policy_types.is_none());
+        assert!(super::narrowing(&car).policy_reach.unwrap().rules.is_some());
     }
 }

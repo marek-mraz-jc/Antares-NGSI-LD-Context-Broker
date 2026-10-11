@@ -748,7 +748,7 @@ async fn query_entities_inner(
     st: &AppState,
     params: &HashMap<String, String>,
     headers: &HeaderMap,
-    filter: &crate::policy::Filter,
+    filter: &std::sync::Arc<crate::policy::Filter>,
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     check_params(params, crate::negotiate::QUERY_PARAMS)?;
@@ -1071,6 +1071,48 @@ fn proj_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -
 /// mandatory — IS pushed: the store returns no rows and counts the match set,
 /// which is the same count the scan derives from a materialized one, without
 /// materializing 100 million documents to throw them away.
+/// The client's type selection (OR of AND groups, `None` = any type) with
+/// one of the rules' types required in every group: `(a;b)|c` under rules
+/// of `T` and `U` selects `(a;b;T)|(a;b;U)|(c;T)|(c;U)`, and a group that
+/// already names one of them stays as it is (`(a;T)` selects no more than
+/// `(a;T;U)`). `None` when the rules name no type, so a selection is never
+/// dropped into "any".
+fn judged_types<'a>(
+    client: Option<&'a [Vec<String>]>,
+    rules: &crate::policy::Filter,
+) -> Option<std::borrow::Cow<'a, [Vec<String>]>> {
+    let mut union: Vec<&String> = rules.rules.iter().flat_map(|r| &r.types).collect();
+    union.sort();
+    union.dedup();
+    if union.is_empty() {
+        return None;
+    }
+    let named = |g: &Vec<String>| g.iter().any(|t| union.contains(&t));
+    if let Some(groups) = client.filter(|c| c.iter().all(named)) {
+        return Some(std::borrow::Cow::Borrowed(groups));
+    }
+    let any = [Vec::new()];
+    Some(std::borrow::Cow::Owned(
+        client
+            .unwrap_or(&any)
+            .iter()
+            .flat_map(|g| -> Vec<Vec<String>> {
+                if named(g) {
+                    return vec![g.clone()];
+                }
+                union
+                    .iter()
+                    .map(|t| {
+                        let mut g = g.clone();
+                        g.push((*t).clone());
+                        g
+                    })
+                    .collect()
+            })
+            .collect(),
+    ))
+}
+
 fn page_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -> bool {
     fed_is_empty && !params.contains_key("idPattern") && !params.contains_key("orderBy")
 }
@@ -1198,10 +1240,10 @@ pub async fn filter_entities_paged(
     // ADR-0023 rule 11: under rules the store answers the policy's own
     // predicates over the stored Entity, and the loop below decides which
     // rules hold and evaluates the client's predicates on the Entity as it
-    // is shown, so no page and no projection is cut before that.
-    // ponytail: a scan of what the policy admits; compile the rules' OR and
-    // the shown-set predicates to SQL if it shows up
+    // is shown, so the client's page is cut in the store only where the
+    // store can judge the rules itself (`judged` below).
     let rules = narrow.and_then(|r| r.policy_types.as_deref());
+    let client_page = page;
     let page = if rules.is_some() { None } else { page };
     let proj = if rules.is_some() { None } else { proj };
     let ids: Option<Vec<&str>> = params.get("id").map(|s| s.split(',').collect());
@@ -1273,6 +1315,37 @@ pub async fn filter_entities_paged(
     } else {
         (attr_filter, None)
     };
+    let reads_shown = shown_attrs.is_some() || !shown_geos.is_empty() || shown_q.is_some();
+    // Rules that select by type alone admit exactly the Entities of their
+    // types. When the client reads nothing on the shown Entity either, the
+    // store takes those types as one more selection, and pages and counts
+    // as at the root (T-3667: a page of one read every Entity the policy
+    // admits).
+    let judged = rules
+        .filter(|f| {
+            f.rules
+                .iter()
+                .all(crate::policy::Rule::admits_by_type_alone)
+        })
+        .filter(|_| !reads_shown)
+        .and_then(|f| judged_types(type_sel.as_deref(), f));
+    let page = if judged.is_some() { client_page } else { page };
+    // Otherwise, without `count` the answer needs the matches up to the
+    // page's end and one more (whether a next page exists): the store is
+    // read in pages of its own, doubling, until that many held.
+    // ponytail: `count=true` under conditional rules still reads every
+    // Entity the policy admits; compile the rules' OR and the shown-set
+    // predicates to SQL if that shows up
+    let enough = match client_page {
+        Some((offset, limit))
+            if rules.is_some()
+                && judged.is_none()
+                && params.get("count").map(String::as_str) != Some("true") =>
+        {
+            offset.checked_add(limit).and_then(|n| n.checked_add(1))
+        }
+        _ => None,
+    };
 
     // Hand the store what it can filter on. A backend that can push
     // the predicate down (postgres/timescale) returns fewer rows — and says
@@ -1290,6 +1363,7 @@ pub async fn filter_entities_paged(
     // compile still narrow the rows.
     let geo_uncompiled = geo_specs.len() < geos.len();
     let page = if geo_uncompiled { None } else { page };
+    let enough = enough.filter(|_| !geo_uncompiled);
     let proj = proj.filter(|_| !geo_uncompiled);
     // pick (or attrs) heads to keep / whole-attr omit heads to drop; core
     // members are never SQL-dropped (only `://` IRIs qualify) — repr::apply
@@ -1318,135 +1392,168 @@ pub async fn filter_entities_paged(
     // post-merge loop below applies them instead (`decided` is already
     // false whenever `fed` is non-empty).
     let split_agg = crate::federation::split_entities(params) && !fed.is_empty();
-    let outcome = st
-        .store
-        .query_entities(
-            tenant,
-            &antares_store::filter::EntityFilter {
-                ids: ids.as_deref(),
-                // 5.2.33: id takes precedence over idPattern, so the literal
-                // narrows only when no id selector was given
-                id_literal: if ids.is_none() {
-                    params
-                        .get("idPattern")
-                        .and_then(|p| antares_store::filter::id_pattern_literal(p))
-                } else {
-                    None
-                },
-                types: type_sel.as_deref(),
-                attrs: if split_agg {
-                    None
-                } else {
-                    attr_filter.as_deref()
-                },
-                q: if split_agg { None } else { q_ast.as_ref() },
-                scope_q: if split_agg {
-                    None
-                } else {
-                    scope_q.map(String::as_str)
-                },
-                geo: if split_agg { &[] } else { &geo_specs },
-                expand: &expand,
-                ctx: Some(ctx),
-                page: page.map(|(offset, limit)| antares_store::filter::Page {
-                    offset: offset as i64,
-                    limit: limit as i64,
-                    count: params.get("count").map(String::as_str) == Some("true"),
-                }),
-                keep_attrs: keep_attrs.as_deref(),
-                drop_attrs: drop_attrs.as_deref(),
-            },
-        )
-        .await?;
-    let decided = outcome.decided && fed.is_empty() && !geo_uncompiled;
-    let paged = outcome.paged && fed.is_empty();
-    let total = outcome.total.map(|t| t as usize);
-    let rows = outcome.rows.len();
-    let all = crate::federation::merge_candidates(outcome.rows, fed);
     // the id list is client-sized (a POST query body carries an array with no
     // count of its own) and the candidate set is store-sized, so the two are
     // never multiplied together
     let id_set: Option<std::collections::HashSet<&str>> =
         ids.as_ref().map(|v| v.iter().copied().collect());
     let mut out = Vec::new();
-    for doc in all {
-        let id = doc["id"].as_str().unwrap_or("");
-        if let Some(ids) = &id_set {
-            if !decided && !ids.contains(id) {
-                continue;
-            }
-        }
-        // 5.2.33: "id takes precedence over idPattern" — the pattern only
-        // filters when no id selector was given.
-        if ids.is_none() {
-            if let Some(re) = &id_pattern {
-                // idPattern is invisible to the store — applied even when
-                // decided
-                if !re.is_match(id) {
+    let (mut paged, mut total): (bool, Option<usize>);
+    let mut rows = 0usize;
+    let mut fed_once = Some(fed);
+    // the store page under `enough`: (offset, limit), the limit doubling
+    let mut read = (0usize, enough.unwrap_or(0));
+    'scan: loop {
+        let outcome = st
+            .store
+            .query_entities(
+                tenant,
+                &antares_store::filter::EntityFilter {
+                    ids: ids.as_deref(),
+                    // 5.2.33: id takes precedence over idPattern, so the literal
+                    // narrows only when no id selector was given
+                    id_literal: if ids.is_none() {
+                        params
+                            .get("idPattern")
+                            .and_then(|p| antares_store::filter::id_pattern_literal(p))
+                    } else {
+                        None
+                    },
+                    types: judged.as_deref().or(type_sel.as_deref()),
+                    attrs: if split_agg {
+                        None
+                    } else {
+                        attr_filter.as_deref()
+                    },
+                    q: if split_agg { None } else { q_ast.as_ref() },
+                    scope_q: if split_agg {
+                        None
+                    } else {
+                        scope_q.map(String::as_str)
+                    },
+                    geo: if split_agg { &[] } else { &geo_specs },
+                    expand: &expand,
+                    ctx: Some(ctx),
+                    page: match enough {
+                        Some(_) => Some(antares_store::filter::Page {
+                            offset: read.0 as i64,
+                            limit: read.1 as i64,
+                            count: false,
+                        }),
+                        None => page.map(|(offset, limit)| antares_store::filter::Page {
+                            offset: offset as i64,
+                            limit: limit as i64,
+                            count: params.get("count").map(String::as_str) == Some("true"),
+                        }),
+                    },
+                    keep_attrs: keep_attrs.as_deref(),
+                    drop_attrs: drop_attrs.as_deref(),
+                },
+            )
+            .await?;
+        let fed = fed_once.take().unwrap_or_default();
+        let store_paged = outcome.paged;
+        let decided = outcome.decided && fed.is_empty() && !geo_uncompiled;
+        paged = store_paged && fed.is_empty() && enough.is_none();
+        total = outcome.total.map(|t| t as usize);
+        let got = outcome.rows.len();
+        rows = rows.saturating_add(got);
+        let all = crate::federation::merge_candidates(outcome.rows, fed);
+        for doc in all {
+            let id = doc["id"].as_str().unwrap_or("");
+            if let Some(ids) = &id_set {
+                if !decided && !ids.contains(id) {
                     continue;
                 }
             }
-        }
-        if !decided {
-            if let Some(sel) = &type_sel {
-                let etypes: Vec<&str> = doc["type"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(Value::as_str).collect())
-                    .unwrap_or_default();
-                let matched = sel
-                    .iter()
-                    .any(|and_group| and_group.iter().all(|w| etypes.contains(&w.as_str())));
-                if !matched {
-                    continue;
+            // 5.2.33: "id takes precedence over idPattern" — the pattern only
+            // filters when no id selector was given.
+            if ids.is_none() {
+                if let Some(re) = &id_pattern {
+                    // idPattern is invisible to the store — applied even when
+                    // decided
+                    if !re.is_match(id) {
+                        continue;
+                    }
                 }
             }
-            if let Some(attrs) = &attr_filter {
-                if !attrs.iter().any(|a| doc.get(a).is_some()) {
-                    continue;
+            if !decided {
+                if let Some(sel) = &type_sel {
+                    let etypes: Vec<&str> = doc["type"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    let matched = sel
+                        .iter()
+                        .any(|and_group| and_group.iter().all(|w| etypes.contains(&w.as_str())));
+                    if !matched {
+                        continue;
+                    }
                 }
-            }
-            if let Some(ast) = &q_ast {
-                // 4.9 linked-entity subqueries (attr{path}) resolve through
-                // the local store, same tenant, under the caller's narrowing
-                let narrow = narrow.map(|r| (r, ctx));
-                if !crate::notify::linked_eval(st, tenant, narrow, |l| eval_q(ast, &doc, ctx, l))
+                if let Some(attrs) = &attr_filter {
+                    if !attrs.iter().any(|a| doc.get(a).is_some()) {
+                        continue;
+                    }
+                }
+                if let Some(ast) = &q_ast {
+                    // 4.9 linked-entity subqueries (attr{path}) resolve through
+                    // the local store, same tenant, under the caller's narrowing
+                    let narrow = narrow.map(|r| (r, ctx));
+                    if !crate::notify::linked_eval(st, tenant, narrow, |l| {
+                        eval_q(ast, &doc, ctx, l)
+                    })
                     .await
-                {
+                    {
+                        continue;
+                    }
+                }
+                if let Some(sq) = scope_q {
+                    if !crate::scope_matches(sq, &doc) {
+                        continue;
+                    }
+                }
+                if !geos.iter().all(|g| g.matches(&doc, ctx)) {
                     continue;
                 }
             }
-            if let Some(sq) = scope_q {
-                if !crate::scope_matches(sq, &doc) {
+            if let (Some(rules), Some(r)) = (rules, narrow) {
+                if !rules.admits(&doc, crate::repr::policy_context()) {
                     continue;
                 }
+                // the Entity as shown is built only for a client predicate
+                // that reads it
+                if reads_shown {
+                    let view = crate::repr::policy_view(&doc, r);
+                    if let Some(attrs) = &shown_attrs {
+                        if !attrs.iter().any(|a| view.get(a).is_some()) {
+                            continue;
+                        }
+                    }
+                    if !shown_geos.iter().all(|g| g.matches(&view, ctx)) {
+                        continue;
+                    }
+                    if let Some(ast) = shown_q {
+                        let narrow = narrow.map(|r| (r, ctx));
+                        if !crate::notify::linked_eval(st, tenant, narrow, |l| {
+                            eval_q(ast, &view, ctx, l)
+                        })
+                        .await
+                        {
+                            continue;
+                        }
+                    }
+                }
             }
-            if !geos.iter().all(|g| g.matches(&doc, ctx)) {
-                continue;
+            out.push(doc);
+            if enough.is_some_and(|n| out.len() >= n) {
+                break 'scan;
             }
         }
-        if let (Some(rules), Some(r)) = (rules, narrow) {
-            if crate::repr::shown(Some(rules), &doc).is_none() {
-                continue;
-            }
-            let view = crate::repr::policy_view(&doc, r);
-            if let Some(attrs) = &shown_attrs {
-                if !attrs.iter().any(|a| view.get(a).is_some()) {
-                    continue;
-                }
-            }
-            if !shown_geos.iter().all(|g| g.matches(&view, ctx)) {
-                continue;
-            }
-            if let Some(ast) = shown_q {
-                let narrow = narrow.map(|r| (r, ctx));
-                if !crate::notify::linked_eval(st, tenant, narrow, |l| eval_q(ast, &view, ctx, l))
-                    .await
-                {
-                    continue;
-                }
-            }
+        // a store that could not page answered with every row it holds
+        if enough.is_none() || !store_paged || got < read.1 {
+            break;
         }
-        out.push(doc);
+        read = (read.0.saturating_add(got), read.1.saturating_mul(2));
     }
     Ok(Filtered {
         docs: out,
@@ -4012,5 +4119,61 @@ mod clause_4_8_system_attributes {
                 "{method} {path} let the client stamp the document: {served}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod judged_types_tests {
+    use super::judged_types;
+    use crate::policy::{Filter, Rule};
+    use std::borrow::Cow;
+
+    fn rules(types: &[&[&str]]) -> Filter {
+        Filter {
+            rules: types
+                .iter()
+                .map(|t| Rule {
+                    types: t.iter().map(|s| (*s).to_owned()).collect(),
+                    ..Rule::default()
+                })
+                .collect(),
+            ..Filter::default()
+        }
+    }
+
+    fn sel(groups: &[&[&str]]) -> Vec<Vec<String>> {
+        groups
+            .iter()
+            .map(|g| g.iter().map(|s| (*s).to_owned()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_selection_naming_a_rule_type_in_every_group_is_kept_as_is() {
+        let client = sel(&[&["a", "T"], &["U"]]);
+        let got = judged_types(Some(&client), &rules(&[&["T"], &["U"]]));
+        assert!(matches!(got, Some(Cow::Borrowed(g)) if g == client.as_slice()));
+    }
+
+    #[test]
+    fn a_group_naming_no_rule_type_takes_each_in_turn() {
+        let client = sel(&[&["a", "b"], &["T"]]);
+        let got = judged_types(Some(&client), &rules(&[&["U", "T"], &["T"]]));
+        assert_eq!(
+            got.as_deref(),
+            Some(sel(&[&["a", "b", "T"], &["a", "b", "U"], &["T"]]).as_slice())
+        );
+    }
+
+    #[test]
+    fn no_client_selection_selects_the_rule_types() {
+        let got = judged_types(None, &rules(&[&["T"], &["U"]]));
+        assert_eq!(got.as_deref(), Some(sel(&[&["T"], &["U"]]).as_slice()));
+    }
+
+    #[test]
+    fn rules_without_types_judge_nothing() {
+        assert!(judged_types(None, &rules(&[&[]])).is_none());
+        assert!(judged_types(Some(&sel(&[&["a"]])), &Filter::default()).is_none());
     }
 }

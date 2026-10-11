@@ -14,6 +14,12 @@ Usage:
                                        run's tp-status.csv (a green run, or a
                                        `robot --dryrun` folded by etsi-report)
 
+  etsi-baseline.py compare <vanilla> <full>
+                                       the same TPs ran in both runs with the
+                                       same verdict (T-3675: the IOP suite on
+                                       the all-features build answers as the
+                                       vanilla build of the same commit does)
+
 check exits nonzero naming every TP that failed or did not run; a TP that
 ran and is not in the baseline prints "ratchet: update baseline" and passes.
 A cell named in MQTT_OFF runs with MQTT=0 (dev/etsi-pipeline.sh forces it for
@@ -77,6 +83,23 @@ def check(cells_dir):
     return 1 if red else 0
 
 
+def compare(vanilla_dir, full_dir):
+    """Every TP whose verdict differs between the two runs, or that ran in
+    one only, is named and fails. An empty run fails too: two runs that
+    executed nothing agree, and say nothing."""
+    vanilla, full = run_of(vanilla_dir), run_of(full_dir)
+    red = [f"{d}: no TP ran (tp-status.csv missing or empty)" for d, r in ((vanilla_dir, vanilla), (full_dir, full)) if not r]
+    if not red:
+        for k in sorted(vanilla.keys() | full.keys()):
+            a, b = vanilla.get(k, "did not run"), full.get(k, "did not run")
+            if a != b:
+                red.append(f"vanilla {a}, full {b}: {k}")
+        print(f"{len(vanilla)} TPs vanilla, {len(full)} full, {len(red)} differ")
+    for line in red:
+        print(line)
+    return 1 if red else 0
+
+
 def write(results_dir):
     rows = rows_of(results_dir)
     if not rows:
@@ -112,6 +135,8 @@ def write(results_dir):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["compare"] and len(sys.argv) == 4:
+        sys.exit(compare(sys.argv[2], sys.argv[3]))
     if len(sys.argv) != 3 or sys.argv[1] not in ("check", "write"):
         sys.exit(__doc__)
     sys.exit((check if sys.argv[1] == "check" else write)(sys.argv[2]))

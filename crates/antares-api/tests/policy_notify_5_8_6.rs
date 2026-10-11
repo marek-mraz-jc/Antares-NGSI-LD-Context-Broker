@@ -198,6 +198,13 @@ async fn stored_sub(st: &AppState) -> Value {
 
 const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a test listens for a notification that may or must not come:
+/// 1.5 s, stretched under a sanitizer, whose slowdown once held an allowed
+/// joined notification past a flat 1.5 s (strict TSan, T-3706).
+fn listen() -> std::time::Duration {
+    std::time::Duration::from_millis(1500 * antares_api::state::slow_factor())
+}
+
 /// 5.11.7 increments `timesSent` for a notification that "shall be sent",
 /// and Table 5.2.14.2-1 defines it as the number of times the notification
 /// HAS BEEN sent. A dropped one never was: no POST, no stamp, no count —
@@ -210,9 +217,7 @@ async fn a_dropped_notification_is_no_attempt_at_all() {
     fire(&st, "urn:ngsi-ld:Vehicle:dropped").await;
 
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(listen(), rx.recv()).await.is_err(),
         "a dropped notification was delivered anyway"
     );
     let n = stored_sub(&st).await;
@@ -342,9 +347,7 @@ async fn a_notification_filter_that_carries_a_query_is_dropped() {
     fire(&st, "urn:ngsi-ld:Vehicle:qfilter").await;
 
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(listen(), rx.recv()).await.is_err(),
         "a narrowing the broker cannot apply was reported as applied"
     );
     let n = stored_sub(&st).await;
@@ -502,7 +505,7 @@ async fn a_joined_notification_does_not_carry_a_target_the_narrowing_hides() {
         )
         .await;
         assert_eq!(code, StatusCode::CREATED, "{body}");
-        let got = tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv()).await;
+        let got = tokio::time::timeout(listen(), rx.recv()).await;
         match got {
             Ok(Some(n)) => {
                 assert!(delivered, "a narrowed join was delivered: {n}");
@@ -569,7 +572,7 @@ async fn a_linked_condition_under_a_projecting_narrowing_is_not_an_oracle() {
         )
         .await;
         assert_eq!(code, StatusCode::CREATED, "{body}");
-        let got = tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv()).await;
+        let got = tokio::time::timeout(listen(), rx.recv()).await;
         match got {
             Ok(Some(n)) => assert!(delivered, "the hidden salary decided a notification: {n}"),
             _ => assert!(!delivered, "the allowed linked condition never notified"),

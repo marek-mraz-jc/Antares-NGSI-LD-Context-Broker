@@ -16,7 +16,8 @@
 ///
 /// The named members go into the [`policy::Operation`]; every other member
 /// keeps the empty default of `Operation::new`. The awaited value is the
-/// `Filter` the engine narrowed the operation to, or the refusal that
+/// `Filter` the engine narrowed the operation to, shared (`Arc`) so a
+/// view's compiled narrowing reaches the handler uncopied, or the refusal that
 /// becomes a 403. It is a macro because a gate reads as one line at the
 /// call site and the alternative is the same eight lines in every handler.
 ///
@@ -28,7 +29,7 @@ macro_rules! gate {
     ($st:expr, $tenant:expr, $headers:expr, $clause:expr $(, $field:ident: $value:expr)* $(,)?) => {
         async {
             let answer = match &$st.policy {
-                None => Ok($crate::policy::Filter::default()),
+                None => Ok($crate::policy::unnarrowed()),
                 Some(engine) => {
                     $crate::policy::gate(
                         engine.as_ref(),
@@ -40,6 +41,7 @@ macro_rules! gate {
                         },
                     )
                     .await
+                    .map(std::sync::Arc::new)
                 }
             };
             // A state served through an endpoint view adds the view's
@@ -93,6 +95,7 @@ pub use antares_notifier::DeliveryPolicy;
 pub use antares_notifier::{
     build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
 };
+pub use contexts::public_base;
 pub use federation::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 pub use state::{AppState, TemporalRecord};
 
@@ -503,7 +506,100 @@ pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
     ]
 }
 
+/// The broker's whole HTTP surface, under trailing-slash normalization: every
+/// host of it (the binary, the browser build, an in-process forward, a test)
+/// serves `/entities/{id}/attrs/` as `/entities/{id}/attrs`, the form 5.6.2
+/// and 5.6.3 forwards are sent in (T-3701).
 pub fn router(state: AppState) -> Router {
+    let served = routes(state);
+    Router::new().fallback_service(tower::util::MapRequest::new(
+        served,
+        trim_trailing_slash::<axum::body::Body>,
+    ))
+}
+
+/// tower-http's `NormalizePath::trim_trailing_slash`, except below a view's
+/// OData service (`/x/views/{view}/odata/`): OData 4.01 Part 2 section 4 has
+/// no empty path segment, so `Products/` is a malformed URL there and not a
+/// spelling of `Products` (T-3731), and the path reaches the OData parser as
+/// sent. Anywhere else, trailing slashes and a leading `//` collapse to one
+/// path, `/` alone for a path of slashes.
+pub fn trim_trailing_slash<B>(mut req: axum::http::Request<B>) -> axum::http::Request<B> {
+    let path = req.uri().path();
+    if !path.ends_with('/') && !path.starts_with("//") {
+        return req;
+    }
+    let below_odata = path
+        .strip_prefix(surface::VIEW_ROOT)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, rest)| rest.starts_with("odata/"));
+    if below_odata {
+        return req;
+    }
+    let trimmed = format!("/{}", path.trim_matches('/'));
+    let path_and_query = match req.uri().query() {
+        Some(query) => format!("{trimmed}?{query}"),
+        None => trimmed,
+    };
+    let mut parts = req.uri().clone().into_parts();
+    // A path cut from a valid one stays valid; were it ever not, the request
+    // goes on as sent rather than failing here.
+    if let Ok(pq) = path_and_query.parse() {
+        parts.path_and_query = Some(pq);
+        if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+            *req.uri_mut() = uri;
+        }
+    }
+    req
+}
+
+#[cfg(test)]
+mod trim_trailing_slash_tests {
+    use super::trim_trailing_slash;
+
+    fn trimmed(uri: &str) -> String {
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(())
+            .unwrap_or_default();
+        trim_trailing_slash(req).uri().to_string()
+    }
+
+    /// The NGSI-LD API and every other surface: tower-http's trim, the query
+    /// kept. A view's OData service: as sent (T-3731).
+    #[test]
+    fn trims_everywhere_but_a_views_odata_service() {
+        for (sent, served) in [
+            ("/ngsi-ld/v1/entities/", "/ngsi-ld/v1/entities"),
+            (
+                "/ngsi-ld/v1/entities//?type=Car",
+                "/ngsi-ld/v1/entities?type=Car",
+            ),
+            ("//ngsi-ld/v1/entities", "/ngsi-ld/v1/entities"),
+            ("/", "/"),
+            ("///", "/"),
+            ("/x/views/", "/x/views"),
+            ("/x/views/a/", "/x/views/a"),
+            (
+                "/x/views/a/ngsi-ld/v1/entities/",
+                "/x/views/a/ngsi-ld/v1/entities",
+            ),
+            ("/x/views/a/odata", "/x/views/a/odata"),
+            ("/x/views/a/odata/v4/", "/x/views/a/odata/v4/"),
+            ("/x/views/a/odata/v4/Car/", "/x/views/a/odata/v4/Car/"),
+            (
+                "/x/views/a/odata/v4/Car//?$top=1",
+                "/x/views/a/odata/v4/Car//?$top=1",
+            ),
+            ("/q/views/odata/", "/q/views/odata"),
+        ] {
+            assert_eq!(trimmed(sent), served, "{sent}");
+        }
+    }
+}
+
+fn routes(state: AppState) -> Router {
     let api = api_routes()
         .into_iter()
         .fold(Router::new(), |api, (path, methods)| {

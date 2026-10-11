@@ -514,6 +514,14 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("example", || {
         Box::new(antares_plugin_example::ExampleSurface)
     }),
+    // The joinedcontext engine's access surface reads the table the
+    // engine of this process decides with (addon README section 4).
+    #[cfg(all(feature = "jc-policy", feature = "views"))]
+    (joinedcontext_policy::surface::NAME, || {
+        antares_ops::mount(joinedcontext_policy::surface::Access::new(
+            joinedcontext_policy::JoinedcontextPolicy::process(),
+        ))
+    }),
 ];
 
 /// ANTARES_API_SURFACES → the surfaces mounted beside the NGSI-LD API,
@@ -567,6 +575,10 @@ const POLICY_SHELF: &[(&str, PolicyCtor)] = &[
     #[cfg(feature = "plugin-example")]
     (antares_plugin_example::POLICY_NAME, || {
         std::sync::Arc::new(antares_plugin_example::ExamplePolicy::from_env())
+    }),
+    #[cfg(feature = "jc-policy")]
+    (joinedcontext_policy::POLICY_NAME, || {
+        joinedcontext_policy::JoinedcontextPolicy::process()
     }),
 ];
 
@@ -1135,10 +1147,7 @@ async fn run(
     } else {
         antares_api::ops_router(state)
     };
-    let app = tower::Layer::layer(
-        &tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash(),
-        routed,
-    );
+    let app: App = tower::util::MapRequest::new(routed, antares_api::trim_trailing_slash);
 
     // A connection that never finishes its request headers must not hold a
     // slot forever; hyper closes it after this timeout.
@@ -1294,8 +1303,10 @@ fn accept_backoff(e: &std::io::Error) -> bool {
     )
 }
 
-/// The served app: the router under trailing-slash normalization.
-type App = tower_http::normalize_path::NormalizePath<axum::Router>;
+/// The served app: the router under trailing-slash normalization, which
+/// leaves a view's OData paths as sent (T-3731).
+type App =
+    tower::util::MapRequest<axum::Router, fn(axum::extract::Request) -> axum::extract::Request>;
 
 /// One accepted connection. Split out of the accept loop so the drain's
 /// notice window serves connections with identical behaviour, and so the
@@ -1796,6 +1807,16 @@ mod api_surface_tests {
         }
     }
 
+    /// `full` is every surface in one binary (T-3636): the platform image
+    /// selects them all by name.
+    #[cfg(feature = "full")]
+    #[test]
+    fn the_full_build_shelves_every_surface() {
+        let names = "admin,views,mcp,odata,ws,ws-views";
+        let picked = api_surfaces(Some(names)).expect("every surface is on the shelf");
+        assert_eq!(picked.len(), names.split(',').count());
+    }
+
     /// Rule M3, the route half (surfaces-threat-model 9.5 item 4): with no
     /// surface feature the shelf is the admin surface alone, and a path of
     /// every surface prefix (ADR-0023 to ADR-0027) is unrouted. A surface
@@ -1850,7 +1871,7 @@ mod policy_shelf_tests {
     /// against it. A release build carries no other — an engine reaches the
     /// shelf only through an off-by-default feature, so this assertion is
     /// what "no addon in the shipped build" means for the policy seam.
-    #[cfg(not(feature = "plugin-example"))]
+    #[cfg(not(any(feature = "plugin-example", feature = "jc-policy")))]
     #[test]
     fn the_shipped_build_carries_only_the_built_in_engine() {
         assert_eq!(shelf(), vec!["allow-all"]);
@@ -1898,6 +1919,53 @@ mod policy_shelf_tests {
                 .is_some(),
             "an engine selected without rules would otherwise allow everything"
         );
+    }
+
+    /// The access surface is on the shelf beside the platform's engine, and
+    /// both are the one engine of the process: what the surface shows is
+    /// the table the broker decides with (T-3638).
+    #[cfg(all(feature = "jc-policy", feature = "views"))]
+    #[test]
+    fn the_access_surface_reads_the_engine_the_broker_decides_with() {
+        let picked = api_surfaces(Some("admin,views,access")).expect("access is on the shelf");
+        let access = picked[2].1();
+        assert_eq!(access.name(), "access");
+        assert_eq!(access.prefix(), "/x/views");
+        let (_, build) = policy_engine(Some(joinedcontext_policy::POLICY_NAME)).expect("engine");
+        let engine = build();
+        let shared = joinedcontext_policy::JoinedcontextPolicy::process();
+        engine
+            .load("t3638", &serde_json::json!({"policies": []}))
+            .expect("an empty document loads");
+        assert!(
+            shared.table("t3638").is_some(),
+            "the surface's engine saw the load"
+        );
+        engine
+            .load("t3638", &serde_json::Value::Null)
+            .expect("a removal");
+        assert!(shared.table("t3638").is_none());
+    }
+
+    /// The platform's engine is selected by name, and with no document
+    /// loaded it denies a platform caller (T-3637).
+    #[cfg(feature = "jc-policy")]
+    #[tokio::test]
+    async fn the_platform_engine_is_on_the_shelf_and_fails_closed() {
+        let name = joinedcontext_policy::POLICY_NAME;
+        let (selected, build) = policy_engine(Some(name)).expect("selection");
+        assert_eq!(selected, name);
+        let engine = build();
+        assert!(engine.loads_documents());
+        let subject = antares_api::policy::Subject {
+            tenant: antares_model::TenantId::default(),
+            headers: vec![("x-jc-subject".into(), "ana".into())],
+        };
+        let op = antares_api::policy::Operation::new("5.7.2");
+        assert!(matches!(
+            engine.decide(&subject, &op).await,
+            antares_api::policy::Decision::Deny(_)
+        ));
     }
 }
 

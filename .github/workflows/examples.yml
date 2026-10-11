@@ -32,6 +32,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # The platform's engine is the other addon (T-3637): its contract
+      # tests through the router, and its place on the broker's shelf.
+      - name: The joinedcontext policy engine
+        run: |
+          cargo test --locked -p joinedcontext-policy
+          cargo test --locked -p antares-broker --features jc-policy --bin antares policy_shelf
+
       - name: Build the broker on the plugin driver
         run: cargo build --locked -p antares-broker --features plugin-example
 

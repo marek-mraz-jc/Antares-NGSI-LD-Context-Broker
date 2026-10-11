@@ -43,7 +43,7 @@ broker nor a storage backend (`antares-api`, `antares-broker`,
 | `antares-model` | 1 370 | CIM 009 types verbatim (`Entity`, `NgsiError` = Table 6.3.2-1), publishable | depend on anything Antares |
 | `antares-ql` | 5 600 | `q=`, `scopeQ`, `geoQ` parsers → typed AST; the in-memory evaluator (`eval`) | know HTTP or SQL |
 | `antares-jsonld` | 9 040 | `@context` loader with caches and pinned core contexts, expansion/compaction, structural validation, the one outbound `client_builder` | do business logic |
-| `antares-matcher` | 432 | subscription vs entity: selector, conditions, activity, throttling | touch a store |
+| `antares-matcher` | 480 | subscription vs entity: selector, conditions, activity, throttling | touch a store |
 | `antares-store` | 3 000 | `CurrentStateDriver`, `TemporalDriver` (object-safe, `lib.rs:140`, `:385`), `Kind`, filters/paging (`filter.rs`) | pull a backend |
 | `antares-sql` | 10 600 | AST → SQL compiler (`compile/`), migrations, the sqlx drivers (`store/pg/`), the memory/redb drivers (`store/mem/`), `AnyStore` facade (`store/any.rs`) | be called from handlers directly (see §7) |
 | `antares-bus` | 848 | `ChangeEvent`, the JetStream bus, subjects, core request/reply | decide who consumes |
@@ -97,7 +97,7 @@ module's header comment.
 | `bounds.rs` | 718 | every cap: body, URI, JSON depth, batch, fan-out, in-flight, regex program size, and the notification pipeline's queue depth and delivery widths; all reported by `/q/health`, which a test over this module's own source keeps true |
 | `egress.rs` | 470 | SSRF wall and per-destination circuit breakers for notifications, forwards, `@context` fetches |
 | `surface.rs` | 115 | `ApiSurface`: HTTP surfaces mounted beside the API root, on the reserved prefixes `/q` and `/x` |
-| `policy.rs` | 2 750 | the policy seam (ADR-0020): `PolicyEngine`, `Subject`/`Operation`/`Decision`/`Filter` (per-rule allowlists, ADR-0023 rule 11), the `Condition` an `AllowIf` holds a write by id to inside the store (gap G12), the built-in `AllowAll` engine, the clauses a narrowing can reach and the refusal everywhere else, the fail-closed calls that deny on a panic or a timeout, and the stored subject a notification is decided under |
+| `policy.rs` | 3 050 | the policy seam (ADR-0020): `PolicyEngine`, `Subject`/`Operation`/`Decision`/`Filter` (per-rule allowlists, ADR-0023 rule 11), the `Condition` an `AllowIf` holds a write by id to inside the store (gap G12), the built-in `AllowAll` engine, the clauses a narrowing can reach and the refusal everywhere else, the fail-closed calls that deny on a panic or a timeout, and the stored subject a notification is decided under |
 | `state.rs` | 1 300 | `AppState`: store, bus flag, mirror, HTTP clients, delivery policy, sinks, surfaces, hooks, the forward transport, and the endpoint view a state is narrowed to (feature `views`), and the task-local @context a surface calls in (`call_in_context`) |
 | `fuzzing.rs` | 84 | the request parsers the `fuzz/` targets drive, behind the `fuzzing` feature that no broker build enables (T-3463) |
 | `views.rs` | 1 500 | feature `views` (ADR-0023, ADR-0027 section 5): `CompiledView` and the composition `gate!` applies after the engine answers, effective = view ∧ engine, neither side widening, rule pairs keeping both id narrowings (G2); `WriteGuard`, rule 7 checked inside the store's read-modify-write; the `ViewTable` a pod serves from (views and each Tenant's schema bytes with their revision) and the `Kind::View` documents under `antares-views`; never in a vanilla build |
