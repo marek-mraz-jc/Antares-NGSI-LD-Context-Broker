@@ -162,8 +162,19 @@ pub fn with_view(
         // still refuses a narrowed write, as it does without a view.
         return match resolve(clause, Decision::Filter(engine?)) {
             Decision::Deny(why) => Err(Denied(why)),
+            // 5.8.4 lists the view's own and keeps the engine's selection
+            // among them (T-3673)
+            Decision::Filter(f) if crate::policy::RECORD_LISTS.contains(&clause) => Ok(f),
             _ => Ok(Filter::default()),
         };
+    }
+    if crate::policy::RECORD_LISTS.contains(&clause) && !view.narrowing().is_empty() {
+        // The view narrows Entities; read over a Registration or a
+        // Context Source Subscription it would select records by what an
+        // Entity carries. Refused, as before those lists took a narrowing.
+        return Err(Denied(format!(
+            "{clause} lists records an Entity view cannot narrow"
+        )));
     }
     let composed = compose(view.narrowing(), engine?)?;
     match resolve(clause, Decision::Filter(composed)) {
@@ -905,6 +916,45 @@ mod tests {
             with_view(Some(&view), "5.13.4", Ok(Filter::default())).is_err(),
             "serving a stored @context is refused under a view"
         );
+    }
+
+    /// T-3673: Query Subscriptions keeps the engine's selection among the
+    /// view's own; the Registration and CSR Subscription lists are not
+    /// narrowed by an Entity view at all.
+    #[test]
+    fn a_record_list_under_a_view_keeps_the_engines_selection_or_is_refused() {
+        let view = cars();
+        let mine = Filter {
+            q: Some(Box::new(
+                antares_ql::parse_q("subject==\"alice\"").expect("q"),
+            )),
+            ..Filter::default()
+        };
+        assert_eq!(
+            with_view(Some(&view), "5.8.4", Ok(mine.clone())),
+            Ok(mine.clone())
+        );
+        assert_eq!(
+            with_view(Some(&view), "5.8.4", Ok(Filter::default())),
+            Ok(Filter::default())
+        );
+        // a view that only selects, so nothing projects and only the rule
+        // above refuses
+        let fast = CompiledView::new(
+            &["Car".into()],
+            Some(antares_ql::parse_q("speed>50").expect("q")),
+            None,
+            None,
+            vec![rule(&["Car"], None, &[])],
+        )
+        .expect("view");
+        assert!(!fast.narrowing().projects());
+        for v in [&view, &fast] {
+            for clause in ["5.10.2", "5.11.5"] {
+                assert!(with_view(Some(v), clause, Ok(Filter::default())).is_err());
+                assert!(with_view(Some(v), clause, Ok(mine.clone())).is_err());
+            }
+        }
     }
 
     /// Cars only, showing `speed` and `colour`, never `secret`.

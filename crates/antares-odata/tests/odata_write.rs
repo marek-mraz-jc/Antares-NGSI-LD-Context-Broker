@@ -13,6 +13,10 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 use writes::{city, odata, send, stored, CITY, ROOT};
 
+/// The base a request without `Host` is answered under (no
+/// `ANTARES_PUBLIC_URL` in tests): the entity id is absolute.
+const PUBLIC: &str = "http://localhost:9090";
+
 #[tokio::test(flavor = "multi_thread")]
 async fn odata_writes_an_entity_through_its_view() {
     let (_b, app) = city().await.expect("broker");
@@ -101,7 +105,7 @@ async fn odata_writes_an_entity_through_its_view() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert_eq!(
         resp.headers()["OData-EntityId"],
-        format!("{ROOT}/Car('urn:ngsi-ld:Car:9')").as_str()
+        format!("{PUBLIC}{ROOT}/Car('urn:ngsi-ld:Car:9')").as_str()
     );
     assert_eq!(resp.headers()["Location"], resp.headers()["OData-EntityId"]);
 }
