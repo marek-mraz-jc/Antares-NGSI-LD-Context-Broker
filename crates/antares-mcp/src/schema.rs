@@ -138,7 +138,7 @@ fn is_attr_name(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || "_-.:/#".contains(c))
 }
 
-fn is_entity_id(s: &str) -> bool {
+pub(crate) fn is_entity_id(s: &str) -> bool {
     s.len() <= 512
         && s.strip_prefix("urn:ngsi-ld:")
             .is_some_and(|rest| !rest.is_empty() && !rest.chars().any(char::is_whitespace))

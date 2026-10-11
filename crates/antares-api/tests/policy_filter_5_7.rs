@@ -1585,3 +1585,174 @@ async fn an_engine_q_past_its_share_is_refused_whatever_the_caller_asks() {
         );
     }
 }
+
+/// The `q` parameter of a request line, percent-decoded.
+fn forwarded_q(request: &str) -> Option<String> {
+    let target = request.split_whitespace().nth(1)?;
+    let query = target.split_once('?')?.1;
+    let raw = query.split('&').find_map(|kv| kv.strip_prefix("q="))?;
+    let mut out = Vec::new();
+    let mut bytes = raw.bytes();
+    while let Some(b) = bytes.next() {
+        match b {
+            b'%' => {
+                let hex: String = bytes.by_ref().take(2).map(char::from).collect();
+                out.push(u8::from_str_radix(&hex, 16).ok()?);
+            }
+            b'+' => out.push(b' '),
+            b => out.push(b),
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// A peer with Antares's own `q` caps (threat V23 across federation,
+/// T-3621): it answers 400 TooComplexQuery to a forwarded `q` its strict
+/// parser refuses, else one Entity both the caller's `q` and the engine's
+/// select. Returns its port and the `q`s it was asked.
+fn strict_peer() -> (u16, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let seen: Arc<std::sync::Mutex<Vec<Option<String>>>> = Arc::default();
+    let recorder = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut request = Vec::new();
+            let mut buf = [0u8; 8192];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            let temporal = request.contains("/temporal/entities");
+            let q = forwarded_q(&request);
+            let refused = q
+                .as_deref()
+                .is_some_and(|q| antares_ql::parse_q(q).is_err());
+            if let Ok(mut v) = recorder.lock() {
+                v.push(q);
+            }
+            let (status, body) = if refused {
+                (
+                    "400 Bad Request",
+                    json!({
+                        "type": "https://uri.etsi.org/ngsi-ld/errors/TooComplexQuery",
+                        "title": "q expression exceeds 512 nodes",
+                    }),
+                )
+            } else if temporal {
+                let at = "2026-01-01T00:00:00Z";
+                (
+                    "200 OK",
+                    json!([{
+                        "id": "urn:ngsi-ld:Vehicle:remote",
+                        "type": "Vehicle",
+                        "a": [{"type": "Property", "value": 1, "observedAt": at}],
+                        "speed": [{"type": "Property", "value": 30, "observedAt": at}],
+                    }]),
+                )
+            } else {
+                (
+                    "200 OK",
+                    json!([{
+                        "id": "urn:ngsi-ld:Vehicle:remote",
+                        "type": "Vehicle",
+                        "a": {"type": "Property", "value": 1},
+                        "speed": {"type": "Property", "value": 30},
+                    }]),
+                )
+            };
+            let body = body.to_string();
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s.write_all(reply.as_bytes());
+        }
+    });
+    (port, seen)
+}
+
+/// T-3621, threat V23 across federation: a caller `q` under the cap,
+/// conjoined with the engine's, would be refused by a peer that counts the
+/// forwarded `q` with its own strict caps. The caller would then see a
+/// warning and a missing Entity it sees with no engine, which tells it the
+/// engine's predicate is there and how large. The answer through the
+/// engine is the answer without it: the peer's Entity, no warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_narrowed_q_past_a_peers_cap_answers_as_the_callers_q_alone() {
+    let (port, seen) = strict_peer();
+    let open = state(Filter::default()).await;
+    let narrowed = state(slow()).await;
+    for st in [&open, &narrowed] {
+        let (code, doc) = send(
+            st,
+            "POST",
+            "/ngsi-ld/v1/csourceRegistrations",
+            Some(json!({
+                "id": "urn:ngsi-ld:ContextSourceRegistration:strict-peer",
+                "type": "ContextSourceRegistration",
+                "mode": "inclusive",
+                "operations": ["queryEntity", "queryTemporal"],
+                "information": [{"entities": [{"type": "Vehicle"}]}],
+                "endpoint": format!("http://127.0.0.1:{port}"),
+            })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{doc}");
+    }
+    let q = vec!["a==1"; antares_ql::MAX_Q_NODES - 1].join("|");
+    for uri in [
+        format!("/ngsi-ld/v1/entities?type=Vehicle&q={}", enc(&q)),
+        format!(
+            "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after&timeAt=1970-01-01T00:00:00Z&q={}",
+            enc(&q)
+        ),
+    ] {
+        same_answer_through_the_engine(&open, &narrowed, &uri).await;
+    }
+    // the forwards: the caller's own q with no engine; through the engine
+    // nothing the peer refuses
+    let asked: Vec<Option<String>> = seen.lock().unwrap().drain(..).collect();
+    assert_eq!(asked.len(), 4, "every read reached the peer: {asked:?}");
+    assert!(
+        asked
+            .iter()
+            .all(|q| q.as_deref().is_none_or(|q| antares_ql::parse_q(q).is_ok())),
+        "a forward the peer refuses"
+    );
+}
+
+async fn same_answer_through_the_engine(open: &AppState, narrowed: &AppState, uri: &str) {
+    let path = uri.split('?').next().unwrap_or(uri);
+    let read = |st: &AppState| {
+        let st = st.clone();
+        let uri = uri.to_owned();
+        async move {
+            let res = antares_api::router(st)
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let warning = res.headers().get("ngsild-warning").cloned();
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            let list: Value = serde_json::from_slice(&body).unwrap();
+            (ids(&list), warning)
+        }
+    };
+    let want = read(open).await;
+    assert_eq!(
+        want,
+        (vec!["urn:ngsi-ld:Vehicle:remote".to_owned()], None),
+        "{path}: with no engine the peer serves the caller's q"
+    );
+    assert_eq!(
+        read(narrowed).await,
+        want,
+        "{path}: the engine's q changed the answer"
+    );
+}
