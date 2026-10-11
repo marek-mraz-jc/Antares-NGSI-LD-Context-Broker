@@ -2,8 +2,8 @@
 //! The MCP surface's integration tests, one binary, over the fixture in
 //! `common`: discovery and the tool list (`mcp_discovery`), the gate
 //! (`mcp_gate`), errors (`mcp_errors`), result size and paging
-//! (`mcp_output`), resources (`mcp_resources`), caching (`mcp_cache`) and
-//! the transport (`mcp_transport`).
+//! (`mcp_output`), resources (`mcp_resources`), caching (`mcp_cache`), the
+//! transport (`mcp_transport`) and the confirmed writes (`mcp_writes`).
 
 mod common;
 mod engines;
@@ -14,3 +14,4 @@ mod mcp_gate;
 mod mcp_output;
 mod mcp_resources;
 mod mcp_transport;
+mod mcp_writes;
