@@ -2310,8 +2310,10 @@ async fn deliver_as(
     // either. `is_open` returning false IS the half-open probe, so the
     // check stays exactly once per attempt.
     // A binding that opens no socket has no destination for the policy or
-    // the breaker to judge; every network binding is policed below.
-    let policed = st.sinks.sink_for_uri(uri).is_some_and(|s| s.network());
+    // the breaker to judge, nor has a delivery the forward transport makes
+    // in process; every other network binding is policed below.
+    let policed =
+        in_process(st, uri).is_none() && st.sinks.sink_for_uri(uri).is_some_and(|s| s.network());
     if policed && st.egress.is_open(tenant.as_str(), uri) {
         tracing::debug!(
             "notification to {} short-circuited (breaker open)",
@@ -2548,7 +2550,7 @@ async fn deliver_as(
     let first = if refused {
         Err((false, "refused by egress policy".to_owned()))
     } else {
-        send_outbound(st, uri, timeout_ms, &outbound).await
+        send_outbound(st, tenant, uri, timeout_ms, &outbound).await
     };
     let (ok, timed_out) = match &first {
         Ok(()) => (true, false),
@@ -2665,15 +2667,30 @@ fn strip_reserved_markers(info: &mut Vec<(String, String)>) {
     });
 }
 
+/// The forward transport, when it delivers the notifications sent to `uri`
+/// in process (ADR-0025 rule 7).
+fn in_process<'a>(st: &'a AppState, uri: &str) -> Option<&'a Arc<dyn crate::ForwardTransport>> {
+    st.forward_transport.get().filter(|t| t.notifies(uri))
+}
+
 /// One attempt on the wire, through the binding the registry holds for the
-/// endpoint's scheme (6.3.8). `Err((timed_out, why))`: only a timeout-class
-/// failure feeds the breaker — an endpoint that answers is alive.
+/// endpoint's scheme (6.3.8), or in process when the forward transport
+/// takes the endpoint (ADR-0025 rule 7), on every attempt, retries and
+/// replays included. `Err((timed_out, why))`: only a timeout-class failure
+/// feeds the breaker — an endpoint that answers is alive.
 async fn send_outbound(
     st: &AppState,
+    tenant: &TenantId,
     uri: &str,
     timeout_ms: u32,
     outbound: &Outbound,
 ) -> Result<(), (bool, String)> {
+    if let Some(transport) = in_process(st, uri) {
+        return transport
+            .notify(tenant, uri, &outbound.body)
+            .await
+            .map_err(|e| (false, e));
+    }
     let Some(sink) = st.sinks.sink_for_uri(uri) else {
         return Err((
             false,
@@ -2735,7 +2752,7 @@ async fn retry_and_settle(
             return;
         }
         made += 1;
-        match send_outbound(st, uri, timeout_ms, &outbound).await {
+        match send_outbound(st, tenant, uri, timeout_ms, &outbound).await {
             Ok(()) => {
                 st.egress.record_success(tenant.as_str(), uri);
                 metrics::counter!("antares_notifications_retried_total", "outcome" => "ok")
@@ -2840,18 +2857,22 @@ fn letter_timeout_ms(letter: &Value) -> u32 {
 
 /// Replay one dead letter through the same binding, once. `Ok` = delivered
 /// (the caller deletes the letter); `Err` carries the failure text.
-pub(crate) async fn replay_dead_letter(st: &AppState, letter: &Value) -> Result<(), String> {
+pub(crate) async fn replay_dead_letter(
+    st: &AppState,
+    tenant: &TenantId,
+    letter: &Value,
+) -> Result<(), String> {
     let uri = letter["uri"].as_str().ok_or("dead letter without uri")?;
     let timeout_ms = letter_timeout_ms(letter);
     let outbound = Outbound::from_dead_letter(letter)?;
     // the egress policy of the moment applies, exactly as for a fresh send
-    if st.sinks.sink_for_uri(uri).is_some_and(|s| s.network()) {
+    if in_process(st, uri).is_none() && st.sinks.sink_for_uri(uri).is_some_and(|s| s.network()) {
         st.egress
             .check_destination(uri)
             .await
             .map_err(|e| e.to_string())?;
     }
-    send_outbound(st, uri, timeout_ms, &outbound)
+    send_outbound(st, tenant, uri, timeout_ms, &outbound)
         .await
         .map_err(|(_, e)| e)
 }

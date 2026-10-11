@@ -5,6 +5,7 @@
 
 use antares_ops::policy::PolicyEngine;
 use antares_ops::test_kit::TestBroker;
+use antares_ops::NotificationSink;
 use axum::body::Body;
 use axum::http::Request;
 use http_body_util::BodyExt;
@@ -16,11 +17,15 @@ use tower::ServiceExt;
 pub const SELF_URL: &str = "http://self.invalid";
 
 /// A broker over the built-in store with the internal transport, asking
-/// `engine` when there is one; the router serves `/q` too.
-pub async fn broker(engine: Option<Arc<dyn PolicyEngine>>) -> (TestBroker, axum::Router) {
+/// `engine` when there is one and delivering through `sinks` too; the
+/// router serves `/q` too.
+pub async fn broker(
+    engine: Option<Arc<dyn PolicyEngine>>,
+    sinks: Vec<Box<dyn NotificationSink>>,
+) -> (TestBroker, axum::Router) {
     std::env::set_var("ANTARES_POLICY_SUBJECT_HEADERS", "X-Subject");
     let selfs = antares_icsr::SelfUrls::parse(SELF_URL).unwrap_or_default();
-    let broker = TestBroker::with_sinks(Vec::new(), engine)
+    let broker = TestBroker::with_sinks(sinks, engine)
         .await
         .and_then(|b| b.with_forward_transport(antares_icsr::transport(selfs)))
         .unwrap_or_else(|e| unreachable!("{e}"));

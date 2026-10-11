@@ -76,7 +76,9 @@ pub mod bounds {
 
 /// The federation transport contract (ADR-0025 rule 8, ADR-0027 section 9),
 /// for a crate that serves some forwards in process.
-pub use antares_api::{AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
+pub use antares_api::{
+    AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport, NotifyFuture,
+};
 
 /// The URL this broker is reached at (`ANTARES_PUBLIC_URL`, else the
 /// request's `Host`), for a surface whose documents name its resources by
@@ -714,6 +716,56 @@ impl Ops {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or(serde_json::Value::Null);
         (status, body, warnings)
+    }
+}
+
+/// The notifications an internal transport delivers in process (ADR-0025
+/// rule 7).
+impl Ops {
+    /// The Tenant receiving the notifications of the distributed
+    /// Subscription copy `subscription_id` (5.8.1.4), from this broker's
+    /// inbound index; `None` when no Subscription maps it.
+    pub async fn notification_receiver(&self, subscription_id: &str) -> Option<String> {
+        self.state.notification_receiver(subscription_id).await
+    }
+
+    /// POST `notification` to `path` through this broker's own router, as
+    /// the HTTP sink would send it to the self URL, with no subject: a
+    /// notification is broker-initiated (ADR-0020). Past
+    /// [`antares_api::bounds::MAX_IN_PROCESS_CALL_DEPTH`] it is not made.
+    ///
+    /// # Errors
+    /// The receiver's status when it is not a success, or why no request
+    /// was made.
+    pub async fn notify_in_process(
+        &self,
+        path: &str,
+        notification: &serde_json::Value,
+    ) -> Result<(), String> {
+        if antares_api::state::in_process_depth() >= antares_api::bounds::MAX_IN_PROCESS_CALL_DEPTH
+        {
+            return Err("in-process call depth exceeded".into());
+        }
+        let body = notification.to_string();
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri(path)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(axum::http::header::CONTENT_LENGTH, body.len())
+            .body(Body::from(body))
+            .map_err(|e| e.to_string())?;
+        let answer = self
+            .state
+            .call_on_task(axum::http::HeaderMap::new(), req)
+            .await;
+        if answer.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the receiver answered {}",
+                answer.status().as_u16()
+            ))
+        }
     }
 }
 

@@ -401,11 +401,11 @@ Threat ids are those of `docs/analysis/surfaces-threat-model.md` section 8.
 | C4: an A → B → A chain, stack exhaustion | 3 | `icsr_loops.rs::icsr_a_two_tenant_cycle_terminates_like_http`, `icsr_loops.rs::icsr_past_the_depth_bound_no_forward_is_made_and_none_goes_over_http` |
 | C5: fan-out amplification | 2 | `icsr_loops.rs::icsr_in_process_forwards_count_against_the_federation_bounds` |
 | C6: a write forwarded on a read grant | 5 | `icsr_grant.rs::icsr_a_write_forward_needs_a_read_write_grant` |
-| C7: data after revocation | 5, 7 | `icsr_grant.rs::icsr_a_revoked_grant_stops_forwards_and_notifications` |
+| C7: data after revocation | 5, 7 | `icsr_grant.rs::icsr_a_revoked_grant_stops_forwards`, `icsr_notify.rs::icsr_a_revoked_grant_stops_notifications` |
 | C8: an internal tenant as a target | 5 | `icsr_grant.rs::icsr_an_internal_tenant_is_not_a_target` |
 | C9: B cannot tell what A read | 5 | `icsr_gate.rs::icsr_a_forward_is_logged_in_the_target_with_the_registration_id` |
 | C10: B's error text reaches A | 4 | `icsr_gate.rs::icsr_a_target_error_reaches_the_source_without_its_detail` |
-| the subject leaves the process | 4, 7 | `policy_subject_on_the_wire_p6.rs` keeps passing for HTTP forwards; `icsr_gate.rs::icsr_a_notification_carries_no_subject` |
+| the subject leaves the process | 4, 7 | `policy_subject_on_the_wire_p6.rs` keeps passing for HTTP forwards; `icsr_notify.rs::icsr_a_notification_carries_no_subject` |
 
 ## Confirmation
 

@@ -96,7 +96,9 @@ pub use antares_notifier::{
     build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
 };
 pub use contexts::public_base;
-pub use federation::{AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
+pub use federation::{
+    AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport, NotifyFuture,
+};
 pub use state::{AppState, TemporalRecord};
 
 /// Spawn for both targets — tokio natively, the JS microtask queue on
@@ -1210,7 +1212,7 @@ async fn dead_letter_replay(
         }
         Err(e) => return ApiError::from(e).into_response(),
     };
-    match notify::replay_dead_letter(&st, &letter).await {
+    match notify::replay_dead_letter(&st, &tenant, &letter).await {
         Ok(()) => match st.store.delete(&tenant, Kind::DeadLetter, &id).await {
             Ok(_) => StatusCode::NO_CONTENT.into_response(),
             Err(e) => ApiError::from(e).into_response(),
