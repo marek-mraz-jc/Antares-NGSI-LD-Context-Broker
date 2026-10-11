@@ -39,6 +39,8 @@ const SCHEMA: &str = include_str!("views-matrix/_schema.json");
 const TYPES: [&str; 3] = ["Vehicle", "Parking", "Sensor"];
 /// The page size every surface is read with: small, so every answer pages.
 const PAGE: usize = 3;
+/// More pages than any answer of the seed needs: a next link past it never ends.
+const MAX_PAGES: usize = 50;
 /// The read and subscription clauses a scenario without policies grants
 /// the public role whole, so the view alone decides.
 const READS: [&str; 15] = [
@@ -337,22 +339,30 @@ fn add(out: &mut Answer, id: String, names: BTreeSet<String>, twice: &mut Vec<St
 /// With `temporal`, Query Temporal Evolution of Entities (11.3.3) over
 /// every instance since 2000 instead.
 async fn ngsi_ld(app: &Router, s: &Scenario, temporal: bool) -> Read {
-    let who = with_tenant(s);
-    let (path, window) = if temporal {
-        (
-            "temporal/entities",
-            "&timerel=after&timeAt=2000-01-01T00:00:00Z&timeproperty=modifiedAt",
-        )
+    let types = format!("type={}", s.types().join(","));
+    if temporal {
+        let window = "&timerel=after&timeAt=2000-01-01T00:00:00Z&timeproperty=modifiedAt";
+        ngsi_ld_read(app, s, "temporal/entities", &format!("{types}{window}")).await
     } else {
-        ("entities", "")
-    };
+        ngsi_ld_read(app, s, "entities", &types).await
+    }
+}
+
+/// NGSI-LD `path` below the view root with `query`, following
+/// `Link: rel="next"`.
+async fn ngsi_ld_read(app: &Router, s: &Scenario, path: &str, query: &str) -> Read {
+    let who = with_tenant(s);
     let mut uri = format!(
-        "/x/views/{}/ngsi-ld/v1/{path}?type={}&limit={PAGE}&count=true{window}",
-        s.view(),
-        s.types().join(",")
+        "/x/views/{}/ngsi-ld/v1/{path}?{query}&limit={PAGE}&count=true",
+        s.view()
     );
     let (mut out, mut twice, mut count) = (Answer::new(), Vec::new(), None);
+    let mut pages = 0;
     loop {
+        pages += 1;
+        if pages > MAX_PAGES {
+            return Read::Refused(StatusCode::LOOP_DETECTED, json!("a next link without end"));
+        }
         let (status, headers, body) = send(app, "GET", &uri, &who, None).await;
         if status != StatusCode::OK {
             return Read::Refused(status, body);
@@ -386,14 +396,25 @@ async fn ngsi_ld(app: &Router, s: &Scenario, temporal: bool) -> Read {
 /// The OData EntitySet of each type, following `@odata.nextLink`; a set
 /// the view does not serve (404) holds nothing.
 async fn odata(app: &Router, s: &Scenario) -> Read {
+    odata_read(app, s, &s.types(), "").await
+}
+
+/// The OData EntitySets of `types` with the options `extra`, following
+/// `@odata.nextLink`; a set the view does not serve (404) holds nothing.
+async fn odata_read(app: &Router, s: &Scenario, types: &[String], extra: &str) -> Read {
     let who = with_tenant(s);
     let (mut out, mut twice, mut total) = (Answer::new(), Vec::new(), 0u64);
-    for t in s.types() {
-        let mut uri = format!("/x/views/{}/odata/v4/{t}?$count=true", s.view());
+    for t in types {
+        let mut uri = format!("/x/views/{}/odata/v4/{t}?$count=true{extra}", s.view());
         let mut first = true;
         let mut paged = who.clone();
         paged.push(("Prefer".to_owned(), format!("odata.maxpagesize={PAGE}")));
+        let mut pages = 0;
         loop {
+            pages += 1;
+            if pages > MAX_PAGES {
+                return Read::Refused(StatusCode::LOOP_DETECTED, json!("a next link without end"));
+            }
             let (status, _, body) = send(app, "GET", &uri, &paged, None).await;
             if status == StatusCode::NOT_FOUND && first {
                 break;
@@ -443,15 +464,27 @@ async fn odata(app: &Router, s: &Scenario) -> Read {
 /// collection the view does not serve (404) holds nothing. The geometry is
 /// `location`.
 async fn ogc(app: &Router, s: &Scenario) -> Read {
+    ogc_read(app, s, &s.types(), "").await
+}
+
+/// OGC API Features items of the collections `types` with the parameters
+/// `extra`, following `rel=next`; a collection the view does not serve
+/// (404) holds nothing.
+async fn ogc_read(app: &Router, s: &Scenario, types: &[String], extra: &str) -> Read {
     let who = with_tenant(s);
     let (mut out, mut twice, mut total) = (Answer::new(), Vec::new(), 0u64);
-    for t in s.types() {
+    for t in types {
         let mut uri = format!(
-            "/x/views/{}/ogc/features/collections/{t}/items?limit={PAGE}",
+            "/x/views/{}/ogc/features/collections/{t}/items?limit={PAGE}{extra}",
             s.view()
         );
         let mut first = true;
+        let mut pages = 0;
         loop {
+            pages += 1;
+            if pages > MAX_PAGES {
+                return Read::Refused(StatusCode::LOOP_DETECTED, json!("a next link without end"));
+            }
             let (status, _, body) = send(app, "GET", &uri, &who, None).await;
             if status == StatusCode::NOT_FOUND && first {
                 break;
@@ -531,7 +564,12 @@ async fn mcp_call(app: &Router, s: &Scenario, tool: &str, args: Value) -> Value 
 async fn mcp(app: &Router, s: &Scenario) -> Read {
     let (mut out, mut twice, mut total) = (Answer::new(), Vec::new(), None);
     let mut cursor: Option<String> = None;
+    let mut pages = 0;
     loop {
+        pages += 1;
+        if pages > MAX_PAGES {
+            return Read::Refused(StatusCode::LOOP_DETECTED, json!("a next link without end"));
+        }
         let mut args = json!({"type": s.types(), "limit": PAGE, "count": true});
         if let Some(c) = &cursor {
             args["cursor"] = json!(c);
@@ -665,6 +703,82 @@ fn judge(surface: &str, read: Read, want: &Expect, failures: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// Judge `got` against what NGSI-LD answered for the same question: the
+/// same Entities and names, or a refusal on both. A surface may refuse a
+/// name the view hides (`400`) where NGSI-LD answers nothing.
+fn same(surface: &str, got: Read, ngsi: Read, hidden: bool, failures: &mut Vec<String>) {
+    let want = match ngsi {
+        Read::Entities(want, _) => {
+            if let Read::Refused(StatusCode::BAD_REQUEST, _) = got {
+                if hidden || want.is_empty() {
+                    return judge(surface, got, &Expect::Denied, failures);
+                }
+            }
+            Expect::Admitted(want)
+        }
+        Read::Refused(..) => Expect::Denied,
+    };
+    judge(surface, got, &want, failures);
+}
+
+/// Whether one of `names` is shown on no Vehicle `want` admits: a surface
+/// refuses a name the view hides like a misspelt one (`400`, ogc.md 2,
+/// odata.md), where NGSI-LD omits it.
+fn hidden(want: &Expect, names: &[&str]) -> bool {
+    let Expect::Admitted(want) = want else {
+        return false;
+    };
+    names.iter().any(|n| {
+        !want
+            .iter()
+            .any(|(id, shown)| id.contains(":Vehicle:") && shown.contains(*n))
+    })
+}
+
+/// The query-language rows, each through the same view and caller: OData
+/// `$filter` and `$select` against NGSI-LD `q` and `pick`, OGC `bbox` and
+/// `properties` against a `geoQ` intersects and `pick` plus the Features
+/// without a geometry, which `bbox` keeps (Part 1 Req 24 C). The box has
+/// V2 on its corner.
+async fn rows(app: &Router, s: &Scenario, want: &Expect, failures: &mut Vec<String>) {
+    let vehicles = ["Vehicle".to_owned()];
+    let pick = "type=Vehicle&pick=id,type,location,speed";
+    let ngsi = ngsi_ld_read(app, s, "entities", &format!("{pick}&q=speed%3E40")).await;
+    let got = odata_read(
+        app,
+        s,
+        &vehicles,
+        "&$filter=speed%20gt%2040&$select=location,speed",
+    )
+    .await;
+    same(
+        "OData $filter $select",
+        got,
+        ngsi,
+        hidden(want, &["location", "speed"]),
+        failures,
+    );
+    let geo = "&georel=intersects&geometry=Polygon&coordinates=%5B%5B%5B0,0%5D,%5B7,0%5D,%5B7,7%5D,%5B0,7%5D,%5B0,0%5D%5D%5D";
+    let mut ngsi = ngsi_ld_read(app, s, "entities", &format!("{pick}{geo}")).await;
+    if let (Read::Entities(inside, n), Read::Entities(all, _)) =
+        (&mut ngsi, ngsi_ld_read(app, s, "entities", pick).await)
+    {
+        inside.extend(
+            all.into_iter()
+                .filter(|(_, names)| !names.contains("location")),
+        );
+        *n = u64::try_from(inside.len()).ok();
+    }
+    let got = ogc_read(app, s, &vehicles, "&bbox=0,0,7,7&properties=speed").await;
+    same(
+        "OGC bbox properties",
+        got,
+        ngsi,
+        hidden(want, &["speed"]),
+        failures,
+    );
 }
 
 /// What a temporal query answers where the snapshot answers `want`: an
@@ -904,6 +1018,7 @@ async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
             }
         }
         check(&app, s, &want, &s.doc["temporal"], &mut failures).await;
+        rows(&app, s, &want, &mut failures).await;
         for (n, st) in s.doc["steps"].as_array().into_iter().flatten().enumerate() {
             let mut after = Vec::new();
             step(&app, s, st, &mut after).await;

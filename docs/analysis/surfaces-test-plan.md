@@ -114,6 +114,12 @@ CI jobs named below (all in Antares `.github/workflows/`):
   scenario states `temporal`: a policy condition holds per instance (ADR-0023 rule 11), so a
   `scopeQ` condition (scope has no history) hides every instance and a moved Entity keeps the
   instances recorded while its rule held.
+- Query-language rows, each against the NGSI-LD query that means the same through the same view
+  and caller: OData `$filter=speed gt 40&$select=location,speed` against `q=speed>40` with `pick`,
+  and OGC `bbox=0,0,7,7&properties=speed` against a `geoQ` intersects with `pick` plus the
+  Vehicles without a shown `location` (`bbox` keeps them, Part 1 Req 24 C). A surface may refuse a
+  name the view hides with `400` where NGSI-LD omits it. Every pager stops after 50 pages, so a
+  next link without end is a mismatch, not a hang.
 - A mismatch with a fix task filed is listed in the scenario's `known` (surface to task id) and
   must still fail, so the fix removes the entry; the test prints the list.
 - Job: `workspace-tests` (all-features).
