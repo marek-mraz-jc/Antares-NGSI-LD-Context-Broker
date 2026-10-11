@@ -24,6 +24,7 @@ members = [
     "crates/antares-views",
     "crates/antares-mcp",
     "crates/antares-odata",
+    "crates/antares-ogc",
     "crates/antares-ws",
     # The reference plugin: built and tested with the workspace so the
     # driver, routing and notification seams cannot drift from it.
@@ -58,6 +59,7 @@ antares-ops = { path = "crates/antares-ops" }
 antares-views = { path = "crates/antares-views" }
 antares-mcp = { path = "crates/antares-mcp" }
 antares-odata = { path = "crates/antares-odata" }
+antares-ogc = { path = "crates/antares-ogc" }
 antares-ws = { path = "crates/antares-ws" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
@@ -225,6 +227,10 @@ overflow-checks = true
 codegen-units = 1
 
 [profile.release.package.antares-odata]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-ogc]
 overflow-checks = true
 codegen-units = 1
 

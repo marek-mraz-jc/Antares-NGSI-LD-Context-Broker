@@ -35,6 +35,11 @@ Purge and the temporal writes are not served through a view. A Batch
 Upsert member that exists out of the view is never overwritten: it takes
 the create half and answers 409, as a create of a taken id does.
 
+A view may select every type and show every Attribute with one form:
+`"selector": ["*"]` and the single rule `{"types": ["*"], "attributes":
+["*"]}` (ADR-0023 rule 12). Its `q`, `scopeQ`, `geoQ`, `operations` and
+Tenant still apply. `*` anywhere else is refused when the view loads.
+
 ## 2. What a client sees
 
 - An Entity is in the view when a rule names its type and the view's `q`,
