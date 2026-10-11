@@ -9,6 +9,9 @@
 #   SUITES         robot suite dirs, default: the Scorpio serial order
 #   STOP_ON_ERROR  default 1 (local loop: stop at the FIRST failing TP);
 #                  CI sets 0 to run the whole suite and report everything
+#   SETUP_URL      when set, every setup and teardown reaches this root and
+#                  only the TP bodies reach BROKER_URL (a view's NGSI-LD
+#                  root, surfaces-conformance.md 2.3); the reset uses it too
 # -e stays off: a failing TP is a result to report, not an abort.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -83,6 +86,7 @@ EXTRA=()
 # TPs needing a specially-configured broker (ANTARES_TEMPORAL=none) never
 # belong in a default conformance run — they get their own harness.
 EXTRA+=(--exclude config_no_temporal)
+[ -n "${SETUP_URL:-}" ] && EXTRA+=(--listener "$PWD/dev/etsi_setup_url.py;$SETUP_URL")  # ; keeps the URL's colons
 
 status=0
 for s in $SUITES; do
@@ -91,7 +95,7 @@ for s in $SUITES; do
   # Tell the 1 Hz sampler which suite owns the samples from here on —
   # written before the reset so the reset's own churn is attributed too.
   [ -n "${PHASE_FILE:-}" ] && echo "$name" > "$PHASE_FILE"
-  bash dev/reset-broker.sh "$BROKER_URL"   # state reset between suites
+  bash dev/reset-broker.sh "${SETUP_URL:-$BROKER_URL}"   # state reset between suites
   # Console tee'd next to output.xml: when robot dies before writing it,
   # the CI artifact must still say why (see the IOP step's twin note).
   (cd "$SUITE" && "$VENV/bin/robot" \
