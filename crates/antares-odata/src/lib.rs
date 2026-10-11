@@ -24,8 +24,10 @@ mod filter;
 mod names;
 mod paths;
 mod read;
+mod write;
 
-use antares_ops::{Caller, Ops, Surface, ViewOps};
+use antares_ops::{Caller, OperationId, Ops, Surface, ViewOps};
+use axum::body::Bytes;
 use axum::extract::{MatchedPath, Request};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -126,19 +128,19 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
         edm,
         state: state.clone(),
     });
-    let api =
-        odata_axum::metadata_router(state.clone()).merge(
-            Router::new()
-                .fallback(
-                    move |method: Method,
-                          caller: Caller,
-                          request: ODataRequest,
-                          headers: HeaderMap| async move {
-                        read::serve(&reads, &method, &caller, &request, &headers).await
-                    },
-                )
-                .with_state(state),
-        );
+    let api = odata_axum::metadata_router(state.clone()).merge(
+        Router::new()
+            .fallback(
+                move |method: Method,
+                      caller: Caller,
+                      request: ODataRequest,
+                      headers: HeaderMap,
+                      body: Bytes| async move {
+                    read::serve(&reads, &method, &caller, &request, &headers, &body).await
+                },
+            )
+            .with_state(state),
+    );
     let Ok(resp) = Router::new()
         .nest_service(&format!("/{id}/odata/v4"), api)
         .oneshot(req)
@@ -217,11 +219,12 @@ async fn query_in_body(req: Request, max: usize) -> Result<Request, ODataErrorRe
 }
 
 /// What a model is a function of (T-3441 7.3): the view, the types and
-/// Attributes it shows, its Tenant's schema revision, the OData version.
+/// Attributes it shows, the writes it offers, its Tenant's schema
+/// revision, the OData version.
 /// The key is compared whole, so two views never share a model by a
 /// collision. ponytail: no engine probe bits yet; section 4's Capabilities
 /// add them to the key when the model reads the engine.
-type ModelKey = (String, edm::Shown, u64, bool);
+type ModelKey = (String, edm::Shown, edm::Writable, u64, bool);
 
 /// A built model, its CSDL document and that document's `ETag`.
 type Built = (Arc<edm::Edm>, Arc<odata_csdl::Model>, Option<String>);
@@ -232,9 +235,15 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
     static CACHE: LazyLock<Mutex<HashMap<ModelKey, Built>>> = LazyLock::new(Mutex::default);
     let (revision, bytes) = view.schema()?;
     let shown = view.shown_by_type();
+    let writable = edm::Writable {
+        insert: view.allows(OperationId::CreateEntity),
+        update: view.allows(OperationId::MergeEntity) || view.allows(OperationId::ReplaceEntity),
+        delete: view.allows(OperationId::DeleteEntity),
+    };
     let key = (
         id.to_owned(),
         shown,
+        writable,
         revision,
         version == CsdlVersion::V4_01,
     );
@@ -246,7 +255,7 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
         return Some(hit.clone());
     }
     let schema = parsed(revision, &bytes)?;
-    let edm = edm::build(id, &schema, &key.1, version).ok()?;
+    let edm = edm::build(id, &schema, &key.1, key.2, version).ok()?;
     tracing::debug!(
         view = id,
         schema_revision = revision,

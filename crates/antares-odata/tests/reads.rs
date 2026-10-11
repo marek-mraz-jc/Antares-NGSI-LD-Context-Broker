@@ -479,8 +479,8 @@ async fn the_forms_of_later_rounds_are_501_and_read_only_writes_405() {
     let got = send(&app, Method::POST, &format!("{ROOT}/Car"), Some("{}"), &[]).await;
     assert_eq!(
         got.status,
-        StatusCode::NOT_IMPLEMENTED,
-        "writes are T-3509's: {}",
+        StatusCode::METHOD_NOT_ALLOWED,
+        "a write the view does not offer, before its body is read: {}",
         got.body
     );
     let got = send(

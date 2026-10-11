@@ -30,8 +30,6 @@ const SCHEMA: &str = r#"{
 }"#;
 
 /// One request per row: method, path below the service root, headers.
-/// `odata_upsert` answers 501 until T-3509 serves writes, then the 404 the
-/// matrix names; it is the only row whose status this round differs.
 /// Request headers of a row.
 type Headers = &'static [(&'static str, &'static str)];
 
@@ -142,8 +140,16 @@ const MORE: &[(&str, &str, &str)] = &[
     ("odata_each", "DELETE", "Car/$each"),
 ];
 
-/// The interim answer of a row whose binding needs a later round.
-const INTERIM: &[(&str, u16, &str)] = &[("odata_upsert", 501, "T-3509")];
+/// The body a row's request carries, where `{}` is not the form it names.
+const BODIES: &[(&str, &str)] = &[(
+    "odata_deep_update",
+    r#"{"owner": {"id": "urn:ngsi-ld:Person:5", "name": "new"}}"#,
+)];
+
+/// The rows the operation they stand for answers, so its gate is asked:
+/// an upsert is the Merge or Replace Entity of a key the store does not
+/// hold (W7), whose 404 is the one a hidden Entity gets.
+const GATED: &[&str] = &["odata_upsert"];
 
 /// Counts every decision asked of it, and allows.
 #[derive(Default)]
@@ -203,11 +209,12 @@ async fn send(
     method: &str,
     uri: &str,
     headers: &[(&str, &str)],
+    body: Option<&'static str>,
 ) -> (StatusCode, Value) {
-    let body = if method == "GET" || method == "DELETE" {
-        ""
-    } else {
-        "{}"
+    let body = match body {
+        Some(body) => body,
+        None if method == "GET" || method == "DELETE" => "",
+        None => "{}",
     };
     let mut req = Request::builder()
         .method(Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET))
@@ -247,7 +254,7 @@ async fn broker(engine: Arc<Counting>) -> Result<(TestBroker, Router), String> {
         "selector": ["city:Car", "city:Person"],
         "rules": [{"types": ["city:Car"], "attributes": ["city:speed", "city:tags", "city:owner"]},
                   {"types": ["city:Person"], "attributes": ["city:name"]}],
-        "operations": ["query_entities", "retrieve_entity"]
+        "operations": ["query_entities", "retrieve_entity", "merge_entity", "replace_entity"]
     })
     .to_string();
     for (uri, body) in [
@@ -271,7 +278,7 @@ async fn broker(engine: Arc<Counting>) -> Result<(TestBroker, Router), String> {
 async fn odata_refused_features_answer_501_before_any_gate() {
     let engine = Arc::new(Counting::default());
     let (_b, app) = broker(engine.clone()).await.expect("broker");
-    let (served, body) = send(&app, "GET", &format!("{ROOT}/Car"), &[]).await;
+    let (served, body) = send(&app, "GET", &format!("{ROOT}/Car"), &[], None).await;
     assert_eq!(served, StatusCode::OK, "{body}");
     assert_eq!(
         body["value"],
@@ -290,11 +297,14 @@ async fn odata_refused_features_answer_501_before_any_gate() {
     let before = engine.0.load(Ordering::SeqCst);
     let rows = matrix_rows();
     assert!(rows.len() >= 25, "the matrix rows are read: {rows:?}");
-    for (id, status, code) in &rows {
-        let (want_status, want_code) = INTERIM
-            .iter()
-            .find(|(i, _, _)| i == id)
-            .map_or((*status, code.as_str()), |(_, s, _)| (*s, "NotImplemented"));
+    let refused = rows.iter().filter(|(id, ..)| !GATED.contains(&id.as_str()));
+    let gated = rows.iter().filter(|(id, ..)| GATED.contains(&id.as_str()));
+    let mut asked = Vec::new();
+    for (pass, (id, want_status, want_code)) in refused.map(|r| (0, r)).chain(gated.map(|r| (1, r)))
+    {
+        if pass == 1 && asked.is_empty() {
+            asked.push(engine.0.load(Ordering::SeqCst));
+        }
         let requests: Vec<(&str, &str, Headers)> = ROWS
             .iter()
             .filter(|(r, ..)| r == id)
@@ -310,18 +320,24 @@ async fn odata_refused_features_answer_501_before_any_gate() {
             "{id}: the matrix names a refusal this test does not send"
         );
         for (method, path, headers) in requests {
-            let (got, body) = send(&app, method, &format!("{ROOT}/{path}"), headers).await;
-            assert_eq!(got.as_u16(), want_status, "{id}: {method} {path}: {body}");
+            let body = BODIES.iter().find(|(r, _)| r == id).map(|(_, b)| *b);
+            let (got, body) = send(&app, method, &format!("{ROOT}/{path}"), headers, body).await;
+            assert_eq!(got.as_u16(), *want_status, "{id}: {method} {path}: {body}");
             assert_eq!(
-                body["error"]["code"], want_code,
+                body["error"]["code"],
+                want_code.as_str(),
                 "{id}: {method} {path}: {body}"
             );
         }
     }
     assert_eq!(
-        engine.0.load(Ordering::SeqCst),
-        before,
+        asked.first().copied(),
+        Some(before),
         "no refused request reached a gate"
+    );
+    assert!(
+        engine.0.load(Ordering::SeqCst) > before,
+        "an upsert is its operation, gated"
     );
     for (id, ..) in ROWS {
         assert!(
@@ -329,7 +345,7 @@ async fn odata_refused_features_answer_501_before_any_gate() {
             "{id} is no refusing row of the matrix"
         );
     }
-    let (served, body) = send(&app, "GET", &format!("{ROOT}/Car"), &[]).await;
+    let (served, body) = send(&app, "GET", &format!("{ROOT}/Car"), &[], None).await;
     assert_eq!(served, StatusCode::OK, "{body}");
     assert_eq!(body["value"][0]["id"], "urn:ngsi-ld:Car:1", "{body}");
     assert!(
