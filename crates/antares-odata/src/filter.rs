@@ -107,10 +107,18 @@ pub(crate) enum SortBy {
     Id,
     /// The value of the Attribute of this term, at its default instance.
     Value(String),
-    /// The `observedAt` of the Attribute of this term.
-    ObservedAt(String),
     /// `createdAt` or `modifiedAt` of the Entity.
-    System(&'static str),
+    System(String),
+}
+
+impl SortBy {
+    /// The `orderBy` key of a pushed sort.
+    fn key(&self) -> &str {
+        match self {
+            Self::Id => "id",
+            Self::Value(name) | Self::System(name) => name,
+        }
+    }
 }
 
 /// Translates `filter` against the members of `set` and, through a
@@ -209,22 +217,12 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
             Some("id") => SortBy::Id,
             // Q9: no Entity member `orderBy` names (7.2.3.1); the surface sorts
             Some(name @ ("createdAt" | "modifiedAt")) if !set.members.contains_key(name) => {
-                SortBy::System(if name == "createdAt" {
-                    "createdAt"
-                } else {
-                    "modifiedAt"
-                })
+                SortBy::System(name.to_owned())
             }
             Some(name) if set.members.get(name).is_some_and(|m| !m.shape.sortable()) => {
                 return Err(Refused::Bad)
             }
-            _ => {
-                let key = terms.scalar(&item.expr)?;
-                match key.strip_suffix(".observedAt") {
-                    Some(term) => SortBy::ObservedAt(term.to_owned()),
-                    None => SortBy::Value(key),
-                }
-            }
+            _ => SortBy::Value(terms.scalar(&item.expr)?),
         };
         keys.push(SortKey {
             by,
@@ -236,7 +234,7 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
         out.sort_reads = keys
             .iter()
             .filter_map(|k| match &k.by {
-                SortBy::Value(term) | SortBy::ObservedAt(term) => Some(term.clone()),
+                SortBy::Value(term) => Some(term.clone()),
                 SortBy::Id | SortBy::System(_) => None,
             })
             .collect();
@@ -246,12 +244,7 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
     let pushed: Vec<String> = keys
         .iter()
         .map(|k| {
-            let key = match &k.by {
-                SortBy::Id => "id".to_owned(),
-                SortBy::Value(term) => term.clone(),
-                SortBy::ObservedAt(term) => format!("{term}.observedAt"),
-                SortBy::System(name) => (*name).to_owned(),
-            };
+            let key = k.by.key().to_owned();
             if k.descending {
                 format!("{key};desc")
             } else {
@@ -639,16 +632,17 @@ impl<'a> Terms<'a> {
                 let values = list.iter().map(residual_lit).collect::<Result<_, _>>()?;
                 Ok(definite(RExpr::In(Box::new(RExpr::Path(path)), values)))
             }
-            Expr::Call(Method::GeoIntersects, _) => match self.geo(e)? {
-                Some((term, polygon)) => Ok(intersects(&term, &polygon)),
-                None => Err(Refused::Later),
-            },
             Expr::Call(method, args) => {
                 let func = match method {
                     Method::Contains => Func::Contains,
                     Method::StartsWith => Func::StartsWith,
                     Method::EndsWith => Func::EndsWith,
-                    Method::GeoIntersects => return Err(Refused::Later),
+                    Method::GeoIntersects => {
+                        return self
+                            .geo(e)?
+                            .map(|(term, polygon)| intersects(&term, &polygon))
+                            .ok_or(Refused::Later)
+                    }
                 };
                 let [member, operand] = args.as_slice() else {
                     return Err(Refused::Later);
@@ -866,8 +860,8 @@ pub(crate) fn program(t: &Translated, now: DateTime) -> Result<Option<residual::
         .map(Some)
         .map_err(|e| match e {
             residual::Error::TooComplex => Refused::TooComplex,
-            residual::Error::Invalid(_) => Refused::Bad,
-            residual::Error::Unsupported(_) => Refused::Later,
+            // this module builds no pattern, the one construct the evaluator may not support
+            residual::Error::Invalid(_) | residual::Error::Unsupported(_) => Refused::Bad,
         })
 }
 
@@ -1692,5 +1686,206 @@ mod tests {
         ] {
             assert_eq!(q(&e), Err(Refused::Bad), "{e:?}");
         }
+    }
+
+    fn ordered(set: &Set, names: &[(&str, bool)]) -> Result<Translated, Refused> {
+        let items: Vec<OrderBy> = names
+            .iter()
+            .map(|(name, descending)| OrderBy {
+                expr: m(name),
+                descending: *descending,
+            })
+            .collect();
+        let mut t = Translated::default();
+        order(&items, set, &mut t).map(|()| t)
+    }
+
+    #[test]
+    fn a_system_member_is_sorted_by_the_surface_unless_the_model_names_it() -> Result<(), Refused> {
+        // Q9: the surface sorts, reading the value keys beside it
+        let t = ordered(
+            &set(),
+            &[("createdAt", false), ("speed", true), ("id", false)],
+        )?;
+        assert_eq!(t.order, None);
+        assert!(t.sort_system);
+        assert_eq!(t.sort_reads, ["t0"]);
+        assert_eq!(
+            t.sort.map(|keys| keys
+                .into_iter()
+                .map(|k| (k.by, k.descending))
+                .collect::<Vec<_>>()),
+            Some(vec![
+                (SortBy::System("createdAt".into()), false),
+                (SortBy::Value("t0".into()), true),
+                (SortBy::Id, false),
+            ])
+        );
+        // without one, `orderBy` is pushed
+        let t = ordered(&set(), &[("speed", true), ("id", false)])?;
+        assert_eq!((t.order.as_deref(), t.sort), (Some("t0;desc,id"), None));
+        // a model member of that name is an Attribute like any other
+        let mut named = set();
+        named.members.insert(
+            "modifiedAt".into(),
+            Member {
+                iri: "https://e.org/modifiedAt".into(),
+                shape: Shape::Value {
+                    edm: "Edm.DateTimeOffset",
+                    collection: false,
+                },
+                list: false,
+                written: crate::edm::Written::Always,
+            },
+        );
+        let t = ordered(&named, &[("modifiedAt", false)])?;
+        assert_eq!((t.order.as_deref(), t.sort), (Some("t0"), None));
+        Ok(())
+    }
+
+    #[test]
+    fn every_residual_form_is_evaluated_or_refused() {
+        use residual::Truth::{False, True};
+        use serde_json::json;
+        let not = |e: Expr| Expr::Not(Box::new(e));
+        let int = |n| lit(Literal::Int(n));
+        let speed = |op, n| cmp(m("speed"), op, int(n));
+        let and = not(Expr::And(
+            Box::new(speed(CompareOp::Gt, 1)),
+            Box::new(speed(CompareOp::Lt, 9)),
+        ));
+        assert_eq!(evaluated(&and, Some(json!(5))), Some(False));
+        assert_eq!(evaluated(&and, Some(json!(10))), Some(True));
+        // a literal on the left is mirrored
+        let left = not(cmp(int(5), CompareOp::Lt, m("speed")));
+        assert_eq!(evaluated(&left, Some(json!(6))), Some(False));
+        assert_eq!(evaluated(&left, Some(json!(5))), Some(True));
+        for (op, value, want) in [
+            (CompareOp::Ge, 5, False),
+            (CompareOp::Ge, 4, True),
+            (CompareOp::Le, 5, False),
+            (CompareOp::Le, 6, True),
+        ] {
+            assert_eq!(
+                evaluated(&not(speed(op, 5)), Some(json!(value))),
+                Some(want)
+            );
+        }
+        // `eq null` and `ne null` under `or`
+        let null = |op| cmp(m("speed"), op, lit(Literal::Null));
+        let absent = not(Expr::Or(
+            Box::new(null(CompareOp::Eq)),
+            Box::new(speed(CompareOp::Gt, 3)),
+        ));
+        assert_eq!(evaluated(&absent, None), Some(False));
+        assert_eq!(evaluated(&absent, Some(json!(2))), Some(True));
+        let present = not(Expr::Or(
+            Box::new(null(CompareOp::Ne)),
+            Box::new(speed(CompareOp::Gt, 3)),
+        ));
+        assert_eq!(evaluated(&present, None), Some(True));
+        assert_eq!(evaluated(&present, Some(json!(2))), Some(False));
+        let ends = not(not(Expr::Call(
+            Method::EndsWith,
+            vec![m("name"), lit(Literal::String("ion".into()))],
+        )));
+        assert_eq!(evaluated(&ends, Some(json!("Station"))), Some(True));
+        let on = not(cmp(m("on"), CompareOp::Eq, lit(Literal::Bool(true))));
+        assert_eq!(evaluated(&on, Some(json!(false))), Some(True));
+        let half = not(cmp(
+            m("speed"),
+            CompareOp::Gt,
+            lit(Literal::Decimal("1.5".into())),
+        ));
+        assert_eq!(evaluated(&half, Some(json!(1))), Some(True));
+        // two residual conjuncts are one program
+        let both = Expr::And(
+            Box::new(not(speed(CompareOp::Gt, 8))),
+            Box::new(not(speed(CompareOp::Lt, 2))),
+        );
+        assert_eq!(evaluated(&both, Some(json!(5))), Some(True));
+        assert_eq!(evaluated(&both, Some(json!(9))), Some(False));
+        // what no member type takes is Bad
+        for e in [
+            not(not(Expr::Call(
+                Method::Contains,
+                vec![m("speed"), lit(Literal::String("1".into()))],
+            ))),
+            not(m("speed")),
+            not(cmp(m("doc"), CompareOp::Eq, int(1))),
+            not(cmp(
+                m("speed"),
+                CompareOp::Gt,
+                lit(Literal::Decimal("NaN".into())),
+            )),
+        ] {
+            assert_eq!(q(&e), Err(Refused::Bad), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn a_date_and_a_time_of_day_are_residual_values() {
+        use residual::Truth::{False, True};
+        use serde_json::json;
+        let mut timed = set();
+        for (name, edm) in [("day", "Edm.Date"), ("at", "Edm.TimeOfDay")] {
+            timed.members.insert(
+                name.into(),
+                Member {
+                    iri: format!("https://e.org/{name}"),
+                    shape: Shape::Value {
+                        edm,
+                        collection: false,
+                    },
+                    list: false,
+                    written: crate::edm::Written::Always,
+                },
+            );
+        }
+        let not = |e: Expr| Expr::Not(Box::new(e));
+        let now = DateTime::parse("2026-10-11T12:00:00Z");
+        for (e, value, want) in [
+            (
+                not(cmp(
+                    m("day"),
+                    CompareOp::Lt,
+                    lit(Literal::Date("2026-01-02".into())),
+                )),
+                json!({"@type": "Date", "@value": "2026-01-01"}),
+                False,
+            ),
+            (
+                not(cmp(
+                    m("at"),
+                    CompareOp::Lt,
+                    lit(Literal::TimeOfDay("09:30:00".into())),
+                )),
+                json!({"@type": "Time", "@value": "10:00:00"}),
+                True,
+            ),
+        ] {
+            let t = translate(&e, &timed, &BTreeMap::new(), &[]);
+            let program = t
+                .and_then(|t| now.map_or(Err(Refused::Later), |now| program(&t, now)))
+                .ok()
+                .flatten();
+            let entity = json!({"id": "urn:ngsi-ld:Car:1", "type": "Car",
+                "t0": {"type": "Property", "value": value}});
+            assert_eq!(
+                program.and_then(|p| p.eval(&entity).ok()),
+                Some(want),
+                "{e:?}"
+            );
+        }
+        // a literal the type cannot hold is Bad
+        let bad = not(cmp(
+            m("day"),
+            CompareOp::Lt,
+            lit(Literal::Date("2026-02-30".into())),
+        ));
+        assert_eq!(
+            translate(&bad, &timed, &BTreeMap::new(), &[]).map(|_| ()),
+            Err(Refused::Bad)
+        );
     }
 }

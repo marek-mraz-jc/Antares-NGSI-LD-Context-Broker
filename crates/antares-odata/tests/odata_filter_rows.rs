@@ -263,8 +263,23 @@ async fn a_hidden_attributes_observed_at_is_the_400_of_an_unknown_name() {
 async fn the_forms_these_rows_do_not_cover_stay_501() {
     let (_b, app) = broker().await.expect("broker");
     let polygon = "geography'SRID=4326;Polygon((0%200,1%200,1%201,0%201,0%200))'";
+    // a geo test under `or` is evaluated by the residual (T-3758)
+    let (status, answer) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=geo.intersects(location,{polygon})%20or%20speed%20gt%2015"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let ids: Vec<&str> = answer["value"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["urn:ngsi-ld:Car:1", "urn:ngsi-ld:Car:2"], "{answer}");
     for filter in [
-        format!("geo.intersects(location,{polygon})%20or%20speed%20gt%2015"),
         "label%20ne%20'blue'".to_owned(),
         "tags/any(x:x%20ne%20'a')".to_owned(),
         "tags/all(x:x%20eq%20'a')".to_owned(),
@@ -278,4 +293,37 @@ async fn the_forms_these_rows_do_not_cover_stay_501() {
         .await;
         assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{filter}: {answer}");
     }
+}
+
+/// T-3758: a caller's `ngsild.georel` takes the one `geoQ`, so the OData geo test is evaluated;
+/// a polygon outside WGS84 is the caller's error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callers_geoq_moves_the_geo_filter_to_the_residual() {
+    let (_b, app) = broker().await.expect("broker");
+    let polygon = "geography'SRID=4326;Polygon((0%200,1%200,1%201,0%201,0%200))'";
+    let near = "ngsild.georel=near%3BmaxDistance==2000000&ngsild.geometry=Point&ngsild.coordinates=%5B5,5%5D&ngsild.geoproperty=city:location";
+    let (status, answer) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=geo.intersects(location,{polygon})&{near}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let ids: Vec<&str> = answer["value"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["urn:ngsi-ld:Car:1"], "{answer}");
+    let outside = "geography'SRID=4326;Polygon((0%200,500%200,500%201,0%201,0%200))'";
+    let (status, answer) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=not%20geo.intersects(location,{outside})"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
 }

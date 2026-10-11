@@ -14,7 +14,7 @@ use crate::paths;
 use antares_ops::residual::{DateTime, Expr as RExpr, Program};
 use antares_ops::{
     core_name, Caller, OperationId, OpsRequest, Page as ScanPage, Pushdown, Refusal, Scanned,
-    ViewOps, RESIDUAL_SCAN, TOO_COMPLEX,
+    ViewOps, RESIDUAL_SCAN,
 };
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -575,7 +575,7 @@ async fn evaluated(
     caller: &Caller,
     (set, picked, expansions): (&Set, Option<&[&str]>, &[Expansion<'_>]),
     filter: &mut Translated,
-    residual: Option<Program>,
+    program: &Program,
     window: Window,
     link: &(dyn Fn(u64, u64, Option<u64>) -> String + Sync),
 ) -> Result<Served, ODataErrorResponse> {
@@ -596,10 +596,6 @@ async fn evaluated(
         // truncated unseen (S1, O6), so a residual stays off a join.
         return Err(not_implemented(version));
     }
-    let program = match residual {
-        Some(program) => program,
-        None => everything(version)?,
-    };
     let pushdown = pushdown(set, picked, expansions, filter);
     Ok(if counted || filter.sort.is_some() {
         // The whole answer, counted and sorted here (ADR-0028 rule 5); the
@@ -609,7 +605,7 @@ async fn evaluated(
             size: 0,
             whole: true,
         };
-        let (mut docs, _) = scanned(reads, caller, &pushdown, &program, whole, version).await?;
+        let (mut docs, _) = scanned(reads, caller, &pushdown, program, whole, version).await?;
         if let Some(keys) = &filter.sort {
             sort(&mut docs, keys);
         }
@@ -639,7 +635,7 @@ async fn evaluated(
             size: usize::try_from(skip.saturating_add(page)).unwrap_or(usize::MAX),
             whole: false,
         };
-        let (docs, next) = scanned(reads, caller, &pushdown, &program, fill, version).await?;
+        let (docs, next) = scanned(reads, caller, &pushdown, program, fill, version).await?;
         let dropped = docs.len().min(usize::try_from(skip).unwrap_or(usize::MAX));
         let skip = skip.saturating_sub(u64::try_from(dropped).unwrap_or(u64::MAX));
         let docs: Vec<Value> = docs.into_iter().skip(dropped).collect();
@@ -693,6 +689,10 @@ async fn collection(
         .unwrap_or(u64::MAX)
         .min(max_page(headers, reads.state.max_header_len))
         .min(MAX_PAGE);
+    if filter.sort.is_some() && filter.residual.is_empty() {
+        // a surface sort reads the whole answer through the scan: a residual that always holds
+        filter.residual.push(RExpr::And(Vec::new()));
+    }
     let residual = residual_of(&filter, version)?;
     let counted = options.count == Some(true);
     let link = |cursor: u64, skip: u64, top: Option<u64>| {
@@ -717,10 +717,11 @@ async fn collection(
         version,
     };
     let shape = (set, picked.as_deref(), expansions.as_slice());
-    let served = if residual.is_none() && filter.sort.is_none() {
-        pushed(reads, caller, shape, &filter, window, &link).await?
-    } else {
-        evaluated(reads, caller, shape, &mut filter, residual, window, &link).await?
+    let served = match residual {
+        None => pushed(reads, caller, shape, &filter, window, &link).await?,
+        Some(program) => {
+            evaluated(reads, caller, shape, &mut filter, &program, window, &link).await?
+        }
     };
     let Served { docs, total, next } = served;
     let next_link = next;
@@ -1469,23 +1470,18 @@ fn residual_of(
     filter: &Translated,
     version: ODataVersion,
 ) -> Result<Option<Program>, ODataErrorResponse> {
-    program(filter, now(version)?).map_err(|refused| refusal(refused, version))
+    program(filter, now()).map_err(|refused| refusal(refused, version))
 }
 
-/// The residual that holds for every Entity: a surface sort with nothing to
-/// evaluate.
-fn everything(version: ODataVersion) -> Result<Program, ODataErrorResponse> {
-    antares_ops::residual::compile(&RExpr::And(Vec::new()), now(version)?)
-        .map_err(|_| refusal(Refused::Later, version))
-}
-
-fn now(version: ODataVersion) -> Result<DateTime, ODataErrorResponse> {
-    std::time::SystemTime::now()
+/// The wall clock; one before 1970 reads as 1970, one past 9999 as the last instant.
+fn now() -> DateTime {
+    let micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros());
+    i64::try_from(micros)
         .ok()
-        .and_then(|d| i64::try_from(d.as_micros()).ok())
         .and_then(DateTime::from_unix_micros)
-        .ok_or_else(|| refused(StatusCode::INTERNAL_SERVER_ERROR, version))
+        .unwrap_or(DateTime::MAX)
 }
 
 /// One `ViewOps::scan` of `program`: the Entities it served and the
@@ -1513,7 +1509,8 @@ async fn scanned(
             ),
         )
         .with_version(version)),
-        Err(Refusal::Malformed(TOO_COMPLEX)) => Err(refusal(Refused::TooComplex, version)),
+        // `TOO_COMPLEX` needs an evaluation past MAX_STEPS, which no program `filter` builds
+        // within MAX_NODES reaches: a plain 400
         Err(other) => Err(refused(other.status(), version)),
     }
 }
@@ -1541,11 +1538,8 @@ fn sort(docs: &mut [Value], keys: &[SortKey]) {
 fn sort_value<'d>(doc: &'d Value, by: &SortBy) -> Option<&'d Value> {
     let found = match by {
         SortBy::Id => doc.get("id"),
-        SortBy::System(name) => doc.get(*name),
+        SortBy::System(name) => doc.get(name),
         SortBy::Value(term) => default_instance(doc.get(term)).and_then(|i| i.get("value")),
-        SortBy::ObservedAt(term) => {
-            default_instance(doc.get(term)).and_then(|i| i.get("observedAt"))
-        }
     };
     found
         .map(|v| v.get("@value").unwrap_or(v))
@@ -2012,5 +2006,52 @@ mod tests {
                 .map_or_else(|| key.clone(), |(_, v)| Key::Single(v.clone())),
             Key::Single(_) => key.clone(),
         }
+    }
+
+    #[test]
+    fn the_surface_sort_puts_nothing_first_and_orders_within_a_kind() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let v = |v: Value| Some(v);
+        for (a, b, want) in [
+            (None, None, Equal),
+            (None, v(json!(1)), Less),
+            (v(json!(1)), None, Greater),
+            (v(json!(2)), v(json!(10)), Less),
+            (v(json!("b")), v(json!("a")), Greater),
+            (v(json!(false)), v(json!(true)), Less),
+            // across kinds: by kind, bool < number < string < array < object
+            (v(json!(true)), v(json!(0)), Less),
+            (v(json!("a")), v(json!([1])), Less),
+            (v(json!({"a": 1})), v(json!([1])), Greater),
+            (v(Value::Null), v(json!(false)), Less),
+        ] {
+            assert_eq!(compare(a.as_ref(), b.as_ref()), want, "{a:?} {b:?}");
+        }
+        // a JSON-LD value object sorts by its @value; ties keep their order
+        let doc = |id: &str, at: Value, speed: Value| json!({"id": id, "createdAt": at, "t0": {"type": "Property", "value": speed}});
+        let mut docs = vec![
+            doc(
+                "a",
+                json!({"@type": "DateTime", "@value": "2026-01-02"}),
+                json!(1),
+            ),
+            doc("b", json!("2026-01-01"), json!(1)),
+            doc("c", json!("2026-01-02"), json!(3)),
+        ];
+        sort(
+            &mut docs,
+            &[
+                SortKey {
+                    by: SortBy::System("createdAt".into()),
+                    descending: true,
+                },
+                SortKey {
+                    by: SortBy::Value("t0".into()),
+                    descending: false,
+                },
+            ],
+        );
+        let ids: Vec<&str> = docs.iter().filter_map(|d| d["id"].as_str()).collect();
+        assert_eq!(ids, ["a", "c", "b"]);
     }
 }

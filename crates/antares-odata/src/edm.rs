@@ -549,7 +549,8 @@ fn written(slot: &linkml_model::Slot) -> Written {
 /// C2 to C16: the writes the view offers, none of them deep or an upsert,
 /// with the members no write may name ([`Shape::writable`], the computed
 /// ones are `Core.Computed`); counting; filtering and sorting on the
-/// members [`Shape::scalar`] admits and `id` (C11, C12); expanding one
+/// members [`Shape::scalar`] admits and `id` (C11, C12), sorting also on
+/// `createdAt` and `modifiedAt`; expanding one
 /// level (C13). Advisory: every request is still gated (O25).
 fn capabilities(
     members: &BTreeMap<String, Member>,
@@ -625,7 +626,18 @@ fn capabilities(
             "SortRestrictions",
             vec![
                 ("Sortable", flag(true)),
-                ("NonSortableProperties", Expr::Collection(unserved)),
+                // `createdAt` and `modifiedAt` are sorted by the surface (T-3758)
+                (
+                    "NonSortableProperties",
+                    Expr::Collection(
+                        unserved
+                            .into_iter()
+                            .filter(|p| {
+                                !matches!(p, Expr::PropertyPath(n) if n == "createdAt" || n == "modifiedAt")
+                            })
+                            .collect(),
+                    ),
+                ),
             ],
         ),
         restriction(
