@@ -15,10 +15,10 @@
 [[exclusion]]
 crate = "antares-ops"
 file = "src/lib.rs"
-function = "Ops::run" # v0 mangling puts the impl between the crate and the type
-lines = 6
-branches = 1
-reason = "a 503 comes from a store whose pool timed out (DB_OVERLOADED); the built-in store under test_kit has no pool, and the broker's own tests cover the 503 through their pool-wall driver"
+function = "Ops::run_in" # v0 mangling puts the impl between the crate and the type
+lines = 13
+branches = 2
+reason = "6 lines, 1 branch: a 503 comes from a store whose pool timed out (DB_OVERLOADED); the built-in store under test_kit has no pool, and the broker's own tests cover the 503 through their pool-wall driver. 7 lines, 1 branch: the two tracing::info! of the surface operation line repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/ops_log.rs covers the subscriber path and asserts what it logs"
 
 [[exclusion]]
 crate = "antares-ops"
@@ -35,6 +35,14 @@ function = "antares_ops::views::inner"
 lines = 8
 branches = 0
 reason = "the view store failing: the built-in store under test_kit does not fail, and antares-ops may not name the store to put one that does in its place (module rule M2)"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/views/preview.rs"
+function = "antares_ops::views::preview::preview"
+lines = 2
+branches = 0
+reason = "the errors of building a request from a query axum already parsed and a tenant the loader validated, and of reading an in-memory body: neither can fail"
 
 [[exclusion]]
 crate = "antares-ops"
@@ -56,7 +64,7 @@ reason = "the view's tenant fails TenantId::new: the loader stores a TenantId's 
 crate = "antares-mcp"
 file = "src/server.rs"
 function = "Server::run" # v0 mangling puts the impl between the crate and the type
-lines = 5
+lines = 6
 branches = 0
 reason = "an inner answer past 32 MiB: every tool asks a bounded page (limit at most 1000, lastN at most 100), so the built-in store cannot produce one without a fixture of that size in every test run"
 
@@ -67,3 +75,11 @@ function = "Server::call" # v0 mangling puts the impl between the crate and the 
 lines = 5
 branches = 0
 reason = "tracing::info! repeats the fields in its `log` fallback, which runs only with no subscriber set; tests/mcp_log.rs covers the subscriber path and asserts what it logs"
+
+[[exclusion]]
+crate = "antares-mcp"
+file = "src/server.rs"
+function = "Server::write" # v0 mangling puts the impl between the crate and the type
+lines = 2
+branches = 1
+reason = "a deployment key file that cannot be used: the codec is a process static, so a test run with a working key never reaches the refusal; confirm::codec_of's refusals are unit-tested"

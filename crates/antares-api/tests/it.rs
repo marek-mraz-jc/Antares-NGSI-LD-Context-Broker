@@ -72,6 +72,7 @@ mod policy_pre_image;
 mod policy_temporal_window_g6;
 mod pool_overload_6_3_2;
 mod prefer_body_cap;
+mod projection_absolute_iri_4_21;
 mod query_binding_parity_5_7_2;
 mod query_json_keys_4_9;
 mod reg_index;
