@@ -248,6 +248,9 @@ struct Windowed {
     /// some Attribute holds instances past this page in its order: the
     /// response links to the next page (6.4.7.3)
     more: bool,
+    /// the fewest instances an Attribute the ceiling cut shortened still
+    /// served (`truncate`): how far the next offsetN page may move
+    cut_served: Option<usize>,
 }
 
 /// NGSI-LD 6.3.10: the most instances of one Attribute the broker serves in
@@ -273,10 +276,12 @@ const TEMPORAL_INSTANCE_LIMIT: usize = 9;
 /// back empty on this page. ETSI 020_14 checks exactly that (T-3612; the
 /// per-Attribute count of T-3456 failed it on every store).
 ///
-/// ponytail: the offsetN Links step by the ceiling, the count the boundary
-/// Attribute served; an Attribute the boundary cut shorter skips its cut
-/// instances on the next offsetN page. Continuing from the Content-Range end
-/// misses none. A boundary-aware next Link is T-3613.
+/// An Attribute the boundary cut shorter than the ceiling holds the next
+/// page's instances at a smaller offset than the boundary Attribute, so the
+/// next offsetN Link moves by the fewest instances a cut Attribute served
+/// (`cut_served`): it repeats, never skips. One cut to nothing leaves no
+/// offsetN that continues it, and the Link continues by time from the
+/// boundary instead (`interval_links`, T-3613).
 fn truncate(w: &mut Windowed, timeprop: &str, descending: bool) {
     if w.max_per_attr <= TEMPORAL_INSTANCE_LIMIT {
         return;
@@ -294,11 +299,18 @@ fn truncate(w: &mut Windowed, timeprop: &str, descending: bool) {
         .reduce(|a, b| if (b < a) != descending { b } else { a });
     let (mut ts_min, mut ts_max) = (None::<String>, None::<String>);
     for instances in w.attrs.values_mut() {
+        let before = instances.len();
         match &boundary {
             Some(bd) => instances.retain(|inst| {
                 key(inst).is_none_or(|k| if descending { k >= *bd } else { k <= *bd })
             }),
             None => instances.truncate(TEMPORAL_INSTANCE_LIMIT),
+        }
+        if instances.len() < before {
+            w.cut_served = Some(
+                w.cut_served
+                    .map_or(instances.len(), |c| c.min(instances.len())),
+            );
         }
         for inst in instances.iter() {
             if let Some(t) = inst.get(timeprop).and_then(Value::as_str) {
@@ -312,6 +324,16 @@ fn truncate(w: &mut Windowed, timeprop: &str, descending: bool) {
         }
     }
     (w.ts_min, w.ts_max) = (ts_min, ts_max);
+}
+
+/// The instant a cut page ends at in its order: the boundary `truncate`
+/// kept every Attribute to.
+fn cut_boundary(w: &Windowed, desc: bool) -> Option<&str> {
+    if desc {
+        w.ts_min.as_deref()
+    } else {
+        w.ts_max.as_deref()
+    }
 }
 
 /// 5.7.4.4 S4/S7: does a scope VALUE (string or array of strings) match the
@@ -379,6 +401,7 @@ fn window(
         ts_min: None,
         ts_max: None,
         truncated: false,
+        cut_served: None,
         more: false,
     };
     let Some(obj) = doc.as_object() else { return w };
@@ -522,6 +545,13 @@ fn content_range(
 /// media type. Ascending pages run forward in time, so their next page is
 /// `intervalafter` and their previous one `intervalbefore`; lastN pages run
 /// backward and swap the two. `step` is the page size served per Attribute.
+///
+/// A page the ceiling cut moves its next Link by `cut`, the fewest
+/// instances a cut Attribute served (see `truncate`). When that is none at
+/// all, no offsetN continues every Attribute, and the next Link asks for the
+/// time past `boundary` instead (the window's end the cut moved): `after`
+/// it ascending, which repeats the instances at the boundary instant once
+/// (4.11 `after` is inclusive), `before` it descending, which is exact.
 fn interval_links(
     params: &HashMap<String, String>,
     path: &str,
@@ -529,18 +559,21 @@ fn interval_links(
     page: InstancePage,
     more: bool,
     step: usize,
+    cut: Option<(usize, &str)>,
 ) -> Vec<String> {
     let (forward, back) = match page.desc {
         false => ("intervalafter", "intervalbefore"),
         true => ("intervalbefore", "intervalafter"),
     };
-    let link = |offset: usize, rel: &str| {
+    // the request with `set` replacing its own values of those names
+    let link = |set: Vec<(&str, String)>, rel: &str| {
         let mut qp: Vec<String> = params
             .iter()
-            .filter(|(k, _)| k.as_str() != "offsetN")
+            .filter(|(k, _)| k.as_str() != "offsetN" && !set.iter().any(|(s, _)| s == k))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .chain(set.iter().map(|(k, v)| (*k, v.as_str())))
             .map(|(k, v)| format!("{k}={}", crate::paging::query_value(v)))
             .collect();
-        qp.push(format!("offsetN={offset}"));
         qp.sort();
         format!(
             "<{path}?{}>; rel=\"{rel}\";type=\"{}\"",
@@ -548,14 +581,57 @@ fn interval_links(
             crate::paging::link_media_type(accept)
         )
     };
+    let offset = |n: usize| vec![("offsetN", n.to_string())];
     let mut links = Vec::new();
     if more {
-        links.push(link(page.offset.saturating_add(step), forward));
+        match cut {
+            None => links.push(link(offset(page.offset.saturating_add(step)), forward)),
+            Some((0, boundary)) => {
+                links.push(link(resume_after(params, page.desc, boundary), forward))
+            }
+            Some((served, _)) => {
+                links.push(link(
+                    offset(page.offset.saturating_add(served.min(step))),
+                    forward,
+                ));
+            }
+        }
     }
     if page.offset > 0 {
-        links.push(link(page.offset.saturating_sub(step), back));
+        links.push(link(offset(page.offset.saturating_sub(step)), back));
     }
     links
+}
+
+/// ponytail: ascending, a page whose boundary instant holds a whole page of
+/// one Attribute's instances links to itself; offsetN by time would fix it.
+///
+/// The request's time window moved past `boundary` in the page order: the
+/// window's other end stays (4.11: `between` is inclusive of `timeAt`,
+/// exclusive of `endTimeAt`).
+fn resume_after(
+    params: &HashMap<String, String>,
+    desc: bool,
+    boundary: &str,
+) -> Vec<(&'static str, String)> {
+    let rel = params.get("timerel").map(String::as_str);
+    let (at, end) = (params.get("timeAt"), params.get("endTimeAt"));
+    let b = boundary.to_owned();
+    let between = |from: String, to: String| {
+        vec![
+            ("timerel", "between".to_owned()),
+            ("timeAt", from),
+            ("endTimeAt", to),
+        ]
+    };
+    match (desc, rel, at, end) {
+        (false, Some("between"), _, Some(e)) | (false, Some("before"), Some(e), _) => {
+            between(b, e.clone())
+        }
+        (false, ..) => vec![("timerel", "after".to_owned()), ("timeAt", b)],
+        (true, Some("between" | "after"), Some(a), _) => between(a.clone(), b),
+        (true, ..) => vec![("timerel", "before".to_owned()), ("timeAt", b)],
+    }
 }
 
 /// Render one temporal entity from its windowed data.
@@ -1649,6 +1725,7 @@ fn respond_aggregated(
         ts_min: None,
         ts_max: None,
         truncated: false,
+        cut_served: None,
         more: false,
     };
     let mut payload: Vec<Value> = Vec::new();
@@ -2424,6 +2501,9 @@ pub(crate) async fn query_temporal_collected(
     let mut payload: Vec<Value> = Vec::new();
     let (mut g_trunc, mut g_min, mut g_maxts) = (false, None::<String>, None::<String>);
     let mut g_more = false;
+    // the next page's move: the fewest instances any Entity's cut Attribute
+    // served, and the boundary every Entity's cut reached (`interval_links`)
+    let (mut g_cut, mut g_bound) = (None::<usize>, None::<String>);
     // ADR-0023 rule 11: each Entity's history was narrowed by its rules in
     // the loop above, before the window, so lastN counts only what may be
     // seen (rule 8)
@@ -2442,6 +2522,19 @@ pub(crate) async fn query_temporal_collected(
         }
         g_trunc |= w.truncated;
         g_more |= w.more;
+        if let Some(c) = w.cut_served {
+            g_cut = Some(g_cut.map_or(c, |g| g.min(c)));
+        }
+        if let Some(b) = w.truncated.then(|| cut_boundary(&w, page_n.desc)).flatten() {
+            // the earliest boundary forwards, the latest backwards: no
+            // Entity's instance past its own boundary is left behind
+            if g_bound
+                .as_deref()
+                .is_none_or(|g| (dt_key(b) < dt_key(g)) != page_n.desc)
+            {
+                g_bound = Some(b.to_owned());
+            }
+        }
         if let Some(m) = &w.ts_min {
             if g_min.as_deref().is_none_or(|c| dt_key(m) < dt_key(c)) {
                 g_min = Some(m.clone());
@@ -2499,6 +2592,7 @@ pub(crate) async fn query_temporal_collected(
             page_n,
             g_more,
             page_n.step(trepr.aggregated),
+            g_cut.zip(g_bound.as_deref()),
         ),
     );
     // 6.18.3.2: entityMap=true — the temporal EntityMap for this query is
@@ -2759,6 +2853,7 @@ async fn retrieve_temporal_inner(
                 page_n,
                 w.more,
                 page_n.step(trepr.aggregated),
+                w.cut_served.zip(cut_boundary(&w, page_n.desc)),
             ),
         );
         if let Some(cr) = cr {
@@ -3846,6 +3941,42 @@ mod clause_6_3_10 {
             .max()
     }
 
+    /// T-3613: the time continuation keeps the window's other end, and
+    /// moves the end the page reached in its order.
+    #[test]
+    fn a_page_cut_to_nothing_resumes_past_its_boundary() {
+        let p = |kv: &[(&str, &str)]| -> HashMap<String, String> {
+            kv.iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let (a, b, e) = (
+            "2020-01-01T00:00:00Z",
+            "2020-01-01T00:08:00Z",
+            "2020-01-02T00:00:00Z",
+        );
+        let between = |from: &str, to: &str| {
+            vec![
+                ("timerel", "between".to_owned()),
+                ("timeAt", from.to_owned()),
+                ("endTimeAt", to.to_owned()),
+            ]
+        };
+        let one =
+            |rel: &str, at: &str| vec![("timerel", rel.to_owned()), ("timeAt", at.to_owned())];
+        let window = p(&[("timerel", "between"), ("timeAt", a), ("endTimeAt", e)]);
+        assert_eq!(resume_after(&window, false, b), between(b, e));
+        assert_eq!(resume_after(&window, true, b), between(a, b));
+        let before = p(&[("timerel", "before"), ("timeAt", e)]);
+        assert_eq!(resume_after(&before, false, b), between(b, e));
+        assert_eq!(resume_after(&before, true, b), one("before", b));
+        let after = p(&[("timerel", "after"), ("timeAt", a)]);
+        assert_eq!(resume_after(&after, false, b), one("after", b));
+        assert_eq!(resume_after(&after, true, b), between(a, b));
+        assert_eq!(resume_after(&p(&[]), false, b), one("after", b));
+        assert_eq!(resume_after(&p(&[]), true, b), one("before", b));
+    }
+
     /// 6.3.10: the partial content IS the representation the Content-Range
     /// describes — so the cut is one time boundary for the whole entity.
     /// With `speed` over-full first, `heading` is trimmed to the same last
@@ -4228,6 +4359,7 @@ mod clause_4_5_19 {
             ts_min: times.first().map(|s| (*s).to_owned()),
             ts_max: times.last().map(|s| (*s).to_owned()),
             truncated: false,
+            cut_served: None,
             more: false,
         }
     }
@@ -4397,6 +4529,7 @@ mod clause_4_5_19 {
             ts_min: times.first().cloned(),
             ts_max: times.last().cloned(),
             truncated: false,
+            cut_served: None,
             more: false,
         }
     }
