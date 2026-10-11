@@ -8,7 +8,7 @@ use odata_csdl::{Model, Property, TypeRef};
 use odata_url::{EdmModel, Key, ODataUri, QueryOptions, Segment};
 use serde_json::{Map, Value};
 
-use crate::model::{computed, Resource};
+use crate::model::{computed, computed_default, Resource};
 use crate::{json, BodyError, BodyLimit, Ctx, Feature};
 
 /// The bounds of one request body (ADR-0024 decision 4, threat model O22). Every reader takes
@@ -396,6 +396,12 @@ impl<'m> Reader<'_, 'm> {
                 .property(name)
                 .ok_or(BodyError::UnknownProperty)?;
             if key.contains(name) {
+                // Core.Computed: the service sets the key, a body never does.
+                if computed(self.model(), property) {
+                    return Err(BodyError::ReadOnly {
+                        property: name.clone(),
+                    });
+                }
                 self.single(name, &property.ty.name, value)?;
                 payload.key.push((name.clone(), value.clone()));
             } else {
@@ -415,10 +421,16 @@ impl<'m> Reader<'_, 'm> {
             });
         }
         if kind == WriteKind::Create {
-            if let Some(missing) = key
-                .iter()
-                .find(|k| payload.key.iter().all(|(name, _)| name != *k))
-            {
+            // A key the service computes (Core.Computed, or
+            // Core.ComputedDefaultValue when the body leaves it out) is not
+            // the client's to name.
+            let named = |k: &String| payload.key.iter().any(|(name, _)| name == k);
+            let service_sets = |k: &String| {
+                self.resource
+                    .property(k)
+                    .is_some_and(|p| computed(self.model(), p) || computed_default(self.model(), p))
+            };
+            if let Some(missing) = key.iter().find(|k| !named(k) && !service_sets(k)) {
                 return Err(BodyError::MissingKey {
                     property: missing.clone(),
                 });
@@ -473,7 +485,8 @@ fn object(input: &[u8], limits: &BodyLimits) -> Result<Map<String, Value>, BodyE
 ///
 /// Structural properties must be declared (open types are not read), have their declared type, and be
 /// neither `Core.Computed` nor named by the set's `NonInsertableProperties` (create) or
-/// `NonUpdatableProperties` (update, replace); a create names every key property. A
+/// `NonUpdatableProperties` (update, replace); a create names every key property but one the
+/// service computes (`Core.Computed`, never in a body, or `Core.ComputedDefaultValue`). A
 /// single-valued navigation property is bound by URL; nested entities, collection binds and
 /// unbinding answer [`BodyError::NotImplemented`]. `@odata.type`, when present, names the set's
 /// type; other control information and instance annotations are ignored.

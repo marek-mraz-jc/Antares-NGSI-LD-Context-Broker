@@ -149,7 +149,7 @@ impl Form<'_> {
 }
 
 /// `POST {Set}` (W1, W2): Create Entity of the set's type with the body's
-/// id; `201` with the Entity as the view reads it and its `Location`, or
+/// id, or a minted one when the body leaves out the key; `201` with the Entity as the view reads it and its `Location`, or
 /// `204` under `Prefer: return=minimal`.
 async fn create(
     reads: &Reads,
@@ -170,19 +170,22 @@ async fn create(
         &BodyLimits::strict(),
     )
     .map_err(|e| body_error(&e, version))?;
-    // The reader requires the key and checks it against its Edm type.
-    let (id, own) = payload
-        .key
-        .first()
-        .and_then(|(_, value)| Some((body_id(set, value)?, value)))
-        .ok_or_else(|| body_error(&invalid_key(), version))?;
+    // The reader checks a key against its Edm type, and leaves one out
+    // only where `$metadata` says the service computes it (W1).
+    let (id, own) = match payload.key.first() {
+        Some((_, value)) => (
+            body_id(set, value).ok_or_else(|| body_error(&invalid_key(), version))?,
+            value.clone(),
+        ),
+        None => minted(set, set_name),
+    };
     let mut doc = attributes(set, &payload.properties, WriteKind::Create);
     // E2a: the identifier is an Attribute of its own too.
     let identifier = set
         .identifier
         .as_ref()
         .and_then(|i| set.members.get(&i.member));
-    doc.extend(identifier.and_then(|m| Some((m.iri.clone(), attribute(m, own)?))));
+    doc.extend(identifier.and_then(|m| Some((m.iri.clone(), attribute(m, &own)?))));
     bind(reads, caller, set, &payload.binds, &mut doc, version).await?;
     doc.insert("id".into(), Value::from(id.as_str()));
     doc.insert("type".into(), Value::from(set.type_iri.as_str()));
@@ -224,6 +227,18 @@ async fn create(
     }
     answer.headers_mut().insert(LOCATION, location);
     Ok(answer)
+}
+
+/// W1: the URN of a create that names no key and the key value it is
+/// under: `urn:ngsi-ld:{Set}:{uuid}`, or the E2a identifier's prefix and
+/// the uuid as its value.
+fn minted(set: &Set, set_name: &str) -> (String, Value) {
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let prefix = set
+        .identifier
+        .as_ref()
+        .map_or_else(|| format!("urn:ngsi-ld:{set_name}:"), |i| i.prefix.clone());
+    (format!("{prefix}{uuid}"), Value::from(uuid))
 }
 
 /// `PATCH` (W4) and `PUT` (W6) of an Entity: Merge or Replace Entity of

@@ -406,3 +406,70 @@ async fn entity_dereferences_an_id_of_this_service() {
         assert_eq!(a.status, StatusCode::BAD_REQUEST, "{id}: {}", a.body);
     }
 }
+
+/// W1 (T-3721): a create that leaves out a `Guid` or `String` key gets a
+/// uuid as its key value and the URN from it, the identifier stored as its
+/// own Attribute; an `Int64` key has no such default and stays required.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_without_the_key_mints_its_value() {
+    let (_b, app) = shop().await.expect("broker");
+    let uuid_of = |location: &str, set: &str, quote: &str| {
+        let value = location
+            .rsplit_once(&format!("/{set}({quote}"))
+            .and_then(|(_, rest)| rest.strip_suffix(&format!("{quote})")))
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(
+            (value.len(), value.split('-').count()),
+            (36, 5),
+            "{location}"
+        );
+        value
+    };
+    let a = odata(&app, Method::POST, "Product", Some(r#"{"Name": "Saw"}"#)).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let guid = uuid_of(&a.location, "Product", "");
+    assert_eq!(a.body["ID"], guid.as_str(), "{}", a.body);
+    let stored = send(
+        &app,
+        Method::GET,
+        &format!("/ngsi-ld/v1/entities/urn:ngsi-ld:Product:{guid}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        stored.body[format!("{SHOP}ID")]["value"],
+        guid.as_str(),
+        "{}",
+        stored.body
+    );
+
+    let a = odata(&app, Method::POST, "Category", Some(r#"{"Name": "Saws"}"#)).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let code = uuid_of(&a.location, "Category", "'");
+    let read = odata(&app, Method::GET, &format!("Category('{code}')"), None).await;
+    assert_eq!(read.body["Name"], "Saws", "{}", read.body);
+
+    let a = odata(&app, Method::POST, "Bin", Some("{}")).await;
+    assert_eq!(
+        (a.status, a.body["error"]["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("MissingKey")),
+        "{}",
+        a.body
+    );
+
+    let a = odata(&app, Method::GET, "$metadata?$format=json", None).await;
+    let ns = &a.body["shop"];
+    for (ty, key, minted) in [
+        ("Product", "ID", true),
+        ("Category", "code", true),
+        ("Bin", "number", false),
+    ] {
+        assert_eq!(
+            ns[ty][key]["@Core.ComputedDefaultValue"].as_bool(),
+            minted.then_some(true),
+            "{ty}.{key}: {}",
+            ns[ty]
+        );
+    }
+}

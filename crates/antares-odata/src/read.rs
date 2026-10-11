@@ -1426,6 +1426,26 @@ mod tests {
         assert_eq!(body_id(&set, &json!(null)), None);
     }
 
+    #[test]
+    fn a_string_key_keeps_its_case_and_a_broken_escape_decodes_to_nothing() {
+        let codes = Set {
+            identifier: Some(crate::edm::Identifier {
+                member: "code".into(),
+                edm: "Edm.String",
+                prefix: "urn:ngsi-ld:P:".into(),
+            }),
+            ..set()
+        };
+        assert_eq!(
+            body_id(&codes, &json!("Ab")),
+            Some("urn:ngsi-ld:P:Ab".into())
+        );
+        assert_eq!(percent_decoded("P%28a%29"), Some("P(a)".into()));
+        for broken in ["P%zz", "P%2", "%FF"] {
+            assert_eq!(percent_decoded(broken), None, "{broken}");
+        }
+    }
+
     fn single_or(key: &Key) -> Key {
         // The canonical form of a named key is the single one.
         match key {

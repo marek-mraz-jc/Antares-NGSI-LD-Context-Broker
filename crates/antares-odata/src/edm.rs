@@ -241,8 +241,8 @@ pub fn build(
                 }
                 other => {
                     let p = property(&member, &slot_iri, other, schema, &slot);
-                    let key = ty.key.contains(&member);
-                    ty.properties.push(if key { p.required() } else { p });
+                    ty.properties
+                        .push(key_property(p, ty.key.contains(&member), other));
                 }
             }
             members.insert(
@@ -279,6 +279,26 @@ pub fn build(
         namespace,
         sets,
     })
+}
+
+/// A key member is required, and one a create may leave out is
+/// `Core.ComputedDefaultValue`: the surface mints a uuid for a `Guid` or
+/// `String` key (W1).
+fn key_property(p: Property, key: bool, shape: &Shape) -> Property {
+    if !key {
+        return p;
+    }
+    let mut p = p.required();
+    if matches!(
+        shape,
+        Shape::Value {
+            edm: "Edm.Guid" | "Edm.String",
+            ..
+        }
+    ) {
+        p.annotations.push(core("ComputedDefaultValue"));
+    }
+    p
 }
 
 /// E2a: `ty` declares the base members itself and is keyed by `member`.
@@ -585,8 +605,11 @@ fn base_properties() -> Vec<Property> {
         p.annotations.push(core("Computed"));
         p
     };
+    // W1: a create that leaves out `id` gets one minted
+    let mut id = Property::new("id", TypeRef::single("Edm.String")).required();
+    id.annotations.push(core("ComputedDefaultValue"));
     vec![
-        Property::new("id", TypeRef::single("Edm.String")).required(),
+        id,
         computed(Property::new("_types", TypeRef::collection("Edm.String"))),
         Property::new("scope", TypeRef::collection("Edm.String")).required(),
         computed(Property::new(
