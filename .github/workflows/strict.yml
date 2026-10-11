@@ -300,7 +300,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [antares-model, antares-ql, antares-matcher, linkml-model, odata-csdl, odata-url, odata-json, odata-batch]
+        crate: [antares-model, antares-ql, antares-matcher, linkml-model, odata-csdl, odata-url, odata-json, odata-batch, antares-residual]
     env:
           # ignore-leaks: crossbeam-epoch parks its per-thread handle in a thread-local
           # that Miri reports as leaked at exit; not a broker leak.
