@@ -495,9 +495,15 @@ impl Rule {
     /// so a temporal instance is selected the same way (unlike the
     /// condition, [`Rule::is_conditional`]).
     pub fn selects(&self, doc: &Value) -> bool {
-        entity_types(doc)
-            .iter()
-            .any(|t| self.types.iter().any(|r| r == t))
+        // `entity_types` read in place: this runs per rule per Entity of a
+        // page, and the list it would allocate is read once.
+        let named = |t: &str| self.types.iter().any(|r| r == t);
+        let typed = match doc.get("type") {
+            Some(Value::String(t)) => named(t),
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).any(named),
+            _ => false,
+        };
+        typed
             && match doc.get("id").and_then(Value::as_str) {
                 Some(id) => self.selects_id(id),
                 None => self.ids.is_empty() && self.id_patterns.is_empty(),

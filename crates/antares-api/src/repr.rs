@@ -194,15 +194,63 @@ pub fn narrow_projection(
 /// The Entity frame survives a policy pick — 5.2.4 makes `id` and `type`
 /// the Entity, and a document without them is not one — which is why the
 /// policy pick is applied to Attributes and never to the core members.
-pub fn narrow_repr(r: &mut Repr, f: &crate::policy::Filter) {
+pub fn narrow_repr(r: &mut Repr, f: &std::sync::Arc<crate::policy::Filter>) {
+    // A view or an engine answers every request with the same narrowing,
+    // and the gate hands it out as one shared `Arc`: its reach is built
+    // once and handed out again while that `Arc` comes back. The memo
+    // holds the `Arc` itself, so its address cannot be reused by another
+    // Filter while it is kept, and `ptr_eq` never answers for rules other
+    // than its own (O16).
+    type Reached = (
+        std::sync::Arc<crate::policy::Filter>,
+        Option<std::sync::Arc<PolicyReach>>,
+        Option<std::sync::Arc<crate::policy::Filter>>,
+    );
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<Reached>> = const { std::cell::RefCell::new(None) };
+    }
+    let hit = LAST.with_borrow(|last| {
+        last.as_ref()
+            .filter(|l| std::sync::Arc::ptr_eq(&l.0, f))
+            .map(|l| (l.1.clone(), l.2.clone()))
+    });
+    let (reach, rules) = hit.unwrap_or_else(|| {
+        let built = reach_of(f);
+        LAST.set(Some((f.clone(), built.0.clone(), built.1.clone())));
+        built
+    });
+    fill(r, f, reach, rules);
+}
+
+/// The reach of `f` and its expanded rules, built afresh.
+fn reach_of(
+    f: &crate::policy::Filter,
+) -> (
+    Option<std::sync::Arc<PolicyReach>>,
+    Option<std::sync::Arc<crate::policy::Filter>>,
+) {
     let rules = type_rules(f);
-    if f.q.is_some() || f.scope_q.is_some() || f.areas().next().is_some() || rules.is_some() {
-        r.policy_reach = Some(std::sync::Arc::new(PolicyReach {
-            q: f.q.as_deref().cloned(),
-            scope_q: f.scope_q.clone(),
-            areas: f.areas().cloned().collect(),
-            rules: rules.clone(),
-        }));
+    let reach =
+        (f.q.is_some() || f.scope_q.is_some() || f.areas().next().is_some() || rules.is_some())
+            .then(|| {
+                std::sync::Arc::new(PolicyReach {
+                    q: f.q.as_deref().cloned(),
+                    scope_q: f.scope_q.clone(),
+                    areas: f.areas().cloned().collect(),
+                    rules: rules.clone(),
+                })
+            });
+    (reach, rules)
+}
+
+fn fill(
+    r: &mut Repr,
+    f: &crate::policy::Filter,
+    reach: Option<std::sync::Arc<PolicyReach>>,
+    rules: Option<std::sync::Arc<crate::policy::Filter>>,
+) {
+    if reach.is_some() {
+        r.policy_reach = reach;
     }
     if !f.omit.is_empty() {
         r.policy_omit = Some(policy_nodes(&f.omit));
@@ -447,7 +495,8 @@ pub(crate) fn policy_view(doc: &Value, r: &Repr) -> Value {
 /// the Filter but builds no representation of its own.
 pub fn narrowing(f: &crate::policy::Filter) -> Repr {
     let mut r = Repr::default();
-    narrow_repr(&mut r, f);
+    let (reach, rules) = reach_of(f);
+    fill(&mut r, f, reach, rules);
     r
 }
 
@@ -2145,5 +2194,45 @@ mod type_rules_memo_tests {
         );
         assert!(type_rules(&car).unwrap().omit_by_type.is_empty());
         assert!(type_rules(&Filter::default()).is_none());
+    }
+
+    /// T-3697: the reach memo answers for the one `Arc` it holds. The same
+    /// `Arc` gets the same reach back; another `Arc`, even one with equal
+    /// content, or a narrowing that was dropped and rebuilt, gets its own,
+    /// so a reach never outlives the Filter it was made from.
+    #[test]
+    fn the_reach_memo_answers_only_for_its_own_arc() {
+        use std::sync::Arc;
+        let reach = |f: &Arc<Filter>| {
+            let mut r = super::Repr::default();
+            super::narrow_repr(&mut r, f);
+            r
+        };
+        let car = Arc::new(filter("Car", "speed"));
+        let user = Arc::new(filter("User", "name"));
+        let (a, b) = (reach(&car), reach(&car));
+        let (ra, rb) = (a.policy_reach.unwrap(), b.policy_reach.unwrap());
+        assert!(Arc::ptr_eq(&ra, &rb), "the same Arc reuses its reach");
+        for (f, t) in [(&user, "User"), (&car, "Car"), (&user, "User")] {
+            let got = reach(f).policy_reach.unwrap();
+            let rules = got.rules.as_ref().unwrap();
+            assert_eq!(rules.rules[0].types, vec![format!("{DEFAULT}{t}")]);
+        }
+        let twin = Arc::new(filter("Car", "speed"));
+        let own = reach(&twin).policy_reach.unwrap();
+        assert!(
+            !Arc::ptr_eq(&own, &ra),
+            "an equal Filter in another Arc builds its own"
+        );
+        assert_eq!(own.rules, ra.rules);
+        let narrowed = Arc::new(Filter {
+            q: Some(Box::new(antares_ql::parse_q("speed>1").expect("q"))),
+            ..Filter::default()
+        });
+        assert!(reach(&narrowed).policy_reach.unwrap().q.is_some());
+        let open = crate::policy::unnarrowed();
+        let none = reach(&open);
+        assert!(none.policy_reach.is_none() && none.policy_types.is_none());
+        assert!(super::narrowing(&car).policy_reach.unwrap().rules.is_some());
     }
 }
