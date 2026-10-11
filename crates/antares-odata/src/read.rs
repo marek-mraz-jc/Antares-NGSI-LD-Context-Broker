@@ -80,7 +80,6 @@ fn later(uri: &ODataUri) -> Option<&'static str> {
     };
     let refused = [
         (options.expand.is_some(), "$expand"),
-        (options.skiptoken.is_some(), "$skiptoken"),
         (options.id.is_some(), "$id"),
         (
             options.schemaversion.as_deref().is_some_and(|v| v != "*"),
@@ -173,9 +172,16 @@ async fn collection(
     let set = set_of(reads, set_name, version)?;
     let picked = selected(set, options).map_err(|()| not_implemented(version))?;
     let filter = filtered(set, options, version)?;
-    let skip = options.skip.unwrap_or(0);
-    let page = options
-        .top
+    let digest = digest(&reads.state.service_root, path, options);
+    let (skip, top) = match &options.skiptoken {
+        None => (options.skip.unwrap_or(0), options.top),
+        // The token carries both: a $skip or $top beside it is an edit.
+        Some(_) if options.skip.is_some() || options.top.is_some() => {
+            return Err(bad_token(version))
+        }
+        Some(text) => read_token(text, digest).ok_or_else(|| bad_token(version))?,
+    };
+    let page = top
         .unwrap_or(u64::MAX)
         .min(max_page(headers, reads.state.max_header_len))
         .min(MAX_PAGE);
@@ -198,13 +204,16 @@ async fn collection(
         .collect();
     let served = u64::try_from(entities.len()).unwrap_or(u64::MAX);
     let next = skip.saturating_add(served);
-    let end = options
-        .top
-        .map_or(total, |top| total.min(skip.saturating_add(top)));
+    let end = top.map_or(total, |top| total.min(skip.saturating_add(top)));
     let next_link = (served > 0 && next < end).then(|| {
         let rest = QueryOptions {
-            skip: Some(next),
-            top: options.top.map(|top| top.saturating_sub(served)),
+            skip: None,
+            top: None,
+            skiptoken: Some(token(
+                next,
+                top.map(|top| top.saturating_sub(served)),
+                digest,
+            )),
             ..options.clone()
         };
         let uri = ODataUri::Resource {
@@ -338,6 +347,59 @@ fn filtered(
         )
         .with_version(version),
     })
+}
+
+/// The digest a `$skiptoken` carries (S5.2): the view's service root and
+/// the request without its paging, so a token read under another view or
+/// another query does not match. ponytail: std `SipHash`; a forged token
+/// does no more than `$skip`, every page is narrowed by the store again.
+fn digest(root: &str, path: &[Segment], options: &QueryOptions) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let normal = ODataUri::Resource {
+        path: path.to_vec(),
+        options: QueryOptions {
+            skip: None,
+            top: None,
+            skiptoken: None,
+            ..options.clone()
+        },
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{root}{normal}").hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `{offset}.{remaining $top or -}.{digest}`.
+fn token(offset: u64, top: Option<u64>, digest: u64) -> String {
+    let top = top.map_or_else(|| "-".to_owned(), |t| t.to_string());
+    format!("{offset}.{top}.{digest:016x}")
+}
+
+/// The offset and remaining `$top` of a token issued for `digest`.
+fn read_token(text: &str, digest: u64) -> Option<(u64, Option<u64>)> {
+    let mut parts = text.split('.');
+    let (Some(offset), Some(top), Some(tag), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if tag != format!("{digest:016x}") {
+        return None;
+    }
+    let top = match top {
+        "-" => None,
+        n => Some(n.parse().ok()?),
+    };
+    Some((offset.parse().ok()?, top))
+}
+
+fn bad_token(version: ODataVersion) -> ODataErrorResponse {
+    ODataErrorResponse::new(
+        StatusCode::BAD_REQUEST,
+        "BadRequest",
+        "the skip token does not belong to this request",
+    )
+    .with_version(version)
 }
 
 /// The Entity id a key predicate names: `('urn:…')` or `(id='urn:…')`,
@@ -744,6 +806,22 @@ mod tests {
         ] {
             let answer = refused(status, ODataVersion::V4_01).into_response();
             assert_eq!(answer.status(), status, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_token_reads_back_only_under_its_digest() {
+        assert_eq!(read_token(&token(5, Some(3), 7), 7), Some((5, Some(3))));
+        assert_eq!(read_token(&token(5, None, 7), 7), Some((5, None)));
+        for bad in [
+            token(5, None, 8),
+            "5.-".to_owned(),
+            format!("5.-.{:016x}.x", 7),
+            format!("x.-.{:016x}", 7),
+            format!("5.x.{:016x}", 7),
+            "5.-.7".to_owned(),
+        ] {
+            assert_eq!(read_token(&bad, 7), None, "{bad}");
         }
     }
 

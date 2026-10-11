@@ -204,35 +204,44 @@ async fn odata_count_is_the_narrowed_count() {
 #[tokio::test(flavor = "multi_thread")]
 async fn top_and_skip_page_and_the_next_link_carries_the_rest() {
     let (_b, app) = broker().await.expect("broker");
-    let got = send(
+    let one = [("Prefer", "odata.maxpagesize=1")];
+    let first = send(
         &app,
         Method::GET,
-        &format!("{ROOT}/Car?$top=2"),
+        &format!("{ROOT}/Car?$top=2&$filter=speed%20gt%201"),
         None,
-        &[("Prefer", "odata.maxpagesize=1")],
+        &one,
     )
     .await;
-    let body = got.json();
+    let body = first.json();
     assert_eq!(body["value"].as_array().map(Vec::len), Some(1), "{body}");
-    assert_eq!(
-        body["@odata.nextLink"],
-        format!("{ROOT}/Car?$top=1&$skip=1"),
-        "{body}"
+    let next = body["@odata.nextLink"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        next.starts_with(&format!(
+            "{ROOT}/Car?$filter=speed%20gt%201&$skiptoken=1.1."
+        )),
+        "{next}"
     );
-    let got = send(
-        &app,
-        Method::GET,
-        &format!("{ROOT}/Car?$top=1&$skip=1"),
-        None,
-        &[],
-    )
-    .await;
-    let body = got.json();
+    assert!(
+        !next.contains("$top") && !next.contains("$skip="),
+        "the token carries both: {next}"
+    );
+    let second = send(&app, Method::GET, &next, None, &one).await;
+    let body = second.json();
     assert_eq!(body["value"].as_array().map(Vec::len), Some(1), "{body}");
     assert!(
         body.get("@odata.nextLink").is_none(),
         "$top is used up: {body}"
     );
+    assert_ne!(
+        body["value"][0]["id"],
+        first.json()["value"][0]["id"],
+        "the next page"
+    );
+
     let got = send(&app, Method::GET, &format!("{ROOT}/Car?$skip=2"), None, &[]).await;
     let body = got.json();
     assert_eq!(body["value"].as_array().map(Vec::len), Some(1), "{body}");
@@ -240,20 +249,30 @@ async fn top_and_skip_page_and_the_next_link_carries_the_rest() {
         body.get("@odata.nextLink").is_none(),
         "the last page: {body}"
     );
-    let got = send(
-        &app,
-        Method::GET,
-        &format!("{ROOT}/Car"),
-        None,
-        &[("Prefer", "odata.maxpagesize=2")],
-    )
-    .await;
-    assert_eq!(
-        got.json()["@odata.nextLink"],
-        format!("{ROOT}/Car?$skip=2"),
-        "{}",
-        got.body
-    );
+
+    let mut ids = Vec::new();
+    let mut link = Some(format!("{ROOT}/Car"));
+    while let Some(uri) = link.take() {
+        let page = send(
+            &app,
+            Method::GET,
+            &uri,
+            None,
+            &[("Prefer", "odata.maxpagesize=2")],
+        )
+        .await;
+        let body = page.json();
+        assert_eq!(page.status, StatusCode::OK, "{uri}: {body}");
+        ids.extend(
+            body["value"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|e| e["id"].clone()),
+        );
+        link = body["@odata.nextLink"].as_str().map(str::to_owned);
+    }
+    assert_eq!(ids.len(), 3, "every Entity once: {ids:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -436,7 +455,6 @@ async fn the_forms_of_later_rounds_are_501_and_read_only_writes_405() {
         "Car?$filter=not%20(speed%20gt%201)",
         "Car('urn:ngsi-ld:Car:1')?$filter=speed%20gt%201",
         "Car?$expand=*",
-        "Car?$skiptoken=x",
         "Car?$schemaversion=2",
         "Car('urn:ngsi-ld:Car:1')/speed",
         "$entity?$id=Car('urn:ngsi-ld:Car:1')",
