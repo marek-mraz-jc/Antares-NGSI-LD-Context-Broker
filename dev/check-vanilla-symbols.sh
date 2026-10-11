@@ -30,9 +30,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Rust paths, as `nm --demangle` prints them.
-SYMBOLS='(^|[^A-Za-z0-9_])(antares_(ops|views|odata|mcp|linkml|ws|icsr|plugin_[a-z_]+)|odata_(url|csdl|json|batch|axum)|linkml_model|rmcp|tungstenite)::'
+SYMBOLS='(^|[^A-Za-z0-9_])(antares_(ops|views|odata|mcp|linkml|ws|icsr|plugin_[a-z_]+)|joinedcontext_[a-z_]+|odata_(url|csdl|json|batch|axum)|linkml_model|rmcp|tungstenite)::'
 # The same crates as package names, as the auditable list carries them.
-PACKAGES='^(antares-(ops|views|odata|mcp|linkml|ws|icsr|plugin-.+)|odata-.+|linkml-model|rmcp|tungstenite)$'
+PACKAGES='^(antares-(ops|views|odata|mcp|linkml|ws|icsr|plugin-.+)|joinedcontext-.+|odata-.+|linkml-model|rmcp|tungstenite)$'
 
 if [ "${1:-}" = --sbom ]; then
   sbom=${2:?usage: --sbom <cdx.json>}
