@@ -370,6 +370,34 @@ async fn metadata(
     Ok(respond(version, content_type, out))
 }
 
+/// The JSON metadata level a resource is written at (JSON Format 4.01 section 3.1): `$format`
+/// first, then `Accept` by quality. A resource has no XML form, so XML or any other type is
+/// 406, as an `Accept` header this service cannot read is 400.
+///
+/// # Errors
+///
+/// The refusal, in the request's version.
+pub fn json_level(
+    request: &ODataRequest,
+    headers: &HeaderMap,
+    max_header_len: usize,
+) -> Result<MetadataLevel, ODataErrorResponse> {
+    let format = options(&request.uri).and_then(|o| o.format.as_ref());
+    match body(format, headers, max_header_len, false)
+        .map_err(|e| e.with_version(request.version))?
+    {
+        Body::Json(level) => Ok(level),
+        Body::Xml => Err(not_acceptable().with_version(request.version)),
+    }
+}
+
+/// A `200` JSON answer: `body` as written, its content type carrying the metadata level in the
+/// spelling of `version`, and `OData-Version`.
+#[must_use]
+pub fn json_response(version: ODataVersion, level: MetadataLevel, body: Vec<u8>) -> Response {
+    respond(version, json_type(version, level), body)
+}
+
 fn respond(version: ODataVersion, content_type: &'static str, body: Vec<u8>) -> Response {
     let mut response = (StatusCode::OK, body).into_response();
     let headers = response.headers_mut();

@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode};
 use axum::routing;
 use axum::Router;
 use http_body_util::BodyExt;
-use odata_axum::{metadata_router, ODataRequest, ODataState};
+use odata_axum::{json_level, json_response, metadata_router, ODataRequest, ODataState};
 use odata_csdl::{
     CsdlVersion, EntityContainer, EntitySet, EntityType, Model, Property, Schema, TypeRef,
 };
@@ -446,5 +446,74 @@ async fn the_extractor_parses_below_the_service_root_and_answers_refusals_with_t
         "{}",
         answer.body
     );
+    Ok(())
+}
+
+async fn level(request: ODataRequest, headers: axum::http::HeaderMap) -> axum::response::Response {
+    match json_level(&request, &headers, 64) {
+        Ok(level) => json_response(request.version, level, b"{}".to_vec()),
+        Err(refused) => axum::response::IntoResponse::into_response(refused),
+    }
+}
+
+/// A surface's own resource: JSON at the level `$format` or `Accept` asks, never XML.
+#[tokio::test]
+async fn a_resource_is_json_at_the_level_asked_and_xml_is_406() -> Result<(), String> {
+    let routes = Router::new()
+        .route("/{*rest}", routing::get(level))
+        .with_state(Arc::new(state()));
+    let app = || Router::new().nest("/odata", routes.clone());
+    for (uri, headers, status, content_type) in [
+        (
+            "/odata/Buildings",
+            &[][..],
+            StatusCode::OK,
+            "application/json;odata.metadata=minimal",
+        ),
+        (
+            "/odata/Buildings",
+            &[V401][..],
+            StatusCode::OK,
+            "application/json;metadata=minimal",
+        ),
+        (
+            "/odata/Buildings?$format=application/json;metadata=full",
+            &[V401][..],
+            StatusCode::OK,
+            "application/json;metadata=full",
+        ),
+        (
+            "/odata/Buildings",
+            &[("Accept", "application/json;odata.metadata=none")][..],
+            StatusCode::OK,
+            "application/json;odata.metadata=none",
+        ),
+        (
+            "/odata/Buildings?$format=xml",
+            &[][..],
+            StatusCode::NOT_ACCEPTABLE,
+            "application/json",
+        ),
+        (
+            "/odata/Buildings",
+            &[("Accept", "application/xml")][..],
+            StatusCode::NOT_ACCEPTABLE,
+            "application/json",
+        ),
+        (
+            "/odata/Buildings",
+            &[("Accept", "text/plain")][..],
+            StatusCode::NOT_ACCEPTABLE,
+            "application/json",
+        ),
+    ] {
+        let answer = get_with(app(), uri, headers).await?;
+        assert_eq!(answer.status, status, "{uri} {headers:?}: {}", answer.body);
+        assert_eq!(answer.content_type, content_type, "{uri} {headers:?}");
+        assert!(
+            answer.version.is_some(),
+            "{uri}: OData-Version on every answer"
+        );
+    }
     Ok(())
 }

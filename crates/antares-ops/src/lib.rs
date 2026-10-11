@@ -426,6 +426,22 @@ pub trait Surface: Send + Sync + 'static {
     fn version_info(&self) -> serde_json::Value;
 }
 
+/// The name an NGSI-LD answer gives the expanded IRI `iri` when the
+/// request names no `@context`: its compaction under the core context, the
+/// IRI itself when the core context has no term for it. A surface that
+/// reads an answer by IRI maps its keys through this.
+///
+/// ```
+/// assert_eq!(antares_ops::core_name("https://uri.etsi.org/ngsi-ld/location"), "location");
+/// assert_eq!(antares_ops::core_name("https://example.org/speed"), "https://example.org/speed");
+/// ```
+#[must_use]
+pub fn core_name(iri: &str) -> String {
+    static CORE: std::sync::LazyLock<antares_jsonld::Context> =
+        std::sync::LazyLock::new(antares_jsonld::core_context);
+    CORE.compact_iri(iri)
+}
+
 /// `surface` as the broker mounts it.
 ///
 /// ```
@@ -603,6 +619,18 @@ pub mod test_kit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_iri_is_named_as_an_answer_without_a_context_names_it() {
+        assert_eq!(
+            core_name("https://uri.etsi.org/ngsi-ld/location"),
+            "location"
+        );
+        assert_eq!(
+            core_name("https://example.org/speed"),
+            "https://example.org/speed"
+        );
+    }
 
     #[test]
     fn a_request_keeps_its_own_headers_and_body_and_drops_the_outer_ones() {

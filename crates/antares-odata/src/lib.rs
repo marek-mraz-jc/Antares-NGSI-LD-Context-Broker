@@ -21,14 +21,15 @@
 
 pub mod edm;
 mod names;
+mod read;
 
-use antares_ops::{Ops, Surface, ViewOps};
+use antares_ops::{Caller, Ops, Surface, ViewOps};
 use axum::extract::{MatchedPath, Request};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
 use axum::Router;
-use odata_axum::{ODataErrorResponse, ODataState};
+use odata_axum::{ODataErrorResponse, ODataRequest, ODataState};
 use odata_csdl::CsdlVersion;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
@@ -101,7 +102,7 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
         return not_found();
     };
     let state = Arc::new(ODataState {
-        model: Arc::new(edm.csdl),
+        model: Arc::new(edm.csdl.clone()),
         service_root: format!("{PREFIX}/{id}/odata/v4/"),
         url_limits: odata_url::Limits::strict(),
         csdl_limits: odata_csdl::Limits::strict(),
@@ -109,11 +110,26 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
     });
     // The inner router matches its own path; the outer match goes.
     req.extensions_mut().remove::<MatchedPath>();
+    let reads = Arc::new(read::Reads {
+        view,
+        edm: Arc::new(edm),
+        state: state.clone(),
+    });
+    let api =
+        odata_axum::metadata_router(state.clone()).merge(
+            Router::new()
+                .fallback(
+                    move |method: Method,
+                          caller: Caller,
+                          request: ODataRequest,
+                          headers: HeaderMap| async move {
+                        read::serve(&reads, &method, &caller, &request, &headers).await
+                    },
+                )
+                .with_state(state),
+        );
     let Ok(resp) = Router::new()
-        .nest_service(
-            &format!("/{id}/odata/v4"),
-            odata_axum::metadata_router(state),
-        )
+        .nest_service(&format!("/{id}/odata/v4"), api)
         .oneshot(req)
         .await;
     resp
