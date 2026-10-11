@@ -53,9 +53,17 @@ print(f\"{s['http_reqs']['rate']:.0f} {s['http_req_duration']['p(99)']:.2f}\")")
 seed() {  # seed <store>: ENTITIES Vehicles into the broker on PORT, settled
   k6 run --quiet -e BROKER_URL="http://127.0.0.1:$PORT" -e SHAPE=seed \
     -e ENTITIES="${ENTITIES:-100}" dev/perf/k6-shapes.js >/dev/null
+  # a seed that did not land would measure an empty broker
+  curl -sf -o /dev/null "http://127.0.0.1:$PORT/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:shape:$(( ${ENTITIES:-100} - 1 ))" \
+    || { echo "$1: seed missing" >&2; exit 1; }
   if [ "$1" = postgres ]; then
     psql "$DATABASE_URL" -qX -v ON_ERROR_STOP=1 -c 'VACUUM (ANALYZE)' -c 'CHECKPOINT'
   fi
+}
+
+unseed() {  # the seeded Vehicles out again, so a PostgreSQL keeps nothing
+  k6 run --quiet -e BROKER_URL="http://127.0.0.1:$PORT" -e SHAPE=unseed \
+    -e ENTITIES="${ENTITIES:-100}" dev/perf/k6-shapes.js >/dev/null
 }
 
 {
@@ -84,6 +92,7 @@ seed() {  # seed <store>: ENTITIES Vehicles into the broker on PORT, settled
       [ -n "${rps:-}" ] || { echo "$store $shape: no number" >&2; exit 1; }
       echo "| $store | $shape | c$vus | $rps | $p99 ms |"
     done
+    unseed
     kill "$PID"; wait "$PID" 2>/dev/null || true; PID=
   done
   # ADR-0027 section 6 end to end (T-3523): the `full` binary with view
