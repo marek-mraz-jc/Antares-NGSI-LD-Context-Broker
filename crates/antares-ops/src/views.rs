@@ -35,6 +35,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
 
+pub mod rule_documents;
+
 /// How often, in milliseconds, every pod rebuilds its table from the store
 /// (default 5000): the bound on how long a view written on one pod takes to
 /// open, change or close on another.
@@ -372,6 +374,8 @@ struct Reloader {
     /// Each stored document and its entry, so an unchanged view is not
     /// validated (and its notes not logged) again on every reload.
     cache: tokio::sync::Mutex<HashMap<String, (Value, ViewEntry)>>,
+    /// The same for the policy engine's rule documents, per Tenant.
+    policy: tokio::sync::Mutex<rule_documents::Cache>,
 }
 
 impl Reloader {
@@ -400,7 +404,8 @@ impl Reloader {
                 .collect::<BTreeMap<_, _>>(),
         );
         *cache = next;
-        Ok(())
+        drop(cache);
+        rule_documents::reload(&self.state, &mut *self.policy.lock().await).await
     }
 }
 
@@ -417,9 +422,11 @@ fn log_entry(id: &str, e: &ViewEntry) {
     }
 }
 
-/// Load the stored views into `state`'s table, serve `/q/views` on its
-/// admin surface, and reload the table every [`RELOAD_ENV`] milliseconds.
-/// Call it once, before the router is built, inside a tokio runtime.
+/// Load the stored views into `state`'s table, serve `/q/views` and
+/// `/q/policy` on its admin surface, and reload the table every
+/// [`RELOAD_ENV`] milliseconds. Call it once, after the policy engine is
+/// attached (the rule documents go to the engine of the `state` given
+/// here) and before the router is built, inside a tokio runtime.
 ///
 /// # Errors
 /// The store's, or routes set already.
@@ -427,6 +434,7 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
     let reloader = Arc::new(Reloader {
         state: state.clone(),
         cache: tokio::sync::Mutex::new(HashMap::new()),
+        policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
     });
     reloader.reload().await?;
     // The routes live in the table the reloader fills; a strong handle there
@@ -475,7 +483,8 @@ impl Reload {
     }
 }
 
-/// `/q/views`: the table (GET), and one view's document (GET, PUT, DELETE).
+/// `/q/views`: the table (GET), and one view's document (GET, PUT, DELETE);
+/// and `/q/policy` beside it.
 fn admin(r: &Weak<Reloader>) -> Router {
     let (list, one, put, del) = (r.clone(), r.clone(), r.clone(), r.clone());
     Router::new()
@@ -495,6 +504,7 @@ fn admin(r: &Weak<Reloader>) -> Router {
                 })
                 .delete(move |Path(id): Path<String>| serve(del.clone(), |r| delete_one(r, id))),
         )
+        .merge(rule_documents::routes(r))
 }
 
 /// Run `f` with the reloader, or answer 503 once the runtime that ran
