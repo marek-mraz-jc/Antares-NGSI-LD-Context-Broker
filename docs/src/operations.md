@@ -133,6 +133,8 @@ The broker keeps part of its own state under tenants it names itself
 |---|---|
 | any name starting with `snap-` | the frozen data of one snapshot (`snap-<32 hex digits>`) and the snapshot index (`snap-index`) |
 | `distsub-index` | the index of distributed subscriptions received from other brokers |
+| `antares-views` | the endpoint view documents of `/q/views` (`views` build) |
+| `antares-policy` | the policy engine's rule documents of `/q/policy` (`views` build) |
 
 A request whose `NGSILD-Tenant` is one of these answers
 `400 BadRequestData` on every operation, reads included, so such a

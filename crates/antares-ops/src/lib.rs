@@ -65,6 +65,10 @@ pub mod policy {
 /// delivers notifications (WebSocket).
 pub use antares_api::{DeliveryError, DeliveryFuture, NotificationSink, Outbound};
 
+/// The federation transport contract (ADR-0025 rule 8, ADR-0027 section 9),
+/// for a crate that serves some forwards in process.
+pub use antares_api::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
+
 /// The headers a surface may never set on an operation: the tenant, the
 /// snapshot and the policy subject come from the outer request alone (G2).
 const OUTER_ONLY: [&str; 2] = ["ngsild-tenant", "ngsild-snapshot"];
@@ -428,6 +432,98 @@ pub fn mount<S: Surface>(surface: S) -> Box<dyn antares_api::ApiSurface> {
     })
 }
 
+/// Register the forward transport `make` builds over the broker's
+/// operations: every federation forward asks it first, and a forward it
+/// does not serve goes over HTTP (ADR-0025 rule 8). The composition root
+/// calls this once, before the state serves.
+///
+/// ```
+/// use antares_ops::{BuiltForward, ForwardFuture, ForwardTransport};
+///
+/// /// Serves nothing: every forward stays HTTP.
+/// struct Nothing;
+///
+/// impl ForwardTransport for Nothing {
+///     fn forward<'a>(&'a self, _req: BuiltForward<'a>) -> Option<ForwardFuture<'a>> {
+///         None
+///     }
+/// }
+///
+/// let transport: std::sync::Arc<dyn ForwardTransport> = std::sync::Arc::new(Nothing);
+/// # let _ = transport;
+/// ```
+///
+/// # Errors
+/// When a transport is already registered.
+pub fn with_forward_transport(
+    state: AppState,
+    make: impl FnOnce(Ops) -> Arc<dyn ForwardTransport>,
+) -> Result<AppState, String> {
+    let transport = make(Ops::new(state.clone()));
+    state.with_forward_transport(transport)
+}
+
+impl Ops {
+    /// Serve the forward `req` through this broker's own router, in process
+    /// (ADR-0025 rule 2). `self_url` is the self URL its endpoint starts
+    /// with; the rest of its target is the path the router serves. The
+    /// inner request carries the forward's headers and payload and nothing
+    /// else of the triggering request: the caller map is its subject headers
+    /// alone (rules 2 and 4), so a registration without a `tenant` lands in
+    /// the default Tenant and a snapshot is never inherited. The answer is
+    /// read as an HTTP one is: the body up to the federation response cap,
+    /// the source's `NGSILD-Warning` values up to their cap.
+    pub async fn forward_in_process(&self, req: BuiltForward<'_>, self_url: &str) -> ForwardAnswer {
+        // A target outside `self_url` is the transport's mistake, and a
+        // header 5.9.2 let through that HTTP could not send either: the
+        // forward is not made in process, and the answer says so (502).
+        let inner = req
+            .target()
+            .and_then(|target| {
+                target
+                    .strip_prefix(self_url)
+                    .filter(|rest| rest.starts_with('/'))
+                    .map(str::to_owned)
+            })
+            .and_then(|path| {
+                let mut inner = axum::http::Request::builder()
+                    .method(req.method().clone())
+                    .uri(path);
+                for (name, value) in req.headers() {
+                    inner = inner.header(name.as_str(), value.as_str());
+                }
+                // The HTTP client states the length of what it sends.
+                let body = match req.body() {
+                    Some(bytes) => {
+                        inner = inner.header(axum::http::header::CONTENT_LENGTH, bytes.len());
+                        Body::from(bytes.to_vec())
+                    }
+                    None => Body::empty(),
+                };
+                inner.body(body).ok()
+            });
+        let Some(inner) = inner else {
+            return (502, serde_json::Value::Null, Vec::new());
+        };
+        let answer = self.state.call(req.subject(), inner).await;
+        let status = answer.status().as_u16();
+        let warnings = answer
+            .headers()
+            .get_all("ngsild-warning")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .take(antares_api::bounds::MAX_PEER_WARNINGS)
+            .collect();
+        let cap = *antares_api::bounds::MAX_FED_RESPONSE_BYTES;
+        let body = axum::body::to_bytes(answer.into_body(), cap)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(serde_json::Value::Null);
+        (status, body, warnings)
+    }
+}
+
 /// A surface as the broker mounts it: closed, every route 404, while no
 /// view is loaded (rule M4), and reported so in `/q/health`.
 struct Mounted<S> {
@@ -515,7 +611,8 @@ pub mod test_kit {
             Ok(Self { state, reload })
         }
 
-        /// The same broker asking `engine` (ADR-0020).
+        /// The same broker asking `engine` (ADR-0020). Its view table was
+        /// loaded before: `/q/policy` keeps answering as without an engine.
         #[must_use]
         pub fn with_policy(self, engine: Arc<dyn super::policy::PolicyEngine>) -> Self {
             Self {
