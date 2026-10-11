@@ -137,8 +137,8 @@ cancel is a tool error too.
   can ask the person`.
 - **Bodies.** An Entity, a fragment and a batch member name only the
   types and Attributes the view shows; `@context` is refused, the view's
-  is used. Under a view the broker refuses a write it cannot check on the
-  stored Entity (ADR-0023 rule 7): `batch_upsert` answers `403` there.
+  is used. Under a view the broker checks every write on the stored
+  Entity (ADR-0023 rule 7), a batch member by member.
 - **Subscriptions.** `create_subscription` and `update_subscription`
   accept only the members `type`, `subscriptionName`, `description`,
   `entities`, `watchedAttributes`, `q`, `notification` (`attributes`,
