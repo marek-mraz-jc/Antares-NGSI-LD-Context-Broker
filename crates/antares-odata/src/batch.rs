@@ -69,7 +69,9 @@ pub(crate) async fn serve(
     };
     let content_type = header("Content-Type").unwrap_or_default().to_owned();
     let json = is_json(&content_type);
-    if json && version == ODataVersion::V4_0 {
+    // Only a client that caps the version refuses 4.01; without the
+    // headers the version is 4.0 and a JSON batch still reads.
+    if json && version == ODataVersion::V4_0 && header("OData-MaxVersion").is_some() {
         return bad("a JSON batch is an OData 4.01 format; OData-MaxVersion 4.0 asks for 4.0")
             .with_version(version)
             .into_response();

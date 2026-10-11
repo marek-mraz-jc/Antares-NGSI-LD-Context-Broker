@@ -132,7 +132,8 @@ unless `Prefer: odata.continue-on-error` (or `continue-on-error`) is sent
 `dependsOn` failed answers `424` (JSON Format 19.1). The response carries
 `Preference-Applied` when the preference asked to go on.
 
-A JSON batch is a 4.01 format: under `OData-MaxVersion: 4.0` it is `400`.
+A JSON batch is a 4.01 format: with `OData-MaxVersion: 4.0` it is `400`;
+without the header it reads.
 The multipart framing reads CRLF or a bare LF as a line end; a lone CR is
 `400`, and a part's body keeps its bytes.
 

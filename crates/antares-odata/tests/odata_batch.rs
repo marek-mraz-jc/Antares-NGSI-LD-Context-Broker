@@ -418,6 +418,20 @@ async fn odata_batch_json_under_odata_4_0_is_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
     assert_eq!(answer["error"]["code"], "BadRequest", "{answer}");
     assert_eq!(engine.take(), [], "no member runs");
+    // Without OData-MaxVersion a JSON batch reads.
+    let body = json!({ "requests": members }).to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("{ROOT}/$batch"))
+        .header("Host", "broker:8080")
+        .header("NGSILD-Tenant", "city")
+        .header("X-Subject", "alice")
+        .header("Content-Type", "application/json")
+        .header("Content-Length", body.len())
+        .body(Body::from(body))
+        .unwrap_or_default();
+    let Ok(resp) = app.clone().oneshot(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
     // A multipart batch is a 4.0 format and still reads under 4.0.
     let body = multipart(&[("1", "GET Car('urn:ngsi-ld:Car:1') HTTP/1.1\r\n")]);
     let (status, _, text) = batch(&app, MULTIPART, &body, &[("OData-MaxVersion", "4.0")]).await;
