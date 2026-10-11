@@ -161,13 +161,16 @@ fn typed(body: &str, media_type: &'static str) -> Response {
     ([(CONTENT_TYPE, media_type)], body.to_owned()).into_response()
 }
 
+/// How one prospective request is answered: [`check`] or [`explain`].
+type Answer = fn(&Grants<'_>, &str, Option<&str>, &dyn Fn(&str) -> bool) -> Value;
+
 fn decide(
     ops: &Ops,
     engine: &JoinedcontextPolicy,
     id: &str,
     caller: &Caller,
     body: &[u8],
-    answer: fn(&Grants<'_>, &str, Option<&str>, &dyn Fn(&str) -> bool) -> Value,
+    answer: Answer,
 ) -> Response {
     let Some(view) = ops.view(id) else {
         return Refusal::NotFound.ngsi_ld();
