@@ -7,9 +7,12 @@
 //! The whole batch is refused before any member runs when a member URL
 //! leaves this view's service root (O8), a member header is not an OData
 //! one (O9: the tenant, the subject and the credentials are the outer
-//! request's) or a bound is passed (O11). Members run in order; the first
-//! failure ends the batch unless `Prefer: odata.continue-on-error`, under
-//! which a member whose `dependsOn` failed answers `424`.
+//! request's) or a bound is passed (O11). Members run in order. In a
+//! multipart batch the first failure ends the batch unless `Prefer:
+//! odata.continue-on-error` (Protocol 4.01 section 11.7.7.4); a JSON batch,
+//! a 4.01 format, goes on unless `continue-on-error=false` (JSON Format 4.01
+//! section 19.4). A member whose `dependsOn` failed answers `424` (section
+//! 19.1).
 
 use crate::query_in_body;
 use antares_ops::bounds::{MAX_BATCH_ITEMS, MAX_BODY_BYTES};
@@ -66,13 +69,19 @@ pub(crate) async fn serve(
     };
     let content_type = header("Content-Type").unwrap_or_default().to_owned();
     let json = is_json(&content_type);
-    let continue_on_error = parts
+    if json && version == ODataVersion::V4_0 {
+        return bad("a JSON batch is an OData 4.01 format; OData-MaxVersion 4.0 asks for 4.0")
+            .with_version(version)
+            .into_response();
+    }
+    let preference = parts
         .headers
         .get_all("Prefer")
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
-        .any(continues);
+        .find_map(continues);
+    let continue_on_error = preference.unwrap_or(json);
     let host = parts
         .uri
         .authority()
@@ -140,7 +149,7 @@ pub(crate) async fn serve(
             break;
         }
     }
-    written(&answers, json, continue_on_error, version)
+    written(&answers, json, preference == Some(true), version)
 }
 
 /// One member as a request of its own: the outer request's headers (the
@@ -275,15 +284,16 @@ fn allowed(name: &str, value: &str) -> Option<(HeaderName, HeaderValue)> {
         .map(|value| (name, value))
 }
 
-/// Whether one preference is `odata.continue-on-error` (4.0) or
-/// `continue-on-error` (4.01), not set to `false`.
-fn continues(preference: &str) -> bool {
+/// The value of one preference that is `odata.continue-on-error` (4.0) or
+/// `continue-on-error` (4.01): `false` only when set to `false`.
+fn continues(preference: &str) -> Option<bool> {
     let (name, value) = preference.split_once('=').unwrap_or((preference, "true"));
     let name = name.trim().to_ascii_lowercase();
     matches!(
         name.as_str(),
         "odata.continue-on-error" | "continue-on-error"
-    ) && !value.trim().eq_ignore_ascii_case("false")
+    )
+    .then(|| !value.trim().eq_ignore_ascii_case("false"))
 }
 
 fn is_json(content_type: &str) -> bool {
@@ -436,9 +446,9 @@ mod tests {
 
     #[test]
     fn continue_on_error_is_read_in_both_spellings() {
-        assert!(continues("odata.continue-on-error"));
-        assert!(continues(" continue-on-error=true"));
-        assert!(!continues("continue-on-error=false"));
-        assert!(!continues("return=minimal"));
+        assert_eq!(continues("odata.continue-on-error"), Some(true));
+        assert_eq!(continues(" continue-on-error=true"), Some(true));
+        assert_eq!(continues("continue-on-error=false"), Some(false));
+        assert_eq!(continues("return=minimal"), None);
     }
 }

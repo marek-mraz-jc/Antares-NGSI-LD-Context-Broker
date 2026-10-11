@@ -125,10 +125,16 @@ member is `400` before any operation.
 (JSON Format 19) batch and answers in the same format. Each member is
 served as a request of its own: parsed, refused and gated as it would be
 alone, under the outer request's tenant, subject and credentials. Members
-run in order. The first failed member ends the batch unless
-`Prefer: odata.continue-on-error` (or `continue-on-error`) is sent; then
-every member runs, a member whose `dependsOn` failed answers `424`, and
-the response carries `Preference-Applied`.
+run in order. In a multipart batch the first failed member ends the batch
+unless `Prefer: odata.continue-on-error` (or `continue-on-error`) is sent
+(Protocol 11.7.7.4). A JSON batch runs every member unless
+`continue-on-error=false` is sent (JSON Format 19.4). A member whose
+`dependsOn` failed answers `424` (JSON Format 19.1). The response carries
+`Preference-Applied` when the preference asked to go on.
+
+A JSON batch is a 4.01 format: under `OData-MaxVersion: 4.0` it is `400`.
+The multipart framing reads CRLF or a bare LF as a line end; a lone CR is
+`400`, and a part's body keeps its bytes.
 
 The whole batch is `400` before any member runs when a member URL leaves
 this view's service root (another host, view or root, a `.` or `..`

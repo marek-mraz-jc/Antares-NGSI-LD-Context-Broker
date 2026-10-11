@@ -77,9 +77,11 @@ async fn batch(
         .header("Host", "broker:8080")
         .header("NGSILD-Tenant", "city")
         .header("X-Subject", "alice")
-        .header("OData-MaxVersion", "4.01")
         .header("Content-Type", content_type)
         .header("Content-Length", body.len());
+    if !headers.iter().any(|(k, _)| *k == "OData-MaxVersion") {
+        req = req.header("OData-MaxVersion", "4.01");
+    }
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
@@ -339,7 +341,7 @@ async fn odata_batch_content_id_reference_is_501() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn odata_batch_stops_at_the_first_failure_unless_asked_to_go_on() {
+async fn odata_batch_json_goes_on_unless_asked_to_stop() {
     let (_b, app, _engine) = broker().await.expect("broker");
     // Car 2 is outside the view: its read fails as an absent one would.
     let members = json!([
@@ -348,29 +350,79 @@ async fn odata_batch_stops_at_the_first_failure_unless_asked_to_go_on() {
          "headers": {"Content-Type": "application/json"}, "body": {"label": "x"}},
         {"id": "3", "method": "get", "url": "Car('urn:ngsi-ld:Car:1')"}
     ]);
-    let (status, headers, answer) = json_batch(&app, &members, &[]).await;
+    // JSON Format 4.01 section 19.4: without the preference, or with it true, every member runs.
+    for prefer in [
+        None,
+        Some("odata.continue-on-error"),
+        Some("continue-on-error=true"),
+    ] {
+        let headers: Vec<_> = prefer.map(|p| ("Prefer", p)).into_iter().collect();
+        let (status, headers, answer) = json_batch(&app, &members, &headers).await;
+        assert_eq!(
+            (status, statuses(&answer)),
+            (StatusCode::OK, vec![404, 424, 200]),
+            "{prefer:?}: {answer}"
+        );
+        assert_eq!(answer["responses"][1]["id"], "2");
+        assert_eq!(
+            headers
+                .get("preference-applied")
+                .and_then(|v| v.to_str().ok()),
+            prefer.map(|_| "odata.continue-on-error"),
+            "{prefer:?}"
+        );
+    }
+    let stop = [("Prefer", "continue-on-error=false")];
+    let (status, headers, answer) = json_batch(&app, &members, &stop).await;
     assert_eq!(
         (status, statuses(&answer)),
         (StatusCode::OK, vec![404]),
         "{answer}"
     );
     assert!(headers.get("preference-applied").is_none());
-    for prefer in ["odata.continue-on-error", "continue-on-error=true"] {
-        let (status, headers, answer) = json_batch(&app, &members, &[("Prefer", prefer)]).await;
-        assert_eq!(
-            (status, statuses(&answer)),
-            (StatusCode::OK, vec![404, 424, 200]),
-            "{prefer}: {answer}"
-        );
-        assert_eq!(answer["responses"][1]["id"], "2");
-        assert_eq!(headers["preference-applied"], "odata.continue-on-error");
-    }
     let (_, car) = stored(&app, "urn:ngsi-ld:Car:1").await;
     assert_eq!(
         car[format!("{CITY}label")]["value"],
         "one",
         "a failed dependency writes nothing"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_batch_multipart_stops_at_the_first_failure_unless_asked_to_go_on() {
+    let (_b, app, _engine) = broker().await.expect("broker");
+    let body = multipart(&[
+        ("1", "GET Car('urn:ngsi-ld:Car:2') HTTP/1.1\r\n"),
+        ("2", "GET Car('urn:ngsi-ld:Car:1') HTTP/1.1\r\n"),
+    ]);
+    // Protocol 4.01 section 11.7.7.4: processing stops on the first error.
+    let (status, _, text) = batch(&app, MULTIPART, &body, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(text.matches("HTTP/1.1 ").count(), 1, "{text}");
+    assert!(text.contains("HTTP/1.1 404"), "{text}");
+    let go_on = [("Prefer", "odata.continue-on-error")];
+    let (status, headers, text) = batch(&app, MULTIPART, &body, &go_on).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(
+        text.contains("HTTP/1.1 404") && text.contains("HTTP/1.1 200"),
+        "{text}"
+    );
+    assert_eq!(headers["preference-applied"], "odata.continue-on-error");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_batch_json_under_odata_4_0_is_400() {
+    let (_b, app, engine) = broker().await.expect("broker");
+    let members = json!([{"id": "1", "method": "get", "url": "Car('urn:ngsi-ld:Car:1')"}]);
+    let (status, _, answer) = json_batch(&app, &members, &[("OData-MaxVersion", "4.0")]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["error"]["code"], "BadRequest", "{answer}");
+    assert_eq!(engine.take(), [], "no member runs");
+    // A multipart batch is a 4.0 format and still reads under 4.0.
+    let body = multipart(&[("1", "GET Car('urn:ngsi-ld:Car:1') HTTP/1.1\r\n")]);
+    let (status, _, text) = batch(&app, MULTIPART, &body, &[("OData-MaxVersion", "4.0")]).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(text.contains("HTTP/1.1 200"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
