@@ -381,8 +381,6 @@ async fn entity_dereferences_an_id_of_this_service() {
         assert_eq!(a.status, StatusCode::OK, "{id}: {}", a.body);
         assert!(a.body["Name"].is_string(), "{id}: {}", a.body);
     }
-    let a = odata(&app, Method::GET, &format!("$entity?$id={OTHER}"), None).await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST, "a bare key: {}", a.body);
     let a = odata(
         &app,
         Method::GET,
@@ -391,19 +389,51 @@ async fn entity_dereferences_an_id_of_this_service() {
     )
     .await;
     assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
-    for id in [
-        format!("http://elsewhere.example/{relative}"),
-        format!("/{relative}"),
-        "Product".to_owned(),
-        format!("{relative}/Name"),
-        format!("{relative}%3F%24select%3DName"),
-        "Product%2".to_owned(),
-        "Product%zz".to_owned(),
-        "%FF".to_owned(),
-        "Nothing('x')".to_owned(),
+}
+
+/// Q23 (T-3738): a well-formed id that names no Entity of this service is
+/// `404`, as a hidden Entity is (O5); `400` is kept for a missing id, a
+/// broken escape and an id with query options of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn entity_with_an_id_of_no_entity_here_is_not_found() {
+    let (_b, app) = shop().await.expect("broker");
+    let hidden = json!({"id": "urn:ngsi-ld:Thing:t1", "type": format!("{SHOP}Thing"),
+                        format!("{SHOP}Name"): property(&json!("Hidden"))});
+    let a = send(
+        &app,
+        Method::POST,
+        "/ngsi-ld/v1/entities",
+        Some(&hidden.to_string()),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let relative = format!("Product({GUID})");
+    for query in [
+        "$id=http://host/path".to_owned(),
+        "$id=urn:some:id".to_owned(),
+        "id=urn:some:id".to_owned(),
+        format!("$id=http://elsewhere.example/{relative}"),
+        format!("$id=/{relative}"),
+        format!("$id={OTHER}"),
+        "$id=Product".to_owned(),
+        format!("$id={relative}/Name"),
+        "$id=Nothing('x')".to_owned(),
+        "$id=Product(id='urn:ngsi-ld:Thing:t1')".to_owned(),
     ] {
-        let a = odata(&app, Method::GET, &format!("$entity?$id={id}"), None).await;
-        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{id}: {}", a.body);
+        let a = odata(&app, Method::GET, &format!("$entity?{query}"), None).await;
+        assert_eq!(a.status, StatusCode::NOT_FOUND, "{query}: {}", a.body);
+    }
+    let a = odata(&app, Method::GET, &format!("$entity?id={relative}"), None).await;
+    assert_eq!(a.status, StatusCode::OK, "id without $: {}", a.body);
+    for query in [
+        String::new(),
+        format!("$id={relative}%3F%24select%3DName"),
+        "$id=Product%2".to_owned(),
+        "$id=Product%zz".to_owned(),
+        "$id=%FF".to_owned(),
+    ] {
+        let a = odata(&app, Method::GET, &format!("$entity?{query}"), None).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{query}: {}", a.body);
     }
 }
 
@@ -471,6 +501,168 @@ async fn a_create_without_the_key_mints_its_value() {
             "{ty}.{key}: {}",
             ns[ty]
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filter_literal_of_another_type_is_400() {
+    // T-3725: URL 5.1.1.1; an Int64 literal past its range (5.1.1.5).
+    let (_b, app) = shop().await.expect("broker");
+    for path in [
+        "Product?$filter=Name%20eq%201",
+        "Product?$filter=Name%20gt%2010",
+        "Product?$filter=Name%20in%20(1,2)",
+        "Product?$filter=ID%20eq%20'x'",
+        "Bin?$filter=number%20eq%20'abc'",
+        "Bin?$filter=number%20in%20('a','b')",
+        "Bin?$filter=number%20eq%209223372036854775808",
+    ] {
+        let a = odata(&app, Method::GET, path, None).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{path}: {}", a.body);
+        assert_eq!(a.body["error"]["code"], "BadRequest", "{path}");
+    }
+    for (path, rows) in [
+        // Within the exact range of a JSON number (F26).
+        ("Bin?$filter=number%20eq%209007199254740991", 0),
+        ("Bin?$filter=number%20lt%208", 1),
+        // URL 5.1.1.1: an Int64 member promotes to a decimal literal.
+        ("Bin?$filter=number%20lt%207.5", 1),
+        ("Product?$filter=Name%20eq%20'Drill'", 1),
+        ("Product?$filter=ID%20eq%20null", 1),
+    ] {
+        let a = odata(&app, Method::GET, path, None).await;
+        assert_eq!(a.status, StatusCode::OK, "{path}: {}", a.body);
+        assert_eq!(
+            a.body["value"].as_array().map(Vec::len),
+            Some(rows),
+            "{path}: {}",
+            a.body
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn references_of_a_set_and_of_one_entity() {
+    let (_b, app) = shop().await.expect("broker");
+    let ids = |a: &Answer| -> Vec<String> {
+        a.body["value"]
+            .as_array()
+            .map(|v| {
+                v.iter()
+                    .filter_map(|r| r["@odata.id"].as_str())
+                    .filter_map(|id| id.rsplit_once('/').map(|(_, last)| last.to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let a = odata(&app, Method::GET, "Product/$ref", None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert!(
+        a.body["@odata.context"]
+            .as_str()
+            .is_some_and(|c| c.ends_with("$metadata#Collection($ref)")),
+        "{}",
+        a.body
+    );
+    let mut all = ids(&a);
+    all.sort();
+    assert_eq!(
+        all,
+        [
+            format!("Product({GUID})"),
+            "Product(id='urn:ngsi-ld:Product:odd')".to_owned()
+        ],
+        "{}",
+        a.body
+    );
+    assert!(
+        a.body["value"][0].as_object().is_some_and(|r| r.len() == 1),
+        "a reference carries only its id: {}",
+        a.body
+    );
+    let a = odata(
+        &app,
+        Method::GET,
+        &format!("Product/$ref?$filter=ID%20eq%20{GUID}&$count=true"),
+        None,
+    )
+    .await;
+    assert_eq!(ids(&a), [format!("Product({GUID})")], "{}", a.body);
+    assert_eq!(a.body["@odata.count"], 1, "{}", a.body);
+    let a = odata(&app, Method::GET, "Product/$ref?$orderby=Name&$top=1", None).await;
+    assert_eq!(
+        ids(&a),
+        [format!("Product({GUID})")],
+        "Drill before Odd: {}",
+        a.body
+    );
+    let a = odata(
+        &app,
+        Method::GET,
+        "Product/$ref?$orderby=Name&$skip=1",
+        None,
+    )
+    .await;
+    assert_eq!(ids(&a).len(), 1, "{}", a.body);
+    assert_ne!(ids(&a), [format!("Product({GUID})")], "{}", a.body);
+
+    let a = odata(&app, Method::GET, &format!("Product({GUID})/$ref"), None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert!(
+        a.body["@odata.id"]
+            .as_str()
+            .is_some_and(|id| id.ends_with(&format!("/Product({GUID})"))),
+        "{}",
+        a.body
+    );
+    assert!(a.body.get("Name").is_none(), "{}", a.body);
+    assert!(
+        a.body["@odata.context"]
+            .as_str()
+            .is_some_and(|c| c.ends_with("$metadata#$ref")),
+        "{}",
+        a.body
+    );
+    let a = odata(&app, Method::GET, "Bin(7)/$ref", None).await;
+    assert!(
+        a.body["@odata.id"]
+            .as_str()
+            .is_some_and(|id| id.ends_with("/Bin(7)")),
+        "{}",
+        a.body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn references_of_absent_entities_and_with_properties_are_refused() {
+    let (_b, app) = shop().await.expect("broker");
+    // Absent, or of another set: 404, as the Entity read answers.
+    for path in [
+        format!("Product({OTHER})/$ref"),
+        "Product(id='urn:ngsi-ld:Bin:7')/$ref".to_owned(),
+    ] {
+        let a = odata(&app, Method::GET, &path, None).await;
+        assert_eq!(a.status, StatusCode::NOT_FOUND, "{path}: {}", a.body);
+    }
+    // A collection option on one reference is not served.
+    let a = odata(
+        &app,
+        Method::GET,
+        &format!("Product({GUID})/$ref?$top=1"),
+        None,
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NOT_IMPLEMENTED, "{}", a.body);
+    // A reference has no properties: $select and $expand are 400.
+    for path in [
+        "Product/$ref?$select=Name".to_owned(),
+        "Product/$ref?$expand=category".to_owned(),
+        format!("Product({GUID})/$ref?$select=Name"),
+        format!("Product({GUID})/$ref?$expand=category"),
+    ] {
+        let a = odata(&app, Method::GET, &path, None).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{path}: {}", a.body);
+        assert_eq!(a.body["error"]["code"], "BadRequest", "{path}");
     }
 }
 

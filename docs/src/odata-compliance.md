@@ -112,16 +112,32 @@ The pass rate counts passed and failed tests; skipped tests stay out of it.
 The baseline was first recorded on dev `f0da234` (T-3714) and raised by
 T-3719, which reads a form-encoded query, T-3723, which declares `$batch`
 and serves `HEAD`, T-3731, which answers an empty path segment with 400,
-T-3720, which keys a set by its LinkML identifier and
-serves `$entity`, and T-3722, which narrows Edm types and writes the Core
-and Capabilities terms the schema states (section 6):
+and then by train 8, written from its own run (surfaces-conformance
+38136321034 on `2f26761`, never merged by hand): T-3720, which keys a set by
+its LinkML identifier and serves `$entity`, T-3722, which narrows Edm types
+and writes the Core and Capabilities terms the schema states (section 6),
+T-3721 (minted keys, C5 required properties), T-3725 (typed `$filter`
+literals), T-3726 (batch framing and `continue-on-error`), T-3730 (entity
+references), T-3737 (one `Content-Length` on `HEAD`), T-3738 (`$entity`
+404) and T-3760 (a bind to a missing Entity is 400):
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| Minimal | 170 | 103 | 20 | 62.3 % |
-| Intermediate | 221 | 115 | 14 | 65.8 % |
-| Advanced | 159 | 345 | 63 | 31.5 % |
-| **All** (suite summary) | 550 | 563 | 97 | 49.4 % |
+| Minimal | 178 | 95 | 20 | 65.2 % |
+| Intermediate | 246 | 90 | 14 | 73.2 % |
+| Advanced | 199 | 303 | 65 | 39.6 % |
+| **All** (suite summary) | 623 | 488 | 99 | 56.1 % |
+
+One earlier pass is a skip now, by the suite's own rule: `POST with
+nonexistent foreign key` posts a `ProductDescription` whose `ProductID` names
+no `Product` and skips on 201, since referential constraints are a SHOULD
+(Protocol 11.4.2). Dev answered it with a 4xx before train 8; with train 8
+the create succeeds, because the broker checks a reference only on a bind
+(T-3760), not in a plain property. Enforcing a LinkML slot whose range is a class as a reference is
+T-3761.
+
+Before train 8 the baseline stood at 550 passed, 563 failed and 97 skipped
+(Minimal 62.3 %, Intermediate 65.8 %, Advanced 31.5 %).
 
 Before T-3720 the baseline stood at 455 passed, 661 failed and 94 skipped
 (Minimal 57.8 %, Intermediate 49.1 %, Advanced 26.0 %).

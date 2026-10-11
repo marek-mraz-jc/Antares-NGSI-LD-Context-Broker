@@ -116,7 +116,9 @@ async fn odata_writes_an_entity_through_its_view() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn odata_bind_to_hidden_target_is_404_and_writes_nothing() {
+async fn odata_bind_to_hidden_or_missing_target_is_400_and_writes_nothing() {
+    // Protocol 11.4.2.1: the bind is the request body's; Person:2 is hidden,
+    // Person:9 absent, and both answer the same 400 (T-3760, O5).
     let (_b, app) = city().await.expect("broker");
     let mut answers = Vec::new();
     for (n, person) in [(10, "urn:ngsi-ld:Person:2"), (11, "urn:ngsi-ld:Person:9")] {
@@ -124,7 +126,8 @@ async fn odata_bind_to_hidden_target_is_404_and_writes_nothing() {
                             "owner@odata.bind": format!("Person('{person}')")})
         .to_string();
         let (status, body) = odata(&app, Method::POST, "Car", Some(&create)).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{person}: {body}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{person}: {body}");
+        assert_eq!(body["error"]["target"], "owner", "{person}: {body}");
         assert_eq!(
             stored(&app, &format!("urn:ngsi-ld:Car:{n}")).await.0,
             StatusCode::NOT_FOUND,
@@ -138,7 +141,7 @@ async fn odata_bind_to_hidden_target_is_404_and_writes_nothing() {
             Some(&merge),
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{person}: {merged}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{person}: {merged}");
         answers.push((body, merged));
     }
     assert_eq!(
@@ -717,6 +720,7 @@ impl PolicyEngine for NoNewCars {
 #[tokio::test(flavor = "multi_thread")]
 async fn odata_a_minted_id_meets_the_policy() {
     let engine = Arc::new(NoNewCars::default());
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
     let b = TestBroker::new()
         .await
         .expect("broker")
@@ -744,6 +748,55 @@ async fn odata_a_minted_id_meets_the_policy() {
     );
     assert_eq!(
         stored(&app, id).await.0,
+        StatusCode::NOT_FOUND,
+        "nothing written"
+    );
+}
+
+/// Once armed, refuses Retrieve Entity of a Person.
+#[derive(Default)]
+struct NoPersonReads(Mutex<bool>);
+
+impl PolicyEngine for NoPersonReads {
+    fn name(&self) -> &'static str {
+        "no-person-reads"
+    }
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        let armed = *self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let person = op.types.iter().any(|t| *t == format!("{CITY}Person"));
+        Box::pin(std::future::ready(
+            if armed && op.clause == "5.7.1" && person {
+                Decision::Deny("no Person reads".into())
+            } else {
+                Decision::Allow
+            },
+        ))
+    }
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// T-3760: only a target that is not there is the body's 400; the engine
+/// refusing to read a bind target keeps its own answer, and nothing is
+/// written.
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_bind_keeps_the_engines_refusal_of_its_target() {
+    let engine = Arc::new(NoPersonReads::default());
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
+    let b = TestBroker::new()
+        .await
+        .expect("broker")
+        .with_policy(engine.clone());
+    let (_b, app) = city_on(b).await.expect("city");
+    *engine.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    let create = json!({"id": "urn:ngsi-ld:Car:12", "scope": ["/a"],
+                        "owner@odata.bind": "Person('urn:ngsi-ld:Person:1')"})
+    .to_string();
+    let (status, body) = odata(&app, Method::POST, "Car", Some(&create)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        stored(&app, "urn:ngsi-ld:Car:12").await.0,
         StatusCode::NOT_FOUND,
         "nothing written"
     );

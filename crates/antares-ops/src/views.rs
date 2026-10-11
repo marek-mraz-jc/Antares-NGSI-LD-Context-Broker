@@ -102,6 +102,12 @@ pub struct View {
     pub rules: Vec<ViewRule>,
     /// The operations it allows, as `operation-matrix.yaml` ids.
     pub operations: Vec<String>,
+    /// The compiled Mapping IR of a view of another model (gap G18,
+    /// `docs/analysis/view-mapping.md` section 3): the view serves its
+    /// target class, selects its source class alone, and allows only
+    /// [`crate::mapping::READS`].
+    #[serde(default)]
+    pub mapping: Option<Value>,
 }
 
 /// One allowlist of a [`View`]: the Entities of `types` for which the
@@ -152,6 +158,8 @@ pub struct Loaded {
     /// Attribute they do not show, a temporal view keyed on a mutable
     /// member.
     pub notes: Vec<String>,
+    /// The compiled Mapping of a view of another model.
+    pub mapping: Option<Arc<crate::mapping::Mapping>>,
 }
 
 impl View {
@@ -209,6 +217,16 @@ impl View {
             .collect::<Result<Vec<_>, _>>()?;
         let notes = disclosures(&rules);
         let operations = operations(&self.operations)?;
+        let mapping = match &self.mapping {
+            None => None,
+            Some(ir) => Some(Arc::new(mapped(
+                ir,
+                &ctx,
+                self.context.as_ref(),
+                &selector,
+                &operations,
+            )?)),
+        };
         let view = CompiledView::new(
             &selector,
             parse_q("q", self.q.as_deref())?,
@@ -222,6 +240,7 @@ impl View {
             tenant: tenant.as_str().to_owned(),
             operations,
             notes,
+            mapping,
         };
         if self.q.is_some()
             && loaded
@@ -239,6 +258,32 @@ impl View {
         }
         Ok(loaded)
     }
+}
+
+/// Section 3 and 7: the IR compiles, the view selects its source class
+/// alone (any other type would be served rebuilt as the target class), and
+/// it allows only the reads a mapping inverts.
+fn mapped(
+    ir: &Value,
+    ctx: &Context,
+    own: Option<&serde_json::Map<String, Value>>,
+    selector: &[String],
+    operations: &[OperationId],
+) -> Result<crate::mapping::Mapping, String> {
+    let mapping = crate::mapping::Mapping::compile(ir, ctx, own)?;
+    if selector != [mapping.source_class()] {
+        return Err("a mapped view selects its mapping's sourceClass and nothing else".into());
+    }
+    if let Some(op) = operations
+        .iter()
+        .find(|op| !crate::mapping::READS.contains(op))
+    {
+        return Err(format!(
+            "a mapped view is read only: {:?} is not one of the reads a mapping inverts",
+            op.id()
+        ));
+    }
+    Ok(mapping)
 }
 
 fn valid_id(id: &str) -> bool {
@@ -369,6 +414,9 @@ fn entry(doc: &Value) -> ViewEntry {
             tenant: l.tenant,
             operations: l.operations.iter().map(|op| op.id().to_owned()).collect(),
             notes: l.notes,
+            mapping: l
+                .mapping
+                .map(|m| antares_api::views::Attached(m as Arc<dyn std::any::Any + Send + Sync>)),
         },
         Err(reason) => ViewEntry::Invalid { reason },
     }
@@ -795,6 +843,62 @@ mod tests {
         let mut v = base();
         v[member] = value;
         v
+    }
+
+    fn mapped() -> Value {
+        let mut v = with(
+            "mapping",
+            json!({"version": 2, "sourceClass": "Car", "targetClass": "Vehicle",
+                   "slots": [{"target": "velocity", "source": "speed", "kind": "rename"}]}),
+        );
+        v["operations"] = json!([
+            "retrieve_entity",
+            "query_entities",
+            "retrieve_attribute_value"
+        ]);
+        v
+    }
+
+    #[test]
+    fn a_mapped_view_loads_with_its_mapping() {
+        let loaded = load(&mapped());
+        assert_eq!(
+            loaded
+                .ok()
+                .and_then(|l| l.mapping.map(|m| m.source_class().to_owned())),
+            Some("https://uri.etsi.org/ngsi-ld/default-context/Car".to_owned())
+        );
+        assert!(load(&base()).is_ok_and(|l| l.mapping.is_none()));
+    }
+
+    #[test]
+    fn a_mapped_view_is_read_only_selects_its_source_class_alone_and_runs_a_valid_ir() {
+        for op in [
+            "create_entity",
+            "create_subscription",
+            "batch_upsert",
+            "query_entities_post",
+            "retrieve_entity_types",
+            "temporal_query",
+        ] {
+            let mut v = mapped();
+            v["operations"] = json!(["query_entities", op]);
+            let e = load(&v).err().unwrap_or_default();
+            assert!(e.contains("read only"), "{op}: {e}");
+        }
+        for selector in [json!(["Truck"]), json!(["Car", "Truck"])] {
+            let mut v = mapped();
+            v["selector"] = selector.clone();
+            v["rules"] = json!([{"types": ["Car", "Truck"], "attributes": ["speed"]}]);
+            let e = load(&v).err().unwrap_or_default();
+            assert!(
+                e.contains("sourceClass and nothing else"),
+                "{selector}: {e}"
+            );
+        }
+        let mut v = mapped();
+        v["mapping"]["version"] = json!(1);
+        assert!(load(&v).err().unwrap_or_default().contains("version 1"));
     }
 
     #[test]
