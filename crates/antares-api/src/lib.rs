@@ -93,6 +93,7 @@ pub use antares_notifier::DeliveryPolicy;
 pub use antares_notifier::{
     build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
 };
+pub use contexts::public_base;
 pub use federation::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 pub use state::{AppState, TemporalRecord};
 

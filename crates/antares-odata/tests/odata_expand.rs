@@ -15,6 +15,9 @@ use tower::ServiceExt;
 
 const CITY: &str = "https://example.org/city/";
 const ROOT: &str = "/x/views/cars/odata/v4";
+/// The base a request without `Host` is answered under (no
+/// `ANTARES_PUBLIC_URL` in tests): context URLs are absolute.
+const PUBLIC: &str = "http://localhost:9090";
 
 const SCHEMA: &str = r#"{
   "id": "https://example.org/city", "name": "city",
@@ -212,7 +215,7 @@ async fn odata_expand_ref_star_and_a_nested_select() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["@odata.context"],
-        format!("{ROOT}/$metadata#Car(speed)")
+        format!("{PUBLIC}{ROOT}/$metadata#Car(speed)")
     );
     let one = by_id(&body, "urn:ngsi-ld:Car:1");
     let mut keys: Vec<&str> = one
@@ -246,7 +249,7 @@ async fn odata_expand_context_url_names_the_expansions() {
     let one: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     assert_eq!(
         one["@context"],
-        format!("{ROOT}/$metadata#Car(owner(id))/$entity"),
+        format!("{PUBLIC}{ROOT}/$metadata#Car(owner(id))/$entity"),
         "{one}"
     );
     assert_eq!(
@@ -286,7 +289,7 @@ async fn odata_expand_context_url_names_the_expansions() {
     let page: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     assert_eq!(
         page["@context"],
-        format!("{ROOT}/$metadata#Car(owner())"),
+        format!("{PUBLIC}{ROOT}/$metadata#Car(owner())"),
         "{page}"
     );
 }
@@ -423,12 +426,12 @@ async fn odata_reads_a_property_its_value_and_the_entities_a_navigation_names() 
     assert!(tag.is_some_and(|t| t.is_string()), "{body}");
     assert_eq!(
         body,
-        json!({"@odata.context": format!("{ROOT}/$metadata#{one}/speed"), "value": 1.0})
+        json!({"@odata.context": format!("{PUBLIC}{ROOT}/$metadata#{one}/speed"), "value": 1.0})
     );
     for (headers, want) in [
         (
             ("OData-MaxVersion", "4.01"),
-            json!({"@context": format!("{ROOT}/$metadata#{one}/speed"), "value": 1.0}),
+            json!({"@context": format!("{PUBLIC}{ROOT}/$metadata#{one}/speed"), "value": 1.0}),
         ),
         (
             ("Accept", "application/json;odata.metadata=none"),
@@ -461,7 +464,7 @@ async fn odata_reads_a_property_its_value_and_the_entities_a_navigation_names() 
     assert_eq!(status, StatusCode::OK, "{owner}");
     assert_eq!(
         owner["@odata.context"],
-        format!("{ROOT}/$metadata#Person/$entity")
+        format!("{PUBLIC}{ROOT}/$metadata#Person/$entity")
     );
     assert_eq!(
         (&owner["id"], &owner["name"]),
@@ -485,8 +488,8 @@ async fn odata_reads_a_property_its_value_and_the_entities_a_navigation_names() 
     assert_eq!(
         refs["value"],
         json!([
-            {"@odata.id": format!("{ROOT}/Person('urn:ngsi-ld:Person:1')")},
-            {"@odata.id": format!("{ROOT}/Person('urn:ngsi-ld:Person:2')")}
+            {"@odata.id": format!("{PUBLIC}{ROOT}/Person('urn:ngsi-ld:Person:1')")},
+            {"@odata.id": format!("{PUBLIC}{ROOT}/Person('urn:ngsi-ld:Person:2')")}
         ]),
         "references are the Relationship's objects (Q33): {refs}"
     );
@@ -494,7 +497,7 @@ async fn odata_reads_a_property_its_value_and_the_entities_a_navigation_names() 
     assert_eq!(status, StatusCode::OK, "{owner_ref}");
     assert_eq!(
         owner_ref["@odata.id"],
-        format!("{ROOT}/Person('urn:ngsi-ld:Person:1')")
+        format!("{PUBLIC}{ROOT}/Person('urn:ngsi-ld:Person:1')")
     );
     let (status, none) = get(&app, "Car('urn:ngsi-ld:Car:2')/drivers").await;
     assert_eq!(
