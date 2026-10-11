@@ -281,7 +281,8 @@ fn compile_rule(i: usize, r: &ViewRule, ctx: &Context) -> Result<Rule, String> {
         scope_q: scope_q(&at("scopeQ"), r.scope_q.as_deref())?,
         geo_q: geo_q(&at("geoQ"), r.geo_q.as_ref())?.map(Box::new),
         attributes,
-        // a view rule has one area and names no ids
+        // a view rule has one area, names no ids and no windows; an engine's
+        // narrow temporal reads
         ..Rule::default()
     })
 }

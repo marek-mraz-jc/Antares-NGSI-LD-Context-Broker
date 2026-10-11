@@ -18,7 +18,7 @@
 //! ([`ViewTable`]) with the store seam the loader writes through, so the
 //! operation layer never names the store (threat F1).
 
-use crate::policy::{resolve, Decision, Denied, Filter, Rule};
+use crate::policy::{resolve, Decision, Denied, Filter, Rule, Warning};
 use antares_ql::geo::GeoQuery;
 use antares_ql::QNode;
 use std::collections::BTreeMap;
@@ -150,6 +150,12 @@ pub fn with_view(
         // so the view has nothing of its own to narrow there.
         return engine;
     }
+    if crate::policy::WRITE_BY_ID.contains(&clause) {
+        // Rule 7 as below, and the engine's answer is the condition its
+        // write holds the stored Entity to (`gate`), which the handler
+        // checks beside the view's own.
+        return engine;
+    }
     if CHECKED_WRITES.contains(&clause) || SUBSCRIPTIONS.contains(&clause) {
         // Rule 7: the handler checks the view on the stored Entity before
         // and after the write (`WriteGuard`); the engine's own answer
@@ -162,7 +168,8 @@ pub fn with_view(
     let composed = compose(view.narrowing(), engine?)?;
     match resolve(clause, Decision::Filter(composed)) {
         Decision::Allow => Ok(Filter::default()),
-        Decision::Filter(f) => Ok(f),
+        // `resolve` makes no condition of a filter
+        Decision::Filter(f) | Decision::AllowIf(f) => Ok(f),
         Decision::Deny(why) => Err(Denied(why)),
     }
 }
@@ -200,6 +207,8 @@ pub fn compose(a: &Filter, b: Filter) -> Result<Filter, Denied> {
         rules,
         omit_by_type,
         restricted: a.restricted || b.restricted,
+        warning: Warning::join(a.warning.as_ref(), b.warning),
+        temporal: [&a.temporal[..], &b.temporal[..]].concat().into(),
     })
 }
 
@@ -327,6 +336,7 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
                 ids,
                 id_patterns,
                 attributes: shared(&x.attributes, y.attributes.clone()),
+                temporal: [x.temporal.as_slice(), y.temporal.as_slice()].concat(),
             });
         }
     }
@@ -650,12 +660,8 @@ pub const TARGET_NOT_SHOWN: &str =
 /// the store call.
 #[derive(Debug)]
 pub(crate) struct WriteGuard {
-    q: Option<QNode>,
-    scope_q: Option<String>,
-    areas: Vec<GeoQuery>,
-    /// The rules with type and Attribute names expanded, the form a stored
-    /// document is in.
-    rules: Option<Arc<Filter>>,
+    /// The view's selection, as an engine's write condition is held.
+    sel: crate::policy::Condition,
     /// The expanded names of the Attributes the write sets or removes.
     written: Vec<String>,
     refused: std::sync::OnceLock<&'static str>,
@@ -672,10 +678,7 @@ impl WriteGuard {
     ) -> Option<Self> {
         let narrowing = st.view.as_deref()?.narrowing();
         Some(Self {
-            q: narrowing.q.as_deref().cloned(),
-            scope_q: narrowing.scope_q.clone(),
-            areas: narrowing.areas().cloned().collect(),
-            rules: crate::repr::type_rules(narrowing),
+            sel: crate::policy::Condition::new(narrowing),
             written: written.into_iter().map(str::to_owned).collect(),
             refused: std::sync::OnceLock::new(),
         })
@@ -685,16 +688,7 @@ impl WriteGuard {
     /// the view's `q` never holds here, as in a rule (ADR-0023 rule 11): the
     /// check runs inside the store's write and reads no other Entity.
     pub(crate) fn sees(&self, doc: &serde_json::Value) -> bool {
-        let ctx = crate::repr::policy_context();
-        crate::repr::shown(self.rules.as_deref(), doc).is_some()
-            && self
-                .scope_q
-                .as_deref()
-                .is_none_or(|s| crate::scope_matches(s, doc))
-            && self.areas.iter().all(|g| g.matches(doc, ctx))
-            && self.q.as_ref().is_none_or(|q| {
-                !q.has_linked_paths() && antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
-            })
+        self.sel.holds(doc)
     }
 
     /// Why the view refuses `doc` with the written names on it, if it does.
@@ -706,6 +700,7 @@ impl WriteGuard {
         if !self.sees(doc) {
             Some(MOVES_OUT)
         } else if !self
+            .sel
             .rules
             .as_deref()
             .is_none_or(|r| r.admits_write(doc, &written, crate::repr::policy_context()))
@@ -994,6 +989,49 @@ mod tests {
             .unwrap_or_default();
         v.sort();
         v
+    }
+
+    /// G8: a view alone sends no `NGSILD-Warning`; an engine's warning
+    /// reaches every read it narrows, directly and through a view, once.
+    #[tokio::test]
+    async fn only_the_engine_warns_and_its_warning_survives_the_view() {
+        let warnings = |h: &axum::http::HeaderMap| -> Vec<String> {
+            h.get_all("NGSILD-Warning")
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(str::to_owned))
+                .collect()
+        };
+        let reads = [
+            "/ngsi-ld/v1/entities?type=Car",
+            "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:3",
+            "/ngsi-ld/v1/types",
+            "/ngsi-ld/v1/attributes",
+        ];
+        let st = seeded(None).await;
+        let view = st.with_view(Arc::new(cars()));
+        for uri in reads {
+            let (s, body, headers) = send(&view, "GET", uri, None).await;
+            assert_eq!(s, StatusCode::OK, "{uri}: {body}");
+            assert!(warnings(&headers).is_empty(), "{uri}: a view alone");
+        }
+
+        let warned = Filter {
+            warning: Some(Warning::new("types left out by the filter: Bike").expect("text")),
+            ..Filter::default()
+        };
+        let st = seeded(Some(warned)).await;
+        let view = st.with_view(Arc::new(cars()));
+        for (who, st) in [("engine", &st), ("view and engine", &view)] {
+            for uri in reads {
+                let (s, body, headers) = send(st, "GET", uri, None).await;
+                assert_eq!(s, StatusCode::OK, "{who} {uri}: {body}");
+                assert_eq!(
+                    warnings(&headers),
+                    ["199 me \"types left out by the filter: Bike\""],
+                    "{who} {uri}"
+                );
+            }
+        }
     }
 
     /// Rule 1: `NGSILD-Results-Count` and the `Link` pages describe the
