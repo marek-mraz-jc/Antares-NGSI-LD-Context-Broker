@@ -89,22 +89,29 @@ impl Name {
 
 /// An option name of `among` and its `=`, consumed; `None` (cursor unmoved) otherwise.
 ///
-/// Each name is one ABNF string (`"$filter" / "filter"`), so a `$` alone matches nothing.
+/// Each name is one ABNF string (`"$filter" / "filter"`), so a `$` alone matches nothing. The
+/// `$` may come percent-encoded (`%24filter`), as every client that builds its query with a
+/// form encoder (Go's `url.Values`, Java's `URLEncoder`) writes it (T-3719): the ABNF reads that
+/// as a custom option, which the surface refuses, so taking it as the system option changes no
+/// URL that is served.
 fn option_name(c: &mut Cursor<'_>, among: &[Name]) -> Option<Name> {
     let start = c.pos();
     let rest = c.rest();
-    let (dollar, body) = rest
-        .strip_prefix('$')
-        .map_or((false, rest), |body| (true, body));
+    let encoded = rest.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("%24"));
+    let (dollar, body) = match (rest.strip_prefix('$'), rest.get(3..)) {
+        (Some(body), _) => (1, body),
+        (None, Some(body)) if encoded => (3, body),
+        _ => (0, rest),
+    };
     for (word, plain_too, name) in NAMES {
         let word = word.trim_start_matches('$');
         let head = body.as_bytes().get(..word.len());
         if among.contains(&name)
-            && (dollar || plain_too)
+            && (dollar > 0 || plain_too)
             && head.is_some_and(|h| h.eq_ignore_ascii_case(word.as_bytes()))
         {
-            c.advance(word.len().saturating_add(usize::from(dollar)));
-            if c.eat("=") {
+            c.advance(word.len().saturating_add(dollar));
+            if c.eq_sign() {
                 return Some(name);
             }
             c.reset(start);
@@ -219,7 +226,7 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
         let Some(name) = self.c.identifier()? else {
             return Err(self.c.syntax("parameterAlias"));
         };
-        if !self.c.eat("=") {
+        if !self.c.eq_sign() {
             return Err(self.c.syntax("EQ"));
         }
         let value_at = self.c.pos();
@@ -310,7 +317,7 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
                     if self.c.open() {
                         return Err(self.c.not_implemented(Feature::NestedOption));
                     }
-                    if !self.c.eat("/") {
+                    if !self.c.slash() {
                         return Ok(SelectItem::Path(path));
                     }
                     here = Scope::Type(ty);
@@ -397,7 +404,7 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
             path.push(name.to_owned());
             match found {
                 Some(Member::Complex { ty, .. }) => {
-                    if !self.c.eat("/") {
+                    if !self.c.slash() {
                         return Err(self.c.syntax("expandPath"));
                     }
                     here = Scope::Type(ty);
@@ -420,7 +427,7 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
     /// What follows a navigation property in `$expand`.
     fn expand_kind(&mut self, target: Scope<'m>, depth: usize) -> Result<ExpandKind, UrlError> {
         let start = self.c.pos();
-        if self.c.eat("/") {
+        if self.c.slash() {
             let at = self.c.pos();
             if self.c.identifier()?.is_some() {
                 // A type cast, qualified or by the default namespace (4.01).
