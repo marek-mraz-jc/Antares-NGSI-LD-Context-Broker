@@ -278,10 +278,10 @@ pub(crate) fn type_rules(
 
 /// What the expanded `rules` let the INTERNAL document `doc` show: every
 /// member without rules, `None` when no rule holds for it.
-pub(crate) fn shown(
-    rules: Option<&crate::policy::Filter>,
+pub(crate) fn shown<'a>(
+    rules: Option<&'a crate::policy::Filter>,
     doc: &Value,
-) -> Option<crate::policy::Shown> {
+) -> Option<crate::policy::Shown<'a>> {
     match rules {
         None => Some(crate::policy::Shown::default()),
         Some(f) => f.shown(doc, &POLICY_CONTEXT),

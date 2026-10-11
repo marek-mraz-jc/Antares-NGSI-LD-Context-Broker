@@ -21,6 +21,7 @@ use antares_ql::geo::GeoQuery;
 use antares_ql::QNode;
 use axum::http::HeaderMap;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -580,15 +581,27 @@ impl Rule {
     }
 }
 
+/// The answer of a broker without an engine: a [`Filter`] that narrows
+/// nothing, one shared instance so asking costs no allocation.
+pub fn unnarrowed() -> std::sync::Arc<Filter> {
+    static NOTHING: LazyLock<std::sync::Arc<Filter>> =
+        LazyLock::new(|| std::sync::Arc::new(Filter::default()));
+    NOTHING.clone()
+}
+
 /// What a [`Filter`]'s rules let one Entity show: `only` (when set) is the
 /// union of the matched rules' Attributes, `omitted` what its types omit.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Shown {
-    pub only: Option<std::collections::BTreeSet<String>>,
-    pub omitted: std::collections::BTreeSet<String>,
+///
+/// The names borrow from the rules that decided them, so judging an Entity
+/// copies no Attribute name (T-3697); [`Shown::into_owned`] and
+/// [`Shown::map_names`] give a set that outlives the rules.
+pub struct Shown<'a> {
+    pub only: Option<std::collections::BTreeSet<Cow<'a, str>>>,
+    pub omitted: std::collections::BTreeSet<Cow<'a, str>>,
 }
 
-impl Shown {
+impl Shown<'_> {
     /// Nothing beside the frame: what a projection falls back to for an
     /// Entity no rule holds for, should one reach it.
     pub fn nothing() -> Self {
@@ -603,10 +616,22 @@ impl Shown {
     }
 
     /// The same set with every name mapped, for a document in another form.
-    pub fn map_names(&self, f: impl Fn(&str) -> String) -> Self {
+    pub fn map_names(&self, f: impl Fn(&str) -> String) -> Shown<'static> {
         Shown {
-            only: self.only.as_ref().map(|o| o.iter().map(|n| f(n)).collect()),
-            omitted: self.omitted.iter().map(|n| f(n)).collect(),
+            only: self
+                .only
+                .as_ref()
+                .map(|o| o.iter().map(|n| Cow::Owned(f(n))).collect()),
+            omitted: self.omitted.iter().map(|n| Cow::Owned(f(n))).collect(),
+        }
+    }
+
+    /// The same set, owning its names.
+    pub fn into_owned(self) -> Shown<'static> {
+        let own = |n: Cow<'_, str>| Cow::Owned(n.into_owned());
+        Shown {
+            only: self.only.map(|o| o.into_iter().map(own).collect()),
+            omitted: self.omitted.into_iter().map(own).collect(),
         }
     }
 }
@@ -706,7 +731,7 @@ impl Filter {
     /// any of its types omits. Names compare as written: the caller brings
     /// rules and document into one form first (`repr::type_rules` expands
     /// both), and `ctx` is the one the conditions' names expand through.
-    pub fn shown(&self, doc: &Value, ctx: &antares_jsonld::Context) -> Option<Shown> {
+    pub fn shown(&self, doc: &Value, ctx: &antares_jsonld::Context) -> Option<Shown<'_>> {
         let only = if self.rules.is_empty() {
             None
         } else {
@@ -718,7 +743,7 @@ impl Filter {
             } else {
                 Some(
                     held.iter()
-                        .flat_map(|r| r.attributes.iter().cloned())
+                        .flat_map(|r| r.attributes.iter().map(|a| Cow::Borrowed(a.as_str())))
                         .collect(),
                 )
             }
@@ -733,7 +758,7 @@ impl Filter {
             .into_iter()
             .filter_map(|t| self.omit_by_type.get(t))
             .flatten()
-            .cloned()
+            .map(|a| Cow::Borrowed(a.as_str()))
             .collect();
         Some(Shown { only, omitted })
     }
@@ -2553,17 +2578,17 @@ mod tests {
     #[test]
     fn mapping_the_names_maps_both_sets() {
         let shown = Shown {
-            only: Some(std::collections::BTreeSet::from(["a".to_owned()])),
-            omitted: std::collections::BTreeSet::from(["b".to_owned()]),
+            only: Some(std::collections::BTreeSet::from([Cow::Borrowed("a")])),
+            omitted: std::collections::BTreeSet::from([Cow::Borrowed("b")]),
         };
         let mapped = shown.map_names(str::to_uppercase);
         assert_eq!(
             mapped.only,
-            Some(std::collections::BTreeSet::from(["A".to_owned()]))
+            Some(std::collections::BTreeSet::from([Cow::Borrowed("A")]))
         );
         assert_eq!(
             mapped.omitted,
-            std::collections::BTreeSet::from(["B".to_owned()])
+            std::collections::BTreeSet::from([Cow::Borrowed("B")])
         );
     }
 
