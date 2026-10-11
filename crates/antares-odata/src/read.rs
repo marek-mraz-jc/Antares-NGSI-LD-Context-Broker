@@ -170,8 +170,6 @@ fn percent_decoded(text: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// Whether no option but `$select` (and `$format`, `$schemaversion=*`,
-/// read before) is asked.
 /// Whether `$select` or `$expand` asks for properties.
 fn shaped(options: &QueryOptions) -> bool {
     options.select.is_some() || options.expand.is_some()
@@ -187,6 +185,8 @@ fn no_properties(version: ODataVersion) -> ODataErrorResponse {
     .with_version(version)
 }
 
+/// Whether no option but `$select` (and `$format`, `$schemaversion=*`,
+/// read before) is asked.
 fn only_select(options: &QueryOptions) -> bool {
     options.filter.is_none()
         && options.expand.is_none()
