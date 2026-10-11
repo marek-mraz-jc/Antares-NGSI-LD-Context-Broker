@@ -197,7 +197,7 @@ instance type):
 | LinkML document | ≤ 5 ms p99 for a 100-class schema, cached per view revision | computed once per view revision |
 | WebSocket notification | delivery latency p99 ≤ 1.10× HTTP sink p99 to a local receiver (T-3626); ≤ 32 KiB resident per idle connection plus its queue | no socket opened per notification; one queue hop per connection |
 | internal CSR forward | p99 ≤ 0.5× the HTTP forward to the same broker | no socket, no TLS, no second JSON parse of the request line |
-| binary size | `full` release binary ≤ vanilla + 6 MiB; each feature alone ≤ vanilla + 2 MiB, except `mcp` ≤ vanilla + 4.5 MiB (T-3662) and `odata` ≤ vanilla + 3.5 MiB (T-3705) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
+| binary size | `full` release binary ≤ vanilla + 7 MiB (T-3744); each feature alone ≤ vanilla + 2 MiB, except `mcp` ≤ vanilla + 4.5 MiB (T-3662) and `odata` ≤ vanilla + 3.5 MiB (T-3705) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
 | vanilla | unchanged within the noise band of T-3467 | GOAL point 1 |
 
 A benchmark per row: criterion benches in each surface crate for the
@@ -254,6 +254,26 @@ Options: raise the `odata` budget (chosen), drop `float_roundtrip` (an
 `Edm.Double` no longer round-trips, ADR-0024 broken), measure each
 feature over the feature it implies (changes the rule for every feature),
 size-optimise the OData crates (saves part of 0.6 MiB, still over 2 MiB).
+
+The `full` budget, measured 2026-10-11 in the `binary-size` job of `fast`
+(stripped thin-LTO release binary, x86_64): on dev 7b22710 (run
+38143777118) vanilla 31 110 424 bytes and `full` (views, mcp, odata, ws)
+37 352 760 (+5.95 MiB, 0.05 MiB under the old 6 MiB); with `ogc` on
+train 9f4270d (run 38143787514) `full` 37 690 456 (+6.28 MiB) and `ogc`
+alone 32 943 928 (+1.75 MiB, inside its 2 MiB). `ogc` adds 0.32 MiB to
+`full`, because `views`, `serde_json` and axum are shared. The 6 MiB was
+set for four surfaces; `full` is the union of every surface, so it grows
+with each one even when each stays inside its own budget.
+
+Decided (worker-4, owner may override): `full` ≤ vanilla + 7 MiB,
+because the per-feature budgets still bound each surface and the union of
+five sits at +6.28 MiB, leaving 0.72 MiB for the CQL2 filter (T-3745)
+before this row is read again. Options: raise `full` (chosen), shrink
+`antares-ogc` by 0.28 MiB (its own share over `views` is 0.53 MiB, so
+this would cut most of the surface), `opt-level = "s"` on the surface
+crates (rejected for `mcp` in T-3662 for the same unmeasurable call
+cost), fat LTO for the release profile (slower release builds for every
+lane, not measured here).
 
 The WebSocket notification budget, measured 2026-10-11 on dev f3db73d
 (T-3626, `bench-ws.yml` run 38127455609 on ubuntu-latest), five runs of

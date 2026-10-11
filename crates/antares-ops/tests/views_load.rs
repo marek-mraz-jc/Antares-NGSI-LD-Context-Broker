@@ -53,3 +53,62 @@ fn a_temporal_view_keyed_on_a_mutable_property_is_warned() {
     assert!(!rule8(&load(&current_only).expect("loads")));
     assert!(!rule8(&load(&view()).expect("loads")));
 }
+
+/// ADR-0023 rule 12: `selector ["*"]` with the one rule `{types ["*"],
+/// attributes ["*"]}` loads; `*` anywhere else is refused, whatever the
+/// view's `@context` makes of the term.
+#[test]
+fn star_loads_alone_and_nowhere_else() {
+    let every = json!({
+        "id": "all", "tenant": "city", "selector": ["*"],
+        "rules": [{"types": ["*"], "attributes": ["*"]}],
+        "operations": ["query_entities"]
+    });
+    assert!(load(&every).is_ok());
+    let mut conditioned = every.clone();
+    conditioned["q"] = json!("speed<80");
+    assert!(load(&conditioned).is_ok(), "the view's own q still narrows");
+    let refused = |patch: &dyn Fn(&mut Value)| {
+        let mut doc = every.clone();
+        patch(&mut doc);
+        let why = load(&doc).expect_err("loads");
+        assert!(why.contains("rule 12"), "{why}");
+    };
+    refused(&|d| d["selector"] = json!(["*", "Car"]));
+    refused(&|d| d["selector"] = json!(["Car"]));
+    refused(&|d| d["rules"][0]["types"] = json!(["Car"]));
+    refused(&|d| d["rules"][0]["attributes"] = json!(["speed"]));
+    refused(&|d| d["rules"][0]["attributes"] = json!(["*", "speed"]));
+    refused(&|d| d["rules"][0]["q"] = json!("speed<80"));
+    refused(&|d| d["rules"][0]["scopeQ"] = json!("/a"));
+    refused(&|d| {
+        d["rules"][0]["geoQ"] =
+            json!({"georel": "near;maxDistance==1", "geometry": "Point", "coordinates": [0, 0]});
+    });
+    refused(&|d| {
+        d["rules"] = json!([
+            {"types": ["*"], "attributes": ["*"]},
+            {"types": ["Car"], "attributes": ["speed"]}
+        ]);
+    });
+    // a named view naming `*` beside its names, and a context defining it
+    let mut named = view();
+    named["@context"] = json!({"*": "https://uri.etsi.org/ngsi-ld/default-context/Car"});
+    named["rules"][0]["attributes"] = json!(["speed", "*"]);
+    let why = load(&named).expect_err("a named rule with * loads");
+    assert!(why.contains("rule 12"), "{why}");
+    named["rules"][0]["attributes"] = json!(["speed"]);
+    named["selector"] = json!(["*"]);
+    assert!(load(&named).is_err(), "selector * with named rules loads");
+}
+
+/// The view T-3501 runs the ETSI suite and surfaces-conformance its MCP suites through loads as
+/// committed, in the Tenant `dev/views-rig.sh` seeds.
+#[test]
+fn the_committed_all_view_loads() {
+    let doc: Value = serde_json::from_str(include_str!("../../../ci/views/all.json"))
+        .expect("ci/views/all.json is JSON");
+    let loaded = load(&doc).expect("ci/views/all.json loads");
+    assert!(loaded.view.shows_every_name());
+    assert_eq!(loaded.tenant, "conformance");
+}

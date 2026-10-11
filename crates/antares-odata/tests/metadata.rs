@@ -307,3 +307,33 @@ async fn an_unreadable_schema_is_logged_once_with_its_reason() {
         .unwrap_or_default();
     assert_eq!(log.matches("cannot be read").count(), 1, "{log}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_of_every_name_describes_the_whole_schema() {
+    let (_b, app) = broker().await.expect("broker");
+    let all = json!({
+        "id": "all", "tenant": "city", "selector": ["*"],
+        "rules": [{"types": ["*"], "attributes": ["*"]}],
+        "operations": ["query_entities", "retrieve_entity"]
+    })
+    .to_string();
+    let (s, body) = send(&app, Method::PUT, "/q/views/all", Some(&all), &[]).await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let (s, xml) = send(
+        &app,
+        Method::GET,
+        "/x/views/all/odata/v4/$metadata",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{xml}");
+    for shown in [
+        r#"<EntityType Name="Car""#,
+        r#"<EntityType Name="Person""#,
+        r#"<Property Name="secret""#,
+        "NavigationProperty",
+    ] {
+        assert!(xml.contains(shown), "ADR-0023 rule 12, {shown}: {xml}");
+    }
+}
