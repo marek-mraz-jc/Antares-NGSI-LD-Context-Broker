@@ -3,7 +3,7 @@
 //! its tools take any well-formed name, by pattern, and answer what the
 //! view root answers; a name the view does not know is no refusal.
 
-use crate::common::{call, fixture, put_view, rpc, READS};
+use crate::common::{answered, call, confirmable, fixture, prop, put_view, rpc, READS};
 use serde_json::{json, Value};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -71,6 +71,49 @@ async fn every_name_is_offered_by_its_pattern() -> Result<(), String> {
         bike.result().pointer("/contents/0/text").is_some(),
         "{}",
         bike.text
+    );
+    Ok(())
+}
+
+/// A write tool of the `all` view takes a type and an Attribute no view
+/// names, by pattern, and the Entity lands (T-3666, with T-3514's writes).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_tool_takes_any_name_by_its_pattern() -> Result<(), String> {
+    let f = fixture().await?;
+    put_view(
+        &f.app,
+        &json!({"id": "all", "tenant": "city", "selector": ["*"],
+                "rules": [{"types": ["*"], "attributes": ["*"]}],
+                "operations": ["create_entity", "retrieve_entity"]}),
+    )
+    .await?;
+    let args = json!({"entity": {"id": "urn:ngsi-ld:Tram:1", "type": "Tram",
+                                 "line": prop(&json!(4))}});
+    let first = confirmable(&f.app, "all", "create_entity", args.clone(), json!({})).await;
+    let state = first
+        .result()
+        .get("requestState")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("not asked: {}", first.text))?
+        .to_owned();
+    let created = confirmable(&f.app, "all", "create_entity", args, answered(&state, true)).await;
+    assert_eq!(
+        created.structured(),
+        &json!({"created": "urn:ngsi-ld:Tram:1"}),
+        "{}",
+        created.text
+    );
+    let tram = call(
+        &f.app,
+        "all",
+        "get_entity",
+        json!({"id": "urn:ngsi-ld:Tram:1"}),
+    )
+    .await;
+    assert!(
+        !tram.is_error() && tram.text.contains("line"),
+        "{}",
+        tram.text
     );
     Ok(())
 }

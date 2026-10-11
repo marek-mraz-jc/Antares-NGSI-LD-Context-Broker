@@ -256,13 +256,19 @@ fn entity(arg: &str, v: &Value, names: &Names, whole: bool) -> Result<(), Broken
             }
             "id" => return Err(broken(arg, "names no id; the id argument does")),
             "type" => {
-                one_name(arg, member, &names.types, is_type_name, "types")?;
+                one_name(
+                    arg,
+                    member,
+                    (&names.types, names.every),
+                    is_type_name,
+                    "types",
+                )?;
             }
             name => {
                 one_name(
                     arg,
                     &Value::String(name.to_owned()),
-                    &names.attributes,
+                    (&names.attributes, names.every),
                     is_attr_name,
                     "attributes",
                 )?;
