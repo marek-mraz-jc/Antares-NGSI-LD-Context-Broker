@@ -2,9 +2,10 @@
 //! wasm32 only: a bounded map with moka's call surface. moka's clock
 //! calls `std::time::Instant::now()` unconditionally, which panics on
 //! wasm32-unknown-unknown — so the browser build swaps in this FIFO-evicting
-//! cache behind the same six methods the loader uses. Bounded is the
-//! requirement (every cache has a max size); recency-optimal
-//! eviction is not — a browser tab's @context set is tiny.
+//! cache behind the same methods and builder the loader uses. Bounded is the
+//! requirement, by the same budget as moka's: an entry count, or with a
+//! weigher the sum of the entries' weights (the loader's byte and term
+//! budgets, T-3698). Recency-optimal eviction is not a requirement.
 // FIFO eviction is deliberate; port moka's TinyLFU here only if a browser
 // workload ever shows cache thrash.
 
@@ -12,23 +13,59 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::sync::Mutex;
 
+type Weigher<K, V> = Box<dyn Fn(&K, &V) -> u32 + Send + Sync>;
+
 /// Eviction policy, in full: entries leave in the order they were FIRST
-/// inserted. `get` is a pure read — it does not refresh recency — and
-/// re-inserting a resident key overwrites its value without moving it back in
-/// the queue. `entry_count()` never exceeds the capacity the cache was built
-/// with, including a capacity of zero.
+/// inserted, until the new entry fits the budget. `get` is a pure read — it
+/// does not refresh recency — and re-inserting a resident key overwrites its
+/// value without moving it back in the queue. The held weight (one per entry
+/// without a weigher) never exceeds the capacity the cache was built with,
+/// including a capacity of zero; an entry heavier than the whole budget is
+/// not held.
 pub struct Cache<K, V> {
-    cap: usize,
-    inner: Mutex<(HashMap<K, V>, VecDeque<K>)>,
+    cap: u64,
+    weigher: Option<Weigher<K, V>>,
+    inner: Mutex<Inner<K, V>>,
 }
 
-type Inner<K, V> = (HashMap<K, V>, VecDeque<K>);
+/// The entries with their weights, the insertion queue and the weight held.
+type Inner<K, V> = (HashMap<K, (V, u64)>, VecDeque<K>, u64);
+
+/// moka's `Cache::builder()` surface: a capacity and an optional weigher.
+pub struct CacheBuilder<K, V> {
+    cap: u64,
+    weigher: Option<Weigher<K, V>>,
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> CacheBuilder<K, V> {
+    pub fn max_capacity(mut self, cap: u64) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    pub fn weigher(mut self, weigh: impl Fn(&K, &V) -> u32 + Send + Sync + 'static) -> Self {
+        self.weigher = Some(Box::new(weigh));
+        self
+    }
+
+    pub fn build(self) -> Cache<K, V> {
+        Cache {
+            cap: self.cap,
+            weigher: self.weigher,
+            inner: Mutex::new((HashMap::new(), VecDeque::new(), 0)),
+        }
+    }
+}
 
 impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
     pub fn new(cap: u64) -> Self {
-        Self {
-            cap: cap as usize,
-            inner: Mutex::new((HashMap::new(), VecDeque::new())),
+        Self::builder().max_capacity(cap).build()
+    }
+
+    pub fn builder() -> CacheBuilder<K, V> {
+        CacheBuilder {
+            cap: 0,
+            weigher: None,
         }
     }
 
@@ -44,26 +81,38 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
         K: std::borrow::Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.lock().0.get(key).cloned()
+        self.lock().0.get(key).map(|(v, _)| v.clone())
     }
 
     pub fn insert(&self, key: K, value: V) {
-        if self.cap == 0 {
+        let weight = self
+            .weigher
+            .as_ref()
+            .map_or(1, |w| u64::from(w(&key, &value)));
+        let mut g = self.lock();
+        let (map, order, held) = &mut *g;
+        if let Some((_, old)) = map.remove(&key) {
+            *held = held.saturating_sub(old);
+        }
+        if weight > self.cap {
+            order.retain(|k| k != &key);
             return;
         }
-        let mut g = self.lock();
-        if !g.0.contains_key(&key) {
-            while g.0.len() >= self.cap {
-                match g.1.pop_front() {
-                    Some(old) => {
-                        g.0.remove(&old);
-                    }
-                    None => break,
+        while held.saturating_add(weight) > self.cap {
+            let Some(at) = order.iter().position(|k| k != &key) else {
+                break;
+            };
+            if let Some(old) = order.remove(at) {
+                if let Some((_, w)) = map.remove(&old) {
+                    *held = held.saturating_sub(w);
                 }
             }
-            g.1.push_back(key.clone());
         }
-        g.0.insert(key, value);
+        if !order.contains(&key) {
+            order.push_back(key.clone());
+        }
+        *held = held.saturating_add(weight);
+        map.insert(key, (value, weight));
     }
 
     pub fn invalidate<Q>(&self, key: &Q)
@@ -72,15 +121,11 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
         Q: Eq + Hash + ?Sized,
     {
         let mut g = self.lock();
-        let (map, order) = &mut *g;
-        map.remove(key);
+        let (map, order, held) = &mut *g;
+        if let Some((_, w)) = map.remove(key) {
+            *held = held.saturating_sub(w);
+        }
         order.retain(|k| map.contains_key::<K>(k));
-    }
-
-    pub fn invalidate_all(&self) {
-        let mut g = self.lock();
-        g.0.clear();
-        g.1.clear();
     }
 
     /// Snapshot of the resident entries, in moka's `iter()` item shape — the
@@ -89,7 +134,7 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
     pub fn iter(&self) -> std::vec::IntoIter<(std::sync::Arc<K>, V)> {
         let g = self.lock();
         g.0.iter()
-            .map(|(k, v)| (std::sync::Arc::new(k.clone()), v.clone()))
+            .map(|(k, (v, _))| (std::sync::Arc::new(k.clone()), v.clone()))
             .collect::<Vec<_>>()
             .into_iter()
     }
@@ -98,6 +143,12 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
 
     pub fn entry_count(&self) -> u64 {
         self.lock().0.len() as u64
+    }
+
+    /// The weight held, moka's `weighted_size()`.
+    #[cfg(test)]
+    pub fn weighted_size(&self) -> u64 {
+        self.lock().2
     }
 }
 
@@ -207,22 +258,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn invalidate_all_clears_both_map_and_queue() {
-        let c = filled(4, 4);
-        c.invalidate_all();
-        assert_eq!(c.entry_count(), 0);
-        assert_eq!(c.get(&3), None);
-        // the queue was cleared too: the next 4 inserts evict nothing
-        for i in 10..14 {
-            c.insert(i, i);
-        }
-        assert_eq!(c.entry_count(), 4);
-        for i in 10..14 {
-            assert_eq!(c.get(&i), Some(i));
-        }
-    }
-
     /// `iter` yields every resident entry exactly once — it is what the
     /// caller filters to invalidate a subset, so a missed entry would leave a
     /// stale one behind. Evicted keys must not appear.
@@ -246,8 +281,73 @@ mod tests {
         let mut seen: Vec<u32> = c.iter().map(|(k, _)| *k).collect();
         seen.sort_unstable();
         assert_eq!(seen, vec![2, 4, 5]);
-        c.invalidate_all();
-        assert_eq!(c.iter().count(), 0);
+    }
+
+    fn weighed(cap: u64) -> Cache<u32, u32> {
+        Cache::builder()
+            .max_capacity(cap)
+            .weigher(|_k: &u32, v: &u32| *v)
+            .build()
+    }
+
+    /// With a weigher the budget is the sum of the weights, as moka's is:
+    /// a heavy entry evicts as many of the oldest as it needs, never more,
+    /// and the held weight never passes the capacity (T-3698).
+    #[test]
+    fn a_weigher_bounds_the_held_weight() {
+        let c = weighed(10);
+        for (k, w) in [(0, 3), (1, 3), (2, 3)] {
+            c.insert(k, w);
+        }
+        assert_eq!((c.entry_count(), c.weighted_size()), (3, 9));
+        c.insert(3, 5);
+        assert_eq!(c.get(&0), None, "the oldest made room");
+        assert_eq!(c.get(&1), None, "and the next, since 3 + 3 + 5 > 10");
+        assert_eq!((c.get(&2), c.get(&3)), (Some(3), Some(5)));
+        assert_eq!(c.weighted_size(), 8);
+        for k in 10..1000 {
+            c.insert(k, k % 7 + 1);
+            assert!(c.weighted_size() <= 10, "bound breached at {k}");
+        }
+    }
+
+    /// An entry heavier than the whole budget is not held, and it evicts
+    /// nothing: a hostile 5 MiB document cannot flush the warm ones.
+    #[test]
+    fn an_entry_over_the_budget_is_not_held() {
+        let c = weighed(10);
+        c.insert(0, 4);
+        c.insert(1, 11);
+        assert_eq!(c.get(&1), None);
+        assert_eq!((c.get(&0), c.weighted_size()), (Some(4), 4));
+        // a resident key re-inserted over the budget leaves too
+        c.insert(0, 11);
+        assert_eq!(
+            (c.get(&0), c.entry_count(), c.weighted_size()),
+            (None, 0, 0)
+        );
+        c.insert(2, 10);
+        assert_eq!(c.get(&2), Some(10), "the queue holds no stale key");
+    }
+
+    /// Re-inserting a key with a new weight charges the new weight, and
+    /// invalidating returns it to the budget.
+    #[test]
+    fn reinsert_and_invalidate_keep_the_weight_exact() {
+        let c = weighed(10);
+        c.insert(0, 2);
+        c.insert(1, 2);
+        c.insert(0, 7);
+        assert_eq!((c.weighted_size(), c.entry_count()), (9, 2));
+        c.insert(2, 3);
+        assert_eq!(
+            (c.get(&0), c.get(&1)),
+            (None, Some(2)),
+            "FIFO: the re-inserted 0 kept its place at the head of the queue"
+        );
+        assert_eq!(c.weighted_size(), 5);
+        c.invalidate(&1);
+        assert_eq!(c.weighted_size(), 3);
     }
 
     /// `run_pending_tasks` exists only to match moka's call surface; it must

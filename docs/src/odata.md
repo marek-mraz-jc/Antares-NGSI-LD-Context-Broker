@@ -75,6 +75,10 @@ hidden or absent property or single target is `404`, a hidden target of a
 collection navigation is left out, and an operation the view does not offer
 is `405` `MethodNotAllowed`.
 
+Context URLs, next links, entity references, `Location` and
+`OData-EntityId` are absolute under `ANTARES_PUBLIC_URL`, or `http://{Host}`
+of the request when it is unset, as for the JSON-LD context URL.
+
 A page that leaves rows carries `@odata.nextLink` with a `$skiptoken`. The
 token is bound to the view and the query: a token beside `$skip`/`$top`,
 from another query or another view is `400`. A query in a Tenant that holds
@@ -198,5 +202,5 @@ carries no NGSI-LD `ProblemDetails`.
 
 - [Endpoint views](views.md)
 - [MCP endpoint of a view](mcp.md)
-- `docs/analysis/odata-linkml-mapping.md`, `docs/analysis/surfaces-threat-model.md` (O1 to O26)
+- `docs/analysis/odata-linkml-mapping.md`, `docs/analysis/surfaces-threat-model.md` (O1 to O27)
 - ADR-0024 (the OData crates)

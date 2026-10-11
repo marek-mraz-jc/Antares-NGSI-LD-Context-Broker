@@ -122,7 +122,7 @@ before the registry is asked (`notify.rs:2013`), so the two never meet.
 
 The client creates, updates and deletes its Subscriptions **over the
 socket** (`x-subscribe`, `x-update`, `x-unsubscribe`). The surface turns
-each into the ordinary 10.5.2 / 10.5.3 / 10.5.5 request through
+each into the ordinary 10.5.2 / 10.5.3 / 10.5.6 request through
 `AppState::call` (the operation layer of the module rules), with the
 endpoint set to this connection's URI (a body naming any other endpoint
 URI is 400), so the request is gated, stored
@@ -221,7 +221,7 @@ no longer reaches back that far, and delivery continues with the next
 `x-seq`. A failed resume is `x-result` 404 `ResourceNotFound` for every
 reason (an existence oracle on connection ids would otherwise appear).
 After the grace period the connection's Subscriptions are deleted
-through 10.5.5 like any client delete.
+through 10.5.6 (Delete Subscription, gated as 5.8.5) like any client delete.
 
 ### 8. Identity: bound at upgrade, limited by lifetime
 
