@@ -209,6 +209,19 @@ step sbom bash -c 'cargo cyclonedx --version >/dev/null 2>&1 || { echo "missing 
 if grep -q 'Cargo.toml$' <<< "$changed" || git diff "$mb" -- '*.rs' | grep -q '^+.*ANTARES_'; then
   step config-keys cargo test --locked -p antares-broker --bins config_key_tests
 fi
+# workspace.yml "Binary size per surface feature" (ADR-0027 section 6
+# budget, train 10): release builds of vanilla and each surface feature, when
+# a manifest, the broker or a crate of role surface, ops or protocol changed
+if grep -qE '(^|/)Cargo\.(toml|lock)$|^crates/antares-broker/' <<< "$changed" ||
+  python3 - "${crates[@]}" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gate", "dev/coverage-gate.py")
+g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
+sys.exit(0 if any(c["name"] in sys.argv[1:] for c in g.new_crates()) else 1)
+PY
+then
+  step binary-size python3 dev/surface-features.py sizes
+fi
 # workspace.yml "Route docs check" and "Env-var docs check"
 step route-docs dev/check-route-docs.sh
 step env-docs dev/check-env-docs.sh
