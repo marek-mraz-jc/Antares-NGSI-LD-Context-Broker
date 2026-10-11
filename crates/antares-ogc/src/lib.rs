@@ -27,7 +27,7 @@ mod model;
 mod schema;
 mod write;
 
-use antares_ops::{Caller, Ops, Surface, ViewOps};
+use antares_ops::{Caller, OperationId, Ops, Surface, ViewOps};
 use axum::body::Body;
 use axum::extract::{Query, Request};
 use axum::http::header::{ACCEPT, ALLOW, CONTENT_LENGTH, CONTENT_TYPE};
@@ -389,6 +389,15 @@ struct Here<'a> {
 }
 
 impl Here<'_> {
+    /// How this request's Features write references and their EP-38 links.
+    fn refs(&self, profile: items::Profile) -> items::Refs<'_> {
+        items::Refs {
+            profile,
+            base: self.base,
+            alternate: self.view.allows(OperationId::RetrieveEntity),
+        }
+    }
+
     /// C1: the landing page.
     fn landing(&self) -> Value {
         let b = self.base;
@@ -455,10 +464,11 @@ impl Here<'_> {
             Err(refused) => return refused.reply(),
         };
         let digest = items::digest(self.id, &c.id, pairs);
-        let page = match items::page(self.view, self.caller, c, &p, digest, self.base).await {
-            Ok(page) => page,
-            Err(refused) => return refused.reply(),
-        };
+        let page =
+            match items::page(self.view, self.caller, c, &p, digest, self.refs(p.profile)).await {
+                Ok(page) => page,
+                Err(refused) => return refused.reply(),
+            };
         let at = format!("{}/collections/{}/items", self.base, c.id);
         let this = query.map_or_else(|| at.clone(), |q| format!("{at}?{q}"));
         let mut links = vec![
@@ -500,18 +510,19 @@ impl Here<'_> {
             Ok(p) => p,
             Err(refused) => return refused.reply(),
         };
-        let refs = items::Refs {
-            profile: p.profile,
-            base: self.base,
-        };
-        match items::one(self.view, self.caller, c, id, &p, refs).await {
+        match items::one(self.view, self.caller, c, id, &p, self.refs(p.profile)).await {
             Ok(mut feature) => {
                 let at = format!("{}/collections/{}", self.base, c.id);
                 let own = format!("{at}/items/{}", items::encode(id));
+                let entity = match feature.remove("links") {
+                    Some(Value::Array(links)) => links,
+                    _ => Vec::new(),
+                };
                 let links: Vec<Value> =
                     [link("self", GEOJSON, &own), link("collection", JSON, &at)]
                         .into_iter()
                         .chain(profile_link(c, p.profile))
+                        .chain(entity)
                         .collect();
                 feature.insert("links".into(), Value::from(links));
                 in_crs(p.crs, document(GEOJSON, &Value::Object(feature)))
