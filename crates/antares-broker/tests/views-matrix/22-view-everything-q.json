@@ -1,0 +1,36 @@
+{
+ "about": "The `*` view with a view q speed<25: only Entities with such a speed.",
+ "view": {
+  "selector": [
+   "*"
+  ],
+  "rules": [
+   {
+    "types": [
+     "*"
+    ],
+    "attributes": [
+     "*"
+    ]
+   }
+  ],
+  "q": "speed<25"
+ },
+ "expect": {
+  "urn:ngsi-ld:Vehicle:V5": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V6": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ]
+ },
+ "caller": {
+  "x-jc-roles": "public"
+ }
+}

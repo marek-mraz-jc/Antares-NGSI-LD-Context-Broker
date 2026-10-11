@@ -1,0 +1,32 @@
+{
+ "about": "q !owner: only the Vehicle without owner.",
+ "view": {
+  "selector": [
+   "Vehicle"
+  ],
+  "rules": [
+   {
+    "types": [
+     "Vehicle"
+    ],
+    "attributes": [
+     "location",
+     "owner",
+     "speed",
+     "vehicleType"
+    ]
+   }
+  ],
+  "q": "!owner"
+ },
+ "expect": {
+  "urn:ngsi-ld:Vehicle:V7": [
+   "location",
+   "speed",
+   "vehicleType"
+  ]
+ },
+ "caller": {
+  "x-jc-roles": "public"
+ }
+}
