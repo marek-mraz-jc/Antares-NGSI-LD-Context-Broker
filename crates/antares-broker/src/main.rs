@@ -1145,10 +1145,7 @@ async fn run(
     } else {
         antares_api::ops_router(state)
     };
-    let app = tower::Layer::layer(
-        &tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash(),
-        routed,
-    );
+    let app: App = tower::util::MapRequest::new(routed, antares_api::trim_trailing_slash);
 
     // A connection that never finishes its request headers must not hold a
     // slot forever; hyper closes it after this timeout.
@@ -1304,8 +1301,10 @@ fn accept_backoff(e: &std::io::Error) -> bool {
     )
 }
 
-/// The served app: the router under trailing-slash normalization.
-type App = tower_http::normalize_path::NormalizePath<axum::Router>;
+/// The served app: the router under trailing-slash normalization, which
+/// leaves a view's OData paths as sent (T-3731).
+type App =
+    tower::util::MapRequest<axum::Router, fn(axum::extract::Request) -> axum::extract::Request>;
 
 /// One accepted connection. Split out of the accept loop so the drain's
 /// notice window serves connections with identical behaviour, and so the

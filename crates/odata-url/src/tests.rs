@@ -186,6 +186,20 @@ fn the_service_forms() {
     syntax("$metadata#Buildings", 9);
 }
 
+/// URL Conventions section 4 and the ABNF `resourcePath`: no path segment is
+/// empty, so a trailing or doubled `/` is a syntax error at the empty segment,
+/// never the resource without it and never a name that does not resolve
+/// (T-3731).
+#[test]
+fn an_empty_path_segment_is_a_syntax_error() {
+    syntax("Buildings/", 10);
+    syntax("Buildings//", 10);
+    syntax("Buildings//name", 10);
+    syntax("Buildings/?$top=1", 10);
+    syntax("Buildings('b1')/", 16);
+    syntax("Buildings('b1')//name", 16);
+}
+
 fn unreachable_form(uri: &ODataUri) {
     assert!(matches!(uri, ODataUri::Entity { .. }), "{uri:?}");
 }

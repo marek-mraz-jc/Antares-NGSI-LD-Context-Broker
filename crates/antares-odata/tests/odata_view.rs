@@ -181,3 +181,34 @@ async fn odata_skiptoken_from_another_query_is_400() {
     );
     assert_eq!(body["value"].as_array().map(Vec::len), Some(1), "{body}");
 }
+
+/// OData 4.01 Part 2 section 4 and the ABNF `resourcePath`: a path segment
+/// is never empty, so `Car/` is not `Car` but a malformed URL (T-3731, the
+/// external compliance suite's `11.1_resource_path`). The broker's
+/// trailing-slash trim, which the NGSI-LD API keeps, leaves the OData
+/// service's paths as sent; the service root still answers with and without
+/// its slash.
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_an_empty_path_segment_is_400_and_the_service_root_stays() {
+    let (_b, app) = broker().await.expect("broker");
+    let root = "/x/views/fleet-a/odata/v4";
+    for path in ["Car/", "Car//", "Car('urn:ngsi-ld:Car:1')/", "Car//speed"] {
+        let (s, body) = send(&app, "GET", &format!("{root}/{path}"), "", &[]).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "BadRequest", "{path}: {body}");
+    }
+    for uri in [root.to_owned(), format!("{root}/"), format!("{root}/Car")] {
+        let (s, body) = send(&app, "GET", &uri, "", &[]).await;
+        assert_eq!(s, StatusCode::OK, "{uri}: {body}");
+    }
+    // the NGSI-LD API beside it keeps reading a trailing slash as absent
+    let (s, body) = send(
+        &app,
+        "GET",
+        "/ngsi-ld/v1/entities/?type=https://example.org/city/Car",
+        "",
+        &[("NGSILD-Tenant", "city")],
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{body}");
+}
