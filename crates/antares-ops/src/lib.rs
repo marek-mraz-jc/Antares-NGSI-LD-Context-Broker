@@ -821,32 +821,7 @@ impl Ops {
         // A target outside `self_url` is the transport's mistake, and a
         // header 5.9.2 let through that HTTP could not send either: the
         // forward is not made in process, and the answer says so (502).
-        let inner = req
-            .target()
-            .and_then(|target| {
-                target
-                    .strip_prefix(self_url)
-                    .filter(|rest| rest.starts_with('/'))
-                    .map(str::to_owned)
-            })
-            .and_then(|path| {
-                let mut inner = axum::http::Request::builder()
-                    .method(req.method().clone())
-                    .uri(path);
-                for (name, value) in req.headers() {
-                    inner = inner.header(name.as_str(), value.as_str());
-                }
-                // The HTTP client states the length of what it sends.
-                let body = match req.body() {
-                    Some(bytes) => {
-                        inner = inner.header(axum::http::header::CONTENT_LENGTH, bytes.len());
-                        Body::from(bytes.to_vec())
-                    }
-                    None => Body::empty(),
-                };
-                inner.body(body).ok()
-            });
-        let Some(inner) = inner else {
+        let Some(inner) = in_process_request(&req, self_url) else {
             return (502, serde_json::Value::Null, Vec::new());
         };
         let answer = self.state.call_on_task(req.subject().clone(), inner).await;
@@ -866,6 +841,39 @@ impl Ops {
             .unwrap_or(serde_json::Value::Null);
         (status, body, warnings)
     }
+}
+
+/// The request [`Ops::forward_in_process`] hands the router for `req`: its
+/// method, the path and query of its target after `self_url`, its headers
+/// and its payload with the length the HTTP client would state, and nothing
+/// else (ADR-0025 equivalence layer 1). `None` when the target does not lie
+/// under `self_url` or a header is one no request can carry.
+#[must_use]
+pub fn in_process_request(
+    req: &BuiltForward<'_>,
+    self_url: &str,
+) -> Option<axum::http::Request<Body>> {
+    let path = req.target().and_then(|target| {
+        target
+            .strip_prefix(self_url)
+            .filter(|rest| rest.starts_with('/'))
+            .map(str::to_owned)
+    })?;
+    let mut inner = axum::http::Request::builder()
+        .method(req.method().clone())
+        .uri(path);
+    for (name, value) in req.headers() {
+        inner = inner.header(name.as_str(), value.as_str());
+    }
+    // The HTTP client states the length of what it sends.
+    let body = match req.body() {
+        Some(bytes) => {
+            inner = inner.header(axum::http::header::CONTENT_LENGTH, bytes.len());
+            Body::from(bytes.to_vec())
+        }
+        None => Body::empty(),
+    };
+    inner.body(body).ok()
 }
 
 /// The export grants of internal context sources (ADR-0025 rule 5), kept
@@ -969,6 +977,12 @@ impl<S: Surface> antares_api::ApiSurface for Mounted<S> {
 pub mod test_kit {
     use super::{mount, AppState, Surface};
     use std::sync::Arc;
+
+    /// Let this process forward to loopback and private addresses, as a
+    /// test's own listener is one (the egress policy refuses them otherwise).
+    pub fn allow_private_egress() {
+        antares_jsonld::allow_private_egress(true);
+    }
 
     /// One broker: the NGSI-LD API, the admin surface and the surfaces a
     /// test mounts, over one in-memory store.

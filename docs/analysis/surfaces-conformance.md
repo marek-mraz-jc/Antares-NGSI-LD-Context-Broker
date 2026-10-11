@@ -235,6 +235,7 @@ pytest junit). Required checks are the merge-request subset; the rest runs night
 | `etsi-full-direct` | full | none | E3 | no | `file` cell |
 | `etsi-full-restricted` | full | `etsi-restricted` | E4 with `expected_view_refusals.json` | no | `file` cell |
 | `etsi-iop` | vanilla, full | none | `IOP_TP` through `dev/run-five.sh` | no | yes |
+| `etsi-icsr` | vanilla, full with `internal-csr` | none | `DistributedOperations` on broker1 through `dev/etsi-pipeline.sh`, `ANTARES_SELF_URLS` its own URL on full, diff with `dev/etsi-baseline.py compare` (ADR-0025 layer 3) | no (layers 1 and 2 are crate tests in every run) | yes |
 | `mcp-conformance` | `mcp` | `all` | `npx --yes @modelcontextprotocol/conformance@0.1.16 server --url <root>/x/views/all/mcp --spec-version 2025-11-25 --expected-failures ci/mcp-baseline.yaml`, then `--spec-version 2025-06-18` (section 3.2) | yes | yes |
 | `mcp-suites` | `mcp` | `all`, `parity-restricted`, `other` | the three suites of `tests/mcp` with `MCP_SURFACE=broker`, `-m "not platform_only"` | `test_mcp_read_parity.py` with `MCP_PARITY_CASES=5` | all three |
 | `odata-conformance` | full | `all`, `parity-restricted` | `jc-conformance odata` | `test_abnf_cases_live`, both `$metadata` validations | all, both client jobs |

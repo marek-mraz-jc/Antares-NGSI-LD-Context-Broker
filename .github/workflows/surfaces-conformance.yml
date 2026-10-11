@@ -25,6 +25,11 @@ name: surfaces-conformance
 #                    2.16.0, then joinedcontext-conformance tests/ws: the
 #                    scripted sessions of /x/views/all/ws, every message
 #                    held against that document
+#   etsi-icsr        the ETSI DistributedOperations directory on broker1 of
+#                    the internal-csr image with ANTARES_SELF_URLS set to
+#                    its own URL, compared TP by TP with the vanilla image
+#                    (ADR-0025 equivalence layer 3, T-3521); not per pull
+#                    request
 #   etsi-iop         the ETSI IOP suite over five brokers on the
 #                    all-features image (mqtt, views, mcp, odata, ws),
 #                    compared TP by TP with the vanilla image of the same
@@ -514,3 +519,76 @@ jobs:
           title: etsi-iop went red
           body: The ETSI IOP suite on the all-features build differs from the vanilla build of the same commit.
           log-file: iop-compare.txt
+
+  # T-3521, ADR-0025 equivalence layer 3: the ETSI DistributedOperations
+  # directory against broker1 of the full image with internal-csr and
+  # ANTARES_SELF_URLS set to that broker's own URL, and against the vanilla
+  # image of the same commit. The suite's Context Source is its HTTP mock,
+  # no self URL, so every forward stays HTTP and no verdict may move: the
+  # feature leaves foreign federation alone. Two release images per run, so
+  # nightly, v* tags and dispatch only, as etsi-iop.
+  etsi-icsr-run:
+    name: etsi-icsr ${{ matrix.variant }}
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [vanilla, full]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      OUT: results/icsr-${{ matrix.variant }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the ${{ matrix.variant }} image
+        run: |
+          f=""; [ "${{ matrix.variant }}" = full ] && f=internal-csr,mqtt,views,mcp,odata,ws
+          docker build --build-arg FEATURES="$f" -t antares-local:latest .
+      - name: DistributedOperations on broker1
+        env:
+          STORE: memory
+          SUITES: DistributedOperations
+          RESULTS_DIR: ${{ env.OUT }}
+          SKIP_BUILD: "1"
+          STOP_ON_ERROR: "0"
+          CALLBACK_HOST: localhost
+          SELF_URLS: ${{ matrix.variant == 'full' && 'http://localhost:9090' || '' }}
+        run: ./dev/etsi-pipeline.sh || true
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: etsi-icsr-${{ matrix.variant }}
+          path: |
+            ${{ env.OUT }}/tp-status.csv
+            ${{ env.OUT }}/run-summary.md
+            ${{ env.OUT }}/failures.csv
+            ${{ env.OUT }}/*-console.log
+            ${{ env.OUT }}/**/log.html
+          retention-days: 14
+
+  etsi-icsr:
+    name: etsi-icsr
+    needs: etsi-icsr-run
+    if: always() && needs.etsi-icsr-run.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: etsi-icsr-*
+          path: in
+      - name: The internal-csr build answers as vanilla, TP by TP
+        # explicit bash is -eo pipefail: the compare's exit survives the tee
+        shell: bash
+        run: python3 dev/etsi-baseline.py compare in/etsi-icsr-vanilla in/etsi-icsr-full | tee icsr-compare.txt
+      - name: File an issue on nightly failure
+        if: failure() && github.event_name == 'schedule'
+        uses: ./.github/actions/failure-issue
+        with:
+          title: etsi-icsr went red
+          body: The ETSI DistributedOperations verdicts of the internal-csr build differ from the vanilla build of the same commit.
+          log-file: icsr-compare.txt
