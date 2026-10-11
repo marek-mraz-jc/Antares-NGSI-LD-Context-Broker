@@ -140,8 +140,10 @@ surface.
 
 Actions are the CIM 009 Table 4.20-1 names (`queryEntity`, `createEntity`,
 ...): each clause a policy lists, restricted to the names whose
-operation-matrix rows the view allows. A policy without `information`
-shows the type `*`.
+operation-matrix rows the view allows, under the clause the engine is
+asked for those rows: `retrieveEntityTypeDetails` and
+`retrieveAttrTypeDetails` are asked as 5.7.5 and 5.7.8, on the routes they
+share with the lists. A policy without `information` shows the type `*`.
 
 What the caller holds and nothing else: only policies whose assignee is the
 caller and that are in force now; a type only somebody else may touch is
