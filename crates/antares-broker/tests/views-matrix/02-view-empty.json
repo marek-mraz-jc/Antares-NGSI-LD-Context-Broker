@@ -11,7 +11,7 @@
     ],
     "attributes": [
      "location",
-     "owner",
+     "operator",
      "speed",
      "vehicleType"
     ]

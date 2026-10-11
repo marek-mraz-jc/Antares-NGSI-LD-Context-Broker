@@ -26,7 +26,12 @@ use axum::Router;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tower::Service;
+
+#[path = "common/ws_client.rs"]
+mod ws_client;
+use ws_client::Socket;
 
 const SEED: &str = include_str!("views-matrix/_seed.json");
 const SCHEMA: &str = include_str!("views-matrix/_schema.json");
@@ -34,11 +39,16 @@ const SCHEMA: &str = include_str!("views-matrix/_schema.json");
 const TYPES: [&str; 3] = ["Vehicle", "Parking", "Sensor"];
 /// The page size every surface is read with: small, so every answer pages.
 const PAGE: usize = 3;
-/// The read clauses a scenario without policies grants the public role
-/// whole, so the view alone decides.
-const READS: [&str; 10] = [
+/// The read and subscription clauses a scenario without policies grants
+/// the public role whole, so the view alone decides.
+const READS: [&str; 15] = [
     "5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.7.5", "5.7.6", "5.7.7", "5.7.8", "5.7.9", "5.7.10",
+    "5.8.1", "5.8.2", "5.8.3", "5.8.4", "5.8.5",
 ];
+/// The service account the harness writes the seed and the moves as: a
+/// permission of its own in every document, never the scenario's caller.
+const SEEDER: &str = "matrix-seed";
+
 /// The members of an Entity that are not Attributes.
 const FRAME: [&str; 7] = [
     "id",
@@ -128,6 +138,13 @@ impl Scenario {
                             "operations": READS}]),
         };
         let mut doc = json!({ "policies": policies });
+        if let Some(all) = doc["policies"].as_array_mut() {
+            all.push(
+                json!({"id": "matrix-seed", "assignee": {"kind": "serviceAccount", "id": SEEDER},
+                            "operations": ["5.6.1", "5.6.2", "5.6.8"],
+                            "information": [{"entities": TYPES.map(|t| json!({"type": t}))}]}),
+            );
+        }
         if let Some(bound) = self.doc.get("bind") {
             doc["views"] = json!({ self.view(): bound });
         }
@@ -168,18 +185,19 @@ fn corpus() -> Vec<Scenario> {
         .collect()
 }
 
-/// The broker of a `full` build with the joinedcontext engine, and a
-/// second router over the same store and views without it, for what the
-/// harness writes itself (the seed, the moves): the engine refuses a write
-/// that names `owner`, an access-control member.
-async fn broker() -> (Router, Router, antares_ops::views::Reload) {
+/// The broker of a `full` build with the joinedcontext engine set before
+/// it is wired, as `main` sets it, so notifications are decided by it too.
+async fn broker() -> (Router, antares_ops::views::Reload) {
     std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
     std::env::set_var(
         "ANTARES_POLICY_SUBJECT_HEADERS",
         joinedcontext_policy::subject::HEADERS.join(","),
     );
     let mut state = AppState::new("views-matrix".into())
-        .with_sink(Box::new(antares_ws::Sink::new(antares_ws::Hub::process())));
+        .with_sink(Box::new(antares_ws::Sink::new(antares_ws::Hub::process())))
+        .with_policy(std::sync::Arc::new(
+            joinedcontext_policy::JoinedcontextPolicy::new(),
+        ));
     antares_api::wire(&mut state).await;
     let surfaces: Vec<Box<dyn antares_api::ApiSurface>> = vec![
         Box::new(antares_api::Admin),
@@ -187,16 +205,13 @@ async fn broker() -> (Router, Router, antares_ops::views::Reload) {
         antares_ops::mount(antares_odata::OData),
         antares_ops::mount(antares_ogc::Ogc),
         antares_ops::mount(antares_mcp::Mcp),
+        antares_ops::mount(antares_ws::ViewWs::process()),
     ];
     let state = state.with_surfaces(surfaces).expect("the surfaces mount");
-    let plain = antares_api::router(state.clone());
-    let state = state.with_policy(std::sync::Arc::new(
-        joinedcontext_policy::JoinedcontextPolicy::new(),
-    ));
     let reload = antares_ops::views::install(&state)
         .await
         .expect("the view table");
-    (antares_api::router(state), plain, reload)
+    (antares_api::router(state), reload)
 }
 
 /// One request; status, headers and the JSON body (the text as a string
@@ -243,8 +258,15 @@ fn tenant_header(s: &Scenario) -> (String, String) {
     ("NGSILD-Tenant".to_owned(), s.tenant.clone())
 }
 
-/// The view, schema, rule document and seed of `s`, in its Tenant.
-async fn install(app: &Router, plain: &Router, s: &Scenario) {
+fn seeder(s: &Scenario) -> Vec<(String, String)> {
+    vec![
+        ("x-jc-client".to_owned(), SEEDER.to_owned()),
+        tenant_header(s),
+    ]
+}
+
+/// The view, schema and rule document of `s`, in its Tenant.
+async fn install(app: &Router, s: &Scenario) {
     let ops: Vec<&str> = antares_ops::OperationId::ALL
         .iter()
         .map(|op| op.id())
@@ -254,7 +276,6 @@ async fn install(app: &Router, plain: &Router, s: &Scenario) {
     view["tenant"] = json!(s.tenant);
     view["operations"] = json!(ops);
     let schema: Value = serde_json::from_str(SCHEMA).expect("the schema");
-    let seed: Value = serde_json::from_str(SEED).expect("the seed");
     for (uri, doc) in [
         (format!("/q/views/{}", s.view()), view),
         (format!("/q/schemas/{}", s.tenant), schema),
@@ -263,14 +284,13 @@ async fn install(app: &Router, plain: &Router, s: &Scenario) {
         let (status, _, body) = send(app, "PUT", &uri, &[], Some(&doc)).await;
         assert!(status.is_success(), "{}: {uri}: {status} {body}", s.name);
     }
-    let (status, _, body) = send(
-        plain,
-        "POST",
-        "/ngsi-ld/v1/entityOperations/upsert",
-        &[tenant_header(s)],
-        Some(&seed),
-    )
-    .await;
+}
+
+/// The seed, written in the Tenant of `s` as the seeder.
+async fn seed(app: &Router, s: &Scenario) {
+    let seed: Value = serde_json::from_str(SEED).expect("the seed");
+    let uri = "/ngsi-ld/v1/entityOperations/upsert";
+    let (status, _, body) = send(app, "POST", uri, &seeder(s), Some(&seed)).await;
     assert!(status.is_success(), "{}: seed: {status} {body}", s.name);
 }
 
@@ -314,10 +334,20 @@ fn add(out: &mut Answer, id: String, names: BTreeSet<String>, twice: &mut Vec<St
 }
 
 /// NGSI-LD Query Entities through the view, following `Link: rel="next"`.
-async fn ngsi_ld(app: &Router, s: &Scenario) -> Read {
+/// With `temporal`, Query Temporal Evolution of Entities (11.3.3) over
+/// every instance since 2000 instead.
+async fn ngsi_ld(app: &Router, s: &Scenario, temporal: bool) -> Read {
     let who = with_tenant(s);
+    let (path, window) = if temporal {
+        (
+            "temporal/entities",
+            "&timerel=after&timeAt=2000-01-01T00:00:00Z&timeproperty=modifiedAt",
+        )
+    } else {
+        ("entities", "")
+    };
     let mut uri = format!(
-        "/x/views/{}/ngsi-ld/v1/entities?type={}&limit={PAGE}&count=true",
+        "/x/views/{}/ngsi-ld/v1/{path}?type={}&limit={PAGE}&count=true{window}",
         s.view(),
         s.types().join(",")
     );
@@ -637,9 +667,45 @@ fn judge(surface: &str, read: Read, want: &Expect, failures: &mut Vec<String>) {
     }
 }
 
-/// Every surface against `want`.
-async fn check(app: &Router, s: &Scenario, want: &Expect, failures: &mut Vec<String>) {
-    judge("NGSI-LD query", ngsi_ld(app, s).await, want, failures);
+/// What a temporal query answers where the snapshot answers `want`: an
+/// Entity shows in it only through an instance of a shown Attribute, so one
+/// shown with its frame alone is absent (ADR-0023 rule 11, temporal);
+/// `temporal` in the scenario or step states it where a move changed the
+/// history.
+fn temporal(want: &Expect, stated: &Value) -> Expect {
+    match (want, stated.is_null()) {
+        (_, false) => expect(stated),
+        (Expect::Admitted(want), true) => Expect::Admitted(
+            want.iter()
+                .filter(|(_, names)| !names.is_empty())
+                .map(|(id, names)| (id.clone(), names.clone()))
+                .collect(),
+        ),
+        (Expect::Denied, true) => Expect::Denied,
+    }
+}
+
+/// Every surface against `want`; `stated` is the scenario's or step's
+/// `temporal`.
+async fn check(
+    app: &Router,
+    s: &Scenario,
+    want: &Expect,
+    stated: &Value,
+    failures: &mut Vec<String>,
+) {
+    judge(
+        "NGSI-LD query",
+        ngsi_ld(app, s, false).await,
+        want,
+        failures,
+    );
+    judge(
+        "NGSI-LD temporal",
+        ngsi_ld(app, s, true).await,
+        &temporal(want, stated),
+        failures,
+    );
     judge("OData", odata(app, s).await, want, failures);
     judge("OGC items", ogc(app, s).await, want, failures);
     judge("MCP query_entities", mcp(app, s).await, want, failures);
@@ -648,19 +714,13 @@ async fn check(app: &Router, s: &Scenario, want: &Expect, failures: &mut Vec<Str
     }
 }
 
-/// A step: `set` writes on the Tenant root (outside the engine), `patch`
-/// writes as the caller through the view and expects `status`.
-async fn step(
-    app: &Router,
-    plain: &Router,
-    s: &Scenario,
-    step: &Value,
-    failures: &mut Vec<String>,
-) {
+/// A step: `set` writes on the Tenant root as the seeder, `patch` writes as
+/// the caller through the view and expects `status`.
+async fn step(app: &Router, s: &Scenario, step: &Value, failures: &mut Vec<String>) {
     let attrs = &step["attrs"];
     if let Some(id) = step["set"].as_str() {
         let uri = format!("/ngsi-ld/v1/entities/{id}/attrs");
-        let (status, _, body) = send(plain, "PATCH", &uri, &[tenant_header(s)], Some(attrs)).await;
+        let (status, _, body) = send(app, "PATCH", &uri, &seeder(s), Some(attrs)).await;
         assert!(status.is_success(), "{}: set {id}: {status} {body}", s.name);
     }
     if let Some(id) = step["patch"].as_str() {
@@ -675,11 +735,68 @@ async fn step(
     }
 }
 
+/// A WebSocket Subscription through the view, made as the caller before
+/// the seed is written: its status, and the socket when it was made.
+async fn subscribe(port: u16, s: &Scenario) -> (u64, Option<Socket>) {
+    let (path, who) = (format!("/x/views/{}/ws", s.view()), with_tenant(s));
+    let types: Vec<Value> = s.types().iter().map(|t| json!({"type": t})).collect();
+    let name = s.name.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut socket = Socket::open(port, &path, &who, Duration::from_millis(800))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let welcome = socket.next().unwrap_or_default();
+        assert_eq!(
+            welcome["metadata"]["x-op"], "x-welcome",
+            "{name}: {welcome}"
+        );
+        socket
+            .send(&json!({"metadata": {"x-op": "x-subscribe", "x-id": "m"},
+                          "body": {"type": "Subscription", "entities": types}}))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let made = socket.next().unwrap_or_default();
+        let status = made["metadata"]["x-status"].as_u64().unwrap_or_default();
+        (status, (status == 201).then_some(socket))
+    })
+    .await
+    .expect("a subscription")
+}
+
+/// Every Entity the socket was notified until it fell silent, the last
+/// notification of each id.
+async fn notified(socket: Socket) -> Read {
+    tokio::task::spawn_blocking(move || {
+        let mut socket = socket;
+        let (mut out, mut never) = (Answer::new(), Vec::new());
+        while let Some(m) = socket.next() {
+            if m["metadata"]["x-op"] == "x-notification" {
+                for e in m["body"]["data"].as_array().into_iter().flatten() {
+                    out.insert(text(e, "id"), ngsi_names(e));
+                }
+            } else {
+                never.push(m);
+            }
+        }
+        if !never.is_empty() {
+            out.insert(format!("other messages: {never:?}"), BTreeSet::new());
+        }
+        let n = u64::try_from(out.len()).ok();
+        Read::Entities(out, n)
+    })
+    .await
+    .expect("the notifications")
+}
+
 /// The whole corpus through every surface; every mismatch is listed with
 /// its scenario.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
-    let (app, plain, _reload) = broker().await;
+    let (app, _reload) = broker().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("an address").port();
+    let served = app.clone();
+    tokio::spawn(async move { axum::serve(listener, served).await });
     let corpus = corpus();
     assert!(
         corpus.len() >= 40,
@@ -688,13 +805,29 @@ async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
     );
     let (mut report, mut listed) = (Vec::new(), Vec::new());
     for s in &corpus {
-        install(&app, &plain, s).await;
+        install(&app, s).await;
+        let want = expect(&s.doc["expect"]);
         let mut failures = Vec::new();
-        check(&app, s, &expect(&s.doc["expect"]), &mut failures).await;
+        // the Subscription is made before the seed, so the seed notifies it
+        let (status, socket) = subscribe(port, s).await;
+        seed(&app, s).await;
+        match (socket, &want) {
+            (Some(socket), _) => {
+                // a notification carries what the view shows now; an Entity
+                // shown with its frame alone has nothing to notify
+                let shown = temporal(&want, &Value::Null);
+                judge("WebSocket", notified(socket).await, &shown, &mut failures);
+            }
+            (None, Expect::Denied) => {}
+            (None, Expect::Admitted(_)) => {
+                failures.push(format!("WebSocket: the Subscription answered {status}"));
+            }
+        }
+        check(&app, s, &want, &s.doc["temporal"], &mut failures).await;
         for (n, st) in s.doc["steps"].as_array().into_iter().flatten().enumerate() {
             let mut after = Vec::new();
-            step(&app, &plain, s, st, &mut after).await;
-            check(&app, s, &expect(&st["expect"]), &mut after).await;
+            step(&app, s, st, &mut after).await;
+            check(&app, s, &expect(&st["expect"]), &st["temporal"], &mut after).await;
             failures.extend(after.into_iter().map(|f| format!("step {n}: {f}")));
         }
         // A mismatch with a fix task filed is listed in the scenario's

@@ -1,5 +1,5 @@
 {
- "about": "q !owner: only the Vehicle without owner.",
+ "about": "q !operator: only the Vehicle without operator.",
  "view": {
   "selector": [
    "Vehicle"
@@ -11,13 +11,13 @@
     ],
     "attributes": [
      "location",
-     "owner",
+     "operator",
      "speed",
      "vehicleType"
     ]
    }
   ],
-  "q": "!owner"
+  "q": "!operator"
  },
  "expect": {
   "urn:ngsi-ld:Vehicle:V7": [

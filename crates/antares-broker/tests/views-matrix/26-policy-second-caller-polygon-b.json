@@ -1,5 +1,5 @@
 {
- "about": "Owner example 2: bob reads city Vehicles within B under /Zilina/transport, projected to location and speed; a granted scope path covers its subtree (platform R13), so V2's /Zilina/transport/buses is in; alice's policy is not his.",
+ "about": "Owner example 2: bob reads city Vehicles within B under /Zilina/transport, projected to location and speed; a granted scope path covers its subtree (platform R13), so V2's /Zilina/transport/buses is in; alice's policy is not his. Temporally nothing shows (ADR-0023 rule 11): the policy's scopeQ is a rule condition, and scope has no history, so every instance is hidden.",
  "view": {
   "selector": [
    "*"
@@ -35,7 +35,12 @@
     "5.7.7",
     "5.7.8",
     "5.7.9",
-    "5.7.10"
+    "5.7.10",
+    "5.8.1",
+    "5.8.2",
+    "5.8.3",
+    "5.8.4",
+    "5.8.5"
    ],
    "information": [
     {
@@ -64,7 +69,12 @@
     "5.7.7",
     "5.7.8",
     "5.7.9",
-    "5.7.10"
+    "5.7.10",
+    "5.8.1",
+    "5.8.2",
+    "5.8.3",
+    "5.8.4",
+    "5.8.5"
    ],
    "information": [
     {
@@ -79,7 +89,7 @@
      ]
     }
    ],
-   "q": "owner==\"city\"",
+   "q": "operator==\"city\"",
    "geoQ": "georel=within;geometry=Polygon;coordinates=[[[5,5],[15,5],[15,15],[5,15],[5,5]]]",
    "scopeQ": "/Zilina/transport"
   }
@@ -89,5 +99,6 @@
    "location",
    "speed"
   ]
- }
+ },
+ "temporal": {}
 }

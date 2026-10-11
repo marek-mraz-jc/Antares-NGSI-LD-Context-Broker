@@ -19,13 +19,13 @@
  "expect": {
   "urn:ngsi-ld:Vehicle:V5": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
   "urn:ngsi-ld:Vehicle:V6": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ]

@@ -1,5 +1,5 @@
 {
- "about": "Rules with their own q per type: city Vehicles show owner and speed; Parking shows name (P2 has none: frame only).",
+ "about": "Rules with their own q per type: city Vehicles show operator and speed; Parking shows name (P2 has none: frame only).",
  "view": {
   "selector": [
    "Vehicle",
@@ -10,9 +10,9 @@
     "types": [
      "Vehicle"
     ],
-    "q": "owner==\"city\"",
+    "q": "operator==\"city\"",
     "attributes": [
-     "owner",
+     "operator",
      "speed"
     ]
    },
@@ -28,23 +28,23 @@
  },
  "expect": {
   "urn:ngsi-ld:Vehicle:V1": [
-   "owner",
+   "operator",
    "speed"
   ],
   "urn:ngsi-ld:Vehicle:V2": [
-   "owner",
+   "operator",
    "speed"
   ],
   "urn:ngsi-ld:Vehicle:V4": [
-   "owner",
+   "operator",
    "speed"
   ],
   "urn:ngsi-ld:Vehicle:V6": [
-   "owner",
+   "operator",
    "speed"
   ],
   "urn:ngsi-ld:Vehicle:V8": [
-   "owner",
+   "operator",
    "speed"
   ],
   "urn:ngsi-ld:Parking:P1": [

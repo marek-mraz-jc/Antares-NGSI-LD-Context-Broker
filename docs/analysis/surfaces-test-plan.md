@@ -102,11 +102,18 @@ CI jobs named below (all in Antares `.github/workflows/`):
   seed, never read from the code under test.
 - Test `every_surface_answers_what_ngsi_ld_admits_in_every_scenario`: each scenario in a Tenant of
   its own, read page by page through the NGSI-LD view (Link `next`), OData (`odata.maxpagesize`,
-  `@odata.nextLink`), OGC items (`next` links) and MCP `query_entities` (cursor). Each must answer
+  `@odata.nextLink`), OGC items (`next` links), MCP `query_entities` (cursor) and the NGSI-LD
+  temporal query (11.3.3 over `modifiedAt`), and notified over a WebSocket Subscription made
+  through the view as the caller before the seed is written (the broker wired with the engine,
+  as `main` wires it, so notifications are decided by it). Each must answer
   exactly the expected ids and Attribute names, its count (`NGSILD-Results-Count`, `@odata.count`,
   `numberMatched`, MCP `total`) the expected size. A retrieve by id (NGSI-LD and MCP `get_entity`)
   of a seed Entity the scenario does not admit answers the bytes of an absent id; a denied caller
   gets a refusal naming no seed Entity.
+- The temporal answer is the snapshot's less the Entities shown with their frame alone, unless the
+  scenario states `temporal`: a policy condition holds per instance (ADR-0023 rule 11), so a
+  `scopeQ` condition (scope has no history) hides every instance and a moved Entity keeps the
+  instances recorded while its rule held.
 - A mismatch with a fix task filed is listed in the scenario's `known` (surface to task id) and
   must still fail, so the fix removes the entry; the test prints the list.
 - Job: `workspace-tests` (all-features).

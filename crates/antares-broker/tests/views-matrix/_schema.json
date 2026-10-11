@@ -12,7 +12,7 @@
   "Vehicle": {
    "slots": [
     "vehicleType",
-    "owner",
+    "operator",
     "speed",
     "location"
    ]
@@ -21,14 +21,14 @@
    "slots": [
     "name",
     "availableSpots",
-    "owner",
+    "operator",
     "location"
    ]
   },
   "Sensor": {
    "slots": [
     "temperature",
-    "owner",
+    "operator",
     "location"
    ]
   }
@@ -37,7 +37,7 @@
   "vehicleType": {
    "range": "string"
   },
-  "owner": {
+  "operator": {
    "range": "string"
   },
   "speed": {

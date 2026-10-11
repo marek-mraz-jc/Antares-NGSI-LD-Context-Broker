@@ -35,7 +35,12 @@
     "5.7.7",
     "5.7.8",
     "5.7.9",
-    "5.7.10"
+    "5.7.10",
+    "5.8.1",
+    "5.8.2",
+    "5.8.3",
+    "5.8.4",
+    "5.8.5"
    ],
    "information": [
     {
@@ -52,19 +57,19 @@
  "expect": {
   "urn:ngsi-ld:Vehicle:V1": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
   "urn:ngsi-ld:Vehicle:V2": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
   "urn:ngsi-ld:Vehicle:V3": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ]
