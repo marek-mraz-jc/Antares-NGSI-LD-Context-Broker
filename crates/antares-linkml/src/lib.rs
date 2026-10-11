@@ -184,9 +184,17 @@ async fn answer(
         Wanted::Class(_) | Wanted::Slot(_) => return Err(Refusal::NotFound),
         Wanted::Index | Wanted::Document { .. } => (Vec::new(), Vec::new()),
     };
-    let visible = view
+    // An engine refusing a named class or slot answers as an absent one
+    // (LK1): a 403 would tell the caller the name is there.
+    let visible = match view
         .visible(caller, wanted.operation(), &types, &attrs)
-        .await?;
+        .await
+    {
+        Err(Refusal::Denied(_)) if matches!(wanted, Wanted::Class(_) | Wanted::Slot(_)) => {
+            return Err(Refusal::NotFound)
+        }
+        other => other?,
+    };
     let rendered = cache.get(id, schema, &visible).ok_or(Refusal::NotFound)?;
     let found = match wanted {
         Wanted::Index => Some((render::JSON, rendered.index.clone())),
