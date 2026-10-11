@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 # crates this repository knows about, so a rename that dodges the path rule
 # is still caught.
 # The surfaces epic adds its ops, surface and protocol crates (surfaces-threat-model 9.5, rule M3).
-FORBIDDEN='examples/|antares-plugin-|antares-policy-|antares-facade-|antares-sensorthings|antares-ogcapi|antares-wfs|antares-odata|antares-ops|antares-views|antares-mcp|antares-linkml|antares-ws|antares-icsr|odata-|linkml-model|rmcp|tungstenite'
+FORBIDDEN='examples/|addons/|joinedcontext-|antares-plugin-|antares-policy-|antares-facade-|antares-sensorthings|antares-ogcapi|antares-wfs|antares-odata|antares-ops|antares-views|antares-mcp|antares-linkml|antares-ws|antares-icsr|odata-|linkml-model|rmcp|tungstenite'
 
 tree() { cargo tree -p antares-broker -e normal --locked "$@"; }
 
@@ -32,10 +32,12 @@ shipped=$(tree)
 
 # Self-test: the pattern must actually FIND an addon when one is there.
 # Without this the gate is a grep that has never matched anything.
-tree --features plugin-example | grep -Eq "$FORBIDDEN" || {
-  echo "self-test failed: the pattern does not match a build that DOES carry the addon"
-  exit 1
-}
+for addon in plugin-example jc-policy; do
+  tree --features "$addon" | grep -Eq "$FORBIDDEN" || {
+    echo "self-test failed: the pattern does not match a build that DOES carry $addon"
+    exit 1
+  }
+done
 
 if found=$(printf '%s\n' "$shipped" | grep -E "$FORBIDDEN"); then
   echo "ADDON IN THE SHIPPED BUILD — the release runs the core alone:"
