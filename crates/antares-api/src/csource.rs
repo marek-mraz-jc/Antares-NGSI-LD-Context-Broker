@@ -323,6 +323,11 @@ fn norm_reg_member(
         // what "ignore" says, alongside the 4.8 system attributes.
         "@context" | "createdAt" | "modifiedAt" | "status" | "timesSent" | "timesFailed"
         | "lastSuccess" | "lastFailure" => return Ok(()),
+        // The `__` prefix is the broker's (`policy::SUBJECT_MEMBER`): this
+        // only sees a create body or a 5.9.3 fragment, so dropping it here
+        // stops a client from seeding the subject a Registration was
+        // created by and from replacing it later (T-3692).
+        k if k.starts_with("__") => return Ok(()),
         "id" => {
             let id = v
                 .as_str()
@@ -1035,6 +1040,14 @@ pub async fn create_registration(
             }
         };
         validate_auxiliary_ops(&norm)?;
+        // The creating subject, kept as a Subscription keeps it: an engine
+        // narrows Query Registrations (5.10.2) by the subject the broker
+        // recorded, never by a member the client wrote (T-3692).
+        if let Some(subject) =
+            crate::policy::subject_member(&crate::policy::subject_of(&tenant, &headers))
+        {
+            norm.insert(crate::policy::SUBJECT_MEMBER.into(), subject);
+        }
         let doc = {
             let _serialized = registration_write_lock(&tenant).await;
             take_live_registration(&st, &tenant, &id).await?;
