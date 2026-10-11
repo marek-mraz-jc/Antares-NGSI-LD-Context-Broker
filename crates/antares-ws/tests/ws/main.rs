@@ -4,6 +4,7 @@
 
 mod common;
 mod ws_bounds;
+mod ws_contract;
 mod ws_delivery;
 mod ws_hub;
 mod ws_queue;

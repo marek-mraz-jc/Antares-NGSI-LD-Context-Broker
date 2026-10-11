@@ -33,6 +33,9 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 [dev-dependencies]
 antares-ops = { workspace = true, features = ["test-kit"] }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+# the tests read docs/api/asyncapi-ws.yaml, the published contract (T-3518)
+regex = { workspace = true }
+serde-saphyr = { version = "=1.3.0", default-features = false, features = ["deserialize"] }
 tokio = { version = "1", default-features = false, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }

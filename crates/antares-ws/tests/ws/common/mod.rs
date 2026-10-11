@@ -3,6 +3,8 @@
 //! a client that speaks the envelope, and the HTTP calls the tests make
 //! beside it.
 
+pub mod asyncapi;
+
 use antares_ops::test_kit::TestBroker;
 use antares_ws::{Hub, Limits, Sink, ViewWs, Ws};
 use futures_util::{SinkExt, StreamExt};
@@ -288,6 +290,13 @@ pub async fn connect(
         .map_err(|r| format!("upgrade refused: {}", r.status()))
 }
 
+/// A server message as JSON, once `asyncapi-ws.yaml` describes it.
+fn described(text: &str) -> Result<Value, String> {
+    let m: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    asyncapi::check_server(&m)?;
+    Ok(m)
+}
+
 /// The string at `pointer`, empty when absent.
 #[must_use]
 pub fn text(v: &Value, pointer: &str) -> String {
@@ -324,9 +333,7 @@ impl Client {
                 .ok_or("the socket closed")?
                 .map_err(|e| e.to_string())?;
             match frame {
-                Message::Text(t) => {
-                    return serde_json::from_str(t.as_str()).map_err(|e| e.to_string())
-                }
+                Message::Text(t) => return described(t.as_str()),
                 Message::Close(c) => return Err(format!("closed: {c:?}")),
                 _ => {}
             }
@@ -341,9 +348,7 @@ impl Client {
                 .await
                 .map_err(|_| "not closed within the wait".to_owned())?;
             match frame {
-                Some(Ok(Message::Text(t))) => {
-                    seen.push(serde_json::from_str(t.as_str()).map_err(|e| e.to_string())?);
-                }
+                Some(Ok(Message::Text(t))) => seen.push(described(t.as_str())?),
                 Some(Ok(Message::Close(Some(c)))) => return Ok((c.code.into(), seen)),
                 Some(Ok(Message::Close(None))) | None => return Ok((1005, seen)),
                 Some(Ok(_)) => {}
@@ -410,6 +415,19 @@ pub fn outbound(subscription: Option<&str>, tenant: Option<&str>) -> antares_ops
             .collect(),
         notifier_info: Vec::new(),
     }
+}
+
+/// The TS 104 243 message a pod renders for `subscription`, as another pod
+/// forwards it: a Notification whose id ends in `n`.
+#[must_use]
+pub fn rendered(subscription: &str, n: i64) -> Value {
+    json!({
+        "metadata": {"Content-Type": "application/ld+json"},
+        "body": {
+            "id": format!("urn:ngsi-ld:Notification:{n}"), "type": "Notification",
+            "subscriptionId": subscription, "notifiedAt": "2026-10-10T00:00:00Z", "data": []
+        }
+    })
 }
 
 /// A Subscription to Cars' `speed`.
