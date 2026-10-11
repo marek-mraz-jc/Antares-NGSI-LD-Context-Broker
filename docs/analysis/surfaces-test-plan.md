@@ -103,7 +103,7 @@ CI jobs named below (all in Antares `.github/workflows/`):
 - Test `every_surface_answers_what_ngsi_ld_admits_in_every_scenario`: each scenario in a Tenant of
   its own, read page by page through the NGSI-LD view (Link `next`), OData (`odata.maxpagesize`,
   `@odata.nextLink`), OGC items (`next` links), MCP `query_entities` (cursor) and the NGSI-LD
-  temporal query (11.3.3 over `modifiedAt`), and notified over a WebSocket Subscription made
+  temporal query (11.3.3 over `modifiedAt`), and notified over a WebSocket and an HTTP Subscription made
   through the view as the caller before the seed is written (the broker wired with the engine,
   as `main` wires it, so notifications are decided by it). Each must answer
   exactly the expected ids and Attribute names, its count (`NGSILD-Results-Count`, `@odata.count`,

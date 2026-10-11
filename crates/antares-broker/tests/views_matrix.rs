@@ -761,6 +761,67 @@ async fn subscribe(port: u16, s: &Scenario) -> (u64, Option<Socket>) {
     .expect("a subscription")
 }
 
+/// The HTTP endpoint every Subscription notifies: each notification with
+/// the path it was sent to.
+async fn receiver() -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let base = format!("http://{}/n/", listener.local_addr().expect("an address"));
+    let hooks = Router::new().route(
+        "/n/{tenant}",
+        axum::routing::post(
+            move |axum::extract::Path(tenant): axum::extract::Path<String>,
+                  body: axum::body::Bytes| {
+                let tx = tx.clone();
+                async move {
+                    let v = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let _ = tx.send((tenant, v));
+                    StatusCode::NO_CONTENT
+                }
+            },
+        ),
+    );
+    tokio::spawn(async move { axum::serve(listener, hooks).await });
+    (base, rx)
+}
+
+/// An HTTP Subscription through the view's NGSI-LD root, made as the caller
+/// before the seed is written, notifying `{base}{tenant}`: its status.
+async fn subscribe_http(app: &Router, s: &Scenario, base: &str) -> StatusCode {
+    let types: Vec<Value> = s.types().iter().map(|t| json!({"type": t})).collect();
+    let sub = json!({"type": "Subscription", "entities": types,
+                     "notification": {"endpoint": {"uri": format!("{base}{}", s.tenant),
+                                                   "accept": "application/json"}}});
+    let uri = format!("/x/views/{}/ngsi-ld/v1/subscriptions", s.view());
+    send(app, "POST", &uri, &with_tenant(s), Some(&sub)).await.0
+}
+
+/// Every Entity notified to the Tenant of `s` until the endpoint fell
+/// silent, the last notification of each id.
+async fn notified_http(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
+    s: &Scenario,
+) -> Read {
+    let mut out = Answer::new();
+    while let Ok(Some((tenant, n))) =
+        tokio::time::timeout(Duration::from_millis(800), rx.recv()).await
+    {
+        // an earlier scenario's steps may still notify its own Tenant
+        if tenant == s.tenant {
+            for e in n["data"].as_array().into_iter().flatten() {
+                out.insert(text(e, "id"), ngsi_names(e));
+            }
+        }
+    }
+    let n = u64::try_from(out.len()).ok();
+    Read::Entities(out, n)
+}
+
 /// Every Entity the socket was notified until it fell silent, the last
 /// notification of each id.
 async fn notified(socket: Socket) -> Read {
@@ -797,6 +858,8 @@ async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
     let port = listener.local_addr().expect("an address").port();
     let served = app.clone();
     tokio::spawn(async move { axum::serve(listener, served).await });
+    antares_jsonld::allow_private_egress(true);
+    let (hooks, mut hooked) = receiver().await;
     let corpus = corpus();
     assert!(
         corpus.len() >= 40,
@@ -810,12 +873,29 @@ async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
         let mut failures = Vec::new();
         // the Subscription is made before the seed, so the seed notifies it
         let (status, socket) = subscribe(port, s).await;
+        let made = subscribe_http(&app, s, &hooks).await;
         seed(&app, s).await;
+        // a notification carries what the view shows now; an Entity shown
+        // with its frame alone has nothing to notify
+        let shown = temporal(&want, &Value::Null);
+        match (made, &want) {
+            (StatusCode::CREATED, _) => {
+                judge(
+                    "HTTP notification",
+                    notified_http(&mut hooked, s).await,
+                    &shown,
+                    &mut failures,
+                );
+            }
+            (_, Expect::Denied) => {}
+            (_, Expect::Admitted(_)) => {
+                failures.push(format!(
+                    "HTTP notification: the Subscription answered {made}"
+                ));
+            }
+        }
         match (socket, &want) {
             (Some(socket), _) => {
-                // a notification carries what the view shows now; an Entity
-                // shown with its frame alone has nothing to notify
-                let shown = temporal(&want, &Value::Null);
                 judge("WebSocket", notified(socket).await, &shown, &mut failures);
             }
             (None, Expect::Denied) => {}

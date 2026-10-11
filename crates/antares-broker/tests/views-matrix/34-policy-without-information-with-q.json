@@ -91,6 +91,7 @@
  "byId": "denied",
  "known": {
   "MCP query_entities": "T-3784",
-  "WebSocket": "T-3784"
+  "WebSocket": "T-3784",
+  "HTTP notification": "T-3784"
  }
 }
