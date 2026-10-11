@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! A view of another model through the view root (gap G18,
-//! `docs/analysis/view-mapping.md` sections 4 and 5): the request inverted
-//! into the source model, run through the view as any other, and the answer
-//! rebuilt in the target model.
+//! A view of another model (gap G18, `docs/analysis/view-mapping.md`
+//! sections 4 and 5), whichever surface asks ([`ViewOps::run`]): the request
+//! inverted into the source model, run through the view as any other, and
+//! the answer rebuilt in the target model.
 
-use antares_ops::mapping::{self, Mapping};
-use antares_ops::{Caller, OperationId, OpsRequest, Refusal, ViewOps};
+use crate::mapping::{self, Mapping};
+use crate::{Caller, OperationId, OpsRequest, Refusal, ViewOps};
 use axum::body::Body;
-use axum::http::request::Parts;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 
 /// Why a request that names its own `@context` is refused.
@@ -17,32 +16,48 @@ pub const OWN_CONTEXT: &str =
 /// Why a `GeoJSON` answer is refused.
 pub const NO_GEOJSON: &str = "a mapped view answers JSON and JSON-LD, not GeoJSON";
 
-/// Serve `op` through `view`, whose mapping is `mapping`. `path` is the
-/// request path below the view's API root.
+/// The method and headers of the request a mapped view serves.
+struct Head {
+    method: Method,
+    headers: HeaderMap,
+}
+
+/// Serve `req` as `op` through `view`, whose mapping is `mapping`.
 pub(crate) async fn serve(
     view: &ViewOps,
     mapping: &Mapping,
     op: OperationId,
     caller: &Caller,
-    parts: Parts,
-    body: Body,
-    path: &str,
+    req: OpsRequest,
 ) -> Result<Response, Refusal> {
-    if parts.headers.contains_key(header::LINK) {
+    let OpsRequest {
+        method,
+        path_and_query,
+        headers,
+        body,
+        ..
+    } = req;
+    if headers.contains_key(header::LINK) {
         return Err(Refusal::Malformed(OWN_CONTEXT));
     }
-    if parts
-        .headers
+    if headers
         .get_all(header::ACCEPT)
         .iter()
         .any(|v| v.to_str().is_ok_and(|v| v.contains("geo+json")))
     {
         return Err(Refusal::Malformed(NO_GEOJSON));
     }
-    // `serve` refused a query that is no form encoding before it got here
-    let pairs = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(&parts.uri)
+    let path = path_and_query
+        .split_once('?')
+        .map_or(path_and_query.as_str(), |(path, _)| path);
+    // a query that is no form encoding is refused before a view runs it
+    let pairs = path_and_query
+        .parse::<axum::http::Uri>()
+        .ok()
+        .and_then(|uri| axum::extract::Query::<Vec<(String, String)>>::try_from_uri(&uri).ok())
         .map(|q| q.0)
-        .unwrap_or_default();
+        .ok_or(Refusal::Malformed("the query is not form encoded"))?;
+    let parts = Head { method, headers };
     if mapping::DISCOVERY.contains(&op) {
         // every discovery read is a GET: no body
         return discover(view, mapping, op, caller, parts, path, &pairs).await;
@@ -50,7 +65,7 @@ pub(crate) async fn serve(
     let inverted = mapping.invert(&pairs).map_err(Refusal::Malformed)?;
     if inverted.selects_nothing {
         return if matches!(op, OperationId::QueryEntities | OperationId::TemporalQuery) {
-            Ok(empty_page(&parts, &pairs))
+            Ok(empty_page(&parts.headers, &pairs))
         } else {
             Err(Refusal::NotFound)
         };
@@ -101,7 +116,7 @@ async fn discover(
     mapping: &Mapping,
     op: OperationId,
     caller: &Caller,
-    parts: Parts,
+    parts: Head,
     path: &str,
     pairs: &[(String, String)],
 ) -> Result<Response, Refusal> {
@@ -147,7 +162,7 @@ async fn answer(
     inner: OpsRequest,
     rebuild: impl FnOnce(&mut serde_json::Value),
 ) -> Result<Response, Refusal> {
-    let answer = view.run(op, caller, inner).await?;
+    let answer = view.run_unmapped(op, caller, inner).await?;
     let (mut parts, body) = answer.into_parts();
     let bytes = view.read_answer(body).await?;
     parts.headers.remove(header::CONTENT_LENGTH);
@@ -166,9 +181,8 @@ async fn answer(
 
 /// Query Entities whose `type` names nothing the view serves: an empty
 /// page, answered without asking the store (section 4.1).
-fn empty_page(parts: &Parts, pairs: &[(String, String)]) -> Response {
-    let ld = parts
-        .headers
+fn empty_page(headers: &HeaderMap, pairs: &[(String, String)]) -> Response {
+    let ld = headers
         .get_all(header::ACCEPT)
         .iter()
         .any(|v| v.to_str().is_ok_and(|v| v.contains("application/ld+json")));

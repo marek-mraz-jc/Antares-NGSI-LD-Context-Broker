@@ -36,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod mapped;
 pub mod mapping;
 mod operation;
 pub mod views;
@@ -661,6 +662,22 @@ impl ViewOps {
     /// [`Refusal::Malformed`] when the caller names another Tenant, and
     /// everything [`Ops::run`] refuses.
     pub async fn run(
+        &self,
+        op: OperationId,
+        caller: &Caller,
+        req: OpsRequest,
+    ) -> Result<Response, Refusal> {
+        match &self.mapping {
+            // a view of another model inverts the request and rebuilds the
+            // answer, for every surface alike (G18)
+            Some(mapping) if self.allows(op) => mapped::serve(self, mapping, op, caller, req).await,
+            Some(_) => Err(Refusal::NotAllowed { allow: Vec::new() }),
+            None => self.run_unmapped(op, caller, req).await,
+        }
+    }
+
+    /// [`Self::run`] of a request already in the view's stored model.
+    pub(crate) async fn run_unmapped(
         &self,
         op: OperationId,
         caller: &Caller,
