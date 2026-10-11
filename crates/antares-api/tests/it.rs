@@ -63,6 +63,7 @@ mod panic_isolation;
 mod pg_query_parity;
 mod plugin_sink_5_2_15;
 mod policy_allow_if_g12;
+mod policy_allow_if_temporal;
 mod policy_filter_5_7;
 mod policy_filter_by_id;
 mod policy_filter_by_type;

@@ -254,11 +254,12 @@ pub enum Decision {
 /// deletes Entities that are already stored, by id, and judges each of them
 /// inside its store operation. A create has no stored Entity to judge; Batch
 /// Upsert updates the members its condition selects and creates none of the
-/// conditioned ones (T-3668). A temporal write changes the evolution, not
-/// the Entity a filter reads.
-pub const WRITE_BY_ID: [&str; 12] = [
+/// conditioned ones (T-3668). The temporal writes 5.6.12 to 5.6.15 judge the
+/// evolution's latest instances (`Condition::pre_evolution`); 5.6.16 is
+/// not one: the temporal seam has no delete that reads the document first.
+pub const WRITE_BY_ID: [&str; 16] = [
     "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.17", "5.6.18", "5.6.19", "5.6.8", "5.6.9",
-    "5.6.10", "5.6.20",
+    "5.6.10", "5.6.20", "5.6.12", "5.6.13", "5.6.14", "5.6.15",
 ];
 
 /// Why a write conditioned on its stored Entity is refused rather than
@@ -1658,6 +1659,23 @@ impl Condition {
         }
     }
 
+    /// [`Condition::pre`] on a Temporal Evolution, inside the temporal
+    /// store's closure: judged on [`latest_image`], and one it does not
+    /// select is the absent evolution the temporal writes answer.
+    pub(crate) fn pre_evolution(
+        cond: Option<&Self>,
+        id: &str,
+        doc: &Value,
+    ) -> Result<(), antares_model::NgsiError> {
+        if cond.is_none_or(|c| c.holds(&latest_image(doc))) {
+            Ok(())
+        } else {
+            Err(antares_model::NgsiError::ResourceNotFound(format!(
+                "temporal entity {id} not found"
+            )))
+        }
+    }
+
     /// A conditioned write that would reach a Context Source is refused:
     /// nothing in this store can judge the Source's copy.
     pub(crate) fn unforwarded(cond: Option<&Self>, forwards: bool) -> Result<(), Denied> {
@@ -1667,6 +1685,57 @@ impl Condition {
             Ok(())
         }
     }
+}
+
+/// A Temporal Evolution as the Entity it now is: each Attribute keeps its
+/// latest instance per `datasetId` (the greatest `observedAt`, else
+/// `createdAt`; the later one on a tie) and a temporal `scope` the value of
+/// its latest instance. A condition judged on every instance would let a
+/// value the Entity held once select it for good.
+// ponytail: instances without a time compare as the earliest; the temporal
+// writes stamp `createdAt` on every instance they store.
+pub(crate) fn latest_image(doc: &Value) -> Value {
+    let time = |i: &Value| {
+        ["observedAt", "createdAt"]
+            .iter()
+            .find_map(|k| i.get(*k).and_then(Value::as_str))
+            .map(antares_model::dt_key)
+            .unwrap_or_default()
+    };
+    let mut out = serde_json::Map::new();
+    for (k, v) in doc.as_object().into_iter().flatten() {
+        let instances = match v.as_array() {
+            Some(a) if !antares_model::is_meta(k) || k == "scope" => a,
+            _ => {
+                out.insert(k.clone(), v.clone());
+                continue;
+            }
+        };
+        if !instances.iter().all(Value::is_object) {
+            out.insert(k.clone(), v.clone());
+            continue;
+        }
+        let mut latest: Vec<&Value> = Vec::new();
+        for i in instances {
+            let ds = i.get("datasetId");
+            match latest.iter_mut().find(|l| l.get("datasetId") == ds) {
+                Some(l) if time(i) >= time(l) => *l = i,
+                Some(_) => {}
+                None => latest.push(i),
+            }
+        }
+        let kept = if k == "scope" {
+            latest
+                .first()
+                .and_then(|i| i.get("value"))
+                .cloned()
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Array(latest.into_iter().cloned().collect())
+        };
+        out.insert(k.clone(), kept);
+    }
+    Value::Object(out)
 }
 
 /// The members of a JSON object, or nothing when it is not one.
@@ -2731,6 +2800,48 @@ mod tests {
         assert!(!w.admits("2026-01-01T00:00:00.003Z", now), "after the end");
     }
 
+    /// T-3668: an evolution is judged as the Entity it now is, per
+    /// Attribute and `datasetId`, whatever order its instances are stored in.
+    #[test]
+    fn the_latest_image_keeps_the_latest_instance_per_dataset() {
+        let i = |v: &str, at: &str, ds: Option<&str>| {
+            let mut i = serde_json::json!({"type": "Property", "value": v, "observedAt": at});
+            if let Some(ds) = ds {
+                i["datasetId"] = ds.into();
+            }
+            i
+        };
+        let doc = serde_json::json!({
+            "id": "urn:ngsi-ld:V:1",
+            "type": ["V"],
+            "zone": [
+                i("A", "2026-01-01T00:00:02Z", None),
+                i("B", "2026-01-01T00:00:01Z", None),
+                i("C", "2026-01-01T00:00:01Z", Some("urn:ds:1")),
+                i("D", "2026-01-01T00:00:03Z", Some("urn:ds:1")),
+                i("E", "2026-01-01T00:00:02Z", None),
+            ],
+            "scope": [
+                {"type": "Property", "value": ["/old"], "observedAt": "2026-01-01T00:00:01Z"},
+                {"type": "Property", "value": ["/new"], "observedAt": "2026-01-01T00:00:02Z"},
+            ],
+            "modifiedAt": "2026-01-01T00:00:03Z",
+        });
+        let img = latest_image(&doc);
+        let zone: Vec<&str> = img["zone"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i["value"].as_str())
+            .collect();
+        assert_eq!(zone, ["E", "D"], "a tie goes to the later one");
+        assert_eq!(img["scope"], serde_json::json!(["/new"]));
+        assert_eq!(img["type"], doc["type"]);
+        assert_eq!(img["modifiedAt"], doc["modifiedAt"]);
+        let plain = serde_json::json!({"id": "urn:ngsi-ld:V:1", "scope": "/a"});
+        assert_eq!(latest_image(&plain), plain);
+    }
+
     /// G8: the engine's warning travels as one `NGSILD-Warning` value per
     /// text, and a text that could not be one header line is refused.
     #[test]
@@ -2752,7 +2863,7 @@ mod tests {
                 "{clause}: an empty condition selects everything"
             );
         }
-        for clause in ["5.6.1", "5.6.7", "5.6.12", "5.6.21", "5.7.1", "5.8.1"] {
+        for clause in ["5.6.1", "5.6.7", "5.6.16", "5.6.21", "5.7.1", "5.8.1"] {
             assert!(
                 matches!(resolve(clause, conditioned.clone()), Decision::Deny(_)),
                 "{clause}"
