@@ -381,8 +381,6 @@ async fn entity_dereferences_an_id_of_this_service() {
         assert_eq!(a.status, StatusCode::OK, "{id}: {}", a.body);
         assert!(a.body["Name"].is_string(), "{id}: {}", a.body);
     }
-    let a = odata(&app, Method::GET, &format!("$entity?$id={OTHER}"), None).await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST, "a bare key: {}", a.body);
     let a = odata(
         &app,
         Method::GET,
@@ -391,19 +389,51 @@ async fn entity_dereferences_an_id_of_this_service() {
     )
     .await;
     assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
-    for id in [
-        format!("http://elsewhere.example/{relative}"),
-        format!("/{relative}"),
-        "Product".to_owned(),
-        format!("{relative}/Name"),
-        format!("{relative}%3F%24select%3DName"),
-        "Product%2".to_owned(),
-        "Product%zz".to_owned(),
-        "%FF".to_owned(),
-        "Nothing('x')".to_owned(),
+}
+
+/// Q23 (T-3738): a well-formed id that names no Entity of this service is
+/// `404`, as a hidden Entity is (O5); `400` is kept for a missing id, a
+/// broken escape and an id with query options of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn entity_with_an_id_of_no_entity_here_is_not_found() {
+    let (_b, app) = shop().await.expect("broker");
+    let hidden = json!({"id": "urn:ngsi-ld:Thing:t1", "type": format!("{SHOP}Thing"),
+                        format!("{SHOP}Name"): property(&json!("Hidden"))});
+    let a = send(
+        &app,
+        Method::POST,
+        "/ngsi-ld/v1/entities",
+        Some(&hidden.to_string()),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let relative = format!("Product({GUID})");
+    for query in [
+        "$id=http://host/path".to_owned(),
+        "$id=urn:some:id".to_owned(),
+        "id=urn:some:id".to_owned(),
+        format!("$id=http://elsewhere.example/{relative}"),
+        format!("$id=/{relative}"),
+        format!("$id={OTHER}"),
+        "$id=Product".to_owned(),
+        format!("$id={relative}/Name"),
+        "$id=Nothing('x')".to_owned(),
+        "$id=Product(id='urn:ngsi-ld:Thing:t1')".to_owned(),
     ] {
-        let a = odata(&app, Method::GET, &format!("$entity?$id={id}"), None).await;
-        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{id}: {}", a.body);
+        let a = odata(&app, Method::GET, &format!("$entity?{query}"), None).await;
+        assert_eq!(a.status, StatusCode::NOT_FOUND, "{query}: {}", a.body);
+    }
+    let a = odata(&app, Method::GET, &format!("$entity?id={relative}"), None).await;
+    assert_eq!(a.status, StatusCode::OK, "id without $: {}", a.body);
+    for query in [
+        String::new(),
+        format!("$id={relative}%3F%24select%3DName"),
+        "$id=Product%2".to_owned(),
+        "$id=Product%zz".to_owned(),
+        "$id=%FF".to_owned(),
+    ] {
+        let a = odata(&app, Method::GET, &format!("$entity?{query}"), None).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{query}: {}", a.body);
     }
 }
 

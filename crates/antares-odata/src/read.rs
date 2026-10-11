@@ -106,41 +106,48 @@ pub(crate) async fn serve(
 
 /// `$entity?$id=` (Q23): the id, percent-decoded, is a URL of this service,
 /// absolute under its root or relative to it, that names one Entity by key
-/// and nothing else; it is read as that URL is. Any other id is `400`.
+/// and nothing else; it is read as that URL is. A missing `$id`, a broken
+/// escape or an id with query options of its own is `400`; any other id
+/// names no Entity here and is `404`, like a hidden one (O5). A foreign URL
+/// is never fetched.
 async fn dereference(
     reads: &Reads,
     caller: &Caller,
     ctx: &Ctx<'_>,
     options: &QueryOptions,
 ) -> Result<Response, ODataErrorResponse> {
-    let bad = || {
-        ODataErrorResponse::new(
-            StatusCode::BAD_REQUEST,
-            "BadRequest",
-            "$id names no entity of this service",
-        )
-        .with_version(ctx.version)
-    };
     let id = options
         .id
         .as_deref()
         .and_then(percent_decoded)
-        .ok_or_else(bad)?;
+        .ok_or_else(|| {
+            ODataErrorResponse::new(
+                StatusCode::BAD_REQUEST,
+                "BadRequest",
+                "$id is missing or not percent-encoded",
+            )
+            .with_version(ctx.version)
+        })?;
     let relative = id.strip_prefix(ctx.service_root).unwrap_or(&id);
-    if relative.starts_with('/') || relative.contains("://") {
-        return Err(bad());
-    }
     let model = EdmModel(&reads.state.model);
-    let Ok(ODataUri::Resource { path, options }) =
-        odata_url::parse(relative, &model, &reads.state.url_limits)
-    else {
-        return Err(bad());
-    };
-    match path.as_slice() {
-        [Segment::EntitySet(set), Segment::Key(key)] if options == QueryOptions::default() => {
-            entity(reads, caller, ctx, set, key, &options).await
+    let parsed = (!relative.starts_with('/') && !relative.contains("://"))
+        .then(|| odata_url::parse(relative, &model, &reads.state.url_limits));
+    match parsed {
+        Some(Ok(ODataUri::Resource { options, .. })) if options != QueryOptions::default() => {
+            Err(ODataErrorResponse::new(
+                StatusCode::BAD_REQUEST,
+                "BadRequest",
+                "$id has query options of its own",
+            )
+            .with_version(ctx.version))
         }
-        _ => Err(bad()),
+        Some(Ok(ODataUri::Resource { path, options })) => match path.as_slice() {
+            [Segment::EntitySet(set), Segment::Key(key)] => {
+                entity(reads, caller, ctx, set, key, &options).await
+            }
+            _ => Err(not_found(ctx.version)),
+        },
+        _ => Err(not_found(ctx.version)),
     }
 }
 
