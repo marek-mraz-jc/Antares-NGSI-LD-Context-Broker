@@ -220,8 +220,9 @@ pair, one schema (`crates/antares-sql/migrations/`: `0001_init.sql`,
    through `antares_jsonld::client_builder` and `egress.rs`.
 4. No dynamic SQL outside the compiler (CI gate); `unsafe` forbidden;
    `unwrap`/`expect` denied outside tests.
-5. Every env variable is in `KNOWN_KEYS` (`broker/src/main.rs`) and in
-   `docs/src/configuration.md` (`dev/check-env-docs.sh`). Every version is
+5. Every env variable is in `KNOWN_KEYS` (`broker/src/main.rs`), or, for
+   a surface, in its crate's `ENV_KEYS`, which `SURFACE_KEYS` names, and
+   in `docs/src/configuration.md` (`dev/check-env-docs.sh`). Every version is
    in `[workspace.dependencies]`; the `wasm32` target sections, which
    cannot say `workspace = true` because cargo features are additive, are
    held equal to it by `dev/check-wasm-pins.py`.

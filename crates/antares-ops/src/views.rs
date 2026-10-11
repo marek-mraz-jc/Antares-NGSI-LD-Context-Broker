@@ -48,6 +48,10 @@ pub const RELOAD_ENV: &str = "ANTARES_VIEWS_RELOAD_MS";
 /// bytes. No default: unset, the broker takes no schema (T-3628).
 pub const SCHEMA_MAX_ENV: &str = "ANTARES_SCHEMA_MAX_BYTES";
 
+/// Every variable the view table reads. The broker accepts these as config
+/// keys from here, so a new one is added in this crate alone (T-3766).
+pub const ENV_KEYS: &[&str] = &[RELOAD_ENV, SCHEMA_MAX_ENV];
+
 /// The largest view document `/q/views` accepts, in bytes.
 pub const MAX_VIEW_BYTES: usize = 64 * 1024;
 

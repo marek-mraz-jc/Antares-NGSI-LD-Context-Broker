@@ -20,6 +20,18 @@ pub const MAX_SUBSCRIPTIONS_ENV: &str = "ANTARES_WS_MAX_SUBSCRIPTIONS";
 /// The variable of the bound of the same name (the broker knows it as a config key).
 pub const ALLOWED_ORIGINS_ENV: &str = "ANTARES_WS_ALLOWED_ORIGINS";
 
+/// Every variable this crate reads. The broker accepts these as config keys
+/// from here, so a new one is added in this crate alone (T-3766).
+pub const ENV_KEYS: &[&str] = &[
+    QUEUE_ENV,
+    RESUME_GRACE_ENV,
+    MAX_LIFETIME_ENV,
+    MAX_CONNECTIONS_ENV,
+    MAX_CONNECTIONS_PER_TENANT_ENV,
+    MAX_SUBSCRIPTIONS_ENV,
+    ALLOWED_ORIGINS_ENV,
+];
+
 /// Every bound a connection is held to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
