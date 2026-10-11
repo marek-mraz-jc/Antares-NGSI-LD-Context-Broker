@@ -104,6 +104,7 @@ dependencies = [
  "antares-api",
  "antares-bus",
  "antares-jsonld",
+ "antares-linkml",
  "antares-mcp",
  "antares-model",
  "antares-odata",
@@ -167,6 +168,21 @@ dependencies = [
  "tokio",
  "uuid",
  "web-time",
+]
+
+[[package]]
+name = "antares-linkml"
+version = "0.1.3"
+dependencies = [
+ "antares-ops",
+ "axum",
+ "http-body-util",
+ "linkml-model",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
