@@ -79,6 +79,15 @@ jobs:
           docker rm "$id"
           ./dev/check-vanilla-symbols.sh --audit-info ./antares-image-bin
 
+      # The shipped binary against the advisory database, from the package
+      # list cargo-auditable embeds: what a vulnerable crate in the image
+      # looks like even when Cargo.lock has moved on. Same ignore list as
+      # workspace.yml's cargo-audit, read from deny.toml.
+      - name: cargo audit bin
+        run: |
+          cargo install --locked cargo-audit@0.22.2
+          cargo audit --deny warnings $(python3 dev/advisory-ignores.py) bin ./antares-image-bin
+
       - name: Export it for the downstream jobs
         run: docker save "antares-local:$TAG" | gzip > "$ART.tgz"
 
