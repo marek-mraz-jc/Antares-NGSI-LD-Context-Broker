@@ -297,6 +297,7 @@ dependencies = [
  "antares-model",
  "antares-ops",
  "antares-ql",
+ "antares-residual",
  "axum",
  "http-body-util",
  "proptest",

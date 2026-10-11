@@ -6,7 +6,15 @@
 //! `contains`/`startswith`/`endswith` and their `not` (F9, F15), `id`
 //! as a top-level conjunct (F28), `observedAt` (F21), membership in a
 //! ListProperty (F22), `geo.intersects` as a top-level conjunct (F29), and
-//! `eq` on a LanguageProperty (F31) or a VocabProperty (F32). Everything
+//! `eq` on a LanguageProperty (F31) or a VocabProperty (F32).
+//!
+//! The filter is split at its top-level `and`s (ADR-0028 rule 1, T-3758): a
+//! conjunct `q`, `id` or the one `geoQ` can say is pushed; any other the
+//! residual evaluator covers goes, whole, to [`Translated::residual`]: `not`
+//! over the rows above (F11), a second `geo.intersects` or `id` conjunct, a
+//! date-time literal with an offset. OData compares a missing value as false
+//! (URL 5.1.1.1.2, 5.1.1.1.3), so a residual comparison is made definite
+//! ([`definite`]) and `not` of it holds where the member is absent. Everything
 //! else is `Later` (501) or `Bad` (400) before any operation runs.
 //!
 //! A `q` names Attributes by term, and a term is a letter followed by
@@ -16,6 +24,9 @@
 //! `@context` that defines them (`OpsRequest::context`).
 
 use crate::edm::{Member, Set, Shape};
+use antares_ops::residual::{
+    self, Cmp, Date, DateTime, Expr as RExpr, Func, Lit, Member as RMember, Path, Spatial, Time,
+};
 use odata_url::{CompareOp, Expr, Geography, Literal, MemberPath, Method, OrderBy};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -62,6 +73,52 @@ pub(crate) struct Translated {
     /// F32: the VocabProperty terms whose compared values the broker
     /// expands (`expandValues`, 7.2.3.2 EXAMPLE 13).
     pub(crate) expand_values: Vec<String>,
+    /// The conjuncts the store cannot say, each true for an Entity in the
+    /// answer (ADR-0028 rule 1); empty when the filter pushes whole.
+    pub(crate) residual: Vec<RExpr>,
+    /// The pushed `geo` conjunct as a residual one, for a request whose
+    /// `ngsild.georel` takes the one `geoQ` (ADR-0028 rule 6).
+    pub(crate) geo_residual: Option<RExpr>,
+    /// The `$orderby` when a key is one `orderBy` cannot name (Q9): the
+    /// surface sorts the whole answer by these keys, `order` is then `None`.
+    pub(crate) sort: Option<Vec<SortKey>>,
+    /// The Attribute terms the surface sort reads, for the pushdown's `attrs`.
+    pub(crate) sort_reads: Vec<String>,
+    /// Whether the surface sort reads `createdAt` or `modifiedAt`.
+    pub(crate) sort_system: bool,
+    /// The `ngsild.*` parameters pushed beside the rest (`&scopeQ=…`,
+    /// `&georel=…`), encoded (ADR-0028 rule 6).
+    pub(crate) ngsild: String,
+}
+
+/// One key of a surface sort (Q9, ADR-0028 rule 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SortKey {
+    /// What the key reads.
+    pub(crate) by: SortBy,
+    /// `desc`.
+    pub(crate) descending: bool,
+}
+
+/// The value a [`SortKey`] reads from an Entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SortBy {
+    /// The Entity id.
+    Id,
+    /// The value of the Attribute of this term, at its default instance.
+    Value(String),
+    /// `createdAt` or `modifiedAt` of the Entity.
+    System(String),
+}
+
+impl SortBy {
+    /// The `orderBy` key of a pushed sort.
+    fn key(&self) -> &str {
+        match self {
+            Self::Id => "id",
+            Self::Value(name) | Self::System(name) => name,
+        }
+    }
 }
 
 /// Translates `filter` against the members of `set` and, through a
@@ -84,19 +141,37 @@ pub(crate) fn translate(
     };
     let mut conjuncts = Vec::new();
     for conjunct in conjuncts_of(filter) {
-        if let Some(geo) = terms.geo(conjunct)? {
+        if let Some((term, polygon)) = terms.geo(conjunct)? {
+            // one geoQ per query (4.10): a second area is the residual's
+            let geo = intersects(&term, &polygon);
             if out.geo.is_some() {
-                // ponytail: one geoQ per query (4.10); two areas would intersect
-                return Err(Refused::Later);
+                out.residual.push(geo);
+            } else {
+                out.geo = Some((term, polygon.to_string()));
+                out.geo_residual = Some(geo);
             }
-            out.geo = Some(geo);
             continue;
         }
         match ids_of(conjunct, aliases)? {
             Some(ids) if out.ids.is_none() => out.ids = Some(ids),
-            // ponytail: one id conjunct; two would intersect, no client sends it
-            Some(_) => return Err(Refused::Later),
-            None => conjuncts.push(format!("({})", terms.term(conjunct)?)),
+            // one id parameter per query: a second list is the residual's
+            Some(ids) => out.residual.push(RExpr::In(
+                Box::new(RExpr::Path(Path::Id)),
+                ids.into_iter().map(Lit::Str).collect(),
+            )),
+            None => {
+                let mark = (terms.linked, terms.expand_values.len());
+                match terms.term(conjunct) {
+                    Ok(q) => conjuncts.push(format!("({q})")),
+                    Err(Refused::Later) => {
+                        // what the failed translation marked is not pushed
+                        terms.linked = mark.0;
+                        terms.expand_values.truncate(mark.1);
+                        out.residual.push(terms.residual(conjunct)?);
+                    }
+                    Err(refused) => return Err(refused),
+                }
+            }
         }
     }
     out.linked = terms.linked;
@@ -137,21 +212,47 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
             },
             _ => None,
         };
-        let key = match single {
+        let by = match single {
             None => return Err(Refused::Later),
-            Some("id") => "id".to_owned(),
+            Some("id") => SortBy::Id,
+            // Q9: no Entity member `orderBy` names (7.2.3.1); the surface sorts
+            Some(name @ ("createdAt" | "modifiedAt")) if !set.members.contains_key(name) => {
+                SortBy::System(name.to_owned())
+            }
             Some(name) if set.members.get(name).is_some_and(|m| !m.shape.sortable()) => {
                 return Err(Refused::Bad)
             }
-            _ => terms.scalar(&item.expr)?,
+            _ => SortBy::Value(terms.scalar(&item.expr)?),
         };
-        keys.push(if item.descending {
-            format!("{key};desc")
-        } else {
-            key
+        keys.push(SortKey {
+            by,
+            descending: item.descending,
         });
     }
-    out.order = Some(keys.join(","));
+    if keys.iter().any(|k| matches!(k.by, SortBy::System(_))) {
+        out.sort_system = true;
+        out.sort_reads = keys
+            .iter()
+            .filter_map(|k| match &k.by {
+                SortBy::Value(term) => Some(term.clone()),
+                SortBy::Id | SortBy::System(_) => None,
+            })
+            .collect();
+        out.sort = Some(keys);
+        return Ok(());
+    }
+    let pushed: Vec<String> = keys
+        .iter()
+        .map(|k| {
+            let key = k.by.key().to_owned();
+            if k.descending {
+                format!("{key};desc")
+            } else {
+                key
+            }
+        })
+        .collect();
+    out.order = Some(pushed.join(","));
     Ok(())
 }
 
@@ -297,7 +398,7 @@ impl<'a> Terms<'a> {
     /// F29: `geo.intersects(p, geography'SRID=4326;Polygon(...)')` as a
     /// top-level conjunct, `None` for any other conjunct. NGSI-LD
     /// coordinates are WGS 84 (5.2.2.4), so another SRID is not mapped.
-    fn geo(&mut self, e: &Expr) -> Result<Option<(String, String)>, Refused> {
+    fn geo(&mut self, e: &Expr) -> Result<Option<(String, Value)>, Refused> {
         let Expr::Call(Method::GeoIntersects, args) = e else {
             return Ok(None);
         };
@@ -344,7 +445,7 @@ impl<'a> Terms<'a> {
             polygon.push(Value::from(points));
         }
         let term = self.term_of(&m.iri);
-        Ok(Some((term, Value::from(polygon).to_string())))
+        Ok(Some((term, Value::from(polygon))))
     }
 
     /// F1 to F6, F2/F4 on `null`, F25 refused.
@@ -519,16 +620,130 @@ impl<'a> Terms<'a> {
 
     /// The term `t{n}` of an IRI, minted on first use.
     fn term_of(&mut self, iri: &str) -> String {
-        let found = self
-            .context
-            .iter()
-            .find(|(_, defined)| defined.as_str() == Some(iri))
-            .map(|(term, _)| term.clone());
-        found.unwrap_or_else(|| {
-            let next = format!("t{}", self.context.len());
-            self.context.insert(next.clone(), Value::from(iri));
-            next
+        mint(self.context, iri)
+    }
+
+    /// One boolean expression as a residual one (ADR-0028 rule 2): the
+    /// constructs `term` maps, any `not`, with OData's null rules; what the
+    /// evaluator does not cover yet is `Later` (T-3749).
+    fn residual(&mut self, e: &Expr) -> Result<RExpr, Refused> {
+        match e {
+            Expr::And(l, r) => Ok(RExpr::And(vec![self.residual(l)?, self.residual(r)?])),
+            Expr::Or(l, r) => Ok(RExpr::Or(vec![self.residual(l)?, self.residual(r)?])),
+            Expr::Not(inner) => Ok(RExpr::Not(Box::new(self.residual(inner)?))),
+            Expr::Compare(l, op, r) => self.residual_compare(l, *op, r),
+            Expr::In(l, list) => {
+                let (path, edm) = self.residual_member(l)?;
+                typed(edm, list)?;
+                let values = list.iter().map(residual_lit).collect::<Result<_, _>>()?;
+                Ok(definite(RExpr::In(Box::new(RExpr::Path(path)), values)))
+            }
+            Expr::Call(method, args) => {
+                let func = match method {
+                    Method::Contains => Func::Contains,
+                    Method::StartsWith => Func::StartsWith,
+                    Method::EndsWith => Func::EndsWith,
+                    Method::GeoIntersects => {
+                        return self
+                            .geo(e)?
+                            .map(|(term, polygon)| intersects(&term, &polygon))
+                            .ok_or(Refused::Later)
+                    }
+                };
+                let [member, operand] = args.as_slice() else {
+                    return Err(Refused::Later);
+                };
+                let Ok(Literal::String(s)) = literal(operand, self.aliases) else {
+                    return Err(Refused::Later);
+                };
+                let (path, edm) = self.residual_member(member)?;
+                if edm != "Edm.String" {
+                    return Err(Refused::Bad);
+                }
+                // URL 5.1.1.5: null in, null out; `not` keeps it null
+                Ok(RExpr::Call(
+                    func,
+                    vec![RExpr::Path(path), RExpr::Lit(Lit::Str(s.clone()))],
+                ))
+            }
+            // `$filter=flag`: a Boolean member, null when absent.
+            Expr::Member(_) => match self.residual_member(e)? {
+                (path, "Edm.Boolean") => Ok(RExpr::Path(path)),
+                _ => Err(Refused::Bad),
+            },
+            Expr::Literal(_) | Expr::Alias(_) | Expr::Any { .. } => Err(Refused::Later),
+        }
+    }
+
+    /// F1 to F6 and F2/F4 as residual comparisons: definite, so a missing
+    /// value or one of another type compares false (URL 5.1.1.1.2, 5.1.1.1.3)
+    /// and `ne` holds on it.
+    fn residual_compare(&mut self, l: &Expr, op: CompareOp, r: &Expr) -> Result<RExpr, Refused> {
+        let (member, op, lit) = match (literal(l, self.aliases), literal(r, self.aliases)) {
+            (Err(_), Ok(lit)) => (l, op, lit),
+            (Ok(lit), Err(_)) => (r, mirrored(op), lit),
+            // F25: two members, or two literals.
+            _ => return Err(Refused::Later),
+        };
+        let (path, edm) = self.residual_member(member)?;
+        typed(edm, std::slice::from_ref(lit))?;
+        let value = || RExpr::Path(path.clone());
+        let null = || RExpr::IsNull(Box::new(value()));
+        if matches!(lit, Literal::Null) {
+            return match op {
+                CompareOp::Eq => Ok(null()),
+                CompareOp::Ne => Ok(RExpr::Not(Box::new(null()))),
+                _ => Err(Refused::Later),
+            };
+        }
+        let lit = residual_lit(lit)?;
+        let cmp = |op| RExpr::Cmp(op, Box::new(value()), Box::new(RExpr::Lit(lit.clone())));
+        Ok(match op {
+            CompareOp::Eq => definite(cmp(Cmp::Eq)),
+            CompareOp::Ne => RExpr::Not(Box::new(definite(cmp(Cmp::Eq)))),
+            CompareOp::Gt => definite(cmp(Cmp::Gt)),
+            CompareOp::Ge => definite(cmp(Cmp::Ge)),
+            CompareOp::Lt => definite(cmp(Cmp::Lt)),
+            CompareOp::Le => definite(cmp(Cmp::Le)),
         })
+    }
+
+    /// [`Self::typed_member`] as a residual path: a scalar member of the set
+    /// or its `observedAt` (F21); a hop is gated (F24) and stays `Later`.
+    fn residual_member(&mut self, e: &Expr) -> Result<(Path, &'static str), Refused> {
+        let Expr::Member(MemberPath {
+            variable: None,
+            path,
+        }) = e
+        else {
+            return Err(Refused::Later);
+        };
+        if let [name, annotation] = path.as_slice() {
+            if annotation == OBSERVED_AT {
+                let member = self.set.members.get(name).ok_or(Refused::Later)?;
+                let term = self.term_of(&member.iri);
+                return Ok((
+                    Path::Attribute {
+                        attrs: vec![term],
+                        member: RMember::ObservedAt,
+                        keys: Vec::new(),
+                    },
+                    "Edm.DateTimeOffset",
+                ));
+            }
+        }
+        let Some((None, member)) = self.leaf(path) else {
+            return Err(Refused::Later);
+        };
+        let edm = match &member.shape {
+            Shape::Value {
+                edm,
+                collection: false,
+            } => *edm,
+            Shape::Json => return Err(Refused::Bad),
+            _ => return Err(Refused::Later),
+        };
+        Ok((Path::value(&self.term_of(&member.iri)), edm))
     }
 }
 
@@ -580,6 +795,80 @@ fn fits(edm: &str, lit: &Literal) -> bool {
         | "Edm.TimeOfDay" | "Edm.Single" | "Edm.Double" | "Edm.Decimal" => false,
         _ => true,
     }
+}
+
+/// The term `t{n}` of `iri` in `context`, minted on first use.
+pub(crate) fn mint(context: &mut Map<String, Value>, iri: &str) -> String {
+    let found = context
+        .iter()
+        .find(|(_, defined)| defined.as_str() == Some(iri))
+        .map(|(term, _)| term.clone());
+    found.unwrap_or_else(|| {
+        let next = format!("t{}", context.len());
+        context.insert(next.clone(), Value::from(iri));
+        next
+    })
+}
+
+/// `e`, with unknown read as false: `not (e is null) and e` (OData's
+/// comparisons are two-valued, the evaluator's three-valued).
+fn definite(e: RExpr) -> RExpr {
+    RExpr::And(vec![
+        RExpr::Not(Box::new(RExpr::IsNull(Box::new(e.clone())))),
+        e,
+    ])
+}
+
+/// F29 as a residual conjunct: the GeoProperty of `term` intersects
+/// `polygon` (`coordinates` of a WGS 84 Polygon).
+fn intersects(term: &str, polygon: &Value) -> RExpr {
+    RExpr::Spatial(
+        Spatial::Intersects,
+        Box::new(RExpr::Path(Path::value(term))),
+        Box::new(RExpr::Lit(Lit::Geometry(serde_json::json!({
+            "type": "Polygon",
+            "coordinates": polygon,
+        })))),
+    )
+}
+
+/// A literal as a residual value: an offset date-time is one instant, which
+/// `q` cannot say (F26).
+fn residual_lit(lit: &Literal) -> Result<Lit, Refused> {
+    let parsed = |v: Option<Lit>| v.ok_or(Refused::Bad);
+    match lit {
+        Literal::Bool(b) => Ok(Lit::Bool(*b)),
+        Literal::Int(n) => Ok(Lit::Int(*n)),
+        Literal::Decimal(raw) => match raw.parse::<f64>() {
+            Ok(n) if n.is_finite() => Ok(Lit::Num(n)),
+            _ => Err(Refused::Bad),
+        },
+        Literal::String(s) | Literal::Guid(s) => Ok(Lit::Str(s.clone())),
+        Literal::Date(d) => parsed(Date::parse(d).map(Lit::Date)),
+        Literal::DateTimeOffset(t) => parsed(DateTime::parse(t).map(Lit::DateTime)),
+        Literal::TimeOfDay(t) => parsed(Time::parse(t).map(Lit::Time)),
+        Literal::Null | Literal::Geography(_) => Err(Refused::Later),
+    }
+}
+
+/// The residual of `t` as one program, `None` when the filter pushes whole.
+///
+/// # Errors
+/// The evaluator's bounds (ADR-0028 rule 7) as `TooComplex`, anything it
+/// does not take as `Later`.
+pub(crate) fn program(t: &Translated, now: DateTime) -> Result<Option<residual::Program>, Refused> {
+    let conjuncts = match t.residual.as_slice() {
+        [] => return Ok(None),
+        [one] => one.clone(),
+        many => RExpr::And(many.to_vec()),
+    };
+    residual::compile(&conjuncts, now)
+        .map(Some)
+        .map_err(|e| match e {
+            residual::Error::TooComplex => Refused::TooComplex,
+            // this module builds no pattern, the one construct the evaluator may not support
+            residual::Error::Invalid(_) | residual::Error::Unsupported(_) => Refused::Bad,
+        })
 }
 
 /// `v op p` read as `p op' v`.
@@ -865,10 +1154,16 @@ mod tests {
             (t.q.as_deref(), t.ids),
             (Some("(t0>0)"), Some(vec!["urn:a".to_owned()]))
         );
+        // one `id` parameter per query: the second list is evaluated (T-3758)
         let twice = Expr::And(Box::new(id("urn:a")), Box::new(mirrored));
+        let t = translate(&twice, &set(), &BTreeMap::new(), &[]).unwrap_or_default();
+        assert_eq!(t.ids, Some(vec!["urn:a".to_owned()]));
         assert_eq!(
-            translate(&twice, &set(), &BTreeMap::new(), &[]),
-            Err(Refused::Later)
+            t.residual,
+            [RExpr::In(
+                Box::new(RExpr::Path(Path::Id)),
+                vec![Lit::Str("urn:b".into())]
+            )]
         );
         let number = cmp(m("id"), CompareOp::Eq, lit(Literal::Int(1)));
         assert_eq!(
@@ -893,11 +1188,7 @@ mod tests {
         let later = [
             cmp(m("speed"), CompareOp::Eq, m("speed")),
             cmp(lit(Literal::Int(1)), CompareOp::Eq, lit(Literal::Int(1))),
-            Expr::Not(Box::new(cmp(
-                m("speed"),
-                CompareOp::Gt,
-                lit(Literal::Int(1)),
-            ))),
+            Expr::Not(Box::new(cmp(m("speed"), CompareOp::Eq, m("speed")))),
             cmp(m("tags"), CompareOp::Eq, lit(Literal::String("a".into()))),
             cmp(
                 m("location"),
@@ -921,14 +1212,6 @@ mod tests {
                 }),
                 CompareOp::Eq,
                 lit(Literal::Int(1)),
-            ),
-            cmp(
-                Expr::Member(MemberPath {
-                    variable: None,
-                    path: vec!["speed".into(), OBSERVED_AT.into()],
-                }),
-                CompareOp::Eq,
-                lit(Literal::DateTimeOffset("2026-01-01T00:00:00+01:00".into())),
             ),
             Expr::Literal(Literal::Bool(true)),
             Expr::Any {
@@ -1129,9 +1412,13 @@ mod tests {
             Box::new(within("location", area(4326, &square))),
             Box::new(within("location", area(4326, &square))),
         );
+        // T-3758: a second area, or one below `or`, is evaluated
+        for (e, pushed) in [(nested, false), (twice, true)] {
+            let t = translate(&e, &set(), &BTreeMap::new(), &[]).unwrap_or_default();
+            assert_eq!(t.geo.is_some(), pushed, "{e:?}");
+            assert_eq!(t.residual.len(), 1, "{e:?}");
+        }
         for e in [
-            nested,
-            twice,
             within("location", area(3857, &square)),
             within("hidden", area(4326, &square)),
             Expr::Call(Method::GeoIntersects, vec![m("location")]),
@@ -1237,6 +1524,117 @@ mod tests {
         );
     }
 
+    /// The answer of a residual filter for an Entity whose `t0` holds
+    /// `value` (`None`: no such Attribute), and whether it was pushed.
+    fn evaluated(e: &Expr, value: Option<serde_json::Value>) -> Option<residual::Truth> {
+        let t = translate(e, &set(), &BTreeMap::new(), &[]).ok()?;
+        let now = DateTime::parse("2026-10-11T12:00:00Z")?;
+        let program = program(&t, now).ok()??;
+        let mut entity = serde_json::json!({"id": "urn:ngsi-ld:Car:1", "type": "Car"});
+        if let (Some(v), Some(members)) = (value, entity.as_object_mut()) {
+            members.insert(
+                "t0".into(),
+                serde_json::json!({"type": "Property", "value": v}),
+            );
+        }
+        program.eval(&entity).ok()
+    }
+
+    #[test]
+    fn not_is_evaluated_with_odatas_null_rules() {
+        use residual::Truth::{False, True, Unknown};
+        use serde_json::json;
+        let not = |e: Expr| Expr::Not(Box::new(e));
+        // F11, URL 5.1.1.1.3: a missing value, or one of another type,
+        // compares false, so `not` of the comparison holds there
+        let gt = not(cmp(m("speed"), CompareOp::Gt, lit(Literal::Int(5))));
+        for (value, want) in [
+            (Some(json!(3)), True),
+            (Some(json!(7)), False),
+            (Some(json!(5.5)), False),
+            (Some(json!("x")), True),
+            (None, True),
+        ] {
+            assert_eq!(evaluated(&gt, value.clone()), Some(want), "{value:?}");
+        }
+        // URL 5.1.1.1.2: null is not equal to any value
+        let eq = not(cmp(
+            m("name"),
+            CompareOp::Eq,
+            lit(Literal::String("a".into())),
+        ));
+        assert_eq!(evaluated(&eq, None), Some(True));
+        assert_eq!(evaluated(&eq, Some(json!("a"))), Some(False));
+        let listed = not(Expr::In(
+            Box::new(m("speed")),
+            vec![Literal::Int(1), Literal::Int(2)],
+        ));
+        assert_eq!(evaluated(&listed, None), Some(True));
+        assert_eq!(evaluated(&listed, Some(json!(2))), Some(False));
+        // a double negation is the comparison again
+        let ne = not(not(cmp(m("speed"), CompareOp::Ne, lit(Literal::Int(5)))));
+        assert_eq!(evaluated(&ne, None), Some(True));
+        assert_eq!(evaluated(&ne, Some(json!(5))), Some(False));
+        // a string function or a Boolean member over nothing stays null
+        let flag = not(m("on"));
+        assert_eq!(evaluated(&flag, None), Some(Unknown));
+        assert_eq!(evaluated(&flag, Some(json!(false))), Some(True));
+        let starts = not(not(Expr::Call(
+            Method::StartsWith,
+            vec![m("name"), lit(Literal::String("Sta".into()))],
+        )));
+        assert_eq!(evaluated(&starts, None), Some(Unknown));
+        assert_eq!(evaluated(&starts, Some(json!("Station"))), Some(True));
+        // `not (p eq null)` is F10, pushed
+        let present = not(cmp(m("speed"), CompareOp::Eq, lit(Literal::Null)));
+        assert_eq!(evaluated(&present, None), None);
+        assert_eq!(q(&present), Ok("(t0)".into()));
+    }
+
+    #[test]
+    fn a_conjunct_goes_whole_to_the_residual_and_the_rest_is_pushed() {
+        let e = Expr::And(
+            Box::new(cmp(m("speed"), CompareOp::Gt, lit(Literal::Int(1)))),
+            Box::new(Expr::Not(Box::new(Expr::Or(
+                Box::new(cmp(
+                    m("name"),
+                    CompareOp::Eq,
+                    lit(Literal::String("a".into())),
+                )),
+                Box::new(cmp(m("speed"), CompareOp::Lt, lit(Literal::Int(9)))),
+            )))),
+        );
+        let t = translate(&e, &set(), &BTreeMap::new(), &[]).unwrap_or_default();
+        assert_eq!(t.q.as_deref(), Some("(t0>1)"));
+        assert_eq!(t.residual.len(), 1);
+        assert!(!t.linked, "a failed push leaves no join behind");
+        // an offset date-time is one instant `q` cannot say: evaluated
+        let offset = cmp(
+            Expr::Member(MemberPath {
+                variable: None,
+                path: vec!["speed".into(), OBSERVED_AT.into()],
+            }),
+            CompareOp::Lt,
+            lit(Literal::DateTimeOffset("2026-01-01T00:00:00+01:00".into())),
+        );
+        let t = translate(&offset, &set(), &BTreeMap::new(), &[]).unwrap_or_default();
+        assert_eq!((t.q, t.residual.len()), (None, 1));
+        // a `not` over what is still a later round's stays 501
+        let later = Expr::Not(Box::new(cmp(m("speed"), CompareOp::Eq, m("speed"))));
+        assert_eq!(q(&later), Err(Refused::Later));
+        // past the evaluator's bounds: TooComplex (ADR-0028 rule 7)
+        let mut deep = cmp(m("speed"), CompareOp::Gt, lit(Literal::Int(1)));
+        for _ in 0..80 {
+            deep = Expr::Not(Box::new(deep));
+        }
+        let t = translate(&deep, &set(), &BTreeMap::new(), &[]).unwrap_or_default();
+        let now = DateTime::parse("2026-10-11T12:00:00Z");
+        assert_eq!(
+            now.map(|now| program(&t, now).map(|_| ())),
+            Some(Err(Refused::TooComplex))
+        );
+    }
+
     #[test]
     fn a_literal_of_another_type_than_its_member_is_bad() {
         // T-3725: URL 5.1.1.1, and 5.1.1.5 for an integer past its range.
@@ -1295,5 +1693,206 @@ mod tests {
         ] {
             assert_eq!(q(&e), Err(Refused::Bad), "{e:?}");
         }
+    }
+
+    fn ordered(set: &Set, names: &[(&str, bool)]) -> Result<Translated, Refused> {
+        let items: Vec<OrderBy> = names
+            .iter()
+            .map(|(name, descending)| OrderBy {
+                expr: m(name),
+                descending: *descending,
+            })
+            .collect();
+        let mut t = Translated::default();
+        order(&items, set, &mut t).map(|()| t)
+    }
+
+    #[test]
+    fn a_system_member_is_sorted_by_the_surface_unless_the_model_names_it() -> Result<(), Refused> {
+        // Q9: the surface sorts, reading the value keys beside it
+        let t = ordered(
+            &set(),
+            &[("createdAt", false), ("speed", true), ("id", false)],
+        )?;
+        assert_eq!(t.order, None);
+        assert!(t.sort_system);
+        assert_eq!(t.sort_reads, ["t0"]);
+        assert_eq!(
+            t.sort.map(|keys| keys
+                .into_iter()
+                .map(|k| (k.by, k.descending))
+                .collect::<Vec<_>>()),
+            Some(vec![
+                (SortBy::System("createdAt".into()), false),
+                (SortBy::Value("t0".into()), true),
+                (SortBy::Id, false),
+            ])
+        );
+        // without one, `orderBy` is pushed
+        let t = ordered(&set(), &[("speed", true), ("id", false)])?;
+        assert_eq!((t.order.as_deref(), t.sort), (Some("t0;desc,id"), None));
+        // a model member of that name is an Attribute like any other
+        let mut named = set();
+        named.members.insert(
+            "modifiedAt".into(),
+            Member {
+                iri: "https://e.org/modifiedAt".into(),
+                shape: Shape::Value {
+                    edm: "Edm.DateTimeOffset",
+                    collection: false,
+                },
+                list: false,
+                written: crate::edm::Written::Always,
+            },
+        );
+        let t = ordered(&named, &[("modifiedAt", false)])?;
+        assert_eq!((t.order.as_deref(), t.sort), (Some("t0"), None));
+        Ok(())
+    }
+
+    #[test]
+    fn every_residual_form_is_evaluated_or_refused() {
+        use residual::Truth::{False, True};
+        use serde_json::json;
+        let not = |e: Expr| Expr::Not(Box::new(e));
+        let int = |n| lit(Literal::Int(n));
+        let speed = |op, n| cmp(m("speed"), op, int(n));
+        let and = not(Expr::And(
+            Box::new(speed(CompareOp::Gt, 1)),
+            Box::new(speed(CompareOp::Lt, 9)),
+        ));
+        assert_eq!(evaluated(&and, Some(json!(5))), Some(False));
+        assert_eq!(evaluated(&and, Some(json!(10))), Some(True));
+        // a literal on the left is mirrored
+        let left = not(cmp(int(5), CompareOp::Lt, m("speed")));
+        assert_eq!(evaluated(&left, Some(json!(6))), Some(False));
+        assert_eq!(evaluated(&left, Some(json!(5))), Some(True));
+        for (op, value, want) in [
+            (CompareOp::Ge, 5, False),
+            (CompareOp::Ge, 4, True),
+            (CompareOp::Le, 5, False),
+            (CompareOp::Le, 6, True),
+        ] {
+            assert_eq!(
+                evaluated(&not(speed(op, 5)), Some(json!(value))),
+                Some(want)
+            );
+        }
+        // `eq null` and `ne null` under `or`
+        let null = |op| cmp(m("speed"), op, lit(Literal::Null));
+        let absent = not(Expr::Or(
+            Box::new(null(CompareOp::Eq)),
+            Box::new(speed(CompareOp::Gt, 3)),
+        ));
+        assert_eq!(evaluated(&absent, None), Some(False));
+        assert_eq!(evaluated(&absent, Some(json!(2))), Some(True));
+        let present = not(Expr::Or(
+            Box::new(null(CompareOp::Ne)),
+            Box::new(speed(CompareOp::Gt, 3)),
+        ));
+        assert_eq!(evaluated(&present, None), Some(True));
+        assert_eq!(evaluated(&present, Some(json!(2))), Some(False));
+        let ends = not(not(Expr::Call(
+            Method::EndsWith,
+            vec![m("name"), lit(Literal::String("ion".into()))],
+        )));
+        assert_eq!(evaluated(&ends, Some(json!("Station"))), Some(True));
+        let on = not(cmp(m("on"), CompareOp::Eq, lit(Literal::Bool(true))));
+        assert_eq!(evaluated(&on, Some(json!(false))), Some(True));
+        let half = not(cmp(
+            m("speed"),
+            CompareOp::Gt,
+            lit(Literal::Decimal("1.5".into())),
+        ));
+        assert_eq!(evaluated(&half, Some(json!(1))), Some(True));
+        // two residual conjuncts are one program
+        let both = Expr::And(
+            Box::new(not(speed(CompareOp::Gt, 8))),
+            Box::new(not(speed(CompareOp::Lt, 2))),
+        );
+        assert_eq!(evaluated(&both, Some(json!(5))), Some(True));
+        assert_eq!(evaluated(&both, Some(json!(9))), Some(False));
+        // what no member type takes is Bad
+        for e in [
+            not(not(Expr::Call(
+                Method::Contains,
+                vec![m("speed"), lit(Literal::String("1".into()))],
+            ))),
+            not(m("speed")),
+            not(cmp(m("doc"), CompareOp::Eq, int(1))),
+            not(cmp(
+                m("speed"),
+                CompareOp::Gt,
+                lit(Literal::Decimal("NaN".into())),
+            )),
+        ] {
+            assert_eq!(q(&e), Err(Refused::Bad), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn a_date_and_a_time_of_day_are_residual_values() {
+        use residual::Truth::{False, True};
+        use serde_json::json;
+        let mut timed = set();
+        for (name, edm) in [("day", "Edm.Date"), ("at", "Edm.TimeOfDay")] {
+            timed.members.insert(
+                name.into(),
+                Member {
+                    iri: format!("https://e.org/{name}"),
+                    shape: Shape::Value {
+                        edm,
+                        collection: false,
+                    },
+                    list: false,
+                    written: crate::edm::Written::Always,
+                },
+            );
+        }
+        let not = |e: Expr| Expr::Not(Box::new(e));
+        let now = DateTime::parse("2026-10-11T12:00:00Z");
+        for (e, value, want) in [
+            (
+                not(cmp(
+                    m("day"),
+                    CompareOp::Lt,
+                    lit(Literal::Date("2026-01-02".into())),
+                )),
+                json!({"@type": "Date", "@value": "2026-01-01"}),
+                False,
+            ),
+            (
+                not(cmp(
+                    m("at"),
+                    CompareOp::Lt,
+                    lit(Literal::TimeOfDay("09:30:00".into())),
+                )),
+                json!({"@type": "Time", "@value": "10:00:00"}),
+                True,
+            ),
+        ] {
+            let t = translate(&e, &timed, &BTreeMap::new(), &[]);
+            let program = t
+                .and_then(|t| now.map_or(Err(Refused::Later), |now| program(&t, now)))
+                .ok()
+                .flatten();
+            let entity = json!({"id": "urn:ngsi-ld:Car:1", "type": "Car",
+                "t0": {"type": "Property", "value": value}});
+            assert_eq!(
+                program.and_then(|p| p.eval(&entity).ok()),
+                Some(want),
+                "{e:?}"
+            );
+        }
+        // a literal the type cannot hold is Bad
+        let bad = not(cmp(
+            m("day"),
+            CompareOp::Lt,
+            lit(Literal::Date("2026-02-30".into())),
+        ));
+        assert_eq!(
+            translate(&bad, &timed, &BTreeMap::new(), &[]).map(|_| ()),
+            Err(Refused::Bad)
+        );
     }
 }
