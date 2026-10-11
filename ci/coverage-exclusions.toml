@@ -40,9 +40,9 @@ reason = "the view store failing: the built-in store under test_kit does not fai
 crate = "antares-ops"
 file = "src/views/preview.rs"
 function = "antares_ops::views::preview::preview"
-lines = 2
+lines = 1
 branches = 0
-reason = "the errors of building a request from a query axum already parsed and a tenant the loader validated, and of reading an in-memory body: neither can fail"
+reason = "the error of building a request from a query axum already parsed and a tenant the loader validated: it cannot fail"
 
 [[exclusion]]
 crate = "antares-ops"
@@ -179,11 +179,3 @@ function = "antares_ops::mapping::sources"
 lines = 1
 branches = 0
 reason = "the inner @context failing to merge: it maps generated terms to IRIs that compile already expanded and checked, which merge_object accepts; the arm keeps a refusal instead of an unwrap"
-
-[[exclusion]]
-crate = "antares-views"
-file = "src/mapped.rs"
-function = "antares_views::mapped::answer"
-lines = 1
-branches = 0
-reason = "an answer over MAX_ANSWER_BYTES (64 MiB): a test would have to store and page more than that through the test kit's in-memory store"
