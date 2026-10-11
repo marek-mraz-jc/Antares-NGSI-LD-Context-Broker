@@ -14,16 +14,20 @@ role = "addon"
 [dependencies]
 antares-api = { workspace = true }
 antares-jsonld = { workspace = true }
+antares-model = { workspace = true }
+# the access surface (README section 4)
+antares-ops = { workspace = true }
+axum = { workspace = true }
 antares-ql = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # the policy seam's own contract, and the broker's router for the end-to-end cases
 antares-api = { workspace = true, features = ["test-kit"] }
-antares-model = { workspace = true }
-axum = { workspace = true }
+antares-ops = { workspace = true, features = ["test-kit"] }
 http-body-util = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
