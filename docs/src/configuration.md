@@ -70,6 +70,8 @@ here).
 | `ANTARES_WS_QUEUE` | `256` | Builds with the `ws` feature only: notifications queued per connection, and the resume ring's length. A consumer that falls past it gets `x-gap` and is closed with 1013, never buffered further (W4). |
 | `ANTARES_WS_RESUME_GRACE_SECS` | `30` | Builds with the `ws` feature only: how long a connection with Subscriptions outlives its socket for `x-resume`; after it its Subscriptions are deleted. |
 | `ANTARES_WS_MAX_LIFETIME_SECS` | `300` | Builds with the `ws` feature only: a socket ends at this age with `x-closing` `lifetime` and 1000, and the client resumes on a new one, so a revoked credential stops at the next reconnect (W7). |
+| `ANTARES_MCP_REQUEST_STATE_KEY_FILE` | unset: a key per process | Builds with the `mcp` feature only: a file of at least 32 bytes, mounted from a Secret, whose bytes seal a write tool's `requestState` (HMAC-SHA256), so a confirmation answers every replica. Unreadable or shorter: every write tool call is refused. Never logged. |
+| `ANTARES_MCP_SUBSCRIPTION_ENDPOINTS` | unset: none | Builds with the `mcp` feature only: comma-separated notification endpoints `create_subscription` and `update_subscription` may name; an entry ending in `/` allows every URI below it. |
 | `ANTARES_EXTRA_CA_FILE` | unset | PEM bundle of ADDITIONAL trust anchors for egress TLS (private CAs). Egress TLS trusts the host's certificate store (`/etc/ssl/certs` on Linux; the shipped image carries one), and this widens it. Verification itself is never disableable. |
 
 ## Notification delivery

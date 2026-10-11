@@ -16,8 +16,9 @@ RUN apt-get update \
 # Release binaries embed their dependency list (SBOM) via
 # cargo-auditable — `cargo audit bin /antares` can then verify a shipped
 # broker against advisories with no source tree at hand. Installed (with chef)
-# BEFORE any source COPY so the layer caches across source changes.
-RUN cargo install cargo-chef cargo-auditable --locked
+# BEFORE any source COPY so the layer caches across source changes; both at
+# an exact version, as every build tool is (surfaces-threat-model 11.1).
+RUN cargo install cargo-chef@0.1.78 cargo-auditable@0.7.7 --locked
 # The pinned toolchain must be present from the first cargo invocation —
 # otherwise the dep layer compiles with the image's default toolchain and the
 # final build recompiles everything under the pinned one, defeating the cache.

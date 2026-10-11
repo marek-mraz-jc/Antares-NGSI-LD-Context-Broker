@@ -58,6 +58,12 @@ const KNOWN_KEYS: &[&str] = &[
     antares_ws::MAX_SUBSCRIPTIONS_ENV,
     #[cfg(feature = "ws")]
     antares_ws::ALLOWED_ORIGINS_ENV,
+    // The key that seals a write's confirmation, and the endpoints a
+    // subscription made through a tool may notify (MC4, MC12).
+    #[cfg(feature = "mcp")]
+    antares_mcp::REQUEST_STATE_KEY_FILE_ENV,
+    #[cfg(feature = "mcp")]
+    antares_mcp::SUBSCRIPTION_ENDPOINTS_ENV,
     "ANTARES_DATABASE_URL",
     "ANTARES_STORE",
     // Temporal driver: a store mode, or `none` — history off (temporal
@@ -920,6 +926,22 @@ async fn run(
     if policy_name != antares_api::policy::BUILT_IN_NAME {
         state = state.with_policy(build_policy());
     }
+    // A notification binding compiled in from outside the workspace mounts
+    // exactly like the two shipped ones: one registration, no core-crate
+    // edit. It is not in a release build — the feature is off by default,
+    // so the shipped binary serves network schemes only. Every sink before
+    // `views::install`: the registry is sealed once the state is shared.
+    #[cfg(feature = "plugin-example")]
+    {
+        state = state.with_sink(Box::new(antares_plugin_example::MemorySink::new()));
+    }
+    // The WebSocket channel (ADR-0026): its sink beside HTTP and MQTT, over
+    // the hub its two surfaces share. A mistyped bound stops the broker.
+    #[cfg(feature = "ws")]
+    {
+        antares_ws::Limits::from_env(|k| std::env::var(k).ok())?;
+        state = state.with_sink(Box::new(antares_ws::Sink::new(antares_ws::Hub::process())));
+    }
     // Endpoint views (ADR-0023 rule 10): the stored views loaded into the
     // table every surface that serves through views opens on, `/q/views`
     // and `/q/policy` on the admin surface, and the reload that keeps every
@@ -942,21 +964,6 @@ async fn run(
              ANTARES_ADMIN_TOKEN_FILE is unset"
         ),
     }
-    // A notification binding compiled in from outside the workspace mounts
-    // exactly like the two shipped ones: one registration, no core-crate
-    // edit. It is not in a release build — the feature is off by default,
-    // so the shipped binary serves network schemes only.
-    #[cfg(feature = "plugin-example")]
-    let state = state.with_sink(Box::new(antares_plugin_example::MemorySink::new()));
-    // The WebSocket channel (ADR-0026): its sink beside HTTP and MQTT, over
-    // the hub its two surfaces share. A mistyped bound stops the broker.
-    #[cfg(feature = "ws")]
-    let state = {
-        antares_ws::Limits::from_env(|k| std::env::var(k).ok())?;
-        state.with_sink(Box::new(antares_ws::Sink::new(antares_ws::Hub::process())))
-    };
-    #[cfg(any(feature = "plugin-example", feature = "ws"))]
-    let mut state = state;
     // /q/metrics renders through this closure (None without the
     // `telemetry` feature — the endpoint answers 404); the sampler feeds
     // the process-level gauges the whole run.
@@ -1409,6 +1416,22 @@ mod config_key_tests {
     /// deployment knob is a CrashLoopBackOff and the knob cannot be used at
     /// all. Scans the sources rather than restating the list, so the check
     /// keeps holding as crates add knobs.
+    /// The MCP surface names its variables by constant, which the source
+    /// scan below cannot see; a key missing here stops the broker at start.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn known_keys_hold_the_mcp_surface_variables() {
+        for key in [
+            antares_mcp::ALLOWED_HOSTS_ENV,
+            antares_mcp::ALLOWED_ORIGINS_ENV,
+            antares_mcp::MAX_RESULT_BYTES_ENV,
+            antares_mcp::REQUEST_STATE_KEY_FILE_ENV,
+            antares_mcp::SUBSCRIPTION_ENDPOINTS_ENV,
+        ] {
+            assert!(!unknown_config_key(key), "{key}");
+        }
+    }
+
     #[test]
     fn known_keys_cover_every_variable_the_workspace_reads() {
         let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
