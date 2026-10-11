@@ -455,7 +455,6 @@ async fn the_forms_of_later_rounds_are_501_and_read_only_writes_405() {
         "Car?$filter=not%20(speed%20gt%201)",
         "Car('urn:ngsi-ld:Car:1')?$filter=speed%20gt%201",
         "Car?$schemaversion=2",
-        "Car('urn:ngsi-ld:Car:1')/speed",
         "$entity?$id=Car('urn:ngsi-ld:Car:1')",
         "$batch",
     ] {
@@ -503,6 +502,20 @@ async fn the_forms_of_later_rounds_are_501_and_read_only_writes_405() {
     )
     .await;
     assert_eq!(got.status, StatusCode::NOT_ACCEPTABLE, "{}", got.body);
+    let got = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car('urn:ngsi-ld:Car:1')/speed"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        (got.status, &got.json()["error"]["code"]),
+        (StatusCode::METHOD_NOT_ALLOWED, &json!("MethodNotAllowed")),
+        "a property read the view's operations do not offer: {}",
+        got.body
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

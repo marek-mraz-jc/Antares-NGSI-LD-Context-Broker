@@ -92,7 +92,7 @@ async fn broker(entities: &[Value]) -> Result<(TestBroker, Router), String> {
         "scopeQ": "/a",
         "rules": [{"types": ["city:Car"], "attributes": ["city:speed", "city:owner", "city:drivers"]},
                   {"types": ["city:Person"], "attributes": ["city:name"]}],
-        "operations": ["query_entities", "retrieve_entity"]
+        "operations": ["query_entities", "retrieve_entity", "retrieve_attribute_value"]
     })
     .to_string();
     for (uri, body) in [
@@ -328,13 +328,14 @@ async fn odata_expand_stops_at_the_join_lookup_budget() {
     for path in [
         "Car('urn:ngsi-ld:Car:1')?$expand=drivers",
         "Car?$expand=drivers",
+        "Car('urn:ngsi-ld:Car:1')/drivers",
     ] {
         let (status, body) = get(&app, path).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
         assert!(
             body["error"]["message"]
                 .as_str()
-                .is_some_and(|m| m.contains("$top")),
+                .is_some_and(|m| m.contains("$filter")),
             "{path}: names the way to narrow it: {body}"
         );
     }
@@ -386,5 +387,167 @@ async fn odata_filter_navigation_path_reads_hidden_targets_as_absent() {
     ] {
         let (status, body) = get(&app, path).await;
         assert_eq!(status, want, "{path}: {body}");
+    }
+}
+
+async fn text(app: &Router, path: &str) -> (StatusCode, String, String) {
+    let req = Request::get(format!("{ROOT}/{path}"))
+        .body(Body::empty())
+        .unwrap_or_default();
+    let Ok(resp) = app.clone().oneshot(req).await;
+    let status = resp.status();
+    let kind = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .unwrap_or_default();
+    (status, kind, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_reads_a_property_its_value_and_the_entities_a_navigation_names() {
+    let (_b, app) = city().await.expect("broker");
+    let one = "Car('urn:ngsi-ld:Car:1')";
+    let (status, body) = get(&app, &format!("{one}/speed")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({"@odata.context": format!("{ROOT}/$metadata#{one}/speed"), "value": 1.0})
+    );
+    for (headers, want) in [
+        (
+            ("OData-MaxVersion", "4.01"),
+            json!({"@context": format!("{ROOT}/$metadata#{one}/speed"), "value": 1.0}),
+        ),
+        (
+            ("Accept", "application/json;odata.metadata=none"),
+            json!({"value": 1.0}),
+        ),
+    ] {
+        let req = Request::get(format!("{ROOT}/{one}/speed"))
+            .header(headers.0, headers.1)
+            .body(Body::empty())
+            .unwrap_or_default();
+        let Ok(resp) = app.clone().oneshot(req).await;
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .map(http_body_util::Collected::to_bytes)
+            .unwrap_or_default();
+        let got: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(got, want, "{headers:?}");
+    }
+    let (status, kind, raw) = text(&app, &format!("{one}/speed/$value")).await;
+    assert_eq!(
+        (status, kind.as_str(), raw.as_str()),
+        (StatusCode::OK, "text/plain", "1.0")
+    );
+    let (status, owner) = get(&app, &format!("{one}/owner")).await;
+    assert_eq!(status, StatusCode::OK, "{owner}");
+    assert_eq!(
+        owner["@odata.context"],
+        format!("{ROOT}/$metadata#Person/$entity")
+    );
+    assert_eq!(
+        (&owner["id"], &owner["name"]),
+        (&json!("urn:ngsi-ld:Person:1"), &json!("Ann"))
+    );
+    let (status, named) = get(&app, &format!("{one}/owner?$select=name")).await;
+    assert_eq!(status, StatusCode::OK, "{named}");
+    assert!(
+        named.get("scope").is_none() && named["name"] == "Ann",
+        "{named}"
+    );
+    let (status, drivers) = get(&app, &format!("{one}/drivers")).await;
+    assert_eq!(status, StatusCode::OK, "{drivers}");
+    assert_eq!(
+        ids(&drivers),
+        ["urn:ngsi-ld:Person:1"],
+        "the hidden driver is left out: {drivers}"
+    );
+    let (status, refs) = get(&app, &format!("{one}/drivers/$ref")).await;
+    assert_eq!(status, StatusCode::OK, "{refs}");
+    assert_eq!(
+        refs["value"],
+        json!([
+            {"@odata.id": format!("{ROOT}/Person('urn:ngsi-ld:Person:1')")},
+            {"@odata.id": format!("{ROOT}/Person('urn:ngsi-ld:Person:2')")}
+        ]),
+        "references are the Relationship's objects (Q33): {refs}"
+    );
+    let (status, owner_ref) = get(&app, &format!("{one}/owner/$ref")).await;
+    assert_eq!(status, StatusCode::OK, "{owner_ref}");
+    assert_eq!(
+        owner_ref["@odata.id"],
+        format!("{ROOT}/Person('urn:ngsi-ld:Person:1')")
+    );
+    let (status, none) = get(&app, "Car('urn:ngsi-ld:Car:2')/drivers").await;
+    assert_eq!(
+        (status, &none["value"]),
+        (StatusCode::OK, &json!([])),
+        "{none}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_a_hidden_target_or_value_reads_like_an_absent_one() {
+    let (_b, app) = city().await.expect("broker");
+    let hidden = text(&app, "Car('urn:ngsi-ld:Car:2')/owner").await;
+    let absent = text(&app, "Car('urn:ngsi-ld:Car:3')/owner").await;
+    assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{}", hidden.2);
+    assert_eq!(hidden, absent, "a hidden owner answers like a dangling one");
+    let (status, body) = get(&app, "Car('urn:ngsi-ld:Car:3')/drivers").await;
+    assert_eq!(
+        (status, &body["value"]),
+        (StatusCode::OK, &json!([])),
+        "one absent driver: an empty collection: {body}"
+    );
+    let hidden = text(&app, "Person('urn:ngsi-ld:Person:2')/name").await;
+    let absent = text(&app, "Person('urn:ngsi-ld:Person:9')/name").await;
+    assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{}", hidden.2);
+    assert_eq!(hidden, absent);
+    assert!(!hidden.2.contains("Bob"), "{}", hidden.2);
+    let pin = text(&app, "Person('urn:ngsi-ld:Person:1')/pin").await;
+    let unknown = text(&app, "Person('urn:ngsi-ld:Person:1')/nosuch").await;
+    assert_eq!(pin.0, StatusCode::NOT_FOUND, "{}", pin.2);
+    assert_eq!(pin, unknown, "a hidden member is an unknown one");
+    let bare = json!({"id": "urn:ngsi-ld:Car:7", "type": format!("{CITY}Car"), "scope": "/a"});
+    let (status, made) = send(
+        &app,
+        Method::POST,
+        "/ngsi-ld/v1/entities",
+        Some(&bare.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{made}");
+    let (status, body) = get(&app, "Car('urn:ngsi-ld:Car:7')/owner").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no owner: {body}");
+    let (status, body) = get(&app, "Car('urn:ngsi-ld:Car:7')/drivers").await;
+    assert_eq!(
+        (status, &body["value"]),
+        (StatusCode::OK, &json!([])),
+        "{body}"
+    );
+    for path in [
+        "Car('urn:ngsi-ld:Car:1')/drivers?$top=1",
+        "Car('urn:ngsi-ld:Car:1')/drivers?$skip=1",
+        "Car('urn:ngsi-ld:Car:1')/drivers?$count=true",
+        "Car('urn:ngsi-ld:Car:1')/drivers?$orderby=name",
+        "Car('urn:ngsi-ld:Car:1')/drivers?$skiptoken=x",
+        "Car('urn:ngsi-ld:Car:1')/drivers?$filter=name%20eq%20'Ann'",
+        "Car('urn:ngsi-ld:Car:1')/drivers/$count",
+        "Car('urn:ngsi-ld:Car:1')/owner?$expand=*",
+        "Car('urn:ngsi-ld:Car:1')/scope",
+    ] {
+        let (status, body) = get(&app, path).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{path}: {body}");
     }
 }

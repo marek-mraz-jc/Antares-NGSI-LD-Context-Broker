@@ -10,6 +10,7 @@
 
 use crate::edm::{base_member, Edm, Set, Shape};
 use crate::filter::{order, translate, Refused, Translated};
+use crate::paths;
 use antares_ops::{core_name, Caller, OperationId, OpsRequest, Refusal, ViewOps};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -69,9 +70,35 @@ pub(crate) async fn serve(
         [Segment::EntitySet(set), Segment::Key(key)] => {
             entity(reads, caller, &ctx, set, key, options).await
         }
+        // Below one Entity only `$select` applies (Q31 to Q33).
+        [_, _, ..] if !only_select(options) => Err(not_implemented(version)),
+        [Segment::EntitySet(set), Segment::Key(key), Segment::Property(name)] => {
+            paths::property(reads, caller, &ctx, (set, key, name), false, options).await
+        }
+        [Segment::EntitySet(set), Segment::Key(key), Segment::Property(name), Segment::Value] => {
+            paths::property(reads, caller, &ctx, (set, key, name), true, options).await
+        }
+        [Segment::EntitySet(set), Segment::Key(key), Segment::Navigation(nav)] => {
+            paths::related(reads, caller, &ctx, (set, key, nav), false, options).await
+        }
+        [Segment::EntitySet(set), Segment::Key(key), Segment::Navigation(nav), Segment::Ref] => {
+            paths::related(reads, caller, &ctx, (set, key, nav), true, options).await
+        }
         _ => Err(not_implemented(version)),
     };
     answer.unwrap_or_else(IntoResponse::into_response)
+}
+
+/// Whether no option but `$select` (and `$format`, `$schemaversion=*`,
+/// read before) is asked.
+fn only_select(options: &QueryOptions) -> bool {
+    options.filter.is_none()
+        && options.expand.is_none()
+        && options.orderby.is_none()
+        && options.top.is_none()
+        && options.skip.is_none()
+        && options.count.is_none()
+        && options.skiptoken.is_none()
 }
 
 /// Why a parsed URL is answered `501` in this round: a form or an option a
@@ -96,7 +123,7 @@ fn later(uri: &ODataUri) -> Option<&'static str> {
 /// The members a `$select` list names, `None` for every member. A path
 /// through a complex property, a navigation property or an annotation is a
 /// later round's.
-fn selected<'s>(
+pub(crate) fn selected<'s>(
     set: &'s Set,
     select: Option<&'s Vec<SelectItem>>,
 ) -> Result<Option<Vec<&'s str>>, ()> {
@@ -134,7 +161,7 @@ enum Writes<'s> {
 }
 
 /// One navigation member `$expand` names, one level deep (Q3, Q6 to Q8).
-struct Expansion<'s> {
+pub(crate) struct Expansion<'s> {
     name: &'s str,
     iri: &'s str,
     target_name: &'s str,
@@ -231,7 +258,7 @@ fn listed(picked: Option<&[&str]>, expansions: &[Expansion], version: ODataVersi
 /// follows every Relationship it is given (4.5.23), so it names the
 /// structural members and the expanded ones: a navigation not expanded
 /// spends none of the walk's lookups.
-fn query(
+pub(crate) fn query(
     set: &Set,
     picked: Option<&[&str]>,
     expansions: &[Expansion],
@@ -564,7 +591,7 @@ fn bad_token(version: ODataVersion) -> ODataErrorResponse {
 
 /// The Entity id a key predicate names: `('urn:…')` or `(id='urn:…')`,
 /// either through a parameter alias bound to a string.
-fn key_id(key: &Key, options: &QueryOptions) -> Option<String> {
+pub(crate) fn key_id(key: &Key, options: &QueryOptions) -> Option<String> {
     let value = match key {
         Key::Single(v) => v,
         Key::Compound(pairs) => &pairs.iter().find(|(name, _)| name == "id")?.1,
@@ -580,7 +607,7 @@ fn key_id(key: &Key, options: &QueryOptions) -> Option<String> {
 }
 
 /// Runs one operation; the Entities of its answer and the result count.
-async fn run(
+pub(crate) async fn run(
     reads: &Reads,
     caller: &Caller,
     op: OperationId,
@@ -646,7 +673,7 @@ async fn run(
 /// One NGSI-LD Entity, as normalized JSON keyed by the core context and the
 /// filter's terms, as the members of `set` (or the `picked` ones) and the
 /// expanded navigation members.
-fn entity_value(
+pub(crate) fn entity_value(
     reads: &Reads,
     set_name: &str,
     set: &Set,
@@ -750,7 +777,7 @@ fn expansion(reads: &Reads, e: &Expansion, instance: Option<&Value>, filter: &Tr
 
 /// The object URIs of a Relationship instance: `object` (one or many) or a
 /// ListRelationship's `objectList`.
-fn objects(instance: Option<&Value>) -> Vec<String> {
+pub(crate) fn objects(instance: Option<&Value>) -> Vec<String> {
     let Some(instance) = instance else {
         return Vec::new();
     };
@@ -792,7 +819,7 @@ fn visible_types(edm: &Edm, doc: &Value) -> Vec<String> {
 }
 
 /// The instance without a `datasetId` (S3), else the first.
-fn default_instance(attr: Option<&Value>) -> Option<&Value> {
+pub(crate) fn default_instance(attr: Option<&Value>) -> Option<&Value> {
     match attr? {
         Value::Array(instances) => instances
             .iter()
@@ -803,7 +830,7 @@ fn default_instance(attr: Option<&Value>) -> Option<&Value> {
 }
 
 /// The OData value of one Attribute instance (rows P1 to P7, R5).
-fn member_value(shape: &Shape, instance: Option<&Value>) -> Value {
+pub(crate) fn member_value(shape: &Shape, instance: Option<&Value>) -> Value {
     let member = |names: &[&str]| {
         names
             .iter()
@@ -846,7 +873,7 @@ fn plain(value: Value) -> Value {
     }
 }
 
-fn set_of<'r>(
+pub(crate) fn set_of<'r>(
     reads: &'r Reads,
     name: &str,
     version: ODataVersion,
@@ -855,7 +882,7 @@ fn set_of<'r>(
     reads.edm.sets.get(name).ok_or_else(|| not_found(version))
 }
 
-fn resource<'r>(
+pub(crate) fn resource<'r>(
     reads: &'r Reads,
     name: &str,
     version: ODataVersion,
@@ -874,7 +901,7 @@ fn max_page(headers: &HeaderMap, max_len: usize) -> u64 {
 }
 
 /// Percent-encodes everything but RFC 3986 unreserved characters.
-fn encode(raw: &str) -> String {
+pub(crate) fn encode(raw: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(raw.len());
     for b in raw.bytes() {
@@ -893,6 +920,7 @@ fn refused(status: StatusCode, version: ODataVersion) -> ODataErrorResponse {
     let code = match status {
         StatusCode::NOT_FOUND => "NotFound",
         StatusCode::FORBIDDEN => "Forbidden",
+        StatusCode::METHOD_NOT_ALLOWED => "MethodNotAllowed",
         StatusCode::BAD_REQUEST => "BadRequest",
         StatusCode::SERVICE_UNAVAILABLE => "ServiceUnavailable",
         _ => "InternalError",
@@ -900,12 +928,12 @@ fn refused(status: StatusCode, version: ODataVersion) -> ODataErrorResponse {
     ODataErrorResponse::new(status, code, "the request was refused").with_version(version)
 }
 
-fn not_found(version: ODataVersion) -> ODataErrorResponse {
+pub(crate) fn not_found(version: ODataVersion) -> ODataErrorResponse {
     ODataErrorResponse::new(StatusCode::NOT_FOUND, "NotFound", "no such resource")
         .with_version(version)
 }
 
-fn not_implemented(version: ODataVersion) -> ODataErrorResponse {
+pub(crate) fn not_implemented(version: ODataVersion) -> ODataErrorResponse {
     ODataErrorResponse::new(
         StatusCode::NOT_IMPLEMENTED,
         "NotImplemented",

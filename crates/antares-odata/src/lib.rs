@@ -22,6 +22,7 @@
 pub mod edm;
 mod filter;
 mod names;
+mod paths;
 mod read;
 
 use antares_ops::{Caller, Ops, Surface, ViewOps};

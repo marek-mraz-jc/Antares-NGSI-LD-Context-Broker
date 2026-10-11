@@ -9,6 +9,7 @@ GET  /x/views/{view}/odata/v4/$metadata
 GET  /x/views/{view}/odata/v4/{EntitySet}
 GET  /x/views/{view}/odata/v4/{EntitySet}('{id}')
 GET  /x/views/{view}/odata/v4/{EntitySet}/$count
+GET  /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property or navigation}
 POST /x/views/{view}/odata/v4/{EntitySet}/$query
 ```
 
@@ -48,6 +49,9 @@ root.
 | `{Set}` | Query Entities (`type`), `count=true` |
 | `{Set}('{id}')`, `{Set}(id='{id}')` | Retrieve Entity |
 | `{Set}/$count` | Query Entities, `limit=0&count=true`, `text/plain` |
+| `{Set}('{id}')/{prop}`, `.../{prop}/$value` | Retrieve Attribute Value (the view's `operations` name `retrieve_attribute_value`); `$value` is `text/plain` |
+| `{Set}('{id}')/{nav}` | Retrieve Entity of the source, then Retrieve Entity of a single target or Query Entities `id=…` of up to 1000 |
+| `{Set}('{id}')/{nav}/$ref` | the Relationship's objects as entity references |
 | `POST {Set}/$query` | the same `GET`: the body's options (`text/plain` or a form) joined to the URL's |
 | `$filter` | `q` and `id` (section 3) |
 | `$orderby` | `orderBy` on `id` and single-valued values, `;desc` |
@@ -55,6 +59,11 @@ root.
 | `$expand` | `join=inline&joinLevel=1` (section 4) |
 | `$top`, `$skip`, `Prefer: odata.maxpagesize` | `limit`, `offset`; a page is at most 1000, 100 by default |
 | `$count=true` | `@odata.count` from `NGSILD-Results-Count` |
+
+Below one Entity only `$select` applies; another option there is `501`. A
+hidden or absent property or single target is `404`, a hidden target of a
+collection navigation is left out, and an operation the view does not offer
+is `405` `MethodNotAllowed`.
 
 A page that leaves rows carries `@odata.nextLink` with a `$skiptoken`. The
 token is bound to the view and the query: a token beside `$skip`/`$top`,
