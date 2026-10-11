@@ -549,3 +549,85 @@ async fn batch_create_and_delete(app: &axum::Router) -> Result<(), String> {
     );
     Ok(())
 }
+
+/// Batch Upsert (10.3.3) through `fleet`, member by member (T-3594): an
+/// absent id is created in the view or refused, a stored one in the view is
+/// replaced only when it holds nothing the view hides (D6), and one out of
+/// the view is never overwritten: it answers as a create of a taken id does.
+#[tokio::test(flavor = "multi_thread")]
+async fn views_batch_upsert_is_decided_per_entity() -> Result<(), String> {
+    let f = fixture().await?;
+    let car = |n: &str, speed: u32| json!({"id": format!("urn:ngsi-ld:Car:{n}"), "type": "Car", "speed": prop(&json!(speed))});
+    let upsert = "/entityOperations/upsert";
+
+    // every member created in the view: 201, S the created ids
+    let a = write(&f.app, Method::POST, upsert, Some(&json!([car("24", 1)]))).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.text);
+    assert_eq!(a.json, json!(["urn:ngsi-ld:Car:24"]), "{}", a.text);
+
+    let body = json!([
+        car("24", 2),
+        car("1", 5),
+        car("3", 1),
+        car("0", 1),
+        car("23", 99)
+    ]);
+    let a = write(&f.app, Method::POST, upsert, Some(&body)).await;
+    assert_eq!(a.status, StatusCode::MULTI_STATUS, "{}", a.text);
+    assert_eq!(
+        a.json.get("success"),
+        Some(&json!(["urn:ngsi-ld:Car:24", "urn:ngsi-ld:Car:0"])),
+        "{}",
+        a.text
+    );
+    assert_eq!(
+        at(entry(&a, "urn:ngsi-ld:Car:1"), "/error/detail"),
+        NOT_WRITABLE,
+        "a replace would delete the hidden secret: {}",
+        a.text
+    );
+    assert_eq!(
+        at(entry(&a, "urn:ngsi-ld:Car:3"), "/error/status"),
+        409,
+        "{}",
+        a.text
+    );
+    assert_eq!(
+        at(entry(&a, "urn:ngsi-ld:Car:23"), "/error/detail"),
+        MOVES_OUT,
+        "{}",
+        a.text
+    );
+    assert_eq!(value(&f.app, "urn:ngsi-ld:Car:24", "speed").await, 2);
+    assert_eq!(value(&f.app, "urn:ngsi-ld:Car:0", "speed").await, 1);
+    assert_eq!(value(&f.app, "urn:ngsi-ld:Car:1", "speed").await, 10);
+    assert_eq!(value(&f.app, "urn:ngsi-ld:Car:1", "secret").await, 1);
+    assert_eq!(value(&f.app, "urn:ngsi-ld:Car:3", "speed").await, 90);
+    assert_eq!(
+        stored(&f.app, "urn:ngsi-ld:Car:23").await.status,
+        StatusCode::NOT_FOUND
+    );
+
+    // options=update writes only what it names: the hidden secret stays
+    let a = write(
+        &f.app,
+        Method::POST,
+        &format!("{upsert}?options=update"),
+        Some(&json!([car("1", 6)])),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.text);
+    assert_eq!(value(&f.app, "urn:ngsi-ld:Car:1", "speed").await, 6);
+    assert_eq!(value(&f.app, "urn:ngsi-ld:Car:1", "secret").await, 1);
+
+    // the post-image decides: a replace out of the view is refused
+    let a = write(&f.app, Method::POST, upsert, Some(&json!([car("24", 95)]))).await;
+    assert_eq!(
+        at(entry(&a, "urn:ngsi-ld:Car:24"), "/error/detail"),
+        MOVES_OUT,
+        "{}",
+        a.text
+    );
+    assert_eq!(value(&f.app, "urn:ngsi-ld:Car:24", "speed").await, 2);
+    Ok(())
+}

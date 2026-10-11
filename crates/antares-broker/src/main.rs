@@ -500,6 +500,8 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("views", || antares_ops::mount(antares_views::Views)),
     #[cfg(feature = "mcp")]
     ("mcp", || antares_ops::mount(antares_mcp::Mcp)),
+    #[cfg(feature = "odata")]
+    ("odata", || antares_ops::mount(antares_odata::OData)),
     #[cfg(feature = "ws")]
     ("ws", || antares_ops::mount(antares_ws::Ws::process())),
     #[cfg(all(feature = "ws", feature = "views"))]

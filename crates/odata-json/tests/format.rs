@@ -16,6 +16,7 @@ mod headers {
             service_root: ROOT,
             level: MetadataLevel::Minimal,
             version: ODataVersion::V4_0,
+            metadata_etag: None,
         }
     }
 

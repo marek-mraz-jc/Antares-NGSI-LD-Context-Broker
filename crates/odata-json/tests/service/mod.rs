@@ -168,6 +168,7 @@ pub fn ctx(level: MetadataLevel, version: ODataVersion) -> Ctx<'static> {
         service_root: ROOT,
         level,
         version,
+        metadata_etag: None,
     }
 }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! `ViewOps::offered`, `ViewOps::shown_names` and
-//! `ViewOps::shows_every_name` (MCP D-3, D-4, ADR-0023 rule 12): what a
+//! `ViewOps::offered`, `ViewOps::shown_names`, `ViewOps::shown_by_type` and
+//! `ViewOps::shows_every_name` (MCP D-3, D-4, `OData` 3.1, ADR-0023 rule 12):
+//! what a
 //! surface may list for a caller is the view's allowlist filtered by one
 //! fail-closed engine probe, and the names it may offer are the view's, or
 //! every name for a view of `*`.
@@ -29,7 +30,8 @@ const ASKED: [OperationId; 4] = [
 ];
 
 /// `/x/offers/{view}/offered` answers `ViewOps::offered` for [`ASKED`],
-/// `/x/offers/{view}/names` answers `ViewOps::shown_names` and
+/// `/x/offers/{view}/names` answers `ViewOps::shown_names`,
+/// `/x/offers/{view}/by-type` `ViewOps::shown_by_type` and
 /// `/x/offers/{view}/every` `ViewOps::shows_every_name`.
 struct Offers;
 
@@ -46,11 +48,18 @@ impl Surface for Offers {
     fn router(&self, ops: Ops) -> Router {
         let names = ops.clone();
         let every = ops.clone();
+        let by_type = ops.clone();
         Router::new()
             .route(
                 "/{view}/every",
                 get(move |Path(id): Path<String>| async move {
                     axum::Json(json!(every.view(&id).map(|v| v.shows_every_name())))
+                }),
+            )
+            .route(
+                "/{view}/by-type",
+                get(move |Path(id): Path<String>| async move {
+                    axum::Json(json!(by_type.view(&id).map(|v| v.shown_by_type())))
                 }),
             )
             .route(
@@ -204,6 +213,22 @@ async fn the_names_offered_are_the_ones_the_view_shows() -> Result<(), String> {
         get_json(&app, "/x/offers/all/names").await,
         json!([[], []]),
         "a view of `*` lists no name: a surface offers every one by its syntax"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_type_shows_the_union_of_its_rules_as_iris() -> Result<(), String> {
+    let (_b, app) = broker(None).await?;
+    let core = "https://uri.etsi.org/ngsi-ld/default-context/";
+    assert_eq!(
+        get_json(&app, "/x/offers/cars/by-type").await,
+        json!({format!("{core}Car"): ["https://example.org/odd", format!("{core}speed")]}),
+        "expanded, each name once; Bike has no rule and is absent"
+    );
+    assert_eq!(
+        get_json(&app, "/x/offers/nosuch/by-type").await,
+        Value::Null
     );
     Ok(())
 }

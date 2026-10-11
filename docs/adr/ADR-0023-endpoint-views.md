@@ -188,6 +188,20 @@ per-member call the matrix recommends (section 8, item 6) inside one engine
 call (ADR-0014 rule 1). A Relationship write (any write of a Relationship
 Attribute) requires the target Entity to be visible in the view as well.
 
+Batch Upsert (10.3.3) splits each member under the store's lock (T-3594).
+A stored Entity in the view is replaced, or with `options=update` updated,
+between the pre-image and post-image checks; a replace counts every
+Attribute the Entity holds as written, because it deletes the ones it
+omits, so an Entity holding a hidden Attribute is refused (threat model
+D6). An absent id, and one out of the view, take the create half: the
+Entity is created in the view or refused with 403, and an out-of-view one
+is never overwritten. Its create answers 409, the exception rule 3 names
+for a create of a taken id. Decided (worker-2, owner may override): the
+create half for an out-of-view id, because overwriting it would replace an
+Entity the caller cannot see and a 404 would deny a create the operation
+promises; options: 409 through the create half, 404 as for a write naming
+the id.
+
 ### 8. Temporal: membership by current state, limits after the allowlist
 
 A temporal request (11.3.2, 11.3.3) serves the history of the Entities the

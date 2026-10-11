@@ -27,12 +27,13 @@ Tenant:
 | 11.3.2, 11.3.3 | Temporal Retrieve and Query |
 | 13.3 | List @contexts: the core context only |
 | 10.2.2 to 10.2.11, but 10.2.12 Purge | Create, Update, Append, Partial Update, Set Value, Delete Attribute, Delete, Merge, Replace Entity, Replace Attribute |
-| 10.3.2, 10.3.4 to 10.3.6 | Batch create, update, merge and delete, member by member |
+| 10.3.2 to 10.3.6 | Batch create, upsert, update, merge and delete, member by member |
 | 10.5.2 to 10.5.6 | Create, Update, Retrieve, Query and Delete Subscription |
 
 A view serves an operation only when its `operations` list names it.
-Batch Upsert, Purge and the temporal writes are not served through a
-view.
+Purge and the temporal writes are not served through a view. A Batch
+Upsert member that exists out of the view is never overwritten: it takes
+the create half and answers 409, as a create of a taken id does.
 
 A view may select every type and show every Attribute with one form:
 `"selector": ["*"]` and the single rule `{"types": ["*"], "attributes":

@@ -44,15 +44,15 @@ pub const PREFIX: &str = "/x/views";
 /// rules 1 to 3, 5, 6 and 8) and the writes the broker checks on the stored
 /// Entity (rule 7), batches member by member, and the Subscriptions made
 /// through it (rule 9). A view that allows any other
-/// operation (Purge, Batch Upsert, the temporal writes) answers it with 405
-/// or 422.
-pub const SERVED: [OperationId; 33] = [
+/// operation (Purge, the temporal writes) answers it with 405 or 422.
+pub const SERVED: [OperationId; 34] = [
     OperationId::CreateSubscription,
     OperationId::UpdateSubscription,
     OperationId::RetrieveSubscription,
     OperationId::QuerySubscriptions,
     OperationId::DeleteSubscription,
     OperationId::BatchCreate,
+    OperationId::BatchUpsert,
     OperationId::BatchUpdate,
     OperationId::BatchMerge,
     OperationId::BatchDelete,
