@@ -8,6 +8,8 @@
 mod shutdown;
 mod telemetry;
 mod wiring;
+#[cfg(feature = "ws")]
+mod ws_relay;
 
 use antares_api::AppState;
 
@@ -41,6 +43,21 @@ const KNOWN_KEYS: &[&str] = &[
     antares_mcp::ALLOWED_ORIGINS_ENV,
     #[cfg(feature = "mcp")]
     antares_mcp::MAX_RESULT_BYTES_ENV,
+    // The WebSocket channel's bounds (ADR-0026 rules 6 to 10).
+    #[cfg(feature = "ws")]
+    antares_ws::QUEUE_ENV,
+    #[cfg(feature = "ws")]
+    antares_ws::RESUME_GRACE_ENV,
+    #[cfg(feature = "ws")]
+    antares_ws::MAX_LIFETIME_ENV,
+    #[cfg(feature = "ws")]
+    antares_ws::MAX_CONNECTIONS_ENV,
+    #[cfg(feature = "ws")]
+    antares_ws::MAX_CONNECTIONS_PER_TENANT_ENV,
+    #[cfg(feature = "ws")]
+    antares_ws::MAX_SUBSCRIPTIONS_ENV,
+    #[cfg(feature = "ws")]
+    antares_ws::ALLOWED_ORIGINS_ENV,
     "ANTARES_DATABASE_URL",
     "ANTARES_STORE",
     // Temporal driver: a store mode, or `none` — history off (temporal
@@ -477,6 +494,12 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("views", || antares_ops::mount(antares_views::Views)),
     #[cfg(feature = "mcp")]
     ("mcp", || antares_ops::mount(antares_mcp::Mcp)),
+    #[cfg(feature = "ws")]
+    ("ws", || antares_ops::mount(antares_ws::Ws::process())),
+    #[cfg(all(feature = "ws", feature = "views"))]
+    ("ws-views", || {
+        antares_ops::mount(antares_ws::ViewWs::process())
+    }),
     #[cfg(feature = "plugin-example")]
     ("example", || {
         Box::new(antares_plugin_example::ExampleSurface)
@@ -924,7 +947,16 @@ async fn run(
     // edit. It is not in a release build — the feature is off by default,
     // so the shipped binary serves network schemes only.
     #[cfg(feature = "plugin-example")]
-    let mut state = state.with_sink(Box::new(antares_plugin_example::MemorySink::new()));
+    let state = state.with_sink(Box::new(antares_plugin_example::MemorySink::new()));
+    // The WebSocket channel (ADR-0026): its sink beside HTTP and MQTT, over
+    // the hub its two surfaces share. A mistyped bound stops the broker.
+    #[cfg(feature = "ws")]
+    let state = {
+        antares_ws::Limits::from_env(|k| std::env::var(k).ok())?;
+        state.with_sink(Box::new(antares_ws::Sink::new(antares_ws::Hub::process())))
+    };
+    #[cfg(any(feature = "plugin-example", feature = "ws"))]
+    let mut state = state;
     // /q/metrics renders through this closure (None without the
     // `telemetry` feature — the endpoint answers 404); the sampler feeds
     // the process-level gauges the whole run.
@@ -952,7 +984,13 @@ async fn run(
         // consumers per role, topology asserted before traffic.
         let url = std::env::var("ANTARES_NATS_URL")
             .map_err(|_| "ANTARES_BUS=nats requires ANTARES_NATS_URL")?;
-        wiring::wire_nats(&mut state, &url, roles).await?;
+        let bus = wiring::wire_nats(&mut state, &url, roles).await?;
+        // ADR-0026 rule 5: a notifier pod reaches the socket another pod
+        // holds over core NATS request/reply.
+        #[cfg(feature = "ws")]
+        antares_ws::Hub::process().set_relay(std::sync::Arc::new(ws_relay::NatsRelay::new(bus)));
+        #[cfg(not(feature = "ws"))]
+        drop(bus);
     } else {
         antares_api::wire(&mut state).await; // in-process matcher + notifier + interval firing
     }
@@ -1273,7 +1311,10 @@ fn serve(
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(header_read_timeout)
             .title_case_headers(true);
-        let conn = builder.serve_connection(hyper_util::rt::TokioIo::new(stream), svc);
+        // With upgrades: a WebSocket surface answers 101 and takes the
+        // stream (ADR-0026); without an upgrading route nothing changes.
+        let conn =
+            builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), svc);
         let mut conn = std::pin::pin!(conn);
         // On drain, close an IDLE keep-alive connection immediately —
         // hyper finishes any active request first, then closes. Without this
@@ -1717,7 +1758,7 @@ mod api_surface_tests {
     /// surface feature the shelf is the admin surface alone, and a path of
     /// every surface prefix (ADR-0023 to ADR-0027) is unrouted. A surface
     /// that lands without its feature gate turns this red.
-    #[cfg(not(any(feature = "plugin-example", feature = "views")))]
+    #[cfg(not(any(feature = "plugin-example", feature = "views", feature = "ws")))]
     #[tokio::test]
     async fn the_vanilla_shelf_is_admin_alone() {
         use tower::ServiceExt;
