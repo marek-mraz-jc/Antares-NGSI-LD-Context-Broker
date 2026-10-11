@@ -18,9 +18,11 @@ const SCHEMA: &str = r#"{
   "prefixes": {"city": {"prefix_prefix": "city", "prefix_reference": "https://example.org/city/"}},
   "default_prefix": "city",
   "classes": {"Car": {"slots": ["speed", "label", "owner", "drivers", "garage", "location", "notes", "colour",
-                                "route", "tags"]},
+                                "route", "tags", "ownerRef"]},
               "Person": {"slots": ["name"]}, "Garage": {"slots": ["name"]}},
-  "slots": {"speed": {"range": "float"}, "label": {"range": "string"}, "owner": {"range": "Person"},
+  "slots": {"speed": {"range": "float"}, "label": {"range": "string"}, "owner": {"range": "Person", "annotations": {"odata_referential_constraint":
+                      {"tag": "odata_referential_constraint", "value": "ownerRef"}}},
+            "ownerRef": {"range": "string"},
             "name": {}, "garage": {"range": "Garage"}, "drivers": {"range": "Person", "multivalued": true},
             "location": {"annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}}},
             "notes": {"annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "JsonProperty"}}},
@@ -106,7 +108,8 @@ pub async fn city_on(b: TestBroker) -> Result<(TestBroker, Router), String> {
             "scopeQ": "/a",
             "rules": [{"types": ["city:Car"],
                        "attributes": ["city:speed", "city:label", "city:owner", "city:drivers", "city:garage",
-                                      "city:location", "city:notes", "city:colour", "city:route", "city:tags"]},
+                                      "city:location", "city:notes", "city:colour", "city:route", "city:tags",
+                                      "city:ownerRef"]},
                       {"types": ["city:Person"], "attributes": ["city:name"]}],
             "operations": operations
         });

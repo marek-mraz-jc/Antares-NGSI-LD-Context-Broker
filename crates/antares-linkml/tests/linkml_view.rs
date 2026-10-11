@@ -4,7 +4,7 @@
 //! names, and how it refuses.
 
 use antares_ops::policy::{
-    Decision, DecisionFuture, Filter, NotifyDecision, Operation, PolicyEngine, Subject,
+    Decision, DecisionFuture, Filter, NotifyDecision, Operation, PolicyEngine, Rule, Subject,
 };
 use antares_ops::test_kit::TestBroker;
 use axum::body::Body;
@@ -413,7 +413,7 @@ async fn an_oversized_schema_is_refused_and_the_surface_stays_closed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_schema_outside_the_subset_or_none_closes_the_surface() {
     let mut outside = schema();
-    outside["imports"] = json!(["linkml:types"]);
+    outside["imports"] = json!(["https://w3id.org/biolink/biolink-model"]);
     let app = broker(None, &view(&READS), Some(&outside))
         .await
         .expect("a broker");
@@ -594,4 +594,53 @@ async fn linkml_a_view_of_everything_serves_every_class_and_slot() {
         None,
         "nothing is left out"
     );
+}
+
+/// Grants the whole Car Entity, as a Policy naming the type without
+/// `propertyNames` does (`Rule::every_attribute`, T-3637).
+struct WholeCar;
+
+impl PolicyEngine for WholeCar {
+    fn name(&self) -> &'static str {
+        "whole-car"
+    }
+    fn decide<'a>(&'a self, _: &'a Subject, _: &'a Operation<'a>) -> DecisionFuture<'a> {
+        Box::pin(std::future::ready(Decision::Filter(Filter {
+            rules: vec![Rule {
+                types: vec!["https://e.org/city/Car".into()],
+                every_attribute: true,
+                ..Rule::default()
+            }],
+            ..Filter::default()
+        })))
+    }
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// T-3798: under a grant over the whole Entity a view of `*` (ADR-0023
+/// rule 12, no rule of its own) keeps every slot of the granted class, and
+/// no class the grant does not name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grant_over_the_whole_entity_keeps_every_slot_of_its_class() {
+    let all = json!({
+      "id": "cars", "tenant": "city", "selector": ["*"],
+      "rules": [{"types": ["*"], "attributes": ["*"]}],
+      "operations": READS
+    });
+    let app = broker(Some(Arc::new(WholeCar)), &all, Some(&schema()))
+        .await
+        .expect("a broker");
+    let (s, _, car) = get(&app, "classes/Car").await;
+    assert_eq!(s, StatusCode::OK, "{car}");
+    let car: Value = serde_json::from_str(&car).expect("json");
+    let slots: Vec<&str> = car["slots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert_eq!(slots, ["speed", "owner", "fuel", "owner_secret"], "{car}");
+    assert_eq!(get(&app, "classes/Person").await.0, StatusCode::NOT_FOUND);
 }

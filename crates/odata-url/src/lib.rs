@@ -227,5 +227,31 @@ fn escapes(out: &str, plain: u8) -> bool {
             || (before == Some(&b'%') && last.is_some_and(u8::is_ascii_hexdigit)))
 }
 
+/// `text` with each `%XX` decoded: a value as written in a URL, read as meant (a `$format`
+/// media type, T-3742). `None` for a `%` without two hex digits after it, or bytes that are no
+/// UTF-8.
+///
+/// ```
+/// use odata_url::percent_decoded;
+/// assert_eq!(percent_decoded("application%2Fjson%3Bodata.metadata%3Dnone").as_deref(),
+///            Some("application/json;odata.metadata=none"));
+/// assert_eq!(percent_decoded("a%2"), None);
+/// assert_eq!(percent_decoded("%FF"), None);
+/// ```
+#[must_use]
+pub fn percent_decoded(text: &str) -> Option<String> {
+    let mut c = cursor::Cursor::new(text);
+    let mut out = Vec::with_capacity(text.len());
+    while let Some(b) = c.peek() {
+        if b == b'%' {
+            out.push(literal::pct_encoded(&mut c)?);
+        } else {
+            out.push(b);
+            c.advance(1);
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 #[cfg(test)]
 mod tests;
