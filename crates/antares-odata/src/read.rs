@@ -15,7 +15,9 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use odata_axum::{json_level, json_response, ODataErrorResponse, ODataRequest, ODataState};
 use odata_json::{write_collection, write_entity, Ctx, EntityValue, ODataVersion, Page, Resource};
-use odata_url::{Key, KeyValue, Literal, ODataUri, QueryOptions, Segment, SelectItem};
+use odata_url::{
+    ExpandKind, ExpandPath, Key, KeyValue, Literal, ODataUri, QueryOptions, Segment, SelectItem,
+};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -79,7 +81,6 @@ fn later(uri: &ODataUri) -> Option<&'static str> {
         return Some("this resource is not served");
     };
     let refused = [
-        (options.expand.is_some(), "$expand"),
         (options.id.is_some(), "$id"),
         (
             options.schemaversion.as_deref().is_some_and(|v| v != "*"),
@@ -92,11 +93,14 @@ fn later(uri: &ODataUri) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
-/// The members `$select` names, `None` for every member. A path through a
-/// complex property, a navigation property or an annotation is a later
-/// round's.
-fn selected<'s>(set: &'s Set, options: &'s QueryOptions) -> Result<Option<Vec<&'s str>>, ()> {
-    let Some(items) = &options.select else {
+/// The members a `$select` list names, `None` for every member. A path
+/// through a complex property, a navigation property or an annotation is a
+/// later round's.
+fn selected<'s>(
+    set: &'s Set,
+    select: Option<&'s Vec<SelectItem>>,
+) -> Result<Option<Vec<&'s str>>, ()> {
+    let Some(items) = select else {
         return Ok(None);
     };
     let mut names = Vec::new();
@@ -121,10 +125,134 @@ fn selected<'s>(set: &'s Set, options: &'s QueryOptions) -> Result<Option<Vec<&'
     Ok(Some(names))
 }
 
+/// What one `$expand` item writes.
+enum Writes<'s> {
+    /// `/$ref`: an entity reference per target, under this id member.
+    Refs(&'static str),
+    /// The targets, projected by the nested `$select` (`None` for all).
+    Entities(Option<Vec<&'s str>>),
+}
+
+/// One navigation member `$expand` names, one level deep (Q3, Q6 to Q8).
+struct Expansion<'s> {
+    name: &'s str,
+    iri: &'s str,
+    target_name: &'s str,
+    target: &'s Set,
+    collection: bool,
+    writes: Writes<'s>,
+}
+
+/// The `$expand` items of a request. `*` names every navigation member,
+/// a named item overrides it. A nested `$expand`, `$levels` or a path
+/// through a complex property is a later round's.
+fn expanded<'s>(
+    edm: &'s Edm,
+    set: &'s Set,
+    options: &'s QueryOptions,
+    version: ODataVersion,
+) -> Result<Vec<Expansion<'s>>, ()> {
+    let mut out: Vec<Expansion<'s>> = Vec::new();
+    for item in options.expand.iter().flatten() {
+        let named = match &item.path {
+            ExpandPath::Star => None,
+            ExpandPath::Path(path) => match path.as_slice() {
+                [name] => Some(name.as_str()),
+                _ => return Err(()),
+            },
+        };
+        let select = match &item.kind {
+            ExpandKind::Ref => None,
+            ExpandKind::Entities {
+                select,
+                expand: None,
+                levels: None,
+            } => select.as_ref(),
+            ExpandKind::Entities { .. } => return Err(()),
+        };
+        for (name, member) in &set.members {
+            let Shape::Nav { target, collection } = &member.shape else {
+                continue;
+            };
+            if named.is_some_and(|n| n != name) {
+                continue;
+            }
+            if named.is_none() && out.iter().any(|e| e.name == name) {
+                continue;
+            }
+            out.retain(|e| e.name != name);
+            let target_set = edm.sets.get(target).ok_or(())?;
+            let writes = match item.kind {
+                ExpandKind::Ref => Writes::Refs(match version {
+                    ODataVersion::V4_0 => "@odata.id",
+                    ODataVersion::V4_01 => "@id",
+                }),
+                ExpandKind::Entities { .. } => Writes::Entities(selected(target_set, select)?),
+            };
+            out.push(Expansion {
+                name,
+                iri: &member.iri,
+                target_name: target,
+                target: target_set,
+                collection: *collection,
+                writes,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The names the context URL lists (JSON Format 10.9): the selected ones
+/// and each expanded member, `owner()` or `owner(name)`; 4.0 lists an
+/// expansion only with a nested `$select`.
+fn listed(picked: Option<&[&str]>, expansions: &[Expansion], version: ODataVersion) -> Vec<String> {
+    let mut names: Vec<String> = picked
+        .into_iter()
+        .flatten()
+        .map(|n| (*n).to_owned())
+        .collect();
+    for e in expansions {
+        match (&e.writes, version) {
+            (Writes::Entities(Some(nested)), _) => {
+                names.push(format!("{}({})", e.name, nested.join(",")));
+            }
+            (Writes::Entities(None), ODataVersion::V4_01) => names.push(format!("{}()", e.name)),
+            _ => {}
+        }
+    }
+    names
+}
+
 /// The NGSI-LD query of an EntitySet: its type, the Attributes selected
-/// (`attrs`, which takes IRIs; the core members always come), the system
-/// members only when selected (E6).
-fn query(set: &Set, picked: Option<&[&str]>, filter: &Translated) -> String {
+/// (`attrs`, which takes IRIs; the core members always come, and the
+/// expanded Relationships), the system members only when selected (E6),
+/// `join=inline` one level deep for an expansion of entities. A join
+/// follows every Relationship it is given (4.5.23), so it names the
+/// structural members and the expanded ones: a navigation not expanded
+/// spends none of the walk's lookups.
+fn query(
+    set: &Set,
+    picked: Option<&[&str]>,
+    expansions: &[Expansion],
+    filter: &Translated,
+) -> String {
+    let nested = expansions.iter().filter_map(|e| match &e.writes {
+        Writes::Entities(picked) => Some(picked.as_deref()),
+        Writes::Refs(_) => None,
+    });
+    let structural: Vec<&str>;
+    let picked = match picked {
+        None if nested.clone().count() > 0 => {
+            structural = set
+                .members
+                .iter()
+                .filter(|(_, m)| !matches!(m.shape, Shape::Nav { .. }))
+                .map(|(name, _)| name.as_str())
+                .collect();
+            Some(structural.as_slice())
+        }
+        picked => picked,
+    };
     let mut q = format!("type={}", encode(&set.type_iri));
     if let Some(ids) = &filter.ids {
         let ids: Vec<String> = ids.iter().map(|id| encode(id)).collect();
@@ -143,18 +271,23 @@ fn query(set: &Set, picked: Option<&[&str]>, filter: &Translated) -> String {
         let attrs: Vec<String> = names
             .iter()
             .filter_map(|name| set.members.get(*name))
-            .map(|m| encode(&m.iri))
+            .map(|m| m.iri.as_str())
+            .chain(expansions.iter().map(|e| e.iri))
+            .map(encode)
             .collect();
         if !attrs.is_empty() {
             q.push_str("&attrs=");
             q.push_str(&attrs.join(","));
         }
-        if names
-            .iter()
-            .any(|m| matches!(*m, "createdAt" | "modifiedAt"))
-        {
-            q.push_str("&options=sysAttrs");
-        }
+    }
+    let system = |names: Option<&[&str]>| {
+        names.is_some_and(|n| n.iter().any(|m| matches!(*m, "createdAt" | "modifiedAt")))
+    };
+    if system(picked) || nested.clone().any(system) {
+        q.push_str("&options=sysAttrs");
+    }
+    if nested.count() > 0 {
+        q.push_str("&join=inline&joinLevel=1");
     }
     q
 }
@@ -170,7 +303,9 @@ async fn collection(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
-    let picked = selected(set, options).map_err(|()| not_implemented(version))?;
+    let picked = selected(set, options.select.as_ref()).map_err(|()| not_implemented(version))?;
+    let expansions =
+        expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
     let filter = filtered(set, options, version)?;
     let digest = digest(&reads.state.service_root, path, options);
     let (skip, top) = match &options.skiptoken {
@@ -187,7 +322,7 @@ async fn collection(
         .min(MAX_PAGE);
     let target = format!(
         "/ngsi-ld/v1/entities?{}&limit={page}&offset={skip}&count=true",
-        query(set, picked.as_deref(), &filter),
+        query(set, picked.as_deref(), &expansions, &filter),
     );
     let (docs, total) = run(
         reads,
@@ -200,7 +335,17 @@ async fn collection(
     .await?;
     let entities: Vec<EntityValue> = docs
         .iter()
-        .map(|doc| entity_value(reads, set_name, set, doc, picked.as_deref(), &filter))
+        .map(|doc| {
+            entity_value(
+                reads,
+                set_name,
+                set,
+                doc,
+                picked.as_deref(),
+                &expansions,
+                &filter,
+            )
+        })
         .collect();
     let served = u64::try_from(entities.len()).unwrap_or(u64::MAX);
     let next = skip.saturating_add(served);
@@ -222,12 +367,13 @@ async fn collection(
         };
         format!("{}{uri}", reads.state.service_root)
     });
-    let names = picked.unwrap_or_default();
+    let names = listed(picked.as_deref(), &expansions, version);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let resource = resource(reads, set_name, version)?;
-    let resource = if options.select.is_some() && !names.is_empty() {
-        resource.select(&names)
-    } else {
+    let resource = if names.is_empty() {
         resource
+    } else {
+        resource.select(&names)
     };
     let page = Page {
         count: (options.count == Some(true)).then_some(total),
@@ -250,7 +396,7 @@ async fn count(
     let filter = filtered(set, options, version)?;
     let target = format!(
         "/ngsi-ld/v1/entities?{}&limit=0&count=true",
-        query(set, None, &filter)
+        query(set, None, &[], &filter)
     );
     let (_, total) = run(
         reads,
@@ -282,12 +428,14 @@ async fn entity(
     if options.filter.is_some() {
         return Err(not_implemented(version));
     }
-    let picked = selected(set, options).map_err(|()| not_implemented(version))?;
+    let picked = selected(set, options.select.as_ref()).map_err(|()| not_implemented(version))?;
+    let expansions =
+        expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
     let id = key_id(key, options).ok_or_else(|| not_found(version))?;
     let target = format!(
         "/ngsi-ld/v1/entities/{}?{}",
         encode(&id),
-        query(set, picked.as_deref(), &Translated::default()),
+        query(set, picked.as_deref(), &expansions, &Translated::default()),
     );
     let none = Translated::default();
     let (docs, _) = run(
@@ -300,8 +448,17 @@ async fn entity(
     )
     .await?;
     let doc = docs.first().ok_or_else(|| not_found(version))?;
-    let value = entity_value(reads, set_name, set, doc, picked.as_deref(), &none);
-    let names = picked.unwrap_or_default();
+    let value = entity_value(
+        reads,
+        set_name,
+        set,
+        doc,
+        picked.as_deref(),
+        &expansions,
+        &none,
+    );
+    let names = listed(picked.as_deref(), &expansions, version);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let resource = resource(reads, set_name, version)?;
     let resource = if names.is_empty() {
         resource
@@ -448,6 +605,22 @@ async fn run(
     if !answer.status().is_success() {
         return Err(refused(answer.status(), version));
     }
+    // The join walk stopped at the broker's lookup budget (4.5.23.1): an
+    // OData client cannot see the NGSI-LD warning, so a partial expansion
+    // is refused (S1, O6, D9).
+    let truncated = answer
+        .headers()
+        .get_all("NGSILD-Warning")
+        .iter()
+        .any(|w| w.as_bytes().windows(9).any(|at| at == b"truncated"));
+    if truncated {
+        return Err(ODataErrorResponse::new(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "the expansion reaches more Entities than one answer embeds: narrow it with $top or $filter",
+        )
+        .with_version(version));
+    }
     let total = answer
         .headers()
         .get("NGSILD-Results-Count")
@@ -468,14 +641,15 @@ async fn run(
 }
 
 /// One NGSI-LD Entity, as normalized JSON keyed by the core context and the
-/// filter's terms, as
-/// the members of `set` (or the `picked` ones).
+/// filter's terms, as the members of `set` (or the `picked` ones) and the
+/// expanded navigation members.
 fn entity_value(
     reads: &Reads,
     set_name: &str,
     set: &Set,
     doc: &Value,
     picked: Option<&[&str]>,
+    expansions: &[Expansion],
     filter: &Translated,
 ) -> EntityValue {
     let id = doc.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -485,7 +659,10 @@ fn entity_value(
         properties.push(("_types".into(), Value::from(visible_types(&reads.edm, doc))));
     }
     for system in ["scope", "createdAt", "modifiedAt"] {
-        if let Some(value) = doc.get(system).filter(|_| wanted(system)) {
+        // The temporal members only when named (E6): a nested $select may
+        // have asked the broker for them.
+        let named = system == "scope" || picked.is_some_and(|p| p.contains(&system));
+        if let Some(value) = doc.get(system).filter(|_| wanted(system) && named) {
             let value = match (system, value) {
                 ("scope", Value::String(_)) => Value::Array(vec![value.clone()]),
                 _ => value.clone(),
@@ -497,15 +674,12 @@ fn entity_value(
         if !wanted(name) || matches!(member.shape, Shape::Nav { .. }) {
             continue;
         }
-        // The answer is compacted under the request's context: a term the
-        // filter defined names its Attribute.
-        let key = filter
-            .context
-            .iter()
-            .find(|(_, iri)| iri.as_str() == Some(member.iri.as_str()))
-            .map_or_else(|| core_name(&member.iri), |(term, _)| term.clone());
-        let instance = default_instance(doc.get(&key));
+        let instance = default_instance(doc.get(key_of(&member.iri, filter)));
         properties.push((name.clone(), member_value(&member.shape, instance)));
+    }
+    for e in expansions {
+        let instance = default_instance(doc.get(key_of(e.iri, filter)));
+        properties.push((e.name.to_owned(), expansion(reads, e, instance, filter)));
     }
     let key = Segment::Key(Key::Single(KeyValue::Literal(Literal::String(
         id.to_owned(),
@@ -516,13 +690,97 @@ fn entity_value(
     }
 }
 
-/// The sets of the Entity's types the model holds, by name.
-fn visible_types(edm: &Edm, doc: &Value) -> Vec<String> {
-    let types: Vec<&str> = match doc.get("type") {
+/// The key of an Attribute in an answer compacted under the request's
+/// context: a term the filter defined, else the core name.
+fn key_of(iri: &str, filter: &Translated) -> String {
+    filter
+        .context
+        .iter()
+        .find(|(_, defined)| defined.as_str() == Some(iri))
+        .map_or_else(|| core_name(iri), |(term, _)| term.clone())
+}
+
+/// An expanded navigation member: references to the Relationship's
+/// objects, or the targets the join embedded. A target the view or the
+/// policy hides is not embedded (T-3470), nor one of another type: it reads
+/// like an absent target, `null` or left out of the collection (O5).
+fn expansion(reads: &Reads, e: &Expansion, instance: Option<&Value>, filter: &Translated) -> Value {
+    let found: Vec<Value> = match &e.writes {
+        Writes::Refs(id) => objects(instance)
+            .into_iter()
+            .map(|urn| {
+                let key = Segment::Key(Key::Single(KeyValue::Literal(Literal::String(urn))));
+                serde_json::json!({ *id: format!("{}{key}", e.target_name) })
+            })
+            .collect(),
+        Writes::Entities(picked) => {
+            let wanted = core_name(&e.target.type_iri);
+            ["entity", "entityList"]
+                .iter()
+                .filter_map(|m| instance.and_then(|i| i.get(*m)))
+                .flat_map(|v| match v {
+                    Value::Array(docs) => docs.clone(),
+                    one => vec![one.clone()],
+                })
+                .filter(|doc| types_of(doc).contains(&wanted.as_str()))
+                .map(|doc| {
+                    let value = entity_value(
+                        reads,
+                        e.target_name,
+                        e.target,
+                        &doc,
+                        picked.as_deref(),
+                        &[],
+                        filter,
+                    );
+                    Value::Object(value.properties.into_iter().collect())
+                })
+                .collect()
+        }
+    };
+    if e.collection {
+        Value::Array(found)
+    } else {
+        found.into_iter().next().unwrap_or(Value::Null)
+    }
+}
+
+/// The object URIs of a Relationship instance: `object` (one or many) or a
+/// ListRelationship's `objectList`.
+fn objects(instance: Option<&Value>) -> Vec<String> {
+    let Some(instance) = instance else {
+        return Vec::new();
+    };
+    let items = |v: &Value| match v {
+        Value::Array(items) => items.clone(),
+        one => vec![one.clone()],
+    };
+    instance
+        .get("object")
+        .map(items)
+        .into_iter()
+        .chain(instance.get("objectList").map(items))
+        .flatten()
+        .filter_map(|v| match v {
+            Value::String(urn) => Some(urn),
+            Value::Object(o) => o.get("object").and_then(Value::as_str).map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An Entity's types as its answer names them.
+fn types_of(doc: &Value) -> Vec<&str> {
+    match doc.get("type") {
         Some(Value::Array(many)) => many.iter().filter_map(Value::as_str).collect(),
         Some(one) => one.as_str().into_iter().collect(),
         None => Vec::new(),
-    };
+    }
+}
+
+/// The sets of the Entity's types the model holds, by name.
+fn visible_types(edm: &Edm, doc: &Value) -> Vec<String> {
+    let types = types_of(doc);
     edm.sets
         .iter()
         .filter(|(_, s)| types.contains(&core_name(&s.type_iri).as_str()))
@@ -701,6 +959,35 @@ mod tests {
     }
 
     #[test]
+    fn expand_takes_one_level_and_the_objects_of_a_relationship() {
+        let edm = Edm {
+            csdl: odata_csdl::Model {
+                version: odata_csdl::CsdlVersion::V4_01,
+                references: vec![],
+                schemas: vec![],
+            },
+            namespace: "n".into(),
+            sets: BTreeMap::new(),
+        };
+        let item = |path: &[&str]| QueryOptions {
+            expand: Some(vec![odata_url::ExpandItem {
+                path: ExpandPath::Path(path.iter().map(|s| (*s).to_owned()).collect()),
+                kind: ExpandKind::Ref,
+            }]),
+            ..QueryOptions::default()
+        };
+        let set = set();
+        assert!(expanded(&edm, &set, &item(&["c", "nav"]), ODataVersion::V4_0).is_err());
+        assert!(
+            expanded(&edm, &set, &item(&["nav"]), ODataVersion::V4_0).is_err(),
+            "a target set the model lacks"
+        );
+        assert_eq!(objects(None), Vec::<String>::new());
+        let relationship = json!({"object": ["a", 1], "objectList": [{"object": "b"}, "c", 2]});
+        assert_eq!(objects(Some(&relationship)), ["a", "b", "c"]);
+    }
+
+    #[test]
     fn select_takes_plain_names_and_leaves_paths_and_annotations_to_later() {
         let set = set();
         let with = |items| QueryOptions {
@@ -709,15 +996,22 @@ mod tests {
         };
         let path = |p: &[&str]| SelectItem::Path(p.iter().map(|s| (*s).to_owned()).collect());
         let star = with(vec![path(&["geo"]), SelectItem::Star]);
-        assert_eq!(selected(&set, &star), Ok(None));
+        assert_eq!(selected(&set, star.select.as_ref()), Ok(None));
         let plain = with(vec![path(&["geo"]), path(&["scope"])]);
-        assert_eq!(selected(&set, &plain), Ok(Some(vec!["geo", "scope"])));
+        assert_eq!(
+            selected(&set, plain.select.as_ref()),
+            Ok(Some(vec!["geo", "scope"]))
+        );
         for refused in [
             with(vec![path(&["nav"])]),
             with(vec![path(&["geo", "x"])]),
             with(vec![SelectItem::Annotation("@Core.Description".into())]),
         ] {
-            assert_eq!(selected(&set, &refused), Err(()), "{refused:?}");
+            assert_eq!(
+                selected(&set, refused.select.as_ref()),
+                Err(()),
+                "{refused:?}"
+            );
         }
     }
 

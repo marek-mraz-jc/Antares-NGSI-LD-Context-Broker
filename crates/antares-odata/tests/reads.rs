@@ -454,7 +454,6 @@ async fn the_forms_of_later_rounds_are_501_and_read_only_writes_405() {
     for uri in [
         "Car?$filter=not%20(speed%20gt%201)",
         "Car('urn:ngsi-ld:Car:1')?$filter=speed%20gt%201",
-        "Car?$expand=*",
         "Car?$schemaversion=2",
         "Car('urn:ngsi-ld:Car:1')/speed",
         "$entity?$id=Car('urn:ngsi-ld:Car:1')",
