@@ -456,7 +456,7 @@ async fn retrieve_entity_inner(
     };
     let mut resp = respond_prefer(StatusCode::OK, payload, &ctx, accept, &tenant, headers);
     attach_warnings(&mut resp, &warnings);
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 
@@ -986,7 +986,7 @@ async fn query_entities_inner(
             }
         }
     }
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 
@@ -2648,7 +2648,7 @@ async fn retrieve_attr_inner(
     };
     let accept = parse_accept(headers)?;
     let mut resp = respond(StatusCode::OK, body, &ctx, accept, &tenant);
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 

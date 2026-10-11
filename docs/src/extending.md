@@ -197,7 +197,13 @@ never in the caller's, so a request cannot rebind the term a rule names
 and step out from under it; write the rule as an IRI and it is used as written, write it
 as a short name and it means what the default `@context` says. Set
 `restricted` and a narrowed read answers `Antares-Results-Restricted: true`,
-so an operator can tell a short answer from an empty one. Three limits are the seam's, not the engine's: an
+so an operator can tell a short answer from an empty one. Set `warning`
+(a `Warning::new(text)`: printable ASCII on one line, at most 256 bytes, no
+`"` or `\`, refused otherwise) and every read it narrows answers
+`NGSILD-Warning: 199 {alias} "{text}"`, for instance to name the types a
+filter on an Attribute the caller may not filter on left out; the text is the
+engine's, names only what the caller may already see, and a view composed
+with the engine keeps it. Three limits are the seam's, not the engine's: an
 operation over everything the tenant holds — delete-by-type, purge, the
 whole-tenant snapshot clauses — is `Allow` or `Deny` and never a `Filter`,
 because doing it to less than it says is a data-loss bug; a `Filter` on a

@@ -18,7 +18,7 @@
 //! ([`ViewTable`]) with the store seam the loader writes through, so the
 //! operation layer never names the store (threat F1).
 
-use crate::policy::{resolve, Decision, Denied, Filter, Rule};
+use crate::policy::{resolve, Decision, Denied, Filter, Rule, Warning};
 use antares_ql::geo::GeoQuery;
 use antares_ql::QNode;
 use std::collections::BTreeMap;
@@ -200,6 +200,7 @@ pub fn compose(a: &Filter, b: Filter) -> Result<Filter, Denied> {
         rules,
         omit_by_type,
         restricted: a.restricted || b.restricted,
+        warning: Warning::join(a.warning.as_ref(), b.warning),
     })
 }
 
@@ -848,6 +849,49 @@ mod tests {
             .unwrap_or_default();
         v.sort();
         v
+    }
+
+    /// G8: a view alone sends no `NGSILD-Warning`; an engine's warning
+    /// reaches every read it narrows, directly and through a view, once.
+    #[tokio::test]
+    async fn only_the_engine_warns_and_its_warning_survives_the_view() {
+        let warnings = |h: &axum::http::HeaderMap| -> Vec<String> {
+            h.get_all("NGSILD-Warning")
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(str::to_owned))
+                .collect()
+        };
+        let reads = [
+            "/ngsi-ld/v1/entities?type=Car",
+            "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:3",
+            "/ngsi-ld/v1/types",
+            "/ngsi-ld/v1/attributes",
+        ];
+        let st = seeded(None).await;
+        let view = st.with_view(Arc::new(cars()));
+        for uri in reads {
+            let (s, body, headers) = send(&view, "GET", uri, None).await;
+            assert_eq!(s, StatusCode::OK, "{uri}: {body}");
+            assert!(warnings(&headers).is_empty(), "{uri}: a view alone");
+        }
+
+        let warned = Filter {
+            warning: Some(Warning::new("types left out by the filter: Bike").expect("text")),
+            ..Filter::default()
+        };
+        let st = seeded(Some(warned)).await;
+        let view = st.with_view(Arc::new(cars()));
+        for (who, st) in [("engine", &st), ("view and engine", &view)] {
+            for uri in reads {
+                let (s, body, headers) = send(st, "GET", uri, None).await;
+                assert_eq!(s, StatusCode::OK, "{who} {uri}: {body}");
+                assert_eq!(
+                    warnings(&headers),
+                    ["199 me \"types left out by the filter: Bike\""],
+                    "{who} {uri}"
+                );
+            }
+        }
     }
 
     /// Rule 1: `NGSILD-Results-Count` and the `Link` pages describe the

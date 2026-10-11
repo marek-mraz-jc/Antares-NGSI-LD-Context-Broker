@@ -2508,7 +2508,7 @@ pub(crate) async fn query_temporal_collected(
             }
         }
     }
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 
@@ -2760,7 +2760,7 @@ async fn retrieve_temporal_inner(
             }
         }
         crate::paging::attach_warnings(&mut resp, &warnings);
-        filter.mark_restricted(resp.headers_mut());
+        filter.mark(&st.host_alias, resp.headers_mut());
         Ok(resp)
     }
 }

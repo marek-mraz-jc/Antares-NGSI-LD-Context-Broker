@@ -272,6 +272,75 @@ pub struct Filter {
     /// Answer [`RESTRICTED_HEADER`]`: true`, so a client can know the
     /// answer was narrowed. Narrowing is otherwise silent.
     pub restricted: bool,
+    /// The engine's advisory, sent as `NGSILD-Warning` (TS 104 176 6.3.17,
+    /// gap G8): e.g. the Entity types a filter on an Attribute the caller
+    /// may not filter on left out, so a developer can tell that refusal
+    /// from an empty answer. The text is the engine's, never an echo of the
+    /// request, and names only what the caller may already see.
+    pub warning: Option<Warning>,
+}
+
+/// The text of a [`Filter::warning`]: printable ASCII on one line, at most
+/// [`Warning::MAX_LEN`] bytes, no `"` or `\`, so it travels as one quoted
+/// `warn-text` of an `NGSILD-Warning` value. Composed filters keep each
+/// side's text, at most [`Warning::MAX_TEXTS`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning(Vec<String>);
+
+impl Warning {
+    /// Bytes in one text.
+    pub const MAX_LEN: usize = 256;
+    /// Texts a composed filter keeps.
+    pub const MAX_TEXTS: usize = 4;
+
+    /// One advisory.
+    ///
+    /// # Errors
+    /// When `text` is empty, longer than [`Warning::MAX_LEN`], or holds a
+    /// character outside printable ASCII (a line break, a control
+    /// character), a `"` or a `\\`: it could not travel as one header line.
+    pub fn new(text: &str) -> Result<Self, String> {
+        if text.is_empty() || text.len() > Self::MAX_LEN {
+            return Err(format!(
+                "a policy warning holds 1 to {} bytes",
+                Self::MAX_LEN
+            ));
+        }
+        if !text
+            .bytes()
+            .all(|b| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\')
+        {
+            return Err(
+                "a policy warning is printable ASCII on one line, without '\"' or '\\\\'".into(),
+            );
+        }
+        Ok(Self(vec![text.to_owned()]))
+    }
+
+    /// The texts, in the order the filters were composed.
+    #[must_use]
+    pub fn texts(&self) -> &[String] {
+        &self.0
+    }
+
+    /// `a` and `b` as one: each text once, `a`'s first.
+    #[must_use]
+    pub fn join(a: Option<&Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                let mut texts = a.0.clone();
+                for t in b.0 {
+                    if !texts.contains(&t) {
+                        texts.push(t);
+                    }
+                }
+                texts.truncate(Self::MAX_TEXTS);
+                Some(Self(texts))
+            }
+            (Some(a), None) => Some(a.clone()),
+            (None, b) => b,
+        }
+    }
 }
 
 /// One allowlist of a [`Filter`] (ADR-0023 rule 11): the Entities of
@@ -507,15 +576,24 @@ impl Filter {
             })
     }
 
-    /// Say the answer was narrowed, when the engine asked for it to be
-    /// said. Narrowing is otherwise silent: a caller cannot tell an Entity
-    /// it may not see from one that is not there.
-    pub fn mark_restricted(&self, headers: &mut HeaderMap) {
+    /// Say the answer was narrowed, and add the engine's warning, when the
+    /// engine asked for either. Narrowing is otherwise silent: a caller
+    /// cannot tell an Entity it may not see from one that is not there.
+    /// `alias` is the warn-agent, this broker's host alias.
+    pub fn mark(&self, alias: &str, headers: &mut HeaderMap) {
         if self.restricted {
             headers.insert(
                 RESTRICTED_HEADER,
                 axum::http::HeaderValue::from_static("true"),
             );
+        }
+        for text in self.warning.iter().flat_map(Warning::texts) {
+            // 199 Miscellaneous warning (RFC 7234 5.5), as the gateway's
+            // dropped-types warning was.
+            let value = crate::federation::warning(199, alias, text);
+            if let Ok(v) = axum::http::HeaderValue::from_str(&value) {
+                headers.append("NGSILD-Warning", v);
+            }
         }
     }
 
@@ -1950,17 +2028,69 @@ mod tests {
         assert!(omits.has_rules(), "per-type omits alone");
 
         let mut headers = HeaderMap::new();
-        Filter::default().mark_restricted(&mut headers);
+        Filter::default().mark("me", &mut headers);
         assert!(headers.get(RESTRICTED_HEADER).is_none());
+        assert!(headers.get("NGSILD-Warning").is_none());
         Filter {
             restricted: true,
             ..Filter::default()
         }
-        .mark_restricted(&mut headers);
+        .mark("me", &mut headers);
         assert_eq!(
             headers.get(RESTRICTED_HEADER).and_then(|v| v.to_str().ok()),
             Some("true")
         );
+        assert!(headers.get("NGSILD-Warning").is_none(), "only when set");
+    }
+
+    /// G8: the engine's warning travels as one `NGSILD-Warning` value per
+    /// text, and a text that could not be one header line is refused.
+    #[test]
+    fn a_warning_is_one_header_line_or_refused() {
+        let left_out = Warning::new("types left out by the filter: Building").unwrap();
+        let mut headers = HeaderMap::new();
+        Filter {
+            warning: Some(left_out.clone()),
+            ..Filter::default()
+        }
+        .mark("me", &mut headers);
+        let sent: Vec<_> = headers
+            .get_all("NGSILD-Warning")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(sent, ["199 me \"types left out by the filter: Building\""]);
+
+        for bad in [
+            "a\nb",
+            "a\rb",
+            "tab\there",
+            "say \"x\"",
+            "back\\slash",
+            "é",
+            "",
+        ] {
+            assert!(Warning::new(bad).is_err(), "{bad:?}");
+        }
+        assert!(Warning::new(&"x".repeat(Warning::MAX_LEN)).is_ok());
+        assert!(Warning::new(&"x".repeat(Warning::MAX_LEN + 1)).is_err());
+
+        let other = Warning::new("other").unwrap();
+        let joined = Warning::join(Some(&left_out), Some(other.clone())).unwrap();
+        assert_eq!(joined.texts().len(), 2);
+        assert_eq!(
+            Warning::join(Some(&left_out), Some(left_out.clone())),
+            Some(left_out.clone())
+        );
+        assert_eq!(
+            Warning::join(None, Some(other.clone())),
+            Some(other.clone())
+        );
+        assert_eq!(Warning::join(Some(&other), None), Some(other));
+        let many = (0..10).fold(None, |acc: Option<Warning>, i| {
+            Warning::join(acc.as_ref(), Some(Warning::new(&format!("w{i}")).unwrap()))
+        });
+        assert_eq!(many.unwrap().texts().len(), Warning::MAX_TEXTS);
     }
 
     #[test]

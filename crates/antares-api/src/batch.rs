@@ -1745,7 +1745,7 @@ async fn batch_query_inner(
             resp.headers_mut().insert("NGSILD-Results-Count", v);
         }
     }
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 
