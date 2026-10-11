@@ -14,6 +14,7 @@
 - [Endpoint views](views.md)
 - [MCP endpoint of a view](mcp.md)
 - [OData endpoint of a view](odata.md)
+- [OGC API - Features endpoint of a view](ogc.md)
 - [WebSocket notifications](websocket.md)
 - [Federation](federation.md)
 - [Internal context sources](internal-context-sources.md)

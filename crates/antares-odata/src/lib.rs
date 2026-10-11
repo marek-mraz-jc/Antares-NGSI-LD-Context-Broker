@@ -279,7 +279,16 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
         return Some(hit.clone());
     }
     let schema = parsed(revision, &bytes)?;
-    let edm = edm::build(id, &schema, &key.1, key.2, version).ok()?;
+    // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
+    let every = view.shows_every_name().then(|| edm::every(&schema));
+    let edm = edm::build(
+        id,
+        &schema,
+        every.as_ref().unwrap_or(&key.1),
+        key.2,
+        version,
+    )
+    .ok()?;
     tracing::debug!(
         view = id,
         schema_revision = revision,

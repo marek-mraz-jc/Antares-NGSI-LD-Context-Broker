@@ -829,3 +829,158 @@ async fn a_conditional_grant_over_every_type_needs_the_types_named() -> Res {
     assert_eq!(code, StatusCode::FORBIDDEN);
     Ok(())
 }
+
+/// `doc` with the views member (README section 2, T-3702).
+fn bound(policies: &[Value], views: Value) -> Value {
+    with(doc(policies), "views", views)
+}
+
+async fn through(
+    view: &str,
+    st: &AppState,
+    method: &str,
+    uri: &str,
+    who: &[(&str, &str)],
+    body: Option<&Value>,
+) -> Result<(StatusCode, Value), String> {
+    antares_api::policy::through_view(view, send(st, method, uri, who, body)).await
+}
+
+fn secrets() -> Value {
+    json!([{"entities": [{"type": "Secret"}]}])
+}
+
+/// T-3702: a subject holding Policy B reads nothing of B through a view
+/// bound to Policy A; the plain root still decides with both.
+#[tokio::test]
+async fn a_view_bound_to_one_policy_is_not_widened_by_another_the_caller_holds() -> Res {
+    let a = grant("a", "group", "city", &["5.7.1", "5.7.2"], cars(&[]));
+    let b = grant("b", "group", "city", &["5.7.1", "5.7.2"], secrets());
+    let (st, _) = broker(bound(&[a, b], json!({"cars": ["a"]}))).await?;
+    fleet(&st).await?;
+
+    let (code, list) = through("cars", &st, "GET", QUERY, &ANA, None).await?;
+    assert_eq!((code, ids(&list)), (StatusCode::OK, car_ids(&[1, 2, 3])));
+    let (code, body) = through(
+        "cars",
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Secret:1",
+        &ANA,
+        None,
+    )
+    .await?;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{body}");
+
+    let (code, list) = send(&st, "GET", QUERY, &ANA, None).await?;
+    let mut all = car_ids(&[1, 2, 3]);
+    all.push("urn:ngsi-ld:Secret:1".into());
+    assert_eq!((code, ids(&list)), (StatusCode::OK, all));
+    Ok(())
+}
+
+/// T-3702: an App's view is decided by the App's own grant and the space's
+/// prohibition alone: another grant of the same caller adds nothing there,
+/// and the prohibition still holds.
+#[tokio::test]
+async fn an_app_view_is_decided_by_its_own_grant_and_the_prohibition() -> Res {
+    const APP: [(&str, &str); 2] = [("x-jc-client", "app-x"), ("x-jc-groups", "city")];
+    let own = grant(
+        "own",
+        "serviceAccount",
+        "app-x",
+        &["5.7.1", "5.7.2"],
+        json!([
+            {"entities": [{"type": "Car"}, {"type": "Secret"}]}
+        ]),
+    );
+    let no_secret = with(
+        grant("no-secret", "group", "city", &["5.7.2"], secrets()),
+        "effect",
+        json!("prohibit"),
+    );
+    let writes = grant("writes", "group", "city", &["5.6.1"], cars(&[]));
+    let (st, _) = broker(bound(
+        &[own, no_secret, writes],
+        json!({"app-x": ["own", "no-secret"]}),
+    ))
+    .await?;
+    fleet(&st).await?;
+
+    let (code, list) = through(
+        "app-x",
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Car",
+        &APP,
+        None,
+    )
+    .await?;
+    assert_eq!((code, ids(&list)), (StatusCode::OK, car_ids(&[1, 2, 3])));
+    let (code, body) = through("app-x", &st, "GET", QUERY, &APP, None).await?;
+    assert_eq!(code, StatusCode::FORBIDDEN, "the prohibition holds: {body}");
+    let new = car(9, 1, "/geo/SK/BB");
+    let (code, body) = through(
+        "app-x",
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        &APP,
+        Some(&new),
+    )
+    .await?;
+    assert_eq!(
+        code,
+        StatusCode::FORBIDDEN,
+        "the other grant adds nothing: {body}"
+    );
+    let (code, body) = send(&st, "POST", "/ngsi-ld/v1/entities", &APP, Some(&new)).await?;
+    assert_eq!(
+        code,
+        StatusCode::CREATED,
+        "the plain root has every policy: {body}"
+    );
+    Ok(())
+}
+
+/// T-3702: a view the document does not list is decided by every policy.
+#[tokio::test]
+async fn a_view_not_listed_is_decided_by_every_policy() -> Res {
+    let a = grant("a", "group", "city", &["5.7.2"], cars(&[]));
+    let b = grant("b", "group", "city", &["5.7.2"], secrets());
+    let (st, _) = broker(bound(&[a, b], json!({"cars": ["a"]}))).await?;
+    fleet(&st).await?;
+    let (code, list) = through("elsewhere", &st, "GET", QUERY, &ANA, None).await?;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list).len(), 4, "{list}");
+    Ok(())
+}
+
+/// T-3702: a view naming a policy the document lacks, or one twice, is
+/// refused and the previous document keeps deciding; a view may list none.
+#[tokio::test]
+async fn a_view_list_that_does_not_match_the_document_is_refused() -> Res {
+    let a = grant("a", "group", "city", &["5.7.2"], cars(&[]));
+    let engine = JoinedcontextPolicy::new();
+    for views in [
+        json!({"cars": ["a", "a"]}),
+        json!({"cars": ["nope"]}),
+        json!({"cars": "a"}),
+    ] {
+        let refused = engine.load("default", &bound(std::slice::from_ref(&a), views.clone()));
+        assert!(refused.is_err(), "{views}");
+    }
+    engine.load(
+        "default",
+        &bound(std::slice::from_ref(&a), json!({"closed": []})),
+    )?;
+    let (st, _) = broker(bound(&[a], json!({"closed": []}))).await?;
+    fleet(&st).await?;
+    let (code, body) = through("closed", &st, "GET", QUERY, &ANA, None).await?;
+    assert_eq!(
+        code,
+        StatusCode::FORBIDDEN,
+        "a view listing nothing grants nothing: {body}"
+    );
+    Ok(())
+}
