@@ -323,3 +323,50 @@ async fn ws_an_overflow_while_away_is_a_gap_on_resume() -> Result<(), String> {
     assert_eq!(gap.pointer("/metadata/x-to"), Some(&json!(3)), "{gap}");
     Ok(())
 }
+
+/// 4.3: a notification whose message would reach the cap with the longest
+/// seq is written, one byte more is refused before it takes a seq. The
+/// message is rendered once with the seq it takes (T-3626), so the cap is
+/// judged on that text plus the digits a larger seq would add.
+#[tokio::test]
+async fn ws_the_notification_cap_holds_to_the_byte() -> Result<(), String> {
+    let b = broker_alone(Limits::default()).await?;
+    let mut c = connect(b.addr, ROOT, &[]).await?;
+    let (sub, _) = two(&mut c).await?;
+    let padded = |n: usize| json!({"metadata": {}, "body": {"pad": "x".repeat(n)}});
+    let base = antares_ws::envelope::notification(&padded(0), u64::MAX, &sub).len();
+    let fits = antares_ws::MAX_NOTIFICATION_BYTES
+        .checked_sub(base)
+        .ok_or("an empty notification is over the cap")?;
+    let offer = |n: usize| {
+        serde_json::to_vec(&Forwarded {
+            tenant: "default".into(),
+            subscription: sub.clone(),
+            entity: None,
+            changes: false,
+            rendered: padded(n),
+        })
+        .map_err(|e| e.to_string())
+    };
+    assert_eq!(
+        answer(&b.hub.answer(&c.connection, &offer(fits + 1)?))?,
+        Answer::TooLarge
+    );
+    assert_eq!(
+        answer(&b.hub.answer(&c.connection, &offer(fits)?))?,
+        Answer::Queued
+    );
+    let n = c.notification().await?;
+    // the refused one took no seq
+    assert_eq!(
+        n.pointer("/metadata/x-seq"),
+        Some(&json!(1)),
+        "{}",
+        n["metadata"]
+    );
+    assert_eq!(
+        n.pointer("/body/pad").and_then(Value::as_str).map(str::len),
+        Some(fits)
+    );
+    Ok(())
+}
