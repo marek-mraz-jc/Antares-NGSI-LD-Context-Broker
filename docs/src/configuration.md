@@ -17,6 +17,7 @@ here).
 | `ANTARES_BUS` | `local` | Change-event bus: `local` (in-process, single node) or `nats` (JetStream, multi-pod). Unknown value = fatal. |
 | `ANTARES_HOST_ALIAS` | `antares` | This broker's name in federation `Via` chains (CIM 009 6.3.18) — loop detection identity. Two LB'd replicas of one logical broker share one alias. |
 | `ANTARES_PUBLIC_URL` | `http://{host_alias}:{port}` | The URL peers can reach this broker at: forwarded subscription copies notify `{ANTARES_PUBLIC_URL}/ex/v1/remote-notify` (5.8.1.4). Set it whenever the default is not routable from peers. |
+| `ANTARES_SELF_URLS` | empty | Comma-separated base URLs this deployment answers under (`internal-csr` builds): a registration whose endpoint lies under one is served in process under the target Tenant's export grant (`/q/grants`). An invalid entry stops the broker; empty, every forward goes over HTTP. A build without the feature warns once and ignores it. See [Internal context sources](internal-context-sources.md). |
 
 ## Store backends
 
