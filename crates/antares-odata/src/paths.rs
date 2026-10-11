@@ -103,7 +103,8 @@ pub(crate) async fn reference(
         encode(&set.type_iri)
     );
     let none = Translated::default();
-    let (docs, _) = run(
+    // Retrieve Entity answers 200 only with the Entity it was asked for.
+    run(
         reads,
         caller,
         OperationId::RetrieveEntity,
@@ -112,15 +113,11 @@ pub(crate) async fn reference(
         version,
     )
     .await?;
-    let urn = docs
-        .first()
-        .and_then(|doc| doc.get("id")?.as_str())
-        .ok_or_else(|| not_found(version))?;
     let mut body = Vec::new();
     // A Vec takes every byte: the write cannot fail.
     let _ = write_entity_reference(
         ctx,
-        &format!("{set_name}{}", key_segment(set, urn)),
+        &format!("{set_name}{}", key_segment(set, &id)),
         &mut body,
     );
     Ok(json_response(version, ctx.level, body))

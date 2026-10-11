@@ -510,6 +510,15 @@ async fn references_of_absent_entities_and_with_properties_are_refused() {
         let a = odata(&app, Method::GET, &path, None).await;
         assert_eq!(a.status, StatusCode::NOT_FOUND, "{path}: {}", a.body);
     }
+    // A collection option on one reference is not served.
+    let a = odata(
+        &app,
+        Method::GET,
+        &format!("Product({GUID})/$ref?$top=1"),
+        None,
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NOT_IMPLEMENTED, "{}", a.body);
     // A reference has no properties: $select and $expand are 400.
     for path in [
         "Product/$ref?$select=Name".to_owned(),
