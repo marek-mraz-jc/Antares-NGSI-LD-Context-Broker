@@ -278,6 +278,72 @@ pub struct Filter {
     /// from an empty answer. The text is the engine's, never an echo of the
     /// request, and names only what the caller may already see.
     pub warning: Option<Warning>,
+    /// Windows of `observedAt` the instances of a temporal read (5.7.3,
+    /// 5.7.4) must fall into, every one of them (gap G6): the request's own
+    /// 4.11 window is clamped to them before the store runs, so the store
+    /// fetches no instance outside them. A window the request does not reach
+    /// answers nothing, never a refusal that tells where the grant ends. A
+    /// slice, not a `Vec`: every [`Decision`] carries a `Filter`'s size.
+    pub temporal: Box<[Window]>,
+}
+
+/// A half-open interval `[from, to)` of `observedAt`; an open end is the
+/// beginning or the end of time (gap G6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Window {
+    /// The earliest instant admitted.
+    pub from: Option<TimeBound>,
+    /// The first instant no longer admitted.
+    pub to: Option<TimeBound>,
+}
+
+/// One end of a [`Window`]: a fixed instant, or a duration before the
+/// moment the request is decided, so "the last 24 hours" slides with now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeBound {
+    /// This instant.
+    At(chrono::DateTime<chrono::Utc>),
+    /// This long before now.
+    Ago(chrono::Duration),
+}
+
+impl TimeBound {
+    fn at(self, now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        match self {
+            Self::At(t) => t,
+            Self::Ago(d) => now
+                .checked_sub_signed(d)
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+        }
+    }
+
+    /// The bound at `now` in milliseconds, the precision 4.11 accepts: a
+    /// start (`up`) rounds up and an end down, so rounding only narrows.
+    fn render(self, now: chrono::DateTime<chrono::Utc>, up: bool) -> String {
+        let t = self.at(now);
+        let sub = i64::from(t.timestamp_subsec_nanos() % 1_000_000);
+        let t = if up && sub > 0 {
+            t.checked_add_signed(chrono::Duration::nanoseconds(1_000_000 - sub))
+                .unwrap_or(t)
+        } else {
+            t
+        };
+        t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+}
+
+impl Window {
+    /// Whether an instance observed at `observed_at` falls inside, the
+    /// bounds resolved against `now`; 4.11's half-open comparison.
+    #[must_use]
+    pub fn admits(&self, observed_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let t = antares_model::dt_key(observed_at);
+        self.from
+            .is_none_or(|b| t >= antares_model::dt_key(&b.render(now, true)))
+            && self
+                .to
+                .is_none_or(|b| t < antares_model::dt_key(&b.render(now, false)))
+    }
 }
 
 /// The text of a [`Filter::warning`]: printable ASCII on one line, at most
@@ -285,7 +351,7 @@ pub struct Filter {
 /// `warn-text` of an `NGSILD-Warning` value. Composed filters keep each
 /// side's text, at most [`Warning::MAX_TEXTS`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Warning(Vec<String>);
+pub struct Warning(Box<[String]>); // a slice: every Decision carries a Filter's size
 
 impl Warning {
     /// Bytes in one text.
@@ -314,7 +380,7 @@ impl Warning {
                 "a policy warning is printable ASCII on one line, without '\"' or '\\\\'".into(),
             );
         }
-        Ok(Self(vec![text.to_owned()]))
+        Ok(Self(Box::new([text.to_owned()])))
     }
 
     /// The texts, in the order the filters were composed.
@@ -328,14 +394,14 @@ impl Warning {
     pub fn join(a: Option<&Self>, b: Option<Self>) -> Option<Self> {
         match (a, b) {
             (Some(a), Some(b)) => {
-                let mut texts = a.0.clone();
+                let mut texts = a.0.to_vec();
                 for t in b.0 {
                     if !texts.contains(&t) {
                         texts.push(t);
                     }
                 }
                 texts.truncate(Self::MAX_TEXTS);
-                Some(Self(texts))
+                Some(Self(texts.into()))
             }
             (Some(a), None) => Some(a.clone()),
             (None, b) => b,
@@ -361,6 +427,11 @@ pub struct Rule {
     pub geo_also: Vec<GeoQuery>,
     /// The Attributes an Entity this rule holds for shows.
     pub attributes: Vec<String>,
+    /// Windows of `observedAt` (gap G6): in a temporal read (5.7.3, 5.7.4)
+    /// an instance of these `attributes` is shown through this rule only if
+    /// it falls into every one. A current-state read shows what the rule
+    /// shows, as the gateway's grant windows did.
+    pub temporal: Vec<Window>,
 }
 
 impl Rule {
@@ -519,6 +590,7 @@ impl Filter {
             && self.omit.is_empty()
             && self.pick.is_empty()
             && !self.has_rules()
+            && self.temporal.is_empty()
     }
 
     /// Whether the filter carries rules or per-type omits (ADR-0023 rule 11).
@@ -595,6 +667,77 @@ impl Filter {
                 headers.append("NGSILD-Warning", v);
             }
         }
+    }
+
+    /// The request's temporal parameters with its 4.11 window clamped to
+    /// [`Filter::temporal`], resolved against now (gap G6), for every reader
+    /// after the gate: the store's instance range, the forward, the links.
+    /// `required` is the operation's (5.7.4 demands a window, 5.7.3 does
+    /// not), so a request that lacked one is still refused. The windows are
+    /// on `observedAt`: a request on another timeproperty is answered
+    /// nothing, since the store applies one range on one timeproperty.
+    ///
+    /// # Errors
+    /// The request's own 4.11 window is invalid.
+    pub fn narrow_window(
+        &self,
+        params: &std::collections::HashMap<String, String>,
+        required: bool,
+    ) -> Result<std::collections::HashMap<String, String>, antares_model::NgsiError> {
+        let mut out = params.clone();
+        if self.temporal.is_empty() {
+            return Ok(out);
+        }
+        let asked = crate::temporalq::TemporalQ::from_params(params, required)?;
+        let key = |s: &String| antares_model::dt_key(s);
+        let (mut from, mut to) = match &asked {
+            Some(tq) if tq.timeproperty != "observedAt" => {
+                let epoch = "1970-01-01T00:00:00Z".to_owned();
+                (Some(epoch.clone()), Some(epoch))
+            }
+            Some(tq) => match tq.timerel.as_str() {
+                "before" => (None, Some(tq.time_at.clone())),
+                "after" => (Some(tq.time_at.clone()), None),
+                "between" => (Some(tq.time_at.clone()), tq.end_time_at.clone()),
+                _ => (None, None),
+            },
+            None => (None, None),
+        };
+        let now = chrono::Utc::now();
+        for w in &self.temporal {
+            if let Some(b) = w.from.map(|b| b.render(now, true)) {
+                from = Some(match from {
+                    Some(f) if key(&f) >= key(&b) => f,
+                    _ => b,
+                });
+            }
+            if let Some(b) = w.to.map(|b| b.render(now, false)) {
+                to = Some(match to {
+                    Some(t) if key(&t) <= key(&b) => t,
+                    _ => b,
+                });
+            }
+        }
+        // `between` an instant and itself admits nothing: the answer is
+        // empty, as for a window over a period with no data
+        if let (Some(f), Some(t)) = (&from, &to) {
+            if key(f) >= key(t) {
+                to = Some(f.clone());
+            }
+        }
+        let (timerel, time_at, end) = match (from, to) {
+            (Some(f), Some(t)) => ("between", f, Some(t)),
+            (Some(f), None) => ("after", f, None),
+            (None, Some(t)) => ("before", t, None),
+            (None, None) => return Ok(out),
+        };
+        out.insert("timerel".into(), timerel.into());
+        out.insert("timeAt".into(), time_at);
+        match end {
+            Some(e) => out.insert("endTimeAt".into(), e),
+            None => out.remove("endTimeAt"),
+        };
+        Ok(out)
     }
 
     /// The request's own query parameters, narrowed by this decision.
@@ -2041,6 +2184,110 @@ mod tests {
             Some("true")
         );
         assert!(headers.get("NGSILD-Warning").is_none(), "only when set");
+    }
+
+    /// G6: the request's window clamped to the narrowing's, written back
+    /// into the parameters; nothing changes without windows, a missing or
+    /// invalid window stays refused, and no overlap is a window of nothing.
+    #[test]
+    fn a_temporal_window_is_clamped_into_the_parameters() {
+        let p = |pairs: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let t = |s: &str| TimeBound::At(s.parse().unwrap());
+        let between = Filter {
+            temporal: Box::new([Window {
+                from: Some(t("2026-01-01T01:00:00Z")),
+                to: Some(t("2026-01-01T02:00:00Z")),
+            }]),
+            ..Filter::default()
+        };
+        let odd = p(&[("timerel", "sideways")]);
+        assert_eq!(
+            Filter::default().narrow_window(&odd, true).unwrap(),
+            odd,
+            "no windows, no reading"
+        );
+        assert!(
+            between.narrow_window(&p(&[]), true).is_err(),
+            "5.7.4 still demands a window"
+        );
+        assert!(between.narrow_window(&odd, false).is_err());
+
+        let out = between.narrow_window(&p(&[]), false).unwrap();
+        assert_eq!(out["timerel"], "between");
+        assert_eq!(out["timeAt"], "2026-01-01T01:00:00.000Z");
+        assert_eq!(out["endTimeAt"], "2026-01-01T02:00:00.000Z");
+
+        let out = between
+            .narrow_window(
+                &p(&[("timerel", "after"), ("timeAt", "2026-01-01T01:30:00Z")]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            (out["timerel"].as_str(), out["timeAt"].as_str()),
+            ("between", "2026-01-01T01:30:00Z")
+        );
+
+        let out = between
+            .narrow_window(
+                &p(&[("timerel", "before"), ("timeAt", "2025-01-01T00:00:00Z")]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            out["timeAt"], out["endTimeAt"],
+            "no overlap: between an instant and itself"
+        );
+
+        let open = Filter {
+            temporal: Box::new([Window {
+                from: None,
+                to: Some(t("2026-01-01T02:00:00Z")),
+            }]),
+            ..Filter::default()
+        };
+        let out = open
+            .narrow_window(
+                &p(&[
+                    ("timerel", "between"),
+                    ("timeAt", "2025-01-01T00:00:00Z"),
+                    ("endTimeAt", "2027-01-01T00:00:00Z"),
+                ]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            (out["timeAt"].as_str(), out["endTimeAt"].as_str()),
+            ("2025-01-01T00:00:00Z", "2026-01-01T02:00:00.000Z")
+        );
+        let out = open.narrow_window(&p(&[]), false).unwrap();
+        assert_eq!(out["timerel"], "before");
+        assert!(!out.contains_key("endTimeAt"));
+        let empty = Filter {
+            temporal: Box::new([Window::default()]),
+            ..Filter::default()
+        };
+        assert_eq!(
+            empty.narrow_window(&p(&[]), false).unwrap(),
+            p(&[]),
+            "an unbounded window narrows nothing"
+        );
+
+        // a relative start rounds up to the millisecond, an end down
+        let slide = Filter {
+            temporal: Box::new([Window {
+                from: Some(TimeBound::Ago(chrono::Duration::nanoseconds(1))),
+                to: Some(TimeBound::Ago(chrono::Duration::nanoseconds(1))),
+            }]),
+            ..Filter::default()
+        };
+        let out = slide.narrow_window(&p(&[]), false).unwrap();
+        assert!(antares_model::dt_key(&out["timeAt"]) >= antares_model::dt_key(&out["endTimeAt"]));
     }
 
     /// G8: the engine's warning travels as one `NGSILD-Warning` value per

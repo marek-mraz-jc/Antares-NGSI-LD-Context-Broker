@@ -274,6 +274,8 @@ fn compile_rule(i: usize, r: &ViewRule, ctx: &Context) -> Result<Rule, String> {
         geo_q: geo_q(&at("geoQ"), r.geo_q.as_ref())?.map(Box::new),
         geo_also: Vec::new(),
         attributes,
+        // a view document names no windows; an engine's narrow temporal reads
+        temporal: Vec::new(),
     })
 }
 

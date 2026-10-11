@@ -201,6 +201,7 @@ pub fn compose(a: &Filter, b: Filter) -> Result<Filter, Denied> {
         omit_by_type,
         restricted: a.restricted || b.restricted,
         warning: Warning::join(a.warning.as_ref(), b.warning),
+        temporal: [&a.temporal[..], &b.temporal[..]].concat().into(),
     })
 }
 
@@ -290,6 +291,7 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
                 geo_q,
                 geo_also,
                 attributes: shared(&x.attributes, y.attributes.clone()),
+                temporal: [x.temporal.as_slice(), y.temporal.as_slice()].concat(),
             });
         }
     }

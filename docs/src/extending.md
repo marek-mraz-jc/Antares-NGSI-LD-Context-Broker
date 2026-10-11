@@ -203,7 +203,14 @@ so an operator can tell a short answer from an empty one. Set `warning`
 `NGSILD-Warning: 199 {alias} "{text}"`, for instance to name the types a
 filter on an Attribute the caller may not filter on left out; the text is the
 engine's, names only what the caller may already see, and a view composed
-with the engine keeps it. Three limits are the seam's, not the engine's: an
+with the engine keeps it. Set `temporal` (windows of `observedAt`, each end a
+`TimeBound::At(instant)` or a `TimeBound::Ago(duration)` resolved when the
+request is decided) and a temporal read (5.7.3, 5.7.4) has its own 4.11
+window clamped to every one of them before the store runs, the forward to a
+Context Source included; a window the grant does not reach answers nothing,
+not a refusal, and a request on another `timeproperty` answers nothing. A
+`Rule` may carry windows too: its Attributes' instances outside them are not
+shown through it. Three limits are the seam's, not the engine's: an
 operation over everything the tenant holds — delete-by-type, purge, the
 whole-tenant snapshot clauses — is `Allow` or `Deny` and never a `Filter`,
 because doing it to less than it says is a data-loss bug; a `Filter` on a
