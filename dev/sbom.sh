@@ -21,6 +21,21 @@ sbom() { # <name> [cargo-cyclonedx feature flags]
   # cargo-cyclonedx writes one file per workspace member; the broker's is
   # the shipped binary's, the others go.
   find crates examples -name "antares-$name.cdx.json" -type f -delete
+  # cargo-cyclonedx resolves features as `cargo metadata` does, for the
+  # whole workspace: antares-ws's axum `ws` lands on the broker's one axum
+  # although `-p antares-broker` builds none (T-3694), and optional crates
+  # of other members ride along. The SBOM keeps the components the binary
+  # is built from, the graph `cargo tree -p` resolves for the same features.
+  local keep
+  keep=$(cargo tree -q -p antares-broker -e normal,build --prefix none -f '{p}' "$@" |
+    sed 's/ (.*//; s/ v/@/' | sort -u | jq -R . | jq -sc .)
+  jq --argjson keep "$keep" '
+    .components |= map(select("\(.name)@\(.version)" as $k | $keep | index($k)))
+    | ([.metadata.component["bom-ref"]] + [.components[]["bom-ref"]]) as $refs
+    | .dependencies |= map(select(.ref as $r | $refs | index($r))
+        | if has("dependsOn") then .dependsOn |= map(select(. as $r | $refs | index($r))) else . end)
+  ' "$out/antares-$name.cdx.json" >"$out/antares-$name.cdx.json.tmp"
+  mv "$out/antares-$name.cdx.json.tmp" "$out/antares-$name.cdx.json"
   jq -e '.components | length > 0' "$out/antares-$name.cdx.json" >/dev/null || {
     echo "antares-$name.cdx.json lists no component"
     exit 1

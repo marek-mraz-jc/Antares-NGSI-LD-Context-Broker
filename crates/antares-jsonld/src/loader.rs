@@ -646,7 +646,7 @@ const MAX_MERGED_CACHE_TERMS: u64 = 2_000_000;
 const MAX_MERGED_ENTRIES: u64 = 256;
 
 /// The merged-context cache, bounded by TERMS held rather than by entries.
-#[cfg(not(target_arch = "wasm32"))]
+/// The same budget on wasm32: the minicache takes moka's weigher (T-3698).
 fn merged_cache() -> BoundedCache<String, Arc<Context>> {
     let floor = (MAX_MERGED_CACHE_TERMS / MAX_MERGED_ENTRIES) as u32;
     BoundedCache::builder()
@@ -659,16 +659,10 @@ fn merged_cache() -> BoundedCache<String, Arc<Context>> {
         .build()
 }
 
-/// wasm32: the FIFO minicache carries no weigher, and a browser tab's
-/// @context set is tiny — the entry bound is the bound there.
-#[cfg(target_arch = "wasm32")]
-fn merged_cache() -> BoundedCache<String, Arc<Context>> {
-    BoundedCache::new(MAX_MERGED_ENTRIES)
-}
-
 /// The fetched-document cache, bounded by BYTES: the weight of an entry is
-/// the size of the document it holds (floored, see above).
-#[cfg(not(target_arch = "wasm32"))]
+/// the size of the document it holds (floored, see above). A browser page
+/// that loads hostile @contexts holds 16 MiB of them at most, as the broker
+/// does.
 fn fetched_cache() -> BoundedCache<String, FetchedDoc> {
     // what one entry costs of the budget at minimum
     let floor = (MAX_FETCHED_CACHE_BYTES / MAX_FETCHED_ENTRIES) as u32;
@@ -680,13 +674,6 @@ fn fetched_cache() -> BoundedCache<String, FetchedDoc> {
                 .max(floor)
         })
         .build()
-}
-
-/// wasm32: the FIFO minicache carries no weigher, and a browser tab's
-/// @context set is tiny — the entry bound is the bound there.
-#[cfg(target_arch = "wasm32")]
-fn fetched_cache() -> BoundedCache<String, FetchedDoc> {
-    BoundedCache::new(MAX_FETCHED_ENTRIES)
 }
 
 #[derive(Clone)]

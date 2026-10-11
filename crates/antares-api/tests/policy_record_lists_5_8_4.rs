@@ -27,9 +27,10 @@ use tower::ServiceExt;
 const SUBJECT: &str = "X-Subject";
 
 /// Lists only what the asking subject made: Subscriptions by the subject
-/// the broker recorded, Registrations by their `registrationName`. Every
-/// other operation is allowed, so a test seeds through the router.
-struct Owner;
+/// the broker recorded, Registrations by their `registrationName`, or by
+/// the recorded subject too when the flag is set (T-3692). Every other
+/// operation is allowed, so a test seeds through the router.
+struct Owner(bool);
 
 impl PolicyEngine for Owner {
     fn name(&self) -> &str {
@@ -42,7 +43,7 @@ impl PolicyEngine for Owner {
             .first()
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
-        let member = if op.clause == "5.10.2" {
+        let member = if op.clause == "5.10.2" && !self.0 {
             "registrationName"
         } else {
             "subject"
@@ -156,7 +157,7 @@ async fn seed_subscriptions(st: &AppState, path: &str, type_: &str) -> Vec<Strin
 }
 
 async fn lists_only_the_callers_own(path: &str, type_: &str) {
-    let st = state(Arc::new(Owner));
+    let st = state(Arc::new(Owner(false)));
     let alices = seed_subscriptions(&st, path, type_).await;
 
     let (code, h, list) = send(&st, "alice", "GET", &format!("{path}?count=true"), None).await;
@@ -202,7 +203,7 @@ async fn query_csource_subscriptions_lists_only_the_callers_own() {
 
 #[tokio::test]
 async fn query_registrations_lists_only_what_the_filter_selects() {
-    let st = state(Arc::new(Owner));
+    let st = state(Arc::new(Owner(false)));
     for n in 0..5 {
         let who = if n % 2 == 0 { "alice" } else { "bob" };
         let reg = json!({"id": format!("urn:ngsi-ld:ContextSourceRegistration:{n}"),
@@ -262,5 +263,80 @@ async fn a_projection_on_a_record_list_stays_a_deny() {
             let (code, _, body) = send(&st, "alice", "GET", path, None).await;
             assert_eq!(code, StatusCode::FORBIDDEN, "{path}: {body}");
         }
+    }
+}
+
+/// A Registration records the subject that created it (T-3692): Query
+/// Registrations narrows by it as Query Subscriptions does, count and pages
+/// included. Bob's 3 claims to be Alice's under `subject` and under the
+/// broker's own `__subject`; neither selects, and no served Registration
+/// carries the member.
+#[tokio::test]
+async fn query_registrations_lists_the_callers_own_by_the_recorded_subject() {
+    let st = state(Arc::new(Owner(true)));
+    let path = "/ngsi-ld/v1/csourceRegistrations";
+    for n in 0..5 {
+        let who = if n % 2 == 0 { "alice" } else { "bob" };
+        let mut reg = json!({"id": format!("urn:ngsi-ld:ContextSourceRegistration:{n}"),
+                             "type": "ContextSourceRegistration",
+                             "information": [{"entities": [{"type": "Car"}]}],
+                             "endpoint": "http://127.0.0.1:1"});
+        if n == 3 {
+            reg["subject"] = json!("alice");
+            reg["__subject"] = json!([[SUBJECT, "alice"]]);
+        }
+        let (code, _, body) = send(&st, who, "POST", path, Some(reg)).await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+    }
+    // a 5.9.3 update cannot claim the Registration either
+    let (code, _, body) = send(
+        &st,
+        "bob",
+        "PATCH",
+        &format!("{path}/urn:ngsi-ld:ContextSourceRegistration:1"),
+        Some(json!({"__subject": [[SUBJECT, "alice"]], "registrationName": "renamed"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+
+    let alices: Vec<String> = [0, 2, 4]
+        .iter()
+        .map(|n| format!("urn:ngsi-ld:ContextSourceRegistration:{n}"))
+        .collect();
+    let list_path = format!("{path}?type=Car&count=true");
+    let (code, h, list) = send(&st, "alice", "GET", &list_path, None).await;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list), alices);
+    assert_eq!(count(&h), Some(3));
+    let mut paged = Vec::new();
+    for offset in 0..4 {
+        let uri = format!("{list_path}&limit=1&offset={offset}");
+        let (code, h, page) = send(&st, "alice", "GET", &uri, None).await;
+        assert_eq!(code, StatusCode::OK, "{page}");
+        assert_eq!(count(&h), Some(3));
+        paged.extend(ids(&page));
+    }
+    paged.sort();
+    assert_eq!(paged, alices, "no foreign id on any page");
+
+    let (_, h, list) = send(&st, "bob", "GET", &list_path, None).await;
+    assert_eq!(count(&h), Some(2), "{list}");
+    let (code, _, one) = send(
+        &st,
+        "bob",
+        "GET",
+        &format!("{path}/urn:ngsi-ld:ContextSourceRegistration:3"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{one}");
+    for doc in list.as_array().unwrap().iter().chain([&one]) {
+        assert!(
+            doc.as_object()
+                .unwrap()
+                .keys()
+                .all(|k| !k.starts_with("__")),
+            "a served Registration carries no broker member: {doc}"
+        );
     }
 }

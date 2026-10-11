@@ -69,7 +69,6 @@ mod policy_filter_by_type;
 mod policy_gate_seam;
 mod policy_operation_members;
 mod policy_pre_image;
-mod policy_record_lists_5_8_4;
 mod policy_temporal_window_g6;
 mod pool_overload_6_3_2;
 mod prefer_body_cap;
