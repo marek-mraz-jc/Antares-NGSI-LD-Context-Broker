@@ -69,12 +69,24 @@ impl Surface for Probe {
             )
             .route(
                 "/{view}/mapping",
-                get(move |Path(id): Path<String>| {
+                get(move |Path(id): Path<String>, caller: Caller| {
                     let ops = mapped.clone();
                     async move {
+                        let view = ops.mapped_view(&id);
+                        // an operation the view does not allow, mapped or not
+                        let types = match &view {
+                            Some(v) => {
+                                let req = OpsRequest::new(Method::GET, "/ngsi-ld/v1/types");
+                                let run = v.run(OperationId::RetrieveEntityTypes, &caller, req);
+                                Some(run.await.map_or_else(|r| r.ngsi_ld().status(), |a| a.status()).as_u16())
+                            }
+                            None => None,
+                        };
                         axum::Json(json!({
                             "view": ops.view(&id).is_some(),
-                            "mapped": ops.mapped_view(&id).and_then(|v| v.mapping().map(|m| m.source_class().to_owned())),
+                            "mapped": view.as_ref().and_then(|v| v.mapping().map(|m| m.source_class().to_owned())),
+                            "names": view.as_ref().and_then(antares_ops::ViewOps::target_names),
+                            "types": types,
                         }))
                     }
                 }),
@@ -312,14 +324,71 @@ async fn a_view_of_another_model_reaches_only_the_surface_that_asks_for_its_mapp
     let a = send(&app, Method::GET, "/x/probe/mapped/mapping", &[], None).await;
     assert_eq!(
         a.json,
-        json!({"view": false, "mapped": "https://uri.etsi.org/ngsi-ld/default-context/Car"})
+        json!({"view": false, "mapped": "https://uri.etsi.org/ngsi-ld/default-context/Car",
+               "names": [["Vehicle"], ["velocity"]], "types": 405})
     );
     let a = send(&app, Method::GET, "/x/probe/cars/mapping", &[], None).await;
     assert_eq!(
-        a.json,
-        json!({"view": true, "mapped": null}),
-        "a view of the store's own model"
+        a.json["names"],
+        Value::Null,
+        "a view of the store's own model: {}",
+        a.json
     );
+    assert_eq!(a.json["mapped"], Value::Null);
+}
+
+/// T-3817: a mapped view names the slots it can produce from what its rules
+/// show of the source class: none shown names the constants alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mapped_view_names_the_slots_its_rules_can_produce() {
+    let (_b, app) = broker().await.expect("broker");
+    let slots = json!([
+        {"target": "velocity", "source": "speed", "kind": "rename"},
+        {"target": "hidden", "source": "secret", "kind": "rename"},
+        {"target": "maker", "kind": "constant", "value": "acme"}
+    ]);
+    for (id, rules, names) in [
+        (
+            "narrow",
+            json!([{"types": ["Car"], "attributes": ["speed"]}]),
+            json!(["maker", "velocity"]),
+        ),
+        (
+            "bare",
+            json!([{"types": ["Car"], "attributes": []}]),
+            json!(["maker"]),
+        ),
+        (
+            "both",
+            json!([{"types": ["Car"], "attributes": ["speed", "secret"]}]),
+            json!(["hidden", "maker", "velocity"]),
+        ),
+    ] {
+        let view = json!({
+            "id": id, "tenant": "city", "selector": ["Car"],
+            "rules": rules,
+            "operations": ["query_entities"],
+            "mapping": {"version": 2, "sourceClass": "Car", "targetClass": "Vehicle", "slots": slots}
+        });
+        let a = send(
+            &app,
+            Method::PUT,
+            &format!("/q/views/{id}"),
+            &[],
+            Some(&view),
+        )
+        .await;
+        assert_eq!(a.status, StatusCode::CREATED, "{}", a.json);
+        let a = send(
+            &app,
+            Method::GET,
+            &format!("/x/probe/{id}/mapping"),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(a.json["names"], json!([["Vehicle"], names]), "{id}");
+    }
 }
 
 /// T-3773: a view's answer is read up to the broker's buffer bound; past it

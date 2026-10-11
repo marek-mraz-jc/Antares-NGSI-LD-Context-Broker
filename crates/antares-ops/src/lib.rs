@@ -605,6 +605,26 @@ impl ViewOps {
         self.view.shows_every_name()
     }
 
+    /// The type and Attribute names a caller of a view of another model
+    /// uses: the target model's, limited to what the view's rules show of
+    /// the source class ([`mapping::Mapping::target_names`]); `None` for a
+    /// view of its stored model.
+    #[must_use]
+    pub fn target_names(&self) -> Option<(Vec<String>, Vec<String>)> {
+        let mapping = self.mapping.as_deref()?;
+        // a mapped view selects its source class alone, and names what it
+        // shows of it: never the `*` form
+        let shown: std::collections::BTreeSet<String> = self
+            .view
+            .narrowing()
+            .rules
+            .iter()
+            .filter(|rule| rule.types.iter().any(|t| t == mapping.source_class()))
+            .flat_map(|rule| rule.attributes.iter().cloned())
+            .collect();
+        Some(mapping.target_names(&shown))
+    }
+
     /// Each Entity type the view shows with the Attributes it shows of it,
     /// as expanded IRIs: the union of the view's rules, type by type. A
     /// surface that builds a model from a schema intersects it with this.
