@@ -118,9 +118,9 @@ and T-3726, which reads multipart framed with a bare LF and runs a JSON batch on
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
 | Minimal | 165 | 104 | 24 | 61.3 % |
-| Intermediate | 222 | 114 | 14 | 66.1 % |
-| Advanced | 159 | 345 | 63 | 31.5 % |
-| **All** (suite summary) | 546 | 563 | 101 | 49.2 % |
+| Intermediate | 225 | 111 | 14 | 67.0 % |
+| Advanced | 167 | 337 | 63 | 33.1 % |
+| **All** (suite summary) | 557 | 552 | 101 | 50.2 % |
 
 Before T-3720 the baseline stood at 456 passed, 660 failed and 94 skipped
 (Minimal 57.8 %, Intermediate 49.4 %, Advanced 26.0 %).
