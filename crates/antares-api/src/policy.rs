@@ -336,6 +336,13 @@ impl Rule {
         self.q.is_some() || self.scope_q.is_some() || self.areas().next().is_some()
     }
 
+    /// Whether the rule holds for exactly the Entities of its types: no
+    /// condition, no ids, no id patterns (what [`Self::holds`] reads beside
+    /// the types).
+    pub fn admits_by_type_alone(&self) -> bool {
+        !self.is_conditional() && self.ids.is_empty() && self.id_patterns.is_empty()
+    }
+
     /// Whether the rule holds for `doc`, an Entity in the form `ctx`
     /// expands names to (the broker's internal form: expanded keys, each
     /// Attribute an array of instances).
@@ -487,6 +494,12 @@ impl Filter {
         !self.rules.is_empty() || !self.omit_by_type.is_empty()
     }
 
+    /// Whether a rule holds for `doc` (every document without rules): what
+    /// [`Self::shown`] answers `Some` for, without building the set.
+    pub fn admits(&self, doc: &Value, ctx: &antares_jsonld::Context) -> bool {
+        self.rules.is_empty() || self.rules.iter().any(|r| r.holds(doc, ctx))
+    }
+
     /// ADR-0023 rule 11: what `doc` may show, or `None` when `rules` is
     /// non-empty and none holds for it (the Entity is out). An Entity sees
     /// the union of the Attributes of the rules that hold for it, less what
@@ -501,6 +514,12 @@ impl Filter {
             held.peek()?;
             Some(held.flat_map(|r| r.attributes.iter().cloned()).collect())
         };
+        if self.omit_by_type.is_empty() {
+            return Some(Shown {
+                only,
+                omitted: Default::default(),
+            });
+        }
         let omitted = entity_types(doc)
             .into_iter()
             .filter_map(|t| self.omit_by_type.get(t))
@@ -1381,6 +1400,41 @@ impl PolicyEngine for Slow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `admits` is `shown(..).is_some()` without the set (T-3667).
+    #[test]
+    fn admits_is_whether_shown_answers() {
+        let ctx = antares_jsonld::core_context();
+        let car = serde_json::json!({"id": "urn:ngsi-ld:Car:1", "type": "Car"});
+        let rule = |t: &str| Rule {
+            types: vec![t.to_owned()],
+            ..Rule::default()
+        };
+        let cases = [
+            Filter::default(),
+            Filter {
+                omit_by_type: BTreeMap::from([("Car".to_owned(), vec!["speed".to_owned()])]),
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("Car")],
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("User")],
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("User"), rule("Car")],
+                ..Filter::default()
+            },
+        ];
+        let admitted: Vec<bool> = cases.iter().map(|f| f.admits(&car, &ctx)).collect();
+        assert_eq!(admitted, [true, true, true, false, true]);
+        for f in &cases {
+            assert_eq!(f.admits(&car, &ctx), f.shown(&car, &ctx).is_some(), "{f:?}");
+        }
+    }
 
     /// T-3482: only the caller's own q is rewritten; the engine's
     /// condition may read what it hides from the caller.

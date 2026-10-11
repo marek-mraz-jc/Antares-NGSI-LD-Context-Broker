@@ -714,6 +714,11 @@ pub mod test_kit {
             self.reload.now().await
         }
 
+        /// The broker's router: the NGSI-LD API and `/q`.
+        pub fn router(&self) -> axum::Router {
+            antares_api::router(self.state.clone())
+        }
+
         /// The NGSI-LD API narrowed by the loaded view `id`: every operation
         /// composed with it as the view root will serve it (ADR-0023).
         ///
