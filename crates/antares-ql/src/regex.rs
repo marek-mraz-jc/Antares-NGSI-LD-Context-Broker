@@ -319,7 +319,6 @@ mod tests {
     /// `MAX_REGEX_CACHE` nor `MAX_REGEX_CACHE_BYTES`, and the programs
     /// handed out across an eviction stay correct.
     #[test]
-    #[cfg_attr(miri, ignore)] // a cap-sized input: past the weekly Miri job's 90 min (T-3706)
     fn cache_stays_bounded_under_many_distinct_patterns() {
         let _serial = serial_lock();
         for i in 0..MAX_REGEX_CACHE * 3 {
@@ -443,7 +442,6 @@ mod tests {
     /// 300 small programs all stay retained, and the counters report them
     /// (T-3531 mutants on the eviction conditions and the byte charge).
     #[test]
-    #[cfg_attr(miri, ignore)] // a cap-sized input: past the weekly Miri job's 90 min (T-3706)
     fn below_the_bounds_every_entry_is_kept() {
         let _serial = serial_lock();
         let a = q_node("keep_a>1").expect("valid q");
@@ -481,7 +479,6 @@ mod tests {
     /// programs past the 32 KiB tier are charged 256 KiB each, so ~260 of
     /// them overrun MAX_REGEX_CACHE_BYTES long before MAX_REGEX_CACHE.
     #[test]
-    #[cfg_attr(miri, ignore)] // a cap-sized input: past the weekly Miri job's 90 min (T-3706)
     fn the_byte_budget_evicts_before_the_entry_count() {
         let _serial = serial_lock();
         for i in 0..300 {
@@ -575,8 +572,7 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|t| {
                 std::thread::spawn(move || {
-                    // Miri interprets every round; 4 still interleave the 8 threads
-                    for round in 0..if cfg!(miri) { 4 } else { 200 } {
+                    for round in 0..200 {
                         let (p, hit, miss) = pats[round % pats.len()];
                         let re = compile(p).expect("valid pattern");
                         assert!(re.is_match(hit), "thread {t} pattern {p}");

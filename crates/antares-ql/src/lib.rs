@@ -33,6 +33,15 @@ pub mod sql;
 
 use antares_model::NgsiError;
 
+/// The pinned core `@context`, parsed once for every test of the crate:
+/// under Miri one parse takes minutes (T-3706).
+#[cfg(test)]
+pub(crate) fn test_core() -> std::sync::Arc<antares_jsonld::Context> {
+    static CORE: std::sync::LazyLock<std::sync::Arc<antares_jsonld::Context>> =
+        std::sync::LazyLock::new(|| std::sync::Arc::new(antares_jsonld::core_context()));
+    std::sync::Arc::clone(&CORE)
+}
+
 /// Entity Type Selection Language (4.17) match against expanded type IRIs:
 /// `,`/`|` = OR of alternatives, `(a;b)` = AND within one alternative.
 pub fn type_selection_matches(sel: &str, types: &[&str], ctx: &antares_jsonld::Context) -> bool {
@@ -1263,7 +1272,7 @@ mod complexity_tests {
     /// expanded against the @context before they are compared.
     #[test]
     fn type_selection_or_and_and() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let d = |t: &str| format!("https://uri.etsi.org/ngsi-ld/default-context/{t}");
         let (car, bus) = (d("Car"), d("Bus"));
         let both = [car.as_str(), bus.as_str()];

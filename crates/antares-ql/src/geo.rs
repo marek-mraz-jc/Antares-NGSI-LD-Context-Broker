@@ -359,7 +359,6 @@ impl GeoQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use antares_jsonld::Loader;
     use serde_json::json;
 
     fn q(rel: &str, gtype: &str, coords: &str) -> GeoQuery {
@@ -428,7 +427,7 @@ mod tests {
     #[test]
     fn near_point() {
         let g = q("near;maxDistance==2000", "Point", "[2.29,48.85]");
-        let ctx = Loader::new().core();
+        let ctx = crate::test_core();
         let doc = json!({
             "https://uri.etsi.org/ngsi-ld/location": [
                 {"type": "GeoProperty", "value": {"type": "Point", "coordinates": [2.30, 48.86]}}
@@ -539,7 +538,7 @@ mod tests {
                 .collect();
             format!("[[{},{}]]", pts.join(","), pts[0])
         };
-        let ctx = Loader::new().core();
+        let ctx = crate::test_core();
         let corpus: Vec<Value> = (0..8)
             .map(|i| {
                 json!({"https://uri.etsi.org/ngsi-ld/location": [
@@ -720,7 +719,7 @@ mod tests {
     /// expanded IRI for every geoproperty.
     #[test]
     fn only_the_default_geoproperty_is_pushed_down_to_sql() {
-        let ctx = Loader::new().core();
+        let ctx = crate::test_core();
         let mut params = HashMap::new();
         params.insert("georel".to_owned(), "within".to_owned());
         params.insert("geometry".to_owned(), "Polygon".to_owned());
@@ -811,7 +810,6 @@ mod tests {
 #[cfg(test)]
 mod clause_4_10_grammar {
     use super::*;
-    use antares_jsonld::Loader;
     use serde_json::json;
 
     fn params(rel: &str) -> HashMap<String, String> {
@@ -854,7 +852,7 @@ mod clause_4_10_grammar {
     /// query shall be considered as non-matching."
     #[test]
     fn missing_target_geoproperty_is_a_nonmatch() {
-        let ctx = Loader::new().core();
+        let ctx = crate::test_core();
         let g = GeoQuery::from_params(&params("near;maxDistance==2000"))
             .unwrap()
             .unwrap();
