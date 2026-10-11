@@ -223,17 +223,40 @@ pub(crate) fn type_rules(
     if !f.has_rules() {
         return None;
     }
+    // The expansion is a function of the rules alone, and a view or an
+    // engine answers every request with the same ones: the last expansion
+    // is kept per thread and handed out again while its rules come back
+    // (T-3667). It is keyed by the whole input, so it never answers for
+    // rules other than its own (O16).
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(crate::policy::Filter, std::sync::Arc<crate::policy::Filter>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let hit = LAST.with_borrow(|last| {
+        last.as_ref()
+            .filter(|l| l.0.rules == f.rules && l.0.omit_by_type == f.omit_by_type)
+            .map(|l| l.1.clone())
+    });
+    if hit.is_some() {
+        return hit;
+    }
     let expand = |names: &[String]| -> Vec<String> {
         names.iter().map(|n| POLICY_CONTEXT.expand_key(n)).collect()
     };
-    Some(std::sync::Arc::new(crate::policy::Filter {
+    let expanded = std::sync::Arc::new(crate::policy::Filter {
         rules: f
             .rules
             .iter()
             .map(|r| crate::policy::Rule {
                 types: expand(&r.types),
                 attributes: expand(&r.attributes),
-                ..r.clone()
+                q: r.q.clone(),
+                scope_q: r.scope_q.clone(),
+                geo_q: r.geo_q.clone(),
+                geo_also: r.geo_also.clone(),
+                ids: r.ids.clone(),
+                id_patterns: r.id_patterns.clone(),
+                temporal: r.temporal.clone(),
             })
             .collect(),
         omit_by_type: f
@@ -242,7 +265,14 @@ pub(crate) fn type_rules(
             .map(|(t, attrs)| (POLICY_CONTEXT.expand_key(t), expand(attrs)))
             .collect(),
         ..crate::policy::Filter::default()
-    }))
+    });
+    let key = crate::policy::Filter {
+        rules: f.rules.clone(),
+        omit_by_type: f.omit_by_type.clone(),
+        ..crate::policy::Filter::default()
+    };
+    LAST.set(Some((key, expanded.clone())));
+    Some(expanded)
 }
 
 /// What the expanded `rules` let the INTERNAL document `doc` show: every
@@ -2067,5 +2097,52 @@ mod clause_6_3_7 {
         let empty = to_geojson_collection(vec![], None);
         assert_eq!(empty["type"], "FeatureCollection");
         assert_eq!(empty["features"], json!([]));
+    }
+}
+
+#[cfg(test)]
+mod type_rules_memo_tests {
+    use super::type_rules;
+    use crate::policy::{Filter, Rule};
+    use std::collections::BTreeMap;
+
+    fn filter(t: &str, attr: &str) -> Filter {
+        Filter {
+            rules: vec![Rule {
+                types: vec![t.to_owned()],
+                attributes: vec![attr.to_owned()],
+                ..Rule::default()
+            }],
+            ..Filter::default()
+        }
+    }
+
+    const DEFAULT: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+
+    /// The memo answers only for the rules it was made from: alternating
+    /// filters (two views, two subjects) each get their own expansion.
+    #[test]
+    fn the_memo_answers_only_for_its_own_rules() {
+        let (car, user) = (filter("Car", "speed"), filter("User", "name"));
+        for f in [&car, &user, &car, &car, &user] {
+            let got = type_rules(f).unwrap();
+            let r = &f.rules[0];
+            assert_eq!(got.rules[0].types, vec![format!("{DEFAULT}{}", r.types[0])]);
+            assert_eq!(
+                got.rules[0].attributes,
+                vec![format!("{DEFAULT}{}", r.attributes[0])]
+            );
+        }
+        let omitting = Filter {
+            omit_by_type: BTreeMap::from([("Car".to_owned(), vec!["speed".to_owned()])]),
+            ..car.clone()
+        };
+        let got = type_rules(&omitting).unwrap();
+        assert_eq!(
+            got.omit_by_type.get(&format!("{DEFAULT}Car")),
+            Some(&vec![format!("{DEFAULT}speed")])
+        );
+        assert!(type_rules(&car).unwrap().omit_by_type.is_empty());
+        assert!(type_rules(&Filter::default()).is_none());
     }
 }

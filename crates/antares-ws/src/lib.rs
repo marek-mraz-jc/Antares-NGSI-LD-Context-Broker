@@ -41,15 +41,15 @@ pub use limits::{
 use antares_ops::{
     Caller, DeliveryError, DeliveryFuture, NgsiError, NotificationSink, Ops, Outbound, Surface,
 };
-use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::Path;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{Path, Request};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use serde_json::json;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 
 /// The view root ADR-0023 rule 10 names, shared with the other view
 /// surfaces.
@@ -141,8 +141,8 @@ impl Surface for Ws {
         Router::new().route(
             "/ngsi-ld/v1",
             get(
-                move |caller: Caller, headers: HeaderMap, ws: WebSocketUpgrade| async move {
-                    upgrade(hub, ops, None, caller, &headers, ws)
+                move |caller: Caller, req: Request| async move {
+                    upgrade(hub, ops, None, caller, req)
                 },
             ),
         )
@@ -167,11 +167,8 @@ impl Surface for ViewWs {
         Router::new().route(
             "/{view}/ws",
             get(
-                move |Path(view): Path<String>,
-                      caller: Caller,
-                      headers: HeaderMap,
-                      ws: WebSocketUpgrade| async move {
-                    upgrade(hub, ops, Some(view), caller, &headers, ws)
+                move |Path(view): Path<String>, caller: Caller, req: Request| async move {
+                    upgrade(hub, ops, Some(view), caller, req)
                 },
             ),
         )
@@ -189,16 +186,73 @@ fn problem(status: StatusCode, title: &str, detail: &str) -> Response {
         .into_response()
 }
 
-/// The upgrade (rules 2, 8 and 10): the `Origin` allowlist, the Tenant (or
-/// the view's), the admission caps, then the socket.
+/// A refused handshake: status, problem title and detail.
+type Refusal = (StatusCode, &'static str, &'static str);
+
+/// The opening handshake of RFC 6455 section 4.2.2 on an HTTP/1.1 GET: the
+/// `Sec-WebSocket-Accept` value and the connection hyper hands over after
+/// the 101. axum's `ws` feature does the same, and is not used: cargo
+/// unifies it across the workspace, which put tungstenite into the vanilla
+/// broker's axum (T-3704).
+fn handshake(req: &mut Request) -> Result<(String, hyper::upgrade::OnUpgrade), Refusal> {
+    let headers = req.headers();
+    let lists = |name: header::HeaderName, token: &str| {
+        headers.get_all(name).iter().any(|v| {
+            v.to_str()
+                .is_ok_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
+        })
+    };
+    if !lists(header::CONNECTION, "upgrade") || !lists(header::UPGRADE, "websocket") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "BadRequestData",
+            "this is a WebSocket endpoint: send Connection: upgrade and Upgrade: websocket",
+        ));
+    }
+    if headers
+        .get(header::SEC_WEBSOCKET_VERSION)
+        .map(axum::http::HeaderValue::as_bytes)
+        != Some(b"13")
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "BadRequestData",
+            "Sec-WebSocket-Version is 13",
+        ));
+    }
+    let Some(key) = headers.get(header::SEC_WEBSOCKET_KEY) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "BadRequestData",
+            "no Sec-WebSocket-Key",
+        ));
+    };
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    let on_upgrade = req
+        .extensions_mut()
+        .remove::<hyper::upgrade::OnUpgrade>()
+        .ok_or((
+            StatusCode::UPGRADE_REQUIRED,
+            "OperationNotSupported",
+            "this connection cannot be upgraded",
+        ))?;
+    Ok((accept, on_upgrade))
+}
+
+/// The upgrade (rules 2, 8 and 10): the handshake, the `Origin` allowlist,
+/// the Tenant (or the view's), the admission caps, then the socket.
 fn upgrade(
     hub: Arc<Hub>,
     ops: Ops,
     view: Option<String>,
     caller: Caller,
-    headers: &HeaderMap,
-    ws: WebSocketUpgrade,
+    mut req: Request,
 ) -> Response {
+    let (accept, on_upgrade) = match handshake(&mut req) {
+        Ok(h) => h,
+        Err((status, title, detail)) => return problem(status, title, detail),
+    };
+    let headers = req.headers();
     if let Some(origin) = headers.get(header::ORIGIN) {
         let allowed = hub
             .limits
@@ -265,17 +319,38 @@ fn upgrade(
             )
         }
     };
-    let (failed_hub, failed_id) = (hub.clone(), conn.id.clone());
     // tungstenite reads into a 128 KiB buffer by default, four times the
     // budget of an idle connection (ADR-0027 section 6); client messages
     // are small, and a large one is read in more chunks.
-    ws.read_buffer_size(READ_BUFFER_BYTES)
-        .max_message_size(envelope::MAX_MESSAGE_BYTES)
-        .max_frame_size(envelope::MAX_FRAME_BYTES)
+    let config = WebSocketConfig::default()
+        .read_buffer_size(READ_BUFFER_BYTES)
+        .max_message_size(Some(envelope::MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(envelope::MAX_FRAME_BYTES))
         .write_buffer_size(0)
-        .max_write_buffer_size(MAX_NOTIFICATION_BYTES.saturating_mul(2))
-        .on_failed_upgrade(move |_| failed_hub.close(&failed_id))
-        .on_upgrade(move |socket| socket::serve(hub, conn, socket))
+        .max_write_buffer_size(MAX_NOTIFICATION_BYTES.saturating_mul(2));
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(upgraded) => {
+                let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                    hyper_util::rt::TokioIo::new(upgraded),
+                    Role::Server,
+                    Some(config),
+                )
+                .await;
+                socket::serve(hub, conn, socket).await;
+            }
+            Err(_) => hub.close(&conn.id),
+        }
+    });
+    (
+        StatusCode::SWITCHING_PROTOCOLS,
+        [
+            (header::CONNECTION, "upgrade".to_owned()),
+            (header::UPGRADE, "websocket".to_owned()),
+            (header::SEC_WEBSOCKET_ACCEPT, accept),
+        ],
+    )
+        .into_response()
 }
 
 /// The read buffer of one socket.
