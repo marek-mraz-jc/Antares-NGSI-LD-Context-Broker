@@ -49,6 +49,7 @@ tracing-opentelemetry = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
 console-subscriber = { workspace = true, optional = true }
 antares-plugin-example = { workspace = true, optional = true }
+joinedcontext-policy = { workspace = true, optional = true }
 antares-ops = { workspace = true, optional = true }
 antares-views = { workspace = true, optional = true }
 antares-mcp = { workspace = true, optional = true }
@@ -73,6 +74,11 @@ mqtt = ["antares-api/mqtt"]
 # and a non-network notification binding, none of which belong in a release
 # image. It exists so the seams are proven from outside, not documented.
 plugin-example = ["dep:antares-plugin-example"]
+# The joinedcontext platform's policy engine (ADR-0020 addon, T-3637):
+# `ANTARES_POLICY=joinedcontext`, the Tenant's Policy rules loaded through
+# `/q/policy/{tenant}`. Only the platform image builds it (T-3636); vanilla
+# Antares ships `allow-all`.
+jc-policy = ["dep:joinedcontext-policy"]
 # Endpoint views (ADR-0023): the view table, `/q/views` on the admin surface
 # and its reload, and the view root `/x/views/{view}/ngsi-ld/v1`
 # (`ANTARES_API_SURFACES=admin,views`). Off by default: a vanilla broker
@@ -92,6 +98,11 @@ odata = ["views", "dep:antares-odata"]
 # (`ANTARES_API_SURFACES=...,ws`), and with `views` also
 # `/x/views/{view}/ws` (`ws-views`); its sink serves `urn:antares:ws:`.
 ws = ["dep:antares-ops", "dep:antares-ws"]
+
+# Every surface the broker serves (ADR-0027 Consequences, T-3636): what
+# `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
+# sets it; the platform image builds `full,jc-policy` (image-jc.yml).
+full = ["views", "mcp", "odata", "ws"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
 # Unix-only: the wasm target keeps the default allocator.

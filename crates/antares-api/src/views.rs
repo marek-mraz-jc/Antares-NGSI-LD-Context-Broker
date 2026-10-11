@@ -36,7 +36,7 @@ pub const MAX_COMPOSED_RULES: usize = 4096;
 /// would serve everything.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledView {
-    narrowing: Filter,
+    narrowing: Arc<Filter>,
     /// The view's id, recorded on what is made through it (a
     /// Subscription's `__view`, rule 9).
     id: String,
@@ -83,13 +83,13 @@ impl CompiledView {
             );
         }
         Ok(Self {
-            narrowing: Filter {
+            narrowing: Arc::new(Filter {
                 q: q.map(Box::new),
                 scope_q,
                 geo_q: geo_q.map(Box::new),
                 rules,
                 ..Filter::default()
-            },
+            }),
             id: String::new(),
         })
     }
@@ -140,8 +140,8 @@ const LIST_CONTEXTS: &str = "5.13.3";
 pub fn with_view(
     view: Option<&CompiledView>,
     clause: &str,
-    engine: Result<Filter, Denied>,
-) -> Result<Filter, Denied> {
+    engine: Result<Arc<Filter>, Denied>,
+) -> Result<Arc<Filter>, Denied> {
     let Some(view) = view else {
         return engine;
     };
@@ -162,12 +162,12 @@ pub fn with_view(
         // Rule 7: the handler checks the view on the stored Entity before
         // and after the write (`WriteGuard`); the engine's own answer
         // still refuses a narrowed write, as it does without a view.
-        return match resolve(clause, Decision::Filter(engine?)) {
+        return match resolve(clause, Decision::Filter(Arc::unwrap_or_clone(engine?))) {
             Decision::Deny(why) => Err(Denied(why)),
             // 5.8.4 lists the view's own and keeps the engine's selection
             // among them (T-3673)
-            Decision::Filter(f) if crate::policy::RECORD_LISTS.contains(&clause) => Ok(f),
-            _ => Ok(Filter::default()),
+            Decision::Filter(f) if crate::policy::RECORD_LISTS.contains(&clause) => Ok(Arc::new(f)),
+            _ => Ok(crate::policy::unnarrowed()),
         };
     }
     if crate::policy::RECORD_LISTS.contains(&clause) && !view.narrowing().is_empty() {
@@ -178,11 +178,26 @@ pub fn with_view(
             "{clause} lists records an Entity view cannot narrow"
         )));
     }
-    let composed = compose(view.narrowing(), engine?)?;
+    // An engine that narrows nothing (allow-all) leaves the view's own
+    // narrowing: `compose(v, Filter::default())` is `v`, so the pairing is
+    // skipped on the path every request of an allow-all broker takes
+    // (T-3697, ADR-0027 section 6).
+    // A query keeps a filter as it is (`resolve`), so there the view's
+    // compiled narrowing itself is the answer, shared and not copied.
+    let engine = engine?;
+    let narrows_nothing = *engine == Filter::default();
+    if narrows_nothing && crate::policy::FILTERABLE.contains(&clause) {
+        return Ok(view.narrowing.clone());
+    }
+    let composed = if narrows_nothing {
+        Filter::clone(view.narrowing())
+    } else {
+        compose(view.narrowing(), Arc::unwrap_or_clone(engine))?
+    };
     match resolve(clause, Decision::Filter(composed)) {
-        Decision::Allow => Ok(Filter::default()),
+        Decision::Allow => Ok(crate::policy::unnarrowed()),
         // `resolve` makes no condition of a filter
-        Decision::Filter(f) | Decision::AllowIf(f) => Ok(f),
+        Decision::Filter(f) | Decision::AllowIf(f) => Ok(Arc::new(f)),
         Decision::Deny(why) => Err(Denied(why)),
     }
 }
@@ -348,7 +363,13 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
                 geo_also,
                 ids,
                 id_patterns,
-                attributes: shared(&x.attributes, y.attributes.clone()),
+                // a side that shows every Attribute leaves the other's list
+                attributes: match (x.every_attribute, y.every_attribute) {
+                    (true, _) => y.attributes.clone(),
+                    (false, true) => x.attributes.clone(),
+                    (false, false) => shared(&x.attributes, y.attributes.clone()),
+                },
+                every_attribute: x.every_attribute && y.every_attribute,
                 temporal: [x.temporal.as_slice(), y.temporal.as_slice()].concat(),
             });
         }
@@ -911,11 +932,11 @@ mod tests {
     fn the_context_list_is_the_one_read_a_view_does_not_narrow() {
         let view = cars();
         assert_eq!(
-            with_view(Some(&view), LIST_CONTEXTS, Ok(Filter::default())),
-            Ok(Filter::default())
+            with_view(Some(&view), LIST_CONTEXTS, Ok(Arc::new(Filter::default()))),
+            Ok(Arc::new(Filter::default()))
         );
         assert!(
-            with_view(Some(&view), "5.13.4", Ok(Filter::default())).is_err(),
+            with_view(Some(&view), "5.13.4", Ok(Arc::new(Filter::default()))).is_err(),
             "serving a stored @context is refused under a view"
         );
     }
@@ -949,12 +970,12 @@ mod tests {
             ..Filter::default()
         };
         assert_eq!(
-            with_view(Some(&view), "5.8.4", Ok(mine.clone())),
-            Ok(mine.clone())
+            with_view(Some(&view), "5.8.4", Ok(Arc::new(mine.clone()))),
+            Ok(Arc::new(mine.clone()))
         );
         assert_eq!(
-            with_view(Some(&view), "5.8.4", Ok(Filter::default())),
-            Ok(Filter::default())
+            with_view(Some(&view), "5.8.4", Ok(Arc::new(Filter::default()))),
+            Ok(Arc::new(Filter::default()))
         );
         // a view that only selects, so nothing projects and only the rule
         // above refuses
@@ -969,8 +990,8 @@ mod tests {
         assert!(!fast.narrowing().projects());
         for v in [&view, &fast] {
             for clause in ["5.10.2", "5.11.5"] {
-                assert!(with_view(Some(v), clause, Ok(Filter::default())).is_err());
-                assert!(with_view(Some(v), clause, Ok(mine.clone())).is_err());
+                assert!(with_view(Some(v), clause, Ok(Arc::new(Filter::default()))).is_err());
+                assert!(with_view(Some(v), clause, Ok(Arc::new(mine.clone()))).is_err());
             }
         }
     }
@@ -1297,10 +1318,10 @@ mod tests {
             pick: vec!["speed".into()],
             ..Filter::default()
         };
-        assert!(with_view(Some(&cars()), "5.6.1", Ok(narrowed)).is_err());
+        assert!(with_view(Some(&cars()), "5.6.1", Ok(Arc::new(narrowed))).is_err());
         assert_eq!(
-            with_view(Some(&cars()), "5.6.1", Ok(Filter::default())),
-            Ok(Filter::default())
+            with_view(Some(&cars()), "5.6.1", Ok(Arc::new(Filter::default()))),
+            Ok(Arc::new(Filter::default()))
         );
     }
 
@@ -1365,6 +1386,72 @@ mod tests {
             pair_rules(&[by(&[], &["a"])], vec![by(&[], &["b"])]).is_err(),
             "two pattern lists refuse rather than widen"
         );
+    }
+
+    /// T-3697: the allow-all shortcut widens nothing. For every shape a
+    /// view's narrowing takes, composing it with an engine that narrows
+    /// nothing is the narrowing itself.
+    #[test]
+    fn a_view_composed_with_an_engine_that_narrows_nothing_is_the_view() {
+        let area = antares_ql::geo::GeoQuery::from_params(
+            &[
+                ("georel".to_owned(), "near;maxDistance==10".to_owned()),
+                ("geometry".to_owned(), "Point".to_owned()),
+                ("coordinates".to_owned(), "[1,2]".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect("geo")
+        .expect("an area");
+        let views = [
+            cars(),
+            CompiledView::new(
+                &["Car".into(), "Bike".into()],
+                Some(antares_ql::parse_q("speed>1").expect("q")),
+                Some("/city/#".into()),
+                Some(area),
+                vec![
+                    rule(&["Car"], Some("colour==\"red\""), &["speed"]),
+                    Rule {
+                        ids: vec!["urn:ngsi-ld:Bike:1".into()],
+                        ..rule(&["Bike"], None, &[])
+                    },
+                ],
+            )
+            .expect("view"),
+        ];
+        for v in &views {
+            assert_eq!(
+                compose(v.narrowing(), Filter::default()),
+                Ok(v.narrowing().clone())
+            );
+            assert_eq!(
+                with_view(Some(v), "5.7.2", Ok(Arc::new(Filter::default()))),
+                Ok(Arc::new(v.narrowing().clone()))
+            );
+        }
+    }
+
+    #[test]
+    fn a_side_over_every_attribute_leaves_the_other_sides_list() {
+        let every = Rule {
+            every_attribute: true,
+            ..rule(&["Car"], None, &[])
+        };
+        let both = pair_rules(
+            std::slice::from_ref(&every),
+            vec![rule(&["Car"], None, &["speed"])],
+        )
+        .expect("pairs");
+        assert_eq!(both[0].attributes, vec!["speed"]);
+        assert!(!both[0].every_attribute);
+        let both =
+            pair_rules(&[rule(&["Car"], None, &["colour"])], vec![every.clone()]).expect("pairs");
+        assert_eq!(both[0].attributes, vec!["colour"]);
+        assert!(!both[0].every_attribute);
+        let both = pair_rules(std::slice::from_ref(&every), vec![every.clone()]).expect("pairs");
+        assert!(both[0].every_attribute && both[0].attributes.is_empty());
     }
 
     #[test]
@@ -1568,7 +1655,10 @@ mod tests {
             pick: vec!["a".into()],
             ..Filter::default()
         };
-        assert_eq!(with_view(None, "5.6.1", Ok(f.clone())), Ok(f));
+        assert_eq!(
+            with_view(None, "5.6.1", Ok(Arc::new(f.clone()))),
+            Ok(Arc::new(f))
+        );
         assert_eq!(
             with_view(Some(&cars()), "5.7.2", Err(Denied("no".into()))),
             Err(Denied("no".into()))

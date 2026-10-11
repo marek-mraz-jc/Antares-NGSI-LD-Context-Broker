@@ -50,6 +50,10 @@ jobs:
             # three stay binaries of their own, so both are named. `Slow` is
             # the test-kit wrapper the engine contract sleeps in, not seam code.
             args: -p antares-api -f crates/antares-api/src/policy.rs --exclude-re 'for Slow' -- --lib --test it --test 'policy_*'
+          - name: jc-policy
+            shards: 6
+            # the platform's engine (T-3637): its own unit and router tests
+            args: -p joinedcontext-policy
         shard: [0, 1, 2, 3, 4, 5]
     env:
       CARGO_TERM_COLOR: never

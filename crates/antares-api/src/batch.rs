@@ -899,7 +899,7 @@ async fn batch_write(
     crate::views::with_view(
         st.view.as_deref(),
         mode.clause(),
-        Ok(crate::policy::Filter::default()),
+        Ok(crate::policy::unnarrowed()),
     )?;
     let mut conds = Conditions::default();
     if let Some(engine) = &st.policy {
@@ -1530,7 +1530,7 @@ pub async fn batch_delete(
         crate::views::with_view(
             st.view.as_deref(),
             "5.6.10",
-            Ok(crate::policy::Filter::default()),
+            Ok(crate::policy::unnarrowed()),
         )?;
         if let Some(engine) = &st.policy {
             let mut pres: Vec<crate::policy::PreImage> = Vec::new();
