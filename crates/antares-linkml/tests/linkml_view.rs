@@ -413,7 +413,7 @@ async fn an_oversized_schema_is_refused_and_the_surface_stays_closed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_schema_outside_the_subset_or_none_closes_the_surface() {
     let mut outside = schema();
-    outside["imports"] = json!(["linkml:types"]);
+    outside["imports"] = json!(["https://w3id.org/biolink/biolink-model"]);
     let app = broker(None, &view(&READS), Some(&outside))
         .await
         .expect("a broker");
