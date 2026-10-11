@@ -969,6 +969,7 @@ async fn health(
     #[cfg(feature = "views")]
     {
         body["views"] = state.views.report();
+        body["schemas"] = state.views.schema_report();
     }
     // Changes the bounded matcher queue dropped (this process, since start).
     body["changesDropped"] = notify::changes_dropped().into();

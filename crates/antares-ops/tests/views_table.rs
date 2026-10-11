@@ -362,6 +362,9 @@ fn the_view_routes_answer_503_once_their_runtime_has_stopped() {
             (Method::GET, "/q/views/v", None),
             (Method::PUT, "/q/views/v", Some(view("v").to_string())),
             (Method::DELETE, "/q/views/v", None),
+            (Method::GET, "/q/schemas/city", None),
+            (Method::PUT, "/q/schemas/city", Some("{}".to_owned())),
+            (Method::DELETE, "/q/schemas/city", None),
         ] {
             let (s, b) = send_raw(&app, method, uri, None, body).await;
             assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {b}");
