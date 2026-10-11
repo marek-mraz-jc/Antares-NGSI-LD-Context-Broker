@@ -60,6 +60,9 @@ pub enum Scanned {
         next: Option<usize>,
         /// The exact count of the answer, when the page asked for the whole of it.
         count: Option<usize>,
+        /// An upstream page said its join walk stopped at the lookup budget (an `NGSILD-Warning`
+        /// naming `truncated`, TS 104 175 4.5.23.1): some Linked Entity is missing.
+        truncated: bool,
     },
     /// The store's own answer to the pushdown when it was no success (a broken `q`: 400), for
     /// the surface to render as it renders [`ViewOps::run`]'s.
@@ -120,10 +123,11 @@ impl ViewOps {
             page.size,
             page.start
         );
-        let (mut batch, total) = match read(self.query(caller, pushdown, &query).await?).await? {
-            Ok(read) => read,
-            Err(answer) => return Ok(Scanned::Answer(answer)),
-        };
+        let (mut batch, total, truncated) =
+            match read(self.query(caller, pushdown, &query).await?).await? {
+                Ok(read) => read,
+                Err(answer) => return Ok(Scanned::Answer(answer)),
+            };
         for entity in &mut batch {
             strip(entity, &[], false, local);
         }
@@ -133,6 +137,7 @@ impl ViewOps {
             entities: batch,
             next,
             count: total.filter(|_| page.whole),
+            truncated,
         })
     }
 
@@ -170,7 +175,7 @@ impl ViewOps {
         if page.whole {
             let counted = format!("{fixed}&limit=0&count=true");
             match read(self.query(caller, pushdown, &counted).await?).await? {
-                Ok((_, total)) => {
+                Ok((_, total, _)) => {
                     // no count is no promise the answer fits
                     cap = total.unwrap_or(usize::MAX);
                     if cap > budget {
@@ -182,9 +187,9 @@ impl ViewOps {
         }
         let size = if page.whole { usize::MAX } else { page.size };
         let mut entities = Vec::new();
-        let (mut offset, mut read_so_far) = (page.start, 0usize);
+        let (mut offset, mut read_so_far, mut truncated) = (page.start, 0usize, false);
         if size == 0 {
-            return Ok(served(entities, None, None, read_so_far));
+            return Ok(served(entities, None, None, (read_so_far, truncated)));
         }
         loop {
             let limit = upstream.min(cap.saturating_sub(read_so_far));
@@ -193,11 +198,14 @@ impl ViewOps {
                 // full and is served short with its continuation.
                 let count = page.whole.then_some(entities.len());
                 let next = (!page.whole).then_some(offset);
-                return Ok(served(entities, next, count, read_so_far));
+                return Ok(served(entities, next, count, (read_so_far, truncated)));
             }
             let query = format!("{fixed}&limit={limit}&offset={offset}");
             let batch = match read(self.query(caller, pushdown, &query).await?).await? {
-                Ok((batch, _)) => batch,
+                Ok((batch, _, cut)) => {
+                    truncated |= cut;
+                    batch
+                }
                 Err(answer) => return Ok((Scanned::Answer(answer), read_so_far)),
             };
             let last = batch.len();
@@ -214,12 +222,13 @@ impl ViewOps {
                 entities.push(entity);
                 if entities.len() == size {
                     let more = !(ended && i.saturating_add(1) == last);
-                    return Ok(served(entities, more.then_some(offset), None, read_so_far));
+                    let next = more.then_some(offset);
+                    return Ok(served(entities, next, None, (read_so_far, truncated)));
                 }
             }
             if ended {
                 let count = page.whole.then_some(entities.len());
-                return Ok(served(entities, None, count, read_so_far));
+                return Ok(served(entities, None, count, (read_so_far, truncated)));
             }
         }
     }
@@ -243,13 +252,14 @@ fn served(
     entities: Vec<Value>,
     next: Option<usize>,
     count: Option<usize>,
-    read: usize,
+    (read, truncated): (usize, bool),
 ) -> (Scanned, usize) {
     (
         Scanned::Page {
             entities,
             next,
             count,
+            truncated,
         },
         read,
     )
@@ -332,12 +342,18 @@ fn join<'a>(names: impl Iterator<Item = &'a str>) -> String {
     out
 }
 
-/// The Entities of a successful Query Entities answer and its `NGSILD-Results-Count`, or the
-/// answer itself when the store answered with anything but a success.
-async fn read(answer: Response) -> Result<Result<(Vec<Value>, Option<usize>), Response>, Refusal> {
+/// The Entities of a successful Query Entities answer, its `NGSILD-Results-Count` and whether
+/// it warns its join walk was truncated, or the answer itself when the store answered with
+/// anything but a success.
+async fn read(answer: Response) -> Result<Result<Upstream, Response>, Refusal> {
     if !answer.status().is_success() {
         return Ok(Err(answer));
     }
+    let truncated = answer
+        .headers()
+        .get_all("NGSILD-Warning")
+        .iter()
+        .any(|w| w.as_bytes().windows(9).any(|at| at == b"truncated"));
     let total = answer
         .headers()
         .get("NGSILD-Results-Count")
@@ -347,12 +363,15 @@ async fn read(answer: Response) -> Result<Result<(Vec<Value>, Option<usize>), Re
         .await
         .ok();
     match bytes.and_then(|b| serde_json::from_slice(&b).ok()) {
-        Some(Value::Array(entities)) => Ok(Ok((entities, total))),
+        Some(Value::Array(entities)) => Ok(Ok((entities, total, truncated))),
         _ => Err(Refusal::Malformed(
             "the store's answer is no list of Entities",
         )),
     }
 }
+
+/// One upstream page: its Entities, its count and whether its join walk was truncated.
+type Upstream = (Vec<Value>, Option<usize>, bool);
 
 /// The members of an Attribute that hold its value, never an Attribute of their own.
 const VALUES: [&str; 7] = [

@@ -394,21 +394,13 @@ pub(crate) fn query(
     expansions: &[Expansion],
     filter: &Translated,
 ) -> String {
-    let nested = expansions.iter().filter_map(|e| match &e.writes {
-        Writes::Entities(picked) => Some(picked.as_deref()),
-        Writes::Refs(_) => None,
-    });
-    let joined = filter.linked || nested.clone().count() > 0;
-    let structural: Vec<&str>;
+    let nested = nested(expansions);
+    let joined = joins(expansions, filter);
+    let frame: Vec<&str>;
     let picked = match picked {
         None if joined => {
-            structural = set
-                .members
-                .iter()
-                .filter(|(_, m)| !matches!(m.shape, Shape::Nav { .. }))
-                .map(|(name, _)| name.as_str())
-                .collect();
-            Some(structural.as_slice())
+            frame = structural(set);
+            Some(frame.as_slice())
         }
         picked => picked,
     };
@@ -451,6 +443,31 @@ pub(crate) fn query(
     q
 }
 
+/// The `$select` of each expansion of entities.
+fn nested<'e>(expansions: &'e [Expansion]) -> impl Iterator<Item = Option<&'e [&'e str]>> + Clone {
+    expansions.iter().filter_map(|e| match &e.writes {
+        Writes::Entities(picked) => Some(picked.as_deref()),
+        Writes::Refs(_) => None,
+    })
+}
+
+/// Whether a read joins: an expansion of entities or a `q` that follows a
+/// Relationship (5.7.2.4).
+fn joins(expansions: &[Expansion], filter: &Translated) -> bool {
+    filter.linked || nested(expansions).next().is_some()
+}
+
+/// The members a join without `$select` projects to: every one but the
+/// navigations, so a navigation not expanded spends none of the walk's
+/// lookups.
+fn structural(set: &Set) -> Vec<&str> {
+    set.members
+        .iter()
+        .filter(|(_, m)| !matches!(m.shape, Shape::Nav { .. }))
+        .map(|(name, _)| name.as_str())
+        .collect()
+}
+
 /// Which Entities a query selects: its type, `id`, `q`, `geoQ`,
 /// `expandValues` and the `ngsild.*` parameters.
 fn selection(set: &Set, filter: &Translated) -> String {
@@ -489,6 +506,15 @@ fn pushdown(
     expansions: &[Expansion],
     filter: &mut Translated,
 ) -> Pushdown {
+    let joined = joins(expansions, filter);
+    let frame: Vec<&str>;
+    let picked = match picked {
+        None if joined => {
+            frame = structural(set);
+            Some(frame.as_slice())
+        }
+        picked => picked,
+    };
     let attrs = picked.map(|names| {
         let iris = names
             .iter()
@@ -511,15 +537,19 @@ fn pushdown(
     let system = |names: Option<&[&str]>| {
         names.is_some_and(|n| n.iter().any(|m| matches!(*m, "createdAt" | "modifiedAt")))
     };
+    let mut query = selection(set, filter);
+    if joined {
+        query.push_str("&join=inline&joinLevel=1");
+    }
     Pushdown {
-        query: selection(set, filter),
+        query,
         order: filter
             .order
             .as_deref()
             .map(|keys| keys.split(',').map(str::to_owned).collect())
             .unwrap_or_default(),
         attrs,
-        sys_attrs: system(picked) || filter.sort_system,
+        sys_attrs: system(picked) || nested(expansions).any(system) || filter.sort_system,
         context: (!filter.context.is_empty()).then(|| Value::Object(filter.context.clone())),
     }
 }
@@ -598,15 +628,6 @@ async fn evaluated(
         counted,
         version,
     } = window;
-    let joined = filter.linked
-        || expansions
-            .iter()
-            .any(|e| matches!(e.writes, Writes::Entities(_)));
-    if joined {
-        // The scan reads no NGSILD-Warning: a join it walked could be
-        // truncated unseen (S1, O6), so a residual stays off a join.
-        return Err(not_implemented(version));
-    }
     let pushdown = pushdown(set, picked, expansions, filter);
     Ok(if counted || filter.sort.is_some() {
         // The whole answer, counted and sorted here (ADR-0028 rule 5); the
@@ -805,8 +826,6 @@ async fn count(
             .await?
             .1
         }
-        // A hop is evaluated under a join the scan cannot see truncated.
-        Some(_) if filter.linked => return Err(not_implemented(version)),
         Some(program) => {
             filter.sort = None;
             let pushdown = pushdown(set, None, &[], &mut filter);
@@ -1122,21 +1141,13 @@ pub(crate) async fn run_request(
     if !answer.status().is_success() {
         return Err(refused(answer.status(), version));
     }
-    // The join walk stopped at the broker's lookup budget (4.5.23.1): an
-    // OData client cannot see the NGSI-LD warning, so a partial expansion
-    // is refused (S1, O6, D9).
     let truncated = answer
         .headers()
         .get_all("NGSILD-Warning")
         .iter()
         .any(|w| w.as_bytes().windows(9).any(|at| at == b"truncated"));
     if truncated {
-        return Err(ODataErrorResponse::new(
-            StatusCode::BAD_REQUEST,
-            "BadRequest",
-            "the expansion reaches more Entities than one answer embeds: narrow it with $top or $filter",
-        )
-        .with_version(version));
+        return Err(truncated_join(version));
     }
     let total = answer
         .headers()
@@ -1506,6 +1517,10 @@ async fn scanned(
     version: ODataVersion,
 ) -> Result<(Vec<Value>, Option<usize>), ODataErrorResponse> {
     match reads.view.scan(caller, pushdown, Some(program), page).await {
+        // T-3823: a scanned join is refused like a pushed one when the walk stopped short
+        Ok(Scanned::Page {
+            truncated: true, ..
+        }) => Err(truncated_join(version)),
         Ok(Scanned::Page { entities, next, .. }) => Ok((entities, next)),
         // A query answers 404 for a Tenant that holds nothing yet (5.5.10).
         Ok(Scanned::Answer(answer)) if answer.status() == StatusCode::NOT_FOUND => {
@@ -1524,6 +1539,18 @@ async fn scanned(
         // within MAX_NODES reaches: a plain 400
         Err(other) => Err(refused(other.status(), version)),
     }
+}
+
+/// The join walk stopped at the broker's lookup budget (4.5.23.1): an OData
+/// client cannot see the NGSI-LD warning, so a partial expansion is refused
+/// (S1, O6, D9).
+fn truncated_join(version: ODataVersion) -> ODataErrorResponse {
+    ODataErrorResponse::new(
+        StatusCode::BAD_REQUEST,
+        "BadRequest",
+        "the expansion reaches more Entities than one answer embeds: narrow it with $top or $filter",
+    )
+    .with_version(version)
 }
 
 /// `docs` in the order of `keys` (Q9, URL 5.1.5): null and missing values

@@ -101,10 +101,12 @@ impl Surface for Probe {
                                 entities,
                                 next,
                                 count,
+                                truncated,
                             },
                             read,
                         )) => Json(json!({
-                            "entities": entities, "next": next, "count": count, "read": read
+                            "entities": entities, "next": next, "count": count, "read": read,
+                            "truncated": truncated
                         }))
                         .into_response(),
                         Ok((Scanned::Answer(answer), _)) => answer,
@@ -566,4 +568,67 @@ fn pickable_names_are_one_member() {
     for name in ["", "a.b", "colour name", "a~", "-x", "a,b", "a{b}", "a|b"] {
         assert!(!pickable(name), "{name}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_past_the_lookup_budget_is_reported_under_a_residual() {
+    // T-3823: the scan reads the store's `NGSILD-Warning`, so a surface can refuse a partial
+    // expansion. Hub 0 links Hub 1 more times than one request may look up (4.5.23.1).
+    let broker = TestBroker::new().await.expect("broker");
+    let admin = broker.router();
+    let view = json!({"id": "hubs", "tenant": TENANT, "selector": ["Hub"],
+        "rules": [{"types": ["Hub"], "attributes": ["to", "n"]}],
+        "operations": ["query_entities"]});
+    let (s, b) = send(&admin, with_body(Request::put("/q/views/hubs"), &view)).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    for (n, width) in [(0, 1001), (1, 1), (2, 1)] {
+        let hub = json!({"id": format!("urn:ngsi-ld:Hub:{n}"), "type": "Hub",
+            "n": {"type": "Property", "value": n},
+            "to": {"type": "ListRelationship", "objectList": vec!["urn:ngsi-ld:Hub:1"; width]}});
+        let (s, b) = send(
+            &admin,
+            with_body(Request::post("/ngsi-ld/v1/entities"), &hub),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+    }
+    let plan = Plan::default();
+    let app = broker.serve(Probe(plan.clone())).expect("serve");
+    let scan = |query: &str, n: Option<i64>| {
+        let residual = n.map(|n| {
+            Expr::Cmp(
+                Cmp::Ge,
+                Box::new(Expr::Path(Path::value("n"))),
+                Box::new(Expr::Lit(Lit::Int(n))),
+            )
+        });
+        *plan.lock().unwrap_or_else(PoisonError::into_inner) = (
+            Pushdown {
+                query: format!("type=Hub&join=inline&joinLevel=1{query}"),
+                ..pushdown()
+            },
+            residual,
+        );
+        let req = Request::get("/x/scan/hubs?size=10")
+            .header("NGSILD-Tenant", TENANT)
+            .body(Body::empty())
+            .unwrap_or_default();
+        send(&app, req)
+    };
+    for residual in [None, Some(0)] {
+        let (s, b) = scan("", residual).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["truncated"], true, "{residual:?}: {b}");
+        // past the long link list, the walk fits
+        let (_, b) = scan("&id=urn:ngsi-ld:Hub:1,urn:ngsi-ld:Hub:2", residual).await;
+        assert_eq!(b["truncated"], false, "{b}");
+        assert_eq!(b["entities"].as_array().map(Vec::len), Some(2), "{b}");
+    }
+    // the residual drops Hub 0, yet the page it was read in still says so
+    let (_, b) = scan("", Some(1)).await;
+    assert_eq!(
+        (b["truncated"].clone(), ids(&b).len()),
+        (json!(true), 2),
+        "{b}"
+    );
 }

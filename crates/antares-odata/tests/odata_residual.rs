@@ -469,54 +469,93 @@ async fn a_token_of_the_earlier_form_or_an_edited_cursor_is_handled() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_scanned_read_beside_a_join_stays_501_and_references_are_served() -> Result<(), String> {
+async fn a_scanned_read_beside_a_join_serves_the_expansion() -> Result<(), String> {
+    // T-3823: the scan reads the store's truncation warning, so a residual, a residual count
+    // and a surface sort may expand entities and follow a hop
     let (_b, app) = broker(CARS).await?;
     let residual = "$filter=not%20(speed%20gt%2020)";
-    // T-3823: the scan cannot see a truncated join walk, so no partial expansion is served
-    for uri in [
-        format!("{ROOT}/Car?{residual}&$expand=follows"),
-        format!("{ROOT}/Car?$orderby=createdAt&$expand=follows"),
-        format!("{ROOT}/Car?$count=true&{residual}&$expand=follows($select=label)"),
-    ] {
-        let answer = get(&app, &uri, &[]).await;
-        assert_eq!(
-            answer.status,
-            StatusCode::NOT_IMPLEMENTED,
-            "{uri}: {}",
-            answer.body
-        );
-    }
-    // a reference is no join, and a join without a residual is served as before
-    for uri in [
-        format!("{ROOT}/Car?{residual}&$expand=follows/$ref"),
-        format!("{ROOT}/Car?$filter=speed%20gt%2020&$expand=follows"),
+    let want = expected(|n| speed(n).is_none_or(|s| s <= 20));
+    for (uri, want) in [
+        (format!("{ROOT}/Car?{residual}&$expand=follows&$top=1000"), &want),
+        (format!("{ROOT}/Car?$orderby=createdAt&$expand=follows&$top=1000"), &expected(|_| true)),
+        (
+            format!("{ROOT}/Car?$count=true&{residual}&$expand=follows($select=label)&$top=1000"),
+            &want,
+        ),
+        (format!("{ROOT}/Car?{residual}&$expand=follows/$ref&$top=1000"), &want),
+        // every Car follows Car 1, of speed 1: a hop beside a residual
+        (
+            format!("{ROOT}/Car?$filter=follows/speed%20ge%201%20and%20not%20(speed%20gt%2020)&$top=1000"),
+            &want,
+        ),
     ] {
         let answer = get(&app, &uri, &[]).await;
         assert_eq!(answer.status, StatusCode::OK, "{uri}: {}", answer.body);
-        let first = answer.body.get("value").and_then(|v| v.get(0));
-        assert!(
-            first.and_then(|e| e.get("follows")).is_some(),
-            "{}",
-            answer.body
-        );
+        assert_eq!(ids(&answer.body), *want, "{uri}");
+        if uri.contains("$expand") {
+            let follows = &answer.body["value"][0]["follows"];
+            assert!(!follows.is_null(), "{uri}: {}", answer.body);
+        }
     }
+    let counted = get(
+        &app,
+        &format!("{ROOT}/Car?$count=true&{residual}&$expand=follows"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        counted.body["@odata.count"],
+        json!(want.len()),
+        "{}",
+        counted.body
+    );
+    let label = get(
+        &app,
+        &format!("{ROOT}/Car?{residual}&$expand=follows($select=label)"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        label.body["value"][0]["follows"]["label"], "car 1",
+        "{}",
+        label.body
+    );
+    let hop = "$filter=follows/speed%20ge%201%20and%20not%20(speed%20gt%2020)";
+    let bare = get(&app, &format!("{ROOT}/Car/$count?{hop}"), &[]).await;
+    assert_eq!(bare.body, json!(want.len()), "{}", bare.body);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_hop_beside_a_residual_stays_501() -> Result<(), String> {
+async fn a_join_past_the_lookup_budget_is_400_scanned_or_pushed() -> Result<(), String> {
+    // T-3823: Car 1 follows Car 2 more times than one request may look up (4.5.23.1); a
+    // partial expansion is never served, whether the store or the scan answers
     let (_b, app) = broker(CARS).await?;
-    // a hop beside a residual is a join the scan cannot see truncated (T-3823)
-    let hop = "$filter=follows/speed%20gt%201%20and%20not%20(speed%20gt%2020)";
-    for uri in [
-        format!("{ROOT}/Car?{hop}"),
-        format!("{ROOT}/Car/$count?{hop}"),
+    let long = json!({format!("{CITY}follows"): {"type": "ListRelationship",
+        "objectList": vec!["urn:ngsi-ld:Car:002"; 1001]}});
+    let status = put(
+        &app,
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:001/attrs",
+        long.to_string(),
+        Some("city"),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    for query in [
+        "$filter=speed%20lt%2030&$expand=follows",
+        "$filter=not%20(speed%20gt%2020)&$expand=follows",
+        "$orderby=createdAt&$expand=follows",
     ] {
-        let answer = get(&app, &uri, &[]).await;
+        let answer = get(&app, &format!("{ROOT}/Car?{query}"), &[]).await;
         assert_eq!(
             answer.status,
-            StatusCode::NOT_IMPLEMENTED,
-            "{uri}: {}",
+            StatusCode::BAD_REQUEST,
+            "{query}: {}",
+            answer.body
+        );
+        assert!(
+            answer.body.to_string().contains("expansion reaches"),
+            "{}",
             answer.body
         );
     }
