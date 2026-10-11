@@ -17,7 +17,8 @@ use axum::response::{IntoResponse, Response};
 use odata_axum::{json_level, json_response, ODataErrorResponse, ODataRequest, ODataState};
 use odata_json::{write_collection, write_entity, Ctx, EntityValue, ODataVersion, Page, Resource};
 use odata_url::{
-    ExpandKind, ExpandPath, Key, KeyValue, Literal, ODataUri, QueryOptions, Segment, SelectItem,
+    EdmModel, ExpandKind, ExpandPath, Key, KeyValue, Literal, ODataUri, QueryOptions, Segment,
+    SelectItem,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -53,14 +54,19 @@ pub(crate) async fn serve(
         Ok(level) => level,
         Err(refused) => return refused.into_response(),
     };
-    let (ODataUri::Resource { path, options }, None) = (&request.uri, later(&request.uri)) else {
-        return not_implemented(version).into_response();
-    };
     let ctx = Ctx {
         service_root: &reads.state.service_root,
         level,
         version,
         metadata_etag: reads.state.metadata_etag.as_deref(),
+    };
+    if let ODataUri::Entity { options } = &request.uri {
+        return dereference(reads, caller, &ctx, options)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
+    let (ODataUri::Resource { path, options }, None) = (&request.uri, later(&request.uri)) else {
+        return not_implemented(version).into_response();
     };
     let answer = match path.as_slice() {
         [Segment::EntitySet(set)] => {
@@ -89,6 +95,65 @@ pub(crate) async fn serve(
         _ => Err(not_implemented(version)),
     };
     answer.unwrap_or_else(IntoResponse::into_response)
+}
+
+/// `$entity?$id=` (Q23): the id, percent-decoded, is a URL of this service,
+/// absolute under its root or relative to it, that names one Entity by key
+/// and nothing else; it is read as that URL is. Any other id is `400`.
+async fn dereference(
+    reads: &Reads,
+    caller: &Caller,
+    ctx: &Ctx<'_>,
+    options: &QueryOptions,
+) -> Result<Response, ODataErrorResponse> {
+    let bad = || {
+        ODataErrorResponse::new(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "$id names no entity of this service",
+        )
+        .with_version(ctx.version)
+    };
+    let id = options
+        .id
+        .as_deref()
+        .and_then(percent_decoded)
+        .ok_or_else(bad)?;
+    let relative = id.strip_prefix(ctx.service_root).unwrap_or(&id);
+    if relative.starts_with('/') || relative.contains("://") {
+        return Err(bad());
+    }
+    let model = EdmModel(&reads.state.model);
+    let Ok(ODataUri::Resource { path, options }) =
+        odata_url::parse(relative, &model, &reads.state.url_limits)
+    else {
+        return Err(bad());
+    };
+    match path.as_slice() {
+        [Segment::EntitySet(set), Segment::Key(key)] if options == QueryOptions::default() => {
+            entity(reads, caller, ctx, set, key, &options).await
+        }
+        _ => Err(bad()),
+    }
+}
+
+/// `text` with each `%XX` decoded; `None` for a broken escape or bytes that
+/// are no UTF-8.
+fn percent_decoded(text: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut bytes = text.bytes();
+    while let Some(b) = bytes.next() {
+        out.push(if b == b'%' {
+            let hex = [bytes.next()?, bytes.next()?];
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?
+        } else {
+            b
+        });
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Whether no option but `$select` (and `$format`, `$schemaversion=*`,
@@ -472,7 +537,7 @@ pub(crate) async fn entity(
     let picked = selected(set, options.select.as_ref()).map_err(|()| not_implemented(version))?;
     let expansions =
         expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
-    let id = key_id(key, options).ok_or_else(|| not_found(version))?;
+    let id = key_id(set, key, options).ok_or_else(|| not_found(version))?;
     let target = format!(
         "/ngsi-ld/v1/entities/{}?{}",
         encode(&id),
@@ -601,19 +666,96 @@ fn bad_token(version: ODataVersion) -> ODataErrorResponse {
     .with_version(version)
 }
 
-/// The Entity id a key predicate names: `('urn:…')` or `(id='urn:…')`,
-/// either through a parameter alias bound to a string.
-pub(crate) fn key_id(key: &Key, options: &QueryOptions) -> Option<String> {
-    let value = match key {
-        Key::Single(v) => v,
-        Key::Compound(pairs) => &pairs.iter().find(|(name, _)| name == "id")?.1,
+/// The Entity id a key predicate names, either through a parameter alias:
+/// `('urn:…')` or `(id='urn:…')` (E2); on a set with an identifier (E2a)
+/// its value `(v)` or `(ID=v)` names `{prefix}{v}`, and `('urn:…')` stays
+/// a URN where the identifier is no string.
+pub(crate) fn key_id(set: &Set, key: &Key, options: &QueryOptions) -> Option<String> {
+    let own = set.identifier.as_ref();
+    let (value, by_id) = match key {
+        Key::Single(v) => (v, false),
+        Key::Compound(pairs) => pairs
+            .iter()
+            .find(|(name, _)| name == "id")
+            .map(|(_, v)| (v, true))
+            .or_else(|| {
+                let i = own?;
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == i.member)
+                    .map(|(_, v)| (v, false))
+            })?,
     };
     let literal = match value {
         KeyValue::Literal(l) => l,
         KeyValue::Alias(name) => &options.aliases.iter().find(|(n, _)| n == name)?.1,
     };
-    match literal {
-        Literal::String(s) => Some(s.clone()),
+    match (own.filter(|_| !by_id), literal) {
+        (Some(i), Literal::Guid(g)) if i.edm == "Edm.Guid" => Some(format!("{}{g}", i.prefix)),
+        (Some(i), Literal::Int(n)) if integer(i.edm) => Some(format!("{}{n}", i.prefix)),
+        (Some(i), Literal::String(s)) if i.edm == "Edm.String" => Some(format!("{}{s}", i.prefix)),
+        (_, Literal::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// The canonical key predicate of Entity `urn` in `set`: its identifier's
+/// value when the URN follows `{prefix}{v}` and `v` reads back as the
+/// same URN (E2a), else `(id='urn:…')`; `('urn:…')` without an identifier.
+pub(crate) fn key_segment(set: &Set, urn: &str) -> Segment {
+    Segment::Key(canonical_key(set, urn))
+}
+
+/// The key of [`key_segment`].
+pub(crate) fn canonical_key(set: &Set, urn: &str) -> Key {
+    let string = |s: &str| KeyValue::Literal(Literal::String(s.to_owned()));
+    let Some(own) = &set.identifier else {
+        return Key::Single(string(urn));
+    };
+    let value = urn
+        .strip_prefix(own.prefix.as_str())
+        .and_then(|v| match own.edm {
+            "Edm.Guid" => is_guid(v).then(|| Literal::Guid(v.to_owned())),
+            edm if integer(edm) => v
+                .parse()
+                .ok()
+                .filter(|n: &i64| n.to_string() == v)
+                .map(Literal::Int),
+            _ => Some(Literal::String(v.to_owned())),
+        });
+    match value {
+        Some(v) => Key::Single(KeyValue::Literal(v)),
+        None => Key::Compound(vec![("id".into(), string(urn))]),
+    }
+}
+
+/// One of the integer Edm types a key may have (T-3722).
+fn integer(edm: &str) -> bool {
+    matches!(
+        edm,
+        "Edm.Byte" | "Edm.SByte" | "Edm.Int16" | "Edm.Int32" | "Edm.Int64"
+    )
+}
+
+/// `8-4-4-4-12` lower-case hex digits, as a `guid` literal reads back.
+fn is_guid(v: &str) -> bool {
+    v.len() == 36
+        && v.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => matches!(c, '0'..='9' | 'a'..='f'),
+        })
+}
+
+/// The Entity id a key member of a write body names: the URN itself (E2),
+/// or the identifier's value as in [`key_id`] (E2a).
+pub(crate) fn body_id(set: &Set, value: &Value) -> Option<String> {
+    match (&set.identifier, value) {
+        (None, Value::String(s)) => Some(s.clone()),
+        (Some(i), Value::String(s)) if i.edm == "Edm.Guid" => {
+            Some(format!("{}{}", i.prefix, s.to_ascii_lowercase()))
+        }
+        (Some(i), Value::String(s)) => Some(format!("{}{s}", i.prefix)),
+        (Some(i), Value::Number(n)) => Some(format!("{}{n}", i.prefix)),
         _ => None,
     }
 }
@@ -735,11 +877,8 @@ pub(crate) fn entity_value(
         let instance = default_instance(doc.get(key_of(e.iri, filter)));
         properties.push((e.name.to_owned(), expansion(reads, e, instance, filter)));
     }
-    let key = Segment::Key(Key::Single(KeyValue::Literal(Literal::String(
-        id.to_owned(),
-    ))));
     EntityValue {
-        id: format!("{set_name}{key}"),
+        id: format!("{set_name}{}", key_segment(set, id)),
         properties,
     }
 }
@@ -763,7 +902,7 @@ fn expansion(reads: &Reads, e: &Expansion, instance: Option<&Value>, filter: &Tr
         Writes::Refs(id) => objects(instance)
             .into_iter()
             .map(|urn| {
-                let key = Segment::Key(Key::Single(KeyValue::Literal(Literal::String(urn))));
+                let key = key_segment(e.target, &urn);
                 serde_json::json!({ *id: format!("{}{key}", e.target_name) })
             })
             .collect(),
@@ -1002,9 +1141,12 @@ mod tests {
             iri: "https://e.org/m".into(),
             shape,
             list: false,
+            written: crate::edm::Written::Always,
         };
         Set {
             type_iri: "https://e.org/T".into(),
+            identifier: None,
+            writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 ("geo".into(), member(Shape::Geo)),
                 (
@@ -1186,5 +1328,141 @@ mod tests {
             "https%3A%2F%2Fe.org%2Fa%23b%20c"
         );
         assert_eq!(encode("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    #[test]
+    fn a_key_maps_to_its_urn_and_back() {
+        // E2a, T-3720: each identifier type both ways, and a URN outside
+        // the pattern by `id`.
+        let keyed = |edm| Set {
+            identifier: Some(crate::edm::Identifier {
+                member: "ID".into(),
+                edm,
+                prefix: "urn:ngsi-ld:P:".into(),
+            }),
+            ..set()
+        };
+        let none = QueryOptions::default();
+        let plain = set();
+        let single = |l| Key::Single(KeyValue::Literal(l));
+        let named = |n: &str, l| Key::Compound(vec![(n.into(), KeyValue::Literal(l))]);
+        let guid = "01234567-89ab-cdef-0123-456789abcdef";
+        let cases = [
+            (
+                "Edm.Guid",
+                single(Literal::Guid(guid.into())),
+                format!("urn:ngsi-ld:P:{guid}"),
+            ),
+            (
+                "Edm.Int64",
+                single(Literal::Int(-7)),
+                "urn:ngsi-ld:P:-7".to_owned(),
+            ),
+            (
+                "Edm.String",
+                single(Literal::String("a b".into())),
+                "urn:ngsi-ld:P:a b".to_owned(),
+            ),
+            (
+                "Edm.String",
+                named("ID", Literal::String("x".into())),
+                "urn:ngsi-ld:P:x".to_owned(),
+            ),
+        ];
+        for (edm, key, urn) in cases {
+            let set = keyed(edm);
+            assert_eq!(
+                key_id(&set, &key, &none).as_deref(),
+                Some(urn.as_str()),
+                "{edm}"
+            );
+            assert_eq!(canonical_key(&set, &urn), single_or(&key), "{edm}");
+        }
+        let by_id = |urn: &str| named("id", Literal::String(urn.into()));
+        for (edm, urn) in [
+            (
+                "Edm.Guid",
+                "urn:ngsi-ld:P:01234567-89AB-cdef-0123-456789abcdef",
+            ),
+            ("Edm.Guid", "urn:ngsi-ld:P:x"),
+            ("Edm.Int64", "urn:ngsi-ld:P:07"),
+            ("Edm.Int64", "urn:ngsi-ld:P:99999999999999999999"),
+            ("Edm.String", "urn:ngsi-ld:Q:1"),
+        ] {
+            let set = keyed(edm);
+            assert_eq!(canonical_key(&set, urn), by_id(urn), "{edm} {urn}");
+            assert_eq!(key_id(&set, &by_id(urn), &none).as_deref(), Some(urn));
+        }
+        // A literal of another type names nothing; a string URN stays one
+        // where the key is no string.
+        let set = keyed("Edm.Guid");
+        assert_eq!(key_id(&set, &single(Literal::Int(1)), &none), None);
+        assert_eq!(
+            key_id(&set, &named("other", Literal::Guid(guid.into())), &none),
+            None
+        );
+        assert_eq!(
+            key_id(&set, &single(Literal::String("urn:x".into())), &none).as_deref(),
+            Some("urn:x")
+        );
+        assert_eq!(
+            key_id(
+                &keyed("Edm.Int64"),
+                &single(Literal::Guid(guid.into())),
+                &none
+            ),
+            None
+        );
+        // Without an identifier the key is the URN (E2).
+        assert_eq!(
+            canonical_key(&plain, "urn:x"),
+            single(Literal::String("urn:x".into()))
+        );
+        assert_eq!(
+            key_id(&plain, &single(Literal::Guid(guid.into())), &none),
+            None
+        );
+        // A body names the key as JSON.
+        assert_eq!(
+            body_id(&set, &json!(guid.to_ascii_uppercase())),
+            Some(format!("urn:ngsi-ld:P:{guid}"))
+        );
+        assert_eq!(
+            body_id(&keyed("Edm.Int64"), &json!(5)),
+            Some("urn:ngsi-ld:P:5".into())
+        );
+        assert_eq!(body_id(&plain, &json!("urn:x")), Some("urn:x".into()));
+        assert_eq!(body_id(&plain, &json!(5)), None);
+        assert_eq!(body_id(&set, &json!(null)), None);
+    }
+
+    #[test]
+    fn a_string_key_keeps_its_case_and_a_broken_escape_decodes_to_nothing() {
+        let codes = Set {
+            identifier: Some(crate::edm::Identifier {
+                member: "code".into(),
+                edm: "Edm.String",
+                prefix: "urn:ngsi-ld:P:".into(),
+            }),
+            ..set()
+        };
+        assert_eq!(
+            body_id(&codes, &json!("Ab")),
+            Some("urn:ngsi-ld:P:Ab".into())
+        );
+        assert_eq!(percent_decoded("P%28a%29"), Some("P(a)".into()));
+        for broken in ["P%zz", "P%2", "%FF"] {
+            assert_eq!(percent_decoded(broken), None, "{broken}");
+        }
+    }
+
+    fn single_or(key: &Key) -> Key {
+        // The canonical form of a named key is the single one.
+        match key {
+            Key::Compound(pairs) => pairs
+                .first()
+                .map_or_else(|| key.clone(), |(_, v)| Key::Single(v.clone())),
+            Key::Single(_) => key.clone(),
+        }
     }
 }

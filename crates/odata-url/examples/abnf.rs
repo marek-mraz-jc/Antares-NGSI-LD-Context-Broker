@@ -119,7 +119,6 @@ const OUTSIDE: &[&str] = &[
     "enumLiteral",
     "binaryLiteral",
     "durationLiteral",
-    "guid",
     "geographyCollection",
     "geographyLineString",
     "geographyMultiLineString",
@@ -156,6 +155,7 @@ fn literal_rule(rule: &str) -> Option<fn(&Literal) -> bool> {
             |l| matches!(l, Literal::DateTimeOffset(_))
         }
         "timeOfDayLiteral" => |l| matches!(l, Literal::TimeOfDay(_)),
+        "guid" => |l| matches!(l, Literal::Guid(_)),
         "stringLiteral" => |l| matches!(l, Literal::String(_)),
         "decimalLiteral" | "doubleLiteral" | "singleLiteral" => {
             |l| matches!(l, Literal::Int(_) | Literal::Decimal(_))

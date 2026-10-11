@@ -534,7 +534,8 @@ fn value(lit: &Literal) -> Result<String, Refused> {
             Ok(n) if n.is_finite() => Ok(Value::from(n).to_string()),
             _ => Err(Refused::Bad),
         },
-        Literal::String(s) => Ok(Value::from(s.as_str()).to_string()),
+        // An NGSI-LD Property holds a GUID as its string (T-3720).
+        Literal::String(s) | Literal::Guid(s) => Ok(Value::from(s.as_str()).to_string()),
         Literal::Date(d) => Ok(d.clone()),
         Literal::DateTimeOffset(t) if t.ends_with('Z') => Ok(t.clone()),
         Literal::TimeOfDay(t) => Ok(format!("{t}Z")),
@@ -572,10 +573,13 @@ mod tests {
             iri: iri.into(),
             shape,
             list: false,
+            written: crate::edm::Written::Always,
         };
         let value = |edm, collection| Shape::Value { edm, collection };
         Set {
             type_iri: "https://e.org/Car".into(),
+            identifier: None,
+            writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 (
                     "speed".into(),
