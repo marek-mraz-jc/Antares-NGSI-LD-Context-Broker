@@ -504,6 +504,26 @@ async fn a_scanned_read_beside_a_join_stays_501_and_references_are_served() -> R
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_hop_beside_a_residual_stays_501() -> Result<(), String> {
+    let (_b, app) = broker(CARS).await?;
+    // a hop beside a residual is a join the scan cannot see truncated (T-3823)
+    let hop = "$filter=follows/speed%20gt%201%20and%20not%20(speed%20gt%2020)";
+    for uri in [
+        format!("{ROOT}/Car?{hop}"),
+        format!("{ROOT}/Car/$count?{hop}"),
+    ] {
+        let answer = get(&app, &uri, &[]).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::NOT_IMPLEMENTED,
+            "{uri}: {}",
+            answer.body
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_scanned_read_keeps_select_orderby_and_the_stores_refusals() -> Result<(), String> {
     let (_b, app) = broker(CARS).await?;
     let residual = "$filter=not%20(speed%20gt%2020)";
@@ -586,20 +606,6 @@ async fn a_scanned_read_keeps_select_orderby_and_the_stores_refusals() -> Result
         "{}",
         answer.body
     );
-    // a hop beside a residual is a join the scan cannot see truncated (T-3823)
-    let hop = "$filter=follows/speed%20gt%201%20and%20not%20(speed%20gt%2020)";
-    for uri in [
-        format!("{ROOT}/Car?{hop}"),
-        format!("{ROOT}/Car/$count?{hop}"),
-    ] {
-        let answer = get(&app, &uri, &[]).await;
-        assert_eq!(
-            answer.status,
-            StatusCode::NOT_IMPLEMENTED,
-            "{uri}: {}",
-            answer.body
-        );
-    }
     // what the store answers on a pushed read it answers on a scanned one
     for (option, status) in [
         ("ngsild.georel=nowhere", StatusCode::BAD_REQUEST),
