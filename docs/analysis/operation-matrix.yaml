@@ -1313,7 +1313,7 @@ operations:
       gate_site: crates/antares-api/src/batch.rs:747
     odata:
       status: not_offered
-      binding: OData $batch members map to the single-Entity rows, each its own gate (T-3441 W24)
+      binding: OData $batch members run as the single-Entity rows, each its own operation and gate (T-3509 W24); no batch operation
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1772,7 +1772,7 @@ operations:
       gate_site: crates/antares-api/src/batch.rs:1252
     odata:
       status: not_offered
-      binding: OData $batch members map to the single-Entity rows, each its own gate (T-3441 W24)
+      binding: OData $batch members run as the single-Entity rows, each its own operation and gate (T-3509 W24); no batch operation
       checks:
         adr0020_phase: on_request
         operation_fields:

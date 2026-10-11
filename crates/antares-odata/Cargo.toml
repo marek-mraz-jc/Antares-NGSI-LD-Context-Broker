@@ -11,13 +11,14 @@ rust-version.workspace = true
 [package.metadata.antares]
 role = "surface"
 feature = "odata"
-protocols = ["linkml-model", "odata-axum", "odata-csdl", "odata-json", "odata-url"]
+protocols = ["linkml-model", "odata-axum", "odata-batch", "odata-csdl", "odata-json", "odata-url"]
 
 [dependencies]
 antares-ops = { workspace = true }
 axum = { version = "0.8", default-features = false }
 linkml-model = { path = "../linkml-model" }
 odata-axum = { path = "../odata-axum" }
+odata-batch = { path = "../odata-batch" }
 odata-csdl = { path = "../odata-csdl" }
 odata-json = { path = "../odata-json" }
 odata-url = { path = "../odata-url", features = ["edm"] }

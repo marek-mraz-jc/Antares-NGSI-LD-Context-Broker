@@ -77,7 +77,12 @@ pub fn person(n: u32, scope: &str) -> Value {
 /// in view, Person:2 out of its scope; Car:1 in view, Car:2 out of it.
 pub async fn city() -> Result<(TestBroker, Router), String> {
     std::env::set_var("ANTARES_SCHEMA_MAX_BYTES", "65536");
-    let b = TestBroker::new().await?;
+    city_on(TestBroker::new().await?).await
+}
+
+/// [`city`] on a broker the caller built (a policy engine of its own),
+/// with `ANTARES_SCHEMA_MAX_BYTES` set before it was.
+pub async fn city_on(b: TestBroker) -> Result<(TestBroker, Router), String> {
     let app = b.serve(antares_odata::OData)?;
     let reads = ["query_entities", "retrieve_entity"];
     let writes = [

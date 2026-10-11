@@ -141,10 +141,21 @@ const MORE: &[(&str, &str, &str)] = &[
 ];
 
 /// The body a row's request carries, where `{}` is not the form it names.
-const BODIES: &[(&str, &str)] = &[(
-    "odata_deep_update",
-    r#"{"owner": {"id": "urn:ngsi-ld:Person:5", "name": "new"}}"#,
-)];
+const BODIES: &[(&str, &str)] = &[
+    (
+        "odata_deep_update",
+        r#"{"owner": {"id": "urn:ngsi-ld:Person:5", "name": "new"}}"#,
+    ),
+    (
+        "odata_batch_atomicity",
+        r#"{"requests": [{"id": "1", "method": "get", "url": "Car", "atomicityGroup": "g"}]}"#,
+    ),
+    (
+        "odata_batch_references",
+        r#"{"requests": [{"id": "1", "method": "get", "url": "Car('urn:ngsi-ld:Car:1')"},
+                         {"id": "2", "method": "get", "url": "$1/speed"}]}"#,
+    ),
+];
 
 /// The rows the operation they stand for answers, so its gate is asked:
 /// an upsert is the Merge or Replace Entity of a key the store does not

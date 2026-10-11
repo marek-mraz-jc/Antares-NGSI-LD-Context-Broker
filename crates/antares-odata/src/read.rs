@@ -969,6 +969,8 @@ pub(crate) fn written(method: &Method, uri: &ODataUri, version: ODataVersion) ->
             [Segment::EntitySet(_), Segment::Key(_)] => method == Method::POST,
             _ => false,
         },
+        // `POST $batch` is served before any other request.
+        ODataUri::Batch { .. } => true,
         _ => false,
     };
     if read_only {

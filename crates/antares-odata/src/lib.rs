@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod batch;
 mod below;
 pub mod edm;
 mod filter;
@@ -140,12 +141,15 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
                     read::serve(&reads, &method, &caller, &request, &headers, &body).await
                 },
             )
-            .with_state(state),
+            .with_state(state.clone()),
     );
-    let Ok(resp) = Router::new()
-        .nest_service(&format!("/{id}/odata/v4"), api)
-        .oneshot(req)
-        .await;
+    let inner_root = format!("/{id}/odata/v4/");
+    let routed = Router::new().nest_service(&format!("/{id}/odata/v4"), api);
+    if req.method() == Method::POST && req.uri().path() == format!("{inner_root}$batch") {
+        let roots = (state.service_root.as_str(), inner_root.as_str());
+        return batch::serve(&routed, roots, req, state.url_limits.max_query_len).await;
+    }
+    let Ok(resp) = routed.oneshot(req).await;
     resp
 }
 

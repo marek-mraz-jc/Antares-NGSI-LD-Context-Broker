@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! `$ref` writes (odata-linkml-mapping section 6 rows W16 to W20,
-//! surfaces-threat-model O15): setting a single-valued navigation is
-//! Append Attributes, the full list of a collection-valued one Replace
-//! Attribute in the Relationship's own kind, removing one Delete
+//! surfaces-threat-model O15): setting a single-valued navigation, or the
+//! full list of a collection-valued one in the Relationship's own kind, is
+//! Append Attributes, removing one Delete
 //! Attribute; every target is read under the view first, so a hidden one
 //! answers like an absent one and nothing is written. Adding to or
 //! removing from a collection has no NGSI-LD operation: 501.

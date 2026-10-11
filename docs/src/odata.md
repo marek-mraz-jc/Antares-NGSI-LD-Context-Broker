@@ -15,12 +15,14 @@ POST   /x/views/{view}/odata/v4/{EntitySet}
 PATCH  /x/views/{view}/odata/v4/{EntitySet}('{id}')
 PUT    /x/views/{view}/odata/v4/{EntitySet}('{id}')
 DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')
+PUT|PATCH|DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property}
+PUT|DELETE       /x/views/{view}/odata/v4/{EntitySet}('{id}')/{navigation}/$ref
+POST   /x/views/{view}/odata/v4/$batch
 ```
 
 Mount it with `ANTARES_API_SURFACES=admin,views,odata`. The design is
 `docs/analysis/odata-linkml-mapping.md` (T-3441); this page is what the
-build serves today (T-3508, T-3509). Property and `$ref` writes and
-`$batch` come with later rounds of T-3509.
+build serves today (T-3508, T-3509).
 
 ## 1. The model
 
@@ -112,6 +114,27 @@ Relationship) and `PUT …/$value` are `501`, and so are `If-Match`,
 `If-None-Match` and a query option on a write. A property write that
 names `id`, `scope`, a computed member, a `LanguageProperty` or a URL
 member is `400` before any operation.
+
+### 3.1 `$batch`
+
+`POST $batch` takes a `multipart/mixed` (Protocol 11.7.7) or a JSON
+(JSON Format 19) batch and answers in the same format. Each member is
+served as a request of its own: parsed, refused and gated as it would be
+alone, under the outer request's tenant, subject and credentials. Members
+run in order. The first failed member ends the batch unless
+`Prefer: odata.continue-on-error` (or `continue-on-error`) is sent; then
+every member runs, a member whose `dependsOn` failed answers `424`, and
+the response carries `Preference-Applied`.
+
+The whole batch is `400` before any member runs when a member URL leaves
+this view's service root (another host, view or root, a `.` or `..`
+segment, an encoded `/` or `\`), when a member sets a header other than
+`Accept`, `Content-Type`, `Content-Length`, `If-Match`, `If-None-Match`,
+`OData-Version`, `OData-MaxVersion` and a `Prefer` of `return` and
+`odata.*` preferences, past 100 members (or `ANTARES_MAX_BATCH_ITEMS`
+when lower), or when a member's JSON body nests deeper than 16. Change
+sets, `atomicityGroup` and Content-ID references (`$1/...`) are `501`; a
+batch inside a batch is `400`.
 
 ## 4. `$filter`
 

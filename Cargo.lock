@@ -226,6 +226,7 @@ dependencies = [
  "http-body-util",
  "linkml-model",
  "odata-axum",
+ "odata-batch",
  "odata-csdl",
  "odata-json",
  "odata-url",
