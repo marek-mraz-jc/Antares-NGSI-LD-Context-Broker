@@ -214,17 +214,53 @@ pub fn with_view(
     if narrows_nothing && crate::policy::FILTERABLE.contains(&clause) {
         return Ok(view.narrowing.clone());
     }
-    let composed = if narrows_nothing {
-        Filter::clone(view.narrowing())
-    } else {
-        compose(view.narrowing(), Arc::unwrap_or_clone(engine))?
-    };
-    match resolve(clause, Decision::Filter(composed)) {
-        Decision::Allow => Ok(crate::policy::unnarrowed()),
-        // `resolve` makes no condition of a filter
-        Decision::Filter(f) | Decision::AllowIf(f) => Ok(Arc::new(f)),
-        Decision::Deny(why) => Err(Denied(why)),
+    paired(view, clause, engine)
+}
+
+/// The view's narrowing paired with an engine's that narrows, for `clause`.
+/// An engine answers a caller with the same narrowing request after
+/// request, and composing a large view costs tens of microseconds (benches
+/// `views`, T-3778): the last answer is kept per thread and handed out again
+/// while the same view, clause and engine narrowing come back. It is keyed
+/// by the whole input (the view's `Arc` itself, held so its address cannot
+/// be reused; the clause; the engine's `Filter` by value), so it never
+/// answers for another (O16). A filter unequal to itself (a NaN) misses.
+/// The answer is the same `Arc` on a hit, so `repr::narrow_repr` finds its
+/// reach by pointer as well.
+fn paired(view: &CompiledView, clause: &str, engine: Arc<Filter>) -> Result<Arc<Filter>, Denied> {
+    type Last = (Arc<Filter>, String, Filter, Result<Arc<Filter>, Denied>);
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<Last>> = const { std::cell::RefCell::new(None) };
     }
+    let hit = LAST.with_borrow(|last| {
+        last.as_ref()
+            .filter(|l| Arc::ptr_eq(&l.0, &view.narrowing) && l.1 == clause && l.2 == *engine)
+            .map(|l| l.3.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let key = Filter::clone(&engine);
+    let composed = if *engine == Filter::default() {
+        Ok(Filter::clone(view.narrowing()))
+    } else {
+        compose(view.narrowing(), Arc::unwrap_or_clone(engine))
+    };
+    let answer = composed.and_then(
+        |composed| match resolve(clause, Decision::Filter(composed)) {
+            Decision::Allow => Ok(crate::policy::unnarrowed()),
+            // `resolve` makes no condition of a filter
+            Decision::Filter(f) | Decision::AllowIf(f) => Ok(Arc::new(f)),
+            Decision::Deny(why) => Err(Denied(why)),
+        },
+    );
+    LAST.set(Some((
+        view.narrowing.clone(),
+        clause.to_owned(),
+        key,
+        answer.clone(),
+    )));
+    answer
 }
 
 /// `a ∧ b` as one [`Filter`]: every member narrows and none widens. The
@@ -1009,6 +1045,52 @@ mod tests {
             with_view(Some(&view), "5.13.4", Ok(Arc::new(Filter::default()))).is_err(),
             "serving a stored @context is refused under a view"
         );
+    }
+
+    /// T-3778: the pairing kept per thread is handed out again for the same
+    /// view, clause and engine narrowing, and for nothing else (O16): another
+    /// narrowing, another clause or a reloaded view is paired afresh.
+    #[test]
+    fn the_kept_pairing_answers_only_its_own_input() {
+        let view = cars();
+        let one = Filter {
+            rules: vec![rule(&["Car"], Some("speed>10"), &["speed"])],
+            ..Filter::default()
+        };
+        let two = Filter {
+            rules: vec![rule(&["Car"], Some("speed>20"), &["speed"])],
+            ..Filter::default()
+        };
+        let paired = |v: &CompiledView, clause: &str, f: &Filter| {
+            with_view(Some(v), clause, Ok(Arc::new(f.clone())))
+        };
+        let first = paired(&view, "5.7.2", &one).expect("query");
+        assert_eq!(
+            *first,
+            compose(view.narrowing(), one.clone()).expect("pair")
+        );
+        let again = paired(&view, "5.7.2", &one).expect("query");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "the same input is not paired twice"
+        );
+        let other = paired(&view, "5.7.2", &two).expect("query");
+        assert_eq!(
+            *other,
+            compose(view.narrowing(), two.clone()).expect("pair")
+        );
+        assert_ne!(*other, *first);
+        // a clause `resolve` refuses a filter on is refused, kept pairing or not
+        assert!(paired(&view, "5.13.4", &one).is_err());
+        assert!(paired(&view, "5.13.4", &one).is_err());
+        assert_eq!(paired(&view, "5.7.2", &one).as_deref(), Ok(&*first));
+        let reloaded = cars();
+        let fresh = paired(&reloaded, "5.7.2", &one).expect("query");
+        assert!(
+            !Arc::ptr_eq(&fresh, &first),
+            "a reloaded view is paired afresh"
+        );
+        assert_eq!(*fresh, *first);
     }
 
     /// T-3673: Query Subscriptions keeps the engine's selection among the
