@@ -227,6 +227,7 @@ dependencies = [
  "odata-csdl",
  "odata-json",
  "odata-url",
+ "proptest",
  "serde_json",
  "tokio",
  "tower",

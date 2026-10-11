@@ -28,6 +28,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 [dev-dependencies]
 antares-ops = { workspace = true, features = ["test-kit"] }
 http-body-util = { version = "0.1", default-features = false }
+proptest = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { workspace = true }
