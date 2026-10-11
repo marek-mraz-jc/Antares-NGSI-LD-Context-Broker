@@ -183,7 +183,7 @@ async fn an_unknown_view_a_view_without_schema_and_an_unknown_path_are_404() -> 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_write_method_is_405_with_allow() -> Result<(), String> {
+async fn a_write_the_view_does_not_offer_is_405_with_allow() -> Result<(), String> {
     let f = fixture().await?;
     for method in ["POST", "PUT", "PATCH", "DELETE"] {
         let a = send(
@@ -199,7 +199,7 @@ async fn a_write_method_is_405_with_allow() -> Result<(), String> {
             a.headers
                 .get("allow")
                 .map(axum::http::HeaderValue::as_bytes),
-            Some(&b"GET, HEAD"[..]),
+            Some(&b"GET, HEAD, OPTIONS"[..]),
             "{method}"
         );
     }

@@ -7,6 +7,7 @@
 //!   schema and hidden.
 //! - `slow` shows the same, narrowed to `speed<50` by the view.
 //! - `empty` shows `Stop` only.
+//! - `fleet` shows the same as `city` and offers every write Part 4 maps.
 //! - `reads` shows `Car` and allows Retrieve Entity alone, which OGC reads never use.
 
 use antares_ops::policy::{
@@ -68,9 +69,14 @@ pub async fn send(
 ) -> Answer {
     let mut req = Request::builder().method(method).uri(uri);
     if !body.is_empty() {
-        req = req
-            .header("Content-Type", "application/json")
-            .header("Content-Length", body.len());
+        req = req.header("Content-Length", body.len());
+    }
+    if !body.is_empty()
+        && !headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+    {
+        req = req.header("Content-Type", "application/json");
     }
     for (k, v) in headers {
         req = req.header(*k, *v);
@@ -105,6 +111,15 @@ pub async fn fixture() -> Result<Fixture, String> {
     fixture_with(TestBroker::new().await?).await
 }
 
+/// The operations of the `fleet` view: the reads and the four writes of Part 4.
+pub const WRITES: [&str; 5] = [
+    "query_entities",
+    "create_entity",
+    "replace_entity",
+    "merge_entity",
+    "delete_entity",
+];
+
 /// The broker takes schemas only when their bound is set, read when it starts.
 fn schemas_on() {
     std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
@@ -124,12 +139,16 @@ pub async fn fixture_with(broker: TestBroker) -> Result<Fixture, String> {
         ("empty", json!(["Stop"]), None, "query_entities"),
         ("reads", json!(["Car"]), None, "retrieve_entity"),
     ];
-    for (id, selector, q, op) in views {
+    let views = views
+        .into_iter()
+        .map(|(id, selector, q, op)| (id, selector, q, json!([op])))
+        .chain([("fleet", json!(["Car", "Stop"]), None, json!(WRITES))]);
+    for (id, selector, q, ops) in views {
         let mut view = json!({
             "id": id, "tenant": "city", "selector": selector,
             "rules": [{"types": ["Car"], "attributes": ["speed", "location", "seen", "at", "home", "colour", "tags"]},
                       {"types": ["Stop"], "attributes": ["name"]}],
-            "operations": [op]
+            "operations": ops
         });
         if let (Some(q), Some(map)) = (q, view.as_object_mut()) {
             map.insert("q".into(), json!(q));
@@ -252,4 +271,39 @@ pub async fn narrowed() -> Result<Fixture, String> {
             .with_policy(Arc::new(SlowOnly(q_filter("speed<50")?))),
     )
     .await
+}
+
+/// An engine that, once locked, refuses every write (clause 5.6) and allows every read, as a
+/// read-only Policy would; unlocked while the fixture seeds.
+#[derive(Default)]
+pub struct ReadOnly(pub std::sync::atomic::AtomicBool);
+
+impl PolicyEngine for ReadOnly {
+    fn name(&self) -> &'static str {
+        "read-only"
+    }
+
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        let locked = self.0.load(std::sync::atomic::Ordering::SeqCst);
+        Box::pin(std::future::ready(
+            if locked && op.clause.starts_with("5.6.") {
+                Decision::Deny("read only".into())
+            } else {
+                Decision::Allow
+            },
+        ))
+    }
+
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// [`fixture`] under a [`ReadOnly`] engine, locked once seeded.
+pub async fn read_only() -> Result<Fixture, String> {
+    schemas_on();
+    let engine = Arc::new(ReadOnly::default());
+    let f = fixture_with(TestBroker::new().await?.with_policy(engine.clone())).await?;
+    engine.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(f)
 }

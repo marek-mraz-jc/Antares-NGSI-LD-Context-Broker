@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! The OGC API - Features surface of a view (`docs/analysis/ogc-features-mapping.md`,
 //! ADR-0029, T-3744): `/x/views/{view}/ogc/features` serves the view's Entities as Features
-//! of OGC API - Features Part 1 Core with `GeoJSON` and `OpenAPI` 3.0, and the Part 5 draft's
-//! schemas, sortables and feature references (`schema.rs`, T-3754). A collection is a class
+//! of OGC API - Features Part 1 Core with `GeoJSON` and `OpenAPI` 3.0, Part 2 `CRS84` (`crs.rs`),
+//! the Part 4 draft's writes (`write.rs`, T-3746) and the Part 5 draft's schemas, sortables
+//! and feature references (`schema.rs`, T-3754). A collection is a class
 //! of the Tenant's `LinkML` schema whose type the view shows (`model.rs`); its Features are the
-//! Entities a Query Entities through the view returns for the caller, so the operation's own
-//! gate fires and the view narrows the answer as on the NGSI-LD view root.
+//! Entities a Query Entities through the view returns for the caller, and a write one Create,
+//! Replace, Merge or Delete Entity through it, so the operation's own gate fires and the view narrows the answer as on the NGSI-LD view root.
 //!
 //! A view whose Tenant has no schema, or one this surface cannot read, has no OGC endpoint:
 //! every path answers 404 as an unknown view does, as the `OData` surface does.
@@ -20,14 +21,18 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod crs;
 mod items;
 mod model;
 mod schema;
+mod write;
 
 use antares_ops::{Caller, Ops, Surface, ViewOps};
+use axum::body::Body;
 use axum::extract::{Query, Request};
 use axum::http::header::{ACCEPT, ALLOW, CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
 use axum::Router;
@@ -45,9 +50,10 @@ pub const SCHEMA_LIMITS: linkml_model::Limits = linkml_model::Limits {
     max_elements: 100_000,
 };
 
-/// The conformance classes `/conformance` declares (mapping rows C3, S1 to S3, S5, S7; Part 5
-/// is the draft OGC 23-058r1).
-pub const CONFORMANCE: [&str; 10] = [
+/// The conformance classes `/conformance` declares (mapping rows C3, R1 to R5, W1 to W5, S1 to
+/// S3, S5, S7; Parts 4 and 5 are the drafts OGC 20-002r1 and 23-058r1). A view that offers no
+/// write answers each write 405 with the methods it offers (W4).
+pub const CONFORMANCE: [&str; 14] = [
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
@@ -58,6 +64,10 @@ pub const CONFORMANCE: [&str; 10] = [
     "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/feature-references",
     "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/profile-parameter",
     "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/profile-references",
+    "http://www.opengis.net/spec/ogcapi-features-2/1.0/conf/crs",
+    "http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/create-replace-delete",
+    "http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/update",
+    "http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/features",
 ];
 
 const JSON: &str = "application/json";
@@ -131,11 +141,11 @@ fn document(media: &'static str, body: &Value) -> Reply {
 /// `GET` sends (Part 1 `/req/core/http`, RFC 9110 9.3.2).
 async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
     let head = req.method() == Method::HEAD;
-    let (mut parts, _) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     if head {
         parts.method = Method::GET;
     }
-    let answer = respond(ops, caller, &parts.method, &parts.uri, &parts.headers).await;
+    let answer = respond(ops, caller, &parts, body).await;
     if !head {
         return answer;
     }
@@ -149,13 +159,8 @@ async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
 
 /// One request below `/{view}/ogc/features`, read as sent: a view id is `[a-z0-9-]`, so its
 /// raw segment is its id.
-async fn respond(
-    ops: &Ops,
-    caller: &Caller,
-    method: &Method,
-    uri: &Uri,
-    headers: &HeaderMap,
-) -> Reply {
+async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply {
+    let (method, uri, headers) = (&parts.method, &parts.uri, &parts.headers);
     let mut segments = uri.path().split('/').skip(1);
     let id = segments.next().unwrap_or_default();
     // `ogc`, `features`: the route matched them.
@@ -167,15 +172,21 @@ async fn respond(
     let Some(collections) = collections(&view) else {
         return not_found();
     };
-    if method != Method::GET {
-        let mut refused = problem(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "this resource is read with GET",
-        );
-        refused
-            .headers_mut()
-            .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
-        return refused;
+    // W4: a resource's methods are the reads and the writes the view offers on it.
+    let item = match rest.as_slice() {
+        ["collections", c, "items"] => Some((*c, None)),
+        ["collections", c, "items", feature] => Some((*c, Some(*feature))),
+        _ => None,
+    };
+    if let Some(reply) = offered(&view, method, item) {
+        return reply;
+    }
+    let base = format!(
+        "{}{PREFIX}/{id}/ogc/features",
+        antares_ops::public_base(headers)
+    );
+    if let Some(item) = item.filter(|_| method != Method::GET) {
+        return write_to(&view, caller, &collections, &base, parts, item, body).await;
     }
     if !acceptable(headers) {
         return problem(
@@ -187,10 +198,6 @@ async fn respond(
     let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
         .map(|Query(pairs)| pairs)
         .unwrap_or_default();
-    let base = format!(
-        "{}{PREFIX}/{id}/ogc/features",
-        antares_ops::public_base(headers)
-    );
     let at = Here {
         view: &view,
         id,
@@ -201,7 +208,10 @@ async fn respond(
     match (rest.as_slice(), pairs.is_empty()) {
         ([] | [""], true) => document(JSON, &at.landing()),
         (["conformance"], true) => document(JSON, &json!({"conformsTo": CONFORMANCE})),
-        (["api"], true) => document(OPENAPI, &api::document(&base, &collections)),
+        (["api"], true) => document(
+            OPENAPI,
+            &api::document(&base, &collections, &|op| view.allows(op)),
+        ),
         (["collections"], true) => document(JSON, &at.collections()),
         (["collections", c], true) => match collections.get(*c) {
             Some(c) => document(JSON, &at.collection(c)),
@@ -234,6 +244,67 @@ async fn respond(
         ),
         _ => not_found(),
     }
+}
+
+/// W4: whether the resource offers `method`: its reads, and the writes the view offers on it
+/// (`item`: the collection and the Feature of an `items` path). A method it does not offer is
+/// 405 before the body is read (W1); `OPTIONS` answers the list. `None`: serve it.
+fn offered(view: &ViewOps, method: &Method, item: Option<(&str, Option<&str>)>) -> Option<Reply> {
+    let writes = [
+        (Method::POST, "POST"),
+        (Method::PUT, "PUT"),
+        (Method::PATCH, "PATCH"),
+        (Method::DELETE, "DELETE"),
+    ];
+    let allow: Vec<&str> = ["GET", "HEAD", "OPTIONS"]
+        .into_iter()
+        .chain(
+            writes
+                .iter()
+                .filter(|(m, _)| {
+                    item.and_then(|(_, feature)| write::Write::of(m, feature))
+                        .is_some_and(|w| view.allows(w.operation().0))
+                })
+                .map(|(_, name)| *name),
+        )
+        .collect();
+    // Method names joined by commas are a header value.
+    let allow_header =
+        HeaderValue::from_str(&allow.join(", ")).unwrap_or(HeaderValue::from_static("GET"));
+    if !allow.contains(&method.as_str()) {
+        let mut refused = problem(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "this view does not offer the method on this resource",
+        );
+        refused.headers_mut().insert(ALLOW, allow_header);
+        return Some(refused);
+    }
+    (method == Method::OPTIONS).then(|| (StatusCode::OK, [(ALLOW, allow_header)]).into_response())
+}
+
+/// A write on an `items` path the view offers (W1 to W7).
+async fn write_to(
+    view: &ViewOps,
+    caller: &Caller,
+    collections: &BTreeMap<String, Collection>,
+    base: &str,
+    parts: &Parts,
+    (c, feature): (&str, Option<&str>),
+    body: Body,
+) -> Reply {
+    let decoded = feature.map(decode);
+    let write = match &decoded {
+        None => write::Write::of(&parts.method, None),
+        Some(f) => f
+            .as_deref()
+            .and_then(|f| write::Write::of(&parts.method, Some(f))),
+    };
+    let (Some(c), Some(write)) = (collections.get(c), write) else {
+        return problem(StatusCode::NOT_FOUND, "no such resource");
+    };
+    write::run(view, caller, (c, base), write, &parts.headers, body)
+        .await
+        .unwrap_or_else(Problem::reply)
 }
 
 /// The collections of the view, if its Tenant has a schema this surface reads.
@@ -294,6 +365,14 @@ fn profile_link(c: &Collection, profile: items::Profile) -> Option<Value> {
         .then(|| json!({"rel": "profile", "href": items::profile_uri(profile)}))
 }
 
+/// A Feature answer with the `Content-Crs` of its coordinates (R4).
+fn in_crs(crs: &str, mut reply: Reply) -> Reply {
+    // A CRS URI is ASCII: always a header value.
+    let value = HeaderValue::from_str(&format!("<{crs}>")).unwrap_or(HeaderValue::from_static(""));
+    reply.headers_mut().insert("content-crs", value);
+    reply
+}
+
 /// What one request reads under.
 struct Here<'a> {
     view: &'a ViewOps,
@@ -325,7 +404,11 @@ impl Here<'_> {
             .values()
             .map(|c| self.collection(c))
             .collect();
-        json!({"links": [link("self", JSON, &format!("{}/collections", self.base))], "collections": all})
+        json!({
+            "links": [link("self", JSON, &format!("{}/collections", self.base))],
+            "crs": [crs::CRS84, crs::CRS84H],
+            "collections": all,
+        })
     }
 
     /// C7: one collection; no `extent` (M8).
@@ -342,6 +425,8 @@ impl Here<'_> {
             ("title", Some(Value::from(c.id.as_str()))),
             ("description", c.description.as_deref().map(Value::from)),
             ("itemType", Some(Value::from("feature"))),
+            ("crs", Some(json!([crs::CRS84, crs::CRS84H]))),
+            ("storageCrs", Some(Value::from(crs::CRS84))),
             ("links", Some(links)),
         ];
         Value::Object(
@@ -388,15 +473,18 @@ impl Here<'_> {
         }
         links.extend(profile_link(c, p.profile));
         let returned = page.features.len();
-        document(
-            GEOJSON,
-            &json!({
-                "type": "FeatureCollection",
-                "features": page.features,
-                "numberMatched": page.matched,
-                "numberReturned": returned,
-                "links": links,
-            }),
+        in_crs(
+            p.crs,
+            document(
+                GEOJSON,
+                &json!({
+                    "type": "FeatureCollection",
+                    "features": page.features,
+                    "numberMatched": page.matched,
+                    "numberReturned": returned,
+                    "links": links,
+                }),
+            ),
         )
     }
 
@@ -420,7 +508,7 @@ impl Here<'_> {
                         .chain(profile_link(c, p.profile))
                         .collect();
                 feature.insert("links".into(), Value::from(links));
-                document(GEOJSON, &Value::Object(feature))
+                in_crs(p.crs, document(GEOJSON, &Value::Object(feature)))
             }
             Err(refused) => refused.reply(),
         }

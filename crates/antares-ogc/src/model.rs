@@ -47,6 +47,9 @@ pub(crate) struct Prop {
     pub description: Option<String>,
     /// One scalar value a string, number or boolean: `sortby` may name it (S5).
     pub sortable: bool,
+    /// The NGSI-LD kind a write gives it (W1): the slot's, `JsonProperty` for an inlined
+    /// class.
+    pub kind: String,
     /// A Relationship (S7).
     pub reference: bool,
     /// A Relationship's target collection: the class its range names, if the view shows it.
@@ -167,6 +170,7 @@ fn prop(
         role: slot.annotations.get(ROLE).map(|a| a.value.clone()),
         unit: slot.unit.as_ref().and_then(|u| u.ucum_code.clone()),
         description: slot.description.clone(),
+        kind: if inlined { "JsonProperty" } else { kind }.to_owned(),
         reference: relationship,
         target: match range {
             Range::Class(c) if relationship && shown(c) => Some(c.to_owned()),

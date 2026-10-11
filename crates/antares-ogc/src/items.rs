@@ -29,6 +29,8 @@ pub(crate) struct Params {
     pub properties: Option<Vec<String>>,
     /// `profile` (S7).
     pub profile: Profile,
+    /// `crs` (R2): the CRS the answer's coordinates are in, CRS84 by default.
+    pub crs: &'static str,
 }
 
 /// How a Feature writes a Relationship to a collection the view shows (Part 5
@@ -111,7 +113,7 @@ fn bad(detail: &'static str) -> Problem {
 pub(crate) fn item_params(c: &Collection, pairs: &[(String, String)]) -> Result<Params, Problem> {
     if pairs
         .iter()
-        .all(|(name, _)| name == "properties" || name == "profile")
+        .all(|(name, _)| matches!(name.as_str(), "properties" | "profile" | "crs"))
     {
         params(c, pairs)
     } else {
@@ -126,6 +128,7 @@ pub(crate) fn item_params(c: &Collection, pairs: &[(String, String)]) -> Result<
 pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Params, Problem> {
     let mut p = Params {
         limit: DEFAULT_LIMIT,
+        crs: crate::crs::CRS84,
         ..Params::default()
     };
     let mut seen: Vec<&str> = Vec::new();
@@ -145,6 +148,11 @@ pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Param
             "bbox" => p.bbox = Some(bbox(value).ok_or_else(|| bad("bbox is 4 or 6 numbers in CRS84: lower corner, upper corner"))?),
             "datetime" => p.datetime = Some(datetime(value).ok_or_else(|| bad("datetime is an RFC 3339 date-time or an interval start/end, '..' or empty for an open end"))?),
             "next" => p.next = Some(value.clone()),
+            "crs" => p.crs = crate::crs::read(value).ok_or(bad(crate::crs::UNSUPPORTED))?,
+            // R3: both CRS name the same axes, so the box reads the same.
+            "bbox-crs" => {
+                crate::crs::read(value).ok_or(bad(crate::crs::UNSUPPORTED))?;
+            }
             "sortby" => p.sortby = sortby(c, value).ok_or_else(|| bad("sortby names properties of the collection's sortables, each [+|-]name"))?,
             "properties" => p.properties = Some(properties(c, value).ok_or_else(|| bad("properties names properties of the collection's schema"))?),
             "profile" => p.profile = profile(value).ok_or_else(|| bad("profile is one of rel-as-key, rel-as-uri and rel-as-link"))?,
@@ -644,6 +652,7 @@ mod tests {
             unit: None,
             description: None,
             sortable,
+            kind: "Property".into(),
             reference: false,
             target: None,
         }
