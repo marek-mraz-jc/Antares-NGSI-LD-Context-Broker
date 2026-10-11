@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 pub mod edm;
+mod filter;
 mod names;
 mod read;
 

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Reads through a view (odata-linkml-mapping.md 5.1 rows Q13, Q29, Q30 and
 //! S3): an EntitySet, one Entity by key, `/$count`, `$select`, `$top`,
-//! `$skip`, `$count`, each the narrowed answer of one operation, and the
+//! `$skip`, `$count`, `$filter` (5.2), each the narrowed answer of one
+//! operation, and the
 //! forms of later rounds refused before any operation runs.
 
 use antares_ops::test_kit::TestBroker;
@@ -18,11 +19,11 @@ const SCHEMA: &str = r#"{
   "id": "https://example.org/city", "name": "city",
   "prefixes": {"city": {"prefix_prefix": "city", "prefix_reference": "https://example.org/city/"}},
   "default_prefix": "city",
-  "classes": {"Car": {"slots": ["speed", "secret", "owner", "seen", "tags"]}, "Person": {"slots": ["name"]}},
+  "classes": {"Car": {"slots": ["speed", "secret", "owner", "seen", "tags", "label"]}, "Person": {"slots": ["name"]}},
   "slots": {"speed": {"range": "float"}, "secret": {"range": "integer"},
             "owner": {"range": "Person"}, "seen": {"range": "datetime"},
             "tags": {"annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "ListProperty"}}},
-            "name": {}}
+            "name": {}, "label": {"range": "string"}}
 }"#;
 
 struct Answer {
@@ -84,6 +85,7 @@ fn car(n: u32, scope: &str, speed: f64) -> String {
         format!("{CITY}owner"): {"type": "Relationship", "object": "urn:ngsi-ld:Person:1"},
         format!("{CITY}seen"): {"type": "Property", "value": {"@type": "DateTime", "@value": "2026-10-11T08:00:00Z"}},
         format!("{CITY}tags"): {"type": "ListProperty", "valueList": ["a", "b"]},
+        format!("{CITY}label"): {"type": "Property", "value": format!("car.{n}")},
     })
     .to_string()
 }
@@ -97,7 +99,7 @@ async fn broker() -> Result<(TestBroker, Router), String> {
         "@context": {"city": CITY},
         "selector": ["city:Car"],
         "scopeQ": "/a",
-        "rules": [{"types": ["city:Car"], "attributes": ["city:speed", "city:owner", "city:seen", "city:tags"]}],
+        "rules": [{"types": ["city:Car"], "attributes": ["city:speed", "city:owner", "city:seen", "city:tags", "city:label"]}],
         "operations": ["query_entities", "retrieve_entity"]
     });
     let put = send(
@@ -431,7 +433,8 @@ async fn a_hidden_or_unknown_name_is_the_same_400() {
 async fn the_forms_of_later_rounds_are_501_and_writes_405() {
     let (_b, app) = broker().await.expect("broker");
     for uri in [
-        "Car?$filter=speed%20gt%201",
+        "Car?$filter=not%20(speed%20gt%201)",
+        "Car('urn:ngsi-ld:Car:1')?$filter=speed%20gt%201",
         "Car?$orderby=speed",
         "Car?$expand=*",
         "Car?$skiptoken=x",
@@ -496,5 +499,229 @@ async fn a_view_without_the_read_operations_is_refused_by_its_allowlist() {
         got.json()["error"]["message"],
         "the request was refused",
         "no broker detail"
+    );
+}
+
+fn ids(answer: &Answer) -> Vec<String> {
+    let mut ids: Vec<String> = answer
+        .json()
+        .get("value")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filter_selects_through_q_and_the_count_follows() {
+    let (_b, app) = broker().await.expect("broker");
+    let car = |n: u32| format!("urn:ngsi-ld:Car:{n}");
+    for (filter, want) in [
+        ("speed%20gt%2010", vec![car(1), car(2)]),
+        ("10%20lt%20speed%20and%20speed%20lt%2020", vec![car(1)]),
+        ("speed%20ne%2030", vec![car(1), car(3)]),
+        ("speed%20eq%20null", vec![]),
+        ("speed%20in%20(5,30)", vec![car(2), car(3)]),
+        (
+            "seen%20eq%202026-10-11T08:00:00Z%20or%20speed%20eq%201",
+            vec![car(1), car(2), car(3)],
+        ),
+        ("id%20eq%20'urn:ngsi-ld:Car:2'", vec![car(2)]),
+        ("startswith(label,'car.1')", vec![car(1)]),
+        (
+            "endswith(label,'.3')%20or%20contains(label,'2')",
+            vec![car(2), car(3)],
+        ),
+        ("not%20contains(label,'.1')", vec![car(2), car(3)]),
+        ("contains(label,'.')", vec![car(1), car(2), car(3)]),
+        (
+            "contains(label,'r.')%20and%20not%20(label%20eq%20null)",
+            vec![car(1), car(2), car(3)],
+        ),
+        (
+            "id%20in%20('urn:ngsi-ld:Car:3','urn:ngsi-ld:Car:4')",
+            vec![car(3)],
+        ),
+    ] {
+        let got = send(
+            &app,
+            Method::GET,
+            &format!("{ROOT}/Car?$filter={filter}&$count=true"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::OK, "{filter}: {}", got.body);
+        assert_eq!(ids(&got), want, "{filter}: {}", got.body);
+        assert_eq!(got.json()["@odata.count"], want.len(), "{filter}");
+        let count = send(
+            &app,
+            Method::GET,
+            &format!("{ROOT}/Car/$count?$filter={filter}"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(count.body, want.len().to_string(), "{filter}");
+    }
+    let got = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=speed%20gt%2020"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        got.json()["value"][0]["speed"],
+        30.0,
+        "the answer read under the filter's terms: {}",
+        got.body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_clients_link_header_does_not_change_what_a_filter_means() {
+    let (_b, app) = broker().await.expect("broker");
+    let uri = format!("{ROOT}/Car?$filter=speed%20gt%2010");
+    let plain = send(&app, Method::GET, &uri, None, &[]).await;
+    let link = r#"<https://example.invalid/c.jsonld>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json""#;
+    let linked = send(&app, Method::GET, &uri, None, &[("Link", link)]).await;
+    assert_eq!(
+        (plain.status, ids(&plain)),
+        (linked.status, ids(&linked)),
+        "{}",
+        linked.body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_filter_on_hidden_attribute_equals_filter_on_unknown_name() {
+    let (_b, app) = broker().await.expect("broker");
+    let hidden = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=secret%20eq%207"),
+        None,
+        &[],
+    )
+    .await;
+    let unknown = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=nosuch%20eq%207"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(hidden.status, StatusCode::BAD_REQUEST, "{}", hidden.body);
+    assert_eq!(
+        (hidden.status, &hidden.body),
+        (unknown.status, &unknown.body)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_bisecting_a_hidden_value_learns_nothing() {
+    let (_b, app) = broker().await.expect("broker");
+    let mut answers = Vec::new();
+    for bound in ["0", "6", "7", "8", "100"] {
+        for op in ["gt", "lt", "eq"] {
+            let got = send(
+                &app,
+                Method::GET,
+                &format!("{ROOT}/Car?$filter=secret%20{op}%20{bound}"),
+                None,
+                &[],
+            )
+            .await;
+            answers.push((got.status, got.body));
+        }
+    }
+    answers.dedup();
+    assert_eq!(answers.len(), 1, "every bound answers alike: {answers:?}");
+    assert!(
+        !answers[0].1.contains('7'),
+        "no literal echoed: {}",
+        answers[0].1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filter_past_the_bounds_is_400_before_any_operation() {
+    let (_b, app) = broker().await.expect("broker");
+    let deep = format!("{}speed%20gt%201{}", "(".repeat(40), ")".repeat(40));
+    let got = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter={deep}"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::BAD_REQUEST, "{}", got.body);
+    let long = "x".repeat(1000);
+    let ors: Vec<String> = (0..5)
+        .map(|_| format!("contains(label,'{long}')"))
+        .collect();
+    let got = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter={}", ors.join("%20or%20")),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::BAD_REQUEST, "{}", got.body);
+    assert_eq!(
+        got.json()["error"]["code"],
+        "TooComplexQuery",
+        "{}",
+        got.body
+    );
+    let inexact = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=speed%20eq%209007199254740993"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        inexact.status,
+        StatusCode::BAD_REQUEST,
+        "F26: {}",
+        inexact.body
+    );
+    assert_eq!(
+        inexact.json()["error"]["code"],
+        "BadRequest",
+        "{}",
+        inexact.body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_filter_ne_doubling_is_checked_on_the_translated_tree() {
+    let (_b, app) = broker().await.expect("broker");
+    // 30 `ne` terms, as deep as max_expr_depth lets an `and` chain go;
+    // each is `!t|t!=v` in q, which the broker bounds again.
+    let terms: Vec<String> = (0..30).map(|n| format!("speed%20ne%20{n}")).collect();
+    let got = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter={}", terms.join("%20and%20")),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::OK, "{}", got.body);
+    assert_eq!(
+        ids(&got),
+        vec!["urn:ngsi-ld:Car:1", "urn:ngsi-ld:Car:2"],
+        "5 is one of 0..30"
     );
 }

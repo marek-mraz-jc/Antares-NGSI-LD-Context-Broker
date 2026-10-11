@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Reads (odata-linkml-mapping.md 5.1): an EntitySet (Q29) as Query
 //! Entities, one Entity by key (Q30) as Retrieve Entity, `/$count` (Q13),
-//! with `$select`, `$top`, `$skip` and `$count`. Each request is one
+//! with `$filter` ([`crate::filter`]), `$select`, `$top`, `$skip` and
+//! `$count`. Each request is one
 //! operation through `ViewOps::run`; the NGSI-LD answer is mapped back
 //! through the model, so a member the model does not hold is never written.
 //! The options and forms of later rounds answer `501` before any operation
 //! runs.
 
 use crate::edm::{base_member, Edm, Set, Shape};
+use crate::filter::{translate, Refused, Translated};
 use antares_ops::{core_name, Caller, OperationId, OpsRequest, Refusal, ViewOps};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -59,7 +61,9 @@ pub(crate) async fn serve(
         [Segment::EntitySet(set)] => {
             collection(reads, caller, &ctx, set, path, options, headers).await
         }
-        [Segment::EntitySet(set), Segment::Count] => count(reads, caller, set, version).await,
+        [Segment::EntitySet(set), Segment::Count] => {
+            count(reads, caller, set, options, version).await
+        }
         [Segment::EntitySet(set), Segment::Key(key)] => {
             entity(reads, caller, &ctx, set, key, options).await
         }
@@ -75,7 +79,6 @@ fn later(uri: &ODataUri) -> Option<&'static str> {
         return Some("this resource is not served");
     };
     let refused = [
-        (options.filter.is_some(), "$filter"),
         (options.orderby.is_some(), "$orderby"),
         (options.expand.is_some(), "$expand"),
         (options.skiptoken.is_some(), "$skiptoken"),
@@ -123,8 +126,17 @@ fn selected<'s>(set: &'s Set, options: &'s QueryOptions) -> Result<Option<Vec<&'
 /// The NGSI-LD query of an EntitySet: its type, the Attributes selected
 /// (`attrs`, which takes IRIs; the core members always come), the system
 /// members only when selected (E6).
-fn query(set: &Set, picked: Option<&[&str]>) -> String {
+fn query(set: &Set, picked: Option<&[&str]>, filter: &Translated) -> String {
     let mut q = format!("type={}", encode(&set.type_iri));
+    if let Some(ids) = &filter.ids {
+        let ids: Vec<String> = ids.iter().map(|id| encode(id)).collect();
+        q.push_str("&id=");
+        q.push_str(&ids.join(","));
+    }
+    if let Some(text) = &filter.q {
+        q.push_str("&q=");
+        q.push_str(&encode(text));
+    }
     if let Some(names) = picked {
         let attrs: Vec<String> = names
             .iter()
@@ -157,6 +169,7 @@ async fn collection(
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
     let picked = selected(set, options).map_err(|()| not_implemented(version))?;
+    let filter = filtered(set, options, version)?;
     let skip = options.skip.unwrap_or(0);
     let page = options
         .top
@@ -165,12 +178,20 @@ async fn collection(
         .min(MAX_PAGE);
     let target = format!(
         "/ngsi-ld/v1/entities?{}&limit={page}&offset={skip}&count=true",
-        query(set, picked.as_deref()),
+        query(set, picked.as_deref(), &filter),
     );
-    let (docs, total) = run(reads, caller, OperationId::QueryEntities, target, version).await?;
+    let (docs, total) = run(
+        reads,
+        caller,
+        OperationId::QueryEntities,
+        target,
+        &filter,
+        version,
+    )
+    .await?;
     let entities: Vec<EntityValue> = docs
         .iter()
-        .map(|doc| entity_value(reads, set_name, set, doc, picked.as_deref()))
+        .map(|doc| entity_value(reads, set_name, set, doc, picked.as_deref(), &filter))
         .collect();
     let served = u64::try_from(entities.len()).unwrap_or(u64::MAX);
     let next = skip.saturating_add(served);
@@ -210,14 +231,24 @@ async fn count(
     reads: &Reads,
     caller: &Caller,
     set_name: &str,
+    options: &QueryOptions,
     version: ODataVersion,
 ) -> Result<Response, ODataErrorResponse> {
     let set = set_of(reads, set_name, version)?;
+    let filter = filtered(set, options, version)?;
     let target = format!(
         "/ngsi-ld/v1/entities?{}&limit=0&count=true",
-        query(set, None)
+        query(set, None, &filter)
     );
-    let (_, total) = run(reads, caller, OperationId::QueryEntities, target, version).await?;
+    let (_, total) = run(
+        reads,
+        caller,
+        OperationId::QueryEntities,
+        target,
+        &filter,
+        version,
+    )
+    .await?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/plain")],
@@ -236,16 +267,28 @@ async fn entity(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
+    if options.filter.is_some() {
+        return Err(not_implemented(version));
+    }
     let picked = selected(set, options).map_err(|()| not_implemented(version))?;
     let id = key_id(key, options).ok_or_else(|| not_found(version))?;
     let target = format!(
         "/ngsi-ld/v1/entities/{}?{}",
         encode(&id),
-        query(set, picked.as_deref()),
+        query(set, picked.as_deref(), &Translated::default()),
     );
-    let (docs, _) = run(reads, caller, OperationId::RetrieveEntity, target, version).await?;
+    let none = Translated::default();
+    let (docs, _) = run(
+        reads,
+        caller,
+        OperationId::RetrieveEntity,
+        target,
+        &none,
+        version,
+    )
+    .await?;
     let doc = docs.first().ok_or_else(|| not_found(version))?;
-    let value = entity_value(reads, set_name, set, doc, picked.as_deref());
+    let value = entity_value(reads, set_name, set, doc, picked.as_deref(), &none);
     let names = picked.unwrap_or_default();
     let resource = resource(reads, set_name, version)?;
     let resource = if names.is_empty() {
@@ -257,6 +300,32 @@ async fn entity(
     // A Vec takes every byte: the write cannot fail.
     let _ = write_entity(ctx, &resource, &value, &mut body);
     Ok(json_response(version, ctx.level, body))
+}
+
+/// The request's `$filter` as `q` and `id` (5.2), empty without one.
+fn filtered(
+    set: &Set,
+    options: &QueryOptions,
+    version: ODataVersion,
+) -> Result<Translated, ODataErrorResponse> {
+    let Some(filter) = &options.filter else {
+        return Ok(Translated::default());
+    };
+    translate(filter, set, &options.aliases).map_err(|refused| match refused {
+        Refused::Later => not_implemented(version),
+        Refused::Bad => ODataErrorResponse::new(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "the filter cannot hold for this model",
+        )
+        .with_version(version),
+        Refused::TooComplex => ODataErrorResponse::new(
+            StatusCode::BAD_REQUEST,
+            "TooComplexQuery",
+            "the filter is too complex",
+        )
+        .with_version(version),
+    })
 }
 
 /// The Entity id a key predicate names: `('urn:…')` or `(id='urn:…')`,
@@ -282,11 +351,16 @@ async fn run(
     caller: &Caller,
     op: OperationId,
     target: String,
+    filter: &Translated,
     version: ODataVersion,
 ) -> Result<(Vec<Value>, u64), ODataErrorResponse> {
+    let mut req = OpsRequest::new(Method::GET, target);
+    if !filter.context.is_empty() {
+        req = req.context(Value::Object(filter.context.clone()));
+    }
     let answer = reads
         .view
-        .run(op, caller, OpsRequest::new(Method::GET, target))
+        .run(op, caller, req)
         .await
         .map_err(|refusal: Refusal| refused(refusal.status(), version))?;
     if answer.status() == StatusCode::NOT_FOUND {
@@ -314,7 +388,8 @@ async fn run(
     Ok((docs, total))
 }
 
-/// One NGSI-LD Entity, as normalized JSON keyed by the core context, as
+/// One NGSI-LD Entity, as normalized JSON keyed by the core context and the
+/// filter's terms, as
 /// the members of `set` (or the `picked` ones).
 fn entity_value(
     reads: &Reads,
@@ -322,6 +397,7 @@ fn entity_value(
     set: &Set,
     doc: &Value,
     picked: Option<&[&str]>,
+    filter: &Translated,
 ) -> EntityValue {
     let id = doc.get("id").and_then(Value::as_str).unwrap_or_default();
     let wanted = |name: &str| picked.is_none_or(|p| p.contains(&name));
@@ -342,7 +418,14 @@ fn entity_value(
         if !wanted(name) || matches!(member.shape, Shape::Nav { .. }) {
             continue;
         }
-        let instance = default_instance(doc.get(core_name(&member.iri)));
+        // The answer is compacted under the request's context: a term the
+        // filter defined names its Attribute.
+        let key = filter
+            .context
+            .iter()
+            .find(|(_, iri)| iri.as_str() == Some(member.iri.as_str()))
+            .map_or_else(|| core_name(&member.iri), |(term, _)| term.clone());
+        let instance = default_instance(doc.get(&key));
         properties.push((name.clone(), member_value(&member.shape, instance)));
     }
     let key = Segment::Key(Key::Single(KeyValue::Literal(Literal::String(

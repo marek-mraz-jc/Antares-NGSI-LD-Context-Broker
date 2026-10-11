@@ -127,6 +127,7 @@ pub struct OpsRequest {
     path_and_query: String,
     headers: HeaderMap,
     body: Body,
+    context: Option<Arc<serde_json::Value>>,
 }
 
 impl OpsRequest {
@@ -142,6 +143,7 @@ impl OpsRequest {
             path_and_query: path_and_query.into(),
             headers: HeaderMap::new(),
             body: Body::empty(),
+            context: None,
         }
     }
 
@@ -158,6 +160,21 @@ impl OpsRequest {
         if !outer_only(&name) {
             self.headers.append(name, value);
         }
+        self
+    }
+
+    /// The @context the request's names are read under, in place of the
+    /// outer request's `Link` header (a read's `q`, `attrs`, `type`): a
+    /// surface that names Attributes outside the core @context defines its
+    /// own terms, and the outer client cannot redefine them.
+    ///
+    /// ```
+    /// let req = antares_ops::OpsRequest::new(axum::http::Method::GET, "/ngsi-ld/v1/entities?type=Car&q=speed>1")
+    ///     .context(serde_json::json!({"Car": "https://example.org/Car", "speed": "https://example.org/speed"}));
+    /// ```
+    #[must_use]
+    pub fn context(mut self, context: serde_json::Value) -> Self {
+        self.context = Some(Arc::new(context));
         self
     }
 
@@ -250,7 +267,10 @@ impl Ops {
             .body(req.body)
             .map_err(|_| Refusal::Malformed("the operation's target is not a URI"))?;
         *inner.headers_mut() = req.headers;
-        let answer = self.state.call(&caller.0, inner).await;
+        let answer = match req.context {
+            Some(context) => self.state.call_in_context(&caller.0, inner, context).await,
+            None => self.state.call(&caller.0, inner).await,
+        };
         if !answer.status().is_server_error() {
             return Ok(answer);
         }

@@ -66,6 +66,21 @@ static PROPAGATED: [axum::http::HeaderName; 3] = [
     axum::http::HeaderName::from_static("link"),
 ];
 
+#[cfg(feature = "views")]
+tokio::task_local! {
+    /// The @context an in-process caller names for its request
+    /// ([`AppState::call_in_context`]). It takes the place of the `Link`
+    /// header, which the outer client chose and the caller cannot vouch for.
+    static INPROCESS_CONTEXT: Arc<serde_json::Value>;
+}
+
+/// The @context of the in-process call this task is inside, if its caller
+/// named one.
+#[cfg(feature = "views")]
+pub(crate) fn inprocess_context() -> Option<Arc<serde_json::Value>> {
+    INPROCESS_CONTEXT.try_with(Arc::clone).ok()
+}
+
 tokio::task_local! {
     /// How many [`AppState::call`] frames this task is already inside, held
     /// against [`crate::bounds::MAX_IN_PROCESS_CALL_DEPTH`]. Absent outside a
@@ -719,6 +734,23 @@ impl AppState {
             ))
             .into_response(),
         }
+    }
+
+    /// [`AppState::call`] with the terms of the request defined by
+    /// `context` (a JSON-LD `@context` value, resolved as a body's would
+    /// be) instead of a `Link` header: a surface that writes a `q` naming
+    /// Attributes outside the core @context says what its names mean, and
+    /// no header of the outer client changes it.
+    #[cfg(feature = "views")]
+    pub async fn call_in_context(
+        &self,
+        caller: &axum::http::HeaderMap,
+        req: axum::http::Request<axum::body::Body>,
+        context: Arc<serde_json::Value>,
+    ) -> axum::response::Response {
+        INPROCESS_CONTEXT
+            .scope(context, self.call(caller, req))
+            .await
     }
 
     /// Temporal auto-recording happens synchronously in the write path in
