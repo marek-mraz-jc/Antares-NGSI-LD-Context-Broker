@@ -12,22 +12,39 @@ surface joins by being declared, without a YAML edit.
                                        release, report, gate against the budget
   dev/surface-features.py --self-test  the gate is red on a synthetic overrun
 
-Budget: `full` <= vanilla + 6 MiB, every other feature alone <= vanilla
-+ 2 MiB, measured as the size of the stripped release binary (the release
-profile strips symbols). The report is a Markdown table on stdout and, in
-GitHub Actions, in the step summary.
+Budget: the "binary size" row of ADR-0027 section 6, read from the ADR so
+the gate cannot drift from it (`full` <= vanilla + 6 MiB, each feature alone
+<= vanilla + 2 MiB, `mcp` <= vanilla + 4.5 MiB since T-3662), measured as
+the size of the stripped release binary (the release profile strips
+symbols). The report is a Markdown table on stdout and, in GitHub Actions,
+in the step summary.
 """
 
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
 MIB = 1024 * 1024
-BUDGET = {"full": 6 * MIB}
-DEFAULT_BUDGET = 2 * MIB
 BROKER = "antares-broker"
+ADR = pathlib.Path(__file__).resolve().parent.parent / "docs/adr/ADR-0027-surfaces-architecture.md"
+
+
+def budgets(text):
+    """`(named, default)` in bytes from the ADR's `| binary size |` row: a
+    feature in backticks followed by `≤ vanilla + N MiB`, and `each feature
+    alone ≤ vanilla + N MiB` for the rest."""
+    row = next((line for line in text.splitlines() if line.startswith("| binary size |")), None)
+    if row is None:
+        sys.exit("ADR-0027 has no `| binary size |` row: no budget to gate against")
+    rule = row.split("|")[2]
+    named = {f: float(n) * MIB for f, n in re.findall(r"`([a-z0-9-]+)`[^`≤]*≤ vanilla \+ ([\d.]+) MiB", rule)}
+    default = re.search(r"each feature alone ≤ vanilla \+ ([\d.]+) MiB", rule)
+    if default is None or "full" not in named:
+        sys.exit(f"ADR-0027's binary size row does not read as a budget: {rule.strip()}")
+    return named, float(default.group(1)) * MIB
 
 
 def metadata():
@@ -56,11 +73,12 @@ def surface_features(meta):
     return found
 
 
-def verdicts(vanilla, sizes):
+def verdicts(vanilla, sizes, budget):
     """One row per feature: (feature, size, over vanilla, budget, within)."""
+    named, default = budget
     rows = []
     for feature, size in sizes.items():
-        budget = BUDGET.get(feature, DEFAULT_BUDGET)
+        budget = named.get(feature, default)
         rows.append((feature, size, size - vanilla, budget, size - vanilla <= budget))
     return rows
 
@@ -75,7 +93,7 @@ def report(vanilla, rows):
     ]
     for feature, size, over, budget, ok in rows:
         lines.append(
-            f"| `{feature}` | {size} | {over / MIB:+.2f} MiB | {budget / MIB:.0f} MiB | {'ok' if ok else 'OVER'} |"
+            f"| `{feature}` | {size} | {over / MIB:+.2f} MiB | {budget / MIB:g} MiB | {'ok' if ok else 'OVER'} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -92,7 +110,8 @@ def sizes():
     meta = metadata()
     target = meta["target_directory"]
     vanilla = build(target, None)
-    rows = verdicts(vanilla, {f: build(target, f) for f in surface_features(meta)})
+    budget = budgets(ADR.read_text())
+    rows = verdicts(vanilla, {f: build(target, f) for f in surface_features(meta)}, budget)
     text = report(vanilla, rows)
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -106,11 +125,16 @@ def sizes():
 
 def self_test():
     vanilla = 30 * MIB
-    rows = verdicts(vanilla, {"views": vanilla + 2 * MIB, "mcp": vanilla + 2 * MIB + 1,
-                              "full": vanilla + 6 * MIB})
+    budget = budgets(ADR.read_text())
+    if budget != ({"full": 6 * MIB, "mcp": 4.5 * MIB}, 2 * MIB):
+        sys.exit(f"self-test: the ADR's budget reads as {budget}")
+    rows = verdicts(vanilla, {"views": vanilla + 2 * MIB, "odata": vanilla + 2 * MIB + 1,
+                              "mcp": vanilla + 4.5 * MIB, "full": vanilla + 6 * MIB + 1}, budget)
     got = {r[0]: r[4] for r in rows}
-    if got != {"views": True, "mcp": False, "full": True}:
+    if got != {"views": True, "odata": False, "mcp": True, "full": False}:
         sys.exit(f"self-test: verdicts {got}")
+    if "4.5 MiB" not in report(vanilla, rows):
+        sys.exit("self-test: a fractional budget is not reported as it is")
     if "OVER" not in report(vanilla, rows):
         sys.exit("self-test: an overrun is not marked in the report")
     meta = {"packages": [
