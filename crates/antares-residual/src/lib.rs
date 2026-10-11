@@ -63,8 +63,9 @@ pub use time::{Date, DateTime, Time};
 pub const MAX_DEPTH: usize = 64;
 /// The most nodes one expression holds, literals and list members included (rule 7).
 pub const MAX_NODES: usize = 4096;
-/// The longest string a function may build; a longer result is unknown.
-pub const MAX_STRING_BYTES: usize = 1024 * 1024;
+/// The longest string a function may build; a longer result is unknown. Under Miri the bound
+/// is 4 KiB, so the test that crosses it runs the same code in seconds rather than an hour.
+pub const MAX_STRING_BYTES: usize = if cfg!(miri) { 4096 } else { 1024 * 1024 };
 /// The most nodes one evaluation visits, lambda bodies counted once per list member: nested
 /// `any`/`all` over long lists cost their product, and past this the evaluation is refused with
 /// [`Error::TooComplex`] instead of answering a guess.
