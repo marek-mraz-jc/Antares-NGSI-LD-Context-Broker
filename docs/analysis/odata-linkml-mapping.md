@@ -130,6 +130,10 @@ CSDL XML 15.2: a simple identifier "consists of at least one and at most 128 Uni
 | a class, `inlined: false` | Relationship | rows R1 to R5 | |
 | none, or unknown range | any | `Edm.Untyped` | 4.01 only (N8) |
 
+LinkML has one `integer`, one `string` and no binary, duration or GUID type, so a slot may narrow its Edm type with the annotation `edm_type` (T-3720, T-3722): `Edm.Byte`, `Edm.SByte`, `Edm.Int16` or `Edm.Int32` on `integer`; `Edm.Single` on `float` or `double`; `Edm.Guid`, `Edm.Duration` or `Edm.Binary` on `string`. Any other pairing, or another value, fails the load. The NGSI-LD value stays the range's JSON value; a write checks it against the narrower type (an `Edm.Int16` of 40000 is 400), and a `$filter` literal compares as the range's value.
+
+Core annotations from the schema (T-3722): a slot's `description` is `Core.Description` on its property and a class's `description` on its EntityType. The slot annotation `odata_computed: "true"` writes `Core.Computed`, and the property joins `NonInsertableProperties` and `NonUpdatableProperties` (rows C3, C9), so a body naming it is 400 as for the base members; `odata_immutable: "true"` writes `Core.Immutable` and adds it to `NonUpdatableProperties` only. Values other than `"true"` and `"false"` fail the load.
+
 For an `OData-MaxVersion: 4.0` request the `$metadata` and payloads leave every `Edm.Untyped` property out and mark the EntityType `OpenType="true"`, which is what CSDL XML 3.4 says services should do; CSDL JSON is 4.01 only (`odata-library.md` section 3.2), so a 4.0 request for `$metadata?$format=json` is answered 406 (unknown: OData names no status for it; HTTP 406 is the general rule).
 
 ```cypher
@@ -159,6 +163,7 @@ The view half of `effective = view ∧ engine` is read directly from the view: `
 | C8 | EntitySet T | `UpdateRestrictions/DeltaUpdateSupported` | constant | `false` (`odata_delta_update`) |
 | C9 | EntitySet T | `UpdateRestrictions/NonUpdatableProperties`, `NonUpdatableNavigationProperties` | as C3, C4 | |
 | C10 | EntitySet T | `DeleteRestrictions/Deletable` | view `operations` contains `delete_entity`, and probe 5.6.6 | `false` on `Deny`/`Filter` |
+| C10a | EntitySet T | `Insertable`, `Updatable`, `Deletable` of C2, C6, C10 (T-3722) | the class annotations `odata_insertable`, `odata_updatable`, `odata_deletable` with the value `"false"` | the class can only narrow what the view offers, never widen it; a create, an update (of the Entity, a property or a reference) or a delete the set refuses is 405 before its body is read, as for an operation the view lacks |
 | C11 | EntitySet T | `FilterRestrictions/Filterable` `true`, `MaxLevels`, `NonFilterableProperties` | (a) and constants | `MaxLevels` = 1 in round 1 (no navigation path in `$filter`, section 5.2 row F23); `NonFilterableProperties`: every `Edm.Untyped`, `_datasets`, `_types`, every R5 property is filterable as a string |
 | C12 | EntitySet T | `SortRestrictions/Sortable` `true`, `NonSortableProperties` | (a) | every `Edm.Untyped`, collection, LanguageProperty and navigation property |
 | C13 | EntitySet T | `ExpandRestrictions/Expandable`, `MaxLevels`, `NonExpandableProperties` | constants and C1 of targets | `Expandable=false` until the join visibility fix (section 5.1 row Q3); then `MaxLevels = min(MAX_JOIN_LEVEL, view cap)` (`bounds.rs:109`, 10); `NonExpandableProperties`: navigations to hidden or non-traversable targets (none exist as navigations after R5, so the list is empty by construction) |

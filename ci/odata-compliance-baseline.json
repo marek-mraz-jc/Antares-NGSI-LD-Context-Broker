@@ -1,8 +1,8 @@
 {
  "counts": {
-  "FAIL": 564,
-  "PASS": 545,
-  "SKIP": 78
+  "FAIL": 563,
+  "PASS": 550,
+  "SKIP": 74
  },
  "results": {
   "[V4.01] 11.2.12_query_schemaversion :: $metadata accepts $schemaversion=*": "SKIP",
@@ -811,7 +811,7 @@
   "[V4] 4.4_primitive_types :: Edm.Duration primitive type is supported": "PASS",
   "[V4] 4.4_primitive_types :: Edm.Guid primitive type is supported": "PASS",
   "[V4] 4.4_primitive_types :: Edm.Int16 primitive type is supported": "PASS",
-  "[V4] 4.4_primitive_types :: Edm.Int32 primitive type is supported": "FAIL",
+  "[V4] 4.4_primitive_types :: Edm.Int32 primitive type is supported": "PASS",
   "[V4] 4.4_primitive_types :: Edm.Int64 primitive type is supported": "PASS",
   "[V4] 4.4_primitive_types :: Edm.SByte primitive type is supported": "PASS",
   "[V4] 4.4_primitive_types :: Edm.Single primitive type is supported": "PASS",
@@ -873,7 +873,7 @@
   "[V4] 5.1.1.3_int16_type :: Edm.Int16 max value (32767) round-trips unchanged through POST and GET": "FAIL",
   "[V4] 5.1.1.3_int16_type :: Edm.Int16 min value (-32768) round-trips unchanged through POST and GET": "FAIL",
   "[V4] 5.1.1.3_int16_type :: Edm.Int16 orderby returns entities in ascending order by Quantity": "FAIL",
-  "[V4] 5.1.1.3_int16_type :: Edm.Int16 type appears in metadata as a genuine Property declaration": "SKIP",
+  "[V4] 5.1.1.3_int16_type :: Edm.Int16 type appears in metadata as a genuine Property declaration": "PASS",
   "[V4] 5.1.1.3_int16_type :: Edm.Int16 value above the max (32768) is rejected, not silently truncated": "PASS",
   "[V4] 5.1.1.3_int16_type :: Edm.Int16 value below the min (-32769) is rejected, not silently clamped": "PASS",
   "[V4] 5.1.1.3_int16_type :: Int16 values are serialized as numbers within the valid range [-32768, 32767]": "FAIL",
@@ -887,7 +887,7 @@
   "[V4] 5.1.1.4_single_type :: Edm.Single ne NaN literal is accepted": "FAIL",
   "[V4] 5.1.1.4_single_type :: Edm.Single scientific notation: Weight lt 1.5e2f returns correct set": "FAIL",
   "[V4] 5.1.1.4_single_type :: Edm.Single supports gt comparison with 'f' suffix": "FAIL",
-  "[V4] 5.1.1.4_single_type :: Edm.Single type appears in metadata as a genuine Property declaration": "SKIP",
+  "[V4] 5.1.1.4_single_type :: Edm.Single type appears in metadata as a genuine Property declaration": "PASS",
   "[V4] 5.1.1.4_single_type :: Single (Weight) values are present and numeric in response": "PASS",
   "[V4] 5.1.1.4_single_type :: cast() function supports Edm.Single": "FAIL",
   "[V4] 5.1.1.5_numeric_boundary_tests :: (Price div 3) mul 3 eq Price matches exactly the products where that holds under IEEE-754 double arithmetic": "FAIL",
@@ -956,7 +956,7 @@
   "[V4] 5.1.6_binary_type :: Binary literal binary'base64' returns entities whose Data matches": "FAIL",
   "[V4] 5.1.6_binary_type :: Binary ne comparison returns entities where Data differs": "FAIL",
   "[V4] 5.1.6_binary_type :: Binary ne null returns only entities with a non-null Data field": "PASS",
-  "[V4] 5.1.6_binary_type :: Edm.Binary type appears in metadata as a genuine Property declaration": "SKIP",
+  "[V4] 5.1.6_binary_type :: Edm.Binary type appears in metadata as a genuine Property declaration": "PASS",
   "[V4] 5.1.6_binary_type :: Invalid base64 encoding returns 400 Bad Request": "FAIL",
   "[V4] 5.1.6_binary_type :: Non-null Binary values are base64-encoded strings in the JSON response": "FAIL",
   "[V4] 5.1.6_binary_type :: cast() function supports Edm.Binary": "FAIL",
@@ -993,7 +993,7 @@
   "[V4] 5.1.8_duration_type :: Duration ne P0D returns entities where ShippingTime is not zero": "FAIL",
   "[V4] 5.1.8_duration_type :: Duration ne null returns only entities with a non-null ShippingTime": "PASS",
   "[V4] 5.1.8_duration_type :: Duration values are serialized as ISO 8601 strings (P... format)": "PASS",
-  "[V4] 5.1.8_duration_type :: Edm.Duration type appears in metadata as a genuine Property declaration": "SKIP",
+  "[V4] 5.1.8_duration_type :: Edm.Duration type appears in metadata as a genuine Property declaration": "PASS",
   "[V4] 5.1.8_duration_type :: Invalid duration format returns 400 Bad Request": "FAIL",
   "[V4] 5.1.8_duration_type :: Negative duration literal -P1D matches entities with Offset of exactly -1 day": "FAIL",
   "[V4] 5.1.8_duration_type :: cast() function supports Edm.Duration": "FAIL",

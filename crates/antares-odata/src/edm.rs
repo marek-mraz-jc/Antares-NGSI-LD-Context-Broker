@@ -5,7 +5,7 @@
 //! name a request carries (M1 to M3). A type or an Attribute the view does
 //! not show leaves no trace in it (S4).
 
-use linkml_model::{Builtin, Range, EDM_TYPE_TAG};
+use linkml_model::{edm_types, Builtin, Range, EDM_TYPE_TAG};
 use odata_csdl::{
     Annotation, CsdlVersion, EntityContainer, EntitySet, EntityType, Expr, Include, Model,
     NavigationProperty, NavigationPropertyBinding, Property, Reference, Scale, Schema, Term,
@@ -128,6 +128,21 @@ pub struct Member {
     /// The slot is a `ListProperty` or a `ListRelationship`: a write
     /// keeps the kind (`valueList`, `objectList`).
     pub list: bool,
+    /// When a client may write it (T-3722).
+    pub written: Written,
+}
+
+/// When a client may write a member: `Core.Computed` never,
+/// `Core.Immutable` on create only (T-3722).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Written {
+    /// On create and on update.
+    #[default]
+    Always,
+    /// On create only (`odata_immutable`).
+    OnCreate,
+    /// Never (`odata_computed`).
+    Never,
 }
 
 /// One EntitySet: its Entity type and the members the view shows of it.
@@ -140,6 +155,8 @@ pub struct Set {
     /// The class's `identifier` slot, when the view shows it (E2a); the key
     /// is `id` without one (E2).
     pub identifier: Option<Identifier>,
+    /// The writes the set takes: the view's, narrowed by the class (C10a).
+    pub writable: Writable,
 }
 
 /// A key taken from the model (E2a): its value `v` names the Entity
@@ -196,6 +213,10 @@ pub fn build(
         ty.base_type = Some(BASE.into());
         let mut identifier = None;
         ty.annotations.push(iri(&schema.class_iri(class)));
+        let own = schema.schema().classes.get(*class);
+        ty.annotations
+            .extend(own.and_then(|c| c.description.as_deref()).map(description));
+        let writable = narrowed(writable, own);
         let mut set = EntitySet::new(name.clone(), format!("{namespace}.{name}"));
         let mut members = BTreeMap::new();
         for (slot_name, slot) in schema.class_slots(class) {
@@ -218,22 +239,15 @@ pub fn build(
             }
             match &shape {
                 Shape::Nav { target, collection } => {
+                    let ordered = schema.kind(&slot) == "ListRelationship";
                     let target_ty = format!("{namespace}.{target}");
-                    let mut nav = NavigationProperty::new(
-                        member.clone(),
-                        if *collection {
-                            TypeRef::collection(target_ty)
-                        } else {
-                            TypeRef::single(target_ty)
-                        },
-                    );
-                    // CSDL XML 8.1.4: a collection-valued navigation is never null.
-                    nav.nullable = !*collection;
-                    nav.annotations.push(iri(&slot_iri));
-                    if schema.kind(&slot) == "ListRelationship" {
-                        nav.annotations.push(core("Ordered"));
-                    }
-                    ty.navigation_properties.push(nav);
+                    ty.navigation_properties.push(navigation(
+                        &member,
+                        &slot_iri,
+                        target_ty,
+                        *collection,
+                        ordered,
+                    ));
                     set.bindings.push(NavigationPropertyBinding {
                         path: member.clone(),
                         target: target.clone(),
@@ -251,6 +265,7 @@ pub fn build(
                     iri: slot_iri,
                     shape,
                     list: schema.kind(&slot).starts_with("List"),
+                    written: written(&slot),
                 },
             );
         }
@@ -263,6 +278,7 @@ pub fn build(
                 type_iri: schema.class_iri(class),
                 members,
                 identifier,
+                writable,
             },
         );
     }
@@ -313,6 +329,29 @@ fn keyed(ty: &mut EntityType, class: &str, member: &str, edm: &'static str) -> I
     }
 }
 
+/// Rows R1 to R4: the navigation property of a Relationship slot.
+fn navigation(
+    member: &str,
+    slot_iri: &str,
+    target_ty: String,
+    collection: bool,
+    ordered: bool,
+) -> NavigationProperty {
+    let ty = if collection {
+        TypeRef::collection(target_ty)
+    } else {
+        TypeRef::single(target_ty)
+    };
+    let mut nav = NavigationProperty::new(member, ty);
+    // CSDL XML 8.1.4: a collection-valued navigation is never null.
+    nav.nullable = !collection;
+    nav.annotations.push(iri(slot_iri));
+    if ordered {
+        nav.annotations.push(core("Ordered"));
+    }
+    nav
+}
+
 /// Section 3.4 and rows P1 to P7, R1 to R5.
 fn shape(
     schema: &linkml_model::Model,
@@ -345,11 +384,13 @@ fn shape(
             collection: many || kind == "ListProperty",
         },
         (kind, Range::Type(b)) => Shape::Value {
-            edm: match slot.annotations.get(EDM_TYPE_TAG) {
-                // The model admits `Edm.Guid` on a string slot only.
-                Some(_) => "Edm.Guid",
-                None => edm_type(b),
-            },
+            // The model admits only the narrowings of `edm_types`.
+            edm: slot
+                .annotations
+                .get(EDM_TYPE_TAG)
+                .and_then(|a| edm_types(b).iter().find(|t| **t == a.value))
+                .copied()
+                .unwrap_or_else(|| edm_type(b)),
             collection: many || kind == "ListProperty",
         },
     }
@@ -411,6 +452,13 @@ fn property(
     if schema.kind(slot) == "ListProperty" {
         p.annotations.push(core("Ordered"));
     }
+    match written(slot) {
+        Written::Never => p.annotations.push(core("Computed")),
+        Written::OnCreate => p.annotations.push(core("Immutable")),
+        Written::Always => {}
+    }
+    p.annotations
+        .extend(slot.description.as_deref().map(description));
     if let Range::Enum(e) = range {
         // `range` names an enum only when the schema holds it.
         let values = schema.schema().enums.get(e).into_iter();
@@ -438,6 +486,40 @@ fn core(term: &str) -> Annotation {
     Annotation::new(format!("Core.{term}"), Expr::Bool(true))
 }
 
+/// The view's writes narrowed by the class's `odata_insertable`,
+/// `odata_updatable` and `odata_deletable` (C10a): `"false"` takes one away,
+/// nothing adds one.
+fn narrowed(writable: Writable, class: Option<&linkml_model::Class>) -> Writable {
+    let flag = |tag: &str| {
+        class
+            .and_then(|c| c.annotations.get(tag))
+            .is_none_or(|a| a.value != "false")
+    };
+    Writable {
+        insert: writable.insert && flag("odata_insertable"),
+        update: writable.update && flag("odata_updatable"),
+        delete: writable.delete && flag("odata_deletable"),
+    }
+}
+
+/// `Core.Description` of a slot or a class (T-3722).
+fn description(text: &str) -> Annotation {
+    Annotation::new("Core.Description", Expr::String(text.to_owned()))
+}
+
+/// When a client may write the slot's member (T-3722); the model admits
+/// only `"true"` and `"false"` as the flags' values.
+fn written(slot: &linkml_model::Slot) -> Written {
+    let set = |tag: &str| slot.annotations.get(tag).is_some_and(|a| a.value == "true");
+    if set("odata_computed") {
+        Written::Never
+    } else if set("odata_immutable") {
+        Written::OnCreate
+    } else {
+        Written::Always
+    }
+}
+
 /// C2 to C16: the writes the view offers, none of them deep or an upsert,
 /// with the members no write may name ([`Shape::writable`], the computed
 /// ones are `Core.Computed`); counting; filtering and sorting on the
@@ -462,20 +544,23 @@ fn capabilities(members: &BTreeMap<String, Member>, writable: Writable) -> Vec<A
         )
         .map(Expr::PropertyPath)
         .collect();
-    let unwritable: Vec<Expr> = members
-        .iter()
-        .filter(|(_, m)| !m.shape.writable())
-        .map(|(name, _)| Expr::PropertyPath(name.clone()))
-        .collect();
+    let refused = |create: bool| -> Vec<Expr> {
+        members
+            .iter()
+            .filter(|(_, m)| {
+                !m.shape.writable()
+                    || m.written == Written::Never
+                    || (!create && m.written == Written::OnCreate)
+            })
+            .map(|(name, _)| Expr::PropertyPath(name.clone()))
+            .collect()
+    };
     vec![
         restriction(
             "InsertRestrictions",
             vec![
                 ("Insertable", flag(writable.insert)),
-                (
-                    "NonInsertableProperties",
-                    Expr::Collection(unwritable.clone()),
-                ),
+                ("NonInsertableProperties", Expr::Collection(refused(true))),
             ],
         ),
         restriction(
@@ -484,7 +569,7 @@ fn capabilities(members: &BTreeMap<String, Member>, writable: Writable) -> Vec<A
                 ("Updatable", flag(writable.update)),
                 ("Upsertable", flag(false)),
                 ("DeltaUpdateSupported", flag(false)),
-                ("NonUpdatableProperties", Expr::Collection(unwritable)),
+                ("NonUpdatableProperties", Expr::Collection(refused(false))),
             ],
         ),
         restriction(

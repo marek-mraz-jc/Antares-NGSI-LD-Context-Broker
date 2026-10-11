@@ -265,10 +265,12 @@ mod tests {
             iri: "https://e.org/m".into(),
             shape,
             list: false,
+            written: crate::edm::Written::Always,
         };
         let set = Set {
             type_iri: "https://e.org/T".into(),
             identifier: None,
+            writable: crate::edm::Writable::default(),
             members: std::collections::BTreeMap::from([
                 (
                     "nav".into(),
