@@ -13,11 +13,14 @@ rust-version.workspace = true
 role = "ops"
 
 [dependencies]
+geo = { workspace = true }
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# the pushed `georel` matcher, held against the residual relations (tests/geometry.rs)
+antares-ql = { workspace = true }
 proptest = { workspace = true }
 
 [lints.rust]
