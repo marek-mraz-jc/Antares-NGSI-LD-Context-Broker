@@ -94,6 +94,33 @@ impl CompiledView {
         })
     }
 
+    /// The view that selects every type and shows every Attribute
+    /// (ADR-0023 rule 12): no rules, so the engine's answer stands, narrowed
+    /// by the view's own conditions alone.
+    #[must_use]
+    pub fn every(
+        q: Option<QNode>,
+        scope_q: Option<String>,
+        geo_q: Option<antares_ql::geo::GeoQuery>,
+    ) -> Self {
+        Self {
+            narrowing: Arc::new(Filter {
+                q: q.map(Box::new),
+                scope_q,
+                geo_q: geo_q.map(Box::new),
+                ..Filter::default()
+            }),
+            id: String::new(),
+        }
+    }
+
+    /// Whether the view shows every name ([`Self::every`]): [`Self::new`]
+    /// never compiles a view without rules.
+    #[must_use]
+    pub fn shows_every_name(&self) -> bool {
+        self.narrowing.rules.is_empty()
+    }
+
     /// The same view under the id the table serves it as.
     #[must_use]
     pub fn named(mut self, id: &str) -> Self {
@@ -669,7 +696,9 @@ pub(crate) fn watched_in(
         .unwrap_or_default();
     let kept: Vec<serde_json::Value> = watched
         .iter()
-        .filter(|w| w.as_str().is_some_and(|w| shown.iter().any(|s| s == w)))
+        .filter(|w| {
+            view.shows_every_name() || w.as_str().is_some_and(|w| shown.iter().any(|s| s == w))
+        })
         .cloned()
         .collect();
     if kept.is_empty() {

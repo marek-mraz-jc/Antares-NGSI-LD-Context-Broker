@@ -2,18 +2,15 @@
   "id": "all",
   "tenant": "conformance",
   "selector": [
-    "AirQualityObserved"
+    "*"
   ],
   "rules": [
     {
       "types": [
-        "AirQualityObserved"
+        "*"
       ],
       "attributes": [
-        "temperature",
-        "NO2",
-        "location",
-        "nearest"
+        "*"
       ]
     }
   ],
@@ -31,8 +28,11 @@
     "temporal_retrieve",
     "temporal_query",
     "temporal_query_post",
-    "retrieve_subscription",
-    "query_subscriptions",
+    "list_contexts",
+    "batch_create",
+    "batch_update",
+    "batch_merge",
+    "batch_delete",
     "create_entity",
     "update_attributes",
     "append_attributes",
@@ -43,12 +43,10 @@
     "merge_entity",
     "replace_entity",
     "replace_attribute",
-    "batch_create",
-    "batch_update",
-    "batch_merge",
-    "batch_delete",
     "create_subscription",
     "update_subscription",
+    "retrieve_subscription",
+    "query_subscriptions",
     "delete_subscription"
   ]
 }

@@ -11,6 +11,7 @@ mod engines;
 mod mcp_cache;
 mod mcp_discovery;
 mod mcp_errors;
+mod mcp_every;
 mod mcp_gate;
 mod mcp_listen;
 mod mcp_output;

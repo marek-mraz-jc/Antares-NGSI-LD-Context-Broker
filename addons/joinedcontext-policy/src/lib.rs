@@ -79,7 +79,7 @@ impl JoinedcontextPolicy {
     fn decide_now(&self, subject: &Subject, op: &Operation<'_>) -> Decision {
         let table = self.table(subject.tenant.as_str());
         decide::decide(
-            table.as_deref(),
+            table.as_deref().map(|t| t.through(subject.view())),
             &Caller::of(subject),
             op,
             chrono::Utc::now(),
