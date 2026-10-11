@@ -560,3 +560,69 @@ async fn a_write_on_the_documents_is_an_odata_405() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn metadata_carries_a_strong_etag_per_serialisation_and_revalidates() -> Result<(), String> {
+    let head = |uri: &'static str, headers: Vec<(&'static str, String)>| async move {
+        let mut request = Request::get(uri).header("OData-MaxVersion", "4.01");
+        for (k, v) in headers {
+            request = request.header(k, v);
+        }
+        let request = request.body(Body::empty()).map_err(|e| e.to_string())?;
+        let response = app(state())
+            .oneshot(request)
+            .await
+            .map_err(|e| e.to_string())?;
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let (status, etag, cache) = (response.status(), header("etag"), header("cache-control"));
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| e.to_string())?
+            .to_bytes();
+        Ok::<_, String>((status, etag, cache, bytes.len()))
+    };
+    let (status, xml_tag, cache, _) = head("/odata/$metadata", vec![]).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        xml_tag.starts_with('"') && xml_tag.ends_with('"') && xml_tag.len() == 18,
+        "{xml_tag}"
+    );
+    assert_eq!(cache, "private, no-cache");
+    let (_, again, ..) = head("/odata/$metadata", vec![]).await?;
+    assert_eq!(again, xml_tag, "the same bytes, the same tag");
+    let (_, json_tag, ..) = head("/odata/$metadata?$format=json", vec![]).await?;
+    assert_ne!(json_tag, xml_tag, "one tag per serialisation");
+    for matching in [
+        xml_tag.clone(),
+        format!("W/{xml_tag}"),
+        format!("\"x\", {xml_tag}"),
+        "*".to_owned(),
+    ] {
+        let (status, tag, cache, len) = head(
+            "/odata/$metadata",
+            vec![("If-None-Match", matching.clone())],
+        )
+        .await?;
+        assert_eq!((status, len), (StatusCode::NOT_MODIFIED, 0), "{matching}");
+        assert_eq!(
+            (tag.as_str(), cache.as_str()),
+            (xml_tag.as_str(), "private, no-cache")
+        );
+    }
+    let (status, ..) = head("/odata/$metadata", vec![("If-None-Match", json_tag)]).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "another document's tag does not match"
+    );
+    Ok(())
+}

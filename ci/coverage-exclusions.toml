@@ -75,3 +75,12 @@ function = "antares_odata::unreadable"
 lines = 2
 branches = 0
 reason = "tracing::warn! repeats the fields in its `log` fallback, which runs only with no subscriber set; tests/metadata.rs::an_unreadable_schema_is_logged_once_with_its_reason covers the subscriber path and asserts what it logs"
+
+
+[[exclusion]]
+crate = "antares-odata"
+file = "src/lib.rs"
+function = "antares_odata::model"
+lines = 3
+branches = 0
+reason = "tracing::debug! repeats the fields in its `log` fallback, which runs only with no subscriber set; tests/odata_metadata.rs sets one and counts the build events"

@@ -236,6 +236,13 @@ impl Terms<'_> {
             return Err(Refused::Later);
         }
         let name = self.scalar(member)?;
+        // URL 5.1.1.5: the string functions take a string; NGSI-LD would
+        // match no other value without saying why.
+        let string = matches!(member, Expr::Member(MemberPath { path, .. })
+            if path.first().and_then(|n| self.set.members.get(n)).is_some_and(|m| matches!(m.shape, Shape::Value { edm: "Edm.String", .. })));
+        if !string {
+            return Err(Refused::Bad);
+        }
         let escaped = escape(s);
         let pattern = match method {
             Method::StartsWith => format!("^{escaped}"),
@@ -495,6 +502,15 @@ mod tests {
         assert_eq!(q(&one_arg), Err(Refused::Later));
         let number = Expr::Call(Method::Contains, vec![m("name"), lit(Literal::Int(1))]);
         assert_eq!(q(&number), Err(Refused::Later));
+        let on_a_number = Expr::Call(
+            Method::Contains,
+            vec![m("speed"), lit(Literal::String("1".into()))],
+        );
+        assert_eq!(
+            q(&on_a_number),
+            Err(Refused::Bad),
+            "a string function on a Double"
+        );
     }
 
     #[test]

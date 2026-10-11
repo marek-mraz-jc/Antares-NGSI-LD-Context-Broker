@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use axum::extract::{FromRef, FromRequestParts, State};
-use axum::http::header::{ACCEPT, CONTENT_TYPE};
+use axum::http::header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -367,7 +367,49 @@ async fn metadata(
             "application/json"
         }
     };
-    Ok(respond(version, content_type, out))
+    Ok(revalidated(&headers, version, content_type, out))
+}
+
+/// The metadata document with its strong `ETag` and `Cache-Control:
+/// private, no-cache` (T-3441 7.4: the bytes may differ per subject, so no
+/// shared cache keeps them), or `304` when `If-None-Match` names it.
+/// ponytail: the tag is the std `SipHash` of the bytes, the same on every pod
+/// of one build; SHA-256 if tags must agree across builds.
+fn revalidated(
+    headers: &HeaderMap,
+    version: ODataVersion,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> Response {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    let etag = format!("\"{:016x}\"", hasher.finish());
+    // If-None-Match compares weakly (RFC 9110 13.1.2).
+    let matched = headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|tag| tag == "*" || tag.trim_start_matches("W/") == etag);
+    let mut response = if matched {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        response
+            .headers_mut()
+            .insert("odata-version", HeaderValue::from_static(version.as_str()));
+        response
+    } else {
+        respond(version, content_type, body)
+    };
+    let headers = response.headers_mut();
+    // Hex digits between quotes: always a header value.
+    headers.insert(
+        ETAG,
+        HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("\"\"")),
+    );
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+    response
 }
 
 /// The JSON metadata level a resource is written at (JSON Format 4.01 section 3.1): `$format`

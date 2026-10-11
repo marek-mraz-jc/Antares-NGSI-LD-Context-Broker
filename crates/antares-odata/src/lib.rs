@@ -53,6 +53,9 @@ pub const MAX_HEADER_LEN: usize = 4096;
 /// How many parsed schemas a pod keeps, by revision.
 const SCHEMA_CACHE: usize = 64;
 
+/// How many built models a pod keeps (T-3441 7.3).
+const MODEL_CACHE: usize = 256;
+
 /// The OData surface.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OData;
@@ -99,11 +102,11 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
     let Some(view) = ops.view(&id) else {
         return not_found();
     };
-    let Some(edm) = model(&id, &view, csdl_version(&req)) else {
+    let Some((edm, csdl)) = model(&id, &view, csdl_version(&req)) else {
         return not_found();
     };
     let state = Arc::new(ODataState {
-        model: Arc::new(edm.csdl.clone()),
+        model: csdl,
         service_root: format!("{PREFIX}/{id}/odata/v4/"),
         url_limits: odata_url::Limits::strict(),
         csdl_limits: odata_csdl::Limits::strict(),
@@ -113,7 +116,7 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
     req.extensions_mut().remove::<MatchedPath>();
     let reads = Arc::new(read::Reads {
         view,
-        edm: Arc::new(edm),
+        edm,
         state: state.clone(),
     });
     let api =
@@ -136,12 +139,50 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
     resp
 }
 
-/// The model of `view` at `version`, `None` when its Tenant has no schema
-/// this surface can read.
-fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<edm::Edm> {
+/// What a model is a function of (T-3441 7.3): the view, the types and
+/// Attributes it shows, its Tenant's schema revision, the OData version.
+/// The key is compared whole, so two views never share a model by a
+/// collision. ponytail: no engine probe bits yet; section 4's Capabilities
+/// add them to the key when the model reads the engine.
+type ModelKey = (String, edm::Shown, u64, bool);
+
+/// A built model and its CSDL document.
+type Built = (Arc<edm::Edm>, Arc<odata_csdl::Model>);
+
+/// The model of `view` at `version`, built once per key on this pod (O21),
+/// `None` when its Tenant has no schema this surface can read.
+fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
+    static CACHE: LazyLock<Mutex<HashMap<ModelKey, Built>>> = LazyLock::new(Mutex::default);
     let (revision, bytes) = view.schema()?;
+    let shown = view.shown_by_type();
+    let key = (
+        id.to_owned(),
+        shown,
+        revision,
+        version == CsdlVersion::V4_01,
+    );
+    if let Some(hit) = CACHE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+    {
+        return Some(hit.clone());
+    }
     let schema = parsed(revision, &bytes)?;
-    edm::build(id, &schema, &view.shown_by_type(), version).ok()
+    let edm = edm::build(id, &schema, &key.1, version).ok()?;
+    tracing::debug!(
+        view = id,
+        schema_revision = revision,
+        "the view's OData model was built"
+    );
+    let built = (Arc::new(edm.clone()), Arc::new(edm.csdl));
+    remember(
+        &mut CACHE.lock().unwrap_or_else(PoisonError::into_inner),
+        MODEL_CACHE,
+        key,
+        built.clone(),
+    );
+    Some(built)
 }
 
 /// The schema of `bytes`, parsed once per revision on this pod.
@@ -159,14 +200,23 @@ fn parsed(revision: u64, bytes: &[u8]) -> Option<Arc<linkml_model::Model>> {
         .map(Arc::new)
         .inspect_err(|e| unreadable(revision, e))
         .ok();
-    let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-    // ponytail: dropped whole when full; an LRU when one pod serves more
-    // than SCHEMA_CACHE schemas at once.
-    if cache.len() >= SCHEMA_CACHE {
+    remember(
+        &mut CACHE.lock().unwrap_or_else(PoisonError::into_inner),
+        SCHEMA_CACHE,
+        revision,
+        read.clone(),
+    );
+    read
+}
+
+/// Keeps `value` under `key` in a cache of at most `max` entries.
+/// ponytail: a full cache is dropped whole; an LRU when one pod serves more
+/// views or schemas at once than the bound.
+fn remember<K: std::hash::Hash + Eq, V>(cache: &mut HashMap<K, V>, max: usize, key: K, value: V) {
+    if cache.len() >= max {
         cache.clear();
     }
-    cache.insert(revision, read.clone());
-    read
+    cache.insert(key, value);
 }
 
 /// Logged once per revision on this pod: the result is cached.
