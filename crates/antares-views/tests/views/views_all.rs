@@ -110,3 +110,83 @@ async fn views_all_writes_and_watches_every_attribute() -> Result<(), String> {
     assert_eq!(sub.status, StatusCode::CREATED, "{}", sub.text);
     Ok(())
 }
+
+/// A Relationship to an Entity that does not exist, written through `all`,
+/// is written as at the root (T-3786, ETSI `454_01`): a view that selects
+/// every Entity hides none, so the absent target tells nothing. A view of
+/// every type narrowed by a `q` still answers absent as hidden (D7).
+#[tokio::test(flavor = "multi_thread")]
+async fn views_all_writes_a_relationship_to_an_absent_entity_as_the_root_does() -> Result<(), String>
+{
+    let f = fixture().await?;
+    put_view(&f.app, &all_view()).await?;
+    let absent = "urn:ngsi-ld:Person:nobody";
+    let car3 = "/entities/urn:ngsi-ld:Car:3";
+    let list = json!({"type": "ListRelationship", "objectList": [absent]});
+    for (method, path, body, want) in [
+        (
+            Method::POST,
+            "/entities".to_owned(),
+            json!({"id": "urn:ngsi-ld:Car:z1", "type": "Car", "r": list}),
+            StatusCode::CREATED,
+        ),
+        (
+            Method::PATCH,
+            format!("{car3}/attrs"),
+            json!({"owner": {"type": "Relationship", "object": absent}}),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            Method::POST,
+            format!("{car3}/attrs"),
+            json!({"driver": {"type": "Relationship", "object": absent}}),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            Method::PATCH,
+            car3.to_owned(),
+            json!({"owner": {"type": "Relationship", "object": absent}}),
+            StatusCode::NO_CONTENT,
+        ),
+    ] {
+        let a = send(
+            &f.app,
+            method.clone(),
+            &format!("{ALL}{path}"),
+            &[],
+            Some(&body),
+        )
+        .await;
+        assert_eq!(a.status, want, "{method} {path}: {}", a.text);
+    }
+    let made = direct(&f.app, "/entities/urn:ngsi-ld:Car:z1").await;
+    assert_eq!(
+        made.json.pointer("/r/objectList"),
+        Some(&json!([{"object": absent}])),
+        "{}",
+        made.text
+    );
+
+    let mut narrowed = all_view();
+    if let Some(o) = narrowed.as_object_mut() {
+        o.insert("id".into(), json!("all-slow"));
+        o.insert("q".into(), json!("speed<80"));
+    }
+    put_view(&f.app, &narrowed).await?;
+    let a = send(
+        &f.app,
+        Method::POST,
+        "/x/views/all-slow/ngsi-ld/v1/entities",
+        &[],
+        Some(&json!({"id": "urn:ngsi-ld:Car:z2", "type": "Car", "speed": {"type": "Property", "value": 1}, "r": list})),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.text);
+    assert_eq!(
+        a.json.pointer("/detail"),
+        Some(&json!(
+            "a Relationship written through this view must point at an Entity it shows"
+        ))
+    );
+    Ok(())
+}

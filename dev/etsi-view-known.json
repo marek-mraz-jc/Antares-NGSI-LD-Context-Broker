@@ -1,5 +1,3 @@
 {
- "all": {
-  "TP/NGSI-LD/ContextInformation/Consumption/Entity/RetrieveEntity/454_01.robot::454_01 Simplified Representation Per Attribute Type": "T-3786: a Relationship to an absent Entity is refused through a view that shows every Entity"
- }
+ "all": {}
 }
