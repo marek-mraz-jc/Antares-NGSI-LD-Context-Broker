@@ -192,7 +192,9 @@ read-modify-write on the very document it changes, so a concurrent write
 between the decision and the commit cannot carry it onto an Entity the
 condition no longer selects. An Entity it does not select answers `404`
 exactly as an absent one does; a batch judges each member by its own
-Entity and reports the others in `errors`; a conditioned write that would
+Entity and reports the others in `errors`, and a Batch Upsert member under
+a condition never creates: absent, it answers the same `404` (T-3668); a
+conditioned write that would
 be forwarded to a Context Source is refused (`403`). `AllowIf` holds on the
 clauses in `policy::WRITE_BY_ID` and selects only: on any other clause, or
 with a `pick`, `omit`, `omit_by_type`, `temporal` or a rule's Attribute
