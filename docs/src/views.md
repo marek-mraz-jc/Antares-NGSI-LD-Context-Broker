@@ -124,4 +124,7 @@ and navigation properties, the LinkML surface) reads the Tenant's `LinkML`
 schema, written to [`/q/schemas/{tenant}`](admin-api.md#schemas). Every view
 of that Tenant sees the same schema and no view sees another Tenant's. The
 surface gets the bytes and a revision through `ViewOps::schema`, parses
-them under its own limits, and parses again only when the revision changes.
+them under its own limits, and parses again only when the revision changes. A view
+document carries no schema of its own: one with a `linkml` member is
+refused with `400` like any unknown member, so the Tenant's schema is the
+one source (T-3658).
