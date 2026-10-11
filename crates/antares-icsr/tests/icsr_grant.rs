@@ -6,8 +6,10 @@
 
 mod common;
 
+use antares_ops::test_kit::TestBroker;
 use common::{broker, car, cars, grant, ids, register, send, warned};
 use serde_json::json;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// C1: no grant, no registration (403 before it is stored, at 12.2.2 and
 /// 12.2.4); with a grant the registration is stored and B's Cars arrive.
@@ -206,6 +208,7 @@ async fn the_grant_routes_check_what_they_store() {
     let (_b, app) = broker(None, Vec::new()).await;
     for (path, doc) in [
         ("/q/grants/b/a", json!({"target": "b", "source": "c"})),
+        ("/q/grants/b/a", json!({"target": "c", "source": "a"})),
         (
             "/q/grants/b/a",
             json!({"target": "b", "source": "a", "access": "all"}),
@@ -224,12 +227,17 @@ async fn the_grant_routes_check_what_they_store() {
             .status,
         404
     );
-    assert_eq!(
-        send(&app, "DELETE", "/q/grants/b/a", None, None, None)
-            .await
-            .status,
-        404
-    );
+    // A pair with a Tenant no client can name holds nothing to read or remove.
+    for path in [
+        "/q/grants/b/a",
+        "/q/grants/snap-1/a",
+        "/q/grants/b/antares-grants",
+    ] {
+        for method in ["GET", "DELETE"] {
+            let a = send(&app, method, path, None, None, None).await;
+            assert_eq!(a.status, 404, "{method} {path}: {}", a.body);
+        }
+    }
     grant(&app, "b", "a", json!({"access": "read-write"})).await;
     let one = send(&app, "GET", "/q/grants/b/a", None, None, None).await;
     assert_eq!(
@@ -241,5 +249,107 @@ async fn the_grant_routes_check_what_they_store() {
     assert_eq!(
         all.body,
         json!([{"target": "b", "source": "a", "access": "read"}])
+    );
+}
+
+/// A stored document that does not read as the grant of its pair (another
+/// pair's, or no grant at all) grants nothing: 404, and no forward.
+#[tokio::test]
+async fn icsr_a_stored_document_that_is_no_grant_of_its_pair_grants_nothing() {
+    let kept = Arc::new(Mutex::new(None));
+    let keep = kept.clone();
+    let selfs = antares_icsr::SelfUrls::parse(common::SELF_URL).unwrap_or_default();
+    let b = TestBroker::new()
+        .await
+        .and_then(|b| {
+            b.with_forward_transport(move |ops| {
+                *keep.lock().unwrap_or_else(PoisonError::into_inner) = Some(ops.clone());
+                antares_icsr::transport(selfs)(ops)
+            })
+        })
+        .unwrap_or_else(|e| unreachable!("{e}"));
+    let app = b
+        .serve_mounted(Vec::new())
+        .unwrap_or_else(|e| unreachable!("{e}"));
+    let ops = kept
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .unwrap_or_else(|| unreachable!("the transport was made"));
+    for (key, doc) in [
+        ("b~a", json!({"target": "c", "source": "a"})),
+        ("b~c", json!({"target": "b", "source": "c", "subject": "x"})),
+        ("b~d", json!({"target": "b", "source": "a"})),
+    ] {
+        assert_eq!(ops.put_grant_doc(key, doc).await, Ok(false));
+    }
+    for path in ["/q/grants/b/a", "/q/grants/b/c", "/q/grants/b/d"] {
+        let a = send(&app, "GET", path, None, None, None).await;
+        assert_eq!(a.status, 404, "{path}: {}", a.body);
+    }
+    let r = register(&app, "a", "r1", Some("b"), json!({})).await;
+    assert_eq!(r.status, 403, "{}", r.body);
+}
+
+/// A forward the transport cannot serve as an NGSI-LD operation (an
+/// endpoint below the self URL), and one the grant's view does not allow,
+/// are not made: 299 for a read, the write refused, nothing in b. An
+/// endpoint that is not this broker needs no grant to be stored.
+#[tokio::test]
+async fn icsr_a_forward_that_is_no_operation_or_that_the_grant_view_refuses_is_not_made() {
+    let (_b, app) = broker(None).await;
+    car(&app, "b", 1).await;
+    let elsewhere = register(
+        &app,
+        "x",
+        "far",
+        Some("b"),
+        json!({"endpoint": "http://other.invalid"}),
+    )
+    .await;
+    assert_eq!(elsewhere.status, 201, "{}", elsewhere.body);
+    grant(&app, "b", "a", json!({})).await;
+    let below = format!("{}/other", common::SELF_URL);
+    let r = register(&app, "a", "below", Some("b"), json!({"endpoint": below})).await;
+    assert_eq!(r.status, 201, "{}", r.body);
+    let read = cars(&app, "a", None).await;
+    assert!(ids(&read.body).is_empty(), "{}", read.body);
+    assert!(warned(&read.warnings, "299"), "{:?}", read.warnings);
+
+    let view = json!({"id": "b-read", "tenant": "b", "selector": ["Car"],
+                      "rules": [{"types": ["Car"], "attributes": ["speed"]}],
+                      "operations": ["query_entities", "retrieve_entity"]});
+    let put = send(&app, "PUT", "/q/views/b-read", None, None, Some(view)).await;
+    assert_eq!(put.status, 201, "{}", put.body);
+    grant(
+        &app,
+        "b",
+        "d",
+        json!({"view": "b-read", "access": "read-write"}),
+    )
+    .await;
+    let w = register(
+        &app,
+        "d",
+        "w",
+        Some("b"),
+        json!({"operations": ["createEntity"]}),
+    )
+    .await;
+    assert_eq!(w.status, 201, "{}", w.body);
+    let new_car = json!({"id": "urn:ngsi-ld:Car:d1", "type": "Car"});
+    let refused = send(
+        &app,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        Some("d"),
+        None,
+        Some(new_car),
+    )
+    .await;
+    assert_eq!(refused.status, 207, "{}", refused.body);
+    assert_eq!(
+        ids(&cars(&app, "b", None).await.body),
+        ["urn:ngsi-ld:Car:b-1"]
     );
 }

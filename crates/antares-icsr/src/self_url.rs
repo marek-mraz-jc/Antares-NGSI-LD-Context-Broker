@@ -70,8 +70,8 @@ impl SelfUrls {
 /// `raw` as a self URL, or `None` when it cannot be one.
 fn normalise(raw: &str) -> Option<String> {
     let url = Url::parse(raw).ok()?;
+    // An http(s) URL always has a host: the parser refuses an empty one.
     let fine = matches!(url.scheme(), "http" | "https")
-        && url.host_str().is_some_and(|h| !h.is_empty())
         && url.username().is_empty()
         && url.password().is_none()
         && url.query().is_none()
@@ -111,6 +111,11 @@ mod tests {
             ("http://self.example/ngsi-ld/v1/entities", None),
             ("https://user@self.example/ngsi-ld/v1/entities", None),
             ("https://user:pw@self.example/ngsi-ld/v1/entities", None),
+            ("https://:pw@self.example/ngsi-ld/v1/entities", None),
+            (
+                "http://broker.example/prefix",
+                Some("http://broker.example/prefix"),
+            ),
             ("http://broker.example/prefixed/ngsi-ld/v1", None),
             ("http://broker.example/ngsi-ld/v1", None),
             ("https://127.0.0.1/ngsi-ld/v1", None),
@@ -126,6 +131,8 @@ mod tests {
             "self.example",
             "ftp://self.example",
             "https://u@self.example",
+            "https://:pw@self.example",
+            "http://",
             "https://self.example/?q=1",
             "https://self.example/#f",
             "https://self.example, /relative",

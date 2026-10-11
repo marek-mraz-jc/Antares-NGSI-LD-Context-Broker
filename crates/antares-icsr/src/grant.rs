@@ -240,12 +240,16 @@ mod tests {
 
     #[test]
     fn a_grant_reads_only_unless_it_says_read_write() {
-        let read = ExportGrant::parse(br#"{"target":"b","source":"a"}"#);
-        assert!(read
-            .as_ref()
-            .is_ok_and(|g| g.allows(false) && !g.allows(true)));
+        let read = ExportGrant::parse(br#"{"target":"b","source":"a","view":"b-1"}"#);
+        assert_eq!(
+            read.map(|g| (g.allows(false), g.allows(true))),
+            Ok((true, false))
+        );
         let rw = ExportGrant::parse(br#"{"target":"b","source":"a","access":"read-write"}"#);
-        assert!(rw.is_ok_and(|g| g.access == Access::ReadWrite && g.allows(true)));
+        assert_eq!(
+            rw.map(|g| (g.access, g.allows(true))),
+            Ok((Access::ReadWrite, true))
+        );
     }
 
     #[test]
@@ -256,6 +260,7 @@ mod tests {
             r#"{"target":"b c","source":"a"}"#,
             r#"{"target":"","source":"a"}"#,
             r#"{"target":"b","source":"a","view":"Cars"}"#,
+            r#"{"target":"b","source":"a","view":""}"#,
             r#"{"target":"b","source":"a","access":"write"}"#,
             r#"{"target":"b","source":"a","subject":"alice"}"#,
             r#"{"target":"b"}"#,
@@ -263,6 +268,11 @@ mod tests {
         ] {
             assert!(ExportGrant::parse(bad.as_bytes()).is_err(), "{bad}");
         }
+        let long = format!(
+            r#"{{"target":"b","source":"a","view":"{}"}}"#,
+            "v".repeat(64)
+        );
+        assert!(ExportGrant::parse(long.as_bytes()).is_err());
     }
 
     #[test]
