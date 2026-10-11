@@ -21,6 +21,8 @@ struct PolicyDoc {
     id: String,
     #[serde(default)]
     effect: Effect,
+    #[serde(default)]
+    assigner: Option<String>,
     assignee: Assignee,
     operations: Vec<String>,
     #[serde(default)]
@@ -122,6 +124,41 @@ pub struct Policy {
     /// Attribute, for a policy that names no selector: [`Rule::types`] is
     /// filled per operation.
     pub conditions: Rule,
+    /// The policy as written, for the access surface.
+    pub source: Source,
+}
+
+/// A policy as its document wrote it (README section 4): names before
+/// expansion and conditions as strings, so the access surface shows the
+/// caller the words their grant was given in. Never read by a decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Source {
+    /// The party that granted it.
+    pub assigner: Option<String>,
+    /// One per `information.entities` member, in document order.
+    pub selectors: Vec<Selector>,
+    /// `q`.
+    pub q: Option<String>,
+    /// `scopeQ`.
+    pub scope_q: Option<String>,
+    /// `geoQ`.
+    pub geo_q: Option<String>,
+    /// `temporalQ`.
+    pub temporal_q: Option<String>,
+}
+
+/// One Entity selector as written, with its information's Attributes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Selector {
+    /// `type`.
+    pub entity_type: String,
+    /// `id`.
+    pub id: Option<String>,
+    /// `idPattern`.
+    pub id_pattern: Option<String>,
+    /// `propertyNames` and `relationshipNames`, sorted; empty = the whole
+    /// Entity.
+    pub attributes: Vec<String>,
 }
 
 impl Policy {
@@ -215,6 +252,14 @@ fn policy(p: PolicyDoc) -> Result<Policy, String> {
         }
     };
     let (from, to) = p.validity.map_or((None, None), |v| (v.from, v.to));
+    let mut source = Source {
+        assigner: p.assigner,
+        selectors: Vec::new(),
+        q: p.q,
+        scope_q: p.scope_q,
+        geo_q: p.geo_q,
+        temporal_q: p.temporal_q,
+    };
     let conditions = Rule {
         every_attribute: true,
         q: q.map(Box::new),
@@ -223,9 +268,31 @@ fn policy(p: PolicyDoc) -> Result<Policy, String> {
         temporal: temporal.into_iter().collect(),
         ..Rule::default()
     };
+    let (selectors, written) = rules(p.information, &conditions, &why)?;
+    source.selectors = written;
+    Ok(Policy {
+        id,
+        prohibit: p.effect == Effect::Prohibit,
+        assignee: p.assignee,
+        clauses: p.operations.into_iter().collect(),
+        validity: (from, to),
+        selectors,
+        conditions,
+        source,
+    })
+}
+
+/// One rule per Entity selector of `information`, with its information's
+/// Attributes and the policy's `conditions`, and the selectors as written.
+fn rules(
+    information: Vec<Information>,
+    conditions: &Rule,
+    why: &dyn Fn(String) -> String,
+) -> Result<(Vec<Rule>, Vec<Selector>), String> {
     let ctx = context();
     let mut selectors = Vec::new();
-    for info in p.information {
+    let mut written_selectors = Vec::new();
+    for info in information {
         let attributes: Vec<String> = info
             .property_names
             .iter()
@@ -235,6 +302,14 @@ fn policy(p: PolicyDoc) -> Result<Policy, String> {
         if info.entities.is_empty() {
             return Err(why("an information entry selects no Entity".into()));
         }
+        let mut written: Vec<String> = info
+            .property_names
+            .iter()
+            .chain(&info.relationship_names)
+            .cloned()
+            .collect();
+        written.sort();
+        written.dedup();
         for s in info.entities {
             if s.id.is_some() && s.id_pattern.is_some() {
                 return Err(why(format!(
@@ -246,6 +321,12 @@ fn policy(p: PolicyDoc) -> Result<Policy, String> {
                 antares_ql::regex::compile(&format!("^(?:{p})$"))
                     .map_err(|e| why(format!("idPattern {p:?}: {e}")))?;
             }
+            written_selectors.push(Selector {
+                entity_type: s.entity_type.clone(),
+                id: s.id.clone(),
+                id_pattern: s.id_pattern.clone(),
+                attributes: written.clone(),
+            });
             selectors.push(Rule {
                 types: vec![ctx.expand_key(&s.entity_type)],
                 ids: s.id.into_iter().collect(),
@@ -257,15 +338,7 @@ fn policy(p: PolicyDoc) -> Result<Policy, String> {
             });
         }
     }
-    Ok(Policy {
-        id,
-        prohibit: p.effect == Effect::Prohibit,
-        assignee: p.assignee,
-        clauses: p.operations.into_iter().collect(),
-        validity: (from, to),
-        selectors,
-        conditions,
-    })
+    Ok((selectors, written_selectors))
 }
 
 /// `georel=…;geometry=…;coordinates=…[;geoproperty=…]` as the broker parses

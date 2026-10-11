@@ -6,7 +6,13 @@
 #   dev/perf/shapes.sh                          # memory
 #   DATABASE_URL=postgres://… dev/perf/shapes.sh   # + postgres
 #
-# Env: BIN (target/release/antares), OUT (results/perf), PORT (9471),
+#   BIN_SURFACES=target/release/antares-full dev/perf/shapes.sh
+#                                               # + ADR-0027 section 6 rows
+#
+# Env: BIN (target/release/antares), BIN_SURFACES (unset: a `full` build,
+#      whose `query`, `view`, `odata` and `mcp` rows follow the vanilla
+#      ones), SURFACE_VUS (50: their closed-loop clients), OUT
+#      (results/perf), PORT (9471),
 #      DATABASE_URL, RUNS (3), DURATION (5s), ENTITIES (100, seeded per
 #      store), SPECS ("query 50,query 200,
 #      retrieve 50": shape and closed-loop clients per row).
@@ -30,7 +36,9 @@ run() {  # run <shape> <vus>: prints "<req/s> <p99 ms>" (median over RUNS by req
       -e SHAPE="$1" -e VUS="$2" -e DURATION="$DURATION" -e ENTITIES="${ENTITIES:-100}" \
       dev/perf/k6-shapes.js >/dev/null
     rows+=("$(python3 -c "
-import json; s=json.load(open('$OUT/shape.json'))['metrics']
+import json, sys; s=json.load(open('$OUT/shape.json'))['metrics']
+# a refused request answers fast: a row with a failed check is no number
+if s.get('checks', {}).get('fails'): sys.exit('$1: ' + str(s['checks']['fails']) + ' checks failed')
 print(f\"{s['http_reqs']['rate']:.0f} {s['http_req_duration']['p(99)']:.2f}\")")")
   done
   printf '%s\n' "${rows[@]}" | sort -n | sed -n "$(( (RUNS + 1) / 2 ))p"
@@ -57,8 +65,46 @@ print(f\"{s['http_reqs']['rate']:.0f} {s['http_req_duration']['p(99)']:.2f}\")")
       echo "shapes $store ${spec// /-c}" > "$OUT/phase"
       read -r shape vus <<<"$spec"
       read -r rps p99 < <(run "$shape" "$vus")
+      [ -n "${rps:-}" ] || { echo "$store $shape: no number" >&2; exit 1; }
       echo "| $store | $shape | c$vus | $rps | $p99 ms |"
     done
     kill "$PID"; wait "$PID" 2>/dev/null || true; PID=
   done
+  # ADR-0027 section 6 end to end (T-3523): the `full` binary with view
+  # `perf` (Vehicle, every Attribute shown) and the default Tenant's LinkML
+  # schema, its own `query` row first, so each surface is priced against
+  # the same query on the same binary; the vanilla rows above stay the
+  # vanilla binary's.
+  if [ -n "${BIN_SURFACES:-}" ]; then
+    [ -x "$BIN_SURFACES" ] || { echo "missing $BIN_SURFACES" >&2; exit 1; }
+    mkdir -p "$DATA/surfaces"
+    ANTARES_STORE=memory ANTARES_DATA_DIR="$DATA/surfaces" ANTARES_HTTP_PORT="$PORT" \
+      ANTARES_ALLOW_SHARED_LOCAL=1 ANTARES_API_SURFACES=admin,views,odata,mcp \
+      ANTARES_SCHEMA_MAX_BYTES=65536 "$BIN_SURFACES" > "$OUT/shapes-surfaces.log" 2>&1 & PID=$!
+    until curl -sf -o /dev/null "http://127.0.0.1:$PORT/q/health"; do sleep 0.05; done
+    put() {  # put <path> <json>: fails the run on a refusal
+      curl -sf -o /dev/null -X PUT -H 'Content-Type: application/json' --data "$2" \
+        "http://127.0.0.1:$PORT$1" || { echo "PUT $1 refused" >&2; exit 1; }
+    }
+    put /q/views/perf '{"id": "perf", "tenant": "default", "selector": ["Vehicle"],
+      "rules": [{"types": ["Vehicle"], "attributes": ["brand", "speed", "mileage", "colour", "location"]}],
+      "operations": ["query_entities", "retrieve_entity"]}'
+    put /q/schemas/default '{"id": "https://example.org/perf", "name": "perf",
+      "prefixes": {"d": {"prefix_prefix": "d", "prefix_reference": "https://uri.etsi.org/ngsi-ld/default-context/"}},
+      "default_prefix": "d",
+      "classes": {"Vehicle": {"slots": ["brand", "speed", "mileage", "colour", "location"]}},
+      "slots": {"brand": {"range": "string"}, "speed": {"range": "integer"}, "mileage": {"range": "integer"},
+                "colour": {"range": "string"},
+                "location": {"slot_uri": "https://uri.etsi.org/ngsi-ld/location",
+                             "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}}}}}'
+    for shape in query view odata mcp; do
+      spec="$shape ${SURFACE_VUS:-50}"
+      echo "shapes surfaces ${spec// /-c}" > "$OUT/phase"
+      read -r shape vus <<<"$spec"
+      read -r rps p99 < <(run "$shape" "$vus")
+      [ -n "${rps:-}" ] || { echo "full $shape: no number" >&2; exit 1; }
+      echo "| full | $shape | c$vus | $rps | $p99 ms |"
+    done
+    kill "$PID"; wait "$PID" 2>/dev/null || true; PID=
+  fi
 } | tee "$OUT/shapes.md"

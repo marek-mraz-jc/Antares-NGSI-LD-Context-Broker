@@ -748,7 +748,7 @@ async fn query_entities_inner(
     st: &AppState,
     params: &HashMap<String, String>,
     headers: &HeaderMap,
-    filter: &crate::policy::Filter,
+    filter: &std::sync::Arc<crate::policy::Filter>,
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     check_params(params, crate::negotiate::QUERY_PARAMS)?;

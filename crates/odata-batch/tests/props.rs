@@ -84,6 +84,9 @@ mod round_trips {
     }
 
     proptest! {
+        // Miri runs every case through its interpreter: past the weekly job's 90 min (T-3706)
+        #![proptest_config(ProptestConfig::with_cases(if cfg!(miri) { 4 } else { 256 }))]
+
         #[test]
         fn multipart_batches_read_back(members in members()) {
             let (body, expected) = multipart(&members);

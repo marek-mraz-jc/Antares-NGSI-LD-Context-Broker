@@ -3,9 +3,11 @@
 //! `$orderby` to `orderBy` (Q9: `id` and scalar Attributes). The
 //! subset of this round: comparisons of a scalar member with a literal
 //! (F1 to F6, F26), `and`/`or` (F7, F8), `null` (F2, F4, F10), `in` (F12),
-//! `contains`/`startswith`/`endswith` and their `not` (F9, F15), and `id`
-//! as a top-level conjunct (F28). Everything else is `Later` (501) or
-//! `Bad` (400) before any operation runs.
+//! `contains`/`startswith`/`endswith` and their `not` (F9, F15), `id`
+//! as a top-level conjunct (F28), `observedAt` (F21), membership in a
+//! ListProperty (F22), `geo.intersects` as a top-level conjunct (F29), and
+//! `eq` on a LanguageProperty (F31) or a VocabProperty (F32). Everything
+//! else is `Later` (501) or `Bad` (400) before any operation runs.
 //!
 //! A `q` names Attributes by term, and a term is a letter followed by
 //! letters, digits or `_` (7.2.3.2), and `orderBy` reads a `.` as a path
@@ -14,13 +16,16 @@
 //! `@context` that defines them (`OpsRequest::context`).
 
 use crate::edm::{Member, Set, Shape};
-use odata_url::{CompareOp, Expr, Literal, MemberPath, Method, OrderBy};
+use odata_url::{CompareOp, Expr, Geography, Literal, MemberPath, Method, OrderBy};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
 /// The broker's bound on a `q` (`antares_ql::MAX_Q_BYTES`): a longer
 /// translation is refused here with the OData error a bound gets.
 pub const MAX_Q_BYTES: usize = 4096;
+
+/// The instance annotation of a sub-Property `observedAt` (S1, F21).
+const OBSERVED_AT: &str = "@NgsiLd.observedAt";
 
 /// The largest integer an `f64` holds exactly: NGSI-LD compares numbers as
 /// `f64` (F26).
@@ -51,6 +56,12 @@ pub(crate) struct Translated {
     /// Whether `q` follows a Relationship (F24): the broker evaluates a
     /// hop only under a `join` (5.7.2.4).
     pub(crate) linked: bool,
+    /// F29: the `geoQ` of a `geo.intersects` conjunct, the GeoProperty's
+    /// term and the polygon's `coordinates`.
+    pub(crate) geo: Option<(String, String)>,
+    /// F32: the VocabProperty terms whose compared values the broker
+    /// expands (`expandValues`, 7.2.3.2 EXAMPLE 13).
+    pub(crate) expand_values: Vec<String>,
 }
 
 /// Translates `filter` against the members of `set` and, through a
@@ -69,9 +80,18 @@ pub(crate) fn translate(
         aliases,
         context: &mut out.context,
         linked: false,
+        expand_values: Vec::new(),
     };
     let mut conjuncts = Vec::new();
     for conjunct in conjuncts_of(filter) {
+        if let Some(geo) = terms.geo(conjunct)? {
+            if out.geo.is_some() {
+                // ponytail: one geoQ per query (4.10); two areas would intersect
+                return Err(Refused::Later);
+            }
+            out.geo = Some(geo);
+            continue;
+        }
         match ids_of(conjunct, aliases)? {
             Some(ids) if out.ids.is_none() => out.ids = Some(ids),
             // ponytail: one id conjunct; two would intersect, no client sends it
@@ -80,6 +100,7 @@ pub(crate) fn translate(
         }
     }
     out.linked = terms.linked;
+    out.expand_values = terms.expand_values;
     if !conjuncts.is_empty() {
         let q = conjuncts.join(";");
         if q.len() > MAX_Q_BYTES {
@@ -102,6 +123,7 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
         aliases: &[],
         context: &mut out.context,
         linked: false,
+        expand_values: Vec::new(),
     };
     let mut keys = Vec::new();
     for item in items {
@@ -183,6 +205,7 @@ struct Terms<'a> {
     aliases: &'a [(String, Literal)],
     context: &'a mut Map<String, Value>,
     linked: bool,
+    expand_values: Vec<String>,
 }
 
 impl<'a> Terms<'a> {
@@ -210,8 +233,111 @@ impl<'a> Terms<'a> {
             },
             // `$filter=flag`: a Boolean member as the predicate.
             Expr::Member(_) => Ok(format!("{}==true", self.scalar(e)?)),
+            Expr::Any {
+                collection,
+                lambda: Some((variable, body)),
+            } => self.any(collection, variable, body),
             Expr::Literal(_) | Expr::Alias(_) | Expr::Any { .. } => Err(Refused::Later),
         }
+    }
+
+    /// F22: `p/any(x: x eq v)` or `p/any(x: x in (...))` over a
+    /// ListProperty is membership, which is what `==` on a list is in `q`
+    /// (7.2.3.4); any other body is F23.
+    fn any(
+        &mut self,
+        collection: &MemberPath,
+        variable: &str,
+        body: &Expr,
+    ) -> Result<String, Refused> {
+        let item = |e: &Expr| matches!(e, Expr::Member(MemberPath { variable: Some(v), path }) if v == variable && path.is_empty());
+        let values: Vec<&Literal> = match body {
+            Expr::Compare(l, CompareOp::Eq, r) if item(l) => vec![literal(r, self.aliases)?],
+            Expr::Compare(l, CompareOp::Eq, r) if item(r) => vec![literal(l, self.aliases)?],
+            Expr::In(l, list) if item(l) => list.iter().collect(),
+            _ => return Err(Refused::Later),
+        };
+        let member = match collection {
+            MemberPath {
+                variable: None,
+                path,
+            } => match self.leaf(path) {
+                Some((None, m)) => m,
+                _ => return Err(Refused::Later),
+            },
+            MemberPath { .. } => return Err(Refused::Later),
+        };
+        if !matches!(
+            member.shape,
+            Shape::Value {
+                collection: true,
+                ..
+            }
+        ) {
+            return Err(Refused::Later);
+        }
+        let values = values
+            .into_iter()
+            .map(value)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(format!(
+            "{}=={}",
+            self.term_of(&member.iri),
+            values.join(",")
+        ))
+    }
+
+    /// F29: `geo.intersects(p, geography'SRID=4326;Polygon(...)')` as a
+    /// top-level conjunct, `None` for any other conjunct. NGSI-LD
+    /// coordinates are WGS 84 (5.2.2.4), so another SRID is not mapped.
+    fn geo(&mut self, e: &Expr) -> Result<Option<(String, String)>, Refused> {
+        let Expr::Call(Method::GeoIntersects, args) = e else {
+            return Ok(None);
+        };
+        let [member, area] = args.as_slice() else {
+            return Err(Refused::Later);
+        };
+        let Ok(Literal::Geography(Geography {
+            srid: 4326,
+            shape: odata_url::Shape::Polygon(rings),
+        })) = literal(area, self.aliases)
+        else {
+            return Err(Refused::Later);
+        };
+        let Expr::Member(MemberPath {
+            variable: None,
+            path,
+        }) = member
+        else {
+            return Err(Refused::Later);
+        };
+        let Some((None, m)) = self.leaf(path) else {
+            return Err(Refused::Later);
+        };
+        if !matches!(m.shape, Shape::Geo) {
+            return Err(Refused::Bad);
+        }
+        let mut polygon = Vec::with_capacity(rings.len());
+        for ring in rings {
+            let mut points = Vec::with_capacity(ring.len());
+            for position in ring {
+                let point = position
+                    .0
+                    .iter()
+                    .map(|n| {
+                        n.parse::<f64>()
+                            .ok()
+                            .filter(|n| n.is_finite())
+                            .map(Value::from)
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(Refused::Bad)?;
+                points.push(Value::from(point));
+            }
+            polygon.push(Value::from(points));
+        }
+        let term = self.term_of(&m.iri);
+        Ok(Some((term, Value::from(polygon).to_string())))
     }
 
     /// F1 to F6, F2/F4 on `null`, F25 refused.
@@ -222,6 +348,9 @@ impl<'a> Terms<'a> {
             // F25: two members, or two literals.
             _ => return Err(Refused::Later),
         };
+        if let Some(term) = self.entry(member, op, lit)? {
+            return Ok(term);
+        }
         let name = self.scalar(member)?;
         Ok(match (op, lit) {
             (CompareOp::Eq, Literal::Null) => format!("!{name}"),
@@ -235,6 +364,44 @@ impl<'a> Terms<'a> {
             (CompareOp::Lt, lit) => format!("{name}<{}", value(lit)?),
             (CompareOp::Le, lit) => format!("{name}<={}", value(lit)?),
         })
+    }
+
+    /// F31, F32: `eq` on a LanguageProperty, in any language (7.2.3.4
+    /// conditions 4 and 5: the read asks for no language), or on a
+    /// VocabProperty with its value expanded like the stored one; `None`
+    /// when `member` is neither. Any other operator is a later round's.
+    fn entry(
+        &mut self,
+        member: &Expr,
+        op: CompareOp,
+        lit: &Literal,
+    ) -> Result<Option<String>, Refused> {
+        let Expr::Member(MemberPath {
+            variable: None,
+            path,
+        }) = member
+        else {
+            return Ok(None);
+        };
+        let Some((None, m)) = self.leaf(path) else {
+            return Ok(None);
+        };
+        if !matches!(m.shape, Shape::Language | Shape::Vocab) {
+            return Ok(None);
+        }
+        let (CompareOp::Eq, Literal::String(s)) = (op, lit) else {
+            return Err(Refused::Later);
+        };
+        let term = self.term_of(&m.iri);
+        let s = Value::from(s.as_str());
+        Ok(Some(if matches!(m.shape, Shape::Language) {
+            format!("{term}[*]=={s}")
+        } else {
+            if !self.expand_values.contains(&term) {
+                self.expand_values.push(term.clone());
+            }
+            format!("{term}=={s}")
+        }))
     }
 
     /// F9, F15: the literal regex-escaped, anchored for starts and ends.
@@ -300,9 +467,17 @@ impl<'a> Terms<'a> {
         else {
             return Err(Refused::Later);
         };
+        // F21: the `observedAt` of a member of the set, as EXAMPLE 9's
+        // `temperature.observedAt`.
+        if let [name, annotation] = path.as_slice() {
+            if annotation == OBSERVED_AT {
+                let member = self.set.members.get(name).ok_or(Refused::Later)?;
+                return Ok(format!("{}.observedAt", self.term_of(&member.iri)));
+            }
+        }
         // The base members (`id` outside a top-level conjunct, `scope`,
-        // `_types`, the system members), complex and annotation paths
-        // (F20, F21, F22, F28, F33) are a later round's.
+        // `_types`, the system members) and complex paths (F20, F28, F33)
+        // are a later round's.
         let (via, member) = self.leaf(path).ok_or(Refused::Later)?;
         match &member.shape {
             // The same test the model's NonFilterableProperties and
@@ -419,6 +594,18 @@ mod tests {
                     member("https://e.org/tags", value("Edm.String", true)),
                 ),
                 ("doc".into(), member("https://e.org/doc", Shape::Json)),
+                (
+                    "label".into(),
+                    member("https://e.org/label", Shape::Language),
+                ),
+                (
+                    "status".into(),
+                    member("https://e.org/status", Shape::Vocab),
+                ),
+                (
+                    "location".into(),
+                    member("https://e.org/location", Shape::Geo),
+                ),
                 (
                     "owner".into(),
                     member("https://e.org/owner", Shape::Url { collection: false }),
@@ -638,6 +825,11 @@ mod tests {
                 lit(Literal::Int(1)),
             ))),
             cmp(m("tags"), CompareOp::Eq, lit(Literal::String("a".into()))),
+            cmp(
+                m("location"),
+                CompareOp::Eq,
+                lit(Literal::String("a".into())),
+            ),
             cmp(m("owner"), CompareOp::Eq, lit(Literal::String("a".into()))),
             cmp(m("scope"), CompareOp::Eq, lit(Literal::String("/a".into()))),
             cmp(
@@ -684,6 +876,207 @@ mod tests {
         ] {
             assert_eq!(q(&e), Err(Refused::Bad), "{e:?}");
         }
+    }
+
+    fn path(names: &[&str]) -> Expr {
+        Expr::Member(MemberPath {
+            variable: None,
+            path: names.iter().map(|n| (*n).to_owned()).collect(),
+        })
+    }
+
+    #[test]
+    fn observed_at_is_the_sub_property_of_a_member_of_the_set() {
+        let at = |names: &[&str], op| {
+            cmp(
+                path(names),
+                op,
+                lit(Literal::DateTimeOffset("2026-05-01T08:30:00Z".into())),
+            )
+        };
+        assert_eq!(
+            q(&at(&["speed", OBSERVED_AT], CompareOp::Ge)),
+            Ok("(t0.observedAt>=2026-05-01T08:30:00Z)".into()),
+            "F21, 7.2.3.2 EXAMPLE 9"
+        );
+        assert_eq!(
+            q(&at(&["label", OBSERVED_AT], CompareOp::Lt)),
+            Ok("(t0.observedAt<2026-05-01T08:30:00Z)".into()),
+            "any member of the set has one"
+        );
+        for refused in [
+            at(&["hidden", OBSERVED_AT], CompareOp::Ge),
+            at(&["speed", "@NgsiLd.datasetId"], CompareOp::Eq),
+            at(&["owner", "name", OBSERVED_AT], CompareOp::Eq),
+        ] {
+            assert_eq!(q(&refused), Err(Refused::Later), "{refused:?}");
+        }
+        let by = [OrderBy {
+            expr: path(&["speed", OBSERVED_AT]),
+            descending: false,
+        }];
+        assert_eq!(
+            order(&by, &set(), &mut Translated::default()),
+            Err(Refused::Later),
+            "orderBy reads a `.` as a path: not this round's"
+        );
+    }
+
+    #[test]
+    fn any_over_a_list_property_is_membership() {
+        let var = |name: &str, path: &[&str]| {
+            Expr::Member(MemberPath {
+                variable: Some(name.into()),
+                path: path.iter().map(|p| (*p).to_owned()).collect(),
+            })
+        };
+        let x = || {
+            Expr::Member(MemberPath {
+                variable: Some("x".into()),
+                path: Vec::new(),
+            })
+        };
+        let any = |names: &[&str], body: Expr| Expr::Any {
+            collection: MemberPath {
+                variable: None,
+                path: names.iter().map(|n| (*n).to_owned()).collect(),
+            },
+            lambda: Some(("x".into(), Box::new(body))),
+        };
+        let a = || lit(Literal::String("a".into()));
+        assert_eq!(
+            q(&any(&["tags"], cmp(x(), CompareOp::Eq, a()))),
+            Ok(r#"(t0=="a")"#.into()),
+            "F22, 7.2.3.4"
+        );
+        assert_eq!(
+            q(&any(&["tags"], cmp(a(), CompareOp::Eq, x()))),
+            Ok(r#"(t0=="a")"#.into())
+        );
+        let listed = Expr::In(
+            Box::new(x()),
+            vec![Literal::String("a".into()), Literal::String("b".into())],
+        );
+        assert_eq!(q(&any(&["tags"], listed)), Ok(r#"(t0=="a","b")"#.into()));
+        for refused in [
+            any(&["tags"], cmp(x(), CompareOp::Ne, a())),
+            any(&["tags"], cmp(x(), CompareOp::Eq, lit(Literal::Null))),
+            any(&["tags"], cmp(m("name"), CompareOp::Eq, a())),
+            any(&["name"], cmp(x(), CompareOp::Eq, a())),
+            any(&["scope"], cmp(x(), CompareOp::Eq, a())),
+            any(&["hidden"], cmp(x(), CompareOp::Eq, a())),
+            any(&["tags"], cmp(var("y", &[]), CompareOp::Eq, a())),
+            any(&["tags"], cmp(var("x", &["sub"]), CompareOp::Eq, a())),
+            any(
+                &["tags"],
+                Expr::In(Box::new(m("name")), vec![Literal::String("a".into())]),
+            ),
+            Expr::Any {
+                collection: MemberPath {
+                    variable: Some("y".into()),
+                    path: vec!["tags".into()],
+                },
+                lambda: Some(("x".into(), Box::new(cmp(x(), CompareOp::Eq, a())))),
+            },
+        ] {
+            assert_eq!(q(&refused), Err(Refused::Later), "{refused:?}");
+        }
+        let unknown = || Expr::Alias("missing".into());
+        for bad in [
+            any(&["tags"], cmp(x(), CompareOp::Eq, unknown())),
+            any(&["tags"], cmp(unknown(), CompareOp::Eq, x())),
+        ] {
+            assert_eq!(q(&bad), Err(Refused::Bad), "an unknown alias: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn language_and_vocab_eq_are_mapped() {
+        let eq = |name: &str| cmp(m(name), CompareOp::Eq, lit(Literal::String("s".into())));
+        assert_eq!(q(&eq("label")), Ok(r#"(t0[*]=="s")"#.into()), "F31");
+        let t = translate(&eq("status"), &set(), &BTreeMap::new(), &[]).unwrap_or_default();
+        assert_eq!(
+            (t.q.as_deref(), t.expand_values.as_slice()),
+            (Some(r#"(t0=="s")"#), ["t0".to_owned()].as_slice()),
+            "F32"
+        );
+        let twice = Expr::Or(Box::new(eq("status")), Box::new(eq("status")));
+        let t = translate(&twice, &set(), &BTreeMap::new(), &[]).unwrap_or_default();
+        assert_eq!(t.expand_values, ["t0"], "one term once");
+        for refused in [
+            cmp(m("label"), CompareOp::Ne, lit(Literal::String("s".into()))),
+            cmp(m("status"), CompareOp::Gt, lit(Literal::String("s".into()))),
+            cmp(m("label"), CompareOp::Eq, lit(Literal::Int(1))),
+            cmp(m("status"), CompareOp::Eq, lit(Literal::Null)),
+        ] {
+            assert_eq!(q(&refused), Err(Refused::Later), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn geo_intersects_is_a_top_level_geo_query() {
+        let area = |srid, ring: &[(&str, &str)]| {
+            let ring = ring
+                .iter()
+                .map(|(x, y)| odata_url::Position(vec![(*x).into(), (*y).into()]))
+                .collect();
+            lit(Literal::Geography(Geography {
+                srid,
+                shape: odata_url::Shape::Polygon(vec![ring]),
+            }))
+        };
+        let square = [("0", "0"), ("1", "0"), ("1", "1"), ("0", "0")];
+        let within = |name: &str, area| Expr::Call(Method::GeoIntersects, vec![m(name), area]);
+        let both = Expr::And(
+            Box::new(within("location", area(4326, &square))),
+            Box::new(cmp(m("speed"), CompareOp::Gt, lit(Literal::Int(0)))),
+        );
+        let t = translate(&both, &set(), &BTreeMap::new(), &[]).unwrap_or_default();
+        assert_eq!(
+            (t.geo, t.q.as_deref()),
+            (
+                Some((
+                    "t0".to_owned(),
+                    "[[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]]".to_owned()
+                )),
+                Some("(t1>0)")
+            ),
+            "F29"
+        );
+        let refused = |e: &Expr| translate(e, &set(), &BTreeMap::new(), &[]).map(|_| ());
+        let nested = Expr::Or(
+            Box::new(within("location", area(4326, &square))),
+            Box::new(cmp(m("speed"), CompareOp::Gt, lit(Literal::Int(0)))),
+        );
+        let twice = Expr::And(
+            Box::new(within("location", area(4326, &square))),
+            Box::new(within("location", area(4326, &square))),
+        );
+        for e in [
+            nested,
+            twice,
+            within("location", area(3857, &square)),
+            within("hidden", area(4326, &square)),
+            Expr::Call(Method::GeoIntersects, vec![m("location")]),
+            Expr::Call(
+                Method::GeoIntersects,
+                vec![lit(Literal::Int(1)), area(4326, &square)],
+            ),
+        ] {
+            assert_eq!(refused(&e), Err(Refused::Later), "{e:?}");
+        }
+        assert_eq!(
+            refused(&within("speed", area(4326, &square))),
+            Err(Refused::Bad),
+            "not a GeoProperty"
+        );
+        assert_eq!(
+            refused(&within(
+                "location",
+                area(4326, &[("0", "x"), ("1", "1"), ("0", "0")])
+            )),
+            Err(Refused::Bad)
+        );
     }
 
     #[test]

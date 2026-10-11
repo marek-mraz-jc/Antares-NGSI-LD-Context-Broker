@@ -33,6 +33,15 @@ pub mod sql;
 
 use antares_model::NgsiError;
 
+/// The pinned core `@context`, parsed once for every test of the crate:
+/// under Miri one parse takes minutes (T-3706).
+#[cfg(test)]
+pub(crate) fn test_core() -> std::sync::Arc<antares_jsonld::Context> {
+    static CORE: std::sync::LazyLock<std::sync::Arc<antares_jsonld::Context>> =
+        std::sync::LazyLock::new(|| std::sync::Arc::new(antares_jsonld::core_context()));
+    std::sync::Arc::clone(&CORE)
+}
+
 /// Entity Type Selection Language (4.17) match against expanded type IRIs:
 /// `,`/`|` = OR of alternatives, `(a;b)` = AND within one alternative.
 pub fn type_selection_matches(sel: &str, types: &[&str], ctx: &antares_jsonld::Context) -> bool {
@@ -672,10 +681,13 @@ impl<'a> Parser<'a> {
             .rest
             .find(|c: char| ";|(),".contains(c))
             .unwrap_or(self.rest.len());
-        let end = match self.rest.find("..") {
-            Some(d) if d < stop => d,
-            _ => stop,
-        };
+        // the Range separator is looked for in this token only: across the
+        // whole rest, every term rescanned the terms after it (T-3706)
+        let end = self
+            .rest
+            .get(..stop)
+            .and_then(|token| token.find(".."))
+            .unwrap_or(stop);
         let (raw, rest) = self.rest.split_at(end);
         let raw = raw.trim();
         // The unquoted alternatives are `dateTime`/`date`/`time` (4.6.3), a
@@ -1260,7 +1272,7 @@ mod complexity_tests {
     /// expanded against the @context before they are compared.
     #[test]
     fn type_selection_or_and_and() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let d = |t: &str| format!("https://uri.etsi.org/ngsi-ld/default-context/{t}");
         let (car, bus) = (d("Car"), d("Bus"));
         let both = [car.as_str(), bus.as_str()];
@@ -1339,6 +1351,7 @@ mod complexity_tests {
     /// joined with the largest and the deepest policy `q` that fits, still
     /// parse, so the policy's size decides no caller's answer.
     #[test]
+    #[cfg_attr(miri, ignore)] // a cap-sized input: past the weekly Miri job's 90 min (T-3706)
     fn every_join_of_an_accepted_q_and_a_fitting_policy_parses() {
         fn hidden(n: QNode) -> QNode {
             match n {
@@ -1429,9 +1442,35 @@ mod complexity_tests {
         );
     }
 
+    /// Parsing grows with the `q`, not with its square: each unquoted value
+    /// once looked for the Range `..` across the whole rest, so a chain of
+    /// `n` comparisons scanned n²/2 terms (T-3706: the Miri job ran out of
+    /// time inside one 511-term parse). Eight times the terms may cost eight
+    /// times the time; the old scan cost about forty. Minimum of five runs,
+    /// so a busy runner's pause counts against neither size.
+    #[test]
+    #[cfg_attr(miri, ignore)] // a wall-clock ratio, measured natively
+    fn parsing_a_chain_grows_linearly() {
+        let chain = |n: usize| vec!["a==1"; n].join(";");
+        let fastest = |q: &str| {
+            (0..5)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    assert!(parse_narrowed_q(q).is_ok());
+                    started.elapsed()
+                })
+                .min()
+                .unwrap_or_default()
+        };
+        let (small, large) = (chain(MAX_Q_NODES - 1), chain(MAX_NARROWED_Q_NODES - 1));
+        let ratio = fastest(&large).as_secs_f64() / fastest(&small).as_secs_f64().max(1e-9);
+        assert!(ratio < 20.0, "8x the terms took {ratio:.1}x the time");
+    }
+
     /// The narrowed caps are ceilings too: past them a narrowed `q` is
     /// TooComplexQuery, as a caller's is past [`MAX_Q_NODES`].
     #[test]
+    #[cfg_attr(miri, ignore)] // a cap-sized input: past the weekly Miri job's 90 min (T-3706)
     fn a_narrowed_q_past_its_caps_is_too_complex() {
         let chain = |n: usize| vec!["a==1"; n].join(";");
         assert!(parse_narrowed_q(&chain(MAX_NARROWED_Q_NODES - 1)).is_ok());

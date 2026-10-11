@@ -306,7 +306,14 @@ pub async fn put_view(app: &Router, view: &Value) -> Result<(), String> {
 /// # Errors
 /// The broker's, or a write that did not land.
 pub async fn fixture() -> Result<Fixture, String> {
-    let broker = TestBroker::new().await?;
+    fixture_with(TestBroker::new().await?).await
+}
+
+/// [`fixture`] on `broker`, which may carry a policy engine.
+///
+/// # Errors
+/// The broker's, or a write that did not land.
+pub async fn fixture_with(broker: TestBroker) -> Result<Fixture, String> {
     let app = broker.serve(antares_views::Views)?;
     seed(&app).await?;
     put_view(&app, &cars_view()).await?;

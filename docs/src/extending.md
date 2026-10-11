@@ -194,7 +194,11 @@ read-modify-write on the very document it changes, so a concurrent write
 between the decision and the commit cannot carry it onto an Entity the
 condition no longer selects. An Entity it does not select answers `404`
 exactly as an absent one does; a batch judges each member by its own
-Entity and reports the others in `errors`; a conditioned write that would
+Entity and reports the others in `errors`, and a Batch Upsert member under
+a condition never creates: absent, it answers the same `404` (T-3668). The
+temporal writes 5.6.12 to 5.6.15 judge the condition on the evolution's
+latest instance per Attribute and `datasetId` (T-3668); a
+conditioned write that would
 be forwarded to a Context Source is refused (`403`). `AllowIf` holds on the
 clauses in `policy::WRITE_BY_ID` and selects only: on any other clause, or
 with a `pick`, `omit`, `omit_by_type`, `temporal` or a rule's Attribute
@@ -308,7 +312,10 @@ conformance suite on `allow-all` and that folder on the engine, in one job.
 production: the joinedcontext platform loads each Tenant's Policy rules
 through `/q/policy/{tenant}` and the engine decides on the caller the
 gateway forwards. Its README is the rule document contract, and
-`addons/joinedcontext-policy/tests/engine.rs` holds it through the router.
+`addons/joinedcontext-policy/tests/engine.rs` holds it through the router. The
+same addon ships the `access` surface (`/x/views/{view}/access`, README
+section 4): the caller's grants and the AuthZEN check, read from the table
+the engine decides with.
 
 ### Façades for another standard
 

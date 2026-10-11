@@ -2,7 +2,10 @@
 //! What a tool call costs on top of the operation it runs (MCP section 8,
 //! surfaces-test-plan section 5): `tools/list` with its engine probe, and
 //! `tools/call query_entities` against the same query on the NGSI-LD root
-//! and through the view, which is most of what the call costs.
+//! and through the view, which is most of what the call costs. It prints
+//! the ADR-0027 section 6 row "MCP tool call", the call's mean against the
+//! root query's mean + 0.2 ms + 1 µs per Entity; it reports and never fails
+//! (the `bench-surfaces` job decides that, T-3523).
 //!
 //!     cargo bench -p antares-mcp --bench call
 
@@ -72,12 +75,12 @@ async fn rpc(app: &Router, method: &str, name: Option<&str>, params: Value) -> S
     send(app, "POST", "/x/views/cars/mcp", &headers, Some(&body)).await
 }
 
-/// Runs `f` `n` times and reports microseconds per run.
+/// Runs `f` `n` times, reports microseconds per run and returns them.
 async fn time<F: std::future::Future<Output = StatusCode>>(
     name: &str,
     n: u32,
     mut f: impl FnMut() -> F,
-) -> std::io::Result<()> {
+) -> std::io::Result<u128> {
     let start = Instant::now();
     for _ in 0..n {
         let status = f().await;
@@ -90,7 +93,8 @@ async fn time<F: std::future::Future<Output = StatusCode>>(
         .as_micros()
         .checked_div(u128::from(n))
         .unwrap_or(0);
-    writeln!(std::io::stdout(), "{name}: {per} µs/op ({n} runs)")
+    writeln!(std::io::stdout(), "{name}: {per} µs/op ({n} runs)")?;
+    Ok(per)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -107,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "operations": ["query_entities", "retrieve_entity", "retrieve_entity_types"]});
     send(&app, "PUT", "/q/views/cars", &[], Some(&view)).await;
     let n = 300;
-    time("NGSI-LD root: query 20 Cars", n, || {
+    let root = time("NGSI-LD root: query 20 Cars", n, || {
         send(
             &app,
             "GET",
@@ -129,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
     time("tools/list", n, || rpc(&app, "tools/list", None, json!({}))).await?;
-    time("tools/call query_entities: 20 Cars", n, || {
+    let call = time("tools/call query_entities: 20 Cars", n, || {
         rpc(
             &app,
             "tools/call",
@@ -138,5 +142,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     })
     .await?;
+    let budget = root.saturating_add(200 + 20);
+    writeln!(
+        std::io::stdout(),
+        "budget MCP tool call (20 Entities): mean {call} µs of {budget} µs {}",
+        if call <= budget { "within" } else { "over" }
+    )?;
     Ok(())
 }
