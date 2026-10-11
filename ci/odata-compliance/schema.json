@@ -44,7 +44,8 @@
       ],
       "slot_usage": {
         "Name": {
-          "description": "Product display name"
+          "description": "Product display name",
+          "required": true
         },
         "Description": {
           "description": "Detailed product description"
@@ -66,7 +67,12 @@
         "LongText",
         "CustomName",
         "Product"
-      ]
+      ],
+      "slot_usage": {
+        "Description": {
+          "required": true
+        }
+      }
     },
     "MediaItems": {
       "slots": [

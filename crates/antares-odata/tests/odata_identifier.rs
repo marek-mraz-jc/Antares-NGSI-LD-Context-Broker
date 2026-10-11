@@ -24,7 +24,7 @@ const SCHEMA: &str = r#"{
   "prefixes": {"shop": {"prefix_prefix": "shop", "prefix_reference": "https://example.org/shop/"}},
   "default_prefix": "shop",
   "classes": {"Product": {"slots": ["ID", "Name", "category"]},
-              "Category": {"slots": ["code", "Name"]},
+              "Category": {"slots": ["code", "Name"], "slot_usage": {"Name": {"required": true}}},
               "Bin": {"slots": ["number"]}},
   "slots": {"ID": {"identifier": true, "annotations": {"edm_type": {"tag": "edm_type", "value": "Edm.Guid"}}},
             "Name": {}, "category": {"range": "Category"},
@@ -472,4 +472,31 @@ async fn a_create_without_the_key_mints_its_value() {
             ns[ty]
         );
     }
+}
+
+/// C5 (T-3721): a `required` slot is a `RequiredProperties` path of the set,
+/// and a create that leaves it out or sends null is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_names_every_required_property() {
+    let (_b, app) = shop().await.expect("broker");
+    for body in ["{}", r#"{"Name": null}"#] {
+        let a = odata(&app, Method::POST, "Category", Some(body)).await;
+        assert_eq!(
+            (a.status, a.body["error"]["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("MissingProperty")),
+            "{body}: {}",
+            a.body
+        );
+        assert_eq!(a.body["error"]["target"], "Name", "{}", a.body);
+    }
+    let a = odata(&app, Method::POST, "Product", Some("{}")).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+
+    let a = odata(&app, Method::GET, "$metadata?$format=json", None).await;
+    let insert = |set: &str| {
+        a.body["shop"]["Container"][set]["@Capabilities.InsertRestrictions"]["RequiredProperties"]
+            .clone()
+    };
+    assert_eq!(insert("Category"), json!(["Name"]), "{}", a.body);
+    assert_eq!(insert("Product"), json!([]), "{}", a.body);
 }

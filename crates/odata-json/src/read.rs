@@ -435,6 +435,18 @@ impl<'m> Reader<'_, 'm> {
                     property: missing.clone(),
                 });
             }
+            // C5: InsertRestrictions/RequiredProperties are named, and not null.
+            let given = |p: &&str| members.get(*p).is_some_and(|v| !v.is_null());
+            if let Some(missing) = self
+                .resource
+                .restricted("InsertRestrictions", "RequiredProperties")
+                .into_iter()
+                .find(|p| !given(p))
+            {
+                return Err(BodyError::MissingProperty {
+                    property: missing.to_owned(),
+                });
+            }
         }
         Ok(payload)
     }

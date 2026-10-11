@@ -212,6 +212,7 @@ pub fn build(
         let mut ty = EntityType::new(name.clone());
         ty.base_type = Some(BASE.into());
         let mut identifier = None;
+        let mut required = Vec::new();
         ty.annotations.push(iri(&schema.class_iri(class)));
         let own = schema.schema().classes.get(*class);
         ty.annotations
@@ -257,6 +258,8 @@ pub fn build(
                     let p = property(&member, &slot_iri, other, schema, &slot);
                     ty.properties
                         .push(key_property(p, ty.key.contains(&member), other));
+                    let named = slot.required == Some(true);
+                    required.extend(named.then(|| Expr::PropertyPath(member.clone())));
                 }
             }
             members.insert(
@@ -269,7 +272,7 @@ pub fn build(
                 },
             );
         }
-        set.annotations = capabilities(&members, writable);
+        set.annotations = capabilities(&members, writable, required);
         container.entity_sets.push(set);
         types.push(ty);
         sets.insert(
@@ -525,7 +528,11 @@ fn written(slot: &linkml_model::Slot) -> Written {
 /// ones are `Core.Computed`); counting; filtering and sorting on the
 /// members [`Shape::scalar`] admits and `id` (C11, C12); expanding one
 /// level (C13). Advisory: every request is still gated (O25).
-fn capabilities(members: &BTreeMap<String, Member>, writable: Writable) -> Vec<Annotation> {
+fn capabilities(
+    members: &BTreeMap<String, Member>,
+    writable: Writable,
+    required: Vec<Expr>,
+) -> Vec<Annotation> {
     let flag = |value: bool| Expr::Bool(value);
     let restriction = |term: &str, record: Vec<(&str, Expr)>| {
         Annotation::new(
@@ -561,6 +568,8 @@ fn capabilities(members: &BTreeMap<String, Member>, writable: Writable) -> Vec<A
             vec![
                 ("Insertable", flag(writable.insert)),
                 ("NonInsertableProperties", Expr::Collection(refused(true))),
+                // C5: a create names them (LinkML `required`)
+                ("RequiredProperties", Expr::Collection(required)),
             ],
         ),
         restriction(

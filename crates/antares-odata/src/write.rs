@@ -128,15 +128,13 @@ impl Form<'_> {
         | Self::Delete(set, _)
         | Self::Attribute(set, ..)
         | Self::Reference(set, ..)) = self;
-        let Some(writable) = reads.edm.sets.get(*set).map(|s| s.writable) else {
-            // An unknown set is the write's own 404.
-            return true;
-        };
-        match self {
-            Self::Create(_) => writable.insert,
-            Self::Delete(..) => writable.delete,
-            _ => writable.update,
-        }
+        // An unknown set is the write's own 404 (the path resolves against
+        // the same model first, so it does not get here).
+        reads.edm.sets.get(*set).is_none_or(|s| match self {
+            Self::Create(_) => s.writable.insert,
+            Self::Delete(..) => s.writable.delete,
+            _ => s.writable.update,
+        })
     }
 
     /// The operation the write is; `None` for a form none is (W19).
