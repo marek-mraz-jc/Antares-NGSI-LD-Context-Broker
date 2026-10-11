@@ -83,7 +83,7 @@ axum = "0.8"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "http1", "http2", "tokio"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["normalize-path", "cors", "catch-panic"] }
+tower-http = { version = "0.7", features = ["cors", "catch-panic"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # SHA-256 of the access surface's ODRL rules (joinedcontext-policy); the

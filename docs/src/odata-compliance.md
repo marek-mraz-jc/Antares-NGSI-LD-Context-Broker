@@ -110,15 +110,16 @@ A deliberate break proved the gate: the error response stopped sending the
 
 The pass rate counts passed and failed tests; skipped tests stay out of it.
 The baseline was first recorded on dev `f0da234` (T-3714) and raised by
-T-3719, which reads a form-encoded query, and T-3723, which declares
-`$batch` and serves `HEAD` (section 6):
+T-3719, which reads a form-encoded query, T-3723, which declares
+`$batch` and serves `HEAD` (section 6), and T-3731, which answers an empty
+path segment with 400:
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
 | Minimal | 155 | 113 | 25 | 57.8 % |
-| Intermediate | 169 | 175 | 6 | 49.1 % |
+| Intermediate | 170 | 174 | 6 | 49.4 % |
 | Advanced | 131 | 373 | 63 | 26.0 % |
-| **All** (suite summary) | 455 | 661 | 94 | 40.8 % |
+| **All** (suite summary) | 456 | 660 | 94 | 40.9 % |
 
 The first baseline (T-3714) stood at Minimal 37.5 %, Intermediate 28.2 % and
 Advanced 11.7 % (254 passed, 840 failed, 116 skipped).

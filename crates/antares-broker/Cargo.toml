@@ -30,7 +30,7 @@ antares-store = { workspace = true }
 antares-sql = { workspace = true, features = ["postgres"] }
 futures-util = { workspace = true }
 tokio = { workspace = true }
-tower = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
