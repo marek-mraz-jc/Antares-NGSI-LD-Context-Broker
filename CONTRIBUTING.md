@@ -43,9 +43,9 @@ ETSI badges describe `dev`; `:latest` and the versioned images describe
 3. Open the pull request into `dev`. `ci` runs on it; a first-time
    contributor's run waits for a maintainer to approve it.
 4. Keep the branch current with `git rebase origin/dev`, not by merging
-   `dev` into it. A conflict in `ci/sizes.txt` is resolved by taking
-   either side and running `python3 dev/spec.py --write-sizes`, which
-   rewrites every stale size.
+   `dev` into it. A conflict in the size column of `ARCHITECTURE.md` is
+   resolved by taking either side and running
+   `python3 dev/spec.py --write-sizes`, which rewrites every stale size.
 5. A maintainer lands it by rebase when every commit stands on its own,
    by squash when the branch is one change told in several commits.
 

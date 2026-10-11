@@ -18,7 +18,7 @@ Commands:
     python3 dev/spec.py robot     # refresh the robot: field from suite tags
     python3 dev/spec.py status    # counts + per-chapter rollup
     python3 dev/spec.py gaps      # leaves with status not-implemented and no TPs
-    python3 dev/spec.py --write-sizes  # rewrite stale lines of ci/sizes.txt
+    python3 dev/spec.py --write-sizes  # rewrite stale ARCHITECTURE.md size rows
     python3 dev/spec.py check     # ledger integrity gate (exit 1 on violation):
                                   #   every clause file parses, status is in the
                                   #   enum, partial/staged carry notes, robot
@@ -719,7 +719,6 @@ def robot_recipe_violations():
 
 
 SIZE_ROW = re.compile(r"^\| `([a-z_0-9.-]+)` \| ([\d ]+) \|", re.M)
-SIZES = "ci/sizes.txt"
 
 
 def architecture_sizes(root=ROOT):
@@ -742,84 +741,59 @@ def size_is_stale(stated, actual):
     return abs(stated - actual) > max(0.10 * actual, 2)
 
 
-def stated_sizes(root=ROOT):
-    """ci/sizes.txt as {name: lines}; None when the file is missing."""
-    path = root / SIZES
-    if not path.exists():
-        return None
-    stated = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip() and not line.startswith("#"):
-            name, lines = line.split()
-            stated[name] = int(lines)
-    return stated
-
-
 def architecture_size_violations(root=ROOT):
-    """The size of every crate and every `antares-api` module, so a reader can
-    tell where the weight sits before opening anything. Typed by hand they
-    drift with the code and stop meaning anything: the sql crate was published
-    at 2 900 lines while it held 9 415, and the store crate at half its size,
-    which sends a reader to the wrong file for the biggest change in the
-    workspace. They live in ci/sizes.txt, one sorted line per name, and no
-    longer in ARCHITECTURE.md's tables, whose rows every branch edited
-    (T-3766); the tables still need a row for every module. Rounding is the
-    writer's business: the check only refuses a number that is no longer the
-    right size."""
+    """ARCHITECTURE.md sizes every crate and every `antares-api` module so a
+    reader can tell where the weight sits before opening anything. Typed by
+    hand they drift with the code and stop meaning anything: the sql crate was
+    published at 2 900 lines while it held 9 415, and the store crate at half
+    its size, which sends a reader to the wrong file for the biggest change in
+    the workspace. Rounding is the author's business — the check only refuses a
+    number that is no longer the right size."""
     doc = root / "ARCHITECTURE.md"
     if not doc.exists():
         return [f"{doc}: the code map is missing"]
     out, sizes = [], architecture_sizes(root)
     text = doc.read_text(encoding="utf-8")
     for row in SIZE_ROW.finditer(text):
-        out.append(f"ARCHITECTURE.md: sizes {row.group(1)} in a table; sizes live in {SIZES}")
-    stated = stated_sizes(root)
-    if stated is None:
-        out.append(f"{SIZES}: missing; run dev/spec.py --write-sizes")
-        stated = {}
+        name, stated = row.group(1), int(row.group(2).replace(" ", ""))
+        if name in sizes and size_is_stale(stated, sizes[name]):
+            out.append(
+                f"ARCHITECTURE.md: sizes {name} at {stated} lines, it holds {sizes[name]}"
+            )
     for name in sorted(sizes):
-        if name not in stated:
-            out.append(f"{SIZES}: no line for {name}")
-        elif size_is_stale(stated[name], sizes[name]):
-            out.append(f"{SIZES}: sizes {name} at {stated[name]} lines, it holds {sizes[name]}")
         if name.endswith(".rs"):
             if not re.search(rf"^\| `{re.escape(name)}` \|", text, re.M):
                 out.append(f"ARCHITECTURE.md: the module table has no row for {name}")
-    for name in sorted(set(stated) - set(sizes)):
-        out.append(f"{SIZES}: {name} is no crate or antares-api module")
     return out
 
 
 def rounded(n):
-    """A size as written: exact below 100, then to the ten, the fifty and the
-    hundred, each step inside the check's tolerance."""
+    """A size as the table writes it: exact below 100, then to the ten, the
+    fifty and the hundred, each step inside the check's tolerance."""
     step = 1 if n < 100 else 10 if n < 1000 else 50 if n < 10000 else 100
-    return (n + step // 2) // step * step
+    return f"{(n + step // 2) // step * step:,}".replace(",", " ")
 
 
 def write_sizes(root=ROOT):
-    """Rewrite ci/sizes.txt (T-3664, T-3766), so a conflict in it is resolved
-    by taking either side and running this. A line within tolerance keeps its
-    number, a stale or missing one gets the rounded size, a name that is no
-    crate or module goes. The names changed, in order."""
-    sizes, stated = architecture_sizes(root), stated_sizes(root) or {}
-    changed, lines = [], []
-    for name in sorted(sizes):
-        keep = name in stated and not size_is_stale(stated[name], sizes[name])
-        if not keep:
-            changed.append(name)
-        lines.append(f"{name} {stated[name] if keep else rounded(sizes[name])}")
-    changed += sorted(set(stated) - set(sizes))
-    text = (
-        "# Lines of each crate's src/ and of each antares-api module.\n"
-        "# Written by `python3 dev/spec.py --write-sizes`; `dev/spec.py check` refuses\n"
-        "# a number more than 10 % off. On a merge conflict: take either side, rerun.\n"
-        + "\n".join(lines) + "\n"
-    )
-    path = root / SIZES
-    if not path.exists() or path.read_text(encoding="utf-8") != text:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+    """Rewrite the number of every stale size row of ARCHITECTURE.md (T-3664),
+    so a conflict in that table is resolved by taking either side and running
+    this. A row within tolerance keeps the author's rounding; a row for a name
+    that is no crate or module, and the prose, stay byte for byte; a missing
+    row is not added. The names rewritten, in order."""
+    doc = root / "ARCHITECTURE.md"
+    sizes, changed = architecture_sizes(root), []
+
+    def fix(row):
+        name, stated = row.group(1), int(row.group(2).replace(" ", ""))
+        if name not in sizes or not size_is_stale(stated, sizes[name]):
+            return row.group(0)
+        changed.append(name)
+        return f"| `{name}` | {rounded(sizes[name])} |"
+
+    text = doc.read_text(encoding="utf-8")
+    new = SIZE_ROW.sub(fix, text)
+    if new != text:
+        doc.write_text(new, encoding="utf-8")
     return changed
 
 
