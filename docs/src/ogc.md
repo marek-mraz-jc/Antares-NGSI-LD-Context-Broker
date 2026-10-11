@@ -49,9 +49,15 @@ endpoint (`404`). The collections carry no `extent`, and the
 
 ## 2. Items
 
-`/items` is one Query Entities of the collection's type through the view
-(`format=simplified`, `count=true`), so the view's `q` and the policy
-engine narrow Features, `numberMatched` and the next link alike.
+`/items` is a Query Entities of the collection's type through the view,
+paged by `ViewOps::scan` (ADR-0028 rules 4 to 6), so the view's `q` and the
+policy engine narrow Features, `numberMatched` and the next link alike. A
+property is named in the request's `@context` by its property name (by
+`p{n}` when the core context defines that name or the query grammar cannot
+read it), so an `ngsild.` option names it as `properties` does.
+`numberMatched` is exact; with a residual (`bbox` beside `ngsild.georel`) it
+is counted within the scan budget of 10 000 Entities and omitted beyond it,
+while the page and its `next` link are still served.
 
 | Parameter | Meaning |
 |---|---|
@@ -63,6 +69,9 @@ engine narrow Features, `numberMatched` and the next link alike.
 | `properties` | property names by commas, empty for none; an NGSI-LD `pick` that keeps `id`, `type` and the geometry |
 | `profile` | `rel-as-key` (default), `rel-as-uri` or `rel-as-link`, below |
 | `crs`, `bbox-crs` | CRS84 or CRS84h (the URI or `[OGC:CRS84]`); any other is `400` naming both. The answer carries `Content-Crs` |
+| `ngsild.q`, `ngsild.scopeQ` | an NGSI-LD `q` (joined to the request's own with `;`) or `scopeQ`; a broken one is `400` |
+| `ngsild.georel`, `ngsild.geometry`, `ngsild.coordinates`, `ngsild.geoproperty` | the request's one NGSI-LD `geoQ`; a `bbox` beside it is evaluated on what the store answers |
+| `ngsild.pick`, `ngsild.omit` | an NGSI-LD `pick` (not beside `properties`, `400`) or `omit` (beside `properties`, it removes from the selection) |
 
 Any other parameter, a repeated one, or a parameter on a resource that
 takes none is `400`; a property the view hides is refused like a

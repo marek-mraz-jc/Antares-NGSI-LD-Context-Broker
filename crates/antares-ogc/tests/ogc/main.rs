@@ -9,5 +9,6 @@ mod crs;
 mod geojson;
 mod items;
 mod oas30;
+mod scan;
 mod schemas;
 mod write;

@@ -473,19 +473,17 @@ impl Here<'_> {
         }
         links.extend(profile_link(c, p.profile));
         let returned = page.features.len();
-        in_crs(
-            p.crs,
-            document(
-                GEOJSON,
-                &json!({
-                    "type": "FeatureCollection",
-                    "features": page.features,
-                    "numberMatched": page.matched,
-                    "numberReturned": returned,
-                    "links": links,
-                }),
-            ),
-        )
+        let mut body = json!({
+            "type": "FeatureCollection",
+            "features": page.features,
+            "numberReturned": returned,
+            "links": links,
+        });
+        // Optional in Part 1: omitted when the count would need more than the budget reads.
+        if let (Some(matched), Some(members)) = (page.matched, body.as_object_mut()) {
+            members.insert("numberMatched".into(), json!(matched));
+        }
+        in_crs(p.crs, document(GEOJSON, &body))
     }
 
     /// C19: one Feature; `properties` and `profile` are its only parameters (S6, S7).

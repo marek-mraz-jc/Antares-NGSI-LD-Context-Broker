@@ -72,19 +72,29 @@ fn read(id: &str, summary: &str, media: &str, parameters: &[Value]) -> Map<Strin
 
 /// The problem schema and the query parameters the operations name.
 fn components() -> Value {
+    let mut parameters = json!({
+        "limit": {"name": "limit", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 10}},
+        "bbox": {"name": "bbox", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "array", "oneOf": [{"minItems": 4, "maxItems": 4}, {"minItems": 6, "maxItems": 6}], "items": {"type": "number"}}},
+        "datetime": {"name": "datetime", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "string"}},
+        "next": {"name": "next", "in": "query", "required": false, "description": "the token of a next link", "schema": {"type": "string"}},
+        "sortby": {"name": "sortby", "in": "query", "required": false, "style": "form", "explode": false, "description": "[+|-]name of the collection's sortables", "schema": {"type": "array", "items": {"type": "string"}}},
+        "properties": {"name": "properties", "in": "query", "required": false, "style": "form", "explode": false, "description": "the properties of the collection's schema to return", "schema": {"type": "array", "items": {"type": "string"}}},
+        "crs": {"name": "crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
+        "bbox-crs": {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
+        "profile": {"name": "profile", "in": "query", "required": false, "style": "form", "explode": false, "description": "how references are written", "schema": {"type": "string", "enum": ["rel-as-key", "rel-as-uri", "rel-as-link"]}},
+    })
+    .as_object()
+    .cloned()
+    .unwrap_or_default();
+    parameters.extend(crate::items::NGSILD.iter().map(|name| {
+        (
+            format!("ngsild.{name}"),
+            json!({"name": format!("ngsild.{name}"), "in": "query", "required": false, "description": format!("the NGSI-LD Query Entities `{name}` (TS 104 176 7.2.3.1), ANDed into the query; it only narrows"), "schema": {"type": "string"}}),
+        )
+    }));
     json!({
         "schemas": {"problem": {"type": "object", "properties": {"type": {"type": "string"}, "title": {"type": "string"}, "status": {"type": "integer"}, "detail": {"type": "string"}}}},
-        "parameters": {
-            "limit": {"name": "limit", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 10}},
-            "bbox": {"name": "bbox", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "array", "oneOf": [{"minItems": 4, "maxItems": 4}, {"minItems": 6, "maxItems": 6}], "items": {"type": "number"}}},
-            "datetime": {"name": "datetime", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "string"}},
-            "next": {"name": "next", "in": "query", "required": false, "description": "the token of a next link", "schema": {"type": "string"}},
-            "sortby": {"name": "sortby", "in": "query", "required": false, "style": "form", "explode": false, "description": "[+|-]name of the collection's sortables", "schema": {"type": "array", "items": {"type": "string"}}},
-            "properties": {"name": "properties", "in": "query", "required": false, "style": "form", "explode": false, "description": "the properties of the collection's schema to return", "schema": {"type": "array", "items": {"type": "string"}}},
-            "crs": {"name": "crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
-            "bbox-crs": {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
-            "profile": {"name": "profile", "in": "query", "required": false, "style": "form", "explode": false, "description": "how references are written", "schema": {"type": "string", "enum": ["rel-as-key", "rel-as-uri", "rel-as-link"]}},
-        },
+        "parameters": parameters,
     })
 }
 
@@ -218,7 +228,14 @@ pub(crate) fn document(
         json!({"$ref": "#/components/parameters/profile"}),
         json!({"$ref": "#/components/parameters/crs"}),
         json!({"$ref": "#/components/parameters/bbox-crs"}),
-    ];
+    ]
+    .into_iter()
+    .chain(
+        crate::items::NGSILD
+            .iter()
+            .map(|name| json!({"$ref": format!("#/components/parameters/ngsild.{name}")})),
+    )
+    .collect::<Vec<_>>();
     let feature_id = [
         json!({"name": "featureId", "in": "path", "required": true, "schema": {"type": "string"}}),
         json!({"$ref": "#/components/parameters/properties"}),
