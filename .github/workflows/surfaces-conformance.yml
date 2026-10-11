@@ -1,8 +1,8 @@
 name: surfaces-conformance
 
 # The surfaces' conformance jobs (docs/analysis/surfaces-conformance.md
-# section 7). This file holds the MCP pair (T-3516); the other surfaces add
-# their jobs here.
+# section 7). This file holds the MCP pair (T-3516) and etsi-iop (T-3675);
+# the other surfaces add their jobs here.
 #
 #   mcp-conformance  the official @modelcontextprotocol/conformance 0.1.16
 #                    against /x/views/all/mcp, both revisions it knows that
@@ -12,6 +12,10 @@ name: surfaces-conformance
 #                    isolation, read parity) with MCP_SURFACE=broker, the
 #                    platform_only cases deselected; parity under view `all`
 #                    and under `parity-restricted`
+#   etsi-iop         the ETSI IOP suite over five brokers on the
+#                    all-features image (mqtt, views, mcp), compared TP by
+#                    TP with the vanilla image of the same commit
+#                    (dev/etsi-baseline.py compare); not per pull request
 #
 # Pull requests to dev run the merge-request subset (both official
 # revisions, the parity suite trimmed to MCP_PARITY_CASES=5); the nightly
@@ -169,3 +173,73 @@ jobs:
           title: mcp-suites went red
           body: The joinedcontext-conformance MCP suites against the broker failed.
           log-file: broker.log
+
+  # T-3675: the ETSI IOP suite over five brokers (dev/etsi-pipeline.sh,
+  # SUITES=IOP) on the all-features image and on the vanilla image of the
+  # same commit; red on any TP whose verdict differs. Two release images per
+  # run, so nightly, v* tags and dispatch only, never per pull request.
+  etsi-iop-run:
+    name: etsi-iop ${{ matrix.variant }}
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [vanilla, full]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OUT: results/iop-${{ matrix.variant }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the ${{ matrix.variant }} image
+        run: |
+          f=""; [ "${{ matrix.variant }}" = full ] && f=mqtt,views,mcp
+          docker build --build-arg FEATURES="$f" -t antares-local:latest .
+      - name: IOP_TP over five brokers
+        env:
+          STORE: memory
+          SUITES: IOP
+          RESULTS_DIR: ${{ env.OUT }}
+          SKIP_BUILD: "1"
+          STOP_ON_ERROR: "0"
+          CALLBACK_HOST: localhost
+          API_SURFACES: ${{ matrix.variant == 'full' && 'admin,views,mcp' || 'admin' }}
+        run: ./dev/etsi-pipeline.sh || true
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: etsi-iop-${{ matrix.variant }}
+          path: |
+            ${{ env.OUT }}/tp-status.csv
+            ${{ env.OUT }}/run-summary.md
+            ${{ env.OUT }}/failures.csv
+            ${{ env.OUT }}/IOP-console.log
+            ${{ env.OUT }}/**/log.html
+          retention-days: 14
+
+  etsi-iop:
+    name: etsi-iop
+    needs: etsi-iop-run
+    if: always() && needs.etsi-iop-run.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: etsi-iop-*
+          path: in
+      - name: Full answers as vanilla, TP by TP
+        # explicit bash is -eo pipefail: the compare's exit survives the tee
+        shell: bash
+        run: python3 dev/etsi-baseline.py compare in/etsi-iop-vanilla in/etsi-iop-full | tee iop-compare.txt
+      - name: File an issue on nightly failure
+        if: failure() && github.event_name == 'schedule'
+        uses: ./.github/actions/failure-issue
+        with:
+          title: etsi-iop went red
+          body: The ETSI IOP suite on the all-features build differs from the vanilla build of the same commit.
+          log-file: iop-compare.txt
