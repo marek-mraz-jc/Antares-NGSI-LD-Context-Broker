@@ -41,24 +41,27 @@ async fn send(app: &Router, method: &str, uri: &str, body: Option<&Value>) -> St
     status
 }
 
-/// p50 and p99 of `n` runs of `uri` against `app`.
-async fn sample(app: &Router, uri: &str, n: usize) -> Result<(Duration, Duration), String> {
-    let mut runs = Vec::with_capacity(n);
-    for _ in 0..n {
-        let start = Instant::now();
-        let status = send(app, "GET", uri, None).await;
-        runs.push(start.elapsed());
-        if status != StatusCode::OK {
-            return Err(format!("{uri}: {status}"));
-        }
+/// One timed GET of `uri` against `app`.
+async fn time(app: &Router, uri: &str) -> Result<Duration, String> {
+    let start = Instant::now();
+    let status = send(app, "GET", uri, None).await;
+    let took = start.elapsed();
+    if status == StatusCode::OK {
+        Ok(took)
+    } else {
+        Err(format!("{uri}: {status}"))
     }
+}
+
+/// p50 and p99 of `runs`.
+fn percentiles(mut runs: Vec<Duration>) -> (Duration, Duration) {
     runs.sort();
     let at = |p: usize| {
-        runs.get(n.saturating_mul(p) / 100)
+        runs.get(runs.len().saturating_mul(p) / 100)
             .copied()
             .unwrap_or_default()
     };
-    Ok((at(50), at(99)))
+    (at(50), at(99))
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -85,13 +88,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let viewed = broker.serve_view("cars")?;
     let uri = "/ngsi-ld/v1/entities?type=Car&limit=1";
-    // warm both paths, then alternate so drift hits both alike
-    sample(&root, uri, 200).await?;
-    sample(&viewed, uri, 200).await?;
+    // warm both paths, then time them in turns, one request each, so a
+    // busy host slows both alike; the best of 9 rounds of each
     let (mut root_runs, mut view_runs) = (Vec::new(), Vec::new());
-    for _ in 0..9 {
-        root_runs.push(sample(&root, uri, 500).await?);
-        view_runs.push(sample(&viewed, uri, 500).await?);
+    for round in 0..10 {
+        let (mut r, mut v) = (Vec::with_capacity(500), Vec::with_capacity(500));
+        for _ in 0..500 {
+            r.push(time(&root, uri).await?);
+            v.push(time(&viewed, uri).await?);
+        }
+        if round > 0 {
+            root_runs.push(percentiles(r));
+            view_runs.push(percentiles(v));
+        }
     }
     let best = |runs: &[(Duration, Duration)]| {
         let p50 = runs.iter().map(|r| r.0).min().unwrap_or_default();
