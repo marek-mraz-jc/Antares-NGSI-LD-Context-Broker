@@ -255,7 +255,7 @@ jobs:
       # drops out of every count — make that (and status typos, robot drift)
       # a red build instead.
       - name: conformance ledger check
-        run: pip install --quiet pyyaml && python3 dev/spec.py check
+        run: pip install --quiet pyyaml && python3 dev/spec.py check && python3 dev/spec_test.py
 
       - name: Env-var docs check
         run: ./dev/check-env-docs.sh

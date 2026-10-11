@@ -197,7 +197,7 @@ instance type):
 | LinkML document | ≤ 5 ms p99 for a 100-class schema, cached per view revision | computed once per view revision |
 | WebSocket notification | delivery latency p99 ≤ HTTP sink p99 to a local receiver; ≤ 32 KiB resident per idle connection plus its queue | no socket opened per notification |
 | internal CSR forward | p99 ≤ 0.5× the HTTP forward to the same broker | no socket, no TLS, no second JSON parse of the request line |
-| binary size | `full` release binary ≤ vanilla + 6 MiB; each feature alone ≤ vanilla + 2 MiB | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
+| binary size | `full` release binary ≤ vanilla + 6 MiB; each feature alone ≤ vanilla + 2 MiB, except `mcp` ≤ vanilla + 4.5 MiB (T-3662) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
 | vanilla | unchanged within the noise band of T-3467 | GOAL point 1 |
 
 A benchmark per row: criterion benches in each surface crate for the
@@ -211,6 +211,29 @@ term for the translating surfaces, because the façade measurement shows
 a near-zero fixed cost and a per-Entity cost, so a pure ratio would be
 too loose on large pages and too tight on empty ones. Options: ratios
 only, absolute milliseconds, ratio plus fixed term (chosen).
+
+The `mcp` budget, measured 2026-10-11 on dev 10c2946
+(T-3662), stripped thin-LTO release binary, x86_64, default features plus
+the one named: vanilla 31 033 392 bytes; `views` 32 279 216 (+1.19 MiB);
+`mcp` 35 405 648 (+4.17 MiB). `mcp` implies `views`, so its own share is
+2.98 MiB. `cargo bloat --crates` puts 0.78 MiB of `.text` in
+`antares_mcp` (32 tools, their argument checks and schemas), 0.68 MiB in
+`rmcp` (the protocol, Streamable HTTP, request state) and 0.5 MiB more in
+`std` (their generic instantiations); no single function is above
+40 KiB. `opt-level = "s"` on `antares-mcp`, `rmcp` and `schemars` gives
+34 607 792 (+3.41 MiB): still over 2 MiB, and the shared host's
+`benches/call.rs` noise (the unchanged root query moved from 107 to
+170 µs between runs) cannot show it costs a tool call nothing, so it is
+not taken.
+
+Decided (worker-2, owner may override): `mcp` ≤ vanilla + 4.5 MiB,
+because 2 MiB is reachable only by dropping rmcp for a hand-written
+JSON-RPC and Streamable HTTP layer or by dropping tools, and the first
+trades bytes for a protocol implementation nobody else tests while the
+second removes MCP behaviour. Options: raise the `mcp` budget (chosen),
+measure each feature over the feature it implies (`mcp` over `views`,
+2.98 MiB, still over), size-optimise the MCP crates (+3.41 MiB, still
+over), replace rmcp.
 
 ### 7. Code rules for every new crate
 

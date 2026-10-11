@@ -20,7 +20,9 @@ view that is not loaded. The design is `docs/analysis/mcp-surface.md`
   metadata in `_meta`, and `server/discover` answers the versions served.
 - The legacy `initialize` of `2025-11-25` and `2025-06-18` works without a
   session and lists the same tools as the modern era, no more (MC13).
-- A JSON-RPC batch array is refused whole with `-32600` (MC6).
+- A JSON-RPC batch array is refused whole with `-32600` (MC6); a body that
+  is not JSON answers `-32700` and a message other than JSON-RPC 2.0
+  `-32600`, each as an error frame with HTTP 400.
 - `Mcp-Method` and `Mcp-Name` headers that disagree with the body are
   `400` before dispatch (MC14).
 - The `Host` must be one of `ANTARES_MCP_ALLOWED_HOSTS` (loopback names
@@ -76,7 +78,9 @@ The write tools (section 3) are listed the same way:
 | `update_attributes` | Update Attributes (10.2.3) | `id`, `attributes` |
 | `update_subscription` | Update Subscription (10.5.3) | `id`, `fragment` |
 
-A read tool is annotated `readOnlyHint: true`, a write tool `false`.
+A read tool is annotated `readOnlyHint: true`, a write tool `false`; a write
+that can remove or overwrite is `destructiveHint: true`, and the three that
+only add (`create_entity`, `create_subscription`, `batch_create`) say `false`.
 
 - **Input schemas** name only the types and Attributes the view shows
   (D-4), as an `enum` up to 256 names. An unknown argument, a hidden name
