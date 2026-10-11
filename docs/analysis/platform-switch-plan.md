@@ -193,9 +193,8 @@ Still unknown, each named in the task that meets it:
 - which UI code reads the gateway's `code` member (M7): 5.2's switch task;
 - where data-space agreements are compiled in production (map section 8): K38 waits for it;
 - whether the view write path applies the matrix's linked-entity checks under an engine `Filter` (G17): 5.2's switch task;
-- `docs/src/views.md:11-12` says an empty view table answers 503, ADR-0023 (`:55-56`) and `docs/src/admin-api.md:228-229` say 404; which one the code does was not checked.
 
-Stale citations in the map, found while reading and corrected there in this commit (the code moved since T-3436): the addon rule is `ADR-0020:192-196` (map: `:187-191`), `RESTRICTED_HEADER` is `policy.rs:662` (map: `:232`), `ACCESS_DENIED_TYPE` is `policy.rs:976` (map: `:470`), `SUBJECT_HEADERS` is `policy.rs:984` (map: `:478`).
+Stale citations in the map, found while reading and corrected there in this commit (the code moved since T-3436), and `docs/src/views.md`, which said an empty view table answers 503: the code answers 404 (`crates/antares-views/src/lib.rs:129-131`, `crates/antares-broker/tests/surfaces_fail_closed.rs::a_selected_surface_without_a_view_is_closed`), as ADR-0023 (`:55-56`) says. the addon rule is `ADR-0020:192-196` (map: `:187-191`), `RESTRICTED_HEADER` is `policy.rs:662` (map: `:232`), `ACCESS_DENIED_TYPE` is `policy.rs:976` (map: `:470`), `SUBJECT_HEADERS` is `policy.rs:984` (map: `:478`).
 
 ## 8. Tasks filed
 
