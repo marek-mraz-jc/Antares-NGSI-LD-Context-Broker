@@ -79,7 +79,7 @@ pub fn write_multipart<W: Write>(
         return Err(invalid("not a multipart boundary"));
     }
     let dash = format!("--{boundary}");
-    let delimiter = format!("\r\n{dash}");
+    let delimiter = format!("\n{dash}");
     let finder = memmem::Finder::new(delimiter.as_bytes());
     for response in responses {
         check_headers(response)?;

@@ -635,7 +635,13 @@ impl PgEntityStore {
         // construction: `sql` is built from this function's own literals
         // plus `$n` placeholders — no caller-supplied text reaches it.
         // The audit lives here, next to the builder.
-        let mut qy = sqlx::query(sqlx::AssertSqlSafe(sql.clone()));
+        // Unprepared: a prepared statement goes to a generic plan after five
+        // runs on a connection, and that plan cannot tell a selective `@?`
+        // from one `jsonb_path_ops` cannot narrow. It ORs one GIN scan per
+        // `q` alternative over the whole type: 1.6 s instead of 1.5 ms at
+        // 100 000 entities (T-3735). The text varies with every q, geo and
+        // projection shape, so the statement cache saved little anyway.
+        let mut qy = sqlx::query(sqlx::AssertSqlSafe(sql.clone())).persistent(false);
         for b in &binds {
             qy = match b {
                 Bind::Text(s) | Bind::Path(s) => qy.bind(s),
@@ -679,7 +685,9 @@ impl PgEntityStore {
                 "SELECT count(*) FROM entities WHERE {}",
                 wheres.join(" AND ")
             );
-            let mut cq = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql));
+            // unprepared for the same reason as the statement above
+            let mut cq =
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql)).persistent(false);
             // same wheres ⇒ same bind prefix; stop before the
             // projection/page binds, which the count statement lacks
             for b in binds.iter().take(where_binds) {

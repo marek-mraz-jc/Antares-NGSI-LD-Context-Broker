@@ -43,7 +43,7 @@ pub(crate) async fn property(
         .get(name)
         .filter(|m| m.shape.writable())
         .ok_or(body_error(&read_only, version))?;
-    let id = id_of(key, version)?;
+    let id = id_of(set, key, version)?;
     let target = attrs_of(&id, Some(&member.iri), set);
     if method == Method::DELETE {
         send(
@@ -90,7 +90,7 @@ pub(crate) async fn reference(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
-    let id = id_of(key, version)?;
+    let id = id_of(set, key, version)?;
     let (iri, _, _) = nav_of(set, nav);
     let list = set.members.get(nav).is_some_and(|m| m.list);
     if op == OperationId::DeleteAttribute {

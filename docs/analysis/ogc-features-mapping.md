@@ -1,0 +1,123 @@
+# OGC API - Features surface: Parts 1 to 5 and CQL2 onto `ViewOps::run` (T-3743)
+
+Sources: Antares-NGSI-LD-Context-Broker `fbef380` (dev), joinedcontext-platform `context-gateway` (worker-4 clone, read only; `cg` graph of the worker-1 clone built 2026-10-10). OGC standards fetched on 2026-10-11: OGC API - Features - Part 1: Core 1.0.1 (`docs.ogc.org/is/17-069r4/17-069r4.html`), Part 2: Coordinate Reference Systems by Reference 1.0.1 (`docs.ogc.org/is/18-058r1/18-058r1.html`), Part 3: Filtering 1.0 (`docs.ogc.org/is/19-079r2/19-079r2.html`), Common Query Language CQL2 1.0 (`docs.ogc.org/is/21-065r2/21-065r2.html`), Part 4: Create, Replace, Update and Delete 1.0.0-draft.2 (`docs.ogc.org/DRAFTS/20-002r1.html`, "not an OGC Standard"), Part 5: Schemas 1.0.0-draft.2 (`docs.ogc.org/DRAFTS/23-058r1.html`, public comment draft 2024-06-04). Inputs on this branch: `docs/analysis/odata-linkml-mapping.md` (the pattern this page follows), `docs/analysis/gateway-to-broker-map.md` (row D10, decision O-1), `docs/analysis/surfaces-conformance.md`, ADR-0023, ADR-0027. Nothing was built or run. The decision record is ADR-0029.
+
+## 1. Scope and conventions
+
+This page maps every requirements class of OGC API - Features Parts 1 to 5 and every conformance class of CQL2 onto the operations a view offers (`ViewOps::run`, `crates/antares-ops/src/lib.rs:452`), so the crate `antares-ogc` (ADR-0029) can be built slice by slice. The surface lives at `/x/views/{view}/ogc/features` beside `ngsi-ld/v1`, `odata/v4`, `mcp` and `linkml` (ADR-0027 section 1).
+
+- **Status.** `mapped`: the request becomes the named NGSI-LD operation(s) through `ViewOps::run` as the caller, so the operation's `gate!` and the ADR-0020 seam fire as on the NGSI-LD view. `residual`: the part NGSI-LD `q`/`geoQ` cannot express is evaluated by the shared residual engine of T-3748 (ADR-0028) over what `ViewOps::run` returned for the caller; until that engine serves the operator, the row answers 501. `rejected 501`: refused before any operation runs, with the reason in the problem body. `not declared`: a class the surface does not list in `/conformance`; its parameters are unknown parameters (row C9, 400).
+- **Error body.** RFC 7807 problem JSON (`application/problem+json`), as the gateway serves today (`handlers/ogc.rs`) and as Part 1 7.5.1 permits ("the server SHOULD include ... information about the error"). The `detail` text never names a type, Attribute or Entity the caller cannot see (Security, section 7).
+- **Views.** What a caller sees is `effective = view ∧ engine` (ADR-0023). "Hidden" means outside it. A hidden collection, Feature or queryable answers exactly as an absent one.
+- **Test ids.** `ogc/<file>::<fn>` is `crates/antares-ogc/tests/<file>.rs`, `cql2/<file>::<fn>` is `crates/ogc-cql2/tests/<file>.rs`. The slice task named in the last column carries the test.
+- **Decisions.** Written as **Decided (worker-4, owner may override): choice, because reason; options: ...**, under the owner rule of 2026-10-10 (`tasks/GOAL-antares-surfaces.md`).
+
+## 2. Model: collections, Features, geometry, time
+
+| # | OGC concept | NGSI-LD / view source | Rule |
+|---|---|---|---|
+| M1 | collection | each Entity type the view shows (`ViewOps::shown_names().0`, compacted under the view's `@context`) | `collectionId` = the compacted type name; a type the view hides or the store never held answers 404 like a misspelled one. No sampling: the list is the view's selector intersected with the engine, never the data |
+| M2 | Feature | an Entity of that type, as Query Entities (`QueryEntities`, `GET /entities?type=T`) and Retrieve Entity (`RetrieveEntity`) return it through the view | Features are the GeoJSON representation the broker already writes (4.5.16, `crates/antares-api/src/repr.rs:1509` `to_geojson_feature`): `Accept: application/geo+json`, `format=simplified`; the surface removes the `@context` member and adds `links` |
+| M3 | `featureId` | the Entity id (URN), percent-encoded in the path | `id` of the Feature = the URN as a string (Part 1 `/req/geojson/content` B: the `id` member equals `featureId`) |
+| M4 | primary geometry | one GeoProperty per type | **Decided (worker-4, owner may override):** the LinkML slot of the type annotated `ogc_role: primary-geometry` (the Part 5 `x-ogc-role` value, carried as a LinkML annotation like `ngsi_ld_kind`), else `location`; sent as `geometryProperty` and `geoproperty`, because `location` is the only GeoProperty the store indexes (`crates/antares-ql/src/geo.rs` `LOCATION_IRI`) and NGSI-LD already defaults to it (4.5.16.1); options: `location` only, annotation override (chosen), first GeoProperty in the schema. An Entity without that GeoProperty is a Feature with `"geometry": null` |
+| M5 | properties | the Attributes the view shows of the Entity, simplified (`format=simplified`) | Sub-attributes (`unitCode`, `observedAt`) are not flattened into `{name}_unitCode` as the gateway does (`translators/geojson.rs`); the unit is in the Part 5 schema (`x-ogc-unit`, row S4). The geometry Property also stays out of `properties` |
+| M6 | temporal geometry | **Decided (worker-4, owner may override):** the slot annotated `ogc_role: primary-instant`, or the pair `primary-interval-start` / `primary-interval-end` (Part 5 Req 10 to 12), a Property with an RFC 3339 value; a type that declares none has no temporal geometry, because `observedAt` is per Attribute, not per Entity, and a guessed choice changes answers when the data changes; options: geometry's `observedAt` (the gateway's choice), declared slot (chosen), `modifiedAt` |
+| M7 | queryables, sortables, schema | the Tenant's LinkML (`ViewOps::schema`, as `crates/antares-odata/src/edm.rs` reads it) intersected with `shown_names()` | JSON Schema 2020-12, `additionalProperties: false`, so a hidden and a misspelled name are the same 400 |
+| M8 | extent | omitted | Part 1 lets a collection omit `extent`; a computed extent would tell the caller where hidden Entities of the type are (the engine narrows Entities, the store-wide extent does not), and the view has no stored extent |
+
+## 3. Part 1: Core, GeoJSON, OpenAPI 3.0
+
+| # | Requirement (17-069r4) | NGSI-LD operation through `ViewOps::run` | Status | Test | Slice |
+|---|---|---|---|---|---|
+| C1 | `/req/core/root-op`, `root-success` (landing page, links `self`, `service-desc`, `conformance`, `data`) | none; built from the view id | mapped | `ogc/core::landing_page_links` | T-3744 |
+| C2 | `/req/core/api-definition-op`, `-success`; `/req/oas30/*` (OpenAPI 3.0 of what is served) | none; generated per view from the shown types and the offered operations, `service-desc` `application/vnd.oai.openapi+json;version=3.0` | mapped | `ogc/oas30::definition_lists_only_shown_collections_and_offered_methods` | T-3744 |
+| C3 | `/req/core/conformance-op`, `-success` | none | mapped: lists exactly the classes this page marks mapped and built; never `html`, `gmlsf0`, `gmlsf2` | `ogc/core::conformance_lists_what_is_served` | T-3744 |
+| C4 | `/req/core/http` (HTTP 1.1, HEAD) | as the GET | mapped: HEAD = GET without the body (the T-3737 lesson: one `Content-Length`) | `ogc/core::head_is_the_get_without_its_body` | T-3744 |
+| C5 | `/req/core/fc-md-op`, `fc-md-success`, `fc-md-links`, `fc-md-items`, `fc-md-items-links` (`/collections`) | `shown_names()`; no store read | mapped (M1) | `ogc/collections::lists_the_view_types_only` | T-3744 |
+| C6 | `/req/core/fc-md-extent`, `fc-md-extent-multi` | none | mapped as omitted (M8) | `ogc/collections::no_extent_member` | T-3744 |
+| C7 | `/req/core/sfc-md-op`, `sfc-md-success` (`/collections/{c}`) | as C5 | mapped; hidden or unknown `c` is 404 | `ogc/collections::hidden_and_unknown_collection_are_the_same_404` | T-3744 |
+| C8 | `/req/core/fc-op`, `fc-response` (`/items`) | `QueryEntities` `type=T`, `format=simplified`, `geometryProperty`, `Accept: application/geo+json` | mapped | `ogc/items::items_are_the_view_answer` | T-3744 |
+| C9 | `/req/core/query-param-unknown`, `query-param-invalid` (400) | none | mapped: every parameter outside the declared classes and C23 (incl. `profile`, `sortby`, `properties` until their slices land) is 400 | `ogc/core::unknown_and_invalid_parameters_are_400` | T-3744 |
+| C10 | `/req/core/fc-limit-definition`, `fc-limit-response-1` (1 to 10000, default 10) | `limit` | mapped: default 10, values above the broker's `max_limit` clamped to it (the NGSI-LD answer would be 403, `crates/antares-api/src/paging.rs:84`), 0 and >10000 are 400 | `ogc/items::limit_default_clamp_and_bounds` | T-3744 |
+| C11 | `/req/core/fc-bbox-definition`, `fc-bbox-response` A, B, D (4 or 6 numbers, CRS84) | `geoQ` `georel=intersects`, `geometry=Polygon` (MultiPolygon split at 180° when `minx > maxx`), `geoproperty` = M4 | mapped; 6 numbers use the 2D footprint (heights are not indexed) | `ogc/items::bbox_2d_3d_and_antimeridian` | T-3744 |
+| C12 | `/req/core/fc-bbox-response` C: "The `bbox` parameter SHALL match all features in the collection that are not associated with a spatial geometry, too." | a second `QueryEntities` with `q=!{geometry}`; both ordered by id and merged; the next token carries both cursors | mapped | `ogc/items::bbox_keeps_features_without_geometry` | T-3744 |
+| C13 | `/req/core/fc-time-definition`, `fc-time-response` A, B, D to F (instant, interval, `..` and empty open ends) | `q` on the M6 slot (`slot>="a";slot<="b"`, interval overlap on start/end slots) | mapped | `ogc/items::datetime_instant_interval_open_ends` | T-3744 |
+| C14 | `/req/core/fc-time-response` C (Features without temporal geometry match too) | type with no M6 slot: no `q` added; type with one: union with `q=!slot` as C12 | mapped | `ogc/items::datetime_keeps_features_without_time` | T-3744 |
+| C15 | `/rec/core/fc-filters` (simple property filters as parameters) | `q` equality | not declared: Part 3 `filter` covers it; a property name as parameter is 400 by C9 | `ogc/core::unknown_and_invalid_parameters_are_400` | T-3744 |
+| C16 | `/req/core/fc-links`, `/rec/core/fc-next-1..3`, `fc-rel-type` (`self`, `alternate`, `next`, `prev`) | `offset` of the same query | mapped: `next` while the answer is full; the token is the offset(s) plus a hash of the normalised query and the view id, a mismatch is 400; `prev` omitted (a permission) | `ogc/items::next_token_bound_to_view_and_query` | T-3744 |
+| C17 | `/req/core/fc-timeStamp` | none | omitted: the requirement binds only a `timeStamp` that is present, and the member is optional; a response time is no Entity time and would only invite caching mistakes | `ogc/geojson::feature_collection_and_feature_shape` (no `timeStamp`) | T-3744 |
+| C18 | `/req/core/fc-numberMatched`, `fc-numberReturned` | `count=true`, `NGSILD-Results-Count` (summed over the C12/C14 union, whose parts are disjoint) | mapped while every predicate is pushed down; with a residual predicate, numberMatched only if the residual engine read the whole set within budget, else omitted (Part 1: "servers may omit it"), never estimated | `ogc/items::counts_are_the_view_counts` | T-3744, T-3759 |
+| C19 | `/req/core/f-op`, `f-success`, `f-links` (`/items/{featureId}`) | `QueryEntities` with `id` and `type`, `format=simplified`, so the view and its engine narrow it like a page | mapped; an Entity of another type, hidden, absent or with an id that is no URI is 404 | `ogc/items::feature_of_another_type_is_404` | T-3744 |
+| C20 | `/req/geojson/definition`, `/req/geojson/content` | as C8 and C19 | mapped | `ogc/geojson::feature_collection_and_feature_shape` | T-3744 |
+| C21 | `/req/html/*` (HTML encoding) | none | not declared: Apps read JSON; an `Accept: text/html` only request is 406 | `ogc/core::html_only_accept_is_406` | T-3744 |
+| C22 | `/req/gmlsf0/*`, `/req/gmlsf2/*` (GML) | none | not declared: no GML writer in the tree; `Accept: application/gml+xml` only is 406 | `ogc/core::gml_only_accept_is_406` | T-3744 |
+| C23 | (no OGC requirement) NGSI-LD options beside the standard's own: `ngsild.q`, `ngsild.scopeQ`, `ngsild.georel`, `ngsild.geometry`, `ngsild.coordinates`, `ngsild.geoproperty`, `ngsild.pick`, `ngsild.omit` (ADR-0028) | ANDed into the `QueryEntities` pushdown | mapped, declared in the collection's OpenAPI so C9 does not refuse them | `ogc/items::ngsild_options_narrow` | T-3759 |
+
+## 4. Part 2: CRS by reference
+
+| # | Requirement (18-058r1) | Operation | Status | Test | Slice |
+|---|---|---|---|---|---|
+| R1 | `/req/crs/fc-md-crs-list`, `fc-md-storageCrs`, `fc-md-storageCrs-valid-value`, `fc-md-crs-list-global` | none | mapped: `crs` = [CRS84, CRS84h], `storageCrs` = CRS84 | `ogc/crs::collection_lists_crs84_only` | T-3746 |
+| R2 | `/req/crs/fc-crs-definition`, `fc-crs-action`, `fc-crs-default-value`, `fc-crs-valid-value` | as C8/C19 | mapped for CRS84 and CRS84h; any other `crs` is 400 with the supported list, because no coordinate transform is in the tree (`geo` relates, it does not reproject) | `ogc/crs::unsupported_crs_is_400_with_the_list` | T-3746 |
+| R3 | `/req/crs/fc-bbox-crs-definition`, `fc-bbox-crs-action`, `fc-bbox-crs-valid-value` | as C11 | mapped for CRS84 and CRS84h, else 400 | `ogc/crs::unsupported_bbox_crs_is_400` | T-3746 |
+| R4 | `/req/crs/ogc-crs-header`, `ogc-crs-header-value` (`Content-Crs: <uri>`) | none | mapped | `ogc/crs::content_crs_header` | T-3746 |
+| R5 | `/req/crs/geojson` | none | mapped (CRS84 is GeoJSON's own) | `ogc/crs::collection_lists_crs84_only` | T-3746 |
+
+## 5. Part 3: Filtering and CQL2
+
+The filter is parsed by `ogc-cql2` (ADR-0029) into one AST for both encodings, then split by `antares-ogc` into the largest pushable conjunction (NGSI-LD `q`, at most one `geoQ`) and a residual for T-3748's engine. The filter is ANDed with `bbox` and `datetime` and with the view's own predicate, so it only narrows.
+
+| # | Class (19-079r2, 21-065r2) | NGSI-LD | Status | Test | Slice |
+|---|---|---|---|---|---|
+| F1 | Part 3 `queryables`, `queryables-query-parameters` (`/collections/{c}/queryables`, `application/schema+json`, `additionalProperties: false`) | none; LinkML ∩ shown Attributes (M7) | mapped | `ogc/filter::queryables_are_the_shown_attributes` | T-3745 |
+| F2 | Part 3 `filter`, `features-filter` (`filter`, `filter-lang`, `filter-crs`) | `q`, `geoQ`, residual | mapped; `filter-crs` other than CRS84 is 400 (R2 reason) | `ogc/filter::filter_and_bbox_and_datetime_are_anded` | T-3745 |
+| F3 | CQL2 `cql2-text`, `cql2-json` | parser only | mapped | `cql2/parse::text_and_json_give_the_same_ast` | T-3753 |
+| F4 | CQL2 `basic-cql2`: `=`, `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `IS NULL` | `q`: `==`, `!=`, `<`, `<=`, `>`, `>=`, `;`, `|`; `IS NULL` → `!attr` | mapped | `ogc/filter::basic_cql2_pushed_to_q` | T-3745 |
+| F5 | CQL2 `basic-cql2`: `NOT` | none in `q` (only `!attr`) | residual | `ogc/filter::not_is_residual` | T-3745 |
+| F6 | CQL2 `advanced-comparison-operators`: `LIKE`, `BETWEEN`, `IN` | `~=` with the pattern as an anchored regex; `==a..b`; `==a,b,c` | mapped | `ogc/filter::like_between_in_pushed` | T-3745 |
+| F7 | CQL2 `case-insensitive-comparison` (`CASEI`) | `~=(?i)` for equality and LIKE | mapped; other uses residual | `ogc/filter::casei_pushed_as_regex_flag` | T-3745 |
+| F8 | CQL2 `accent-insensitive-comparison` (`ACCENTI`) | none | residual | `ogc/filter::accenti_is_residual` | T-3745 |
+| F9 | CQL2 `basic-spatial-functions` (`S_INTERSECTS` with point and bbox) | `geoQ` `intersects` on M4 | mapped when it is a top-level conjunct and the only spatial one; else residual | `ogc/filter::s_intersects_pushed_to_geoq` | T-3745 |
+| F10 | CQL2 `basic-spatial-functions-plus`, `spatial-functions`: `S_WITHIN`, `S_CONTAINS`, `S_DISJOINT`, `S_EQUALS`, `S_OVERLAPS`, `S_CROSSES`, `S_TOUCHES` | `geoQ` `within`, `contains`, `disjoint`, `equals`, `overlaps` (`crates/antares-ql/src/geo.rs` `Rel`); `S_CROSSES`, `S_TOUCHES` have no `georel` | mapped for the five with a georel (one per request, top-level); the rest and every second spatial predicate residual (`geo::Relate` already in the tree) | `ogc/filter::spatial_functions_pushed_or_residual` | T-3745 |
+| F11 | CQL2 `temporal-functions`: `T_AFTER`, `T_BEFORE`, `T_DURING`, `T_EQUALS`, `T_INTERSECTS`, `T_CONTAINS`, `T_DISJOINT`, `T_FINISHEDBY`, `T_FINISHES`, `T_MEETS`, `T_METBY`, `T_OVERLAPPEDBY`, `T_OVERLAPS`, `T_STARTEDBY`, `T_STARTS` | `q` comparisons on RFC 3339 values for `T_AFTER`, `T_BEFORE`, `T_DURING`, `T_EQUALS`, `T_INTERSECTS` against an instant or the start/end slots | mapped for those five, residual for the other ten | `ogc/filter::temporal_functions_pushed_or_residual` | T-3745 |
+| F12 | CQL2 `array-functions`: `A_EQUALS`, `A_CONTAINS`, `A_CONTAINEDBY`, `A_OVERLAPS` | `q` `==a,b` matches any element, which is `A_OVERLAPS` only for a ListProperty | `A_OVERLAPS` mapped, the other three residual | `ogc/filter::array_functions` | T-3745 |
+| F13 | CQL2 `property-property` (a property on both sides) | none: `q` compares to literals | residual | `ogc/filter::property_property_is_residual` | T-3745 |
+| F14 | CQL2 `functions` (`/functions` resource, custom functions) | none | mapped as an empty `/functions` list: the surface defines no custom function; an unknown function name is 400 | `ogc/filter::functions_list_is_empty_and_unknown_is_400` | T-3745 |
+| F15 | CQL2 `arithmetic` (`+ - * / % div ^`) | none | residual | `ogc/filter::arithmetic_is_residual` | T-3745 |
+| F16 | a name outside the queryables, hidden or misspelled | none | 400 before any operation (F1 `additionalProperties: false`) | `ogc/filter::hidden_and_unknown_property_are_the_same_400` | T-3745 |
+| F17 | parse limits | none | 400 above the depth and size bounds of `ogc-cql2` (as T-0808 bounded the gateway parser) | `cql2/parse::depth_and_size_bounded` | T-3753 |
+
+Residual rows answer 501 `NotImplemented` naming the operator until the T-3748 engine (T-3755, T-3756) and `ViewOps::scan` (T-3757, OGC items in T-3759) serve it; the engine never returns an Entity the pushed-down query did not return (ADR-0028).
+
+## 6. Part 4: Create, Replace, Update, Delete (draft) and Part 5: Schemas (draft)
+
+| # | Class / requirement | NGSI-LD operation | Status | Test | Slice |
+|---|---|---|---|---|---|
+| W1 | Part 4 `create-replace-delete` `post-*` (`POST /items`, 201 + `Location`) | `CreateEntity`; id minted as the OData surface mints it (T-3721), a Feature `id` in the body ignored (R5); geometry → M4 GeoProperty, properties → Attributes by their LinkML kind | mapped when the view offers `create_entity`, else 405 before the body is read | `ogc/write::post_creates_and_answers_location` | T-3746 |
+| W2 | `put-*` (`PUT /items/{id}`), `put-rid`, `put-rid-exception` | `ReplaceEntity`; absent or hidden → 404 (no PUT-create) | mapped when offered | `ogc/write::put_replaces_and_absent_is_404` | T-3746 |
+| W3 | `delete-*` | `DeleteEntity` | mapped when offered | `ogc/write::delete_and_hidden_is_404` | T-3746 |
+| W4 | `options-op`, `options-response` (`Allow` per resource) | none; from the view's operations | mapped | `ogc/write::options_lists_offered_methods` | T-3746 |
+| W5 | `update` (`PATCH`, `application/merge-patch+json`, RFC 7396) | `MergeEntity` (NGSI-LD merge: `null` deletes, as RFC 7396) | mapped when offered; other patch media types 415 | `ogc/write::patch_is_merge_patch` | T-3746 |
+| W6 | `optimistic-locking-etags`, `optimistic-locking-timestamps` (`If-Match`, `If-Unmodified-Since`) | none | rejected 501: the broker has no atomic conditional write (odata-linkml-mapping N13), and an ignored precondition can lose an update; a request carrying either header is refused before it runs | `ogc/write::preconditions_are_501` | T-3746 |
+| W7 | a write the Policy refuses, a post-image leaving the view, a hidden Attribute written | as W1 to W5 | 403 `AccessDenied`, nothing stored (ADR-0023 rule 7) | `ogc/write::policy_refusal_stores_nothing` | T-3746 |
+| S1 | Part 5 `schemas` (`json-schema`, `properties`, `role`, `role-id`, `property-seq`, `unit`, `definition`) | none; LinkML ∩ shown (M7); `x-ogc-unit` from `ucum_code`, `x-ogc-definition` from `slot_uri` | mapped | `ogc/schemas::schema_is_json_schema_2020_12` | T-3754 |
+| S2 | `core-roles-features` (`primary-geometry`, `primary-instant`, interval roles, `type`) | none (M4, M6) | mapped | `ogc/schemas::roles_follow_the_annotations` | T-3754 |
+| S3 | `returnables-and-receivables` (`/collections/{c}/schema`, rel `.../schema`) | none | mapped | `ogc/schemas::schema_link_and_response` | T-3754 |
+| S4 | `queryables` (Part 5 form) | as F1 | mapped (F1) | `ogc/filter::queryables_are_the_shown_attributes` | T-3745 |
+| S5 | `sortables` (`/collections/{c}/sortables`) plus the `sortby` parameter (OGC API Features Part 8 draft) | `orderBy` (`crates/antares-api/src/paging.rs:192`) | mapped for scalar shown Attributes; object, array and spatial properties excluded (Req 24) | `ogc/schemas::sortables_and_sortby_pushed_to_order_by` | T-3754 |
+| S6 | `properties` parameter (Part 6 draft, property selection) | `pick` | mapped; a hidden name is 400 like an unknown one | `ogc/schemas::properties_pushed_to_pick` | T-3754 |
+| S7 | `feature-references`, `profile-parameter`, `profiles-for-feature-references` (`rel-as-key`, `rel-as-uri`, `rel-as-link`) | none; a Relationship's `object` rendered per profile, `rel-as-link` pointing at `/collections/{T}/items/{urn}` only for a target type the view shows | mapped; `rel-as-key` default | `ogc/schemas::relationship_profiles` | T-3754 |
+
+## 7. Security
+
+- The surface never serves more than the view answers. Collections, queryables, sortables and schemas come from `shown_names()` and the LinkML intersected with it, never from the store; Features, counts and links come from `ViewOps::run` as the caller. A hidden collection, Feature or property is a 404 or 400 identical to an absent or misspelled one.
+- `numberMatched` is the `NGSILD-Results-Count` of the caller's own query, or the residual engine's full count within budget, or absent. It is never estimated or taken from an unscoped count.
+- The `next` token holds offsets and a hash of the normalised query and view id; the server re-runs the query as the caller, so a forged token reaches nothing the caller could not query directly.
+- A CQL2 filter is ANDed with the view's predicate inside the operation, so it only narrows. Parse depth and size are bounded (F17), the residual is budget-bounded (ADR-0028: 10 000 upstream Entities per request, beyond it 400 `TooManyResults` where an exact answer is required, never a partial answer).
+- Writes reach the store only through `ViewOps::run` and the Policy (W1 to W7). No route serves a write the view does not offer.
+
+## 8. Unknowns
+
+- Part 4 and Part 5 are drafts (20-002r1, 23-058r1); their requirement ids may change before publication. The slices cite the draft ids and T-3747's ETS run shows what the published test suite checks.
+- Whether `antares-ql` accepts `!attr` combined with a type query on every backend (C12, C14): T-3744's first test proves it on memory and Postgres.
+- Whether the CITE ETS for Part 3 is published as a teamengine image (T-3747 decides from the registry).
