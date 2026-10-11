@@ -162,6 +162,8 @@ jobs:
             results/${{ matrix.cell }}/gate-status.txt
             results/${{ matrix.cell }}/failures.csv
             results/${{ matrix.cell }}/tp-status.csv
+            results/${{ matrix.cell }}/local-context-check.txt
+            results/${{ matrix.cell }}/local-context/access.log
             results/${{ matrix.cell }}/resource-samples.csv
             results/${{ matrix.cell }}/resource-by-test.csv
             results/${{ matrix.cell }}/roll-loop.log
