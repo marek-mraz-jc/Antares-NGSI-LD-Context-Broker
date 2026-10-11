@@ -306,6 +306,19 @@ impl ViewOps {
         &self.tenant
     }
 
+    /// The `LinkML` schema of the view's Tenant as written to
+    /// `/q/schemas/{tenant}`, with its revision, if one is stored (T-3628).
+    /// The surface parses it under its own limits and caches the parse per
+    /// revision; another Tenant's schema never reaches it.
+    #[must_use]
+    pub fn schema(&self) -> Option<(u64, Arc<[u8]>)> {
+        self.inner
+            .state
+            .views
+            .schema(&self.tenant)
+            .map(|s| (s.revision, s.bytes))
+    }
+
     /// The Entity types and the Attributes the view shows, compacted under
     /// the core @context, sorted: the names a surface may offer the caller.
     #[must_use]
@@ -591,6 +604,15 @@ pub mod test_kit {
         /// The store's.
         pub async fn store_view_doc(&self, id: &str, doc: serde_json::Value) -> Result<(), String> {
             self.state.put_view_doc(id, doc).await?;
+            self.reload.now().await
+        }
+
+        /// Rebuild this broker's table from the store now, as its interval
+        /// would after another pod's write.
+        ///
+        /// # Errors
+        /// The store's.
+        pub async fn reload_now(&self) -> Result<(), String> {
             self.reload.now().await
         }
 

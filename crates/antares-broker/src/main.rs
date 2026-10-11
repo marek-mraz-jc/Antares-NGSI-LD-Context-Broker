@@ -32,6 +32,10 @@ const KNOWN_KEYS: &[&str] = &[
     // rule 10); only a build with views has one.
     #[cfg(feature = "views")]
     antares_ops::views::RELOAD_ENV,
+    // The bound on a Tenant's LinkML schema (T-3628); unset, no schema is
+    // taken.
+    #[cfg(feature = "views")]
+    antares_ops::views::SCHEMA_MAX_ENV,
     // The MCP surface's hosts, origins and result budget (MC8, D-10).
     #[cfg(feature = "mcp")]
     antares_mcp::ALLOWED_HOSTS_ENV,
