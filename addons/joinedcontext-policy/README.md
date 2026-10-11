@@ -120,7 +120,8 @@ deciding; a Tenant with no document denies every platform caller.
 ## 4. The access surface
 
 `ANTARES_API_SURFACES=...,access` mounts `/x/views/{view}/access`, built
-with `jc-policy` (plan section 5.6). It answers "what may I do through this
+with `jc-policy` and `views` (the platform image's `full,jc-policy`; plan
+section 5.6). It answers "what may I do through this
 view" from the same compiled table the engine decides with, so the
 description and the enforcement cannot drift (platform EP-60). The view
 names the Tenant; an unknown view is 404, the same as on every view
