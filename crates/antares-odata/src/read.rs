@@ -692,7 +692,7 @@ pub(crate) fn key_id(set: &Set, key: &Key, options: &QueryOptions) -> Option<Str
     };
     match (own.filter(|_| !by_id), literal) {
         (Some(i), Literal::Guid(g)) if i.edm == "Edm.Guid" => Some(format!("{}{g}", i.prefix)),
-        (Some(i), Literal::Int(n)) if i.edm == "Edm.Int64" => Some(format!("{}{n}", i.prefix)),
+        (Some(i), Literal::Int(n)) if integer(i.edm) => Some(format!("{}{n}", i.prefix)),
         (Some(i), Literal::String(s)) if i.edm == "Edm.String" => Some(format!("{}{s}", i.prefix)),
         (_, Literal::String(s)) => Some(s.clone()),
         _ => None,
@@ -716,7 +716,7 @@ pub(crate) fn canonical_key(set: &Set, urn: &str) -> Key {
         .strip_prefix(own.prefix.as_str())
         .and_then(|v| match own.edm {
             "Edm.Guid" => is_guid(v).then(|| Literal::Guid(v.to_owned())),
-            "Edm.Int64" => v
+            edm if integer(edm) => v
                 .parse()
                 .ok()
                 .filter(|n: &i64| n.to_string() == v)
@@ -727,6 +727,14 @@ pub(crate) fn canonical_key(set: &Set, urn: &str) -> Key {
         Some(v) => Key::Single(KeyValue::Literal(v)),
         None => Key::Compound(vec![("id".into(), string(urn))]),
     }
+}
+
+/// One of the integer Edm types a key may have (T-3722).
+fn integer(edm: &str) -> bool {
+    matches!(
+        edm,
+        "Edm.Byte" | "Edm.SByte" | "Edm.Int16" | "Edm.Int32" | "Edm.Int64"
+    )
 }
 
 /// `8-4-4-4-12` lower-case hex digits, as a `guid` literal reads back.
@@ -1133,10 +1141,12 @@ mod tests {
             iri: "https://e.org/m".into(),
             shape,
             list: false,
+            written: crate::edm::Written::Always,
         };
         Set {
             type_iri: "https://e.org/T".into(),
             identifier: None,
+            writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 ("geo".into(), member(Shape::Geo)),
                 (

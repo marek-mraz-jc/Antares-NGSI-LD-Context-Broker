@@ -573,11 +573,13 @@ mod tests {
             iri: iri.into(),
             shape,
             list: false,
+            written: crate::edm::Written::Always,
         };
         let value = |edm, collection| Shape::Value { edm, collection };
         Set {
             type_iri: "https://e.org/Car".into(),
             identifier: None,
+            writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 (
                     "speed".into(),

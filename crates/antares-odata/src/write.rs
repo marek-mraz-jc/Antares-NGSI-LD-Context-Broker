@@ -73,7 +73,7 @@ pub(crate) async fn serve(
     };
     // Rule 4: a write the view does not offer is refused before its body
     // is read, whatever the body holds.
-    if !reads.view.allows(op) {
+    if !reads.view.allows(op) || !form.taken(reads) {
         return refused(StatusCode::METHOD_NOT_ALLOWED, version).into_response();
     }
     // W32: the broker has no conditional write; options shape a read's
@@ -120,6 +120,25 @@ enum Form<'u> {
 }
 
 impl Form<'_> {
+    /// Whether the set's class takes this write (C10a): a create, a delete,
+    /// or an update of the Entity, a property or a reference.
+    fn taken(&self, reads: &Reads) -> bool {
+        let (Self::Create(set)
+        | Self::Change(set, ..)
+        | Self::Delete(set, _)
+        | Self::Attribute(set, ..)
+        | Self::Reference(set, ..)) = self;
+        let Some(writable) = reads.edm.sets.get(*set).map(|s| s.writable) else {
+            // An unknown set is the write's own 404.
+            return true;
+        };
+        match self {
+            Self::Create(_) => writable.insert,
+            Self::Delete(..) => writable.delete,
+            _ => writable.update,
+        }
+    }
+
     /// The operation the write is; `None` for a form none is (W19).
     fn op(&self, reads: &Reads) -> Option<OperationId> {
         Some(match self {
@@ -454,10 +473,12 @@ mod tests {
             iri: iri.into(),
             shape,
             list: false,
+            written: crate::edm::Written::Always,
         };
         let set = Set {
             type_iri: "https://e.org/T".into(),
             identifier: None,
+            writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 (
                     "url".into(),

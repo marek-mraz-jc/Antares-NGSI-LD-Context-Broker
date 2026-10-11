@@ -45,6 +45,16 @@ intersected with what the view shows:
   `(ID=v)` names the same Entity. `(id='urn:…')` still names any Entity of
   the set, and it is the canonical key of an Entity whose URN does not
   follow the pattern. A key value never names an Entity of another set.
+- the schema narrows and annotates (T-3722): a slot's `edm_type` annotation
+  makes an `integer` an `Edm.Byte`, `Edm.SByte`, `Edm.Int16` or `Edm.Int32`,
+  a `float` or `double` an `Edm.Single`, and a `string` an `Edm.Guid`,
+  `Edm.Duration` or `Edm.Binary`, and a write is checked against that type;
+  `description` is `Core.Description`; `odata_computed: "true"` is
+  `Core.Computed` and `odata_immutable: "true"` is `Core.Immutable`, and a
+  body that writes such a member where the term forbids it is `400`; a
+  class's `odata_insertable`, `odata_updatable` or `odata_deletable` set to
+  `"false"` takes that write from its set (`405`), never adding one the
+  view's `operations` lack.
 
 A view without a schema, or with one the build cannot read, has no OData
 endpoint (`404`). Nothing the view hides appears in a document, a name or

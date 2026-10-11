@@ -509,6 +509,14 @@ fn an_identifier_that_is_not_one_plain_value_is_malformed() {
             None,
         ),
         (
+            "a duration key",
+            room(
+                json!(["code"]),
+                json!({"identifier": true, "annotations": {"edm_type": {"tag": "edm_type", "value": "Edm.Duration"}}}),
+            ),
+            None,
+        ),
+        (
             "an Edm type outside the list",
             room(
                 json!(["code"]),
@@ -526,6 +534,64 @@ fn an_identifier_that_is_not_one_plain_value_is_malformed() {
             }
             _ => {}
         }
+        let got = load(&doc);
+        assert!(matches!(got, Err(Error::Malformed(_))), "{what}: {got:?}");
+    }
+}
+
+#[test]
+fn edm_types_and_flags_load_only_where_they_fit() {
+    // T-3722: each `edm_type` on the range it narrows, flags as "true"/"false".
+    let tagged = |range: &str, tag: &str, value: &str| {
+        let mut doc = base();
+        doc["slots"]["size"] =
+            json!({"range": range, "annotations": {tag: {"tag": tag, "value": value}}});
+        doc
+    };
+    for (range, edm) in [
+        ("integer", "Edm.Byte"),
+        ("integer", "Edm.SByte"),
+        ("integer", "Edm.Int16"),
+        ("integer", "Edm.Int32"),
+        ("float", "Edm.Single"),
+        ("double", "Edm.Single"),
+        ("string", "Edm.Guid"),
+        ("string", "Edm.Duration"),
+        ("string", "Edm.Binary"),
+    ] {
+        load(&tagged(range, "edm_type", edm)).unwrap();
+    }
+    for flag in ["odata_computed", "odata_immutable"] {
+        load(&tagged("integer", flag, "true")).unwrap();
+        load(&tagged("integer", flag, "false")).unwrap();
+    }
+    let mut doc = base();
+    doc["classes"]["Room"]["annotations"] = json!({"odata_insertable": {"tag": "odata_insertable", "value": "false"}, "other": {"tag": "other", "value": "x"}});
+    load(&doc).unwrap();
+
+    let mut bad = vec![
+        (
+            "Single on integer",
+            tagged("integer", "edm_type", "Edm.Single"),
+        ),
+        ("Int16 on float", tagged("float", "edm_type", "Edm.Int16")),
+        ("Int64 named", tagged("integer", "edm_type", "Edm.Int64")),
+        (
+            "Guid on a boolean",
+            tagged("boolean", "edm_type", "Edm.Guid"),
+        ),
+        ("Guid on an enum", tagged("E", "edm_type", "Edm.Guid")),
+        ("computed yes", tagged("integer", "odata_computed", "yes")),
+        ("immutable empty", tagged("integer", "odata_immutable", "")),
+    ];
+    let mut class = base();
+    class["classes"]["Room"]["annotations"] =
+        json!({"odata_deletable": {"tag": "odata_deletable", "value": "no"}});
+    bad.push(("class flag no", class));
+    let mut differs = base();
+    differs["classes"]["Room"]["annotations"] = json!({"a": {"tag": "b", "value": "c"}});
+    bad.push(("class tag differs", differs));
+    for (what, doc) in bad {
         let got = load(&doc);
         assert!(matches!(got, Err(Error::Malformed(_))), "{what}: {got:?}");
     }
