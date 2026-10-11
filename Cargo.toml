@@ -22,6 +22,7 @@ members = [
     "crates/ogc-cql2",
     "crates/antares-views",
     "crates/antares-mcp",
+    "crates/antares-linkml",
     "crates/antares-odata",
     "crates/antares-ws",
     # The reference plugin: built and tested with the workspace so the
@@ -56,6 +57,7 @@ joinedcontext-policy = { path = "addons/joinedcontext-policy" }
 antares-ops = { path = "crates/antares-ops" }
 antares-views = { path = "crates/antares-views" }
 antares-mcp = { path = "crates/antares-mcp" }
+antares-linkml = { path = "crates/antares-linkml" }
 antares-odata = { path = "crates/antares-odata" }
 antares-ws = { path = "crates/antares-ws" }
 
@@ -218,6 +220,9 @@ codegen-units = 1
 [profile.release.package.antares-mcp]
 overflow-checks = true
 codegen-units = 1
+
+[profile.release.package.antares-linkml]
+overflow-checks = true
 
 [profile.release.package.antares-odata]
 overflow-checks = true

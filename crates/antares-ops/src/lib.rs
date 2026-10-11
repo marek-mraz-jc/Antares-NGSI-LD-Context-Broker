@@ -50,7 +50,7 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -117,9 +117,103 @@ pub struct Ops {
 pub struct ViewOps {
     inner: Ops,
     view: Arc<antares_api::views::CompiledView>,
-    tenant: String,
+    tenant: antares_model::TenantId,
     operations: Vec<OperationId>,
     mapping: Option<Arc<mapping::Mapping>>,
+}
+
+/// The Entity types a caller may see through a view and the Attributes
+/// each may show, as IRIs (ADR-0023 rule 5): made by [`ViewOps::visible`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Visible {
+    /// Each rule's types and the Attributes it shows, `pick` and `omit`
+    /// applied: an Attribute is shown when a rule of its type shows it.
+    rules: Vec<(BTreeSet<String>, BTreeSet<String>)>,
+    /// Attributes removed per type, on top of the rules.
+    omit_by_type: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Visible {
+    /// Whether an Entity of type `name` (an IRI or a core-context term) may
+    /// be seen.
+    ///
+    /// ```
+    /// assert!(!antares_ops::Visible::default().shows_type("Car"));
+    /// ```
+    #[must_use]
+    pub fn shows_type(&self, name: &str) -> bool {
+        let ty = expand(name);
+        self.rules.iter().any(|(types, _)| types.contains(&ty))
+    }
+
+    /// Whether an Entity of type `ty` may show Attribute `attr`.
+    ///
+    /// ```
+    /// assert!(!antares_ops::Visible::default().shows_attribute("Car", "speed"));
+    /// ```
+    #[must_use]
+    pub fn shows_attribute(&self, ty: &str, attr: &str) -> bool {
+        let (ty, attr) = (expand(ty), expand(attr));
+        !self
+            .omit_by_type
+            .get(&ty)
+            .is_some_and(|gone| gone.contains(&attr))
+            && self
+                .rules
+                .iter()
+                .any(|(types, attrs)| types.contains(&ty) && attrs.contains(&attr))
+    }
+
+    /// What `filter`'s rules show: each rule's types with its Attributes,
+    /// less what `pick` leaves out and `omit` and `omit_by_type` remove. A
+    /// rule's condition is not read: it decides which Entities show the
+    /// Attributes, not which Attributes there are.
+    ///
+    /// ```
+    /// use antares_ops::policy::{Filter, Rule};
+    /// let visible = antares_ops::Visible::from_filter(&Filter {
+    ///     rules: vec![Rule {
+    ///         types: vec!["https://e.org/Car".into()],
+    ///         attributes: vec!["https://e.org/speed".into(), "https://e.org/vin".into()],
+    ///         ..Rule::default()
+    ///     }],
+    ///     omit: vec!["https://e.org/vin".into()],
+    ///     ..Filter::default()
+    /// });
+    /// assert!(visible.shows_attribute("https://e.org/Car", "https://e.org/speed"));
+    /// assert!(!visible.shows_attribute("https://e.org/Car", "https://e.org/vin"));
+    /// ```
+    #[must_use]
+    pub fn from_filter(filter: &policy::Filter) -> Self {
+        let set =
+            |names: &[String]| -> BTreeSet<String> { names.iter().map(|n| expand(n)).collect() };
+        let (pick, omit) = (set(&filter.pick), set(&filter.omit));
+        let rules = filter
+            .rules
+            .iter()
+            .map(|rule| {
+                let mut attrs = set(&rule.attributes);
+                attrs.retain(|a| (pick.is_empty() || pick.contains(a)) && !omit.contains(a));
+                (set(&rule.types), attrs)
+            })
+            .collect();
+        let omit_by_type = filter
+            .omit_by_type
+            .iter()
+            .map(|(t, attrs)| (expand(t), set(attrs)))
+            .collect();
+        Self {
+            rules,
+            omit_by_type,
+        }
+    }
+}
+
+/// `name` as an IRI under the core @context, as a view's names are kept.
+fn expand(name: &str) -> String {
+    static CORE: std::sync::LazyLock<antares_jsonld::Context> =
+        std::sync::LazyLock::new(antares_jsonld::core_context);
+    CORE.expand_key(name)
 }
 
 /// The headers of the request a surface is answering, as the HTTP layer
@@ -269,6 +363,8 @@ impl Ops {
         else {
             return None;
         };
+        // The loader stored the tenant it validated, so this never refuses.
+        let tenant = antares_model::TenantId::new(tenant).ok()?;
         // the loader attaches nothing else, so a failed downcast is a view
         // no surface serves
         let mapping = match mapping {
@@ -282,7 +378,7 @@ impl Ops {
         let made = ViewOps {
             inner: Self::new(self.state.with_view(view.clone()), self.surface.clone()),
             view: view.clone(),
-            tenant: tenant.clone(),
+            tenant,
             operations: operations
                 .iter()
                 .filter_map(|o| OperationId::from_id(o))
@@ -398,7 +494,7 @@ impl ViewOps {
     /// The one Tenant the view serves (ADR-0023 rule 10).
     #[must_use]
     pub fn tenant(&self) -> &str {
-        &self.tenant
+        self.tenant.as_str()
     }
 
     /// The `LinkML` schema of the view's Tenant as written to
@@ -410,7 +506,7 @@ impl ViewOps {
         self.inner
             .state
             .views
-            .schema(&self.tenant)
+            .schema(self.tenant.as_str())
             .map(|s| (s.revision, s.bytes))
     }
 
@@ -419,6 +515,43 @@ impl ViewOps {
     #[must_use]
     pub fn shown_names(&self) -> (Vec<String>, Vec<String>) {
         self.view.shown_names()
+    }
+
+    /// What `caller` may see through the view for `op`, a read the view
+    /// allows: the view's rules composed with the engine's answer for the
+    /// operation's clause and the expanded `types` and `attrs` it names
+    /// (`effective = view ∧ engine`, ADR-0023 rule 5), asked once, in the
+    /// view's Tenant, failing closed as every gate does.
+    ///
+    /// # Errors
+    /// [`Refusal::NotAllowed`] when the view does not allow `op`,
+    /// [`Refusal::Denied`] when the engine refuses it.
+    pub async fn visible(
+        &self,
+        caller: &Caller,
+        op: OperationId,
+        types: &[String],
+        attrs: &[String],
+    ) -> Result<Visible, Refusal> {
+        let Some(clause) = op.gate_clause().filter(|_| self.allows(op)) else {
+            return Err(Refusal::NotAllowed { allow: Vec::new() });
+        };
+        let engine = match self.inner.state.policy.as_deref() {
+            None => Ok(antares_api::policy::unnarrowed()),
+            Some(engine) => {
+                let asked = policy::Operation {
+                    types,
+                    attrs,
+                    ..policy::Operation::new(clause)
+                };
+                antares_api::policy::gate(engine, &self.tenant, &caller.0, &asked)
+                    .await
+                    .map(Arc::new)
+            }
+        };
+        antares_api::views::with_view(Some(&self.view), clause, engine)
+            .map(|f| Visible::from_filter(&f))
+            .map_err(|d| Refusal::Denied(d.0))
     }
 
     /// Each Entity type the view shows with the Attributes it shows of it,
@@ -445,27 +578,23 @@ impl ViewOps {
     /// view's Tenant (MCP D-3). The probe fails closed: an engine that fails
     /// it offers nothing.
     pub async fn offered(&self, caller: &Caller, ops: &[OperationId]) -> Vec<bool> {
-        let Ok(tenant) = antares_model::TenantId::new(&self.tenant) else {
-            return vec![false; ops.len()];
-        };
-        let asked: Vec<(usize, &'static str)> = ops
+        let asked = |op: &OperationId| self.allows(*op) && op.gate_clause().is_some();
+        let clauses: Vec<&'static str> = ops
             .iter()
-            .enumerate()
-            .filter(|(_, op)| self.allows(**op))
-            .filter_map(|(i, op)| op.gate_clause().map(|c| (i, c)))
+            .filter(|op| asked(op))
+            .filter_map(|op| op.gate_clause())
             .collect();
-        let clauses: Vec<&'static str> = asked.iter().map(|(_, c)| *c).collect();
-        let answers = antares_api::policy::offers(
+        let mut answers = antares_api::policy::offers(
             self.inner.state.policy.as_deref(),
-            &tenant,
+            &self.tenant,
             &caller.0,
             &clauses,
         )
-        .await;
-        let given: std::collections::HashMap<usize, bool> =
-            asked.iter().map(|(i, _)| *i).zip(answers).collect();
-        (0..ops.len())
-            .map(|i| given.get(&i).copied().unwrap_or(false))
+        .await
+        .into_iter();
+        // The answers come in the order asked; a short answer offers nothing.
+        ops.iter()
+            .map(|op| asked(op) && answers.next().unwrap_or(false))
             .collect()
     }
 
@@ -497,7 +626,7 @@ impl ViewOps {
                     .to_str()
                     .ok()
                     .and_then(|t| antares_model::TenantId::new(t).ok())
-                    .is_some_and(|t| t.as_str() == self.tenant);
+                    .is_some_and(|t| t.as_str() == self.tenant.as_str());
                 if !same {
                     return Err(Refusal::Malformed(OTHER));
                 }
@@ -508,7 +637,7 @@ impl ViewOps {
         let mut headers = caller.0.clone();
         headers.insert(
             TENANT,
-            HeaderValue::from_str(&self.tenant).map_err(|_| Refusal::Malformed(OTHER))?,
+            HeaderValue::from_str(self.tenant.as_str()).map_err(|_| Refusal::Malformed(OTHER))?,
         );
         let mut answer = self
             .inner
@@ -516,7 +645,7 @@ impl ViewOps {
                 op,
                 &Caller(headers),
                 req,
-                Some((self.view.id(), &self.tenant)),
+                Some((self.view.id(), self.tenant.as_str())),
             )
             .await?;
         if !named {
@@ -924,6 +1053,64 @@ mod tests {
             Some("colour==\"red\"")
         );
         assert!(test_kit::q_filter("colour==").is_err());
+    }
+
+    #[test]
+    fn visible_names_are_the_rules_less_pick_omit_and_omit_by_type() {
+        let rule = |types: &[&str], attrs: &[&str]| policy::Rule {
+            types: types.iter().map(|t| (*t).to_owned()).collect(),
+            attributes: attrs.iter().map(|a| (*a).to_owned()).collect(),
+            ..policy::Rule::default()
+        };
+        let iri = |n: &str| format!("https://e.org/{n}");
+        let filter = policy::Filter {
+            rules: vec![
+                rule(&[&iri("Car")], &[&iri("speed"), &iri("owner"), &iri("vin")]),
+                rule(&[&iri("Bus")], &[&iri("speed"), &iri("vin")]),
+                rule(&[&iri("Car")], &[&iri("colour")]),
+            ],
+            pick: vec![iri("speed"), iri("owner"), iri("colour"), iri("vin")],
+            omit: vec![iri("owner")],
+            omit_by_type: BTreeMap::from([(iri("Bus"), vec![iri("vin")])]),
+            ..policy::Filter::default()
+        };
+        let v = Visible::from_filter(&filter);
+        assert!(v.shows_type(&iri("Car")));
+        assert!(v.shows_type(&iri("Bus")));
+        assert!(!v.shows_type(&iri("Tram")));
+        assert!(v.shows_attribute(&iri("Car"), &iri("speed")));
+        assert!(
+            v.shows_attribute(&iri("Car"), &iri("colour")),
+            "rules add up"
+        );
+        assert!(
+            !v.shows_attribute(&iri("Car"), &iri("owner")),
+            "omit removes"
+        );
+        assert!(v.shows_attribute(&iri("Car"), &iri("vin")));
+        assert!(
+            !v.shows_attribute(&iri("Bus"), &iri("vin")),
+            "omit_by_type removes"
+        );
+        assert!(!v.shows_attribute(&iri("Tram"), &iri("speed")));
+
+        let picked = Visible::from_filter(&policy::Filter {
+            pick: vec![iri("speed")],
+            ..filter
+        });
+        assert!(
+            !picked.shows_attribute(&iri("Car"), &iri("colour")),
+            "pick keeps"
+        );
+        // A core-context term is the IRI it expands to.
+        let core = Visible::from_filter(&policy::Filter {
+            rules: vec![rule(&["Car"], &["location"])],
+            ..policy::Filter::default()
+        });
+        assert!(core.shows_attribute(
+            "https://uri.etsi.org/ngsi-ld/default-context/Car",
+            "https://uri.etsi.org/ngsi-ld/location"
+        ));
     }
 
     #[test]

@@ -53,14 +53,6 @@ branches = 1
 reason = "the periodic reload failing on the store, which the built-in store does not (see antares_ops::views::inner)"
 
 [[exclusion]]
-crate = "antares-ops"
-file = "src/lib.rs"
-function = "ViewOps::offered" # v0 mangling puts the impl between the crate and the type
-lines = 1
-branches = 1
-reason = "the view's tenant fails TenantId::new: the loader stores a TenantId's own text (views.rs Loaded), so the fail-closed answer is unreachable after a checked conversion the type system cannot see"
-
-[[exclusion]]
 crate = "antares-mcp"
 file = "src/server.rs"
 function = "Server::run" # v0 mangling puts the impl between the crate and the type
@@ -163,6 +155,14 @@ function = "Server::write" # v0 mangling puts the impl between the crate and the
 lines = 2
 branches = 1
 reason = "a deployment key file that cannot be used: the codec is a process static, so a test run with a working key never reaches the refusal; confirm::codec_of's refusals are unit-tested"
+
+[[exclusion]]
+crate = "antares-linkml"
+file = "src/render.rs"
+function = "Cache::get" # v0 mangling puts the impl between the crate and the type
+lines = 2
+branches = 0
+reason = "Model::new refusing a narrowing of a model that loaded: narrow keeps every name the kept elements use (a range to a hidden class becomes uriorcurie, enums and prefixes are kept by use), so no test schema reaches it; the arm keeps a narrowing defect from being served"
 
 [[exclusion]]
 crate = "antares-mcp"
