@@ -111,15 +111,16 @@ A deliberate break proved the gate: the error response stopped sending the
 The pass rate counts passed and failed tests; skipped tests stay out of it.
 The baseline was first recorded on dev `f0da234` (T-3714) and raised by
 T-3719, which reads a form-encoded query, T-3723, which declares `$batch`
-and serves `HEAD`, and T-3720, which keys a set by its LinkML identifier
-and serves `$entity` (section 6):
+and serves `HEAD`, T-3720, which keys a set by its LinkML identifier
+and serves `$entity`, and T-3730, which serves the entity references of a
+set and of one Entity (section 6):
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
 | Minimal | 165 | 104 | 24 | 61.3 % |
-| Intermediate | 221 | 115 | 14 | 65.8 % |
+| Intermediate | 233 | 103 | 14 | 69.3 % |
 | Advanced | 159 | 345 | 63 | 31.5 % |
-| **All** (suite summary) | 545 | 564 | 101 | 49.1 % |
+| **All** (suite summary) | 557 | 552 | 101 | 50.2 % |
 
 Before T-3720 the baseline stood at 455 passed, 661 failed and 94 skipped
 (Minimal 57.8 %, Intermediate 49.1 %, Advanced 26.0 %).
@@ -141,7 +142,7 @@ Each failing area is a task, or a decision with its reason:
 | A form-encoded query (Go `url.Values`, Java `URLEncoder`): `%24` before an option name, `+` for a space, `%2F` and `%3D` for the query's `/` and `=` | 11.2.5.x, 11.3.x, 5.1.x, 11.2.9, 11.2.14 | T-3719: read as plain. A `+` reads as a space only where the grammar requires whitespace (`RWS`); inside a literal and in optional whitespace (`BWS`) it stays a `+`, by design: OData writes a space as `%20` (Part 2, the note under Example 32) and gives `+` its own meanings (a sign, a time zone offset), so `'a+b'` keeps its plus |
 | The key was always `id` (the URN); the model's own key (`ID`, Edm.Guid) did not address an Entity, and `$entity?$id=` answered 501 | 11.1, 11.2.1 to 11.2.3, 11.2.11, 11.4.11, 8.2.7 | T-3720: the schema marks `ID` `identifier: true` with `edm_type: Edm.Guid` (`ci/odata-compliance/schema.json`); the set is keyed by it and `$entity` is served |
 | `@odata.id URL is dereferenceable` (11.2.2) appends the relative `@odata.id` to the service URL without a `/`, and keeps the whole path of an absolute one; under a service root with a path neither form reaches the Entity | 11.2.2 | a limit of the suite: JSON Format 4.01 section 4.5.8 lets `@odata.id` be relative to the context URL, and `$entity?$id=` with the same value passes |
-| Entity references of a set or an Entity (`{Set}/$ref`, `{Set}(key)/$ref`) answer 501 | 11.2.15 | T-3730 |
+| Entity references of a set or an Entity (`{Set}/$ref`, `{Set}(key)/$ref`) answer 501 | 11.2.15 | T-3730: served (mapping rows Q33a, Q33b); `$select` and `$expand` on a reference are 400 |
 | `{Set}/` and `{Set}//` read as `{Set}` | 11.1 | T-3731 |
 | A create without a key is refused (`MissingKey`); the service does not mint one | 11.4.2 to 11.4.5, 11.4.12 to 11.4.15, 8.1.5, 8.2.3, 8.2.5, 8.2.8 | T-3721 |
 | Edm types beyond String, Double and Int64, enums, Core and Capabilities annotations from the LinkML schema | 4.4, 5.1.1.x, 5.1.4 to 5.1.8, 5.3, 14.1, vocab_* | T-3722 |
