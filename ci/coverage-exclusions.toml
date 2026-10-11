@@ -15,10 +15,10 @@
 [[exclusion]]
 crate = "antares-ops"
 file = "src/lib.rs"
-function = "Ops::run" # v0 mangling puts the impl between the crate and the type
-lines = 6
-branches = 1
-reason = "a 503 comes from a store whose pool timed out (DB_OVERLOADED); the built-in store under test_kit has no pool, and the broker's own tests cover the 503 through their pool-wall driver"
+function = "Ops::run_in" # v0 mangling puts the impl between the crate and the type
+lines = 13
+branches = 2
+reason = "6 lines, 1 branch: a 503 comes from a store whose pool timed out (DB_OVERLOADED); the built-in store under test_kit has no pool, and the broker's own tests cover the 503 through their pool-wall driver. 7 lines, 1 branch: the two tracing::info! of the surface operation line repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/ops_log.rs covers the subscriber path and asserts what it logs"
 
 [[exclusion]]
 crate = "antares-ops"

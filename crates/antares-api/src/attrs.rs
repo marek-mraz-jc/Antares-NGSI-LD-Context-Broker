@@ -3,6 +3,7 @@
 
 use crate::federation::path_segment;
 use crate::negotiate::*;
+use crate::policy::Condition;
 use crate::state::{now_iso, AppState};
 use antares_jsonld::{expand_entity, ExpandOpts};
 use antares_model::{check_attr_name, NgsiError};
@@ -148,7 +149,7 @@ async fn write_attrs(
         },
     )?;
     let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await;
-    gate!(
+    let granted = gate!(
         st, &tenant, headers, mode.clause,
         ids: &[id],
         types: &pre.types,
@@ -157,6 +158,7 @@ async fn write_attrs(
         body: Some(&fragment),
     )
     .await?;
+    let cond = Condition::of(&granted);
     #[cfg(feature = "views")]
     let guard =
         crate::views::WriteGuard::of(st, attr_iris_of(&fragment).iter().map(String::as_str));
@@ -170,6 +172,7 @@ async fn write_attrs(
         crate::federation::WritePlan::Answered(r) => return Ok(*r),
         crate::federation::WritePlan::Forward(regs) => regs,
     };
+    Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
     let local_covered = proxies_cover_all(&regs, &all_attr_iris);
     let fragment = crate::federation::strip_covered_expanded(&fragment, &regs);
     let local_iris = attr_iris_of(&fragment);
@@ -182,6 +185,7 @@ async fn write_attrs(
         let res = st
             .store
             .mutate(&tenant, Kind::Entity, id, |doc| {
+                Condition::pre(cond.as_ref(), id, doc)?;
                 #[cfg(feature = "views")]
                 if let Some(g) = &guard {
                     g.pre(id, doc)?;
@@ -822,7 +826,7 @@ async fn partial_update_inner(
     // that is not an Attribute.
     let attr_iri = antares_jsonld::expand_attr_name(attr, &parsed.ctx)?;
     let pre = crate::policy::pre_image(st, &tenant, id, None).await;
-    gate!(
+    let granted = gate!(
         st, &tenant, headers, "5.6.4",
         ids: &[id],
         types: &pre.types,
@@ -831,6 +835,7 @@ async fn partial_update_inner(
         body: Some(&frag_inst),
     )
     .await?;
+    let cond = Condition::of(&granted);
     #[cfg(feature = "views")]
     let guard = crate::views::WriteGuard::of(st, [attr_iri.as_str()]);
     #[cfg(feature = "views")]
@@ -855,6 +860,7 @@ async fn partial_update_inner(
     if let Some(r) = loop_answer {
         return Ok(r);
     }
+    Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
     let local_covered = proxies_cover_all(&regs, std::slice::from_ref(&attr_iri));
     let want_ds = frag_inst
         .get("datasetId")
@@ -869,6 +875,7 @@ async fn partial_update_inner(
         let res = st
             .store
             .mutate(&tenant, Kind::Entity, id, |doc| {
+                Condition::pre(cond.as_ref(), id, doc)?;
                 #[cfg(feature = "views")]
                 if let Some(g) = &guard {
                     g.pre(id, doc)?;
@@ -1014,7 +1021,7 @@ pub async fn replace_attr(
             },
         )?;
         let pre = crate::policy::pre_image(&st, &tenant, &id, None).await;
-        gate!(
+        let granted = gate!(
             st, &tenant, &headers, "5.6.19",
             ids: &[&id],
             types: &pre.types,
@@ -1023,6 +1030,7 @@ pub async fn replace_attr(
             body: Some(&fragment),
         )
         .await?;
+        let cond = Condition::of(&granted);
         #[cfg(feature = "views")]
         let guard = crate::views::WriteGuard::of(&st, [attr_iri.as_str()]);
         #[cfg(feature = "views")]
@@ -1047,6 +1055,7 @@ pub async fn replace_attr(
         if let Some(r) = loop_answer {
             return Ok(r);
         }
+        Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
         let local_covered = proxies_cover_all(&regs, std::slice::from_ref(&attr_iri));
         let ts = now_iso();
         let mut found = false;
@@ -1056,6 +1065,7 @@ pub async fn replace_attr(
             let res = st
                 .store
                 .mutate(&tenant, Kind::Entity, &id, |doc| {
+                    Condition::pre(cond.as_ref(), &id, doc)?;
                     #[cfg(feature = "views")]
                     if let Some(g) = &guard {
                         g.pre(&id, doc)?;
@@ -1206,7 +1216,7 @@ async fn set_attr_value_inner(
         .transpose()?
         .map(|i| serde_json::json!({ attr_iri.clone(): [i] }));
     let pre = crate::policy::pre_image(st, &tenant, id, None).await;
-    gate!(
+    let granted = gate!(
         st, &tenant, headers, "5.6.19",
         ids: &[id],
         types: &pre.types,
@@ -1215,6 +1225,7 @@ async fn set_attr_value_inner(
         body: judged.as_ref(),
     )
     .await?;
+    let cond = Condition::of(&granted);
     #[cfg(feature = "views")]
     let guard = crate::views::WriteGuard::of(st, [attr_iri.as_str()]);
     #[cfg(feature = "views")]
@@ -1226,6 +1237,7 @@ async fn set_attr_value_inner(
     if let Some(r) = loop_answer {
         return Ok(r);
     }
+    Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
     let local_covered = proxies_cover_all(&regs, std::slice::from_ref(&attr_iri));
     let ts = now_iso();
     let mut found = false;
@@ -1235,6 +1247,7 @@ async fn set_attr_value_inner(
         let res = st
             .store
             .mutate(&tenant, Kind::Entity, id, |doc| {
+                Condition::pre(cond.as_ref(), id, doc)?;
                 #[cfg(feature = "views")]
                 if let Some(g) = &guard {
                     g.pre(id, doc)?;
@@ -1436,7 +1449,7 @@ async fn delete_attr_inner(
         }
     };
     let pre = crate::policy::pre_image(st, &tenant, id, None).await;
-    gate!(
+    let granted = gate!(
         st, &tenant, headers, "5.6.5",
         ids: &[id],
         types: &pre.types,
@@ -1444,6 +1457,7 @@ async fn delete_attr_inner(
         attrs: std::slice::from_ref(&attr_iri),
     )
     .await?;
+    let cond = Condition::of(&granted);
     #[cfg(feature = "views")]
     let guard =
         crate::views::WriteGuard::of(st, (attr_iri != "scope").then_some(attr_iri.as_str()));
@@ -1454,6 +1468,7 @@ async fn delete_attr_inner(
     if let Some(r) = loop_answer {
         return Ok(r);
     }
+    Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
     let local_covered = proxies_cover_all(&regs, std::slice::from_ref(&attr_iri));
     let ts = now_iso();
     let mut found = false;
@@ -1463,6 +1478,7 @@ async fn delete_attr_inner(
         let res = st
             .store
             .mutate(&tenant, Kind::Entity, id, |doc| {
+                Condition::pre(cond.as_ref(), id, doc)?;
                 #[cfg(feature = "views")]
                 if let Some(g) = &guard {
                     g.pre(id, doc)?;
