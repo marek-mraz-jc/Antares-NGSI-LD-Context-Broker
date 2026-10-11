@@ -75,7 +75,7 @@ The map's section 3 was written against a five-member `Filter`. The seam has gro
 | G9 batch division | K23 | closed (T-3480, `decide_each`) | per member |
 | G10 discovery | K21 | closed (T-3479, `FILTERABLE`) | `Filter.rules` narrows `/types`, `/attributes`, and the LinkML surface (T-3511) |
 | G11 per-entity notification selection | K25 | not checked here; T-3499 decides view ∧ subscription at match time | the switch task for 7.3 checks it with the engine attached |
-| G12 grants on stored state | K24 | partly: the engine sees the stored types, scope and attribute names (T-3483), not values, so a grant with a value `q` cannot be decided for a write | such a grant answers `Deny` for writes (fail closed); task filed for a store-side conditional write |
+| G12 grants on stored state | K24 | yes (T-3634): the engine answers `AllowIf(filter)` on a write by id and the store applies the write only if the stored Entity matches, inside its own read-modify-write | a conditioned write that would be forwarded is refused; a temporal write or a Batch Upsert under such a grant answers `Deny` (fail closed) |
 | G13 preview | R11, M10 | **open** | task filed (preview of a draft view through `/q`) |
 | G15 subject | K1, K2, K34, K38 | open in the deployment | section 4.2 |
 | G17 relationship targets | K29 | the matrix names the linked-entity check per write row (`operation-matrix.yaml`, `linked_entity_checks`); whether the view write path enforces it for an engine `Filter` is not checked here | the 7.1 switch task proves it with a test per M7 caller |

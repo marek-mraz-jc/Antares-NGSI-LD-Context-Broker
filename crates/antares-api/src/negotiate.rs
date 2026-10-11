@@ -624,6 +624,10 @@ pub(crate) async fn request_context(
     loader: &Loader,
     headers: &HeaderMap,
 ) -> ApiResult<Arc<Context>> {
+    #[cfg(feature = "views")]
+    if let Some(context) = crate::state::inprocess_context() {
+        return Ok(loader.resolve_for(&tenant_from(headers)?, &context).await?);
+    }
     match link_context(headers)? {
         // 5.5.10: the Tenant bounds what the operation may see, and a locally
         // stored @context (5.13.1) is information related to the Tenant that

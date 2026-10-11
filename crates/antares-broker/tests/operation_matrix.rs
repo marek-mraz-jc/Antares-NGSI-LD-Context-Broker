@@ -18,6 +18,13 @@
 //!   is refused (404, 405 or 422, ADR-0023 rule 4) before the engine is
 //!   asked; and no answer through `restricted` carries the hidden
 //!   Attribute.
+//! - In an `odata` build, the OData column (T-3508): every row marked
+//!   `odata: supported` is sent in its OData form through both views; a
+//!   read asks the engine once with its clause, the service document and
+//!   `$metadata` ask nothing, a write asks once under `all` and is 405
+//!   before the engine under `restricted`, the forms of a later round
+//!   are refused before the engine, and a supported row this column does
+//!   not send is red.
 //!
 //! The MCP column is T-3656's: the tools name rows the matrix's proposal
 //! names do not match yet.
@@ -299,18 +306,46 @@ enum Pass {
     View(&'static str),
 }
 
+/// The Tenant's `LinkML` schema: Vehicle with both Attributes, under the
+/// core context's default vocabulary the views' names expand to.
+const SCHEMA: &str = r#"{
+  "id": "https://example.org/matrix", "name": "matrix",
+  "prefixes": {"d": {"prefix_prefix": "d", "prefix_reference": "https://uri.etsi.org/ngsi-ld/default-context/"}},
+  "default_prefix": "d",
+  "classes": {"Vehicle": {"slots": ["speed", "secret", "owner"]}},
+  "slots": {"speed": {"range": "integer"}, "secret": {}, "owner": {"range": "Vehicle"}}
+}"#;
+
+/// The OData surface, in a build that has it.
+#[cfg(feature = "odata")]
+fn odata() -> Option<Box<dyn antares_api::ApiSurface>> {
+    Some(antares_ops::mount(antares_odata::OData))
+}
+
+#[cfg(not(feature = "odata"))]
+fn odata() -> Option<Box<dyn antares_api::ApiSurface>> {
+    None
+}
+
 /// A `views` build's surfaces over the built-in store, asking `engine`,
 /// with views `all` and `restricted` loaded, and Vehicle `matrix:1`
 /// (speed and the hidden Attribute) in the views' Tenant.
 async fn broker(engine: Clauses, writes: &HashSet<String>) -> (Router, antares_ops::views::Reload) {
+    if cfg!(feature = "odata") {
+        // The OData model is the Tenant's schema; a broker takes none
+        // without a size limit.
+        std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
+    }
     let mut state = AppState::new("matrix".into());
     antares_api::wire(&mut state).await;
+    let mut surfaces: Vec<Box<dyn antares_api::ApiSurface>> = vec![
+        Box::new(antares_api::Admin),
+        antares_ops::mount(antares_views::Views),
+    ];
+    surfaces.extend(odata());
     let state = state
         .with_policy(Arc::new(engine))
-        .with_surfaces(vec![
-            Box::new(antares_api::Admin),
-            antares_ops::mount(antares_views::Views),
-        ])
+        .with_surfaces(surfaces)
         .expect("the surfaces mount");
     let reload = antares_ops::views::install(&state)
         .await
@@ -323,7 +358,7 @@ async fn broker(engine: Clauses, writes: &HashSet<String>) -> (Router, antares_o
         .filter(|id| !writes.contains(*id))
         .collect();
     for (id, attributes, operations) in [
-        ("all", vec!["speed", HIDDEN], all),
+        ("all", vec!["speed", HIDDEN, "owner"], all),
         ("restricted", vec!["speed"], reads),
     ] {
         let doc = json!({"id": id, "tenant": TENANT, "selector": ["Vehicle"],
@@ -339,6 +374,18 @@ async fn broker(engine: Clauses, writes: &HashSet<String>) -> (Router, antares_o
         *req.uri_mut() = format!("/q/views/{id}").parse().expect("uri");
         let (status, body) = call(&app, req).await;
         assert!(status.is_success(), "view {id}: {status} {body}");
+    }
+    if cfg!(feature = "odata") {
+        let schema = Cell {
+            method: "PUT".into(),
+            route: String::new(),
+            query: "",
+            body: serde_json::from_str(SCHEMA).expect("the schema"),
+        };
+        let mut req = schema.request("");
+        *req.uri_mut() = format!("/q/schemas/{TENANT}").parse().expect("uri");
+        let (status, body) = call(&app, req).await;
+        assert!(status.is_success(), "schema: {status} {body}");
     }
     let vehicle = json!({"id": "urn:ngsi-ld:Vehicle:matrix:1", "type": "Vehicle",
                          "speed": {"type": "Property", "value": 1},
@@ -410,6 +457,236 @@ async fn every_cell_is_reachable_or_rejected_as_stated() {
             assert!(
                 engine.take().is_empty(),
                 "{v}: a non-route asked the engine"
+            );
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The `odata:` status of every row of the operation matrix.
+#[cfg(feature = "odata")]
+fn odata_status(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut row = None;
+    let mut inside = false;
+    for l in section(text, "operations") {
+        if let Some(id) = l.strip_prefix("- id: ") {
+            row = Some(id.trim().to_owned());
+            inside = false;
+        } else if l == "    odata:" {
+            inside = true;
+        } else if let Some(status) = l.strip_prefix("      status: ").filter(|_| inside) {
+            out.extend(row.take().map(|id| (id, status.trim().to_owned())));
+            inside = false;
+        }
+    }
+    out
+}
+
+/// The OData column (T-3508): every row the matrix marks `odata:
+/// supported` is sent in its OData form through views `all` and
+/// `restricted`. A read this round serves asks the engine once, with the
+/// row's clause; a document the model answers asks nothing; a write is
+/// T-3509's and is refused before the engine. A row marked supported that
+/// this column does not send is red.
+#[cfg(feature = "odata")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_odata_column_is_served_as_the_matrix_states() {
+    const KEY: &str = "Vehicle('urn:ngsi-ld:Vehicle:matrix:1')";
+    /// How a row answers.
+    enum Want {
+        /// 200 after asking the engine once, with the row's clause.
+        Gated,
+        /// 200 from the model, asking nothing.
+        Model,
+        /// A write with this body: under view `all` a 2xx after asking
+        /// the engine once, with the row's clause; under `restricted`,
+        /// which offers no write, 405 before the engine.
+        Write(&'static str),
+        /// A `$ref` write with this body: under `all` the target read
+        /// (5.7.1) and then the row's clause; under `restricted`, whose
+        /// model has no navigation, 404 before the engine.
+        Linked(&'static str),
+    }
+    let sent: &[(&str, &str, String, Want)] = &[
+        (
+            "query_entities",
+            "GET",
+            "Vehicle?$top=1".into(),
+            Want::Gated,
+        ),
+        ("retrieve_entity", "GET", KEY.into(), Want::Gated),
+        (
+            "retrieve_attribute_value",
+            "GET",
+            format!("{KEY}/speed"),
+            Want::Gated,
+        ),
+        ("retrieve_entity_types", "GET", String::new(), Want::Model),
+        (
+            "retrieve_entity_type_details",
+            "GET",
+            "$metadata".into(),
+            Want::Model,
+        ),
+        // paging is by offset: no EntityMap is made (the row's binding says "may")
+        (
+            "create_entity_map",
+            "GET",
+            "Vehicle?$top=1&$skip=1".into(),
+            Want::Gated,
+        ),
+        (
+            "create_entity",
+            "POST",
+            "Vehicle".into(),
+            Want::Write(r#"{"id": "urn:ngsi-ld:Vehicle:matrix:2", "speed": 2}"#),
+        ),
+        (
+            "merge_entity",
+            "PATCH",
+            KEY.into(),
+            Want::Write(r#"{"speed": 3}"#),
+        ),
+        (
+            "replace_entity",
+            "PUT",
+            KEY.into(),
+            Want::Write(r#"{"speed": 4}"#),
+        ),
+        (
+            "delete_entity",
+            "DELETE",
+            "Vehicle('urn:ngsi-ld:Vehicle:matrix:2')".into(),
+            Want::Write(""),
+        ),
+        (
+            "append_attributes",
+            "PUT",
+            format!("{KEY}/owner/$ref"),
+            Want::Linked(r#"{"@odata.id": "Vehicle('urn:ngsi-ld:Vehicle:matrix:1')"}"#),
+        ),
+        (
+            "partial_attribute_update",
+            "PATCH",
+            format!("{KEY}/speed"),
+            Want::Write(r#"{"value": 5}"#),
+        ),
+        (
+            "replace_attribute",
+            "PUT",
+            format!("{KEY}/speed"),
+            Want::Write(r#"{"value": 6}"#),
+        ),
+        (
+            "delete_attribute",
+            "DELETE",
+            format!("{KEY}/speed"),
+            Want::Write(""),
+        ),
+    ];
+    let text = std::fs::read_to_string(MATRIX).expect("the operation matrix");
+    let supported: Vec<String> = odata_status(&text)
+        .into_iter()
+        .filter(|(_, status)| status == "supported")
+        .map(|(id, _)| id)
+        .collect();
+    assert!(supported.len() >= 10, "the column is read: {supported:?}");
+    let mut wrong: Vec<String> = supported
+        .iter()
+        .filter(|id| !sent.iter().any(|(row, ..)| row == id))
+        .map(|id| format!("{id}: marked supported, not sent"))
+        .collect();
+    let writes = writes(&text);
+    for view in ["all", "restricted"] {
+        let engine = Clauses::default();
+        let (app, _reload) = broker(engine.clone(), &writes).await;
+        engine.take();
+        for (row, method, path, want) in sent {
+            if !supported.iter().any(|id| id == row) {
+                wrong.push(format!(
+                    "{row}: sent, but the matrix does not mark it supported"
+                ));
+                continue;
+            }
+            let body = match want {
+                Want::Write(body) | Want::Linked(body) => body,
+                _ if *method == "GET" || *method == "DELETE" => "",
+                _ => "{}",
+            };
+            // A create answers without reading the Entity back: one ask.
+            let mut req = Request::builder()
+                .method(*method)
+                .uri(format!("/x/views/{view}/odata/v4/{path}"))
+                .header("Prefer", "return=minimal");
+            if !body.is_empty() {
+                req = req
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", body.len());
+            }
+            let req = req.body(Body::from(body)).expect("request");
+            let (status, answer) = call(&app, req).await;
+            let seen = engine.take();
+            let cell = format!("{view} {row}: {method} {path}");
+            let op = OperationId::from_id(row);
+            let clause: Vec<&str> = op.and_then(OperationId::gate_clause).into_iter().collect();
+            let read = !writes.contains(*row);
+            match want {
+                Want::Gated if status != StatusCode::OK => {
+                    wrong.push(format!("{cell}: {status} {answer}"));
+                }
+                Want::Gated if *row == "create_entity_map" => {
+                    if seen != ["5.7.2"] {
+                        wrong.push(format!(
+                            "{cell}: asked {seen:?}, paging is one Query Entities"
+                        ));
+                    }
+                }
+                Want::Gated if seen != clause => {
+                    wrong.push(format!(
+                        "{cell}: asked {seen:?}, the row's clause is {clause:?}"
+                    ));
+                }
+                Want::Model if status != StatusCode::OK || !seen.is_empty() => {
+                    wrong.push(format!("{cell}: {status} after {seen:?}"));
+                }
+                Want::Write(_) if view == "all" && (!status.is_success() || seen != clause) => {
+                    wrong.push(format!(
+                        "{cell}: {status} {answer} after {seen:?}, the row's clause is {clause:?}"
+                    ));
+                }
+                Want::Linked(_)
+                    if view == "all"
+                        && (!status.is_success()
+                            || seen.first() != Some(&"5.7.1")
+                            || seen.get(1..) != Some(&clause[..])) =>
+                {
+                    wrong.push(format!(
+                        "{cell}: {status} {answer} after {seen:?}, the target read and then {clause:?}"
+                    ));
+                }
+                Want::Linked(_)
+                    if view == "restricted"
+                        && (status != StatusCode::NOT_FOUND || !seen.is_empty()) =>
+                {
+                    wrong.push(format!("{cell}: answered {status} after {seen:?}"));
+                }
+                Want::Write(_)
+                    if view == "restricted"
+                        && (status != StatusCode::METHOD_NOT_ALLOWED || !seen.is_empty()) =>
+                {
+                    wrong.push(format!(
+                        "{cell}: a write the view does not offer answered {status} after {seen:?}"
+                    ));
+                }
+                _ => {}
+            }
+            if view == "restricted" && answer.contains(HIDDEN) {
+                wrong.push(format!("{cell}: the hidden Attribute is in {answer}"));
+            }
+            assert!(
+                read != matches!(want, Want::Write(_) | Want::Linked(_)),
+                "{cell}: a read sent as a write or a write as a read"
             );
         }
     }

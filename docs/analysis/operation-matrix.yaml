@@ -185,29 +185,16 @@ operations:
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.4.3.2.md
       gate_site: crates/antares-api/src/attrs.rs:150
     odata:
-      status: supported
-      binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}') (Protocol 11.4.3); collection-valued $ref add/remove
-        rejected 501 (T-3441 W18, W19); single-valued $ref moved to append_attributes/delete_attribute, replace-all
-        to replace_attribute
+      status: not_offered
+      binding: none since T-3509; PATCH of an Entity is merge_entity (T-3441 W4), a single-valued $ref is
+        append_attributes and delete_attribute (W16, W17), the full collection replace_attribute (W20), and adding to or
+        removing from a collection-valued navigation is 501 (W18, W19)
       checks:
-        adr0020_phase: on_request
-        operation_fields:
-        - clause
-        - ids
-        - types
-        - attrs
-        - body
+        adr0020_phase: none
+        operation_fields: []
         filterable: false
         whole_tenant: false
-        linked_entity_checks:
-        - '$ref add/remove/change: Update Attributes (10.2.3) on the source Entity''s relationship attribute plus
-          visibility of the target Entity under the view'
-      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
-      post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        linked_entity_checks: []
     mcp:
       status: supported
       binding: update_attributes (proposal)
@@ -313,10 +300,12 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:150
     odata:
       status: supported
-      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref, single-valued (Protocol 11.4.6.3, T-3441
-        W16)
+      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref, one object for a single-valued navigation
+        (Protocol 11.4.6.3, T-3441 W16) and the full list for a collection-valued one (11.4.6.4, W20), each target read
+        under the view first (Retrieve Entity, 5.7.1); Append overwrites (10.2.4), so it sets a Relationship the Entity
+        does not hold yet, where Replace Attribute answers 404 (T-3509)
       checks:
-        adr0020_phase: none
+        adr0020_phase: on_request
         operation_fields: []
         filterable: false
         whole_tenant: false
@@ -427,7 +416,8 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:803
     odata:
       status: supported
-      binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}')/{complexProperty} (Protocol 11.4.9)
+      binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9, T-3441 W11), any property a
+        write may name (the model has no complex type: an inlined class is Edm.Untyped)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -633,7 +623,7 @@ operations:
     odata:
       status: supported
       binding: DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9; OData sets it to
-        null, the mapping to Delete Attribute is a proposal); also DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{prop}/$value
+        null, an absent Attribute is NGSI-LD's null); also DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{prop}/$value
         and single-valued DELETE .../{nav}/$ref (T-3441 W13, W17)
       checks:
         adr0020_phase: on_request
@@ -1110,8 +1100,9 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:975
     odata:
       status: supported
-      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9); also PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref
-        replacing the whole collection (T-3441 W20)
+      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9, T-3441 W10); an Attribute the
+        Entity does not hold is 404, a merge of the Entity adds it; the full collection of a $ref is append_attributes
+        (W20, T-3509)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1322,7 +1313,7 @@ operations:
       gate_site: crates/antares-api/src/batch.rs:747
     odata:
       status: not_offered
-      binding: OData $batch members map to the single-Entity rows, each its own gate (T-3441 W24)
+      binding: OData $batch members run as the single-Entity rows, each its own operation and gate (T-3509 W24); no batch operation
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1781,7 +1772,7 @@ operations:
       gate_site: crates/antares-api/src/batch.rs:1252
     odata:
       status: not_offered
-      binding: OData $batch members map to the single-Entity rows, each its own gate (T-3441 W24)
+      binding: OData $batch members run as the single-Entity rows, each its own operation and gate (T-3509 W24); no batch operation
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -6308,12 +6299,12 @@ odata_without_ngsi_ld_operation:
         code: NotFound
         message: no entity with this key in the view
       checks:
-        adr0020_phase: none
+        adr0020_phase: on_request
         operation_fields: []
         filterable: false
         whole_tenant: false
         linked_entity_checks: []
-      note: refused before any gate or store access
+      note: answered by the Merge or Replace Entity the request is (W4, W6, T-3509), under its own gate; the store holds no Entity of that key in the view, so the answer is the 404 a hidden Entity gets and nothing is created
 - id: odata_derived_types
   odata_feature: derived type cast segments
   odata_section: URL 4.11

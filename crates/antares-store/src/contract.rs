@@ -202,6 +202,38 @@ pub async fn run_current_state_contract(
     assert!(batch[1].is_none(), "an absent id answers None, in place");
     assert!(batch[2].is_some(), "results align with ids: {ids:?}");
 
+    // A member whose closure refuses commits nothing while the others
+    // commit: a batch write conditioned on each stored Entity (gap G12)
+    // refuses member by member, and a refused member stays as it was.
+    let pair = vec![e1.clone(), e2.clone()];
+    let judged = d
+        .batch_mutate::<&'static str>(a, &pair, |id, v| {
+            v["judged"] = json!(true);
+            if id == e2.as_str() {
+                Err("refused")
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .expect("batch_mutate");
+    assert_eq!(
+        judged,
+        vec![Some(Ok(())), Some(Err("refused"))],
+        "each member's own answer, in place"
+    );
+    let accepted = d.get(a, Kind::Entity, &e1).await.expect("get");
+    assert_eq!(
+        accepted.expect("row")["judged"],
+        json!(true),
+        "an accepted member commits"
+    );
+    let refused = d.get(a, Kind::Entity, &e2).await.expect("get");
+    assert!(
+        refused.expect("row").get("judged").is_none(),
+        "a refused member must commit nothing"
+    );
+
     // A query may over-return (the caller re-checks whatever the backend
     // could not decide) but must never drop a matching row, and must never
     // cross a tenant.

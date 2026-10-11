@@ -53,6 +53,8 @@ antares-ops = { workspace = true, optional = true }
 antares-views = { workspace = true, optional = true }
 antares-mcp = { workspace = true, optional = true }
 antares-linkml = { workspace = true, optional = true }
+antares-odata = { workspace = true, optional = true }
+antares-ws = { workspace = true, optional = true }
 
 [features]
 # tokio-console in dev — build with RUSTFLAGS="--cfg tokio_unstable"
@@ -86,6 +88,17 @@ mcp = ["views", "dep:antares-mcp"]
 # the view's schema narrowed to what the caller may see
 # (`ANTARES_API_SURFACES=admin,views,linkml`).
 linkml = ["views", "dep:antares-linkml"]
+
+# The OData surface of a view (ADR-0024, T-3508): `/x/views/{view}/odata/v4`,
+# its $metadata from the Tenant's LinkML schema (`/q/schemas/{tenant}`)
+# intersected with the view (`ANTARES_API_SURFACES=admin,views,odata`).
+odata = ["views", "dep:antares-odata"]
+
+# The WebSocket notification channel (ADR-0026, T-3517): `/x/ws/ngsi-ld/v1`
+# (`ANTARES_API_SURFACES=...,ws`), and with `views` also
+# `/x/views/{view}/ws` (`ws-views`); its sink serves `urn:antares:ws:`.
+ws = ["dep:antares-ops", "dep:antares-ws"]
+
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
 # Unix-only: the wasm target keeps the default allocator.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]

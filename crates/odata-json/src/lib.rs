@@ -29,7 +29,7 @@
 //! let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![city] };
 //!
 //! let version = negotiate_version(None, Some("4.01")).map_err(|e| e.to_string())?;
-//! let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version };
+//! let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version, metadata_etag: None };
 //! let buildings = Resource::new(&model, "Buildings").ok_or("no set")?;
 //! let created = read_entity_body(&ctx, &buildings, WriteKind::Create, br#"{"id":"b1"}"#, &BodyLimits::strict())
 //!     .map_err(|e| e.to_string())?;

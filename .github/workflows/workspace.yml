@@ -246,6 +246,12 @@ jobs:
       # broken (an empty column reads as "nothing happened") — check them here.
       - name: ETSI sampling self-check
         run: python3 dev/etsi-selftest.py
+      # The external-suites harness (T-3549): its comparator and adapters
+      # decide verdicts, and a wrong one reads as a plausible pass.
+      - name: External-suites harness self-check
+        run: |
+          python3 -m unittest discover -s tests/external/coraine
+          python3 -m unittest discover -s tests/external/etsi
       # Same failure shape one layer over: the merged coverage table counts
       # functions from lcov FN records, and a wrong key there prints a
       # plausible percentage rather than an error.
@@ -255,7 +261,7 @@ jobs:
       # drops out of every count — make that (and status typos, robot drift)
       # a red build instead.
       - name: conformance ledger check
-        run: pip install --quiet pyyaml && python3 dev/spec.py check
+        run: pip install --quiet pyyaml && python3 dev/spec.py check && python3 dev/spec_test.py
 
       - name: Env-var docs check
         run: ./dev/check-env-docs.sh
@@ -312,6 +318,12 @@ jobs:
         run: |
           python3 dev/threat-tests.py --self-test
           python3 dev/threat-tests.py
+      # Security invariants as code-graph queries (T-3587): dev/security.cypher
+      # against ci/cg-allowlist.txt. cg is owner tooling a runner cannot
+      # install yet, so CI runs the checker's self-test; the graph run itself
+      # is `dev/cg-invariants.py` after `cg build`, before every hand merge.
+      - name: cg invariants checker
+        run: python3 dev/cg-invariants.py --selftest
       # SQL-injection guard: dynamically assembled SQL (AssertSqlSafe, or an
       # sqlx query built with format!) belongs to the antares-sql backend
       # source and nowhere else. Everything a request supplies reaches the

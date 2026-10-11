@@ -208,11 +208,54 @@ fn denied_entry(id: Option<&str>, why: &str) -> Value {
 
 /// The reason a batch is refused whole: every member was refused, so the
 /// answer is the 403 a single refusal gives, carrying the first reason.
-fn whole_refusal(refused: &[Option<String>]) -> Option<String> {
-    if refused.iter().all(Option::is_some) {
-        refused.first().cloned().flatten()
+fn whole_refusal(refused: &[Result<crate::policy::Filter, String>]) -> Option<String> {
+    if refused.iter().all(Result::is_err) {
+        refused.first().and_then(|r| r.clone().err())
     } else {
         None
+    }
+}
+
+/// The conditions the engine set on the allowed members (gap G12), by id.
+/// One id named by several members holds to every condition any of them
+/// carries: a round writes each id once, so the strictest reading is the
+/// one that never applies a member's write past its own condition.
+#[derive(Default)]
+struct Conditions(HashMap<String, Vec<crate::policy::Condition>>);
+
+impl Conditions {
+    fn add(&mut self, id: Option<&str>, granted: &crate::policy::Filter) {
+        if let (Some(id), Some(c)) = (id, crate::policy::Condition::of(granted)) {
+            self.0.entry(id.to_owned()).or_default().push(c);
+        }
+    }
+
+    fn holds(&self, id: &str, doc: &Value) -> bool {
+        self.0
+            .get(id)
+            .is_none_or(|cs| cs.iter().all(|c| c.holds(doc)))
+    }
+
+    /// Inside the store closure: a member whose stored Entity a condition
+    /// does not select is not found, as an absent one is.
+    fn pre(&self, id: &str, doc: &Value) -> Result<(), NgsiError> {
+        if self.holds(id, doc) {
+            Ok(())
+        } else {
+            Err(NgsiError::ResourceNotFound(format!(
+                "entity {id} not found"
+            )))
+        }
+    }
+
+    fn unforwarded(&self, forwards: bool) -> Result<(), crate::policy::Denied> {
+        if forwards && !self.0.is_empty() {
+            Err(crate::policy::Denied(
+                crate::policy::CONDITION_NOT_FORWARDED.to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -246,6 +289,100 @@ async fn view_guards(
         }
     }
     (kept, guards)
+}
+
+/// One round of a Batch Upsert under a view, member by member (ADR-0023
+/// rule 7, T-3594): a stored Entity the view shows is replaced, or with
+/// `options=update` updated, under the store's lock between the pre-image
+/// and post-image checks; a replace counts every Attribute the Entity holds
+/// as written, so one holding a hidden Attribute is refused (D6). An absent
+/// id, and one out of the view, take the create path: the Entity is created
+/// in the view or refused, and an out-of-view one is never overwritten,
+/// answering as Create Entity through the view does for a taken id. The ids
+/// created, in order.
+#[cfg(feature = "views")]
+async fn upsert_in_view(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    round: Vec<(String, Value)>,
+    update_mode: bool,
+    ts: &str,
+    out: &mut BatchOutcome,
+) -> Result<Vec<String>, NgsiError> {
+    let (round, guards) = view_guards(st, tenant, round, out).await;
+    let ids: Vec<String> = round.iter().map(|(id, _)| id.clone()).collect();
+    let docs: HashMap<&str, &Value> = round.iter().map(|(id, d)| (id.as_str(), d)).collect();
+    let res = st
+        .store
+        .batch_mutate(tenant, &ids, |id, doc| {
+            let guard = guards.get(id);
+            if let Some(g) = guard {
+                if update_mode {
+                    g.pre(id, doc)?;
+                } else {
+                    g.pre_whole(id, doc)?;
+                }
+            }
+            if update_mode {
+                merge_into(doc, docs[id], ts);
+            } else {
+                let mut new = docs[id].clone();
+                stamp_new(&mut new, ts);
+                // 4.8: a replaced Entity keeps the instant it was created.
+                if let (Some(o), Some(created)) = (new.as_object_mut(), doc.get("createdAt")) {
+                    o.insert("createdAt".into(), created.clone());
+                }
+                *doc = new;
+            }
+            if let Some(g) = guard {
+                g.post(doc)?;
+            }
+            Ok::<(), NgsiError>(())
+        })
+        .await?;
+    let mut creates = Vec::new();
+    for ((id, doc), r) in round.into_iter().zip(res) {
+        if let Some(crate::policy::Denied(why)) = guards.get(&id).and_then(|g| g.verdict().err()) {
+            out.errors.push(denied_entry(Some(&id), &why));
+            continue;
+        }
+        match r {
+            Some(Ok(())) => {
+                if !out.success.contains(&Value::String(id.clone())) {
+                    out.success.push(Value::String(id));
+                }
+            }
+            // absent, or out of the view: the pre-image answers not found
+            None | Some(Err(NgsiError::ResourceNotFound(_))) => creates.push((id, doc)),
+            Some(Err(e)) => out.errors.push(err_entry(Some(&id), &e)),
+        }
+    }
+    let mut kept = Vec::with_capacity(creates.len());
+    for (id, mut doc) in creates {
+        match crate::views::admits_new(st, tenant, &doc).await {
+            Ok(()) => {
+                stamp_new(&mut doc, ts);
+                kept.push((id, doc));
+            }
+            Err(crate::policy::Denied(why)) => out.errors.push(denied_entry(Some(&id), &why)),
+        }
+    }
+    let mut created = Vec::new();
+    if kept.is_empty() {
+        return Ok(created);
+    }
+    let ids: Vec<String> = kept.iter().map(|(id, _)| id.clone()).collect();
+    let flags = st.store.batch_create(tenant, kept).await?;
+    for (id, ok) in ids.into_iter().zip(flags) {
+        if !ok {
+            let e = NgsiError::AlreadyExists(format!("entity {id} already exists"));
+            out.errors.push(err_entry(Some(&id), &e));
+        } else if !out.success.contains(&Value::String(id.clone())) {
+            out.success.push(Value::String(id.clone()));
+            created.push(id);
+        }
+    }
+    Ok(created)
 }
 
 fn err_entry(id: Option<&str>, e: &NgsiError) -> Value {
@@ -737,15 +874,16 @@ async fn batch_write(
     // problem and the rest are applied (207); a batch refused whole is the
     // 403 it always was. An entry that does not expand is shown by its id
     // alone and left to the local arm to report.
-    // ADR-0023 rule 7 under an endpoint view: Batch Upsert is refused whole
-    // as `gate!` refuses a narrowed write; the others are decided per member
-    // on the stored Entities below.
+    // ADR-0023 rule 7 under an endpoint view: every batch write is decided
+    // per member on the stored Entities below; an engine narrowing still
+    // refuses it whole, as `gate!` refuses a narrowed write.
     #[cfg(feature = "views")]
     crate::views::with_view(
         st.view.as_deref(),
         mode.clause(),
         Ok(crate::policy::Filter::default()),
     )?;
+    let mut conds = Conditions::default();
     if let Some(engine) = &st.policy {
         let mut shown: Vec<(Option<String>, crate::policy::PreImage, Option<Value>)> = Vec::new();
         for (item, ctx) in &items {
@@ -801,11 +939,15 @@ async fn batch_write(
         }
         let mut verdicts = refused.into_iter().zip(shown);
         items.retain(|_| match verdicts.next() {
-            Some((Some(why), (id, _, _))) => {
+            Some((Err(why), (id, _, _))) => {
                 out.errors.push(denied_entry(id.as_deref(), &why));
                 false
             }
-            _ => true,
+            Some((Ok(granted), (id, _, _))) => {
+                conds.add(id.as_deref(), &granted);
+                true
+            }
+            None => true,
         });
     }
     let (spec, fwd_items) = batch_spec(&items);
@@ -816,6 +958,7 @@ async fn batch_write(
             crate::federation::WritePlan::Answered(r) => return Ok(*r),
             crate::federation::WritePlan::Forward(regs) => regs,
         };
+    conds.unforwarded(!fed_regs.is_empty())?;
     let mut created_ids: Vec<String> = vec![];
     let mut any_created = false;
     let proxies: Vec<&crate::federation::FedReg> =
@@ -928,6 +1071,17 @@ async fn batch_write(
                 }
             }
             BatchMode::Upsert => {
+                #[cfg(feature = "views")]
+                if st.view.is_some() {
+                    for id in upsert_in_view(st, &tenant, round, update_mode, &ts, &mut out).await?
+                    {
+                        any_created = true;
+                        if !created_ids.contains(&id) {
+                            created_ids.push(id);
+                        }
+                    }
+                    continue;
+                }
                 // options=update: merge into existing rows first; ids that
                 // turn out absent (or vanish mid-flight) fall through to the
                 // replace batch — never a silent success (TOCTOU fix).
@@ -992,6 +1146,7 @@ async fn batch_write(
                 let res = st
                     .store
                     .batch_mutate(&tenant, &ids, |id, doc| {
+                        conds.pre(id, doc)?;
                         #[cfg(feature = "views")]
                         let guard = guards.get(id);
                         #[cfg(feature = "views")]
@@ -1308,6 +1463,7 @@ pub async fn batch_delete(
         // sits behind the parse the way the single-Entity delete sits behind
         // its path parameter. A refused id lands in E, the rest are deleted.
         let mut ids: Vec<&Value> = ids.iter().collect();
+        let mut conds = Conditions::default();
         #[cfg(feature = "views")]
         crate::views::with_view(
             st.view.as_deref(),
@@ -1342,10 +1498,14 @@ pub async fn batch_delete(
                 return Err(crate::policy::Denied(why).into());
             }
             let mut verdicts = refused.into_iter();
-            ids.retain(|id| match verdicts.next().flatten() {
-                Some(why) => {
+            ids.retain(|id| match verdicts.next() {
+                Some(Err(why)) => {
                     out.errors.push(denied_entry(id.as_str(), &why));
                     false
+                }
+                Some(Ok(granted)) => {
+                    conds.add(id.as_str(), &granted);
+                    true
                 }
                 None => true,
             });
@@ -1372,6 +1532,7 @@ pub async fn batch_delete(
             crate::federation::WritePlan::Answered(r) => return Ok(*r),
             crate::federation::WritePlan::Forward(regs) => regs,
         };
+        conds.unforwarded(!regs.is_empty())?;
         // One multi-row DELETE for the whole batch; flags in input order.
         let id_strs: Vec<String> = ids
             .iter()
@@ -1379,26 +1540,32 @@ pub async fn batch_delete(
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect();
-        // Under an endpoint view each delete reads its Entity under the lock
-        // and leaves one out of the view, which then answers as absent
-        // (ADR-0023 rule 7).
+        // Under an endpoint view or an engine's condition each delete reads
+        // its Entity under the lock and leaves one out of the view, or one
+        // the condition does not select, which then answers as absent
+        // (ADR-0023 rule 7, gap G12).
         #[cfg(feature = "views")]
-        let flags = match crate::views::WriteGuard::of(&st, std::iter::empty()) {
-            Some(g) => {
-                let mut flags = Vec::with_capacity(id_strs.len());
-                for id in &id_strs {
-                    flags.push(
-                        st.store
-                            .delete_entity_if(&tenant, id, &|d| g.sees(d))
-                            .await?,
-                    );
-                }
-                flags
-            }
-            None => st.store.batch_delete(&tenant, &id_strs).await?,
-        };
+        let guard = crate::views::WriteGuard::of(&st, std::iter::empty());
+        #[cfg(feature = "views")]
+        let judged = guard.is_some() || !conds.0.is_empty();
         #[cfg(not(feature = "views"))]
-        let flags = st.store.batch_delete(&tenant, &id_strs).await?;
+        let judged = !conds.0.is_empty();
+        let flags = if judged {
+            let mut flags = Vec::with_capacity(id_strs.len());
+            for id in &id_strs {
+                let keep = |d: &Value| {
+                    #[cfg(feature = "views")]
+                    if guard.as_ref().is_some_and(|g| !g.sees(d)) {
+                        return false;
+                    }
+                    conds.holds(id, d)
+                };
+                flags.push(st.store.delete_entity_if(&tenant, id, &keep).await?);
+            }
+            flags
+        } else {
+            st.store.batch_delete(&tenant, &id_strs).await?
+        };
         let mut flags = flags.into_iter();
         let mut local_ok: std::collections::HashSet<String> = Default::default();
         let mut local_miss: Vec<String> = Vec::new();
@@ -1745,7 +1912,7 @@ async fn batch_query_inner(
             resp.headers_mut().insert("NGSILD-Results-Count", v);
         }
     }
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 
