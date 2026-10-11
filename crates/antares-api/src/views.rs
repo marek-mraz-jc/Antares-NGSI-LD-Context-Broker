@@ -390,6 +390,10 @@ pub const VIEW_TENANT: &str = "antares-views";
 /// (ADR-0020 amendment), one document per Tenant, keyed by its name.
 pub const POLICY_TENANT: &str = "antares-policy";
 
+/// The reserved tenant the export grants of internal context sources live
+/// under (ADR-0025 rule 5), one document per (target, source) pair.
+pub const GRANT_TENANT: &str = "antares-grants";
+
 /// What a surface crate attached to a loaded view, opaque to the broker.
 #[derive(Clone)]
 pub struct Attached(pub Arc<dyn std::any::Any + Send + Sync>);
@@ -438,6 +442,8 @@ pub struct ViewTable {
     /// (threat V26): pods over one store report the same value.
     revision: std::sync::atomic::AtomicU64,
     admin: std::sync::OnceLock<axum::Router>,
+    /// Admin routes of other broker modules, merged beside the views'.
+    more_admin: std::sync::Mutex<Vec<axum::Router>>,
     policy: std::sync::RwLock<serde_json::Value>,
     schemas: std::sync::RwLock<Arc<BTreeMap<String, Schema>>>,
 }
@@ -608,9 +614,32 @@ impl ViewTable {
             .map_err(|_| "the /q/views routes are set already".to_owned())
     }
 
-    /// The `/q/views` routes, if a loader set them.
+    /// Add `routes` to the admin surface beside `/q/views` (relative to
+    /// `/q`, behind the same credential). Before the router is built: it
+    /// reads them once, when it mounts.
+    pub fn add_admin(&self, routes: axum::Router) {
+        self.more_admin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(routes);
+    }
+
+    /// The `/q/views` routes, if a loader set them, with every module's
+    /// [`Self::add_admin`] routes.
     pub fn admin(&self) -> Option<axum::Router> {
-        self.admin.get().cloned()
+        let more = self
+            .more_admin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let first = self.admin.get().cloned();
+        if first.is_none() && more.is_empty() {
+            return None;
+        }
+        Some(
+            more.into_iter()
+                .fold(first.unwrap_or_default(), axum::Router::merge),
+        )
     }
 }
 

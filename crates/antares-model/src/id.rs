@@ -24,8 +24,12 @@ impl TenantId {
     /// rule 10) are fixed names.
     pub const RESERVED_PREFIXES: &'static [&'static str] = &["snap-"];
     /// The reserved names that are not a prefix family.
-    pub const RESERVED_EXACT: &'static [&'static str] =
-        &["distsub-index", "antares-views", "antares-policy"];
+    pub const RESERVED_EXACT: &'static [&'static str] = &[
+        "distsub-index",
+        "antares-views",
+        "antares-policy",
+        "antares-grants",
+    ];
 
     /// Whether `raw` names one of the broker's own tenants.
     ///

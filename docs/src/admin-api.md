@@ -284,6 +284,33 @@ an unknown tenant, the engine's denial) comes back as the API gave it. No
 view root reaches this route: a view serves only the operations of the
 matrix.
 
+## Export grants
+
+Only in a broker built with the `internal-csr` feature and started with
+`ANTARES_SELF_URLS` set (ADR-0025 rule 5): a Tenant's consent to another
+Tenant's registrations reading it in process. See
+[Internal context sources](internal-context-sources.md) for what a grant
+allows; bound: 4 KiB per document.
+
+### GET /q/grants
+
+Every stored grant.
+
+### GET /q/grants/{target}/{source}
+
+The grant `target` holds for `source`, or `404`.
+
+### PUT /q/grants/{target}/{source}
+
+`{"target", "source", "access"?, "view"?}`: `201` created, `204` replaced;
+`400` when the document is no grant, names a Tenant no client can, or names
+another pair than the path (nothing is stored).
+
+### DELETE /q/grants/{target}/{source}
+
+`204`, or `404` when there is no such grant. The next forward that needed it
+is not made.
+
 ## Policy rule documents
 
 Only in a broker built with the `views` feature and started with a policy
