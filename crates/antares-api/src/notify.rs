@@ -29,7 +29,10 @@ use std::sync::Arc;
 const DEFAULT_TRIGGERS: &[&str] = &["attributeCreated", "attributeUpdated"];
 /// Depth of the change→matcher queue, the same ring size the local bus uses.
 /// Held with the other published ceilings so `/q/health` reports it.
-use crate::bounds::{CHANGE_QUEUE, DELIVERY_WIDTH, DELIVERY_WIDTH_PER_TENANT};
+use crate::bounds::{CHANGE_QUEUE, DELIVERY_WIDTH};
+// the per-tenant slots of the native delivery pool (`tenant_slots`)
+#[cfg(not(target_arch = "wasm32"))]
+use crate::bounds::DELIVERY_WIDTH_PER_TENANT;
 static CHANGES_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TASK_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Hand a batch to the matcher queue: counted as pending on acceptance,
@@ -2791,7 +2794,9 @@ async fn retry_and_settle(
 }
 
 /// The dead-letter document: everything a replay needs to send the very
-/// same request again, plus the attempt history.
+/// same request again, plus the attempt history. Written by the native
+/// retry loop (`retry_and_settle`) alone.
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)] // one param per stored letter member
 fn dead_letter(
     sub_id: &str,

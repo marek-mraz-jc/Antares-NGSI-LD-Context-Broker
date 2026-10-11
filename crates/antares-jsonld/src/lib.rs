@@ -22,7 +22,8 @@ pub mod compact;
 pub mod context;
 pub mod expand;
 pub mod loader;
-#[cfg(target_arch = "wasm32")]
+// compiled for the native tests too, so its bounds are tested where CI runs
+#[cfg(any(test, target_arch = "wasm32"))]
 pub(crate) mod minicache;
 
 pub use compact::{compact_entity, compact_entity_shallow, compact_types};
