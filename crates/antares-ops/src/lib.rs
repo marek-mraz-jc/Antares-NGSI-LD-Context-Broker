@@ -126,15 +126,19 @@ pub struct ViewOps {
 /// each may show, as IRIs (ADR-0023 rule 5): made by [`ViewOps::visible`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Visible {
-    /// Each rule's types and the Attributes it shows, `pick` and `omit`
-    /// applied: an Attribute is shown when a rule of its type shows it.
-    rules: Vec<(BTreeSet<String>, BTreeSet<String>)>,
+    /// Each rule's types and the Attributes it shows; `None` for an
+    /// engine's grant over the whole Entity (`Rule::every_attribute`), which
+    /// shows every Attribute of its types.
+    rules: Vec<(BTreeSet<String>, Option<BTreeSet<String>>)>,
+    /// The filter's `pick` (empty keeps every name) and `omit`, applied to
+    /// every rule.
+    pick: BTreeSet<String>,
+    omit: BTreeSet<String>,
     /// Attributes removed per type, on top of the rules.
     omit_by_type: BTreeMap<String, BTreeSet<String>>,
     /// A filter without rules narrows by none (a `*` view, ADR-0023 rule
-    /// 12): every type, and every Attribute its `pick` keeps and its `omit`
-    /// does not remove, as those two sets.
-    every: Option<(BTreeSet<String>, BTreeSet<String>)>,
+    /// 12): every type and every Attribute, less `pick` and `omit`.
+    every: bool,
 }
 
 impl Visible {
@@ -147,7 +151,7 @@ impl Visible {
     #[must_use]
     pub fn shows_type(&self, name: &str) -> bool {
         let ty = expand(name);
-        self.every.is_some() || self.rules.iter().any(|(types, _)| types.contains(&ty))
+        self.every || self.rules.iter().any(|(types, _)| types.contains(&ty))
     }
 
     /// Whether an Entity of type `ty` may show Attribute `attr`.
@@ -158,23 +162,24 @@ impl Visible {
     #[must_use]
     pub fn shows_attribute(&self, ty: &str, attr: &str) -> bool {
         let (ty, attr) = (expand(ty), expand(attr));
-        !self
-            .omit_by_type
-            .get(&ty)
-            .is_some_and(|gone| gone.contains(&attr))
-            && (self.every.as_ref().is_some_and(|(pick, omit)| {
-                (pick.is_empty() || pick.contains(&attr)) && !omit.contains(&attr)
-            }) || self
-                .rules
-                .iter()
-                .any(|(types, attrs)| types.contains(&ty) && attrs.contains(&attr)))
+        let kept = (self.pick.is_empty() || self.pick.contains(&attr))
+            && !self.omit.contains(&attr)
+            && !self
+                .omit_by_type
+                .get(&ty)
+                .is_some_and(|gone| gone.contains(&attr));
+        kept && (self.every
+            || self.rules.iter().any(|(types, attrs)| {
+                types.contains(&ty) && attrs.as_ref().is_none_or(|a| a.contains(&attr))
+            }))
     }
 
-    /// What `filter`'s rules show: each rule's types with its Attributes,
-    /// less what `pick` leaves out and `omit` and `omit_by_type` remove; a
-    /// filter without rules shows every type and Attribute, less the same.
-    /// A rule's condition is not read: it decides which Entities show the
-    /// Attributes, not which Attributes there are.
+    /// What `filter`'s rules show: each rule's types with its Attributes
+    /// (every one for a rule over the whole Entity), less what `pick` leaves
+    /// out and `omit` and `omit_by_type` remove; a filter without rules
+    /// shows every type and Attribute, less the same. A rule's condition is
+    /// not read: it decides which Entities show the Attributes, not which
+    /// Attributes there are.
     ///
     /// ```
     /// use antares_ops::policy::{Filter, Rule};
@@ -194,26 +199,24 @@ impl Visible {
     pub fn from_filter(filter: &policy::Filter) -> Self {
         let set =
             |names: &[String]| -> BTreeSet<String> { names.iter().map(|n| expand(n)).collect() };
-        let (pick, omit) = (set(&filter.pick), set(&filter.omit));
         let rules = filter
             .rules
             .iter()
             .map(|rule| {
-                let mut attrs = set(&rule.attributes);
-                attrs.retain(|a| (pick.is_empty() || pick.contains(a)) && !omit.contains(a));
+                let attrs = (!rule.every_attribute).then(|| set(&rule.attributes));
                 (set(&rule.types), attrs)
             })
             .collect();
-        let omit_by_type = filter
-            .omit_by_type
-            .iter()
-            .map(|(t, attrs)| (expand(t), set(attrs)))
-            .collect();
-        let every = filter.rules.is_empty().then_some((pick, omit));
         Self {
             rules,
-            omit_by_type,
-            every,
+            pick: set(&filter.pick),
+            omit: set(&filter.omit),
+            omit_by_type: filter
+                .omit_by_type
+                .iter()
+                .map(|(t, attrs)| (expand(t), set(attrs)))
+                .collect(),
+            every: filter.rules.is_empty(),
         }
     }
 }
@@ -1168,6 +1171,59 @@ mod tests {
             [true, false, false, false]
         );
         assert!(!Visible::default().shows_type(&iri("Car")));
+    }
+
+    /// T-3798: an engine's grant over the whole Entity (`every_attribute`,
+    /// ADR-0023 rule 11 as amended by T-3637) shows every Attribute of its
+    /// types, less `pick`, `omit` and `omit_by_type`, and none of a type no
+    /// rule names.
+    #[test]
+    fn a_rule_over_the_whole_entity_shows_every_attribute_of_its_types() {
+        let iri = |n: &str| format!("https://e.org/{n}");
+        let whole = |types: &[&str]| policy::Rule {
+            types: types.iter().map(|t| iri(t)).collect(),
+            every_attribute: true,
+            ..policy::Rule::default()
+        };
+        let open = Visible::from_filter(&policy::Filter {
+            rules: vec![whole(&["Car"])],
+            ..policy::Filter::default()
+        });
+        assert_eq!(
+            [
+                open.shows_type(&iri("Car")),
+                open.shows_attribute(&iri("Car"), &iri("speed")),
+                open.shows_type(&iri("Bus")),
+                open.shows_attribute(&iri("Bus"), &iri("speed")),
+            ],
+            [true, true, false, false]
+        );
+        let narrowed = Visible::from_filter(&policy::Filter {
+            rules: vec![
+                whole(&["Car", "Bus"]),
+                policy::Rule {
+                    types: vec![iri("Tram")],
+                    attributes: vec![iri("speed")],
+                    ..policy::Rule::default()
+                },
+            ],
+            pick: vec![iri("speed"), iri("vin"), iri("colour")],
+            omit: vec![iri("vin")],
+            omit_by_type: BTreeMap::from([(iri("Bus"), vec![iri("colour")])]),
+            ..policy::Filter::default()
+        });
+        assert_eq!(
+            [
+                narrowed.shows_attribute(&iri("Car"), &iri("speed")),
+                narrowed.shows_attribute(&iri("Car"), &iri("colour")),
+                narrowed.shows_attribute(&iri("Car"), &iri("vin")),
+                narrowed.shows_attribute(&iri("Car"), &iri("owner")),
+                narrowed.shows_attribute(&iri("Bus"), &iri("colour")),
+                narrowed.shows_attribute(&iri("Tram"), &iri("colour")),
+                narrowed.shows_type(&iri("Truck")),
+            ],
+            [true, true, false, false, false, false, false]
+        );
     }
 
     #[test]
