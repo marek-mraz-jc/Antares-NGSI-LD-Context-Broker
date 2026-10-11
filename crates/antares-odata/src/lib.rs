@@ -105,7 +105,10 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
     let (mut parts, body) = respond(ops, req).await.into_parts();
     // The body is the surface's own, built in memory: reading it does not
     // fail, and if it ever did the answer would carry no length.
+    // `extend` appends: the `GET`'s own length goes first, or hyper sees
+    // two and drops the answer.
     let read = axum::body::to_bytes(body, usize::MAX).await.ok();
+    parts.headers.remove(CONTENT_LENGTH);
     parts
         .headers
         .extend(read.map(|bytes| (CONTENT_LENGTH, bytes.len().into())));

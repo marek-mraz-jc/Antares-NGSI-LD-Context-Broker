@@ -281,6 +281,12 @@ async fn head_is_the_get_without_its_body() {
         let (head, head_headers, empty) = fetch(&app, Method::HEAD, &uri).await;
         assert_eq!(head, got, "{path}");
         assert!(empty.is_empty(), "{path}: {empty:?}");
+        // one length: two make hyper drop the answer (T-3733 regression)
+        assert_eq!(
+            head_headers.get_all("content-length").iter().count(),
+            1,
+            "{path}: {head_headers:?}"
+        );
         assert_eq!(
             head_headers
                 .get("content-length")
