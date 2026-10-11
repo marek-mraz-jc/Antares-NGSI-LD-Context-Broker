@@ -32,6 +32,15 @@
 //!   tool is called (a write asked and confirmed) and asks the engine
 //!   with its row's gate clause once, after the one probe that keeps a
 //!   hidden tool unknown (MC3). A tool added without a row is red.
+//! - In a `ws` build, the WebSocket column (T-3696): every `x-op` the
+//!   envelope of `antares-ws` reads is the binding of a `supported`
+//!   websocket cell or a `session_messages` entry, and back. Over a real
+//!   socket on the Tenant root and view `all`, each op asks the engine
+//!   with its row's gate clause once (plus Retrieve Subscription where the
+//!   binding says it answers with the stored Subscription), a change is
+//!   pushed as a notification asking nothing more, and through view
+//!   `restricted` (reads only), an unknown `x-op` and `x-resume` are
+//!   refused before the engine.
 #![cfg(feature = "views")]
 
 use antares_api::policy::{
@@ -342,6 +351,32 @@ fn mcp() -> Option<Box<dyn antares_api::ApiSurface>> {
     None
 }
 
+/// The WebSocket surfaces, Tenant root and view, in a build that has them.
+#[cfg(feature = "ws")]
+fn ws() -> Vec<Box<dyn antares_api::ApiSurface>> {
+    vec![
+        antares_ops::mount(antares_ws::Ws::process()),
+        antares_ops::mount(antares_ws::ViewWs::process()),
+    ]
+}
+
+#[cfg(not(feature = "ws"))]
+fn ws() -> Vec<Box<dyn antares_api::ApiSurface>> {
+    Vec::new()
+}
+
+/// The WebSocket notification sink, registered before `wire` and the
+/// views share the sink registry (as `main.rs` does).
+#[cfg(feature = "ws")]
+fn ws_sink(state: AppState) -> AppState {
+    state.with_sink(Box::new(antares_ws::Sink::new(antares_ws::Hub::process())))
+}
+
+#[cfg(not(feature = "ws"))]
+fn ws_sink(state: AppState) -> AppState {
+    state
+}
+
 /// A `views` build's surfaces over the built-in store, asking `engine`,
 /// with views `all` and `restricted` loaded, and Vehicle `matrix:1`
 /// (speed and the hidden Attribute) in the views' Tenant.
@@ -351,7 +386,7 @@ async fn broker(engine: Clauses, writes: &HashSet<String>) -> (Router, antares_o
         // without a size limit.
         std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
     }
-    let mut state = AppState::new("matrix".into());
+    let mut state = ws_sink(AppState::new("matrix".into()));
     antares_api::wire(&mut state).await;
     let mut surfaces: Vec<Box<dyn antares_api::ApiSurface>> = vec![
         Box::new(antares_api::Admin),
@@ -359,6 +394,7 @@ async fn broker(engine: Clauses, writes: &HashSet<String>) -> (Router, antares_o
     ];
     surfaces.extend(odata());
     surfaces.extend(mcp());
+    surfaces.extend(ws());
     let state = state
         .with_policy(Arc::new(engine))
         .with_surfaces(surfaces)
@@ -1002,4 +1038,257 @@ async fn mcp_call(
         );
     }
     mcp_rpc(app, view, "tools/call", params).await
+}
+
+/// The `websocket:` status and binding of every row: `(id, status, binding)`.
+#[cfg(feature = "ws")]
+fn ws_cells(text: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let mut row = String::new();
+    let mut status = None;
+    let mut inside = false;
+    let mut binding: Option<String> = None;
+    let mut flush = |row: &str, status: &mut Option<String>, binding: &mut Option<String>| {
+        if let Some(b) = binding.take() {
+            let s = status.take().unwrap_or_default();
+            out.push((row.to_owned(), s, b.trim().trim_matches('\'').to_owned()));
+        }
+    };
+    for l in section(text, "operations") {
+        if let Some(b) = binding.as_mut().filter(|_| l.starts_with("        ")) {
+            // a folded binding continues on the deeper lines
+            b.push(' ');
+            b.push_str(l.trim());
+            continue;
+        }
+        flush(&row, &mut status, &mut binding);
+        if let Some(id) = l.strip_prefix("- id: ") {
+            row = id.trim().to_owned();
+            inside = false;
+        } else if l == "    websocket:" {
+            inside = true;
+        } else if let Some(st) = l.strip_prefix("      status: ").filter(|_| inside) {
+            status = Some(st.trim().to_owned());
+        } else if let Some(b) = l.strip_prefix("      binding: ").filter(|_| inside) {
+            binding = Some(b.to_owned());
+            inside = false;
+        }
+    }
+    flush(&row, &mut status, &mut binding);
+    out
+}
+
+/// The `x-op` names under `surfaces.websocket.session_messages`.
+#[cfg(feature = "ws")]
+fn session_messages(text: &str) -> Vec<String> {
+    section(text, "surfaces")
+        .skip_while(|l| *l != "  websocket:")
+        .skip_while(|l| *l != "    session_messages:")
+        .skip(1)
+        .take_while(|l| l.starts_with("      "))
+        .filter_map(|l| l.strip_prefix("      ")?.split_once(':'))
+        .filter(|(k, _)| !k.starts_with(' '))
+        .map(|(k, _)| k.to_owned())
+        .collect()
+}
+
+/// The `x-op` names the `antares-ws` envelope reads: the renames of its
+/// `OpName`, from the source, so an op added there without a row is red.
+#[cfg(feature = "ws")]
+fn served_ops() -> std::collections::BTreeSet<String> {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../antares-ws/src/envelope.rs"
+    ))
+    .expect("the envelope source");
+    let start = src.find("enum OpName {").expect("enum OpName");
+    let body = &src[start..];
+    let body = &body[..body.find("\n}").expect("the end of OpName")];
+    body.split("rename = \"")
+        .skip(1)
+        .filter_map(|r| r.split_once('"').map(|(name, _)| name.to_owned()))
+        .collect()
+}
+
+/// The WebSocket column (T-3696).
+#[cfg(feature = "ws")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_websocket_column_is_served_as_the_matrix_states() {
+    use std::collections::BTreeSet;
+    #[path = "common/ws_client.rs"]
+    mod ws_client;
+    use ws_client::Socket;
+
+    let text = std::fs::read_to_string(MATRIX).expect("the operation matrix");
+    let cells = ws_cells(&text);
+    assert_eq!(
+        cells.len(),
+        OperationId::ALL.len(),
+        "a row without a websocket cell"
+    );
+    let supported: Vec<(String, String)> = cells
+        .into_iter()
+        .filter(|(_, status, _)| status == "supported")
+        .map(|(row, _, binding)| (row, binding))
+        .collect();
+    let session = session_messages(&text);
+    assert_eq!(session, ["x-resume"], "session_messages read");
+    let op_of = |binding: &str| binding.split(':').next().unwrap_or_default().to_owned();
+    let stated: BTreeSet<String> = supported
+        .iter()
+        .map(|(_, b)| op_of(b))
+        .filter(|op| op.starts_with("x-"))
+        .chain(session.iter().cloned())
+        .collect();
+    assert_eq!(
+        stated,
+        served_ops(),
+        "the envelope's x-ops and the matrix's websocket bindings differ"
+    );
+    let clause = |row: &str| {
+        OperationId::ALL
+            .iter()
+            .find(|op| op.id() == row)
+            .and_then(|op| op.gate_clause())
+    };
+    let retrieve = clause("retrieve_subscription").expect("5.8.3");
+    // each supported row: (x-op, the clauses it asks, in order)
+    let mut asks: Vec<(String, Vec<&'static str>)> = Vec::new();
+    let mut pushed = false;
+    for (row, binding) in &supported {
+        let op = op_of(binding);
+        if !op.starts_with("x-") {
+            assert!(
+                op == "server push" && clause(row).is_none(),
+                "{row}: a websocket binding is an x-op or the server push of a broker-initiated row"
+            );
+            pushed = true;
+            continue;
+        }
+        let mut c = vec![clause(row).unwrap_or_else(|| panic!("{row} has no gate clause"))];
+        if binding.contains("then Retrieve Subscription") {
+            c.push(retrieve);
+        }
+        asks.push((op, c));
+    }
+    assert!(pushed, "no row states the notification push");
+    let patch_clause = clause("update_attributes").expect("5.6.2");
+
+    let engine = Clauses::default();
+    let (app, _reload) = broker(engine.clone(), &writes(&text)).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let served = app.clone();
+    tokio::spawn(async move { axum::serve(listener, served).await });
+    let rt = tokio::runtime::Handle::current();
+
+    let failures = tokio::task::spawn_blocking(move || {
+        let mut wrong = Vec::new();
+        let message = |op: &str, sub: &str| match op {
+            "x-subscribe" => json!({"metadata": {"x-op": op, "x-id": op},
+                "body": {"type": "Subscription", "entities": [{"type": "Vehicle"}]}}),
+            "x-update" => json!({"metadata": {"x-op": op, "x-id": op, "x-subscription": sub},
+                "body": {"description": "matrix"}}),
+            "x-unsubscribe" => json!({"metadata": {"x-op": op, "x-id": op, "x-subscription": sub}}),
+            other => {
+                panic!("no message for {other}: the column sends every x-op the matrix states")
+            }
+        };
+        let open = |path: &str, tenant: Option<&str>| {
+            let mut ws = Socket::open(port, path, tenant).expect("the upgrade");
+            let welcome = ws.next().expect("the welcome");
+            assert_eq!(welcome.pointer("/metadata/x-op"), Some(&json!("x-welcome")));
+            engine.take();
+            ws
+        };
+        let status = |m: &Option<Value>| {
+            m.as_ref()
+                .and_then(|m| m.pointer("/metadata/x-status").cloned())
+        };
+        for (speed, path, tenant) in [
+            (2, "/x/ws/ngsi-ld/v1", Some(TENANT)),
+            (3, "/x/views/all/ws", None),
+        ] {
+            let mut ws = open(path, tenant);
+            let mut sub = String::from("urn:ngsi-ld:Subscription:none");
+            for (op, clauses) in &asks {
+                ws.send(&message(op, &sub)).expect("send");
+                let answer = ws.next();
+                let st = status(&answer).and_then(|s| s.as_u64()).unwrap_or(0);
+                if !(200..300).contains(&st) {
+                    wrong.push(format!("{path} {op}: {answer:?}"));
+                }
+                if op == "x-subscribe" {
+                    sub = answer
+                        .as_ref()
+                        .and_then(|a| a.pointer("/body/id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    // a change is pushed and asks nothing beyond its own gate
+                    let patch_body =
+                        json!({"speed": {"type": "Property", "value": speed}}).to_string();
+                    let patch = Request::builder()
+                        .method("PATCH")
+                        .uri(format!("{API}/entities/urn:ngsi-ld:Vehicle:matrix:1/attrs"))
+                        .header("NGSILD-Tenant", TENANT)
+                        .header("Content-Type", "application/json")
+                        .header("Content-Length", patch_body.len())
+                        .body(Body::from(patch_body))
+                        .expect("request");
+                    let (code, body) = rt.block_on(call(&app, patch));
+                    assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+                    let got = std::iter::from_fn(|| ws.next())
+                        .find(|m| m.pointer("/metadata/x-op") == Some(&json!("x-notification")));
+                    if got.is_none() {
+                        wrong.push(format!("{path}: no notification of the change"));
+                    }
+                    let seen = engine.take();
+                    if seen != [clauses.as_slice(), &[patch_clause]].concat() {
+                        wrong.push(format!("{path} {op} and the push asked {seen:?}"));
+                    }
+                    continue;
+                }
+                let seen = engine.take();
+                if seen != *clauses {
+                    wrong.push(format!(
+                        "{path} {op} asked {seen:?}, the matrix states {clauses:?}"
+                    ));
+                }
+            }
+        }
+        // refused before the engine: the writes through a read-only view,
+        // an x-op no row names, and x-resume of no connection
+        let mut ws = open("/x/views/restricted/ws", None);
+        for (op, _) in &asks {
+            ws.send(&message(op, "urn:ngsi-ld:Subscription:none"))
+                .expect("send");
+            let answer = ws.next();
+            let st = status(&answer).and_then(|s| s.as_u64()).unwrap_or(0);
+            let seen = engine.take();
+            if !(400..500).contains(&st) || !seen.is_empty() {
+                wrong.push(format!("restricted {op}: {answer:?}, asked {seen:?}"));
+            }
+        }
+        ws.send(&json!({"metadata": {"x-op": "x-query-entities", "x-id": "q"}}))
+            .expect("send");
+        let answer = ws.next();
+        if status(&answer) != Some(json!(400)) || !engine.take().is_empty() {
+            wrong.push(format!("an unknown x-op: {answer:?}"));
+        }
+        let mut ws = open("/x/ws/ngsi-ld/v1", Some(TENANT));
+        ws.send(&json!({"metadata": {"x-op": "x-resume", "x-id": "r",
+            "x-connection": "none", "x-resume-token": "none", "x-seq": 0}}))
+            .expect("send");
+        let answer = ws.next();
+        if status(&answer) != Some(json!(404)) || !engine.take().is_empty() {
+            wrong.push(format!("x-resume: {answer:?}"));
+        }
+        wrong
+    })
+    .await
+    .expect("the socket client");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
