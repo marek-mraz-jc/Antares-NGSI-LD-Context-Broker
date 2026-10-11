@@ -9,7 +9,9 @@
 //! runs.
 
 use crate::edm::{base_member, Edm, Set, Shape};
-use crate::filter::{mint, order, program, translate, Refused, SortBy, SortKey, Translated};
+use crate::filter::{
+    mint, order, program, searched, translate, Refused, SortBy, SortKey, Translated,
+};
 use crate::paths;
 use antares_ops::residual::{DateTime, Expr as RExpr, Program};
 use antares_ops::{
@@ -24,8 +26,8 @@ use odata_json::{
     Resource,
 };
 use odata_url::{
-    EdmModel, ExpandKind, ExpandPath, Key, KeyValue, Literal, ODataUri, QueryOptions, Segment,
-    SelectItem,
+    EdmModel, ExpandKind, ExpandPath, Expr, Key, KeyValue, Literal, ODataUri, QueryOptions,
+    Segment, SelectItem,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -221,6 +223,7 @@ fn no_properties(version: ODataVersion) -> ODataErrorResponse {
 /// read before) is asked.
 fn only_select(options: &QueryOptions) -> bool {
     options.filter.is_none()
+        && options.search.is_none()
         && options.expand.is_none()
         && options.orderby.is_none()
         && options.top.is_none()
@@ -826,7 +829,7 @@ pub(crate) async fn entity(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
-    if options.filter.is_some() {
+    if options.filter.is_some() || options.search.is_some() {
         return Err(not_implemented(version));
     }
     let picked = selected(set, options.select.as_ref()).map_err(|()| not_implemented(version))?;
@@ -872,16 +875,21 @@ pub(crate) async fn entity(
     Ok(json_response(version, ctx.level, body))
 }
 
-/// The request's `$filter` as `q` and `id` (5.2) and its `$orderby` as
-/// `orderBy` (Q9), empty without them.
+/// The request's `$filter` and `$search` as `q` and `id` (5.2) and its
+/// `$orderby` as `orderBy` (Q9), empty without them.
 fn filtered(
     set: &Set,
     sets: &std::collections::BTreeMap<String, Set>,
     options: &QueryOptions,
     version: ODataVersion,
 ) -> Result<Translated, ODataErrorResponse> {
-    let translated = options
-        .filter
+    // `$search` is one more conjunct of the filter (Protocol 11.2.1: both before `$count`)
+    let search = options.search.as_ref().and_then(|s| searched(s, set));
+    let filter = match (options.filter.clone(), search) {
+        (Some(f), Some(s)) => Some(Expr::And(Box::new(f), Box::new(s))),
+        (f, s) => f.or(s),
+    };
+    let translated = filter
         .as_ref()
         .map_or_else(
             || Ok(Translated::default()),

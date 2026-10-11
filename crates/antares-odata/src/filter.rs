@@ -27,7 +27,9 @@ use crate::edm::{Member, Set, Shape};
 use antares_ops::residual::{
     self, Cmp, Date, DateTime, Expr as RExpr, Func, Lit, Member as RMember, Path, Spatial, Time,
 };
-use odata_url::{ArithOp, CompareOp, Expr, Geography, Literal, MemberPath, Method, OrderBy};
+use odata_url::{
+    ArithOp, CompareOp, Expr, Geography, Literal, MemberPath, Method, OrderBy, Search,
+};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
@@ -185,6 +187,91 @@ pub(crate) fn translate(
         out.q = Some(q);
     }
     Ok(out)
+}
+
+/// `$search` (URL 5.1.7, Q14) as the `$filter` conjunct it means here: a word or phrase
+/// matches an Entity when one of its single-valued `Edm.String` properties the view shows holds
+/// it, case-insensitively (`tolower` on both sides); `NOT`, `AND` and `OR` as in a filter. An
+/// absent property holds nothing, so `NOT` of a term holds where every property is absent. A
+/// property the view or the engine hides is not in the answer the residual reads, so a search
+/// never matches through it. `None` when the search holds for every Entity.
+///
+/// Decided (worker-5, owner may override): substring matching over the String properties, no
+/// stemming or ranking, because the residual evaluator holds `contains` and `tolower` and an
+/// Entity either matches or not (5.1.7 leaves the matching rule to the service); options: whole
+/// words only, or the Relationships' object URIs too.
+pub(crate) fn searched(search: &Search, set: &Set) -> Option<Expr> {
+    let members: Vec<&str> = set
+        .members
+        .iter()
+        .filter(|(_, m)| {
+            matches!(
+                m.shape,
+                Shape::Value {
+                    edm: "Edm.String",
+                    collection: false
+                }
+            )
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    match fold(search, &members) {
+        Folded::Always(true) => None,
+        Folded::Always(false) => Some(Expr::Literal(Literal::Bool(false))),
+        Folded::Expr(e) => Some(e),
+    }
+}
+
+/// A search with its constant parts folded: a set without String properties matches no term.
+enum Folded {
+    Always(bool),
+    Expr(Expr),
+}
+
+fn fold(search: &Search, members: &[&str]) -> Folded {
+    match search {
+        Search::Word(text) | Search::Phrase(text) => {
+            let needle = Literal::String(text.to_lowercase());
+            let matches = members.iter().map(|name| {
+                let member = || {
+                    Expr::Member(MemberPath {
+                        variable: None,
+                        path: vec![(*name).to_owned()],
+                    })
+                };
+                let present = Expr::Compare(
+                    Box::new(member()),
+                    CompareOp::Ne,
+                    Box::new(Expr::Literal(Literal::Null)),
+                );
+                let holds = Expr::Call(
+                    Method::Contains,
+                    vec![
+                        Expr::Call(Method::ToLower, vec![member()]),
+                        Expr::Literal(needle.clone()),
+                    ],
+                );
+                Expr::And(Box::new(present), Box::new(holds))
+            });
+            matches
+                .reduce(|a, b| Expr::Or(Box::new(a), Box::new(b)))
+                .map_or(Folded::Always(false), Folded::Expr)
+        }
+        Search::Not(operand) => match fold(operand, members) {
+            Folded::Always(b) => Folded::Always(!b),
+            Folded::Expr(e) => Folded::Expr(Expr::Not(Box::new(e))),
+        },
+        Search::And(left, right) => match (fold(left, members), fold(right, members)) {
+            (Folded::Always(false), _) | (_, Folded::Always(false)) => Folded::Always(false),
+            (Folded::Always(true), other) | (other, Folded::Always(true)) => other,
+            (Folded::Expr(a), Folded::Expr(b)) => Folded::Expr(Expr::And(Box::new(a), Box::new(b))),
+        },
+        Search::Or(left, right) => match (fold(left, members), fold(right, members)) {
+            (Folded::Always(true), _) | (_, Folded::Always(true)) => Folded::Always(true),
+            (Folded::Always(false), other) | (other, Folded::Always(false)) => other,
+            (Folded::Expr(a), Folded::Expr(b)) => Folded::Expr(Expr::Or(Box::new(a), Box::new(b))),
+        },
+    }
 }
 
 /// Adds `$orderby` to `out` as `orderBy` (Q9) over the same terms: `id`, or
@@ -2481,5 +2568,55 @@ mod tests {
             translate(&bad, &timed, &BTreeMap::new(), &[]).map(|_| ()),
             Err(Refused::Bad)
         );
+    }
+
+    /// `$search` folds to a constant where no String property can hold a term, and reads only
+    /// the single-valued String properties otherwise (T-3750).
+    #[test]
+    fn a_search_reads_the_string_properties_and_folds_without_them() {
+        let word = |w: &str| Box::new(Search::Word(w.into()));
+        let mut bare = set();
+        bare.members.retain(|name, _| name != "name");
+        let always = |s: &Search| searched(s, &bare);
+        assert_eq!(
+            always(&Search::Word("x".into())),
+            Some(lit(Literal::Bool(false)))
+        );
+        assert_eq!(always(&Search::Not(word("x"))), None);
+        assert_eq!(
+            always(&Search::Or(word("x"), Box::new(Search::Not(word("y"))))),
+            None
+        );
+        assert_eq!(
+            always(&Search::And(word("x"), Box::new(Search::Not(word("y"))))),
+            Some(lit(Literal::Bool(false)))
+        );
+        // `name` is the one single-valued String: `tags` is a collection, `doc` no String
+        let one = searched(&Search::Phrase("A b".into()), &set());
+        let name = || m("name");
+        let want = Expr::And(
+            Box::new(cmp(name(), CompareOp::Ne, lit(Literal::Null))),
+            Box::new(Expr::Call(
+                Method::Contains,
+                vec![
+                    Expr::Call(Method::ToLower, vec![name()]),
+                    lit(Literal::String("a b".into())),
+                ],
+            )),
+        );
+        assert_eq!(one, Some(want.clone()));
+        // a term and the constant side of a fold: the term alone
+        let mixed = Search::Or(word("x"), Box::new(Search::Word("y".into())));
+        assert!(matches!(searched(&mixed, &set()), Some(Expr::Or(..))));
+        let negated = searched(&Search::Not(Box::new(Search::Phrase("A b".into()))), &set());
+        assert_eq!(negated, Some(Expr::Not(Box::new(want))));
+        let translated = translate(
+            &searched(&Search::Word("x".into()), &set()).unwrap_or(lit(Literal::Null)),
+            &set(),
+            &BTreeMap::new(),
+            &[],
+        );
+        // the presence is pushed as `q`, the case-insensitive match is the residual's
+        assert!(translated.is_ok_and(|t| t.q.is_some() && t.residual.len() == 1));
     }
 }

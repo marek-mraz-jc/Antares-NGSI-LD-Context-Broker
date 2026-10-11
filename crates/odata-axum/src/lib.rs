@@ -250,7 +250,7 @@ impl IntoResponse for ODataErrorResponse {
 /// use axum::http::StatusCode;
 /// use odata_axum::url_error;
 /// use odata_url::{Feature, UrlError, UrlErrorKind};
-/// let refused = UrlError { kind: UrlErrorKind::NotImplemented(Feature::Search), offset: 10 };
+/// let refused = UrlError { kind: UrlErrorKind::NotImplemented(Feature::Index), offset: 10 };
 /// assert_eq!(url_error(&refused, 9).status, StatusCode::NOT_IMPLEMENTED);
 /// let unknown = UrlError { kind: UrlErrorKind::Unresolved, offset: 0 };
 /// assert_eq!(url_error(&unknown, 6).status, StatusCode::NOT_FOUND);

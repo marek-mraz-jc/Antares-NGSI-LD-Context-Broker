@@ -693,7 +693,7 @@ fn capabilities(
             vec![("Deletable", flag(writable.delete))],
         ),
         restriction("CountRestrictions", vec![("Countable", flag(true))]),
-        restriction("SearchRestrictions", vec![("Searchable", flag(false))]),
+        restriction("SearchRestrictions", vec![("Searchable", flag(true))]),
         restriction(
             "FilterRestrictions",
             vec![

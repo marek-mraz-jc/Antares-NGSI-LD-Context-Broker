@@ -369,7 +369,6 @@ fn query_option_errors() {
         }
     );
     for (name, feature) in [
-        ("$search=blue", Feature::Search),
         ("compute=1 as x", Feature::Compute),
         ("$index=1", Feature::Index),
         ("$deltatoken=x", Feature::DeltaToken),
@@ -942,8 +941,8 @@ fn the_canonical_form_parses_back() {
 
 #[test]
 fn errors_name_themselves() {
-    let e = err("Buildings?$search=x");
-    assert_eq!(e.to_string(), "not implemented at byte 10: $search");
+    let e = err("Buildings?$index=1");
+    assert_eq!(e.to_string(), "not implemented at byte 10: $index");
     let e = err("Towers");
     assert_eq!(e.to_string(), "unknown name at byte 0");
     let e = err("Buildings?$top=1&$top=1");
@@ -971,7 +970,6 @@ fn every_feature_and_limit_has_its_own_name() {
     use Feature as F;
     use LimitKind as L;
     let features = [
-        F::Search,
         F::Compute,
         F::Index,
         F::Apply,
@@ -1327,5 +1325,138 @@ fn arithmetic_and_lambdas_round_trip() {
         let canonical = ok(text).to_string();
         assert_eq!(canonical, text, "{text}");
         assert_eq!(ok(&canonical).to_string(), canonical, "{text}");
+    }
+}
+
+fn search_of(query: &str) -> Search {
+    options(&format!("Buildings?{query}"))
+        .search
+        .unwrap_or(Search::Word(String::new()))
+}
+
+#[test]
+fn search_reads_words_phrases_and_operators_with_their_precedence() {
+    use Search::{And, Not, Or, Phrase, Word};
+    let word = |w: &str| Box::new(Word(w.into()));
+    assert_eq!(search_of("$search=blue"), Word("blue".into()));
+    assert_eq!(search_of("search=blue"), Word("blue".into()));
+    // side by side is AND; NOT binds tighter than AND, AND tighter than OR (URL 5.1.7)
+    assert_eq!(search_of("$search=a b"), And(word("a"), word("b")));
+    assert_eq!(search_of("$search=a%20AND%20b"), And(word("a"), word("b")));
+    assert_eq!(
+        search_of("$search=a b OR c"),
+        Or(Box::new(And(word("a"), word("b"))), word("c"))
+    );
+    assert_eq!(
+        search_of("$search=a OR b c"),
+        Or(word("a"), Box::new(And(word("b"), word("c"))))
+    );
+    assert_eq!(
+        search_of("$search=NOT a b"),
+        And(Box::new(Not(word("a"))), word("b"))
+    );
+    assert_eq!(
+        search_of("$search=NOT (a OR b)"),
+        Not(Box::new(Or(word("a"), word("b"))))
+    );
+    assert_eq!(
+        search_of("$search=( a OR b ) c"),
+        And(Box::new(Or(word("a"), word("b"))), word("c"))
+    );
+    // a form encoder's `+` is a space; a plus in a word is written `%2B`
+    assert_eq!(search_of("$search=a+OR+b"), Or(word("a"), word("b")));
+    assert_eq!(search_of("$search=C%2B%2B"), Word("C++".into()));
+    // operators are upper case and need whitespace on both sides; otherwise they are words
+    assert_eq!(
+        search_of("$search=a or b"),
+        And(Box::new(And(word("a"), word("or"))), word("b"))
+    );
+    assert_eq!(search_of("$search=NOT"), Word("NOT".into()));
+    assert_eq!(search_of("$search=NOTE"), Word("NOTE".into()));
+    assert_eq!(search_of("$search=a OR"), And(word("a"), word("OR")));
+    // phrases keep spaces, parentheses and percent-decoded text
+    assert_eq!(
+        search_of("$search=\"dark red\" OR %22a (b)%22"),
+        Or(
+            Box::new(Phrase("dark red".into())),
+            Box::new(Phrase("a (b)".into()))
+        )
+    );
+    // `&` and `#` only percent-encoded; UTF-8 decoded; a quote inside a word
+    assert_eq!(search_of("$search=R%26D%23"), Word("R&D#".into()));
+    assert_eq!(search_of("$search=caf%C3%A9"), Word("café".into()));
+    assert_eq!(search_of("$search=it's"), Word("it's".into()));
+    // `searchExpr-incomplete` is one phrase, `''` a quote
+    assert_eq!(search_of("$search='it''s red'"), Phrase("it's red".into()));
+    // the option ends at `&`
+    let both = options("Buildings?$search=a&$top=1");
+    assert_eq!((both.search, both.top), (Some(Word("a".into())), Some(1)));
+}
+
+#[test]
+fn search_refuses_what_is_no_search_expression() {
+    for query in [
+        "$search=",
+        "$search=%20",
+        "$search=(a",
+        "$search=a)",
+        "$search=()",
+        "$search=\"\"",
+        "$search=\"%20\"",
+        "$search=\"open",
+        "$search='open",
+        "$search=''",
+        "$search='x'y",
+        "$search=a%2",
+        "$search=%FF",
+        "$search=a;b",
+    ] {
+        let e = err(&format!("Buildings?{query}"));
+        assert!(
+            matches!(e.kind, UrlErrorKind::Syntax { .. }),
+            "{query}: {e:?}"
+        );
+    }
+    let dup = err("Buildings?$search=a&search=b");
+    assert_eq!(dup.to_string(), "system query option $search given twice");
+}
+
+#[test]
+fn search_is_bounded() {
+    let tight = Limits {
+        max_expr_depth: 2,
+        max_expr_nodes: 5,
+        max_literal_len: 4,
+        ..Limits::strict()
+    };
+    let limit = |q: &str| {
+        let e = err_within(&format!("Buildings?{q}"), &tight);
+        match e.kind {
+            UrlErrorKind::LimitExceeded { limit, .. } => limit,
+            other => panic!("{q}: {other:?}"),
+        }
+    };
+    assert_eq!(limit("$search=a b c d"), LimitKind::ExprNodes);
+    assert_eq!(limit("$search=NOT NOT NOT a"), LimitKind::ExprDepth);
+    assert_eq!(limit("$search=(((a)))"), LimitKind::ExprDepth);
+    assert_eq!(limit("$search=abcdef"), LimitKind::LiteralLength);
+    assert_eq!(limit("$search=\"abcdef\""), LimitKind::LiteralLength);
+    assert_eq!(limit("$search='abcdef'"), LimitKind::LiteralLength);
+    assert!(parse("Buildings?$search=NOT (a)", &Service, &tight).is_ok());
+}
+
+#[test]
+fn search_writes_its_canonical_form() {
+    for (query, written) in [
+        ("$search=a b OR c", "$search=a%20AND%20b%20OR%20c"),
+        ("$search=a (b OR c)", "$search=a%20AND%20(b%20OR%20c)"),
+        ("$search=NOT (a b)", "$search=NOT%20(a%20AND%20b)"),
+        ("$search=\"x y\"", "$search=%22x%20y%22"),
+        ("$search=C%2B%2B", "$search=C%2B%2B"),
+        ("$search=a OR", "$search=a%20AND%20%22OR%22"),
+    ] {
+        let uri = ok(&format!("Buildings?{query}"));
+        assert_eq!(uri.to_string(), format!("Buildings?{written}"), "{query}");
+        assert_eq!(ok(&uri.to_string()).to_string(), uri.to_string(), "{query}");
     }
 }

@@ -87,6 +87,7 @@ root.
 | `{Set}('{id}')/$ref` | Retrieve Entity; the Entity's reference, `404` when hidden or absent; `$select` or `$expand` is `400` |
 | `POST {Set}/$query` | the same `GET`: the body's options (`text/plain` or a form) joined to the URL's |
 | `$filter` | `q` and `id` (section 4) |
+| `$search` | one more `$filter` conjunct: a word or `"phrase"` matches when a single-valued String property the view shows contains it, case-insensitively; `NOT` before `AND` (or a space) before `OR`; evaluated by the residual on what the view and the engine admit, so a hidden property never matches (T-3750) |
 | `$orderby` | `orderBy` on `id` and single-valued values, `;desc`; `createdAt`, `modifiedAt` sorted by the surface (section 4) |
 | `$select` | `attrs`; `createdAt`/`modifiedAt` add `options=sysAttrs` |
 | `$expand` | `join=inline&joinLevel=1` (section 5) |
@@ -263,7 +264,7 @@ Every `GET` answers `HEAD` too: the same status and headers, with the
 ## 7. Refusals and errors
 
 The OData features no NGSI-LD operation stands behind (matrix 7.1 of
-`docs/analysis/operation-matrix.yaml`: `$apply`, `$search`, `$compute`,
+`docs/analysis/operation-matrix.yaml`: `$apply`, `$compute`,
 actions, functions, `$crossjoin`, `$all`, delta, media, and the rest) are
 refused with the status the matrix names, before any gate or store access.
 An upsert is the exception: it is the Merge or Replace Entity it names,

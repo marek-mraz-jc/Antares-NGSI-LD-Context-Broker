@@ -75,6 +75,9 @@ impl Display for Query<'_> {
         if let Some(filter) = &o.filter {
             items.push(format!("$filter={filter}"));
         }
+        if let Some(search) = &o.search {
+            items.push(format!("$search={search}"));
+        }
         if let Some(select) = &o.select {
             items.push(format!("$select={}", List(select)));
         }

@@ -7,7 +7,7 @@ mod service;
 use odata_url::{
     parse, ArithOp, CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key,
     KeyValue, Levels, Limits, Literal, MemberPath, Method, ODataUri, OrderBy, Position,
-    QueryOptions, Segment, SelectItem, Shape,
+    QueryOptions, Search, Segment, SelectItem, Shape,
 };
 use proptest::prelude::*;
 use service::Service;
@@ -257,6 +257,28 @@ mod strategy {
         ]
     }
 
+    /// A `$search` tree: words with every character a word may hold, an operator's name
+    /// only as a phrase, phrases with spaces and quotes.
+    pub(crate) fn search() -> BoxedStrategy<Search> {
+        let word = "[a-zA-Z0-9é+&#%=!*,:@/?$~._-][a-zA-Z0-9é'+&#%=!*,:@/?$~._-]{0,6}"
+            .prop_filter("an operator's name", |w| {
+                !["AND", "OR", "NOT"].contains(&w.as_str())
+            })
+            .prop_map(Search::Word);
+        let phrase = "[a-z' ()&;+é]{0,5}[a-z]".prop_map(Search::Phrase);
+        prop_oneof![word, phrase]
+            .boxed()
+            .prop_recursive(4, 16, 2, |inner| {
+                prop_oneof![
+                    inner.clone().prop_map(|s| Search::Not(Box::new(s))),
+                    (inner.clone(), inner.clone())
+                        .prop_map(|(a, b)| Search::And(Box::new(a), Box::new(b))),
+                    (inner.clone(), inner).prop_map(|(a, b)| Search::Or(Box::new(a), Box::new(b))),
+                ]
+            })
+            .boxed()
+    }
+
     /// The name of a custom option: never a system option's, with or without `$`.
     fn custom() -> impl Strategy<Value = (String, Option<String>)> {
         ("x-[a-z]{1,6}", prop::option::of("[a-z0-9.~-]{0,8}"))
@@ -283,6 +305,7 @@ mod strategy {
             prop::option::of("[a-zA-Z0-9]{1,8}"),
             prop::option::of(prop_oneof![Just("*".to_owned()), "[a-z0-9.]{1,6}"]),
             prop::option::of("[a-z]{1,8}"),
+            prop::option::of(search()),
             prop::collection::vec(("[a-z]{1,4}", literal()), 0..3),
             prop::collection::vec(custom(), 0..3),
         );
@@ -290,10 +313,11 @@ mod strategy {
             .prop_map(
                 |(
                     (filter, select, expand, orderby, top, skip, count, format),
-                    (skiptoken, schemaversion, id, aliases, custom),
+                    (skiptoken, schemaversion, id, search, aliases, custom),
                 )| {
                     QueryOptions {
                         filter,
+                        search,
                         select,
                         expand,
                         orderby,

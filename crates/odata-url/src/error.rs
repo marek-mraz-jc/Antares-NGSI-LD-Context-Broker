@@ -129,8 +129,6 @@ pub enum LimitKind {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Feature {
-    /// `$search` (Q14).
-    Search,
     /// `$compute` (Q16).
     Compute,
     /// `$index` (Q17).
@@ -255,12 +253,11 @@ impl Feature {
     /// The construct's fixed name.
     ///
     /// ```
-    /// assert_eq!(odata_url::Feature::Search.as_str(), "$search");
+    /// assert_eq!(odata_url::Feature::Index.as_str(), "$index");
     /// ```
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Search => "$search",
             Self::Compute => "$compute",
             Self::Index => "$index",
             Self::Apply => "$apply",

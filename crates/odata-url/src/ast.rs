@@ -104,6 +104,8 @@ pub enum KeyValue {
 pub struct QueryOptions {
     /// `$filter`.
     pub filter: Option<Expr>,
+    /// `$search` (URL 5.1.7).
+    pub search: Option<crate::Search>,
     /// `$select`.
     pub select: Option<Vec<SelectItem>>,
     /// `$expand`.
