@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! The MCP surface of a view (`docs/analysis/mcp-surface.md`, T-3442):
 //! `POST /x/views/{view}/mcp` is a Streamable HTTP endpoint whose tools and
-//! resources are the view's read operations, each run as one operation
+//! resources are the view's operations, each run as one operation
 //! through [`antares_ops`], so the operation's own policy gate fires once
 //! and the view narrows the answer as it does on the NGSI-LD view root.
 //!
@@ -9,8 +9,9 @@
 //! 2025-11-25 and 2025-06-18 is served without a session (D-8). The tool
 //! list is the view's allowlist filtered by one engine probe (D-3); input
 //! schemas name only what the view shows (D-4); a list result is paged
-//! with an opaque cursor under a byte budget, never cut (D-10). Write
-//! tools and resource subscriptions come with T-3514 and T-3515.
+//! with an opaque cursor under a byte budget, never cut (D-10). A write
+//! tool runs only after the person confirmed the call (D-11, T-3514);
+//! resource subscriptions come with T-3515.
 //!
 //! ```
 //! use antares_ops::Surface;
@@ -20,6 +21,7 @@
 //! ```
 #![forbid(unsafe_code)]
 
+mod confirm;
 mod cursor;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
@@ -51,6 +53,13 @@ pub const ALLOWED_ORIGINS_ENV: &str = "ANTARES_MCP_ALLOWED_ORIGINS";
 
 /// The most bytes one tool result's structured content may take (D-10).
 pub const MAX_RESULT_BYTES_ENV: &str = "ANTARES_MCP_MAX_RESULT_BYTES";
+
+/// A file holding the key that seals a write's `requestState` (MCP 3.4),
+/// at least 32 bytes, mounted from a Secret; unset, each process draws its
+/// own and a confirmation answers only the process that asked.
+pub const REQUEST_STATE_KEY_FILE_ENV: &str = "ANTARES_MCP_REQUEST_STATE_KEY_FILE";
+
+pub use schema::SUBSCRIPTION_ENDPOINTS_ENV;
 
 /// The largest request body the endpoint reads (`MCP_MAX_REQUEST_BYTES`).
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -115,7 +124,7 @@ fn config_of(hosts: Option<&[String]>, origins: &[String]) -> StreamableHttpServ
 }
 
 /// The comma-separated names of `raw`, `None` when it names none.
-fn listed(raw: Option<&str>) -> Option<Vec<String>> {
+pub(crate) fn listed(raw: Option<&str>) -> Option<Vec<String>> {
     let names: Vec<String> = raw?
         .split(',')
         .map(str::trim)
