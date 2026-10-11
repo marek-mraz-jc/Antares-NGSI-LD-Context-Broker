@@ -19,19 +19,20 @@ index 921db29..53e672c 100644
   "proptest",
   "serde_json",
 diff --git a/crates/antares-api/src/lib.rs b/crates/antares-api/src/lib.rs
-index 8d83ed7..e1572c3 100644
+index fdaab93..85b8023 100644
 --- a/crates/antares-api/src/lib.rs
 +++ b/crates/antares-api/src/lib.rs
-@@ -400,6 +400,8 @@ pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
+@@ -416,6 +416,9 @@ pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
          ("/entityOperations/delete", post(batch::batch_delete)),
          ("/entityOperations/merge", post(batch::batch_merge)),
          ("/entityOperations/query", post(batch::batch_query)),
 +        ("/cg-fixture", get(cg_fixture_route)),
 +        ("/cg-fixture-store", get(cg_fixture_store_route)),
++        ("/cg-fixture-fs", get(cg_fixture_fs_route)),
          // EntityMaps (5.14; 6.32/6.34/6.35)
          (
              "/entityMaps",
-@@ -6674,3 +6676,30 @@ mod clause_6_3_11 {
+@@ -6690,3 +6693,46 @@ mod clause_6_3_11 {
  pub(crate) fn allow_private() {
      antares_jsonld::allow_private_egress(true);
  }
@@ -61,6 +62,22 @@ index 8d83ed7..e1572c3 100644
 +        .get(&TenantId::default(), antares_store::Kind::Entity, "urn:x")
 +        .await;
 +    axum::http::StatusCode::OK
++}
++
++/// cg-invariants fixture: a route that writes a file and unwraps.
++async fn cg_fixture_fs_route() -> axum::http::StatusCode {
++    std::fs::write("/tmp/cg-fixture", b"").unwrap();
++    axum::http::StatusCode::OK
++}
++
++/// cg-invariants fixture: a secret taken out of its wrapper.
++pub fn cg_fixture_secret(s: &secret::Secret) -> String {
++    s.expose().to_owned()
++}
++
++/// cg-invariants fixture: a child process.
++pub fn cg_fixture_spawn() {
++    let _ = std::process::Command::new("true").status();
 +}
 diff --git a/crates/antares-sql/src/lib.rs b/crates/antares-sql/src/lib.rs
 index 6f5ffb5..dc8951f 100644

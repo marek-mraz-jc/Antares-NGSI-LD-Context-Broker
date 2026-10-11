@@ -1,7 +1,22 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! NGSI-LD HTTP binding: axum routers, thin
 //! handlers per spec operation.
-#![cfg_attr(not(test), warn(clippy::expect_used))]
+// T-3915: a panic on a request path is a remote DoS. Outside tests this
+// crate may not unwrap, expect or panic; indexing_slicing (107 sites) and
+// arithmetic_side_effects (81) join when T-3932 has rewritten them.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::dbg_macro,
+        clippy::print_stdout,
+        clippy::print_stderr
+    )
+)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 // the Send proof of the spawned snapshot fill walks temporal → entity map
 // futures deeper than the default 128 (nightly: recursion_depth_exceeding_limit)
@@ -77,6 +92,7 @@ pub(crate) mod paging;
 pub mod policy;
 pub(crate) mod registry;
 pub(crate) mod repr;
+pub mod secret;
 pub(crate) mod snapshots;
 pub(crate) mod stamp;
 pub mod state;

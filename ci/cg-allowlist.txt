@@ -82,3 +82,9 @@ tenant-not-from-header | POST /q/dead-letters/{}/replay | antares_api::dead_lett
 tenant-not-from-header | GET /q/tenants/{} | antares_api::tenant_get | admin secret route layer; the Tenant is the path segment, parsed by TenantId::new
 tenant-not-from-header | DELETE /q/tenants/{} | antares_api::tenant_purge | admin secret route layer; the Tenant is the path segment, parsed by TenantId::new
 tenant-not-from-header | POST /ex/v1/remote-notify | antares_api::distsub::remote_notify | the Tenant is read back from the broker's own inbound index under the peer's random subscriptionId, never from the request (ADR-0019)
+
+# T-3915: secrets, child processes, files a route writes, panics a route reaches.
+secret-exposed | antares_api::admin_auth::AdminAuth::admits | the presented bearer is compared with the admin token in constant time (constant_time_eq); the value goes nowhere else
+secret-exposed | antares_broker::build_builtin | the database URL goes to the Postgres pool's connect (connect_with) and nowhere else; the retry loop keeps the error text, which names no URL (tests/secret_logs.rs)
+process-spawn | antares_api::main | the build script of antares-api runs `git rev-parse --short HEAD` with fixed arguments to bake the commit into /q/health; nothing at run time spawns a process
+fs-write-from-a-server | antares_sql::store::mem::redb::Shadow::write | the file store's one redb file, opened at boot under ANTARES_DATA_DIR (operator config, Store::open_file); a request only supplies the key bytes of a row inside it (tenant NUL id), never a path
