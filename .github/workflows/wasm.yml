@@ -51,7 +51,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
+      # the browser build compiles code the native lanes never see (the
+      # minicache, the wasm sweep loop): a warning there is red here (T-3698)
+      - name: wasm32 is warning-free
+        run: cargo clippy --locked -p antares-wasm --target wasm32-unknown-unknown -- -D warnings
       - name: wasm-bindgen (lockfile-matched) + binaryen
         run: |
           ./dev/install-wasm-tools.sh

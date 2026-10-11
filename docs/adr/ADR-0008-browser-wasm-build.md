@@ -23,7 +23,7 @@ not spec surface.
 |---|---|---|
 | tokio runtime + `tokio::spawn` | no runtime; JS microtask queue | `crate::spawn` = `tokio::spawn` / `spawn_local` |
 | `std::time::Instant` | panics | `web-time` (std re-export natively) |
-| moka's clock (std Instant, unconditional) | panics at cache creation | `minicache` FIFO behind the same six methods |
+| moka's clock (std Instant, unconditional) | panics at cache creation | `minicache` FIFO behind the same methods and builder, weigher included, so the byte and term budgets hold in the browser too (T-3698) |
 | process env (`ANTARES_*`) | `std::env::var` always errs | constructor options (`allowPrivateEgress`) |
 | reqwest client + futures are Send | `!Send`, but axum demands Send everywhere | `send_wrapper` fences (`HttpClient`, `http_interaction`) — sound single-threaded, runtime-checked |
 | DNS-pinned egress resolver, redirect cap | no DNS, no redirect control in `fetch` | native-only; the browser's CORS sandbox IS the egress boundary in a page |
