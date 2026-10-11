@@ -33,6 +33,14 @@ mkdir -p site/reports/unit
 if [ -n "$uid" ] && [ "$uid" != "null" ]; then
   gh api "repos/$REPO/actions/artifacts/$uid/zip" > unit.zip
   mkdir -p unit-junit && unzip -q -o unit.zip -d unit-junit
+  # the feature-sets cells of the same run (workspace.yml) upload
+  # unit-junit-<set>; one page per run, so only that run's bundles join
+  run=$(gh api "repos/$REPO/actions/artifacts/$uid" -q .workflow_run.id)
+  for cid in $(gh api "repos/$REPO/actions/runs/$run/artifacts?per_page=100" \
+                 -q '.artifacts[] | select(.name | startswith("unit-junit-")) | .id'); do
+    gh api "repos/$REPO/actions/artifacts/$cid/zip" > cell.zip
+    unzip -q -o cell.zip -d unit-junit
+  done
   python3 dev/unit-report-site.py unit-junit site/reports/unit
 else
   echo '<!doctype html><title>Unit tests</title><p>No unit-junit bundle in the retention window — run the ci workflow.' \
