@@ -20,7 +20,7 @@
     ]
    }
   },
-  "owner": {
+  "operator": {
    "type": "Property",
    "value": "city"
   },
@@ -47,7 +47,7 @@
     ]
    }
   },
-  "owner": {
+  "operator": {
    "type": "Property",
    "value": "city"
   },
@@ -74,7 +74,7 @@
     ]
    }
   },
-  "owner": {
+  "operator": {
    "type": "Property",
    "value": "private"
   },
@@ -101,7 +101,7 @@
     ]
    }
   },
-  "owner": {
+  "operator": {
    "type": "Property",
    "value": "city"
   },
@@ -128,7 +128,7 @@
     ]
    }
   },
-  "owner": {
+  "operator": {
    "type": "Property",
    "value": "private"
   },
@@ -155,7 +155,7 @@
     ]
    }
   },
-  "owner": {
+  "operator": {
    "type": "Property",
    "value": "city"
   },
@@ -211,7 +211,7 @@
     ]
    }
   },
-  "owner": {
+  "operator": {
    "type": "Property",
    "value": "city"
   },
@@ -235,7 +235,7 @@
    "type": "Property",
    "value": 12
   },
-  "owner": {
+  "operator": {
    "type": "Property",
    "value": "city"
   },
@@ -258,7 +258,7 @@
    "type": "Property",
    "value": 0
   },
-  "owner": {
+  "operator": {
    "type": "Property",
    "value": "private"
   },
@@ -281,7 +281,7 @@
    "type": "Property",
    "value": 21
   },
-  "owner": {
+  "operator": {
    "type": "Property",
    "value": "city"
   },

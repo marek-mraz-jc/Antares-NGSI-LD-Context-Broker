@@ -11,7 +11,7 @@
     ],
     "attributes": [
      "location",
-     "owner",
+     "operator",
      "speed",
      "vehicleType"
     ]
@@ -49,13 +49,13 @@
  "expect": {
   "urn:ngsi-ld:Vehicle:V3": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
   "urn:ngsi-ld:Vehicle:V5": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ]

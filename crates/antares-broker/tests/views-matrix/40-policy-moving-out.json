@@ -1,5 +1,5 @@
 {
- "about": "A policy within A; V4 moves to B between two reads.",
+ "about": "A policy within A; V4 moves to B between two reads. Temporally (ADR-0023 rule 11), V4's instances recorded while it was in A still show; its new location does not.",
  "view": {
   "selector": [
    "*"
@@ -35,7 +35,12 @@
     "5.7.7",
     "5.7.8",
     "5.7.9",
-    "5.7.10"
+    "5.7.10",
+    "5.8.1",
+    "5.8.2",
+    "5.8.3",
+    "5.8.4",
+    "5.8.5"
    ],
    "information": [
     {
@@ -52,19 +57,19 @@
  "expect": {
   "urn:ngsi-ld:Vehicle:V1": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
   "urn:ngsi-ld:Vehicle:V2": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
   "urn:ngsi-ld:Vehicle:V4": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
@@ -75,7 +80,7 @@
   ],
   "urn:ngsi-ld:Vehicle:V8": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ]
@@ -98,13 +103,13 @@
    "expect": {
     "urn:ngsi-ld:Vehicle:V1": [
      "location",
-     "owner",
+     "operator",
      "speed",
      "vehicleType"
     ],
     "urn:ngsi-ld:Vehicle:V2": [
      "location",
-     "owner",
+     "operator",
      "speed",
      "vehicleType"
     ],
@@ -115,11 +120,43 @@
     ],
     "urn:ngsi-ld:Vehicle:V8": [
      "location",
-     "owner",
+     "operator",
+     "speed",
+     "vehicleType"
+    ]
+   },
+   "temporal": {
+    "urn:ngsi-ld:Vehicle:V1": [
+     "location",
+     "operator",
+     "speed",
+     "vehicleType"
+    ],
+    "urn:ngsi-ld:Vehicle:V2": [
+     "location",
+     "operator",
+     "speed",
+     "vehicleType"
+    ],
+    "urn:ngsi-ld:Vehicle:V7": [
+     "location",
+     "speed",
+     "vehicleType"
+    ],
+    "urn:ngsi-ld:Vehicle:V8": [
+     "location",
+     "operator",
+     "speed",
+     "vehicleType"
+    ],
+    "urn:ngsi-ld:Vehicle:V4": [
+     "location",
+     "operator",
      "speed",
      "vehicleType"
     ]
    }
   }
- ]
+ ],
+ "known": {"LinkML": "T-3798"}
 }

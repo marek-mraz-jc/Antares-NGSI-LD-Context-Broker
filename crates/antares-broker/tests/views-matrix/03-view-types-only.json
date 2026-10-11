@@ -13,7 +13,7 @@
      "availableSpots",
      "location",
      "name",
-     "owner"
+     "operator"
     ]
    }
   ]
@@ -23,12 +23,12 @@
    "availableSpots",
    "location",
    "name",
-   "owner"
+   "operator"
   ],
   "urn:ngsi-ld:Parking:P2": [
    "availableSpots",
    "location",
-   "owner"
+   "operator"
   ]
  },
  "caller": {

@@ -35,39 +35,44 @@
     "5.7.7",
     "5.7.8",
     "5.7.9",
-    "5.7.10"
+    "5.7.10",
+    "5.8.1",
+    "5.8.2",
+    "5.8.3",
+    "5.8.4",
+    "5.8.5"
    ],
-   "q": "owner==\"city\""
+   "q": "operator==\"city\""
   }
  ],
  "expect": {
   "urn:ngsi-ld:Vehicle:V1": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
   "urn:ngsi-ld:Vehicle:V2": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
   "urn:ngsi-ld:Vehicle:V4": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
   "urn:ngsi-ld:Vehicle:V6": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
   "urn:ngsi-ld:Vehicle:V8": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
@@ -75,16 +80,19 @@
    "availableSpots",
    "location",
    "name",
-   "owner"
+   "operator"
   ],
   "urn:ngsi-ld:Sensor:S1": [
    "location",
-   "owner",
+   "operator",
    "temperature"
   ]
  },
  "byId": "denied",
  "known": {
-  "MCP query_entities": "T-3784"
+  "MCP query_entities": "T-3784",
+  "WebSocket": "T-3784",
+  "HTTP notification": "T-3784",
+  "LinkML": "T-3798"
  }
 }

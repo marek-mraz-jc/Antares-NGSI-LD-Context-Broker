@@ -102,14 +102,43 @@ CI jobs named below (all in Antares `.github/workflows/`):
   seed, never read from the code under test.
 - Test `every_surface_answers_what_ngsi_ld_admits_in_every_scenario`: each scenario in a Tenant of
   its own, read page by page through the NGSI-LD view (Link `next`), OData (`odata.maxpagesize`,
-  `@odata.nextLink`), OGC items (`next` links) and MCP `query_entities` (cursor). Each must answer
+  `@odata.nextLink`), OGC items (`next` links), MCP `query_entities` (cursor) and the NGSI-LD
+  temporal query (11.3.3 over `modifiedAt`), and notified over a WebSocket and an HTTP Subscription made
+  through the view as the caller before the seed is written (the broker wired with the engine,
+  as `main` wires it, so notifications are decided by it). Each must answer
   exactly the expected ids and Attribute names, its count (`NGSILD-Results-Count`, `@odata.count`,
   `numberMatched`, MCP `total`) the expected size. A retrieve by id (NGSI-LD and MCP `get_entity`)
   of a seed Entity the scenario does not admit answers the bytes of an absent id; a denied caller
   gets a refusal naming no seed Entity.
+- The temporal answer is the snapshot's less the Entities shown with their frame alone, unless the
+  scenario states `temporal`: a policy condition holds per instance (ADR-0023 rule 11), so a
+  `scopeQ` condition (scope has no history) hides every instance and a moved Entity keeps the
+  instances recorded while its rule held.
+- Query-language rows, each against the NGSI-LD query that means the same through the same view
+  and caller: OData `$filter=speed gt 40&$select=location,speed` against `q=speed>40` with `pick`,
+  and OGC `bbox=0,0,7,7&properties=speed` against a `geoQ` intersects with `pick` plus the
+  Vehicles without a shown `location` (`bbox` keeps them, Part 1 Req 24 C). A surface may refuse a
+  name the view hides with `400` where NGSI-LD omits it. Every pager stops after 50 pages, so a
+  next link without end is a mismatch, not a hang.
+- LinkML (a build with `linkml`, as CI's all-features): `classes/{class}` of each type through the
+  view as the caller, each kept class with its slot names. By default each admitted type with the
+  names its admitted Entities show, and none for a denied caller; a scenario states `linkml` where a
+  rule's condition drops the Entities but not the class (linkml.md 2).
 - A mismatch with a fix task filed is listed in the scenario's `known` (surface to task id) and
   must still fail, so the fix removes the entry; the test prints the list.
 - Job: `workspace-tests` (all-features).
+- Test `every_surface_answers_what_ngsi_ld_admits_for_generated_views_and_policies`, the
+  differential: up to eight generated Vehicles and Sensors (each Attribute, a point on a 0..=12
+  grid and a scope present or not), a generated view (`*`, or one or both types with a
+  projection, and a `q`, an area `within` or `intersects` and a `scopeQ`, each or not) and none
+  or up to three generated policies for the caller (a type or both, `propertyNames` or the whole
+  Entity, the same conditions, one in four a prohibition). OData, OGC and MCP must answer what
+  NGSI-LD answers through the same view. All cases share one Tenant, the seed deleted after each.
+  `VIEWS_DIFF_CASES` sets the cases (200 in `fast`, 2 000 in ci's `views-differential` job, which
+  `publish-dev` waits for), `VIEWS_DIFF_SEED` the seed (3777, printed). A failure shrinks and
+  prints the minimal case as a corpus file with its own `seed`: commit it with its `expect`
+  written by hand and file the fix task. Mismatches with a task filed are listed in `KNOWN_DIFF`
+  (MCP "unknown tool", T-3784).
 
 ## 4. Property tests (`proptest` 1.11.0, already a workspace dependency: `Cargo.lock:2329`, used by `antares-sql`)
 

@@ -19,18 +19,19 @@
  "expect": {
   "urn:ngsi-ld:Vehicle:V5": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ],
   "urn:ngsi-ld:Vehicle:V6": [
    "location",
-   "owner",
+   "operator",
    "speed",
    "vehicleType"
   ]
  },
  "caller": {
   "x-jc-roles": "public"
- }
+ },
+ "linkml": {"Parking": ["availableSpots", "location", "name", "operator"], "Sensor": ["location", "operator", "temperature"], "Vehicle": ["location", "operator", "speed", "vehicleType"]}
 }

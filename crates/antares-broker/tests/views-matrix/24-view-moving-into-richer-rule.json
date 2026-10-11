@@ -1,5 +1,5 @@
 {
- "about": "V3 drives into A and shows more under the per-area rule.",
+ "about": "V3 drives into A and shows more under the per-area rule. Temporally (ADR-0023 rule 11), V3's speed and its old location were recorded outside A, so only its new location and vehicleType instances show.",
  "view": {
   "selector": [
    "Vehicle"
@@ -118,6 +118,43 @@
     "urn:ngsi-ld:Vehicle:V3": [
      "location",
      "speed",
+     "vehicleType"
+    ],
+    "urn:ngsi-ld:Vehicle:V4": [
+     "location",
+     "speed",
+     "vehicleType"
+    ],
+    "urn:ngsi-ld:Vehicle:V7": [
+     "location",
+     "speed",
+     "vehicleType"
+    ],
+    "urn:ngsi-ld:Vehicle:V8": [
+     "location",
+     "speed",
+     "vehicleType"
+    ],
+    "urn:ngsi-ld:Vehicle:V5": [
+     "vehicleType"
+    ],
+    "urn:ngsi-ld:Vehicle:V6": [
+     "vehicleType"
+    ]
+   },
+   "temporal": {
+    "urn:ngsi-ld:Vehicle:V1": [
+     "location",
+     "speed",
+     "vehicleType"
+    ],
+    "urn:ngsi-ld:Vehicle:V2": [
+     "location",
+     "speed",
+     "vehicleType"
+    ],
+    "urn:ngsi-ld:Vehicle:V3": [
+     "location",
      "vehicleType"
     ],
     "urn:ngsi-ld:Vehicle:V4": [
