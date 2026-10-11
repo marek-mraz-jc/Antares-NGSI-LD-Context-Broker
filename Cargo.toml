@@ -168,39 +168,62 @@ lto = "thin"
 # the stable perf-baseline shapes (docs/src/perf-baseline.md, T-3552).
 overflow-checks = true
 
+# ADR-0027 section 6 (T-3712): `full` measured +6.81 MiB over vanilla.
+# Request-path surface crates (and rmcp) build as one codegen unit, which
+# drops the copies of generics each unit inlined; cold ones (admin reload,
+# $metadata, $batch, schemas) build for size: +5.58 MiB, OData/MCP benches
+# within host noise. opt-level "s" everywhere reached +4.92 MiB but cost
+# 16-26 % on the OData and MCP benches. Vanilla links none of these crates.
 # surfaces-threat-model 10.1: the new crates keep overflow checks in release.
 [profile.release.package.antares-ops]
 overflow-checks = true
+opt-level = "s"
 
 [profile.release.package.linkml-model]
 overflow-checks = true
+opt-level = "s"
 
 [profile.release.package.odata-csdl]
 overflow-checks = true
+opt-level = "s"
 
 [profile.release.package.odata-url]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.odata-json]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.odata-batch]
 overflow-checks = true
+opt-level = "s"
 
 [profile.release.package.odata-axum]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.antares-views]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.antares-mcp]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.antares-odata]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.antares-ws]
 overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.rmcp]
+codegen-units = 1
+
+[profile.release.package.schemars]
+opt-level = "s"
 
 [profile.wasm-release]
 inherits = "release"
