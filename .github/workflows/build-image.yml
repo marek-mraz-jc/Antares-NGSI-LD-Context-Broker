@@ -25,6 +25,12 @@ on:
         description: "amd64 (default) or arm64"
         type: string
         default: amd64
+      ref:
+        # the commit to test (ci.yml under workflow_run passes the head_sha
+        # of the green fast run; empty is the triggering commit)
+        description: "commit to check out (empty: the triggering commit)"
+        type: string
+        default: ""
 
 # Builds and uploads an image tarball as an artifact; nothing is
 # published from here, so the token only has to read the checkout.
@@ -41,6 +47,8 @@ jobs:
       ART: ${{ inputs.arch == 'arm64' && 'antares-image-arm64' || 'antares-image' }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: docker/setup-buildx-action@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -58,7 +66,7 @@ jobs:
           tags: antares-local:${{ env.TAG }}
           build-args: |
             VERSION=${{ github.ref_name }}
-            REVISION=${{ github.sha }}
+            REVISION=${{ inputs.ref || github.sha }}
           load: true
           # The layer cache is read by everything but a release and written
           # only by this repository's own branches: a pull request starts

@@ -55,6 +55,10 @@ pub const MAX_VIEW_BYTES: usize = 64 * 1024;
 /// every request through the view evaluates each of them).
 pub const MAX_RULES: usize = 64;
 
+/// The one name that is no name: a view of every type and every
+/// Attribute writes it alone (ADR-0023 rule 12).
+pub const EVERY: &str = "*";
+
 /// The most names in one list of a view: its selector, a rule's types or
 /// Attributes, its operations.
 pub const MAX_NAMES: usize = 256;
@@ -102,6 +106,12 @@ pub struct View {
     pub rules: Vec<ViewRule>,
     /// The operations it allows, as `operation-matrix.yaml` ids.
     pub operations: Vec<String>,
+    /// The compiled Mapping IR of a view of another model (gap G18,
+    /// `docs/analysis/view-mapping.md` section 3): the view serves its
+    /// target class, selects its source class alone, and allows only
+    /// [`crate::mapping::READS`].
+    #[serde(default)]
+    pub mapping: Option<Value>,
 }
 
 /// One allowlist of a [`View`]: the Entities of `types` for which the
@@ -152,6 +162,8 @@ pub struct Loaded {
     /// Attribute they do not show, a temporal view keyed on a mutable
     /// member.
     pub notes: Vec<String>,
+    /// The compiled Mapping of a view of another model.
+    pub mapping: Option<Arc<crate::mapping::Mapping>>,
 }
 
 impl View {
@@ -169,6 +181,39 @@ impl View {
             return Err(format!("a view document is at most {MAX_VIEW_BYTES} bytes"));
         }
         serde_json::from_slice(bytes).map_err(|e| format!("not a view: {e}"))
+    }
+
+    /// Whether this is ADR-0023 rule 12's view of every type and every
+    /// Attribute: `selector ["*"]` and the one rule `{types ["*"],
+    /// attributes ["*"]}` with no condition of its own. `*` anywhere else is
+    /// an error, before any name is expanded, so no `@context` turns it into
+    /// a name.
+    fn is_every(&self) -> Result<bool, String> {
+        let star = |names: &[String]| names.iter().any(|n| n == EVERY);
+        let only = |names: &[String]| names.len() == 1 && star(names);
+        if !star(&self.selector)
+            && !self
+                .rules
+                .iter()
+                .any(|r| star(&r.types) || star(&r.attributes))
+        {
+            return Ok(false);
+        }
+        match self.rules.as_slice() {
+            [r] if only(&self.selector)
+                && only(&r.types)
+                && only(&r.attributes)
+                && r.q.is_none()
+                && r.scope_q.is_none()
+                && r.geo_q.is_none() =>
+            {
+                Ok(true)
+            }
+            _ => Err(format!(
+                "`{EVERY}` stands alone (ADR-0023 rule 12): selector [\"{EVERY}\"] and the one \
+                 rule {{\"types\": [\"{EVERY}\"], \"attributes\": [\"{EVERY}\"]}}"
+            )),
+        }
     }
 
     /// Validate the view and compile it (ADR-0023 rule 10): its id, its
@@ -197,31 +242,53 @@ impl View {
             ctx.merge_object(local)
                 .map_err(|e| format!("the view's @context: {e}"))?;
         }
-        let selector = expand_all("selector", &self.selector, &ctx)?;
-        if self.rules.len() > MAX_RULES {
-            return Err(format!("a view holds at most {MAX_RULES} rules"));
-        }
-        let rules = self
-            .rules
-            .iter()
-            .enumerate()
-            .map(|(i, r)| compile_rule(i, r, &ctx))
-            .collect::<Result<Vec<_>, _>>()?;
-        let notes = disclosures(&rules);
-        let operations = operations(&self.operations)?;
-        let view = CompiledView::new(
-            &selector,
+        let (q, scope, geo) = (
             parse_q("q", self.q.as_deref())?,
             scope_q("scopeQ", self.scope_q.as_deref())?,
             geo_q("geoQ", self.geo_q.as_ref())?,
-            rules,
-        )?
-        .named(&self.id);
+        );
+        let operations = operations(&self.operations)?;
+        let (view, notes, selector) = if self.is_every()? {
+            (
+                CompiledView::every(q, scope, geo),
+                Vec::new(),
+                vec![EVERY.to_owned()],
+            )
+        } else {
+            let selector = expand_all("selector", &self.selector, &ctx)?;
+            if self.rules.len() > MAX_RULES {
+                return Err(format!("a view holds at most {MAX_RULES} rules"));
+            }
+            let rules = self
+                .rules
+                .iter()
+                .enumerate()
+                .map(|(i, r)| compile_rule(i, r, &ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            let notes = disclosures(&rules);
+            (
+                CompiledView::new(&selector, q, scope, geo, rules)?,
+                notes,
+                selector,
+            )
+        };
+        let mapping = match &self.mapping {
+            None => None,
+            Some(ir) => Some(Arc::new(mapped(
+                ir,
+                &ctx,
+                self.context.as_ref(),
+                &selector,
+                &operations,
+            )?)),
+        };
+        let view = view.named(&self.id);
         let mut loaded = Loaded {
             view: Arc::new(view),
             tenant: tenant.as_str().to_owned(),
             operations,
             notes,
+            mapping,
         };
         if self.q.is_some()
             && loaded
@@ -239,6 +306,32 @@ impl View {
         }
         Ok(loaded)
     }
+}
+
+/// Section 3 and 7: the IR compiles, the view selects its source class
+/// alone (any other type would be served rebuilt as the target class), and
+/// it allows only the reads a mapping inverts.
+fn mapped(
+    ir: &Value,
+    ctx: &Context,
+    own: Option<&serde_json::Map<String, Value>>,
+    selector: &[String],
+    operations: &[OperationId],
+) -> Result<crate::mapping::Mapping, String> {
+    let mapping = crate::mapping::Mapping::compile(ir, ctx, own)?;
+    if selector != [mapping.source_class()] {
+        return Err("a mapped view selects its mapping's sourceClass and nothing else".into());
+    }
+    if let Some(op) = operations
+        .iter()
+        .find(|op| !crate::mapping::READS.contains(op))
+    {
+        return Err(format!(
+            "a mapped view is read only: {:?} is not one of the reads a mapping inverts",
+            op.id()
+        ));
+    }
+    Ok(mapping)
 }
 
 fn valid_id(id: &str) -> bool {
@@ -369,6 +462,9 @@ fn entry(doc: &Value) -> ViewEntry {
             tenant: l.tenant,
             operations: l.operations.iter().map(|op| op.id().to_owned()).collect(),
             notes: l.notes,
+            mapping: l
+                .mapping
+                .map(|m| antares_api::views::Attached(m as Arc<dyn std::any::Any + Send + Sync>)),
         },
         Err(reason) => ViewEntry::Invalid { reason },
     }
@@ -795,6 +891,83 @@ mod tests {
         let mut v = base();
         v[member] = value;
         v
+    }
+
+    fn mapped() -> Value {
+        let mut v = with(
+            "mapping",
+            json!({"version": 2, "sourceClass": "Car", "targetClass": "Vehicle",
+                   "slots": [{"target": "velocity", "source": "speed", "kind": "rename"}]}),
+        );
+        v["operations"] = json!([
+            "retrieve_entity",
+            "query_entities",
+            "retrieve_attribute_value"
+        ]);
+        v
+    }
+
+    #[test]
+    fn a_mapped_view_serves_the_temporal_and_discovery_reads() {
+        let mut v = mapped();
+        v["operations"] = json!(crate::mapping::READS
+            .iter()
+            .map(|op| op.id())
+            .collect::<Vec<_>>());
+        let loaded = load(&v).map(|l| l.operations.len());
+        assert_eq!(loaded, Ok(11));
+    }
+
+    #[test]
+    fn a_mapped_view_loads_with_its_mapping() {
+        let loaded = load(&mapped());
+        assert_eq!(
+            loaded
+                .ok()
+                .and_then(|l| l.mapping.map(|m| m.source_class().to_owned())),
+            Some("https://uri.etsi.org/ngsi-ld/default-context/Car".to_owned())
+        );
+        assert!(load(&base()).is_ok_and(|l| l.mapping.is_none()));
+    }
+
+    #[test]
+    fn a_mapped_view_is_read_only_selects_its_source_class_alone_and_runs_a_valid_ir() {
+        for op in [
+            "create_entity",
+            "create_subscription",
+            "batch_upsert",
+            "query_entities_post",
+            "temporal_query_post",
+            "temporal_upsert",
+            "create_temporal_entity_map",
+        ] {
+            let mut v = mapped();
+            v["operations"] = json!(["query_entities", op]);
+            let e = load(&v).err().unwrap_or_default();
+            assert!(e.contains("read only"), "{op}: {e}");
+        }
+        for selector in [json!(["Truck"]), json!(["Car", "Truck"])] {
+            let mut v = mapped();
+            v["selector"] = selector.clone();
+            v["rules"] = json!([{"types": ["Car", "Truck"], "attributes": ["speed"]}]);
+            let e = load(&v).err().unwrap_or_default();
+            assert!(
+                e.contains("sourceClass and nothing else"),
+                "{selector}: {e}"
+            );
+        }
+        let mut v = mapped();
+        v["mapping"]["version"] = json!(1);
+        assert!(load(&v).err().unwrap_or_default().contains("version 1"));
+    }
+
+    #[test]
+    fn a_view_of_everything_takes_no_mapping() {
+        let mut v = mapped();
+        v["selector"] = json!([EVERY]);
+        v["rules"] = json!([{"types": [EVERY], "attributes": [EVERY]}]);
+        let e = load(&v).err().unwrap_or_default();
+        assert!(e.contains("sourceClass and nothing else"), "{e}");
     }
 
     #[test]

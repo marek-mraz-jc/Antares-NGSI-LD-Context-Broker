@@ -105,6 +105,35 @@ pub struct Subject {
     pub headers: Vec<(String, String)>,
 }
 
+/// The name of the reserved pair in [`Subject::headers`] that says which view
+/// the request came through (ADR-0020 amendment, T-3702). `@` is no
+/// header-name character (RFC 9110 `tchar`), so no request can carry it:
+/// only [`through_view`] puts it there.
+pub const VIEW_PAIR: &str = "@view";
+
+tokio::task_local! {
+    /// The view the in-process request running in this task came through.
+    static VIEW: std::sync::Arc<str>;
+}
+
+/// Runs `f` as a request through the view `id`: every [`Subject`] built in
+/// it carries the [`VIEW_PAIR`]. The view surfaces' operation layer is the
+/// one caller; a request off the socket never runs inside it.
+pub async fn through_view<F: Future>(id: &str, f: F) -> F::Output {
+    VIEW.scope(std::sync::Arc::from(id), f).await
+}
+
+impl Subject {
+    /// The view the request came through, if it came through one.
+    #[must_use]
+    pub fn view(&self) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(name, _)| name == VIEW_PAIR)
+            .map(|(_, id)| id.as_str())
+    }
+}
+
 impl std::fmt::Debug for Subject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Subject")
@@ -1408,6 +1437,9 @@ pub fn subject_of(tenant: &antares_model::TenantId, headers: &HeaderMap) -> Subj
             }
         }
     }
+    if let Ok(view) = VIEW.try_with(std::sync::Arc::clone) {
+        carried.push((VIEW_PAIR.to_owned(), view.to_string()));
+    }
     Subject {
         tenant: tenant.clone(),
         headers: carried,
@@ -1623,11 +1655,14 @@ fn record_image(doc: &Value) -> Value {
             }
         }
     }
-    let carried: Vec<(String, String)> = doc
+    let mut carried: Vec<(String, String)> = doc
         .get(SUBJECT_MEMBER)
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
+    // The view is where the creator came from, not who they are: a view
+    // id equal to some user's name must not select that user's documents.
+    carried.retain(|(name, _)| name != VIEW_PAIR);
     if !carried.is_empty() {
         let values = carried
             .into_iter()
@@ -2668,6 +2703,62 @@ mod tests {
         );
     }
 
+    /// T-3729: a notification's shown set outlives its rules unchanged; an
+    /// empty set would show the whole Entity.
+    #[test]
+    fn an_owned_shown_set_keeps_both_sets() {
+        let shown = Shown {
+            only: Some(std::collections::BTreeSet::from([Cow::Borrowed("a")])),
+            omitted: std::collections::BTreeSet::from([Cow::Borrowed("b")]),
+        };
+        let owned = shown.clone().into_owned();
+        assert_eq!(owned, shown);
+        assert!(owned.allows("a") && !owned.allows("b") && !owned.allows("c"));
+    }
+
+    /// T-3729: only a rule with no condition, ids or id patterns admits by
+    /// type alone, the one the store may page as a type selection.
+    #[test]
+    fn a_rule_admits_by_type_alone_only_without_condition_or_ids() {
+        let typed = Rule {
+            types: vec![iri("Car")],
+            ..Rule::default()
+        };
+        assert!(typed.admits_by_type_alone());
+        for narrowed in [
+            Rule {
+                ids: vec!["urn:ngsi-ld:Car:1".into()],
+                ..typed.clone()
+            },
+            Rule {
+                id_patterns: vec!["urn:.*".into()],
+                ..typed.clone()
+            },
+            Rule {
+                scope_q: Some("/a/#".into()),
+                ..typed.clone()
+            },
+        ] {
+            assert!(!narrowed.admits_by_type_alone(), "{narrowed:?}");
+        }
+    }
+
+    /// T-3729: the broker's `__` members of a stored Subscription or
+    /// Registration are no Attributes a condition reads.
+    #[test]
+    fn a_record_image_leaves_the_brokers_members_out() {
+        let image = record_image(&json!({"id": "urn:ngsi-ld:Subscription:1",
+            "type": "Subscription", "__tenant": "acme", "description": "d"}));
+        let keys: Vec<&String> = image
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys.len(), 3, "{image}");
+        assert!(keys.iter().all(|k| !k.contains("__")), "{image}");
+    }
+
     #[test]
     fn a_filter_says_its_areas_its_rules_and_its_restriction() {
         let both = Filter {
@@ -3179,5 +3270,68 @@ mod tests {
             image.stored.map(|s| s.attribute_names),
             Some(vec![iri("speed")])
         );
+    }
+
+    /// T-3702: a subject built inside a view's scope names the view, one
+    /// built outside names none, and no request can carry the pair.
+    #[tokio::test]
+    async fn a_subject_names_the_view_it_came_through_and_nothing_else_can() {
+        let tenant = antares_model::TenantId::default();
+        let plain = subject_of(&tenant, &HeaderMap::new());
+        assert_eq!(plain.view(), None);
+        let inside = through_view("cars", async { subject_of(&tenant, &HeaderMap::new()) }).await;
+        assert_eq!(inside.view(), Some("cars"));
+        let nested = through_view(
+            "cars",
+            through_view("bikes", async { subject_of(&tenant, &HeaderMap::new()) }),
+        )
+        .await;
+        assert_eq!(nested.view(), Some("bikes"), "the innermost view decides");
+        assert!(
+            axum::http::HeaderName::from_bytes(VIEW_PAIR.as_bytes()).is_err(),
+            "{VIEW_PAIR} must not be a header name a client could send"
+        );
+    }
+
+    /// T-3702: the view is stored with the subject (a notification is
+    /// decided for it), and a condition never reads it as one of the
+    /// creator's values.
+    #[test]
+    fn the_view_is_stored_with_the_subject_and_never_read_as_its_value() {
+        let tenant = antares_model::TenantId::default();
+        let subject = Subject {
+            tenant: tenant.clone(),
+            headers: vec![
+                ("x-jc-subject".into(), "ana".into()),
+                (VIEW_PAIR.into(), "ana".into()),
+            ],
+        };
+        let mut doc = json!({"id": "urn:ngsi-ld:Subscription:1", "type": "Subscription"});
+        if let (Some(o), Some(member)) = (doc.as_object_mut(), subject_member(&subject)) {
+            o.insert(SUBJECT_MEMBER.into(), member);
+        }
+        let stored = stored_subject(&tenant, &doc);
+        assert_eq!(stored.view(), Some("ana"));
+        assert!(belongs_to(&doc, &subject));
+        let through_other = Subject {
+            tenant: tenant.clone(),
+            headers: vec![
+                ("x-jc-subject".into(), "ana".into()),
+                (VIEW_PAIR.into(), "bikes".into()),
+            ],
+        };
+        assert!(
+            !belongs_to(&doc, &through_other),
+            "another view, another creator"
+        );
+        let image = record_image(&doc);
+        let values: Vec<&Value> = image
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, _)| k.ends_with("subject"))
+            .flat_map(|(_, v)| v.as_array().into_iter().flatten())
+            .collect();
+        assert_eq!(values, [&json!({"value": "ana"})], "{image}");
     }
 }

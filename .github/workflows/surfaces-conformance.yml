@@ -31,6 +31,10 @@ name: surfaces-conformance
 #                    commit (dev/etsi-baseline.py compare); not per pull
 #                    request
 #
+# The fast lane (fast.yml) calls this file with `fast: true` on a push to
+# dev that touches a surface crate: build, odata-conformance (the
+# merge-request subset) and odata-compliance-external.
+#
 # Pull requests to dev run the merge-request subset (both official
 # revisions, the parity suite trimmed to MCP_PARITY_CASES=5, the OData ABNF
 # and $metadata cases); the nightly run, v* tags and dispatch run
@@ -44,9 +48,18 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  # fast.yml (T-3765): the OData jobs only, on a push to dev that touches a
+  # surface crate; every job without `!inputs.fast` belongs to that subset
+  workflow_call:
+    inputs:
+      fast:
+        type: boolean
+        default: false
 
 concurrency:
-  group: surfaces-conformance-${{ github.ref }}
+  # under workflow_call github.workflow is the caller's name, so the fast
+  # lane's call never cancels a nightly or pull-request run of this file
+  group: surfaces-conformance-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -55,9 +68,10 @@ permissions:
 env:
   # joinedcontext-conformance (public) at the commit that carries the
   # broker's MCP parity table, the platform_only marker, tests/odata and
-  # its client checks, and tests/ws
-  CONFORMANCE_REF: c897b11dee3ddc65909c20849e98d01ed0344ecb
-  NIGHTLY: ${{ github.event_name != 'pull_request' }}
+  # its client checks, tests/ws, the F21/F29 parity rows (T-3686) and
+  # the bind-to-an-absent-target 400 (T-3760)
+  CONFORMANCE_REF: e77fa00765d291dc89bffd37b30986e66e77bbc3
+  NIGHTLY: ${{ github.event_name != 'pull_request' && !inputs.fast }}
 
 jobs:
   build:
@@ -80,6 +94,7 @@ jobs:
 
   mcp-conformance:
     name: mcp-conformance
+    if: ${{ !inputs.fast }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -128,6 +143,7 @@ jobs:
 
   mcp-suites:
     name: mcp-suites
+    if: ${{ !inputs.fast }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -326,6 +342,7 @@ jobs:
 
   ws-conformance:
     name: ws-conformance
+    if: ${{ !inputs.fast }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -389,7 +406,7 @@ jobs:
   # one page of view all, then the restricted view without NO2. Nightly.
   odata-clients:
     name: odata-clients-${{ matrix.client }}
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && !inputs.fast
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -450,7 +467,7 @@ jobs:
   # run, so nightly, v* tags and dispatch only, never per pull request.
   etsi-iop-run:
     name: etsi-iop ${{ matrix.variant }}
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && !inputs.fast
     strategy:
       fail-fast: false
       matrix:

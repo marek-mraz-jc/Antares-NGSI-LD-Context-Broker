@@ -8,11 +8,15 @@ use antares_ql::geo::GeoQuery;
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Document {
     policies: Vec<PolicyDoc>,
+    /// The policies each listed view is decided by (README section 2).
+    #[serde(default)]
+    views: HashMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -180,6 +184,17 @@ impl Policy {
 pub struct Table {
     /// In document order.
     pub policies: Vec<Policy>,
+    /// Per listed view, the table of its policies alone, in document order.
+    pub views: HashMap<String, Arc<Table>>,
+}
+
+impl Table {
+    /// The table a request through `view` is decided by: the view's own
+    /// when the document lists it, this one otherwise.
+    #[must_use]
+    pub fn through(&self, view: Option<&str>) -> &Table {
+        view.and_then(|v| self.views.get(v)).map_or(self, |t| t)
+    }
 }
 
 /// The core `@context` every name is expanded by: the broker hands the
@@ -205,7 +220,33 @@ pub fn compile(doc: &serde_json::Value) -> Result<Table, String> {
         }
         policies.push(policy(p)?);
     }
-    Ok(Table { policies })
+    let mut views = HashMap::with_capacity(doc.views.len());
+    for (view, ids) in doc.views {
+        let mut listed = BTreeSet::new();
+        for id in &ids {
+            if !seen.contains(id) {
+                return Err(format!(
+                    "view {view:?} names policy {id:?}, which is not in the document"
+                ));
+            }
+            if !listed.insert(id.as_str()) {
+                return Err(format!("view {view:?} names policy {id:?} twice"));
+            }
+        }
+        let own = policies
+            .iter()
+            .filter(|p| listed.contains(p.id.as_str()))
+            .cloned()
+            .collect();
+        views.insert(
+            view,
+            Arc::new(Table {
+                policies: own,
+                views: HashMap::new(),
+            }),
+        );
+    }
+    Ok(Table { policies, views })
 }
 
 fn policy(p: PolicyDoc) -> Result<Policy, String> {
@@ -390,7 +431,8 @@ fn bound(raw: &str) -> Result<TimeBound, String> {
     }
     match duration(raw) {
         Some(d) if d < Duration::zero() => Ok(TimeBound::Ago(d.abs())),
-        Some(_) => Err(format!("{raw:?} lies in the future")),
+        // zero is now, which no window reaches back to
+        Some(_) => Err(format!("{raw:?} does not lie in the past")),
         None => Err(format!(
             "{raw:?} is neither an instant nor a duration in weeks, days, hours, minutes and seconds"
         )),
@@ -408,6 +450,7 @@ fn duration(raw: &str) -> Option<Duration> {
     let (date, time) = rest.split_once('T').unwrap_or((rest, ""));
     let mut total = Duration::zero();
     let mut digits = String::new();
+    let mut units_seen = false;
     for (part, units) in [(date, "WD"), (time, "HMS")] {
         for c in part.chars() {
             match c {
@@ -416,6 +459,7 @@ fn duration(raw: &str) -> Option<Duration> {
                 u if units.contains(u) => {
                     let n: i64 = digits.parse().ok()?;
                     digits.clear();
+                    units_seen = true;
                     total = total.checked_add(&match u {
                         'W' => Duration::try_weeks(n)?,
                         'D' => Duration::try_days(n)?,
@@ -428,7 +472,7 @@ fn duration(raw: &str) -> Option<Duration> {
             }
         }
     }
-    (digits.is_empty() && total != Duration::zero()).then(|| total.checked_mul(sign))?
+    (digits.is_empty() && units_seen).then(|| total.checked_mul(sign))?
 }
 
 /// The scope paths of a `scopeQ`, whose operators separate them; a trailing
@@ -537,7 +581,7 @@ mod tests {
             ),
             (
                 json!({"policies": [with("temporalQ", json!("timerel=after;timeAt=P1D"))]}),
-                "future",
+                "past",
             ),
             (
                 json!({"policies": [with("temporalQ", json!("timerel=after;timeAt=P1Y"))]}),
@@ -593,6 +637,26 @@ mod tests {
             let why = compile(&doc).err().unwrap_or_default();
             assert!(why.contains(said), "{doc}: {why:?} does not say {said:?}");
         }
+    }
+
+    /// T-3729: names expand by the core `@context`, the form the broker
+    /// hands the engine; a policy's own conditions show every Attribute;
+    /// an `idPattern` selects by its pattern.
+    #[test]
+    fn a_selector_keeps_its_id_pattern_and_the_conditions_every_attribute() -> Result<(), String> {
+        assert_eq!(
+            context().expand_key("location"),
+            "https://uri.etsi.org/ngsi-ld/location"
+        );
+        let p = one(&with(
+            "information",
+            json!([{"entities": [{"type": "Car", "idPattern": "urn:ngsi-ld:Car:a.*"}]}]),
+        ))?;
+        assert!(p.conditions.every_attribute);
+        let car = p.selectors.first().ok_or("no Car selector")?;
+        assert_eq!(car.id_patterns, ["urn:ngsi-ld:Car:a.*"]);
+        assert!(car.selects_id("urn:ngsi-ld:Car:a1") && !car.selects_id("urn:ngsi-ld:Car:b1"));
+        Ok(())
     }
 
     #[test]
@@ -651,11 +715,16 @@ mod tests {
             "P1",
             "P1M",
             "PT1D",
-            "P0D",
+            "P1-2D",
             "Px",
             "-P100000000000DT2000000000000H",
         ] {
             assert_eq!(duration(bad), None, "{bad}");
+        }
+        // T-3729: a bound is a duration strictly before now
+        assert_eq!(duration("P0D"), Some(Duration::zero()));
+        for (raw, ok) in [("P0D", false), ("PT1S", false), ("-PT1S", true)] {
+            assert_eq!(bound(raw).is_ok(), ok, "{raw}");
         }
     }
 

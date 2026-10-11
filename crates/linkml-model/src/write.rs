@@ -4,12 +4,13 @@
 //! IRI and text the schema supplies is quoted and escaped for the format it
 //! lands in, so no value can change a document's structure (threat LK3).
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use serde_json::{json, Map, Value};
 
 use crate::model::{Builtin, Model, Range};
-use crate::schema::Slot;
+use crate::schema::{Annotation, Slot};
 
 // ---------------------------------------------------------------- YAML (L2)
 
@@ -84,6 +85,24 @@ fn flag(map: &mut Vec<(String, Node)>, key: &str, value: Option<bool>) {
     }
 }
 
+/// `annotations:` in LinkML's expanded `tag`/`value` form, when there are any.
+fn annotations(map: &mut Vec<(String, Node)>, tagged: &BTreeMap<String, Annotation>) {
+    if tagged.is_empty() {
+        return;
+    }
+    let body = tagged
+        .iter()
+        .map(|(k, a)| {
+            let pair = vec![
+                ("tag".to_owned(), Node::Str(a.tag.clone())),
+                ("value".to_owned(), Node::Str(a.value.clone())),
+            ];
+            (k.clone(), Node::Map(pair))
+        })
+        .collect();
+    map.push(("annotations".to_owned(), Node::Map(body)));
+}
+
 fn slot_node(slot: &Slot) -> Node {
     let mut m = Vec::new();
     opt(&mut m, "name", slot.name.as_ref());
@@ -91,6 +110,7 @@ fn slot_node(slot: &Slot) -> Node {
     opt(&mut m, "range", slot.range.as_ref());
     flag(&mut m, "required", slot.required);
     flag(&mut m, "multivalued", slot.multivalued);
+    flag(&mut m, "identifier", slot.identifier);
     flag(&mut m, "inlined", slot.inlined);
     opt(&mut m, "inverse", slot.inverse.as_ref());
     if let Some(u) = &slot.unit {
@@ -105,20 +125,7 @@ fn slot_node(slot: &Slot) -> Node {
         }
         m.push(("unit".to_owned(), Node::Map(unit)));
     }
-    if !slot.annotations.is_empty() {
-        let annotations = slot
-            .annotations
-            .iter()
-            .map(|(k, a)| {
-                let body = vec![
-                    ("tag".to_owned(), Node::Str(a.tag.clone())),
-                    ("value".to_owned(), Node::Str(a.value.clone())),
-                ];
-                (k.clone(), Node::Map(body))
-            })
-            .collect();
-        m.push(("annotations".to_owned(), Node::Map(annotations)));
-    }
+    annotations(&mut m, &slot.annotations);
     opt(&mut m, "description", slot.description.as_ref());
     Node::Map(m)
 }
@@ -184,6 +191,7 @@ pub fn yaml(model: &Model) -> String {
                         .collect();
                     m.push(("slot_usage".to_owned(), Node::Map(usage)));
                 }
+                annotations(&mut m, &c.annotations);
                 opt(&mut m, "description", c.description.as_ref());
                 (k.clone(), Node::Map(m))
             })
