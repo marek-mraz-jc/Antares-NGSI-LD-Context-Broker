@@ -84,6 +84,10 @@ services:
       ANTARES_STORE: ${STORE:-memory}
       # the all-features cells (external-suites.yml) mount every surface the image has
       ANTARES_API_SURFACES: ${API_SURFACES:-admin}
+      # ADR-0025 equivalence layer 3 (etsi-icsr, surfaces-conformance.yml):
+      # this broker's own URL on the internal-csr image; empty elsewhere,
+      # which the vanilla build reads as unset (one warning)
+      ANTARES_SELF_URLS: ${SELF_URLS:-}
       # Each broker owns its own database, so one process per store is the
       # deployment shape the default bus assumes.
       ANTARES_ALLOW_SHARED_LOCAL: "1"
