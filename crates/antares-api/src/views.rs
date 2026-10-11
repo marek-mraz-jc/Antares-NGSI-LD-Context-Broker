@@ -446,6 +446,9 @@ pub enum ViewEntry {
         /// only the view root reads; the broker carries it and never looks
         /// inside.
         mapping: Option<Attached>,
+        /// The view's own `@context` as written, which a surface reads the
+        /// NGSI-LD names a caller writes under (ADR-0028 rule 6).
+        context: Option<Arc<serde_json::Map<String, serde_json::Value>>>,
     },
     /// A stored view that failed validation: never served, named in
     /// `/q/health` with the reason.

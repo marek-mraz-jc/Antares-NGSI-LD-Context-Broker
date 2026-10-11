@@ -247,7 +247,7 @@ async fn top_and_skip_page_and_the_next_link_carries_the_rest() {
         .to_owned();
     assert!(
         next.starts_with(&format!(
-            "{PUBLIC}{ROOT}/Car?$filter=speed%20gt%201&$skiptoken=1.1."
+            "{PUBLIC}{ROOT}/Car?$filter=speed%20gt%201&$skiptoken=2.1.0.1."
         )),
         "{next}"
     );
