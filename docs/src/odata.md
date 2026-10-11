@@ -208,7 +208,9 @@ the request's `$orderby` and then `id`, at most 10 000 per request: a page
 that runs out of budget is served short with its next link.
 `$count=true`, `/$count` and a `$orderby` on `createdAt` or `modifiedAt`
 read the whole answer, which is `400` `TooManyResults` when the broker
-counts more than 10 000 Entities.
+counts more than 10 000 Entities. Such a read beside an `$expand` of
+entities, or with a navigation hop in the filter, is `501` until the scan
+can see a truncated join (T-3823).
 
 The custom options `ngsild.q`, `ngsild.scopeQ`, `ngsild.georel`,
 `ngsild.geometry`, `ngsild.coordinates`, `ngsild.geoproperty`,
