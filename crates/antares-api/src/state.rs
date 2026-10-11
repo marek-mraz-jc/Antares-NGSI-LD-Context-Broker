@@ -114,6 +114,11 @@ pub struct AppState {
     /// costs about 1.5 ms, which is worth memoizing per state and not worth
     /// paying in a host that never makes an in-process call.
     pub(crate) inbound: Arc<std::sync::OnceLock<axum::Router>>,
+    /// The transport every federation forward asks before the socket
+    /// (ADR-0025 rule 8): shared by every clone, so a state made before the
+    /// transport was registered (the one an `Ops` holds) forwards through it
+    /// too. Empty in vanilla: every forward is HTTP.
+    pub(crate) forward_transport: Arc<std::sync::OnceLock<Arc<dyn crate::ForwardTransport>>>,
     /// The endpoint view every operation through this state is narrowed to
     /// (ADR-0023); `None` serves the NGSI-LD API as it is.
     #[cfg(feature = "views")]
@@ -440,6 +445,7 @@ impl AppState {
             ),
             sinks: Arc::new(sinks),
             inbound: Arc::new(std::sync::OnceLock::new()),
+            forward_transport: Arc::new(std::sync::OnceLock::new()),
             #[cfg(feature = "views")]
             view: None,
             #[cfg(feature = "views")]
@@ -550,6 +556,60 @@ impl AppState {
             .map_err(|e| e.to_string())
     }
 
+    /// Every stored policy rule document (ADR-0020 amendment), as written.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn policy_docs(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.store
+            .list(&policy_tenant()?, antares_store::Kind::View)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The stored policy rule document of `tenant`, if there is one.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn policy_doc(&self, tenant: &str) -> Result<Option<serde_json::Value>, String> {
+        self.store
+            .get(&policy_tenant()?, antares_store::Kind::View, tenant)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Store the policy rule document of `tenant`; `true` when it replaced
+    /// one. The caller bounded it and the engine took it.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn put_policy_doc(
+        &self,
+        tenant: &str,
+        doc: serde_json::Value,
+    ) -> Result<bool, String> {
+        self.store
+            .upsert(&policy_tenant()?, antares_store::Kind::View, tenant, doc)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove the policy rule document of `tenant`; `false` when there was
+    /// none.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn delete_policy_doc(&self, tenant: &str) -> Result<bool, String> {
+        self.store
+            .delete(&policy_tenant()?, antares_store::Kind::View, tenant)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// The engine `/q/health` reports. No engine reports the built-in name:
     /// the decision an operator reads is the one the broker takes.
     pub fn policy_name(&self) -> &str {
@@ -576,6 +636,27 @@ impl AppState {
             None => tracing::warn!("sink registry already shared; binding not registered"),
         }
         self
+    }
+
+    /// Register the transport every federation forward asks before the
+    /// socket (ADR-0025 rule 8, as amended by ADR-0027 section 9). A
+    /// forward it answers `None` for goes over HTTP as before. Every clone
+    /// of this state shares the one slot, before or after this call. The
+    /// transport usually holds such a clone, so it lives as long as the
+    /// state's last clone does: register it in a host that keeps its state
+    /// for the life of the process, as the broker does.
+    ///
+    /// # Errors
+    /// When a transport is already registered: a second one would leave
+    /// the choice between them to registration order.
+    pub fn with_forward_transport(
+        self,
+        transport: Arc<dyn crate::ForwardTransport>,
+    ) -> Result<Self, String> {
+        self.forward_transport
+            .set(transport)
+            .map_err(|_| "a forward transport is already registered".to_owned())?;
+        Ok(self)
     }
 
     /// Mount one more HTTP surface (`/q`, `/x`, or below `/x`). A prefix
@@ -852,6 +933,11 @@ pub fn now_iso() -> String {
 #[cfg(feature = "views")]
 fn view_tenant() -> Result<antares_model::TenantId, String> {
     antares_model::TenantId::new_internal(crate::views::VIEW_TENANT).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "views")]
+fn policy_tenant() -> Result<antares_model::TenantId, String> {
+    antares_model::TenantId::new_internal(crate::views::POLICY_TENANT).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

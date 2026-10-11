@@ -306,6 +306,10 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
 /// document kind they are stored as.
 pub const VIEW_TENANT: &str = "antares-views";
 
+/// The reserved tenant the policy engine's rule documents live under
+/// (ADR-0020 amendment), one document per Tenant, keyed by its name.
+pub const POLICY_TENANT: &str = "antares-policy";
+
 /// One view of the table.
 #[derive(Debug, Clone)]
 pub enum ViewEntry {
@@ -337,6 +341,7 @@ pub enum ViewEntry {
 pub struct ViewTable {
     entries: std::sync::RwLock<Arc<BTreeMap<String, ViewEntry>>>,
     admin: std::sync::OnceLock<axum::Router>,
+    policy: std::sync::RwLock<serde_json::Value>,
     schemas: std::sync::RwLock<Arc<BTreeMap<String, Schema>>>,
 }
 
@@ -462,6 +467,24 @@ impl ViewTable {
                 })
                 .collect(),
         )
+    }
+
+    /// What `/q/health` lists of the policy rule documents (ADR-0020
+    /// amendment): set by the loader on every reload, `null` until it runs
+    /// with an engine that reads documents. Tenant and revision only.
+    pub fn policy_report(&self) -> serde_json::Value {
+        self.policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace what [`policy_report`](Self::policy_report) answers.
+    pub fn set_policy_report(&self, report: serde_json::Value) {
+        *self
+            .policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = report;
     }
 
     /// The `/q/views` routes the loader serves, merged into the admin
