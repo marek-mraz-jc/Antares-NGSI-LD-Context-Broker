@@ -44,7 +44,7 @@ fuzz_target!(|data: &[u8]| {
     let Some(buildings) = Resource::new(&model, "Buildings") else {
         return;
     };
-    let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_01 };
+    let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_01, metadata_etag: None };
     let limits = BodyLimits { max_bytes: 4096, max_properties: 64, max_bind_links: 4, max_collection_len: 32, ..BodyLimits::strict() };
     let Ok(payload) = read_entity_body(&ctx, &buildings, WriteKind::Update, data, &limits) else {
         return;

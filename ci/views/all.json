@@ -12,7 +12,8 @@
       "attributes": [
         "temperature",
         "NO2",
-        "location"
+        "location",
+        "nearest"
       ]
     }
   ],

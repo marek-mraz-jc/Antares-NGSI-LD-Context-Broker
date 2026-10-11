@@ -513,6 +513,13 @@ impl Rule {
         self.q.is_some() || self.scope_q.is_some() || self.areas().next().is_some()
     }
 
+    /// Whether the rule holds for exactly the Entities of its types: no
+    /// condition, no ids, no id patterns (what [`Self::holds`] reads beside
+    /// the types).
+    pub fn admits_by_type_alone(&self) -> bool {
+        !self.is_conditional() && self.ids.is_empty() && self.id_patterns.is_empty()
+    }
+
     /// Whether the rule holds for `doc`, an Entity in the form `ctx`
     /// expands names to (the broker's internal form: expanded keys, each
     /// Attribute an array of instances).
@@ -680,6 +687,12 @@ impl Filter {
         !self.rules.is_empty() || !self.omit_by_type.is_empty()
     }
 
+    /// Whether a rule holds for `doc` (every document without rules): what
+    /// [`Self::shown`] answers `Some` for, without building the set.
+    pub fn admits(&self, doc: &Value, ctx: &antares_jsonld::Context) -> bool {
+        self.rules.is_empty() || self.rules.iter().any(|r| r.holds(doc, ctx))
+    }
+
     /// ADR-0023 rule 11: what `doc` may show, or `None` when `rules` is
     /// non-empty and none holds for it (the Entity is out). An Entity sees
     /// the union of the Attributes of the rules that hold for it, less what
@@ -694,6 +707,12 @@ impl Filter {
             held.peek()?;
             Some(held.flat_map(|r| r.attributes.iter().cloned()).collect())
         };
+        if self.omit_by_type.is_empty() {
+            return Some(Shown {
+                only,
+                omitted: Default::default(),
+            });
+        }
         let omitted = entity_types(doc)
             .into_iter()
             .filter_map(|t| self.omit_by_type.get(t))
@@ -1799,6 +1818,41 @@ impl PolicyEngine for Slow<'_> {
 mod tests {
     use super::*;
 
+    /// `admits` is `shown(..).is_some()` without the set (T-3667).
+    #[test]
+    fn admits_is_whether_shown_answers() {
+        let ctx = antares_jsonld::core_context();
+        let car = serde_json::json!({"id": "urn:ngsi-ld:Car:1", "type": "Car"});
+        let rule = |t: &str| Rule {
+            types: vec![t.to_owned()],
+            ..Rule::default()
+        };
+        let cases = [
+            Filter::default(),
+            Filter {
+                omit_by_type: BTreeMap::from([("Car".to_owned(), vec!["speed".to_owned()])]),
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("Car")],
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("User")],
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("User"), rule("Car")],
+                ..Filter::default()
+            },
+        ];
+        let admitted: Vec<bool> = cases.iter().map(|f| f.admits(&car, &ctx)).collect();
+        assert_eq!(admitted, [true, true, true, false, true]);
+        for f in &cases {
+            assert_eq!(f.admits(&car, &ctx), f.shown(&car, &ctx).is_some(), "{f:?}");
+        }
+    }
+
     /// T-3684: an engine that keeps the trait's defaults reads no rule
     /// documents (ADR-0020 amendment): it says so, so `/q/policy` answers
     /// 404, and a document handed to it anyway is refused, never taken.
@@ -2613,6 +2667,67 @@ mod tests {
         };
         let out = slide.narrow_window(&p(&[]), false).unwrap();
         assert!(antares_model::dt_key(&out["timeAt"]) >= antares_model::dt_key(&out["endTimeAt"]));
+
+        // the windows are on observedAt: a request on another timeproperty
+        // is answered nothing, even one whose own window overlaps
+        let out = between
+            .narrow_window(
+                &p(&[
+                    ("timerel", "after"),
+                    ("timeAt", "2026-01-01T01:30:00Z"),
+                    ("timeproperty", "modifiedAt"),
+                ]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(out["timeAt"], out["endTimeAt"], "{out:?}");
+        assert_eq!(out["timeAt"], "2026-01-01T01:00:00.000Z", "{out:?}");
+    }
+
+    /// A bound renders to the millisecond 4.11 takes: a start rounds up
+    /// (only ever by less than a millisecond), an end down, an exact
+    /// millisecond stays; a window is half-open on those renderings.
+    #[test]
+    fn a_bound_rounds_only_inward_and_a_window_is_half_open() {
+        let at = |ns: u32| {
+            TimeBound::At(chrono::DateTime::from_timestamp(1_767_225_600, ns).expect("an instant"))
+        };
+        let now = chrono::Utc::now();
+        for (ns, start, end) in [
+            (0, "00.000", "00.000"),
+            (500, "00.001", "00.000"),
+            (999_000, "00.001", "00.000"),
+            (1_000_500, "00.002", "00.001"),
+        ] {
+            assert_eq!(
+                at(ns).render(now, true),
+                format!("2026-01-01T00:00:{start}Z"),
+                "start at {ns} ns"
+            );
+            assert_eq!(
+                at(ns).render(now, false),
+                format!("2026-01-01T00:00:{end}Z"),
+                "end at {ns} ns"
+            );
+        }
+        let w = Window {
+            from: Some(at(0)),
+            to: Some(at(2_000_000)),
+        };
+        assert!(
+            !w.admits("2025-12-31T23:59:59.999Z", now),
+            "before the start"
+        );
+        assert!(
+            w.admits("2026-01-01T00:00:00.000Z", now),
+            "the start is inside"
+        );
+        assert!(w.admits("2026-01-01T00:00:00.001Z", now), "inside");
+        assert!(
+            !w.admits("2026-01-01T00:00:00.002Z", now),
+            "the end is outside"
+        );
+        assert!(!w.admits("2026-01-01T00:00:00.003Z", now), "after the end");
     }
 
     /// G8: the engine's warning travels as one `NGSILD-Warning` value per
@@ -2705,6 +2820,15 @@ mod tests {
                 .holds(&doc("A")),
             "a linked path reads no other Entity inside the write, so it never holds"
         );
+        let scoped = Filter {
+            scope_q: Some("/a".to_owned()),
+            ..Filter::default()
+        };
+        assert!(
+            Condition::of(&scoped).is_some(),
+            "a scopeQ alone selects: it is a condition"
+        );
+        assert!(Condition::of(&Filter::default()).is_none());
         assert!(Condition::unforwarded(Some(&c), false).is_ok());
         assert!(Condition::unforwarded(None, true).is_ok());
         assert_eq!(
