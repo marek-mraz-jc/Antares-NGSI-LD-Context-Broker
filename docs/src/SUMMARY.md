@@ -11,6 +11,7 @@
 - [Deployment](deployment.md)
 - [Subscriptions and notifications](subscriptions.md)
 - [Temporal API](temporal.md)
+- [Surfaces](surfaces.md)
 - [Endpoint views](views.md)
 - [MCP endpoint of a view](mcp.md)
 - [LinkML schema of a view](linkml.md)
