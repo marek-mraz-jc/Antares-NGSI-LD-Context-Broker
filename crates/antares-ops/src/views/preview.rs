@@ -41,7 +41,10 @@ fn query(raw: Option<&str>) -> Result<String, String> {
     let mut pairs = Vec::new();
     for pair in raw.unwrap_or_default().split('&').filter(|p| !p.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        match key {
+        // as the API reads them, so an escaped `limit` meets the bound too
+        let dec = |s: &str| antares_ql::percent_decode(s.replace('+', " ").as_bytes());
+        let (key, value) = (dec(key), dec(value));
+        match key.as_str() {
             "count" => continue,
             "limit" => match value.parse::<u64>() {
                 Ok(n) if n <= MAX_PREVIEW_LIMIT => {}
@@ -120,5 +123,12 @@ mod tests {
         assert!(query(Some("limit=101")).is_err());
         assert!(query(Some("limit=x")).is_err());
         assert!(query(Some("limit")).is_err());
+        // escaped as the API reads it: the bound and the count hold
+        assert!(query(Some("li%6Dit=1000")).is_err());
+        assert!(query(Some("limit=%31%30%31")).is_err());
+        assert_eq!(
+            query(Some("%63ount=false&type=Car")).as_deref(),
+            Ok("type=Car&count=true")
+        );
     }
 }
