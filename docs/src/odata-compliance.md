@@ -111,19 +111,19 @@ A deliberate break proved the gate: the error response stopped sending the
 The pass rate counts passed and failed tests; skipped tests stay out of it.
 The baseline was first recorded on dev `f0da234` (T-3714) and raised by
 T-3719, which reads a form-encoded query, T-3723, which declares `$batch`
-and serves `HEAD`, T-3720, which keys a set by its LinkML identifier
-and serves `$entity`, and T-3726, which reads multipart framed with a bare
-LF and runs a JSON batch on after a failure (section 6):
+and serves `HEAD`, T-3731, which answers an empty path segment with 400,
+T-3720, which keys a set by its LinkML identifier and serves `$entity`,
+and T-3726, which reads multipart framed with a bare LF and runs a JSON batch on after a failure (section 6):
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
 | Minimal | 165 | 104 | 24 | 61.3 % |
-| Intermediate | 224 | 112 | 14 | 66.7 % |
-| Advanced | 167 | 337 | 63 | 33.1 % |
-| **All** (suite summary) | 556 | 553 | 101 | 50.1 % |
+| Intermediate | 222 | 114 | 14 | 66.1 % |
+| Advanced | 159 | 345 | 63 | 31.5 % |
+| **All** (suite summary) | 546 | 563 | 101 | 49.2 % |
 
-Before T-3720 the baseline stood at 455 passed, 661 failed and 94 skipped
-(Minimal 57.8 %, Intermediate 49.1 %, Advanced 26.0 %).
+Before T-3720 the baseline stood at 456 passed, 660 failed and 94 skipped
+(Minimal 57.8 %, Intermediate 49.4 %, Advanced 26.0 %).
 
 The first baseline (T-3714) stood at Minimal 37.5 %, Intermediate 28.2 % and
 Advanced 11.7 % (254 passed, 840 failed, 116 skipped).
@@ -143,7 +143,7 @@ Each failing area is a task, or a decision with its reason:
 | The key was always `id` (the URN); the model's own key (`ID`, Edm.Guid) did not address an Entity, and `$entity?$id=` answered 501 | 11.1, 11.2.1 to 11.2.3, 11.2.11, 11.4.11, 8.2.7 | T-3720: the schema marks `ID` `identifier: true` with `edm_type: Edm.Guid` (`ci/odata-compliance/schema.json`); the set is keyed by it and `$entity` is served |
 | `@odata.id URL is dereferenceable` (11.2.2) appends the relative `@odata.id` to the service URL without a `/`, and keeps the whole path of an absolute one; under a service root with a path neither form reaches the Entity | 11.2.2 | a limit of the suite: JSON Format 4.01 section 4.5.8 lets `@odata.id` be relative to the context URL, and `$entity?$id=` with the same value passes |
 | Entity references of a set or an Entity (`{Set}/$ref`, `{Set}(key)/$ref`) answer 501 | 11.2.15 | T-3730 |
-| `{Set}/` and `{Set}//` read as `{Set}` | 11.1 | T-3731 |
+| `{Set}/` and `{Set}//` read as `{Set}` | 11.1 | T-3731: an empty path segment is 400; the broker's trailing-slash trim leaves a view's OData paths as sent |
 | A create without a key is refused (`MissingKey`); the service does not mint one | 11.4.2 to 11.4.5, 11.4.12 to 11.4.15, 8.1.5, 8.2.3, 8.2.5, 8.2.8 | T-3721 |
 | Edm types beyond String, Double and Int64, enums, Core and Capabilities annotations from the LinkML schema | 4.4, 5.1.1.x, 5.1.4 to 5.1.8, 5.3, 14.1, vocab_* | T-3722 |
 | `BatchSupported` was declared false while `$batch` is served; HEAD on a collection or an Entity answered 501 | 11.4.9.x, 11.4.11 | T-3723: declared and served; the batch scripts run, their failures are in the baseline |

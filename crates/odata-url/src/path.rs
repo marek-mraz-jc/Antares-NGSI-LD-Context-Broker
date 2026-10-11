@@ -109,6 +109,11 @@ impl<'m, M: Model> PathParser<'_, '_, 'm, M> {
         if !self.c.eat("/") {
             return Ok(None);
         }
+        // `resourcePath` has no empty segment: `Buildings/` is malformed, not
+        // `Buildings` nor a name that fails to resolve (T-3731).
+        if matches!(self.c.peek(), None | Some(b'/' | b'?')) {
+            return Err(self.c.syntax("path segment"));
+        }
         let start = self.c.pos();
         let dollar = [
             ("$count", Segment::Count),
