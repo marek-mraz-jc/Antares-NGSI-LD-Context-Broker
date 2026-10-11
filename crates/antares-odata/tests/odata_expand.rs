@@ -86,7 +86,7 @@ fn car(n: u32, owner: &str, drivers: &[&str]) -> Value {
 /// owned by 1 and driven by 1 and 2, Car:2 owned by the hidden 2, Car:3 by
 /// the absent 9.
 async fn broker(entities: &[Value]) -> Result<(TestBroker, Router), String> {
-    std::env::set_var("ANTARES_SCHEMA_MAX_BYTES", "65536");
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
     let b = TestBroker::new().await?;
     let app = b.serve(antares_odata::OData)?;
     let view = json!({

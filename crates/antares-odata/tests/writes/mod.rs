@@ -76,7 +76,7 @@ pub fn person(n: u32, scope: &str) -> Value {
 /// writes; view `reads` shows the same and offers reads only. Person:1 is
 /// in view, Person:2 out of its scope; Car:1 in view, Car:2 out of it.
 pub async fn city() -> Result<(TestBroker, Router), String> {
-    std::env::set_var("ANTARES_SCHEMA_MAX_BYTES", "65536");
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
     city_on(TestBroker::new().await?).await
 }
 

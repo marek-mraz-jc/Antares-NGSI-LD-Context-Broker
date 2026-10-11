@@ -81,7 +81,7 @@ async fn sample(name: &str, app: &Router, uri: &str) -> std::io::Result<(Duratio
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    std::env::set_var("ANTARES_SCHEMA_MAX_BYTES", "65536");
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
     let broker = TestBroker::new().await?;
     let app = broker.serve(antares_odata::OData)?;
     let view = json!({"id": "cars", "tenant": "city", "@context": {"city": CITY},
