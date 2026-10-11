@@ -83,5 +83,8 @@
    "temperature"
   ]
  },
- "byId": "denied"
+ "byId": "denied",
+ "known": {
+  "MCP query_entities": "T-3784"
+ }
 }

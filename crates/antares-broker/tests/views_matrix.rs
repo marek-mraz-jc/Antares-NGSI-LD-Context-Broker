@@ -234,7 +234,6 @@ async fn send(
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
         .await
         .unwrap_or_default();
-    if std::env::var("VM_DEBUG").is_ok() { eprintln!("DBG {method} {uri} -> {status} {headers:?}\n{}", String::from_utf8_lossy(&bytes).chars().take(600).collect::<String>()); }
     let body = serde_json::from_slice(&bytes)
         .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
     (status, headers, body)
@@ -294,7 +293,9 @@ fn text(v: &Value, key: &str) -> String {
 
 /// A next link as a path below the view root.
 fn local(href: &str) -> String {
-    href.find("/x/views/").map_or(href, |i| &href[i..]).to_owned()
+    href.find("/x/views/")
+        .map_or(href, |i| &href[i..])
+        .to_owned()
 }
 
 /// What one surface answered: the Entities read, the count it reported, or
@@ -371,10 +372,18 @@ async fn odata(app: &Router, s: &Scenario) -> Read {
                 return Read::Refused(status, body);
             }
             if first {
-                total += body.get("@odata.count").and_then(Value::as_u64).unwrap_or(u64::MAX / 4);
+                total += body
+                    .get("@odata.count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::MAX / 4);
                 first = false;
             }
-            for row in body.get("value").and_then(Value::as_array).into_iter().flatten() {
+            for row in body
+                .get("value")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
                 let names = row
                     .as_object()
                     .into_iter()
@@ -421,10 +430,18 @@ async fn ogc(app: &Router, s: &Scenario) -> Read {
                 return Read::Refused(status, body);
             }
             if first {
-                total += body.get("numberMatched").and_then(Value::as_u64).unwrap_or(u64::MAX / 4);
+                total += body
+                    .get("numberMatched")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(u64::MAX / 4);
                 first = false;
             }
-            for f in body.get("features").and_then(Value::as_array).into_iter().flatten() {
+            for f in body
+                .get("features")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
                 let mut names: BTreeSet<String> = f
                     .get("properties")
                     .and_then(Value::as_object)
@@ -499,7 +516,12 @@ async fn mcp(app: &Router, s: &Scenario) -> Read {
         if total.is_none() {
             total = page.get("total").and_then(Value::as_u64);
         }
-        for e in page.get("entities").and_then(Value::as_array).into_iter().flatten() {
+        for e in page
+            .get("entities")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             add(&mut out, text(e, "id"), ngsi_names(e), &mut twice);
         }
         cursor = page
@@ -570,9 +592,7 @@ async fn by_id(app: &Router, s: &Scenario, want: &Answer, failures: &mut Vec<Str
                         "NGSI-LD retrieve {id} not admitted: {status} {body}, an absent id gets {nothing}"
                     ));
                 }
-                if mcp_entity.is_some()
-                    || masked(&answer, &id) != masked(&mcp_nothing, absent)
-                {
+                if mcp_entity.is_some() || masked(&answer, &id) != masked(&mcp_nothing, absent) {
                     failures.push(format!(
                         "MCP get_entity {id} not admitted: {answer}, an absent id gets {mcp_nothing}"
                     ));
@@ -604,7 +624,9 @@ fn judge(surface: &str, read: Read, want: &Expect, failures: &mut Vec<String>) {
             failures.push(format!("{surface}: refused {status} {body}"));
         }
         (Read::Entities(got, count), Expect::Denied) => {
-            failures.push(format!("{surface}: denied caller read {got:?} (count {count:?})"));
+            failures.push(format!(
+                "{surface}: denied caller read {got:?} (count {count:?})"
+            ));
         }
         (Read::Refused(status, body), Expect::Denied) => {
             let text = body.to_string();
@@ -628,7 +650,13 @@ async fn check(app: &Router, s: &Scenario, want: &Expect, failures: &mut Vec<Str
 
 /// A step: `set` writes on the Tenant root (outside the engine), `patch`
 /// writes as the caller through the view and expects `status`.
-async fn step(app: &Router, plain: &Router, s: &Scenario, step: &Value, failures: &mut Vec<String>) {
+async fn step(
+    app: &Router,
+    plain: &Router,
+    s: &Scenario,
+    step: &Value,
+    failures: &mut Vec<String>,
+) {
     let attrs = &step["attrs"];
     if let Some(id) = step["set"].as_str() {
         let uri = format!("/ngsi-ld/v1/entities/{id}/attrs");
@@ -639,7 +667,10 @@ async fn step(app: &Router, plain: &Router, s: &Scenario, step: &Value, failures
         let uri = format!("/x/views/{}/ngsi-ld/v1/entities/{id}/attrs", s.view());
         let (status, _, body) = send(app, "PATCH", &uri, &with_tenant(s), Some(attrs)).await;
         if Some(u64::from(status.as_u16())) != step["status"].as_u64() {
-            failures.push(format!("write {id}: {status} {body}, want {}", step["status"]));
+            failures.push(format!(
+                "write {id}: {status} {body}, want {}",
+                step["status"]
+            ));
         }
     }
 }
@@ -650,10 +681,13 @@ async fn step(app: &Router, plain: &Router, s: &Scenario, step: &Value, failures
 async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
     let (app, plain, _reload) = broker().await;
     let corpus = corpus();
-    assert!(corpus.len() >= 40, "the corpus has {} scenarios", corpus.len());
+    assert!(
+        corpus.len() >= 40,
+        "the corpus has {} scenarios",
+        corpus.len()
+    );
     let (mut report, mut listed) = (Vec::new(), Vec::new());
     for s in &corpus {
-        if std::env::var("VM_ONLY").is_ok_and(|o| !s.name.starts_with(&o)) { continue; }
         install(&app, &plain, s).await;
         let mut failures = Vec::new();
         check(&app, s, &expect(&s.doc["expect"]), &mut failures).await;
@@ -671,11 +705,15 @@ async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
             .flatten()
             .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_owned()))
             .collect();
-        let of = |f: &str, surface: &str| f.starts_with(surface) || f.contains(&format!(": {surface}"));
+        let of =
+            |f: &str, surface: &str| f.starts_with(surface) || f.contains(&format!(": {surface}"));
         for (surface, task) in &known {
             let hits = failures.iter().filter(|f| of(f, surface)).count();
             if hits == 0 {
-                report.push(format!("{}: {surface} matches now; remove its `known` entry ({task})", s.name));
+                report.push(format!(
+                    "{}: {surface} matches now; remove its `known` entry ({task})",
+                    s.name
+                ));
             } else {
                 listed.push(format!("{} {surface}: {hits} mismatches, {task}", s.name));
             }
@@ -683,6 +721,14 @@ async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
         failures.retain(|f| !known.keys().any(|surface| of(f, surface)));
         report.extend(failures.into_iter().map(|f| format!("{}: {f}", s.name)));
     }
-    eprintln!("known mismatches, each with its fix task:\n{}", listed.join("\n"));
-    assert!(report.is_empty(), "{} mismatches:\n{}", report.len(), report.join("\n"));
+    eprintln!(
+        "known mismatches, each with its fix task:\n{}",
+        listed.join("\n")
+    );
+    assert!(
+        report.is_empty(),
+        "{} mismatches:\n{}",
+        report.len(),
+        report.join("\n")
+    );
 }

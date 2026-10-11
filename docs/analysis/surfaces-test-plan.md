@@ -91,6 +91,26 @@ CI jobs named below (all in Antares `.github/workflows/`):
   MCP result count are equal; paging through each surface yields the same ids in the same order.
 - Job: `workspace-tests`.
 
+## 3a. View and policy matrix (T-3777)
+
+- File: `crates/antares-broker/tests/views_matrix.rs`, `--features full,jc-policy`; corpus
+  `crates/antares-broker/tests/views-matrix/`: one JSON file per scenario (a view, the
+  joinedcontext engine's policies, a caller, optional `steps`), a shared seed of 11 Entities
+  (`_seed.json`: three polygons, an edge point, scopes with several paths and none, an Attribute on
+  some Entities only, a multi-attribute, a LanguageProperty) and its LinkML schema (`_schema.json`).
+- Each scenario's `expect` (Entity id to Attribute names, or `denied`) is written by hand from the
+  seed, never read from the code under test.
+- Test `every_surface_answers_what_ngsi_ld_admits_in_every_scenario`: each scenario in a Tenant of
+  its own, read page by page through the NGSI-LD view (Link `next`), OData (`odata.maxpagesize`,
+  `@odata.nextLink`), OGC items (`next` links) and MCP `query_entities` (cursor). Each must answer
+  exactly the expected ids and Attribute names, its count (`NGSILD-Results-Count`, `@odata.count`,
+  `numberMatched`, MCP `total`) the expected size. A retrieve by id (NGSI-LD and MCP `get_entity`)
+  of a seed Entity the scenario does not admit answers the bytes of an absent id; a denied caller
+  gets a refusal naming no seed Entity.
+- A mismatch with a fix task filed is listed in the scenario's `known` (surface to task id) and
+  must still fail, so the fix removes the entry; the test prints the list.
+- Job: `workspace-tests` (all-features).
+
 ## 4. Property tests (`proptest` 1.11.0, already a workspace dependency: `Cargo.lock:2329`, used by `antares-sql`)
 
 | property | crate and file | generator |
