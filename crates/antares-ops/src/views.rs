@@ -456,10 +456,13 @@ impl Reloader {
             };
             next.insert(id, (doc, entry));
         }
+        let table: BTreeMap<_, _> = next.iter().collect();
         self.state.views.replace(
-            next.iter()
-                .map(|(id, (_, e))| (id.clone(), e.clone()))
-                .collect::<BTreeMap<_, _>>(),
+            table
+                .iter()
+                .map(|(id, (_, e))| ((*id).clone(), e.clone()))
+                .collect(),
+            revision(table.iter().map(|(id, (doc, _))| (id.as_str(), doc))),
         );
         self.state.views.replace_schemas(schemas);
         *cache = next;
@@ -479,6 +482,19 @@ fn log_entry(id: &str, e: &ViewEntry) {
             tracing::warn!(view = id, reason = reason.as_str(), "view not served");
         }
     }
+}
+
+/// The digest of the view documents, in id order (threat V26): a pure
+/// function of what the store holds, so pods over one store agree without
+/// coordination.
+fn revision<'a>(docs: impl Iterator<Item = (&'a str, &'a Value)>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (id, doc) in docs {
+        id.hash(&mut h);
+        doc.to_string().hash(&mut h);
+    }
+    h.finish()
 }
 
 /// [`SCHEMA_MAX_ENV`]: `None` unset; a value that is no positive byte count

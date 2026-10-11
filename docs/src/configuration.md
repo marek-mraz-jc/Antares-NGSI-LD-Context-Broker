@@ -63,6 +63,8 @@ here).
 | `ANTARES_MCP_ALLOWED_HOSTS` | unset (loopback names) | Builds with the `mcp` feature only: the `Host` names the [MCP endpoint](mcp.md) answers, comma-separated. Set it to the names clients reach the broker by; any other `Host` is refused, which stops DNS rebinding (MC8). |
 | `ANTARES_MCP_ALLOWED_ORIGINS` | unset (no browser origin) | Builds with the `mcp` feature only: the browser origins the MCP endpoint answers, comma-separated. Origin validation is always on: unset, a request that carries any `Origin` is `403`. |
 | `ANTARES_MCP_MAX_RESULT_BYTES` | `65536` (64 KiB) | Builds with the `mcp` feature only: the most bytes of structured content one tool result carries; a list past it comes a page at a time. Values outside 1 KiB to 16 MiB are ignored. |
+| `ANTARES_MCP_REQUEST_STATE_KEY_FILE` | unset: a key per process | Builds with the `mcp` feature only: a file of at least 32 bytes, mounted from a Secret, whose bytes seal a write tool's `requestState` (HMAC-SHA256), so a confirmation answers every replica. Unreadable or shorter: every write tool call is refused. Never logged. |
+| `ANTARES_MCP_SUBSCRIPTION_ENDPOINTS` | unset: none | Builds with the `mcp` feature only: comma-separated notification endpoints `create_subscription` and `update_subscription` may name; an entry ending in `/` allows every URI below it. |
 | `ANTARES_EXTRA_CA_FILE` | unset | PEM bundle of ADDITIONAL trust anchors for egress TLS (private CAs). Egress TLS trusts the host's certificate store (`/etc/ssl/certs` on Linux; the shipped image carries one), and this widens it. Verification itself is never disableable. |
 
 ## Notification delivery

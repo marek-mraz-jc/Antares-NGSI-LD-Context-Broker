@@ -45,10 +45,43 @@ pub(crate) enum Kind {
     Flag,
     /// A `GeoJSON` `coordinates` array, sent as its JSON text.
     Coordinates,
+    /// A whole Entity: `id`, a type the view shows and Attributes it shows.
+    Entity,
+    /// A list of whole Entities, at most [`MAX_ITEMS`].
+    Entities,
+    /// Attributes of one Entity, and its type at most: no `id`.
+    Fragment,
+    /// One Attribute's body.
+    Attribute,
+    /// An object of these members.
+    Object(&'static [Arg]),
+    /// A list of objects of these members, at most this many.
+    ListOf(&'static [Arg], usize),
+    /// A notification endpoint the deployment lets a tool name (MC12).
+    Endpoint,
+}
+
+/// The endpoints a subscription made through a tool may notify, comma
+/// separated; unset, none (MCP section 10 rule 7).
+pub const SUBSCRIPTION_ENDPOINTS_ENV: &str = "ANTARES_MCP_SUBSCRIPTION_ENDPOINTS";
+
+/// The deployment's endpoint allowlist.
+fn endpoints() -> &'static [String] {
+    static ENDPOINTS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+        crate::listed(std::env::var(SUBSCRIPTION_ENDPOINTS_ENV).ok().as_deref()).unwrap_or_default()
+    });
+    &ENDPOINTS
+}
+
+/// Whether `uri` is one of `allowed`, or below one that ends in `/`.
+fn endpoint_allowed(uri: &str, allowed: &[String]) -> bool {
+    allowed
+        .iter()
+        .any(|a| uri == a || (a.ends_with('/') && uri.starts_with(a.as_str())))
 }
 
 /// One argument of a tool.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Arg {
     pub name: &'static str,
     pub kind: Kind,
@@ -161,7 +194,93 @@ fn schema_of(kind: Kind, names: &Names) -> Value {
         Kind::Int(min, max) => json!({"type": "integer", "minimum": min, "maximum": max}),
         Kind::Flag => json!({"type": "boolean"}),
         Kind::Coordinates => json!({"type": "array", "maxItems": 1000}),
+        Kind::Entity => json!({
+            "type": "object",
+            "required": ["id", "type"],
+            "properties": {"id": schema_of(Kind::Id, names), "type": schema_of(Kind::Type, names)},
+            "propertyNames": member_names(names, &["id", "type"]),
+        }),
+        Kind::Entities => {
+            json!({"type": "array", "minItems": 1, "maxItems": MAX_ITEMS, "items": schema_of(Kind::Entity, names)})
+        }
+        Kind::Fragment => json!({
+            "type": "object",
+            "minProperties": 1,
+            "properties": {"type": schema_of(Kind::Type, names)},
+            "propertyNames": member_names(names, &["type"]),
+        }),
+        Kind::Attribute => json!({"type": "object"}),
+        Kind::Object(args) => Value::Object(input_schema(args, names)),
+        Kind::ListOf(args, max) => {
+            json!({"type": "array", "maxItems": max, "items": input_schema(args, names)})
+        }
+        Kind::Endpoint => json!({"type": "string", "maxLength": 2048}),
     }
+}
+
+/// The member names of an Entity body: `core` and the view's Attributes.
+fn member_names(names: &Names, core: &[&str]) -> Value {
+    if names.attributes.len() <= MAX_ENUM {
+        let mut all: Vec<&str> = core.to_vec();
+        all.extend(names.attributes.iter().map(String::as_str));
+        json!({"enum": all})
+    } else {
+        json!({"pattern": ATTR_NAME, "maxLength": 256})
+    }
+}
+
+/// An object without `@context`: the surface sets the view's (MCP 3.2).
+fn object<'v>(arg: &str, v: &'v Value) -> Result<&'v Map<String, Value>, Broken> {
+    let o = v
+        .as_object()
+        .ok_or_else(|| broken(arg, "must be an object"))?;
+    if o.contains_key("@context") {
+        return Err(broken(
+            arg,
+            "carries no @context; the endpoint sets the view's",
+        ));
+    }
+    Ok(o)
+}
+
+/// An Entity body (`whole`) or an Attribute fragment of one, each member
+/// a name the view shows.
+fn entity(arg: &str, v: &Value, names: &Names, whole: bool) -> Result<(), Broken> {
+    let o = object(arg, v)?;
+    for (k, member) in o {
+        match k.as_str() {
+            "id" if whole => {
+                if !member.as_str().is_some_and(is_entity_id) {
+                    return Err(broken(arg, "id must be an NGSI-LD Entity id"));
+                }
+            }
+            "id" => return Err(broken(arg, "names no id; the id argument does")),
+            "type" => {
+                one_name(arg, member, &names.types, is_type_name, "types")?;
+            }
+            name => {
+                one_name(
+                    arg,
+                    &Value::String(name.to_owned()),
+                    &names.attributes,
+                    is_attr_name,
+                    "attributes",
+                )?;
+            }
+        }
+    }
+    if whole && !(o.contains_key("id") && o.contains_key("type")) {
+        return Err(broken(arg, "must have an id and a type"));
+    }
+    if o.is_empty() {
+        return Err(broken(arg, "must name at least one Attribute"));
+    }
+    Ok(())
+}
+
+/// `inner`, a refusal of a member of `arg`, named as one.
+fn nested(arg: &str, inner: &Broken) -> Broken {
+    inner.replacen("argument ", &format!("argument {arg}."), 1)
 }
 
 /// The input schema of a tool with `args` under `names`.
@@ -315,6 +434,60 @@ fn check(arg: &Arg, v: &Value, names: &Names) -> Result<Checked, Broken> {
             list(name, v, 1, 1000)?;
             Checked::Json(v.clone())
         }
+        Kind::Entity
+        | Kind::Entities
+        | Kind::Fragment
+        | Kind::Attribute
+        | Kind::Object(_)
+        | Kind::ListOf(..)
+        | Kind::Endpoint => body(arg, v, names)?,
+    })
+}
+
+/// [`check`] of a body a write tool sends: kept as given once checked.
+fn body(arg: &Arg, v: &Value, names: &Names) -> Result<Checked, Broken> {
+    let name = arg.name;
+    Ok(match arg.kind {
+        Kind::Entity => {
+            entity(name, v, names, true)?;
+            Checked::Json(v.clone())
+        }
+        Kind::Entities => {
+            for e in list(name, v, 1, MAX_ITEMS)? {
+                entity(name, e, names, true)?;
+            }
+            Checked::Json(v.clone())
+        }
+        Kind::Fragment => {
+            entity(name, v, names, false)?;
+            Checked::Json(v.clone())
+        }
+        Kind::Attribute => {
+            object(name, v)?;
+            Checked::Json(v.clone())
+        }
+        Kind::Object(args) => {
+            check_all(args, object(name, v)?, names).map_err(|e| nested(name, &e))?;
+            Checked::Json(v.clone())
+        }
+        Kind::ListOf(args, max) => {
+            for item in list(name, v, 0, max)? {
+                check_all(args, object(name, item)?, names).map_err(|e| nested(name, &e))?;
+            }
+            Checked::Json(v.clone())
+        }
+        Kind::Endpoint => {
+            let s = v.as_str().filter(|s| s.len() <= 2048);
+            let s = s.ok_or_else(|| broken(name, "must be a string of at most 2048 bytes"))?;
+            if !endpoint_allowed(s, endpoints()) {
+                return Err(broken(
+                    name,
+                    "not an endpoint this deployment lets a tool notify",
+                ));
+            }
+            Checked::One(s.to_owned())
+        }
+        _ => return Err(broken(name, "is no body")),
     })
 }
 
@@ -486,5 +659,143 @@ mod tests {
                 .is_err_and(|e| e.contains("tenant"))
         );
         assert!(check_all(&args, &Map::new(), &n).is_err_and(|e| e.contains("required")));
+    }
+
+    #[test]
+    fn an_entity_body_names_only_what_the_view_shows_and_no_context() {
+        let n = names();
+        let entity = |v: Value| check(&req("entity", Kind::Entity), &v, &n);
+        let fragment = |v: Value| check(&req("attributes", Kind::Fragment), &v, &n);
+        assert!(entity(json!({"id": "urn:ngsi-ld:Car:1", "type": "Car", "speed": 1})).is_ok());
+        for (bad, rule) in [
+            (
+                json!({"id": "urn:ngsi-ld:Car:1", "type": "Car", "secret": 1}),
+                "not one of the attributes",
+            ),
+            (
+                json!({"id": "urn:ngsi-ld:Car:1", "type": "Bike"}),
+                "not one of the types",
+            ),
+            (
+                json!({"id": "Car:1", "type": "Car"}),
+                "id must be an NGSI-LD Entity id",
+            ),
+            (
+                json!({"type": "Car", "speed": 1}),
+                "must have an id and a type",
+            ),
+            (
+                json!({"id": "urn:ngsi-ld:Car:1", "speed": 1}),
+                "must have an id and a type",
+            ),
+            (
+                json!({"id": "urn:ngsi-ld:Car:1", "type": "Car", "@context": "x"}),
+                "no @context",
+            ),
+            (json!([1]), "must be an object"),
+        ] {
+            assert!(
+                entity(bad.clone()).is_err_and(|e| e.contains(rule)),
+                "{bad}"
+            );
+        }
+        assert!(fragment(json!({"speed": 1, "type": "Car"})).is_ok());
+        assert!(
+            fragment(json!({"id": "urn:ngsi-ld:Car:1"})).is_err_and(|e| e.contains("names no id"))
+        );
+        assert!(fragment(json!({})).is_err_and(|e| e.contains("at least one")));
+        let batch = |v: Value| check(&req("entities", Kind::Entities), &v, &n);
+        assert!(batch(json!([{"id": "urn:ngsi-ld:Car:1", "type": "Car"}])).is_ok());
+        assert!(batch(json!([{"id": "urn:ngsi-ld:Car:1", "type": "Car", "secret": 1}])).is_err());
+        assert!(batch(json!([])).is_err());
+        let attribute = |v: Value| check(&req("attribute", Kind::Attribute), &v, &n);
+        assert!(attribute(json!({"value": 1})).is_ok());
+        assert!(attribute(json!({"value": 1, "@context": []})).is_err());
+        assert!(attribute(json!(1)).is_err());
+    }
+
+    #[test]
+    fn nested_members_are_checked_and_named_by_their_path() {
+        const INNER: &[Arg] = &[req("uri", Kind::Endpoint)];
+        const OUTER: &[Arg] = &[
+            opt("endpoint", Kind::Object(INNER)),
+            opt("each", Kind::ListOf(INNER, 1)),
+        ];
+        let n = names();
+        let outer = |v: Value| check(&req("n", Kind::Object(OUTER)), &v, &n);
+        let refused = "argument n.endpoint.uri: not an endpoint this deployment lets a tool notify";
+        assert_eq!(
+            outer(json!({"endpoint": {"uri": "https://x.example/"}})),
+            Err(refused.into())
+        );
+        assert!(outer(json!({"endpoint": {"uri": 7}})).is_err_and(|e| e.contains("2048 bytes")));
+        assert!(outer(json!({"endpoint": {}}))
+            .is_err_and(|e| e.contains("n.endpoint.uri: is required")));
+        assert!(outer(json!({"other": 1})).is_err_and(|e| e.contains("n.other")));
+        assert!(outer(json!({"each": [{}, {}]})).is_err_and(|e| e.contains("takes 0 to 1")));
+        assert!(outer(json!({"each": [7]})).is_err_and(|e| e.contains("must be an object")));
+        assert!(outer(json!({"each": []})).is_ok());
+        let schema = schema_of(Kind::Object(OUTER), &n);
+        assert_eq!(
+            schema.pointer("/properties/endpoint/required"),
+            Some(&json!(["uri"]))
+        );
+        assert_eq!(schema.pointer("/properties/each/maxItems"), Some(&json!(1)));
+    }
+
+    #[test]
+    fn an_endpoint_is_one_named_or_below_one_ending_in_a_slash() {
+        let allowed = [
+            "https://hooks.example/".to_owned(),
+            "https://one.example/x".to_owned(),
+        ];
+        for ok in [
+            "https://hooks.example/",
+            "https://hooks.example/a/b",
+            "https://one.example/x",
+        ] {
+            assert!(endpoint_allowed(ok, &allowed), "{ok}");
+        }
+        for no in [
+            "https://hooks.example",
+            "https://hooks.example.evil/",
+            "https://one.example/xy",
+            "",
+        ] {
+            assert!(!endpoint_allowed(no, &allowed), "{no}");
+        }
+        assert!(!endpoint_allowed("https://hooks.example/", &[]));
+    }
+
+    #[test]
+    fn a_body_schema_lists_the_view_names_as_member_names() {
+        let n = names();
+        let entity = schema_of(Kind::Entity, &n);
+        assert_eq!(
+            entity.pointer("/propertyNames/enum"),
+            Some(&json!(["id", "type", "speed", "https://example.org/odd"]))
+        );
+        assert_eq!(entity.get("required"), Some(&json!(["id", "type"])));
+        let fragment = schema_of(Kind::Fragment, &n);
+        assert_eq!(
+            fragment.pointer("/propertyNames/enum/0"),
+            Some(&json!("type"))
+        );
+        assert_eq!(
+            schema_of(Kind::Entities, &n).get("maxItems"),
+            Some(&json!(MAX_ITEMS))
+        );
+        assert_eq!(schema_of(Kind::Attribute, &n), json!({"type": "object"}));
+        assert_eq!(
+            schema_of(Kind::Endpoint, &n).get("maxLength"),
+            Some(&json!(2048))
+        );
+        let many: Vec<String> = (0..=MAX_ENUM).map(|i| format!("a{i}")).collect();
+        let wide = Names::new(vec![], many);
+        assert_eq!(
+            schema_of(Kind::Entity, &wide).pointer("/propertyNames/pattern"),
+            Some(&json!(ATTR_NAME))
+        );
+        assert!(body(&req("x", Kind::Flag), &json!(true), &n).is_err());
     }
 }

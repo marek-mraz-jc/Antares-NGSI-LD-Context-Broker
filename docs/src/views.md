@@ -77,6 +77,12 @@ same store operation (ADR-0023 rule 7):
 
 A refused write leaves the store as it was.
 
+Every operation a surface runs, through a view or not, writes one `info`
+line, `surface operation`, with `surface`, `view` and `tenant` (through a
+view), `operation` (its matrix id) and `status`. The line names no subject
+and no argument, so you can trace a write to the surface and view that made
+it without the broker recording who asked.
+
 ## 3a. Subscriptions
 
 A Subscription made through a view is stored as the client sent it, with

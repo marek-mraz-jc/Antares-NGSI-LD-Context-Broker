@@ -91,6 +91,9 @@ pub struct Ops {
     /// The narrowed handle of each view served so far, so a request does
     /// not build the narrowed state and its in-process router anew.
     views: Arc<Mutex<BTreeMap<String, ViewOps>>>,
+    /// The surface these operations are run for, named on each one's log
+    /// line (threat G10); `None` for the broker's own in-process forwards.
+    surface: Option<Arc<str>>,
 }
 
 /// The operations of one loaded view (ADR-0023): every one runs composed
@@ -109,6 +112,25 @@ pub struct ViewOps {
 /// the tenant or the subject an operation runs as.
 #[derive(Debug, Clone)]
 pub struct Caller(HeaderMap);
+
+impl Caller {
+    /// The policy subject headers the caller sent, in the order
+    /// `ANTARES_POLICY_SUBJECT_HEADERS` names them, each with every value:
+    /// what a surface compares when it binds something to one subject
+    /// (a resumed WebSocket connection, ADR-0026 rule 7).
+    #[must_use]
+    pub fn subject(&self) -> Vec<(String, Vec<u8>)> {
+        antares_api::policy::SUBJECT_HEADERS
+            .iter()
+            .flat_map(|name| {
+                self.0
+                    .get_all(name.as_str())
+                    .iter()
+                    .map(move |v| (name.clone(), v.as_bytes().to_vec()))
+            })
+            .collect()
+    }
+}
 
 impl<S: Send + Sync> FromRequestParts<S> for Caller {
     type Rejection = std::convert::Infallible;
@@ -179,10 +201,11 @@ impl OpsRequest {
 }
 
 impl Ops {
-    fn new(state: AppState) -> Self {
+    fn new(state: AppState, surface: Option<Arc<str>>) -> Self {
         Self {
             state,
             views: Arc::default(),
+            surface,
         }
     }
 
@@ -206,7 +229,7 @@ impl Ops {
             return Some(hit.clone());
         }
         let made = ViewOps {
-            inner: Self::new(self.state.with_view(view.clone())),
+            inner: Self::new(self.state.with_view(view.clone()), self.surface.clone()),
             view: view.clone(),
             tenant: tenant.clone(),
             operations: operations
@@ -241,6 +264,17 @@ impl Ops {
         caller: &Caller,
         req: OpsRequest,
     ) -> Result<Response, Refusal> {
+        self.run_in(op, caller, req, None).await
+    }
+
+    /// [`Self::run`], logged with the view (id and Tenant) it runs through.
+    async fn run_in(
+        &self,
+        op: OperationId,
+        caller: &Caller,
+        req: OpsRequest,
+        view: Option<(&str, &str)>,
+    ) -> Result<Response, Refusal> {
         let (path, query) = match req.path_and_query.split_once('?') {
             Some((p, q)) => (p, Some(q)),
             None => (req.path_and_query.as_str(), None),
@@ -255,6 +289,28 @@ impl Ops {
             .map_err(|_| Refusal::Malformed("the operation's target is not a URI"))?;
         *inner.headers_mut() = req.headers;
         let answer = self.state.call(&caller.0, inner).await;
+        if let Some(surface) = &self.surface {
+            // Threat G10: which surface and view ran it; never the subject
+            // or an argument (ADR-0020).
+            let status = answer.status().as_u16();
+            if let Some((view, tenant)) = view {
+                tracing::info!(
+                    surface = &**surface,
+                    view,
+                    tenant,
+                    operation = op.id(),
+                    status,
+                    "surface operation"
+                );
+            } else {
+                tracing::info!(
+                    surface = &**surface,
+                    operation = op.id(),
+                    status,
+                    "surface operation"
+                );
+            }
+        }
         if !answer.status().is_server_error() {
             return Ok(answer);
         }
@@ -375,7 +431,15 @@ impl ViewOps {
             TENANT,
             HeaderValue::from_str(&self.tenant).map_err(|_| Refusal::Malformed(OTHER))?,
         );
-        let mut answer = self.inner.run(op, &Caller(headers), req).await?;
+        let mut answer = self
+            .inner
+            .run_in(
+                op,
+                &Caller(headers),
+                req,
+                Some((self.view.id(), &self.tenant)),
+            )
+            .await?;
         if !named {
             answer.headers_mut().remove(TENANT);
         }
@@ -467,7 +531,7 @@ pub fn with_forward_transport(
     state: AppState,
     make: impl FnOnce(Ops) -> Arc<dyn ForwardTransport>,
 ) -> Result<AppState, String> {
-    let transport = make(Ops::new(state.clone()));
+    let transport = make(Ops::new(state.clone(), None));
     state.with_forward_transport(transport)
 }
 
@@ -554,7 +618,7 @@ impl<S: Surface> antares_api::ApiSurface for Mounted<S> {
         // The first state it is mounted on is the one /q/health reports.
         let _ = self.views.set(table.clone());
         self.surface
-            .router(Ops::new(st))
+            .router(Ops::new(st, Some(Arc::from(self.surface.name()))))
             .layer(axum::middleware::from_fn(
                 move |req: axum::extract::Request, next: axum::middleware::Next| {
                     let open = table.any_loaded();
