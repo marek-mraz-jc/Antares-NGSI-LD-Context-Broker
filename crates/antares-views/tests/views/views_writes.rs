@@ -9,7 +9,7 @@ use crate::common::{fixture, fixture_with, prop, rel, send, stored, Answer, FLEE
 use antares_ops::policy::{
     Decision, DecisionFuture, Filter, NotifyDecision, Operation, PolicyEngine, Subject,
 };
-use antares_ops::test_kit::TestBroker;
+use antares_ops::test_kit::{q_filter, TestBroker};
 use axum::http::{Method, StatusCode};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -638,7 +638,7 @@ async fn views_batch_upsert_is_decided_per_entity() -> Result<(), String> {
 }
 
 /// Batch Upsert (5.6.8) under a write condition (T-3668): only red Cars.
-struct RedOnly;
+struct RedOnly(Filter);
 
 impl PolicyEngine for RedOnly {
     fn name(&self) -> &'static str {
@@ -647,10 +647,7 @@ impl PolicyEngine for RedOnly {
 
     fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
         Box::pin(std::future::ready(if op.clause == "5.6.8" {
-            Decision::AllowIf(Filter {
-                q: antares_ql::parse_q("colour==\"red\"").ok().map(Box::new),
-                ..Filter::default()
-            })
+            Decision::AllowIf(self.0.clone())
         } else {
             Decision::Allow
         }))
@@ -666,7 +663,12 @@ impl PolicyEngine for RedOnly {
 /// is created.
 #[tokio::test(flavor = "multi_thread")]
 async fn views_batch_upsert_holds_each_member_to_its_condition() -> Result<(), String> {
-    let f = fixture_with(TestBroker::new().await?.with_policy(Arc::new(RedOnly))).await?;
+    let f = fixture_with(
+        TestBroker::new()
+            .await?
+            .with_policy(Arc::new(RedOnly(q_filter("colour==\"red\"")?))),
+    )
+    .await?;
     let car = |n: &str, speed: u32| json!({"id": format!("urn:ngsi-ld:Car:{n}"), "type": "Car", "speed": prop(&json!(speed))});
     let upsert = "/entityOperations/upsert";
     for (uri, body) in [
