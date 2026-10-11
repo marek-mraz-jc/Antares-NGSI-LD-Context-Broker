@@ -150,6 +150,12 @@ pub fn with_view(
         // so the view has nothing of its own to narrow there.
         return engine;
     }
+    if crate::policy::WRITE_BY_ID.contains(&clause) {
+        // Rule 7 as below, and the engine's answer is the condition its
+        // write holds the stored Entity to (`gate`), which the handler
+        // checks beside the view's own.
+        return engine;
+    }
     if CHECKED_WRITES.contains(&clause) || SUBSCRIPTIONS.contains(&clause) {
         // Rule 7: the handler checks the view on the stored Entity before
         // and after the write (`WriteGuard`); the engine's own answer
@@ -162,7 +168,8 @@ pub fn with_view(
     let composed = compose(view.narrowing(), engine?)?;
     match resolve(clause, Decision::Filter(composed)) {
         Decision::Allow => Ok(Filter::default()),
-        Decision::Filter(f) => Ok(f),
+        // `resolve` makes no condition of a filter
+        Decision::Filter(f) | Decision::AllowIf(f) => Ok(f),
         Decision::Deny(why) => Err(Denied(why)),
     }
 }
@@ -577,12 +584,8 @@ pub const TARGET_NOT_SHOWN: &str =
 /// the store call.
 #[derive(Debug)]
 pub(crate) struct WriteGuard {
-    q: Option<QNode>,
-    scope_q: Option<String>,
-    areas: Vec<GeoQuery>,
-    /// The rules with type and Attribute names expanded, the form a stored
-    /// document is in.
-    rules: Option<Arc<Filter>>,
+    /// The view's selection, as an engine's write condition is held.
+    sel: crate::policy::Condition,
     /// The expanded names of the Attributes the write sets or removes.
     written: Vec<String>,
     refused: std::sync::OnceLock<&'static str>,
@@ -599,10 +602,7 @@ impl WriteGuard {
     ) -> Option<Self> {
         let narrowing = st.view.as_deref()?.narrowing();
         Some(Self {
-            q: narrowing.q.as_deref().cloned(),
-            scope_q: narrowing.scope_q.clone(),
-            areas: narrowing.areas().cloned().collect(),
-            rules: crate::repr::type_rules(narrowing),
+            sel: crate::policy::Condition::new(narrowing),
             written: written.into_iter().map(str::to_owned).collect(),
             refused: std::sync::OnceLock::new(),
         })
@@ -612,16 +612,7 @@ impl WriteGuard {
     /// the view's `q` never holds here, as in a rule (ADR-0023 rule 11): the
     /// check runs inside the store's write and reads no other Entity.
     pub(crate) fn sees(&self, doc: &serde_json::Value) -> bool {
-        let ctx = crate::repr::policy_context();
-        crate::repr::shown(self.rules.as_deref(), doc).is_some()
-            && self
-                .scope_q
-                .as_deref()
-                .is_none_or(|s| crate::scope_matches(s, doc))
-            && self.areas.iter().all(|g| g.matches(doc, ctx))
-            && self.q.as_ref().is_none_or(|q| {
-                !q.has_linked_paths() && antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
-            })
+        self.sel.holds(doc)
     }
 
     /// Why the view refuses `doc` with the written names on it, if it does.
@@ -633,6 +624,7 @@ impl WriteGuard {
         if !self.sees(doc) {
             Some(MOVES_OUT)
         } else if !self
+            .sel
             .rules
             .as_deref()
             .is_none_or(|r| r.admits_write(doc, &written, crate::repr::policy_context()))

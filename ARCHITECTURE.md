@@ -73,7 +73,7 @@ module's header comment.
 | `paging.rs` | 1 400 | 4.12, 6.3.10 limit/offset/count and the next/prev links, 4.23 ordering and ICU collation, 6.3.17 `NGSILD-Warning`, the query body of 5.2.23 lifted into parameters; every list operation pages through it |
 | `admin_auth.rs` | 245 | the optional `/q` admin credential (T-3569): one bearer secret from `ANTARES_ADMIN_TOKEN_FILE`, compared without an early exit; health and readiness stay open, metrics configurable |
 | `attrs.rs` | 2 350 | 5.6.2–5.6.5 attribute operations, 10.2.6 Set Attribute Value |
-| `batch.rs` | 2 360 | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
+| `batch.rs` | 2 420 | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
 | `temporal.rs` | 4 600 | 5.6.11–5.6.16, 5.7.3–5.7.4 `/temporal/entities` |
 | `temporalq.rs` | 200 | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |
 | `types_attrs.rs` | 900 | 5.7.5–5.7.10 `/types`, `/attributes` |
@@ -95,10 +95,10 @@ module's header comment.
 | `bounds.rs` | 718 | every cap: body, URI, JSON depth, batch, fan-out, in-flight, regex program size, and the notification pipeline's queue depth and delivery widths; all reported by `/q/health`, which a test over this module's own source keeps true |
 | `egress.rs` | 470 | SSRF wall and per-destination circuit breakers for notifications, forwards, `@context` fetches |
 | `surface.rs` | 115 | `ApiSurface`: HTTP surfaces mounted beside the API root, on the reserved prefixes `/q` and `/x` |
-| `policy.rs` | 2 440 | the policy seam (ADR-0020): `PolicyEngine`, `Subject`/`Operation`/`Decision`/`Filter` (per-rule allowlists, ADR-0023 rule 11), the built-in `AllowAll` engine, the clauses a narrowing can reach and the refusal everywhere else, the fail-closed calls that deny on a panic or a timeout, and the stored subject a notification is decided under |
+| `policy.rs` | 2 680 | the policy seam (ADR-0020): `PolicyEngine`, `Subject`/`Operation`/`Decision`/`Filter` (per-rule allowlists, ADR-0023 rule 11), the `Condition` an `AllowIf` holds a write by id to inside the store (gap G12), the built-in `AllowAll` engine, the clauses a narrowing can reach and the refusal everywhere else, the fail-closed calls that deny on a panic or a timeout, and the stored subject a notification is decided under |
 | `state.rs` | 1 050 | `AppState`: store, bus flag, mirror, HTTP clients, delivery policy, sinks, surfaces, hooks, the forward transport, and the endpoint view a state is narrowed to (feature `views`) |
 | `fuzzing.rs` | 84 | the request parsers the `fuzz/` targets drive, behind the `fuzzing` feature that no broker build enables (T-3463) |
-| `views.rs` | 1 350 | feature `views` (ADR-0023, ADR-0027 section 5): `CompiledView` and the composition `gate!` applies after the engine answers, effective = view ∧ engine, neither side widening; `WriteGuard`, rule 7 checked inside the store's read-modify-write; the `ViewTable` a pod serves from (views and each Tenant's schema bytes with their revision) and the `Kind::View` documents under `antares-views`; never in a vanilla build |
+| `views.rs` | 1 390 | feature `views` (ADR-0023, ADR-0027 section 5): `CompiledView` and the composition `gate!` applies after the engine answers, effective = view ∧ engine, neither side widening; `WriteGuard`, rule 7 checked inside the store's read-modify-write; the `ViewTable` a pod serves from (views and each Tenant's schema bytes with their revision) and the `Kind::View` documents under `antares-views`; never in a vanilla build |
 Geoquery evaluation, the `q=` evaluator and the caches of compiled client
 query text are not in that table because they are not this crate's: they are
 `antares_ql::geo`, `::eval` and `::regex`, named by those paths at every call

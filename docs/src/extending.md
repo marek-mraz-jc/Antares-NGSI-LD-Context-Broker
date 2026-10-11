@@ -182,6 +182,22 @@ other operation — a create, a delete, a subscription, a registration — and
 the seam answers 403 rather than dropping it; decide those with `Allow` or
 `Deny`.
 
+A write by id whose grant depends on what the stored Entity holds (a zone,
+a status, an owner) is answered `AllowIf(filter)`: the `Operation` shows
+the engine the stored types, scope and Attribute names, never the values,
+so the engine hands the condition to the store instead. The write is
+applied only if the stored Entity matches the filter's `q`, `scopeQ`, areas
+and the types and conditions of its rules, judged inside the store's own
+read-modify-write on the very document it changes, so a concurrent write
+between the decision and the commit cannot carry it onto an Entity the
+condition no longer selects. An Entity it does not select answers `404`
+exactly as an absent one does; a batch judges each member by its own
+Entity and reports the others in `errors`; a conditioned write that would
+be forwarded to a Context Source is refused (`403`). `AllowIf` holds on the
+clauses in `policy::WRITE_BY_ID` and selects only: on any other clause, or
+with a `pick`, `omit`, `omit_by_type`, `temporal` or a rule's Attribute
+list or windows, the seam answers 403.
+
 A `Filter` may only narrow. Its `q` and `scopeQ` are conjoined into the
 condition the store already had — a `scopeQ` by the 4.19 distribution, so a
 caller filtering by Scope of its own is served the Scopes both select and

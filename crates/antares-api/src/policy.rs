@@ -215,8 +215,9 @@ impl Operation<'_> {
     }
 }
 
-/// What an engine may answer. There is no third state: an operation is
-/// allowed, refused, or allowed over less than it asked for.
+/// What an engine may answer: an operation is allowed, refused, allowed
+/// over less than it asked for, or allowed on a condition the stored Entity
+/// has to meet.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     Allow,
@@ -227,7 +228,34 @@ pub enum Decision {
     /// Allowed over less. The caller cannot tell a hidden entity from an
     /// absent one.
     Filter(Filter),
+    /// Allowed only if the stored Entity the write lands on is one the
+    /// filter selects (gap G12): its `q`, `scopeQ`, areas and the types and
+    /// conditions of its `rules`, judged on stored values, which the
+    /// [`Operation`] does not carry. The store judges the document it is
+    /// about to change, inside the write's own read-modify-write, so a
+    /// concurrent write between this answer and the commit cannot carry the
+    /// write onto an Entity the filter no longer selects. An Entity it does
+    /// not select answers as an absent one. Honoured on [`WRITE_BY_ID`], with
+    /// a filter that selects and projects nothing; anywhere else a deny
+    /// ([`resolve`]).
+    AllowIf(Filter),
 }
+
+/// The writes by id a [`Decision::AllowIf`] can condition: each changes or
+/// deletes Entities that are already stored, by id, and judges each of them
+/// inside its store operation. A create has no stored Entity to judge, and
+/// Batch Upsert may create; a temporal write changes the evolution, not the
+/// Entity a filter reads.
+pub const WRITE_BY_ID: [&str; 11] = [
+    "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.17", "5.6.18", "5.6.19", "5.6.9", "5.6.10",
+    "5.6.20",
+];
+
+/// Why a write conditioned on its stored Entity is refused rather than
+/// forwarded: a Context Source's copy is not in this store, so nothing here
+/// can judge it.
+pub const CONDITION_NOT_FORWARDED: &str =
+    "a write conditioned on the stored Entity is not forwarded to a Context Source";
 
 /// How much less. Every member narrows and none widens: the `q`, `scopeQ`
 /// and `geo_q` are conjoined with the caller's own, `pick` keeps a subset of
@@ -591,6 +619,21 @@ impl Filter {
             && self.pick.is_empty()
             && !self.has_rules()
             && self.temporal.is_empty()
+    }
+
+    /// Whether the filter removes anything from what it selects: a
+    /// projection, a per-type omit, a rule's Attribute list or a temporal
+    /// window. A write condition ([`Decision::AllowIf`]) may not: the write
+    /// is performed whole or not at all.
+    pub fn projects(&self) -> bool {
+        !self.pick.is_empty()
+            || !self.omit.is_empty()
+            || !self.omit_by_type.is_empty()
+            || !self.temporal.is_empty()
+            || self
+                .rules
+                .iter()
+                .any(|r| !r.attributes.is_empty() || !r.temporal.is_empty())
     }
 
     /// Whether the filter carries rules or per-type omits (ADR-0023 rule 11).
@@ -992,6 +1035,13 @@ impl PolicyEngine for AllowAll {
 /// means refuse. An empty `Filter` asks for nothing and is an allow.
 pub fn resolve(clause: &str, decision: Decision) -> Decision {
     match decision {
+        Decision::AllowIf(_) if !WRITE_BY_ID.contains(&clause) => Decision::Deny(format!(
+            "{clause} is not a write by id and cannot be conditioned on the stored Entity"
+        )),
+        Decision::AllowIf(f) if f.projects() => {
+            Decision::Deny("a write condition selects Entities and projects nothing".into())
+        }
+        Decision::AllowIf(f) if Condition::of(&f).is_none() => Decision::Allow,
         Decision::Filter(f) if !FILTERABLE.contains(&clause) => {
             if f.is_empty() {
                 Decision::Allow
@@ -1378,28 +1428,109 @@ pub async fn gate(
 ) -> Result<Filter, Denied> {
     match decide(engine, &subject_of(tenant, headers), op).await {
         Decision::Allow => Ok(Filter::default()),
-        Decision::Filter(f) => Ok(f),
+        // On a write by id the filter is the condition ([`Condition::of`]);
+        // `resolve` lets an `AllowIf` through nowhere else, and turns a
+        // `Filter` there into a deny, so a handler of such a clause reads
+        // what it gets back as the condition and nothing else.
+        Decision::Filter(f) | Decision::AllowIf(f) => Ok(f),
         Decision::Deny(why) => Err(Denied(why)),
     }
 }
 
-/// [`gate`](fn@gate) for a batch: the refusal reason of each member, `None` where
-/// the member is allowed. A batch writes its members whole, so a `Filter`
-/// on a member is a refusal ([`resolve`]: no batch clause is FILTERABLE).
+/// [`gate`](fn@gate) for a batch: per member the refusal reason, or the
+/// condition its stored Entity has to meet (empty when there is none). A
+/// batch writes its members whole, so a `Filter` on a member is a refusal
+/// ([`resolve`]: no batch clause is FILTERABLE).
 pub async fn gate_each(
     engine: &dyn PolicyEngine,
     tenant: &antares_model::TenantId,
     headers: &HeaderMap,
     ops: &[Operation<'_>],
-) -> Vec<Option<String>> {
+) -> Vec<Result<Filter, String>> {
     decide_each(engine, &subject_of(tenant, headers), ops)
         .await
         .into_iter()
         .map(|d| match d {
-            Decision::Deny(why) => Some(why),
-            Decision::Allow | Decision::Filter(_) => None,
+            Decision::Deny(why) => Err(why),
+            Decision::AllowIf(f) => Ok(f),
+            Decision::Allow | Decision::Filter(_) => Ok(Filter::default()),
         })
         .collect()
+}
+
+/// What a write by id needs of the Entity it lands on
+/// ([`Decision::AllowIf`]), in the form a stored document is read in. The
+/// handler checks it inside the store's own read-modify-write, on the
+/// document the store is about to change.
+#[derive(Debug)]
+pub(crate) struct Condition {
+    q: Option<QNode>,
+    scope_q: Option<String>,
+    areas: Vec<GeoQuery>,
+    /// The rules with type and Attribute names expanded, the form a stored
+    /// document is in.
+    pub(crate) rules: Option<std::sync::Arc<Filter>>,
+}
+
+impl Condition {
+    /// The selection `f` makes, whatever it projects.
+    pub(crate) fn new(f: &Filter) -> Self {
+        Self {
+            q: f.q.as_deref().cloned(),
+            scope_q: f.scope_q.clone(),
+            areas: f.areas().cloned().collect(),
+            rules: crate::repr::type_rules(f),
+        }
+    }
+
+    /// The condition `f` sets, or `None` when it selects every Entity.
+    pub(crate) fn of(f: &Filter) -> Option<Self> {
+        let c = Self::new(f);
+        (c.q.is_some() || c.scope_q.is_some() || !c.areas.is_empty() || c.rules.is_some())
+            .then_some(c)
+    }
+
+    /// Whether the stored document `doc` is selected. A linked path in a
+    /// `q` never holds, as in a rule (ADR-0023 rule 11): the check runs
+    /// inside the store's write and reads no other Entity.
+    pub(crate) fn holds(&self, doc: &Value) -> bool {
+        let ctx = crate::repr::policy_context();
+        crate::repr::shown(self.rules.as_deref(), doc).is_some()
+            && self
+                .scope_q
+                .as_deref()
+                .is_none_or(|s| crate::scope_matches(s, doc))
+            && self.areas.iter().all(|g| g.matches(doc, ctx))
+            && self.q.as_ref().is_none_or(|q| {
+                !q.has_linked_paths() && antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
+            })
+    }
+
+    /// Inside the store closure: an Entity the condition does not select is
+    /// not found, the answer an absent one gets.
+    pub(crate) fn pre(
+        cond: Option<&Self>,
+        id: &str,
+        doc: &Value,
+    ) -> Result<(), antares_model::NgsiError> {
+        if cond.is_none_or(|c| c.holds(doc)) {
+            Ok(())
+        } else {
+            Err(antares_model::NgsiError::ResourceNotFound(format!(
+                "entity {id} not found"
+            )))
+        }
+    }
+
+    /// A conditioned write that would reach a Context Source is refused:
+    /// nothing in this store can judge the Source's copy.
+    pub(crate) fn unforwarded(cond: Option<&Self>, forwards: bool) -> Result<(), Denied> {
+        if cond.is_some() && forwards {
+            Err(Denied(CONDITION_NOT_FORWARDED.to_owned()))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// The members of a JSON object, or nothing when it is not one.
@@ -1455,6 +1586,9 @@ pub async fn run_policy_contract(engine: &dyn PolicyEngine) {
                     );
                 }
             }
+            // `decide` answers a condition on anything but a write by id as
+            // a deny, so reaching here is the seam's fault, not the engine's.
+            Decision::AllowIf(_) => panic!("{name}: a condition on {clause} passed the seam"),
         }
     }
 
@@ -2293,6 +2427,102 @@ mod tests {
     /// G8: the engine's warning travels as one `NGSILD-Warning` value per
     /// text, and a text that could not be one header line is refused.
     #[test]
+    fn a_condition_holds_only_on_a_write_by_id_and_only_as_a_selection() {
+        let zone = Filter {
+            q: Some(Box::new(antares_ql::parse_q("zone==\"A\"").expect("q"))),
+            ..Filter::default()
+        };
+        let conditioned = Decision::AllowIf(zone.clone());
+        for clause in WRITE_BY_ID {
+            assert_eq!(
+                resolve(clause, conditioned.clone()),
+                conditioned,
+                "{clause}"
+            );
+            assert_eq!(
+                resolve(clause, Decision::AllowIf(Filter::default())),
+                Decision::Allow,
+                "{clause}: an empty condition selects everything"
+            );
+        }
+        for clause in [
+            "5.6.1", "5.6.7", "5.6.8", "5.6.12", "5.6.21", "5.7.1", "5.8.1",
+        ] {
+            assert!(
+                matches!(resolve(clause, conditioned.clone()), Decision::Deny(_)),
+                "{clause}"
+            );
+        }
+        for projecting in [
+            Filter {
+                pick: vec!["speed".into()],
+                ..zone.clone()
+            },
+            Filter {
+                omit: vec!["speed".into()],
+                ..zone.clone()
+            },
+            Filter {
+                temporal: Box::new([Window::default()]),
+                ..zone.clone()
+            },
+            Filter {
+                omit_by_type: BTreeMap::from([("Vehicle".into(), vec!["speed".into()])]),
+                ..zone.clone()
+            },
+            Filter {
+                rules: vec![Rule {
+                    types: vec!["Vehicle".into()],
+                    temporal: vec![Window::default()],
+                    ..Rule::default()
+                }],
+                ..Filter::default()
+            },
+        ] {
+            assert!(
+                matches!(
+                    resolve("5.6.2", Decision::AllowIf(projecting.clone())),
+                    Decision::Deny(_)
+                ),
+                "{projecting:?}"
+            );
+        }
+
+        let dc = "https://uri.etsi.org/ngsi-ld/default-context/";
+        let doc = |z: &str| {
+            serde_json::json!({"id": "urn:ngsi-ld:Vehicle:v", "type": [format!("{dc}Vehicle")],
+                               format!("{dc}zone"): [{"type": "Property", "value": z}]})
+        };
+        let c = Condition::of(&zone).expect("a condition");
+        assert!(c.holds(&doc("A")) && !c.holds(&doc("B")));
+        assert!(Condition::pre(Some(&c), "urn:ngsi-ld:Vehicle:v", &doc("A")).is_ok());
+        assert!(matches!(
+            Condition::pre(Some(&c), "urn:ngsi-ld:Vehicle:v", &doc("B")),
+            Err(antares_model::NgsiError::ResourceNotFound(m))
+                if m == "entity urn:ngsi-ld:Vehicle:v not found"
+        ));
+        assert!(Condition::pre(None, "urn:ngsi-ld:Vehicle:v", &doc("B")).is_ok());
+        let linked = Filter {
+            q: Some(Box::new(
+                antares_ql::parse_q("owner.zone==\"A\"").expect("q"),
+            )),
+            ..Filter::default()
+        };
+        assert!(
+            !Condition::of(&linked)
+                .expect("a condition")
+                .holds(&doc("A")),
+            "a linked path reads no other Entity inside the write, so it never holds"
+        );
+        assert!(Condition::unforwarded(Some(&c), false).is_ok());
+        assert!(Condition::unforwarded(None, true).is_ok());
+        assert_eq!(
+            Condition::unforwarded(Some(&c), true),
+            Err(Denied(CONDITION_NOT_FORWARDED.into()))
+        );
+    }
+
+    #[test]
     fn a_warning_is_one_header_line_or_refused() {
         let left_out = Warning::new("types left out by the filter: Building").unwrap();
         let mut headers = HeaderMap::new();
@@ -2412,7 +2642,10 @@ mod tests {
             &ops,
         )
         .await;
-        assert_eq!(gated, vec![None, Some("no upserts".to_owned())]);
+        assert_eq!(
+            gated,
+            vec![Ok(Filter::default()), Err("no upserts".to_owned())]
+        );
     }
 
     #[tokio::test]
