@@ -961,7 +961,11 @@ async fn run(
         antares_ws::Limits::from_env(|k| std::env::var(k).ok())?;
         state.with_sink(Box::new(antares_ws::Sink::new(antares_ws::Hub::process())))
     };
-    #[cfg(any(feature = "plugin-example", feature = "ws"))]
+    // The MCP surface's resource subscriptions (MCP section 5): an
+    // in-process sink that flags a URI on a stream this process holds.
+    #[cfg(feature = "mcp")]
+    let state = state.with_sink(Box::new(antares_mcp::Sink));
+    #[cfg(any(feature = "plugin-example", feature = "ws", feature = "mcp"))]
     let mut state = state;
     // /q/metrics renders through this closure (None without the
     // `telemetry` feature — the endpoint answers 404); the sampler feeds

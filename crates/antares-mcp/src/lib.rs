@@ -25,6 +25,7 @@ mod confirm;
 mod cursor;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
+mod listen;
 mod schema;
 mod server;
 mod tools;
@@ -59,6 +60,7 @@ pub const MAX_RESULT_BYTES_ENV: &str = "ANTARES_MCP_MAX_RESULT_BYTES";
 /// own and a confirmation answers only the process that asked.
 pub const REQUEST_STATE_KEY_FILE_ENV: &str = "ANTARES_MCP_REQUEST_STATE_KEY_FILE";
 
+pub use listen::Sink;
 pub use schema::SUBSCRIPTION_ENDPOINTS_ENV;
 
 /// The largest request body the endpoint reads (`MCP_MAX_REQUEST_BYTES`).
