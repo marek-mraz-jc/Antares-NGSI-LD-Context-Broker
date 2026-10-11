@@ -512,6 +512,14 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("example", || {
         Box::new(antares_plugin_example::ExampleSurface)
     }),
+    // The joinedcontext engine's access surface reads the table the
+    // engine of this process decides with (addon README section 4).
+    #[cfg(all(feature = "jc-policy", feature = "views"))]
+    (joinedcontext_policy::surface::NAME, || {
+        antares_ops::mount(joinedcontext_policy::surface::Access::new(
+            joinedcontext_policy::JoinedcontextPolicy::process(),
+        ))
+    }),
 ];
 
 /// ANTARES_API_SURFACES → the surfaces mounted beside the NGSI-LD API,
@@ -568,7 +576,7 @@ const POLICY_SHELF: &[(&str, PolicyCtor)] = &[
     }),
     #[cfg(feature = "jc-policy")]
     (joinedcontext_policy::POLICY_NAME, || {
-        std::sync::Arc::new(joinedcontext_policy::JoinedcontextPolicy::new())
+        joinedcontext_policy::JoinedcontextPolicy::process()
     }),
 ];
 
@@ -1901,6 +1909,32 @@ mod policy_shelf_tests {
                 .is_some(),
             "an engine selected without rules would otherwise allow everything"
         );
+    }
+
+    /// The access surface is on the shelf beside the platform's engine, and
+    /// both are the one engine of the process: what the surface shows is
+    /// the table the broker decides with (T-3638).
+    #[cfg(all(feature = "jc-policy", feature = "views"))]
+    #[test]
+    fn the_access_surface_reads_the_engine_the_broker_decides_with() {
+        let picked = api_surfaces(Some("admin,views,access")).expect("access is on the shelf");
+        let access = picked[2].1();
+        assert_eq!(access.name(), "access");
+        assert_eq!(access.prefix(), "/x/views");
+        let (_, build) = policy_engine(Some(joinedcontext_policy::POLICY_NAME)).expect("engine");
+        let engine = build();
+        let shared = joinedcontext_policy::JoinedcontextPolicy::process();
+        engine
+            .load("t3638", &serde_json::json!({"policies": []}))
+            .expect("an empty document loads");
+        assert!(
+            shared.table("t3638").is_some(),
+            "the surface's engine saw the load"
+        );
+        engine
+            .load("t3638", &serde_json::Value::Null)
+            .expect("a removal");
+        assert!(shared.table("t3638").is_none());
     }
 
     /// The platform's engine is selected by name, and with no document
