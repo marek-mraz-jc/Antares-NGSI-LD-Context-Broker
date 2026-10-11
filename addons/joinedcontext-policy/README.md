@@ -21,6 +21,16 @@ token and strips them from every client request.
 | `x-jc-roles` | roles, comma separated; the Endpoint roles (`endpoint:{project}/{endpoint}[/{role}]`) the gateway resolved for this request among them |
 | `x-jc-restricted` | `true` when the caller opted into the restricted signal (O-3 (b)) |
 
+Each value, and each member of a list, is percent-encoded UTF-8 (RFC 3986:
+the unreserved characters `A-Z a-z 0-9 - . _ ~` stay as they are, every
+other byte is `%XX`), so a name with a diacritic or a comma travels whole
+(`doprava/správa` is `doprava%2Fspr%C3%A1va`). The engine splits a list on
+`,` first and decodes each member after, so an encoded comma never splits a
+name. A member that does not decode (a broken escape, bytes that are not
+UTF-8) is dropped alone and the rest kept; a `x-jc-subject` or
+`x-jc-client` that does not decode names nobody and still makes the caller
+not anonymous. Unencoded ASCII names read as before.
+
 A request with at least one of these headers is a platform caller. One with
 no `x-jc-subject` and no `x-jc-client` is anonymous and holds the role
 `public`, whatever `x-jc-roles` says beside it.
