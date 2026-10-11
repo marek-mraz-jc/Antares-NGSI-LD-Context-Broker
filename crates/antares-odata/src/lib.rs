@@ -26,6 +26,7 @@ mod read;
 
 use antares_ops::{Caller, Ops, Surface, ViewOps};
 use axum::extract::{MatchedPath, Request};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
@@ -114,6 +115,10 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
     });
     // The inner router matches its own path; the outer match goes.
     req.extensions_mut().remove::<MatchedPath>();
+    let req = match query_in_body(req, state.url_limits.max_query_len).await {
+        Ok(req) => req,
+        Err(refused) => return refused.into_response(),
+    };
     let reads = Arc::new(read::Reads {
         view,
         edm,
@@ -137,6 +142,76 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
         .oneshot(req)
         .await;
     resp
+}
+
+/// `POST {resource}/$query` (Protocol 11.2.5.2, T-3441 Q22): the options
+/// of the body, joined to the URL's, served as the `GET` they stand for,
+/// so the parser, the refusals and the engine see one request (O24). The
+/// body is bounded by the query length the parser takes.
+async fn query_in_body(req: Request, max: usize) -> Result<Request, ODataErrorResponse> {
+    let path = req.uri().path();
+    let Some(resource) = path
+        .strip_suffix("/$query")
+        .filter(|_| req.method() == Method::POST)
+    else {
+        return Ok(req);
+    };
+    let resource = resource.to_owned();
+    let kind = req
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(|v| v.trim().to_ascii_lowercase());
+    let form = match kind.as_deref() {
+        Some("text/plain") => false,
+        Some("application/x-www-form-urlencoded") => true,
+        _ => {
+            return Err(ODataErrorResponse::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "UnsupportedMediaType",
+                "a query body is text/plain or application/x-www-form-urlencoded",
+            ))
+        }
+    };
+    let (mut parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, max).await.map_err(|_| {
+        ODataErrorResponse::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "PayloadTooLarge",
+            "the query body is longer than this service reads",
+        )
+    })?;
+    let bad = || {
+        ODataErrorResponse::new(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "the query body is not a URL query",
+        )
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|_| bad())?.trim();
+    // A form encodes a space as `+`; a URL query reads `+` as itself.
+    let text = if form {
+        text.replace('+', "%20")
+    } else {
+        text.to_owned()
+    };
+    let query: Vec<&str> = parts
+        .uri
+        .query()
+        .into_iter()
+        .chain(Some(text.as_str()))
+        .filter(|q| !q.is_empty())
+        .collect();
+    let uri = match query.join("&") {
+        q if q.is_empty() => resource,
+        q => format!("{resource}?{q}"),
+    };
+    parts.uri = uri.parse().map_err(|_| bad())?;
+    parts.method = Method::GET;
+    parts.headers.remove(CONTENT_TYPE);
+    parts.headers.remove(CONTENT_LENGTH);
+    Ok(Request::from_parts(parts, axum::body::Body::empty()))
 }
 
 /// What a model is a function of (T-3441 7.3): the view, the types and

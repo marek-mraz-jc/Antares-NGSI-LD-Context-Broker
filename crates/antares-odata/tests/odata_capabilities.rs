@@ -190,8 +190,8 @@ async fn the_restrictions_name_what_filter_and_orderby_refuse() {
         );
     }
     assert!(
-        xml.contains(r#"<Annotation Term="Capabilities.QuerySegmentSupported" Bool="false"/>"#),
-        "C20 until /$query is served: {xml}"
+        xml.contains(r#"<Annotation Term="Capabilities.QuerySegmentSupported" Bool="true"/>"#),
+        "C20: POST /$query is served: {xml}"
     );
 }
 

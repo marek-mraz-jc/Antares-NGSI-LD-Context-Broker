@@ -430,7 +430,7 @@ fn container_capabilities() -> Vec<Annotation> {
             },
         ),
         flag("BatchSupported", false),
-        flag("QuerySegmentSupported", false),
+        flag("QuerySegmentSupported", true),
         flag("CrossJoinSupported", false),
         flag("ComputeSupported", false),
         flag("KeyAsSegmentSupported", false),
