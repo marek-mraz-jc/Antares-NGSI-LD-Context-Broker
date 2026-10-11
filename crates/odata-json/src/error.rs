@@ -209,6 +209,12 @@ pub enum BodyError {
         /// The key property.
         property: String,
     },
+    /// A create that leaves out, or names `null`, a property the set's
+    /// `InsertRestrictions/RequiredProperties` lists.
+    MissingProperty {
+        /// The property.
+        property: String,
+    },
     /// A key, computed, non-insertable or non-updatable property in a write.
     ReadOnly {
         /// The property path, `/`-separated.
@@ -245,6 +251,7 @@ impl BodyError {
             Self::UnknownProperty => "UnknownProperty",
             Self::InvalidValue { .. } | Self::NullNotAllowed { .. } => "InvalidValue",
             Self::MissingKey { .. } => "MissingKey",
+            Self::MissingProperty { .. } => "MissingProperty",
             Self::ReadOnly { .. } => "ReadOnly",
             Self::InvalidBind { .. } => "InvalidBind",
             Self::NotImplemented(_) => "NotImplemented",
@@ -256,6 +263,7 @@ impl BodyError {
             Self::InvalidValue { property }
             | Self::NullNotAllowed { property }
             | Self::MissingKey { property }
+            | Self::MissingProperty { property }
             | Self::ReadOnly { property } => Some(property),
             Self::InvalidBind { navigation } => Some(navigation),
             _ => None,
@@ -287,6 +295,7 @@ impl Display for BodyError {
             Self::InvalidValue { .. } => f.write_str("a value does not have the declared type"),
             Self::NullNotAllowed { .. } => f.write_str("a property that is not nullable is null"),
             Self::MissingKey { .. } => f.write_str("the key property is missing"),
+            Self::MissingProperty { .. } => f.write_str("a required property is missing"),
             Self::ReadOnly { .. } => f.write_str("the property cannot be written"),
             Self::InvalidBind { .. } => {
                 f.write_str("the bind does not address an entity this navigation property reaches")

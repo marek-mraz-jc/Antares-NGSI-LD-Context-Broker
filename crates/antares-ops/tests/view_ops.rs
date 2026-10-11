@@ -43,7 +43,20 @@ impl Surface for Probe {
                 }
             }
         };
+        let mapped = ops.clone();
         Router::new()
+            .route(
+                "/{view}/mapping",
+                get(move |Path(id): Path<String>| {
+                    let ops = mapped.clone();
+                    async move {
+                        axum::Json(json!({
+                            "view": ops.view(&id).is_some(),
+                            "mapped": ops.mapped_view(&id).and_then(|v| v.mapping().map(|m| m.source_class().to_owned())),
+                        }))
+                    }
+                }),
+            )
             .route(
                 "/{view}/types",
                 get(run(
@@ -251,4 +264,35 @@ async fn the_handle_follows_the_view_table() {
     );
     let a = send(&app, Method::GET, "/x/probe/trucks/entities", &[], None).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.json);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_of_another_model_reaches_only_the_surface_that_asks_for_its_mapping() {
+    let (_b, app) = broker().await.expect("broker");
+    let mapped = json!({
+        "id": "mapped", "tenant": "city", "selector": ["Car"],
+        "rules": [{"types": ["Car"], "attributes": ["speed"]}],
+        "operations": ["query_entities"],
+        "mapping": {"version": 2, "sourceClass": "Car", "targetClass": "Vehicle",
+                    "slots": [{"target": "velocity", "source": "speed", "kind": "rename"}]}
+    });
+    let a = send(&app, Method::PUT, "/q/views/mapped", &[], Some(&mapped)).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.json);
+    let a = send(&app, Method::GET, "/x/probe/mapped/entities", &[], None).await;
+    assert_eq!(
+        a.status,
+        StatusCode::NOT_FOUND,
+        "Ops::view: an unknown view to every other surface"
+    );
+    let a = send(&app, Method::GET, "/x/probe/mapped/mapping", &[], None).await;
+    assert_eq!(
+        a.json,
+        json!({"view": false, "mapped": "https://uri.etsi.org/ngsi-ld/default-context/Car"})
+    );
+    let a = send(&app, Method::GET, "/x/probe/cars/mapping", &[], None).await;
+    assert_eq!(
+        a.json,
+        json!({"view": true, "mapped": null}),
+        "a view of the store's own model"
+    );
 }
