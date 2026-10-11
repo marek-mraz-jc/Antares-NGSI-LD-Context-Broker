@@ -2668,6 +2668,62 @@ mod tests {
         );
     }
 
+    /// T-3729: a notification's shown set outlives its rules unchanged; an
+    /// empty set would show the whole Entity.
+    #[test]
+    fn an_owned_shown_set_keeps_both_sets() {
+        let shown = Shown {
+            only: Some(std::collections::BTreeSet::from([Cow::Borrowed("a")])),
+            omitted: std::collections::BTreeSet::from([Cow::Borrowed("b")]),
+        };
+        let owned = shown.clone().into_owned();
+        assert_eq!(owned, shown);
+        assert!(owned.allows("a") && !owned.allows("b") && !owned.allows("c"));
+    }
+
+    /// T-3729: only a rule with no condition, ids or id patterns admits by
+    /// type alone, the one the store may page as a type selection.
+    #[test]
+    fn a_rule_admits_by_type_alone_only_without_condition_or_ids() {
+        let typed = Rule {
+            types: vec![iri("Car")],
+            ..Rule::default()
+        };
+        assert!(typed.admits_by_type_alone());
+        for narrowed in [
+            Rule {
+                ids: vec!["urn:ngsi-ld:Car:1".into()],
+                ..typed.clone()
+            },
+            Rule {
+                id_patterns: vec!["urn:.*".into()],
+                ..typed.clone()
+            },
+            Rule {
+                scope_q: Some("/a/#".into()),
+                ..typed.clone()
+            },
+        ] {
+            assert!(!narrowed.admits_by_type_alone(), "{narrowed:?}");
+        }
+    }
+
+    /// T-3729: the broker's `__` members of a stored Subscription or
+    /// Registration are no Attributes a condition reads.
+    #[test]
+    fn a_record_image_leaves_the_brokers_members_out() {
+        let image = record_image(&json!({"id": "urn:ngsi-ld:Subscription:1",
+            "type": "Subscription", "__tenant": "acme", "description": "d"}));
+        let keys: Vec<&String> = image
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys.len(), 3, "{image}");
+        assert!(keys.iter().all(|k| !k.contains("__")), "{image}");
+    }
+
     #[test]
     fn a_filter_says_its_areas_its_rules_and_its_restriction() {
         let both = Filter {
