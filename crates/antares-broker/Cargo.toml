@@ -129,6 +129,8 @@ antares-api = { workspace = true, features = ["test-kit"] }
 # mqtt e2e: sync rumqttc client against a live mosquitto
 rumqttc = { workspace = true }
 serde_json = { workspace = true }
+# the views differential (T-3777): generated views and policies
+proptest = { workspace = true }
 
 [lints]
 workspace = true

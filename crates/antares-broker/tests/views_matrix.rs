@@ -23,6 +23,8 @@ use antares_api::AppState;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::Router;
+use proptest::prelude::*;
+use proptest::test_runner::{RngSeed, TestRunner};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -143,7 +145,7 @@ impl Scenario {
         if let Some(all) = doc["policies"].as_array_mut() {
             all.push(
                 json!({"id": "matrix-seed", "assignee": {"kind": "serviceAccount", "id": SEEDER},
-                            "operations": ["5.6.1", "5.6.2", "5.6.8"],
+                            "operations": ["5.6.1", "5.6.2", "5.6.8", "5.6.10"],
                             "information": [{"entities": TYPES.map(|t| json!({"type": t}))}]}),
             );
         }
@@ -294,9 +296,13 @@ async fn install(app: &Router, s: &Scenario) {
     }
 }
 
-/// The seed, written in the Tenant of `s` as the seeder.
+/// The seed (the scenario's own `seed`, else `_seed.json`), written in the
+/// Tenant of `s` as the seeder.
 async fn seed(app: &Router, s: &Scenario) {
-    let seed: Value = serde_json::from_str(SEED).expect("the seed");
+    let seed: Value = match s.doc.get("seed") {
+        Some(own) => own.clone(),
+        None => serde_json::from_str(SEED).expect("the seed"),
+    };
     let uri = "/ngsi-ld/v1/entityOperations/upsert";
     let (status, _, body) = send(app, "POST", uri, &seeder(s), Some(&seed)).await;
     assert!(status.is_success(), "{}: seed: {status} {body}", s.name);
@@ -328,7 +334,7 @@ fn local(href: &str) -> String {
 
 /// What one surface answered: the Entities read, the count it reported, or
 /// a refusal with its status and body.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Read {
     Entities(Answer, Option<u64>),
     Refused(StatusCode, Value),
@@ -678,13 +684,6 @@ async fn by_id(app: &Router, s: &Scenario, want: &Answer, failures: &mut Vec<Str
 
 /// `read` against `want` on the surface `surface`.
 fn judge(surface: &str, read: Read, want: &Expect, failures: &mut Vec<String>) {
-    let seed_ids: Vec<String> = serde_json::from_str::<Value>(SEED)
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default()
-        .iter()
-        .map(|e| text(e, "id"))
-        .collect();
     match (read, want) {
         (Read::Entities(got, count), Expect::Admitted(want)) => {
             if &got != want {
@@ -704,7 +703,8 @@ fn judge(surface: &str, read: Read, want: &Expect, failures: &mut Vec<String>) {
         }
         (Read::Refused(status, body), Expect::Denied) => {
             let text = body.to_string();
-            if status.is_success() || seed_ids.iter().any(|id| text.contains(id.as_str())) {
+            // a refusal names no Entity: no URN of the seed or of a generated case
+            if status.is_success() || text.contains("urn:ngsi-ld:") {
                 failures.push(format!("{surface}: refusal {status} {text}"));
             }
         }
@@ -1118,4 +1118,293 @@ async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
         report.len(),
         report.join("\n")
     );
+}
+
+// The differential (T-3777 step 3): generated Entities, a generated view and
+// up to three generated policies of the corpus's grammar, each case in a
+// Tenant of its own, and every surface must answer what NGSI-LD answers
+// through the same view for the same caller. `VIEWS_DIFF_CASES` sets the
+// number of cases (200; ci runs 2 000), `VIEWS_DIFF_SEED` the seed, which
+// the test prints. A failure shrinks and prints the minimal case as a
+// corpus file with its own `seed`; its `expect` is then written by hand.
+
+/// The areas a view or policy names, `[x0, y0, x1, y1]`; the generated
+/// points lie on a 0..=12 grid, so some fall on an edge.
+const AREAS: [[u8; 4]; 3] = [[0, 0, 6, 6], [4, 4, 12, 12], [8, 0, 12, 4]];
+const SCOPES: [&str; 3] = ["/Zilina/transport", "/Zilina/police", "/Kosice/transport"];
+const SCOPE_QS: [&str; 4] = [
+    "/Zilina/transport",
+    "/Zilina/#",
+    "/+/transport",
+    "/Kosice/transport",
+];
+const QS: [&str; 7] = [
+    "speed>40",
+    "speed<50",
+    "temperature>20",
+    "operator==\"city\"",
+    "!operator",
+    "vehicleType==\"car\"",
+    "speed>20;operator==\"city\"",
+];
+const NAMES: [&str; 5] = [
+    "location",
+    "operator",
+    "speed",
+    "temperature",
+    "vehicleType",
+];
+
+fn ring(area: usize) -> Value {
+    let [x0, y0, x1, y1] = AREAS[area % AREAS.len()];
+    json!([[[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]])
+}
+
+fn georel(within: bool) -> &'static str {
+    if within {
+        "within"
+    } else {
+        "intersects"
+    }
+}
+
+/// Up to eight Vehicles and Sensors, each Attribute present or not.
+fn generated_seed() -> impl Strategy<Value = Vec<Value>> {
+    let one = (
+        any::<bool>(),
+        proptest::option::of((0u8..13, 0u8..13)),
+        proptest::option::of(0u8..100),
+        proptest::option::of(any::<bool>()),
+        proptest::option::of(any::<bool>()),
+        proptest::option::of(0..SCOPES.len()),
+    );
+    proptest::collection::vec(one, 1..8).prop_map(|all| {
+        all.into_iter()
+            .enumerate()
+            .map(|(i, (vehicle, at, n, city, car, scope))| {
+                let t = if vehicle { "Vehicle" } else { "Sensor" };
+                let prop = |v: Value| json!({"type": "Property", "value": v});
+                let mut e = json!({"id": format!("urn:ngsi-ld:{t}:G{i}"), "type": t});
+                if let Some((x, y)) = at {
+                    e["location"] = json!({"type": "GeoProperty",
+                                           "value": {"type": "Point", "coordinates": [x, y]}});
+                }
+                if let Some(n) = n {
+                    e[if vehicle { "speed" } else { "temperature" }] = prop(json!(n));
+                }
+                if let Some(city) = city {
+                    e["operator"] = prop(json!(if city { "city" } else { "bus" }));
+                }
+                if let (true, Some(car)) = (vehicle, car) {
+                    e["vehicleType"] = prop(json!(if car { "car" } else { "bus" }));
+                }
+                if let Some(scope) = scope {
+                    e["scope"] = json!(SCOPES[scope]);
+                }
+                e
+            })
+            .collect()
+    })
+}
+
+/// A condition: a `q`, an area with its georel, a `scopeQ`, each or not.
+type Condition = (Option<usize>, Option<(usize, bool)>, Option<usize>);
+
+fn condition() -> impl Strategy<Value = Condition> {
+    (
+        proptest::option::of(0..QS.len()),
+        proptest::option::of((0..AREAS.len(), any::<bool>())),
+        proptest::option::of(0..SCOPE_QS.len()),
+    )
+}
+
+/// The types a generated view or policy names: Vehicle, Sensor or both.
+fn types(which: usize) -> Vec<&'static str> {
+    match which % 3 {
+        0 => vec!["Vehicle"],
+        1 => vec!["Sensor"],
+        _ => vec!["Vehicle", "Sensor"],
+    }
+}
+
+/// A view of `*`, or of one or both types with a projection, and a
+/// condition on the view.
+fn generated_view() -> impl Strategy<Value = Value> {
+    (
+        0usize..4,
+        proptest::sample::subsequence(NAMES.to_vec(), 1..=NAMES.len()),
+        condition(),
+    )
+        .prop_map(|(shape, names, (q, area, scope))| {
+            let mut view = if shape == 3 {
+                json!({"selector": ["*"], "rules": [{"types": ["*"], "attributes": ["*"]}]})
+            } else {
+                json!({"selector": types(shape),
+                       "rules": [{"types": types(shape), "attributes": names}]})
+            };
+            if let Some(q) = q {
+                view["q"] = json!(QS[q]);
+            }
+            if let Some((area, within)) = area {
+                view["geoQ"] = json!({"georel": georel(within), "geometry": "Polygon",
+                                      "coordinates": ring(area)});
+            }
+            if let Some(scope) = scope {
+                view["scopeQ"] = json!(SCOPE_QS[scope]);
+            }
+            view
+        })
+}
+
+/// No policy (the public role reads everything), or one to three for the
+/// caller: a type or both, a projection or the whole Entity, a condition,
+/// one in four a prohibition.
+fn generated_policies() -> impl Strategy<Value = Option<Vec<Value>>> {
+    let one = (
+        0usize..3,
+        proptest::option::of(proptest::sample::subsequence(
+            NAMES.to_vec(),
+            1..=NAMES.len(),
+        )),
+        condition(),
+        0u8..4,
+    );
+    proptest::option::of(proptest::collection::vec(one, 1..=3)).prop_map(|all| {
+        all.map(|all| {
+            all.into_iter()
+                .enumerate()
+                .map(|(i, (which, names, (q, area, scope), effect))| {
+                    let entities: Vec<Value> =
+                        types(which).iter().map(|t| json!({"type": t})).collect();
+                    let mut information = json!({"entities": entities});
+                    if let Some(names) = names {
+                        information["propertyNames"] = json!(names);
+                    }
+                    let mut p = json!({"id": format!("p{i}"),
+                                       "assignee": {"kind": "user", "id": "alice"},
+                                       "operations": READS, "information": [information]});
+                    if let Some(q) = q {
+                        p["q"] = json!(QS[q]);
+                    }
+                    if let Some((area, within)) = area {
+                        p["geoQ"] = json!(format!(
+                            "georel={};geometry=Polygon;coordinates={}",
+                            georel(within),
+                            ring(area)
+                        ));
+                    }
+                    if let Some(scope) = scope {
+                        p["scopeQ"] = json!(SCOPE_QS[scope]);
+                    }
+                    if effect == 0 {
+                        p["effect"] = json!("prohibit");
+                    }
+                    p
+                })
+                .collect()
+        })
+    })
+}
+
+/// Every surface of a generated case against NGSI-LD through the view. The
+/// cases share one Tenant and view, each replacing the last, so the broker
+/// does not grow with the number of cases; the seed is deleted after.
+async fn differ(app: &Router, s: &Scenario) -> Vec<String> {
+    install(app, s).await;
+    seed(app, s).await;
+    let failures = compare(app, s).await;
+    let ids: Vec<Value> = s.doc["seed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| e["id"].clone())
+        .collect();
+    let uri = "/ngsi-ld/v1/entityOperations/delete";
+    let (status, _, body) = send(app, "POST", uri, &seeder(s), Some(&json!(ids))).await;
+    assert!(status.is_success(), "{}: delete: {status} {body}", s.name);
+    failures
+}
+
+async fn compare(app: &Router, s: &Scenario) -> Vec<String> {
+    let ngsi = ngsi_ld(app, s, false).await;
+    let mut failures = Vec::new();
+    for (surface, read) in [
+        ("OData", odata(app, s).await),
+        ("OGC", ogc(app, s).await),
+        ("MCP", mcp(app, s).await),
+    ] {
+        same(surface, read, ngsi.clone(), false, &mut failures);
+    }
+    failures
+}
+
+/// Mismatches with a fix task filed: a failure of the surface whose text
+/// holds the needle is printed with its task instead of failing the case.
+const KNOWN_DIFF: [(&str, &str, &str); 1] = [
+    // the MCP tool list is filtered by one engine probe that names no type,
+    // which a policy that can refuse some type refuses
+    ("MCP", "unknown tool", "T-3784"),
+];
+
+fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+#[test]
+fn every_surface_answers_what_ngsi_ld_admits_for_generated_views_and_policies() {
+    let cases: u32 = env_or("VIEWS_DIFF_CASES", 200);
+    let seed: u64 = env_or("VIEWS_DIFF_SEED", 3777);
+    eprintln!("views differential: {cases} cases, VIEWS_DIFF_SEED={seed}");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let (app, _reload) = rt.block_on(broker());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases,
+        rng_seed: RngSeed::Fixed(seed),
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    });
+    let strategy = (generated_seed(), generated_view(), generated_policies());
+    let result = runner.run(&strategy, |(entities, view, policies)| {
+        let n = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut doc = json!({"view": view, "caller": {"x-jc-subject": "alice"}, "seed": entities});
+        if let Some(policies) = policies {
+            doc["policies"] = json!(policies);
+        }
+        let s = Scenario {
+            name: format!("generated {n}"),
+            tenant: "g".to_owned(),
+            doc,
+        };
+        let mut failures = rt.block_on(differ(&app, &s));
+        failures.retain(|f| {
+            let known = KNOWN_DIFF
+                .iter()
+                .find(|(surface, needle, _)| f.starts_with(surface) && f.contains(needle));
+            if let Some((surface, _, task)) = known {
+                eprintln!("{} {surface}: known, {task}", s.name);
+            }
+            known.is_none()
+        });
+        prop_assert!(
+            failures.is_empty(),
+            "{}\nthe case as a corpus file:\n{}",
+            failures.join("\n"),
+            serde_json::to_string_pretty(&s.doc).unwrap_or_default()
+        );
+        Ok(())
+    });
+    if let Err(e) = result {
+        panic!(
+            "{e}\nVIEWS_DIFF_SEED={seed}: add the minimal case as a corpus file, its `expect` \
+             written by hand, and file its fix task"
+        );
+    }
 }

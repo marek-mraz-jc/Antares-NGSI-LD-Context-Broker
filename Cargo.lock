@@ -128,6 +128,7 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "proptest",
  "rumqttc",
  "serde_json",
  "tikv-jemalloc-ctl",

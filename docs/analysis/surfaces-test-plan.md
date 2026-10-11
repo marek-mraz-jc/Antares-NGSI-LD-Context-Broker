@@ -127,6 +127,18 @@ CI jobs named below (all in Antares `.github/workflows/`):
 - A mismatch with a fix task filed is listed in the scenario's `known` (surface to task id) and
   must still fail, so the fix removes the entry; the test prints the list.
 - Job: `workspace-tests` (all-features).
+- Test `every_surface_answers_what_ngsi_ld_admits_for_generated_views_and_policies`, the
+  differential: up to eight generated Vehicles and Sensors (each Attribute, a point on a 0..=12
+  grid and a scope present or not), a generated view (`*`, or one or both types with a
+  projection, and a `q`, an area `within` or `intersects` and a `scopeQ`, each or not) and none
+  or up to three generated policies for the caller (a type or both, `propertyNames` or the whole
+  Entity, the same conditions, one in four a prohibition). OData, OGC and MCP must answer what
+  NGSI-LD answers through the same view. All cases share one Tenant, the seed deleted after each.
+  `VIEWS_DIFF_CASES` sets the cases (200 in `fast`, 2 000 in ci's `views-differential` job, which
+  `publish-dev` waits for), `VIEWS_DIFF_SEED` the seed (3777, printed). A failure shrinks and
+  prints the minimal case as a corpus file with its own `seed`: commit it with its `expect`
+  written by hand and file the fix task. Mismatches with a task filed are listed in `KNOWN_DIFF`
+  (MCP "unknown tool", T-3784).
 
 ## 4. Property tests (`proptest` 1.11.0, already a workspace dependency: `Cargo.lock:2329`, used by `antares-sql`)
 
