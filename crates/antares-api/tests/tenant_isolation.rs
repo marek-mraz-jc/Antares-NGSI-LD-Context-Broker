@@ -371,6 +371,23 @@ async fn no_operation_of_one_tenant_touches_another_tenants_document() {
     // tenant B must exist, or every answer is NonexistentTenant (6.3.14) and
     // the test proves nothing about the document dimension
     create_entity(&st, B, "urn:ngsi-ld:Isolation:intruder-seed").await;
+    // The owner's Subscription watches a type only tenant B writes: nothing
+    // the owner does notifies it, so its delivery members (Table 5.2.12-1)
+    // hold still from `before` to `after` unless one of B's writes crossed
+    // into it (T-3716). Watching the owner's own type raced its first
+    // delivery against `before`.
+    let watched = |id: &str| {
+        format!(r#"{{"id":"urn:ngsi-ld:IsolationWatched:{id}","type":"IsolationWatched"}}"#)
+    };
+    let (status, body) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        Some(B),
+        Some(&watched("seed")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 
     let seeds: [(&str, &str); 3] = [
         (
@@ -382,7 +399,7 @@ async fn no_operation_of_one_tenant_touches_another_tenants_document() {
         (
             "/ngsi-ld/v1/subscriptions",
             r#"{"id":"urn:ngsi-ld:Subscription:owned","type":"Subscription",
-                "entities":[{"type":"Isolation"}],
+                "entities":[{"type":"IsolationWatched"}],
                 "notification":{"endpoint":{"uri":"http://localhost:9/never"}}}"#,
         ),
         (
@@ -421,6 +438,18 @@ async fn no_operation_of_one_tenant_touches_another_tenants_document() {
         temporal_before.contains("speed"),
         "the owner has a Temporal Evolution to attack: {temporal_before}"
     );
+
+    // B writes the watched type in its own tenant: allowed, and never a
+    // notification of the owner's Subscription
+    let (status, body) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        Some(B),
+        Some(&watched("later")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 
     // every mutating shape the API offers for a document named by id
     let attacks: Vec<(&str, String, Option<&str>)> = vec![
