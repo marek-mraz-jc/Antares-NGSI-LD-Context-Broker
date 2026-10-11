@@ -216,8 +216,8 @@ impl<'a> Terms<'a> {
             Expr::Or(l, r) => Ok(format!("({})|({})", self.term(l)?, self.term(r)?)),
             Expr::Compare(l, op, r) => self.compare(l, *op, r),
             Expr::In(l, list) => {
-                let name = self.scalar(l)?;
-                self.typed(l, list)?;
+                let (name, edm) = self.typed_member(l)?;
+                typed(edm, list)?;
                 let values = list.iter().map(value).collect::<Result<Vec<_>, _>>()?;
                 Ok(format!("{name}=={}", values.join(",")))
             }
@@ -352,8 +352,8 @@ impl<'a> Terms<'a> {
         if let Some(term) = self.entry(member, op, lit)? {
             return Ok(term);
         }
-        let name = self.scalar(member)?;
-        self.typed(member, std::slice::from_ref(lit))?;
+        let (name, edm) = self.typed_member(member)?;
+        typed(edm, std::slice::from_ref(lit))?;
         Ok(match (op, lit) {
             (CompareOp::Eq, Literal::Null) => format!("!{name}"),
             (CompareOp::Ne, Literal::Null) => name,
@@ -462,6 +462,11 @@ impl<'a> Terms<'a> {
     /// EXAMPLE 15); the broker resolves its target through the caller's
     /// narrowing, a hidden one like a dangling link (T-3474, O26).
     fn scalar(&mut self, e: &Expr) -> Result<String, Refused> {
+        self.typed_member(e).map(|(name, _)| name)
+    }
+
+    /// [`Self::scalar`]'s term and the Edm type of its value.
+    fn typed_member(&mut self, e: &Expr) -> Result<(String, &'static str), Refused> {
         let Expr::Member(MemberPath {
             variable: None,
             path,
@@ -474,22 +479,27 @@ impl<'a> Terms<'a> {
         if let [name, annotation] = path.as_slice() {
             if annotation == OBSERVED_AT {
                 let member = self.set.members.get(name).ok_or(Refused::Later)?;
-                return Ok(format!("{}.observedAt", self.term_of(&member.iri)));
+                let term = format!("{}.observedAt", self.term_of(&member.iri));
+                return Ok((term, "Edm.DateTimeOffset"));
             }
         }
         // The base members (`id` outside a top-level conjunct, `scope`,
         // `_types`, the system members) and complex paths (F20, F28, F33)
         // are a later round's.
         let (via, member) = self.leaf(path).ok_or(Refused::Later)?;
-        match &member.shape {
-            // The same test the model's NonFilterableProperties and
-            // NonSortableProperties are written from (C11, C12).
-            s if s.scalar() => {}
+        let edm = match &member.shape {
+            // The shapes `Shape::scalar` names, the test the model's
+            // NonFilterableProperties and NonSortableProperties are written
+            // from (C11, C12).
+            Shape::Value {
+                edm,
+                collection: false,
+            } => *edm,
             Shape::Json => return Err(Refused::Bad),
             _ => return Err(Refused::Later),
-        }
+        };
         let attr = self.term_of(&member.iri);
-        Ok(match via {
+        let term = match via {
             None => attr,
             Some((rel, target)) => {
                 self.linked = true;
@@ -497,32 +507,8 @@ impl<'a> Terms<'a> {
                 let ty = self.term_of(&target.type_iri);
                 format!("{rel}{{{ty}:{attr}}}")
             }
-        })
-    }
-
-    /// URL 5.1.1.1: a literal compared with a member is of its type, an
-    /// integer within its range (T-3725). `null` compares with any member;
-    /// a member whose type is not a primitive value takes any literal.
-    fn typed(&self, member: &Expr, literals: &[Literal]) -> Result<(), Refused> {
-        let edm = match member {
-            Expr::Member(MemberPath {
-                variable: None,
-                path,
-            }) => match path.as_slice() {
-                [_, annotation] if annotation == OBSERVED_AT => "Edm.DateTimeOffset",
-                _ => match self.leaf(path).map(|(_, m)| &m.shape) {
-                    Some(Shape::Value { edm, .. }) => edm,
-                    Some(Shape::Url { .. }) => "Edm.String",
-                    _ => return Ok(()),
-                },
-            },
-            _ => return Ok(()),
         };
-        if literals.iter().all(|l| fits(edm, l)) {
-            Ok(())
-        } else {
-            Err(Refused::Bad)
-        }
+        Ok((term, edm))
     }
 
     /// The term `t{n}` of an IRI, minted on first use.
@@ -537,6 +523,16 @@ impl<'a> Terms<'a> {
             self.context.insert(next.clone(), Value::from(iri));
             next
         })
+    }
+}
+
+/// URL 5.1.1.1: a literal compared with a member of type `edm` is of that
+/// type, an integer within its range (T-3725); `null` compares with any.
+fn typed(edm: &str, literals: &[Literal]) -> Result<(), Refused> {
+    if literals.iter().all(|l| fits(edm, l)) {
+        Ok(())
+    } else {
+        Err(Refused::Bad)
     }
 }
 
