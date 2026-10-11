@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! `ViewOps::offered` and `ViewOps::shown_names` (MCP D-3, D-4): what a
+//! `ViewOps::offered`, `ViewOps::shown_names` and `ViewOps::shown_by_type`
+//! (MCP D-3, D-4, `OData` 3.1): what a
 //! surface may list for a caller is the view's allowlist filtered by one
 //! fail-closed engine probe, and the names it may offer are the view's.
 
@@ -27,7 +28,8 @@ const ASKED: [OperationId; 4] = [
 ];
 
 /// `/x/offers/{view}/offered` answers `ViewOps::offered` for [`ASKED`],
-/// `/x/offers/{view}/names` answers `ViewOps::shown_names`.
+/// `/x/offers/{view}/names` answers `ViewOps::shown_names`,
+/// `/x/offers/{view}/by-type` answers `ViewOps::shown_by_type`.
 struct Offers;
 
 impl Surface for Offers {
@@ -42,7 +44,14 @@ impl Surface for Offers {
     }
     fn router(&self, ops: Ops) -> Router {
         let names = ops.clone();
+        let by_type = ops.clone();
         Router::new()
+            .route(
+                "/{view}/by-type",
+                get(move |Path(id): Path<String>| async move {
+                    axum::Json(json!(by_type.view(&id).map(|v| v.shown_by_type())))
+                }),
+            )
             .route(
                 "/{view}/offered",
                 get(move |Path(id): Path<String>, caller: Caller| async move {
@@ -180,6 +189,22 @@ async fn the_names_offered_are_the_ones_the_view_shows() -> Result<(), String> {
         get_json(&app, "/x/offers/cars/names").await,
         json!([["Car"], ["https://example.org/odd", "speed"]]),
         "a type no rule shows is not offered; names once each, sorted"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_type_shows_the_union_of_its_rules_as_iris() -> Result<(), String> {
+    let (_b, app) = broker(None).await?;
+    let core = "https://uri.etsi.org/ngsi-ld/default-context/";
+    assert_eq!(
+        get_json(&app, "/x/offers/cars/by-type").await,
+        json!({format!("{core}Car"): ["https://example.org/odd", format!("{core}speed")]}),
+        "expanded, each name once; Bike has no rule and is absent"
+    );
+    assert_eq!(
+        get_json(&app, "/x/offers/nosuch/by-type").await,
+        Value::Null
     );
     Ok(())
 }

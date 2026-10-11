@@ -85,7 +85,7 @@ impl Display for ODataVersion {
 ///
 /// ```
 /// use odata_json::{Ctx, MetadataLevel, ODataVersion};
-/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_01 };
+/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_01, metadata_etag: None };
 /// assert!(ctx.service_root.ends_with('/'));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +96,9 @@ pub struct Ctx<'a> {
     pub level: MetadataLevel,
     /// The negotiated version ([`negotiate_version`]).
     pub version: ODataVersion,
+    /// The metadata document's `ETag`, written after the context URL as
+    /// `@odata.metadataEtag` (JSON Format 4.01 section 4.5.2); `None` writes none.
+    pub metadata_etag: Option<&'a str>,
 }
 
 /// What a context URL describes (JSON Format 4.01 section 10).
@@ -158,7 +161,7 @@ impl Display for ContextTarget<'_> {
 ///
 /// ```
 /// use odata_json::{context_url, ContextTarget, Ctx, MetadataLevel, ODataVersion};
-/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_0 };
+/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::Minimal, version: ODataVersion::V4_0, metadata_etag: None };
 /// assert_eq!(
 ///     context_url(&ctx, &ContextTarget::Entity { set: "Buildings", select: None }),
 ///     "https://example.org/odata/$metadata#Buildings/$entity"

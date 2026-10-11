@@ -161,6 +161,7 @@ pub struct OpsRequest {
     path_and_query: String,
     headers: HeaderMap,
     body: Body,
+    context: Option<Arc<serde_json::Value>>,
 }
 
 impl OpsRequest {
@@ -176,6 +177,7 @@ impl OpsRequest {
             path_and_query: path_and_query.into(),
             headers: HeaderMap::new(),
             body: Body::empty(),
+            context: None,
         }
     }
 
@@ -192,6 +194,21 @@ impl OpsRequest {
         if !outer_only(&name) {
             self.headers.append(name, value);
         }
+        self
+    }
+
+    /// The @context the request's names are read under, in place of the
+    /// outer request's `Link` header (a read's `q`, `attrs`, `type`): a
+    /// surface that names Attributes outside the core @context defines its
+    /// own terms, and the outer client cannot redefine them.
+    ///
+    /// ```
+    /// let req = antares_ops::OpsRequest::new(axum::http::Method::GET, "/ngsi-ld/v1/entities?type=Car&q=speed>1")
+    ///     .context(serde_json::json!({"Car": "https://example.org/Car", "speed": "https://example.org/speed"}));
+    /// ```
+    #[must_use]
+    pub fn context(mut self, context: serde_json::Value) -> Self {
+        self.context = Some(Arc::new(context));
         self
     }
 
@@ -296,7 +313,10 @@ impl Ops {
             .body(req.body)
             .map_err(|_| Refusal::Malformed("the operation's target is not a URI"))?;
         *inner.headers_mut() = req.headers;
-        let answer = self.state.call(&caller.0, inner).await;
+        let answer = match req.context {
+            Some(context) => self.state.call_in_context(&caller.0, inner, context).await,
+            None => self.state.call(&caller.0, inner).await,
+        };
         if let Some(surface) = &self.surface {
             // Threat G10: which surface and view ran it; never the subject
             // or an argument (ADR-0020).
@@ -365,6 +385,25 @@ impl ViewOps {
     #[must_use]
     pub fn shown_names(&self) -> (Vec<String>, Vec<String>) {
         self.view.shown_names()
+    }
+
+    /// Each Entity type the view shows with the Attributes it shows of it,
+    /// as expanded IRIs: the union of the view's rules, type by type. A
+    /// surface that builds a model from a schema intersects it with this.
+    #[must_use]
+    pub fn shown_by_type(
+        &self,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for rule in &self.view.narrowing().rules {
+            for ty in &rule.types {
+                out.entry(ty.clone())
+                    .or_default()
+                    .extend(rule.attributes.iter().cloned());
+            }
+        }
+        out
     }
 
     /// For each of `ops`, whether the view allows it and the policy engine
@@ -494,6 +533,22 @@ pub trait Surface: Send + Sync + 'static {
     fn needs_view(&self) -> bool {
         true
     }
+}
+
+/// The name an NGSI-LD answer gives the expanded IRI `iri` when the
+/// request names no `@context`: its compaction under the core context, the
+/// IRI itself when the core context has no term for it. A surface that
+/// reads an answer by IRI maps its keys through this.
+///
+/// ```
+/// assert_eq!(antares_ops::core_name("https://uri.etsi.org/ngsi-ld/location"), "location");
+/// assert_eq!(antares_ops::core_name("https://example.org/speed"), "https://example.org/speed");
+/// ```
+#[must_use]
+pub fn core_name(iri: &str) -> String {
+    static CORE: std::sync::LazyLock<antares_jsonld::Context> =
+        std::sync::LazyLock::new(antares_jsonld::core_context);
+    CORE.compact_iri(iri)
 }
 
 /// `surface` as the broker mounts it.
@@ -805,6 +860,18 @@ pub mod test_kit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_iri_is_named_as_an_answer_without_a_context_names_it() {
+        assert_eq!(
+            core_name("https://uri.etsi.org/ngsi-ld/location"),
+            "location"
+        );
+        assert_eq!(
+            core_name("https://example.org/speed"),
+            "https://example.org/speed"
+        );
+    }
 
     #[test]
     fn a_request_keeps_its_own_headers_and_body_and_drops_the_outer_ones() {

@@ -21,6 +21,7 @@
 //!     url_limits: odata_url::Limits::strict(),
 //!     csdl_limits: odata_csdl::Limits::strict(),
 //!     max_header_len: 1024,
+//!     metadata_etag: None,
 //! };
 //! // `nest_service`, so both `/odata` and the service root URL `/odata/` reach `GET /`.
 //! let app: axum::Router = axum::Router::new().nest_service("/odata", metadata_router(Arc::new(state)));
@@ -31,7 +32,7 @@
 use std::sync::Arc;
 
 use axum::extract::{FromRef, FromRequestParts, State};
-use axum::http::header::{ACCEPT, CONTENT_TYPE};
+use axum::http::header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -51,6 +52,7 @@ use odata_url::{EdmModel, Format, LimitKind, ODataUri, QueryOptions, UrlError, U
 ///     url_limits: odata_url::Limits::strict(),
 ///     csdl_limits: odata_csdl::Limits::strict(),
 ///     max_header_len: 1024,
+///     metadata_etag: None,
 /// };
 /// assert!(state.service_root.ends_with('/'));
 /// ```
@@ -66,6 +68,9 @@ pub struct ODataState {
     pub csdl_limits: odata_csdl::Limits,
     /// Bytes of one `OData-Version`, `OData-MaxVersion` or `Accept` header this service reads.
     pub max_header_len: usize,
+    /// The XML metadata document's `ETag` ([`metadata_etag`]), written as
+    /// `@odata.metadataEtag` in every JSON answer; `None` writes none.
+    pub metadata_etag: Option<String>,
 }
 
 /// A request's URL, parsed against the service's model, and the version its response is
@@ -87,6 +92,7 @@ pub struct ODataState {
 /// #     url_limits: odata_url::Limits::strict(),
 /// #     csdl_limits: odata_csdl::Limits::strict(),
 /// #     max_header_len: 1024,
+/// #     metadata_etag: None,
 /// # };
 /// let app: Router = Router::new().route("/{*rest}", get(handler)).with_state(Arc::new(state));
 /// ```
@@ -294,13 +300,14 @@ pub fn url_error(error: &UrlError, path_len: usize) -> ODataErrorResponse {
 /// #     url_limits: odata_url::Limits::strict(),
 /// #     csdl_limits: odata_csdl::Limits::strict(),
 /// #     max_header_len: 1024,
+/// #     metadata_etag: None,
 /// # };
 /// let app: axum::Router = axum::Router::new().nest_service("/odata", odata_axum::metadata_router(Arc::new(state)));
 /// ```
 pub fn metadata_router(state: Arc<ODataState>) -> Router {
     Router::new()
-        .route("/", get(service_document))
-        .route("/$metadata", get(metadata))
+        .route("/", get(service_document).fallback(written))
+        .route("/$metadata", get(metadata).fallback(written))
         .with_state(state)
 }
 
@@ -328,6 +335,7 @@ async fn service_document(
         service_root: &state.service_root,
         level,
         version,
+        metadata_etag: state.metadata_etag.as_deref(),
     };
     let mut out = Vec::new();
     // A Vec takes every byte: the write cannot fail.
@@ -367,7 +375,92 @@ async fn metadata(
             "application/json"
         }
     };
-    Ok(respond(version, content_type, out))
+    Ok(revalidated(&headers, version, content_type, out))
+}
+
+/// The metadata document with its strong `ETag` and `Cache-Control:
+/// private, no-cache` (T-3441 7.4: the bytes may differ per subject, so no
+/// shared cache keeps them), or `304` when `If-None-Match` names it.
+fn revalidated(
+    headers: &HeaderMap,
+    version: ODataVersion,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> Response {
+    let etag = etag_of(&body);
+    // If-None-Match compares weakly (RFC 9110 13.1.2).
+    let matched = headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|tag| tag == "*" || tag.trim_start_matches("W/") == etag);
+    let mut response = if matched {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        response
+            .headers_mut()
+            .insert("odata-version", HeaderValue::from_static(version.as_str()));
+        response
+    } else {
+        respond(version, content_type, body)
+    };
+    let headers = response.headers_mut();
+    // Hex digits between quotes: always a header value.
+    headers.insert(
+        ETAG,
+        HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("\"\"")),
+    );
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+    response
+}
+
+/// The strong `ETag` of `$metadata`'s default (XML) representation, the
+/// one `@odata.metadataEtag` names (JSON Format 4.01 section 4.5.2); `None`
+/// when the model is past the writer's limits, as `$metadata` then is.
+#[must_use]
+pub fn metadata_etag(model: &odata_csdl::Model, limits: &odata_csdl::Limits) -> Option<String> {
+    let mut out = Vec::new();
+    odata_csdl::write_xml(model, limits, &mut out).ok()?;
+    Some(etag_of(&out))
+}
+
+/// A strong tag of `body`.
+/// ponytail: the std `SipHash` of the bytes, the same on every pod of one
+/// build; SHA-256 if tags must agree across builds.
+fn etag_of(body: &[u8]) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("\"{:016x}\"", hasher.finish())
+}
+
+/// The JSON metadata level a resource is written at (JSON Format 4.01 section 3.1): `$format`
+/// first, then `Accept` by quality. A resource has no XML form, so XML or any other type is
+/// 406, as an `Accept` header this service cannot read is 400.
+///
+/// # Errors
+///
+/// The refusal, in the request's version.
+pub fn json_level(
+    request: &ODataRequest,
+    headers: &HeaderMap,
+    max_header_len: usize,
+) -> Result<MetadataLevel, ODataErrorResponse> {
+    let format = options(&request.uri).and_then(|o| o.format.as_ref());
+    match body(format, headers, max_header_len, false)
+        .map_err(|e| e.with_version(request.version))?
+    {
+        Body::Json(level) => Ok(level),
+        Body::Xml => Err(not_acceptable().with_version(request.version)),
+    }
+}
+
+/// A `200` JSON answer: `body` as written, its content type carrying the metadata level in the
+/// spelling of `version`, and `OData-Version`.
+#[must_use]
+pub fn json_response(version: ODataVersion, level: MetadataLevel, body: Vec<u8>) -> Response {
+    respond(version, json_type(version, level), body)
 }
 
 fn respond(version: ODataVersion, content_type: &'static str, body: Vec<u8>) -> Response {
@@ -388,6 +481,34 @@ fn json_type(version: ODataVersion, level: MetadataLevel) -> &'static str {
         (ODataVersion::V4_01, MetadataLevel::Minimal) => "application/json;metadata=minimal",
         (ODataVersion::V4_01, MetadataLevel::Full) => "application/json;metadata=full",
     }
+}
+
+async fn written(request: ODataRequest) -> Response {
+    read_only(request.version)
+}
+
+/// `405 MethodNotAllowed` with `Allow: GET`: a write method on a resource
+/// that is only read (the service and metadata documents, Protocol 11.1;
+/// `/$count`).
+///
+/// ```
+/// let answer = odata_axum::read_only(odata_json::ODataVersion::V4_01);
+/// assert_eq!(answer.status(), 405);
+/// assert_eq!(answer.headers()["allow"], "GET");
+/// ```
+#[must_use]
+pub fn read_only(version: ODataVersion) -> Response {
+    let mut answer = ODataErrorResponse::new(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "MethodNotAllowed",
+        "this resource is read only",
+    )
+    .with_version(version)
+    .into_response();
+    answer
+        .headers_mut()
+        .insert(axum::http::header::ALLOW, HeaderValue::from_static("GET"));
+    answer
 }
 
 fn not_acceptable() -> ODataErrorResponse {
