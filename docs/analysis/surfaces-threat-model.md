@@ -367,7 +367,7 @@ Tools, not dependencies: `cargo-deny` 0.20.2 (MIT OR Apache-2.0), `cargo-audit` 
 | D15 | `Cache-Control: private, no-cache` on `$metadata` and the LinkML documents (amends T-3441 7.4) | O16, LK2 |
 | D10 | a JSON-RPC batch array is refused with `-32600` | MC6 |
 | D11 | (taken by T-3441 section 9, adopted here) the LinkML surface writes YAML with its own emitter and parses none | 6 |
-| D12 | an oversized LinkML schema closes that surface for the view | LK7 |
+| D12 | an oversized LinkML schema is refused when it is written | LK7 |
 | D13 | internal CSR needs an export grant held by the target tenant, checked at registration and on every forward | C1 |
 | D14 | an export grant is read-only unless it says read-write | C6 |
 
