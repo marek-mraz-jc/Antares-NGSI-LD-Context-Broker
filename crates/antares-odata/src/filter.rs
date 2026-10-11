@@ -217,6 +217,7 @@ impl<'a> Terms<'a> {
             Expr::Compare(l, op, r) => self.compare(l, *op, r),
             Expr::In(l, list) => {
                 let name = self.scalar(l)?;
+                self.typed(l, list)?;
                 let values = list.iter().map(value).collect::<Result<Vec<_>, _>>()?;
                 Ok(format!("{name}=={}", values.join(",")))
             }
@@ -352,6 +353,7 @@ impl<'a> Terms<'a> {
             return Ok(term);
         }
         let name = self.scalar(member)?;
+        self.typed(member, std::slice::from_ref(lit))?;
         Ok(match (op, lit) {
             (CompareOp::Eq, Literal::Null) => format!("!{name}"),
             (CompareOp::Ne, Literal::Null) => name,
@@ -498,6 +500,31 @@ impl<'a> Terms<'a> {
         })
     }
 
+    /// URL 5.1.1.1: a literal compared with a member is of its type, an
+    /// integer within its range (T-3725). `null` compares with any member;
+    /// a member whose type is not a primitive value takes any literal.
+    fn typed(&self, member: &Expr, literals: &[Literal]) -> Result<(), Refused> {
+        let edm = match member {
+            Expr::Member(MemberPath {
+                variable: None,
+                path,
+            }) => match path.as_slice() {
+                [_, annotation] if annotation == OBSERVED_AT => "Edm.DateTimeOffset",
+                _ => match self.leaf(path).map(|(_, m)| &m.shape) {
+                    Some(Shape::Value { edm, .. }) => edm,
+                    Some(Shape::Url { .. }) => "Edm.String",
+                    _ => return Ok(()),
+                },
+            },
+            _ => return Ok(()),
+        };
+        if literals.iter().all(|l| fits(edm, l)) {
+            Ok(())
+        } else {
+            Err(Refused::Bad)
+        }
+    }
+
     /// The term `t{n}` of an IRI, minted on first use.
     fn term_of(&mut self, iri: &str) -> String {
         let found = self
@@ -510,6 +537,46 @@ impl<'a> Terms<'a> {
             self.context.insert(next.clone(), Value::from(iri));
             next
         })
+    }
+}
+
+/// Whether `lit` is a value of `edm` (T-3725): numbers promote among the
+/// numeric types, but an integer literal past an integer type's range does
+/// not (5.1.1.5); a type this surface does not know takes any literal.
+fn fits(edm: &str, lit: &Literal) -> bool {
+    let range = |min: i64, max: i64| match lit {
+        Literal::Int(n) => (min..=max).contains(n),
+        // An integer written past i64 reads as a decimal: no integer type holds it.
+        Literal::Decimal(raw) => !raw
+            .trim_start_matches(['-', '+'])
+            .bytes()
+            .all(|b| b.is_ascii_digit()),
+        _ => false,
+    };
+    let same = matches!(
+        (edm, lit),
+        (_, Literal::Null)
+            | ("Edm.String", Literal::String(_))
+            | ("Edm.Boolean", Literal::Bool(_))
+            | ("Edm.Guid", Literal::Guid(_))
+            | ("Edm.Date", Literal::Date(_))
+            | ("Edm.DateTimeOffset", Literal::DateTimeOffset(_))
+            | ("Edm.TimeOfDay", Literal::TimeOfDay(_))
+            | (
+                "Edm.Single" | "Edm.Double" | "Edm.Decimal",
+                Literal::Int(_) | Literal::Decimal(_)
+            )
+    );
+    match edm {
+        _ if same => true,
+        "Edm.Byte" => range(0, 255),
+        "Edm.SByte" => range(-128, 127),
+        "Edm.Int16" => range(i16::MIN.into(), i16::MAX.into()),
+        "Edm.Int32" => range(i32::MIN.into(), i32::MAX.into()),
+        "Edm.Int64" => range(i64::MIN, i64::MAX),
+        "Edm.String" | "Edm.Boolean" | "Edm.Guid" | "Edm.Date" | "Edm.DateTimeOffset"
+        | "Edm.TimeOfDay" | "Edm.Single" | "Edm.Double" | "Edm.Decimal" => false,
+        _ => true,
     }
 }
 
@@ -718,9 +785,9 @@ mod tests {
         assert_eq!(q(&null(CompareOp::Gt)), Err(Refused::Later));
         let within = Expr::In(
             Box::new(m("speed")),
-            vec![Literal::Int(1), Literal::Bool(true)],
+            vec![Literal::Int(1), Literal::Decimal("2.5".into())],
         );
-        assert_eq!(q(&within), Ok("(t0==1,true)".into()));
+        assert_eq!(q(&within), Ok("(t0==1,2.5)".into()));
         assert_eq!(
             q(&Expr::In(Box::new(m("speed")), vec![Literal::Null])),
             Err(Refused::Later)
@@ -851,7 +918,10 @@ mod tests {
                 lit(Literal::Int(1)),
             ),
             cmp(
-                m("name"),
+                Expr::Member(MemberPath {
+                    variable: None,
+                    path: vec!["speed".into(), OBSERVED_AT.into()],
+                }),
                 CompareOp::Eq,
                 lit(Literal::DateTimeOffset("2026-01-01T00:00:00+01:00".into())),
             ),
@@ -1105,7 +1175,7 @@ mod tests {
             descending,
         };
         let mut t = translate(
-            &cmp(m("name"), CompareOp::Eq, lit(Literal::Int(1))),
+            &cmp(m("name"), CompareOp::Eq, lit(Literal::String("1".into()))),
             &set(),
             &BTreeMap::new(),
             &[],
@@ -1160,5 +1230,65 @@ mod tests {
             translate(&e, &set(), &BTreeMap::new(), &[]),
             Err(Refused::TooComplex)
         );
+    }
+
+    #[test]
+    fn a_literal_of_another_type_than_its_member_is_bad() {
+        // T-3725: URL 5.1.1.1, and 5.1.1.5 for an integer past its range.
+        let int = |n| Literal::Int(n);
+        let dec = |raw: &str| Literal::Decimal(raw.into());
+        let string = || Literal::String("1".into());
+        let guid = || Literal::Guid("01234567-89ab-cdef-0123-456789abcdef".into());
+        for (edm, lit) in [
+            ("Edm.String", string()),
+            ("Edm.Double", int(1)),
+            ("Edm.Double", dec("1.5")),
+            ("Edm.Single", dec("NaN")),
+            ("Edm.Decimal", dec("99999999999999999999")),
+            ("Edm.Int64", int(i64::MAX)),
+            ("Edm.Int64", dec("1.5")),
+            ("Edm.Int16", int(-32768)),
+            ("Edm.Byte", int(255)),
+            ("Edm.SByte", int(-128)),
+            ("Edm.Int32", int(i64::from(i32::MAX))),
+            ("Edm.Guid", guid()),
+            ("Edm.Boolean", Literal::Bool(true)),
+            ("Edm.Date", Literal::Date("2026-01-01".into())),
+            ("Edm.TimeOfDay", Literal::TimeOfDay("09:30:00".into())),
+            (
+                "Edm.DateTimeOffset",
+                Literal::DateTimeOffset("2026-01-01T00:00:00Z".into()),
+            ),
+            ("Edm.String", Literal::Null),
+            ("Edm.Untyped", int(1)),
+        ] {
+            assert!(fits(edm, &lit), "{edm} {lit:?}");
+        }
+        for (edm, lit) in [
+            ("Edm.String", int(1)),
+            ("Edm.String", guid()),
+            ("Edm.Double", string()),
+            ("Edm.Int64", string()),
+            ("Edm.Int64", dec("9223372036854775808")),
+            ("Edm.Int64", dec("-9223372036854775809")),
+            ("Edm.Int16", int(32768)),
+            ("Edm.Byte", int(-1)),
+            ("Edm.SByte", int(128)),
+            ("Edm.Int32", int(i64::from(i32::MAX) + 1)),
+            ("Edm.Guid", string()),
+            ("Edm.Boolean", int(1)),
+            ("Edm.Date", string()),
+            ("Edm.DateTimeOffset", Literal::Date("2026-01-01".into())),
+        ] {
+            assert!(!fits(edm, &lit), "{edm} {lit:?}");
+        }
+        for e in [
+            cmp(m("name"), CompareOp::Gt, lit(int(10))),
+            cmp(lit(string()), CompareOp::Eq, m("speed")),
+            Expr::In(Box::new(m("name")), vec![int(1), int(2)]),
+            Expr::In(Box::new(m("speed")), vec![string()]),
+        ] {
+            assert_eq!(q(&e), Err(Refused::Bad), "{e:?}");
+        }
     }
 }

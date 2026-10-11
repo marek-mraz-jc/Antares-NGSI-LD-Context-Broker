@@ -166,8 +166,13 @@ so a client `Link` header cannot change what a filter means.
   `t0{t2:t1}=="Ann"` under a `join`: the broker resolves the target
   through the view and the engine, a hidden one like a dangling link.
 
-`ne` holds on an absent member, as in OData. A number past 2^53 is `400`
-(NGSI-LD compares `f64`). A filter longer than 4096 bytes as `q` is `400`
+`ne` holds on an absent member, as in OData. A literal compared with a
+member, or listed in `in`, is of the member's type or the filter is `400`
+(URL 5.1.1.1, T-3725): `Name eq 1` and `Price eq 'abc'` are refused, a
+number promotes among the numeric types (`Quantity lt 7.5`), an integer
+past its type's range is refused (`Size eq 9223372036854775808`), and
+`null` compares with any member. A number past 2^53 is `400` (NGSI-LD
+compares `f64`). A filter longer than 4096 bytes as `q` is `400`
 `TooComplexQuery`. Lambda operators, arithmetic, other functions, two
 members compared and paths past one hop are `501`.
 

@@ -406,3 +406,40 @@ async fn entity_dereferences_an_id_of_this_service() {
         assert_eq!(a.status, StatusCode::BAD_REQUEST, "{id}: {}", a.body);
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filter_literal_of_another_type_is_400() {
+    // T-3725: URL 5.1.1.1; an Int64 literal past its range (5.1.1.5).
+    let (_b, app) = shop().await.expect("broker");
+    for path in [
+        "Product?$filter=Name%20eq%201",
+        "Product?$filter=Name%20gt%2010",
+        "Product?$filter=Name%20in%20(1,2)",
+        "Product?$filter=ID%20eq%20'x'",
+        "Bin?$filter=number%20eq%20'abc'",
+        "Bin?$filter=number%20in%20('a','b')",
+        "Bin?$filter=number%20eq%209223372036854775808",
+    ] {
+        let a = odata(&app, Method::GET, path, None).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{path}: {}", a.body);
+        assert_eq!(a.body["error"]["code"], "BadRequest", "{path}");
+    }
+    for (path, rows) in [
+        // Within the exact range of a JSON number (F26).
+        ("Bin?$filter=number%20eq%209007199254740991", 0),
+        ("Bin?$filter=number%20lt%208", 1),
+        // URL 5.1.1.1: an Int64 member promotes to a decimal literal.
+        ("Bin?$filter=number%20lt%207.5", 1),
+        ("Product?$filter=Name%20eq%20'Drill'", 1),
+        ("Product?$filter=ID%20eq%20null", 1),
+    ] {
+        let a = odata(&app, Method::GET, path, None).await;
+        assert_eq!(a.status, StatusCode::OK, "{path}: {}", a.body);
+        assert_eq!(
+            a.body["value"].as_array().map(Vec::len),
+            Some(rows),
+            "{path}: {}",
+            a.body
+        );
+    }
+}
