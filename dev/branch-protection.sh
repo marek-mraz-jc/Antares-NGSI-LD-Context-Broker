@@ -122,7 +122,9 @@ ruleset dev-pull-requests refs/heads/dev "$admins" "[
            "Workspace tests / Each feature alone (antares-broker)" \
            "Workspace tests / Each feature alone (antares-notifier)" \
            "Workspace tests / Each feature alone (antares-sql)" \
-           "ETSI cell matrix / Matrix summary") ]"
+           "ETSI cell matrix / Matrix summary" \
+           "mcp-conformance" \
+           "mcp-suites") ]"
 
 # 4. Actions and outside contributors. A workflow gets a read-only token
 #    unless it asks for more, no workflow approves a pull request, and a

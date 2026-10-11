@@ -32,7 +32,7 @@ mod tools;
 
 use antares_ops::{Caller, Ops, Refusal, Surface};
 use axum::extract::{Path, Request};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
 use axum::Router;
@@ -156,14 +156,21 @@ async fn serve(ops: &Ops, id: &str, caller: Caller, req: Request) -> Response {
             "the request body is too large",
         );
     };
-    // MC6: rmcp answers an array with a bare 415; JSON-RPC batching left MCP
-    // in 2025-06-18, so it is an invalid request, refused whole.
-    if bytes.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'[') {
-        return rpc_refusal(
-            StatusCode::BAD_REQUEST,
-            -32600,
-            "a JSON-RPC batch is not served",
-        );
+    // rmcp answers a body it cannot read with a bare 415; JSON-RPC 2.0
+    // section 5.1 wants an error frame. MC6: batching left MCP in 2025-06-18,
+    // so an array is an invalid request, refused whole.
+    if parts.method == Method::POST {
+        let refusal = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Err(_) => Some((-32700, "the body is not JSON")),
+            Ok(v) if v.is_array() => Some((-32600, "a JSON-RPC batch is not served")),
+            Ok(v) if v.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") => {
+                Some((-32600, "not a JSON-RPC 2.0 message"))
+            }
+            Ok(_) => None,
+        };
+        if let Some((code, message)) = refusal {
+            return rpc_refusal(StatusCode::BAD_REQUEST, code, message);
+        }
     }
     let req = Request::from_parts(parts, axum::body::Body::from(bytes));
     let server = server::Server::new(view, caller, id);
