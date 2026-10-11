@@ -78,7 +78,7 @@ root.
 |---|---|
 | `{Set}` | Query Entities (`type`), `count=true` |
 | `{Set}('{id}')`, `{Set}(id='{id}')`, the identifier's `{Set}(v)` | Retrieve Entity |
-| `$entity?$id={url}` | the `{Set}(key)` the percent-decoded URL names, absolute under the service root or relative to it; any other id is `400` |
+| `$entity?$id={url}` | the `{Set}(key)` the percent-decoded URL names, absolute under the service root or relative to it; any other well-formed id, foreign or naming nothing, is `404` like a hidden Entity, and a missing id, a broken escape or an id with its own query options is `400` (T-3738) |
 | `{Set}/$count` | Query Entities, `limit=0&count=true`, `text/plain` |
 | `{Set}('{id}')/{prop}`, `.../{prop}/$value` | Retrieve Attribute Value (the view's `operations` name `retrieve_attribute_value`); `$value` is `text/plain` |
 | `{Set}('{id}')/{nav}` | Retrieve Entity of the source, then Retrieve Entity of a single target or Query Entities `id=…` of up to 1000 |
