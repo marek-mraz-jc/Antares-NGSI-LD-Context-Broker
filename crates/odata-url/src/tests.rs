@@ -1105,8 +1105,17 @@ fn the_rest_of_the_grammar() {
         options("Buildings?$format=jsonx/y").format,
         Some(Format::MediaType("jsonx/y".into()))
     );
+    // T-3742: Go's url.QueryEscape writes the separator as %2F.
+    assert_eq!(
+        options("Buildings?$format=application%2Fjson%3Bodata.metadata%3Dnone").format,
+        Some(Format::MediaType(
+            "application%2Fjson%3Bodata.metadata%3Dnone".into()
+        ))
+    );
     syntax("Buildings?$format=/x", 18);
     syntax("Buildings?$format=abc", 21);
+    syntax("Buildings?$format=%2Fx", 22);
+    syntax("Buildings?$format=a%2F", 22);
     assert_eq!(filter("height\tgt 1"), filter("height gt 1"));
     syntax("Buildings?%zz", 10);
     syntax("Buildings?ab#", 12);
