@@ -1693,6 +1693,103 @@ mod attr_name_and_via_paths {
         );
     }
 
+    /// Antares serves the form it forwards (T-3701): Append and Update
+    /// Entity Attributes (5.6.2, 5.6.3) go out as `…/attrs/`, the form the
+    /// ETSI mock sources expect, and the router itself answers that path,
+    /// not only the binary's layer. So a registration whose endpoint is
+    /// another Antares, or this one through the router in process or in the
+    /// browser build, lands. The peer is a second broker (its own alias, or
+    /// the Via chain reads the forward as a loop) served by the bare router
+    /// over HTTP; the Entity lives in its tenant `t3701` only.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forward_between_two_antares_tenants_lands() {
+        if std::env::var_os("ANTARES_TEST_SANITIZER").is_some() {
+            return;
+        }
+        const ENTITY: &str = "urn:ngsi-ld:Vehicle:attrs-slash";
+        let st = state();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = AppState::new("antares-peer".into());
+        let served = crate::router(peer.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, served).await;
+        });
+        let call = |method: &str, uri: String, tenant: Option<&str>, body: Option<String>| {
+            let mut req = Request::builder().method(method).uri(uri);
+            if let Some(t) = tenant {
+                req = req.header("NGSILD-Tenant", t);
+            }
+            if let Some(b) = &body {
+                req = req
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", b.len());
+            }
+            req.body(body.map_or_else(Body::empty, Body::from))
+                .expect("request")
+        };
+        let entity = serde_json::json!({"id": ENTITY, "type": "Vehicle",
+                                        "speed": {"type": "Property", "value": 1}});
+        let req = call(
+            "POST",
+            "/ngsi-ld/v1/entities".into(),
+            Some("t3701"),
+            Some(entity.to_string()),
+        );
+        assert_eq!(send(&peer, req).await.status(), StatusCode::CREATED);
+        let reg = serde_json::json!({
+            "id": "urn:ngsi-ld:ContextSourceRegistration:attrs-slash",
+            "type": "ContextSourceRegistration", "mode": "redirect", "tenant": "t3701",
+            "operations": ["updateEntity", "updateAttrs", "replaceAttrs", "deleteAttrs", "appendAttrs"],
+            "information": [{"entities": [{"type": "Vehicle", "id": ENTITY}]}],
+            "endpoint": format!("http://127.0.0.1:{port}"),
+        });
+        assert_eq!(
+            post(&st, "/ngsi-ld/v1/csourceRegistrations", reg.to_string()).await,
+            StatusCode::CREATED
+        );
+        let attrs = format!("/ngsi-ld/v1/entities/{ENTITY}/attrs");
+        let update = r#"{"speed":{"type":"Property","value":2}}"#.to_owned();
+        let append = r#"{"colour":{"type":"Property","value":"red"}}"#.to_owned();
+        for (method, body) in [("PATCH", update), ("POST", append)] {
+            let resp = send(&st, call(method, attrs.clone(), None, Some(body))).await;
+            let status = resp.status();
+            let bytes = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .expect("body")
+                .to_bytes();
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "{method} forwarded: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        let req = call(
+            "GET",
+            format!("/ngsi-ld/v1/entities/{ENTITY}?options=keyValues"),
+            Some("t3701"),
+            None,
+        );
+        let resp = send(&peer, req).await;
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("body")
+            .to_bytes();
+        let got: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            (&got["speed"], &got["colour"]),
+            (&serde_json::json!(2), &serde_json::json!("red")),
+            "{got}"
+        );
+        // and the router answers the slash form itself, whoever sends it
+        let direct = r#"{"speed":{"type":"Property","value":3}}"#.to_owned();
+        let req = call("PATCH", format!("{attrs}/"), Some("t3701"), Some(direct));
+        assert_eq!(send(&peer, req).await.status(), StatusCode::NO_CONTENT);
+    }
+
     /// 4.6.2: a name starts with a letter, so no valid Attribute name is a
     /// relative-path dot segment (RFC 3986 clause 5.2.4). Such a name reaching
     /// a forwarded request URL re-targets the registration endpoint —
