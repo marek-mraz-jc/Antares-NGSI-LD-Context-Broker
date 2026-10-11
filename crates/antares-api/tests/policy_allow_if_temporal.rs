@@ -342,3 +342,33 @@ async fn a_conditioned_temporal_write_is_not_forwarded() {
     assert_eq!(out["detail"], CONDITION_NOT_FORWARDED);
     assert_eq!(evolution_of(&st, IN_A).await, before);
 }
+
+/// A temporal write by id has no write guard (ADR-0023 rule 7), so under a
+/// view it stays refused, conditioned or not.
+#[cfg(feature = "views")]
+#[test]
+fn a_temporal_write_by_id_is_refused_under_a_view() {
+    use antares_api::policy::Rule;
+    use antares_api::views::{with_view, CompiledView};
+    let cars = CompiledView::new(
+        &["Car".into()],
+        None,
+        None,
+        None,
+        vec![Rule {
+            types: vec!["Car".into()],
+            attributes: vec!["speed".into()],
+            ..Rule::default()
+        }],
+    )
+    .expect("a view");
+    for clause in ["5.6.12", "5.6.13", "5.6.14", "5.6.15"] {
+        assert!(WRITE_BY_ID.contains(&clause), "{clause}");
+        for engine in [Filter::default(), zone_a()] {
+            assert!(
+                with_view(Some(&cars), clause, Ok(Arc::new(engine))).is_err(),
+                "{clause}"
+            );
+        }
+    }
+}

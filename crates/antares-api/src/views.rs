@@ -150,12 +150,10 @@ pub fn with_view(
         // so the view has nothing of its own to narrow there.
         return engine;
     }
-    // A temporal write by id has no write guard: it falls through and is
-    // refused under a view as a narrowed write is.
     if crate::policy::WRITE_BY_ID.contains(&clause) && CHECKED_WRITES.contains(&clause) {
-        // Rule 7 as below, and the engine's answer is the condition its
-        // write holds the stored Entity to (`gate`), which the handler
-        // checks beside the view's own.
+        // Rule 7 as below, the engine's answer the condition its write
+        // holds the stored Entity to (`gate`), checked beside the view's;
+        // a temporal one has no write guard and is refused as below.
         return engine;
     }
     if CHECKED_WRITES.contains(&clause) || SUBSCRIPTIONS.contains(&clause) {
@@ -939,22 +937,6 @@ mod tests {
             with_view(Some(&view), "5.13.4", Ok(Arc::new(Filter::default()))).is_err(),
             "serving a stored @context is refused under a view"
         );
-    }
-
-    /// T-3668: a temporal write by id has no write guard, so under a view
-    /// it is refused, condition or not.
-    #[test]
-    fn a_temporal_write_by_id_is_refused_under_a_view() {
-        let view = cars();
-        let red = Filter {
-            q: Some(Box::new(antares_ql::parse_q("colour==\"red\"").expect("q"))),
-            ..Filter::default()
-        };
-        for clause in ["5.6.12", "5.6.13", "5.6.14", "5.6.15"] {
-            assert!(crate::policy::WRITE_BY_ID.contains(&clause), "{clause}");
-            assert!(with_view(Some(&view), clause, Ok(Arc::new(Filter::default()))).is_err());
-            assert!(with_view(Some(&view), clause, Ok(Arc::new(red.clone()))).is_err());
-        }
     }
 
     /// T-3673: Query Subscriptions keeps the engine's selection among the
