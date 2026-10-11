@@ -35,6 +35,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
 
+mod preview;
+pub use preview::MAX_PREVIEW_LIMIT;
 pub mod rule_documents;
 
 /// How often, in milliseconds, every pod rebuilds its table from the store
@@ -555,7 +557,8 @@ impl Reload {
     }
 }
 
-/// `/q/views`: the table (GET), and one view's document (GET, PUT, DELETE);
+/// `/q/views`: the table (GET), one view's document (GET, PUT, DELETE), and
+/// what a draft would serve (`POST /q/views/{id}/preview`);
 /// `/q/schemas/{tenant}`: one Tenant's `LinkML` schema (GET, PUT, DELETE);
 /// and `/q/policy` beside them.
 fn admin(r: &Weak<Reloader>) -> Router {
@@ -593,6 +596,7 @@ fn admin(r: &Weak<Reloader>) -> Router {
                 })
                 .delete(move |Path(id): Path<String>| serve(del.clone(), |r| delete_one(r, id))),
         )
+        .merge(preview::routes(r))
         .merge(rule_documents::routes(r))
 }
 
@@ -632,6 +636,17 @@ async fn delete_one(r: Arc<Reloader>, id: String) -> Result<Response, String> {
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// The document of view `id` and the view it loads, or the first reason it
+/// cannot be served.
+fn candidate(id: &str, body: &[u8]) -> Result<(Value, Loaded), String> {
+    let doc = serde_json::from_slice::<Value>(body).map_err(|e| format!("not a view: {e}"))?;
+    let view: View = serde_json::from_value(doc.clone()).map_err(|e| format!("not a view: {e}"))?;
+    if view.id != id {
+        return Err("the document's id names another view than the path".into());
+    }
+    view.load().map(|l| (doc, l))
+}
+
 /// Validate, store, and answer once this pod's table holds the write.
 async fn put_one(r: Arc<Reloader>, id: String, body: Bytes) -> Result<Response, String> {
     if body.len() > MAX_VIEW_BYTES {
@@ -641,18 +656,8 @@ async fn put_one(r: Arc<Reloader>, id: String, body: Bytes) -> Result<Response, 
             &format!("a view document is at most {MAX_VIEW_BYTES} bytes"),
         ));
     }
-    let checked = serde_json::from_slice::<Value>(&body)
-        .map_err(|e| format!("not a view: {e}"))
-        .and_then(|doc| {
-            let view: View =
-                serde_json::from_value(doc.clone()).map_err(|e| format!("not a view: {e}"))?;
-            if view.id != id {
-                return Err("the document's id names another view than the path".into());
-            }
-            view.load().map(|_| doc)
-        });
-    let doc = match checked {
-        Ok(doc) => doc,
+    let doc = match candidate(&id, &body) {
+        Ok((doc, _)) => doc,
         Err(why) => return Ok(problem(StatusCode::BAD_REQUEST, "BadRequestData", &why)),
     };
     let replaced = r.state.put_view_doc(&id, doc).await?;
