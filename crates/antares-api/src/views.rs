@@ -952,8 +952,8 @@ mod tests {
         };
         for clause in ["5.6.12", "5.6.13", "5.6.14", "5.6.15"] {
             assert!(crate::policy::WRITE_BY_ID.contains(&clause), "{clause}");
-            assert!(with_view(Some(&view), clause, Ok(Filter::default())).is_err());
-            assert!(with_view(Some(&view), clause, Ok(red.clone())).is_err());
+            assert!(with_view(Some(&view), clause, Ok(Arc::new(Filter::default()))).is_err());
+            assert!(with_view(Some(&view), clause, Ok(Arc::new(red.clone()))).is_err());
         }
     }
 
