@@ -73,6 +73,8 @@ root.
 | `{Set}('{id}')/{prop}`, `.../{prop}/$value` | Retrieve Attribute Value (the view's `operations` name `retrieve_attribute_value`); `$value` is `text/plain` |
 | `{Set}('{id}')/{nav}` | Retrieve Entity of the source, then Retrieve Entity of a single target or Query Entities `id=…` of up to 1000 |
 | `{Set}('{id}')/{nav}/$ref` | the Relationship's objects as entity references |
+| `{Set}/$ref` | Query Entities as for `{Set}`, with `$filter`, `$orderby`, `$top`, `$skip` and `$count`; each Entity as its reference `{Set}(key)`; `$select` or `$expand` is `400` |
+| `{Set}('{id}')/$ref` | Retrieve Entity; the Entity's reference, `404` when hidden or absent; `$select` or `$expand` is `400` |
 | `POST {Set}/$query` | the same `GET`: the body's options (`text/plain` or a form) joined to the URL's |
 | `$filter` | `q` and `id` (section 4) |
 | `$orderby` | `orderBy` on `id` and single-valued values, `;desc` |
