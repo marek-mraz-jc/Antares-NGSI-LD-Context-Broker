@@ -8,6 +8,8 @@
 
 mod common;
 mod views_errors;
+mod views_mapped;
+mod views_mapped_props;
 mod views_maps;
 mod views_q;
 mod views_read;

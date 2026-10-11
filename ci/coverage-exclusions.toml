@@ -171,3 +171,19 @@ function = "Drop::drop" # the one Drop in server.rs, Closing's
 lines = 1
 branches = 1
 reason = "a listen stream dropped outside any tokio runtime: rmcp polls and drops the listen future inside the runtime that serves it, so only a process ending reaches this side, and expiresAt removes the subscriptions then"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/mapping.rs"
+function = "antares_ops::mapping::sources"
+lines = 1
+branches = 0
+reason = "the inner @context failing to merge: it maps generated terms to IRIs that compile already expanded and checked, which merge_object accepts; the arm keeps a refusal instead of an unwrap"
+
+[[exclusion]]
+crate = "antares-views"
+file = "src/mapped.rs"
+function = "antares_views::mapped::serve"
+lines = 1
+branches = 0
+reason = "an answer over MAX_ANSWER_BYTES (64 MiB): a test would have to store and page more than that through the test kit's in-memory store"
