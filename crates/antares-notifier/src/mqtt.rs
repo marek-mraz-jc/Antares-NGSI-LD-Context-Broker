@@ -21,7 +21,9 @@ fn bad(m: String) -> NgsiError {
 use crate::redact_userinfo as redacted;
 
 /// Parsed `mqtt[s]://[user][:pass]@host[:port]/topic[/subtopic]*` (7.2).
-#[derive(Debug, Clone, PartialEq)]
+/// Debug prints the password as `[redacted]`: it is the subscriber's
+/// credential (T-3876).
+#[derive(Clone, PartialEq)]
 pub struct MqttEndpoint {
     pub secure: bool,
     pub username: Option<String>,
@@ -29,6 +31,19 @@ pub struct MqttEndpoint {
     pub host: String,
     pub port: u16,
     pub topic: String,
+}
+
+impl std::fmt::Debug for MqttEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MqttEndpoint")
+            .field("secure", &self.secure)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[redacted]"))
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("topic", &self.topic)
+            .finish()
+    }
 }
 
 impl MqttEndpoint {
@@ -513,6 +528,22 @@ impl crate::NotificationSink for MqttSink {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn debug_never_prints_the_password() {
+        let e = MqttEndpoint::parse("mqtt://u:s3cret@host:9001/t").expect("user+pass");
+        let shown = format!("{e:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(
+            shown.contains("[redacted]") && shown.contains("\"u\"") && shown.contains("host"),
+            "{shown}"
+        );
+        let none = format!(
+            "{:?}",
+            MqttEndpoint::parse("mqtt://u@host/t").expect("user")
+        );
+        assert!(none.contains("password: None"), "{none}");
+    }
 
     #[test]
     fn parses_endpoint_variants() {
