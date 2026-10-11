@@ -978,6 +978,10 @@ pub mod test_kit {
     use super::{mount, AppState, Surface};
     use std::sync::Arc;
 
+    /// The `/q` credential [`TestBroker::with_admin_auth`] takes, for the
+    /// surface crates, which reach the API crate through this one alone.
+    pub use antares_api::admin_auth::AdminAuth;
+
     /// One broker: the NGSI-LD API, the admin surface and the surfaces a
     /// test mounts, over one in-memory store.
     pub struct TestBroker {
