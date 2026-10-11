@@ -642,6 +642,7 @@ mod tests {
         Set {
             type_iri: "https://e.org/Car".into(),
             identifier: None,
+            references: BTreeMap::new(),
             writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 (

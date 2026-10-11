@@ -240,7 +240,7 @@ pub struct ModelBuilder { /* ... */ }
 impl ModelBuilder { pub fn new(version: CsdlVersion) -> Self; pub fn schema(&mut self, s: Schema) -> &mut Self;
     pub fn build(self) -> Result<Model, Vec<ValidationError>>; }
 
-pub fn validate(model: &Model) -> Result<(), Vec<ValidationError>>;   // names, keys, references, partners, bindings
+pub fn validate(model: &Model) -> Result<(), Vec<ValidationError>>;   // names, keys, references, partners, referential constraints (T-3761), bindings
 pub fn write_xml<W: std::io::Write>(model: &Model, w: W) -> std::io::Result<()>;
 pub fn write_json<W: std::io::Write>(model: &Model, w: W) -> std::io::Result<()>;   // V4_01 only
 pub fn metadata_etag(model: &Model) -> String;   // stable hash of the XML form, for odata.metadataEtag
