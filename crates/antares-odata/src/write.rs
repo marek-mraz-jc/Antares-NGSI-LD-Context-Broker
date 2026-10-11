@@ -369,7 +369,9 @@ pub(crate) fn attribute(member: &Member, value: &Value) -> Option<Value> {
 
 /// Each bind as a Relationship, after its target is read under the view
 /// (W2): a target the view or the engine hides, an absent one and one of
-/// another type are the same `404`, and nothing is written.
+/// another type are the same `400` naming the navigation, because the bind
+/// is the request body's (Protocol 11.4.2.1, T-3760), and nothing is
+/// written.
 async fn bind(
     reads: &Reads,
     caller: &Caller,
@@ -384,13 +386,31 @@ async fn bind(
             .members
             .get(&bind.navigation)
             .ok_or(not_found(version))?;
-        let urn = visible(reads, caller, &bind.target, version).await?;
+        let urn = visible(reads, caller, &bind.target, version)
+            .await
+            .map_err(|e| unbound(e, &bind.navigation, version))?;
         doc.insert(
             member.iri.clone(),
             json!({"type": "Relationship", "object": urn}),
         );
     }
     Ok(())
+}
+
+/// A bind target that is not there, as the body error it is; any other
+/// refusal stays as the operation answered it.
+fn unbound(e: ODataErrorResponse, navigation: &str, version: ODataVersion) -> ODataErrorResponse {
+    if e.status != StatusCode::NOT_FOUND {
+        return e;
+    }
+    let mut bad = ODataErrorResponse::new(
+        StatusCode::BAD_REQUEST,
+        "BadRequest",
+        "the bound Entity does not exist",
+    )
+    .with_version(version);
+    bad.error.target = Some(navigation.to_owned());
+    bad
 }
 
 /// The id of a bound Entity, after Retrieve Entity of the target's set
