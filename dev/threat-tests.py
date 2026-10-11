@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Every STRIDE row of docs/analysis/surfaces-threat-model.md names a test that exists
-(surfaces-test-plan.md section 8, T-3492).
+"""Every STRIDE row of the surfaces threat model names a test that exists
+(surfaces-test-plan.md section 8, T-3492). The model is docs/analysis/surfaces-threat-model.md
+plus one file per surface under docs/analysis/threat-model/ (T-3766), each keeping its
+`## <section>.` heading, so a row's section is the same wherever it lives.
 
 A row's test column names its tests in backticks, one item per `;`:
 
@@ -37,6 +39,7 @@ import sys
 import tempfile
 
 MODEL = "docs/analysis/surfaces-threat-model.md"
+SURFACES = "docs/analysis/threat-model"
 SECTION_CRATE = {
     2: "antares-ops",
     3: "antares-views",
@@ -105,6 +108,13 @@ def rows(markdown):
             yield section, cells[0], cells[-1]
 
 
+def model_text(root):
+    """The index, then every surface file in name order."""
+    parts = [(root / MODEL).read_text()]
+    parts += [f.read_text() for f in sorted((root / SURFACES).glob("*.md"))]
+    return "\n".join(parts)
+
+
 def crate_of_path(path):
     match = re.match(r"crates/([^/]+)/", path)
     return match.group(1) if match else None
@@ -164,7 +174,7 @@ def judge(root, section, item, name):
 def check(root):
     """(problems, checked, pending, rows) over the threat model under `root`."""
     problems, checked, pending, count = [], 0, 0, 0
-    for section, row, cell in rows((root / MODEL).read_text()):
+    for section, row, cell in rows(model_text(root)):
         count += 1
         named = [(item, name) for item in top_level_items(cell) for name in names_of(item)]
         if not named:
@@ -213,6 +223,13 @@ def self_test():
 
 ## 3. Views
 
+In threat-model/views.md.
+"""
+    views = """\
+# Threat model: Views
+
+## 3. Views
+
 | id | S/T/R/I/D/E | threat | mitigation | test |
 |---|---|---|---|---|
 | V1 | I | proposed, crate exists, written | m | `views_present` (proposed, ADR-0023) |
@@ -228,6 +245,8 @@ def self_test():
         root = pathlib.Path(tmp)
         (root / "docs/analysis").mkdir(parents=True)
         (root / MODEL).write_text(model)
+        (root / SURFACES).mkdir()
+        (root / SURFACES / "views.md").write_text(views)
         for crate, files in {
             "antares-broker": {"tests/seam.rs": "fn a_test_that_exists() {}", "src/lib.rs": ""},
             "antares-views": {"tests/views.rs": "#[test]\nfn views_present() {}"},
@@ -261,10 +280,15 @@ def self_test():
 def main(argv):
     if argv == ["--self-test"]:
         return self_test()
-    if argv:
-        print("usage: dev/threat-tests.py [--self-test]", file=sys.stderr)
-        return 2
     root = pathlib.Path(__file__).resolve().parent.parent
+    if argv == ["--ids"]:
+        # one line per row, to compare the model before and after a move
+        for section, row, cell in rows(model_text(root)):
+            print(section, row, cell)
+        return 0
+    if argv:
+        print("usage: dev/threat-tests.py [--self-test | --ids]", file=sys.stderr)
+        return 2
     problems, checked, pending, count = check(root)
     print(
         f"threat-tests: {count} STRIDE rows, {checked} named tests checked, "
