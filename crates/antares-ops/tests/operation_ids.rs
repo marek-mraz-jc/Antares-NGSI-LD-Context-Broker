@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! `OperationId` is the matrix: the same row ids in the same order, each with
-//! the binding the row writes (ADR-0027 section 1, T-3495).
+//! the binding and the gate clause the row writes (ADR-0027 section 1,
+//! T-3495, T-3513).
 
 use antares_ops::OperationId;
 
-/// `(id, binding)` of every row under `operations:` in the matrix, read
-/// line by line: a row starts at `- id:` and its first `binding:` is the
-/// NGSI-LD one, the first surface every row lists.
-fn matrix_rows(text: &str) -> Vec<(String, String)> {
-    let mut rows: Vec<(String, String)> = Vec::new();
+/// `(id, binding, gate clause)` of every row under `operations:` in the
+/// matrix, read line by line: a row starts at `- id:`, its first `binding:`
+/// is the NGSI-LD one, the first surface every row lists, and its
+/// `gate_clause:` is `null` for a broker-initiated row.
+fn matrix_rows(text: &str) -> Vec<(String, String, Option<String>)> {
+    let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
     let mut in_operations = false;
     for line in text.lines() {
         if !line.starts_with(' ') && !line.starts_with('-') {
@@ -19,7 +21,11 @@ fn matrix_rows(text: &str) -> Vec<(String, String)> {
             continue;
         }
         if let Some(id) = line.strip_prefix("- id: ") {
-            rows.push((id.trim().to_owned(), String::new()));
+            rows.push((id.trim().to_owned(), String::new(), None));
+        } else if let Some(clause) = line.strip_prefix("  gate_clause: ") {
+            if let Some(last) = rows.last_mut() {
+                last.2 = Some(clause.trim().to_owned()).filter(|c| c != "null");
+            }
         } else if let Some(binding) = line.trim_start().strip_prefix("binding: ") {
             if let Some(last) = rows.last_mut().filter(|r| r.1.is_empty()) {
                 binding.trim().trim_matches('\'').clone_into(&mut last.1);
@@ -42,9 +48,15 @@ fn operation_ids_match_the_matrix() {
         "the matrix has {} operation rows",
         rows.len()
     );
-    let ours: Vec<(String, String)> = OperationId::ALL
+    let ours: Vec<(String, String, Option<String>)> = OperationId::ALL
         .iter()
-        .map(|op| (op.id().to_owned(), op.binding().to_owned()))
+        .map(|op| {
+            (
+                op.id().to_owned(),
+                op.binding().to_owned(),
+                op.gate_clause().map(str::to_owned),
+            )
+        })
         .collect();
     assert_eq!(ours, rows);
 }

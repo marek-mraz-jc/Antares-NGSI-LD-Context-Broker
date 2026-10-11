@@ -40,16 +40,26 @@ DRAIN_S = 30
 # --- judges: pure, so --selftest can plant a failure in each -------------
 
 def judge_rss(series, warm_at):
-    """series: [(t_seconds, rss_bytes)]. The growth after warm-up is the
-    largest sample from `warm_at` on against the sample at `warm_at`."""
-    after = [r for t, r in series if t >= warm_at]
+    """series: [(t_seconds, rss_bytes[, allocated, resident])]. The growth
+    after warm-up is the largest sample from `warm_at` on against the sample
+    at `warm_at`. The verdict names jemalloc's allocated and resident growth
+    over the same window when the series has them, so a red run says where
+    the memory is: live Rust allocations (allocated), held by jemalloc
+    (resident), or outside jemalloc (neither, T-3614)."""
+    after = [row for row in series if row[0] >= warm_at]
     if len(after) < 2:
         return False, "fewer than two RSS samples after warm-up"
-    base, peak = after[0], max(after)
+    rss = [row[1] for row in after]
+    base, peak = rss[0], max(rss)
     allowed = max(base * 0.25, 16 * MIB)
     ok = peak - base <= allowed
-    return ok, (f"RssAnon {base / MIB:.1f} MiB at warm-up, peak {peak / MIB:.1f} MiB, "
-                f"growth {(peak - base) / MIB:.1f} MiB of {allowed / MIB:.1f} allowed")
+    msg = (f"RssAnon {base / MIB:.1f} MiB at warm-up, peak {peak / MIB:.1f} MiB, "
+           f"growth {(peak - base) / MIB:.1f} MiB of {allowed / MIB:.1f} allowed")
+    for col, name in ((2, "allocated"), (3, "resident")):
+        seen = [row[col] for row in after if len(row) > col and row[col] is not None]
+        if len(seen) >= 2:
+            msg += f"; jemalloc {name} growth {(max(seen) - seen[0]) / MIB:+.1f} MiB"
+    return ok, msg
 
 
 def judge_count(due, received):
@@ -226,6 +236,18 @@ def rss_anon(pid):
     return None
 
 
+def heap(url):
+    """jemalloc's allocated and resident bytes from /q/health (T-3614): what
+    the program holds live against what the allocator keeps mapped, so a
+    step in RssAnon reads as a live allocation or as allocator retention."""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/q/health", timeout=10) as r:
+            mem = json.loads(r.read()).get("memory") or {}
+    except (OSError, ValueError):
+        return None, None
+    return mem.get("allocatedBytes"), mem.get("residentBytes")
+
+
 def soak(args):
     receiver = Receiver()
     broker = Broker(args.url)
@@ -245,7 +267,7 @@ def soak(args):
             if r is None:
                 failures.append(f"broker pid {args.pid} is gone")
                 break
-            series.append((time.monotonic() - start, r))
+            series.append((time.monotonic() - start, r) + heap(args.url))
         time.sleep(min(10.0, max(0.0, end - time.monotonic())))
     stop.set()
     for w in workers:
@@ -277,8 +299,9 @@ def soak(args):
             f.write(text)
     if args.series and series:
         with open(args.series, "w") as f:
-            f.write("seconds,rss_anon_bytes\n")
-            f.writelines(f"{t:.0f},{r}\n" for t, r in series)
+            f.write("seconds,rss_anon_bytes,allocated_bytes,resident_bytes\n")
+            f.writelines(f"{t:.0f},{r},{a if a is not None else ''},{m if m is not None else ''}\n"
+                         for t, r, a, m in series)
     return 0 if ok else 1
 
 
@@ -291,6 +314,12 @@ def selftest():
     warm = [(t, (50 if t < 60 else 100) * MIB) for t in range(0, 600, 10)]
     assert judge_rss(warm, 60)[0]
     assert not judge_rss([(0, MIB)], 0)[0]
+    # heap columns ride along; the verdict reads RssAnon alone
+    assert judge_rss([(0, MIB, 1, 2), (10, MIB, None, None)], 0)[0]
+    # a red verdict says whether the step is in jemalloc's heap or outside it
+    step = [(0, 30 * MIB, 4 * MIB, 13 * MIB), (10, 48 * MIB, 4 * MIB, 13 * MIB)]
+    ok, msg = judge_rss(step, 0)
+    assert not ok and "allocated growth +0.0 MiB" in msg and "resident growth +0.0 MiB" in msg, msg
     assert judge_count({"s": 10}, {"s": 10})[0]
     assert not judge_count({"s": 10}, {"s": 9})[0]
     assert not judge_count({"s": 1, "t": 1}, {"s": 2})[0]

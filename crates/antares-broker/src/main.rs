@@ -26,6 +26,21 @@ const KNOWN_KEYS: &[&str] = &[
     // other key it has no code for.
     #[cfg(feature = "plugin-example")]
     antares_plugin_example::RULES_ENV,
+    // How often every pod reloads the view table from the store (ADR-0023
+    // rule 10); only a build with views has one.
+    #[cfg(feature = "views")]
+    antares_ops::views::RELOAD_ENV,
+    // The bound on a Tenant's LinkML schema (T-3628); unset, no schema is
+    // taken.
+    #[cfg(feature = "views")]
+    antares_ops::views::SCHEMA_MAX_ENV,
+    // The MCP surface's hosts, origins and result budget (MC8, D-10).
+    #[cfg(feature = "mcp")]
+    antares_mcp::ALLOWED_HOSTS_ENV,
+    #[cfg(feature = "mcp")]
+    antares_mcp::ALLOWED_ORIGINS_ENV,
+    #[cfg(feature = "mcp")]
+    antares_mcp::MAX_RESULT_BYTES_ENV,
     "ANTARES_DATABASE_URL",
     "ANTARES_STORE",
     // Temporal driver: a store mode, or `none` — history off (temporal
@@ -65,6 +80,10 @@ const KNOWN_KEYS: &[&str] = &[
     // The HTTP surfaces mounted beside the NGSI-LD API root, comma-separated;
     // default `admin` (/q). An unknown name is fatal and names the shelf.
     "ANTARES_API_SURFACES",
+    // The /q admin credential (T-3569): a file holding the bearer secret,
+    // and whether /q/metrics answers without it (token | open).
+    "ANTARES_ADMIN_TOKEN_FILE",
+    "ANTARES_ADMIN_METRICS",
     // Drain: the LB notice window, and the ceiling on waiting for
     // in-flight requests once the listener has closed.
     "ANTARES_DRAIN_DELAY_MS",
@@ -454,6 +473,10 @@ type SurfaceCtor = fn() -> Box<dyn antares_api::ApiSurface>;
 /// surface would drop out here.
 const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("admin", || Box::new(antares_api::Admin)),
+    #[cfg(feature = "views")]
+    ("views", || antares_ops::mount(antares_views::Views)),
+    #[cfg(feature = "mcp")]
+    ("mcp", || antares_ops::mount(antares_mcp::Mcp)),
     #[cfg(feature = "plugin-example")]
     ("example", || {
         Box::new(antares_plugin_example::ExampleSurface)
@@ -873,6 +896,28 @@ async fn run(
     // rather than boxing a future that always answers allow.
     if policy_name != antares_api::policy::BUILT_IN_NAME {
         state = state.with_policy(build_policy());
+    }
+    // Endpoint views (ADR-0023 rule 10): the stored views loaded into the
+    // table every surface that serves through views opens on, `/q/views`
+    // and `/q/policy` on the admin surface, and the reload that keeps every
+    // pod's table within one interval of the store. After the engine: the
+    // reload hands it its rule documents (ADR-0020 amendment).
+    #[cfg(feature = "views")]
+    antares_ops::views::install(&state).await?;
+    // The /q admin credential, before the router mounts the admin surface.
+    // Unconfigured, /q serves as before and says so once, here.
+    match antares_api::admin_auth::AdminAuth::from_config(
+        std::env::var("ANTARES_ADMIN_TOKEN_FILE").ok().as_deref(),
+        std::env::var("ANTARES_ADMIN_METRICS").ok().as_deref(),
+    )? {
+        Some(auth) => {
+            tracing::info!("/q admin routes require the admin token ({auth:?})");
+            state = state.with_admin_auth(auth);
+        }
+        None => tracing::warn!(
+            "/q admin routes (tenants, dead letters, metrics) answer without a credential: \
+             ANTARES_ADMIN_TOKEN_FILE is unset"
+        ),
     }
     // A notification binding compiled in from outside the workspace mounts
     // exactly like the two shipped ones: one registration, no core-crate
@@ -1640,6 +1685,24 @@ mod api_surface_tests {
         );
     }
 
+    /// The view root is on the shelf of a `views` build, under `/x/views`.
+    #[cfg(feature = "views")]
+    #[test]
+    fn a_views_build_shelves_the_view_root() {
+        assert_eq!(names(Some("admin,views")), vec!["admin", "views"]);
+        let root = api_surfaces(Some("views")).expect("selection")[0].1();
+        assert_eq!(root.prefix(), "/x/views");
+    }
+
+    /// The MCP surface shares the view root (ADR-0027 section 1).
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn an_mcp_build_shelves_the_mcp_surface_on_the_view_root() {
+        assert_eq!(names(Some("views,mcp")), vec!["views", "mcp"]);
+        let mcp = api_surfaces(Some("mcp")).expect("selection")[0].1();
+        assert_eq!(mcp.prefix(), "/x/views");
+    }
+
     /// An empty selection is fatal too: readiness, health and metrics are
     /// the admin surface, so a pod without one can never report itself up.
     #[test]
@@ -1654,7 +1717,7 @@ mod api_surface_tests {
     /// surface feature the shelf is the admin surface alone, and a path of
     /// every surface prefix (ADR-0023 to ADR-0027) is unrouted. A surface
     /// that lands without its feature gate turns this red.
-    #[cfg(not(any(feature = "plugin-example")))]
+    #[cfg(not(any(feature = "plugin-example", feature = "views")))]
     #[tokio::test]
     async fn the_vanilla_shelf_is_admin_alone() {
         use tower::ServiceExt;

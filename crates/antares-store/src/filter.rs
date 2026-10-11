@@ -44,6 +44,10 @@ pub struct EntityFilter<'a> {
     pub geo: &'a [GeoSpec<'a>],
     /// term → IRI, the request context's expander (the AST holds terms)
     pub expand: &'a (dyn Fn(&str) -> String + Sync),
+    /// The request @context, for a store that evaluates `q` on documents
+    /// with the API's own evaluator (`antares_ql::eval::eval_q`). None = such
+    /// a store leaves `q` to the caller.
+    pub ctx: Option<&'a antares_jsonld::Context>,
     /// Pagination pushdown: applied ONLY when every present predicate
     /// compiled exactly (`decided`) — otherwise the caller's evaluator still
     /// has rows to drop and a SQL LIMIT would page over the wrong set. The
@@ -70,6 +74,7 @@ impl Default for EntityFilter<'_> {
             scope_q: None,
             geo: &[],
             expand: &|t: &str| t.to_owned(),
+            ctx: None,
             page: None,
             keep_attrs: None,
             drop_attrs: None,

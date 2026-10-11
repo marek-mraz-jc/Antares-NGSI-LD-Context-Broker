@@ -14,6 +14,8 @@ use antares_api::policy::{
     Decision, DecisionFuture, NotifyDecision, Operation, PolicyEngine, StoredImage, Subject,
 };
 use antares_api::AppState;
+use antares_sql::store::any::AnyStore;
+use antares_sql::store::Store;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
@@ -342,6 +344,129 @@ async fn allow_all_answers_unchanged() {
             &st,
             "DELETE",
             &format!("/ngsi-ld/v1/entities/{SECRET}"),
+            None
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+}
+
+/// The temporal writes by id (5.6.12 to 5.6.16) need the temporal store,
+/// so their state is wired with the memory drivers.
+async fn temporal_state() -> (AppState, Log) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let store = Arc::new(AnyStore::Mem(Store::default()));
+    let mut st = AppState::with_drivers("me".into(), store.clone(), store, "memory")
+        .with_policy(Arc::new(Recording(Arc::clone(&seen))));
+    antares_api::wire(&mut st).await;
+    (st, seen)
+}
+
+/// A Vehicle with a current state and a history, and a Secret held only as
+/// a temporal evolution: no current state to read its type from.
+async fn seed_temporal(st: &AppState) {
+    seed(st).await;
+    let at = |v: i64, t: &str| json!({"type": "Property", "value": v, "observedAt": t});
+    for doc in [
+        json!({"id": VEHICLE, "type": "Vehicle", "scope": "/hel/a",
+               "speed": [at(1, "2026-01-01T00:00:00Z"), at(2, "2026-01-02T00:00:00Z")],
+               "colour": {"type": "Property", "value": "red", "observedAt": "2026-01-01T00:00:00Z"}}),
+        json!({"id": "urn:ngsi-ld:Secret:t", "type": "Secret",
+               "code": [at(7, "2026-01-01T00:00:00Z")]}),
+    ] {
+        let code = send(st, "POST", "/ngsi-ld/v1/temporal/entities", Some(doc)).await;
+        assert!(code.is_success(), "temporal seed: {code}");
+    }
+}
+
+/// The instanceId of the first `attr` instance the temporal store holds.
+async fn first_instance(st: &AppState, id: &str, attr: &str) -> String {
+    let res = antares_api::router(st.clone())
+        .oneshot(
+            Request::get(format!("/ngsi-ld/v1/temporal/entities/{id}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let doc: Value = serde_json::from_slice(&bytes).expect("json");
+    doc[attr][0]["instanceId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no instanceId on {attr}: {doc}"))
+        .to_owned()
+}
+
+/// Every temporal write by id shows the engine what the Entity is, as the
+/// entity writes do (T-3607): a type-keyed rule cannot be stepped around
+/// through the temporal API.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_temporal_write_by_id_shows_the_engine_the_stored_entity() {
+    let base = format!("/ngsi-ld/v1/temporal/entities/{VEHICLE}");
+    for clause in ["5.6.12", "5.6.13", "5.6.14", "5.6.15", "5.6.16"] {
+        let (st, seen) = temporal_state().await;
+        seed_temporal(&st).await;
+        let instance = first_instance(&st, VEHICLE, "speed").await;
+        let (method, uri, body) = match clause {
+            "5.6.12" => (
+                "POST",
+                format!("{base}/attrs"),
+                Some(json!({"speed": [{"type": "Property", "value": 3,
+                                       "observedAt": "2026-01-03T00:00:00Z"}]})),
+            ),
+            "5.6.13" => ("DELETE", format!("{base}/attrs/colour"), None),
+            "5.6.14" => (
+                "PATCH",
+                format!("{base}/attrs/speed/{instance}"),
+                Some(json!({"speed": {"type": "Property", "value": 5,
+                                      "observedAt": "2026-01-01T00:00:00Z"}})),
+            ),
+            "5.6.15" => ("DELETE", format!("{base}/attrs/speed/{instance}"), None),
+            _ => ("DELETE", base.clone(), None),
+        };
+        let code = send(&st, method, &uri, body).await;
+        assert!(code.is_success(), "{clause} {method} {uri}: {code}");
+        let image = image_for(&seen, clause).unwrap_or_else(|| panic!("{clause}: no image"));
+        assert_eq!(image.types, vec![format!("{DC}Vehicle")], "{clause}");
+        assert_eq!(image.scope, vec!["/hel/a".to_owned()], "{clause}");
+    }
+}
+
+/// An engine that refuses by the stored type refuses a temporal append to a
+/// Secret held only as history; an Entity it allows is still written.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_engine_refusing_on_the_stored_type_refuses_the_temporal_write() {
+    let (st, _) = temporal_state().await;
+    seed_temporal(&st).await;
+    let fragment = json!({"code": [{"type": "Property", "value": 0,
+                                    "observedAt": "2026-01-05T00:00:00Z"}]});
+    assert_eq!(
+        send(
+            &st,
+            "POST",
+            "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Secret:t/attrs",
+            Some(fragment),
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(
+            &st,
+            "DELETE",
+            "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Secret:t",
+            None
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(
+            &st,
+            "DELETE",
+            &format!("/ngsi-ld/v1/temporal/entities/{VEHICLE}"),
             None
         )
         .await,

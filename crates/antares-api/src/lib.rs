@@ -51,6 +51,7 @@ macro_rules! gate {
     };
 }
 
+pub mod admin_auth;
 pub(crate) mod attrs;
 pub(crate) mod batch;
 pub mod bounds;
@@ -90,6 +91,7 @@ pub use antares_notifier::DeliveryPolicy;
 // The sink contract, so a surface reaches it through this crate and names no
 // antares-notifier (ADR-0027 section 1, rule M2).
 pub use antares_notifier::{DeliveryError, DeliveryFuture, NotificationSink, Outbound};
+pub use federation::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 pub use state::{AppState, TemporalRecord};
 
 /// Spawn for both targets — tokio natively, the JS microtask queue on
@@ -212,8 +214,10 @@ pub fn ops_router(state: AppState) -> Router {
 }
 
 /// The broker's own operational surface: health, readiness, metrics, the
-/// tenant list and purge, and the dead-letter admin. Gateway-protected like
-/// every `/q` route — the broker adds no authentication of its own.
+/// tenant list and purge, and the dead-letter admin. Health and readiness
+/// are always open; the rest sits behind the admin credential when the
+/// state carries one (`admin_auth.rs`, T-3569), `/q/metrics` unless the
+/// deployment left it open for a scraper.
 pub struct Admin;
 
 impl Admin {
@@ -242,20 +246,37 @@ impl ApiSurface for Admin {
         "/q"
     }
 
-    fn router(&self, _st: AppState) -> Router<AppState> {
+    fn router(&self, st: AppState) -> Router<AppState> {
         let [health_p, ready_p, metrics_p, tenants_p, tenant_p, dl_p, dl_id_p, replay_p] =
             Self::PATHS;
-        Router::new()
-            .route(health_p, get(health))
-            .route(ready_p, get(ready))
-            // Prometheus text format. 404 until the broker installs the
-            // renderer — the api crate never depends on an exporter.
-            .route(metrics_p, get(metrics_endpoint))
+        let guard = axum::middleware::from_fn_with_state(st.clone(), admin_auth::require);
+        // Prometheus text format. 404 until the broker installs the
+        // renderer — the api crate never depends on an exporter.
+        let metrics = Router::new().route(metrics_p, get(metrics_endpoint));
+        let metrics = if st.admin_auth.as_ref().is_some_and(|a| !a.metrics_open) {
+            metrics.route_layer(guard.clone())
+        } else {
+            metrics
+        };
+        let routes = Router::new()
             .route(tenants_p, get(tenants_list))
             .route(tenant_p, get(tenant_get).delete(tenant_purge))
             .route(dl_p, get(dead_letters_list))
             .route(dl_id_p, delete(dead_letter_delete))
-            .route(replay_p, post(dead_letter_replay))
+            .route(replay_p, post(dead_letter_replay));
+        // `/q/views` (ADR-0023 rule 10), when a loader set it: views are
+        // written here, so they sit behind the admin credential with the
+        // rest of /q.
+        #[cfg(feature = "views")]
+        let routes = match st.views.admin() {
+            Some(views) => routes.merge(views.with_state(())),
+            None => routes,
+        };
+        routes
+            .route_layer(guard)
+            .route(health_p, get(health))
+            .route(ready_p, get(ready))
+            .merge(metrics)
     }
 
     fn version_info(&self) -> serde_json::Value {
@@ -507,14 +528,28 @@ pub fn router(state: AppState) -> Router {
 
     // Every registered surface, each under its own reserved prefix — the
     // admin one by default. `with_surface` already refused a prefix outside
-    // /q and /x and any overlap, so the merge here cannot shadow a route.
+    // /q and /x and any overlap, so the merge here cannot shadow a route;
+    // the view surfaces share the view root (ADR-0027 section 1), where
+    // axum's merge refuses two equal routes.
     // The caps are the broker's, not the API nest's: these routes carry the
     // bounds wall and the body limit for the same reason the peer-facing
     // notification endpoint above does — /q deletes Tenants and replays dead
     // letters, and a deployment's own /x routes are no less a way in.
     let mut surfaces = Router::new();
+    let mut view_root: Option<Router<AppState>> = None;
     for s in state.surfaces.iter() {
-        surfaces = surfaces.nest(s.prefix(), s.router(state.clone()));
+        let routes = s.router(state.clone());
+        if s.prefix() == surface::VIEW_ROOT {
+            view_root = Some(match view_root {
+                Some(shared) => shared.merge(routes),
+                None => routes,
+            });
+        } else {
+            surfaces = surfaces.nest(s.prefix(), routes);
+        }
+    }
+    if let Some(shared) = view_root {
+        surfaces = surfaces.nest(surface::VIEW_ROOT, shared);
     }
     let surfaces = surfaces
         .layer(axum::extract::DefaultBodyLimit::max(
@@ -930,6 +965,15 @@ async fn health(
     body["notificationSchemes"] = state.sinks.schemes().into();
     // Notifications the delivery policy gave up on (this process, since start).
     body["deadLetters"] = notify::dead_letters_written().into();
+    // Each stored view, loaded or invalid with the reason (ADR-0023 rule 10).
+    #[cfg(feature = "views")]
+    {
+        body["views"] = state.views.report();
+        // The engine's rule documents by tenant and revision, loaded or
+        // refused (ADR-0020 amendment); never the documents themselves.
+        body["policy"]["documents"] = state.views.policy_report();
+        body["schemas"] = state.views.schema_report();
+    }
     // Changes the bounded matcher queue dropped (this process, since start).
     body["changesDropped"] = notify::changes_dropped().into();
     // Panics absorbed at the notification-task boundary, each one a change

@@ -852,56 +852,200 @@ async fn note_forward(st: &AppState, tenant: &TenantId, reg: &FedReg, ok: bool) 
     }
 }
 
+/// One forward's answer: the status, the body (`Null` when there is none
+/// or it does not parse), and the `NGSILD-Warning` values the source sent.
+pub type ForwardAnswer = (u16, Value, Vec<String>);
+
+/// The answer a [`ForwardTransport`] is working on.
+pub type ForwardFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ForwardAnswer> + Send + 'a>>;
+
+/// A transport that serves some forwards without a socket (ADR-0025 rule 8,
+/// as amended by ADR-0027 section 9). Every distributed operation reaches
+/// it through `federation::forward`, after the request is built and before the
+/// egress check; vanilla registers none
+/// ([`AppState::with_forward_transport`]).
+pub trait ForwardTransport: Send + Sync {
+    /// `Some(answer)` when this transport serves `req`; `None` sends it over
+    /// HTTP as before. The 5.2.34 cooldown and timeout, the bookkeeping of
+    /// Table 5.2.9-2 and the cap on the source's warnings apply to the
+    /// answer as they do over HTTP; the egress guard and the breaker do
+    /// not, since no socket is opened.
+    fn forward<'a>(&'a self, req: BuiltForward<'a>) -> Option<ForwardFuture<'a>>;
+}
+
+/// The request `federation::forward` built, as the HTTP client would send it: a
+/// transport reads it and cannot change what is sent, only how.
+#[derive(Clone)]
+pub struct BuiltForward<'a> {
+    method: reqwest::Method,
+    url: String,
+    query: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+    tenant: &'a TenantId,
+    reg: &'a FedReg,
+    subject: HeaderMap,
+}
+
+impl BuiltForward<'_> {
+    /// The method.
+    #[must_use]
+    pub fn method(&self) -> &reqwest::Method {
+        &self.method
+    }
+
+    /// The URL on the registration's endpoint, without the query.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The URL with the query encoded as the HTTP client encodes it, or
+    /// `None` when the URL does not parse (the HTTP client refuses it too).
+    #[must_use]
+    pub fn target(&self) -> Option<String> {
+        let mut url = reqwest::Url::parse(&self.url).ok()?;
+        if !self.query.is_empty() {
+            url.query_pairs_mut().extend_pairs(&self.query);
+        }
+        Some(url.into())
+    }
+
+    /// The query parameters, in order.
+    #[must_use]
+    pub fn query(&self) -> &[(String, String)] {
+        &self.query
+    }
+
+    /// The headers, in the order they are sent: `Accept`, `Via`, `Link`,
+    /// `NGSILD-Tenant`, the 4.3.6.5 `contextSourceInfo` ones, `Content-Type`.
+    #[must_use]
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    /// The payload, serialized.
+    #[must_use]
+    pub fn body(&self) -> Option<&[u8]> {
+        self.body.as_deref()
+    }
+
+    /// The forwarding Tenant: the one the triggering request ran in.
+    #[must_use]
+    pub fn tenant(&self) -> &TenantId {
+        self.tenant
+    }
+
+    /// The registration this forward is made for.
+    #[must_use]
+    pub fn registration_id(&self) -> &str {
+        &self.reg.reg_id
+    }
+
+    /// The registration's 5.2.9 `tenant`: the Tenant the forward targets,
+    /// `None` for the default Tenant (4.14).
+    #[must_use]
+    pub fn registration_tenant(&self) -> Option<&str> {
+        self.reg.tenant.as_deref()
+    }
+
+    /// The policy subject headers of the triggering request (ADR-0020):
+    /// never on the wire, for a transport that asks the target's engine
+    /// about the caller in process (ADR-0025 rule 4).
+    #[must_use]
+    pub fn subject(&self) -> &HeaderMap {
+        &self.subject
+    }
+}
+
+/// 5.2.34 cooldown (per REGISTRATION, distinct from the host:port breaker):
+/// inside the declared window "a timeout error response for the
+/// registration is automatically returned" — the source is not contacted.
+fn in_cooldown(st: &AppState, tenant: &TenantId, reg: &FedReg) -> bool {
+    reg.cooldown_ms.is_some_and(|cd| {
+        st.egress
+            .reg_in_cooldown(&crate::egress::reg_key(tenant.as_str(), &reg.reg_id), cd)
+    })
+}
+
+/// 5.2.34 timeout: the per-registration budget, below the 8 s ceiling.
+fn deadline_ms(reg: &FedReg) -> u32 {
+    let ceiling = 8_000 * crate::state::slow_factor();
+    reg.timeout_ms.map_or(ceiling, |t| t.min(ceiling)) as u32
+}
+
+/// `fut`, or `None` once `ms` have passed.
+#[cfg(not(target_arch = "wasm32"))]
+async fn within<T>(ms: u32, fut: impl std::future::Future<Output = T>) -> Option<T> {
+    tokio::time::timeout(std::time::Duration::from_millis(u64::from(ms)), fut)
+        .await
+        .ok()
+}
+
+/// The browser timer is not Send, so the wait is one Send unit, as an
+/// HTTP interaction is.
+#[cfg(target_arch = "wasm32")]
+async fn within<T>(ms: u32, fut: impl std::future::Future<Output = T>) -> Option<T> {
+    antares_jsonld::http_interaction(antares_jsonld::io_deadline(fut, ms)).await
+}
+
 /// One forwarded request. `body` is compacted JSON (no @context member).
+/// The registered [`ForwardTransport`] is asked first; without one, or
+/// when it does not serve this forward, it goes over HTTP.
 #[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
 pub async fn forward(
     st: &AppState,
     method: reqwest::Method,
-    mut url: String,
+    url: String,
     query: &[(String, String)],
     headers: &HeaderMap,
     tenant: &TenantId,
     reg: &FedReg,
     ctx_url: &str,
-    mut body: Option<Value>,
-) -> (u16, Value, Vec<String>) {
-    // 6.3.17: NGSILD-Warning values received from the peer are returned to
-    // the caller — abnormal behaviour detected downstream in a cascade
-    // (4.3.6.4) must surface on the aggregated response, not vanish here.
+    body: Option<Value>,
+) -> ForwardAnswer {
     // Process-wide slot first (bounds::MAX_FED_INFLIGHT): the buffers and
     // connections below exist only while a slot is held.
     let _slot = crate::bounds::FED_INFLIGHT.acquire().await;
-    // One policy for every outbound class — scheme allowlist,
-    // private-range deny, per-destination circuit breaker.
-    if let Err(e) = st.egress.check_url(&url).await {
-        // 5.2.9 allows any URI as the registered endpoint, and a URI's
-        // authority may carry credentials reqwest sends as basic auth, so a
-        // peer URL loses its userinfo on the way into the log.
-        tracing::warn!(
-            "federation forward to {} refused: {e}",
-            antares_notifier::redact_userinfo(&url)
-        );
-        return (502, Value::Null, Vec::new());
+    let built = build_forward(st, method, url, query, headers, tenant, reg, ctx_url, body).await;
+    if let Some(answer) = ask_transport(st, &built).await {
+        return answer;
     }
-    if st.egress.is_open(tenant.as_str(), &url) {
-        tracing::debug!(
-            "federation forward to {} short-circuited (breaker open)",
-            antares_notifier::redact_userinfo(&url)
-        );
-        return (503, Value::Null, Vec::new());
+    send_http(st, built).await
+}
+
+/// The forward through the registered transport, or `None` when there is
+/// none or it does not serve this one (ADR-0025 rules 2 and 8).
+async fn ask_transport(st: &AppState, built: &BuiltForward<'_>) -> Option<ForwardAnswer> {
+    let answer = st.forward_transport.get()?.forward(built.clone())?;
+    let (tenant, reg) = (built.tenant, built.reg);
+    if in_cooldown(st, tenant, reg) {
+        return Some((504, Value::Null, Vec::new()));
     }
-    // 5.2.34 cooldown (per REGISTRATION, distinct from the host:port
-    // breaker): inside the declared window "a timeout error response for
-    // the registration is automatically returned" — the source is not
-    // contacted.
-    if let Some(cd) = reg.cooldown_ms {
-        if st
-            .egress
-            .reg_in_cooldown(&crate::egress::reg_key(tenant.as_str(), &reg.reg_id), cd)
-        {
-            return (504, Value::Null, Vec::new());
-        }
-    }
+    let Some((status, body, mut warnings)) = within(deadline_ms(reg), answer).await else {
+        note_forward(st, tenant, reg, false).await;
+        return Some((504, Value::Null, Vec::new()));
+    };
+    warnings.truncate(crate::bounds::MAX_PEER_WARNINGS);
+    note_forward(st, tenant, reg, (200..300).contains(&status)).await;
+    Some((status, body, warnings))
+}
+
+/// The request one forward sends: the 4.3.6.6 processing, the headers and
+/// the payload, exactly as the HTTP client puts them on the wire.
+#[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
+async fn build_forward<'a>(
+    st: &AppState,
+    method: reqwest::Method,
+    mut url: String,
+    query: &[(String, String)],
+    headers: &HeaderMap,
+    tenant: &'a TenantId,
+    reg: &'a FedReg,
+    ctx_url: &str,
+    mut body: Option<Value>,
+) -> BuiltForward<'a> {
     // 4.3.6.6: the four contextSourceInfo keys with processing
     // semantics. Values were validated at registration time (5.9.2).
     let csi_get = |key: &str| {
@@ -1085,22 +1229,18 @@ pub async fn forward(
     } else {
         None
     };
-    let mut req = st
-        .fed_http
-        .request(method, &url)
-        .header("Accept", accept)
-        .header(
-            "Via",
+    let mut sent: Vec<(String, String)> = vec![
+        ("Accept".into(), accept.to_owned()),
+        (
+            "Via".into(),
             outbound_via(headers, &alias_for(&st.host_alias, tenant)),
-        );
+        ),
+    ];
     if inline_ctx.is_none() {
-        req = req.header(
-            "Link",
+        sent.push((
+            "Link".into(),
             format!("<{link_ctx}>; rel=\"http://www.w3.org/ns/json-ld#context\"; type=\"application/ld+json\""),
-        );
-    }
-    if !query.is_empty() {
-        req = req.query(&query);
+        ));
     }
     // 4.14: "the Tenant information from the Context Source Registration has
     // to be used. If no Tenant information is present in the Context Source
@@ -1108,7 +1248,7 @@ pub async fn forward(
     // Tenant is targeted" — the requesting tenant never flows through; 6.3.14
     // omits the header for the default Tenant.
     if let Some(peer_tenant) = reg.tenant.as_deref().filter(|t| *t != "default") {
-        req = req.header("NGSILD-Tenant", peer_tenant);
+        sent.push(("NGSILD-Tenant".into(), peer_tenant.to_owned()));
     }
     // 4.3.6.5 contextSourceInfo ⇒ extra headers; the special value
     // "urn:ngsi-ld:request" copies the header from the triggering request
@@ -1141,8 +1281,9 @@ pub async fn forward(
         } else {
             v.clone()
         };
-        req = req.header(k.as_str(), val);
+        sent.push((k.clone(), val));
     }
+    let mut bytes = None;
     if let Some(mut b) = body {
         // 4.3.6.6 "contentType": provide request + @context as the MIME type
         // requires — ld+json carries the context inline. When "jsonldContext"
@@ -1156,16 +1297,86 @@ pub async fn forward(
             if let Some(o) = b.as_object_mut() {
                 o.insert("@context".into(), ic.clone());
             }
-            req = req.header("Content-Type", "application/ld+json");
+            sent.push(("Content-Type".into(), "application/ld+json".into()));
         } else if want_ld {
             if let Some(o) = b.as_object_mut() {
                 o.insert("@context".into(), Value::String(link_ctx.clone()));
             }
-            req = req.header("Content-Type", "application/ld+json");
+            sent.push(("Content-Type".into(), "application/ld+json".into()));
         } else {
-            req = req.header("Content-Type", "application/json");
+            sent.push(("Content-Type".into(), "application/json".into()));
         }
-        req = req.body(serde_json::to_vec(&b).unwrap_or_default());
+        bytes = Some(serde_json::to_vec(&b).unwrap_or_default());
+    }
+    let mut subject = HeaderMap::new();
+    for name in crate::policy::SUBJECT_HEADERS.iter() {
+        let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        for v in headers.get_all(&name) {
+            subject.append(name.clone(), v.clone());
+        }
+    }
+    BuiltForward {
+        method,
+        url,
+        query,
+        headers: sent,
+        body: bytes,
+        tenant,
+        reg,
+        subject,
+    }
+}
+
+/// One forward over HTTP: the egress policy, the breaker and the cooldown
+/// first, then the request `built` describes.
+async fn send_http(st: &AppState, built: BuiltForward<'_>) -> ForwardAnswer {
+    let BuiltForward {
+        method,
+        url,
+        query,
+        headers: sent,
+        body,
+        tenant,
+        reg,
+        ..
+    } = built;
+    // 6.3.17: NGSILD-Warning values received from the peer are returned to
+    // the caller — abnormal behaviour detected downstream in a cascade
+    // (4.3.6.4) must surface on the aggregated response, not vanish here.
+    // One policy for every outbound class — scheme allowlist,
+    // private-range deny, per-destination circuit breaker.
+    if let Err(e) = st.egress.check_url(&url).await {
+        // 5.2.9 allows any URI as the registered endpoint, and a URI's
+        // authority may carry credentials reqwest sends as basic auth, so a
+        // peer URL loses its userinfo on the way into the log.
+        tracing::warn!(
+            "federation forward to {} refused: {e}",
+            antares_notifier::redact_userinfo(&url)
+        );
+        return (502, Value::Null, Vec::new());
+    }
+    if st.egress.is_open(tenant.as_str(), &url) {
+        tracing::debug!(
+            "federation forward to {} short-circuited (breaker open)",
+            antares_notifier::redact_userinfo(&url)
+        );
+        return (503, Value::Null, Vec::new());
+    }
+    // 5.2.34 cooldown: the source is not contacted.
+    if in_cooldown(st, tenant, reg) {
+        return (504, Value::Null, Vec::new());
+    }
+    let mut req = st.fed_http.request(method, &url);
+    for (k, v) in &sent {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    if !query.is_empty() {
+        req = req.query(&query);
+    }
+    if let Some(b) = body {
+        req = req.body(b);
     }
     // The whole HTTP interaction is one Send unit (http_interaction) so
     // the handler futures above stay Send on wasm32 too.
@@ -1176,8 +1387,7 @@ pub async fn forward(
         // 5.2.34 timeout bounds the forward below the 8 s ceiling.
         // Natively io_deadline is a passthrough (the client owns the 8 s
         // default), so the per-registration budget rides on the request.
-        let ceiling = 8_000 * crate::state::slow_factor();
-        let deadline: u32 = reg.timeout_ms.map_or(ceiling, |t| t.min(ceiling)) as u32;
+        let deadline = deadline_ms(reg);
         #[cfg(not(target_arch = "wasm32"))]
         let req = req.timeout(std::time::Duration::from_millis(deadline as u64));
         let sent = antares_jsonld::io_deadline(req.send(), deadline).await;
@@ -2490,6 +2700,12 @@ pub async fn write_regs(
     headers: &HeaderMap,
 ) -> Result<Vec<FedReg>, NgsiError> {
     if !active(params) {
+        return Ok(Vec::new());
+    }
+    // ADR-0023 rule 7 is checked on the local store: a write through an
+    // endpoint view is local, and no Context Source receives it.
+    #[cfg(feature = "views")]
+    if st.view.is_some() {
         return Ok(Vec::new());
     }
     Ok(matching_regs(st, tenant, spec, ctx, headers)

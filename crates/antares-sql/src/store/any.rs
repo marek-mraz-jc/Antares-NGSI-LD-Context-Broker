@@ -83,6 +83,7 @@ fn doc_kind(kind: Kind) -> Result<DocKind, NgsiError> {
         Kind::EntityMap => Ok(DocKind::EntityMap),
         Kind::DistSub => Ok(DocKind::DistSub),
         Kind::DeadLetter => Ok(DocKind::DeadLetter),
+        Kind::View => Ok(DocKind::View),
         // Entities and Temporal Representations have their own tables and
         // never reach the document store. Every caller routes them to their
         // own match arm first; one that does not has mismatched its arms,
@@ -1134,6 +1135,7 @@ impl AnyStore {
                         "entity_map_docs",
                         "dist_subs",
                         "dead_letters",
+                        "views",
                         // ADR-0021: `tenant_id` is GENERATED from the row's kind
                         // and owner, so a Cached row's is NULL and this DELETE
                         // takes only what the Tenant stored itself.

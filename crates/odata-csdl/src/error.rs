@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! What validation and the writers answer instead of a document.
 
 use std::fmt;
@@ -136,7 +137,7 @@ impl fmt::Display for ValidationError {
     }
 }
 
-/// The CSDL rules [`crate::validate`] checks.
+/// The CSDL rules [`validate`](fn@crate::validate) checks.
 ///
 /// ```
 /// assert_eq!(odata_csdl::Problem::MissingKey.as_str(), "entity type without a key");

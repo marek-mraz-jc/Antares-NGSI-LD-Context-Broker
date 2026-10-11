@@ -15,6 +15,12 @@ members = [
     "crates/antares-ops",
     "crates/linkml-model",
     "crates/odata-csdl",
+    "crates/odata-url",
+    "crates/odata-json",
+    "crates/odata-batch",
+    "crates/odata-axum",
+    "crates/antares-views",
+    "crates/antares-mcp",
     # The reference plugin: built and tested with the workspace so the
     # driver, routing and notification seams cannot drift from it.
     "examples/plugin-example",
@@ -41,6 +47,9 @@ antares-api = { path = "crates/antares-api", default-features = false }
 antares-matcher = { path = "crates/antares-matcher" }
 antares-notifier = { path = "crates/antares-notifier", default-features = false }
 antares-plugin-example = { path = "examples/plugin-example" }
+antares-ops = { path = "crates/antares-ops" }
+antares-views = { path = "crates/antares-views" }
+antares-mcp = { path = "crates/antares-mcp" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 # The storage driver seams are object-safe AND asynchronous, which no
@@ -148,6 +157,9 @@ debug = "line-tables-only"
 # .dep-v0 section survives), thin LTO for smaller + slightly faster code.
 strip = "symbols"
 lto = "thin"
+# Integer overflow panics instead of wrapping: within 3 % of unchecked on
+# the stable perf-baseline shapes (docs/src/perf-baseline.md, T-3552).
+overflow-checks = true
 
 # surfaces-threat-model 10.1: the new crates keep overflow checks in release.
 [profile.release.package.antares-ops]
@@ -157,6 +169,24 @@ overflow-checks = true
 overflow-checks = true
 
 [profile.release.package.odata-csdl]
+overflow-checks = true
+
+[profile.release.package.odata-url]
+overflow-checks = true
+
+[profile.release.package.odata-json]
+overflow-checks = true
+
+[profile.release.package.odata-batch]
+overflow-checks = true
+
+[profile.release.package.odata-axum]
+overflow-checks = true
+
+[profile.release.package.antares-views]
+overflow-checks = true
+
+[profile.release.package.antares-mcp]
 overflow-checks = true
 
 [profile.wasm-release]

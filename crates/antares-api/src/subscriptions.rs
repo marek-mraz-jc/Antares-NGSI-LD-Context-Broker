@@ -421,14 +421,9 @@ fn norm_member(
         }
         "q" => {
             let q = v.as_str().ok_or_else(|| bad("q must be a string".into()))?;
-            // Validate the string the MATCHER will parse. `conditions_match`
-            // percent-decodes first (4.9, 046_05), so validating the raw
-            // form would let `%28%28%28…` through create-time checks and
-            // only become thousands of real parens at notification time —
-            // inside a spawned task, where the parser's own limits are the
-            // last line of defence.
-            let decoded = crate::negotiate::percent_decode(q.as_bytes());
-            antares_ql::parse_q(&decoded)?;
+            // Validate the string the MATCHER will parse: a JSON string,
+            // read as written (5.2.12, 046_05), never percent-decoded.
+            antares_ql::parse_q(q)?;
             out.insert("q".into(), v.clone());
         }
         "geoQ" => {
@@ -792,7 +787,7 @@ fn sub_members(norm: &Map<String, Value>) -> crate::entities::ReadMembers {
         q: norm
             .get("q")
             .and_then(Value::as_str)
-            .and_then(|q| antares_ql::parse_q(&antares_ql::percent_decode(q.as_bytes())).ok()),
+            .and_then(|q| antares_ql::parse_q(q).ok()),
         geo: norm
             .get("geoQ")
             .and_then(Value::as_object)
@@ -801,6 +796,45 @@ fn sub_members(norm: &Map<String, Value>) -> crate::entities::ReadMembers {
             })
             .flatten(),
     }
+}
+
+/// Whether `st` serves through an endpoint view (ADR-0023).
+#[cfg(feature = "views")]
+fn through_a_view(st: &AppState) -> bool {
+    st.view.is_some()
+}
+
+/// A vanilla build serves through no view.
+#[cfg(not(feature = "views"))]
+fn through_a_view(_: &AppState) -> bool {
+    false
+}
+
+/// Whether the stored Subscription `doc` is one `st` may serve: through a
+/// view, only that view's own (rule 9, threat V24); at the root, all.
+#[cfg(feature = "views")]
+fn own(st: &AppState, doc: &Value) -> bool {
+    st.view.is_none() || crate::views::owns(st.view.as_deref(), doc)
+}
+
+/// A vanilla build serves every Subscription of the tenant.
+#[cfg(not(feature = "views"))]
+fn own(_: &AppState, _: &Value) -> bool {
+    true
+}
+
+/// ADR-0023 rule 9: `watchedAttributes` through a view keeps the Attributes
+/// the view shows, and naming none of them is 400.
+#[cfg(feature = "views")]
+fn view_watched(
+    view: &crate::views::CompiledView,
+    norm: &mut Map<String, Value>,
+) -> Result<(), NgsiError> {
+    if let Some(Value::Array(w)) = norm.get("watchedAttributes") {
+        let kept = crate::views::watched_in(view, w).map_err(NgsiError::BadRequestData)?;
+        norm.insert("watchedAttributes".into(), Value::Array(kept));
+    }
+    Ok(())
 }
 
 fn clause_of(kind: Kind, sub: &'static str, csub: &'static str) -> &'static str {
@@ -846,6 +880,16 @@ pub async fn create(
     .await?;
     check_endpoint(st, &norm)?;
     check_jsonld_context(st, &tenant, &norm).await?;
+    // ADR-0023 rule 9: a Subscription made through a view watches only what
+    // the view shows, and carries the view's id to match and deliver under.
+    #[cfg(feature = "views")]
+    if let Some(view) = st.view.as_deref() {
+        view_watched(view, &mut norm)?;
+        norm.insert(
+            crate::views::VIEW_MEMBER.into(),
+            Value::String(view.id().to_owned()),
+        );
+    }
     let id = match norm.get("id").and_then(Value::as_str) {
         Some(id) => id.to_owned(),
         None => {
@@ -921,7 +965,7 @@ pub async fn create(
         return Err(NgsiError::AlreadyExists(format!("subscription {id} already exists")).into());
     }
     st.sub_changed(&tenant, kind, &id, Some(&doc));
-    if kind == Kind::Subscription {
+    if kind == Kind::Subscription && !through_a_view(st) {
         // 5.8.1.4: a distributed Subscription creates its internal Context
         // Source Registration Subscription (consumer half)
         crate::distsub::on_subscription_created(st, &tenant, &doc).await;
@@ -959,6 +1003,7 @@ pub async fn retrieve(
         .store
         .get(&tenant, kind, id)
         .await?
+        .filter(|d| own(st, d))
         .ok_or_else(|| NgsiError::ResourceNotFound(format!("subscription {id} not found")))?;
     let sys = sys_attrs_asked(params);
     let payload = present_subscription(&doc, &ctx, sys, kind == Kind::CSourceSubscription);
@@ -988,6 +1033,23 @@ pub async fn list(
     // here made a tenant at the document ceiling unable to list at all,
     // because that read is the one carrying the ceiling for client queries.
     let (offset, limit, _) = crate::paging::page_params(st, params)?;
+    #[cfg(feature = "views")]
+    let (page_docs, total) = if through_a_view(st) {
+        // ponytail: a scan of the tenant's Subscriptions for the view's own;
+        // a `__view` column with an index when views hold many.
+        let own: Vec<Value> = st
+            .store
+            .list(&tenant, kind)
+            .await?
+            .into_iter()
+            .filter(|d| own(st, d))
+            .collect();
+        let total = own.len();
+        (own.into_iter().skip(offset).take(limit).collect(), total)
+    } else {
+        st.store.list_slice(&tenant, kind, offset, limit).await?
+    };
+    #[cfg(not(feature = "views"))]
     let (page_docs, total) = st.store.list_slice(&tenant, kind, offset, limit).await?;
     let (page, count_hdr, links) = crate::paging::paginate_pre_accept(
         st,
@@ -1037,10 +1099,23 @@ pub async fn update(
     let norm = normalize_subscription(obj, &parsed.ctx, true)?;
     check_endpoint(st, &norm)?;
     check_jsonld_context(st, &tenant, &norm).await?;
+    #[cfg(feature = "views")]
+    let norm = {
+        let mut norm = norm;
+        if let Some(view) = st.view.as_deref() {
+            view_watched(view, &mut norm)?;
+        }
+        norm
+    };
     let ts = now_iso();
     let res = st
         .store
         .mutate(&tenant, kind, id, |doc| {
+            if !own(st, doc) {
+                return Err(NgsiError::ResourceNotFound(format!(
+                    "subscription {id} not found"
+                )));
+            }
             let target = antares_store::stored_object(doc)?;
             crate::apply_doc_fragment(target, &norm, &ts);
             Ok::<(), NgsiError>(())
@@ -1061,7 +1136,7 @@ pub async fn update(
                 let doc = st.store.get(&tenant, kind, id).await?;
                 st.sub_changed(&tenant, kind, id, doc.as_ref());
             }
-            if kind == Kind::Subscription {
+            if kind == Kind::Subscription && !through_a_view(st) {
                 // 5.8.2.4: the CSR subscription and the mapped remote
                 // subscriptions follow the update (5.11.3)
                 crate::distsub::on_subscription_updated(st, &tenant, id).await;
@@ -1085,6 +1160,18 @@ pub async fn delete(
         .map_err(|_| NgsiError::BadRequestData(format!("invalid subscription id {id:?}")))?;
     check_params(params, &["local"])?;
     gate!(st, &tenant, headers, clause_of(kind, "5.8.5", "5.11.6"), ids: &[id]).await?;
+    // ponytail: read, then delete; a Subscription of another view or the
+    // root recreated under this id between the two is deleted with it. A
+    // conditional delete for Subscriptions when that race matters.
+    if through_a_view(st)
+        && !st
+            .store
+            .get(&tenant, kind, id)
+            .await?
+            .is_some_and(|d| own(st, &d))
+    {
+        return Err(NgsiError::ResourceNotFound(format!("subscription {id} not found")).into());
+    }
     if st.store.delete(&tenant, kind, id).await? {
         st.sub_changed(&tenant, kind, id, None);
         if kind == Kind::Subscription {
@@ -1686,17 +1773,16 @@ mod tests {
         }
     }
 
-    /// Table 5.2.12-1: q is "A valid query string as per clause 4.9". The
-    /// matcher percent-decodes before parsing (4.9), so the DECODED form is
-    /// what must be validated here — otherwise an encoded paren bomb passes
-    /// creation and only unfolds inside the notification task.
+    /// Table 5.2.12-1: q is "A valid query string as per clause 4.9", the
+    /// same string the matcher parses — read as written, so an encoded form
+    /// is not a query the matcher could ever run.
     #[test]
-    fn clause_5_2_12_q_is_validated_in_its_decoded_form() {
+    fn clause_5_2_12_q_is_validated_as_written() {
         assert!(norm(&sub(json!({"q": "temperature>20"}))).is_ok());
         assert!(norm(&sub(json!({"q": "(("}))).is_err());
         assert!(
             norm(&sub(json!({"q": "%28%28%28"}))).is_err(),
-            "a percent-encoded unbalanced expression must be rejected at creation"
+            "percent signs are not part of the 4.9 grammar"
         );
         assert!(norm(&sub(json!({"q": 5}))).is_err());
     }

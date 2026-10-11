@@ -20,10 +20,12 @@ impl TenantId {
 
     /// Tenant names the broker mints for its own bookkeeping: the snapshot
     /// module's reverse index and one tenant per snapshot share a prefix, the
-    /// distributed-subscription inbound index is a fixed name.
+    /// distributed-subscription inbound index and the view table (ADR-0023
+    /// rule 10) are fixed names.
     pub const RESERVED_PREFIXES: &'static [&'static str] = &["snap-"];
     /// The reserved names that are not a prefix family.
-    pub const RESERVED_EXACT: &'static [&'static str] = &["distsub-index"];
+    pub const RESERVED_EXACT: &'static [&'static str] =
+        &["distsub-index", "antares-views", "antares-policy"];
 
     /// Whether `raw` names one of the broker's own tenants.
     ///
@@ -262,6 +264,8 @@ mod tests {
             "snap-index",
             "snap-0123456789abcdef0123456789abcdef",
             "distsub-index",
+            "antares-views",
+            "antares-policy",
         ] {
             assert!(
                 TenantId::new(reserved).is_err(),

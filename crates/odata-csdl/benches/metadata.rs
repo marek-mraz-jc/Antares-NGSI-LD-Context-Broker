@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! `$metadata` build: validation plus both writers over the fixture model (ADR-0024
 //! decision 8). Std-only timing (criterion is not in the lock file); `cargo bench -p odata-csdl`
 //! prints the mean per build.

@@ -74,7 +74,7 @@ a, b = statement(lib, "let [health_p")
 names = re.split(r"\s*,\s*", lib[a:b].split("[", 1)[1].split("]", 1)[0])
 by_name = dict(zip(names, paths, strict=True))
 a, b = statement(lib, "let [health_p")
-admin_from = lib.index("fn router(&self, _st: AppState) -> Router<AppState> {")
+admin_from = lib.index("impl ApiSurface for Admin {")
 for off, arg, chain in calls(lib):
     if off > admin_from and arg in by_name:
         routes.update((m, "/q" + by_name[arg]) for m in methods_of(chain))

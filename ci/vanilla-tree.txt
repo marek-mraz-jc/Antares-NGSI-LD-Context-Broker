@@ -227,13 +227,13 @@ antares-broker v0.1.3
 │   │   │       │       │   └── bytes feature "std"
 │   │   │       │       │       └── bytes v1.12.1 (*)
 │   │   │       │       ├── futures-channel feature "default"
-│   │   │       │       │   ├── futures-channel v0.3.33
+│   │   │       │       │   ├── futures-channel v0.3.34
 │   │   │       │       │   │   ├── futures-core v0.3.34
 │   │   │       │       │   │   └── futures-sink v0.3.34
 │   │   │       │       │   └── futures-channel feature "std"
-│   │   │       │       │       ├── futures-channel v0.3.33 (*)
+│   │   │       │       │       ├── futures-channel v0.3.34 (*)
 │   │   │       │       │       ├── futures-channel feature "alloc"
-│   │   │       │       │       │   ├── futures-channel v0.3.33 (*)
+│   │   │       │       │       │   ├── futures-channel v0.3.34 (*)
 │   │   │       │       │       │   └── futures-core feature "alloc"
 │   │   │       │       │       │       └── futures-core v0.3.34
 │   │   │       │       │       └── futures-core feature "std"
@@ -1201,6 +1201,7 @@ antares-broker v0.1.3
 │   │   │               └── regex-syntax feature "unicode" (*)
 │   │   ├── antares-store feature "default"
 │   │   │   └── antares-store v0.1.3
+│   │   │       ├── antares-jsonld feature "default" (*)
 │   │   │       ├── antares-model feature "default" (*)
 │   │   │       ├── serde_json feature "default" (*)
 │   │   │       ├── chrono feature "default" (*)
@@ -1959,16 +1960,16 @@ antares-broker v0.1.3
 │   │   │   │   │               │       ├── byteorder feature "std"
 │   │   │   │   │               │       │   └── byteorder v1.5.0
 │   │   │   │   │               │       ├── futures-channel feature "alloc"
-│   │   │   │   │               │       │   ├── futures-channel v0.3.33
+│   │   │   │   │               │       │   ├── futures-channel v0.3.34
 │   │   │   │   │               │       │   │   ├── futures-core v0.3.34
 │   │   │   │   │               │       │   │   └── futures-sink v0.3.34
 │   │   │   │   │               │       │   └── futures-core feature "alloc" (*)
 │   │   │   │   │               │       ├── futures-channel feature "sink"
-│   │   │   │   │               │       │   ├── futures-channel v0.3.33 (*)
+│   │   │   │   │               │       │   ├── futures-channel v0.3.34 (*)
 │   │   │   │   │               │       │   └── futures-channel feature "futures-sink"
-│   │   │   │   │               │       │       └── futures-channel v0.3.33 (*)
+│   │   │   │   │               │       │       └── futures-channel v0.3.34 (*)
 │   │   │   │   │               │       ├── futures-channel feature "std"
-│   │   │   │   │               │       │   ├── futures-channel v0.3.33 (*)
+│   │   │   │   │               │       │   ├── futures-channel v0.3.34 (*)
 │   │   │   │   │               │       │   ├── futures-core feature "std" (*)
 │   │   │   │   │               │       │   └── futures-channel feature "alloc" (*)
 │   │   │   │   │               │       ├── hkdf feature "default"
@@ -2096,9 +2097,9 @@ antares-broker v0.1.3
 │   │   │   │           ├── uuid feature "default" (*)
 │   │   │   │           ├── futures-channel feature "alloc" (*)
 │   │   │   │           ├── futures-channel feature "sink"
-│   │   │   │           │   ├── futures-channel v0.3.33 (*)
+│   │   │   │           │   ├── futures-channel v0.3.34 (*)
 │   │   │   │           │   └── futures-channel feature "futures-sink"
-│   │   │   │           │       └── futures-channel v0.3.33 (*)
+│   │   │   │           │       └── futures-channel v0.3.34 (*)
 │   │   │   │           ├── futures-channel feature "std" (*)
 │   │   │   │           ├── futures-util feature "alloc" (*)
 │   │   │   │           ├── futures-util feature "io" (*)

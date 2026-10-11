@@ -654,6 +654,11 @@ async fn run_query(
         .ok_or_else(|| bad("Query must be an object".into()))?;
     let mut vp: HashMap<String, String> = HashMap::new();
     crate::paging::query_doc_params(qo, false, &mut vp)?;
+    // the caller's own `q`, held to the caller's caps before the paged
+    // filter reads it with the narrowed ones (threat V23)
+    if let Some(q) = vp.get("q") {
+        antares_ql::parse_q(q)?;
+    }
     for k in ["limit", "offset", "count"] {
         vp.remove(k);
     }

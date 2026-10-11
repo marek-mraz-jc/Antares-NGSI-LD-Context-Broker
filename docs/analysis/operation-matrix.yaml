@@ -3313,9 +3313,7 @@ operations:
         linked_entity_checks:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
-      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under the view [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
       post_image: 'every written instance lies inside the temporal view [not enforced today: the Operation carries
         no stored image, the engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/8/8.4.3.1.md
@@ -3369,14 +3367,10 @@ operations:
         linked_entity_checks:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
-      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-        the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under the view [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
       post_image: 'every written instance lies inside the temporal view [not enforced today: the Operation carries
         no stored image, the engine decides on ids/clause only]'
-  pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-    Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
-    the view [not enforced today: the Operation carries no stored image, the engine decides on ids/clause only]'
+  pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under the view [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
   post_image: 'every written instance lies inside the temporal view [not enforced today: the Operation carries no
     stored image, the engine decides on ids/clause only]'
 - id: temporal_delete_attribute
@@ -3403,9 +3397,7 @@ operations:
         linked_entity_checks:
         - 'relationship delete: removing a Relationship needs the relationship attribute writable; the target is
           not read, so its visibility is not required'
-      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
       post_image: no instance of the Attribute remains
       binding_clause: ts-104176-ngsi-ld-http-binding/8/8.5.3.1.md
       gate_site: crates/antares-api/src/temporal.rs:2671
@@ -3458,13 +3450,9 @@ operations:
         linked_entity_checks:
         - 'relationship delete: removing a Relationship needs the relationship attribute writable; the target is
           not read, so its visibility is not required'
-      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
       post_image: no instance of the Attribute remains
-  pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-    Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced today:
-    the Operation carries no stored image, the engine decides on ids/clause only]'
+  pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
   post_image: no instance of the Attribute remains
 - id: temporal_modify_instance
   ts104175: 11.2.5
@@ -3490,9 +3478,7 @@ operations:
         linked_entity_checks:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
-      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
       post_image: 'the instance lies inside the temporal view [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
       binding_clause: ts-104176-ngsi-ld-http-binding/8/8.6.3.1.md
@@ -3546,14 +3532,10 @@ operations:
         linked_entity_checks:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
-      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
       post_image: 'the instance lies inside the temporal view [not enforced today: the Operation carries no stored
         image, the engine decides on ids/clause only]'
-  pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-    Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced today:
-    the Operation carries no stored image, the engine decides on ids/clause only]'
+  pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
   post_image: 'the instance lies inside the temporal view [not enforced today: the Operation carries no stored image,
     the engine decides on ids/clause only]'
 - id: temporal_delete_instance
@@ -3580,9 +3562,7 @@ operations:
         linked_entity_checks:
         - 'relationship delete: removing a Relationship needs the relationship attribute writable; the target is
           not read, so its visibility is not required'
-      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
       post_image: the instance is absent
       binding_clause: ts-104176-ngsi-ld-http-binding/8/8.6.3.2.md
       gate_site: crates/antares-api/src/temporal.rs:2997
@@ -3635,13 +3615,9 @@ operations:
         linked_entity_checks:
         - 'relationship delete: removing a Relationship needs the relationship attribute writable; the target is
           not read, so its visibility is not required'
-      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced
-        today: the Operation carries no stored image, the engine decides on ids/clause only]'
+      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
       post_image: the instance is absent
-  pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-    Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [not enforced today:
-    the Operation carries no stored image, the engine decides on ids/clause only]'
+  pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
   post_image: the instance is absent
 - id: temporal_delete
   ts104175: 11.2.7
@@ -3667,9 +3643,7 @@ operations:
         linked_entity_checks:
         - 'delete entity: Relationships in other Entities that point at the deleted one are not touched (NGSI-LD
           has no referential integrity), so no linked check'
-      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no
-        stored image, the engine decides on ids/clause only]'
+      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020) [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
       post_image: no temporal evolution remains
       binding_clause: ts-104176-ngsi-ld-http-binding/8/8.3.3.2.md
       gate_site: crates/antares-api/src/temporal.rs:2456
@@ -3722,13 +3696,9 @@ operations:
         linked_entity_checks:
         - 'delete entity: Relationships in other Entities that point at the deleted one are not touched (NGSI-LD
           has no referential integrity), so no linked check'
-      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-        Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no
-        stored image, the engine decides on ids/clause only]'
+      pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020) [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
       post_image: no temporal evolution remains
-  pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
-    Entity is indistinguishable from an absent one, ADR-0020) [not enforced today: the Operation carries no stored
-    image, the engine decides on ids/clause only]'
+  pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020) [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
   post_image: no temporal evolution remains
 - id: temporal_retrieve
   ts104175: 11.3.2

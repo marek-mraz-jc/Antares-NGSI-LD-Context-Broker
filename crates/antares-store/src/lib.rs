@@ -68,6 +68,11 @@ pub enum Kind {
     /// Notifications a delivery policy gave up on (dead letters), kept
     /// under the subscription's tenant for replay.
     DeadLetter,
+    /// Endpoint views (ADR-0023 rule 10): configuration the `views` build
+    /// serves, under the reserved tenant `antares-views`, and the policy
+    /// engine's rule documents (ADR-0020 amendment) under `antares-policy`.
+    /// No NGSI-LD route reads or writes this kind.
+    View,
 }
 
 /// The four store backends, decided ONCE at startup and threaded as a value —

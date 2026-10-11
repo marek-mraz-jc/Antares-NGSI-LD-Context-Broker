@@ -605,12 +605,13 @@ where
 
 /// What each Entity of a notification's `data` (and each one it embeds)
 /// shows under the expanded `rules`, read on its stored state now, names
-/// compacted the way `data` is. An Entity the store no longer holds, or
-/// that no rule holds for, maps to `None`.
+/// compacted the way `data` is. An Entity the store no longer holds, that
+/// `reach` does not admit, or that no rule holds for, maps to `None`.
 async fn shown_now(
     st: &AppState,
     tenant: &TenantId,
     rules: &crate::policy::Filter,
+    reach: Option<&crate::repr::PolicyReach>,
     data: &Value,
     ctx: &Context,
 ) -> HashMap<String, Option<crate::policy::Shown>> {
@@ -630,7 +631,13 @@ async fn shown_now(
     ids(data, &mut wanted);
     let mut out = HashMap::new();
     for id in wanted {
-        let stored = st.store.get(tenant, Kind::Entity, id).await.ok().flatten();
+        let mut stored = st.store.get(tenant, Kind::Entity, id).await.ok().flatten();
+        if let (Some(d), Some(_)) = (&stored, reach) {
+            let ctx = crate::repr::policy_context();
+            if !crate::repr::policy_admits(st, tenant, ctx, reach, d).await {
+                stored = None;
+            }
+        }
         let shown = stored
             .and_then(|d| crate::repr::shown(Some(rules), &d))
             .map(|s| s.map_names(|n| ctx.compact_iri(n)));
@@ -740,13 +747,76 @@ fn project_joined(f: &crate::policy::Filter, e: &mut Value, key_values: bool) {
     }
 }
 
+/// ADR-0023 rule 9: what a Subscription made through `view` sees of the
+/// changed Entity `doc` (internal form): the Attributes the view shows of it,
+/// the document with only those, and the view's narrowing for a linked
+/// condition to read targets through; `None` when the view does not select
+/// the Entity.
+#[cfg(feature = "views")]
+async fn view_sees(
+    st: &AppState,
+    tenant: &TenantId,
+    view: &crate::views::CompiledView,
+    doc: &Value,
+) -> Option<(crate::policy::Shown, Value, crate::repr::Repr)> {
+    let repr = crate::repr::narrowing(view.narrowing());
+    let ctx = crate::repr::policy_context();
+    if !crate::repr::policy_admits(st, tenant, ctx, repr.policy_reach.as_deref(), doc).await {
+        return None;
+    }
+    let shown = crate::repr::shown(repr.policy_types.as_deref(), doc)?;
+    let seen = crate::repr::policy_view(doc, &repr);
+    Some((shown, seen, repr))
+}
+
+/// ADR-0023 rule 9 on a notification about to leave: each notified Entity,
+/// and each one it embeds, read under `view` on its stored state now; the
+/// ones the view does not select are dropped (embedded ones unembedded,
+/// rule 6), the rest keep the Attributes the view shows, `previousValue`
+/// included. `false` when no Entity is left to notify.
+#[cfg(feature = "views")]
+async fn view_project(
+    st: &AppState,
+    tenant: &TenantId,
+    sub: &Value,
+    view: &crate::views::CompiledView,
+    body: &mut Value,
+    ctx: &Context,
+) -> bool {
+    let repr = crate::repr::narrowing(view.narrowing());
+    let Some(rules) = repr.policy_types.as_deref() else {
+        return true;
+    };
+    let key_values = matches!(
+        sub.get("notification")
+            .and_then(|n| n.get("format"))
+            .and_then(Value::as_str),
+        Some("keyValues" | "simplified")
+    );
+    let shown = shown_now(
+        st,
+        tenant,
+        rules,
+        repr.policy_reach.as_deref(),
+        &body["data"],
+        ctx,
+    )
+    .await;
+    let Some(arr) = body.get_mut("data").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    arr.retain(|e| matches!(entity_shown(&shown, e), Some(Some(_))));
+    for e in arr.iter_mut() {
+        project_shown(&shown, e, key_values);
+    }
+    !arr.is_empty()
+}
+
 /// Whether the Subscription's q follows a Relationship (4.9
 /// LinkedEntityRelation).
 fn linked_condition(sub: &Value) -> bool {
-    sub_str(sub, "q").is_some_and(|q| {
-        antares_ql::regex::q_node(&antares_ql::percent_decode(q.as_bytes()))
-            .is_some_and(|n| n.has_linked_paths())
-    })
+    sub_str(sub, "q")
+        .is_some_and(|q| antares_ql::regex::q_node(q).is_some_and(|n| n.has_linked_paths()))
 }
 
 pub(crate) use antares_matcher::{
@@ -1032,24 +1102,12 @@ async fn build_data(
                     if gone.is_empty() {
                         continue;
                     }
-                    let attr_absent = doc.get(attr).is_none();
-                    let tss: Vec<Value> = if attr_absent {
-                        // whole attribute deleted at once: ONE tombstone,
-                        // no datasetId (046_22_08)
-                        let base = gone
-                            .iter()
-                            .find(|i| instance_ds(i).is_none())
-                            .unwrap_or(&gone[0]);
-                        let mut ts = tombstone(base, sys, show, now);
-                        if let Some(o) = ts.as_object_mut() {
-                            o.remove("datasetId");
-                        }
-                        vec![ts]
-                    } else {
-                        gone.iter()
-                            .map(|di| tombstone(di, sys, show, now))
-                            .collect()
-                    };
+                    // one tombstone per deleted instance, each with its
+                    // datasetId, deleteAll included (046_22_08)
+                    let tss: Vec<Value> = gone
+                        .iter()
+                        .map(|di| tombstone(di, sys, show, now))
+                        .collect();
                     let Some(target) = doc.as_object_mut() else {
                         continue;
                     };
@@ -1332,16 +1390,44 @@ async fn matches_for(
         if !is_active(&sub) || sub.get("timeInterval").is_some() {
             continue;
         }
+        // ADR-0023 rule 9: a Subscription made through a view matches what
+        // the view shows of the Entity now: its conditions read only the
+        // shown Attributes (rule 2), and a change to hidden ones alone is no
+        // change at all, so its timing does not leak.
+        #[cfg(feature = "views")]
+        let seen = match crate::views::of_subscription(st, &tenant, &sub) {
+            None => None,
+            Some(None) => continue,
+            Some(Some(view)) => match view_sees(st, &tenant, &view, eval_doc).await {
+                Some(seen) => Some(seen),
+                None => continue,
+            },
+        };
+        #[cfg(feature = "views")]
+        let (eval_doc, narrow) = match &seen {
+            Some((_, doc, repr)) => (doc, Some((repr, crate::repr::policy_context()))),
+            None => (eval_doc, None),
+        };
+        #[cfg(not(feature = "views"))]
+        let narrow = None;
         let triggers = triggers_of(&sub);
         // which attribute-level changes this sub cares about
         let watched: Option<Vec<&str>> = sub
             .get("watchedAttributes")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect());
-        let relevant: Vec<&(String, ChangeClass)> = changes
+        #[cfg_attr(not(feature = "views"), expect(unused_mut))]
+        let mut relevant: Vec<&(String, ChangeClass)> = changes
             .iter()
             .filter(|(k, _)| watched.as_ref().is_none_or(|w| w.contains(&k.as_str())))
             .collect();
+        #[cfg(feature = "views")]
+        if let Some((shown, _, _)) = &seen {
+            relevant.retain(|(k, _)| shown.allows(k));
+            if relevant.is_empty() {
+                continue;
+            }
+        }
         let attr_trigger_fired = relevant.iter().any(|(_, c)| {
             let t = match c {
                 ChangeClass::Created => "attributeCreated",
@@ -1359,7 +1445,7 @@ async fn matches_for(
         if !selector_match(&sub, eval_doc, &ctx) {
             continue;
         }
-        if !linked_eval(st, &tenant, None, |l| {
+        if !linked_eval(st, &tenant, narrow, |l| {
             conditions_match(&sub, eval_doc, &ctx, l)
         })
         .await
@@ -1637,6 +1723,12 @@ pub async fn interval_tick(st: &AppState) {
             } else {
                 None
             };
+            // a stored q that no longer parses (one percent-encoded before
+            // 5.2.12's read-as-written) matches nothing, as conditions_match
+            // decides: no Entity to read and no Notification to send
+            if sub_str(&sub, "q").is_some_and(|q| antares_ql::regex::q_node(q).is_none()) {
+                continue;
+            }
             let ctx = sub_context(st, &tenant, &sub).await;
             let now = now_iso();
             // 5.8.6: the periodic Notification "shall include all the
@@ -1660,12 +1752,10 @@ pub async fn interval_tick(st: &AppState) {
             let rows = {
                 let expand = |t: &str| ctx.expand_key(t);
                 let id_refs: Vec<&str> = ids.iter().flatten().map(String::as_str).collect();
-                // q values in subscription bodies may be percent-encoded (4.9);
-                // parses shared per distinct expression text, as in
-                // conditions_match — the sweep re-runs per due subscription
-                let q_ast = sub_str(&sub, "q").and_then(|q| {
-                    antares_ql::regex::q_node(&crate::negotiate::percent_decode(q.as_bytes()))
-                });
+                // q is read as written (5.2.12); parses shared per distinct
+                // expression text, as in conditions_match — the sweep
+                // re-runs per due subscription
+                let q_ast = sub_str(&sub, "q").and_then(antares_ql::regex::q_node);
                 let geo = sub.get("geoQ").and_then(Value::as_object).and_then(|g| {
                     let key = serde_json::to_string(g).unwrap_or_default();
                     antares_ql::regex::geo_query(&key, || {
@@ -2303,7 +2393,7 @@ async fn deliver_as(
                 // `previousValue` of it, and one no rule holds for is not
                 // notified at all
                 if let Some(rules) = rules {
-                    let shown = shown_now(st, tenant, &rules, &body["data"], ctx).await;
+                    let shown = shown_now(st, tenant, &rules, None, &body["data"], ctx).await;
                     if let Some(arr) = body.get_mut("data").and_then(Value::as_array_mut) {
                         arr.retain(|e| matches!(entity_shown(&shown, e), Some(Some(_))));
                         for e in arr.iter_mut() {
@@ -2318,6 +2408,21 @@ async fn deliver_as(
                     }
                 }
             }
+        }
+    }
+    // ADR-0023 rule 9: a Subscription made through a view is delivered
+    // under the view as the table serves it now, before the bookkeeping
+    // below: a removed view sends nothing, and an Entity the view no longer
+    // selects is not notified.
+    #[cfg(feature = "views")]
+    if let Some(view) = crate::views::of_subscription(st, tenant, sub) {
+        let Some(view) = view else {
+            tracing::debug!("subscription {sub_id}: its view is gone; dropping");
+            return;
+        };
+        if !view_project(st, tenant, sub, &view, &mut body, ctx).await {
+            tracing::debug!("subscription {sub_id}: no notified Entity is in its view; dropping");
+            return;
         }
     }
     // 5.8.6: a subscription's ngsildConformance pins the notification format —
@@ -3711,9 +3816,10 @@ mod clause_5_8_6_deletion_payload {
         }
     }
 
-    /// 5.8.6: a whole Attribute deleted at once is ONE tombstone with no
-    /// datasetId, while losing individual instances tombstones each lost
-    /// datasetId and leaves the survivors untouched.
+    /// 5.8.6: every deleted instance is its own tombstone carrying its
+    /// datasetId, whether the whole Attribute went at once (deleteAll, forge
+    /// 75ba471d, 046_22_08) or single instances did, and survivors stay
+    /// untouched. A multi-instance Attribute is an Array, deleted or not.
     #[tokio::test]
     async fn whole_attribute_versus_per_instance_deletion() {
         let three = json!([
@@ -3742,10 +3848,18 @@ mod clause_5_8_6_deletion_payload {
         )
         .await;
         let got = insts(&entry, "speed");
-        assert_eq!(got.len(), 1, "a whole-attribute deletion is one tombstone");
+        assert_eq!(got.len(), 3, "one tombstone per deleted instance: {got:?}");
+        let mut ds: Vec<Option<&Value>> = got.iter().map(|i| i.get("datasetId")).collect();
+        ds.sort_by_key(|d| d.and_then(Value::as_str));
+        assert_eq!(
+            ds,
+            [None, Some(&json!("urn:ds:a")), Some(&json!("urn:ds:b"))],
+            "each tombstone keeps its datasetId"
+        );
         assert!(
-            got[0].get("datasetId").is_none(),
-            "the single tombstone carries no datasetId"
+            got.iter()
+                .all(|i| i.get("value") == Some(&json!("urn:ngsi-ld:null"))),
+            "{got:?}"
         );
 
         // one instance gone, two survive

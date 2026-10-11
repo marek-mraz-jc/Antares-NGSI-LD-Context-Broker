@@ -90,7 +90,26 @@ Measured by `dev/perf/compare-coraine.sh` on a GitHub-hosted runner (workflow `c
 Read the ratios, not the absolute numbers: a hosted runner varies by a factor of two between runs (Coraine's retrieve at 1 000 entities measured 41 428 req/s in the run before this one, 20 515 here), and both brokers ran on the same runner within minutes.
 
 - Retrieve, upsert and subscription creation are within a factor of two either way; Antares creates subscriptions faster.
-- The query shapes are not. Antares' memory store hands every query a deep copy of every entity of the tenant (`crates/antares-sql/src/store/any.rs:700`, `store/mem/mod.rs:762`) and filters the copy, so a query costs the size of the tenant: 13 req/s at 100 000 entities. T-3556 fixes it. The Postgres store, which deployments run, pushes the filter into SQL and is not measured here.
+- The query shapes are not. Antares' memory store hands every query a deep copy of every entity of the tenant (`crates/antares-sql/src/store/any.rs:700`, `store/mem/mod.rs:762`) and filters the copy, so a query costs the size of the tenant: 13 req/s at 100 000 entities. T-3556 fixed it for queries without `q` (table below). The Postgres store, which deployments run, pushes the filter into SQL and is not measured here.
+
+After T-3556 (run 38078752333, same rig, Antares at 905da4e): the memory store filters on borrowed documents and copies only the page.
+
+| Entities | Shape (k6, 50 VUs) | Antares req/s | p99 | Coraine req/s | p99 |
+|---:|---|---:|---:|---:|---:|
+| 1 000 | query `type=Vehicle&limit=20` | 2665 | 23 ms | 4834 | 11 ms |
+| 1 000 | query with `q` | 255 | 228 ms | 2515 | 21 ms |
+| 100 000 | query | 1459 | 21 ms | 2032 | 13 ms |
+| 100 000 | query with `q` | 12 | 29.1 s | 1172 | 21 ms |
+| 100 000 | retrieve by id | 4629 | 11 ms | 8285 | 12 ms |
+
+A query with `q` took the old path: the memory arm left `q` undecided, handed the API a copy of the tenant and let it filter. T-3572 runs the API's own evaluator on the borrowed documents for a `q` without linked terms (run 38081147511, same rig, Antares 3385b28):
+
+| Entities | Shape (k6, 50 VUs) | Antares req/s | p99 | Coraine req/s | p99 |
+|---:|---|---:|---:|---:|---:|
+| 1 000 | query with `q` | 1758 | 31 ms | 2523 | 21 ms |
+| 100 000 | query with `q` | 923 | 37 ms | 1125 | 21 ms |
+
+The shape's `q` (`speed>100;brand=="Tesla"`) is selective, so a page of 20 walks many documents; each walk resolves the query's terms against the @context again per document.
 - Antares holds 3.6 times Coraine's memory per entity: the expanded JSON-LD form with IRI keys and instance arrays, in `serde_json` values.
 - The first run kept Antares' history on (`ANTARES_TEMPORAL_RECORD=all`, the default) against Coraine without one: RSS at 100 000 entities was 2355 MiB, twice the parity figure. A comparison with history needs Coraine's `--troe` driver and is not done here.
 

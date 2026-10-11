@@ -404,17 +404,107 @@ impl OperationId {
         }
     }
 
+    /// The CIM 009 clause the operation's handler passes to the policy
+    /// gate (the matrix's `gate_clause`), `None` for a broker-initiated
+    /// row no request reaches.
+    ///
+    /// ```
+    /// use antares_ops::OperationId;
+    /// assert_eq!(OperationId::RetrieveAttributeValue.gate_clause(), Some("5.7.1"));
+    /// assert_eq!(OperationId::Notification.gate_clause(), None);
+    /// ```
+    #[must_use]
+    pub fn gate_clause(self) -> Option<&'static str> {
+        match self {
+            Self::CreateEntity => Some("5.6.1"),
+            Self::UpdateAttributes => Some("5.6.2"),
+            Self::AppendAttributes => Some("5.6.3"),
+            Self::PartialAttributeUpdate => Some("5.6.4"),
+            Self::SetAttributeValue | Self::ReplaceAttribute => Some("5.6.19"),
+            Self::DeleteAttribute => Some("5.6.5"),
+            Self::DeleteEntity => Some("5.6.6"),
+            Self::MergeEntity => Some("5.6.17"),
+            Self::ReplaceEntity => Some("5.6.18"),
+            Self::PurgeEntities => Some("5.6.21"),
+            Self::BatchCreate => Some("5.6.7"),
+            Self::BatchUpsert => Some("5.6.8"),
+            Self::BatchUpdate => Some("5.6.9"),
+            Self::BatchMerge => Some("5.6.20"),
+            Self::BatchDelete => Some("5.6.10"),
+            Self::RetrieveEntity | Self::RetrieveAttributeValue => Some("5.7.1"),
+            Self::QueryEntities | Self::QueryEntitiesPost => Some("5.7.2"),
+            Self::CreateSubscription => Some("5.8.1"),
+            Self::UpdateSubscription => Some("5.8.2"),
+            Self::RetrieveSubscription => Some("5.8.3"),
+            Self::QuerySubscriptions => Some("5.8.4"),
+            Self::DeleteSubscription => Some("5.8.5"),
+            Self::Notification | Self::CsourceNotification | Self::SnapshotNotification => None,
+            Self::RetrieveEntityTypes | Self::RetrieveEntityTypeDetails => Some("5.7.5"),
+            Self::RetrieveEntityTypeInfo => Some("5.7.7"),
+            Self::RetrieveAttributes | Self::RetrieveAttributeDetails => Some("5.7.8"),
+            Self::RetrieveAttributeInfo => Some("5.7.10"),
+            Self::TemporalUpsert => Some("5.6.11"),
+            Self::TemporalAddAttributes => Some("5.6.12"),
+            Self::TemporalDeleteAttribute => Some("5.6.13"),
+            Self::TemporalModifyInstance => Some("5.6.14"),
+            Self::TemporalDeleteInstance => Some("5.6.15"),
+            Self::TemporalDelete => Some("5.6.16"),
+            Self::TemporalRetrieve => Some("5.7.3"),
+            Self::TemporalQuery | Self::TemporalQueryPost => Some("5.7.4"),
+            Self::RegisterContextSource => Some("5.9.2"),
+            Self::UpdateRegistration => Some("5.9.3"),
+            Self::DeleteRegistration => Some("5.9.4"),
+            Self::RetrieveRegistration => Some("5.10.1"),
+            Self::QueryRegistrations => Some("5.10.2"),
+            Self::CreateCsourceSubscription => Some("5.11.2"),
+            Self::UpdateCsourceSubscription => Some("5.11.3"),
+            Self::RetrieveCsourceSubscription => Some("5.11.4"),
+            Self::QueryCsourceSubscriptions => Some("5.11.5"),
+            Self::DeleteCsourceSubscription => Some("5.11.6"),
+            Self::AddContext => Some("5.13.2"),
+            Self::ListContexts => Some("5.13.3"),
+            Self::ServeContext => Some("5.13.4"),
+            Self::DeleteContext => Some("5.13.5"),
+            Self::RetrieveEntityMap => Some("5.14.1"),
+            Self::UpdateEntityMap => Some("5.14.2"),
+            Self::DeleteEntityMap => Some("5.14.3"),
+            Self::CreateEntityMap => Some("5.14.4"),
+            Self::CreateTemporalEntityMap => Some("5.14.5"),
+            Self::SourceIdentity => Some("5.15.1"),
+            Self::CreateSnapshot => Some("5.16.1"),
+            Self::CloneSnapshot => Some("5.16.2"),
+            Self::RetrieveSnapshotStatus => Some("5.16.3"),
+            Self::UpdateSnapshotStatus => Some("5.16.4"),
+            Self::DeleteSnapshot => Some("5.16.5"),
+            Self::PurgeSnapshots => Some("5.16.7"),
+        }
+    }
+
+    /// The operation whose matrix row id is `id`.
+    ///
+    /// ```
+    /// use antares_ops::OperationId;
+    /// assert_eq!(OperationId::from_id("query_entities"), Some(OperationId::QueryEntities));
+    /// assert_eq!(OperationId::from_id("drop_tables"), None);
+    /// ```
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|op| op.id() == id)
+    }
+
     /// The operation a request is, when it is one a surface may run: the
     /// method and path match the binding, every segment in braces standing
     /// for one non-empty segment, and a binding with a query (`?details=true`)
-    /// is preferred over the same path without it. Broker-initiated
-    /// deliveries are never matched.
+    /// is preferred over the same path without it, and `HEAD` is the `GET`
+    /// operation. Broker-initiated deliveries are never matched.
     ///
     /// ```
     /// use antares_ops::OperationId;
     /// assert_eq!(OperationId::of("GET", "/ngsi-ld/v1/types", Some("details=true")),
     ///            Some(OperationId::RetrieveEntityTypeDetails));
     /// assert_eq!(OperationId::of("GET", "/ngsi-ld/v1/types", None),
+    ///            Some(OperationId::RetrieveEntityTypes));
+    /// assert_eq!(OperationId::of("HEAD", "/ngsi-ld/v1/types", None),
     ///            Some(OperationId::RetrieveEntityTypes));
     /// assert_eq!(OperationId::of("GET", "/q/health", None), None);
     /// ```
@@ -474,7 +564,10 @@ impl<'a> Binding<'a> {
     }
 
     fn matches(&self, method: &str, path: &str, query: Option<&str>) -> bool {
-        self.methods.split('|').any(|m| m == method)
+        // TS 104 176 6.3.2: HEAD is recognised wherever GET is.
+        self.methods
+            .split('|')
+            .any(|m| m == method || (m == "GET" && method == "HEAD"))
             && self
                 .paths
                 .iter()

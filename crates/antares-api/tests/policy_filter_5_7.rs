@@ -238,6 +238,31 @@ async fn a_hidden_entity_is_a_resource_not_found() {
     );
 }
 
+/// 5.7.1.4 and ADR-0023 rule 3 for Retrieve Attribute (10.4.4): an
+/// Attribute of an Entity outside the narrowing is the Attribute of an
+/// absent Entity, value and all, never served because the Attribute itself
+/// is visible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attribute_of_a_hidden_entity_is_a_resource_not_found() {
+    let st = state(slow()).await;
+    seed(&st).await;
+    for suffix in ["", "/value"] {
+        let shown = format!("/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:slow/attrs/speed{suffix}");
+        let (code, body) = send(&st, "GET", &shown, None).await;
+        assert_eq!(code, StatusCode::OK, "{shown}: {body}");
+        let hidden = format!("/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:fast/attrs/speed{suffix}");
+        let absent = format!("/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:none/attrs/speed{suffix}");
+        let (code, hid) = send(&st, "GET", &hidden, None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{hidden}: {hid}");
+        let (_, abs) = send(&st, "GET", &absent, None).await;
+        assert_eq!(
+            hid.to_string().replace("fast", "X"),
+            abs.to_string().replace("none", "X"),
+            "{hidden} answers apart from an absent Entity"
+        );
+    }
+}
+
 /// 6.5.3.1 `omit`: "the listed Entity members are removed from the Entity",
 /// on every document the operation serves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -393,6 +418,57 @@ async fn the_narrowing_reaches_the_batch_query() {
         ids(&list),
         vec!["urn:ngsi-ld:Vehicle:slow".to_owned()],
         "{list}"
+    );
+}
+
+/// ADR-0023 rule 8, read for every narrowing: the history served is that
+/// of the Entities the narrowing selects now. `fast` was at 10 on
+/// 2026-01-01 and is at 90 now, so its history is hidden by `speed<50`
+/// however slow it once was; its retrieve answers as an absent one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_history_is_served_only_for_entities_the_narrowing_selects_now() {
+    let st = state(slow()).await;
+    seed(&st).await;
+    seed_history(&st).await;
+    let (code, list) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after&timeAt=1970-01-01T00:00:00Z",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(
+        ids(&list),
+        vec!["urn:ngsi-ld:Vehicle:slow".to_owned()],
+        "{list}"
+    );
+    let (code, body) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Vehicle:slow",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (code, hid) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Vehicle:fast",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{hid}");
+    let (_, abs) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Vehicle:none",
+        None,
+    )
+    .await;
+    assert_eq!(
+        hid.to_string().replace("fast", "X"),
+        abs.to_string().replace("none", "X")
     );
 }
 
@@ -1248,6 +1324,23 @@ async fn a_filter_geo_q_narrows_the_temporal_query() {
         sorted_ids(&st, base).await,
         ["urn:ngsi-ld:Vehicle:at0", "urn:ngsi-ld:Vehicle:at1"]
     );
+    // the retrieve of one held only temporally reads the same area
+    let (code, body) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Vehicle:at1",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let (code, body) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Vehicle:at3",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(
         sorted_ids(&st, &format!("{base}&{}", box_query(0.5, 3.5))).await,
         ["urn:ngsi-ld:Vehicle:at1"]
@@ -1391,4 +1484,104 @@ async fn a_q_term_on_a_visible_attribute_answers_as_before() {
         sorted_ids(&st, "/ngsi-ld/v1/entities?type=Person&q=salary%3E0").await,
         ["urn:ngsi-ld:Person:open", "urn:ngsi-ld:Person:shut"],
     );
+}
+
+fn enc(q: &str) -> String {
+    q.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// The status and the problem title a caller `q` meets on the entity, the
+/// temporal and the batch query.
+async fn verdicts(st: &AppState, q: &str) -> Vec<(StatusCode, Value)> {
+    let mut out = Vec::new();
+    for uri in [
+        format!("/ngsi-ld/v1/entities?type=Vehicle&q={}", enc(q)),
+        format!(
+            "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after&timeAt=1970-01-01T00:00:00Z&q={}",
+            enc(q)
+        ),
+    ] {
+        let (code, doc) = send(st, "GET", &uri, None).await;
+        out.push((code, doc.get("title").cloned().unwrap_or(Value::Null)));
+    }
+    let (code, doc) = send(
+        st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/query",
+        Some(json!({"type": "Query", "entities": [{"type": "Vehicle"}], "q": q})),
+    )
+    .await;
+    out.push((code, doc.get("title").cloned().unwrap_or(Value::Null)));
+    out
+}
+
+/// `MAX_Q_NODES` (512) counts the caller's `q` alone through a narrowing
+/// engine (threat V23): with the engine's own `q` joined and a term on the
+/// Attribute it omits rewritten as `(colour;!colour)`, a `q` meets the
+/// verdict it meets with no engine at all, at the cap and one past it, so
+/// the cap is an oracle neither on the engine's predicate nor on "hidden".
+#[tokio::test]
+async fn the_q_node_cap_counts_the_callers_q_alone() {
+    const MAX_Q_NODES: usize = 512;
+    let open = AppState::new("me".into());
+    let narrowed = state(Filter {
+        omit: vec!["colour".into()],
+        ..slow()
+    })
+    .await;
+    seed(&open).await;
+    seed(&narrowed).await;
+    for (term, terms) in [
+        ("a==1", MAX_Q_NODES - 1),
+        ("a==1", MAX_Q_NODES),
+        ("colour==\"red\"", 170),
+        ("colour==\"red\"", 270),
+    ] {
+        let q = vec![term; terms].join("|");
+        let want = verdicts(&open, &q).await;
+        let ok = terms < MAX_Q_NODES;
+        assert!(
+            want.iter().all(|(code, _)| code.is_success() == ok),
+            "{terms} x {term} with no engine: {want:?}"
+        );
+        assert_eq!(verdicts(&narrowed, &q).await, want, "{terms} x {term}");
+    }
+}
+
+/// The share of the narrowed caps an engine's `q` may take is judged on
+/// the engine's `q` alone: past it every caller meets the same refusal,
+/// the one with no `q` as much as the one with the longest.
+#[tokio::test]
+async fn an_engine_q_past_its_share_is_refused_whatever_the_caller_asks() {
+    let leaf = antares_ql::parse_q("speed<50").expect("q");
+    let st = state(Filter {
+        q: Some(Box::new(antares_ql::QNode::Or(vec![leaf; 4096]))),
+        ..Filter::default()
+    })
+    .await;
+    let none = send(&st, "GET", "/ngsi-ld/v1/entities?type=Vehicle", None).await;
+    assert!(!none.0.is_success(), "{none:?}");
+    for q in ["speed==1".to_owned(), vec!["a==1"; 511].join("|")] {
+        let (code, doc) = send(
+            &st,
+            "GET",
+            &format!("/ngsi-ld/v1/entities?type=Vehicle&q={}", enc(&q)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            (code, doc.get("title")),
+            (none.0, none.1.get("title")),
+            "{doc} vs {}",
+            none.1
+        );
+    }
 }

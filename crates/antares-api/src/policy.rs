@@ -47,13 +47,16 @@ pub type DecisionsFuture<'a> = Pin<Box<dyn Future<Output = Vec<Decision>> + Send
 /// either way — failing closed at 250 ms is the difference between a 403
 /// and a broker that stops accepting.
 pub static TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
-    let ms = std::env::var("ANTARES_POLICY_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n: &u64| *n > 0)
-        .unwrap_or(250);
-    Duration::from_millis(ms)
+    let env = std::env::var("ANTARES_POLICY_TIMEOUT_MS").ok();
+    Duration::from_millis(timeout_ms(env.as_deref()))
 });
+
+/// `ANTARES_POLICY_TIMEOUT_MS` in milliseconds: a positive integer, else 250.
+fn timeout_ms(env: Option<&str>) -> u64 {
+    env.and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(250)
+}
 
 /// The reasons the seam denies on its own, rather than on an engine's word.
 /// Fixed strings: they reach the client in a ProblemDetails `detail`, and
@@ -554,6 +557,16 @@ impl Filter {
             Ok(own) => own.map(|own| self.hide_terms(own, ctx)),
             Err(_) => return Err(Denied(ENGINE_FAILED.to_owned())),
         };
+        // threat V23: the policy part is held to its share of the narrowed
+        // caps on its own, so whether it fits never depends on the caller's
+        // `q` (see `antares_ql::parse_narrowed_q`)
+        if self
+            .q
+            .as_deref()
+            .is_some_and(|q| !antares_ql::fits_policy_q(q))
+        {
+            return Err(Denied(ENGINE_FAILED.to_owned()));
+        }
         let narrowed = match (own, &self.q) {
             (Some(own), Some(extra)) => Some(QNode::And(vec![own, (**extra).clone()])),
             (own, extra) => own.or_else(|| extra.as_deref().cloned()),
@@ -715,6 +728,30 @@ pub trait PolicyEngine: Send + Sync {
         sub: &Value,
         notification: &mut Value,
     ) -> NotifyDecision;
+
+    /// Whether the engine reads rule documents through
+    /// [`load`](Self::load) (ADR-0020 amendment). No by default: `/q/policy`
+    /// then answers 404, as it does for a broker without an engine.
+    fn loads_documents(&self) -> bool {
+        false
+    }
+
+    /// Take `document` as the rule document of `tenant`, or drop that
+    /// Tenant's document when it is `Value::Null`. An `Err` leaves the
+    /// engine as it was: the previous document keeps deciding. The reason
+    /// goes back to the admin caller who wrote the document and nowhere
+    /// else, so it may name parts of it. The default refuses every
+    /// document.
+    ///
+    /// # Errors
+    /// Why the engine refuses the document.
+    fn load(&self, tenant: &str, document: &Value) -> Result<(), String> {
+        let _ = (tenant, document);
+        Err(format!(
+            "the policy engine {:?} reads no rule documents",
+            self.name()
+        ))
+    }
 }
 
 /// The name of the engine the broker ships, which is also the name
@@ -892,6 +929,45 @@ pub async fn decide_each(
         .collect()
 }
 
+/// Whether any request of each of `clauses` could be allowed for the caller
+/// of `headers`: one batch-shaped probe a surface lists its operations by
+/// (MCP D-3), never a decision on a request. Each clause is asked as an
+/// Operation that names nothing, through [`decide_each`], so it fails
+/// closed the same way (a panic, a timeout or a short answer hides every
+/// clause), and a narrowing on a clause that cannot be narrowed hides it.
+/// With no engine attached every clause is offered.
+// ponytail: no `PolicyEngine::offers` hook; an engine that has to answer a
+// probe differently from an empty Operation gets one when it exists.
+pub async fn offers(
+    engine: Option<&dyn PolicyEngine>,
+    tenant: &antares_model::TenantId,
+    headers: &HeaderMap,
+    clauses: &[&'static str],
+) -> Vec<bool> {
+    let Some(engine) = engine else {
+        return vec![true; clauses.len()];
+    };
+    let ops: Vec<Operation<'_>> = clauses
+        .iter()
+        .map(|clause| Operation {
+            clause,
+            ids: &[],
+            types: &[],
+            attrs: &[],
+            q: None,
+            scope_q: None,
+            geo: None,
+            body: None,
+            stored: None,
+        })
+        .collect();
+    decide_each(engine, &subject_of(tenant, headers), &ops)
+        .await
+        .into_iter()
+        .map(|d| !matches!(d, Decision::Deny(_)))
+        .collect()
+}
+
 /// Ask the engine about one notification, and fail closed: an engine that
 /// panics drops the notification. The document it was handed may already be
 /// half-edited, and the broker cannot know which half — so it is not sent.
@@ -1001,6 +1077,29 @@ pub(crate) async fn pre_image(
         .await
         .ok()
         .flatten();
+    image(stored, body)
+}
+
+/// The [`PreImage`] of a temporal write by id (5.6.12 to 5.6.16, T-3607):
+/// the Entity's temporal evolution, which a history-only Entity has
+/// without a current state, else its current state. Read only with an
+/// engine attached, as [`pre_image`].
+pub(crate) async fn temporal_pre_image(
+    st: &crate::state::AppState,
+    tenant: &antares_model::TenantId,
+    id: &str,
+) -> PreImage {
+    if st.policy.is_none() {
+        return PreImage::default();
+    }
+    match st.temporal.get(tenant, id).await.ok().flatten() {
+        Some(evolution) => image(Some(evolution), None),
+        None => pre_image(st, tenant, id, None).await,
+    }
+}
+
+/// The image of a stored document, with the types the body adds.
+fn image(stored: Option<Value>, body: Option<&Value>) -> PreImage {
     let mut types: Vec<String> = Vec::new();
     for doc in stored.as_ref().into_iter().chain(body) {
         for t in entity_types(doc) {
@@ -1087,7 +1186,7 @@ pub async fn gate(
     }
 }
 
-/// [`gate`] for a batch: the refusal reason of each member, `None` where
+/// [`gate`](fn@gate) for a batch: the refusal reason of each member, `None` where
 /// the member is allowed. A batch writes its members whole, so a `Filter`
 /// on a member is a refusal ([`resolve`]: no batch clause is FILTERABLE).
 pub async fn gate_each(
@@ -1755,5 +1854,237 @@ mod tests {
             }
         );
         assert!(!printed.contains("BB-123-XY"), "{printed}");
+    }
+
+    /// T-3552: the policy survivors of mutants run 38073511508.
+    #[test]
+    fn the_timeout_takes_a_positive_integer_or_falls_back() {
+        assert_eq!(timeout_ms(None), 250);
+        assert_eq!(timeout_ms(Some("0")), 250, "zero would deny every request");
+        assert_eq!(timeout_ms(Some("x")), 250);
+        assert_eq!(timeout_ms(Some("1")), 1);
+        assert_eq!(timeout_ms(Some("300")), 300);
+    }
+
+    #[test]
+    fn a_single_string_counts_as_a_one_element_list() {
+        let doc = json!({"type": "T", "scope": "/a"});
+        assert_eq!(entity_types(&doc), ["T"]);
+        assert_eq!(StoredImage::of(&doc).scope, ["/a"]);
+        let listed = json!({"type": ["T", "U"], "scope": ["/a", "/b"]});
+        assert_eq!(entity_types(&listed), ["T", "U"]);
+        assert_eq!(StoredImage::of(&listed).scope, ["/a", "/b"]);
+    }
+
+    #[test]
+    fn an_operation_logs_its_shape_and_never_its_payload() {
+        let op = Operation::new("5.6.1");
+        let shown = format!("{op:?}");
+        assert!(shown.starts_with("Operation {"), "{shown}");
+        assert!(shown.contains("clause: \"5.6.1\""), "{shown}");
+        assert!(shown.contains("ids: 0"), "{shown}");
+    }
+
+    #[test]
+    fn a_rule_is_conditional_on_any_one_of_its_conditions() {
+        let plain = rule("Car", &["speed"]);
+        assert!(!plain.is_conditional());
+        let q = Rule {
+            q: Some(Box::new(antares_ql::parse_q("speed>1").expect("q"))),
+            ..plain.clone()
+        };
+        let scope = Rule {
+            scope_q: Some("/a".to_owned()),
+            ..plain.clone()
+        };
+        assert!(q.is_conditional() && scope.is_conditional());
+    }
+
+    #[test]
+    fn shown_nothing_admits_no_attribute() {
+        let nothing = Shown::nothing();
+        assert_eq!(nothing.only, Some(Default::default()));
+        assert!(!nothing.allows(&iri("name")));
+    }
+
+    #[test]
+    fn a_write_is_refused_only_for_the_attribute_its_type_omits() {
+        let ctx = ctx();
+        let f = Filter {
+            omit_by_type: BTreeMap::from([(iri("User"), vec![iri("status")])]),
+            ..Filter::default()
+        };
+        let user = json!({"id": "urn:x", "type": [iri("User")]});
+        assert!(f.admits_write(&user, &[iri("name").as_str()], &ctx));
+        assert!(!f.admits_write(&user, &[iri("status").as_str()], &ctx));
+    }
+
+    /// T-3552 (mutants run 38081990103): the image of a stored Entity names
+    /// its Attributes, never what frames, dates or annotates it.
+    #[test]
+    fn a_stored_image_names_attributes_only() {
+        let doc = json!({"id": "urn:ngsi-ld:Car:1", "type": [iri("Car")], "scope": ["/a"],
+                         "createdAt": "t", "modifiedAt": "t", "deletedAt": "t",
+                         "@context": [], "__tenant": "acme",
+                         (iri("speed")): [{"type": "Property", "value": 1}]});
+        let image = StoredImage::of(&doc);
+        assert_eq!(image.types, vec![iri("Car")]);
+        assert_eq!(image.scope, vec!["/a".to_owned()]);
+        assert_eq!(image.attribute_names, vec![iri("speed")]);
+    }
+
+    #[test]
+    fn mapping_the_names_maps_both_sets() {
+        let shown = Shown {
+            only: Some(std::collections::BTreeSet::from(["a".to_owned()])),
+            omitted: std::collections::BTreeSet::from(["b".to_owned()]),
+        };
+        let mapped = shown.map_names(str::to_uppercase);
+        assert_eq!(
+            mapped.only,
+            Some(std::collections::BTreeSet::from(["A".to_owned()]))
+        );
+        assert_eq!(
+            mapped.omitted,
+            std::collections::BTreeSet::from(["B".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_filter_says_its_areas_its_rules_and_its_restriction() {
+        let both = Filter {
+            geo_q: Some(zone_a()),
+            geo_also: vec![*zone_a()],
+            ..Filter::default()
+        };
+        assert_eq!(both.areas().count(), 2);
+        let also = Filter {
+            geo_also: vec![*zone_a()],
+            ..Filter::default()
+        };
+        assert_eq!(also.areas().count(), 1);
+        assert!(!also.is_empty());
+
+        assert!(!Filter::default().has_rules());
+        assert!(zones().has_rules(), "rules alone");
+        let omits = Filter {
+            omit_by_type: BTreeMap::from([(iri("User"), vec![iri("status")])]),
+            ..Filter::default()
+        };
+        assert!(omits.has_rules(), "per-type omits alone");
+
+        let mut headers = HeaderMap::new();
+        Filter::default().mark_restricted(&mut headers);
+        assert!(headers.get(RESTRICTED_HEADER).is_none());
+        Filter {
+            restricted: true,
+            ..Filter::default()
+        }
+        .mark_restricted(&mut headers);
+        assert_eq!(
+            headers.get(RESTRICTED_HEADER).and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn only_a_pick_or_an_omit_hides_a_term() {
+        let speed = iri("speed");
+        assert!(!Filter::default().hides("speed", &speed));
+        let pick = Filter {
+            pick: vec!["status".into()],
+            ..Filter::default()
+        };
+        assert!(pick.hides("speed", &speed));
+        assert!(!pick.hides("status", &iri("status")));
+        let omit = Filter {
+            omit: vec!["speed".into()],
+            ..Filter::default()
+        };
+        assert!(omit.hides("speed", &speed));
+    }
+
+    /// Refuses upserts, allows the rest; `short` answers one decision
+    /// fewer than it was asked for.
+    struct Batch {
+        short: bool,
+    }
+
+    impl PolicyEngine for Batch {
+        fn name(&self) -> &str {
+            "batch"
+        }
+        fn decide<'a>(&'a self, _s: &'a Subject, o: &'a Operation<'a>) -> DecisionFuture<'a> {
+            Box::pin(std::future::ready(if o.clause == "5.6.8" {
+                Decision::Deny("no upserts".into())
+            } else {
+                Decision::Allow
+            }))
+        }
+        fn decide_each<'a>(
+            &'a self,
+            s: &'a Subject,
+            ops: &'a [Operation<'a>],
+        ) -> DecisionsFuture<'a> {
+            Box::pin(async move {
+                let mut out = Vec::new();
+                for op in ops {
+                    out.push(self.decide(s, op).await);
+                }
+                if self.short {
+                    out.pop();
+                }
+                out
+            })
+        }
+        fn pre_notify(&self, _s: &Subject, _sub: &Value, _n: &mut Value) -> NotifyDecision {
+            NotifyDecision::Deliver
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_answered_member_by_member_and_a_short_answer_denies_all() {
+        let ops = [Operation::new("5.6.7"), Operation::new("5.6.8")];
+        let each = decide_each(&Batch { short: false }, &subject(), &ops).await;
+        assert_eq!(
+            each,
+            vec![Decision::Allow, Decision::Deny("no upserts".into())]
+        );
+        let short = decide_each(&Batch { short: true }, &subject(), &ops).await;
+        assert_eq!(short, vec![Decision::Deny(ENGINE_FAILED.to_owned()); 2]);
+        let gated = gate_each(
+            &Batch { short: false },
+            &antares_model::TenantId::default(),
+            &HeaderMap::new(),
+            &ops,
+        )
+        .await;
+        assert_eq!(gated, vec![None, Some("no upserts".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn the_pre_image_joins_stored_and_written_types_once_each() {
+        let tenant = antares_model::TenantId::default();
+        let id = "urn:ngsi-ld:Car:pre";
+        let stored = json!({"id": id, "type": [iri("Car")],
+                            (iri("speed")): [{"type": "Property", "value": 1}]});
+        let body = json!({"type": [iri("Car"), iri("Vehicle")]});
+        let bare = crate::state::AppState::new("pre-image".into());
+        bare.store
+            .create(&tenant, antares_store::Kind::Entity, id, stored)
+            .await
+            .expect("create");
+        let none = pre_image(&bare, &tenant, id, Some(&body)).await;
+        assert!(
+            none.types.is_empty() && none.stored.is_none(),
+            "no engine, no read"
+        );
+        let st = bare.with_policy(std::sync::Arc::new(AllowAll));
+        let image = pre_image(&st, &tenant, id, Some(&body)).await;
+        assert_eq!(image.types, vec![iri("Car"), iri("Vehicle")]);
+        assert_eq!(
+            image.stored.map(|s| s.attribute_names),
+            Some(vec![iri("speed")])
+        );
     }
 }

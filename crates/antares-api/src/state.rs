@@ -114,10 +114,18 @@ pub struct AppState {
     /// costs about 1.5 ms, which is worth memoizing per state and not worth
     /// paying in a host that never makes an in-process call.
     pub(crate) inbound: Arc<std::sync::OnceLock<axum::Router>>,
+    /// The transport every federation forward asks before the socket
+    /// (ADR-0025 rule 8): shared by every clone, so a state made before the
+    /// transport was registered (the one an `Ops` holds) forwards through it
+    /// too. Empty in vanilla: every forward is HTTP.
+    pub(crate) forward_transport: Arc<std::sync::OnceLock<Arc<dyn crate::ForwardTransport>>>,
     /// The endpoint view every operation through this state is narrowed to
     /// (ADR-0023); `None` serves the NGSI-LD API as it is.
     #[cfg(feature = "views")]
     pub view: Option<Arc<crate::views::CompiledView>>,
+    /// The views this pod serves (ADR-0023 rule 10), shared by every clone.
+    #[cfg(feature = "views")]
+    pub views: Arc<crate::views::ViewTable>,
     /// Bounds-wall rejection counters (exported by /q/health).
     pub limits: Arc<crate::bounds::LimitStats>,
     /// Allocator stats provider (set by the broker; None in tests/wasm).
@@ -137,6 +145,9 @@ pub struct AppState {
     /// boxing a future or arming a timer, so a broker with no engine pays
     /// nothing for the seam.
     pub policy: Option<Arc<dyn crate::policy::PolicyEngine>>,
+    /// The `/q` admin credential ([`AppState::with_admin_auth`]); `None`
+    /// serves `/q` without one, as the broker did before T-3569.
+    pub admin_auth: Option<Arc<crate::admin_auth::AdminAuth>>,
     /// Set the moment SIGTERM arrives, BEFORE the listener stops
     /// accepting — `/q/health` then answers 503 DRAINING so the load balancer
     /// takes this instance out while its socket still works.
@@ -434,14 +445,18 @@ impl AppState {
             ),
             sinks: Arc::new(sinks),
             inbound: Arc::new(std::sync::OnceLock::new()),
+            forward_transport: Arc::new(std::sync::OnceLock::new()),
             #[cfg(feature = "views")]
             view: None,
+            #[cfg(feature = "views")]
+            views: Arc::default(),
             surfaces: Arc::new(vec![Box::new(crate::Admin)]),
             limits: Arc::new(crate::bounds::LimitStats::default()),
             mem_stats: None,
             bus_stats: None,
             egress: Arc::new(crate::egress::Egress::new(egress_policy)),
             policy: None,
+            admin_auth: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_changes: Arc::default(),
             sub_sync: None,
@@ -470,6 +485,15 @@ impl AppState {
         self
     }
 
+    /// Puts every `/q` route except health and readiness (and metrics, when
+    /// `auth` leaves them open) behind `auth`'s bearer secret. Set before
+    /// the router is built: the admin surface reads it when it mounts.
+    #[must_use]
+    pub fn with_admin_auth(mut self, auth: crate::admin_auth::AdminAuth) -> Self {
+        self.admin_auth = Some(Arc::new(auth));
+        self
+    }
+
     /// This state narrowed to `view`: every operation served through the
     /// returned state, and everything it spawns or calls in-process, is
     /// composed with the view (ADR-0023). It shares the store and every
@@ -481,6 +505,109 @@ impl AppState {
         st.view = Some(view);
         st.inbound = Arc::new(std::sync::OnceLock::new());
         st
+    }
+
+    /// Every stored view document (ADR-0023 rule 10), as written.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn view_docs(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.store
+            .list(&view_tenant()?, antares_store::Kind::View)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The stored view document `id`, if there is one.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn view_doc(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
+        self.store
+            .get(&view_tenant()?, antares_store::Kind::View, id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Store view document `id`; `true` when it replaced one. The caller
+    /// validated it: the store keeps what it is given.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn put_view_doc(&self, id: &str, doc: serde_json::Value) -> Result<bool, String> {
+        self.store
+            .upsert(&view_tenant()?, antares_store::Kind::View, id, doc)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove view document `id`; `false` when there was none.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn delete_view_doc(&self, id: &str) -> Result<bool, String> {
+        self.store
+            .delete(&view_tenant()?, antares_store::Kind::View, id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Every stored policy rule document (ADR-0020 amendment), as written.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn policy_docs(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.store
+            .list(&policy_tenant()?, antares_store::Kind::View)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The stored policy rule document of `tenant`, if there is one.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn policy_doc(&self, tenant: &str) -> Result<Option<serde_json::Value>, String> {
+        self.store
+            .get(&policy_tenant()?, antares_store::Kind::View, tenant)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Store the policy rule document of `tenant`; `true` when it replaced
+    /// one. The caller bounded it and the engine took it.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn put_policy_doc(
+        &self,
+        tenant: &str,
+        doc: serde_json::Value,
+    ) -> Result<bool, String> {
+        self.store
+            .upsert(&policy_tenant()?, antares_store::Kind::View, tenant, doc)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove the policy rule document of `tenant`; `false` when there was
+    /// none.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn delete_policy_doc(&self, tenant: &str) -> Result<bool, String> {
+        self.store
+            .delete(&policy_tenant()?, antares_store::Kind::View, tenant)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// The engine `/q/health` reports. No engine reports the built-in name:
@@ -509,6 +636,27 @@ impl AppState {
             None => tracing::warn!("sink registry already shared; binding not registered"),
         }
         self
+    }
+
+    /// Register the transport every federation forward asks before the
+    /// socket (ADR-0025 rule 8, as amended by ADR-0027 section 9). A
+    /// forward it answers `None` for goes over HTTP as before. Every clone
+    /// of this state shares the one slot, before or after this call. The
+    /// transport usually holds such a clone, so it lives as long as the
+    /// state's last clone does: register it in a host that keeps its state
+    /// for the life of the process, as the broker does.
+    ///
+    /// # Errors
+    /// When a transport is already registered: a second one would leave
+    /// the choice between them to registration order.
+    pub fn with_forward_transport(
+        self,
+        transport: Arc<dyn crate::ForwardTransport>,
+    ) -> Result<Self, String> {
+        self.forward_transport
+            .set(transport)
+            .map_err(|_| "a forward transport is already registered".to_owned())?;
+        Ok(self)
     }
 
     /// Mount one more HTTP surface (`/q`, `/x`, or below `/x`). A prefix
@@ -780,6 +928,16 @@ async fn hosted_row_id(
 /// Server-managed timestamp, ISO 8601 UTC with milliseconds.
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[cfg(feature = "views")]
+fn view_tenant() -> Result<antares_model::TenantId, String> {
+    antares_model::TenantId::new_internal(crate::views::VIEW_TENANT).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "views")]
+fn policy_tenant() -> Result<antares_model::TenantId, String> {
+    antares_model::TenantId::new_internal(crate::views::POLICY_TENANT).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -37,6 +37,7 @@
 
 mod error;
 mod operation;
+pub mod views;
 
 pub use error::{Refusal, INNER_DETAIL};
 pub use operation::OperationId;
@@ -48,7 +49,9 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The policy seam's public types (ADR-0020), so a surface names no
 /// `antares-api` item.
@@ -61,6 +64,10 @@ pub mod policy {
 /// The notification sink contract (ADR-0027 section 1), for a surface that
 /// delivers notifications (WebSocket).
 pub use antares_api::{DeliveryError, DeliveryFuture, NotificationSink, Outbound};
+
+/// The federation transport contract (ADR-0025 rule 8, ADR-0027 section 9),
+/// for a crate that serves some forwards in process.
+pub use antares_api::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 
 /// The headers a surface may never set on an operation: the tenant, the
 /// snapshot and the policy subject come from the outer request alone (G2).
@@ -81,6 +88,20 @@ const LOGGED_DETAIL_BYTES: usize = 4096;
 #[derive(Clone)]
 pub struct Ops {
     state: AppState,
+    /// The narrowed handle of each view served so far, so a request does
+    /// not build the narrowed state and its in-process router anew.
+    views: Arc<Mutex<BTreeMap<String, ViewOps>>>,
+}
+
+/// The operations of one loaded view (ADR-0023): every one runs composed
+/// with the view's narrowing, in the view's one Tenant, and only when the
+/// view allows it. Made by [`Ops::view`].
+#[derive(Clone)]
+pub struct ViewOps {
+    inner: Ops,
+    view: Arc<antares_api::views::CompiledView>,
+    tenant: String,
+    operations: Vec<OperationId>,
 }
 
 /// The headers of the request a surface is answering, as the HTTP layer
@@ -158,6 +179,48 @@ impl OpsRequest {
 }
 
 impl Ops {
+    fn new(state: AppState) -> Self {
+        Self {
+            state,
+            views: Arc::default(),
+        }
+    }
+
+    /// The operations of the loaded view `id`, or `None` when no view of
+    /// that id is loaded: an unknown id, a view that failed validation and
+    /// a removed one are the same answer.
+    #[must_use]
+    pub fn view(&self, id: &str) -> Option<ViewOps> {
+        let table = self.state.views.snapshot();
+        let Some(antares_api::views::ViewEntry::Loaded {
+            view,
+            tenant,
+            operations,
+            ..
+        }) = table.get(id)
+        else {
+            return None;
+        };
+        let mut cache = self.views.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hit) = cache.get(id).filter(|c| Arc::ptr_eq(&c.view, view)) {
+            return Some(hit.clone());
+        }
+        let made = ViewOps {
+            inner: Self::new(self.state.with_view(view.clone())),
+            view: view.clone(),
+            tenant: tenant.clone(),
+            operations: operations
+                .iter()
+                .filter_map(|o| OperationId::from_id(o))
+                .collect(),
+        };
+        // Only views loaded now stay cached: a removed one goes with the
+        // first view served after its removal.
+        cache.retain(|k, _| table.contains_key(k));
+        cache.insert(id.to_owned(), made.clone());
+        Some(made)
+    }
+
     /// Run `op` as the caller of the outer request.
     ///
     /// The request must be the operation it names: its method, path and
@@ -204,6 +267,111 @@ impl Ops {
             });
         }
         Err(inner_failure(op, answer).await)
+    }
+}
+
+impl ViewOps {
+    /// Whether the view allows `op`.
+    #[must_use]
+    pub fn allows(&self, op: OperationId) -> bool {
+        self.operations.contains(&op)
+    }
+
+    /// The `LinkML` schema of the view's Tenant as written to
+    /// `/q/schemas/{tenant}`, with its revision, if one is stored (T-3628).
+    /// The surface parses it under its own limits and caches the parse per
+    /// revision; another Tenant's schema never reaches it.
+    #[must_use]
+    pub fn schema(&self) -> Option<(u64, Arc<[u8]>)> {
+        self.inner
+            .state
+            .views
+            .schema(&self.tenant)
+            .map(|s| (s.revision, s.bytes))
+    }
+
+    /// The Entity types and the Attributes the view shows, compacted under
+    /// the core @context, sorted: the names a surface may offer the caller.
+    #[must_use]
+    pub fn shown_names(&self) -> (Vec<String>, Vec<String>) {
+        self.view.shown_names()
+    }
+
+    /// For each of `ops`, whether the view allows it and the policy engine
+    /// could allow a request of it for `caller`, asked in one probe in the
+    /// view's Tenant (MCP D-3). The probe fails closed: an engine that fails
+    /// it offers nothing.
+    pub async fn offered(&self, caller: &Caller, ops: &[OperationId]) -> Vec<bool> {
+        let Ok(tenant) = antares_model::TenantId::new(&self.tenant) else {
+            return vec![false; ops.len()];
+        };
+        let asked: Vec<(usize, &'static str)> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| self.allows(**op))
+            .filter_map(|(i, op)| op.gate_clause().map(|c| (i, c)))
+            .collect();
+        let clauses: Vec<&'static str> = asked.iter().map(|(_, c)| *c).collect();
+        let answers = antares_api::policy::offers(
+            self.inner.state.policy.as_deref(),
+            &tenant,
+            &caller.0,
+            &clauses,
+        )
+        .await;
+        let given: std::collections::HashMap<usize, bool> =
+            asked.iter().map(|(i, _)| *i).zip(answers).collect();
+        (0..ops.len())
+            .map(|i| given.get(&i).copied().unwrap_or(false))
+            .collect()
+    }
+
+    /// Run `op` through the view, as [`Ops::run`] does, in the view's
+    /// Tenant (ADR-0023 rule 10): a caller's `NGSILD-Tenant` naming another
+    /// Tenant is refused, never a switch, and the answer names the Tenant
+    /// only to a caller who named it (threat F4/V18).
+    ///
+    /// # Errors
+    /// [`Refusal::NotAllowed`] when the view does not allow `op`,
+    /// [`Refusal::Malformed`] when the caller names another Tenant, and
+    /// everything [`Ops::run`] refuses.
+    pub async fn run(
+        &self,
+        op: OperationId,
+        caller: &Caller,
+        req: OpsRequest,
+    ) -> Result<Response, Refusal> {
+        const TENANT: HeaderName = HeaderName::from_static("ngsild-tenant");
+        const OTHER: &str = "a view serves one tenant";
+        if !self.allows(op) {
+            return Err(Refusal::NotAllowed { allow: Vec::new() });
+        }
+        let mut sent = caller.0.get_all(&TENANT).iter();
+        let named = match (sent.next(), sent.next()) {
+            (None, _) => false,
+            (Some(one), None) => {
+                let same = one
+                    .to_str()
+                    .ok()
+                    .and_then(|t| antares_model::TenantId::new(t).ok())
+                    .is_some_and(|t| t.as_str() == self.tenant);
+                if !same {
+                    return Err(Refusal::Malformed(OTHER));
+                }
+                true
+            }
+            (Some(_), Some(_)) => return Err(Refusal::Malformed(OTHER)),
+        };
+        let mut headers = caller.0.clone();
+        headers.insert(
+            TENANT,
+            HeaderValue::from_str(&self.tenant).map_err(|_| Refusal::Malformed(OTHER))?,
+        );
+        let mut answer = self.inner.run(op, &Caller(headers), req).await?;
+        if !named {
+            answer.headers_mut().remove(TENANT);
+        }
+        Ok(answer)
     }
 }
 
@@ -258,26 +426,149 @@ pub trait Surface: Send + Sync + 'static {
 /// assert_eq!(mounted.name(), "empty");
 /// ```
 pub fn mount<S: Surface>(surface: S) -> Box<dyn antares_api::ApiSurface> {
-    Box::new(Mounted(surface))
+    Box::new(Mounted {
+        surface,
+        views: std::sync::OnceLock::new(),
+    })
 }
 
-struct Mounted<S>(S);
+/// Register the forward transport `make` builds over the broker's
+/// operations: every federation forward asks it first, and a forward it
+/// does not serve goes over HTTP (ADR-0025 rule 8). The composition root
+/// calls this once, before the state serves.
+///
+/// ```
+/// use antares_ops::{BuiltForward, ForwardFuture, ForwardTransport};
+///
+/// /// Serves nothing: every forward stays HTTP.
+/// struct Nothing;
+///
+/// impl ForwardTransport for Nothing {
+///     fn forward<'a>(&'a self, _req: BuiltForward<'a>) -> Option<ForwardFuture<'a>> {
+///         None
+///     }
+/// }
+///
+/// let transport: std::sync::Arc<dyn ForwardTransport> = std::sync::Arc::new(Nothing);
+/// # let _ = transport;
+/// ```
+///
+/// # Errors
+/// When a transport is already registered.
+pub fn with_forward_transport(
+    state: AppState,
+    make: impl FnOnce(Ops) -> Arc<dyn ForwardTransport>,
+) -> Result<AppState, String> {
+    let transport = make(Ops::new(state.clone()));
+    state.with_forward_transport(transport)
+}
+
+impl Ops {
+    /// Serve the forward `req` through this broker's own router, in process
+    /// (ADR-0025 rule 2). `self_url` is the self URL its endpoint starts
+    /// with; the rest of its target is the path the router serves. The
+    /// inner request carries the forward's headers and payload and nothing
+    /// else of the triggering request: the caller map is its subject headers
+    /// alone (rules 2 and 4), so a registration without a `tenant` lands in
+    /// the default Tenant and a snapshot is never inherited. The answer is
+    /// read as an HTTP one is: the body up to the federation response cap,
+    /// the source's `NGSILD-Warning` values up to their cap.
+    pub async fn forward_in_process(&self, req: BuiltForward<'_>, self_url: &str) -> ForwardAnswer {
+        // A target outside `self_url` is the transport's mistake, and a
+        // header 5.9.2 let through that HTTP could not send either: the
+        // forward is not made in process, and the answer says so (502).
+        let inner = req
+            .target()
+            .and_then(|target| {
+                target
+                    .strip_prefix(self_url)
+                    .filter(|rest| rest.starts_with('/'))
+                    .map(str::to_owned)
+            })
+            .and_then(|path| {
+                let mut inner = axum::http::Request::builder()
+                    .method(req.method().clone())
+                    .uri(path);
+                for (name, value) in req.headers() {
+                    inner = inner.header(name.as_str(), value.as_str());
+                }
+                // The HTTP client states the length of what it sends.
+                let body = match req.body() {
+                    Some(bytes) => {
+                        inner = inner.header(axum::http::header::CONTENT_LENGTH, bytes.len());
+                        Body::from(bytes.to_vec())
+                    }
+                    None => Body::empty(),
+                };
+                inner.body(body).ok()
+            });
+        let Some(inner) = inner else {
+            return (502, serde_json::Value::Null, Vec::new());
+        };
+        let answer = self.state.call(req.subject(), inner).await;
+        let status = answer.status().as_u16();
+        let warnings = answer
+            .headers()
+            .get_all("ngsild-warning")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .take(antares_api::bounds::MAX_PEER_WARNINGS)
+            .collect();
+        let cap = *antares_api::bounds::MAX_FED_RESPONSE_BYTES;
+        let body = axum::body::to_bytes(answer.into_body(), cap)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(serde_json::Value::Null);
+        (status, body, warnings)
+    }
+}
+
+/// A surface as the broker mounts it: closed, every route 404, while no
+/// view is loaded (rule M4), and reported so in `/q/health`.
+struct Mounted<S> {
+    surface: S,
+    /// The table of the state it was mounted on, for `version_info`.
+    views: std::sync::OnceLock<std::sync::Arc<antares_api::views::ViewTable>>,
+}
 
 impl<S: Surface> antares_api::ApiSurface for Mounted<S> {
     fn name(&self) -> &str {
-        self.0.name()
+        self.surface.name()
     }
 
     fn prefix(&self) -> &str {
-        self.0.prefix()
+        self.surface.prefix()
     }
 
     fn router(&self, st: AppState) -> Router<AppState> {
-        self.0.router(Ops { state: st }).with_state(())
+        let table = st.views.clone();
+        // The first state it is mounted on is the one /q/health reports.
+        let _ = self.views.set(table.clone());
+        self.surface
+            .router(Ops::new(st))
+            .layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let open = table.any_loaded();
+                    async move {
+                        if open {
+                            next.run(req).await
+                        } else {
+                            Refusal::Closed.ngsi_ld()
+                        }
+                    }
+                },
+            ))
+            .with_state(())
     }
 
     fn version_info(&self) -> serde_json::Value {
-        self.0.version_info()
+        let info = self.surface.version_info();
+        if self.views.get().is_some_and(|t| t.any_loaded()) {
+            serde_json::json!({"state": "open", "info": info})
+        } else {
+            serde_json::json!({"state": "closed", "reason": "no view is loaded", "info": info})
+        }
     }
 }
 
@@ -291,21 +582,85 @@ pub mod test_kit {
     /// test mounts, over one in-memory store.
     pub struct TestBroker {
         state: AppState,
+        reload: crate::views::Reload,
     }
 
     impl TestBroker {
-        /// A wired broker with no policy engine.
-        pub async fn new() -> Self {
+        /// A wired broker with no policy engine, its view table loaded and
+        /// `/q/views` served.
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn new() -> Result<Self, String> {
             let mut state = AppState::new("antares-test".into());
             antares_api::wire(&mut state).await;
-            Self { state }
+            let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
         }
 
-        /// The same broker asking `engine` (ADR-0020).
+        /// Another pod over the same store: its own view table, loaded and
+        /// reloaded from the store like this one's.
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn sibling(&self) -> Result<Self, String> {
+            let mut state = AppState::new("antares-test".into());
+            state.store = self.state.store.clone();
+            antares_api::wire(&mut state).await;
+            let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
+        }
+
+        /// The same broker asking `engine` (ADR-0020). Its view table was
+        /// loaded before: `/q/policy` keeps answering as without an engine.
         #[must_use]
         pub fn with_policy(self, engine: Arc<dyn super::policy::PolicyEngine>) -> Self {
             Self {
                 state: self.state.with_policy(engine),
+                reload: self.reload,
+            }
+        }
+
+        /// The same broker with `/q` behind the admin credential (T-3569).
+        #[must_use]
+        pub fn with_admin_auth(self, auth: antares_api::admin_auth::AdminAuth) -> Self {
+            Self {
+                state: self.state.with_admin_auth(auth),
+                reload: self.reload,
+            }
+        }
+
+        /// Store a view document as it is, past `/q/views`' validation (what
+        /// another version or a hand edit may have left in the store), and
+        /// reload this broker's table.
+        ///
+        /// # Errors
+        /// The store's.
+        pub async fn store_view_doc(&self, id: &str, doc: serde_json::Value) -> Result<(), String> {
+            self.state.put_view_doc(id, doc).await?;
+            self.reload.now().await
+        }
+
+        /// Rebuild this broker's table from the store now, as its interval
+        /// would after another pod's write.
+        ///
+        /// # Errors
+        /// The store's.
+        pub async fn reload_now(&self) -> Result<(), String> {
+            self.reload.now().await
+        }
+
+        /// The NGSI-LD API narrowed by the loaded view `id`: every operation
+        /// composed with it as the view root will serve it (ADR-0023).
+        ///
+        /// # Errors
+        /// When `id` is not a loaded view.
+        pub fn serve_view(&self, id: &str) -> Result<axum::Router, String> {
+            match self.state.views.snapshot().get(id) {
+                Some(antares_api::views::ViewEntry::Loaded { view, .. }) => {
+                    Ok(antares_api::router(self.state.with_view(view.clone())))
+                }
+                _ => Err(format!("{id:?} is not a loaded view")),
             }
         }
 
