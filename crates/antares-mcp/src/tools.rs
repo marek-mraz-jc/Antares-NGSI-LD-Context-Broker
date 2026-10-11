@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! The read tools (MCP 3.5, rows 15 to 18, 21, 22 and 24 to 32): each is
-//! one row of the operation matrix, and a call is one NGSI-LD request of
-//! that operation, built from checked arguments only. Write tools come with
-//! T-3514.
+//! The tools (MCP 3.5, 32 rows): each is one row of the operation matrix,
+//! and a call is one NGSI-LD request of that operation, built from checked
+//! arguments only. A write tool runs only after the person confirmed the
+//! call (MCP 3.4, `crate::confirm`).
 
 use crate::schema::{opt, req, Arg, Args, Checked, Kind};
 use antares_ops::OperationId;
@@ -20,6 +20,8 @@ pub(crate) struct ToolDef {
     pub key: &'static str,
     /// Whether the answer is a list paged with `limit` and `cursor`.
     pub paged: bool,
+    /// Whether the tool writes, and so asks the person first (MCP 3.4).
+    pub write: bool,
 }
 
 const GEOMETRIES: &[&str] = &[
@@ -132,8 +134,139 @@ const ATTR_VALUE: &[Arg] = &[req("id", Kind::Id), req("attrId", Kind::Attr)];
 const TYPE_ONLY: &[Arg] = &[req("type", Kind::Type)];
 const ATTR_ONLY: &[Arg] = &[req("attrId", Kind::Attr)];
 
-/// Every read tool, sorted by name (2026-07-28: a deterministic order).
-pub(crate) const TOOLS: [ToolDef; 15] = [
+const ENTITY_ID: &[Arg] = &[req("id", Kind::Id)];
+const ENTITY: &[Arg] = &[req("entity", Kind::Entity)];
+const REPLACE: &[Arg] = &[req("id", Kind::Id), req("entity", Kind::Entity)];
+const ATTRIBUTES: &[Arg] = &[req("id", Kind::Id), req("attributes", Kind::Fragment)];
+const APPEND: &[Arg] = &[
+    req("id", Kind::Id),
+    req("attributes", Kind::Fragment),
+    opt("noOverwrite", Kind::Flag),
+];
+const MERGE: &[Arg] = &[req("id", Kind::Id), req("fragment", Kind::Fragment)];
+const ONE_ATTRIBUTE: &[Arg] = &[
+    req("id", Kind::Id),
+    req("attrId", Kind::Attr),
+    req("attribute", Kind::Attribute),
+];
+const DELETE_ATTRIBUTE: &[Arg] = &[
+    req("id", Kind::Id),
+    req("attrId", Kind::Attr),
+    opt("datasetId", Kind::Text(512)),
+    opt("deleteAll", Kind::Flag),
+];
+const BATCH: &[Arg] = &[req("entities", Kind::Entities)];
+const BATCH_UPSERT: &[Arg] = &[
+    req("entities", Kind::Entities),
+    opt("options", Kind::Word(&["update", "replace"])),
+];
+const BATCH_UPDATE: &[Arg] = &[
+    req("entities", Kind::Entities),
+    opt("noOverwrite", Kind::Flag),
+];
+const BATCH_DELETE: &[Arg] = &[req("ids", Kind::Ids)];
+
+/// A notification endpoint: one the deployment allows (MC12).
+const ENDPOINT: &[Arg] = &[
+    req("uri", Kind::Endpoint),
+    opt(
+        "accept",
+        Kind::Word(&["application/json", "application/ld+json"]),
+    ),
+];
+const NOTIFICATION: &[Arg] = &[
+    opt("attributes", Kind::Attrs),
+    opt(
+        "format",
+        Kind::Word(&["normalized", "concise", "keyValues"]),
+    ),
+    req("endpoint", Kind::Object(ENDPOINT)),
+];
+const SELECTOR: &[Arg] = &[
+    req("type", Kind::Type),
+    opt("id", Kind::Id),
+    opt("idPattern", Kind::Text(256)),
+];
+/// The members a Subscription made through a tool may carry (5.2.12).
+const SUBSCRIPTION: &[Arg] = &[
+    req("type", Kind::Word(&["Subscription"])),
+    opt("subscriptionName", Kind::Text(256)),
+    opt("description", Kind::Text(1024)),
+    opt("entities", Kind::ListOf(SELECTOR, 50)),
+    opt("watchedAttributes", Kind::Attrs),
+    opt("q", Kind::Text(4096)),
+    req("notification", Kind::Object(NOTIFICATION)),
+    opt("expiresAt", Kind::Text(64)),
+    opt("throttling", Kind::Int(0, 86_400)),
+    opt("isActive", Kind::Flag),
+];
+/// [`SUBSCRIPTION`], each member optional.
+const SUBSCRIPTION_FRAGMENT: &[Arg] = &[
+    opt("subscriptionName", Kind::Text(256)),
+    opt("description", Kind::Text(1024)),
+    opt("entities", Kind::ListOf(SELECTOR, 50)),
+    opt("watchedAttributes", Kind::Attrs),
+    opt("q", Kind::Text(4096)),
+    opt("notification", Kind::Object(NOTIFICATION)),
+    opt("expiresAt", Kind::Text(64)),
+    opt("throttling", Kind::Int(0, 86_400)),
+    opt("isActive", Kind::Flag),
+];
+const CREATE_SUBSCRIPTION: &[Arg] = &[req("subscription", Kind::Object(SUBSCRIPTION))];
+const UPDATE_SUBSCRIPTION: &[Arg] = &[
+    req("id", Kind::Text(512)),
+    req("fragment", Kind::Object(SUBSCRIPTION_FRAGMENT)),
+];
+
+/// A write tool: one call changes data, after the person confirmed it.
+const fn write(
+    name: &'static str,
+    op: OperationId,
+    description: &'static str,
+    args: &'static [Arg],
+    key: &'static str,
+) -> ToolDef {
+    ToolDef {
+        name,
+        op,
+        description,
+        args,
+        key,
+        paged: false,
+        write: true,
+    }
+}
+
+/// Every tool, sorted by name (2026-07-28: a deterministic order).
+pub(crate) const TOOLS: [ToolDef; 32] = [
+    write(
+        "append_attributes",
+        OperationId::AppendAttributes,
+        "Append Attributes to one Entity (TS 104 175 10.2.4); noOverwrite keeps those it has. The tool asks the person to confirm before it writes.",
+        APPEND,
+        "result",
+    ),
+    write(
+        "batch_create",
+        OperationId::BatchCreate,
+        "Create several Entities (TS 104 175 10.3.2). The tool asks the person to confirm before it writes.",
+        BATCH,
+        "result",
+    ),
+    write(
+        "batch_delete",
+        OperationId::BatchDelete,
+        "Delete several Entities by id (TS 104 175 10.3.6). The tool asks the person to confirm before it writes.",
+        BATCH_DELETE,
+        "result",
+    ),
+    write(
+        "batch_merge",
+        OperationId::BatchMerge,
+        "Merge into several Entities (TS 104 175 10.3.5). The tool asks the person to confirm before it writes.",
+        BATCH,
+        "result",
+    ),
     ToolDef {
         name: "batch_query",
         op: OperationId::QueryEntitiesPost,
@@ -141,6 +274,7 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: BATCH_QUERY,
         key: "entities",
         paged: true,
+        write: false,
     },
     ToolDef {
         name: "batch_query_temporal",
@@ -149,7 +283,57 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: TEMPORAL_QUERY,
         key: "entities",
         paged: true,
+        write: false,
     },
+    write(
+        "batch_update",
+        OperationId::BatchUpdate,
+        "Update Attributes of several Entities (TS 104 175 10.3.4). The tool asks the person to confirm before it writes.",
+        BATCH_UPDATE,
+        "result",
+    ),
+    write(
+        "batch_upsert",
+        OperationId::BatchUpsert,
+        "Create several Entities or update those that exist (TS 104 175 10.3.3). The tool asks the person to confirm before it writes.",
+        BATCH_UPSERT,
+        "result",
+    ),
+    write(
+        "create_entity",
+        OperationId::CreateEntity,
+        "Create one Entity (TS 104 175 10.2.2). The tool asks the person to confirm before it writes.",
+        ENTITY,
+        "created",
+    ),
+    write(
+        "create_subscription",
+        OperationId::CreateSubscription,
+        "Subscribe an endpoint the deployment allows to changes of Entities (TS 104 175 10.5.2). The tool asks the person to confirm before it writes.",
+        CREATE_SUBSCRIPTION,
+        "created",
+    ),
+    write(
+        "delete_attribute",
+        OperationId::DeleteAttribute,
+        "Delete one Attribute of one Entity (TS 104 175 10.2.7). The tool asks the person to confirm before it writes.",
+        DELETE_ATTRIBUTE,
+        "result",
+    ),
+    write(
+        "delete_entity",
+        OperationId::DeleteEntity,
+        "Delete one Entity (TS 104 175 10.2.8). The tool asks the person to confirm before it writes.",
+        ENTITY_ID,
+        "result",
+    ),
+    write(
+        "delete_subscription",
+        OperationId::DeleteSubscription,
+        "Delete one Subscription (TS 104 175 10.5.6). The tool asks the person to confirm before it writes.",
+        ID_ONLY,
+        "result",
+    ),
     ToolDef {
         name: "get_attribute",
         op: OperationId::RetrieveAttributeInfo,
@@ -157,6 +341,7 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: ATTR_ONLY,
         key: "attribute",
         paged: false,
+        write: false,
     },
     ToolDef {
         name: "get_attribute_value",
@@ -165,6 +350,7 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: ATTR_VALUE,
         key: "attribute",
         paged: false,
+        write: false,
     },
     ToolDef {
         name: "get_entity",
@@ -173,6 +359,7 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: GET_ENTITY,
         key: "entity",
         paged: false,
+        write: false,
     },
     ToolDef {
         name: "get_subscription",
@@ -181,6 +368,7 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: ID_ONLY,
         key: "subscription",
         paged: false,
+        write: false,
     },
     ToolDef {
         name: "get_type",
@@ -189,6 +377,7 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: TYPE_ONLY,
         key: "entityType",
         paged: false,
+        write: false,
     },
     ToolDef {
         name: "list_attribute_details",
@@ -197,6 +386,7 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: NONE,
         key: "attributes",
         paged: false,
+        write: false,
     },
     ToolDef {
         name: "list_attributes",
@@ -205,6 +395,7 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: NONE,
         key: "attributes",
         paged: false,
+        write: false,
     },
     ToolDef {
         name: "list_subscriptions",
@@ -213,6 +404,7 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: PAGE_ONLY,
         key: "subscriptions",
         paged: true,
+        write: false,
     },
     ToolDef {
         name: "list_type_details",
@@ -221,6 +413,7 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: NONE,
         key: "entityTypes",
         paged: false,
+        write: false,
     },
     ToolDef {
         name: "list_types",
@@ -229,7 +422,15 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: NONE,
         key: "entityTypes",
         paged: false,
+        write: false,
     },
+    write(
+        "merge_entity",
+        OperationId::MergeEntity,
+        "Merge a fragment into one Entity (TS 104 175 10.2.9). The tool asks the person to confirm before it writes.",
+        MERGE,
+        "result",
+    ),
     ToolDef {
         name: "query_entities",
         op: OperationId::QueryEntities,
@@ -237,6 +438,7 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: QUERY,
         key: "entities",
         paged: true,
+        write: false,
     },
     ToolDef {
         name: "query_temporal",
@@ -245,7 +447,22 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: TEMPORAL_QUERY,
         key: "entities",
         paged: true,
+        write: false,
     },
+    write(
+        "replace_attribute",
+        OperationId::ReplaceAttribute,
+        "Replace one Attribute of one Entity (TS 104 175 10.2.11). The tool asks the person to confirm before it writes.",
+        ONE_ATTRIBUTE,
+        "result",
+    ),
+    write(
+        "replace_entity",
+        OperationId::ReplaceEntity,
+        "Replace one Entity whole (TS 104 175 10.2.10). The tool asks the person to confirm before it writes.",
+        REPLACE,
+        "result",
+    ),
     ToolDef {
         name: "retrieve_temporal",
         op: OperationId::TemporalRetrieve,
@@ -253,7 +470,29 @@ pub(crate) const TOOLS: [ToolDef; 15] = [
         args: TEMPORAL_ONE,
         key: "entity",
         paged: false,
+        write: false,
     },
+    write(
+        "update_attribute",
+        OperationId::PartialAttributeUpdate,
+        "Update part of one Attribute of one Entity (TS 104 175 10.2.5). The tool asks the person to confirm before it writes.",
+        ONE_ATTRIBUTE,
+        "result",
+    ),
+    write(
+        "update_attributes",
+        OperationId::UpdateAttributes,
+        "Update Attributes one Entity has (TS 104 175 10.2.3). The tool asks the person to confirm before it writes.",
+        ATTRIBUTES,
+        "result",
+    ),
+    write(
+        "update_subscription",
+        OperationId::UpdateSubscription,
+        "Update one Subscription (TS 104 175 10.5.3). The tool asks the person to confirm before it writes.",
+        UPDATE_SUBSCRIPTION,
+        "result",
+    ),
 ];
 
 /// The tool named `name`.
@@ -328,6 +567,17 @@ fn page(limit: u64, offset: u64) -> [(&'static str, String); 3] {
     ]
 }
 
+/// `c` as the JSON it was given as.
+fn json_of(c: &Checked) -> Value {
+    match c {
+        Checked::Many(list) => json!(list),
+        Checked::Json(j) => j.clone(),
+        Checked::Int(n) => json!(n),
+        Checked::Flag(b) => json!(b),
+        Checked::One(s) => json!(s),
+    }
+}
+
 /// A Query document (5.2.23) of `args`.
 fn query_document(args: &Args, temporal: bool) -> Value {
     let types = text(args.get("type").unwrap_or(&Checked::Many(Vec::new())));
@@ -343,13 +593,7 @@ fn query_document(args: &Args, temporal: bool) -> Value {
     doc.insert("entities".into(), json!(entities));
     let (mut geo, mut time) = (serde_json::Map::new(), serde_json::Map::new());
     for (k, v) in args {
-        let value = match v {
-            Checked::Many(list) => json!(list),
-            Checked::Json(j) => j.clone(),
-            Checked::Int(n) => json!(n),
-            Checked::Flag(b) => json!(b),
-            Checked::One(s) => json!(s),
-        };
+        let value = json_of(v);
         let into = match *k {
             "type" | "id" | "count" | "limit" | "cursor" => continue,
             "georel" | "geometry" | "coordinates" | "geoproperty" => &mut geo,
@@ -375,6 +619,9 @@ pub(crate) fn build(tool: &ToolDef, args: &Args, limit: u64, offset: u64) -> Bui
         body: None,
     };
     let root = "/ngsi-ld/v1";
+    if let Some(built) = build_write(tool, args) {
+        return built;
+    }
     match tool.op {
         OperationId::RetrieveEntity => get(format!(
             "{root}/entities/{}{}",
@@ -436,12 +683,81 @@ pub(crate) fn build(tool: &ToolDef, args: &Args, limit: u64, offset: u64) -> Bui
     }
 }
 
+/// The request of a write tool; `None` for a read tool.
+fn build_write(tool: &ToolDef, args: &Args) -> Option<Built> {
+    let root = "/ngsi-ld/v1";
+    let send = |method: Method, target: String, member: &str| Built {
+        method,
+        target,
+        body: args.get(member).map(json_of),
+    };
+    let entity = |rest: &str| format!("{root}/entities/{}{rest}", encode(one(args, "id")));
+    let attrs = |q: &str| entity(&format!("/attrs{q}"));
+    let attr = |q: String| entity(&format!("/attrs/{}{q}", encode(one(args, "attrId"))));
+    let batch = |what: &str, q: &str| format!("{root}/entityOperations/{what}{q}");
+    let subscription = || format!("{root}/subscriptions/{}", encode(one(args, "id")));
+    let no_overwrite = if args.get("noOverwrite") == Some(&Checked::Flag(true)) {
+        "?options=noOverwrite"
+    } else {
+        ""
+    };
+    Some(match tool.op {
+        OperationId::CreateEntity => send(Method::POST, format!("{root}/entities"), "entity"),
+        OperationId::UpdateAttributes => send(Method::PATCH, attrs(""), "attributes"),
+        OperationId::AppendAttributes => send(Method::POST, attrs(no_overwrite), "attributes"),
+        OperationId::PartialAttributeUpdate => {
+            send(Method::PATCH, attr(String::new()), "attribute")
+        }
+        OperationId::ReplaceAttribute => send(Method::PUT, attr(String::new()), "attribute"),
+        OperationId::DeleteAttribute => Built {
+            method: Method::DELETE,
+            target: attr(query(args, &["id", "attrId"], &[])),
+            body: None,
+        },
+        OperationId::DeleteEntity => Built {
+            method: Method::DELETE,
+            target: entity(""),
+            body: None,
+        },
+        OperationId::MergeEntity => send(Method::PATCH, entity(""), "fragment"),
+        OperationId::ReplaceEntity => send(Method::PUT, entity(""), "entity"),
+        OperationId::BatchCreate => send(Method::POST, batch("create", ""), "entities"),
+        OperationId::BatchUpsert => {
+            let options = query(args, &["entities"], &[]);
+            send(Method::POST, batch("upsert", &options), "entities")
+        }
+        OperationId::BatchUpdate => send(Method::POST, batch("update", no_overwrite), "entities"),
+        OperationId::BatchMerge => send(Method::POST, batch("merge", ""), "entities"),
+        OperationId::BatchDelete => send(Method::POST, batch("delete", ""), "ids"),
+        OperationId::CreateSubscription => send(
+            Method::POST,
+            format!("{root}/subscriptions"),
+            "subscription",
+        ),
+        OperationId::UpdateSubscription => send(Method::PATCH, subscription(), "fragment"),
+        OperationId::DeleteSubscription => Built {
+            method: Method::DELETE,
+            target: subscription(),
+            body: None,
+        },
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn args(pairs: &[(&'static str, Checked)]) -> Args {
         pairs.iter().cloned().collect()
+    }
+
+    #[test]
+    fn a_write_tool_writes_and_never_pages() {
+        // `write` runs at compile time in `TOOLS`; once here at run time
+        let t = write("x", OperationId::DeleteEntity, "d", ENTITY_ID, "result");
+        assert_eq!((t.write, t.paged), (true, false));
+        assert_eq!(TOOLS.iter().filter(|t| t.write).count(), 17);
     }
 
     #[test]
@@ -490,14 +806,16 @@ mod tests {
             ("limit", Checked::Int(5)),
             ("cursor", Checked::One("ab".into())),
         ]);
-        let b = build(&TOOLS[12], &a, 5, 40);
+        let target = |name: &str, a: &Args, limit, offset| {
+            named(name).map(|t| build(t, a, limit, offset).target)
+        };
         assert_eq!(
-            b.target,
+            target("query_entities", &a, 5, 40).unwrap_or_default(),
             "/ngsi-ld/v1/entities?q=speed%3E1%3Bname%3D%3D%22a%20b%22&type=Car%2CBike&limit=5&offset=40&count=true"
         );
         let one = args(&[("id", Checked::One("urn:ngsi-ld:Car:a/b?c".into()))]);
         assert_eq!(
-            build(&TOOLS[4], &one, 0, 0).target,
+            target("get_entity", &one, 0, 0).unwrap_or_default(),
             "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:a%2Fb%3Fc"
         );
     }
