@@ -146,7 +146,7 @@ jobs:
       # the other falling. Floors only ratchet UP — after a green run raise
       # them to just under the measured figure; never lower one to make a red
       # run pass, and move docs/src/coverage.md in the same commit — the
-      # chapter publishes these four numbers to readers who never open this
+      # chapter publishes these floors to readers who never open this
       # file. The numbers below sit a couple of points under a run
       # measured with a live Postgres but no MQTT or NATS, which this job
       # has, so they are a floor and not a target.
@@ -166,14 +166,17 @@ jobs:
       # synchronous driver traits, so it is not going away; the drivers are
       # proven by the integration files that declare
       # `flavor = "multi_thread"` and by the postgres and timescale ETSI
-      # cells. Nothing else is excluded: a file that in-crate tests COULD
-      # reach and do not is exactly what this floor is for.
+      # cells. The ten crates the crate-test step below names test their
+      # library from their own tests/ directory, which `--lib` never runs,
+      # so they are measured there, against their own tests (T-3715).
+      # Nothing else is excluded: a file that in-crate tests COULD reach and
+      # do not is exactly what this floor is for.
       - name: Unit surface floor (lib + bins)
         run: |
           set -eo pipefail
           rc=0
           cargo llvm-cov --locked --workspace --lib --bins --summary-only \
-            --ignore-filename-regex 'antares-store/src/contract\.rs|antares-sql/src/store/pg/' \
+            --ignore-filename-regex 'antares-store/src/contract\.rs|antares-sql/src/store/pg/|crates/(antares-mcp|antares-odata|antares-ops|antares-views|antares-wasm|antares-ws|linkml-model|odata-axum|odata-batch|odata-json)/' \
             --fail-under-lines 82 --fail-under-functions 79 > unit-cov.txt || rc=$?
           { echo "### Coverage floor — unit (lib + bins)"; echo '```'
             cat unit-cov.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -194,6 +197,23 @@ jobs:
             cat api-cov.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           cargo llvm-cov report --lcov --output-path api.lcov || true
           exit $rc
+      # The crates whose library is tested from its own tests/ directory and
+      # that the API step does not name: every test of the package runs
+      # (lib, bins and tests/), and `-p` reports only these packages' files.
+      # Measured 2026-10-11: 98.96 % lines / 98.06 % functions (T-3715).
+      - name: Crate test floor (crates tested from tests/)
+        if: always()
+        run: |
+          set -eo pipefail
+          rc=0
+          cargo llvm-cov --locked -p antares-mcp -p antares-odata -p antares-ops \
+            -p antares-views -p antares-wasm -p antares-ws -p linkml-model \
+            -p odata-axum -p odata-batch -p odata-json --summary-only \
+            --fail-under-lines 96 --fail-under-functions 95 > crate-cov.txt || rc=$?
+          { echo "### Coverage floor — crate tests"; echo '```'
+            cat crate-cov.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --lcov --output-path crate.lcov || true
+          exit $rc
       # T-3468: every request surface calls straight into these three, so
       # each carries its own floor over its own tests (`-p` reports only the
       # package's files). Measured 2026-10-10: ql 97.2 % lines / 95.7 %
@@ -210,12 +230,12 @@ jobs:
               tail -n 1 "$c-cov.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           done
           exit $rc
-      # The two lcov files say WHICH lines and functions no test reached, so
+      # The three lcov files say WHICH lines and functions no test reached, so
       # the next test can be written against a name instead of a percentage.
       # They are a map, never the gated number: `report` totals every object
       # left in the coverage map, so the api file also carries the lib and bin
-      # objects of the step before it, counted with no data. The four gated
-      # figures are the ones in unit-cov.txt and api-cov.txt.
+      # objects of the step before it, counted with no data. The six gated
+      # figures are the ones in unit-cov.txt, api-cov.txt and crate-cov.txt.
       - name: Publish the coverage map
         if: always()
         uses: actions/upload-artifact@v6
@@ -224,8 +244,10 @@ jobs:
           path: |
             unit-cov.txt
             api-cov.txt
+            crate-cov.txt
             unit.lcov
             api.lcov
+            crate.lcov
           if-no-files-found: warn
           retention-days: 14
 

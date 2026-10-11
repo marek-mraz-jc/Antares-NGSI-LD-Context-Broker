@@ -299,12 +299,20 @@ mod tests {
         );
     }
 
+    /// The lookup of a test with no store: every linked Entity is absent.
+    fn no_store(_: &str) -> Option<Value> {
+        None
+    }
+
     /// 5.8.6: every predicate holds → the change would notify.
     #[test]
     fn matching_change_notifies() {
-        assert!(would_notify(&sub(), &vehicle(30.0, -3.7), &ctx(), &|_| {
-            None
-        }));
+        assert!(would_notify(
+            &sub(),
+            &vehicle(30.0, -3.7),
+            &ctx(),
+            &no_store
+        ));
     }
 
     /// Each predicate alone refuses: q (4.9), geoQ (4.10), selector type,
@@ -395,7 +403,7 @@ mod tests {
         };
         assert!(conditions_match(&s, &doc, &c, &store));
         assert!(
-            !conditions_match(&s, &doc, &c, &|_| None),
+            !conditions_match(&s, &doc, &c, &no_store),
             "no store, no match"
         );
     }
@@ -408,9 +416,9 @@ mod tests {
         doc["scope"] = json!(["/Madrid/Centre"]);
         let mut s = sub();
         s["scopeQ"] = json!("/Madrid/#");
-        assert!(conditions_match(&s, &doc, &c, &|_| None));
+        assert!(conditions_match(&s, &doc, &c, &no_store));
         s["scopeQ"] = json!("/Paris/#");
-        assert!(!conditions_match(&s, &doc, &c, &|_| None));
+        assert!(!conditions_match(&s, &doc, &c, &no_store));
     }
 
     /// Table 5.2.12-1: a Subscription's `q` is a JSON string, not part of a
@@ -429,10 +437,13 @@ mod tests {
         let mut s = sub();
         s.as_object_mut().expect("object").remove("geoQ");
         s["q"] = json!("name==\"Eiffel%20Tower\"");
-        assert!(conditions_match(&s, &named("Eiffel%20Tower"), &c, &|_| {
-            None
-        }));
-        assert!(!conditions_match(&s, &named("Eiffel Tower"), &c, &|_| None));
+        assert!(conditions_match(
+            &s,
+            &named("Eiffel%20Tower"),
+            &c,
+            &no_store
+        ));
+        assert!(!conditions_match(&s, &named("Eiffel Tower"), &c, &no_store));
     }
 
     /// Table 5.2.33-1 `type`: "A valid type selection string as per clause
