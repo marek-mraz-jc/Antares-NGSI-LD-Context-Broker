@@ -92,7 +92,6 @@
  "known": {
   "MCP query_entities": "T-3784",
   "WebSocket": "T-3784",
-  "HTTP notification": "T-3784",
-  "LinkML": "T-3798"
+  "HTTP notification": "T-3784"
  }
 }
