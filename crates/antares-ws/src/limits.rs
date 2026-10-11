@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! The bounds of ADR-0026 rule 10, rule 5's heartbeat and rule 7's grace,
 //! read from the environment once and reported in `/q/health`.
 

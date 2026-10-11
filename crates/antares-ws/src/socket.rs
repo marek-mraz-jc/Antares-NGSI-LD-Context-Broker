@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! One socket: the welcome, the client's operations through the operation
 //! layer, the queue drained in order, Ping/Pong, idle, lifetime and resume
 //! (ADR-0026 rules 4 to 8).

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! The TS 104 243 envelope in both directions (ADR-0026 rules 3 and 5).
 //!
 //! Every message is one text frame holding `{"metadata": {...}, "body": ...}`.

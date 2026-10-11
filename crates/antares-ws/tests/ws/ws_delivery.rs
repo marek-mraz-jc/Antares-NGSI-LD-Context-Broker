@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! Rules 1, 3, 4 and 9: a notification over the socket is the one every
 //! binding is handed, after `pre_notify` under the subscriber, and only the
 //! socket that made the Subscription receives it.

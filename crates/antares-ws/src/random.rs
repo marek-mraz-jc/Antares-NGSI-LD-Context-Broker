@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! The connection id and resume token (ADR-0026 rules 4 and 7): random
 //! bits from the operating system, never a counter or a clock.
 

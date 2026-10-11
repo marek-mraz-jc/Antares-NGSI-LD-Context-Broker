@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! The per-process table of live connections (ADR-0026 rule 9), each
 //! connection's bounded queue and resume ring (rules 6 and 7), and the
 //! admission bounds (rule 10).
