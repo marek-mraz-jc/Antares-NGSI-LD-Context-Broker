@@ -37,7 +37,7 @@ This page maps every requirements class of OGC API - Features Parts 1 to 5 and e
 | C6 | `/req/core/fc-md-extent`, `fc-md-extent-multi` | none | mapped as omitted (M8) | `ogc/collections::no_extent_member` | T-3744 |
 | C7 | `/req/core/sfc-md-op`, `sfc-md-success` (`/collections/{c}`) | as C5 | mapped; hidden or unknown `c` is 404 | `ogc/collections::hidden_and_unknown_collection_are_the_same_404` | T-3744 |
 | C8 | `/req/core/fc-op`, `fc-response` (`/items`) | `QueryEntities` `type=T`, `format=simplified`, `geometryProperty`, `Accept: application/geo+json` | mapped | `ogc/items::items_are_the_view_answer` | T-3744 |
-| C9 | `/req/core/query-param-unknown`, `query-param-invalid` (400) | none | mapped: every parameter outside the declared classes (incl. `profile`, `sortby`, `properties` until their slices land) is 400 | `ogc/core::unknown_and_invalid_parameters_are_400` | T-3744 |
+| C9 | `/req/core/query-param-unknown`, `query-param-invalid` (400) | none | mapped: every parameter outside the declared classes and C23 (incl. `profile`, `sortby`, `properties` until their slices land) is 400 | `ogc/core::unknown_and_invalid_parameters_are_400` | T-3744 |
 | C10 | `/req/core/fc-limit-definition`, `fc-limit-response-1` (1 to 10000, default 10) | `limit` | mapped: default 10, values above the broker's `max_limit` clamped to it (the NGSI-LD answer would be 403, `crates/antares-api/src/paging.rs:84`), 0 and >10000 are 400 | `ogc/items::limit_default_clamp_and_bounds` | T-3744 |
 | C11 | `/req/core/fc-bbox-definition`, `fc-bbox-response` A, B, D (4 or 6 numbers, CRS84) | `geoQ` `georel=intersects`, `geometry=Polygon` (MultiPolygon split at 180° when `minx > maxx`), `geoproperty` = M4 | mapped; 6 numbers use the 2D footprint (heights are not indexed) | `ogc/items::bbox_2d_3d_and_antimeridian` | T-3744 |
 | C12 | `/req/core/fc-bbox-response` C: "The `bbox` parameter SHALL match all features in the collection that are not associated with a spatial geometry, too." | a second `QueryEntities` with `q=!{geometry}`; both ordered by id and merged; the next token carries both cursors | mapped | `ogc/items::bbox_keeps_features_without_geometry` | T-3744 |
@@ -46,11 +46,12 @@ This page maps every requirements class of OGC API - Features Parts 1 to 5 and e
 | C15 | `/rec/core/fc-filters` (simple property filters as parameters) | `q` equality | not declared: Part 3 `filter` covers it; a property name as parameter is 400 by C9 | `ogc/core::unknown_and_invalid_parameters_are_400` | T-3744 |
 | C16 | `/req/core/fc-links`, `/rec/core/fc-next-1..3`, `fc-rel-type` (`self`, `alternate`, `next`, `prev`) | `offset` of the same query | mapped: `next` while the answer is full; the token is the offset(s) plus a hash of the normalised query and the view id, a mismatch is 400; `prev` omitted (a permission) | `ogc/items::next_token_bound_to_view_and_query` | T-3744 |
 | C17 | `/req/core/fc-timeStamp` | none | mapped | `ogc/items::timestamp_is_response_time` | T-3744 |
-| C18 | `/req/core/fc-numberMatched`, `fc-numberReturned` | `count=true`, `NGSILD-Results-Count` (summed over the C12/C14 union, whose parts are disjoint) | mapped while every predicate is pushed down; with a residual predicate, numberMatched only if the residual engine read the whole set within budget, else omitted (Part 1: "servers may omit it"), never estimated | `ogc/items::counts_are_the_view_counts` | T-3744 |
+| C18 | `/req/core/fc-numberMatched`, `fc-numberReturned` | `count=true`, `NGSILD-Results-Count` (summed over the C12/C14 union, whose parts are disjoint) | mapped while every predicate is pushed down; with a residual predicate, numberMatched only if the residual engine read the whole set within budget, else omitted (Part 1: "servers may omit it"), never estimated | `ogc/items::counts_are_the_view_counts` | T-3744, T-3759 |
 | C19 | `/req/core/f-op`, `f-success`, `f-links` (`/items/{featureId}`) | `RetrieveEntity` with `type` check, `format=simplified`, `Accept: application/geo+json` | mapped; an Entity of another type or hidden is 404 | `ogc/items::feature_of_another_type_is_404` | T-3744 |
 | C20 | `/req/geojson/definition`, `/req/geojson/content` | as C8 and C19 | mapped | `ogc/geojson::feature_collection_and_feature_shape` | T-3744 |
 | C21 | `/req/html/*` (HTML encoding) | none | not declared: Apps read JSON; an `Accept: text/html` only request is 406 | `ogc/core::html_only_accept_is_406` | T-3744 |
 | C22 | `/req/gmlsf0/*`, `/req/gmlsf2/*` (GML) | none | not declared: no GML writer in the tree; `Accept: application/gml+xml` only is 406 | `ogc/core::gml_only_accept_is_406` | T-3744 |
+| C23 | (no OGC requirement) NGSI-LD options beside the standard's own: `ngsild.q`, `ngsild.scopeQ`, `ngsild.georel`, `ngsild.geometry`, `ngsild.coordinates`, `ngsild.geoproperty`, `ngsild.pick`, `ngsild.omit` (ADR-0028) | ANDed into the `QueryEntities` pushdown | mapped, declared in the collection's OpenAPI so C9 does not refuse them | `ogc/items::ngsild_options_narrow` | T-3759 |
 
 ## 4. Part 2: CRS by reference
 
@@ -86,7 +87,7 @@ The filter is parsed by `ogc-cql2` (ADR-0029) into one AST for both encodings, t
 | F16 | a name outside the queryables, hidden or misspelled | none | 400 before any operation (F1 `additionalProperties: false`) | `ogc/filter::hidden_and_unknown_property_are_the_same_400` | T-3745 |
 | F17 | parse limits | none | 400 above the depth and size bounds of `ogc-cql2` (as T-0808 bounded the gateway parser) | `cql2/parse::depth_and_size_bounded` | T-3753 |
 
-Residual rows answer 501 `NotImplemented` naming the operator until the T-3748 engine serves it; the engine never returns an Entity the pushed-down query did not return (ADR-0028).
+Residual rows answer 501 `NotImplemented` naming the operator until the T-3748 engine (T-3755, T-3756) and `ViewOps::scan` (T-3757, OGC items in T-3759) serve it; the engine never returns an Entity the pushed-down query did not return (ADR-0028).
 
 ## 6. Part 4: Create, Replace, Update, Delete (draft) and Part 5: Schemas (draft)
 
@@ -112,7 +113,7 @@ Residual rows answer 501 `NotImplemented` naming the operator until the T-3748 e
 - The surface never serves more than the view answers. Collections, queryables, sortables and schemas come from `shown_names()` and the LinkML intersected with it, never from the store; Features, counts and links come from `ViewOps::run` as the caller. A hidden collection, Feature or property is a 404 or 400 identical to an absent or misspelled one.
 - `numberMatched` is the `NGSILD-Results-Count` of the caller's own query, or the residual engine's full count within budget, or absent. It is never estimated or taken from an unscoped count.
 - The `next` token holds offsets and a hash of the normalised query and view id; the server re-runs the query as the caller, so a forged token reaches nothing the caller could not query directly.
-- A CQL2 filter is ANDed with the view's predicate inside the operation, so it only narrows. Parse depth and size are bounded (F17), the residual is budget-bounded (ADR-0028: 409/413 with a reason, never a partial answer).
+- A CQL2 filter is ANDed with the view's predicate inside the operation, so it only narrows. Parse depth and size are bounded (F17), the residual is budget-bounded (ADR-0028: 10 000 upstream Entities per request, beyond it 400 `TooManyResults` where an exact answer is required, never a partial answer).
 - Writes reach the store only through `ViewOps::run` and the Policy (W1 to W7). No route serves a write the view does not offer.
 
 ## 8. Unknowns
