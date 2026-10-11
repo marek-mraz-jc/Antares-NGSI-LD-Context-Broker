@@ -566,6 +566,10 @@ const POLICY_SHELF: &[(&str, PolicyCtor)] = &[
     (antares_plugin_example::POLICY_NAME, || {
         std::sync::Arc::new(antares_plugin_example::ExamplePolicy::from_env())
     }),
+    #[cfg(feature = "jc-policy")]
+    (joinedcontext_policy::POLICY_NAME, || {
+        std::sync::Arc::new(joinedcontext_policy::JoinedcontextPolicy::new())
+    }),
 ];
 
 /// ANTARES_POLICY → the engine every operation is asked about; absent =
@@ -1785,6 +1789,16 @@ mod api_surface_tests {
         }
     }
 
+    /// `full` is every surface in one binary (T-3636): the platform image
+    /// selects them all by name.
+    #[cfg(feature = "full")]
+    #[test]
+    fn the_full_build_shelves_every_surface() {
+        let names = "admin,views,mcp,odata,ws,ws-views";
+        let picked = api_surfaces(Some(names)).expect("every surface is on the shelf");
+        assert_eq!(picked.len(), names.split(',').count());
+    }
+
     /// Rule M3, the route half (surfaces-threat-model 9.5 item 4): with no
     /// surface feature the shelf is the admin surface alone, and a path of
     /// every surface prefix (ADR-0023 to ADR-0027) is unrouted. A surface
@@ -1839,7 +1853,7 @@ mod policy_shelf_tests {
     /// against it. A release build carries no other — an engine reaches the
     /// shelf only through an off-by-default feature, so this assertion is
     /// what "no addon in the shipped build" means for the policy seam.
-    #[cfg(not(feature = "plugin-example"))]
+    #[cfg(not(any(feature = "plugin-example", feature = "jc-policy")))]
     #[test]
     fn the_shipped_build_carries_only_the_built_in_engine() {
         assert_eq!(shelf(), vec!["allow-all"]);
@@ -1887,6 +1901,27 @@ mod policy_shelf_tests {
                 .is_some(),
             "an engine selected without rules would otherwise allow everything"
         );
+    }
+
+    /// The platform's engine is selected by name, and with no document
+    /// loaded it denies a platform caller (T-3637).
+    #[cfg(feature = "jc-policy")]
+    #[tokio::test]
+    async fn the_platform_engine_is_on_the_shelf_and_fails_closed() {
+        let name = joinedcontext_policy::POLICY_NAME;
+        let (selected, build) = policy_engine(Some(name)).expect("selection");
+        assert_eq!(selected, name);
+        let engine = build();
+        assert!(engine.loads_documents());
+        let subject = antares_api::policy::Subject {
+            tenant: antares_model::TenantId::default(),
+            headers: vec![("x-jc-subject".into(), "ana".into())],
+        };
+        let op = antares_api::policy::Operation::new("5.7.2");
+        assert!(matches!(
+            engine.decide(&subject, &op).await,
+            antares_api::policy::Decision::Deny(_)
+        ));
     }
 }
 

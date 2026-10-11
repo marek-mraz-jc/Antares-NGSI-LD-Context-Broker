@@ -1,0 +1,146 @@
+name: image-jc
+
+# The joinedcontext platform's broker image (T-3636): the `full` surfaces
+# and the platform's policy engine (`--features full,jc-policy`), published
+# as `antares-broker-jc` — never as `antares-broker`, which stays the
+# vanilla image full.yml releases. Before anything is pushed, the image
+# proves what it carries (its auditable dependency list holds every surface
+# and the engine) and that it is still the broker: its plain root on
+# `ANTARES_POLICY=allow-all` passes every TP of dev/etsi-baseline.json,
+# TP by TP, like a vanilla cell. Only then is it pushed, signed by digest
+# and given its own SBOM.
+on:
+  push:
+    branches: [dev]
+    paths:
+      - "crates/**"
+      - "addons/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - ".github/workflows/image-jc.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: image-jc-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FEATURES: full,jc-policy
+  # what the jc image must carry, by crate name in its auditable list
+  CARRIES: antares-views antares-mcp antares-odata antares-ws joinedcontext-policy
+
+jobs:
+  build:
+    name: Build the jc image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build with the platform's features
+        run: |
+          docker build --build-arg FEATURES="$FEATURES" \
+            --build-arg VERSION=dev --build-arg REVISION="$GITHUB_SHA" \
+            -t antares-local:latest .
+      - name: SBOM of the built image (syft reads the cargo-auditable list)
+        uses: anchore/sbom-action@v0
+        with:
+          image: antares-local:latest
+          format: spdx-json
+          output-file: antares-broker-jc.sbom.spdx.json
+          upload-artifact: false
+      - name: The image carries every surface and the engine
+        run: |
+          rc=0
+          for crate in $CARRIES; do
+            if jq -e --arg c "$crate" '[.packages[].name] | index($c)' \
+                 antares-broker-jc.sbom.spdx.json >/dev/null; then
+              echo "carries $crate"
+            else
+              echo "MISSING $crate"; rc=1
+            fi
+          done
+          exit $rc
+      - run: docker save antares-local:latest | gzip > antares-image.tgz
+      - uses: actions/upload-artifact@v6
+        with:
+          name: antares-image-jc
+          path: |
+            antares-image.tgz
+            antares-broker-jc.sbom.spdx.json
+          retention-days: 3
+
+  etsi:
+    # E3 on the jc image: the plain root with every surface on and the
+    # built-in engine selected must equal the vanilla baseline TP by TP.
+    name: ETSI on the jc image (allow-all, file)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: antares-image-jc
+      - run: docker load < antares-image.tgz
+      - name: Run every suite through the one pipeline
+        env:
+          STORE: file
+          RESULTS_DIR: cells/ETSI-cell-file
+          SKIP_BUILD: "1"
+          STOP_ON_ERROR: "0"
+          CALLBACK_HOST: localhost
+          API_SURFACES: admin,views,mcp,odata,ws
+        run: ./dev/etsi-pipeline.sh || true
+      - name: Per-TP baseline (dev/etsi-baseline.json)
+        env:
+          STORES: file
+        run: ./dev/etsi-baseline.py check cells
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: ETSI-jc-file
+          path: |
+            cells/ETSI-cell-file/run-summary.md
+            cells/ETSI-cell-file/failures.csv
+            cells/ETSI-cell-file/tp-status.csv
+            cells/ETSI-cell-file/**/log.html
+          retention-days: 30
+
+  publish:
+    name: Push, sign and attest the jc image
+    needs: etsi
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: antares-image-jc
+      - uses: sigstore/cosign-installer@v3
+      - name: Push the tested bytes, sign and attest by digest
+        env:
+          # through the environment, never spliced into the script text
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker load < antares-image.tgz
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          IMG=ghcr.io/${{ github.repository_owner }}/antares-broker-jc
+          SHA=${GITHUB_SHA::7}
+          docker tag antares-local:latest "$IMG:$SHA"
+          docker tag antares-local:latest "$IMG:dev"
+          docker push -q "$IMG:$SHA"
+          docker push -q "$IMG:dev"
+          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMG:$SHA")
+          case "$DIGEST" in "$IMG@sha256:"*) ;; *) echo "no digest for $IMG:$SHA: $DIGEST"; exit 1 ;; esac
+          cosign sign --yes "$DIGEST"
+          cosign attest --yes --type spdxjson --predicate antares-broker-jc.sbom.spdx.json "$DIGEST"
+          echo "## Published \`$DIGEST\` (tags \`$SHA\`, \`dev\`; features \`$FEATURES\`; signed, SPDX attested)" >> "$GITHUB_STEP_SUMMARY"

@@ -43,8 +43,8 @@ concurrency:
 env:
   SMOKE: ${{ github.event_name == 'push' || inputs.smoke == true }}
   CORAINE_REF: ${{ inputs.coraine_ref || 'd313d87fabd74f67e0d4d1f222ccf0c45239a0a9' }}
-  # every feature a shipped surface needs; becomes `full` when the broker has one
-  FULL_FEATURES: mqtt,views,mcp
+  # every surface in one binary (T-3636)
+  FULL_FEATURES: full
   FULL_SURFACES: admin,views,mcp
   FORGE_SUITE: https://forge.etsi.org/rep/cim/ngsi-ld-test-suite.git
 

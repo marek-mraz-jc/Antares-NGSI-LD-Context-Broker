@@ -16,7 +16,8 @@
 ///
 /// The named members go into the [`policy::Operation`]; every other member
 /// keeps the empty default of `Operation::new`. The awaited value is the
-/// `Filter` the engine narrowed the operation to, or the refusal that
+/// `Filter` the engine narrowed the operation to, shared (`Arc`) so a
+/// view's compiled narrowing reaches the handler uncopied, or the refusal that
 /// becomes a 403. It is a macro because a gate reads as one line at the
 /// call site and the alternative is the same eight lines in every handler.
 ///
@@ -28,7 +29,7 @@ macro_rules! gate {
     ($st:expr, $tenant:expr, $headers:expr, $clause:expr $(, $field:ident: $value:expr)* $(,)?) => {
         async {
             let answer = match &$st.policy {
-                None => Ok($crate::policy::Filter::default()),
+                None => Ok($crate::policy::unnarrowed()),
                 Some(engine) => {
                     $crate::policy::gate(
                         engine.as_ref(),
@@ -40,6 +41,7 @@ macro_rules! gate {
                         },
                     )
                     .await
+                    .map(std::sync::Arc::new)
                 }
             };
             // A state served through an endpoint view adds the view's

@@ -2402,10 +2402,14 @@ pub(crate) async fn fed_entity_maps(
         )
         .await;
         if let Some(q) = held_back.as_ref().filter(|_| (200..300).contains(&status)) {
-            narrow_map_ids(
-                st, tenant, headers, ctx, ctx_url, &reg, params, q, &mut body,
-            )
-            .await;
+            let peer = Peer {
+                st,
+                tenant,
+                headers,
+                ctx_url,
+                reg: &reg,
+            };
+            narrow_map_ids(peer, ctx, params.get("type"), q, &mut body).await;
         }
         (reg, status, body)
     })
@@ -2419,24 +2423,35 @@ pub(crate) async fn fed_entity_maps(
     Ok(out)
 }
 
+/// What every forward to one registered peer shares.
+struct Peer<'a> {
+    st: &'a AppState,
+    tenant: &'a TenantId,
+    headers: &'a HeaderMap,
+    ctx_url: &'a str,
+    reg: &'a FedReg,
+}
+
 /// A peer's EntityMap asked without a narrowed `q` its caps refuse (T-3683,
 /// threat V23): the ids it lists are a superset of the narrowing's, and the
 /// map is served to the caller, so each id stays only when the peer's own
 /// Entity is selected by `q` here. The Entities are read from the same peer
 /// by id, as Query Entities forwards them; a linked path does not resolve,
 /// so it never holds, and a peer that cannot be read contributes no id.
-#[allow(clippy::too_many_arguments)] // one param per part of the forward
 async fn narrow_map_ids(
-    st: &AppState,
-    tenant: &TenantId,
-    headers: &HeaderMap,
+    peer: Peer<'_>,
     ctx: &Context,
-    ctx_url: &str,
-    reg: &FedReg,
-    params: &HashMap<String, String>,
+    type_param: Option<&String>,
     q: &antares_ql::QNode,
     body: &mut Value,
 ) {
+    let Peer {
+        st,
+        tenant,
+        headers,
+        ctx_url,
+        reg,
+    } = peer;
     // ponytail: one read per 100 ids, sequential; a peer map is capped at
     // the broker's limit, so this is a few reads at most
     const CHUNK: usize = 100;
@@ -2451,7 +2466,7 @@ async fn narrow_map_ids(
                 ("id".to_owned(), ids.join(",")),
                 ("limit".to_owned(), ids.len().to_string()),
             ];
-            if let Some(t) = params.get("type") {
+            if let Some(t) = type_param {
                 query.push(("type".to_owned(), t.clone()));
             }
             let (status, found, _) = forward(

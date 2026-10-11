@@ -196,3 +196,25 @@ async fn ws_a_request_that_is_no_websocket_handshake_is_refused() -> Result<(), 
     assert_eq!(b.hub.connections(), 1);
     Ok(())
 }
+
+/// RFC 6455 section 4.2.2 needs the connection itself: a request served
+/// in process carries no `OnUpgrade`, so a well-formed handshake there is
+/// refused with 426 and admits nothing (T-3704, T-3707).
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_a_handshake_on_a_connection_that_cannot_upgrade_is_426() -> Result<(), String> {
+    use tower::ServiceExt;
+    let hub = antares_ws::Hub::new(Limits::default());
+    let kit = antares_ops::test_kit::TestBroker::new().await?;
+    let app = kit.serve_mounted(vec![antares_ops::mount(antares_ws::Ws::new(hub.clone()))])?;
+    let req = axum::http::Request::get(ROOT)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(axum::body::Body::empty())
+        .map_err(|e| e.to_string())?;
+    let resp = app.oneshot(req).await.map_err(|e| e.to_string())?;
+    assert_eq!(resp.status(), 426);
+    assert_eq!(hub.connections(), 0);
+    Ok(())
+}
