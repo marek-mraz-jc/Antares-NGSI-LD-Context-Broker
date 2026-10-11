@@ -234,10 +234,16 @@ mod w1_to_w20 {
             id.annotations.push(Annotation::new(term, Expr::Bool(true)));
             ty.properties = vec![id, Property::new("name", TypeRef::single("Edm.String"))];
             city.entity_types.push(ty);
+            let mut set = EntitySet::new(name, format!("City.{name}"));
+            set.annotations.push(Annotation::new(
+                "Capabilities.InsertRestrictions",
+                Expr::Record(vec![(
+                    "RequiredProperties".into(),
+                    Expr::Collection(vec![Expr::PropertyPath("name".into())]),
+                )]),
+            ));
             if let Some(service) = city.entity_container.as_mut() {
-                service
-                    .entity_sets
-                    .push(EntitySet::new(name, format!("City.{name}")));
+                service.entity_sets.push(set);
             }
         }
         read_entity_body(
@@ -273,6 +279,19 @@ mod w1_to_w20 {
                 property: "id".into()
             })
         );
+    }
+
+    #[test]
+    fn a_create_names_every_required_property() {
+        let missing = Err(BodyError::MissingProperty {
+            property: "name".into(),
+        });
+        assert_eq!(read_service_keyed("Minted", &json!({})), missing);
+        assert_eq!(
+            read_service_keyed("Minted", &json!({"name": null})),
+            missing
+        );
+        assert!(read_service_keyed("Minted", &json!({"name": ""})).is_ok());
     }
 
     #[test]
