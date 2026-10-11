@@ -291,6 +291,100 @@ async fn view_guards(
     (kept, guards)
 }
 
+/// One round of a Batch Upsert under a view, member by member (ADR-0023
+/// rule 7, T-3594): a stored Entity the view shows is replaced, or with
+/// `options=update` updated, under the store's lock between the pre-image
+/// and post-image checks; a replace counts every Attribute the Entity holds
+/// as written, so one holding a hidden Attribute is refused (D6). An absent
+/// id, and one out of the view, take the create path: the Entity is created
+/// in the view or refused, and an out-of-view one is never overwritten,
+/// answering as Create Entity through the view does for a taken id. The ids
+/// created, in order.
+#[cfg(feature = "views")]
+async fn upsert_in_view(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    round: Vec<(String, Value)>,
+    update_mode: bool,
+    ts: &str,
+    out: &mut BatchOutcome,
+) -> Result<Vec<String>, NgsiError> {
+    let (round, guards) = view_guards(st, tenant, round, out).await;
+    let ids: Vec<String> = round.iter().map(|(id, _)| id.clone()).collect();
+    let docs: HashMap<&str, &Value> = round.iter().map(|(id, d)| (id.as_str(), d)).collect();
+    let res = st
+        .store
+        .batch_mutate(tenant, &ids, |id, doc| {
+            let guard = guards.get(id);
+            if let Some(g) = guard {
+                if update_mode {
+                    g.pre(id, doc)?;
+                } else {
+                    g.pre_whole(id, doc)?;
+                }
+            }
+            if update_mode {
+                merge_into(doc, docs[id], ts);
+            } else {
+                let mut new = docs[id].clone();
+                stamp_new(&mut new, ts);
+                // 4.8: a replaced Entity keeps the instant it was created.
+                if let (Some(o), Some(created)) = (new.as_object_mut(), doc.get("createdAt")) {
+                    o.insert("createdAt".into(), created.clone());
+                }
+                *doc = new;
+            }
+            if let Some(g) = guard {
+                g.post(doc)?;
+            }
+            Ok::<(), NgsiError>(())
+        })
+        .await?;
+    let mut creates = Vec::new();
+    for ((id, doc), r) in round.into_iter().zip(res) {
+        if let Some(crate::policy::Denied(why)) = guards.get(&id).and_then(|g| g.verdict().err()) {
+            out.errors.push(denied_entry(Some(&id), &why));
+            continue;
+        }
+        match r {
+            Some(Ok(())) => {
+                if !out.success.contains(&Value::String(id.clone())) {
+                    out.success.push(Value::String(id));
+                }
+            }
+            // absent, or out of the view: the pre-image answers not found
+            None | Some(Err(NgsiError::ResourceNotFound(_))) => creates.push((id, doc)),
+            Some(Err(e)) => out.errors.push(err_entry(Some(&id), &e)),
+        }
+    }
+    let mut kept = Vec::with_capacity(creates.len());
+    for (id, mut doc) in creates {
+        match crate::views::admits_new(st, tenant, &doc).await {
+            Ok(()) => {
+                stamp_new(&mut doc, ts);
+                kept.push((id, doc));
+            }
+            Err(crate::policy::Denied(why)) => out.errors.push(denied_entry(Some(&id), &why)),
+        }
+    }
+    let mut created = Vec::new();
+    if kept.is_empty() {
+        return Ok(created);
+    }
+    let ids: Vec<String> = kept.iter().map(|(id, _)| id.clone()).collect();
+    let flags = st.store.batch_create(tenant, kept).await?;
+    for (id, ok) in ids.into_iter().zip(flags) {
+        if !ok {
+            let e = NgsiError::AlreadyExists(format!("entity {id} already exists"));
+            out.errors.push(err_entry(Some(&id), &e));
+        } else if !out.success.contains(&Value::String(id.clone())) {
+            out.success.push(Value::String(id.clone()));
+            created.push(id);
+        }
+    }
+    Ok(created)
+}
+
 fn err_entry(id: Option<&str>, e: &NgsiError) -> Value {
     json!({
         "entityId": id.unwrap_or("unknown"),
@@ -780,9 +874,9 @@ async fn batch_write(
     // problem and the rest are applied (207); a batch refused whole is the
     // 403 it always was. An entry that does not expand is shown by its id
     // alone and left to the local arm to report.
-    // ADR-0023 rule 7 under an endpoint view: Batch Upsert is refused whole
-    // as `gate!` refuses a narrowed write; the others are decided per member
-    // on the stored Entities below.
+    // ADR-0023 rule 7 under an endpoint view: every batch write is decided
+    // per member on the stored Entities below; an engine narrowing still
+    // refuses it whole, as `gate!` refuses a narrowed write.
     #[cfg(feature = "views")]
     crate::views::with_view(
         st.view.as_deref(),
@@ -977,6 +1071,17 @@ async fn batch_write(
                 }
             }
             BatchMode::Upsert => {
+                #[cfg(feature = "views")]
+                if st.view.is_some() {
+                    for id in upsert_in_view(st, &tenant, round, update_mode, &ts, &mut out).await?
+                    {
+                        any_created = true;
+                        if !created_ids.contains(&id) {
+                            created_ids.push(id);
+                        }
+                    }
+                    continue;
+                }
                 // options=update: merge into existing rows first; ids that
                 // turn out absent (or vanish mid-flight) fall through to the
                 // replace batch — never a silent success (TOCTOU fix).

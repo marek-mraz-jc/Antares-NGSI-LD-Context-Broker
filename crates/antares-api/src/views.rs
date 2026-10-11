@@ -571,13 +571,12 @@ impl ViewTable {
 /// The writes whose handlers check ADR-0023 rule 7 on the stored Entity
 /// (the crate's write guard): Create Entity, Update and Append Attributes, Partial
 /// Attribute Update, Delete Attribute, Delete Entity, Merge, Replace Entity,
-/// Replace Attribute and Set Attribute Value, and the batch create, update,
-/// merge and delete, member by member. Every other write is refused under a
-/// view, as a narrowed write is ([`resolve`]): Batch Upsert among them,
-/// whose replace half writes without reading the stored Entity.
-pub const CHECKED_WRITES: [&str; 13] = [
+/// Replace Attribute and Set Attribute Value, and the batch create, upsert,
+/// update, merge and delete, member by member. Every other write is refused
+/// under a view, as a narrowed write is ([`resolve`]).
+pub const CHECKED_WRITES: [&str; 14] = [
     "5.6.1", "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.17", "5.6.18", "5.6.19", "5.6.7",
-    "5.6.9", "5.6.20", "5.6.10",
+    "5.6.8", "5.6.9", "5.6.20", "5.6.10",
 ];
 
 /// The Subscription operations a view serves (rule 9, 5.8.1 to 5.8.5): run
@@ -1193,7 +1192,7 @@ mod tests {
         let (s, body, _) = send(&view, "POST", "/ngsi-ld/v1/entities", Some(bike)).await;
         assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
         assert!(body.to_string().contains(MOVES_OUT), "{body}");
-        let batch = json!([{"id": "urn:ngsi-ld:Car:8", "type": "Car"}]);
+        let batch = json!([{"id": "urn:ngsi-ld:Car:7", "type": "Car"}]);
         let (s, body, _) = send(
             &view,
             "POST",
@@ -1201,7 +1200,7 @@ mod tests {
             Some(batch),
         )
         .await;
-        assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(s, StatusCode::CREATED, "{body}");
         let batch = json!([
             {"id": "urn:ngsi-ld:Car:8", "type": "Car"},
             {"id": "urn:ngsi-ld:Bike:8", "type": "Bike"}

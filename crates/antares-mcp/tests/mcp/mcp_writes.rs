@@ -113,16 +113,11 @@ async fn every_write_tool_runs_once_the_person_confirmed() -> Result<(), String>
         let a = confirmed(&f.app, "writes", tool, &args).await?;
         assert!(!a.is_error(), "{tool}: {}", a.text);
     }
-    // a view refuses an upsert, whose pre-image it cannot check (ADR-0023
-    // rule 7, `CHECKED_WRITES`): asked, confirmed, and still the gate's 403
+    // a view decides an upsert member by member (ADR-0023 rule 7, T-3594):
+    // the absent w3 is created in the view
     let upsert = json!({"entities": [car("w3", 2)], "options": "update"});
     let a = confirmed(&f.app, "writes", "batch_upsert", &upsert).await?;
-    assert_eq!(
-        a.structured().pointer("/error/status"),
-        Some(&json!(403)),
-        "{}",
-        a.text
-    );
+    assert!(!a.is_error(), "{}", a.text);
     let a = confirmed(&f.app, "writes", "get_entity", &json!({"id": w2})).await;
     assert!(a.is_err(), "a read is never asked");
     let speed = call(&f.app, "writes", "get_entity", json!({"id": w2})).await;
@@ -130,7 +125,7 @@ async fn every_write_tool_runs_once_the_person_confirmed() -> Result<(), String>
         speed.structured().pointer("/entity/speed/value"),
         Some(&json!(9))
     );
-    assert!(!exists(&f.app, "urn:ngsi-ld:Car:w3").await);
+    assert!(exists(&f.app, "urn:ngsi-ld:Car:w3").await);
     let deleted = confirmed(&f.app, "writes", "delete_entity", &json!({"id": w2})).await?;
     assert_eq!(deleted.structured(), &json!({}), "{}", deleted.text);
     assert!(!exists(&f.app, w2).await);
