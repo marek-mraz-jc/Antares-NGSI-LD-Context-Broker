@@ -758,6 +758,30 @@ pub trait PolicyEngine: Send + Sync {
         sub: &Value,
         notification: &mut Value,
     ) -> NotifyDecision;
+
+    /// Whether the engine reads rule documents through
+    /// [`load`](Self::load) (ADR-0020 amendment). No by default: `/q/policy`
+    /// then answers 404, as it does for a broker without an engine.
+    fn loads_documents(&self) -> bool {
+        false
+    }
+
+    /// Take `document` as the rule document of `tenant`, or drop that
+    /// Tenant's document when it is `Value::Null`. An `Err` leaves the
+    /// engine as it was: the previous document keeps deciding. The reason
+    /// goes back to the admin caller who wrote the document and nowhere
+    /// else, so it may name parts of it. The default refuses every
+    /// document.
+    ///
+    /// # Errors
+    /// Why the engine refuses the document.
+    fn load(&self, tenant: &str, document: &Value) -> Result<(), String> {
+        let _ = (tenant, document);
+        Err(format!(
+            "the policy engine {:?} reads no rule documents",
+            self.name()
+        ))
+    }
 }
 
 /// The name of the engine the broker ships, which is also the name

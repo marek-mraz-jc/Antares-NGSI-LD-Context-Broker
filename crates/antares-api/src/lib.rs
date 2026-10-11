@@ -91,6 +91,7 @@ pub use antares_notifier::DeliveryPolicy;
 // The sink contract, so a surface reaches it through this crate and names no
 // antares-notifier (ADR-0027 section 1, rule M2).
 pub use antares_notifier::{DeliveryError, DeliveryFuture, NotificationSink, Outbound};
+pub use federation::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 pub use state::{AppState, TemporalRecord};
 
 /// Spawn for both targets — tokio natively, the JS microtask queue on
@@ -968,6 +969,10 @@ async fn health(
     #[cfg(feature = "views")]
     {
         body["views"] = state.views.report();
+        // The engine's rule documents by tenant and revision, loaded or
+        // refused (ADR-0020 amendment); never the documents themselves.
+        body["policy"]["documents"] = state.views.policy_report();
+        body["schemas"] = state.views.schema_report();
     }
     // Changes the bounded matcher queue dropped (this process, since start).
     body["changesDropped"] = notify::changes_dropped().into();

@@ -344,6 +344,10 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
 /// document kind they are stored as.
 pub const VIEW_TENANT: &str = "antares-views";
 
+/// The reserved tenant the policy engine's rule documents live under
+/// (ADR-0020 amendment), one document per Tenant, keyed by its name.
+pub const POLICY_TENANT: &str = "antares-policy";
+
 /// One view of the table.
 #[derive(Debug, Clone)]
 pub enum ViewEntry {
@@ -375,6 +379,38 @@ pub enum ViewEntry {
 pub struct ViewTable {
     entries: std::sync::RwLock<Arc<BTreeMap<String, ViewEntry>>>,
     admin: std::sync::OnceLock<axum::Router>,
+    policy: std::sync::RwLock<serde_json::Value>,
+    schemas: std::sync::RwLock<Arc<BTreeMap<String, Schema>>>,
+}
+
+/// The id prefix a Tenant's schema document is stored under, beside the
+/// view documents in [`VIEW_TENANT`]. A view id is `[a-z0-9-]`, so no view
+/// shares a key with a schema.
+pub const SCHEMA_ID_PREFIX: &str = "schema:";
+
+/// A Tenant's `LinkML` schema as written to `/q/schemas/{tenant}` (T-3628):
+/// JSON the broker checked for size and well-formedness only. A surface
+/// parses it and caches the parse per `revision`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Schema {
+    /// Changes whenever the bytes do: a digest of them, opaque.
+    pub revision: u64,
+    /// The document as written.
+    pub bytes: Arc<[u8]>,
+}
+
+impl Schema {
+    /// The schema of `bytes`, its revision their digest.
+    #[must_use]
+    pub fn new(bytes: &[u8]) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        Self {
+            revision: h.finish(),
+            bytes: bytes.into(),
+        }
+    }
 }
 
 impl ViewTable {
@@ -392,6 +428,45 @@ impl ViewTable {
             .entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(entries);
+    }
+
+    /// Replace every Tenant's schema.
+    pub fn replace_schemas(&self, schemas: BTreeMap<String, Schema>) {
+        *self
+            .schemas
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(schemas);
+    }
+
+    /// The schema of `tenant`, if one is stored.
+    pub fn schema(&self, tenant: &str) -> Option<Schema> {
+        self.schemas
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(tenant)
+            .cloned()
+    }
+
+    /// What `/q/health` lists of the schemas: each Tenant's size and
+    /// revision, never the document.
+    pub fn schema_report(&self) -> serde_json::Value {
+        let schemas = self
+            .schemas
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        serde_json::Value::Object(
+            schemas
+                .iter()
+                .map(|(tenant, s)| {
+                    let v = serde_json::json!({
+                        "bytes": s.bytes.len(),
+                        "revision": format!("{:016x}", s.revision),
+                    });
+                    (tenant.clone(), v)
+                })
+                .collect(),
+        )
     }
 
     /// Whether at least one view loaded: a surface that serves through views
@@ -430,6 +505,24 @@ impl ViewTable {
                 })
                 .collect(),
         )
+    }
+
+    /// What `/q/health` lists of the policy rule documents (ADR-0020
+    /// amendment): set by the loader on every reload, `null` until it runs
+    /// with an engine that reads documents. Tenant and revision only.
+    pub fn policy_report(&self) -> serde_json::Value {
+        self.policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Replace what [`policy_report`](Self::policy_report) answers.
+    pub fn set_policy_report(&self, report: serde_json::Value) {
+        *self
+            .policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = report;
     }
 
     /// The `/q/views` routes the loader serves, merged into the admin

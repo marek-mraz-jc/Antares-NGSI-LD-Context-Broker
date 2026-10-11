@@ -219,6 +219,50 @@ standard is silent, Antares answers in its own namespace and says so.
 Nothing else changes — the header is still advisory, still sent only when
 the engine sets `restricted`, and a narrowing is otherwise silent.
 
+## Amendment: rule documents through `/q/policy`, one image per engine
+
+An engine has no route of its own (surfaces live under `/x/`,
+`crates/antares-api/src/surface.rs`) and, before this amendment, no hook
+to receive data, so a rule table could only be compiled into the engine
+or read by it from somewhere the broker does not control. ADR-0014 rule 3
+asks for configuration "reloaded at runtime from the stores the broker
+already has", and every pod must serve the same revision.
+
+The seam therefore gains one hook and one document table:
+
+- `PolicyEngine::load(tenant, &Value) -> Result<(), String>` hands the
+  engine the rule document of one Tenant (`Value::Null` unloads it), and
+  `PolicyEngine::loads_documents() -> bool` says whether the engine reads
+  documents at all. Both default to no: `load` refuses, and the built-in
+  `AllowAll` and a broker without an engine answer `/q/policy` 404. A
+  refused document leaves the engine's state as it was, so the previous
+  revision keeps deciding.
+- `/q/policy` (GET, the table) and `/q/policy/{tenant}` (GET, PUT,
+  DELETE), served by `antares-ops` beside `/q/views` and behind the same
+  admin credential. The document is opaque JSON: the engine owns its
+  schema, so the broker bounds it (64 KiB, depth and element count) and
+  validates nothing else. A PUT the engine refuses answers 400 with the
+  engine's reason and is not stored.
+- Documents are stored under the reserved tenant `antares-policy`, with a
+  revision the broker counts, and reloaded with the view table (every
+  `ANTARES_VIEWS_RELOAD_MS` and after every write on the pod that took
+  it). A stored revision the engine refuses on reload (written by another
+  version, or by hand) is listed in `/q/health` under
+  `policy.documents.refused` by tenant and revision only. The document,
+  and the engine's reason, never reach a log or `/q/health`: a rule
+  document says who may read what.
+
+The table needs the `views` feature, as `/q/views` does. A vanilla broker
+has neither the routes nor the reserved tenant's documents, and its tree
+is unchanged.
+
+The sentence "built and run by `examples.yml` alone" above is narrowed: a
+deployment that runs an engine may build its own image from the same
+Dockerfile with the engine's feature, one image per engine. That image is
+never published as `antares-broker`, the Antares release image and every
+conformance cell keep `AllowAll`, and the deployment image claims no
+conformance, as the paragraph above already says of any engine.
+
 ## Consequences
 
 - ADR-0014's phase table gains no row: the seam is a named user of two
