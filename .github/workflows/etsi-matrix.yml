@@ -24,6 +24,12 @@ on:
         description: "quick (3 cells, per commit) or full (all 7 cells)"
         type: string
         default: full
+      ref:
+        # the commit to test (ci.yml under workflow_run passes the head_sha
+        # of the green fast run; empty is the triggering commit)
+        description: "commit to check out (empty: the triggering commit)"
+        type: string
+        default: ""
 
 env:
   MEM_LIMIT_MB: 350 # per-broker peak-RSS gate, same limit as ScorpioBroker's pipeline
@@ -43,6 +49,7 @@ jobs:
     uses: ./.github/workflows/build-image.yml
     with:
       arch: amd64
+      ref: ${{ inputs.ref }}
 
   build-wasm:
     # The browser artifact for the wasm-file cell — built ONCE in parallel
@@ -55,6 +62,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -114,6 +123,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
 
 
       - name: Load the image built once for all stores
@@ -192,6 +203,8 @@ jobs:
       actions: write # to delete the merged per-cell artifacts
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Download all cell results
         uses: actions/download-artifact@v7

@@ -47,6 +47,10 @@ name: surfaces-conformance
 #                    commit (dev/etsi-baseline.py compare); not per pull
 #                    request
 #
+# The fast lane (fast.yml) calls this file with `fast: true` on a push to
+# dev that touches a surface crate: build, odata-conformance (the
+# merge-request subset) and odata-compliance-external.
+#
 # Pull requests to dev run the merge-request subset (both official
 # revisions, the parity suite trimmed to MCP_PARITY_CASES=5, the OData ABNF
 # and $metadata cases); the nightly run, v* tags and dispatch run
@@ -61,9 +65,18 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  # fast.yml (T-3765): the OData jobs only, on a push to dev that touches a
+  # surface crate; every job without `!inputs.fast` belongs to that subset
+  workflow_call:
+    inputs:
+      fast:
+        type: boolean
+        default: false
 
 concurrency:
-  group: surfaces-conformance-${{ github.ref }}
+  # under workflow_call github.workflow is the caller's name, so the fast
+  # lane's call never cancels a nightly or pull-request run of this file
+  group: surfaces-conformance-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -75,7 +88,7 @@ env:
   # its client checks, tests/ws, the F21/F29 parity rows (T-3686), the
   # bind-to-an-absent-target 400 (T-3760) and tests/linkml (T-3512)
   CONFORMANCE_REF: 5e3722f143ede3cf768574acb050388044e9aa45
-  NIGHTLY: ${{ github.event_name != 'pull_request' }}
+  NIGHTLY: ${{ github.event_name != 'pull_request' && !inputs.fast }}
 
 jobs:
   build:
@@ -98,6 +111,7 @@ jobs:
 
   mcp-conformance:
     name: mcp-conformance
+    if: ${{ !inputs.fast }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -146,6 +160,7 @@ jobs:
 
   mcp-suites:
     name: mcp-suites
+    if: ${{ !inputs.fast }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -344,6 +359,7 @@ jobs:
 
   ws-conformance:
     name: ws-conformance
+    if: ${{ !inputs.fast }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -406,6 +422,7 @@ jobs:
   linkml-conformance:
     name: linkml-conformance
     needs: build
+    if: ${{ !inputs.fast }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -460,7 +477,7 @@ jobs:
   # one page of view all, then the restricted view without NO2. Nightly.
   odata-clients:
     name: odata-clients-${{ matrix.client }}
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && !inputs.fast
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -521,7 +538,7 @@ jobs:
   # run, so nightly, v* tags and dispatch only, never per pull request.
   etsi-iop-run:
     name: etsi-iop ${{ matrix.variant }}
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && !inputs.fast
     strategy:
       fail-fast: false
       matrix:
@@ -594,7 +611,7 @@ jobs:
   # nightly, v* tags and dispatch only, as etsi-iop.
   etsi-icsr-run:
     name: etsi-icsr ${{ matrix.variant }}
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && !inputs.fast
     strategy:
       fail-fast: false
       matrix:
@@ -666,6 +683,7 @@ jobs:
   # pull requests and nightly; the postgres cell adds a store, not a view path.
   etsi-full-all-run:
     name: etsi-full-all ${{ matrix.run }}
+    if: ${{ !inputs.fast }}
     strategy:
       fail-fast: false
       matrix:
@@ -706,7 +724,7 @@ jobs:
   etsi-full-all:
     name: etsi-full-all
     needs: etsi-full-all-run
-    if: always()
+    if: always() && needs.etsi-full-all-run.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

@@ -908,6 +908,17 @@ mod tests {
     }
 
     #[test]
+    fn a_mapped_view_serves_the_temporal_and_discovery_reads() {
+        let mut v = mapped();
+        v["operations"] = json!(crate::mapping::READS
+            .iter()
+            .map(|op| op.id())
+            .collect::<Vec<_>>());
+        let loaded = load(&v).map(|l| l.operations.len());
+        assert_eq!(loaded, Ok(11));
+    }
+
+    #[test]
     fn a_mapped_view_loads_with_its_mapping() {
         let loaded = load(&mapped());
         assert_eq!(
@@ -926,8 +937,9 @@ mod tests {
             "create_subscription",
             "batch_upsert",
             "query_entities_post",
-            "retrieve_entity_types",
-            "temporal_query",
+            "temporal_query_post",
+            "temporal_upsert",
+            "create_temporal_entity_map",
         ] {
             let mut v = mapped();
             v["operations"] = json!(["query_entities", op]);

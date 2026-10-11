@@ -830,6 +830,37 @@ async fn a_conditional_grant_over_every_type_needs_the_types_named() -> Res {
     Ok(())
 }
 
+/// T-3770: the gateway percent-encodes each name, so a Slovak group reaches the engine whole.
+#[tokio::test]
+async fn a_policy_for_a_group_with_a_diacritic_matches_its_encoded_member() -> Res {
+    let (st, _) = broker(doc(&[grant(
+        "sprava",
+        "group",
+        "doprava/správa",
+        &["5.7.2"],
+        cars(&["speed"]),
+    )]))
+    .await?;
+    fleet(&st).await?;
+    let jozo = [
+        ("x-jc-subject", "jo%C5%BEo"),
+        ("x-jc-groups", "city,doprava%2Fspr%C3%A1va"),
+    ];
+    let (code, list) = send(&st, "GET", QUERY, &jozo, None).await?;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list), car_ids(&[1, 2, 3]));
+    // a broken escape is that member dropped, never a wider caller
+    let broken = [
+        ("x-jc-subject", "jo%C5"),
+        ("x-jc-groups", "doprava%2Fspr%C3"),
+    ];
+    assert_eq!(
+        send(&st, "GET", QUERY, &broken, None).await?.0,
+        StatusCode::FORBIDDEN
+    );
+    Ok(())
+}
+
 /// `doc` with the views member (README section 2, T-3702).
 fn bound(policies: &[Value], views: Value) -> Value {
     with(doc(policies), "views", views)
