@@ -389,17 +389,18 @@ impl<'a> Terms<'a> {
         if !matches!(m.shape, Shape::Language | Shape::Vocab) {
             return Ok(None);
         }
-        let (CompareOp::Eq, Literal::String(_)) = (op, lit) else {
+        let (CompareOp::Eq, Literal::String(s)) = (op, lit) else {
             return Err(Refused::Later);
         };
         let term = self.term_of(&m.iri);
+        let s = Value::from(s.as_str());
         Ok(Some(if matches!(m.shape, Shape::Language) {
-            format!("{term}[*]=={}", value(lit)?)
+            format!("{term}[*]=={s}")
         } else {
             if !self.expand_values.contains(&term) {
                 self.expand_values.push(term.clone());
             }
-            format!("{term}=={}", value(lit)?)
+            format!("{term}=={s}")
         }))
     }
 
@@ -470,12 +471,7 @@ impl<'a> Terms<'a> {
         // `temperature.observedAt`.
         if let [name, annotation] = path.as_slice() {
             if annotation == OBSERVED_AT {
-                let (None, member) = self
-                    .leaf(std::slice::from_ref(name))
-                    .ok_or(Refused::Later)?
-                else {
-                    return Err(Refused::Later);
-                };
+                let member = self.set.members.get(name).ok_or(Refused::Later)?;
                 return Ok(format!("{}.observedAt", self.term_of(&member.iri)));
             }
         }
@@ -928,6 +924,12 @@ mod tests {
 
     #[test]
     fn any_over_a_list_property_is_membership() {
+        let var = |name: &str, path: &[&str]| {
+            Expr::Member(MemberPath {
+                variable: Some(name.into()),
+                path: path.iter().map(|p| (*p).to_owned()).collect(),
+            })
+        };
         let x = || {
             Expr::Member(MemberPath {
                 variable: Some("x".into()),
@@ -963,8 +965,28 @@ mod tests {
             any(&["name"], cmp(x(), CompareOp::Eq, a())),
             any(&["scope"], cmp(x(), CompareOp::Eq, a())),
             any(&["hidden"], cmp(x(), CompareOp::Eq, a())),
+            any(&["tags"], cmp(var("y", &[]), CompareOp::Eq, a())),
+            any(&["tags"], cmp(var("x", &["sub"]), CompareOp::Eq, a())),
+            any(
+                &["tags"],
+                Expr::In(Box::new(m("name")), vec![Literal::String("a".into())]),
+            ),
+            Expr::Any {
+                collection: MemberPath {
+                    variable: Some("y".into()),
+                    path: vec!["tags".into()],
+                },
+                lambda: Some(("x".into(), Box::new(cmp(x(), CompareOp::Eq, a())))),
+            },
         ] {
             assert_eq!(q(&refused), Err(Refused::Later), "{refused:?}");
+        }
+        let unknown = || Expr::Alias("missing".into());
+        for bad in [
+            any(&["tags"], cmp(x(), CompareOp::Eq, unknown())),
+            any(&["tags"], cmp(unknown(), CompareOp::Eq, x())),
+        ] {
+            assert_eq!(q(&bad), Err(Refused::Bad), "an unknown alias: {bad:?}");
         }
     }
 
@@ -1036,6 +1058,10 @@ mod tests {
             within("location", area(3857, &square)),
             within("hidden", area(4326, &square)),
             Expr::Call(Method::GeoIntersects, vec![m("location")]),
+            Expr::Call(
+                Method::GeoIntersects,
+                vec![lit(Literal::Int(1)), area(4326, &square)],
+            ),
         ] {
             assert_eq!(refused(&e), Err(Refused::Later), "{e:?}");
         }
