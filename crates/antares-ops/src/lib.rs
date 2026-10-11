@@ -630,7 +630,8 @@ pub mod test_kit {
             Ok(Self { state, reload })
         }
 
-        /// The same broker asking `engine` (ADR-0020).
+        /// The same broker asking `engine` (ADR-0020). Its view table was
+        /// loaded before: `/q/policy` keeps answering as without an engine.
         #[must_use]
         pub fn with_policy(self, engine: Arc<dyn super::policy::PolicyEngine>) -> Self {
             Self {

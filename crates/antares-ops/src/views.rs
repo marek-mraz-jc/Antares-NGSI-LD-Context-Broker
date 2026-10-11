@@ -35,6 +35,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
 
+pub mod rule_documents;
+
 /// How often, in milliseconds, every pod rebuilds its table from the store
 /// (default 5000): the bound on how long a view written on one pod takes to
 /// open, change or close on another.
@@ -376,6 +378,8 @@ struct Reloader {
     /// Each stored document and its entry, so an unchanged view is not
     /// validated (and its notes not logged) again on every reload.
     cache: tokio::sync::Mutex<HashMap<String, (Value, ViewEntry)>>,
+    /// The same for the policy engine's rule documents, per Tenant.
+    policy: tokio::sync::Mutex<rule_documents::Cache>,
     /// [`SCHEMA_MAX_ENV`]; `None` refuses every schema write.
     schema_max: Option<usize>,
 }
@@ -416,7 +420,8 @@ impl Reloader {
         );
         self.state.views.replace_schemas(schemas);
         *cache = next;
-        Ok(())
+        drop(cache);
+        rule_documents::reload(&self.state, &mut *self.policy.lock().await).await
     }
 }
 
@@ -447,9 +452,11 @@ fn schema_max(raw: Option<String>) -> Result<Option<usize>, String> {
     }
 }
 
-/// Load the stored views into `state`'s table, serve `/q/views` on its
-/// admin surface, and reload the table every [`RELOAD_ENV`] milliseconds.
-/// Call it once, before the router is built, inside a tokio runtime.
+/// Load the stored views into `state`'s table, serve `/q/views`,
+/// `/q/schemas` and `/q/policy` on its admin surface, and reload the table
+/// every [`RELOAD_ENV`] milliseconds. Call it once, after the policy engine
+/// is attached (the rule documents go to the engine of the `state` given
+/// here) and before the router is built, inside a tokio runtime.
 ///
 /// # Errors
 /// The store's, or routes set already.
@@ -457,6 +464,7 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
     let reloader = Arc::new(Reloader {
         state: state.clone(),
         cache: tokio::sync::Mutex::new(HashMap::new()),
+        policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
         schema_max: schema_max(std::env::var(SCHEMA_MAX_ENV).ok())?,
     });
     reloader.reload().await?;
@@ -507,7 +515,8 @@ impl Reload {
 }
 
 /// `/q/views`: the table (GET), and one view's document (GET, PUT, DELETE);
-/// `/q/schemas/{tenant}`: one Tenant's `LinkML` schema (GET, PUT, DELETE).
+/// `/q/schemas/{tenant}`: one Tenant's `LinkML` schema (GET, PUT, DELETE);
+/// and `/q/policy` beside them.
 fn admin(r: &Weak<Reloader>) -> Router {
     let (list, one, put, del) = (r.clone(), r.clone(), r.clone(), r.clone());
     let (s_get, s_put, s_del) = (r.clone(), r.clone(), r.clone());
@@ -543,6 +552,7 @@ fn admin(r: &Weak<Reloader>) -> Router {
                 })
                 .delete(move |Path(id): Path<String>| serve(del.clone(), |r| delete_one(r, id))),
         )
+        .merge(rule_documents::routes(r))
 }
 
 /// Run `f` with the reloader, or answer 503 once the runtime that ran
@@ -840,6 +850,7 @@ mod tests {
         let r = Arc::new(Reloader {
             state: AppState::new("antares-test".into()),
             cache: tokio::sync::Mutex::new(HashMap::new()),
+            policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
             schema_max: None,
         });
         let put = put_schema(r.clone(), "city".into(), Bytes::from_static(b"{}")).await;
