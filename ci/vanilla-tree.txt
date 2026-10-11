@@ -2524,9 +2524,7 @@ antares-broker v0.1.3
 │   │       └── tower-http v0.7.1 (*)
 │   ├── tower-http feature "cors"
 │   │   └── tower-http v0.7.1 (*)
-│   ├── tower-http feature "default"
-│   │   └── tower-http v0.7.1 (*)
-│   └── tower-http feature "normalize-path"
+│   └── tower-http feature "default"
 │       └── tower-http v0.7.1 (*)
 ├── futures-util v0.3.34 (*)
 ├── metrics-exporter-prometheus v0.18.3
@@ -2645,6 +2643,7 @@ antares-broker v0.1.3
 │   └── hyper-util feature "server" (*)
 ├── hyper-util feature "tokio" (*)
 ├── tower feature "default" (*)
+├── tower feature "util" (*)
 ├── antares-sql feature "postgres"
 │   └── antares-sql v0.1.3 (*)
 ├── antares-store feature "default" (*)
@@ -2653,7 +2652,6 @@ antares-broker v0.1.3
 ├── tower-http feature "catch-panic" (*)
 ├── tower-http feature "cors" (*)
 ├── tower-http feature "default" (*)
-├── tower-http feature "normalize-path" (*)
 ├── antares-bus feature "default"
 │   └── antares-bus v0.1.3
 │       ├── futures-util v0.3.34 (*)
