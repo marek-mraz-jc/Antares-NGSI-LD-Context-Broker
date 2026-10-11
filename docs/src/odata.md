@@ -34,7 +34,27 @@ intersected with what the view shows:
 - a Relationship to a type the view shows is a navigation property; to
   any other type, the object URI as a string (R5);
 - every type derives from `NgsiLd.Entity`: `id` (the key), `_types`,
-  `scope`, `createdAt`, `modifiedAt`.
+  `scope`, `createdAt`, `modifiedAt`;
+- a class whose LinkML schema marks a slot `identifier: true`, and whose
+  view shows it, is keyed by that slot instead (T-3720): the type declares
+  the members of `NgsiLd.Entity` itself, and key value `v` names the Entity
+  `urn:ngsi-ld:{Class}:{v}`. The key is `Edm.String`, `Edm.Int64` for an
+  `integer` slot, or `Edm.Guid` when the slot carries the annotation
+  `edm_type: Edm.Guid`, so `Products(2dcd1e3c-e38a-5391-ba63-17ecfeaea3c2)`
+  reads `urn:ngsi-ld:Products:2dcd1e3c-e38a-5391-ba63-17ecfeaea3c2`.
+  `(ID=v)` names the same Entity. `(id='urn:…')` still names any Entity of
+  the set, and it is the canonical key of an Entity whose URN does not
+  follow the pattern. A key value never names an Entity of another set.
+- the schema narrows and annotates (T-3722): a slot's `edm_type` annotation
+  makes an `integer` an `Edm.Byte`, `Edm.SByte`, `Edm.Int16` or `Edm.Int32`,
+  a `float` or `double` an `Edm.Single`, and a `string` an `Edm.Guid`,
+  `Edm.Duration` or `Edm.Binary`, and a write is checked against that type;
+  `description` is `Core.Description`; `odata_computed: "true"` is
+  `Core.Computed` and `odata_immutable: "true"` is `Core.Immutable`, and a
+  body that writes such a member where the term forbids it is `400`; a
+  class's `odata_insertable`, `odata_updatable` or `odata_deletable` set to
+  `"false"` takes that write from its set (`405`), never adding one the
+  view's `operations` lack.
 
 A view without a schema, or with one the build cannot read, has no OData
 endpoint (`404`). Nothing the view hides appears in a document, a name or
@@ -57,11 +77,14 @@ root.
 | OData | NGSI-LD |
 |---|---|
 | `{Set}` | Query Entities (`type`), `count=true` |
-| `{Set}('{id}')`, `{Set}(id='{id}')` | Retrieve Entity |
+| `{Set}('{id}')`, `{Set}(id='{id}')`, the identifier's `{Set}(v)` | Retrieve Entity |
+| `$entity?$id={url}` | the `{Set}(key)` the percent-decoded URL names, absolute under the service root or relative to it; any other well-formed id, foreign or naming nothing, is `404` like a hidden Entity, and a missing id, a broken escape or an id with its own query options is `400` (T-3738) |
 | `{Set}/$count` | Query Entities, `limit=0&count=true`, `text/plain` |
 | `{Set}('{id}')/{prop}`, `.../{prop}/$value` | Retrieve Attribute Value (the view's `operations` name `retrieve_attribute_value`); `$value` is `text/plain` |
 | `{Set}('{id}')/{nav}` | Retrieve Entity of the source, then Retrieve Entity of a single target or Query Entities `id=…` of up to 1000 |
 | `{Set}('{id}')/{nav}/$ref` | the Relationship's objects as entity references |
+| `{Set}/$ref` | Query Entities as for `{Set}`, with `$filter`, `$orderby`, `$top`, `$skip` and `$count`; each Entity as its reference `{Set}(key)`; `$select` or `$expand` is `400` |
+| `{Set}('{id}')/$ref` | Retrieve Entity; the Entity's reference, `404` when hidden or absent; `$select` or `$expand` is `400` |
 | `POST {Set}/$query` | the same `GET`: the body's options (`text/plain` or a form) joined to the URL's |
 | `$filter` | `q` and `id` (section 4) |
 | `$orderby` | `orderBy` on `id` and single-valued values, `;desc` |
@@ -125,10 +148,17 @@ member is `400` before any operation.
 (JSON Format 19) batch and answers in the same format. Each member is
 served as a request of its own: parsed, refused and gated as it would be
 alone, under the outer request's tenant, subject and credentials. Members
-run in order. The first failed member ends the batch unless
-`Prefer: odata.continue-on-error` (or `continue-on-error`) is sent; then
-every member runs, a member whose `dependsOn` failed answers `424`, and
-the response carries `Preference-Applied`.
+run in order. In a multipart batch the first failed member ends the batch
+unless `Prefer: odata.continue-on-error` (or `continue-on-error`) is sent
+(Protocol 11.7.7.4). A JSON batch runs every member unless
+`continue-on-error=false` is sent (JSON Format 19.4). A member whose
+`dependsOn` failed answers `424` (JSON Format 19.1). The response carries
+`Preference-Applied` when the preference asked to go on.
+
+A JSON batch is a 4.01 format: with `OData-MaxVersion: 4.0` it is `400`;
+without the header it reads.
+The multipart framing reads CRLF or a bare LF as a line end; a lone CR is
+`400`, and a part's body keeps its bytes.
 
 The whole batch is `400` before any member runs when a member URL leaves
 this view's service root (another host, view or root, a `.` or `..`
@@ -155,8 +185,13 @@ so a client `Link` header cannot change what a filter means.
   `t0{t2:t1}=="Ann"` under a `join`: the broker resolves the target
   through the view and the engine, a hidden one like a dangling link.
 
-`ne` holds on an absent member, as in OData. A number past 2^53 is `400`
-(NGSI-LD compares `f64`). A filter longer than 4096 bytes as `q` is `400`
+`ne` holds on an absent member, as in OData. A literal compared with a
+member, or listed in `in`, is of the member's type or the filter is `400`
+(URL 5.1.1.1, T-3725): `Name eq 1` and `Price eq 'abc'` are refused, a
+number promotes among the numeric types (`Quantity lt 7.5`), an integer
+past its type's range is refused (`Size eq 9223372036854775808`), and
+`null` compares with any member. A number past 2^53 is `400` (NGSI-LD
+compares `f64`). A filter longer than 4096 bytes as `q` is `400`
 `TooComplexQuery`. Lambda operators, arithmetic, other functions, two
 members compared and paths past one hop are `501`.
 

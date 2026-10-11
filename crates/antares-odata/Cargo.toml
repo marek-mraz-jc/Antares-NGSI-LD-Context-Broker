@@ -25,6 +25,7 @@ odata-url = { path = "../odata-url", features = ["edm"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+uuid = { version = "1", default-features = false, features = ["std", "v4"] }
 
 [dev-dependencies]
 antares-ops = { workspace = true, features = ["test-kit"] }

@@ -7,11 +7,16 @@
 
 mod writes;
 
+use antares_ops::policy::{
+    Decision, DecisionFuture, NotifyDecision, Operation, PolicyEngine, Subject,
+};
+use antares_ops::test_kit::TestBroker;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use serde_json::{json, Value};
+use std::sync::{Arc, Mutex, PoisonError};
 use tower::ServiceExt;
-use writes::{city, odata, send, stored, CITY, ROOT};
+use writes::{city, city_on, odata, send, stored, CITY, ROOT};
 
 /// The base a request without `Host` is answered under (no
 /// `ANTARES_PUBLIC_URL` in tests): the entity id is absolute.
@@ -111,7 +116,9 @@ async fn odata_writes_an_entity_through_its_view() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn odata_bind_to_hidden_target_is_404_and_writes_nothing() {
+async fn odata_bind_to_hidden_or_missing_target_is_400_and_writes_nothing() {
+    // Protocol 11.4.2.1: the bind is the request body's; Person:2 is hidden,
+    // Person:9 absent, and both answer the same 400 (T-3760, O5).
     let (_b, app) = city().await.expect("broker");
     let mut answers = Vec::new();
     for (n, person) in [(10, "urn:ngsi-ld:Person:2"), (11, "urn:ngsi-ld:Person:9")] {
@@ -119,7 +126,8 @@ async fn odata_bind_to_hidden_target_is_404_and_writes_nothing() {
                             "owner@odata.bind": format!("Person('{person}')")})
         .to_string();
         let (status, body) = odata(&app, Method::POST, "Car", Some(&create)).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{person}: {body}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{person}: {body}");
+        assert_eq!(body["error"]["target"], "owner", "{person}: {body}");
         assert_eq!(
             stored(&app, &format!("urn:ngsi-ld:Car:{n}")).await.0,
             StatusCode::NOT_FOUND,
@@ -133,7 +141,7 @@ async fn odata_bind_to_hidden_target_is_404_and_writes_nothing() {
             Some(&merge),
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{person}: {merged}");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{person}: {merged}");
         answers.push((body, merged));
     }
     assert_eq!(
@@ -224,13 +232,6 @@ async fn odata_write_refusals_name_no_hidden_thing() {
     let (_b, app) = city().await.expect("broker");
     let one = "Car('urn:ngsi-ld:Car:1')";
     for (method, path, body, want, code) in [
-        (
-            Method::POST,
-            "Car",
-            r#"{"speed": 1}"#,
-            StatusCode::BAD_REQUEST,
-            "MissingKey",
-        ),
         (
             Method::POST,
             "Car",
@@ -598,4 +599,205 @@ async fn odata_a_property_no_write_may_name_is_refused_before_any_operation() {
             "{id} unchanged: {car}"
         );
     }
+}
+
+/// A create's answer: status, `Location`, `OData-EntityId`, body.
+async fn create(
+    app: &axum::Router,
+    body: &str,
+    minimal: bool,
+) -> (StatusCode, String, String, Value) {
+    let mut req = Request::post(format!("{ROOT}/Car"))
+        .header("NGSILD-Tenant", "city")
+        .header("Content-Type", "application/json")
+        .header("Content-Length", body.len());
+    if minimal {
+        req = req.header("Prefer", "return=minimal");
+    }
+    let Ok(resp) = app
+        .clone()
+        .oneshot(req.body(Body::from(body.to_owned())).unwrap_or_default())
+        .await;
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (status, location, entity_id) =
+        (resp.status(), header("Location"), header("OData-EntityId"));
+    let bytes = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .unwrap_or_default();
+    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, location, entity_id, body)
+}
+
+/// The minted id of `Car('urn:ngsi-ld:Car:{uuid}')` in a `Location`.
+fn minted(location: &str) -> Option<String> {
+    let id = location
+        .strip_prefix(&format!("{PUBLIC}{ROOT}/Car('"))?
+        .strip_suffix("')")?;
+    let uuid = id.strip_prefix("urn:ngsi-ld:Car:")?;
+    (uuid.len() == 36 && uuid.split('-').count() == 5).then(|| id.to_owned())
+}
+
+/// W1 (T-3721): a create that leaves out the key gets `urn:ngsi-ld:Car:{uuid}`,
+/// named by `Location` and, under `return=minimal`, `OData-EntityId`; each
+/// create mints its own; `$metadata` says the key is the service's to
+/// compute when the client does not name it.
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_create_without_a_key_mints_its_id() {
+    let (_b, app) = city().await.expect("broker");
+    let (status, location, _, body) = create(&app, r#"{"speed": 4, "scope": ["/a"]}"#, false).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = minted(&location).unwrap_or_else(|| panic!("a minted Location: {location:?}"));
+    assert_eq!(body["id"].as_str(), Some(id.as_str()), "{body}");
+    assert_eq!(body["speed"].as_f64(), Some(4.0), "{body}");
+    assert_eq!(stored(&app, &id).await.0, StatusCode::OK, "it reads back");
+
+    let (status, location, entity_id, _) = create(&app, r#"{"scope": ["/a"]}"#, true).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(location, entity_id);
+    let quiet = minted(&entity_id).unwrap_or_else(|| panic!("{entity_id:?}"));
+    assert_eq!(stored(&app, &quiet).await.0, StatusCode::OK);
+
+    let body = r#"{"scope": ["/a"]}"#;
+    let (a, b) = tokio::join!(create(&app, body, true), create(&app, body, true));
+    let (a, b) = (minted(&a.1), minted(&b.1));
+    assert!(
+        a.is_some() && b.is_some() && a != b,
+        "two creates, two ids: {a:?} {b:?}"
+    );
+
+    let (status, metadata) = odata(&app, Method::GET, "$metadata", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let xml = metadata.as_str().unwrap_or_default();
+    let id_property = xml
+        .split("<Property Name=\"id\"")
+        .nth(1)
+        .and_then(|rest| rest.split("</Property>").next())
+        .unwrap_or_default();
+    assert!(
+        id_property.contains(r#"Term="Core.ComputedDefaultValue" Bool="true""#),
+        "{id_property}"
+    );
+}
+
+/// Once armed (after the seed), refuses Create Entity of a Car and records
+/// the ids each create named.
+#[derive(Default)]
+struct NoNewCars(Mutex<Option<Vec<String>>>);
+
+impl PolicyEngine for NoNewCars {
+    fn name(&self) -> &'static str {
+        "no-new-cars"
+    }
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        let car = op.types.iter().any(|t| *t == format!("{CITY}Car"));
+        let mut seen = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let armed = seen.is_some();
+        if let (Some(seen), "5.6.1") = (seen.as_mut(), op.clause) {
+            seen.extend(op.ids.iter().map(|id| (*id).to_owned()));
+        }
+        Box::pin(std::future::ready(
+            if armed && op.clause == "5.6.1" && car {
+                Decision::Deny("no new Cars".into())
+            } else {
+                Decision::Allow
+            },
+        ))
+    }
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// The minted id meets the Policy as a supplied one does: the gate sees it,
+/// a refusal writes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_a_minted_id_meets_the_policy() {
+    let engine = Arc::new(NoNewCars::default());
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
+    let b = TestBroker::new()
+        .await
+        .expect("broker")
+        .with_policy(engine.clone());
+    let (_b, app) = city_on(b).await.expect("city");
+    *engine.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(Vec::new());
+    let (status, location, _, body) = create(&app, r#"{"scope": ["/a"]}"#, false).await;
+    assert_eq!(
+        (status, location.as_str()),
+        (StatusCode::FORBIDDEN, ""),
+        "{body}"
+    );
+    let seen = engine
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .unwrap_or_default();
+    let [id] = seen.as_slice() else {
+        panic!("one create, one id: {seen:?}");
+    };
+    assert!(
+        id.starts_with("urn:ngsi-ld:Car:"),
+        "the gate sees the minted id: {id}"
+    );
+    assert_eq!(
+        stored(&app, id).await.0,
+        StatusCode::NOT_FOUND,
+        "nothing written"
+    );
+}
+
+/// Once armed, refuses Retrieve Entity of a Person.
+#[derive(Default)]
+struct NoPersonReads(Mutex<bool>);
+
+impl PolicyEngine for NoPersonReads {
+    fn name(&self) -> &'static str {
+        "no-person-reads"
+    }
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        let armed = *self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let person = op.types.iter().any(|t| *t == format!("{CITY}Person"));
+        Box::pin(std::future::ready(
+            if armed && op.clause == "5.7.1" && person {
+                Decision::Deny("no Person reads".into())
+            } else {
+                Decision::Allow
+            },
+        ))
+    }
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// T-3760: only a target that is not there is the body's 400; the engine
+/// refusing to read a bind target keeps its own answer, and nothing is
+/// written.
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_bind_keeps_the_engines_refusal_of_its_target() {
+    let engine = Arc::new(NoPersonReads::default());
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
+    let b = TestBroker::new()
+        .await
+        .expect("broker")
+        .with_policy(engine.clone());
+    let (_b, app) = city_on(b).await.expect("city");
+    *engine.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    let create = json!({"id": "urn:ngsi-ld:Car:12", "scope": ["/a"],
+                        "owner@odata.bind": "Person('urn:ngsi-ld:Person:1')"})
+    .to_string();
+    let (status, body) = odata(&app, Method::POST, "Car", Some(&create)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        stored(&app, "urn:ngsi-ld:Car:12").await.0,
+        StatusCode::NOT_FOUND,
+        "nothing written"
+    );
 }

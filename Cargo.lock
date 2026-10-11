@@ -132,7 +132,6 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tower",
- "tower-http 0.7.1",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -237,6 +236,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -333,6 +333,7 @@ dependencies = [
  "antares-ops",
  "axum",
  "http-body-util",
+ "proptest",
  "serde_json",
  "tokio",
  "tower",
@@ -2366,6 +2367,14 @@ name = "odata-url"
 version = "0.1.3"
 dependencies = [
  "odata-csdl",
+ "proptest",
+ "serde_json",
+]
+
+[[package]]
+name = "ogc-cql2"
+version = "0.1.3"
+dependencies = [
  "proptest",
  "serde_json",
 ]

@@ -63,13 +63,22 @@ const CHUNK = 500;
 const json = { "Content-Type": "application/json", ...(__ENV.TENANT ? { "NGSILD-Tenant": __ENV.TENANT } : {}) };
 const headers = __ENV.TENANT ? { "NGSILD-Tenant": __ENV.TENANT } : {};
 
+// SHAPE=seed seeds and measures nothing, SHAPE=unseed deletes the seed and
+// measures nothing; SEED=0 skips the seed and leaves it standing, so a run
+// measures its shape alone: k6 counts setup()'s requests in http_reqs and
+// http_req_duration, and at ENTITIES=100000 the 200 upserts of the seed
+// were most of a 5 s row's numbers (T-3735). dev/perf/shapes.sh seeds once
+// per store, measures with SEED=0 and unseeds after its rows.
 export const options = {
   scenarios: {
-    shape: {
-      executor: "constant-vus",
-      vus: Number(__ENV.VUS || 50),
-      duration: __ENV.DURATION || "5s",
-    },
+    shape:
+      SHAPE === "seed" || SHAPE === "unseed"
+        ? { executor: "shared-iterations", vus: 1, iterations: 1 }
+        : {
+            executor: "constant-vus",
+            vus: Number(__ENV.VUS || 50),
+            duration: __ENV.DURATION || "5s",
+          },
   },
   summaryTrendStats: ["med", "p(99)", "max"],
   // seeding ENTITIES=100000 in upserts of 500 outlasts k6's 60 s default
@@ -92,6 +101,7 @@ function vehicle(n, speed) {
 }
 
 export function setup() {
+  if (__ENV.SEED === "0" || SHAPE === "unseed") return;
   for (let n = 0; n < N; n += CHUNK) {
     const batch = [];
     for (let i = n; i < Math.min(n + CHUNK, N); i++) batch.push(vehicle(i, i % 130));
@@ -101,6 +111,7 @@ export function setup() {
 }
 
 export default function () {
+  if (SHAPE === "seed" || SHAPE === "unseed") return;
   let r;
   if (SHAPE === "facade") {
     r = http.get(`${ROOT}/x/example/things?kind=Vehicle`, { headers });
@@ -168,6 +179,8 @@ export default function () {
 }
 
 export function teardown() {
+  // a run that did not seed leaves the seed to the run after it
+  if (SHAPE === "seed" || (__ENV.SEED === "0" && SHAPE !== "unseed")) return;
   for (let n = 0; n < N; n += CHUNK) {
     const ids = [];
     for (let i = n; i < Math.min(n + CHUNK, N); i++) ids.push(`urn:ngsi-ld:Vehicle:shape:${i}`);
