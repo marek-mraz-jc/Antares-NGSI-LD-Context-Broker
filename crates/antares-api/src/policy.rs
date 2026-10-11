@@ -252,12 +252,13 @@ pub enum Decision {
 
 /// The writes by id a [`Decision::AllowIf`] can condition: each changes or
 /// deletes Entities that are already stored, by id, and judges each of them
-/// inside its store operation. A create has no stored Entity to judge, and
-/// Batch Upsert may create; a temporal write changes the evolution, not the
-/// Entity a filter reads.
-pub const WRITE_BY_ID: [&str; 11] = [
-    "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.17", "5.6.18", "5.6.19", "5.6.9", "5.6.10",
-    "5.6.20",
+/// inside its store operation. A create has no stored Entity to judge; Batch
+/// Upsert updates the members its condition selects and creates none of the
+/// conditioned ones (T-3668). A temporal write changes the evolution, not
+/// the Entity a filter reads.
+pub const WRITE_BY_ID: [&str; 12] = [
+    "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.17", "5.6.18", "5.6.19", "5.6.8", "5.6.9",
+    "5.6.10", "5.6.20",
 ];
 
 /// Why a write conditioned on its stored Entity is refused rather than
@@ -2751,9 +2752,7 @@ mod tests {
                 "{clause}: an empty condition selects everything"
             );
         }
-        for clause in [
-            "5.6.1", "5.6.7", "5.6.8", "5.6.12", "5.6.21", "5.7.1", "5.8.1",
-        ] {
+        for clause in ["5.6.1", "5.6.7", "5.6.12", "5.6.21", "5.7.1", "5.8.1"] {
             assert!(
                 matches!(resolve(clause, conditioned.clone()), Decision::Deny(_)),
                 "{clause}"

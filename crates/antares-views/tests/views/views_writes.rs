@@ -5,9 +5,14 @@
 //! at an Entity the view shows, and a refused write leaves the store as it
 //! was.
 
-use crate::common::{fixture, prop, rel, send, stored, Answer, FLEET};
+use crate::common::{fixture, fixture_with, prop, rel, send, stored, Answer, FLEET};
+use antares_ops::policy::{
+    Decision, DecisionFuture, Filter, NotifyDecision, Operation, PolicyEngine, Subject,
+};
+use antares_ops::test_kit::TestBroker;
 use axum::http::{Method, StatusCode};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 const MOVES_OUT: &str = "the write would move the Entity out of this view";
 const NOT_WRITABLE: &str = "the write names an Attribute this view does not let it write";
@@ -629,5 +634,69 @@ async fn views_batch_upsert_is_decided_per_entity() -> Result<(), String> {
         a.text
     );
     assert_eq!(value(&f.app, "urn:ngsi-ld:Car:24", "speed").await, 2);
+    Ok(())
+}
+
+/// Batch Upsert (5.6.8) under a write condition (T-3668): only red Cars.
+struct RedOnly;
+
+impl PolicyEngine for RedOnly {
+    fn name(&self) -> &'static str {
+        "red-only"
+    }
+
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        Box::pin(std::future::ready(if op.clause == "5.6.8" {
+            Decision::AllowIf(Filter {
+                q: antares_ql::parse_q("colour==\"red\"").ok().map(Box::new),
+                ..Filter::default()
+            })
+        } else {
+            Decision::Allow
+        }))
+    }
+
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// Through a view, a conditioned upsert updates the red Car, and the blue
+/// one and an absent id answer the same 404: neither is written, neither
+/// is created.
+#[tokio::test(flavor = "multi_thread")]
+async fn views_batch_upsert_holds_each_member_to_its_condition() -> Result<(), String> {
+    let f = fixture_with(TestBroker::new().await?.with_policy(Arc::new(RedOnly))).await?;
+    let car = |n: &str, speed: u32| json!({"id": format!("urn:ngsi-ld:Car:{n}"), "type": "Car", "speed": prop(&json!(speed))});
+    let upsert = "/entityOperations/upsert";
+    for (uri, body) in [
+        (
+            format!("{upsert}?options=update"),
+            json!([car("1", 11), car("2", 51), car("77", 1)]),
+        ),
+        (upsert.to_owned(), json!([car("2", 52), car("77", 2)])),
+    ] {
+        let a = write(&f.app, Method::POST, &uri, Some(&body)).await;
+        assert_eq!(a.status, StatusCode::MULTI_STATUS, "{uri}: {}", a.text);
+        let blue = entry(&a, "urn:ngsi-ld:Car:2");
+        let absent = entry(&a, "urn:ngsi-ld:Car:77");
+        assert_eq!(at(blue, "/error/status"), 404, "{uri}: {}", a.text);
+        assert_eq!(
+            blue.to_string().replace("Car:2", "Car:77"),
+            absent.to_string(),
+            "{uri}: a member the condition does not select answers as an absent one"
+        );
+        assert_eq!(
+            value(&f.app, "urn:ngsi-ld:Car:2", "speed").await,
+            50,
+            "{uri}"
+        );
+        assert_eq!(
+            stored(&f.app, "urn:ngsi-ld:Car:77").await.status,
+            StatusCode::NOT_FOUND,
+            "{uri}: a conditioned member never creates"
+        );
+    }
+    assert_eq!(value(&f.app, "urn:ngsi-ld:Car:1", "speed").await, 11);
     Ok(())
 }
