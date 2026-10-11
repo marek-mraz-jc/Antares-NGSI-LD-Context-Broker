@@ -11,7 +11,8 @@
 #                  CI sets 0 to run the whole suite and report everything
 #   SETUP_URL      when set, every setup and teardown reaches this root and
 #                  only the TP bodies reach BROKER_URL (a view's NGSI-LD
-#                  root, surfaces-conformance.md 2.3); the reset uses it too
+#                  root, surfaces-conformance.md 2.3); the reset uses it too,
+#                  and every body request lands in $RESULTS_DIR/requests.jsonl
 # -e stays off: a failing TP is a result to report, not an abort.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -86,7 +87,13 @@ EXTRA=()
 # TPs needing a specially-configured broker (ANTARES_TEMPORAL=none) never
 # belong in a default conformance run — they get their own harness.
 EXTRA+=(--exclude config_no_temporal)
-[ -n "${SETUP_URL:-}" ] && EXTRA+=(--listener "$PWD/dev/etsi_setup_url.py;$SETUP_URL")  # ; keeps the URL's colons
+# ; keeps the URL's colons; requests.jsonl is what dev/etsi-view-diff.py reads
+if [ -n "${SETUP_URL:-}" ]; then
+  record="$RESULTS_DIR/requests.jsonl"
+  case "$record" in /*) ;; *) record="$PWD/$record" ;; esac
+  : > "$record"
+  EXTRA+=(--listener "$PWD/dev/etsi_setup_url.py;$SETUP_URL;$record")
+fi
 
 status=0
 for s in $SUITES; do

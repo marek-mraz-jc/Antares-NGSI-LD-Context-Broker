@@ -2,8 +2,9 @@ name: surfaces-conformance
 
 # The surfaces' conformance jobs (docs/analysis/surfaces-conformance.md
 # section 7). This file holds the MCP pair (T-3516), the OData suites
-# (T-3510, T-3714), etsi-iop (T-3675), ws-conformance (T-3518) and
-# linkml-conformance (T-3512); the other surfaces add their jobs here.
+# (T-3510, T-3714), etsi-iop (T-3675), ws-conformance (T-3518),
+# linkml-conformance (T-3512) and etsi-full-all (T-3501); the other surfaces
+# add their jobs here.
 #
 #   mcp-conformance  the official @modelcontextprotocol/conformance 0.1.16
 #                    against /x/views/all/mcp, both revisions it knows that
@@ -30,6 +31,11 @@ name: surfaces-conformance
 #                    linkml 1.12.0 (lint, gen-json-schema, gen-shacl) and
 #                    pyshacl 0.40.1, the view's Entities validated against
 #                    the served JSON Schema and SHACL
+#   etsi-full-all    the serial ETSI suites on the full image, at the plain
+#                    root (E1) and through view `all` (E2), TP by TP: a
+#                    difference passes only as a refusal the view owes
+#                    (dev/etsi-view-diff.py) or a TP dev/etsi-view-known.json
+#                    names with its task (T-3501)
 #   etsi-icsr        the ETSI DistributedOperations directory on broker1 of
 #                    the internal-csr image with ANTARES_SELF_URLS set to
 #                    its own URL, compared TP by TP with the vanilla image
@@ -651,3 +657,85 @@ jobs:
           title: etsi-icsr went red
           body: The ETSI DistributedOperations verdicts of the internal-csr build differ from the vanilla build of the same commit.
           log-file: icsr-compare.txt
+
+  # E1 and E2 of surfaces-conformance.md 2.3 (T-3501): the serial suites on
+  # the full image's plain root, and through view `all` (ci/views/etsi) with
+  # every setup and teardown at the plain root (dev/etsi_setup_url.py).
+  # Pull requests run Consumption and Provision, the nightly every serial
+  # suite. Decided (worker-1, owner may override): cell `file` only, both on
+  # pull requests and nightly; the postgres cell adds a store, not a view path.
+  etsi-full-all-run:
+    name: etsi-full-all ${{ matrix.run }}
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [e1, e2]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OUT: results/etsi-${{ matrix.run }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the full image
+        run: docker build --build-arg FEATURES=mqtt,views,mcp,odata,ws -t antares-local:latest .
+      - name: The serial suites (${{ matrix.run }})
+        env:
+          STORE: file
+          SUITES: ${{ github.event_name == 'pull_request' && 'ContextInformation/Consumption,ContextInformation/Provision' || 'CommonBehaviours,ContextInformation,ContextSource,jsonldContext,DistributedOperations' }}
+          RESULTS_DIR: ${{ env.OUT }}
+          SKIP_BUILD: "1"
+          STOP_ON_ERROR: "0"
+          CALLBACK_HOST: localhost
+          API_SURFACES: admin,views
+          VIEWS: ${{ matrix.run == 'e2' && 'ci/views/etsi' || '' }}
+          NGSILD_BASE: ${{ matrix.run == 'e2' && '/x/views/all/ngsi-ld/v1' || '/ngsi-ld/v1' }}
+        run: ./dev/etsi-pipeline.sh || true
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: etsi-full-all-${{ matrix.run }}
+          path: |
+            ${{ env.OUT }}/tp-status.csv
+            ${{ env.OUT }}/requests.jsonl
+            ${{ env.OUT }}/run-summary.md
+            ${{ env.OUT }}/failures.csv
+            ${{ env.OUT }}/*-console.log
+            ${{ env.OUT }}/**/log.html
+          retention-days: 14
+
+  etsi-full-all:
+    name: etsi-full-all
+    needs: etsi-full-all-run
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: etsi-full-all-*
+          path: in
+      - name: Through view all, every TP answers as the plain root or owes its refusal
+        # explicit bash is -eo pipefail: the diff's exit survives the tee
+        shell: bash
+        run: |
+          pip install --quiet pyyaml
+          python3 dev/etsi-view-diff.py ci/views/etsi/all.json in/etsi-full-all-e1 in/etsi-full-all-e2 | tee view-diff.txt
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: etsi-full-all-diff
+          path: |
+            view-diff.txt
+            in/etsi-full-all-e2/owed-refusals.json
+          retention-days: 14
+      - name: File an issue on nightly failure
+        if: failure() && github.event_name == 'schedule'
+        uses: ./.github/actions/failure-issue
+        with:
+          title: etsi-full-all went red
+          body: Through view all, an ETSI TP answers otherwise than at the plain root of the same image, and no refusal of the view explains it.
+          log-file: view-diff.txt
