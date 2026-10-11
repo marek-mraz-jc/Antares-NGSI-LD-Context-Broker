@@ -323,6 +323,11 @@ fn norm_reg_member(
         // what "ignore" says, alongside the 4.8 system attributes.
         "@context" | "createdAt" | "modifiedAt" | "status" | "timesSent" | "timesFailed"
         | "lastSuccess" | "lastFailure" => return Ok(()),
+        // The `__` prefix is the broker's (`policy::SUBJECT_MEMBER`): this
+        // only sees a create body or a 5.9.3 fragment, so dropping it here
+        // stops a client from seeding the subject a Registration was
+        // created by and from replacing it later (T-3692).
+        k if k.starts_with("__") => return Ok(()),
         "id" => {
             let id = v
                 .as_str()
@@ -1036,6 +1041,14 @@ pub async fn create_registration(
         };
         validate_auxiliary_ops(&norm)?;
         crate::federation::admit_registration(&st, &tenant, &norm).await?;
+        // The creating subject, kept as a Subscription keeps it: an engine
+        // narrows Query Registrations (5.10.2) by the subject the broker
+        // recorded, never by a member the client wrote (T-3692).
+        if let Some(subject) =
+            crate::policy::subject_member(&crate::policy::subject_of(&tenant, &headers))
+        {
+            norm.insert(crate::policy::SUBJECT_MEMBER.into(), subject);
+        }
         let doc = {
             let _serialized = registration_write_lock(&tenant).await;
             take_live_registration(&st, &tenant, &id).await?;
@@ -1133,11 +1146,12 @@ pub async fn query_registrations(
         )?;
         let accept = parse_accept(&headers)?;
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(
+        let narrowing = gate!(
             st, &tenant, &headers, "5.10.2",
             scope_q: params.get("scopeQ").map(String::as_str),
         )
         .await?;
+        let cond = crate::policy::Condition::of(&narrowing);
         let bad = NgsiError::BadRequestData;
         let mut spec = CsrSpec::default();
         if let Some(s) = params.get("id") {
@@ -1249,7 +1263,7 @@ pub async fn query_registrations(
                     _ => return false,
                 }
             }
-            csr_matches(&spec, doc, &ctx)
+            csr_matches(&spec, doc, &ctx) && cond.as_ref().is_none_or(|c| c.holds_for_record(doc))
         };
         let matches = collect_matching(&st, &tenant, keep, *crate::bounds::MAX_FOLD_DOCS).await?;
         let (page, count_hdr, links) = crate::paging::paginate_accept(

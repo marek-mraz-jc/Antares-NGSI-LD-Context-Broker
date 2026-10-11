@@ -134,8 +134,14 @@ jobs:
       # rows of the same tables come from scale-weekly, which owns a database.
       - name: Startup time and idle footprint
         run: ./dev/perf/startup.sh
+      # ADR-0027 section 6 end to end (T-3523): a `full` binary in its own
+      # target dir, so the vanilla binary the other steps run stays the
+      # vanilla build; its `query`, `view`, `odata` and `mcp` rows follow
+      # the vanilla ones in the same table.
+      - name: Build the surfaces binary
+        run: CARGO_TARGET_DIR=target/full cargo build -q --release -p antares-broker --features full -j 2
       - name: Throughput per request shape
-        run: ./dev/perf/shapes.sh
+        run: BIN_SURFACES=target/full/release/antares ./dev/perf/shapes.sh
       - name: Core scaling
         run: ./dev/perf/core-scale.sh
       # The write shape as well: the in-process store holds one writer lock,

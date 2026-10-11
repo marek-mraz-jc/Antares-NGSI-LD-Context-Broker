@@ -379,7 +379,7 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
     }
 
     fn slash_continues(&mut self) -> bool {
-        self.c.eat("/")
+        self.c.slash()
     }
 
     /// `OPEN` next, not consumed.

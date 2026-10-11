@@ -4,6 +4,7 @@
 #
 #   dev/check-vanilla-symbols.sh                      the dev-profile binary
 #   dev/check-vanilla-symbols.sh --audit-info <bin>   a shipped (stripped) one
+#   dev/check-vanilla-symbols.sh --metadata           the resolved graph, no build
 #
 # The first mode builds `-p antares-broker` with the default features in the
 # dev profile (release is stripped, F6), greps its demangled symbols for the
@@ -18,13 +19,20 @@
 #
 # The third mode, `--sbom <cdx.json>`, reads the component names of a
 # CycloneDX SBOM of the broker (dev/sbom.sh) the same way.
+#
+# The fourth mode, `--metadata`, builds nothing: it walks the packages
+# `cargo metadata` resolves under `antares-broker` (normal and build
+# edges), which is the list `cargo auditable` embeds. Cargo unifies features
+# across the workspace there, so a surface that turns on a feature of a
+# shared crate (axum's `ws`, T-3704) shows up here as it does in the image.
+# The first mode runs it before building.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Rust paths, as `nm --demangle` prints them.
-SYMBOLS='(^|[^A-Za-z0-9_])(antares_(ops|views|odata|mcp|linkml|ws|icsr|plugin_[a-z_]+)|odata_(url|csdl|json|batch|axum)|linkml_model|rmcp|tungstenite)::'
+SYMBOLS='(^|[^A-Za-z0-9_])(antares_(ops|views|odata|mcp|linkml|ws|icsr|plugin_[a-z_]+)|joinedcontext_[a-z_]+|odata_(url|csdl|json|batch|axum)|linkml_model|rmcp|tungstenite)::'
 # The same crates as package names, as the auditable list carries them.
-PACKAGES='^(antares-(ops|views|odata|mcp|linkml|ws|icsr|plugin-.+)|odata-.+|linkml-model|rmcp|tungstenite)$'
+PACKAGES='^(antares-(ops|views|odata|mcp|linkml|ws|icsr|plugin-.+)|joinedcontext-.+|odata-.+|linkml-model|rmcp|tungstenite)$'
 
 if [ "${1:-}" = --sbom ]; then
   sbom=${2:?usage: --sbom <cdx.json>}
@@ -37,6 +45,41 @@ if [ "${1:-}" = --sbom ]; then
   fi
   echo "vanilla SBOM: OK ($(printf '%s\n' "$names" | wc -l) components, none a surface)"
   exit 0
+fi
+
+metadata() {
+  local packages
+  packages=$(cargo metadata --locked --format-version 1 | python3 -c '
+import json, sys
+m = json.load(sys.stdin)
+name = {p["id"]: p["name"] for p in m["packages"]}
+deps = {n["id"]: [d["pkg"] for d in n["deps"]
+                  if any(k["kind"] in (None, "build") for k in d["dep_kinds"])]
+        for n in m["resolve"]["nodes"]}
+todo = [i for i, n in name.items() if n == "antares-broker"]
+seen = set(todo)
+while todo:
+    for d in deps.get(todo.pop(), []):
+        if d not in seen:
+            seen.add(d)
+            todo.append(d)
+print("\n".join(sorted({name[i] for i in seen})))
+')
+  printf '%s\n' "$packages" | grep -qx antares-broker || {
+    echo "cargo metadata resolves no antares-broker: the check would pass vacuously"
+    return 1
+  }
+  if found=$(printf '%s\n' "$packages" | grep -E "$PACKAGES"); then
+    echo "SURFACE IN THE RESOLVED GRAPH OF antares-broker (what cargo auditable embeds):"
+    printf '%s\n' "$found"
+    return 1
+  fi
+  echo "vanilla metadata: OK ($(printf '%s\n' "$packages" | wc -l) packages, none a surface)"
+}
+
+if [ "${1:-}" = --metadata ]; then
+  metadata
+  exit
 fi
 
 if [ "${1:-}" = --audit-info ]; then
@@ -54,6 +97,8 @@ if [ "${1:-}" = --audit-info ]; then
   echo "vanilla audit-info: OK ($(printf '%s\n' "$packages" | wc -l) packages, none a surface)"
   exit 0
 fi
+
+metadata
 
 # Wherever cargo puts it (CARGO_TARGET_DIR included).
 bin="$(cargo metadata --locked --format-version 1 --no-deps | jq -r .target_directory)/debug/antares"

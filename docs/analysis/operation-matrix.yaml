@@ -16,13 +16,17 @@ surfaces:
     status: proposal
   mcp:
     prefix: /x/views/{view}/mcp
-    status: proposal; tool names marked 'exists' are the platform gateway's
+    status: served by antares-mcp, one tool per row (crates/antares-mcp/src/tools.rs TOOLS, T-3656)
   linkml:
     prefix: /x/views/{view}/linkml
     status: proposal, read-only
   websocket:
     prefix: /x/views/{view}/ws
-    status: proposal; TS 104 175/176 define no WebSocket binding
+    status: implemented (ADR-0026, T-3517, feature ws; the Tenant root /x/ws/ngsi-ld/v1 serves the same messages);
+      TS 104 175/176 define no WebSocket binding; a binding is the x-op of the TS 104 243 envelope
+    session_messages:
+      x-resume: 'ADR-0026 rule 7: the first message of a new socket takes over a connection within its grace
+        period; no operation, asks no engine (crates/antares-ws/src/socket.rs resume)'
   internal_csr:
     prefix: null
     status: proposal; in-process forward through AppState::call (state.rs:571)
@@ -57,8 +61,10 @@ operations:
       pre_image: the id does not exist in the tenant; the engine allows the expanded body (types, attrs); a Filter
         answer is Deny (not FILTERABLE)
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced through a view (`/x/views/{view}/ngsi-ld/v1`):
+        `views::admits_new` in entities.rs `create_entity_inner` refuses a create that would land outside the view,
+        on the document the store is about to commit (ADR-0023 rule 7, T-3498); the plain binding serves no view,
+        and a Filter answer on a write is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.2.3.2.md
       gate_site: crates/antares-api/src/entities.rs:114
     odata:
@@ -81,11 +87,12 @@ operations:
       pre_image: the id does not exist in the tenant; the engine allows the expanded body (types, attrs); a Filter
         answer is Deny (not FILTERABLE)
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::admits_new` in entities.rs `create_entity_inner` refuses a create that would land outside the view
+        checks the document the store is about to commit (ADR-0023 rule 7, T-3498)]'
     mcp:
       status: supported
-      binding: create_entity (proposal)
+      binding: create_entity
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -102,8 +109,9 @@ operations:
       pre_image: the id does not exist in the tenant; the engine allows the expanded body (types, attrs); a Filter
         answer is Deny (not FILTERABLE)
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::admits_new` in entities.rs `create_entity_inner` refuses a create that would land outside the view
+        checks the document the store is about to commit (ADR-0023 rule 7, T-3498)]'
     linkml:
       status: not_offered
       binding: null
@@ -141,13 +149,15 @@ operations:
       pre_image: the id does not exist in the tenant; the engine allows the expanded body (types, attrs); a Filter
         answer is Deny (not FILTERABLE)
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [the in-process call reaches the ngsi_ld_http handler, so the same
+        check holds through a view: `views::admits_new` in entities.rs `create_entity_inner` refuses a create that
+        would land outside the view (T-3498)]'
   pre_image: the id does not exist in the tenant; the engine allows the expanded body (types, attrs); a Filter answer
     is Deny (not FILTERABLE)
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
-    an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on ids/clause only]'
+    an Entity out of the caller''s sight [enforced through a view: `views::admits_new` in entities.rs
+    `create_entity_inner` refuses a create that would land outside the view, on the document the store is about to
+    commit (ADR-0023 rule 7, T-3498); without a view a Filter answer on a write is a Deny]'
   gaps: 409 AlreadyExists on an id that exists but is out of view is an existence oracle
 - id: update_attributes
   ts104175: 10.2.3
@@ -180,8 +190,9 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
         the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced through a view (`/x/views/{view}/ngsi-ld/v1`):
+        `views::WriteGuard::post` in attrs.rs `write_attrs`, on the document the store is about to commit (ADR-0023
+        rule 7, T-3498); the plain binding serves no view, and a Filter answer on a write is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.4.3.2.md
       gate_site: crates/antares-api/src/attrs.rs:150
     odata:
@@ -197,7 +208,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: update_attributes (proposal)
+      binding: update_attributes
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -215,8 +226,9 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
         the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard::post` in attrs.rs `write_attrs` checks the document the store is about to commit
+        (ADR-0023 rule 7, T-3498)]'
     linkml:
       status: not_offered
       binding: null
@@ -255,14 +267,15 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
         the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [the in-process call reaches the ngsi_ld_http handler, so the same
+        check holds through a view: `views::WriteGuard::post` in attrs.rs `write_attrs` (T-3498)]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
     the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
-    an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on clause, ids, types (stored and named), attrs, body]'
+    an Entity out of the caller''s sight [enforced through a view: `views::WriteGuard::post` in attrs.rs
+    `write_attrs`, on the document the store is about to commit (ADR-0023 rule 7, T-3498); without a view a Filter
+    answer on a write is a Deny]'
 - id: append_attributes
   ts104175: 10.2.4
   cim009: 5.6.3
@@ -294,8 +307,9 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
         the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced through a view (`/x/views/{view}/ngsi-ld/v1`):
+        `views::WriteGuard::post` in attrs.rs `write_attrs`, on the document the store is about to commit (ADR-0023
+        rule 7, T-3498); the plain binding serves no view, and a Filter answer on a write is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.4.3.1.md
       gate_site: crates/antares-api/src/attrs.rs:150
     odata:
@@ -314,7 +328,7 @@ operations:
           is writable under the view'
     mcp:
       status: supported
-      binding: append_attributes (proposal)
+      binding: append_attributes
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -332,8 +346,9 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
         the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard::post` in attrs.rs `write_attrs` checks the document the store is about to commit
+        (ADR-0023 rule 7, T-3498)]'
     linkml:
       status: not_offered
       binding: null
@@ -372,14 +387,15 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
         the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [the in-process call reaches the ngsi_ld_http handler, so the same
+        check holds through a view: `views::WriteGuard::post` in attrs.rs `write_attrs` (T-3498)]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
     the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
-    an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on clause, ids, types (stored and named), attrs, body]'
+    an Entity out of the caller''s sight [enforced through a view: `views::WriteGuard::post` in attrs.rs
+    `write_attrs`, on the document the store is about to commit (ADR-0023 rule 7, T-3498); without a view a Filter
+    answer on a write is a Deny]'
 - id: partial_attribute_update
   ts104175: 10.2.5
   cim009: 5.6.4
@@ -410,14 +426,15 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced through a view (`/x/views/{view}/ngsi-ld/v1`):
+        `views::WriteGuard::post` in attrs.rs `partial_update_inner`, on the document the store is about to commit
+        (ADR-0023 rule 7, T-3498); the plain binding serves no view, and a Filter answer on a write is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.5.3.2.md
       gate_site: crates/antares-api/src/attrs.rs:803
     odata:
       status: supported
-      binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9, T-3441 W11), any property a
-        write may name (the model has no complex type: an inlined class is Edm.Untyped)
+      binding: 'PATCH /x/views/{view}/odata/v4/{EntitySet}(''{id}'')/{property} (Protocol 11.4.9, T-3441 W11), any property a
+        write may name (the model has no complex type: an inlined class is Edm.Untyped)'
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -434,11 +451,12 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard::post` in attrs.rs `partial_update_inner` checks the document the store is about to
+        commit (ADR-0023 rule 7, T-3498)]'
     mcp:
       status: supported
-      binding: update_attribute (proposal)
+      binding: update_attribute
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -455,8 +473,9 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard::post` in attrs.rs `partial_update_inner` checks the document the store is about to
+        commit (ADR-0023 rule 7, T-3498)]'
     linkml:
       status: not_offered
       binding: null
@@ -494,13 +513,14 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [the in-process call reaches the ngsi_ld_http handler, so the same
+        check holds through a view: `views::WriteGuard::post` in attrs.rs `partial_update_inner` (T-3498)]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
-    an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on clause, ids, types (stored and named), attrs, body]'
+    an Entity out of the caller''s sight [enforced through a view: `views::WriteGuard::post` in attrs.rs
+    `partial_update_inner`, on the document the store is about to commit (ADR-0023 rule 7, T-3498); without a view a
+    Filter answer on a write is a Deny]'
 - id: set_attribute_value
   ts104175: 10.2.6
   cim009: null
@@ -531,8 +551,9 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced through a view (`/x/views/{view}/ngsi-ld/v1`):
+        `views::WriteGuard::post` in attrs.rs `set_attr_value_inner`, on the document the store is about to commit
+        (ADR-0023 rule 7, T-3498); the plain binding serves no view, and a Filter answer on a write is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.6.3.2.md
       gate_site: crates/antares-api/src/attrs.rs:1149
       note: 'T-3450: gated as Replace Attribute (5.6.19), the write it is; the body the engine sees is the stored
@@ -617,7 +638,9 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
-        lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
+        lose it) [enforced through a view (`/x/views/{view}/ngsi-ld/v1`): `views::WriteGuard::post` in attrs.rs
+        `delete_attr_inner`, on the document the store is about to commit (ADR-0023 rule 7, T-3498); the plain
+        binding serves no view, and a Filter answer on a write is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.5.3.4.md
       gate_site: crates/antares-api/src/attrs.rs:1361
     odata:
@@ -640,10 +663,11 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
-        lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
+        lose it) [enforced: the surface writes through its view, and `views::WriteGuard::post` in attrs.rs
+        `delete_attr_inner` checks the document the store is about to commit (ADR-0023 rule 7, T-3498)]'
     mcp:
       status: supported
-      binding: delete_attribute (proposal)
+      binding: delete_attribute
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -659,7 +683,8 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
-        lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
+        lose it) [enforced: the surface writes through its view, and `views::WriteGuard::post` in attrs.rs
+        `delete_attr_inner` checks the document the store is about to commit (ADR-0023 rule 7, T-3498)]'
     linkml:
       status: not_offered
       binding: null
@@ -696,11 +721,13 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would
-        lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
+        lose it) [the in-process call reaches the ngsi_ld_http handler, so the same check holds through a view:
+        `views::WriteGuard::post` in attrs.rs `delete_attr_inner` (T-3498)]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the Entity is still inside the view without the Attribute (a view keyed on that Attribute would lose
-    it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
+    it) [enforced through a view: `views::WriteGuard::post` in attrs.rs `delete_attr_inner`, on the document the
+    store is about to commit (ADR-0023 rule 7, T-3498); without a view a Filter answer on a write is a Deny]'
 - id: delete_entity
   ts104175: 10.2.8
   cim009: 5.6.6
@@ -750,7 +777,7 @@ operations:
       post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
     mcp:
       status: supported
-      binding: delete_entity (proposal)
+      binding: delete_entity
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -834,8 +861,9 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
         the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced through a view (`/x/views/{view}/ngsi-ld/v1`):
+        `views::WriteGuard::post` in entities.rs `merge_entity_inner`, on the document the store is about to commit
+        (ADR-0023 rule 7, T-3498); the plain binding serves no view, and a Filter answer on a write is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.3.3.2.md
       gate_site: crates/antares-api/src/entities.rs:1859
     odata:
@@ -859,11 +887,12 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
         the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard::post` in entities.rs `merge_entity_inner` checks the document the store is about to
+        commit (ADR-0023 rule 7, T-3498)]'
     mcp:
       status: supported
-      binding: merge_entity (proposal)
+      binding: merge_entity
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -881,8 +910,9 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
         the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard::post` in entities.rs `merge_entity_inner` checks the document the store is about to
+        commit (ADR-0023 rule 7, T-3498)]'
     linkml:
       status: not_offered
       binding: null
@@ -921,14 +951,15 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
         the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [the in-process call reaches the ngsi_ld_http handler, so the same
+        check holds through a view: `views::WriteGuard::post` in entities.rs `merge_entity_inner` (T-3498)]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under
     the view [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
-    an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on clause, ids, types (stored and named), attrs, body]'
+    an Entity out of the caller''s sight [enforced through a view: `views::WriteGuard::post` in entities.rs
+    `merge_entity_inner`, on the document the store is about to commit (ADR-0023 rule 7, T-3498); without a view a
+    Filter answer on a write is a Deny]'
 - id: replace_entity
   ts104175: 10.2.10
   cim009: 5.6.18
@@ -964,8 +995,9 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
         one the body names is writable (a replace deletes the ones it omits) [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced through a view (`/x/views/{view}/ngsi-ld/v1`):
+        `views::WriteGuard::post` in entities.rs `replace_entity`, on the document the store is about to commit
+        (ADR-0023 rule 7, T-3498); the plain binding serves no view, and a Filter answer on a write is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.3.3.3.md
       gate_site: crates/antares-api/src/entities.rs:2233
     odata:
@@ -990,11 +1022,12 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
         one the body names is writable (a replace deletes the ones it omits) [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard::post` in entities.rs `replace_entity` checks the document the store is about to commit
+        (ADR-0023 rule 7, T-3498)]'
     mcp:
       status: supported
-      binding: replace_entity (proposal)
+      binding: replace_entity
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1014,8 +1047,9 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
         one the body names is writable (a replace deletes the ones it omits) [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard::post` in entities.rs `replace_entity` checks the document the store is about to commit
+        (ADR-0023 rule 7, T-3498)]'
     linkml:
       status: not_offered
       binding: null
@@ -1056,14 +1090,15 @@ operations:
         Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
         one the body names is writable (a replace deletes the ones it omits) [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [the in-process call reaches the ngsi_ld_http handler, so the same
+        check holds through a view: `views::WriteGuard::post` in entities.rs `replace_entity` (T-3498)]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); every Attribute the stored Entity holds and every
     one the body names is writable (a replace deletes the ones it omits) [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
-    an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on clause, ids, types (stored and named), attrs, body]'
+    an Entity out of the caller''s sight [enforced through a view: `views::WriteGuard::post` in entities.rs
+    `replace_entity`, on the document the store is about to commit (ADR-0023 rule 7, T-3498); without a view a
+    Filter answer on a write is a Deny]'
 - id: replace_attribute
   ts104175: 10.2.11
   cim009: 5.6.19
@@ -1094,8 +1129,9 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced through a view (`/x/views/{view}/ngsi-ld/v1`):
+        `views::WriteGuard::post` in attrs.rs `replace_attr`, on the document the store is about to commit (ADR-0023
+        rule 7, T-3498); the plain binding serves no view, and a Filter answer on a write is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.5.3.3.md
       gate_site: crates/antares-api/src/attrs.rs:975
     odata:
@@ -1119,11 +1155,12 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard::post` in attrs.rs `replace_attr` checks the document the store is about to commit
+        (ADR-0023 rule 7, T-3498)]'
     mcp:
       status: supported
-      binding: replace_attribute (proposal)
+      binding: replace_attribute
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1140,8 +1177,9 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard::post` in attrs.rs `replace_attr` checks the document the store is about to commit
+        (ADR-0023 rule 7, T-3498)]'
     linkml:
       status: not_offered
       binding: null
@@ -1179,13 +1217,14 @@ operations:
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
         Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
       post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot
-        move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+        move an Entity out of the caller''s sight [the in-process call reaches the ngsi_ld_http handler, so the same
+        check holds through a view: `views::WriteGuard::post` in attrs.rs `replace_attr` (T-3498)]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden
     Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored and named), attrs, body and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'the stored Entity after the write is still inside the view (q, scopeQ, type), so a write cannot move
-    an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image, the engine
-    decides on clause, ids, types (stored and named), attrs, body]'
+    an Entity out of the caller''s sight [enforced through a view: `views::WriteGuard::post` in attrs.rs
+    `replace_attr`, on the document the store is about to commit (ADR-0023 rule 7, T-3498); without a view a Filter
+    answer on a write is a Deny]'
 - id: purge_entities
   ts104175: 10.2.12
   cim009: 5.6.21
@@ -1307,8 +1346,10 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: as create_entity; one decision per member (decide_each), a refused member is a 403 in E (T-3480)'
-      post_image: 'per Entity: as create_entity [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+      post_image: 'per Entity: as create_entity [enforced through a view (`/x/views/{view}/ngsi-ld/v1`):
+        `views::WriteGuard` per member in batch.rs `view_guards` and `batch_write`, on the document the store is
+        about to commit (ADR-0023 rule 7, T-3498); the plain binding serves no view, and a Filter answer on a write
+        is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.7.3.1.md
       gate_site: crates/antares-api/src/batch.rs:747
     odata:
@@ -1331,11 +1372,12 @@ operations:
           attribute is a relationship write; OData 11.4.2.2 is all-or-nothing, so every gate is decided before the
           first write'
       pre_image: 'per Entity: as create_entity; one gate call for the whole array today (ids of every member)'
-      post_image: 'per Entity: as create_entity [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+      post_image: 'per Entity: as create_entity [enforced: the surface writes through its view, and
+        `views::WriteGuard` per member in batch.rs `view_guards` and `batch_write` checks the document the store is
+        about to commit (ADR-0023 rule 7, T-3498)]'
     mcp:
       status: supported
-      binding: batch_create (proposal)
+      binding: batch_create
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1352,8 +1394,9 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: as create_entity; one gate call for the whole array today (ids of every member)'
-      post_image: 'per Entity: as create_entity [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+      post_image: 'per Entity: as create_entity [enforced: the surface writes through its view, and
+        `views::WriteGuard` per member in batch.rs `view_guards` and `batch_write` checks the document the store is
+        about to commit (ADR-0023 rule 7, T-3498)]'
     linkml:
       status: not_offered
       binding: null
@@ -1391,11 +1434,13 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: as create_entity; one gate call for the whole array today (ids of every member)'
-      post_image: 'per Entity: as create_entity [not enforced today: the Operation carries no stored image, the
-        engine decides on ids/clause only]'
+      post_image: 'per Entity: as create_entity [the in-process call reaches the ngsi_ld_http handler, so the same
+        check holds through a view: `views::WriteGuard` per member in batch.rs `view_guards` and `batch_write`
+        (T-3498)]'
   pre_image: 'per Entity: as create_entity; one decision per member (decide_each), a refused member is a 403 in E (T-3480)'
-  post_image: 'per Entity: as create_entity [not enforced today: the Operation carries no stored image, the engine
-    decides on clause, ids, types (stored and named), attrs, body]'
+  post_image: 'per Entity: as create_entity [enforced through a view: `views::WriteGuard` per member in batch.rs
+    `view_guards` and `batch_write`, on the document the store is about to commit (ADR-0023 rule 7, T-3498); without
+    a view a Filter answer on a write is a Deny]'
 - id: batch_upsert
   ts104175: 10.3.3
   cim009: 5.6.8
@@ -1429,9 +1474,11 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: create_entity pre-image when absent, update pre-image (visible, attrs writable) when
         present [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
-      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
-        a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
-        image, the engine decides on ids/clause only]'
+      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a
+        write cannot move an Entity out of the caller''s sight [enforced through a view
+        (`/x/views/{view}/ngsi-ld/v1`): `views::WriteGuard` per member in batch.rs `upsert_in_view`, on the document
+        the store is about to commit (ADR-0023 rule 7, T-3498); the plain binding serves no view, and a Filter
+        answer on a write is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.8.3.1.md
       gate_site: crates/antares-api/src/batch.rs:747
     odata:
@@ -1445,8 +1492,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'upsert_entity (exists: joinedcontext-platform crates/context-gateway/src/mcp/endpoint_facade.rs:320,
-        Operation::UpsertBatch, one entity)'
+      binding: batch_upsert
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1463,9 +1509,10 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: create_entity pre-image when absent, update pre-image (visible, attrs writable) when
         present [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
-      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
-        a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
-        image, the engine decides on ids/clause only]'
+      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a
+        write cannot move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard` per member in batch.rs `upsert_in_view` checks the document the store is about to commit
+        (ADR-0023 rule 7, T-3498)]'
     linkml:
       status: not_offered
       binding: null
@@ -1503,14 +1550,16 @@ operations:
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: create_entity pre-image when absent, update pre-image (visible, attrs writable) when
         present [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
-      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
-        a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
-        image, the engine decides on ids/clause only]'
+      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a
+        write cannot move an Entity out of the caller''s sight [the in-process call reaches the ngsi_ld_http
+        handler, so the same check holds through a view: `views::WriteGuard` per member in batch.rs `upsert_in_view`
+        (T-3498)]'
   pre_image: 'per Entity: create_entity pre-image when absent, update pre-image (visible, attrs writable) when present
     [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a write
-    cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image,
-    the engine decides on ids/clause only]'
+    cannot move an Entity out of the caller''s sight [enforced through a view: `views::WriteGuard` per member in
+    batch.rs `upsert_in_view`, on the document the store is about to commit (ADR-0023 rule 7, T-3498); without a
+    view a Filter answer on a write is a Deny]'
 - id: batch_update
   ts104175: 10.3.4
   cim009: 5.6.9
@@ -1543,9 +1592,11 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: as update_attributes [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
-      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
-        a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
-        image, the engine decides on ids/clause only]'
+      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a
+        write cannot move an Entity out of the caller''s sight [enforced through a view
+        (`/x/views/{view}/ngsi-ld/v1`): `views::WriteGuard` per member in batch.rs `view_guards` and `batch_write`,
+        on the document the store is about to commit (ADR-0023 rule 7, T-3498); the plain binding serves no view,
+        and a Filter answer on a write is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.9.3.1.md
       gate_site: crates/antares-api/src/batch.rs:747
     odata:
@@ -1559,7 +1610,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: batch_update (proposal)
+      binding: batch_update
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1575,9 +1626,10 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: as update_attributes [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
-      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
-        a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
-        image, the engine decides on ids/clause only]'
+      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a
+        write cannot move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard` per member in batch.rs `view_guards` and `batch_write` checks the document the store is
+        about to commit (ADR-0023 rule 7, T-3498)]'
     linkml:
       status: not_offered
       binding: null
@@ -1614,13 +1666,15 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: as update_attributes [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
-      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
-        a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
-        image, the engine decides on ids/clause only]'
+      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a
+        write cannot move an Entity out of the caller''s sight [the in-process call reaches the ngsi_ld_http
+        handler, so the same check holds through a view: `views::WriteGuard` per member in batch.rs `view_guards`
+        and `batch_write` (T-3498)]'
   pre_image: 'per Entity: as update_attributes [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a write
-    cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image,
-    the engine decides on ids/clause only]'
+    cannot move an Entity out of the caller''s sight [enforced through a view: `views::WriteGuard` per member in
+    batch.rs `view_guards` and `batch_write`, on the document the store is about to commit (ADR-0023 rule 7,
+    T-3498); without a view a Filter answer on a write is a Deny]'
 - id: batch_merge
   ts104175: 10.3.5
   cim009: 5.6.20
@@ -1653,9 +1707,11 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: as merge_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
-      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
-        a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
-        image, the engine decides on ids/clause only]'
+      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a
+        write cannot move an Entity out of the caller''s sight [enforced through a view
+        (`/x/views/{view}/ngsi-ld/v1`): `views::WriteGuard` per member in batch.rs `view_guards` and `batch_write`,
+        on the document the store is about to commit (ADR-0023 rule 7, T-3498); the plain binding serves no view,
+        and a Filter answer on a write is a Deny]'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.10.3.1.md
       gate_site: crates/antares-api/src/batch.rs:747
     odata:
@@ -1670,12 +1726,13 @@ operations:
         - 'batch: each Entity of the array is its own single-Entity operation under the view (one decision per entity,
           one per-entity error)'
       pre_image: 'per Entity: as merge_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
-      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
-        a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
-        image, the engine decides on ids/clause only]'
+      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a
+        write cannot move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard` per member in batch.rs `view_guards` and `batch_write` checks the document the store is
+        about to commit (ADR-0023 rule 7, T-3498)]'
     mcp:
       status: supported
-      binding: batch_merge (proposal)
+      binding: batch_merge
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1691,9 +1748,10 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: as merge_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
-      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
-        a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
-        image, the engine decides on ids/clause only]'
+      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a
+        write cannot move an Entity out of the caller''s sight [enforced: the surface writes through its view, and
+        `views::WriteGuard` per member in batch.rs `view_guards` and `batch_write` checks the document the store is
+        about to commit (ADR-0023 rule 7, T-3498)]'
     linkml:
       status: not_offered
       binding: null
@@ -1730,13 +1788,15 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'per Entity: as merge_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
-      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so
-        a write cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored
-        image, the engine decides on ids/clause only]'
+      post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a
+        write cannot move an Entity out of the caller''s sight [the in-process call reaches the ngsi_ld_http
+        handler, so the same check holds through a view: `views::WriteGuard` per member in batch.rs `view_guards`
+        and `batch_write` (T-3498)]'
   pre_image: 'per Entity: as merge_entity [the engine decides on ids/clause only and the stored image, Operation::stored (types, scope, attribute names, T-3483)]'
   post_image: 'per Entity: the stored Entity after the write is still inside the view (q, scopeQ, type), so a write
-    cannot move an Entity out of the caller''s sight [not enforced today: the Operation carries no stored image,
-    the engine decides on ids/clause only]'
+    cannot move an Entity out of the caller''s sight [enforced through a view: `views::WriteGuard` per member in
+    batch.rs `view_guards` and `batch_write`, on the document the store is about to commit (ADR-0023 rule 7,
+    T-3498); without a view a Filter answer on a write is a Deny]'
 - id: batch_delete
   ts104175: 10.3.6
   cim009: 5.6.10
@@ -1789,7 +1849,7 @@ operations:
       post_image: 'per Entity: absent'
     mcp:
       status: supported
-      binding: batch_delete (proposal)
+      binding: batch_delete
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1889,7 +1949,7 @@ operations:
           ngsi_ld_http cell), and the policy projection applies to it'
     mcp:
       status: supported
-      binding: 'get_entity (exists: endpoint_facade.rs:136, Operation::RetrieveEntity)'
+      binding: get_entity
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1991,7 +2051,7 @@ operations:
         - $count and NGSILD-Results-Count are computed after the narrowing (count leak)
     mcp:
       status: supported
-      binding: 'query_entities (exists: endpoint_facade.rs:110, Operation::QueryEntity)'
+      binding: query_entities
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2086,7 +2146,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'batch_query (exists: endpoint_facade.rs:212, Operation::QueryBatch)'
+      binding: batch_query
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2178,7 +2238,7 @@ operations:
         - none
     mcp:
       status: supported
-      binding: get_attribute_value (proposal)
+      binding: get_attribute_value
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2266,7 +2326,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'create_subscription (exists: endpoint_facade.rs:411, Operation::CreateSubscription)'
+      binding: create_subscription
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2296,7 +2356,8 @@ operations:
         linked_entity_checks: []
     websocket:
       status: supported
-      binding: 'subscribe (proposal): creates a Subscription whose endpoint is the socket'
+      binding: 'x-subscribe: Create Subscription with the socket as its endpoint, then Retrieve Subscription (5.8.3)
+        for the answer (crates/antares-ws/src/socket.rs subscribe)'
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2379,7 +2440,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: update_subscription (proposal)
+      binding: update_subscription
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2404,7 +2465,8 @@ operations:
         linked_entity_checks: []
     websocket:
       status: supported
-      binding: subscription.update (proposal)
+      binding: 'x-update: Update Subscription of one this connection made, then Retrieve Subscription (5.8.3) for
+        the answer (crates/antares-ws/src/socket.rs update)'
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2471,7 +2533,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'get_subscription (exists: endpoint_facade.rs:391, Operation::RetrieveSubscription)'
+      binding: get_subscription
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2525,12 +2587,12 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.13.3.1.md
-      gate_site: crates/antares-api/src/subscriptions.rs:918
+      gate_site: crates/antares-api/src/subscriptions.rs:1028
     odata:
       status: not_offered
       binding: null
@@ -2542,7 +2604,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'list_subscriptions (exists: endpoint_facade.rs:238, Operation::QuerySubscription)'
+      binding: list_subscriptions
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2617,7 +2679,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: delete_subscription (proposal)
+      binding: delete_subscription
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2640,7 +2702,8 @@ operations:
         linked_entity_checks: []
     websocket:
       status: supported
-      binding: unsubscribe (proposal)
+      binding: 'x-unsubscribe: Delete Subscription of one this connection made (crates/antares-ws/src/socket.rs
+        unsubscribe)'
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2721,7 +2784,8 @@ operations:
         linked_entity_checks: []
     websocket:
       status: supported
-      binding: 'notification (proposal): server push of the Notification document'
+      binding: 'server push: the Notification document in the TS 104 243 envelope, after pre_notify (antares-ws
+        Sink)'
       checks:
         adr0020_phase: pre_notify
         operation_fields: []
@@ -2779,7 +2843,7 @@ operations:
         - none
     mcp:
       status: supported
-      binding: 'list_types (exists: endpoint_facade.rs:154, Operation::RetrieveEntityTypes)'
+      binding: list_types
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2853,7 +2917,7 @@ operations:
         - none
     mcp:
       status: supported
-      binding: 'list_types (exists: endpoint_facade.rs:154, Operation::RetrieveEntityTypeDetails)'
+      binding: list_type_details
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2927,7 +2991,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'get_type (exists: endpoint_facade.rs:354, Operation::RetrieveEntityTypeInfo)'
+      binding: get_type
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3001,7 +3065,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'list_attributes (exists: endpoint_facade.rs:172, Operation::RetrieveAttrTypes)'
+      binding: list_attributes
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3073,7 +3137,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'list_attributes (exists: endpoint_facade.rs:172, Operation::RetrieveAttrTypeDetails)'
+      binding: list_attribute_details
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3147,7 +3211,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'get_attribute (exists: endpoint_facade.rs:371, Operation::RetrieveAttrTypeInfo)'
+      binding: get_attribute
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3215,8 +3279,8 @@ operations:
         never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body
         names is writable under the view [not enforced today: the Operation carries no stored image, the engine
         decides on ids/clause only]'
-      post_image: 'every written instance lies inside the temporal view [not enforced today: the Operation carries
-        no stored image, the engine decides on ids/clause only]'
+      post_image: 'every written instance lies inside the temporal view [not enforced today: no post-image check
+        runs on a temporal write; the engine sees the stored image since T-3607 (`policy::temporal_pre_image`)]'
       binding_clause: ts-104176-ngsi-ld-http-binding/8/8.2.3.2.md
       gate_site: crates/antares-api/src/temporal.rs:79
     odata:
@@ -3272,14 +3336,14 @@ operations:
         never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body
         names is writable under the view [not enforced today: the Operation carries no stored image, the engine
         decides on ids/clause only]'
-      post_image: 'every written instance lies inside the temporal view [not enforced today: the Operation carries
-        no stored image, the engine decides on ids/clause only]'
+      post_image: 'every written instance lies inside the temporal view [not enforced today: no post-image check
+        runs on a temporal write; the engine sees the stored image since T-3607 (`policy::temporal_pre_image`)]'
   pre_image: 'when the Entity exists: target Entity exists and is visible under the view (else 404 ResourceNotFound,
     never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names
     is writable under the view [not enforced today: the Operation carries no stored image, the engine decides on
     ids/clause only]'
-  post_image: 'every written instance lies inside the temporal view [not enforced today: the Operation carries no
-    stored image, the engine decides on ids/clause only]'
+  post_image: 'every written instance lies inside the temporal view [not enforced today: no post-image check runs on
+    a temporal write; the engine sees the stored image since T-3607 (`policy::temporal_pre_image`)]'
 - id: temporal_add_attributes
   ts104175: 11.2.3
   cim009: 5.6.12
@@ -3305,8 +3369,8 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under the view [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
-      post_image: 'every written instance lies inside the temporal view [not enforced today: the Operation carries
-        no stored image, the engine decides on ids/clause only]'
+      post_image: 'every written instance lies inside the temporal view [not enforced today: no post-image check
+        runs on a temporal write; the engine sees the stored image since T-3607 (`policy::temporal_pre_image`)]'
       binding_clause: ts-104176-ngsi-ld-http-binding/8/8.4.3.1.md
       gate_site: crates/antares-api/src/temporal.rs:2502
     odata:
@@ -3359,11 +3423,11 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under the view [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
-      post_image: 'every written instance lies inside the temporal view [not enforced today: the Operation carries
-        no stored image, the engine decides on ids/clause only]'
+      post_image: 'every written instance lies inside the temporal view [not enforced today: no post-image check
+        runs on a temporal write; the engine sees the stored image since T-3607 (`policy::temporal_pre_image`)]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); every Attribute the body names is writable under the view [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
-  post_image: 'every written instance lies inside the temporal view [not enforced today: the Operation carries no
-    stored image, the engine decides on ids/clause only]'
+  post_image: 'every written instance lies inside the temporal view [not enforced today: no post-image check runs on
+    a temporal write; the engine sees the stored image since T-3607 (`policy::temporal_pre_image`)]'
 - id: temporal_delete_attribute
   ts104175: 11.2.4
   cim009: 5.6.13
@@ -3470,8 +3534,8 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
-      post_image: 'the instance lies inside the temporal view [not enforced today: the Operation carries no stored
-        image, the engine decides on ids/clause only]'
+      post_image: 'the instance lies inside the temporal view [not enforced today: no post-image check runs on a
+        temporal write; the engine sees the stored image since T-3607 (`policy::temporal_pre_image`)]'
       binding_clause: ts-104176-ngsi-ld-http-binding/8/8.6.3.1.md
       gate_site: crates/antares-api/src/temporal.rs:2887
     odata:
@@ -3524,11 +3588,11 @@ operations:
         - 'relationship write: for each Relationship in the body, the object target Entity is visible under the
           view AND the relationship attribute is writable under the view'
       pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
-      post_image: 'the instance lies inside the temporal view [not enforced today: the Operation carries no stored
-        image, the engine decides on ids/clause only]'
+      post_image: 'the instance lies inside the temporal view [not enforced today: no post-image check runs on a
+        temporal write; the engine sees the stored image since T-3607 (`policy::temporal_pre_image`)]'
   pre_image: 'target Entity exists and is visible under the view (else 404 ResourceNotFound, never 403: a hidden Entity is indistinguishable from an absent one, ADR-0020); the named Attribute is writable [the engine decides on clause, ids, types (stored) and the stored image, Operation::stored (types, scope, attribute names) of the temporal evolution, else of the current state, T-3607]'
-  post_image: 'the instance lies inside the temporal view [not enforced today: the Operation carries no stored image,
-    the engine decides on ids/clause only]'
+  post_image: 'the instance lies inside the temporal view [not enforced today: no post-image check runs on a
+    temporal write; the engine sees the stored image since T-3607 (`policy::temporal_pre_image`)]'
 - id: temporal_delete_instance
   ts104175: 11.2.6
   cim009: 5.6.15
@@ -3726,7 +3790,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'retrieve_temporal (exists: endpoint_facade.rs:197, Operation::RetrieveTemporal)'
+      binding: retrieve_temporal
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3805,7 +3869,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'query_temporal (exists: endpoint_facade.rs:190, Operation::QueryTemporal)'
+      binding: query_temporal
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3892,7 +3956,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'batch_query_temporal (exists: endpoint_facade.rs:336, Operation::QueryTemporal)'
+      binding: batch_query_temporal
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -4272,12 +4336,12 @@ operations:
         operation_fields:
         - clause
         - scope_q
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/9/9.2.3.1.md
-      gate_site: crates/antares-api/src/csource.rs:1076
+      gate_site: crates/antares-api/src/csource.rs:1135
     odata:
       status: not_offered
       binding: null
@@ -4556,12 +4620,12 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/9/9.4.3.2.md (headed POST, see open questions)
-      gate_site: crates/antares-api/src/subscriptions.rs:918
+      gate_site: crates/antares-api/src/subscriptions.rs:1028
     odata:
       status: not_offered
       binding: null
@@ -5293,21 +5357,14 @@ operations:
         linked_entity_checks:
         - as query_entities
     mcp:
-      status: supported
-      binding: used internally by query_entities paging (the platform tool takes an entityMap argument, endpoint_facade.rs:673)
+      status: not_offered
+      binding: null
       checks:
-        adr0020_phase: on_request
-        operation_fields:
-        - clause
-        - types
-        - attrs
-        - q
-        - scope_q
-        - geo
-        filterable: true
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
         whole_tenant: false
-        linked_entity_checks:
-        - the candidate set is narrowed by the Filter (FILTERABLE); remote maps merged (fed_entity_maps)
+        linked_entity_checks: []
     linkml:
       status: not_offered
       binding: null

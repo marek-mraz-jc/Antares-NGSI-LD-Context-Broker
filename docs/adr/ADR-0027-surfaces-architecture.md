@@ -195,9 +195,9 @@ instance type):
 | OData read | p50 ≤ vanilla + 0.15 ms + 1 µs per Entity, p99 ≤ 1.25× | one `AppState::call` (66-71 µs per 100 Entities measured) plus the JSON Format rewrite |
 | MCP tool call | p50 ≤ vanilla + 0.2 ms + 1 µs per Entity, p99 ≤ 1.25× | one `AppState::call` plus JSON-RPC framing |
 | LinkML document | ≤ 5 ms p99 for a 100-class schema, cached per view revision | computed once per view revision |
-| WebSocket notification | delivery latency p99 ≤ HTTP sink p99 to a local receiver; ≤ 32 KiB resident per idle connection plus its queue | no socket opened per notification |
+| WebSocket notification | delivery latency p99 ≤ 1.10× HTTP sink p99 to a local receiver (T-3626); ≤ 32 KiB resident per idle connection plus its queue | no socket opened per notification; one queue hop per connection |
 | internal CSR forward | p99 ≤ 0.5× the HTTP forward to the same broker | no socket, no TLS, no second JSON parse of the request line |
-| binary size | `full` release binary ≤ vanilla + 6 MiB; each feature alone ≤ vanilla + 2 MiB, except `mcp` ≤ vanilla + 4.5 MiB (T-3662) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
+| binary size | `full` release binary ≤ vanilla + 6 MiB; each feature alone ≤ vanilla + 2 MiB, except `mcp` ≤ vanilla + 4.5 MiB (T-3662) and `odata` ≤ vanilla + 3.5 MiB (T-3705) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
 | vanilla | unchanged within the noise band of T-3467 | GOAL point 1 |
 
 A benchmark per row: criterion benches in each surface crate for the
@@ -234,6 +234,52 @@ second removes MCP behaviour. Options: raise the `mcp` budget (chosen),
 measure each feature over the feature it implies (`mcp` over `views`,
 2.98 MiB, still over), size-optimise the MCP crates (+3.41 MiB, still
 over), replace rmcp.
+
+The `odata` budget, measured 2026-10-11 on dev 8c42bcd (T-3705), same
+build: vanilla 31 106 992 bytes; `views` 32 374 448 (+1.21 MiB);
+`odata` 34 439 120 (+3.18 MiB). `odata` implies `views`, so its own
+share is 1.97 MiB, inside the per-feature 2 MiB. `cargo bloat --crates`
+against the `views` build puts 348 KiB of `.text` in `antares_odata`,
+135 KiB in `linkml_model` (the Tenant's schema that `$metadata` reads),
+115 KiB in `odata_url`, 279 KiB more in `serde_json` and 307 KiB more in
+`std` (generic instantiations). The `serde_json` share is its
+`float_roundtrip` feature, which ADR-0024 requires of `odata-json` and
+`odata-batch` (T-3504, T-3505) so an `Edm.Double` reads back to the same
+bits; Cargo unifies it for the whole binary.
+
+Decided (worker-4, owner may override): `odata` ≤ vanilla + 3.5 MiB,
+because its own share over `views` meets the 2 MiB rule and the rest is
+`views` plus a float parser that ADR-0024 makes a correctness property.
+Options: raise the `odata` budget (chosen), drop `float_roundtrip` (an
+`Edm.Double` no longer round-trips, ADR-0024 broken), measure each
+feature over the feature it implies (changes the rule for every feature),
+size-optimise the OData crates (saves part of 0.6 MiB, still over 2 MiB).
+
+The WebSocket notification budget, measured 2026-10-11 on dev f3db73d
+(T-3626, `bench-ws.yml` run 38127455609 on ubuntu-latest), five runs of
+`cargo bench -p antares-ws --bench fanout`, 2000 sequential changes, each
+channel on its own Car and Subscription:
+
+| run | socket p50 | socket p99 | HTTP p50 | HTTP p99 | p99 ratio |
+|---|---|---|---|---|---|
+| 1 | 2.018 ms | 4.017 ms | 1.899 ms | 3.933 ms | 1.021 |
+| 2 | 2.000 ms | 4.306 ms | 1.895 ms | 4.235 ms | 1.017 |
+| 3 | 1.980 ms | 4.065 ms | 1.851 ms | 4.093 ms | 0.993 |
+| 4 | 1.985 ms | 4.054 ms | 1.822 ms | 3.914 ms | 1.036 |
+| 5 | 1.990 ms | 3.988 ms | 1.795 ms | 3.822 ms | 1.044 |
+
+The socket pays one hop the HTTP sink does not: the sink hands the
+notification to `Conn::offer`, which queues it, and the connection's
+session task writes it; the HTTP sink writes from the notifier task.
+That queue is the connection's bounded backlog, its coalescing and its
+resume from a seq, and it keeps a slow client from holding the notifier.
+
+Decided (worker-1, owner may override): socket p99 ≤ 1.10× HTTP sink
+p99, because the measured gap (0.99× to 1.04×, 0.12 to 0.2 ms at p50) is
+that one hop, and 1.10× is the noise margin the NGSI-LD view row already
+uses. Options: raise the bound (chosen), write to the socket from the
+notifier task (one slow client stalls every Subscription's delivery),
+keep the 1.0× bound (fails on noise alone, run 3 is below, run 5 above).
 
 ### 7. Code rules for every new crate
 

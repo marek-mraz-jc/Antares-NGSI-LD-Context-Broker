@@ -129,6 +129,17 @@ ROLL_DURING_RUN=1` (reproduce a `-nats` cell), `WASM=1 WASM_DOCKER=1
 STORE=file` (reproduce the wasm cell). Results land in `results/$STORE`
 with Robot's own `log.html` per suite.
 
+The suite names its own `@context` by a raw.githubusercontent.com URL on
+`dev`, in `variables.py` and in 331 data and expectation files. A pipeline
+run instead serves `resources/jsonld-contexts/` from the checkout on port
+8079 (`dev/etsi-local-context.sh`; it refuses a port a suite file names, the
+IOP mocks own 8089). It rewrites that URL for the length of
+the run and puts the files back in teardown, so a commit is tested with its
+own context file and a GitHub outage fails nothing. The cell fails when a
+file still names the GitHub URL, or when no broker fetched the context from
+the local server (`local-context-check.txt` and `local-context/access.log`
+in the cell artifact).
+
 For a single clause during development, one broker without Docker is
 enough. `resources/variables.py` carries the suite's own compose addresses
 (`scorpio1` for the broker, `172.28.0.18` for the notification and
@@ -177,6 +188,7 @@ carries the fix. The current list:
 | 21 | suite | 008_01 expects a second temporal upsert to replace instances at the same observedAt; 5.6.11.4 adds them |
 | 22 | suite | 046_22_08 reads a deleted three-instance Attribute as one object; 5.8.6 tombstones each instance with its datasetId |
 | 23 | suite | 046_05 percent-encodes the q of a Subscription body; Table 5.2.12-1 makes it a JSON string read as written |
+| 24 | spec | TS 104 176 9.4.3.1 and 9.4.3.2 carry each other's headings: Create Context Source Registration Subscription is headed GET/HEAD, Query is headed POST; Antares serves POST for create, GET for query |
 
 Filing is manual; each entry carries the clause quotation and the
 proposed fix so it can be pasted into the ETSI tracker as is.

@@ -560,3 +560,33 @@ written, the q matches only an Entity whose name is the literal
 `Eiffel%20Tower`. Suggest `name=="Eiffel Tower"`, as the corrected fork
 does (forge commit cd2ef2ba); Antares carries that fix and reads the q as
 written (`antares-matcher::a_subscription_q_is_not_percent_decoded`).
+
+---
+
+## 24. [spec] TS 104 176 9.4.3.1 and 9.4.3.2 carry each other's headings
+
+**Title:** the `csourceSubscriptions` collection binds Create to a clause
+headed GET/HEAD and Query to one headed POST
+
+**Body:**
+
+TS 104 176 V1.1.1 clause 9.4.3.1 (p. 95) is headed "GET/HEAD" and reads:
+"This method is bound to the operation \"Create Context Source
+Registration Subscription\" ... clause 12.4.2, taking the context source
+registration subscription to be created from the HTTP request payload
+body". Clause 9.4.3.2 (p. 96) is headed "POST" and reads: "This method is
+associated to the operation \"Query Context Source Registration
+Subscriptions\" ... clause 12.4.5, providing the context source
+registration subscription data as part of the HTTP response payload body",
+with URL parameters in Table 9.4.3.2-1.
+
+A create takes a request body and a query takes URL parameters, so the
+bodies of the two clauses are right and their headings are swapped. Every
+other collection resource of the binding uses POST for create and
+GET/HEAD for query. Suggest heading 9.4.3.1 "POST" and 9.4.3.2
+"GET/HEAD".
+
+Antares serves POST for create and GET for query on
+`/ngsi-ld/v1/csourceSubscriptions` (`crates/antares-api/src/lib.rs`); the
+operation matrix records the swap (docs/analysis/operation-matrix.md,
+open question 9, T-3674).

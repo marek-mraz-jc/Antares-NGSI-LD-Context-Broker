@@ -2394,6 +2394,14 @@ pub(crate) async fn fed_entity_maps(
         .into_iter()
         .filter(|reg| reg.supports(op))
         .collect();
+    // a narrowed q the peer's caps refuse stays home, and the map the peer
+    // answers without it is narrowed here (T-3683)
+    let held_back = params
+        .get("q")
+        .filter(|q| !split && !forwardable("q", q))
+        .map(|q| antares_ql::parse_narrowed_q(q))
+        .transpose()?;
+    let held_back = &held_back;
     let fetched = fan_out(regs, move |reg| async move {
         let mut query: Vec<(String, String)> = Vec::new();
         for k in [
@@ -2421,12 +2429,12 @@ pub(crate) async fn fed_entity_maps(
                 "scopeQ",
                 "lang",
             ] {
-                if let Some(v) = params.get(k) {
+                if let Some(v) = params.get(k).filter(|v| forwardable(k, v)) {
                     query.push((k.to_owned(), v.clone()));
                 }
             }
         }
-        let (status, body, _) = forward(
+        let (status, mut body, _) = forward(
             st,
             reqwest::Method::GET,
             format!("{}/ngsi-ld/v1/{path}", reg.endpoint),
@@ -2438,6 +2446,16 @@ pub(crate) async fn fed_entity_maps(
             None,
         )
         .await;
+        if let Some(q) = held_back.as_ref().filter(|_| (200..300).contains(&status)) {
+            let peer = Peer {
+                st,
+                tenant,
+                headers,
+                ctx_url,
+                reg: &reg,
+            };
+            narrow_map_ids(peer, ctx, params.get("type"), q, &mut body).await;
+        }
         (reg, status, body)
     })
     .await;
@@ -2448,6 +2466,83 @@ pub(crate) async fn fed_entity_maps(
         }
     }
     Ok(out)
+}
+
+/// What every forward to one registered peer shares.
+struct Peer<'a> {
+    st: &'a AppState,
+    tenant: &'a TenantId,
+    headers: &'a HeaderMap,
+    ctx_url: &'a str,
+    reg: &'a FedReg,
+}
+
+/// A peer's EntityMap asked without a narrowed `q` its caps refuse (T-3683,
+/// threat V23): the ids it lists are a superset of the narrowing's, and the
+/// map is served to the caller, so each id stays only when the peer's own
+/// Entity is selected by `q` here. The Entities are read from the same peer
+/// by id, as Query Entities forwards them; a linked path does not resolve,
+/// so it never holds, and a peer that cannot be read contributes no id.
+async fn narrow_map_ids(
+    peer: Peer<'_>,
+    ctx: &Context,
+    type_param: Option<&String>,
+    q: &antares_ql::QNode,
+    body: &mut Value,
+) {
+    let Peer {
+        st,
+        tenant,
+        headers,
+        ctx_url,
+        reg,
+    } = peer;
+    // ponytail: one read per 100 ids, sequential; a peer map is capped at
+    // the broker's limit, so this is a few reads at most
+    const CHUNK: usize = 100;
+    let Some(map) = body.get_mut("entityMap").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let listed: Vec<String> = map.keys().cloned().collect();
+    let mut kept = std::collections::HashSet::new();
+    if reg.query_op().is_some() {
+        for ids in listed.chunks(CHUNK) {
+            let mut query = vec![
+                ("id".to_owned(), ids.join(",")),
+                ("limit".to_owned(), ids.len().to_string()),
+            ];
+            if let Some(t) = type_param {
+                query.push(("type".to_owned(), t.clone()));
+            }
+            let (status, found, _) = forward(
+                st,
+                reqwest::Method::GET,
+                format!("{}/ngsi-ld/v1/entities", reg.endpoint),
+                &query,
+                headers,
+                tenant,
+                reg,
+                ctx_url,
+                None,
+            )
+            .await;
+            if !(200..300).contains(&status) {
+                continue;
+            }
+            for e in found.as_array().into_iter().flatten() {
+                let Some(id) = e.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if ids.iter().any(|i| i == id)
+                    && import_entity(e, reg, ctx)
+                        .is_some_and(|doc| antares_ql::eval::eval_q(q, &doc, ctx, &|_| None))
+                {
+                    kept.insert(id.to_owned());
+                }
+            }
+        }
+    }
+    map.retain(|id, _| kept.contains(id));
 }
 
 /// 5.7.4.4: forward the temporal query to matching registrations that

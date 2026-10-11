@@ -693,7 +693,12 @@ def robot_recipe_violations():
     run = ROOT / "dev/etsi-run.sh"
     if not run.exists():
         return [f"{run}: the suite runner is missing"]
-    names = re.findall(r'sed -i "s\|\^(\w+) = ', run.read_text(encoding="utf-8"))
+    # Only the overrides the runner always makes: a `|| sed` that applies
+    # when the pipeline set something up (SUITE_CONTEXT, T-3550) has
+    # nothing a bare run could point it at, and its default stays right.
+    names = re.findall(
+        r'^\s*sed -i "s\|\^(\w+) = ', run.read_text(encoding="utf-8"), re.M
+    )
     if not names:
         return [f"{run}: no variables.py overrides to compare a recipe against"]
     out = []

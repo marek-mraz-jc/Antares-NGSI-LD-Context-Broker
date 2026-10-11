@@ -242,10 +242,20 @@ impl Conditions {
         if self.holds(id, doc) {
             Ok(())
         } else {
-            Err(NgsiError::ResourceNotFound(format!(
-                "entity {id} not found"
-            )))
+            Err(Self::not_found(id))
         }
+    }
+
+    /// Whether a condition holds `id`: an upsert of it may update an Entity
+    /// the condition selects and never creates one (5.6.8, T-3668).
+    fn has(&self, id: &str) -> bool {
+        self.0.contains_key(id)
+    }
+
+    /// The one answer for a conditioned member that is absent or not
+    /// selected, so the two cannot be told apart.
+    fn not_found(id: &str) -> NgsiError {
+        NgsiError::ResourceNotFound(format!("entity {id} not found"))
     }
 
     fn unforwarded(&self, forwards: bool) -> Result<(), crate::policy::Denied> {
@@ -307,6 +317,7 @@ async fn upsert_in_view(
     round: Vec<(String, Value)>,
     update_mode: bool,
     ts: &str,
+    conds: &Conditions,
     out: &mut BatchOutcome,
 ) -> Result<Vec<String>, NgsiError> {
     let (round, guards) = view_guards(st, tenant, round, out).await;
@@ -315,6 +326,7 @@ async fn upsert_in_view(
     let res = st
         .store
         .batch_mutate(tenant, &ids, |id, doc| {
+            conds.pre(id, doc)?;
             let guard = guards.get(id);
             if let Some(g) = guard {
                 if update_mode {
@@ -351,6 +363,12 @@ async fn upsert_in_view(
                 if !out.success.contains(&Value::String(id.clone())) {
                     out.success.push(Value::String(id));
                 }
+            }
+            // a conditioned member never creates: absent or not selected,
+            // it is not found
+            None | Some(Err(NgsiError::ResourceNotFound(_))) if conds.has(&id) => {
+                out.errors
+                    .push(err_entry(Some(&id), &Conditions::not_found(&id)));
             }
             // absent, or out of the view: the pre-image answers not found
             None | Some(Err(NgsiError::ResourceNotFound(_))) => creates.push((id, doc)),
@@ -881,7 +899,7 @@ async fn batch_write(
     crate::views::with_view(
         st.view.as_deref(),
         mode.clause(),
-        Ok(crate::policy::Filter::default()),
+        Ok(crate::policy::unnarrowed()),
     )?;
     let mut conds = Conditions::default();
     if let Some(engine) = &st.policy {
@@ -1073,7 +1091,8 @@ async fn batch_write(
             BatchMode::Upsert => {
                 #[cfg(feature = "views")]
                 if st.view.is_some() {
-                    for id in upsert_in_view(st, &tenant, round, update_mode, &ts, &mut out).await?
+                    for id in upsert_in_view(st, &tenant, round, update_mode, &ts, &conds, &mut out)
+                        .await?
                     {
                         any_created = true;
                         if !created_ids.contains(&id) {
@@ -1093,6 +1112,7 @@ async fn batch_write(
                     let res = st
                         .store
                         .batch_mutate(&tenant, &ids, |id, doc| {
+                            conds.pre(id, doc)?;
                             merge_into(doc, docs[id], &ts);
                             Ok::<(), NgsiError>(())
                         })
@@ -1105,11 +1125,53 @@ async fn batch_write(
                                     out.success.push(Value::String(id.clone()));
                                 }
                             }
+                            None if conds.has(id) => out
+                                .errors
+                                .push(err_entry(Some(id), &Conditions::not_found(id))),
                             None => replaces.push((id.clone(), expanded.clone())),
                         }
                     }
                 } else {
-                    replaces = round;
+                    // a conditioned member is replaced only inside the
+                    // store's read of it, where its condition is judged
+                    let (conditioned, free): (Vec<_>, Vec<_>) =
+                        round.into_iter().partition(|(id, _)| conds.has(id));
+                    replaces = free;
+                    if !conditioned.is_empty() {
+                        let ids: Vec<String> =
+                            conditioned.iter().map(|(id, _)| id.clone()).collect();
+                        let docs: HashMap<&str, &Value> =
+                            conditioned.iter().map(|(id, d)| (id.as_str(), d)).collect();
+                        let res = st
+                            .store
+                            .batch_mutate(&tenant, &ids, |id, doc| {
+                                conds.pre(id, doc)?;
+                                let mut new = docs[id].clone();
+                                stamp_new(&mut new, &ts);
+                                // 4.8: a replaced Entity keeps the instant it was created.
+                                if let (Some(o), Some(created)) =
+                                    (new.as_object_mut(), doc.get("createdAt"))
+                                {
+                                    o.insert("createdAt".into(), created.clone());
+                                }
+                                *doc = new;
+                                Ok::<(), NgsiError>(())
+                            })
+                            .await?;
+                        for (id, r) in ids.iter().zip(res) {
+                            match r {
+                                Some(Ok(())) => {
+                                    if !out.success.contains(&Value::String(id.clone())) {
+                                        out.success.push(Value::String(id.clone()));
+                                    }
+                                }
+                                Some(Err(e)) => out.errors.push(err_entry(Some(id), &e)),
+                                None => out
+                                    .errors
+                                    .push(err_entry(Some(id), &Conditions::not_found(id))),
+                            }
+                        }
+                    }
                 }
                 if !replaces.is_empty() {
                     for (_, doc) in replaces.iter_mut() {
@@ -1468,7 +1530,7 @@ pub async fn batch_delete(
         crate::views::with_view(
             st.view.as_deref(),
             "5.6.10",
-            Ok(crate::policy::Filter::default()),
+            Ok(crate::policy::unnarrowed()),
         )?;
         if let Some(engine) = &st.policy {
             let mut pres: Vec<crate::policy::PreImage> = Vec::new();

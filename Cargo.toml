@@ -27,6 +27,8 @@ members = [
     # The reference plugin: built and tested with the workspace so the
     # driver, routing and notification seams cannot drift from it.
     "examples/plugin-example",
+    # The joinedcontext platform's policy engine (ADR-0020 addon).
+    "addons/joinedcontext-policy",
 ]
 # Fuzz harness: own lockfile/profile, built only by cargo-fuzz on
 # nightly (.github/workflows/fuzz.yml) — never part of the normal build.
@@ -50,6 +52,7 @@ antares-api = { path = "crates/antares-api", default-features = false }
 antares-matcher = { path = "crates/antares-matcher" }
 antares-notifier = { path = "crates/antares-notifier", default-features = false }
 antares-plugin-example = { path = "examples/plugin-example" }
+joinedcontext-policy = { path = "addons/joinedcontext-policy" }
 antares-ops = { path = "crates/antares-ops" }
 antares-views = { path = "crates/antares-views" }
 antares-mcp = { path = "crates/antares-mcp" }
@@ -82,9 +85,12 @@ axum = "0.8"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "http1", "http2", "tokio"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["normalize-path", "cors", "catch-panic"] }
+tower-http = { version = "0.7", features = ["cors", "catch-panic"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SHA-256 of the access surface's ODRL rules (joinedcontext-policy); the
+# version sqlx and ed25519-dalek already build.
+sha2 = { version = "0.10", default-features = false }
 redb = "4.1"
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
 # The crypto provider for mqtts. rumqttc is built provider-less
@@ -167,39 +173,62 @@ lto = "thin"
 # the stable perf-baseline shapes (docs/src/perf-baseline.md, T-3552).
 overflow-checks = true
 
+# ADR-0027 section 6 (T-3712): `full` measured +6.81 MiB over vanilla.
+# Request-path surface crates (and rmcp) build as one codegen unit, which
+# drops the copies of generics each unit inlined; cold ones (admin reload,
+# $metadata, $batch, schemas) build for size: +5.58 MiB, OData/MCP benches
+# within host noise. opt-level "s" everywhere reached +4.92 MiB but cost
+# 16-26 % on the OData and MCP benches. Vanilla links none of these crates.
 # surfaces-threat-model 10.1: the new crates keep overflow checks in release.
 [profile.release.package.antares-ops]
 overflow-checks = true
+opt-level = "s"
 
 [profile.release.package.linkml-model]
 overflow-checks = true
+opt-level = "s"
 
 [profile.release.package.odata-csdl]
 overflow-checks = true
+opt-level = "s"
 
 [profile.release.package.odata-url]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.odata-json]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.odata-batch]
 overflow-checks = true
+opt-level = "s"
 
 [profile.release.package.odata-axum]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.antares-views]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.antares-mcp]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.antares-odata]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.antares-ws]
 overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.rmcp]
+codegen-units = 1
+
+[profile.release.package.schemars]
+opt-level = "s"
 
 [profile.release.package.antares-icsr]
 overflow-checks = true

@@ -465,8 +465,10 @@ async fn timeout_and_cooldown_hold_for_the_transport() {
     let started = std::time::Instant::now();
     let (status, first, _) = send(&st, "GET", "entities?type=Vehicle", None).await;
     assert_eq!(status, StatusCode::OK);
+    // ThreadSanitizer slows the whole request, not the 50 ms timeout: a
+    // strict run took it past a flat 5 s (run 38109841097, T-3706)
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(5 * antares_api::state::slow_factor()),
         "the timeout held"
     );
     assert!(first.iter().any(|w| w.starts_with("199 ")), "{first:?}");

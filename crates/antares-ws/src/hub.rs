@@ -20,6 +20,16 @@ pub const ENDPOINT_PREFIX: &str = "urn:antares:ws:";
 /// delivery the Subscription records, never a partial write.
 pub const MAX_NOTIFICATION_BYTES: usize = 1024 * 1024;
 
+/// The digits of `u64::MAX`, the longest seq a notification can carry.
+const U64_MAX_DIGITS: usize = 20;
+
+/// The decimal digits of `n`.
+fn digits(n: u64) -> usize {
+    usize::try_from(n.checked_ilog10().unwrap_or(0))
+        .unwrap_or(U64_MAX_DIGITS)
+        .saturating_add(1)
+}
+
 /// Where a connection's operations run: the NGSI-LD root of its Tenant, or
 /// one view, looked up again on every use so a removed view is noticed.
 #[derive(Clone)]
@@ -117,24 +127,31 @@ impl Conn {
             return Answer::Unknown;
         };
         let coalescible = !show && n.entity.is_some() && !n.changes;
-        // the seq is the one it would take; rendered with the largest one,
-        // a text at the cap stays under it whatever seq it gets
-        if envelope::notification(&n.rendered, u64::MAX, &n.subscription).len()
+        let into = coalescible
+            .then(|| {
+                st.queue
+                    .iter()
+                    .position(|q| q.coalescible && q.sub == n.subscription && q.entity == n.entity)
+            })
+            .flatten();
+        let seq = into
+            .and_then(|i| st.queue.get(i))
+            .map_or(st.next_seq.max(1), |q| q.seq);
+        // rendered once, with the seq it takes; the cap is judged as if the
+        // seq had the most digits a u64 has, so a text at the cap stays
+        // under it whatever seq it gets
+        let text = envelope::notification(&n.rendered, seq, &n.subscription);
+        if text
+            .len()
+            .saturating_add(U64_MAX_DIGITS.saturating_sub(digits(seq)))
             > MAX_NOTIFICATION_BYTES
         {
             return Answer::TooLarge;
         }
-        if coalescible {
-            if let Some(q) = st
-                .queue
-                .iter_mut()
-                .find(|q| q.coalescible && q.sub == n.subscription && q.entity == n.entity)
-            {
-                q.text = envelope::notification(&n.rendered, q.seq, &n.subscription);
-                return Answer::Queued;
-            }
+        if let Some(q) = into.and_then(|i| st.queue.get_mut(i)) {
+            q.text = text;
+            return Answer::Queued;
         }
-        let seq = st.next_seq.max(1);
         st.next_seq = seq.saturating_add(1);
         if st.queue.len() >= limit {
             let from = st.queue.front().map_or(seq, |q| q.seq);
@@ -148,7 +165,6 @@ impl Conn {
             self.wake.notify_one();
             return Answer::Overflow;
         }
-        let text = envelope::notification(&n.rendered, seq, &n.subscription);
         st.queue.push_back(Queued {
             seq,
             sub: n.subscription,

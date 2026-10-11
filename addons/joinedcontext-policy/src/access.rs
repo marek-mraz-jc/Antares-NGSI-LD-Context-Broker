@@ -1,0 +1,425 @@
+// SPDX-License-Identifier: EUPL-1.2
+//! What the caller may do through one view, read from the table the engine
+//! decides with (README section 4, platform EP-55 to EP-60). It answers
+//! "what may I do here" and never "what is here": a type only somebody else
+//! may touch is absent, not listed as denied.
+
+use crate::decide::{covers_types, held};
+use crate::document::{context, Policy, Selector, Table};
+use crate::names::{self, OPERATIONS};
+use crate::subject::{Caller, Platform};
+use chrono::{DateTime, Utc};
+use serde_json::{json, Map, Value};
+
+/// The policies of one caller in force now, split by effect.
+pub struct Grants<'t> {
+    /// The permissions, in document order.
+    pub permissions: Vec<&'t Policy>,
+    /// The prohibitions, in document order.
+    pub prohibitions: Vec<&'t Policy>,
+}
+
+impl<'t> Grants<'t> {
+    /// What `caller` holds in `table` at `now`. The cluster's own caller and
+    /// a Tenant with no document hold nothing.
+    #[must_use]
+    pub fn of(table: Option<&'t Table>, caller: &'t Caller, now: DateTime<Utc>) -> Self {
+        let (prohibitions, permissions) = match (table, caller) {
+            (Some(table), Caller::Platform(p)) => held(table, p, now).partition(|p| p.prohibit),
+            _ => (Vec::new(), Vec::new()),
+        };
+        Self {
+            permissions,
+            prohibitions,
+        }
+    }
+}
+
+/// The Table 4.20-1 names of the clauses `p` lists whose rows the view
+/// serves (`served` answers by operation-matrix row), sorted.
+#[must_use]
+pub fn actions(p: &Policy, served: &dyn Fn(&str) -> bool) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = OPERATIONS
+        .iter()
+        .filter(|(name, rows)| {
+            names::clause(name).is_some_and(|c| p.clauses.contains(c))
+                && rows.iter().any(|r| served(r))
+        })
+        .map(|(name, _)| *name)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// The selectors a policy shows: its own, or the type `*` for a policy
+/// without `information`, which grants every type.
+#[must_use]
+pub fn selectors(p: &Policy) -> Vec<Selector> {
+    if p.source.selectors.is_empty() {
+        vec![Selector {
+            entity_type: "*".into(),
+            ..Selector::default()
+        }]
+    } else {
+        p.source.selectors.clone()
+    }
+}
+
+/// The policy's conditions as written (GW11).
+#[must_use]
+pub fn constraints(p: &Policy) -> Map<String, Value> {
+    let s = &p.source;
+    [
+        ("q", &s.q),
+        ("scopeQ", &s.scope_q),
+        ("geoQ", &s.geo_q),
+        ("temporalQ", &s.temporal_q),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.as_ref().map(|v| (k.to_owned(), json!(v))))
+    .collect()
+}
+
+/// `attributes` of an entry: the names, or `"*"` for the whole Entity.
+fn attributes(s: &Selector) -> Value {
+    if s.attributes.is_empty() {
+        json!("*")
+    } else {
+        json!(s.attributes)
+    }
+}
+
+/// The `AuthZEN` resource-search document (EP-55).
+#[must_use]
+pub fn authzen(
+    caller: &Caller,
+    view: &str,
+    grants: &Grants<'_>,
+    served: &dyn Fn(&str) -> bool,
+) -> Value {
+    json!({
+        "subject": subject(caller),
+        "resource": {"type": "view", "id": view},
+        "permissions": entries(&grants.permissions, served),
+        "prohibitions": entries(&grants.prohibitions, served),
+    })
+}
+
+/// One entry per selector of each policy that leaves an action through the
+/// view.
+fn entries(policies: &[&Policy], served: &dyn Fn(&str) -> bool) -> Vec<Value> {
+    let mut out = Vec::new();
+    for p in policies {
+        let actions = actions(p, served);
+        if actions.is_empty() {
+            continue;
+        }
+        for s in selectors(p) {
+            let mut resource = Map::new();
+            resource.insert("type".into(), json!(s.entity_type));
+            if let Some(pattern) = &s.id_pattern {
+                resource.insert("idPatterns".into(), json!([pattern]));
+            }
+            if let Some(id) = &s.id {
+                resource.insert("id".into(), json!(id));
+            }
+            out.push(json!({
+                "resource": resource,
+                "actions": actions,
+                "attributes": attributes(&s),
+                "constraints": constraints(p),
+            }));
+        }
+    }
+    out
+}
+
+/// The caller as the document names them: never more than they know.
+fn subject(caller: &Caller) -> Value {
+    match caller {
+        Caller::Internal => json!({"type": "internal"}),
+        Caller::Platform(Platform {
+            user: Some(user), ..
+        }) => json!({"type": "user", "id": user}),
+        Caller::Platform(Platform {
+            client: Some(client),
+            ..
+        }) => json!({"type": "serviceAccount", "id": client}),
+        Caller::Platform(_) => json!({"type": "role", "id": "public"}),
+    }
+}
+
+/// One `AuthZEN` decision for one prospective request (platform R51): the
+/// operation named `action` on `entity_type`, decided as the engine decides
+/// (README section 3, steps 1 to 3). A permission may name its assigner,
+/// since the caller holds it; a refusal names nothing (GW6).
+#[must_use]
+pub fn check(
+    grants: &Grants<'_>,
+    action: &str,
+    entity_type: Option<&str>,
+    served: &dyn Fn(&str) -> bool,
+) -> Value {
+    let refused = json!({"decision": false});
+    let Some(clause) = names::clause(action) else {
+        return refused;
+    };
+    let through_view = OPERATIONS
+        .iter()
+        .any(|(n, rows)| *n == action && rows.iter().any(|r| served(r)));
+    if !through_view {
+        return refused;
+    }
+    let types: Vec<String> = entity_type
+        .map(|t| context().expand_key(t))
+        .into_iter()
+        .collect();
+    let lists = |p: &&&Policy| p.clauses.contains(clause);
+    if grants
+        .prohibitions
+        .iter()
+        .filter(lists)
+        .any(|p| covers_types(p, &types))
+    {
+        return refused;
+    }
+    let granted = grants.permissions.iter().filter(lists).find(|p| {
+        types.is_empty()
+            || p.selectors.is_empty()
+            || p.selectors
+                .iter()
+                .any(|s| s.types.iter().any(|t| types.contains(t)))
+    });
+    match granted {
+        Some(p) => {
+            let mut context = Map::new();
+            context.insert("reason".into(), json!("policy_grant_matched"));
+            if let Some(assigner) = &p.source.assigner {
+                context.insert("assigner".into(), json!(assigner));
+            }
+            json!({"decision": true, "context": context})
+        }
+        None => refused,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The member at `path` (a JSON pointer), `null` when absent.
+    fn at(v: &Value, path: &str) -> Value {
+        v.pointer(path).cloned().unwrap_or(Value::Null)
+    }
+    use crate::document::compile;
+    use antares_api::policy::Subject;
+
+    fn table() -> Result<Table, String> {
+        compile(&json!({"policies": [
+            {"id": "read-air", "assigner": "did:web:city.example.org",
+             "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1", "5.7.2", "5.7.4"],
+             "information": [{"entities": [{"type": "AirQualityObserved",
+                                            "idPattern": "^urn:ngsi-ld:AirQualityObserved:.*$"}],
+                              "propertyNames": ["pm25", "pm10"], "relationshipNames": ["location"]}],
+             "q": "pm10>=0", "scopeQ": "/geo/SK/BB"},
+            {"id": "steward-writes", "assignee": {"kind": "role", "id": "steward"},
+             "operations": ["5.6.1", "5.6.4"],
+             "information": [{"entities": [{"type": "InternalIncident"}],
+                              "propertyNames": ["severity"]}]},
+            {"id": "no-history", "effect": "prohibit",
+             "assignee": {"kind": "role", "id": "public"}, "operations": ["5.7.4"],
+             "information": [{"entities": [{"type": "AirQualityObserved"}]}]},
+            {"id": "expired", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1"], "validity": {"to": "2020-01-01T00:00:00Z"},
+             "information": [{"entities": [{"type": "Expired"}]}]}
+        ]}))
+    }
+
+    fn caller(headers: &[(&str, &str)]) -> Caller {
+        Caller::of(&Subject {
+            tenant: antares_model::TenantId::default(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        })
+    }
+
+    fn every(_: &str) -> bool {
+        true
+    }
+
+    #[test]
+    fn the_document_lists_the_callers_grants_and_nothing_of_anyone_else() -> Result<(), String> {
+        let t = table()?;
+        let public = caller(&[("x-jc-roles", "")]);
+        let doc = authzen(
+            &public,
+            "air",
+            &Grants::of(Some(&t), &public, Utc::now()),
+            &every,
+        );
+        assert_eq!(
+            at(&doc, "/subject"),
+            json!({"type": "role", "id": "public"})
+        );
+        assert_eq!(at(&doc, "/resource"), json!({"type": "view", "id": "air"}));
+        let grants = at(&doc, "/permissions");
+        assert_eq!(grants.as_array().map_or(0, Vec::len), 1, "{doc}");
+        let g = &at(&grants, "/0");
+        assert_eq!(at(g, "/resource/type"), "AirQualityObserved");
+        assert_eq!(
+            at(g, "/actions"),
+            json!([
+                "queryBatch",
+                "queryEntity",
+                "queryTemporal",
+                "retrieveEntity"
+            ])
+        );
+        assert_eq!(at(g, "/attributes"), json!(["location", "pm10", "pm25"]));
+        assert_eq!(
+            at(g, "/constraints"),
+            json!({"q": "pm10>=0", "scopeQ": "/geo/SK/BB"})
+        );
+        assert!(at(g, "/resource/idPatterns/0").is_string());
+        let p = at(&doc, "/prohibitions");
+        assert_eq!(p.as_array().map_or(0, Vec::len), 1);
+        assert_eq!(at(&p, "/0/actions"), json!(["queryTemporal"]));
+        assert_eq!(at(&p, "/0/attributes"), json!("*"));
+        let text = doc.to_string();
+        for hidden in [
+            "InternalIncident",
+            "severity",
+            "steward",
+            "Expired",
+            "read-air",
+        ] {
+            assert!(!text.contains(hidden), "{hidden} in {text}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_view_takes_off_the_actions_it_does_not_serve() -> Result<(), String> {
+        let t = table()?;
+        let public = caller(&[("x-jc-roles", "")]);
+        let grants = Grants::of(Some(&t), &public, Utc::now());
+        let doc = authzen(&public, "air", &grants, &|r| r == "query_entities");
+        assert_eq!(at(&doc, "/permissions/0/actions"), json!(["queryEntity"]));
+        assert_eq!(
+            at(&doc, "/prohibitions"),
+            json!([]),
+            "a view without history"
+        );
+        let none = authzen(&public, "air", &grants, &|_| false);
+        assert_eq!(at(&none, "/permissions"), json!([]));
+        Ok(())
+    }
+
+    #[test]
+    fn each_caller_is_named_by_what_it_is_and_the_cluster_holds_nothing() -> Result<(), String> {
+        let t = table()?;
+        for (headers, want) in [
+            (
+                vec![("x-jc-subject", "ana")],
+                json!({"type": "user", "id": "ana"}),
+            ),
+            (
+                vec![("x-jc-client", "app")],
+                json!({"type": "serviceAccount", "id": "app"}),
+            ),
+            (vec![], json!({"type": "internal"})),
+        ] {
+            let c = caller(&headers);
+            let doc = authzen(&c, "v", &Grants::of(Some(&t), &c, Utc::now()), &every);
+            assert_eq!(at(&doc, "/subject"), want);
+            assert_eq!(at(&doc, "/permissions"), json!([]), "{headers:?}");
+        }
+        let steward = caller(&[("x-jc-subject", "bo"), ("x-jc-roles", "steward")]);
+        let doc = authzen(
+            &steward,
+            "v",
+            &Grants::of(Some(&t), &steward, Utc::now()),
+            &every,
+        );
+        assert_eq!(
+            at(&doc, "/permissions/0/actions"),
+            json!(["createEntity", "updateAttrs"])
+        );
+        let none = authzen(
+            &steward,
+            "v",
+            &Grants::of(None, &steward, Utc::now()),
+            &every,
+        );
+        assert_eq!(
+            at(&none, "/permissions"),
+            json!([]),
+            "a Tenant without a document"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_policy_without_information_shows_every_type() -> Result<(), String> {
+        let t = compile(
+            &json!({"policies": [{"id": "all", "assignee": {"kind": "role", "id": "public"},
+                                              "operations": ["5.7.2"]}]}),
+        )?;
+        let public = caller(&[("x-jc-roles", "")]);
+        let doc = authzen(
+            &public,
+            "v",
+            &Grants::of(Some(&t), &public, Utc::now()),
+            &every,
+        );
+        assert_eq!(at(&doc, "/permissions/0/resource"), json!({"type": "*"}));
+        assert_eq!(at(&doc, "/permissions/0/constraints"), json!({}));
+        Ok(())
+    }
+
+    #[test]
+    fn the_check_answers_one_prospective_request_and_a_refusal_says_nothing() -> Result<(), String>
+    {
+        let t = table()?;
+        let public = caller(&[("x-jc-roles", "")]);
+        let grants = Grants::of(Some(&t), &public, Utc::now());
+        let yes = check(&grants, "queryEntity", Some("AirQualityObserved"), &every);
+        assert_eq!(
+            yes,
+            json!({"decision": true, "context": {"reason": "policy_grant_matched",
+                                                 "assigner": "did:web:city.example.org"}})
+        );
+        assert_eq!(
+            at(&check(&grants, "queryEntity", None, &every), "/decision"),
+            true
+        );
+        for (action, ty) in [
+            ("deleteEntity", Some("AirQualityObserved")),
+            ("queryEntity", Some("InternalIncident")),
+            // prohibited although a permission lists it (GW8)
+            ("queryTemporal", Some("AirQualityObserved")),
+            ("queryTemporal", None),
+            ("purgeEntity", None),
+            ("nosuch", None),
+            ("retrieveEntity", Some("Expired")),
+        ] {
+            assert_eq!(
+                check(&grants, action, ty, &every),
+                json!({"decision": false}),
+                "{action}"
+            );
+        }
+        let not_served = check(&grants, "queryEntity", None, &|r| r == "retrieve_entity");
+        assert_eq!(not_served, json!({"decision": false}));
+        let internal = caller(&[]);
+        let none = Grants::of(Some(&t), &internal, Utc::now());
+        assert_eq!(
+            at(&check(&none, "queryEntity", None, &every), "/decision"),
+            false
+        );
+        Ok(())
+    }
+}

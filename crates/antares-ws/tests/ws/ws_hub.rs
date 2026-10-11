@@ -5,7 +5,7 @@
 //! offers made without an `.await` between them all land before the
 //! session drains any.
 
-use crate::common::{broker, broker_alone, cars, connect, outbound, status, text, until};
+use crate::common::{broker, broker_alone, cars, connect, outbound, rendered, status, text, until};
 use antares_ops::{NotificationSink, Surface};
 use antares_ws::{Answer, Forwarded, Hub, Limits, Relay, Sink, ViewWs, Ws, ENDPOINT_PREFIX};
 use serde_json::{json, Value};
@@ -24,7 +24,7 @@ fn forwarded(subscription: &str, entity: Option<&str>, n: i64) -> Result<Vec<u8>
         subscription: subscription.into(),
         entity: entity.map(str::to_owned),
         changes: false,
-        rendered: json!({"metadata": {}, "body": {"n": n}}),
+        rendered: rendered(subscription, n),
     })
     .map_err(|e| e.to_string())
 }
@@ -236,19 +236,16 @@ async fn ws_coalescing_keeps_subscriptions_and_entities_apart() -> Result<(), St
     let mut got = Vec::new();
     for _ in 0..4 {
         let n = c.notification().await?;
-        got.push((
-            text(&n, "/metadata/x-subscription"),
-            n.pointer("/body/n").cloned().unwrap_or(Value::Null),
-        ));
+        got.push((text(&n, "/metadata/x-subscription"), text(&n, "/body/id")));
     }
     // the fourth replaced the first in place
     assert_eq!(
         got,
         vec![
-            (s2.clone(), json!(0)),
-            (s1.clone(), json!(4)),
-            (s1, json!(2)),
-            (s2, json!(3))
+            (s2.clone(), "urn:ngsi-ld:Notification:0".to_owned()),
+            (s1.clone(), "urn:ngsi-ld:Notification:4".to_owned()),
+            (s1, "urn:ngsi-ld:Notification:2".to_owned()),
+            (s2, "urn:ngsi-ld:Notification:3".to_owned())
         ]
     );
     Ok(())
@@ -321,5 +318,53 @@ async fn ws_an_overflow_while_away_is_a_gap_on_resume() -> Result<(), String> {
         "{gap}"
     );
     assert_eq!(gap.pointer("/metadata/x-to"), Some(&json!(3)), "{gap}");
+    Ok(())
+}
+
+/// 4.3: a notification whose message would reach the cap with the longest
+/// seq is written, one byte more is refused before it takes a seq. The
+/// message is rendered once with the seq it takes (T-3626), so the cap is
+/// judged on that text plus the digits a larger seq would add.
+#[tokio::test]
+async fn ws_the_notification_cap_holds_to_the_byte() -> Result<(), String> {
+    let b = broker_alone(Limits::default()).await?;
+    let mut c = connect(b.addr, ROOT, &[]).await?;
+    let (sub, _) = two(&mut c).await?;
+    let padded = |n: usize| {
+        let mut r = rendered(&sub, 1);
+        if let Some(body) = r.get_mut("body").and_then(Value::as_object_mut) {
+            body.insert("pad".into(), json!("x".repeat(n)));
+        }
+        r
+    };
+    let base = antares_ws::envelope::notification(&padded(0), u64::MAX, &sub).len();
+    let fits = antares_ws::MAX_NOTIFICATION_BYTES
+        .checked_sub(base)
+        .ok_or("an empty notification is over the cap")?;
+    let offer = |n: usize| {
+        serde_json::to_vec(&Forwarded {
+            tenant: "default".into(),
+            subscription: sub.clone(),
+            entity: None,
+            changes: false,
+            rendered: padded(n),
+        })
+        .map_err(|e| e.to_string())
+    };
+    assert_eq!(
+        answer(&b.hub.answer(&c.connection, &offer(fits + 1)?))?,
+        Answer::TooLarge
+    );
+    assert_eq!(
+        answer(&b.hub.answer(&c.connection, &offer(fits)?))?,
+        Answer::Queued
+    );
+    let n = c.notification().await?;
+    // the refused one took no seq
+    assert_eq!(n.pointer("/metadata/x-seq"), Some(&json!(1)), "{n}");
+    assert_eq!(
+        n.pointer("/body/pad").and_then(Value::as_str).map(str::len),
+        Some(fits)
+    );
     Ok(())
 }

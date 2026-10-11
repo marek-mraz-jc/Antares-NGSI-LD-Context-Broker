@@ -21,6 +21,7 @@ use antares_ql::geo::GeoQuery;
 use antares_ql::QNode;
 use axum::http::HeaderMap;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -79,10 +80,19 @@ pub const WHOLE_TENANT: [&str; 4] = ["5.6.21", "5.16.1", "5.16.2", "5.16.7"];
 /// answer a narrowing as a deny ([`resolve`]).
 /// Discovery (5.7.5 to 5.7.10) is among them: ADR-0023 rule 5 computes it
 /// from the Entities the narrowing selects.
-pub const FILTERABLE: [&str; 12] = [
+/// Query Subscriptions (5.8.4, 5.11.5) and Query Registrations (5.10.2)
+/// narrow the list ([`RECORD_LISTS`]).
+pub const FILTERABLE: [&str; 15] = [
     "5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.7.5", "5.7.6", "5.7.7", "5.7.8", "5.7.9", "5.7.10",
-    "5.14.4", "5.14.5",
+    "5.14.4", "5.14.5", "5.8.4", "5.11.5", "5.10.2",
 ];
+
+/// The FILTERABLE clauses that list Subscriptions or Registrations. A
+/// narrowing there selects which documents are listed, counted and paged,
+/// and projects nothing: those are the client's own 5.2.12 and 5.2.9
+/// records, not Entities with Attributes to drop, so a [`Filter`] that
+/// projects is a deny there ([`resolve`], T-3673).
+pub const RECORD_LISTS: [&str; 3] = ["5.8.4", "5.11.5", "5.10.2"];
 
 /// Who is asking. The headers are the ones a deployment names for the
 /// seam to carry, copied verbatim and never interpreted: the broker does
@@ -243,12 +253,14 @@ pub enum Decision {
 
 /// The writes by id a [`Decision::AllowIf`] can condition: each changes or
 /// deletes Entities that are already stored, by id, and judges each of them
-/// inside its store operation. A create has no stored Entity to judge, and
-/// Batch Upsert may create; a temporal write changes the evolution, not the
-/// Entity a filter reads.
-pub const WRITE_BY_ID: [&str; 11] = [
-    "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.17", "5.6.18", "5.6.19", "5.6.9", "5.6.10",
-    "5.6.20",
+/// inside its store operation. A create has no stored Entity to judge; Batch
+/// Upsert updates the members its condition selects and creates none of the
+/// conditioned ones (T-3668). The temporal writes 5.6.12 to 5.6.15 judge the
+/// evolution's latest instances (`Condition::pre_evolution`); 5.6.16 is
+/// not one: the temporal seam has no delete that reads the document first.
+pub const WRITE_BY_ID: [&str; 16] = [
+    "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.17", "5.6.18", "5.6.19", "5.6.8", "5.6.9",
+    "5.6.10", "5.6.20", "5.6.12", "5.6.13", "5.6.14", "5.6.15",
 ];
 
 /// Why a write conditioned on its stored Entity is refused rather than
@@ -463,6 +475,10 @@ pub struct Rule {
     pub id_patterns: Vec<String>,
     /// The Attributes an Entity this rule holds for shows.
     pub attributes: Vec<String>,
+    /// The rule shows every Attribute, and `attributes` is not read
+    /// (ADR-0023 rule 11, amended by T-3637): an engine's grant over the
+    /// whole Entity. A view never sets it.
+    pub every_attribute: bool,
     /// Windows of `observedAt` (gap G6): in a temporal read (5.7.3, 5.7.4)
     /// an instance of these `attributes` is shown through this rule only if
     /// it falls into every one. A current-state read shows what the rule
@@ -481,9 +497,15 @@ impl Rule {
     /// so a temporal instance is selected the same way (unlike the
     /// condition, [`Rule::is_conditional`]).
     pub fn selects(&self, doc: &Value) -> bool {
-        entity_types(doc)
-            .iter()
-            .any(|t| self.types.iter().any(|r| r == t))
+        // `entity_types` read in place: this runs per rule per Entity of a
+        // page, and the list it would allocate is read once.
+        let named = |t: &str| self.types.iter().any(|r| r == t);
+        let typed = match doc.get("type") {
+            Some(Value::String(t)) => named(t),
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).any(named),
+            _ => false,
+        };
+        typed
             && match doc.get("id").and_then(Value::as_str) {
                 Some(id) => self.selects_id(id),
                 None => self.ids.is_empty() && self.id_patterns.is_empty(),
@@ -502,6 +524,13 @@ impl Rule {
     /// Whether the rule has a condition beside its types.
     pub fn is_conditional(&self) -> bool {
         self.q.is_some() || self.scope_q.is_some() || self.areas().next().is_some()
+    }
+
+    /// Whether the rule holds for exactly the Entities of its types: no
+    /// condition, no ids, no id patterns (what [`Self::holds`] reads beside
+    /// the types).
+    pub fn admits_by_type_alone(&self) -> bool {
+        !self.is_conditional() && self.ids.is_empty() && self.id_patterns.is_empty()
     }
 
     /// Whether the rule holds for `doc`, an Entity in the form `ctx`
@@ -550,6 +579,9 @@ impl Rule {
     /// caller the condition held, so these are what the visible set
     /// discloses; the view loader reports them.
     pub fn discloses(&self, ctx: &antares_jsonld::Context) -> Vec<String> {
+        if self.every_attribute {
+            return Vec::new();
+        }
         self.reads(ctx)
             .into_iter()
             .filter(|r| !self.attributes.iter().any(|a| ctx.expand_key(a) == *r))
@@ -557,15 +589,27 @@ impl Rule {
     }
 }
 
+/// The answer of a broker without an engine: a [`Filter`] that narrows
+/// nothing, one shared instance so asking costs no allocation.
+pub fn unnarrowed() -> std::sync::Arc<Filter> {
+    static NOTHING: LazyLock<std::sync::Arc<Filter>> =
+        LazyLock::new(|| std::sync::Arc::new(Filter::default()));
+    NOTHING.clone()
+}
+
 /// What a [`Filter`]'s rules let one Entity show: `only` (when set) is the
 /// union of the matched rules' Attributes, `omitted` what its types omit.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Shown {
-    pub only: Option<std::collections::BTreeSet<String>>,
-    pub omitted: std::collections::BTreeSet<String>,
+///
+/// The names borrow from the rules that decided them, so judging an Entity
+/// copies no Attribute name (T-3697); [`Shown::into_owned`] and
+/// [`Shown::map_names`] give a set that outlives the rules.
+pub struct Shown<'a> {
+    pub only: Option<std::collections::BTreeSet<Cow<'a, str>>>,
+    pub omitted: std::collections::BTreeSet<Cow<'a, str>>,
 }
 
-impl Shown {
+impl Shown<'_> {
     /// Nothing beside the frame: what a projection falls back to for an
     /// Entity no rule holds for, should one reach it.
     pub fn nothing() -> Self {
@@ -580,10 +624,22 @@ impl Shown {
     }
 
     /// The same set with every name mapped, for a document in another form.
-    pub fn map_names(&self, f: impl Fn(&str) -> String) -> Self {
+    pub fn map_names(&self, f: impl Fn(&str) -> String) -> Shown<'static> {
         Shown {
-            only: self.only.as_ref().map(|o| o.iter().map(|n| f(n)).collect()),
-            omitted: self.omitted.iter().map(|n| f(n)).collect(),
+            only: self
+                .only
+                .as_ref()
+                .map(|o| o.iter().map(|n| Cow::Owned(f(n))).collect()),
+            omitted: self.omitted.iter().map(|n| Cow::Owned(f(n))).collect(),
+        }
+    }
+
+    /// The same set, owning its names.
+    pub fn into_owned(self) -> Shown<'static> {
+        let own = |n: Cow<'_, str>| Cow::Owned(n.into_owned());
+        Shown {
+            only: self.only.map(|o| o.into_iter().map(own).collect()),
+            omitted: self.omitted.into_iter().map(own).collect(),
         }
     }
 }
@@ -671,25 +727,46 @@ impl Filter {
         !self.rules.is_empty() || !self.omit_by_type.is_empty()
     }
 
+    /// Whether a rule holds for `doc` (every document without rules): what
+    /// [`Self::shown`] answers `Some` for, without building the set.
+    pub fn admits(&self, doc: &Value, ctx: &antares_jsonld::Context) -> bool {
+        self.rules.is_empty() || self.rules.iter().any(|r| r.holds(doc, ctx))
+    }
+
     /// ADR-0023 rule 11: what `doc` may show, or `None` when `rules` is
     /// non-empty and none holds for it (the Entity is out). An Entity sees
     /// the union of the Attributes of the rules that hold for it, less what
     /// any of its types omits. Names compare as written: the caller brings
     /// rules and document into one form first (`repr::type_rules` expands
     /// both), and `ctx` is the one the conditions' names expand through.
-    pub fn shown(&self, doc: &Value, ctx: &antares_jsonld::Context) -> Option<Shown> {
+    pub fn shown(&self, doc: &Value, ctx: &antares_jsonld::Context) -> Option<Shown<'_>> {
         let only = if self.rules.is_empty() {
             None
         } else {
             let mut held = self.rules.iter().filter(|r| r.holds(doc, ctx)).peekable();
             held.peek()?;
-            Some(held.flat_map(|r| r.attributes.iter().cloned()).collect())
+            let held: Vec<&Rule> = held.collect();
+            if held.iter().any(|r| r.every_attribute) {
+                None
+            } else {
+                Some(
+                    held.iter()
+                        .flat_map(|r| r.attributes.iter().map(|a| Cow::Borrowed(a.as_str())))
+                        .collect(),
+                )
+            }
         };
+        if self.omit_by_type.is_empty() {
+            return Some(Shown {
+                only,
+                omitted: Default::default(),
+            });
+        }
         let omitted = entity_types(doc)
             .into_iter()
             .filter_map(|t| self.omit_by_type.get(t))
             .flatten()
-            .cloned()
+            .map(|a| Cow::Borrowed(a.as_str()))
             .collect();
         Some(Shown { only, omitted })
     }
@@ -717,7 +794,8 @@ impl Filter {
         self.rules.is_empty()
             || self.rules.iter().any(|r| {
                 r.holds(post_image, ctx)
-                    && written.iter().all(|w| r.attributes.iter().any(|a| a == w))
+                    && (r.every_attribute
+                        || written.iter().all(|w| r.attributes.iter().any(|a| a == w)))
             })
     }
 
@@ -1096,6 +1174,9 @@ pub fn resolve(clause: &str, decision: Decision) -> Decision {
             Decision::Deny("a write condition selects Entities and projects nothing".into())
         }
         Decision::AllowIf(f) if Condition::of(&f).is_none() => Decision::Allow,
+        Decision::Filter(f) if RECORD_LISTS.contains(&clause) && f.projects() => Decision::Deny(
+            format!("{clause} lists records whole and a narrowing there cannot project"),
+        ),
         Decision::Filter(f) if !FILTERABLE.contains(&clause) => {
             if f.is_empty() {
                 Decision::Allow
@@ -1512,6 +1593,50 @@ pub async fn gate_each(
         .collect()
 }
 
+/// A stored Subscription or Registration as a [`Condition`] reads it: `id`,
+/// `type` and `scope` as an Entity carries them, every other member one
+/// Property holding its value, and `subject` the carried header values of
+/// the subject that created it ([`SUBJECT_MEMBER`]), one instance each, so
+/// an engine selects the caller's own with `q=subject=="<its value>"`. A
+/// member a client wrote under `subject` is not the subject and is left
+/// out, as are the broker's other `__` members.
+// ponytail: values only, without the header names; an engine whose two
+// headers can carry the same value tells them apart by a rule's ids.
+fn record_image(doc: &Value) -> Value {
+    let ctx = crate::repr::policy_context();
+    let mut out = serde_json::Map::new();
+    for (k, v) in doc.as_object().into_iter().flatten() {
+        match k.as_str() {
+            "id" | "scope" => {
+                out.insert(k.clone(), v.clone());
+            }
+            "type" => {
+                let t = v
+                    .as_str()
+                    .map_or_else(|| v.clone(), |t| ctx.expand_key(t).into());
+                out.insert(k.clone(), t);
+            }
+            "subject" => {}
+            k if k.starts_with("__") => {}
+            k => {
+                out.insert(ctx.expand_key(k), serde_json::json!([{ "value": v }]));
+            }
+        }
+    }
+    let carried: Vec<(String, String)> = doc
+        .get(SUBJECT_MEMBER)
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    if !carried.is_empty() {
+        let values = carried
+            .into_iter()
+            .map(|(_, v)| serde_json::json!({ "value": v }));
+        out.insert(ctx.expand_key("subject"), values.collect());
+    }
+    Value::Object(out)
+}
+
 /// What a write by id needs of the Entity it lands on
 /// ([`Decision::AllowIf`]), in the form a stored document is read in. The
 /// handler checks it inside the store's own read-modify-write, on the
@@ -1560,6 +1685,12 @@ impl Condition {
             })
     }
 
+    /// Whether a Subscription or Registration is selected (T-3673): the
+    /// condition read over [`record_image`] of the stored document.
+    pub(crate) fn holds_for_record(&self, doc: &Value) -> bool {
+        self.holds(&record_image(doc))
+    }
+
     /// Inside the store closure: an Entity the condition does not select is
     /// not found, the answer an absent one gets.
     pub(crate) fn pre(
@@ -1576,6 +1707,23 @@ impl Condition {
         }
     }
 
+    /// [`Condition::pre`] on a Temporal Evolution, inside the temporal
+    /// store's closure: judged on [`latest_image`], and one it does not
+    /// select is the absent evolution the temporal writes answer.
+    pub(crate) fn pre_evolution(
+        cond: Option<&Self>,
+        id: &str,
+        doc: &Value,
+    ) -> Result<(), antares_model::NgsiError> {
+        if cond.is_none_or(|c| c.holds(&latest_image(doc))) {
+            Ok(())
+        } else {
+            Err(antares_model::NgsiError::ResourceNotFound(format!(
+                "temporal entity {id} not found"
+            )))
+        }
+    }
+
     /// A conditioned write that would reach a Context Source is refused:
     /// nothing in this store can judge the Source's copy.
     pub(crate) fn unforwarded(cond: Option<&Self>, forwards: bool) -> Result<(), Denied> {
@@ -1585,6 +1733,57 @@ impl Condition {
             Ok(())
         }
     }
+}
+
+/// A Temporal Evolution as the Entity it now is: each Attribute keeps its
+/// latest instance per `datasetId` (the greatest `observedAt`, else
+/// `createdAt`; the later one on a tie) and a temporal `scope` the value of
+/// its latest instance. A condition judged on every instance would let a
+/// value the Entity held once select it for good.
+// ponytail: instances without a time compare as the earliest; the temporal
+// writes stamp `createdAt` on every instance they store.
+pub(crate) fn latest_image(doc: &Value) -> Value {
+    let time = |i: &Value| {
+        ["observedAt", "createdAt"]
+            .iter()
+            .find_map(|k| i.get(*k).and_then(Value::as_str))
+            .map(antares_model::dt_key)
+            .unwrap_or_default()
+    };
+    let mut out = serde_json::Map::new();
+    for (k, v) in doc.as_object().into_iter().flatten() {
+        let instances = match v.as_array() {
+            Some(a) if !antares_model::is_meta(k) || k == "scope" => a,
+            _ => {
+                out.insert(k.clone(), v.clone());
+                continue;
+            }
+        };
+        if !instances.iter().all(Value::is_object) {
+            out.insert(k.clone(), v.clone());
+            continue;
+        }
+        let mut latest: Vec<&Value> = Vec::new();
+        for i in instances {
+            let ds = i.get("datasetId");
+            match latest.iter_mut().find(|l| l.get("datasetId") == ds) {
+                Some(l) if time(i) >= time(l) => *l = i,
+                Some(_) => {}
+                None => latest.push(i),
+            }
+        }
+        let kept = if k == "scope" {
+            latest
+                .first()
+                .and_then(|i| i.get("value"))
+                .cloned()
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Array(latest.into_iter().cloned().collect())
+        };
+        out.insert(k.clone(), kept);
+    }
+    Value::Object(out)
 }
 
 /// The members of a JSON object, or nothing when it is not one.
@@ -1736,6 +1935,41 @@ impl PolicyEngine for Slow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `admits` is `shown(..).is_some()` without the set (T-3667).
+    #[test]
+    fn admits_is_whether_shown_answers() {
+        let ctx = antares_jsonld::core_context();
+        let car = serde_json::json!({"id": "urn:ngsi-ld:Car:1", "type": "Car"});
+        let rule = |t: &str| Rule {
+            types: vec![t.to_owned()],
+            ..Rule::default()
+        };
+        let cases = [
+            Filter::default(),
+            Filter {
+                omit_by_type: BTreeMap::from([("Car".to_owned(), vec!["speed".to_owned()])]),
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("Car")],
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("User")],
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("User"), rule("Car")],
+                ..Filter::default()
+            },
+        ];
+        let admitted: Vec<bool> = cases.iter().map(|f| f.admits(&car, &ctx)).collect();
+        assert_eq!(admitted, [true, true, true, false, true]);
+        for f in &cases {
+            assert_eq!(f.admits(&car, &ctx), f.shown(&car, &ctx).is_some(), "{f:?}");
+        }
+    }
 
     /// T-3684: an engine that keeps the trait's defaults reads no rule
     /// documents (ADR-0020 amendment): it says so, so `/q/policy` answers
@@ -1973,6 +2207,30 @@ mod tests {
         assert!(!f.admits_write(&robot, &[], &ctx), "outside every rule");
     }
 
+    /// A rule over every Attribute admits a write naming any of them, and
+    /// discloses nothing it reads (T-3637).
+    #[test]
+    fn a_rule_over_every_attribute_admits_any_written_name() {
+        let ctx = ctx();
+        let whole = Rule {
+            every_attribute: true,
+            q: Some(Box::new(antares_ql::parse_q("speed>50").expect("q"))),
+            ..rule("Car", &[])
+        };
+        let f = Filter {
+            rules: vec![whole.clone()],
+            ..Filter::default()
+        };
+        let (speed, name) = (iri("speed"), iri("name"));
+        assert!(f.admits_write(&car(0.5), &[&speed, &name], &ctx));
+        let narrow = Filter {
+            rules: vec![rule("Car", &[])],
+            ..Filter::default()
+        };
+        assert!(!narrow.admits_write(&car(0.5), &[&speed], &ctx));
+        assert!(whole.discloses(&ctx).is_empty());
+    }
+
     /// The loader's disclosure report: zone A's rule reads `location` and
     /// shows it, so it discloses nothing; a rule on `speed>100` showing only
     /// `status` discloses `speed`.
@@ -2193,8 +2451,21 @@ mod tests {
             omit: vec!["speed".into()],
             ..Filter::default()
         });
+        let selected = Decision::Filter(Filter {
+            scope_q: Some("/mine".into()),
+            ..Filter::default()
+        });
         for clause in FILTERABLE {
-            assert_eq!(resolve(clause, narrowed.clone()), narrowed, "{clause}");
+            assert_eq!(resolve(clause, selected.clone()), selected, "{clause}");
+            if RECORD_LISTS.contains(&clause) {
+                // a record list selects and never projects (T-3673)
+                assert!(matches!(
+                    resolve(clause, narrowed.clone()),
+                    Decision::Deny(_)
+                ));
+            } else {
+                assert_eq!(resolve(clause, narrowed.clone()), narrowed, "{clause}");
+            }
         }
     }
 
@@ -2383,17 +2654,17 @@ mod tests {
     #[test]
     fn mapping_the_names_maps_both_sets() {
         let shown = Shown {
-            only: Some(std::collections::BTreeSet::from(["a".to_owned()])),
-            omitted: std::collections::BTreeSet::from(["b".to_owned()]),
+            only: Some(std::collections::BTreeSet::from([Cow::Borrowed("a")])),
+            omitted: std::collections::BTreeSet::from([Cow::Borrowed("b")]),
         };
         let mapped = shown.map_names(str::to_uppercase);
         assert_eq!(
             mapped.only,
-            Some(std::collections::BTreeSet::from(["A".to_owned()]))
+            Some(std::collections::BTreeSet::from([Cow::Borrowed("A")]))
         );
         assert_eq!(
             mapped.omitted,
-            std::collections::BTreeSet::from(["B".to_owned()])
+            std::collections::BTreeSet::from([Cow::Borrowed("B")])
         );
     }
 
@@ -2538,6 +2809,109 @@ mod tests {
         };
         let out = slide.narrow_window(&p(&[]), false).unwrap();
         assert!(antares_model::dt_key(&out["timeAt"]) >= antares_model::dt_key(&out["endTimeAt"]));
+
+        // the windows are on observedAt: a request on another timeproperty
+        // is answered nothing, even one whose own window overlaps
+        let out = between
+            .narrow_window(
+                &p(&[
+                    ("timerel", "after"),
+                    ("timeAt", "2026-01-01T01:30:00Z"),
+                    ("timeproperty", "modifiedAt"),
+                ]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(out["timeAt"], out["endTimeAt"], "{out:?}");
+        assert_eq!(out["timeAt"], "2026-01-01T01:00:00.000Z", "{out:?}");
+    }
+
+    /// A bound renders to the millisecond 4.11 takes: a start rounds up
+    /// (only ever by less than a millisecond), an end down, an exact
+    /// millisecond stays; a window is half-open on those renderings.
+    #[test]
+    fn a_bound_rounds_only_inward_and_a_window_is_half_open() {
+        let at = |ns: u32| {
+            TimeBound::At(chrono::DateTime::from_timestamp(1_767_225_600, ns).expect("an instant"))
+        };
+        let now = chrono::Utc::now();
+        for (ns, start, end) in [
+            (0, "00.000", "00.000"),
+            (500, "00.001", "00.000"),
+            (999_000, "00.001", "00.000"),
+            (1_000_500, "00.002", "00.001"),
+        ] {
+            assert_eq!(
+                at(ns).render(now, true),
+                format!("2026-01-01T00:00:{start}Z"),
+                "start at {ns} ns"
+            );
+            assert_eq!(
+                at(ns).render(now, false),
+                format!("2026-01-01T00:00:{end}Z"),
+                "end at {ns} ns"
+            );
+        }
+        let w = Window {
+            from: Some(at(0)),
+            to: Some(at(2_000_000)),
+        };
+        assert!(
+            !w.admits("2025-12-31T23:59:59.999Z", now),
+            "before the start"
+        );
+        assert!(
+            w.admits("2026-01-01T00:00:00.000Z", now),
+            "the start is inside"
+        );
+        assert!(w.admits("2026-01-01T00:00:00.001Z", now), "inside");
+        assert!(
+            !w.admits("2026-01-01T00:00:00.002Z", now),
+            "the end is outside"
+        );
+        assert!(!w.admits("2026-01-01T00:00:00.003Z", now), "after the end");
+    }
+
+    /// T-3668: an evolution is judged as the Entity it now is, per
+    /// Attribute and `datasetId`, whatever order its instances are stored in.
+    #[test]
+    fn the_latest_image_keeps_the_latest_instance_per_dataset() {
+        let i = |v: &str, at: &str, ds: Option<&str>| {
+            let mut i = serde_json::json!({"type": "Property", "value": v, "observedAt": at});
+            if let Some(ds) = ds {
+                i["datasetId"] = ds.into();
+            }
+            i
+        };
+        let doc = serde_json::json!({
+            "id": "urn:ngsi-ld:V:1",
+            "type": ["V"],
+            "zone": [
+                i("A", "2026-01-01T00:00:02Z", None),
+                i("B", "2026-01-01T00:00:01Z", None),
+                i("C", "2026-01-01T00:00:01Z", Some("urn:ds:1")),
+                i("D", "2026-01-01T00:00:03Z", Some("urn:ds:1")),
+                i("E", "2026-01-01T00:00:02Z", None),
+            ],
+            "scope": [
+                {"type": "Property", "value": ["/old"], "observedAt": "2026-01-01T00:00:01Z"},
+                {"type": "Property", "value": ["/new"], "observedAt": "2026-01-01T00:00:02Z"},
+            ],
+            "modifiedAt": "2026-01-01T00:00:03Z",
+        });
+        let img = latest_image(&doc);
+        let zone: Vec<&str> = img["zone"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i["value"].as_str())
+            .collect();
+        assert_eq!(zone, ["E", "D"], "a tie goes to the later one");
+        assert_eq!(img["scope"], serde_json::json!(["/new"]));
+        assert_eq!(img["type"], doc["type"]);
+        assert_eq!(img["modifiedAt"], doc["modifiedAt"]);
+        let plain = serde_json::json!({"id": "urn:ngsi-ld:V:1", "scope": "/a"});
+        assert_eq!(latest_image(&plain), plain);
     }
 
     /// G8: the engine's warning travels as one `NGSILD-Warning` value per
@@ -2561,9 +2935,7 @@ mod tests {
                 "{clause}: an empty condition selects everything"
             );
         }
-        for clause in [
-            "5.6.1", "5.6.7", "5.6.8", "5.6.12", "5.6.21", "5.7.1", "5.8.1",
-        ] {
+        for clause in ["5.6.1", "5.6.7", "5.6.16", "5.6.21", "5.7.1", "5.8.1"] {
             assert!(
                 matches!(resolve(clause, conditioned.clone()), Decision::Deny(_)),
                 "{clause}"
@@ -2630,6 +3002,25 @@ mod tests {
                 .holds(&doc("A")),
             "a linked path reads no other Entity inside the write, so it never holds"
         );
+        let scoped = Filter {
+            scope_q: Some("/a".to_owned()),
+            ..Filter::default()
+        };
+        assert!(
+            Condition::of(&scoped).is_some(),
+            "a scopeQ alone selects: it is a condition"
+        );
+        let vehicles = Condition::of(&Filter {
+            rules: vec![Rule {
+                types: vec!["Vehicle".into()],
+                ..Rule::default()
+            }],
+            ..Filter::default()
+        })
+        .expect("a type rule alone selects: it is a condition");
+        let car = serde_json::json!({"id": "urn:ngsi-ld:Car:c", "type": [format!("{dc}Car")]});
+        assert!(vehicles.holds(&doc("B")) && !vehicles.holds(&car));
+        assert!(Condition::of(&Filter::default()).is_none());
         assert!(Condition::unforwarded(Some(&c), false).is_ok());
         assert!(Condition::unforwarded(None, true).is_ok());
         assert_eq!(
