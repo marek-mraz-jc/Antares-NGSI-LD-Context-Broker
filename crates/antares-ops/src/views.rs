@@ -35,6 +35,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
 
+mod preview;
+pub use preview::MAX_PREVIEW_LIMIT;
 pub mod rule_documents;
 
 /// How often, in milliseconds, every pod rebuilds its table from the store
@@ -278,8 +280,9 @@ fn compile_rule(i: usize, r: &ViewRule, ctx: &Context) -> Result<Rule, String> {
         q: parse_q(&at("q"), r.q.as_deref())?.map(Box::new),
         scope_q: scope_q(&at("scopeQ"), r.scope_q.as_deref())?,
         geo_q: geo_q(&at("geoQ"), r.geo_q.as_ref())?.map(Box::new),
-        geo_also: Vec::new(),
         attributes,
+        // a view rule has one area and names no ids
+        ..Rule::default()
     })
 }
 
@@ -413,10 +416,13 @@ impl Reloader {
             };
             next.insert(id, (doc, entry));
         }
+        let table: BTreeMap<_, _> = next.iter().collect();
         self.state.views.replace(
-            next.iter()
-                .map(|(id, (_, e))| (id.clone(), e.clone()))
-                .collect::<BTreeMap<_, _>>(),
+            table
+                .iter()
+                .map(|(id, (_, e))| ((*id).clone(), e.clone()))
+                .collect(),
+            revision(table.iter().map(|(id, (doc, _))| (id.as_str(), doc))),
         );
         self.state.views.replace_schemas(schemas);
         *cache = next;
@@ -436,6 +442,19 @@ fn log_entry(id: &str, e: &ViewEntry) {
             tracing::warn!(view = id, reason = reason.as_str(), "view not served");
         }
     }
+}
+
+/// The digest of the view documents, in id order (threat V26): a pure
+/// function of what the store holds, so pods over one store agree without
+/// coordination.
+fn revision<'a>(docs: impl Iterator<Item = (&'a str, &'a Value)>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (id, doc) in docs {
+        id.hash(&mut h);
+        doc.to_string().hash(&mut h);
+    }
+    h.finish()
 }
 
 /// [`SCHEMA_MAX_ENV`]: `None` unset; a value that is no positive byte count
@@ -514,7 +533,8 @@ impl Reload {
     }
 }
 
-/// `/q/views`: the table (GET), and one view's document (GET, PUT, DELETE);
+/// `/q/views`: the table (GET), one view's document (GET, PUT, DELETE), and
+/// what a draft would serve (`POST /q/views/{id}/preview`);
 /// `/q/schemas/{tenant}`: one Tenant's `LinkML` schema (GET, PUT, DELETE);
 /// and `/q/policy` beside them.
 fn admin(r: &Weak<Reloader>) -> Router {
@@ -552,6 +572,7 @@ fn admin(r: &Weak<Reloader>) -> Router {
                 })
                 .delete(move |Path(id): Path<String>| serve(del.clone(), |r| delete_one(r, id))),
         )
+        .merge(preview::routes(r))
         .merge(rule_documents::routes(r))
 }
 
@@ -591,6 +612,17 @@ async fn delete_one(r: Arc<Reloader>, id: String) -> Result<Response, String> {
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// The document of view `id` and the view it loads, or the first reason it
+/// cannot be served.
+fn candidate(id: &str, body: &[u8]) -> Result<(Value, Loaded), String> {
+    let doc = serde_json::from_slice::<Value>(body).map_err(|e| format!("not a view: {e}"))?;
+    let view: View = serde_json::from_value(doc.clone()).map_err(|e| format!("not a view: {e}"))?;
+    if view.id != id {
+        return Err("the document's id names another view than the path".into());
+    }
+    view.load().map(|l| (doc, l))
+}
+
 /// Validate, store, and answer once this pod's table holds the write.
 async fn put_one(r: Arc<Reloader>, id: String, body: Bytes) -> Result<Response, String> {
     if body.len() > MAX_VIEW_BYTES {
@@ -600,18 +632,8 @@ async fn put_one(r: Arc<Reloader>, id: String, body: Bytes) -> Result<Response, 
             &format!("a view document is at most {MAX_VIEW_BYTES} bytes"),
         ));
     }
-    let checked = serde_json::from_slice::<Value>(&body)
-        .map_err(|e| format!("not a view: {e}"))
-        .and_then(|doc| {
-            let view: View =
-                serde_json::from_value(doc.clone()).map_err(|e| format!("not a view: {e}"))?;
-            if view.id != id {
-                return Err("the document's id names another view than the path".into());
-            }
-            view.load().map(|_| doc)
-        });
-    let doc = match checked {
-        Ok(doc) => doc,
+    let doc = match candidate(&id, &body) {
+        Ok((doc, _)) => doc,
         Err(why) => return Ok(problem(StatusCode::BAD_REQUEST, "BadRequestData", &why)),
     };
     let replaced = r.state.put_view_doc(&id, doc).await?;

@@ -110,6 +110,25 @@ pub struct ViewOps {
 #[derive(Debug, Clone)]
 pub struct Caller(HeaderMap);
 
+impl Caller {
+    /// The policy subject headers the caller sent, in the order
+    /// `ANTARES_POLICY_SUBJECT_HEADERS` names them, each with every value:
+    /// what a surface compares when it binds something to one subject
+    /// (a resumed WebSocket connection, ADR-0026 rule 7).
+    #[must_use]
+    pub fn subject(&self) -> Vec<(String, Vec<u8>)> {
+        antares_api::policy::SUBJECT_HEADERS
+            .iter()
+            .flat_map(|name| {
+                self.0
+                    .get_all(name.as_str())
+                    .iter()
+                    .map(move |v| (name.clone(), v.as_bytes().to_vec()))
+            })
+            .collect()
+    }
+}
+
 impl<S: Send + Sync> FromRequestParts<S> for Caller {
     type Rejection = std::convert::Infallible;
 

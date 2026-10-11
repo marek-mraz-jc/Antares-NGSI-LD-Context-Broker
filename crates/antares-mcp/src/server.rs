@@ -2,6 +2,7 @@
 //! The MCP server of one view, for one request: discovery, the tool list
 //! and calls, and the resources (MCP sections 3, 4, 6 and 8).
 
+use crate::confirm;
 use crate::schema::{self, Checked, Names};
 use crate::tools::{self, Built, ToolDef, TOOLS};
 use crate::{cursor, MAX_RESULT_BYTES_ENV};
@@ -9,10 +10,11 @@ use antares_ops::{Caller, OperationId, OpsRequest, ViewOps};
 use axum::http::{header, HeaderValue, StatusCode};
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-    DiscoverResult, ErrorCode, Implementation, ListResourceTemplatesResult, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ResourceTemplate,
-    ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
+    DiscoverResult, ElicitRequest, ElicitRequestParams, ElicitationSchema, ErrorCode,
+    Implementation, InputRequest, InputRequiredResult, ListResourceTemplatesResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResourceTemplate, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -77,6 +79,8 @@ struct Answer {
     status: StatusCode,
     /// `NGSILD-Results-Count`, when the broker sent one.
     count: Option<u64>,
+    /// The id a `Location` header names, when the broker sent one.
+    created: Option<String>,
     body: Value,
 }
 
@@ -140,6 +144,12 @@ impl Server {
             .get("ngsild-results-count")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok());
+        let created = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit('/').next())
+            .and_then(percent_decoded);
         let body = match axum::body::to_bytes(response.into_body(), MAX_INNER_BYTES).await {
             // an empty body (a 204) is no JSON: `null`
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
@@ -147,6 +157,7 @@ impl Server {
                 return Answer {
                     status: StatusCode::PAYLOAD_TOO_LARGE,
                     count: None,
+                    created: None,
                     body: Value::Null,
                 }
             }
@@ -154,8 +165,54 @@ impl Server {
         Answer {
             status,
             count,
+            created,
             body,
         }
+    }
+
+    /// A write tool's call (MCP 3.4): checked, then the person is asked
+    /// when the client `asks`, then the confirmed retry runs once.
+    async fn write(
+        &self,
+        tool: &'static ToolDef,
+        request: CallToolRequestParams,
+        asks: bool,
+    ) -> CallToolResponse {
+        let given = request.arguments.unwrap_or_default();
+        if let Err(why) = schema::check_all(tool.args, &given, &self.names()) {
+            return refused(&why).into();
+        }
+        if !asks {
+            return refused("this tool needs a client that can ask the person").into();
+        }
+        let bound = confirm::bound_to(&self.id, &self.caller.subject(), tool.name, &given);
+        let Some(state) = request.request_state else {
+            let Some(state) = confirm::seal(&bound) else {
+                return refused("this endpoint cannot ask the person now; nothing was written")
+                    .into();
+            };
+            let ask = ElicitRequest::new(ElicitRequestParams::FormElicitationParams {
+                meta: None,
+                message: confirm::question(tool.name, tool.op.id(), &given),
+                requested_schema: ElicitationSchema::builder()
+                    .required_bool(confirm::ANSWER)
+                    .build_unchecked(),
+            });
+            let asked = [(confirm::ANSWER.to_owned(), InputRequest::Elicitation(ask))];
+            return InputRequiredResult::new(Some(asked.into_iter().collect()), Some(state)).into();
+        };
+        let confirmed = if !confirm::redeem(&state, &bound) {
+            Err("the requestState does not answer this call; call the tool again without it")
+        } else if !confirm::accepted(request.input_responses.as_ref()) {
+            Err("the person did not confirm; nothing was written")
+        } else {
+            Ok(())
+        };
+        if let Err(why) = confirmed {
+            tracing::info!(view = %self.id, tool = tool.name, "mcp write not confirmed");
+            return refused(why).into();
+        }
+        self.call(tool, &given).await.into()
     }
 
     async fn call(
@@ -194,6 +251,11 @@ impl Server {
         );
         if !answer.status.is_success() {
             return failed(&answer);
+        }
+        if tool.write && answer.body.is_null() {
+            // a write answered without a body: the id it made, if any
+            let out = answer.created.map(|id| json!({ tool.key: id }));
+            return CallToolResult::structured(out.unwrap_or_else(|| json!({})));
         }
         let rows = match answer.body {
             Value::Array(rows) if tool.paged => rows,
@@ -354,7 +416,7 @@ impl ServerHandler for Server {
                     t.description,
                     Arc::new(schema::input_schema(t.args, &names)),
                 )
-                .annotate(ToolAnnotations::new().read_only(true).open_world(false))
+                .annotate(ToolAnnotations::new().read_only(!t.write).open_world(false))
             })
             .collect();
         Ok(ListToolsResult::with_all_items(tools)
@@ -365,13 +427,21 @@ impl ServerHandler for Server {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let Some(tool) = tools::named(&request.name) else {
             return Err(unknown_tool());
         };
         if !self.offers(tool.op).await {
             return Err(unknown_tool());
+        }
+        if tool.write {
+            // a form, which an empty `elicitation` declares too (2025-11-25)
+            let asks = context
+                .client_capabilities()
+                .and_then(|c| c.elicitation)
+                .is_some_and(|e| e.form.is_some() || e.url.is_none());
+            return Ok(self.write(tool, request, asks).await);
         }
         let given = request.arguments.unwrap_or_default();
         Ok(self.call(tool, &given).await.into())
@@ -506,6 +576,7 @@ mod tests {
         let a = Answer {
             status: StatusCode::BAD_REQUEST,
             count: None,
+            created: None,
             body: json!({"title": "BadRequestData", "detail": "secret speed<80"}),
         };
         let r = failed(&a);

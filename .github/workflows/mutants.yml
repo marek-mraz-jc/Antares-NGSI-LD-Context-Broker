@@ -44,10 +44,12 @@ jobs:
             args: -p antares-matcher
           - name: policy
             shards: 6
-            # lib tests plus the policy_* integration files: a mutant only
-            # an integration test kills is not a survivor. `Slow` is the
-            # test-kit wrapper the engine contract sleeps in, not seam code.
-            args: -p antares-api -f crates/antares-api/src/policy.rs --exclude-re 'for Slow' -- --lib --test 'policy_*'
+            # lib tests plus the integration tests: a mutant only an
+            # integration test kills is not a survivor. Since T-3540 most
+            # policy_* files are modules of the one `it` binary, and only
+            # three stay binaries of their own, so both are named. `Slow` is
+            # the test-kit wrapper the engine contract sleeps in, not seam code.
+            args: -p antares-api -f crates/antares-api/src/policy.rs --exclude-re 'for Slow' -- --lib --test it --test 'policy_*'
         shard: [0, 1, 2, 3, 4, 5]
     env:
       CARGO_TERM_COLOR: never
