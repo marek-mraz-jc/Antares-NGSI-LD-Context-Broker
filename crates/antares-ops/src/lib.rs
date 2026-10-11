@@ -293,6 +293,25 @@ impl ViewOps {
         self.view.shown_names()
     }
 
+    /// Each Entity type the view shows with the Attributes it shows of it,
+    /// as expanded IRIs: the union of the view's rules, type by type. A
+    /// surface that builds a model from a schema intersects it with this.
+    #[must_use]
+    pub fn shown_by_type(
+        &self,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for rule in &self.view.narrowing().rules {
+            for ty in &rule.types {
+                out.entry(ty.clone())
+                    .or_default()
+                    .extend(rule.attributes.iter().cloned());
+            }
+        }
+        out
+    }
+
     /// For each of `ops`, whether the view allows it and the policy engine
     /// could allow a request of it for `caller`, asked in one probe in the
     /// view's Tenant (MCP D-3). The probe fails closed: an engine that fails

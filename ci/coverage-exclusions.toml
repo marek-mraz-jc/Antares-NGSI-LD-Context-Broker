@@ -67,3 +67,11 @@ function = "Server::call" # v0 mangling puts the impl between the crate and the 
 lines = 5
 branches = 0
 reason = "tracing::info! repeats the fields in its `log` fallback, which runs only with no subscriber set; tests/mcp_log.rs covers the subscriber path and asserts what it logs"
+
+[[exclusion]]
+crate = "antares-odata"
+file = "src/lib.rs"
+function = "antares_odata::unreadable"
+lines = 2
+branches = 0
+reason = "tracing::warn! repeats the fields in its `log` fallback, which runs only with no subscriber set; tests/metadata.rs::an_unreadable_schema_is_logged_once_with_its_reason covers the subscriber path and asserts what it logs"
