@@ -330,7 +330,13 @@ async fn ws_the_notification_cap_holds_to_the_byte() -> Result<(), String> {
     let b = broker_alone(Limits::default()).await?;
     let mut c = connect(b.addr, ROOT, &[]).await?;
     let (sub, _) = two(&mut c).await?;
-    let padded = |n: usize| json!({"metadata": {}, "body": {"pad": "x".repeat(n)}});
+    let padded = |n: usize| {
+        let mut r = rendered(&sub, 1);
+        if let Some(body) = r.get_mut("body").and_then(Value::as_object_mut) {
+            body.insert("pad".into(), json!("x".repeat(n)));
+        }
+        r
+    };
     let base = antares_ws::envelope::notification(&padded(0), u64::MAX, &sub).len();
     let fits = antares_ws::MAX_NOTIFICATION_BYTES
         .checked_sub(base)
@@ -355,12 +361,7 @@ async fn ws_the_notification_cap_holds_to_the_byte() -> Result<(), String> {
     );
     let n = c.notification().await?;
     // the refused one took no seq
-    assert_eq!(
-        n.pointer("/metadata/x-seq"),
-        Some(&json!(1)),
-        "{}",
-        n["metadata"]
-    );
+    assert_eq!(n.pointer("/metadata/x-seq"), Some(&json!(1)), "{n}");
     assert_eq!(
         n.pointer("/body/pad").and_then(Value::as_str).map(str::len),
         Some(fits)
