@@ -378,6 +378,9 @@ pub enum ViewEntry {
 #[derive(Debug, Default)]
 pub struct ViewTable {
     entries: std::sync::RwLock<Arc<BTreeMap<String, ViewEntry>>>,
+    /// The digest of the view documents the entries were loaded from
+    /// (threat V26): pods over one store report the same value.
+    revision: std::sync::atomic::AtomicU64,
     admin: std::sync::OnceLock<axum::Router>,
     policy: std::sync::RwLock<serde_json::Value>,
     schemas: std::sync::RwLock<Arc<BTreeMap<String, Schema>>>,
@@ -422,12 +425,24 @@ impl ViewTable {
             .clone()
     }
 
-    /// Replace the whole table.
-    pub fn replace(&self, entries: BTreeMap<String, ViewEntry>) {
+    /// Replace the whole table, loaded from the documents whose digest is
+    /// `revision`.
+    pub fn replace(&self, entries: BTreeMap<String, ViewEntry>, revision: u64) {
         *self
             .entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(entries);
+        self.revision
+            .store(revision, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The revision `/q/health` reports as `viewsRevision`: sixteen hex
+    /// digits, the same on every pod that loaded the same documents.
+    pub fn revision(&self) -> String {
+        format!(
+            "{:016x}",
+            self.revision.load(std::sync::atomic::Ordering::Acquire)
+        )
     }
 
     /// Replace every Tenant's schema.
