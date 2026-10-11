@@ -1,0 +1,84 @@
+{
+ "about": "As cars-in-polygon-a with intersects: the edge point V6 is in.",
+ "view": {
+  "selector": [
+   "Vehicle"
+  ],
+  "rules": [
+   {
+    "types": [
+     "Vehicle"
+    ],
+    "attributes": [
+     "location",
+     "owner",
+     "speed",
+     "vehicleType"
+    ]
+   }
+  ],
+  "q": "vehicleType==\"car\"",
+  "geoQ": {
+   "georel": "intersects",
+   "geometry": "Polygon",
+   "coordinates": [
+    [
+     [
+      0,
+      0
+     ],
+     [
+      10,
+      0
+     ],
+     [
+      10,
+      10
+     ],
+     [
+      0,
+      10
+     ],
+     [
+      0,
+      0
+     ]
+    ]
+   ]
+  }
+ },
+ "expect": {
+  "urn:ngsi-ld:Vehicle:V1": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V2": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V6": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V7": [
+   "location",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V8": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ]
+ },
+ "caller": {
+  "x-jc-roles": "public"
+ }
+}

@@ -1,0 +1,51 @@
+{
+ "about": "scopeQ /Zilina/transport: exact, V2's /Zilina/transport/buses is out; V8 holds it among two scopes.",
+ "view": {
+  "selector": [
+   "Vehicle"
+  ],
+  "rules": [
+   {
+    "types": [
+     "Vehicle"
+    ],
+    "attributes": [
+     "location",
+     "owner",
+     "speed",
+     "vehicleType"
+    ]
+   }
+  ],
+  "scopeQ": "/Zilina/transport"
+ },
+ "expect": {
+  "urn:ngsi-ld:Vehicle:V1": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V4": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V6": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V8": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ]
+ },
+ "caller": {
+  "x-jc-roles": "public"
+ }
+}

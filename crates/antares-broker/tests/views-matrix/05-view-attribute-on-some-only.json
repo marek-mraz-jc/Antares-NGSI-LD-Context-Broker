@@ -1,0 +1,45 @@
+{
+ "about": "A rule showing owner, which V7 lacks: V7 is in the view with its frame alone.",
+ "view": {
+  "selector": [
+   "Vehicle"
+  ],
+  "rules": [
+   {
+    "types": [
+     "Vehicle"
+    ],
+    "attributes": [
+     "owner"
+    ]
+   }
+  ]
+ },
+ "expect": {
+  "urn:ngsi-ld:Vehicle:V1": [
+   "owner"
+  ],
+  "urn:ngsi-ld:Vehicle:V2": [
+   "owner"
+  ],
+  "urn:ngsi-ld:Vehicle:V3": [
+   "owner"
+  ],
+  "urn:ngsi-ld:Vehicle:V4": [
+   "owner"
+  ],
+  "urn:ngsi-ld:Vehicle:V5": [
+   "owner"
+  ],
+  "urn:ngsi-ld:Vehicle:V6": [
+   "owner"
+  ],
+  "urn:ngsi-ld:Vehicle:V7": [],
+  "urn:ngsi-ld:Vehicle:V8": [
+   "owner"
+  ]
+ },
+ "caller": {
+  "x-jc-roles": "public"
+ }
+}

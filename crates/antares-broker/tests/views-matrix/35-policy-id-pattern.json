@@ -1,0 +1,72 @@
+{
+ "about": "An idPattern selector.",
+ "view": {
+  "selector": [
+   "*"
+  ],
+  "rules": [
+   {
+    "types": [
+     "*"
+    ],
+    "attributes": [
+     "*"
+    ]
+   }
+  ]
+ },
+ "caller": {
+  "x-jc-subject": "alice"
+ },
+ "policies": [
+  {
+   "id": "v13",
+   "assignee": {
+    "kind": "user",
+    "id": "alice"
+   },
+   "operations": [
+    "5.7.1",
+    "5.7.2",
+    "5.7.3",
+    "5.7.4",
+    "5.7.5",
+    "5.7.6",
+    "5.7.7",
+    "5.7.8",
+    "5.7.9",
+    "5.7.10"
+   ],
+   "information": [
+    {
+     "entities": [
+      {
+       "type": "Vehicle",
+       "idPattern": "^urn:ngsi-ld:Vehicle:V[1-3]$"
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "expect": {
+  "urn:ngsi-ld:Vehicle:V1": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V2": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V3": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ]
+ }
+}

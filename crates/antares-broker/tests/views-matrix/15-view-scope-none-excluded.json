@@ -1,0 +1,72 @@
+{
+ "about": "scopeQ /# over Vehicle and Sensor: Entities without a scope (V7, S1) are out.",
+ "view": {
+  "selector": [
+   "Vehicle",
+   "Sensor"
+  ],
+  "rules": [
+   {
+    "types": [
+     "Vehicle",
+     "Sensor"
+    ],
+    "attributes": [
+     "location",
+     "owner",
+     "speed",
+     "temperature",
+     "vehicleType"
+    ]
+   }
+  ],
+  "scopeQ": "/#"
+ },
+ "expect": {
+  "urn:ngsi-ld:Vehicle:V1": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V2": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V3": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V4": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V5": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V6": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ],
+  "urn:ngsi-ld:Vehicle:V8": [
+   "location",
+   "owner",
+   "speed",
+   "vehicleType"
+  ]
+ },
+ "caller": {
+  "x-jc-roles": "public"
+ }
+}
