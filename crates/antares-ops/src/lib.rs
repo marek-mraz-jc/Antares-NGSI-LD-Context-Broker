@@ -38,10 +38,15 @@
 mod error;
 pub mod mapping;
 mod operation;
+mod scan;
 pub mod views;
 
+/// The residual of a standard query (ADR-0028 rule 2), re-exported so a surface compiles into
+/// it through `antares-ops` alone (rule M2).
+pub use antares_residual as residual;
 pub use error::{Refusal, INNER_DETAIL};
 pub use operation::OperationId;
+pub use scan::{Page, Pushdown, Scanned, RESIDUAL_SCAN, TOO_COMPLEX};
 
 use antares_api::AppState;
 use axum::body::Body;
@@ -912,6 +917,24 @@ pub mod test_kit {
                 .with_surfaces(vec![Box::new(antares_api::Admin), mount(surface)])?;
             Ok(antares_api::router(state))
         }
+    }
+
+    /// [`ViewOps::scan`](super::ViewOps::scan) with `residual` under a `budget` of upstream
+    /// Entities read in upstream pages of `upstream`, and how many it read: the bound a test
+    /// crosses with a handful of Entities instead of [`RESIDUAL_SCAN`](super::RESIDUAL_SCAN).
+    ///
+    /// # Errors
+    /// [`ViewOps::scan`](super::ViewOps::scan)'s.
+    pub async fn scan_within(
+        view: &super::ViewOps,
+        caller: &super::Caller,
+        pushdown: &super::Pushdown,
+        residual: &super::residual::Program,
+        page: super::Page,
+        (budget, upstream): (usize, usize),
+    ) -> Result<(super::Scanned, usize), super::Refusal> {
+        view.fill(caller, pushdown, residual, page, (budget, upstream))
+            .await
     }
 
     /// A policy [`Filter`](super::policy::Filter) conditioned on `q` (4.9),

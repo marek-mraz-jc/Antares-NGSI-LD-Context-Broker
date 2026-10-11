@@ -48,6 +48,7 @@ antares-model = { path = "crates/antares-model" }
 antares-store = { path = "crates/antares-store" }
 antares-jsonld = { path = "crates/antares-jsonld" }
 antares-ql = { path = "crates/antares-ql" }
+antares-residual = { path = "crates/antares-residual" }
 antares-sql = { path = "crates/antares-sql", default-features = false }
 antares-bus = { path = "crates/antares-bus" }
 antares-api = { path = "crates/antares-api", default-features = false }

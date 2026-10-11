@@ -625,3 +625,64 @@ fn nested_lambdas_over_long_lists_hit_the_step_budget() {
     assert_eq!(eval(&program(&nested), &long), Err(Error::TooComplex));
     assert_eq!(program(&one).eval(&long), Ok(F));
 }
+
+#[test]
+fn a_program_names_the_attributes_and_system_members_it_reads() -> Result<(), Error> {
+    use antares_residual::Spatial;
+    let at = |attrs: &[&str], member| Path::Attribute {
+        attrs: attrs.iter().map(|a| (*a).to_owned()).collect(),
+        member,
+        keys: Vec::new(),
+    };
+    let e = Expr::And(vec![
+        Expr::IsNull(Box::new(Expr::Path(Path::value("speed")))),
+        Expr::Any(Box::new(Expr::Path(Path::value("speed"))), None),
+        Expr::IsNull(Box::new(Expr::Path(Path::Id))),
+        Expr::Any(
+            Box::new(Expr::Path(Path::value("tags"))),
+            Some(Box::new(Expr::Cmp(
+                Cmp::Eq,
+                Box::new(Expr::Var {
+                    up: 0,
+                    keys: Vec::new(),
+                }),
+                Box::new(Expr::Path(at(&["speed", "accuracy"], Member::Value))),
+            ))),
+        ),
+        Expr::Spatial(
+            Spatial::Within,
+            Box::new(Expr::Path(Path::value("location"))),
+            Box::new(Expr::Lit(Lit::Geometry(
+                serde_json::json!({"type": "Point", "coordinates": [1, 1]}),
+            ))),
+        ),
+        Expr::All(
+            Box::new(Expr::Path(Path::value("links"))),
+            Box::new(Expr::IsNull(Box::new(Expr::Path(Path::value("tags"))))),
+        ),
+    ]);
+    let program = compile(&e, DateTime::MIN)?;
+    assert_eq!(program.attributes(), ["speed", "tags", "location", "links"]);
+    assert!(!program.reads_system_members());
+    for system in [
+        Expr::Path(Path::ModifiedAt),
+        Expr::Path(Path::CreatedAt),
+        Expr::Path(at(&["speed"], Member::CreatedAt)),
+        Expr::Not(Box::new(Expr::Path(at(
+            &["speed", "x"],
+            Member::ModifiedAt,
+        )))),
+    ] {
+        assert!(
+            compile(&system, DateTime::MIN)?.reads_system_members(),
+            "{system:?}"
+        );
+    }
+    let observed = compile(
+        &Expr::Path(at(&["speed"], Member::ObservedAt)),
+        DateTime::MIN,
+    )?;
+    assert!(!observed.reads_system_members());
+    assert_eq!(observed.attributes(), ["speed"]);
+    Ok(())
+}
