@@ -5,7 +5,7 @@
 //! name a request carries (M1 to M3). A type or an Attribute the view does
 //! not show leaves no trace in it (S4).
 
-use linkml_model::{Builtin, Range};
+use linkml_model::{Builtin, Range, EDM_TYPE_TAG};
 use odata_csdl::{
     Annotation, CsdlVersion, EntityContainer, EntitySet, EntityType, Expr, Include, Model,
     NavigationProperty, NavigationPropertyBinding, Property, Reference, Scale, Schema, Term,
@@ -137,6 +137,21 @@ pub struct Set {
     pub type_iri: String,
     /// The members by their CSDL name.
     pub members: BTreeMap<String, Member>,
+    /// The class's `identifier` slot, when the view shows it (E2a); the key
+    /// is `id` without one (E2).
+    pub identifier: Option<Identifier>,
+}
+
+/// A key taken from the model (E2a): its value `v` names the Entity
+/// `{prefix}{v}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identifier {
+    /// The key member's CSDL name.
+    pub member: String,
+    /// Its Edm type: `Edm.String`, `Edm.Int64` or `Edm.Guid`.
+    pub edm: &'static str,
+    /// `urn:ngsi-ld:{Class}:`.
+    pub prefix: String,
 }
 
 /// The view's model: the CSDL document and, for each EntitySet, how its
@@ -179,6 +194,7 @@ pub fn build(
     for (class, (name, attrs)) in &visible {
         let mut ty = EntityType::new(name.clone());
         ty.base_type = Some(BASE.into());
+        let mut identifier = None;
         ty.annotations.push(iri(&schema.class_iri(class)));
         let mut set = EntitySet::new(name.clone(), format!("{namespace}.{name}"));
         let mut members = BTreeMap::new();
@@ -196,6 +212,9 @@ pub fn build(
                 // CSDL XML 3.4: a 4.0 client gets no Untyped property and an open type.
                 ty.open = true;
                 continue;
+            }
+            if let (Some(true), Shape::Value { edm, .. }) = (slot.identifier, &shape) {
+                identifier = Some(keyed(&mut ty, class, &member, edm));
             }
             match &shape {
                 Shape::Nav { target, collection } => {
@@ -220,9 +239,11 @@ pub fn build(
                         target: target.clone(),
                     });
                 }
-                other => ty
-                    .properties
-                    .push(property(&member, &slot_iri, other, schema, &slot)),
+                other => {
+                    let p = property(&member, &slot_iri, other, schema, &slot);
+                    let key = ty.key.contains(&member);
+                    ty.properties.push(if key { p.required() } else { p });
+                }
             }
             members.insert(
                 member,
@@ -241,6 +262,7 @@ pub fn build(
             Set {
                 type_iri: schema.class_iri(class),
                 members,
+                identifier,
             },
         );
     }
@@ -257,6 +279,18 @@ pub fn build(
         namespace,
         sets,
     })
+}
+
+/// E2a: `ty` declares the base members itself and is keyed by `member`.
+fn keyed(ty: &mut EntityType, class: &str, member: &str, edm: &'static str) -> Identifier {
+    ty.base_type = None;
+    ty.key = vec![member.to_owned()];
+    ty.properties.splice(0..0, base_properties());
+    Identifier {
+        member: member.to_owned(),
+        edm,
+        prefix: format!("urn:ngsi-ld:{class}:"),
+    }
 }
 
 /// Section 3.4 and rows P1 to P7, R1 to R5.
@@ -291,7 +325,11 @@ fn shape(
             collection: many || kind == "ListProperty",
         },
         (kind, Range::Type(b)) => Shape::Value {
-            edm: edm_type(b),
+            edm: match slot.annotations.get(EDM_TYPE_TAG) {
+                // The model admits `Edm.Guid` on a string slot only.
+                Some(_) => "Edm.Guid",
+                None => edm_type(b),
+            },
             collection: many || kind == "ListProperty",
         },
     }
@@ -535,12 +573,19 @@ fn vocabulary() -> Schema {
     let mut base = EntityType::new("Entity");
     base.is_abstract = true;
     base.key = vec!["id".into()];
+    base.properties = base_properties();
+    v.entity_types = vec![base];
+    v
+}
+
+/// The members of `NgsiLd.Entity` (E2, E3, E5, E6).
+fn base_properties() -> Vec<Property> {
     let computed = |p: Property| {
         let mut p = p.required();
         p.annotations.push(core("Computed"));
         p
     };
-    base.properties = vec![
+    vec![
         Property::new("id", TypeRef::single("Edm.String")).required(),
         computed(Property::new("_types", TypeRef::collection("Edm.String"))),
         Property::new("scope", TypeRef::collection("Edm.String")).required(),
@@ -552,9 +597,7 @@ fn vocabulary() -> Schema {
             "modifiedAt",
             TypeRef::single("Edm.DateTimeOffset"),
         )),
-    ];
-    v.entity_types = vec![base];
-    v
+    ]
 }
 
 /// The members every EntityType inherits from the base, as the surface

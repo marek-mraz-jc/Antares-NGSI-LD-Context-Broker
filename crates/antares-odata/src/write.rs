@@ -13,8 +13,8 @@ use crate::below;
 use crate::edm::{Member, Set, Shape};
 use crate::filter::Translated;
 use crate::read::{
-    encode, entity, not_found, not_implemented, refused, resource, run, run_request, set_of,
-    written, Reads,
+    body_id, canonical_key, encode, entity, key_id, not_found, not_implemented, refused, resource,
+    run, run_request, set_of, written, Reads,
 };
 use antares_ops::{Caller, OperationId, OpsRequest};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, IF_MATCH, IF_NONE_MATCH, LOCATION};
@@ -24,7 +24,7 @@ use odata_axum::{json_level, ODataErrorResponse, ODataRequest};
 use odata_json::{
     read_entity_body, Bind, BodyError, BodyLimits, Ctx, ODataError, ODataVersion, Target, WriteKind,
 };
-use odata_url::{Key, KeyValue, Literal, ODataUri, QueryOptions, Segment};
+use odata_url::{Key, ODataUri, QueryOptions, Segment};
 use serde_json::{json, Map, Value};
 
 /// The NGSI-LD Null (8.4.2, 8.4.3): an update or a merge that names it
@@ -170,14 +170,19 @@ async fn create(
         &BodyLimits::strict(),
     )
     .map_err(|e| body_error(&e, version))?;
-    // The reader requires the key and types it `Edm.String`.
-    let id = payload
+    // The reader requires the key and checks it against its Edm type.
+    let (id, own) = payload
         .key
         .first()
-        .and_then(|(_, id)| id.as_str())
-        .unwrap_or_default()
-        .to_owned();
+        .and_then(|(_, value)| Some((body_id(set, value)?, value)))
+        .ok_or_else(|| body_error(&invalid_key(), version))?;
     let mut doc = attributes(set, &payload.properties, WriteKind::Create);
+    // E2a: the identifier is an Attribute of its own too.
+    let identifier = set
+        .identifier
+        .as_ref()
+        .and_then(|i| set.members.get(&i.member));
+    doc.extend(identifier.and_then(|m| Some((m.iri.clone(), attribute(m, own)?))));
     bind(reads, caller, set, &payload.binds, &mut doc, version).await?;
     doc.insert("id".into(), Value::from(id.as_str()));
     doc.insert("type".into(), Value::from(set.type_iri.as_str()));
@@ -191,7 +196,7 @@ async fn create(
         version,
     )
     .await?;
-    let key = Key::Single(KeyValue::Literal(Literal::String(id)));
+    let key = canonical_key(set, &id);
     let location = format!(
         "{}{set_name}{}",
         ctx.service_root,
@@ -235,14 +240,14 @@ async fn change(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
-    let id = id_of(key, version)?;
+    let id = id_of(set, key, version)?;
     let resource = resource(reads, set_name, version)?;
     let payload = read_entity_body(ctx, &resource, kind, body, &BodyLimits::strict())
         .map_err(|e| body_error(&e, version))?;
     if payload
         .key
         .iter()
-        .any(|(_, value)| value.as_str() != Some(id.as_str()))
+        .any(|(_, value)| body_id(set, value).as_deref() != Some(id.as_str()))
     {
         return Err(body_error(&invalid_key(), version));
     }
@@ -277,7 +282,7 @@ async fn delete(
     version: ODataVersion,
 ) -> Result<Response, ODataErrorResponse> {
     let set = set_of(reads, set_name, version)?;
-    let id = id_of(key, version)?;
+    let id = id_of(set, key, version)?;
     send(
         reads,
         caller,
@@ -366,7 +371,7 @@ pub(crate) async fn visible(
     version: ODataVersion,
 ) -> Result<String, ODataErrorResponse> {
     let set = set_of(reads, &target.set, version)?;
-    let urn = id_of(&target.key, version)?;
+    let urn = id_of(set, &target.key, version)?;
     run(
         reads,
         caller,
@@ -406,9 +411,13 @@ pub(crate) fn typed(target: &str, set: &Set) -> String {
     format!("{target}?type={}", encode(&set.type_iri))
 }
 
-/// The id a key names; another key form names no Entity.
-pub(crate) fn id_of(key: &Key, version: ODataVersion) -> Result<String, ODataErrorResponse> {
-    crate::read::key_id(key, &QueryOptions::default()).ok_or_else(|| not_found(version))
+/// The id a key names in `set`; another key form names no Entity.
+pub(crate) fn id_of(
+    set: &Set,
+    key: &Key,
+    version: ODataVersion,
+) -> Result<String, ODataErrorResponse> {
+    key_id(set, key, &QueryOptions::default()).ok_or_else(|| not_found(version))
 }
 
 fn invalid_key() -> BodyError {
@@ -448,6 +457,7 @@ mod tests {
         };
         let set = Set {
             type_iri: "https://e.org/T".into(),
+            identifier: None,
             members: BTreeMap::from([
                 (
                     "url".into(),

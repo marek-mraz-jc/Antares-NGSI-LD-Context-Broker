@@ -115,6 +115,9 @@ pub struct Slot {
     /// Whether it holds several values.
     #[serde(default)]
     pub multivalued: Option<bool>,
+    /// Whether its value identifies the instance among its class's (T-3720).
+    #[serde(default)]
+    pub identifier: Option<bool>,
     /// Whether a class-ranged value is nested instead of referenced.
     #[serde(default)]
     pub inlined: Option<bool>,
@@ -124,7 +127,7 @@ pub struct Slot {
     /// The unit of a quantity.
     #[serde(default)]
     pub unit: Option<Unit>,
-    /// Tagged values, keyed by tag; `ngsi_ld_kind` is read (DM-05).
+    /// Tagged values, keyed by tag; `ngsi_ld_kind` (DM-05) and `edm_type` (T-3720) are read.
     #[serde(default)]
     pub annotations: BTreeMap<String, Annotation>,
     /// Free text.

@@ -577,6 +577,7 @@ mod tests {
         let value = |edm, collection| Shape::Value { edm, collection };
         Set {
             type_iri: "https://e.org/Car".into(),
+            identifier: None,
             members: BTreeMap::from([
                 (
                     "speed".into(),

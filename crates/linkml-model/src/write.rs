@@ -91,6 +91,7 @@ fn slot_node(slot: &Slot) -> Node {
     opt(&mut m, "range", slot.range.as_ref());
     flag(&mut m, "required", slot.required);
     flag(&mut m, "multivalued", slot.multivalued);
+    flag(&mut m, "identifier", slot.identifier);
     flag(&mut m, "inlined", slot.inlined);
     opt(&mut m, "inverse", slot.inverse.as_ref());
     if let Some(u) = &slot.unit {
