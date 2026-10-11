@@ -412,7 +412,7 @@ Each is refused before any gate or store access with `501 Not Implemented` (Prot
 | `odata_media_entities` | media entities | URL 4.14, Protocol 11.4.7 | `POST\|PUT\|DELETE media entity, GET .../$value` | 501 | `NotImplemented` |
 | `odata_stream_properties` | stream properties | Protocol 11.4.8 | `PUT\|DELETE {entity}/{streamProperty}` | 501 | `NotImplemented` |
 | `odata_batch_atomicity` | atomicity groups / change sets in $batch | Protocol 11.7.2, 11.7.7.4 | `POST /$batch with atomicityGroup` | 501 | `NotImplemented` |
-| `odata_upsert` | upsert by PATCH/PUT on a missing key | Protocol 11.4.4 | `PATCH\|PUT /{EntitySet}('{new-id}')` | 501 | `NotImplemented` |
+| `odata_upsert` | upsert by PATCH/PUT on a missing key | Protocol 11.4.4 | `PATCH\|PUT /{EntitySet}('{new-id}')` | 404 | `NotFound` (the Merge or Replace Entity it is answers, gated) |
 | `odata_derived_types` | derived type cast segments | URL 4.11 | `GET /{EntitySet}/{namespace}.{DerivedType}` | 501 | `NotImplemented` |
 
 ### 7.2 Routes and tools that are not an operation

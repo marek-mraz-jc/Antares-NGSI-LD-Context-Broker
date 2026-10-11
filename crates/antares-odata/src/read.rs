@@ -43,10 +43,11 @@ pub(crate) async fn serve(
     caller: &Caller,
     request: &ODataRequest,
     headers: &HeaderMap,
+    body: &[u8],
 ) -> Response {
     let version = request.version;
     if method != Method::GET {
-        return written(method, &request.uri, version);
+        return crate::write::serve(reads, method, caller, request, headers, body).await;
     }
     let level = match json_level(request, headers, reads.state.max_header_len) {
         Ok(level) => level,
@@ -445,7 +446,7 @@ async fn count(
         .into_response())
 }
 
-async fn entity(
+pub(crate) async fn entity(
     reads: &Reads,
     caller: &Caller,
     ctx: &Ctx<'_>,
@@ -620,6 +621,18 @@ pub(crate) async fn run(
     if !filter.context.is_empty() {
         req = req.context(Value::Object(filter.context.clone()));
     }
+    run_request(reads, caller, op, req, version).await
+}
+
+/// Runs one operation of any method; the Entities of its answer, if it
+/// has a body, and the result count.
+pub(crate) async fn run_request(
+    reads: &Reads,
+    caller: &Caller,
+    op: OperationId,
+    req: OpsRequest,
+    version: ODataVersion,
+) -> Result<(Vec<Value>, u64), ODataErrorResponse> {
     let answer = reads
         .view
         .run(op, caller, req)
@@ -917,9 +930,10 @@ pub(crate) fn encode(raw: &str) -> String {
 
 /// A refused or failed operation as an OData error with the same status.
 /// The text is fixed: no detail of the broker's reaches the caller.
-fn refused(status: StatusCode, version: ODataVersion) -> ODataErrorResponse {
+pub(crate) fn refused(status: StatusCode, version: ODataVersion) -> ODataErrorResponse {
     let code = match status {
         StatusCode::NOT_FOUND => "NotFound",
+        StatusCode::CONFLICT => "Conflict",
         StatusCode::FORBIDDEN => "Forbidden",
         StatusCode::METHOD_NOT_ALLOWED => "MethodNotAllowed",
         StatusCode::BAD_REQUEST => "BadRequest",
@@ -943,17 +957,20 @@ pub(crate) fn not_implemented(version: ODataVersion) -> ODataErrorResponse {
     .with_version(version)
 }
 
-/// A write method this round does not serve: `405` on what is only read
-/// (matrix `odata_write_readonly`, `odata_delete_collection`), `501` for
-/// every other form until writes are served (T-3509).
-fn written(method: &Method, uri: &ODataUri, version: ODataVersion) -> Response {
+/// A write this surface does not serve: `405` where the method has no
+/// meaning (matrix `odata_write_readonly`, `odata_delete_collection`, a
+/// `POST` to one Entity), `501` for the forms a later round maps.
+pub(crate) fn written(method: &Method, uri: &ODataUri, version: ODataVersion) -> Response {
     let read_only = match uri {
         ODataUri::Resource { path, .. } => match path.as_slice() {
             [Segment::EntitySet(_), Segment::Count] => true,
             [Segment::EntitySet(_), Segment::Query] => method != Method::POST,
             [Segment::EntitySet(_)] => method == Method::DELETE,
+            [Segment::EntitySet(_), Segment::Key(_)] => method == Method::POST,
             _ => false,
         },
+        // `POST $batch` is served before any other request.
+        ODataUri::Batch { .. } => true,
         _ => false,
     };
     if read_only {
@@ -974,6 +991,7 @@ mod tests {
         let member = |shape| Member {
             iri: "https://e.org/m".into(),
             shape,
+            list: false,
         };
         Set {
             type_iri: "https://e.org/T".into(),

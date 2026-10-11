@@ -225,11 +225,12 @@ async fn targets(
 /// The Relationship IRI, target set and multiplicity of navigation `name`
 /// of `set`. The parser resolves a navigation segment only to one, so
 /// anything else names the empty target, which no set has (404).
-fn nav_of<'s>(set: &'s Set, name: &str) -> (&'s str, &'s str, bool) {
+pub(crate) fn nav_of<'s>(set: &'s Set, name: &str) -> (&'s str, &'s str, bool) {
     match set.members.get(name) {
         Some(Member {
             iri,
             shape: Shape::Nav { target, collection },
+            ..
         }) => (iri, target, *collection),
         _ => ("", "", false),
     }
@@ -270,6 +271,7 @@ mod tests {
         let member = |shape| Member {
             iri: "https://e.org/m".into(),
             shape,
+            list: false,
         };
         let set = Set {
             type_iri: "https://e.org/T".into(),

@@ -27,6 +27,19 @@ const VOCABULARIES: &str = "https://oasis-tcs.github.io/odata-vocabularies/vocab
 /// expanded IRIs.
 pub type Shown = BTreeMap<String, BTreeSet<String>>;
 
+/// The writes the view offers (its `operations`), which the Capabilities
+/// annotations state (C2 to C5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Writable {
+    /// `create_entity`: `POST {Set}` (W1).
+    pub insert: bool,
+    /// `merge_entity` or `replace_entity`: `PATCH` or `PUT` of an Entity
+    /// (W4, W6).
+    pub update: bool,
+    /// `delete_entity` (W9).
+    pub delete: bool,
+}
+
 /// How the surface reads and writes one member of an EntityType.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shape {
@@ -83,6 +96,14 @@ impl Shape {
         )
     }
 
+    /// Whether a write may name it: not a Relationship to a type the view
+    /// hides (W15, it would link to an Entity the caller cannot see), not
+    /// one entry of a `languageMap` (writing it would drop the others).
+    #[must_use]
+    pub fn writable(&self) -> bool {
+        !matches!(self, Self::Url { .. } | Self::Language)
+    }
+
     /// Whether `$orderby` may name it (C12).
     #[must_use]
     pub fn sortable(&self) -> bool {
@@ -104,6 +125,9 @@ pub struct Member {
     pub iri: String,
     /// How it maps.
     pub shape: Shape,
+    /// The slot is a `ListProperty` or a `ListRelationship`: a write
+    /// keeps the kind (`valueList`, `objectList`).
+    pub list: bool,
 }
 
 /// One EntitySet: its Entity type and the members the view shows of it.
@@ -138,6 +162,7 @@ pub fn build(
     view: &str,
     schema: &linkml_model::Model,
     shown: &Shown,
+    writable: Writable,
     version: CsdlVersion,
 ) -> Result<Edm, String> {
     let namespace = mangle(view).ok_or("the view id has no OData namespace form")?;
@@ -204,10 +229,11 @@ pub fn build(
                 Member {
                     iri: slot_iri,
                     shape,
+                    list: schema.kind(&slot).starts_with("List"),
                 },
             );
         }
-        set.annotations = capabilities(&members);
+        set.annotations = capabilities(&members, writable);
         container.entity_sets.push(set);
         types.push(ty);
         sets.insert(
@@ -354,10 +380,12 @@ fn core(term: &str) -> Annotation {
     Annotation::new(format!("Core.{term}"), Expr::Bool(true))
 }
 
-/// C2 to C16 for a read-only round: no write; counting; filtering and
-/// sorting on the members [`Shape::scalar`] admits and `id` (C11, C12);
-/// expanding one level (C13). Advisory: every request is still gated (O25).
-fn capabilities(members: &BTreeMap<String, Member>) -> Vec<Annotation> {
+/// C2 to C16: the writes the view offers, none of them deep or an upsert,
+/// with the members no write may name ([`Shape::writable`], the computed
+/// ones are `Core.Computed`); counting; filtering and sorting on the
+/// members [`Shape::scalar`] admits and `id` (C11, C12); expanding one
+/// level (C13). Advisory: every request is still gated (O25).
+fn capabilities(members: &BTreeMap<String, Member>, writable: Writable) -> Vec<Annotation> {
     let flag = |value: bool| Expr::Bool(value);
     let restriction = |term: &str, record: Vec<(&str, Expr)>| {
         Annotation::new(
@@ -376,17 +404,35 @@ fn capabilities(members: &BTreeMap<String, Member>) -> Vec<Annotation> {
         )
         .map(Expr::PropertyPath)
         .collect();
+    let unwritable: Vec<Expr> = members
+        .iter()
+        .filter(|(_, m)| !m.shape.writable())
+        .map(|(name, _)| Expr::PropertyPath(name.clone()))
+        .collect();
     vec![
-        restriction("InsertRestrictions", vec![("Insertable", flag(false))]),
+        restriction(
+            "InsertRestrictions",
+            vec![
+                ("Insertable", flag(writable.insert)),
+                (
+                    "NonInsertableProperties",
+                    Expr::Collection(unwritable.clone()),
+                ),
+            ],
+        ),
         restriction(
             "UpdateRestrictions",
             vec![
-                ("Updatable", flag(false)),
+                ("Updatable", flag(writable.update)),
                 ("Upsertable", flag(false)),
                 ("DeltaUpdateSupported", flag(false)),
+                ("NonUpdatableProperties", Expr::Collection(unwritable)),
             ],
         ),
-        restriction("DeleteRestrictions", vec![("Deletable", flag(false))]),
+        restriction(
+            "DeleteRestrictions",
+            vec![("Deletable", flag(writable.delete))],
+        ),
         restriction("CountRestrictions", vec![("Countable", flag(true))]),
         restriction("SearchRestrictions", vec![("Searchable", flag(false))]),
         restriction(
@@ -576,7 +622,7 @@ mod tests {
         let s = schema();
         let shown = shown(&s, &[("Car", CAR_ALL), ("Person", &["name"])]);
         for version in [CsdlVersion::V4_01, CsdlVersion::V4_0] {
-            let edm = build("city-cars", &s, &shown, version).unwrap();
+            let edm = build("city-cars", &s, &shown, Writable::default(), version).unwrap();
             odata_csdl::validate(&edm.csdl, &odata_csdl::Limits::strict()).unwrap();
             let mut json = Vec::new();
             if version == CsdlVersion::V4_01 {
@@ -593,6 +639,7 @@ mod tests {
             "v",
             &s,
             &shown(&s, &[("Car", CAR_ALL), ("Person", &["name"])]),
+            Writable::default(),
             CsdlVersion::V4_01,
         )
         .unwrap();
@@ -695,6 +742,7 @@ mod tests {
             "v",
             &s,
             &shown(&s, &[("Car", &["speed", "parkedIn"])]),
+            Writable::default(),
             CsdlVersion::V4_01,
         )
         .unwrap();
@@ -710,7 +758,14 @@ mod tests {
     #[test]
     fn a_4_0_model_has_no_untyped_property_and_an_open_type() {
         let s = schema();
-        let edm = build("v", &s, &shown(&s, &[("Car", CAR_ALL)]), CsdlVersion::V4_0).unwrap();
+        let edm = build(
+            "v",
+            &s,
+            &shown(&s, &[("Car", CAR_ALL)]),
+            Writable::default(),
+            CsdlVersion::V4_0,
+        )
+        .unwrap();
         assert!(!edm.sets["Car"].members.contains_key("notes"));
         assert!(!xml(&edm).contains("Edm.Untyped"));
         assert!(xml(&edm).contains(r#"OpenType="true""#));
@@ -723,11 +778,19 @@ mod tests {
             "city-cars",
             &s,
             &shown(&s, &[("Car", &["speed"])]),
+            Writable::default(),
             CsdlVersion::V4_01,
         )
         .unwrap();
         assert_eq!(edm.namespace, "city_x002D_cars");
-        assert!(build(&"v".repeat(200), &s, &Shown::new(), CsdlVersion::V4_01).is_err());
+        assert!(build(
+            &"v".repeat(200),
+            &s,
+            &Shown::new(),
+            Writable::default(),
+            CsdlVersion::V4_01
+        )
+        .is_err());
     }
 
     #[test]

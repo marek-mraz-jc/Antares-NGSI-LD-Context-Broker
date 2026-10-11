@@ -396,6 +396,7 @@ mod tests {
         let member = |iri: &str, shape| Member {
             iri: iri.into(),
             shape,
+            list: false,
         };
         let value = |edm, collection| Shape::Value { edm, collection };
         Set {

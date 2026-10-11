@@ -70,7 +70,7 @@ pub use antares_model::NgsiError;
 /// The request bounds a surface applies to what it parses itself (a
 /// WebSocket message never passes the HTTP bounds layer).
 pub mod bounds {
-    pub use antares_api::bounds::{json_depth, MAX_JSON_DEPTH};
+    pub use antares_api::bounds::{json_depth, MAX_BATCH_ITEMS, MAX_BODY_BYTES, MAX_JSON_DEPTH};
 }
 
 /// The federation transport contract (ADR-0025 rule 8, ADR-0027 section 9),
