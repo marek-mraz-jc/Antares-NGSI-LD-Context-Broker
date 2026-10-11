@@ -65,7 +65,7 @@ self_test() {
     "sed -i '/^axum = /a uuid = { version = \"1\", default-features = false }' crates/odata-axum/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
   # a dependency fuzz/Cargo.lock does not hold, on a crate a fuzz target uses
   probe fuzz-lock "machete|fuzz-compile" --no-coverage \
-    "sed -i '/^\\[dependencies\\]/a hex = \"0.4\"' crates/odata-url/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
+    "sed -i '/^\\[dependencies\\]/a hex = { version = \"0.4\", default-features = false }' crates/odata-url/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
   probe architecture-row spec --no-coverage "mkdir -p crates/zz-probe/src && echo '//! probe' > crates/zz-probe/src/lib.rs"
   probe red-alone "alone odata-axum::probe_b_needs_the_other" --no-coverage "cat >> $lib <<'RS'
 
