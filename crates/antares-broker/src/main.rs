@@ -43,6 +43,12 @@ const KNOWN_KEYS: &[&str] = &[
     antares_mcp::ALLOWED_ORIGINS_ENV,
     #[cfg(feature = "mcp")]
     antares_mcp::MAX_RESULT_BYTES_ENV,
+    // The key that seals a write's confirmation, and the endpoints a
+    // subscription made through a tool may notify (MC4, MC12).
+    #[cfg(feature = "mcp")]
+    antares_mcp::REQUEST_STATE_KEY_FILE_ENV,
+    #[cfg(feature = "mcp")]
+    antares_mcp::SUBSCRIPTION_ENDPOINTS_ENV,
     // The WebSocket channel's bounds (ADR-0026 rules 6 to 10).
     #[cfg(feature = "ws")]
     antares_ws::QUEUE_ENV,
@@ -1409,6 +1415,22 @@ mod config_key_tests {
     /// deployment knob is a CrashLoopBackOff and the knob cannot be used at
     /// all. Scans the sources rather than restating the list, so the check
     /// keeps holding as crates add knobs.
+    /// The MCP surface names its variables by constant, which the source
+    /// scan below cannot see; a key missing here stops the broker at start.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn known_keys_hold_the_mcp_surface_variables() {
+        for key in [
+            antares_mcp::ALLOWED_HOSTS_ENV,
+            antares_mcp::ALLOWED_ORIGINS_ENV,
+            antares_mcp::MAX_RESULT_BYTES_ENV,
+            antares_mcp::REQUEST_STATE_KEY_FILE_ENV,
+            antares_mcp::SUBSCRIPTION_ENDPOINTS_ENV,
+        ] {
+            assert!(!unknown_config_key(key), "{key}");
+        }
+    }
+
     #[test]
     fn known_keys_cover_every_variable_the_workspace_reads() {
         let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
