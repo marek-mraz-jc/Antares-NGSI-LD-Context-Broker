@@ -2,10 +2,12 @@
 //! The fixture every `antares-ogc` test reads: a broker with the surface mounted, the Tenant
 //! `city`'s `LinkML` schema, four views and a handful of Cars and Stops.
 //!
-//! - `city` shows `Car` (`speed`, `location`, `seen`) and `Stop` (`name`); `Car.secret` and
-//!   the class `Depot` are in the schema and hidden.
+//! - `city` shows `Car` (`speed` in km/h, `location`, `seen`, `at` a Stop, `home` a Depot,
+//!   `colour`, `tags`) and `Stop` (`name`); `Car.secret` and the class `Depot` are in the
+//!   schema and hidden.
 //! - `slow` shows the same, narrowed to `speed<50` by the view.
 //! - `empty` shows `Stop` only.
+//! - `fleet` shows the same as `city` and offers every write Part 4 maps.
 //! - `reads` shows `Car` and allows Retrieve Entity alone, which OGC reads never use.
 
 use antares_ops::policy::{
@@ -26,18 +28,23 @@ pub const SCHEMA: &str = r#"{
                "ngsi": {"prefix_prefix": "ngsi", "prefix_reference": "https://uri.etsi.org/ngsi-ld/"}},
   "default_prefix": "dc",
   "classes": {
-    "Car": {"slots": ["speed", "location", "seen", "secret"], "description": "A car of the fleet"},
+    "Car": {"slots": ["speed", "location", "seen", "secret", "at", "home", "colour", "tags"], "description": "A car of the fleet"},
     "Stop": {"slots": ["name"]},
     "Depot": {"slots": ["name"]}
   },
   "slots": {
-    "speed": {"range": "float"},
+    "speed": {"range": "float", "unit": {"ucum_code": "km/h"}, "description": "how fast"},
+    "at": {"range": "Stop"},
+    "home": {"range": "Depot"},
+    "colour": {"range": "Colour"},
+    "tags": {"range": "string", "multivalued": true},
     "location": {"slot_uri": "ngsi:location", "range": "string",
                  "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}}},
     "seen": {"range": "string", "annotations": {"ogc_role": {"tag": "ogc_role", "value": "primary-instant"}}},
     "secret": {"range": "string"},
     "name": {"range": "string"}
-  }
+  },
+  "enums": {"Colour": {"permissible_values": {"red": {}, "blue": {}}}}
 }"#;
 
 pub struct Fixture {
@@ -62,9 +69,14 @@ pub async fn send(
 ) -> Answer {
     let mut req = Request::builder().method(method).uri(uri);
     if !body.is_empty() {
-        req = req
-            .header("Content-Type", "application/json")
-            .header("Content-Length", body.len());
+        req = req.header("Content-Length", body.len());
+    }
+    if !body.is_empty()
+        && !headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+    {
+        req = req.header("Content-Type", "application/json");
     }
     for (k, v) in headers {
         req = req.header(*k, *v);
@@ -99,6 +111,15 @@ pub async fn fixture() -> Result<Fixture, String> {
     fixture_with(TestBroker::new().await?).await
 }
 
+/// The operations of the `fleet` view: the reads and the four writes of Part 4.
+pub const WRITES: [&str; 5] = [
+    "query_entities",
+    "create_entity",
+    "replace_entity",
+    "merge_entity",
+    "delete_entity",
+];
+
 /// The broker takes schemas only when their bound is set, read when it starts.
 fn schemas_on() {
     std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
@@ -118,12 +139,16 @@ pub async fn fixture_with(broker: TestBroker) -> Result<Fixture, String> {
         ("empty", json!(["Stop"]), None, "query_entities"),
         ("reads", json!(["Car"]), None, "retrieve_entity"),
     ];
-    for (id, selector, q, op) in views {
+    let views = views
+        .into_iter()
+        .map(|(id, selector, q, op)| (id, selector, q, json!([op])))
+        .chain([("fleet", json!(["Car", "Stop"]), None, json!(WRITES))]);
+    for (id, selector, q, ops) in views {
         let mut view = json!({
             "id": id, "tenant": "city", "selector": selector,
-            "rules": [{"types": ["Car"], "attributes": ["speed", "location", "seen"]},
+            "rules": [{"types": ["Car"], "attributes": ["speed", "location", "seen", "at", "home", "colour", "tags"]},
                       {"types": ["Stop"], "attributes": ["name"]}],
-            "operations": [op]
+            "operations": ops
         });
         if let (Some(q), Some(map)) = (q, view.as_object_mut()) {
             map.insert("q".into(), json!(q));
@@ -167,17 +192,22 @@ fn point(lon: f64, lat: f64) -> Value {
     json!({"type": "GeoProperty", "value": {"type": "Point", "coordinates": [lon, lat]}})
 }
 
+fn rel(object: &str) -> Value {
+    json!({"type": "Relationship", "object": object})
+}
+
 fn prop(v: &Value) -> Value {
     json!({"type": "Property", "value": v})
 }
 
 /// Car 1 (slow, in Bratislava, seen in January), Car 2 (fast, east of the antimeridian
-/// line at 179.5, seen in June), Car 3 (slow, no location, never seen), Car 4 (fast, west of
-/// it at -179.5), Stop 1, Depot 1.
+/// line at 179.5, seen in June, at Stop 1, home Depot 1, red, tagged), Car 3 (slow, no
+/// location, never seen), Car 4 (fast, west of it at -179.5), Stop 1, Depot 1.
 pub fn entities() -> Vec<Value> {
     vec![
         json!({"id": "urn:ngsi-ld:Car:1", "type": "Car", "speed": prop(&json!(10)), "location": point(17.1, 48.1), "seen": prop(&json!("2026-01-01T00:00:00Z")), "secret": prop(&json!("s1"))}),
-        json!({"id": "urn:ngsi-ld:Car:2", "type": "Car", "speed": prop(&json!(60)), "location": point(179.5, 0.0), "seen": prop(&json!("2026-06-01T00:00:00Z")), "secret": prop(&json!("s2"))}),
+        json!({"id": "urn:ngsi-ld:Car:2", "type": "Car", "speed": prop(&json!(60)), "location": point(179.5, 0.0), "seen": prop(&json!("2026-06-01T00:00:00Z")), "secret": prop(&json!("s2")),
+               "at": rel("urn:ngsi-ld:Stop:1"), "home": rel("urn:ngsi-ld:Depot:1"), "colour": prop(&json!("red")), "tags": prop(&json!(["a", "b"]))}),
         json!({"id": "urn:ngsi-ld:Car:3", "type": "Car", "speed": prop(&json!(30)), "secret": prop(&json!("s3"))}),
         json!({"id": "urn:ngsi-ld:Car:4", "type": "Car", "speed": prop(&json!(70)), "location": point(-179.5, 0.0)}),
         json!({"id": "urn:ngsi-ld:Stop:1", "type": "Stop", "name": prop(&json!("Hlavná"))}),
@@ -241,4 +271,39 @@ pub async fn narrowed() -> Result<Fixture, String> {
             .with_policy(Arc::new(SlowOnly(q_filter("speed<50")?))),
     )
     .await
+}
+
+/// An engine that, once locked, refuses every write (clause 5.6) and allows every read, as a
+/// read-only Policy would; unlocked while the fixture seeds.
+#[derive(Default)]
+pub struct ReadOnly(pub std::sync::atomic::AtomicBool);
+
+impl PolicyEngine for ReadOnly {
+    fn name(&self) -> &'static str {
+        "read-only"
+    }
+
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        let locked = self.0.load(std::sync::atomic::Ordering::SeqCst);
+        Box::pin(std::future::ready(
+            if locked && op.clause.starts_with("5.6.") {
+                Decision::Deny("read only".into())
+            } else {
+                Decision::Allow
+            },
+        ))
+    }
+
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// [`fixture`] under a [`ReadOnly`] engine, locked once seeded.
+pub async fn read_only() -> Result<Fixture, String> {
+    schemas_on();
+    let engine = Arc::new(ReadOnly::default());
+    let f = fixture_with(TestBroker::new().await?.with_policy(engine.clone())).await?;
+    engine.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(f)
 }

@@ -22,6 +22,7 @@ members = [
     "crates/ogc-cql2",
     "crates/antares-views",
     "crates/antares-mcp",
+    "crates/antares-linkml",
     "crates/antares-odata",
     "crates/antares-ogc",
     "crates/antares-ws",
@@ -57,6 +58,7 @@ joinedcontext-policy = { path = "addons/joinedcontext-policy" }
 antares-ops = { path = "crates/antares-ops" }
 antares-views = { path = "crates/antares-views" }
 antares-mcp = { path = "crates/antares-mcp" }
+antares-linkml = { path = "crates/antares-linkml" }
 antares-odata = { path = "crates/antares-odata" }
 antares-ogc = { path = "crates/antares-ogc" }
 antares-ws = { path = "crates/antares-ws" }
@@ -220,6 +222,9 @@ codegen-units = 1
 [profile.release.package.antares-mcp]
 overflow-checks = true
 codegen-units = 1
+
+[profile.release.package.antares-linkml]
+overflow-checks = true
 
 [profile.release.package.antares-odata]
 overflow-checks = true

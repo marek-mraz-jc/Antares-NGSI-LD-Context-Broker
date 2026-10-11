@@ -62,12 +62,14 @@ What a pull request from a fork can and cannot do here:
   schedule or dispatch, never from a pull request.
 - Nothing a `v*` tag publishes is built from a cache.
 
-**As a maintainer.** Commit on `dev`, push a batch, then dispatch `ci`
-once for the batch (`ci` has no push trigger: a 40-minute pipeline that
-restarts on every push never finishes). A green dispatched run on `dev`
-publishes the `:dev` image. Every push to `dev` also runs `fast` (the
-workspace gate alone, about 15 minutes), which is what a review closes on;
-`ci` adds the ETSI matrix and the images and stays the per-batch gate.
+**As a maintainer.** Commit on `dev` and push a batch. Every push to
+`dev` runs `fast` (the workspace gate, about 15 minutes), which is what a
+review closes on. A green `fast` run starts `ci` on the same commit
+(`workflow_run`): the ETSI matrix and the arm64 build at once, no second
+workspace run, and a green run publishes the `:dev` image. A `fast` run
+that is not green starts nothing (its `ci` run cancels itself). A
+dispatch of `ci` by hand runs the workspace gate first unless
+`with_workspace` is false.
 Work that will stay red for more than a day
 lives on a topic branch and comes in by pull request like a fork's.
 
