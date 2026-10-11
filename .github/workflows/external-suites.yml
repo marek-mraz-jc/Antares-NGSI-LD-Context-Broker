@@ -1,0 +1,320 @@
+name: external-suites
+
+# Final validation (T-3549): Antares (vanilla and all features, one commit)
+# on every store it ships, against suites it did not write:
+#   - Coraine's functional suite (SEAMWARE/coraine test/funcTests) through
+#     the adapter in tests/external/coraine, verdict per case by compare.py;
+#   - the ETSI NGSI-LD suite at (a) the copy this repository carries and
+#     (b) forge's default branch on the run day, @contexts served locally
+#     (tests/external/etsi/forge-free.sh), every TP that differs listed;
+#   - the cross-surface oracle (views, OData, MCP, WebSocket equal the core
+#     answer narrowed by the view), once its test exists (T-3522).
+# The triage of every failure lives in docs/conformance/final-validation.md.
+# GitHub-hosted runners only: the suites never run on a shared host.
+#
+# A push that touches the harness runs the smoke preset (vanilla, file
+# store, the first 60 Coraine cases, the Provision suites of both ETSI
+# commits) so the plumbing is proven before a full run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: smoke preset instead of the full matrix
+        type: boolean
+        default: false
+      coraine_ref:
+        description: SEAMWARE/coraine commit whose test/funcTests run
+        default: d313d87fabd74f67e0d4d1f222ccf0c45239a0a9
+  schedule:
+    - cron: "17 3 * * 0" # weekly, Sunday 03:17 UTC
+  push:
+    paths:
+      - tests/external/**
+      - .github/workflows/external-suites.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: external-suites-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SMOKE: ${{ github.event_name == 'push' || inputs.smoke == true }}
+  CORAINE_REF: ${{ inputs.coraine_ref || 'd313d87fabd74f67e0d4d1f222ccf0c45239a0a9' }}
+  # every feature a shipped surface needs; becomes `full` when the broker has one
+  FULL_FEATURES: mqtt,views,mcp
+  FULL_SURFACES: admin,views,mcp
+  FORGE_SUITE: https://forge.etsi.org/rep/cim/ngsi-ld-test-suite.git
+
+jobs:
+  selftest:
+    name: Harness self-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          python3 -m unittest discover -s tests/external/coraine
+          python3 -m unittest discover -s tests/external/etsi
+
+  plan:
+    name: Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      variants: ${{ steps.m.outputs.variants }}
+      stores: ${{ steps.m.outputs.stores }}
+    steps:
+      - id: m
+        run: |
+          if [ "$SMOKE" = true ]; then
+            echo 'variants=["vanilla"]' >> "$GITHUB_OUTPUT"
+            echo 'stores=["file"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'variants=["vanilla","full"]' >> "$GITHUB_OUTPUT"
+            echo 'stores=["memory","file","postgres","timescale"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  coraine:
+    name: Coraine ${{ matrix.variant }} ${{ matrix.store }}
+    needs: [selftest, plan]
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(needs.plan.outputs.variants) }}
+        store: ${{ fromJSON(needs.plan.outputs.stores) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    # Coraine's own CI image: the C toolchain corLibs builds corTest's tools
+    # with, psql, socat, mosquitto (Coraine's .github/workflows/ci.yml)
+    container:
+      image: quay.io/seamware/coraine-ci:2026-09-22-f5a4eb4
+    services:
+      db:
+        image: timescale/timescaledb-ha:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+      context-server:
+        image: quay.io/seamware/coraine-ci:mirror-context-server-0.2.0
+        env:
+          MEMORY_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: antares
+      - uses: actions/checkout@v7
+        with:
+          repository: SEAMWARE/coraine
+          ref: ${{ env.CORAINE_REF }}
+          path: stack/coraine
+      - uses: actions/checkout@v7
+        with:
+          repository: SEAMWARE/corLibs
+          path: stack/corLibs
+      - name: Build corTest's tools (corLibs bootstrap)
+        working-directory: stack/corLibs
+        run: ./bootstrap.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: antares
+          key: ${{ matrix.variant }}
+      - name: Build Antares (${{ matrix.variant }})
+        working-directory: antares
+        run: |
+          f=""; [ "${{ matrix.variant }}" = full ] && f="--features $FULL_FEATURES"
+          cargo build --release --locked -p antares-broker $f
+      - name: Wait for the database, serve the @context server on localhost:7080
+        run: |
+          for i in $(seq 1 60); do
+            PGPASSWORD=postgres psql -h db -U postgres -c 'SELECT 1' >/dev/null 2>&1 && break
+            [ "$i" = 60 ] && { echo "database never became reachable"; exit 1; }
+            sleep 2
+          done
+          socat TCP-LISTEN:7080,fork,reuseaddr TCP:context-server:8080 &
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null --max-time 2 http://localhost:7080/jsonldContexts/_probe && break
+            sleep 1
+          done
+      - name: Run the suite
+        env:
+          ANTARES_BIN: ${{ github.workspace }}/antares/target/release/antares
+          ANTARES_TEST_PG: postgresql://postgres:postgres@db:5432
+          ANTARES_API_SURFACES: ${{ matrix.variant == 'full' && env.FULL_SURFACES || 'admin' }}
+        run: |
+          smoke=""; [ "$SMOKE" = true ] && smoke="--toIx 60"
+          out=results/coraine-${{ matrix.variant }}-${{ matrix.store }}
+          antares/tests/external/coraine/run.sh stack/coraine stack/corLibs/bin ${{ matrix.store }} "$out" $smoke
+          {
+            echo "antares $(git -C antares rev-parse HEAD) ${{ matrix.variant }} ${{ matrix.store }}"
+            for r in stack/*/; do echo "$(basename "$r") $(git -C "$r" rev-parse HEAD 2>/dev/null)"; done
+          } > "$out/versions.txt"
+          cat "$out/coraine-report.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the outputs of every case that did not pass
+        if: always()
+        run: |
+          out=results/coraine-${{ matrix.variant }}-${{ matrix.store }}
+          mkdir -p "$out/cases"
+          cd stack/coraine/test/funcTests/cases
+          for d in *.diff *.stderr; do [ -s "$d" ] && cp "${d%%.*}".* "$OLDPWD/$out/cases/" 2>/dev/null; done
+          cp /tmp/coraine.*.log "$OLDPWD/$out/" 2>/dev/null || true
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: coraine-${{ matrix.variant }}-${{ matrix.store }}
+          path: results
+          retention-days: 30
+
+  image:
+    name: Image ${{ matrix.variant }}
+    needs: [selftest, plan]
+    strategy:
+      matrix:
+        variant: ${{ fromJSON(needs.plan.outputs.variants) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          f=""; [ "${{ matrix.variant }}" = full ] && f="$FULL_FEATURES"
+          docker build --build-arg FEATURES="$f" -t antares-local:latest .
+          docker save antares-local:latest | gzip > antares-image.tgz
+      - uses: actions/upload-artifact@v6
+        with:
+          name: image-${{ matrix.variant }}
+          path: antares-image.tgz
+          retention-days: 3
+
+  etsi:
+    name: ETSI ${{ matrix.suite }} ${{ matrix.variant }} ${{ matrix.store }}
+    needs: [plan, image]
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(needs.plan.outputs.variants) }}
+        store: ${{ fromJSON(needs.plan.outputs.stores) }}
+        suite: [pinned, latest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      OUT: results/etsi-${{ matrix.suite }}-${{ matrix.variant }}-${{ matrix.store }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: image-${{ matrix.variant }}
+      - run: docker load < antares-image.tgz
+      - name: Take forge's default branch (latest)
+        id: forge
+        if: matrix.suite == 'latest'
+        run: |
+          mkdir -p "$OUT"
+          if git clone -q --depth 1 "$FORGE_SUITE" /tmp/forge-suite; then
+            rm -rf ngsi-ld-test-suite && mv /tmp/forge-suite ngsi-ld-test-suite
+            echo "forge $(git -C ngsi-ld-test-suite rev-parse HEAD)" > "$OUT/suite.txt"
+          else
+            echo "forge unreachable on $(date -u +%FT%RZ): no results for (b)" > "$OUT/suite.txt"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Name the pinned suite
+        if: matrix.suite == 'pinned'
+        run: mkdir -p "$OUT" && echo "vendored ngsi-ld-test-suite at antares $GITHUB_SHA" > "$OUT/suite.txt"
+      - name: Serve the @contexts locally
+        if: steps.forge.outputs.skip != '1'
+        run: |
+          python3 -m http.server 8099 --bind 127.0.0.1 --directory ngsi-ld-test-suite > /dev/null 2>&1 &
+          tests/external/etsi/forge-free.sh ngsi-ld-test-suite http://127.0.0.1:8099
+      - name: Run the suites
+        if: steps.forge.outputs.skip != '1'
+        env:
+          STORE: ${{ matrix.store }}
+          RESULTS_DIR: ${{ env.OUT }}
+          SKIP_BUILD: "1"
+          STOP_ON_ERROR: "0"
+          CALLBACK_HOST: localhost
+          API_SURFACES: ${{ matrix.variant == 'full' && env.FULL_SURFACES || 'admin' }}
+        run: |
+          [ "$SMOKE" = true ] && export SUITES=Provision
+          ./dev/etsi-pipeline.sh > "$OUT/pipeline.log" 2>&1 || echo "pipeline exit $?" >> "$OUT/pipeline.log"
+          tail -5 "$OUT/pipeline.log"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: etsi-${{ matrix.suite }}-${{ matrix.variant }}-${{ matrix.store }}
+          path: |
+            ${{ env.OUT }}/suite.txt
+            ${{ env.OUT }}/pipeline.log
+            ${{ env.OUT }}/run-summary.md
+            ${{ env.OUT }}/failures.csv
+            ${{ env.OUT }}/tp-status.csv
+            ${{ env.OUT }}/**/log.html
+          retention-days: 30
+
+  oracle:
+    name: Cross-surface oracle
+    needs: selftest
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          mkdir -p results/oracle
+          if [ -f crates/antares-broker/tests/surfaces_equivalence.rs ]; then
+            cargo test --locked -p antares-broker --features "$FULL_FEATURES" --test surfaces_equivalence 2>&1 \
+              | tee results/oracle/oracle.log
+          else
+            echo "not built yet: crates/antares-broker/tests/surfaces_equivalence.rs (T-3522)" | tee results/oracle/oracle.log
+          fi
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: oracle
+          path: results
+          retention-days: 30
+
+  report:
+    name: Report
+    if: always()
+    needs: [coraine, etsi, oracle]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          path: in
+      - name: Fold every cell into one summary
+        run: |
+          mkdir -p out
+          {
+            echo "# External suites, antares ${GITHUB_SHA::7}, $(date -u +%FT%RZ)"
+            echo
+            echo "## Coraine ($CORAINE_REF)"
+            for f in in/coraine-*/coraine-*/coraine-report.md; do
+              [ -f "$f" ] || continue
+              echo; echo "### $(basename "$(dirname "$f")")"; echo; head -1 "$f"
+            done
+            echo
+            echo "## ETSI, pinned (a) against forge latest (b)"
+            for a in in/etsi-pinned-*; do
+              [ -d "$a" ] || continue
+              cell=${a#in/etsi-pinned-}
+              b=in/etsi-latest-$cell
+              echo; echo "### $cell"; echo
+              cat "$a/suite.txt" "$b/suite.txt" 2>/dev/null | sed 's/^/- /'
+              echo
+              python3 tests/external/etsi/tp-diff.py "$a/tp-status.csv" "$b/tp-status.csv" "out/etsi-$cell.md" > /dev/null
+              cat "out/etsi-$cell.md"
+            done
+            echo
+            echo "## Cross-surface oracle"
+            echo; tail -3 in/oracle/oracle/oracle.log 2>/dev/null || echo "(no log)"
+          } > out/summary.md
+          cat out/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: final-validation
+          path: out
+          retention-days: 90

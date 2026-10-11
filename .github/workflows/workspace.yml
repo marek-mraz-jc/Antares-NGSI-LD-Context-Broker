@@ -246,6 +246,12 @@ jobs:
       # broken (an empty column reads as "nothing happened") — check them here.
       - name: ETSI sampling self-check
         run: python3 dev/etsi-selftest.py
+      # The external-suites harness (T-3549): its comparator and adapters
+      # decide verdicts, and a wrong one reads as a plausible pass.
+      - name: External-suites harness self-check
+        run: |
+          python3 -m unittest discover -s tests/external/coraine
+          python3 -m unittest discover -s tests/external/etsi
       # Same failure shape one layer over: the merged coverage table counts
       # functions from lcov FN records, and a wrong key there prints a
       # plausible percentage rather than an error.
