@@ -33,6 +33,10 @@ tokio = { version = "1", default-features = false, features = ["macros", "rt-mul
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { workspace = true }
 
+[[bench]]
+name = "render"
+harness = false
+
 # surfaces-threat-model 10.1: the full table, not the workspace's.
 [lints.rust]
 unsafe_code = "forbid"
