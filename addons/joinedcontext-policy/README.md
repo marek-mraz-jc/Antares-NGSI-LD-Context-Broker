@@ -46,6 +46,7 @@ refused:
     {
       "id": "city/read-cars",
       "effect": "permit",
+      "assigner": "did:web:city.example.org",
       "assignee": {"kind": "role", "id": "public"},
       "operations": ["5.7.1", "5.7.2"],
       "validity": {"from": "2026-01-01T00:00:00Z", "to": "2027-01-01T00:00:00Z"},
@@ -69,6 +70,7 @@ refused:
 |---|---|
 | `id` | required, unique in the document; named by the access surface and in a load error, never in a refusal |
 | `effect` | `permit` (default) or `prohibit` |
+| `assigner` | optional: the party that granted it (a DID or URL), shown by the access surface (section 4); decides nothing |
 | `assignee.kind` | `user` (`x-jc-subject`), `group`, `role`, `serviceAccount` (`x-jc-client`); `did` is accepted and matches nobody until a header carries it |
 | `operations` | CIM 009 clauses (`5.6.1`, `5.7.2`, ...); the compiler expands the platform's operation names and groups |
 | `validity` | optional half-open `[from, to)`, RFC 3339 |
@@ -114,3 +116,35 @@ deciding; a Tenant with no document denies every platform caller.
 8. A batch is decided member by member (`decide_each`); a notification is
    decided again for the Subscription's stored subject as a query (5.7.2):
    `Deny` drops it, a `Filter` narrows it.
+
+## 4. The access surface
+
+`ANTARES_API_SURFACES=...,access` mounts `/x/views/{view}/access`, built
+with `jc-policy` (plan section 5.6). It answers "what may I do through this
+view" from the same compiled table the engine decides with, so the
+description and the enforcement cannot drift (platform EP-60). The view
+names the Tenant; an unknown view is 404, the same as on every view
+surface.
+
+| Route | Answer |
+|---|---|
+| `GET access` | the caller's grants; the representation the `Accept` header names first, `application/json` otherwise (never 406) |
+| `POST access/check` | AuthZEN: `{"action": {"name": …}, "resource": {"type": …}}` → `{"decision": true, "context": {"reason": "policy_grant_matched", "assigner": …}}` or `{"decision": false}` |
+
+| `Accept` | Representation |
+|---|---|
+| `application/json` (default) | AuthZEN resource search: `subject`, `resource` (`{"type": "view", "id": …}`), `permissions`, `prohibitions`, one entry per selector with `resource`, `actions`, `attributes` (`"*"` for the whole Entity), `constraints` (`q`, `scopeQ`, `geoQ`, `temporalQ` as written) |
+| `application/odrl+json` | ODRL 2.2 `Set` in the `ngsi-ld:` profile; its `uid` carries the SHA-256 of its rules |
+| `text/turtle` | the same ODRL policy as RDF, written from the JSON-LD |
+| `application/vnd.joinedcontext.grant-ast+json` | UCAST condition tree per Entity type: `operations`, `project`, `q` verbatim, `where` from `scopeQ`, `geoQ`, `temporalQ`; prohibited operations taken off |
+
+Actions are the CIM 009 Table 4.20-1 names (`queryEntity`, `createEntity`,
+...): each clause a policy lists, restricted to the names whose
+operation-matrix rows the view allows. A policy without `information`
+shows the type `*`.
+
+What the caller holds and nothing else: only policies whose assignee is the
+caller and that are in force now; a type only somebody else may touch is
+absent, never listed as denied; a refusal of `access/check` names nothing
+(GW6). A request with no `x-jc-*` header is the cluster's own and holds no
+policy, so its document is empty.
