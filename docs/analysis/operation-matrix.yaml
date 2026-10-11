@@ -300,10 +300,12 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:150
     odata:
       status: supported
-      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref, single-valued (Protocol 11.4.6.3, T-3441
-        W16)
+      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref, one object for a single-valued navigation
+        (Protocol 11.4.6.3, T-3441 W16) and the full list for a collection-valued one (11.4.6.4, W20), each target read
+        under the view first (Retrieve Entity, 5.7.1); Append overwrites (10.2.4), so it sets a Relationship the Entity
+        does not hold yet, where Replace Attribute answers 404 (T-3509)
       checks:
-        adr0020_phase: none
+        adr0020_phase: on_request
         operation_fields: []
         filterable: false
         whole_tenant: false
@@ -414,7 +416,8 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:803
     odata:
       status: supported
-      binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}')/{complexProperty} (Protocol 11.4.9)
+      binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9, T-3441 W11), any property a
+        write may name (the model has no complex type: an inlined class is Edm.Untyped)
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -620,7 +623,7 @@ operations:
     odata:
       status: supported
       binding: DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9; OData sets it to
-        null, the mapping to Delete Attribute is a proposal); also DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{prop}/$value
+        null, an absent Attribute is NGSI-LD's null); also DELETE /x/views/{view}/odata/v4/{EntitySet}('{id}')/{prop}/$value
         and single-valued DELETE .../{nav}/$ref (T-3441 W13, W17)
       checks:
         adr0020_phase: on_request
@@ -1097,8 +1100,9 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:975
     odata:
       status: supported
-      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9); also PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{nav}/$ref
-        replacing the whole collection (T-3441 W20)
+      binding: PUT /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9, T-3441 W10); an Attribute the
+        Entity does not hold is 404, a merge of the Entity adds it; the full collection of a $ref is append_attributes
+        (W20, T-3509)
       checks:
         adr0020_phase: on_request
         operation_fields:

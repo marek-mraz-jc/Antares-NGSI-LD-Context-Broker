@@ -92,6 +92,11 @@ Attribute comes from the model, never from the shape of a value.
 | `PATCH {Set}('{id}')` | Merge Entity `?type=`: a `null` is the NGSI-LD Null and deletes the Attribute; `204` |
 | `PUT {Set}('{id}')` | Replace Entity `?type=`: what the body omits is removed; `204` |
 | `DELETE {Set}('{id}')` | Delete Entity `?type=`; `204` |
+| `PUT {Set}('{id}')/{prop}` | Replace Attribute `?type=` in the member's kind; `404` when the Entity does not hold it (a `PATCH` of the Entity adds it); `204` |
+| `PATCH {Set}('{id}')/{prop}` | Partial Attribute Update `?type=`; `null` is the NGSI-LD Null; `204` |
+| `DELETE {Set}('{id}')/{prop}`, `…/{prop}/$value` | Delete Attribute `?type=`; `204` |
+| `PUT {Set}('{id}')/{nav}/$ref` | Append Attributes `?type=`: a single-valued navigation as one Relationship, a collection as its full list in its kind (`ListRelationship` keeps the order); every target is read first under the view; `204` |
+| `DELETE {Set}('{id}')/{nav}/$ref` | Delete Attribute `?type=`; `204` |
 
 A write the view's `operations` do not offer is `405` before its body is
 read. An absent Entity, a hidden one and one of another type are `404`,
@@ -101,8 +106,12 @@ that differs from the URL's, a computed member (`_types`, `createdAt`,
 `modifiedAt`), a Relationship to a type the view hides and a
 `LanguageProperty` are `400`; `$metadata` lists the last two as
 `NonInsertableProperties` and `NonUpdatableProperties`. Deep insert, deep
-update and a bind on a collection navigation are `501`, and so are
-`If-Match`, `If-None-Match` and a query option on a write.
+update, a bind on a collection navigation, `POST` or `DELETE` of one
+`$ref` in a collection (no operation removes one object of a
+Relationship) and `PUT …/$value` are `501`, and so are `If-Match`,
+`If-None-Match` and a query option on a write. A property write that
+names `id`, `scope`, a computed member, a `LanguageProperty` or a URL
+member is `400` before any operation.
 
 ## 4. `$filter`
 

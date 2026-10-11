@@ -989,6 +989,7 @@ mod tests {
         let member = |shape| Member {
             iri: "https://e.org/m".into(),
             shape,
+            list: false,
         };
         Set {
             type_iri: "https://e.org/T".into(),

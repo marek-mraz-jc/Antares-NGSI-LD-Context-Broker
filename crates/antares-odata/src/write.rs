@@ -9,7 +9,8 @@
 //! body is written in the normalized form, so no kind is guessed from a
 //! value. The other write forms answer `501` or `405` before any operation.
 
-use crate::edm::{Set, Shape};
+use crate::below;
+use crate::edm::{Member, Set, Shape};
 use crate::filter::Translated;
 use crate::read::{
     encode, entity, not_found, not_implemented, refused, resource, run, run_request, set_of,
@@ -21,13 +22,14 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use odata_axum::{json_level, ODataErrorResponse, ODataRequest};
 use odata_json::{
-    read_entity_body, Bind, BodyError, BodyLimits, Ctx, ODataError, ODataVersion, WriteKind,
+    read_entity_body, Bind, BodyError, BodyLimits, Ctx, ODataError, ODataVersion, Target, WriteKind,
 };
 use odata_url::{Key, KeyValue, Literal, ODataUri, QueryOptions, Segment};
 use serde_json::{json, Map, Value};
 
-/// The NGSI-LD Null (8.4.3): a merge that names it deletes the Attribute.
-const NGSI_LD_NULL: &str = "urn:ngsi-ld:null";
+/// The NGSI-LD Null (8.4.2, 8.4.3): an update or a merge that names it
+/// deletes the Attribute.
+pub(crate) const NGSI_LD_NULL: &str = "urn:ngsi-ld:null";
 
 /// One write request below the service root.
 pub(crate) async fn serve(
@@ -51,11 +53,27 @@ pub(crate) async fn serve(
             Form::Change(set, key, WriteKind::Replace)
         }
         (&Method::DELETE, [Segment::EntitySet(set), Segment::Key(key)]) => Form::Delete(set, key),
+        (
+            &Method::PUT | &Method::PATCH | &Method::DELETE,
+            [Segment::EntitySet(set), Segment::Key(key), Segment::Property(name)],
+        )
+        | (
+            &Method::DELETE,
+            [Segment::EntitySet(set), Segment::Key(key), Segment::Property(name), Segment::Value],
+        ) => Form::Attribute(set, key, name, method.clone()),
+        (
+            &Method::PUT | &Method::DELETE,
+            [Segment::EntitySet(set), Segment::Key(key), Segment::Navigation(nav), Segment::Ref],
+        ) => Form::Reference(set, key, nav, method == Method::DELETE),
         _ => return written(method, &request.uri, version),
+    };
+    let Some(op) = form.op(reads) else {
+        // W19: no operation removes one object of a Relationship.
+        return not_implemented(version).into_response();
     };
     // Rule 4: a write the view does not offer is refused before its body
     // is read, whatever the body holds.
-    if !reads.view.allows(form.op()) {
+    if !reads.view.allows(op) {
         return refused(StatusCode::METHOD_NOT_ALLOWED, version).into_response();
     }
     // W32: the broker has no conditional write; options shape a read's
@@ -80,6 +98,12 @@ pub(crate) async fn serve(
         Form::Create(set) => create(reads, caller, &ctx, set, headers, body).await,
         Form::Change(set, key, kind) => change(reads, caller, &ctx, (set, key), kind, body).await,
         Form::Delete(set, key) => delete(reads, caller, set, key, version).await,
+        Form::Attribute(set, key, name, method) => {
+            below::property(reads, caller, &ctx, (set, key, name), &method, body).await
+        }
+        Form::Reference(set, key, nav, _) => {
+            below::reference(reads, caller, &ctx, (set, key, nav), op, body).await
+        }
     };
     answer.unwrap_or_else(IntoResponse::into_response)
 }
@@ -89,17 +113,38 @@ enum Form<'u> {
     Create(&'u str),
     Change(&'u str, &'u Key, WriteKind),
     Delete(&'u str, &'u Key),
+    /// A structural property: `PUT`, `PATCH` or `DELETE` (W10, W11, W13).
+    Attribute(&'u str, &'u Key, &'u str, Method),
+    /// A navigation's `$ref`: set (`false`) or removed (W16, W17, W20).
+    Reference(&'u str, &'u Key, &'u str, bool),
 }
 
 impl Form<'_> {
-    /// The operation the write is.
-    fn op(&self) -> OperationId {
-        match self {
+    /// The operation the write is; `None` for a form none is (W19).
+    fn op(&self, reads: &Reads) -> Option<OperationId> {
+        Some(match self {
             Self::Create(_) => OperationId::CreateEntity,
             Self::Change(.., WriteKind::Replace) => OperationId::ReplaceEntity,
             Self::Change(..) => OperationId::MergeEntity,
             Self::Delete(..) => OperationId::DeleteEntity,
-        }
+            Self::Attribute(.., method) if method == Method::PUT => OperationId::ReplaceAttribute,
+            Self::Attribute(.., method) if method == Method::PATCH => {
+                OperationId::PartialAttributeUpdate
+            }
+            Self::Attribute(..) => OperationId::DeleteAttribute,
+            Self::Reference(set, _, nav, remove) => {
+                let collection = reads
+                    .edm
+                    .sets
+                    .get(*set)
+                    .is_some_and(|s| crate::paths::nav_of(s, nav).2);
+                match (collection, remove) {
+                    (true, true) => return None,
+                    (_, true) => OperationId::DeleteAttribute,
+                    (_, false) => OperationId::AppendAttributes,
+                }
+            }
+        })
     }
 }
 
@@ -248,34 +293,41 @@ async fn delete(
 
 /// The body's structural members as normalized NGSI-LD Attributes keyed by
 /// IRI, `scope` as the Entity's. A `null` in a merge is the NGSI-LD Null
-/// in the Attribute's own member (8.4.3: it deletes the Attribute); in a
-/// create or a replace it is an absent member. A member no write may name ([`Shape::writable`]) was refused by
-/// the body reader through the Capabilities that list it.
+/// as the member's value (8.4.3: it deletes the Attribute, whatever its
+/// kind); in a create or a replace it is an absent member. A member no
+/// write may name ([`Shape::writable`]) was refused by the body reader
+/// through the Capabilities that list it.
 fn attributes(set: &Set, properties: &[(String, Value)], kind: WriteKind) -> Map<String, Value> {
     let mut doc = Map::new();
     for (name, value) in properties {
-        let value = match (value, kind) {
-            (Value::Null, WriteKind::Update) => Value::from(NGSI_LD_NULL),
-            (Value::Null, _) => continue,
-            (value, _) => value.clone(),
+        let member = set.members.get(name);
+        let iri = match (member, name.as_str()) {
+            (Some(member), _) => member.iri.as_str(),
+            (None, "scope") => "scope",
+            (None, _) => continue,
         };
-        if name == "scope" {
-            doc.insert("scope".into(), value);
-            continue;
-        }
-        let Some(member) = set.members.get(name) else {
-            continue;
+        let written = match (value, kind, member) {
+            (Value::Null, WriteKind::Update, _) => Some(Value::from(NGSI_LD_NULL)),
+            (Value::Null, ..) => None,
+            (value, _, None) => Some(value.clone()),
+            (value, _, Some(member)) => attribute(member, value),
         };
-        let attribute = match (&member.shape, value) {
-            (Shape::Value { .. }, value) => json!({"type": "Property", "value": value}),
-            (Shape::Geo, value) => json!({"type": "GeoProperty", "value": value}),
-            (Shape::Json, value) => json!({"type": "JsonProperty", "json": value}),
-            (Shape::Vocab, value) => json!({"type": "VocabProperty", "vocab": value}),
-            (Shape::Language | Shape::Url { .. } | Shape::Nav { .. }, _) => continue,
-        };
-        doc.insert(member.iri.clone(), attribute);
+        doc.extend(written.map(|v| (iri.to_owned(), v)));
     }
     doc
+}
+
+/// One member's value as its normalized NGSI-LD Attribute, of the kind
+/// the schema names; `None` for a member no write may name.
+pub(crate) fn attribute(member: &Member, value: &Value) -> Option<Value> {
+    Some(match (&member.shape, member.list) {
+        (Shape::Value { .. }, true) => json!({"type": "ListProperty", "valueList": value}),
+        (Shape::Value { .. }, false) => json!({"type": "Property", "value": value}),
+        (Shape::Geo, _) => json!({"type": "GeoProperty", "value": value}),
+        (Shape::Json, _) => json!({"type": "JsonProperty", "json": value}),
+        (Shape::Vocab, _) => json!({"type": "VocabProperty", "vocab": value}),
+        (Shape::Language | Shape::Url { .. } | Shape::Nav { .. }, _) => return None,
+    })
 }
 
 /// Each bind as a Relationship, after its target is read under the view
@@ -295,17 +347,7 @@ async fn bind(
             .members
             .get(&bind.navigation)
             .ok_or(not_found(version))?;
-        let target = set_of(reads, &bind.target.set, version)?;
-        let urn = id_of(&bind.target.key, version)?;
-        run(
-            reads,
-            caller,
-            OperationId::RetrieveEntity,
-            typed(&format!("/ngsi-ld/v1/entities/{}", encode(&urn)), target),
-            &Translated::default(),
-            version,
-        )
-        .await?;
+        let urn = visible(reads, caller, &bind.target, version).await?;
         doc.insert(
             member.iri.clone(),
             json!({"type": "Relationship", "object": urn}),
@@ -314,8 +356,31 @@ async fn bind(
     Ok(())
 }
 
+/// The id of a bound Entity, after Retrieve Entity of the target's set
+/// reads it under the view: hidden, absent and of another type are the
+/// same `404` (T-3441 section 6, O15).
+pub(crate) async fn visible(
+    reads: &Reads,
+    caller: &Caller,
+    target: &Target,
+    version: ODataVersion,
+) -> Result<String, ODataErrorResponse> {
+    let set = set_of(reads, &target.set, version)?;
+    let urn = id_of(&target.key, version)?;
+    run(
+        reads,
+        caller,
+        OperationId::RetrieveEntity,
+        typed(&format!("/ngsi-ld/v1/entities/{}", encode(&urn)), set),
+        &Translated::default(),
+        version,
+    )
+    .await?;
+    Ok(urn)
+}
+
 /// Runs one write operation; its status alone counts.
-async fn send(
+pub(crate) async fn send(
     reads: &Reads,
     caller: &Caller,
     op: OperationId,
@@ -337,12 +402,12 @@ async fn send(
 
 /// `target` narrowed to the set's type: an Entity of another type is not
 /// known to the operation (5.6.6.4), tested under the store's row lock.
-fn typed(target: &str, set: &Set) -> String {
+pub(crate) fn typed(target: &str, set: &Set) -> String {
     format!("{target}?type={}", encode(&set.type_iri))
 }
 
 /// The id a key names; another key form names no Entity.
-fn id_of(key: &Key, version: ODataVersion) -> Result<String, ODataErrorResponse> {
+pub(crate) fn id_of(key: &Key, version: ODataVersion) -> Result<String, ODataErrorResponse> {
     crate::read::key_id(key, &QueryOptions::default()).ok_or_else(|| not_found(version))
 }
 
@@ -352,7 +417,7 @@ fn invalid_key() -> BodyError {
     }
 }
 
-fn body_error(error: &BodyError, version: ODataVersion) -> ODataErrorResponse {
+pub(crate) fn body_error(error: &BodyError, version: ODataVersion) -> ODataErrorResponse {
     ODataErrorResponse {
         status: StatusCode::from_u16(error.status()).unwrap_or(StatusCode::BAD_REQUEST),
         error: ODataError::from(error),
@@ -360,7 +425,7 @@ fn body_error(error: &BodyError, version: ODataVersion) -> ODataErrorResponse {
     }
 }
 
-fn no_content(version: ODataVersion) -> Response {
+pub(crate) fn no_content(version: ODataVersion) -> Response {
     (
         StatusCode::NO_CONTENT,
         [("odata-version", HeaderValue::from_static(version.as_str()))],
@@ -379,6 +444,7 @@ mod tests {
         let member = |iri: &str, shape| Member {
             iri: iri.into(),
             shape,
+            list: false,
         };
         let set = Set {
             type_iri: "https://e.org/T".into(),

@@ -312,8 +312,8 @@ const SCHEMA: &str = r#"{
   "id": "https://example.org/matrix", "name": "matrix",
   "prefixes": {"d": {"prefix_prefix": "d", "prefix_reference": "https://uri.etsi.org/ngsi-ld/default-context/"}},
   "default_prefix": "d",
-  "classes": {"Vehicle": {"slots": ["speed", "secret"]}},
-  "slots": {"speed": {"range": "integer"}, "secret": {}}
+  "classes": {"Vehicle": {"slots": ["speed", "secret", "owner"]}},
+  "slots": {"speed": {"range": "integer"}, "secret": {}, "owner": {"range": "Vehicle"}}
 }"#;
 
 /// The OData surface, in a build that has it.
@@ -358,7 +358,7 @@ async fn broker(engine: Clauses, writes: &HashSet<String>) -> (Router, antares_o
         .filter(|id| !writes.contains(*id))
         .collect();
     for (id, attributes, operations) in [
-        ("all", vec!["speed", HIDDEN], all),
+        ("all", vec!["speed", HIDDEN, "owner"], all),
         ("restricted", vec!["speed"], reads),
     ] {
         let doc = json!({"id": id, "tenant": TENANT, "selector": ["Vehicle"],
@@ -503,8 +503,10 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
         /// the engine once, with the row's clause; under `restricted`,
         /// which offers no write, 405 before the engine.
         Write(&'static str),
-        /// The named task's: refused before the engine.
-        Later(&'static str),
+        /// A `$ref` write with this body: under `all` the target read
+        /// (5.7.1) and then the row's clause; under `restricted`, whose
+        /// model has no navigation, 404 before the engine.
+        Linked(&'static str),
     }
     let sent: &[(&str, &str, String, Want)] = &[
         (
@@ -561,26 +563,26 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
         (
             "append_attributes",
             "PUT",
-            format!("{KEY}/speed"),
-            Want::Later("T-3509"),
+            format!("{KEY}/owner/$ref"),
+            Want::Linked(r#"{"@odata.id": "Vehicle('urn:ngsi-ld:Vehicle:matrix:1')"}"#),
         ),
         (
             "partial_attribute_update",
             "PATCH",
             format!("{KEY}/speed"),
-            Want::Later("T-3509"),
+            Want::Write(r#"{"value": 5}"#),
         ),
         (
             "replace_attribute",
             "PUT",
             format!("{KEY}/speed"),
-            Want::Later("T-3509"),
+            Want::Write(r#"{"value": 6}"#),
         ),
         (
             "delete_attribute",
             "DELETE",
             format!("{KEY}/speed"),
-            Want::Later("T-3509"),
+            Want::Write(""),
         ),
     ];
     let text = std::fs::read_to_string(MATRIX).expect("the operation matrix");
@@ -608,7 +610,7 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
                 continue;
             }
             let body = match want {
-                Want::Write(body) => body,
+                Want::Write(body) | Want::Linked(body) => body,
                 _ if *method == "GET" || *method == "DELETE" => "",
                 _ => "{}",
             };
@@ -653,6 +655,22 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
                         "{cell}: {status} {answer} after {seen:?}, the row's clause is {clause:?}"
                     ));
                 }
+                Want::Linked(_)
+                    if view == "all"
+                        && (!status.is_success()
+                            || seen.first() != Some(&"5.7.1")
+                            || seen.get(1..) != Some(&clause[..])) =>
+                {
+                    wrong.push(format!(
+                        "{cell}: {status} {answer} after {seen:?}, the target read and then {clause:?}"
+                    ));
+                }
+                Want::Linked(_)
+                    if view == "restricted"
+                        && (status != StatusCode::NOT_FOUND || !seen.is_empty()) =>
+                {
+                    wrong.push(format!("{cell}: answered {status} after {seen:?}"));
+                }
                 Want::Write(_)
                     if view == "restricted"
                         && (status != StatusCode::METHOD_NOT_ALLOWED || !seen.is_empty()) =>
@@ -661,18 +679,13 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
                         "{cell}: a write the view does not offer answered {status} after {seen:?}"
                     ));
                 }
-                Want::Later(task) if !seen.is_empty() || ![405, 501].contains(&status.as_u16()) => {
-                    wrong.push(format!(
-                        "{cell}: {task}'s, answered {status} after {seen:?}"
-                    ));
-                }
                 _ => {}
             }
             if view == "restricted" && answer.contains(HIDDEN) {
                 wrong.push(format!("{cell}: the hidden Attribute is in {answer}"));
             }
             assert!(
-                read != matches!(want, Want::Write(_) | Want::Later(_)),
+                read != matches!(want, Want::Write(_) | Want::Linked(_)),
                 "{cell}: a read sent as a write or a write as a read"
             );
         }

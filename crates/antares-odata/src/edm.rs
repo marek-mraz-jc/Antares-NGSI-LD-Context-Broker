@@ -125,6 +125,9 @@ pub struct Member {
     pub iri: String,
     /// How it maps.
     pub shape: Shape,
+    /// The slot is a `ListProperty` or a `ListRelationship`: a write
+    /// keeps the kind (`valueList`, `objectList`).
+    pub list: bool,
 }
 
 /// One EntitySet: its Entity type and the members the view shows of it.
@@ -226,6 +229,7 @@ pub fn build(
                 Member {
                     iri: slot_iri,
                     shape,
+                    list: schema.kind(&slot).starts_with("List"),
                 },
             );
         }

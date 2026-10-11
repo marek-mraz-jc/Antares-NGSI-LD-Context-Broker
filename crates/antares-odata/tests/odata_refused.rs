@@ -69,7 +69,7 @@ const ROWS: &[(&str, &str, &str, Headers)] = &[
     (
         "odata_stream_properties",
         "PUT",
-        "Car('urn:ngsi-ld:Car:1')/speed",
+        "Car('urn:ngsi-ld:Car:1')/speed/$value",
         &[],
     ),
     ("odata_batch_atomicity", "POST", "$batch", &[]),

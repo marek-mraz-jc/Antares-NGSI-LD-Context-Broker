@@ -5,145 +5,13 @@
 //! a hidden target and an absent one answer the same 404 and nothing is
 //! written; the forms no operation stands behind are refused before any.
 
-use antares_ops::test_kit::TestBroker;
+mod writes;
+
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use axum::Router;
-use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
-
-const CITY: &str = "https://example.org/city/";
-const ROOT: &str = "/x/views/cars/odata/v4";
-
-const SCHEMA: &str = r#"{
-  "id": "https://example.org/city", "name": "city",
-  "prefixes": {"city": {"prefix_prefix": "city", "prefix_reference": "https://example.org/city/"}},
-  "default_prefix": "city",
-  "classes": {"Car": {"slots": ["speed", "label", "owner", "drivers", "garage", "location", "notes", "colour"]},
-              "Person": {"slots": ["name"]}, "Garage": {"slots": ["name"]}},
-  "slots": {"speed": {"range": "float"}, "label": {"range": "string"}, "owner": {"range": "Person"},
-            "name": {}, "garage": {"range": "Garage"}, "drivers": {"range": "Person", "multivalued": true},
-            "location": {"annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}}},
-            "notes": {"annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "JsonProperty"}}},
-            "colour": {"annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "VocabProperty"}}}}
-}"#;
-
-async fn send(app: &Router, method: Method, uri: &str, body: Option<&str>) -> (StatusCode, Value) {
-    let mut req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("NGSILD-Tenant", "city")
-        // A 4.0 model has no `Edm.Untyped` member (`notes`).
-        .header("OData-MaxVersion", "4.01");
-    if let Some(b) = body {
-        req = req
-            .header("Content-Type", "application/json")
-            .header("Content-Length", b.len());
-    }
-    let Ok(resp) = app
-        .clone()
-        .oneshot(
-            req.body(Body::from(body.unwrap_or_default().to_owned()))
-                .unwrap_or_default(),
-        )
-        .await;
-    let status = resp.status();
-    let bytes = resp
-        .into_body()
-        .collect()
-        .await
-        .map(http_body_util::Collected::to_bytes)
-        .unwrap_or_default();
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    (
-        status,
-        serde_json::from_str(&text).unwrap_or(Value::String(text)),
-    )
-}
-
-fn person(n: u32, scope: &str) -> Value {
-    json!({"id": format!("urn:ngsi-ld:Person:{n}"), "type": format!("{CITY}Person"), "scope": scope,
-           format!("{CITY}name"): {"type": "Property", "value": format!("p{n}")}})
-}
-
-/// View `cars` shows Cars and Persons in scope `/a` and offers the entity
-/// writes; view `reads` shows the same and offers reads only. Person:1 is
-/// in view, Person:2 out of its scope; Car:1 in view, Car:2 out of it.
-async fn city() -> Result<(TestBroker, Router), String> {
-    std::env::set_var("ANTARES_SCHEMA_MAX_BYTES", "65536");
-    let b = TestBroker::new().await?;
-    let app = b.serve(antares_odata::OData)?;
-    let reads = ["query_entities", "retrieve_entity"];
-    let writes = [
-        "create_entity",
-        "merge_entity",
-        "replace_entity",
-        "delete_entity",
-    ];
-    let mut puts = Vec::new();
-    for (id, operations) in [
-        ("cars", reads.iter().chain(&writes).collect::<Vec<_>>()),
-        ("reads", reads.iter().collect()),
-    ] {
-        let view = json!({
-            "id": id, "tenant": "city", "@context": {"city": CITY},
-            "selector": ["city:Car", "city:Person"],
-            "scopeQ": "/a",
-            "rules": [{"types": ["city:Car"],
-                       "attributes": ["city:speed", "city:label", "city:owner", "city:drivers", "city:garage",
-                                      "city:location", "city:notes", "city:colour"]},
-                      {"types": ["city:Person"], "attributes": ["city:name"]}],
-            "operations": operations
-        });
-        puts.push((format!("/q/views/{id}"), view.to_string()));
-    }
-    puts.push(("/q/schemas/city".into(), SCHEMA.into()));
-    for (uri, body) in &puts {
-        let (status, answer) = send(&app, Method::PUT, uri, Some(body)).await;
-        if status != StatusCode::CREATED {
-            return Err(format!("{uri}: {status} {answer}"));
-        }
-    }
-    let car = |n: u32, scope: &str| {
-        json!({"id": format!("urn:ngsi-ld:Car:{n}"), "type": format!("{CITY}Car"), "scope": scope,
-               format!("{CITY}speed"): {"type": "Property", "value": 1.0},
-               format!("{CITY}label"): {"type": "Property", "value": "one"}})
-    };
-    for entity in [person(1, "/a"), person(2, "/b"), car(1, "/a"), car(2, "/b")] {
-        let (status, answer) = send(
-            &app,
-            Method::POST,
-            "/ngsi-ld/v1/entities",
-            Some(&entity.to_string()),
-        )
-        .await;
-        if status != StatusCode::CREATED {
-            return Err(format!("{:?}: {status} {answer}", entity.get("id")));
-        }
-    }
-    Ok((b, app))
-}
-
-/// The Entity as the broker holds it, outside any view.
-async fn stored(app: &Router, id: &str) -> (StatusCode, Value) {
-    send(
-        app,
-        Method::GET,
-        &format!("/ngsi-ld/v1/entities/{id}"),
-        None,
-    )
-    .await
-}
-
-async fn odata(
-    app: &Router,
-    method: Method,
-    path: &str,
-    body: Option<&str>,
-) -> (StatusCode, Value) {
-    send(app, method, &format!("{ROOT}/{path}"), body).await
-}
+use writes::{city, odata, send, stored, CITY, ROOT};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn odata_writes_an_entity_through_its_view() {
@@ -580,6 +448,150 @@ async fn odata_each_member_is_written_in_its_own_ngsi_ld_form() {
         assert!(
             car.get(format!("{CITY}{name}")).is_none(),
             "the NGSI-LD Null deletes {name}: {car}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_writes_one_property_in_its_own_kind() {
+    let (_b, app) = city().await.expect("broker");
+    let one = "Car('urn:ngsi-ld:Car:1')";
+    let attr = |car: &Value, name: &str| {
+        car.get(format!("{CITY}{name}"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    // The attribute writes change what the Entity holds; a merge adds.
+    let (status, answer) = odata(
+        &app,
+        Method::PATCH,
+        one,
+        Some(r#"{"tags": ["a"], "colour": "red"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    for (method, path, body) in [
+        (Method::PUT, "speed", r#"{"value": 8}"#),
+        (Method::PATCH, "label", r#"{"value": "two"}"#),
+        (Method::PATCH, "tags", r#"{"value": ["x", "y"]}"#),
+        (Method::DELETE, "colour/$value", ""),
+    ] {
+        let body = Some(body).filter(|b| !b.is_empty());
+        let (status, answer) = odata(&app, method.clone(), &format!("{one}/{path}"), body).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{method} {path}: {answer}");
+    }
+    let (_, car) = stored(&app, "urn:ngsi-ld:Car:1").await;
+    assert_eq!(
+        attr(&car, "speed"),
+        json!({"type": "Property", "value": 8}),
+        "{car}"
+    );
+    assert_eq!(attr(&car, "label")["value"], "two", "{car}");
+    assert_eq!(
+        (
+            &attr(&car, "tags")["type"],
+            &attr(&car, "tags")["valueList"]
+        ),
+        (&json!("ListProperty"), &json!(["x", "y"])),
+        "a ListProperty keeps its kind: {car}"
+    );
+    // `null` is the NGSI-LD Null: the partial update removes the value.
+    let (status, answer) = odata(
+        &app,
+        Method::PATCH,
+        &format!("{one}/speed"),
+        Some(r#"{"value": null}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let (_, car) = stored(&app, "urn:ngsi-ld:Car:1").await;
+    assert_eq!(attr(&car, "speed"), Value::Null, "{car}");
+    let (status, answer) = odata(&app, Method::DELETE, &format!("{one}/label"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{answer}");
+    let (_, car) = stored(&app, "urn:ngsi-ld:Car:1").await;
+    assert_eq!(attr(&car, "label"), Value::Null, "{car}");
+    let (status, answer) = odata(
+        &app,
+        Method::PUT,
+        &format!("{one}/label"),
+        Some(r#"{"value": "back"}"#),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "Replace Attribute sets only what the Entity holds; a merge adds it: {answer}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_a_property_no_write_may_name_is_refused_before_any_operation() {
+    let (_b, app) = city().await.expect("broker");
+    let one = "Car('urn:ngsi-ld:Car:1')";
+    for (method, path, body, want) in [
+        (
+            Method::PUT,
+            "garage",
+            Some(r#"{"value": "urn:ngsi-ld:Garage:1"}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (Method::DELETE, "garage", None, StatusCode::BAD_REQUEST),
+        (
+            Method::PUT,
+            "createdAt",
+            Some(r#"{"value": "2026-01-01T00:00:00Z"}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (Method::DELETE, "id", None, StatusCode::BAD_REQUEST),
+        (
+            Method::PUT,
+            "speed",
+            Some(r#"{"value": "fast"}"#),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::PUT,
+            "speed/$value",
+            Some("8"),
+            StatusCode::NOT_IMPLEMENTED,
+        ),
+        (
+            Method::PATCH,
+            "speed/$value",
+            Some("8"),
+            StatusCode::NOT_IMPLEMENTED,
+        ),
+    ] {
+        let (status, answer) = odata(&app, method.clone(), &format!("{one}/{path}"), body).await;
+        assert_eq!(status, want, "{method} {path}: {answer}");
+    }
+    let mut answers = Vec::new();
+    for id in ["urn:ngsi-ld:Car:2", "urn:ngsi-ld:Car:99"] {
+        for (method, body) in [
+            (Method::PUT, Some(r#"{"value": 3}"#)),
+            (Method::DELETE, None),
+        ] {
+            let (status, answer) =
+                odata(&app, method.clone(), &format!("Car('{id}')/speed"), body).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {id}: {answer}");
+            answers.push(answer);
+        }
+    }
+    assert!(answers.windows(2).all(|w| w[0] == w[1]), "{answers:?}");
+    let (status, answer) = send(
+        &app,
+        Method::PUT,
+        &format!("/x/views/reads/odata/v4/{one}/speed"),
+        Some(r#"{"value": 3}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{answer}");
+    for id in ["urn:ngsi-ld:Car:1", "urn:ngsi-ld:Car:2"] {
+        let (_, car) = stored(&app, id).await;
+        assert_eq!(
+            car[format!("{CITY}speed")]["value"],
+            1.0,
+            "{id} unchanged: {car}"
         );
     }
 }
