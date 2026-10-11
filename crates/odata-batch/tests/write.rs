@@ -148,6 +148,8 @@ mod write {
         refused(response(Some("1\n"), 200, &[], b""));
         refused(response(None, 200, &[], b"a\r\n--r--\r\n"));
         refused(response(None, 200, &[], b"--r--"));
+        // A reader that takes LF framing would cut here too.
+        refused(response(None, 200, &[], b"a\n--r"));
         let mut out = sink();
         let good_then_bad = [
             response(None, 200, &[], b""),

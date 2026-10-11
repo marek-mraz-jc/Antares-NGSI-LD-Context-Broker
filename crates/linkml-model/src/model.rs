@@ -162,6 +162,38 @@ const KINDS: [&str; 8] = [
 /// The annotation tag that states a slot's NGSI-LD kind (DM-05).
 pub const KIND_TAG: &str = "ngsi_ld_kind";
 
+/// The annotation tag that narrows a slot's Edm type where the LinkML subset
+/// has no type of its own (T-3720, T-3722): see [`edm_types`].
+pub const EDM_TYPE_TAG: &str = "edm_type";
+
+/// The annotation tags whose value is `"true"` or `"false"` (T-3722): a
+/// slot's `odata_computed`, `odata_immutable`; a class's
+/// `odata_insertable`, `odata_updatable`, `odata_deletable`.
+pub const FLAG_TAGS: [&str; 5] = [
+    "odata_computed",
+    "odata_immutable",
+    "odata_insertable",
+    "odata_updatable",
+    "odata_deletable",
+];
+
+/// The Edm types an `edm_type` annotation may name on a slot of range `b`.
+///
+/// ```
+/// use linkml_model::{edm_types, Builtin};
+/// assert!(edm_types(Builtin::Integer).contains(&"Edm.Int16"));
+/// assert!(edm_types(Builtin::Boolean).is_empty());
+/// ```
+#[must_use]
+pub fn edm_types(b: Builtin) -> &'static [&'static str] {
+    match b {
+        Builtin::Integer => &["Edm.Byte", "Edm.SByte", "Edm.Int16", "Edm.Int32"],
+        Builtin::Float | Builtin::Double => &["Edm.Single"],
+        Builtin::String => &["Edm.Guid", "Edm.Duration", "Edm.Binary"],
+        _ => &[],
+    }
+}
+
 /// A schema that passed every load check: names, references, ranges, IRIs,
 /// limits. The writers render only a `Model`, so none of them can fail.
 ///
@@ -426,6 +458,7 @@ fn refine(slot: &mut Slot, usage: &Slot) {
     over(&mut slot.range, usage.range.as_ref());
     over(&mut slot.required, usage.required.as_ref());
     over(&mut slot.multivalued, usage.multivalued.as_ref());
+    over(&mut slot.identifier, usage.identifier.as_ref());
     over(&mut slot.inlined, usage.inlined.as_ref());
     over(&mut slot.inverse, usage.inverse.as_ref());
     over(&mut slot.unit, usage.unit.as_ref());
@@ -615,6 +648,65 @@ fn check_slot(schema: &Schema, what: &str, slot: &Slot) -> Result<(), Error> {
                 a.value
             ));
         }
+        let allowed = match range(schema, slot.range.as_deref()) {
+            Some(Range::Type(b)) => edm_types(b),
+            _ => &[],
+        };
+        if tag == EDM_TYPE_TAG && !allowed.contains(&a.value.as_str()) {
+            return malformed(format!(
+                "{what}: {EDM_TYPE_TAG} {:?} is not one of {allowed:?} for its range",
+                a.value
+            ));
+        }
+        check_flag(what, tag, &a.value)?;
+    }
+    Ok(())
+}
+
+/// A tag of [`FLAG_TAGS`] holds `"true"` or `"false"`.
+fn check_flag(what: &str, tag: &str, value: &str) -> Result<(), Error> {
+    if FLAG_TAGS.contains(&tag) && !matches!(value, "true" | "false") {
+        return malformed(format!(
+            "{what}: {tag} {value:?} is neither \"true\" nor \"false\""
+        ));
+    }
+    Ok(())
+}
+
+/// At most one identifier per class, ancestors included, and it is one
+/// plain value: a single-valued `string`, `integer`, `uri` or `uriorcurie`
+/// Property (T-3720).
+fn check_identifier(schema: &Schema, what: &str, slots: &[(&str, Slot)]) -> Result<(), Error> {
+    let ids: Vec<&(&str, Slot)> = slots
+        .iter()
+        .filter(|(_, s)| s.identifier == Some(true))
+        .collect();
+    if let [_, second, ..] = ids.as_slice() {
+        return malformed(format!("{what}: a second identifier {:?}", second.0));
+    }
+    let Some((name, slot)) = ids.first() else {
+        return Ok(());
+    };
+    let plain = matches!(
+        range(schema, slot.range.as_deref()),
+        Some(Range::Type(
+            Builtin::String | Builtin::Integer | Builtin::Uri | Builtin::Uriorcurie
+        ))
+    );
+    // A key is compared as its literal: a GUID or an integer, not a
+    // duration or a binary.
+    let keyable = slot
+        .annotations
+        .get(EDM_TYPE_TAG)
+        .is_none_or(|a| !matches!(a.value.as_str(), "Edm.Duration" | "Edm.Binary"));
+    let kind = slot
+        .annotations
+        .get(KIND_TAG)
+        .map_or("Property", |a| a.value.as_str());
+    if !plain || !keyable || slot.multivalued == Some(true) || kind != "Property" {
+        return malformed(format!(
+            "{what}: identifier {name:?} must be a single-valued string, integer, uri or uriorcurie Property"
+        ));
     }
     Ok(())
 }
@@ -684,6 +776,10 @@ fn validate(schema: &Schema) -> Result<(), Error> {
         if let Some(s) = class.slots.iter().find(|s| !schema.slots.contains_key(*s)) {
             return malformed(format!("{what}: slot {s:?} is not declared"));
         }
+        for (tag, a) in &class.annotations {
+            check_key(&format!("{what} annotation"), tag, Some(&a.tag))?;
+            check_flag(&what, tag, &a.value)?;
+        }
         let own = class_slots(schema, key);
         for (name, usage) in &class.slot_usage {
             check_key(&format!("{what} slot_usage"), name, usage.name.as_deref())?;
@@ -694,6 +790,7 @@ fn validate(schema: &Schema) -> Result<(), Error> {
             }
             check_slot(schema, &format!("{what} slot_usage {name:?}"), usage)?;
         }
+        check_identifier(schema, &what, &own)?;
     }
     for (key, e) in &schema.enums {
         check_key("enum", key, e.name.as_deref())?;

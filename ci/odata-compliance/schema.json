@@ -41,7 +41,19 @@
         "Category",
         "Descriptions",
         "RelatedProducts"
-      ]
+      ],
+      "slot_usage": {
+        "Name": {
+          "description": "Product display name",
+          "required": true
+        },
+        "Description": {
+          "description": "Detailed product description"
+        },
+        "Price": {
+          "required": true
+        }
+      }
     },
     "Categories": {
       "slots": [
@@ -58,7 +70,12 @@
         "LongText",
         "CustomName",
         "Product"
-      ]
+      ],
+      "slot_usage": {
+        "Description": {
+          "required": true
+        }
+      }
     },
     "MediaItems": {
       "slots": [
@@ -72,7 +89,21 @@
       "slots": [
         "ID",
         "Name"
-      ]
+      ],
+      "annotations": {
+        "odata_insertable": {
+          "tag": "odata_insertable",
+          "value": "false"
+        },
+        "odata_updatable": {
+          "tag": "odata_updatable",
+          "value": "false"
+        },
+        "odata_deletable": {
+          "tag": "odata_deletable",
+          "value": "false"
+        }
+      }
     },
     "DecimalSamples": {
       "slots": [
@@ -101,7 +132,14 @@
   },
   "slots": {
     "ID": {
-      "range": "string"
+      "range": "string",
+      "identifier": true,
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.Guid"
+        }
+      }
     },
     "Name": {
       "range": "string"
@@ -113,19 +151,49 @@
       "range": "float"
     },
     "Rating": {
-      "range": "integer"
+      "range": "integer",
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.Byte"
+        }
+      }
     },
     "Temperature": {
-      "range": "integer"
+      "range": "integer",
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.SByte"
+        }
+      }
     },
     "Quantity": {
-      "range": "integer"
+      "range": "integer",
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.Int16"
+        }
+      }
     },
     "Weight": {
-      "range": "float"
+      "range": "float",
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.Single"
+        }
+      }
     },
     "Data": {
-      "range": "string"
+      "range": "string",
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.Binary"
+        }
+      }
     },
     "ReleaseDate": {
       "range": "date"
@@ -134,31 +202,79 @@
       "range": "time"
     },
     "ShippingTime": {
-      "range": "string"
+      "range": "string",
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.Duration"
+        }
+      }
     },
     "ProcessingTime": {
-      "range": "string"
+      "range": "string",
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.Duration"
+        }
+      }
     },
     "Offset": {
-      "range": "string"
+      "range": "string",
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.Duration"
+        }
+      }
     },
     "CategoryID": {
-      "range": "string"
+      "range": "string",
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.Guid"
+        }
+      }
     },
     "Status": {
-      "range": "integer"
+      "range": "integer",
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.Int32"
+        }
+      }
     },
     "Version": {
       "range": "integer"
     },
     "CreatedAt": {
-      "range": "datetime"
+      "range": "datetime",
+      "annotations": {
+        "odata_computed": {
+          "tag": "odata_computed",
+          "value": "true"
+        }
+      }
     },
     "SerialNumber": {
-      "range": "string"
+      "range": "string",
+      "annotations": {
+        "odata_immutable": {
+          "tag": "odata_immutable",
+          "value": "true"
+        }
+      }
     },
     "ProductType": {
-      "range": "string"
+      "range": "string",
+      "annotations": {
+        "odata_immutable": {
+          "tag": "odata_immutable",
+          "value": "true"
+        }
+      }
     },
     "SpecialProperty": {
       "range": "string"
@@ -202,7 +318,13 @@
       "range": "string"
     },
     "ProductID": {
-      "range": "string"
+      "range": "string",
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.Guid"
+        }
+      }
     },
     "LanguageKey": {
       "range": "string"
