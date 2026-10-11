@@ -21,6 +21,7 @@
 //!     url_limits: odata_url::Limits::strict(),
 //!     csdl_limits: odata_csdl::Limits::strict(),
 //!     max_header_len: 1024,
+//!     metadata_etag: None,
 //! };
 //! // `nest_service`, so both `/odata` and the service root URL `/odata/` reach `GET /`.
 //! let app: axum::Router = axum::Router::new().nest_service("/odata", metadata_router(Arc::new(state)));
@@ -51,6 +52,7 @@ use odata_url::{EdmModel, Format, LimitKind, ODataUri, QueryOptions, UrlError, U
 ///     url_limits: odata_url::Limits::strict(),
 ///     csdl_limits: odata_csdl::Limits::strict(),
 ///     max_header_len: 1024,
+///     metadata_etag: None,
 /// };
 /// assert!(state.service_root.ends_with('/'));
 /// ```
@@ -66,6 +68,9 @@ pub struct ODataState {
     pub csdl_limits: odata_csdl::Limits,
     /// Bytes of one `OData-Version`, `OData-MaxVersion` or `Accept` header this service reads.
     pub max_header_len: usize,
+    /// The XML metadata document's `ETag` ([`metadata_etag`]), written as
+    /// `@odata.metadataEtag` in every JSON answer; `None` writes none.
+    pub metadata_etag: Option<String>,
 }
 
 /// A request's URL, parsed against the service's model, and the version its response is
@@ -87,6 +92,7 @@ pub struct ODataState {
 /// #     url_limits: odata_url::Limits::strict(),
 /// #     csdl_limits: odata_csdl::Limits::strict(),
 /// #     max_header_len: 1024,
+/// #     metadata_etag: None,
 /// # };
 /// let app: Router = Router::new().route("/{*rest}", get(handler)).with_state(Arc::new(state));
 /// ```
@@ -294,6 +300,7 @@ pub fn url_error(error: &UrlError, path_len: usize) -> ODataErrorResponse {
 /// #     url_limits: odata_url::Limits::strict(),
 /// #     csdl_limits: odata_csdl::Limits::strict(),
 /// #     max_header_len: 1024,
+/// #     metadata_etag: None,
 /// # };
 /// let app: axum::Router = axum::Router::new().nest_service("/odata", odata_axum::metadata_router(Arc::new(state)));
 /// ```
@@ -328,6 +335,7 @@ async fn service_document(
         service_root: &state.service_root,
         level,
         version,
+        metadata_etag: state.metadata_etag.as_deref(),
     };
     let mut out = Vec::new();
     // A Vec takes every byte: the write cannot fail.
@@ -373,18 +381,13 @@ async fn metadata(
 /// The metadata document with its strong `ETag` and `Cache-Control:
 /// private, no-cache` (T-3441 7.4: the bytes may differ per subject, so no
 /// shared cache keeps them), or `304` when `If-None-Match` names it.
-/// ponytail: the tag is the std `SipHash` of the bytes, the same on every pod
-/// of one build; SHA-256 if tags must agree across builds.
 fn revalidated(
     headers: &HeaderMap,
     version: ODataVersion,
     content_type: &'static str,
     body: Vec<u8>,
 ) -> Response {
-    use std::hash::{Hash as _, Hasher as _};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    body.hash(&mut hasher);
-    let etag = format!("\"{:016x}\"", hasher.finish());
+    let etag = etag_of(&body);
     // If-None-Match compares weakly (RFC 9110 13.1.2).
     let matched = headers
         .get_all(IF_NONE_MATCH)
@@ -410,6 +413,26 @@ fn revalidated(
     );
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
     response
+}
+
+/// The strong `ETag` of `$metadata`'s default (XML) representation, the
+/// one `@odata.metadataEtag` names (JSON Format 4.01 section 4.5.2); `None`
+/// when the model is past the writer's limits, as `$metadata` then is.
+#[must_use]
+pub fn metadata_etag(model: &odata_csdl::Model, limits: &odata_csdl::Limits) -> Option<String> {
+    let mut out = Vec::new();
+    odata_csdl::write_xml(model, limits, &mut out).ok()?;
+    Some(etag_of(&out))
+}
+
+/// A strong tag of `body`.
+/// ponytail: the std `SipHash` of the bytes, the same on every pod of one
+/// build; SHA-256 if tags must agree across builds.
+fn etag_of(body: &[u8]) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("\"{:016x}\"", hasher.finish())
 }
 
 /// The JSON metadata level a resource is written at (JSON Format 4.01 section 3.1): `$format`

@@ -59,6 +59,7 @@ pub(crate) async fn serve(
         service_root: &reads.state.service_root,
         level,
         version,
+        metadata_etag: reads.state.metadata_etag.as_deref(),
     };
     let answer = match path.as_slice() {
         [Segment::EntitySet(set)] => {

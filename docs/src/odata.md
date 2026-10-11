@@ -36,7 +36,10 @@ an error: a hidden type or Attribute and an unknown one answer alike.
 The model is built once per view, shown names, schema revision and OData
 version, and cached (at most 256 models). `$metadata` carries a strong
 `ETag`, answers `If-None-Match` with `304` and is
-`Cache-Control: private, no-cache`.
+`Cache-Control: private, no-cache`. Every JSON answer at `minimal` or
+`full` metadata names the tag of the XML document its version reads as
+`@odata.metadataEtag` (`@metadataEtag` in 4.01), right after the context
+URL, so a client knows when to fetch the model again.
 
 ## 2. Reads
 

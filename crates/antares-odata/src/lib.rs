@@ -104,7 +104,7 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
     let Some(view) = ops.view(&id) else {
         return not_found();
     };
-    let Some((edm, csdl)) = model(&id, &view, csdl_version(&req)) else {
+    let Some((edm, csdl, metadata_etag)) = model(&id, &view, csdl_version(&req)) else {
         return not_found();
     };
     let state = Arc::new(ODataState {
@@ -113,6 +113,7 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
         url_limits: odata_url::Limits::strict(),
         csdl_limits: odata_csdl::Limits::strict(),
         max_header_len: MAX_HEADER_LEN,
+        metadata_etag,
     });
     // The inner router matches its own path; the outer match goes.
     req.extensions_mut().remove::<MatchedPath>();
@@ -222,8 +223,8 @@ async fn query_in_body(req: Request, max: usize) -> Result<Request, ODataErrorRe
 /// add them to the key when the model reads the engine.
 type ModelKey = (String, edm::Shown, u64, bool);
 
-/// A built model and its CSDL document.
-type Built = (Arc<edm::Edm>, Arc<odata_csdl::Model>);
+/// A built model, its CSDL document and that document's `ETag`.
+type Built = (Arc<edm::Edm>, Arc<odata_csdl::Model>, Option<String>);
 
 /// The model of `view` at `version`, built once per key on this pod (O21),
 /// `None` when its Tenant has no schema this surface can read.
@@ -251,7 +252,8 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
         schema_revision = revision,
         "the view's OData model was built"
     );
-    let built = (Arc::new(edm.clone()), Arc::new(edm.csdl));
+    let etag = odata_axum::metadata_etag(&edm.csdl, &odata_csdl::Limits::strict());
+    let built = (Arc::new(edm.clone()), Arc::new(edm.csdl), etag);
     remember(
         &mut CACHE.lock().unwrap_or_else(PoisonError::into_inner),
         MODEL_CACHE,

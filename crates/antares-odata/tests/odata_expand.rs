@@ -415,8 +415,12 @@ async fn text(app: &Router, path: &str) -> (StatusCode, String, String) {
 async fn odata_reads_a_property_its_value_and_the_entities_a_navigation_names() {
     let (_b, app) = city().await.expect("broker");
     let one = "Car('urn:ngsi-ld:Car:1')";
-    let (status, body) = get(&app, &format!("{one}/speed")).await;
+    let (status, mut body) = get(&app, &format!("{one}/speed")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let tag = body
+        .as_object_mut()
+        .and_then(|o| o.remove("@odata.metadataEtag"));
+    assert!(tag.is_some_and(|t| t.is_string()), "{body}");
     assert_eq!(
         body,
         json!({"@odata.context": format!("{ROOT}/$metadata#{one}/speed"), "value": 1.0})
@@ -442,7 +446,10 @@ async fn odata_reads_a_property_its_value_and_the_entities_a_navigation_names() 
             .await
             .map(http_body_util::Collected::to_bytes)
             .unwrap_or_default();
-        let got: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let mut got: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        if let Some(o) = got.as_object_mut() {
+            o.remove("@metadataEtag");
+        }
         assert_eq!(got, want, "{headers:?}");
     }
     let (status, kind, raw) = text(&app, &format!("{one}/speed/$value")).await;

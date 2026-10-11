@@ -105,7 +105,7 @@ async fn put_view(app: &Router, id: &str, attrs: &[&str]) -> Result<(), String> 
         "id": id, "tenant": "city", "@context": {"city": "https://example.org/city/"},
         "selector": ["city:Car"],
         "rules": [{"types": ["city:Car"], "attributes": attrs.iter().map(|a| format!("city:{a}")).collect::<Vec<_>>()}],
-        "operations": ["query_entities", "retrieve_entity"]
+        "operations": ["query_entities", "retrieve_entity", "retrieve_attribute_value"]
     })
     .to_string();
     let put = send(
@@ -279,4 +279,94 @@ async fn metadata_etag_changes_when_the_view_changes() {
         "the old tag no longer matches"
     );
     assert_ne!(after.etag, tag);
+}
+
+#[tokio::test]
+async fn every_json_answer_names_the_metadata_etag() {
+    let (_b, app) = broker(&[("tagged", &["speed"])]).await.expect("broker");
+    let car = json!({"id": "urn:ngsi-ld:Car:1", "type": "https://example.org/city/Car",
+        "https://example.org/city/speed": {"type": "Property", "value": 5}})
+    .to_string();
+    let seeded = send(
+        &app,
+        Method::POST,
+        "/ngsi-ld/v1/entities",
+        Some(&car),
+        &[("NGSILD-Tenant", "city")],
+    )
+    .await;
+    assert_eq!(seeded.status, StatusCode::CREATED, "{}", seeded.body);
+    let root = "/x/views/tagged/odata/v4";
+    let xml = send(&app, Method::GET, &format!("{root}/$metadata"), None, &[]).await;
+    assert!(xml.etag.starts_with('"'), "{}", xml.etag);
+    let json_doc = send(
+        &app,
+        Method::GET,
+        &format!("{root}/$metadata?$format=json"),
+        None,
+        &[],
+    )
+    .await;
+    for (path, member) in [
+        ("/", "@odata.metadataEtag"),
+        ("/Car", "@odata.metadataEtag"),
+        ("/Car('urn:ngsi-ld:Car:1')", "@odata.metadataEtag"),
+        ("/Car('urn:ngsi-ld:Car:1')/speed", "@odata.metadataEtag"),
+        (
+            "/Car?$top=1&$format=application/json;odata.metadata=full",
+            "@odata.metadataEtag",
+        ),
+    ] {
+        let answer = send(&app, Method::GET, &format!("{root}{path}"), None, &[]).await;
+        assert_eq!(answer.status, StatusCode::OK, "{path}: {}", answer.body);
+        let body: serde_json::Value = serde_json::from_str(&answer.body).expect("json");
+        assert_eq!(
+            body[member].as_str(),
+            Some(xml.etag.as_str()),
+            "{path}: the default metadata document's tag: {}",
+            answer.body
+        );
+        let first = answer.body.find("\",").map_or(0, |at| at + 2);
+        assert!(
+            answer.body[first..].starts_with(&format!("\"{member}\"")),
+            "{path}: right after the context URL: {}",
+            answer.body
+        );
+    }
+    let v401 = send(
+        &app,
+        Method::GET,
+        &format!("{root}/Car"),
+        None,
+        &[("OData-MaxVersion", "4.01")],
+    )
+    .await;
+    let xml401 = send(
+        &app,
+        Method::GET,
+        &format!("{root}/$metadata"),
+        None,
+        &[("OData-MaxVersion", "4.01")],
+    )
+    .await;
+    assert_ne!(xml401.etag, xml.etag, "a 4.01 document of its own");
+    let v401: serde_json::Value = serde_json::from_str(&v401.body).expect("json");
+    assert_eq!(
+        v401["@metadataEtag"].as_str(),
+        Some(xml401.etag.as_str()),
+        "the tag of the document this version reads: {v401}"
+    );
+    let none = send(
+        &app,
+        Method::GET,
+        &format!("{root}/Car?$format=application/json;odata.metadata=none"),
+        None,
+        &[],
+    )
+    .await;
+    assert!(!none.body.contains("etadataEtag"), "{}", none.body);
+    assert_ne!(
+        json_doc.etag, xml.etag,
+        "each representation its own strong tag"
+    );
 }

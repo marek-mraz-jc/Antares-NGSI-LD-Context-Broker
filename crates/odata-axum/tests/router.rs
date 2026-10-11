@@ -47,6 +47,7 @@ fn state() -> ODataState {
         url_limits: odata_url::Limits::strict(),
         csdl_limits: odata_csdl::Limits::strict(),
         max_header_len: 64,
+        metadata_etag: None,
     }
 }
 
@@ -623,6 +624,42 @@ async fn metadata_carries_a_strong_etag_per_serialisation_and_revalidates() -> R
         status,
         StatusCode::OK,
         "another document's tag does not match"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_service_document_names_the_metadata_documents_tag() -> Result<(), String> {
+    let tag = odata_axum::metadata_etag(&model(), &odata_csdl::Limits::strict());
+    let tagged = ODataState {
+        metadata_etag: tag.clone(),
+        ..state()
+    };
+    let xml = get_with(app(tagged.clone()), "/odata/$metadata", &[]).await?;
+    let request = Request::get("/odata/$metadata")
+        .body(Body::empty())
+        .map_err(|e| e.to_string())?;
+    let response = app(tagged.clone())
+        .oneshot(request)
+        .await
+        .map_err(|e| e.to_string())?;
+    let header = response.headers().get("etag").and_then(|v| v.to_str().ok());
+    assert_eq!(header, tag.as_deref(), "the XML document's own tag");
+    assert_eq!(xml.status, StatusCode::OK);
+    let service = get_with(app(tagged), "/odata/", &[]).await?;
+    let written = format!(
+        r#""@odata.metadataEtag":"{}""#,
+        tag.as_deref().unwrap_or("none").replace('"', "\\\"")
+    );
+    assert!(service.body.contains(&written), "{}", service.body);
+    let past_limits = odata_csdl::Limits {
+        max_elements: 1,
+        ..odata_csdl::Limits::strict()
+    };
+    assert_eq!(
+        odata_axum::metadata_etag(&model(), &past_limits),
+        None,
+        "no document, no tag"
     );
     Ok(())
 }

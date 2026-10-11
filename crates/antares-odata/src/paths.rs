@@ -72,6 +72,10 @@ pub(crate) async fn property(
                 key_segment(&id)
             )),
         );
+        body.extend(
+            ctx.metadata_etag
+                .map(|tag| (control(version, "metadataEtag"), Value::from(tag))),
+        );
     }
     body.insert("value".into(), value);
     Ok(json_response(
