@@ -244,6 +244,38 @@ async fn a_vocab_value_matches_as_the_read_shows_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_hidden_attribute_in_an_evaluated_filter_is_the_400_of_an_unknown_name() {
+    let (_b, app) = broker().await.expect("broker");
+    for form in [
+        "length({})%20eq%201",
+        "{}%20add%201%20gt%200",
+        "{}%20eq%20speed",
+        "{}/any(x:x%20eq%201)",
+    ] {
+        let (hidden_status, hidden) = send(
+            &app,
+            Method::GET,
+            &format!("{ROOT}/Car?$filter={}", form.replace("{}", "secret")),
+            None,
+        )
+        .await;
+        let (unknown_status, unknown) = send(
+            &app,
+            Method::GET,
+            &format!("{ROOT}/Car?$filter={}", form.replace("{}", "nothing")),
+            None,
+        )
+        .await;
+        assert_eq!(hidden_status, StatusCode::BAD_REQUEST, "{form}: {hidden}");
+        assert_eq!(
+            (hidden_status, &hidden),
+            (unknown_status, &unknown),
+            "{form}: V1, O1"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_hidden_attributes_observed_at_is_the_400_of_an_unknown_name() {
     let (_b, app) = broker().await.expect("broker");
     let at = |name: &str| {
@@ -279,10 +311,13 @@ async fn the_forms_these_rows_do_not_cover_stay_501() {
         .filter_map(|e| e["id"].as_str())
         .collect();
     assert_eq!(ids, ["urn:ngsi-ld:Car:1", "urn:ngsi-ld:Car:2"], "{answer}");
-    for filter in [
-        "label%20ne%20'blue'".to_owned(),
-        "tags/any(x:x%20ne%20'a')".to_owned(),
-        "tags/all(x:x%20eq%20'a')".to_owned(),
+    // F23: any lambda over a list is evaluated (T-3749)
+    for (filter, want) in [
+        (
+            "tags/any(x:x%20ne%20'a')",
+            &["urn:ngsi-ld:Car:1", "urn:ngsi-ld:Car:2"][..],
+        ),
+        ("tags/all(x:x%20eq%20'c')", &["urn:ngsi-ld:Car:2"][..]),
     ] {
         let (status, answer) = send(
             &app,
@@ -291,8 +326,23 @@ async fn the_forms_these_rows_do_not_cover_stay_501() {
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{filter}: {answer}");
+        assert_eq!(status, StatusCode::OK, "{filter}: {answer}");
+        let ids: Vec<&str> = answer["value"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e["id"].as_str())
+            .collect();
+        assert_eq!(ids, want, "{filter}: {answer}");
     }
+    let (status, answer) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=label%20ne%20'blue'"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{answer}");
 }
 
 /// T-3758: a caller's `ngsild.georel` takes the one `geoQ`, so the OData geo test is evaluated;
