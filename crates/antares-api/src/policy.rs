@@ -290,6 +290,14 @@ pub struct Rule {
     pub geo_q: Option<Box<GeoQuery>>,
     /// Further areas the Entity must lie in, as [`Filter::geo_also`].
     pub geo_also: Vec<GeoQuery>,
+    /// Entity ids the rule holds for (gap G2). With `id_patterns`, an
+    /// Entity is selected when its id is one of these or matches one of
+    /// them; both empty select every id.
+    pub ids: Vec<String>,
+    /// Regular expressions an Entity id may match instead, each anchored
+    /// at both ends. One that does not compile, or compiles past
+    /// `antares_ql::regex`'s bound, matches nothing (fail closed).
+    pub id_patterns: Vec<String>,
     /// The Attributes an Entity this rule holds for shows.
     pub attributes: Vec<String>,
 }
@@ -298,6 +306,29 @@ impl Rule {
     /// Every area the Entity must lie in: `geo_q` and `geo_also`.
     pub fn areas(&self) -> impl Iterator<Item = &GeoQuery> {
         self.geo_q.as_deref().into_iter().chain(&self.geo_also)
+    }
+
+    /// Whether the rule names `doc` by one of its types and, when it
+    /// narrows ids, by its id. Neither changes over an Entity's history,
+    /// so a temporal instance is selected the same way (unlike the
+    /// condition, [`Rule::is_conditional`]).
+    pub fn selects(&self, doc: &Value) -> bool {
+        entity_types(doc)
+            .iter()
+            .any(|t| self.types.iter().any(|r| r == t))
+            && match doc.get("id").and_then(Value::as_str) {
+                Some(id) => self.selects_id(id),
+                None => self.ids.is_empty() && self.id_patterns.is_empty(),
+            }
+    }
+
+    /// Whether the rule's `ids` and `id_patterns` select `id`.
+    pub fn selects_id(&self, id: &str) -> bool {
+        (self.ids.is_empty() && self.id_patterns.is_empty())
+            || self.ids.iter().any(|i| i == id)
+            || self.id_patterns.iter().any(|p| {
+                antares_ql::regex::compile(&format!("^(?:{p})$")).is_ok_and(|re| re.is_match(id))
+            })
     }
 
     /// Whether the rule has a condition beside its types.
@@ -309,8 +340,7 @@ impl Rule {
     /// expands names to (the broker's internal form: expanded keys, each
     /// Attribute an array of instances).
     pub fn holds(&self, doc: &Value, ctx: &antares_jsonld::Context) -> bool {
-        let types = entity_types(doc);
-        types.iter().any(|t| self.types.iter().any(|r| r == t))
+        self.selects(doc)
             && self
                 .scope_q
                 .as_deref()
@@ -1417,6 +1447,24 @@ mod tests {
 
     fn ctx() -> antares_jsonld::Context {
         antares_jsonld::core_context()
+    }
+
+    /// Gap G2: a rule that narrows ids selects by id, and a document with no
+    /// id only when it narrows none.
+    #[test]
+    fn a_rule_selects_by_type_and_id() {
+        let any = rule("Car", &["speed"]);
+        let one = Rule {
+            ids: vec!["urn:ngsi-ld:Car:1".into()],
+            ..rule("Car", &["speed"])
+        };
+        let doc = car(0.5);
+        let anonymous = json!({"type": [iri("Car")]});
+        assert!(any.selects(&doc) && one.selects(&doc));
+        assert!(any.selects(&anonymous), "no id narrowing, no id needed");
+        assert!(!one.selects(&anonymous), "an id narrowing needs an id");
+        assert!(!one.selects(&json!({"id": "urn:ngsi-ld:Car:2", "type": [iri("Car")]})));
+        assert!(!one.selects(&json!({"id": "urn:ngsi-ld:Car:1", "type": [iri("Bus")]})));
     }
 
     /// ADR-0023 rule 11: the union over the rules that hold, nothing for an
