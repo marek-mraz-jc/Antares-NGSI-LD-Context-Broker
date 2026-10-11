@@ -429,6 +429,14 @@ impl ViewOps {
         self.view.shown_names()
     }
 
+    /// Whether the view shows every type and Attribute (ADR-0023 rule 12):
+    /// [`Self::shown_names`] and [`Self::shown_by_type`] are then empty and a
+    /// surface offers a name by its syntax alone.
+    #[must_use]
+    pub fn shows_every_name(&self) -> bool {
+        self.view.shows_every_name()
+    }
+
     /// Each Entity type the view shows with the Attributes it shows of it,
     /// as expanded IRIs: the union of the view's rules, type by type. A
     /// surface that builds a model from a schema intersects it with this.
