@@ -16,7 +16,7 @@ surfaces:
     status: proposal
   mcp:
     prefix: /x/views/{view}/mcp
-    status: proposal; tool names marked 'exists' are the platform gateway's
+    status: served by antares-mcp, one tool per row (crates/antares-mcp/src/tools.rs TOOLS, T-3656)
   linkml:
     prefix: /x/views/{view}/linkml
     status: proposal, read-only
@@ -85,7 +85,7 @@ operations:
         engine decides on ids/clause only]'
     mcp:
       status: supported
-      binding: create_entity (proposal)
+      binding: create_entity
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -197,7 +197,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: update_attributes (proposal)
+      binding: update_attributes
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -314,7 +314,7 @@ operations:
           is writable under the view'
     mcp:
       status: supported
-      binding: append_attributes (proposal)
+      binding: append_attributes
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -416,8 +416,8 @@ operations:
       gate_site: crates/antares-api/src/attrs.rs:803
     odata:
       status: supported
-      binding: PATCH /x/views/{view}/odata/v4/{EntitySet}('{id}')/{property} (Protocol 11.4.9, T-3441 W11), any property a
-        write may name (the model has no complex type: an inlined class is Edm.Untyped)
+      binding: 'PATCH /x/views/{view}/odata/v4/{EntitySet}(''{id}'')/{property} (Protocol 11.4.9, T-3441 W11), any property a
+        write may name (the model has no complex type: an inlined class is Edm.Untyped)'
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -438,7 +438,7 @@ operations:
         engine decides on ids/clause only]'
     mcp:
       status: supported
-      binding: update_attribute (proposal)
+      binding: update_attribute
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -643,7 +643,7 @@ operations:
         lose it) [not enforced today: the Operation carries no stored image, the engine decides on clause, ids, types (stored and named), attrs]'
     mcp:
       status: supported
-      binding: delete_attribute (proposal)
+      binding: delete_attribute
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -750,7 +750,7 @@ operations:
       post_image: the Entity is absent; the change notifications it triggers pass pre_notify per subscriber
     mcp:
       status: supported
-      binding: delete_entity (proposal)
+      binding: delete_entity
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -863,7 +863,7 @@ operations:
         engine decides on ids/clause only]'
     mcp:
       status: supported
-      binding: merge_entity (proposal)
+      binding: merge_entity
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -994,7 +994,7 @@ operations:
         engine decides on ids/clause only]'
     mcp:
       status: supported
-      binding: replace_entity (proposal)
+      binding: replace_entity
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1123,7 +1123,7 @@ operations:
         engine decides on ids/clause only]'
     mcp:
       status: supported
-      binding: replace_attribute (proposal)
+      binding: replace_attribute
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1335,7 +1335,7 @@ operations:
         engine decides on ids/clause only]'
     mcp:
       status: supported
-      binding: batch_create (proposal)
+      binding: batch_create
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1445,8 +1445,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'upsert_entity (exists: joinedcontext-platform crates/context-gateway/src/mcp/endpoint_facade.rs:320,
-        Operation::UpsertBatch, one entity)'
+      binding: batch_upsert
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1559,7 +1558,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: batch_update (proposal)
+      binding: batch_update
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1675,7 +1674,7 @@ operations:
         image, the engine decides on ids/clause only]'
     mcp:
       status: supported
-      binding: batch_merge (proposal)
+      binding: batch_merge
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1789,7 +1788,7 @@ operations:
       post_image: 'per Entity: absent'
     mcp:
       status: supported
-      binding: batch_delete (proposal)
+      binding: batch_delete
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1889,7 +1888,7 @@ operations:
           ngsi_ld_http cell), and the policy projection applies to it'
     mcp:
       status: supported
-      binding: 'get_entity (exists: endpoint_facade.rs:136, Operation::RetrieveEntity)'
+      binding: get_entity
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -1991,7 +1990,7 @@ operations:
         - $count and NGSILD-Results-Count are computed after the narrowing (count leak)
     mcp:
       status: supported
-      binding: 'query_entities (exists: endpoint_facade.rs:110, Operation::QueryEntity)'
+      binding: query_entities
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2086,7 +2085,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'batch_query (exists: endpoint_facade.rs:212, Operation::QueryBatch)'
+      binding: batch_query
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2178,7 +2177,7 @@ operations:
         - none
     mcp:
       status: supported
-      binding: get_attribute_value (proposal)
+      binding: get_attribute_value
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2266,7 +2265,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'create_subscription (exists: endpoint_facade.rs:411, Operation::CreateSubscription)'
+      binding: create_subscription
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2379,7 +2378,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: update_subscription (proposal)
+      binding: update_subscription
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2471,7 +2470,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'get_subscription (exists: endpoint_facade.rs:391, Operation::RetrieveSubscription)'
+      binding: get_subscription
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2542,7 +2541,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'list_subscriptions (exists: endpoint_facade.rs:238, Operation::QuerySubscription)'
+      binding: list_subscriptions
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2617,7 +2616,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: delete_subscription (proposal)
+      binding: delete_subscription
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2779,7 +2778,7 @@ operations:
         - none
     mcp:
       status: supported
-      binding: 'list_types (exists: endpoint_facade.rs:154, Operation::RetrieveEntityTypes)'
+      binding: list_types
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2853,7 +2852,7 @@ operations:
         - none
     mcp:
       status: supported
-      binding: 'list_types (exists: endpoint_facade.rs:154, Operation::RetrieveEntityTypeDetails)'
+      binding: list_type_details
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2927,7 +2926,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'get_type (exists: endpoint_facade.rs:354, Operation::RetrieveEntityTypeInfo)'
+      binding: get_type
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3001,7 +3000,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'list_attributes (exists: endpoint_facade.rs:172, Operation::RetrieveAttrTypes)'
+      binding: list_attributes
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3073,7 +3072,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'list_attributes (exists: endpoint_facade.rs:172, Operation::RetrieveAttrTypeDetails)'
+      binding: list_attribute_details
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3147,7 +3146,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'get_attribute (exists: endpoint_facade.rs:371, Operation::RetrieveAttrTypeInfo)'
+      binding: get_attribute
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3726,7 +3725,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'retrieve_temporal (exists: endpoint_facade.rs:197, Operation::RetrieveTemporal)'
+      binding: retrieve_temporal
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3805,7 +3804,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'query_temporal (exists: endpoint_facade.rs:190, Operation::QueryTemporal)'
+      binding: query_temporal
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3892,7 +3891,7 @@ operations:
         linked_entity_checks: []
     mcp:
       status: supported
-      binding: 'batch_query_temporal (exists: endpoint_facade.rs:336, Operation::QueryTemporal)'
+      binding: batch_query_temporal
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -5293,21 +5292,14 @@ operations:
         linked_entity_checks:
         - as query_entities
     mcp:
-      status: supported
-      binding: used internally by query_entities paging (the platform tool takes an entityMap argument, endpoint_facade.rs:673)
+      status: not_offered
+      binding: null
       checks:
-        adr0020_phase: on_request
-        operation_fields:
-        - clause
-        - types
-        - attrs
-        - q
-        - scope_q
-        - geo
-        filterable: true
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
         whole_tenant: false
-        linked_entity_checks:
-        - the candidate set is narrowed by the Filter (FILTERABLE); remote maps merged (fed_entity_maps)
+        linked_entity_checks: []
     linkml:
       status: not_offered
       binding: null
