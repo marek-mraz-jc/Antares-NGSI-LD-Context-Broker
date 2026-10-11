@@ -1776,11 +1776,12 @@ mod tests {
             "{q}"
         );
         assert!(!q.contains("attrs="), "{q}");
-        if let Some(geo) = set.members.get_mut("geo") {
-            geo.iri = "https://e.org/~m".into();
-        }
+        set.members
+            .entry("geo".into())
+            .and_modify(|geo| geo.iri = "https://e.org/~m".into());
         let q = query(&set, Some(&["geo"]), &[], &none);
-        assert!(!q.contains("pick=") && !q.contains("attrs="), "{q}");
+        assert!(!q.contains("pick="), "{q}");
+        assert!(!q.contains("attrs="), "{q}");
     }
 
     #[test]

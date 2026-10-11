@@ -528,6 +528,14 @@ async fn a_selection_projects_and_never_selects() {
         ..pushdown()
     };
     let frame = vec!["id".to_owned(), "type".to_owned()];
+    // an IRI is one member name to `pick`, percent-encoded on the way
+    let iri = Pushdown {
+        attrs: Some(vec!["https://example.org/x#seen".into()]),
+        ..pushdown()
+    };
+    let (s, b) = rig.scan((iri, None), "size=1000&whole=1").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(ids(&b), expected(|_| true));
     let (s, b) = rig.scan((seen.clone(), None), "size=1000&whole=1").await;
     assert_eq!(s, StatusCode::OK, "{b}");
     assert_eq!(

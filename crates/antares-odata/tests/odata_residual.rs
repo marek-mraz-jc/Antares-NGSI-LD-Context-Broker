@@ -520,6 +520,15 @@ async fn a_scanned_read_beside_a_join_serves_the_expansion() -> Result<(), Strin
         "{}",
         label.body
     );
+    // a system member selected inside the expansion is read with sysAttrs through the scan
+    let created = get(
+        &app,
+        &format!("{ROOT}/Car?{residual}&$expand=follows($select=createdAt)"),
+        &[],
+    )
+    .await;
+    let follows = &created.body["value"][0]["follows"];
+    assert!(follows["createdAt"].is_string(), "{}", created.body);
     let hop = "$filter=follows/speed%20ge%201%20and%20not%20(speed%20gt%2020)";
     let bare = get(&app, &format!("{ROOT}/Car/$count?{hop}"), &[]).await;
     assert_eq!(bare.body, json!(want.len()), "{}", bare.body);
