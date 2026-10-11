@@ -107,6 +107,7 @@ dependencies = [
  "antares-mcp",
  "antares-model",
  "antares-odata",
+ "antares-ogc",
  "antares-ops",
  "antares-plugin-example",
  "antares-sql",
@@ -237,6 +238,19 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "antares-ogc"
+version = "0.1.3"
+dependencies = [
+ "antares-ops",
+ "axum",
+ "http-body-util",
+ "linkml-model",
+ "serde_json",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
