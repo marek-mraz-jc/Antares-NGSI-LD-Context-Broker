@@ -2667,6 +2667,67 @@ mod tests {
         };
         let out = slide.narrow_window(&p(&[]), false).unwrap();
         assert!(antares_model::dt_key(&out["timeAt"]) >= antares_model::dt_key(&out["endTimeAt"]));
+
+        // the windows are on observedAt: a request on another timeproperty
+        // is answered nothing, even one whose own window overlaps
+        let out = between
+            .narrow_window(
+                &p(&[
+                    ("timerel", "after"),
+                    ("timeAt", "2026-01-01T01:30:00Z"),
+                    ("timeproperty", "modifiedAt"),
+                ]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(out["timeAt"], out["endTimeAt"], "{out:?}");
+        assert_eq!(out["timeAt"], "2026-01-01T01:00:00.000Z", "{out:?}");
+    }
+
+    /// A bound renders to the millisecond 4.11 takes: a start rounds up
+    /// (only ever by less than a millisecond), an end down, an exact
+    /// millisecond stays; a window is half-open on those renderings.
+    #[test]
+    fn a_bound_rounds_only_inward_and_a_window_is_half_open() {
+        let at = |ns: u32| {
+            TimeBound::At(chrono::DateTime::from_timestamp(1_767_225_600, ns).expect("an instant"))
+        };
+        let now = chrono::Utc::now();
+        for (ns, start, end) in [
+            (0, "00.000", "00.000"),
+            (500, "00.001", "00.000"),
+            (999_000, "00.001", "00.000"),
+            (1_000_500, "00.002", "00.001"),
+        ] {
+            assert_eq!(
+                at(ns).render(now, true),
+                format!("2026-01-01T00:00:{start}Z"),
+                "start at {ns} ns"
+            );
+            assert_eq!(
+                at(ns).render(now, false),
+                format!("2026-01-01T00:00:{end}Z"),
+                "end at {ns} ns"
+            );
+        }
+        let w = Window {
+            from: Some(at(0)),
+            to: Some(at(2_000_000)),
+        };
+        assert!(
+            !w.admits("2025-12-31T23:59:59.999Z", now),
+            "before the start"
+        );
+        assert!(
+            w.admits("2026-01-01T00:00:00.000Z", now),
+            "the start is inside"
+        );
+        assert!(w.admits("2026-01-01T00:00:00.001Z", now), "inside");
+        assert!(
+            !w.admits("2026-01-01T00:00:00.002Z", now),
+            "the end is outside"
+        );
+        assert!(!w.admits("2026-01-01T00:00:00.003Z", now), "after the end");
     }
 
     /// G8: the engine's warning travels as one `NGSILD-Warning` value per
@@ -2759,6 +2820,15 @@ mod tests {
                 .holds(&doc("A")),
             "a linked path reads no other Entity inside the write, so it never holds"
         );
+        let scoped = Filter {
+            scope_q: Some("/a".to_owned()),
+            ..Filter::default()
+        };
+        assert!(
+            Condition::of(&scoped).is_some(),
+            "a scopeQ alone selects: it is a condition"
+        );
+        assert!(Condition::of(&Filter::default()).is_none());
         assert!(Condition::unforwarded(Some(&c), false).is_ok());
         assert!(Condition::unforwarded(None, true).is_ok());
         assert_eq!(
