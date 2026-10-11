@@ -38,6 +38,14 @@ reason = "the view store failing: the built-in store under test_kit does not fai
 
 [[exclusion]]
 crate = "antares-ops"
+file = "src/views/preview.rs"
+function = "antares_ops::views::preview::preview"
+lines = 2
+branches = 0
+reason = "the errors of building a request from a query axum already parsed and a tenant the loader validated, and of reading an in-memory body: neither can fail"
+
+[[exclusion]]
+crate = "antares-ops"
 file = "src/views.rs"
 function = "Reloader::reload_or_log" # v0 mangling puts the impl between the crate and the type
 lines = 3

@@ -40,3 +40,4 @@ results*/
 
 # ETSI documents are downloaded, not redistributed (etsi-cim-specs/README.md)
 etsi-cim-specs/*.pdf
+/sbom/
