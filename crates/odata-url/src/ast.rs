@@ -367,6 +367,8 @@ pub enum Literal {
     DateTimeOffset(String),
     /// A time of day, colons normalised.
     TimeOfDay(String),
+    /// A `guid`, its hex digits lower-cased (T-3720).
+    Guid(String),
     /// `geography'SRID=n;Point(...)'` or `...;Polygon(...)'`.
     Geography(Geography),
 }

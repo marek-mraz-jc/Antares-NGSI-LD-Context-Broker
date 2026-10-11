@@ -423,3 +423,110 @@ fn every_builtin_type_round_trips_its_name() {
         assert!(b.xsd().starts_with("xsd:"));
     }
 }
+
+#[test]
+fn one_plain_identifier_per_class_loads() {
+    // T-3720: the slot that keys a class, and the Edm type of a string.
+    let guid = json!({"edm_type": {"tag": "edm_type", "value": "Edm.Guid"}});
+    let mut doc = base();
+    doc["classes"]["Room"] = json!({"slots": ["code", "size"]});
+    doc["slots"]["code"] = json!({"identifier": true, "annotations": guid});
+    let m = load(&doc).unwrap();
+    let slots = m.class_slots("Room");
+    assert_eq!(slots[0].1.identifier, Some(true));
+    assert_eq!(slots[1].1.identifier, None);
+    // A child inherits the key; slot_usage may name it on a class without one.
+    doc["classes"]["Hall"] = json!({"is_a": "Room"});
+    doc["classes"]["Shed"] =
+        json!({"slots": ["size"], "slot_usage": {"size": {"identifier": true}}});
+    let m = load(&doc).unwrap();
+    assert_eq!(m.class_slots("Hall")[0].1.identifier, Some(true));
+    assert_eq!(m.class_slots("Shed")[0].1.identifier, Some(true));
+}
+
+#[test]
+fn an_identifier_that_is_not_one_plain_value_is_malformed() {
+    let room = |slots: Value, code: Value| {
+        let mut doc = base();
+        doc["classes"]["Room"] = json!({"slots": slots});
+        doc["slots"]["code"] = code;
+        doc
+    };
+    let cases = [
+        (
+            "two",
+            room(json!(["code", "size"]), json!({"identifier": true})),
+            Some("size"),
+        ),
+        (
+            "inherited and own",
+            room(json!(["code"]), json!({"identifier": true})),
+            Some("child"),
+        ),
+        (
+            "multivalued",
+            room(
+                json!(["code"]),
+                json!({"identifier": true, "multivalued": true}),
+            ),
+            None,
+        ),
+        (
+            "a class range",
+            room(
+                json!(["code"]),
+                json!({"identifier": true, "range": "Room"}),
+            ),
+            None,
+        ),
+        (
+            "an enum range",
+            room(json!(["code"]), json!({"identifier": true, "range": "E"})),
+            None,
+        ),
+        (
+            "a float",
+            room(
+                json!(["code"]),
+                json!({"identifier": true, "range": "float"}),
+            ),
+            None,
+        ),
+        (
+            "another kind",
+            room(
+                json!(["code"]),
+                json!({"identifier": true, "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}}}),
+            ),
+            None,
+        ),
+        (
+            "a Guid on an integer",
+            room(
+                json!(["code"]),
+                json!({"range": "integer", "annotations": {"edm_type": {"tag": "edm_type", "value": "Edm.Guid"}}}),
+            ),
+            None,
+        ),
+        (
+            "an Edm type outside the list",
+            room(
+                json!(["code"]),
+                json!({"annotations": {"edm_type": {"tag": "edm_type", "value": "Edm.Byte"}}}),
+            ),
+            None,
+        ),
+    ];
+    for (what, mut doc, extra) in cases {
+        match extra {
+            Some("size") => doc["slots"]["size"]["identifier"] = json!(true),
+            Some("child") => {
+                doc["classes"]["Hall"] = json!({"is_a": "Room", "slots": ["size"]});
+                doc["slots"]["size"]["identifier"] = json!(true);
+            }
+            _ => {}
+        }
+        let got = load(&doc);
+        assert!(matches!(got, Err(Error::Malformed(_))), "{what}: {got:?}");
+    }
+}

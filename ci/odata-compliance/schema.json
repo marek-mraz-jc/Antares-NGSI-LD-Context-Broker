@@ -101,7 +101,14 @@
   },
   "slots": {
     "ID": {
-      "range": "string"
+      "range": "string",
+      "identifier": true,
+      "annotations": {
+        "edm_type": {
+          "tag": "edm_type",
+          "value": "Edm.Guid"
+        }
+      }
     },
     "Name": {
       "range": "string"

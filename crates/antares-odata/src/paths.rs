@@ -7,8 +7,8 @@
 use crate::edm::{Member, Set, Shape};
 use crate::filter::Translated;
 use crate::read::{
-    default_instance, encode, entity_value, key_id, member_value, not_found, not_implemented,
-    objects, query, resource, run, selected, set_of, Reads, MAX_PAGE,
+    default_instance, encode, entity_value, key_id, key_segment, member_value, not_found,
+    not_implemented, objects, query, resource, run, selected, set_of, Reads, MAX_PAGE,
 };
 use antares_ops::{core_name, Caller, OperationId};
 use axum::http::{header::CONTENT_TYPE, StatusCode};
@@ -18,7 +18,7 @@ use odata_json::{
     write_collection, write_entity, write_entity_reference, write_entity_references, Ctx,
     EntityValue, MetadataLevel, ODataVersion, Page,
 };
-use odata_url::{Key, KeyValue, Literal, QueryOptions, Segment};
+use odata_url::{Key, QueryOptions};
 use serde_json::{Map, Value};
 
 /// `{Set}('{id}')/{prop}` and `.../{prop}/$value` (Q31): the Attribute
@@ -40,7 +40,7 @@ pub(crate) async fn property(
         .members
         .get(name)
         .ok_or_else(|| not_implemented(version))?;
-    let id = key_id(key, options).ok_or_else(|| not_found(version))?;
+    let id = key_id(set, key, options).ok_or_else(|| not_found(version))?;
     let target = format!(
         "/ngsi-ld/v1/entities/{}/attrs/{}",
         encode(&id),
@@ -69,7 +69,7 @@ pub(crate) async fn property(
             Value::from(format!(
                 "{}$metadata#{set_name}{}/{name}",
                 ctx.service_root,
-                key_segment(&id)
+                key_segment(set, &id)
             )),
         );
         body.extend(
@@ -102,7 +102,7 @@ pub(crate) async fn related(
     let set = set_of(reads, set_name, version)?;
     let (iri, target, collection) = nav_of(set, nav);
     let target_set = set_of(reads, target, version)?;
-    let id = key_id(key, options).ok_or_else(|| not_found(version))?;
+    let id = key_id(set, key, options).ok_or_else(|| not_found(version))?;
     let none = Translated::default();
     // The whole source: with `attrs` naming only the Relationship, an
     // Entity without it would answer 404 like an absent one.
@@ -129,7 +129,7 @@ pub(crate) async fn related(
     if refs {
         let ids: Vec<String> = urns
             .iter()
-            .map(|urn| format!("{target}{}", key_segment(urn)))
+            .map(|urn| format!("{target}{}", key_segment(target_set, urn)))
             .collect();
         // A Vec takes every byte: the writes cannot fail.
         if collection {
@@ -246,13 +246,6 @@ fn raw_text(value: Value) -> Option<String> {
     }
 }
 
-/// `('{id}')`, the canonical key predicate.
-fn key_segment(id: &str) -> Segment {
-    Segment::Key(Key::Single(KeyValue::Literal(Literal::String(
-        id.to_owned(),
-    ))))
-}
-
 /// A control member, `@odata.{name}` in 4.0 and `@{name}` in 4.01.
 fn control(version: ODataVersion, name: &str) -> String {
     match version {
@@ -275,6 +268,7 @@ mod tests {
         };
         let set = Set {
             type_iri: "https://e.org/T".into(),
+            identifier: None,
             members: std::collections::BTreeMap::from([
                 (
                     "nav".into(),

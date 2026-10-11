@@ -162,6 +162,10 @@ const KINDS: [&str; 8] = [
 /// The annotation tag that states a slot's NGSI-LD kind (DM-05).
 pub const KIND_TAG: &str = "ngsi_ld_kind";
 
+/// The annotation tag that names the Edm type of a `string` slot where the
+/// LinkML subset has no type of its own (T-3720): `Edm.Guid`.
+pub const EDM_TYPE_TAG: &str = "edm_type";
+
 /// A schema that passed every load check: names, references, ranges, IRIs,
 /// limits. The writers render only a `Model`, so none of them can fail.
 ///
@@ -426,6 +430,7 @@ fn refine(slot: &mut Slot, usage: &Slot) {
     over(&mut slot.range, usage.range.as_ref());
     over(&mut slot.required, usage.required.as_ref());
     over(&mut slot.multivalued, usage.multivalued.as_ref());
+    over(&mut slot.identifier, usage.identifier.as_ref());
     over(&mut slot.inlined, usage.inlined.as_ref());
     over(&mut slot.inverse, usage.inverse.as_ref());
     over(&mut slot.unit, usage.unit.as_ref());
@@ -615,6 +620,48 @@ fn check_slot(schema: &Schema, what: &str, slot: &Slot) -> Result<(), Error> {
                 a.value
             ));
         }
+        let string = matches!(
+            range(schema, slot.range.as_deref()),
+            Some(Range::Type(Builtin::String))
+        );
+        if tag == EDM_TYPE_TAG && (a.value != "Edm.Guid" || !string) {
+            return malformed(format!(
+                "{what}: {EDM_TYPE_TAG} {:?} needs a string range and names Edm.Guid only",
+                a.value
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// At most one identifier per class, ancestors included, and it is one
+/// plain value: a single-valued `string`, `integer`, `uri` or `uriorcurie`
+/// Property (T-3720).
+fn check_identifier(schema: &Schema, what: &str, slots: &[(&str, Slot)]) -> Result<(), Error> {
+    let ids: Vec<&(&str, Slot)> = slots
+        .iter()
+        .filter(|(_, s)| s.identifier == Some(true))
+        .collect();
+    if let [_, second, ..] = ids.as_slice() {
+        return malformed(format!("{what}: a second identifier {:?}", second.0));
+    }
+    let Some((name, slot)) = ids.first() else {
+        return Ok(());
+    };
+    let plain = matches!(
+        range(schema, slot.range.as_deref()),
+        Some(Range::Type(
+            Builtin::String | Builtin::Integer | Builtin::Uri | Builtin::Uriorcurie
+        ))
+    );
+    let kind = slot
+        .annotations
+        .get(KIND_TAG)
+        .map_or("Property", |a| a.value.as_str());
+    if !plain || slot.multivalued == Some(true) || kind != "Property" {
+        return malformed(format!(
+            "{what}: identifier {name:?} must be a single-valued string, integer, uri or uriorcurie Property"
+        ));
     }
     Ok(())
 }
@@ -694,6 +741,7 @@ fn validate(schema: &Schema) -> Result<(), Error> {
             }
             check_slot(schema, &format!("{what} slot_usage {name:?}"), usage)?;
         }
+        check_identifier(schema, &what, &own)?;
     }
     for (key, e) in &schema.enums {
         check_key("enum", key, e.name.as_deref())?;
