@@ -51,7 +51,7 @@ for entry in "${BENCHES[@]}"; do
   fi
   # view_query exits non-zero when it misses its row; any other non-zero
   # exit, or a bench that printed nothing, did not run
-  if grep -qE ' over\b|OVER|misses its ADR-0027|within HTTP p99: false' "$log"; then
+  if grep -qE ' over\b|OVER|misses its ADR-0027|HTTP p99: false' "$log"; then
     verdict=over
     over=$((over + 1))
   elif [ "$status" -ne 0 ] || [ -z "$number" ]; then
