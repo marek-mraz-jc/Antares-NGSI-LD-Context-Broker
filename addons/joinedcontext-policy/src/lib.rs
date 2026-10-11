@@ -22,9 +22,14 @@
 //! # Ok::<(), String>(())
 //! ```
 
+pub mod access;
 pub mod decide;
 pub mod document;
+pub mod names;
+pub mod odrl;
 pub mod subject;
+pub mod surface;
+pub mod ucast;
 
 use antares_api::policy::{
     Decision, DecisionFuture, NotifyDecision, Operation, PolicyEngine, Subject,
@@ -49,6 +54,14 @@ impl JoinedcontextPolicy {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The engine of this process: the one the broker decides with and the
+    /// access surface reads, so the two answer from one table.
+    #[must_use]
+    pub fn process() -> Arc<Self> {
+        static ENGINE: std::sync::OnceLock<Arc<JoinedcontextPolicy>> = std::sync::OnceLock::new();
+        ENGINE.get_or_init(Arc::default).clone()
     }
 
     /// The compiled document of `tenant`.

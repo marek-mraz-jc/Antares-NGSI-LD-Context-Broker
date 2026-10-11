@@ -61,10 +61,8 @@ pub fn decide(
     let Some(table) = table else {
         return Decision::Deny(NOT_GRANTED.into());
     };
-    let applying: Vec<&Policy> = table
-        .policies
-        .iter()
-        .filter(|p| platform.is(&p.assignee) && p.clauses.contains(op.clause) && p.in_force(now))
+    let applying: Vec<&Policy> = held(table, platform, now)
+        .filter(|p| p.clauses.contains(op.clause))
         .collect();
     let types = entity_types(op);
     // GW6: a refusal names no policy, so a caller cannot map the rules
@@ -93,6 +91,19 @@ pub fn decide(
     }
 }
 
+/// The policies of `table` whose assignee is `caller` and that are in force
+/// at `now`: what a decision starts from, and all the access surface shows.
+pub fn held<'t>(
+    table: &'t Table,
+    caller: &'t Platform,
+    now: DateTime<Utc>,
+) -> impl Iterator<Item = &'t Policy> {
+    table
+        .policies
+        .iter()
+        .filter(move |p| caller.is(&p.assignee) && p.in_force(now))
+}
+
 /// The Entity types an operation names: the request's, and the stored
 /// Entity's for a write by id.
 fn entity_types(op: &Operation<'_>) -> Vec<String> {
@@ -107,7 +118,8 @@ fn entity_types(op: &Operation<'_>) -> Vec<String> {
 
 /// A prohibition covers an operation that names no type, or a type it
 /// names, or every operation when it names none (platform GW4).
-fn covers_types(p: &Policy, types: &[String]) -> bool {
+#[must_use]
+pub fn covers_types(p: &Policy, types: &[String]) -> bool {
     p.selectors.is_empty()
         || types.is_empty()
         || p.selectors
