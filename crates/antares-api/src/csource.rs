@@ -1132,11 +1132,12 @@ pub async fn query_registrations(
         )?;
         let accept = parse_accept(&headers)?;
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(
+        let narrowing = gate!(
             st, &tenant, &headers, "5.10.2",
             scope_q: params.get("scopeQ").map(String::as_str),
         )
         .await?;
+        let cond = crate::policy::Condition::of(&narrowing);
         let bad = NgsiError::BadRequestData;
         let mut spec = CsrSpec::default();
         if let Some(s) = params.get("id") {
@@ -1248,7 +1249,7 @@ pub async fn query_registrations(
                     _ => return false,
                 }
             }
-            csr_matches(&spec, doc, &ctx)
+            csr_matches(&spec, doc, &ctx) && cond.as_ref().is_none_or(|c| c.holds_for_record(doc))
         };
         let matches = collect_matching(&st, &tenant, keep, *crate::bounds::MAX_FOLD_DOCS).await?;
         let (page, count_hdr, links) = crate::paging::paginate_accept(

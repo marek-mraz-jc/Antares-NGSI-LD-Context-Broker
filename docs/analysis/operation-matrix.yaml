@@ -2582,12 +2582,12 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/7/7.13.3.1.md
-      gate_site: crates/antares-api/src/subscriptions.rs:918
+      gate_site: crates/antares-api/src/subscriptions.rs:1028
     odata:
       status: not_offered
       binding: null
@@ -4329,12 +4329,12 @@ operations:
         operation_fields:
         - clause
         - scope_q
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/9/9.2.3.1.md
-      gate_site: crates/antares-api/src/csource.rs:1076
+      gate_site: crates/antares-api/src/csource.rs:1135
     odata:
       status: not_offered
       binding: null
@@ -4613,12 +4613,12 @@ operations:
         adr0020_phase: on_request
         operation_fields:
         - clause
-        filterable: false
+        filterable: true
         whole_tenant: false
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
       binding_clause: ts-104176-ngsi-ld-http-binding/9/9.4.3.2.md (headed POST, see open questions)
-      gate_site: crates/antares-api/src/subscriptions.rs:918
+      gate_site: crates/antares-api/src/subscriptions.rs:1028
     odata:
       status: not_offered
       binding: null
