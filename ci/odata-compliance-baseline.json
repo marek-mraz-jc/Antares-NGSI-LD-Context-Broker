@@ -1,8 +1,8 @@
 {
  "counts": {
   "FAIL": 488,
-  "PASS": 623,
-  "SKIP": 76
+  "PASS": 624,
+  "SKIP": 75
  },
  "results": {
   "[V4.01] 11.2.12_query_schemaversion :: $metadata accepts $schemaversion=*": "SKIP",
@@ -631,7 +631,7 @@
   "[V4] 11.4.15_data_validation :: Missing required field returns 400": "PASS",
   "[V4] 11.4.15_data_validation :: PATCH that changes the entity key is rejected with 400/405": "PASS",
   "[V4] 11.4.15_data_validation :: POST with duplicate key is rejected (409 Conflict expected; 500 is go-odata#773)": "FAIL",
-  "[V4] 11.4.15_data_validation :: POST with nonexistent foreign key returns 400/404/409 or is skipped (SHOULD per \u00a711.4.2)": "SKIP",
+  "[V4] 11.4.15_data_validation :: POST with nonexistent foreign key returns 400/404/409 or is skipped (SHOULD per \u00a711.4.2)": "PASS",
   "[V4] 11.4.1_requesting_entities :: GET individual entity by key should return entity": "PASS",
   "[V4] 11.4.1_requesting_entities :: HEAD request should return 200 without body": "PASS",
   "[V4] 11.4.1_requesting_entities :: Request entity with query options should work": "FAIL",

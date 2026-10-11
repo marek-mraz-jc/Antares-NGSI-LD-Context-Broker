@@ -119,14 +119,16 @@ and writes the Core and Capabilities terms the schema states (section 6),
 T-3721 (minted keys, C5 required properties), T-3725 (typed `$filter`
 literals), T-3726 (batch framing and `continue-on-error`), T-3730 (entity
 references), T-3737 (one `Content-Length` on `HEAD`), T-3738 (`$entity`
-404) and T-3760 (a bind to a missing Entity is 400):
+404) and T-3760 (a bind to a missing Entity is 400); and by T-3761 (a
+`ProductID` naming an absent Product is 400), written from its branch run
+(surfaces-conformance 38152573824 on `30ca1c7`):
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
 | Minimal | 178 | 95 | 20 | 65.2 % |
 | Intermediate | 246 | 90 | 14 | 73.2 % |
-| Advanced | 199 | 303 | 65 | 39.6 % |
-| **All** (suite summary) | 623 | 488 | 99 | 56.1 % |
+| Advanced | 200 | 303 | 64 | 39.8 % |
+| **All** (suite summary) | 624 | 488 | 98 | 56.1 % |
 
 One earlier pass was a skip after train 8, by the suite's own rule: `POST with
 nonexistent foreign key` posts a `ProductDescription` whose `ProductID` names
