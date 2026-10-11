@@ -10,11 +10,23 @@ name: fast
 # the fast lane too.
 #
 #   push to dev ──→ fast: workspace.yml            (closes reviews)
+#                         ‖ surfaces-conformance.yml (fast: true) when the
+#                           push touches a surface path (T-3765)
 #   dispatch per train ──→ ci: workspace.yml → ETSI matrix, images
+#
+# The surface subset (build, odata-conformance, odata-compliance-external)
+# runs beside the workspace gate, so a lost conformance pass is red on the
+# push that lost it. A dispatch compares against `base`, or runs the subset
+# when it names none.
 on:
   push:
     branches: [dev]
   workflow_dispatch:
+    inputs:
+      base:
+        description: the ref the surface paths are compared against (empty runs the subset)
+        required: false
+        default: ""
 
 # One push per train: a newer push supersedes the run of the older one.
 concurrency:
@@ -28,3 +40,40 @@ jobs:
   workspace:
     name: Workspace tests
     uses: ./.github/workflows/workspace.yml
+
+  changes:
+    name: Surface paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      surfaces: ${{ steps.diff.outputs.surfaces }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BASE: ${{ inputs.base || github.event.before }}
+        run: |
+          paths='^(crates/(antares-odata|odata-[^/]+|antares-views|antares-ops|antares-ogc|ogc-[^/]+)/|ci/odata-compliance|ci/views/|dev/odata-compliance/|dev/views-rig\.sh$|\.github/workflows/(fast|surfaces-conformance)\.yml$)'
+          if ! git rev-parse -q --verify "${BASE:-none}^{commit}" > /dev/null; then
+            hit=true # no base to compare with (a dispatch, a new branch): run it
+          elif git diff --name-only "$BASE" HEAD | grep -qE "$paths"; then
+            hit=true
+          else
+            hit=false
+          fi
+          echo "surfaces=$hit" | tee -a "$GITHUB_OUTPUT"
+
+  surfaces:
+    name: Surfaces conformance
+    needs: changes
+    if: needs.changes.outputs.surfaces == 'true'
+    # the nightly failure issue step is in the called file; it never runs
+    # on a push, but the job may ask for no more than its caller grants
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/surfaces-conformance.yml
+    with:
+      fast: true

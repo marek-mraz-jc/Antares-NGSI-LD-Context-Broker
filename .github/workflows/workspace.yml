@@ -28,12 +28,12 @@ jobs:
     # keep the arm runner, they run fine there.
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
+    env: &workspace-env
       # Live PostGIS for the antares-sql integration tests — without this
       # they skip vacuously and CI proves nothing about the Pg store.
       ANTARES_TEST_DATABASE_URL: postgresql://antares:antares@localhost:15432/antares
       CARGO_TERM_COLOR: always
-    services:
+    services: &workspace-services
       postgis:
         image: ghcr.io/baosystems/postgis:17-3.5
         env:
@@ -91,10 +91,12 @@ jobs:
       # (.config/nextest.toml, profile `ci`) — dev/unit-report-site.py folds
       # those into the /reports/unit/ page. Plain `cargo test` leaves no
       # machine-readable trace behind.
-      - uses: taiki-e/install-action@nextest
+      - &nextest
+        uses: taiki-e/install-action@nextest
       # Live MQTT server for the clause-7 e2e — without the env var the
       # test skips vacuously and CI proves nothing about MQTT delivery.
-      - name: Start mosquitto for the MQTT e2e
+      - &mosquitto
+        name: Start mosquitto for the MQTT e2e
         run: |
           sudo apt-get install -y -qq mosquitto
           printf 'allow_anonymous true\nlistener 1883\n' | sudo tee /etc/mosquitto/conf.d/antares-e2e.conf
@@ -103,7 +105,8 @@ jobs:
       # Live NATS (JetStream) for the bus tests + the 2-instance roles e2e.
       # A `docker run` step, not a service: services cannot pass the `-js`
       # command argument the JetStream engine needs.
-      - name: Start NATS (JetStream) for the bus tests
+      - &nats
+        name: Start NATS (JetStream) for the bus tests
         run: |
           docker run -d --name nats -p 4222:4222 nats:2-alpine -js
           echo "ANTARES_TEST_NATS_URL=nats://127.0.0.1:4222" >> "$GITHUB_ENV"
@@ -112,7 +115,8 @@ jobs:
       # real pass. Every `SKIP: <VAR> not set` marker in the tree must name a
       # variable this job supplies, so a new gate either gets its service here
       # or turns the build red.
-      - name: no test skips vacuously
+      - &no-vacuous-skip
+        name: no test skips vacuously
         run: |
           vars=$(grep -rhoE 'SKIP: [A-Z_]+(( / )[A-Z_]+)* not set' crates/ \
                    --include='*.rs' \
@@ -174,14 +178,8 @@ jobs:
             -E 'test(/^(split_entities_5_7_2|temporal_fed_paging_5_7_4)::/)'
           dev/unit-junit.sh ignored-db-broker -p antares-broker --bin antares \
             --run-ignored ignored-only outbox_flush_waits
-      # The API tests once more on the on-disk redb store: AppState::new
-      # composes a fresh file store per state under this harness variable,
-      # so every test that passed on memory has to pass on the durable
-      # backend too — no second copy of the tests.
-      - run: ANTARES_TEST_STORE=file dev/unit-junit.sh file-store -p antares-api
-      # feature matrix: no defaults + all features
-      - run: dev/unit-junit.sh no-default-features --workspace --no-default-features
-      - run: dev/unit-junit.sh all-features --workspace --all-features
+      # file-store, no-default-features and all-features: the feature-sets
+      # job below, beside this one
       # Same store tests, timescale temporal mode (hypertable DDL branch,
       # compression-vs-RLS ordering, backend detection).
       - name: Store tests against the timescale temporal mode
@@ -359,6 +357,56 @@ jobs:
             | grep -v 'crates/antares-jsonld/src/loader.rs:'
 
 
+  feature-sets:
+    # The suite once more on another store or feature set. The three passes
+    # ran one after another in the job above, 640 s of its 24 min (run
+    # 38141581358: no-default-features 245 s, all-features 270 s,
+    # file-store 125 s) and the whole `fast` lane waited on them; a cell
+    # each runs beside it, with the same databases, brokers and skip guard
+    # (T-3710).
+    name: Workspace tests (${{ matrix.set }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env: *workspace-env
+    services: *workspace-services
+    strategy:
+      fail-fast: false
+      matrix:
+        set: [no-default-features, all-features, file-store]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+          cache-on-failure: true
+          key: feature-sets-${{ matrix.set }}
+      - *nextest
+      - *mosquitto
+      - *nats
+      - *no-vacuous-skip
+      - name: The workspace suite without default features
+        if: matrix.set == 'no-default-features'
+        run: dev/unit-junit.sh no-default-features --workspace --no-default-features
+      - name: The workspace suite with every feature
+        if: matrix.set == 'all-features'
+        run: dev/unit-junit.sh all-features --workspace --all-features
+      # AppState::new composes a fresh redb file store per state under this
+      # harness variable, so every API test that passed on memory has to pass
+      # on the durable backend too — no second copy of the tests.
+      - name: The API tests on the on-disk store
+        if: matrix.set == 'file-store'
+        run: ANTARES_TEST_STORE=file dev/unit-junit.sh file-store -p antares-api
+      # dev/fold-reports.sh folds these into the job above's unit-junit
+      - name: Unit JUnit bundle
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: unit-junit-${{ matrix.set }}
+          path: unit-junit/
+          if-no-files-found: warn
+
   fuzz-smoke:
     # surfaces-test-plan.md section 5 (T-3492): a parser change does not merge
     # unfuzzed. Every fuzz target the pull request touches (its source, its
@@ -406,7 +454,7 @@ jobs:
 
   features:
     # GOAL point 2 (T-3465): every cargo feature builds, lints and tests on
-    # its own. The workspace job checks no-default and all-features, where a
+    # its own. The feature-sets job checks no-default and all-features, where a
     # feature that only compiles next to another one passes unseen; this one
     # takes each feature alone. A new feature joins it by being declared:
     # cargo-hack enumerates them from the manifests.
@@ -462,7 +510,7 @@ jobs:
         if: matrix.package != 'workspace' && matrix.package != 'binary-size'
         run: cargo hack test --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }}
       # The budget is ADR-0027 section 6's "binary size" row, read from the
-      # ADR (`full` <= vanilla + 6 MiB, each feature alone <= vanilla + 2 MiB,
+      # ADR (`full` <= vanilla + 7 MiB, each feature alone <= vanilla + 2 MiB,
       # `mcp` <= vanilla + 4.5 MiB); the table goes to the step summary.
       - name: Binary size per surface feature
         if: matrix.package == 'binary-size'
