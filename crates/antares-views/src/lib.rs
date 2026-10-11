@@ -21,6 +21,11 @@
 //! serves nothing at all. Entity maps (14.x) are not served through a
 //! view: a request that names one is 400.
 //!
+//! A view of another model (one with a `mapping`, gap G18) serves Retrieve
+//! Entity, Query Entities and Retrieve Attribute Value in its target model:
+//! the request is inverted into the source model before it runs through the
+//! view, and the answer rebuilt after (`docs/analysis/view-mapping.md`).
+//!
 //! ```
 //! use antares_ops::Surface;
 //! let root = antares_views::Views;
@@ -29,6 +34,8 @@
 //! assert_eq!(mounted.name(), "views");
 //! ```
 #![forbid(unsafe_code)]
+
+mod mapped;
 
 use antares_ops::{Caller, OperationId, Ops, OpsRequest, Refusal, Surface, ViewOps};
 use axum::extract::Request;
@@ -126,7 +133,7 @@ async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
     let mut parts_of = parts.uri.path().splitn(3, '/').skip(1);
     let id = parts_of.next().unwrap_or_default();
     let tail = parts_of.next().unwrap_or_default();
-    let Some(view) = ops.view(id) else {
+    let Some(view) = ops.mapped_view(id) else {
         return Refusal::NotFound.ngsi_ld();
     };
     if names_an_entity_map(&parts) {
@@ -138,6 +145,13 @@ async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
         Some(op) if served(&view, op) => op,
         _ => return refusal(&view, &parts.method, &path, query).ngsi_ld(),
     };
+    if let Some(mapping) = view.mapping() {
+        let id = id.to_owned();
+        return match mapped::serve(&view, mapping, op, caller, parts, body, &path).await {
+            Ok(answer) => rebase(answer, &id),
+            Err(refusal) => refusal.ngsi_ld(),
+        };
+    }
     let target = match query {
         Some(q) => format!("{path}?{q}"),
         None => path,
