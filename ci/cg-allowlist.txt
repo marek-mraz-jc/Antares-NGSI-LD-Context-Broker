@@ -1,0 +1,55 @@
+# Rows dev/security.cypher may return, checked by dev/cg-invariants.py (T-3587).
+# name | key | reason. An entry without a reason, or one that matches no row, fails the job.
+# Reviewed like code: a new row says why the invariant does not apply there.
+
+routes-without-decision | GET /q/health | antares_api::health | public liveness probe, open even with an admin secret (docs/analysis/operation-matrix.md 7.2, T-3569)
+routes-without-decision | GET /q/ready | antares_api::ready | public readiness probe (docs/analysis/operation-matrix.md 7.2, T-3569)
+routes-without-decision | GET /q/metrics | antares_api::metrics_endpoint | admin secret route layer (admin_auth.rs, ANTARES_ADMIN_METRICS); a layer is not a call (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | GET /q/tenants | antares_api::tenants_list | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | GET /q/tenants/{} | antares_api::tenant_get | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | DELETE /q/tenants/{} | antares_api::tenant_purge | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | GET /q/dead-letters | antares_api::dead_letters_list | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | DELETE /q/dead-letters/{} | antares_api::dead_letter_delete | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | POST /q/dead-letters/{}/replay | antares_api::dead_letter_replay | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | PATCH /ngsi-ld/v1/entities | antares_api::missing_entity_id | 400 BadRequestData, no store access (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | PUT /ngsi-ld/v1/entities | antares_api::missing_entity_id | 400 BadRequestData, no store access (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | POST /ex/v1/remote-notify | antares_api::distsub::remote_notify | public to peers by key: a per-copy random subscriptionId (ADR-0019, docs/analysis/operation-matrix.md 7.2)
+
+identity-headers | antares_api::negotiate::tenant_from | the one reader of the request's Tenant (5.5.3), validated or 400
+identity-headers | antares_api::negotiate::echo_tenant | echoes the validated Tenant on the answer (5.5.3)
+identity-headers | antares_api::tenant_exists_layer | tenancy layer: refuses a reserved or doubled Tenant (6.3.14) and a read of a non-existing one (5.5.10) before the handler
+identity-headers | antares_api::echo_tenant_layer | tenancy layer: the conditional echo of 5.5.3
+identity-headers | antares_api::cors_layer | lists the header in CORS allow/expose, reads no value
+identity-headers | antares_api::state::PROPAGATED | the internal-call header copy of threat F2: copied only when the internal request sets none (state.rs AppState::call)
+identity-headers | antares_api::csource::check_context_source_info | refuses a Registration's contextSourceInfo that would set the Tenant on forwards
+identity-headers | antares_api::federation::CSI_SKIP | contextSourceInfo pairs never sent on a forward (the Tenant is the registration's)
+identity-headers | antares_api::federation::build_forward | a forward carries the registration's Tenant (5.6, 5.7 distributed operations)
+identity-headers | antares_api::notify::deliver_as | a notification names the Subscription's Tenant (6.3.8, Table 7.2-2)
+identity-headers | antares_api::notify::strip_reserved_markers | drops a subscriber's own Tenant marker from receiverInfo
+identity-headers | antares_api::snapshots::run_temporal_query | the snapshot's internal temporal read in the snapshot's own Tenant
+identity-headers | antares_api::snapshots::scoped | runs a snapshot request in its internal Tenant and restores the caller's on the answer
+identity-headers | crates/antares-api/src/fuzzing.rs | fuzz harness (feature fuzzing), never in a release build
+identity-headers | antares_ops::OUTER_ONLY | the headers a surface cannot set on the operation it runs (ADR-0023)
+identity-headers | antares_ops::TENANT | ViewOps::run: the view's own Tenant on every operation it runs, another named one is refused (ADR-0023)
+identity-headers | antares_ops::views::preview::preview | the draft view's Tenant on its preview query (T-3635)
+
+sql-from-text | antares_sql::store::any::AnyStore::purge_tenant | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::connect_with | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::doc::PgDocStore::delete | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::doc::PgDocStore::get | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::doc::PgDocStore::list | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::doc::PgDocStore::list_page | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::doc::PgDocStore::list_slice | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::doc::PgDocStore::matching_registrations | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::doc::PgDocStore::mutate | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::doc::PgDocStore::record_delivery | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::doc::PgDocStore::status_row | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::doc::insert_doc | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::entity::PgEntityStore::query | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::maintenance::plain_retention | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::maintenance::temporal_maintenance | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::temporal::PgTemporalStore::create | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::temporal::PgTemporalStore::delete | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::temporal::PgTemporalStore::get_range | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::temporal::PgTemporalStore::mutate | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+sql-from-text | antares_sql::store::pg::temporal::PgTemporalStore::query_inner | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
