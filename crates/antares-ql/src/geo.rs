@@ -526,6 +526,7 @@ mod tests {
     /// edge `relate` walks once per candidate entity, so an over-cap geometry
     /// is BadRequestData and NO entity is evaluated.
     #[test]
+    #[cfg_attr(miri, ignore)] // a cap-sized input: past the weekly Miri job's 90 min (T-3706)
     fn oversized_query_geometry_is_rejected_before_any_entity_is_scanned() {
         let cap = MAX_GEO_VERTICES;
         // a closed ring of n positions on the unit circle
