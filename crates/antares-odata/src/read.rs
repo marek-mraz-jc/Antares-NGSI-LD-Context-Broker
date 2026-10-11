@@ -294,6 +294,16 @@ pub(crate) fn query(
         q.push_str("&q=");
         q.push_str(&encode(text));
     }
+    if let Some((property, coordinates)) = &filter.geo {
+        q.push_str("&georel=intersects&geometry=Polygon&coordinates=");
+        q.push_str(&encode(coordinates));
+        q.push_str("&geoproperty=");
+        q.push_str(&encode(property));
+    }
+    if !filter.expand_values.is_empty() {
+        q.push_str("&expandValues=");
+        q.push_str(&encode(&filter.expand_values.join(",")));
+    }
     if let Some(keys) = &filter.order {
         q.push_str("&orderBy=");
         q.push_str(&encode(keys));

@@ -150,10 +150,10 @@ pub fn with_view(
         // so the view has nothing of its own to narrow there.
         return engine;
     }
-    if crate::policy::WRITE_BY_ID.contains(&clause) {
-        // Rule 7 as below, and the engine's answer is the condition its
-        // write holds the stored Entity to (`gate`), which the handler
-        // checks beside the view's own.
+    if crate::policy::WRITE_BY_ID.contains(&clause) && CHECKED_WRITES.contains(&clause) {
+        // Rule 7 as below, the engine's answer the condition its write
+        // holds the stored Entity to (`gate`), checked beside the view's;
+        // a temporal one has no write guard and is refused as below.
         return engine;
     }
     if CHECKED_WRITES.contains(&clause) || SUBSCRIPTIONS.contains(&clause) {

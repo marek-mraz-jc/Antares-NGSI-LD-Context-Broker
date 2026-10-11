@@ -3,7 +3,9 @@
 //! binding is handed, after `pre_notify` under the subscriber, and only the
 //! socket that made the Subscription receives it.
 
-use crate::common::{broker, broker_asking, cars, connect, status, text, with, Client, USER};
+use crate::common::{
+    broker, broker_asking, cars, connect, rendered, status, text, with, Client, USER,
+};
 use antares_ops::policy::{
     Decision, DecisionFuture, NotifyDecision, Operation, PolicyEngine, Subject,
 };
@@ -382,7 +384,7 @@ async fn ws_a_tenant_mismatch_is_never_written() -> Result<(), String> {
         subscription: text(&made, "/body/id"),
         entity: None,
         changes: false,
-        rendered: json!({"metadata": {}, "body": {"type": "Notification"}}),
+        rendered: rendered(&text(&made, "/body/id"), 1),
     };
     let payload = serde_json::to_vec(&n).map_err(|e| e.to_string())?;
     let answer: Answer = serde_json::from_slice(&b.hub.answer(&c.connection, &payload))

@@ -217,6 +217,72 @@ async fn a_batch_applies_the_condition_per_member() {
     }
 }
 
+/// Batch Upsert (T-3668): a conditioned member updates the Entity its
+/// condition selects and never creates. The one it does not select and an
+/// absent one answer the same 404 in E, and neither is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upsert_updates_what_the_condition_selects_and_creates_nothing() {
+    let speed =
+        |id: &str| json!({"id": id, "type": "Vehicle", "speed": {"type": "Property", "value": 9}});
+    for uri in [
+        "/ngsi-ld/v1/entityOperations/upsert",
+        "/ngsi-ld/v1/entityOperations/upsert?options=update",
+    ] {
+        let st = state(Arc::new(Conditioned(zone_a()))).await;
+        let before = stored(&st, IN_B).await;
+        let body = json!([speed(IN_A), speed(IN_B), speed(ABSENT)]);
+        let (status, out) = send(&st, "POST", uri, Some(body)).await;
+        assert_eq!(status, StatusCode::MULTI_STATUS, "{uri}: {out}");
+        assert_eq!(out["success"], json!([IN_A]), "{uri}: {out}");
+        let errors = out["errors"].as_array().cloned().unwrap_or_default();
+        let entry = |id: &str| {
+            errors
+                .iter()
+                .find(|e| e["entityId"] == id)
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        assert_eq!(entry(IN_B)["error"]["status"], 404, "{uri}: {out}");
+        assert_eq!(
+            entry(IN_B).to_string().replace(IN_B, ABSENT),
+            entry(ABSENT).to_string(),
+            "{uri}: a non-matching Entity answers as an absent one"
+        );
+        assert_eq!(stored(&st, IN_B).await, before, "{uri}: unchanged");
+        assert_eq!(stored(&st, IN_A).await["speed"]["value"], 9, "{uri}");
+        let (status, _) = send(&st, "GET", &format!("/ngsi-ld/v1/entities/{ABSENT}"), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: never created");
+    }
+}
+
+/// An upsert's condition is judged on the document the store is about to
+/// change: a writer that moves the Entity out of zone A first wins.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upsert_cannot_slip_past_a_concurrent_change() {
+    let moved = json!({
+        "id": IN_A,
+        "type": [format!("{DC}Vehicle")],
+        format!("{DC}zone"): [{"type": "Property", "value": "B"}],
+        format!("{DC}speed"): [{"type": "Property", "value": 1}],
+        "createdAt": "2026-01-01T00:00:00.000Z",
+        "modifiedAt": "2026-01-01T00:00:00.000Z",
+    });
+    let body = json!([{"id": IN_A, "type": "Vehicle", "speed": {"type": "Property", "value": 9}}]);
+    for uri in [
+        "/ngsi-ld/v1/entityOperations/upsert",
+        "/ngsi-ld/v1/entityOperations/upsert?options=update",
+    ] {
+        let mut st = state(Arc::new(Conditioned(zone_a()))).await;
+        st.store = Arc::new(Double::racing_write(st.store.clone(), moved.clone()));
+        let (status, out) = send(&st, "POST", uri, Some(body.clone())).await;
+        assert_eq!(status, StatusCode::MULTI_STATUS, "{uri}: {out}");
+        assert_eq!(out["errors"][0]["error"]["status"], 404, "{uri}: {out}");
+        let after = stored(&st, IN_A).await;
+        assert_eq!(after["zone"]["value"], "B", "{uri}: {after}");
+        assert_eq!(after["speed"]["value"], 1, "{uri}: {after}");
+    }
+}
+
 /// The engine decided on an Entity in zone A; a second writer moves it to
 /// zone B before the write commits. The store judges the document it is
 /// about to change, so the write does not land.
