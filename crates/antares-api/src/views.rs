@@ -94,6 +94,33 @@ impl CompiledView {
         })
     }
 
+    /// The view that selects every type and shows every Attribute
+    /// (ADR-0023 rule 12): no rules, so the engine's answer stands, narrowed
+    /// by the view's own conditions alone.
+    #[must_use]
+    pub fn every(
+        q: Option<QNode>,
+        scope_q: Option<String>,
+        geo_q: Option<antares_ql::geo::GeoQuery>,
+    ) -> Self {
+        Self {
+            narrowing: Arc::new(Filter {
+                q: q.map(Box::new),
+                scope_q,
+                geo_q: geo_q.map(Box::new),
+                ..Filter::default()
+            }),
+            id: String::new(),
+        }
+    }
+
+    /// Whether the view shows every name ([`Self::every`]): [`Self::new`]
+    /// never compiles a view without rules.
+    #[must_use]
+    pub fn shows_every_name(&self) -> bool {
+        self.narrowing.rules.is_empty()
+    }
+
     /// The same view under the id the table serves it as.
     #[must_use]
     pub fn named(mut self, id: &str) -> Self {
@@ -390,6 +417,16 @@ pub const VIEW_TENANT: &str = "antares-views";
 /// (ADR-0020 amendment), one document per Tenant, keyed by its name.
 pub const POLICY_TENANT: &str = "antares-policy";
 
+/// What a surface crate attached to a loaded view, opaque to the broker.
+#[derive(Clone)]
+pub struct Attached(pub Arc<dyn std::any::Any + Send + Sync>);
+
+impl std::fmt::Debug for Attached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Attached(..)")
+    }
+}
+
 /// One view of the table.
 #[derive(Debug, Clone)]
 pub enum ViewEntry {
@@ -405,6 +442,10 @@ pub enum ViewEntry {
         /// condition reads an Attribute it does not show (ADR-0023 rule
         /// 11), a temporal view keyed on a mutable member (rule 8).
         notes: Vec<String>,
+        /// The compiled Mapping of a view of another model (gap G18), which
+        /// only the view root reads; the broker carries it and never looks
+        /// inside.
+        mapping: Option<Attached>,
     },
     /// A stored view that failed validation: never served, named in
     /// `/q/health` with the reason.
@@ -655,7 +696,9 @@ pub(crate) fn watched_in(
         .unwrap_or_default();
     let kept: Vec<serde_json::Value> = watched
         .iter()
-        .filter(|w| w.as_str().is_some_and(|w| shown.iter().any(|s| s == w)))
+        .filter(|w| {
+            view.shows_every_name() || w.as_str().is_some_and(|w| shown.iter().any(|s| s == w))
+        })
         .cloned()
         .collect();
     if kept.is_empty() {

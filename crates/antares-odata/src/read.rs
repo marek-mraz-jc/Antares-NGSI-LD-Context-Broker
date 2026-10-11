@@ -106,41 +106,48 @@ pub(crate) async fn serve(
 
 /// `$entity?$id=` (Q23): the id, percent-decoded, is a URL of this service,
 /// absolute under its root or relative to it, that names one Entity by key
-/// and nothing else; it is read as that URL is. Any other id is `400`.
+/// and nothing else; it is read as that URL is. A missing `$id`, a broken
+/// escape or an id with query options of its own is `400`; any other id
+/// names no Entity here and is `404`, like a hidden one (O5). A foreign URL
+/// is never fetched.
 async fn dereference(
     reads: &Reads,
     caller: &Caller,
     ctx: &Ctx<'_>,
     options: &QueryOptions,
 ) -> Result<Response, ODataErrorResponse> {
-    let bad = || {
-        ODataErrorResponse::new(
-            StatusCode::BAD_REQUEST,
-            "BadRequest",
-            "$id names no entity of this service",
-        )
-        .with_version(ctx.version)
-    };
     let id = options
         .id
         .as_deref()
         .and_then(percent_decoded)
-        .ok_or_else(bad)?;
+        .ok_or_else(|| {
+            ODataErrorResponse::new(
+                StatusCode::BAD_REQUEST,
+                "BadRequest",
+                "$id is missing or not percent-encoded",
+            )
+            .with_version(ctx.version)
+        })?;
     let relative = id.strip_prefix(ctx.service_root).unwrap_or(&id);
-    if relative.starts_with('/') || relative.contains("://") {
-        return Err(bad());
-    }
     let model = EdmModel(&reads.state.model);
-    let Ok(ODataUri::Resource { path, options }) =
-        odata_url::parse(relative, &model, &reads.state.url_limits)
-    else {
-        return Err(bad());
-    };
-    match path.as_slice() {
-        [Segment::EntitySet(set), Segment::Key(key)] if options == QueryOptions::default() => {
-            entity(reads, caller, ctx, set, key, &options).await
+    let parsed = (!relative.starts_with('/') && !relative.contains("://"))
+        .then(|| odata_url::parse(relative, &model, &reads.state.url_limits));
+    match parsed {
+        Some(Ok(ODataUri::Resource { options, .. })) if options != QueryOptions::default() => {
+            Err(ODataErrorResponse::new(
+                StatusCode::BAD_REQUEST,
+                "BadRequest",
+                "$id has query options of its own",
+            )
+            .with_version(ctx.version))
         }
-        _ => Err(bad()),
+        Some(Ok(ODataUri::Resource { path, options })) => match path.as_slice() {
+            [Segment::EntitySet(set), Segment::Key(key)] => {
+                entity(reads, caller, ctx, set, key, &options).await
+            }
+            _ => Err(not_found(ctx.version)),
+        },
+        _ => Err(not_found(ctx.version)),
     }
 }
 
@@ -724,7 +731,7 @@ pub(crate) fn key_id(set: &Set, key: &Key, options: &QueryOptions) -> Option<Str
     };
     match (own.filter(|_| !by_id), literal) {
         (Some(i), Literal::Guid(g)) if i.edm == "Edm.Guid" => Some(format!("{}{g}", i.prefix)),
-        (Some(i), Literal::Int(n)) if i.edm == "Edm.Int64" => Some(format!("{}{n}", i.prefix)),
+        (Some(i), Literal::Int(n)) if integer(i.edm) => Some(format!("{}{n}", i.prefix)),
         (Some(i), Literal::String(s)) if i.edm == "Edm.String" => Some(format!("{}{s}", i.prefix)),
         (_, Literal::String(s)) => Some(s.clone()),
         _ => None,
@@ -748,7 +755,7 @@ pub(crate) fn canonical_key(set: &Set, urn: &str) -> Key {
         .strip_prefix(own.prefix.as_str())
         .and_then(|v| match own.edm {
             "Edm.Guid" => is_guid(v).then(|| Literal::Guid(v.to_owned())),
-            "Edm.Int64" => v
+            edm if integer(edm) => v
                 .parse()
                 .ok()
                 .filter(|n: &i64| n.to_string() == v)
@@ -759,6 +766,14 @@ pub(crate) fn canonical_key(set: &Set, urn: &str) -> Key {
         Some(v) => Key::Single(KeyValue::Literal(v)),
         None => Key::Compound(vec![("id".into(), string(urn))]),
     }
+}
+
+/// One of the integer Edm types a key may have (T-3722).
+fn integer(edm: &str) -> bool {
+    matches!(
+        edm,
+        "Edm.Byte" | "Edm.SByte" | "Edm.Int16" | "Edm.Int32" | "Edm.Int64"
+    )
 }
 
 /// `8-4-4-4-12` lower-case hex digits, as a `guid` literal reads back.
@@ -1165,10 +1180,12 @@ mod tests {
             iri: "https://e.org/m".into(),
             shape,
             list: false,
+            written: crate::edm::Written::Always,
         };
         Set {
             type_iri: "https://e.org/T".into(),
             identifier: None,
+            writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 ("geo".into(), member(Shape::Geo)),
                 (
@@ -1456,6 +1473,26 @@ mod tests {
         assert_eq!(body_id(&plain, &json!("urn:x")), Some("urn:x".into()));
         assert_eq!(body_id(&plain, &json!(5)), None);
         assert_eq!(body_id(&set, &json!(null)), None);
+    }
+
+    #[test]
+    fn a_string_key_keeps_its_case_and_a_broken_escape_decodes_to_nothing() {
+        let codes = Set {
+            identifier: Some(crate::edm::Identifier {
+                member: "code".into(),
+                edm: "Edm.String",
+                prefix: "urn:ngsi-ld:P:".into(),
+            }),
+            ..set()
+        };
+        assert_eq!(
+            body_id(&codes, &json!("Ab")),
+            Some("urn:ngsi-ld:P:Ab".into())
+        );
+        assert_eq!(percent_decoded("P%28a%29"), Some("P(a)".into()));
+        for broken in ["P%zz", "P%2", "%FF"] {
+            assert_eq!(percent_decoded(broken), None, "{broken}");
+        }
     }
 
     fn single_or(key: &Key) -> Key {

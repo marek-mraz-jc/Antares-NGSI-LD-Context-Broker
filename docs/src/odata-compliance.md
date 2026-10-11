@@ -112,18 +112,35 @@ The pass rate counts passed and failed tests; skipped tests stay out of it.
 The baseline was first recorded on dev `f0da234` (T-3714) and raised by
 T-3719, which reads a form-encoded query, T-3723, which declares `$batch`
 and serves `HEAD`, T-3731, which answers an empty path segment with 400,
-T-3720, which keys a set by its LinkML identifier and serves `$entity`,
-and T-3730, which serves the entity references of a set and of one Entity (section 6):
+and then by train 8, written from its own run (surfaces-conformance
+38136321034 on `2f26761`, never merged by hand): T-3720, which keys a set by
+its LinkML identifier and serves `$entity`, T-3722, which narrows Edm types
+and writes the Core and Capabilities terms the schema states (section 6),
+T-3721 (minted keys, C5 required properties), T-3725 (typed `$filter`
+literals), T-3726 (batch framing and `continue-on-error`), T-3730 (entity
+references), T-3737 (one `Content-Length` on `HEAD`), T-3738 (`$entity`
+404) and T-3760 (a bind to a missing Entity is 400):
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| Minimal | 165 | 104 | 24 | 61.3 % |
-| Intermediate | 234 | 102 | 14 | 69.6 % |
-| Advanced | 159 | 345 | 63 | 31.5 % |
-| **All** (suite summary) | 558 | 551 | 101 | 50.3 % |
+| Minimal | 178 | 95 | 20 | 65.2 % |
+| Intermediate | 246 | 90 | 14 | 73.2 % |
+| Advanced | 199 | 303 | 65 | 39.6 % |
+| **All** (suite summary) | 623 | 488 | 99 | 56.1 % |
 
-Before T-3720 the baseline stood at 456 passed, 660 failed and 94 skipped
-(Minimal 57.8 %, Intermediate 49.4 %, Advanced 26.0 %).
+One earlier pass is a skip now, by the suite's own rule: `POST with
+nonexistent foreign key` posts a `ProductDescription` whose `ProductID` names
+no `Product` and skips on 201, since referential constraints are a SHOULD
+(Protocol 11.4.2). Dev answered it with a 4xx before train 8; with train 8
+the create succeeds, because the broker checks a reference only on a bind
+(T-3760), not in a plain property. Enforcing a LinkML slot whose range is a class as a reference is
+T-3761.
+
+Before train 8 the baseline stood at 550 passed, 563 failed and 97 skipped
+(Minimal 62.3 %, Intermediate 65.8 %, Advanced 31.5 %).
+
+Before T-3720 the baseline stood at 455 passed, 661 failed and 94 skipped
+(Minimal 57.8 %, Intermediate 49.1 %, Advanced 26.0 %).
 
 The first baseline (T-3714) stood at Minimal 37.5 %, Intermediate 28.2 % and
 Advanced 11.7 % (254 passed, 840 failed, 116 skipped).
@@ -143,9 +160,12 @@ Each failing area is a task, or a decision with its reason:
 | The key was always `id` (the URN); the model's own key (`ID`, Edm.Guid) did not address an Entity, and `$entity?$id=` answered 501 | 11.1, 11.2.1 to 11.2.3, 11.2.11, 11.4.11, 8.2.7 | T-3720: the schema marks `ID` `identifier: true` with `edm_type: Edm.Guid` (`ci/odata-compliance/schema.json`); the set is keyed by it and `$entity` is served |
 | `@odata.id URL is dereferenceable` (11.2.2) appends the relative `@odata.id` to the service URL without a `/`, and keeps the whole path of an absolute one; under a service root with a path neither form reaches the Entity | 11.2.2 | a limit of the suite: JSON Format 4.01 section 4.5.8 lets `@odata.id` be relative to the context URL, and `$entity?$id=` with the same value passes |
 | Entity references of a set or an Entity (`{Set}/$ref`, `{Set}(key)/$ref`) answer 501 | 11.2.15 | T-3730 |
-| `{Set}/` and `{Set}//` read as `{Set}` | 11.1 | T-3731: an empty path segment is 400; the broker's trailing-slash trim leaves a view's OData paths as sent |
-| A create without a key is refused (`MissingKey`); the service does not mint one | 11.4.2 to 11.4.5, 11.4.12 to 11.4.15, 8.1.5, 8.2.3, 8.2.5, 8.2.8 | T-3721 |
-| Edm types beyond String, Double and Int64, enums, Core and Capabilities annotations from the LinkML schema | 4.4, 5.1.1.x, 5.1.4 to 5.1.8, 5.3, 14.1, vocab_* | T-3722 |
+| `{Set}/` and `{Set}//` read as `{Set}` | 11.1 | T-3731 |
+| A create without a key was refused (`MissingKey`); the service did not mint one | 11.4.2 to 11.4.5, 11.4.12 to 11.4.15, 8.1.5, 8.2.3, 8.2.5, 8.2.8 | T-3721: a `Guid` or `String` key is minted (`Core.ComputedDefaultValue`, mapping W1), and a LinkML `required` member left out or null is 400 `MissingProperty` (mapping C5; the schema marks `Products.Name`, `Products.Price` and `ProductDescriptions.Description` required, as the suite's contract does) |
+| Edm types beyond String, Double and Int64, Core and Capabilities annotations from the LinkML schema | 4.4, 5.1.1.x, 5.1.4 to 5.1.8, 14.1, vocab_* | T-3722: the schema's `edm_type`, `description`, `odata_computed`, `odata_immutable` and the class's `odata_insertable`, `odata_updatable`, `odata_deletable` (`ci/odata-compliance/schema.json`, as the reference model declares them); the type scripts' metadata tests pass, their filters stay in the rows below (functions, `cast`, arithmetic, `binary'…'` and `duration'…'` literals, the `f` suffix of a Single) |
+| The vocabulary scripts look for the terms on an EntityType named `Product` in the first schema of `$metadata` (`Antares.NgsiLd`, the surface's own vocabulary) and for set restrictions only in external `<Annotations Target="….Container/Set">` blocks | vocab_core_*, vocab_capabilities_*, 14.1 | a limit of the suite: CSDL 14.3 lets an annotation sit inline on its target, which is where the surface writes it, and an EntitySet here is named after its class and so is its EntityType (`Products`). The terms are there: `ReadOnlyItems` refuses `POST`, `PATCH` and `DELETE` with 405 |
+| A create naming a `ProductID` no Product has is accepted, so the suite skips its foreign-key test (it passed on dev only because a ProductDescriptions create without a key was 400 `MissingKey`, before T-3720 and T-3721) | 11.4.15 | not supported, by design: `ProductID` is a plain String Attribute and NGSI-LD has no referential constraint to check it against; Protocol 11.4.2 makes the check a SHOULD. A bind (`Product@odata.bind`) to a missing Product is 400 (T-3760) |
+| An enum as an `EnumType` with integer members (`Status eq 1`, flags) | 5.3, 5.1.1 | not supported, by design: mapping section 3.4 keeps an enum an `Edm.String` with `Validation.AllowedValues`, because NGSI-LD values such as `pm2.5` are no CSDL member names |
 | `BatchSupported` was declared false while `$batch` is served; HEAD on a collection or an Entity answered 501 | 11.4.9.x, 11.4.11 | T-3723: declared and served; the batch scripts run, their failures are in the baseline |
 | Multipart `$batch` framed with bare LF line ends; a JSON batch under `OData-MaxVersion: 4.0`; independent requests and `dependsOn` after a failure | 11.4.9, 11.4.9.1, 11.4.9.3, 19_json_batch | T-3726 |
 | Change sets and atomicity groups, Content-ID references | 11.4.9.1, 11.4.9.3, 19_json_batch | not supported, by design: ADR-0024 section 5 (W26), mapping row C18 |

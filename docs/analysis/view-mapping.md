@@ -65,7 +65,7 @@ Each row is a reading of the code above, filed as T-3672 for as long as the gate
 | A many-to-one `forward` table inverts through one precomputed source value | `:568-573` | `==` misses the other source values that map to the same target value |
 | `type` is replaced whatever it named | `app.rs:2210` | `type=Other` answers the source class |
 | `pick`, `omit` and `orderBy` are not inverted | `app.rs:2206-2215` | a target name reaches the broker as an unknown attribute: nothing picked, nothing omitted, no order |
-| A discovery answer passes untranslated | `view_mapping.rs:415-418` | `/types` and `/attributes` list the source model's names |
+| A discovery answer passes untranslated | `view_mapping.rs:415-418` | `/types` and `/attributes` list the source model's names (fixed in the broker by section 5.1) |
 
 ## 3. The Mapping IR in a view
 
@@ -82,7 +82,7 @@ Names in the IR are written as the Mapping's compiler wrote them. The writer (T-
 
 ### 4.1 Parameters
 
-The view root (`antares-views`, `serve`, `crates/antares-views/src/lib.rs:121-153`) rewrites the query string before it builds the `OpsRequest`, for the reads a mapped view serves: Retrieve Entity, Query Entities (GET) and Retrieve Attribute Value. The temporal reads and discovery follow in T-3670. Of `negotiate::QUERY_PARAMS` (`crates/antares-api/src/negotiate.rs:947-982`), the ones that name attributes or types:
+The view root (`antares-views`, `serve`, `crates/antares-views/src/lib.rs:121-153`) rewrites the query string before it builds the `OpsRequest`, for the reads a mapped view serves: Retrieve Entity, Query Entities (GET), Retrieve Attribute Value and, since T-3670, Retrieve and Query Temporal Evolution (GET); discovery is section 5.1. Of `negotiate::QUERY_PARAMS` (`crates/antares-api/src/negotiate.rs:947-982`), the ones that name attributes or types:
 
 | parameter | rewrite |
 |---|---|
@@ -92,6 +92,8 @@ The view root (`antares-views`, `serve`, `crates/antares-views/src/lib.rs:121-15
 | `q` | section 4.2 on the AST |
 | `geoproperty`, `geometryProperty` | the source name of a filterable slot, else 400 |
 | `orderBy` | the source name of a `rename` slot, or of a `unitConversion` with its direction reversed when `factor < 0`; anything else is 400 |
+| `timerel`, `timeAt`, `endTimeAt`, `timeproperty`, `lastN` | passed as written: a time or a count, and `timeproperty` names a member NGSI-LD puts on every instance |
+| `aggrMethods`, `aggrPeriodDuration`, `options=aggregatedValues` | refused (400): an aggregate of a translated value is not the translation of the aggregate (a `unitConversion` offset summed n times, a `valueMappings` table averaged) |
 | `datasetId`, `lang`, `expandValues`, `join`, `joinLevel` | refused (400) through a mapped view: the IR does not say how a dataset, a language map, a vocabulary or a joined Entity of another class maps |
 
 A path segment that names an Attribute (`/entities/{id}/attrs/{attr}/value`) is rewritten as `attrs` is. A view `scopeQ`, `geoQ` and `q` are the view's own, written in the source model, and are not rewritten.
@@ -116,6 +118,12 @@ The view root rebuilds the answer after `view.run` returns, so after the view an
 
 Headers that name the API root are rebased as they are today (`antares-views/src/lib.rs:206-249`).
 
+A temporal answer (11.3.2, 11.3.3) is rebuilt instance by instance (`Mapping::rebuild_history`): each instance of a `rename`, `unitConversion`, `valueMappings` or `cast` slot in the normalized form, and each `[value, time]` pair of the `temporalValues` form (4.5.9). A `constant` or `expr` slot has no history and is left out: a constant never changed, and an expression would read instances of several source Attributes that do not share their times. Decided (worker-2, owner may override): left out, because inventing a history for a value nobody stored would be data the store does not hold; options were an instance per source instance with the expression evaluated over the latest value of the others, or one instance at the Entity's `createdAt`.
+
+### 5.1 Discovery
+
+The six discovery reads (10.6.3 to 10.6.8) run through the view as they do without a mapping, so ADR-0023 rule 5 narrows them first; `Mapping::rebuild_discovery` then names the answer in the target model. The source class becomes the target class and any other type is dropped; a source Attribute becomes every slot that reads it. A `rename`, `unitConversion`, `valueMappings` or `cast` slot shows when its source does, an `expr` slot when every source it reads does, a `constant` when the answer shows the class or one of its Attributes; a slot without a source is listed as a `Property`. `/types/{type}` names the target class (any other type is 404 without the store) and `/attributes/{attrId}` a slot with a source (a `constant` or `expr` slot is 400, as for Retrieve Attribute Value). Only `details`, `local` and `count` pass. `entityCount` and `attributeCount` are the store's numbers under the view.
+
 ## 6. Composition with the view and the engine
 
 The request the view root hands to `view.run` is in the source model, so everything the broker already does applies unchanged: the view's narrowing in the store query (ADR-0023 rule 1), a hidden attribute absent while `q` is evaluated (rule 2), an out-of-view Entity not found (rule 3), and the engine's decision on an `Operation` that names source types and attributes (ADR-0020). The answer the mapping rebuilds is therefore the answer the same view without a mapping serves, and the rebuild adds nothing taken from the source:
@@ -133,7 +141,7 @@ Two consequences, both inside that bound:
 
 ## 7. Read only (S20)
 
-The broker refuses at load what the gateway refuses per request (section 2.5): a view with a `mapping` may list only `retrieve_entity`, `query_entities` and `retrieve_attribute_value` (T-3670 adds the temporal reads and the discovery reads). A write, a subscription, a batch, the `POST` batch query whose body would need its own inversion, and a Context Source operation are not loadable. Requests for them reach `refusal` (`antares-views/src/lib.rs:179-204`), which answers 405 with the `Allow` the view serves, the answer S20 asks for. A write through the source model with the view's grant (map S20, last column) cannot happen: the view does not offer it, and the root's own routes are not the view's.
+The broker refuses at load what the gateway refuses per request (section 2.5): a view with a `mapping` may list only `retrieve_entity`, `query_entities`, `retrieve_attribute_value`, the temporal reads `temporal_retrieve` and `temporal_query`, and the six discovery reads (`mapping::READS`, T-3670). A write, a subscription, a batch, the `POST` queries (`query_entities_post`, `temporal_query_post`) whose body would need its own inversion, an Entity Map and a Context Source operation are not loadable. Requests for them reach `refusal` (`antares-views/src/lib.rs:179-204`), which answers 405 with the `Allow` the view serves, the answer S20 asks for. A write through the source model with the view's grant (map S20, last column) cannot happen: the view does not offer it, and the root's own routes are not the view's.
 
 ## 8. Tasks
 
@@ -145,3 +153,24 @@ The broker refuses at load what the gateway refuses per request (section 2.5): a
 | T-3672 | platform | the defects of section 2.6, fixed only if the gateway path still serves when it is taken | none |
 
 T-3669, T-3670 and T-3671 go into T-3446's and T-3644's `depends-on:`.
+
+## 9. As built (T-3669)
+
+T-3669 implements sections 3 to 7 in `crates/antares-ops/src/mapping.rs` and `crates/antares-views/src/mapped.rs`. It decides the following beyond the text above, or against it.
+
+- **Names.** IR names are expanded through the view's `@context` over the core at load, and the target model's terms are the view's own. A request to a mapped view that sends a `Link` header is 400.
+- **The inner request.** The inner request runs under an inline `@context` (`OpsRequest::context`) of generated terms (`jcSrc0`, …, `jcSrcClass`), one per source IRI. A `q` name is a 7.2.3.2 name, so no IRI can appear in it. The rebuild reads each source Attribute under the key the broker compacts it to under that context.
+- **Other surfaces.** `Ops::view` returns `None` for a mapped view, so OData, MCP and WebSocket answer it as an unknown view. Only the view root takes it, through `Ops::mapped_view`.
+- **Selector.** A mapped view's `selector` is the mapping's `sourceClass` and nothing else, which is stricter than section 3. Any other type would be served rebuilt as the target class.
+- **`valueMappings` inversion.** `==x` inverts to every key whose forward value is x, plus x itself when x is no key of the table. This is the precise form of the 4.2 cell: a value outside the table passes unchanged.
+- **`geoproperty` and `orderBy`.**
+  - `geoproperty` and `geometryProperty` name a filterable `rename` slot only. A geometry has no unit and no value table.
+  - `orderBy` names a `rename` slot, or a `unitConversion` slot by `asc` or `desc`. `dist-*` applies to `rename` only.
+- **`pick` and `omit`.** These two apply to the rebuilt answer and are never forwarded. `attrs` also restricts the rebuilt answer to the slots it names, so an input fetched for an expression is not served as an attribute of its own.
+- **Unlisted parameters.** A parameter section 4.1 does not list, and that names no attribute (`id`, `limit`, `options`, …), passes through as written. Every other parameter, a parameter named twice, `format=geojson` and `Accept: application/geo+json` are 400.
+- **Refusals.** Every refusal is a fixed text (`Refusal::Malformed`). The broker's own refusals (a 404 naming an attribute) are reworded from generated terms into the target names before they leave the root.
+- **Retrieve Attribute Value.** Through a mapped view it serves a slot with a source Attribute. A constant or computed slot there is 400, and is read through Retrieve Entity.
+- **Tests.**
+  - `mapping/tests.rs` holds the gateway's cases, ported, and every cell of 4.2.
+  - `views_mapped.rs` runs the root end to end.
+  - `views_mapped_props.rs` is the section 6 property: a mapped view serves no id, value or Attribute the same view without its mapping does not.

@@ -24,7 +24,7 @@ const SCHEMA: &str = r#"{
   "prefixes": {"shop": {"prefix_prefix": "shop", "prefix_reference": "https://example.org/shop/"}},
   "default_prefix": "shop",
   "classes": {"Product": {"slots": ["ID", "Name", "category"]},
-              "Category": {"slots": ["code", "Name"]},
+              "Category": {"slots": ["code", "Name"], "slot_usage": {"Name": {"required": true}}},
               "Bin": {"slots": ["number"]}},
   "slots": {"ID": {"identifier": true, "annotations": {"edm_type": {"tag": "edm_type", "value": "Edm.Guid"}}},
             "Name": {}, "category": {"range": "Category"},
@@ -381,8 +381,6 @@ async fn entity_dereferences_an_id_of_this_service() {
         assert_eq!(a.status, StatusCode::OK, "{id}: {}", a.body);
         assert!(a.body["Name"].is_string(), "{id}: {}", a.body);
     }
-    let a = odata(&app, Method::GET, &format!("$entity?$id={OTHER}"), None).await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST, "a bare key: {}", a.body);
     let a = odata(
         &app,
         Method::GET,
@@ -391,19 +389,155 @@ async fn entity_dereferences_an_id_of_this_service() {
     )
     .await;
     assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
-    for id in [
-        format!("http://elsewhere.example/{relative}"),
-        format!("/{relative}"),
-        "Product".to_owned(),
-        format!("{relative}/Name"),
-        format!("{relative}%3F%24select%3DName"),
-        "Product%2".to_owned(),
-        "Product%zz".to_owned(),
-        "%FF".to_owned(),
-        "Nothing('x')".to_owned(),
+}
+
+/// Q23 (T-3738): a well-formed id that names no Entity of this service is
+/// `404`, as a hidden Entity is (O5); `400` is kept for a missing id, a
+/// broken escape and an id with query options of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn entity_with_an_id_of_no_entity_here_is_not_found() {
+    let (_b, app) = shop().await.expect("broker");
+    let hidden = json!({"id": "urn:ngsi-ld:Thing:t1", "type": format!("{SHOP}Thing"),
+                        format!("{SHOP}Name"): property(&json!("Hidden"))});
+    let a = send(
+        &app,
+        Method::POST,
+        "/ngsi-ld/v1/entities",
+        Some(&hidden.to_string()),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let relative = format!("Product({GUID})");
+    for query in [
+        "$id=http://host/path".to_owned(),
+        "$id=urn:some:id".to_owned(),
+        "id=urn:some:id".to_owned(),
+        format!("$id=http://elsewhere.example/{relative}"),
+        format!("$id=/{relative}"),
+        format!("$id={OTHER}"),
+        "$id=Product".to_owned(),
+        format!("$id={relative}/Name"),
+        "$id=Nothing('x')".to_owned(),
+        "$id=Product(id='urn:ngsi-ld:Thing:t1')".to_owned(),
     ] {
-        let a = odata(&app, Method::GET, &format!("$entity?$id={id}"), None).await;
-        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{id}: {}", a.body);
+        let a = odata(&app, Method::GET, &format!("$entity?{query}"), None).await;
+        assert_eq!(a.status, StatusCode::NOT_FOUND, "{query}: {}", a.body);
+    }
+    let a = odata(&app, Method::GET, &format!("$entity?id={relative}"), None).await;
+    assert_eq!(a.status, StatusCode::OK, "id without $: {}", a.body);
+    for query in [
+        String::new(),
+        format!("$id={relative}%3F%24select%3DName"),
+        "$id=Product%2".to_owned(),
+        "$id=Product%zz".to_owned(),
+        "$id=%FF".to_owned(),
+    ] {
+        let a = odata(&app, Method::GET, &format!("$entity?{query}"), None).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{query}: {}", a.body);
+    }
+}
+
+/// W1 (T-3721): a create that leaves out a `Guid` or `String` key gets a
+/// uuid as its key value and the URN from it, the identifier stored as its
+/// own Attribute; an `Int64` key has no such default and stays required.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_without_the_key_mints_its_value() {
+    let (_b, app) = shop().await.expect("broker");
+    let uuid_of = |location: &str, set: &str, quote: &str| {
+        let value = location
+            .rsplit_once(&format!("/{set}({quote}"))
+            .and_then(|(_, rest)| rest.strip_suffix(&format!("{quote})")))
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(
+            (value.len(), value.split('-').count()),
+            (36, 5),
+            "{location}"
+        );
+        value
+    };
+    let a = odata(&app, Method::POST, "Product", Some(r#"{"Name": "Saw"}"#)).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let guid = uuid_of(&a.location, "Product", "");
+    assert_eq!(a.body["ID"], guid.as_str(), "{}", a.body);
+    let stored = send(
+        &app,
+        Method::GET,
+        &format!("/ngsi-ld/v1/entities/urn:ngsi-ld:Product:{guid}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        stored.body[format!("{SHOP}ID")]["value"],
+        guid.as_str(),
+        "{}",
+        stored.body
+    );
+
+    let a = odata(&app, Method::POST, "Category", Some(r#"{"Name": "Saws"}"#)).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let code = uuid_of(&a.location, "Category", "'");
+    let read = odata(&app, Method::GET, &format!("Category('{code}')"), None).await;
+    assert_eq!(read.body["Name"], "Saws", "{}", read.body);
+
+    let a = odata(&app, Method::POST, "Bin", Some("{}")).await;
+    assert_eq!(
+        (a.status, a.body["error"]["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("MissingKey")),
+        "{}",
+        a.body
+    );
+
+    let a = odata(&app, Method::GET, "$metadata?$format=json", None).await;
+    let ns = &a.body["shop"];
+    for (ty, key, minted) in [
+        ("Product", "ID", true),
+        ("Category", "code", true),
+        ("Bin", "number", false),
+    ] {
+        assert_eq!(
+            ns[ty][key]["@Core.ComputedDefaultValue"].as_bool(),
+            minted.then_some(true),
+            "{ty}.{key}: {}",
+            ns[ty]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filter_literal_of_another_type_is_400() {
+    // T-3725: URL 5.1.1.1; an Int64 literal past its range (5.1.1.5).
+    let (_b, app) = shop().await.expect("broker");
+    for path in [
+        "Product?$filter=Name%20eq%201",
+        "Product?$filter=Name%20gt%2010",
+        "Product?$filter=Name%20in%20(1,2)",
+        "Product?$filter=ID%20eq%20'x'",
+        "Bin?$filter=number%20eq%20'abc'",
+        "Bin?$filter=number%20in%20('a','b')",
+        "Bin?$filter=number%20eq%209223372036854775808",
+    ] {
+        let a = odata(&app, Method::GET, path, None).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{path}: {}", a.body);
+        assert_eq!(a.body["error"]["code"], "BadRequest", "{path}");
+    }
+    for (path, rows) in [
+        // Within the exact range of a JSON number (F26).
+        ("Bin?$filter=number%20eq%209007199254740991", 0),
+        ("Bin?$filter=number%20lt%208", 1),
+        // URL 5.1.1.1: an Int64 member promotes to a decimal literal.
+        ("Bin?$filter=number%20lt%207.5", 1),
+        ("Product?$filter=Name%20eq%20'Drill'", 1),
+        ("Product?$filter=ID%20eq%20null", 1),
+    ] {
+        let a = odata(&app, Method::GET, path, None).await;
+        assert_eq!(a.status, StatusCode::OK, "{path}: {}", a.body);
+        assert_eq!(
+            a.body["value"].as_array().map(Vec::len),
+            Some(rows),
+            "{path}: {}",
+            a.body
+        );
     }
 }
 
@@ -530,4 +664,31 @@ async fn references_of_absent_entities_and_with_properties_are_refused() {
         assert_eq!(a.status, StatusCode::BAD_REQUEST, "{path}: {}", a.body);
         assert_eq!(a.body["error"]["code"], "BadRequest", "{path}");
     }
+}
+
+/// C5 (T-3721): a `required` slot is a `RequiredProperties` path of the set,
+/// and a create that leaves it out or sends null is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_create_names_every_required_property() {
+    let (_b, app) = shop().await.expect("broker");
+    for body in ["{}", r#"{"Name": null}"#] {
+        let a = odata(&app, Method::POST, "Category", Some(body)).await;
+        assert_eq!(
+            (a.status, a.body["error"]["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("MissingProperty")),
+            "{body}: {}",
+            a.body
+        );
+        assert_eq!(a.body["error"]["target"], "Name", "{}", a.body);
+    }
+    let a = odata(&app, Method::POST, "Product", Some("{}")).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+
+    let a = odata(&app, Method::GET, "$metadata?$format=json", None).await;
+    let insert = |set: &str| {
+        a.body["shop"]["Container"][set]["@Capabilities.InsertRestrictions"]["RequiredProperties"]
+            .clone()
+    };
+    assert_eq!(insert("Category"), json!(["Name"]), "{}", a.body);
+    assert_eq!(insert("Product"), json!([]), "{}", a.body);
 }
