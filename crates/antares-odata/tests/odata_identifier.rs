@@ -352,3 +352,57 @@ async fn writes_address_and_check_the_key() {
     let a = odata(&app, Method::GET, &format!("Product({OTHER})"), None).await;
     assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn entity_dereferences_an_id_of_this_service() {
+    // Q23: `$entity?$id=` reads the Entity the id names, as its URL does.
+    let (_b, app) = shop().await.expect("broker");
+    let a = odata(&app, Method::GET, &format!("Product({GUID})?{FULL}"), None).await;
+    let root = a.body["@odata.context"]
+        .as_str()
+        .and_then(|c| c.split_once("$metadata"))
+        .map(|(root, _)| root.to_owned())
+        .unwrap_or_default();
+    assert!(root.ends_with("/odata/v4/"), "{}", a.body);
+    let relative = format!("Product({GUID})");
+    let absolute = format!("{root}{relative}");
+    for id in [
+        relative.clone(),
+        absolute.clone(),
+        relative.replace('(', "%28").replace(')', "%29"),
+        absolute
+            .replace(':', "%3A")
+            .replace('/', "%2F")
+            .replace('(', "%28"),
+        "Category('c1')".to_owned(),
+        format!("Product(id='urn:ngsi-ld:Product:{GUID}')"),
+    ] {
+        let a = odata(&app, Method::GET, &format!("$entity?$id={id}"), None).await;
+        assert_eq!(a.status, StatusCode::OK, "{id}: {}", a.body);
+        assert!(a.body["Name"].is_string(), "{id}: {}", a.body);
+    }
+    let a = odata(&app, Method::GET, &format!("$entity?$id={OTHER}"), None).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "a bare key: {}", a.body);
+    let a = odata(
+        &app,
+        Method::GET,
+        &format!("$entity?$id=Product({OTHER})"),
+        None,
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
+    for id in [
+        format!("http://elsewhere.example/{relative}"),
+        format!("/{relative}"),
+        "Product".to_owned(),
+        format!("{relative}/Name"),
+        format!("{relative}%3F%24select%3DName"),
+        "Product%2".to_owned(),
+        "Product%zz".to_owned(),
+        "%FF".to_owned(),
+        "Nothing('x')".to_owned(),
+    ] {
+        let a = odata(&app, Method::GET, &format!("$entity?$id={id}"), None).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{id}: {}", a.body);
+    }
+}

@@ -480,7 +480,6 @@ async fn the_forms_of_later_rounds_are_501_and_read_only_writes_405() {
         "Car?$filter=not%20(speed%20gt%201)",
         "Car('urn:ngsi-ld:Car:1')?$filter=speed%20gt%201",
         "Car?$schemaversion=2",
-        "$entity?$id=Car('urn:ngsi-ld:Car:1')",
         "$batch",
     ] {
         let got = send(&app, Method::GET, &format!("{ROOT}/{uri}"), None, &[]).await;

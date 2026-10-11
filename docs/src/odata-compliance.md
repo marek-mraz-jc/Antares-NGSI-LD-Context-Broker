@@ -110,15 +110,19 @@ A deliberate break proved the gate: the error response stopped sending the
 
 The pass rate counts passed and failed tests; skipped tests stay out of it.
 The baseline was first recorded on dev `f0da234` (T-3714) and raised by
-T-3719, which reads a form-encoded query, and T-3723, which declares
-`$batch` and serves `HEAD` (section 6):
+T-3719, which reads a form-encoded query, T-3723, which declares `$batch`
+and serves `HEAD`, and T-3720, which keys a set by its LinkML identifier
+and serves `$entity` (section 6):
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| Minimal | 155 | 113 | 25 | 57.8 % |
-| Intermediate | 169 | 175 | 6 | 49.1 % |
-| Advanced | 131 | 373 | 63 | 26.0 % |
-| **All** (suite summary) | 455 | 661 | 94 | 40.8 % |
+| Minimal | 165 | 104 | 24 | 61.3 % |
+| Intermediate | 221 | 115 | 14 | 65.8 % |
+| Advanced | 159 | 345 | 63 | 31.5 % |
+| **All** (suite summary) | 545 | 564 | 101 | 49.1 % |
+
+Before T-3720 the baseline stood at 455 passed, 661 failed and 94 skipped
+(Minimal 57.8 %, Intermediate 49.1 %, Advanced 26.0 %).
 
 The first baseline (T-3714) stood at Minimal 37.5 %, Intermediate 28.2 % and
 Advanced 11.7 % (254 passed, 840 failed, 116 skipped).
@@ -135,7 +139,10 @@ Each failing area is a task, or a decision with its reason:
 | Area | Suite scripts | Disposition |
 |---|---|---|
 | A form-encoded query (Go `url.Values`, Java `URLEncoder`): `%24` before an option name, `+` for a space, `%2F` and `%3D` for the query's `/` and `=` | 11.2.5.x, 11.3.x, 5.1.x, 11.2.9, 11.2.14 | T-3719: read as plain. A `+` reads as a space only where the grammar requires whitespace (`RWS`); inside a literal and in optional whitespace (`BWS`) it stays a `+`, by design: OData writes a space as `%20` (Part 2, the note under Example 32) and gives `+` its own meanings (a sign, a time zone offset), so `'a+b'` keeps its plus |
-| The key is always `id` (the URN); the model's own key (`ID`, Edm.Guid) does not address an Entity | 11.1, 11.2.1 to 11.2.3, 11.2.11, 11.2.15, 11.4.11, 8.2.7 | T-3720 |
+| The key was always `id` (the URN); the model's own key (`ID`, Edm.Guid) did not address an Entity, and `$entity?$id=` answered 501 | 11.1, 11.2.1 to 11.2.3, 11.2.11, 11.4.11, 8.2.7 | T-3720: the schema marks `ID` `identifier: true` with `edm_type: Edm.Guid` (`ci/odata-compliance/schema.json`); the set is keyed by it and `$entity` is served |
+| `@odata.id URL is dereferenceable` (11.2.2) appends the relative `@odata.id` to the service URL without a `/`, and keeps the whole path of an absolute one; under a service root with a path neither form reaches the Entity | 11.2.2 | a limit of the suite: JSON Format 4.01 section 4.5.8 lets `@odata.id` be relative to the context URL, and `$entity?$id=` with the same value passes |
+| Entity references of a set or an Entity (`{Set}/$ref`, `{Set}(key)/$ref`) answer 501 | 11.2.15 | T-3730 |
+| `{Set}/` and `{Set}//` read as `{Set}` | 11.1 | T-3731 |
 | A create without a key is refused (`MissingKey`); the service does not mint one | 11.4.2 to 11.4.5, 11.4.12 to 11.4.15, 8.1.5, 8.2.3, 8.2.5, 8.2.8 | T-3721 |
 | Edm types beyond String, Double and Int64, enums, Core and Capabilities annotations from the LinkML schema | 4.4, 5.1.1.x, 5.1.4 to 5.1.8, 5.3, 14.1, vocab_* | T-3722 |
 | `BatchSupported` was declared false while `$batch` is served; HEAD on a collection or an Entity answered 501 | 11.4.9.x, 11.4.11 | T-3723: declared and served; the batch scripts run, their failures are in the baseline |
@@ -152,9 +159,7 @@ Each failing area is a task, or a decision with its reason:
 | The `Company` singleton and derived types (`ProductType` discriminator) | 9.1, 11.2.16, 11.2.13 | not supported, by design: an NGSI-LD type is an entity set, with no singleton and no inheritance beyond the abstract Relationship base (ADR-0024 section 5) |
 
 A by-design line names its reason; the gate keeps such tests as known
-failures and never skips them. Re-run the table after T-3720 lands: many
-scripts in the rows below it fail on the key form first, and their own
-behaviour only shows once that passes.
+failures and never skips them.
 
 ## Related
 

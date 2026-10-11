@@ -17,7 +17,8 @@ use axum::response::{IntoResponse, Response};
 use odata_axum::{json_level, json_response, ODataErrorResponse, ODataRequest, ODataState};
 use odata_json::{write_collection, write_entity, Ctx, EntityValue, ODataVersion, Page, Resource};
 use odata_url::{
-    ExpandKind, ExpandPath, Key, KeyValue, Literal, ODataUri, QueryOptions, Segment, SelectItem,
+    EdmModel, ExpandKind, ExpandPath, Key, KeyValue, Literal, ODataUri, QueryOptions, Segment,
+    SelectItem,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -53,14 +54,19 @@ pub(crate) async fn serve(
         Ok(level) => level,
         Err(refused) => return refused.into_response(),
     };
-    let (ODataUri::Resource { path, options }, None) = (&request.uri, later(&request.uri)) else {
-        return not_implemented(version).into_response();
-    };
     let ctx = Ctx {
         service_root: &reads.state.service_root,
         level,
         version,
         metadata_etag: reads.state.metadata_etag.as_deref(),
+    };
+    if let ODataUri::Entity { options } = &request.uri {
+        return dereference(reads, caller, &ctx, options)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
+    let (ODataUri::Resource { path, options }, None) = (&request.uri, later(&request.uri)) else {
+        return not_implemented(version).into_response();
     };
     let answer = match path.as_slice() {
         [Segment::EntitySet(set)] => {
@@ -89,6 +95,65 @@ pub(crate) async fn serve(
         _ => Err(not_implemented(version)),
     };
     answer.unwrap_or_else(IntoResponse::into_response)
+}
+
+/// `$entity?$id=` (Q23): the id, percent-decoded, is a URL of this service,
+/// absolute under its root or relative to it, that names one Entity by key
+/// and nothing else; it is read as that URL is. Any other id is `400`.
+async fn dereference(
+    reads: &Reads,
+    caller: &Caller,
+    ctx: &Ctx<'_>,
+    options: &QueryOptions,
+) -> Result<Response, ODataErrorResponse> {
+    let bad = || {
+        ODataErrorResponse::new(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "$id names no entity of this service",
+        )
+        .with_version(ctx.version)
+    };
+    let id = options
+        .id
+        .as_deref()
+        .and_then(percent_decoded)
+        .ok_or_else(bad)?;
+    let relative = id.strip_prefix(ctx.service_root).unwrap_or(&id);
+    if relative.starts_with('/') || relative.contains("://") {
+        return Err(bad());
+    }
+    let model = EdmModel(&reads.state.model);
+    let Ok(ODataUri::Resource { path, options }) =
+        odata_url::parse(relative, &model, &reads.state.url_limits)
+    else {
+        return Err(bad());
+    };
+    match path.as_slice() {
+        [Segment::EntitySet(set), Segment::Key(key)] if options == QueryOptions::default() => {
+            entity(reads, caller, ctx, set, key, &options).await
+        }
+        _ => Err(bad()),
+    }
+}
+
+/// `text` with each `%XX` decoded; `None` for a broken escape or bytes that
+/// are no UTF-8.
+fn percent_decoded(text: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut bytes = text.bytes();
+    while let Some(b) = bytes.next() {
+        out.push(if b == b'%' {
+            let hex = [bytes.next()?, bytes.next()?];
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?
+        } else {
+            b
+        });
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Whether no option but `$select` (and `$format`, `$schemaversion=*`,

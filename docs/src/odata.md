@@ -34,7 +34,17 @@ intersected with what the view shows:
 - a Relationship to a type the view shows is a navigation property; to
   any other type, the object URI as a string (R5);
 - every type derives from `NgsiLd.Entity`: `id` (the key), `_types`,
-  `scope`, `createdAt`, `modifiedAt`.
+  `scope`, `createdAt`, `modifiedAt`;
+- a class whose LinkML schema marks a slot `identifier: true`, and whose
+  view shows it, is keyed by that slot instead (T-3720): the type declares
+  the members of `NgsiLd.Entity` itself, and key value `v` names the Entity
+  `urn:ngsi-ld:{Class}:{v}`. The key is `Edm.String`, `Edm.Int64` for an
+  `integer` slot, or `Edm.Guid` when the slot carries the annotation
+  `edm_type: Edm.Guid`, so `Products(2dcd1e3c-e38a-5391-ba63-17ecfeaea3c2)`
+  reads `urn:ngsi-ld:Products:2dcd1e3c-e38a-5391-ba63-17ecfeaea3c2`.
+  `(ID=v)` names the same Entity. `(id='urn:…')` still names any Entity of
+  the set, and it is the canonical key of an Entity whose URN does not
+  follow the pattern. A key value never names an Entity of another set.
 
 A view without a schema, or with one the build cannot read, has no OData
 endpoint (`404`). Nothing the view hides appears in a document, a name or
@@ -57,7 +67,8 @@ root.
 | OData | NGSI-LD |
 |---|---|
 | `{Set}` | Query Entities (`type`), `count=true` |
-| `{Set}('{id}')`, `{Set}(id='{id}')` | Retrieve Entity |
+| `{Set}('{id}')`, `{Set}(id='{id}')`, the identifier's `{Set}(v)` | Retrieve Entity |
+| `$entity?$id={url}` | the `{Set}(key)` the percent-decoded URL names, absolute under the service root or relative to it; any other id is `400` |
 | `{Set}/$count` | Query Entities, `limit=0&count=true`, `text/plain` |
 | `{Set}('{id}')/{prop}`, `.../{prop}/$value` | Retrieve Attribute Value (the view's `operations` name `retrieve_attribute_value`); `$value` is `text/plain` |
 | `{Set}('{id}')/{nav}` | Retrieve Entity of the source, then Retrieve Entity of a single target or Query Entities `id=…` of up to 1000 |
