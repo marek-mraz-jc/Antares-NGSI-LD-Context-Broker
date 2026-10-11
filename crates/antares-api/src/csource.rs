@@ -1040,6 +1040,7 @@ pub async fn create_registration(
             }
         };
         validate_auxiliary_ops(&norm)?;
+        crate::federation::admit_registration(&st, &tenant, &norm).await?;
         // The creating subject, kept as a Subscription keeps it: an engine
         // narrows Query Registrations (5.10.2) by the subject the broker
         // recorded, never by a member the client wrote (T-3692).
@@ -1423,6 +1424,7 @@ pub async fn update_registration(
                 validate_exclusive(&merged)?;
                 // 5.9.3.4: the mode-specific rules apply to the merged document
                 validate_auxiliary_ops(&merged)?;
+                crate::federation::admit_registration(&st, &tenant, &merged).await?;
                 check_entity_conflict(&st, &tenant, &merged).await?;
                 check_proxied_overlap(&st, &tenant, &merged, Some(&id), &parsed.ctx).await?;
             }
