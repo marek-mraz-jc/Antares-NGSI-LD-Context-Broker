@@ -510,19 +510,16 @@ impl Here<'_> {
             Ok(p) => p,
             Err(refused) => return refused.reply(),
         };
-        match items::one(self.view, self.caller, c, id, &p, self.refs(p.profile)).await {
+        let refs = self.refs(p.profile);
+        match items::one(self.view, self.caller, c, id, &p, refs).await {
             Ok(mut feature) => {
                 let at = format!("{}/collections/{}", self.base, c.id);
                 let own = format!("{at}/items/{}", items::encode(id));
-                let entity = match feature.remove("links") {
-                    Some(Value::Array(links)) => links,
-                    _ => Vec::new(),
-                };
                 let links: Vec<Value> =
                     [link("self", GEOJSON, &own), link("collection", JSON, &at)]
                         .into_iter()
                         .chain(profile_link(c, p.profile))
-                        .chain(entity)
+                        .chain(refs.links(&c.id, id))
                         .collect();
                 feature.insert("links".into(), Value::from(links));
                 in_crs(p.crs, document(GEOJSON, &Value::Object(feature)))

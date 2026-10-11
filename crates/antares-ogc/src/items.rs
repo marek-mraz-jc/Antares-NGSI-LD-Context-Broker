@@ -890,6 +890,9 @@ mod tests {
             without.first().and_then(|l| l.get("rel")),
             Some(&json!("describedby"))
         );
+        let terms = Terms::of(&car());
+        let nameless = feature(&car(), &terms, &json!({"type": "Car"}), refs(true));
+        assert_eq!(nameless.get("links"), None, "no id, nothing to link");
         let elsewhere = Refs {
             base: "http://h/other",
             ..refs(true)
