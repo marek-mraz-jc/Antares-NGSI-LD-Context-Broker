@@ -156,10 +156,18 @@ with 150k instances.
 ### Pagination
 
 One response carries at most nine instances per attribute, and fewer
-when `firstN` or `lastN` asks for fewer. Every attribute is cut to the
-same count in the page order (oldest first, newest first with `lastN`),
-and the response links to its neighbours with `offsetN` moved by one page
-(TS 104 176 6.4.7.3). Twelve hourly instances of a sensor:
+when `firstN` or `lastN` asks for fewer. Above nine the page ends at one
+instant for the whole entity: the ninth instance, in the page order
+(oldest first, newest first with `lastN`), of the attribute that reaches
+it first. A sparser attribute serves fewer instances on that page, or
+none. The response links to its neighbours with `offsetN` moved by one
+page (TS 104 176 6.4.7.3). After such a cut the next link moves `offsetN`
+by the fewest instances a cut attribute served, so it repeats instances
+and never skips one. If an attribute served none, no `offsetN` continues
+it, and the next link moves the time window past the page's last instant
+instead (`timerel=after` ascending, which serves the instances at that
+instant once more; `timerel=before` with `lastN`). Twelve hourly
+instances of a sensor:
 
 ```text
 HTTP/1.1 206 Partial Content
