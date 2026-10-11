@@ -215,6 +215,34 @@ async fn an_anonymous_caller_gets_the_public_grant_as_a_rewrite() -> Res {
 }
 
 #[tokio::test]
+async fn an_anonymous_caller_gets_the_grant_of_the_endpoint_role_the_gateway_resolved() -> Res {
+    let (st, _) = broker(doc(&[grant(
+        "app",
+        "role",
+        "endpoint:p/e",
+        &["5.7.2"],
+        cars(&["speed"]),
+    )]))
+    .await?;
+    fleet(&st).await?;
+    // AP-97: the gateway pins the Endpoint's caller role for an anonymous caller it admits
+    let admitted = [("x-jc-roles", "endpoint%3Ap%2Fe")];
+    let (code, list) = send(&st, "GET", QUERY, &admitted, None).await?;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list), car_ids(&[1, 2, 3]));
+    // another Endpoint's role, or a realm role claimed beside it, grants nothing
+    for roles in ["endpoint%3Ap%2Fother", "admin", "endpoint:"] {
+        let other = [("x-jc-roles", roles)];
+        assert_eq!(
+            send(&st, "GET", QUERY, &other, None).await?.0,
+            StatusCode::FORBIDDEN,
+            "{roles}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_caller_the_policy_does_not_name_is_denied() -> Res {
     let (st, _) = broker(doc(&[grant(
         "bob",
