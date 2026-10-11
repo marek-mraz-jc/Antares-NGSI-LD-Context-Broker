@@ -281,13 +281,13 @@ async fn head_is_the_get_without_its_body() {
         let (head, head_headers, empty) = fetch(&app, Method::HEAD, &uri).await;
         assert_eq!(head, got, "{path}");
         assert!(empty.is_empty(), "{path}: {empty:?}");
-        assert_eq!(
-            head_headers
-                .get("content-length")
-                .and_then(|v| v.to_str().ok()),
-            Some(body.len().to_string().as_str()),
-            "{path}"
-        );
+        // One value: a second Content-Length makes hyper drop the answer (T-3737).
+        let lengths: Vec<_> = head_headers
+            .get_all("content-length")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(lengths, [body.len().to_string()], "{path}");
         for name in ["content-type", "odata-version"] {
             assert_eq!(
                 head_headers.get(name),
