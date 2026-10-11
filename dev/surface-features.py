@@ -13,7 +13,7 @@ surface joins by being declared, without a YAML edit.
   dev/surface-features.py --self-test  the gate is red on a synthetic overrun
 
 Budget: the "binary size" row of ADR-0027 section 6, read from the ADR so
-the gate cannot drift from it (`full` <= vanilla + 6 MiB, each feature alone
+the gate cannot drift from it (`full` <= vanilla + 7 MiB since T-3744, each feature alone
 <= vanilla + 2 MiB, `mcp` <= vanilla + 4.5 MiB since T-3662), measured as
 the size of the stripped release binary (the release profile strips
 symbols). The report is a Markdown table on stdout and, in GitHub Actions,
