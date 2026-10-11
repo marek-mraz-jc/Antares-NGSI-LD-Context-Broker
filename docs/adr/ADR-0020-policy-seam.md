@@ -266,6 +266,28 @@ never published as `antares-broker`, the Antares release image and every
 conformance cell keep `AllowAll`, and the deployment image claims no
 conformance, as the paragraph above already says of any engine.
 
+## Amendment: the view a request came through
+
+An engine that binds its rules per endpoint has to know which view a
+request came through, and a client must not be able to name one: a view
+whose Endpoint binds fewer Policies than the Tenant holds would otherwise
+be a way around a prohibition the plain root applies (platform T-3702).
+
+`Subject.headers` therefore carries one reserved pair, `("@view", id)`,
+when the request reached the broker through `/x/views/{id}/` (any view
+surface; `antares-ops` runs the inner request inside that scope).
+`Subject::view()` returns it. `@` is no header-name character (RFC 9110
+`tchar`), so no request, inner or outer, can carry the pair: the broker
+adds it from the in-process call alone, after the headers a deployment
+named. The pair is persisted with the rest of the subject (a
+Subscription, an EntityMap, a Snapshot, a registration), so a
+notification is decided for the view the Subscription was created
+through, and two subjects that differ only in their view are different
+creators. It is never served: the stored subject stays a `__` member.
+
+An engine that does not bind per view ignores the pair, as it ignores
+every header it was not told about; `AllowAll` is unchanged.
+
 ## Consequences
 
 - ADR-0014's phase table gains no row: the seam is a named user of two

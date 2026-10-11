@@ -4,7 +4,7 @@
 //! into the source model, run through the view as any other, and the answer
 //! rebuilt in the target model.
 
-use antares_ops::mapping::Mapping;
+use antares_ops::mapping::{self, Mapping};
 use antares_ops::{Caller, OperationId, OpsRequest, Refusal, ViewOps};
 use axum::body::Body;
 use axum::http::request::Parts;
@@ -48,9 +48,13 @@ pub(crate) async fn serve(
     let pairs = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(&parts.uri)
         .map(|q| q.0)
         .unwrap_or_default();
+    if mapping::DISCOVERY.contains(&op) {
+        // every discovery read is a GET: no body
+        return discover(view, mapping, op, caller, parts, path, &pairs).await;
+    }
     let inverted = mapping.invert(&pairs).map_err(Refusal::Malformed)?;
     if inverted.selects_nothing {
-        return if op == OperationId::QueryEntities {
+        return if matches!(op, OperationId::QueryEntities | OperationId::TemporalQuery) {
             Ok(empty_page(&parts, &pairs))
         } else {
             Err(Refusal::NotFound)
@@ -86,6 +90,68 @@ pub(crate) async fn serve(
     for (name, value) in &parts.headers {
         inner = inner.header(name.clone(), value.clone());
     }
+    let history = mapping::HISTORY.contains(&op);
+    answer(view, mapping, op, caller, inner, |json| match attribute {
+        Some(slot) => mapping.rebuild_attribute(slot, json),
+        None if history => mapping.rebuild_history(json, &inverted.keep),
+        None => mapping.rebuild(json, &inverted.keep),
+    })
+    .await
+}
+
+/// A discovery read (10.6.3 to 10.6.8): the type or Attribute its path
+/// names inverted, the view's narrowed answer named by the mapping.
+async fn discover(
+    view: &ViewOps,
+    mapping: &Mapping,
+    op: OperationId,
+    caller: &Caller,
+    parts: Parts,
+    path: &str,
+    pairs: &[(String, String)],
+) -> Result<Response, Refusal> {
+    mapping::discovery_pairs(pairs).map_err(Refusal::Malformed)?;
+    let (resource, segment) = path.rsplit_once('/').ok_or(Refusal::NotFound)?;
+    let mut slot = None;
+    let path = match op {
+        OperationId::RetrieveEntityTypeInfo => {
+            let class = mapping.source_type(segment).ok_or(Refusal::NotFound)?;
+            format!("{resource}/{class}")
+        }
+        OperationId::RetrieveAttributeInfo => {
+            let (s, source) = mapping
+                .source_attribute(segment)
+                .map_err(Refusal::Malformed)?;
+            slot = Some(s);
+            format!("{resource}/{source}")
+        }
+        _ => path.to_owned(),
+    };
+    let target = if pairs.is_empty() {
+        path
+    } else {
+        format!("{path}?{}", encode(pairs))
+    };
+    let mut inner = OpsRequest::new(parts.method, target).context(mapping.inner_context().clone());
+    for (name, value) in &parts.headers {
+        inner = inner.header(name.clone(), value.clone());
+    }
+    answer(view, mapping, op, caller, inner, |json| {
+        mapping.rebuild_discovery(json, slot);
+    })
+    .await
+}
+
+/// Run `inner` through the view and `rebuild` its answer in the target
+/// model; a refusal is reworded into the target model.
+async fn answer(
+    view: &ViewOps,
+    mapping: &Mapping,
+    op: OperationId,
+    caller: &Caller,
+    inner: OpsRequest,
+    rebuild: impl FnOnce(&mut serde_json::Value),
+) -> Result<Response, Refusal> {
     let answer = view.run(op, caller, inner).await?;
     let (mut parts, body) = answer.into_parts();
     let bytes = axum::body::to_bytes(body, MAX_ANSWER_BYTES)
@@ -101,10 +167,7 @@ pub(crate) async fn serve(
     let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Ok(Response::from_parts(parts, Body::from(bytes)));
     };
-    match attribute {
-        Some(slot) => mapping.rebuild_attribute(slot, &mut json),
-        None => mapping.rebuild(&mut json, &inverted.keep),
-    }
+    rebuild(&mut json);
     Ok(Response::from_parts(parts, Body::from(json.to_string())))
 }
 
