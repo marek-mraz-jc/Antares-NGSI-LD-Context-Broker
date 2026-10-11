@@ -33,11 +33,14 @@ pub enum Artifact {
     Rdf,
     /// Markdown.
     Markdown,
+    /// The RDF Data Cube structure, only when a kept class is a Data
+    /// Structure Definition (DM-60).
+    Qb,
 }
 
 impl Artifact {
     /// Every document, in the order an agent should read them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::LinkMl,
         Self::JsonSchema,
         Self::Context,
@@ -45,6 +48,7 @@ impl Artifact {
         Self::Owl,
         Self::Rdf,
         Self::Markdown,
+        Self::Qb,
     ];
 
     /// The file name it is published under.
@@ -62,6 +66,7 @@ impl Artifact {
             Self::Owl => "model.owl.ttl",
             Self::Rdf => "model.rdf.ttl",
             Self::Markdown => "model.md",
+            Self::Qb => "model.qb.ttl",
         }
     }
 
@@ -76,22 +81,21 @@ impl Artifact {
             Self::LinkMl => "text/yaml",
             Self::JsonSchema => "application/schema+json",
             Self::Context => "application/ld+json",
-            Self::Shacl | Self::Rdf => "text/turtle",
+            Self::Shacl | Self::Rdf | Self::Qb => "text/turtle",
             Self::Owl => "text/turtle; profile=\"owl\"",
             Self::Markdown => "text/markdown",
         }
     }
 
     /// The document one path segment names: a file name, its short name, or
-    /// `model`, which `accept` picks the formalism of (L7). `model.qb.ttl`
-    /// and `qb` name nothing: the subset holds no Data Structure Definition
-    /// (L6).
+    /// `model`, which `accept` picks the formalism of (L7); `model` never
+    /// picks the cube, which a model has only when it declares one (L6).
     ///
     /// ```
     /// use antares_linkml::Artifact;
     /// assert_eq!(Artifact::of("shacl", ""), Some(Artifact::Shacl));
     /// assert_eq!(Artifact::of("model", "text/yaml"), Some(Artifact::LinkMl));
-    /// assert_eq!(Artifact::of("qb", ""), None);
+    /// assert_eq!(Artifact::of("qb", ""), Some(Artifact::Qb));
     /// ```
     #[must_use]
     pub fn of(segment: &str, accept: &str) -> Option<Self> {
@@ -103,6 +107,7 @@ impl Artifact {
             "model.owl.ttl" | "owl" => Some(Self::Owl),
             "model.rdf.ttl" | "rdf" => Some(Self::Rdf),
             "model.md" | "docs" => Some(Self::Markdown),
+            "model.qb.ttl" | "qb" => Some(Self::Qb),
             "model" => Some(Self::negotiated(accept)),
             _ => None,
         }
@@ -129,8 +134,10 @@ impl Artifact {
         }
     }
 
-    fn render(self, model: &Model) -> String {
-        match self {
+    /// The document of `model`; `None` for the cube of a model that
+    /// declares no Data Structure Definition, which then does not exist.
+    fn render(self, model: &Model) -> Option<String> {
+        Some(match self {
             Self::LinkMl => linkml_model::yaml(model),
             Self::JsonSchema => linkml_model::json_schema(model),
             Self::Context => linkml_model::context(model),
@@ -138,7 +145,8 @@ impl Artifact {
             Self::Owl => linkml_model::owl(model),
             Self::Rdf => linkml_model::rdfs(model),
             Self::Markdown => linkml_model::markdown(model),
-        }
+            Self::Qb => return linkml_model::qb(model),
+        })
     }
 }
 
@@ -168,7 +176,7 @@ impl Rendered {
         let major = major(model.schema().version.as_deref());
         let documents: Vec<(Artifact, Arc<[u8]>)> = Artifact::ALL
             .iter()
-            .map(|a| (*a, Arc::from(a.render(&model).into_bytes())))
+            .filter_map(|a| Some((*a, Arc::from(a.render(&model)?.into_bytes()))))
             .collect();
         let artifacts: Map<String, Value> = documents
             .iter()

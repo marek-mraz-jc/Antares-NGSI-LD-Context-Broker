@@ -186,6 +186,30 @@ fn malformed_documents_are_malformed() {
     }
 }
 
+/// DM-60: a cube role is `dimension` or `measure`, `qb_dsd` a flag; the
+/// roles and the flag load.
+#[test]
+fn a_cube_annotation_outside_its_values_is_malformed() {
+    let tagged = |tag: &str, value: &str| json!({ tag: {"tag": tag, "value": value} });
+    for (pointer, tag, value) in [
+        ("/slots/size/annotations", "qb_component", "slice"),
+        ("/classes/Room/annotations", "qb_dsd", "yes"),
+    ] {
+        let got = load(&with(pointer, tagged(tag, value)));
+        assert!(matches!(got, Err(Error::Malformed(_))), "{tag}: {got:?}");
+    }
+    for (pointer, tag, value) in [
+        ("/slots/size/annotations", "qb_component", "dimension"),
+        ("/slots/size/annotations", "qb_component", "measure"),
+        ("/classes/Room/annotations", "qb_dsd", "false"),
+    ] {
+        assert!(
+            load(&with(pointer, tagged(tag, value))).is_ok(),
+            "{tag} {value}"
+        );
+    }
+}
+
 #[test]
 fn an_is_a_cycle_is_malformed_and_does_not_loop() {
     let doc = json!({

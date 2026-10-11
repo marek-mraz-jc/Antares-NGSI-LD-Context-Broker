@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 
 use serde_json::{json, Map, Value};
 
-use crate::model::{Builtin, Model, Range};
+use crate::model::{Builtin, Model, Range, QB_COMPONENT_TAG, QB_DSD_TAG};
 use crate::schema::{Annotation, Slot};
 
 // ---------------------------------------------------------------- YAML (L2)
@@ -525,7 +525,11 @@ fn rdf_range(model: &Model, slot: &Slot) -> String {
 #[must_use]
 pub fn owl(model: &Model) -> String {
     let s = model.schema();
+    let roles = cube_roles(model);
     let mut out = turtle_header("OWL ontology", &[("owl", "http://www.w3.org/2002/07/owl#")]);
+    if s.classes.keys().any(|c| is_dsd(model, c)) {
+        let _ = writeln!(out, "@prefix qb: <{QB}> .");
+    }
     let _ = write!(
         out,
         "\n<{}> a owl:Ontology ;\n  rdfs:label {}",
@@ -546,6 +550,9 @@ pub fn owl(model: &Model) -> String {
         if let Some(p) = &class.is_a {
             let _ = write!(out, " ;\n  rdfs:subClassOf <{}>", model.class_iri(p));
         }
+        if is_dsd(model, name) {
+            out.push_str(" ;\n  rdfs:subClassOf qb:Observation");
+        }
         if let Some(d) = &class.description {
             let _ = write!(out, " ;\n  rdfs:comment {}", lit(d));
         }
@@ -556,6 +563,10 @@ pub fn owl(model: &Model) -> String {
             "owl:ObjectProperty"
         } else {
             "owl:DatatypeProperty"
+        };
+        let kind = match roles.get(name.as_str()) {
+            Some(role) => format!("{kind}, {role}"),
+            None => kind.to_owned(),
         };
         let _ = write!(
             out,
@@ -573,6 +584,120 @@ pub fn owl(model: &Model) -> String {
         out.push_str(" .\n");
     }
     out
+}
+
+/// The W3C RDF Data Cube vocabulary (DM-60).
+const QB: &str = "http://purl.org/linked-data/cube#";
+
+/// Whether class `name` is a Data Structure Definition: annotated
+/// `qb_dsd: "true"` (DM-60).
+fn is_dsd(model: &Model, name: &str) -> bool {
+    model
+        .schema()
+        .classes
+        .get(name)
+        .and_then(|c| c.annotations.get(QB_DSD_TAG))
+        .is_some_and(|a| a.value == "true")
+}
+
+/// A slot's role in a cube, as the key a structure names it by and its
+/// property type; `None` for a slot without `qb_component`.
+fn component(slot: &Slot) -> Option<(&'static str, &'static str)> {
+    // the load refuses any value but these two
+    if slot.annotations.get(QB_COMPONENT_TAG)?.value == "dimension" {
+        Some(("qb:dimension", "qb:DimensionProperty"))
+    } else {
+        Some(("qb:measure", "qb:MeasureProperty"))
+    }
+}
+
+/// The cube property type of each slot that is a component of some Data
+/// Structure Definition of the model, by slot name.
+fn cube_roles(model: &Model) -> BTreeMap<&str, &'static str> {
+    model
+        .schema()
+        .classes
+        .keys()
+        .filter(|c| is_dsd(model, c))
+        .flat_map(|c| model.class_slots(c))
+        .filter_map(|(name, slot)| Some((name, component(&slot)?.1)))
+        .collect()
+}
+
+/// The RDF Data Cube structure (row L6, `model.qb.ttl`, DM-60): one
+/// `qb:DataStructureDefinition` per class that is one, its components the
+/// slots annotated `qb_component`, the class a subclass of
+/// `qb:Observation`. No `qb:order`: the vocabulary makes it optional, and a
+/// narrowed model may have dropped components. `None` when no class is a
+/// Data Structure Definition: the document does not exist then, it is not
+/// an empty cube.
+///
+/// ```
+/// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "s",
+///     "classes": {"Count": {"slots": ["year", "n"],
+///                           "annotations": {"qb_dsd": {"tag": "qb_dsd", "value": "true"}}}},
+///     "slots": {"year": {"range": "integer",
+///                        "annotations": {"qb_component": {"tag": "qb_component", "value": "dimension"}}},
+///               "n": {"range": "integer",
+///                     "annotations": {"qb_component": {"tag": "qb_component", "value": "measure"}}}}}"#,
+///     &linkml_model::Limits { max_bytes: 999, max_depth: 8, max_elements: 99 }).unwrap();
+/// let ttl = linkml_model::qb(&m).unwrap();
+/// assert!(ttl.contains("<https://e.org/s/CountStructure> a qb:DataStructureDefinition"));
+/// assert!(ttl.contains("[ qb:measure <https://e.org/s/n> ]"));
+/// ```
+#[must_use]
+pub fn qb(model: &Model) -> Option<String> {
+    let s = model.schema();
+    let cubes: Vec<&String> = s.classes.keys().filter(|c| is_dsd(model, c)).collect();
+    if cubes.is_empty() {
+        return None;
+    }
+    let mut out = turtle_header("RDF Data Cube structure", &[("qb", QB)]);
+    for name in cubes {
+        let iri = model.class_iri(name);
+        let components: Vec<(&str, Slot, (&str, &str))> = model
+            .class_slots(name)
+            .into_iter()
+            .filter_map(|(n, slot)| {
+                let role = component(&slot)?;
+                Some((n, slot, role))
+            })
+            .collect();
+        let _ = write!(
+            out,
+            "\n<{iri}Structure> a qb:DataStructureDefinition ;\n  rdfs:label {}",
+            lit(name)
+        );
+        if let Some(d) = s.classes.get(name).and_then(|c| c.description.as_ref()) {
+            let _ = write!(out, " ;\n  rdfs:comment {}", lit(d));
+        }
+        let entries: Vec<String> = components
+            .iter()
+            .map(|(n, slot, (key, _))| {
+                format!("{IN}{IN}[ {key} <{}> ]", refined_iri(model, n, slot))
+            })
+            .collect();
+        if entries.is_empty() {
+            out.push_str(" .\n");
+        } else {
+            let _ = write!(out, " ;\n  qb:component\n{} .\n", entries.join(" ,\n"));
+        }
+        let _ = writeln!(out, "\n<{iri}> rdfs:subClassOf qb:Observation .");
+        for (n, slot, (_, kind)) in &components {
+            let _ = write!(
+                out,
+                "\n<{}> a rdf:Property, {kind} ;\n  rdfs:label {} ;\n  rdfs:range {}",
+                refined_iri(model, n, slot),
+                lit(n),
+                rdf_range(model, slot)
+            );
+            if let Some(d) = &slot.description {
+                let _ = write!(out, " ;\n  rdfs:comment {}", lit(d));
+            }
+            out.push_str(" .\n");
+        }
+    }
+    Some(out)
 }
 
 /// The RDFS rendering (row L6, `model.rdf.ttl`): classes, subclasses,
