@@ -361,6 +361,21 @@ impl Drop for Closing {
     }
 }
 
+/// A read is read-only; a write is destructive unless it only adds (MCP
+/// `destructiveHint`: a create cannot remove or overwrite what is there).
+fn annotations(t: &tools::ToolDef) -> ToolAnnotations {
+    let hints = ToolAnnotations::new().read_only(!t.write).open_world(false);
+    let additive = matches!(
+        t.name,
+        "create_entity" | "create_subscription" | "batch_create"
+    );
+    if t.write {
+        hints.destructive(!additive)
+    } else {
+        hints
+    }
+}
+
 /// The rows of a page that fit the budget, in order, and whether any were
 /// left out. A page is never cut inside a row.
 fn fit(rows: Vec<Value>) -> (Vec<Value>, bool) {
@@ -571,7 +586,7 @@ impl ServerHandler for Server {
                     t.description,
                     Arc::new(schema::input_schema(t.args, &names)),
                 )
-                .annotate(ToolAnnotations::new().read_only(!t.write).open_world(false))
+                .annotate(annotations(t))
             })
             .collect();
         Ok(ListToolsResult::with_all_items(tools)
