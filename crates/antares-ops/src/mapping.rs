@@ -35,10 +35,36 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// The operations a mapped view may allow (section 7): the reads whose
 /// request the view root inverts and whose answer it rebuilds.
-pub const READS: [crate::OperationId; 3] = [
+pub const READS: [crate::OperationId; 11] = [
     crate::OperationId::RetrieveEntity,
     crate::OperationId::QueryEntities,
     crate::OperationId::RetrieveAttributeValue,
+    crate::OperationId::TemporalRetrieve,
+    crate::OperationId::TemporalQuery,
+    crate::OperationId::RetrieveEntityTypes,
+    crate::OperationId::RetrieveEntityTypeDetails,
+    crate::OperationId::RetrieveEntityTypeInfo,
+    crate::OperationId::RetrieveAttributes,
+    crate::OperationId::RetrieveAttributeDetails,
+    crate::OperationId::RetrieveAttributeInfo,
+];
+
+/// The discovery reads (10.6.3 to 10.6.8): answered from the view's
+/// narrowed answer and named by the mapping ([`Mapping::rebuild_discovery`]).
+pub const DISCOVERY: [crate::OperationId; 6] = [
+    crate::OperationId::RetrieveEntityTypes,
+    crate::OperationId::RetrieveEntityTypeDetails,
+    crate::OperationId::RetrieveEntityTypeInfo,
+    crate::OperationId::RetrieveAttributes,
+    crate::OperationId::RetrieveAttributeDetails,
+    crate::OperationId::RetrieveAttributeInfo,
+];
+
+/// The temporal reads (11.3.2, 11.3.3): each instance rebuilt
+/// ([`Mapping::rebuild_history`]).
+pub const HISTORY: [crate::OperationId; 2] = [
+    crate::OperationId::TemporalRetrieve,
+    crate::OperationId::TemporalQuery,
 ];
 
 /// The IR version this interpreter runs (DM-52).
@@ -61,8 +87,9 @@ const STRUCTURAL: [&str; 3] = ["id", "@id", "scope"];
 const SYSTEM: [&str; 4] = ["createdAt", "modifiedAt", "deletedAt", "expiresAt"];
 
 /// The parameters that pass to the broker as the caller wrote them: none
-/// names an Attribute or a type.
-const PASSED: [&str; 15] = [
+/// names an Attribute or a type (`timeproperty` names a member NGSI-LD puts
+/// on every instance).
+const PASSED: [&str; 20] = [
     "id",
     "idPattern",
     "georel",
@@ -78,7 +105,15 @@ const PASSED: [&str; 15] = [
     "orderFrom",
     "orderGeometry",
     "collation",
+    "timerel",
+    "timeAt",
+    "endTimeAt",
+    "timeproperty",
+    "lastN",
 ];
+
+/// The parameters of a discovery read; none names an Attribute or a type.
+const DISCOVERY_PASSED: [&str; 3] = ["details", "local", "count"];
 
 /// The attribute types of the normalized form (4.5).
 const ATTRIBUTE_TYPES: [&str; 8] = [
@@ -192,6 +227,7 @@ struct Slot {
 /// when a shorter term of the core `@context` names the same IRI.
 #[derive(Debug, Clone, PartialEq)]
 struct Source {
+    iri: String,
     term: String,
     key: String,
 }
@@ -213,6 +249,9 @@ pub struct Mapping {
     sources: Vec<Source>,
     /// The `@context` the rebuilt answer carries.
     served: Value,
+    /// The core with the inner terms over it: what the broker's answer
+    /// names mean.
+    answer: Context,
 }
 
 /// A request inverted into the source model.
@@ -299,7 +338,7 @@ impl Mapping {
         for (index, entry) in listed.iter().enumerate() {
             raw.push(slot(index, entry, &iri)?);
         }
-        let (inner, source_of) = sources(&raw, &source_class)?;
+        let (inner, source_of, answer) = sources(&raw, &source_class)?;
         let key_of: BTreeMap<String, String> = source_of
             .iter()
             .map(|(iri, s)| (iri.clone(), s.key.clone()))
@@ -326,6 +365,7 @@ impl Mapping {
             source_class,
             slots,
             inner: Value::Object(inner),
+            answer,
             ctx,
             served: served.map_or_else(
                 || Value::String(antares_jsonld::CORE_CONTEXT.to_owned()),
@@ -381,6 +421,11 @@ impl Mapping {
                 }
                 "q" => self.invert_q(value)?,
                 "geoproperty" | "geometryProperty" => self.geo_property(value)?,
+                // an aggregate of a translated value is not the translation
+                // of the aggregate (an offset summed n times)
+                "options" if value.split(',').any(|o| o.trim() == "aggregatedValues") => {
+                    return Err(NOT_SERVED)
+                }
                 "orderBy" => self.invert_order_by(value)?,
                 "format"
                     if matches!(
@@ -627,14 +672,29 @@ impl Mapping {
         match body {
             Value::Array(entities) => {
                 for e in entities {
-                    self.rebuild_entity(e, keep);
+                    self.rebuild_entity(e, keep, false);
                 }
             }
-            entity => self.rebuild_entity(entity, keep),
+            entity => self.rebuild_entity(entity, keep, false),
         }
     }
 
-    fn rebuild_entity(&self, entity: &mut Value, keep: &Keep) {
+    /// Rebuild a temporal answer (11.3.2, 11.3.3) in the target model:
+    /// each instance of a renamed or translated slot, in the normalized
+    /// and the `temporalValues` form. A constant and a computed slot have
+    /// no history and are left out.
+    pub fn rebuild_history(&self, body: &mut Value, keep: &Keep) {
+        match body {
+            Value::Array(entities) => {
+                for e in entities {
+                    self.rebuild_entity(e, keep, true);
+                }
+            }
+            entity => self.rebuild_entity(entity, keep, true),
+        }
+    }
+
+    fn rebuild_entity(&self, entity: &mut Value, keep: &Keep, history: bool) {
         let Some(members) = entity.as_object() else {
             return;
         };
@@ -657,6 +717,7 @@ impl Mapping {
                 continue;
             }
             let value = match &slot.derivation {
+                Derivation::Constant(_) | Derivation::Expr(_) if history => None,
                 Derivation::Constant(v) => Some(produced(v.clone(), normalized)),
                 Derivation::Expr(e) => e.evaluate(members).map(|v| produced(v, normalized)),
                 d => slot
@@ -677,6 +738,224 @@ impl Mapping {
         }
         *entity = Value::Object(out);
     }
+}
+
+impl Mapping {
+    /// The term the inner request names the type of Retrieve Entity Type
+    /// Information by (its path segment, percent-encoded as sent): the
+    /// target class reads the source class; `None` for any other type.
+    #[must_use]
+    pub fn source_type(&self, segment: &str) -> Option<&'static str> {
+        let name = antares_ql::percent_decode(segment.as_bytes());
+        (self.ctx.expand_key(&name) == self.target_class_iri).then_some(CLASS_TERM)
+    }
+
+    /// A discovery answer (10.6.3 to 10.6.8) in the target model: the
+    /// target class for the source class, and the target slots the view
+    /// shows for the source Attributes the narrowed answer names (ADR-0023
+    /// rule 5, then named by the mapping). A slot with a source shows when
+    /// its source does, a computed one when every source it reads does, a
+    /// constant when the answer shows the class or any Attribute of it; no
+    /// source name survives. `slot` is the slot Retrieve Attribute
+    /// Information asked for.
+    pub fn rebuild_discovery(&self, body: &mut Value, slot: Option<usize>) {
+        match body {
+            Value::Array(items) => {
+                let rebuilt = if items
+                    .iter()
+                    .any(|i| i.get("type").and_then(Value::as_str) == Some("EntityType"))
+                {
+                    items
+                        .iter()
+                        .filter(|i| self.is_source_class(i.get("id")))
+                        .map(|i| self.entity_type(i))
+                        .collect()
+                } else {
+                    self.attribute_entries(items)
+                };
+                *items = rebuilt;
+            }
+            Value::Object(m) => {
+                let names = |key: &str| -> Vec<Value> {
+                    m.get(key)
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                match m.get("type").and_then(Value::as_str) {
+                    Some("EntityTypeList") => {
+                        let shows = names("typeList")
+                            .iter()
+                            .any(|t| self.is_source_class(Some(t)));
+                        let list = if shows {
+                            vec![Value::String(self.target_class.clone())]
+                        } else {
+                            Vec::new()
+                        };
+                        m.insert("typeList".into(), Value::Array(list));
+                    }
+                    Some("EntityTypeInfo") => {
+                        let details = self.attribute_entries(&names("attributeDetails"));
+                        self.name_class(m);
+                        m.insert("attributeDetails".into(), Value::Array(details));
+                    }
+                    Some("AttributeList") => {
+                        let present = self.present(&names("attributeList"));
+                        let list = self
+                            .shown(&present, !present.is_empty())
+                            .map(|s| Value::String(s.term.clone()))
+                            .collect();
+                        m.insert("attributeList".into(), Value::Array(list));
+                    }
+                    Some("Attribute") => {
+                        if let Some(s) = slot.and_then(|i| self.slots.get(i)) {
+                            self.name_attribute(m, s);
+                        }
+                    }
+                    _ => {}
+                }
+                self.serve_context(m);
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `name` (an IRI or a term of the answer) is the source class.
+    fn is_source_class(&self, name: Option<&Value>) -> bool {
+        name.and_then(Value::as_str)
+            .is_some_and(|n| self.answer.expand_key(n) == self.source_class)
+    }
+
+    /// The source IRIs `names` (IRIs or terms of the answer) name.
+    fn present(&self, names: &[Value]) -> BTreeSet<String> {
+        names
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|n| self.answer.expand_key(n))
+            .filter(|iri| self.sources.iter().any(|s| &s.iri == iri))
+            .collect()
+    }
+
+    /// The slots shown when the answer names the sources in `present`;
+    /// `class`: it shows the class.
+    fn shown<'a>(
+        &'a self,
+        present: &'a BTreeSet<String>,
+        class: bool,
+    ) -> impl Iterator<Item = &'a Slot> + 'a {
+        self.slots
+            .iter()
+            .filter(move |slot| match &slot.derivation {
+                Derivation::Constant(_) => class,
+                Derivation::Expr(e) => {
+                    let mut keys = Vec::new();
+                    e.reads(&mut keys);
+                    class
+                        && keys.iter().all(|k| {
+                            self.sources
+                                .iter()
+                                .any(|s| &s.key == k && present.contains(&s.iri))
+                        })
+                }
+                _ => slot
+                    .source
+                    .as_ref()
+                    .is_some_and(|s| present.contains(&s.iri)),
+            })
+    }
+
+    /// One `EntityType` of the detailed type list, for the source class.
+    fn entity_type(&self, item: &Value) -> Value {
+        let mut out = item.as_object().cloned().unwrap_or_default();
+        let names = out
+            .get("attributeNames")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let present = self.present(&names);
+        let shown = self
+            .shown(&present, true)
+            .map(|s| Value::String(s.term.clone()))
+            .collect();
+        self.name_class(&mut out);
+        out.insert("attributeNames".into(), Value::Array(shown));
+        self.serve_context(&mut out);
+        Value::Object(out)
+    }
+
+    /// `Attribute` entries (a detailed list, or a type's
+    /// `attributeDetails`) in the target model: one per shown slot, made
+    /// from its source's entry; a slot without a source is a Property.
+    fn attribute_entries(&self, entries: &[Value]) -> Vec<Value> {
+        let ids: Vec<Value> = entries
+            .iter()
+            .filter_map(|e| e.get("id").cloned())
+            .collect();
+        let present = self.present(&ids);
+        let entry_of = |iri: &str| {
+            entries.iter().find(|e| {
+                e.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| self.answer.expand_key(id) == iri)
+            })
+        };
+        self.shown(&present, !present.is_empty())
+            .filter_map(|slot| {
+                let from = slot.source.as_ref().and_then(|s| entry_of(&s.iri));
+                let mut out = from.or_else(|| entries.first())?.as_object()?.clone();
+                if from.is_none() {
+                    out.remove("attributeCount");
+                    if out.contains_key("attributeTypes") {
+                        out.insert("attributeTypes".into(), serde_json::json!(["Property"]));
+                    }
+                }
+                self.name_attribute(&mut out, slot);
+                self.serve_context(&mut out);
+                Some(Value::Object(out))
+            })
+            .collect()
+    }
+
+    fn name_class(&self, m: &mut Map<String, Value>) {
+        m.insert("id".into(), Value::String(self.target_class_iri.clone()));
+        m.insert("typeName".into(), Value::String(self.target_class.clone()));
+    }
+
+    fn name_attribute(&self, m: &mut Map<String, Value>, slot: &Slot) {
+        m.insert("id".into(), Value::String(slot.iri.clone()));
+        m.insert("attributeName".into(), Value::String(slot.term.clone()));
+        if m.contains_key("typeNames") {
+            m.insert(
+                "typeNames".into(),
+                Value::Array(vec![Value::String(self.target_class.clone())]),
+            );
+        }
+    }
+
+    fn serve_context(&self, m: &mut Map<String, Value>) {
+        if m.contains_key("@context") {
+            m.insert("@context".into(), self.served.clone());
+        }
+    }
+}
+
+/// The parameters of a discovery read: `details`, `local` and `count`
+/// pass, once each.
+///
+/// # Errors
+/// The fixed text of the 400: a parameter named twice or one a mapped view
+/// does not serve.
+pub fn discovery_pairs(pairs: &[(String, String)]) -> Result<(), &'static str> {
+    let mut seen = BTreeSet::new();
+    for (name, _) in pairs {
+        if !seen.insert(name.as_str()) {
+            return Err(TWICE);
+        }
+        if !DISCOVERY_PASSED.contains(&name.as_str()) {
+            return Err(NOT_SERVED);
+        }
+    }
+    Ok(())
 }
 
 impl Derivation {
@@ -993,6 +1272,20 @@ fn map_value(attribute: &Value, transform: &dyn Fn(&Value) -> Value) -> Value {
                 out.insert(key.to_owned(), transform(v));
                 Value::Object(out)
             }
+            // `temporalValues` (4.5.9): `[value, time]` pairs
+            None if ["values", "objects"].iter().any(|k| m.contains_key(*k)) => {
+                let mut out = m.clone();
+                for key in ["values", "objects"] {
+                    if let Some(Value::Array(pairs)) = out.get_mut(key) {
+                        for pair in pairs {
+                            if let Some(v) = pair.get_mut(0) {
+                                *v = transform(v);
+                            }
+                        }
+                    }
+                }
+                Value::Object(out)
+            }
             // a geometry or a language map in the simplified form: no
             // scalar to translate
             None => attribute.clone(),
@@ -1067,7 +1360,10 @@ fn produced(v: Value, normalized: bool) -> Value {
 /// The inline `@context` of the inner request, and each source IRI's
 /// generated term and answer key: one term per IRI, in IRI order, so equal
 /// IRs give equal inner requests.
-fn sources(raw: &[RawSlot], source_class: &str) -> Result<(Map<String, Value>, SourceMap), String> {
+fn sources(
+    raw: &[RawSlot],
+    source_class: &str,
+) -> Result<(Map<String, Value>, SourceMap, Context), String> {
     let iris: BTreeSet<String> = raw
         .iter()
         .flat_map(|(_, source, derivation, _)| {
@@ -1102,13 +1398,14 @@ fn sources(raw: &[RawSlot], source_class: &str) -> Result<(Map<String, Value>, S
             (
                 iri.clone(),
                 Source {
+                    iri: iri.clone(),
                     term: term.clone(),
                     key,
                 },
             )
         })
         .collect();
-    Ok((inner, source_of))
+    Ok((inner, source_of, answer))
 }
 
 /// Each source IRI with its term and its answer key.

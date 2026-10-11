@@ -1252,3 +1252,238 @@ fn an_inverse_too_large_to_round_is_kept_as_it_is() {
     let n: f64 = q.trim_start_matches("s==").parse().unwrap_or_default();
     assert!((n - 1.0 / 1e-300).abs() <= 1e284, "{q}: not rounded away");
 }
+
+const DEFAULT: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+
+fn iri(name: &str) -> String {
+    format!("{DEFAULT}{name}")
+}
+
+#[test]
+fn the_temporal_parameters_pass_and_an_aggregate_is_refused() {
+    let m = mapping();
+    let asked = pairs(&[
+        ("timerel", "between"),
+        ("timeAt", "2026-01-01T00:00:00Z"),
+        ("endTimeAt", "2026-02-01T00:00:00Z"),
+        ("timeproperty", "observedAt"),
+        ("lastN", "3"),
+        ("options", "temporalValues"),
+        ("attrs", "temperature"),
+    ]);
+    let inverted = m.invert(&asked).map(|i| i.pairs);
+    let mut expected = asked.clone();
+    if let Some(attrs) = expected.last_mut() {
+        attrs.1 = term(&m, "teplota");
+    }
+    assert_eq!(inverted, Ok(expected));
+    for refused in [
+        ("options", "temporalValues,aggregatedValues"),
+        ("options", " aggregatedValues"),
+        ("aggrMethods", "avg"),
+        ("aggrPeriodDuration", "PT1H"),
+    ] {
+        assert_eq!(
+            m.invert(&pairs(&[refused])).map(|i| i.pairs),
+            Err(NOT_SERVED),
+            "{refused:?}"
+        );
+    }
+}
+
+#[test]
+fn every_instance_of_a_history_is_rebuilt_and_what_has_none_is_left_out() {
+    let m = mapping();
+    let history = json!({
+        "id": STATION, "type": "jcSrcClass",
+        "teplota": [
+            {"type": "Property", "value": 293.15, "observedAt": "2026-01-01T00:00:00Z", "instanceId": "urn:i:1"},
+            {"type": "Property", "value": 283.15, "observedAt": "2026-01-02T00:00:00Z", "instanceId": "urn:i:2"}
+        ],
+        "spolahlivost": {"type": "Property", "values": [["vysoka", "2026-01-01T00:00:00Z"], ["inak", "2026-01-02T00:00:00Z"]]},
+        "nazov": [{"type": "Property", "value": "S", "observedAt": "2026-01-01T00:00:00Z"}]
+    });
+    let mut body = Value::Array(vec![answered(&m, &history)]);
+    m.rebuild_history(&mut body, &Keep::default());
+    assert_eq!(
+        body,
+        json!([{
+            "id": STATION, "type": "AirQualityObserved",
+            "temperature": [
+                {"type": "Property", "value": 20.0, "observedAt": "2026-01-01T00:00:00Z", "instanceId": "urn:i:1"},
+                {"type": "Property", "value": 10.0, "observedAt": "2026-01-02T00:00:00Z", "instanceId": "urn:i:2"}
+            ],
+            "reliability": {"type": "Property", "values": [["high", "2026-01-01T00:00:00Z"], ["inak", "2026-01-02T00:00:00Z"]]}
+        }]),
+        "the constant and the expression over `nazov` have no history"
+    );
+    let mut one = answered(&m, &history);
+    m.rebuild_history(&mut one, &Keep::default());
+    assert_eq!(one.get("type"), Some(&json!("AirQualityObserved")));
+    let mut current = answered(&m, &stored());
+    m.rebuild(&mut current, &Keep::default());
+    assert!(current.get("dataProvider").is_some(), "{current}");
+}
+
+#[test]
+fn a_type_list_names_the_target_class_only_for_the_source_class() {
+    let m = mapping();
+    for (inner, shown) in [
+        (json!(["jcSrcClass"]), json!(["AirQualityObserved"])),
+        (json!([iri("MestskySenzor")]), json!(["AirQualityObserved"])),
+        (json!(["Other"]), json!([])),
+        (json!([]), json!([])),
+    ] {
+        let mut body = json!({"id": "urn:ngsi-ld:EntityTypeList:1", "type": "EntityTypeList", "typeList": inner});
+        m.rebuild_discovery(&mut body, None);
+        assert_eq!(
+            body,
+            json!({"id": "urn:ngsi-ld:EntityTypeList:1", "type": "EntityTypeList", "typeList": shown})
+        );
+    }
+}
+
+#[test]
+fn discovery_names_the_slots_whose_sources_the_view_shows() {
+    let m = mapping();
+    let (teplota, nazov, spolahlivost) = (
+        term(&m, "teplota"),
+        term(&m, "nazov"),
+        term(&m, "spolahlivost"),
+    );
+    // `nazov` shown alone: `label` also reads `spolahlivost`, so it stays out
+    let mut details = json!([
+        {"id": iri("MestskySenzor"), "type": "EntityType", "typeName": "jcSrcClass",
+         "attributeNames": [teplota, nazov, "kalibracia"]},
+        {"id": iri("Other"), "type": "EntityType", "typeName": "Other", "attributeNames": ["x"]}
+    ]);
+    m.rebuild_discovery(&mut details, None);
+    assert_eq!(
+        details,
+        json!([{"id": iri("AirQualityObserved"), "type": "EntityType", "typeName": "AirQualityObserved",
+                "attributeNames": ["temperature", "dataProvider"]}])
+    );
+    let mut list = json!({"id": "urn:x", "type": "AttributeList",
+                          "attributeList": [teplota, nazov, spolahlivost, "kalibracia"]});
+    m.rebuild_discovery(&mut list, None);
+    assert_eq!(
+        list.get("attributeList"),
+        Some(&json!([
+            "temperature",
+            "reliability",
+            "dataProvider",
+            "label"
+        ]))
+    );
+    let mut none = json!({"id": "urn:x", "type": "AttributeList", "attributeList": ["kalibracia"]});
+    m.rebuild_discovery(&mut none, None);
+    assert_eq!(
+        none.get("attributeList"),
+        Some(&json!([])),
+        "no source shown: not even the constant"
+    );
+    let mut empty = json!([]);
+    m.rebuild_discovery(&mut empty, None);
+    assert_eq!(empty, json!([]));
+}
+
+#[test]
+fn attribute_entries_are_made_from_their_sources() {
+    let m = mapping();
+    let mut info = json!({
+        "@context": "inner", "id": iri("MestskySenzor"), "type": "EntityTypeInfo",
+        "typeName": "jcSrcClass", "entityCount": 2,
+        "attributeDetails": [
+            {"id": iri("teplota"), "type": "Attribute", "attributeName": term(&m, "teplota"), "attributeTypes": ["Property"]},
+            {"id": iri("kalibracia"), "type": "Attribute", "attributeName": "kalibracia", "attributeTypes": ["Property"]}
+        ]
+    });
+    m.rebuild_discovery(&mut info, None);
+    assert_eq!(
+        info,
+        json!({
+            "@context": antares_jsonld::CORE_CONTEXT, "id": iri("AirQualityObserved"),
+            "type": "EntityTypeInfo", "typeName": "AirQualityObserved", "entityCount": 2,
+            "attributeDetails": [
+                {"id": iri("temperature"), "type": "Attribute", "attributeName": "temperature", "attributeTypes": ["Property"]},
+                {"id": iri("dataProvider"), "type": "Attribute", "attributeName": "dataProvider", "attributeTypes": ["Property"]}
+            ]
+        })
+    );
+    let mut details = json!([
+        {"id": iri("pocet"), "type": "Attribute", "attributeName": term(&m, "pocet"), "typeNames": ["jcSrcClass"]}
+    ]);
+    m.rebuild_discovery(&mut details, None);
+    assert_eq!(
+        details,
+        json!([
+            {"id": iri("stationCount"), "type": "Attribute", "attributeName": "stationCount", "typeNames": ["AirQualityObserved"]},
+            {"id": iri("dataProvider"), "type": "Attribute", "attributeName": "dataProvider", "typeNames": ["AirQualityObserved"]}
+        ])
+    );
+    let (slot, source) = m.source_attribute("pm25").unwrap_or_default();
+    assert_eq!(source, term(&m, "pm2p5"));
+    let mut one = json!({"id": iri("pm2p5"), "type": "Attribute", "attributeName": source,
+                         "attributeCount": 3, "attributeTypes": ["Property"], "typeNames": ["jcSrcClass"]});
+    m.rebuild_discovery(&mut one, Some(slot));
+    assert_eq!(
+        one,
+        json!({"id": iri("pm25"), "type": "Attribute", "attributeName": "pm25",
+               "attributeCount": 3, "attributeTypes": ["Property"], "typeNames": ["AirQualityObserved"]})
+    );
+    let mut other = json!({"type": "Unknown", "x": 1});
+    m.rebuild_discovery(&mut other, None);
+    assert_eq!(other, json!({"type": "Unknown", "x": 1}));
+}
+
+#[test]
+fn a_discovery_read_names_the_target_class_and_takes_its_own_parameters() {
+    let m = mapping();
+    assert_eq!(m.source_type("AirQualityObserved"), Some("jcSrcClass"));
+    assert_eq!(
+        m.source_type(
+            "https%3A%2F%2Furi.etsi.org%2Fngsi-ld%2Fdefault-context%2FAirQualityObserved"
+        ),
+        Some("jcSrcClass")
+    );
+    for other in ["MestskySenzor", "jcSrcClass", ""] {
+        assert_eq!(m.source_type(other), None, "{other}");
+    }
+    assert_eq!(
+        discovery_pairs(&pairs(&[
+            ("details", "true"),
+            ("local", "true"),
+            ("count", "true")
+        ])),
+        Ok(())
+    );
+    assert_eq!(discovery_pairs(&pairs(&[("type", "X")])), Err(NOT_SERVED));
+    assert_eq!(
+        discovery_pairs(&pairs(&[("details", "true"), ("details", "false")])),
+        Err(TWICE)
+    );
+}
+
+#[test]
+fn what_discovery_or_a_history_cannot_name_passes_as_it_is() {
+    let m = mapping();
+    for mut body in [
+        json!(null),
+        json!("text"),
+        json!({"id": iri("x"), "type": "Attribute", "attributeName": "x"}),
+    ] {
+        let before = body.clone();
+        m.rebuild_discovery(&mut body, None);
+        assert_eq!(body, before);
+    }
+    let mut history = answered(
+        &m,
+        &json!({"id": STATION, "type": "jcSrcClass",
+                "teplota": {"type": "Property", "values": [[], [283.15]]}}),
+    );
+    m.rebuild_history(&mut history, &Keep::default());
+    assert_eq!(
+        history.get("temperature"),
+        Some(&json!({"type": "Property", "values": [[], [10.0]]}))
+    );
+}
