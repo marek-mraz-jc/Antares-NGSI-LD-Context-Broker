@@ -38,7 +38,8 @@ The collections are the view's Tenant's LinkML schema
 (`/q/schemas/{tenant}`) intersected with what the view shows:
 
 - one collection per class whose type the view shows, its `collectionId`
-  the class name (a name that is no plain path segment is left out);
+  the class name (a name that is no plain path segment is left out); a
+  view of `*` (ADR-0023 rule 12) shows every class with every slot;
 - a Feature's `geometry` is the slot annotated `ogc_role:
   primary-geometry`, else `location` when the view shows it, else `null`;
 - `properties` are the other Attributes the view shows, by slot name;

@@ -243,7 +243,7 @@ jobs:
       # The ETSI resource sampler + its sample↔TP join fail silently when
       # broken (an empty column reads as "nothing happened") — check them here.
       - name: ETSI sampling self-check
-        run: python3 dev/etsi-selftest.py
+        run: pip install --quiet pyyaml && python3 dev/etsi-selftest.py
       # The external-suites harness (T-3549): its comparator and adapters
       # decide verdicts, and a wrong one reads as a plausible pass.
       - name: External-suites harness self-check
@@ -510,8 +510,7 @@ jobs:
         if: matrix.package != 'workspace' && matrix.package != 'binary-size'
         run: cargo hack test --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }}
       # The budget is ADR-0027 section 6's "binary size" row, read from the
-      # ADR (`full` <= vanilla + 7 MiB, each feature alone <= vanilla + 2 MiB,
-      # `mcp` <= vanilla + 4.5 MiB); the table goes to the step summary.
+      # ADR (`full` and each feature alone <= vanilla + 10 MiB, T-3775); the table goes to the step summary.
       - name: Binary size per surface feature
         if: matrix.package == 'binary-size'
         run: |

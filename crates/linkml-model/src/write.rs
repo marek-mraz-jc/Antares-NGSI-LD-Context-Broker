@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use serde_json::{json, Map, Value};
 
 use crate::model::{Builtin, Model, Range};
-use crate::schema::{Annotation, Slot};
+use crate::schema::{Annotation, Slot, DEFAULT_RANGE, IMPORTS};
 
 // ---------------------------------------------------------------- YAML (L2)
 
@@ -140,7 +140,8 @@ fn slot_node(slot: &Slot) -> Node {
 /// # assert!(m.is_err(), "a newline in a name is refused at load");
 /// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "a: b #c"}"#,
 ///     &linkml_model::Limits { max_bytes: 999, max_depth: 4, max_elements: 9 }).unwrap();
-/// assert_eq!(linkml_model::yaml(&m), "\"id\": \"https://e.org/s\"\n\"name\": \"a: b #c\"\n");
+/// assert_eq!(linkml_model::yaml(&m), "\"id\": \"https://e.org/s\"\n\"name\": \"a: b #c\"\n\
+///     \"imports\":\n  - \"linkml:types\"\n\"default_range\": \"string\"\n");
 /// ```
 #[must_use]
 pub fn yaml(model: &Model) -> String {
@@ -150,6 +151,12 @@ pub fn yaml(model: &Model) -> String {
         ("name".to_owned(), Node::Str(s.name.clone())),
     ];
     opt(&mut top, "version", s.version.as_ref());
+    // what the subset implies, declared for every LinkML reader
+    top.push(("imports".to_owned(), Node::List(vec![IMPORTS.to_owned()])));
+    top.push((
+        "default_range".to_owned(),
+        Node::Str(DEFAULT_RANGE.to_owned()),
+    ));
     if !s.prefixes.is_empty() {
         let prefixes = s
             .prefixes
@@ -262,8 +269,15 @@ fn builtin_schema(b: Builtin) -> Map<String, Value> {
     }
 }
 
+/// Whether the slot holds a `GeoJSON` geometry (NGSI-LD 4.7), whatever its
+/// range says.
+fn geo(model: &Model, slot: &Slot) -> bool {
+    model.kind(slot) == "GeoProperty"
+}
+
 fn slot_schema(model: &Model, slot: &Slot) -> Value {
     let base = match model.range(slot) {
+        _ if geo(model, slot) => typed("object", None),
         Range::Type(b) => builtin_schema(b),
         // A relationship holds the target entity's id.
         Range::Class(_) => typed("string", Some("uri")),
@@ -349,23 +363,42 @@ pub fn json_schema(model: &Model) -> String {
 
 // ------------------------------------------------------- JSON-LD context (L4)
 
+/// The namespace the `xsd:` of [`Builtin::xsd`] stands for.
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
 /// The JSON-LD `@context` (row L4): every class and slot name mapped to its
 /// full IRI, and nothing else: no prefixes, so no term outside the model is
-/// named (threat LK6).
+/// named (threat LK6). A Relationship's value is the target's `@id`, a typed
+/// value carries its XSD datatype, so an Entity in keyValues reads as the
+/// SHACL shapes (L5) describe it; a string, an enum and a `GeoJSON` geometry
+/// stay as they are.
 ///
 /// ```
 /// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "s",
-///     "slots": {"size": {}}}"#,
+///     "classes": {"Room": {}}, "slots": {"name": {}, "size": {"range": "float"}, "in": {"range": "Room"}}}"#,
 ///     &linkml_model::Limits { max_bytes: 999, max_depth: 8, max_elements: 9 }).unwrap();
 /// let v: serde_json::Value = serde_json::from_str(&linkml_model::context(&m)).unwrap();
-/// assert_eq!(v["@context"]["size"], "https://e.org/s/size");
+/// assert_eq!(v["@context"]["name"], "https://e.org/s/name");
+/// assert_eq!(v["@context"]["size"]["@type"], "http://www.w3.org/2001/XMLSchema#float");
+/// assert_eq!(v["@context"]["in"]["@type"], "@id");
 /// ```
 #[must_use]
 pub fn context(model: &Model) -> String {
     let s = model.schema();
     let mut terms = Map::new();
-    for name in s.slots.keys() {
-        terms.insert(name.clone(), Value::String(model.slot_iri(name)));
+    for (name, slot) in &s.slots {
+        let iri = model.slot_iri(name);
+        let coerced = match model.range(slot) {
+            _ if geo(model, slot) => None,
+            Range::Class(_) => Some("@id".to_owned()),
+            Range::Type(Builtin::String) | Range::Enum(_) => None,
+            Range::Type(b) => Some(b.xsd().replacen("xsd:", XSD, 1)),
+        };
+        let term = match coerced {
+            Some(ty) => json!({"@id": iri, "@type": ty}),
+            None => Value::String(iri),
+        };
+        terms.insert(name.clone(), term);
     }
     for name in s.classes.keys() {
         terms.insert(name.clone(), Value::String(model.class_iri(name)));
@@ -466,6 +499,8 @@ pub fn shacl(model: &Model) -> String {
                 lit(slot_name)
             );
             match model.range(&slot) {
+                // a GeoJSON geometry: a node, whatever the range says
+                _ if geo(model, &slot) => {}
                 Range::Type(b) => {
                     let _ = write!(out, " ;\n{IN}{IN}sh:datatype {}", b.xsd());
                 }

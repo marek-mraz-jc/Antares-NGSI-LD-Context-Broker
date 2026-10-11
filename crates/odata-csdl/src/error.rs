@@ -180,6 +180,9 @@ pub enum Problem {
     NullableCollectionNavigation,
     /// The partner is not a navigation property of the target leading back.
     InvalidPartner,
+    /// A referential constraint on a collection-valued navigation, or whose properties are
+    /// missing, not primitive, of different types or of a nullability CSDL XML 8.5 forbids.
+    InvalidReferentialConstraint,
     /// A binding path names no navigation property of the set's type, or casts to a type that
     /// does not derive from its target.
     InvalidBindingPath,
@@ -228,6 +231,7 @@ impl Problem {
             Self::BaseTypeNotFound => "base type is not an entity type of the model",
             Self::NullableCollectionNavigation => "collection-valued navigation marked nullable",
             Self::InvalidPartner => "partner does not lead back",
+            Self::InvalidReferentialConstraint => "referential constraint does not hold",
             Self::InvalidBindingPath => "binding path is not a navigation of the set's type",
             Self::UnknownBindingTarget => "binding target is not an entity set",
             Self::UnknownEntitySetType => "entity set type is not an entity type of the model",

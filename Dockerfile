@@ -32,7 +32,7 @@ FROM chef AS build
 COPY --from=planner /src/recipe.json recipe.json
 # Cargo features of the broker (empty = the default, vanilla build). The
 # full cells of external-suites.yml build with --build-arg FEATURES=full,
-# image-jc.yml builds full,jc-policy as antares-broker-jc; the vanilla
+# image-jc.yml builds full,jc-policy,linkml as antares-broker-jc; the vanilla
 # antares-broker image never sets it.
 ARG FEATURES=""
 # Cook scoped to the shipped package so feature unification matches the real

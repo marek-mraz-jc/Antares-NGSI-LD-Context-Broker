@@ -1,6 +1,9 @@
 "id": "https://example.org/building"
 "name": "building"
 "version": "1.2.0"
+"imports":
+  - "linkml:types"
+"default_range": "string"
 "prefixes":
   "bld":
     "prefix_prefix": "bld"

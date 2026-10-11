@@ -74,12 +74,56 @@ fn the_json_writers_emit_json() {
     assert_eq!(ctx["@context"]["Room"], "https://schema.org/Room");
     assert_eq!(
         ctx["@context"]["floor"],
-        "https://example.org/building#floor"
+        serde_json::json!({"@id": "https://example.org/building#floor",
+                           "@type": "http://www.w3.org/2001/XMLSchema#integer"})
+    );
+    assert_eq!(
+        ctx["@context"]["name"], "https://schema.org/name",
+        "a string: no coercion"
     );
     assert!(
         ctx["@context"].get("schema").is_none(),
         "no prefix terms (LK6)"
     );
+}
+
+/// T-3780: an Entity in keyValues, read with L4, is what L3 and L5 describe:
+/// a Relationship holds the target's `@id`, a float its datatype, and a
+/// `GeoProperty` a `GeoJSON` geometry, an object and never a string.
+#[test]
+fn a_view_s_data_reads_as_its_documents_describe_it() {
+    let doc = serde_json::json!({
+        "id": "https://e.org/s", "name": "s",
+        "classes": {"Station": {"slots": ["temperature", "location", "nearest"]}},
+        "slots": {
+            "temperature": {"range": "float"},
+            "location": {"annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}}},
+            "nearest": {"range": "Station"}
+        }
+    });
+    let model = Model::read(doc.to_string().as_bytes(), &LIMITS).unwrap();
+    let ctx: serde_json::Value = serde_json::from_str(&linkml_model::context(&model)).unwrap();
+    let terms = &ctx["@context"];
+    assert_eq!(
+        terms["nearest"],
+        serde_json::json!({"@id": "https://e.org/s/nearest", "@type": "@id"})
+    );
+    assert_eq!(
+        terms["temperature"]["@type"],
+        "http://www.w3.org/2001/XMLSchema#float"
+    );
+    assert_eq!(terms["location"], "https://e.org/s/location", "no coercion");
+    let schema: serde_json::Value =
+        serde_json::from_str(&linkml_model::json_schema(&model)).unwrap();
+    let location = &schema["definitions"]["Station"]["properties"]["location"];
+    assert_eq!(location["type"], "object", "{location}");
+    let shapes = linkml_model::shacl(&model);
+    let geo = shapes
+        .split("sh:property [")
+        .find(|p| p.contains("sh:name \"location\""))
+        .unwrap();
+    assert!(!geo.contains("sh:datatype"), "{geo}");
+    assert!(shapes.contains("sh:datatype xsd:float"), "{shapes}");
 }
 
 /// Names and texts that would end a YAML scalar, open a mapping, an anchor,
