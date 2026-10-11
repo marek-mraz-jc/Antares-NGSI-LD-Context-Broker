@@ -340,9 +340,17 @@ impl Ops {
             .body(req.body)
             .map_err(|_| Refusal::Malformed("the operation's target is not a URI"))?;
         *inner.headers_mut() = req.headers;
-        let answer = match req.context {
-            Some(context) => self.state.call_in_context(&caller.0, inner, context).await,
-            None => self.state.call(&caller.0, inner).await,
+        let call = async {
+            match req.context {
+                Some(context) => self.state.call_in_context(&caller.0, inner, context).await,
+                None => self.state.call(&caller.0, inner).await,
+            }
+        };
+        // The engine learns the view from the in-process scope, never from
+        // a header a client could send (ADR-0020 amendment, T-3702).
+        let answer = match view {
+            Some((id, _)) => antares_api::policy::through_view(id, call).await,
+            None => call.await,
         };
         if let Some(surface) = &self.surface {
             // Threat G10: which surface and view ran it; never the subject
@@ -455,11 +463,14 @@ impl ViewOps {
             .filter_map(|(i, op)| op.gate_clause().map(|c| (i, c)))
             .collect();
         let clauses: Vec<&'static str> = asked.iter().map(|(_, c)| *c).collect();
-        let answers = antares_api::policy::offers(
-            self.inner.state.policy.as_deref(),
-            &tenant,
-            &caller.0,
-            &clauses,
+        let answers = antares_api::policy::through_view(
+            self.view.id(),
+            antares_api::policy::offers(
+                self.inner.state.policy.as_deref(),
+                &tenant,
+                &caller.0,
+                &clauses,
+            ),
         )
         .await;
         let given: std::collections::HashMap<usize, bool> =
