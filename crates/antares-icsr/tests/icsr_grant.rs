@@ -297,7 +297,7 @@ async fn icsr_a_stored_document_that_is_no_grant_of_its_pair_grants_nothing() {
 /// endpoint that is not this broker needs no grant to be stored.
 #[tokio::test]
 async fn icsr_a_forward_that_is_no_operation_or_that_the_grant_view_refuses_is_not_made() {
-    let (_b, app) = broker(None).await;
+    let (_b, app) = broker(None, Vec::new()).await;
     car(&app, "b", 1).await;
     let elsewhere = register(
         &app,
