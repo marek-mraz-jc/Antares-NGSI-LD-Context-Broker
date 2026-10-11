@@ -179,8 +179,14 @@ Create, Merge or Replace, and Delete Entity, with the members no write
 names; `Countable`, `Filterable` and `Sortable` with the members they
 refuse (`NonFilterableProperties`, `NonSortableProperties`), `Expandable`
 one level, no upsert, deep insert, deep update or search, and
-`QuerySegmentSupported`. The annotations are advisory: every request is
-still gated, and a read the engine denies is `403` whatever they say.
+`QuerySegmentSupported`. The container declares `BatchSupported` and
+`BatchSupport` (`multipart/mixed` and `application/json`, continue on
+error, no Content-ID references; T-3723). The annotations are advisory:
+every request is still gated, and a read the engine denies is `403`
+whatever they say.
+
+Every `GET` answers `HEAD` too: the same status and headers, with the
+`Content-Length` of the `GET` and no body, through the same gate (T-3723).
 
 ## 7. Refusals and errors
 

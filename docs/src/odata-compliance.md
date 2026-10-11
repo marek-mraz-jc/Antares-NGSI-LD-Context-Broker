@@ -92,7 +92,7 @@ in the surface, or the model under `ci/views` beside the other views.
 ## 4. The baseline and the regression gate
 
 `ci/odata-compliance-baseline.json` records every test the suite reports
-on its own line (1 154 of 1 210). The rest belong to whole scripts the
+on its own line (1 187 of 1 210 today). The rest belong to whole scripts the
 suite skips on a declared capability. Each test is keyed
 `[V4] 2.1_conformance :: Service returns service document (MUST)` with
 status `PASS`, `FAIL` or `SKIP`. `baseline.py check` fails the job when a
@@ -110,21 +110,23 @@ A deliberate break proved the gate: the error response stopped sending the
 
 The pass rate counts passed and failed tests; skipped tests stay out of it.
 The baseline was first recorded on dev `f0da234` (T-3714) and raised by
-T-3719, which reads a form-encoded query (section 6):
+T-3719, which reads a form-encoded query, and T-3723, which declares
+`$batch` and serves `HEAD` (section 6):
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
 | Minimal | 155 | 113 | 25 | 57.8 % |
-| Intermediate | 162 | 182 | 6 | 47.1 % |
-| Advanced | 119 | 352 | 96 | 25.3 % |
-| **All** (suite summary) | 436 | 647 | 127 | 40.3 % |
+| Intermediate | 169 | 175 | 6 | 49.1 % |
+| Advanced | 131 | 373 | 63 | 26.0 % |
+| **All** (suite summary) | 455 | 661 | 94 | 40.8 % |
 
 The first baseline (T-3714) stood at Minimal 37.5 %, Intermediate 28.2 % and
 Advanced 11.7 % (254 passed, 840 failed, 116 skipped).
 
 The suite skips whole test scripts on what `$metadata` declares:
-`Capabilities.BatchSupported` and `KeyAsSegmentSupported` false on the
-container, search and compute unsupported on `Products`.
+`KeyAsSegmentSupported` false on the container, search and compute
+unsupported on `Products`. Until T-3723 the container also declared
+`BatchSupported` false, and the suite skipped every `$batch` script.
 
 ## 6. Failing areas
 
@@ -136,7 +138,9 @@ Each failing area is a task, or a decision with its reason:
 | The key is always `id` (the URN); the model's own key (`ID`, Edm.Guid) does not address an Entity | 11.1, 11.2.1 to 11.2.3, 11.2.11, 11.2.15, 11.4.11, 8.2.7 | T-3720 |
 | A create without a key is refused (`MissingKey`); the service does not mint one | 11.4.2 to 11.4.5, 11.4.12 to 11.4.15, 8.1.5, 8.2.3, 8.2.5, 8.2.8 | T-3721 |
 | Edm types beyond String, Double and Int64, enums, Core and Capabilities annotations from the LinkML schema | 4.4, 5.1.1.x, 5.1.4 to 5.1.8, 5.3, 14.1, vocab_* | T-3722 |
-| `BatchSupported` is declared false while `$batch` is served; HEAD on a collection answers 501 | 11.4.9.x, 11.4.11 | T-3723 |
+| `BatchSupported` was declared false while `$batch` is served; HEAD on a collection or an Entity answered 501 | 11.4.9.x, 11.4.11 | T-3723: declared and served; the batch scripts run, their failures are in the baseline |
+| Multipart `$batch` framed with bare LF line ends; a JSON batch under `OData-MaxVersion: 4.0`; independent requests and `dependsOn` after a failure | 11.4.9, 11.4.9.1, 11.4.9.3, 19_json_batch | T-3726 |
+| Change sets and atomicity groups, Content-ID references | 11.4.9.1, 11.4.9.3, 19_json_batch | not supported, by design: ADR-0024 section 5 (W26), mapping row C18 |
 | A comparison or `in` between a property and a literal of another type answers 200 with no rows; an Int64 literal past its range is accepted | 11.3.6, 11.2.5.1, 5.1.1.5 | T-3725 |
 | Options inside `$expand(...)` other than `$select` and `$expand` (Q5) | 11.2.5.9, 11.3.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
 | `$apply`, `$compute`, `$index`, `$search`, `$deltatoken` and delta links | 11.2.5.4.x, 11.2.5.13, 11.2.4.1, 11.2.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
