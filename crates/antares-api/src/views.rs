@@ -361,7 +361,13 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
                 geo_also,
                 ids,
                 id_patterns,
-                attributes: shared(&x.attributes, y.attributes.clone()),
+                // a side that shows every Attribute leaves the other's list
+                attributes: match (x.every_attribute, y.every_attribute) {
+                    (true, _) => y.attributes.clone(),
+                    (false, true) => x.attributes.clone(),
+                    (false, false) => shared(&x.attributes, y.attributes.clone()),
+                },
+                every_attribute: x.every_attribute && y.every_attribute,
                 temporal: [x.temporal.as_slice(), y.temporal.as_slice()].concat(),
             });
         }
@@ -1407,6 +1413,27 @@ mod tests {
                 Ok(Arc::new(v.narrowing().clone()))
             );
         }
+    }
+
+    #[test]
+    fn a_side_over_every_attribute_leaves_the_other_sides_list() {
+        let every = Rule {
+            every_attribute: true,
+            ..rule(&["Car"], None, &[])
+        };
+        let both = pair_rules(
+            std::slice::from_ref(&every),
+            vec![rule(&["Car"], None, &["speed"])],
+        )
+        .expect("pairs");
+        assert_eq!(both[0].attributes, vec!["speed"]);
+        assert!(!both[0].every_attribute);
+        let both =
+            pair_rules(&[rule(&["Car"], None, &["colour"])], vec![every.clone()]).expect("pairs");
+        assert_eq!(both[0].attributes, vec!["colour"]);
+        assert!(!both[0].every_attribute);
+        let both = pair_rules(std::slice::from_ref(&every), vec![every.clone()]).expect("pairs");
+        assert!(both[0].every_attribute && both[0].attributes.is_empty());
     }
 
     #[test]

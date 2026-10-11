@@ -566,6 +566,10 @@ const POLICY_SHELF: &[(&str, PolicyCtor)] = &[
     (antares_plugin_example::POLICY_NAME, || {
         std::sync::Arc::new(antares_plugin_example::ExamplePolicy::from_env())
     }),
+    #[cfg(feature = "jc-policy")]
+    (joinedcontext_policy::POLICY_NAME, || {
+        std::sync::Arc::new(joinedcontext_policy::JoinedcontextPolicy::new())
+    }),
 ];
 
 /// ANTARES_POLICY → the engine every operation is asked about; absent =
@@ -1839,7 +1843,7 @@ mod policy_shelf_tests {
     /// against it. A release build carries no other — an engine reaches the
     /// shelf only through an off-by-default feature, so this assertion is
     /// what "no addon in the shipped build" means for the policy seam.
-    #[cfg(not(feature = "plugin-example"))]
+    #[cfg(not(any(feature = "plugin-example", feature = "jc-policy")))]
     #[test]
     fn the_shipped_build_carries_only_the_built_in_engine() {
         assert_eq!(shelf(), vec!["allow-all"]);
@@ -1887,6 +1891,27 @@ mod policy_shelf_tests {
                 .is_some(),
             "an engine selected without rules would otherwise allow everything"
         );
+    }
+
+    /// The platform's engine is selected by name, and with no document
+    /// loaded it denies a platform caller (T-3637).
+    #[cfg(feature = "jc-policy")]
+    #[tokio::test]
+    async fn the_platform_engine_is_on_the_shelf_and_fails_closed() {
+        let name = joinedcontext_policy::POLICY_NAME;
+        let (selected, build) = policy_engine(Some(name)).expect("selection");
+        assert_eq!(selected, name);
+        let engine = build();
+        assert!(engine.loads_documents());
+        let subject = antares_api::policy::Subject {
+            tenant: antares_model::TenantId::default(),
+            headers: vec![("x-jc-subject".into(), "ana".into())],
+        };
+        let op = antares_api::policy::Operation::new("5.7.2");
+        assert!(matches!(
+            engine.decide(&subject, &op).await,
+            antares_api::policy::Decision::Deny(_)
+        ));
     }
 }
 
