@@ -202,5 +202,6 @@ carries no NGSI-LD `ProblemDetails`.
 
 - [Endpoint views](views.md)
 - [MCP endpoint of a view](mcp.md)
+- [OData compliance](odata-compliance.md): the independent suite, its baseline and pass rate per level
 - `docs/analysis/odata-linkml-mapping.md`, `docs/analysis/surfaces-threat-model.md` (O1 to O27)
 - ADR-0024 (the OData crates)
