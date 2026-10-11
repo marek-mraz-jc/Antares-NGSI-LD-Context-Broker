@@ -203,6 +203,7 @@ async fn create(
         .as_ref()
         .and_then(|i| set.members.get(&i.member));
     doc.extend(identifier.and_then(|m| Some((m.iri.clone(), attribute(m, &own)?))));
+    referenced(reads, caller, set, &payload.properties, version).await?;
     bind(reads, caller, set, &payload.binds, &mut doc, version).await?;
     doc.insert("id".into(), Value::from(id.as_str()));
     doc.insert("type".into(), Value::from(set.type_iri.as_str()));
@@ -284,6 +285,7 @@ async fn change(
         return Err(body_error(&invalid_key(), version));
     }
     let mut doc = attributes(set, &payload.properties, kind);
+    referenced(reads, caller, set, &payload.properties, version).await?;
     bind(reads, caller, set, &payload.binds, &mut doc, version).await?;
     let (op, method) = if kind == WriteKind::Replace {
         doc.insert("id".into(), Value::from(id.as_str()));
@@ -388,7 +390,14 @@ async fn bind(
             .ok_or(not_found(version))?;
         let urn = visible(reads, caller, &bind.target, version)
             .await
-            .map_err(|e| unbound(e, &bind.navigation, version))?;
+            .map_err(|e| {
+                unbound(
+                    e,
+                    &bind.navigation,
+                    "the bound Entity does not exist",
+                    version,
+                )
+            })?;
         doc.insert(
             member.iri.clone(),
             json!({"type": "Relationship", "object": urn}),
@@ -397,19 +406,53 @@ async fn bind(
     Ok(())
 }
 
-/// A bind target that is not there, as the body error it is; any other
-/// refusal stays as the operation answered it.
-fn unbound(e: ODataErrorResponse, navigation: &str, version: ODataVersion) -> ODataErrorResponse {
+/// Each R6 Property the body gives a value names an Entity of the
+/// target's set, read under the view first (T-3761): absent, hidden and of
+/// another type are the same `400` naming the Property, as for a bind, and
+/// nothing is written. `null` names none.
+pub(crate) async fn referenced(
+    reads: &Reads,
+    caller: &Caller,
+    set: &Set,
+    properties: &[(String, Value)],
+    version: ODataVersion,
+) -> Result<(), ODataErrorResponse> {
+    for (name, value) in properties {
+        let Some(target) = set.references.get(name).filter(|_| !value.is_null()) else {
+            continue;
+        };
+        let target = set_of(reads, target, version)?;
+        // The body reader checked the value against the key's Edm type.
+        let urn = body_id(target, value).ok_or_else(|| body_error(&invalid_key(), version))?;
+        run(
+            reads,
+            caller,
+            OperationId::RetrieveEntity,
+            typed(&format!("/ngsi-ld/v1/entities/{}", encode(&urn)), target),
+            &Translated::default(),
+            version,
+        )
+        .await
+        .map_err(|e| unbound(e, name, "the referenced Entity does not exist", version))?;
+    }
+    Ok(())
+}
+
+/// A bind target or a referenced Entity that is not there, as the body
+/// error it is, naming `target`; any other refusal stays as the operation
+/// answered it.
+fn unbound(
+    e: ODataErrorResponse,
+    target: &str,
+    message: &'static str,
+    version: ODataVersion,
+) -> ODataErrorResponse {
     if e.status != StatusCode::NOT_FOUND {
         return e;
     }
-    let mut bad = ODataErrorResponse::new(
-        StatusCode::BAD_REQUEST,
-        "BadRequest",
-        "the bound Entity does not exist",
-    )
-    .with_version(version);
-    bad.error.target = Some(navigation.to_owned());
+    let mut bad = ODataErrorResponse::new(StatusCode::BAD_REQUEST, "BadRequest", message)
+        .with_version(version);
+    bad.error.target = Some(target.to_owned());
     bad
 }
 
@@ -511,6 +554,7 @@ mod tests {
         let set = Set {
             type_iri: "https://e.org/T".into(),
             identifier: None,
+            references: BTreeMap::new(),
             writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 (

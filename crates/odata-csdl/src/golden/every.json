@@ -85,10 +85,20 @@
         "$Type": "t.Place",
         "$Nullable": true
       },
+      "ownerId": {
+        "$Type": "Edm.Guid"
+      },
+      "nextId": {
+        "$Type": "Edm.Guid",
+        "$Nullable": true
+      },
       "owner": {
         "$Kind": "NavigationProperty",
         "$Type": "t.Thing",
-        "$Partner": "parts"
+        "$Partner": "parts",
+        "$ReferentialConstraint": {
+          "ownerId": "id"
+        }
       },
       "parts": {
         "$Kind": "NavigationProperty",
@@ -100,6 +110,9 @@
         "$Kind": "NavigationProperty",
         "$Type": "t.Base",
         "$Nullable": true,
+        "$ReferentialConstraint": {
+          "nextId": "id"
+        },
         "@Core.Description": "tab\u0009here"
       },
       "@Core.Description#en": "thing"
