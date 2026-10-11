@@ -88,7 +88,7 @@ root.
 | `POST {Set}/$query` | the same `GET`: the body's options (`text/plain` or a form) joined to the URL's |
 | `$filter` | `q` and `id` (section 4) |
 | `$orderby` | `orderBy` on `id` and single-valued values, `;desc`; `createdAt`, `modifiedAt` sorted by the surface (section 4) |
-| `$select` | `attrs`; `createdAt`/`modifiedAt` add `options=sysAttrs` |
+| `$select` | `pick` of `id`, `type`, `scope` and the selected Attributes (TS 104 175 4.21: a projection, so an Entity lacking every selected Attribute is still in the answer, its members `null`); `createdAt`/`modifiedAt` add `options=sysAttrs` and are picked. A name the 4.21 grammar would read as something else (a character outside `_:#/%-+@`, a dot in a short name) pushes no projection: the whole Entity is read and the surface projects it (T-3822) |
 | `$expand` | `join=inline&joinLevel=1` (section 5) |
 | `$top`, `$skip`, `Prefer: odata.maxpagesize` | `limit`, `offset`; a page is at most 1000, 100 by default |
 | `$count=true` | `@odata.count` from `NGSILD-Results-Count`, or counted by the surface (section 4) |

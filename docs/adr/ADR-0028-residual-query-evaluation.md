@@ -102,8 +102,10 @@ rule 2), so a residual term on it evaluates as on an absent one, the same
 answer the pushdown gives: no query can tell "hidden" from "absent" by
 moving a term from `q` into the residual.
 
-The pushdown asks for what the residual reads: `attrs` = the standard's
-projection ∪ the Attributes the residual and the ordering name, and
+The pushdown asks for what the residual reads: `pick` = `id`, `type`,
+`scope`, the standard's projection ∪ the Attributes the residual and the
+ordering name (T-3822: `pick`, never `attrs`, because `attrs` also selects:
+an Entity holding none of them would leave the answer and its count), and
 `options=sysAttrs` when it names `createdAt`/`modifiedAt` (F33). The
 surface projects to the standard's selection after evaluation. A value
 the residual read but the caller did not select never leaves the process.
@@ -176,7 +178,7 @@ into the pushdown:
 - `ngsild.scopeQ` is pushed as is;
 - `ngsild.geo*` takes the request's one `geoQ`, and a standard geo
   conjunct then goes to the residual (F29 stays exact);
-- `ngsild.pick`/`ngsild.omit` narrow the pushdown's `attrs`. They also
+- `ngsild.pick`/`ngsild.omit` narrow the pushdown's `pick`. They also
   narrow what the residual can read: a filter on an omitted Attribute
   evaluates as absent, like a hidden one. Every `ngsild.` option narrows.
 
