@@ -1737,6 +1737,50 @@ impl PolicyEngine for Slow<'_> {
 mod tests {
     use super::*;
 
+    /// T-3684: an engine that keeps the trait's defaults reads no rule
+    /// documents (ADR-0020 amendment): it says so, so `/q/policy` answers
+    /// 404, and a document handed to it anyway is refused, never taken.
+    #[test]
+    fn an_engine_on_the_defaults_reads_no_rule_documents() {
+        assert!(!AllowAll.loads_documents());
+        let refused = AllowAll.load("city", &serde_json::json!({"rules": []}));
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains(BUILT_IN_NAME)),
+            "{refused:?}"
+        );
+    }
+
+    /// T-3684: `offers` answers one verdict per clause, in the clauses'
+    /// order, false for a Deny; with no engine every clause is offered.
+    #[tokio::test]
+    async fn offers_answers_each_clause_in_order() {
+        struct DenyRetrieve;
+        impl PolicyEngine for DenyRetrieve {
+            fn name(&self) -> &str {
+                "deny-retrieve"
+            }
+            fn decide<'a>(&'a self, _s: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+                Box::pin(std::future::ready(if op.clause == "retrieveEntity" {
+                    Decision::Deny("no".into())
+                } else {
+                    Decision::Allow
+                }))
+            }
+            fn pre_notify(&self, _s: &Subject, _sub: &Value, _n: &mut Value) -> NotifyDecision {
+                NotifyDecision::Deliver
+            }
+        }
+        let (tenant, headers) = (antares_model::TenantId::default(), HeaderMap::new());
+        let clauses = ["queryEntity", "retrieveEntity", "queryTemporal"];
+        assert_eq!(
+            offers(Some(&DenyRetrieve), &tenant, &headers, &clauses).await,
+            [true, false, true]
+        );
+        assert_eq!(offers(None, &tenant, &headers, &clauses).await, [true; 3]);
+    }
+
     /// T-3482: only the caller's own q is rewritten; the engine's
     /// condition may read what it hides from the caller.
     #[test]
