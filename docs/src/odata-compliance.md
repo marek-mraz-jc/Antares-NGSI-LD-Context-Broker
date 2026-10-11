@@ -108,15 +108,19 @@ A deliberate break proved the gate: the error response stopped sending the
 
 ## 5. Pass rate per level
 
-Baseline of dev `f0da234` (T-3714). The pass rate counts passed and failed
-tests; skipped tests stay out of it.
+The pass rate counts passed and failed tests; skipped tests stay out of it.
+The baseline was first recorded on dev `f0da234` (T-3714) and raised by
+T-3719, which reads a form-encoded query (section 6):
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| Minimal | 100 | 167 | 26 | 37.5 % |
-| Intermediate | 98 | 249 | 3 | 28.2 % |
-| Advanced | 56 | 424 | 87 | 11.7 % |
-| **All** (suite summary) | 254 | 840 | 116 | 23.2 % |
+| Minimal | 155 | 113 | 25 | 57.8 % |
+| Intermediate | 162 | 182 | 6 | 47.1 % |
+| Advanced | 119 | 352 | 96 | 25.3 % |
+| **All** (suite summary) | 436 | 647 | 127 | 40.3 % |
+
+The first baseline (T-3714) stood at Minimal 37.5 %, Intermediate 28.2 % and
+Advanced 11.7 % (254 passed, 840 failed, 116 skipped).
 
 The suite skips whole test scripts on what `$metadata` declares:
 `Capabilities.BatchSupported` and `KeyAsSegmentSupported` false on the
@@ -128,11 +132,13 @@ Each failing area is a task, or a decision with its reason:
 
 | Area | Suite scripts | Disposition |
 |---|---|---|
-| A percent-encoded option name (`%24top`) is read as a custom option, and `+` in a value is not read as a space; most of the failures sit behind this, because Go clients write both forms | 11.2.5.x, 11.3.x, 5.1.x, 11.2.9, 11.2.14 | T-3719 |
+| A form-encoded query (Go `url.Values`, Java `URLEncoder`): `%24` before an option name, `+` for a space, `%2F` and `%3D` for the query's `/` and `=` | 11.2.5.x, 11.3.x, 5.1.x, 11.2.9, 11.2.14 | T-3719: read as plain. A `+` reads as a space only where the grammar requires whitespace (`RWS`); inside a literal and in optional whitespace (`BWS`) it stays a `+`, by design: OData writes a space as `%20` (Part 2, the note under Example 32) and gives `+` its own meanings (a sign, a time zone offset), so `'a+b'` keeps its plus |
 | The key is always `id` (the URN); the model's own key (`ID`, Edm.Guid) does not address an Entity | 11.1, 11.2.1 to 11.2.3, 11.2.11, 11.2.15, 11.4.11, 8.2.7 | T-3720 |
 | A create without a key is refused (`MissingKey`); the service does not mint one | 11.4.2 to 11.4.5, 11.4.12 to 11.4.15, 8.1.5, 8.2.3, 8.2.5, 8.2.8 | T-3721 |
 | Edm types beyond String, Double and Int64, enums, Core and Capabilities annotations from the LinkML schema | 4.4, 5.1.1.x, 5.1.4 to 5.1.8, 5.3, 14.1, vocab_* | T-3722 |
 | `BatchSupported` is declared false while `$batch` is served; HEAD on a collection answers 501 | 11.4.9.x, 11.4.11 | T-3723 |
+| A comparison or `in` between a property and a literal of another type answers 200 with no rows; an Int64 literal past its range is accepted | 11.3.6, 11.2.5.1, 5.1.1.5 | T-3725 |
+| Options inside `$expand(...)` other than `$select` and `$expand` (Q5) | 11.2.5.9, 11.3.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
 | `$apply`, `$compute`, `$index`, `$search`, `$deltatoken` and delta links | 11.2.5.4.x, 11.2.5.13, 11.2.4.1, 11.2.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
 | Filter functions outside the F-row subset (date and time, arithmetic, `length`, `indexof`, `substring`, `divby`, `matchesPattern`, `isof`, `cast`) | 11.3.1 to 11.3.4, 11.3.9, 11.5.x | not supported, by design: ADR-0024 section 5; the mapped rows still at 501 are T-3686 |
 | Actions and functions, bound or unbound | 11.2.10, 11.4.13, 12.1, 12.2 | not supported, by design: an NGSI-LD view has no operations (ADR-0024 section 5) |
@@ -142,9 +148,9 @@ Each failing area is a task, or a decision with its reason:
 | The `Company` singleton and derived types (`ProductType` discriminator) | 9.1, 11.2.16, 11.2.13 | not supported, by design: an NGSI-LD type is an entity set, with no singleton and no inheritance beyond the abstract Relationship base (ADR-0024 section 5) |
 
 A by-design line names its reason; the gate keeps such tests as known
-failures and never skips them. Re-run the table after T-3719 and T-3720
-land: many scripts in the rows below them fail on a URL or key form first,
-and their own behaviour only shows once those pass.
+failures and never skips them. Re-run the table after T-3720 lands: many
+scripts in the rows below it fail on the key form first, and their own
+behaviour only shows once that passes.
 
 ## Related
 
