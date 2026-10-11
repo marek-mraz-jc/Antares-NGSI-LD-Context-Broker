@@ -66,7 +66,10 @@ What a pull request from a fork can and cannot do here:
 **As a maintainer.** Commit on `dev`, push a batch, then dispatch `ci`
 once for the batch (`ci` has no push trigger: a 40-minute pipeline that
 restarts on every push never finishes). A green dispatched run on `dev`
-publishes the `:dev` image. Work that will stay red for more than a day
+publishes the `:dev` image. Every push to `dev` also runs `fast` (the
+workspace gate alone, about 15 minutes), which is what a review closes on;
+`ci` adds the ETSI matrix and the images and stays the per-batch gate.
+Work that will stay red for more than a day
 lives on a topic branch and comes in by pull request like a fork's.
 
 **Promotion to `main`.** When `dev` holds a release:
