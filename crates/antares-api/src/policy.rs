@@ -215,8 +215,9 @@ impl Operation<'_> {
     }
 }
 
-/// What an engine may answer. There is no third state: an operation is
-/// allowed, refused, or allowed over less than it asked for.
+/// What an engine may answer: an operation is allowed, refused, allowed
+/// over less than it asked for, or allowed on a condition the stored Entity
+/// has to meet.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     Allow,
@@ -227,7 +228,34 @@ pub enum Decision {
     /// Allowed over less. The caller cannot tell a hidden entity from an
     /// absent one.
     Filter(Filter),
+    /// Allowed only if the stored Entity the write lands on is one the
+    /// filter selects (gap G12): its `q`, `scopeQ`, areas and the types and
+    /// conditions of its `rules`, judged on stored values, which the
+    /// [`Operation`] does not carry. The store judges the document it is
+    /// about to change, inside the write's own read-modify-write, so a
+    /// concurrent write between this answer and the commit cannot carry the
+    /// write onto an Entity the filter no longer selects. An Entity it does
+    /// not select answers as an absent one. Honoured on [`WRITE_BY_ID`], with
+    /// a filter that selects and projects nothing; anywhere else a deny
+    /// ([`resolve`]).
+    AllowIf(Filter),
 }
+
+/// The writes by id a [`Decision::AllowIf`] can condition: each changes or
+/// deletes Entities that are already stored, by id, and judges each of them
+/// inside its store operation. A create has no stored Entity to judge, and
+/// Batch Upsert may create; a temporal write changes the evolution, not the
+/// Entity a filter reads.
+pub const WRITE_BY_ID: [&str; 11] = [
+    "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.17", "5.6.18", "5.6.19", "5.6.9", "5.6.10",
+    "5.6.20",
+];
+
+/// Why a write conditioned on its stored Entity is refused rather than
+/// forwarded: a Context Source's copy is not in this store, so nothing here
+/// can judge it.
+pub const CONDITION_NOT_FORWARDED: &str =
+    "a write conditioned on the stored Entity is not forwarded to a Context Source";
 
 /// How much less. Every member narrows and none widens: the `q`, `scopeQ`
 /// and `geo_q` are conjoined with the caller's own, `pick` keeps a subset of
@@ -272,6 +300,141 @@ pub struct Filter {
     /// Answer [`RESTRICTED_HEADER`]`: true`, so a client can know the
     /// answer was narrowed. Narrowing is otherwise silent.
     pub restricted: bool,
+    /// The engine's advisory, sent as `NGSILD-Warning` (TS 104 176 6.3.17,
+    /// gap G8): e.g. the Entity types a filter on an Attribute the caller
+    /// may not filter on left out, so a developer can tell that refusal
+    /// from an empty answer. The text is the engine's, never an echo of the
+    /// request, and names only what the caller may already see.
+    pub warning: Option<Warning>,
+    /// Windows of `observedAt` the instances of a temporal read (5.7.3,
+    /// 5.7.4) must fall into, every one of them (gap G6): the request's own
+    /// 4.11 window is clamped to them before the store runs, so the store
+    /// fetches no instance outside them. A window the request does not reach
+    /// answers nothing, never a refusal that tells where the grant ends. A
+    /// slice, not a `Vec`: every [`Decision`] carries a `Filter`'s size.
+    pub temporal: Box<[Window]>,
+}
+
+/// A half-open interval `[from, to)` of `observedAt`; an open end is the
+/// beginning or the end of time (gap G6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Window {
+    /// The earliest instant admitted.
+    pub from: Option<TimeBound>,
+    /// The first instant no longer admitted.
+    pub to: Option<TimeBound>,
+}
+
+/// One end of a [`Window`]: a fixed instant, or a duration before the
+/// moment the request is decided, so "the last 24 hours" slides with now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeBound {
+    /// This instant.
+    At(chrono::DateTime<chrono::Utc>),
+    /// This long before now.
+    Ago(chrono::Duration),
+}
+
+impl TimeBound {
+    fn at(self, now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        match self {
+            Self::At(t) => t,
+            Self::Ago(d) => now
+                .checked_sub_signed(d)
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+        }
+    }
+
+    /// The bound at `now` in milliseconds, the precision 4.11 accepts: a
+    /// start (`up`) rounds up and an end down, so rounding only narrows.
+    fn render(self, now: chrono::DateTime<chrono::Utc>, up: bool) -> String {
+        let t = self.at(now);
+        let sub = i64::from(t.timestamp_subsec_nanos() % 1_000_000);
+        let t = if up && sub > 0 {
+            t.checked_add_signed(chrono::Duration::nanoseconds(1_000_000 - sub))
+                .unwrap_or(t)
+        } else {
+            t
+        };
+        t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+}
+
+impl Window {
+    /// Whether an instance observed at `observed_at` falls inside, the
+    /// bounds resolved against `now`; 4.11's half-open comparison.
+    #[must_use]
+    pub fn admits(&self, observed_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let t = antares_model::dt_key(observed_at);
+        self.from
+            .is_none_or(|b| t >= antares_model::dt_key(&b.render(now, true)))
+            && self
+                .to
+                .is_none_or(|b| t < antares_model::dt_key(&b.render(now, false)))
+    }
+}
+
+/// The text of a [`Filter::warning`]: printable ASCII on one line, at most
+/// [`Warning::MAX_LEN`] bytes, no `"` or `\`, so it travels as one quoted
+/// `warn-text` of an `NGSILD-Warning` value. Composed filters keep each
+/// side's text, at most [`Warning::MAX_TEXTS`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning(Box<[String]>); // a slice: every Decision carries a Filter's size
+
+impl Warning {
+    /// Bytes in one text.
+    pub const MAX_LEN: usize = 256;
+    /// Texts a composed filter keeps.
+    pub const MAX_TEXTS: usize = 4;
+
+    /// One advisory.
+    ///
+    /// # Errors
+    /// When `text` is empty, longer than [`Warning::MAX_LEN`], or holds a
+    /// character outside printable ASCII (a line break, a control
+    /// character), a `"` or a `\\`: it could not travel as one header line.
+    pub fn new(text: &str) -> Result<Self, String> {
+        if text.is_empty() || text.len() > Self::MAX_LEN {
+            return Err(format!(
+                "a policy warning holds 1 to {} bytes",
+                Self::MAX_LEN
+            ));
+        }
+        if !text
+            .bytes()
+            .all(|b| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\')
+        {
+            return Err(
+                "a policy warning is printable ASCII on one line, without '\"' or '\\\\'".into(),
+            );
+        }
+        Ok(Self(Box::new([text.to_owned()])))
+    }
+
+    /// The texts, in the order the filters were composed.
+    #[must_use]
+    pub fn texts(&self) -> &[String] {
+        &self.0
+    }
+
+    /// `a` and `b` as one: each text once, `a`'s first.
+    #[must_use]
+    pub fn join(a: Option<&Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                let mut texts = a.0.to_vec();
+                for t in b.0 {
+                    if !texts.contains(&t) {
+                        texts.push(t);
+                    }
+                }
+                texts.truncate(Self::MAX_TEXTS);
+                Some(Self(texts.into()))
+            }
+            (Some(a), None) => Some(a.clone()),
+            (None, b) => b,
+        }
+    }
 }
 
 /// One allowlist of a [`Filter`] (ADR-0023 rule 11): the Entities of
@@ -300,6 +463,11 @@ pub struct Rule {
     pub id_patterns: Vec<String>,
     /// The Attributes an Entity this rule holds for shows.
     pub attributes: Vec<String>,
+    /// Windows of `observedAt` (gap G6): in a temporal read (5.7.3, 5.7.4)
+    /// an instance of these `attributes` is shown through this rule only if
+    /// it falls into every one. A current-state read shows what the rule
+    /// shows, as the gateway's grant windows did.
+    pub temporal: Vec<Window>,
 }
 
 impl Rule {
@@ -480,6 +648,22 @@ impl Filter {
             && self.omit.is_empty()
             && self.pick.is_empty()
             && !self.has_rules()
+            && self.temporal.is_empty()
+    }
+
+    /// Whether the filter removes anything from what it selects: a
+    /// projection, a per-type omit, a rule's Attribute list or a temporal
+    /// window. A write condition ([`Decision::AllowIf`]) may not: the write
+    /// is performed whole or not at all.
+    pub fn projects(&self) -> bool {
+        !self.pick.is_empty()
+            || !self.omit.is_empty()
+            || !self.omit_by_type.is_empty()
+            || !self.temporal.is_empty()
+            || self
+                .rules
+                .iter()
+                .any(|r| !r.attributes.is_empty() || !r.temporal.is_empty())
     }
 
     /// Whether the filter carries rules or per-type omits (ADR-0023 rule 11).
@@ -537,16 +721,96 @@ impl Filter {
             })
     }
 
-    /// Say the answer was narrowed, when the engine asked for it to be
-    /// said. Narrowing is otherwise silent: a caller cannot tell an Entity
-    /// it may not see from one that is not there.
-    pub fn mark_restricted(&self, headers: &mut HeaderMap) {
+    /// Say the answer was narrowed, and add the engine's warning, when the
+    /// engine asked for either. Narrowing is otherwise silent: a caller
+    /// cannot tell an Entity it may not see from one that is not there.
+    /// `alias` is the warn-agent, this broker's host alias.
+    pub fn mark(&self, alias: &str, headers: &mut HeaderMap) {
         if self.restricted {
             headers.insert(
                 RESTRICTED_HEADER,
                 axum::http::HeaderValue::from_static("true"),
             );
         }
+        for text in self.warning.iter().flat_map(Warning::texts) {
+            // 199 Miscellaneous warning (RFC 7234 5.5), as the gateway's
+            // dropped-types warning was.
+            let value = crate::federation::warning(199, alias, text);
+            if let Ok(v) = axum::http::HeaderValue::from_str(&value) {
+                headers.append("NGSILD-Warning", v);
+            }
+        }
+    }
+
+    /// The request's temporal parameters with its 4.11 window clamped to
+    /// [`Filter::temporal`], resolved against now (gap G6), for every reader
+    /// after the gate: the store's instance range, the forward, the links.
+    /// `required` is the operation's (5.7.4 demands a window, 5.7.3 does
+    /// not), so a request that lacked one is still refused. The windows are
+    /// on `observedAt`: a request on another timeproperty is answered
+    /// nothing, since the store applies one range on one timeproperty.
+    ///
+    /// # Errors
+    /// The request's own 4.11 window is invalid.
+    pub fn narrow_window(
+        &self,
+        params: &std::collections::HashMap<String, String>,
+        required: bool,
+    ) -> Result<std::collections::HashMap<String, String>, antares_model::NgsiError> {
+        let mut out = params.clone();
+        if self.temporal.is_empty() {
+            return Ok(out);
+        }
+        let asked = crate::temporalq::TemporalQ::from_params(params, required)?;
+        let key = |s: &String| antares_model::dt_key(s);
+        let (mut from, mut to) = match &asked {
+            Some(tq) if tq.timeproperty != "observedAt" => {
+                let epoch = "1970-01-01T00:00:00Z".to_owned();
+                (Some(epoch.clone()), Some(epoch))
+            }
+            Some(tq) => match tq.timerel.as_str() {
+                "before" => (None, Some(tq.time_at.clone())),
+                "after" => (Some(tq.time_at.clone()), None),
+                "between" => (Some(tq.time_at.clone()), tq.end_time_at.clone()),
+                _ => (None, None),
+            },
+            None => (None, None),
+        };
+        let now = chrono::Utc::now();
+        for w in &self.temporal {
+            if let Some(b) = w.from.map(|b| b.render(now, true)) {
+                from = Some(match from {
+                    Some(f) if key(&f) >= key(&b) => f,
+                    _ => b,
+                });
+            }
+            if let Some(b) = w.to.map(|b| b.render(now, false)) {
+                to = Some(match to {
+                    Some(t) if key(&t) <= key(&b) => t,
+                    _ => b,
+                });
+            }
+        }
+        // `between` an instant and itself admits nothing: the answer is
+        // empty, as for a window over a period with no data
+        if let (Some(f), Some(t)) = (&from, &to) {
+            if key(f) >= key(t) {
+                to = Some(f.clone());
+            }
+        }
+        let (timerel, time_at, end) = match (from, to) {
+            (Some(f), Some(t)) => ("between", f, Some(t)),
+            (Some(f), None) => ("after", f, None),
+            (None, Some(t)) => ("before", t, None),
+            (None, None) => return Ok(out),
+        };
+        out.insert("timerel".into(), timerel.into());
+        out.insert("timeAt".into(), time_at);
+        match end {
+            Some(e) => out.insert("endTimeAt".into(), e),
+            None => out.remove("endTimeAt"),
+        };
+        Ok(out)
     }
 
     /// The request's own query parameters, narrowed by this decision.
@@ -825,6 +1089,13 @@ impl PolicyEngine for AllowAll {
 /// means refuse. An empty `Filter` asks for nothing and is an allow.
 pub fn resolve(clause: &str, decision: Decision) -> Decision {
     match decision {
+        Decision::AllowIf(_) if !WRITE_BY_ID.contains(&clause) => Decision::Deny(format!(
+            "{clause} is not a write by id and cannot be conditioned on the stored Entity"
+        )),
+        Decision::AllowIf(f) if f.projects() => {
+            Decision::Deny("a write condition selects Entities and projects nothing".into())
+        }
+        Decision::AllowIf(f) if Condition::of(&f).is_none() => Decision::Allow,
         Decision::Filter(f) if !FILTERABLE.contains(&clause) => {
             if f.is_empty() {
                 Decision::Allow
@@ -1211,28 +1482,109 @@ pub async fn gate(
 ) -> Result<Filter, Denied> {
     match decide(engine, &subject_of(tenant, headers), op).await {
         Decision::Allow => Ok(Filter::default()),
-        Decision::Filter(f) => Ok(f),
+        // On a write by id the filter is the condition ([`Condition::of`]);
+        // `resolve` lets an `AllowIf` through nowhere else, and turns a
+        // `Filter` there into a deny, so a handler of such a clause reads
+        // what it gets back as the condition and nothing else.
+        Decision::Filter(f) | Decision::AllowIf(f) => Ok(f),
         Decision::Deny(why) => Err(Denied(why)),
     }
 }
 
-/// [`gate`](fn@gate) for a batch: the refusal reason of each member, `None` where
-/// the member is allowed. A batch writes its members whole, so a `Filter`
-/// on a member is a refusal ([`resolve`]: no batch clause is FILTERABLE).
+/// [`gate`](fn@gate) for a batch: per member the refusal reason, or the
+/// condition its stored Entity has to meet (empty when there is none). A
+/// batch writes its members whole, so a `Filter` on a member is a refusal
+/// ([`resolve`]: no batch clause is FILTERABLE).
 pub async fn gate_each(
     engine: &dyn PolicyEngine,
     tenant: &antares_model::TenantId,
     headers: &HeaderMap,
     ops: &[Operation<'_>],
-) -> Vec<Option<String>> {
+) -> Vec<Result<Filter, String>> {
     decide_each(engine, &subject_of(tenant, headers), ops)
         .await
         .into_iter()
         .map(|d| match d {
-            Decision::Deny(why) => Some(why),
-            Decision::Allow | Decision::Filter(_) => None,
+            Decision::Deny(why) => Err(why),
+            Decision::AllowIf(f) => Ok(f),
+            Decision::Allow | Decision::Filter(_) => Ok(Filter::default()),
         })
         .collect()
+}
+
+/// What a write by id needs of the Entity it lands on
+/// ([`Decision::AllowIf`]), in the form a stored document is read in. The
+/// handler checks it inside the store's own read-modify-write, on the
+/// document the store is about to change.
+#[derive(Debug)]
+pub(crate) struct Condition {
+    q: Option<QNode>,
+    scope_q: Option<String>,
+    areas: Vec<GeoQuery>,
+    /// The rules with type and Attribute names expanded, the form a stored
+    /// document is in.
+    pub(crate) rules: Option<std::sync::Arc<Filter>>,
+}
+
+impl Condition {
+    /// The selection `f` makes, whatever it projects.
+    pub(crate) fn new(f: &Filter) -> Self {
+        Self {
+            q: f.q.as_deref().cloned(),
+            scope_q: f.scope_q.clone(),
+            areas: f.areas().cloned().collect(),
+            rules: crate::repr::type_rules(f),
+        }
+    }
+
+    /// The condition `f` sets, or `None` when it selects every Entity.
+    pub(crate) fn of(f: &Filter) -> Option<Self> {
+        let c = Self::new(f);
+        (c.q.is_some() || c.scope_q.is_some() || !c.areas.is_empty() || c.rules.is_some())
+            .then_some(c)
+    }
+
+    /// Whether the stored document `doc` is selected. A linked path in a
+    /// `q` never holds, as in a rule (ADR-0023 rule 11): the check runs
+    /// inside the store's write and reads no other Entity.
+    pub(crate) fn holds(&self, doc: &Value) -> bool {
+        let ctx = crate::repr::policy_context();
+        crate::repr::shown(self.rules.as_deref(), doc).is_some()
+            && self
+                .scope_q
+                .as_deref()
+                .is_none_or(|s| crate::scope_matches(s, doc))
+            && self.areas.iter().all(|g| g.matches(doc, ctx))
+            && self.q.as_ref().is_none_or(|q| {
+                !q.has_linked_paths() && antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
+            })
+    }
+
+    /// Inside the store closure: an Entity the condition does not select is
+    /// not found, the answer an absent one gets.
+    pub(crate) fn pre(
+        cond: Option<&Self>,
+        id: &str,
+        doc: &Value,
+    ) -> Result<(), antares_model::NgsiError> {
+        if cond.is_none_or(|c| c.holds(doc)) {
+            Ok(())
+        } else {
+            Err(antares_model::NgsiError::ResourceNotFound(format!(
+                "entity {id} not found"
+            )))
+        }
+    }
+
+    /// A conditioned write that would reach a Context Source is refused:
+    /// nothing in this store can judge the Source's copy.
+    pub(crate) fn unforwarded(cond: Option<&Self>, forwards: bool) -> Result<(), Denied> {
+        if cond.is_some() && forwards {
+            Err(Denied(CONDITION_NOT_FORWARDED.to_owned()))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// The members of a JSON object, or nothing when it is not one.
@@ -1288,6 +1640,9 @@ pub async fn run_policy_contract(engine: &dyn PolicyEngine) {
                     );
                 }
             }
+            // `decide` answers a condition on anything but a write by id as
+            // a deny, so reaching here is the seam's fault, not the engine's.
+            Decision::AllowIf(_) => panic!("{name}: a condition on {clause} passed the seam"),
         }
     }
 
@@ -2022,17 +2377,269 @@ mod tests {
         assert!(omits.has_rules(), "per-type omits alone");
 
         let mut headers = HeaderMap::new();
-        Filter::default().mark_restricted(&mut headers);
+        Filter::default().mark("me", &mut headers);
         assert!(headers.get(RESTRICTED_HEADER).is_none());
+        assert!(headers.get("NGSILD-Warning").is_none());
         Filter {
             restricted: true,
             ..Filter::default()
         }
-        .mark_restricted(&mut headers);
+        .mark("me", &mut headers);
         assert_eq!(
             headers.get(RESTRICTED_HEADER).and_then(|v| v.to_str().ok()),
             Some("true")
         );
+        assert!(headers.get("NGSILD-Warning").is_none(), "only when set");
+    }
+
+    /// G6: the request's window clamped to the narrowing's, written back
+    /// into the parameters; nothing changes without windows, a missing or
+    /// invalid window stays refused, and no overlap is a window of nothing.
+    #[test]
+    fn a_temporal_window_is_clamped_into_the_parameters() {
+        let p = |pairs: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let t = |s: &str| TimeBound::At(s.parse().unwrap());
+        let between = Filter {
+            temporal: Box::new([Window {
+                from: Some(t("2026-01-01T01:00:00Z")),
+                to: Some(t("2026-01-01T02:00:00Z")),
+            }]),
+            ..Filter::default()
+        };
+        let odd = p(&[("timerel", "sideways")]);
+        assert_eq!(
+            Filter::default().narrow_window(&odd, true).unwrap(),
+            odd,
+            "no windows, no reading"
+        );
+        assert!(
+            between.narrow_window(&p(&[]), true).is_err(),
+            "5.7.4 still demands a window"
+        );
+        assert!(between.narrow_window(&odd, false).is_err());
+
+        let out = between.narrow_window(&p(&[]), false).unwrap();
+        assert_eq!(out["timerel"], "between");
+        assert_eq!(out["timeAt"], "2026-01-01T01:00:00.000Z");
+        assert_eq!(out["endTimeAt"], "2026-01-01T02:00:00.000Z");
+
+        let out = between
+            .narrow_window(
+                &p(&[("timerel", "after"), ("timeAt", "2026-01-01T01:30:00Z")]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            (out["timerel"].as_str(), out["timeAt"].as_str()),
+            ("between", "2026-01-01T01:30:00Z")
+        );
+
+        let out = between
+            .narrow_window(
+                &p(&[("timerel", "before"), ("timeAt", "2025-01-01T00:00:00Z")]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            out["timeAt"], out["endTimeAt"],
+            "no overlap: between an instant and itself"
+        );
+
+        let open = Filter {
+            temporal: Box::new([Window {
+                from: None,
+                to: Some(t("2026-01-01T02:00:00Z")),
+            }]),
+            ..Filter::default()
+        };
+        let out = open
+            .narrow_window(
+                &p(&[
+                    ("timerel", "between"),
+                    ("timeAt", "2025-01-01T00:00:00Z"),
+                    ("endTimeAt", "2027-01-01T00:00:00Z"),
+                ]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            (out["timeAt"].as_str(), out["endTimeAt"].as_str()),
+            ("2025-01-01T00:00:00Z", "2026-01-01T02:00:00.000Z")
+        );
+        let out = open.narrow_window(&p(&[]), false).unwrap();
+        assert_eq!(out["timerel"], "before");
+        assert!(!out.contains_key("endTimeAt"));
+        let empty = Filter {
+            temporal: Box::new([Window::default()]),
+            ..Filter::default()
+        };
+        assert_eq!(
+            empty.narrow_window(&p(&[]), false).unwrap(),
+            p(&[]),
+            "an unbounded window narrows nothing"
+        );
+
+        // a relative start rounds up to the millisecond, an end down
+        let slide = Filter {
+            temporal: Box::new([Window {
+                from: Some(TimeBound::Ago(chrono::Duration::nanoseconds(1))),
+                to: Some(TimeBound::Ago(chrono::Duration::nanoseconds(1))),
+            }]),
+            ..Filter::default()
+        };
+        let out = slide.narrow_window(&p(&[]), false).unwrap();
+        assert!(antares_model::dt_key(&out["timeAt"]) >= antares_model::dt_key(&out["endTimeAt"]));
+    }
+
+    /// G8: the engine's warning travels as one `NGSILD-Warning` value per
+    /// text, and a text that could not be one header line is refused.
+    #[test]
+    fn a_condition_holds_only_on_a_write_by_id_and_only_as_a_selection() {
+        let zone = Filter {
+            q: Some(Box::new(antares_ql::parse_q("zone==\"A\"").expect("q"))),
+            ..Filter::default()
+        };
+        let conditioned = Decision::AllowIf(zone.clone());
+        for clause in WRITE_BY_ID {
+            assert_eq!(
+                resolve(clause, conditioned.clone()),
+                conditioned,
+                "{clause}"
+            );
+            assert_eq!(
+                resolve(clause, Decision::AllowIf(Filter::default())),
+                Decision::Allow,
+                "{clause}: an empty condition selects everything"
+            );
+        }
+        for clause in [
+            "5.6.1", "5.6.7", "5.6.8", "5.6.12", "5.6.21", "5.7.1", "5.8.1",
+        ] {
+            assert!(
+                matches!(resolve(clause, conditioned.clone()), Decision::Deny(_)),
+                "{clause}"
+            );
+        }
+        for projecting in [
+            Filter {
+                pick: vec!["speed".into()],
+                ..zone.clone()
+            },
+            Filter {
+                omit: vec!["speed".into()],
+                ..zone.clone()
+            },
+            Filter {
+                temporal: Box::new([Window::default()]),
+                ..zone.clone()
+            },
+            Filter {
+                omit_by_type: BTreeMap::from([("Vehicle".into(), vec!["speed".into()])]),
+                ..zone.clone()
+            },
+            Filter {
+                rules: vec![Rule {
+                    types: vec!["Vehicle".into()],
+                    temporal: vec![Window::default()],
+                    ..Rule::default()
+                }],
+                ..Filter::default()
+            },
+        ] {
+            assert!(
+                matches!(
+                    resolve("5.6.2", Decision::AllowIf(projecting.clone())),
+                    Decision::Deny(_)
+                ),
+                "{projecting:?}"
+            );
+        }
+
+        let dc = "https://uri.etsi.org/ngsi-ld/default-context/";
+        let doc = |z: &str| {
+            serde_json::json!({"id": "urn:ngsi-ld:Vehicle:v", "type": [format!("{dc}Vehicle")],
+                               format!("{dc}zone"): [{"type": "Property", "value": z}]})
+        };
+        let c = Condition::of(&zone).expect("a condition");
+        assert!(c.holds(&doc("A")) && !c.holds(&doc("B")));
+        assert!(Condition::pre(Some(&c), "urn:ngsi-ld:Vehicle:v", &doc("A")).is_ok());
+        assert!(matches!(
+            Condition::pre(Some(&c), "urn:ngsi-ld:Vehicle:v", &doc("B")),
+            Err(antares_model::NgsiError::ResourceNotFound(m))
+                if m == "entity urn:ngsi-ld:Vehicle:v not found"
+        ));
+        assert!(Condition::pre(None, "urn:ngsi-ld:Vehicle:v", &doc("B")).is_ok());
+        let linked = Filter {
+            q: Some(Box::new(
+                antares_ql::parse_q("owner.zone==\"A\"").expect("q"),
+            )),
+            ..Filter::default()
+        };
+        assert!(
+            !Condition::of(&linked)
+                .expect("a condition")
+                .holds(&doc("A")),
+            "a linked path reads no other Entity inside the write, so it never holds"
+        );
+        assert!(Condition::unforwarded(Some(&c), false).is_ok());
+        assert!(Condition::unforwarded(None, true).is_ok());
+        assert_eq!(
+            Condition::unforwarded(Some(&c), true),
+            Err(Denied(CONDITION_NOT_FORWARDED.into()))
+        );
+    }
+
+    #[test]
+    fn a_warning_is_one_header_line_or_refused() {
+        let left_out = Warning::new("types left out by the filter: Building").unwrap();
+        let mut headers = HeaderMap::new();
+        Filter {
+            warning: Some(left_out.clone()),
+            ..Filter::default()
+        }
+        .mark("me", &mut headers);
+        let sent: Vec<_> = headers
+            .get_all("NGSILD-Warning")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(sent, ["199 me \"types left out by the filter: Building\""]);
+
+        for bad in [
+            "a\nb",
+            "a\rb",
+            "tab\there",
+            "say \"x\"",
+            "back\\slash",
+            "é",
+            "",
+        ] {
+            assert!(Warning::new(bad).is_err(), "{bad:?}");
+        }
+        assert!(Warning::new(&"x".repeat(Warning::MAX_LEN)).is_ok());
+        assert!(Warning::new(&"x".repeat(Warning::MAX_LEN + 1)).is_err());
+
+        let other = Warning::new("other").unwrap();
+        let joined = Warning::join(Some(&left_out), Some(other.clone())).unwrap();
+        assert_eq!(joined.texts().len(), 2);
+        assert_eq!(
+            Warning::join(Some(&left_out), Some(left_out.clone())),
+            Some(left_out.clone())
+        );
+        assert_eq!(
+            Warning::join(None, Some(other.clone())),
+            Some(other.clone())
+        );
+        assert_eq!(Warning::join(Some(&other), None), Some(other));
+        let many = (0..10).fold(None, |acc: Option<Warning>, i| {
+            Warning::join(acc.as_ref(), Some(Warning::new(&format!("w{i}")).unwrap()))
+        });
+        assert_eq!(many.unwrap().texts().len(), Warning::MAX_TEXTS);
     }
 
     #[test]
@@ -2107,7 +2714,10 @@ mod tests {
             &ops,
         )
         .await;
-        assert_eq!(gated, vec![None, Some("no upserts".to_owned())]);
+        assert_eq!(
+            gated,
+            vec![Ok(Filter::default()), Err("no upserts".to_owned())]
+        );
     }
 
     #[tokio::test]

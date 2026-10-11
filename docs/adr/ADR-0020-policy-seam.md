@@ -60,7 +60,8 @@ credential and validates no token. `Operation` is the expanded request:
 clause, ids, types, attrs, `q`, `scopeQ`, geo, body, and for a write by
 id the stored Entity's image (`stored`: types, scope, Attribute names;
 ADR-0023 rule 7). `Decision` is
-`Allow`, `Deny(String)` or `Filter(Filter)`; `Filter` carries a `q`, a
+`Allow`, `Deny(String)`, `Filter(Filter)` or `AllowIf(Filter)` (gap G12,
+T-3634); `Filter` carries a `q`, a
 `scopeQ`, a list of areas (`geo_q` and `geo_also`, all of which must hold;
 T-3543), `omit`, `pick` and `restricted`.
 
@@ -80,6 +81,8 @@ T-3543), `omit`, `pick` and `restricted`.
 | `Filter` | narrows: the `q` and the `scopeQ` are conjoined into the query the store runs and travel on forwards; the `geo_q` joins the request's own geoquery in the store query's list of geo predicates, all of which must hold (ADR-0023 rule 1, T-3484), and is checked again after a federated merge; `omit`/`pick` go through the 5.2.14.1 projection the notification path already has, and a merged federated result is filtered after the merge |
 | `Filter { restricted: true }` | the same, plus `Antares-Results-Restricted: true` (see the amendment) |
 | `Filter` on anything outside `policy::FILTERABLE` | answered as `Deny` — there is no narrowed form of "delete everything", and no handler outside that list reads the filter at all |
+| `AllowIf` on a write by id (`policy::WRITE_BY_ID`) | the write is applied only if the stored Entity matches the filter's `q`, `scopeQ`, areas and the types and conditions of its rules, judged inside the store's own read-modify-write on the document it is about to change; an Entity it does not select answers 404 with the body an absent one gets; a batch judges each member by its own Entity; a write that would be forwarded to a Context Source is refused (403), since no copy there can be judged here (T-3634) |
+| `AllowIf` anywhere else, or with a projection (`pick`, `omit`, `omit_by_type`, `temporal`, a rule's Attribute list or windows) | answered as `Deny`: a create, a Batch Upsert and a temporal write have no stored Entity a filter reads, and a write is performed whole or not at all; an empty condition is `Allow` |
 
 The conjunction is made on the `antares-ql` AST, never on the query
 string, so the precedence trap a gateway rewrite has to distribute around
