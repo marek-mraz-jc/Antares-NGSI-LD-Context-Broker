@@ -717,6 +717,7 @@ impl PolicyEngine for NoNewCars {
 #[tokio::test(flavor = "multi_thread")]
 async fn odata_a_minted_id_meets_the_policy() {
     let engine = Arc::new(NoNewCars::default());
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
     let b = TestBroker::new()
         .await
         .expect("broker")
