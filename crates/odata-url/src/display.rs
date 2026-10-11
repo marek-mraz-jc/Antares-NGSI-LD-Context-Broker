@@ -6,8 +6,8 @@
 use std::fmt::{self, Display, Formatter, Write};
 
 use crate::{
-    CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key, KeyValue, Levels,
-    Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions, Segment, SelectItem,
+    ArithOp, CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key, KeyValue,
+    Levels, Literal, MemberPath, ODataUri, OrderBy, Position, QueryOptions, Segment, SelectItem,
     Shape,
 };
 
@@ -215,8 +215,10 @@ fn strength(expr: &Expr) -> u8 {
         Expr::And(..) => 2,
         Expr::Compare(_, CompareOp::Eq | CompareOp::Ne, _) | Expr::In(..) => 3,
         Expr::Compare(..) => 4,
-        Expr::Not(_) => 5,
-        _ => 6,
+        Expr::Arith(_, ArithOp::Add | ArithOp::Sub, _) => 5,
+        Expr::Arith(..) => 6,
+        Expr::Not(_) | Expr::Neg(_) => 7,
+        _ => 8,
     }
 }
 
@@ -256,19 +258,24 @@ impl Display for Expr {
             Expr::And(left, right) => write!(f, "{}%20and%20{}", At(left, s), At(right, next)),
             Expr::Or(left, right) => write!(f, "{}%20or%20{}", At(left, s), At(right, next)),
             Expr::Not(operand) => write!(f, "not%20{}", At(operand, s)),
-            Expr::Call(method, args) => {
-                let name = match method {
-                    Method::Contains => "contains",
-                    Method::StartsWith => "startswith",
-                    Method::EndsWith => "endswith",
-                    Method::GeoIntersects => "geo.intersects",
-                };
-                write!(f, "{name}({})", List(args))
+            Expr::Call(method, args) => write!(f, "{}({})", method.name(), List(args)),
+            Expr::Arith(left, op, right) => {
+                write!(f, "{}%20{}%20{}", At(left, s), op.word(), At(right, next))
             }
+            // `-` then a negative literal or another negation would read as `--`, which is no
+            // token: the operand is parenthesised unless it is a member, a call or a group.
+            Expr::Neg(operand) => match operand.as_ref() {
+                Expr::Member(_) | Expr::Call(..) | Expr::Alias(_) => write!(f, "-{operand}"),
+                _ => write!(f, "-({operand})"),
+            },
             Expr::Any { collection, lambda } => match lambda {
                 None => write!(f, "{collection}/any()"),
                 Some((variable, body)) => write!(f, "{collection}/any({variable}:{body})"),
             },
+            Expr::All {
+                collection,
+                lambda: (variable, body),
+            } => write!(f, "{collection}/all({variable}:{body})"),
         }
     }
 }

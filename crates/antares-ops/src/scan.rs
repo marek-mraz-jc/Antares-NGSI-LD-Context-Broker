@@ -15,8 +15,8 @@ use crate::residual::{Program, Truth};
 use crate::{Caller, OperationId, OpsRequest, Refusal, ViewOps};
 
 /// The most upstream Entities one [`ViewOps::scan`] reads (ADR-0028 rule 4).
-// ponytail: one constant for every deployment; an `ANTARES_RESIDUAL_SCAN` variable when a
-// deployment measures that it needs another value.
+// ponytail: one constant for every deployment; an environment variable (documented in
+// docs/src/configuration.md) when a deployment measures that it needs another value.
 pub const RESIDUAL_SCAN: usize = 10_000;
 
 /// The Query Entities the store answers, as a surface built it.
