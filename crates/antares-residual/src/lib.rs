@@ -5,8 +5,8 @@
 //!
 //! An [`Expr`] names values by [`Path`] (an Attribute's value, a sub-Attribute, `observedAt`,
 //! `createdAt`, `modifiedAt`, the Entity's `id` and `type`), literals ([`Lit`]), comparison
-//! ([`Cmp`]), `and`/`or`/`not`, `IS NULL`, `IN`, `any`/`all` over a list value and calls from the
-//! closed table [`Func`]. [`compile`] checks it against the bounds of rule 7 ([`MAX_DEPTH`],
+//! ([`Cmp`]), `and`/`or`/`not`, `IS NULL`, `IN`, `any`/`all` over a list value, calls from the
+//! closed table [`Func`] and spatial relations of `GeoJSON` geometries ([`Spatial`]). [`compile`] checks it against the bounds of rule 7 ([`MAX_DEPTH`],
 //! [`MAX_NODES`]), folds `now` to the one value the request was given and builds each pattern
 //! once; [`eval`] answers [`Truth`] for one Entity.
 //!
@@ -48,6 +48,7 @@
 //! ```
 
 mod eval;
+mod geometry;
 mod pattern;
 mod time;
 
@@ -56,6 +57,7 @@ use std::fmt;
 use regex::Regex;
 use serde_json::Value;
 
+pub use geometry::MAX_GEO_VERTICES;
 pub use pattern::{MAX_PATTERN_BYTES, MAX_PROGRAM_BYTES};
 pub use time::{Date, DateTime, Time};
 
@@ -185,6 +187,32 @@ pub enum Lit {
     Date(Date),
     /// A time of day.
     Time(Time),
+    /// A `GeoJSON` geometry object (`type`, `coordinates`), checked at [`compile`] as the
+    /// NGSI-LD `georel` checks its `geometry`: RFC 7946 shape, WGS84 range, at most
+    /// [`MAX_GEO_VERTICES`] positions.
+    Geometry(Value),
+}
+
+/// A spatial relation (DE-9IM): the NGSI-LD georels but `near` (TS 104 175 7.2.4), CQL2's
+/// spatial operators (`S_INTERSECTS` to `S_CROSSES`) and `OData`'s `geo.intersects`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spatial {
+    /// The two share a point.
+    Intersects,
+    /// The first lies in the second and touches its interior.
+    Within,
+    /// The second lies in the first and touches its interior.
+    Contains,
+    /// The same point set.
+    Equals,
+    /// No point shared.
+    Disjoint,
+    /// Interiors meet, of the same dimension, neither holds the other.
+    Overlaps,
+    /// Boundaries meet, interiors do not.
+    Touches,
+    /// Interiors meet in a lower dimension than the larger of the two.
+    Crosses,
 }
 
 /// A comparison operator.
@@ -351,19 +379,23 @@ pub enum Expr {
     All(Box<Expr>, Box<Expr>),
     /// A function of the closed table.
     Call(Func, Vec<Expr>),
+    /// The first geometry's relation to the second; each a geometry value of the Entity (a
+    /// `GeoProperty`'s value) or a [`Lit::Geometry`]. A value that is no geometry, or has more
+    /// than [`MAX_GEO_VERTICES`] positions, is unknown.
+    Spatial(Spatial, Box<Expr>, Box<Expr>),
 }
 
 /// Why an expression was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// Past [`MAX_DEPTH`], [`MAX_NODES`], a pattern bound or [`MAX_STEPS`]: `OData` 400
-    /// `TooComplexQuery`.
+    /// Past [`MAX_DEPTH`], [`MAX_NODES`], a pattern bound, [`MAX_GEO_VERTICES`] in a literal or
+    /// [`MAX_STEPS`]: `OData` 400 `TooComplexQuery`.
     TooComplex,
     /// A construct the evaluator does not read with the standard's meaning (a pattern construct
     /// of rule 7, a pattern that is not a literal): 501 `NotImplemented`.
     Unsupported(String),
     /// An expression no compiler should build (a wrong argument count, a variable outside any
-    /// lambda, a broken LIKE escape): 400.
+    /// lambda, a broken LIKE escape, a geometry literal that is no `GeoJSON` geometry): 400.
     Invalid(String),
 }
 
@@ -404,16 +436,24 @@ enum Node {
     All(Box<Node>, Box<Node>),
     Call(Func, Vec<Node>),
     Match(Box<Node>, Regex),
+    Spatial(Spatial, Shape, Shape),
+}
+
+/// An operand of a spatial relation: a literal parsed at compile, or a value read per Entity.
+#[derive(Debug, Clone)]
+enum Shape {
+    Fixed(Box<geo::Geometry<f64>>),
+    Value(Box<Node>),
 }
 
 /// Checks `expr` against the bounds, folds `now()` to `now` and builds its patterns.
 ///
 /// # Errors
 ///
-/// [`Error::TooComplex`] past [`MAX_DEPTH`] or [`MAX_NODES`] or a pattern bound,
-/// [`Error::Unsupported`] for a pattern construct outside the shared subset or a pattern that
-/// is not a literal, [`Error::Invalid`] for a wrong argument count or a variable outside every
-/// lambda.
+/// [`Error::TooComplex`] past [`MAX_DEPTH`] or [`MAX_NODES`] or a pattern bound or a geometry
+/// literal past [`MAX_GEO_VERTICES`], [`Error::Unsupported`] for a pattern construct outside the
+/// shared subset or a pattern that is not a literal, [`Error::Invalid`] for a wrong argument
+/// count, a variable outside every lambda or a geometry literal that is no `GeoJSON` geometry.
 pub fn compile(expr: &Expr, now: DateTime) -> Result<Program, Error> {
     let mut c = Compiler { now, nodes: 0 };
     Ok(Program {
@@ -507,7 +547,20 @@ impl Compiler {
                 Node::All(self.boxed(list, d, lambdas)?, self.boxed(body, d, inner)?)
             }
             Expr::Call(f, args) => self.call(*f, args, d, lambdas)?,
+            Expr::Spatial(rel, a, b) => {
+                Node::Spatial(*rel, self.shape(a, d, lambdas)?, self.shape(b, d, lambdas)?)
+            }
         })
+    }
+
+    fn shape(&mut self, e: &Expr, depth: usize, lambdas: usize) -> Result<Shape, Error> {
+        match e {
+            Expr::Lit(Lit::Geometry(g)) => {
+                self.count(1)?;
+                Ok(Shape::Fixed(Box::new(geometry::literal(g)?)))
+            }
+            _ => Ok(Shape::Value(self.boxed(e, depth, lambdas)?)),
+        }
     }
 
     fn call(

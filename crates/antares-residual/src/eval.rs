@@ -13,8 +13,8 @@ use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{
-    Cmp, Date, DateTime, Error, Func, Lit, Member, Node, Path, Time, Truth, MAX_STEPS,
-    MAX_STRING_BYTES,
+    geometry, Cmp, Date, DateTime, Error, Func, Lit, Member, Node, Path, Shape, Time, Truth,
+    MAX_STEPS, MAX_STRING_BYTES,
 };
 
 /// A value while evaluating; strings borrow from the Entity or the program when they can.
@@ -152,6 +152,21 @@ impl<'a> Eval<'a> {
                 }
                 call(*f, vals)
             }
+            Node::Spatial(rel, a, b) => match (self.shape(a)?, self.shape(b)?) {
+                (Some(a), Some(b)) => Some(Val::Bool(geometry::relate(*rel, &a, &b))),
+                _ => None,
+            },
+        })
+    }
+
+    /// A spatial operand's geometry; `None` when the value is no geometry.
+    fn shape(&mut self, s: &'a Shape) -> Result<Option<Cow<'a, geo::Geometry<f64>>>, Error> {
+        Ok(match s {
+            Shape::Fixed(g) => Some(Cow::Borrowed(g)),
+            Shape::Value(n) => match self.value(n)? {
+                Some(Val::Json(v)) => geometry::value(v).map(Cow::Owned),
+                _ => None,
+            },
         })
     }
 
@@ -184,6 +199,7 @@ fn literal(l: &Lit) -> Val<'_> {
         Lit::DateTime(d) => Val::DateTime(*d),
         Lit::Date(d) => Val::Date(*d),
         Lit::Time(t) => Val::Time(*t),
+        Lit::Geometry(g) => Val::Json(g),
     }
 }
 
