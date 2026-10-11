@@ -614,6 +614,42 @@ async fn a_filter_selects_through_q_and_the_count_follows() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_quote_or_backslash_in_a_string_literal_is_matched_not_cut() {
+    let (_b, app) = broker().await.expect("broker");
+    let mut odd: Value = serde_json::from_str(&car(5, "/a", 1.0)).unwrap_or(Value::Null);
+    odd[format!("{CITY}label")]["value"] = json!(r#"say "hi" \ ok"#);
+    let made = send(
+        &app,
+        Method::POST,
+        "/ngsi-ld/v1/entities",
+        Some(&odd.to_string()),
+        &[("NGSILD-Tenant", "city")],
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::CREATED, "{}", made.body);
+    let five = vec!["urn:ngsi-ld:Car:5".to_owned()];
+    for (filter, want) in [
+        ("label%20eq%20'say%20%22hi%22%20%5C%20ok'", five.clone()),
+        ("label%20eq%20'say%20%22hi'", vec![]),
+        ("contains(label,'%22hi%22')", five.clone()),
+        ("startswith(label,'say%20%22')", five.clone()),
+        ("endswith(label,'%5C%20ok')", five.clone()),
+        ("contains(label,'%22%22')", vec![]),
+    ] {
+        let got = send(
+            &app,
+            Method::GET,
+            &format!("{ROOT}/Car?$filter={filter}"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::OK, "{filter}: {}", got.body);
+        assert_eq!(ids(&got), want, "{filter}: {}", got.body);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_clients_link_header_does_not_change_what_a_filter_means() {
     let (_b, app) = broker().await.expect("broker");
     let uri = format!("{ROOT}/Car?$filter=speed%20gt%2010");

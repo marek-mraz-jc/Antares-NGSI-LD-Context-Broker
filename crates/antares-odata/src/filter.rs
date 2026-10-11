@@ -231,10 +231,6 @@ impl Terms<'_> {
         else {
             return Err(Refused::Later);
         };
-        // The quoted RegExp of `q` is taken as written: it cannot hold `"`.
-        if s.contains('"') {
-            return Err(Refused::Later);
-        }
         let name = self.scalar(member)?;
         // URL 5.1.1.5: the string functions take a string; NGSI-LD would
         // match no other value without saying why.
@@ -323,10 +319,15 @@ fn value(lit: &Literal) -> Result<String, Refused> {
 }
 
 /// The characters of `s` with every regular-expression metacharacter
-/// escaped.
+/// escaped, and `"` as `\x22`: the quoted `RegExp` of `q` is taken as
+/// written up to the next quote.
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
+        if c == '"' {
+            out.push_str(r"\x22");
+            continue;
+        }
         if r"\.^$|?*+()[]{}".contains(c) {
             out.push('\\');
         }
@@ -496,7 +497,10 @@ mod tests {
         assert_eq!(q(&call(Method::EndsWith, "$")), Ok(r#"(t0~="\$$")"#.into()));
         let not = Expr::Not(Box::new(call(Method::Contains, "x")));
         assert_eq!(q(&not), Ok(r#"(t0!~="x")"#.into()), "F9");
-        assert_eq!(q(&call(Method::Contains, "a\"b")), Err(Refused::Later));
+        assert_eq!(
+            q(&call(Method::Contains, "a\"b\\")),
+            Ok(r#"(t0~="a\x22b\\")"#.into())
+        );
         assert_eq!(q(&call(Method::GeoIntersects, "x")), Err(Refused::Later));
         let one_arg = Expr::Call(Method::Contains, vec![m("name")]);
         assert_eq!(q(&one_arg), Err(Refused::Later));
