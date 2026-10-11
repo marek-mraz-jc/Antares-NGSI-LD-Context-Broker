@@ -1,0 +1,42 @@
+[package]
+name = "antares-residual"
+description = "The residual of a standard query over an NGSI-LD view: one intermediate form and its three-valued evaluator over a normalized Entity (ADR-0028 rules 2 and 7)."
+version.workspace = true
+edition.workspace = true
+publish = false
+license.workspace = true
+rust-version.workspace = true
+
+# ADR-0028 rule 2: reached only through antares-ops (T-3757), so it carries the ops role and its
+# fences (module rules, the vanilla build never links it, the coverage gate).
+[package.metadata.antares]
+role = "ops"
+
+[dependencies]
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
