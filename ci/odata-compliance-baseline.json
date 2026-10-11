@@ -1,7 +1,7 @@
 {
  "counts": {
-  "FAIL": 661,
-  "PASS": 455,
+  "FAIL": 660,
+  "PASS": 456,
   "SKIP": 71
  },
  "results": {
@@ -163,7 +163,7 @@
   "[V4] 11.1_resource_path :: $metadata system resource path returns 200": "PASS",
   "[V4] 11.1_resource_path :: Bound function path with colon inside quoted key is parsed as a valid OData resource path": "PASS",
   "[V4] 11.1_resource_path :: Chained navigation paths work or are not implemented": "FAIL",
-  "[V4] 11.1_resource_path :: Empty path segments should return error or redirect": "FAIL",
+  "[V4] 11.1_resource_path :: Empty path segments should return error or redirect": "PASS",
   "[V4] 11.1_resource_path :: Entity by key path returns 200": "FAIL",
   "[V4] 11.1_resource_path :: Entity by named key path (ID=value) works or returns 404": "FAIL",
   "[V4] 11.1_resource_path :: Entity set path returns 200": "PASS",
