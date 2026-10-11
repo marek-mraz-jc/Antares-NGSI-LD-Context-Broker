@@ -169,7 +169,7 @@ equivalence of the 105 DistributedOperations TPs is ADR-0025's plan
 
 ## 8. Threat-model tests and the rule jobs
 
-- Every STRIDE row of `surfaces-threat-model.md` sections 2 to 8 (G1 to G10, V1 to V27, O1 to O26,
+- Every STRIDE row of `surfaces-threat-model.md` sections 2 to 8 (G1 to G10, V1 to V27, O1 to O27,
   MC1 to MC20, LK1 to LK8, W1 to W11, C1 to C10: 112 rows) names its test in its own row; the
   implementing task of each crate copies those names. A check keeps them true:
   `dev/threat-tests.py` (new) parses the test column of every row and fails when a named test

@@ -30,6 +30,8 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 antares-ops = { path = ".", features = ["test-kit"] }
 http-body-util = { version = "0.1", default-features = false }
 proptest = { workspace = true }
+# the broker's allocator, so `benches/view_query.rs` times what ships
+tikv-jemallocator = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing-subscriber = { workspace = true }
@@ -58,4 +60,8 @@ broken_intra_doc_links = "deny"
 
 [[bench]]
 name = "views"
+harness = false
+
+[[bench]]
+name = "view_query"
 harness = false
