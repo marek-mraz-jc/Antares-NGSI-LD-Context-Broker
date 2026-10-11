@@ -4595,6 +4595,7 @@ mod delivery_policy_tests {
         // the rest of its life
         st.egress = Arc::new(crate::egress::Egress::new(antares_jsonld::EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         }));
         let (uri, hits) = flaky_endpoint(0).await;
         let sub = subscribe(&st, &t, SUB_ID, &uri).await;
@@ -4608,6 +4609,37 @@ mod delivery_policy_tests {
         assert!(
             letters(&st, &t).await.is_empty(),
             "a policy verdict is not a transport failure"
+        );
+        assert_eq!(
+            notification(&st, &t, SUB_ID).await["status"],
+            json!("failed")
+        );
+    }
+
+    /// T-3908: listing a name in `private_hosts` never opens the broker's own
+    /// host. A subscription naming `localhost` is refused at delivery like
+    /// any private destination: nothing leaves, the status is failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listed_name_on_the_local_host_is_refused_at_delivery() {
+        let (mut st, t) = state(policy(3, 50));
+        let hosts: &'static [String] = vec!["localhost".to_owned()].leak();
+        st.egress = Arc::new(crate::egress::Egress::new(antares_jsonld::EgressPolicy {
+            allow_private: false,
+            private_hosts: hosts,
+        }));
+        let (uri, hits) = flaky_endpoint(0).await;
+        let uri = uri.replace("127.0.0.1", "localhost");
+        let sub = subscribe(&st, &t, SUB_ID, &uri).await;
+        send(&st, &t, &sub).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "nothing reaches the local host"
+        );
+        assert!(
+            letters(&st, &t).await.is_empty(),
+            "a policy verdict, not a transport failure"
         );
         assert_eq!(
             notification(&st, &t, SUB_ID).await["status"],
