@@ -1,0 +1,264 @@
+{
+  "id": "https://uri.etsi.org/ngsi-ld/default-context",
+  "name": "odata-compliance",
+  "prefixes": {
+    "ngsild": {
+      "prefix_prefix": "ngsild",
+      "prefix_reference": "https://uri.etsi.org/ngsi-ld/default-context/"
+    }
+  },
+  "default_prefix": "ngsild",
+  "classes": {
+    "Products": {
+      "slots": [
+        "ID",
+        "Name",
+        "Description",
+        "Price",
+        "Rating",
+        "Temperature",
+        "Quantity",
+        "Weight",
+        "Data",
+        "ReleaseDate",
+        "OpenTime",
+        "ShippingTime",
+        "ProcessingTime",
+        "Offset",
+        "CategoryID",
+        "Status",
+        "Version",
+        "CreatedAt",
+        "SerialNumber",
+        "ProductType",
+        "SpecialProperty",
+        "SpecialFeature",
+        "ShippingAddress",
+        "Dimensions",
+        "Location",
+        "Route",
+        "Area",
+        "Category",
+        "Descriptions",
+        "RelatedProducts"
+      ]
+    },
+    "Categories": {
+      "slots": [
+        "ID",
+        "Name",
+        "Description"
+      ]
+    },
+    "ProductDescriptions": {
+      "slots": [
+        "ProductID",
+        "LanguageKey",
+        "Description",
+        "LongText",
+        "CustomName",
+        "Product"
+      ]
+    },
+    "MediaItems": {
+      "slots": [
+        "ID",
+        "Name",
+        "ContentType",
+        "Size"
+      ]
+    },
+    "ReadOnlyItems": {
+      "slots": [
+        "ID",
+        "Name"
+      ]
+    },
+    "DecimalSamples": {
+      "slots": [
+        "ID",
+        "Name",
+        "Amount"
+      ]
+    },
+    "Address": {
+      "slots": [
+        "Street",
+        "City",
+        "State",
+        "PostalCode",
+        "Country"
+      ]
+    },
+    "DimensionsType": {
+      "slots": [
+        "Length",
+        "Width",
+        "Height",
+        "Unit"
+      ]
+    }
+  },
+  "slots": {
+    "ID": {
+      "range": "string"
+    },
+    "Name": {
+      "range": "string"
+    },
+    "Description": {
+      "range": "string"
+    },
+    "Price": {
+      "range": "float"
+    },
+    "Rating": {
+      "range": "integer"
+    },
+    "Temperature": {
+      "range": "integer"
+    },
+    "Quantity": {
+      "range": "integer"
+    },
+    "Weight": {
+      "range": "float"
+    },
+    "Data": {
+      "range": "string"
+    },
+    "ReleaseDate": {
+      "range": "date"
+    },
+    "OpenTime": {
+      "range": "time"
+    },
+    "ShippingTime": {
+      "range": "string"
+    },
+    "ProcessingTime": {
+      "range": "string"
+    },
+    "Offset": {
+      "range": "string"
+    },
+    "CategoryID": {
+      "range": "string"
+    },
+    "Status": {
+      "range": "integer"
+    },
+    "Version": {
+      "range": "integer"
+    },
+    "CreatedAt": {
+      "range": "datetime"
+    },
+    "SerialNumber": {
+      "range": "string"
+    },
+    "ProductType": {
+      "range": "string"
+    },
+    "SpecialProperty": {
+      "range": "string"
+    },
+    "SpecialFeature": {
+      "range": "string"
+    },
+    "ShippingAddress": {
+      "range": "Address",
+      "inlined": true
+    },
+    "Dimensions": {
+      "range": "DimensionsType",
+      "inlined": true
+    },
+    "Street": {
+      "range": "string"
+    },
+    "City": {
+      "range": "string"
+    },
+    "State": {
+      "range": "string"
+    },
+    "PostalCode": {
+      "range": "string"
+    },
+    "Country": {
+      "range": "string"
+    },
+    "Length": {
+      "range": "float"
+    },
+    "Width": {
+      "range": "float"
+    },
+    "Height": {
+      "range": "float"
+    },
+    "Unit": {
+      "range": "string"
+    },
+    "ProductID": {
+      "range": "string"
+    },
+    "LanguageKey": {
+      "range": "string"
+    },
+    "LongText": {
+      "range": "string"
+    },
+    "CustomName": {
+      "range": "string"
+    },
+    "ContentType": {
+      "range": "string"
+    },
+    "Size": {
+      "range": "integer"
+    },
+    "Amount": {
+      "range": "decimal"
+    },
+    "Category": {
+      "range": "Categories"
+    },
+    "Descriptions": {
+      "range": "ProductDescriptions",
+      "multivalued": true
+    },
+    "RelatedProducts": {
+      "range": "Products",
+      "multivalued": true
+    },
+    "Product": {
+      "range": "Products"
+    },
+    "Location": {
+      "annotations": {
+        "ngsi_ld_kind": {
+          "tag": "ngsi_ld_kind",
+          "value": "GeoProperty"
+        }
+      }
+    },
+    "Route": {
+      "annotations": {
+        "ngsi_ld_kind": {
+          "tag": "ngsi_ld_kind",
+          "value": "GeoProperty"
+        }
+      }
+    },
+    "Area": {
+      "annotations": {
+        "ngsi_ld_kind": {
+          "tag": "ngsi_ld_kind",
+          "value": "GeoProperty"
+        }
+      }
+    }
+  }
+}
