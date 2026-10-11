@@ -51,7 +51,10 @@ LEGEND = {
         "c50 / c200 = that many closed-loop clients, each sending the next request as soon as the "
         "previous one answers; req/s is what the broker sustained at that concurrency. "
         "postgres rows run on the main broker over the LOADED dataset (tenant t7), memory rows on a "
-        "fresh in-memory broker holding the 100 seeded entities."
+        "fresh in-memory broker holding the 100 seeded entities. full rows: a `full` binary with "
+        "view perf (Vehicle, every Attribute shown); view = the query through the view, odata = the "
+        "same page as an EntitySet ($top=20), mcp = tools/call query_entities for 20 Vehicles, each "
+        "priced against that binary's own query row (ADR-0027 section 6)."
     ),
     "saturate.md": (
         "Open-loop arrival rate stepped up by STEP rps per stage on a FRESH broker in the default "
