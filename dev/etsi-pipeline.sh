@@ -295,6 +295,7 @@ teardown() {
   kill "$MONITOR_PID" 2>/dev/null || true
   [ -n "$ROLL_PID" ] && { kill "$ROLL_PID" 2>/dev/null || true; }
   rm -f "$PHASE_FILE"
+  RESULTS="$RESULTS" dev/etsi-local-context.sh stop || true
   # Leave the suite tree clean — the IOP step seds variables.py and
   # the MQTT step overlays MqttUtils.resource.
   git -C ngsi-ld-test-suite checkout -- resources/variables.py \
@@ -317,6 +318,12 @@ teardown() {
   fi
 }
 trap teardown EXIT
+
+# 4b. The suite's @context from this checkout, not from GitHub on dev
+# (T-3550): teardown puts the rewritten files back.
+SUITE_CONTEXT=$(RESULTS="$RESULTS" dev/etsi-local-context.sh start) \
+  || { echo "could not serve the suite context locally"; exit 1; }
+export SUITE_CONTEXT
 
 # 5. Serial suites against broker1 (STOP_ON_ERROR respected by etsi-run.sh).
 serial_status=0
@@ -363,7 +370,8 @@ fi
   sed -i "s|^temporal_api_url = .*|temporal_api_url = 'http://localhost:9090/ngsi-ld/v1'|" variables.py
   sed -i "s|^notification_server_host = .*|notification_server_host = '${CALLBACK_HOST:-localhost}'|" variables.py
   sed -i "s|^context_source_host = .*|context_source_host = '${CALLBACK_HOST:-localhost}'|" variables.py
-  sed -i "s|^context_server_host = .*|context_server_host = '${CALLBACK_HOST:-localhost}'|" variables.py )
+  sed -i "s|^context_server_host = .*|context_server_host = '${CALLBACK_HOST:-localhost}'|" variables.py
+  sed -i "s|^ngsild_test_suite_context = .*|ngsild_test_suite_context = '$SUITE_CONTEXT'|" variables.py )
 # Console tee'd into the results dir: when robot dies before writing
 # output.xml (import error, unreachable broker), the artifact must still
 # say why — a 1 KB artifact with no clue is undebuggable in CI.
@@ -376,11 +384,18 @@ fi
     IOP_TP ) 2>&1 | tee "$RESULTS/IOP-console.log" || true
 fi
 
+# 7a. No TP may have resolved the suite context outside this run.
+context_status=0
+RESULTS="$RESULTS" dev/etsi-local-context.sh check | tee "$RESULTS/local-context-check.txt" \
+  || context_status=1
+
 # 7. Report: suite table, per-broker CPU/RSS, spike attribution, downloadable
 # failure + sample CSVs, image size and the memory gate.
 kill "$MONITOR_PID" 2>/dev/null || true
 IMAGE_BYTES=$(docker image inspect antares-local:latest --format '{{.Size}}' 2>/dev/null || echo 0)
 RESULTS="$RESULTS" STORE="$STORE" MEM_LIMIT_MB="$MEM_LIMIT_MB" IMAGE_BYTES="$IMAGE_BYTES" \
   python3 dev/etsi-report.py
+# the cell gate is this file (etsi-matrix.yml): a context fetched off-run fails it
+[ "$context_status" = 0 ] || echo FAIL > "$RESULTS/gate-status.txt"
 
-grep -q '^PASS$' "$RESULTS/gate-status.txt"
+grep -q '^PASS$' "$RESULTS/gate-status.txt" && [ "$context_status" = 0 ]

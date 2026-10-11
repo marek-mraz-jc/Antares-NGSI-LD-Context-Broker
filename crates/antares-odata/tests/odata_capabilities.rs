@@ -9,7 +9,8 @@ use antares_ops::policy::{
 };
 use antares_ops::test_kit::TestBroker;
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode};
+use axum::body::Bytes;
+use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -217,5 +218,95 @@ async fn odata_capabilities_true_but_engine_denies_is_403() {
         let (status, body) = send(&app, Method::GET, &format!("{ROOT}/{path}"), None).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
         assert!(!body.contains("urn:ngsi-ld:Car:1"), "{path}: {body}");
+    }
+}
+
+/// Status, headers and body of one request.
+async fn fetch(app: &Router, method: Method, uri: &str) -> (StatusCode, HeaderMap, Bytes) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap_or_default();
+    let Ok(resp) = app.clone().oneshot(req).await;
+    let (parts, body) = resp.into_parts();
+    let bytes = body
+        .collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .unwrap_or_default();
+    (parts.status, parts.headers, bytes)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_is_declared_as_the_surface_serves_it() {
+    let (_b, app) = broker(false).await.expect("broker");
+    let (status, xml) = send(&app, Method::GET, &format!("{ROOT}/$metadata"), None).await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert!(
+        xml.contains(r#"<Annotation Term="Capabilities.BatchSupported" Bool="true"/>"#),
+        "C18: {xml}"
+    );
+    let support = xml
+        .find(r#"Term="Capabilities.BatchSupport""#)
+        .and_then(|at| xml.get(at..))
+        .and_then(|rest| rest.split("</Annotation>").next())
+        .unwrap_or_default();
+    for claim in [
+        r#"<PropertyValue Property="Supported" Bool="true"/>"#,
+        r#"<PropertyValue Property="ContinueOnErrorSupported" Bool="true"/>"#,
+        r#"<PropertyValue Property="ReferencesInRequestBodiesSupported" Bool="false"/>"#,
+        "<String>multipart/mixed</String>",
+        "<String>application/json</String>",
+    ] {
+        assert!(support.contains(claim), "{claim}: {support}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn head_is_the_get_without_its_body() {
+    let (_b, app) = broker(false).await.expect("broker");
+    for path in [
+        "",
+        "/$metadata",
+        "/Car",
+        "/Car/$count",
+        "/Car('urn:ngsi-ld:Car:1')",
+        "/Car?$top=1&$select=speed",
+        "/Car('urn:ngsi-ld:Car:9')",
+        "/Nothing",
+    ] {
+        let uri = format!("{ROOT}{path}");
+        let (got, get_headers, body) = fetch(&app, Method::GET, &uri).await;
+        let (head, head_headers, empty) = fetch(&app, Method::HEAD, &uri).await;
+        assert_eq!(head, got, "{path}");
+        assert!(empty.is_empty(), "{path}: {empty:?}");
+        assert_eq!(
+            head_headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok()),
+            Some(body.len().to_string().as_str()),
+            "{path}"
+        );
+        for name in ["content-type", "odata-version"] {
+            assert_eq!(
+                head_headers.get(name),
+                get_headers.get(name),
+                "{path}: {name}"
+            );
+        }
+    }
+    let (status, _, _) = fetch(&app, Method::HEAD, "/x/views/none/odata/v4/Car").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn head_passes_the_gate_the_get_does() {
+    let (_b, app) = broker(true).await.expect("broker");
+    for path in ["Car", "Car/$count", "Car('urn:ngsi-ld:Car:1')"] {
+        let uri = format!("{ROOT}/{path}");
+        let (status, _, body) = fetch(&app, Method::HEAD, &uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        assert!(body.is_empty(), "{path}: {body:?}");
     }
 }

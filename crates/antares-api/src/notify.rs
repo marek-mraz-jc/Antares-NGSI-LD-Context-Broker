@@ -29,7 +29,10 @@ use std::sync::Arc;
 const DEFAULT_TRIGGERS: &[&str] = &["attributeCreated", "attributeUpdated"];
 /// Depth of the change→matcher queue, the same ring size the local bus uses.
 /// Held with the other published ceilings so `/q/health` reports it.
-use crate::bounds::{CHANGE_QUEUE, DELIVERY_WIDTH, DELIVERY_WIDTH_PER_TENANT};
+use crate::bounds::{CHANGE_QUEUE, DELIVERY_WIDTH};
+// the per-tenant slots of the native delivery pool (`tenant_slots`)
+#[cfg(not(target_arch = "wasm32"))]
+use crate::bounds::DELIVERY_WIDTH_PER_TENANT;
 static CHANGES_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TASK_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Hand a batch to the matcher queue: counted as pending on acceptance,
@@ -614,7 +617,7 @@ async fn shown_now(
     reach: Option<&crate::repr::PolicyReach>,
     data: &Value,
     ctx: &Context,
-) -> HashMap<String, Option<crate::policy::Shown>> {
+) -> HashMap<String, Option<crate::policy::Shown<'static>>> {
     fn ids<'a>(v: &'a Value, out: &mut std::collections::BTreeSet<&'a str>) {
         match v {
             Value::Object(o) => {
@@ -648,9 +651,9 @@ async fn shown_now(
 
 /// The entry of `shown` for the Entity `e`; `None` when `e` is no Entity.
 fn entity_shown<'a>(
-    shown: &'a HashMap<String, Option<crate::policy::Shown>>,
+    shown: &'a HashMap<String, Option<crate::policy::Shown<'static>>>,
     e: &Value,
-) -> Option<Option<&'a crate::policy::Shown>> {
+) -> Option<Option<&'a crate::policy::Shown<'static>>> {
     let id = e.get("id").and_then(Value::as_str)?;
     Some(shown.get(id).and_then(Option::as_ref))
 }
@@ -659,7 +662,7 @@ fn entity_shown<'a>(
 /// and every Entity it embeds the same way: an embedded one no rule holds
 /// for is not embedded (ADR-0023 rule 6), its Relationship stays.
 fn project_shown(
-    shown: &HashMap<String, Option<crate::policy::Shown>>,
+    shown: &HashMap<String, Option<crate::policy::Shown<'static>>>,
     e: &mut Value,
     key_values: bool,
 ) {
@@ -758,13 +761,13 @@ async fn view_sees(
     tenant: &TenantId,
     view: &crate::views::CompiledView,
     doc: &Value,
-) -> Option<(crate::policy::Shown, Value, crate::repr::Repr)> {
+) -> Option<(crate::policy::Shown<'static>, Value, crate::repr::Repr)> {
     let repr = crate::repr::narrowing(view.narrowing());
     let ctx = crate::repr::policy_context();
     if !crate::repr::policy_admits(st, tenant, ctx, repr.policy_reach.as_deref(), doc).await {
         return None;
     }
-    let shown = crate::repr::shown(repr.policy_types.as_deref(), doc)?;
+    let shown = crate::repr::shown(repr.policy_types.as_deref(), doc)?.into_owned();
     let seen = crate::repr::policy_view(doc, &repr);
     Some((shown, seen, repr))
 }
@@ -2791,7 +2794,9 @@ async fn retry_and_settle(
 }
 
 /// The dead-letter document: everything a replay needs to send the very
-/// same request again, plus the attempt history.
+/// same request again, plus the attempt history. Written by the native
+/// retry loop (`retry_and_settle`) alone.
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)] // one param per stored letter member
 fn dead_letter(
     sub_id: &str,

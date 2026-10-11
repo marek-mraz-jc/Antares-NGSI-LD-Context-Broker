@@ -49,12 +49,29 @@ fi
 # Restore the sed-ed file on exit: a dirty suite tree should mean a real
 # change, not a leftover run configuration.
 trap 'git -C "$SUITE" checkout -- resources/variables.py 2>/dev/null || true' EXIT
+# The suite's @contexts from this checkout (T-3550): the pipeline serves them
+# and exports SUITE_CONTEXT; a caller that runs this script alone (examples,
+# etsi-coverage, a dev box on the vendored suite) gets the same server here,
+# so no run reads them from GitHub or forge at run time (T-3678).
+own_context=0
+if [ -z "${SUITE_CONTEXT:-}" ] && [ "$SUITE" -ef ./ngsi-ld-test-suite ]; then
+  SUITE_CONTEXT=$(RESULTS="$RESULTS_DIR" dev/etsi-local-context.sh start) \
+    || { echo "could not serve the suite context locally"; exit 1; }
+  own_context=1
+  trap 'RESULTS="$RESULTS_DIR" dev/etsi-local-context.sh stop || true
+        git -C "$SUITE" checkout -- resources/variables.py 2>/dev/null || true' EXIT
+fi
+# FederationReset.py reads it from the environment (its Link header)
+export SUITE_CONTEXT="${SUITE_CONTEXT:-}"
 ( cd "$SUITE/resources"
   sed -i "s|^url = .*|url = '$BROKER_URL'|" variables.py
   sed -i "s|^temporal_api_url = .*|temporal_api_url = '$BROKER_URL'|" variables.py
   sed -i "s|^notification_server_host = .*|notification_server_host = '$CALLBACK_HOST'|" variables.py
   sed -i "s|^context_source_host = .*|context_source_host = '$CALLBACK_HOST'|" variables.py
-  sed -i "s|^context_server_host = .*|context_server_host = '$CALLBACK_HOST'|" variables.py )
+  sed -i "s|^context_server_host = .*|context_server_host = '$CALLBACK_HOST'|" variables.py
+  # the suite context the pipeline serves from this checkout (T-3550)
+  [ -z "${SUITE_CONTEXT:-}" ] \
+    || sed -i "s|^ngsild_test_suite_context = .*|ngsild_test_suite_context = '$SUITE_CONTEXT'|" variables.py )
 
 mkdir -p "$RESULTS_DIR"
 EXTRA=()
@@ -83,4 +100,8 @@ for s in $SUITES; do
       "TP/NGSI-LD/$s") 2>&1 | tee "$RESULTS_DIR/$name-console.log" \
     || { status=$?; [ "$STOP_ON_ERROR" = 1 ] && break; }
 done
+if [ "$own_context" = 1 ]; then
+  RESULTS="$RESULTS_DIR" dev/etsi-local-context.sh check | tee "$RESULTS_DIR/local-context-check.txt" \
+    || status=1
+fi
 exit $status

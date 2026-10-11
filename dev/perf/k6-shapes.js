@@ -15,6 +15,15 @@
 //   facade-twin  GET /entities?type=Vehicle&options=keyValues — the request
 //           that façade makes, so the pair prices the seam's round trip.
 //           Both need a binary built with the plugin-example feature.
+//   view    GET /x/views/{VIEW}/ngsi-ld/v1/entities?type=Vehicle&limit=20&local=true
+//           — `query` through an endpoint view that shows everything
+//   odata   GET /x/views/{VIEW}/odata/v4/Vehicle?$top=20 — the same page as an
+//           OData EntitySet
+//   mcp     POST /x/views/{VIEW}/mcp tools/call query_entities, 20 Vehicles —
+//           the same page as an MCP tool call
+//           The three need a `full` binary with the view and the Tenant's
+//           schema loaded (shapes.sh does it, BIN_SURFACES); ADR-0027
+//           section 6 prices each against `query` on that binary.
 // Closed model (constant VUs) on purpose here: this measures what the
 // broker sustains at a fixed concurrency (c50, c200), which is what the
 // published tables of other brokers report. k6-baseline.js keeps the open
@@ -22,7 +31,8 @@
 //
 //   k6 run -e SHAPE=query -e VUS=50 -e DURATION=5s dev/perf/k6-shapes.js
 //
-// Env: BROKER_URL, SHAPE (query|query-q|retrieve|update|upsert|subscribe|facade|facade-twin),
+// Env: BROKER_URL, SHAPE (query|query-q|retrieve|update|upsert|subscribe|facade|facade-twin|
+//      view|odata|mcp), VIEW (perf),
 //      VUS (50), DURATION (5s), TENANT (unset = default tenant), ENTITIES (100: how many
 //      urn:ngsi-ld:Vehicle:shape:<n> are seeded, in upserts of 500).
 
@@ -32,6 +42,22 @@ import { check } from "k6";
 const ROOT = __ENV.BROKER_URL || "http://localhost:9090";
 const BASE = `${ROOT}/ngsi-ld/v1`;
 const SHAPE = __ENV.SHAPE || "query";
+const VIEW = `${ROOT}/x/views/${__ENV.VIEW || "perf"}`;
+const MCP = "2026-07-28";
+const mcpCall = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  method: "tools/call",
+  params: {
+    name: "query_entities",
+    arguments: { type: ["Vehicle"], limit: 20 },
+    _meta: {
+      "io.modelcontextprotocol/protocolVersion": MCP,
+      "io.modelcontextprotocol/clientInfo": { name: "k6-shapes", version: "1" },
+      "io.modelcontextprotocol/clientCapabilities": {},
+    },
+  },
+});
 const N = Number(__ENV.ENTITIES || 100);
 const CHUNK = 500;
 const json = { "Content-Type": "application/json", ...(__ENV.TENANT ? { "NGSILD-Tenant": __ENV.TENANT } : {}) };
@@ -81,6 +107,23 @@ export default function () {
   } else if (SHAPE === "facade-twin") {
     // exactly what the façade asks the broker, so the difference is the seam
     r = http.get(`${BASE}/entities?type=Vehicle&options=keyValues`, { headers });
+  } else if (SHAPE === "view") {
+    r = http.get(`${VIEW}/ngsi-ld/v1/entities?type=Vehicle&limit=20&local=true`, { headers });
+  } else if (SHAPE === "odata") {
+    r = http.get(`${VIEW}/odata/v4/Vehicle?$top=20`, { headers });
+  } else if (SHAPE === "mcp") {
+    r = http.post(`${VIEW}/mcp`, mcpCall, {
+      headers: {
+        ...json,
+        Accept: "application/json, text/event-stream",
+        "MCP-Protocol-Version": MCP,
+        "Mcp-Method": "tools/call",
+        "Mcp-Name": "query_entities",
+      },
+    });
+    // a refused call is a 200 carrying isError: count only real answers
+    check(r, { "200": (res) => res.status === 200 && !res.body.includes('"isError":true') });
+    return;
   } else if (SHAPE === "retrieve") {
     r = http.get(`${BASE}/entities/urn:ngsi-ld:Vehicle:shape:${__ITER % N}`, { headers });
   } else if (SHAPE === "update") {

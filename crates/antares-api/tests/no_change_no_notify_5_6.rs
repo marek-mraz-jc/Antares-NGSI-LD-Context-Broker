@@ -62,22 +62,18 @@ async fn capture_server() -> (String, tokio::sync::mpsc::Receiver<Value>) {
 /// assertion is ordering, not silence: the only write that changed anything
 /// is the append of `b`, so if a 404 emitted a change it arrives first and
 /// carries an Entity without `b`.
+///
+/// The Subscription comes first and its notification of the Entity's
+/// creation is read before the misses: a creation made before the
+/// Subscription may still be in the matcher's queue when it registers and
+/// reach it late, carrying `a` alone, the same shape as a published miss
+/// (T-3713).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_miss_on_one_attribute_notifies_nobody() {
     allow_private();
     let mut st = AppState::new("test".into());
     antares_api::wire(&mut st).await;
-
-    let (status, body) = call(
-        &st,
-        "POST",
-        "entities",
-        &json!({"id": "urn:ngsi-ld:Miss:1", "type": "Miss",
-                "a": {"type": "Property", "value": 1}})
-        .to_string(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let wait = std::time::Duration::from_secs(5 * antares_api::state::slow_factor());
 
     let (uri, mut rx) = capture_server().await;
     let (status, body) = call(
@@ -90,6 +86,23 @@ async fn a_miss_on_one_attribute_notifies_nobody() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = call(
+        &st,
+        "POST",
+        "entities",
+        &json!({"id": "urn:ngsi-ld:Miss:1", "type": "Miss",
+                "a": {"type": "Property", "value": 1}})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let created = tokio::time::timeout(wait, rx.recv())
+        .await
+        .expect("the creation notifies within 5s")
+        .expect("one notification");
+    assert_eq!(created["data"][0]["a"]["value"], 1, "{created}");
+    assert!(created["data"][0].get("b").is_none(), "{created}");
 
     // 5.6.4 partial update, 5.6.19 replace, 5.6.5 delete — each on an
     // Attribute the Entity does not have
@@ -117,13 +130,10 @@ async fn a_miss_on_one_attribute_notifies_nobody() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
-    let n = tokio::time::timeout(
-        std::time::Duration::from_secs(5 * antares_api::state::slow_factor()),
-        rx.recv(),
-    )
-    .await
-    .expect("notification within 5s")
-    .expect("one notification");
+    let n = tokio::time::timeout(wait, rx.recv())
+        .await
+        .expect("notification within 5s")
+        .expect("one notification");
     assert_eq!(
         n["data"][0]["b"]["value"], 9,
         "the first notification is not the append — a miss was published as a change: {n}"

@@ -2,7 +2,7 @@
 //! Rules 6 and 9: what a socket may be opened from, how many there are, and
 //! what one client message may weigh.
 
-use crate::common::{broker, cars, connect, open, status, until, Client};
+use crate::common::{broker, cars, connect, open, status, text, until, Client};
 use antares_ws::Limits;
 use futures_util::SinkExt;
 use serde_json::json;
@@ -157,5 +157,64 @@ async fn ws_subscriptions_per_connection_are_capped() -> Result<(), String> {
     .await?;
     assert_eq!(status(&c.result().await?), 204);
     assert_eq!(status(&c.subscribe(cars()).await?), 201);
+    Ok(())
+}
+
+/// RFC 6455 section 4.2.1, which the surface checks itself since it no
+/// longer uses axum's `ws` feature (T-3704): a GET that is no upgrade, a
+/// version other than 13 and a missing key are refused with a problem
+/// document and admit nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_a_request_that_is_no_websocket_handshake_is_refused() -> Result<(), String> {
+    let b = broker(Limits::default()).await?;
+    let upgrade = [("Connection", "Upgrade"), ("Upgrade", "websocket")];
+    let key = ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    for (headers, said) in [
+        (vec![], "Upgrade: websocket"),
+        (vec![upgrade[1]], "Upgrade: websocket"),
+        (vec![upgrade[0]], "Upgrade: websocket"),
+        (
+            vec![upgrade[0], upgrade[1], ("Sec-WebSocket-Version", "8"), key],
+            "Version is 13",
+        ),
+        (
+            vec![upgrade[0], upgrade[1], ("Sec-WebSocket-Version", "13")],
+            "Sec-WebSocket-Key",
+        ),
+    ] {
+        let (code, body) = b.http.call("GET", ROOT, &headers, None).await?;
+        assert_eq!(code, 400, "{headers:?}: {body}");
+        assert_eq!(
+            text(&body, "/type"),
+            "https://uri.etsi.org/ngsi-ld/errors/BadRequestData",
+            "{headers:?}"
+        );
+        assert!(text(&body, "/detail").contains(said), "{headers:?}: {body}");
+    }
+    assert_eq!(b.hub.connections(), 0);
+    let _upgraded = connect(b.addr, ROOT, &[]).await?;
+    assert_eq!(b.hub.connections(), 1);
+    Ok(())
+}
+
+/// RFC 6455 section 4.2.2 needs the connection itself: a request served
+/// in process carries no `OnUpgrade`, so a well-formed handshake there is
+/// refused with 426 and admits nothing (T-3704, T-3707).
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_a_handshake_on_a_connection_that_cannot_upgrade_is_426() -> Result<(), String> {
+    use tower::ServiceExt;
+    let hub = antares_ws::Hub::new(Limits::default());
+    let kit = antares_ops::test_kit::TestBroker::new().await?;
+    let app = kit.serve_mounted(vec![antares_ops::mount(antares_ws::Ws::new(hub.clone()))])?;
+    let req = axum::http::Request::get(ROOT)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(axum::body::Body::empty())
+        .map_err(|e| e.to_string())?;
+    let resp = app.oneshot(req).await.map_err(|e| e.to_string())?;
+    assert_eq!(resp.status(), 426);
+    assert_eq!(hub.connections(), 0);
     Ok(())
 }

@@ -259,9 +259,9 @@ Semantics that decide the translation:
 | F17 | `length`, `indexof`, `substring`, `concat`, `tolower`, `toupper`, `trim`, `hassubset`, `hassubsequence` | 5.1.1.5 to 5.1.1.7 | rejected 501 | |
 | F18 | date and time functions (`year` ... `totalseconds`, `now`, `maxdatetime`, `mindatetime`) | 5.1.1.8 | rejected 501 | |
 | F19 | `round`, `floor`, `ceiling`, `cast`, `isof`, `case` | 5.1.1.9, 5.1.1.10, 5.1.1.12 | rejected 501 | |
-| F20 | complex path `p/a/b` | 5.1.1.15 | mapped | `QPath{path: [p], bracket: [a, b]}` (7.2.3.2 "trailing path ... enclosed in a single pair of square brackets") |
+| F20 | complex path `p/a/b` | 5.1.1.15 | mapped, gated: 501 until the model builds row P2's `ComplexType` (the build types an inlined class `Edm.Untyped`, `edm.rs` P2, so no path below `p` names a member; T-3686) | `QPath{path: [p], bracket: [a, b]}` (7.2.3.2 "trailing path ... enclosed in a single pair of square brackets") |
 | F21 | annotation value `p/@NgsiLd.observedAt` | 5.1.1.16 | mapped | `QPath{path: [p, observedAt]}` (7.2.3.2 EXAMPLE 9 `temperature.observedAt>=...`) |
-| F22 | `p/any(x: x eq v)` or `x in (...)` over a primitive collection (ListProperty, `scope`) | 5.1.1.13.1 | mapped | ListProperty: `Cmp{p, Eq, v\|List}` (membership, 7.2.3.4); `scope`: `scopeQ` (7.2.5), intersected like the seam's own (`policy.rs:257-264`) |
+| F22 | `p/any(x: x eq v)` or `x in (...)` over a primitive collection (ListProperty, `scope`) | 5.1.1.13.1 | mapped for a ListProperty; `scope` gated: 501 until the base members are filtered (F33's round; T-3686) | ListProperty: `Cmp{p, Eq, v\|List}` (membership, 7.2.3.4); `scope`: `scopeQ` (7.2.5), intersected like the seam's own (`policy.rs:257-264`) |
 | F23 | `p/all(...)`, `any` with any other body | 5.1.1.13 | rejected 501 | |
 | F24 | single-valued navigation path `nav/attr op v` | 5.1.1.15 | mapped, gated: 501 until the linked-entity evaluation of `q` checks each hop's target against the view and the engine (a new task, section 11; T-3470 covers the join walk only) (security S1) | `QPath{links: [Link{attr: nav, types: [B]}], path: [attr]}` (7.2.3.2 EXAMPLE 15 `sensor{Device:humidity}==40`) |
 | F25 | property against property | 5.1.1.1 | rejected 501 | `q` compares against literals only |

@@ -22,7 +22,11 @@
         ]
       }
     },
-    "scope": "/SK/BB"
+    "scope": "/SK/BB",
+    "nearest": {
+      "type": "Relationship",
+      "object": "urn:ngsi-ld:AirQualityObserved:ba-1"
+    }
   },
   {
     "id": "urn:ngsi-ld:AirQualityObserved:bb-2",

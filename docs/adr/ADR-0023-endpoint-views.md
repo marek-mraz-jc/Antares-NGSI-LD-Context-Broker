@@ -288,6 +288,7 @@ Rule {
     scope_q:     Option<String>
     geo_q:       Option<GeoQuery>
     attributes:  Set<Attribute IRI>
+    every_attribute: bool           // engine rules only, see below
 }
 ```
 
@@ -374,6 +375,23 @@ over that set, so paging and projection pushdown are forfeited
 (`ponytail:` a scan; compile the rules' OR to SQL when it shows up);
 options: scan, SQL compilation of per-Entity visibility now.
 
+Amended 2026-10-11 (T-3637): an engine's rule may show the whole Entity.
+The platform's grant without an attribute list is the whole Entity (map
+K9, `no_whitelist_anywhere_means_the_whole_entity`), and a rule with an
+empty `attributes` shows its frame alone, so the joinedcontext engine could
+not say it. `Rule::every_attribute` set means the rule shows every
+Attribute and its `attributes` are not read: an Entity it holds for keeps
+everything the stored Entity carries (minus `omit`, `omit_by_type` and
+`pick`, which still narrow), a write under it may name any Attribute, it
+discloses nothing (it shows what its condition reads), and a temporal
+answer keeps every Attribute's instances at the times it holds. Composed
+with a view's rule (rule 1), the pair shows the view rule's Attributes.
+A view never sets it: a view states every Attribute with rule 12's `*`.
+Decided (worker-1, owner may override): a flag beside the list, because a
+reserved name in the list would be compared as an Attribute IRI wherever
+the list is read; options: a flag, a reserved `*` member, an
+`Option<Set>`, which would change every reader of the list.
+
 ### 12. A view that narrows nothing: `*`
 
 Added 2026-10-11 (T-3666). The confirmation below runs the ETSI suite
@@ -399,9 +417,9 @@ the engine's answer under the view's conditions.
 a vocabulary that defines a term `*` cannot widen a view. Any other use
 of `*` is a load error: beside a name in the same list, in a rule beside
 other rules, in a rule with a condition, as a rule's types with named
-Attributes or the other way round. Each of those would need an
-"every Attribute" rule in the policy seam, which none of the platform's
-grants asks for.
+Attributes or the other way round. Each of those would be a view rule over every type
+or every Attribute, which no view asks for; an engine says the whole
+Entity with `Rule::every_attribute` (rule 11, amended by T-3637).
 
 Decided (worker-2, owner may override): the whole-view wildcard alone,
 because it is what the confirmation and the conformance jobs need and it

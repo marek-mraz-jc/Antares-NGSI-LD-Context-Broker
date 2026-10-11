@@ -1,0 +1,30 @@
+name: fast
+
+# The fast lane (T-3710): the workspace gate alone, on every push to dev,
+# about 15 minutes. A review closes on it (tasks/ci), so a task does not wait
+# for the ETSI matrix and the images. ci.yml is unchanged and still runs per
+# train: the workspace gate again, then the quick ETSI matrix, the arm64
+# build and the :dev image. Nothing moves out of ci.yml; the vanilla checks
+# (rule M3: the committed feature tree, the symbol gate with its --metadata
+# walk, the SBOM) are part of workspace.yml, so they now answer a push in
+# the fast lane too.
+#
+#   push to dev ──→ fast: workspace.yml            (closes reviews)
+#   dispatch per train ──→ ci: workspace.yml → ETSI matrix, images
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+# One push per train: a newer push supersedes the run of the older one.
+concurrency:
+  group: fast-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  workspace:
+    name: Workspace tests
+    uses: ./.github/workflows/workspace.yml

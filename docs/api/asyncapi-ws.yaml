@@ -153,7 +153,7 @@ components:
           metadata:
             type: object
             additionalProperties: false
-            required: [x-op, x-id, x-subscription]
+            required: [x-op, x-subscription]
             properties:
               x-op: { const: x-update }
               x-id: { $ref: '#/components/schemas/correlationId' }
@@ -170,7 +170,7 @@ components:
           metadata:
             type: object
             additionalProperties: false
-            required: [x-op, x-id, x-subscription]
+            required: [x-op, x-subscription]
             properties:
               x-op: { const: x-unsubscribe }
               x-id: { $ref: '#/components/schemas/correlationId' }
@@ -189,6 +189,7 @@ components:
             required: [x-op, x-connection, x-resume-token, x-seq]
             properties:
               x-op: { const: x-resume }
+              x-id: { $ref: '#/components/schemas/correlationId' }
               x-connection: { $ref: '#/components/schemas/connectionId' }
               x-resume-token: { type: string, pattern: '^[a-z2-7]{52}$' }
               x-seq:
@@ -283,8 +284,13 @@ components:
       pattern: '^[a-z2-7]{26}$'
     correlationId:
       type: string
+      description: |
+        Chosen by the client and echoed on the `x-result`; optional on every
+        client message. At most 256 bytes of UTF-8 (`MAX_ID_BYTES`); the
+        schema counts characters, so a multi-byte id may pass it and still be
+        refused with 400.
       minLength: 1
-      maxLength: 64
+      maxLength: 256
     clientEnvelopeWithBody:
       type: object
       additionalProperties: false
@@ -293,7 +299,7 @@ components:
         metadata:
           type: object
           additionalProperties: false
-          required: [x-op, x-id]
+          required: [x-op]
           properties:
             x-op: { const: x-subscribe }
             x-id: { $ref: '#/components/schemas/correlationId' }
@@ -323,8 +329,11 @@ components:
           items: { type: object }
     ProblemDetails:
       type: object
-      description: TS 104 175 V1.1.1 clause 5.5.3 (IETF RFC 9457).
-      required: [type]
+      description: |
+        TS 104 175 V1.1.1 clause 5.5.3 (IETF RFC 9457). The broker writes
+        `title` and `status` on every one, which keeps it apart from a
+        Subscription in `x-result`.
+      required: [type, title, status]
       properties:
         type: { type: string, format: uri }
         title: { type: string }

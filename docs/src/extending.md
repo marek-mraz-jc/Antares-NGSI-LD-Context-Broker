@@ -28,6 +28,8 @@ Every optional capability is one cargo feature plus a registration in
 | `antares-broker` | `console` | off | `tokio-console` support; only arms under `RUSTFLAGS="--cfg tokio_unstable"` |
 | `antares-broker` | `mqtt` | on | forwards `antares-api/mqtt`; off, MQTT endpoints fail at subscription creation. Measured on one release build: 27.2 → 26.0 MB binary, 58.1 → 55.4 MiB idle RSS |
 | `antares-broker` | `plugin-example` | off | the reference plugin (`examples/plugin-example`): one more backend, surface, notification binding, policy engine and façade route, all from outside `crates/`. Never in a shipped build |
+| `antares-broker` | `jc-policy` | off | the joinedcontext platform's policy engine (`addons/joinedcontext-policy`, `ANTARES_POLICY=joinedcontext`): the Tenant's Policy rules from `/q/policy/{tenant}`, decided on the gateway's `x-jc-*` headers. Built only into the platform image |
+| `antares-broker` | `full` | off | every surface in one binary: `views`, `mcp`, `odata`, `ws` (ADR-0027). The vanilla image never sets it; `image-jc.yml` builds `full,jc-policy` as `antares-broker-jc` |
 
 The browser artifact (`antares-wasm`) is the one build with `postgres`
 off: it drives the same router over the memory store and the OPFS shadow.
@@ -192,7 +194,11 @@ read-modify-write on the very document it changes, so a concurrent write
 between the decision and the commit cannot carry it onto an Entity the
 condition no longer selects. An Entity it does not select answers `404`
 exactly as an absent one does; a batch judges each member by its own
-Entity and reports the others in `errors`; a conditioned write that would
+Entity and reports the others in `errors`, and a Batch Upsert member under
+a condition never creates: absent, it answers the same `404` (T-3668). The
+temporal writes 5.6.12 to 5.6.15 judge the condition on the evolution's
+latest instance per Attribute and `datasetId` (T-3668); a
+conditioned write that would
 be forwarded to a Context Source is refused (`403`). `AllowIf` holds on the
 clauses in `policy::WRITE_BY_ID` and selects only: on any other clause, or
 with a `pick`, `omit`, `omit_by_type`, `temporal` or a rule's Attribute
@@ -301,6 +307,15 @@ contract and then answers real requests through the router;
 `ngsi-ld-test-suite/AntaresSpecificTests/policy_engine.robot` does the same
 against a running broker, and `.github/workflows/examples.yml` runs the
 conformance suite on `allow-all` and that folder on the engine, in one job.
+
+`addons/joinedcontext-policy` is the engine a deployment runs in
+production: the joinedcontext platform loads each Tenant's Policy rules
+through `/q/policy/{tenant}` and the engine decides on the caller the
+gateway forwards. Its README is the rule document contract, and
+`addons/joinedcontext-policy/tests/engine.rs` holds it through the router. The
+same addon ships the `access` surface (`/x/views/{view}/access`, README
+section 4): the caller's grants and the AuthZEN check, read from the table
+the engine decides with.
 
 ### Façades for another standard
 

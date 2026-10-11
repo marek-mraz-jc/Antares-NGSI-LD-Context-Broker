@@ -240,12 +240,31 @@ async fn odata_batch_part_bodies_are_depth_checked() {
 #[tokio::test(flavor = "multi_thread")]
 async fn odata_batch_part_count_is_capped() {
     let (_b, app, engine) = broker().await.expect("broker");
-    let members: Vec<Value> = (0..101)
-        .map(|n| json!({"id": n.to_string(), "method": "get", "url": "Car"}))
-        .collect();
-    let (status, _, answer) = json_batch(&app, &Value::from(members), &[]).await;
+    // the surface's cap: the library's strict limit, never above the broker's batch bound
+    let cap = odata_batch::Limits::strict()
+        .max_requests
+        .min(*antares_ops::bounds::MAX_BATCH_ITEMS);
+    let members = |n: usize| -> Value {
+        (0..n)
+            .map(|i| json!({"id": i.to_string(), "method": "get", "url": "Car"}))
+            .collect()
+    };
+    let (status, _, answer) = json_batch(&app, &members(cap + 1), &[]).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
-    assert_eq!(engine.take(), []);
+    assert_eq!(engine.take(), [], "no JSON member ran");
+
+    let ids: Vec<String> = (0..=cap).map(|i| i.to_string()).collect();
+    let parts: Vec<(&str, &str)> = ids
+        .iter()
+        .map(|id| (id.as_str(), "GET Car HTTP/1.1\r\n"))
+        .collect();
+    let (status, _, answer) = batch(&app, MULTIPART, &multipart(&parts), &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(engine.take(), [], "no multipart member ran");
+
+    let (status, _, answer) = json_batch(&app, &members(cap), &[]).await;
+    assert_eq!(status, StatusCode::OK, "the cap itself is served: {answer}");
+    assert_eq!(engine.take().len(), cap, "every member is gated alone");
 }
 
 #[tokio::test(flavor = "multi_thread")]
