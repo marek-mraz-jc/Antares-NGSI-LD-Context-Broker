@@ -257,6 +257,21 @@ fn collect(
     };
     // 1. sub-attribute step (expanded key)
     let iri = ctx.expand_key(seg);
+    // 0. a core member of the instance, kept under its own name by
+    // expansion: `temperature.observedAt>=...` (4.9 EXAMPLE 8) and
+    // `unitCode`, each a plain value and the last segment
+    if tail.is_empty() && bracket.is_none() {
+        let core = iri
+            .strip_prefix("https://uri.etsi.org/ngsi-ld/")
+            .filter(|name| matches!(*name, "observedAt" | "unitCode"));
+        if let Some(v) = core
+            .and_then(|name| inst.get(name))
+            .filter(|v| v.is_string())
+        {
+            push_target(TargetKind::Value, v, out);
+            return;
+        }
+    }
     if let Some(subs) = inst.get(&iri).and_then(Value::as_array) {
         for s in subs {
             collect(s, tail, bracket, ctx, out);
@@ -627,6 +642,26 @@ mod clause_4_9_extensions {
     fn q(doc: &Value, q: &str) -> bool {
         let ast = parse_q(q).expect(q);
         eval_q(&ast, doc, &ctx(), &|_| None)
+    }
+
+    /// 4.9 EXAMPLE 8 (and 7.2.3.2 EXAMPLE 9 of the API):
+    /// `temperature.observedAt>=...` compares the Property's `observedAt`.
+    #[test]
+    fn observed_at_is_a_sub_attribute_path() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "temperature": {"type": "Property", "value": 20,
+                "observedAt": "2017-12-24T13:00:00Z"}}));
+        assert!(q(&e, "temperature.observedAt>=2017-12-24T12:00:00Z"));
+        assert!(!q(&e, "temperature.observedAt<2017-12-24T12:00:00Z"));
+        assert!(q(&e, "temperature.observedAt==2017-12-24T13:00:00Z"));
+        assert!(!q(&e, "humidity.observedAt>=2017-12-24T12:00:00Z"));
+        let unit = expand(json!({"id": "urn:x", "type": "T",
+            "temperature": {"type": "Property", "value": 20, "unitCode": "CEL"}}));
+        assert!(q(&unit, r#"temperature.unitCode=="CEL""#));
+        assert!(
+            !q(&unit, "temperature.observedAt>=2017-12-24T12:00:00Z"),
+            "absent"
+        );
     }
 
     /// 4.9 EXAMPLE 9/10/11: trailing [path] navigates the compound value
