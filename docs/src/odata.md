@@ -197,12 +197,22 @@ number promotes among the numeric types (`Quantity lt 7.5`), an integer
 past its type's range is refused (`Size eq 9223372036854775808`), and
 `null` compares with any member. A number past 2^53 is `400` (NGSI-LD
 compares `f64`). A filter longer than 4096 bytes as `q` is `400`
-`TooComplexQuery`. Lambda operators, arithmetic, other functions, two
-members compared and paths past one hop are `501`.
+`TooComplexQuery`. Paths past one hop, durations, `cast`, `isof`,
+`case`, `hassubset`, `hassubsequence`, `totalseconds`, `geo.distance` and
+`geo.length` are `501`.
 
-Evaluated by the surface (T-3758): `not` over any of the above (`not
-(Price gt 5)` holds where `Price` is absent: OData compares a missing value
-as false), and a `geo.intersects` that is not the one top-level conjunct.
+Evaluated by the surface (T-3758, T-3749): `not` over any filter here
+(`not (Price gt 5)` holds where `Price` is absent: OData compares a
+missing value as false), a `geo.intersects` that is not the one top-level
+conjunct, arithmetic (`Price mul Quantity gt 100`, `-Price lt 0`), two
+members compared (`Price gt Cost`), the string functions (`length`,
+`indexof`, `substring`, `concat`, `tolower`, `toupper`, `trim`,
+`matchesPattern` with an ECMAScript pattern), the date and time functions
+(`year` to `fractionalseconds`, `totaloffsetminutes`, `date`, `time`,
+`now()`, `mindatetime()`, `maxdatetime()`), `round`, `floor`, `ceiling`,
+and `any`/`all` over a list (`Tags/all(t: t ne 'x')`; an absent list is
+empty). An operand of the wrong type is `400`: `length(Price)`, `Name add
+1`, `Price eq Name`.
 Such a filter reads the answer in pages of up to 1000 Entities ordered by
 the request's `$orderby` and then `id`, at most 10 000 per request: a page
 that runs out of budget is served short with its next link.
