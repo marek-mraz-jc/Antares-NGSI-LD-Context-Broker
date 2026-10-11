@@ -79,10 +79,19 @@ pub const WHOLE_TENANT: [&str; 4] = ["5.6.21", "5.16.1", "5.16.2", "5.16.7"];
 /// answer a narrowing as a deny ([`resolve`]).
 /// Discovery (5.7.5 to 5.7.10) is among them: ADR-0023 rule 5 computes it
 /// from the Entities the narrowing selects.
-pub const FILTERABLE: [&str; 12] = [
+/// Query Subscriptions (5.8.4, 5.11.5) and Query Registrations (5.10.2)
+/// narrow the list ([`RECORD_LISTS`]).
+pub const FILTERABLE: [&str; 15] = [
     "5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.7.5", "5.7.6", "5.7.7", "5.7.8", "5.7.9", "5.7.10",
-    "5.14.4", "5.14.5",
+    "5.14.4", "5.14.5", "5.8.4", "5.11.5", "5.10.2",
 ];
+
+/// The FILTERABLE clauses that list Subscriptions or Registrations. A
+/// narrowing there selects which documents are listed, counted and paged,
+/// and projects nothing: those are the client's own 5.2.12 and 5.2.9
+/// records, not Entities with Attributes to drop, so a [`Filter`] that
+/// projects is a deny there ([`resolve`], T-3673).
+pub const RECORD_LISTS: [&str; 3] = ["5.8.4", "5.11.5", "5.10.2"];
 
 /// Who is asking. The headers are the ones a deployment names for the
 /// seam to carry, copied verbatim and never interpreted: the broker does
@@ -504,6 +513,13 @@ impl Rule {
         self.q.is_some() || self.scope_q.is_some() || self.areas().next().is_some()
     }
 
+    /// Whether the rule holds for exactly the Entities of its types: no
+    /// condition, no ids, no id patterns (what [`Self::holds`] reads beside
+    /// the types).
+    pub fn admits_by_type_alone(&self) -> bool {
+        !self.is_conditional() && self.ids.is_empty() && self.id_patterns.is_empty()
+    }
+
     /// Whether the rule holds for `doc`, an Entity in the form `ctx`
     /// expands names to (the broker's internal form: expanded keys, each
     /// Attribute an array of instances).
@@ -671,6 +687,12 @@ impl Filter {
         !self.rules.is_empty() || !self.omit_by_type.is_empty()
     }
 
+    /// Whether a rule holds for `doc` (every document without rules): what
+    /// [`Self::shown`] answers `Some` for, without building the set.
+    pub fn admits(&self, doc: &Value, ctx: &antares_jsonld::Context) -> bool {
+        self.rules.is_empty() || self.rules.iter().any(|r| r.holds(doc, ctx))
+    }
+
     /// ADR-0023 rule 11: what `doc` may show, or `None` when `rules` is
     /// non-empty and none holds for it (the Entity is out). An Entity sees
     /// the union of the Attributes of the rules that hold for it, less what
@@ -685,6 +707,12 @@ impl Filter {
             held.peek()?;
             Some(held.flat_map(|r| r.attributes.iter().cloned()).collect())
         };
+        if self.omit_by_type.is_empty() {
+            return Some(Shown {
+                only,
+                omitted: Default::default(),
+            });
+        }
         let omitted = entity_types(doc)
             .into_iter()
             .filter_map(|t| self.omit_by_type.get(t))
@@ -1096,6 +1124,9 @@ pub fn resolve(clause: &str, decision: Decision) -> Decision {
             Decision::Deny("a write condition selects Entities and projects nothing".into())
         }
         Decision::AllowIf(f) if Condition::of(&f).is_none() => Decision::Allow,
+        Decision::Filter(f) if RECORD_LISTS.contains(&clause) && f.projects() => Decision::Deny(
+            format!("{clause} lists records whole and a narrowing there cannot project"),
+        ),
         Decision::Filter(f) if !FILTERABLE.contains(&clause) => {
             if f.is_empty() {
                 Decision::Allow
@@ -1512,6 +1543,50 @@ pub async fn gate_each(
         .collect()
 }
 
+/// A stored Subscription or Registration as a [`Condition`] reads it: `id`,
+/// `type` and `scope` as an Entity carries them, every other member one
+/// Property holding its value, and `subject` the carried header values of
+/// the subject that created it ([`SUBJECT_MEMBER`]), one instance each, so
+/// an engine selects the caller's own with `q=subject=="<its value>"`. A
+/// member a client wrote under `subject` is not the subject and is left
+/// out, as are the broker's other `__` members.
+// ponytail: values only, without the header names; an engine whose two
+// headers can carry the same value tells them apart by a rule's ids.
+fn record_image(doc: &Value) -> Value {
+    let ctx = crate::repr::policy_context();
+    let mut out = serde_json::Map::new();
+    for (k, v) in doc.as_object().into_iter().flatten() {
+        match k.as_str() {
+            "id" | "scope" => {
+                out.insert(k.clone(), v.clone());
+            }
+            "type" => {
+                let t = v
+                    .as_str()
+                    .map_or_else(|| v.clone(), |t| ctx.expand_key(t).into());
+                out.insert(k.clone(), t);
+            }
+            "subject" => {}
+            k if k.starts_with("__") => {}
+            k => {
+                out.insert(ctx.expand_key(k), serde_json::json!([{ "value": v }]));
+            }
+        }
+    }
+    let carried: Vec<(String, String)> = doc
+        .get(SUBJECT_MEMBER)
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    if !carried.is_empty() {
+        let values = carried
+            .into_iter()
+            .map(|(_, v)| serde_json::json!({ "value": v }));
+        out.insert(ctx.expand_key("subject"), values.collect());
+    }
+    Value::Object(out)
+}
+
 /// What a write by id needs of the Entity it lands on
 /// ([`Decision::AllowIf`]), in the form a stored document is read in. The
 /// handler checks it inside the store's own read-modify-write, on the
@@ -1558,6 +1633,12 @@ impl Condition {
             && self.q.as_ref().is_none_or(|q| {
                 !q.has_linked_paths() && antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
             })
+    }
+
+    /// Whether a Subscription or Registration is selected (T-3673): the
+    /// condition read over [`record_image`] of the stored document.
+    pub(crate) fn holds_for_record(&self, doc: &Value) -> bool {
+        self.holds(&record_image(doc))
     }
 
     /// Inside the store closure: an Entity the condition does not select is
@@ -1736,6 +1817,41 @@ impl PolicyEngine for Slow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `admits` is `shown(..).is_some()` without the set (T-3667).
+    #[test]
+    fn admits_is_whether_shown_answers() {
+        let ctx = antares_jsonld::core_context();
+        let car = serde_json::json!({"id": "urn:ngsi-ld:Car:1", "type": "Car"});
+        let rule = |t: &str| Rule {
+            types: vec![t.to_owned()],
+            ..Rule::default()
+        };
+        let cases = [
+            Filter::default(),
+            Filter {
+                omit_by_type: BTreeMap::from([("Car".to_owned(), vec!["speed".to_owned()])]),
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("Car")],
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("User")],
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("User"), rule("Car")],
+                ..Filter::default()
+            },
+        ];
+        let admitted: Vec<bool> = cases.iter().map(|f| f.admits(&car, &ctx)).collect();
+        assert_eq!(admitted, [true, true, true, false, true]);
+        for f in &cases {
+            assert_eq!(f.admits(&car, &ctx), f.shown(&car, &ctx).is_some(), "{f:?}");
+        }
+    }
 
     /// T-3684: an engine that keeps the trait's defaults reads no rule
     /// documents (ADR-0020 amendment): it says so, so `/q/policy` answers
@@ -2193,8 +2309,21 @@ mod tests {
             omit: vec!["speed".into()],
             ..Filter::default()
         });
+        let selected = Decision::Filter(Filter {
+            scope_q: Some("/mine".into()),
+            ..Filter::default()
+        });
         for clause in FILTERABLE {
-            assert_eq!(resolve(clause, narrowed.clone()), narrowed, "{clause}");
+            assert_eq!(resolve(clause, selected.clone()), selected, "{clause}");
+            if RECORD_LISTS.contains(&clause) {
+                // a record list selects and never projects (T-3673)
+                assert!(matches!(
+                    resolve(clause, narrowed.clone()),
+                    Decision::Deny(_)
+                ));
+            } else {
+                assert_eq!(resolve(clause, narrowed.clone()), narrowed, "{clause}");
+            }
         }
     }
 

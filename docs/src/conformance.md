@@ -177,6 +177,7 @@ carries the fix. The current list:
 | 21 | suite | 008_01 expects a second temporal upsert to replace instances at the same observedAt; 5.6.11.4 adds them |
 | 22 | suite | 046_22_08 reads a deleted three-instance Attribute as one object; 5.8.6 tombstones each instance with its datasetId |
 | 23 | suite | 046_05 percent-encodes the q of a Subscription body; Table 5.2.12-1 makes it a JSON string read as written |
+| 24 | spec | TS 104 176 9.4.3.1 and 9.4.3.2 carry each other's headings: Create Context Source Registration Subscription is headed GET/HEAD, Query is headed POST; Antares serves POST for create, GET for query |
 
 Filing is manual; each entry carries the clause quotation and the
 proposed fix so it can be pasted into the ETSI tracker as is.

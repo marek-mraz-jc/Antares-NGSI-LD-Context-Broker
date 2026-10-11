@@ -93,6 +93,7 @@ pub use antares_notifier::DeliveryPolicy;
 pub use antares_notifier::{
     build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
 };
+pub use contexts::public_base;
 pub use federation::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 pub use state::{AppState, TemporalRecord};
 
@@ -503,7 +504,17 @@ pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
     ]
 }
 
+/// The broker's whole HTTP surface, under trailing-slash normalization: every
+/// host of it (the binary, the browser build, an in-process forward, a test)
+/// serves `/entities/{id}/attrs/` as `/entities/{id}/attrs`, the form 5.6.2
+/// and 5.6.3 forwards are sent in (T-3701).
 pub fn router(state: AppState) -> Router {
+    let served = routes(state);
+    Router::new()
+        .fallback_service(tower_http::normalize_path::NormalizePath::trim_trailing_slash(served))
+}
+
+fn routes(state: AppState) -> Router {
     let api = api_routes()
         .into_iter()
         .fold(Router::new(), |api, (path, methods)| {

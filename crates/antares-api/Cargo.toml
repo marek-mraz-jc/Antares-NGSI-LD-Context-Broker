@@ -145,6 +145,12 @@ name = "policy_notify_5_8_6"
 path = "tests/policy_notify_5_8_6.rs"
 
 [[test]]
+# own process: sets ANTARES_POLICY_SUBJECT_HEADERS (T-3692: as a module of
+# `it` it raced the first request of another module for the header list)
+name = "policy_record_lists_5_8_4"
+path = "tests/policy_record_lists_5_8_4.rs"
+
+[[test]]
 # own process: sets ANTARES_POLICY_SUBJECT_HEADERS and ANTARES_PUBLIC_URL
 name = "policy_subject_on_the_wire_p6"
 path = "tests/policy_subject_on_the_wire_p6.rs"
