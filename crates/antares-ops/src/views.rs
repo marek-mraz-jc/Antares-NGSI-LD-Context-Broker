@@ -850,6 +850,7 @@ mod tests {
         let r = Arc::new(Reloader {
             state: AppState::new("antares-test".into()),
             cache: tokio::sync::Mutex::new(HashMap::new()),
+            policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
             schema_max: None,
         });
         let put = put_schema(r.clone(), "city".into(), Bytes::from_static(b"{}")).await;
