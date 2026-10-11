@@ -50,11 +50,13 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install k6
+      - name: Install k6 and psql
         run: |
           curl -sL https://github.com/grafana/k6/releases/download/v0.54.0/k6-v0.54.0-linux-amd64.tar.gz \
             | tar xz --strip-components=1
           sudo mv k6 /usr/local/bin/
+          # shapes.sh settles PostgreSQL after each seed (T-3735)
+          command -v psql >/dev/null || sudo apt-get install -y -qq postgresql-client
       - name: Build vanilla and overflow-checked binaries
         run: |
           set -euo pipefail
