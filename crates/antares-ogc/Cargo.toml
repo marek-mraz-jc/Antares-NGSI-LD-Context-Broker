@@ -18,6 +18,7 @@ antares-ops = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["query"] }
 linkml-model = { path = "../linkml-model" }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+uuid = { version = "1", default-features = false, features = ["v4"] }
 
 [dev-dependencies]
 antares-ops = { workspace = true, features = ["test-kit"] }

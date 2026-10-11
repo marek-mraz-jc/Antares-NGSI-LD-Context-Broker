@@ -18,6 +18,10 @@ name: fast
 # runs beside the workspace gate, so a lost conformance pass is red on the
 # push that lost it. A dispatch compares against `base`, or runs the subset
 # when it names none.
+#
+# A train is tested on train/<stamp> and dev then fast-forwards to that same
+# sha (T-3776): the push to dev finds the green fast run on its sha and skips
+# every job, so one train costs one fast run. A dispatch always runs.
 on:
   push:
     branches: [dev]
@@ -37,12 +41,38 @@ permissions:
   contents: read
 
 jobs:
+  proven:
+    name: Already green on this sha
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: read
+    outputs:
+      green: ${{ steps.ask.outputs.green }}
+    steps:
+      - id: ask
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          green=false
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            # a failed question runs everything: the answer must prove the sha, never assume it
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$GITHUB_SHA&status=success&per_page=30" \
+              --jq '[.workflow_runs[] | select(.path == ".github/workflows/fast.yml" and .id != (env.GITHUB_RUN_ID | tonumber)) | .id] | join(" ")') || runs=
+            [ -n "$runs" ] && green=true && echo "green fast run(s) on $GITHUB_SHA: $runs"
+          fi
+          echo "green=$green" | tee -a "$GITHUB_OUTPUT"
+
   workspace:
     name: Workspace tests
+    needs: proven
+    if: needs.proven.outputs.green != 'true'
     uses: ./.github/workflows/workspace.yml
 
   changes:
     name: Surface paths
+    needs: proven
+    if: needs.proven.outputs.green != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
