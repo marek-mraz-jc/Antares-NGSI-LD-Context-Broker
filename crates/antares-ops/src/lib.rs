@@ -508,14 +508,16 @@ impl ViewOps {
             return Err(Refusal::NotAllowed { allow: Vec::new() });
         };
         let engine = match self.inner.state.policy.as_deref() {
-            None => Ok(policy::Filter::default()),
+            None => Ok(antares_api::policy::unnarrowed()),
             Some(engine) => {
                 let asked = policy::Operation {
                     types,
                     attrs,
                     ..policy::Operation::new(clause)
                 };
-                antares_api::policy::gate(engine, &self.tenant, &caller.0, &asked).await
+                antares_api::policy::gate(engine, &self.tenant, &caller.0, &asked)
+                    .await
+                    .map(Arc::new)
             }
         };
         antares_api::views::with_view(Some(&self.view), clause, engine)
