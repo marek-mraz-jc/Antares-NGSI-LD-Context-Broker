@@ -969,6 +969,12 @@ async fn health(
     #[cfg(feature = "views")]
     {
         body["views"] = state.views.report();
+        // Which documents the table was loaded from (threat V26): two pods
+        // reporting two values serve two predicates.
+        body["viewsRevision"] = state.views.revision().into();
+        // The engine's rule documents by tenant and revision, loaded or
+        // refused (ADR-0020 amendment); never the documents themselves.
+        body["policy"]["documents"] = state.views.policy_report();
         body["schemas"] = state.views.schema_report();
     }
     // Changes the bounded matcher queue dropped (this process, since start).

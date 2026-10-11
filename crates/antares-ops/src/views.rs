@@ -35,6 +35,10 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
 
+mod preview;
+pub use preview::MAX_PREVIEW_LIMIT;
+pub mod rule_documents;
+
 /// How often, in milliseconds, every pod rebuilds its table from the store
 /// (default 5000): the bound on how long a view written on one pod takes to
 /// open, change or close on another.
@@ -276,8 +280,9 @@ fn compile_rule(i: usize, r: &ViewRule, ctx: &Context) -> Result<Rule, String> {
         q: parse_q(&at("q"), r.q.as_deref())?.map(Box::new),
         scope_q: scope_q(&at("scopeQ"), r.scope_q.as_deref())?,
         geo_q: geo_q(&at("geoQ"), r.geo_q.as_ref())?.map(Box::new),
-        geo_also: Vec::new(),
         attributes,
+        // a view rule has one area and names no ids
+        ..Rule::default()
     })
 }
 
@@ -376,6 +381,8 @@ struct Reloader {
     /// Each stored document and its entry, so an unchanged view is not
     /// validated (and its notes not logged) again on every reload.
     cache: tokio::sync::Mutex<HashMap<String, (Value, ViewEntry)>>,
+    /// The same for the policy engine's rule documents, per Tenant.
+    policy: tokio::sync::Mutex<rule_documents::Cache>,
     /// [`SCHEMA_MAX_ENV`]; `None` refuses every schema write.
     schema_max: Option<usize>,
 }
@@ -409,14 +416,18 @@ impl Reloader {
             };
             next.insert(id, (doc, entry));
         }
+        let table: BTreeMap<_, _> = next.iter().collect();
         self.state.views.replace(
-            next.iter()
-                .map(|(id, (_, e))| (id.clone(), e.clone()))
-                .collect::<BTreeMap<_, _>>(),
+            table
+                .iter()
+                .map(|(id, (_, e))| ((*id).clone(), e.clone()))
+                .collect(),
+            revision(table.iter().map(|(id, (doc, _))| (id.as_str(), doc))),
         );
         self.state.views.replace_schemas(schemas);
         *cache = next;
-        Ok(())
+        drop(cache);
+        rule_documents::reload(&self.state, &mut *self.policy.lock().await).await
     }
 }
 
@@ -433,6 +444,19 @@ fn log_entry(id: &str, e: &ViewEntry) {
     }
 }
 
+/// The digest of the view documents, in id order (threat V26): a pure
+/// function of what the store holds, so pods over one store agree without
+/// coordination.
+fn revision<'a>(docs: impl Iterator<Item = (&'a str, &'a Value)>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (id, doc) in docs {
+        id.hash(&mut h);
+        doc.to_string().hash(&mut h);
+    }
+    h.finish()
+}
+
 /// [`SCHEMA_MAX_ENV`]: `None` unset; a value that is no positive byte count
 /// is an error, so a typo never silently refuses every schema.
 fn schema_max(raw: Option<String>) -> Result<Option<usize>, String> {
@@ -447,9 +471,11 @@ fn schema_max(raw: Option<String>) -> Result<Option<usize>, String> {
     }
 }
 
-/// Load the stored views into `state`'s table, serve `/q/views` on its
-/// admin surface, and reload the table every [`RELOAD_ENV`] milliseconds.
-/// Call it once, before the router is built, inside a tokio runtime.
+/// Load the stored views into `state`'s table, serve `/q/views`,
+/// `/q/schemas` and `/q/policy` on its admin surface, and reload the table
+/// every [`RELOAD_ENV`] milliseconds. Call it once, after the policy engine
+/// is attached (the rule documents go to the engine of the `state` given
+/// here) and before the router is built, inside a tokio runtime.
 ///
 /// # Errors
 /// The store's, or routes set already.
@@ -457,6 +483,7 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
     let reloader = Arc::new(Reloader {
         state: state.clone(),
         cache: tokio::sync::Mutex::new(HashMap::new()),
+        policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
         schema_max: schema_max(std::env::var(SCHEMA_MAX_ENV).ok())?,
     });
     reloader.reload().await?;
@@ -506,8 +533,10 @@ impl Reload {
     }
 }
 
-/// `/q/views`: the table (GET), and one view's document (GET, PUT, DELETE);
-/// `/q/schemas/{tenant}`: one Tenant's `LinkML` schema (GET, PUT, DELETE).
+/// `/q/views`: the table (GET), one view's document (GET, PUT, DELETE), and
+/// what a draft would serve (`POST /q/views/{id}/preview`);
+/// `/q/schemas/{tenant}`: one Tenant's `LinkML` schema (GET, PUT, DELETE);
+/// and `/q/policy` beside them.
 fn admin(r: &Weak<Reloader>) -> Router {
     let (list, one, put, del) = (r.clone(), r.clone(), r.clone(), r.clone());
     let (s_get, s_put, s_del) = (r.clone(), r.clone(), r.clone());
@@ -543,6 +572,8 @@ fn admin(r: &Weak<Reloader>) -> Router {
                 })
                 .delete(move |Path(id): Path<String>| serve(del.clone(), |r| delete_one(r, id))),
         )
+        .merge(preview::routes(r))
+        .merge(rule_documents::routes(r))
 }
 
 /// Run `f` with the reloader, or answer 503 once the runtime that ran
@@ -581,6 +612,17 @@ async fn delete_one(r: Arc<Reloader>, id: String) -> Result<Response, String> {
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// The document of view `id` and the view it loads, or the first reason it
+/// cannot be served.
+fn candidate(id: &str, body: &[u8]) -> Result<(Value, Loaded), String> {
+    let doc = serde_json::from_slice::<Value>(body).map_err(|e| format!("not a view: {e}"))?;
+    let view: View = serde_json::from_value(doc.clone()).map_err(|e| format!("not a view: {e}"))?;
+    if view.id != id {
+        return Err("the document's id names another view than the path".into());
+    }
+    view.load().map(|l| (doc, l))
+}
+
 /// Validate, store, and answer once this pod's table holds the write.
 async fn put_one(r: Arc<Reloader>, id: String, body: Bytes) -> Result<Response, String> {
     if body.len() > MAX_VIEW_BYTES {
@@ -590,18 +632,8 @@ async fn put_one(r: Arc<Reloader>, id: String, body: Bytes) -> Result<Response, 
             &format!("a view document is at most {MAX_VIEW_BYTES} bytes"),
         ));
     }
-    let checked = serde_json::from_slice::<Value>(&body)
-        .map_err(|e| format!("not a view: {e}"))
-        .and_then(|doc| {
-            let view: View =
-                serde_json::from_value(doc.clone()).map_err(|e| format!("not a view: {e}"))?;
-            if view.id != id {
-                return Err("the document's id names another view than the path".into());
-            }
-            view.load().map(|_| doc)
-        });
-    let doc = match checked {
-        Ok(doc) => doc,
+    let doc = match candidate(&id, &body) {
+        Ok((doc, _)) => doc,
         Err(why) => return Ok(problem(StatusCode::BAD_REQUEST, "BadRequestData", &why)),
     };
     let replaced = r.state.put_view_doc(&id, doc).await?;
@@ -840,6 +872,7 @@ mod tests {
         let r = Arc::new(Reloader {
             state: AppState::new("antares-test".into()),
             cache: tokio::sync::Mutex::new(HashMap::new()),
+            policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
             schema_max: None,
         });
         let put = put_schema(r.clone(), "city".into(), Bytes::from_static(b"{}")).await;

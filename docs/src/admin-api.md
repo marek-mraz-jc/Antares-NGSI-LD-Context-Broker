@@ -104,7 +104,7 @@ progress). A memory-store broker answers:
 | `changesDropped` | Changes the bounded matcher queue refused since start, each one a notification never matched: delivery is slower than the write rate. |
 | `taskPanics` | Panics absorbed at the notification-task boundary since start, each one a lost notification. Reported here because the Prometheus recorder is off unless `ANTARES_TELEMETRY` is set. |
 | `temporalDrainErrors` | Post-response history writes that failed since start; the client's 2xx stands, the counter and a warning record the loss. |
-| `policy` | The policy engine this binary was started with (`ANTARES_POLICY`, `allow-all` unless a deployment registered another) and the deadline one decision gets (`ANTARES_POLICY_TIMEOUT_MS`). An engine that overruns it is a refusal, not a delay. |
+| `policy` | The policy engine this binary was started with (`ANTARES_POLICY`, `allow-all` unless a deployment registered another) and the deadline one decision gets (`ANTARES_POLICY_TIMEOUT_MS`). An engine that overruns it is a refusal, not a delay. In a `views` build, `documents` lists the engine's rule documents by tenant and revision, `loaded` or `refused` ([Policy rule documents](#policy-rule-documents)); `null` when the engine reads none. |
 | `surfaces` | The mounted admin surfaces by name, each with its prefix and route count. |
 | `limits` | The bounds wall: every `max*` cap in force and the `rejected*` counters of requests refused by it, plus the notification-pipeline ceilings (`changeQueue`, `deliveryWidth`, `deliveryWidthPerTenant`, `maxTrackedDestinations`). No request is rejected against those four — they are published because reaching one is what a dropped change or a stalled fan-out looks like from outside. |
 | `memory` | jemalloc live (`allocatedBytes`) and resident (`residentBytes`) bytes. |
@@ -226,7 +226,10 @@ the pod's view table before they answer; every other pod reloads within
 (`loaded` with its tenant, operation count and loader notes, or `invalid`
 with the reason) under `views`, and each surface that serves through views
 as `open` or `closed` under `surfaces`: no view loaded, every route of such
-a surface answers `404`.
+a surface answers `404`. `viewsRevision` is sixteen hex digits, a digest of
+the stored view documents the table was loaded from: every pod over one
+store reports the same value once it has reloaded, so two values mean two
+pods serving two predicates.
 
 ```json
 {
@@ -264,6 +267,63 @@ be served (nothing is stored), `413` over 64 KiB.
 ### DELETE /q/views/{id}
 
 `204`, or `404` when there is no such view.
+
+### POST /q/views/{id}/preview
+
+What a draft would serve, before it is stored (the Portal's view writer).
+The body is the candidate view document, checked as a PUT checks it; the
+request's query string is a Query Entities query (5.7.2), run in the
+draft's tenant through its narrowing with no caller subject, so a policy
+engine is asked as for an anonymous caller. `limit` is at most 100
+(default 20) and any `count` is replaced by `count=true`. The answer is
+`{"count": 2, "entities": [...]}`, the count of the whole narrowed set and
+one page. Nothing is stored and no table reloads. `400` with the loader's
+reason for a draft that cannot be served or a `limit` over 100, `413` over
+64 KiB; a refusal of the query itself (no `type`, `attrs`, `q` or `georel`,
+an unknown tenant, the engine's denial) comes back as the API gave it. No
+view root reaches this route: a view serves only the operations of the
+matrix.
+
+## Policy rule documents
+
+Only in a broker built with the `views` feature and started with a policy
+engine that reads rule documents (ADR-0020 amendment); with `allow-all`, or
+an engine that reads none, every route here answers `404`. A rule document
+belongs to one client tenant and is opaque to the broker: the engine owns
+its schema. The broker bounds it (64 KiB, 32 levels of nesting, 8192 JSON
+values), hands it to the engine, and stores it under the reserved tenant
+`antares-policy` with a revision it counts. The table reloads with the view
+table: the pod that took a write before it answers, every other pod within
+`ANTARES_VIEWS_RELOAD_MS`. A stored revision the engine refuses on reload
+(written by another version, or by hand) leaves the previous revision
+deciding. `/q/health` lists the documents under `policy.documents` by
+tenant and revision only; neither a document nor the engine's reason is
+logged.
+
+```json
+{"loaded": [{"tenant": "city", "revision": 3}], "refused": []}
+```
+
+### GET /q/policy
+
+The table, as `/q/health` lists it.
+
+### GET /q/policy/{tenant}
+
+`{"tenant": "city", "revision": 3, "document": {...}}`, or `404`; `400`
+for a name that is not a client tenant.
+
+### PUT /q/policy/{tenant}
+
+The body is the document. `201` created, `204` replaced; `400` for no JSON,
+`null`, a depth or value count over its bound, or the engine's reason for
+refusing it (nothing is stored, the previous revision keeps deciding);
+`413` over 64 KiB.
+
+### DELETE /q/policy/{tenant}
+
+`204`, and the engine drops the tenant's document; `404` when there is
+none.
 
 ## Schemas
 

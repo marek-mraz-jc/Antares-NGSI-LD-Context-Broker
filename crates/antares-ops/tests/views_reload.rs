@@ -136,3 +136,64 @@ async fn views_reload_without_restart() {
         "pod b closed on pod a's delete"
     );
 }
+
+/// `/q/health` `viewsRevision` of `app`.
+async fn revision(app: &Router) -> Value {
+    send(app, Method::GET, "/q/health", None)
+        .await
+        .1
+        .get("viewsRevision")
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Polls `app` until its revision is `want`, for at most two seconds.
+async fn until_revision(app: &Router, want: &Value) -> bool {
+    for _ in 0..100 {
+        if revision(app).await == *want {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// Threat V26: two pods over one store report one revision once both have
+/// reloaded, a write changes it on the writer at once and on the other pod
+/// after its reload, and a reload that finds nothing new keeps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_reports_the_view_table_revision() {
+    std::env::set_var(antares_ops::views::RELOAD_ENV, "100");
+    let a = TestBroker::new().await.expect("pod a");
+    let b = a.sibling().await.expect("pod b");
+    let (app_a, app_b) = (
+        a.serve(Probe).expect("mounts"),
+        b.serve(Probe).expect("mounts"),
+    );
+    let empty = revision(&app_a).await;
+    assert!(
+        empty.as_str().is_some_and(|r| r.len() == 16),
+        "sixteen hex digits: {empty}"
+    );
+    assert!(
+        until_revision(&app_b, &empty).await,
+        "one store, one revision"
+    );
+
+    let v = json!({
+        "id": "cars", "tenant": "city", "selector": ["Car"],
+        "rules": [{"types": ["Car"], "attributes": ["speed"]}],
+        "operations": ["retrieve_entity_types"]
+    });
+    let (s, _) = send(&app_a, Method::PUT, "/q/views/cars", Some(&v)).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let written = revision(&app_a).await;
+    assert_ne!(written, empty, "the writer reports its write at once");
+    assert!(
+        until_revision(&app_b, &written).await,
+        "pod b reports pod a's write after its reload"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(revision(&app_a).await, written, "an unchanged reload");
+    assert_eq!(revision(&app_b).await, written);
+}

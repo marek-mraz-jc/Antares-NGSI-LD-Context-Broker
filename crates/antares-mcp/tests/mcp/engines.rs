@@ -25,6 +25,14 @@ pub struct NoTypes;
 /// names nothing, passes and the call is refused at its gate.
 pub struct NoNamedTypes;
 
+/// Denies every Delete Entity (clause 5.6.6): the probe hides the tool.
+pub struct NoDeletes;
+
+/// Denies Delete Entity (clause 5.6.6) of `urn:ngsi-ld:Car:w1`, so the
+/// probe, which names no Entity, passes and the confirmed call is refused
+/// at its own gate.
+pub struct KeepW1;
+
 fn notify() -> NotifyDecision {
     NotifyDecision::Deliver
 }
@@ -68,6 +76,40 @@ impl PolicyEngine for NoNamedTypes {
             Decision::Allow
         } else {
             Decision::Deny("denied: speed<80 on secret".into())
+        };
+        Box::pin(std::future::ready(d))
+    }
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        notify()
+    }
+}
+
+impl PolicyEngine for KeepW1 {
+    fn name(&self) -> &'static str {
+        "keep-w1"
+    }
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        let d = if op.clause == "5.6.6" && op.ids.contains(&"urn:ngsi-ld:Car:w1") {
+            Decision::Deny("kept".into())
+        } else {
+            Decision::Allow
+        };
+        Box::pin(std::future::ready(d))
+    }
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        notify()
+    }
+}
+
+impl PolicyEngine for NoDeletes {
+    fn name(&self) -> &'static str {
+        "no-deletes"
+    }
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        let d = if op.clause == "5.6.6" {
+            Decision::Deny("no".into())
+        } else {
+            Decision::Allow
         };
         Box::pin(std::future::ready(d))
     }
