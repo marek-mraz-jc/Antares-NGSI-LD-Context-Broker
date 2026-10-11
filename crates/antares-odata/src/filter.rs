@@ -1567,6 +1567,23 @@ mod tests {
             ),
             Expr::Not(Box::new(cmp(m("speed"), CompareOp::Eq, m("speed")))),
             lit(Literal::Bool(true)),
+            // a Boolean expression as a value
+            cmp(
+                cmp(m("speed"), CompareOp::Gt, int(1)),
+                CompareOp::Eq,
+                lit(Literal::Bool(true)),
+            ),
+            cmp(
+                Expr::Any {
+                    collection: MemberPath {
+                        variable: None,
+                        path: vec!["tags".into()],
+                    },
+                    lambda: None,
+                },
+                CompareOp::Ne,
+                m("on"),
+            ),
             call_of(Method::MatchesPattern, vec![m("name"), s("^a+$")]),
             Expr::All {
                 collection: MemberPath {
@@ -1601,6 +1618,12 @@ mod tests {
                 "the evaluator takes {e:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_operand_of_another_type_is_bad_and_a_duration_is_later() {
+        let int = |n| lit(Literal::Int(n));
+        let s = |t: &str| lit(Literal::String(t.into()));
         // URL 5.1.1: an operand of a known type the operator does not take
         let bad = [
             cmp(
@@ -1649,6 +1672,28 @@ mod tests {
         for e in later {
             assert_eq!(q(&e), Err(Refused::Later), "{e:?}");
         }
+    }
+
+    #[test]
+    fn every_method_but_geo_intersects_is_a_function_of_the_residuals_table() {
+        for method in Method::all() {
+            match signature(method) {
+                None => assert_eq!(method, Method::GeoIntersects),
+                Some((func, params, _)) => {
+                    let (min, max) = method.arity();
+                    assert_eq!(func.arity(), (min, max), "{method:?}");
+                    assert!(params.len() <= max.max(1), "{method:?}");
+                }
+            }
+        }
+        assert_eq!(family("Edm.Int16"), "integer");
+        assert_eq!(family("Edm.Single"), "number");
+        assert_eq!(
+            takes_arg(STRING, "Edm.Duration"),
+            Ok(()),
+            "an unknown type is taken"
+        );
+        assert_eq!(literal_edm(&Literal::Null), None);
     }
 
     fn path(names: &[&str]) -> Expr {
