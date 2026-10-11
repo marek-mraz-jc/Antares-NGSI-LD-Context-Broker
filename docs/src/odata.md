@@ -218,9 +218,11 @@ the request's `$orderby` and then `id`, at most 10 000 per request: a page
 that runs out of budget is served short with its next link.
 `$count=true`, `/$count` and a `$orderby` on `createdAt` or `modifiedAt`
 read the whole answer, which is `400` `TooManyResults` when the broker
-counts more than 10 000 Entities. Such a read beside an `$expand` of
-entities, or with a navigation hop in the filter, is `501` until the scan
-can see a truncated join (T-3823).
+counts more than 10 000 Entities. Such a read may `$expand` entities and
+follow a navigation hop in the filter: the scan reads the broker's
+`NGSILD-Warning`, and a join walk any upstream page truncated at the
+lookup budget is the same `400` as a pushed read's (T-3823); a partial
+expansion is never served.
 
 The custom options `ngsild.q`, `ngsild.scopeQ`, `ngsild.georel`,
 `ngsild.geometry`, `ngsild.coordinates`, `ngsild.geoproperty`,
