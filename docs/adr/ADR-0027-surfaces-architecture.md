@@ -198,7 +198,7 @@ instance type):
 | LinkML document | ≤ 5 ms p99 for a 100-class schema, cached per view revision | computed once per view revision |
 | WebSocket notification | delivery latency p99 ≤ 1.10× HTTP sink p99 to a local receiver (T-3626); ≤ 32 KiB resident per idle connection plus its queue | no socket opened per notification; one queue hop per connection |
 | internal CSR forward | p99 ≤ 0.5× the HTTP forward to the same broker | no socket, no TLS, no second JSON parse of the request line |
-| binary size | `full` release binary ≤ vanilla + 7 MiB (T-3744); each feature alone ≤ vanilla + 2 MiB, except `mcp` ≤ vanilla + 4.5 MiB (T-3662) and `odata` ≤ vanilla + 3.5 MiB (T-3705) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
+| binary size | `full` release binary ≤ vanilla + 7 MiB (T-3744); each feature alone ≤ vanilla + 2 MiB, except `mcp` ≤ vanilla + 4.5 MiB (T-3662), `odata` ≤ vanilla + 3.5 MiB (T-3705) and `ogc` ≤ vanilla + 2.5 MiB (T-3745) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
 | vanilla | unchanged within the noise band of T-3467 | GOAL point 1 |
 
 A benchmark per row: criterion benches in each surface crate for the
@@ -255,6 +255,22 @@ Options: raise the `odata` budget (chosen), drop `float_roundtrip` (an
 `Edm.Double` no longer round-trips, ADR-0024 broken), measure each
 feature over the feature it implies (changes the rule for every feature),
 size-optimise the OData crates (saves part of 0.6 MiB, still over 2 MiB).
+
+The `ogc` budget, measured 2026-10-11 by `dev/preflight` on the T-3745
+branch (stacked on T-3759), same build: vanilla 31 086 672 bytes;
+`views` 32 391 184 (+1.24 MiB); `ogc` 33 568 368 (+2.37 MiB). `ogc`
+implies `views`, so its own share is 1.13 MiB, inside the per-feature
+2 MiB. Part 3 (T-3745) brings the CQL2 text and JSON parser
+(`ogc-cql2`) and the residual evaluator (`antares-residual`, shared
+with `odata` in `full`) into the `ogc` build.
+
+Decided (worker-6, owner may override): `ogc` ≤ vanilla + 2.5 MiB,
+because its own share over `views` meets the 2 MiB rule and the rest
+is `views` plus the residual that OGC Part 3 needs for what `q` cannot
+say. Options: raise the `ogc` budget (chosen), push only what `q`
+says and answer 501 for the rest (drops most CQL2 conformance classes),
+measure each feature over the feature it implies (changes the rule for
+every feature).
 
 The `full` budget, measured 2026-10-11 in the `binary-size` job of `fast`
 (stripped thin-LTO release binary, x86_64): on dev 7b22710 (run

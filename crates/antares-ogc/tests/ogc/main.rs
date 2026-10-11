@@ -6,6 +6,7 @@ mod collections;
 mod common;
 mod core;
 mod crs;
+mod filter;
 mod geojson;
 mod items;
 mod oas30;

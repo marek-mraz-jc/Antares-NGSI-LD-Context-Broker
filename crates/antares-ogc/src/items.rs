@@ -3,6 +3,7 @@
 //! the query parameters, the Query Entities requests they become, and the Features of the
 //! answers.
 
+use crate::filter::Lowered;
 use crate::model::{Collection, Time};
 use crate::Problem;
 use antares_ops::residual::{self, Expr, Lit, Path, Spatial};
@@ -36,6 +37,8 @@ pub(crate) struct Params {
     /// The NGSI-LD options beside the standard's own (ADR-0028 rule 6), by name without the
     /// prefix, values verbatim.
     pub ngsild: Vec<(&'static str, String)>,
+    /// `filter` and the queryables named as parameters (F1, F2), names checked.
+    pub filter: Option<ogc_cql2::Expr>,
 }
 
 /// The `ngsild.` options a collection's `items` declares (ADR-0028 rule 6): each narrows.
@@ -149,6 +152,7 @@ pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Param
         ..Params::default()
     };
     let mut seen: Vec<&str> = Vec::new();
+    let mut raw = crate::filter::Raw::default();
     for (name, value) in pairs {
         if seen.contains(&name.as_str()) {
             return Err(bad("a query parameter is repeated"));
@@ -173,12 +177,22 @@ pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Param
             "sortby" => p.sortby = sortby(c, value).ok_or_else(|| bad("sortby names properties of the collection's sortables, each [+|-]name"))?,
             "properties" => p.properties = Some(properties(c, value).ok_or_else(|| bad("properties names properties of the collection's schema"))?),
             "profile" => p.profile = profile(value).ok_or_else(|| bad("profile is one of rel-as-key, rel-as-uri and rel-as-link"))?,
+            "filter" => raw.filter = Some(value.clone()),
+            "filter-lang" => raw.lang = Some(value.clone()),
+            "filter-crs" => raw.crs = Some(value.clone()),
             other => match other.strip_prefix("ngsild.").and_then(|o| NGSILD.iter().find(|n| **n == o)) {
                 Some(option) => p.ngsild.push((option, value.clone())),
+                None if crate::filter::is_parameter(c, other) => raw.equals.push((other.to_owned(), value.clone())),
                 None => return Err(bad("the request names a query parameter this resource does not define")),
             },
         }
     }
+    if p.option("pick").is_some() && p.option("omit").is_some() {
+        return Err(bad(
+            "ngsild.pick and ngsild.omit both select the properties; name one",
+        ));
+    }
+    p.filter = crate::filter::read(c, &raw)?;
     if p.properties.is_some() && p.option("pick").is_some() {
         return Err(bad(
             "properties and ngsild.pick both select the properties; name one",
@@ -210,7 +224,13 @@ fn bbox(text: &str) -> Option<[f64; 4]> {
         .split(',')
         .map(|v| v.trim().parse().ok().filter(|v: &f64| v.is_finite()))
         .collect::<Option<_>>()?;
-    let [west, south, east, north] = match numbers.as_slice() {
+    corners(&numbers)
+}
+
+/// The corners of a CRS84 box of 4 or 6 numbers (a CQL2 `BBOX` too); heights are dropped, and a
+/// number that is not finite is out of range.
+pub(crate) fn corners(numbers: &[f64]) -> Option<[f64; 4]> {
+    let [west, south, east, north] = match numbers {
         [west, south, east, north] => [*west, *south, *east, *north],
         [west, south, low, east, north, high] if low <= high => [*west, *south, *east, *north],
         _ => return None,
@@ -444,7 +464,7 @@ fn shape(c: &Collection, terms: &Terms, p: &Params) -> String {
 
 /// The polygon(s) of a CRS84 box; one that crosses the antimeridian (its west edge east of
 /// its east edge) is two.
-fn bbox_geometry([west, south, east, north]: [f64; 4]) -> (&'static str, Value) {
+pub(crate) fn bbox_geometry([west, south, east, north]: [f64; 4]) -> (&'static str, Value) {
     let ring = |from: f64, to: f64| {
         json!([[
             [from, south],
@@ -464,25 +484,63 @@ fn bbox_geometry([west, south, east, north]: [f64; 4]) -> (&'static str, Value) 
     }
 }
 
-/// One Query Entities an `items` request reads: the store's pushdown and, when an
-/// `ngsild.geo*` option holds the request's one geo query, the `bbox` it then evaluates as a
-/// residual (ADR-0028 rule 6).
+/// One Query Entities an `items` request reads: the store's pushdown and the residual the
+/// scan evaluates over its answer (ADR-0028): the filter's conjuncts NGSI-LD cannot say, and
+/// the `bbox` when an `ngsild.geo*` option or the filter holds the request's one geo query.
 pub(crate) struct Part {
     pub query: String,
     pub residual: Option<Expr>,
 }
 
+/// The conjunction of residual conjuncts, none when there are none.
+fn conjunction(mut all: Vec<Expr>) -> Option<Expr> {
+    match all.len() {
+        0 => None,
+        1 => all.pop(),
+        _ => Some(Expr::And(all)),
+    }
+}
+
 /// The Query Entities of one `items` request: one, or two when `bbox` must also keep the
-/// Features without a geometry (C12). Disjoint, served in this order. `ngsild.q` joins the
-/// request's own `q` with `;`, the other `ngsild.` options are pushed as they are.
-pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params) -> Vec<Part> {
-    let mut base = format!("type={}{}", encode(&c.type_iri), shape(c, terms, p));
+/// Features without a geometry (C12). Disjoint, served in this order. `ngsild.q` and the
+/// filter's `q` join the request's own `q` with `;`, the other `ngsild.` options are pushed as
+/// they are. A part with a residual selects by [`attrs`], not by `pick`/`omit`, so the scan reads
+/// what the residual needs and drops it again.
+pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params, f: &Lowered) -> Vec<Part> {
+    let bbox = p.bbox.zip(c.geometry.as_deref());
+    let residual = !f.residual.is_empty() || (bbox.is_some() && p.ngsild_geo());
+    let projection = if residual {
+        p.option("scopeQ")
+            .map(|v| format!("&scopeQ={}", encode(v)))
+            .unwrap_or_default()
+    } else {
+        shape(c, terms, p)
+    };
+    let mut base = format!("type={}{projection}", encode(&c.type_iri));
     if p.ngsild_geo() {
         for name in ["georel", "geometry", "coordinates", "geoproperty"] {
             if let Some(value) = p.option(name) {
                 let _ = write!(base, "&{name}={}", encode(value));
             }
         }
+    }
+    if let (Some(geo), Some(geometry)) = (&f.geo, c.geometry.as_deref()) {
+        let _ = write!(
+            base,
+            "&georel={}&geometry={}&coordinates={}&geoproperty={}",
+            geo.rel,
+            geo.geometry
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            encode(
+                &geo.geometry
+                    .get("coordinates")
+                    .map(Value::to_string)
+                    .unwrap_or_default()
+            ),
+            encode(geometry)
+        );
     }
     let time = p
         .datetime
@@ -495,6 +553,7 @@ pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params) -> Vec<Part> {
             .cloned()
             .chain(extra)
             .chain(theirs.clone())
+            .chain(f.q.iter().map(|q| format!("({q})")))
             .collect();
         if q.is_empty() {
             base.clone()
@@ -502,23 +561,31 @@ pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params) -> Vec<Part> {
             format!("{base}&q={}", encode(&q.join(";")))
         }
     };
-    let Some((bbox, geometry)) = p.bbox.zip(c.geometry.as_deref()) else {
+    let filtered = |extra: Option<Expr>| {
+        conjunction(
+            extra
+                .into_iter()
+                .chain(f.residual.iter().cloned())
+                .collect(),
+        )
+    };
+    let Some((bbox, geometry)) = bbox else {
         return vec![Part {
             query: with_q(None),
-            residual: None,
+            residual: filtered(None),
         }];
     };
     let (kind, coordinates) = bbox_geometry(bbox);
     let located = if p.ngsild_geo() {
         Part {
             query: with_q(None),
-            residual: Some(Expr::Spatial(
+            residual: filtered(Some(Expr::Spatial(
                 Spatial::Intersects,
                 Box::new(Expr::Path(Path::value(terms.term(geometry)))),
                 Box::new(Expr::Lit(Lit::Geometry(
                     json!({ "type": kind, "coordinates": coordinates }),
                 ))),
-            )),
+            ))),
         }
     } else {
         Part {
@@ -528,16 +595,50 @@ pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params) -> Vec<Part> {
                 encode(&coordinates.to_string()),
                 encode(geometry)
             ),
-            residual: None,
+            residual: filtered(None),
         }
     };
     vec![
         located,
         Part {
             query: with_q(Some(format!("!{}", terms.term(geometry)))),
-            residual: None,
+            residual: filtered(None),
         },
     ]
+}
+
+/// The Attributes a part with a residual selects: `properties` (with the geometry), else
+/// `ngsild.pick`, else every Attribute of the collection but `ngsild.omit`; all when none.
+fn attrs(c: &Collection, terms: &Terms, p: &Params) -> Option<Vec<String>> {
+    let omitted: Vec<&str> = p
+        .option("omit")
+        .map_or_else(Vec::new, |o| o.split(',').collect());
+    let names: Vec<String> = if let Some(keep) = &p.properties {
+        c.geometry
+            .iter()
+            .chain(keep)
+            .map(|iri| terms.term(iri).to_owned())
+            .collect()
+    } else if let Some(pick) = p.option("pick") {
+        pick.split(',')
+            .filter(|n| !matches!(*n, "id" | "type"))
+            .map(str::to_owned)
+            .collect()
+    } else if omitted.is_empty() {
+        return None;
+    } else {
+        c.geometry
+            .iter()
+            .chain(c.properties.iter().map(|prop| &prop.iri))
+            .map(|iri| terms.term(iri).to_owned())
+            .collect()
+    };
+    Some(
+        names
+            .into_iter()
+            .filter(|n| !omitted.contains(&n.as_str()))
+            .collect(),
+    )
 }
 
 /// The token of the next page: the part and the offset in it, and a digest of the request
@@ -594,7 +695,14 @@ pub(crate) async fn page(
         base,
     };
     let terms = Terms::of(c);
-    let parts = targets(c, &terms, p);
+    // One geoQ per request (4.10): the filter's spatial conjunct is pushed only when neither
+    // `bbox` nor an `ngsild.geo*` option holds it.
+    let geo_free = !p.ngsild_geo() && (p.bbox.is_none() || c.geometry.is_none());
+    let lowered = match &p.filter {
+        Some(f) => crate::filter::lower(c, &terms, f, geo_free)?,
+        None => Lowered::default(),
+    };
+    let parts = targets(c, &terms, p, &lowered);
     let (start, offset) = match &p.next {
         None => (0, 0),
         Some(t) => read_token(t, digest, parts.len())
@@ -614,7 +722,7 @@ pub(crate) async fn page(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "the clock reads no time",
                 ))?;
-                Some(residual::compile(expr, now).map_err(|_| bad(antares_ops::TOO_COMPLEX))?)
+                Some(residual::compile(expr, now).map_err(|e| refused(&e))?)
             }
         };
         let pushdown = Pushdown {
@@ -624,7 +732,7 @@ pub(crate) async fn page(
                 format!("{}&format=simplified", part.query)
             },
             order: order(&terms, p),
-            attrs: None,
+            attrs: residual.as_ref().and_then(|_| attrs(c, &terms, p)),
             sys_attrs: false,
             context: terms.context(),
         };
@@ -681,6 +789,19 @@ pub(crate) async fn page(
         out.next = next.map(|next| token(i, next, digest));
     }
     Ok(out)
+}
+
+/// Why the residual refused the filter: too large (400), a construct it does not read with the
+/// standard's meaning (501), or one no filter of this collection can be (400).
+fn refused(e: &residual::Error) -> Problem {
+    match e {
+        residual::Error::TooComplex => bad(antares_ops::TOO_COMPLEX),
+        residual::Error::Unsupported(_) => Problem(
+            StatusCode::NOT_IMPLEMENTED,
+            "the filter uses a construct this endpoint does not evaluate (a LIKE pattern that is no literal, or a pattern construct)",
+        ),
+        residual::Error::Invalid(_) => bad("the filter is not valid: a LIKE pattern ending in its escape, or a geometry that is no GeoJSON geometry in CRS84"),
+    }
 }
 
 /// The time a residual's `now()` reads.
@@ -1165,6 +1286,20 @@ mod tests {
                 "odd": {"type": "Property"},
                 "seen": {"dataset": {"@none": "now", "urn:ngsi-ld:Dataset:old": "then"}}
             })
+        );
+    }
+
+    #[test]
+    fn a_refused_residual_names_its_status() {
+        let status = |e| refused(&e).0;
+        assert_eq!(status(residual::Error::TooComplex), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status(residual::Error::Unsupported("x".into())),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            status(residual::Error::Invalid("x".into())),
+            StatusCode::BAD_REQUEST
         );
     }
 }

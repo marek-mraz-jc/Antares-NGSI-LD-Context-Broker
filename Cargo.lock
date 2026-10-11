@@ -264,6 +264,7 @@ dependencies = [
  "axum",
  "http-body-util",
  "linkml-model",
+ "ogc-cql2",
  "serde_json",
  "tokio",
  "tower",

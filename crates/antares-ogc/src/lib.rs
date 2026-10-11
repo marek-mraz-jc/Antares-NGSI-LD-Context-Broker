@@ -22,6 +22,7 @@
 
 mod api;
 mod crs;
+mod filter;
 mod items;
 mod model;
 mod schema;
@@ -51,9 +52,10 @@ pub const SCHEMA_LIMITS: linkml_model::Limits = linkml_model::Limits {
 };
 
 /// The conformance classes `/conformance` declares (mapping rows C3, R1 to R5, W1 to W5, S1 to
-/// S3, S5, S7; Parts 4 and 5 are the drafts OGC 20-002r1 and 23-058r1). A view that offers no
-/// write answers each write 405 with the methods it offers (W4).
-pub const CONFORMANCE: [&str; 14] = [
+/// S3, S5, S7, F1 to F16; Parts 4 and 5 are the drafts OGC 20-002r1 and 23-058r1, Part 3 is
+/// OGC 19-079r2 with CQL2 21-065r2). A view that offers no write answers each write 405 with the
+/// methods it offers (W4).
+pub const CONFORMANCE: [&str; 32] = [
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
@@ -68,6 +70,24 @@ pub const CONFORMANCE: [&str; 14] = [
     "http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/create-replace-delete",
     "http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/update",
     "http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/features",
+    "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/queryables",
+    "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/queryables-query-parameters",
+    "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/filter",
+    "http://www.opengis.net/spec/ogcapi-features-3/1.0/conf/features-filter",
+    "http://www.opengis.net/spec/cql2/1.0/conf/cql2-text",
+    "http://www.opengis.net/spec/cql2/1.0/conf/cql2-json",
+    "http://www.opengis.net/spec/cql2/1.0/conf/basic-cql2",
+    "http://www.opengis.net/spec/cql2/1.0/conf/advanced-comparison-operators",
+    "http://www.opengis.net/spec/cql2/1.0/conf/case-insensitive-comparison",
+    "http://www.opengis.net/spec/cql2/1.0/conf/accent-insensitive-comparison",
+    "http://www.opengis.net/spec/cql2/1.0/conf/basic-spatial-functions",
+    "http://www.opengis.net/spec/cql2/1.0/conf/basic-spatial-functions-plus",
+    "http://www.opengis.net/spec/cql2/1.0/conf/spatial-functions",
+    "http://www.opengis.net/spec/cql2/1.0/conf/temporal-functions",
+    "http://www.opengis.net/spec/cql2/1.0/conf/array-functions",
+    "http://www.opengis.net/spec/cql2/1.0/conf/property-property",
+    "http://www.opengis.net/spec/cql2/1.0/conf/functions",
+    "http://www.opengis.net/spec/cql2/1.0/conf/arithmetic",
 ];
 
 const JSON: &str = "application/json";
@@ -217,13 +237,21 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
             Some(c) => document(JSON, &at.collection(c)),
             None => not_found(),
         },
-        (["collections", c, which @ ("schema" | "sortables")], true) => match collections.get(*c) {
-            Some(c) => {
-                let id = format!("{base}/collections/{}/{which}", c.id);
-                document(SCHEMA, &schema::document(c, &id, *which == "sortables"))
+        (["functions"], true) => document(JSON, &json!({"functions": []})),
+        (["collections", c, which @ ("schema" | "sortables" | "queryables")], true) => {
+            match collections.get(*c) {
+                Some(c) => {
+                    let id = format!("{base}/collections/{}/{which}", c.id);
+                    let doc = if *which == "queryables" {
+                        schema::queryables(c, &id)
+                    } else {
+                        schema::document(c, &id, *which == "sortables")
+                    };
+                    document(SCHEMA, &doc)
+                }
+                None => not_found(),
             }
-            None => not_found(),
-        },
+        }
         (["collections", c, "items"], _) => match collections.get(*c) {
             Some(c) => at.items(c, &pairs, uri.query()).await,
             None => not_found(),
@@ -234,9 +262,9 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
         },
         (
             []
-            | ["" | "conformance" | "api" | "collections"]
+            | ["" | "conformance" | "api" | "collections" | "functions"]
             | ["collections", _]
-            | ["collections", _, "schema" | "sortables"],
+            | ["collections", _, "schema" | "sortables" | "queryables"],
             false,
         ) => problem(
             StatusCode::BAD_REQUEST,
@@ -355,6 +383,10 @@ fn link(rel: &str, media: &str, href: &str) -> Value {
 const SCHEMA_REL: &str = "http://www.opengis.net/def/rel/ogc/1.0/schema";
 /// The link relation of a collection's sortables (Part 5 `/req/sortables`).
 const SORTABLES_REL: &str = "http://www.opengis.net/def/rel/ogc/1.0/sortables";
+/// The link relation of a collection's queryables (Part 3 `/req/queryables/get-queryables-uri`).
+const QUERYABLES_REL: &str = "http://www.opengis.net/def/rel/ogc/1.0/queryables";
+/// The link relation of the functions a filter may call (CQL2 `functions`; Part 3 F14).
+const FUNCTIONS_REL: &str = "http://www.opengis.net/def/rel/ogc/1.0/functions";
 
 /// The `profile` link of a response whose collection holds references (Part 5
 /// `/req/profile-references`): the profile its references are written in.
@@ -393,6 +425,7 @@ impl Here<'_> {
                 link("service-desc", OPENAPI, &format!("{b}/api")),
                 link("conformance", JSON, &format!("{b}/conformance")),
                 link("data", JSON, &format!("{b}/collections")),
+                link(FUNCTIONS_REL, JSON, &format!("{b}/functions")),
             ],
         })
     }
@@ -419,6 +452,7 @@ impl Here<'_> {
             link("items", GEOJSON, &format!("{at}/items")),
             link(SCHEMA_REL, SCHEMA, &format!("{at}/schema")),
             link(SORTABLES_REL, SCHEMA, &format!("{at}/sortables")),
+            link(QUERYABLES_REL, SCHEMA, &format!("{at}/queryables")),
         ]);
         let fields = [
             ("id", Some(Value::from(c.id.as_str()))),

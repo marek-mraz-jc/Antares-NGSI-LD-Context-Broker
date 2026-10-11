@@ -19,6 +19,10 @@ fn refusals() -> Map<String, Value> {
             ("404", "no such resource in this view"),
             ("406", "the client accepts no JSON"),
             (
+                "501",
+                "a construct this endpoint does not serve (a LIKE pattern that is no literal, a conditional write)",
+            ),
+            (
                 "500",
                 "the broker failed; the detail is logged under a request id",
             ),
@@ -81,6 +85,9 @@ fn components() -> Value {
         "properties": {"name": "properties", "in": "query", "required": false, "style": "form", "explode": false, "description": "the properties of the collection's schema to return", "schema": {"type": "array", "items": {"type": "string"}}},
         "crs": {"name": "crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
         "bbox-crs": {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
+        "filter": {"name": "filter", "in": "query", "required": false, "description": "a CQL2 filter over the collection's queryables", "schema": {"type": "string"}},
+        "filter-lang": {"name": "filter-lang", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cql2-text", "cql2-json"], "default": "cql2-text"}},
+        "filter-crs": {"name": "filter-crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
         "profile": {"name": "profile", "in": "query", "required": false, "style": "form", "explode": false, "description": "how references are written", "schema": {"type": "string", "enum": ["rel-as-key", "rel-as-uri", "rel-as-link"]}},
     })
     .as_object()
@@ -119,6 +126,7 @@ fn collection_paths(
     for (which, summary) in [
         ("schema", "the schema of its Features"),
         ("sortables", "the properties sortby may name"),
+        ("queryables", "the properties a filter may name"),
     ] {
         paths.insert(
             format!("{at}/{which}"),
@@ -130,11 +138,22 @@ fn collection_paths(
             ),
         );
     }
+    // `queryables-query-parameters`: each scalar queryable as an equality.
+    let own: Vec<Value> = items_params
+        .iter()
+        .cloned()
+        .chain(
+            ["id"]
+                .into_iter()
+                .chain(c.properties.iter().filter(|p| p.sortable).map(|p| p.name.as_str()))
+                .map(|name| json!({"name": name, "in": "query", "required": false, "description": "the Features whose property equals the value", "schema": {"type": "string"}})),
+        )
+        .collect();
     let mut items = read(
         &format!("items-{}", c.id),
         "a page of Features",
         "application/geo+json",
-        items_params,
+        &own,
     );
     let mut item = read(
         &format!("item-{}", c.id),
@@ -218,6 +237,15 @@ pub(crate) fn document(
         "/collections".into(),
         get("collections", "the collections", "application/json", &[]),
     );
+    paths.insert(
+        "/functions".into(),
+        get(
+            "functions",
+            "the functions a filter may call: none",
+            "application/json",
+            &[],
+        ),
+    );
     let items_params = [
         json!({"$ref": "#/components/parameters/limit"}),
         json!({"$ref": "#/components/parameters/bbox"}),
@@ -228,6 +256,9 @@ pub(crate) fn document(
         json!({"$ref": "#/components/parameters/profile"}),
         json!({"$ref": "#/components/parameters/crs"}),
         json!({"$ref": "#/components/parameters/bbox-crs"}),
+        json!({"$ref": "#/components/parameters/filter"}),
+        json!({"$ref": "#/components/parameters/filter-lang"}),
+        json!({"$ref": "#/components/parameters/filter-crs"}),
     ]
     .into_iter()
     .chain(
@@ -297,9 +328,11 @@ mod tests {
                 "/collections/Car",
                 "/collections/Car/items",
                 "/collections/Car/items/{featureId}",
+                "/collections/Car/queryables",
                 "/collections/Car/schema",
                 "/collections/Car/sortables",
-                "/conformance"
+                "/conformance",
+                "/functions"
             ]
         );
         for (_, op) in doc
