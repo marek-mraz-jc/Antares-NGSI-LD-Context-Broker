@@ -104,6 +104,9 @@ ruleset protect-main refs/heads/main '[]' "[ $hard,
   $(pull_request '["merge"]'),
   $(checks "Source of the change" \
            "Workspace tests / Workspace tests" \
+           "Workspace tests / Workspace tests (no-default-features)" \
+           "Workspace tests / Workspace tests (all-features)" \
+           "Workspace tests / Workspace tests (file-store)" \
            "Workspace tests / Each feature alone (workspace)" \
            "Workspace tests / Each feature alone (antares-api)" \
            "Workspace tests / Each feature alone (antares-broker)" \
@@ -117,6 +120,9 @@ ruleset protect-main refs/heads/main '[]' "[ $hard,
 ruleset dev-pull-requests refs/heads/dev "$admins" "[
   $(pull_request '["rebase", "squash"]'),
   $(checks "Workspace tests / Workspace tests" \
+           "Workspace tests / Workspace tests (no-default-features)" \
+           "Workspace tests / Workspace tests (all-features)" \
+           "Workspace tests / Workspace tests (file-store)" \
            "Workspace tests / Each feature alone (workspace)" \
            "Workspace tests / Each feature alone (antares-api)" \
            "Workspace tests / Each feature alone (antares-broker)" \

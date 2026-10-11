@@ -13,7 +13,7 @@ surface joins by being declared, without a YAML edit.
   dev/surface-features.py --self-test  the gate is red on a synthetic overrun
 
 Budget: the "binary size" row of ADR-0027 section 6, read from the ADR so
-the gate cannot drift from it (`full` <= vanilla + 6 MiB, each feature alone
+the gate cannot drift from it (`full` <= vanilla + 7 MiB since T-3744, each feature alone
 <= vanilla + 2 MiB, `mcp` <= vanilla + 4.5 MiB since T-3662), measured as
 the size of the stripped release binary (the release profile strips
 symbols). The report is a Markdown table on stdout and, in GitHub Actions,
@@ -126,11 +126,11 @@ def sizes():
 def self_test():
     vanilla = 30 * MIB
     budget = budgets(ADR.read_text())
-    if budget != ({"full": 6 * MIB, "mcp": 4.5 * MIB, "odata": 3.5 * MIB}, 2 * MIB):
+    if budget != ({"full": 7 * MIB, "mcp": 4.5 * MIB, "odata": 3.5 * MIB}, 2 * MIB):
         sys.exit(f"self-test: the ADR's budget reads as {budget}")
     rows = verdicts(vanilla, {"views": vanilla + 2 * MIB, "ws": vanilla + 2 * MIB + 1,
                               "odata": vanilla + 3.5 * MIB + 1,
-                              "mcp": vanilla + 4.5 * MIB, "full": vanilla + 6 * MIB + 1}, budget)
+                              "mcp": vanilla + 4.5 * MIB, "full": vanilla + 7 * MIB + 1}, budget)
     got = {r[0]: r[4] for r in rows}
     if got != {"views": True, "ws": False, "odata": False, "mcp": True, "full": False}:
         sys.exit(f"self-test: verdicts {got}")

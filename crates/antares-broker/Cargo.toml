@@ -52,7 +52,9 @@ joinedcontext-policy = { workspace = true, optional = true }
 antares-ops = { workspace = true, optional = true }
 antares-views = { workspace = true, optional = true }
 antares-mcp = { workspace = true, optional = true }
+antares-linkml = { workspace = true, optional = true }
 antares-odata = { workspace = true, optional = true }
+antares-ogc = { workspace = true, optional = true }
 antares-ws = { workspace = true, optional = true }
 
 [features]
@@ -88,10 +90,19 @@ views = ["dep:antares-ops", "dep:antares-views"]
 # view's read operations as tools and resources
 # (`ANTARES_API_SURFACES=admin,views,mcp`).
 mcp = ["views", "dep:antares-mcp"]
+# The LinkML surface of a view (ADR-0027, T-3511): `/x/views/{view}/linkml`,
+# the view's schema narrowed to what the caller may see
+# (`ANTARES_API_SURFACES=admin,views,linkml`).
+linkml = ["views", "dep:antares-linkml"]
+
 # The OData surface of a view (ADR-0024, T-3508): `/x/views/{view}/odata/v4`,
 # its $metadata from the Tenant's LinkML schema (`/q/schemas/{tenant}`)
 # intersected with the view (`ANTARES_API_SURFACES=admin,views,odata`).
 odata = ["views", "dep:antares-odata"]
+# The OGC API - Features surface of a view (ADR-0029, T-3744):
+# `/x/views/{view}/ogc/features`, collections from the Tenant's LinkML schema
+# intersected with the view (`ANTARES_API_SURFACES=admin,views,ogc`).
+ogc = ["views", "dep:antares-ogc"]
 
 # The WebSocket notification channel (ADR-0026, T-3517): `/x/ws/ngsi-ld/v1`
 # (`ANTARES_API_SURFACES=...,ws`), and with `views` also
@@ -101,7 +112,7 @@ ws = ["dep:antares-ops", "dep:antares-ws"]
 # Every surface the broker serves (ADR-0027 Consequences, T-3636): what
 # `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
 # sets it; the platform image builds `full,jc-policy` (image-jc.yml).
-full = ["views", "mcp", "odata", "ws"]
+full = ["views", "mcp", "odata", "ogc", "ws"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
 # Unix-only: the wasm target keeps the default allocator.
