@@ -360,6 +360,42 @@ over that set, so paging and projection pushdown are forfeited
 (`ponytail:` a scan; compile the rules' OR to SQL when it shows up);
 options: scan, SQL compilation of per-Entity visibility now.
 
+### 12. A view that narrows nothing: `*`
+
+Added 2026-10-11 (T-3666). The confirmation below runs the ETSI suite
+through a view "that selects every type and hides nothing", and
+`surfaces-conformance.md` section 1 names it `all`. Rules 10 and 11 cannot
+say it: a selector names its types and a rule its Attributes, at most 256
+names a list and 64 rules, while the suite makes up types and Attributes
+as it goes. So a view may write one wildcard form, and only that one:
+
+```
+"selector": ["*"],
+"rules": [{"types": ["*"], "attributes": ["*"]}]
+```
+
+It selects every Entity type and shows every Attribute; the view's own
+`q`, `scopeQ` and `geoQ` still narrow, its `operations` still decide
+what it serves, and its Tenant stays pinned (rule 10). It compiles to a
+narrowing with no rules, which is what an engine's `Filter` without rules
+already means, so every rule above reads it unchanged: `view ∧ engine` is
+the engine's answer under the view's conditions.
+
+`*` is never a name: it is not expanded through the view's `@context`, so
+a vocabulary that defines a term `*` cannot widen a view. Any other use
+of `*` is a load error: beside a name in the same list, in a rule beside
+other rules, in a rule with a condition, as a rule's types with named
+Attributes or the other way round. Each of those would need an
+"every Attribute" rule in the policy seam, which none of the platform's
+grants asks for.
+
+Decided (worker-2, owner may override): the whole-view wildcard alone,
+because it is what the confirmation and the conformance jobs need and it
+adds no member to `policy::Rule`; options: the whole-view wildcard
+(chosen), `*` per list (a rule over every type with named Attributes,
+named types with every Attribute), a boolean member `narrowsNothing`
+(a second way to say what `rules` already says).
+
 ## Threats and the rule that answers each
 
 | threat | example | rule |

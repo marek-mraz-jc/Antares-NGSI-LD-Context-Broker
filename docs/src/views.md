@@ -34,6 +34,11 @@ A view serves an operation only when its `operations` list names it.
 Batch Upsert, Purge and the temporal writes are not served through a
 view.
 
+A view may select every type and show every Attribute with one form:
+`"selector": ["*"]` and the single rule `{"types": ["*"], "attributes":
+["*"]}` (ADR-0023 rule 12). Its `q`, `scopeQ`, `geoQ`, `operations` and
+Tenant still apply. `*` anywhere else is refused when the view loads.
+
 ## 2. What a client sees
 
 - An Entity is in the view when a rule names its type and the view's `q`,
