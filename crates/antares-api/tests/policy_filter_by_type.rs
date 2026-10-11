@@ -1108,3 +1108,50 @@ async fn temporal_speed_history_only_while_in_zone_a() {
     .await;
     assert_eq!(list, json!([]), "a hidden instance matched: {list}");
 }
+
+/// A rule with `every_attribute` shows the whole Entity, live and in
+/// history, and a sibling rule's list never narrows it; a rule with an
+/// empty list and no flag still shows only `id` and `type` (ADR-0023
+/// rule 11 amendment, T-3637).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rule_over_every_attribute_shows_the_whole_entity() {
+    let whole = Rule {
+        every_attribute: true,
+        ..rule("Car", &[])
+    };
+    let st = state(Filter {
+        rules: vec![whole, rule("Car", &["speed"]), rule("User", &[])],
+        ..Filter::default()
+    })
+    .await;
+    seed(&st).await;
+    let (code, list) = send(&st, "GET", "/ngsi-ld/v1/entities?type=Car,User", None).await;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    let got = members(&list);
+    assert_eq!(
+        got["urn:ngsi-ld:Car:1"],
+        keys(&["id", "type", "speed", "colour", "ownedBy"]),
+        "{list}"
+    );
+    assert_eq!(got["urn:ngsi-ld:User:1"], keys(&["id", "type"]), "{list}");
+
+    let mut doc = json!({"id": "urn:ngsi-ld:Car:t", "type": "Car"});
+    for a in ["speed", "colour"] {
+        doc[a] = json!([{"type": "Property", "value": 1,
+                         "observedAt": "2026-01-01T00:00:00Z"}]);
+    }
+    let (code, body) = send(&st, "POST", "/ngsi-ld/v1/temporal/entities", Some(doc)).await;
+    assert!(code.is_success(), "{body}");
+    let (code, car) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Car:t",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{car}");
+    assert_eq!(
+        members(&json!([car]))["urn:ngsi-ld:Car:t"],
+        keys(&["id", "type", "speed", "colour"])
+    );
+}
