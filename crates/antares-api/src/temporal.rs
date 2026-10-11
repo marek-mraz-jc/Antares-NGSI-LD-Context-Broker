@@ -1858,6 +1858,8 @@ pub(crate) fn rules_per_instance(doc: &Value, rules: &crate::policy::Filter) -> 
         .filter(|r| per_instance(r) && r.scope_q.is_none())
         .map(|r| (*r, r.reads(ctx)))
         .collect();
+    // an unconditioned rule over every Attribute keeps every instance
+    let every = typed.iter().any(|r| !per_instance(r) && r.every_attribute);
     let now = chrono::Utc::now();
     let Some(obj) = doc.as_object() else {
         return Some(doc.clone());
@@ -1871,13 +1873,13 @@ pub(crate) fn rules_per_instance(doc: &Value, rules: &crate::policy::Filter) -> 
         if omitted.contains(k.as_str()) {
             continue;
         }
-        if rules.rules.is_empty() || always.contains(k.as_str()) {
+        if rules.rules.is_empty() || every || always.contains(k.as_str()) {
             out.insert(k.clone(), v.clone());
             continue;
         }
         let deciding: Vec<&(&crate::policy::Rule, Vec<String>)> = conditional
             .iter()
-            .filter(|(r, _)| r.attributes.iter().any(|a| a == k))
+            .filter(|(r, _)| r.every_attribute || r.attributes.iter().any(|a| a == k))
             .collect();
         let Some(instances) = v.as_array().filter(|_| !deciding.is_empty()) else {
             continue;

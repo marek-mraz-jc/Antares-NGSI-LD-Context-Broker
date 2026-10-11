@@ -256,6 +256,7 @@ pub(crate) fn type_rules(
                 geo_also: r.geo_also.clone(),
                 ids: r.ids.clone(),
                 id_patterns: r.id_patterns.clone(),
+                every_attribute: r.every_attribute,
                 temporal: r.temporal.clone(),
             })
             .collect(),

@@ -472,6 +472,10 @@ pub struct Rule {
     pub id_patterns: Vec<String>,
     /// The Attributes an Entity this rule holds for shows.
     pub attributes: Vec<String>,
+    /// The rule shows every Attribute, and `attributes` is not read
+    /// (ADR-0023 rule 11, amended by T-3637): an engine's grant over the
+    /// whole Entity. A view never sets it.
+    pub every_attribute: bool,
     /// Windows of `observedAt` (gap G6): in a temporal read (5.7.3, 5.7.4)
     /// an instance of these `attributes` is shown through this rule only if
     /// it falls into every one. A current-state read shows what the rule
@@ -566,6 +570,9 @@ impl Rule {
     /// caller the condition held, so these are what the visible set
     /// discloses; the view loader reports them.
     pub fn discloses(&self, ctx: &antares_jsonld::Context) -> Vec<String> {
+        if self.every_attribute {
+            return Vec::new();
+        }
         self.reads(ctx)
             .into_iter()
             .filter(|r| !self.attributes.iter().any(|a| ctx.expand_key(a) == *r))
@@ -705,7 +712,16 @@ impl Filter {
         } else {
             let mut held = self.rules.iter().filter(|r| r.holds(doc, ctx)).peekable();
             held.peek()?;
-            Some(held.flat_map(|r| r.attributes.iter().cloned()).collect())
+            let held: Vec<&Rule> = held.collect();
+            if held.iter().any(|r| r.every_attribute) {
+                None
+            } else {
+                Some(
+                    held.iter()
+                        .flat_map(|r| r.attributes.iter().cloned())
+                        .collect(),
+                )
+            }
         };
         if self.omit_by_type.is_empty() {
             return Some(Shown {
@@ -745,7 +761,8 @@ impl Filter {
         self.rules.is_empty()
             || self.rules.iter().any(|r| {
                 r.holds(post_image, ctx)
-                    && written.iter().all(|w| r.attributes.iter().any(|a| a == w))
+                    && (r.every_attribute
+                        || written.iter().all(|w| r.attributes.iter().any(|a| a == w)))
             })
     }
 
@@ -2087,6 +2104,30 @@ mod tests {
         );
         let robot = json!({"id": "urn:ngsi-ld:Robot:1", "type": [iri("Robot")]});
         assert!(!f.admits_write(&robot, &[], &ctx), "outside every rule");
+    }
+
+    /// A rule over every Attribute admits a write naming any of them, and
+    /// discloses nothing it reads (T-3637).
+    #[test]
+    fn a_rule_over_every_attribute_admits_any_written_name() {
+        let ctx = ctx();
+        let whole = Rule {
+            every_attribute: true,
+            q: Some(Box::new(antares_ql::parse_q("speed>50").expect("q"))),
+            ..rule("Car", &[])
+        };
+        let f = Filter {
+            rules: vec![whole.clone()],
+            ..Filter::default()
+        };
+        let (speed, name) = (iri("speed"), iri("name"));
+        assert!(f.admits_write(&car(0.5), &[&speed, &name], &ctx));
+        let narrow = Filter {
+            rules: vec![rule("Car", &[])],
+            ..Filter::default()
+        };
+        assert!(!narrow.admits_write(&car(0.5), &[&speed], &ctx));
+        assert!(whole.discloses(&ctx).is_empty());
     }
 
     /// The loader's disclosure report: zone A's rule reads `location` and
