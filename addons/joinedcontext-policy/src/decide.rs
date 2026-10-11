@@ -5,10 +5,11 @@
 use crate::document::{context, covers, scope_paths, Policy, Table};
 use crate::subject::{Caller, Platform};
 use antares_api::policy::{
-    Decision, Filter, Operation, Rule, FILTERABLE, WHOLE_TENANT, WRITE_BY_ID,
+    Decision, Filter, Operation, Rule, Warning, FILTERABLE, WHOLE_TENANT, WRITE_BY_ID,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Writes judged on the Entity they create, so a conditional policy is
 /// judged on the request body.
@@ -77,7 +78,7 @@ pub fn decide(
         return Decision::Deny(NOT_GRANTED.into());
     }
     if FILTERABLE.contains(&op.clause) {
-        read(&grants, &types, platform)
+        read(&grants, op, &types, platform)
     } else if WHOLE_TENANT.contains(&op.clause) {
         if grants.iter().any(|p| unconditional_whole(p)) {
             Decision::Allow
@@ -132,7 +133,7 @@ fn unconditional_whole(p: &Policy) -> bool {
 }
 
 /// A read: one rule per selector of every grant (ADR-0023 rule 11).
-fn read(grants: &[&Policy], types: &[String], caller: &Platform) -> Decision {
+fn read(grants: &[&Policy], op: &Operation<'_>, types: &[String], caller: &Platform) -> Decision {
     if grants.iter().any(|p| unconditional_whole(p)) {
         return Decision::Allow;
     }
@@ -152,10 +153,90 @@ fn read(grants: &[&Policy], types: &[String], caller: &Platform) -> Decision {
         }
     }
     Decision::Filter(Filter {
+        warning: left_out(&rules, op, types),
         rules,
         restricted: caller.restricted,
         ..Filter::default()
     })
+}
+
+/// The advisory naming the types the request's filter leaves out (map K18, MP-02), as the
+/// gateway's oracle sent it: a type whose rules do not show an Attribute `q` names, or, without
+/// a `q`, none of the Attributes `attrs` names, answers nothing, and the caller would read that
+/// as no data. Only types the grants show (and the request names, when it names any) are
+/// named, so the text tells nothing the caller may not read. An `orderBy` leaves no Entity out
+/// and is not counted.
+fn left_out(rules: &[Rule], op: &Operation<'_>, types: &[String]) -> Option<Warning> {
+    let ctx = context();
+    // The handler hands `q` over as written; its names expand as the grants' own did.
+    let referenced: Vec<String> =
+        op.q.map(|q| q.attribute_paths())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|name| antares_ql::is_non_system_attr(name))
+            .map(|name| ctx.expand_key(name))
+            .collect();
+    let asked: Vec<&str> = match op.q {
+        Some(_) => Vec::new(),
+        None => op.attrs.iter().map(String::as_str).collect(),
+    };
+    if referenced.is_empty() && asked.is_empty() {
+        return None;
+    }
+    // What each type shows: `None` is every Attribute.
+    let mut shown: BTreeMap<&str, Option<BTreeSet<&str>>> = BTreeMap::new();
+    for rule in rules {
+        for t in rule
+            .types
+            .iter()
+            .filter(|t| types.is_empty() || types.contains(t))
+        {
+            let entry = shown.entry(t).or_insert_with(|| Some(BTreeSet::new()));
+            match (entry.as_mut(), rule.every_attribute) {
+                (Some(held), false) => held.extend(rule.attributes.iter().map(String::as_str)),
+                _ => *entry = None,
+            }
+        }
+    }
+    let names: Vec<String> = shown
+        .into_iter()
+        .filter_map(|(t, attributes)| {
+            let attributes = attributes?;
+            let unserved = referenced.iter().any(|a| !attributes.contains(a.as_str()))
+                || (!asked.is_empty() && !asked.iter().any(|a| attributes.contains(a)));
+            unserved.then(|| ctx.compact_iri(t))
+        })
+        .collect();
+    warning(&names)
+}
+
+/// The gateway's text for `names`, as many of them as one header line holds.
+fn warning(names: &[String]) -> Option<Warning> {
+    let verb = if names.len() == 1 { "was" } else { "were" };
+    let tail = |shown: usize| match names.len().saturating_sub(shown) {
+        0 => format!(
+            " {verb} not queried: this request selects or orders on an attribute they do not \
+             serve on this endpoint"
+        ),
+        more => format!(
+            " and {more} more {verb} not queried: this request selects or orders on an \
+             attribute they do not serve on this endpoint"
+        ),
+    };
+    let mut listed = String::new();
+    let mut text = None;
+    for (at, name) in names.iter().enumerate() {
+        if !listed.is_empty() {
+            listed.push_str(", ");
+        }
+        listed.push_str(name);
+        let line = format!("{listed}{}", tail(at.saturating_add(1)));
+        if line.len() > Warning::MAX_LEN {
+            break;
+        }
+        text = Some(line);
+    }
+    Warning::new(&text?).ok()
 }
 
 /// How one grant admits a write.
@@ -519,6 +600,121 @@ mod tests {
         assert_eq!(
             on(&t, "5.6.1", Some(&at(5.0))),
             Decision::Deny(NOT_GRANTED.into())
+        );
+        Ok(())
+    }
+
+    /// The warning a read by `q` (or `attrs` alone) carries, over a grant
+    /// showing `speed` of a Car and `name` of a Bus.
+    fn left_out_by(
+        types: &[&str],
+        q: Option<&str>,
+        attrs: &[&str],
+    ) -> Result<Option<String>, String> {
+        let t = table(&json!({"operations": ["5.7.2"], "information": [
+            {"entities": [{"type": "Car"}], "propertyNames": ["speed"]},
+            {"entities": [{"type": "Bus"}], "propertyNames": ["name"]}]}))?;
+        let types: Vec<String> = types.iter().map(|n| iri(n)).collect();
+        let attrs: Vec<String> = attrs.iter().map(|n| iri(n)).collect();
+        let q = q
+            .map(antares_ql::parse_q)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let op = Operation {
+            types: &types,
+            attrs: &attrs,
+            q: q.as_ref(),
+            ..Operation::new("5.7.2")
+        };
+        let Decision::Filter(f) = decide(Some(&t), &caller(), &op, Utc::now()) else {
+            return Err("a read by selector is a filter".into());
+        };
+        Ok(f.warning.map(|w| w.texts().join("; ")))
+    }
+
+    const WAS: &str = "was not queried: this request selects or orders on an attribute they do \
+                       not serve on this endpoint";
+    const WERE: &str = "were not queried: this request selects or orders on an attribute they \
+                        do not serve on this endpoint";
+
+    /// T-3796 (MP-02): a filter on an attribute a type does not show names
+    /// that type, as the gateway did.
+    #[test]
+    fn a_filter_names_the_one_type_it_left_out() -> Result<(), String> {
+        assert_eq!(
+            left_out_by(&["Car", "Bus"], Some("speed>1"), &[])?,
+            Some(format!("Bus {WAS}"))
+        );
+        assert_eq!(
+            left_out_by(&["Car", "Bus"], None, &["name"])?,
+            Some(format!("Car {WAS}")),
+            "attrs alone leaves out the type that shows none of them"
+        );
+        Ok(())
+    }
+
+    /// T-3796: two types left out are both named; none left out is no warning.
+    #[test]
+    fn a_filter_names_two_types_or_none() -> Result<(), String> {
+        assert_eq!(
+            left_out_by(&[], Some("colour==\"red\""), &[])?,
+            Some(format!("Bus, Car {WERE}"))
+        );
+        assert_eq!(left_out_by(&["Car"], Some("speed>1"), &[])?, None);
+        assert_eq!(
+            left_out_by(&["Car", "Bus"], None, &["speed", "name"])?,
+            None
+        );
+        assert_eq!(left_out_by(&["Car", "Bus"], None, &[])?, None);
+        assert_eq!(
+            left_out_by(&["Car"], Some("createdAt>\"2020-01-01T00:00:00Z\""), &[])?,
+            None,
+            "a system member is never left out"
+        );
+        Ok(())
+    }
+
+    /// T-3796: a type the subject may not read is never named, and a type
+    /// shown whole leaves nothing out.
+    #[test]
+    fn a_type_the_subject_may_not_read_is_never_named() -> Result<(), String> {
+        assert_eq!(
+            left_out_by(&["Car", "Secret"], Some("name==\"x\""), &[])?,
+            Some(format!("Car {WAS}"))
+        );
+        let whole = table(&json!({"operations": ["5.7.2"]}))?;
+        let q = antares_ql::parse_q("anything>1").map_err(|e| e.to_string())?;
+        let op = Operation {
+            types: &car(),
+            q: Some(&q),
+            ..Operation::new("5.7.2")
+        };
+        let Decision::Filter(f) = decide(Some(&whole), &caller(), &op, Utc::now()) else {
+            return Err("a read by selector is a filter".into());
+        };
+        assert_eq!(f.warning, None);
+        Ok(())
+    }
+
+    /// T-3796: the names one header line cannot hold are counted, not cut.
+    #[test]
+    fn the_warning_fits_one_header_line() -> Result<(), String> {
+        let names: Vec<String> = (0..40)
+            .map(|i| format!("AVeryLongTypeName{i:02}"))
+            .collect();
+        let w = warning(&names).ok_or("no warning")?;
+        let text = w.texts().join("");
+        assert!(text.len() <= Warning::MAX_LEN, "{text}");
+        assert!(
+            text.starts_with("AVeryLongTypeName00, AVeryLongTypeName01"),
+            "{text}"
+        );
+        assert!(text.contains(" more were not queried"), "{text}");
+        assert_eq!(warning(&[]), None);
+        assert_eq!(
+            warning(&["x".repeat(300)]),
+            None,
+            "a name past the bound is not cut"
         );
         Ok(())
     }

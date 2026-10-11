@@ -198,7 +198,7 @@ instance type):
 | LinkML document | ≤ 5 ms p99 for a 100-class schema, cached per view revision | computed once per view revision |
 | WebSocket notification | delivery latency p99 ≤ 1.10× HTTP sink p99 to a local receiver (T-3626); ≤ 32 KiB resident per idle connection plus its queue | no socket opened per notification; one queue hop per connection |
 | internal CSR forward | p99 ≤ 0.5× the HTTP forward to the same broker | no socket, no TLS, no second JSON parse of the request line |
-| binary size | `full` release binary ≤ vanilla + 7 MiB (T-3744); each feature alone ≤ vanilla + 2 MiB, except `mcp` ≤ vanilla + 4.5 MiB (T-3662) and `odata` ≤ vanilla + 3.5 MiB (T-3705) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
+| binary size | `full` release binary ≤ vanilla + 10 MiB; each feature alone ≤ vanilla + 10 MiB (owner 2026-10-11: under 10 MiB of growth is fine, T-3775) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
 | vanilla | unchanged within the noise band of T-3467 | GOAL point 1 |
 
 A benchmark per row: criterion benches in each surface crate for the
@@ -301,6 +301,12 @@ that one hop, and 1.10× is the noise margin the NGSI-LD view row already
 uses. Options: raise the bound (chosen), write to the socket from the
 notifier task (one slow client stalls every Subscription's delivery),
 keep the 1.0× bound (fails on noise alone, run 3 is below, run 5 above).
+
+Decided (owner, 2026-10-11, T-3775): one ceiling, `full` and each feature
+alone ≤ vanilla + 10 MiB. The per-feature 2 MiB rule and its exceptions
+(`mcp` 4.5, `odata` 3.5, `full` 6 then 7 MiB) cost a budget fight on every
+new surface and two red trains on 2026-10-11 for growth the owner accepts.
+The gate stays, so a surface that pulls in tens of MiB is still red.
 
 ### 7. Code rules for every new crate
 

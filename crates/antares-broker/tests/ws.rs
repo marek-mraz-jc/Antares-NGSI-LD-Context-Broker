@@ -139,7 +139,12 @@ fn ws_cross_pod_delivery_reaches_the_holding_pod() -> Result<(), String> {
 /// worker pod learns the Subscription through the KV mirror, and until it
 /// does a change matches nothing.
 fn notified(port: u16, tenant: &str, run: u128) -> Result<(), String> {
-    let mut ws = Socket::open(port, "/x/ws/ngsi-ld/v1", Some(tenant))?;
+    let mut ws = Socket::open(
+        port,
+        "/x/ws/ngsi-ld/v1",
+        &[("NGSILD-Tenant".to_owned(), tenant.to_owned())],
+        Duration::from_secs(2),
+    )?;
     let welcome = ws.next().ok_or("no welcome")?;
     assert_eq!(welcome.pointer("/metadata/x-op"), Some(&json!("x-welcome")));
     ws.send(&json!({"metadata": {"x-op": "x-subscribe", "x-id": "s"},

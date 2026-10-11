@@ -42,6 +42,19 @@ async fn send(
     who: &[(&str, &str)],
     body: Option<&Value>,
 ) -> Result<(StatusCode, Value), String> {
+    exchange(st, method, uri, who, body)
+        .await
+        .map(|(status, _, body)| (status, body))
+}
+
+/// `send`, keeping the answer's headers.
+async fn exchange(
+    st: &AppState,
+    method: &str,
+    uri: &str,
+    who: &[(&str, &str)],
+    body: Option<&Value>,
+) -> Result<(StatusCode, axum::http::HeaderMap, Value), String> {
     let mut b = Request::builder().method(method).uri(uri);
     for (k, v) in who {
         b = b.header(*k, *v);
@@ -58,6 +71,7 @@ async fn send(
         .await
         .map_err(|e| e.to_string())?;
     let status = resp.status();
+    let headers = resp.headers().clone();
     let bytes = resp
         .into_body()
         .collect()
@@ -66,6 +80,7 @@ async fn send(
         .to_bytes();
     Ok((
         status,
+        headers,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     ))
 }
@@ -1013,5 +1028,39 @@ async fn a_view_list_that_does_not_match_the_document_is_refused() -> Res {
         StatusCode::FORBIDDEN,
         "a view listing nothing grants nothing: {body}"
     );
+    Ok(())
+}
+
+/// T-3796 (MP-02): through a view, a filter on an attribute the grant does
+/// not show answers nothing and says which type it left out, as the gateway
+/// did; a filter on what it shows says nothing.
+#[tokio::test]
+async fn a_view_names_the_type_its_filter_left_out() -> Res {
+    let a = grant("a", "group", "city", &["5.7.1", "5.7.2"], cars(&["speed"]));
+    let (st, _) = broker(bound(&[a], json!({"cars": ["a"]}))).await?;
+    fleet(&st).await?;
+    let read = |uri: &'static str| {
+        let st = st.clone();
+        antares_api::policy::through_view("cars", async move {
+            exchange(&st, "GET", uri, &ANA, None).await
+        })
+    };
+
+    let (code, headers, list) = read("/ngsi-ld/v1/entities?type=Car&q=colour==%22red%22").await?;
+    assert_eq!((code, list), (StatusCode::OK, json!([])));
+    let warned: Vec<&str> = headers
+        .get_all("NGSILD-Warning")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert!(
+        warned.iter().any(|w| w.starts_with("199 ")
+            && w.contains("Car was not queried: this request selects or orders on an attribute")),
+        "{warned:?}"
+    );
+
+    let (code, headers, list) = read("/ngsi-ld/v1/entities?type=Car&q=speed%3E20").await?;
+    assert_eq!((code, ids(&list)), (StatusCode::OK, car_ids(&[2, 3])));
+    assert!(headers.get("NGSILD-Warning").is_none(), "{headers:?}");
     Ok(())
 }

@@ -22,6 +22,10 @@ const KNOWN_KEYS: &[&str] = &[
     // reach this one at (the reduced-copy notification endpoint); defaults
     // to http://{host_alias}.
     "ANTARES_PUBLIC_URL",
+    // Internal context sources (ADR-0025 rule 1): the URLs this deployment
+    // answers under. Accepted in every build: one without the
+    // `internal-csr` feature says once that it does not read it.
+    "ANTARES_SELF_URLS",
     "ANTARES_ROLES",
     // The example policy engine's rules document; accepted only in a build
     // that carries the engine, so a release binary rejects it like any
@@ -500,6 +504,8 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("views", || antares_ops::mount(antares_views::Views)),
     #[cfg(feature = "mcp")]
     ("mcp", || antares_ops::mount(antares_mcp::Mcp)),
+    #[cfg(feature = "linkml")]
+    ("linkml", || antares_ops::mount(antares_linkml::Linkml)),
     #[cfg(feature = "odata")]
     ("odata", || antares_ops::mount(antares_odata::OData)),
     #[cfg(feature = "ogc")]
@@ -971,6 +977,26 @@ async fn run(
     // reload hands it its rule documents (ADR-0020 amendment).
     #[cfg(feature = "views")]
     antares_ops::views::install(&state).await?;
+    // Internal context sources (ADR-0025): a registration whose endpoint is
+    // a self URL is served in process under the target's export grant, and
+    // `/q/grants` joins the admin surface. No self URL, no transport: every
+    // forward stays HTTP. An entry that is no self URL stops the broker.
+    #[cfg(feature = "internal-csr")]
+    {
+        let selfs = antares_icsr::SelfUrls::parse(
+            &std::env::var(antares_icsr::SELF_URLS_ENV).unwrap_or_default(),
+        )?;
+        if !selfs.is_empty() {
+            state = antares_ops::with_forward_transport(state, antares_icsr::transport(selfs))?;
+        }
+    }
+    #[cfg(not(feature = "internal-csr"))]
+    if std::env::var_os("ANTARES_SELF_URLS").is_some() {
+        tracing::warn!(
+            "ANTARES_SELF_URLS is set and this build has no internal-csr feature: \
+             every federation forward goes over HTTP"
+        );
+    }
     // The /q admin credential, before the router mounts the admin surface.
     // Unconfigured, /q serves as before and says so once, here.
     match antares_api::admin_auth::AdminAuth::from_config(
@@ -1777,6 +1803,15 @@ mod api_surface_tests {
         assert_eq!(names(Some("admin,views")), vec!["admin", "views"]);
         let root = api_surfaces(Some("views")).expect("selection")[0].1();
         assert_eq!(root.prefix(), "/x/views");
+    }
+
+    /// The LinkML surface shares the view root (ADR-0027 section 1).
+    #[cfg(feature = "linkml")]
+    #[test]
+    fn a_linkml_build_shelves_the_linkml_surface_on_the_view_root() {
+        assert_eq!(names(Some("views,linkml")), vec!["views", "linkml"]);
+        let linkml = api_surfaces(Some("linkml")).expect("selection")[0].1();
+        assert_eq!(linkml.prefix(), "/x/views");
     }
 
     /// The MCP surface shares the view root (ADR-0027 section 1).

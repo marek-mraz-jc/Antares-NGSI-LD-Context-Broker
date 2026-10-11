@@ -52,9 +52,11 @@ joinedcontext-policy = { workspace = true, optional = true }
 antares-ops = { workspace = true, optional = true }
 antares-views = { workspace = true, optional = true }
 antares-mcp = { workspace = true, optional = true }
+antares-linkml = { workspace = true, optional = true }
 antares-odata = { workspace = true, optional = true }
 antares-ogc = { workspace = true, optional = true }
 antares-ws = { workspace = true, optional = true }
+antares-icsr = { workspace = true, optional = true }
 
 [features]
 # tokio-console in dev — build with RUSTFLAGS="--cfg tokio_unstable"
@@ -89,6 +91,11 @@ views = ["dep:antares-ops", "dep:antares-views"]
 # view's read operations as tools and resources
 # (`ANTARES_API_SURFACES=admin,views,mcp`).
 mcp = ["views", "dep:antares-mcp"]
+# The LinkML surface of a view (ADR-0027, T-3511): `/x/views/{view}/linkml`,
+# the view's schema narrowed to what the caller may see
+# (`ANTARES_API_SURFACES=admin,views,linkml`).
+linkml = ["views", "dep:antares-linkml"]
+
 # The OData surface of a view (ADR-0024, T-3508): `/x/views/{view}/odata/v4`,
 # its $metadata from the Tenant's LinkML schema (`/q/schemas/{tenant}`)
 # intersected with the view (`ANTARES_API_SURFACES=admin,views,odata`).
@@ -102,6 +109,11 @@ ogc = ["views", "dep:antares-ogc"]
 # (`ANTARES_API_SURFACES=...,ws`), and with `views` also
 # `/x/views/{view}/ws` (`ws-views`); its sink serves `urn:antares:ws:`.
 ws = ["dep:antares-ops", "dep:antares-ws"]
+
+# Internal context sources (ADR-0025, T-3520): a registration whose endpoint
+# is one of ANTARES_SELF_URLS is served in process under the target Tenant's
+# export grant (`/q/grants`) and engine.
+internal-csr = ["views", "dep:antares-icsr"]
 
 # Every surface the broker serves (ADR-0027 Consequences, T-3636): what
 # `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
@@ -123,6 +135,8 @@ antares-api = { workspace = true, features = ["test-kit"] }
 # mqtt e2e: sync rumqttc client against a live mosquitto
 rumqttc = { workspace = true }
 serde_json = { workspace = true }
+# the views differential (T-3777): generated views and policies
+proptest = { workspace = true }
 
 [lints]
 workspace = true

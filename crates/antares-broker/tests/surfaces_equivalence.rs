@@ -399,8 +399,13 @@ async fn the_same_read_returns_the_same_entities_on_every_surface() {
         let types: Vec<Value> = v.types.iter().map(|t| json!({"type": t})).collect();
         let id = v.id;
         let socket = tokio::task::spawn_blocking(move || {
-            let mut s = Socket::open(port, &format!("/x/views/{id}/ws"), Some(TENANT))
-                .unwrap_or_else(|e| panic!("{id}: {e}"));
+            let mut s = Socket::open(
+                port,
+                &format!("/x/views/{id}/ws"),
+                &[("NGSILD-Tenant".to_owned(), TENANT.to_owned())],
+                std::time::Duration::from_secs(2),
+            )
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
             let welcome = s.next().unwrap_or_default();
             assert_eq!(welcome["metadata"]["x-op"], "x-welcome", "{id}: {welcome}");
             s.send(&json!({"metadata": {"x-op": "x-subscribe", "x-id": id},

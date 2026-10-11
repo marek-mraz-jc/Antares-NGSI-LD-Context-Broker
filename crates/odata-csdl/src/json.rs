@@ -281,6 +281,14 @@ fn navigation(navigation: &NavigationProperty) -> (String, J) {
     if let Some(partner) = &navigation.partner {
         members.push(member("$Partner", J::str(partner)));
     }
+    if !navigation.referential_constraints.is_empty() {
+        let pairs = navigation
+            .referential_constraints
+            .iter()
+            .map(|c| member(&c.property, J::str(&c.referenced_property)))
+            .collect();
+        members.push(member("$ReferentialConstraint", J::Obj(pairs)));
+    }
     annotations(&mut members, &navigation.annotations);
     (navigation.name.clone(), J::Obj(members))
 }

@@ -178,10 +178,74 @@ def check_compare():
     print("  compare ok (a flip or a TP in one run only fails, a shared failure does not)")
 
 
+def check_view_diff():
+    """dev/etsi-view-diff.py: a TP that differs through the view passes only
+    when its body sent a request the view does not offer, an entity map or a
+    Tenant, or the known file names it; a known TP that answers as E1 again,
+    a deviation nobody owes and a TP that did not run fail."""
+    vd = importlib.util.spec_from_file_location("view_diff", f"{HERE}/etsi-view-diff.py")
+    view_diff = importlib.util.module_from_spec(vd)
+    vd.loader.exec_module(view_diff)
+    binds = view_diff.bindings()
+    root = "http://h/x/views/v/ngsi-ld/v1"
+    for method, url, op in [
+        ("GET", f"{root}/entities/urn:a", "retrieve_entity"),
+        ("GET", f"{root}/types?details=true", "retrieve_entity_type_details"),
+        ("GET", f"{root}/types", "retrieve_entity_types"),
+        ("GET", f"{root}/entities/urn:a/attrs/p/value", "retrieve_attribute_value"),
+        ("POST", f"{root}/entityOperations/upsert?options=update", "batch_upsert"),
+        ("POST", f"{root}/entities/", "create_entity"),
+        ("GET", f"{root}/nothing", None),
+        ("GET", "http://h/q/health", None),
+    ]:
+        assert view_diff.operation(method, url, binds) == op, (method, url)
+
+    a, b, c, d = (f"TP/s.robot::00{i} T" for i in range(4))
+    with tempfile.TemporaryDirectory() as tmp:
+
+        def run(name, rows, requests=()):
+            path = f"{tmp}/{name}"
+            os.makedirs(path)
+            with open(f"{path}/tp-status.csv", "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["suite", "source", "test", "status"])
+                for key, status in rows:
+                    w.writerow(["s", *key.split("::"), status])
+            with open(f"{path}/requests.jsonl", "w") as fh:
+                for test, method, url, headers in requests:
+                    fh.write(json.dumps({"test": test, "method": method, "url": url, "headers": headers}) + "\n")
+            return path
+
+        view = f"{tmp}/view.json"
+        json.dump({"id": "v", "operations": ["retrieve_entity", "create_entity"]}, open(view, "w"))
+        known = f"{tmp}/known.json"
+        json.dump({"v": {d: "T-0000"}}, open(known, "w"))
+        view_diff.KNOWN = known
+        e1 = run("e1", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "PASS")])
+        owed = run("owed", [(a, "FAIL"), (b, "FAIL"), (c, "FAIL"), (d, "FAIL")], [
+            (a, "POST", f"{root}/entityOperations/upsert", []),
+            (b, "GET", f"{root}/entities/urn:x?entityMap=true", []),
+            (c, "GET", f"{root}/entities/urn:x", ["ngsild-tenant"]),
+        ])
+        assert view_diff.diff(view, e1, owed, binds) == 0
+        refusals = json.load(open(f"{owed}/owed-refusals.json"))["refusals"]
+        assert [r["tp"] for r in refusals] == [a, b, c], refusals
+        stale = run("stale", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "PASS")])
+        assert view_diff.diff(view, e1, stale, binds) == 1, "a known TP answering as E1 must fail"
+        offered = run("offered", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
+                      [(a, "POST", f"{root}/entities", [])])
+        assert view_diff.diff(view, e1, offered, binds) == 1, "an offered operation owes nothing"
+        gone = run("gone", [(b, "PASS"), (c, "PASS"), (d, "FAIL")])
+        assert view_diff.diff(view, e1, gone, binds) == 1, "a TP that did not run must fail"
+        assert view_diff.diff(view, e1, f"{tmp}/nowhere", binds) == 1, "an empty run must fail"
+    print("  view diff ok (owed refusals pass, a deviation, a stale known entry or a missing TP fails)")
+
+
 if __name__ == "__main__":
     print("etsi sampling self-check")
     check_proc_parsing()
     check_join()
     check_baseline()
     check_compare()
+    check_view_diff()
     print("OK")
