@@ -123,5 +123,6 @@ the status the view gives (`405`).
 
 - [Endpoint views](views.md)
 - [OData endpoint of a view](odata.md)
+- [OGC API - Features compliance](ogc-compliance.md): the OGC CITE ETS, its baseline and pass rate per class
 - `docs/analysis/ogc-features-mapping.md` (rows M, C, R, F, W, S)
 - ADR-0029 (the OGC surface and the `ogc-cql2` crate)
