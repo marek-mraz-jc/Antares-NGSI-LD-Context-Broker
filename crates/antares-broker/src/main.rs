@@ -1789,6 +1789,16 @@ mod api_surface_tests {
         }
     }
 
+    /// `full` is every surface in one binary (T-3636): the platform image
+    /// selects them all by name.
+    #[cfg(feature = "full")]
+    #[test]
+    fn the_full_build_shelves_every_surface() {
+        let names = "admin,views,mcp,odata,ws,ws-views";
+        let picked = api_surfaces(Some(names)).expect("every surface is on the shelf");
+        assert_eq!(picked.len(), names.split(',').count());
+    }
+
     /// Rule M3, the route half (surfaces-threat-model 9.5 item 4): with no
     /// surface feature the shelf is the admin surface alone, and a path of
     /// every surface prefix (ADR-0023 to ADR-0027) is unrouted. A surface
