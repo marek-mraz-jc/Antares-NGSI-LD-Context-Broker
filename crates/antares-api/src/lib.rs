@@ -93,7 +93,7 @@ pub use antares_notifier::DeliveryPolicy;
 pub use antares_notifier::{
     build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
 };
-pub use federation::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
+pub use federation::{AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 pub use state::{AppState, TemporalRecord};
 
 /// Spawn for both targets — tokio natively, the JS microtask queue on

@@ -54,6 +54,7 @@ antares-views = { workspace = true, optional = true }
 antares-mcp = { workspace = true, optional = true }
 antares-odata = { workspace = true, optional = true }
 antares-ws = { workspace = true, optional = true }
+antares-icsr = { workspace = true, optional = true }
 
 [features]
 # tokio-console in dev — build with RUSTFLAGS="--cfg tokio_unstable"
@@ -92,6 +93,11 @@ odata = ["views", "dep:antares-odata"]
 # (`ANTARES_API_SURFACES=...,ws`), and with `views` also
 # `/x/views/{view}/ws` (`ws-views`); its sink serves `urn:antares:ws:`.
 ws = ["dep:antares-ops", "dep:antares-ws"]
+
+# Internal context sources (ADR-0025, T-3520): a registration whose endpoint
+# is one of ANTARES_SELF_URLS is served in process under the target Tenant's
+# export grant (`/q/grants`) and engine.
+internal-csr = ["views", "dep:antares-icsr"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
 # Unix-only: the wasm target keeps the default allocator.

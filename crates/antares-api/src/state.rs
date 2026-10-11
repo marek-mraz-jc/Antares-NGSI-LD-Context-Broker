@@ -81,6 +81,15 @@ pub(crate) fn inprocess_context() -> Option<Arc<serde_json::Value>> {
     INPROCESS_CONTEXT.try_with(Arc::clone).ok()
 }
 
+/// How many [`AppState::call`] frames the running task is inside: zero
+/// outside an in-process call. A caller that must not reach the router past
+/// [`crate::bounds::MAX_IN_PROCESS_CALL_DEPTH`] reads it to answer for
+/// itself rather than take the router's 500 (ADR-0025 rule 3).
+#[must_use]
+pub fn in_process_depth() -> usize {
+    INPROCESS_DEPTH.try_with(|d| *d).unwrap_or(0)
+}
+
 tokio::task_local! {
     /// How many [`AppState::call`] frames this task is already inside, held
     /// against [`crate::bounds::MAX_IN_PROCESS_CALL_DEPTH`]. Absent outside a
@@ -571,6 +580,55 @@ impl AppState {
             .map_err(|e| e.to_string())
     }
 
+    /// Every stored export grant (ADR-0025 rule 5), as written.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn grant_docs(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.store
+            .list(&grant_tenant()?, antares_store::Kind::View)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The stored export grant `id`, if there is one.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn grant_doc(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
+        self.store
+            .get(&grant_tenant()?, antares_store::Kind::View, id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Store export grant `id`; `true` when it replaced one. The caller
+    /// validated it.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn put_grant_doc(&self, id: &str, doc: serde_json::Value) -> Result<bool, String> {
+        self.store
+            .upsert(&grant_tenant()?, antares_store::Kind::View, id, doc)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove export grant `id`; `false` when there was none.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn delete_grant_doc(&self, id: &str) -> Result<bool, String> {
+        self.store
+            .delete(&grant_tenant()?, antares_store::Kind::View, id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Every stored policy rule document (ADR-0020 amendment), as written.
     ///
     /// # Errors
@@ -760,7 +818,7 @@ impl AppState {
         // serves would call itself for as long as the stack lasts, and
         // every frame builds a router. The chain is counted per task, so a
         // façade over a façade is served and a loop is not.
-        let depth = INPROCESS_DEPTH.try_with(|d| *d).unwrap_or(0);
+        let depth = in_process_depth();
         if depth >= crate::bounds::MAX_IN_PROCESS_CALL_DEPTH {
             return crate::negotiate::ApiError::from(antares_model::NgsiError::InternalError(
                 format!(
@@ -815,6 +873,39 @@ impl AppState {
             ))
             .into_response(),
         }
+    }
+
+    /// [`AppState::call`] on a task of its own, at the caller's in-process
+    /// depth. A chain of calls each awaiting the next polls every frame
+    /// inside the one before it, and a few federation handlers deep that
+    /// is more stack than a worker thread has; on its own task each frame
+    /// is polled from the scheduler, as a request over HTTP is. Dropping
+    /// the returned future (a forward's timeout) aborts the task.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn call_on_task(
+        &self,
+        caller: axum::http::HeaderMap,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+        /// Aborts the task when the forward waiting on it is dropped.
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let st = self.clone();
+        let task = tokio::spawn(INPROCESS_DEPTH.scope(in_process_depth(), async move {
+            st.call(&caller, req).await
+        }));
+        let _abort = AbortOnDrop(task.abort_handle());
+        task.await.unwrap_or_else(|_| {
+            crate::negotiate::ApiError::from(antares_model::NgsiError::InternalError(
+                "the in-process call failed".into(),
+            ))
+            .into_response()
+        })
     }
 
     /// [`AppState::call`] with the terms of the request defined by
@@ -965,6 +1056,11 @@ pub fn now_iso() -> String {
 #[cfg(feature = "views")]
 fn view_tenant() -> Result<antares_model::TenantId, String> {
     antares_model::TenantId::new_internal(crate::views::VIEW_TENANT).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "views")]
+fn grant_tenant() -> Result<antares_model::TenantId, String> {
+    antares_model::TenantId::new_internal(crate::views::GRANT_TENANT).map_err(|e| e.to_string())
 }
 
 #[cfg(feature = "views")]

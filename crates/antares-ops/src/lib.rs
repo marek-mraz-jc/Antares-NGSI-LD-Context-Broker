@@ -65,7 +65,7 @@ pub mod policy {
 /// delivers notifications (WebSocket).
 pub use antares_api::{build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound};
 /// The error a sink's endpoint check answers with.
-pub use antares_model::NgsiError;
+pub use antares_model::{NgsiError, TenantId};
 
 /// The request bounds a surface applies to what it parses itself (a
 /// WebSocket message never passes the HTTP bounds layer).
@@ -75,7 +75,7 @@ pub mod bounds {
 
 /// The federation transport contract (ADR-0025 rule 8, ADR-0027 section 9),
 /// for a crate that serves some forwards in process.
-pub use antares_api::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
+pub use antares_api::{AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 
 /// The headers a surface may never set on an operation: the tenant, the
 /// snapshot and the policy subject come from the outer request alone (G2).
@@ -361,6 +361,14 @@ impl ViewOps {
         self.operations.contains(&op)
     }
 
+    /// [`Ops::forward_in_process`] through this view: the forward is
+    /// served as a request to the view's Tenant through the view is, the
+    /// view's rules composed with that Tenant's engine (ADR-0023 rule 5,
+    /// ADR-0025 rule 5).
+    pub async fn forward_in_process(&self, req: BuiltForward<'_>, self_url: &str) -> ForwardAnswer {
+        self.inner.forward_in_process(req, self_url).await
+    }
+
     /// The one Tenant the view serves (ADR-0023 rule 10).
     #[must_use]
     pub fn tenant(&self) -> &str {
@@ -613,7 +621,18 @@ impl Ops {
     /// the default Tenant and a snapshot is never inherited. The answer is
     /// read as an HTTP one is: the body up to the federation response cap,
     /// the source's `NGSILD-Warning` values up to their cap.
+    ///
+    /// Past [`antares_api::bounds::MAX_IN_PROCESS_CALL_DEPTH`] the forward
+    /// is not made, in process or over HTTP (rule 3): it answers 508 for an
+    /// `exclusive` or `redirect` registration, whose failure is the
+    /// operation's answer, and 504 otherwise, which the merge reports as
+    /// code 199 (6.3.17), as a loop is.
     pub async fn forward_in_process(&self, req: BuiltForward<'_>, self_url: &str) -> ForwardAnswer {
+        if antares_api::state::in_process_depth() >= antares_api::bounds::MAX_IN_PROCESS_CALL_DEPTH
+        {
+            let status = if req.proxied() { 508 } else { 504 };
+            return (status, serde_json::Value::Null, Vec::new());
+        }
         // A target outside `self_url` is the transport's mistake, and a
         // header 5.9.2 let through that HTTP could not send either: the
         // forward is not made in process, and the answer says so (502).
@@ -645,7 +664,7 @@ impl Ops {
         let Some(inner) = inner else {
             return (502, serde_json::Value::Null, Vec::new());
         };
-        let answer = self.state.call(req.subject(), inner).await;
+        let answer = self.state.call_on_task(req.subject().clone(), inner).await;
         let status = answer.status().as_u16();
         let warnings = answer
             .headers()
@@ -661,6 +680,49 @@ impl Ops {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or(serde_json::Value::Null);
         (status, body, warnings)
+    }
+}
+
+/// The export grants of internal context sources (ADR-0025 rule 5), kept
+/// under their reserved tenant, and the admin routes a module adds beside
+/// `/q/views`.
+impl Ops {
+    /// Every stored grant document.
+    ///
+    /// # Errors
+    /// The store's.
+    pub async fn grant_docs(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.state.grant_docs().await
+    }
+
+    /// The stored grant document `id`, if there is one.
+    ///
+    /// # Errors
+    /// The store's.
+    pub async fn grant_doc(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
+        self.state.grant_doc(id).await
+    }
+
+    /// Store grant document `id`; `true` when it replaced one.
+    ///
+    /// # Errors
+    /// The store's.
+    pub async fn put_grant_doc(&self, id: &str, doc: serde_json::Value) -> Result<bool, String> {
+        self.state.put_grant_doc(id, doc).await
+    }
+
+    /// Remove grant document `id`; `false` when there was none.
+    ///
+    /// # Errors
+    /// The store's.
+    pub async fn delete_grant_doc(&self, id: &str) -> Result<bool, String> {
+        self.state.delete_grant_doc(id).await
+    }
+
+    /// Serve `routes` on the admin surface, relative to `/q` and behind its
+    /// credential. Before the router is built.
+    pub fn add_admin(&self, routes: Router) {
+        self.state.views.add_admin(routes);
     }
 }
 
@@ -784,6 +846,22 @@ pub mod test_kit {
                 state: self.state.with_policy(engine),
                 reload: self.reload,
             }
+        }
+
+        /// The same broker with the forward transport `make` builds
+        /// registered (ADR-0025 rule 8), as the composition root registers
+        /// it.
+        ///
+        /// # Errors
+        /// When a transport is registered already.
+        pub fn with_forward_transport(
+            self,
+            make: impl FnOnce(super::Ops) -> Arc<dyn super::ForwardTransport>,
+        ) -> Result<Self, String> {
+            Ok(Self {
+                state: super::with_forward_transport(self.state, make)?,
+                reload: self.reload,
+            })
         }
 
         /// The same broker with `/q` behind the admin credential (T-3569).

@@ -872,6 +872,44 @@ pub trait ForwardTransport: Send + Sync {
     /// answer as they do over HTTP; the egress guard and the breaker do
     /// not, since no socket is opened.
     fn forward<'a>(&'a self, req: BuiltForward<'a>) -> Option<ForwardFuture<'a>>;
+
+    /// Whether Tenant `source` may store a registration whose forwards go
+    /// to `endpoint` in Tenant `target` (`None`: the default Tenant), asked
+    /// at 12.2.2 and 12.2.4 before anything is stored (ADR-0025 rule 5).
+    /// `Ok` for an endpoint this transport does not serve: its forwards go
+    /// over HTTP, as before. `Err` carries the reason of the 403.
+    fn admit<'a>(
+        &'a self,
+        _source: &'a TenantId,
+        _endpoint: &'a str,
+        _target: Option<&'a str>,
+    ) -> AdmitFuture<'a> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+/// What [`ForwardTransport::admit`] answers.
+pub type AdmitFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+
+/// The registered transport's [`ForwardTransport::admit`] for the
+/// registration document `doc` of `tenant`; `Ok` without a transport.
+pub(crate) async fn admit_registration(
+    st: &AppState,
+    tenant: &TenantId,
+    doc: &serde_json::Map<String, Value>,
+) -> Result<(), crate::policy::Denied> {
+    let (Some(transport), Some(endpoint)) = (
+        st.forward_transport.get(),
+        doc.get("endpoint").and_then(Value::as_str),
+    ) else {
+        return Ok(());
+    };
+    let target = doc.get("tenant").and_then(Value::as_str);
+    transport
+        .admit(tenant, endpoint, target)
+        .await
+        .map_err(crate::policy::Denied)
 }
 
 /// The request `federation::forward` built, as the HTTP client would send it: a
@@ -941,6 +979,13 @@ impl BuiltForward<'_> {
     #[must_use]
     pub fn registration_id(&self) -> &str {
         &self.reg.reg_id
+    }
+
+    /// Whether the registration is the `exclusive` or `redirect` kind
+    /// (9.3.3), whose single failure is the operation's answer (6.3.17).
+    #[must_use]
+    pub fn proxied(&self) -> bool {
+        self.reg.is_proxy()
     }
 
     /// The registration's 5.2.9 `tenant`: the Tenant the forward targets,

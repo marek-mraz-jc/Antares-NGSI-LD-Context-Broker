@@ -16,6 +16,7 @@
 - [OData endpoint of a view](odata.md)
 - [WebSocket notifications](websocket.md)
 - [Federation](federation.md)
+- [Internal context sources](internal-context-sources.md)
 - [Operations](operations.md)
 - [Browser & WebAssembly](wasm.md)
 
