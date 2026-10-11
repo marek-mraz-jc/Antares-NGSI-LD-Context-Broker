@@ -517,3 +517,46 @@ async fn a_resource_is_json_at_the_level_asked_and_xml_is_406() -> Result<(), St
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn a_write_on_the_documents_is_an_odata_405() -> Result<(), String> {
+    for (method, uri) in [
+        ("POST", "/odata/"),
+        ("PUT", "/odata/$metadata"),
+        ("DELETE", "/odata/$metadata"),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("OData-MaxVersion", "4.01")
+            .body(Body::empty())
+            .map_err(|e| e.to_string())?;
+        let response = app(state())
+            .oneshot(request)
+            .await
+            .map_err(|e| e.to_string())?;
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {uri}"
+        );
+        assert_eq!(response.headers()["allow"], "GET", "{method} {uri}");
+        assert_eq!(
+            response.headers()["odata-version"],
+            "4.01",
+            "{method} {uri}"
+        );
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| e.to_string())?
+            .to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains(r#""code":"MethodNotAllowed""#),
+            "{method} {uri}: {body}"
+        );
+    }
+    Ok(())
+}

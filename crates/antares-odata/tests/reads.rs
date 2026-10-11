@@ -430,7 +430,7 @@ async fn a_hidden_or_unknown_name_is_the_same_400() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_forms_of_later_rounds_are_501_and_writes_405() {
+async fn the_forms_of_later_rounds_are_501_and_read_only_writes_405() {
     let (_b, app) = broker().await.expect("broker");
     for uri in [
         "Car?$filter=not%20(speed%20gt%201)",
@@ -461,6 +461,20 @@ async fn the_forms_of_later_rounds_are_501_and_writes_405() {
     .await;
     assert_eq!(got.status, StatusCode::OK, "{}", got.body);
     let got = send(&app, Method::POST, &format!("{ROOT}/Car"), Some("{}"), &[]).await;
+    assert_eq!(
+        got.status,
+        StatusCode::NOT_IMPLEMENTED,
+        "writes are T-3509's: {}",
+        got.body
+    );
+    let got = send(
+        &app,
+        Method::POST,
+        &format!("{ROOT}/Car/$count"),
+        Some("{}"),
+        &[],
+    )
+    .await;
     assert_eq!(got.status, StatusCode::METHOD_NOT_ALLOWED, "{}", got.body);
     assert_eq!(got.headers["allow"], "GET");
     let got = send(

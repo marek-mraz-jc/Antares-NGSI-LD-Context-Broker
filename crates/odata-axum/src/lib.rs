@@ -299,8 +299,8 @@ pub fn url_error(error: &UrlError, path_len: usize) -> ODataErrorResponse {
 /// ```
 pub fn metadata_router(state: Arc<ODataState>) -> Router {
     Router::new()
-        .route("/", get(service_document))
-        .route("/$metadata", get(metadata))
+        .route("/", get(service_document).fallback(written))
+        .route("/$metadata", get(metadata).fallback(written))
         .with_state(state)
 }
 
@@ -416,6 +416,34 @@ fn json_type(version: ODataVersion, level: MetadataLevel) -> &'static str {
         (ODataVersion::V4_01, MetadataLevel::Minimal) => "application/json;metadata=minimal",
         (ODataVersion::V4_01, MetadataLevel::Full) => "application/json;metadata=full",
     }
+}
+
+async fn written(request: ODataRequest) -> Response {
+    read_only(request.version)
+}
+
+/// `405 MethodNotAllowed` with `Allow: GET`: a write method on a resource
+/// that is only read (the service and metadata documents, Protocol 11.1;
+/// `/$count`).
+///
+/// ```
+/// let answer = odata_axum::read_only(odata_json::ODataVersion::V4_01);
+/// assert_eq!(answer.status(), 405);
+/// assert_eq!(answer.headers()["allow"], "GET");
+/// ```
+#[must_use]
+pub fn read_only(version: ODataVersion) -> Response {
+    let mut answer = ODataErrorResponse::new(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "MethodNotAllowed",
+        "this resource is read only",
+    )
+    .with_version(version)
+    .into_response();
+    answer
+        .headers_mut()
+        .insert(axum::http::header::ALLOW, HeaderValue::from_static("GET"));
+    answer
 }
 
 fn not_acceptable() -> ODataErrorResponse {

@@ -43,7 +43,7 @@ pub(crate) async fn serve(
 ) -> Response {
     let version = request.version;
     if method != Method::GET {
-        return not_allowed(version);
+        return written(method, &request.uri, version);
     }
     let level = match json_level(request, headers, reads.state.max_header_len) {
         Ok(level) => level,
@@ -376,7 +376,12 @@ async fn run(
         .await
         .map_err(|refusal: Refusal| refused(refusal.status(), version))?;
     if answer.status() == StatusCode::NOT_FOUND {
-        return Err(not_found(version));
+        // A query answers 404 for a Tenant that holds nothing yet (5.5.10);
+        // its EntitySet is empty.
+        return match op {
+            OperationId::QueryEntities => Ok((Vec::new(), 0)),
+            _ => Err(not_found(version)),
+        };
     }
     if !answer.status().is_success() {
         return Err(refused(answer.status(), version));
@@ -586,19 +591,24 @@ fn not_implemented(version: ODataVersion) -> ODataErrorResponse {
     .with_version(version)
 }
 
-fn not_allowed(version: ODataVersion) -> Response {
-    let mut answer = ODataErrorResponse::new(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "MethodNotAllowed",
-        "this resource is read only",
-    )
-    .with_version(version)
-    .into_response();
-    answer.headers_mut().insert(
-        axum::http::header::ALLOW,
-        axum::http::HeaderValue::from_static("GET"),
-    );
-    answer
+/// A write method this round does not serve: `405` on what is only read
+/// (matrix `odata_write_readonly`, `odata_delete_collection`), `501` for
+/// every other form until writes are served (T-3509).
+fn written(method: &Method, uri: &ODataUri, version: ODataVersion) -> Response {
+    let read_only = match uri {
+        ODataUri::Resource { path, .. } => match path.as_slice() {
+            [Segment::EntitySet(_), Segment::Count] => true,
+            [Segment::EntitySet(_), Segment::Query] => method != Method::POST,
+            [Segment::EntitySet(_)] => method == Method::DELETE,
+            _ => false,
+        },
+        _ => false,
+    };
+    if read_only {
+        odata_axum::read_only(version)
+    } else {
+        not_implemented(version).into_response()
+    }
 }
 
 #[cfg(test)]
