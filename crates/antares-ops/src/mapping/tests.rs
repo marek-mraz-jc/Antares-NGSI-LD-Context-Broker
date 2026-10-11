@@ -1000,6 +1000,13 @@ fn retrieve_attribute_value_reads_a_source_attribute_and_rebuilds_it() {
         attribute,
         json!({ "@context": antares_jsonld::CORE_CONTEXT, "type": "Property", "value": "low" })
     );
+    let mut plain = json!({ "type": "Property", "value": "nizka" });
+    m.rebuild_attribute(i, &mut plain);
+    assert_eq!(
+        plain,
+        json!({ "type": "Property", "value": "low" }),
+        "a JSON answer gets no @context"
+    );
     let mut untouched = json!({ "type": "Property", "value": 1 });
     m.rebuild_attribute(99, &mut untouched);
     assert_eq!(
@@ -1179,4 +1186,69 @@ fn a_refusal_in_the_inner_terms_is_reworded_into_the_target_model() {
         "AirQualityObserved has no attribute temperature or an attribute",
         "an input only an expression reads has no target name of its own"
     );
+}
+
+#[test]
+fn what_two_slots_or_two_literals_share_is_asked_once() {
+    let m = mapping();
+    let inv = m
+        .invert(&pairs(&[("attrs", "label,reliability,pm25,pm25")]))
+        .unwrap_or_else(|e| unreachable!("{e}"));
+    let asked = format!(
+        "{},{},{}",
+        term(&m, "nazov"),
+        term(&m, "spolahlivost"),
+        term(&m, "pm2p5")
+    );
+    assert_eq!(inv.pairs, [("attrs".to_owned(), asked)]);
+    let twice = computed(&json!([slot_of(
+        "double",
+        &json!({ "binary": "+", "left": { "slot": "a" }, "right": { "slot": "a" } })
+    )]));
+    let inv = twice
+        .invert(&pairs(&[("attrs", "double")]))
+        .unwrap_or_else(|e| unreachable!("{e}"));
+    assert_eq!(inv.pairs, [("attrs".to_owned(), term(&twice, "a"))]);
+    assert_eq!(
+        sent(&m, "reliability==\"high\",\"high\""),
+        Ok("spolahlivost==\"vysoka\",\"high\"".to_owned())
+    );
+}
+
+#[test]
+fn a_number_or_a_boolean_literal_inverts_through_a_table_by_its_text() {
+    let m = slots(
+        &json!([{ "target": "level", "source": "l", "kind": "valueMappings",
+        "forward": { "1": 7, "on": true }, "filterable": true }]),
+    );
+    assert_eq!(sent(&m, "level==7"), Ok("l==1,7".to_owned()));
+    assert_eq!(sent(&m, "level==true"), Ok("l==\"on\",true".to_owned()));
+}
+
+#[test]
+fn a_junction_decides_on_every_operand() {
+    let k = |v: Value| json!({ "const": v });
+    evaluates(&[
+        (
+            "and",
+            json!({ "boolean": "and", "operands": [k(json!(false)), k(json!(true))] }),
+            json!(false),
+        ),
+        (
+            "or",
+            json!({ "boolean": "or", "operands": [k(json!(true)), k(json!(false))] }),
+            json!(true),
+        ),
+    ]);
+}
+
+#[test]
+fn an_inverse_too_large_to_round_is_kept_as_it_is() {
+    let m = slots(
+        &json!([{ "target": "t", "source": "s", "kind": "unitConversion",
+        "factor": 1e-300, "filterable": true }]),
+    );
+    let q = sent(&m, "t==1").unwrap_or_default();
+    let n: f64 = q.trim_start_matches("s==").parse().unwrap_or_default();
+    assert!((n - 1.0 / 1e-300).abs() <= 1e284, "{q}: not rounded away");
 }

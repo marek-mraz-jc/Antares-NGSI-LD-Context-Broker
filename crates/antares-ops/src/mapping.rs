@@ -538,13 +538,12 @@ impl Mapping {
                 .map(|n| self.invert_node(n))
                 .collect::<Result<_, _>>()
                 .map(QNode::Or),
-            QNode::Exists { path, negated } => {
-                let (path, slot) = self.source_path(path)?;
-                match slot.derivation {
-                    Derivation::Constant(_) | Derivation::Expr(_) => Err(NOT_FILTERABLE),
-                    _ => Ok(QNode::Exists { path, negated }),
-                }
-            }
+            // a constant or a computed slot has no source: `source_path`
+            // refuses it
+            QNode::Exists { path, negated } => Ok(QNode::Exists {
+                path: self.source_path(path)?.0,
+                negated,
+            }),
             QNode::Cmp { path, op, value } => {
                 let deep =
                     !path.path.get(1..).unwrap_or_default().is_empty() || path.bracket.is_some();
@@ -877,7 +876,7 @@ fn invert_comparison(
             };
             let mut sources: Vec<QValue> = Vec::new();
             for target in asked {
-                let text = scalar_text(&target).ok_or(NOT_COMPARABLE)?;
+                let text = scalar_text(&target);
                 let mut add = |v: QValue| {
                     if !sources.contains(&v) {
                         sources.push(v);
@@ -940,11 +939,12 @@ fn source_value(key: &str) -> QValue {
     }
 }
 
-fn scalar_text(v: &QValue) -> Option<String> {
+/// A scalar of a `q` (4.9 lists hold scalars only) as the text a table is
+/// keyed by.
+fn scalar_text(v: &QValue) -> String {
     match v {
-        QValue::Str(s) => Some(s.clone()),
-        QValue::Num(_) | QValue::Bool(_) => Some(v.to_string()),
-        QValue::List(_) | QValue::Range(..) => None,
+        QValue::Str(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -984,12 +984,13 @@ fn map_value(attribute: &Value, transform: &dyn Fn(&Value) -> Value) -> Value {
         Value::Array(instances) if instances.iter().all(Value::is_object) => {
             Value::Array(instances.iter().map(|i| map_value(i, transform)).collect())
         }
-        Value::Object(m) => match ["value", "object"].into_iter().find(|k| m.contains_key(*k)) {
-            Some(key) => {
+        Value::Object(m) => match ["value", "object"]
+            .into_iter()
+            .find_map(|k| m.get(k).map(|v| (k, v)))
+        {
+            Some((key, v)) => {
                 let mut out = m.clone();
-                if let Some(v) = m.get(key) {
-                    out.insert(key.to_owned(), transform(v));
-                }
+                out.insert(key.to_owned(), transform(v));
                 Value::Object(out)
             }
             // a geometry or a language map in the simplified form: no
@@ -1142,10 +1143,9 @@ fn slot(index: usize, entry: &Value, iri: Expand<'_>) -> Result<RawSlot, String>
                 None => 0.0,
                 Some(o) => o.as_f64().ok_or_else(|| at("an offset is a number"))?,
             };
-            if factor == 0.0 || !factor.is_finite() || !offset.is_finite() {
-                return Err(at(
-                    "a unit conversion has a finite, non-zero factor and a finite offset",
-                ));
+            // a JSON number is finite: zero is the one factor with no inverse
+            if factor == 0.0 {
+                return Err(at("a unit conversion has a non-zero factor"));
             }
             Derivation::UnitConversion { factor, offset }
         }

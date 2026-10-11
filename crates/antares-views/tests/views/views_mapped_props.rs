@@ -70,8 +70,8 @@ fn view(id: &str, mapping: Option<Value>) -> Value {
         "rules": [{"types": ["Car"], "q": "speed<80", "attributes": ["speed", "colour"]}],
         "operations": ["query_entities"]
     });
-    if let Some(m) = mapping {
-        v["mapping"] = m;
+    if let (Some(m), Some(o)) = (mapping, v.as_object_mut()) {
+        o.insert("mapping".into(), m);
     }
     v
 }
@@ -116,16 +116,20 @@ async fn case(cars: Vec<Car>, queries: Vec<String>) -> Result<(), TestCaseError>
     .await;
     prop_assert_eq!(a.status.as_u16(), 201, "{}", a.text);
     for (n, speed, colour, secret) in cars {
-        let mut car = json!({"id": format!("urn:ngsi-ld:Car:{n}"), "type": "Car"});
-        if let Some(s) = speed {
-            car["speed"] = prop(&json!(s));
+        let mut car = serde_json::Map::new();
+        car.insert("id".into(), json!(format!("urn:ngsi-ld:Car:{n}")));
+        car.insert("type".into(), json!("Car"));
+        let colour = colour.and_then(|c| COLOURS.get(c));
+        for (name, value) in [
+            ("speed", speed.map(|s| json!(s))),
+            ("colour", colour.map(|c| json!(c))),
+            ("secret", secret.map(|x| json!(x))),
+        ] {
+            if let Some(v) = value {
+                car.insert(name.into(), prop(&v));
+            }
         }
-        if let Some(c) = colour.and_then(|c| COLOURS.get(c)) {
-            car["colour"] = prop(&json!(c));
-        }
-        if let Some(x) = secret {
-            car["secret"] = prop(&json!(x));
-        }
+        let car = Value::Object(car);
         let a = send(
             &app,
             Method::POST,
@@ -164,44 +168,56 @@ async fn case(cars: Vec<Car>, queries: Vec<String>) -> Result<(), TestCaseError>
         let a = send(&app, Method::GET, &uri, &[], None).await;
         prop_assert_eq!(a.status.as_u16(), 200, "{}: {}", q, a.text);
         for e in a.json.as_array().into_iter().flatten() {
-            let id = e.get("id").and_then(Value::as_str).unwrap_or_default();
-            let Some(source) = served.get(id) else {
+            served_by_plain(&q, e, &served)?;
+        }
+    }
+    Ok(())
+}
+
+/// `e`, one Entity the mapped view answered for `q`, is one the plain view
+/// serves, with no value the plain view does not serve.
+fn served_by_plain(
+    q: &str,
+    e: &Value,
+    served: &BTreeMap<String, Value>,
+) -> Result<(), TestCaseError> {
+    let id = e.get("id").and_then(Value::as_str).unwrap_or_default();
+    let Some(source) = served.get(id) else {
+        return Err(TestCaseError::fail(format!(
+            "{q}: {id} is not served by the plain view"
+        )));
+    };
+    for (name, value) in e.as_object().into_iter().flatten() {
+        let from = |attr: &str| source.pointer(&format!("/{attr}/value")).cloned();
+        match name.as_str() {
+            "id" | "type" => {}
+            "velocity" => {
+                let speed = from("speed").and_then(|v| v.as_f64());
+                prop_assert_eq!(
+                    value.pointer("/value").and_then(Value::as_f64),
+                    speed.map(|s| s * 2.0),
+                    "{}: {}",
+                    q,
+                    e
+                );
+            }
+            "paint" => {
+                let colour = from("colour");
+                let want = match colour.as_ref().and_then(Value::as_str) {
+                    Some("red") => Some(json!("rot")),
+                    Some("blue") => Some(json!("blau")),
+                    _ => colour,
+                };
+                prop_assert_eq!(value.pointer("/value").cloned(), want, "{}: {}", q, e);
+            }
+            other => {
                 return Err(TestCaseError::fail(format!(
-                    "{q}: {id} is not served by the plain view"
-                )));
-            };
-            for (name, value) in e.as_object().into_iter().flatten() {
-                let from = |attr: &str| source.pointer(&format!("/{attr}/value")).cloned();
-                match name.as_str() {
-                    "id" | "type" => {}
-                    "velocity" => {
-                        let speed = from("speed").and_then(|v| v.as_f64());
-                        prop_assert_eq!(
-                            value.pointer("/value").and_then(Value::as_f64),
-                            speed.map(|s| s * 2.0),
-                            "{}: {}",
-                            q,
-                            e
-                        );
-                    }
-                    "paint" => {
-                        let colour = from("colour");
-                        let want = match colour.as_ref().and_then(Value::as_str) {
-                            Some("red") => Some(json!("rot")),
-                            Some("blue") => Some(json!("blau")),
-                            _ => colour,
-                        };
-                        prop_assert_eq!(value.pointer("/value").cloned(), want, "{}: {}", q, e);
-                    }
-                    other => {
-                        return Err(TestCaseError::fail(format!(
-                            "{q}: {other} is no value the plain view serves: {e}"
-                        )))
-                    }
-                }
+                    "{q}: {other} is no value the plain view serves: {e}"
+                )))
             }
         }
     }
+
     Ok(())
 }
 

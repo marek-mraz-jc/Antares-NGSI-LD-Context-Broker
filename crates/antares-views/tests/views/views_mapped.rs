@@ -32,10 +32,10 @@ pub fn vehicles_view() -> Value {
     })
 }
 
-async fn vehicles() -> Fixture {
-    let f = fixture().await.expect("fixture");
-    put_view(&f.app, &vehicles_view()).await.expect("vehicles");
-    f
+async fn vehicles() -> Result<Fixture, String> {
+    let f = fixture().await?;
+    put_view(&f.app, &vehicles_view()).await?;
+    Ok(f)
 }
 
 /// No answer of a mapped view names a source Attribute or the view's
@@ -47,8 +47,8 @@ fn speaks_the_target_model(a: &Answer) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_query_answers_in_the_target_model_what_the_view_serves() {
-    let f = vehicles().await;
+async fn a_query_answers_in_the_target_model_what_the_view_serves() -> Result<(), String> {
+    let f = vehicles().await?;
     let a = get(&f.app, &format!("{ROOT}/entities?type=Vehicle")).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.text);
     assert_eq!(
@@ -70,11 +70,12 @@ async fn a_query_answers_in_the_target_model_what_the_view_serves() {
         "`hidden` reads `secret`, which the view does not show: it is absent"
     );
     speaks_the_target_model(&a);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_filter_in_the_target_model_selects_in_the_source_model() {
-    let f = vehicles().await;
+async fn a_filter_in_the_target_model_selects_in_the_source_model() -> Result<(), String> {
+    let f = vehicles().await?;
     for (q, ids) in [
         ("velocity%3C50", vec!["urn:ngsi-ld:Car:1"]),
         ("velocity==100", vec!["urn:ngsi-ld:Car:2"]),
@@ -91,11 +92,12 @@ async fn a_filter_in_the_target_model_selects_in_the_source_model() {
         assert_eq!(a.status, StatusCode::OK, "{q}: {}", a.text);
         assert_eq!(a.ids(), ids, "{q}");
     }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn another_type_is_an_empty_answer_without_the_store() {
-    let f = vehicles().await;
+async fn another_type_is_an_empty_answer_without_the_store() -> Result<(), String> {
+    let f = vehicles().await?;
     for ty in ["Car", "Person", "Other"] {
         let a = get(&f.app, &format!("{ROOT}/entities?type={ty}&count=true")).await;
         assert_eq!(
@@ -135,11 +137,12 @@ async fn another_type_is_an_empty_answer_without_the_store() {
     )
     .await;
     assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.text);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn retrieve_entity_and_attribute_rebuild_and_keep_the_view() {
-    let f = vehicles().await;
+async fn retrieve_entity_and_attribute_rebuild_and_keep_the_view() -> Result<(), String> {
+    let f = vehicles().await?;
     let a = get(
         &f.app,
         &format!("{ROOT}/entities/urn:ngsi-ld:Car:2?attrs=label"),
@@ -183,11 +186,12 @@ async fn retrieve_entity_and_attribute_rebuild_and_keep_the_view() {
         .await;
         assert_eq!(a.status, StatusCode::BAD_REQUEST, "{computed}: {}", a.text);
     }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn every_representation_is_rebuilt_and_carries_the_views_context() {
-    let f = vehicles().await;
+async fn every_representation_is_rebuilt_and_carries_the_views_context() -> Result<(), String> {
+    let f = vehicles().await?;
     let uri = format!("{ROOT}/entities/urn:ngsi-ld:Car:1?pick=id,velocity,paint");
     let a = send(
         &f.app,
@@ -225,11 +229,12 @@ async fn every_representation_is_rebuilt_and_carries_the_views_context() {
         json!({"id": "urn:ngsi-ld:Car:1", "type": "Vehicle", "velocity": 20.0}),
         "concise: a Property with nothing but its value is the value"
     );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ordering_and_paging_follow_the_source_model() {
-    let f = vehicles().await;
+async fn ordering_and_paging_follow_the_source_model() -> Result<(), String> {
+    let f = vehicles().await?;
     let a = get(
         &f.app,
         &format!("{ROOT}/entities?type=Vehicle&orderBy=velocity;desc&limit=1&count=true"),
@@ -247,11 +252,13 @@ async fn ordering_and_paging_follow_the_source_model() {
         next.starts_with("/x/views/vehicles/ngsi-ld/v1/entities?"),
         "{next}"
     );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn what_a_mapped_view_does_not_serve_is_refused_without_naming_the_source() {
-    let f = vehicles().await;
+async fn what_a_mapped_view_does_not_serve_is_refused_without_naming_the_source(
+) -> Result<(), String> {
+    let f = vehicles().await?;
     for (uri, headers, status) in [
         (
             format!("{ROOT}/entities?type=Vehicle&q=speed%3C5"),
@@ -331,11 +338,12 @@ async fn what_a_mapped_view_does_not_serve_is_refused_without_naming_the_source(
         a.text
     );
     assert_eq!(a.header("allow").as_deref(), Some("GET, HEAD"));
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_head_request_answers_without_a_body() {
-    let f = vehicles().await;
+async fn a_head_request_answers_without_a_body() -> Result<(), String> {
+    let f = vehicles().await?;
     let a = send(
         &f.app,
         Method::HEAD,
@@ -345,4 +353,5 @@ async fn a_head_request_answers_without_a_body() {
     )
     .await;
     assert_eq!((a.status, a.text.as_str()), (StatusCode::OK, ""));
+    Ok(())
 }

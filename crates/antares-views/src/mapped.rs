@@ -44,9 +44,10 @@ pub(crate) async fn serve(
     {
         return Err(Refusal::Malformed(NO_GEOJSON));
     }
+    // `serve` refused a query that is no form encoding before it got here
     let pairs = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(&parts.uri)
         .map(|q| q.0)
-        .map_err(|_| Refusal::Malformed(antares_ops::mapping::NOT_SERVED))?;
+        .unwrap_or_default();
     let inverted = mapping.invert(&pairs).map_err(Refusal::Malformed)?;
     if inverted.selects_nothing {
         return if op == OperationId::QueryEntities {
