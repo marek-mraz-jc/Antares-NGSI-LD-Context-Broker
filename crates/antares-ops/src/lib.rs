@@ -131,6 +131,10 @@ pub struct Visible {
     rules: Vec<(BTreeSet<String>, BTreeSet<String>)>,
     /// Attributes removed per type, on top of the rules.
     omit_by_type: BTreeMap<String, BTreeSet<String>>,
+    /// A filter without rules narrows by none (a `*` view, ADR-0023 rule
+    /// 12): every type, and every Attribute its `pick` keeps and its `omit`
+    /// does not remove, as those two sets.
+    every: Option<(BTreeSet<String>, BTreeSet<String>)>,
 }
 
 impl Visible {
@@ -143,7 +147,7 @@ impl Visible {
     #[must_use]
     pub fn shows_type(&self, name: &str) -> bool {
         let ty = expand(name);
-        self.rules.iter().any(|(types, _)| types.contains(&ty))
+        self.every.is_some() || self.rules.iter().any(|(types, _)| types.contains(&ty))
     }
 
     /// Whether an Entity of type `ty` may show Attribute `attr`.
@@ -158,15 +162,18 @@ impl Visible {
             .omit_by_type
             .get(&ty)
             .is_some_and(|gone| gone.contains(&attr))
-            && self
+            && (self.every.as_ref().is_some_and(|(pick, omit)| {
+                (pick.is_empty() || pick.contains(&attr)) && !omit.contains(&attr)
+            }) || self
                 .rules
                 .iter()
-                .any(|(types, attrs)| types.contains(&ty) && attrs.contains(&attr))
+                .any(|(types, attrs)| types.contains(&ty) && attrs.contains(&attr)))
     }
 
     /// What `filter`'s rules show: each rule's types with its Attributes,
-    /// less what `pick` leaves out and `omit` and `omit_by_type` remove. A
-    /// rule's condition is not read: it decides which Entities show the
+    /// less what `pick` leaves out and `omit` and `omit_by_type` remove; a
+    /// filter without rules shows every type and Attribute, less the same.
+    /// A rule's condition is not read: it decides which Entities show the
     /// Attributes, not which Attributes there are.
     ///
     /// ```
@@ -202,9 +209,11 @@ impl Visible {
             .iter()
             .map(|(t, attrs)| (expand(t), set(attrs)))
             .collect();
+        let every = filter.rules.is_empty().then_some((pick, omit));
         Self {
             rules,
             omit_by_type,
+            every,
         }
     }
 }
@@ -1132,6 +1141,33 @@ mod tests {
             "https://uri.etsi.org/ngsi-ld/default-context/Car",
             "https://uri.etsi.org/ngsi-ld/location"
         ));
+    }
+
+    /// A `*` view (ADR-0023 rule 12) narrows by no rule: every type and
+    /// Attribute shows, less `pick`, `omit` and `omit_by_type`; the
+    /// default still shows nothing.
+    #[test]
+    fn a_filter_without_rules_shows_every_name_less_pick_and_omit() {
+        let iri = |n: &str| format!("https://e.org/{n}");
+        let open = Visible::from_filter(&policy::Filter::default());
+        assert!(open.shows_type(&iri("Tram")));
+        assert!(open.shows_attribute(&iri("Tram"), &iri("speed")));
+        let narrowed = Visible::from_filter(&policy::Filter {
+            pick: vec![iri("speed"), iri("vin")],
+            omit: vec![iri("vin")],
+            omit_by_type: BTreeMap::from([(iri("Bus"), vec![iri("speed")])]),
+            ..policy::Filter::default()
+        });
+        assert_eq!(
+            [
+                narrowed.shows_attribute(&iri("Car"), &iri("speed")),
+                narrowed.shows_attribute(&iri("Car"), &iri("vin")),
+                narrowed.shows_attribute(&iri("Car"), &iri("colour")),
+                narrowed.shows_attribute(&iri("Bus"), &iri("speed")),
+            ],
+            [true, false, false, false]
+        );
+        assert!(!Visible::default().shows_type(&iri("Car")));
     }
 
     #[test]

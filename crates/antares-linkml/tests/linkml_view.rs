@@ -293,7 +293,7 @@ async fn linkml_errors_carry_no_hidden_name() {
     let denied = broker(Some(Arc::new(DenyAll)), &view(&READS), Some(&schema()))
         .await
         .expect("a broker");
-    let (s, _, body) = get(&denied, "classes/Car").await;
+    let (s, _, body) = get(&denied, "schema/index.json").await;
     assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
     assert_no_hidden_name("a denial", &body);
 }
@@ -469,8 +469,11 @@ impl PolicyEngine for NotCarNotSpeed {
     }
 }
 
+/// LK1: the engine is asked about the class or slot named, and its
+/// refusal answers byte for byte as a name the schema lacks, so a 403
+/// never tells a hidden name is there.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_class_or_slot_request_names_it_to_the_engine() {
+async fn linkml_a_denied_class_or_slot_is_the_404_of_an_absent_one() {
     let app = broker(
         Some(Arc::new(NotCarNotSpeed)),
         &view(&READS),
@@ -478,12 +481,21 @@ async fn a_class_or_slot_request_names_it_to_the_engine() {
     )
     .await
     .expect("a broker");
-    assert_eq!(get(&app, "classes/Car").await.0, StatusCode::FORBIDDEN);
-    assert_eq!(get(&app, "slots/speed").await.0, StatusCode::FORBIDDEN);
+    for (denied, absent) in [
+        ("classes/Car", "classes/Nothing"),
+        ("slots/speed", "slots/nothing"),
+    ] {
+        let (s, _, body) = get(&app, denied).await;
+        let (t, _, other) = get(&app, absent).await;
+        assert_eq!(
+            (s, t),
+            (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND),
+            "{denied}"
+        );
+        assert_eq!(body, other, "{denied} answers as {absent}");
+    }
     assert_eq!(get(&app, "slots/fuel").await.0, StatusCode::OK);
     assert_eq!(get(&app, "schema/index.json").await.0, StatusCode::OK);
-    // A name the schema lacks never reaches the engine: the same 404.
-    assert_eq!(get(&app, "classes/Nothing").await.0, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -504,4 +516,38 @@ async fn model_answers_the_formalism_accept_names() {
         assert_eq!(s, StatusCode::OK, "{accept}");
         assert_eq!(h[header::CONTENT_TYPE], media_type, "{accept}");
     }
+}
+
+/// ADR-0023 rule 12: a `*` view narrows by no rule, so its LinkML surface
+/// serves every class and slot of the schema, as its NGSI-LD surface
+/// serves every type and Attribute.
+#[tokio::test(flavor = "multi_thread")]
+async fn linkml_a_view_of_everything_serves_every_class_and_slot() {
+    let all = json!({
+      "id": "cars", "tenant": "city", "selector": ["*"],
+      "rules": [{"types": ["*"], "attributes": ["*"]}],
+      "operations": READS
+    });
+    let app = broker(None, &all, Some(&schema())).await.expect("a broker");
+    let (s, _, car) = get(&app, "classes/Car").await;
+    assert_eq!(s, StatusCode::OK, "{car}");
+    let car: Value = serde_json::from_str(&car).expect("json");
+    let slots: Vec<&str> = car["slots"]
+        .as_array()
+        .expect("slots")
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert_eq!(slots, ["speed", "owner", "fuel", "owner_secret"]);
+    for path in ["classes/Person", "slots/name", "slots/owner_secret"] {
+        assert_eq!(get(&app, path).await.0, StatusCode::OK, "{path}");
+    }
+    let (s, _, index) = get(&app, "schema/index.json").await;
+    let index: Value = serde_json::from_str(&index).expect("json");
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        index["models"][0].get("redacted"),
+        None,
+        "nothing is left out"
+    );
 }
