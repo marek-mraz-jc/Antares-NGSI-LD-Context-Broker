@@ -117,10 +117,10 @@ and T-3725, which answers a literal of another type than its property 400 (secti
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| Minimal | 165 | 104 | 24 | 61.3 % |
-| Intermediate | 222 | 114 | 14 | 66.1 % |
-| Advanced | 159 | 345 | 63 | 31.5 % |
-| **All** (suite summary) | 546 | 563 | 101 | 49.2 % |
+| Minimal | 166 | 103 | 24 | 61.7 % |
+| Intermediate | 224 | 112 | 14 | 66.7 % |
+| Advanced | 162 | 342 | 63 | 32.1 % |
+| **All** (suite summary) | 552 | 557 | 101 | 49.8 % |
 
 Before T-3720 the baseline stood at 456 passed, 660 failed and 94 skipped
 (Minimal 57.8 %, Intermediate 49.4 %, Advanced 26.0 %).
