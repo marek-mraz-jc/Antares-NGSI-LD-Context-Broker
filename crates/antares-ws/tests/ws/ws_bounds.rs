@@ -172,6 +172,7 @@ async fn ws_a_request_that_is_no_websocket_handshake_is_refused() -> Result<(), 
     for (headers, said) in [
         (vec![], "Upgrade: websocket"),
         (vec![upgrade[1]], "Upgrade: websocket"),
+        (vec![upgrade[0]], "Upgrade: websocket"),
         (
             vec![upgrade[0], upgrade[1], ("Sec-WebSocket-Version", "8"), key],
             "Version is 13",
