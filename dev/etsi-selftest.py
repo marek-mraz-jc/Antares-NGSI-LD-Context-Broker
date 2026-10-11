@@ -142,9 +142,46 @@ def check_baseline():
     print("  baseline ok (flip and vanish fail, a new pass asks for a ratchet)")
 
 
+def check_compare():
+    """dev/etsi-baseline.py compare: a TP whose verdict differs between the
+    vanilla and the full run, or that ran in one only, fails and is named;
+    the same failure in both is not a difference; an empty run fails."""
+    with tempfile.TemporaryDirectory() as tmp:
+
+        def run(name, rows):
+            d = f"{tmp}/{name}"
+            os.makedirs(d, exist_ok=True)
+            with open(f"{d}/tp-status.csv", "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["suite", "source", "test", "status"])
+                for key, status in rows:
+                    source, test = key.split("::")
+                    w.writerow(["IOP", source, test, status])
+            return d
+
+        def compare(a, b):
+            return subprocess.run([sys.executable, f"{HERE}/etsi-baseline.py", "compare", a, b],
+                                  capture_output=True, text=True)
+
+        one, two = "IOP_TP/a.robot::IOP_001 One", "IOP_TP/a.robot::IOP_002 Two"
+        vanilla = run("vanilla", [(one, "PASS"), (two, "FAIL")])
+        same = compare(vanilla, run("same", [(one, "PASS"), (two, "FAIL")]))
+        assert same.returncode == 0, same.stdout
+        flipped = compare(vanilla, run("flipped", [(one, "FAIL"), (two, "FAIL")]))
+        assert flipped.returncode != 0 and f"vanilla PASS, full FAIL: {one}" in flipped.stdout, flipped.stdout
+        gone = compare(vanilla, run("gone", [(two, "FAIL")]))
+        assert gone.returncode != 0 and f"vanilla PASS, full did not run: {one}" in gone.stdout, gone.stdout
+        empty = compare(vanilla, run("empty", []))
+        assert empty.returncode != 0 and "no TP ran" in empty.stdout, empty.stdout
+        missing = compare(vanilla, f"{tmp}/nowhere")
+        assert missing.returncode != 0, missing.stdout
+    print("  compare ok (a flip or a TP in one run only fails, a shared failure does not)")
+
+
 if __name__ == "__main__":
     print("etsi sampling self-check")
     check_proc_parsing()
     check_join()
     check_baseline()
+    check_compare()
     print("OK")

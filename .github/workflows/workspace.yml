@@ -435,6 +435,10 @@ jobs:
           - { package: antares-api, partition: 2/4 }
           - { package: antares-api, partition: 3/4 }
           - { package: antares-api, partition: 4/4 }
+          # ADR-0027 section 6 (T-3493): the stripped release binary per
+          # surface feature against vanilla; not a crate, so no clippy or
+          # test step runs for it.
+          - { package: binary-size }
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -452,11 +456,19 @@ jobs:
         if: matrix.package == 'workspace'
         run: cargo hack check --locked --workspace --exclude antares-wasm --each-feature --exclude-features console
       - name: Clippy with each feature alone
-        if: matrix.package != 'workspace'
+        if: matrix.package != 'workspace' && matrix.package != 'binary-size'
         run: cargo hack clippy --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }} --all-targets -- -D warnings
       - name: Tests with each feature alone
-        if: matrix.package != 'workspace'
+        if: matrix.package != 'workspace' && matrix.package != 'binary-size'
         run: cargo hack test --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }}
+      # The budget is ADR-0027 section 6's "binary size" row, read from the
+      # ADR (`full` <= vanilla + 6 MiB, each feature alone <= vanilla + 2 MiB,
+      # `mcp` <= vanilla + 4.5 MiB); the table goes to the step summary.
+      - name: Binary size per surface feature
+        if: matrix.package == 'binary-size'
+        run: |
+          python3 dev/surface-features.py --self-test
+          python3 dev/surface-features.py sizes
 
   coverage-surfaces:
     # Every new crate of the surfaces epic (metadata.antares.role ops,
