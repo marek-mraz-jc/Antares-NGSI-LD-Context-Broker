@@ -278,8 +278,9 @@ fn compile_rule(i: usize, r: &ViewRule, ctx: &Context) -> Result<Rule, String> {
         q: parse_q(&at("q"), r.q.as_deref())?.map(Box::new),
         scope_q: scope_q(&at("scopeQ"), r.scope_q.as_deref())?,
         geo_q: geo_q(&at("geoQ"), r.geo_q.as_ref())?.map(Box::new),
-        geo_also: Vec::new(),
         attributes,
+        // a view rule has one area and names no ids
+        ..Rule::default()
     })
 }
 
