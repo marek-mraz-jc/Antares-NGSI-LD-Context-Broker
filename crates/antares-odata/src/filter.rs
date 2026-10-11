@@ -13,9 +13,10 @@
 //! term `t{n}`, and the request carries the
 //! `@context` that defines them (`OpsRequest::context`).
 
-use crate::edm::{Set, Shape};
+use crate::edm::{Member, Set, Shape};
 use odata_url::{CompareOp, Expr, Literal, MemberPath, Method, OrderBy};
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 /// The broker's bound on a `q` (`antares_ql::MAX_Q_BYTES`): a longer
 /// translation is refused here with the OData error a bound gets.
@@ -47,20 +48,27 @@ pub(crate) struct Translated {
     pub(crate) order: Option<String>,
     /// The terms `q` and `orderBy` use, term to IRI.
     pub(crate) context: Map<String, Value>,
+    /// Whether `q` follows a Relationship (F24): the broker evaluates a
+    /// hop only under a `join` (5.7.2.4).
+    pub(crate) linked: bool,
 }
 
-/// Translates `filter` against the members of `set`, with the parameter
-/// aliases of the request bound.
+/// Translates `filter` against the members of `set` and, through a
+/// navigation, of the `sets` it targets, with the parameter aliases of the
+/// request bound.
 pub(crate) fn translate(
     filter: &Expr,
     set: &Set,
+    sets: &BTreeMap<String, Set>,
     aliases: &[(String, Literal)],
 ) -> Result<Translated, Refused> {
     let mut out = Translated::default();
     let mut terms = Terms {
         set,
+        sets,
         aliases,
         context: &mut out.context,
+        linked: false,
     };
     let mut conjuncts = Vec::new();
     for conjunct in conjuncts_of(filter) {
@@ -71,6 +79,7 @@ pub(crate) fn translate(
             None => conjuncts.push(format!("({})", terms.term(conjunct)?)),
         }
     }
+    out.linked = terms.linked;
     if !conjuncts.is_empty() {
         let q = conjuncts.join(";");
         if q.len() > MAX_Q_BYTES {
@@ -85,10 +94,14 @@ pub(crate) fn translate(
 /// a scalar Attribute; a member the model marks not sortable (C12) is 400,
 /// the base members and the other shapes are a later round's.
 pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Result<(), Refused> {
+    // `orderBy` names Attributes of the Entity itself: no navigation.
+    let sets = BTreeMap::new();
     let mut terms = Terms {
         set,
+        sets: &sets,
         aliases: &[],
         context: &mut out.context,
+        linked: false,
     };
     let mut keys = Vec::new();
     for item in items {
@@ -103,6 +116,7 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
             _ => None,
         };
         let key = match single {
+            None => return Err(Refused::Later),
             Some("id") => "id".to_owned(),
             Some(name) if set.members.get(name).is_some_and(|m| !m.shape.sortable()) => {
                 return Err(Refused::Bad)
@@ -165,11 +179,13 @@ fn literal<'a>(e: &'a Expr, aliases: &'a [(String, Literal)]) -> Result<&'a Lite
 
 struct Terms<'a> {
     set: &'a Set,
+    sets: &'a BTreeMap<String, Set>,
     aliases: &'a [(String, Literal)],
     context: &'a mut Map<String, Value>,
+    linked: bool,
 }
 
-impl Terms<'_> {
+impl<'a> Terms<'a> {
     /// One boolean expression as `q`.
     fn term(&mut self, e: &Expr) -> Result<String, Refused> {
         match e {
@@ -235,7 +251,7 @@ impl Terms<'_> {
         // URL 5.1.1.5: the string functions take a string; NGSI-LD would
         // match no other value without saying why.
         let string = matches!(member, Expr::Member(MemberPath { path, .. })
-            if path.first().and_then(|n| self.set.members.get(n)).is_some_and(|m| matches!(m.shape, Shape::Value { edm: "Edm.String", .. })));
+            if self.leaf(path).is_some_and(|(_, m)| matches!(m.shape, Shape::Value { edm: "Edm.String", .. })));
         if !string {
             return Err(Refused::Bad);
         }
@@ -249,9 +265,33 @@ impl Terms<'_> {
         Ok(format!("{name}{op}\"{pattern}\""))
     }
 
-    /// The term of a scalar member of the set: a single name, filterable,
-    /// not a collection (a collection's `eq` is membership in NGSI-LD and
-    /// not in OData, F22).
+    /// The member a path ends in, and the navigation it goes through: a
+    /// member of the set, or (F24) a member of the set a single-valued
+    /// navigation targets.
+    fn leaf(&self, path: &[String]) -> Option<(Option<(&'a Member, &'a Set)>, &'a Member)> {
+        match path {
+            [name] => Some((None, self.set.members.get(name)?)),
+            [nav, name] => {
+                let via = self.set.members.get(nav)?;
+                let Shape::Nav {
+                    target,
+                    collection: false,
+                } = &via.shape
+                else {
+                    return None;
+                };
+                let target = self.sets.get(target)?;
+                Some((Some((via, target)), target.members.get(name)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// The term of a scalar member: filterable, not a collection (a
+    /// collection's `eq` is membership in NGSI-LD and not in OData, F22),
+    /// of the set or one hop away. A hop is `rel{Type:attr}` (7.2.3.2
+    /// EXAMPLE 15); the broker resolves its target through the caller's
+    /// narrowing, a hidden one like a dangling link (T-3474, O26).
     fn scalar(&mut self, e: &Expr) -> Result<String, Refused> {
         let Expr::Member(MemberPath {
             variable: None,
@@ -260,13 +300,10 @@ impl Terms<'_> {
         else {
             return Err(Refused::Later);
         };
-        let [name] = path.as_slice() else {
-            // F20, F21, F24: paths are a later round's.
-            return Err(Refused::Later);
-        };
         // The base members (`id` outside a top-level conjunct, `scope`,
-        // `_types`, the system members) are F22, F28 and F33.
-        let member = self.set.members.get(name).ok_or(Refused::Later)?;
+        // `_types`, the system members), complex and annotation paths
+        // (F20, F21, F22, F28, F33) are a later round's.
+        let (via, member) = self.leaf(path).ok_or(Refused::Later)?;
         match &member.shape {
             // The same test the model's NonFilterableProperties and
             // NonSortableProperties are written from (C11, C12).
@@ -274,17 +311,30 @@ impl Terms<'_> {
             Shape::Json => return Err(Refused::Bad),
             _ => return Err(Refused::Later),
         }
-        let next = format!("t{}", self.context.len());
+        let attr = self.term_of(&member.iri);
+        Ok(match via {
+            None => attr,
+            Some((rel, target)) => {
+                self.linked = true;
+                let rel = self.term_of(&rel.iri);
+                let ty = self.term_of(&target.type_iri);
+                format!("{rel}{{{ty}:{attr}}}")
+            }
+        })
+    }
+
+    /// The term `t{n}` of an IRI, minted on first use.
+    fn term_of(&mut self, iri: &str) -> String {
         let found = self
             .context
             .iter()
-            .find(|(_, iri)| iri.as_str() == Some(member.iri.as_str()))
+            .find(|(_, defined)| defined.as_str() == Some(iri))
             .map(|(term, _)| term.clone());
-        Ok(found.unwrap_or_else(|| {
-            self.context
-                .insert(next.clone(), Value::from(member.iri.clone()));
+        found.unwrap_or_else(|| {
+            let next = format!("t{}", self.context.len());
+            self.context.insert(next.clone(), Value::from(iri));
             next
-        }))
+        })
     }
 }
 
@@ -392,7 +442,13 @@ mod tests {
     }
 
     fn q(e: &Expr) -> Result<String, Refused> {
-        translate(e, &set(), &[("a".into(), Literal::Int(3))]).map(|t| t.q.unwrap_or_default())
+        translate(
+            e,
+            &set(),
+            &BTreeMap::new(),
+            &[("a".into(), Literal::Int(3))],
+        )
+        .map(|t| t.q.unwrap_or_default())
     }
 
     #[test]
@@ -445,7 +501,7 @@ mod tests {
                 )),
             )),
         );
-        let t = translate(&e, &set(), &[]).unwrap_or_default();
+        let t = translate(&e, &set(), &BTreeMap::new(), &[]).unwrap_or_default();
         assert_eq!(t.q.as_deref(), Some(r#"(t0>1);((t1=="a\"b")|(t0<0.5))"#));
         assert_eq!(t.context.len(), 2);
         assert_eq!(t.context["t1"], "https://e.org/name");
@@ -480,6 +536,18 @@ mod tests {
             Err(Refused::Later)
         );
         assert_eq!(q(&m("on")), Ok("(t0==true)".into()));
+    }
+
+    #[test]
+    fn a_path_past_one_hop_is_later() {
+        let deep = Expr::Member(MemberPath {
+            variable: None,
+            path: vec!["nav".into(), "name".into(), "x".into()],
+        });
+        assert_eq!(
+            q(&cmp(deep, CompareOp::Eq, lit(Literal::Int(1)))),
+            Err(Refused::Later)
+        );
     }
 
     #[test]
@@ -520,7 +588,7 @@ mod tests {
     #[test]
     fn ids_are_a_top_level_conjunct() {
         let id = |l: &str| cmp(m("id"), CompareOp::Eq, lit(Literal::String(l.into())));
-        let t = translate(&id("urn:a"), &set(), &[]).unwrap_or_default();
+        let t = translate(&id("urn:a"), &set(), &BTreeMap::new(), &[]).unwrap_or_default();
         assert_eq!((t.q, t.ids), (None, Some(vec!["urn:a".to_owned()])));
         let mirrored = cmp(lit(Literal::String("urn:b".into())), CompareOp::Eq, m("id"));
         let both = Expr::And(
@@ -530,23 +598,32 @@ mod tests {
             )),
             Box::new(cmp(m("speed"), CompareOp::Gt, lit(Literal::Int(0)))),
         );
-        let t = translate(&both, &set(), &[]).unwrap_or_default();
+        let t = translate(&both, &set(), &BTreeMap::new(), &[]).unwrap_or_default();
         assert_eq!(
             (t.q.as_deref(), t.ids),
             (Some("(t0>0)"), Some(vec!["urn:a".to_owned()]))
         );
         let twice = Expr::And(Box::new(id("urn:a")), Box::new(mirrored));
-        assert_eq!(translate(&twice, &set(), &[]), Err(Refused::Later));
+        assert_eq!(
+            translate(&twice, &set(), &BTreeMap::new(), &[]),
+            Err(Refused::Later)
+        );
         let number = cmp(m("id"), CompareOp::Eq, lit(Literal::Int(1)));
-        assert_eq!(translate(&number, &set(), &[]), Err(Refused::Bad));
+        assert_eq!(
+            translate(&number, &set(), &BTreeMap::new(), &[]),
+            Err(Refused::Bad)
+        );
         let nested = Expr::Or(Box::new(id("urn:a")), Box::new(id("urn:b")));
         assert_eq!(
-            translate(&nested, &set(), &[]),
+            translate(&nested, &set(), &BTreeMap::new(), &[]),
             Err(Refused::Later),
             "F28: top level only"
         );
         let unbound = cmp(m("id"), CompareOp::Eq, Expr::Alias("x".into()));
-        assert_eq!(translate(&unbound, &set(), &[]), Err(Refused::Bad));
+        assert_eq!(
+            translate(&unbound, &set(), &BTreeMap::new(), &[]),
+            Err(Refused::Bad)
+        );
     }
 
     #[test]
@@ -634,6 +711,7 @@ mod tests {
         let mut t = translate(
             &cmp(m("name"), CompareOp::Eq, lit(Literal::Int(1))),
             &set(),
+            &BTreeMap::new(),
             &[],
         )
         .unwrap_or_default();
@@ -682,6 +760,9 @@ mod tests {
     fn a_translation_past_the_broker_bound_is_too_complex() {
         let long = "x".repeat(MAX_Q_BYTES);
         let e = cmp(m("name"), CompareOp::Eq, lit(Literal::String(long)));
-        assert_eq!(translate(&e, &set(), &[]), Err(Refused::TooComplex));
+        assert_eq!(
+            translate(&e, &set(), &BTreeMap::new(), &[]),
+            Err(Refused::TooComplex)
+        );
     }
 }

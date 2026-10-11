@@ -339,3 +339,52 @@ async fn odata_expand_stops_at_the_join_lookup_budget() {
         );
     }
 }
+
+fn ids(body: &Value) -> Vec<&str> {
+    let mut ids: Vec<&str> = body["value"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_filter_navigation_path_reads_hidden_targets_as_absent() {
+    let (_b, app) = city().await.expect("broker");
+    for (filter, want) in [
+        ("owner/name%20eq%20'Ann'", vec!["urn:ngsi-ld:Car:1"]),
+        ("contains(owner/name,'n')", vec!["urn:ngsi-ld:Car:1"]),
+        ("owner/name%20eq%20'Bob'", vec![]),
+        ("owner/name%20eq%20'Nobody'", vec![]),
+        (
+            "owner/name%20eq%20'Ann'%20and%20speed%20gt%200",
+            vec!["urn:ngsi-ld:Car:1"],
+        ),
+    ] {
+        let (status, body) = get(&app, &format!("Car?$filter={filter}")).await;
+        assert_eq!(status, StatusCode::OK, "{filter}: {body}");
+        assert_eq!(ids(&body), want, "{filter}: {body}");
+    }
+    let (status, body) = get(&app, "Car?$filter=owner/name%20ne%20'Ann'").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let others = ids(&body);
+    assert_eq!(
+        others.contains(&"urn:ngsi-ld:Car:2"),
+        others.contains(&"urn:ngsi-ld:Car:3"),
+        "the hidden owner of Car:2 answers like the absent one of Car:3: {body}"
+    );
+    for (path, want) in [
+        (
+            "Car?$filter=drivers/name%20eq%20'Ann'",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("Car?$orderby=owner/name", StatusCode::NOT_IMPLEMENTED),
+        ("Car?$filter=owner/pin%20eq%204711", StatusCode::BAD_REQUEST),
+    ] {
+        let (status, body) = get(&app, path).await;
+        assert_eq!(status, want, "{path}: {body}");
+    }
+}

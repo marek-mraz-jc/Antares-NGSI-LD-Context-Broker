@@ -226,7 +226,8 @@ fn listed(picked: Option<&[&str]>, expansions: &[Expansion], version: ODataVersi
 /// The NGSI-LD query of an EntitySet: its type, the Attributes selected
 /// (`attrs`, which takes IRIs; the core members always come, and the
 /// expanded Relationships), the system members only when selected (E6),
-/// `join=inline` one level deep for an expansion of entities. A join
+/// `join=inline` one level deep for an expansion of entities or a `q` that
+/// follows a Relationship (5.7.2.4). A join
 /// follows every Relationship it is given (4.5.23), so it names the
 /// structural members and the expanded ones: a navigation not expanded
 /// spends none of the walk's lookups.
@@ -240,9 +241,10 @@ fn query(
         Writes::Entities(picked) => Some(picked.as_deref()),
         Writes::Refs(_) => None,
     });
+    let joined = filter.linked || nested.clone().count() > 0;
     let structural: Vec<&str>;
     let picked = match picked {
-        None if nested.clone().count() > 0 => {
+        None if joined => {
             structural = set
                 .members
                 .iter()
@@ -286,7 +288,7 @@ fn query(
     if system(picked) || nested.clone().any(system) {
         q.push_str("&options=sysAttrs");
     }
-    if nested.count() > 0 {
+    if joined {
         q.push_str("&join=inline&joinLevel=1");
     }
     q
@@ -306,7 +308,7 @@ async fn collection(
     let picked = selected(set, options.select.as_ref()).map_err(|()| not_implemented(version))?;
     let expansions =
         expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
-    let filter = filtered(set, options, version)?;
+    let filter = filtered(set, &reads.edm.sets, options, version)?;
     let digest = digest(&reads.state.service_root, path, options);
     let (skip, top) = match &options.skiptoken {
         None => (options.skip.unwrap_or(0), options.top),
@@ -393,7 +395,7 @@ async fn count(
     version: ODataVersion,
 ) -> Result<Response, ODataErrorResponse> {
     let set = set_of(reads, set_name, version)?;
-    let filter = filtered(set, options, version)?;
+    let filter = filtered(set, &reads.edm.sets, options, version)?;
     let target = format!(
         "/ngsi-ld/v1/entities?{}&limit=0&count=true",
         query(set, None, &[], &filter)
@@ -475,6 +477,7 @@ async fn entity(
 /// `orderBy` (Q9), empty without them.
 fn filtered(
     set: &Set,
+    sets: &std::collections::BTreeMap<String, Set>,
     options: &QueryOptions,
     version: ODataVersion,
 ) -> Result<Translated, ODataErrorResponse> {
@@ -483,7 +486,7 @@ fn filtered(
         .as_ref()
         .map_or_else(
             || Ok(Translated::default()),
-            |f| translate(f, set, &options.aliases),
+            |f| translate(f, set, sets, &options.aliases),
         )
         .and_then(|mut t| match &options.orderby {
             Some(items) => order(items, set, &mut t).map(|()| t),
