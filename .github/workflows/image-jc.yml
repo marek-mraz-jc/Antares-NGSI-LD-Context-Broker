@@ -63,6 +63,15 @@ jobs:
             fi
           done
           exit $rc
+      # T-3834: the bytes that get pushed carry no HIGH or CRITICAL with a fixed version; an
+      # exception is a .trivyignore line with its reason, task and expiry.
+      - name: No fixable HIGH or CRITICAL in the image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: antares-local:latest
+          severity: "HIGH,CRITICAL"
+          ignore-unfixed: true
+          exit-code: "1"
       - run: docker save antares-local:latest | gzip > antares-image.tgz
       - uses: actions/upload-artifact@v6
         with:
