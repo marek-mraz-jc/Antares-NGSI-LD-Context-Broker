@@ -117,10 +117,10 @@ and T-3720, which keys a set by its LinkML identifier and serves `$entity`
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| Minimal | @M |
-| Intermediate | @I |
-| Advanced | @A |
-| **All** (suite summary) | @ALL |
+| Minimal | 165 | 104 | 24 | 61.3 % |
+| Intermediate | 222 | 114 | 14 | 66.1 % |
+| Advanced | 159 | 345 | 63 | 31.5 % |
+| **All** (suite summary) | 546 | 563 | 101 | 49.2 % |
 
 Before T-3720 the baseline stood at 456 passed, 660 failed and 94 skipped
 (Minimal 57.8 %, Intermediate 49.4 %, Advanced 26.0 %).
