@@ -32,6 +32,22 @@ fn get(id: &str, summary: &str, media: &str, parameters: &[Value]) -> Value {
     json!({"get": {"operationId": id, "summary": summary, "parameters": parameters, "responses": responses}})
 }
 
+/// The problem schema and the query parameters the operations name.
+fn components() -> Value {
+    json!({
+        "schemas": {"problem": {"type": "object", "properties": {"type": {"type": "string"}, "title": {"type": "string"}, "status": {"type": "integer"}, "detail": {"type": "string"}}}},
+        "parameters": {
+            "limit": {"name": "limit", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 10}},
+            "bbox": {"name": "bbox", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "array", "oneOf": [{"minItems": 4, "maxItems": 4}, {"minItems": 6, "maxItems": 6}], "items": {"type": "number"}}},
+            "datetime": {"name": "datetime", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "string"}},
+            "next": {"name": "next", "in": "query", "required": false, "description": "the token of a next link", "schema": {"type": "string"}},
+            "sortby": {"name": "sortby", "in": "query", "required": false, "style": "form", "explode": false, "description": "[+|-]name of the collection's sortables", "schema": {"type": "array", "items": {"type": "string"}}},
+            "properties": {"name": "properties", "in": "query", "required": false, "style": "form", "explode": false, "description": "the properties of the collection's schema to return", "schema": {"type": "array", "items": {"type": "string"}}},
+            "profile": {"name": "profile", "in": "query", "required": false, "style": "form", "explode": false, "description": "how references are written", "schema": {"type": "string", "enum": ["rel-as-key", "rel-as-uri", "rel-as-link"]}},
+        },
+    })
+}
+
 /// The document for the endpoint at `base` serving `collections`.
 pub(crate) fn document(base: &str, collections: &BTreeMap<String, Collection>) -> Value {
     let mut paths = Map::new();
@@ -66,9 +82,14 @@ pub(crate) fn document(base: &str, collections: &BTreeMap<String, Collection>) -
         json!({"$ref": "#/components/parameters/bbox"}),
         json!({"$ref": "#/components/parameters/datetime"}),
         json!({"$ref": "#/components/parameters/next"}),
+        json!({"$ref": "#/components/parameters/sortby"}),
+        json!({"$ref": "#/components/parameters/properties"}),
+        json!({"$ref": "#/components/parameters/profile"}),
     ];
     let feature_id = [
         json!({"name": "featureId", "in": "path", "required": true, "schema": {"type": "string"}}),
+        json!({"$ref": "#/components/parameters/properties"}),
+        json!({"$ref": "#/components/parameters/profile"}),
     ];
     for c in collections.values() {
         let at = format!("/collections/{}", c.id);
@@ -81,6 +102,20 @@ pub(crate) fn document(base: &str, collections: &BTreeMap<String, Collection>) -
                 &[],
             ),
         );
+        for (which, summary) in [
+            ("schema", "the schema of its Features"),
+            ("sortables", "the properties sortby may name"),
+        ] {
+            paths.insert(
+                format!("{at}/{which}"),
+                get(
+                    &format!("{which}-{}", c.id),
+                    summary,
+                    "application/schema+json",
+                    &[],
+                ),
+            );
+        }
         paths.insert(
             format!("{at}/items"),
             get(
@@ -105,15 +140,7 @@ pub(crate) fn document(base: &str, collections: &BTreeMap<String, Collection>) -
         "info": {"title": "OGC API - Features", "version": "1.0.0"},
         "servers": [{"url": base}],
         "paths": paths,
-        "components": {
-            "schemas": {"problem": {"type": "object", "properties": {"type": {"type": "string"}, "title": {"type": "string"}, "status": {"type": "integer"}, "detail": {"type": "string"}}}},
-            "parameters": {
-                "limit": {"name": "limit", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 10}},
-                "bbox": {"name": "bbox", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "array", "oneOf": [{"minItems": 4, "maxItems": 4}, {"minItems": 6, "maxItems": 6}], "items": {"type": "number"}}},
-                "datetime": {"name": "datetime", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "string"}},
-                "next": {"name": "next", "in": "query", "required": false, "description": "the token of a next link", "schema": {"type": "string"}},
-            },
-        },
+        "components": components(),
     })
 }
 
@@ -147,6 +174,8 @@ mod tests {
                 "/collections/Car",
                 "/collections/Car/items",
                 "/collections/Car/items/{featureId}",
+                "/collections/Car/schema",
+                "/collections/Car/sortables",
                 "/conformance"
             ]
         );

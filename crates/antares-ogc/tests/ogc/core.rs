@@ -100,6 +100,12 @@ async fn unknown_and_invalid_parameters_are_400() -> Result<(), String> {
         format!("{ROOT}/collections/Car/items?datetime=yesterday"),
         format!("{ROOT}/collections/Car/items?limit=1&limit=2"),
         format!("{ROOT}/collections/Car/items?next=garbage"),
+        format!("{ROOT}/collections/Car/schema?f=json"),
+        format!("{ROOT}/collections/Car/sortables?limit=1"),
+        format!("{ROOT}/collections/Car/items/urn:ngsi-ld:Car:1?sortby=speed"),
+        format!("{ROOT}/collections/Car/items?sortby=wheels"),
+        format!("{ROOT}/collections/Car/items?properties=wheels"),
+        format!("{ROOT}/collections/Car/items?profile=rel-as-none"),
     ] {
         let a = get(&f.app, &uri).await;
         assert_eq!(a.status, StatusCode::BAD_REQUEST, "{uri}: {}", a.body);

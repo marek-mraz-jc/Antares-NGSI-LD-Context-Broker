@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! The OGC API - Features surface of a view (`docs/analysis/ogc-features-mapping.md`,
 //! ADR-0029, T-3744): `/x/views/{view}/ogc/features` serves the view's Entities as Features
-//! of OGC API - Features Part 1 Core with `GeoJSON` and `OpenAPI` 3.0. A collection is a class
+//! of OGC API - Features Part 1 Core with `GeoJSON` and `OpenAPI` 3.0, and the Part 5 draft's
+//! schemas, sortables and feature references (`schema.rs`, T-3754). A collection is a class
 //! of the Tenant's `LinkML` schema whose type the view shows (`model.rs`); its Features are the
-//! Entities a Query Entities or Retrieve Entity through the view returns for the caller, so
-//! the operation's own gate fires and the view narrows the answer as on the NGSI-LD view root.
+//! Entities a Query Entities through the view returns for the caller, so the operation's own
+//! gate fires and the view narrows the answer as on the NGSI-LD view root.
 //!
 //! A view whose Tenant has no schema, or one this surface cannot read, has no OGC endpoint:
 //! every path answers 404 as an unknown view does, as the `OData` surface does.
@@ -21,6 +22,7 @@
 mod api;
 mod items;
 mod model;
+mod schema;
 
 use antares_ops::{Caller, Ops, Surface, ViewOps};
 use axum::extract::{Query, Request};
@@ -43,16 +45,25 @@ pub const SCHEMA_LIMITS: linkml_model::Limits = linkml_model::Limits {
     max_elements: 100_000,
 };
 
-/// The conformance classes `/conformance` declares (mapping row C3).
-pub const CONFORMANCE: [&str; 3] = [
+/// The conformance classes `/conformance` declares (mapping rows C3, S1 to S3, S5, S7; Part 5
+/// is the draft OGC 23-058r1).
+pub const CONFORMANCE: [&str; 10] = [
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
+    "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/schemas",
+    "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/core-roles-features",
+    "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/returnables-and-receivables",
+    "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/sortables",
+    "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/feature-references",
+    "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/profile-parameter",
+    "http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/profile-references",
 ];
 
 const JSON: &str = "application/json";
 const GEOJSON: &str = "application/geo+json";
 const OPENAPI: &str = "application/vnd.oai.openapi+json;version=3.0";
+const SCHEMA: &str = "application/schema+json";
 
 /// The OGC API - Features surface.
 #[derive(Debug, Clone, Copy, Default)]
@@ -169,7 +180,7 @@ async fn respond(
     if !acceptable(headers) {
         return problem(
             StatusCode::NOT_ACCEPTABLE,
-            "this surface writes JSON, GeoJSON and OpenAPI JSON",
+            "this surface writes JSON, GeoJSON, JSON Schema and OpenAPI JSON",
         );
     }
     // Form decoding is lossy (an undecodable escape stays as written), so this never fails.
@@ -196,21 +207,26 @@ async fn respond(
             Some(c) => document(JSON, &at.collection(c)),
             None => not_found(),
         },
+        (["collections", c, which @ ("schema" | "sortables")], true) => match collections.get(*c) {
+            Some(c) => {
+                let id = format!("{base}/collections/{}/{which}", c.id);
+                document(SCHEMA, &schema::document(c, &id, *which == "sortables"))
+            }
+            None => not_found(),
+        },
         (["collections", c, "items"], _) => match collections.get(*c) {
             Some(c) => at.items(c, &pairs, uri.query()).await,
             None => not_found(),
         },
-        (["collections", c, "items", feature], true) => {
-            match (collections.get(*c), decode(feature)) {
-                (Some(c), Some(feature)) => at.item(c, &feature).await,
-                _ => not_found(),
-            }
-        }
+        (["collections", c, "items", feature], _) => match (collections.get(*c), decode(feature)) {
+            (Some(c), Some(feature)) => at.item(c, &feature, &pairs).await,
+            _ => not_found(),
+        },
         (
             []
             | ["" | "conformance" | "api" | "collections"]
             | ["collections", _]
-            | ["collections", _, "items", _],
+            | ["collections", _, "schema" | "sortables"],
             false,
         ) => problem(
             StatusCode::BAD_REQUEST,
@@ -264,6 +280,20 @@ fn link(rel: &str, media: &str, href: &str) -> Value {
     json!({"rel": rel, "type": media, "href": href})
 }
 
+/// The link relation of a collection's schema (Part 5 `/req/returnables-and-receivables`).
+const SCHEMA_REL: &str = "http://www.opengis.net/def/rel/ogc/1.0/schema";
+/// The link relation of a collection's sortables (Part 5 `/req/sortables`).
+const SORTABLES_REL: &str = "http://www.opengis.net/def/rel/ogc/1.0/sortables";
+
+/// The `profile` link of a response whose collection holds references (Part 5
+/// `/req/profile-references`): the profile its references are written in.
+fn profile_link(c: &Collection, profile: items::Profile) -> Option<Value> {
+    c.properties
+        .iter()
+        .any(|p| p.reference)
+        .then(|| json!({"rel": "profile", "href": items::profile_uri(profile)}))
+}
+
 /// What one request reads under.
 struct Here<'a> {
     view: &'a ViewOps,
@@ -303,7 +333,9 @@ impl Here<'_> {
         let at = format!("{}/collections/{}", self.base, c.id);
         let links = json!([
             link("self", JSON, &at),
-            link("items", GEOJSON, &format!("{at}/items"))
+            link("items", GEOJSON, &format!("{at}/items")),
+            link(SCHEMA_REL, SCHEMA, &format!("{at}/schema")),
+            link(SORTABLES_REL, SCHEMA, &format!("{at}/sortables")),
         ]);
         let fields = [
             ("id", Some(Value::from(c.id.as_str()))),
@@ -327,12 +359,12 @@ impl Here<'_> {
         pairs: &[(String, String)],
         query: Option<&str>,
     ) -> Reply {
-        let p = match items::params(pairs) {
+        let p = match items::params(c, pairs) {
             Ok(p) => p,
             Err(refused) => return refused.reply(),
         };
         let digest = items::digest(self.id, &c.id, pairs);
-        let page = match items::page(self.view, self.caller, c, &p, digest).await {
+        let page = match items::page(self.view, self.caller, c, &p, digest, self.base).await {
             Ok(page) => page,
             Err(refused) => return refused.reply(),
         };
@@ -354,6 +386,7 @@ impl Here<'_> {
             let query: Vec<String> = kept.chain([format!("next={token}")]).collect();
             links.push(link("next", GEOJSON, &format!("{at}?{}", query.join("&"))));
         }
+        links.extend(profile_link(c, p.profile));
         let returned = page.features.len();
         document(
             GEOJSON,
@@ -367,16 +400,26 @@ impl Here<'_> {
         )
     }
 
-    /// C19: one Feature.
-    async fn item(&self, c: &Collection, id: &str) -> Reply {
-        match items::one(self.view, self.caller, c, id).await {
+    /// C19: one Feature; `properties` and `profile` are its only parameters (S6, S7).
+    async fn item(&self, c: &Collection, id: &str, pairs: &[(String, String)]) -> Reply {
+        let p = match items::item_params(c, pairs) {
+            Ok(p) => p,
+            Err(refused) => return refused.reply(),
+        };
+        let refs = items::Refs {
+            profile: p.profile,
+            base: self.base,
+        };
+        match items::one(self.view, self.caller, c, id, &p, refs).await {
             Ok(mut feature) => {
                 let at = format!("{}/collections/{}", self.base, c.id);
                 let own = format!("{at}/items/{}", items::encode(id));
-                feature.insert(
-                    "links".into(),
-                    json!([link("self", GEOJSON, &own), link("collection", JSON, &at)]),
-                );
+                let links: Vec<Value> =
+                    [link("self", GEOJSON, &own), link("collection", JSON, &at)]
+                        .into_iter()
+                        .chain(profile_link(c, p.profile))
+                        .collect();
+                feature.insert("links".into(), Value::from(links));
                 document(GEOJSON, &Value::Object(feature))
             }
             Err(refused) => refused.reply(),

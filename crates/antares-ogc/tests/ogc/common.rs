@@ -2,8 +2,9 @@
 //! The fixture every `antares-ogc` test reads: a broker with the surface mounted, the Tenant
 //! `city`'s `LinkML` schema, four views and a handful of Cars and Stops.
 //!
-//! - `city` shows `Car` (`speed`, `location`, `seen`) and `Stop` (`name`); `Car.secret` and
-//!   the class `Depot` are in the schema and hidden.
+//! - `city` shows `Car` (`speed` in km/h, `location`, `seen`, `at` a Stop, `home` a Depot,
+//!   `colour`, `tags`) and `Stop` (`name`); `Car.secret` and the class `Depot` are in the
+//!   schema and hidden.
 //! - `slow` shows the same, narrowed to `speed<50` by the view.
 //! - `empty` shows `Stop` only.
 //! - `reads` shows `Car` and allows Retrieve Entity alone, which OGC reads never use.
@@ -26,18 +27,23 @@ pub const SCHEMA: &str = r#"{
                "ngsi": {"prefix_prefix": "ngsi", "prefix_reference": "https://uri.etsi.org/ngsi-ld/"}},
   "default_prefix": "dc",
   "classes": {
-    "Car": {"slots": ["speed", "location", "seen", "secret"], "description": "A car of the fleet"},
+    "Car": {"slots": ["speed", "location", "seen", "secret", "at", "home", "colour", "tags"], "description": "A car of the fleet"},
     "Stop": {"slots": ["name"]},
     "Depot": {"slots": ["name"]}
   },
   "slots": {
-    "speed": {"range": "float"},
+    "speed": {"range": "float", "unit": {"ucum_code": "km/h"}, "description": "how fast"},
+    "at": {"range": "Stop"},
+    "home": {"range": "Depot"},
+    "colour": {"range": "Colour"},
+    "tags": {"range": "string", "multivalued": true},
     "location": {"slot_uri": "ngsi:location", "range": "string",
                  "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}}},
     "seen": {"range": "string", "annotations": {"ogc_role": {"tag": "ogc_role", "value": "primary-instant"}}},
     "secret": {"range": "string"},
     "name": {"range": "string"}
-  }
+  },
+  "enums": {"Colour": {"permissible_values": {"red": {}, "blue": {}}}}
 }"#;
 
 pub struct Fixture {
@@ -121,7 +127,7 @@ pub async fn fixture_with(broker: TestBroker) -> Result<Fixture, String> {
     for (id, selector, q, op) in views {
         let mut view = json!({
             "id": id, "tenant": "city", "selector": selector,
-            "rules": [{"types": ["Car"], "attributes": ["speed", "location", "seen"]},
+            "rules": [{"types": ["Car"], "attributes": ["speed", "location", "seen", "at", "home", "colour", "tags"]},
                       {"types": ["Stop"], "attributes": ["name"]}],
             "operations": [op]
         });
@@ -167,17 +173,22 @@ fn point(lon: f64, lat: f64) -> Value {
     json!({"type": "GeoProperty", "value": {"type": "Point", "coordinates": [lon, lat]}})
 }
 
+fn rel(object: &str) -> Value {
+    json!({"type": "Relationship", "object": object})
+}
+
 fn prop(v: &Value) -> Value {
     json!({"type": "Property", "value": v})
 }
 
 /// Car 1 (slow, in Bratislava, seen in January), Car 2 (fast, east of the antimeridian
-/// line at 179.5, seen in June), Car 3 (slow, no location, never seen), Car 4 (fast, west of
-/// it at -179.5), Stop 1, Depot 1.
+/// line at 179.5, seen in June, at Stop 1, home Depot 1, red, tagged), Car 3 (slow, no
+/// location, never seen), Car 4 (fast, west of it at -179.5), Stop 1, Depot 1.
 pub fn entities() -> Vec<Value> {
     vec![
         json!({"id": "urn:ngsi-ld:Car:1", "type": "Car", "speed": prop(&json!(10)), "location": point(17.1, 48.1), "seen": prop(&json!("2026-01-01T00:00:00Z")), "secret": prop(&json!("s1"))}),
-        json!({"id": "urn:ngsi-ld:Car:2", "type": "Car", "speed": prop(&json!(60)), "location": point(179.5, 0.0), "seen": prop(&json!("2026-06-01T00:00:00Z")), "secret": prop(&json!("s2"))}),
+        json!({"id": "urn:ngsi-ld:Car:2", "type": "Car", "speed": prop(&json!(60)), "location": point(179.5, 0.0), "seen": prop(&json!("2026-06-01T00:00:00Z")), "secret": prop(&json!("s2")),
+               "at": rel("urn:ngsi-ld:Stop:1"), "home": rel("urn:ngsi-ld:Depot:1"), "colour": prop(&json!("red")), "tags": prop(&json!(["a", "b"]))}),
         json!({"id": "urn:ngsi-ld:Car:3", "type": "Car", "speed": prop(&json!(30)), "secret": prop(&json!("s3"))}),
         json!({"id": "urn:ngsi-ld:Car:4", "type": "Car", "speed": prop(&json!(70)), "location": point(-179.5, 0.0)}),
         json!({"id": "urn:ngsi-ld:Stop:1", "type": "Stop", "name": prop(&json!("Hlavná"))}),

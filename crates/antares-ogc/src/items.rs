@@ -23,14 +23,107 @@ pub(crate) struct Params {
     pub bbox: Option<[f64; 4]>,
     pub datetime: Option<(Option<String>, Option<String>)>,
     pub next: Option<String>,
+    /// `sortby` (S5): Attribute IRIs, `true` descending.
+    pub sortby: Vec<(String, bool)>,
+    /// `properties` (S6): the Attribute IRIs to keep, all when `None`.
+    pub properties: Option<Vec<String>>,
+    /// `profile` (S7).
+    pub profile: Profile,
+}
+
+/// How a Feature writes a Relationship to a collection the view shows (Part 5
+/// `profiles-for-feature-references`); one to a class the view does not show stays its URN.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Profile {
+    /// The target's `featureId`, its URN.
+    #[default]
+    Key,
+    /// The target Feature's URI.
+    Uri,
+    /// A link object: `href` the target Feature's URI, `title` its URN.
+    Link,
+}
+
+/// The feature-reference profiles by id.
+const PROFILES: [(&str, Profile); 3] = [
+    ("rel-as-key", Profile::Key),
+    ("rel-as-uri", Profile::Uri),
+    ("rel-as-link", Profile::Link),
+];
+
+/// Where the profile URIs live; Part 5 writes `OGC` and `ogc` both, so it is matched in any case.
+const PROFILE_BASE: &str = "http://www.opengis.net/def/profile/OGC/0/";
+
+/// A profile as Part 5 names it: its id, a safe CURIE `[ogc-profile:id]`, or its URI.
+fn profile(text: &str) -> Option<Profile> {
+    let id = text
+        .strip_prefix("[ogc-profile:")
+        .and_then(|t| t.strip_suffix(']'))
+        .or_else(|| {
+            text.get(..PROFILE_BASE.len())
+                .filter(|head| head.eq_ignore_ascii_case(PROFILE_BASE))
+                .and_then(|_| text.get(PROFILE_BASE.len()..))
+        })
+        .unwrap_or(text);
+    PROFILES
+        .iter()
+        .find(|(name, _)| *name == id)
+        .map(|(_, p)| *p)
+}
+
+/// The URI of a profile, as a `profile` link names it.
+pub(crate) fn profile_uri(p: Profile) -> String {
+    let id = PROFILES
+        .iter()
+        .find(|(_, q)| *q == p)
+        .map_or("rel-as-key", |(id, _)| id);
+    format!("{PROFILE_BASE}{id}")
+}
+
+/// `sortby` (OGC API Records and Features Part 8 drafts): `[+|-]name` by commas; a `+` the
+/// form decoding turned into a space is ascending too. Only sortable properties (S5).
+fn sortby(c: &Collection, text: &str) -> Option<Vec<(String, bool)>> {
+    text.split(',')
+        .map(|key| {
+            let (name, desc) = match key.strip_prefix('-') {
+                Some(name) => (name, true),
+                None => (key.trim_start_matches([' ', '+']), false),
+            };
+            let p = c.properties.iter().find(|p| p.name == name && p.sortable)?;
+            Some((p.iri.clone(), desc))
+        })
+        .collect()
+}
+
+/// `properties` (S6): property names by commas, none when empty.
+fn properties(c: &Collection, text: &str) -> Option<Vec<String>> {
+    text.split(',')
+        .filter(|name| !text.is_empty() || !name.is_empty())
+        .map(|name| Some(c.properties.iter().find(|p| p.name == name)?.iri.clone()))
+        .collect()
 }
 
 fn bad(detail: &'static str) -> Problem {
     Problem(StatusCode::BAD_REQUEST, detail)
 }
 
-/// Reads the query of an `items` request (C9 to C13): each parameter once, none unknown.
-pub(crate) fn params(pairs: &[(String, String)]) -> Result<Params, Problem> {
+/// Reads the query of an `items/{featureId}` request: `properties` and `profile` only.
+pub(crate) fn item_params(c: &Collection, pairs: &[(String, String)]) -> Result<Params, Problem> {
+    if pairs
+        .iter()
+        .all(|(name, _)| name == "properties" || name == "profile")
+    {
+        params(c, pairs)
+    } else {
+        Err(bad(
+            "the request names a query parameter this resource does not define",
+        ))
+    }
+}
+
+/// Reads the query of an `items` request (C9 to C13, S5 to S7): each parameter once, none
+/// unknown; a property the view hides reads as one the collection does not have.
+pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Params, Problem> {
     let mut p = Params {
         limit: DEFAULT_LIMIT,
         ..Params::default()
@@ -52,6 +145,9 @@ pub(crate) fn params(pairs: &[(String, String)]) -> Result<Params, Problem> {
             "bbox" => p.bbox = Some(bbox(value).ok_or_else(|| bad("bbox is 4 or 6 numbers in CRS84: lower corner, upper corner"))?),
             "datetime" => p.datetime = Some(datetime(value).ok_or_else(|| bad("datetime is an RFC 3339 date-time or an interval start/end, '..' or empty for an open end"))?),
             "next" => p.next = Some(value.clone()),
+            "sortby" => p.sortby = sortby(c, value).ok_or_else(|| bad("sortby names properties of the collection's sortables, each [+|-]name"))?,
+            "properties" => p.properties = Some(properties(c, value).ok_or_else(|| bad("properties names properties of the collection's schema"))?),
+            "profile" => p.profile = profile(value).ok_or_else(|| bad("profile is one of rel-as-key, rel-as-uri and rel-as-link"))?,
             _ => return Err(bad("the request names a query parameter this resource does not define")),
         }
     }
@@ -164,11 +260,7 @@ impl Terms {
             context: Map::new(),
             by_iri: Vec::new(),
         };
-        for iri in c
-            .geometry
-            .iter()
-            .chain(c.properties.iter().map(|(_, iri)| iri))
-        {
+        for iri in c.geometry.iter().chain(c.properties.iter().map(|p| &p.iri)) {
             let core = antares_ops::core_name(iri);
             let term = if core == *iri {
                 let term = format!("p{}", t.context.len());
@@ -242,6 +334,26 @@ fn time_q(
     (!parts.is_empty()).then(|| parts.join(";"))
 }
 
+/// The `orderBy` (S5) and `pick` (S6) a request adds; `pick` keeps `id`, `type` and the
+/// geometry, which every Feature carries.
+fn shape(c: &Collection, terms: &Terms, p: &Params) -> String {
+    let order: Vec<String> = p
+        .sortby
+        .iter()
+        .map(|(iri, desc)| format!("{};{}", terms.term(iri), if *desc { "desc" } else { "asc" }))
+        .collect();
+    let order = (!order.is_empty()).then(|| format!("&orderBy={}", encode(&order.join(","))));
+    let pick = p.properties.as_ref().map(|keep| {
+        let names: Vec<&str> = ["id", "type"]
+            .into_iter()
+            .chain(c.geometry.iter().map(|g| terms.term(g)))
+            .chain(keep.iter().map(|iri| terms.term(iri)))
+            .collect();
+        format!("&pick={}", encode(&names.join(",")))
+    });
+    order.into_iter().chain(pick).collect()
+}
+
 /// The polygon(s) of a CRS84 box; one that crosses the antimeridian (its west edge east of
 /// its east edge) is two.
 fn bbox_geometry([west, south, east, north]: [f64; 4]) -> (&'static str, String) {
@@ -268,8 +380,9 @@ fn bbox_geometry([west, south, east, north]: [f64; 4]) -> (&'static str, String)
 /// keep the Features without a geometry (C12). Disjoint, served in this order.
 pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params) -> Vec<String> {
     let base = format!(
-        "/ngsi-ld/v1/entities?type={}&format=simplified&count=true",
-        encode(&c.type_iri)
+        "/ngsi-ld/v1/entities?type={}&format=simplified&count=true{}",
+        encode(&c.type_iri),
+        shape(c, terms, p)
     );
     let time = p
         .datetime
@@ -374,7 +487,12 @@ pub(crate) async fn page(
     c: &Collection,
     p: &Params,
     digest: u64,
+    base: &str,
 ) -> Result<Page, Problem> {
+    let refs = Refs {
+        profile: p.profile,
+        base,
+    };
     let terms = Terms::of(c);
     let targets = targets(c, &terms, p);
     let (start, mut offset) = match &p.next {
@@ -404,8 +522,10 @@ pub(crate) async fn page(
         .await?;
         out.matched = out.matched.saturating_add(count);
         let got = u64::try_from(docs.len()).unwrap_or(u64::MAX);
-        out.features
-            .extend(docs.iter().map(|d| Value::Object(feature(c, &terms, d))));
+        out.features.extend(
+            docs.iter()
+                .map(|d| Value::Object(feature(c, &terms, d, refs))),
+        );
         if part >= start && out.next.is_none() && at.saturating_add(got) < count {
             out.next = Some(token(part, at.saturating_add(got), digest));
         }
@@ -416,7 +536,12 @@ pub(crate) async fn page(
 
 /// One Entity of `c` as a `GeoJSON` Feature (M2 to M5): `id` the URN, `geometry` the primary
 /// geometry or null, `properties` the other Attributes the view shows, by slot name.
-pub(crate) fn feature(c: &Collection, terms: &Terms, doc: &Value) -> Map<String, Value> {
+pub(crate) fn feature(
+    c: &Collection,
+    terms: &Terms,
+    doc: &Value,
+    refs: Refs,
+) -> Map<String, Value> {
     let geometry = c
         .geometry
         .as_ref()
@@ -426,7 +551,16 @@ pub(crate) fn feature(c: &Collection, terms: &Terms, doc: &Value) -> Map<String,
     let properties: Map<String, Value> = c
         .properties
         .iter()
-        .filter_map(|(name, iri)| Some((name.clone(), doc.get(terms.term(iri))?.clone())))
+        .filter_map(|p| {
+            let value = doc.get(terms.term(&p.iri))?;
+            let value = match (&p.target, refs.profile) {
+                (Some(target), Profile::Uri | Profile::Link) => {
+                    refer(value, &|urn| refs.render(target, urn))
+                }
+                _ => value.clone(),
+            };
+            Some((p.name.clone(), value))
+        })
         .collect();
     Map::from_iter([
         ("type".to_owned(), json!("Feature")),
@@ -439,6 +573,35 @@ pub(crate) fn feature(c: &Collection, terms: &Terms, doc: &Value) -> Map<String,
     ])
 }
 
+/// How one request writes references (S7): the profile and the endpoint's URI.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Refs<'a> {
+    pub profile: Profile,
+    pub base: &'a str,
+}
+
+impl Refs<'_> {
+    /// A reference to `urn` in the collection `target` the view shows, as `rel-as-uri` or
+    /// `rel-as-link` write it (`rel-as-key` keeps the URN and never calls this).
+    fn render(self, target: &str, urn: &str) -> Value {
+        let href = format!("{}/collections/{target}/items/{}", self.base, encode(urn));
+        if self.profile == Profile::Link {
+            json!({"href": href, "title": urn})
+        } else {
+            Value::from(href)
+        }
+    }
+}
+
+/// A Relationship's object (a URN, or an array of them) with each URN rendered.
+fn refer(value: &Value, render: &dyn Fn(&str) -> Value) -> Value {
+    match value {
+        Value::String(urn) => render(urn),
+        Value::Array(objects) => Value::Array(objects.iter().map(|o| refer(o, render)).collect()),
+        other => other.clone(),
+    }
+}
+
 /// One Feature by its id, if the view shows it and it is of the collection's type (C19): a
 /// Query Entities by id and type, so the view and its engine narrow it like a page. An id that
 /// is no URI names no Feature either.
@@ -447,15 +610,18 @@ pub(crate) async fn one(
     caller: &Caller,
     c: &Collection,
     id: &str,
+    p: &Params,
+    refs: Refs<'_>,
 ) -> Result<Map<String, Value>, Problem> {
     let terms = Terms::of(c);
     let target = format!(
-        "/ngsi-ld/v1/entities?id={}&type={}&format=simplified",
+        "/ngsi-ld/v1/entities?id={}&type={}&format=simplified{}",
         encode(id),
-        encode(&c.type_iri)
+        encode(&c.type_iri),
+        shape(c, &terms, p)
     );
     match query(view, caller, &terms, target).await {
-        Ok((docs, _)) => docs.first().map(|d| feature(c, &terms, d)),
+        Ok((docs, _)) => docs.first().map(|d| feature(c, &terms, d, refs)),
         Err(Problem(StatusCode::BAD_REQUEST, _)) => None,
         Err(refused) => return Err(refused),
     }
@@ -469,6 +635,31 @@ pub(crate) async fn one(
 mod tests {
     use super::*;
 
+    fn prop(name: &str, sortable: bool) -> crate::model::Prop {
+        crate::model::Prop {
+            name: name.into(),
+            iri: format!("https://e.org/{name}"),
+            schema: json!({"type": "number"}),
+            role: None,
+            unit: None,
+            description: None,
+            sortable,
+            reference: false,
+            target: None,
+        }
+    }
+
+    fn car() -> Collection {
+        Collection {
+            id: "Car".into(),
+            description: None,
+            type_iri: "https://e.org/Car".into(),
+            geometry: Some(crate::model::LOCATION.into()),
+            properties: vec![prop("speed", true), prop("tags", false)],
+            time: None,
+        }
+    }
+
     fn pairs(q: &[(&str, &str)]) -> Vec<(String, String)> {
         q.iter()
             .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
@@ -477,9 +668,14 @@ mod tests {
 
     #[test]
     fn parameters_are_read_and_checked() {
-        assert_eq!(params(&[]).map(|p| p.limit).ok(), Some(DEFAULT_LIMIT));
         assert_eq!(
-            params(&pairs(&[("limit", "10000")])).map(|p| p.limit).ok(),
+            params(&car(), &[]).map(|p| p.limit).ok(),
+            Some(DEFAULT_LIMIT)
+        );
+        assert_eq!(
+            params(&car(), &pairs(&[("limit", "10000")]))
+                .map(|p| p.limit)
+                .ok(),
             Some(MAX_LIMIT),
             "clamped"
         );
@@ -503,13 +699,16 @@ mod tests {
             vec![("datetime", "2026-01-01")],
             vec![("datetime", "2026-01-01T00:00:00Z/tomorrow")],
         ] {
-            assert!(params(&pairs(&bad)).is_err(), "{bad:?}");
+            assert!(params(&car(), &pairs(&bad)).is_err(), "{bad:?}");
         }
-        let p = params(&pairs(&[
-            ("bbox", "170,-10,-170,10"),
-            ("datetime", "2026-01-01T00:00:00Z/.."),
-            ("next", "t"),
-        ]))
+        let p = params(
+            &car(),
+            &pairs(&[
+                ("bbox", "170,-10,-170,10"),
+                ("datetime", "2026-01-01T00:00:00Z/.."),
+                ("next", "t"),
+            ]),
+        )
         .unwrap_or_default();
         assert_eq!(p.bbox, Some([170.0, -10.0, -170.0, 10.0]));
         assert_eq!(
@@ -518,15 +717,18 @@ mod tests {
         );
         assert_eq!(p.next.as_deref(), Some("t"));
         assert_eq!(
-            params(&pairs(&[("bbox", "0,0,-5,1,1,5")]))
+            params(&car(), &pairs(&[("bbox", "0,0,-5,1,1,5")]))
                 .map(|p| p.bbox)
                 .ok(),
             Some(Some([0.0, 0.0, 1.0, 1.0]))
         );
         assert_eq!(
-            params(&pairs(&[("datetime", "/2026-01-01T00:00:00.5+01:00")]))
-                .map(|p| p.datetime)
-                .ok(),
+            params(
+                &car(),
+                &pairs(&[("datetime", "/2026-01-01T00:00:00.5+01:00")])
+            )
+            .map(|p| p.datetime)
+            .ok(),
             Some(Some((None, Some("2026-01-01T00:00:00.5+01:00".into()))))
         );
     }
@@ -633,13 +835,36 @@ mod tests {
     }
 
     #[test]
+    fn references_render_each_urn_of_an_object() {
+        let refs = Refs {
+            profile: Profile::Uri,
+            base: "http://b",
+        };
+        let render = |urn: &str| refs.render("Stop", urn);
+        assert_eq!(
+            refer(&json!(["urn:a", "urn:b"]), &render),
+            json!([
+                "http://b/collections/Stop/items/urn%3Aa",
+                "http://b/collections/Stop/items/urn%3Ab"
+            ])
+        );
+        assert_eq!(refer(&json!(7), &render), json!(7), "no URN, kept");
+        assert_eq!(profile("rel-as-nothing"), None);
+        assert_eq!(profile("[ogc-profile:rel-as-link"), None);
+        assert_eq!(
+            profile_uri(Profile::Uri),
+            "http://www.opengis.net/def/profile/OGC/0/rel-as-uri"
+        );
+    }
+
+    #[test]
     fn core_attributes_keep_their_name_and_others_get_a_context_term() {
         let c = Collection {
             id: "Car".into(),
             description: None,
             type_iri: "https://e.org/Car".into(),
             geometry: Some(crate::model::LOCATION.into()),
-            properties: vec![("speed".into(), "https://e.org/speed".into())],
+            properties: vec![prop("speed", true)],
             time: None,
         };
         let t = Terms::of(&c);
