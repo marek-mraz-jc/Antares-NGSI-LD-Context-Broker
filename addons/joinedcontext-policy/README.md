@@ -106,9 +106,11 @@ deciding; a Tenant with no document denies every platform caller.
    `scope` inside the policy's scope tree (path prefix, `/a/b` covers
    `/a/b/c` and never `/a/bc`), its `location` inside the policy's area, no
    access-control member (`owner`, `acl`, `allowedRoles`, `visibility`,
-   `permissions`, `policy`). A create or an upsert also meets the policy's
+   `permissions`, `policy`). A create (5.6.1, 5.6.7) also meets the policy's
    `q`. A write by id (`policy::WRITE_BY_ID`) under a permission with a `q`,
    `scopeQ` or `geoQ` answers `AllowIf`: the store judges the stored Entity.
+   A Batch Upsert member (5.6.8) is such a write: the store holds an
+   update to the condition and refuses a create under one (T-3668).
 6. Every other clause (subscriptions, registrations, snapshots, ...):
    `Allow` when a permission applies, as decided above.
 7. A refusal says `no policy grants this operation` or `a policy prohibits

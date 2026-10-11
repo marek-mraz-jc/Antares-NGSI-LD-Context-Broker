@@ -331,9 +331,19 @@ mod tests {
     }
 
     #[test]
-    fn a_conditional_grant_admits_no_batch_upsert_and_a_window_no_write() -> Result<(), String> {
+    fn a_conditional_grant_holds_a_batch_upsert_by_id_and_a_window_no_write() -> Result<(), String>
+    {
+        // T-3668: an upserted member is judged on the stored Entity inside
+        // the store write, and a conditioned upsert never creates
         let t = table(&json!({"q": "speed>1"}))?;
-        assert_eq!(on(&t, "5.6.8", None), Decision::Deny(NOT_GRANTED.into()));
+        let Decision::AllowIf(held) = on(&t, "5.6.8", None) else {
+            return Err("a conditioned upsert is held to the condition".into());
+        };
+        assert_eq!(held.rules.len(), 1);
+        assert!(held
+            .rules
+            .first()
+            .is_some_and(|r| r.q.is_some() && r.types == car()));
         let t = table(&json!({"temporalQ": "timerel=after;timeAt=P-1D"}))?;
         assert_eq!(on(&t, "5.6.1", None), Decision::Deny(NOT_GRANTED.into()));
         Ok(())
