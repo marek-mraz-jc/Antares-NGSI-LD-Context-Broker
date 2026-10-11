@@ -20,6 +20,7 @@ members = [
     "crates/odata-batch",
     "crates/odata-axum",
     "crates/ogc-cql2",
+    "crates/antares-residual",
     "crates/antares-views",
     "crates/antares-mcp",
     "crates/antares-linkml",
@@ -48,6 +49,7 @@ antares-model = { path = "crates/antares-model" }
 antares-store = { path = "crates/antares-store" }
 antares-jsonld = { path = "crates/antares-jsonld" }
 antares-ql = { path = "crates/antares-ql" }
+antares-residual = { path = "crates/antares-residual" }
 antares-sql = { path = "crates/antares-sql", default-features = false }
 antares-bus = { path = "crates/antares-bus" }
 antares-api = { path = "crates/antares-api", default-features = false }
@@ -200,6 +202,10 @@ overflow-checks = true
 codegen-units = 1
 
 [profile.release.package.ogc-cql2]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-residual]
 overflow-checks = true
 codegen-units = 1
 
