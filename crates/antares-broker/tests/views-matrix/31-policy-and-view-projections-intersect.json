@@ -83,8 +83,5 @@
   "urn:ngsi-ld:Vehicle:V8": [
    "speed"
   ]
- },
- "known": {
-  "OGC bbox properties": "T-3795"
  }
 }

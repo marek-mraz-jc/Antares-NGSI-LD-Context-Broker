@@ -114,8 +114,5 @@
   "urn:ngsi-ld:Vehicle:V3": [
    "location"
   ]
- },
- "known": {
-  "OGC bbox properties": "T-3795"
  }
 }
