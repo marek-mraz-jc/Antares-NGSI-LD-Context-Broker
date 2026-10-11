@@ -321,10 +321,6 @@ pub enum ViewEntry {
         /// condition reads an Attribute it does not show (ADR-0023 rule
         /// 11), a temporal view keyed on a mutable member (rule 8).
         notes: Vec<String>,
-        /// The view's resolved LinkML JSON, as the view document names it,
-        /// for the LinkML surface to read and narrow; `None` when the view
-        /// names none or names one past its bound (threat LK7).
-        linkml: Option<Arc<[u8]>>,
     },
     /// A stored view that failed validation: never served, named in
     /// `/q/health` with the reason.
@@ -341,6 +337,37 @@ pub enum ViewEntry {
 pub struct ViewTable {
     entries: std::sync::RwLock<Arc<BTreeMap<String, ViewEntry>>>,
     admin: std::sync::OnceLock<axum::Router>,
+    schemas: std::sync::RwLock<Arc<BTreeMap<String, Schema>>>,
+}
+
+/// The id prefix a Tenant's schema document is stored under, beside the
+/// view documents in [`VIEW_TENANT`]. A view id is `[a-z0-9-]`, so no view
+/// shares a key with a schema.
+pub const SCHEMA_ID_PREFIX: &str = "schema:";
+
+/// A Tenant's `LinkML` schema as written to `/q/schemas/{tenant}` (T-3628):
+/// JSON the broker checked for size and well-formedness only. A surface
+/// parses it and caches the parse per `revision`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Schema {
+    /// Changes whenever the bytes do: a digest of them, opaque.
+    pub revision: u64,
+    /// The document as written.
+    pub bytes: Arc<[u8]>,
+}
+
+impl Schema {
+    /// The schema of `bytes`, its revision their digest.
+    #[must_use]
+    pub fn new(bytes: &[u8]) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut h);
+        Self {
+            revision: h.finish(),
+            bytes: bytes.into(),
+        }
+    }
 }
 
 impl ViewTable {
@@ -358,6 +385,45 @@ impl ViewTable {
             .entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(entries);
+    }
+
+    /// Replace every Tenant's schema.
+    pub fn replace_schemas(&self, schemas: BTreeMap<String, Schema>) {
+        *self
+            .schemas
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(schemas);
+    }
+
+    /// The schema of `tenant`, if one is stored.
+    pub fn schema(&self, tenant: &str) -> Option<Schema> {
+        self.schemas
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(tenant)
+            .cloned()
+    }
+
+    /// What `/q/health` lists of the schemas: each Tenant's size and
+    /// revision, never the document.
+    pub fn schema_report(&self) -> serde_json::Value {
+        let schemas = self
+            .schemas
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        serde_json::Value::Object(
+            schemas
+                .iter()
+                .map(|(tenant, s)| {
+                    let v = serde_json::json!({
+                        "bytes": s.bytes.len(),
+                        "revision": format!("{:016x}", s.revision),
+                    });
+                    (tenant.clone(), v)
+                })
+                .collect(),
+        )
     }
 
     /// Whether at least one view loaded: a surface that serves through views

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! `ViewOps::visible` and `ViewOps::linkml` (T-3511): what a caller may see
-//! through a view is the view's rules composed with the engine's answer for
-//! the operation, asked with the names it is about; the view's `LinkML` is the
-//! document's `linkml` member as stored bytes.
+//! `ViewOps::visible` (T-3511): what a caller may see through a view is the
+//! view's rules composed with the engine's answer for the operation, asked
+//! with the names it is about.
 
 use antares_ops::policy::{
     Decision, DecisionFuture, Filter, NotifyDecision, Operation, PolicyEngine, Subject,
@@ -24,8 +23,7 @@ const SPEED: &str = "https://uri.etsi.org/ngsi-ld/default-context/speed";
 const COLOUR: &str = "https://uri.etsi.org/ngsi-ld/default-context/colour";
 
 /// `/x/visible/{view}/{op}` answers what `ViewOps::visible` shows of Car,
-/// speed and colour for operation `op`, asked about Car and speed;
-/// `/x/visible/{view}/linkml` answers the stored `LinkML`.
+/// speed and colour for operation `op`, asked about Car and speed.
 struct Shown;
 
 impl Surface for Shown {
@@ -46,10 +44,6 @@ impl Surface for Shown {
                     let Some(view) = ops.view(&id) else {
                         return axum::Json(json!("no view"));
                     };
-                    if op == "linkml" {
-                        let bytes = view.linkml().map(|b| b.to_vec()).unwrap_or_default();
-                        return axum::Json(serde_json::from_slice(&bytes).unwrap_or(Value::Null));
-                    }
                     let op = OperationId::from_id(&op).unwrap_or(OperationId::Notification);
                     let asked = view
                         .visible(&caller, op, &[CAR.to_owned()], &[SPEED.to_owned()])
@@ -125,8 +119,7 @@ async fn broker(engine: Option<Arc<dyn PolicyEngine>>) -> Result<Router, String>
             "retrieve_entity_types",
             "retrieve_entity_type_info",
             "retrieve_attribute_info"
-        ],
-        "linkml": {"id": "https://e.org/s", "name": "s"}
+        ]
     });
     let body = view.to_string();
     let req = Request::builder()
@@ -150,10 +143,6 @@ async fn without_an_engine_the_view_alone_decides() {
     assert_eq!(
         get_json(&app, "/x/visible/cars/retrieve_entity_type_info").await,
         json!([true, true, true])
-    );
-    assert_eq!(
-        get_json(&app, "/x/visible/cars/linkml").await,
-        json!({"id": "https://e.org/s", "name": "s"})
     );
 }
 

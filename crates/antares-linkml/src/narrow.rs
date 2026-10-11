@@ -13,11 +13,12 @@ use linkml_model::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The bounds the view's schema is read under: the size the view table
-/// already holds it to (`MAX_LINKML_BYTES`), a nesting deep enough for
-/// LinkML's JSON form, and as many elements as a large model holds.
+/// The bounds the Tenant's schema is read under: 1 MiB whatever
+/// `ANTARES_SCHEMA_MAX_BYTES` lets the schema table store (a larger schema
+/// closes the surface, LK7), a nesting deep enough for LinkML's JSON form,
+/// and as many elements as a large model holds.
 pub(crate) const LIMITS: Limits = Limits {
-    max_bytes: antares_ops::views::MAX_LINKML_BYTES,
+    max_bytes: 1024 * 1024,
     max_depth: 32,
     max_elements: 20_000,
 };

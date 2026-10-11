@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! What a LinkML document costs (ADR-0027 section 6: ≤ 5 ms p99 for a
-//! 100-class schema, computed once per view revision): the first request
-//! after the view changes, which reads, narrows and renders the schema, and
+//! 100-class schema, computed once per schema revision): the first request
+//! after the Tenant's schema changes, which reads, narrows and renders the schema, and
 //! a request answered from the cache.
 //!
 //!     cargo bench -p antares-linkml --bench schema
@@ -53,7 +53,7 @@ fn schema(classes: usize, revision: usize) -> Value {
            "classes": cs, "slots": slots})
 }
 
-fn view(revision: usize) -> Value {
+fn view() -> Value {
     let types: Vec<String> = (0..100)
         .map(|c| format!("https://e.org/bench/C{c}"))
         .collect();
@@ -62,8 +62,7 @@ fn view(revision: usize) -> Value {
         .collect();
     json!({"id": "bench", "tenant": "city", "selector": types,
            "rules": [{"types": types, "attributes": attrs}],
-           "operations": ["retrieve_entity_type_details"],
-           "linkml": schema(100, revision)})
+           "operations": ["retrieve_entity_type_details"]})
 }
 
 fn report(name: &str, mut runs: Vec<Duration>) -> std::io::Result<()> {
@@ -84,12 +83,17 @@ fn report(name: &str, mut runs: Vec<Duration>) -> std::io::Result<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    std::env::set_var(
+        antares_ops::views::SCHEMA_MAX_ENV,
+        (1024 * 1024).to_string(),
+    );
     let broker = TestBroker::new().await?;
     let app = broker.serve(antares_linkml::Linkml)?;
     let doc = "/x/views/bench/linkml/schema/v{major}/model.linkml.yaml";
+    send(&app, "PUT", "/q/views/bench", Some(&view())).await;
     let mut cold = Vec::new();
     for revision in 1..=50 {
-        send(&app, "PUT", "/q/views/bench", Some(&view(revision))).await;
+        send(&app, "PUT", "/q/schemas/city", Some(&schema(100, revision))).await;
         let uri = doc.replace("{major}", &revision.to_string());
         let start = Instant::now();
         let status = send(&app, "GET", &uri, None).await;

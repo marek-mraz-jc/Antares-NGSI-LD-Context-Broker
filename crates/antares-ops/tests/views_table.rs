@@ -195,13 +195,6 @@ async fn a_view_is_refused_before_it_is_stored() {
     let big = "x".repeat(MAX_VIEW_BYTES + 1);
     let (s, _) = send_raw(&app, Method::PUT, "/q/views/v", None, Some(big)).await;
     assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
-    // A `linkml` member has its own bound; the rest of the document keeps
-    // the view's.
-    let mut padded = view("v");
-    padded["linkml"] = json!({"id": "https://e.org/s", "name": "s"});
-    padded["scopeQ"] = json!("x".repeat(MAX_VIEW_BYTES));
-    let (s, body) = put(&app, "v", &padded).await;
-    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     let (s, _) = send_raw(&app, Method::PUT, "/q/views/v", None, Some("{".into())).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
@@ -369,6 +362,9 @@ fn the_view_routes_answer_503_once_their_runtime_has_stopped() {
             (Method::GET, "/q/views/v", None),
             (Method::PUT, "/q/views/v", Some(view("v").to_string())),
             (Method::DELETE, "/q/views/v", None),
+            (Method::GET, "/q/schemas/city", None),
+            (Method::PUT, "/q/schemas/city", Some("{}".to_owned())),
+            (Method::DELETE, "/q/schemas/city", None),
         ] {
             let (s, b) = send_raw(&app, method, uri, None, body).await;
             assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {b}");

@@ -44,16 +44,18 @@ fn schema() -> Value {
     })
 }
 
-fn view(operations: &[&str], linkml: &Value) -> Value {
+fn view(operations: &[&str]) -> Value {
     json!({
       "id": "cars", "tenant": "city",
       "@context": {"city": "https://e.org/city/"},
       "selector": ["city:Car"],
       "rules": [{"types": ["city:Car"], "attributes": ["city:speed", "city:owner", "city:fuel"]}],
-      "operations": operations,
-      "linkml": linkml
+      "operations": operations
     })
 }
+
+/// The schema bound every broker here runs with.
+const SCHEMA_MAX: usize = 64 * 1024;
 
 const READS: [&str; 3] = [
     "retrieve_entity_type_details",
@@ -106,8 +108,15 @@ async fn get(app: &Router, path: &str) -> (StatusCode, axum::http::HeaderMap, St
     .await
 }
 
-/// A broker asking `engine` (none when `None`) with view `doc` loaded.
-async fn broker(engine: Option<Arc<dyn PolicyEngine>>, doc: &Value) -> Result<Router, String> {
+/// A broker asking `engine` (none when `None`) with view `doc` loaded and
+/// `schema` stored for its Tenant (`/q/schemas/city`, T-3628).
+async fn broker(
+    engine: Option<Arc<dyn PolicyEngine>>,
+    doc: &Value,
+    schema: Option<&Value>,
+) -> Result<Router, String> {
+    // Read once when the broker is wired; every test here sets the same value.
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, SCHEMA_MAX.to_string());
     let mut broker = TestBroker::new().await?;
     if let Some(engine) = engine {
         broker = broker.with_policy(engine);
@@ -116,6 +125,12 @@ async fn broker(engine: Option<Arc<dyn PolicyEngine>>, doc: &Value) -> Result<Ro
     let (status, _, body) = send(&app, "PUT", "/q/views/cars", &[], Some(doc)).await;
     if !status.is_success() {
         return Err(format!("the view does not load: {status} {body}"));
+    }
+    if let Some(schema) = schema {
+        let (status, _, body) = send(&app, "PUT", "/q/schemas/city", &[], Some(schema)).await;
+        if !status.is_success() {
+            return Err(format!("the schema does not load: {status} {body}"));
+        }
     }
     Ok(app)
 }
@@ -166,7 +181,7 @@ impl PolicyEngine for DenyAll {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn linkml_prefixes_and_context_hold_only_visible_terms() {
-    let app = broker(None, &view(&READS, &schema()))
+    let app = broker(None, &view(&READS), Some(&schema()))
         .await
         .expect("a broker");
     let (s, h, yaml) = get(&app, "schema/v2/model.linkml.yaml").await;
@@ -212,7 +227,7 @@ async fn linkml_prefixes_and_context_hold_only_visible_terms() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_class_and_a_slot_are_served_and_out_of_view_ones_are_404() {
-    let app = broker(None, &view(&READS, &schema()))
+    let app = broker(None, &view(&READS), Some(&schema()))
         .await
         .expect("a broker");
     let (s, _, car) = get(&app, "classes/Car").await;
@@ -248,7 +263,7 @@ async fn a_class_and_a_slot_are_served_and_out_of_view_ones_are_404() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn linkml_errors_carry_no_hidden_name() {
-    let app = broker(None, &view(&READS, &schema()))
+    let app = broker(None, &view(&READS), Some(&schema()))
         .await
         .expect("a broker");
     for path in [
@@ -275,7 +290,7 @@ async fn linkml_errors_carry_no_hidden_name() {
     assert_eq!(s, StatusCode::NOT_FOUND);
     assert_no_hidden_name("an unknown view", &body);
 
-    let denied = broker(Some(Arc::new(DenyAll)), &view(&READS, &schema()))
+    let denied = broker(Some(Arc::new(DenyAll)), &view(&READS), Some(&schema()))
         .await
         .expect("a broker");
     let (s, _, body) = get(&denied, "classes/Car").await;
@@ -285,7 +300,7 @@ async fn linkml_errors_carry_no_hidden_name() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn linkml_is_read_only() {
-    let app = broker(None, &view(&READS, &schema()))
+    let app = broker(None, &view(&READS), Some(&schema()))
         .await
         .expect("a broker");
     for method in ["POST", "PUT", "PATCH", "DELETE"] {
@@ -304,7 +319,7 @@ async fn linkml_is_read_only() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_etag_revalidates_and_head_carries_no_body() {
-    let app = broker(None, &view(&READS, &schema()))
+    let app = broker(None, &view(&READS), Some(&schema()))
         .await
         .expect("a broker");
     let (s, h, body) = get(&app, "schema/v2/model.shacl.ttl").await;
@@ -328,7 +343,7 @@ async fn an_etag_revalidates_and_head_carries_no_body() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn each_path_is_an_operation_the_view_allows() {
-    let app = broker(None, &view(&["retrieve_entity_type_info"], &schema()))
+    let app = broker(None, &view(&["retrieve_entity_type_info"]), Some(&schema()))
         .await
         .expect("a broker");
     assert_eq!(get(&app, "classes/Car").await.0, StatusCode::OK);
@@ -341,7 +356,7 @@ async fn each_path_is_an_operation_the_view_allows() {
 #[tokio::test(flavor = "multi_thread")]
 async fn linkml_schema_is_cached_per_view_and_subject_and_never_served_across_them() {
     let engine = Arc::new(OmitSpeed(AtomicBool::new(false)));
-    let app = broker(Some(engine.clone()), &view(&READS, &schema()))
+    let app = broker(Some(engine.clone()), &view(&READS), Some(&schema()))
         .await
         .expect("a broker");
     let (_, wide_tag, wide) = get(&app, "schema/v2/model.linkml.yaml").await;
@@ -374,35 +389,39 @@ async fn linkml_schema_is_cached_per_view_and_subject_and_never_served_across_th
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_oversized_schema_closes_the_surface_not_the_view() {
+async fn an_oversized_schema_is_refused_and_the_surface_stays_closed() {
     let mut big = schema();
-    big["classes"]["Car"]["description"] = json!("x".repeat(antares_ops::views::MAX_LINKML_BYTES));
-    let app = broker(None, &view(&READS, &big)).await.expect("a broker");
+    big["classes"]["Car"]["description"] = json!("x".repeat(SCHEMA_MAX));
+    let err = broker(None, &view(&READS), Some(&big))
+        .await
+        .expect_err("past the bound");
+    assert!(err.contains("413"), "{err}");
+    let app = broker(None, &view(&READS), None).await.expect("a broker");
     let (s, _, body) = get(&app, "schema/index.json").await;
     assert_eq!(s, StatusCode::NOT_FOUND, "{body}");
     let (s, _, health) = send(&app, "GET", "/q/health", &[], None).await;
     assert_eq!(s, StatusCode::OK);
-    assert!(
-        health.contains("LK7"),
-        "the view's note names why: {health}"
+    assert!(health.contains("/x/views/{view}/linkml"), "{health}");
+    let (s, _, _) = send(&app, "GET", "/x/views/cars/linkml", &[], None).await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "the surface root names no document"
     );
-    assert!(health.contains("\"loaded\""), "{health}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_schema_outside_the_subset_or_none_closes_the_surface() {
     let mut outside = schema();
     outside["imports"] = json!(["linkml:types"]);
-    let app = broker(None, &view(&READS, &outside))
+    let app = broker(None, &view(&READS), Some(&outside))
         .await
         .expect("a broker");
     assert_eq!(
         get(&app, "schema/index.json").await.0,
         StatusCode::NOT_FOUND
     );
-    let mut none = view(&READS, &Value::Null);
-    none.as_object_mut().expect("an object").remove("linkml");
-    let app = broker(None, &none).await.expect("a broker");
+    let app = broker(None, &view(&READS), None).await.expect("a broker");
     assert_eq!(
         get(&app, "schema/index.json").await.0,
         StatusCode::NOT_FOUND
@@ -411,7 +430,7 @@ async fn a_schema_outside_the_subset_or_none_closes_the_surface() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn linkml_a_relationship_to_a_hidden_class_is_uriorcurie() {
-    let app = broker(None, &view(&READS, &schema()))
+    let app = broker(None, &view(&READS), Some(&schema()))
         .await
         .expect("a broker");
     let (s, _, owner) = get(&app, "slots/owner").await;
@@ -452,9 +471,13 @@ impl PolicyEngine for NotCarNotSpeed {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_class_or_slot_request_names_it_to_the_engine() {
-    let app = broker(Some(Arc::new(NotCarNotSpeed)), &view(&READS, &schema()))
-        .await
-        .expect("a broker");
+    let app = broker(
+        Some(Arc::new(NotCarNotSpeed)),
+        &view(&READS),
+        Some(&schema()),
+    )
+    .await
+    .expect("a broker");
     assert_eq!(get(&app, "classes/Car").await.0, StatusCode::FORBIDDEN);
     assert_eq!(get(&app, "slots/speed").await.0, StatusCode::FORBIDDEN);
     assert_eq!(get(&app, "slots/fuel").await.0, StatusCode::OK);
@@ -465,7 +488,7 @@ async fn a_class_or_slot_request_names_it_to_the_engine() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn model_answers_the_formalism_accept_names() {
-    let app = broker(None, &view(&READS, &schema()))
+    let app = broker(None, &view(&READS), Some(&schema()))
         .await
         .expect("a broker");
     let uri = "/x/views/cars/linkml/schema/v2/model";

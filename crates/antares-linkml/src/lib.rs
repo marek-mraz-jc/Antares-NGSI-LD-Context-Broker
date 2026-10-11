@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! The LinkML surface of a view (`odata-linkml-mapping.md` section 8,
 //! T-3511): `GET /x/views/{view}/linkml/…` serves the view's schema, the
-//! LinkML the view document names, narrowed to what the caller may see
+//! LinkML stored for the view's Tenant (`/q/schemas/{tenant}`, T-3628),
+//! narrowed to what the caller may see
 //! through the view and the policy engine (`effective = view ∧ engine`,
 //! ADR-0023 rule 5) and rendered from that narrowed model alone (LK1).
 //!
@@ -164,11 +165,11 @@ async fn answer(
     wanted: &Wanted,
     caller: &Caller,
 ) -> Result<(&'static str, Arc<[u8]>), Refusal> {
-    // A view with no schema, or one past its bound, has its LinkML surface
-    // closed (LK7): the same answer as a path that is not there.
-    let Some(schema) = view.linkml() else {
-        return Err(Refusal::NotFound);
-    };
+    // A Tenant with no schema has its views' LinkML surface closed: the
+    // same answer as a path that is not there. An oversized one never got
+    // in (`ANTARES_SCHEMA_MAX_BYTES` refuses the write, LK7).
+    let (_, schema) = view.schema().ok_or(Refusal::NotFound)?;
+    let schema = &schema;
     let source = cache.source(id, schema).ok_or(Refusal::NotFound)?;
     // The operation names what it asks about (operation-matrix.yaml
     // `operation_fields`): a class or slot the stored schema lacks is the

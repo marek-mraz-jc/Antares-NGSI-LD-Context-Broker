@@ -245,14 +245,8 @@ a surface answers `404`.
 `@context` (inline, over the core context); every `q` is read against the
 core context; `operations` are row ids of `docs/analysis/operation-matrix.yaml`.
 No member has a default that serves more: an empty selector, rule list or
-operation list is refused. Bounds: 64 KiB per document beside its `linkml`
-member, 64 rules, 256 names per list, 4096 bytes per `q` or `scopeQ`.
-
-An optional `linkml` member holds the schema of what the view serves:
-LinkML in its resolved JSON form (imports and `is_a` folded, as LinkML's
-JSON serialisation writes it), read by the [LinkML surface](linkml.md).
-It may take up to 1 MiB; a stored view whose schema is larger still loads,
-with its LinkML surface closed and a loader note saying why (LK7).
+operation list is refused. Bounds: 64 KiB per document, 64 rules, 256 names
+per list, 4096 bytes per `q` or `scopeQ`.
 
 ### GET /q/views
 
@@ -265,12 +259,41 @@ The stored document, or `404`.
 ### PUT /q/views/{id}
 
 `201` created, `204` replaced; `400` with the first reason the view cannot
-be served (nothing is stored), `413` over 64 KiB beside the `linkml`
-member or over 1 MiB + 64 KiB in all.
+be served (nothing is stored), `413` over 64 KiB.
 
 ### DELETE /q/views/{id}
 
 `204`, or `404` when there is no such view.
+
+## Schemas
+
+Only in a broker built with the `views` feature (T-3628). Each Tenant has at
+most one `LinkML` schema, in its JSON serialisation, resolved (imports and
+`is_a` folded): the model a surface such as OData or LinkML reads for value
+types, relationship targets and kinds (`docs/analysis/odata-linkml-mapping.md`
+3.1). The broker checks only its size and that it is JSON; the surface parses
+it, so a schema it cannot read closes that surface for the Tenant's views and
+the surface says so in `/q/health`. The document is stored beside the views
+under `antares-views` and reloaded with them; `/q/health` lists each Tenant's
+`bytes` and `revision` under `schemas`, never the document.
+
+The path names the Tenant, and only one a client can name; nothing in the
+body does.
+
+### GET /q/schemas/{tenant}
+
+The schema as written, `application/json`, or `404`.
+
+### PUT /q/schemas/{tenant}
+
+`201` created, `204` replaced. `413` over `ANTARES_SCHEMA_MAX_BYTES`, `400`
+when the body is not JSON or the path names no client tenant; nothing is
+stored. `503` while `ANTARES_SCHEMA_MAX_BYTES` is unset: the operator names
+the bound before any schema is taken.
+
+### DELETE /q/schemas/{tenant}
+
+`204`, or `404` when the Tenant has no schema.
 
 ## The peer-facing wire
 

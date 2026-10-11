@@ -14,12 +14,15 @@ what the build serves today (T-3511).
 
 ## 1. Where the schema comes from
 
-The view document's `linkml` member: LinkML in its resolved JSON form
-([admin API](admin-api.md)). The surface reads it with the `linkml-model`
-subset, so a metaslot outside the subset (`imports`, for one) closes the
-view's LinkML surface and the reason goes to the log (LK4). A view without
-`linkml`, or with one over 1 MiB (LK7, named in the view's `/q/health`
-notes), answers `404` on every path, like a view that is not loaded.
+The schema stored for the view's Tenant at `/q/schemas/{tenant}`: LinkML
+in its resolved JSON form ([admin API](admin-api.md), T-3628). Every view of
+a Tenant serves the same source, each narrowed by its own rules. The surface
+reads it with the `linkml-model` subset, so a metaslot outside the subset
+(`imports`, for one) closes the LinkML surface and the reason goes to the
+log (LK4). A Tenant without a schema answers `404` on every path, like a
+view that is not loaded; a schema over `ANTARES_SCHEMA_MAX_BYTES` is
+refused with `413` when it is written and never reaches the surface; one
+stored under a bound above 1 MiB closes the surface and goes to the log (LK7).
 
 ## 2. What a caller sees
 
