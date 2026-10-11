@@ -102,12 +102,13 @@ fn star_loads_alone_and_nowhere_else() {
     assert!(load(&named).is_err(), "selector * with named rules loads");
 }
 
-/// The view T-3501 runs the ETSI suite through loads as committed.
+/// The view T-3501 runs the ETSI suite and surfaces-conformance its MCP suites through loads as
+/// committed, in the Tenant `dev/views-rig.sh` seeds.
 #[test]
 fn the_committed_all_view_loads() {
     let doc: Value = serde_json::from_str(include_str!("../../../ci/views/all.json"))
         .expect("ci/views/all.json is JSON");
     let loaded = load(&doc).expect("ci/views/all.json loads");
     assert!(loaded.view.shows_every_name());
-    assert_eq!(loaded.tenant, "default");
+    assert_eq!(loaded.tenant, "conformance");
 }

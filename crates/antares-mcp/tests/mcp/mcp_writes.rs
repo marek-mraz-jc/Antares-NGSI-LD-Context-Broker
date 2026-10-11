@@ -362,15 +362,38 @@ async fn write_tools_are_offered_only_where_the_view_allows_them() -> Result<(),
         .cloned()
         .unwrap_or_default();
     assert_eq!(tools.len(), 30, "{}", listed.text);
-    let read_only = |name: &str| {
+    let hint = |name: &str, hint: &str| {
         tools
             .iter()
             .find(|t| t.get("name") == Some(&json!(name)))
-            .and_then(|t| t.pointer("/annotations/readOnlyHint"))
+            .and_then(|t| t.pointer(&format!("/annotations/{hint}")))
             .cloned()
     };
-    assert_eq!(read_only("create_entity"), Some(json!(false)));
-    assert_eq!(read_only("get_entity"), Some(json!(true)));
+    assert_eq!(hint("create_entity", "readOnlyHint"), Some(json!(false)));
+    assert_eq!(hint("get_entity", "readOnlyHint"), Some(json!(true)));
+    // MCP: a write that only adds is not destructive; one that removes or
+    // overwrites says so, a read says nothing
+    for additive in ["create_entity", "create_subscription", "batch_create"] {
+        assert_eq!(
+            hint(additive, "destructiveHint"),
+            Some(json!(false)),
+            "{additive}"
+        );
+    }
+    for destructive in [
+        "delete_entity",
+        "delete_attribute",
+        "replace_entity",
+        "update_attributes",
+        "batch_delete",
+    ] {
+        assert_eq!(
+            hint(destructive, "destructiveHint"),
+            Some(json!(true)),
+            "{destructive}"
+        );
+    }
+    assert_eq!(hint("get_entity", "destructiveHint"), None);
     Ok(())
 }
 

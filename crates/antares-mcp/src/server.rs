@@ -3,20 +3,23 @@
 //! and calls, and the resources (MCP sections 3, 4, 6 and 8).
 
 use crate::confirm;
+use crate::listen::{self, LIFETIME, MAX_URIS, SCHEME};
 use crate::schema::{self, Checked, Names};
 use crate::tools::{self, Built, ToolDef, TOOLS};
 use crate::{cursor, MAX_RESULT_BYTES_ENV};
 use antares_ops::{Caller, OperationId, OpsRequest, ViewOps};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
     DiscoverResult, ElicitRequest, ElicitRequestParams, ElicitationSchema, ErrorCode,
     Implementation, InputRequest, InputRequiredResult, ListResourceTemplatesResult,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ResourceTemplate, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
+    ResourceContents, ResourceTemplate, ResourceUpdatedNotification,
+    ResourceUpdatedNotificationParam, ServerCapabilities, ServerConfig, ServerNotification,
+    SubscriptionFilter, Tool, ToolAnnotations,
 };
-use rmcp::service::RequestContext;
+use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{json, Value};
 use std::borrow::Cow;
@@ -173,6 +176,53 @@ impl Server {
         }
     }
 
+    /// Watch the Entity `uri` names for `stream` (MCP 5.2 steps 2 and 3):
+    /// read it through the gate, then make one internal Subscription on it
+    /// through the view as the caller. An Entity the caller cannot read, or
+    /// a Subscription the gate refuses, is never watched and never said so.
+    async fn watch(&self, stream: &str, uri: &str, attributes: &[String]) {
+        let prefix = format!("ngsi-ld://{}/entities/", self.id);
+        let Some(id) = uri.strip_prefix(&prefix).and_then(percent_decoded) else {
+            return;
+        };
+        if !schema::is_entity_id(&id) {
+            return;
+        }
+        let read = Built {
+            method: Method::GET,
+            target: format!("/ngsi-ld/v1/entities/{}", tools::encode(&id)),
+            body: None,
+        };
+        let read = self.run(OperationId::RetrieveEntity, read).await;
+        let Some(kind) = read.body.get("type").filter(|_| read.status.is_success()) else {
+            return;
+        };
+        let sub = format!(
+            "urn:ngsi-ld:Subscription:mcp-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let endpoint = json!({"uri": format!("{SCHEME}:{stream}"), "accept": "application/json"});
+        let expires = listen::date_time_after(std::time::SystemTime::now(), LIFETIME);
+        // a view names at least one Attribute (its rules must), so the
+        // Subscription never watches every Attribute
+        let body = json!({"id": sub, "type": "Subscription", "entities": [{"id": id, "type": kind}],
+               "watchedAttributes": attributes,
+               "notification": {"attributes": attributes, "endpoint": endpoint},
+               "expiresAt": expires, "throttling": 1});
+        // known before it exists, so a change the moment it is made finds it
+        listen::streams().watch(stream, &sub, uri);
+        let made = Built {
+            method: Method::POST,
+            target: "/ngsi-ld/v1/subscriptions".into(),
+            body: Some(body),
+        };
+        let answer =
+            listen::creating(stream, self.run(OperationId::CreateSubscription, made)).await;
+        if !answer.status.is_success() {
+            listen::streams().unwatch(stream, &sub);
+        }
+    }
+
     /// A write tool's call (MCP 3.4): checked, then the person is asked
     /// when the client `asks`, then the confirmed retry runs once.
     async fn write(
@@ -285,6 +335,50 @@ impl Server {
     }
 }
 
+/// Ends a stream however its `listen` ends: forgets it and deletes its
+/// internal Subscriptions through the view as the caller (MCP 5.2 step 5).
+struct Closing {
+    stream: String,
+    view: ViewOps,
+    caller: Caller,
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        let made = listen::streams().close(&self.stream);
+        let (view, caller) = (self.view.clone(), self.caller.clone());
+        // without a runtime the process is ending: expiresAt deletes them
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                for id in made {
+                    let target = format!("/ngsi-ld/v1/subscriptions/{}", tools::encode(&id));
+                    let req = OpsRequest::new(Method::DELETE, target);
+                    let deleted = view
+                        .run(OperationId::DeleteSubscription, &caller, req)
+                        .await;
+                    let status = deleted.map_or(0, |r| r.status().as_u16());
+                    tracing::debug!(status, "mcp stream subscription deleted");
+                }
+            });
+        }
+    }
+}
+
+/// A read is read-only; a write is destructive unless it only adds (MCP
+/// `destructiveHint`: a create cannot remove or overwrite what is there).
+fn annotations(t: &tools::ToolDef) -> ToolAnnotations {
+    let hints = ToolAnnotations::new().read_only(!t.write).open_world(false);
+    let additive = matches!(
+        t.name,
+        "create_entity" | "create_subscription" | "batch_create"
+    );
+    if t.write {
+        hints.destructive(!additive)
+    } else {
+        hints
+    }
+}
+
 /// The rows of a page that fit the budget, in order, and whether any were
 /// left out. A page is never cut inside a row.
 fn fit(rows: Vec<Value>) -> (Vec<Value>, bool) {
@@ -379,6 +473,7 @@ impl ServerHandler for Server {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                .enable_resources_subscribe()
                 .build(),
         )
         .with_instructions(INSTRUCTIONS)
@@ -403,6 +498,81 @@ impl ServerHandler for Server {
         std::future::ready(Ok(found))
     }
 
+    /// Resource subscriptions only (MCP 5.2 step 1): the Entity URIs of
+    /// this view, at most [`MAX_URIS`] distinct ones, and none when the view
+    /// does not let a caller read an Entity and make and delete a
+    /// Subscription, which a watch is. Whether an Entity exists or is
+    /// visible is no part of the acknowledgment (MC7).
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        let prefix = format!("ngsi-ld://{}/entities/", self.id);
+        let watches = [
+            OperationId::RetrieveEntity,
+            OperationId::CreateSubscription,
+            OperationId::DeleteSubscription,
+        ]
+        .into_iter()
+        .all(|op| self.view.allows(op));
+        let mut uris: Vec<String> = Vec::new();
+        for uri in requested.resource_subscriptions.iter().flatten() {
+            let fits = watches && uris.len() < MAX_URIS;
+            if fits && uri.starts_with(&prefix) && !uris.contains(uri) {
+                uris.push(uri.clone());
+            }
+        }
+        let mut accepted = SubscriptionFilter::new();
+        accepted.resource_subscriptions = Some(uris);
+        Some(accepted)
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let (stream, wake) = listen::streams()
+            .open(self.view.tenant(), self.caller.subject(), listen::CAPS)
+            .map_err(|why| ErrorData::new(ErrorCode(-32000), why, None))?;
+        let _closing = Closing {
+            stream: stream.clone(),
+            view: self.view.clone(),
+            caller: self.caller.clone(),
+        };
+        // every Attribute the view shows, whether or not a schema may name
+        // it: a name left out here would make a change to it no event, but
+        // one left out of `watchedAttributes` would make every change one
+        let (_, attributes) = self.view.shown_names();
+        // rmcp acknowledges what was asked, repeats included: one watch each
+        let uris: std::collections::BTreeSet<&String> = context
+            .accepted()
+            .resource_subscriptions
+            .iter()
+            .flatten()
+            .collect();
+        for uri in uris {
+            self.watch(&stream, uri, &attributes).await;
+        }
+        let lifetime = tokio::time::sleep(LIFETIME);
+        tokio::pin!(lifetime);
+        loop {
+            tokio::select! {
+                () = context.cancelled() => return Ok(()),
+                () = &mut lifetime => return Ok(()),
+                () = wake.notified() => {
+                    for uri in listen::streams().take(&stream) {
+                        let updated = ResourceUpdatedNotification::new(
+                            ResourceUpdatedNotificationParam::new(uri),
+                        );
+                        // it fails only once the stream closed, which
+                        // `cancelled` ends on the next turn
+                        let _closed = context
+                            .sink()
+                            .send(ServerNotification::ResourceUpdatedNotification(updated))
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -419,7 +589,7 @@ impl ServerHandler for Server {
                     t.description,
                     Arc::new(schema::input_schema(t.args, &names)),
                 )
-                .annotate(ToolAnnotations::new().read_only(!t.write).open_world(false))
+                .annotate(annotations(t))
             })
             .collect();
         Ok(ListToolsResult::with_all_items(tools)

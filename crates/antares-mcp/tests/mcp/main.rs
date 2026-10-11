@@ -3,7 +3,8 @@
 //! `common`: discovery and the tool list (`mcp_discovery`), the gate
 //! (`mcp_gate`), errors (`mcp_errors`), result size and paging
 //! (`mcp_output`), resources (`mcp_resources`), caching (`mcp_cache`), the
-//! transport (`mcp_transport`) and the confirmed writes (`mcp_writes`).
+//! transport (`mcp_transport`), the confirmed writes (`mcp_writes`) and
+//! resource subscriptions (`mcp_listen`).
 
 mod common;
 mod engines;
@@ -12,6 +13,7 @@ mod mcp_discovery;
 mod mcp_errors;
 mod mcp_every;
 mod mcp_gate;
+mod mcp_listen;
 mod mcp_output;
 mod mcp_resources;
 mod mcp_transport;

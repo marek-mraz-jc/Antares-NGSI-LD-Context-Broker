@@ -1,6 +1,6 @@
 {
   "id": "all",
-  "tenant": "default",
+  "tenant": "conformance",
   "selector": [
     "*"
   ],
