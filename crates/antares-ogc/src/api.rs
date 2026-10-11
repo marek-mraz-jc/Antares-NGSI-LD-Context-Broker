@@ -2,8 +2,12 @@
 //! `/api` (mapping row C2, Part 1 `/req/oas30/*`): the `OpenAPI` 3.0 document of exactly what
 //! this view serves, one path per collection the view shows, so no hidden type is named.
 
+use crate::crs;
 use crate::model::Collection;
+use antares_ops::OperationId;
 use serde_json::{json, Map, Value};
+
+const GEOJSON: &str = "application/geo+json";
 use std::collections::BTreeMap;
 
 /// The answers every operation may give besides its 200 (`/req/oas30/completeness`).
@@ -23,17 +27,160 @@ fn refusals() -> Map<String, Value> {
     )
 }
 
+/// A write operation (W1 to W5): its success status and, but for `DELETE`, its body's media.
+fn write(id: &str, summary: &str, ok: &str, body: Option<&str>) -> Value {
+    let mut responses = refusals();
+    responses.insert(ok.into(), json!({"description": summary}));
+    for (code, text) in [
+        ("403", "the view or its Policy refused the write"),
+        ("413", "the body is above 1 MiB"),
+        ("415", "the body's media type is not this operation's"),
+        ("501", "a conditional write (If-Match, If-Unmodified-Since)"),
+    ] {
+        responses.insert(code.into(), json!({"description": text}));
+    }
+    let mut op = Map::from_iter([
+        ("operationId".to_owned(), Value::from(id)),
+        ("summary".to_owned(), Value::from(summary)),
+        ("responses".to_owned(), Value::Object(responses)),
+    ]);
+    if let Some(media) = body {
+        op.insert(
+            "requestBody".into(),
+            json!({"required": true, "content": {media: {"schema": {"type": "object"}}}}),
+        );
+    }
+    Value::Object(op)
+}
+
 fn get(id: &str, summary: &str, media: &str, parameters: &[Value]) -> Value {
+    Value::Object(read(id, summary, media, parameters))
+}
+
+/// A path item with its `get`.
+fn read(id: &str, summary: &str, media: &str, parameters: &[Value]) -> Map<String, Value> {
     let mut responses = refusals();
     responses.insert(
         "200".into(),
         json!({"description": summary, "content": {media: {"schema": {"type": "object"}}}}),
     );
-    json!({"get": {"operationId": id, "summary": summary, "parameters": parameters, "responses": responses}})
+    Map::from_iter([(
+        "get".to_owned(),
+        json!({"operationId": id, "summary": summary, "parameters": parameters, "responses": responses}),
+    )])
 }
 
-/// The document for the endpoint at `base` serving `collections`.
-pub(crate) fn document(base: &str, collections: &BTreeMap<String, Collection>) -> Value {
+/// The problem schema and the query parameters the operations name.
+fn components() -> Value {
+    json!({
+        "schemas": {"problem": {"type": "object", "properties": {"type": {"type": "string"}, "title": {"type": "string"}, "status": {"type": "integer"}, "detail": {"type": "string"}}}},
+        "parameters": {
+            "limit": {"name": "limit", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 10}},
+            "bbox": {"name": "bbox", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "array", "oneOf": [{"minItems": 4, "maxItems": 4}, {"minItems": 6, "maxItems": 6}], "items": {"type": "number"}}},
+            "datetime": {"name": "datetime", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "string"}},
+            "next": {"name": "next", "in": "query", "required": false, "description": "the token of a next link", "schema": {"type": "string"}},
+            "sortby": {"name": "sortby", "in": "query", "required": false, "style": "form", "explode": false, "description": "[+|-]name of the collection's sortables", "schema": {"type": "array", "items": {"type": "string"}}},
+            "properties": {"name": "properties", "in": "query", "required": false, "style": "form", "explode": false, "description": "the properties of the collection's schema to return", "schema": {"type": "array", "items": {"type": "string"}}},
+            "crs": {"name": "crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
+            "bbox-crs": {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
+            "profile": {"name": "profile", "in": "query", "required": false, "style": "form", "explode": false, "description": "how references are written", "schema": {"type": "string", "enum": ["rel-as-key", "rel-as-uri", "rel-as-link"]}},
+        },
+    })
+}
+
+/// The paths of one collection: it, its schemas, its items and one Feature, with the writes
+/// the view `offers`.
+fn collection_paths(
+    paths: &mut Map<String, Value>,
+    c: &Collection,
+    offers: &dyn Fn(OperationId) -> bool,
+    (items_params, feature_id): (&[Value], &[Value]),
+) {
+    let at = format!("/collections/{}", c.id);
+    paths.insert(
+        at.clone(),
+        get(
+            &format!("collection-{}", c.id),
+            "the collection",
+            "application/json",
+            &[],
+        ),
+    );
+    for (which, summary) in [
+        ("schema", "the schema of its Features"),
+        ("sortables", "the properties sortby may name"),
+    ] {
+        paths.insert(
+            format!("{at}/{which}"),
+            get(
+                &format!("{which}-{}", c.id),
+                summary,
+                "application/schema+json",
+                &[],
+            ),
+        );
+    }
+    let mut items = read(
+        &format!("items-{}", c.id),
+        "a page of Features",
+        "application/geo+json",
+        items_params,
+    );
+    let mut item = read(
+        &format!("item-{}", c.id),
+        "one Feature",
+        "application/geo+json",
+        feature_id,
+    );
+    if offers(OperationId::CreateEntity) {
+        items.insert(
+            "post".into(),
+            write(
+                &format!("post-{}", c.id),
+                "create a Feature",
+                "201",
+                Some(GEOJSON),
+            ),
+        );
+    }
+    for (method, op, body, summary) in [
+        (
+            "put",
+            OperationId::ReplaceEntity,
+            Some(GEOJSON),
+            "replace the Feature",
+        ),
+        (
+            "patch",
+            OperationId::MergeEntity,
+            Some("application/merge-patch+json"),
+            "merge a patch into the Feature",
+        ),
+        (
+            "delete",
+            OperationId::DeleteEntity,
+            None,
+            "delete the Feature",
+        ),
+    ] {
+        if offers(op) {
+            item.insert(
+                method.into(),
+                write(&format!("{method}-{}", c.id), summary, "204", body),
+            );
+        }
+    }
+    paths.insert(format!("{at}/items"), Value::Object(items));
+    paths.insert(format!("{at}/items/{{featureId}}"), Value::Object(item));
+}
+
+/// The document for the endpoint at `base` serving `collections`, with the writes the view
+/// `offers` (W4).
+pub(crate) fn document(
+    base: &str,
+    collections: &BTreeMap<String, Collection>,
+    offers: &dyn Fn(OperationId) -> bool,
+) -> Value {
     let mut paths = Map::new();
     paths.insert(
         "/".into(),
@@ -66,54 +213,27 @@ pub(crate) fn document(base: &str, collections: &BTreeMap<String, Collection>) -
         json!({"$ref": "#/components/parameters/bbox"}),
         json!({"$ref": "#/components/parameters/datetime"}),
         json!({"$ref": "#/components/parameters/next"}),
+        json!({"$ref": "#/components/parameters/sortby"}),
+        json!({"$ref": "#/components/parameters/properties"}),
+        json!({"$ref": "#/components/parameters/profile"}),
+        json!({"$ref": "#/components/parameters/crs"}),
+        json!({"$ref": "#/components/parameters/bbox-crs"}),
     ];
     let feature_id = [
         json!({"name": "featureId", "in": "path", "required": true, "schema": {"type": "string"}}),
+        json!({"$ref": "#/components/parameters/properties"}),
+        json!({"$ref": "#/components/parameters/profile"}),
+        json!({"$ref": "#/components/parameters/crs"}),
     ];
     for c in collections.values() {
-        let at = format!("/collections/{}", c.id);
-        paths.insert(
-            at.clone(),
-            get(
-                &format!("collection-{}", c.id),
-                "the collection",
-                "application/json",
-                &[],
-            ),
-        );
-        paths.insert(
-            format!("{at}/items"),
-            get(
-                &format!("items-{}", c.id),
-                "a page of Features",
-                "application/geo+json",
-                &items_params,
-            ),
-        );
-        paths.insert(
-            format!("{at}/items/{{featureId}}"),
-            get(
-                &format!("item-{}", c.id),
-                "one Feature",
-                "application/geo+json",
-                &feature_id,
-            ),
-        );
+        collection_paths(&mut paths, c, offers, (&items_params, &feature_id));
     }
     json!({
         "openapi": "3.0.3",
         "info": {"title": "OGC API - Features", "version": "1.0.0"},
         "servers": [{"url": base}],
         "paths": paths,
-        "components": {
-            "schemas": {"problem": {"type": "object", "properties": {"type": {"type": "string"}, "title": {"type": "string"}, "status": {"type": "integer"}, "detail": {"type": "string"}}}},
-            "parameters": {
-                "limit": {"name": "limit", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 10}},
-                "bbox": {"name": "bbox", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "array", "oneOf": [{"minItems": 4, "maxItems": 4}, {"minItems": 6, "maxItems": 6}], "items": {"type": "number"}}},
-                "datetime": {"name": "datetime", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "string"}},
-                "next": {"name": "next", "in": "query", "required": false, "description": "the token of a next link", "schema": {"type": "string"}},
-            },
-        },
+        "components": components(),
     })
 }
 
@@ -131,7 +251,20 @@ mod tests {
             time: None,
             properties: Vec::new(),
         };
-        let doc = document("http://b", &BTreeMap::from([("Car".to_owned(), car)]));
+        let doc = document(
+            "http://b",
+            &BTreeMap::from([("Car".to_owned(), car)]),
+            &|op| op != OperationId::MergeEntity,
+        );
+        let item = doc.pointer("/paths/~1collections~1Car~1items~1{featureId}");
+        assert_eq!(
+            ["put", "patch", "delete"].map(|m| item.and_then(|i| i.get(m)).is_some()),
+            [true, false, true],
+            "only the writes the view offers"
+        );
+        assert!(doc
+            .pointer("/paths/~1collections~1Car~1items/post/requestBody")
+            .is_some());
         let paths = doc
             .get("paths")
             .unwrap_or(&Value::Null)
@@ -147,6 +280,8 @@ mod tests {
                 "/collections/Car",
                 "/collections/Car/items",
                 "/collections/Car/items/{featureId}",
+                "/collections/Car/schema",
+                "/collections/Car/sortables",
                 "/conformance"
             ]
         );

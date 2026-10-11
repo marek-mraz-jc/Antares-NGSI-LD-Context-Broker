@@ -5,6 +5,9 @@ name: ci
 #   workspace tests ──→ [image build → quick matrix (file postgres timescale) → summary]
 #                   └──→ build arm64 image ──────────────→ publish :dev (dev, all green)
 #
+# On dev the workspace tests are the green `fast` run that started this one
+# (T-3717): the matrix and the arm64 build start at once on its head_sha.
+#
 # Branch model (CONTRIBUTING.md): `dev` takes the commits and the pull
 # requests, and this workflow is its gate. `main` moves only by a pull
 # request from `dev`, gated by full.yml; `v*` tags on `main` run
@@ -25,21 +28,61 @@ name: ci
 # k8s-smoke.yml. Shared pieces: workspace.yml (the test gate),
 # etsi-matrix.yml (the cell matrix), build-image.yml (image builds).
 
-# Runs on PRs targeting dev and on manual dispatch — NOT on every push:
-# cancel-in-progress meant a 40 min run never finished under a stream of
-# fix commits. Dispatch it when a batch is ready. Tags run full.yml.
+# Runs on PRs targeting dev, on manual dispatch, and after a GREEN `fast`
+# run on dev (T-3717): fast.yml already ran workspace.yml on that commit, so
+# this run checks out the fast run's head_sha and starts the ETSI matrix and
+# the arm64 build at once, without a second workspace run. A red fast run
+# starts nothing here. A dispatch runs workspace first unless
+# `with_workspace` is false. NOT on every push: cancel-in-progress meant a
+# 40 min run never finished under a stream of fix commits. Tags run full.yml.
 on:
   pull_request:
     branches: [dev]
   workflow_dispatch:
+    inputs:
+      with_workspace:
+        description: "run workspace.yml first (false: a green fast run already gated this commit)"
+        type: boolean
+        default: true
+  workflow_run:
+    workflows: [fast]
+    types: [completed]
+    branches: [dev]
 
 # A newer commit supersedes a running pipeline.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# The commit under test: the green fast run's head_sha under workflow_run
+# (github.sha is then the tip of dev, which may have moved), else the
+# triggering commit.
+env:
+  HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
 jobs:
+  fast-gate:
+    # Under workflow_run a fast run that did not go green (red, or cancelled
+    # by a newer push) starts nothing: this run cancels itself, so tasks/ci
+    # reads it as neither green nor red. The red fast run is its own ci-red.
+    name: The fast run was not green
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/cancel"
+          sleep 120
+
   workspace:
+    # skipped under workflow_run (fast ran it on this commit) and on a
+    # dispatch with with_workspace false
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.with_workspace)
     permissions:
       contents: read
     # The shared workspace-test gate (workflow_call) — one definition for
@@ -52,11 +95,14 @@ jobs:
     # The full seven-cell matrix runs twice a week, on v* tags and by manual
     # dispatch — all in full.yml.
     name: ETSI cell matrix
-    # GATE: no image build / ETSI run unless the workspace suite is green.
+    # GATE: no image build / ETSI run unless the workspace suite is green,
+    # here or in the fast run that triggered this one.
     needs: workspace
+    if: ${{ !cancelled() && contains(fromJSON('["success", "skipped"]'), needs.workspace.result) && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') }}
     uses: ./.github/workflows/etsi-matrix.yml
     with:
       preset: quick
+      ref: ${{ github.event.workflow_run.head_sha }}
     permissions:
       contents: read
       actions: write # the summary job deletes the merged per-cell artifacts
@@ -67,12 +113,13 @@ jobs:
     # The arm64 half of the published manifest — BUILT, never tested; the
     # rationale lives in the shared build-image.yml.
     name: Build the arm64 image (untested)
-    # GATE: only build after the workspace suite passes.
+    # GATE: only build after the workspace suite passes (here or in fast).
     needs: workspace
-    if: github.ref == 'refs/heads/dev'
+    if: ${{ github.ref == 'refs/heads/dev' && !cancelled() && contains(fromJSON('["success", "skipped"]'), needs.workspace.result) && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') }}
     uses: ./.github/workflows/build-image.yml
     with:
       arch: arm64
+      ref: ${{ github.event.workflow_run.head_sha }}
 
   publish-dev:
     # Every green dispatched run on dev ships a DEV image: the sha and a moving
@@ -83,7 +130,10 @@ jobs:
     # Runs on dev publish :dev; PRs never do. All signals — workspace
     # tests, the cell matrix (quick preset, all 10 suites incl. IOP per
     # cell) and the arm build — must be green.
-    if: github.ref == 'refs/heads/dev' && success()
+    if: >-
+      github.ref == 'refs/heads/dev' && !cancelled()
+      && contains(fromJSON('["success", "skipped"]'), needs.workspace.result)
+      && needs.matrix.result == 'success' && needs.build-arm.result == 'success'
     needs: [workspace, matrix, build-arm]
     runs-on: ubuntu-latest
     permissions:
@@ -109,7 +159,7 @@ jobs:
           docker load < antares-image-arm64.tgz
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           IMG=ghcr.io/${{ github.repository_owner }}/antares-broker
-          SHA=${GITHUB_SHA::7}
+          SHA=${HEAD_SHA::7}
           docker tag antares-local:latest "$IMG:$SHA-amd64"
           docker tag antares-local:arm64 "$IMG:$SHA-arm64"
           docker push "$IMG:$SHA-amd64"

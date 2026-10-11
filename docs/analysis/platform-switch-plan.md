@@ -28,7 +28,7 @@ The Endpoint kind is `EndpointSpec` (joinedcontext-platform `crates/jc-core/src/
 | `q`, `scopeQ`, `geoQ` | `projection.filter.q`, `.scopeQ`, `.geoQ` (`model_projection.rs` `ProjectionFilter`) | Copied. `temporalQ` has no view member: an Endpoint with a projection `temporalQ` stays on the gateway until G6 (section 3.1) lands; the writer refuses it with that reason. |
 | `operations` | union of the bound Policies' `operations` (`policy.rs:629`; `OperationRef` single or group, `:430`), each CIM 009 name mapped to the matrix row whose `cim009` clause it names (map section 2.2 has the name-to-clause table), groups expanded by Table 4.20-2 | An Endpoint serving `mcp` keeps the same list: the MCP tools follow the view's allowlist (`mcp-surface.md`). Operations outside the map's 2.2 table (registrations, `@context` management, snapshots, purge) never enter a view, which is what S16 asked for. |
 | `@context` | none | The view's names are written as expanded IRIs, so no context is needed and K30 holds by construction (`ADR-0020:112-123`). |
-| `linkml` | the resolved LinkML JSON of the projection's model, or of the space's `dataModelRef` | Until T-3628 moves the schema to a per-Tenant document; then the writer stops sending it (section 5.4). |
+| (schema) | the resolved LinkML JSON of the space's `dataModelRef` | Not a view member (T-3628): the writer PUTs it to `/q/schemas/{tenant}` once per Tenant, and each view narrows it by its rules, so a projection's classes and slots reach the surface as the view's `rules` (`docs/src/linkml.md` section 1). The broker needs `ANTARES_SCHEMA_MAX_BYTES` set (T-3642), or every schema write answers 503 and the LinkML surface stays 404 (section 5.4). |
 
 Endpoint fields that do not reach the view, and where they stay:
 

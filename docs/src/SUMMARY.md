@@ -13,6 +13,7 @@
 - [Temporal API](temporal.md)
 - [Endpoint views](views.md)
 - [MCP endpoint of a view](mcp.md)
+- [LinkML schema of a view](linkml.md)
 - [OData endpoint of a view](odata.md)
 - [OGC API - Features endpoint of a view](ogc.md)
 - [WebSocket notifications](websocket.md)
