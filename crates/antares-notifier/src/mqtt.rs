@@ -7,9 +7,9 @@
 //! parameters ride in `notifier_info` (Table 7.2-1), receiver metadata in
 //! `receiver_info` (Table 7.2-2).
 
+use crate::build_message;
 use antares_jsonld::loader::EgressPolicy;
 use antares_model::NgsiError;
-use crate::build_message;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
