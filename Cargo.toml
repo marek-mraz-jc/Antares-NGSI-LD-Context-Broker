@@ -19,6 +19,7 @@ members = [
     "crates/odata-json",
     "crates/odata-batch",
     "crates/odata-axum",
+    "crates/ogc-cql2",
     "crates/antares-views",
     "crates/antares-mcp",
     "crates/antares-odata",
@@ -191,6 +192,10 @@ overflow-checks = true
 opt-level = "s"
 
 [profile.release.package.odata-url]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.ogc-cql2]
 overflow-checks = true
 codegen-units = 1
 
