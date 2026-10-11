@@ -1038,13 +1038,25 @@ async fn notification_after_zone_exit_has_no_hidden_previous_value() {
         last.to_string().contains("left"),
         "no notification of the change: {seen:?}"
     );
+    // the subscription's initial notification of Car a and b may travel in
+    // the same batch as the change (T-3690): every entry is held to the
+    // rules, not only the last one per id
     let data = last["data"].as_array().cloned().unwrap_or_default();
-    assert_eq!(
-        members(&json!(data))["urn:ngsi-ld:Car:a"],
-        keys(&["id", "type", "status"]),
-        "a hidden Attribute or its previousValue travelled: {last}"
-    );
-    assert_eq!(data.len(), 1, "{last}");
+    for e in &data {
+        assert_eq!(e["type"], "Car", "a Robot was notified: {last}");
+        assert_eq!(
+            members(&json!([e])).into_values().next(),
+            Some(keys(&["id", "type", "status"])),
+            "a hidden Attribute or its previousValue travelled: {last}"
+        );
+    }
+    let change: Vec<_> = data
+        .iter()
+        .filter(|e| e["status"]["value"] == "left")
+        .collect();
+    assert_eq!(change.len(), 1, "{last}");
+    assert_eq!(change[0]["id"], "urn:ngsi-ld:Car:a", "{last}");
+    assert_eq!(change[0]["status"]["previousValue"], "ok", "{last}");
 }
 
 /// The history of `speed` is served only for the instants Car a was in

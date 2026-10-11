@@ -2828,6 +2828,16 @@ mod tests {
             Condition::of(&scoped).is_some(),
             "a scopeQ alone selects: it is a condition"
         );
+        let vehicles = Condition::of(&Filter {
+            rules: vec![Rule {
+                types: vec!["Vehicle".into()],
+                ..Rule::default()
+            }],
+            ..Filter::default()
+        })
+        .expect("a type rule alone selects: it is a condition");
+        let car = serde_json::json!({"id": "urn:ngsi-ld:Car:c", "type": [format!("{dc}Car")]});
+        assert!(vehicles.holds(&doc("B")) && !vehicles.holds(&car));
         assert!(Condition::of(&Filter::default()).is_none());
         assert!(Condition::unforwarded(Some(&c), false).is_ok());
         assert!(Condition::unforwarded(None, true).is_ok());

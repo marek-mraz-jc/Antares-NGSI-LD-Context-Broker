@@ -1629,6 +1629,7 @@ fn strict_peer() -> (u16, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
             }
             let request = String::from_utf8_lossy(&request);
             let temporal = request.contains("/temporal/entities");
+            let map = request.contains("/entityMaps");
             let q = forwarded_q(&request);
             let refused = q
                 .as_deref()
@@ -1644,6 +1645,20 @@ fn strict_peer() -> (u16, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
                         "title": "q expression exceeds 512 nodes",
                     }),
                 )
+            } else if map {
+                (
+                    "200 OK",
+                    json!({
+                        "id": "urn:ngsi-ld:entitymap:strict-peer",
+                        "type": "EntityMap",
+                        "expiresAt": "2999-01-01T00:00:00Z",
+                        "entityMap": {
+                            "urn:ngsi-ld:Vehicle:remote": ["@none"],
+                            "urn:ngsi-ld:Vehicle:fast": ["@none"],
+                        },
+                        "linkedMaps": {},
+                    }),
+                )
             } else if temporal {
                 let at = "2026-01-01T00:00:00Z";
                 (
@@ -1656,15 +1671,22 @@ fn strict_peer() -> (u16, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
                     }]),
                 )
             } else {
-                (
-                    "200 OK",
-                    json!([{
-                        "id": "urn:ngsi-ld:Vehicle:remote",
+                let mut found = vec![json!({
+                    "id": "urn:ngsi-ld:Vehicle:remote",
+                    "type": "Vehicle",
+                    "a": {"type": "Property", "value": 1},
+                    "speed": {"type": "Property", "value": 30},
+                })];
+                // the Entity only an EntityMap names: read back by id
+                if request.contains("Vehicle%3Afast") || request.contains("Vehicle:fast") {
+                    found.push(json!({
+                        "id": "urn:ngsi-ld:Vehicle:fast",
                         "type": "Vehicle",
                         "a": {"type": "Property", "value": 1},
-                        "speed": {"type": "Property", "value": 30},
-                    }]),
-                )
+                        "speed": {"type": "Property", "value": 90},
+                    }));
+                }
+                ("200 OK", json!(found))
             };
             let body = body.to_string();
             let reply = format!(
@@ -1754,5 +1776,87 @@ async fn same_answer_through_the_engine(open: &AppState, narrowed: &AppState, ur
         read(narrowed).await,
         want,
         "{path}: the engine's q changed the answer"
+    );
+}
+
+/// T-3683, threat V23 on 5.14.4: an EntityMap forward carries the `q` the
+/// Query Entities forward does. A narrowed `q` past the peer's cap would
+/// leave the peer out of the map, which no engine would do. Through the
+/// engine the peer is asked without it and its map is narrowed here: the
+/// Entity the narrowing selects and the peer's linked map, as with no
+/// engine; the one it hides (speed 90) is not in the map; no warning; and
+/// no forward is one the peer refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entity_map_under_a_narrowed_q_past_a_peers_cap_is_the_callers_map() {
+    let (port, seen) = strict_peer();
+    let open = state(Filter::default()).await;
+    let narrowed = state(slow()).await;
+    let reg = "urn:ngsi-ld:ContextSourceRegistration:strict-peer";
+    for st in [&open, &narrowed] {
+        let (code, doc) = send(
+            st,
+            "POST",
+            "/ngsi-ld/v1/csourceRegistrations",
+            Some(json!({
+                "id": reg,
+                "type": "ContextSourceRegistration",
+                "mode": "inclusive",
+                "operations": ["queryEntity", "createEntityMapQueryEntity"],
+                "information": [{"entities": [{"type": "Vehicle"}]}],
+                "endpoint": format!("http://127.0.0.1:{port}"),
+            })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{doc}");
+    }
+    let q = vec!["a==1"; antares_ql::MAX_Q_NODES - 1].join("|");
+    let uri = format!("/ngsi-ld/v1/entityMaps?type=Vehicle&q={}", enc(&q));
+    let map = |st: &AppState| {
+        let st = st.clone();
+        let uri = uri.clone();
+        async move {
+            let res = antares_api::router(st)
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = res.status();
+            let warning = res.headers().get("ngsild-warning").cloned();
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            let doc: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            (
+                status,
+                doc["entityMap"].clone(),
+                doc["linkedMaps"].clone(),
+                warning,
+            )
+        }
+    };
+    let want = map(&open).await;
+    assert_eq!(
+        (want.1.clone(), want.2.clone()),
+        (
+            json!({"urn:ngsi-ld:Vehicle:remote": [reg], "urn:ngsi-ld:Vehicle:fast": [reg]}),
+            json!({reg: "urn:ngsi-ld:entitymap:strict-peer"})
+        ),
+        "with no engine the peer maps the caller's q: {want:?}"
+    );
+    let got = map(&narrowed).await;
+    assert_eq!(
+        got,
+        (
+            want.0,
+            json!({"urn:ngsi-ld:Vehicle:remote": [reg]}),
+            want.2.clone(),
+            None
+        ),
+        "the map through the engine is the caller's map, narrowed"
+    );
+    let asked: Vec<Option<String>> = seen.lock().unwrap().drain(..).collect();
+    assert!(
+        asked
+            .iter()
+            .all(|q| q.as_deref().is_none_or(|q| antares_ql::parse_q(q).is_ok())),
+        "a forward the peer refuses: {} forwards",
+        asked.len()
     );
 }

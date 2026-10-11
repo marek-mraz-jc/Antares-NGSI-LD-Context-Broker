@@ -5,7 +5,8 @@ name: strict
 #
 #   DAILY  02:41 UTC : doc warnings + unused deps, fuzz-crash regression
 #                      replay (-runs=0), query pushdown properties at 10k
-#                      cases, workspace coverage floor
+#                      cases, workspace coverage floor, surface feature
+#                      powerset at depth 2
 #   WEEKLY Sun 03:41 : ThreadSanitizer over the workspace tests, Miri over
 #                      the pure parsing crates
 #
@@ -287,12 +288,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo +nightly miri test -p antares-model -p antares-ql -p antares-matcher -p linkml-model -p odata-csdl -p odata-url -p odata-json -p odata-batch
 
+  feature-powerset:
+    # ADR-0027 section 4 (T-3493): every pair of surface features compiles
+    # (`--depth 2`, decided there), with mqtt on as the shipped default has
+    # it, so an interaction between two surfaces cannot compile only in
+    # `full`; and `full` itself with and without mqtt once it exists. The
+    # surface features are read from the broker's manifest
+    # (dev/surface-features.py), so a new surface joins by being declared.
+    name: Surface feature powerset, depth 2 (daily)
+    if: github.event.schedule != '41 3 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - run: python3 dev/surface-features.py --self-test
+      - name: Every pair of surface features, with mqtt
+        run: cargo hack check --locked -p antares-broker --feature-powerset --depth 2 --include-features "$(python3 dev/surface-features.py list)" --features mqtt
+      - name: full, with and without mqtt
+        run: |
+          if python3 dev/surface-features.py list | tr , '\n' | grep -qx full; then
+            cargo check --locked -p antares-broker --no-default-features --features full
+            cargo check --locked -p antares-broker --features full
+          else
+            echo "antares-broker has no full feature yet"
+          fi
+
   alarm:
     # A red scheduled wall auto-files a deduped issue (the shared
     # failure-issue action) — dispatch runs are watched by the dispatcher.
     name: File an issue on a red scheduled run
     if: failure() && github.event_name == 'schedule'
-    needs: [hygiene, fuzz-regression, properties, coverage, tsan, miri]
+    needs: [hygiene, fuzz-regression, properties, coverage, feature-powerset, tsan, miri]
     runs-on: ubuntu-latest
     permissions:
       contents: read

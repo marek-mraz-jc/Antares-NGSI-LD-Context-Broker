@@ -197,7 +197,7 @@ instance type):
 | LinkML document | ≤ 5 ms p99 for a 100-class schema, cached per view revision | computed once per view revision |
 | WebSocket notification | delivery latency p99 ≤ HTTP sink p99 to a local receiver; ≤ 32 KiB resident per idle connection plus its queue | no socket opened per notification |
 | internal CSR forward | p99 ≤ 0.5× the HTTP forward to the same broker | no socket, no TLS, no second JSON parse of the request line |
-| binary size | `full` release binary ≤ vanilla + 6 MiB; each feature alone ≤ vanilla + 2 MiB, except `mcp` ≤ vanilla + 4.5 MiB (T-3662) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
+| binary size | `full` release binary ≤ vanilla + 6 MiB; each feature alone ≤ vanilla + 2 MiB, except `mcp` ≤ vanilla + 4.5 MiB (T-3662) and `odata` ≤ vanilla + 3.5 MiB (T-3705) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
 | vanilla | unchanged within the noise band of T-3467 | GOAL point 1 |
 
 A benchmark per row: criterion benches in each surface crate for the
@@ -234,6 +234,26 @@ second removes MCP behaviour. Options: raise the `mcp` budget (chosen),
 measure each feature over the feature it implies (`mcp` over `views`,
 2.98 MiB, still over), size-optimise the MCP crates (+3.41 MiB, still
 over), replace rmcp.
+
+The `odata` budget, measured 2026-10-11 on dev 8c42bcd (T-3705), same
+build: vanilla 31 106 992 bytes; `views` 32 374 448 (+1.21 MiB);
+`odata` 34 439 120 (+3.18 MiB). `odata` implies `views`, so its own
+share is 1.97 MiB, inside the per-feature 2 MiB. `cargo bloat --crates`
+against the `views` build puts 348 KiB of `.text` in `antares_odata`,
+135 KiB in `linkml_model` (the Tenant's schema that `$metadata` reads),
+115 KiB in `odata_url`, 279 KiB more in `serde_json` and 307 KiB more in
+`std` (generic instantiations). The `serde_json` share is its
+`float_roundtrip` feature, which ADR-0024 requires of `odata-json` and
+`odata-batch` (T-3504, T-3505) so an `Edm.Double` reads back to the same
+bits; Cargo unifies it for the whole binary.
+
+Decided (worker-4, owner may override): `odata` ≤ vanilla + 3.5 MiB,
+because its own share over `views` meets the 2 MiB rule and the rest is
+`views` plus a float parser that ADR-0024 makes a correctness property.
+Options: raise the `odata` budget (chosen), drop `float_roundtrip` (an
+`Edm.Double` no longer round-trips, ADR-0024 broken), measure each
+feature over the feature it implies (changes the rule for every feature),
+size-optimise the OData crates (saves part of 0.6 MiB, still over 2 MiB).
 
 ### 7. Code rules for every new crate
 
