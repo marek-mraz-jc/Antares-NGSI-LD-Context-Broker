@@ -23,10 +23,10 @@ const SCHEMA: &str = r#"{
   "id": "https://example.org/city", "name": "city",
   "prefixes": {"city": {"prefix_prefix": "city", "prefix_reference": "https://example.org/city/"}},
   "default_prefix": "city",
-  "classes": {"Car": {"slots": ["brand", "owner", "note", "speed", "seats", "since"]}},
+  "classes": {"Car": {"slots": ["brand", "owner", "note", "speed", "seats", "since", "day", "at"]}},
   "slots": {"brand": {"range": "string"}, "owner": {"range": "string"}, "note": {"range": "string"},
             "speed": {"range": "float"}, "seats": {"range": "integer"},
-            "since": {"range": "datetime"}}
+            "since": {"range": "datetime"}, "day": {"range": "date"}, "at": {"range": "time"}}
 }"#;
 
 /// `(n, brand, owner)` of a Car; its seats are `n`, its speed `10.5 n`, `since` the 15th of
@@ -108,7 +108,7 @@ async fn broker(hiding: bool) -> Result<(TestBroker, Router), String> {
         "selector": ["city:Car"],
         "rules": [{"types": ["city:Car"],
                    "attributes": ["city:brand", "city:owner", "city:speed", "city:seats",
-                                  "city:since"]}],
+                                  "city:since", "city:day", "city:at"]}],
         "operations": ["query_entities", "retrieve_entity"]
     });
     let mut writes = vec![
@@ -126,6 +126,10 @@ async fn broker(hiding: bool) -> Result<(TestBroker, Router), String> {
             format!("{CITY}seats"): {"type": "Property", "value": n},
             format!("{CITY}since"): {"type": "Property",
                 "value": {"@type": "DateTime", "@value": format!("2025-{n:02}-15T00:00:00Z")}},
+            format!("{CITY}day"): {"type": "Property",
+                "value": {"@type": "Date", "@value": format!("2025-{n:02}-15")}},
+            format!("{CITY}at"): {"type": "Property",
+                "value": {"@type": "Time", "@value": format!("{n:02}:00:00")}},
             format!("{CITY}note"): {"type": "Property", "value": "secret"}
         });
         for (name, value) in [("brand", brand), ("owner", owner)] {
@@ -243,7 +247,15 @@ async fn groupby_makes_a_row_per_distinct_key_in_the_order_first_seen() -> Resul
         rows(&app, "groupby((brand),aggregate($count as n))/groupby((n),aggregate($count as k))/orderby(n)/skip(1)/top(1)/identity").await?,
         json!([{"n": 2, "k": 2}])
     );
-    // a date of a row compares as a date
+    // a date, a time and an instant of a row compare as such
+    assert_eq!(
+        rows(
+            &app,
+            "groupby((day,at))/filter(day ge 2025-03-01 and at lt 05:00:00)/orderby(day desc)"
+        )
+        .await?,
+        json!([{"day": "2025-04-15", "at": "04:00:00"}, {"day": "2025-03-15", "at": "03:00:00"}])
+    );
     assert_eq!(
         rows(&app, "groupby((brand),aggregate(since with max as last))/filter(last gt 2025-03-01T00:00:00Z)/orderby(brand)").await?,
         json!([{"brand": null, "last": "2025-05-15T00:00:00Z"},
@@ -421,6 +433,14 @@ async fn apply_is_refused_where_it_does_not_apply() -> Result<(), String> {
         ),
         (
             "Car?$apply=filter(brand add 1 eq 2)",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "Car('urn:ngsi-ld:Car:1')/brand?$apply=identity",
+            StatusCode::NOT_IMPLEMENTED,
+        ),
+        (
+            "Car?$apply=groupby((brand),aggregate($count as n))/filter(brand add 1 eq 2)",
             StatusCode::BAD_REQUEST,
         ),
         (

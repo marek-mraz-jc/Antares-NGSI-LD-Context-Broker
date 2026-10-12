@@ -1651,7 +1651,7 @@ pub(crate) async fn scanned(
 /// `docs` in the order of `keys` (Q9, URL 5.1.5): null and missing values
 /// first ascending, numbers by value, strings by code point; ties keep the
 /// upstream order, which ends in `id`.
-pub(crate) fn sort(docs: &mut [Value], keys: &[SortKey]) {
+fn sort(docs: &mut [Value], keys: &[SortKey]) {
     docs.sort_by(|a, b| {
         keys.iter()
             .map(|k| {

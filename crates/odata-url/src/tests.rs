@@ -1773,6 +1773,7 @@ fn apply_refuses_what_is_no_served_transformation() {
         ("aggregate(height)", 33),
         ("aggregate(height from name with sum as s)", 33),
         ("aggregate(height with ns.f as s)", 39),
+        ("aggregate(height with)", 33),
     ] {
         refused(&format!("Buildings?$apply={query}"), Feature::Apply, offset);
     }
@@ -1791,6 +1792,10 @@ fn apply_refuses_what_is_no_served_transformation() {
         ("groupby((name),aggregate($count as n)", 54),
         ("groupby((name),aggregate($count as name))", 56),
         ("aggregate($count)", 33),
+        ("groupby((name x))", 31),
+        ("groupby((name),aggregate($count as n x))", 54),
+        ("aggregate($count is n)", 34),
+        ("aggregate($count as 1)", 37),
         ("aggregate($count as)", 36),
         ("aggregate(height with median as m)", 45),
         ("aggregate(height with sum as s,$count as s)", 59),
@@ -1815,6 +1820,12 @@ fn apply_writes_its_canonical_form() {
             "groupby((name,built),aggregate(height%20with%20average%20as%20a,$count%20as%20n))",
         ),
         ("groupby((name))", "groupby((name))"),
+        (
+            "aggregate(height with sum as s,height with min as lo,height with max as hi,\
+             height with countdistinct as d)",
+            "aggregate(height%20with%20sum%20as%20s,height%20with%20min%20as%20lo,\
+             height%20with%20max%20as%20hi,height%20with%20countdistinct%20as%20d)",
+        ),
     ] {
         let uri = ok(&format!("Buildings?$apply={query}"));
         assert_eq!(uri.to_string(), format!("Buildings?$apply={canonical}"));

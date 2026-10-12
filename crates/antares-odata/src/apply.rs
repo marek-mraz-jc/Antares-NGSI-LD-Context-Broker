@@ -16,10 +16,10 @@
 //! `$count` and the `ngsild.*` options apply as on any collection read.
 
 use crate::edm::{Member, Set, Shape, Written};
-use crate::filter::{compute, numeric, whole, SortBy, SortKey, Translated};
+use crate::filter::{compute, numeric, whole, Translated};
 use crate::read::{
-    attach, digest, entity_value, ngsild, not_implemented, now, paged, position, pushdown, refusal,
-    resource, scanned, set_of, sort, token, Reads, COMPUTED,
+    attach, compare, digest, entity_value, ngsild, not_implemented, now, paged, position, pushdown,
+    refusal, resource, scanned, set_of, token, Reads, COMPUTED,
 };
 use antares_ops::{Caller, Page as ScanPage};
 use axum::http::{HeaderMap, StatusCode};
@@ -59,7 +59,10 @@ pub(crate) async fn collection(
     let set = set_of(reads, set_name, version)?;
     let steps = options.apply.as_deref().unwrap_or_default();
     // the transformations up to the first aggregation read the Entities
-    let split = steps.iter().position(aggregates).unwrap_or(steps.len());
+    let split = steps
+        .iter()
+        .position(|s| grouped(s).is_some())
+        .unwrap_or(steps.len());
     let (before, after) = steps.split_at(split);
     let mut t = Translated::default();
     let items: Vec<Compute> = before
@@ -81,7 +84,7 @@ pub(crate) async fn collection(
     let (mut docs, _) = scanned(reads, caller, &pushdown, &program, all, version).await?;
     attach(&mut docs, &t, version)?;
     for (at, step) in before.iter().enumerate() {
-        docs = kept(step, at, docs);
+        docs = kept(step, at, docs, |doc| doc);
     }
     let digest = digest(&reads.state.service_root, path, options);
     let window = position(reads, options, digest, headers, version)?;
@@ -99,7 +102,10 @@ pub(crate) async fn collection(
         format!("{}{uri}", reads.state.service_root)
     };
     let counted = options.count == Some(true);
-    let Some((first, later)) = after.split_first() else {
+    let aggregation = after
+        .split_first()
+        .and_then(|(first, later)| Some((grouped(first)?, later)));
+    let Some((first, later)) = aggregation else {
         // no aggregation: the Entities, as a collection read writes them
         let (docs, total, next) = paged(docs, window, &link);
         let plain = Translated {
@@ -167,12 +173,17 @@ fn types(t: &Translated) -> BTreeMap<&str, &'static str> {
         .collect()
 }
 
-/// Whether a transformation aggregates: what follows reads its rows.
-fn aggregates(step: &Transformation) -> bool {
-    matches!(
-        step,
-        Transformation::Aggregate(_) | Transformation::GroupBy { .. }
-    )
+/// The grouping properties and the aggregates of a transformation that aggregates (what
+/// follows reads its rows), `None` for one that keeps the instances.
+fn grouped(step: &Transformation) -> Option<(&[String], &[Aggregate])> {
+    match step {
+        Transformation::GroupBy {
+            properties,
+            aggregate,
+        } => Some((properties, aggregate.as_deref().unwrap_or_default())),
+        Transformation::Aggregate(list) => Some((&[], list)),
+        _ => None,
+    }
 }
 
 /// Where the `item`th value of the transformation at `step` is kept among an instance's
@@ -226,23 +237,35 @@ fn value<'d>(doc: &'d Value, name: &str) -> Option<&'d Value> {
     doc.get(COMPUTED)?.get(name).filter(|v| !v.is_null())
 }
 
-/// The instances a transformation that does not aggregate keeps, in its order.
-fn kept(step: &Transformation, at: usize, mut docs: Vec<Value>) -> Vec<Value> {
+/// The instances a transformation that does not aggregate keeps, in its order, each read
+/// through `doc`. A sort puts null first ascending and keeps the order of ties (URL 5.1.5).
+fn kept<T>(
+    step: &Transformation,
+    at: usize,
+    mut docs: Vec<T>,
+    doc: impl Fn(&T) -> &Value,
+) -> Vec<T> {
     let count = |n: &u64| usize::try_from(*n).unwrap_or(usize::MAX);
     match step {
         Transformation::Filter(_) => {
-            docs.retain(|doc| value(doc, &slot(at, 0)) == Some(&Value::Bool(true)));
+            docs.retain(|d| value(doc(d), &slot(at, 0)) == Some(&Value::Bool(true)));
         }
         Transformation::OrderBy(keys) => {
-            let keys: Vec<SortKey> = keys
-                .iter()
-                .enumerate()
-                .map(|(i, k)| SortKey {
-                    by: SortBy::Computed(slot(at, i)),
-                    descending: k.descending,
-                })
-                .collect();
-            sort(&mut docs, &keys);
+            docs.sort_by(|a, b| {
+                keys.iter()
+                    .enumerate()
+                    .map(|(i, k)| {
+                        let name = slot(at, i);
+                        let o = compare(value(doc(a), &name), value(doc(b), &name));
+                        if k.descending {
+                            o.reverse()
+                        } else {
+                            o
+                        }
+                    })
+                    .find(|o| o.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
         Transformation::Top(n) => docs.truncate(count(n)),
         Transformation::Skip(n) => {
@@ -262,20 +285,12 @@ struct Rows {
 
 /// The rows of the aggregation at `at` over `docs`, whose computed values have the Edm `types`.
 fn aggregated(
-    step: &Transformation,
+    (properties, list): (&[String], &[Aggregate]),
     at: usize,
     docs: &[Value],
     types: &BTreeMap<&str, &'static str>,
     version: ODataVersion,
 ) -> Result<Rows, ODataErrorResponse> {
-    let (properties, list): (&[String], &[Aggregate]) = match step {
-        Transformation::GroupBy {
-            properties,
-            aggregate,
-        } => (properties, aggregate.as_deref().unwrap_or_default()),
-        Transformation::Aggregate(list) => (&[], list),
-        _ => (&[], &[]),
-    };
     let edm_of = |name: &str| types.get(name).copied().unwrap_or("Edm.Untyped");
     let mut names: Vec<(String, &'static str)> = properties
         .iter()
@@ -352,7 +367,7 @@ fn folded<'v>(a: &Aggregate, values: impl Iterator<Item = &'v Value>, instances:
         }
         AggregateWith::Min | AggregateWith::Max => {
             let pick = values.into_iter().reduce(|best, v| {
-                let o = crate::read::compare(Some(v), Some(best));
+                let o = compare(Some(v), Some(best));
                 let better = if with == AggregateWith::Min {
                     o.is_lt()
                 } else {
@@ -437,15 +452,13 @@ fn over_rows(
         .map(|row| pseudo(&rows.names, &terms, row))
         .collect();
     attach(&mut docs, &t, version)?;
-    if aggregates(step) {
-        return aggregated(step, at, &docs, &types(&t), version);
+    if let Some(grouping) = grouped(step) {
+        return aggregated(grouping, at, &docs, &types(&t), version);
     }
-    let values = kept(step, at, docs)
+    let pairs: Vec<(Value, Vec<Value>)> = docs.into_iter().zip(rows.values).collect();
+    let values = kept(step, at, pairs, |(doc, _)| doc)
         .into_iter()
-        .map(|mut doc| match doc.get_mut("@row").map(Value::take) {
-            Some(Value::Array(row)) => row,
-            _ => Vec::new(),
-        })
+        .map(|(_, row)| row)
         .collect();
     Ok(Rows {
         names: rows.names,
@@ -454,7 +467,7 @@ fn over_rows(
 }
 
 /// One row as a normalized NGSI-LD Entity: each non-null value a Property under its term, a
-/// date, time or instant as its typed JSON-LD value, and the row itself under `@row`.
+/// date, time or instant as its typed JSON-LD value.
 fn pseudo(names: &[(String, &'static str)], terms: &[String], row: &[Value]) -> Value {
     let mut doc = Map::new();
     doc.insert("id".into(), Value::from("urn:ngsi-ld:Row:0"));
@@ -476,7 +489,6 @@ fn pseudo(names: &[(String, &'static str)], terms: &[String], row: &[Value]) -> 
             serde_json::json!({"type": "Property", "value": v}),
         );
     }
-    doc.insert("@row".into(), Value::Array(row.to_vec()));
     Value::Object(doc)
 }
 
@@ -504,9 +516,6 @@ fn written(
             format!("{prefix}context"),
             Value::from(context_url(ctx, &target)),
         ));
-        if let Some(tag) = ctx.metadata_etag {
-            members.push((format!("{prefix}metadataEtag"), Value::from(tag)));
-        }
     }
     if let Some(count) = count {
         members.push((format!("{prefix}count"), Value::from(count)));
