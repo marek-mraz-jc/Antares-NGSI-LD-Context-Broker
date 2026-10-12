@@ -370,30 +370,59 @@ async fn reap_expired_entities(pool: &PgPool) -> Result<u64, sqlx::Error> {
 /// stamp wins) and were last modified before `before`. The subquery bounds
 /// the statement; `i_entities_types` serves the (tenant, type) match. Service
 /// role, like every reap here; the 4.22 reap's precedent holds: rows go, no
-/// notification is owed for a removal the client declared.
+/// notification is owed for a removal the client declared. `dry_run` counts
+/// the same rows and deletes none.
 pub async fn retain_current(
     pool: &PgPool,
     tenant: &str,
     type_iri: &str,
     before: &str,
     batch: usize,
+    dry_run: bool,
 ) -> Result<u64, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    crate::store::pg::set_service(&mut tx).await?;
-    let n = sqlx::query(
-        "DELETE FROM entities WHERE (tenant_id, id) IN (
-           SELECT tenant_id, id FROM entities
+    const ROWS: &str = "SELECT tenant_id, id FROM entities
            WHERE tenant_id = $1 AND types @> ARRAY[$2]::text[]
              AND expires_at IS NULL AND modified_at < $3::timestamptz
-           LIMIT $4)",
+           LIMIT $4";
+    retain(
+        pool,
+        ROWS,
+        "DELETE FROM entities WHERE (tenant_id, id) IN",
+        (tenant, type_iri, before, batch),
+        dry_run,
     )
-    .bind(tenant)
-    .bind(type_iri)
-    .bind(antares_store::filter::canonical_datetime(before).as_ref())
-    .bind(i64::try_from(batch).unwrap_or(i64::MAX))
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    .await
+}
+
+/// One bounded retention statement: `rows` selects at most `$4` keys of
+/// Tenant `$1` and type `$2` before `$3`; `delete` removes them, a dry run
+/// counts them.
+async fn retain(
+    pool: &PgPool,
+    rows: &str,
+    delete: &str,
+    (tenant, type_iri, before, batch): (&str, &str, &str, usize),
+    dry_run: bool,
+) -> Result<u64, sqlx::Error> {
+    let sql = if dry_run {
+        format!("SELECT count(*) FROM ({rows}) r")
+    } else {
+        format!("{delete} ({rows})")
+    };
+    let mut tx = pool.begin().await?;
+    crate::store::pg::set_service(&mut tx).await?;
+    // Both parts are the two constants above; every value is bound.
+    let query = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(tenant)
+        .bind(type_iri)
+        .bind(antares_store::filter::canonical_datetime(before).into_owned())
+        .bind(i64::try_from(batch).unwrap_or(i64::MAX));
+    let n = if dry_run {
+        let count: i64 = sqlx::Row::get(&query.fetch_one(&mut *tx).await?, 0);
+        u64::try_from(count).unwrap_or_default()
+    } else {
+        query.execute(&mut *tx).await?.rows_affected()
+    };
     tx.commit().await?;
     Ok(n)
 }
@@ -408,28 +437,23 @@ pub async fn retain_history(
     type_iri: &str,
     before: &str,
     batch: usize,
+    dry_run: bool,
 ) -> Result<u64, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    crate::store::pg::set_service(&mut tx).await?;
-    let n = sqlx::query(
-        "DELETE FROM attr_instances
-         WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN (
-           SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+    const ROWS: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
            FROM attr_instances a
            JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
            WHERE a.tenant_id = $1 AND t.types @> ARRAY[$2]::text[]
              AND a.observed_at < $3::timestamptz
-           LIMIT $4)",
+           LIMIT $4";
+    retain(
+        pool,
+        ROWS,
+        "DELETE FROM attr_instances
+         WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN",
+        (tenant, type_iri, before, batch),
+        dry_run,
     )
-    .bind(tenant)
-    .bind(type_iri)
-    .bind(antares_store::filter::canonical_datetime(before).as_ref())
-    .bind(i64::try_from(batch).unwrap_or(i64::MAX))
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    tx.commit().await?;
-    Ok(n)
+    .await
 }
 
 /// Drop one partition, named the way the catalog row spells it. The name

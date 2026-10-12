@@ -55,7 +55,7 @@ reason = "the periodic reload failing on the store, which the built-in store doe
 [[exclusion]]
 crate = "antares-ops"
 file = "src/views/retention.rs"
-function = "antares_ops::views::retention::sweep"
+function = "antares_ops::views::retention::retain"
 lines = 2
 branches = 0
 reason = "a retention statement failing on the store, which the built-in store under test_kit does not (see antares_ops::views::inner); tests/pg_retention.rs in antares-sql runs the Postgres statements themselves"

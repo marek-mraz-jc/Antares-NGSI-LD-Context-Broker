@@ -552,13 +552,15 @@ impl Store {
 
     /// Retention of current state (T-3900): drop at most `batch` Entities of
     /// `tenant` typed `type_iri` that carry no `expiresAt` and whose
-    /// `modifiedAt` is before `before`. Persisted per key in `file` mode.
+    /// `modifiedAt` is before `before`. Persisted per key in `file` mode;
+    /// `dry_run` counts them and drops none.
     pub fn retain_current(
         &self,
         tenant: &TenantId,
         type_iri: &str,
         before: &str,
         batch: usize,
+        dry_run: bool,
     ) -> u64 {
         on_blocking(true, || {
             let mut inner = self.write_inner();
@@ -578,7 +580,7 @@ impl Store {
                 .map(|(id, _)| id.clone())
                 .take(batch)
                 .collect();
-            for id in &dead {
+            for id in dead.iter().filter(|_| !dry_run) {
                 self.persist(T_ENTITIES, &key_bytes(tenant.as_str(), id), None);
                 docs.remove(id);
             }
@@ -589,12 +591,14 @@ impl Store {
     /// Retention of history (T-3900): drop at most `batch` attribute
     /// instances of `tenant`'s temporal documents typed `type_iri` whose
     /// instant is before `before`; an attribute left without instances goes.
+    /// `dry_run` counts them and drops none.
     pub fn retain_history(
         &self,
         tenant: &TenantId,
         type_iri: &str,
         before: &str,
         batch: usize,
+        dry_run: bool,
     ) -> u64 {
         on_blocking(true, || {
             let mut inner = self.write_inner();
@@ -630,13 +634,13 @@ impl Store {
                             left = left.saturating_sub(1);
                             dropped = dropped.saturating_add(1);
                         }
-                        !old
+                        dry_run || !old
                     });
-                    if arr.is_empty() {
+                    if arr.is_empty() && !dry_run {
                         obj.remove(&k);
                     }
                 }
-                if dropped != before_count {
+                if dropped != before_count && !dry_run {
                     self.persist(
                         T_TEMPORAL_ENTITIES,
                         &key_bytes(tenant.as_str(), id),

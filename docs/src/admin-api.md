@@ -39,6 +39,7 @@ schema: `docs/openapi/antares-admin.yaml`, rendered at
 | `DELETE /q/tenants/{tenant}` | Tenant purge |
 | `GET /q/dead-letters` | Notifications the delivery policy gave up on |
 | `GET`, `PUT`, `DELETE /q/retention/{tenant}` | How long a Tenant keeps each type ([Retention](#retention)) |
+| `POST /q/retention/{tenant}/preview`, `GET /q/retention/{tenant}/deleted` | What a retention document would delete now; what this pod's sweeps deleted ([Retention](#retention)) |
 | `POST /q/dead-letters/{id}/replay` | One more delivery attempt |
 | `DELETE /q/dead-letters/{id}` | Drop a dead letter |
 | `POST /ex/v1/remote-notify` | The 5.8.1.4 receiver other brokers post to |
@@ -433,6 +434,20 @@ bounds), `413` over 64 KiB; nothing is stored.
 ### DELETE /q/retention/{tenant}
 
 `204`, or `404` when the Tenant has no document.
+
+### POST /q/retention/{tenant}/preview
+
+The body is a retention document, checked as `PUT` checks it, and nothing is
+stored or deleted. `200` with `{"counts": [{"type", "kind", "count"}]}`: per
+type and kind (`entity`, `history`) what a sweep now would delete, at most
+100 000 each; a type that would lose nothing is not listed. `400` and `413` as
+`PUT`.
+
+### GET /q/retention/{tenant}/deleted
+
+`200` with `{"counts": [{"type", "kind", "count"}]}`: what this pod's sweeps
+deleted of the Tenant since the pod started. Every pod sweeps the same rules,
+so a pod's totals are its share; `antares_retention_deleted_total` sums them.
 
 ## The peer-facing wire
 

@@ -18,7 +18,7 @@ use axum::body::Bytes;
 use axum::extract::Path;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
 use serde_json::Value;
@@ -38,6 +38,8 @@ pub const SWEEP_EVERY: Duration = Duration::from_secs(60);
 /// a backlog drains over several minutes instead of holding one long lock.
 const BATCH: usize = 1000;
 const ROUNDS: usize = 50;
+/// The most rows a preview counts per rule and kind, in one statement.
+pub const PREVIEW_CAP: usize = 100_000;
 /// The bounds a duration has to sit in: one minute to ten years.
 const SHORTEST: Duration = Duration::from_secs(60);
 const LONGEST: Duration = Duration::from_hours(87_600);
@@ -205,14 +207,43 @@ pub struct Deleted {
     pub count: u64,
 }
 
-/// One sweep at `now` over `rules`: every rule's current state, then its
-/// history, each in at most [`ROUNDS`] statements of [`BATCH`] rows. Logs
-/// and counts what it deleted, never what it held.
-pub async fn sweep(
+/// One sweep at `now` over the rules the last reload found: every rule's
+/// current state, then its history, each in at most [`ROUNDS`] statements
+/// of [`BATCH`] rows. Logs, counts and totals per pod what it deleted, never
+/// what it held.
+pub(super) async fn sweep(r: &Reloader, now: chrono::DateTime<chrono::Utc>) -> Vec<Deleted> {
+    let out = retain(&r.state, &r.retention_rules(), now, false).await;
+    let mut totals = r
+        .deleted
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for d in &out {
+        let (tenant, ty, kind, count) = (d.tenant.as_str(), d.type_iri.as_str(), d.kind, d.count);
+        metrics::counter!("antares_retention_deleted_total",
+            "tenant" => tenant.to_owned(), "type" => ty.to_owned(), "kind" => kind)
+        .increment(count);
+        tracing::info!(tenant, r#type = ty, kind, count, "retention deleted");
+        let total = totals
+            .entry((tenant.to_owned(), ty.to_owned(), kind))
+            .or_default();
+        *total = total.saturating_add(count);
+    }
+    out
+}
+
+/// What `rules` delete at `now`, or with `dry_run` would delete: a dry run
+/// counts at most [`PREVIEW_CAP`] rows per rule and kind in one statement.
+async fn retain(
     state: &AppState,
     rules: &Rules,
     now: chrono::DateTime<chrono::Utc>,
+    dry_run: bool,
 ) -> Vec<Deleted> {
+    let (batch, rounds) = if dry_run {
+        (PREVIEW_CAP, 1)
+    } else {
+        (BATCH, ROUNDS)
+    };
     let mut out = Vec::new();
     for (t, list) in rules {
         let tenant = t.as_str();
@@ -228,22 +259,22 @@ pub async fn sweep(
                     .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
                     .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 let mut count = 0u64;
-                for _ in 0..ROUNDS {
+                for _ in 0..rounds {
                     let n = if kind == "entity" {
                         state
                             .store
-                            .retain_current(t, &rule.type_iri, &before, BATCH)
+                            .retain_current(t, &rule.type_iri, &before, batch, dry_run)
                             .await
                     } else {
                         state
                             .temporal
-                            .retain_history(t, &rule.type_iri, &before, BATCH)
+                            .retain_history(t, &rule.type_iri, &before, batch, dry_run)
                             .await
                     };
                     match n {
                         Ok(n) => {
                             count = count.saturating_add(n);
-                            if n < BATCH as u64 {
+                            if n < batch as u64 {
                                 break;
                             }
                         }
@@ -254,11 +285,6 @@ pub async fn sweep(
                     }
                 }
                 if count > 0 {
-                    let ty = rule.type_iri.as_str();
-                    metrics::counter!("antares_retention_deleted_total",
-                        "tenant" => tenant.to_owned(), "type" => ty.to_owned(), "kind" => kind)
-                    .increment(count);
-                    tracing::info!(tenant, r#type = ty, kind, count, "retention deleted");
                     out.push(Deleted {
                         tenant: tenant.to_owned(),
                         type_iri: rule.type_iri.clone(),
@@ -272,17 +298,33 @@ pub async fn sweep(
     out
 }
 
-/// `/q/retention/{tenant}`: GET the document as written, PUT one, DELETE it.
-pub(super) fn routes(r: &Weak<Reloader>) -> Router {
-    let (g, p, d) = (r.clone(), r.clone(), r.clone());
-    Router::new().route(
-        "/retention/{tenant}",
-        get(move |Path(t): Path<String>| serve(g.clone(), |r| get_doc(r, t)))
-            .put(move |Path(t): Path<String>, body: Bytes| {
-                serve(p.clone(), |r| put_doc(r, t, body))
-            })
-            .delete(move |Path(t): Path<String>| serve(d.clone(), |r| delete_doc(r, t))),
-    )
+/// `/q/retention/{tenant}`: GET the document as written, PUT one, DELETE
+/// it; `POST …/preview` counts what a document would delete now, `GET
+/// …/deleted` totals what this pod's sweeps deleted since it started.
+pub(super) fn routes(weak: &Weak<Reloader>) -> Router {
+    let (read, write, remove) = (weak.clone(), weak.clone(), weak.clone());
+    let (count, totals) = (weak.clone(), weak.clone());
+    Router::new()
+        .route(
+            "/retention/{tenant}/preview",
+            post(move |Path(tenant): Path<String>, body: Bytes| {
+                serve(count.clone(), |r| preview(r, tenant, body))
+            }),
+        )
+        .route(
+            "/retention/{tenant}/deleted",
+            get(move |Path(tenant): Path<String>| {
+                serve(totals.clone(), |r| async move { Ok(deleted(&r, &tenant)) })
+            }),
+        )
+        .route(
+            "/retention/{tenant}",
+            get(move |Path(t): Path<String>| serve(read.clone(), |r| get_doc(r, t)))
+                .put(move |Path(t): Path<String>, body: Bytes| {
+                    serve(write.clone(), |r| put_doc(r, t, body))
+                })
+                .delete(move |Path(t): Path<String>| serve(remove.clone(), |r| delete_doc(r, t))),
+        )
 }
 
 fn key(tenant: &str) -> Option<String> {
@@ -323,18 +365,11 @@ async fn get_doc(r: Arc<Reloader>, tenant: String) -> Result<Response, String> {
 }
 
 async fn put_doc(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Response, String> {
-    if body.len() > MAX_RETENTION_BYTES {
-        return Ok(problem(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "BadRequestData",
-            &format!("a retention document is at most {MAX_RETENTION_BYTES} bytes"),
-        ));
-    }
     let Some(key) = key(&tenant) else {
         return Ok(bad_tenant());
     };
-    if let Err(why) = parse(&body) {
-        return Ok(problem(StatusCode::BAD_REQUEST, "BadRequestData", &why));
+    if let Some(refusal) = refused(&body) {
+        return Ok(refusal);
     }
     let text = String::from_utf8_lossy(&body).into_owned();
     let replaced = r
@@ -348,6 +383,58 @@ async fn put_doc(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Respon
         StatusCode::CREATED
     }
     .into_response())
+}
+
+/// The document `body` would be refused for, as `put_doc` answers it.
+fn refused(body: &[u8]) -> Option<Response> {
+    if body.len() > MAX_RETENTION_BYTES {
+        return Some(problem(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "BadRequestData",
+            &format!("a retention document is at most {MAX_RETENTION_BYTES} bytes"),
+        ));
+    }
+    parse(body)
+        .err()
+        .map(|why| problem(StatusCode::BAD_REQUEST, "BadRequestData", &why))
+}
+
+fn counts(rows: impl Iterator<Item = (String, &'static str, u64)>) -> Response {
+    let rows: Vec<Value> = rows
+        .map(|(ty, kind, count)| serde_json::json!({"type": ty, "kind": kind, "count": count}))
+        .collect();
+    axum::Json(serde_json::json!({ "counts": rows })).into_response()
+}
+
+async fn preview(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Response, String> {
+    let Ok(t) = TenantId::new(&tenant) else {
+        return Ok(bad_tenant());
+    };
+    if let Some(refusal) = refused(&body) {
+        return Ok(refusal);
+    }
+    let rules = vec![(t, parse(&body)?)];
+    let found = retain(&r.state, &rules, chrono::Utc::now(), true).await;
+    Ok(counts(
+        found.into_iter().map(|d| (d.type_iri, d.kind, d.count)),
+    ))
+}
+
+fn deleted(r: &Reloader, tenant: &str) -> Response {
+    let Ok(t) = TenantId::new(tenant) else {
+        return bad_tenant();
+    };
+    let totals = r
+        .deleted
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    counts(
+        totals
+            .into_iter()
+            .filter(|((owner, _, _), _)| owner == t.as_str())
+            .map(|((_, ty, kind), count)| (ty, kind, count)),
+    )
 }
 
 async fn delete_doc(r: Arc<Reloader>, tenant: String) -> Result<Response, String> {

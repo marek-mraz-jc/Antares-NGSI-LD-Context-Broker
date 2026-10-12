@@ -485,6 +485,8 @@ struct Reloader {
     schema_max: Option<usize>,
     /// Every Tenant's retention rules, as the last reload found them.
     retention: std::sync::RwLock<Arc<retention::Rules>>,
+    /// What this pod's sweeps deleted since it started, by Tenant, type and kind.
+    deleted: std::sync::Mutex<BTreeMap<(String, String, &'static str), u64>>,
 }
 
 impl Reloader {
@@ -597,6 +599,7 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
         policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
         schema_max: schema_max(std::env::var(SCHEMA_MAX_ENV).ok())?,
         retention: std::sync::RwLock::default(),
+        deleted: std::sync::Mutex::default(),
     });
     reloader.reload().await?;
     // The routes live in the table the reloader fills; a strong handle there
@@ -612,8 +615,7 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
         let mut tick = tokio::time::interval(retention::SWEEP_EVERY);
         loop {
             tick.tick().await;
-            let rules = sweeping.retention_rules();
-            retention::sweep(&sweeping.state, &rules, chrono::Utc::now()).await;
+            retention::sweep(&sweeping, chrono::Utc::now()).await;
         }
     });
     let looping = reloader.clone();
@@ -658,8 +660,7 @@ impl Reload {
         &self,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Vec<retention::Deleted> {
-        let rules = self.0.retention_rules();
-        retention::sweep(&self.0.state, &rules, now).await
+        retention::sweep(&self.0, now).await
     }
 
     /// Rebuild the table from the store now.
@@ -1091,6 +1092,7 @@ mod tests {
             policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
             schema_max: None,
             retention: std::sync::RwLock::default(),
+            deleted: std::sync::Mutex::default(),
         });
         let put = put_schema(r.clone(), "city".into(), Bytes::from_static(b"{}")).await;
         assert_eq!(put.map(|p| p.status()), Ok(StatusCode::SERVICE_UNAVAILABLE));

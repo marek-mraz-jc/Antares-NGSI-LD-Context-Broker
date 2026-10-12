@@ -85,7 +85,14 @@ async fn current_state_of_one_type_in_one_tenant_goes_and_a_writers_expiry_wins(
     entity(&pool, "retain-a", "urn:w:old", W, 10, false).await;
     entity(&pool, "retain-b", "urn:v:old", V, 10, false).await;
 
-    let n = retain_current(&pool, "retain-a", V, &ago(5), 1000)
+    assert_eq!(
+        retain_current(&pool, "retain-a", V, &ago(5), 1000, true)
+            .await
+            .expect("dry run"),
+        1,
+        "a dry run counts the same row"
+    );
+    let n = retain_current(&pool, "retain-a", V, &ago(5), 1000, false)
         .await
         .expect("retain");
     assert_eq!(n, 1, "only the old Vehicle without its own expiresAt");
@@ -106,7 +113,7 @@ async fn current_state_of_one_type_in_one_tenant_goes_and_a_writers_expiry_wins(
         "tenant B untouched"
     );
     assert_eq!(
-        retain_current(&pool, "retain-a", V, &ago(5), 1000)
+        retain_current(&pool, "retain-a", V, &ago(5), 1000, false)
             .await
             .expect("again"),
         0,
@@ -136,7 +143,13 @@ async fn history_of_one_type_goes_before_the_cut_in_bounded_batches() {
             assert!(store.create(&tenant, id, &doc).await.expect("create"));
         }
     }
-    let n = retain_history(&pool, "retain-h", V, &ago(5), 1000)
+    assert_eq!(
+        retain_history(&pool, "retain-h", V, &ago(5), 1000, true)
+            .await
+            .expect("dry run"),
+        1
+    );
+    let n = retain_history(&pool, "retain-h", V, &ago(5), 1000, false)
         .await
         .expect("retain");
     assert_eq!(n, 1, "the Vehicle's 6-minute instance");
@@ -175,7 +188,7 @@ async fn history_of_one_type_goes_before_the_cut_in_bounded_batches() {
         .expect("backlog"));
     let mut rounds = Vec::new();
     loop {
-        let n = retain_history(&pool, "retain-h", V, &ago(5), 1000)
+        let n = retain_history(&pool, "retain-h", V, &ago(5), 1000, false)
             .await
             .expect("retain");
         rounds.push(n);

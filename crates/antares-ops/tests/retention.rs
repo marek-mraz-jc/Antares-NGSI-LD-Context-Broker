@@ -349,3 +349,87 @@ async fn a_backlog_drains_in_batches_within_one_sweep() {
         [("history", 2500)]
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preview_counts_without_deleting_and_the_totals_follow_the_sweeps() {
+    let b = TestBroker::new().await.expect("broker");
+    let app = b.serve_mounted(Vec::new()).expect("app");
+    seed(&app).await;
+    let would = json!([{"type": V, "kind": "history", "count": 1}]);
+    for _ in 0..2 {
+        let (s, body) = send(
+            &app,
+            Method::POST,
+            "/q/retention/city/preview",
+            None,
+            Some(RULES.into()),
+        )
+        .await;
+        assert_eq!(
+            (s, &body["counts"]),
+            (StatusCode::OK, &would),
+            "a preview deletes nothing"
+        );
+    }
+    let totals = |tenant: &'static str| {
+        let app = app.clone();
+        async move {
+            send(
+                &app,
+                Method::GET,
+                &format!("/q/retention/{tenant}/deleted"),
+                None,
+                None,
+            )
+            .await
+            .1["counts"]
+                .clone()
+        }
+    };
+    assert_eq!(totals("city").await, json!([]));
+    assert_eq!(
+        send(
+            &app,
+            Method::PUT,
+            "/q/retention/city",
+            None,
+            Some(RULES.into())
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert_eq!(b.sweep_retention(chrono::Utc::now()).await.len(), 1);
+    assert_eq!(totals("city").await, would);
+    assert_eq!(totals("port").await, json!([]), "per tenant");
+
+    let big = format!(r#"{{"rules":[],"pad":"{}"}}"#, "x".repeat(64 * 1024));
+    for (method, uri, body, status) in [
+        (
+            Method::POST,
+            "/q/retention/Not%20One/preview",
+            Some(RULES.to_owned()),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::POST,
+            "/q/retention/city/preview",
+            Some("nope".to_owned()),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            Method::POST,
+            "/q/retention/city/preview",
+            Some(big),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            Method::GET,
+            "/q/retention/Not%20One/deleted",
+            None,
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(send(&app, method, uri, None, body).await.0, status, "{uri}");
+    }
+}

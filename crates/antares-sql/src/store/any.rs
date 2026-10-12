@@ -1503,9 +1503,10 @@ impl antares_store::CurrentStateDriver for AnyStore {
         type_iri: &str,
         before: &str,
         batch: usize,
+        dry_run: bool,
     ) -> Result<u64, NgsiError> {
         match self {
-            AnyStore::Mem(s) => Ok(s.retain_current(tenant, type_iri, before, batch)),
+            AnyStore::Mem(s) => Ok(s.retain_current(tenant, type_iri, before, batch, dry_run)),
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => crate::store::pg::maintenance::retain_current(
                 p.docs.pool(),
@@ -1513,6 +1514,7 @@ impl antares_store::CurrentStateDriver for AnyStore {
                 type_iri,
                 before,
                 batch,
+                dry_run,
             )
             .await
             .map_err(db),
@@ -1570,9 +1572,10 @@ impl antares_store::TemporalDriver for AnyStore {
         type_iri: &str,
         before: &str,
         batch: usize,
+        dry_run: bool,
     ) -> Result<u64, NgsiError> {
         match self {
-            AnyStore::Mem(s) => Ok(s.retain_history(tenant, type_iri, before, batch)),
+            AnyStore::Mem(s) => Ok(s.retain_history(tenant, type_iri, before, batch, dry_run)),
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => crate::store::pg::maintenance::retain_history(
                 p.docs.pool(),
@@ -1580,6 +1583,7 @@ impl antares_store::TemporalDriver for AnyStore {
                 type_iri,
                 before,
                 batch,
+                dry_run,
             )
             .await
             .map_err(db),
