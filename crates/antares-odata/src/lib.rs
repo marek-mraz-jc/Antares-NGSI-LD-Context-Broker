@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod apply;
 mod batch;
 mod below;
 pub mod edm;

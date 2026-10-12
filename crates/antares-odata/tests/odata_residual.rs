@@ -259,6 +259,8 @@ async fn a_count_or_a_surface_sort_over_the_budget_is_400_and_a_page_is_served(
         format!("{ROOT}/Car?{filter}&$count=true"),
         format!("{ROOT}/Car/$count?{filter}"),
         format!("{ROOT}/Car?$orderby=createdAt"),
+        // an aggregate reads the whole answer: refused past the bound, never one over a part
+        format!("{ROOT}/Car?$apply=aggregate($count%20as%20n)"),
     ] {
         let answer = get(&app, &uri, &[]).await;
         assert_eq!(

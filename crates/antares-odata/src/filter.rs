@@ -94,6 +94,8 @@ pub(crate) struct Translated {
     /// The `$compute` items as residual values, name and value, in the
     /// request's order (Q16).
     pub(crate) computed: Vec<(String, RExpr)>,
+    /// The Edm type of each computed value, in the order of `computed`.
+    pub(crate) computed_types: Vec<&'static str>,
     /// The Attribute terms the computed values read, for the pushdown's
     /// `attrs`.
     pub(crate) computed_reads: Vec<String>,
@@ -384,8 +386,9 @@ pub(crate) fn compute(
         lambdas: Vec::new(),
     };
     for item in items {
-        let (value, _) = terms.residual_value(&item.expr)?;
+        let (value, edm) = terms.residual_value(&item.expr)?;
         out.computed.push((item.alias.clone(), value));
+        out.computed_types.push(edm);
     }
     for (_, program) in computed(out, now)? {
         for term in program.attributes() {
@@ -1350,6 +1353,20 @@ pub(crate) fn program(t: &Translated, now: DateTime) -> Result<Option<residual::
         many => RExpr::And(many.to_vec()),
     };
     compiled(&conjuncts, now).map(Some)
+}
+
+/// The residual of `t` as one program that holds for every Entity when `t` has none: a read
+/// of the whole answer.
+///
+/// # Errors
+/// As [`program`].
+pub(crate) fn whole(t: &Translated, now: DateTime) -> Result<residual::Program, Refused> {
+    compiled(&RExpr::And(t.residual.clone()), now)
+}
+
+/// Whether the Edm type `edm` is a number's.
+pub(crate) fn numeric(edm: &str) -> bool {
+    takes_arg(NUMBER, edm).is_ok()
 }
 
 /// `e` compiled under the evaluator's bounds.

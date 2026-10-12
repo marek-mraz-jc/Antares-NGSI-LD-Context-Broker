@@ -226,6 +226,7 @@ fn only_select(options: &QueryOptions) -> bool {
     options.filter.is_none()
         && options.search.is_none()
         && options.compute.is_none()
+        && options.apply.is_none()
         && options.expand.is_none()
         && options.orderby.is_none()
         && options.top.is_none()
@@ -499,7 +500,7 @@ fn selection(set: &Set, filter: &Translated) -> String {
 /// selected Attributes, the expanded ones and those the sort reads, each by
 /// a term of the request's own @context, so the scan tells apart what only
 /// the residual reads. `ViewOps::scan` sets `limit`, `offset` and `count`.
-fn pushdown(
+pub(crate) fn pushdown(
     set: &Set,
     picked: Option<&[&str]>,
     expansions: &[Expansion],
@@ -637,23 +638,8 @@ async fn evaluated(
         if let Some(keys) = &filter.sort {
             sort(&mut docs, keys);
         }
-        let total = u64::try_from(docs.len()).unwrap_or(u64::MAX);
-        let from = cursor.saturating_add(skip);
-        let end = top.map_or(total, |top| total.min(from.saturating_add(top)));
-        let take = end.saturating_sub(from).min(page);
-        let docs: Vec<Value> = docs
-            .into_iter()
-            .skip(usize::try_from(from).unwrap_or(usize::MAX))
-            .take(usize::try_from(take).unwrap_or(usize::MAX))
-            .collect();
-        let served = u64::try_from(docs.len()).unwrap_or(u64::MAX);
-        let next = from.saturating_add(served);
-        Served {
-            docs,
-            total,
-            next: (served > 0 && next < end)
-                .then(|| link(next, 0, top.map(|top| top.saturating_sub(served)))),
-        }
+        let (docs, total, next) = paged(docs, (cursor, skip, top, page), link);
+        Served { docs, total, next }
     } else {
         // A page filled from the upstream cursor (ADR-0028 rule 4); the
         // `$skip` is of the filtered answer, so it is dropped here and
@@ -679,6 +665,53 @@ async fn evaluated(
     })
 }
 
+/// Where a collection read starts: the cursor, `$skip` and `$top` of the request or of its
+/// token, and the page size.
+pub(crate) fn position(
+    reads: &Reads,
+    options: &QueryOptions,
+    digest: u64,
+    headers: &HeaderMap,
+    version: ODataVersion,
+) -> Result<(u64, u64, Option<u64>, u64), ODataErrorResponse> {
+    let (cursor, skip, top) = match &options.skiptoken {
+        None => (0, options.skip.unwrap_or(0), options.top),
+        // The token carries both: a $skip or $top beside it is an edit.
+        Some(_) if options.skip.is_some() || options.top.is_some() => {
+            return Err(bad_token(version))
+        }
+        Some(text) => read_token(text, digest).ok_or_else(|| bad_token(version))?,
+    };
+    let page = top
+        .unwrap_or(u64::MAX)
+        .min(max_page(headers, reads.state.max_header_len))
+        .min(MAX_PAGE);
+    Ok((cursor, skip, top, page))
+}
+
+/// The page of a whole answer `items` from `cursor` past `skip`, at most `top` in all and
+/// `page` here: the items, the total, and the link to the next page.
+pub(crate) fn paged<T>(
+    items: Vec<T>,
+    (cursor, skip, top, page): (u64, u64, Option<u64>, u64),
+    link: &(dyn Fn(u64, u64, Option<u64>) -> String + Sync),
+) -> (Vec<T>, u64, Option<String>) {
+    let total = u64::try_from(items.len()).unwrap_or(u64::MAX);
+    let from = cursor.saturating_add(skip);
+    let end = top.map_or(total, |top| total.min(from.saturating_add(top)));
+    let take = end.saturating_sub(from).min(page);
+    let items: Vec<T> = items
+        .into_iter()
+        .skip(usize::try_from(from).unwrap_or(usize::MAX))
+        .take(usize::try_from(take).unwrap_or(usize::MAX))
+        .collect();
+    let served = u64::try_from(items.len()).unwrap_or(u64::MAX);
+    let next = from.saturating_add(served);
+    let next = (served > 0 && next < end)
+        .then(|| link(next, 0, top.map(|top| top.saturating_sub(served))));
+    (items, total, next)
+}
+
 /// The page a collection read serves: its Entities, the count when asked,
 /// and the token of the next page.
 struct Served {
@@ -697,6 +730,10 @@ async fn collection(
     headers: &HeaderMap,
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
+    if options.apply.is_some() {
+        return crate::apply::collection(reads, caller, ctx, (set_name, path), options, headers)
+            .await;
+    }
     let set = set_of(reads, set_name, version)?;
     let expansions =
         expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
@@ -706,18 +743,7 @@ async fn collection(
     let projection = ngsild(&reads.view, options, &mut filter, version)?;
     let picked = projected(set, picked, &projection);
     let digest = digest(&reads.state.service_root, path, options);
-    let (cursor, skip, top) = match &options.skiptoken {
-        None => (0, options.skip.unwrap_or(0), options.top),
-        // The token carries both: a $skip or $top beside it is an edit.
-        Some(_) if options.skip.is_some() || options.top.is_some() => {
-            return Err(bad_token(version))
-        }
-        Some(text) => read_token(text, digest).ok_or_else(|| bad_token(version))?,
-    };
-    let page = top
-        .unwrap_or(u64::MAX)
-        .min(max_page(headers, reads.state.max_header_len))
-        .min(MAX_PAGE);
+    let (cursor, skip, top, page) = position(reads, options, digest, headers, version)?;
     if filter.sort.is_some() && filter.residual.is_empty() {
         // a surface sort reads the whole answer through the scan: a residual that always holds
         filter.residual.push(RExpr::And(Vec::new()));
@@ -805,6 +831,9 @@ async fn count(
     version: ODataVersion,
 ) -> Result<Response, ODataErrorResponse> {
     let set = set_of(reads, set_name, version)?;
+    if options.apply.is_some() {
+        return Err(not_implemented(version));
+    }
     let mut filter = filtered(set, &reads.edm.sets, options, version)?;
     ngsild(&reads.view, options, &mut filter, version)?;
     let total = match residual_of(&filter, version)? {
@@ -856,7 +885,7 @@ pub(crate) async fn entity(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
-    if options.filter.is_some() || options.search.is_some() {
+    if options.filter.is_some() || options.search.is_some() || options.apply.is_some() {
         return Err(not_implemented(version));
     }
     // `$compute` alone: its values over the one Entity
@@ -958,13 +987,13 @@ fn computed_over(
 
 /// The name under which [`attach`] keeps an Entity's computed values: no
 /// Attribute name starts with `@` (a JSON-LD keyword), so none collides.
-const COMPUTED: &str = "@computed";
+pub(crate) const COMPUTED: &str = "@computed";
 
 /// Each of `docs` with its computed values, by name, `null` for an unknown
 /// one: computed over what the view and the engine let the Entity show, so
 /// a hidden Attribute reads as an absent one. A document that holds them
 /// already is left as it is.
-fn attach(
+pub(crate) fn attach(
     docs: &mut [Value],
     filter: &Translated,
     version: ODataVersion,
@@ -993,7 +1022,7 @@ fn attach(
 }
 
 /// The OData error of a filter the surface does not take.
-fn refusal(refused: Refused, version: ODataVersion) -> ODataErrorResponse {
+pub(crate) fn refusal(refused: Refused, version: ODataVersion) -> ODataErrorResponse {
     match refused {
         Refused::Later => not_implemented(version),
         Refused::Bad => ODataErrorResponse::new(
@@ -1015,7 +1044,7 @@ fn refusal(refused: Refused, version: ODataVersion) -> ODataErrorResponse {
 /// the request without its paging, so a token read under another view or
 /// another query does not match. ponytail: std `SipHash`; a forged token
 /// does no more than `$skip`, every page is narrowed by the store again.
-fn digest(root: &str, path: &[Segment], options: &QueryOptions) -> u64 {
+pub(crate) fn digest(root: &str, path: &[Segment], options: &QueryOptions) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     let normal = ODataUri::Resource {
         path: path.to_vec(),
@@ -1036,7 +1065,7 @@ fn digest(root: &str, path: &[Segment], options: &QueryOptions) -> u64 {
 /// residual page served, or the position in a counted or sorted answer;
 /// which one follows from the query the digest binds. A token of the form
 /// before T-3758 does not read.
-fn token(cursor: u64, skip: u64, top: Option<u64>, digest: u64) -> String {
+pub(crate) fn token(cursor: u64, skip: u64, top: Option<u64>, digest: u64) -> String {
     let top = top.map_or_else(|| "-".to_owned(), |t| t.to_string());
     format!("2.{cursor}.{skip}.{top}.{digest:016x}")
 }
@@ -1456,7 +1485,7 @@ fn plain(value: Value) -> Value {
 /// residual when they take the one `geoQ`. Each name is read under the
 /// view's `@context` and written as a term of the request's own. What
 /// `ngsild.pick` and `ngsild.omit` name, as IRIs, is returned.
-fn ngsild(
+pub(crate) fn ngsild(
     view: &ViewOps,
     options: &QueryOptions,
     filter: &mut Translated,
@@ -1525,7 +1554,7 @@ fn ngsild(
 
 /// What `ngsild.pick` keeps and `ngsild.omit` drops, as IRIs.
 #[derive(Default)]
-struct Projection {
+pub(crate) struct Projection {
     pick: Option<Vec<String>>,
     omit: Option<Vec<String>>,
 }
@@ -1578,7 +1607,7 @@ fn residual_of(
 }
 
 /// The wall clock; one before 1970 reads as 1970, one past 9999 as the last instant.
-fn now() -> DateTime {
+pub(crate) fn now() -> DateTime {
     let micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_micros());
@@ -1590,7 +1619,7 @@ fn now() -> DateTime {
 
 /// One `ViewOps::scan` of `program`: the Entities it served and the
 /// upstream offset to continue from.
-async fn scanned(
+pub(crate) async fn scanned(
     reads: &Reads,
     caller: &Caller,
     pushdown: &Pushdown,
@@ -1622,7 +1651,7 @@ async fn scanned(
 /// `docs` in the order of `keys` (Q9, URL 5.1.5): null and missing values
 /// first ascending, numbers by value, strings by code point; ties keep the
 /// upstream order, which ends in `id`.
-fn sort(docs: &mut [Value], keys: &[SortKey]) {
+pub(crate) fn sort(docs: &mut [Value], keys: &[SortKey]) {
     docs.sort_by(|a, b| {
         keys.iter()
             .map(|k| {
@@ -1651,7 +1680,7 @@ fn sort_value<'d>(doc: &'d Value, by: &SortBy) -> Option<&'d Value> {
         .filter(|v| !v.is_null())
 }
 
-fn compare(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+pub(crate) fn compare(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
     use std::cmp::Ordering::{Equal, Greater, Less};
     let kind = |v: &Value| match v {
         Value::Null => 0,
