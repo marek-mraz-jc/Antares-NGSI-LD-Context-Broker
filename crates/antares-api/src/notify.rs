@@ -1271,7 +1271,18 @@ async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>) {
         std::collections::HashMap::new();
     let mut ctx_memo = CtxMemo::new();
     for (queued, (tenant_str, before, after)) in changes {
-        for m in matches_for(st, &tenant_str, before, after, queued, &mut ctx_memo).await {
+        let matched = matches_for(st, &tenant_str, before, after, queued, &mut ctx_memo);
+        #[cfg(not(target_arch = "wasm32"))]
+        let matched = match tokio::time::timeout(STEP_DEADLINE, matched).await {
+            Ok(m) => m,
+            Err(_) => {
+                note_stall("match", &tenant_str, "");
+                continue;
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        let matched = matched.await;
+        for m in matched {
             let key = (
                 m.tenant.as_str().to_owned(),
                 m.sub
@@ -1305,8 +1316,20 @@ async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>) {
         for g in groups {
             let st = st.clone();
             set.spawn(async move {
-                let _permits = delivery_permits(&g.tenant).await;
-                deliver(&st, &g.tenant, &g.sub, g.data, &g.ctx).await;
+                let id = g.sub.get("id").and_then(Value::as_str).unwrap_or_default();
+                let Ok(_permits) =
+                    tokio::time::timeout(STEP_DEADLINE, delivery_permits(&g.tenant)).await
+                else {
+                    note_stall("permits", g.tenant.as_str(), id);
+                    return;
+                };
+                let delivered = deliver(&st, &g.tenant, &g.sub, g.data, &g.ctx);
+                if tokio::time::timeout(STEP_DEADLINE, delivered)
+                    .await
+                    .is_err()
+                {
+                    note_stall("deliver", g.tenant.as_str(), id);
+                }
             });
         }
         while let Some(joined) = set.join_next().await {
@@ -1324,6 +1347,25 @@ async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>) {
             })
             .await;
     }
+}
+
+/// How long one step of a drain may take: matching one change, waiting for
+/// one group's delivery permits, or that delivery. A drain waits for all of
+/// its groups and the next drain for it, so a step that never ends stops
+/// notifications for every Subscription of the process (T-4102). A send is
+/// at most 30 s (`endpoint_timeout_ms`), so a live step stays well inside.
+#[cfg(not(target_arch = "wasm32"))]
+const STEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A step abandoned at [`STEP_DEADLINE`]: counted and named, so the wait
+/// that never ended is in the log.
+#[cfg(not(target_arch = "wasm32"))]
+fn note_stall(step: &'static str, tenant: &str, sub: &str) {
+    metrics::counter!("antares_notification_stalls_total", "step" => step).increment(1);
+    tracing::warn!(
+        "notification step {step} abandoned after {}s (tenant {tenant}, subscription {sub}); the drain goes on",
+        STEP_DEADLINE.as_secs()
+    );
 }
 
 /// A change the full queue refused: counted, and said once per thousand so

@@ -89,6 +89,8 @@ views = []
 async-trait = { workspace = true }
 antares-api = { workspace = true, features = ["test-kit", "postgres"] }
 http-body-util = { workspace = true }
+# a paused clock runs a test to a 60 s deadline at once (T-4102)
+tokio = { workspace = true, features = ["test-util"] }
 # capturing subscriber: the tests that prove a credential is not logged
 tracing-subscriber = { workspace = true }
 

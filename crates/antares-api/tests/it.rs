@@ -54,6 +54,7 @@ mod notification_expand_values_5_2_12;
 mod notification_geojson;
 mod notification_headers_6_3_8;
 mod notification_triggers_5_2_12;
+mod notifier_stall;
 mod notify_join_flat_4_5_23;
 mod notify_linked_q_4_9;
 mod notify_projection_4_21;
