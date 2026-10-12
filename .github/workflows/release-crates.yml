@@ -29,7 +29,7 @@ permissions:
 
 env:
   # dependency order; `cargo publish` with several -p publishes them in this order itself
-  CRATES: antares-model antares-jsonld antares-ql antares-matcher antares-residual
+  CRATES: ngsild-model ngsild-jsonld ngsild-ql ngsild-matcher ngsild-residual
 
 jobs:
   release:
@@ -52,7 +52,7 @@ jobs:
       - name: The tag is the crates' version
         run: |
           version=$(cargo metadata --locked --no-deps --format-version 1 \
-            | python3 -c 'import json,sys; print({p["name"]: p["version"] for p in json.load(sys.stdin)["packages"]}["antares-model"])')
+            | python3 -c 'import json,sys; print({p["name"]: p["version"] for p in json.load(sys.stdin)["packages"]}["ngsild-model"])')
           [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME, crates at $version"; exit 1; }
       - name: cargo publish --dry-run
         run: cargo publish --dry-run --locked $(printf -- '-p %s ' $CRATES)

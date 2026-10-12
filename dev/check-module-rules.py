@@ -122,7 +122,7 @@ def check(meta):
 
     for name in of("protocol"):
         for d in pkgs[name]["dependencies"]:
-            if d["name"].startswith("antares-"):
+            if d["name"].startswith(("antares-", "ngsild-")):
                 out.append(("protocol-dep", f"{name} (protocol) depends on {d['name']} "
                                             f"({d['kind'] or 'normal'})"))
 

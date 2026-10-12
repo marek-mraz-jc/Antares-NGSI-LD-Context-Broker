@@ -1,4 +1,4 @@
-# antares-jsonld
+# ngsild-jsonld
 
 The JSON-LD subset NGSI-LD uses (ETSI GS CIM 009 V1.9.1, clause 5.5.7, and JSON-LD 1.1), written
 for NGSI-LD documents: `@context` processing, expansion with the structural validation of an
@@ -14,7 +14,7 @@ Entity, compaction back to the caller's terms, and a caching loader with the pin
 | `Loader`: remote `@context` documents fetched, cached and bounded | 5.5.7, 6.3.5 |
 
 ```rust
-use antares_jsonld::{compact_entity, core_context, expand_entity, ExpandOpts};
+use ngsild_jsonld::{compact_entity, core_context, expand_entity, ExpandOpts};
 use serde_json::json;
 
 let mut ctx = core_context();

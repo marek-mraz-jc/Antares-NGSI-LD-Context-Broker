@@ -45,7 +45,7 @@ impl DateTime {
     /// a value without an offset included.
     ///
     /// ```
-    /// use antares_residual::DateTime;
+    /// use ngsild_residual::DateTime;
     ///
     /// let a = DateTime::parse("2026-10-11T12:00:00+02:00").ok_or("a")?;
     /// let b = DateTime::parse("2026-10-11T10:00:00Z").ok_or("b")?;
@@ -113,7 +113,7 @@ impl Date {
     /// `YYYY-MM-DD`; `None` for anything else or a day the month does not have.
     ///
     /// ```
-    /// use antares_residual::Date;
+    /// use ngsild_residual::Date;
     ///
     /// assert!(Date::parse("2024-02-29").is_some());
     /// assert!(Date::parse("2023-02-29").is_none());
@@ -135,7 +135,7 @@ impl Time {
     /// `hh:mm[:ss[.f]]`; `None` for anything else.
     ///
     /// ```
-    /// use antares_residual::Time;
+    /// use ngsild_residual::Time;
     ///
     /// assert!(Time::parse("23:59:59.5").is_some());
     /// assert!(Time::parse("24:00").is_none());

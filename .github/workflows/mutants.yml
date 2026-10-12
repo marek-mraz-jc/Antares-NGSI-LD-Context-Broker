@@ -1,7 +1,7 @@
 name: mutants
 
-# Mutation testing of the decision code (T-3531): antares-ql (q, geo, scope
-# filters), antares-matcher (subscription matching) and the policy seam
+# Mutation testing of the decision code (T-3531): ngsild-ql (q, geo, scope
+# filters), ngsild-matcher (subscription matching) and the policy seam
 # (crates/antares-api/src/policy.rs). A mutant the tests do not kill is a
 # filter or policy branch nothing pins; dev/mutants-survivors.txt lists the
 # ones that carry a written reason, and a survivor outside that list fails
@@ -38,10 +38,10 @@ jobs:
         target:
           - name: ql
             shards: 6
-            args: -p antares-ql
+            args: -p ngsild-ql
           - name: matcher
             shards: 6
-            args: -p antares-matcher
+            args: -p ngsild-matcher
           - name: policy
             shards: 6
             # lib tests plus the integration tests: a mutant only an

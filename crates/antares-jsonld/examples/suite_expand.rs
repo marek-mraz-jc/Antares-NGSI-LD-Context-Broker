@@ -4,7 +4,7 @@
 //!
 //!     cargo run -p antares-jsonld --example suite_expand [ngsi-ld-test-suite]
 #![allow(clippy::print_stdout)]
-use antares_jsonld::{core_context, expand_entity, ExpandOpts};
+use ngsild_jsonld::{core_context, expand_entity, ExpandOpts};
 use serde_json::Value;
 use std::path::PathBuf;
 

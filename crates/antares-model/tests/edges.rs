@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Each refusal of the entry checks on its own, so every condition is seen false once.
 #![allow(clippy::unwrap_used)]
-use antares_model::{check_attr_name, EntityId};
+use ngsild_model::{check_attr_name, EntityId};
 
 #[test]
 fn an_entity_id_is_refused_for_each_reason_alone() {

@@ -1,5 +1,5 @@
 [package]
-name = "antares-residual"
+name = "ngsild-residual"
 description = "The residual of a standard query over an NGSI-LD view: one intermediate form and its three-valued evaluator over a normalized Entity (ADR-0028 rules 2 and 7)."
 version.workspace = true
 edition.workspace = true

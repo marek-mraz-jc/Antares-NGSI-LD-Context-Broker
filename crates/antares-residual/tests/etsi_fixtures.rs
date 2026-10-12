@@ -2,7 +2,7 @@
 //! The evaluator over the ETSI NGSI-LD test suite's own Entity fixtures
 //! (`ngsi-ld-test-suite/data/entities`, vendored in the workspace; not in the published crate).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-use antares_residual::{compile, eval, Cmp, DateTime, Expr, Lit, Path as Attr, Truth};
+use ngsild_residual::{compile, eval, Cmp, DateTime, Expr, Lit, Path as Attr, Truth};
 use serde_json::Value;
 use std::path::Path;
 

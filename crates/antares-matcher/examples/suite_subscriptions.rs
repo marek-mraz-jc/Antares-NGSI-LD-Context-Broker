@@ -6,7 +6,7 @@
 //!     cargo run -p antares-matcher --example suite_subscriptions [ngsi-ld-test-suite]
 #![allow(clippy::print_stdout)]
 use antares_jsonld::{core_context, expand_entity, Context, ExpandOpts};
-use antares_matcher::would_notify;
+use ngsild_matcher::would_notify;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 

@@ -1,4 +1,4 @@
-# antares-model
+# ngsild-model
 
 The NGSI-LD data model of ETSI GS CIM 009 V1.9.1 as Rust types and checks: no I/O, no clock, no
 configuration. It is the crate every other NGSI-LD crate of Antares builds on (published as
@@ -15,8 +15,8 @@ configuration. It is the crate every other NGSI-LD crate of Antares builds on (p
 | `API_ROOT`: `/ngsi-ld/v1` | 6.2 |
 
 ```rust
-use antares_model::operations::group_members;
-use antares_model::{check_attr_name, EntityId, NgsiError, TenantId};
+use ngsild_model::operations::group_members;
+use ngsild_model::{check_attr_name, EntityId, NgsiError, TenantId};
 
 let id = EntityId::new("urn:ngsi-ld:Vehicle:A4567")?;
 assert_eq!(id.as_str(), "urn:ngsi-ld:Vehicle:A4567");

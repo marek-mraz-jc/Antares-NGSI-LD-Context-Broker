@@ -2,7 +2,7 @@
 //! The syntax checks over the ETSI NGSI-LD test suite's own Entity fixtures
 //! (`ngsi-ld-test-suite/data/entities`, vendored in the workspace; not in the published crate).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-use antares_model::{check_attr_name, EntityId};
+use ngsild_model::{check_attr_name, EntityId};
 use serde_json::Value;
 use std::path::Path;
 

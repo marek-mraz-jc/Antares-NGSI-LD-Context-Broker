@@ -1,4 +1,4 @@
-# antares-residual
+# ngsild-residual
 
 The residual of a standard query over an NGSI-LD view (Antares ADR-0028 rules 2 and 7): the part
 of an `OData`, CQL2 or `SensorThings` filter that the NGSI-LD Query Language (ETSI GS CIM 009
@@ -18,7 +18,7 @@ integer overflow, a division by zero and a string past `MAX_STRING_BYTES`: never
 truncated value. The caller keeps an Entity only on `Truth::True`.
 
 ```rust
-use antares_residual::{compile, eval, Cmp, DateTime, Expr, Func, Lit, Path, Truth};
+use ngsild_residual::{compile, eval, Cmp, DateTime, Expr, Func, Lit, Path, Truth};
 use serde_json::json;
 
 // contains(tolower(name), 'sta') and not (pm10 gt 50)

@@ -1,5 +1,5 @@
 [package]
-name = "antares-matcher"
+name = "ngsild-matcher"
 description = "Subscription matching against an in-memory entity: selector, q/scopeQ/geoQ conditions, activity and throttling."
 version.workspace = true
 edition.workspace = true

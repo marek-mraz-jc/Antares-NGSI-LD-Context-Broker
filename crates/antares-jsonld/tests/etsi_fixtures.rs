@@ -2,7 +2,7 @@
 //! `expand_entity` over the ETSI NGSI-LD test suite's own Entity fixtures
 //! (`ngsi-ld-test-suite/data/entities`, vendored in the workspace; not in the published crate).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-use antares_jsonld::{core_context, expand_entity, Context, ExpandOpts};
+use ngsild_jsonld::{core_context, expand_entity, Context, ExpandOpts};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 

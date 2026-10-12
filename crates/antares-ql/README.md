@@ -1,4 +1,4 @@
-# antares-ql
+# ngsild-ql
 
 The query languages of ETSI GS CIM 009 V1.9.1 parsed into one typed AST, with an in-memory
 evaluator and a Postgres lowering (published as `ngsild-ql` once released).
@@ -15,8 +15,8 @@ evaluator and a Postgres lowering (published as `ngsild-ql` once released).
 
 ```rust
 use antares_jsonld::{core_context, expand_entity, ExpandOpts};
-use antares_ql::eval::eval_q;
-use antares_ql::{parse_q, MAX_Q_BYTES};
+use ngsild_ql::eval::eval_q;
+use ngsild_ql::{parse_q, MAX_Q_BYTES};
 use serde_json::json;
 
 let ctx = core_context();

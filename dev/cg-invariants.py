@@ -16,7 +16,7 @@ or comments never count. Red when:
   dev/cg-invariants.py --selftest
 
 dev/cg-invariants/fixture.patch violates each invariant once: apply it, `cg build --fg`, run; every
-statement must show its cg_fixture row (and odata-url -> antares-model), then revert the patch.
+statement must show its cg_fixture row (and odata-url -> ngsild-model), then revert the patch.
 """
 
 from __future__ import annotations

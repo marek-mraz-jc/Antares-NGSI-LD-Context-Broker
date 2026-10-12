@@ -2,7 +2,7 @@
 //! `antares-residual` over a normalized NGSI-LD Entity: every path, operator and function, each
 //! with its unknown and mistyped rows (ADR-0028 rules 2 and 7).
 
-use antares_residual::{
+use ngsild_residual::{
     compile, eval, Cmp, Date, DateTime, Error, Expr, Func, Lit, Member, Path, Program, Time, Truth,
     MAX_DEPTH, MAX_NODES, MAX_STRING_BYTES,
 };

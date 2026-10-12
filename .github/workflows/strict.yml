@@ -223,7 +223,7 @@ jobs:
         run: |
           set -eo pipefail
           rc=0
-          for c in antares-ql antares-matcher antares-model; do
+          for c in ngsild-ql ngsild-matcher ngsild-model; do
             cargo llvm-cov --locked -p "$c" --summary-only \
               --fail-under-lines 95 --fail-under-functions 95 > "$c-cov.txt" || rc=1
             { echo "### Coverage floor — $c"; echo '```'
@@ -291,7 +291,7 @@ jobs:
     # time-touching tests run instead of erroring out. Tree borrows: the
     # @context cache (moka over crossbeam-epoch) is rejected by the stacked
     # borrows model and accepted by the tree model.
-    # One job per crate: in one job the crates shared 90 min and antares-ql
+    # One job per crate: in one job the crates shared 90 min and ngsild-ql
     # alone ran past it (run 38109841097, T-3706).
     name: Miri UB check (weekly, ${{ matrix.crate }})
     if: github.event.schedule != '41 2 * * *'
@@ -300,7 +300,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [antares-model, antares-ql, antares-matcher, linkml-model, odata-csdl, odata-url, odata-json, odata-batch, antares-residual]
+        crate: [ngsild-model, ngsild-ql, ngsild-matcher, linkml-model, odata-csdl, odata-url, odata-json, odata-batch, ngsild-residual]
     env:
           # ignore-leaks: crossbeam-epoch parks its per-thread handle in a thread-local
           # that Miri reports as leaked at exit; not a broker leak.

@@ -516,7 +516,7 @@ fn compare(target: &Value, op: CmpOp, want: &QValue, re: Option<&regex::Regex>) 
             // considered shall be a temporal one" (EXAMPLE 8 of the clause is
             // exactly this: `?q=temperature.observedAt>=2017-12-24T12:00:00Z`).
             // Equality stays a string comparison: `==` also lowers to a
-            // jsonpath string compare in `antares_ql::sql`, and widening it
+            // jsonpath string compare in `ngsild_ql::sql`, and widening it
             // here alone would make the memory and Postgres arms disagree.
             if matches!(op, CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le) {
                 if let (Some(tk), Some(sk)) = (temporal_key(t), temporal_key(s)) {
