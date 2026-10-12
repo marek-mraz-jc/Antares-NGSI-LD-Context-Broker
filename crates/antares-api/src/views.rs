@@ -25,10 +25,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// How many rules a composed narrowing may hold: the pairs of a view's
-/// rules and an engine's are the product of two bounded lists, and the
-/// product is bounded again so neither side can make the other's allocation
-/// grow without limit.
+/// rules and an engine's that share a type are bounded, so neither side can
+/// make the other's allocation grow without limit. Pairs that share no type
+/// compose to nothing and are never counted (T-4079).
 pub const MAX_COMPOSED_RULES: usize = 4096;
+
+/// The refusal when [`MAX_COMPOSED_RULES`] is reached. A bound on the
+/// request, not a policy: answered 400 BadRequestData naming the bound,
+/// never 403, which reads as "no policy grants this" (T-4079).
+pub const TOO_MANY_RULES: &str = "the view and the policy compose to more than 4096 rules \
+     (MAX_COMPOSED_RULES); name fewer types in the request";
 
 /// A view as `gate!` applies it: the predicate `selector ∧ q ∧ scope_q ∧
 /// geo_q` and the per-rule allowlists (ADR-0023 rule 11), compiled once.
@@ -176,6 +182,13 @@ pub fn with_view(
         // Rule 5: the handler lists the core @context alone under a view,
         // so the view has nothing of its own to narrow there.
         return engine;
+    }
+    if crate::policy::NAME_READS.contains(&clause) {
+        // Serve @context (5.13.4) is offered through no view: refused here,
+        // as it was before NAME_READS took a narrowing (T-4009).
+        return Err(Denied(format!(
+            "{clause} serves no stored @context through a view"
+        )));
     }
     if crate::policy::WRITE_BY_ID.contains(&clause) && CHECKED_WRITES.contains(&clause) {
         // Rule 7 as below, the engine's answer the condition its write
@@ -400,18 +413,35 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
         (false, true) => return Ok(a.to_vec()),
         (false, false) => {}
     }
-    if a.len().saturating_mul(b.len()) > MAX_COMPOSED_RULES {
-        return Err(Denied(format!(
-            "the view and the policy compose to more than {MAX_COMPOSED_RULES} rules"
-        )));
+    // Only a pair that shares a type composes to anything, so `b` is
+    // indexed by type and each rule of `a` meets only the rules it shares
+    // one with: an engine's rule per requested type no longer multiplies by
+    // every rule of the view (T-4079). The bound counts those pairs.
+    let ctx = crate::repr::policy_context();
+    let mut by_type: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, y) in b.iter().enumerate() {
+        for t in &y.types {
+            by_type.entry(ctx.expand_key(t)).or_default().push(index);
+        }
     }
+    let mut paired = 0usize;
     let mut out = Vec::new();
     for x in a {
-        for y in &b {
+        let mut meets: Vec<usize> = x
+            .types
+            .iter()
+            .filter_map(|t| by_type.get(&ctx.expand_key(t)))
+            .flatten()
+            .copied()
+            .collect();
+        meets.sort_unstable();
+        meets.dedup();
+        paired = paired.saturating_add(meets.len());
+        if paired > MAX_COMPOSED_RULES {
+            return Err(Denied(TOO_MANY_RULES.to_owned()));
+        }
+        for y in meets.into_iter().filter_map(|index| b.get(index)) {
             let types = shared(&x.types, y.types.clone());
-            if types.is_empty() {
-                continue;
-            }
             let Some((ids, id_patterns)) = and_ids(x, y)? else {
                 continue;
             };
@@ -1806,6 +1836,117 @@ mod tests {
         assert_eq!(
             with_view(Some(&cars()), "5.7.2", Err(Denied("no".into()))),
             Err(Denied("no".into()))
+        );
+    }
+
+    /// T-4079: the export asks a view for all 21 types of a space whose
+    /// policy grants 9. The engine answers one rule per requested type and
+    /// the view holds hundreds; only the pairs that share a type compose, so
+    /// the request is served with the 9 granted types instead of refused.
+    #[test]
+    fn twenty_one_requested_types_compose_per_type_not_as_a_product() {
+        let granted = [
+            "Vehicle",
+            "GtfsStop",
+            "TransitRoute",
+            "GtfsStation",
+            "GtfsAgency",
+            "GtfsRoute",
+            "GtfsShape",
+            "Alert",
+            "OffStreetParking",
+        ];
+        let requested: Vec<String> = granted
+            .iter()
+            .map(|t| (*t).to_owned())
+            .chain((0..12).map(|i| format!("Other{i}")))
+            .collect();
+        let view: Vec<Rule> = (0..300)
+            .map(|i| rule(&[granted[i % granted.len()]], None, &[]))
+            .collect();
+        let engine: Vec<Rule> = requested
+            .iter()
+            .map(|t| rule(&[t.as_str()], None, &[]))
+            .collect();
+        assert!(
+            view.len() * engine.len() > MAX_COMPOSED_RULES,
+            "the product alone was refused"
+        );
+        let pairs = pair_rules(&view, engine).expect("composes");
+        assert_eq!(
+            pairs.len(),
+            300,
+            "one pair per view rule, each with its own type"
+        );
+        let mut types: Vec<&str> = pairs
+            .iter()
+            .flat_map(|r| &r.types)
+            .map(String::as_str)
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        let mut want = granted.to_vec();
+        want.sort_unstable();
+        assert_eq!(
+            types, want,
+            "the bound never widens: the granted types alone"
+        );
+    }
+
+    /// T-4079: the bound still holds for pairs that do share a type, at
+    /// exactly MAX_COMPOSED_RULES, and its refusal names it.
+    #[test]
+    fn the_bound_counts_pairs_that_share_a_type() {
+        let view: Vec<Rule> = (0..MAX_COMPOSED_RULES)
+            .map(|_| rule(&["Car"], None, &[]))
+            .collect();
+        assert_eq!(
+            pair_rules(&view, vec![rule(&["Car"], None, &[])])
+                .expect("at the bound")
+                .len(),
+            MAX_COMPOSED_RULES
+        );
+        let two = vec![
+            rule(&["Car"], Some("speed>1"), &[]),
+            rule(&["Car"], Some("speed<9"), &[]),
+        ];
+        assert_eq!(
+            pair_rules(&view, two),
+            Err(Denied(TOO_MANY_RULES.to_owned()))
+        );
+        assert!(TOO_MANY_RULES.contains(&MAX_COMPOSED_RULES.to_string()));
+    }
+
+    /// T-4079: a bound on the request answers 400 BadRequestData naming it,
+    /// never the 403 a policy refusal is.
+    #[tokio::test]
+    async fn the_bound_answers_400_naming_it() {
+        use axum::response::IntoResponse;
+        let response =
+            crate::negotiate::ApiError::from(Denied(TOO_MANY_RULES.to_owned())).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+        )
+        .expect("json");
+        assert_eq!(
+            body["type"],
+            "https://uri.etsi.org/ngsi-ld/errors/BadRequestData"
+        );
+        assert!(body["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("MAX_COMPOSED_RULES"));
+        let other = crate::negotiate::ApiError::from(Denied("no".into())).into_response();
+        assert_eq!(
+            other.status(),
+            StatusCode::FORBIDDEN,
+            "a policy refusal stays 403"
         );
     }
 }
