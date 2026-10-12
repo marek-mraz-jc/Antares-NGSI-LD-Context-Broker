@@ -87,3 +87,8 @@ tenant-not-from-header | POST /ex/v1/remote-notify | antares_api::distsub::remot
 surface-entry-without-ops | antares_odata::batch::serve | each part is a oneshot into the nested OData router (batch.rs run), whose read::serve and write::serve run through Ops; a tower Service call is no edge (T-3844)
 
 fs-from-a-request | antares_odata::serve | antares_jsonld::loader::client_builder | reads the CA bundle the operator configured (ANTARES_* env, once per client), never a path from the request (T-3844)
+
+# T-3915: secrets, child processes, files a route writes, panics a route reaches.
+secret-exposed | antares_api::admin_auth::AdminAuth::admits | the presented bearer is compared with the admin token in constant time (constant_time_eq); the value goes nowhere else
+secret-exposed | antares_broker::build_builtin | the database URL goes to the Postgres pool's connect (connect_with) and nowhere else; the retry loop keeps the error text, which names no URL (tests/secret_logs.rs)
+fs-write-from-a-server | antares_sql::store::mem::redb::Shadow::write | the file store's one redb file, opened at boot under ANTARES_DATA_DIR (operator config, Store::open_file); a request only supplies the key bytes of a row inside it (tenant NUL id), never a path
