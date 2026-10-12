@@ -92,6 +92,64 @@ pub fn decide(
     }
 }
 
+/// Whether some request of `op.clause` could be allowed for `caller`: the
+/// probe a surface lists its tools by (T-3784), where `op` names nothing.
+/// A read is decided per type the request names, and a prohibition refuses
+/// only the types it names, so a read is offered when a grant applies and
+/// no prohibition names every type (a read of another type is narrowed,
+/// never refused). A write must fall inside a grant: it is offered when a
+/// grant takes the written types or names a type no prohibition covers; a
+/// conditional prohibition counts as refusing its whole type, so the probe
+/// may hide a write, never offer one every request of which is refused. The
+/// whole-Tenant clauses are decided as a request.
+#[must_use]
+pub fn probe(
+    table: Option<&Table>,
+    caller: &Caller,
+    op: &Operation<'_>,
+    now: DateTime<Utc>,
+) -> Decision {
+    let (Caller::Platform(platform), Some(table)) = (caller, table) else {
+        return decide(table, caller, op, now);
+    };
+    if WHOLE_TENANT.contains(&op.clause) {
+        return decide(Some(table), caller, op, now);
+    }
+    let applying: Vec<&Policy> = held(table, platform, now)
+        .filter(|p| p.clauses.contains(op.clause))
+        .collect();
+    let refused = |t: &String| {
+        applying
+            .iter()
+            .any(|p| p.prohibit && covers_types(p, std::slice::from_ref(t)))
+    };
+    let every_type_refused = applying
+        .iter()
+        .any(|p| p.prohibit && p.selectors.is_empty());
+    let grants = applying.iter().filter(|p| !p.prohibit);
+    let offered = if every_type_refused {
+        false
+    } else if op.clause.starts_with("5.6.") {
+        // a window is about reading history; it admits no write (`admits`)
+        grants
+            .filter(|p| p.conditions.temporal.is_empty())
+            .any(|p| {
+                p.selectors.is_empty()
+                    || p.selectors
+                        .iter()
+                        .flat_map(|s| &s.types)
+                        .any(|t| !refused(t))
+            })
+    } else {
+        grants.count() > 0
+    };
+    if offered {
+        Decision::Allow
+    } else {
+        Decision::Deny(NOT_GRANTED.into())
+    }
+}
+
 /// The policies of `table` whose assignee is `caller` and that are in force
 /// at `now`: what a decision starts from, and all the access surface shows.
 pub fn held<'t>(

@@ -229,7 +229,9 @@ async fn properties_pushed_to_pick() -> Result<(), String> {
         a.body.pointer("/features/0"),
         Some(&json!({"type": "Feature", "id": "urn:ngsi-ld:Car:1",
                      "geometry": {"type": "Point", "coordinates": [17.1, 48.1]},
-                     "properties": {"speed": 10}})),
+                     "properties": {"speed": 10},
+                     "links": [{"rel": "describedby", "type": "application/schema+json",
+                                "href": "http://localhost:9090/x/views/city/ogc/features/collections/Car/schema"}]})),
         "{}",
         a.body
     );

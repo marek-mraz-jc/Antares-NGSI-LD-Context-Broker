@@ -40,6 +40,26 @@ pub(crate) fn run(root: &Node, entity: &Value) -> Result<Truth, Error> {
     Ok(truth(e.value(root)?.as_ref()))
 }
 
+/// The value of `root` for `entity` as JSON: a date, time or date-time as its text, `None`
+/// when unknown.
+pub(crate) fn run_value(root: &Node, entity: &Value) -> Result<Option<Value>, Error> {
+    let mut e = Eval {
+        entity,
+        scope: Vec::new(),
+        steps: 0,
+    };
+    Ok(e.value(root)?.map(|v| match v {
+        Val::Bool(b) => Value::Bool(b),
+        Val::Int(i) => Value::from(i),
+        Val::Num(n) => Value::from(n),
+        Val::Str(s) => Value::String(s.into_owned()),
+        Val::DateTime(d) => Value::String(d.to_string()),
+        Val::Date(d) => Value::String(d.to_string()),
+        Val::Time(t) => Value::String(t.to_string()),
+        Val::Json(v) => v.clone(),
+    }))
+}
+
 /// `CASEI` and `ACCENTI` of a string.
 pub(crate) fn fold_text(f: Func, s: &str) -> String {
     if f == Func::CaseI {
