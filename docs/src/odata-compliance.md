@@ -171,7 +171,8 @@ Each failing area is a task, or a decision with its reason:
 | Change sets and atomicity groups, Content-ID references | 11.4.9.1, 11.4.9.3, 19_json_batch | not supported, by design: ADR-0024 section 5 (W26), mapping row C18 |
 | A comparison or `in` between a property and a literal of another type answers 200 with no rows; an Int64 literal past its range is accepted | 11.3.6, 11.2.5.1, 5.1.1.5 | T-3725 |
 | Options inside `$expand(...)` other than `$select` and `$expand` (Q5) | 11.2.5.9, 11.3.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
-| `$apply`, `$compute`, `$index`, `$search`, `$deltatoken` and delta links | 11.2.5.4.x, 11.2.5.13, 11.2.4.1, 11.2.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
+| `$apply`, `$compute`, `$index`, `$deltatoken` and delta links | 11.2.5.4.x, 11.2.5.13, 11.2.4.1, 11.2.8 | not supported, by design: ADR-0024 section 5 answers them 501; `$compute` is T-3936, `$apply` T-3937 |
+| `$search` answered 501 | 11.2.5.6 | T-3750: served over the String properties the view shows |
 | Filter functions outside the F-row subset (date and time, arithmetic, `length`, `indexof`, `substring`, `divby`, `matchesPattern`, `isof`, `cast`) | 11.3.1 to 11.3.4, 11.3.9, 11.5.x | not supported, by design: ADR-0024 section 5; the mapped rows still at 501 are T-3686 |
 | Actions and functions, bound or unbound | 11.2.10, 11.4.13, 12.1, 12.2 | not supported, by design: an NGSI-LD view has no operations (ADR-0024 section 5) |
 | Media entities and stream properties | 11.2.12 | not supported, by design: ADR-0024 section 5 |

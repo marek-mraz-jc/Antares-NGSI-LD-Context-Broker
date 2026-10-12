@@ -369,7 +369,6 @@ fn query_option_errors() {
         }
     );
     for (name, feature) in [
-        ("$search=blue", Feature::Search),
         ("compute=1 as x", Feature::Compute),
         ("$index=1", Feature::Index),
         ("$deltatoken=x", Feature::DeltaToken),
@@ -571,12 +570,11 @@ fn filter_errors() {
         ("$root/Buildings", Feature::Root, 0),
         ("$it/height", Feature::ImplicitVariable, 0),
         ("$this", Feature::ImplicitVariable, 0),
-        ("-height", Feature::Arithmetic, 0),
-        ("height add 1", Feature::Arithmetic, 7),
         ("height has 1", Feature::Has, 7),
         ("name in tags", Feature::InExpression, 8),
         ("name in (name)", Feature::InExpression, 8),
-        ("length(name) gt 1", Feature::Method, 0),
+        ("totalseconds(name) gt 1", Feature::Method, 0),
+        ("hassubset(tags,tags)", Feature::Method, 0),
         ("geo.distance(location,location) lt 1", Feature::Method, 0),
         ("cast(name,Edm.String)", Feature::CastIsOf, 0),
         ("isof(Model.Tower)", Feature::CastIsOf, 0),
@@ -591,7 +589,6 @@ fn filter_errors() {
         ("tags/$count gt 1", Feature::NestedCount, 4),
         ("tags/$filter(true)", Feature::PathInExpression, 4),
         ("sensors(1)/value", Feature::PathInExpression, 7),
-        ("tags/all(t:t eq 'x')", Feature::AllLambda, 5),
         ("@Core.Messages/any()", Feature::AnnotationPath, 0),
         ("name/@Core.Size/x", Feature::AnnotationPath, 5),
         ("tags/@Core.Size/x", Feature::AnnotationPath, 5),
@@ -944,8 +941,8 @@ fn the_canonical_form_parses_back() {
 
 #[test]
 fn errors_name_themselves() {
-    let e = err("Buildings?$search=x");
-    assert_eq!(e.to_string(), "not implemented at byte 10: $search");
+    let e = err("Buildings?$index=1");
+    assert_eq!(e.to_string(), "not implemented at byte 10: $index");
     let e = err("Towers");
     assert_eq!(e.to_string(), "unknown name at byte 0");
     let e = err("Buildings?$top=1&$top=1");
@@ -973,7 +970,6 @@ fn every_feature_and_limit_has_its_own_name() {
     use Feature as F;
     use LimitKind as L;
     let features = [
-        F::Search,
         F::Compute,
         F::Index,
         F::Apply,
@@ -991,11 +987,9 @@ fn every_feature_and_limit_has_its_own_name() {
         F::NestedOption,
         F::NestedCount,
         F::PathInExpression,
-        F::Arithmetic,
         F::Has,
         F::Method,
         F::CastIsOf,
-        F::AllLambda,
         F::InExpression,
         F::JsonLiteral,
         F::Literal,
@@ -1123,4 +1117,361 @@ fn the_rest_of_the_grammar() {
     assert_eq!(ok(&rings.to_string()), rings);
     let punctuated = ok("Buildings?$filter=name eq 'a-b.c_d~e!f(g)h*i,j;k$l&m=n:o@p+q'");
     assert_eq!(ok(&punctuated.to_string()), punctuated);
+}
+
+/// The offset just past `text` in a `$filter` of `Buildings`.
+fn past(text: &str) -> usize {
+    "Buildings?$filter=".len().saturating_add(text.len())
+}
+
+/// T-3749: arithmetic binds tighter than comparison, `mul div divby mod` tighter than `add sub`,
+/// both left-associative, and negation tightest; a `-` before a number is the number.
+#[test]
+fn arithmetic_follows_the_precedence_of_5_1_1_16() {
+    let arith = |l, op, r| Expr::Arith(Box::new(l), op, Box::new(r));
+    assert_eq!(
+        filter("height add 2 mul 3 gt 10"),
+        Expr::Compare(
+            Box::new(arith(
+                member(&["height"]),
+                ArithOp::Add,
+                arith(int(2), ArithOp::Mul, int(3))
+            )),
+            CompareOp::Gt,
+            Box::new(int(10)),
+        )
+    );
+    assert_eq!(
+        filter("height sub 1 sub 2 eq 0"),
+        Expr::Compare(
+            Box::new(arith(
+                arith(member(&["height"]), ArithOp::Sub, int(1)),
+                ArithOp::Sub,
+                int(2)
+            )),
+            CompareOp::Eq,
+            Box::new(int(0)),
+        )
+    );
+    for (word, op) in [
+        ("div", ArithOp::Div),
+        ("divby", ArithOp::DivBy),
+        ("mod", ArithOp::Mod),
+    ] {
+        assert_eq!(
+            filter(&format!("height {word} 2 eq 1")),
+            Expr::Compare(
+                Box::new(arith(member(&["height"]), op, int(2))),
+                CompareOp::Eq,
+                Box::new(int(1)),
+            ),
+            "{word}"
+        );
+    }
+    assert_eq!(
+        filter("-height lt -2"),
+        Expr::Compare(
+            Box::new(Expr::Neg(Box::new(member(&["height"])))),
+            CompareOp::Lt,
+            Box::new(int(-2)),
+        )
+    );
+    assert_eq!(
+        filter("- (height add 1) lt 0"),
+        Expr::Compare(
+            Box::new(Expr::Neg(Box::new(arith(
+                member(&["height"]),
+                ArithOp::Add,
+                int(1)
+            )))),
+            CompareOp::Lt,
+            Box::new(int(0)),
+        )
+    );
+    // A dangling operator is a syntax error at the operand it lacks.
+    syntax("Buildings?$filter=height add", past("height add"));
+}
+
+/// T-3749: every method of the table parses with its arity; one argument too few fails where
+/// the `COMMA` was due, one too many where the `CLOSE` was.
+#[test]
+fn methods_parse_with_their_arity() {
+    for method in Method::all() {
+        let args = match method.arity().0 {
+            0 => String::new(),
+            1 => "name".into(),
+            _ => "name,name".into(),
+        };
+        // a method's name with no `(` after it is a member's name, here an unknown one; a
+        // dotted one reads as a qualified cast
+        let bare = err(&format!("Buildings?$filter={}%20eq%201", method.name()));
+        let want = if method.name().contains('.') {
+            "not implemented at byte 18: type cast"
+        } else {
+            "unknown name at byte 18"
+        };
+        assert_eq!(bare.to_string(), want, "{method:?}");
+        let text = format!("{}({args}) eq null", method.name().to_uppercase());
+        let parsed = filter(&text);
+        let Expr::Compare(call, CompareOp::Eq, _) = parsed else {
+            panic!("{text}: {parsed:?}")
+        };
+        assert!(
+            matches!(call.as_ref(), Expr::Call(m, a) if *m == method && a.len() == method.arity().0),
+            "{text}: {call:?}"
+        );
+    }
+    // so is the bare name of a method that stays 501, and of cast and isof
+    for name in ["totalseconds", "cast", "isof"] {
+        let bare = err(&format!("Buildings?$filter={name}%20eq%201"));
+        assert_eq!(bare.to_string(), "unknown name at byte 18", "{name}");
+    }
+    assert_eq!(
+        filter("substring(name,1,2) eq 'x'"),
+        Expr::Compare(
+            Box::new(Expr::Call(
+                Method::Substring,
+                vec![member(&["name"]), int(1), int(2)]
+            )),
+            CompareOp::Eq,
+            Box::new(Expr::Literal(Literal::String("x".into()))),
+        )
+    );
+    assert_eq!(
+        filter("year(now()) gt 2000"),
+        Expr::Compare(
+            Box::new(Expr::Call(
+                Method::Year,
+                vec![Expr::Call(Method::Now, Vec::new())]
+            )),
+            CompareOp::Gt,
+            Box::new(int(2000)),
+        )
+    );
+    syntax(
+        "Buildings?$filter=length(name,name) eq 1",
+        past("length(name"),
+    );
+    syntax("Buildings?$filter=now(name) eq 1", past("now("));
+    syntax("Buildings?$filter=concat(name) eq 'x'", past("concat(name"));
+    syntax(
+        "Buildings?$filter=substring(name,1,2,3) eq 'x'",
+        past("substring(name,1,2"),
+    );
+    // A member that shares a method's name is still the member.
+    assert_eq!(
+        filter("built eq 1"),
+        Expr::Compare(
+            Box::new(member(&["built"])),
+            CompareOp::Eq,
+            Box::new(int(1))
+        )
+    );
+}
+
+/// T-3749: `all` reads like `any`, needs its lambda, and its variable is in scope in the body
+/// only.
+#[test]
+fn all_lambdas_parse() {
+    let area = Expr::Member(MemberPath {
+        variable: Some("r".into()),
+        path: vec!["area".into()],
+    });
+    assert_eq!(
+        filter("rooms/all(r:r/area gt 10)"),
+        Expr::All {
+            collection: MemberPath {
+                variable: None,
+                path: vec!["rooms".into()],
+            },
+            lambda: (
+                "r".into(),
+                Box::new(Expr::Compare(
+                    Box::new(area),
+                    CompareOp::Gt,
+                    Box::new(int(10))
+                ))
+            ),
+        }
+    );
+    assert!(matches!(
+        filter("tags/all(t:t ne 'x') and rooms/any()"),
+        Expr::And(..)
+    ));
+    // past the `)`, as the OASIS runner reports `Products/all()`
+    syntax("Buildings?$filter=tags/all()", past("tags/all()"));
+    unresolved(
+        "Buildings?$filter=tags/all(t:t eq 'x') and t eq 'x'",
+        past("tags/all(t:t eq 'x') and "),
+    );
+}
+
+/// T-3749: the canonical writer parenthesises only what the precedence needs, and what it
+/// writes parses back to the same tree.
+#[test]
+fn arithmetic_and_lambdas_round_trip() {
+    for text in [
+        "Buildings?$filter=height%20add%202%20mul%203%20gt%2010",
+        "Buildings?$filter=(height%20add%202)%20mul%203%20gt%2010",
+        "Buildings?$filter=height%20sub%20(1%20sub%202)%20eq%200",
+        "Buildings?$filter=-height%20lt%20-2",
+        "Buildings?$filter=-(height%20add%201)%20lt%200",
+        "Buildings?$filter=-(-1)%20eq%201",
+        "Buildings?$filter=not%20(height%20add%201%20gt%202)",
+        "Buildings?$filter=rooms/all(r:r/area%20gt%2010)",
+        "Buildings?$filter=substring(name,1,2)%20eq%20'x'",
+        "Buildings?$filter=round(height%20divby%203)%20eq%201",
+        "Buildings?$filter=matchesPattern(name,'%5EA.*e$')",
+    ] {
+        let canonical = ok(text).to_string();
+        assert_eq!(canonical, text, "{text}");
+        assert_eq!(ok(&canonical).to_string(), canonical, "{text}");
+    }
+}
+
+fn search_of(query: &str) -> Search {
+    options(&format!("Buildings?{query}"))
+        .search
+        .unwrap_or(Search::Word(String::new()))
+}
+
+#[test]
+fn search_reads_words_phrases_and_operators_with_their_precedence() {
+    use Search::{And, Not, Or, Phrase, Word};
+    let word = |w: &str| Box::new(Word(w.into()));
+    assert_eq!(search_of("$search=blue"), Word("blue".into()));
+    assert_eq!(search_of("search=blue"), Word("blue".into()));
+    // side by side is AND; NOT binds tighter than AND, AND tighter than OR (URL 5.1.7)
+    assert_eq!(search_of("$search=a b"), And(word("a"), word("b")));
+    assert_eq!(search_of("$search=a%20AND%20b"), And(word("a"), word("b")));
+    assert_eq!(
+        search_of("$search=a b OR c"),
+        Or(Box::new(And(word("a"), word("b"))), word("c"))
+    );
+    assert_eq!(
+        search_of("$search=a OR b c"),
+        Or(word("a"), Box::new(And(word("b"), word("c"))))
+    );
+    assert_eq!(
+        search_of("$search=NOT a b"),
+        And(Box::new(Not(word("a"))), word("b"))
+    );
+    assert_eq!(
+        search_of("$search=NOT (a OR b)"),
+        Not(Box::new(Or(word("a"), word("b"))))
+    );
+    assert_eq!(
+        search_of("$search=( a OR b ) c"),
+        And(Box::new(Or(word("a"), word("b"))), word("c"))
+    );
+    // a form encoder's `+` is a space; a plus in a word is written `%2B`
+    assert_eq!(search_of("$search=a+OR+b"), Or(word("a"), word("b")));
+    assert_eq!(search_of("$search=C%2B%2B"), Word("C++".into()));
+    // operators are upper case and need whitespace on both sides; otherwise they are words
+    assert_eq!(
+        search_of("$search=a or b"),
+        And(Box::new(And(word("a"), word("or"))), word("b"))
+    );
+    assert_eq!(search_of("$search=NOT"), Word("NOT".into()));
+    assert_eq!(search_of("$search=NOTE"), Word("NOTE".into()));
+    assert_eq!(search_of("$search=a OR"), And(word("a"), word("OR")));
+    // phrases keep spaces, parentheses and percent-decoded text
+    assert_eq!(
+        search_of("$search=\"dark red\" OR %22a (b)%22"),
+        Or(
+            Box::new(Phrase("dark red".into())),
+            Box::new(Phrase("a (b)".into()))
+        )
+    );
+    // `&` and `#` only percent-encoded; UTF-8 decoded; a quote inside a word
+    assert_eq!(search_of("$search=R%26D%23"), Word("R&D#".into()));
+    assert_eq!(search_of("$search=caf%C3%A9"), Word("café".into()));
+    assert_eq!(search_of("$search=it's"), Word("it's".into()));
+    // a literal `;` ends a word, a percent-encoded one is text (ABNF `searchWord`)
+    assert_eq!(search_of("$search=a%3Bb"), Word("a;b".into()));
+    syntax("Buildings?$search=a;b", "Buildings?$search=a".len());
+    // `searchExpr-incomplete` is one phrase, `''` a quote
+    assert_eq!(search_of("$search='it''s red'"), Phrase("it's red".into()));
+    // `+` is a space in a phrase too; `&` percent-encoded is text
+    assert_eq!(search_of("$search=%22a+b%22"), Phrase("a b".into()));
+    assert_eq!(search_of("$search='a+b%26c'"), Phrase("a b&c".into()));
+    // whitespace before the end of the option or the next one
+    assert_eq!(search_of("$search=a%20"), Word("a".into()));
+    let spaced = options("Buildings?$search=a%20&$top=1");
+    assert_eq!(
+        (spaced.search, spaced.top),
+        (Some(Word("a".into())), Some(1))
+    );
+    // the option ends at `&`
+    let both = options("Buildings?$search=a&$top=1");
+    assert_eq!((both.search, both.top), (Some(Word("a".into())), Some(1)));
+}
+
+#[test]
+fn search_refuses_what_is_no_search_expression() {
+    for query in [
+        "$search=",
+        "$search=%20",
+        "$search=(a",
+        "$search=a)",
+        "$search=()",
+        "$search=\"\"",
+        "$search=\"%20\"",
+        "$search=\"open",
+        "$search='open",
+        "$search=''",
+        "$search='x'y",
+        "$search=a%2",
+        "$search=%FF",
+        "$search=a;b",
+        "$search=a 'b",
+    ] {
+        let e = err(&format!("Buildings?{query}"));
+        assert!(
+            matches!(e.kind, UrlErrorKind::Syntax { .. }),
+            "{query}: {e:?}"
+        );
+    }
+    let dup = err("Buildings?$search=a&search=b");
+    assert_eq!(dup.to_string(), "system query option $search given twice");
+}
+
+#[test]
+fn search_is_bounded() {
+    let tight = Limits {
+        max_expr_depth: 2,
+        max_expr_nodes: 5,
+        max_literal_len: 4,
+        ..Limits::strict()
+    };
+    let limit = |q: &str| {
+        let e = err_within(&format!("Buildings?{q}"), &tight);
+        match e.kind {
+            UrlErrorKind::LimitExceeded { limit, .. } => limit,
+            other => panic!("{q}: {other:?}"),
+        }
+    };
+    assert_eq!(limit("$search=a b c d"), LimitKind::ExprNodes);
+    assert_eq!(limit("$search=NOT NOT NOT a"), LimitKind::ExprDepth);
+    assert_eq!(limit("$search=(((a)))"), LimitKind::ExprDepth);
+    assert_eq!(limit("$search=abcdef"), LimitKind::LiteralLength);
+    assert_eq!(limit("$search=\"abcdef\""), LimitKind::LiteralLength);
+    assert_eq!(limit("$search='abcdef'"), LimitKind::LiteralLength);
+    assert!(parse("Buildings?$search=NOT (a)", &Service, &tight).is_ok());
+}
+
+#[test]
+fn search_writes_its_canonical_form() {
+    for (query, written) in [
+        ("$search=a b OR c", "$search=a%20AND%20b%20OR%20c"),
+        ("$search=a (b OR c)", "$search=a%20AND%20(b%20OR%20c)"),
+        ("$search=NOT (a b)", "$search=NOT%20(a%20AND%20b)"),
+        ("$search=\"x y\"", "$search=%22x%20y%22"),
+        ("$search=C%2B%2B", "$search=C%2B%2B"),
+        ("$search=a OR", "$search=a%20AND%20%22OR%22"),
+    ] {
+        let uri = ok(&format!("Buildings?{query}"));
+        assert_eq!(uri.to_string(), format!("Buildings?{written}"), "{query}");
+        assert_eq!(ok(&uri.to_string()).to_string(), uri.to_string(), "{query}");
+    }
 }

@@ -50,19 +50,21 @@ mod literal;
 mod model;
 mod path;
 mod query;
+mod search;
 
 use std::borrow::Cow;
 
 pub use ast::{
-    CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key, KeyValue, Levels,
-    Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions, Segment, SelectItem,
-    Shape,
+    ArithOp, CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key, KeyValue,
+    Levels, Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions, Segment,
+    SelectItem, Shape,
 };
 #[cfg(feature = "edm")]
 pub use edm::EdmModel;
 pub use error::{Feature, LimitKind, UrlError, UrlErrorKind};
 pub use limits::Limits;
 pub use model::{Member, Model};
+pub use search::Search;
 
 use cursor::Cursor;
 use expr::{Budget, Scope};
@@ -83,8 +85,8 @@ use query::{Allowed, Query};
 /// #     fn entity_set(&self, name: &str) -> Option<&str> { (name == "Buildings").then_some("B") }
 /// #     fn member(&self, _: &str, _: &str) -> Option<Member<'_>> { None }
 /// # }
-/// let refused = parse("Buildings?$search=blue", &Service, &Limits::strict()).unwrap_err();
-/// assert_eq!(refused.kind, UrlErrorKind::NotImplemented(Feature::Search));
+/// let refused = parse("Buildings?$index=1", &Service, &Limits::strict()).unwrap_err();
+/// assert_eq!(refused.kind, UrlErrorKind::NotImplemented(Feature::Index));
 /// assert_eq!(refused.offset, 10);
 /// ```
 pub fn parse<M: Model>(uri: &str, model: &M, limits: &Limits) -> Result<ODataUri, UrlError> {

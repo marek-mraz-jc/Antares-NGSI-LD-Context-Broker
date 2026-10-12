@@ -2,14 +2,14 @@
 //! `commonExpr` and `boolCommonExpr` (ABNF section 4) for `$filter` and `$orderby`.
 //!
 //! The ABNF lists operators without precedence; the tree follows URL Conventions 5.1.1.16:
-//! `not` binds tightest, then `gt ge lt le`, then `eq ne in`, then `and`, then `or`, each
-//! left-associative.
+//! `not` and negation bind tightest, then `mul div divby mod`, then `add sub`, then
+//! `gt ge lt le`, then `eq ne in`, then `and`, then `or`, each binary one left-associative.
 
 use crate::cursor::{count, Cursor};
 use crate::literal::literal;
 use crate::model::{Member, Model};
 use crate::{
-    CompareOp, Expr, Feature, LimitKind, Limits, Literal, MemberPath, Method, UrlError,
+    ArithOp, CompareOp, Expr, Feature, LimitKind, Limits, Literal, MemberPath, Method, UrlError,
     UrlErrorKind,
 };
 
@@ -67,35 +67,21 @@ const RELATIONAL: [(&str, CompareOp); 4] = [
     ("le", CompareOp::Le),
 ];
 const EQUALITY: [(&str, CompareOp); 2] = [("eq", CompareOp::Eq), ("ne", CompareOp::Ne)];
-const ARITHMETIC: [&str; 6] = ["add", "sub", "mul", "div", "divby", "mod"];
+const ADDITIVE: [ArithOp; 2] = [ArithOp::Add, ArithOp::Sub];
+/// `divby` before `div`: the operator word must be followed by white space, so the order only
+/// saves a failed attempt.
+const MULTIPLICATIVE: [ArithOp; 4] = [ArithOp::Mul, ArithOp::DivBy, ArithOp::Div, ArithOp::Mod];
 
-/// Method names of `methodCallExpr` outside the subset.
-const OTHER_METHODS: [&str; 26] = [
-    "concat",
-    "indexof",
-    "length",
-    "matchesPattern",
-    "substring",
-    "tolower",
-    "toupper",
-    "trim",
-    "year",
-    "month",
-    "day",
-    "hour",
-    "minute",
-    "second",
-    "fractionalseconds",
+/// Method names of `methodCallExpr` the parser does not implement: `totalseconds` reads a
+/// duration, which has no NGSI-LD value type (F27); `geo.distance` and `geo.length` measure,
+/// which ADR-0028 rule 8 keeps out of the residual; `hassubset`, `hassubsequence` and `case`
+/// have no evaluator.
+const OTHER_METHODS: [&str; 6] = [
     "totalseconds",
-    "date",
-    "time",
-    "totaloffsetminutes",
-    "mindatetime",
-    "maxdatetime",
-    "now",
-    "round",
-    "floor",
-    "ceiling",
+    "geo.distance",
+    "geo.length",
+    "hassubset",
+    "hassubsequence",
     "case",
 ];
 
@@ -171,11 +157,34 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
     }
 
     fn relational(&mut self, scope: Scope<'m>) -> Result<Expr, UrlError> {
-        let mut left = self.unary(scope)?;
+        let mut left = self.additive(scope)?;
         while let Some(op) = RELATIONAL.into_iter().find(|(w, _)| self.operator(w)) {
-            let right = self.unary(scope)?;
+            let right = self.additive(scope)?;
             self.node()?;
             left = Expr::Compare(Box::new(left), op.1, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn additive(&mut self, scope: Scope<'m>) -> Result<Expr, UrlError> {
+        let mut left = self.multiplicative(scope)?;
+        while let Some(op) = ADDITIVE.into_iter().find(|op| self.operator(op.word())) {
+            let right = self.multiplicative(scope)?;
+            self.node()?;
+            left = Expr::Arith(Box::new(left), op, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn multiplicative(&mut self, scope: Scope<'m>) -> Result<Expr, UrlError> {
+        let mut left = self.unary(scope)?;
+        while let Some(op) = MULTIPLICATIVE
+            .into_iter()
+            .find(|op| self.operator(op.word()))
+        {
+            let right = self.unary(scope)?;
+            self.node()?;
+            left = Expr::Arith(Box::new(left), op, Box::new(right));
         }
         Ok(left)
     }
@@ -190,9 +199,23 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
             return Ok(Expr::Not(Box::new(operand)));
         }
         self.c.reset(start);
-        let operand = self.primary(scope)?;
-        self.refuse_operators(&ARITHMETIC, Feature::Arithmetic)?;
-        Ok(operand)
+        // `negateExpr = "-" BWS commonExpr`, unless the `-` starts a numeric literal.
+        if self.c.eat("-") {
+            self.c.reset(start);
+            if let Some(value) = literal(self.c, self.limits)? {
+                self.node()?;
+                return Ok(Expr::Literal(value));
+            }
+            self.c.reset(start);
+            self.c.eat("-");
+            self.c.bws();
+            self.enter()?;
+            let operand = self.unary(scope)?;
+            self.leave();
+            self.node()?;
+            return Ok(Expr::Neg(Box::new(operand)));
+        }
+        self.primary(scope)
     }
 
     /// `feature` refused at its operator word when one of `words` follows.
@@ -274,9 +297,6 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
         if self.c.eat("$it") || self.c.eat("$this") {
             return Err(self.not_implemented_at(start, Feature::ImplicitVariable));
         }
-        if self.c.eat("-") {
-            return Err(self.not_implemented_at(start, Feature::Arithmetic));
-        }
         if self.c.open() {
             self.enter()?;
             self.c.bws();
@@ -305,43 +325,21 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
         self.c.not_implemented(feature)
     }
 
-    /// A method name directly followed by `OPEN`: the subset's methods parsed, the others not
-    /// implemented. `None` (cursor unmoved) when no method call starts here.
+    /// A method name directly followed by `OPEN`: the methods of [`Method`] parsed with their
+    /// arity checked, the others not implemented. `None` (cursor unmoved) when no method call
+    /// starts here.
     fn method_call(&mut self, scope: Scope<'m>) -> Result<Option<Expr>, UrlError> {
         let start = self.c.pos();
-        let subset = [
-            ("contains", Method::Contains),
-            ("startswith", Method::StartsWith),
-            ("endswith", Method::EndsWith),
-            ("geo.intersects", Method::GeoIntersects),
-        ];
-        for (name, method) in subset {
-            if self.c.eat_ci(name) && self.c.open() {
+        for method in Method::all() {
+            if self.c.eat_ci(method.name()) && self.c.open() {
                 self.enter()?;
-                self.c.bws();
-                let first = self.or_expr(scope)?;
-                self.c.bws();
-                if !self.c.comma() {
-                    return Err(self.c.syntax("COMMA"));
-                }
-                self.c.bws();
-                let second = self.or_expr(scope)?;
-                self.c.bws();
-                if !self.c.close() {
-                    return Err(self.c.syntax("CLOSE"));
-                }
+                let args = self.arguments(scope, method.arity())?;
                 self.leave();
-                return Ok(Some(Expr::Call(method, vec![first, second])));
+                return Ok(Some(Expr::Call(method, args)));
             }
             self.c.reset(start);
         }
-        let others = OTHER_METHODS.into_iter().chain([
-            "geo.distance",
-            "geo.length",
-            "hassubset",
-            "hassubsequence",
-        ]);
-        for name in others {
+        for name in OTHER_METHODS {
             if self.c.eat_ci(name) && self.c.open() {
                 return Err(self.not_implemented_at(start, Feature::Method));
             }
@@ -354,6 +352,39 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
             self.c.reset(start);
         }
         Ok(None)
+    }
+
+    /// The arguments after a method's `OPEN`, through its `CLOSE`: `BWS [ commonExpr BWS
+    /// *( COMMA BWS commonExpr BWS ) ] CLOSE`, between `least` and `most` of them. A missing
+    /// argument fails where its `COMMA` was due, an extra one where the `CLOSE` was.
+    fn arguments(
+        &mut self,
+        scope: Scope<'m>,
+        (least, most): (usize, usize),
+    ) -> Result<Vec<Expr>, UrlError> {
+        self.c.bws();
+        let mut args = Vec::new();
+        if most == 0 {
+            return if self.c.close() {
+                Ok(args)
+            } else {
+                Err(self.c.syntax("CLOSE"))
+            };
+        }
+        loop {
+            args.push(self.or_expr(scope)?);
+            self.c.bws();
+            if args.len() >= least && self.c.close() {
+                return Ok(args);
+            }
+            if args.len() >= most {
+                return Err(self.c.syntax("CLOSE"));
+            }
+            if !self.c.comma() {
+                return Err(self.c.syntax("COMMA"));
+            }
+            self.c.bws();
+        }
     }
 
     /// `firstMemberExpr`: a lambda variable or a member of `scope`, then the path on from it.
@@ -493,7 +524,7 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
         }
         self.c.reset(at);
         if self.c.eat_ci("all") && self.c.open() {
-            return Err(self.not_implemented_at(at, Feature::AllLambda));
+            return self.all(items, path);
         }
         self.c.reset(at);
         if self.c.identifier()?.is_some() {
@@ -527,6 +558,27 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
                 lambda: None,
             });
         }
+        let lambda = self.lambda(items)?;
+        Ok(Expr::Any {
+            collection,
+            lambda: Some(lambda),
+        })
+    }
+
+    /// The rest of `allExpr` after `all(`: `all` has no empty form.
+    fn all(&mut self, items: Scope<'m>, collection: MemberPath) -> Result<Expr, UrlError> {
+        self.c.bws();
+        if self.c.close() {
+            // past the `)`, where the ABNF runner stops reading `all()` as a function call
+            return Err(self.c.syntax("lambdaVariableExpr"));
+        }
+        let lambda = self.lambda(items)?;
+        Ok(Expr::All { collection, lambda })
+    }
+
+    /// `lambdaVariableExpr BWS COLON BWS lambdaPredicateExpr BWS CLOSE`, the variable ranging
+    /// over `items`.
+    fn lambda(&mut self, items: Scope<'m>) -> Result<(String, Box<Expr>), UrlError> {
         let Some(variable) = self.c.identifier()? else {
             return Err(self.c.syntax("lambdaVariableExpr"));
         };
@@ -546,10 +598,7 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
         if !self.c.close() {
             return Err(self.c.syntax("CLOSE"));
         }
-        Ok(Expr::Any {
-            collection,
-            lambda: Some((variable, Box::new(body))),
-        })
+        Ok((variable, Box::new(body)))
     }
 }
 

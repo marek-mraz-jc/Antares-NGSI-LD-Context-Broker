@@ -6075,19 +6075,18 @@ odata_without_ngsi_ld_operation:
   kind: read
   surfaces:
     odata:
-      status: rejected
-      binding: query option $search
-      http_status: 501
-      odata_error:
-        code: NotImplemented
-        message: '$search is not offered: no NGSI-LD operation stands behind it'
+      status: supported
+      binding: query option $search on an EntitySet read, its /$count and its $query, executed as query_entities with the
+        search as one more $filter conjunct over the view's single-valued String properties, evaluated by the residual
+        (ADR-0028, T-3750)
       checks:
         adr0020_phase: none
         operation_fields: []
         filterable: false
         whole_tenant: false
         linked_entity_checks: []
-      note: refused before any gate or store access
+      note: matched on the answer the view and the engine admit, so a hidden property or Entity never matches; on one
+        Entity or below it 501
 - id: odata_compute
   odata_feature: $compute
   odata_section: URL 5.1.10, Protocol 11.2.5.3

@@ -5,6 +5,7 @@ use crate::cursor::{count, Cursor};
 use crate::expr::{annotation, common_expr, Budget, Scope};
 use crate::literal::{literal, pct_encoded};
 use crate::model::{Member, Model};
+use crate::search::search;
 use crate::{
     ExpandItem, ExpandKind, ExpandPath, Feature, Format, Levels, LimitKind, OrderBy, QueryOptions,
     SelectItem, UrlError, UrlErrorKind,
@@ -77,7 +78,6 @@ impl Name {
 
     fn not_implemented(self) -> Option<Feature> {
         match self {
-            Name::Search => Some(Feature::Search),
             Name::Compute => Some(Feature::Compute),
             Name::Index => Some(Feature::Index),
             Name::Deltatoken => Some(Feature::DeltaToken),
@@ -215,6 +215,10 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
             Name::Count => options.count = Some(boolean(self.c)?),
             Name::Format => options.format = Some(format(self.c)?),
             Name::Skiptoken => options.skiptoken = Some(qchars(self.c, "skiptoken")?),
+            Name::Search => {
+                let limits = self.budget.limits;
+                options.search = Some(search(self.c, limits, &mut self.budget.nodes)?);
+            }
             Name::Id => options.id = Some(qchars(self.c, "IRI-in-query")?),
             _ => options.schemaversion = Some(schemaversion(self.c)?),
         }
