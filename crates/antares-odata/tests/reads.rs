@@ -247,7 +247,7 @@ async fn top_and_skip_page_and_the_next_link_carries_the_rest() {
         .to_owned();
     assert!(
         next.starts_with(&format!(
-            "{PUBLIC}{ROOT}/Car?$filter=speed%20gt%201&$skiptoken=1.1."
+            "{PUBLIC}{ROOT}/Car?$filter=speed%20gt%201&$skiptoken=2.1.0.1."
         )),
         "{next}"
     );
@@ -477,8 +477,18 @@ async fn a_hidden_or_unknown_name_is_the_same_400() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_forms_of_later_rounds_are_501_and_read_only_writes_405() {
     let (_b, app) = broker().await.expect("broker");
+    // `not` is evaluated by the residual (T-3758)
+    let got = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=not%20(speed%20gt%201)"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::OK, "{}", got.body);
+    assert_eq!(got.json()["value"], json!([]), "{}", got.body);
     for uri in [
-        "Car?$filter=not%20(speed%20gt%201)",
         "Car('urn:ngsi-ld:Car:1')?$filter=speed%20gt%201",
         "Car?$schemaversion=2",
         "$batch",

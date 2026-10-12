@@ -102,9 +102,12 @@ version = "0.1.3"
 dependencies = [
  "antares-api",
  "axum",
+ "chrono",
+ "metrics",
  "ngsild-jsonld",
  "ngsild-model",
  "ngsild-ql",
+ "ngsild-residual",
  "serde",
  "serde_json",
  "tokio",

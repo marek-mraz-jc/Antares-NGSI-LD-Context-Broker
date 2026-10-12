@@ -50,6 +50,7 @@ antares-model = { package = "ngsild-model", path = "crates/antares-model", versi
 antares-store = { path = "crates/antares-store" }
 antares-jsonld = { package = "ngsild-jsonld", path = "crates/antares-jsonld", version = "0.1" }
 antares-ql = { package = "ngsild-ql", path = "crates/antares-ql", version = "0.1" }
+antares-residual = { package = "ngsild-residual", path = "crates/antares-residual", version = "0.1" }
 antares-sql = { path = "crates/antares-sql", default-features = false }
 antares-bus = { path = "crates/antares-bus" }
 antares-api = { path = "crates/antares-api", default-features = false }

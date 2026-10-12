@@ -91,8 +91,10 @@ env:
   # joinedcontext-conformance (public) at the commit that carries the
   # broker's MCP parity table, the platform_only marker, tests/odata and
   # its client checks, tests/ws, the F21/F29 parity rows (T-3686), the
-  # bind-to-an-absent-target 400 (T-3760) and tests/linkml (T-3512)
-  CONFORMANCE_REF: 5e3722f143ede3cf768574acb050388044e9aa45
+  # bind-to-an-absent-target 400 (T-3760), tests/linkml (T-3512) and the
+  # OData parity rows the residual serves (T-3981), the last two together on
+  # conformance main since its merge of T-3512 (T-4003)
+  CONFORMANCE_REF: 2c6f70d3a41bb40e3bf0a33858396349e3d46d2d
   NIGHTLY: ${{ github.event_name != 'pull_request' && !inputs.fast }}
 
 jobs:

@@ -392,15 +392,15 @@ The linked-entity checks, as the task defines them:
 
 ### 7.1 OData features refused
 
-Revised with T-3441 (`odata-linkml-mapping.md` section 11): the yaml now holds 30 rows here, the 16 below plus 13 refusals and one mapped form (`odata_query_segment`, `POST .../$query`) added there; `odata_upsert` answers 404 `NotFound` and `odata_schemaversion` accepts `*` and the current version. Deep insert is refused 501 in round 1, and `$batch` members map to the single-Entity rows. The yaml is authoritative where this table lags.
+Revised with T-3441 (`odata-linkml-mapping.md` section 11): the yaml now holds 30 rows here, the 16 below plus 13 refusals and one mapped form (`odata_query_segment`, `POST .../$query`) added there; `odata_search` is served since T-3750 and `odata_compute` since T-3936; `odata_upsert` answers 404 `NotFound` and `odata_schemaversion` accepts `*` and the current version. Deep insert is refused 501 in round 1, and `$batch` members map to the single-Entity rows. The yaml is authoritative where this table lags.
 
 Each is refused before any gate or store access with `501 Not Implemented` (Protocol 9.3.1) and a JSON Format 21.1 error object, `{"error": {"code": "NotImplemented", "message": "<feature> is not offered: no NGSI-LD operation stands behind it"}}`. The `code` value is a proposal: OData leaves the code service-defined.
 
 | id | OData feature | OData 4.01 section | request | HTTP status | OData error code |
 |---|---|---|---|---|---|
 | `odata_apply` | $apply | OData Data Aggregation extension (not part of Protocol or URL Conventions 4.01) | `query option $apply` | 501 | `NotImplemented` |
-| `odata_search` | $search | URL 5.1.8, Protocol 11.2.6.6 | `query option $search` | 501 | `NotImplemented` |
-| `odata_compute` | $compute | URL 5.1.10, Protocol 11.2.5.3 | `query option $compute` | 501 | `NotImplemented` |
+| `odata_search` | $search | URL 5.1.7, Protocol 11.2.6.6 | `query option $search` | served since T-3750 (`query_entities`, a residual `$filter` conjunct) | - |
+| `odata_compute` | $compute | URL 5.1.10, Protocol 11.2.5.3 | `query option $compute` | served since T-3936 (the read's operation, a residual value per Entity) | - |
 | `odata_index` | $index | URL 5.1.11 | `query option $index` | 501 | `NotImplemented` |
 | `odata_schemaversion` | $schemaversion | URL 5.1.12 | `query option $schemaversion` | 501 | `NotImplemented` |
 | `odata_actions` | bound and unbound actions | URL 4.5.1, Protocol 11.5.5.1 | `POST {resource}/{namespace}.{action}` | 501 | `NotImplemented` |
