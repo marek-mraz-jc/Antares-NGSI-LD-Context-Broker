@@ -47,6 +47,9 @@ const KNOWN_KEYS: &[&str] = &[
     // brokers federate inside private networks); a hardened deployment sets
     // this to false to arm the SSRF wall.
     "ANTARES_EGRESS_ALLOW_PRIVATE",
+    // Host names that may still resolve to a private address while the wall
+    // is armed: the in-cluster peers (T-3908); never loopback or metadata.
+    "ANTARES_EGRESS_PRIVATE_HOSTS",
     // Refuse to start when the DB role bypasses RLS (production gate;
     // default off so the dev/ETSI superuser stack still boots).
     "ANTARES_REQUIRE_RLS",
