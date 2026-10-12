@@ -801,10 +801,11 @@ mod tests {
             ("x==1e", QValue::Str("1e".into())),
             ("x==-", QValue::Str("-".into())),
         ] {
-            let QNode::Cmp { value, .. } = parse_q(q).expect(q) else {
-                panic!("{q} is a comparison");
-            };
-            assert_eq!(value, want, "{q}");
+            let node = parse_q(q).expect(q);
+            assert!(
+                matches!(&node, QNode::Cmp { value, .. } if *value == want),
+                "{q}: {node:?}"
+            );
         }
     }
 
@@ -862,13 +863,10 @@ mod tests {
     fn and_or_precedence() {
         // `a==1;b==2|c==3` == (a AND b) OR c per grammar: OR binds looser
         let q = parse_q("a==1;b==2|c==3").expect("parse");
-        match q {
-            QNode::Or(items) => {
-                assert_eq!(items.len(), 2);
-                assert!(matches!(items[0], QNode::And(_)));
-            }
-            other => panic!("expected Or, got {other:?}"),
-        }
+        assert!(
+            matches!(&q, QNode::Or(items) if items.len() == 2 && matches!(items[0], QNode::And(_))),
+            "{q:?}"
+        );
     }
 
     #[test]
@@ -1062,10 +1060,10 @@ mod tests {
             (r#"a=="""#, ""),
         ] {
             let node = parse_q(q).unwrap_or_else(|e| panic!("{q}: {e:?}"));
-            let QNode::Cmp { value, .. } = node else {
-                panic!("{q}: expected a comparison")
-            };
-            assert_eq!(value, QValue::Str(want.to_owned()), "{q}");
+            assert!(
+                matches!(&node, QNode::Cmp { value: QValue::Str(s), .. } if s == want),
+                "{q}: {node:?}"
+            );
         }
     }
 
@@ -1079,13 +1077,11 @@ mod tests {
             "an escaped quote leaves the string open"
         );
         let node = parse_q(r#"a=="ends with a backslash\\";b"#).expect("parses");
-        let QNode::And(items) = node else {
-            panic!("expected an And")
-        };
-        let QNode::Cmp { value, .. } = &items[0] else {
-            panic!("expected a comparison")
-        };
-        assert_eq!(value, &QValue::Str("ends with a backslash\\".to_owned()));
+        assert!(
+            matches!(&node, QNode::And(items)
+                if matches!(&items[0], QNode::Cmp { value: QValue::Str(s), .. } if s == "ends with a backslash\\")),
+            "{node:?}"
+        );
     }
 
     /// An escape RFC 8259 does not define is not a String, so the term is
@@ -1131,10 +1127,11 @@ mod complexity_tests {
             .map(|i| format!("a{i}==1"))
             .collect::<Vec<_>>()
             .join(";");
-        match parse_q(&huge) {
-            Err(NgsiError::TooComplexQuery(_)) => {}
-            other => panic!("expected TooComplexQuery, got {other:?}"),
-        }
+        let answer = parse_q(&huge);
+        assert!(
+            matches!(answer, Err(NgsiError::TooComplexQuery(_))),
+            "{answer:?}"
+        );
     }
 
     /// Regression: the parser once recursed per `(` with
@@ -1308,18 +1305,21 @@ mod complexity_tests {
     /// and a `..` past the next separator belongs to the next term.
     #[test]
     fn unquoted_scalars_and_where_a_range_stops() {
-        let QNode::Cmp { value, .. } = parse_q("a==false").expect("parse") else {
-            unreachable!("a comparison")
-        };
-        assert_eq!(value, QValue::Bool(false));
+        assert!(matches!(
+            parse_q("a==false").expect("parse"),
+            QNode::Cmp {
+                value: QValue::Bool(false),
+                ..
+            }
+        ));
         assert!(parse_q("a==").is_err());
         assert!(parse_q("a==;b==1").is_err());
         let range = parse_q("a==1;b==2..3").expect("parse");
         assert_eq!(range, parse_q("(a==1);(b==2..3)").expect("parse"));
-        let QNode::And(terms) = range else {
-            unreachable!("an And")
-        };
-        assert_eq!(terms.len(), 2);
+        assert!(
+            matches!(&range, QNode::And(terms) if terms.len() == 2),
+            "{range:?}"
+        );
     }
 
     /// The byte ceiling is inclusive: MAX_Q_BYTES parses, one more is
@@ -1489,6 +1489,33 @@ mod complexity_tests {
         assert!(matches!(
             parse_q(&nested(MAX_Q_DEPTH + 1)),
             Err(NgsiError::TooComplexQuery(_))
+        ));
+    }
+}
+
+/// Two refusals of the grammar no other test spells, `<=` written back, and a `scope` member
+/// of neither shape 4.19 reads (T-3912).
+#[cfg(test)]
+mod edges {
+    use super::*;
+
+    #[test]
+    fn grammar_edges_and_the_written_form() {
+        let said = |q: &str| parse_q(q).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            said("sensor{Device,Car}==1").contains("expected ':'"),
+            "{}",
+            said("sensor{Device,Car}==1")
+        );
+        assert!(
+            said(r#"a~="abc"#).contains("unterminated string"),
+            "{}",
+            said(r#"a~="abc"#)
+        );
+        assert_eq!(parse_q("a<=1").expect("parse").to_string(), "a<=1");
+        assert!(!scope::scope_matches(
+            "/a",
+            &serde_json::json!({"scope": 5})
         ));
     }
 }

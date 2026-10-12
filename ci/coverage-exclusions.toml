@@ -243,3 +243,109 @@ function = "Internal::serve" # v0 mangling puts the impl between the crate and t
 lines = 21
 branches = 0
 reason = "2 lines: the grant store failing, which the built-in store under test_kit does not (module rule M2). 19 lines: the four tracing::info!/warn! of a forward made or not made repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/icsr_log.rs and icsr_gate.rs cover the subscriber path and assert what they log"
+
+# antares-ql (role ngsild, T-3911/T-3912)
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/eval.rs"
+function = "antares_ql::eval::compare"
+lines = 1
+branches = 0
+reason = "the closing `List | Range => false` arm: both are answered by the unfold guards at the top of the function before this match, so the arm only keeps the match exhaustive; eval::edges drives every reachable arm"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/regex.rs"
+function = "antares_ql::regex::compile"
+lines = 1
+branches = 1
+reason = "the cache's write lock poisoned: only a panic while another thread holds it poisons it, and a test that poisons the process-wide cache breaks every other test sharing it"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/regex.rs"
+function = "antares_ql::regex::q_node"
+lines = 1
+branches = 1
+reason = "the q cache's write lock poisoned: as for compile"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/regex.rs"
+function = "antares_ql::regex::geo_query"
+lines = 2
+branches = 2
+reason = "the geo cache full (MAX_REGEX_CACHE entries) and its write lock poisoned: filling the process-wide cache from a test evicts the entries geo_query_is_shared_per_key reads in parallel, and poisoning is as for compile; the eviction it calls is the one evict_lru_half's own tests drive"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/regex.rs"
+function = "antares_ql::regex::evict_lru_half"
+lines = 1
+branches = 1
+reason = "the `checked_sub` refusal: stamps holds one stamp per entry and keep is half the entries, so the index always exists; it stays a let-else so a future change to `keep` cannot index past the end"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/sql.rs"
+function = "antares_ql::sql::literal"
+lines = 1
+branches = 1
+reason = "an exponent form: Rust's f64 Display never writes one, so the refusal guards a future formatter, not today's"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/eval.rs"
+function = "expand_values_coercion"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/lib.rs"
+function = "unquoted_scalars_and_where_a_range_stops"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/lib.rs"
+function = "a_quoted_string_is_an_rfc_8259_string"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/lib.rs"
+function = "an_escaped_quote_does_not_end_the_string"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/lib.rs"
+function = "an_unquoted_token_is_a_number_only_when_rfc_8259_says_so"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/lib.rs"
+function = "and_or_precedence"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/render.rs"
+function = "a_regexp_operand_keeps_its_own_backslashes"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
