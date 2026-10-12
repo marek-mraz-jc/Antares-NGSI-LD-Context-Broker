@@ -201,6 +201,21 @@ hardware and publishes the broker's and Postgres's memory and CPU per
 phase; the [Performance](docs/src/performance.md) chapter says how each
 number is produced.
 
+## The NGSI-LD crates
+
+`antares-model`, `antares-jsonld`, `antares-ql`, `antares-matcher` and `antares-residual` hold the
+NGSI-LD data model, JSON-LD expansion, the query languages, subscription matching and the
+residual evaluator with no server, store or network in their default features (role `ngsild`,
+ADR-0027). Each has a README with a runnable example and the CIM 009 clauses it implements, and
+builds from its packaged files alone (`cargo publish --dry-run` in `workspace.yml`). They are
+published to crates.io by `.github/workflows/release-crates.yml` from a `v*` tag only, through
+crates.io trusted publishing (no stored token) with SLSA provenance on every `.crate`.
+
+Yanking a bad version: run `cargo yank --version <x.y.z> <crate>` with an owner's crates.io login
+for every crate of the release that carries the defect, open an issue that names the version and
+the defect, and release the fix as a new patch version from a new tag. A yank stops new lockfiles
+from choosing the version; it does not delete it or break a build that already locked it.
+
 ## Repository layout
 
 ```
