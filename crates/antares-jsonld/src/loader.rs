@@ -3250,6 +3250,7 @@ mod hooks {
         let base = serve().await;
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let writes = Arc::new(AtomicUsize::new(0));
         let w = Arc::clone(&writes);
@@ -3376,6 +3377,7 @@ mod hooks {
         // the egress policy is asked before any connection
         let strict = Loader::with_policy(EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         });
         let err = strict.resolve(&a).await.expect_err("loopback denied");
         assert!(
