@@ -30,6 +30,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS build
 COPY --from=planner /src/recipe.json recipe.json
+# The recipe holds workspace members only; vendor/rumqttc is a [patch] path crate outside them
+# (T-4129), so the cook needs its source to compile it with the other dependencies.
+COPY vendor/ vendor/
 # Cargo features of the broker (empty = the default, vanilla build). The
 # full cells of external-suites.yml build with --build-arg FEATURES=full,
 # image-jc.yml builds full,jc-policy,linkml as antares-broker-jc; the vanilla
