@@ -502,7 +502,7 @@ impl AnyStore {
         tenant: &TenantId,
         ids: &[&str],
     ) -> Result<std::collections::HashMap<String, Value>, NgsiError> {
-        let found = match self {
+        let found: std::collections::HashMap<String, Value> = match self {
             AnyStore::Mem(s) => ids
                 .iter()
                 .filter_map(|id| Some(((*id).to_owned(), s.get(tenant, Kind::Entity, id)?)))
