@@ -2593,6 +2593,13 @@ mod tests {
             always(&Search::And(word("x"), Box::new(Search::Not(word("y"))))),
             Some(lit(Literal::Bool(false)))
         );
+        let not = |w: &str| Box::new(Search::Not(word(w)));
+        assert_eq!(always(&Search::And(not("x"), not("y"))), None);
+        assert_eq!(
+            always(&Search::And(not("x"), word("y"))),
+            Some(lit(Literal::Bool(false)))
+        );
+        assert_eq!(always(&Search::Or(not("x"), word("y"))), None);
         // `name` is the one single-valued String: `tags` is a collection, `doc` no String
         let one = searched(&Search::Phrase("A b".into()), &set());
         let name = || m("name");
