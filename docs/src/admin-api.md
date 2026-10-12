@@ -200,24 +200,29 @@ ADR-0030. Hold the
 writers first: the export is not a point-in-time snapshot, and the digest
 proves the copy.
 
-`GET /q/tenants/{tenant}/digest` answers
-`{"tenant","entities","attrInstances","sha256"}`. `sha256` is the sum modulo
-2²⁵⁶ of `sha256(id ‖ 0x00 ‖ modifiedAt)` over the Entities, so two brokers
-agree whatever order they page in.
+#### GET /q/tenants/{tenant}/digest
 
-`GET /q/tenants/{tenant}/export` streams `application/x-ndjson`: a header
-`{"antaresExport":1,"tenant":…}`, one `{"kind":"entity","doc":…}` per
-Entity, then one `{"kind":"temporal","doc":…}` per history document, each as
-stored, and a trailer `{"end":true,"records":n}`. A stream that stops
-without the trailer was cut. A tenant holding Subscriptions, Registrations,
-Registration Subscriptions, Snapshots or distributed subscriptions answers
-`409` with their counts: v1 moves data only.
+Answers `{"tenant","entities","attrInstances","sha256"}`. `sha256` is the
+sum modulo 2²⁵⁶ of `sha256(id ‖ 0x00 ‖ modifiedAt)` over the Entities, so
+two brokers agree whatever order they page in.
 
-`POST /q/tenants/{tenant}/import` takes that stream into a tenant holding no
-Entity and no history (`409` otherwise), with the same tenant name in its
-header, entities before history, lines of at most 16 MiB. Any refused line,
-or a missing trailer, answers `400` naming the line and leaves the tenant
-as it was found. `204` when every record is in.
+#### GET /q/tenants/{tenant}/export
+
+Streams `application/x-ndjson`: a header `{"antaresExport":1,"tenant":…}`,
+one `{"kind":"entity","doc":…}` per Entity, then one
+`{"kind":"temporal","doc":…}` per history document, each as stored, and a
+trailer `{"end":true,"records":n}`. A stream that stops without the trailer
+was cut. A tenant holding Subscriptions, Registrations, Registration
+Subscriptions, Snapshots or distributed subscriptions answers `409` with
+their counts: v1 moves data only.
+
+#### POST /q/tenants/{tenant}/import
+
+Takes that stream into a tenant holding no Entity and no history (`409`
+otherwise), with the same tenant name in its header, entities before
+history, lines of at most 16 MiB. Any refused line, or a missing trailer,
+answers `400` naming the line and leaves the tenant as it was found. `204`
+when every record is in.
 
 ## Dead letters
 
