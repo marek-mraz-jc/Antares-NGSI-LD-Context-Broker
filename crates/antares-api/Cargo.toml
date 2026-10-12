@@ -18,7 +18,7 @@ tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true }
 antares-model = { workspace = true }
 antares-store = { workspace = true }
-antares-jsonld = { workspace = true }
+antares-jsonld = { workspace = true, features = ["fetch"] }
 antares-ql = { workspace = true }
 antares-matcher = { workspace = true }
 # Test-only: the built-in memory/file store behind `AppState::new`, and the

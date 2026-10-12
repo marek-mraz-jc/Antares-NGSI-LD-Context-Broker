@@ -353,3 +353,83 @@ async fn icsr_a_forward_that_is_no_operation_or_that_the_grant_view_refuses_is_n
         ["urn:ngsi-ld:Car:b-1"]
     );
 }
+
+/// Denies a read of Tenant `b` that comes through the view `b-speed` (as a rule document that
+/// binds that view to no policy would), allows every other, and keeps the view each decision in
+/// `b` saw.
+#[derive(Default)]
+struct ViewBound(Mutex<Vec<Option<String>>>);
+
+impl antares_ops::policy::PolicyEngine for ViewBound {
+    fn name(&self) -> &'static str {
+        "view-bound"
+    }
+    fn decide<'a>(
+        &'a self,
+        s: &'a antares_ops::policy::Subject,
+        _op: &'a antares_ops::policy::Operation<'a>,
+    ) -> antares_ops::policy::DecisionFuture<'a> {
+        use antares_ops::policy::Decision;
+        let view = s.view().map(str::to_owned);
+        let decision = if s.tenant.as_str() == "b" {
+            let bound = view.as_deref() == Some("b-speed");
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(view);
+            if bound {
+                Decision::Deny("bound".into())
+            } else {
+                Decision::Allow
+            }
+        } else {
+            Decision::Allow
+        };
+        Box::pin(std::future::ready(decision))
+    }
+    fn pre_notify(
+        &self,
+        _s: &antares_ops::policy::Subject,
+        _sub: &serde_json::Value,
+        _n: &mut serde_json::Value,
+    ) -> antares_ops::policy::NotifyDecision {
+        antares_ops::policy::NotifyDecision::Deliver
+    }
+}
+
+/// T-3935, ADR-0025 rule 5 with ADR-0023 rule 5: a forward under a grant that names a view is
+/// decided by the target's engine as a request through that view is, so a rule bound to the
+/// view holds for it; a grant without a view, and the source's own view, carry none into the
+/// target.
+#[tokio::test]
+async fn icsr_the_engine_decides_a_grant_view_forward_through_that_view() {
+    let engine = Arc::new(ViewBound::default());
+    let (_b, app) = broker(Some(engine.clone())).await;
+    car(&app, "b", 1).await;
+    let view = json!({"id": "b-speed", "tenant": "b", "selector": ["Car"],
+                      "rules": [{"types": ["Car"], "attributes": ["speed"]}],
+                      "operations": ["query_entities", "retrieve_entity"]});
+    let put = send(&app, "PUT", "/q/views/b-speed", None, None, Some(view)).await;
+    assert_eq!(put.status, 201, "{}", put.body);
+    let seen = || std::mem::take(&mut *engine.0.lock().unwrap_or_else(PoisonError::into_inner));
+
+    grant(&app, "b", "a", json!({"view": "b-speed"})).await;
+    assert_eq!(
+        register(&app, "a", "r1", Some("b"), json!({})).await.status,
+        201
+    );
+    seen();
+    let read = cars(&app, "a", None).await;
+    assert!(
+        ids(&read.body).is_empty(),
+        "the bound rule refuses: {}",
+        read.body
+    );
+    assert!(warned(&read.warnings, "299"), "{:?}", read.warnings);
+    assert_eq!(seen(), [Some("b-speed".to_owned())]);
+
+    grant(&app, "b", "a", json!({})).await;
+    let read = cars(&app, "a", None).await;
+    assert_eq!(ids(&read.body), ["urn:ngsi-ld:Car:b-1"], "{}", read.body);
+    assert_eq!(seen(), [None], "a grant without a view is no view");
+}

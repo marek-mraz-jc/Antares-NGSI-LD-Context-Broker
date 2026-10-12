@@ -11,19 +11,19 @@ V22), and, for a view that does not show every name, a request naming a type
 outside its selector (rule 3) or an Attribute no rule shows (rule 2) in its
 `type`, `attrs`, `pick`, `omit`, `orderBy` or `q`, in the JSON body it sent
 (T-3787), in its path (`/types/{type}`, `/attributes/{attr}`) or as the type
-of an entity id it reads (the suite's ids are `urn:ngsi-ld:{Type}:…`, T-3980);
-and an Entity write or a Subscription in a TP whose fixtures registered a
-Context Source, which no write through a view reaches (rule 7 is checked on the
-local store, so the write stays local; rule 9: a view's Subscription has no
-distributed half; T-3945); and a request naming an Entity that an earlier TP's
-body created only through a request the view owes a refusal, so it never
-existed through the view (the restricted view refuses 422_01_05's create, and
-422_01_06 reads that Building; T-3982).
+of an entity id it reads (the suite's ids are `urn:ngsi-ld:{Type}:…`, T-3980).
 Such a view also owes its narrowing (T-3980): a discovery listing names only
 what it shows, a join follows Relationships only into entities it shows, a
 query that names no type answers only the view's types, and
 an answer may lack an Attribute it does not show, when the TP's failure
-message (failures.csv) names only such Attributes as missing.
+message (failures.csv) names only such Attributes as missing;
+and an Entity write or a Subscription in a TP whose fixtures registered a
+Context Source, which no write through a view reaches (rule 7 is checked on the
+local store, so the write stays local; rule 9: a view's Subscription has no
+distributed half; T-3945); and a request naming an Entity that an earlier
+TP's body created only through a request the view owes a refusal, so it never
+existed through the view (the restricted view refuses 422_01_05's create, and
+422_01_06 reads that Building; T-3982).
 Names are expanded as the suite sends them: its own @context, then the core
 one, then the default vocabulary. The body requests come from the run's
 requests.jsonl (dev/etsi_setup_url.py records them, and, marked, the fixtures').
