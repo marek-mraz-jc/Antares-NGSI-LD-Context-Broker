@@ -19,10 +19,25 @@ const METHODS: [&str; 5] = ["GET", "PUT", "POST", "PATCH", "DELETE"];
 
 /// Every guarded `/q` route: its template as mounted, a concrete path, and
 /// the methods it serves.
-const ROUTES: [(&str, &str, &[&str]); 14] = [
+const ROUTES: [(&str, &str, &[&str]); 17] = [
     ("/metrics", "/q/metrics", &["GET"]),
     ("/tenants", "/q/tenants", &["GET"]),
     ("/tenants/{tenant}", "/q/tenants/acme", &["GET", "DELETE"]),
+    (
+        "/tenants/{tenant}/digest",
+        "/q/tenants/acme/digest",
+        &["GET"],
+    ),
+    (
+        "/tenants/{tenant}/export",
+        "/q/tenants/acme/export",
+        &["GET"],
+    ),
+    (
+        "/tenants/{tenant}/import",
+        "/q/tenants/acme/import",
+        &["POST"],
+    ),
     ("/dead-letters", "/q/dead-letters", &["GET"]),
     (
         "/dead-letters/{id}",
