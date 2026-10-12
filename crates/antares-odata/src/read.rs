@@ -1615,7 +1615,7 @@ async fn scanned(
         .with_version(version)),
         // An evaluation past the residual's MAX_STEPS: a nested `any` over a long list reaches
         // it within MAX_NODES (T-4031)
-        Err(Refusal::Malformed(why)) if why == TOO_COMPLEX => Err(ODataErrorResponse::new(
+        Err(Refusal::Malformed(TOO_COMPLEX)) => Err(ODataErrorResponse::new(
             StatusCode::BAD_REQUEST,
             "TooComplexQuery",
             TOO_COMPLEX,
