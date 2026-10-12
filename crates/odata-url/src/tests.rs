@@ -1937,3 +1937,31 @@ fn a_computed_name_and_the_names_a_concat_produces_resolve_after_them() {
     }]])
     .aggregates());
 }
+
+#[test]
+fn apply_chains_and_nestings_cost_their_budget() {
+    let long = Limits {
+        max_query_len: 1 << 20,
+        ..Limits::strict()
+    };
+    let limit_of = |uri: &str| match err_within(uri, &long).kind {
+        UrlErrorKind::LimitExceeded { limit, .. } => Some(limit),
+        _ => None,
+    };
+    // a concat 200 deep is refused by depth, before the parser's stack grows with it (T-4017)
+    let deep = format!(
+        "Buildings?$apply={}identity{}",
+        "concat(identity,".repeat(200),
+        ")".repeat(200)
+    );
+    assert_eq!(limit_of(&deep), Some(LimitKind::ExprDepth));
+    // each transformation is a node: a chain past max_expr_nodes is refused
+    let chain = format!("Buildings?$apply={}", ["identity"; 300].join("/"));
+    assert_eq!(limit_of(&chain), Some(LimitKind::ExprNodes));
+    // within the budget both still parse
+    assert_eq!(apply_of(&["identity"; 40].join("/")).len(), 40);
+    assert_eq!(
+        apply_of("concat(concat(identity,identity),identity)").len(),
+        1
+    );
+}

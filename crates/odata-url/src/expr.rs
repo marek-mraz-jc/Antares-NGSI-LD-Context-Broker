@@ -17,6 +17,9 @@ use crate::{
 pub(crate) struct Budget<'l> {
     pub(crate) limits: &'l Limits,
     pub(crate) nodes: usize,
+    /// `$apply` sequences open around the one being parsed: a `concat` branch is one level
+    /// deeper than the sequence holding it (T-4017).
+    pub(crate) apply_depth: usize,
     /// The `$compute` names, which resolve like primitive members of the resource.
     pub(crate) computed: Vec<String>,
 }

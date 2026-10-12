@@ -5,12 +5,14 @@
 //! `nest`, rollup, a transformation of the groups other than `aggregate`, custom aggregates and
 //! custom methods are not implemented.
 
+use crate::cursor::count;
 use crate::expr::{common_expr, Scope};
 use crate::model::{Member, Model};
 use crate::query::{member, unsigned, Query};
 use crate::search::search;
 use crate::{
-    Aggregate, AggregateWith, Feature, PartitionBy, Transformation, UrlError, UrlErrorKind,
+    Aggregate, AggregateWith, Feature, LimitKind, PartitionBy, Transformation, UrlError,
+    UrlErrorKind,
 };
 
 /// Data Aggregation 4.0 transformations the parser does not serve, and `rollup`.
@@ -47,13 +49,36 @@ const METHODS: [(&str, AggregateWith); 5] = [
 impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
     /// `applyExpr`: transformations separated by `/`, and the scope after them. After one that
     /// aggregates, the scope holds no member and `budget.computed` names what it produced.
+    ///
+    /// Every transformation costs one expression node, `identity` and each `concat` included, and
+    /// a sequence inside a `concat` is one level of `max_expr_depth`: neither a long chain nor a
+    /// deep nesting parses for free, and the nesting is refused before it can exhaust the stack
+    /// (T-4017).
     pub(crate) fn apply(
         &mut self,
         scope: Scope<'m>,
     ) -> Result<(Vec<Transformation>, Scope<'m>), UrlError> {
+        count(
+            &mut self.budget.apply_depth,
+            self.budget.limits.max_expr_depth,
+            LimitKind::ExprDepth,
+            self.c,
+        )?;
+        let parsed = self.sequence(scope);
+        self.budget.apply_depth = self.budget.apply_depth.saturating_sub(1);
+        parsed
+    }
+
+    fn sequence(&mut self, scope: Scope<'m>) -> Result<(Vec<Transformation>, Scope<'m>), UrlError> {
         let mut steps = Vec::new();
         let mut here = scope;
         loop {
+            count(
+                &mut self.budget.nodes,
+                self.budget.limits.max_expr_nodes,
+                LimitKind::ExprNodes,
+                self.c,
+            )?;
             steps.push(self.transformation(&mut here)?);
             if !self.c.slash() {
                 return Ok((steps, here));

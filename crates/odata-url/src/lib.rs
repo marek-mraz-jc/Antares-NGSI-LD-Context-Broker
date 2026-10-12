@@ -138,6 +138,7 @@ fn relative_uri<M: Model>(
         budget: Budget {
             limits,
             nodes: 0,
+            apply_depth: 0,
             computed: Vec::new(),
         },
         expand_items: 0,

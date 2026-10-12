@@ -29,7 +29,7 @@ use crate::read::{
     attach, compare, digest, entity_value, ngsild, not_implemented, now, paged, position, pushdown,
     refusal, resource, scanned, set_of, token, Reads,
 };
-use antares_ops::{Caller, Page as ScanPage};
+use antares_ops::{Caller, Page as ScanPage, RESIDUAL_SCAN};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use odata_axum::{json_response, ODataErrorResponse};
@@ -175,6 +175,14 @@ impl Frame {
         }
     }
 
+    /// How many instances.
+    fn len(&self) -> usize {
+        match self {
+            Self::Entities { docs, .. } => docs.len(),
+            Self::Rows(rows) => rows.values.len(),
+        }
+    }
+
     /// The instances at `order`, in that order.
     fn select(self, order: &[usize]) -> Self {
         fn pick<T>(items: Vec<T>, order: &[usize]) -> Vec<T> {
@@ -223,10 +231,18 @@ fn one(step: &Transformation, frame: Frame, cx: &Cx<'_>) -> Result<Frame, ODataE
     let step = match (step, &frame) {
         (Transformation::Concat(branches), _) => {
             let computes = frame.computes().to_vec();
-            let outs = branches
-                .iter()
-                .map(|branch| run(branch, frame.clone(), cx))
-                .collect::<Result<Vec<_>, _>>()?;
+            // the branches together hold at most what one scan may read: a chain of `concat`
+            // doubles the instances at each step and is refused before it outgrows that (T-4017)
+            let mut outs = Vec::with_capacity(branches.len());
+            let mut total = 0usize;
+            for branch in branches {
+                let out = run(branch, frame.clone(), cx)?;
+                total = total.saturating_add(out.len());
+                if total > RESIDUAL_SCAN {
+                    return Err(too_many(cx.version));
+                }
+                outs.push(out);
+            }
             return Ok(joined(outs, computes));
         }
         (Transformation::Compute(items), _) => return computed_into(items, frame, cx),
@@ -465,6 +481,18 @@ fn partitioned(
         kept.push(i);
     }
     Ok(kept)
+}
+
+/// A `concat` whose branches together hold more than one scan may read (T-4017).
+fn too_many(version: ODataVersion) -> ODataErrorResponse {
+    ODataErrorResponse::new(
+        StatusCode::BAD_REQUEST,
+        "TooManyResults",
+        &format!(
+            "the concat answers more than the {RESIDUAL_SCAN} instances one request may read: narrow it with filter"
+        ),
+    )
+    .with_version(version)
 }
 
 /// The results of the branches of a `concat`, one after the other: the Entities with the
