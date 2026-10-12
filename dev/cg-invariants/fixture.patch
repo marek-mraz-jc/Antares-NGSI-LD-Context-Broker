@@ -1,8 +1,16 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 921db29..53e672c 100644
+index 921db29..0fb8901 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -392,6 +392,7 @@ name = "antares-views"
+@@ -86,6 +86,7 @@ dependencies = [
+  "reqwest",
+  "send_wrapper",
+  "serde_json",
++ "serde_yaml",
+  "sonic-rs",
+  "tokio",
+  "tower",
+@@ -392,6 +393,7 @@ name = "antares-views"
  version = "0.1.3"
  dependencies = [
   "antares-ops",
@@ -10,7 +18,7 @@ index 921db29..53e672c 100644
   "axum",
   "http-body-util",
   "proptest",
-@@ -2427,6 +2428,7 @@ dependencies = [
+@@ -2427,6 +2429,7 @@ dependencies = [
  name = "odata-url"
  version = "0.1.3"
  dependencies = [
@@ -18,8 +26,53 @@ index 921db29..53e672c 100644
   "odata-csdl",
   "proptest",
   "serde_json",
+@@ -3521,6 +3524,19 @@ dependencies = [
+  "serde",
+ ]
+ 
++[[package]]
++name = "serde_yaml"
++version = "0.9.34+deprecated"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
++dependencies = [
++ "indexmap",
++ "itoa",
++ "ryu",
++ "serde",
++ "unsafe-libyaml",
++]
++
+ [[package]]
+ name = "sha1"
+ version = "0.10.7"
+@@ -4476,6 +4492,12 @@ version = "0.2.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+ 
++[[package]]
++name = "unsafe-libyaml"
++version = "0.2.11"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
++
+ [[package]]
+ name = "untrusted"
+ version = "0.9.0"
+diff --git a/crates/antares-api/Cargo.toml b/crates/antares-api/Cargo.toml
+index 9b6575e..3675b4f 100644
+--- a/crates/antares-api/Cargo.toml
++++ b/crates/antares-api/Cargo.toml
+@@ -14,6 +14,7 @@ autotests = false
+ role = "core"
+ 
+ [dependencies]
++serde_yaml = "0.9"
+ tower = { workspace = true, features = ["util"] }
+ tower-http = { workspace = true }
+ antares-model = { workspace = true }
 diff --git a/crates/antares-api/src/lib.rs b/crates/antares-api/src/lib.rs
-index fdaab93..85b8023 100644
+index fdaab93..e7a0307 100644
 --- a/crates/antares-api/src/lib.rs
 +++ b/crates/antares-api/src/lib.rs
 @@ -416,6 +416,9 @@ pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
@@ -32,7 +85,7 @@ index fdaab93..85b8023 100644
          // EntityMaps (5.14; 6.32/6.34/6.35)
          (
              "/entityMaps",
-@@ -6690,3 +6693,46 @@ mod clause_6_3_11 {
+@@ -6690,3 +6693,51 @@ mod clause_6_3_11 {
  pub(crate) fn allow_private() {
      antares_jsonld::allow_private_egress(true);
  }
@@ -50,6 +103,16 @@ index fdaab93..85b8023 100644
 +/// cg-invariants fixture: the Tenant header named outside its owners.
 +pub fn cg_fixture_tenant() -> &'static str {
 +    "NGSILD-Tenant"
++}
++
++/// cg-invariants fixture: a child process from shipped code.
++pub fn cg_fixture_process() -> bool {
++    std::process::Command::new("true").status().is_ok()
++}
++
++/// cg-invariants fixture: a YAML parser in shipped code.
++pub fn cg_fixture_yaml(text: &str) -> bool {
++    serde_yaml::from_str::<serde_json::Value>(text).is_ok()
 +}
 +
 +/// cg-invariants fixture: a route that reaches the store with a Tenant it
@@ -73,11 +136,6 @@ index fdaab93..85b8023 100644
 +/// cg-invariants fixture: a secret taken out of its wrapper.
 +pub fn cg_fixture_secret(s: &secret::Secret) -> String {
 +    s.expose().to_owned()
-+}
-+
-+/// cg-invariants fixture: a child process.
-+pub fn cg_fixture_spawn() {
-+    let _ = std::process::Command::new("true").status();
 +}
 diff --git a/crates/antares-sql/src/lib.rs b/crates/antares-sql/src/lib.rs
 index 6f5ffb5..dc8951f 100644
@@ -120,10 +178,10 @@ index 6fb05a0..2cf5cda 100644
  serde_json = { version = "1", default-features = false, features = ["std"] }
  
 diff --git a/crates/antares-views/src/lib.rs b/crates/antares-views/src/lib.rs
-index 353c251..e6cc93e 100644
+index 353c251..e927121 100644
 --- a/crates/antares-views/src/lib.rs
 +++ b/crates/antares-views/src/lib.rs
-@@ -328,3 +328,8 @@ mod tests {
+@@ -328,3 +328,16 @@ mod tests {
          assert!(!h.contains_key(header::LOCATION));
      }
  }
@@ -131,6 +189,14 @@ index 353c251..e6cc93e 100644
 +/// cg-invariants fixture: a surface calling the store past antares-ops.
 +pub fn cg_fixture_store(doc: &mut serde_json::Value) -> bool {
 +    antares_store::stored_object(doc).is_ok()
++}
++
++/// cg-invariants fixture: a surface entry that reaches no antares-ops
++/// operation and opens a file.
++pub mod cg_fixture {
++    pub async fn serve() -> bool {
++        std::fs::read("/etc/hostname").is_ok()
++    }
 +}
 diff --git a/crates/odata-url/Cargo.toml b/crates/odata-url/Cargo.toml
 index 83a72c2..5ba80ff 100644
