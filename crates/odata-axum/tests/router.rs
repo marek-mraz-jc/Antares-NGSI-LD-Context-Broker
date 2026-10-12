@@ -288,6 +288,14 @@ async fn json_metadata_asked_on_4_0_is_406_and_never_a_document_it_cannot_read(
 }
 
 #[tokio::test]
+async fn a_format_that_does_not_decode_is_400() -> Result<(), String> {
+    // The URL parser refuses an escape that is no UTF-8 before a format is read (T-3742).
+    let answer = get("/odata/$metadata?$format=application%2Fjson%3Bx%3D%FF", &[]).await?;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    Ok(())
+}
+
+#[tokio::test]
 async fn an_unacceptable_accept_or_format_is_406() -> Result<(), String> {
     for (uri, headers) in [
         ("/odata/$metadata", vec![("Accept", "text/html")]),
@@ -482,6 +490,13 @@ async fn a_resource_is_json_at_the_level_asked_and_xml_is_406() -> Result<(), St
             &[V401][..],
             StatusCode::OK,
             "application/json;metadata=full",
+        ),
+        (
+            // Go's url.QueryEscape: read decoded (T-3742).
+            "/odata/Buildings?$format=application%2Fjson%3Bodata.metadata%3Dnone",
+            &[][..],
+            StatusCode::OK,
+            "application/json;odata.metadata=none",
         ),
         (
             "/odata/Buildings",

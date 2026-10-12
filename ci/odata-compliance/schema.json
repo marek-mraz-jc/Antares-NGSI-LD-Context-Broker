@@ -356,7 +356,13 @@
       "multivalued": true
     },
     "Product": {
-      "range": "Products"
+      "range": "Products",
+      "annotations": {
+        "odata_referential_constraint": {
+          "tag": "odata_referential_constraint",
+          "value": "ProductID"
+        }
+      }
     },
     "Location": {
       "annotations": {

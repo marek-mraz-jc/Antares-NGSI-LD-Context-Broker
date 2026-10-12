@@ -35,7 +35,9 @@ ADR-0023 rule 5), never from the stored schema (LK1):
   shows;
 - a slot is kept on a class when a rule for that type shows the Attribute
   (`slot_uri`, else the default prefix and its name), less the engine's
-  `pick`, `omit` and `omit_by_type`; a rule's condition is not read;
+  `pick`, `omit` and `omit_by_type`; an engine's grant over the whole
+  Entity (a Policy naming the type without `propertyNames`) shows every
+  slot of its types; a rule's condition is not read;
 - `is_a` stays only when the parent is kept and shows nothing the child
   does not;
 - a range to a hidden class becomes `uriorcurie`, with the slot's kind

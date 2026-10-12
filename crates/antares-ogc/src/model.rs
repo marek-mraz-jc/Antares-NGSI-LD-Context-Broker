@@ -73,6 +73,26 @@ fn path_safe(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
 }
 
+/// Every class of `schema` with every slot of it: what a view of `*` shows (ADR-0023 rule 12),
+/// which names no type for `ViewOps::shown_by_type`.
+pub(crate) fn every(schema: &linkml_model::Model) -> BTreeMap<String, BTreeSet<String>> {
+    schema
+        .schema()
+        .classes
+        .keys()
+        .map(|class| {
+            let slots = schema.class_slots(class);
+            (
+                schema.class_iri(class),
+                slots
+                    .iter()
+                    .map(|(slot, _)| schema.slot_iri(slot))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 /// The collections of `schema` the view shows (`shown`: type IRI to Attribute IRIs), by id.
 pub(crate) fn build(
     schema: &linkml_model::Model,

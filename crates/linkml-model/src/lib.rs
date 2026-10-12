@@ -31,5 +31,7 @@ pub use model::{
     edm_types, Builtin, Limits, Model, Range, EDM_TYPE_TAG, FLAG_TAGS, KIND_TAG, QB_COMPONENT_TAG,
     QB_DSD_TAG,
 };
-pub use schema::{Annotation, Class, Enum, PermissibleValue, Prefix, Schema, Slot, Unit};
+pub use schema::{
+    Annotation, Class, Enum, PermissibleValue, Prefix, Schema, Slot, Unit, DEFAULT_RANGE, IMPORTS,
+};
 pub use write::{context, json_schema, markdown, owl, qb, rdfs, shacl, yaml};

@@ -69,6 +69,32 @@ fn an_unknown_metaslot_fails_the_load() {
     }
 }
 
+/// T-3780: the two declarations the writer adds load; any other import or
+/// default range is outside the subset (LK4).
+#[test]
+fn the_implied_declarations_load_and_no_other() {
+    let mut doc = with("/imports", json!(["linkml:types"]));
+    if let Some(o) = doc.as_object_mut() {
+        o.insert("default_range".into(), json!("string"));
+    }
+    let declared = load(&doc).unwrap();
+    assert_eq!(declared.schema(), load(&base()).unwrap().schema());
+    for (key, value) in [
+        ("imports", json!([])),
+        ("imports", json!(["linkml:types", "other"])),
+        ("imports", json!(["other"])),
+        ("default_range", json!("integer")),
+        ("default_range", json!(["string"])),
+    ] {
+        match load(&with(&format!("/{key}"), value.clone())) {
+            Err(Error::NotImplemented(why)) => {
+                assert!(why.contains(key), "{key} {value}: {why}");
+            }
+            other => panic!("{key} {value}: {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn a_range_outside_the_subset_is_not_implemented() {
     for range in ["ncname", "MyType", "curie"] {

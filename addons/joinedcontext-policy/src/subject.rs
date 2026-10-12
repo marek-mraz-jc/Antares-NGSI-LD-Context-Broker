@@ -8,12 +8,13 @@ use std::collections::BTreeSet;
 
 /// The headers this engine reads, in the order
 /// `ANTARES_POLICY_SUBJECT_HEADERS` lists them.
-pub const HEADERS: [&str; 5] = [
+pub const HEADERS: [&str; 6] = [
     "x-jc-subject",
     "x-jc-groups",
     "x-jc-roles",
     "x-jc-client",
     "x-jc-restricted",
+    "x-jc-did",
 ];
 
 /// The caller of one request.
@@ -38,6 +39,8 @@ pub struct Platform {
     pub roles: BTreeSet<String>,
     /// `x-jc-restricted: true`: the caller wants a narrowed answer said.
     pub restricted: bool,
+    /// `x-jc-did`: the data-space participant a transfer token names (DS-02).
+    pub did: Option<String>,
 }
 
 impl Caller {
@@ -65,20 +68,25 @@ impl Caller {
                 .filter_map(decode)
                 .collect()
         };
-        // A name that does not decode is nobody, never the anonymous caller.
-        let anonymous = !named("x-jc-subject") && !named("x-jc-client");
+        // A name that does not decode is nobody, never the anonymous caller. A participant holds
+        // what its agreement's Policies grant and nothing else: no role, no group (DS-02).
+        let participant = named("x-jc-did");
+        let anonymous = !named("x-jc-subject") && !named("x-jc-client") && !participant;
         let (user, client) = (one("x-jc-subject"), one("x-jc-client"));
         Caller::Platform(Platform {
-            groups: if anonymous {
+            groups: if anonymous || participant {
                 BTreeSet::new()
             } else {
                 list("x-jc-groups")
             },
             roles: if anonymous {
                 BTreeSet::from(["public".to_owned()])
+            } else if participant {
+                BTreeSet::new()
             } else {
                 list("x-jc-roles")
             },
+            did: one("x-jc-did"),
             restricted: get("x-jc-restricted").is_some_and(|v| v.eq_ignore_ascii_case("true")),
             user,
             client,
@@ -111,7 +119,7 @@ impl Platform {
             Kind::Group => self.groups.contains(id),
             Kind::Role => self.roles.contains(id),
             Kind::ServiceAccount => self.client.as_deref() == Some(id),
-            Kind::Did => false,
+            Kind::Did => self.did.as_deref() == Some(id),
         }
     }
 }
@@ -187,6 +195,26 @@ mod tests {
         }
         let p = platform(caller(&[("x-jc-subject", "a"), ("x-jc-restricted", "yes")]))?;
         assert!(!p.restricted && p.roles.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_participant_holds_its_did_and_no_role_or_group() -> Result<(), String> {
+        // A transfer token establishes the participant and nothing else (DS-02): the gateway
+        // sends `x-jc-did` alone, and a forged role or group beside it grants nothing.
+        let p = platform(caller(&[
+            ("x-jc-did", "did%3Aweb%3Aconsumer.example"),
+            ("x-jc-roles", "public,steward"),
+            ("x-jc-groups", "ops"),
+        ]))?;
+        assert_eq!(p.did.as_deref(), Some("did:web:consumer.example"));
+        assert!(p.roles.is_empty() && p.groups.is_empty());
+        assert!(p.is(&assignee(Kind::Did, "did:web:consumer.example")));
+        assert!(!p.is(&assignee(Kind::Did, "did:web:other.example")));
+        assert!(!p.is(&assignee(Kind::Role, "public")));
+        let p = platform(caller(&[("x-jc-did", "did%3A%C5")]))?;
+        assert_eq!(p.did, None, "an undecodable did names nobody");
+        assert!(p.roles.is_empty(), "and is never the anonymous caller");
         Ok(())
     }
 

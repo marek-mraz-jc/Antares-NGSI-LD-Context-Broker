@@ -3264,4 +3264,21 @@ antares-broker v0.1.3
 │   └── antares-api v0.1.3 (*)
 ├── serde_json feature "default" (*)
 ├── rumqttc feature "use-rustls-no-provider" (*)
-└── async-trait feature "default" (*)
+├── async-trait feature "default" (*)
+└── proptest feature "std"
+    ├── proptest v1.11.0
+    │   ├── num-traits v0.2.19 (*)
+    │   ├── rand_chacha v0.9.0 (*)
+    │   ├── bitflags feature "default" (*)
+    │   ├── regex-syntax feature "default" (*)
+    │   ├── rand feature "alloc" (*)
+    │   ├── rand_xorshift feature "default"
+    │   │   └── rand_xorshift v0.4.0
+    │   │       └── rand_core feature "default" (*)
+    │   └── unarray feature "default"
+    │       └── unarray v0.1.4
+    ├── num-traits feature "std" (*)
+    ├── rand feature "os_rng" (*)
+    ├── rand feature "std" (*)
+    └── proptest feature "regex-syntax"
+        └── proptest v1.11.0 (*)

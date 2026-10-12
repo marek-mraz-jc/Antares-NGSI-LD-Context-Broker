@@ -234,7 +234,8 @@ gated, and answers that operation's `404`. A custom query option is
 `400`. A query a form encoder wrote reads as its plain form (T-3719):
 `%24filter` is `$filter`, `%2F` and `%3D` are the query's `/` and `=`, and
 `+` is a space where the grammar requires whitespace (`Price+gt+5`), never
-inside a literal; a write method where it has no meaning (`/`, `$metadata`,
+inside a literal; a `$format` media type is read percent-decoded
+(`application%2Fjson%3Bodata.metadata%3Dnone`, T-3742); a write method where it has no meaning (`/`, `$metadata`,
 `$count`, a `POST` to one Entity, a `DELETE` of a set) is `405`, and the
 write forms of later rounds are `501`.
 
