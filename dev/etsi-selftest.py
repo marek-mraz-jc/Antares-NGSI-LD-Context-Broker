@@ -200,7 +200,8 @@ def check_view_diff():
     ]:
         assert view_diff.operation(method, url, binds) == op, (method, url)
 
-    a, b, c, d = (f"TP/s.robot::00{i} T" for i in range(4))
+    a, b, c, d, e, f = (f"TP/s.robot::00{i} T" for i in range(6))
+    plain = "http://h/ngsi-ld/v1"
     with tempfile.TemporaryDirectory() as tmp:
 
         def run(name, rows, requests=()):
@@ -212,30 +213,44 @@ def check_view_diff():
                 for key, status in rows:
                     w.writerow(["s", *key.split("::"), status])
             with open(f"{path}/requests.jsonl", "w") as fh:
-                for test, method, url, headers in requests:
-                    fh.write(json.dumps({"test": test, "method": method, "url": url, "headers": headers}) + "\n")
+                for test, method, url, headers, *fixture in requests:
+                    line = {"test": test, "method": method, "url": url, "headers": headers}
+                    if fixture:
+                        line.update(fixture=True, suite=fixture[0])
+                    fh.write(json.dumps(line) + "\n")
             return path
 
         view = f"{tmp}/view.json"
-        json.dump({"id": "v", "operations": ["retrieve_entity", "create_entity"]}, open(view, "w"))
+        json.dump({"id": "v", "operations": ["retrieve_entity", "create_entity",
+                                             "create_subscription", "retrieve_subscription"]},
+                  open(view, "w"))
         known = f"{tmp}/known.json"
         json.dump({"v": {d: "T-0000"}}, open(known, "w"))
         view_diff.KNOWN = known
-        e1 = run("e1", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "PASS")])
-        owed = run("owed", [(a, "FAIL"), (b, "FAIL"), (c, "FAIL"), (d, "FAIL")], [
+        e1 = run("e1", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "PASS"), (e, "PASS")])
+        owed = run("owed", [(a, "FAIL"), (b, "FAIL"), (c, "FAIL"), (d, "FAIL"), (e, "FAIL")], [
             (a, "POST", f"{root}/entityOperations/upsert", []),
             (b, "GET", f"{root}/entities/urn:x?entityMap=true", []),
             (c, "GET", f"{root}/entities/urn:x", ["ngsild-tenant"]),
+            # rule 9: the suite's setup made the Subscription at the root
+            (None, "POST", f"{plain}/subscriptions/", [], "TP/s.robot"),
+            (e, "GET", f"{root}/subscriptions/urn:s", []),
         ])
         assert view_diff.diff(view, e1, owed, binds) == 0
         refusals = json.load(open(f"{owed}/owed-refusals.json"))["refusals"]
-        assert [r["tp"] for r in refusals] == [a, b, c], refusals
-        stale = run("stale", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "PASS")])
+        assert [r["tp"] for r in refusals] == [a, b, c, e], refusals
+        # a Subscription the TP made through the view owes nothing
+        own = run("own", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "FAIL"), (e, "FAIL")], [
+            (e, "POST", f"{root}/subscriptions/", []),
+            (e, "GET", f"{root}/subscriptions/urn:s", []),
+        ])
+        assert view_diff.diff(view, e1, own, binds) == 1, "a view's own Subscription owes nothing"
+        stale = run("stale", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "PASS"), (e, "PASS")])
         assert view_diff.diff(view, e1, stale, binds) == 1, "a known TP answering as E1 must fail"
-        offered = run("offered", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
+        offered = run("offered", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL"), (e, "PASS")],
                       [(a, "POST", f"{root}/entities", [])])
         assert view_diff.diff(view, e1, offered, binds) == 1, "an offered operation owes nothing"
-        gone = run("gone", [(b, "PASS"), (c, "PASS"), (d, "FAIL")])
+        gone = run("gone", [(b, "PASS"), (c, "PASS"), (d, "FAIL"), (e, "PASS")])
         assert view_diff.diff(view, e1, gone, binds) == 1, "a TP that did not run must fail"
         assert view_diff.diff(view, e1, f"{tmp}/nowhere", binds) == 1, "an empty run must fail"
     print("  view diff ok (owed refusals pass, a deviation, a stale known entry or a missing TP fails)")

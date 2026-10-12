@@ -7,8 +7,10 @@ A refusal is owed, not hand-listed: a TP whose body sent a request the view
 does not offer (its operation, from operation-matrix.yaml's NGSI-LD binding,
 is not in the view's `operations`; ADR-0023 rule 4), a request no operation
 binds, a request naming an NGSILD-Tenant (rule 10) or an entity map (threat
-V22). The body requests come from the run's requests.jsonl
-(dev/etsi_setup_url.py records them).
+V22), or a Subscription operation in a TP whose fixtures made a Subscription
+at the root, which no view serves (rule 9: a view serves its own
+Subscriptions alone). The requests come from the run's requests.jsonl
+(dev/etsi_setup_url.py records the body's and, marked, the fixtures').
 
 Usage:
   etsi-view-diff.py <view.json> <e1-dir> <e2-dir>
@@ -80,9 +82,16 @@ def operation(method, url, binds):
     return best
 
 
-def owed(requests, offered, binds):
+# The Subscription operations a view runs on its own Subscriptions alone
+# (ADR-0023 rule 9, antares-api views::SUBSCRIPTIONS).
+OWN_SUBSCRIPTIONS = {"retrieve_subscription", "update_subscription",
+                     "delete_subscription", "query_subscriptions"}
+
+
+def owed(requests, offered, binds, fixtures=()):
     """Why the view refuses some request of a TP's body, or []."""
     why = []
+    at_root = any(operation(f["method"], f["url"], binds) == "create_subscription" for f in fixtures)
     for r in requests:
         url, headers = r["url"], set(r.get("headers") or ())
         op = operation(r["method"], url, binds)
@@ -94,16 +103,23 @@ def owed(requests, offered, binds):
             why.append(f"{r['method']} {urlsplit(url).path}: no operation binds it (ADR-0023 rule 4)")
         elif op not in offered:
             why.append(f"{r['method']} {op}: not offered (ADR-0023 rule 4)")
+        elif at_root and op in OWN_SUBSCRIPTIONS:
+            why.append(f"{r['method']} {op}: a fixture made the Subscription at the root, "
+                       "and a view serves its own alone (ADR-0023 rule 9)")
     return why
 
 
 def requests_of(d):
-    by_tp = {}
+    """(body requests by TP, fixture requests by TP and by suite file)."""
+    by_tp, fixtures = {}, {}
     for path in glob.glob(f"{d}/**/requests.jsonl", recursive=True):
         for line in open(path, encoding="utf-8"):
             r = json.loads(line)
-            by_tp.setdefault(r["test"], []).append(r)
-    return by_tp
+            if r.get("fixture"):
+                fixtures.setdefault(r["test"] or r.get("suite", ""), []).append(r)
+            else:
+                by_tp.setdefault(r["test"], []).append(r)
+    return by_tp, fixtures
 
 
 def diff(view_path, e1_dir, e2_dir, binds=None):
@@ -115,7 +131,7 @@ def diff(view_path, e1_dir, e2_dir, binds=None):
     if red:
         print("\n".join(red))
         return 1
-    reqs = requests_of(e2_dir)
+    reqs, fixtures = requests_of(e2_dir)
     offered = set(view.get("operations") or [])
     refusals, explained = [], 0
     for tp in sorted(e1.keys() | e2.keys()):
@@ -124,7 +140,8 @@ def diff(view_path, e1_dir, e2_dir, binds=None):
             if tp in known:
                 red.append(f"stale: {tp} answers as E1 now; remove it from {os.path.basename(KNOWN)}")
             continue
-        why = owed(reqs.get(tp, []), offered, binds) if "did not run" not in (a, b) else []
+        made = fixtures.get(tp, []) + fixtures.get(tp.split("::")[0], [])
+        why = owed(reqs.get(tp, []), offered, binds, made) if "did not run" not in (a, b) else []
         if why:
             refusals.append({"tp": tp, "e1": a, "view": b, "owed": why})
         elif tp in known:
