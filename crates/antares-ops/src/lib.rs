@@ -1066,6 +1066,14 @@ pub mod test_kit {
             Ok(Self { state, reload })
         }
 
+        /// One retention sweep at `now` (T-3900), as the minute loop runs it.
+        pub async fn sweep_retention(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Vec<crate::views::retention::Deleted> {
+            self.reload.sweep_retention(now).await
+        }
+
         /// Another pod over the same store: its own view table, loaded and
         /// reloaded from the store like this one's.
         ///
