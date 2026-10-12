@@ -236,7 +236,7 @@ async fn next_token_bound_to_view_and_query() -> Result<(), String> {
         .ok_or("a token")?;
     for other in [
         format!("/x/views/slow/ogc/features/collections/Car/items?limit=1&next={token}"),
-        format!("{CARS}?limit=2&next={token}"),
+        format!("{CARS}?limit=1&bbox=0,0,1,1&next={token}"),
         format!("{CARS}?limit=1&next={token}x"),
     ] {
         assert_eq!(
@@ -247,6 +247,15 @@ async fn next_token_bound_to_view_and_query() -> Result<(), String> {
     }
     assert_eq!(
         get(&f.app, &format!("{CARS}?limit=1&next={token}"))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    // the page size is no part of the request a token belongs to (ETS
+    // `validateFeaturesWithLimitResponse_NumberMatched` follows a token
+    // with another `limit`)
+    assert_eq!(
+        get(&f.app, &format!("{CARS}?limit=10000&next={token}"))
             .await
             .status,
         StatusCode::OK
