@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 # ADR-0027 / surfaces-threat-model 9.1: checked by dev/check-module-rules.py.
 [package.metadata.antares]
-role = "core"
+role = "ngsild"
 
 [dependencies]
 antares-jsonld = { workspace = true }

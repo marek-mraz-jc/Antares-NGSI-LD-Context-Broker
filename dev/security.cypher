@@ -8,5 +8,5 @@ MATCH (a:Package)-[d:DEPENDS_ON]->(b:Package) WHERE (a.name STARTS WITH 'odata-'
 GREP (?i)"(x-)?ngsild-tenant" IN crates/*/src/**/*.rs;
 // sql-from-text: dynamic SQL (sqlx takes a non-literal statement only through AssertSqlSafe); every function that builds one names why its interpolations are not input
 MATCH (c:Symbol)-[:CALLS|REFERENCES]->(x:Symbol) WHERE x.name = 'AssertSqlSafe' AND x.external AND NOT c.is_test RETURN DISTINCT c.path ORDER BY c.path;
-// egress-outside-policy: a reqwest client built anywhere but antares_jsonld::client_builder, which applies the EgressPolicy (SSRF)
+// egress-outside-policy: a reqwest client built anywhere but antares_jsonld::client_builder, which applies the EgressPolicy (SSRF); since T-3911 client_builder compiles only with antares-jsonld's `fetch` feature, so a build without it has no HTTP client at all
 MATCH (c:Symbol)-[:CALLS]->(x:Symbol) WHERE x.external AND x.path STARTS WITH 'reqwest::' AND x.name IN ['builder','new','default'] AND (x.path CONTAINS '::Client::' OR x.path CONTAINS '::ClientBuilder::') AND NOT c.is_test AND NOT c.file CONTAINS '/examples/' AND c.path <> 'antares_jsonld::loader::client_builder' RETURN DISTINCT c.path, x.path ORDER BY c.path;
