@@ -743,7 +743,10 @@ async fn build_builtin(
             Ok((AnyStore::Mem(Store::open_file(&dir)?), None))
         }
         StoreMode::Postgres | StoreMode::Timescale => {
+            // The URL carries the database password: held as a Secret so no
+            // error or log line below can print it (T-3915).
             let url = std::env::var("ANTARES_DATABASE_URL")
+                .map(antares_api::secret::Secret::new)
                 .map_err(|_| format!("ANTARES_STORE={mode} requires ANTARES_DATABASE_URL"))?;
             let pool_size = parse_pg_pool(std::env::var("ANTARES_PG_POOL").ok().as_deref())?;
             let statement_timeout = parse_pg_statement_timeout(
@@ -754,7 +757,12 @@ async fn build_builtin(
             // The DB container may still be booting — bounded retry, then die.
             let mut last = String::new();
             for _ in 0..30 {
-                match antares_sql::store::pg::connect_with(&url, pool_size, statement_timeout).await
+                match antares_sql::store::pg::connect_with(
+                    url.expose(),
+                    pool_size,
+                    statement_timeout,
+                )
+                .await
                 {
                     Ok(pool) => {
                         // The temporal backend is what the migrations actually

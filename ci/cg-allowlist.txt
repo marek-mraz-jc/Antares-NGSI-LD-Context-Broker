@@ -53,3 +53,38 @@ sql-from-text | antares_sql::store::pg::temporal::PgTemporalStore::delete | pg d
 sql-from-text | antares_sql::store::pg::temporal::PgTemporalStore::get_range | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
 sql-from-text | antares_sql::store::pg::temporal::PgTemporalStore::mutate | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
 sql-from-text | antares_sql::store::pg::temporal::PgTemporalStore::query_inner | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
+
+identity-headers | antares_ws::upgrade | the WebSocket upgrade (ADR-0026) reads the root connection's Tenant for its per-Tenant cap and notification routing; every operation on the socket goes through the NGSI-LD router, whose tenant_from and tenant_exists_layer validate it (T-3914)
+identity-headers | antares_ws::hub::Forwarded::of | reads the Tenant the notifier stamped on its own receiverInfo, never a client's header, to deliver a notification only to sockets of that Tenant (T-3914)
+
+# T-3914: every row classified in docs/analysis/tenant-isolation.md section 2.
+store-method-without-tenant | CurrentStateDriver | close | lifecycle: closes the pool at shutdown, reads no row
+store-method-without-tenant | CurrentStateDriver | commit_queue | metrics: the group-commit queue depth, no row
+store-method-without-tenant | CurrentStateDriver | outbox_ack | the outbox drain acks rows by the seq outbox_peek handed out; each row carries its Tenant (outbox_retain and outbox_event take it)
+store-method-without-tenant | CurrentStateDriver | outbox_peek | the outbox drain is cross-Tenant by design: each row is (seq, tenant, event) and the relay dispatches under that Tenant
+store-method-without-tenant | CurrentStateDriver | ping | readiness probe, no row
+store-method-without-tenant | CurrentStateDriver | set_change_hook | installs the change feed once at boot; the hook is called with (tenant, before, after)
+store-method-without-tenant | CurrentStateDriver | set_outbox | boot switch for the outbox, no row
+store-method-without-tenant | CurrentStateDriver | subscription_tenants | the Tenant inventory the interval sweep and the mirror hydration iterate; names only, each Tenant then read on its own
+store-method-without-tenant | CurrentStateDriver | sweep_expired | 4.22 reap of expired rows, cross-Tenant maintenance by design (Postgres runs it under the service role)
+store-method-without-tenant | CurrentStateDriver | tenant_ids | the /q/tenants inventory behind the admin secret, names only
+store-method-without-tenant | CurrentStateDriver | version_info | /q/health versions, no row
+store-method-without-tenant | TemporalDriver | close | lifecycle: closes the pool at shutdown, reads no row
+store-method-without-tenant | TemporalDriver | event_list | each TemporalEvent carries its Tenant, and the default fold groups by (tenant, entity id); run_tenant_isolation_contract drains one event and checks the other Tenant's history
+store-method-without-tenant | TemporalDriver | ping | readiness probe, no row
+store-method-without-tenant | TemporalDriver | q_pushdown_exact | a capability question about a q expression, reads no row
+store-method-without-tenant | TemporalDriver | supported | capability flag, no row
+store-method-without-tenant | TemporalDriver | version_info | /q/health versions, no row
+
+tenant-not-from-header | DELETE /q/dead-letters/{} | antares_api::dead_letter_delete | admin secret route layer; the Tenant is the operator's ?tenant=, parsed by admin_tenant (TenantId::new, reserved names refused)
+tenant-not-from-header | GET /q/dead-letters | antares_api::dead_letters_list | admin secret route layer; the Tenant is the operator's ?tenant=, parsed by admin_tenant (TenantId::new, reserved names refused)
+tenant-not-from-header | POST /q/dead-letters/{}/replay | antares_api::dead_letter_replay | admin secret route layer; the Tenant is the operator's ?tenant=, parsed by admin_tenant (TenantId::new, reserved names refused)
+tenant-not-from-header | GET /q/tenants/{} | antares_api::tenant_get | admin secret route layer; the Tenant is the path segment, parsed by TenantId::new
+tenant-not-from-header | DELETE /q/tenants/{} | antares_api::tenant_purge | admin secret route layer; the Tenant is the path segment, parsed by TenantId::new
+tenant-not-from-header | POST /ex/v1/remote-notify | antares_api::distsub::remote_notify | the Tenant is read back from the broker's own inbound index under the peer's random subscriptionId, never from the request (ADR-0019)
+
+# T-3915: secrets, child processes, files a route writes, panics a route reaches.
+secret-exposed | antares_api::admin_auth::AdminAuth::admits | the presented bearer is compared with the admin token in constant time (constant_time_eq); the value goes nowhere else
+secret-exposed | antares_broker::build_builtin | the database URL goes to the Postgres pool's connect (connect_with) and nowhere else; the retry loop keeps the error text, which names no URL (tests/secret_logs.rs)
+process-spawn | antares_api::main | the build script of antares-api runs `git rev-parse --short HEAD` with fixed arguments to bake the commit into /q/health; nothing at run time spawns a process
+fs-write-from-a-server | antares_sql::store::mem::redb::Shadow::write | the file store's one redb file, opened at boot under ANTARES_DATA_DIR (operator config, Store::open_file); a request only supplies the key bytes of a row inside it (tenant NUL id), never a path
