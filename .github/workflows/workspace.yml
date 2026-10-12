@@ -246,8 +246,9 @@ jobs:
           retention-days: 30
       # The ETSI resource sampler + its sample↔TP join fail silently when
       # broken (an empty column reads as "nothing happened") — check them here.
+      # robotframework at the suite's pin: the request recorder runs a two-test suite (T-4030).
       - name: ETSI sampling self-check
-        run: pip install --quiet pyyaml && python3 dev/etsi-selftest.py
+        run: pip install --quiet pyyaml robotframework==7.4.1 && python3 dev/etsi-selftest.py
       # The external-suites harness (T-3549): its comparator and adapters
       # decide verdicts, and a wrong one reads as a plausible pass.
       - name: External-suites harness self-check
