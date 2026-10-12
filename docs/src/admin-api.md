@@ -37,6 +37,9 @@ schema: `docs/openapi/antares-admin.yaml`, rendered at
 | `GET /q/tenants` | Tenant names |
 | `GET /q/tenants/{tenant}` | What one tenant holds |
 | `DELETE /q/tenants/{tenant}` | Tenant purge |
+| `GET /q/tenants/{tenant}/digest` | Entity count, history count and a hash over (id, `modifiedAt`) |
+| `GET /q/tenants/{tenant}/export` | The tenant's Entities and history as NDJSON, system attributes kept |
+| `POST /q/tenants/{tenant}/import` | An export into an empty tenant, all or nothing |
 | `GET /q/dead-letters` | Notifications the delivery policy gave up on |
 | `POST /q/dead-letters/{id}/replay` | One more delivery attempt |
 | `DELETE /q/dead-letters/{id}` | Drop a dead letter |
@@ -189,6 +192,32 @@ Context Source, `400` for a name outside the tenant grammar. The default
 tenant is emptied and keeps existing. The path names the tenant; an
 `NGSILD-Tenant` header is ignored. Background in
 [operations](operations.md#tenants).
+
+
+### Moving a tenant to another broker
+
+ADR-0030. Hold the
+writers first: the export is not a point-in-time snapshot, and the digest
+proves the copy.
+
+`GET /q/tenants/{tenant}/digest` answers
+`{"tenant","entities","attrInstances","sha256"}`. `sha256` is the sum modulo
+2²⁵⁶ of `sha256(id ‖ 0x00 ‖ modifiedAt)` over the Entities, so two brokers
+agree whatever order they page in.
+
+`GET /q/tenants/{tenant}/export` streams `application/x-ndjson`: a header
+`{"antaresExport":1,"tenant":…}`, one `{"kind":"entity","doc":…}` per
+Entity, then one `{"kind":"temporal","doc":…}` per history document, each as
+stored, and a trailer `{"end":true,"records":n}`. A stream that stops
+without the trailer was cut. A tenant holding Subscriptions, Registrations,
+Registration Subscriptions, Snapshots or distributed subscriptions answers
+`409` with their counts: v1 moves data only.
+
+`POST /q/tenants/{tenant}/import` takes that stream into a tenant holding no
+Entity and no history (`409` otherwise), with the same tenant name in its
+header, entities before history, lines of at most 16 MiB. Any refused line,
+or a missing trailer, answers `400` naming the line and leaves the tenant
+as it was found. `204` when every record is in.
 
 ## Dead letters
 

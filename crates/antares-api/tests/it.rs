@@ -108,6 +108,7 @@ mod temporal_scope_5_7_4;
 mod temporal_values_4_5_9;
 mod tenant_header_6_3_14;
 mod tenant_isolation;
+mod tenant_move;
 mod tenant_purge_large;
 mod tenants_admin;
 mod throttling_5_2_12;
