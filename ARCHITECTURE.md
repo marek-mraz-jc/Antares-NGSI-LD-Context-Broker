@@ -104,6 +104,7 @@ module's header comment.
 | `egress.rs` | SSRF wall and per-destination circuit breakers for notifications, forwards, `@context` fetches |
 | `surface.rs` | `ApiSurface`: HTTP surfaces mounted beside the API root, on the reserved prefixes `/q` and `/x` |
 | `policy.rs` | the policy seam (ADR-0020): `PolicyEngine`, `Subject`/`Operation`/`Decision`/`Filter` (per-rule allowlists, ADR-0023 rule 11), the `Condition` an `AllowIf` holds a write by id to inside the store (gap G12), the built-in `AllowAll` engine, the clauses a narrowing can reach and the refusal everywhere else, the fail-closed calls that deny on a panic or a timeout, and the stored subject a notification is decided under |
+| `secret.rs` | `Secret`: a configured credential (the admin token, the database URL) whose `Debug` and `Display` print `[redacted]`; `expose()` is the one way to read it, and dev/security.cypher secret-exposed lists every caller |
 | `state.rs` | `AppState`: store, bus flag, mirror, HTTP clients, delivery policy, sinks, surfaces, hooks, the forward transport, and the endpoint view a state is narrowed to (feature `views`), and the task-local @context a surface calls in (`call_in_context`) |
 | `fuzzing.rs` | the request parsers the `fuzz/` targets drive, behind the `fuzzing` feature that no broker build enables (T-3463) |
 | `views.rs` | feature `views` (ADR-0023, ADR-0027 section 5): `CompiledView` and the composition `gate!` applies after the engine answers, effective = view ∧ engine, neither side widening, rule pairs keeping both id narrowings (G2); `WriteGuard`, rule 7 checked inside the store's read-modify-write; the `ViewTable` a pod serves from (views and each Tenant's schema bytes with their revision) and the `Kind::View` documents under `antares-views`; never in a vanilla build |
@@ -222,8 +223,9 @@ pair, one schema (`crates/antares-sql/migrations/`: `0001_init.sql`,
    through `antares_jsonld::client_builder` and `egress.rs`.
 4. No dynamic SQL outside the compiler (CI gate); `unsafe` forbidden;
    `unwrap`/`expect` denied outside tests.
-5. Every env variable is in `KNOWN_KEYS` (`broker/src/main.rs`) and in
-   `docs/src/configuration.md` (`dev/check-env-docs.sh`). Every version is
+5. Every env variable is in `KNOWN_KEYS` (`broker/src/main.rs`), or, for
+   a surface, in its crate's `ENV_KEYS`, which `SURFACE_KEYS` names, and
+   in `docs/src/configuration.md` (`dev/check-env-docs.sh`). Every version is
    in `[workspace.dependencies]`; the `wasm32` target sections, which
    cannot say `workspace = true` because cargo features are additive, are
    held equal to it by `dev/check-wasm-pins.py`.

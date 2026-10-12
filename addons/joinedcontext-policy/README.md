@@ -133,8 +133,18 @@ deciding; a Tenant with no document denies every platform caller.
 7. A refusal says `no policy grants this operation` or `a policy prohibits
    this operation` and names no policy (platform GW6).
 8. A batch is decided member by member (`decide_each`); a notification is
-   decided again for the Subscription's stored subject as a query (5.7.2):
-   `Deny` drops it, a `Filter` narrows it.
+   decided again for the Subscription's stored subject as a query (5.7.2)
+   naming the types of the Entities it carries: `Deny` drops it, a `Filter`
+   narrows it (T-3784).
+9. The tool probe (`offers_each`, MCP D-3) asks whether some request of a
+   clause could be allowed, with an Operation naming nothing. A prohibition
+   without type refuses every clause it lists. Otherwise a read is offered
+   when a permission applies (a read of a type no prohibition names is
+   narrowed, never refused, rules 2 and 4); a write when a permission
+   without information applies, or one naming a type no prohibition covers
+   (a conditional prohibition counts as covering its whole type); a
+   whole-Tenant clause is decided as a request. A call is still decided by
+   rules 1 to 7 (T-3784).
 
 ## 4. The access surface
 

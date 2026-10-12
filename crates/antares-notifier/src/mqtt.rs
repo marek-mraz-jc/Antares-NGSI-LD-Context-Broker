@@ -199,10 +199,11 @@ fn shared_tls_config() -> Result<rumqttc::TlsConfiguration, NgsiError> {
 /// copy of both. Private egress is allowed by default (dev boxes, compose
 /// stacks and the conformance mocks all live there) and
 /// `ANTARES_EGRESS_ALLOW_PRIVATE=false` turns the deny on for
-/// internet-exposed deployments. Read once per process.
-fn allow_private_egress() -> bool {
-    static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ALLOW.get_or_init(|| EgressPolicy::from_env().allow_private)
+/// internet-exposed deployments, with `ANTARES_EGRESS_PRIVATE_HOSTS` naming
+/// the peers it still reaches. Read once per process.
+fn egress_policy() -> EgressPolicy {
+    static POLICY: std::sync::OnceLock<EgressPolicy> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(EgressPolicy::from_env)
 }
 
 /// Resolve the endpoint host ONCE and return the address to dial, or a
@@ -216,7 +217,7 @@ fn allow_private_egress() -> bool {
 async fn checked_addr(
     host: &str,
     port: u16,
-    allow_private: bool,
+    policy: EgressPolicy,
     dns_timeout: Duration,
 ) -> Result<std::net::SocketAddr, NgsiError> {
     let denied = || {
@@ -240,10 +241,7 @@ async fn checked_addr(
     };
     addrs
         .into_iter()
-        .find(|a| {
-            !EgressPolicy::ip_is_metadata(a.ip())
-                && (allow_private || !EgressPolicy::ip_is_private(a.ip()))
-        })
+        .find(|a| policy.admits(host, a.ip()))
         .ok_or_else(denied)
 }
 
@@ -413,7 +411,7 @@ impl MqttSink {
         };
         // Egress policy first: resolve once, judge the answer, dial what was
         // judged. Nothing below opens a socket to an unchecked destination.
-        let addr = checked_addr(&ep.host, ep.port, allow_private_egress(), self.timeout).await?;
+        let addr = checked_addr(&ep.host, ep.port, egress_policy(), self.timeout).await?;
         let dial = dial_host(ep, addr);
         if params.v5 {
             let mut opts = rumqttc::v5::MqttOptions::new(id, dial, addr.port());
@@ -725,6 +723,15 @@ mod tests {
     /// metadata range is refused unconditionally, private ranges only when
     /// the deployment switched private egress off, and IPv4-mapped IPv6
     /// spellings are judged as their IPv4 selves.
+    const OPEN: EgressPolicy = EgressPolicy {
+        allow_private: true,
+        private_hosts: &[],
+    };
+    const CLOSED: EgressPolicy = EgressPolicy {
+        allow_private: false,
+        private_hosts: &[],
+    };
+
     #[tokio::test]
     async fn checked_addr_applies_the_egress_rules_to_resolved_addresses() {
         let d = Duration::from_secs(2);
@@ -738,7 +745,7 @@ mod tests {
             "fd00:ec2::254",
             "2002:a9fe:a9fe::",
         ] {
-            let e = checked_addr(host, 1883, true, d)
+            let e = checked_addr(host, 1883, OPEN, d)
                 .await
                 .expect_err("metadata range must be refused whatever the switch says");
             assert!(e.to_string().contains("denied"), "{host}: {e}");
@@ -752,24 +759,24 @@ mod tests {
             "::1",
             "localhost",
         ] {
-            let ok = checked_addr(host, 1883, true, d)
+            let ok = checked_addr(host, 1883, OPEN, d)
                 .await
                 .unwrap_or_else(|e| panic!("{host} must be reachable by default: {e}"));
             assert_eq!(ok.port(), 1883);
             assert!(
-                checked_addr(host, 1883, false, d).await.is_err(),
+                checked_addr(host, 1883, CLOSED, d).await.is_err(),
                 "{host} must be refused with private egress off"
             );
         }
         // a public literal clears the strict policy and comes back as the
         // ADDRESS to dial — the resolution the check judged, pinned
-        let a = checked_addr("93.184.216.34", 8883, false, d)
+        let a = checked_addr("93.184.216.34", 8883, CLOSED, d)
             .await
             .expect("public address allowed");
         assert_eq!(a.to_string(), "93.184.216.34:8883");
         // a name that cannot be resolved is a denial, not a pass-through
         assert!(
-            checked_addr("no-such-host.invalid", 1883, true, d)
+            checked_addr("no-such-host.invalid", 1883, OPEN, d)
                 .await
                 .is_err(),
             "an unresolvable destination must not be dialled"

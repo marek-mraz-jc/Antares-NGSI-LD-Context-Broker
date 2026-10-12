@@ -244,7 +244,6 @@ fn unwrap_single(v: Value) -> Value {
 mod tests {
     use super::*;
     use crate::expand::{expand_entity, ExpandOpts};
-    use crate::loader::Loader;
     use serde_json::json;
 
     const DEFAULT: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
@@ -255,7 +254,7 @@ mod tests {
     /// same name expands through @vocab. Compaction is the reverse.
     #[test]
     fn a_type_scoped_term_expands_inside_its_type_only() {
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let feature = json!({
             "id": "urn:ngsi-ld:Feature:1",
             "type": "Feature",
@@ -288,7 +287,7 @@ mod tests {
     /// propagate), and compacts back to the scoped term.
     #[test]
     fn a_property_scoped_term_expands_inside_its_property() {
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let doc = json!({
             "id": "urn:ngsi-ld:Device:1",
             "type": "Device",
@@ -317,7 +316,7 @@ mod tests {
             "name": {"type": "Property", "value": "Eiffel Tower"},
             "location": {"type": "GeoProperty", "value": {"type": "Point", "coordinates": [2.29, 48.85]}}
         });
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let expanded =
             expand_entity(input.as_object().unwrap(), &ctx, ExpandOpts::default()).unwrap();
         let compacted = compact_entity(&expanded, &ctx);
@@ -330,7 +329,7 @@ mod tests {
     /// dataset-map instances compact per instance (Example 9).
     #[test]
     fn simplified_vocab_compacts_to_term() {
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let doc = json!({
             "id": "urn:ngsi-ld:V:1",
             "type": "https://uri.etsi.org/ngsi-ld/default-context/Vehicle",
@@ -357,7 +356,7 @@ mod tests {
             "route": {"type": "ListRelationship",
                       "objectList": [{"object": "urn:ngsi-ld:R:1"}, "urn:ngsi-ld:R:2"]}
         });
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let expanded =
             expand_entity(input.as_object().unwrap(), &ctx, ExpandOpts::default()).unwrap();
         let route = &expanded["https://uri.etsi.org/ngsi-ld/default-context/route"][0];
@@ -408,7 +407,7 @@ mod tests {
     /// own and the system members keep their values.
     #[test]
     fn reserved_members_are_not_clobbered_by_attributes() {
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let vocab = "https://uri.etsi.org/ngsi-ld/default-context/";
         let mut internal = Map::new();
         internal.insert("id".into(), json!("urn:ngsi-ld:B:1"));
@@ -440,7 +439,7 @@ mod tests {
     /// verbatim; a single-element scope array is unwrapped.
     #[test]
     fn entity_edge_shapes() {
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         assert_eq!(
             compact_entity(&json!("not an object"), &ctx),
             json!("not an object")
@@ -579,7 +578,7 @@ mod tests {
     /// wrapped twice, and a non-array objectList passes through.
     #[test]
     fn object_list_wrapping_edges() {
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let out = compact_instance(
             &json!({"type": "ListRelationship",
                     "objectList": ["urn:a", {"object": "urn:b"}],
@@ -642,7 +641,7 @@ mod tests {
     /// A "dataset" member whose value is not an object is left alone.
     #[test]
     fn simplified_dataset_edges() {
-        let ctx = Loader::new().core();
+        let ctx = std::sync::Arc::new(crate::core_context());
         let out = compact_entity_shallow(
             &json!({"https://uri.etsi.org/ngsi-ld/default-context/a": {"dataset": 5}}),
             &ctx,

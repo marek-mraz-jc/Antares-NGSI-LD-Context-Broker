@@ -15,9 +15,9 @@ Sources: Antares-NGSI-LD-Context-Broker origin/dev `3232418`, code graph built a
 |---|---|---|---|---|
 | antares-model | ngsild | yes | | |
 | antares-residual | ops | yes | the coverage gate (section 1) | T-3912 |
-| antares-ql | core | no | `antares-jsonld` (a core crate with reqwest, rustls, tokio, moka) | T-3911 |
-| antares-matcher | core | no | `antares-jsonld`, `antares-ql` | T-3911 |
-| antares-jsonld | core | no | reqwest, rustls, tokio, moka, futures-util, gloo-timers, send_wrapper, web-time by default | T-3911 |
+| antares-ql | ngsild (T-3911) | yes | | |
+| antares-matcher | ngsild (T-3911) | yes | | |
+| antares-jsonld | ngsild (T-3911) | yes | the network loader sits behind the non-default `fetch` feature (section 7) | |
 | antares-store | core | no | `async-trait`, jsonld, ql; stays core (section 1) | |
 
 `antares-residual` has no workspace dependent at all (no `Cargo.toml` names it outside its own crate, and query 3 finds no caller), so its move changes no other crate.
@@ -264,7 +264,15 @@ antares-store | Trait | antares_store::TemporalDriverExt
 antares-store | Function | antares_store::record_forward_via_mutate
 ```
 
-## 7. The check
+## 7. After T-3911: the loader behind `fetch`
+
+`antares-jsonld` splits in two. `src/pinned.rs` holds what needs no network: the pinned core context, `core_context()`, the size and URL-count limits, the `ContextLoader` trait, `PinnedOnly` (answers the pinned URLs and refuses every other with `LdContextNotAvailable`) and `resolve_with`, which resolves an `@context` value through any loader. `src/loader.rs` (the HTTP client, the `EgressPolicy`, the moka cache, `uuid` for cache keys) compiles only with the `fetch` feature, which turns on the optional `tokio`, `reqwest`, `rustls`, `moka`, `futures-util`, `uuid` and the wasm timer crates. `default` is empty. The broker side (`antares-api`, `antares-broker`, `antares-notifier`, `antares-wasm`, the `antares-ops` test kit) names `features = ["fetch"]`; `antares-ql` and `antares-matcher` use the core context only and drop to role `ngsild` with it.
+
+`cargo tree -p antares-jsonld -e normal --no-default-features --prefix none`: 111 distinct crates at origin/dev `7d74f43` (reqwest, hyper, rustls, ring, tokio, moka, futures-util, uuid among them), 18 after. The workspace job checks `cargo check --locked --target wasm32-unknown-unknown -p antares-jsonld --no-default-features`; it failed before `uuid` moved under `fetch` (getrandom has no wasm32 source without a feature).
+
+- Decided (worker-2, owner may override): an unknown context URL without `fetch` answers `LdContextNotAvailable`, the error the fetching loader already returns for a URL its policy refuses; the crate has no `LoadingDocumentFailed` variant and a new one would be a new public error for one case. Options: new variant, reuse (chosen).
+
+## 8. The check
 
 `dev/check-module-rules.py` runs M3 beside M1 and M2 in the workspace job's module-rules step (`.github/workflows/workspace.yml`) and in `dev/preflight.sh`. Its `--self-test` plants six M3 violations on a synthetic workspace whose clean `ngsild` crates include one with `tokio` behind a non-default `fetch` feature: a normal and a build dependency on `tokio`, a dependency on `antares-api` and on `antares-store`, `default` turning on `fetch`, and `default` naming the optional dependency itself. An unknown role was already a planted violation.
 
