@@ -57,6 +57,21 @@ const ROUTES: &[(&str, &str, &[&str])] = &[
         "/q/schemas/acme",
         &["GET", "PUT", "DELETE"],
     ),
+    (
+        "/retention/{tenant}",
+        "/q/retention/acme",
+        &["GET", "PUT", "DELETE"],
+    ),
+    (
+        "/retention/{tenant}/preview",
+        "/q/retention/acme/preview",
+        &["POST"],
+    ),
+    (
+        "/retention/{tenant}/deleted",
+        "/q/retention/acme/deleted",
+        &["GET"],
+    ),
     ("/policy", "/q/policy", &["GET"]),
     (
         "/policy/{tenant}",
@@ -286,6 +301,7 @@ fn routes_equals_what_the_sources_mount() {
         "crates/antares-ops/src/views.rs",
         "crates/antares-ops/src/views/preview.rs",
         "crates/antares-ops/src/views/rule_documents.rs",
+        "crates/antares-ops/src/views/retention.rs",
         "crates/antares-icsr/src/grant.rs",
     ] {
         let found = route_literals(&read(rel))

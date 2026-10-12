@@ -494,7 +494,7 @@ impl OperationId {
 
     /// The operation a request is, when it is one a surface may run: the
     /// method and path match the binding, every segment in braces standing
-    /// for one non-empty segment, and a binding with a query (`?details=true`)
+    /// for one segment other than `.` and `..`, and a binding with a query (`?details=true`)
     /// is preferred over the same path without it, and `HEAD` is the `GET`
     /// operation. Broker-initiated deliveries are never matched.
     ///
@@ -585,8 +585,10 @@ fn template_matches(template: &str, path: &str) -> bool {
     loop {
         match (want.next(), have.next()) {
             (None, None) => return true,
+            // An empty one (`/entities//attrs`) is the operation with its id
+            // missing, which the root refuses as BadRequestData (T-3948).
             (Some(w), Some(h)) if w.starts_with('{') => {
-                if h.is_empty() || h == "." || h == ".." {
+                if h == "." || h == ".." {
                     return false;
                 }
             }

@@ -87,6 +87,13 @@ EXTRA=()
 # TPs needing a specially-configured broker (ANTARES_TEMPORAL=none) never
 # belong in a default conformance run — they get their own harness.
 EXTRA+=(--exclude config_no_temporal)
+# 019_31 spells the root's path into the Link headers it expects; through a
+# view the links point into the view's own root (ADR-0023), so the TP is told
+# the path it runs under (T-3948). At the root this is the TP's own value.
+hostpath="${BROKER_URL#*://}"
+root_path=""
+[ "$hostpath" = "${hostpath#*/}" ] || root_path="/${hostpath#*/}"
+EXTRA+=(--variable "entities_path:${root_path%/}/entities")
 # ; keeps the URL's colons; requests.jsonl is what dev/etsi-view-diff.py reads
 if [ -n "${SETUP_URL:-}" ]; then
   record="$RESULTS_DIR/requests.jsonl"
