@@ -45,16 +45,14 @@ struct Scope {
 
 impl Scope {
     fn new(terms: HashMap<String, TermDef>) -> Self {
-        let mut inverse: HashMap<String, String> = HashMap::new();
-        for (term, def) in &terms {
-            match inverse.get(&def.iri) {
-                Some(existing)
-                    if (existing.len(), existing.as_str()) <= (term.len(), term.as_str()) => {}
-                _ => {
-                    inverse.insert(def.iri.clone(), term.clone());
-                }
-            }
-        }
+        // longest first: a later insert wins, so the shortest term (then the
+        // first in order) is the one kept for its IRI
+        let mut order: Vec<_> = terms.iter().collect();
+        order.sort_by(|a, b| (b.0.len(), b.0).cmp(&(a.0.len(), a.0)));
+        let inverse = order
+            .into_iter()
+            .map(|(term, def)| (def.iri.clone(), term.clone()))
+            .collect();
         Self { terms, inverse }
     }
 }
@@ -279,18 +277,6 @@ impl Context {
             }
         }
         view
-    }
-
-    /// The same context outside every scope: what a node below a
-    /// type-scoped one sees.
-    pub fn outside(&self) -> Cow<'_, Context> {
-        if self.inner.is_none() {
-            return Cow::Borrowed(self);
-        }
-        Cow::Owned(Context {
-            inner: None,
-            ..self.clone()
-        })
     }
 
     /// 5.5.6: an `@context` that "is invalid" is BadRequestData. The term map
@@ -678,7 +664,9 @@ mod tests {
             "implicit": {"@type": "@id"}
         }));
         let rel = c.term("rel").unwrap();
-        assert!(rel.type_is_id && !rel.type_is_vocab && !rel.container_list);
+        assert!(rel.type_is_id);
+        assert!(!rel.type_is_vocab);
+        assert!(!rel.container_list);
         assert_eq!(rel.iri, "https://example.org/rel");
         assert!(c.term("kind").unwrap().type_is_vocab);
         assert!(c.term("items").unwrap().container_list);
@@ -996,5 +984,88 @@ mod tests {
                 "{noise}"
             );
         }
+    }
+
+    /// A Core document: `T` type-scopes `speed` (and two members a scope
+    /// skips), `p` property-scopes `name` through an array.
+    fn scoped() -> Context {
+        let mut c = Context::default();
+        c.merge_core_object(
+            json!({
+                "speed": "https://v.example/speed",
+                "T": {"@id": "https://v.example/T", "@context": {
+                    "speed": "https://v.example/s2",
+                    "skip": {"@type": "@id"},
+                    "num": 5
+                }},
+                "p": {"@id": "https://v.example/p", "@context": [{"name": "https://v.example/n2"}, 7]}
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .unwrap();
+        c.freeze();
+        c
+    }
+
+    #[test]
+    fn scopes_nest_and_skip_what_they_cannot_read() {
+        let c = scoped();
+        let t = c.within("https://v.example/T");
+        assert_eq!(t.expand_key("speed"), "https://v.example/s2");
+        assert_ne!(t.expand_key("skip"), "https://v.example/skip");
+        let both = t.within("https://v.example/p");
+        assert_eq!(both.expand_key("speed"), "https://v.example/s2");
+        assert_eq!(both.expand_key("name"), "https://v.example/n2");
+        // the outer `speed` is shadowed inside T, so it compacts by vocab or prefix
+        assert_ne!(t.compact_iri("https://v.example/speed"), "speed");
+        assert!(c.scope_of(&json!(5)).terms.is_empty());
+    }
+
+    /// One IRI under several terms: the inverse keeps the shortest, then the
+    /// first in order, whatever order the map iterates in.
+    #[test]
+    fn a_scope_inverse_keeps_the_shortest_term() {
+        let terms: HashMap<String, TermDef> = ["aaaa", "b", "cc", "ddd", "eeeee", "f"]
+            .into_iter()
+            .map(|t| {
+                (
+                    t.to_owned(),
+                    TermDef {
+                        iri: "https://v.example/x".into(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let scope = Scope::new(terms);
+        assert_eq!(
+            scope.inverse.get("https://v.example/x").map(String::as_str),
+            Some("b")
+        );
+    }
+
+    /// The IRI positions of term definitions: a prefix term, an object term
+    /// that is no prefix, an unknown or non-absolute prefix, a bare term, and
+    /// an absolute IRI as a term with no @id.
+    #[test]
+    fn term_definition_iris() {
+        let c = ctx(json!({
+            "ex": "https://example.org/",
+            "aobj": {"@id": "https://example.org/o"},
+            "list": {"@container": "@list"},
+            "a": "ex:x",
+            "b": "aobj:y",
+            "c": "1x:y",
+            "d": "ex",
+            "https://abs.example/q": {"@type": "@id"}
+        }));
+        assert_eq!(c.expand_key("a"), "https://example.org/x");
+        assert_eq!(c.expand_key("b"), "aobj:y");
+        assert_eq!(c.expand_key("c"), "1x:y", "no @vocab to put it under");
+        assert_eq!(c.expand_key("d"), "https://example.org/");
+        assert!(c
+            .term("https://abs.example/q")
+            .is_some_and(|d| d.type_is_id));
     }
 }

@@ -252,10 +252,17 @@ impl EgressPolicy {
             // not answer is a DENIAL: a destination the policy could not
             // check is never allowed through, and the request path never
             // waits on the resolver.
-            let addrs = tokio::time::timeout(dns_timeout, tokio::net::lookup_host((host, port)))
-                .await
-                .map_err(|_| format!("resolving {host}: timed out"))?
-                .map_err(|e| format!("resolving {host}: {e}"))?;
+            // `biased`: a deadline already passed wins over an answer that
+            // arrives in the same poll, so a zero bound always denies
+            let addrs = tokio::select! {
+                biased;
+                () = tokio::time::sleep(dns_timeout) => {
+                    return Err(format!("resolving {host}: timed out"));
+                }
+                found = tokio::net::lookup_host((host, port)) => {
+                    found.map_err(|e| format!("resolving {host}: {e}"))?
+                }
+            };
             for a in addrs {
                 if Self::ip_is_private(a.ip()) {
                     // The denial reaches the client verbatim in the RFC 7807
@@ -877,13 +884,11 @@ impl Loader {
                 // evicts the entry with the oldest lastUsage (RFC 3339
                 // strings order chronologically)
                 if map.len() >= MAX_USAGE_ENTRIES {
-                    if let Some(oldest) = map
+                    let oldest = map
                         .values()
                         .min_by(|a, b| a.last_usage.cmp(&b.last_usage))
-                        .map(|u| u.url.clone())
-                    {
-                        map.remove(&oldest);
-                    }
+                        .map(|u| u.url.clone());
+                    oldest.and_then(|url| map.remove(&url));
                 }
                 map.insert(
                     url.to_owned(),
@@ -1088,11 +1093,10 @@ impl Loader {
     /// from one Tenant's locally stored @context must not be handed to
     /// another.
     fn merged_hit_is_usable(&self, key: &str, tenant: Option<&TenantId>) -> bool {
-        match self.merged_urls.get(key) {
-            // the documents behind this entry are unknown: it can be shown
-            // neither fresh nor in-Tenant, so it is rebuilt
-            None => false,
-            Some(urls) => urls.iter().all(|url| match self.fetched.get(url) {
+        // the documents behind an entry with no URL list are unknown: it can
+        // be shown neither fresh nor in-Tenant, so it is rebuilt
+        self.merged_urls.get(key).is_some_and(|urls| {
+            urls.iter().all(|url| match self.fetched.get(url) {
                 Some(doc) => doc.serves(tenant) && !doc.is_stale(),
                 // Dropped from the document cache (it is a bounded LRU, and
                 // a locally stored @context is as evictable as any other):
@@ -1102,8 +1106,8 @@ impl Loader {
                 // context has no cache entry by design and belongs to no
                 // Tenant, so it never forces one.
                 None => Self::is_pinned_core(url),
-            }),
-        }
+            })
+        })
     }
 
     fn merge_entry<'a>(
@@ -1172,9 +1176,9 @@ impl Loader {
                         )));
                     }
                     let doc = self.fetch(&resolved, tenant).await?;
-                    if let Ok(mut u) = urls.lock() {
-                        u.push(resolved.clone());
-                    }
+                    urls.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(resolved.clone());
                     self.merge_entry(
                         ctx,
                         &doc,
@@ -1437,9 +1441,10 @@ impl Loader {
         let stale: Vec<String> = self
             .merged
             .iter()
-            .filter(|(key, _)| match self.merged_urls.get(key.as_str()) {
-                Some(urls) => urls.iter().any(|u| u == url),
-                None => true,
+            .filter(|(key, _)| {
+                self.merged_urls
+                    .get(key.as_str())
+                    .is_none_or(|urls| urls.iter().any(|u| u == url))
             })
             .map(|(key, _)| (*key).clone())
             .collect();
@@ -1532,7 +1537,8 @@ mod tests {
                 .expect("bind");
             let addr = listener.local_addr().expect("addr");
             tokio::spawn(async move {
-                while let Ok((mut sock, _)) = listener.accept().await {
+                loop {
+                    let (mut sock, _) = listener.accept().await.expect("accept");
                     use tokio::io::AsyncWriteExt;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/ld+json\r\nContent-Length: {}\r\n\r\n{body}",
@@ -1608,9 +1614,7 @@ mod tests {
         let seen = hops.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
-                };
+                let (mut sock, _) = listener.accept().await.expect("accept");
                 seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let resp = format!(
                     "HTTP/1.1 302 Found\r\nLocation: http://{addr}/loop\r\nContent-Length: 0\r\n\r\n"
@@ -1654,7 +1658,8 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let seen = hits.clone();
         tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
                 seen.fetch_add(1, Ordering::SeqCst);
                 // redirect to a private IP literal (self)
                 let resp = format!(
@@ -1695,30 +1700,18 @@ mod tests {
     // never be reached.
     #[tokio::test]
     async fn redirect_to_private_ipv6_literal_is_blocked() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
         let target = tokio::net::TcpListener::bind("[::1]:0")
             .await
             .expect("bind v6");
         let target_addr = target.local_addr().expect("addr");
-        let reached = Arc::new(AtomicUsize::new(0));
-        let hit = reached.clone();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = target.accept().await {
-                hit.fetch_add(1, Ordering::SeqCst);
-                use tokio::io::AsyncWriteExt;
-                let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                    .await;
-            }
-        });
 
         let entry = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let entry_addr = entry.local_addr().expect("addr");
         tokio::spawn(async move {
-            while let Ok((mut sock, _)) = entry.accept().await {
+            loop {
+                let (mut sock, _) = entry.accept().await.expect("accept");
                 let resp = format!(
                     "HTTP/1.1 302 Found\r\nLocation: http://[::1]:{}/internal\r\nContent-Length: 0\r\n\r\n",
                     target_addr.port()
@@ -1741,9 +1734,12 @@ mod tests {
             .await
             .expect("stop returns the 3xx, not an error");
         assert_eq!(resp.status().as_u16(), 302, "redirect was not followed");
-        assert_eq!(
-            reached.load(Ordering::SeqCst),
-            0,
+        // a connection the hop opened would sit in the backlog: accept
+        // returns it at once, so a timeout means nothing ever connected
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), target.accept())
+                .await
+                .is_err(),
             "the IPv6-literal hop was followed into loopback"
         );
     }
@@ -1886,7 +1882,8 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let served = body.clone();
         tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
                 use tokio::io::AsyncWriteExt;
                 let b = served.lock().expect("lock").clone();
                 let resp = match b {
@@ -1963,33 +1960,23 @@ mod tests {
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 // drain the request head: closing a socket with unread data
                 // pending sends RST, which discards body bytes the client
                 // has not consumed yet and turns the test nondeterministic
                 let mut reqbuf = vec![0u8; 4096];
                 let _ = sock.read(&mut reqbuf).await;
-                if sock
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: application/ld+json\r\nTransfer-Encoding: chunked\r\n\r\n",
-                    )
-                    .await
-                    .is_err()
-                {
-                    continue;
-                }
                 let chunk = vec![b'x'; 64 * 1024];
-                let head = format!("{:x}\r\n", chunk.len());
+                let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/ld+json\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
                 for _ in 0..128 {
-                    // stop early once the client hangs up (cap tripped)
-                    if sock.write_all(head.as_bytes()).await.is_err()
-                        || sock.write_all(&chunk).await.is_err()
-                        || sock.write_all(b"\r\n").await.is_err()
-                    {
-                        break;
-                    }
+                    resp.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                    resp.extend_from_slice(&chunk);
+                    resp.extend_from_slice(b"\r\n");
                 }
+                // the client hangs up once the cap trips, which fails the write
+                let _ = sock.write_all(&resp).await;
                 // no terminating 0-chunk: the connection just closes
             }
         });
@@ -2023,7 +2010,8 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let seen = hits.clone();
         tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 if seen.fetch_add(1, Ordering::SeqCst) == 0 {
                     // close before any response: reqwest reports a send
@@ -2070,7 +2058,8 @@ mod tests {
         let accepted = Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
         let seen = accepted.clone();
         tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let first = {
                     let mut at = seen.lock().expect("lock");
@@ -2120,7 +2109,8 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let seen = hits.clone();
         tokio::spawn(async move {
-            while let Ok((sock, _)) = listener.accept().await {
+            loop {
+                let (sock, _) = listener.accept().await.expect("accept");
                 seen.fetch_add(1, Ordering::SeqCst);
                 drop(sock);
             }
@@ -2156,7 +2146,8 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let seen = hits.clone();
         tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
                 seen.fetch_add(1, Ordering::SeqCst);
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 4096];
@@ -2281,7 +2272,8 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let served = body.clone();
         tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 4096];
                 let _ = sock.read(&mut buf).await;
@@ -2546,8 +2538,9 @@ mod tests {
             .check_host("ip6-localhost", 80)
             .await
             .expect_err("a name resolving into a private range is denied");
+        assert!(!err.contains("::1"), "leaked the resolved address: {err}");
         assert!(
-            !err.contains("::1") && !err.contains("127.0.0.1"),
+            !err.contains("127.0.0.1"),
             "leaked the resolved address: {err}"
         );
         for host in ["10.1.2.3", "127.0.0.1"] {
@@ -3011,5 +3004,290 @@ mod tests {
             );
         }
         assert!(!v18.contains_key("Snapshot"), "v1.8 predates Snapshot");
+    }
+}
+
+/// The broker-side hooks (hosted documents, shared usage rows, write-through)
+/// and the refusals on the wire, each on its own.
+#[cfg(test)]
+mod hooks {
+    use super::*;
+    use serde_json::json;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn tenant(name: &str) -> TenantId {
+        TenantId::new(name).expect("tenant")
+    }
+
+    /// A lookup hosting `docs` (url -> owner, @context value) while `served` lists the url.
+    fn hosting(
+        docs: Vec<(&'static str, Option<TenantId>, Value)>,
+        served: Arc<Mutex<HashSet<String>>>,
+    ) -> LocalLookup {
+        let docs = Arc::new(docs);
+        Arc::new(move |_, url| {
+            let found = docs
+                .iter()
+                .find(|(u, _, _)| *u == url)
+                .filter(|(u, _, _)| served.lock().expect("lock").contains(*u))
+                .map(|(_, owner, v)| (owner.clone(), v.clone()));
+            Box::pin(async move { found })
+        })
+    }
+
+    fn all(urls: &[&str]) -> Arc<Mutex<HashSet<String>>> {
+        Arc::new(Mutex::new(urls.iter().map(|u| (*u).to_owned()).collect()))
+    }
+
+    /// Answers the first connection with `response`, then closes it.
+    async fn answer_once(response: &'static [u8]) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(response).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_hosted_document_serves_its_owner_alone() {
+        let loader = Loader::new();
+        let (alpha, beta) = (tenant("alpha"), tenant("beta"));
+        let url = "http://h.example/a";
+        let doc = json!({"a": "https://t.example/a"});
+        loader.set_local_lookup(hosting(vec![(url, Some(alpha.clone()), doc)], all(&[url])));
+        let user = json!(url);
+        let ctx = loader.resolve_for(&alpha, &user).await.expect("the owner");
+        assert_eq!(ctx.expand_key("a"), "https://t.example/a");
+        assert!(loader.resolve_quiet_for(&alpha, &user).await.is_ok());
+        assert!(
+            loader.resolve_for(&beta, &user).await.is_err(),
+            "another Tenant"
+        );
+        assert!(loader.resolve(&user).await.is_err(), "no Tenant");
+        let fresh = Loader::new();
+        fresh.set_local_lookup(hosting(
+            vec![(url, Some(alpha.clone()), json!({}))],
+            all(&[url]),
+        ));
+        assert!(
+            fresh.resolve_for(&beta, &user).await.is_err(),
+            "another Tenant, cold"
+        );
+        assert!(loader
+            .resolve_quiet(&json!({"q": "https://t.example/q"}))
+            .await
+            .is_ok());
+    }
+
+    /// A usage row deleted through another instance: the warm copy is not
+    /// served, the resolution rebuilds, and a counted use re-creates the row.
+    #[tokio::test]
+    async fn a_row_gone_elsewhere_is_rebuilt_and_counted_once() {
+        let loader = Loader::new();
+        let (a, b) = ("http://h.example/a", "http://h.example/b");
+        loader.set_local_lookup(hosting(
+            vec![
+                (a, None, json!({"a": "https://t.example/a"})),
+                (b, None, json!({"b": "https://t.example/b"})),
+            ],
+            all(&[a, b]),
+        ));
+        let gone: Arc<Mutex<HashSet<String>>> = Arc::default();
+        let bumps: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (g, seen) = (Arc::clone(&gone), Arc::clone(&bumps));
+        loader.set_usage_bump(Arc::new(move |_, url| {
+            seen.lock().expect("lock").push(url.to_owned());
+            let exists = !g.lock().expect("lock").contains(url);
+            Box::pin(async move { exists })
+        }));
+        let user = json!([a, b]);
+        loader.resolve(&user).await.expect("first");
+        gone.lock().expect("lock").insert(b.to_owned());
+        bumps.lock().expect("lock").clear();
+        let ctx = loader.resolve(&user).await.expect("rebuilt");
+        assert_eq!(ctx.expand_key("b"), "https://t.example/b");
+        let seen = bumps.lock().expect("lock").clone();
+        assert_eq!(seen.iter().filter(|u| *u == a).count(), 1, "{seen:?}");
+        assert!(seen.iter().filter(|u| *u == b).count() >= 2, "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_fetch_is_written_through() {
+        let addr = answer_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/ld+json\r\nContent-Length: 30\r\n\r\n{\"@context\":{\"w\":\"https://w\"}}",
+        )
+        .await;
+        let loader = Loader::with_policy(EgressPolicy {
+            allow_private: true,
+        });
+        let written: Arc<Mutex<Vec<String>>> = Arc::default();
+        let w = Arc::clone(&written);
+        loader.set_cache_writer(Arc::new(move |_, url, _| {
+            w.lock().expect("lock").push(url.to_owned());
+            Box::pin(async {})
+        }));
+        let url = format!("http://{addr}/w.jsonld");
+        loader.resolve(&json!(url)).await.expect("fetched");
+        assert_eq!(*written.lock().expect("lock"), vec![url]);
+    }
+
+    #[tokio::test]
+    async fn a_seeded_copy_is_found_by_its_local_id_until_removed() {
+        let loader = Loader::default();
+        let url = "http://h.example/s";
+        loader
+            .seed_cached(
+                url,
+                "local-1",
+                "2026-01-01T00:00:00Z",
+                json!({"s": "https://t.example/s"}),
+            )
+            .await;
+        assert_eq!(
+            loader.usage_get("local-1").await.map(|u| u.url),
+            Some(url.to_owned())
+        );
+        let ctx = loader.resolve(&json!(url)).await.expect("seeded");
+        assert_eq!(ctx.expand_key("s"), "https://t.example/s");
+        loader.usage_remove(url).await;
+        assert!(loader.usage_get("local-1").await.is_none());
+        loader.evict(url).await;
+    }
+
+    #[tokio::test]
+    async fn references_and_entries() {
+        let loader = Loader::new();
+        let (dir, rel) = ("http://h.example/d/a", "http://h.example/d/b");
+        loader.set_local_lookup(hosting(
+            vec![
+                (dir, None, json!(["b", {"x": "https://t.example/x"}])),
+                (rel, None, json!({"r": "https://t.example/r"})),
+                ("http://h.example/bad", None, json!(["//[bad"])),
+            ],
+            all(&[dir, rel, "http://h.example/bad"]),
+        ));
+        let ctx = loader
+            .resolve(&json!([null, dir]))
+            .await
+            .expect("relative to its document");
+        assert_eq!(ctx.expand_key("r"), "https://t.example/r");
+        for (user, status) in [
+            (json!("relative.jsonld"), 504),
+            (json!([5]), 400),
+            (json!("http://h.example/bad"), 504),
+        ] {
+            let err = loader.resolve(&user).await.expect_err("refused");
+            assert_eq!(err.status(), status, "{user}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refusals_on_the_wire() {
+        let deny = Loader::with_policy(EgressPolicy {
+            allow_private: false,
+        });
+        for url in ["http://127.0.0.1:1/x", "https://127.0.0.1:1/x"] {
+            assert!(deny.resolve(&json!(url)).await.is_err(), "private {url}");
+        }
+        let open = Loader::with_policy(EgressPolicy {
+            allow_private: true,
+        });
+        assert!(open
+            .refetch("http://127.0.0.1:9/never-cached")
+            .await
+            .is_err());
+        let huge = answer_once(b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n").await;
+        let err = open
+            .resolve(&json!(format!("http://{huge}/h")))
+            .await
+            .expect_err("too large");
+        assert!(err.to_string().contains("too large"), "{err}");
+        let cut = answer_once(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"@context\"").await;
+        let err = open
+            .resolve(&json!(format!("http://{cut}/c")))
+            .await
+            .expect_err("cut short");
+        assert!(err.to_string().contains("reading"), "{err}");
+        // a redirect loop is an answer of its own and is not asked twice
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.expect("accept");
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{addr}/l\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let err = open
+            .resolve(&json!(format!("http://{addr}/l")))
+            .await
+            .expect_err("a loop");
+        assert!(err.to_string().contains("fetching"), "{err}");
+    }
+
+    #[test]
+    fn cache_headers() {
+        assert_eq!(
+            ttl_from_headers(Some("no-cache"), None),
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(ttl_from_headers(Some("max-age=soon"), None), None);
+    }
+
+    #[test]
+    fn private_and_mapped_addresses() {
+        for ip in [
+            "169.254.1.1",
+            "192.0.0.8",
+            "198.18.0.1",
+            "198.19.0.1",
+            "::1",
+            "::",
+            "fc00::1",
+        ] {
+            let ip: std::net::IpAddr = ip.parse().expect("ip");
+            assert!(EgressPolicy::ip_is_private(ip), "{ip}");
+        }
+        for ip in [
+            "198.20.0.1",
+            "192.0.1.1",
+            "192.1.0.1",
+            "64:ff9b:1::808:808",
+            "64:ff9b::1:0:0:808:808",
+            "64:1::1",
+        ] {
+            let ip: std::net::IpAddr = ip.parse().expect("ip");
+            assert!(!EgressPolicy::ip_is_private(ip), "{ip}");
+        }
+        allow_private_egress(false);
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_denies() {
+        let deny = EgressPolicy {
+            allow_private: false,
+        };
+        assert!(deny
+            .check_host_within("", 443, std::time::Duration::from_secs(5))
+            .await
+            .is_err());
+        assert!(
+            deny.check_host("8.8.8.8", 443).await.is_ok(),
+            "a public literal needs no lookup"
+        );
     }
 }

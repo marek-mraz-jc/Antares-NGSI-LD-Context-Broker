@@ -243,3 +243,115 @@ function = "Internal::serve" # v0 mangling puts the impl between the crate and t
 lines = 21
 branches = 0
 reason = "2 lines: the grant store failing, which the built-in store under test_kit does not (module rule M2). 19 lines: the four tracing::info!/warn! of a forward made or not made repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/icsr_log.rs and icsr_gate.rs cover the subscriber path and assert what they log"
+
+[[exclusion]]
+crate = "ngsild-ql"
+file = "src/eval.rs"
+function = "ngsild_ql::eval::compare"
+lines = 1
+branches = 0
+reason = "the List and Range arm of the final match: both are answered by the unfold guards at the top of the function, and the match must still name them to be exhaustive"
+
+[[exclusion]]
+crate = "ngsild-ql"
+file = "src/regex.rs"
+function = "ngsild_ql::regex::compile"
+lines = 1
+branches = 1
+reason = "a poisoned cache lock (a panic while a writer held it) degrades to compile-every-time; no test can poison the private lock"
+
+[[exclusion]]
+crate = "ngsild-ql"
+file = "src/regex.rs"
+function = "ngsild_ql::regex::q_node"
+lines = 1
+branches = 1
+reason = "a poisoned cache lock (a panic while a writer held it) degrades to parse-every-time; no test can poison the private lock"
+
+[[exclusion]]
+crate = "ngsild-ql"
+file = "src/regex.rs"
+function = "ngsild_ql::regex::geo_query"
+lines = 1
+branches = 1
+reason = "a poisoned cache lock (a panic while a writer held it) degrades to build-every-time; no test can poison the private lock"
+
+[[exclusion]]
+crate = "ngsild-ql"
+file = "src/sql.rs"
+function = "ngsild_ql::sql::literal"
+lines = 1
+branches = 1
+reason = "f64's Display never writes an exponent; the guard keeps an exponent form out of the jsonpath should that ever change"
+
+[[exclusion]]
+crate = "ngsild-jsonld"
+file = "src/expand.rs"
+function = "ngsild_jsonld::expand::expand_instance"
+lines = 3
+branches = 0
+reason = "the InternalError arm for an attribute type without an expansion arm: every member of ATTR_TYPES and every inferred type has one; every_declarable_attribute_type_is_dispatched_not_unreachable pins it"
+
+[[exclusion]]
+crate = "ngsild-jsonld"
+file = "src/loader.rs"
+function = "ngsild_jsonld::loader::slow_factor"
+lines = 1
+branches = 1
+reason = "ANTARES_TEST_SANITIZER is set by the strict workflow's sanitizer job alone; setting it here would slow every test beside this one"
+
+[[exclusion]]
+crate = "ngsild-jsonld"
+file = "src/loader.rs"
+function = "EgressPolicy::from_env"
+lines = 0
+branches = 1
+reason = "ANTARES_EGRESS_ALLOW_PRIVATE is process environment; a test setting it races every policy built beside it (allow_private_from is tested on its own)"
+
+[[exclusion]]
+crate = "ngsild-jsonld"
+file = "src/loader.rs"
+function = "EgressPolicy::ip_is_private"
+lines = 0
+branches = 2
+reason = "::1 and :: are IPv4-compatible spellings (0.0.0.1, 0.0.0.0), so embedded_v4 denies them before the IPv6 checks; kept as the IPv6 statement of the rule"
+
+[[exclusion]]
+crate = "ngsild-jsonld"
+file = "src/loader.rs"
+function = "EgressPolicy::check_host_within"
+lines = 2
+branches = 1
+reason = "a name that resolves to a public address: the tests run without a resolver that answers one"
+
+[[exclusion]]
+crate = "ngsild-jsonld"
+file = "src/loader.rs"
+function = "ngsild_jsonld::loader::client_builder"
+lines = 7
+branches = 4
+reason = "a redirect hop whose host is not an IP literal, or a public literal, needs a resolver or the internet; ANTARES_EXTRA_CA_FILE is process environment read at client build, which a test cannot set without racing every client built beside it"
+
+[[exclusion]]
+crate = "ngsild-jsonld"
+file = "src/loader.rs"
+function = "Loader::resolve_counted"
+lines = 1
+branches = 1
+reason = "1 line: the core @context is compiled in (every_pinned_context_parses_and_carries_an_at_context). 1 branch: a hosted row that vanishes between the bump and the refetch falls to the network, which the tests do not reach"
+
+[[exclusion]]
+crate = "ngsild-jsonld"
+file = "src/loader.rs"
+function = "Loader::fetch"
+lines = 2
+branches = 2
+reason = "the 10 s whole-interaction deadline, which a test would wait out, and the post-read size check that only the wasm32 path (body read whole) can trip"
+
+[[exclusion]]
+crate = "ngsild-jsonld"
+file = "src/pinned.rs"
+function = "ngsild_jsonld::pinned::resolve_with"
+lines = 1
+branches = 0
+reason = "the core @context is compiled in (every_pinned_context_parses_and_carries_an_at_context)"

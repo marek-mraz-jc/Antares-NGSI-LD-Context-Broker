@@ -634,3 +634,31 @@ mod tests {
         assert!(got.binds[0].contains(r#""x\u0001 y""#), "{}", got.binds[0]);
     }
 }
+
+/// The arms the pushdown tests above leave: plain existence, the two lower
+/// orderings, and the literals no compiled term reaches.
+#[cfg(test)]
+mod arms {
+    use super::*;
+    use crate::parse_q;
+
+    fn c(q: &str) -> Option<CompiledSql> {
+        compile_q(&parse_q(q).expect("parse"), "entity", 2, &|t: &str| {
+            t.to_owned()
+        })
+    }
+
+    #[test]
+    fn existence_and_the_lower_orderings_compile() {
+        assert!(c("temperature").is_some_and(|got| !got.sql.starts_with("NOT")));
+        assert!(c("t<1").is_some_and(|got| got.binds.iter().any(|b| b.ends_with("? (@ < 1)"))));
+        assert!(c("t<=1").is_some_and(|got| got.binds.iter().any(|b| b.ends_with("? (@ <= 1)"))));
+    }
+
+    #[test]
+    fn literals_outside_the_subset() {
+        assert_eq!(literal(&QValue::Bool(true)).as_deref(), Some("true"));
+        assert_eq!(literal(&QValue::List(Vec::new())), None);
+        assert_eq!(quoted("a\r\tb"), r#""a\r\tb""#);
+    }
+}

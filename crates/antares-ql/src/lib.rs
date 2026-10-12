@@ -748,6 +748,15 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
 
+    /// `attr==value`, as the parser builds it.
+    fn eq(attr: &str, value: QValue) -> QNode {
+        QNode::Cmp {
+            path: QPath::dotted(vec![attr.to_owned()]),
+            op: CmpOp::Eq,
+            value,
+        }
+    }
+
     /// RFC 3986 2.1: "%" and exactly two hex digits; anything shorter or
     /// signed stays as written, at the end of the input too (T-3468: the
     /// decoder walks the bytes without indexing past them).
@@ -801,10 +810,7 @@ mod tests {
             ("x==1e", QValue::Str("1e".into())),
             ("x==-", QValue::Str("-".into())),
         ] {
-            let QNode::Cmp { value, .. } = parse_q(q).expect(q) else {
-                panic!("{q} is a comparison");
-            };
-            assert_eq!(value, want, "{q}");
+            assert_eq!(parse_q(q).expect(q), eq("x", want), "{q}");
         }
     }
 
@@ -862,13 +868,8 @@ mod tests {
     fn and_or_precedence() {
         // `a==1;b==2|c==3` == (a AND b) OR c per grammar: OR binds looser
         let q = parse_q("a==1;b==2|c==3").expect("parse");
-        match q {
-            QNode::Or(items) => {
-                assert_eq!(items.len(), 2);
-                assert!(matches!(items[0], QNode::And(_)));
-            }
-            other => panic!("expected Or, got {other:?}"),
-        }
+        let and = parse_q("a==1;b==2").expect("parse");
+        assert_eq!(q, QNode::Or(vec![and, parse_q("c==3").expect("parse")]));
     }
 
     #[test]
@@ -1062,10 +1063,7 @@ mod tests {
             (r#"a=="""#, ""),
         ] {
             let node = parse_q(q).unwrap_or_else(|e| panic!("{q}: {e:?}"));
-            let QNode::Cmp { value, .. } = node else {
-                panic!("{q}: expected a comparison")
-            };
-            assert_eq!(value, QValue::Str(want.to_owned()), "{q}");
+            assert_eq!(node, eq("a", QValue::Str(want.to_owned())), "{q}");
         }
     }
 
@@ -1079,13 +1077,11 @@ mod tests {
             "an escaped quote leaves the string open"
         );
         let node = parse_q(r#"a=="ends with a backslash\\";b"#).expect("parses");
-        let QNode::And(items) = node else {
-            panic!("expected an And")
-        };
-        let QNode::Cmp { value, .. } = &items[0] else {
-            panic!("expected a comparison")
-        };
-        assert_eq!(value, &QValue::Str("ends with a backslash\\".to_owned()));
+        let value = QValue::Str("ends with a backslash\\".to_owned());
+        assert_eq!(
+            node,
+            QNode::And(vec![eq("a", value), parse_q("b").expect("parse")])
+        );
     }
 
     /// An escape RFC 8259 does not define is not a String, so the term is
@@ -1131,10 +1127,8 @@ mod complexity_tests {
             .map(|i| format!("a{i}==1"))
             .collect::<Vec<_>>()
             .join(";");
-        match parse_q(&huge) {
-            Err(NgsiError::TooComplexQuery(_)) => {}
-            other => panic!("expected TooComplexQuery, got {other:?}"),
-        }
+        let err = parse_q(&huge).unwrap_err();
+        assert_eq!(err.status(), 403, "TooComplexQuery: {err}");
     }
 
     /// Regression: the parser once recursed per `(` with
@@ -1308,18 +1302,23 @@ mod complexity_tests {
     /// and a `..` past the next separator belongs to the next term.
     #[test]
     fn unquoted_scalars_and_where_a_range_stops() {
-        let QNode::Cmp { value, .. } = parse_q("a==false").expect("parse") else {
-            unreachable!("a comparison")
-        };
-        assert_eq!(value, QValue::Bool(false));
+        assert_eq!(
+            parse_q("a==false").expect("parse"),
+            QNode::Cmp {
+                path: QPath::dotted(vec!["a".to_owned()]),
+                op: CmpOp::Eq,
+                value: QValue::Bool(false)
+            }
+        );
         assert!(parse_q("a==").is_err());
         assert!(parse_q("a==;b==1").is_err());
         let range = parse_q("a==1;b==2..3").expect("parse");
         assert_eq!(range, parse_q("(a==1);(b==2..3)").expect("parse"));
-        let QNode::And(terms) = range else {
-            unreachable!("an And")
-        };
-        assert_eq!(terms.len(), 2);
+        let terms = vec![
+            parse_q("a==1").expect("parse"),
+            parse_q("b==2..3").expect("parse"),
+        ];
+        assert_eq!(range, QNode::And(terms));
     }
 
     /// The byte ceiling is inclusive: MAX_Q_BYTES parses, one more is
@@ -1490,5 +1489,19 @@ mod complexity_tests {
             parse_q(&nested(MAX_Q_DEPTH + 1)),
             Err(NgsiError::TooComplexQuery(_))
         ));
+    }
+}
+
+/// The two parser refusals no clause test reaches.
+#[cfg(test)]
+mod refusals {
+    use super::*;
+
+    #[test]
+    fn hints_without_a_colon_and_an_open_pattern_are_refused() {
+        let err = parse_q("sensor{Device,Camera.humidity}==1").unwrap_err();
+        assert!(err.to_string().contains("expected ':'"), "{err}");
+        let err = parse_q(r#"a~="open"#).unwrap_err();
+        assert!(err.to_string().contains("unterminated string"), "{err}");
     }
 }

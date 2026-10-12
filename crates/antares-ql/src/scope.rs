@@ -377,3 +377,13 @@ mod clause_4_19 {
         assert_eq!(check_scope_q(&long).unwrap_err().status(), 403);
     }
 }
+
+#[cfg(test)]
+mod shapes {
+    /// A `scope` that is neither an array nor a string carries no scope.
+    #[test]
+    fn a_scalar_scope_is_no_scope() {
+        let doc = serde_json::json!({"id": "urn:x", "scope": 5});
+        assert!(!super::scope_matches("/a", &doc));
+    }
+}

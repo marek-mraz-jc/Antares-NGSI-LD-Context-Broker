@@ -98,15 +98,19 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
             order.retain(|k| k != &key);
             return;
         }
-        while held.saturating_add(weight) > self.cap {
-            let Some(at) = order.iter().position(|k| k != &key) else {
-                break;
-            };
-            if let Some(old) = order.remove(at) {
-                if let Some((_, w)) = map.remove(&old) {
-                    *held = held.saturating_sub(w);
-                }
-            }
+        // held weighs the keys other than `key`, so while it is over the cap
+        // there is another key to evict; the position is still checked, so a
+        // broken invariant ends the loop instead of spinning under the lock
+        while let Some(at) = order
+            .iter()
+            .position(|k| k != &key)
+            .filter(|_| held.saturating_add(weight) > self.cap)
+        {
+            let w = order
+                .remove(at)
+                .and_then(|old| map.remove(&old))
+                .map_or(0, |(_, w)| w);
+            *held = held.saturating_sub(w);
         }
         if !order.contains(&key) {
             order.push_back(key.clone());

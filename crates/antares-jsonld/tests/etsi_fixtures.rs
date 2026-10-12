@@ -74,15 +74,18 @@ fn the_suite_fixtures_expand_and_its_negative_ones_are_refused() {
             ..ExpandOpts::default()
         };
         match expand_entity(&doc, &ctx, opts) {
-            Ok(_) if !negative => ok += 1,
-            Err(e) if negative => {
+            Ok(_) => {
+                assert!(!negative, "{name}: a negative fixture expanded");
+                ok += 1;
+            }
+            Err(e) => {
+                assert!(negative, "{name}: {e}");
                 assert_eq!(e.status(), 400, "{name}: {e}");
                 assert_eq!(e.to_problem_details().title, "BadRequestData", "{name}");
                 refused += 1;
             }
-            Ok(_) => panic!("{name}: a negative fixture expanded"),
-            Err(e) => panic!("{name}: {e}"),
         }
     }
-    assert!(ok > 60 && refused >= 8, "{ok} expanded, {refused} refused");
+    assert!(ok > 60, "{ok} expanded");
+    assert!(refused >= 8, "{refused} refused");
 }

@@ -903,10 +903,7 @@ mod clause_4_9_extensions {
             Some("category"),
             &ctx(),
         );
-        match ast {
-            QNode::Cmp { value, .. } => assert_eq!(value, QValue::Str("commercial".into())),
-            other => panic!("unexpected {other:?}"),
-        }
+        assert_eq!(ast, parse_q(r#"other=="commercial""#).expect("parse"));
     }
 
     /// 4.9 EXAMPLE 13/14: linked entity subquery attr{[Type:]path} follows
@@ -1113,6 +1110,8 @@ mod bounds_and_patterns {
             "((((a{1000}){1000}){1000}){1000})".to_owned(),
             format!("(?:{})", "a{255}".repeat(64)),
             format!("{}a", "(".repeat(200)) + &")".repeat(200),
+            // and one the parser refuses outright: the trailing quote
+            "a\"".to_owned(),
         ];
         let started = std::time::Instant::now();
         for p in bombs {
@@ -1229,9 +1228,8 @@ mod bounds_and_patterns {
             "type": [format!("{DC}Vehicle")],
             format!("{DC}speed"): [{"type": "Property", "unitCode": "KMH"}],
         });
-        assert!(!eval_q(&parse_q("speed").expect("q"), &bare, &ctx, &|_| {
-            None
-        }));
+        let none = |_: &str| None;
+        assert!(!eval_q(&parse_q("speed").expect("q"), &bare, &ctx, &none));
     }
 
     /// 4.9 logical operators: `|` is OR, `;` is AND, `!` negates existence.
@@ -1437,10 +1435,9 @@ mod tests {
             })
         };
         let ast = parse_q(r#"color!="red""#).expect("q");
+        let none = |_: &str| None;
         assert!(
-            eval_q(&ast, &mk(json!(["blue", "black", "green"])), &ctx, &|_| {
-                None
-            }),
+            eval_q(&ast, &mk(json!(["blue", "black", "green"])), &ctx, &none),
             "no element equals red ⇒ matches"
         );
         assert!(
@@ -1645,5 +1642,105 @@ mod temporal_keys {
             Some("a")
         );
         assert_eq!(expansion_list(Some("a"), Some(" a ")), None);
+    }
+}
+
+/// The arms the clause tests above do not reach: shapes a stored entity or a
+/// hand-built QPath can carry, and the operator/value pairs the parser never
+/// emits, each asked of the private function that owns the arm.
+#[cfg(test)]
+mod arms {
+    use super::*;
+    use crate::parse_q;
+    use serde_json::json;
+
+    fn ctx() -> std::sync::Arc<Context> {
+        crate::test_core()
+    }
+
+    /// An internal entity whose one attribute `attr` holds `instances`.
+    fn doc(attr: &str, instances: Value) -> Value {
+        let mut m = serde_json::Map::new();
+        m.insert("id".into(), json!("urn:x"));
+        m.insert(ctx().expand_key(attr), instances);
+        Value::Object(m)
+    }
+
+    fn q(doc: &Value, q: &str) -> bool {
+        let none = |_: &str| None;
+        eval_q(&parse_q(q).expect(q), doc, &ctx(), &none)
+    }
+
+    #[test]
+    fn linked_hops_read_object_and_object_list() {
+        let device = doc("humidity", json!([{"value": 40}]));
+        let lookup = |id: &str| (id == "urn:d").then(|| device.clone());
+        let station = doc("sensor", json!([{"object": 5}, {"objectList": ["urn:d"]}]));
+        let ast = parse_q("sensor{humidity}==40").expect("q");
+        assert!(eval_q(&ast, &station, &ctx(), &lookup), "objectList");
+        let elsewhere = doc("other", json!([{"object": "urn:d"}]));
+        assert!(!eval_q(&ast, &elsewhere, &ctx(), &lookup), "no such hop");
+        let empty = QPath::dotted(Vec::new());
+        assert!(resolve_targets(&station, &empty, &ctx()).is_empty());
+    }
+
+    #[test]
+    fn value_paths_and_brackets() {
+        let bare = doc("temperature", json!([{"type": "Property"}]));
+        assert!(!q(&bare, "temperature.a==1"), "no value to navigate");
+        let nested = doc("temperature", json!([{"value": {"a": {"b": 1}}}]));
+        assert!(q(&nested, "temperature.a[b]==1"));
+        assert!(!q(&nested, "temperature.a[c]==1"));
+        let several = doc("v", json!([{"value": [{"a": [1, 2]}, {"a": 3}]}]));
+        assert!(q(&several, "v[a]==2"));
+        assert!(q(&doc("category", json!([{"vocab": 5}])), "category==5"));
+    }
+
+    #[test]
+    fn language_map_filters() {
+        let name = doc(
+            "name",
+            json!([{"languageMap": {"en": ["a", "b"], "fr": "c"}}]),
+        );
+        assert!(q(&name, r#"name[*]=="b""#));
+        assert!(q(&name, r#"name[*]=="c""#));
+        assert!(!q(&name, r#"name[de]=="a""#));
+        assert!(!q(&name, r#"name[en.x]=="a""#), "one language, not a path");
+        let flat = doc("name", json!([{"languageMap": "a"}]));
+        assert!(!q(&flat, r#"name[en]=="a""#));
+    }
+
+    #[test]
+    fn operator_and_value_pairs_the_parser_never_emits() {
+        let (n, s) = (QValue::Num, |v: &str| QValue::Str(v.into()));
+        assert!(same_datatype(&json!(1), &QValue::List(Vec::new())));
+        assert!(!compare(
+            &json!(1),
+            CmpOp::Gt,
+            &QValue::List(vec![n(0.0)]),
+            None
+        ));
+        let range = QValue::Range(Box::new(n(0.0)), Box::new(n(2.0)));
+        assert!(!compare(&json!(1), CmpOp::Gt, &range, None));
+        assert!(!compare(&json!(true), CmpOp::Gt, &QValue::Bool(true), None));
+        assert!(!in_range(&json!(1), &n(0.0), &s("a")));
+        assert!(!num_cmp(1.0, CmpOp::Pattern, 1.0));
+    }
+
+    #[test]
+    fn a_time_and_a_date_time_order_as_strings() {
+        let (t, dt) = ("12:00:00Z", "2020-01-01T00:00:00Z");
+        let s = |v: &str| QValue::Str(v.into());
+        assert!(!compare(&json!(t), CmpOp::Gt, &s(dt), None));
+        assert!(!in_range(&json!(t), &s(dt), &s("2021-01-01T00:00:00Z")));
+        assert!(!in_range(
+            &json!("2019-01-01T00:00:00Z"),
+            &s(dt),
+            &s("2021-01-01T00:00:00Z")
+        ));
+        assert_eq!(temporal_key("2020-01-01T00:00:00.1234567Z"), None);
+        assert_eq!(temporal_key("12:00:00.x1Z"), None);
+        assert_eq!(temporal_key("noonZ"), None);
+        assert_eq!(temporal_key("12:00:00.1234567Z"), None);
     }
 }

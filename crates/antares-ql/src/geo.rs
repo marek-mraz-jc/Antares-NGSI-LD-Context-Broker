@@ -967,3 +967,83 @@ mod clause_4_10_grammar {
         }
     }
 }
+
+/// Each refusal of [`GeoQuery::from_params`] on its own, and a query naming
+/// its own `geoproperty`.
+#[cfg(test)]
+mod refusals {
+    use super::*;
+    use serde_json::json;
+
+    fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut p: HashMap<String, String> = [
+            ("georel", "near;maxDistance==5"),
+            ("geometry", "Point"),
+            ("coordinates", "[8,40]"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        for (k, v) in pairs {
+            p.insert((*k).to_owned(), (*v).to_owned());
+        }
+        p
+    }
+
+    #[test]
+    fn each_refusal_names_its_cause() {
+        for (pairs, cause) in [
+            (
+                vec![("georel", "near;maxDistance==far")],
+                "invalid maxDistance",
+            ),
+            (
+                vec![("georel", "near;minDistance==1;maxDistance==5")],
+                "single distance",
+            ),
+            (
+                vec![("georel", "near;closeTo==1")],
+                "invalid georel modifier",
+            ),
+            (
+                vec![("georel", "near")],
+                "requires maxDistance or minDistance",
+            ),
+            (vec![("geometry", "Circle")], "invalid geometry"),
+            (vec![("coordinates", "[8,")], "invalid coordinates"),
+            (vec![("coordinates", "8")], "must be a JSON array"),
+        ] {
+            let err = GeoQuery::from_params(&params(&pairs)).unwrap_err();
+            assert!(err.to_string().contains(cause), "{pairs:?}: {err}");
+        }
+        let mut p = params(&[]);
+        p.remove("geometry");
+        assert!(GeoQuery::from_params(&p)
+            .unwrap_err()
+            .to_string()
+            .contains("requires geometry"));
+        let mut p = params(&[]);
+        p.remove("coordinates");
+        assert!(GeoQuery::from_params(&p)
+            .unwrap_err()
+            .to_string()
+            .contains("requires coordinates"));
+    }
+
+    #[test]
+    fn a_scalar_among_positions_counts_none() {
+        assert_eq!(count_positions(&json!([[1, 2], 3])), 1);
+    }
+
+    #[test]
+    fn a_named_geoproperty_is_the_target() {
+        let ctx = crate::test_core();
+        let g = GeoQuery::from_params(&params(&[("geoproperty", "spot")]))
+            .unwrap()
+            .unwrap();
+        let point =
+            json!([{"type": "GeoProperty", "value": {"type": "Point", "coordinates": [8, 40]}}]);
+        assert!(g.matches(&json!({ ctx.expand_key("spot"): point }), &ctx));
+        assert!(!g.matches(&json!({ LOCATION_IRI: point }), &ctx));
+    }
+}

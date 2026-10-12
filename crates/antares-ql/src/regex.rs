@@ -107,9 +107,13 @@ fn evict_lru_half<V>(map: &mut HashMap<Box<str>, Entry<V>>) {
     stamps.sort_unstable();
     // `keep` newest survive; a tie on the boundary stamp keeps both, which
     // costs at most a few entries over the half and never a bound.
-    let Some(&cut) = stamps.len().checked_sub(keep).and_then(|i| stamps.get(i)) else {
-        return;
-    };
+    // `keep` is at least one and at most the length, so the index is in range; 0 would keep all
+    let cut = stamps
+        .len()
+        .checked_sub(keep)
+        .and_then(|i| stamps.get(i))
+        .copied()
+        .unwrap_or(0);
     map.retain(|_, e| e.1.load(Ordering::Relaxed) >= cut);
 }
 
@@ -595,5 +599,32 @@ mod tests {
             cached("shared-c").is_some(),
             "a hot pattern survives concurrent use"
         );
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod geo_cache {
+    use super::*;
+
+    /// A full geoquery cache halves before it takes one more.
+    #[test]
+    fn a_full_cache_evicts_before_it_inserts() {
+        let _serial = serial_lock();
+        let params: HashMap<String, String> = [
+            ("georel", "near;maxDistance==5"),
+            ("geometry", "Point"),
+            ("coordinates", "[8,40]"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let gq = crate::geo::GeoQuery::from_params(&params)
+            .expect("valid")
+            .expect("a query");
+        for i in 0..=MAX_REGEX_CACHE {
+            assert!(geo_query(&format!("geo-cache-{i}"), || Some(gq.clone())).is_some());
+        }
+        let len = GEO_CACHE.read().map(|c| c.len()).unwrap_or(usize::MAX);
+        assert!(len <= MAX_REGEX_CACHE, "{len}");
     }
 }

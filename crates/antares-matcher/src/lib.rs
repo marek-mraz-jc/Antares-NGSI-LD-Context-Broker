@@ -483,4 +483,46 @@ mod tests {
             "a \"*\" type does not widen an id that was given"
         );
     }
+
+    /// The selector and condition edges: a 4.17 type expression, an `id`
+    /// that is neither a string nor an array, a `q` or `geoQ` that does not
+    /// parse (a stored Subscription never matches on a condition it cannot
+    /// read), and `geoQ.coordinates` given as a JSON array or left out.
+    #[test]
+    fn selector_and_condition_edges() {
+        let c = ctx();
+        let none = |_: &str| None;
+        let doc = vehicle(30.0, -3.7);
+        let car = format!("{DC}/Vehicle");
+        let with = |sel: Value| json!({"entities": [sel]});
+        assert!(selector_match(
+            &with(json!({"type": format!("Bus|{car}")})),
+            &doc,
+            &c
+        ));
+        assert!(!selector_match(
+            &with(json!({"type": "Bus|Tram"})),
+            &doc,
+            &c
+        ));
+        assert!(!selector_match(
+            &with(json!({"type": car, "id": 7})),
+            &doc,
+            &c
+        ));
+
+        let mut s = sub();
+        s["q"] = json!("speed==");
+        assert!(!conditions_match(&s, &doc, &c, &none), "an unreadable q");
+        let mut s = sub();
+        s["geoQ"] = json!({"georel": "near;maxDistance==2000", "geometry": "Point",
+                           "coordinates": "[nope]"});
+        assert!(!conditions_match(&s, &doc, &c, &none), "an unreadable geoQ");
+
+        let array = json!({"georel": "within", "geometry": "Point", "coordinates": [1, 2]});
+        let p = geo_params(array.as_object().expect("object"));
+        assert_eq!(p.get("coordinates").map(String::as_str), Some("[1,2]"));
+        let bare = json!({"georel": "within"});
+        assert!(!geo_params(bare.as_object().expect("object")).contains_key("coordinates"));
+    }
 }

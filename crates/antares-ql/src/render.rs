@@ -113,7 +113,23 @@ impl fmt::Display for QValue {
 
 #[cfg(test)]
 mod tests {
-    use crate::{parse_q, QNode, QPath, QValue};
+    use crate::{parse_q, CmpOp, QNode, QPath, QValue};
+
+    #[test]
+    fn every_operator_renders_as_written() {
+        for q in [
+            "a==1",
+            "a!=1",
+            "a>1",
+            "a>=1",
+            "a<1",
+            "a<=1",
+            r#"a~="x""#,
+            r#"a!~="x""#,
+        ] {
+            assert_eq!(parse_q(q).expect(q).to_string(), q);
+        }
+    }
 
     /// Every grammar shape survives parse → render → parse unchanged.
     #[test]
@@ -198,17 +214,21 @@ mod tests {
     /// decoded on the way in nor escaped on the way out.
     #[test]
     fn a_regexp_operand_keeps_its_own_backslashes() {
-        for q in [r#"a~="^\d+$""#, r#"a!~="^[a-z]\.[0-9]{2}$""#] {
+        for (q, op, pattern) in [
+            (r#"a~="^\d+$""#, CmpOp::Pattern, r"^\d+$"),
+            (
+                r#"a!~="^[a-z]\.[0-9]{2}$""#,
+                CmpOp::NotPattern,
+                r"^[a-z]\.[0-9]{2}$",
+            ),
+        ] {
             let node = parse_q(q).expect(q);
-            let QNode::Cmp { value, .. } = &node else {
-                panic!("{q}: expected a comparison")
-            };
-            let QValue::Str(pattern) = value else {
-                panic!("{q}: expected a string operand")
-            };
-            assert!(
-                pattern.contains('\\'),
-                "{q}: the regex kept its backslash: {pattern:?}"
+            let path = QPath::dotted(vec!["a".to_owned()]);
+            let value = QValue::Str(pattern.to_owned());
+            assert_eq!(
+                node,
+                QNode::Cmp { path, op, value },
+                "{q}: the regex kept its backslash"
             );
             assert_eq!(parse_q(&node.to_string()).expect("re-parses"), node, "{q}");
         }

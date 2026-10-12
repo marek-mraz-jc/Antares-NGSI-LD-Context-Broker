@@ -269,11 +269,8 @@ mod tests {
             "id": "urn:ngsi-ld:Car:1", "type": "Car",
             "location": {"type": "GeoProperty", "value": {"type": "Point", "coordinates": [1.0, 2.0]}}
         });
-        let Value::Object(entity) = entity else {
-            unreachable!("an object literal")
-        };
-        let out =
-            crate::expand_entity(&entity, &ctx, crate::ExpandOpts::default()).expect("expand");
+        let entity = entity.as_object().expect("an object literal");
+        let out = crate::expand_entity(entity, &ctx, crate::ExpandOpts::default()).expect("expand");
         assert!(
             out.get("https://uri.etsi.org/ngsi-ld/location").is_some(),
             "{out}"
@@ -375,12 +372,80 @@ mod tests {
         }
         let core = pinned(CORE_CONTEXT).expect("the Core @context is pinned");
         assert!(
-            core.is_object() || core.is_array() || core.is_string(),
-            "the Core @context is not a usable @context value: {core}"
+            core.is_object(),
+            "the Core @context is not one object: {core}"
         );
         assert!(
             PINNED.iter().any(|(u, _)| *u == CORE_CONTEXT),
             "CORE_CONTEXT must be in the pinned table by URL, not merely resolvable"
         );
+    }
+
+    /// The core URL of a pinned version, and `None` for a malformed or an
+    /// unpinned one.
+    #[test]
+    fn core_context_url_of_a_version() {
+        assert_eq!(
+            core_context_url("1.8"),
+            Some("https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.8.jsonld")
+        );
+        for v in ["18", "1.", ".8", "x.8", "1.x", "9.9"] {
+            assert_eq!(core_context_url(v), None, "{v}");
+        }
+    }
+
+    /// A Core value merges object by object, an array element by element, and
+    /// skips anything else; the pinned-only loader knows no other document.
+    #[test]
+    fn core_values_merge_and_the_pinned_loader_knows_nothing_else() {
+        let mut ctx = Context::default();
+        merge_context_value(
+            &mut ctx,
+            &serde_json::json!([{"a": "https://x.example/a"}, 5]),
+        );
+        ctx.freeze();
+        assert_eq!(ctx.expand_key("a"), "https://x.example/a");
+        assert_eq!(PinnedOnly.load("https://x.example/ctx.jsonld"), None);
+    }
+
+    /// A document's own references resolve against its URL when relative,
+    /// and stay as written when absolute (http or https).
+    #[test]
+    fn references_inside_a_document_resolve_against_it() {
+        struct Docs;
+        impl ContextLoader for Docs {
+            fn load(&self, url: &str) -> Option<Value> {
+                [
+                    (
+                        "https://ex.org/a/ctx.jsonld",
+                        serde_json::json!([
+                            "b.jsonld",
+                            "http://h.example/c.jsonld",
+                            "https://h.example/d.jsonld"
+                        ]),
+                    ),
+                    (
+                        "https://ex.org/a/b.jsonld",
+                        serde_json::json!({"b": "https://t.example/b"}),
+                    ),
+                    (
+                        "http://h.example/c.jsonld",
+                        serde_json::json!({"c": "https://t.example/c"}),
+                    ),
+                    (
+                        "https://h.example/d.jsonld",
+                        serde_json::json!({"d": "https://t.example/d"}),
+                    ),
+                ]
+                .into_iter()
+                .find(|(u, _)| *u == url)
+                .map(|(_, doc)| doc)
+            }
+        }
+        let ctx = resolve_with(&Docs, &Value::String("https://ex.org/a/ctx.jsonld".into()))
+            .expect("resolve");
+        for t in ["b", "c", "d"] {
+            assert_eq!(ctx.expand_key(t), format!("https://t.example/{t}"));
+        }
     }
 }

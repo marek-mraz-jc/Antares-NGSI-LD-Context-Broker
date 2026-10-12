@@ -92,6 +92,15 @@ fn compact_attr_value(v: &Value, ctx: &Context) -> Value {
     }
 }
 
+/// A vocab value, an IRI or an array of them, compacted back to terms.
+fn compact_vocab(v: &Value, ctx: &Context) -> Value {
+    match v {
+        Value::String(iri) => Value::String(ctx.compact_iri(iri)),
+        Value::Array(a) => Value::Array(a.iter().map(|s| compact_vocab(s, ctx)).collect()),
+        other => other.clone(),
+    }
+}
+
 /// Compact one attribute instance (public for temporal presentation, which
 /// keeps instance arrays un-unwrapped).
 pub fn compact_instance(inst: &Value, ctx: &Context) -> Value {
@@ -101,20 +110,7 @@ pub fn compact_instance(inst: &Value, ctx: &Context) -> Value {
     let mut out = Map::new();
     for (k, v) in obj {
         if k == "vocab" || k == "previousVocab" {
-            // vocab values compact back to terms
-            let compacted = match v {
-                Value::String(iri) => Value::String(ctx.compact_iri(iri)),
-                Value::Array(a) => Value::Array(
-                    a.iter()
-                        .map(|s| match s {
-                            Value::String(iri) => Value::String(ctx.compact_iri(iri)),
-                            o => o.clone(),
-                        })
-                        .collect(),
-                ),
-                o => o.clone(),
-            };
-            out.insert(k.clone(), compacted);
+            out.insert(k.clone(), compact_vocab(v, ctx));
         } else if k == "objectType" {
             out.insert("objectType".into(), compact_types(v, ctx));
         } else if k == "entityTypeSealed" {
@@ -197,19 +193,7 @@ fn compact_simplified_value(v: &Value, ctx: &Context) -> Value {
     };
     if o.len() == 1 {
         if let Some(vocab) = o.get("vocab") {
-            let compacted = match vocab {
-                Value::String(iri) => Value::String(ctx.compact_iri(iri)),
-                Value::Array(a) => Value::Array(
-                    a.iter()
-                        .map(|s| match s {
-                            Value::String(iri) => Value::String(ctx.compact_iri(iri)),
-                            other => other.clone(),
-                        })
-                        .collect(),
-                ),
-                other => other.clone(),
-            };
-            return serde_json::json!({ "vocab": compacted });
+            return serde_json::json!({ "vocab": compact_vocab(vocab, ctx) });
         }
         if let Some(Value::Object(m)) = o.get("dataset") {
             let per_instance: Map<String, Value> = m
@@ -670,5 +654,17 @@ mod tests {
         let doc: Value = serde_json::from_str(&nest(20)).expect("within the parser limit");
         let out = compact_entity(&doc, &ctx);
         assert!(out.get("s").is_some());
+    }
+
+    /// A vocab value compacts element by element and leaves a non-IRI as it is.
+    #[test]
+    fn vocab_values_compact_to_terms() {
+        let ctx = crate::core_context();
+        let iri = format!("{DEFAULT}Camping");
+        assert_eq!(
+            compact_vocab(&json!([iri, 5]), &ctx),
+            json!([ctx.compact_iri(&iri), 5])
+        );
+        assert_eq!(compact_vocab(&json!(5), &ctx), json!(5));
     }
 }
