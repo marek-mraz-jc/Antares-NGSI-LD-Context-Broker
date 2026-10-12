@@ -17,7 +17,7 @@ use crate::paths;
 use antares_ops::residual::{DateTime, Expr as RExpr, Program};
 use antares_ops::{
     core_name, Caller, OperationId, OpsRequest, Page as ScanPage, Pushdown, Refusal, Scanned,
-    ViewOps, RESIDUAL_SCAN,
+    ViewOps, RESIDUAL_SCAN, TOO_COMPLEX,
 };
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -1613,8 +1613,14 @@ async fn scanned(
             ),
         )
         .with_version(version)),
-        // `TOO_COMPLEX` needs an evaluation past MAX_STEPS, which no program `filter` builds
-        // within MAX_NODES reaches: a plain 400
+        // An evaluation past the residual's MAX_STEPS: a nested `any` over a long list reaches
+        // it within MAX_NODES (T-4031)
+        Err(Refusal::Malformed(why)) if why == TOO_COMPLEX => Err(ODataErrorResponse::new(
+            StatusCode::BAD_REQUEST,
+            "TooComplexQuery",
+            TOO_COMPLEX,
+        )
+        .with_version(version)),
         Err(other) => Err(refused(other.status(), version)),
     }
 }
