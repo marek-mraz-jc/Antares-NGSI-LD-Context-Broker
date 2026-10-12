@@ -142,6 +142,7 @@ dependencies = [
  "antares-jsonld",
  "antares-model",
  "antares-ql",
+ "antares-residual",
  "axum",
  "chrono",
  "metrics",

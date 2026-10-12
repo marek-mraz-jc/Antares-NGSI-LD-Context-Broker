@@ -267,3 +267,11 @@ function = "Internal::serve" # v0 mangling puts the impl between the crate and t
 lines = 21
 branches = 0
 reason = "2 lines: the grant store failing, which the built-in store under test_kit does not (module rule M2). 19 lines: the four tracing::info!/warn! of a forward made or not made repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/icsr_log.rs and icsr_gate.rs cover the subscriber path and assert what they log"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/scan.rs"
+function = "antares_ops::scan::read"
+lines = 3
+branches = 0
+reason = "a successful Query Entities answer that is no JSON list: the scan asks the store for application/json and never forwards the outer Accept (tests/view_scan.rs asserts geo+json stays outside), so the store answers a list; the refusal stays as the trust boundary on the store's answer"
