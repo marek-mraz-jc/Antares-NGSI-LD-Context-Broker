@@ -92,7 +92,7 @@ async fn create_entity_inner(
     let id = antares_jsonld::expanded_id(&expanded)?.to_owned();
 
     // distributed create (4.3.6, 6.4.3.1)
-    let types: Option<Vec<String>> = expanded["type"].as_array().map(|a| {
+    let types: Option<Vec<String>> = expanded.get("type").and_then(Value::as_array).map(|a| {
         a.iter()
             .filter_map(Value::as_str)
             .map(str::to_owned)
@@ -651,20 +651,20 @@ async fn query_entities_outer(
                 let local_only = emap
                     .get(id)
                     .and_then(Value::as_array)
-                    .is_some_and(|a| a.len() == 1 && a[0] == "@none");
+                    .is_some_and(|a| matches!(a.as_slice(), [only] if only == "@none"));
                 if local_only && !matched.contains(id.as_str()) {
                     emap.remove(id);
                 }
             }
         }
-        visited += chunk.len();
+        visited = visited.saturating_add(chunk.len());
         for id in chunk {
             if !matched.contains(id.as_str()) {
                 continue;
             }
-            total += 1;
+            total = total.saturating_add(1);
             if skipped < offset {
-                skipped += 1;
+                skipped = skipped.saturating_add(1);
             } else if page_ids.len() < limit {
                 page_ids.push(id.clone());
             } else {
@@ -680,7 +680,7 @@ async fn query_entities_outer(
         }
     }
     if count {
-        more = total > offset + limit;
+        more = total > offset.saturating_add(limit);
     }
     crate::entity_map::map_put(st, &tenant, map.clone()).await?;
     // fix the final fetch to exactly the page's survivors (5.5.14: an empty
@@ -718,7 +718,7 @@ async fn query_entities_outer(
     // 6.3.10 links from the original query — the inner call saw offset 0
     // over exactly one page, so it emitted none
     for (off, rel, cond) in [
-        (offset + limit, "next", more && limit > 0),
+        (offset.saturating_add(limit), "next", more && limit > 0),
         (offset.saturating_sub(limit.max(1)), "prev", offset > 0),
     ] {
         if !cond {
@@ -1460,7 +1460,7 @@ pub async fn filter_entities_paged(
         rows = rows.saturating_add(got);
         let all = crate::federation::merge_candidates(outcome.rows, fed);
         for doc in all {
-            let id = doc["id"].as_str().unwrap_or("");
+            let id = doc.get("id").and_then(Value::as_str).unwrap_or("");
             if let Some(ids) = &id_set {
                 if !decided && !ids.contains(id) {
                     continue;
@@ -1479,8 +1479,9 @@ pub async fn filter_entities_paged(
             }
             if !decided {
                 if let Some(sel) = &type_sel {
-                    let etypes: Vec<&str> = doc["type"]
-                        .as_array()
+                    let etypes: Vec<&str> = doc
+                        .get("type")
+                        .and_then(Value::as_array)
                         .map(|a| a.iter().filter_map(Value::as_str).collect())
                         .unwrap_or_default();
                     let matched = sel
@@ -1749,7 +1750,7 @@ pub(crate) fn next_scan_offset(
     if !paged || rows < chunk {
         return None;
     }
-    Some(offset + rows.saturating_sub(left_the_set))
+    Some(offset.saturating_add(rows.saturating_sub(left_the_set)))
 }
 
 /// 5.6.21.4 "And thereafter": with no Attribute-name list, delete every
@@ -1807,7 +1808,7 @@ async fn purge_locally(
                         }
                     }
                     if target.len() != before {
-                        changed += 1;
+                        changed = changed.saturating_add(1);
                     }
                     Ok::<(), NgsiError>(())
                 })
@@ -1827,7 +1828,7 @@ async fn purge_locally(
             let mut gone = 0usize;
             for (id, deleted) in ids.iter().zip(st.store.batch_delete(tenant, &ids).await?) {
                 if deleted {
-                    gone += 1;
+                    gone = gone.saturating_add(1);
                     mirror_delete_entity(st, tenant, id).await;
                 }
             }
@@ -2368,7 +2369,9 @@ pub fn merge_into(doc: &mut Value, fragment: &Value, ts: &str) {
                         }
                         (true, None) => {}
                         (false, Some(p)) => {
-                            merge_instance(&mut cur[p], &fi, ts);
+                            if let Some(ci) = cur.get_mut(p) {
+                                merge_instance(ci, &fi, ts);
+                            }
                         }
                         (false, None) => {
                             let mut ni = fi.clone();
@@ -2516,7 +2519,7 @@ pub async fn replace_entity(
                 "entity must be a JSON object".into(),
             ))?;
             let mut expanded = expand_entity(obj, &parsed.ctx, ExpandOpts::default())?;
-            if expanded["id"].as_str() != Some(id.as_str()) {
+            if expanded.get("id").and_then(Value::as_str) != Some(id.as_str()) {
                 return Err(NgsiError::BadRequestData("entity id mismatch".into()).into());
             }
             let ts = now_iso();
@@ -2579,7 +2582,7 @@ pub async fn replace_entity(
             "entity must be a JSON object".into(),
         ))?;
         let expanded = expand_entity(obj, &parsed.ctx, ExpandOpts::default())?;
-        if expanded["id"].as_str() != Some(id.as_str()) {
+        if expanded.get("id").and_then(Value::as_str) != Some(id.as_str()) {
             return Err(NgsiError::BadRequestData("entity id mismatch".into()).into());
         }
         let mut parts = Vec::new();

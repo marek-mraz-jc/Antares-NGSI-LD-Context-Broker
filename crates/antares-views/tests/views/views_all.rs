@@ -345,3 +345,47 @@ async fn views_all_keeps_writes_and_subscriptions_off_context_sources() -> Resul
     );
     Ok(())
 }
+
+/// A write whose Entity id segment is empty is a malformed request through
+/// `all` as at the root (T-3948, ETSI `010_02_01`, `011_02_01`, `012_02_01`,
+/// `013_02_01`): 400 `BadRequestData`, not the 404 of a path no operation binds.
+#[tokio::test(flavor = "multi_thread")]
+async fn views_all_answers_an_empty_entity_id_as_the_root_does() -> Result<(), String> {
+    let f = fixture().await?;
+    put_view(&f.app, &all_view()).await?;
+    let attr = json!({"speed": {"type": "Property", "value": 1}});
+    let value = json!({"type": "Property", "value": 1});
+    for (method, path, body) in [
+        (Method::POST, "/entities//attrs/", Some(&attr)),
+        (Method::PATCH, "/entities//attrs/", Some(&attr)),
+        (Method::PATCH, "/entities//attrs/speed", Some(&value)),
+        (
+            Method::DELETE,
+            "/entities//attrs/speed?deleteAll=false",
+            None,
+        ),
+    ] {
+        let d = send(
+            &f.app,
+            method.clone(),
+            &format!("/ngsi-ld/v1{path}"),
+            &[("NGSILD-Tenant", "city")],
+            body,
+        )
+        .await;
+        let v = send(&f.app, method.clone(), &format!("{ALL}{path}"), &[], body).await;
+        assert_eq!(
+            d.status,
+            StatusCode::BAD_REQUEST,
+            "{method} {path}: {}",
+            d.text
+        );
+        assert_eq!(v.status, d.status, "{method} {path}: {}", v.text);
+        assert_eq!(
+            v.json.pointer("/type"),
+            d.json.pointer("/type"),
+            "{method} {path}"
+        );
+    }
+    Ok(())
+}

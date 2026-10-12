@@ -291,12 +291,49 @@ def check_view_diff():
         shown = run("shown", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
                     [(d, "GET", f"{root}/entities?type=Building&attrs=name,location", [])])
         assert view_diff.diff(restricted, e1, shown, binds) == 1, "a read of shown names owes nothing"
+
+        # T-3980: names in the path, the type of an entity id read, an orderBy, a listing, a join, a
+        # query naming no type, and an answer lacking only hidden Attributes are owed by the view
+        json.dump({"id": "r", "operations": ["retrieve_entity", "query_entities", "retrieve_attributes",
+                                             "retrieve_attribute_info", "retrieve_entity_type_info",
+                                             "temporal_retrieve"],
+                   "selector": ["https://ngsi-ld-test-suite/context#Building"],
+                   "rules": [{"types": ["https://ngsi-ld-test-suite/context#Building"],
+                              "attributes": ["https://ngsi-ld-test-suite/context#name"]}]},
+                  open(restricted, "w"))
+        e, f, g, h, i, j, k, m = (f"TP/s.robot::01{n} T" for n in range(8))
+        e1n = run("e1n", [(t, "PASS") for t in (e, f, g, h, i, j, k, m)])
+        narrowed = run("narrowed", [(t, "FAIL") for t in (e, f, g, h, i, j, k, m)], [
+            (e, "GET", f"{root}/attributes/airQualityLevel", []),
+            (f, "GET", f"{root}/temporal/entities/urn:ngsi-ld:Vehicle:7", []),
+            (g, "GET", f"{root}/entities?type=Building&orderBy=rankProbe", []),
+            (h, "GET", f"{root}/attributes?details=false", []),
+            (i, "GET", f"{root}/entities/urn:ngsi-ld:Building:1?join=inline&joinLevel=2", []),
+            (j, "GET", f"{root}/entities?q=name==%22x%22", []),
+            (k, "GET", f"{root}/entities/urn:ngsi-ld:Building:2", []),
+            (m, "GET", f"{root}/entities/urn:ngsi-ld:Building:3", []),
+        ])
+        with open(f"{narrowed}/failures.csv", "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["suite", "test", "message"])
+            w.writerow(["s", "011 T", "never read: a request names it"])
+            w.writerow(["s", "016 T", "Item root['https://ngsi-ld-test-suite/context#airQualityLevel'] removed from dictionary."])
+            w.writerow(["s", "017 T", "Item root['name'] removed from dictionary. KeyError: 'airQualityLevel'"])
+        assert view_diff.diff(restricted, e1n, narrowed, binds) == 1, "an answer lacking a shown Attribute owes nothing"
+        why = {r["tp"]: " ".join(r["owed"]) for r in json.load(open(f"{narrowed}/owed-refusals.json"))["refusals"]}
+        assert sorted(why) == [e, f, g, h, i, j, k], why
+        assert "Attribute airQualityLevel" in why[e] and "type Vehicle" in why[f], why
+        assert "Attribute rankProbe" in why[g] and "lists only" in why[h] and "join" in why[i], why
+        assert "naming no type" in why[j] and "lacks Attribute" in why[k], why
+        assert view_diff.lacking("Item root['name'] removed from dictionary.", view_diff.hidden_by(
+            json.load(open(restricted)), view_diff.core_terms())) == [], "a shown Attribute is not owed"
+        assert view_diff.lacking("anything", None) == [], "a view that shows every name owes no lack"
         committed = json.load(open(f"{HERE}/../ci/views/etsi/etsi-restricted.json"))
         reads = {o["id"] for o in __import__("yaml").safe_load(open(view_diff.MATRIX))["operations"]
                  if o.get("kind") == "read"}
         assert set(committed["operations"]) == reads, "etsi-restricted offers the matrix's reads"
     print("  view diff ok (owed refusals pass, a deviation, a stale known entry or a missing TP fails;"
-          " a hidden type or Attribute owes its refusal)")
+          " a hidden type or Attribute owes its refusal, a narrowing view its narrowing)")
 
 
 def check_view_residue():

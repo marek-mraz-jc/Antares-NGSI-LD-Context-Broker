@@ -37,11 +37,17 @@
 
 mod error;
 pub mod mapping;
+mod names;
 mod operation;
+mod scan;
 pub mod views;
 
+/// The residual of a standard query (ADR-0028 rule 2), re-exported so a surface compiles into
+/// it through `antares-ops` alone (rule M2).
+pub use antares_residual as residual;
 pub use error::{Refusal, CONTEXT_DETAIL, INNER_DETAIL};
 pub use operation::OperationId;
+pub use scan::{Page, Pushdown, Scanned, RESIDUAL_SCAN, TOO_COMPLEX};
 
 use antares_api::AppState;
 use axum::body::Body;
@@ -120,6 +126,9 @@ pub struct ViewOps {
     tenant: antares_model::TenantId,
     operations: Vec<OperationId>,
     mapping: Option<Arc<mapping::Mapping>>,
+    /// The core @context with the view's own merged in: what a name a caller
+    /// writes in an NGSI-LD parameter means here (`names.rs`).
+    names: Arc<antares_jsonld::Context>,
 }
 
 /// The Entity types a caller may see through a view and the Attributes
@@ -370,6 +379,7 @@ impl Ops {
             tenant,
             operations,
             mapping,
+            context,
             ..
         }) = table.get(id)
         else {
@@ -396,6 +406,7 @@ impl Ops {
                 .filter_map(|o| OperationId::from_id(o))
                 .collect(),
             mapping,
+            names: Arc::new(names::of_view(context.as_deref())?),
         };
         // Only views loaded now stay cached: a removed one goes with the
         // first view served after its removal.
@@ -542,7 +553,9 @@ impl ViewOps {
     /// view's rules composed with that Tenant's engine (ADR-0023 rule 5,
     /// ADR-0025 rule 5).
     pub async fn forward_in_process(&self, req: BuiltForward<'_>, self_url: &str) -> ForwardAnswer {
-        self.inner.forward_in_process(req, self_url).await
+        self.inner
+            .forward_through(Some(self.view.id()), req, self_url)
+            .await
     }
 
     /// The one Tenant the view serves (ADR-0023 rule 10).
@@ -845,6 +858,17 @@ impl Ops {
     /// operation's answer, and 504 otherwise, which the merge reports as
     /// code 199 (6.3.17), as a loop is.
     pub async fn forward_in_process(&self, req: BuiltForward<'_>, self_url: &str) -> ForwardAnswer {
+        self.forward_through(None, req, self_url).await
+    }
+
+    /// [`Self::forward_in_process`] through the view `view` (T-3935): the
+    /// engine of the target learns it as for a request through that view.
+    async fn forward_through(
+        &self,
+        view: Option<&str>,
+        req: BuiltForward<'_>,
+        self_url: &str,
+    ) -> ForwardAnswer {
         if antares_api::state::in_process_depth() >= antares_api::bounds::MAX_IN_PROCESS_CALL_DEPTH
         {
             let status = if req.proxied() { 508 } else { 504 };
@@ -856,7 +880,10 @@ impl Ops {
         let Some(inner) = in_process_request(&req, self_url) else {
             return (502, serde_json::Value::Null, Vec::new());
         };
-        let answer = self.state.call_on_task(req.subject().clone(), inner).await;
+        let answer = self
+            .state
+            .call_on_task(view, req.subject().clone(), inner)
+            .await;
         let status = answer.status().as_u16();
         let warnings = answer
             .headers()
@@ -1060,6 +1087,14 @@ pub mod test_kit {
             Ok(Self { state, reload })
         }
 
+        /// One retention sweep at `now` (T-3900), as the minute loop runs it.
+        pub async fn sweep_retention(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Vec<crate::views::retention::Deleted> {
+            self.reload.sweep_retention(now).await
+        }
+
         /// Another pod over the same store: its own view table, loaded and
         /// reloaded from the store like this one's.
         ///
@@ -1172,6 +1207,24 @@ pub mod test_kit {
                 .with_surfaces(vec![Box::new(antares_api::Admin), mount(surface)])?;
             Ok(antares_api::router(state))
         }
+    }
+
+    /// [`ViewOps::scan`](super::ViewOps::scan) with `residual` under a `budget` of upstream
+    /// Entities read in upstream pages of `upstream`, and how many it read: the bound a test
+    /// crosses with a handful of Entities instead of [`RESIDUAL_SCAN`](super::RESIDUAL_SCAN).
+    ///
+    /// # Errors
+    /// [`ViewOps::scan`](super::ViewOps::scan)'s.
+    pub async fn scan_within(
+        view: &super::ViewOps,
+        caller: &super::Caller,
+        pushdown: &super::Pushdown,
+        residual: &super::residual::Program,
+        page: super::Page,
+        (budget, upstream): (usize, usize),
+    ) -> Result<(super::Scanned, usize), super::Refusal> {
+        view.fill(caller, pushdown, residual, page, (budget, upstream))
+            .await
     }
 
     /// A policy [`Filter`](super::policy::Filter) conditioned on `q` (4.9),

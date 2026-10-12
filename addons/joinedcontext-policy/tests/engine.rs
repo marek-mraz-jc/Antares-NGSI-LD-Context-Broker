@@ -1092,3 +1092,108 @@ async fn a_view_names_the_type_its_filter_left_out() -> Res {
     assert!(headers.get("NGSILD-Warning").is_none(), "{headers:?}");
     Ok(())
 }
+
+/// The tool probe a surface lists by (T-3784): `alice` offered each clause
+/// under `policies`, as `antares_api::policy::offers` asks it.
+async fn offered(policies: &[Value], clauses: &[&'static str]) -> Result<Vec<bool>, String> {
+    let (_, engine) = broker(doc(policies)).await?;
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-jc-subject",
+        axum::http::HeaderValue::from_static("alice"),
+    );
+    Ok(antares_api::policy::offers(
+        Some(engine.as_ref()),
+        &antares_model::TenantId::default(),
+        &headers,
+        clauses,
+    )
+    .await)
+}
+
+fn alice(id: &str, ops: &[&str]) -> Value {
+    json!({"id": id, "assignee": {"kind": "user", "id": "alice"}, "operations": ops})
+}
+
+/// A grant of every type under a condition takes the queried types, so a
+/// typed query is allowed and the probe offers the clause (T-3784, matrix
+/// scenario 34); without a grant, or under a prohibition of every type, it
+/// is not offered.
+#[tokio::test]
+async fn the_probe_offers_a_read_a_grant_without_information_takes_types_for() -> Res {
+    let city = with(alice("city", &["5.7.2"]), "q", json!("operator==\"city\""));
+    assert_eq!(
+        offered(std::slice::from_ref(&city), &["5.7.2"]).await?,
+        [true]
+    );
+    assert_eq!(offered(&[], &["5.7.2"]).await?, [false]);
+    let every = with(alice("no", &["5.7.2"]), "effect", json!("prohibit"));
+    assert_eq!(offered(&[city, every], &["5.7.2"]).await?, [false]);
+    Ok(())
+}
+
+/// A prohibition on one type leaves a grant on another offered; under a
+/// prohibition of every type a grant names, a read of another type is
+/// still narrowed, not refused, so the read is offered and the write is
+/// not (the T-3777 differential's shrunk cases).
+#[tokio::test]
+async fn the_probe_refuses_a_write_only_when_every_granted_type_is_prohibited() -> Res {
+    let on = |id: &str, t: &str| {
+        with(
+            alice(id, &["5.7.2", "5.6.3"]),
+            "information",
+            json!([{"entities": [{"type": t}]}]),
+        )
+    };
+    let no = |id: &str, t: &str| with(on(id, t), "effect", json!("prohibit"));
+    assert_eq!(
+        offered(
+            &[on("v", "Vehicle"), no("s", "Sensor")],
+            &["5.7.2", "5.6.3"]
+        )
+        .await?,
+        [true, true]
+    );
+    assert_eq!(
+        offered(&[on("s", "Sensor"), no("x", "Sensor")], &["5.7.2", "5.6.3"]).await?,
+        [true, false]
+    );
+    Ok(())
+}
+
+/// A notification is decided as a query naming the types it carries: under
+/// a grant of every type with a condition it is narrowed per type, not
+/// dropped for naming none (T-3784); with no Entity it names no type and is
+/// dropped.
+#[tokio::test]
+async fn a_notification_names_the_types_it_carries() -> Res {
+    use antares_api::policy::{NotifyDecision, Subject};
+    let (_, engine) = broker(doc(&[with(
+        alice("city", &["5.7.2"]),
+        "q",
+        json!("speed<50"),
+    )]))
+    .await?;
+    let subject = Subject {
+        tenant: antares_model::TenantId::default(),
+        headers: vec![("x-jc-subject".into(), "alice".into())],
+    };
+    let mut n = json!({"data": [car(1, 10, "/a")]});
+    match engine.pre_notify(&subject, &json!({}), &mut n) {
+        NotifyDecision::Filter(f) => {
+            let types: Vec<&str> = f
+                .rules
+                .iter()
+                .flat_map(|r| r.types.iter().map(String::as_str))
+                .collect();
+            assert_eq!(types, ["https://uri.etsi.org/ngsi-ld/default-context/Car"]);
+        }
+        other => return Err(format!("want a per-type narrowing, got {other:?}")),
+    }
+    let mut empty = json!({"data": []});
+    assert_eq!(
+        engine.pre_notify(&subject, &json!({}), &mut empty),
+        NotifyDecision::Drop
+    );
+    Ok(())
+}
