@@ -1127,9 +1127,10 @@ impl Loader {
         }
         // Core context last: its (protected) terms win — CIM 009 4.4.
         // CORE_CONTEXT is a PINNED entry and every entry parses: pinned by
-        // `every_pinned_context_parses_and_carries_an_at_context`.
-        #[allow(clippy::expect_used)]
-        let core = pinned(CORE_CONTEXT).expect("pinned core");
+        // `every_pinned_context_parses_and_carries_an_at_context`. A request
+        // reaches this line, so a broken pin is a 500, never a panic (T-3915).
+        let core = pinned(CORE_CONTEXT)
+            .ok_or_else(|| NgsiError::InternalError("the core @context is not pinned".into()))?;
         merge_context_value(&mut ctx, &core);
         ctx.freeze();
         ctx.source = user.clone();
