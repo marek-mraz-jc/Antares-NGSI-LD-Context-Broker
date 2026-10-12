@@ -369,7 +369,6 @@ fn query_option_errors() {
         }
     );
     for (name, feature) in [
-        ("compute=1 as x", Feature::Compute),
         ("$index=1", Feature::Index),
         ("$deltatoken=x", Feature::DeltaToken),
         ("$apply=groupby((name))", Feature::Apply),
@@ -970,7 +969,6 @@ fn every_feature_and_limit_has_its_own_name() {
     use Feature as F;
     use LimitKind as L;
     let features = [
-        F::Compute,
         F::Index,
         F::Apply,
         F::DeltaToken,
@@ -1469,6 +1467,179 @@ fn search_writes_its_canonical_form() {
         ("$search=\"x y\"", "$search=%22x%20y%22"),
         ("$search=C%2B%2B", "$search=C%2B%2B"),
         ("$search=a OR", "$search=a%20AND%20%22OR%22"),
+    ] {
+        let uri = ok(&format!("Buildings?{query}"));
+        assert_eq!(uri.to_string(), format!("Buildings?{written}"), "{query}");
+        assert_eq!(ok(&uri.to_string()).to_string(), uri.to_string(), "{query}");
+    }
+}
+
+fn compute_of(query: &str) -> Vec<Compute> {
+    options(&format!("Buildings?{query}"))
+        .compute
+        .unwrap_or_default()
+}
+
+fn computed(expr: Expr, alias: &str) -> Compute {
+    Compute {
+        expr,
+        alias: alias.to_owned(),
+    }
+}
+
+#[test]
+fn compute_reads_items_and_its_names_resolve_in_the_other_options() {
+    let double = Expr::Arith(
+        Box::new(member(&["height"])),
+        ArithOp::Mul,
+        Box::new(int(2)),
+    );
+    assert_eq!(
+        compute_of("$compute=height mul 2 as double"),
+        [computed(double.clone(), "double")]
+    );
+    assert_eq!(
+        compute_of("compute=height mul 2 as double,tolower(name) AS low"),
+        [
+            computed(double, "double"),
+            computed(Expr::Call(Method::ToLower, vec![member(&["name"])]), "low"),
+        ]
+    );
+    // the names resolve in $filter, $orderby and $select, wherever $compute stands
+    let o = options(
+        "Buildings?$filter=double gt 10 and tags/any(t: t eq low)&$orderby=double desc\
+         &$select=name,double&$compute=height mul 2 as double,name as low",
+    );
+    assert_eq!(
+        o.filter,
+        Some(Expr::And(
+            Box::new(Expr::Compare(
+                Box::new(member(&["double"])),
+                CompareOp::Gt,
+                Box::new(int(10))
+            )),
+            Box::new(Expr::Any {
+                collection: MemberPath {
+                    variable: None,
+                    path: vec!["tags".into()]
+                },
+                lambda: Some((
+                    "t".into(),
+                    Box::new(Expr::Compare(
+                        Box::new(Expr::Member(MemberPath {
+                            variable: Some("t".into()),
+                            path: vec![]
+                        })),
+                        CompareOp::Eq,
+                        Box::new(member(&["low"]))
+                    ))
+                ))
+            })
+        ))
+    );
+    assert_eq!(
+        o.orderby,
+        Some(vec![OrderBy {
+            expr: member(&["double"]),
+            descending: true
+        }])
+    );
+    assert_eq!(
+        o.select,
+        Some(vec![
+            SelectItem::Path(vec!["name".into()]),
+            SelectItem::Path(vec!["double".into()])
+        ])
+    );
+    assert_eq!(o.compute.map(|c| c.len()), Some(2));
+}
+
+#[test]
+fn compute_refuses_what_is_no_compute_item() {
+    let at = |q: &str| format!("Buildings?{q}").len();
+    // no `as`, no name, a name the type has, a name given twice, junk after the item
+    syntax("Buildings?$compute=height", at("$compute=height"));
+    syntax("Buildings?$compute=height as", at("$compute=height as"));
+    syntax("Buildings?$compute=height is h", at("$compute=height "));
+    syntax("Buildings?$compute=height asx", at("$compute=height as"));
+    syntax("Buildings?$compute=height as 1x", at("$compute=height as "));
+    syntax(
+        "Buildings?$compute=height as name",
+        at("$compute=height as name"),
+    );
+    syntax(
+        "Buildings?$compute=height as h,name as h",
+        at("$compute=height as h,name as h"),
+    );
+    syntax(
+        "Buildings?$compute=height as h)",
+        at("$compute=height as h"),
+    );
+    // a computed name is the resource's: not past a path, not a lambda variable's member,
+    // not in a nested $select, not in an item beside it, not without $compute
+    unresolved(
+        "Buildings?$compute=height as h&$filter=address/h eq 1",
+        at("$compute=height as h&$filter=address/"),
+    );
+    unresolved(
+        "Buildings?$compute=height as h&$filter=rooms/any(r: r/h eq 1)",
+        at("$compute=height as h&$filter=rooms/any(r: r/"),
+    );
+    unresolved(
+        "Buildings?$compute=height as h&$expand=owner($select=h)",
+        at("$compute=height as h&$expand=owner($select="),
+    );
+    unresolved(
+        "Buildings?$compute=height as h,h as g",
+        at("$compute=height as h,"),
+    );
+    unresolved("Buildings?$filter=h eq 1", at("$filter="));
+    let dup = err("Buildings?$compute=height as h&compute=height as g");
+    assert_eq!(dup.to_string(), "system query option $compute given twice");
+    // nested in $expand it stays refused
+    refused(
+        "Buildings?$expand=owner($compute=1 as x)",
+        Feature::NestedOption,
+        at("$expand=owner("),
+    );
+    // and outside the query forms with every option
+    syntax("$batch?$compute=1 as x", "$batch?".len());
+}
+
+#[test]
+fn compute_is_bounded_by_the_expression_budget() {
+    let tight = Limits {
+        max_expr_nodes: 3,
+        ..Limits::strict()
+    };
+    let e = err_within(
+        "Buildings?$compute=height add 1 as a,height add 1 as b",
+        &tight,
+    );
+    assert!(
+        matches!(
+            e.kind,
+            UrlErrorKind::LimitExceeded {
+                limit: LimitKind::ExprNodes,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(parse("Buildings?$compute=height add 1 as a", &Service, &tight).is_ok());
+}
+
+#[test]
+fn compute_writes_its_canonical_form() {
+    for (query, written) in [
+        (
+            "$filter=d gt 1&$compute=height mul 2 as d",
+            "$compute=height%20mul%202%20as%20d&$filter=d%20gt%201",
+        ),
+        (
+            "compute=name as n,height as h&$select=n",
+            "$compute=name%20as%20n,height%20as%20h&$select=n",
+        ),
     ] {
         let uri = ok(&format!("Buildings?{query}"));
         assert_eq!(uri.to_string(), format!("Buildings?{written}"), "{query}");

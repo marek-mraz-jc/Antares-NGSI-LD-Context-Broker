@@ -7,8 +7,8 @@ use crate::literal::{literal, pct_encoded};
 use crate::model::{Member, Model};
 use crate::search::search;
 use crate::{
-    ExpandItem, ExpandKind, ExpandPath, Feature, Format, Levels, LimitKind, OrderBy, QueryOptions,
-    SelectItem, UrlError, UrlErrorKind,
+    Compute, ExpandItem, ExpandKind, ExpandPath, Feature, Format, Levels, LimitKind, OrderBy,
+    QueryOptions, SelectItem, UrlError, UrlErrorKind,
 };
 
 /// Which options a URL form allows besides custom ones (ABNF `batchOptions`,
@@ -78,7 +78,6 @@ impl Name {
 
     fn not_implemented(self) -> Option<Feature> {
         match self {
-            Name::Compute => Some(Feature::Compute),
             Name::Index => Some(Feature::Index),
             Name::Deltatoken => Some(Feature::DeltaToken),
             Name::Apply => Some(Feature::Apply),
@@ -156,6 +155,10 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
         allowed: Allowed,
     ) -> Result<QueryOptions, UrlError> {
         let mut options = QueryOptions::default();
+        let computed = match allowed {
+            Allowed::All => self.compute_first(scope)?,
+            Allowed::Format | Allowed::EntityId => None,
+        };
         let mut seen: Vec<Name> = Vec::new();
         let mut n = 0;
         let max = self.budget.limits.max_query_options;
@@ -173,7 +176,15 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
                     return Err(self.c.error(UrlErrorKind::DuplicateOption(name.label())));
                 }
                 seen.push(name);
-                self.system(scope, name, start, &mut options)?;
+                match (name, &computed) {
+                    // parsed first
+                    // parsed first; a second one is the duplicate refused above
+                    (Name::Compute, Some((end, items))) => {
+                        self.c.reset(*end);
+                        options.compute = Some(items.clone());
+                    }
+                    _ => self.system(scope, name, start, &mut options)?,
+                }
             } else if allowed == Allowed::All && self.c.at() {
                 self.alias(&mut options)?;
             } else {
@@ -190,6 +201,66 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
             return Err(self.c.syntax("id"));
         }
         Ok(options)
+    }
+
+    /// `$compute` before every other option (Protocol 11.2.1): its names resolve in the
+    /// others wherever it stands. Its items and where it ends, `None` without one; the first
+    /// one only, so a second is the duplicate the options loop answers.
+    fn compute_first(
+        &mut self,
+        scope: Scope<'m>,
+    ) -> Result<Option<(usize, Vec<Compute>)>, UrlError> {
+        let base = self.c.pos();
+        // a raw `&` ends an option: inside a value it is percent-encoded
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(
+                self.c
+                    .rest()
+                    .match_indices('&')
+                    .map(|(at, _)| at.saturating_add(1)),
+            )
+            .collect();
+        for at in starts {
+            self.c.reset(base.saturating_add(at));
+            if option_name(self.c, &[Name::Compute]).is_some() {
+                let items = self.compute(scope)?;
+                let end = self.c.pos();
+                self.c.reset(base);
+                return Ok(Some((end, items)));
+            }
+        }
+        self.c.reset(base);
+        Ok(None)
+    }
+
+    /// `computeItem *( COMMA computeItem )`, `computeItem = commonExpr RWS "as" RWS
+    /// computedProperty`; a name the resource has, or one given twice, is refused. Each
+    /// expression counts against the request's expression budget.
+    fn compute(&mut self, scope: Scope<'m>) -> Result<Vec<Compute>, UrlError> {
+        let mut items: Vec<Compute> = Vec::new();
+        loop {
+            let expr = common_expr(self.c, self.model, scope, &mut self.budget)?;
+            if !(self.c.rws() && self.c.eat_ci("as") && self.c.rws()) {
+                return Err(self.c.syntax("computeItem"));
+            }
+            let at = self.c.pos();
+            let Some(alias) = self.c.identifier()? else {
+                return Err(self.c.syntax("computedProperty"));
+            };
+            if member(self.model, scope, alias).is_some() || items.iter().any(|i| i.alias == alias)
+            {
+                self.c.reset(at);
+                return Err(self.c.syntax("computedProperty"));
+            }
+            items.push(Compute {
+                expr,
+                alias: alias.to_owned(),
+            });
+            if !self.c.comma() {
+                self.budget.computed = items.iter().map(|i| i.alias.clone()).collect();
+                return Ok(items);
+            }
+        }
     }
 
     fn system(
@@ -311,7 +382,10 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
                 self.c.reset(at);
                 return Err(self.c.not_implemented(Feature::TypeCast));
             }
-            let Some(found) = member(self.model, here, name) else {
+            let computed = path.is_empty() && self.budget.computed.iter().any(|c| c == name);
+            let found = member(self.model, here, name)
+                .or_else(|| computed.then_some(Member::Primitive { collection: false }));
+            let Some(found) = found else {
                 self.c.reset(at);
                 return Err(self.c.error(UrlErrorKind::Unresolved));
             };
@@ -460,39 +534,56 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
         }
         let (mut select, mut expand, mut levels) = (None, None, None);
         if self.c.open() {
-            loop {
-                match option_name(self.c, &[Name::Select, Name::Expand, Name::Levels]) {
-                    Some(Name::Select) => select = Some(self.select(target)?),
-                    Some(Name::Expand) => {
-                        expand = Some(self.expand(target, depth.saturating_add(1))?);
-                    }
-                    Some(_) => levels = Some(self.levels(depth)?),
-                    None => {
-                        let refused = [
-                            Name::Filter,
-                            Name::Search,
-                            Name::Orderby,
-                            Name::Skip,
-                            Name::Top,
-                            Name::Count,
-                            Name::Compute,
-                        ];
-                        return Err(self.nested_refused(&refused));
-                    }
-                }
-                if self.c.close() {
-                    break;
-                }
-                if !self.c.semi() {
-                    return Err(self.c.syntax("SEMI"));
-                }
-            }
+            // the `$compute` names are the resource's, not the expanded entities'
+            let computed = std::mem::take(&mut self.budget.computed);
+            let nested = self.expand_options(target, depth, &mut select, &mut expand, &mut levels);
+            self.budget.computed = computed;
+            nested?;
         }
         Ok(ExpandKind::Entities {
             select,
             expand,
             levels,
         })
+    }
+
+    /// The options of an expanded navigation after its `OPEN`, up to its `CLOSE`.
+    fn expand_options(
+        &mut self,
+        target: Scope<'m>,
+        depth: usize,
+        select: &mut Option<Vec<SelectItem>>,
+        expand: &mut Option<Vec<ExpandItem>>,
+        levels: &mut Option<Levels>,
+    ) -> Result<(), UrlError> {
+        loop {
+            match option_name(self.c, &[Name::Select, Name::Expand, Name::Levels]) {
+                Some(Name::Select) => *select = Some(self.select(target)?),
+                Some(Name::Expand) => {
+                    *expand = Some(self.expand(target, depth.saturating_add(1))?);
+                }
+                Some(_) => *levels = Some(self.levels(depth)?),
+                None => {
+                    let refused = [
+                        Name::Filter,
+                        Name::Search,
+                        Name::Orderby,
+                        Name::Skip,
+                        Name::Top,
+                        Name::Count,
+                        Name::Compute,
+                    ];
+                    return Err(self.nested_refused(&refused));
+                }
+            }
+            if self.c.close() {
+                break;
+            }
+            if !self.c.semi() {
+                return Err(self.c.syntax("SEMI"));
+            }
+        }
+        Ok(())
     }
 
     /// A nested option that is not implemented when it is one of `refused` or an alias, and a

@@ -771,7 +771,7 @@ fn container_capabilities() -> Vec<Annotation> {
         ),
         flag("QuerySegmentSupported", true),
         flag("CrossJoinSupported", false),
-        flag("ComputeSupported", false),
+        flag("ComputeSupported", true),
         flag("KeyAsSegmentSupported", false),
         flag("AsynchronousRequestsSupported", false),
     ]

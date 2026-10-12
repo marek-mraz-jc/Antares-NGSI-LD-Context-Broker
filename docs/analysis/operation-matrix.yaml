@@ -6069,7 +6069,7 @@ odata_without_ngsi_ld_operation:
       note: refused before any gate or store access
 - id: odata_search
   odata_feature: $search
-  odata_section: URL 5.1.8, Protocol 11.2.6.6
+  odata_section: URL 5.1.7, Protocol 11.2.6.6
   ts104175: null
   cim009: null
   kind: read
@@ -6095,19 +6095,19 @@ odata_without_ngsi_ld_operation:
   kind: read
   surfaces:
     odata:
-      status: rejected
-      binding: query option $compute
-      http_status: 501
-      odata_error:
-        code: NotImplemented
-        message: '$compute is not offered: no NGSI-LD operation stands behind it'
+      status: supported
+      binding: query option $compute on an EntitySet read, its /$count, its $query and one Entity, executed as the
+        read's query_entities or retrieve_entity; each item a residual value evaluated per Entity on the answer
+        (ADR-0028, T-3936), written as a dynamic property; its name is inlined into $filter and sorts as a surface
+        $orderby key
       checks:
         adr0020_phase: none
         operation_fields: []
         filterable: false
         whole_tenant: false
         linked_entity_checks: []
-      note: refused before any gate or store access
+      note: computed on the answer the view and the engine admit, so a hidden Attribute reads as absent (null); inside
+        $expand and below one Entity 501
 - id: odata_index
   odata_feature: $index
   odata_section: URL 5.1.11

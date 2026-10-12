@@ -6,9 +6,9 @@
 use std::fmt::{self, Display, Formatter, Write};
 
 use crate::{
-    ArithOp, CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key, KeyValue,
-    Levels, Literal, MemberPath, ODataUri, OrderBy, Position, QueryOptions, Segment, SelectItem,
-    Shape,
+    ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key,
+    KeyValue, Levels, Literal, MemberPath, ODataUri, OrderBy, Position, QueryOptions, Segment,
+    SelectItem, Shape,
 };
 
 impl Display for ODataUri {
@@ -72,6 +72,9 @@ impl Display for Query<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let o = self.0;
         let mut items: Vec<String> = Vec::new();
+        if let Some(compute) = &o.compute {
+            items.push(format!("$compute={}", List(compute)));
+        }
         if let Some(filter) = &o.filter {
             items.push(format!("$filter={filter}"));
         }
@@ -197,6 +200,12 @@ impl Display for OrderBy {
             f.write_str("%20desc")?;
         }
         Ok(())
+    }
+}
+
+impl Display for Compute {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}%20as%20{}", self.expr, self.alias)
     }
 }
 

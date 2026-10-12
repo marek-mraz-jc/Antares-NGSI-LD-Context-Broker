@@ -55,9 +55,9 @@ mod search;
 use std::borrow::Cow;
 
 pub use ast::{
-    ArithOp, CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key, KeyValue,
-    Levels, Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions, Segment,
-    SelectItem, Shape,
+    ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key,
+    KeyValue, Levels, Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions,
+    Segment, SelectItem, Shape,
 };
 #[cfg(feature = "edm")]
 pub use edm::EdmModel;
@@ -134,7 +134,11 @@ fn relative_uri<M: Model>(
     let mut query = Query {
         c,
         model,
-        budget: Budget { limits, nodes: 0 },
+        budget: Budget {
+            limits,
+            nodes: 0,
+            computed: Vec::new(),
+        },
         expand_items: 0,
         select_items: 0,
     };

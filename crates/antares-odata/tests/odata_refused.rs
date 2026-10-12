@@ -40,12 +40,6 @@ const ROWS: &[(&str, &str, &str, Headers)] = &[
         "Car?$apply=aggregate(speed%20with%20sum%20as%20s)",
         &[],
     ),
-    (
-        "odata_compute",
-        "GET",
-        "Car?$compute=speed%20mul%202%20as%20s",
-        &[],
-    ),
     ("odata_index", "GET", "Car?$index=1", &[]),
     ("odata_schemaversion", "GET", "Car?$schemaversion=2", &[]),
     (
