@@ -923,9 +923,15 @@ impl AppState {
     /// is more stack than a worker thread has; on its own task each frame
     /// is polled from the scheduler, as a request over HTTP is. Dropping
     /// the returned future (a forward's timeout) aborts the task.
+    ///
+    /// The new task inherits no view: the call runs through `view` when one
+    /// is given ([`crate::policy::through_view`]), so the engine decides a
+    /// forward under a grant's view as a request through that view (T-3935),
+    /// and never by the view of the request that triggered the forward.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn call_on_task(
         &self,
+        view: Option<&str>,
         caller: axum::http::HeaderMap,
         req: axum::http::Request<axum::body::Body>,
     ) -> axum::response::Response {
@@ -938,8 +944,12 @@ impl AppState {
             }
         }
         let st = self.clone();
+        let view = view.map(str::to_owned);
         let task = tokio::spawn(INPROCESS_DEPTH.scope(in_process_depth(), async move {
-            st.call(&caller, req).await
+            match view {
+                Some(id) => crate::policy::through_view(&id, st.call(&caller, req)).await,
+                None => st.call(&caller, req).await,
+            }
         }));
         let _abort = AbortOnDrop(task.abort_handle());
         task.await.unwrap_or_else(|_| {
