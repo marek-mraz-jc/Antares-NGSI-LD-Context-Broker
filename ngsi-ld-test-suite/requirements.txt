@@ -2,7 +2,7 @@
 robotframework==7.4.1
 robotframework-jsonlibrary==0.5
 robotframework-requests==0.9.7
-deepdiff==8.6.1
+deepdiff==8.6.2
 prettydiff==0.1.0
 paho-mqtt==1.6.1
 -e ./libraries/robotframework-httpctrl

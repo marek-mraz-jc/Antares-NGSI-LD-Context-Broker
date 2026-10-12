@@ -692,3 +692,47 @@ fn a_program_names_the_attributes_and_system_members_it_reads() -> Result<(), Er
     assert_eq!(observed.attributes(), ["speed"]);
     Ok(())
 }
+
+#[test]
+fn a_value_is_json_of_its_kind_and_unknown_is_none() {
+    let value = |e: Expr| program(&e).value(&entity());
+    let read = |attr: &str| value(Expr::Path(Path::value(attr)));
+    assert_eq!(read("flag"), Ok(Some(json!(true))));
+    assert_eq!(read("pm10"), Ok(Some(json!(12))));
+    assert_eq!(read("ratio"), Ok(Some(json!(2.5))));
+    assert_eq!(read("padded"), Ok(Some(json!("  x  "))));
+    assert_eq!(
+        read("when"),
+        Ok(Some(json!("2026-10-11T12:30:15.25+02:00")))
+    );
+    assert_eq!(read("day"), Ok(Some(json!("2026-10-11"))));
+    assert_eq!(read("at"), Ok(Some(json!("08:15:00"))));
+    assert_eq!(read("tags"), Ok(Some(json!(["a", "b", 3]))));
+    assert_eq!(
+        read("address"),
+        Ok(Some(json!({"city": "Bonn", "rooms": [{"n": 1}, {"n": 5}]})))
+    );
+    // missing, null, mistyped and overflowing are unknown, never a default
+    assert_eq!(read("absent"), Ok(None));
+    assert_eq!(read("nothing"), Ok(None));
+    assert_eq!(read("broken"), Ok(None));
+    let twice = |l: Lit| {
+        Expr::Call(
+            Func::Mul,
+            vec![Expr::Path(Path::value("huge")), Expr::Lit(l)],
+        )
+    };
+    assert_eq!(value(twice(Lit::Int(10))), Ok(None));
+    // a computed value: a function over two members, a comparison
+    let concat = Expr::Call(
+        Func::Concat,
+        vec![Expr::Path(Path::value("kind")), Expr::Path(Path::Id)],
+    );
+    assert_eq!(value(concat), Ok(Some(json!("Carurn:ngsi-ld:Station:1"))));
+    let over = Expr::Cmp(
+        Cmp::Gt,
+        Box::new(Expr::Path(Path::value("pm10"))),
+        Box::new(Expr::Lit(Lit::Int(10))),
+    );
+    assert_eq!(value(over), Ok(Some(json!(true))));
+}

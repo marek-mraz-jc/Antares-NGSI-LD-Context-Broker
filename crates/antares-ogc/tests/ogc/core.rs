@@ -50,7 +50,21 @@ async fn conformance_lists_what_is_served() -> Result<(), String> {
     let f = fixture().await?;
     let a = get(&f.app, &format!("{ROOT}/conformance")).await;
     assert_eq!(a.status, StatusCode::OK);
-    assert_eq!(a.body, json!({"conformsTo": antares_ogc::CONFORMANCE}));
+    let read_only: Vec<&str> = antares_ogc::CONFORMANCE
+        .into_iter()
+        .filter(|c| !c.contains("ogcapi-features-4"))
+        .collect();
+    assert_eq!(
+        a.body,
+        json!({"conformsTo": read_only}),
+        "a view that offers no write declares no Part 4 class (W4)"
+    );
+    let fleet = get(&f.app, "/x/views/fleet/ogc/features/conformance").await;
+    assert_eq!(
+        fleet.body,
+        json!({"conformsTo": antares_ogc::CONFORMANCE}),
+        "the fleet view offers all four writes"
+    );
     Ok(())
 }
 

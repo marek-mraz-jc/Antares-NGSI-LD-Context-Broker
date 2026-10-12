@@ -17,6 +17,8 @@ use crate::{
 pub(crate) struct Budget<'l> {
     pub(crate) limits: &'l Limits,
     pub(crate) nodes: usize,
+    /// The `$compute` names, which resolve like primitive members of the resource.
+    pub(crate) computed: Vec<String>,
 }
 
 /// What a path can name from where it starts: the members of a structured type, or nothing
@@ -35,6 +37,7 @@ struct Parser<'c, 'a, 'm, M: Model> {
     model: &'m M,
     limits: &'c Limits,
     nodes: &'c mut usize,
+    computed: &'c [String],
     /// What names without a lambda variable resolve against, inside lambdas too.
     root: Scope<'m>,
     variables: Variables<'m>,
@@ -53,6 +56,7 @@ pub(crate) fn common_expr<'m, M: Model>(
         model,
         limits: budget.limits,
         nodes: &mut budget.nodes,
+        computed: &budget.computed,
         root: scope,
         variables: Vec::new(),
         depth: 0,
@@ -435,6 +439,12 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
             Scope::Type(ty) => self.model.member(ty, name),
             Scope::Primitive => None,
         };
+        // a `$compute` name, from the resource itself only
+        let root = path.variable.is_none() && path.path.is_empty();
+        let member = member.or_else(|| {
+            (root && self.computed.iter().any(|c| c == name))
+                .then_some(Member::Primitive { collection: false })
+        });
         let Some(member) = member else {
             if self.at_open() {
                 // An unqualified function call; no function is in the subset's model.
@@ -568,6 +578,10 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
     /// The rest of `allExpr` after `all(`: `all` has no empty form.
     fn all(&mut self, items: Scope<'m>, collection: MemberPath) -> Result<Expr, UrlError> {
         self.c.bws();
+        if self.c.close() {
+            // past the `)`, where the ABNF runner stops reading `all()` as a function call
+            return Err(self.c.syntax("lambdaVariableExpr"));
+        }
         let lambda = self.lambda(items)?;
         Ok(Expr::All { collection, lambda })
     }

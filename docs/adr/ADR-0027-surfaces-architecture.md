@@ -67,8 +67,9 @@ Adopted from the threat model section 9.1 without change:
 `full = ["views", "odata", "mcp", "linkml", "ws", "internal-csr"]`;
 `default` stays `["mqtt"]` (`crates/antares-broker/Cargo.toml:56`), so
 the default build is vanilla. Every workspace package declares
-`[package.metadata.antares] role = "core" | "ops" | "surface" |
-"protocol" | "addon"` (threat model 9.1).
+`[package.metadata.antares] role = "core" | "ngsild" | "ops" | "surface" |
+"protocol" | "addon"` (threat model 9.1; `ngsild` and its rule M3 added by
+T-3910, `docs/analysis/ngsild-crates.md`).
 
 Decided (worker-2, owner may override): the threat model's feature names
 (`views`, `odata`, `mcp`, `linkml`, `ws`, `internal-csr`), not

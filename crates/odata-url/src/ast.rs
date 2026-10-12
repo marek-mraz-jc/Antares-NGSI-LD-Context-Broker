@@ -104,6 +104,10 @@ pub enum KeyValue {
 pub struct QueryOptions {
     /// `$filter`.
     pub filter: Option<Expr>,
+    /// `$search` (URL 5.1.7).
+    pub search: Option<crate::Search>,
+    /// `$compute` (URL 5.1.10): its names resolve in `$filter`, `$orderby` and `$select`.
+    pub compute: Option<Vec<Compute>>,
     /// `$select`.
     pub select: Option<Vec<SelectItem>>,
     /// `$expand`.
@@ -128,6 +132,23 @@ pub struct QueryOptions {
     pub aliases: Vec<(String, Literal)>,
     /// Custom query options, as written: name and value after `=` (URL Conventions 5.2).
     pub custom: Vec<(String, Option<String>)>,
+}
+
+/// One `$compute` item: an expression and the name of the dynamic property it computes.
+///
+/// ```
+/// use odata_url::{ArithOp, Compute, Expr, Literal, MemberPath};
+/// let height = Expr::Member(MemberPath { variable: None, path: vec!["height".into()] });
+/// let expr = Expr::Arith(Box::new(height), ArithOp::Mul, Box::new(Expr::Literal(Literal::Int(2))));
+/// let item = Compute { expr, alias: "double".into() };
+/// assert_eq!(item.to_string(), "height%20mul%202%20as%20double");
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct Compute {
+    /// The value, over the members of the resource.
+    pub expr: Expr,
+    /// `computedProperty`: the name the value takes.
+    pub alias: String,
 }
 
 /// One `$select` item.
