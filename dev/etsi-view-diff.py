@@ -9,7 +9,10 @@ is not in the view's `operations`; ADR-0023 rule 4), a request no operation
 binds, a request naming an NGSILD-Tenant (rule 10) or an entity map (threat
 V22), or a Subscription operation in a TP whose fixtures made a Subscription
 at the root, which no view serves (rule 9: a view serves its own
-Subscriptions alone). The requests come from the run's requests.jsonl
+Subscriptions alone), or an Entity write in a TP whose fixtures registered a
+Context Source, which no write through a view reaches (rule 7 is checked on
+the local store, so the write stays local), and the same for a Subscription
+made through a view (rule 9: it has no distributed half). The requests come from the run's requests.jsonl
 (dev/etsi_setup_url.py records the body's and, marked, the fixtures').
 
 Usage:
@@ -88,10 +91,23 @@ OWN_SUBSCRIPTIONS = {"retrieve_subscription", "update_subscription",
                      "delete_subscription", "query_subscriptions"}
 
 
+# The Entity writes a registration can forward (TS 104 175 4.3.6.2); through
+# a view they stay local and no Context Source receives them, since rule 7
+# is checked on the local store alone (ADR-0023 rule 7,
+# antares-api federation::write_regs).
+LOCAL_WRITES = {"create_entity", "replace_entity", "merge_entity", "delete_entity",
+                "purge_entities", "append_attributes", "update_attributes",
+                "partial_attribute_update", "replace_attribute", "set_attribute_value",
+                "delete_attribute", "batch_create", "batch_update", "batch_upsert",
+                "batch_merge", "batch_delete"}
+
+
 def owed(requests, offered, binds, fixtures=()):
     """Why the view refuses some request of a TP's body, or []."""
     why = []
-    at_root = any(operation(f["method"], f["url"], binds) == "create_subscription" for f in fixtures)
+    made = {operation(f["method"], f["url"], binds) for f in fixtures}
+    at_root = "create_subscription" in made
+    registered = "register_context_source" in made
     for r in requests:
         url, headers = r["url"], set(r.get("headers") or ())
         op = operation(r["method"], url, binds)
@@ -106,6 +122,12 @@ def owed(requests, offered, binds, fixtures=()):
         elif at_root and op in OWN_SUBSCRIPTIONS:
             why.append(f"{r['method']} {op}: a fixture made the Subscription at the root, "
                        "and a view serves its own alone (ADR-0023 rule 9)")
+        elif registered and op in LOCAL_WRITES:
+            why.append(f"{r['method']} {op}: a fixture registered a Context Source, "
+                       "and a write through a view stays local (ADR-0023 rule 7)")
+        elif registered and op == "create_subscription":
+            why.append(f"{r['method']} {op}: a fixture registered a Context Source, "
+                       "and a Subscription through a view stays local (ADR-0023 rule 9)")
     return why
 
 
