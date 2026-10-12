@@ -1388,6 +1388,16 @@ fn search_reads_words_phrases_and_operators_with_their_precedence() {
     assert_eq!(search_of("$search=it's"), Word("it's".into()));
     // `searchExpr-incomplete` is one phrase, `''` a quote
     assert_eq!(search_of("$search='it''s red'"), Phrase("it's red".into()));
+    // `+` is a space in a phrase too; `&` percent-encoded is text
+    assert_eq!(search_of("$search=%22a+b%22"), Phrase("a b".into()));
+    assert_eq!(search_of("$search='a+b%26c'"), Phrase("a b&c".into()));
+    // whitespace before the end of the option or the next one
+    assert_eq!(search_of("$search=a%20"), Word("a".into()));
+    let spaced = options("Buildings?$search=a%20&$top=1");
+    assert_eq!(
+        (spaced.search, spaced.top),
+        (Some(Word("a".into())), Some(1))
+    );
     // the option ends at `&`
     let both = options("Buildings?$search=a&$top=1");
     assert_eq!((both.search, both.top), (Some(Word("a".into())), Some(1)));
@@ -1410,6 +1420,7 @@ fn search_refuses_what_is_no_search_expression() {
         "$search=a%2",
         "$search=%FF",
         "$search=a;b",
+        "$search=a 'b",
     ] {
         let e = err(&format!("Buildings?{query}"));
         assert!(

@@ -215,28 +215,35 @@ pub(crate) fn searched(search: &Search, set: &Set) -> Option<Expr> {
         })
         .map(|(name, _)| name.as_str())
         .collect();
-    match fold(search, &members) {
-        Folded::Always(true) => None,
-        Folded::Always(false) => Some(Expr::Literal(Literal::Bool(false))),
-        Folded::Expr(e) => Some(e),
+    if members.is_empty() {
+        // no property can hold a term: the search is a constant
+        return (!holds_nothing(search)).then_some(Expr::Literal(Literal::Bool(false)));
+    }
+    Some(matched(search, &members))
+}
+
+/// Whether `search` holds for an Entity whose properties hold no term.
+fn holds_nothing(search: &Search) -> bool {
+    match search {
+        Search::Word(_) | Search::Phrase(_) => false,
+        Search::Not(operand) => !holds_nothing(operand),
+        Search::And(left, right) => holds_nothing(left) && holds_nothing(right),
+        Search::Or(left, right) => holds_nothing(left) || holds_nothing(right),
     }
 }
 
-/// A search with its constant parts folded: a set without String properties matches no term.
-enum Folded {
-    Always(bool),
-    Expr(Expr),
-}
-
-fn fold(search: &Search, members: &[&str]) -> Folded {
+/// `search` as a filter over `members`, at least one.
+fn matched(search: &Search, members: &[&str]) -> Expr {
+    let both =
+        |l: &Search, r: &Search| (Box::new(matched(l, members)), Box::new(matched(r, members)));
     match search {
         Search::Word(text) | Search::Phrase(text) => {
             let needle = Literal::String(text.to_lowercase());
-            let matches = members.iter().map(|name| {
+            let one = |name: &str| {
                 let member = || {
                     Expr::Member(MemberPath {
                         variable: None,
-                        path: vec![(*name).to_owned()],
+                        path: vec![name.to_owned()],
                     })
                 };
                 let present = Expr::Compare(
@@ -252,25 +259,20 @@ fn fold(search: &Search, members: &[&str]) -> Folded {
                     ],
                 );
                 Expr::And(Box::new(present), Box::new(holds))
-            });
-            matches
-                .reduce(|a, b| Expr::Or(Box::new(a), Box::new(b)))
-                .map_or(Folded::Always(false), Folded::Expr)
+            };
+            let mut terms = members.iter().map(|name| one(name));
+            let first = terms.next().unwrap_or(Expr::Literal(Literal::Bool(false)));
+            terms.fold(first, |a, b| Expr::Or(Box::new(a), Box::new(b)))
         }
-        Search::Not(operand) => match fold(operand, members) {
-            Folded::Always(b) => Folded::Always(!b),
-            Folded::Expr(e) => Folded::Expr(Expr::Not(Box::new(e))),
-        },
-        Search::And(left, right) => match (fold(left, members), fold(right, members)) {
-            (Folded::Always(false), _) | (_, Folded::Always(false)) => Folded::Always(false),
-            (Folded::Always(true), other) | (other, Folded::Always(true)) => other,
-            (Folded::Expr(a), Folded::Expr(b)) => Folded::Expr(Expr::And(Box::new(a), Box::new(b))),
-        },
-        Search::Or(left, right) => match (fold(left, members), fold(right, members)) {
-            (Folded::Always(true), _) | (_, Folded::Always(true)) => Folded::Always(true),
-            (Folded::Always(false), other) | (other, Folded::Always(false)) => other,
-            (Folded::Expr(a), Folded::Expr(b)) => Folded::Expr(Expr::Or(Box::new(a), Box::new(b))),
-        },
+        Search::Not(operand) => Expr::Not(Box::new(matched(operand, members))),
+        Search::And(left, right) => {
+            let (l, r) = both(left, right);
+            Expr::And(l, r)
+        }
+        Search::Or(left, right) => {
+            let (l, r) = both(left, right);
+            Expr::Or(l, r)
+        }
     }
 }
 
@@ -2605,9 +2607,11 @@ mod tests {
             )),
         );
         assert_eq!(one, Some(want.clone()));
-        // a term and the constant side of a fold: the term alone
-        let mixed = Search::Or(word("x"), Box::new(Search::Word("y".into())));
-        assert!(matches!(searched(&mixed, &set()), Some(Expr::Or(..))));
+        let both = Search::And(word("x"), Box::new(Search::Or(word("y"), word("z"))));
+        assert!(matches!(
+            searched(&both, &set()),
+            Some(Expr::And(_, r)) if matches!(*r, Expr::Or(..))
+        ));
         let negated = searched(&Search::Not(Box::new(Search::Phrase("A b".into()))), &set());
         assert_eq!(negated, Some(Expr::Not(Box::new(want))));
         let translated = translate(
@@ -2617,6 +2621,9 @@ mod tests {
             &[],
         );
         // the presence is pushed as `q`, the case-insensitive match is the residual's
-        assert!(translated.is_ok_and(|t| t.q.is_some() && t.residual.len() == 1));
+        assert_eq!(
+            translated.ok().map(|t| (t.q.is_some(), t.residual.len())),
+            Some((true, 1))
+        );
     }
 }

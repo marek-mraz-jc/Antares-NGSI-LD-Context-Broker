@@ -259,8 +259,8 @@ impl Parser<'_, '_> {
                 continue;
             }
             match self.byte() {
-                Some(b) if b != b'&' => bytes.push(b),
-                _ => return Err(self.c.syntax("SQUOTE")),
+                Some(b) => bytes.push(b),
+                None => return Err(self.c.syntax("SQUOTE")),
             }
             self.length(start)?;
         }
