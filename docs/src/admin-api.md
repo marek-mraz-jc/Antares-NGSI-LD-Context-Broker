@@ -37,6 +37,9 @@ schema: `docs/openapi/antares-admin.yaml`, rendered at
 | `GET /q/tenants` | Tenant names |
 | `GET /q/tenants/{tenant}` | What one tenant holds |
 | `DELETE /q/tenants/{tenant}` | Tenant purge |
+| `GET /q/tenants/{tenant}/digest` | Entity count, history count and a hash over (id, `modifiedAt`) |
+| `GET /q/tenants/{tenant}/export` | The tenant's Entities and history as NDJSON, system attributes kept |
+| `POST /q/tenants/{tenant}/import` | An export into an empty tenant, all or nothing |
 | `GET /q/dead-letters` | Notifications the delivery policy gave up on |
 | `GET`, `PUT`, `DELETE /q/retention/{tenant}` | How long a Tenant keeps each type ([Retention](#retention)) |
 | `POST /q/retention/{tenant}/preview`, `GET /q/retention/{tenant}/deleted` | What a retention document would delete now; what this pod's sweeps deleted ([Retention](#retention)) |
@@ -194,6 +197,39 @@ Context Source, `400` for a name outside the tenant grammar. The default
 tenant is emptied and keeps existing. The path names the tenant; an
 `NGSILD-Tenant` header is ignored. Background in
 [operations](operations.md#tenants).
+
+
+### Moving a tenant to another broker
+
+ADR-0030. Hold the
+writers first: the export is not a point-in-time snapshot, and the digest
+proves the copy.
+
+#### GET /q/tenants/{tenant}/digest
+
+Answers `{"tenant","entities","attrInstances","sha256"}`. `sha256` is the
+sum modulo 2²⁵⁶ of `sha256(id ‖ 0x00 ‖ modifiedAt)` over the Entities, so
+two brokers agree whatever order they page in.
+
+#### GET /q/tenants/{tenant}/export
+
+Streams `application/x-ndjson`: a header `{"antaresExport":1,"tenant":…}`,
+one `{"kind":"entity","doc":…}` per Entity, then one
+`{"kind":"temporal","doc":…}` per history document, each as stored, and a
+trailer `{"end":true,"records":n}`. A stream that stops without the trailer
+was cut. A tenant holding Subscriptions, Registrations, Registration
+Subscriptions, Snapshots or distributed subscriptions answers `409` with
+their counts: v1 moves data only.
+
+#### POST /q/tenants/{tenant}/import
+
+Takes that stream into a tenant that holds nothing: no Entity, history,
+Subscription, registration, Snapshot, EntityMap, distributed subscription
+or hosted `@context` (`409` naming each count otherwise). The header names
+the same tenant, entities come before history, a line is at most 16 MiB.
+Any refused line, or a missing trailer, answers `400` naming the line; the
+import then deletes the Entities and history it wrote, by id, and nothing
+else. `204` when every record is in.
 
 ## Dead letters
 

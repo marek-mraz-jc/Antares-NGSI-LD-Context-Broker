@@ -94,6 +94,7 @@ module's header comment.
 | `entity_maps.rs` | 5.14 the `/entityMaps` resources (6.32, 6.34, 6.35): create from a query, retrieve, update, delete |
 | `entity_map.rs` | one EntityMap document (5.2.39): store it under its tenant with a lifetime, read it back while it lives, take a page's candidate ids from it, merge what a distributed query reached, and serve a retrieve through a presented map |
 | `snapshots.rs` | 5.16 snapshots under synthetic `snap-…` tenants |
+| `tenant_move.rs` | ADR-0030 tenant digest, export and import on `/q/tenants/{tenant}/…`: what a platform needs to move one tenant to another broker with its system attributes and history, and to prove the copy from both sides |
 | `contexts.rs` | 5.13 `/jsonldContexts` |
 | `conformance.rs` | 6.3.21 version negotiation |
 | `repr.rs` | 6.3.7, 4.5.4 representations: normalized, concise, keyValues, sysAttrs; 4.5.23 Linked Entity Retrieval (inline and flat, the lookup budget) and the 4.5.16 GeoJSON Feature/FeatureCollection shapes — what every module needs to render a document |

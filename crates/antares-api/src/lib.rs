@@ -100,6 +100,7 @@ pub mod state;
 pub(crate) mod subscriptions;
 pub(crate) mod temporal;
 pub(crate) mod temporalq;
+pub(crate) mod tenant_move;
 pub(crate) mod types_attrs;
 // The composition hook of endpoint views (ADR-0023, ADR-0027 section 5);
 // never in a vanilla build.
@@ -247,12 +248,15 @@ impl Admin {
     /// count `/q/health` reports. The destructuring in `router` binds one
     /// name per entry, so a route added to one and not the other does not
     /// compile.
-    const PATHS: [&'static str; 8] = [
+    const PATHS: [&'static str; 11] = [
         "/health",
         "/ready",
         "/metrics",
         "/tenants",
         "/tenants/{tenant}",
+        "/tenants/{tenant}/digest",
+        "/tenants/{tenant}/export",
+        "/tenants/{tenant}/import",
         "/dead-letters",
         "/dead-letters/{id}",
         "/dead-letters/{id}/replay",
@@ -269,7 +273,7 @@ impl ApiSurface for Admin {
     }
 
     fn router(&self, st: AppState) -> Router<AppState> {
-        let [health_p, ready_p, metrics_p, tenants_p, tenant_p, dl_p, dl_id_p, replay_p] =
+        let [health_p, ready_p, metrics_p, tenants_p, tenant_p, digest_p, export_p, import_p, dl_p, dl_id_p, replay_p] =
             Self::PATHS;
         let guard = axum::middleware::from_fn_with_state(st.clone(), admin_auth::require);
         // Prometheus text format. 404 until the broker installs the
@@ -283,6 +287,10 @@ impl ApiSurface for Admin {
         let routes = Router::new()
             .route(tenants_p, get(tenants_list))
             .route(tenant_p, get(tenant_get).delete(tenant_purge))
+            // ADR-0030: a Tenant's move to another broker.
+            .route(digest_p, get(tenant_move::digest))
+            .route(export_p, get(tenant_move::export))
+            .route(import_p, post(tenant_move::import))
             .route(dl_p, get(dead_letters_list))
             .route(dl_id_p, delete(dead_letter_delete))
             .route(replay_p, post(dead_letter_replay));
