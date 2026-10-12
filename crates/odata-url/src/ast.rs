@@ -108,6 +108,9 @@ pub struct QueryOptions {
     pub search: Option<crate::Search>,
     /// `$compute` (URL 5.1.10): its names resolve in `$filter`, `$orderby` and `$select`.
     pub compute: Option<Vec<Compute>>,
+    /// `$apply` (Data Aggregation 4.0 section 3): its transformations in order. After one that
+    /// aggregates, the other options name what it produces.
+    pub apply: Option<Vec<Transformation>>,
     /// `$select`.
     pub select: Option<Vec<SelectItem>>,
     /// `$expand`.
@@ -149,6 +152,111 @@ pub struct Compute {
     pub expr: Expr,
     /// `computedProperty`: the name the value takes.
     pub alias: String,
+}
+
+/// One transformation of `$apply` (Data Aggregation 4.0 section 3.1, `applyTrafo`).
+///
+/// ```
+/// use odata_url::{Aggregate, AggregateWith, Expr, MemberPath, Transformation};
+/// let price = Expr::Member(MemberPath { variable: None, path: vec!["price".into()] });
+/// let sum = Aggregate::With { expr: price, with: AggregateWith::Sum, alias: "total".into() };
+/// let groupby = Transformation::GroupBy {
+///     properties: vec!["brand".into()],
+///     aggregate: Some(vec![sum, Aggregate::Count { alias: "n".into() }]),
+/// };
+/// assert_eq!(
+///     groupby.to_string(),
+///     "groupby((brand),aggregate(price%20with%20sum%20as%20total,$count%20as%20n))"
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub enum Transformation {
+    /// `identity`: the input unchanged.
+    Identity,
+    /// `filter(boolCommonExpr)`.
+    Filter(Expr),
+    /// `orderby(orderbyItem, ...)`.
+    OrderBy(Vec<OrderBy>),
+    /// `top(n)`.
+    Top(u64),
+    /// `skip(n)`.
+    Skip(u64),
+    /// `aggregate(...)`: one row of every aggregate over the whole input.
+    Aggregate(Vec<Aggregate>),
+    /// `groupby((p, ...)[, aggregate(...)])`: one row per distinct value of the grouping
+    /// properties, each with the aggregates over its group.
+    GroupBy {
+        /// The grouping properties: single-segment primitive members.
+        properties: Vec<String>,
+        /// The aggregates of each group, none without one.
+        aggregate: Option<Vec<Aggregate>>,
+    },
+}
+
+/// One `aggregateExpr`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Aggregate {
+    /// `commonExpr with method as alias`.
+    With {
+        /// The value aggregated, over each input instance.
+        expr: Expr,
+        /// The aggregation method.
+        with: AggregateWith,
+        /// The name of the result.
+        alias: String,
+    },
+    /// `$count as alias`: the number of input instances.
+    Count {
+        /// The name of the result.
+        alias: String,
+    },
+}
+
+impl Aggregate {
+    /// The name of the result.
+    ///
+    /// ```
+    /// assert_eq!(odata_url::Aggregate::Count { alias: "n".into() }.alias(), "n");
+    /// ```
+    #[must_use]
+    pub fn alias(&self) -> &str {
+        match self {
+            Self::With { alias, .. } | Self::Count { alias } => alias,
+        }
+    }
+}
+
+/// The standard aggregation methods (Data Aggregation 4.0 section 3.1.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateWith {
+    /// `sum`.
+    Sum,
+    /// `min`.
+    Min,
+    /// `max`.
+    Max,
+    /// `average`.
+    Average,
+    /// `countdistinct`.
+    CountDistinct,
+}
+
+impl AggregateWith {
+    /// The method's name.
+    ///
+    /// ```
+    /// assert_eq!(odata_url::AggregateWith::CountDistinct.as_str(), "countdistinct");
+    /// ```
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Average => "average",
+            Self::CountDistinct => "countdistinct",
+        }
+    }
 }
 
 /// One `$select` item.

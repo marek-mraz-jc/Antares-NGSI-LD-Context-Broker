@@ -6,9 +6,9 @@
 use std::fmt::{self, Display, Formatter, Write};
 
 use crate::{
-    ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key,
-    KeyValue, Levels, Literal, MemberPath, ODataUri, OrderBy, Position, QueryOptions, Segment,
-    SelectItem, Shape,
+    Aggregate, ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath, Expr, Format,
+    Geography, Key, KeyValue, Levels, Literal, MemberPath, ODataUri, OrderBy, Position,
+    QueryOptions, Segment, SelectItem, Shape, Transformation,
 };
 
 impl Display for ODataUri {
@@ -72,6 +72,10 @@ impl Display for Query<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let o = self.0;
         let mut items: Vec<String> = Vec::new();
+        if let Some(apply) = &o.apply {
+            let steps: Vec<String> = apply.iter().map(ToString::to_string).collect();
+            items.push(format!("$apply={}", steps.join("/")));
+        }
         if let Some(compute) = &o.compute {
             items.push(format!("$compute={}", List(compute)));
         }
@@ -206,6 +210,40 @@ impl Display for OrderBy {
 impl Display for Compute {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}%20as%20{}", self.expr, self.alias)
+    }
+}
+
+impl Display for Transformation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Transformation::Identity => f.write_str("identity"),
+            Transformation::Filter(expr) => write!(f, "filter({expr})"),
+            Transformation::OrderBy(items) => write!(f, "orderby({})", List(items)),
+            Transformation::Top(n) => write!(f, "top({n})"),
+            Transformation::Skip(n) => write!(f, "skip({n})"),
+            Transformation::Aggregate(items) => write!(f, "aggregate({})", List(items)),
+            Transformation::GroupBy {
+                properties,
+                aggregate,
+            } => {
+                write!(f, "groupby(({})", properties.join(","))?;
+                if let Some(items) = aggregate {
+                    write!(f, ",aggregate({})", List(items))?;
+                }
+                f.write_str(")")
+            }
+        }
+    }
+}
+
+impl Display for Aggregate {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Aggregate::With { expr, with, alias } => {
+                write!(f, "{expr}%20with%20{}%20as%20{alias}", with.as_str())
+            }
+            Aggregate::Count { alias } => write!(f, "$count%20as%20{alias}"),
+        }
     }
 }
 
