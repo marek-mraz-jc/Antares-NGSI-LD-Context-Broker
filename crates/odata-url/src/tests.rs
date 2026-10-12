@@ -1912,6 +1912,11 @@ fn a_computed_name_and_the_names_a_concat_produces_resolve_after_them() {
         .len(),
         2
     );
+    // a name two branches produce resolves once
+    assert_eq!(
+        apply_of("concat(aggregate($count as n),aggregate($count as n))/filter(n gt 1)").len(),
+        2
+    );
     unresolved(
         "Buildings?$apply=concat(aggregate($count as n),groupby((name)))&$filter=height gt 1",
         72,

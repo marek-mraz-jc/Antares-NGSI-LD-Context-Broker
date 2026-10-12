@@ -772,7 +772,7 @@ fn container_capabilities() -> Vec<Annotation> {
         flag("QuerySegmentSupported", true),
         flag("CrossJoinSupported", false),
         flag("ComputeSupported", true),
-        // Q19: the `$apply` transformations served (T-3937)
+        // Q19: the `$apply` transformations served (T-3937, T-3985)
         Annotation::new(
             "Aggregation.ApplySupported",
             Expr::Record(vec![
@@ -787,6 +787,15 @@ fn container_capabilities() -> Vec<Annotation> {
                             "skip",
                             "aggregate",
                             "groupby",
+                            "topcount",
+                            "topsum",
+                            "toppercent",
+                            "bottomcount",
+                            "bottomsum",
+                            "bottompercent",
+                            "concat",
+                            "compute",
+                            "search",
                         ]
                         .into_iter()
                         .map(|t| Expr::String(t.into()))

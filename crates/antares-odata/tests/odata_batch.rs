@@ -450,7 +450,7 @@ async fn odata_batch_member_is_refused_like_the_request_alone() {
          "headers": {"Content-Type": "text/csv"}, "body": "x"},
         {"id": "3", "method": "get", "url": "Car?$filter=label eq 'one'"},
         {"id": "4", "method": "get", "url": "$metadata"},
-        {"id": "5", "method": "get", "url": "Car?$apply=topcount(1,speed)"}
+        {"id": "5", "method": "get", "url": "Car?$apply=expand(owner)"}
     ]);
     let (status, _, answer) = json_batch(&app, &members, &go_on).await;
     assert_eq!(status, StatusCode::OK, "{answer}");
