@@ -335,10 +335,15 @@ async fn upsert_in_view(
                     g.pre_whole(id, doc)?;
                 }
             }
+            let Some(&src) = docs.get(id) else {
+                return Err(NgsiError::InternalError(format!(
+                    "batch member {id} lost its document"
+                )));
+            };
             if update_mode {
-                merge_into(doc, docs[id], ts);
+                merge_into(doc, src, ts);
             } else {
-                let mut new = docs[id].clone();
+                let mut new = src.clone();
                 stamp_new(&mut new, ts);
                 // 4.8: a replaced Entity keeps the instant it was created.
                 if let (Some(o), Some(created)) = (new.as_object_mut(), doc.get("createdAt")) {
@@ -1066,11 +1071,13 @@ async fn batch_write(
         let mut occurrence: HashMap<String, usize> = HashMap::new();
         for (id, doc) in prepped {
             let n = occurrence.entry(id.clone()).or_insert(0);
-            if rounds.len() <= *n {
-                rounds.push(Vec::new());
+            // `n` never passes `rounds.len()`: each id's count grows by one
+            // and a round is added the first time a count reaches it
+            match rounds.get_mut(*n) {
+                Some(round) => round.push((id, doc)),
+                None => rounds.push(vec![(id, doc)]),
             }
-            rounds[*n].push((id, doc));
-            *n += 1;
+            *n = n.saturating_add(1);
         }
     }
     for round in rounds {
@@ -1113,7 +1120,12 @@ async fn batch_write(
                         .store
                         .batch_mutate(&tenant, &ids, |id, doc| {
                             conds.pre(id, doc)?;
-                            merge_into(doc, docs[id], &ts);
+                            let Some(&src) = docs.get(id) else {
+                                return Err(NgsiError::InternalError(format!(
+                                    "batch member {id} lost its document"
+                                )));
+                            };
+                            merge_into(doc, src, &ts);
                             Ok::<(), NgsiError>(())
                         })
                         .await?;
@@ -1146,7 +1158,12 @@ async fn batch_write(
                             .store
                             .batch_mutate(&tenant, &ids, |id, doc| {
                                 conds.pre(id, doc)?;
-                                let mut new = docs[id].clone();
+                                let Some(&src) = docs.get(id) else {
+                                    return Err(NgsiError::InternalError(format!(
+                                        "batch member {id} lost its document"
+                                    )));
+                                };
+                                let mut new = src.clone();
                                 stamp_new(&mut new, &ts);
                                 // 4.8: a replaced Entity keeps the instant it was created.
                                 if let (Some(o), Some(created)) =
@@ -1215,7 +1232,11 @@ async fn batch_write(
                         if let Some(g) = guard {
                             g.pre(id, doc)?;
                         }
-                        let expanded = docs[id];
+                        let Some(&expanded) = docs.get(id) else {
+                            return Err(NgsiError::InternalError(format!(
+                                "batch member {id} lost its document"
+                            )));
+                        };
                         if mode == BatchMode::Update && no_overwrite {
                             // noOverwrite is instance-level: only instances
                             // whose datasetId already exists are skipped

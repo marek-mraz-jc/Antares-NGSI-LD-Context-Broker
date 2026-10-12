@@ -144,6 +144,8 @@ dependencies = [
  "antares-ql",
  "antares-residual",
  "axum",
+ "chrono",
+ "metrics",
  "serde",
  "serde_json",
  "tokio",

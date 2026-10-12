@@ -32,42 +32,6 @@ const KNOWN_KEYS: &[&str] = &[
     // other key it has no code for.
     #[cfg(feature = "plugin-example")]
     antares_plugin_example::RULES_ENV,
-    // How often every pod reloads the view table from the store (ADR-0023
-    // rule 10); only a build with views has one.
-    #[cfg(feature = "views")]
-    antares_ops::views::RELOAD_ENV,
-    // The bound on a Tenant's LinkML schema (T-3628); unset, no schema is
-    // taken.
-    #[cfg(feature = "views")]
-    antares_ops::views::SCHEMA_MAX_ENV,
-    // The MCP surface's hosts, origins and result budget (MC8, D-10).
-    #[cfg(feature = "mcp")]
-    antares_mcp::ALLOWED_HOSTS_ENV,
-    #[cfg(feature = "mcp")]
-    antares_mcp::ALLOWED_ORIGINS_ENV,
-    #[cfg(feature = "mcp")]
-    antares_mcp::MAX_RESULT_BYTES_ENV,
-    // The WebSocket channel's bounds (ADR-0026 rules 6 to 10).
-    #[cfg(feature = "ws")]
-    antares_ws::QUEUE_ENV,
-    #[cfg(feature = "ws")]
-    antares_ws::RESUME_GRACE_ENV,
-    #[cfg(feature = "ws")]
-    antares_ws::MAX_LIFETIME_ENV,
-    #[cfg(feature = "ws")]
-    antares_ws::MAX_CONNECTIONS_ENV,
-    #[cfg(feature = "ws")]
-    antares_ws::MAX_CONNECTIONS_PER_TENANT_ENV,
-    #[cfg(feature = "ws")]
-    antares_ws::MAX_SUBSCRIPTIONS_ENV,
-    #[cfg(feature = "ws")]
-    antares_ws::ALLOWED_ORIGINS_ENV,
-    // The key that seals a write's confirmation, and the endpoints a
-    // subscription made through a tool may notify (MC4, MC12).
-    #[cfg(feature = "mcp")]
-    antares_mcp::REQUEST_STATE_KEY_FILE_ENV,
-    #[cfg(feature = "mcp")]
-    antares_mcp::SUBSCRIPTION_ENDPOINTS_ENV,
     "ANTARES_DATABASE_URL",
     "ANTARES_STORE",
     // Temporal driver: a store mode, or `none` — history off (temporal
@@ -83,6 +47,9 @@ const KNOWN_KEYS: &[&str] = &[
     // brokers federate inside private networks); a hardened deployment sets
     // this to false to arm the SSRF wall.
     "ANTARES_EGRESS_ALLOW_PRIVATE",
+    // Host names that may still resolve to a private address while the wall
+    // is armed: the in-cluster peers (T-3908); never loopback or metadata.
+    "ANTARES_EGRESS_PRIVATE_HOSTS",
     // Refuse to start when the DB role bypasses RLS (production gate;
     // default off so the dev/ETSI superuser stack still boots).
     "ANTARES_REQUIRE_RLS",
@@ -173,6 +140,29 @@ const KNOWN_KEYS: &[&str] = &[
     "ANTARES_MIGRATE",
 ];
 
+/// The keys of each surface this binary was built with, listed by the crate
+/// that reads them: a surface's new variable lands in its own crate, not in
+/// this file, which every surface branch used to edit (T-3766).
+const SURFACE_KEYS: &[&[&str]] = &[
+    // the view table's reload interval and LinkML schema bound
+    #[cfg(feature = "views")]
+    antares_ops::views::ENV_KEYS,
+    // hosts, origins, result budget, the confirmation key, tool endpoints
+    #[cfg(feature = "mcp")]
+    antares_mcp::ENV_KEYS,
+    // the WebSocket channel's bounds (ADR-0026 rules 6 to 10)
+    #[cfg(feature = "ws")]
+    antares_ws::ENV_KEYS,
+];
+
+/// Every config key this binary accepts.
+fn known_keys() -> impl Iterator<Item = &'static str> {
+    KNOWN_KEYS
+        .iter()
+        .chain(SURFACE_KEYS.iter().flat_map(|keys| keys.iter()))
+        .copied()
+}
+
 /// Jemalloc with decay-based purging — RSS returns to ~live×1.2 when idle;
 /// tune via MALLOC_CONF (e.g. dirty_decay_ms). Deliberately not glibc
 /// malloc, whose arena fragmentation never gives memory back.
@@ -190,7 +180,7 @@ fn unknown_config_key(key: &str) -> bool {
     if !key.starts_with("ANTARES_") || key.starts_with("ANTARES_TEST_") {
         return false;
     }
-    if KNOWN_KEYS.contains(&key) {
+    if known_keys().any(|known| known == key) {
         return false;
     }
     // kubelet service-link shapes for the Services OUR manifests ship
@@ -276,7 +266,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              (an unknown ANTARES_* key is fatal at startup).\n",
             env!("CARGO_PKG_VERSION")
         );
-        for key in KNOWN_KEYS {
+        for key in known_keys() {
             println!("  {key}");
         }
         return Ok(());
@@ -306,7 +296,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (key, _) in std::env::vars_os() {
         let key = key.to_string_lossy();
         if unknown_config_key(&key) {
-            return Err(format!("unknown config key {key} (known: {KNOWN_KEYS:?})").into());
+            let known: Vec<&str> = known_keys().collect();
+            return Err(format!("unknown config key {key} (known: {known:?})").into());
         }
     }
 
@@ -743,7 +734,10 @@ async fn build_builtin(
             Ok((AnyStore::Mem(Store::open_file(&dir)?), None))
         }
         StoreMode::Postgres | StoreMode::Timescale => {
+            // The URL carries the database password: held as a Secret so no
+            // error or log line below can print it (T-3915).
             let url = std::env::var("ANTARES_DATABASE_URL")
+                .map(antares_api::secret::Secret::new)
                 .map_err(|_| format!("ANTARES_STORE={mode} requires ANTARES_DATABASE_URL"))?;
             let pool_size = parse_pg_pool(std::env::var("ANTARES_PG_POOL").ok().as_deref())?;
             let statement_timeout = parse_pg_statement_timeout(
@@ -754,7 +748,12 @@ async fn build_builtin(
             // The DB container may still be booting — bounded retry, then die.
             let mut last = String::new();
             for _ in 0..30 {
-                match antares_sql::store::pg::connect_with(&url, pool_size, statement_timeout).await
+                match antares_sql::store::pg::connect_with(
+                    url.expose(),
+                    pool_size,
+                    statement_timeout,
+                )
+                .await
                 {
                     Ok(pool) => {
                         // The temporal backend is what the migrations actually
@@ -1520,6 +1519,52 @@ mod config_key_tests {
             missing.is_empty(),
             "KNOWN_KEYS is missing variables the workspace reads: {missing:#?}"
         );
+    }
+
+    /// The test above finds a key a crate reads as a literal; a surface reads
+    /// through a `*_ENV` const instead, which the broker accepts only when
+    /// the crate lists it in its `ENV_KEYS`. With every surface built, each
+    /// such const under `crates/` has to be a key the broker knows.
+    #[cfg(feature = "full")]
+    #[test]
+    fn every_env_const_of_a_surface_crate_is_a_known_key() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates dir")
+            .to_path_buf();
+        let mut declared = Vec::new();
+        let mut stack = vec![crates];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read_dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let src = std::fs::read_to_string(&path).unwrap_or_default();
+                    for line in src.lines() {
+                        let Some(rest) = line.trim_start().strip_prefix("pub const ") else {
+                            continue;
+                        };
+                        let Some((name, value)) = rest.split_once(": &str = \"") else {
+                            continue;
+                        };
+                        if name.ends_with("_ENV") {
+                            let key = value.trim_end_matches("\";").to_owned();
+                            declared.push(format!("{key} ({name} in {})", path.display()));
+                            if key.starts_with("ANTARES_") {
+                                assert!(
+                                    super::known_keys().any(|k| k == key),
+                                    "{key} ({name} in {}) is no ENV_KEYS entry",
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // the scan itself must find the surface consts it guards
+        assert!(declared.len() >= 14, "found only {declared:#?}");
     }
 }
 

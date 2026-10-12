@@ -8,7 +8,7 @@
 //! ([`Cmp`]), `and`/`or`/`not`, `IS NULL`, `IN`, `any`/`all` over a list value, calls from the
 //! closed table [`Func`] and spatial relations of `GeoJSON` geometries ([`Spatial`]). [`compile`] checks it against the bounds of rule 7 ([`MAX_DEPTH`],
 //! [`MAX_NODES`]), folds `now` to the one value the request was given and builds each pattern
-//! once; [`eval`] answers [`Truth`] for one Entity.
+//! once; [`eval()`] answers [`Truth`] for one Entity.
 //!
 //! A missing value, a hidden one (the view removed it before the residual sees the Entity) and
 //! a value of the wrong type are all *unknown*: a comparison with one is [`Truth::Unknown`], and
@@ -471,11 +471,11 @@ pub fn eval(program: &Program, entity: &Value) -> Result<Truth, Error> {
 }
 
 impl Program {
-    /// [`eval`] as a method.
+    /// [`eval()`] as a method.
     ///
     /// # Errors
     ///
-    /// As [`eval`].
+    /// As [`eval()`].
     pub fn eval(&self, entity: &Value) -> Result<Truth, Error> {
         eval(self, entity)
     }

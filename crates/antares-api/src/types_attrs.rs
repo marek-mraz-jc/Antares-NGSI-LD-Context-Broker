@@ -183,10 +183,15 @@ async fn type_stats(
                 attrs.entry(k.clone()).or_default().extend(types);
             }
         }
-        for t in doc["type"].as_array().cloned().unwrap_or_default() {
+        for t in doc
+            .get("type")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
             if let Some(t) = t.as_str() {
                 let e = map.entry(t.to_owned()).or_default();
-                e.0 += 1;
+                e.0 = e.0.saturating_add(1);
                 for (a, tys) in &attrs {
                     e.1.entry(a.clone())
                         .or_default()
@@ -212,8 +217,9 @@ async fn attr_stats(
     let mut map: AttrStats = BTreeMap::new();
     let (rows, partial) = scan(st, tenant, max, only, view).await?;
     for doc in rows {
-        let etypes: Vec<String> = doc["type"]
-            .as_array()
+        let etypes: Vec<String> = doc
+            .get("type")
+            .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default()
             .iter()
@@ -229,7 +235,7 @@ async fn attr_stats(
                 // Table 5.2.28-1 attributeCount: "Number of attribute
                 // instances with this attribute name" — a multi-instance
                 // attribute (4.5.5 datasetId) counts once per instance.
-                e.0 += v.as_array().map_or(1, Vec::len);
+                e.0 = e.0.saturating_add(v.as_array().map_or(1, Vec::len));
                 if let Some(arr) = v.as_array() {
                     for inst in arr {
                         if let Some(t) = inst.get("type").and_then(Value::as_str) {
