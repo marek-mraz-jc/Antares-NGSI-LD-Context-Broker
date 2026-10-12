@@ -3,8 +3,9 @@
 //! sections 8 and 9, ADR-0024): read from LinkML's resolved JSON
 //! serialisation, never from YAML, with every metaslot outside the subset
 //! refused (threat LK4); written as LinkML YAML, JSON Schema, a JSON-LD
-//! `@context`, SHACL, OWL, RDFS and Markdown by deterministic writers that
-//! quote and escape every name they print (threat LK3).
+//! `@context`, SHACL, OWL, RDFS, the RDF Data Cube and Markdown by
+//! deterministic writers that quote and escape every name they print
+//! (threat LK3).
 //!
 //! ```
 //! use linkml_model::{Limits, Model};
@@ -26,8 +27,11 @@ mod schema;
 mod write;
 
 pub use error::Error;
-pub use model::{edm_types, Builtin, Limits, Model, Range, EDM_TYPE_TAG, FLAG_TAGS, KIND_TAG};
+pub use model::{
+    edm_types, Builtin, Limits, Model, Range, EDM_TYPE_TAG, FLAG_TAGS, KIND_TAG, QB_COMPONENT_TAG,
+    QB_DSD_TAG,
+};
 pub use schema::{
     Annotation, Class, Enum, PermissibleValue, Prefix, Schema, Slot, Unit, DEFAULT_RANGE, IMPORTS,
 };
-pub use write::{context, json_schema, markdown, owl, rdfs, shacl, yaml};
+pub use write::{context, json_schema, markdown, owl, qb, rdfs, shacl, yaml};
