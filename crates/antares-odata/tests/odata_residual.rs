@@ -571,6 +571,26 @@ async fn a_join_past_the_lookup_budget_is_400_scanned_or_pushed() -> Result<(), 
     Ok(())
 }
 
+/// A key every Car holds stays pushed beside a residual: the store's order is
+/// URL 5.1.5's when nothing lacks the key (T-3853).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_every_entity_holds_stays_pushed_beside_a_residual() -> Result<(), String> {
+    let (_b, app) = broker(CARS).await?;
+    let residual = "$filter=not%20(speed%20gt%2020)";
+    let by_label = |filter: &str| format!("{ROOT}/Car?{filter}&$orderby=label%20desc&$top=1000");
+    let answer = get(&app, &by_label(residual), &[]).await;
+    let pushed = get(
+        &app,
+        &by_label("$filter=speed%20le%2020%20or%20speed%20eq%20null"),
+        &[],
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(ids(&answer.body), ids(&pushed.body));
+    assert_eq!(ids(&answer.body).len(), 22);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_scanned_read_keeps_select_orderby_and_the_stores_refusals() -> Result<(), String> {
     let (_b, app) = broker(CARS).await?;
@@ -776,5 +796,75 @@ async fn a_select_projects_and_never_selects() -> Result<(), String> {
     .await;
     assert_eq!(no_speed.status, StatusCode::OK, "{}", no_speed.body);
     assert_eq!(no_speed.body["speed"], Value::Null, "{}", no_speed.body);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn orderby_puts_a_missing_value_first_ascending_and_last_descending() -> Result<(), String> {
+    // T-3853, URL 5.1.5: null first ascending, last descending; ties in id order
+    let (_b, app) = broker(CARS).await?;
+    let id = |n: u32| format!("urn:ngsi-ld:Car:{n:03}");
+    let speedless: Vec<String> = (1..=CARS).filter(|n| speed(*n).is_none()).map(id).collect();
+    let mut fast: Vec<u32> = (1..=CARS).filter(|n| speed(*n).is_some()).collect();
+    let rising: Vec<String> = speedless
+        .iter()
+        .cloned()
+        .chain(fast.iter().copied().map(id))
+        .collect();
+    // the speedless tie on `speed`, so `label` orders them, as strings: "car 10" before "car 5"
+    let mut labelled = speedless.clone();
+    labelled.sort_by_key(|i| {
+        format!(
+            "car {}",
+            i.rsplit(':').next().unwrap_or("").trim_start_matches('0')
+        )
+    });
+    let by_label: Vec<String> = labelled
+        .into_iter()
+        .chain(fast.iter().copied().map(id))
+        .collect();
+    fast.reverse();
+    let falling: Vec<String> = fast
+        .into_iter()
+        .map(id)
+        .chain(speedless.iter().cloned())
+        .collect();
+    for (orderby, want) in [
+        ("speed", &rising),
+        ("speed%20desc", &falling),
+        ("speed,label", &by_label),
+        ("speed%20desc,id", &falling),
+    ] {
+        for page in [1000, 7] {
+            let got = chained(&app, &format!("{ROOT}/Car?$orderby={orderby}"), page).await?;
+            assert_eq!(got, *want, "$orderby={orderby}, pages of {page}");
+        }
+        // beside a residual, through the scan
+        let got = chained(
+            &app,
+            &format!("{ROOT}/Car?$orderby={orderby}&$filter=not%20(speed%20gt%2020)"),
+            4,
+        )
+        .await?;
+        let kept: Vec<String> = want
+            .iter()
+            .filter(|i| {
+                let n: u32 = i
+                    .rsplit(':')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                speed(n).is_none_or(|s| s <= 20)
+            })
+            .cloned()
+            .collect();
+        assert_eq!(got, kept, "$orderby={orderby} beside a residual");
+    }
+    // a key every Entity holds stays the store's order
+    let labels = chained(&app, &format!("{ROOT}/Car?$orderby=label%20desc"), 7).await?;
+    let mut want: Vec<(String, String)> = (1..=CARS).map(|n| (format!("car {n}"), id(n))).collect();
+    want.sort();
+    want.reverse();
+    assert_eq!(labels, want.into_iter().map(|(_, i)| i).collect::<Vec<_>>());
     Ok(())
 }

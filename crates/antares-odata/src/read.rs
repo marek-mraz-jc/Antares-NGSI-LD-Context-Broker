@@ -721,6 +721,7 @@ async fn collection(
         .unwrap_or(u64::MAX)
         .min(max_page(headers, reads.state.max_header_len))
         .min(MAX_PAGE);
+    nulls_first(reads, caller, set, &mut filter, version).await?;
     if filter.sort.is_some() && filter.residual.is_empty() {
         // a surface sort reads the whole answer through the scan: a residual that always holds
         filter.residual.push(RExpr::And(Vec::new()));
@@ -1485,6 +1486,64 @@ fn projected<'s>(
             })
             .collect(),
     )
+}
+
+/// URL 5.1.5 puts null first ascending and last descending; the store puts
+/// an Entity lacking an `orderBy` key after every value either way. One
+/// count of the Entities lacking a key decides: none, and the store's order
+/// is the standard's; any, and the read is sorted on the surface (T-3853).
+// ponytail: a sparse key over RESIDUAL_SCAN Entities is 400 TooManyResults;
+// split a single-key sort into "lacks it" and "holds it" reads if that matters
+async fn nulls_first(
+    reads: &Reads,
+    caller: &Caller,
+    set: &Set,
+    filter: &mut Translated,
+    version: ODataVersion,
+) -> Result<(), ODataErrorResponse> {
+    let terms: Vec<&str> = filter
+        .pushed_keys
+        .iter()
+        .filter_map(|k| match &k.by {
+            SortBy::Value(term) => Some(term.as_str()),
+            SortBy::Id | SortBy::System(_) => None,
+        })
+        .collect();
+    if filter.order.is_none() || terms.is_empty() {
+        return Ok(());
+    }
+    let lacking = terms
+        .iter()
+        .map(|t| format!("!{t}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let q = match &filter.q {
+        Some(q) => format!("({q});({lacking})"),
+        None => lacking,
+    };
+    let probe = Translated {
+        q: Some(q),
+        ..filter.probe()
+    };
+    let target = format!(
+        "/ngsi-ld/v1/entities?{}&limit=0&count=true",
+        query(set, None, &[], &probe)
+    );
+    let (_, lacking) = run(
+        reads,
+        caller,
+        OperationId::QueryEntities,
+        target,
+        &probe,
+        version,
+    )
+    .await?;
+    if lacking > 0 {
+        filter.sort_reads = terms.iter().map(|t| (*t).to_owned()).collect();
+        filter.sort = Some(std::mem::take(&mut filter.pushed_keys));
+        filter.order = None;
+    }
+    Ok(())
 }
 
 /// The request's residual as a program, `now` read once (ADR-0028 rule 2).
