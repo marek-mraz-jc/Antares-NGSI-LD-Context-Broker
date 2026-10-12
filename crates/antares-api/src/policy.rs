@@ -1876,6 +1876,8 @@ pub async fn run_policy_contract(engine: &dyn PolicyEngine) {
             }
             // `decide` answers a condition on anything but a write by id as
             // a deny, so reaching here is the seam's fault, not the engine's.
+            // A contract harness (test-kit) fails by panicking, as asserts do.
+            #[allow(clippy::panic)]
             Decision::AllowIf(_) => panic!("{name}: a condition on {clause} passed the seam"),
         }
     }

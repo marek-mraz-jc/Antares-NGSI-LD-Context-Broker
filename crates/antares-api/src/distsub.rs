@@ -134,9 +134,9 @@ async fn inbound_put(st: &AppState, remote_id: &str, tenant: &TenantId, own_id: 
             )
             .await
         {
-            tracing::warn!(
-                "subscription {own_id}: inbound mapping for {remote_id} not stored: {e}"
-            );
+            // Not the remote id: it is the key /ex/v1/remote-notify accepts
+            // a notification by, and a log line is no place for it (T-3915).
+            tracing::warn!("subscription {own_id}: inbound mapping not stored: {e}");
         }
     }
 }
