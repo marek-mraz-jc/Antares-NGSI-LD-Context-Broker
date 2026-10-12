@@ -700,5 +700,11 @@ jobs:
         run: |
           base=$(git describe --tags --abbrev=0 --match 'v*')
           echo "baseline $base"
-          cargo semver-checks --baseline-rev "$base" \
-            -p antares-model -p antares-jsonld -p antares-ql -p antares-matcher -p antares-residual
+          # a crate the baseline tag does not have yet has no API to break
+          for crate in antares-model antares-jsonld antares-ql antares-matcher antares-residual; do
+            if git cat-file -e "$base:crates/$crate/Cargo.toml" 2>/dev/null; then
+              cargo semver-checks --baseline-rev "$base" -p "$crate"
+            else
+              echo "::notice::$crate is new since $base, no baseline to compare"
+            fi
+          done

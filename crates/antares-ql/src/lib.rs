@@ -203,7 +203,7 @@ impl QNode {
 /// System-generated members that never count as a "non-system Attribute"
 /// (5.6.21.4). `id`/`type`/`scope` are Entity members, the timestamps are the
 /// system temporal attributes of 6.3.11.
-pub(crate) const SYSTEM_ATTRS: &[&str] = &[
+pub const SYSTEM_ATTRS: &[&str] = &[
     "id",
     "type",
     "scope",
