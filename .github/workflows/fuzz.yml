@@ -48,6 +48,11 @@ jobs:
       - name: Fuzz ${{ matrix.target }}
         # bounded allocation is part of the property (T-3463): one allocation
         # past 512 MB, or a process past 2 GB, is a finding like a panic
+        # ASan keeps every distinct allocation stack forever; a recursive builder
+        # (residual_compile, nesting to 80) makes a new 30-frame stack per path and
+        # grew to the 2 GB limit with 31 MB live (T-3992). 8 frames keep it flat.
+        env:
+          ASAN_OPTIONS: malloc_context_size=8
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=${{ inputs.seconds || 300 }} -malloc_limit_mb=512 -rss_limit_mb=2048
       - name: A crash leaves its input behind
         # `cargo fuzz run` builds and runs under one command, so a target that
