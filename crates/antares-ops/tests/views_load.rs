@@ -112,3 +112,27 @@ fn the_committed_all_view_loads() {
     assert!(loaded.view.shows_every_name());
     assert_eq!(loaded.tenant, "conformance");
 }
+
+/// The view E4 runs the ETSI suite through (T-3787) loads as committed: Building and City, every
+/// Attribute the suite writes on them but `airQualityLevel`, the read operations only.
+#[test]
+fn the_committed_etsi_restricted_view_loads() {
+    let doc: Value =
+        serde_json::from_str(include_str!("../../../ci/views/etsi/etsi-restricted.json"))
+            .expect("ci/views/etsi/etsi-restricted.json is JSON");
+    let loaded = load(&doc).expect("ci/views/etsi/etsi-restricted.json loads");
+    assert!(!loaded.view.shows_every_name());
+    let (types, attributes) = loaded.view.shown_names();
+    assert_eq!(
+        types,
+        ["City", "https://ngsi-ld-test-suite/context#Building"],
+        "compacted under the core @context"
+    );
+    assert!(attributes.contains(&"https://ngsi-ld-test-suite/context#name".to_owned()));
+    assert!(!attributes.iter().any(|a| a.ends_with("airQualityLevel")));
+    assert_eq!(
+        loaded.operations.len(),
+        15,
+        "the read operations of operation-matrix.yaml"
+    );
+}

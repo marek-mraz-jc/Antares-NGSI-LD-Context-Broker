@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Module rules M1 and M2 (ADR-0027 section 2, surfaces-threat-model 9.3, 9.4,
+"""Module rules M1, M2 and M3 (ADR-0027 section 2, surfaces-threat-model 9.3, 9.4,
 10.1 and the 11.1 row `default-features = false`), checked on the output of
 `cargo metadata --format-version 1 --locked --no-deps`.
 
-Every workspace package declares `[package.metadata.antares] role` (core, ops,
-surface, protocol, addon). From the roles:
+Every workspace package declares `[package.metadata.antares] role` (core, ngsild,
+ops, surface, protocol, addon). From the roles:
 
   M1  a protocol crate depends on no `antares-*` crate, in any dependency kind;
       a surface crate is an optional dependency of `antares-broker` behind its
@@ -15,6 +15,10 @@ surface, protocol, addon). From the roles:
       never depends on the store, SQL, bus, notifier, a surface or a protocol
       crate, and never re-exports the store, SQL or `AppState` from its source
       (threat F1: the store is unreachable from a surface by dependency).
+  M3  an ngsild crate (pure NGSI-LD, reusable outside the broker, T-3910)
+      depends inside the workspace only on ngsild crates, and outside it only
+      on the crates NGSILD_EXTERNAL names; any other crate is an optional
+      dependency its `default` feature does not turn on (T-3911's `fetch`).
   11.1 every registry dependency of an ops, surface or protocol crate has
       `default-features = false` unless `default-features-ok` names it with a
       reason.
@@ -26,6 +30,7 @@ cannot pass by never matching (the dev/check-no-addon.sh discipline).
 """
 
 import copy
+import fnmatch
 import json
 import pathlib
 import re
@@ -34,10 +39,13 @@ import sys
 import tempfile
 import tomllib
 
-ROLES = {"core", "ops", "surface", "protocol", "addon"}
+ROLES = {"core", "ngsild", "ops", "surface", "protocol", "addon"}
 BROKER = "antares-broker"
 OPS = "antares-ops"
 OPS_FORBIDDEN = {"antares-store", "antares-sql", "antares-bus", "antares-notifier"}
+
+# M3: what an ngsild crate may link by default. Patterns are fnmatch globs.
+NGSILD_EXTERNAL = ("serde", "serde_json", "thiserror", "chrono", "regex", "geo*", "unicode-*", "uuid")
 
 # 10.1: the table each new crate carries instead of `workspace = true`.
 LINTS = {
@@ -117,6 +125,26 @@ def check(meta):
             if d["name"].startswith("antares-"):
                 out.append(("protocol-dep", f"{name} (protocol) depends on {d['name']} "
                                             f"({d['kind'] or 'normal'})"))
+
+    for name in of("ngsild"):
+        pkg = pkgs[name]
+        optional = {d["name"] for d in pkg["dependencies"] if d["optional"]}
+        _, by_default = feature_closure(pkg["features"], pkg["features"].get("default", []), optional)
+        for d in pkg["dependencies"]:
+            if d["kind"] == "dev":
+                continue
+            kind = d["kind"] or "normal"
+            if d["name"] in pkgs:
+                if role.get(d["name"]) != "ngsild":
+                    out.append(("ngsild-dep", f"{name} (ngsild) depends on {d['name']} "
+                                              f"({role.get(d['name'])}, {kind})"))
+            elif not any(fnmatch.fnmatchcase(d["name"], g) for g in NGSILD_EXTERNAL):
+                if not d["optional"]:
+                    out.append(("ngsild-dep", f"{name} (ngsild) depends on {d['name']} ({kind}); "
+                                              f"only {', '.join(NGSILD_EXTERNAL)} by default"))
+                elif d["name"] in by_default:
+                    out.append(("ngsild-dep", f"{name} (ngsild): its default features turn on "
+                                              f"{d['name']}"))
 
     broker = pkgs.get(BROKER)
     if broker is None:
@@ -245,6 +273,10 @@ def synthetic(root):
             **{"default-features-ok": {"tokio": "runtime, its defaults are minimal"}}),
         pkg("odata-url", "protocol", [dep("serde", kind="dev", source=reg)], lints=True),
         pkg("antares-plugin-example", "addon", [dep("antares-store")]),
+        pkg("antares-model", "ngsild", [dep("serde", source=reg), dep("geo-types", source=reg)]),
+        {**pkg("antares-ql", "ngsild", [dep("antares-model"), dep("regex", source=reg),
+                                        dep("tokio", optional=True, source=reg)]),
+         "features": {"default": ["std"], "std": [], "fetch": ["dep:tokio"]}},
     ]}
 
 
@@ -312,6 +344,12 @@ def self_test():
             ("default-features", edit(lambda m: p(m, "antares-views")["metadata"]["antares"].update(
                 {"default-features-ok": {"tokio": " "}}))),
             ("lints", strip_lint),
+            ("ngsild-dep", edit(lambda m: p(m, "antares-model")["dependencies"].append(dep("tokio", source="registry+x")))),
+            ("ngsild-dep", edit(lambda m: p(m, "antares-model")["dependencies"].append(dep("tokio", kind="build", source="registry+x")))),
+            ("ngsild-dep", edit(lambda m: p(m, "antares-model")["dependencies"].append(dep("antares-api")))),
+            ("ngsild-dep", edit(lambda m: p(m, "antares-ql")["dependencies"].append(dep("antares-store")))),
+            ("ngsild-dep", edit(lambda m: p(m, "antares-ql")["features"].update(default=["std", "fetch"]))),
+            ("ngsild-dep", edit(lambda m: p(m, "antares-ql")["features"].update(default=["tokio"]))),
         ]
         failed = 0
         for code, run in cases:
