@@ -5,9 +5,9 @@
 mod service;
 
 use odata_url::{
-    parse, ArithOp, CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key,
-    KeyValue, Levels, Limits, Literal, MemberPath, Method, ODataUri, OrderBy, Position,
-    QueryOptions, Search, Segment, SelectItem, Shape,
+    parse, ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath, Expr, Format,
+    Geography, Key, KeyValue, Levels, Limits, Literal, MemberPath, Method, ODataUri, OrderBy,
+    Position, QueryOptions, Search, Segment, SelectItem, Shape,
 };
 use proptest::prelude::*;
 use service::Service;
@@ -308,16 +308,28 @@ mod strategy {
             prop::option::of(search()),
             prop::collection::vec(("[a-z]{1,4}", literal()), 0..3),
             prop::collection::vec(custom(), 0..3),
+            prop::collection::vec(expr(), 0..3),
         );
         (system, rest)
             .prop_map(
                 |(
                     (filter, select, expand, orderby, top, skip, count, format),
-                    (skiptoken, schemaversion, id, search, aliases, custom),
+                    (skiptoken, schemaversion, id, search, aliases, custom, computed),
                 )| {
+                    let compute = (!computed.is_empty()).then(|| {
+                        computed
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, expr)| Compute {
+                                expr,
+                                alias: format!("c{i}"),
+                            })
+                            .collect()
+                    });
                     QueryOptions {
                         filter,
                         search,
+                        compute,
                         select,
                         expand,
                         orderby,

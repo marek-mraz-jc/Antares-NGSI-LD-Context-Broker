@@ -28,7 +28,7 @@ use antares_ops::residual::{
     self, Cmp, Date, DateTime, Expr as RExpr, Func, Lit, Member as RMember, Path, Spatial, Time,
 };
 use odata_url::{
-    ArithOp, CompareOp, Expr, Geography, Literal, MemberPath, Method, OrderBy, Search,
+    ArithOp, CompareOp, Compute, Expr, Geography, Literal, MemberPath, Method, OrderBy, Search,
 };
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -91,6 +91,14 @@ pub(crate) struct Translated {
     /// The `ngsild.*` parameters pushed beside the rest (`&scopeQ=…`,
     /// `&georel=…`), encoded (ADR-0028 rule 6).
     pub(crate) ngsild: String,
+    /// The `$compute` items as residual values, name and value, in the
+    /// request's order (Q16).
+    pub(crate) computed: Vec<(String, RExpr)>,
+    /// The Attribute terms the computed values read, for the pushdown's
+    /// `attrs`.
+    pub(crate) computed_reads: Vec<String>,
+    /// Whether a computed value reads `createdAt` or `modifiedAt`.
+    pub(crate) computed_system: bool,
 }
 
 /// One key of a surface sort (Q9, ADR-0028 rule 5).
@@ -111,6 +119,8 @@ pub(crate) enum SortBy {
     Value(String),
     /// `createdAt` or `modifiedAt` of the Entity.
     System(String),
+    /// The `$compute` value of this name.
+    Computed(String),
 }
 
 impl SortBy {
@@ -118,7 +128,7 @@ impl SortBy {
     fn key(&self) -> &str {
         match self {
             Self::Id => "id",
-            Self::Value(name) | Self::System(name) => name,
+            Self::Value(name) | Self::System(name) | Self::Computed(name) => name,
         }
     }
 }
@@ -305,6 +315,9 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
         };
         let by = match single {
             None => return Err(Refused::Later),
+            Some(name) if out.computed.iter().any(|(c, _)| c == name) => {
+                SortBy::Computed(name.to_owned())
+            }
             Some("id") => SortBy::Id,
             // Q9: no Entity member `orderBy` names (7.2.3.1); the surface sorts
             Some(name @ ("createdAt" | "modifiedAt")) if !set.members.contains_key(name) => {
@@ -320,13 +333,16 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
             descending: item.descending,
         });
     }
-    if keys.iter().any(|k| matches!(k.by, SortBy::System(_))) {
+    if keys
+        .iter()
+        .any(|k| matches!(k.by, SortBy::System(_) | SortBy::Computed(_)))
+    {
         out.sort_system = true;
         out.sort_reads = keys
             .iter()
             .filter_map(|k| match &k.by {
                 SortBy::Value(term) => Some(term.clone()),
-                SortBy::Id | SortBy::System(_) => None,
+                SortBy::Id | SortBy::System(_) | SortBy::Computed(_) => None,
             })
             .collect();
         out.sort = Some(keys);
@@ -345,6 +361,98 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
         .collect();
     out.order = Some(pushed.join(","));
     Ok(())
+}
+
+/// `$compute` (URL 5.1.10, Q16): each item as a residual value over the
+/// members of `set` into `out.computed`, with the terms and system members
+/// the values read. The scalar members, functions and arithmetic a `$filter`
+/// residual takes; a navigation is a later round's.
+pub(crate) fn compute(
+    items: &[Compute],
+    set: &Set,
+    aliases: &[(String, Literal)],
+    out: &mut Translated,
+    now: DateTime,
+) -> Result<(), Refused> {
+    let sets = BTreeMap::new();
+    let mut terms = Terms {
+        set,
+        sets: &sets,
+        aliases,
+        context: &mut out.context,
+        linked: false,
+        expand_values: Vec::new(),
+        lambdas: Vec::new(),
+    };
+    for item in items {
+        let (value, _) = terms.residual_value(&item.expr)?;
+        out.computed.push((item.alias.clone(), value));
+    }
+    for (_, program) in computed(out, now)? {
+        for term in program.attributes() {
+            if !out.computed_reads.iter().any(|t| t == term) {
+                out.computed_reads.push(term.to_owned());
+            }
+        }
+        out.computed_system |= program.reads_system_members();
+    }
+    Ok(())
+}
+
+/// The computed values of `t` as programs, by name.
+///
+/// # Errors
+/// As [`program`].
+pub(crate) fn computed(
+    t: &Translated,
+    now: DateTime,
+) -> Result<Vec<(String, residual::Program)>, Refused> {
+    t.computed
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), compiled(value, now)?)))
+        .collect()
+}
+
+/// `e` with each `$compute` name replaced by its expression: a filter on
+/// a computed value is a filter on what it computes.
+pub(crate) fn inlined(e: &Expr, items: &[Compute]) -> Expr {
+    let boxed = |e: &Expr| Box::new(inlined(e, items));
+    match e {
+        Expr::Member(MemberPath {
+            variable: None,
+            path,
+        }) => match path.as_slice() {
+            [name] => items
+                .iter()
+                .find(|c| c.alias == *name)
+                .map_or_else(|| e.clone(), |c| c.expr.clone()),
+            _ => e.clone(),
+        },
+        Expr::Compare(l, op, r) => Expr::Compare(boxed(l), *op, boxed(r)),
+        Expr::In(l, list) => Expr::In(boxed(l), list.clone()),
+        Expr::And(l, r) => Expr::And(boxed(l), boxed(r)),
+        Expr::Or(l, r) => Expr::Or(boxed(l), boxed(r)),
+        Expr::Not(inner) => Expr::Not(boxed(inner)),
+        Expr::Call(method, args) => {
+            Expr::Call(*method, args.iter().map(|a| inlined(a, items)).collect())
+        }
+        Expr::Arith(l, op, r) => Expr::Arith(boxed(l), *op, boxed(r)),
+        Expr::Neg(inner) => Expr::Neg(boxed(inner)),
+        Expr::Any { collection, lambda } => Expr::Any {
+            collection: collection.clone(),
+            lambda: lambda
+                .as_ref()
+                .map(|(variable, body)| (variable.clone(), boxed(body))),
+        },
+        Expr::All {
+            collection,
+            lambda: (variable, body),
+        } => Expr::All {
+            collection: collection.clone(),
+            lambda: (variable.clone(), boxed(body)),
+        },
+        Expr::Literal(_) | Expr::Alias(_) | Expr::Member(_) => e.clone(),
+    }
 }
 
 /// The operands of the top-level `and`s.
@@ -1243,13 +1351,16 @@ pub(crate) fn program(t: &Translated, now: DateTime) -> Result<Option<residual::
         [one] => one.clone(),
         many => RExpr::And(many.to_vec()),
     };
-    residual::compile(&conjuncts, now)
-        .map(Some)
-        .map_err(|e| match e {
-            residual::Error::TooComplex => Refused::TooComplex,
-            // this module builds no pattern, the one construct the evaluator may not support
-            residual::Error::Invalid(_) | residual::Error::Unsupported(_) => Refused::Bad,
-        })
+    compiled(&conjuncts, now).map(Some)
+}
+
+/// `e` compiled under the evaluator's bounds.
+fn compiled(e: &RExpr, now: DateTime) -> Result<residual::Program, Refused> {
+    residual::compile(e, now).map_err(|e| match e {
+        residual::Error::TooComplex => Refused::TooComplex,
+        // this module builds no pattern, the one construct the evaluator may not support
+        residual::Error::Invalid(_) | residual::Error::Unsupported(_) => Refused::Bad,
+    })
 }
 
 /// `v op p` read as `p op' v`.

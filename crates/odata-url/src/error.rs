@@ -129,8 +129,6 @@ pub enum LimitKind {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Feature {
-    /// `$compute` (Q16).
-    Compute,
     /// `$index` (Q17).
     Index,
     /// `$apply` (Q19).
@@ -258,7 +256,6 @@ impl Feature {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Compute => "$compute",
             Self::Index => "$index",
             Self::Apply => "$apply",
             Self::DeltaToken => "$deltatoken",
