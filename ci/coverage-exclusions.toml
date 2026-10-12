@@ -213,6 +213,14 @@ branches = 0
 reason = "an answer over MAX_ANSWER_BYTES (64 MiB): a test would have to store and page more than that through the test kit's in-memory store"
 
 [[exclusion]]
+crate = "antares-ops"
+file = "src/scan.rs"
+function = "antares_ops::scan::read"
+lines = 3
+branches = 0
+reason = "a successful Query Entities answer that is no JSON list: the scan asks the store for application/json and never forwards the outer Accept (tests/view_scan.rs asserts geo+json stays outside), so the store answers a list; the refusal stays as the trust boundary on the store's answer"
+
+[[exclusion]]
 crate = "antares-icsr"
 file = "src/grant.rs"
 function = "antares_icsr::grant::held"
@@ -637,11 +645,3 @@ function = "antares_jsonld::pinned::resolve_with"
 lines = 1
 branches = 0
 reason = "the unpinned core context: every_pinned_context_parses_and_carries_an_at_context rules it out; the arm makes a broken pin a 500 instead of a panic"
-
-[[exclusion]]
-crate = "antares-ops"
-file = "src/scan.rs"
-function = "antares_ops::scan::read"
-lines = 3
-branches = 0
-reason = "a successful Query Entities answer that is no JSON list: the scan asks the store for application/json and never forwards the outer Accept (tests/view_scan.rs asserts geo+json stays outside), so the store answers a list; the refusal stays as the trust boundary on the store's answer"
