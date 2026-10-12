@@ -13,7 +13,7 @@ role = "core"
 
 [dependencies]
 antares-model = { workspace = true }
-antares-jsonld = { workspace = true }
+antares-jsonld = { workspace = true, features = ["fetch"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 rumqttc = { workspace = true, optional = true }
