@@ -198,3 +198,97 @@ async fn history_of_one_type_goes_before_the_cut_in_bounded_batches() {
     }
     assert_eq!(rounds, [1000, 1000, 500]);
 }
+
+/// The broker connects as a role that is neither owner nor BYPASSRLS, so
+/// `temporal_entities`' tenant policy applies to the sweep's JOIN: with only
+/// the service flag set, the JOIN saw no row and history retention deleted
+/// nothing on dev while reporting `Ok(0)` (T-3900 re-open). Run as such a
+/// role, the history and current-state rules both remove what they select.
+#[tokio::test(flavor = "multi_thread")]
+async fn retention_deletes_as_the_brokers_rls_bound_role() {
+    let url = require_db!();
+    let admin = pg::connect(&url, 5).await.expect("connect");
+    for stmt in [
+        "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
+        "GRANT USAGE ON SCHEMA public TO antares_app",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
+    ] {
+        sqlx::query(stmt).execute(&admin).await.expect(stmt);
+    }
+    let app_url = url.replace("antares:antares@", "antares_app:app@");
+    assert_ne!(
+        app_url, url,
+        "test URL must embed antares:antares credentials"
+    );
+    let app = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&app_url)
+        .await
+        .expect("app-role connect");
+    let bypass: bool = sqlx::query_scalar(
+        "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&app)
+    .await
+    .expect("role");
+    assert!(
+        !bypass,
+        "the role must wear RLS or this test proves nothing"
+    );
+
+    let store = PgTemporalStore::new(admin.clone());
+    let attr = "https://example.org/speed";
+    let tenant = TenantId::new("retain-rls").expect("tenant");
+    pg::ensure_tenant(&admin, &tenant)
+        .await
+        .expect("tenant row");
+    let _ = store.delete(&tenant, "urn:v:rls").await;
+    sqlx::query("DELETE FROM entities WHERE tenant_id = 'retain-rls'")
+        .execute(&admin)
+        .await
+        .expect("clean");
+    let doc = json!({
+        "id": "urn:v:rls", "type": [V], "createdAt": ago(30), "modifiedAt": ago(4),
+        attr: [
+            {"type": "Property", "value": 1, "observedAt": ago(6), "instanceId": "urn:i:rls:6"},
+            {"type": "Property", "value": 2, "observedAt": ago(4), "instanceId": "urn:i:rls:4"}]
+    });
+    assert!(store
+        .create(&tenant, "urn:v:rls", &doc)
+        .await
+        .expect("create"));
+    entity(&admin, "retain-rls", "urn:v:rls-old", V, 10, false).await;
+
+    assert_eq!(
+        retain_history(&app, "retain-rls", V, &ago(5), 1000, true)
+            .await
+            .expect("dry run"),
+        1,
+        "the dry run sees the old instance through the tenant policy"
+    );
+    assert_eq!(
+        retain_history(&app, "retain-rls", V, &ago(5), 1000, false)
+            .await
+            .expect("retain history"),
+        1,
+        "the 6-minute instance goes"
+    );
+    assert_eq!(
+        count(
+            &admin,
+            "SELECT count(*) FROM attr_instances WHERE tenant_id = $1",
+            "retain-rls"
+        )
+        .await,
+        1,
+        "the 4-minute instance stays"
+    );
+    assert_eq!(
+        retain_current(&app, "retain-rls", V, &ago(5), 1000, false)
+            .await
+            .expect("retain current"),
+        1,
+        "the stale Vehicle goes too"
+    );
+}
