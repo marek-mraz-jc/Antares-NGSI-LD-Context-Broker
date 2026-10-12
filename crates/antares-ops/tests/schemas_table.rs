@@ -285,3 +285,49 @@ async fn the_view_routes_never_read_or_delete_a_schema() {
         "and is no view: {h}"
     );
 }
+
+/// A slot named after a member of an Attribute (`value`, `object`,
+/// `unitCode`, `json`) could never be an Attribute: the PUT refuses it,
+/// naming the slot, wherever the schema declares it (T-3956). `location` is
+/// an Attribute, and `id`, `type` and `observedAt` are the Entity's own as
+/// the platform's core model declares them: they load.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_named_after_an_ngsi_ld_member_is_refused() {
+    let (_b, app) = broker().await.expect("broker");
+    let schema = |slots: Value, classes: Value| {
+        json!({"id": "https://w3id.org/city", "name": "city", "slots": slots, "classes": classes})
+            .to_string()
+    };
+    for member in ["value", "object", "unitCode", "json"] {
+        for doc in [
+            schema(
+                json!({member: {}, "pm": {}}),
+                json!({"R": {"slots": ["pm"]}}),
+            ),
+            schema(json!({"pm": {}}), json!({"R": {"slots": ["pm", member]}})),
+            schema(
+                json!({"pm": {}}),
+                json!({"R": {"slot_usage": {member: {}}}}),
+            ),
+        ] {
+            let (s, body) = send(&app, Method::PUT, "/q/schemas/city", Some(&doc)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{doc}: {body}");
+            let detail = json_of(&body)["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            assert!(
+                detail.contains(&format!("\"{member}\"")) && detail.contains("another name"),
+                "{doc}: {detail}"
+            );
+        }
+    }
+    let (s, _) = send(&app, Method::GET, "/q/schemas/city", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "nothing refused was stored");
+    let located = schema(
+        json!({"location": {}, "pm": {}}),
+        json!({"R": {"slots": ["location", "pm"]}}),
+    );
+    let (s, body) = send(&app, Method::PUT, "/q/schemas/city", Some(&located)).await;
+    assert_eq!(s, StatusCode::CREATED, "location is an Attribute: {body}");
+}
