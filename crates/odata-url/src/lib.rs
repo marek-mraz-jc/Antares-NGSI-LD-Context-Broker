@@ -58,7 +58,7 @@ use std::borrow::Cow;
 pub use ast::{
     Aggregate, AggregateWith, ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath,
     Expr, Format, Geography, Key, KeyValue, Levels, Literal, MemberPath, Method, ODataUri, OrderBy,
-    Position, QueryOptions, Segment, SelectItem, Shape, Transformation,
+    PartitionBy, Position, QueryOptions, Segment, SelectItem, Shape, Transformation,
 };
 #[cfg(feature = "edm")]
 pub use edm::EdmModel;

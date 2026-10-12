@@ -275,7 +275,7 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
     /// `computeItem *( COMMA computeItem )`, `computeItem = commonExpr RWS "as" RWS
     /// computedProperty`; a name the resource has, or one given twice, is refused. Each
     /// expression counts against the request's expression budget.
-    fn compute(&mut self, scope: Scope<'m>) -> Result<Vec<Compute>, UrlError> {
+    pub(crate) fn compute(&mut self, scope: Scope<'m>) -> Result<Vec<Compute>, UrlError> {
         let mut items: Vec<Compute> = Vec::new();
         loop {
             let expr = common_expr(self.c, self.model, scope, &mut self.budget)?;
@@ -332,7 +332,7 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
             Name::Skiptoken => options.skiptoken = Some(qchars(self.c, "skiptoken")?),
             Name::Search => {
                 let limits = self.budget.limits;
-                options.search = Some(search(self.c, limits, &mut self.budget.nodes)?);
+                options.search = Some(search(self.c, limits, &mut self.budget.nodes, false)?);
             }
             Name::Id => options.id = Some(qchars(self.c, "IRI-in-query")?),
             _ => options.schemaversion = Some(schemaversion(self.c)?),

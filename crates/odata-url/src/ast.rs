@@ -191,6 +191,70 @@ pub enum Transformation {
         /// The aggregates of each group, none without one.
         aggregate: Option<Vec<Aggregate>>,
     },
+    /// `topcount`, `topsum`, `toppercent`, `bottomcount`, `bottomsum`, `bottompercent`: the
+    /// instances with the highest (`top`) or lowest values of `expr`, as many as `n` says.
+    Partition {
+        /// What `n` counts.
+        by: PartitionBy,
+        /// The highest values, not the lowest.
+        top: bool,
+        /// The count, the sum or the percentage.
+        n: Expr,
+        /// The value each instance is ranked by.
+        expr: Expr,
+    },
+    /// `concat(applyExpr, applyExpr, ...)`: the results of each sequence over the same input,
+    /// one after the other.
+    Concat(Vec<Vec<Transformation>>),
+    /// `compute(expr as name, ...)`: each instance with the values as dynamic properties.
+    Compute(Vec<Compute>),
+    /// `search(searchExpr)`: the instances that match.
+    Search(crate::Search),
+}
+
+impl Transformation {
+    /// Whether it makes rows of aggregates: what follows names only what it produced.
+    ///
+    /// ```
+    /// use odata_url::Transformation;
+    /// assert!(!Transformation::Identity.aggregates());
+    /// assert!(Transformation::Aggregate(Vec::new()).aggregates());
+    /// ```
+    #[must_use]
+    pub fn aggregates(&self) -> bool {
+        match self {
+            Self::Aggregate(_) | Self::GroupBy { .. } => true,
+            Self::Concat(branches) => branches.iter().flatten().any(Self::aggregates),
+            _ => false,
+        }
+    }
+}
+
+/// What the first parameter of a [`Transformation::Partition`] counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionBy {
+    /// `topcount`, `bottomcount`: instances.
+    Count,
+    /// `topsum`, `bottomsum`: the sum of the values.
+    Sum,
+    /// `toppercent`, `bottompercent`: a percentage of the sum of every value.
+    Percent,
+}
+
+impl PartitionBy {
+    /// The name after `top` or `bottom`.
+    ///
+    /// ```
+    /// assert_eq!(odata_url::PartitionBy::Percent.as_str(), "percent");
+    /// ```
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Percent => "percent",
+        }
+    }
 }
 
 /// One `aggregateExpr`.
