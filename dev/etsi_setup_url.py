@@ -108,8 +108,10 @@ class etsi_setup_url:  # Robot takes the class named as its module
             if self.depth == 0:
                 self._point(at_setup=True)
             self.depth += 1
+        # A step after a failure still starts, NOT RUN, and a variable an earlier step would have
+        # assigned does not exist: no request left, so nothing to record or delete (T-4030).
         elif data.name in METHODS and getattr(result, "owner", None) == "RequestsLibrary" \
-                and (self.depth > 0 or self.test):
+                and not result.not_run and (self.depth > 0 or self.test):
             fixture = self.depth > 0
             line = self._request(data.name, data.args)
             tenant = line.pop("tenant", None)
