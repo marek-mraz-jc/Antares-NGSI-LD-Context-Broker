@@ -1471,26 +1471,35 @@ mod complexity_tests {
     /// Parsing grows with the `q`, not with its square: each unquoted value
     /// once looked for the Range `..` across the whole rest, so a chain of
     /// `n` comparisons scanned n²/2 terms (T-3706: the Miri job ran out of
-    /// time inside one 511-term parse). Eight times the terms may cost eight
-    /// times the time; the old scan cost about forty. Minimum of five runs,
-    /// so a busy runner's pause counts against neither size.
+    /// time inside one 511-term parse). Eight parses of a chain against one
+    /// parse of a chain eight times as long: linear, the two take the same
+    /// time (measured 1.04 to 1.24, also beside twelve busy cores); the old
+    /// scan took 5.1 times as long. Both are timed alternately and of about
+    /// the same length, so a loaded host slows both alike (T-4118: one small
+    /// and one large parse drifted from 9 to 18 under load, against a bound
+    /// of 20).
     #[test]
     #[cfg_attr(miri, ignore)] // a wall-clock ratio, measured natively
     fn parsing_a_chain_grows_linearly() {
+        use std::time::{Duration, Instant};
         let chain = |n: usize| vec!["a==1"; n].join(";");
-        let fastest = |q: &str| {
-            (0..5)
-                .map(|_| {
-                    let started = std::time::Instant::now();
-                    assert!(parse_narrowed_q(q).is_ok());
-                    started.elapsed()
-                })
-                .min()
-                .unwrap_or_default()
-        };
         let (small, large) = (chain(MAX_Q_NODES - 1), chain(MAX_NARROWED_Q_NODES - 1));
-        let ratio = fastest(&large).as_secs_f64() / fastest(&small).as_secs_f64().max(1e-9);
-        assert!(ratio < 20.0, "8x the terms took {ratio:.1}x the time");
+        let (mut eight_small, mut one_large) = (Duration::MAX, Duration::MAX);
+        for _ in 0..31 {
+            let started = Instant::now();
+            for _ in 0..8 {
+                assert!(parse_narrowed_q(&small).is_ok());
+            }
+            eight_small = eight_small.min(started.elapsed());
+            let started = Instant::now();
+            assert!(parse_narrowed_q(&large).is_ok());
+            one_large = one_large.min(started.elapsed());
+        }
+        let ratio = one_large.as_secs_f64() / eight_small.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 2.5,
+            "one 8x chain took {ratio:.2}x eight short ones"
+        );
     }
 
     /// The narrowed caps are ceilings too: past them a narrowed `q` is
