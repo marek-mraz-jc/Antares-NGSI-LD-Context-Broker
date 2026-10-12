@@ -83,6 +83,7 @@ fn assignee(caller: &Caller) -> &str {
             client: Some(client),
             ..
         }) => client,
+        Caller::Platform(Platform { did: Some(did), .. }) => did,
         Caller::Platform(_) => "public",
     }
 }
@@ -457,6 +458,30 @@ mod tests {
         );
         assert_eq!(at(&c, "/4/operator"), "lteq");
         assert!(d.get("prohibition").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_participant_holds_its_agreements_grants_and_not_the_publics() -> Result<(), String> {
+        let did = "did:web:consumer.example";
+        let agreed = air(&json!({"id": "agreed", "assignee": {"kind": "did", "id": did}}));
+        let participant = caller(&[("x-jc-did", did)]);
+        let d = doc(&json!([agreed, air(&json!({}))]), &participant)?;
+        assert_eq!(at(&d, "/assignee"), did);
+        assert_eq!(at(&d, "/permission").as_array().map_or(0, Vec::len), 2);
+        let other = caller(&[("x-jc-did", "did:web:other.example")]);
+        let d = doc(
+            &json!([
+                air(&json!({"id": "agreed", "assignee": {"kind": "did", "id": did}})),
+                air(&json!({}))
+            ]),
+            &other,
+        )?;
+        assert_eq!(
+            at(&d, "/permission"),
+            json!([]),
+            "neither the agreement nor public: {d}"
+        );
         Ok(())
     }
 
