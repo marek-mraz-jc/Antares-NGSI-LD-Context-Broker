@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! What the view root answers when it does not serve (surfaces-test-plan
 //! section 6, G9; ADR-0023 rule 4): no error names a hidden member or
-//! carries an inner failure's detail (an `@context` that does not load
-//! included), and a request the view does not
+//! carries an inner failure's detail, and a request the view does not
 //! serve gets 405 with `Allow`, 422 when the method stays, 404 where the
 //! view serves nothing.
 
@@ -42,10 +41,14 @@ async fn views_errors_carry_no_hidden_name_and_no_inner_detail() -> Result<(), S
         None,
     )
     .await;
-    // the caller's own @context did not load: 504 as at the root (T-3944),
-    // with a fixed detail that names neither the URL nor its host
+    // 6.3.2 as at the root (T-3947), with a fixed detail: never the URL or
+    // the fetch error.
     assert_eq!(a.status, StatusCode::GATEWAY_TIMEOUT, "{}", a.text);
-    assert!(a.text.contains("LdContextNotAvailable"), "{}", a.text);
+    assert!(
+        a.text.contains("\"title\":\"LdContextNotAvailable\""),
+        "{}",
+        a.text
+    );
     assert!(a.text.contains(CONTEXT_DETAIL), "{}", a.text);
     assert!(
         !a.text.contains("nowhere-7f3a") && !a.text.contains("127.0.0.1"),

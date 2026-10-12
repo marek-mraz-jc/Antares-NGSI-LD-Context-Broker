@@ -92,6 +92,7 @@ tags and on dispatch.
 |---|---|---|---|
 | NGSI-LD root of the `full` build | answers as vanilla, TP by TP (E3, on the `full,jc-policy` image with `ANTARES_POLICY=allow-all`) | ETSI `ngsi-ld-test-suite` vendored (GS CIM 009 V1.9.1), `dev/etsi-baseline.json` | `image-jc.yml` `etsi` |
 | NGSI-LD view root | view `all` answers as the plain root of the same image, TP by TP, except the refusals the view owes (E2) | the same suite, `dev/etsi-view-diff.py` | `etsi-full-all` (pull requests: Consumption and Provision) |
+| NGSI-LD restricted view | view `etsi-restricted` (Building and City, `airQualityLevel` hidden, reads only) answers as the plain root, TP by TP, except a write, a hidden type or a hidden Attribute the TP names (E4) | the same suite, `dev/etsi-view-diff.py` | `etsi-full-restricted` (nightly) |
 | NGSI-LD over five brokers | the all-features image answers as vanilla | ETSI IOP suite (TS 104 188) | `etsi-iop` |
 | Internal context sources | a forward in process answers as one over HTTP | ETSI DistributedOperations | `etsi-icsr` |
 | MCP | the server scenarios pass but the listed baseline | `@modelcontextprotocol/conformance` 0.1.16, revisions 2025-11-25 and 2025-06-18, `ci/mcp-baseline.yaml` | `mcp-conformance` (pull requests) |

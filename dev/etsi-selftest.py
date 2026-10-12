@@ -200,8 +200,7 @@ def check_view_diff():
     ]:
         assert view_diff.operation(method, url, binds) == op, (method, url)
 
-    a, b, c, d, e, f = (f"TP/s.robot::00{i} T" for i in range(6))
-    plain = "http://h/ngsi-ld/v1"
+    a, b, c, d = (f"TP/s.robot::00{i} T" for i in range(4))
     with tempfile.TemporaryDirectory() as tmp:
 
         def run(name, rows, requests=()):
@@ -213,52 +212,91 @@ def check_view_diff():
                 for key, status in rows:
                     w.writerow(["s", *key.split("::"), status])
             with open(f"{path}/requests.jsonl", "w") as fh:
-                for test, method, url, headers, *fixture in requests:
+                # a fixture's request has no test and names its suite file
+                for test, method, url, headers, *extra in requests:
                     line = {"test": test, "method": method, "url": url, "headers": headers}
-                    if fixture:
-                        line.update(fixture=True, suite=fixture[0])
+                    if test is None:
+                        line.update(fixture=True, suite=extra[0])
+                    elif extra:
+                        line["body"] = extra[0]
                     fh.write(json.dumps(line) + "\n")
             return path
 
         view = f"{tmp}/view.json"
-        json.dump({"id": "v", "operations": ["retrieve_entity", "create_entity",
-                                             "create_subscription", "retrieve_subscription"]},
-                  open(view, "w"))
+        json.dump({"id": "v", "operations": ["retrieve_entity", "create_entity"]}, open(view, "w"))
         known = f"{tmp}/known.json"
         json.dump({"v": {d: "T-0000"}}, open(known, "w"))
         view_diff.KNOWN = known
-        e1 = run("e1", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "PASS"), (e, "PASS"), (f, "PASS")])
-        owed = run("owed", [(a, "FAIL"), (b, "FAIL"), (c, "FAIL"), (d, "FAIL"), (e, "FAIL"),
-                            (f, "FAIL")], [
+        e1 = run("e1", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "PASS")])
+        owed = run("owed", [(a, "FAIL"), (b, "FAIL"), (c, "FAIL"), (d, "FAIL")], [
             (a, "POST", f"{root}/entityOperations/upsert", []),
             (b, "GET", f"{root}/entities/urn:x?entityMap=true", []),
             (c, "GET", f"{root}/entities/urn:x", ["ngsild-tenant"]),
-            # rule 9: the suite's setup made the Subscription at the root
-            (None, "POST", f"{plain}/subscriptions/", [], "TP/s.robot"),
-            (e, "GET", f"{root}/subscriptions/urn:s", []),
-            # rule 7: the TP's setup registered a Context Source at the root
-            (f, "POST", f"{plain}/csourceRegistrations/", [], "TP/s.robot"),
-            (f, "POST", f"{root}/entities", []),
-            (f, "POST", f"{root}/subscriptions", []),
         ])
         assert view_diff.diff(view, e1, owed, binds) == 0
         refusals = json.load(open(f"{owed}/owed-refusals.json"))["refusals"]
-        assert [r["tp"] for r in refusals] == [a, b, c, e, f], refusals
-        # a Subscription the TP made through the view owes nothing
-        own = run("own", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "FAIL"), (e, "FAIL"), (f, "PASS")], [
-            (e, "POST", f"{root}/subscriptions/", []),
-            (e, "GET", f"{root}/subscriptions/urn:s", []),
-        ])
-        assert view_diff.diff(view, e1, own, binds) == 1, "a view's own Subscription owes nothing"
-        stale = run("stale", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "PASS"), (e, "PASS"), (f, "PASS")])
+        assert [r["tp"] for r in refusals] == [a, b, c], refusals
+        stale = run("stale", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "PASS")])
         assert view_diff.diff(view, e1, stale, binds) == 1, "a known TP answering as E1 must fail"
-        offered = run("offered", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL"), (e, "PASS"), (f, "PASS")],
+        offered = run("offered", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
                       [(a, "POST", f"{root}/entities", [])])
         assert view_diff.diff(view, e1, offered, binds) == 1, "an offered operation owes nothing"
-        gone = run("gone", [(b, "PASS"), (c, "PASS"), (d, "FAIL"), (e, "PASS"), (f, "PASS")])
+        gone = run("gone", [(b, "PASS"), (c, "PASS"), (d, "FAIL")])
         assert view_diff.diff(view, e1, gone, binds) == 1, "a TP that did not run must fail"
+        json.dump({"id": "v", "operations": ["create_subscription", "retrieve_subscription"]}, open(view, "w"))
+        sub = f"{root}/subscriptions/urn:ngsi-ld:Subscription:1"
+        rootsub = run("rootsub", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
+                      [(a, "GET", sub, [])])
+        assert view_diff.diff(view, e1, rootsub, binds) == 0, "a fixture's Subscription is not the view's (rule 9)"
+        ownsub = run("ownsub", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
+                     [(a, "POST", f"{root}/subscriptions", []), (a, "GET", sub, [])])
+        assert view_diff.diff(view, e1, ownsub, binds) == 1, "a Subscription made through the view owes nothing"
+        # T-3945: after a suite fixture registered a Context Source at the root, an Entity write
+        # and a Subscription through the view stay local (rules 7 and 9)
+        json.dump({"id": "v", "operations": ["create_entity", "create_subscription"]}, open(view, "w"))
+        writes = [(a, "POST", f"{root}/entities", []), (a, "POST", f"{root}/subscriptions", [])]
+        registered = run("registered", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")], [
+            (None, "POST", "http://h/ngsi-ld/v1/csourceRegistrations/", [], "TP/s.robot"), *writes])
+        assert view_diff.diff(view, e1, registered, binds) == 0, "a write after a registration stays local"
+        why = json.load(open(f"{registered}/owed-refusals.json"))["refusals"][0]["owed"]
+        assert ["rule 7" in why[0], "rule 9" in why[1]] == [True, True], why
+        unregistered = run("unregistered", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")], writes)
+        assert view_diff.diff(view, e1, unregistered, binds) == 1, "without a registration a write owes nothing"
+        json.dump({"v": {a: "T-0000"}}, open(known, "w"))
+        assert view_diff.diff(view, e1, rootsub, binds) == 1, "a known TP that is owed now must fail"
         assert view_diff.diff(view, e1, f"{tmp}/nowhere", binds) == 1, "an empty run must fail"
-    print("  view diff ok (owed refusals pass, a deviation, a stale known entry or a missing TP fails)")
+
+        # T-3787: a view that hides types and Attributes owes the refusal of a read that names one,
+        # in the query or in the body, under the names the suite's @context gives them
+        restricted = f"{tmp}/restricted.json"
+        json.dump({"id": "r", "operations": ["retrieve_entity", "query_entities", "query_entities_post"],
+                   "selector": ["https://ngsi-ld-test-suite/context#Building"],
+                   "rules": [{"types": ["https://ngsi-ld-test-suite/context#Building"],
+                              "attributes": ["https://ngsi-ld-test-suite/context#name",
+                                             "https://uri.etsi.org/ngsi-ld/location"]}]},
+                  open(restricted, "w"))
+        view_diff.KNOWN = f"{tmp}/none.json"
+        hidden = run("hidden", [(a, "FAIL"), (b, "FAIL"), (c, "FAIL"), (d, "PASS")], [
+            (a, "GET", f"{root}/entities?type=Vehicle", []),
+            (b, "GET", f"{root}/entities?type=Building&q=airQualityLevel>2", []),
+            (c, "POST", f"{root}/entityOperations/query", [],
+             {"type": "Query", "entities": [{"type": "Building"}], "attrs": ["name", "airQualityLevel"]}),
+            (d, "GET", f"{root}/entities?type=Building&attrs=name,location", []),
+        ])
+        assert view_diff.diff(restricted, e1, hidden, binds) == 0
+        why = {r["tp"]: r["owed"] for r in json.load(open(f"{hidden}/owed-refusals.json"))["refusals"]}
+        assert sorted(why) == [a, b, c], why
+        assert "type Vehicle" in why[a][0] and "Attribute airQualityLevel" in why[b][0], why
+        assert any("airQualityLevel" in w for w in why[c]), why
+        shown = run("shown", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
+                    [(d, "GET", f"{root}/entities?type=Building&attrs=name,location", [])])
+        assert view_diff.diff(restricted, e1, shown, binds) == 1, "a read of shown names owes nothing"
+        committed = json.load(open(f"{HERE}/../ci/views/etsi/etsi-restricted.json"))
+        reads = {o["id"] for o in __import__("yaml").safe_load(open(view_diff.MATRIX))["operations"]
+                 if o.get("kind") == "read"}
+        assert set(committed["operations"]) == reads, "etsi-restricted offers the matrix's reads"
+    print("  view diff ok (owed refusals pass, a deviation, a stale known entry or a missing TP fails;"
+          " a hidden type or Attribute owes its refusal)")
 
 
 if __name__ == "__main__":

@@ -7,13 +7,16 @@ A refusal is owed, not hand-listed: a TP whose body sent a request the view
 does not offer (its operation, from operation-matrix.yaml's NGSI-LD binding,
 is not in the view's `operations`; ADR-0023 rule 4), a request no operation
 binds, a request naming an NGSILD-Tenant (rule 10) or an entity map (threat
-V22), or a Subscription operation in a TP whose fixtures made a Subscription
-at the root, which no view serves (rule 9: a view serves its own
-Subscriptions alone), or an Entity write in a TP whose fixtures registered a
-Context Source, which no write through a view reaches (rule 7 is checked on
-the local store, so the write stays local), and the same for a Subscription
-made through a view (rule 9: it has no distributed half). The requests come from the run's requests.jsonl
-(dev/etsi_setup_url.py records the body's and, marked, the fixtures').
+V22), and, for a view that does not show every name, a request naming a type
+outside its selector (rule 3) or an Attribute no rule shows (rule 2) in its
+`type`, `attrs`, `pick`, `omit` or `q`, or in the JSON body it sent (T-3787);
+and an Entity write or a Subscription in a TP whose fixtures registered a
+Context Source, which no write through a view reaches (rule 7 is checked on the
+local store, so the write stays local; rule 9: a view's Subscription has no
+distributed half; T-3945).
+Names are expanded as the suite sends them: its own @context, then the core
+one, then the default vocabulary. The body requests come from the run's
+requests.jsonl (dev/etsi_setup_url.py records them, and, marked, the fixtures').
 
 Usage:
   etsi-view-diff.py <view.json> <e1-dir> <e2-dir>
@@ -26,6 +29,7 @@ differs fails too (remove it). The owed refusals are written to
 import glob
 import json
 import os
+import re
 import sys
 from urllib.parse import parse_qs, urlsplit
 
@@ -33,6 +37,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MATRIX = f"{HERE}/../docs/analysis/operation-matrix.yaml"
 KNOWN = os.environ.get("KNOWN") or f"{HERE}/etsi-view-known.json"
 ROOT = "/ngsi-ld/v1"
+CORE_CONTEXT = f"{HERE}/../crates/antares-jsonld/contexts/core-v1.9.jsonld"
+DEFAULT_VOCAB = "https://uri.etsi.org/ngsi-ld/default-context/"
+# ngsi-ld-test-suite resources/jsonld-contexts/ngsi-ld-test-suite.jsonld, the
+# terms of the @context every TP sends (through -compound.jsonld, before core)
+SUITE_CONTEXT = {t: f"https://ngsi-ld-test-suite/context#{t}" for t in (
+    "Building", "Vehicle", "OffStreetParking", "airQualityLevel", "almostFull",
+    "availableSpotsNumber", "brandName", "fuelLevel", "isParked", "name",
+    "reliability", "source", "speed", "totalSpotsNumber", "subCategory")}
+# members of an Entity or a request body that are no Attribute (CIM 009 5.2)
+NOT_ATTRIBUTES = {"id", "@id", "type", "@type", "@context", "scope", "createdAt",
+                  "modifiedAt", "deletedAt", "expiresAt"}
+# request bodies that name entities and attributes rather than being one
+SELECTORS = {"Query", "Subscription", "ContextSourceRegistration", "CSourceRegistration"}
 
 sys.path.insert(0, HERE)
 from importlib import import_module  # noqa: E402
@@ -85,10 +102,85 @@ def operation(method, url, binds):
     return best
 
 
-# The Subscription operations a view runs on its own Subscriptions alone
-# (ADR-0023 rule 9, antares-api views::SUBSCRIPTIONS).
-OWN_SUBSCRIPTIONS = {"retrieve_subscription", "update_subscription",
-                     "delete_subscription", "query_subscriptions"}
+# A view serves only the Subscriptions made through it (ADR-0023 rule 9).
+OWN_SUBSCRIPTIONS = {"retrieve_subscription", "query_subscriptions",
+                     "update_subscription", "delete_subscription"}
+
+
+def core_terms(path=CORE_CONTEXT):
+    """term -> IRI of the core @context, its compact IRIs resolved."""
+    ctx = json.load(open(path))["@context"]
+    plain = {k: v if isinstance(v, str) else v.get("@id") if isinstance(v, dict) else None
+             for k, v in ctx.items()}
+    out = {}
+    for term, iri in plain.items():
+        if not iri or term.startswith("@"):
+            continue
+        prefix, sep, rest = iri.partition(":")
+        out[term] = plain[prefix] + rest if sep and prefix in plain and not rest.startswith("//") else iri
+    return out
+
+
+def expand(name, core):
+    """The IRI the broker reads `name` as under the suite's @context."""
+    if "://" in name or name.startswith("urn:"):
+        return name
+    return SUITE_CONTEXT.get(name) or core.get(name) or DEFAULT_VOCAB + name
+
+
+def q_attributes(q):
+    """The Attribute names a `q` (CIM 009 4.9) reads: the first path segment
+    of every term, before its operator."""
+    names = set()
+    for term in re.split(r"[;|()]", q or ""):
+        m = re.match(r"\s*!?\s*([^=!<>~\[.\s]+)", term)
+        if m and not m.group(1).startswith(("'", '"')):
+            names.add(m.group(1))
+    return names
+
+
+def named(url, body):
+    """(types, attributes) a request names, in its query and its body."""
+    query = parse_qs(urlsplit(url).query)
+    first = lambda key: ",".join(query.get(key, []))
+    types = {t for t in re.split(r"[,;|()]", first("type")) if t.strip()}
+    attrs = {a for key in ("attrs", "pick", "omit") for a in first(key).split(",") if a.strip()}
+    attrs |= q_attributes(first("q"))
+    for item in (body if isinstance(body, list) else [body]):
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind in SELECTORS:
+            for e in item.get("entities") or []:
+                if isinstance(e, dict) and isinstance(e.get("type"), str):
+                    types |= {t for t in re.split(r"[,;|()]", e["type"]) if t.strip()}
+            for key in ("attrs", "watchedAttributes"):
+                attrs |= {a for a in item.get(key) or [] if isinstance(a, str)}
+            attrs |= {a for a in (item.get("notification") or {}).get("attributes") or [] if isinstance(a, str)}
+            attrs |= q_attributes(item.get("q") if isinstance(item.get("q"), str) else "")
+        else:
+            kinds = kind if isinstance(kind, list) else [kind]
+            types |= {t for t in kinds if isinstance(t, str)}
+            attrs |= {k for k in item if k not in NOT_ATTRIBUTES}
+    return {t.strip() for t in types}, {a.strip() for a in attrs}
+
+
+def hidden_by(view, core):
+    """A function naming what of a request the view hides, or None for a view
+    that shows every name."""
+    selector = set(view.get("selector") or [])
+    shown = {a for rule in view.get("rules") or [] for a in rule.get("attributes") or []}
+    if "*" in selector and "*" in shown:
+        return None
+
+    def hidden(url, body):
+        types, attrs = named(url, body)
+        why = [f"type {t} outside the view (ADR-0023 rule 3)"
+               for t in sorted(types) if "*" not in selector and expand(t, core) not in selector]
+        why += [f"Attribute {a} the view does not show (ADR-0023 rule 2)"
+                for a in sorted(attrs) if "*" not in shown and expand(a, core) not in shown]
+        return why
+    return hidden
 
 
 # The Entity writes a registration can forward (TS 104 175 4.3.6.2); through
@@ -102,15 +194,15 @@ LOCAL_WRITES = {"create_entity", "replace_entity", "merge_entity", "delete_entit
                 "batch_merge", "batch_delete"}
 
 
-def owed(requests, offered, binds, fixtures=()):
+def owed(requests, offered, binds, hidden=None, fixtures=()):
     """Why the view refuses some request of a TP's body, or []."""
     why = []
-    made = {operation(f["method"], f["url"], binds) for f in fixtures}
-    at_root = "create_subscription" in made
-    registered = "register_context_source" in made
+    made = False
+    registered = any(operation(f["method"], f["url"], binds) == "register_context_source" for f in fixtures)
     for r in requests:
         url, headers = r["url"], set(r.get("headers") or ())
         op = operation(r["method"], url, binds)
+        made = made or op == "create_subscription"
         if "ngsild-tenant" in headers:
             why.append(f"{r['method']} {op or url}: NGSILD-Tenant (ADR-0023 rule 10)")
         elif "ngsild-entitymap" in headers or "entityMap" in parse_qs(urlsplit(url).query):
@@ -119,15 +211,16 @@ def owed(requests, offered, binds, fixtures=()):
             why.append(f"{r['method']} {urlsplit(url).path}: no operation binds it (ADR-0023 rule 4)")
         elif op not in offered:
             why.append(f"{r['method']} {op}: not offered (ADR-0023 rule 4)")
-        elif at_root and op in OWN_SUBSCRIPTIONS:
-            why.append(f"{r['method']} {op}: a fixture made the Subscription at the root, "
-                       "and a view serves its own alone (ADR-0023 rule 9)")
+        elif op in OWN_SUBSCRIPTIONS and not made:
+            why.append(f"{r['method']} {op}: a Subscription made at the root, not through the view (ADR-0023 rule 9)")
         elif registered and op in LOCAL_WRITES:
             why.append(f"{r['method']} {op}: a fixture registered a Context Source, "
                        "and a write through a view stays local (ADR-0023 rule 7)")
         elif registered and op == "create_subscription":
             why.append(f"{r['method']} {op}: a fixture registered a Context Source, "
                        "and a Subscription through a view stays local (ADR-0023 rule 9)")
+        elif hidden:
+            why += [f"{r['method']} {op}: {w}" for w in hidden(url, r.get("body"))]
     return why
 
 
@@ -155,6 +248,7 @@ def diff(view_path, e1_dir, e2_dir, binds=None):
         return 1
     reqs, fixtures = requests_of(e2_dir)
     offered = set(view.get("operations") or [])
+    hidden = hidden_by(view, core_terms())
     refusals, explained = [], 0
     for tp in sorted(e1.keys() | e2.keys()):
         a, b = e1.get(tp, "did not run"), e2.get(tp, "did not run")
@@ -163,9 +257,11 @@ def diff(view_path, e1_dir, e2_dir, binds=None):
                 red.append(f"stale: {tp} answers as E1 now; remove it from {os.path.basename(KNOWN)}")
             continue
         made = fixtures.get(tp, []) + fixtures.get(tp.split("::")[0], [])
-        why = owed(reqs.get(tp, []), offered, binds, made) if "did not run" not in (a, b) else []
+        why = owed(reqs.get(tp, []), offered, binds, hidden, made) if "did not run" not in (a, b) else []
         if why:
             refusals.append({"tp": tp, "e1": a, "view": b, "owed": why})
+            if tp in known:
+                red.append(f"stale: {tp} is an owed refusal now; remove it from {os.path.basename(KNOWN)}")
         elif tp in known:
             explained += 1
             print(f"known ({known[tp]}): E1 {a}, view {b}: {tp}")
