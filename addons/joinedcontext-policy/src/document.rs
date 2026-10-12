@@ -201,7 +201,7 @@ impl Table {
 /// engine expanded names, and an IRI expands to itself.
 pub fn context() -> &'static antares_jsonld::Context {
     static CORE: std::sync::OnceLock<antares_jsonld::Context> = std::sync::OnceLock::new();
-    CORE.get_or_init(antares_jsonld::loader::core_context)
+    CORE.get_or_init(antares_jsonld::core_context)
 }
 
 /// Compile `doc`, or say why it is refused. `now` resolves nothing: a

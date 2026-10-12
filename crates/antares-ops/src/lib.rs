@@ -542,7 +542,9 @@ impl ViewOps {
     /// view's rules composed with that Tenant's engine (ADR-0023 rule 5,
     /// ADR-0025 rule 5).
     pub async fn forward_in_process(&self, req: BuiltForward<'_>, self_url: &str) -> ForwardAnswer {
-        self.inner.forward_in_process(req, self_url).await
+        self.inner
+            .forward_through(Some(self.view.id()), req, self_url)
+            .await
     }
 
     /// The one Tenant the view serves (ADR-0023 rule 10).
@@ -845,6 +847,17 @@ impl Ops {
     /// operation's answer, and 504 otherwise, which the merge reports as
     /// code 199 (6.3.17), as a loop is.
     pub async fn forward_in_process(&self, req: BuiltForward<'_>, self_url: &str) -> ForwardAnswer {
+        self.forward_through(None, req, self_url).await
+    }
+
+    /// [`Self::forward_in_process`] through the view `view` (T-3935): the
+    /// engine of the target learns it as for a request through that view.
+    async fn forward_through(
+        &self,
+        view: Option<&str>,
+        req: BuiltForward<'_>,
+        self_url: &str,
+    ) -> ForwardAnswer {
         if antares_api::state::in_process_depth() >= antares_api::bounds::MAX_IN_PROCESS_CALL_DEPTH
         {
             let status = if req.proxied() { 508 } else { 504 };
@@ -856,7 +869,10 @@ impl Ops {
         let Some(inner) = in_process_request(&req, self_url) else {
             return (502, serde_json::Value::Null, Vec::new());
         };
-        let answer = self.state.call_on_task(req.subject().clone(), inner).await;
+        let answer = self
+            .state
+            .call_on_task(view, req.subject().clone(), inner)
+            .await;
         let status = answer.status().as_u16();
         let warnings = answer
             .headers()

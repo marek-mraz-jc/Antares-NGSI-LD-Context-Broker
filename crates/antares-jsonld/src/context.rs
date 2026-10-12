@@ -302,7 +302,7 @@ impl Context {
     /// several documents cannot walk past it.
     fn charge(&mut self, iri: &str) -> Result<(), NgsiError> {
         self.bytes = self.bytes.saturating_add(iri.len());
-        if self.bytes > crate::loader::MAX_CONTEXT_BYTES {
+        if self.bytes > crate::pinned::MAX_CONTEXT_BYTES {
             return Err(NgsiError::BadRequestData(
                 "@context term definitions exceed the maximum size".into(),
             ));

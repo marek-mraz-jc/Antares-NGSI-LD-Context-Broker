@@ -179,6 +179,7 @@ mod tests {
         HttpSink::new(
             antares_jsonld::client_builder(antares_jsonld::EgressPolicy {
                 allow_private: true,
+                private_hosts: &[],
             })
             .build()
             .expect("client"),
