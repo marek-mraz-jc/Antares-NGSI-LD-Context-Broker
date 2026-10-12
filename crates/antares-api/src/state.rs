@@ -627,7 +627,8 @@ impl AppState {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let types = [types.to_vec()];
+        // OR-of-AND groups (4.17): one group per type, so any of them matches.
+        let types: Vec<Vec<String>> = types.iter().map(|t| vec![t.clone()]).collect();
         let filter = antares_store::filter::EntityFilter {
             types: Some(&types),
             attrs: Some(attrs),

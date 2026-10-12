@@ -246,26 +246,31 @@ fn property(value: &Value, ts: &str) -> Value {
     json!([{ "type": "Property", "value": value, "createdAt": ts, "modifiedAt": ts }])
 }
 
-/// Mark or lift `rule` on `doc` as `cut` judges it now; `false` when the
-/// Entity already says what the rule says, so nothing is written.
-fn judge(doc: &mut Value, rule: &Rule, cut: chrono::DateTime<chrono::Utc>, ts: &str) -> bool {
+/// What `rule` would change on `doc` as `cut` judges it now: `Some(true)`
+/// mark, `Some(false)` lift, `None` when the Entity already says what the
+/// rule says.
+fn verdict(doc: &Value, rule: &Rule, cut: chrono::DateTime<chrono::Utc>) -> Option<bool> {
     let is_stale = stale(doc, rule, cut);
+    (is_stale != marked_by(doc).contains(&rule.name)).then_some(is_stale)
+}
+
+/// Mark or lift `rule` on `doc` as `cut` judges it now, stamped `ts`; what
+/// [`verdict`] says, and nothing written on `None` or on a document that is
+/// no object.
+fn judge(
+    doc: &mut Value,
+    rule: &Rule,
+    cut: chrono::DateTime<chrono::Utc>,
+    ts: &str,
+) -> Option<bool> {
+    let is_stale = verdict(doc, rule, cut)?;
     let mut names = marked_by(doc);
-    let was = names.contains(&rule.name);
-    if is_stale == was {
-        return false;
-    }
-    let Some(object) = doc.as_object_mut() else {
-        return false;
-    };
+    let object = doc.as_object_mut()?;
     if is_stale {
         names.push(rule.name.clone());
-        if !object.contains_key(QUARANTINED_AT) {
-            object.insert(
-                QUARANTINED_AT.to_owned(),
-                property(&json!({ "@type": "DateTime", "@value": ts }), ts),
-            );
-        }
+        object
+            .entry(QUARANTINED_AT)
+            .or_insert_with(|| property(&json!({ "@type": "DateTime", "@value": ts }), ts));
     } else {
         names.retain(|n| *n != rule.name);
     }
@@ -275,7 +280,7 @@ fn judge(doc: &mut Value, rule: &Rule, cut: chrono::DateTime<chrono::Utc>, ts: &
     } else {
         object.insert(QUARANTINE_RULES.to_owned(), property(&json!(names), ts));
     }
-    true
+    Some(is_stale)
 }
 
 /// One sweep at `now` over the rules the last reload found. Logs and counts
@@ -350,10 +355,10 @@ async fn judge_rule(
         };
         let last = rows.len() < PAGE;
         pending.extend(rows.iter().filter_map(|doc| {
-            let was = marked_by(doc).contains(&rule.name);
-            (stale(doc, rule, cut) != was)
-                .then(|| doc.get("id").and_then(Value::as_str).map(str::to_owned))
-                .flatten()
+            verdict(doc, rule, cut)
+                .and_then(|_| doc.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
         }));
         if last {
             break;
@@ -361,33 +366,25 @@ async fn judge_rule(
     }
     let (mut marked, mut lifted) = (0u64, 0u64);
     for batch in pending.chunks(PAGE) {
-        // Whether each id the closure changed was marked (`true`) or lifted.
-        let mut marking = std::collections::HashMap::new();
+        // What the closure wrote, judged again under each row lock: one
+        // entry per Entity marked (`true`) or lifted (`false`).
+        let mut wrote = Vec::new();
         let written = state
-            .mutate_entities(t, batch, |id, doc| {
-                let is_stale = stale(doc, rule, cut);
-                let changed = judge(doc, rule, cut, &ts);
-                if changed {
-                    marking.insert(id.to_owned(), is_stale);
-                }
-                changed
+            .mutate_entities(t, batch, |_, doc| {
+                judge(doc, rule, cut, &ts)
+                    .map(|is_stale| wrote.push(is_stale))
+                    .is_some()
             })
             .await;
-        match written {
-            Ok(written) => {
-                for (id, done) in batch.iter().zip(written) {
-                    match (done, marking.get(id)) {
-                        (true, Some(true)) => marked = marked.saturating_add(1),
-                        (true, Some(false)) => lifted = lifted.saturating_add(1),
-                        _ => {}
-                    }
-                }
-            }
-            Err(e) => {
-                failed(&e);
-                break;
-            }
+        if let Err(e) = written {
+            failed(&e);
+            break;
         }
+        let now_marked = wrote.iter().filter(|m| **m).count();
+        marked = marked.saturating_add(u64::try_from(now_marked).unwrap_or(u64::MAX));
+        lifted = lifted.saturating_add(
+            u64::try_from(wrote.len().saturating_sub(now_marked)).unwrap_or(u64::MAX),
+        );
     }
     [("quarantine", marked), ("lift", lifted)]
         .into_iter()
@@ -495,88 +492,87 @@ async fn delete_doc(r: Arc<Reloader>, tenant: String) -> Result<Response, String
 mod tests {
     use super::*;
 
-    const DOC: &[u8] = br#"{"rules":[{"name":"stale-position","type":"https://e.org/Vehicle",
-        "attribute":"https://e.org/location","maxAge":"PT10M"}]}"#;
+    const V: &str = "https://e.org/Vehicle";
+    const LOCATION: &str = "https://e.org/location";
 
     fn rule() -> Rule {
-        parse(DOC)
-            .unwrap_or_default()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| Rule {
-                name: String::new(),
-                checks: Vec::new(),
-                max_age: Duration::ZERO,
-            })
+        Rule {
+            name: "stale-position".into(),
+            checks: vec![(V.into(), LOCATION.into())],
+            max_age: Duration::from_secs(600),
+        }
+    }
+
+    fn entry(name: &str, ty: &str, attribute: &str, max_age: &str) -> Value {
+        json!({"name": name, "type": ty, "attribute": attribute, "maxAge": max_age})
+    }
+
+    fn doc(entries: &[Value]) -> Vec<u8> {
+        json!({ "rules": entries }).to_string().into_bytes()
+    }
+
+    /// `now` less `minutes`, as an `observedAt`.
+    fn at(now: chrono::DateTime<chrono::Utc>, minutes: i64) -> String {
+        now.checked_sub_signed(chrono::Duration::minutes(minutes))
+            .unwrap_or(now)
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    fn cut_of(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        now.checked_sub_signed(chrono::Duration::minutes(10))
+            .unwrap_or(now)
     }
 
     #[test]
     fn a_document_names_labels_and_expanded_iris_once() {
-        let r = rule();
-        assert_eq!(r.name, "stale-position");
-        assert_eq!(r.max_age, Duration::from_secs(600));
-        assert!(parse(br#"{"rules":[{"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1S"}]}"#).is_ok());
+        assert_eq!(
+            parse(&doc(&[entry("stale-position", V, LOCATION, "PT10M")])),
+            Ok(vec![rule()])
+        );
+        assert!(parse(&doc(&[entry("a1", V, LOCATION, "PT1S")])).is_ok());
+        let too_many: Vec<Value> = (0..=MAX_QUALITY_RULES)
+            .map(|n| entry(&format!("r{n}"), V, LOCATION, "PT1M"))
+            .collect();
         for bad in [
-            &br#"{"rules":[{"name":"A","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M"}]}"#[..],
-            br#"{"rules":[{"name":"a","type":"Vehicle","attribute":"https://e.org/x","maxAge":"PT1M"}]}"#,
-            br#"{"rules":[{"name":"a","type":"https://e.org/V","attribute":"speed","maxAge":"PT1M"}]}"#,
-            br#"{"rules":[{"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT0S"}]}"#,
-            br#"{"rules":[{"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"P3651D"}]}"#,
-            br#"{"rules":[{"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M"},
-                          {"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M"}]}"#,
-            br#"{"rules":[{"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M"},
-                          {"name":"a","type":"https://e.org/S","attribute":"https://e.org/x","maxAge":"PT2M"}]}"#,
-            br#"{"rules":[{"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M","outcome":"flag"}]}"#,
-            br#"{"rules":[{"name":"-a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M"}]}"#,
-            b"not json",
+            doc(&[entry("A", V, LOCATION, "PT1M")]),
+            doc(&[entry("-a", V, LOCATION, "PT1M")]),
+            doc(&[entry("a-", V, LOCATION, "PT1M")]),
+            doc(&[entry("a_b", V, LOCATION, "PT1M")]),
+            doc(&[entry(&"a".repeat(64), V, LOCATION, "PT1M")]),
+            doc(&[entry("a", ":Vehicle", LOCATION, "PT1M")]),
+            doc(&[entry("a", "urn:", LOCATION, "PT1M")]),
+            doc(&[entry("a", "https://e.org/a b", LOCATION, "PT1M")]),
+            doc(&[entry("a", "Vehicle", LOCATION, "PT1M")]),
+            doc(&[entry("a", V, "speed", "PT1M")]),
+            doc(&[entry("a", V, LOCATION, "PT0S")]),
+            doc(&[entry("a", V, LOCATION, "P3651D")]),
+            doc(&[
+                entry("a", V, LOCATION, "PT1M"),
+                entry("a", V, LOCATION, "PT1M"),
+            ]),
+            doc(&[
+                entry("a", V, LOCATION, "PT1M"),
+                entry("a", "https://e.org/S", LOCATION, "PT2M"),
+            ]),
+            json!({"rules": [{"name": "a", "type": V, "attribute": LOCATION, "maxAge": "PT1M",
+                "outcome": "flag"}]})
+            .to_string()
+            .into_bytes(),
+            doc(&too_many),
+            b"not json".to_vec(),
         ] {
-            assert!(parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+            assert!(parse(&bad).is_err(), "{}", String::from_utf8_lossy(&bad));
         }
     }
 
     #[test]
-    fn a_stale_entity_is_marked_once_and_lifted_when_fresh() {
-        let r = rule();
-        let now = chrono::Utc::now();
-        let cut = now - chrono::Duration::minutes(10);
-        let at = |minutes: i64| {
-            (now - chrono::Duration::minutes(minutes))
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        };
-        let mut doc = json!({"id": "urn:v:1", "type": ["https://e.org/Vehicle"],
-            "https://e.org/location": [{"type": "Property", "value": 1, "observedAt": at(11)}]});
-        assert!(judge(&mut doc, &r, cut, "t1"));
-        assert_eq!(marked_by(&doc), ["stale-position"]);
-        assert!(doc.get(QUARANTINED_AT).is_some());
-        assert!(
-            !judge(&mut doc, &r, cut, "t2"),
-            "marked twice is marked once"
-        );
-
-        doc["https://e.org/location"] =
-            json!([{"type": "Property", "value": 2, "observedAt": at(1)}]);
-        assert!(judge(&mut doc, &r, cut, "t3"));
-        assert!(doc.get(QUARANTINED_AT).is_none() && doc.get(QUARANTINE_RULES).is_none());
-
-        // Another rule's mark stays when this one lifts; the attribute gone lifts too.
-        doc[QUARANTINE_RULES] = property(&json!(["stale-position", "other"]), "t4");
-        doc[QUARANTINED_AT] = property(&json!({"@type": "DateTime", "@value": "t4"}), "t4");
-        doc.as_object_mut()
-            .map(|o| o.remove("https://e.org/location"));
-        assert!(judge(&mut doc, &r, cut, "t5"));
-        assert_eq!(marked_by(&doc), ["other"]);
-        assert!(doc.get(QUARANTINED_AT).is_some());
-    }
-
-    #[test]
     fn the_entries_of_one_name_are_one_rule() {
-        let rules = parse(
-            br#"{"rules":[
-            {"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M"},
-            {"name":"b","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT5M"},
-            {"name":"a","type":"https://e.org/S","attribute":"https://e.org/x","maxAge":"PT1M"},
-            {"name":"a","type":"https://e.org/V","attribute":"https://e.org/y","maxAge":"PT1M"}]}"#,
-        )
+        let rules = parse(&doc(&[
+            entry("a", V, "https://e.org/x", "PT1M"),
+            entry("b", V, "https://e.org/x", "PT5M"),
+            entry("a", "https://e.org/S", "https://e.org/x", "PT1M"),
+            entry("a", V, "https://e.org/y", "PT1M"),
+        ]))
         .unwrap_or_default();
         let shape: Vec<(&str, usize)> = rules
             .iter()
@@ -585,39 +581,102 @@ mod tests {
         assert_eq!(shape, [("a", 3), ("b", 1)]);
     }
 
+    #[test]
+    fn a_stored_document_that_no_longer_parses_is_skipped() {
+        let good = json!({"text": String::from_utf8_lossy(&doc(&[entry("stale-position", V, LOCATION, "PT10M")]))});
+        let broken = json!({"text": "not json"});
+        let rules = load([("city", &good), ("port", &broken), ("Not One", &good)].into_iter());
+        let tenants: Vec<&str> = rules.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(tenants, ["city"]);
+    }
+
+    #[test]
+    fn a_stale_entity_is_marked_once_and_lifted_when_fresh() {
+        let r = rule();
+        let now = chrono::Utc::now();
+        let cut = cut_of(now);
+        let mut doc = json!({"id": "urn:v:1", "type": [V],
+            LOCATION: [{"type": "Property", "value": 1, "observedAt": at(now, 11)}]});
+        assert_eq!(judge(&mut doc, &r, cut, "t1"), Some(true));
+        assert_eq!(marked_by(&doc), ["stale-position"]);
+        assert!(doc.get(QUARANTINED_AT).is_some());
+        assert_eq!(
+            judge(&mut doc, &r, cut, "t2"),
+            None,
+            "marked twice is marked once"
+        );
+
+        doc[LOCATION] = json!([{"type": "Property", "value": 2, "observedAt": at(now, 1)}]);
+        assert_eq!(judge(&mut doc, &r, cut, "t3"), Some(false));
+        assert!(doc.get(QUARANTINED_AT).is_none(), "{doc}");
+        assert!(doc.get(QUARANTINE_RULES).is_none(), "{doc}");
+
+        // Another rule's mark stays when this one lifts; the attribute gone lifts too.
+        doc[QUARANTINE_RULES] = property(&json!(["stale-position", "other"]), "t4");
+        doc[QUARANTINED_AT] = property(&json!({"@type": "DateTime", "@value": "t4"}), "t4");
+        doc.as_object_mut().map(|o| o.remove(LOCATION));
+        assert_eq!(judge(&mut doc, &r, cut, "t5"), Some(false));
+        assert_eq!(marked_by(&doc), ["other"]);
+        assert!(doc.get(QUARANTINED_AT).is_some());
+    }
+
+    /// The mark of another rule keeps its `quarantinedAt`; one attribute
+    /// instance as an object, a type and a `quarantineRules` value as one
+    /// string read as their arrays do.
+    #[test]
+    fn a_mark_beside_another_rules_keeps_the_first_quarantined_at() {
+        let r = rule();
+        let now = chrono::Utc::now();
+        let mut doc = json!({"id": "urn:v:1", "type": V,
+            LOCATION: {"type": "Property", "value": 1, "observedAt": at(now, 30)},
+            QUARANTINE_RULES: [{"type": "Property", "value": "other"}],
+            QUARANTINED_AT: [{"type": "Property", "value": "first"}]});
+        assert_eq!(judge(&mut doc, &r, cut_of(now), "t1"), Some(true));
+        assert_eq!(marked_by(&doc), ["other", "stale-position"]);
+        assert_eq!(doc[QUARANTINED_AT][0]["value"], "first");
+
+        let mut odd = json!({"id": "urn:v:2", "type": 7,
+            LOCATION: [{"type": "Property", "value": 1, "observedAt": at(now, 30)}],
+            QUARANTINE_RULES: [{"type": "Property", "value": 7}]});
+        assert_eq!(marked_by(&odd), Vec::<String>::new());
+        assert_eq!(
+            judge(&mut odd, &r, cut_of(now), "t2"),
+            None,
+            "no type is not the rule's"
+        );
+        assert_eq!(judge(&mut json!(1), &r, cut_of(now), "t3"), None);
+    }
+
     /// An Entity of two types one name judges: the stale attribute of one
     /// type marks it, the fresh one of the other does not lift it, so two
     /// entries of a name never undo each other sweep after sweep.
     #[test]
     fn two_entries_of_one_name_never_undo_each_other() {
-        let r = parse(br#"{"rules":[
-            {"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT10M"},
-            {"name":"a","type":"https://e.org/S","attribute":"https://e.org/y","maxAge":"PT10M"}]}"#)
-        .unwrap_or_default()
-        .into_iter()
-        .next()
-        .unwrap_or_else(rule);
-        let now = chrono::Utc::now();
-        let cut = now - chrono::Duration::minutes(10);
-        let at = |minutes: i64| {
-            (now - chrono::Duration::minutes(minutes))
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        let r = Rule {
+            name: "a".into(),
+            checks: vec![
+                (V.into(), "https://e.org/x".into()),
+                ("https://e.org/S".into(), "https://e.org/y".into()),
+            ],
+            max_age: Duration::from_secs(600),
         };
-        let mut doc = json!({"id": "urn:v:1", "type": ["https://e.org/V", "https://e.org/S"],
-            "https://e.org/x": [{"type": "Property", "value": 1, "observedAt": at(30)}],
-            "https://e.org/y": [{"type": "Property", "value": 1, "observedAt": at(1)}]});
-        assert!(judge(&mut doc, &r, cut, "t1"));
-        assert!(!judge(&mut doc, &r, cut, "t2"), "the mark stays");
+        let now = chrono::Utc::now();
+        let cut = cut_of(now);
+        let mut doc = json!({"id": "urn:v:1", "type": [V, "https://e.org/S"],
+            "https://e.org/x": [{"type": "Property", "value": 1, "observedAt": at(now, 30)}],
+            "https://e.org/y": [{"type": "Property", "value": 1, "observedAt": at(now, 1)}]});
+        assert_eq!(judge(&mut doc, &r, cut, "t1"), Some(true));
+        assert_eq!(judge(&mut doc, &r, cut, "t2"), None, "the mark stays");
         // The attribute of a type the Entity lacks is not judged.
         let mut other = json!({"id": "urn:s:1", "type": ["https://e.org/S"],
-            "https://e.org/x": [{"type": "Property", "value": 1, "observedAt": at(30)}]});
-        assert!(!judge(&mut other, &r, cut, "t3"));
+            "https://e.org/x": [{"type": "Property", "value": 1, "observedAt": at(now, 30)}]});
+        assert_eq!(judge(&mut other, &r, cut, "t3"), None);
     }
 
     #[test]
     fn an_instance_without_observed_at_is_not_judged() {
-        let r = rule();
-        let mut doc = json!({"id": "urn:v:1", "type": ["https://e.org/Vehicle"], "https://e.org/location": [{"type": "Property", "value": 1}]});
-        assert!(!judge(&mut doc, &r, chrono::Utc::now(), "t"));
+        let mut doc =
+            json!({"id": "urn:v:1", "type": [V], LOCATION: [{"type": "Property", "value": 1}]});
+        assert_eq!(judge(&mut doc, &rule(), chrono::Utc::now(), "t"), None);
     }
 }

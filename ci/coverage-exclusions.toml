@@ -61,6 +61,22 @@ branches = 0
 reason = "a retention statement failing on the store, which the built-in store under test_kit does not (see antares_ops::views::inner); tests/pg_retention.rs in antares-sql runs the Postgres statements themselves"
 
 [[exclusion]]
+crate = "antares-ops"
+file = "src/views/quality.rs"
+function = "antares_ops::views::quality::sweep"
+lines = 6
+branches = 0
+reason = "tracing::info! repeats its fields in the `log` fallback, which runs only with no subscriber set; the counter beside it is what tests/quality.rs reads through the sweep's answer"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/views/quality.rs"
+function = "antares_ops::views::quality::judge_rule"
+lines = 8
+branches = 2
+reason = "6 lines, 1 branch: the scan or the in-place write failing on the store, which the built-in store under test_kit does not (see antares_ops::views::inner); tests/quality_pg.rs runs both on Postgres. 2 lines, 1 branch: a type with more than PAGE (1000) Entities read over a second page, which no test seeds"
+
+[[exclusion]]
 crate = "antares-mcp"
 file = "src/server.rs"
 function = "Server::run" # v0 mangling puts the impl between the crate and the type

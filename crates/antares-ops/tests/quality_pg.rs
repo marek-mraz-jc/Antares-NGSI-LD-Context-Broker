@@ -16,6 +16,8 @@ use tower::ServiceExt;
 
 const LOCATION: &str = "https://example.org/position";
 const RULES: &str = r#"{"rules":[{"name":"stale-position","type":"https://example.org/Vehicle",
+    "attribute":"https://example.org/position","maxAge":"PT10M"},
+    {"name":"stale-position","type":"https://example.org/Bus",
     "attribute":"https://example.org/position","maxAge":"PT10M"}]}"#;
 
 async fn send(

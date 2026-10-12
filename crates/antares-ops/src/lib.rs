@@ -1045,9 +1045,7 @@ pub mod test_kit {
             if let Some(engine) = engine {
                 state = state.with_policy(engine);
             }
-            antares_api::wire(&mut state).await;
-            let reload = crate::views::install(&state).await?;
-            Ok(Self { state, reload })
+            Self::over(state).await
         }
 
         /// One retention sweep at `now` (T-3900), as the minute loop runs it.

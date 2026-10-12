@@ -17,7 +17,13 @@ const V: &str = "https://example.org/Vehicle";
 const S: &str = "https://example.org/Stop";
 const LOCATION: &str = "https://example.org/position";
 
+/// One rule of three entries: a second attribute of the same type, and the
+/// same attribute of a type no Entity here has.
 const RULES: &str = r#"{"rules":[{"name":"stale-position","type":"https://example.org/Vehicle",
+    "attribute":"https://example.org/position","maxAge":"PT10M"},
+    {"name":"stale-position","type":"https://example.org/Vehicle",
+    "attribute":"https://example.org/speed","maxAge":"PT10M"},
+    {"name":"stale-position","type":"https://example.org/Bus",
     "attribute":"https://example.org/position","maxAge":"PT10M"}]}"#;
 
 async fn send(
@@ -136,12 +142,22 @@ async fn a_document_is_checked_stored_replaced_and_deleted() {
             .0,
         StatusCode::NO_CONTENT
     );
-    assert_eq!(
-        send(&app, Method::GET, "/q/quality/city", None, None)
-            .await
-            .0,
-        StatusCode::NOT_FOUND
-    );
+    for (method, uri, status) in [
+        (Method::GET, "/q/quality/city", StatusCode::NOT_FOUND),
+        (Method::DELETE, "/q/quality/city", StatusCode::NOT_FOUND),
+        (Method::GET, "/q/quality/Not%20One", StatusCode::BAD_REQUEST),
+        (
+            Method::DELETE,
+            "/q/quality/Not%20One",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(
+            send(&app, method.clone(), uri, None, None).await.0,
+            status,
+            "{method} {uri}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -240,10 +256,8 @@ async fn a_stale_entity_is_quarantined_and_lifted_when_fresh_and_nothing_else_is
         [("lift", 1)]
     );
     let lifted = entity(&app, "city", "urn:v:old").await;
-    assert!(
-        lifted.get("quarantinedAt").is_none() && lifted.get("quarantineRules").is_none(),
-        "{lifted}"
-    );
+    assert!(lifted.get("quarantinedAt").is_none(), "{lifted}");
+    assert!(lifted.get("quarantineRules").is_none(), "{lifted}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
