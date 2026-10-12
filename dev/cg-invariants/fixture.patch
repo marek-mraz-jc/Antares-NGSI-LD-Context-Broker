@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 01e06aa..6859c2d 100644
+index 921db29..0fb8901 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -86,6 +86,7 @@ dependencies = [
@@ -10,7 +10,7 @@ index 01e06aa..6859c2d 100644
   "sonic-rs",
   "tokio",
   "tower",
-@@ -391,6 +392,7 @@ name = "antares-views"
+@@ -392,6 +393,7 @@ name = "antares-views"
  version = "0.1.3"
  dependencies = [
   "antares-ops",
@@ -18,7 +18,7 @@ index 01e06aa..6859c2d 100644
   "axum",
   "http-body-util",
   "proptest",
-@@ -2426,6 +2428,7 @@ dependencies = [
+@@ -2427,6 +2429,7 @@ dependencies = [
  name = "odata-url"
  version = "0.1.3"
  dependencies = [
@@ -26,7 +26,7 @@ index 01e06aa..6859c2d 100644
   "odata-csdl",
   "proptest",
   "serde_json",
-@@ -3520,6 +3523,19 @@ dependencies = [
+@@ -3521,6 +3524,19 @@ dependencies = [
   "serde",
  ]
  
@@ -46,7 +46,7 @@ index 01e06aa..6859c2d 100644
  [[package]]
  name = "sha1"
  version = "0.10.7"
-@@ -4475,6 +4491,12 @@ version = "0.2.2"
+@@ -4476,6 +4492,12 @@ version = "0.2.2"
  source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
  
@@ -72,18 +72,19 @@ index 9b6575e..3675b4f 100644
  tower-http = { workspace = true }
  antares-model = { workspace = true }
 diff --git a/crates/antares-api/src/lib.rs b/crates/antares-api/src/lib.rs
-index 8d83ed7..7b479dd 100644
+index 8d83ed7..506484e 100644
 --- a/crates/antares-api/src/lib.rs
 +++ b/crates/antares-api/src/lib.rs
-@@ -400,6 +400,7 @@ pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
+@@ -400,6 +400,8 @@ pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
          ("/entityOperations/delete", post(batch::batch_delete)),
          ("/entityOperations/merge", post(batch::batch_merge)),
          ("/entityOperations/query", post(batch::batch_query)),
 +        ("/cg-fixture", get(cg_fixture_route)),
++        ("/cg-fixture-store", get(cg_fixture_store_route)),
          // EntityMaps (5.14; 6.32/6.34/6.35)
          (
              "/entityMaps",
-@@ -6674,3 +6675,28 @@ mod clause_6_3_11 {
+@@ -6674,3 +6676,40 @@ mod clause_6_3_11 {
  pub(crate) fn allow_private() {
      antares_jsonld::allow_private_egress(true);
  }
@@ -112,6 +113,18 @@ index 8d83ed7..7b479dd 100644
 +pub fn cg_fixture_yaml(text: &str) -> bool {
 +    serde_yaml::from_str::<serde_json::Value>(text).is_ok()
 +}
++
++/// cg-invariants fixture: a route that reaches the store with a Tenant it
++/// did not read through negotiate::tenant_from.
++async fn cg_fixture_store_route(
++    axum::extract::State(st): axum::extract::State<AppState>,
++) -> axum::http::StatusCode {
++    let _ = st
++        .store
++        .get(&TenantId::default(), antares_store::Kind::Entity, "urn:x")
++        .await;
++    axum::http::StatusCode::OK
++}
 diff --git a/crates/antares-sql/src/lib.rs b/crates/antares-sql/src/lib.rs
 index 6f5ffb5..dc8951f 100644
 --- a/crates/antares-sql/src/lib.rs
@@ -125,6 +138,21 @@ index 6f5ffb5..dc8951f 100644
 +pub fn cg_fixture_sql(table: &str) -> sqlx::AssertSqlSafe<String> {
 +    sqlx::AssertSqlSafe(format!("SELECT * FROM {table}"))
 +}
+diff --git a/crates/antares-store/src/lib.rs b/crates/antares-store/src/lib.rs
+index ff06756..0380468 100644
+--- a/crates/antares-store/src/lib.rs
++++ b/crates/antares-store/src/lib.rs
+@@ -321,6 +321,10 @@ pub trait CurrentStateDriver: Send + Sync {
+     }
+     /// Installs the (tenant, before, after) hook called on every entity write.
+     fn set_change_hook(&self, h: ChangeHook);
++    /// cg-invariants fixture: a store method that takes no Tenant.
++    fn cg_fixture_unscoped(&self) -> usize {
++        0
++    }
+     /// Turn the same-transaction outbox producer on (bus=nats).
+     fn set_outbox(&self, on: bool) {
+         let _ = on;
 diff --git a/crates/antares-views/Cargo.toml b/crates/antares-views/Cargo.toml
 index 6fb05a0..2cf5cda 100644
 --- a/crates/antares-views/Cargo.toml
