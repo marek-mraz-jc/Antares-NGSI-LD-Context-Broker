@@ -240,7 +240,7 @@ impl Egress {
             evict_oldest(&mut map, &k, |b: &Breaker| b.touched_at);
         }
         let b = map.entry(k).or_default();
-        b.failures += 1;
+        b.failures = b.failures.saturating_add(1);
         b.touched_at = Some(Instant::now());
         if b.failures >= TRIP_AFTER {
             b.tripped_at = Some(Instant::now());
@@ -260,6 +260,7 @@ mod tests {
     async fn a_refused_url_never_repeats_its_userinfo() {
         let e = Egress::new(antares_jsonld::EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         });
         for url in [
             "http://alice:s3cret@[not-an-ip]/x",
@@ -274,6 +275,7 @@ mod tests {
     async fn scheme_allowlist_and_private_deny() {
         let e = Egress::new(antares_jsonld::EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         });
         assert!(e.check_url("file:///etc/passwd").await.is_err());
         assert!(e.check_url("http://127.0.0.1:9090/x").await.is_err());
@@ -283,6 +285,7 @@ mod tests {
             .is_err());
         let allow = Egress::new(antares_jsonld::EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         assert!(allow.check_url("http://127.0.0.1:9090/x").await.is_ok());
         assert!(
@@ -316,6 +319,7 @@ mod tests {
     async fn a_literal_metadata_address_is_refused_with_private_egress_allowed() {
         let allow = Egress::new(antares_jsonld::EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         for u in [
             "http://169.254.169.254/latest/meta-data",
