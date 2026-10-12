@@ -222,3 +222,40 @@ async fn an_export_refuses_what_it_does_not_carry_and_names_it() {
         StatusCode::BAD_REQUEST
     );
 }
+
+/// The move between backends: a memory broker's tenant imported into a
+/// Postgres one answers the same digest and the same history.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a live PostGIS in ANTARES_TEST_DATABASE_URL: cargo test -p antares-api --features postgres --test it tenant_move:: -- --ignored"]
+async fn a_memory_tenant_moves_into_postgres_with_the_same_digest() {
+    let url = std::env::var("ANTARES_TEST_DATABASE_URL")
+        .expect("ANTARES_TEST_DATABASE_URL must point at a live PostGIS");
+    let pool = antares_sql::store::pg::connect(&url, 5)
+        .await
+        .expect("connect");
+    let store =
+        antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(pool));
+    let mut target =
+        AppState::with_store("antares-pg".into(), std::sync::Arc::new(store), "postgres");
+    antares_api::wire(&mut target).await;
+    let source = state().await;
+    let tenant = format!("move{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    seeded(&source, &tenant).await;
+
+    let before = read(&source, &format!("/q/tenants/{tenant}/digest"), None).await;
+    let (status, why) = import(&target, &tenant, export(&source, &tenant).await).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{why}");
+    let after = read(&target, &format!("/q/tenants/{tenant}/digest"), None).await;
+    assert_eq!(after, before);
+    let path = "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Room:1";
+    assert_eq!(
+        read(&target, path, Some(&tenant)).await,
+        read(&source, path, Some(&tenant)).await
+    );
+    // and back out of Postgres: the export of the copy is the export of the source
+    assert_eq!(
+        export(&target, &tenant).await,
+        export(&source, &tenant).await
+    );
+}
