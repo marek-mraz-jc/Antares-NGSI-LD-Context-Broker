@@ -4,7 +4,7 @@
 //! and a request that is not the operation it names is refused.
 
 use antares_ops::test_kit::TestBroker;
-use antares_ops::{Caller, OperationId, Ops, OpsRequest, Refusal, Surface, INNER_DETAIL};
+use antares_ops::{Caller, OperationId, Ops, OpsRequest, Refusal, Surface, CONTEXT_DETAIL};
 use axum::body::Body;
 use axum::extract::Query;
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode};
@@ -131,12 +131,13 @@ async fn open(app: &Router) {
     assert_eq!(resp.status(), StatusCode::CREATED, "the view loads");
 }
 
-/// A `@context` nobody serves: the NGSI-LD answer is a 5xx naming it
-/// (`LdContextNotAvailable`); the surface gets a fixed detail and an id,
-/// and the log carries the detail under the same id. Current-thread, so the
-/// recording subscriber sees every event of the run.
+/// A `@context` nobody serves: the NGSI-LD answer is a 504 naming it
+/// (`LdContextNotAvailable`); the surface keeps the 504 and its type, as
+/// the root answers (T-3944), with a fixed detail, and the log carries the
+/// fetch's own detail under a request id. Current-thread, so the recording
+/// subscriber sees every event of the run.
 #[tokio::test(flavor = "current_thread")]
-async fn an_inner_5xx_detail_never_reaches_the_surface() {
+async fn a_context_that_does_not_load_stays_504_without_its_detail() {
     let log = Log::default();
     let _guard = tracing::subscriber::set_default(log.clone());
     let app = TestBroker::new()
@@ -180,12 +181,22 @@ async fn an_inner_5xx_detail_never_reaches_the_surface() {
         &format!("/x/probe?path=/ngsi-ld/v1/entities%3Ftype%3DCar&context={ctx}"),
     )
     .await;
-    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert!(body.contains(INNER_DETAIL), "{body}");
-    assert!(body.contains("request id ops-"), "{body}");
+    assert_eq!(s, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert!(body.contains("LdContextNotAvailable"), "{body}");
+    assert!(body.contains(CONTEXT_DETAIL), "{body}");
     assert!(
         !body.contains("nowhere-7f3a") && !body.contains("127.0.0.1"),
         "no inner detail: {body}"
+    );
+    let lines = log
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("request_id=\"ops-") && l.contains("nowhere-7f3a")),
+        "the log keeps the detail under an id: {lines:?}"
     );
 }
 
@@ -276,6 +287,7 @@ fn every_refusal_renders_with_its_status_and_no_echo() {
             },
             500,
         ),
+        (Refusal::ContextUnavailable, 504),
         (
             Refusal::Overloaded {
                 retry_after: Some(HeaderValue::from_static("6")),

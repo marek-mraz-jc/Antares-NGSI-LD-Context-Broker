@@ -40,7 +40,7 @@ pub mod mapping;
 mod operation;
 pub mod views;
 
-pub use error::{Refusal, INNER_DETAIL};
+pub use error::{Refusal, CONTEXT_DETAIL, INNER_DETAIL};
 pub use operation::OperationId;
 
 use antares_api::AppState;
@@ -412,12 +412,14 @@ impl Ops {
     /// never the admin or another surface's routes. A failure inside the
     /// broker (5xx) never reaches the surface with its detail: it becomes
     /// [`Refusal::Inner`] with a request id, and the detail goes to the log
-    /// under that id.
+    /// under that id. A 504 `LdContextNotAvailable` is the caller's own
+    /// `@context` failing to load and stays one ([`Refusal::ContextUnavailable`]).
     ///
     /// # Errors
     /// [`Refusal::NotAllowed`] when the request is not `op`,
     /// [`Refusal::Malformed`] when its target is not a URI,
-    /// [`Refusal::Inner`] or [`Refusal::Overloaded`] when the broker failed.
+    /// [`Refusal::Inner`] or [`Refusal::Overloaded`] when the broker failed,
+    /// [`Refusal::ContextUnavailable`] when a named `@context` did not load.
     pub async fn run(
         &self,
         op: OperationId,
@@ -495,6 +497,16 @@ impl Ops {
         }
         Err(inner_failure(op, answer).await)
     }
+}
+
+/// Whether a 504 is TS 104 176's `LdContextNotAvailable` (6.3.2), the one
+/// broker 5xx that answers for the request rather than for the broker.
+fn context_unavailable(status: StatusCode, body: &[u8]) -> bool {
+    status == StatusCode::GATEWAY_TIMEOUT
+        && serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|problem| {
+            problem.get("type").and_then(serde_json::Value::as_str)
+                == Some("https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable")
+        })
 }
 
 impl ViewOps {
@@ -698,18 +710,29 @@ impl ViewOps {
 
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
-/// Log an inner failure under a fresh id and answer with the id alone.
+/// Log an inner failure under a fresh id and answer with the id alone; a
+/// `@context` that did not load is logged the same way and answered as one.
 async fn inner_failure(op: OperationId, answer: Response) -> Refusal {
     let request_id = format!(
         "ops-{:x}-{:x}",
         std::process::id(),
         NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
     );
-    let status = answer.status().as_u16();
-    let detail = axum::body::to_bytes(answer.into_body(), LOGGED_DETAIL_BYTES)
+    let status = answer.status();
+    let body = axum::body::to_bytes(answer.into_body(), LOGGED_DETAIL_BYTES)
         .await
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
+    let detail = String::from_utf8_lossy(&body).into_owned();
+    if context_unavailable(status, &body) {
+        tracing::info!(
+            request_id,
+            operation = op.id(),
+            detail,
+            "a JSON-LD @context the request names did not load"
+        );
+        return Refusal::ContextUnavailable;
+    }
+    let status = status.as_u16();
     tracing::warn!(
         request_id,
         operation = op.id(),
