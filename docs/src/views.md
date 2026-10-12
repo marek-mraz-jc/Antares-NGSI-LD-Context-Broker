@@ -25,7 +25,7 @@ Tenant:
 | 10.4.4 | Retrieve Attribute Value |
 | 10.6.3 to 10.6.8 | Entity types and Attributes |
 | 11.3.2, 11.3.3 | Temporal Retrieve and Query |
-| 13.3 | List @contexts: the core context only |
+| 13.3 | List @contexts: the core context only; a view that shows every name lists the Tenant's stored @contexts as the root does |
 | 10.2.2 to 10.2.11, but 10.2.12 Purge | Create, Update, Append, Partial Update, Set Value, Delete Attribute, Delete, Merge, Replace Entity, Replace Attribute |
 | 10.3.2 to 10.3.6 | Batch create, upsert, update, merge and delete, member by member |
 | 10.5.2 to 10.5.6 | Create, Update, Retrieve, Query and Delete Subscription |
