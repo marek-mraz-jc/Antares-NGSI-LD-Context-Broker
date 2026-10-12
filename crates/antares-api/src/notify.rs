@@ -1465,10 +1465,12 @@ fn to_lane(st: &AppState, group: Matched, batch: &Arc<BatchDone>) {
 /// Serve one subscription's lane in order until it is empty, then retire it.
 #[cfg(not(target_arch = "wasm32"))]
 async fn run_lane(key: (String, String), mut rx: tokio::sync::mpsc::Receiver<LaneJob>) {
+    // a group the last fold had no room for leads the next notification
+    let mut carry = None;
     loop {
-        let job = match rx.try_recv() {
-            Ok(job) => job,
-            Err(_) => {
+        let job = match carry.take().map_or_else(|| rx.try_recv().ok(), Some) {
+            Some(job) => job,
+            None => {
                 // Looked at again under the map's lock, which every sender
                 // holds while it sends: a group cannot arrive between this
                 // look and the removal.
@@ -1482,26 +1484,42 @@ async fn run_lane(key: (String, String), mut rx: tokio::sync::mpsc::Receiver<Lan
                 }
             }
         };
-        // Everything waiting behind it leaves in the same notification, as a
-        // drain folds one subscription's changes into one group: a lane
-        // keeps up by sending fewer, larger notifications, not by queueing
-        // one per change. The newest group carries the subscription as it
-        // reads now; the batches stay pending until this delivery ends.
-        let LaneJob {
-            st,
-            mut group,
-            _batch,
-        } = job;
-        let mut batches = vec![_batch];
-        while let Ok(next) = rx.try_recv() {
-            let mut data = std::mem::take(&mut group.data);
-            data.extend(next.group.data);
-            group = Matched { data, ..next.group };
-            batches.push(next._batch);
-        }
+        let (st, group, batches, rest) = fold(job, &mut rx);
+        carry = rest;
         guarded(async move { deliver_group(&st, group).await }).await;
         drop(batches);
     }
+}
+
+/// What waits behind `job` on its lane leaves in the same notification, as
+/// a drain folds one subscription's changes into one group: a lane keeps up
+/// by sending fewer, larger notifications, not by queueing one per change.
+/// The fold stops before a group that would take the notification past
+/// [`CHANGE_BATCH`] entities and hands that group back, so a backed-up lane
+/// sends several bounded POSTs, never its whole depth in one. The newest
+/// group carries the subscription as it reads now; the batches stay pending
+/// until the delivery ends.
+#[cfg(not(target_arch = "wasm32"))]
+fn fold(
+    job: LaneJob,
+    rx: &mut tokio::sync::mpsc::Receiver<LaneJob>,
+) -> (AppState, Matched, Vec<Arc<BatchDone>>, Option<LaneJob>) {
+    let LaneJob {
+        st,
+        mut group,
+        _batch,
+    } = job;
+    let mut batches = vec![_batch];
+    while let Ok(next) = rx.try_recv() {
+        if group.data.len().saturating_add(next.group.data.len()) > CHANGE_BATCH {
+            return (st, group, batches, Some(next));
+        }
+        let mut data = std::mem::take(&mut group.data);
+        data.extend(next.group.data);
+        group = Matched { data, ..next.group };
+        batches.push(next._batch);
+    }
+    (st, group, batches, None)
 }
 
 /// Groups a full lane refused: counted by entity, and named by tenant and
@@ -3653,6 +3671,48 @@ mod change_pipeline {
             hits.load(Ordering::SeqCst) > before,
             "a change created after the poisoned one must still notify"
         );
+    }
+
+    /// T-4086: a backed-up lane folds into notifications of at most
+    /// CHANGE_BATCH entities; a group that does not fit leads the next one,
+    /// and a single group larger than that still leaves whole.
+    #[tokio::test]
+    async fn lane_fold_stops_at_change_batch() {
+        let st = AppState::new("antares-lane-fold".into());
+        let pending: Arc<AtomicUsize> = Arc::default();
+        let job = |n: usize| {
+            pending.fetch_add(1, Ordering::SeqCst);
+            LaneJob {
+                st: st.clone(),
+                group: Matched {
+                    tenant: TenantId::new("default").expect("tenant"),
+                    sub: Arc::new(json!({"id": "urn:ngsi-ld:Subscription:fold"})),
+                    ctx: antares_jsonld::Loader::new().core(),
+                    data: vec![json!({}); n],
+                },
+                _batch: Arc::new(BatchDone {
+                    pending: pending.clone(),
+                    taken: 1,
+                }),
+            }
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(DELIVERY_LANE);
+        for n in [100, 100, 100, CHANGE_BATCH + 1, 1] {
+            assert!(tx.try_send(job(n)).is_ok(), "lane has room");
+        }
+        let mut sizes = Vec::new();
+        let mut next = rx.try_recv().ok();
+        while let Some(first) = next {
+            let (_, group, batches, rest) = fold(first, &mut rx);
+            sizes.push((group.data.len(), batches.len()));
+            next = rest.or_else(|| rx.try_recv().ok());
+        }
+        assert_eq!(
+            sizes,
+            [(200, 2), (100, 1), (CHANGE_BATCH + 1, 1), (1, 1)],
+            "folds stop before CHANGE_BATCH; an oversized group leaves alone"
+        );
+        assert_eq!(pending.load(Ordering::SeqCst), 0, "every batch released");
     }
 
     /// T-4086: behind a subscriber that never answers, a burst of a whole
