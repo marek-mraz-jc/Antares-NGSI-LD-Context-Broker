@@ -9,7 +9,14 @@ is not in the view's `operations`; ADR-0023 rule 4), a request no operation
 binds, a request naming an NGSILD-Tenant (rule 10) or an entity map (threat
 V22), and, for a view that does not show every name, a request naming a type
 outside its selector (rule 3) or an Attribute no rule shows (rule 2) in its
-`type`, `attrs`, `pick`, `omit` or `q`, or in the JSON body it sent (T-3787).
+`type`, `attrs`, `pick`, `omit`, `orderBy` or `q`, in the JSON body it sent
+(T-3787), in its path (`/types/{type}`, `/attributes/{attr}`) or as the type
+of an entity id it reads (the suite's ids are `urn:ngsi-ld:{Type}:…`, T-3980).
+Such a view also owes its narrowing (T-3980): a discovery listing names only
+what it shows, a join follows Relationships only into entities it shows, a
+query that names no type answers only the view's types, and
+an answer may lack an Attribute it does not show, when the TP's failure
+message (failures.csv) names only such Attributes as missing.
 Names are expanded as the suite sends them: its own @context, then the core
 one, then the default vocabulary. The body requests come from the run's
 requests.jsonl (dev/etsi_setup_url.py records them).
@@ -22,12 +29,13 @@ under the view's id with the task that fixes it; a named TP that no longer
 differs fails too (remove it). The owed refusals are written to
 <e2-dir>/owed-refusals.json. KNOWN overrides the known file (the selftest).
 """
+import csv
 import glob
 import json
 import os
 import re
 import sys
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MATRIX = f"{HERE}/../docs/analysis/operation-matrix.yaml"
@@ -44,6 +52,16 @@ SUITE_CONTEXT = {t: f"https://ngsi-ld-test-suite/context#{t}" for t in (
 # members of an Entity or a request body that are no Attribute (CIM 009 5.2)
 NOT_ATTRIBUTES = {"id", "@id", "type", "@type", "@context", "scope", "createdAt",
                   "modifiedAt", "deletedAt", "expiresAt"}
+# the discovery listings a view narrows to the names it shows (ADR-0023 rules 2 and 3)
+LISTINGS = {"retrieve_entity_types", "retrieve_entity_type_details", "retrieve_entity_type_info",
+            "retrieve_attributes", "retrieve_attribute_details", "retrieve_attribute_info"}
+# the queries a view narrows to its selector's types when they name none (ADR-0023 rule 3)
+QUERIES = {"query_entities", "query_entities_post", "temporal_query", "temporal_query_post"}
+# the type segment of the suite's entity ids; an id that says nothing names no type
+ID_TYPE = re.compile(r"urn:ngsi-ld:([A-Za-z][\w-]*):")
+# what a failure message says is missing from an answer: a DeepDiff removal, a key not found
+MISSING = re.compile(r"Item root\[(?:'[^']*'\]\[)*'([^']+)'\] removed from dictionary"
+                     r"|has no key '([^']+)'|KeyError: '([^']+)'|does not contain '([^']+)'")
 # request bodies that name entities and attributes rather than being one
 SELECTORS = {"Query", "Subscription", "ContextSourceRegistration", "CSourceRegistration"}
 
@@ -141,7 +159,16 @@ def named(url, body):
     first = lambda key: ",".join(query.get(key, []))
     types = {t for t in re.split(r"[,;|()]", first("type")) if t.strip()}
     attrs = {a for key in ("attrs", "pick", "omit") for a in first(key).split(",") if a.strip()}
+    attrs |= {re.split(r"[;\s]", a.strip())[0] for a in first("orderBy").split(",") if a.strip()}
     attrs |= q_attributes(first("q"))
+    segs = [unquote(s) for s in urlsplit(url).path.split(ROOT, 1)[-1].strip("/").split("/")]
+    if len(segs) == 2 and segs[0] == "types":
+        types.add(segs[1])
+    if len(segs) == 2 and segs[0] == "attributes":
+        attrs.add(segs[1])
+    ids = query.get("id", [""])[0].split(",")
+    ids += [segs[i + 1] for i, s in enumerate(segs[:-1]) if s == "entities"]
+    types |= {m.group(1) for m in map(ID_TYPE.match, ids) if m}
     for item in (body if isinstance(body, list) else [body]):
         if not isinstance(item, dict):
             continue
@@ -169,14 +196,29 @@ def hidden_by(view, core):
     if "*" in selector and "*" in shown:
         return None
 
-    def hidden(url, body):
+    def hides(attribute):
+        return "*" not in shown and expand(attribute, core) not in shown
+
+    def hidden(url, body, op=None):
         types, attrs = named(url, body)
-        why = [f"type {t} outside the view (ADR-0023 rule 3)"
+        why = [f"a query naming no type answers only the view's types (ADR-0023 rule 3)"] \
+            if op in QUERIES and not types and "*" not in selector else []
+        why += [f"type {t} outside the view (ADR-0023 rule 3)"
                for t in sorted(types) if "*" not in selector and expand(t, core) not in selector]
         why += [f"Attribute {a} the view does not show (ADR-0023 rule 2)"
-                for a in sorted(attrs) if "*" not in shown and expand(a, core) not in shown]
+                for a in sorted(attrs) if hides(a)]
         return why
+    hidden.hides = hides
     return hidden
+
+
+def lacking(message, hidden):
+    """Why an answer may lack what the failure message says it lacks: every
+    name it says is missing is an Attribute the view does not show; else []."""
+    names = {next(g for g in m.groups() if g) for m in MISSING.finditer(message or "")}
+    if not hidden or not names or not all(hidden.hides(n) for n in names):
+        return []
+    return [f"the answer lacks Attribute {n} the view does not show (ADR-0023 rule 2)" for n in sorted(names)]
 
 
 def owed(requests, offered, binds, hidden=None):
@@ -198,7 +240,11 @@ def owed(requests, offered, binds, hidden=None):
         elif op in OWN_SUBSCRIPTIONS and not made:
             why.append(f"{r['method']} {op}: a Subscription made at the root, not through the view (ADR-0023 rule 9)")
         elif hidden:
-            why += [f"{r['method']} {op}: {w}" for w in hidden(url, r.get("body"))]
+            why += [f"{r['method']} {op}: {w}" for w in hidden(url, r.get("body"), op)]
+            if op in LISTINGS:
+                why.append(f"{r['method']} {op}: lists only the names the view shows (ADR-0023 rules 2 and 3)")
+            if "join" in parse_qs(urlsplit(url).query):
+                why.append(f"{r['method']} {op}: a join follows only into entities the view shows (ADR-0023 rule 3)")
     return why
 
 
@@ -211,6 +257,16 @@ def requests_of(d):
     return by_tp
 
 
+def messages_of(d):
+    """{"<test name>": failure message} from the failures.csv under `d`."""
+    out = {}
+    for path in glob.glob(f"{d}/**/failures.csv", recursive=True):
+        with open(path, newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                out[row["test"]] = row.get("message") or ""
+    return out
+
+
 def diff(view_path, e1_dir, e2_dir, binds=None):
     view = json.load(open(view_path))
     known = json.load(open(KNOWN)).get(view["id"], {}) if os.path.exists(KNOWN) else {}
@@ -221,6 +277,7 @@ def diff(view_path, e1_dir, e2_dir, binds=None):
         print("\n".join(red))
         return 1
     reqs = requests_of(e2_dir)
+    messages = messages_of(e2_dir)
     offered = set(view.get("operations") or [])
     hidden = hidden_by(view, core_terms())
     refusals, explained = [], 0
@@ -231,6 +288,8 @@ def diff(view_path, e1_dir, e2_dir, binds=None):
                 red.append(f"stale: {tp} answers as E1 now; remove it from {os.path.basename(KNOWN)}")
             continue
         why = owed(reqs.get(tp, []), offered, binds, hidden) if "did not run" not in (a, b) else []
+        if not why and "did not run" not in (a, b):
+            why = lacking(messages.get(tp.split("::", 1)[-1]), hidden)
         if why:
             refusals.append({"tp": tp, "e1": a, "view": b, "owed": why})
             if tp in known:
