@@ -240,7 +240,7 @@ impl Egress {
             evict_oldest(&mut map, &k, |b: &Breaker| b.touched_at);
         }
         let b = map.entry(k).or_default();
-        b.failures += 1;
+        b.failures = b.failures.saturating_add(1);
         b.touched_at = Some(Instant::now());
         if b.failures >= TRIP_AFTER {
             b.tripped_at = Some(Instant::now());

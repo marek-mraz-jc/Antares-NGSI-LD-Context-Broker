@@ -236,13 +236,13 @@ pub(crate) async fn wire_matcher(state: &mut AppState) {
     let pending = state.pending_changes.clone();
     crate::spawn_loop(async move {
         while let Some(mut batch) = rx.recv().await {
-            let mut taken = 1;
+            let mut taken: usize = 1;
             // everything already queued behind it rides the same pass
             while batch.len() < CHANGE_BATCH {
                 match rx.try_recv() {
                     Ok(c) => {
                         batch.extend(c);
-                        taken += 1;
+                        taken = taken.saturating_add(1);
                     }
                     Err(_) => break,
                 }
@@ -1270,7 +1270,11 @@ pub(crate) async fn process_changes(st: &AppState, changes: Vec<Change>) {
                     .to_owned(),
             );
             match index.get(&key) {
-                Some(&i) => groups[i].data.extend(m.data),
+                Some(&i) => {
+                    if let Some(group) = groups.get_mut(i) {
+                        group.data.extend(m.data);
+                    }
+                }
                 None => {
                     index.insert(key, groups.len());
                     groups.push(m);
@@ -1314,7 +1318,9 @@ pub(crate) async fn process_changes(st: &AppState, changes: Vec<Change>) {
 /// A change the full queue refused: counted, and said once per thousand so
 /// a 40 % delivery gap is visible in the log and not only on the counter.
 fn note_drop() {
-    let n = CHANGES_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let n = CHANGES_DROPPED
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
     metrics::counter!("antares_notification_changes_dropped_total").increment(1);
     if n == 1 || n.is_multiple_of(1000) {
         tracing::warn!("notification change queue full: {n} changes dropped so far (delivery slower than the write rate)");
@@ -1899,7 +1905,7 @@ pub async fn interval_tick(st: &AppState) {
         if sweep_csubs {
             let _ = m.next_csub_sweep_ms.compare_exchange(
                 csub_clock,
-                next_csub.min(now_ms + CSUB_SWEEP_BACKSTOP_MS),
+                next_csub.min(now_ms.saturating_add(CSUB_SWEEP_BACKSTOP_MS)),
                 Relaxed,
                 Relaxed,
             );
@@ -1941,9 +1947,9 @@ fn chunk_by_bytes(data: Vec<Value>, cap: usize) -> Vec<Vec<Value>> {
     for item in data {
         let n = serde_json::to_vec(&item).map(|b| b.len()).unwrap_or(0);
         match out.last_mut() {
-            Some(run) if size + n <= cap => {
+            Some(run) if size.saturating_add(n) <= cap => {
                 run.push(item);
-                size += n;
+                size = size.saturating_add(n);
             }
             _ => {
                 out.push(vec![item]);
@@ -2331,8 +2337,8 @@ async fn deliver_as(
         "notifiedAt": now,
         "data": data,
     });
-    if let Some(r) = trigger_reason {
-        body["triggerReason"] = Value::String(r.into());
+    if let (Some(r), Some(body)) = (trigger_reason, body.as_object_mut()) {
+        body.insert("triggerReason".into(), Value::String(r.into()));
     }
     // ADR-0020: the engine sees the notification the broker means to send,
     // before it is encoded — the data entities are still the 5.2.14.1
@@ -2396,7 +2402,15 @@ async fn deliver_as(
                 // `previousValue` of it, and one no rule holds for is not
                 // notified at all
                 if let Some(rules) = rules {
-                    let shown = shown_now(st, tenant, &rules, None, &body["data"], ctx).await;
+                    let shown = shown_now(
+                        st,
+                        tenant,
+                        &rules,
+                        None,
+                        body.get("data").unwrap_or(&Value::Null),
+                        ctx,
+                    )
+                    .await;
                     if let Some(arr) = body.get_mut("data").and_then(Value::as_array_mut) {
                         arr.retain(|e| matches!(entity_shown(&shown, e), Some(Some(_))));
                         for e in arr.iter_mut() {
@@ -2459,12 +2473,18 @@ async fn deliver_as(
                         && kv.get("value").and_then(Value::as_str) == Some("body=json")
                 })
             });
-        let entities = body["data"].as_array().cloned().unwrap_or_default();
+        let entities = body
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let mut fc = crate::repr::to_geojson_collection(entities, None);
-        if !prefer_body_json {
-            fc["@context"] = crate::negotiate::served_context(ctx);
+        if let (false, Some(fc)) = (prefer_body_json, fc.as_object_mut()) {
+            fc.insert("@context".into(), crate::negotiate::served_context(ctx));
         }
-        body["data"] = fc;
+        if let Some(body) = body.as_object_mut() {
+            body.insert("data".into(), fc);
+        }
     }
     let receiver_info = kv_pairs(ep.get("receiverInfo"));
 
@@ -2603,7 +2623,7 @@ async fn deliver_as(
                     // when delivering the notification" — an output-only
                     // member implementations shall generate.
                     let failed = n.get("timesFailed").and_then(Value::as_i64).unwrap_or(0);
-                    n.insert("timesFailed".into(), json!(failed + 1));
+                    n.insert("timesFailed".into(), json!(failed.saturating_add(1)));
                     n.insert("status".into(), Value::String("failed".into()));
                 }
                 failed_doc = Some(doc.clone());
@@ -2734,7 +2754,7 @@ async fn retry_and_settle(
         {
             return;
         }
-        made += 1;
+        made = made.saturating_add(1);
         match send_outbound(st, uri, timeout_ms, &outbound).await {
             Ok(()) => {
                 st.egress.record_success(tenant.as_str(), uri);
@@ -2780,7 +2800,11 @@ async fn retry_and_settle(
     let letter = dead_letter(
         sub_id, uri, timeout_ms, &outbound, made, &first_err, &last_err, &first_at,
     );
-    let id = letter["id"].as_str().unwrap_or_default().to_owned();
+    let id = letter
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     match st.store.create(tenant, Kind::DeadLetter, &id, letter).await {
         Ok(_) => {
             DEAD_LETTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2808,7 +2832,7 @@ fn dead_letter(
     last_err: &str,
     first_at: &str,
 ) -> Value {
-    let mut doc = json!({
+    json!({
         "id": format!("urn:ngsi-ld:DeadLetter:{}", uuid::Uuid::new_v4()),
         "type": "DeadLetter",
         "subscriptionId": sub_id,
@@ -2819,14 +2843,13 @@ fn dead_letter(
         "lastError": last_err,
         "firstAt": first_at,
         "lastAt": now_iso(),
-    });
-    doc["binding"] = json!(antares_notifier::SinkRegistry::scheme_of(uri));
-    doc["payload"] = outbound.body.clone();
-    doc["accept"] = json!(outbound.accept);
-    doc["link"] = json!(outbound.link);
-    doc["receiverInfo"] = json!(outbound.receiver_info);
-    doc["notifierInfo"] = json!(outbound.notifier_info);
-    doc
+        "binding": antares_notifier::SinkRegistry::scheme_of(uri),
+        "payload": outbound.body.clone(),
+        "accept": outbound.accept,
+        "link": outbound.link,
+        "receiverInfo": outbound.receiver_info,
+        "notifierInfo": outbound.notifier_info,
+    })
 }
 
 /// The deadline a dead letter was written with. It is read back from

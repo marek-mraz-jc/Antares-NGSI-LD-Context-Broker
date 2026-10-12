@@ -407,13 +407,18 @@ impl AppState {
                         }
                     };
                     match row {
-                        // the row is what the store handed back, and `Value`'s
-                        // index panics on anything that is not an object; a row
-                        // that cannot carry the counters is left uncounted
+                        // the row is what the store handed back; a row that
+                        // cannot carry the counters is left uncounted
                         Ok(Some(mut doc)) if doc.is_object() => {
-                            let hits = doc["numberOfHits"].as_u64().unwrap_or(0) + 1;
-                            doc["numberOfHits"] = serde_json::json!(hits);
-                            doc["lastUsage"] = serde_json::json!(now_iso());
+                            if let Some(o) = doc.as_object_mut() {
+                                let hits = o
+                                    .get("numberOfHits")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0)
+                                    .saturating_add(1);
+                                o.insert("numberOfHits".into(), serde_json::json!(hits));
+                                o.insert("lastUsage".into(), serde_json::json!(now_iso()));
+                            }
                             if let Err(e) = store.context_put(tenant, &id, doc).await {
                                 tracing::warn!(
                                     "@context hit bump failed for {}: {e}",
@@ -454,7 +459,10 @@ impl AppState {
                     // it.
                     let owner = antares_store::context_row_owner(&row)
                         .and_then(|o| antares_model::TenantId::new_internal(o).ok());
-                    Some((owner, row["body"]["@context"].clone()))
+                    Some((
+                        owner,
+                        row.pointer("/body/@context").cloned().unwrap_or_default(),
+                    ))
                 })
             }));
         }
@@ -474,7 +482,7 @@ impl AppState {
         // notification delivery never names a transport.
         let http = outbound_client(
             egress_policy,
-            std::time::Duration::from_secs(5 * slow_factor()),
+            std::time::Duration::from_secs(slow_factor().saturating_mul(5)),
         );
         let mut sinks = antares_notifier::SinkRegistry::default();
         sinks.register(Box::new(antares_notifier::HttpSink::new(http.clone())));
@@ -498,7 +506,7 @@ impl AppState {
                 http: http.clone(),
                 fed_http: outbound_client(
                     egress_policy,
-                    std::time::Duration::from_secs(8 * slow_factor()),
+                    std::time::Duration::from_secs(slow_factor().saturating_mul(8)),
                 ),
                 sinks: Arc::new(sinks),
                 forward_transport: Arc::new(std::sync::OnceLock::new()),
@@ -893,7 +901,10 @@ impl AppState {
         }
         let req = axum::http::Request::from_parts(parts, body);
         match INPROCESS_DEPTH
-            .scope(depth + 1, tower::ServiceExt::oneshot(router.clone(), req))
+            .scope(
+                depth.saturating_add(1),
+                tower::ServiceExt::oneshot(router.clone(), req),
+            )
             .await
         {
             Ok(r) => r,
@@ -1029,7 +1040,7 @@ fn outbound_client(
 ) -> antares_jsonld::HttpClient {
     let b = antares_jsonld::with_timeouts(
         antares_jsonld::client_builder(policy),
-        std::time::Duration::from_secs(2 * slow_factor()),
+        std::time::Duration::from_secs(slow_factor().saturating_mul(2)),
         total,
     );
     // the suite's notification receiver asserts header names

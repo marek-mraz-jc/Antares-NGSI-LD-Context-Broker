@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! NGSI-LD HTTP binding: axum routers, thin
 //! handlers per spec operation.
-// T-3915: a panic on a request path is a remote DoS. Outside tests this
-// crate may not unwrap, expect or panic; indexing_slicing (107 sites) and
-// arithmetic_side_effects (81) join when T-3932 has rewritten them.
+// T-3915, T-3932: a panic on a request path is a remote DoS. Outside tests
+// this crate may not unwrap, expect, panic, index or overflow.
 #![cfg_attr(
     not(test),
     deny(
@@ -14,7 +13,9 @@
         clippy::unimplemented,
         clippy::dbg_macro,
         clippy::print_stdout,
-        clippy::print_stderr
+        clippy::print_stderr,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
     )
 )]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -347,14 +348,16 @@ pub async fn sweep_expired_docs(st: &AppState) -> usize {
     let Ok(tenants) = st.store.tenant_ids().await else {
         return 0;
     };
-    let mut n = 0;
+    let mut n: usize = 0;
     for name in tenants {
         let Ok(tenant) = antares_model::TenantId::new(&name) else {
             continue;
         };
-        n += csource::sweep_expired_registrations(st, &tenant).await;
-        n += snapshots::sweep_expired_snapshots(st, &tenant).await;
-        n += entity_map::sweep_expired_maps(st, &tenant).await;
+        // Each sweep counts documents it deleted, far below `usize::MAX`.
+        n = n
+            .saturating_add(csource::sweep_expired_registrations(st, &tenant).await)
+            .saturating_add(snapshots::sweep_expired_snapshots(st, &tenant).await)
+            .saturating_add(entity_map::sweep_expired_maps(st, &tenant).await);
     }
     n
 }
@@ -1013,15 +1016,20 @@ async fn health(
     } else {
         StatusCode::OK
     };
-    let mut body = serde_json::json!({
-        "status": if draining { "DRAINING" } else { "UP" },
-        "store": state.store_name,
-        "temporal": state.temporal_name.as_deref().unwrap_or("none"),
-        // Version surface: workspace version + build-time git hash
-        // (build.rs), both asserted against the checkout by health_is_up.
-        "version": env!("CARGO_PKG_VERSION"),
-        "commit": env!("ANTARES_GIT_HASH"),
-    });
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "status".into(),
+        (if draining { "DRAINING" } else { "UP" }).into(),
+    );
+    body.insert("store".into(), state.store_name.clone().into());
+    body.insert(
+        "temporal".into(),
+        state.temporal_name.as_deref().unwrap_or("none").into(),
+    );
+    // Version surface: workspace version + build-time git hash
+    // (build.rs), both asserted against the checkout by health_is_up.
+    body.insert("version".into(), env!("CARGO_PKG_VERSION").into());
+    body.insert("commit".into(), env!("ANTARES_GIT_HASH").into());
     // What each driver runs on — engine, server version, extensions — so an
     // operator can tell two deployments of the same backend name apart. Both
     // seams answer from state captured at startup; a driver with nothing to
@@ -1031,7 +1039,7 @@ async fn health(
         ("temporalInfo", state.temporal.version_info()),
     ] {
         if info.as_object().is_some_and(|m| !m.is_empty()) {
-            body[key] = info;
+            body.insert(key.into(), info);
         }
     }
     // Where commits serialize behind one writer, the queue depth (current,
@@ -1039,76 +1047,84 @@ async fn health(
     // without such a committer reports nothing, so the branch is the
     // driver's, not a backend name read here.
     if let Some((depth, peak)) = state.store.commit_queue() {
-        body["commitQueueDepth"] = depth.into();
-        body["commitQueuePeak"] = peak.into();
+        body.insert("commitQueueDepth".into(), depth.into());
+        body.insert("commitQueuePeak".into(), peak.into());
     }
     // The policy engine this binary was started with, and how long it has
     // to answer before the seam denies for it (ADR-0020). An operator
     // reading `allow-all` here knows no engine is attached.
-    body["policy"] = serde_json::json!({
-        "engine": state.policy_name(),
-        "timeoutMs": u64::try_from(policy::TIMEOUT.as_millis()).unwrap_or(u64::MAX),
-    });
+    let mut policy = serde_json::Map::new();
+    policy.insert("engine".into(), state.policy_name().into());
+    policy.insert(
+        "timeoutMs".into(),
+        u64::try_from(policy::TIMEOUT.as_millis())
+            .unwrap_or(u64::MAX)
+            .into(),
+    );
     // Configured caps + rejection counters, for observability.
-    body["limits"] = state.limits.snapshot();
+    body.insert("limits".into(), state.limits.snapshot());
     // History events a driver failed to record after the write stood.
-    body["temporalDrainErrors"] = history::drain_errors().into();
+    body.insert("temporalDrainErrors".into(), history::drain_errors().into());
     // What this binary serves beside the NGSI-LD API: one entry per mounted
     // surface, its prefix and whatever the surface reports about itself.
-    body["surfaces"] = serde_json::Value::Object(
-        state
-            .surfaces
-            .iter()
-            .map(|s| {
-                let mut info = match s.version_info() {
-                    serde_json::Value::Object(m) => m,
-                    other => {
-                        let mut m = serde_json::Map::new();
-                        m.insert("info".into(), other);
-                        m
-                    }
-                };
-                info.insert("prefix".into(), s.prefix().into());
-                (s.name().to_owned(), serde_json::Value::Object(info))
-            })
-            .collect(),
+    body.insert(
+        "surfaces".into(),
+        serde_json::Value::Object(
+            state
+                .surfaces
+                .iter()
+                .map(|s| {
+                    let mut info = match s.version_info() {
+                        serde_json::Value::Object(m) => m,
+                        other => {
+                            let mut m = serde_json::Map::new();
+                            m.insert("info".into(), other);
+                            m
+                        }
+                    };
+                    info.insert("prefix".into(), s.prefix().into());
+                    (s.name().to_owned(), serde_json::Value::Object(info))
+                })
+                .collect(),
+        ),
     );
     // Endpoint schemes this deployment can deliver notifications to: the
     // registered bindings (6.3.8, clause 7, and any a deployment added).
     // A subscription naming a scheme absent here is refused at creation.
-    body["notificationSchemes"] = state.sinks.schemes().into();
+    body.insert("notificationSchemes".into(), state.sinks.schemes().into());
     // Notifications the delivery policy gave up on (this process, since start).
-    body["deadLetters"] = notify::dead_letters_written().into();
+    body.insert("deadLetters".into(), notify::dead_letters_written().into());
     // Each stored view, loaded or invalid with the reason (ADR-0023 rule 10).
     #[cfg(feature = "views")]
     {
-        body["views"] = state.views.report();
+        body.insert("views".into(), state.views.report());
         // Which documents the table was loaded from (threat V26): two pods
         // reporting two values serve two predicates.
-        body["viewsRevision"] = state.views.revision().into();
+        body.insert("viewsRevision".into(), state.views.revision().into());
         // The engine's rule documents by tenant and revision, loaded or
         // refused (ADR-0020 amendment); never the documents themselves.
-        body["policy"]["documents"] = state.views.policy_report();
-        body["schemas"] = state.views.schema_report();
+        policy.insert("documents".into(), state.views.policy_report());
+        body.insert("schemas".into(), state.views.schema_report());
     }
     // Changes the bounded matcher queue dropped (this process, since start).
-    body["changesDropped"] = notify::changes_dropped().into();
+    body.insert("changesDropped".into(), notify::changes_dropped().into());
     // Panics absorbed at the notification-task boundary, each one a change
     // whose notification was lost. Reported here and not only through the
     // metrics facade: the recorder is installed by ANTARES_TELEMETRY, which
     // is off by default, so this endpoint is where a default deployment can
     // see it at all.
-    body["taskPanics"] = notify::task_panics().into();
+    body.insert("taskPanics".into(), notify::task_panics().into());
     // Jemalloc heap stats (RSS ≈ live×1.2 is the target).
     if let Some(mem) = &state.mem_stats {
-        body["memory"] = mem();
+        body.insert("memory".into(), mem());
     }
     // Bus visibility: present only when the nats wiring installed the
     // provider — bus=local carries NO bus member.
     if let Some(bus) = &state.bus_stats {
-        body["bus"] = bus();
+        body.insert("bus".into(), bus());
     }
-    (code, axum::Json(body))
+    body.insert("policy".into(), serde_json::Value::Object(policy));
+    (code, axum::Json(serde_json::Value::Object(body)))
 }
 
 /// The tenant an admin dead-letter call addresses: `?tenant=` (default
@@ -1244,7 +1260,7 @@ async fn dead_letter_replay(
                         .get("attempts")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0)
-                        + 1;
+                        .saturating_add(1);
                     letter.insert("attempts".into(), n.into());
                     letter.insert("lastError".into(), serde_json::Value::String(w));
                     letter.insert("lastAt".into(), serde_json::Value::String(ts));
@@ -1342,7 +1358,9 @@ async fn tenant_get(
         },
     });
     if let Some(c) = stats.created_at {
-        row["createdAt"] = serde_json::Value::String(c);
+        if let Some(row) = row.as_object_mut() {
+            row.insert("createdAt".into(), serde_json::Value::String(c));
+        }
     }
     (StatusCode::OK, axum::Json(row)).into_response()
 }
@@ -1492,8 +1510,8 @@ async fn ready(
         "status": if ready { "READY" } else { "NOT_READY" },
         "store": store_ok,
     });
-    if let Some(b) = bus {
-        body["bus"] = b;
+    if let (Some(b), Some(body)) = (bus, body.as_object_mut()) {
+        body.insert("bus".into(), b);
     }
     let code = if ready {
         StatusCode::OK
