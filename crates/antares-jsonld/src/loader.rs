@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! Remote @context loading + caching + pinned core contexts.
+//! Remote @context loading and caching (feature `fetch`); the pinned core
+//! contexts it serves first live in `pinned`.
 
 use crate::context::Context;
+use crate::pinned::{
+    core_context, merge_context_value, pinned, CORE_CONTEXT, MAX_CONTEXT_BYTES, MAX_CONTEXT_URLS,
+};
 use antares_model::{NgsiError, TenantId};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -19,48 +23,6 @@ use web_time::Instant;
 use crate::minicache::Cache as BoundedCache;
 #[cfg(not(target_arch = "wasm32"))]
 use moka::sync::Cache as BoundedCache;
-
-/// Core context versions served from the build, never the network
-/// (uri.etsi.org serves an HTML landing page to plain HTTP clients).
-static PINNED: &[(&str, &str)] = &[
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.3.jsonld",
-        include_str!("../contexts/core-v1.6.jsonld"),
-    ),
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.4.jsonld",
-        include_str!("../contexts/core-v1.6.jsonld"),
-    ),
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.5.jsonld",
-        include_str!("../contexts/core-v1.6.jsonld"),
-    ),
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.6.jsonld",
-        include_str!("../contexts/core-v1.6.jsonld"),
-    ),
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.7.jsonld",
-        include_str!("../contexts/core-v1.7.jsonld"),
-    ),
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.8.jsonld",
-        include_str!("../contexts/core-v1.8.jsonld"),
-    ),
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld",
-        include_str!("../contexts/core-v1.9.jsonld"),
-    ),
-];
-
-/// 4.4: "The NGSI-LD Core @context is publicly available at
-/// `https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld` and
-/// shall contain all the terms as mandated by annex B." It is what this broker
-/// advertises (the Link header of a `application/json` answer, the `@context`
-/// of an `ld+json` one, the context a forwarded request carries) and the
-/// document merged last when a request names no @context of its own. Older
-/// core versions stay in `PINNED` because a client may still reference one.
-pub const CORE_CONTEXT: &str = "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld";
 
 /// Usage bookkeeping for one externally-referenced @context URL (5.13.3.5:
 /// localId, createdAt, numberOfHits, lastUsage of "Cached" entries).
@@ -670,20 +632,9 @@ fn ttl_from_headers(
     None
 }
 
-/// @context responses above this size are refused.
-pub(crate) const MAX_CONTEXT_BYTES: usize = 5 * 1024 * 1024;
-
 /// Cap on usage-registry entries (client-supplied URLs); past it, adding a
 /// new URL evicts the least recently used entry.
 const MAX_USAGE_ENTRIES: usize = 4096;
-
-/// Fetch-count cap per @context resolution — a hostile context tree must
-/// not turn one request into an unbounded crawl. Checked BEFORE each
-/// fetch, so at most this many URLs are ever contacted. Public because
-/// `/q/health` publishes the caps a request runs under, and a second
-/// constant carrying the same number is one that can drift from the one
-/// actually enforced.
-pub const MAX_CONTEXT_URLS: usize = 32;
 
 /// The merged-context cache is keyed by the SERIALIZED user @context, which
 /// an `application/ld+json` body may carry inline up to the body cap — 256
@@ -884,20 +835,6 @@ impl Loader {
         .expect("reqwest client");
         Self::with_client(policy, client)
     }
-}
-
-/// The pinned core `@context`, parsed and frozen, with no loader, client or
-/// cache behind it: the value every `Loader` pins, and what a test of
-/// expansion or matching needs on its own.
-#[allow(clippy::expect_used)]
-pub fn core_context() -> Context {
-    let mut core = Context::default();
-    // PINNED holds CORE_CONTEXT and every entry parses: pinned by
-    // `every_pinned_context_parses_and_carries_an_at_context`
-    merge_context_value(&mut core, &pinned(CORE_CONTEXT).expect("pinned core"));
-    core.freeze();
-    core.source = Value::String(CORE_CONTEXT.to_owned());
-    core
 }
 
 impl Loader {
@@ -1602,75 +1539,9 @@ impl Loader {
     }
 }
 
-/// The core @context URL of NGSI-LD version `major.minor` (TS 104 175
-/// 13.4.3 `core`), for the versions whose core is pinned in this build;
-/// `None` for anything else, a malformed version included.
-pub fn core_context_url(version: &str) -> Option<&'static str> {
-    let (major, minor) = version.split_once('.')?;
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    if !digits(major) || !digits(minor) {
-        return None;
-    }
-    let want = format!("https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v{version}.jsonld");
-    PINNED.iter().map(|(u, _)| *u).find(|u| *u == want)
-}
-
-/// The `@context` of a compiled-in document, or `None` for a URL that is not
-/// pinned. The bodies are `include_str!`-ed at build time, so a body that
-/// does not parse or carries no `@context` is a build defect rather than
-/// anything a request can cause —
-/// `every_pinned_context_parses_and_carries_an_at_context` fails on it.
-fn pinned(url: &str) -> Option<Value> {
-    let (_, body) = PINNED.iter().find(|(u, _)| *u == url)?;
-    let doc: Value = serde_json::from_str(body).ok()?;
-    doc.get("@context").cloned()
-}
-
-/// Merge a pre-parsed Core @context value (4.4: merged last, so it wins).
-fn merge_context_value(ctx: &mut Context, v: &Value) {
-    match v {
-        Value::Object(o) => {
-            let _ = ctx.merge_core_object(o);
-        }
-        Value::Array(items) => {
-            for i in items {
-                merge_context_value(ctx, i);
-            }
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `core_context` and the merge tail unwrap `pinned(CORE_CONTEXT)`,
-    /// because a broker without the Core @context cannot expand anything and
-    /// has no useful degraded mode. That is only safe while the compiled-in
-    /// table really does carry a parseable `@context` for every URL in it —
-    /// which is a property of the build, so it is checked here rather than
-    /// left to a comment. A pinned document that stops parsing fails this
-    /// test instead of the first request after deploy.
-    #[test]
-    fn every_pinned_context_parses_and_carries_an_at_context() {
-        assert!(!PINNED.is_empty(), "the pinned table is empty");
-        for (url, _) in PINNED {
-            assert!(
-                pinned(url).is_some(),
-                "pinned document {url} does not parse, or carries no @context"
-            );
-        }
-        let core = pinned(CORE_CONTEXT).expect("the Core @context is pinned");
-        assert!(
-            core.is_object() || core.is_array() || core.is_string(),
-            "the Core @context is not a usable @context value: {core}"
-        );
-        assert!(
-            PINNED.iter().any(|(u, _)| *u == CORE_CONTEXT),
-            "CORE_CONTEXT must be in the pinned table by URL, not merely resolvable"
-        );
-    }
 
     /// 4.4: "the Core @context is protected and shall remain immutable and
     /// invariant during expansion or compaction of terms. […] implementations
