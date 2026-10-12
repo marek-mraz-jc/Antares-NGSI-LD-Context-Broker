@@ -31,6 +31,8 @@ identity-headers | antares_api::snapshots::scoped | runs a snapshot request in i
 identity-headers | crates/antares-api/src/fuzzing.rs | fuzz harness (feature fuzzing), never in a release build
 identity-headers | antares_ops::OUTER_ONLY | the headers a surface cannot set on the operation it runs (ADR-0023)
 identity-headers | antares_ops::TENANT | ViewOps::run: the view's own Tenant on every operation it runs, another named one is refused (ADR-0023)
+identity-headers | antares_ws::upgrade | the WebSocket's Tenant: one NGSILD-Tenant or 400; a view's socket refuses another Tenant than the view's, a root socket's operations carry the header into AppState::call, where negotiate::tenant_from validates it (T-3844)
+identity-headers | antares_ws::hub::Forwarded::of | reads the delivering broker's marker: notify::deliver_as strips every subscriber-supplied NGSILD-Tenant pair and appends its own last, which .rev().find takes (T-3844)
 identity-headers | antares_ops::views::preview::preview | the draft view's Tenant on its preview query (T-3635)
 
 sql-from-text | antares_sql::store::any::AnyStore::purge_tenant | pg driver dynamic SQL as of T-3587: identifiers from closed tables (DocKind::table, the aggregation table of T-3464), $n placeholders, catalog names quoted (drop_partition_sql); RLS: tests/pg_rls_pentest.rs
@@ -82,3 +84,6 @@ tenant-not-from-header | POST /q/dead-letters/{}/replay | antares_api::dead_lett
 tenant-not-from-header | GET /q/tenants/{} | antares_api::tenant_get | admin secret route layer; the Tenant is the path segment, parsed by TenantId::new
 tenant-not-from-header | DELETE /q/tenants/{} | antares_api::tenant_purge | admin secret route layer; the Tenant is the path segment, parsed by TenantId::new
 tenant-not-from-header | POST /ex/v1/remote-notify | antares_api::distsub::remote_notify | the Tenant is read back from the broker's own inbound index under the peer's random subscriptionId, never from the request (ADR-0019)
+surface-entry-without-ops | antares_odata::batch::serve | each part is a oneshot into the nested OData router (batch.rs run), whose read::serve and write::serve run through Ops; a tower Service call is no edge (T-3844)
+
+fs-from-a-request | antares_odata::serve | antares_jsonld::loader::client_builder | reads the CA bundle the operator configured (ANTARES_* env, once per client), never a path from the request (T-3844)

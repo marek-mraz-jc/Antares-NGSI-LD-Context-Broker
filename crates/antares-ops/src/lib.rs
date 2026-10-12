@@ -989,6 +989,10 @@ pub mod test_kit {
     use super::{mount, AppState, Surface};
     use std::sync::Arc;
 
+    /// The `/q` credential [`TestBroker::with_admin_auth`] takes, for the
+    /// surface crates, which reach the API crate through this one alone.
+    pub use antares_api::admin_auth::AdminAuth;
+
     /// Let this process forward to loopback and private addresses, as a
     /// test's own listener is one (the egress policy refuses them otherwise).
     pub fn allow_private_egress() {
