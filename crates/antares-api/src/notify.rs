@@ -29,7 +29,7 @@ use std::sync::Arc;
 const DEFAULT_TRIGGERS: &[&str] = &["attributeCreated", "attributeUpdated"];
 /// Depth of the change→matcher queue, the same ring size the local bus uses.
 /// Held with the other published ceilings so `/q/health` reports it.
-use crate::bounds::{CHANGE_QUEUE, DELIVERY_WIDTH};
+use crate::bounds::{CHANGE_QUEUE, DELIVERY_LANE, DELIVERY_WIDTH};
 // the per-tenant slots of the native delivery pool (`tenant_slots`)
 #[cfg(not(target_arch = "wasm32"))]
 use crate::bounds::DELIVERY_WIDTH_PER_TENANT;
@@ -56,6 +56,12 @@ fn queue_for_matching(
 /// Changes dropped because the matcher queue was full, since process start.
 pub(crate) fn changes_dropped() -> u64 {
     CHANGES_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Groups dropped from a full delivery lane, since process start (T-4086).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn lane_drops() -> u64 {
+    LANE_DROPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Panics absorbed at the notification-task boundary, since process start.
@@ -253,8 +259,13 @@ pub(crate) async fn wire_matcher(state: &mut AppState) {
                 }
             }
             let st = st.clone();
-            guarded(async move { process_queued(&st, batch).await }).await;
-            pending.fetch_sub(taken, std::sync::atomic::Ordering::SeqCst);
+            // The batch stays pending until its last group is delivered: the
+            // groups leave on their subscriptions' lanes, after this drain.
+            let done = Arc::new(BatchDone {
+                pending: pending.clone(),
+                taken,
+            });
+            guarded(async move { process_queued(&st, batch, Some(done)).await }).await;
         }
     });
     let st = state.clone();
@@ -1255,12 +1266,24 @@ pub async fn process_change(
 /// travels in one notification, so a batch of N entities is one POST with N
 /// data entries (and timesSent moves by one), never N POSTs.
 pub(crate) async fn process_changes(st: &AppState, changes: Vec<Change>) {
-    process_queued(st, changes.into_iter().map(|c| (u64::MAX, c)).collect()).await;
+    process_queued(
+        st,
+        changes.into_iter().map(|c| (u64::MAX, c)).collect(),
+        None,
+    )
+    .await;
 }
 
 /// [`process_changes`] of changes each stamped with the [`crate::mirror::tick`]
 /// they were queued at.
-async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>) {
+///
+/// With `done` (the matcher queue's drain), each group is handed to its
+/// subscription's lane and the drain goes on to the next batch: a slow or
+/// dead endpoint holds its own lane, never the matching of every other
+/// change (T-4086). `done` falls when the last group of the batch has left.
+/// Without it (a bus event, a direct call), the groups are delivered before
+/// this returns.
+async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>, done: Option<Arc<BatchDone>>) {
     let mut groups: Vec<Matched> = Vec::new();
     // (tenant, subscription id) → its group. A scan for the group would be
     // linear in the subscriptions already matched, and a drain of
@@ -1305,8 +1328,16 @@ async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>) {
         }
     }
     // Groups are distinct subscriptions, so they leave concurrently; a
-    // subscription's changes in this drain are already one group, and the
-    // next drain starts only after this one, so per-subscription order holds.
+    // subscription's changes in this drain are already one group. On a lane
+    // its groups leave in drain order; awaited, the next pass starts only
+    // after this one. Either way per-subscription order holds.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(done) = done {
+        for g in groups {
+            to_lane(st, g, &done);
+        }
+        return;
+    }
     // Each group is its own task: a group's bookkeeping reads and writes
     // await the store, and one task's `for_each_concurrent` would still put
     // every group's round-trips on a single task's poll budget.
@@ -1315,22 +1346,7 @@ async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>) {
         let mut set = tokio::task::JoinSet::new();
         for g in groups {
             let st = st.clone();
-            set.spawn(async move {
-                let id = g.sub.get("id").and_then(Value::as_str).unwrap_or_default();
-                let Ok(_permits) =
-                    tokio::time::timeout(STEP_DEADLINE, delivery_permits(&g.tenant)).await
-                else {
-                    note_stall("permits", g.tenant.as_str(), id);
-                    return;
-                };
-                let delivered = deliver(&st, &g.tenant, &g.sub, g.data, &g.ctx);
-                if tokio::time::timeout(STEP_DEADLINE, delivered)
-                    .await
-                    .is_err()
-                {
-                    note_stall("deliver", g.tenant.as_str(), id);
-                }
-            });
+            set.spawn(async move { deliver_group(&st, g).await });
         }
         while let Some(joined) = set.join_next().await {
             if joined.is_err() {
@@ -1340,6 +1356,7 @@ async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>) {
     }
     #[cfg(target_arch = "wasm32")]
     {
+        drop(done);
         use futures_util::StreamExt;
         futures_util::stream::iter(groups)
             .for_each_concurrent(*DELIVERY_WIDTH, |g| async move {
@@ -1348,6 +1365,148 @@ async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>) {
             .await;
     }
 }
+
+/// One group out: the delivery permits, then the delivery, each bounded by
+/// [`STEP_DEADLINE`].
+#[cfg(not(target_arch = "wasm32"))]
+async fn deliver_group(st: &AppState, g: Matched) {
+    let id = g.sub.get("id").and_then(Value::as_str).unwrap_or_default();
+    let Ok(_permits) = tokio::time::timeout(STEP_DEADLINE, delivery_permits(&g.tenant)).await
+    else {
+        note_stall("permits", g.tenant.as_str(), id);
+        return;
+    };
+    let delivered = deliver(st, &g.tenant, &g.sub, g.data, &g.ctx);
+    if tokio::time::timeout(STEP_DEADLINE, delivered)
+        .await
+        .is_err()
+    {
+        note_stall("deliver", g.tenant.as_str(), id);
+    }
+}
+
+/// A drained batch still owed to its subscribers: while any of its groups
+/// waits on a lane, the batch counts as pending, so a shutdown drain that
+/// waits for zero closes the pool only after the last delivery.
+pub(crate) struct BatchDone {
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    taken: usize,
+}
+
+impl Drop for BatchDone {
+    fn drop(&mut self) {
+        self.pending
+            .fetch_sub(self.taken, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// One group waiting on its subscription's lane, holding its batch pending.
+#[cfg(not(target_arch = "wasm32"))]
+struct LaneJob {
+    st: AppState,
+    group: Matched,
+    _batch: Arc<BatchDone>,
+}
+
+/// (tenant, subscription id) → the lane its groups wait on. An entry lives
+/// while its lane has work: the lane's task removes it when it finds the
+/// lane empty, under this lock, so a group is never sent to a lane nobody
+/// serves.
+#[cfg(not(target_arch = "wasm32"))]
+type Lanes = std::sync::Mutex<HashMap<(String, String), tokio::sync::mpsc::Sender<LaneJob>>>;
+#[cfg(not(target_arch = "wasm32"))]
+static LANES: std::sync::LazyLock<Lanes> = std::sync::LazyLock::new(Lanes::default);
+
+/// Hand one group to its subscription's lane, opening the lane when there is
+/// none. A full lane drops the group for that subscription alone, counted
+/// and named (T-4086): the drain never waits for a subscriber.
+#[cfg(not(target_arch = "wasm32"))]
+fn to_lane(st: &AppState, group: Matched, batch: &Arc<BatchDone>) {
+    use tokio::sync::mpsc::error::TrySendError;
+    let key = (
+        group.tenant.as_str().to_owned(),
+        group
+            .sub
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    );
+    let job = LaneJob {
+        st: st.clone(),
+        group,
+        _batch: batch.clone(),
+    };
+    // A poisoned map is a panic in some past hand-off; what it holds is
+    // senders, rebuilt on the next group either way.
+    let mut lanes = LANES.lock().unwrap_or_else(|p| p.into_inner());
+    let job = match lanes.get(&key) {
+        Some(lane) => match lane.try_send(job) {
+            Ok(()) => return,
+            Err(TrySendError::Full(job)) => {
+                note_lane_drop(&key, job.group.data.len());
+                return;
+            }
+            // its task is gone (a panic past the guard): open a new lane
+            Err(TrySendError::Closed(job)) => job,
+        },
+        None => job,
+    };
+    let (lane, rx) = tokio::sync::mpsc::channel(DELIVERY_LANE);
+    if lane.try_send(job).is_err() {
+        // a fresh channel always has room; nothing to serve otherwise
+        return;
+    }
+    lanes.insert(key.clone(), lane);
+    drop(lanes);
+    tokio::spawn(run_lane(key, rx));
+}
+
+/// Serve one subscription's lane in order until it is empty, then retire it.
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_lane(key: (String, String), mut rx: tokio::sync::mpsc::Receiver<LaneJob>) {
+    loop {
+        let job = match rx.try_recv() {
+            Ok(job) => job,
+            Err(_) => {
+                // Looked at again under the map's lock, which every sender
+                // holds while it sends: a group cannot arrive between this
+                // look and the removal.
+                let mut lanes = LANES.lock().unwrap_or_else(|p| p.into_inner());
+                match rx.try_recv() {
+                    Ok(job) => job,
+                    Err(_) => {
+                        lanes.remove(&key);
+                        return;
+                    }
+                }
+            }
+        };
+        let LaneJob { st, group, _batch } = job;
+        guarded(async move { deliver_group(&st, group).await }).await;
+    }
+}
+
+/// Groups a full lane refused: counted by entity, and named by tenant and
+/// subscription in the log, so an operator can tell which subscriber fell
+/// behind and lost changes (T-4086).
+#[cfg(not(target_arch = "wasm32"))]
+fn note_lane_drop(key: &(String, String), entities: usize) {
+    let n = LANE_DROPS
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    metrics::counter!("antares_notification_lane_dropped_total").increment(entities as u64);
+    if n == 1 || n.is_multiple_of(100) {
+        tracing::warn!(
+            "subscription {} of tenant {} is slower than its changes: {entities} entities dropped from its delivery lane ({n} groups so far, all subscriptions)",
+            key.1,
+            key.0
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static LANE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How long one step of a drain may take: matching one change, waiting for
 /// one group's delivery permits, or that delivery. A drain waits for all of
@@ -3479,21 +3638,18 @@ mod change_pipeline {
         );
     }
 
-    /// The matcher queue is bounded: behind a stalled subscriber the excess
-    /// changes are dropped and counted instead of growing without limit.
+    /// T-4086: behind a subscriber that never answers, a burst of a whole
+    /// matcher queue reaches a healthy subscriber in full. The stalled one
+    /// backs up its own lane, which drops and counts; the matcher queue,
+    /// shared by every subscription, drops nothing.
     #[tokio::test(flavor = "multi_thread")]
-    async fn overflowing_change_queue_drops_and_counts() {
-        // stages a race between producer and a parked consumer; under a
-        // sanitizer's slowdown the producer never outruns the queue
-        // (same for the file store: fsync per create is slower than the drain)
-        if std::env::var_os("ANTARES_TEST_SANITIZER").is_some()
-            || std::env::var("ANTARES_TEST_STORE").is_ok_and(|s| s == "file")
-        {
-            return;
-        }
+    async fn stalled_subscriber_costs_only_its_own_lane() {
+        // the file store's fsync per create is slower than a 5 s stall frees
+        // lane room, so its lane never fills; the healthy half still runs
+        let file_store = std::env::var("ANTARES_TEST_STORE").is_ok_and(|s| s == "file");
         crate::allow_private();
-        // accepts, reads nothing, never answers — the serial consumer parks
-        // on the first delivery for the endpoint's whole timeout
+        // accepts, reads nothing, never answers: every delivery waits out the
+        // outbound client's timeout
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         std::thread::spawn(move || {
@@ -3502,28 +3658,60 @@ mod change_pipeline {
                 held.push(s);
             }
         });
-        let mut st = AppState::new("antares-queue-bound".into());
-        crate::wire(&mut st).await;
-        // the stall is bounded by the outbound client's own 5 s timeout, not
-        // by endpoint.timeout: after each timeout the consumer frees another
-        // CHANGE_BATCH slots, and on a slow runner a single-queue-depth loop
-        // fits inside that window and never overflows (seen in CI). Produce
-        // several queue depths and stop at the first counted drop — the
-        // producer only has to outpace the drain, not beat one window.
-        subscribe(&st, "staller", &format!("http://{addr}/notify"), 30_000).await;
-        let before = changes_dropped();
-        for n in 0..(4 * CHANGE_QUEUE) {
-            assert_eq!(create_vehicle(&st, 1_000 + n).await, 201);
-            if changes_dropped() > before {
-                break;
-            }
-        }
-        assert!(
-            changes_dropped() > before,
-            "a full matcher queue must drop and count, not grow (dropped {} → {})",
-            before,
-            changes_dropped()
+        // an endpoint that answers at once and keeps every entity id it got
+        let seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Arc::default();
+        let got = seen.clone();
+        let healthy = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let healthy_addr = healthy.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/notify",
+            axum::routing::post(move |body: axum::Json<Value>| {
+                let got = got.clone();
+                async move {
+                    let mut got = got.lock().expect("ids");
+                    for e in body.0["data"].as_array().into_iter().flatten() {
+                        got.insert(e["id"].as_str().unwrap_or_default().to_owned());
+                    }
+                    axum::http::StatusCode::OK
+                }
+            }),
         );
+        tokio::spawn(async move { axum::serve(healthy, app).await.expect("serve") });
+        let mut st = AppState::new("antares-stalled-lane".into());
+        crate::wire(&mut st).await;
+        subscribe(&st, "staller", &format!("http://{addr}/notify"), 30_000).await;
+        subscribe(
+            &st,
+            "healthy",
+            &format!("http://{healthy_addr}/notify"),
+            30_000,
+        )
+        .await;
+        let (queue_before, lane_before) = (changes_dropped(), lane_drops());
+        for n in 0..CHANGE_QUEUE {
+            assert_eq!(create_vehicle(&st, 1_000 + n).await, 201);
+        }
+        let received = || seen.lock().expect("ids").len();
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(30 * crate::state::slow_factor());
+        while received() < CHANGE_QUEUE && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            received(),
+            CHANGE_QUEUE,
+            "the healthy subscriber must get every change of the burst (matcher queue dropped {})",
+            changes_dropped() - queue_before
+        );
+        assert_eq!(changes_dropped(), queue_before, "the matcher queue dropped");
+        if !file_store {
+            assert!(
+                lane_drops() > lane_before,
+                "the stalled subscriber's lane must drop and count, not grow"
+            );
+        }
     }
 
     /// Every accepted change is counted until its pass has run, so a drain
