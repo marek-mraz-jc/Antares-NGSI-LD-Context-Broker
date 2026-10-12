@@ -483,6 +483,32 @@ impl Program {
         eval(self, entity)
     }
 
+    /// The value of the program for one normalized NGSI-LD Entity, as JSON: a number,
+    /// string, boolean, list or object, a date, time or date-time as its RFC 3339 text;
+    /// `None` when it is unknown (a missing, hidden or mistyped operand), never a default.
+    ///
+    /// ```
+    /// use antares_residual::{compile, DateTime, Expr, Func, Lit, Path};
+    /// use serde_json::json;
+    ///
+    /// let double = Expr::Call(Func::Mul, vec![Expr::Path(Path::value("pm10")), Expr::Lit(Lit::Int(2))]);
+    /// let now = DateTime::parse("2026-10-11T12:00:00Z").ok_or("now")?;
+    /// let program = compile(&double, now)?;
+    /// let station = json!({"id": "urn:ngsi-ld:AirQuality:1", "type": "AirQuality",
+    ///     "pm10": {"type": "Property", "value": 12}});
+    /// assert_eq!(program.value(&station)?, Some(json!(24)));
+    /// let silent = json!({"id": "urn:ngsi-ld:AirQuality:2", "type": "AirQuality"});
+    /// assert_eq!(program.value(&silent)?, None);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`eval`].
+    pub fn value(&self, entity: &Value) -> Result<Option<Value>, Error> {
+        eval::run_value(&self.root, entity)
+    }
+
     /// The top-level Attribute terms the program reads, each once in the order first read: what
     /// a pushdown's `attrs` must hold for the residual to see them (ADR-0028 rule 3).
     #[must_use]

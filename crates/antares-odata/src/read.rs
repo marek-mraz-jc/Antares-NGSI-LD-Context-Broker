@@ -9,7 +9,10 @@
 //! runs.
 
 use crate::edm::{base_member, Edm, Set, Shape};
-use crate::filter::{mint, order, program, translate, Refused, SortBy, SortKey, Translated};
+use crate::filter::{
+    compute, computed, inlined, mint, order, program, searched, translate, Refused, SortBy,
+    SortKey, Translated,
+};
 use crate::paths;
 use antares_ops::residual::{DateTime, Expr as RExpr, Program};
 use antares_ops::{
@@ -24,8 +27,8 @@ use odata_json::{
     Resource,
 };
 use odata_url::{
-    EdmModel, ExpandKind, ExpandPath, Key, KeyValue, Literal, ODataUri, QueryOptions, Segment,
-    SelectItem,
+    EdmModel, ExpandKind, ExpandPath, Expr, Key, KeyValue, Literal, ODataUri, QueryOptions,
+    Segment, SelectItem,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -221,6 +224,8 @@ fn no_properties(version: ODataVersion) -> ODataErrorResponse {
 /// read before) is asked.
 fn only_select(options: &QueryOptions) -> bool {
     options.filter.is_none()
+        && options.search.is_none()
+        && options.compute.is_none()
         && options.expand.is_none()
         && options.orderby.is_none()
         && options.top.is_none()
@@ -255,6 +260,15 @@ pub(crate) fn selected<'s>(
     set: &'s Set,
     select: Option<&'s Vec<SelectItem>>,
 ) -> Result<Option<Vec<&'s str>>, ()> {
+    selected_of(set, select, &[])
+}
+
+/// [`selected`], the `$compute` names of the request among the members.
+fn selected_of<'s>(
+    set: &'s Set,
+    select: Option<&'s Vec<SelectItem>>,
+    computed: &[(String, RExpr)],
+) -> Result<Option<Vec<&'s str>>, ()> {
     let Some(items) = select else {
         return Ok(None);
     };
@@ -263,7 +277,9 @@ pub(crate) fn selected<'s>(
         match item {
             SelectItem::Star => return Ok(None),
             SelectItem::Path(path) => match path.as_slice() {
-                [name] if base_member(name) => names.push(name.as_str()),
+                [name] if base_member(name) || computed.iter().any(|(c, _)| c == name) => {
+                    names.push(name.as_str());
+                }
                 [name]
                     if set
                         .members
@@ -416,13 +432,24 @@ pub(crate) fn query(
         q.push_str(&encode(keys));
     }
     if let Some(names) = picked {
-        let attrs: Vec<String> = names
+        // the computed values read their Attributes by term of the request's context
+        let reads = filter
+            .computed_reads
+            .iter()
+            .filter_map(|term| filter.context.get(term)?.as_str());
+        let mut attrs: Vec<String> = Vec::new();
+        for iri in names
             .iter()
             .filter_map(|name| set.members.get(*name))
             .map(|m| m.iri.as_str())
             .chain(expansions.iter().map(|e| e.iri))
-            .map(encode)
-            .collect();
+            .chain(reads)
+        {
+            let iri = encode(iri);
+            if !attrs.contains(&iri) {
+                attrs.push(iri);
+            }
+        }
         if !attrs.is_empty() {
             q.push_str("&attrs=");
             q.push_str(&attrs.join(","));
@@ -490,7 +517,7 @@ fn pushdown(
             .iter()
             .map(|iri| mint(&mut filter.context, iri))
             .collect();
-        for term in &filter.sort_reads {
+        for term in filter.sort_reads.iter().chain(&filter.computed_reads) {
             if !terms.contains(term) {
                 terms.push(term.clone());
             }
@@ -606,6 +633,7 @@ async fn evaluated(
             whole: true,
         };
         let (mut docs, _) = scanned(reads, caller, &pushdown, program, whole, version).await?;
+        attach(&mut docs, filter, version)?;
         if let Some(keys) = &filter.sort {
             sort(&mut docs, keys);
         }
@@ -670,10 +698,11 @@ async fn collection(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
-    let picked = selected(set, options.select.as_ref()).map_err(|()| not_implemented(version))?;
     let expansions =
         expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
     let mut filter = filtered(set, &reads.edm.sets, options, version)?;
+    let picked = selected_of(set, options.select.as_ref(), &filter.computed)
+        .map_err(|()| not_implemented(version))?;
     let projection = ngsild(&reads.view, options, &mut filter, version)?;
     let picked = projected(set, picked, &projection);
     let digest = digest(&reads.state.service_root, path, options);
@@ -717,12 +746,13 @@ async fn collection(
         version,
     };
     let shape = (set, picked.as_deref(), expansions.as_slice());
-    let served = match residual {
+    let mut served = match residual {
         None => pushed(reads, caller, shape, &filter, window, &link).await?,
         Some(program) => {
             evaluated(reads, caller, shape, &mut filter, &program, window, &link).await?
         }
     };
+    attach(&mut served.docs, &filter, version)?;
     let Served { docs, total, next } = served;
     let next_link = next;
     let entities: Vec<EntityValue> = docs
@@ -826,28 +856,35 @@ pub(crate) async fn entity(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
-    if options.filter.is_some() {
+    if options.filter.is_some() || options.search.is_some() {
         return Err(not_implemented(version));
     }
-    let picked = selected(set, options.select.as_ref()).map_err(|()| not_implemented(version))?;
+    // `$compute` alone: its values over the one Entity
+    let computing = Translated::default();
+    let computing = match &options.compute {
+        Some(items) => computed_over(set, items, options, computing, version)?,
+        None => computing,
+    };
+    let picked = selected_of(set, options.select.as_ref(), &computing.computed)
+        .map_err(|()| not_implemented(version))?;
     let expansions =
         expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
     let id = key_id(set, key, options).ok_or_else(|| not_found(version))?;
     let target = format!(
         "/ngsi-ld/v1/entities/{}?{}",
         encode(&id),
-        query(set, picked.as_deref(), &expansions, &Translated::default()),
+        query(set, picked.as_deref(), &expansions, &computing),
     );
-    let none = Translated::default();
-    let (docs, _) = run(
+    let (mut docs, _) = run(
         reads,
         caller,
         OperationId::RetrieveEntity,
         target,
-        &none,
+        &computing,
         version,
     )
     .await?;
+    attach(&mut docs, &computing, version)?;
     let doc = docs.first().ok_or_else(|| not_found(version))?;
     let value = entity_value(
         reads,
@@ -856,7 +893,7 @@ pub(crate) async fn entity(
         doc,
         picked.as_deref(),
         &expansions,
-        &none,
+        &computing,
     );
     let names = listed(picked.as_deref(), &expansions, version);
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -872,26 +909,87 @@ pub(crate) async fn entity(
     Ok(json_response(version, ctx.level, body))
 }
 
-/// The request's `$filter` as `q` and `id` (5.2) and its `$orderby` as
-/// `orderBy` (Q9), empty without them.
+/// The request's `$filter` and `$search` as `q` and `id` (5.2) and its
+/// `$orderby` as `orderBy` (Q9), empty without them.
 fn filtered(
     set: &Set,
     sets: &std::collections::BTreeMap<String, Set>,
     options: &QueryOptions,
     version: ODataVersion,
 ) -> Result<Translated, ODataErrorResponse> {
-    let translated = options
-        .filter
-        .as_ref()
-        .map_or_else(
-            || Ok(Translated::default()),
-            |f| translate(f, set, sets, &options.aliases),
-        )
-        .and_then(|mut t| match &options.orderby {
-            Some(items) => order(items, set, &mut t).map(|()| t),
-            None => Ok(t),
-        });
-    translated.map_err(|refused| refusal(refused, version))
+    // `$search` is one more conjunct of the filter (Protocol 11.2.1: both before `$count`)
+    let search = options.search.as_ref().and_then(|s| searched(s, set));
+    let filter = match (options.filter.clone(), search) {
+        (Some(f), Some(s)) => Some(Expr::And(Box::new(f), Box::new(s))),
+        (f, s) => f.or(s),
+    };
+    let items = options.compute.as_deref().unwrap_or_default();
+    // a filter on a computed value is one on what it computes (URL 5.1.10)
+    let filter = filter.map(|f| inlined(&f, items));
+    let translated = filter.as_ref().map_or_else(
+        || Ok(Translated::default()),
+        |f| translate(f, set, sets, &options.aliases),
+    );
+    let translated = translated.map_err(|refused| refusal(refused, version))?;
+    let translated = computed_over(set, items, options, translated, version)?;
+    match &options.orderby {
+        Some(keys) => {
+            let mut t = translated;
+            order(keys, set, &mut t)
+                .map(|()| t)
+                .map_err(|refused| refusal(refused, version))
+        }
+        None => Ok(translated),
+    }
+}
+
+/// `t` with the request's `$compute` `items` (Q16).
+fn computed_over(
+    set: &Set,
+    items: &[odata_url::Compute],
+    options: &QueryOptions,
+    mut t: Translated,
+    version: ODataVersion,
+) -> Result<Translated, ODataErrorResponse> {
+    compute(items, set, &options.aliases, &mut t, now())
+        .map(|()| t)
+        .map_err(|refused| refusal(refused, version))
+}
+
+/// The name under which [`attach`] keeps an Entity's computed values: no
+/// Attribute name starts with `@` (a JSON-LD keyword), so none collides.
+const COMPUTED: &str = "@computed";
+
+/// Each of `docs` with its computed values, by name, `null` for an unknown
+/// one: computed over what the view and the engine let the Entity show, so
+/// a hidden Attribute reads as an absent one. A document that holds them
+/// already is left as it is.
+fn attach(
+    docs: &mut [Value],
+    filter: &Translated,
+    version: ODataVersion,
+) -> Result<(), ODataErrorResponse> {
+    if filter.computed.is_empty() {
+        return Ok(());
+    }
+    let programs = computed(filter, now()).map_err(|refused| refusal(refused, version))?;
+    for doc in docs {
+        if doc.get(COMPUTED).is_some() {
+            continue;
+        }
+        let mut values = serde_json::Map::new();
+        for (name, program) in &programs {
+            let value = program
+                .value(doc)
+                .map_err(|_| refusal(Refused::TooComplex, version))?;
+            values.insert(name.clone(), value.unwrap_or(Value::Null));
+        }
+        // an Entity is a JSON object: the broker answers no other document
+        let _ = doc
+            .as_object_mut()
+            .map(|members| members.insert(COMPUTED.to_owned(), Value::Object(values)));
+    }
+    Ok(())
 }
 
 /// The OData error of a filter the surface does not take.
@@ -1186,6 +1284,12 @@ pub(crate) fn entity_value(
     for e in expansions {
         let instance = default_instance(doc.get(key_of(e.iri, filter)));
         properties.push((e.name.to_owned(), expansion(reads, e, instance, filter)));
+    }
+    for (name, _) in &filter.computed {
+        if wanted(name) {
+            let value = doc.get(COMPUTED).and_then(|c| c.get(name));
+            properties.push((name.clone(), value.cloned().unwrap_or(Value::Null)));
+        }
     }
     EntityValue {
         id: format!("{set_name}{}", key_segment(set, id)),
@@ -1540,6 +1644,7 @@ fn sort_value<'d>(doc: &'d Value, by: &SortBy) -> Option<&'d Value> {
         SortBy::Id => doc.get("id"),
         SortBy::System(name) => doc.get(name),
         SortBy::Value(term) => default_instance(doc.get(term)).and_then(|i| i.get("value")),
+        SortBy::Computed(name) => doc.get(COMPUTED).and_then(|c| c.get(name)),
     };
     found
         .map(|v| v.get("@value").unwrap_or(v))
