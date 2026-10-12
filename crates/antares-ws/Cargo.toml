@@ -32,6 +32,8 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 antares-ops = { workspace = true, features = ["test-kit"] }
+# the view's NGSI-LD root, so a write through one view reaches a socket of another (T-4084)
+antares-views = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 # the tests read docs/api/asyncapi-ws.yaml, the published contract (T-3518)
 regex = { workspace = true }

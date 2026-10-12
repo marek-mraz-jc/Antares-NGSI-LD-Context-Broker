@@ -89,6 +89,7 @@ async fn start(
     let app = broker.serve_mounted(vec![
         antares_ops::mount(Ws::new(hub.clone())),
         antares_ops::mount(ViewWs::new(hub.clone())),
+        antares_ops::mount(antares_views::Views),
     ])?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

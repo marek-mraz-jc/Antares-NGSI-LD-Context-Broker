@@ -621,6 +621,9 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
     let sweeping = reloader.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(retention::SWEEP_EVERY);
+        // A sweep that outlasts its minute waits for the next one instead of
+        // the missed ticks firing back to back (T-4084).
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
             retention::sweep(&sweeping, chrono::Utc::now()).await;
@@ -669,6 +672,15 @@ impl Reload {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Vec<retention::Deleted> {
         retention::sweep(&self.0, now).await
+    }
+
+    /// [`Self::sweep_retention`] that starts no statement after `budget`.
+    pub async fn sweep_retention_within(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        budget: std::time::Duration,
+    ) -> Vec<retention::Deleted> {
+        retention::sweep_within(&self.0, now, budget).await
     }
 
     /// Rebuild the table from the store now.

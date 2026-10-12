@@ -69,3 +69,54 @@ async fn ws_a_removed_view_stops_delivery() -> Result<(), String> {
     assert_eq!(refused.status(), 404);
     Ok(())
 }
+
+/// T-4084: a batch upsert through one view (the HFP writer's) notifies a
+/// Subscription made over the socket of another view of the same tenant
+/// whose grant reads the type; an x-subscribe whose `q` is no NGSI-LD q is
+/// answered 400, as POST /subscriptions is.
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_a_write_through_another_view_notifies_and_a_bad_q_is_refused() -> Result<(), String> {
+    let b = broker(Limits::default()).await?;
+    cars_view(&b).await?;
+    let writer = json!({
+        "id": "writer", "tenant": "city", "selector": ["Car"],
+        "rules": [{"types": ["Car"], "attributes": ["speed"]}],
+        "operations": ["batch_upsert"]
+    });
+    let (code, answer) = b
+        .http
+        .call("PUT", "/q/views/writer", &[], Some(&writer))
+        .await?;
+    assert!(code == 201 || code == 204, "{code} {answer}");
+
+    let mut c = connect(b.addr, "/x/views/cars/ws", &[]).await?;
+    let bad = c
+        .subscribe(json!({"type": "Subscription", "entities": [{"type": "Car"}], "q": "speed>>"}))
+        .await?;
+    assert_eq!(status(&bad), 400, "{bad}");
+    assert_eq!(
+        bad.pointer("/body/type"),
+        Some(&json!("https://uri.etsi.org/ngsi-ld/errors/BadRequestData")),
+        "{bad}"
+    );
+    assert_eq!(status(&c.subscribe(cars()).await?), 201);
+
+    let batch = json!([{"id": "urn:ngsi-ld:Car:w", "type": "Car", "speed": {"type": "Property", "value": 7}}]);
+    let (code, answer) = b
+        .http
+        .call(
+            "POST",
+            "/x/views/writer/ngsi-ld/v1/entityOperations/upsert",
+            &[],
+            Some(&batch),
+        )
+        .await?;
+    assert!(code == 201 || code == 204, "{code} {answer}");
+    let n = c.notification().await?;
+    assert_eq!(
+        n.pointer("/body/data/0/speed/value"),
+        Some(&json!(7)),
+        "{n}"
+    );
+    Ok(())
+}

@@ -436,6 +436,7 @@ name = "antares-ws"
 version = "0.1.3"
 dependencies = [
  "antares-ops",
+ "antares-views",
  "axum",
  "data-encoding",
  "futures-util",
