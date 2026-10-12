@@ -576,7 +576,7 @@ pub fn proj_depth(nodes: &[ProjNode]) -> usize {
     nodes
         .iter()
         .map(|n| match &n.children {
-            Some(c) => 1 + proj_depth(c),
+            Some(c) => proj_depth(c).saturating_add(1),
             None => 0,
         })
         .max()
@@ -625,12 +625,13 @@ pub(crate) fn parse_projection(s: &str, ctx: &Context) -> Result<Vec<ProjNode>, 
         let mut start = 0usize;
         for (i, c) in s.char_indices() {
             match c {
-                '{' => depth += 1,
+                '{' => depth = depth.saturating_add(1),
                 '}' => depth = depth.checked_sub(1)?,
                 // 4.21 orOp = | / , — both split at the same depth
                 ',' | '|' if depth == 0 => {
                     out.push(&s[start..i]);
-                    start = i + 1;
+                    // the separator is one byte
+                    start = i.saturating_add(1);
                 }
                 _ => {}
             }
@@ -647,12 +648,12 @@ pub(crate) fn parse_projection(s: &str, ctx: &Context) -> Result<Vec<ProjNode>, 
             if t.is_empty() {
                 return Err(bad("empty projection member"));
             }
-            let (head_part, children) = match t.find('{') {
-                Some(i) => {
-                    let inner = t[i + 1..]
+            let (head_part, children) = match t.split_once('{') {
+                Some((head, rest)) => {
+                    let inner = rest
                         .strip_suffix('}')
                         .ok_or_else(|| bad("unclosed brace"))?;
-                    (&t[..i], Some(parse_nodes(inner, ctx)?))
+                    (head, Some(parse_nodes(inner, ctx)?))
                 }
                 None => (t, None),
             };
@@ -1313,7 +1314,7 @@ async fn inline_join_walk(
                 };
                 for (child_at, expand) in at.into_iter().zip(expand) {
                     if expand {
-                        next.push((child_at, slot.child.clone(), level - 1));
+                        next.push((child_at, slot.child.clone(), level.saturating_sub(1)));
                     }
                 }
             }
@@ -1339,7 +1340,7 @@ async fn lookup_joined(
         walk.complete = false;
         return None;
     }
-    walk.budget -= 1;
+    walk.budget = walk.budget.saturating_sub(1);
     let target = st
         .store
         .get(tenant, Kind::Entity, id)
@@ -1481,7 +1482,7 @@ async fn collect_flat_walk(
                             walk.complete = false;
                             return;
                         }
-                        walk.budget -= 1;
+                        walk.budget = walk.budget.saturating_sub(1);
                         let Some(target) =
                             st.store.get(tenant, Kind::Entity, id).await.ok().flatten()
                         else {
@@ -1495,7 +1496,7 @@ async fn collect_flat_walk(
                         walk.seen.insert(id.to_owned());
                         out.insert(id.to_owned(), (target.clone(), child.clone()));
                         if *level > 1 {
-                            next.push((target, child.clone(), level - 1));
+                            next.push((target, child.clone(), level.saturating_sub(1)));
                         }
                     }
                 }
@@ -1549,8 +1550,10 @@ fn geo_value_of(attr: &Value) -> Value {
     let inst = match attr {
         Value::Array(a) => match a.iter().find(|i| i.get("datasetId").is_none()) {
             Some(default) => default.clone(),
-            None if a.len() == 1 => a[0].clone(),
-            None => return Value::Null,
+            None => match a.as_slice() {
+                [only] => only.clone(),
+                _ => return Value::Null,
+            },
         },
         other => other.clone(),
     };
@@ -2234,5 +2237,25 @@ mod type_rules_memo_tests {
         let none = reach(&open);
         assert!(none.policy_reach.is_none() && none.policy_types.is_none());
         assert!(super::narrowing(&car).policy_reach.unwrap().rules.is_some());
+    }
+}
+
+#[cfg(test)]
+mod t3932_projection_edges {
+    use super::*;
+    use antares_jsonld::Loader;
+
+    /// T-3932: the projection parser splits at the brace it found and counts
+    /// depth without overflow; a malformed or multi-byte term is a 400, never
+    /// a panic.
+    #[test]
+    fn malformed_and_multibyte_projections_are_refused() {
+        let ctx = Loader::new().core();
+        let deep = parse_projection("a{b{c}}", &ctx).expect("nested");
+        assert_eq!(proj_depth(&deep), 2);
+        assert_eq!(deep[0].raw, "a");
+        for bad in ["a{b", "a}", "a{}", "{", "}", ",", "a,,b", "é{ü|ö}", "a{é}"] {
+            assert!(parse_projection(bad, &ctx).is_err(), "{bad} is refused");
+        }
     }
 }
