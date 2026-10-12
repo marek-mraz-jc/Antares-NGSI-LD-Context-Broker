@@ -568,6 +568,10 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
     /// The rest of `allExpr` after `all(`: `all` has no empty form.
     fn all(&mut self, items: Scope<'m>, collection: MemberPath) -> Result<Expr, UrlError> {
         self.c.bws();
+        if self.c.close() {
+            // past the `)`, where the ABNF runner stops reading `all()` as a function call
+            return Err(self.c.syntax("lambdaVariableExpr"));
+        }
         let lambda = self.lambda(items)?;
         Ok(Expr::All { collection, lambda })
     }

@@ -214,18 +214,19 @@ impl Parser<'_, '_> {
         Ok(Search::Phrase(self.text(bytes)?))
     }
 
-    /// A `searchWord`: up to whitespace, a parenthesis, a quote, `;` or the end of the option;
-    /// `&` and `#` only percent-encoded.
+    /// A `searchWord`: up to whitespace, a parenthesis, a quote, a literal `;` or the end of
+    /// the option; `;`, `&` and `#` percent-encoded.
     fn word(&mut self) -> Result<Search, UrlError> {
         let start = self.c.pos();
         let mut bytes = Vec::new();
         loop {
             let at = self.c.pos();
-            if self.c.peek() == Some(b'+') {
+            // looked at, not matched: a syntax error stands at the `;` (the ABNF runner's offset)
+            if matches!(self.c.peek(), Some(b'+' | b';')) {
                 break;
             }
             match self.byte() {
-                Some(b) if !(b.is_ascii_whitespace() || b"()\";".contains(&b)) => {
+                Some(b) if !(b.is_ascii_whitespace() || b"()\"".contains(&b)) => {
                     bytes.push(b);
                 }
                 _ => {

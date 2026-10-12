@@ -1298,7 +1298,8 @@ fn all_lambdas_parse() {
         filter("tags/all(t:t ne 'x') and rooms/any()"),
         Expr::And(..)
     ));
-    syntax("Buildings?$filter=tags/all()", past("tags/all("));
+    // past the `)`, as the OASIS runner reports `Products/all()`
+    syntax("Buildings?$filter=tags/all()", past("tags/all()"));
     unresolved(
         "Buildings?$filter=tags/all(t:t eq 'x') and t eq 'x'",
         past("tags/all(t:t eq 'x') and "),
@@ -1386,6 +1387,9 @@ fn search_reads_words_phrases_and_operators_with_their_precedence() {
     assert_eq!(search_of("$search=R%26D%23"), Word("R&D#".into()));
     assert_eq!(search_of("$search=caf%C3%A9"), Word("café".into()));
     assert_eq!(search_of("$search=it's"), Word("it's".into()));
+    // a literal `;` ends a word, a percent-encoded one is text (ABNF `searchWord`)
+    assert_eq!(search_of("$search=a%3Bb"), Word("a;b".into()));
+    syntax("Buildings?$search=a;b", "Buildings?$search=a".len());
     // `searchExpr-incomplete` is one phrase, `''` a quote
     assert_eq!(search_of("$search='it''s red'"), Phrase("it's red".into()));
     // `+` is a space in a phrase too; `&` percent-encoded is text
