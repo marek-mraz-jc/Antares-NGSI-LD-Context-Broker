@@ -9,6 +9,7 @@ mod crs;
 mod filter;
 mod geojson;
 mod items;
+mod matrix;
 mod oas30;
 mod scan;
 mod schemas;
