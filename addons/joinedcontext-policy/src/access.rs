@@ -145,6 +145,7 @@ fn subject(caller: &Caller) -> Value {
             client: Some(client),
             ..
         }) => json!({"type": "serviceAccount", "id": client}),
+        Caller::Platform(Platform { did: Some(did), .. }) => json!({"type": "did", "id": did}),
         Caller::Platform(_) => json!({"type": "role", "id": "public"}),
     }
 }
@@ -329,6 +330,10 @@ mod tests {
             (
                 vec![("x-jc-client", "app")],
                 json!({"type": "serviceAccount", "id": "app"}),
+            ),
+            (
+                vec![("x-jc-did", "did:web:consumer.example")],
+                json!({"type": "did", "id": "did:web:consumer.example"}),
             ),
             (vec![], json!({"type": "internal"})),
         ] {

@@ -24,7 +24,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 antares-bus = { workspace = true }
 # the outbound-client crate: its crypto provider is installed from main
-antares-jsonld = { workspace = true }
+antares-jsonld = { workspace = true, features = ["fetch"] }
 antares-model = { workspace = true }
 antares-store = { workspace = true }
 antares-sql = { workspace = true, features = ["postgres"] }
@@ -117,7 +117,7 @@ internal-csr = ["views", "dep:antares-icsr"]
 
 # Every surface the broker serves (ADR-0027 Consequences, T-3636): what
 # `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
-# sets it; the platform image builds `full,jc-policy` (image-jc.yml).
+# sets it; the platform image builds `full,jc-policy,linkml` (image-jc.yml).
 full = ["views", "mcp", "odata", "ogc", "ws"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).

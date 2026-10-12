@@ -212,8 +212,11 @@ def check_view_diff():
                 for key, status in rows:
                     w.writerow(["s", *key.split("::"), status])
             with open(f"{path}/requests.jsonl", "w") as fh:
-                for test, method, url, headers in requests:
-                    fh.write(json.dumps({"test": test, "method": method, "url": url, "headers": headers}) + "\n")
+                for test, method, url, headers, *body in requests:
+                    line = {"test": test, "method": method, "url": url, "headers": headers}
+                    if body:
+                        line["body"] = body[0]
+                    fh.write(json.dumps(line) + "\n")
             return path
 
         view = f"{tmp}/view.json"
@@ -238,7 +241,38 @@ def check_view_diff():
         gone = run("gone", [(b, "PASS"), (c, "PASS"), (d, "FAIL")])
         assert view_diff.diff(view, e1, gone, binds) == 1, "a TP that did not run must fail"
         assert view_diff.diff(view, e1, f"{tmp}/nowhere", binds) == 1, "an empty run must fail"
-    print("  view diff ok (owed refusals pass, a deviation, a stale known entry or a missing TP fails)")
+
+        # T-3787: a view that hides types and Attributes owes the refusal of a read that names one,
+        # in the query or in the body, under the names the suite's @context gives them
+        restricted = f"{tmp}/restricted.json"
+        json.dump({"id": "r", "operations": ["retrieve_entity", "query_entities", "query_entities_post"],
+                   "selector": ["https://ngsi-ld-test-suite/context#Building"],
+                   "rules": [{"types": ["https://ngsi-ld-test-suite/context#Building"],
+                              "attributes": ["https://ngsi-ld-test-suite/context#name",
+                                             "https://uri.etsi.org/ngsi-ld/location"]}]},
+                  open(restricted, "w"))
+        view_diff.KNOWN = f"{tmp}/none.json"
+        hidden = run("hidden", [(a, "FAIL"), (b, "FAIL"), (c, "FAIL"), (d, "PASS")], [
+            (a, "GET", f"{root}/entities?type=Vehicle", []),
+            (b, "GET", f"{root}/entities?type=Building&q=airQualityLevel>2", []),
+            (c, "POST", f"{root}/entityOperations/query", [],
+             {"type": "Query", "entities": [{"type": "Building"}], "attrs": ["name", "airQualityLevel"]}),
+            (d, "GET", f"{root}/entities?type=Building&attrs=name,location", []),
+        ])
+        assert view_diff.diff(restricted, e1, hidden, binds) == 0
+        why = {r["tp"]: r["owed"] for r in json.load(open(f"{hidden}/owed-refusals.json"))["refusals"]}
+        assert sorted(why) == [a, b, c], why
+        assert "type Vehicle" in why[a][0] and "Attribute airQualityLevel" in why[b][0], why
+        assert any("airQualityLevel" in w for w in why[c]), why
+        shown = run("shown", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
+                    [(d, "GET", f"{root}/entities?type=Building&attrs=name,location", [])])
+        assert view_diff.diff(restricted, e1, shown, binds) == 1, "a read of shown names owes nothing"
+        committed = json.load(open(f"{HERE}/../ci/views/etsi/etsi-restricted.json"))
+        reads = {o["id"] for o in __import__("yaml").safe_load(open(view_diff.MATRIX))["operations"]
+                 if o.get("kind") == "read"}
+        assert set(committed["operations"]) == reads, "etsi-restricted offers the matrix's reads"
+    print("  view diff ok (owed refusals pass, a deviation, a stale known entry or a missing TP fails;"
+          " a hidden type or Attribute owes its refusal)")
 
 
 if __name__ == "__main__":

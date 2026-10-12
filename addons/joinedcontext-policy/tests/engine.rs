@@ -214,6 +214,34 @@ async fn an_anonymous_caller_gets_the_public_grant_as_a_rewrite() -> Res {
     Ok(())
 }
 
+/// K38, DS-02: a data-space participant reads what its agreement's Policy grants it, through
+/// the header the gateway sets from the transfer token, and none of the public grant.
+#[tokio::test]
+async fn a_participant_reads_what_its_agreement_grants_and_nothing_public() -> Res {
+    let did = "did:web:consumer.example";
+    let (st, _) = broker(doc(&[
+        grant("agreed", "did", did, &["5.7.2"], cars(&["colour"])),
+        grant("pub", "role", "public", &["5.7.2"], cars(&["speed"])),
+    ]))
+    .await?;
+    fleet(&st).await?;
+    let participant = [
+        ("x-jc-did", "did%3Aweb%3Aconsumer.example"),
+        ("x-jc-roles", "public"),
+    ];
+    let (code, list) = send(&st, "GET", QUERY, &participant, None).await?;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list), car_ids(&[1, 2, 3]));
+    let text = list.to_string();
+    assert!(text.contains("colour") && !text.contains("speed"), "{text}");
+    let other = [("x-jc-did", "did:web:other.example")];
+    assert_eq!(
+        send(&st, "GET", QUERY, &other, None).await?.0,
+        StatusCode::FORBIDDEN
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn an_anonymous_caller_gets_the_grant_of_the_endpoint_role_the_gateway_resolved() -> Res {
     let (st, _) = broker(doc(&[grant(
