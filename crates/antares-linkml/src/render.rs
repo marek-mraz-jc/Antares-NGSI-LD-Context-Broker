@@ -181,7 +181,9 @@ impl Rendered {
         let s = model.schema();
         let mut described = Map::new();
         described.insert("name".into(), json!(s.name));
-        described.insert("version".into(), json!(major));
+        // a number, as the platform's index writes it (the SDK keeps only an integer, T-3963);
+        // `major` holds digits that fit a u64, so the fallback never fires
+        described.insert("version".into(), json!(major.parse::<u64>().unwrap_or(1)));
         described.insert("semver".into(), json!(s.version));
         described.insert("types".into(), json!(s.classes.keys().collect::<Vec<_>>()));
         described.insert("artifacts".into(), Value::Object(artifacts));
@@ -265,11 +267,11 @@ impl Rendered {
     }
 }
 
-/// The leading number of a semantic version, `1` for none.
+/// The leading number of a semantic version, `1` for none or for one past `u64`.
 fn major(version: Option<&str>) -> String {
     version
         .and_then(|v| v.split('.').next())
-        .filter(|m| !m.is_empty() && m.bytes().all(|b| b.is_ascii_digit()))
+        .filter(|m| m.bytes().all(|b| b.is_ascii_digit()) && m.parse::<u64>().is_ok())
         .unwrap_or("1")
         .to_owned()
 }
@@ -412,6 +414,7 @@ mod tests {
         assert_eq!(major(Some("v3")), "1");
         assert_eq!(major(Some(".1")), "1");
         assert_eq!(major(None), "1");
+        assert_eq!(major(Some("99999999999999999999999.0.0")), "1");
     }
 
     #[test]
@@ -471,8 +474,8 @@ mod tests {
         let model = &index["models"][0];
         assert_eq!(index["endpoint"], "v");
         assert_eq!(
-            (model["version"].as_str(), model["redacted"].as_bool()),
-            (Some("3"), Some(true))
+            (model["version"].as_u64(), model["redacted"].as_bool()),
+            (Some(3), Some(true))
         );
         let yaml = r.document(Artifact::LinkMl).expect("yaml");
         assert_eq!(
@@ -481,6 +484,27 @@ mod tests {
         );
         assert_eq!(model["artifacts"]["model.linkml.yaml"]["bytes"], yaml.len());
         assert_eq!(model["artifacts"].as_object().map(Map::len), Some(7));
+    }
+
+    /// The index's `version` is the major as a JSON integer, as the platform's index writes it:
+    /// 1 for a schema with no version, 2 for `2.3.0` (T-3963).
+    #[test]
+    fn the_index_version_is_an_integer() {
+        for (schema, want) in [
+            (&br#"{"id": "https://e.org/s", "name": "s"}"#[..], 1),
+            (
+                &br#"{"id": "https://e.org/s", "name": "s", "version": "2.3.0"}"#[..],
+                2,
+            ),
+        ] {
+            let r = Cache::default()
+                .get("v", &Arc::from(schema), &visible(&[]))
+                .expect("renders");
+            let index: Value = serde_json::from_slice(&r.index).expect("json");
+            assert!(index["models"][0]["version"].is_u64(), "{index}");
+            assert_eq!(index["models"][0]["version"], want);
+            assert_eq!(r.major, want.to_string());
+        }
     }
 
     #[test]

@@ -499,7 +499,7 @@ fn split_unquoted(s: &str, sep: char) -> Vec<&str> {
             '>' if !quoted => angle = false,
             c if c == sep && !quoted && !angle => {
                 out.push(&s[start..i]);
-                start = i + c.len_utf8();
+                start = i.saturating_add(c.len_utf8());
             }
             _ => {}
         }

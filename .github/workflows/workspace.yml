@@ -136,6 +136,10 @@ jobs:
       # moves under everyone's feet takes the wasm32 arm down silently. A
       # check here costs one target and keeps the arm honest per commit.
       - run: cargo check --locked --target wasm32-unknown-unknown -p antares-wasm
+      # T-3911: the JSON-LD algorithms without the `fetch` loader build for
+      # the browser with no network stack at all, the shape another project
+      # embeds (rule M3).
+      - run: cargo check --locked --target wasm32-unknown-unknown -p antares-jsonld --no-default-features
       # --locked everywhere below: the image builds with it (Dockerfile), so
       # without it CI would gate on a dependency set the shipped binary never
       # used, and an out-of-date Cargo.lock would pass here and fail there.
