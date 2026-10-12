@@ -173,7 +173,8 @@ pub fn compile(pattern: &str) -> Result<Arc<regex::Regex>, String> {
 
 /// The retained program for `pattern`, without compiling anything. A
 /// retained refusal holds no program and reads as `None` here.
-pub fn cached(pattern: &str) -> Option<Arc<regex::Regex>> {
+#[cfg(test)]
+pub(crate) fn cached(pattern: &str) -> Option<Arc<regex::Regex>> {
     CACHE.read().ok().and_then(|c| {
         c.get(pattern)
             .and_then(|e| touch(e).0.as_ref().ok())
@@ -182,17 +183,20 @@ pub fn cached(pattern: &str) -> Option<Arc<regex::Regex>> {
 }
 
 /// Compilations performed on the calling thread (i.e. its cache misses).
-pub fn compiles() -> u64 {
+#[cfg(test)]
+pub(crate) fn compiles() -> u64 {
     COMPILES.with(std::cell::Cell::get)
 }
 
 /// Patterns currently retained — never above `MAX_REGEX_CACHE`.
-pub fn len() -> usize {
+#[cfg(test)]
+pub(crate) fn len() -> usize {
     CACHE.read().map(|c| c.len()).unwrap_or(0)
 }
 
 /// Program bytes currently charged — never above `MAX_REGEX_CACHE_BYTES`.
-pub fn retained_bytes() -> usize {
+#[cfg(test)]
+pub(crate) fn retained_bytes() -> usize {
     BYTES.load(Ordering::Relaxed)
 }
 
