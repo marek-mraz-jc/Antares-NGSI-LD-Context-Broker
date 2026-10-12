@@ -42,14 +42,18 @@ included (`list_page`), and creates a document as given.
    The export is not a point-in-time snapshot: the caller holds the
    writers first (the platform's gateway answers them `503`), and the
    digest proves the copy.
-4. **The import** takes an export into a Tenant that holds no Entity and no
-   history (`409` otherwise). It reads line by line, at most 16 MiB a line,
-   writes each Entity as given, then replaces each history document with
-   the exported one (writing an Entity records a history instance through
-   the change hook; the replace makes the target's history the source's).
-   A bad line, a Tenant mismatch or a missing trailer stops it and purges
-   what it wrote, so the Tenant is left as empty as it was found: all or
-   nothing, without a transaction across backends.
+4. **The import** takes an export into a Tenant that holds nothing: no
+   Entity, history, Subscription, registration, Snapshot, EntityMap,
+   distributed subscription or hosted @context (`409` naming each count
+   otherwise). It reads line by line, at most 16 MiB a line, writes each
+   Entity as given, then replaces each history document with the exported
+   one (writing an Entity records a history instance through the change
+   hook; the replace makes the target's history the source's). A bad line,
+   a Tenant mismatch or a missing trailer stops it and deletes, by id, the
+   Entities and history it wrote, and nothing else; a Tenant the import
+   created goes again once nothing is left in it. All or nothing, without a
+   transaction across backends, and never at the cost of data another
+   writer owns (T-4016).
 5. **v1 moves data only.** A Tenant holding Subscriptions, Context Source
    Registrations or their Subscriptions, distributed subscriptions or
    Snapshots is refused by the export with `409` and the counts: each of

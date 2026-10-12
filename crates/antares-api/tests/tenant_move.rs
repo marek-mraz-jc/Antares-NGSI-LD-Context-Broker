@@ -259,3 +259,99 @@ async fn a_memory_tenant_moves_into_postgres_with_the_same_digest() {
         export(&source, &tenant).await
     );
 }
+
+/// T-4016: a target holding anything, a Subscription or a hosted @context
+/// as much as an Entity, is refused before a line is read, and what it holds
+/// stays; a failed import removes only what it wrote.
+#[tokio::test]
+async fn an_import_never_touches_what_the_target_already_holds() {
+    let (source, target) = (state().await, state().await);
+    seeded(&source, "air").await;
+    let stream = export(&source, "air").await;
+
+    let sub = json!({"id": "urn:ngsi-ld:Subscription:kept", "type": "Subscription", "entities": [{"type": "Room"}],
+        "notification": {"endpoint": {"uri": "http://127.0.0.1:9/notify"}}});
+    assert_eq!(
+        ngsi(&target, "POST", "/ngsi-ld/v1/subscriptions", sub, "air").await,
+        StatusCode::CREATED
+    );
+    let ctx = json!({"@context": {"Room": "https://example.org/Room"}});
+    assert_eq!(
+        ngsi(&target, "POST", "/ngsi-ld/v1/jsonldContexts", ctx, "air").await,
+        StatusCode::CREATED
+    );
+    let hosted = |st: AppState| async move {
+        read(&st, "/ngsi-ld/v1/jsonldContexts?kind=Hosted", Some("air"))
+            .await
+            .as_array()
+            .map_or(0, Vec::len)
+    };
+
+    let (status, why) = import(&target, "air", stream.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{why}");
+    assert!(
+        why.contains("1 subscriptions") && why.contains("1 @contexts"),
+        "{why}"
+    );
+    // a cut stream into the same tenant: refused the same way, nothing purged
+    let cut = stream.lines().take(3).collect::<Vec<_>>().join("\n") + "\n";
+    let (status, _) = import(&target, "air", cut).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (s, _) = call(
+        &target,
+        "GET",
+        "/ngsi-ld/v1/subscriptions/urn:ngsi-ld:Subscription:kept",
+        "",
+        Some("air"),
+        false,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "the subscription is still there");
+    assert_eq!(hosted(target.clone()).await, 1, "and so is the @context");
+    let digest = read(&target, "/q/tenants/air/digest", None).await;
+    assert_eq!(digest["entities"], 0, "{digest}");
+}
+
+#[tokio::test]
+async fn a_known_empty_tenant_digests_to_zero() {
+    let st = state().await;
+    let sub = json!({"id": "urn:ngsi-ld:Subscription:1", "type": "Subscription", "entities": [{"type": "Room"}],
+        "notification": {"endpoint": {"uri": "http://127.0.0.1:9/notify"}}});
+    assert_eq!(
+        ngsi(&st, "POST", "/ngsi-ld/v1/subscriptions", sub, "quiet").await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        read(&st, "/q/tenants/quiet/digest", None).await,
+        json!({"tenant": "quiet", "entities": 0, "attrInstances": 0, "sha256": "0".repeat(64)})
+    );
+}
+
+/// A line that arrives one byte a chunk is read once (T-4016): the import
+/// of an export split into one-byte chunks equals the import of it whole.
+#[tokio::test]
+async fn an_export_in_one_byte_chunks_imports_like_one_piece() {
+    let (source, target) = (state().await, state().await);
+    seeded(&source, "air").await;
+    let stream = export(&source, "air").await;
+    let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = stream
+        .bytes()
+        .map(|b| Ok(axum::body::Bytes::copy_from_slice(&[b])))
+        .collect();
+    let res = antares_api::router(target.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/q/tenants/air/import")
+                .header("Content-Length", stream.len())
+                .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        read(&target, "/q/tenants/air/digest", None).await,
+        read(&source, "/q/tenants/air/digest", None).await
+    );
+}

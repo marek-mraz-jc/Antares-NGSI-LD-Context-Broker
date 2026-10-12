@@ -221,8 +221,44 @@ fn line(v: &Value) -> Bytes {
     Bytes::from(out)
 }
 
-/// `POST /q/tenants/{tenant}/import`: an export into a Tenant that holds no
-/// Entity and no history; all or nothing (ADR-0030 rule 4).
+/// What the Tenant holds in any kind, by name and count: an import takes a
+/// Tenant that holds nothing, so a failed one can never touch data it did
+/// not write (T-4016).
+async fn occupied(st: &AppState, tenant: &TenantId) -> Result<Vec<String>, NgsiError> {
+    let mut held = match st.store.tenant_stats_one(tenant).await? {
+        Some(stats) => {
+            let mut held = unmovable(&stats);
+            for (name, n) in [
+                ("entities", stats.entities),
+                ("entityMaps", stats.entity_maps),
+            ] {
+                if n > 0 {
+                    held.push(format!("{n} {name}"));
+                }
+            }
+            held
+        }
+        None => Vec::new(),
+    };
+    let instances = st.temporal.attr_instance_count(tenant).await?;
+    if instances > 0 {
+        held.push(format!("{instances} history instances"));
+    }
+    let contexts = st
+        .store
+        .context_list_meta(Some(tenant))
+        .await?
+        .iter()
+        .filter(|row| row.get("owner").and_then(Value::as_str) == Some(tenant.as_str()))
+        .count();
+    if contexts > 0 {
+        held.push(format!("{contexts} @contexts"));
+    }
+    Ok(held)
+}
+
+/// `POST /q/tenants/{tenant}/import`: an export into a Tenant that holds
+/// nothing; all or nothing (ADR-0030 rule 4).
 pub async fn import(
     axum::extract::State(st): axum::extract::State<AppState>,
     axum::extract::Path(raw): axum::extract::Path<String>,
@@ -232,35 +268,54 @@ pub async fn import(
         Ok(t) => t,
         Err(r) => return *r,
     };
-    let entities = match st.store.tenant_stats_one(&tenant).await {
-        Ok(stats) => stats.map_or(0, |s| s.entities),
+    let existed = match st.store.tenant_exists(&tenant).await {
+        Ok(b) => b,
         Err(e) => return ApiError::from(e).into_response(),
     };
-    let instances = match st.temporal.attr_instance_count(&tenant).await {
-        Ok(n) => n,
+    match occupied(&st, &tenant).await {
+        Ok(held) if held.is_empty() => {}
+        Ok(held) => {
+            return ApiError::from(NgsiError::Conflict(format!(
+                "the tenant already holds {}; an import takes an empty tenant",
+                held.join(", ")
+            )))
+            .into_response()
+        }
         Err(e) => return ApiError::from(e).into_response(),
-    };
-    if entities > 0 || instances > 0 {
-        return ApiError::from(NgsiError::Conflict(format!(
-            "the tenant already holds {entities} entities and {instances} history instances; an import takes an empty tenant"
-        )))
-        .into_response();
     }
-    match take(&st, &tenant, &raw, body).await {
+    let mut written = Vec::new();
+    match take(&st, &tenant, &raw, body, &mut written).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            // The Tenant was empty: emptying it again undoes this import.
-            let _ = st.temporal.purge_tenant(&tenant).await;
-            let _ = st.store.purge_tenant(&tenant).await;
+            // Undo by id: only the Entities this import wrote and their
+            // history, never what another writer put in meanwhile.
+            for id in &written {
+                let _ = st.store.delete(&tenant, Kind::Entity, id).await;
+                let _ = st.temporal.delete(&tenant, id).await;
+            }
+            // A Tenant this import created goes again, once nothing is left
+            // in it: an emptied one would still list.
+            if !existed && matches!(occupied(&st, &tenant).await, Ok(held) if held.is_empty()) {
+                let _ = st.store.purge_tenant(&tenant).await;
+            }
             ApiError::from(e).into_response()
         }
     }
 }
 
-async fn take(st: &AppState, tenant: &TenantId, raw: &str, body: Body) -> Result<(), NgsiError> {
+async fn take(
+    st: &AppState,
+    tenant: &TenantId,
+    raw: &str,
+    body: Body,
+    written: &mut Vec<String>,
+) -> Result<(), NgsiError> {
     let bad = |n: usize, why: &str| NgsiError::BadRequestData(format!("line {n}: {why}"));
     let mut stream = body.into_data_stream();
     let mut buf: Vec<u8> = Vec::new();
+    // Bytes of `buf` already searched for a line break: a long line that
+    // arrives in many chunks is scanned once, not once a chunk.
+    let mut scanned = 0usize;
     let mut n = 0usize;
     let mut header_seen = false;
     let mut ended = false;
@@ -274,7 +329,12 @@ async fn take(st: &AppState, tenant: &TenantId, raw: &str, body: Body) -> Result
                 chunk.map_err(|e| NgsiError::BadRequestData(format!("the body was cut: {e}")))?;
             buf.extend_from_slice(&chunk);
         }
-        while let Some(end) = buf.iter().position(|b| *b == b'\n') {
+        while let Some(end) = buf
+            .get(scanned..)
+            .and_then(|rest| rest.iter().position(|b| *b == b'\n'))
+            .map(|at| at.saturating_add(scanned))
+        {
+            scanned = 0;
             let mut text: Vec<u8> = buf.drain(..=end).collect();
             text.pop();
             n = n.saturating_add(1);
@@ -315,17 +375,20 @@ async fn take(st: &AppState, tenant: &TenantId, raw: &str, body: Body) -> Result
                     if !st.store.create(tenant, Kind::Entity, &id, doc).await? {
                         return Err(bad(n, &format!("entity {id} appears twice")));
                     }
+                    written.push(id);
                 }
                 // After every Entity: writing one records history through
                 // the change hook, which the exported history then replaces.
                 Some("temporal") => {
                     in_history = true;
                     st.temporal.upsert(tenant, &id, doc).await?;
+                    written.push(id);
                 }
                 _ => return Err(bad(n, "a record of an unknown kind")),
             }
             records = records.saturating_add(1);
         }
+        scanned = buf.len();
         if buf.len() > MAX_LINE_BYTES {
             return Err(bad(n.saturating_add(1), "longer than 16 MiB"));
         }
