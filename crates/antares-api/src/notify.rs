@@ -1482,8 +1482,25 @@ async fn run_lane(key: (String, String), mut rx: tokio::sync::mpsc::Receiver<Lan
                 }
             }
         };
-        let LaneJob { st, group, _batch } = job;
+        // Everything waiting behind it leaves in the same notification, as a
+        // drain folds one subscription's changes into one group: a lane
+        // keeps up by sending fewer, larger notifications, not by queueing
+        // one per change. The newest group carries the subscription as it
+        // reads now; the batches stay pending until this delivery ends.
+        let LaneJob {
+            st,
+            mut group,
+            _batch,
+        } = job;
+        let mut batches = vec![_batch];
+        while let Ok(next) = rx.try_recv() {
+            let mut data = std::mem::take(&mut group.data);
+            data.extend(next.group.data);
+            group = Matched { data, ..next.group };
+            batches.push(next._batch);
+        }
         guarded(async move { deliver_group(&st, group).await }).await;
+        drop(batches);
     }
 }
 
