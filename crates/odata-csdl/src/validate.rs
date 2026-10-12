@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use crate::error::{CsdlError, Feature, LimitKind, Problem, ValidationError};
 use crate::model::{
     Annotation, CsdlVersion, EntityContainer, EntitySet, EntityType, Expr, Model,
-    NavigationProperty, Property, Schema, Term, TypeRef,
+    NavigationProperty, Property, ReferentialConstraint, Schema, Term, TypeRef,
 };
 use crate::names::{is_namespace, is_simple_identifier, split_qualified};
 
@@ -411,6 +411,10 @@ impl<'m> Check<'m> {
             self.problem(at.clone(), Problem::NullableCollectionNavigation);
         }
         let target = self.type_ref(&at, &navigation.ty, Use::Navigation)?;
+        let principal = match &target {
+            Some(Resolved::Entity(t)) => Some((self.base_of(t), *t)),
+            _ => None,
+        };
         if let (Some(partner), Some(Resolved::Entity(target))) = (&navigation.partner, target) {
             let back = all_navigations(self.base_of(target), target).find(|n| &n.name == partner);
             let leads_back = back.is_some_and(|back| {
@@ -428,6 +432,13 @@ impl<'m> Check<'m> {
             }
         } else if navigation.partner.is_some() {
             self.problem(at.clone(), Problem::InvalidPartner);
+        }
+        for constraint in &navigation.referential_constraints {
+            self.count()?;
+            if !holds(navigation, (base, owner), principal, constraint) {
+                let at = format!("{at}/{}", constraint.property);
+                self.problem(at, Problem::InvalidReferentialConstraint);
+            }
         }
         self.annotations(&at, &navigation.annotations)
     }
@@ -689,6 +700,43 @@ fn member_names(ty: &EntityType) -> impl Iterator<Item = &str> {
         .iter()
         .map(|p| p.name.as_str())
         .chain(ty.navigation_properties.iter().map(|n| n.name.as_str()))
+}
+
+/// CSDL XML 8.5 on a single-valued navigation: the dependent property is a primitive of the
+/// declaring type; the principal one, of the target type, has the same type; the dependent is
+/// nullable when the navigation or the principal is, and only then. A target that is no entity
+/// type of the model is its own problem already.
+fn holds(
+    navigation: &NavigationProperty,
+    (base, owner): (Option<&EntityType>, &EntityType),
+    principal: Option<(Option<&EntityType>, &EntityType)>,
+    constraint: &ReferentialConstraint,
+) -> bool {
+    fn named<'a>(
+        base: Option<&'a EntityType>,
+        ty: &'a EntityType,
+        name: &str,
+    ) -> Option<&'a Property> {
+        base.into_iter()
+            .flat_map(|b| b.properties.iter())
+            .chain(ty.properties.iter())
+            .find(|p| p.name == name)
+    }
+    let Some(dependent) = named(base, owner, &constraint.property) else {
+        return false;
+    };
+    if navigation.ty.collection
+        || dependent.ty.collection
+        || !PRIMITIVES.contains(&dependent.ty.name.as_str())
+    {
+        return false;
+    }
+    let Some((base, target)) = principal else {
+        return true;
+    };
+    named(base, target, &constraint.referenced_property).is_some_and(|p| {
+        p.ty == dependent.ty && dependent.nullable == (navigation.nullable || p.nullable)
+    })
 }
 
 fn all_navigations<'a>(
@@ -1098,6 +1146,87 @@ mod tests {
                 Problem::InvalidPartner,
                 Problem::InvalidPartner
             ]
+        );
+    }
+
+    #[test]
+    fn referential_constraints_pair_like_properties() {
+        let constrained = |m: &mut Model, dependent: Property, property: &str, referenced: &str| {
+            ty(m, "A").properties.push(dependent);
+            ty(m, "A").navigation_properties[0].referential_constraints =
+                vec![ReferentialConstraint::new(property, referenced)];
+        };
+        let bk = || Property::new("bk", TypeRef::single("Edm.Int32"));
+        assert_eq!(problems(|m| constrained(m, bk(), "bk", "k")), vec![]);
+        // A target that is no entity type is that problem alone.
+        assert_eq!(
+            problems(|m| {
+                constrained(m, bk(), "bk", "k");
+                ty(m, "A").navigation_properties[0].ty = TypeRef::single("ns.Address");
+                ty(m, "A").navigation_properties[0].partner = None;
+                ty(m, "B").navigation_properties[0].partner = None;
+            }),
+            vec![Problem::NotAnEntityType]
+        );
+        let bad = Problem::InvalidReferentialConstraint;
+        for (dependent, property, referenced) in [
+            (bk(), "nope", "k"),
+            (bk(), "bk", "nope"),
+            // p is an Int64, k an Int32
+            (bk(), "p", "k"),
+            // the navigation is nullable, so the dependent must be
+            (bk().required(), "bk", "k"),
+            (
+                Property::new("bks", TypeRef::collection("Edm.Int32")),
+                "bks",
+                "k",
+            ),
+            (
+                Property::new("at", TypeRef::single("ns.Address")),
+                "at",
+                "k",
+            ),
+        ] {
+            assert_eq!(
+                problems(|m| constrained(m, dependent, property, referenced)),
+                vec![bad],
+                "{property} -> {referenced}"
+            );
+        }
+        // Both sides non-nullable: the dependent may not be nullable either.
+        assert_eq!(
+            problems(|m| {
+                constrained(m, bk(), "bk", "k");
+                ty(m, "A").navigation_properties[0].nullable = false;
+            }),
+            vec![bad]
+        );
+        assert_eq!(
+            problems(|m| {
+                constrained(m, bk().required(), "bk", "k");
+                ty(m, "A").navigation_properties[0].nullable = false;
+            }),
+            vec![]
+        );
+        // The dependent may be the base's; a collection-valued navigation takes none.
+        assert_eq!(
+            first(|m| {
+                ty(m, "B").navigation_properties[0].referential_constraints =
+                    vec![ReferentialConstraint::new("k", "id")];
+            }),
+            bad
+        );
+        assert_eq!(
+            problems(|m| {
+                ty(m, "A")
+                    .properties
+                    .push(Property::new("p2", TypeRef::single("Edm.String")));
+                let mut to_any = NavigationProperty::new("e", TypeRef::single("ns.Entity"));
+                to_any.referential_constraints = vec![ReferentialConstraint::new("id", "id")];
+                ty(m, "A").navigation_properties.push(to_any);
+            }),
+            vec![bad],
+            "id is the base's and not nullable, the navigation is"
         );
     }
 

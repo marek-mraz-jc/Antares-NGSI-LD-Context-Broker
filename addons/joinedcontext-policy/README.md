@@ -20,6 +20,7 @@ token and strips them from every client request.
 | `x-jc-groups` | groups, comma separated |
 | `x-jc-roles` | roles, comma separated; the Endpoint roles (`endpoint:{project}/{endpoint}[/{role}]`) the gateway resolved for this request among them |
 | `x-jc-restricted` | `true` when the caller opted into the restricted signal (O-3 (b)) |
+| `x-jc-did` | the data-space participant a transfer token names (platform DS-02, map K38) |
 
 Each value, and each member of a list, is percent-encoded UTF-8 (RFC 3986:
 the unreserved characters `A-Z a-z 0-9 - . _ ~` stay as they are, every
@@ -32,8 +33,11 @@ UTF-8) is dropped alone and the rest kept; a `x-jc-subject` or
 not anonymous. Unencoded ASCII names read as before.
 
 A request with at least one of these headers is a platform caller. One with
-no `x-jc-subject` and no `x-jc-client` is anonymous and holds the role
-`public`, whatever `x-jc-roles` says beside it.
+`x-jc-did` is a data-space participant: it holds no role and no group,
+whatever `x-jc-roles` and `x-jc-groups` say beside it, so only the Policies
+compiled from its agreement (assignee `did`) grant it anything. One with no
+`x-jc-subject`, no `x-jc-client` and no `x-jc-did` is anonymous and holds the
+role `public`, whatever `x-jc-roles` says beside it.
 
 A request with none of them comes from inside the cluster (the Portal's
 registration sync, plan 5.2 M22; nothing else reaches the broker, the
@@ -81,7 +85,7 @@ refused:
 | `id` | required, unique in the document; named by the access surface and in a load error, never in a refusal |
 | `effect` | `permit` (default) or `prohibit` |
 | `assigner` | optional: the party that granted it (a DID or URL), shown by the access surface (section 4); decides nothing |
-| `assignee.kind` | `user` (`x-jc-subject`), `group`, `role`, `serviceAccount` (`x-jc-client`); `did` is accepted and matches nobody until a header carries it |
+| `assignee.kind` | `user` (`x-jc-subject`), `group`, `role`, `serviceAccount` (`x-jc-client`); `did` (`x-jc-did`) |
 | `operations` | CIM 009 clauses (`5.6.1`, `5.7.2`, ...); the compiler expands the platform's operation names and groups |
 | `validity` | optional half-open `[from, to)`, RFC 3339 |
 | `information` | the grant's selectors; each `entities` member has a `type` (an IRI or a core term), at most one of `id` and `idPattern`; `propertyNames` and `relationshipNames` are the Attributes it shows, none = the whole Entity |
@@ -129,8 +133,18 @@ deciding; a Tenant with no document denies every platform caller.
 7. A refusal says `no policy grants this operation` or `a policy prohibits
    this operation` and names no policy (platform GW6).
 8. A batch is decided member by member (`decide_each`); a notification is
-   decided again for the Subscription's stored subject as a query (5.7.2):
-   `Deny` drops it, a `Filter` narrows it.
+   decided again for the Subscription's stored subject as a query (5.7.2)
+   naming the types of the Entities it carries: `Deny` drops it, a `Filter`
+   narrows it (T-3784).
+9. The tool probe (`offers_each`, MCP D-3) asks whether some request of a
+   clause could be allowed, with an Operation naming nothing. A prohibition
+   without type refuses every clause it lists. Otherwise a read is offered
+   when a permission applies (a read of a type no prohibition names is
+   narrowed, never refused, rules 2 and 4); a write when a permission
+   without information applies, or one naming a type no prohibition covers
+   (a conditional prohibition counts as covering its whole type); a
+   whole-Tenant clause is decided as a request. A call is still decided by
+   rules 1 to 7 (T-3784).
 
 ## 4. The access surface
 

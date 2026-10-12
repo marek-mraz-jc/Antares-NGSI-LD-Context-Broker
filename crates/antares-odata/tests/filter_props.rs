@@ -4,7 +4,10 @@
 //! broker's `q`, exactly the Entities an OData evaluator written here
 //! selects. An absent member is OData `null`: a comparison with it is
 //! false except `ne`, which holds (F3), and `not` of a string function on
-//! it stays `null`, so the Entity is not selected.
+//! it stays `null`, so the Entity is not selected. Arithmetic, the
+//! numeric and string functions, two members compared and the `any`/`all`
+//! lambdas are evaluated on the broker's answer (T-3749); an absent list is
+//! the empty collection the surface shows.
 
 use antares_ops::test_kit::TestBroker;
 use axum::body::Body;
@@ -23,8 +26,10 @@ const SCHEMA: &str = r#"{
   "id": "https://example.org/city", "name": "city",
   "prefixes": {"city": {"prefix_prefix": "city", "prefix_reference": "https://example.org/city/"}},
   "default_prefix": "city",
-  "classes": {"Car": {"slots": ["speed", "label", "on"]}},
-  "slots": {"speed": {"range": "float"}, "label": {"range": "string"}, "on": {"range": "boolean"}}
+  "classes": {"Car": {"slots": ["speed", "label", "on", "tags"]}},
+  "slots": {"speed": {"range": "float"}, "label": {"range": "string"}, "on": {"range": "boolean"},
+            "tags": {"range": "string",
+                     "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "ListProperty"}}}}
 }"#;
 
 /// One Car of the fixture; `None` is an absent Attribute.
@@ -32,6 +37,7 @@ struct Car {
     speed: Option<f64>,
     label: Option<&'static str>,
     on: Option<bool>,
+    tags: Option<&'static [&'static str]>,
 }
 
 const CARS: &[Car] = &[
@@ -39,42 +45,52 @@ const CARS: &[Car] = &[
         speed: Some(5.0),
         label: Some("a.b"),
         on: Some(true),
+        tags: Some(&["a", "b"]),
     },
     Car {
         speed: Some(10.5),
         label: Some("ab\""),
         on: Some(false),
+        tags: Some(&["b"]),
     },
     Car {
         speed: Some(30.0),
         label: None,
         on: Some(true),
+        tags: Some(&[]),
     },
     Car {
         speed: None,
         label: Some("b"),
         on: None,
+        tags: None,
     },
     Car {
         speed: Some(-1.0),
         label: Some("."),
         on: Some(false),
+        tags: Some(&["a"]),
     },
     Car {
         speed: Some(0.0),
         label: Some("\"a"),
         on: Some(true),
+        tags: Some(&["\"a", "b"]),
     },
     Car {
         speed: None,
         label: None,
         on: None,
+        tags: None,
     },
 ];
 
 const NUMBERS: &[f64] = &[-1.0, 0.0, 5.0, 10.5, 30.0];
 const OPS: &[&str] = &["eq", "ne", "gt", "ge", "lt", "le"];
 const FUNCTIONS: &[&str] = &["contains", "startswith", "endswith"];
+const ARITH: &[&str] = &["add", "sub", "mul"];
+const ROUNDING: &[&str] = &["round", "floor", "ceiling"];
+const TAGS: &[&str] = &["a", "b", "\"a"];
 
 /// A filter of the served subset.
 #[derive(Debug, Clone)]
@@ -86,6 +102,24 @@ enum F {
     Function(&'static str, String, bool),
     On,
     OnIs(bool),
+    /// `speed <arith> n <op> m`.
+    Arith(&'static str, f64, &'static str, f64),
+    /// `-speed <op> n`.
+    Neg(&'static str, f64),
+    /// `<rounding>(speed) <op> n`.
+    Rounded(&'static str, &'static str, f64),
+    /// `length(label) <op> n`.
+    Length(&'static str, f64),
+    /// `toupper(label) eq s`.
+    Upper(String),
+    /// `speed <op> speed <arith> n`: two members (F25).
+    Members(&'static str, &'static str, f64),
+    /// `not (speed <arith> n <op> m)`: `not` over an evaluated comparison.
+    NotArith(&'static str, f64, &'static str, f64),
+    /// `tags/any(x:x eq s)`, or `tags/any()` with no tag.
+    Any(Option<&'static str>),
+    /// `tags/all(x:x ne s)`.
+    All(&'static str),
     And(Box<F>, Box<F>),
     Or(Box<F>, Box<F>),
 }
@@ -110,6 +144,16 @@ impl F {
             }
             Self::On => "on".to_owned(),
             Self::OnIs(b) => format!("on eq {b}"),
+            Self::Arith(arith, n, op, m) => format!("speed {arith} {n} {op} {m}"),
+            Self::Neg(op, n) => format!("-speed {op} {n}"),
+            Self::Rounded(f, op, n) => format!("{f}(speed) {op} {n}"),
+            Self::Length(op, n) => format!("length(label) {op} {n}"),
+            Self::Upper(s) => format!("toupper(label) eq '{s}'"),
+            Self::Members(op, arith, n) => format!("speed {op} speed {arith} {n}"),
+            Self::NotArith(arith, n, op, m) => format!("not (speed {arith} {n} {op} {m})"),
+            Self::Any(None) => "tags/any()".to_owned(),
+            Self::Any(Some(t)) => format!("tags/any(x:x eq '{t}')"),
+            Self::All(t) => format!("tags/all(x:x ne '{t}')"),
             Self::And(l, r) => format!("({}) and ({})", l.text(), r.text()),
             Self::Or(l, r) => format!("({}) or ({})", l.text(), r.text()),
         }
@@ -118,14 +162,36 @@ impl F {
     /// The OData answer for `car`; `null` selects nothing.
     fn holds(&self, car: &Car) -> bool {
         match self {
-            Self::Number(op, n) => car.speed.map_or(*op == "ne", |s| match *op {
-                "eq" => (s - n).abs() < f64::EPSILON,
-                "ne" => (s - n).abs() >= f64::EPSILON,
-                "gt" => s > *n,
-                "ge" => s >= *n,
-                "lt" => s < *n,
-                _ => s <= *n,
-            }),
+            Self::Number(op, n) => compare(car.speed, op, *n),
+            Self::Arith(arith, n, op, m) => compare(car.speed.map(|s| apply(arith, s, *n)), op, *m),
+            Self::Neg(op, n) => compare(car.speed.map(|s| -s), op, *n),
+            Self::Rounded(f, op, n) => compare(
+                car.speed.map(|s| match *f {
+                    "round" => s.round(),
+                    "floor" => s.floor(),
+                    _ => s.ceil(),
+                }),
+                op,
+                *n,
+            ),
+            Self::Length(op, n) => compare(
+                car.label
+                    .map(|l| f64::from(u32::try_from(l.chars().count()).unwrap_or(0))),
+                op,
+                *n,
+            ),
+            Self::Upper(s) => car.label.is_some_and(|l| l.to_uppercase() == *s),
+            Self::Members(op, arith, n) => match car.speed {
+                Some(s) => compare(Some(s), op, apply(arith, s, *n)),
+                None => *op == "ne",
+            },
+            Self::NotArith(arith, n, op, m) => {
+                !compare(car.speed.map(|s| apply(arith, s, *n)), op, *m)
+            }
+            Self::Any(t) => car
+                .tags
+                .is_some_and(|tags| t.map_or(!tags.is_empty(), |t| tags.contains(&t))),
+            Self::All(t) => car.tags.is_none_or(|tags| !tags.contains(t)),
             Self::Null(eq) => car.label.is_none() == *eq,
             Self::In(list) => car
                 .speed
@@ -147,6 +213,27 @@ impl F {
     }
 }
 
+/// OData's comparison of a number that may be `null` (absent): false,
+/// except `ne`, which holds (F3).
+fn compare(value: Option<f64>, op: &str, n: f64) -> bool {
+    value.map_or(op == "ne", |s| match op {
+        "eq" => (s - n).abs() < f64::EPSILON,
+        "ne" => (s - n).abs() >= f64::EPSILON,
+        "gt" => s > n,
+        "ge" => s >= n,
+        "lt" => s < n,
+        _ => s <= n,
+    })
+}
+
+fn apply(arith: &str, a: f64, b: f64) -> f64 {
+    match arith {
+        "add" => a + b,
+        "sub" => a - b,
+        _ => a * b,
+    }
+}
+
 fn atom() -> impl Strategy<Value = F> {
     let number = || prop::sample::select(NUMBERS);
     let text = || {
@@ -162,6 +249,25 @@ fn atom() -> impl Strategy<Value = F> {
             .prop_map(|(name, s, negated)| F::Function(name, s, negated)),
         Just(F::On),
         any::<bool>().prop_map(F::OnIs),
+        evaluated(),
+    ]
+}
+
+/// The atoms the residual evaluates (T-3749).
+fn evaluated() -> impl Strategy<Value = F> {
+    let number = || prop::sample::select(NUMBERS);
+    let op = || prop::sample::select(OPS);
+    let arith = || prop::sample::select(ARITH);
+    prop_oneof![
+        (arith(), number(), op(), number()).prop_map(|(a, n, o, m)| F::Arith(a, n, o, m)),
+        (op(), number()).prop_map(|(o, n)| F::Neg(o, n)),
+        (prop::sample::select(ROUNDING), op(), number()).prop_map(|(f, o, n)| F::Rounded(f, o, n)),
+        (op(), prop::sample::select(&[0.0, 1.0, 2.0, 3.0][..])).prop_map(|(o, n)| F::Length(o, n)),
+        prop::sample::select(&["A.B", "B", "AB\"", "a.b"][..]).prop_map(|s| F::Upper(s.to_owned())),
+        (op(), arith(), number()).prop_map(|(o, a, n)| F::Members(o, a, n)),
+        (arith(), number(), op(), number()).prop_map(|(a, n, o, m)| F::NotArith(a, n, o, m)),
+        prop::option::of(prop::sample::select(TAGS)).prop_map(F::Any),
+        prop::sample::select(TAGS).prop_map(F::All),
     ]
 }
 
@@ -211,7 +317,7 @@ async fn broker() -> Result<(TestBroker, Router), String> {
     let view = json!({
         "id": "cars", "tenant": "city", "@context": {"city": CITY},
         "selector": ["city:Car"],
-        "rules": [{"types": ["city:Car"], "attributes": ["city:speed", "city:label", "city:on"]}],
+        "rules": [{"types": ["city:Car"], "attributes": ["city:speed", "city:label", "city:on", "city:tags"]}],
         "operations": ["query_entities", "retrieve_entity"]
     });
     put(&app, "PUT", "/q/views/cars", view.to_string()).await?;
@@ -220,6 +326,12 @@ async fn broker() -> Result<(TestBroker, Router), String> {
         let mut doc = Map::new();
         doc.insert("id".into(), json!(format!("urn:ngsi-ld:Car:{n}")));
         doc.insert("type".into(), json!(format!("{CITY}Car")));
+        if let Some(tags) = car.tags {
+            doc.insert(
+                format!("{CITY}tags"),
+                json!({"type": "ListProperty", "valueList": tags}),
+            );
+        }
         let values = [
             ("speed", car.speed.map(Value::from)),
             ("label", car.label.map(Value::from)),

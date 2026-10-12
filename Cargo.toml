@@ -27,6 +27,7 @@ members = [
     "crates/antares-odata",
     "crates/antares-ogc",
     "crates/antares-ws",
+    "crates/antares-icsr",
     # The reference plugin: built and tested with the workspace so the
     # driver, routing and notification seams cannot drift from it.
     "examples/plugin-example",
@@ -64,6 +65,7 @@ antares-linkml = { path = "crates/antares-linkml" }
 antares-odata = { path = "crates/antares-odata" }
 antares-ogc = { path = "crates/antares-ogc" }
 antares-ws = { path = "crates/antares-ws" }
+antares-icsr = { path = "crates/antares-icsr" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 # The storage driver seams are object-safe AND asynchronous, which no
@@ -249,6 +251,9 @@ codegen-units = 1
 
 [profile.release.package.schemars]
 opt-level = "s"
+
+[profile.release.package.antares-icsr]
+overflow-checks = true
 
 [profile.wasm-release]
 inherits = "release"

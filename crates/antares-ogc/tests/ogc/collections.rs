@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Part 1 Core: `/collections` and `/collections/{c}` (mapping rows C5 to C7, M1, M8).
 
-use crate::common::{fixture, get, href};
+use crate::common::{fixture, get, href, send};
 use axum::http::StatusCode;
 use serde_json::Value;
 
@@ -94,6 +94,65 @@ async fn hidden_and_unknown_collection_are_the_same_404() -> Result<(), String> 
         car_in_empty.status,
         StatusCode::NOT_FOUND,
         "a type another view shows"
+    );
+    Ok(())
+}
+
+/// ADR-0023 rule 12: a view of `*` shows every class of the schema with every slot, as its
+/// NGSI-LD root serves every Entity; its own `q` still narrows the items.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_of_everything_serves_every_collection() -> Result<(), String> {
+    let f = fixture().await?;
+    let view = r#"{"id": "all", "tenant": "city", "selector": ["*"], "q": "speed<50",
+                   "rules": [{"types": ["*"], "attributes": ["*"]}], "operations": ["query_entities"]}"#;
+    let a = send(&f.app, "PUT", "/q/views/all", view, &[]).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let a = get(&f.app, "/x/views/all/ogc/features/collections").await;
+    let ids: Vec<&str> = a
+        .body
+        .get("collections")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.get("id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(ids, ["Car", "Depot", "Stop"], "{}", a.body);
+    let ids = |v: &Value, key: &str| -> Vec<String> {
+        let mut out: Vec<String> = v
+            .as_array()
+            .or_else(|| v.get(key).and_then(Value::as_array))
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        out.sort();
+        out
+    };
+    let root = send(
+        &f.app,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Car&q=speed%3C50&limit=1000",
+        "",
+        &[("NGSILD-Tenant", "city")],
+    )
+    .await;
+    let a = get(
+        &f.app,
+        "/x/views/all/ogc/features/collections/Car/items?limit=1000",
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let want = ids(&root.body, "");
+    assert_eq!(
+        (ids(&a.body, "features"), want.len()),
+        (want.clone(), 2),
+        "{}",
+        a.body
+    );
+    assert_eq!(a.body.get("numberMatched").and_then(Value::as_u64), Some(2));
+    assert!(
+        a.body.pointer("/features/0/properties/secret").is_some(),
+        "every slot shows"
     );
     Ok(())
 }

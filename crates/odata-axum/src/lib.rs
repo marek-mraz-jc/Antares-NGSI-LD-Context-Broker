@@ -22,6 +22,7 @@
 //!     csdl_limits: odata_csdl::Limits::strict(),
 //!     max_header_len: 1024,
 //!     metadata_etag: None,
+//!     custom_options: vec![],
 //! };
 //! // `nest_service`, so both `/odata` and the service root URL `/odata/` reach `GET /`.
 //! let app: axum::Router = axum::Router::new().nest_service("/odata", metadata_router(Arc::new(state)));
@@ -53,6 +54,7 @@ use odata_url::{EdmModel, Format, LimitKind, ODataUri, QueryOptions, UrlError, U
 ///     csdl_limits: odata_csdl::Limits::strict(),
 ///     max_header_len: 1024,
 ///     metadata_etag: None,
+///     custom_options: vec![],
 /// };
 /// assert!(state.service_root.ends_with('/'));
 /// ```
@@ -71,11 +73,16 @@ pub struct ODataState {
     /// The XML metadata document's `ETag` ([`metadata_etag`]), written as
     /// `@odata.metadataEtag` in every JSON answer; `None` writes none.
     pub metadata_etag: Option<String>,
+    /// The custom query options (URL Conventions 5.2: no `$`, no `@`) the service reads on a
+    /// resource path, by their exact name; a request naming any other one, or any one on the
+    /// service document, `$metadata`, `$batch` or `$entity`, is 400.
+    pub custom_options: Vec<String>,
 }
 
 /// A request's URL, parsed against the service's model, and the version its response is
-/// written in (Protocol 4.01 8.2.6, 8.2.7). Custom query options are refused (400, T-3441
-/// row Q27), as NGSI-LD refuses an unknown parameter.
+/// written in (Protocol 4.01 8.2.6, 8.2.7). A custom query option the state does not name in
+/// [`ODataState::custom_options`] is refused (400, T-3441 row Q27), as NGSI-LD refuses an
+/// unknown parameter.
 ///
 /// ```
 /// # use std::sync::Arc;
@@ -93,6 +100,7 @@ pub struct ODataState {
 /// #     csdl_limits: odata_csdl::Limits::strict(),
 /// #     max_header_len: 1024,
 /// #     metadata_etag: None,
+/// #     custom_options: vec![],
 /// # };
 /// let app: Router = Router::new().route("/{*rest}", get(handler)).with_state(Arc::new(state));
 /// ```
@@ -135,7 +143,13 @@ impl ODataRequest {
         };
         let uri = odata_url::parse(&relative, &EdmModel(&state.model), &state.url_limits)
             .map_err(|error| url_error(&error, path.len()).with_version(version))?;
-        if options(&uri).is_some_and(|options| !options.custom.is_empty()) {
+        let resource = matches!(uri, ODataUri::Resource { .. });
+        let unknown = |options: &QueryOptions| {
+            options.custom.iter().any(|(name, _)| {
+                !resource || !state.custom_options.iter().any(|known| known == name)
+            })
+        };
+        if options(&uri).is_some_and(unknown) {
             return Err(ODataErrorResponse::new(
                 StatusCode::BAD_REQUEST,
                 "BadRequest",
@@ -236,7 +250,7 @@ impl IntoResponse for ODataErrorResponse {
 /// use axum::http::StatusCode;
 /// use odata_axum::url_error;
 /// use odata_url::{Feature, UrlError, UrlErrorKind};
-/// let refused = UrlError { kind: UrlErrorKind::NotImplemented(Feature::Search), offset: 10 };
+/// let refused = UrlError { kind: UrlErrorKind::NotImplemented(Feature::Index), offset: 10 };
 /// assert_eq!(url_error(&refused, 9).status, StatusCode::NOT_IMPLEMENTED);
 /// let unknown = UrlError { kind: UrlErrorKind::Unresolved, offset: 0 };
 /// assert_eq!(url_error(&unknown, 6).status, StatusCode::NOT_FOUND);
@@ -301,6 +315,7 @@ pub fn url_error(error: &UrlError, path_len: usize) -> ODataErrorResponse {
 /// #     csdl_limits: odata_csdl::Limits::strict(),
 /// #     max_header_len: 1024,
 /// #     metadata_etag: None,
+/// #     custom_options: vec![],
 /// # };
 /// let app: axum::Router = axum::Router::new().nest_service("/odata", odata_axum::metadata_router(Arc::new(state)));
 /// ```
@@ -575,7 +590,12 @@ fn body(
             Format::Json => Ok(Body::Json(MetadataLevel::Minimal)),
             Format::Xml => Ok(Body::Xml),
             Format::Atom => Err(not_acceptable()),
-            Format::MediaType(media) => media_type(media)?.ok_or_else(not_acceptable),
+            // Written percent-encoded by a form encoder, meant decoded (T-3742); the URL
+            // parser refused an escape that does not decode.
+            Format::MediaType(media) => {
+                media_type(&odata_url::percent_decoded(media).unwrap_or_default())?
+                    .ok_or_else(not_acceptable)
+            }
         };
     }
     let Some(accept) = header(headers, ACCEPT.as_str(), max)? else {

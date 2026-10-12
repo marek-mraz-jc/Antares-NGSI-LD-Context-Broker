@@ -119,22 +119,24 @@ and writes the Core and Capabilities terms the schema states (section 6),
 T-3721 (minted keys, C5 required properties), T-3725 (typed `$filter`
 literals), T-3726 (batch framing and `continue-on-error`), T-3730 (entity
 references), T-3737 (one `Content-Length` on `HEAD`), T-3738 (`$entity`
-404) and T-3760 (a bind to a missing Entity is 400):
+404) and T-3760 (a bind to a missing Entity is 400); and by T-3761 (a
+`ProductID` naming an absent Product is 400), written from its branch run
+(surfaces-conformance 38152573824 on `30ca1c7`):
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| Minimal | 178 | 95 | 20 | 65.2 % |
-| Intermediate | 246 | 90 | 14 | 73.2 % |
-| Advanced | 199 | 303 | 65 | 39.6 % |
-| **All** (suite summary) | 623 | 488 | 99 | 56.1 % |
+| Minimal | 197 | 76 | 20 | 72.2 % |
+| Intermediate | 266 | 70 | 14 | 79.2 % |
+| Advanced | 275 | 247 | 45 | 52.7 % |
+| **All** (suite summary) | 738 | 393 | 79 | 65.3 % |
 
-One earlier pass is a skip now, by the suite's own rule: `POST with
+Measured by surfaces-conformance 38241435755 on `513fa62` (train 20261012-1042), written by tasks/train.
+
+One earlier pass was a skip after train 8, by the suite's own rule: `POST with
 nonexistent foreign key` posts a `ProductDescription` whose `ProductID` names
 no `Product` and skips on 201, since referential constraints are a SHOULD
-(Protocol 11.4.2). Dev answered it with a 4xx before train 8; with train 8
-the create succeeds, because the broker checks a reference only on a bind
-(T-3760), not in a plain property. Enforcing a LinkML slot whose range is a class as a reference is
-T-3761.
+(Protocol 11.4.2). With T-3761 the schema states `ProductID` as the
+referential constraint of the `Product` navigation, and the create is 400.
 
 Before train 8 the baseline stood at 550 passed, 563 failed and 97 skipped
 (Minimal 62.3 %, Intermediate 65.8 %, Advanced 31.5 %).
@@ -146,8 +148,9 @@ The first baseline (T-3714) stood at Minimal 37.5 %, Intermediate 28.2 % and
 Advanced 11.7 % (254 passed, 840 failed, 116 skipped).
 
 The suite skips whole test scripts on what `$metadata` declares:
-`KeyAsSegmentSupported` false on the container, search and compute
-unsupported on `Products`. Until T-3723 the container also declared
+`KeyAsSegmentSupported` false on the container. Until T-3750 and T-3936
+it also skipped the search and compute scripts, which `Products` declared
+unsupported. Until T-3723 the container also declared
 `BatchSupported` false, and the suite skipped every `$batch` script.
 
 ## 6. Failing areas
@@ -164,14 +167,16 @@ Each failing area is a task, or a decision with its reason:
 | A create without a key was refused (`MissingKey`); the service did not mint one | 11.4.2 to 11.4.5, 11.4.12 to 11.4.15, 8.1.5, 8.2.3, 8.2.5, 8.2.8 | T-3721: a `Guid` or `String` key is minted (`Core.ComputedDefaultValue`, mapping W1), and a LinkML `required` member left out or null is 400 `MissingProperty` (mapping C5; the schema marks `Products.Name`, `Products.Price` and `ProductDescriptions.Description` required, as the suite's contract does) |
 | Edm types beyond String, Double and Int64, Core and Capabilities annotations from the LinkML schema | 4.4, 5.1.1.x, 5.1.4 to 5.1.8, 14.1, vocab_* | T-3722: the schema's `edm_type`, `description`, `odata_computed`, `odata_immutable` and the class's `odata_insertable`, `odata_updatable`, `odata_deletable` (`ci/odata-compliance/schema.json`, as the reference model declares them); the type scripts' metadata tests pass, their filters stay in the rows below (functions, `cast`, arithmetic, `binary'…'` and `duration'…'` literals, the `f` suffix of a Single) |
 | The vocabulary scripts look for the terms on an EntityType named `Product` in the first schema of `$metadata` (`Antares.NgsiLd`, the surface's own vocabulary) and for set restrictions only in external `<Annotations Target="….Container/Set">` blocks | vocab_core_*, vocab_capabilities_*, 14.1 | a limit of the suite: CSDL 14.3 lets an annotation sit inline on its target, which is where the surface writes it, and an EntitySet here is named after its class and so is its EntityType (`Products`). The terms are there: `ReadOnlyItems` refuses `POST`, `PATCH` and `DELETE` with 405 |
-| A create naming a `ProductID` no Product has is accepted, so the suite skips its foreign-key test (it passed on dev only because a ProductDescriptions create without a key was 400 `MissingKey`, before T-3720 and T-3721) | 11.4.15 | not supported, by design: `ProductID` is a plain String Attribute and NGSI-LD has no referential constraint to check it against; Protocol 11.4.2 makes the check a SHOULD. A bind (`Product@odata.bind`) to a missing Product is 400 (T-3760) |
+| A create naming a `ProductID` no Product has was accepted, so the suite skipped its foreign-key test (it passed on dev only because a ProductDescriptions create without a key was 400 `MissingKey`, before T-3720 and T-3721) | 11.4.15 | T-3761: the schema's `Product` navigation carries `odata_referential_constraint: ProductID` (`ci/odata-compliance/schema.json`), `$metadata` states the `ReferentialConstraint`, and a create, replace or merge whose `ProductID` names an absent or hidden Product is 400 `BadRequest` (mapping row R6); a bind (`Product@odata.bind`) to a missing Product is 400 (T-3760) |
 | An enum as an `EnumType` with integer members (`Status eq 1`, flags) | 5.3, 5.1.1 | not supported, by design: mapping section 3.4 keeps an enum an `Edm.String` with `Validation.AllowedValues`, because NGSI-LD values such as `pm2.5` are no CSDL member names |
 | `BatchSupported` was declared false while `$batch` is served; HEAD on a collection or an Entity answered 501 | 11.4.9.x, 11.4.11 | T-3723: declared and served; the batch scripts run, their failures are in the baseline |
 | Multipart `$batch` framed with bare LF line ends; a JSON batch under `OData-MaxVersion: 4.0`; independent requests and `dependsOn` after a failure | 11.4.9, 11.4.9.1, 11.4.9.3, 19_json_batch | T-3726 |
 | Change sets and atomicity groups, Content-ID references | 11.4.9.1, 11.4.9.3, 19_json_batch | not supported, by design: ADR-0024 section 5 (W26), mapping row C18 |
 | A comparison or `in` between a property and a literal of another type answers 200 with no rows; an Int64 literal past its range is accepted | 11.3.6, 11.2.5.1, 5.1.1.5 | T-3725 |
 | Options inside `$expand(...)` other than `$select` and `$expand` (Q5) | 11.2.5.9, 11.3.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
-| `$apply`, `$compute`, `$index`, `$search`, `$deltatoken` and delta links | 11.2.5.4.x, 11.2.5.13, 11.2.4.1, 11.2.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
+| `$apply`, `$index`, `$deltatoken` and delta links | 11.2.5.4.x, 11.2.4.1, 11.2.8 | not supported, by design: ADR-0024 section 5 answers them 501; `$apply` is T-3937 |
+| `$compute` answered 501 | 11.2.5.13 | T-3936: served, each item evaluated per Entity on what the view shows |
+| `$search` answered 501 | 11.2.5.6 | T-3750: served over the String properties the view shows |
 | Filter functions outside the F-row subset (date and time, arithmetic, `length`, `indexof`, `substring`, `divby`, `matchesPattern`, `isof`, `cast`) | 11.3.1 to 11.3.4, 11.3.9, 11.5.x | not supported, by design: ADR-0024 section 5; the mapped rows still at 501 are T-3686 |
 | Actions and functions, bound or unbound | 11.2.10, 11.4.13, 12.1, 12.2 | not supported, by design: an NGSI-LD view has no operations (ADR-0024 section 5) |
 | Media entities and stream properties | 11.2.12 | not supported, by design: ADR-0024 section 5 |

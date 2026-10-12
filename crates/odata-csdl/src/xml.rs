@@ -214,7 +214,22 @@ impl<W: Write> Xml<W> {
         if let Some(partner) = &navigation.partner {
             attrs.push(("Partner", partner));
         }
-        self.annotated("NavigationProperty", &attrs, &navigation.annotations)
+        let constraints = &navigation.referential_constraints;
+        if constraints.is_empty() {
+            return self.annotated("NavigationProperty", &attrs, &navigation.annotations);
+        }
+        self.open("NavigationProperty", &attrs)?;
+        for c in constraints {
+            self.empty(
+                "ReferentialConstraint",
+                &[
+                    ("Property", &c.property),
+                    ("ReferencedProperty", &c.referenced_property),
+                ],
+            )?;
+        }
+        self.annotations(&navigation.annotations)?;
+        self.close("NavigationProperty")
     }
 
     fn term(&mut self, term: &Term) -> std::io::Result<()> {

@@ -37,6 +37,7 @@
 
 mod error;
 pub mod mapping;
+mod names;
 mod operation;
 mod scan;
 pub mod views;
@@ -71,7 +72,7 @@ pub mod policy {
 /// delivers notifications (WebSocket).
 pub use antares_api::{build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound};
 /// The error a sink's endpoint check answers with.
-pub use antares_model::NgsiError;
+pub use antares_model::{NgsiError, TenantId};
 
 /// The request bounds a surface applies to what it parses itself (a
 /// WebSocket message never passes the HTTP bounds layer).
@@ -81,7 +82,7 @@ pub mod bounds {
 
 /// The federation transport contract (ADR-0025 rule 8, ADR-0027 section 9),
 /// for a crate that serves some forwards in process.
-pub use antares_api::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
+pub use antares_api::{AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 
 /// The URL this broker is reached at (`ANTARES_PUBLIC_URL`, else the
 /// request's `Host`), for a surface whose documents name its resources by
@@ -125,21 +126,28 @@ pub struct ViewOps {
     tenant: antares_model::TenantId,
     operations: Vec<OperationId>,
     mapping: Option<Arc<mapping::Mapping>>,
+    /// The core @context with the view's own merged in: what a name a caller
+    /// writes in an NGSI-LD parameter means here (`names.rs`).
+    names: Arc<antares_jsonld::Context>,
 }
 
 /// The Entity types a caller may see through a view and the Attributes
 /// each may show, as IRIs (ADR-0023 rule 5): made by [`ViewOps::visible`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Visible {
-    /// Each rule's types and the Attributes it shows, `pick` and `omit`
-    /// applied: an Attribute is shown when a rule of its type shows it.
-    rules: Vec<(BTreeSet<String>, BTreeSet<String>)>,
+    /// Each rule's types and the Attributes it shows; `None` for an
+    /// engine's grant over the whole Entity (`Rule::every_attribute`), which
+    /// shows every Attribute of its types.
+    rules: Vec<(BTreeSet<String>, Option<BTreeSet<String>>)>,
+    /// The filter's `pick` (empty keeps every name) and `omit`, applied to
+    /// every rule.
+    pick: BTreeSet<String>,
+    omit: BTreeSet<String>,
     /// Attributes removed per type, on top of the rules.
     omit_by_type: BTreeMap<String, BTreeSet<String>>,
     /// A filter without rules narrows by none (a `*` view, ADR-0023 rule
-    /// 12): every type, and every Attribute its `pick` keeps and its `omit`
-    /// does not remove, as those two sets.
-    every: Option<(BTreeSet<String>, BTreeSet<String>)>,
+    /// 12): every type and every Attribute, less `pick` and `omit`.
+    every: bool,
 }
 
 impl Visible {
@@ -152,7 +160,7 @@ impl Visible {
     #[must_use]
     pub fn shows_type(&self, name: &str) -> bool {
         let ty = expand(name);
-        self.every.is_some() || self.rules.iter().any(|(types, _)| types.contains(&ty))
+        self.every || self.rules.iter().any(|(types, _)| types.contains(&ty))
     }
 
     /// Whether an Entity of type `ty` may show Attribute `attr`.
@@ -163,23 +171,24 @@ impl Visible {
     #[must_use]
     pub fn shows_attribute(&self, ty: &str, attr: &str) -> bool {
         let (ty, attr) = (expand(ty), expand(attr));
-        !self
-            .omit_by_type
-            .get(&ty)
-            .is_some_and(|gone| gone.contains(&attr))
-            && (self.every.as_ref().is_some_and(|(pick, omit)| {
-                (pick.is_empty() || pick.contains(&attr)) && !omit.contains(&attr)
-            }) || self
-                .rules
-                .iter()
-                .any(|(types, attrs)| types.contains(&ty) && attrs.contains(&attr)))
+        let kept = (self.pick.is_empty() || self.pick.contains(&attr))
+            && !self.omit.contains(&attr)
+            && !self
+                .omit_by_type
+                .get(&ty)
+                .is_some_and(|gone| gone.contains(&attr));
+        kept && (self.every
+            || self.rules.iter().any(|(types, attrs)| {
+                types.contains(&ty) && attrs.as_ref().is_none_or(|a| a.contains(&attr))
+            }))
     }
 
-    /// What `filter`'s rules show: each rule's types with its Attributes,
-    /// less what `pick` leaves out and `omit` and `omit_by_type` remove; a
-    /// filter without rules shows every type and Attribute, less the same.
-    /// A rule's condition is not read: it decides which Entities show the
-    /// Attributes, not which Attributes there are.
+    /// What `filter`'s rules show: each rule's types with its Attributes
+    /// (every one for a rule over the whole Entity), less what `pick` leaves
+    /// out and `omit` and `omit_by_type` remove; a filter without rules
+    /// shows every type and Attribute, less the same. A rule's condition is
+    /// not read: it decides which Entities show the Attributes, not which
+    /// Attributes there are.
     ///
     /// ```
     /// use antares_ops::policy::{Filter, Rule};
@@ -199,26 +208,24 @@ impl Visible {
     pub fn from_filter(filter: &policy::Filter) -> Self {
         let set =
             |names: &[String]| -> BTreeSet<String> { names.iter().map(|n| expand(n)).collect() };
-        let (pick, omit) = (set(&filter.pick), set(&filter.omit));
         let rules = filter
             .rules
             .iter()
             .map(|rule| {
-                let mut attrs = set(&rule.attributes);
-                attrs.retain(|a| (pick.is_empty() || pick.contains(a)) && !omit.contains(a));
+                let attrs = (!rule.every_attribute).then(|| set(&rule.attributes));
                 (set(&rule.types), attrs)
             })
             .collect();
-        let omit_by_type = filter
-            .omit_by_type
-            .iter()
-            .map(|(t, attrs)| (expand(t), set(attrs)))
-            .collect();
-        let every = filter.rules.is_empty().then_some((pick, omit));
         Self {
             rules,
-            omit_by_type,
-            every,
+            pick: set(&filter.pick),
+            omit: set(&filter.omit),
+            omit_by_type: filter
+                .omit_by_type
+                .iter()
+                .map(|(t, attrs)| (expand(t), set(attrs)))
+                .collect(),
+            every: filter.rules.is_empty(),
         }
     }
 }
@@ -372,6 +379,7 @@ impl Ops {
             tenant,
             operations,
             mapping,
+            context,
             ..
         }) = table.get(id)
         else {
@@ -398,6 +406,7 @@ impl Ops {
                 .filter_map(|o| OperationId::from_id(o))
                 .collect(),
             mapping,
+            names: Arc::new(names::of_view(context.as_deref())?),
         };
         // Only views loaded now stay cached: a removed one goes with the
         // first view served after its removal.
@@ -511,6 +520,16 @@ impl ViewOps {
     #[must_use]
     pub fn allows(&self, op: OperationId) -> bool {
         self.operations.contains(&op)
+    }
+
+    /// [`Ops::forward_in_process`] through this view: the forward is
+    /// served as a request to the view's Tenant through the view is, the
+    /// view's rules composed with that Tenant's engine (ADR-0023 rule 5,
+    /// ADR-0025 rule 5).
+    pub async fn forward_in_process(&self, req: BuiltForward<'_>, self_url: &str) -> ForwardAnswer {
+        self.inner
+            .forward_through(Some(self.view.id()), req, self_url)
+            .await
     }
 
     /// The one Tenant the view serves (ADR-0023 rule 10).
@@ -826,39 +845,39 @@ impl Ops {
     /// the default Tenant and a snapshot is never inherited. The answer is
     /// read as an HTTP one is: the body up to the federation response cap,
     /// the source's `NGSILD-Warning` values up to their cap.
+    ///
+    /// Past [`antares_api::bounds::MAX_IN_PROCESS_CALL_DEPTH`] the forward
+    /// is not made, in process or over HTTP (rule 3): it answers 508 for an
+    /// `exclusive` or `redirect` registration, whose failure is the
+    /// operation's answer, and 504 otherwise, which the merge reports as
+    /// code 199 (6.3.17), as a loop is.
     pub async fn forward_in_process(&self, req: BuiltForward<'_>, self_url: &str) -> ForwardAnswer {
+        self.forward_through(None, req, self_url).await
+    }
+
+    /// [`Self::forward_in_process`] through the view `view` (T-3935): the
+    /// engine of the target learns it as for a request through that view.
+    async fn forward_through(
+        &self,
+        view: Option<&str>,
+        req: BuiltForward<'_>,
+        self_url: &str,
+    ) -> ForwardAnswer {
+        if antares_api::state::in_process_depth() >= antares_api::bounds::MAX_IN_PROCESS_CALL_DEPTH
+        {
+            let status = if req.proxied() { 508 } else { 504 };
+            return (status, serde_json::Value::Null, Vec::new());
+        }
         // A target outside `self_url` is the transport's mistake, and a
         // header 5.9.2 let through that HTTP could not send either: the
         // forward is not made in process, and the answer says so (502).
-        let inner = req
-            .target()
-            .and_then(|target| {
-                target
-                    .strip_prefix(self_url)
-                    .filter(|rest| rest.starts_with('/'))
-                    .map(str::to_owned)
-            })
-            .and_then(|path| {
-                let mut inner = axum::http::Request::builder()
-                    .method(req.method().clone())
-                    .uri(path);
-                for (name, value) in req.headers() {
-                    inner = inner.header(name.as_str(), value.as_str());
-                }
-                // The HTTP client states the length of what it sends.
-                let body = match req.body() {
-                    Some(bytes) => {
-                        inner = inner.header(axum::http::header::CONTENT_LENGTH, bytes.len());
-                        Body::from(bytes.to_vec())
-                    }
-                    None => Body::empty(),
-                };
-                inner.body(body).ok()
-            });
-        let Some(inner) = inner else {
+        let Some(inner) = in_process_request(&req, self_url) else {
             return (502, serde_json::Value::Null, Vec::new());
         };
-        let answer = self.state.call(req.subject(), inner).await;
+        let answer = self
+            .state
+            .call_on_task(view, req.subject().clone(), inner)
+            .await;
         let status = answer.status().as_u16();
         let warnings = answer
             .headers()
@@ -874,6 +893,82 @@ impl Ops {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or(serde_json::Value::Null);
         (status, body, warnings)
+    }
+}
+
+/// The request [`Ops::forward_in_process`] hands the router for `req`: its
+/// method, the path and query of its target after `self_url`, its headers
+/// and its payload with the length the HTTP client would state, and nothing
+/// else (ADR-0025 equivalence layer 1). `None` when the target does not lie
+/// under `self_url` or a header is one no request can carry.
+#[must_use]
+pub fn in_process_request(
+    req: &BuiltForward<'_>,
+    self_url: &str,
+) -> Option<axum::http::Request<Body>> {
+    let path = req.target().and_then(|target| {
+        target
+            .strip_prefix(self_url)
+            .filter(|rest| rest.starts_with('/'))
+            .map(str::to_owned)
+    })?;
+    let mut inner = axum::http::Request::builder()
+        .method(req.method().clone())
+        .uri(path);
+    for (name, value) in req.headers() {
+        inner = inner.header(name.as_str(), value.as_str());
+    }
+    // The HTTP client states the length of what it sends.
+    let body = match req.body() {
+        Some(bytes) => {
+            inner = inner.header(axum::http::header::CONTENT_LENGTH, bytes.len());
+            Body::from(bytes.to_vec())
+        }
+        None => Body::empty(),
+    };
+    inner.body(body).ok()
+}
+
+/// The export grants of internal context sources (ADR-0025 rule 5), kept
+/// under their reserved tenant, and the admin routes a module adds beside
+/// `/q/views`.
+impl Ops {
+    /// Every stored grant document.
+    ///
+    /// # Errors
+    /// The store's.
+    pub async fn grant_docs(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.state.grant_docs().await
+    }
+
+    /// The stored grant document `id`, if there is one.
+    ///
+    /// # Errors
+    /// The store's.
+    pub async fn grant_doc(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
+        self.state.grant_doc(id).await
+    }
+
+    /// Store grant document `id`; `true` when it replaced one.
+    ///
+    /// # Errors
+    /// The store's.
+    pub async fn put_grant_doc(&self, id: &str, doc: serde_json::Value) -> Result<bool, String> {
+        self.state.put_grant_doc(id, doc).await
+    }
+
+    /// Remove grant document `id`; `false` when there was none.
+    ///
+    /// # Errors
+    /// The store's.
+    pub async fn delete_grant_doc(&self, id: &str) -> Result<bool, String> {
+        self.state.delete_grant_doc(id).await
+    }
+
+    /// Serve `routes` on the admin surface, relative to `/q` and behind its
+    /// credential. Before the router is built.
+    pub fn add_admin(&self, routes: Router) {
+        self.state.views.add_admin(routes);
     }
 }
 
@@ -936,6 +1031,16 @@ pub mod test_kit {
     use super::{mount, AppState, Surface};
     use std::sync::Arc;
 
+    /// The `/q` credential [`TestBroker::with_admin_auth`] takes, for the
+    /// surface crates, which reach the API crate through this one alone.
+    pub use antares_api::admin_auth::AdminAuth;
+
+    /// Let this process forward to loopback and private addresses, as a
+    /// test's own listener is one (the egress policy refuses them otherwise).
+    pub fn allow_private_egress() {
+        antares_jsonld::allow_private_egress(true);
+    }
+
     /// One broker: the NGSI-LD API, the admin surface and the surfaces a
     /// test mounts, over one in-memory store.
     pub struct TestBroker {
@@ -976,6 +1081,14 @@ pub mod test_kit {
             Ok(Self { state, reload })
         }
 
+        /// One retention sweep at `now` (T-3900), as the minute loop runs it.
+        pub async fn sweep_retention(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Vec<crate::views::retention::Deleted> {
+            self.reload.sweep_retention(now).await
+        }
+
         /// Another pod over the same store: its own view table, loaded and
         /// reloaded from the store like this one's.
         ///
@@ -997,6 +1110,22 @@ pub mod test_kit {
                 state: self.state.with_policy(engine),
                 reload: self.reload,
             }
+        }
+
+        /// The same broker with the forward transport `make` builds
+        /// registered (ADR-0025 rule 8), as the composition root registers
+        /// it.
+        ///
+        /// # Errors
+        /// When a transport is registered already.
+        pub fn with_forward_transport(
+            self,
+            make: impl FnOnce(super::Ops) -> Arc<dyn super::ForwardTransport>,
+        ) -> Result<Self, String> {
+            Ok(Self {
+                state: super::with_forward_transport(self.state, make)?,
+                reload: self.reload,
+            })
         }
 
         /// The same broker with `/q` behind the admin credential (T-3569).
@@ -1220,6 +1349,59 @@ mod tests {
             [true, false, false, false]
         );
         assert!(!Visible::default().shows_type(&iri("Car")));
+    }
+
+    /// T-3798: an engine's grant over the whole Entity (`every_attribute`,
+    /// ADR-0023 rule 11 as amended by T-3637) shows every Attribute of its
+    /// types, less `pick`, `omit` and `omit_by_type`, and none of a type no
+    /// rule names.
+    #[test]
+    fn a_rule_over_the_whole_entity_shows_every_attribute_of_its_types() {
+        let iri = |n: &str| format!("https://e.org/{n}");
+        let whole = |types: &[&str]| policy::Rule {
+            types: types.iter().map(|t| iri(t)).collect(),
+            every_attribute: true,
+            ..policy::Rule::default()
+        };
+        let open = Visible::from_filter(&policy::Filter {
+            rules: vec![whole(&["Car"])],
+            ..policy::Filter::default()
+        });
+        assert_eq!(
+            [
+                open.shows_type(&iri("Car")),
+                open.shows_attribute(&iri("Car"), &iri("speed")),
+                open.shows_type(&iri("Bus")),
+                open.shows_attribute(&iri("Bus"), &iri("speed")),
+            ],
+            [true, true, false, false]
+        );
+        let narrowed = Visible::from_filter(&policy::Filter {
+            rules: vec![
+                whole(&["Car", "Bus"]),
+                policy::Rule {
+                    types: vec![iri("Tram")],
+                    attributes: vec![iri("speed")],
+                    ..policy::Rule::default()
+                },
+            ],
+            pick: vec![iri("speed"), iri("vin"), iri("colour")],
+            omit: vec![iri("vin")],
+            omit_by_type: BTreeMap::from([(iri("Bus"), vec![iri("colour")])]),
+            ..policy::Filter::default()
+        });
+        assert_eq!(
+            [
+                narrowed.shows_attribute(&iri("Car"), &iri("speed")),
+                narrowed.shows_attribute(&iri("Car"), &iri("colour")),
+                narrowed.shows_attribute(&iri("Car"), &iri("vin")),
+                narrowed.shows_attribute(&iri("Car"), &iri("owner")),
+                narrowed.shows_attribute(&iri("Bus"), &iri("colour")),
+                narrowed.shows_attribute(&iri("Tram"), &iri("colour")),
+                narrowed.shows_type(&iri("Truck")),
+            ],
+            [true, true, false, false, false, false, false]
+        );
     }
 
     #[test]

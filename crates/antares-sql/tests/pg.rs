@@ -617,6 +617,42 @@ async fn the_postgres_store_keeps_the_driver_contract() {
     antares_store::contract::run_temporal_contract(&store, &a, &b, &prefix).await;
 }
 
+/// T-3914: the same isolation walk as the in-process stores, on fresh
+/// Tenants (the purge empties `a`). `_` would be a LIKE wildcard; `x`
+/// extends the other name. The default Tenant is `b`, never purged.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_postgres_store_keeps_tenants_apart() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let t = |s: String| TenantId::new(&s).expect("tenant");
+    let pairs = [
+        (t(format!("iso{run}_b")), t(format!("iso{run}xb"))),
+        (t(format!("isp{run}xb")), t(format!("isp{run}_b"))),
+        (t(format!("isq{run}")), t(format!("isq{run}x"))),
+        (t(format!("isr{run}")), TenantId::default()),
+    ];
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    for (n, (a, b)) in pairs.iter().enumerate() {
+        for t in [a, b] {
+            pg::ensure_tenant(&pool, t).await.expect("tenant row");
+        }
+        antares_store::contract::run_tenant_isolation_contract(
+            &store,
+            &store,
+            a,
+            b,
+            &format!("pgiso{run}{n}"),
+        )
+        .await;
+    }
+}
+
 /// The tenants the broker mints for itself are not customer accounts, and
 /// `/q/tenants` reads this list. They still hold a row: on Postgres this table
 /// IS the broker's tenant enumeration — `subscription_tenants` reads it,

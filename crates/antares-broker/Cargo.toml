@@ -24,7 +24,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 antares-bus = { workspace = true }
 # the outbound-client crate: its crypto provider is installed from main
-antares-jsonld = { workspace = true }
+antares-jsonld = { workspace = true, features = ["fetch"] }
 antares-model = { workspace = true }
 antares-store = { workspace = true }
 antares-sql = { workspace = true, features = ["postgres"] }
@@ -56,6 +56,7 @@ antares-linkml = { workspace = true, optional = true }
 antares-odata = { workspace = true, optional = true }
 antares-ogc = { workspace = true, optional = true }
 antares-ws = { workspace = true, optional = true }
+antares-icsr = { workspace = true, optional = true }
 
 [features]
 # tokio-console in dev — build with RUSTFLAGS="--cfg tokio_unstable"
@@ -109,9 +110,14 @@ ogc = ["views", "dep:antares-ogc"]
 # `/x/views/{view}/ws` (`ws-views`); its sink serves `urn:antares:ws:`.
 ws = ["dep:antares-ops", "dep:antares-ws"]
 
+# Internal context sources (ADR-0025, T-3520): a registration whose endpoint
+# is one of ANTARES_SELF_URLS is served in process under the target Tenant's
+# export grant (`/q/grants`) and engine.
+internal-csr = ["views", "dep:antares-icsr"]
+
 # Every surface the broker serves (ADR-0027 Consequences, T-3636): what
 # `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
-# sets it; the platform image builds `full,jc-policy` (image-jc.yml).
+# sets it; the platform image builds `full,jc-policy,linkml` (image-jc.yml).
 full = ["views", "mcp", "odata", "ogc", "ws"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
@@ -129,6 +135,8 @@ antares-api = { workspace = true, features = ["test-kit"] }
 # mqtt e2e: sync rumqttc client against a live mosquitto
 rumqttc = { workspace = true }
 serde_json = { workspace = true }
+# the views differential (T-3777): generated views and policies
+proptest = { workspace = true }
 
 [lints]
 workspace = true

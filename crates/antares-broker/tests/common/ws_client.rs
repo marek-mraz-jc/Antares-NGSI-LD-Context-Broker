@@ -13,17 +13,24 @@ use std::time::Duration;
 pub struct Socket(TcpStream);
 
 impl Socket {
-    /// Upgrade `path` on `port`, naming `tenant` when given.
-    pub fn open(port: u16, path: &str, tenant: Option<&str>) -> Result<Self, String> {
+    /// Upgrade `path` on `port` with `headers`; [`Self::next`] gives up after
+    /// `silence`.
+    pub fn open(
+        port: u16,
+        path: &str,
+        headers: &[(String, String)],
+        silence: Duration,
+    ) -> Result<Self, String> {
         let mut s = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
-        s.set_read_timeout(Some(Duration::from_secs(2)))
+        s.set_read_timeout(Some(silence))
             .map_err(|e| e.to_string())?;
         let req = format!(
             "GET {path} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{}\r\n",
-            tenant
-                .map(|t| format!("NGSILD-Tenant: {t}\r\n"))
-                .unwrap_or_default()
+            headers
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}\r\n"))
+                .collect::<String>()
         );
         s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
         // the answer's head, a byte at a time so no frame is read with it
@@ -58,7 +65,7 @@ impl Socket {
         self.0.write_all(&frame).map_err(|e| e.to_string())
     }
 
-    /// The next text message as JSON; `None` on silence (2 s) or an end.
+    /// The next text message as JSON; `None` on silence or an end.
     /// Control frames (Ping) are skipped; the server sends unmasked frames.
     pub fn next(&mut self) -> Option<Value> {
         loop {

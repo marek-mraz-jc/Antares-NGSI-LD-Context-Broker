@@ -50,19 +50,21 @@ mod literal;
 mod model;
 mod path;
 mod query;
+mod search;
 
 use std::borrow::Cow;
 
 pub use ast::{
-    CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key, KeyValue, Levels,
-    Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions, Segment, SelectItem,
-    Shape,
+    ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key,
+    KeyValue, Levels, Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions,
+    Segment, SelectItem, Shape,
 };
 #[cfg(feature = "edm")]
 pub use edm::EdmModel;
 pub use error::{Feature, LimitKind, UrlError, UrlErrorKind};
 pub use limits::Limits;
 pub use model::{Member, Model};
+pub use search::Search;
 
 use cursor::Cursor;
 use expr::{Budget, Scope};
@@ -83,8 +85,8 @@ use query::{Allowed, Query};
 /// #     fn entity_set(&self, name: &str) -> Option<&str> { (name == "Buildings").then_some("B") }
 /// #     fn member(&self, _: &str, _: &str) -> Option<Member<'_>> { None }
 /// # }
-/// let refused = parse("Buildings?$search=blue", &Service, &Limits::strict()).unwrap_err();
-/// assert_eq!(refused.kind, UrlErrorKind::NotImplemented(Feature::Search));
+/// let refused = parse("Buildings?$index=1", &Service, &Limits::strict()).unwrap_err();
+/// assert_eq!(refused.kind, UrlErrorKind::NotImplemented(Feature::Index));
 /// assert_eq!(refused.offset, 10);
 /// ```
 pub fn parse<M: Model>(uri: &str, model: &M, limits: &Limits) -> Result<ODataUri, UrlError> {
@@ -132,7 +134,11 @@ fn relative_uri<M: Model>(
     let mut query = Query {
         c,
         model,
-        budget: Budget { limits, nodes: 0 },
+        budget: Budget {
+            limits,
+            nodes: 0,
+            computed: Vec::new(),
+        },
         expand_items: 0,
         select_items: 0,
     };
@@ -225,6 +231,32 @@ fn escapes(out: &str, plain: u8) -> bool {
     plain.is_ascii_hexdigit()
         && (last == Some(&b'%')
             || (before == Some(&b'%') && last.is_some_and(u8::is_ascii_hexdigit)))
+}
+
+/// `text` with each `%XX` decoded: a value as written in a URL, read as meant (a `$format`
+/// media type, T-3742). `None` for a `%` without two hex digits after it, or bytes that are no
+/// UTF-8.
+///
+/// ```
+/// use odata_url::percent_decoded;
+/// assert_eq!(percent_decoded("application%2Fjson%3Bodata.metadata%3Dnone").as_deref(),
+///            Some("application/json;odata.metadata=none"));
+/// assert_eq!(percent_decoded("a%2"), None);
+/// assert_eq!(percent_decoded("%FF"), None);
+/// ```
+#[must_use]
+pub fn percent_decoded(text: &str) -> Option<String> {
+    let mut c = cursor::Cursor::new(text);
+    let mut out = Vec::with_capacity(text.len());
+    while let Some(b) = c.peek() {
+        if b == b'%' {
+            out.push(literal::pct_encoded(&mut c)?);
+        } else {
+            out.push(b);
+            c.advance(1);
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 #[cfg(test)]

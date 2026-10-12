@@ -142,7 +142,10 @@ dependencies = [
  "antares-jsonld",
  "antares-model",
  "antares-ql",
+ "antares-residual",
  "axum",
+ "chrono",
+ "metrics",
  "serde",
  "serde_json",
  "tokio",
@@ -167,6 +170,7 @@ dependencies = [
 name = "antares-residual"
 version = "0.1.3"
 dependencies = [
+ "geo",
  "regex",
  "serde_json",
  "unicode-normalization",
