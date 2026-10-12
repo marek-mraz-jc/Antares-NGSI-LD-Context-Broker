@@ -8,7 +8,7 @@ evaluator and a Postgres lowering (published as `ngsild-ql` once released).
 | `parse_q`, `QNode`: the NGSI-LD Query Language (`q=`), rendered back by `Display` | 4.9 |
 | `eval::eval_q`: `q=` over an expanded Entity, linked-entity terms included | 4.9 |
 | `geo::GeoQuery`: `georel`, `geometry`, `coordinates`, `geoproperty` | 4.10 |
-| `scope::scope_matches`, `scope::intersect_scope_q`: the Scope Query Language | 4.19 |
+| `scope::check_scope_q`, `scope::scope_matches`, `scope::intersect_scope_q`: the Scope Query Language | 4.19 |
 | `type_selection_matches`: the Entity Type Selection Language | 4.17 |
 | `geo::parse_ref_geometry`: the reference geometry of distance ordering | 4.23 |
 | `sql`: `q=` lowered to a bind-parameter jsonpath predicate | (backend) |
