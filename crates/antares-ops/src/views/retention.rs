@@ -90,6 +90,19 @@ pub type Rules = Vec<(TenantId, Vec<Rule>)>;
 /// # Errors
 /// Why `raw` is not one.
 pub fn parse_duration(raw: &str) -> Result<Duration, String> {
+    parse_duration_within(raw, SHORTEST, LONGEST)
+}
+
+/// A duration as [`parse_duration`] reads it, between `shortest` and
+/// `longest` (the quality sweep's `maxAge` starts at one second, T-4018).
+///
+/// # Errors
+/// Why `raw` is not one.
+pub fn parse_duration_within(
+    raw: &str,
+    shortest: Duration,
+    longest: Duration,
+) -> Result<Duration, String> {
     let bad = || format!("{raw:?} is not a duration such as PT5M, PT8H, P30D, 5m, 8h or 14d");
     let secs = if let Some(iso) = raw.strip_prefix('P') {
         let (days, time) = match iso.split_once('T') {
@@ -142,8 +155,12 @@ pub fn parse_duration(raw: &str) -> Result<Duration, String> {
             .ok_or_else(bad)?
     };
     let d = Duration::from_secs(secs);
-    if d < SHORTEST || d > LONGEST {
-        return Err(format!("{raw:?} is outside one minute to ten years"));
+    if d < shortest || d > longest {
+        return Err(format!(
+            "{raw:?} is outside {}s to {}s",
+            shortest.as_secs(),
+            longest.as_secs()
+        ));
     }
     Ok(d)
 }

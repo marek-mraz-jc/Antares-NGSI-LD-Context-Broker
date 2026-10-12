@@ -1043,6 +1043,17 @@ pub mod test_kit {
             Self::with_sinks(Vec::new(), None).await
         }
 
+        /// [`TestBroker::new`] over `state`, a test's own store (the Postgres
+        /// arm of the quality sweep's tests, T-4018).
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn over(mut state: AppState) -> Result<Self, String> {
+            antares_api::wire(&mut state).await;
+            let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
+        }
+
         /// [`TestBroker::new`] delivering through `sinks` too (a surface's
         /// own notification binding, ADR-0026) and asking `engine`, both
         /// set before the notifier is wired, as the broker sets them, so
@@ -1061,9 +1072,7 @@ pub mod test_kit {
             if let Some(engine) = engine {
                 state = state.with_policy(engine);
             }
-            antares_api::wire(&mut state).await;
-            let reload = crate::views::install(&state).await?;
-            Ok(Self { state, reload })
+            Self::over(state).await
         }
 
         /// One retention sweep at `now` (T-3900), as the minute loop runs it.
@@ -1081,6 +1090,14 @@ pub mod test_kit {
             budget: std::time::Duration,
         ) -> Vec<crate::views::retention::Deleted> {
             self.reload.sweep_retention_within(now, budget).await
+        }
+
+        /// One quality sweep at `now` (T-4018), as the minute loop runs it.
+        pub async fn sweep_quality(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Vec<crate::views::quality::Changed> {
+            self.reload.sweep_quality(now).await
         }
 
         /// Another pod over the same store: its own view table, loaded and
