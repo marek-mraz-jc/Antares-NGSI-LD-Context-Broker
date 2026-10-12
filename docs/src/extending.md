@@ -264,10 +264,12 @@ asserts the deployed image reports `allow-all` and no surface beyond
 `admin`.
 
 Every workspace package names its place in that layering in
-`[package.metadata.antares] role`: `core`, `ops`, `surface`, `protocol` or
-`addon` (ADR-0027). `dev/check-module-rules.py` reads `cargo metadata` and
-refuses a package without one, a protocol crate that depends on an
-`antares-*` crate, a surface that is not its own optional feature of
+`[package.metadata.antares] role`: `core`, `ngsild`, `ops`, `surface`,
+`protocol` or `addon` (ADR-0027). `dev/check-module-rules.py` reads `cargo
+metadata` and refuses a package without one, a protocol crate that depends
+on an `antares-*` crate, an `ngsild` crate (pure NGSI-LD, embeddable
+outside the broker) that links by default anything but other `ngsild`
+crates and the external crates `NGSILD_EXTERNAL` names (rule M3), a surface that is not its own optional feature of
 `antares-broker` or reaches past `antares-ops` and its protocols, an
 `antares-ops` that depends on or re-exports the store, a broker `default`
 that links any of them, and an ops, surface or protocol crate without the

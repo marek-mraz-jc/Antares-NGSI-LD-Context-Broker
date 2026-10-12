@@ -63,6 +63,9 @@ self_test() {
   probe fmt fmt --no-coverage "sed -i '0,/^use /s//use  /' $lib"
   probe unused-dependency machete --no-coverage \
     "sed -i '/^axum = /a uuid = { version = \"1\", default-features = false }' crates/odata-axum/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
+  # a dependency fuzz/Cargo.lock does not hold, on a crate a fuzz target uses
+  probe fuzz-lock "machete|fuzz-compile" --no-coverage \
+    "sed -i '/^\\[dependencies\\]/a hex = { version = \"0.4\", default-features = false }' crates/odata-url/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
   probe architecture-row spec --no-coverage "mkdir -p crates/zz-probe/src && echo '//! probe' > crates/zz-probe/src/lib.rs"
   probe red-alone "alone odata-axum::probe_b_needs_the_other" --no-coverage "cat >> $lib <<'RS'
 
@@ -194,6 +197,13 @@ else
 fi
 # workspace.yml "cargo-machete"
 step machete bash -c 'need() { "$@" >/dev/null 2>&1 || { echo "missing tool: $*"; exit 1; }; }; need cargo machete --version && cargo machete'
+# workspace.yml "The fuzz targets still compile": fuzz/ has a lock of its
+# own, so a new dependency of a crate a target uses is red there only (train
+# 15, T-3821)
+if grep -qE '(^|/)Cargo\.(toml|lock)$|^(crates|fuzz)/' <<< "$changed"; then
+  step fuzz-compile bash -c 'cargo check --locked --manifest-path fuzz/Cargo.toml --bins || {
+    echo "fix: cargo update --manifest-path fuzz/Cargo.toml -p <the new crate>, and commit fuzz/Cargo.lock (never drop --locked)"; exit 1; }'
+fi
 # workspace.yml "conformance ledger check"
 step spec bash -c 'python3 dev/spec.py check && python3 dev/spec_test.py'
 # workspace.yml "Module rules"

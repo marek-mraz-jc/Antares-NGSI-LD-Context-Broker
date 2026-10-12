@@ -261,7 +261,7 @@ pub fn json_depth(bytes: &[u8]) -> usize {
         match b {
             b'"' => in_str = true,
             b'{' | b'[' => {
-                depth += 1;
+                depth = depth.saturating_add(1);
                 max = max.max(depth);
             }
             b'}' | b']' => depth = depth.saturating_sub(1),

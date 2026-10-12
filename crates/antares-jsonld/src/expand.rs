@@ -1422,7 +1422,6 @@ pub fn parse_datetime(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     /// 4.5.5.1: explicit "datasetId": "@none" designates the default
@@ -1806,7 +1805,7 @@ mod tests {
     }
 
     fn core() -> std::sync::Arc<Context> {
-        Loader::new().core()
+        std::sync::Arc::new(crate::core_context())
     }
 
     #[test]
@@ -2686,8 +2685,7 @@ mod bench {
     #[test]
     #[ignore = "benchmark — run explicitly in release"]
     fn bench_expansion_rate() {
-        let loader = crate::Loader::new();
-        let ctx = loader.core();
+        let ctx = crate::core_context();
         let entity: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
             r#"{
             "id": "urn:ngsi-ld:Vehicle:bench-1", "type": "Vehicle",
@@ -2725,13 +2723,12 @@ mod bench {
 #[cfg(test)]
 mod clause_4_18 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -2793,7 +2790,7 @@ mod clause_4_18 {
         let merge = |s: serde_json::Value| {
             expand_entity(
                 with_scope(s).as_object().expect("obj"),
-                &Loader::new().core(),
+                &std::sync::Arc::new(crate::core_context()),
                 ExpandOpts {
                     allow_null: true,
                     ..ExpandOpts::default()
@@ -2816,13 +2813,12 @@ mod clause_4_18 {
 #[cfg(test)]
 mod clause_5_2_1 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand_create(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(), // create: allow_null = false
         )
     }
@@ -2856,7 +2852,7 @@ mod clause_5_2_1 {
         let doc = json!({"p": {"type": "Property", "value": "urn:ngsi-ld:null"}});
         let out = expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts {
                 fragment: true,
                 allow_null: true,
@@ -2886,7 +2882,7 @@ mod clause_5_2_1 {
         });
         let e = expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts {
                 allow_null: true,
                 temporal: true,
@@ -2901,7 +2897,7 @@ mod clause_5_2_1 {
         let frag = json!({"expiresAt": "urn:ngsi-ld:null"});
         let out = expand_entity(
             frag.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts {
                 fragment: true,
                 allow_null: true,
@@ -2916,13 +2912,12 @@ mod clause_5_2_1 {
 #[cfg(test)]
 mod clause_5_2_4 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -2965,13 +2960,12 @@ mod clause_5_2_4 {
 #[cfg(test)]
 mod clause_5_2_5 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3029,13 +3023,12 @@ mod clause_5_2_5 {
 #[cfg(test)]
 mod clause_5_2_6 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3086,13 +3079,12 @@ mod clause_5_2_6 {
 #[cfg(test)]
 mod clause_5_2_32 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3153,13 +3145,12 @@ mod clause_5_2_32 {
 #[cfg(test)]
 mod clause_5_2_35 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3216,13 +3207,12 @@ mod clause_5_2_35 {
 #[cfg(test)]
 mod clause_5_2_36 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3258,13 +3248,12 @@ mod clause_5_2_36 {
 #[cfg(test)]
 mod clause_5_2_37 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3327,13 +3316,12 @@ mod clause_5_2_37 {
 #[cfg(test)]
 mod clause_5_2_38 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3391,13 +3379,12 @@ mod clause_5_2_38 {
 #[cfg(test)]
 mod clause_5_5_4 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3447,13 +3434,12 @@ mod clause_5_5_4 {
 #[cfg(test)]
 mod clause_5_2_7 {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     fn expand(doc: serde_json::Value) -> Result<Value, NgsiError> {
         expand_entity(
             doc.as_object().expect("obj"),
-            &Loader::new().core(),
+            &std::sync::Arc::new(crate::core_context()),
             ExpandOpts::default(),
         )
     }
@@ -3488,7 +3474,6 @@ mod clause_5_2_7 {
 #[cfg(test)]
 mod reserved_member_guards {
     use super::*;
-    use crate::loader::Loader;
     use serde_json::json;
 
     /// 4.5.1: an Attribute name is expanded against the @context, and the
@@ -3496,11 +3481,9 @@ mod reserved_member_guards {
     /// is a bare word stays a RELATIVE IRI. Expanding an attribute onto
     /// "id" must not be allowed to replace the Entity id (5.5.4
     /// BadRequestData), the same rule expand_types applies to type names.
-    #[tokio::test]
-    async fn attribute_name_must_expand_to_an_absolute_iri() {
-        let ctx = Loader::new()
-            .resolve_quiet(&json!({"hostile": {"@id": "id"}}))
-            .await
+    #[test]
+    fn attribute_name_must_expand_to_an_absolute_iri() {
+        let ctx = crate::resolve_with(&crate::PinnedOnly, &json!({"hostile": {"@id": "id"}}))
             .expect("inline @context");
         assert_eq!(ctx.expand_key("hostile"), "id", "term maps to a bare word");
 
@@ -3521,12 +3504,13 @@ mod reserved_member_guards {
     /// 4.5.1/5.5.4: the same at sub-attribute level — a term expanding onto
     /// "observedAt" would replace the validated DateTime with an instance
     /// array, bypassing the 4.6.3 DateTime check.
-    #[tokio::test]
-    async fn sub_attribute_name_must_not_overwrite_observed_at() {
-        let ctx = Loader::new()
-            .resolve_quiet(&json!({"hostile": {"@id": "observedAt"}}))
-            .await
-            .expect("inline @context");
+    #[test]
+    fn sub_attribute_name_must_not_overwrite_observed_at() {
+        let ctx = crate::resolve_with(
+            &crate::PinnedOnly,
+            &json!({"hostile": {"@id": "observedAt"}}),
+        )
+        .expect("inline @context");
         assert_eq!(ctx.expand_key("hostile"), "observedAt");
 
         let doc = json!({"id": "urn:ngsi-ld:Vehicle:1", "type": "T",
@@ -3538,10 +3522,11 @@ mod reserved_member_guards {
 
         // negative: with a well-behaved @context the sub-attribute lands on
         // its own IRI and observedAt still holds the DateTime string.
-        let ctx = Loader::new()
-            .resolve_quiet(&json!({"hostile": {"@id": "https://example.org/hostile"}}))
-            .await
-            .expect("inline @context");
+        let ctx = crate::resolve_with(
+            &crate::PinnedOnly,
+            &json!({"hostile": {"@id": "https://example.org/hostile"}}),
+        )
+        .expect("inline @context");
         let out = expand_entity(doc.as_object().expect("obj"), &ctx, ExpandOpts::default())
             .expect("absolute IRI is fine");
         let inst = &out["https://uri.etsi.org/ngsi-ld/default-context/speed"][0];
@@ -3854,7 +3839,7 @@ mod reserved_member_guards {
     }
 
     fn core() -> std::sync::Arc<Context> {
-        Loader::new().core()
+        std::sync::Arc::new(crate::core_context())
     }
 
     /// `expand_instance` dispatches on `attr_type` and closes the match with
