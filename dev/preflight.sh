@@ -53,13 +53,16 @@ self_test() {
     fi
     local run got
     # shellcheck disable=SC2086 # $3 is a flag list
-    run=$(cd "$wt" && "$self" --base HEAD~"$([[ -n $4 ]] && echo 1 || echo 0)" $3 2>&1)
+    # a hang is a red run, never a self-test that waits forever
+    run=$(cd "$wt" && timeout 3600 "$self" --base HEAD~"$([[ -n $4 ]] && echo 1 || echo 0)" $3 2>&1)
     got=$(sed -n 's/^FAIL \(.*\) [0-9]*s$/\1/p' <<< "$run" | paste -sd'|')
     if ! grep -q '^preflight: [0-9]* steps' <<< "$run"; then
       echo "FAIL $1: the run did not finish"; sed 's/^/    /' <<< "$run" | tail -n 20; bad=1
     elif [[ $got == "$2" ]]; then echo "ok   $1: red ${2:-nothing}"; else echo "FAIL $1: red '$got', expected '${2}'"; bad=1; fi
   }
-  probe clean "" "" ""
+  # with --log as the train runs it: the final wait must not wait for its tee
+  probe clean "" "--log $tmp/clean.log" ""
+  grep -q '^preflight: [0-9]* steps' "$tmp/clean.log" || { echo "FAIL clean: --log holds no verdict"; bad=1; }
   probe fmt fmt --no-coverage "sed -i '0,/^use /s//use  /' $lib"
   probe unused-dependency machete --no-coverage \
     "sed -i '/^axum = /a uuid = { version = \"1\", default-features = false }' crates/odata-axum/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
@@ -102,22 +105,43 @@ if ((selftest)); then
 fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/preflight.XXXXXX")
-steps=0 red=0 start=$SECONDS
+mkdir -p "$work/res"
+start=$SECONDS
 
-# step <name> <command...>: run, time, print one line; on FAIL the tail
+# step <key> <name> <command...>: run, time, write one line to res/<key>; on
+# FAIL the tail too. The steps run side by side (T-4032), and the keys sort in
+# the serial order, so the report reads as it always did, each tail under its
+# own FAIL line.
 step() {
-  local name=$1 at=$SECONDS out
-  shift
-  out="$work/$((steps + 1))-${name//[^A-Za-z0-9_.-]/_}.txt"
+  local key=$1 name=$2 at=$SECONDS out
+  shift 2
+  out="$work/$key-${name//[^A-Za-z0-9_.-]/_}.txt"
   if "$@" > "$out" 2>&1 < /dev/null; then
-    echo "PASS $name $((SECONDS - at))s"
+    echo "PASS $name $((SECONDS - at))s" > "$work/res/$key"
   else
-    echo "FAIL $name $((SECONDS - at))s"
-    tail -n 25 "$out" | sed 's/^/    /'
-    red=$((red + 1))
+    { echo "FAIL $name $((SECONDS - at))s"; tail -n 25 "$out" | sed 's/^/    /'; } > "$work/res/$key"
   fi
-  steps=$((steps + 1))
 }
+
+# Cargo lanes in the background, at most `slots` at a time: one below 6 jobs,
+# so a small worker builds one thing at once as before, else one per 3 jobs, at
+# most 3. Each lane builds in a profile or target directory of its own (debug,
+# release, llvm-cov, fuzz), so no lane waits on another's lock. The steps
+# without a build run beside them unbounded.
+total=${CARGO_BUILD_JOBS:-$(nproc)}
+slots=$((total < 6 ? 1 : total / 3 < 3 ? total / 3 : 3))
+lanes=()
+lane() { # <function> [args...]
+  local p live
+  while :; do
+    live=()
+    for p in "${lanes[@]}"; do kill -0 "$p" 2> /dev/null && live+=("$p"); done
+    ((${#live[@]} < slots)) && break
+    wait -n "${live[@]}"
+  done
+  bg "$@"
+}
+bg() { "$@" & lanes+=($!); }
 
 mb=$(git merge-base "$base" HEAD) || { echo "preflight: no merge base with $base" >&2; exit 2; }
 changed=$({ git diff --name-only "$mb"; git ls-files --others --exclude-standard; } | sort -u)
@@ -178,74 +202,41 @@ alone() { # <crate> <fn>: the test by its full path, in a process of its own
   done
 }
 
-# workspace.yml "cargo fmt --all --check"
-step fmt cargo fmt --all --check
-if ((${#crates[@]})); then
-  # workspace.yml "cargo clippy" (the touched crates of its --workspace wall)
-  step clippy cargo clippy --locked "${pflags[@]}" --all-targets --all-features -- -D warnings
-  # workspace.yml "dev/unit-junit.sh all-features"
-  step test cargo test --locked "${pflags[@]}" --all-features
-  # ci 38133016763: a test red only when it runs alone (env and order)
-  while read -r path name; do
-    c=$(crate_of "$path")
-    [[ -n $c ]] && step "alone $c::$name" alone "$c" "$name"
-  done < <(added_tests)
-else
-  echo "PASS clippy 0s (no crate touched)"
-  echo "PASS test 0s (no crate touched)"
-  steps=$((steps + 2))
-fi
-# workspace.yml "cargo-machete"
-step machete bash -c 'need() { "$@" >/dev/null 2>&1 || { echo "missing tool: $*"; exit 1; }; }; need cargo machete --version && cargo machete'
-# workspace.yml "The fuzz targets still compile": fuzz/ has a lock of its
-# own, so a new dependency of a crate a target uses is red there only (train
-# 15, T-3821)
-if grep -qE '(^|/)Cargo\.(toml|lock)$|^(crates|fuzz)/' <<< "$changed"; then
-  step fuzz-compile bash -c 'cargo check --locked --manifest-path fuzz/Cargo.toml --bins || {
-    echo "fix: cargo update --manifest-path fuzz/Cargo.toml -p <the new crate>, and commit fuzz/Cargo.lock (never drop --locked)"; exit 1; }'
-fi
-# workspace.yml "conformance ledger check"
-step spec bash -c 'python3 dev/spec.py check && python3 dev/spec_test.py'
-# workspace.yml "Module rules"
-step module-rules python3 dev/check-module-rules.py
-# workspace.yml "Vanilla feature tree is committed"
-step vanilla-tree bash -c 'set -o pipefail; dev/vanilla-tree.sh | diff -u ci/vanilla-tree.txt -'
-# workspace.yml "Vanilla binary links no surface"
-step vanilla-symbols dev/check-vanilla-symbols.sh
-# workspace.yml "SBOM (vanilla and full)"
-step sbom bash -c 'cargo cyclonedx --version >/dev/null 2>&1 || { echo "missing tool: cargo cyclonedx"; exit 1; }; dev/sbom.sh "$1"' _ "$work/sbom"
-# config.rs KNOWN_KEYS (memory: antares-fuzz-outside-workspace) when an
-# ANTARES_ key or a manifest changed
-if grep -q 'Cargo.toml$' <<< "$changed" || git diff "$mb" -- '*.rs' | grep -q '^+.*ANTARES_'; then
-  step config-keys cargo test --locked -p antares-broker --bins config_key_tests
-fi
-# workspace.yml "Binary size per surface feature" (ADR-0027 section 6
-# budget, train 10): release builds of vanilla and each surface feature, when
-# a manifest, the broker or a crate of role surface, ops or protocol changed
-if grep -qE '(^|/)Cargo\.(toml|lock)$|^crates/antares-broker/' <<< "$changed" ||
-  python3 - "${crates[@]}" <<'PY'
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("gate", "dev/coverage-gate.py")
-g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
-sys.exit(0 if any(c["name"] in sys.argv[1:] for c in g.new_crates()) else 1)
-PY
-then
-  step binary-size python3 dev/surface-features.py sizes
-fi
-# workspace.yml "Route docs check" and "Env-var docs check"
-step route-docs dev/check-route-docs.sh
-step env-docs dev/check-env-docs.sh
-# strict.yml "coverage": dev/coverage-gate.py on each touched crate with a role
-if ((cover)); then
-  roles=$(python3 - "${crates[@]}" <<'PY'
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("gate", "dev/coverage-gate.py")
-g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
-print(" ".join(c["name"] for c in g.new_crates() if c["name"] in sys.argv[1:]))
-PY
-  )
-  for c in $roles; do
-    step "coverage $c" bash -c 'cargo +nightly llvm-cov --version >/dev/null 2>&1 || { echo "missing tool: cargo +nightly llvm-cov"; exit 1; }
+target=$(python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])' <<< "$meta")
+
+# the debug lane: clippy, the tests, the added tests alone, the debug builds
+debug_lane() {
+  if ((${#crates[@]})); then
+    # workspace.yml "cargo clippy" (the touched crates of its --workspace wall)
+    step 02 clippy cargo clippy --locked "${pflags[@]}" --all-targets --all-features -- -D warnings
+    # workspace.yml "dev/unit-junit.sh all-features"
+    step 03 test cargo test --locked "${pflags[@]}" --all-features
+    # ci 38133016763: a test red only when it runs alone (env and order)
+    local k=0 path name c
+    while read -r path name; do
+      c=$(crate_of "$path")
+      [[ -n $c ]] && k=$((k + 1)) && step "04-$(printf %04d "$k")" "alone $c::$name" alone "$c" "$name"
+    done < <(added_tests)
+  else
+    echo "PASS clippy 0s (no crate touched)" > "$work/res/02"
+    echo "PASS test 0s (no crate touched)" > "$work/res/03"
+  fi
+  # workspace.yml "Vanilla binary links no surface"
+  step 10 vanilla-symbols dev/check-vanilla-symbols.sh
+  # config.rs KNOWN_KEYS (memory: antares-fuzz-outside-workspace) when an
+  # ANTARES_ key or a manifest changed
+  if grep -q 'Cargo.toml$' <<< "$changed" || git diff "$mb" -- '*.rs' | grep -q '^+.*ANTARES_'; then
+    step 12 config-keys cargo test --locked -p antares-broker --bins config_key_tests
+  fi
+}
+
+# strict.yml "coverage": dev/coverage-gate.py on each touched crate with a
+# role, one after the other in llvm-cov's own target directory
+coverage_lane() {
+  local c k=0
+  for c in "$@"; do
+    k=$((k + 1))
+    step "16-$(printf %02d "$k")" "coverage $c" bash -c 'cargo +nightly llvm-cov --version >/dev/null 2>&1 || { echo "missing tool: cargo +nightly llvm-cov"; exit 1; }
       python3 - "$1" <<'"'PY'"'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("gate", "dev/coverage-gate.py")
@@ -256,7 +247,63 @@ print("\n".join(errors) or "OK")
 sys.exit(1 if errors else 0)
 PY' _ "$c"
   done
+}
+
+# workspace.yml "Binary size per surface feature" (ADR-0027 section 6
+# budget, train 10): release builds of vanilla and each surface feature, when
+# a manifest, the broker or a crate of role surface, ops or protocol changed.
+# The longest lane, so it starts first.
+if grep -qE '(^|/)Cargo\.(toml|lock)$|^crates/antares-broker/' <<< "$changed" ||
+  python3 - "${crates[@]}" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gate", "dev/coverage-gate.py")
+g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
+sys.exit(0 if any(c["name"] in sys.argv[1:] for c in g.new_crates()) else 1)
+PY
+then
+  lane step 13 binary-size python3 dev/surface-features.py sizes
+fi
+lane debug_lane
+if ((cover)); then
+  roles=$(python3 - "${crates[@]}" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gate", "dev/coverage-gate.py")
+g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
+print(" ".join(c["name"] for c in g.new_crates() if c["name"] in sys.argv[1:]))
+PY
+  )
+  # shellcheck disable=SC2086 # one crate name per word
+  [[ -n $roles ]] && lane coverage_lane $roles
+fi
+# workspace.yml "The fuzz targets still compile": fuzz/ has a lock of its
+# own, so a new dependency of a crate a target uses is red there only (train
+# 15, T-3821); a target directory of its own beside the debug lane's
+if grep -qE '(^|/)Cargo\.(toml|lock)$|^(crates|fuzz)/' <<< "$changed"; then
+  lane step 06 fuzz-compile bash -c 'CARGO_TARGET_DIR="$1/preflight-fuzz" cargo check --locked --manifest-path fuzz/Cargo.toml --bins || {
+    echo "fix: cargo update --manifest-path fuzz/Cargo.toml -p <the new crate>, and commit fuzz/Cargo.lock (never drop --locked)"; exit 1; }' _ "$target"
 fi
 
+# workspace.yml "cargo fmt --all --check"
+bg step 01 fmt cargo fmt --all --check
+# workspace.yml "cargo-machete"
+bg step 05 machete bash -c 'need() { "$@" >/dev/null 2>&1 || { echo "missing tool: $*"; exit 1; }; }; need cargo machete --version && cargo machete'
+# workspace.yml "conformance ledger check"
+bg step 07 spec bash -c 'python3 dev/spec.py check && python3 dev/spec_test.py'
+# workspace.yml "Module rules"
+bg step 08 module-rules python3 dev/check-module-rules.py
+# workspace.yml "Vanilla feature tree is committed"
+bg step 09 vanilla-tree bash -c 'set -o pipefail; dev/vanilla-tree.sh | diff -u ci/vanilla-tree.txt -'
+# workspace.yml "SBOM (vanilla and full)"
+bg step 11 sbom bash -c 'cargo cyclonedx --version >/dev/null 2>&1 || { echo "missing tool: cargo cyclonedx"; exit 1; }; dev/sbom.sh "$1"' _ "$work/sbom"
+# workspace.yml "Route docs check" and "Env-var docs check"
+bg step 14 route-docs dev/check-route-docs.sh
+bg step 15 env-docs dev/check-env-docs.sh
+# Our own pids only: a bare `wait` also waits for the `tee` behind --log
+# (bash 5.1+), which never exits while this shell holds its stdout.
+wait "${lanes[@]}"
+
+cat "$work"/res/*
+steps=$(cat "$work"/res/* | grep -c '^\(PASS\|FAIL\) ')
+red=$(cat "$work"/res/* | grep -c '^FAIL ')
 echo "preflight: $steps steps, $red red, $((SECONDS - start)) s (step output in $work)"
 ((red == 0))
