@@ -802,13 +802,9 @@ fn container_capabilities() -> Vec<Annotation> {
                         .collect(),
                     ),
                 ),
-                (
-                    "Rollup".into(),
-                    Expr::EnumMember {
-                        ty: "Aggregation.RollupType".into(),
-                        members: vec!["None".into()],
-                    },
-                ),
+                // No `Rollup`: `Aggregation.RollupType/None` is an enum member of a vocabulary
+                // the clients do not load, and Microsoft.OData.Edm's validator refuses the whole
+                // $metadata over it (BadUnresolvedEnumMember); `rollup` answers 501 (T-3937).
             ]),
         ),
         flag("KeyAsSegmentSupported", false),
