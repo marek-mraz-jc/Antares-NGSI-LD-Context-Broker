@@ -359,6 +359,8 @@ async fn compute_is_refused_where_it_does_not_apply() -> Result<(), String> {
         ("Car?$compute=speed", StatusCode::BAD_REQUEST),
         ("Car?$compute=speed as label", StatusCode::BAD_REQUEST),
         ("Car?$compute=nothing as x", StatusCode::BAD_REQUEST),
+        // the view hides `note`: the 400 of an unknown name, as in $filter
+        ("Car?$compute=note as x", StatusCode::BAD_REQUEST),
         ("Car?$compute=label add 1 as x", StatusCode::BAD_REQUEST),
         (
             "Car?$compute=label as l&$filter=l gt 1",
