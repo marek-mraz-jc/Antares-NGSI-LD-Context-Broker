@@ -92,12 +92,19 @@ if [ "${UNIT_TESTS:-0}" = 1 ]; then
   cargo test --workspace --lib --bins -j 2 || true
   stash_profraw unit
   echo "=== api tests: the integration binaries (instrumented) ==="
-  # Named packages rather than --workspace: a package with no tests/
-  # directory has no target matching the glob and cargo refuses the whole
-  # invocation. antares-wasm's integration test is a wasm target and belongs
-  # to the wasm cell.
-  cargo test -p antares-api -p antares-broker -p antares-bus -p antares-sql \
-    --test '*' -j 2 || true
+  # Every package with a tests/*.rs rather than --workspace: a package with
+  # no tests/ directory has no target matching the glob and cargo refuses the
+  # whole invocation. Listed from the tree, not by hand: a hand-kept list of
+  # four left every crate added later uncovered by its own tests (T-4006).
+  # antares-wasm's integration test is a wasm target and belongs to the wasm
+  # cell.
+  API_PKGS=()
+  for dir in crates/*/; do
+    name=$(basename "$dir")
+    [ "$name" = antares-wasm ] && continue
+    compgen -G "${dir}tests/*.rs" >/dev/null && API_PKGS+=(-p "$name")
+  done
+  cargo test "${API_PKGS[@]}" --test '*' -j 2 || true
   stash_profraw api
 fi
 
