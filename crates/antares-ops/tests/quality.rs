@@ -57,7 +57,9 @@ async fn send(
 }
 
 fn ago(minutes: i64) -> String {
-    (chrono::Utc::now() - chrono::Duration::minutes(minutes))
+    let now = chrono::Utc::now();
+    now.checked_sub_signed(chrono::Duration::minutes(minutes))
+        .unwrap_or(now)
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
@@ -216,7 +218,8 @@ async fn a_stale_entity_is_quarantined_and_lifted_when_fresh_and_nothing_else_is
     }
 
     // Marked once: a second sweep changes nothing.
-    assert!(b.sweep_quality(chrono::Utc::now()).await.is_empty());
+    let changed = b.sweep_quality(chrono::Utc::now()).await;
+    assert!(changed.is_empty(), "{changed:?}");
 
     // A fresh observation: the next sweep lifts both Properties.
     let (status, body) = send(
@@ -248,7 +251,8 @@ async fn a_tenant_without_a_document_and_a_deleted_document_mark_nothing() {
     let b = TestBroker::new().await.expect("broker");
     let app = b.serve_mounted(Vec::new()).expect("app");
     create(&app, "city", positioned("urn:v:old", V, 30)).await;
-    assert!(b.sweep_quality(chrono::Utc::now()).await.is_empty());
+    let changed = b.sweep_quality(chrono::Utc::now()).await;
+    assert!(changed.is_empty(), "{changed:?}");
 
     send(
         &app,
@@ -259,7 +263,8 @@ async fn a_tenant_without_a_document_and_a_deleted_document_mark_nothing() {
     )
     .await;
     send(&app, Method::DELETE, "/q/quality/city", None, None).await;
-    assert!(b.sweep_quality(chrono::Utc::now()).await.is_empty());
+    let changed = b.sweep_quality(chrono::Utc::now()).await;
+    assert!(changed.is_empty(), "{changed:?}");
     assert!(entity(&app, "city", "urn:v:old")
         .await
         .get("quarantinedAt")

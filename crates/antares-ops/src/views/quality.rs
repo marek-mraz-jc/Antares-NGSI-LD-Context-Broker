@@ -4,9 +4,12 @@
 //! ADR-N-046 2.5 and 2.6, DM-90, DM-91).
 //!
 //! One document per Tenant, stored beside the view and retention documents
-//! and reloaded with them. A rule names an expanded type and attribute IRI and
-//! a `maxAge`. Once a minute every pod sweeps: an Entity of the type whose
-//! attribute has an instance observed longer ago than `maxAge` gets
+//! and reloaded with them. An entry names a rule, an expanded type and
+//! attribute IRI and a `maxAge`; the entries of one name are one rule (a
+//! space's rule reaches the broker once per expansion of its type, and an
+//! Entity carries one mark per name), judged together. Once a minute every
+//! pod sweeps: an Entity of one of the rule's types whose attribute for that
+//! type has an instance observed longer ago than `maxAge` gets
 //! `quarantinedAt` and the rule's name in `quarantineRules`; the name goes
 //! again when no instance is stale (or the attribute is gone), and both
 //! Properties go with the last name. Marking twice what is already marked
@@ -21,8 +24,6 @@
 use super::{bad_tenant, problem, serve, Reloader};
 use antares_api::AppState;
 use antares_model::TenantId;
-use antares_store::filter::{EntityFilter, Page};
-use antares_store::CurrentStateDriverExt;
 use axum::body::Bytes;
 use axum::extract::Path;
 use axum::http::StatusCode;
@@ -75,15 +76,14 @@ struct Document {
     rules: Vec<RuleDoc>,
 }
 
-/// One rule as the sweep runs it.
+/// One rule as the sweep runs it: every entry of one name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     /// The name the Portal lists the rule by, written into `quarantineRules`.
     pub name: String,
-    /// The expanded Entity type.
-    pub type_iri: String,
-    /// The expanded attribute whose `observedAt` is judged.
-    pub attribute: String,
+    /// The expanded Entity types and, for each, the expanded attribute whose
+    /// `observedAt` is judged, in the order the document lists them.
+    pub checks: Vec<(String, String)>,
     /// How old an observation may be.
     pub max_age: Duration,
 }
@@ -109,11 +109,12 @@ fn label(raw: &str) -> bool {
         && !raw.ends_with('-')
 }
 
-/// The rules of one document, or the first reason it holds none.
+/// The rules of one document, its entries grouped by name, or the first
+/// reason it holds none.
 ///
 /// # Errors
-/// A document that is not one, a name that is no DNS-1123 label or is used
-/// twice, a type or attribute that is no absolute IRI, a `maxAge` that is
+/// A document that is not one, a name that is no DNS-1123 label, one name
+/// with two `maxAge` values or the same type and attribute twice, a type or attribute that is no absolute IRI, a `maxAge` that is
 /// no duration of one second to ten years, or more than
 /// [`MAX_QUALITY_RULES`] rules.
 pub fn parse(body: &[u8]) -> Result<Vec<Rule>, String> {
@@ -124,30 +125,37 @@ pub fn parse(body: &[u8]) -> Result<Vec<Rule>, String> {
             "a document holds at most {MAX_QUALITY_RULES} rules"
         ));
     }
-    let mut seen = std::collections::BTreeSet::new();
-    doc.rules
-        .into_iter()
-        .map(|r| {
-            if !label(&r.name) {
-                return Err(format!("name {:?} is not a DNS-1123 label", r.name));
+    let mut rules: Vec<Rule> = Vec::new();
+    for r in doc.rules {
+        if !label(&r.name) {
+            return Err(format!("name {:?} is not a DNS-1123 label", r.name));
+        }
+        for (field, iri) in [("type", &r.type_iri), ("attribute", &r.attribute)] {
+            if !expanded(iri) {
+                return Err(format!("{field} {iri:?} is not an expanded IRI"));
             }
-            if !seen.insert(r.name.clone()) {
-                return Err(format!("name {:?} has two rules", r.name));
+        }
+        let max_age = super::retention::parse_duration_within(&r.max_age, SHORTEST, LONGEST)?;
+        let check = (r.type_iri, r.attribute);
+        match rules.iter_mut().find(|known| known.name == r.name) {
+            Some(known) if known.max_age != max_age => {
+                return Err(format!("name {:?} has two maxAge values", r.name));
             }
-            for (field, iri) in [("type", &r.type_iri), ("attribute", &r.attribute)] {
-                if !expanded(iri) {
-                    return Err(format!("{field} {iri:?} is not an expanded IRI"));
-                }
+            Some(known) if known.checks.contains(&check) => {
+                return Err(format!(
+                    "name {:?} lists type {:?} and attribute {:?} twice",
+                    r.name, check.0, check.1
+                ));
             }
-            let max_age = super::retention::parse_duration_within(&r.max_age, SHORTEST, LONGEST)?;
-            Ok(Rule {
+            Some(known) => known.checks.push(check),
+            None => rules.push(Rule {
                 name: r.name,
-                type_iri: r.type_iri,
-                attribute: r.attribute,
+                checks: vec![check],
                 max_age,
-            })
-        })
-        .collect()
+            }),
+        }
+    }
+    Ok(rules)
 }
 
 /// The rules of the stored quality documents among `docs`, by Tenant; a
@@ -173,7 +181,7 @@ pub(super) fn load<'a>(docs: impl Iterator<Item = (&'a str, &'a Value)>) -> Rule
 pub struct Changed {
     /// The Tenant.
     pub tenant: String,
-    /// The expanded type.
+    /// The rule's expanded types, comma-separated.
     pub type_iri: String,
     /// The rule's name.
     pub rule: String,
@@ -193,19 +201,27 @@ fn instances(attribute: Option<&Value>) -> Vec<&Value> {
     }
 }
 
-/// Whether some instance of `rule`'s attribute was observed before `cut`. An
-/// instance without a readable `observedAt` is not judged: nothing says it
-/// is old.
+/// Whether, for one of `rule`'s types the Entity has, some instance of that
+/// type's attribute was observed before `cut`. An instance without a
+/// readable `observedAt` is not judged: nothing says it is old.
 fn stale(doc: &Value, rule: &Rule, cut: chrono::DateTime<chrono::Utc>) -> bool {
-    instances(doc.get(&rule.attribute)).into_iter().any(|inst| {
-        inst.get("observedAt")
-            .and_then(Value::as_str)
-            .and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&antares_store::filter::canonical_datetime(s))
-                    .ok()
-            })
-            .is_some_and(|at| at < cut)
-    })
+    let types = doc.get("type");
+    let has = |ty: &str| match types {
+        Some(Value::Array(all)) => all.iter().any(|t| t.as_str() == Some(ty)),
+        Some(Value::String(one)) => one == ty,
+        _ => false,
+    };
+    rule.checks
+        .iter()
+        .filter(|(ty, _)| has(ty))
+        .flat_map(|(_, attribute)| instances(doc.get(attribute)))
+        .any(|inst| {
+            inst.get("observedAt")
+                .and_then(Value::as_str)
+                // A comma may stand for the fraction's point (ISO 8601).
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s.replacen(',', ".", 1)).ok())
+                .is_some_and(|at| at < cut)
+        })
 }
 
 /// The rule names an Entity's `quarantineRules` holds.
@@ -289,7 +305,7 @@ pub(super) async fn sweep(r: &Reloader, now: chrono::DateTime<chrono::Utc>) -> V
     out
 }
 
-/// The Entities of `rule`'s type in Tenant `t` whose mark the rule would
+/// The Entities of `rule`'s types in Tenant `t` whose mark the rule would
 /// change at `now`, read in at most [`ROUNDS`] pages of [`PAGE`]; then each
 /// one marked or lifted under its row lock, judged again on what the store
 /// holds at that moment.
@@ -300,46 +316,40 @@ async fn judge_rule(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<Changed> {
     let tenant = t.as_str();
+    let mut types: Vec<String> = Vec::new();
+    let mut attrs = vec![QUARANTINE_RULES.to_owned()];
+    for (ty, attribute) in &rule.checks {
+        if !types.contains(ty) {
+            types.push(ty.clone());
+        }
+        if !attrs.contains(attribute) {
+            attrs.push(attribute.clone());
+        }
+    }
+    let type_iri = types.join(",");
+    let failed = |e: &str| {
+        tracing::warn!(tenant, r#type = type_iri.as_str(), rule = rule.name.as_str(), error = %e, "quality sweep failed");
+    };
     // A maxAge holds at most ten years, so the cut is always in range.
     let cut = chrono::Duration::from_std(rule.max_age)
         .ok()
         .and_then(|age| now.checked_sub_signed(age))
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
     let ts = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let types = [vec![rule.type_iri.clone()]];
-    let attrs = [rule.attribute.clone(), QUARANTINE_RULES.to_owned()];
     let mut pending: Vec<String> = Vec::new();
     for round in 0..ROUNDS {
-        let filter = EntityFilter {
-            types: Some(&types),
-            attrs: Some(&attrs),
-            page: Some(Page {
-                offset: i64::try_from(round.saturating_mul(PAGE)).unwrap_or(i64::MAX),
-                limit: i64::try_from(PAGE).unwrap_or(i64::MAX),
-                count: false,
-            }),
-            ..EntityFilter::default()
-        };
-        let found = match state.store.query_entities(t, &filter).await {
-            Ok(found) => found,
+        let rows = match state
+            .scan_entities(t, &types, &attrs, round.saturating_mul(PAGE), PAGE)
+            .await
+        {
+            Ok(rows) => rows,
             Err(e) => {
-                tracing::warn!(tenant, r#type = rule.type_iri.as_str(), rule = rule.name.as_str(), error = %e, "quality sweep failed");
+                failed(&e);
                 return Vec::new();
             }
         };
-        // A store that could not page answered every match at once.
-        let rows: Vec<&Value> = if found.paged {
-            found.rows.iter().collect()
-        } else {
-            found
-                .rows
-                .iter()
-                .skip(round.saturating_mul(PAGE))
-                .take(PAGE)
-                .collect()
-        };
         let last = rows.len() < PAGE;
-        pending.extend(rows.into_iter().filter_map(|doc| {
+        pending.extend(rows.iter().filter_map(|doc| {
             let was = marked_by(doc).contains(&rule.name);
             (stale(doc, rule, cut) != was)
                 .then(|| doc.get("id").and_then(Value::as_str).map(str::to_owned))
@@ -353,31 +363,28 @@ async fn judge_rule(
     for batch in pending.chunks(PAGE) {
         // Whether each id the closure changed was marked (`true`) or lifted.
         let mut marking = std::collections::HashMap::new();
-        let results = state
-            .store
-            .batch_mutate(t, batch, |id, doc| {
+        let written = state
+            .mutate_entities(t, batch, |id, doc| {
                 let is_stale = stale(doc, rule, cut);
-                if judge(doc, rule, cut, &ts) {
+                let changed = judge(doc, rule, cut, &ts);
+                if changed {
                     marking.insert(id.to_owned(), is_stale);
-                    Ok(())
-                } else {
-                    // Already what the rule says: nothing is written.
-                    Err(())
                 }
+                changed
             })
             .await;
-        match results {
-            Ok(results) => {
-                for (id, result) in batch.iter().zip(results) {
-                    match (result, marking.get(id)) {
-                        (Some(Ok(())), Some(true)) => marked = marked.saturating_add(1),
-                        (Some(Ok(())), Some(false)) => lifted = lifted.saturating_add(1),
+        match written {
+            Ok(written) => {
+                for (id, done) in batch.iter().zip(written) {
+                    match (done, marking.get(id)) {
+                        (true, Some(true)) => marked = marked.saturating_add(1),
+                        (true, Some(false)) => lifted = lifted.saturating_add(1),
                         _ => {}
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!(tenant, r#type = rule.type_iri.as_str(), rule = rule.name.as_str(), error = %e, "quality sweep failed");
+                failed(&e);
                 break;
             }
         }
@@ -387,7 +394,7 @@ async fn judge_rule(
         .filter(|(_, count)| *count > 0)
         .map(|(outcome, count)| Changed {
             tenant: tenant.to_owned(),
-            type_iri: rule.type_iri.clone(),
+            type_iri: type_iri.clone(),
             rule: rule.name.clone(),
             outcome,
             count,
@@ -498,8 +505,7 @@ mod tests {
             .next()
             .unwrap_or_else(|| Rule {
                 name: String::new(),
-                type_iri: String::new(),
-                attribute: String::new(),
+                checks: Vec::new(),
                 max_age: Duration::ZERO,
             })
     }
@@ -517,7 +523,9 @@ mod tests {
             br#"{"rules":[{"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT0S"}]}"#,
             br#"{"rules":[{"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"P3651D"}]}"#,
             br#"{"rules":[{"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M"},
-                          {"name":"a","type":"https://e.org/S","attribute":"https://e.org/x","maxAge":"PT1M"}]}"#,
+                          {"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M"}]}"#,
+            br#"{"rules":[{"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M"},
+                          {"name":"a","type":"https://e.org/S","attribute":"https://e.org/x","maxAge":"PT2M"}]}"#,
             br#"{"rules":[{"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M","outcome":"flag"}]}"#,
             br#"{"rules":[{"name":"-a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M"}]}"#,
             b"not json",
@@ -561,10 +569,55 @@ mod tests {
     }
 
     #[test]
+    fn the_entries_of_one_name_are_one_rule() {
+        let rules = parse(
+            br#"{"rules":[
+            {"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT1M"},
+            {"name":"b","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT5M"},
+            {"name":"a","type":"https://e.org/S","attribute":"https://e.org/x","maxAge":"PT1M"},
+            {"name":"a","type":"https://e.org/V","attribute":"https://e.org/y","maxAge":"PT1M"}]}"#,
+        )
+        .unwrap_or_default();
+        let shape: Vec<(&str, usize)> = rules
+            .iter()
+            .map(|r| (r.name.as_str(), r.checks.len()))
+            .collect();
+        assert_eq!(shape, [("a", 3), ("b", 1)]);
+    }
+
+    /// An Entity of two types one name judges: the stale attribute of one
+    /// type marks it, the fresh one of the other does not lift it, so two
+    /// entries of a name never undo each other sweep after sweep.
+    #[test]
+    fn two_entries_of_one_name_never_undo_each_other() {
+        let r = parse(br#"{"rules":[
+            {"name":"a","type":"https://e.org/V","attribute":"https://e.org/x","maxAge":"PT10M"},
+            {"name":"a","type":"https://e.org/S","attribute":"https://e.org/y","maxAge":"PT10M"}]}"#)
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .unwrap_or_else(rule);
+        let now = chrono::Utc::now();
+        let cut = now - chrono::Duration::minutes(10);
+        let at = |minutes: i64| {
+            (now - chrono::Duration::minutes(minutes))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        let mut doc = json!({"id": "urn:v:1", "type": ["https://e.org/V", "https://e.org/S"],
+            "https://e.org/x": [{"type": "Property", "value": 1, "observedAt": at(30)}],
+            "https://e.org/y": [{"type": "Property", "value": 1, "observedAt": at(1)}]});
+        assert!(judge(&mut doc, &r, cut, "t1"));
+        assert!(!judge(&mut doc, &r, cut, "t2"), "the mark stays");
+        // The attribute of a type the Entity lacks is not judged.
+        let mut other = json!({"id": "urn:s:1", "type": ["https://e.org/S"],
+            "https://e.org/x": [{"type": "Property", "value": 1, "observedAt": at(30)}]});
+        assert!(!judge(&mut other, &r, cut, "t3"));
+    }
+
+    #[test]
     fn an_instance_without_observed_at_is_not_judged() {
         let r = rule();
-        let mut doc =
-            json!({"id": "urn:v:1", "https://e.org/location": [{"type": "Property", "value": 1}]});
+        let mut doc = json!({"id": "urn:v:1", "type": ["https://e.org/Vehicle"], "https://e.org/location": [{"type": "Property", "value": 1}]});
         assert!(!judge(&mut doc, &r, chrono::Utc::now(), "t"));
     }
 }

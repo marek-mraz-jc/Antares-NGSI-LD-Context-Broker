@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! The quality sweep on the Postgres arm (T-4018, DM-90, DM-91): the same
 //! mark and lift as `tests/quality.rs`, through the store's query and row-lock
-//! paths of the database. Skips loudly without ANTARES_TEST_DATABASE_URL (see
+//! paths of the database. Skips loudly without `ANTARES_TEST_DATABASE_URL` (see
 //! antares-sql/tests/pg.rs for the recipe).
 
 use antares_ops::test_kit::TestBroker;
@@ -55,12 +55,84 @@ async fn send(
 }
 
 fn positioned(id: &str, ty: &str, minutes_ago: i64) -> String {
-    let at = (chrono::Utc::now() - chrono::Duration::minutes(minutes_ago))
+    let now = chrono::Utc::now();
+    let at = now
+        .checked_sub_signed(chrono::Duration::minutes(minutes_ago))
+        .unwrap_or(now)
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     json!({"id": id, "type": ty, LOCATION: {"type": "Property", "value": 1, "observedAt": at}})
         .to_string()
 }
 
+/// The Vehicles of `tenant` the condition every other permit carries (DM-90)
+/// lets through.
+async fn unquarantined(app: &Router, tenant: &str) -> Vec<String> {
+    let (_, visible) = send(
+        app,
+        Method::GET,
+        "/ngsi-ld/v1/entities?type=https%3A%2F%2Fexample.org%2FVehicle&q=!quarantinedAt",
+        Some(tenant),
+        None,
+    )
+    .await;
+    let ids: Vec<String> = visible
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e["id"].as_str().map(str::to_owned))
+        .collect();
+    ids
+}
+
+/// A fresh observation of `urn:v:old`'s position in `tenant`.
+async fn observe_now(app: &Router, tenant: &str) {
+    let fresh = json!({LOCATION: {"type": "Property", "value": 2,
+        "observedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)}});
+    let (s, _) = send(
+        app,
+        Method::PATCH,
+        "/ngsi-ld/v1/entities/urn:v:old/attrs",
+        Some(tenant),
+        Some(fresh.to_string()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+}
+
+/// Four Entities: a stale and a fresh Vehicle and a stale Stop in `city`, a
+/// stale Vehicle in `port`.
+async fn seed(app: &Router, city: &str, port: &str) {
+    for (tenant, body) in [
+        (
+            city,
+            positioned("urn:v:old", "https://example.org/Vehicle", 30),
+        ),
+        (
+            city,
+            positioned("urn:v:new", "https://example.org/Vehicle", 1),
+        ),
+        (
+            city,
+            positioned("urn:s:old", "https://example.org/Stop", 30),
+        ),
+        (
+            port,
+            positioned("urn:v:old", "https://example.org/Vehicle", 30),
+        ),
+    ] {
+        let (s, answer) = send(
+            app,
+            Method::POST,
+            "/ngsi-ld/v1/entities",
+            Some(tenant),
+            Some(body),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{answer}");
+    }
+}
+
+#[expect(clippy::print_stderr, reason = "a skipped database test says so")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_entity_is_quarantined_and_lifted_on_postgres() {
     let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
@@ -89,34 +161,7 @@ async fn a_stale_entity_is_quarantined_and_lifted_on_postgres() {
     )
     .await;
     assert_eq!(put.0, StatusCode::CREATED, "{}", put.1);
-    for (tenant, body) in [
-        (
-            &city,
-            positioned("urn:v:old", "https://example.org/Vehicle", 30),
-        ),
-        (
-            &city,
-            positioned("urn:v:new", "https://example.org/Vehicle", 1),
-        ),
-        (
-            &city,
-            positioned("urn:s:old", "https://example.org/Stop", 30),
-        ),
-        (
-            &port,
-            positioned("urn:v:old", "https://example.org/Vehicle", 30),
-        ),
-    ] {
-        let (s, answer) = send(
-            &app,
-            Method::POST,
-            "/ngsi-ld/v1/entities",
-            Some(tenant),
-            Some(body),
-        )
-        .await;
-        assert_eq!(s, StatusCode::CREATED, "{answer}");
-    }
+    seed(&app, &city, &port).await;
     let get = |tenant: String, id: &'static str| {
         let app = app.clone();
         async move {
@@ -158,37 +203,13 @@ async fn a_stale_entity_is_quarantined_and_lifted_on_postgres() {
     ] {
         assert!(get(tenant, id).await.get("quarantinedAt").is_none(), "{id}");
     }
-    let (_, visible) = send(
-        &app,
-        Method::GET,
-        "/ngsi-ld/v1/entities?type=https%3A%2F%2Fexample.org%2FVehicle&q=!quarantinedAt",
-        Some(&city),
-        None,
-    )
-    .await;
-    let ids: Vec<&str> = visible
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e["id"].as_str())
-        .collect();
-    assert_eq!(ids, ["urn:v:new"]);
+    assert_eq!(unquarantined(&app, &city).await, ["urn:v:new"]);
     assert!(
         b.sweep_quality(chrono::Utc::now()).await.is_empty(),
         "marked once"
     );
 
-    let fresh = json!({LOCATION: {"type": "Property", "value": 2,
-        "observedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)}});
-    let (s, _) = send(
-        &app,
-        Method::PATCH,
-        "/ngsi-ld/v1/entities/urn:v:old/attrs",
-        Some(&city),
-        Some(fresh.to_string()),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NO_CONTENT);
+    observe_now(&app, &city).await;
     let changed = b.sweep_quality(chrono::Utc::now()).await;
     assert_eq!(
         changed
@@ -218,7 +239,7 @@ fn uuid_like() -> String {
         "{:x}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() % 0xffff_ffff)
+            .map(|d| d.as_nanos().checked_rem(0xffff_ffff).unwrap_or_default())
             .unwrap_or_default()
     )
 }
