@@ -19,7 +19,7 @@ const METHODS: [&str; 5] = ["GET", "PUT", "POST", "PATCH", "DELETE"];
 
 /// Every guarded `/q` route: its template as mounted, a concrete path, and
 /// the methods it serves.
-const ROUTES: [(&str, &str, &[&str]); 14] = [
+const ROUTES: [(&str, &str, &[&str]); 15] = [
     ("/metrics", "/q/metrics", &["GET"]),
     ("/tenants", "/q/tenants", &["GET"]),
     ("/tenants/{tenant}", "/q/tenants/acme", &["GET", "DELETE"]),
@@ -40,6 +40,11 @@ const ROUTES: [(&str, &str, &[&str]); 14] = [
     (
         "/schemas/{tenant}",
         "/q/schemas/acme",
+        &["GET", "PUT", "DELETE"],
+    ),
+    (
+        "/retention/{tenant}",
+        "/q/retention/acme",
         &["GET", "PUT", "DELETE"],
     ),
     ("/policy", "/q/policy", &["GET"]),
@@ -271,6 +276,7 @@ fn routes_equals_what_the_sources_mount() {
         "crates/antares-ops/src/views.rs",
         "crates/antares-ops/src/views/preview.rs",
         "crates/antares-ops/src/views/rule_documents.rs",
+        "crates/antares-ops/src/views/retention.rs",
         "crates/antares-icsr/src/grant.rs",
     ] {
         let found = route_literals(&read(rel))

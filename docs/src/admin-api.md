@@ -38,6 +38,7 @@ schema: `docs/openapi/antares-admin.yaml`, rendered at
 | `GET /q/tenants/{tenant}` | What one tenant holds |
 | `DELETE /q/tenants/{tenant}` | Tenant purge |
 | `GET /q/dead-letters` | Notifications the delivery policy gave up on |
+| `GET`, `PUT`, `DELETE /q/retention/{tenant}` | How long a Tenant keeps each type ([Retention](#retention)) |
 | `POST /q/dead-letters/{id}/replay` | One more delivery attempt |
 | `DELETE /q/dead-letters/{id}` | Drop a dead letter |
 | `POST /ex/v1/remote-notify` | The 5.8.1.4 receiver other brokers post to |
@@ -136,6 +137,7 @@ Prometheus text with the `antares_` prefix:
 | `antares_notifications_sent_total`, `antares_notifications_retried_total`, `antares_notifications_failed_total` | Notification deliveries by outcome. |
 | `antares_notification_changes_dropped_total` | Change events the notifier dropped under back-pressure. |
 | `antares_claim_check_unresolved_total` | Changes too big for the bus whose kept outbox row was already reaped: the before-image is gone and the change notifies nobody. Non-zero means a matcher lagged past the retention window. |
+| `antares_retention_deleted_total` | Entities (`kind="entity"`) and attribute instances (`kind="history"`) the [retention](#retention) sweep deleted, by `tenant` and `type`. |
 | `antares_notification_task_panics_total` | Delivery tasks that panicked (a bug, never expected). |
 | `antares_change_lag_seconds` | Age of the change a notifier is handling. |
 | `antares_policy_failures_total` | Decisions the policy seam had to make itself because the engine did not, by reason (`panic`, `timeout`). Always zero under the built-in `allow-all` engine. |
@@ -384,6 +386,53 @@ the bound before any schema is taken.
 ### DELETE /q/schemas/{tenant}
 
 `204`, or `404` when the Tenant has no schema.
+
+## Retention
+
+Only in a broker built with the `views` feature (T-3900). Each Tenant has at
+most one retention document: how long it keeps each Entity type's current
+state and history. A type without a rule, and a Tenant without a document,
+lose nothing. The document is stored beside the views under
+`antares-views` and reloaded with them.
+
+```json
+{"rules": [
+  {"type": "https://example.org/Vehicle", "current": "PT5M", "history": "PT8H"},
+  {"type": "https://example.org/Stop"}
+]}
+```
+
+- `type` is the expanded type IRI, as the store holds it; one rule per type,
+  at most 256 rules.
+- `current`: an Entity of that type that carries no `expiresAt` of its own
+  and has not been modified for that long is deleted. An `expiresAt` the
+  writer sent wins (4.22).
+- `history`: the type's attribute instances whose `observedAt` (else
+  `modifiedAt`, `deletedAt`, `createdAt`) is older than that are deleted.
+- A duration is ISO 8601 (`PT5M`, `PT8H`, `P30D`, `P1DT12H`) or short
+  (`90s`, `5m`, `8h`, `14d`), from one minute to ten years.
+
+Every pod sweeps once a minute, each rule in statements of at most 1000 rows
+and at most 50 statements a sweep, logs per Tenant and type the count it
+deleted, never ids or values, and counts it in
+`antares_retention_deleted_total{tenant,type,kind}` (`kind` is `entity` or
+`history`). `ANTARES_TEMPORAL_RETENTION_DAYS` stays the broker-wide horizon
+beside it.
+
+### GET /q/retention/{tenant}
+
+`200` with the document as written, `404` when the Tenant has none, `400`
+for a name outside the tenant grammar.
+
+### PUT /q/retention/{tenant}
+
+`201` created, `204` replaced. `400` for a document that is not one (an
+unknown member, a short type name, a type named twice, a duration out of
+bounds), `413` over 64 KiB; nothing is stored.
+
+### DELETE /q/retention/{tenant}
+
+`204`, or `404` when the Tenant has no document.
 
 ## The peer-facing wire
 

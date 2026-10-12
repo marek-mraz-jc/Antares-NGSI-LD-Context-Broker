@@ -365,6 +365,73 @@ async fn reap_expired_entities(pool: &PgPool) -> Result<u64, sqlx::Error> {
     Ok(n)
 }
 
+/// Retention of current state (`/q/retention`, T-3900): at most `batch`
+/// Entities of one Tenant and type that carry no `expiresAt` (a writer's 4.22
+/// stamp wins) and were last modified before `before`. The subquery bounds
+/// the statement; `i_entities_types` serves the (tenant, type) match. Service
+/// role, like every reap here; the 4.22 reap's precedent holds: rows go, no
+/// notification is owed for a removal the client declared.
+pub async fn retain_current(
+    pool: &PgPool,
+    tenant: &str,
+    type_iri: &str,
+    before: &str,
+    batch: usize,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    crate::store::pg::set_service(&mut tx).await?;
+    let n = sqlx::query(
+        "DELETE FROM entities WHERE (tenant_id, id) IN (
+           SELECT tenant_id, id FROM entities
+           WHERE tenant_id = $1 AND types @> ARRAY[$2]::text[]
+             AND expires_at IS NULL AND modified_at < $3::timestamptz
+           LIMIT $4)",
+    )
+    .bind(tenant)
+    .bind(type_iri)
+    .bind(antares_store::filter::canonical_datetime(before).as_ref())
+    .bind(i64::try_from(batch).unwrap_or(i64::MAX))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(n)
+}
+
+/// Retention of history (`/q/retention`, T-3900): at most `batch` attribute
+/// instances of one Tenant's Entities of one type observed before `before`.
+/// The type lives on `temporal_entities`; the instance key is the unique
+/// index's, so the IN matches exactly the rows selected in either backend.
+pub async fn retain_history(
+    pool: &PgPool,
+    tenant: &str,
+    type_iri: &str,
+    before: &str,
+    batch: usize,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    crate::store::pg::set_service(&mut tx).await?;
+    let n = sqlx::query(
+        "DELETE FROM attr_instances
+         WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN (
+           SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_instances a
+           JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
+           WHERE a.tenant_id = $1 AND t.types @> ARRAY[$2]::text[]
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4)",
+    )
+    .bind(tenant)
+    .bind(type_iri)
+    .bind(antares_store::filter::canonical_datetime(before).as_ref())
+    .bind(i64::try_from(batch).unwrap_or(i64::MAX))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(n)
+}
+
 /// Drop one partition, named the way the catalog row spells it. The name
 /// comes back from `pg_class.relname` as the identifier itself, not as SQL:
 /// unquoted it would be folded to lower case and would need to be a bare

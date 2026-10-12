@@ -143,6 +143,8 @@ dependencies = [
  "antares-model",
  "antares-ql",
  "axum",
+ "chrono",
+ "metrics",
  "serde",
  "serde_json",
  "tokio",

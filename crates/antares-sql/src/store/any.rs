@@ -1497,6 +1497,27 @@ impl antares_store::CurrentStateDriver for AnyStore {
     async fn sweep_expired(&self) -> usize {
         AnyStore::sweep_expired(self)
     }
+    async fn retain_current(
+        &self,
+        tenant: &TenantId,
+        type_iri: &str,
+        before: &str,
+        batch: usize,
+    ) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.retain_current(tenant, type_iri, before, batch)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => crate::store::pg::maintenance::retain_current(
+                p.docs.pool(),
+                tenant.as_str(),
+                type_iri,
+                before,
+                batch,
+            )
+            .await
+            .map_err(db),
+        }
+    }
     async fn tenant_exists(&self, tenant: &TenantId) -> Result<bool, NgsiError> {
         AnyStore::tenant_exists(self, tenant).await
     }
@@ -1542,6 +1563,27 @@ impl antares_store::CurrentStateDriver for AnyStore {
 impl antares_store::TemporalDriver for AnyStore {
     async fn close(&self) {
         AnyStore::close(self).await;
+    }
+    async fn retain_history(
+        &self,
+        tenant: &TenantId,
+        type_iri: &str,
+        before: &str,
+        batch: usize,
+    ) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.retain_history(tenant, type_iri, before, batch)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => crate::store::pg::maintenance::retain_history(
+                p.docs.pool(),
+                tenant.as_str(),
+                type_iri,
+                before,
+                batch,
+            )
+            .await
+            .map_err(db),
+        }
     }
     fn version_info(&self) -> Value {
         AnyStore::version_info(self)

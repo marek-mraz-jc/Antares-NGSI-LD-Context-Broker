@@ -522,6 +522,21 @@ pub trait CurrentStateDriver: Send + Sync {
     async fn sweep_expired(&self) -> usize {
         0
     }
+    /// Retention of one Entity type in one Tenant (`/q/retention`, T-3900):
+    /// delete at most `batch` Entities whose types include `type_iri`, that
+    /// carry no `expiresAt` of their own (a writer's 4.22 stamp wins) and
+    /// were last modified before `before`, a UTC DateTime. Returns how many
+    /// were deleted; a driver without current state deletes none.
+    async fn retain_current(
+        &self,
+        tenant: &TenantId,
+        type_iri: &str,
+        before: &str,
+        batch: usize,
+    ) -> Result<u64, NgsiError> {
+        let _ = (tenant, type_iri, before, batch);
+        Ok(0)
+    }
     /// Table 5.2.9-2 forward bookkeeping: stamp one distributed operation on
     /// a registration and hand back the stored document. `None` means the row
     /// is gone — the registration was deleted while its forward was in
@@ -817,6 +832,22 @@ pub trait TemporalDriver: Send + Sync {
     /// without history reports 0.
     async fn attr_instance_count(&self, tenant: &TenantId) -> Result<u64, NgsiError> {
         let _ = tenant;
+        Ok(0)
+    }
+    /// Retention of one Entity type's history in one Tenant (`/q/retention`,
+    /// T-3900): delete at most `batch` attribute instances of Entities whose
+    /// types include `type_iri` and whose instant (`observedAt`, else
+    /// `modifiedAt`, `deletedAt`, `createdAt`) is before `before`, a UTC
+    /// DateTime. Returns how many were deleted; a driver without history
+    /// deletes none.
+    async fn retain_history(
+        &self,
+        tenant: &TenantId,
+        type_iri: &str,
+        before: &str,
+        batch: usize,
+    ) -> Result<u64, NgsiError> {
+        let _ = (tenant, type_iri, before, batch);
         Ok(0)
     }
     /// Remove the whole history of one tenant; nothing to do without history.

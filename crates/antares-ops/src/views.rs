@@ -37,6 +37,7 @@ use std::sync::{Arc, Weak};
 
 mod preview;
 pub use preview::MAX_PREVIEW_LIMIT;
+pub mod retention;
 pub mod rule_documents;
 
 /// How often, in milliseconds, every pod rebuilds its table from the store
@@ -482,6 +483,8 @@ struct Reloader {
     policy: tokio::sync::Mutex<rule_documents::Cache>,
     /// [`SCHEMA_MAX_ENV`]; `None` refuses every schema write.
     schema_max: Option<usize>,
+    /// Every Tenant's retention rules, as the last reload found them.
+    retention: std::sync::RwLock<Arc<retention::Rules>>,
 }
 
 impl Reloader {
@@ -490,11 +493,16 @@ impl Reloader {
         let docs = self.state.view_docs().await?;
         let mut next = HashMap::with_capacity(docs.len());
         let mut schemas = BTreeMap::new();
+        let mut retention_docs = Vec::new();
         for doc in docs {
             let Some(id) = doc.get("id").and_then(Value::as_str).map(str::to_owned) else {
                 tracing::warn!("a stored view document has no id; skipped");
                 continue;
             };
+            if let Some(tenant) = id.strip_prefix(retention::RETENTION_ID_PREFIX) {
+                retention_docs.push((tenant.to_owned(), doc));
+                continue;
+            }
             if let Some(tenant) = id.strip_prefix(SCHEMA_ID_PREFIX) {
                 if let Some(text) = doc.get("text").and_then(Value::as_str) {
                     schemas.insert(tenant.to_owned(), Schema::new(text.as_bytes()));
@@ -522,6 +530,12 @@ impl Reloader {
             revision(table.iter().map(|(id, (doc, _))| (id.as_str(), doc))),
         );
         self.state.views.replace_schemas(schemas);
+        *self
+            .retention
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(retention::load(
+            retention_docs.iter().map(|(t, d)| (t.as_str(), d)),
+        ));
         *cache = next;
         drop(cache);
         rule_documents::reload(&self.state, &mut *self.policy.lock().await).await
@@ -582,6 +596,7 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
         cache: tokio::sync::Mutex::new(HashMap::new()),
         policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
         schema_max: schema_max(std::env::var(SCHEMA_MAX_ENV).ok())?,
+        retention: std::sync::RwLock::default(),
     });
     reloader.reload().await?;
     // The routes live in the table the reloader fills; a strong handle there
@@ -592,6 +607,15 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|ms| *ms > 0)
         .unwrap_or(5000);
+    let sweeping = reloader.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(retention::SWEEP_EVERY);
+        loop {
+            tick.tick().await;
+            let rules = sweeping.retention_rules();
+            retention::sweep(&sweeping.state, &rules, chrono::Utc::now()).await;
+        }
+    });
     let looping = reloader.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(every));
@@ -605,6 +629,13 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
 }
 
 impl Reloader {
+    fn retention_rules(&self) -> Arc<retention::Rules> {
+        self.retention
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     async fn reload_or_log(&self) {
         if let Err(e) = self.reload().await {
             tracing::warn!(
@@ -621,6 +652,16 @@ impl Reloader {
 pub struct Reload(Arc<Reloader>);
 
 impl Reload {
+    /// One retention sweep at `now` over the rules the last reload found
+    /// (the loop [`install`] starts runs it every minute).
+    pub async fn sweep_retention(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<retention::Deleted> {
+        let rules = self.0.retention_rules();
+        retention::sweep(&self.0.state, &rules, now).await
+    }
+
     /// Rebuild the table from the store now.
     ///
     /// # Errors
@@ -671,6 +712,7 @@ fn admin(r: &Weak<Reloader>) -> Router {
         )
         .merge(preview::routes(r))
         .merge(rule_documents::routes(r))
+        .merge(retention::routes(r))
 }
 
 /// Run `f` with the reloader, or answer 503 once the runtime that ran
@@ -1048,6 +1090,7 @@ mod tests {
             cache: tokio::sync::Mutex::new(HashMap::new()),
             policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
             schema_max: None,
+            retention: std::sync::RwLock::default(),
         });
         let put = put_schema(r.clone(), "city".into(), Bytes::from_static(b"{}")).await;
         assert_eq!(put.map(|p| p.status()), Ok(StatusCode::SERVICE_UNAVAILABLE));
