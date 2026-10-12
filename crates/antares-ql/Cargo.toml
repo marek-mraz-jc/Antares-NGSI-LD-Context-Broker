@@ -8,6 +8,8 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 readme = "README.md"
+# reads the vendored ETSI suite, which is not in the package
+exclude = ["tests/etsi_fixtures.rs"]
 keywords = ["ngsi-ld", "etsi", "query-language", "geospatial", "fiware"]
 categories = ["parser-implementations", "science::geo"]
 
