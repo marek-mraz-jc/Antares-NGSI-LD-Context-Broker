@@ -879,6 +879,16 @@ async fn put_schema(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Res
             ))
         }
     };
+    if let Some(slot) = member_slot(text) {
+        return Ok(problem(
+            StatusCode::BAD_REQUEST,
+            "BadRequestData",
+            &format!(
+                "slot {slot:?} is a member of an NGSI-LD Attribute, never an Attribute \
+                 name: no Entity can carry it; give the slot another name, one that says what it holds (pm10, not value)"
+            ),
+        ));
+    }
     let doc = serde_json::json!({"id": key, "text": text});
     let replaced = r.state.put_view_doc(&key, doc).await?;
     r.reload().await?;
@@ -888,6 +898,55 @@ async fn put_schema(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Res
         StatusCode::CREATED
     }
     .into_response())
+}
+
+/// Members of an Attribute instance an Entity also carries, or that the
+/// platform's core model (`ngsi-ld-core.linkml.yaml`, imported by every
+/// compiled data model) declares as slots of every Entity: a surface reads
+/// them as the Entity's own, so they stay allowed (T-3956).
+const ENTITY_SLOTS: [&str; 6] = [
+    "type",
+    "observedAt",
+    "createdAt",
+    "modifiedAt",
+    "deletedAt",
+    "expiresAt",
+];
+
+/// The first slot of a `LinkML` schema named after a member of an Attribute
+/// instance (`value`, `object`, `unitCode`, ...): no Entity can carry it as
+/// an Attribute, the expansion reads the key as that member. The schema's own
+/// slots, each class's slots and slot usages (T-3956).
+fn member_slot(text: &str) -> Option<String> {
+    let doc: serde_json::Value = serde_json::from_str(text).ok()?;
+    let keys = |v: Option<&serde_json::Value>| {
+        v.and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flat_map(|o| o.keys().cloned())
+            .collect::<Vec<_>>()
+    };
+    let mut names = keys(doc.get("slots"));
+    for class in doc
+        .get("classes")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flat_map(serde_json::Map::values)
+    {
+        names.extend(keys(class.get("slot_usage")));
+        names.extend(
+            class
+                .get("slots")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned),
+        );
+    }
+    names.into_iter().find(|n| {
+        antares_jsonld::RESERVED_MEMBERS.contains(&n.as_str())
+            && !ENTITY_SLOTS.contains(&n.as_str())
+    })
 }
 
 fn no_schema() -> Response {
