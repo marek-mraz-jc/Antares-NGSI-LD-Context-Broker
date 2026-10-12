@@ -177,6 +177,13 @@ pub fn with_view(
         // so the view has nothing of its own to narrow there.
         return engine;
     }
+    if crate::policy::NAME_READS.contains(&clause) {
+        // Serve @context (5.13.4) is offered through no view: refused here,
+        // as it was before NAME_READS took a narrowing (T-4009).
+        return Err(Denied(format!(
+            "{clause} serves no stored @context through a view"
+        )));
+    }
     if crate::policy::WRITE_BY_ID.contains(&clause) && CHECKED_WRITES.contains(&clause) {
         // Rule 7 as below, the engine's answer the condition its write
         // holds the stored Entity to (`gate`), checked beside the view's;

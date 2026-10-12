@@ -94,6 +94,13 @@ pub const FILTERABLE: [&str; 15] = [
 /// projects is a deny there ([`resolve`], T-3673).
 pub const RECORD_LISTS: [&str; 3] = ["5.8.4", "5.11.5", "5.10.2"];
 
+/// List and Serve @context (5.13.3, 5.13.4). A stored `@context` may define
+/// a term for an Attribute the caller may not see, so a narrowing there,
+/// whatever it holds, says the caller sees fewer names than the tenant
+/// holds: the list is the core `@context` alone and a stored one is not
+/// found (ADR-0023 rule 5, T-4009). [`resolve`] passes it through.
+pub const NAME_READS: [&str; 2] = ["5.13.3", "5.13.4"];
+
 /// Who is asking. The headers are the ones a deployment names for the
 /// seam to carry, copied verbatim and never interpreted: the broker does
 /// not know what a token is. They never leave this process — stripped from every
@@ -1208,7 +1215,7 @@ pub fn resolve(clause: &str, decision: Decision) -> Decision {
         Decision::Filter(f) if RECORD_LISTS.contains(&clause) && f.projects() => Decision::Deny(
             format!("{clause} lists records whole and a narrowing there cannot project"),
         ),
-        Decision::Filter(f) if !FILTERABLE.contains(&clause) => {
+        Decision::Filter(f) if !FILTERABLE.contains(&clause) && !NAME_READS.contains(&clause) => {
             if f.is_empty() {
                 Decision::Allow
             } else if WHOLE_TENANT.contains(&clause) {
