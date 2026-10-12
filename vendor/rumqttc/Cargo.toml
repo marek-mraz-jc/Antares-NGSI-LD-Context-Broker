@@ -164,3 +164,7 @@ features = ["tokio_io"]
 optional = true
 default-features = false
 
+
+# rustls-webpki's library is named `webpki` (src/tls.rs), which cargo-machete does not match.
+[package.metadata.cargo-machete]
+ignored = ["rustls-webpki"]

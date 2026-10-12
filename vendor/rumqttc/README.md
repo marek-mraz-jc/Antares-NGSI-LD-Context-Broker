@@ -3,8 +3,8 @@
 `src/` is rumqttc 0.25.1 from crates.io byte for byte (`.crate` sha256
 0feff8d882bff0b2fddaf99355a10336d43dd3ed44204f85ece28cf9626ab519, the checksum in
 Cargo.lock before this copy), Apache-2.0 (LICENSE). `Cargo.toml` is the published manifest
-with its examples, tests and dev-dependencies removed and one change:
-`rustls-webpki` 0.102.8 -> 0.103.13. rumqttc uses webpki for one error variant
+with its examples, tests and dev-dependencies removed, a cargo-machete note (the
+dependency's library is named `webpki`), and one change: `rustls-webpki` 0.102.8 -> 0.103.13. rumqttc uses webpki for one error variant
 (`src/tls.rs`, `TlsError::WebPki`), whose type is the same in 0.103.
 
 Why: every rumqttc release and upstream main pin `rustls-webpki ^0.102.8`, which has
