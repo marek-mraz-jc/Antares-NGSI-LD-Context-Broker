@@ -453,6 +453,7 @@ async fn replay_respects_the_egress_policy_of_the_moment() {
     st.egress = Arc::new(antares_api::egress::Egress::new(
         antares_jsonld::EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         },
     ));
     let (uri, hits, _) = receiver(StatusCode::OK).await;
