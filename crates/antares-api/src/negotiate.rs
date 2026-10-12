@@ -649,6 +649,11 @@ pub(crate) fn check_params(
             return Err(NgsiError::InvalidRequest(format!("unknown query parameter {k:?}")).into());
         }
     }
+    // 4.19: a malformed scopeQ is refused before any read, at every
+    // operation that takes one (T-3959)
+    if let Some(s) = params.get("scopeQ") {
+        antares_ql::scope::check_scope_q(s)?;
+    }
     Ok(())
 }
 

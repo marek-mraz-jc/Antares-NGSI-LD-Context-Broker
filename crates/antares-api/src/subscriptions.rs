@@ -531,7 +531,14 @@ fn norm_member(
         // is __subject. The prefix as a whole is the broker's, so a member
         // added later cannot be forgotten here.
         k if k.starts_with("__") => return Ok(()),
-        "scopeQ" | "lang" | "subscriptionName" | "name" | "description" | "jsonldContext"
+        "scopeQ" => {
+            let q = v
+                .as_str()
+                .ok_or_else(|| bad("scopeQ must be a string (5.2.12)".into()))?;
+            antares_ql::scope::check_scope_q(q)?;
+            out.insert(k.to_owned(), v.clone());
+        }
+        "lang" | "subscriptionName" | "name" | "description" | "jsonldContext"
         | "ngsildConformance" | "datasetId" => {
             out.insert(k.to_owned(), v.clone());
         }
