@@ -41,11 +41,12 @@ static TASK_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// caller's transaction: this ring lives in the process and a full one
 /// drops, which is why the drop is counted.
 fn queue_for_matching(
-    tx: &tokio::sync::mpsc::Sender<Vec<Change>>,
+    tx: &tokio::sync::mpsc::Sender<(u64, Vec<Change>)>,
     pending: &std::sync::atomic::AtomicUsize,
     changes: Vec<Change>,
 ) {
-    if tx.try_send(changes).is_ok() {
+    // stamped now, after the write: a subscription made later never matches it
+    if tx.try_send((crate::mirror::tick(), changes)).is_ok() {
         pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     } else {
         note_drop();
@@ -81,9 +82,12 @@ async fn subs_for(
     tenant: &TenantId,
     types: &[&str],
     changed: &[&str],
+    queued: u64,
 ) -> Vec<Arc<Value>> {
     match &st.sub_mirror {
-        Some(m) => m.candidates(tenant.as_str(), types, changed),
+        Some(m) => m.candidates_before(tenant.as_str(), types, changed, queued),
+        // ponytail: the scan reads subscriptions as they are now, so a change
+        // drained late may reach one made after it; only the never-wired path.
         // The scan is the fallback, so its own failure may not be read as
         // "this tenant has no subscriptions" either: that is the silence
         // the mirror seed refuses to install.
@@ -200,7 +204,7 @@ pub(crate) async fn wire_matcher(state: &mut AppState) {
     // inline delivery at a time, so behind one slow subscriber an unbounded
     // queue grows until the process dies. Bounded instead: a full queue drops
     // the change and counts it.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<Change>>(CHANGE_QUEUE);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Vec<Change>)>(CHANGE_QUEUE);
     let flush_tx = tx.clone();
     let flush_pending = state.pending_changes.clone();
     state.change_flush = Some(Arc::new(move |changes: Vec<Change>| {
@@ -235,20 +239,21 @@ pub(crate) async fn wire_matcher(state: &mut AppState) {
     let st = state.clone();
     let pending = state.pending_changes.clone();
     crate::spawn_loop(async move {
-        while let Some(mut batch) = rx.recv().await {
+        while let Some((queued, first)) = rx.recv().await {
+            let mut batch: Vec<(u64, Change)> = first.into_iter().map(|c| (queued, c)).collect();
             let mut taken: usize = 1;
             // everything already queued behind it rides the same pass
             while batch.len() < CHANGE_BATCH {
                 match rx.try_recv() {
-                    Ok(c) => {
-                        batch.extend(c);
+                    Ok((queued, c)) => {
+                        batch.extend(c.into_iter().map(|c| (queued, c)));
                         taken = taken.saturating_add(1);
                     }
                     Err(_) => break,
                 }
             }
             let st = st.clone();
-            guarded(async move { process_changes(&st, batch).await }).await;
+            guarded(async move { process_queued(&st, batch).await }).await;
             pending.fetch_sub(taken, std::sync::atomic::Ordering::SeqCst);
         }
     });
@@ -1250,6 +1255,12 @@ pub async fn process_change(
 /// travels in one notification, so a batch of N entities is one POST with N
 /// data entries (and timesSent moves by one), never N POSTs.
 pub(crate) async fn process_changes(st: &AppState, changes: Vec<Change>) {
+    process_queued(st, changes.into_iter().map(|c| (u64::MAX, c)).collect()).await;
+}
+
+/// [`process_changes`] of changes each stamped with the [`crate::mirror::tick`]
+/// they were queued at.
+async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>) {
     let mut groups: Vec<Matched> = Vec::new();
     // (tenant, subscription id) → its group. A scan for the group would be
     // linear in the subscriptions already matched, and a drain of
@@ -1259,8 +1270,8 @@ pub(crate) async fn process_changes(st: &AppState, changes: Vec<Change>) {
     let mut index: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
     let mut ctx_memo = CtxMemo::new();
-    for (tenant_str, before, after) in changes {
-        for m in matches_for(st, &tenant_str, before, after, &mut ctx_memo).await {
+    for (queued, (tenant_str, before, after)) in changes {
+        for m in matches_for(st, &tenant_str, before, after, queued, &mut ctx_memo).await {
             let key = (
                 m.tenant.as_str().to_owned(),
                 m.sub
@@ -1370,6 +1381,7 @@ async fn matches_for(
     tenant_str: &str,
     before: Option<Value>,
     after: Option<Value>,
+    queued: u64,
     ctx_memo: &mut CtxMemo,
 ) -> Vec<Matched> {
     let mut out = Vec::new();
@@ -1394,7 +1406,7 @@ async fn matches_for(
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
     let changed_keys: Vec<&str> = changes.iter().map(|(k, _)| k.as_str()).collect();
-    let subs = subs_for(st, &tenant, &types, &changed_keys).await;
+    let subs = subs_for(st, &tenant, &types, &changed_keys, queued).await;
     for sub in subs {
         if !is_active(&sub) || sub.get("timeInterval").is_some() {
             continue;
