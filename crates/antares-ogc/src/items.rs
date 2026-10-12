@@ -483,12 +483,8 @@ pub(crate) async fn page(
     c: &Collection,
     p: &Params,
     digest: u64,
-    base: &str,
+    refs: Refs<'_>,
 ) -> Result<Page, Problem> {
-    let refs = Refs {
-        profile: p.profile,
-        base,
-    };
     let terms = Terms::of(c);
     let targets = targets(c, &terms, p);
     let (start, offset) = match &p.next {
@@ -557,15 +553,18 @@ pub(crate) fn feature(
             Some((p.name.clone(), value))
         })
         .collect();
-    Map::from_iter([
+    let id = doc.get("id").cloned().unwrap_or(Value::Null);
+    let links = id.as_str().map(|urn| refs.links(&c.id, urn));
+    let mut feature = Map::from_iter([
         ("type".to_owned(), json!("Feature")),
-        (
-            "id".to_owned(),
-            doc.get("id").cloned().unwrap_or(Value::Null),
-        ),
+        ("id".to_owned(), id),
         ("geometry".to_owned(), geometry),
         ("properties".to_owned(), Value::Object(properties)),
-    ])
+    ]);
+    if let Some(links) = links {
+        feature.insert("links".to_owned(), Value::from(links));
+    }
+    feature
 }
 
 /// How one request writes references (S7): the profile and the endpoint's URI.
@@ -573,9 +572,35 @@ pub(crate) fn feature(
 pub(crate) struct Refs<'a> {
     pub profile: Profile,
     pub base: &'a str,
+    /// Whether the view offers Retrieve Entity, so a Feature's canonical Entity answers (EP-38).
+    pub alternate: bool,
 }
 
 impl Refs<'_> {
+    /// EP-38: a Feature's `alternate` link to its Entity under the same view's NGSI-LD root,
+    /// when the view offers Retrieve Entity (never the Tenant's API, never a link to a 403), and
+    /// its `describedby` link to the collection's schema.
+    pub(crate) fn links(self, collection: &str, urn: &str) -> Vec<Value> {
+        let entity = self
+            .base
+            .strip_suffix("/ogc/features")
+            .filter(|_| self.alternate)
+            .map(|root| {
+                json!({
+                    "rel": "alternate",
+                    "type": "application/ld+json",
+                    "title": urn,
+                    "href": format!("{root}/ngsi-ld/v1/entities/{}", encode(urn)),
+                })
+            });
+        let schema = crate::link(
+            "describedby",
+            crate::SCHEMA,
+            &format!("{}/collections/{collection}/schema", self.base),
+        );
+        entity.into_iter().chain([schema]).collect()
+    }
+
     /// A reference to `urn` in the collection `target` the view shows, as `rel-as-uri` or
     /// `rel-as-link` write it (`rel-as-key` keeps the URN and never calls this).
     fn render(self, target: &str, urn: &str) -> Value {
@@ -831,10 +856,48 @@ mod tests {
     }
 
     #[test]
+    fn a_feature_links_its_entity_only_when_the_view_retrieves_it() {
+        let refs = |alternate| Refs {
+            profile: Profile::Key,
+            base: "http://h/x/views/city/ogc/features",
+            alternate,
+        };
+        let urn = "urn:ngsi-ld:Car:a#1";
+        assert_eq!(
+            refs(true).links("Car", urn),
+            [
+                json!({"rel": "alternate", "type": "application/ld+json", "title": urn,
+                       "href": "http://h/x/views/city/ngsi-ld/v1/entities/urn%3Angsi-ld%3ACar%3Aa%231"}),
+                json!({"rel": "describedby", "type": "application/schema+json",
+                       "href": "http://h/x/views/city/ogc/features/collections/Car/schema"}),
+            ]
+        );
+        let without = refs(false).links("Car", urn);
+        assert_eq!(without.len(), 1, "no Retrieve Entity, no alternate link");
+        assert_eq!(
+            without.first().and_then(|l| l.get("rel")),
+            Some(&json!("describedby"))
+        );
+        let terms = Terms::of(&car());
+        let nameless = feature(&car(), &terms, &json!({"type": "Car"}), refs(true));
+        assert_eq!(nameless.get("links"), None, "no id, nothing to link");
+        let elsewhere = Refs {
+            base: "http://h/other",
+            ..refs(true)
+        };
+        assert_eq!(
+            elsewhere.links("Car", urn).len(),
+            1,
+            "a base off the view has no entity root"
+        );
+    }
+
+    #[test]
     fn references_render_each_urn_of_an_object() {
         let refs = Refs {
             profile: Profile::Uri,
             base: "http://b",
+            alternate: false,
         };
         let render = |urn: &str| refs.render("Stop", urn);
         assert_eq!(

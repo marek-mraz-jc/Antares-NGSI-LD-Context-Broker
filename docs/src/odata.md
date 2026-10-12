@@ -87,11 +87,14 @@ root.
 | `{Set}('{id}')/$ref` | Retrieve Entity; the Entity's reference, `404` when hidden or absent; `$select` or `$expand` is `400` |
 | `POST {Set}/$query` | the same `GET`: the body's options (`text/plain` or a form) joined to the URL's |
 | `$filter` | `q` and `id` (section 4) |
-| `$orderby` | `orderBy` on `id` and single-valued values, `;desc` |
+| `$search` | one more `$filter` conjunct: a word or `"phrase"` matches when a single-valued String property the view shows contains it, case-insensitively; `NOT` before `AND` (or a space) before `OR`; evaluated by the residual on what the view and the engine admit, so a hidden property never matches (T-3750) |
+| `$compute` | `expr as name`, evaluated per Entity by the residual on what the view and the engine admit and written as a dynamic property; the name works in `$filter`, `$orderby` (sorted by the surface) and `$select`; a hidden Attribute reads as absent, so its computed value is `null` (T-3936) |
+| `$orderby` | `orderBy` on `id` and single-valued values, `;desc`; `createdAt`, `modifiedAt` sorted by the surface (section 4) |
 | `$select` | `attrs`; `createdAt`/`modifiedAt` add `options=sysAttrs` |
 | `$expand` | `join=inline&joinLevel=1` (section 5) |
 | `$top`, `$skip`, `Prefer: odata.maxpagesize` | `limit`, `offset`; a page is at most 1000, 100 by default |
-| `$count=true` | `@odata.count` from `NGSILD-Results-Count` |
+| `$count=true` | `@odata.count` from `NGSILD-Results-Count`, or counted by the surface (section 4) |
+| `ngsild.q`, `ngsild.scopeQ`, `ngsild.georel`, `ngsild.geometry`, `ngsild.coordinates`, `ngsild.geoproperty`, `ngsild.pick`, `ngsild.omit` | the NGSI-LD parameter of that name, ANDed into the query of a `{Set}` or `{Set}/$count` (section 4) |
 
 Below one Entity only `$select` applies; another option there is `501`. A
 hidden or absent property or single target is `404`, a hidden target of a
@@ -104,7 +107,9 @@ of the request when it is unset, as for the JSON-LD context URL.
 
 A page that leaves rows carries `@odata.nextLink` with a `$skiptoken`. The
 token is bound to the view and the query: a token beside `$skip`/`$top`,
-from another query or another view is `400`. A query in a Tenant that holds
+from another query or another view, or one issued before T-3758, is `400`.
+A page may hold fewer rows than asked and still carry a next link, when the
+surface read its budget before it filled (section 4). A query in a Tenant that holds
 nothing yet answers an empty set.
 
 ## 3. Writes
@@ -172,7 +177,9 @@ batch inside a batch is `400`.
 
 ## 4. `$filter`
 
-A filter is translated to `q`, never evaluated in the surface. Each
+A filter is split at its top-level `and`s. A part `q` can say is
+translated to `q`; any other the residual evaluator covers is evaluated on
+the Entities the view answered, never on more (ADR-0028). Each
 Attribute is named by a term `t{n}` the request's own `@context` defines,
 so a client `Link` header cannot change what a filter means.
 
@@ -192,8 +199,40 @@ number promotes among the numeric types (`Quantity lt 7.5`), an integer
 past its type's range is refused (`Size eq 9223372036854775808`), and
 `null` compares with any member. A number past 2^53 is `400` (NGSI-LD
 compares `f64`). A filter longer than 4096 bytes as `q` is `400`
-`TooComplexQuery`. Lambda operators, arithmetic, other functions, two
-members compared and paths past one hop are `501`.
+`TooComplexQuery`. Paths past one hop, durations, `cast`, `isof`,
+`case`, `hassubset`, `hassubsequence`, `totalseconds`, `geo.distance` and
+`geo.length` are `501`.
+
+Evaluated by the surface (T-3758, T-3749): `not` over any filter here
+(`not (Price gt 5)` holds where `Price` is absent: OData compares a
+missing value as false), a `geo.intersects` that is not the one top-level
+conjunct, arithmetic (`Price mul Quantity gt 100`, `-Price lt 0`), two
+members compared (`Price gt Cost`), the string functions (`length`,
+`indexof`, `substring`, `concat`, `tolower`, `toupper`, `trim`,
+`matchesPattern` with an ECMAScript pattern), the date and time functions
+(`year` to `fractionalseconds`, `totaloffsetminutes`, `date`, `time`,
+`now()`, `mindatetime()`, `maxdatetime()`), `round`, `floor`, `ceiling`,
+and `any`/`all` over a list (`Tags/all(t: t ne 'x')`; an absent list is
+empty). An operand of the wrong type is `400`: `length(Price)`, `Name add
+1`, `Price eq Name`.
+Such a filter reads the answer in pages of up to 1000 Entities ordered by
+the request's `$orderby` and then `id`, at most 10 000 per request: a page
+that runs out of budget is served short with its next link.
+`$count=true`, `/$count` and a `$orderby` on `createdAt` or `modifiedAt`
+read the whole answer, which is `400` `TooManyResults` when the broker
+counts more than 10 000 Entities. Such a read beside an `$expand` of
+entities, or with a navigation hop in the filter, is `501` until the scan
+can see a truncated join (T-3823).
+
+The custom options `ngsild.q`, `ngsild.scopeQ`, `ngsild.georel`,
+`ngsild.geometry`, `ngsild.coordinates`, `ngsild.geoproperty`,
+`ngsild.pick` and `ngsild.omit` take NGSI-LD values (TS 104 176 7.2.3.1)
+whose names are read under the view's `@context`. They only narrow:
+`ngsild.q` is ANDed with the filter, `ngsild.geo*` takes the one `geoQ`,
+and `ngsild.pick`/`ngsild.omit` drop members from the answer without
+changing which Entities match. Each is accepted once, on a collection or
+its `$count`; a `ngsild.q` that does not parse is `400`, a bad value of the
+others the broker's own `400`.
 
 ## 5. `$expand`
 
@@ -213,9 +252,9 @@ budget of 1000 lookups is `400`, never a partial answer. A nested
 Create, Merge or Replace, and Delete Entity, with the members no write
 names; `Countable`, `Filterable` and `Sortable` with the members they
 refuse (`NonFilterableProperties`, `NonSortableProperties`), `Expandable`
-one level, no upsert, deep insert, deep update or search, and
-`QuerySegmentSupported`. The container declares `BatchSupported` and
-`BatchSupport` (`multipart/mixed` and `application/json`, continue on
+one level, no upsert, deep insert or deep update, and `Searchable`. The
+container declares `QuerySegmentSupported`, `ComputeSupported`,
+`BatchSupported` and `BatchSupport` (`multipart/mixed` and `application/json`, continue on
 error, no Content-ID references; T-3723). The annotations are advisory:
 every request is still gated, and a read the engine denies is `403`
 whatever they say.
@@ -226,12 +265,12 @@ Every `GET` answers `HEAD` too: the same status and headers, with the
 ## 7. Refusals and errors
 
 The OData features no NGSI-LD operation stands behind (matrix 7.1 of
-`docs/analysis/operation-matrix.yaml`: `$apply`, `$search`, `$compute`,
+`docs/analysis/operation-matrix.yaml`: `$apply`,
 actions, functions, `$crossjoin`, `$all`, delta, media, and the rest) are
 refused with the status the matrix names, before any gate or store access.
 An upsert is the exception: it is the Merge or Replace Entity it names,
-gated, and answers that operation's `404`. A custom query option is
-`400`. A query a form encoder wrote reads as its plain form (T-3719):
+gated, and answers that operation's `404`. A custom query option other
+than the `ngsild.` ones of section 4 is `400`. A query a form encoder wrote reads as its plain form (T-3719):
 `%24filter` is `$filter`, `%2F` and `%3D` are the query's `/` and `=`, and
 `+` is a space where the grammar requires whitespace (`Price+gt+5`), never
 inside a literal; a `$format` media type is read percent-decoded
@@ -249,4 +288,4 @@ carries no NGSI-LD `ProblemDetails`.
 - [MCP endpoint of a view](mcp.md)
 - [OData compliance](odata-compliance.md): the independent suite, its baseline and pass rate per level
 - `docs/analysis/odata-linkml-mapping.md`, `docs/analysis/surfaces-threat-model.md` (O1 to O27)
-- ADR-0024 (the OData crates)
+- ADR-0024 (the OData crates), ADR-0028 (pushdown and residual)

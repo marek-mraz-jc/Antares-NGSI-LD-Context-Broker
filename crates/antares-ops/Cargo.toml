@@ -20,7 +20,10 @@ antares-api = { workspace = true, features = ["views"] }
 antares-jsonld = { workspace = true }
 antares-model = { workspace = true }
 antares-ql = { workspace = true }
+antares-residual = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+metrics = { version = "0.24", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"] }

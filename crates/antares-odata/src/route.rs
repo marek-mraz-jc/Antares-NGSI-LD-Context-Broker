@@ -15,7 +15,7 @@ use antares_ops::{Caller, OperationId};
 use axum::http::header::{IF_MATCH, IF_NONE_MATCH};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use odata_axum::{json_level, ODataRequest};
+use odata_axum::{json_level, ODataErrorResponse, ODataRequest};
 use odata_json::{Ctx, WriteKind};
 use odata_url::{Key, ODataUri, QueryOptions, Segment};
 
@@ -30,6 +30,21 @@ pub(crate) async fn serve(
     body: &[u8],
 ) -> Response {
     let version = request.version;
+    if let ODataUri::Resource { path, options } = &request.uri {
+        let collection = matches!(
+            path.as_slice(),
+            [Segment::EntitySet(_)] | [Segment::EntitySet(_), Segment::Ref | Segment::Count]
+        );
+        if !(options.custom.is_empty() || collection && method == Method::GET) {
+            return ODataErrorResponse::new(
+                StatusCode::BAD_REQUEST,
+                "BadRequest",
+                "the ngsild options apply to reading a collection",
+            )
+            .with_version(version)
+            .into_response();
+        }
+    }
     if method != Method::GET {
         return write(reads, method, caller, request, headers, body).await;
     }
