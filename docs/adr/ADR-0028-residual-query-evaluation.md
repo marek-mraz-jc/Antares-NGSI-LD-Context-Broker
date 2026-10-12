@@ -157,6 +157,21 @@ evaluated:
 Nothing is counted approximately, and no page is served from a partial
 sort.
 
+A pushed OData `$orderby` follows URL 5.1.5 too: a missing value comes
+first ascending and last descending. The store orders a missing Attribute
+after every value, so the read first asks one count of the Entities that
+lack a sort key, `q=(<q>);(!k1|!k2…)`. A count of 0 keeps the pushed sort
+and its paging. Any other count turns the read into the surface sort
+above, within `RESIDUAL_SCAN` and refused beyond it (T-3853).
+
+Decided (worker-4, owner may override): count first, then sort on the
+surface only when a key is missing somewhere, because one count costs
+less than a scan and leaves the common case pushed; options: split a
+pushed sort into "lacks the key" and "holds it" reads (right for the
+first key only, 2^k reads for k keys), always sort on the surface (a
+scan for every `$orderby`), keep the store's order (contradicts URL
+5.1.5 and the surface sort of `createdAt`).
+
 Decided (worker-1, owner may override): 400 with the NGSI-LD error name
 `TooManyResults`, because the caller fixes it by narrowing the query and
 OData already answers `TooComplexQuery` with 400 (`filter.rs` `Refused::TooComplex`);
