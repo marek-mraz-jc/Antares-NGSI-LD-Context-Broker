@@ -5,7 +5,7 @@
 use crate::document::{context, covers, scope_paths, Policy, Table};
 use crate::subject::{Caller, Platform};
 use antares_api::policy::{
-    Decision, Filter, Operation, Rule, Warning, FILTERABLE, WHOLE_TENANT, WRITE_BY_ID,
+    Decision, Filter, Operation, Rule, Warning, FILTERABLE, NAME_READS, WHOLE_TENANT, WRITE_BY_ID,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -87,6 +87,8 @@ pub fn decide(
         }
     } else if op.clause.starts_with("5.6.") {
         write(&grants, op, &types)
+    } else if NAME_READS.contains(&op.clause) {
+        names(table, platform, now)
     } else {
         Decision::Allow
     }
@@ -188,6 +190,22 @@ pub fn covers_types(p: &Policy, types: &[String]) -> bool {
 
 fn unconditional_whole(p: &Policy) -> bool {
     p.selectors.is_empty() && !p.is_conditional()
+}
+
+/// List and Serve @context (ADR-0023 rule 5, T-4009): a stored `@context`
+/// may define a term for any Attribute, so only a caller who may query every
+/// Entity whole, and is prohibited none, sees the tenant's. Anyone else gets
+/// a narrowing with one rule that shows nothing: the core `@context` alone.
+fn names(table: &Table, caller: &Platform, now: DateTime<Utc>) -> Decision {
+    let query = || held(table, caller, now).filter(|p| p.clauses.contains("5.7.2"));
+    if !query().any(|p| p.prohibit) && query().any(|p| !p.prohibit && unconditional_whole(p)) {
+        return Decision::Allow;
+    }
+    Decision::Filter(Filter {
+        rules: vec![Rule::default()],
+        restricted: caller.restricted,
+        ..Filter::default()
+    })
 }
 
 /// A read: one rule per selector of every grant (ADR-0023 rule 11).
@@ -596,6 +614,34 @@ mod tests {
                 "{attrs:?} {body}: {d:?}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn the_stored_contexts_are_listed_only_to_a_caller_who_queries_every_entity_whole(
+    ) -> Result<(), String> {
+        // T-4009: a stored @context may define a term for an Attribute the
+        // caller's grant hides, so a narrowed reader lists the core alone
+        let ops = json!(["5.7.2", "5.13.3", "5.13.4"]);
+        let whole = table(&json!({"operations": ops, "information": []}))?;
+        let cars = table(&json!({"operations": ops}))?;
+        let speed = table(&json!({"operations": ops,
+            "information": [{"entities": [{"type": "Car"}], "propertyNames": ["speed"]}]}))?;
+        let no_query = table(&json!({"operations": ["5.13.3", "5.13.4"], "information": []}))?;
+        for clause in ["5.13.3", "5.13.4"] {
+            assert_eq!(on(&whole, clause, None), Decision::Allow, "{clause}");
+            for (name, t) in [("cars", &cars), ("speed", &speed), ("no query", &no_query)] {
+                let Decision::Filter(f) = on(t, clause, None) else {
+                    return Err(format!("{name} {clause}: a narrowing"));
+                };
+                assert!(!f.is_empty(), "{name} {clause}");
+            }
+        }
+        let not_listed = table(&json!({"operations": ["5.7.2"], "information": []}))?;
+        assert_eq!(
+            on(&not_listed, "5.13.3", None),
+            Decision::Deny(NOT_GRANTED.into())
+        );
         Ok(())
     }
 

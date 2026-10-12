@@ -298,6 +298,7 @@ dependencies = [
  "antares-ops",
  "antares-ql",
  "antares-residual",
+ "antares-sql",
  "axum",
  "chrono",
  "http-body-util",
