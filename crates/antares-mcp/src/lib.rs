@@ -60,6 +60,16 @@ pub const MAX_RESULT_BYTES_ENV: &str = "ANTARES_MCP_MAX_RESULT_BYTES";
 /// own and a confirmation answers only the process that asked.
 pub const REQUEST_STATE_KEY_FILE_ENV: &str = "ANTARES_MCP_REQUEST_STATE_KEY_FILE";
 
+/// Every variable this crate reads. The broker accepts these as config keys
+/// from here, so a new one is added in this crate alone (T-3766).
+pub const ENV_KEYS: &[&str] = &[
+    ALLOWED_HOSTS_ENV,
+    ALLOWED_ORIGINS_ENV,
+    MAX_RESULT_BYTES_ENV,
+    REQUEST_STATE_KEY_FILE_ENV,
+    SUBSCRIPTION_ENDPOINTS_ENV,
+];
+
 pub use listen::Sink;
 pub use schema::SUBSCRIPTION_ENDPOINTS_ENV;
 
