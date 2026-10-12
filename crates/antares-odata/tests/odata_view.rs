@@ -165,7 +165,8 @@ async fn odata_skiptoken_from_another_query_is_400() {
         let (s, body) = send(&app, "GET", &format!("{root}?{query}"), "", &[]).await;
         assert_eq!(s, status, "{query}: {body}");
     }
-    let edited = format!("2{}", issued.trim_start_matches('1'));
+    // `2.{cursor}.{skip}.{top}.{digest}` (T-3758): the cursor of the first page is 1
+    let edited = format!("2.2.{}", issued.trim_start_matches("2.1."));
     let (s, body) = send(
         &app,
         "GET",

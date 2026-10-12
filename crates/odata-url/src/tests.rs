@@ -571,12 +571,11 @@ fn filter_errors() {
         ("$root/Buildings", Feature::Root, 0),
         ("$it/height", Feature::ImplicitVariable, 0),
         ("$this", Feature::ImplicitVariable, 0),
-        ("-height", Feature::Arithmetic, 0),
-        ("height add 1", Feature::Arithmetic, 7),
         ("height has 1", Feature::Has, 7),
         ("name in tags", Feature::InExpression, 8),
         ("name in (name)", Feature::InExpression, 8),
-        ("length(name) gt 1", Feature::Method, 0),
+        ("totalseconds(name) gt 1", Feature::Method, 0),
+        ("hassubset(tags,tags)", Feature::Method, 0),
         ("geo.distance(location,location) lt 1", Feature::Method, 0),
         ("cast(name,Edm.String)", Feature::CastIsOf, 0),
         ("isof(Model.Tower)", Feature::CastIsOf, 0),
@@ -591,7 +590,6 @@ fn filter_errors() {
         ("tags/$count gt 1", Feature::NestedCount, 4),
         ("tags/$filter(true)", Feature::PathInExpression, 4),
         ("sensors(1)/value", Feature::PathInExpression, 7),
-        ("tags/all(t:t eq 'x')", Feature::AllLambda, 5),
         ("@Core.Messages/any()", Feature::AnnotationPath, 0),
         ("name/@Core.Size/x", Feature::AnnotationPath, 5),
         ("tags/@Core.Size/x", Feature::AnnotationPath, 5),
@@ -991,11 +989,9 @@ fn every_feature_and_limit_has_its_own_name() {
         F::NestedOption,
         F::NestedCount,
         F::PathInExpression,
-        F::Arithmetic,
         F::Has,
         F::Method,
         F::CastIsOf,
-        F::AllLambda,
         F::InExpression,
         F::JsonLiteral,
         F::Literal,
@@ -1123,4 +1119,213 @@ fn the_rest_of_the_grammar() {
     assert_eq!(ok(&rings.to_string()), rings);
     let punctuated = ok("Buildings?$filter=name eq 'a-b.c_d~e!f(g)h*i,j;k$l&m=n:o@p+q'");
     assert_eq!(ok(&punctuated.to_string()), punctuated);
+}
+
+/// The offset just past `text` in a `$filter` of `Buildings`.
+fn past(text: &str) -> usize {
+    "Buildings?$filter=".len().saturating_add(text.len())
+}
+
+/// T-3749: arithmetic binds tighter than comparison, `mul div divby mod` tighter than `add sub`,
+/// both left-associative, and negation tightest; a `-` before a number is the number.
+#[test]
+fn arithmetic_follows_the_precedence_of_5_1_1_16() {
+    let arith = |l, op, r| Expr::Arith(Box::new(l), op, Box::new(r));
+    assert_eq!(
+        filter("height add 2 mul 3 gt 10"),
+        Expr::Compare(
+            Box::new(arith(
+                member(&["height"]),
+                ArithOp::Add,
+                arith(int(2), ArithOp::Mul, int(3))
+            )),
+            CompareOp::Gt,
+            Box::new(int(10)),
+        )
+    );
+    assert_eq!(
+        filter("height sub 1 sub 2 eq 0"),
+        Expr::Compare(
+            Box::new(arith(
+                arith(member(&["height"]), ArithOp::Sub, int(1)),
+                ArithOp::Sub,
+                int(2)
+            )),
+            CompareOp::Eq,
+            Box::new(int(0)),
+        )
+    );
+    for (word, op) in [
+        ("div", ArithOp::Div),
+        ("divby", ArithOp::DivBy),
+        ("mod", ArithOp::Mod),
+    ] {
+        assert_eq!(
+            filter(&format!("height {word} 2 eq 1")),
+            Expr::Compare(
+                Box::new(arith(member(&["height"]), op, int(2))),
+                CompareOp::Eq,
+                Box::new(int(1)),
+            ),
+            "{word}"
+        );
+    }
+    assert_eq!(
+        filter("-height lt -2"),
+        Expr::Compare(
+            Box::new(Expr::Neg(Box::new(member(&["height"])))),
+            CompareOp::Lt,
+            Box::new(int(-2)),
+        )
+    );
+    assert_eq!(
+        filter("- (height add 1) lt 0"),
+        Expr::Compare(
+            Box::new(Expr::Neg(Box::new(arith(
+                member(&["height"]),
+                ArithOp::Add,
+                int(1)
+            )))),
+            CompareOp::Lt,
+            Box::new(int(0)),
+        )
+    );
+    // A dangling operator is a syntax error at the operand it lacks.
+    syntax("Buildings?$filter=height add", past("height add"));
+}
+
+/// T-3749: every method of the table parses with its arity; one argument too few fails where
+/// the `COMMA` was due, one too many where the `CLOSE` was.
+#[test]
+fn methods_parse_with_their_arity() {
+    for method in Method::all() {
+        let args = match method.arity().0 {
+            0 => String::new(),
+            1 => "name".into(),
+            _ => "name,name".into(),
+        };
+        // a method's name with no `(` after it is a member's name, here an unknown one; a
+        // dotted one reads as a qualified cast
+        let bare = err(&format!("Buildings?$filter={}%20eq%201", method.name()));
+        let want = if method.name().contains('.') {
+            "not implemented at byte 18: type cast"
+        } else {
+            "unknown name at byte 18"
+        };
+        assert_eq!(bare.to_string(), want, "{method:?}");
+        let text = format!("{}({args}) eq null", method.name().to_uppercase());
+        let parsed = filter(&text);
+        let Expr::Compare(call, CompareOp::Eq, _) = parsed else {
+            panic!("{text}: {parsed:?}")
+        };
+        assert!(
+            matches!(call.as_ref(), Expr::Call(m, a) if *m == method && a.len() == method.arity().0),
+            "{text}: {call:?}"
+        );
+    }
+    // so is the bare name of a method that stays 501, and of cast and isof
+    for name in ["totalseconds", "cast", "isof"] {
+        let bare = err(&format!("Buildings?$filter={name}%20eq%201"));
+        assert_eq!(bare.to_string(), "unknown name at byte 18", "{name}");
+    }
+    assert_eq!(
+        filter("substring(name,1,2) eq 'x'"),
+        Expr::Compare(
+            Box::new(Expr::Call(
+                Method::Substring,
+                vec![member(&["name"]), int(1), int(2)]
+            )),
+            CompareOp::Eq,
+            Box::new(Expr::Literal(Literal::String("x".into()))),
+        )
+    );
+    assert_eq!(
+        filter("year(now()) gt 2000"),
+        Expr::Compare(
+            Box::new(Expr::Call(
+                Method::Year,
+                vec![Expr::Call(Method::Now, Vec::new())]
+            )),
+            CompareOp::Gt,
+            Box::new(int(2000)),
+        )
+    );
+    syntax(
+        "Buildings?$filter=length(name,name) eq 1",
+        past("length(name"),
+    );
+    syntax("Buildings?$filter=now(name) eq 1", past("now("));
+    syntax("Buildings?$filter=concat(name) eq 'x'", past("concat(name"));
+    syntax(
+        "Buildings?$filter=substring(name,1,2,3) eq 'x'",
+        past("substring(name,1,2"),
+    );
+    // A member that shares a method's name is still the member.
+    assert_eq!(
+        filter("built eq 1"),
+        Expr::Compare(
+            Box::new(member(&["built"])),
+            CompareOp::Eq,
+            Box::new(int(1))
+        )
+    );
+}
+
+/// T-3749: `all` reads like `any`, needs its lambda, and its variable is in scope in the body
+/// only.
+#[test]
+fn all_lambdas_parse() {
+    let area = Expr::Member(MemberPath {
+        variable: Some("r".into()),
+        path: vec!["area".into()],
+    });
+    assert_eq!(
+        filter("rooms/all(r:r/area gt 10)"),
+        Expr::All {
+            collection: MemberPath {
+                variable: None,
+                path: vec!["rooms".into()],
+            },
+            lambda: (
+                "r".into(),
+                Box::new(Expr::Compare(
+                    Box::new(area),
+                    CompareOp::Gt,
+                    Box::new(int(10))
+                ))
+            ),
+        }
+    );
+    assert!(matches!(
+        filter("tags/all(t:t ne 'x') and rooms/any()"),
+        Expr::And(..)
+    ));
+    syntax("Buildings?$filter=tags/all()", past("tags/all("));
+    unresolved(
+        "Buildings?$filter=tags/all(t:t eq 'x') and t eq 'x'",
+        past("tags/all(t:t eq 'x') and "),
+    );
+}
+
+/// T-3749: the canonical writer parenthesises only what the precedence needs, and what it
+/// writes parses back to the same tree.
+#[test]
+fn arithmetic_and_lambdas_round_trip() {
+    for text in [
+        "Buildings?$filter=height%20add%202%20mul%203%20gt%2010",
+        "Buildings?$filter=(height%20add%202)%20mul%203%20gt%2010",
+        "Buildings?$filter=height%20sub%20(1%20sub%202)%20eq%200",
+        "Buildings?$filter=-height%20lt%20-2",
+        "Buildings?$filter=-(height%20add%201)%20lt%200",
+        "Buildings?$filter=-(-1)%20eq%201",
+        "Buildings?$filter=not%20(height%20add%201%20gt%202)",
+        "Buildings?$filter=rooms/all(r:r/area%20gt%2010)",
+        "Buildings?$filter=substring(name,1,2)%20eq%20'x'",
+        "Buildings?$filter=round(height%20divby%203)%20eq%201",
+        "Buildings?$filter=matchesPattern(name,'%5EA.*e$')",
+    ] {
+        let canonical = ok(text).to_string();
+        assert_eq!(canonical, text, "{text}");
+        assert_eq!(ok(&canonical).to_string(), canonical, "{text}");
+    }
 }

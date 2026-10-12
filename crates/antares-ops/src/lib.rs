@@ -37,11 +37,17 @@
 
 mod error;
 pub mod mapping;
+mod names;
 mod operation;
+mod scan;
 pub mod views;
 
+/// The residual of a standard query (ADR-0028 rule 2), re-exported so a surface compiles into
+/// it through `antares-ops` alone (rule M2).
+pub use antares_residual as residual;
 pub use error::{Refusal, INNER_DETAIL};
 pub use operation::OperationId;
+pub use scan::{Page, Pushdown, Scanned, RESIDUAL_SCAN, TOO_COMPLEX};
 
 use antares_api::AppState;
 use axum::body::Body;
@@ -120,6 +126,9 @@ pub struct ViewOps {
     tenant: antares_model::TenantId,
     operations: Vec<OperationId>,
     mapping: Option<Arc<mapping::Mapping>>,
+    /// The core @context with the view's own merged in: what a name a caller
+    /// writes in an NGSI-LD parameter means here (`names.rs`).
+    names: Arc<antares_jsonld::Context>,
 }
 
 /// The Entity types a caller may see through a view and the Attributes
@@ -370,6 +379,7 @@ impl Ops {
             tenant,
             operations,
             mapping,
+            context,
             ..
         }) = table.get(id)
         else {
@@ -396,6 +406,7 @@ impl Ops {
                 .filter_map(|o| OperationId::from_id(o))
                 .collect(),
             mapping,
+            names: Arc::new(names::of_view(context.as_deref())?),
         };
         // Only views loaded now stay cached: a removed one goes with the
         // first view served after its removal.
@@ -750,10 +761,25 @@ pub trait Surface: Send + Sync + 'static {
 /// ```
 #[must_use]
 pub fn core_name(iri: &str) -> String {
-    static CORE: std::sync::LazyLock<antares_jsonld::Context> =
-        std::sync::LazyLock::new(antares_jsonld::core_context);
     CORE.compact_iri(iri)
 }
+
+/// Whether the core @context defines the term `name` (its keyword aliases `id` and `type`
+/// included), which a surface's own @context must not define again.
+///
+/// ```
+/// assert!(antares_ops::is_core_term("location"));
+/// assert!(antares_ops::is_core_term("value"));
+/// assert!(!antares_ops::is_core_term("speed"));
+/// ```
+#[must_use]
+pub fn is_core_term(name: &str) -> bool {
+    CORE.term(name).is_some()
+}
+
+/// The core @context, read once.
+static CORE: std::sync::LazyLock<antares_jsonld::Context> =
+    std::sync::LazyLock::new(antares_jsonld::core_context);
 
 /// `surface` as the broker mounts it.
 ///
@@ -1153,6 +1179,24 @@ pub mod test_kit {
         }
     }
 
+    /// [`ViewOps::scan`](super::ViewOps::scan) with `residual` under a `budget` of upstream
+    /// Entities read in upstream pages of `upstream`, and how many it read: the bound a test
+    /// crosses with a handful of Entities instead of [`RESIDUAL_SCAN`](super::RESIDUAL_SCAN).
+    ///
+    /// # Errors
+    /// [`ViewOps::scan`](super::ViewOps::scan)'s.
+    pub async fn scan_within(
+        view: &super::ViewOps,
+        caller: &super::Caller,
+        pushdown: &super::Pushdown,
+        residual: &super::residual::Program,
+        page: super::Page,
+        (budget, upstream): (usize, usize),
+    ) -> Result<(super::Scanned, usize), super::Refusal> {
+        view.fill(caller, pushdown, residual, page, (budget, upstream))
+            .await
+    }
+
     /// A policy [`Filter`](super::policy::Filter) conditioned on `q` (4.9),
     /// for a test engine's `AllowIf`: a surface reaches the query language
     /// through this crate alone (ADR-0027 rule M1).
@@ -1171,6 +1215,20 @@ pub mod test_kit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_terms_are_the_core_contexts_own() {
+        for term in ["id", "type", "value", "location", "observedAt"] {
+            assert!(is_core_term(term), "{term}");
+        }
+        for name in ["speed", "p0", "Location"] {
+            assert!(!is_core_term(name), "{name}");
+        }
+        assert_eq!(
+            core_name("https://uri.etsi.org/ngsi-ld/location"),
+            "location"
+        );
+    }
 
     #[cfg(feature = "test-kit")]
     #[test]

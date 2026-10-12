@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! AST → URL → AST (T-3503): every tree of the subset writes itself as a URL that parses back
-//! to the same tree, and that URL is its own canonical form.
+//! AST → URL → AST (T-3503, T-3749): every tree of the subset writes itself as a URL that parses
+//! back to the same tree, and that URL is its own canonical form.
 
 mod service;
 
 use odata_url::{
-    parse, CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key, KeyValue,
-    Levels, Limits, Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions,
-    Segment, SelectItem, Shape,
+    parse, ArithOp, CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key,
+    KeyValue, Levels, Limits, Literal, MemberPath, Method, ODataUri, OrderBy, Position,
+    QueryOptions, Segment, SelectItem, Shape,
 };
 use proptest::prelude::*;
 use service::Service;
@@ -114,12 +114,18 @@ mod strategy {
     }
 
     fn method() -> impl Strategy<Value = Method> {
-        prop_oneof![
-            Just(Method::Contains),
-            Just(Method::StartsWith),
-            Just(Method::EndsWith),
-            Just(Method::GeoIntersects),
-        ]
+        prop::sample::select(Method::all().collect::<Vec<_>>())
+    }
+
+    fn arith() -> impl Strategy<Value = ArithOp> {
+        prop::sample::select(vec![
+            ArithOp::Add,
+            ArithOp::Sub,
+            ArithOp::Mul,
+            ArithOp::Div,
+            ArithOp::DivBy,
+            ArithOp::Mod,
+        ])
     }
 
     fn lambda() -> impl Strategy<Value = Expr> {
@@ -134,12 +140,19 @@ mod strategy {
                 Box::new(Expr::Literal(Literal::Int(n))),
             )
         });
-        prop::option::of(body).prop_map(|body| Expr::Any {
-            collection: MemberPath {
-                variable: None,
-                path: vec!["rooms".into()],
+        let rooms = || MemberPath {
+            variable: None,
+            path: vec!["rooms".into()],
+        };
+        (prop::option::of(body), any::<bool>()).prop_map(move |(body, all)| match body {
+            Some(b) if all => Expr::All {
+                collection: rooms(),
+                lambda: ("r".to_owned(), Box::new(b)),
             },
-            lambda: body.map(|b| ("r".to_owned(), Box::new(b))),
+            body => Expr::Any {
+                collection: rooms(),
+                lambda: body.map(|b| ("r".to_owned(), Box::new(b))),
+            },
         })
     }
 
@@ -164,7 +177,16 @@ mod strategy {
                 inner.clone().prop_map(|e| Expr::Not(Box::new(e))),
                 (inner.clone(), prop::collection::vec(literal(), 0..4))
                     .prop_map(|(l, list)| Expr::In(Box::new(l), list)),
-                (method(), inner.clone(), inner).prop_map(|(m, a, b)| Expr::Call(m, vec![a, b])),
+                (method(), inner.clone(), inner.clone()).prop_map(|(m, a, b)| {
+                    let args = [a, b].into_iter().take(m.arity().0).collect();
+                    Expr::Call(m, args)
+                }),
+                (inner.clone(), arith(), inner.clone()).prop_map(|(l, op, r)| Expr::Arith(
+                    Box::new(l),
+                    op,
+                    Box::new(r)
+                )),
+                inner.prop_map(|e| Expr::Neg(Box::new(e))),
             ]
         })
         .boxed()

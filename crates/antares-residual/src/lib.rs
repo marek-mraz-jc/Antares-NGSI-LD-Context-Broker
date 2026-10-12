@@ -309,6 +309,9 @@ pub enum Func {
     DivBy,
     /// `a mod b`: the sign of `a`.
     Mod,
+    /// CQL2 `a ^ b`: an integer for two integers and an exponent from 0, a number otherwise;
+    /// an overflow or a result that is no finite number is unknown.
+    Pow,
     /// `-a`.
     Neg,
 }
@@ -478,6 +481,73 @@ impl Program {
     /// As [`eval`].
     pub fn eval(&self, entity: &Value) -> Result<Truth, Error> {
         eval(self, entity)
+    }
+
+    /// The top-level Attribute terms the program reads, each once in the order first read: what
+    /// a pushdown's `attrs` must hold for the residual to see them (ADR-0028 rule 3).
+    #[must_use]
+    pub fn attributes(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        self.root.paths(&mut |p| {
+            if let Path::Attribute { attrs, .. } = p {
+                out.extend(attrs.first().map(String::as_str));
+            }
+        });
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|a| seen.insert(*a));
+        out
+    }
+
+    /// Whether it reads a `createdAt` or `modifiedAt`, of the Entity or of an Attribute: the
+    /// pushdown then asks for `options=sysAttrs` (F33).
+    #[must_use]
+    pub fn reads_system_members(&self) -> bool {
+        let mut system = false;
+        self.root.paths(&mut |p| {
+            system |= matches!(
+                p,
+                Path::CreatedAt
+                    | Path::ModifiedAt
+                    | Path::Attribute {
+                        member: Member::CreatedAt | Member::ModifiedAt,
+                        ..
+                    }
+            );
+        });
+        system
+    }
+}
+
+impl Node {
+    /// Every [`Path`] the node reads, in evaluation order.
+    fn paths<'a>(&'a self, f: &mut impl FnMut(&'a Path)) {
+        match self {
+            Self::Lit(_) | Self::Var(..) => {}
+            Self::Path(p) => f(p),
+            Self::Cmp(_, a, b) => {
+                a.paths(f);
+                b.paths(f);
+            }
+            Self::And(es) | Self::Or(es) | Self::Call(_, es) => es.iter().for_each(|e| e.paths(f)),
+            Self::Not(a) | Self::IsNull(a) | Self::In(a, _) | Self::Match(a, _) => a.paths(f),
+            Self::Any(list, body) => {
+                list.paths(f);
+                if let Some(b) = body {
+                    b.paths(f);
+                }
+            }
+            Self::All(list, body) => {
+                list.paths(f);
+                body.paths(f);
+            }
+            Self::Spatial(_, a, b) => {
+                for shape in [a, b] {
+                    if let Shape::Value(n) = shape {
+                        n.paths(f);
+                    }
+                }
+            }
+        }
     }
 }
 

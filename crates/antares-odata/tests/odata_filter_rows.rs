@@ -244,6 +244,38 @@ async fn a_vocab_value_matches_as_the_read_shows_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_hidden_attribute_in_an_evaluated_filter_is_the_400_of_an_unknown_name() {
+    let (_b, app) = broker().await.expect("broker");
+    for form in [
+        "length({})%20eq%201",
+        "{}%20add%201%20gt%200",
+        "{}%20eq%20speed",
+        "{}/any(x:x%20eq%201)",
+    ] {
+        let (hidden_status, hidden) = send(
+            &app,
+            Method::GET,
+            &format!("{ROOT}/Car?$filter={}", form.replace("{}", "secret")),
+            None,
+        )
+        .await;
+        let (unknown_status, unknown) = send(
+            &app,
+            Method::GET,
+            &format!("{ROOT}/Car?$filter={}", form.replace("{}", "nothing")),
+            None,
+        )
+        .await;
+        assert_eq!(hidden_status, StatusCode::BAD_REQUEST, "{form}: {hidden}");
+        assert_eq!(
+            (hidden_status, &hidden),
+            (unknown_status, &unknown),
+            "{form}: V1, O1"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_hidden_attributes_observed_at_is_the_400_of_an_unknown_name() {
     let (_b, app) = broker().await.expect("broker");
     let at = |name: &str| {
@@ -263,11 +295,29 @@ async fn a_hidden_attributes_observed_at_is_the_400_of_an_unknown_name() {
 async fn the_forms_these_rows_do_not_cover_stay_501() {
     let (_b, app) = broker().await.expect("broker");
     let polygon = "geography'SRID=4326;Polygon((0%200,1%200,1%201,0%201,0%200))'";
-    for filter in [
-        format!("geo.intersects(location,{polygon})%20or%20speed%20gt%2015"),
-        "label%20ne%20'blue'".to_owned(),
-        "tags/any(x:x%20ne%20'a')".to_owned(),
-        "tags/all(x:x%20eq%20'a')".to_owned(),
+    // a geo test under `or` is evaluated by the residual (T-3758)
+    let (status, answer) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=geo.intersects(location,{polygon})%20or%20speed%20gt%2015"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let ids: Vec<&str> = answer["value"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["urn:ngsi-ld:Car:1", "urn:ngsi-ld:Car:2"], "{answer}");
+    // F23: any lambda over a list is evaluated (T-3749)
+    for (filter, want) in [
+        (
+            "tags/any(x:x%20ne%20'a')",
+            &["urn:ngsi-ld:Car:1", "urn:ngsi-ld:Car:2"][..],
+        ),
+        ("tags/all(x:x%20eq%20'c')", &["urn:ngsi-ld:Car:2"][..]),
     ] {
         let (status, answer) = send(
             &app,
@@ -276,6 +326,54 @@ async fn the_forms_these_rows_do_not_cover_stay_501() {
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{filter}: {answer}");
+        assert_eq!(status, StatusCode::OK, "{filter}: {answer}");
+        let ids: Vec<&str> = answer["value"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e["id"].as_str())
+            .collect();
+        assert_eq!(ids, want, "{filter}: {answer}");
     }
+    let (status, answer) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=label%20ne%20'blue'"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{answer}");
+}
+
+/// T-3758: a caller's `ngsild.georel` takes the one `geoQ`, so the OData geo test is evaluated;
+/// a polygon outside WGS84 is the caller's error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callers_geoq_moves_the_geo_filter_to_the_residual() {
+    let (_b, app) = broker().await.expect("broker");
+    let polygon = "geography'SRID=4326;Polygon((0%200,1%200,1%201,0%201,0%200))'";
+    let near = "ngsild.georel=near%3BmaxDistance==2000000&ngsild.geometry=Point&ngsild.coordinates=%5B5,5%5D&ngsild.geoproperty=city:location";
+    let (status, answer) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=geo.intersects(location,{polygon})&{near}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let ids: Vec<&str> = answer["value"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["urn:ngsi-ld:Car:1"], "{answer}");
+    let outside = "geography'SRID=4326;Polygon((0%200,500%200,500%201,0%201,0%200))'";
+    let (status, answer) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=not%20geo.intersects(location,{outside})"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
 }

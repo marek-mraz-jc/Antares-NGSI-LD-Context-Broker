@@ -164,6 +164,8 @@ pub struct Loaded {
     pub notes: Vec<String>,
     /// The compiled Mapping of a view of another model.
     pub mapping: Option<Arc<crate::mapping::Mapping>>,
+    /// The view's own `@context`, as written.
+    pub context: Option<Arc<serde_json::Map<String, Value>>>,
 }
 
 impl View {
@@ -289,6 +291,7 @@ impl View {
             operations,
             notes,
             mapping,
+            context: self.context.clone().map(Arc::new),
         };
         if self.q.is_some()
             && loaded
@@ -465,6 +468,7 @@ fn entry(doc: &Value) -> ViewEntry {
             mapping: l
                 .mapping
                 .map(|m| antares_api::views::Attached(m as Arc<dyn std::any::Any + Send + Sync>)),
+            context: l.context,
         },
         Err(reason) => ViewEntry::Invalid { reason },
     }
