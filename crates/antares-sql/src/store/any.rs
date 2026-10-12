@@ -1347,6 +1347,15 @@ mod db_error_tests {
 // the inherent methods above. New backends implement the traits directly —
 // this enum stays an implementation detail of the built-in backends, no
 // longer the API surface.
+/// The most Entities one history transaction appends (T-4085). Each append
+/// holds `FOR KEY SHARE` on its Entity until the commit, and a concurrent
+/// write's `FOR UPDATE` waits for it: a 1000-member page in one transaction
+/// would hold every other page over the same ids for the whole append (T-4123).
+/// Small requests, the HSL stream's, are one transaction.
+// ponytail: a fixed chunk; a measured one if lock waits still show on dev.
+#[cfg(feature = "postgres")]
+const HISTORY_CHUNK: usize = 64;
+
 #[async_trait::async_trait]
 impl antares_store::CurrentStateDriver for AnyStore {
     async fn ping(&self) -> Result<(), NgsiError> {
@@ -1686,12 +1695,16 @@ impl antares_store::TemporalDriver for AnyStore {
     ) -> Result<(), NgsiError> {
         AnyStore::temporal_append(self, tenant, id, shell, additions).await
     }
-    /// On Postgres a drained request is one transaction (T-4085); a scope
-    /// change, and the memory arm, take the default's append per Entity.
+    /// On Postgres a drained request is one transaction per
+    /// [`HISTORY_CHUNK`] Entities (T-4085); a scope change, and the memory
+    /// arm, take the default's append per Entity.
     async fn event_list(&self, evs: &[antares_store::TemporalEvent]) -> Result<(), NgsiError> {
         #[cfg(feature = "postgres")]
         if let (AnyStore::Pg(p), Some(appends)) = (self, antares_store::fold_appends(evs)) {
-            return p.temporal.append_many(&appends).await.map_err(db);
+            for chunk in appends.chunks(HISTORY_CHUNK) {
+                p.temporal.append_many(chunk).await.map_err(db)?;
+            }
+            return Ok(());
         }
         antares_store::drain_events(self, evs).await
     }
