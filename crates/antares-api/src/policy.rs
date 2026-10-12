@@ -392,8 +392,10 @@ impl TimeBound {
         let t = self.at(now);
         let sub = i64::from(t.timestamp_subsec_nanos() % 1_000_000);
         let t = if up && sub > 0 {
-            t.checked_add_signed(chrono::Duration::nanoseconds(1_000_000 - sub))
-                .unwrap_or(t)
+            t.checked_add_signed(chrono::Duration::nanoseconds(
+                1_000_000_i64.saturating_sub(sub),
+            ))
+            .unwrap_or(t)
         } else {
             t
         };
@@ -1876,6 +1878,8 @@ pub async fn run_policy_contract(engine: &dyn PolicyEngine) {
             }
             // `decide` answers a condition on anything but a write by id as
             // a deny, so reaching here is the seam's fault, not the engine's.
+            // A contract harness (test-kit) fails by panicking, as asserts do.
+            #[allow(clippy::panic)]
             Decision::AllowIf(_) => panic!("{name}: a condition on {clause} passed the seam"),
         }
     }
@@ -1957,7 +1961,12 @@ impl PolicyEngine for Slow<'_> {
 
     fn decide<'a>(&'a self, subject: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
         Box::pin(async move {
-            tokio::time::sleep(*TIMEOUT * 2 + Duration::from_millis(50)).await;
+            tokio::time::sleep(
+                TIMEOUT
+                    .saturating_mul(2)
+                    .saturating_add(Duration::from_millis(50)),
+            )
+            .await;
             self.0.decide(subject, op).await
         })
     }

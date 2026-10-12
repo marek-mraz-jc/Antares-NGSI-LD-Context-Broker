@@ -349,6 +349,42 @@ async fn a_next_link_crosses_from_the_bbox_part_to_the_features_without_geometry
     Ok(())
 }
 
+/// T-3795: a token into the part of the Features without a geometry keeps its offset, so
+/// more of them than a page are read to their end, each once.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_features_without_geometry_page_to_their_end() -> Result<(), String> {
+    let f = fixture().await?;
+    let car = json!({"id": "urn:ngsi-ld:Car:5", "type": "Car", "speed": {"type": "Property", "value": 5}});
+    let a = send(
+        &f.app,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        &car.to_string(),
+        &[("NGSILD-Tenant", "city")],
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let mut uri = format!("{CARS}?bbox=0,0,1,1&limit=1");
+    let mut seen = Vec::new();
+    for _ in 0..5 {
+        let page = get(&f.app, &uri).await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        assert_eq!(
+            page.body.get("numberMatched"),
+            Some(&json!(2)),
+            "{}",
+            page.body
+        );
+        seen.extend(ids(&page.body));
+        match href(&page.body, "next") {
+            Some(next) => uri = local(&next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, ["urn:ngsi-ld:Car:3", "urn:ngsi-ld:Car:5"]);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tenant_that_holds_nothing_is_an_empty_collection() -> Result<(), String> {
     let f = fixture().await?;

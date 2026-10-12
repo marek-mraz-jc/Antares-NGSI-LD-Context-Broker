@@ -575,7 +575,12 @@ fn body(
             Format::Json => Ok(Body::Json(MetadataLevel::Minimal)),
             Format::Xml => Ok(Body::Xml),
             Format::Atom => Err(not_acceptable()),
-            Format::MediaType(media) => media_type(media)?.ok_or_else(not_acceptable),
+            // Written percent-encoded by a form encoder, meant decoded (T-3742); the URL
+            // parser refused an escape that does not decode.
+            Format::MediaType(media) => {
+                media_type(&odata_url::percent_decoded(media).unwrap_or_default())?
+                    .ok_or_else(not_acceptable)
+            }
         };
     }
     let Some(accept) = header(headers, ACCEPT.as_str(), max)? else {

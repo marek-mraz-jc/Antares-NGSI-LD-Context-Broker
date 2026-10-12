@@ -274,8 +274,11 @@ be served (nothing is stored), `413` over 64 KiB.
 What a draft would serve, before it is stored (the Portal's view writer).
 The body is the candidate view document, checked as a PUT checks it; the
 request's query string is a Query Entities query (5.7.2), run in the
-draft's tenant through its narrowing with no caller subject, so a policy
-engine is asked as for an anonymous caller. `limit` is at most 100
+draft's tenant through its narrowing under the subject headers of this
+request (`ANTARES_POLICY_SUBJECT_HEADERS`): the admin caller names whose
+reading it previews (the platform's Portal: a member's `x-jc-*`, or
+`x-jc-roles: public` for the anonymous reading), and a request naming nobody
+is the cluster's own caller, as on every other path (T-3813). `limit` is at most 100
 (default 20) and any `count` is replaced by `count=true`. The answer is
 `{"count": 2, "entities": [...]}`, the count of the whole narrowed set and
 one page. Nothing is stored and no table reloads. `400` with the loader's
@@ -284,6 +287,33 @@ reason for a draft that cannot be served or a `limit` over 100, `413` over
 an unknown tenant, the engine's denial) comes back as the API gave it. No
 view root reaches this route: a view serves only the operations of the
 matrix.
+
+## Export grants
+
+Only in a broker built with the `internal-csr` feature and started with
+`ANTARES_SELF_URLS` set (ADR-0025 rule 5): a Tenant's consent to another
+Tenant's registrations reading it in process. See
+[Internal context sources](internal-context-sources.md) for what a grant
+allows; bound: 4 KiB per document.
+
+### GET /q/grants
+
+Every stored grant.
+
+### GET /q/grants/{target}/{source}
+
+The grant `target` holds for `source`, or `404`.
+
+### PUT /q/grants/{target}/{source}
+
+`{"target", "source", "access"?, "view"?}`: `201` created, `204` replaced;
+`400` when the document is no grant, names a Tenant no client can, or names
+another pair than the path (nothing is stored).
+
+### DELETE /q/grants/{target}/{source}
+
+`204`, or `404` when there is no such grant. The next forward that needed it
+is not made.
 
 ## Policy rule documents
 

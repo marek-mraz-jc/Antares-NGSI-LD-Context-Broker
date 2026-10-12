@@ -983,3 +983,353 @@ pub async fn run_temporal_contract(
         "the contract's own rows must be removable"
     );
 }
+
+/// Hold a driver to tenant isolation (T-3914): `a` and `b` each hold an
+/// Entity, a Subscription, a Registration and a temporal document under the
+/// SAME ids, and nothing done as `a` reads, changes or deletes `b`'s copy.
+/// The walk covers every tenant-taking family the API reaches: one-row and
+/// batch writes, the three list reads, the query, delivery bookkeeping, the
+/// registration lookup, the temporal reads and the drain, and last a purge
+/// of `a`, which must leave `b` whole.
+///
+/// The caller picks the pair that matters for its backend: two names a
+/// LIKE pattern would confuse (`a_b`, `axb`), the default Tenant beside a
+/// named one, a name that extends the other. `a` is purged, so it must not
+/// be a Tenant other data lives in. `cs` and `tp` may be the same store.
+pub async fn run_tenant_isolation_contract(
+    cs: &dyn CurrentStateDriver,
+    tp: &dyn TemporalDriver,
+    a: &TenantId,
+    b: &TenantId,
+    prefix: &str,
+) {
+    use crate::filter::{EntityFilter, TemporalFilter};
+    assert_ne!(a, b, "the walk needs two Tenants");
+    let e = format!("urn:ngsi-ld:{prefix}:shared");
+    let sub = format!("urn:ngsi-ld:Subscription:{prefix}:shared");
+    let reg = format!("urn:ngsi-ld:ContextSourceRegistration:{prefix}:shared");
+    let ty = "https://uri.etsi.org/ngsi-ld/default-context/T";
+    let mine = |t: &TenantId| json!({"id": e, "type": ty, "who": t.as_str()});
+    let ids = [e.clone()];
+    let ids_ref = [e.as_str()];
+
+    for t in [a, b] {
+        assert!(
+            cs.create(t, Kind::Entity, &e, mine(t))
+                .await
+                .expect("create"),
+            "{}: the shared id is new in each Tenant",
+            t.as_str()
+        );
+        cs.create(
+            t,
+            Kind::Subscription,
+            &sub,
+            json!({"id": sub, "type": "Subscription", "who": t.as_str()}),
+        )
+        .await
+        .expect("subscription");
+        cs.create(
+            t,
+            Kind::Registration,
+            &reg,
+            json!({"id": reg, "type": "ContextSourceRegistration", "who": t.as_str(),
+                   "information": [{"entities": [{"type": ty}]}], "endpoint": "http://cs.example"}),
+        )
+        .await
+        .expect("registration");
+    }
+    // `b`'s copies as they stand; every step below compares against these.
+    let b_entity = cs.get(b, Kind::Entity, &e).await.expect("get");
+    let b_sub = cs.get(b, Kind::Subscription, &sub).await.expect("get");
+    // A macro, not a closure: the check awaits, and an async closure that
+    // borrows the ids cannot be called twice.
+    macro_rules! b_unchanged {
+        ($step:literal) => {
+            assert_eq!(
+                cs.get(b, Kind::Entity, &e).await.expect("get"),
+                b_entity,
+                "{} as {} changed {}'s Entity",
+                $step,
+                a.as_str(),
+                b.as_str()
+            );
+            assert_eq!(
+                cs.get(b, Kind::Subscription, &sub).await.expect("get"),
+                b_sub,
+                "{} as {} changed {}'s Subscription",
+                $step,
+                a.as_str(),
+                b.as_str()
+            );
+        };
+    }
+    let only_a = |rows: &[Value], what: &str| {
+        let shared: Vec<&Value> = rows.iter().filter(|r| r["id"] == e.as_str()).collect();
+        assert_eq!(shared.len(), 1, "{what}: the shared id once, {rows:?}");
+        assert_eq!(
+            shared[0]["who"],
+            a.as_str(),
+            "{what} served another Tenant's copy"
+        );
+    };
+
+    // Reads.
+    let got = cs
+        .get(a, Kind::Entity, &e)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(got["who"], a.as_str(), "get served another Tenant's copy");
+    only_a(&cs.list(a, Kind::Entity).await.expect("list"), "list");
+    only_a(
+        &cs.list_page(a, Kind::Entity, None, 1000)
+            .await
+            .expect("page"),
+        "list_page",
+    );
+    only_a(
+        &cs.list_slice(a, Kind::Entity, 0, 1000)
+            .await
+            .expect("slice")
+            .0,
+        "list_slice",
+    );
+    let q = cs
+        .query_entities(
+            a,
+            &EntityFilter {
+                ids: Some(&ids_ref),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query");
+    only_a(&q.rows, "query_entities");
+    let subs = cs.list(a, Kind::Subscription).await.expect("list");
+    assert!(
+        subs.iter()
+            .filter(|s| s["id"] == sub.as_str())
+            .all(|s| s["who"] == a.as_str()),
+        "the Subscription list served another Tenant's copy: {subs:?}"
+    );
+    let regs = cs
+        .matching_registrations(a, None, None)
+        .await
+        .expect("registrations");
+    let shared: Vec<&Value> = regs.iter().filter(|r| r["id"] == reg.as_str()).collect();
+    assert!(
+        shared.len() == 1 && shared[0]["who"] == a.as_str(),
+        "matching_registrations served another Tenant's copy: {regs:?}"
+    );
+
+    // Writes, one by one and batched.
+    cs.mutate::<(), ()>(a, Kind::Entity, &e, |d| {
+        d["touched"] = json!(true);
+        Ok(())
+    })
+    .await
+    .expect("mutate");
+    b_unchanged!("mutate");
+    cs.upsert(
+        a,
+        Kind::Entity,
+        &e,
+        json!({"id": e, "type": ty, "who": a.as_str(), "n": 1}),
+    )
+    .await
+    .expect("upsert");
+    b_unchanged!("upsert");
+    assert_eq!(
+        cs.batch_create(a, vec![(e.clone(), mine(a))])
+            .await
+            .expect("batch_create"),
+        [false],
+        "a batch create sees only its own Tenant's row"
+    );
+    b_unchanged!("batch_create");
+    assert_eq!(
+        cs.batch_upsert(a, vec![(e.clone(), mine(a))])
+            .await
+            .expect("batch_upsert"),
+        [false],
+        "a batch upsert replaces its own Tenant's row"
+    );
+    b_unchanged!("batch_upsert");
+    cs.batch_mutate::<()>(a, &ids, |_, d| {
+        d["batched"] = json!(true);
+        Ok(())
+    })
+    .await
+    .expect("batch_mutate");
+    b_unchanged!("batch_mutate");
+    cs.record_delivery(a, Kind::Subscription, &sub, "2026-10-11T00:00:00Z")
+        .await
+        .expect("record_delivery")
+        .expect("a's Subscription");
+    b_unchanged!("record_delivery");
+    assert!(
+        cs.delete_entity_if(a, &e, &|_| true)
+            .await
+            .expect("delete_entity_if"),
+        "a conditional delete removes its own Tenant's row"
+    );
+    b_unchanged!("delete_entity_if");
+    cs.create(a, Kind::Entity, &e, mine(a))
+        .await
+        .expect("recreate");
+    assert_eq!(
+        cs.batch_delete(a, &ids).await.expect("batch_delete"),
+        [true],
+        "a batch delete removes its own Tenant's row"
+    );
+    b_unchanged!("batch_delete");
+    cs.create(a, Kind::Entity, &e, mine(a))
+        .await
+        .expect("recreate");
+    assert!(cs.delete(a, Kind::Entity, &e).await.expect("delete"));
+    b_unchanged!("delete");
+    cs.create(a, Kind::Entity, &e, mine(a))
+        .await
+        .expect("recreate");
+
+    // History under the same id.
+    if tp.supported() {
+        let instance = |t: &TenantId| {
+            json!({"n": [{"type": "Property", "value": t.as_str(),
+                          "observedAt": "2026-10-11T00:00:00Z",
+                          "instanceId": format!("urn:ngsi-ld:{prefix}:{}", t.as_str())}]})
+        };
+        for t in [a, b] {
+            tp.create(t, &e, mine(t)).await.expect("temporal create");
+            tp.temporal_append(t, &e, &mine(t), &instance(t))
+                .await
+                .expect("append");
+        }
+        let b_history = tp.get(b, &e).await.expect("get");
+        macro_rules! history_unchanged {
+            ($step:literal) => {
+                assert_eq!(
+                    tp.get(b, &e).await.expect("get"),
+                    b_history,
+                    "{} as {} changed {}'s history",
+                    $step,
+                    a.as_str(),
+                    b.as_str()
+                );
+            };
+        }
+        let values = |doc: &Value| doc["n"].to_string();
+        let one = tp
+            .get_temporal(a, &e, &TemporalFilter::default())
+            .await
+            .expect("get_temporal")
+            .expect("a's history");
+        assert!(
+            !values(&one).contains(&format!("\"{}\"", b.as_str())),
+            "get_temporal served another Tenant's instances: {one}"
+        );
+        let rows = tp
+            .query_temporal(
+                a,
+                &TemporalFilter {
+                    ids: Some(&ids_ref),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("query_temporal")
+            .rows;
+        assert_eq!(
+            rows.len(),
+            1,
+            "query_temporal: the shared id once, {rows:?}"
+        );
+        assert!(
+            !values(&rows[0]).contains(&format!("\"{}\"", b.as_str())),
+            "query_temporal served another Tenant's instances: {rows:?}"
+        );
+        assert!(
+            tp.list(a)
+                .await
+                .expect("list")
+                .iter()
+                .filter(|r| r["id"] == e.as_str())
+                .count()
+                == 1,
+            "the temporal list holds the shared id once"
+        );
+        tp.event_list(&[crate::TemporalEvent {
+            op: crate::TemporalOp::AttrModified,
+            tenant: a.clone(),
+            entity_id: e.clone(),
+            shell: mine(a),
+            attr: "n".into(),
+            instance: json!({"type": "Property", "value": "drained",
+                             "observedAt": "2026-10-11T00:01:00Z",
+                             "instanceId": format!("urn:ngsi-ld:{prefix}:drained")}),
+        }])
+        .await
+        .expect("event_list");
+        history_unchanged!("event_list");
+        tp.mutate::<(), ()>(a, &e, |d| {
+            d["touched"] = json!(true);
+            Ok(())
+        })
+        .await
+        .expect("mutate");
+        history_unchanged!("temporal mutate");
+        assert!(tp.delete(a, &e).await.expect("delete"));
+        history_unchanged!("temporal delete");
+        tp.create(a, &e, mine(a)).await.expect("recreate");
+        tp.purge_tenant(a).await.expect("temporal purge");
+        assert!(
+            tp.get(a, &e).await.expect("get").is_none(),
+            "the purge empties a's history"
+        );
+        history_unchanged!("temporal purge");
+        assert!(tp.delete(b, &e).await.expect("cleanup"));
+    }
+
+    // A purge of `a` leaves `b` whole.
+    match cs.purge_tenant(a).await {
+        Ok(_) => {
+            assert!(
+                cs.get(a, Kind::Entity, &e).await.expect("get").is_none(),
+                "the purge empties a"
+            );
+            b_unchanged!("purge_tenant");
+            assert!(
+                cs.get(b, Kind::Registration, &reg)
+                    .await
+                    .expect("get")
+                    .is_some(),
+                "the purge of {} took {}'s Registration",
+                a.as_str(),
+                b.as_str()
+            );
+        }
+        Err(antares_model::NgsiError::OperationNotSupported(_)) => {
+            for kind in [Kind::Entity, Kind::Subscription, Kind::Registration] {
+                let id = match kind {
+                    Kind::Entity => &e,
+                    Kind::Subscription => &sub,
+                    _ => &reg,
+                };
+                cs.delete(a, kind, id).await.expect("cleanup");
+            }
+        }
+        Err(other) => panic!("purge_tenant: {other:?}"),
+    }
+    for (kind, id) in [
+        (Kind::Entity, &e),
+        (Kind::Subscription, &sub),
+        (Kind::Registration, &reg),
+    ] {
+        assert!(
+            cs.delete(b, kind, id).await.expect("cleanup"),
+            "{}'s {kind:?} survived",
+            b.as_str()
+        );
+    }
+}

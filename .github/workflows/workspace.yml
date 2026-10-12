@@ -136,6 +136,10 @@ jobs:
       # moves under everyone's feet takes the wasm32 arm down silently. A
       # check here costs one target and keeps the arm honest per commit.
       - run: cargo check --locked --target wasm32-unknown-unknown -p antares-wasm
+      # T-3911: the JSON-LD algorithms without the `fetch` loader build for
+      # the browser with no network stack at all, the shape another project
+      # embeds (rule M3).
+      - run: cargo check --locked --target wasm32-unknown-unknown -p antares-jsonld --no-default-features
       # --locked everywhere below: the image builds with it (Dockerfile), so
       # without it CI would gate on a dependency set the shipped binary never
       # used, and an out-of-date Cargo.lock would pass here and fail there.
@@ -243,7 +247,7 @@ jobs:
       # The ETSI resource sampler + its sample↔TP join fail silently when
       # broken (an empty column reads as "nothing happened") — check them here.
       - name: ETSI sampling self-check
-        run: python3 dev/etsi-selftest.py
+        run: pip install --quiet pyyaml && python3 dev/etsi-selftest.py
       # The external-suites harness (T-3549): its comparator and adapters
       # decide verdicts, and a wrong one reads as a plausible pass.
       - name: External-suites harness self-check
@@ -510,8 +514,7 @@ jobs:
         if: matrix.package != 'workspace' && matrix.package != 'binary-size'
         run: cargo hack test --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }}
       # The budget is ADR-0027 section 6's "binary size" row, read from the
-      # ADR (`full` <= vanilla + 7 MiB, each feature alone <= vanilla + 2 MiB,
-      # `mcp` <= vanilla + 4.5 MiB); the table goes to the step summary.
+      # ADR (`full` and each feature alone <= vanilla + 10 MiB, T-3775); the table goes to the step summary.
       - name: Binary size per surface feature
         if: matrix.package == 'binary-size'
         run: |

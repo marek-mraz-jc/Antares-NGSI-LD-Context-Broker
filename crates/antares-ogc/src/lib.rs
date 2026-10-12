@@ -318,7 +318,13 @@ async fn write_to(
 fn collections(view: &ViewOps) -> Option<BTreeMap<String, Collection>> {
     let (_, bytes) = view.schema()?;
     let schema = linkml_model::Model::read(&bytes, &SCHEMA_LIMITS).ok()?;
-    Some(model::build(&schema, &view.shown_by_type()))
+    // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
+    let shown = if view.shows_every_name() {
+        model::every(&schema)
+    } else {
+        view.shown_by_type()
+    };
+    Some(model::build(&schema, &shown))
 }
 
 /// No `Accept`, or one that takes some JSON or anything.

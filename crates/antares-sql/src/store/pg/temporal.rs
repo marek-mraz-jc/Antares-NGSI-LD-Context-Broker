@@ -716,10 +716,12 @@ impl PgTemporalStore {
                 // refused range shape: reconstruct unpruned, window arbitrates.
                 // The default filter has neither range nor lastN, the two
                 // shapes the compiler can refuse: pinned by
-                // `the_unpruned_fallback_always_compiles`.
-                #[allow(clippy::expect_used)]
+                // `the_unpruned_fallback_always_compiles`. A request reaches
+                // this line: a refusal is an error, never a panic (T-3915).
                 None => attr_object_expr(&TemporalFilter::default(), n_where.saturating_add(1))
-                    .expect("no range/lastN always compiles"),
+                    .ok_or_else(|| {
+                        sqlx::Error::Protocol("the unpruned temporal shape did not compile".into())
+                    })?,
             },
         };
         binds.extend(extra.into_iter().map(B::Text));
@@ -825,11 +827,13 @@ impl PgTemporalStore {
     ) -> Result<Option<Value>, sqlx::Error> {
         // Same unpruned fallback as `query_inner`, and compiling for the
         // same reason: no range and no lastN is the shape that never refuses.
-        #[allow(clippy::expect_used)]
+        // A request reaches this line: a refusal here is an error, never a
+        // panic (T-3915).
         let (attr_expr, binds) = match attr_object_expr(f, 3) {
             Some(v) => v,
-            None => attr_object_expr(&TemporalFilter::default(), 3)
-                .expect("no range/lastN always compiles"),
+            None => attr_object_expr(&TemporalFilter::default(), 3).ok_or_else(|| {
+                sqlx::Error::Protocol("the unpruned temporal shape did not compile".into())
+            })?,
         };
         // 4.22: an expired entity is invalid → None (404), same as get().
         let sql = format!(

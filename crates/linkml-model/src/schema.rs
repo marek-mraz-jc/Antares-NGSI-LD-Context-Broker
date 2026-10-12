@@ -9,15 +9,21 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 /// A schema: `id`, `name`, `version`, `prefixes`, `default_prefix`, and its
-/// classes, slots and enums keyed by name.
+/// classes, slots and enums keyed by name. The two declarations the subset
+/// implies, [`IMPORTS`] and [`DEFAULT_RANGE`], are read when they are
+/// exactly those and refused otherwise (LK4); the writer declares them, so
+/// a LinkML tool reads the schema the broker means.
 ///
 /// ```
 /// let s: linkml_model::Schema =
 ///     serde_json::from_str(r#"{"id": "https://example.org/s", "name": "s"}"#).unwrap();
 /// assert!(s.classes.is_empty());
+/// let declared: Result<linkml_model::Schema, _> = serde_json::from_str(
+///     r#"{"id": "https://e.org/s", "name": "s", "imports": ["linkml:types"], "default_range": "string"}"#);
+/// assert!(declared.is_ok());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawSchema")]
 pub struct Schema {
     /// The schema IRI.
     pub id: String,
@@ -41,6 +47,77 @@ pub struct Schema {
     /// Enums, keyed by name.
     #[serde(default)]
     pub enums: BTreeMap<String, Enum>,
+}
+
+/// The built-in types every range outside the schema's own names resolves
+/// to: the one import the subset reads.
+pub const IMPORTS: &str = "linkml:types";
+
+/// The range of a slot that names none.
+pub const DEFAULT_RANGE: &str = "string";
+
+/// [`Schema`] as read, with the two declarations the subset implies.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSchema {
+    /// The schema IRI.
+    pub id: String,
+    /// The schema name.
+    pub name: String,
+    /// The schema version.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// CURIE prefixes, keyed by prefix.
+    #[serde(default)]
+    pub prefixes: BTreeMap<String, Prefix>,
+    /// The prefix of every element without its own URI.
+    #[serde(default)]
+    pub default_prefix: Option<String>,
+    /// Classes, keyed by name.
+    #[serde(default)]
+    pub classes: BTreeMap<String, Class>,
+    /// Slots, keyed by name.
+    #[serde(default)]
+    pub slots: BTreeMap<String, Slot>,
+    /// Enums, keyed by name.
+    #[serde(default)]
+    pub enums: BTreeMap<String, Enum>,
+    #[serde(default)]
+    imports: Option<serde_json::Value>,
+    #[serde(default)]
+    default_range: Option<serde_json::Value>,
+}
+
+impl TryFrom<RawSchema> for Schema {
+    type Error = String;
+
+    fn try_from(raw: RawSchema) -> Result<Self, String> {
+        // worded as serde words an unknown field, which the load reports
+        // as outside the subset (`Error::NotImplemented`)
+        if raw
+            .imports
+            .is_some_and(|i| i != serde_json::json!([IMPORTS]))
+        {
+            return Err(format!(
+                "unknown field `imports`: the subset reads [{IMPORTS:?}] alone"
+            ));
+        }
+        if raw.default_range.is_some_and(|r| r != DEFAULT_RANGE) {
+            return Err(format!(
+                "unknown field `default_range`: the subset reads {DEFAULT_RANGE:?} alone"
+            ));
+        }
+        Ok(Self {
+            id: raw.id,
+            name: raw.name,
+            version: raw.version,
+            prefixes: raw.prefixes,
+            default_prefix: raw.default_prefix,
+            classes: raw.classes,
+            slots: raw.slots,
+            enums: raw.enums,
+        })
+    }
 }
 
 /// One prefix in LinkML's JSON form.

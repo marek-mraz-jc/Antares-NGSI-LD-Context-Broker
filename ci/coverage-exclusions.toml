@@ -179,3 +179,59 @@ function = "antares_ops::mapping::sources"
 lines = 1
 branches = 0
 reason = "the inner @context failing to merge: it maps generated terms to IRIs that compile already expanded and checked, which merge_object accepts; the arm keeps a refusal instead of an unwrap"
+
+[[exclusion]]
+crate = "antares-icsr"
+file = "src/grant.rs"
+function = "antares_icsr::grant::held"
+lines = 3
+branches = 0
+reason = "tracing::warn! repeats the fields in its `log` fallback, which runs only with no subscriber set; tests/icsr_log.rs covers the subscriber path and asserts what it logs"
+
+[[exclusion]]
+crate = "antares-icsr"
+file = "src/grant.rs"
+function = "antares_icsr::grant::put_one"
+lines = 5
+branches = 0
+reason = "tracing::info! repeats the fields in its `log` fallback, which runs only with no subscriber set; tests/icsr_log.rs covers the subscriber path and asserts what it logs"
+
+[[exclusion]]
+crate = "antares-icsr"
+file = "src/grant.rs"
+function = "antares_icsr::grant::delete_one"
+lines = 3
+branches = 0
+reason = "tracing::info! repeats the fields in its `log` fallback, which runs only with no subscriber set; tests/icsr_log.rs covers the subscriber path and asserts what it logs"
+
+[[exclusion]]
+crate = "antares-icsr"
+file = "src/grant.rs"
+function = "antares_icsr::grant::answer"
+lines = 3
+branches = 0
+reason = "the grant store failing: the built-in store under test_kit does not fail, and antares-icsr may not name the store to put one that does in its place (module rule M2)"
+
+[[exclusion]]
+crate = "antares-icsr"
+file = "src/grant.rs"
+function = "antares_icsr::grant::problem"
+lines = 1
+branches = 0
+reason = "the InternalError kind is the 500 of a failing grant store, see antares_icsr::grant::answer"
+
+[[exclusion]]
+crate = "antares-icsr"
+file = "src/lib.rs"
+function = "ForwardTransport::admit" # v0 mangling puts the trait between the type and the method
+lines = 2
+branches = 0
+reason = "the grant store failing: the built-in store under test_kit does not fail, and antares-icsr may not name the store to put one that does in its place (module rule M2)"
+
+[[exclusion]]
+crate = "antares-icsr"
+file = "src/lib.rs"
+function = "Internal::serve" # v0 mangling puts the impl between the crate and the type
+lines = 21
+branches = 0
+reason = "2 lines: the grant store failing, which the built-in store under test_kit does not (module rule M2). 19 lines: the four tracing::info!/warn! of a forward made or not made repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/icsr_log.rs and icsr_gate.rs cover the subscriber path and assert what they log"

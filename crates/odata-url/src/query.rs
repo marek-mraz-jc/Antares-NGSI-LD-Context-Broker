@@ -590,6 +590,19 @@ fn format(c: &mut Cursor<'_>) -> Result<Format, UrlError> {
     if pchars(c, b'/') > 0 && c.eat("/") && pchars(c, b'&') > 0 {
         return Ok(Format::MediaType(c.slice(start).to_owned()));
     }
+    // A form encoder writes the separator as `%2F` (T-3719, T-3742): the value as written,
+    // with its decoded form `type/subtype`.
+    c.reset(start);
+    if pchars(c, b'&') > 0 {
+        let written = c.slice(start);
+        let decoded = crate::percent_decoded(written).unwrap_or_default();
+        if decoded
+            .split_once('/')
+            .is_some_and(|(t, s)| !t.is_empty() && !s.is_empty())
+        {
+            return Ok(Format::MediaType(written.to_owned()));
+        }
+    }
     Err(c.syntax("format"))
 }
 
