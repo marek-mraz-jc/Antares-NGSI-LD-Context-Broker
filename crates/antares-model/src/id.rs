@@ -436,7 +436,8 @@ mod tests {
     fn entity_id_rejection_message_is_escaped() {
         let e = EntityId::new("urn:x\r\nX-Injected:1").expect_err("rejected");
         let msg = e.to_string();
-        assert!(!msg.contains('\r') && !msg.contains('\n'), "{msg}");
+        assert!(!msg.contains('\r'), "{msg}");
+        assert!(!msg.contains('\n'), "{msg}");
     }
 
     /// Deserialization is an entry point of its own: change events arriving

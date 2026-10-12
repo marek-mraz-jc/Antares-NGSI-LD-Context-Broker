@@ -13,10 +13,10 @@ exclude = ["tests/etsi_fixtures.rs"]
 keywords = ["ngsi-ld", "etsi", "query", "three-valued", "fiware"]
 categories = ["data-structures", "database-implementations"]
 
-# ADR-0028 rule 2: reached only through antares-ops (T-3757), so it carries the ops role and its
-# fences (module rules, the vanilla build never links it, the coverage gate).
+# ADR-0028 rule 2: reached only through antares-ops (T-3757). Role ngsild (T-3912): pure NGSI-LD,
+# published, held to rule M3 (dev/check-module-rules.py) and the 100 % coverage gate.
 [package.metadata.antares]
-role = "ops"
+role = "ngsild"
 
 [dependencies]
 geo = { workspace = true }

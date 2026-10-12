@@ -378,7 +378,8 @@ mod tests {
         // a bare P carries nothing to weigh, and is the only accepted shape
         // that carries nothing
         let bare = super::parse_iso_duration("P").expect("a bare P scans");
-        assert!(bare.empty && bare.whole);
+        assert!(bare.empty);
+        assert!(bare.whole);
         for bad in [
             "",
             "PT",
