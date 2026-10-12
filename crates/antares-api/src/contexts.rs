@@ -335,10 +335,11 @@ pub async fn list_contexts(
             Option<antares_jsonld::CtxUsage>,
         )> = Vec::new();
         // ADR-0023 rule 5: a stored @context is the tenant's and may define
-        // a term for an Attribute a view hides, so through a view the list
-        // is the core @context alone (the pinned entries below).
+        // a term for an Attribute a view hides, so through a view that hides
+        // a name the list is the core @context alone (the pinned entries
+        // below). A view showing every name hides no term (rule 12, T-3946).
         #[cfg(feature = "views")]
-        let stored = if st.view.is_some() {
+        let stored = if st.view.as_ref().is_some_and(|v| !v.shows_every_name()) {
             Vec::new()
         } else {
             st.store.context_list_meta(Some(&tenant)).await?
