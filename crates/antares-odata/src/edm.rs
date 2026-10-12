@@ -632,7 +632,8 @@ fn written(slot: &linkml_model::Slot) -> Written {
 /// C2 to C16: the writes the view offers, none of them deep or an upsert,
 /// with the members no write may name ([`Shape::writable`], the computed
 /// ones are `Core.Computed`); counting; filtering and sorting on the
-/// members [`Shape::scalar`] admits and `id` (C11, C12); expanding one
+/// members [`Shape::scalar`] admits and `id` (C11, C12), sorting also on
+/// `createdAt` and `modifiedAt`; expanding one
 /// level (C13). Advisory: every request is still gated (O25).
 fn capabilities(
     members: &BTreeMap<String, Member>,
@@ -692,7 +693,7 @@ fn capabilities(
             vec![("Deletable", flag(writable.delete))],
         ),
         restriction("CountRestrictions", vec![("Countable", flag(true))]),
-        restriction("SearchRestrictions", vec![("Searchable", flag(false))]),
+        restriction("SearchRestrictions", vec![("Searchable", flag(true))]),
         restriction(
             "FilterRestrictions",
             vec![
@@ -708,7 +709,18 @@ fn capabilities(
             "SortRestrictions",
             vec![
                 ("Sortable", flag(true)),
-                ("NonSortableProperties", Expr::Collection(unserved)),
+                // `createdAt` and `modifiedAt` are sorted by the surface (T-3758)
+                (
+                    "NonSortableProperties",
+                    Expr::Collection(
+                        unserved
+                            .into_iter()
+                            .filter(|p| {
+                                !matches!(p, Expr::PropertyPath(n) if n == "createdAt" || n == "modifiedAt")
+                            })
+                            .collect(),
+                    ),
+                ),
             ],
         ),
         restriction(
@@ -759,14 +771,53 @@ fn container_capabilities() -> Vec<Annotation> {
         ),
         flag("QuerySegmentSupported", true),
         flag("CrossJoinSupported", false),
-        flag("ComputeSupported", false),
+        flag("ComputeSupported", true),
+        // Q19: the `$apply` transformations served (T-3937, T-3985)
+        Annotation::new(
+            "Aggregation.ApplySupported",
+            Expr::Record(vec![
+                (
+                    "Transformations".into(),
+                    Expr::Collection(
+                        [
+                            "identity",
+                            "filter",
+                            "orderby",
+                            "top",
+                            "skip",
+                            "aggregate",
+                            "groupby",
+                            "topcount",
+                            "topsum",
+                            "toppercent",
+                            "bottomcount",
+                            "bottomsum",
+                            "bottompercent",
+                            "concat",
+                            "compute",
+                            "search",
+                        ]
+                        .into_iter()
+                        .map(|t| Expr::String(t.into()))
+                        .collect(),
+                    ),
+                ),
+                (
+                    "Rollup".into(),
+                    Expr::EnumMember {
+                        ty: "Aggregation.RollupType".into(),
+                        members: vec!["None".into()],
+                    },
+                ),
+            ]),
+        ),
         flag("KeyAsSegmentSupported", false),
         flag("AsynchronousRequestsSupported", false),
     ]
 }
 
 fn references() -> Vec<Reference> {
-    ["Core", "Capabilities", "Validation"]
+    ["Core", "Capabilities", "Validation", "Aggregation"]
         .into_iter()
         .map(|alias| Reference {
             uri: format!("{VOCABULARIES}Org.OData.{alias}.V1.xml"),

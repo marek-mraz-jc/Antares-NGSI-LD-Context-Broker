@@ -6,9 +6,9 @@
 use std::fmt::{self, Display, Formatter, Write};
 
 use crate::{
-    CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key, KeyValue, Levels,
-    Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions, Segment, SelectItem,
-    Shape,
+    Aggregate, ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath, Expr, Format,
+    Geography, Key, KeyValue, Levels, Literal, MemberPath, ODataUri, OrderBy, Position,
+    QueryOptions, Segment, SelectItem, Shape, Transformation,
 };
 
 impl Display for ODataUri {
@@ -72,8 +72,18 @@ impl Display for Query<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let o = self.0;
         let mut items: Vec<String> = Vec::new();
+        if let Some(apply) = &o.apply {
+            let steps: Vec<String> = apply.iter().map(ToString::to_string).collect();
+            items.push(format!("$apply={}", steps.join("/")));
+        }
+        if let Some(compute) = &o.compute {
+            items.push(format!("$compute={}", List(compute)));
+        }
         if let Some(filter) = &o.filter {
             items.push(format!("$filter={filter}"));
+        }
+        if let Some(search) = &o.search {
+            items.push(format!("$search={search}"));
         }
         if let Some(select) = &o.select {
             items.push(format!("$select={}", List(select)));
@@ -197,6 +207,64 @@ impl Display for OrderBy {
     }
 }
 
+impl Display for Compute {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}%20as%20{}", self.expr, self.alias)
+    }
+}
+
+impl Display for Transformation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Transformation::Identity => f.write_str("identity"),
+            Transformation::Filter(expr) => write!(f, "filter({expr})"),
+            Transformation::OrderBy(items) => write!(f, "orderby({})", List(items)),
+            Transformation::Top(n) => write!(f, "top({n})"),
+            Transformation::Skip(n) => write!(f, "skip({n})"),
+            Transformation::Aggregate(items) => write!(f, "aggregate({})", List(items)),
+            Transformation::GroupBy {
+                properties,
+                aggregate,
+            } => {
+                write!(f, "groupby(({})", properties.join(","))?;
+                if let Some(items) = aggregate {
+                    write!(f, ",aggregate({})", List(items))?;
+                }
+                f.write_str(")")
+            }
+            Transformation::Partition { by, top, n, expr } => {
+                let side = if *top { "top" } else { "bottom" };
+                write!(f, "{side}{}({n},{expr})", by.as_str())
+            }
+            Transformation::Concat(branches) => {
+                let branches: Vec<String> = branches
+                    .iter()
+                    .map(|b| {
+                        b.iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    })
+                    .collect();
+                write!(f, "concat({})", branches.join(","))
+            }
+            Transformation::Compute(items) => write!(f, "compute({})", List(items)),
+            Transformation::Search(search) => write!(f, "search({search})"),
+        }
+    }
+}
+
+impl Display for Aggregate {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Aggregate::With { expr, with, alias } => {
+                write!(f, "{expr}%20with%20{}%20as%20{alias}", with.as_str())
+            }
+            Aggregate::Count { alias } => write!(f, "$count%20as%20{alias}"),
+        }
+    }
+}
+
 impl Display for Format {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -215,8 +283,10 @@ fn strength(expr: &Expr) -> u8 {
         Expr::And(..) => 2,
         Expr::Compare(_, CompareOp::Eq | CompareOp::Ne, _) | Expr::In(..) => 3,
         Expr::Compare(..) => 4,
-        Expr::Not(_) => 5,
-        _ => 6,
+        Expr::Arith(_, ArithOp::Add | ArithOp::Sub, _) => 5,
+        Expr::Arith(..) => 6,
+        Expr::Not(_) | Expr::Neg(_) => 7,
+        _ => 8,
     }
 }
 
@@ -256,19 +326,24 @@ impl Display for Expr {
             Expr::And(left, right) => write!(f, "{}%20and%20{}", At(left, s), At(right, next)),
             Expr::Or(left, right) => write!(f, "{}%20or%20{}", At(left, s), At(right, next)),
             Expr::Not(operand) => write!(f, "not%20{}", At(operand, s)),
-            Expr::Call(method, args) => {
-                let name = match method {
-                    Method::Contains => "contains",
-                    Method::StartsWith => "startswith",
-                    Method::EndsWith => "endswith",
-                    Method::GeoIntersects => "geo.intersects",
-                };
-                write!(f, "{name}({})", List(args))
+            Expr::Call(method, args) => write!(f, "{}({})", method.name(), List(args)),
+            Expr::Arith(left, op, right) => {
+                write!(f, "{}%20{}%20{}", At(left, s), op.word(), At(right, next))
             }
+            // `-` then a negative literal or another negation would read as `--`, which is no
+            // token: the operand is parenthesised unless it is a member, a call or a group.
+            Expr::Neg(operand) => match operand.as_ref() {
+                Expr::Member(_) | Expr::Call(..) | Expr::Alias(_) => write!(f, "-{operand}"),
+                _ => write!(f, "-({operand})"),
+            },
             Expr::Any { collection, lambda } => match lambda {
                 None => write!(f, "{collection}/any()"),
                 Some((variable, body)) => write!(f, "{collection}/any({variable}:{body})"),
             },
+            Expr::All {
+                collection,
+                lambda: (variable, body),
+            } => write!(f, "{collection}/all({variable}:{body})"),
         }
     }
 }

@@ -5,9 +5,10 @@ use crate::cursor::{count, Cursor};
 use crate::expr::{annotation, common_expr, Budget, Scope};
 use crate::literal::{literal, pct_encoded};
 use crate::model::{Member, Model};
+use crate::search::search;
 use crate::{
-    ExpandItem, ExpandKind, ExpandPath, Feature, Format, Levels, LimitKind, OrderBy, QueryOptions,
-    SelectItem, UrlError, UrlErrorKind,
+    Compute, ExpandItem, ExpandKind, ExpandPath, Feature, Format, Levels, LimitKind, OrderBy,
+    QueryOptions, SelectItem, Transformation, UrlError, UrlErrorKind,
 };
 
 /// Which options a URL form allows besides custom ones (ABNF `batchOptions`,
@@ -45,7 +46,8 @@ enum Name {
 }
 
 /// Names matched case-insensitively, with or without `$` (Protocol 4.01 11.2.1) unless the
-/// flag says `$` is required (`$skiptoken`, `$deltatoken` in the ABNF; `$apply`).
+/// flag says `$` is required (`$skiptoken`, `$deltatoken` in the ABNF; `$apply` in Data
+/// Aggregation 4.0).
 const NAMES: [(&str, bool, Name); 17] = [
     ("$filter", true, Name::Filter),
     ("$select", true, Name::Select),
@@ -77,11 +79,8 @@ impl Name {
 
     fn not_implemented(self) -> Option<Feature> {
         match self {
-            Name::Search => Some(Feature::Search),
-            Name::Compute => Some(Feature::Compute),
             Name::Index => Some(Feature::Index),
             Name::Deltatoken => Some(Feature::DeltaToken),
-            Name::Apply => Some(Feature::Apply),
             _ => None,
         }
     }
@@ -156,6 +155,14 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
         allowed: Allowed,
     ) -> Result<QueryOptions, UrlError> {
         let mut options = QueryOptions::default();
+        let (mut applied, scope) = match allowed {
+            Allowed::All => self.apply_first(scope)?,
+            Allowed::Format | Allowed::EntityId => (None, scope),
+        };
+        let mut computed = match allowed {
+            Allowed::All => self.compute_first(scope)?,
+            Allowed::Format | Allowed::EntityId => None,
+        };
         let mut seen: Vec<Name> = Vec::new();
         let mut n = 0;
         let max = self.budget.limits.max_query_options;
@@ -173,7 +180,22 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
                     return Err(self.c.error(UrlErrorKind::DuplicateOption(name.label())));
                 }
                 seen.push(name);
-                self.system(scope, name, start, &mut options)?;
+                // parsed first; a second one is the duplicate refused above
+                let first = match name {
+                    Name::Apply => applied.take().map(|(end, steps)| {
+                        options.apply = Some(steps);
+                        end
+                    }),
+                    Name::Compute => computed.take().map(|(end, items)| {
+                        options.compute = Some(items);
+                        end
+                    }),
+                    _ => None,
+                };
+                match first {
+                    Some(end) => self.c.reset(end),
+                    None => self.system(scope, name, start, &mut options)?,
+                }
             } else if allowed == Allowed::All && self.c.at() {
                 self.alias(&mut options)?;
             } else {
@@ -190,6 +212,99 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
             return Err(self.c.syntax("id"));
         }
         Ok(options)
+    }
+
+    /// The cursor after the `name=` of the first option `name`; unmoved and `false` without
+    /// one.
+    fn find(&mut self, name: Name) -> bool {
+        let base = self.c.pos();
+        // a raw `&` ends an option: inside a value it is percent-encoded
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(
+                self.c
+                    .rest()
+                    .match_indices('&')
+                    .map(|(at, _)| at.saturating_add(1)),
+            )
+            .collect();
+        for at in starts {
+            self.c.reset(base.saturating_add(at));
+            if option_name(self.c, &[name]).is_some() {
+                return true;
+            }
+        }
+        self.c.reset(base);
+        false
+    }
+
+    /// `$apply` before every other option (Data Aggregation 4.0 section 3): the others name
+    /// what it produces. Its transformations and where it ends, `None` without one, and the
+    /// scope the other options resolve in.
+    #[allow(clippy::type_complexity)]
+    fn apply_first(
+        &mut self,
+        scope: Scope<'m>,
+    ) -> Result<(Option<(usize, Vec<Transformation>)>, Scope<'m>), UrlError> {
+        let base = self.c.pos();
+        if !self.find(Name::Apply) {
+            return Ok((None, scope));
+        }
+        let (steps, after) = self.apply(scope)?;
+        let end = self.c.pos();
+        self.c.reset(base);
+        Ok((Some((end, steps)), after))
+    }
+
+    /// `$compute` before every other option but `$apply` (Protocol 11.2.1): its names resolve
+    /// in the others wherever it stands. Its items and where it ends, `None` without one; the
+    /// first one only, so a second is the duplicate the options loop answers.
+    fn compute_first(
+        &mut self,
+        scope: Scope<'m>,
+    ) -> Result<Option<(usize, Vec<Compute>)>, UrlError> {
+        let base = self.c.pos();
+        if !self.find(Name::Compute) {
+            return Ok(None);
+        }
+        let items = self.compute(scope)?;
+        let end = self.c.pos();
+        self.c.reset(base);
+        Ok(Some((end, items)))
+    }
+
+    /// `computeItem *( COMMA computeItem )`, `computeItem = commonExpr RWS "as" RWS
+    /// computedProperty`; a name the resource has, or one given twice, is refused. Each
+    /// expression counts against the request's expression budget.
+    pub(crate) fn compute(&mut self, scope: Scope<'m>) -> Result<Vec<Compute>, UrlError> {
+        let mut items: Vec<Compute> = Vec::new();
+        loop {
+            let expr = common_expr(self.c, self.model, scope, &mut self.budget)?;
+            if !(self.c.rws() && self.c.eat_ci("as") && self.c.rws()) {
+                return Err(self.c.syntax("computeItem"));
+            }
+            let at = self.c.pos();
+            let Some(alias) = self.c.identifier()? else {
+                return Err(self.c.syntax("computedProperty"));
+            };
+            if member(self.model, scope, alias).is_some()
+                || items.iter().any(|i| i.alias == alias)
+                || self.budget.computed.iter().any(|c| c == alias)
+            {
+                self.c.reset(at);
+                return Err(self.c.syntax("computedProperty"));
+            }
+            items.push(Compute {
+                expr,
+                alias: alias.to_owned(),
+            });
+            if !self.c.comma() {
+                // after the names an aggregating `$apply` produced
+                self.budget
+                    .computed
+                    .extend(items.iter().map(|i| i.alias.clone()));
+                return Ok(items);
+            }
+        }
     }
 
     fn system(
@@ -215,6 +330,10 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
             Name::Count => options.count = Some(boolean(self.c)?),
             Name::Format => options.format = Some(format(self.c)?),
             Name::Skiptoken => options.skiptoken = Some(qchars(self.c, "skiptoken")?),
+            Name::Search => {
+                let limits = self.budget.limits;
+                options.search = Some(search(self.c, limits, &mut self.budget.nodes, false)?);
+            }
             Name::Id => options.id = Some(qchars(self.c, "IRI-in-query")?),
             _ => options.schemaversion = Some(schemaversion(self.c)?),
         }
@@ -241,7 +360,7 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
     }
 
     /// `$orderby`: `orderbyItem *( COMMA orderbyItem )`.
-    fn orderby(&mut self, scope: Scope<'m>) -> Result<Vec<OrderBy>, UrlError> {
+    pub(crate) fn orderby(&mut self, scope: Scope<'m>) -> Result<Vec<OrderBy>, UrlError> {
         let max = self.budget.limits.max_orderby_items;
         let mut items = Vec::new();
         loop {
@@ -307,7 +426,10 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
                 self.c.reset(at);
                 return Err(self.c.not_implemented(Feature::TypeCast));
             }
-            let Some(found) = member(self.model, here, name) else {
+            let computed = path.is_empty() && self.budget.computed.iter().any(|c| c == name);
+            let found = member(self.model, here, name)
+                .or_else(|| computed.then_some(Member::Primitive { collection: false }));
+            let Some(found) = found else {
                 self.c.reset(at);
                 return Err(self.c.error(UrlErrorKind::Unresolved));
             };
@@ -456,39 +578,56 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
         }
         let (mut select, mut expand, mut levels) = (None, None, None);
         if self.c.open() {
-            loop {
-                match option_name(self.c, &[Name::Select, Name::Expand, Name::Levels]) {
-                    Some(Name::Select) => select = Some(self.select(target)?),
-                    Some(Name::Expand) => {
-                        expand = Some(self.expand(target, depth.saturating_add(1))?);
-                    }
-                    Some(_) => levels = Some(self.levels(depth)?),
-                    None => {
-                        let refused = [
-                            Name::Filter,
-                            Name::Search,
-                            Name::Orderby,
-                            Name::Skip,
-                            Name::Top,
-                            Name::Count,
-                            Name::Compute,
-                        ];
-                        return Err(self.nested_refused(&refused));
-                    }
-                }
-                if self.c.close() {
-                    break;
-                }
-                if !self.c.semi() {
-                    return Err(self.c.syntax("SEMI"));
-                }
-            }
+            // the `$compute` names are the resource's, not the expanded entities'
+            let computed = std::mem::take(&mut self.budget.computed);
+            let nested = self.expand_options(target, depth, &mut select, &mut expand, &mut levels);
+            self.budget.computed = computed;
+            nested?;
         }
         Ok(ExpandKind::Entities {
             select,
             expand,
             levels,
         })
+    }
+
+    /// The options of an expanded navigation after its `OPEN`, up to its `CLOSE`.
+    fn expand_options(
+        &mut self,
+        target: Scope<'m>,
+        depth: usize,
+        select: &mut Option<Vec<SelectItem>>,
+        expand: &mut Option<Vec<ExpandItem>>,
+        levels: &mut Option<Levels>,
+    ) -> Result<(), UrlError> {
+        loop {
+            match option_name(self.c, &[Name::Select, Name::Expand, Name::Levels]) {
+                Some(Name::Select) => *select = Some(self.select(target)?),
+                Some(Name::Expand) => {
+                    *expand = Some(self.expand(target, depth.saturating_add(1))?);
+                }
+                Some(_) => *levels = Some(self.levels(depth)?),
+                None => {
+                    let refused = [
+                        Name::Filter,
+                        Name::Search,
+                        Name::Orderby,
+                        Name::Skip,
+                        Name::Top,
+                        Name::Count,
+                        Name::Compute,
+                    ];
+                    return Err(self.nested_refused(&refused));
+                }
+            }
+            if self.c.close() {
+                break;
+            }
+            if !self.c.semi() {
+                return Err(self.c.syntax("SEMI"));
+            }
+        }
+        Ok(())
     }
 
     /// A nested option that is not implemented when it is one of `refused` or an alias, and a
@@ -527,7 +666,11 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
 }
 
 /// The member `name` of `scope`.
-fn member<'m, M: Model>(model: &'m M, scope: Scope<'_>, name: &str) -> Option<Member<'m>> {
+pub(crate) fn member<'m, M: Model>(
+    model: &'m M,
+    scope: Scope<'_>,
+    name: &str,
+) -> Option<Member<'m>> {
     match scope {
         Scope::Type(ty) => model.member(ty, name),
         Scope::Primitive => None,
@@ -535,7 +678,7 @@ fn member<'m, M: Model>(model: &'m M, scope: Scope<'_>, name: &str) -> Option<Me
 }
 
 /// `1*DIGIT` as a `u64`.
-fn unsigned(c: &mut Cursor<'_>) -> Result<u64, UrlError> {
+pub(crate) fn unsigned(c: &mut Cursor<'_>) -> Result<u64, UrlError> {
     let start = c.pos();
     let digits = c.digits();
     if digits.is_empty() {

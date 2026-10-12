@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod apply;
 mod batch;
 mod below;
 pub mod edm;
@@ -136,6 +137,10 @@ async fn respond(ops: &Ops, mut req: Request) -> Response {
         csdl_limits: odata_csdl::Limits::strict(),
         max_header_len: MAX_HEADER_LEN,
         metadata_etag,
+        custom_options: read::NGSILD_OPTIONS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
     });
     // The inner router matches its own path; the outer match goes.
     req.extensions_mut().remove::<MatchedPath>();
