@@ -11,6 +11,8 @@
 //! index-shaped in the broker (candidate lookup by (tenant, type) /
 //! (tenant, watched attribute)); every predicate here evaluates one
 //! candidate self-contained.
+//!
+#![doc = include_str!("../README.md")]
 // T-3468: every surface calls into this crate on a request path, where a
 // panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
 // index out of bounds or overflow.

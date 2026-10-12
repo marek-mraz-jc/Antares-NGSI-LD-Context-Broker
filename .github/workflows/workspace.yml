@@ -619,7 +619,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [antares-model, antares-ql, antares-jsonld, antares-matcher, antares-store]
+        crate: [antares-model, antares-ql, antares-jsonld, antares-matcher, antares-residual, antares-store]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -629,6 +629,14 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
       - run: cargo check --locked -p ${{ matrix.crate }} -j 2
       - run: cargo test --locked -p ${{ matrix.crate }} -j 2
+      # T-3912: each example reads real NGSI-LD input from the ETSI suite's fixtures; it has to
+      # run, not only compile, or the README's promise is untested.
+      - name: Examples run
+        run: |
+          for example in crates/${{ matrix.crate }}/examples/*.rs; do
+            [ -e "$example" ] || continue
+            cargo run --locked -q -p ${{ matrix.crate }} --example "$(basename "$example" .rs)" -j 2
+          done
       # the smallest broker build (every optional feature off) must compile
       - run: cargo check --locked -p antares-broker --no-default-features -j 2
         if: matrix.crate == 'antares-store'
@@ -658,3 +666,39 @@ jobs:
              | grep -E '^(antares-api|antares-broker|antares-sql|sqlx|axum|redb) '; then
             echo "::error::${{ matrix.crate }} depends on the broker or a storage backend"; exit 1
           fi
+
+  ngsild-publish:
+    # T-3912: the NGSI-LD crates build from their packaged files alone (no path-only dependency,
+    # the README packaged with its doctest), in dependency order, as a release would publish
+    # them; and a breaking change to their public API is a visible line against the last v* tag.
+    name: NGSI-LD crates (package, semver)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # cargo-semver-checks builds the baseline from the last tag
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@0.50.0
+      - name: cargo publish --dry-run (packaged files only)
+        run: |
+          cargo publish --dry-run --locked \
+            -p antares-model -p antares-jsonld -p antares-ql -p antares-matcher -p antares-residual
+      - name: cargo package --list (what a release ships)
+        run: |
+          for crate in antares-model antares-jsonld antares-ql antares-matcher antares-residual; do
+            echo "== $crate: $(cargo package --locked --list -p "$crate" | wc -l) files"
+          done
+      - name: cargo-semver-checks against the last v* tag
+        run: |
+          base=$(git describe --tags --abbrev=0 --match 'v*')
+          echo "baseline $base"
+          cargo semver-checks --baseline-rev "$base" \
+            -p antares-model -p antares-jsonld -p antares-ql -p antares-matcher -p antares-residual

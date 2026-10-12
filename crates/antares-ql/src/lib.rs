@@ -8,6 +8,8 @@
 //! and `Clone`, and renders back to `q=` syntax through `Display`, so a
 //! gateway can inspect or rewrite a query (strip an attribute, AND in an
 //! authorization predicate) and forward it with the broker's own semantics.
+//!
+#![doc = include_str!("../README.md")]
 // T-3468: every surface calls into this crate on a request path, where a
 // panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
 // index out of bounds or overflow.
@@ -259,14 +261,14 @@ pub enum QValue {
 /// Longest `q=` accepted, before parsing. The URI cap is 8 KiB but a POST
 /// query body carries `q` too, where the only other ceiling is the 4 MiB body
 /// limit — so the string needs its own bound at the one entry point.
-const MAX_Q_BYTES: usize = 4096;
+pub const MAX_Q_BYTES: usize = 4096;
 
 /// Nesting depth ceiling. `(` costs three stack frames (`or_expr` → `and_expr`
 /// → `term`), and a Rust stack overflow is a guard-page abort, NOT a catchable
 /// panic — no tower layer can contain it, so the parser must refuse before it
 /// recurses rather than be rescued afterwards. 64 is far past any real query
 /// and far below the ~2 MiB tokio worker stack.
-const MAX_Q_DEPTH: usize = 64;
+pub const MAX_Q_DEPTH: usize = 64;
 
 /// AST size cap — checked after parsing, which is safe once depth and
 /// length are bounded first. Public because `/q/health` publishes it: a

@@ -16,36 +16,7 @@
 //! integer overflow, a division by zero and a string past [`MAX_STRING_BYTES`] are unknown too,
 //! never a wrapped or truncated value.
 //!
-//! ```
-//! use antares_residual::{compile, eval, Cmp, DateTime, Expr, Func, Lit, Path, Truth};
-//! use serde_json::json;
-//!
-//! // contains(tolower(name), 'sta') and not (pm10 gt 50)
-//! let filter = Expr::And(vec![
-//!     Expr::Call(Func::Contains, vec![
-//!         Expr::Call(Func::ToLower, vec![Expr::Path(Path::value("name"))]),
-//!         Expr::Lit(Lit::Str("sta".into())),
-//!     ]),
-//!     Expr::Not(Box::new(Expr::Cmp(
-//!         Cmp::Gt,
-//!         Box::new(Expr::Path(Path::value("pm10"))),
-//!         Box::new(Expr::Lit(Lit::Int(50))),
-//!     ))),
-//! ]);
-//! let now = DateTime::parse("2026-10-11T12:00:00Z").ok_or("now")?;
-//! let program = compile(&filter, now)?;
-//! let station = json!({
-//!     "id": "urn:ngsi-ld:AirQuality:1", "type": "AirQuality",
-//!     "name": {"type": "Property", "value": "Station North"},
-//!     "pm10": {"type": "Property", "value": 12},
-//! });
-//! assert_eq!(eval(&program, &station)?, Truth::True);
-//! // no pm10: `pm10 gt 50` is unknown, and so is its negation
-//! let silent = json!({"id": "urn:ngsi-ld:AirQuality:2", "type": "AirQuality",
-//!     "name": {"type": "Property", "value": "Station South"}});
-//! assert_eq!(eval(&program, &silent)?, Truth::Unknown);
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
+#![doc = include_str!("../README.md")]
 
 mod eval;
 mod geometry;

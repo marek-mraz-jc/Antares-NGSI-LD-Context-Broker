@@ -3,9 +3,13 @@ name = "antares-jsonld"
 description = "JSON-LD layer: caching Loader, pinned core contexts, NGSI-LD expansion/compaction + structural validation."
 version.workspace = true
 edition.workspace = true
-publish = false
+publish = ["crates-io"]
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["ngsi-ld", "json-ld", "etsi", "linked-data", "fiware"]
+categories = ["parser-implementations", "encoding"]
 
 # ADR-0027 / surfaces-threat-model 9.1: checked by dev/check-module-rules.py.
 [package.metadata.antares]
@@ -16,6 +20,9 @@ antares-model = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints]
 workspace = true

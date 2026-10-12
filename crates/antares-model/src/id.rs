@@ -18,6 +18,9 @@ impl TenantId {
     /// The default tenant name, used when no `NGSILD-Tenant` header is sent.
     pub const DEFAULT: &'static str = "default";
 
+    /// The longest tenant name, in bytes (all of them ASCII).
+    pub const MAX_LEN: usize = 64;
+
     /// Tenant names the broker mints for its own bookkeeping: the snapshot
     /// module's reverse index and one tenant per snapshot share a prefix, the
     /// distributed-subscription inbound index and the view table (ADR-0023
@@ -72,7 +75,7 @@ impl TenantId {
     /// marker). Never for a name a client supplied.
     pub fn new_internal(raw: &str) -> Result<Self, NgsiError> {
         let ok = !raw.is_empty()
-            && raw.len() <= 64
+            && raw.len() <= Self::MAX_LEN
             && raw
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
