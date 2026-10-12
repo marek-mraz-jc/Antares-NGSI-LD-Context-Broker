@@ -771,6 +771,10 @@ pub(crate) struct WriteGuard {
     /// The expanded names of the Attributes the write sets or removes.
     written: Vec<String>,
     refused: std::sync::OnceLock<&'static str>,
+    /// The request's `If-Match` (T-3789), every field line joined.
+    if_match: Option<String>,
+    /// The stored Entity was in the view and `if_match` held for it.
+    held: std::sync::atomic::AtomicBool,
 }
 
 impl WriteGuard {
@@ -787,7 +791,75 @@ impl WriteGuard {
             sel: crate::policy::Condition::new(narrowing),
             written: written.into_iter().map(str::to_owned).collect(),
             refused: std::sync::OnceLock::new(),
+            if_match: None,
+            held: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// The guard of a write to one Entity, which honours the request's
+    /// `If-Match` (RFC 9110 13.1.1, T-3789). A batch names no one Entity
+    /// and takes none.
+    pub(crate) fn matching(mut self, headers: &axum::http::HeaderMap) -> Self {
+        let lines: Vec<&str> = headers
+            .get_all(axum::http::header::IF_MATCH)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        self.if_match = (!lines.is_empty()).then(|| lines.join(","));
+        self
+    }
+
+    /// The strong entity tag of what the view shows of the stored document
+    /// `doc`: its frame and the Attributes a rule holding for it shows, so a
+    /// write to a hidden Attribute leaves the tag as it was.
+    // ponytail: std's SipHash over the serialized members, 64 bits; a
+    // broker upgrade may change every tag, which a client meets as a 412
+    pub(crate) fn tag(&self, doc: &serde_json::Value) -> String {
+        use std::hash::{Hash, Hasher};
+        let shown = match self.sel.rules.as_deref() {
+            Some(rules) => rules.shown(doc, crate::repr::policy_context()),
+            None => Some(crate::policy::Shown::default()),
+        };
+        let mut hasher = std::hash::DefaultHasher::new();
+        for (k, v) in doc.as_object().into_iter().flatten() {
+            let frame = matches!(k.as_str(), "id" | "type" | "scope");
+            let attribute = !antares_model::is_meta(k)
+                && !k.starts_with("__")
+                && !k.starts_with('@')
+                && shown.as_ref().is_some_and(|s| s.allows(k));
+            if frame || attribute {
+                k.hash(&mut hasher);
+                v.to_string().hash(&mut hasher);
+            }
+        }
+        format!("\"{:016x}\"", hasher.finish())
+    }
+
+    /// The precondition on the stored document: in the view, and the
+    /// request's `If-Match` holds for it. Either failing aborts the write
+    /// as not found; [`Self::settled`] answers a failed `If-Match` 412.
+    fn condition(&self, id: &str, doc: &serde_json::Value) -> Result<(), antares_model::NgsiError> {
+        if self.keeps(doc) {
+            Ok(())
+        } else {
+            Err(antares_model::NgsiError::ResourceNotFound(format!(
+                "entity {id} not found"
+            )))
+        }
+    }
+
+    /// Whether a write may touch the stored document `doc`: the view selects
+    /// it and the request's `If-Match` holds for it.
+    pub(crate) fn keeps(&self, doc: &serde_json::Value) -> bool {
+        let holds = self.sees(doc)
+            && self
+                .if_match
+                .as_deref()
+                .is_none_or(|m| if_match_holds(m, &self.tag(doc)));
+        if holds {
+            self.held.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        holds
     }
 
     /// Whether the view selects the stored document `doc`. A linked path in
@@ -830,13 +902,8 @@ impl WriteGuard {
         id: &str,
         doc: &serde_json::Value,
     ) -> Result<(), antares_model::NgsiError> {
-        match self.judge(doc) {
-            None => Ok(()),
-            Some(MOVES_OUT) => Err(antares_model::NgsiError::ResourceNotFound(format!(
-                "entity {id} not found"
-            ))),
-            Some(why) => Err(self.refuse(why)),
-        }
+        self.condition(id, doc)?;
+        self.judge(doc).map_or(Ok(()), |why| Err(self.refuse(why)))
     }
 
     /// [`Self::pre`] for a write that replaces the whole Entity: every
@@ -859,13 +926,9 @@ impl WriteGuard {
             .map(String::as_str)
             .chain(held)
             .collect();
-        match self.judge_names(doc, names) {
-            None => Ok(()),
-            Some(MOVES_OUT) => Err(antares_model::NgsiError::ResourceNotFound(format!(
-                "entity {id} not found"
-            ))),
-            Some(why) => Err(self.refuse(why)),
-        }
+        self.condition(id, doc)?;
+        self.judge_names(doc, names)
+            .map_or(Ok(()), |why| Err(self.refuse(why)))
     }
 
     /// The post-image check on `doc` as the write leaves it. A refusal is
@@ -883,6 +946,18 @@ impl WriteGuard {
             None => Ok(()),
             Some(why) => Err(Denied(why.to_owned())),
         }
+    }
+
+    /// [`Self::verdict`] after the `If-Match` of the request: one that did
+    /// not hold, on an Entity out of the view or absent alike, is the 412
+    /// the handler answers (RFC 9110 13.1.1).
+    pub(crate) fn settled(&self) -> crate::negotiate::ApiResult<()> {
+        if self.if_match.is_some() && !self.held.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(crate::negotiate::ApiError::Bare(
+                axum::http::StatusCode::PRECONDITION_FAILED,
+            ));
+        }
+        Ok(self.verdict()?)
     }
 
     /// The refusal [`Self::pre`] or [`Self::post`] recorded, as the 403 the
@@ -915,6 +990,16 @@ impl WriteGuard {
         }
         Ok(())
     }
+}
+
+/// RFC 9110 13.1.1: `*` holds for any current representation; otherwise one
+/// listed entity tag must be strongly equal to `tag`, which is quoted, so an
+/// unquoted or weak (`W/`) one never is.
+fn if_match_holds(field: &str, tag: &str) -> bool {
+    field
+        .split(',')
+        .map(str::trim)
+        .any(|t| t == "*" || t == tag)
 }
 
 /// Rule 7 for an Entity a create writes, outside any store closure: in the
