@@ -38,6 +38,14 @@ reason = "the view store failing: the built-in store under test_kit does not fai
 
 [[exclusion]]
 crate = "antares-ops"
+file = "src/views.rs"
+function = "antares_ops::views::install"
+lines = 3
+branches = 0
+reason = "the minute loop's sweep body: its first tick is a minute after start (an immediate one raced the tests' own sweeps, T-3745), so no test runs it; tests call Reload::sweep_retention and sweep_quality, which run the same two sweeps"
+
+[[exclusion]]
+crate = "antares-ops"
 file = "src/views/preview.rs"
 function = "antares_ops::views::preview::preview"
 lines = 2
