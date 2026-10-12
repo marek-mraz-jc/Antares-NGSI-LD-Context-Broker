@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! Tenant export, import and digest (ADR-0030): what a platform needs to move
 //! one Tenant to another broker with its system attributes and its history,
 //! and to prove the copy from both sides. Admin surface only (`/q/`).
