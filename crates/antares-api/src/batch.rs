@@ -2262,9 +2262,10 @@ mod tests {
         // …but `coordinates` keeps its own ceiling: MAX_GEO_VERTICES, which a
         // legal polygon can spend more than MAX_URI_BYTES on. Capping it in
         // bytes too would refuse a geometry the broker advertises support for.
-        let ring: Vec<Value> = (0..600)
-            .map(|i| json!([f64::from(i) / 10_000.0, f64::from(i) / 10_000.0]))
-            .chain(std::iter::once(json!([0.0, 0.0])))
+        // A circle: a valid ring, as the area relations ask (T-3912).
+        let ring: Vec<Value> = (0..=600)
+            .map(|i| f64::from(i % 600) * std::f64::consts::TAU / 600.0)
+            .map(|a| json!([a.cos() / 100.0, a.sin() / 100.0]))
             .collect();
         let coords = json!([ring]);
         assert!(
