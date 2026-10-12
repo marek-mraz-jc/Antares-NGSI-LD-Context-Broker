@@ -312,6 +312,39 @@ def check_view_diff():
           " a hidden type or Attribute owes its refusal, a narrowing view its narrowing)")
 
 
+def check_recorder():
+    """dev/etsi_setup_url.py records what a TP body sends, and nothing a failure left NOT RUN
+    (T-4030: Robot still starts those steps, and their variables do not exist)."""
+    with tempfile.TemporaryDirectory() as d:
+        # a stand-in for RequestsLibrary: the listener reads the owner's name, never the library
+        open(f"{d}/RequestsLibrary.py", "w").write("def post(url, data=None, headers=None, expected_status=None):\n    pass\n")
+        open(f"{d}/t.robot", "w").write("""*** Settings ***
+Library    RequestsLibrary
+*** Variables ***
+${url}    http://127.0.0.1:9/ngsi-ld/v1
+${temporal_api_url}    http://127.0.0.1:9/ngsi-ld/v1/temporal
+*** Test Cases ***
+Runs
+    &{headers}=    Create Dictionary    Content-Type=application/json
+    POST    url=${url}/entities    data={"id": "urn:ngsi-ld:T:1"}    headers=${headers}
+After A Failure
+    Should Be Equal    1    2
+    ${notify_url}=    Set Variable    ${url}/notify
+    POST    url=${notify_url}    data={}
+""")
+        record = f"{d}/requests.jsonl"
+        run = subprocess.run(
+            [sys.executable, "-m", "robot", "--pythonpath", d, "--output", "NONE", "--report", "NONE",
+             "--log", "NONE", "--listener", f"{HERE}/etsi_setup_url.py;http://127.0.0.1:9/ngsi-ld/v1;{record}",
+             f"{d}/t.robot"], capture_output=True, text=True)
+        assert "failed:" not in run.stdout + run.stderr, run.stdout + run.stderr
+        lines = [json.loads(l) for l in open(record)]
+        assert [(l["test"].split("::")[1], l["url"], l["headers"], l["body"]) for l in lines] == [
+            ("Runs", "http://127.0.0.1:9/ngsi-ld/v1/entities", ["content-type"], {"id": "urn:ngsi-ld:T:1"})
+        ], lines
+    print("  recorder ok (a step that runs is recorded, a NOT RUN one is not and raises nothing)")
+
+
 if __name__ == "__main__":
     print("etsi sampling self-check")
     check_proc_parsing()
@@ -319,4 +352,5 @@ if __name__ == "__main__":
     check_baseline()
     check_compare()
     check_view_diff()
+    check_recorder()
     print("OK")
