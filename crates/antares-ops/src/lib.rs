@@ -37,11 +37,17 @@
 
 mod error;
 pub mod mapping;
+mod names;
 mod operation;
+mod scan;
 pub mod views;
 
+/// The residual of a standard query (ADR-0028 rule 2), re-exported so a surface compiles into
+/// it through `antares-ops` alone (rule M2).
+pub use antares_residual as residual;
 pub use error::{Refusal, INNER_DETAIL};
 pub use operation::OperationId;
+pub use scan::{Page, Pushdown, Scanned, RESIDUAL_SCAN, TOO_COMPLEX};
 
 use antares_api::AppState;
 use axum::body::Body;
@@ -120,6 +126,9 @@ pub struct ViewOps {
     tenant: antares_model::TenantId,
     operations: Vec<OperationId>,
     mapping: Option<Arc<mapping::Mapping>>,
+    /// The core @context with the view's own merged in: what a name a caller
+    /// writes in an NGSI-LD parameter means here (`names.rs`).
+    names: Arc<antares_jsonld::Context>,
 }
 
 /// The Entity types a caller may see through a view and the Attributes
@@ -370,6 +379,7 @@ impl Ops {
             tenant,
             operations,
             mapping,
+            context,
             ..
         }) = table.get(id)
         else {
@@ -396,6 +406,7 @@ impl Ops {
                 .filter_map(|o| OperationId::from_id(o))
                 .collect(),
             mapping,
+            names: Arc::new(names::of_view(context.as_deref())?),
         };
         // Only views loaded now stay cached: a removed one goes with the
         // first view served after its removal.
@@ -1032,6 +1043,17 @@ pub mod test_kit {
             Self::with_sinks(Vec::new(), None).await
         }
 
+        /// [`TestBroker::new`] over `state`, a test's own store (the Postgres
+        /// arm of the quality sweep's tests, T-4018).
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn over(mut state: AppState) -> Result<Self, String> {
+            antares_api::wire(&mut state).await;
+            let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
+        }
+
         /// [`TestBroker::new`] delivering through `sinks` too (a surface's
         /// own notification binding, ADR-0026) and asking `engine`, both
         /// set before the notifier is wired, as the broker sets them, so
@@ -1050,9 +1072,23 @@ pub mod test_kit {
             if let Some(engine) = engine {
                 state = state.with_policy(engine);
             }
-            antares_api::wire(&mut state).await;
-            let reload = crate::views::install(&state).await?;
-            Ok(Self { state, reload })
+            Self::over(state).await
+        }
+
+        /// One retention sweep at `now` (T-3900), as the minute loop runs it.
+        pub async fn sweep_retention(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Vec<crate::views::retention::Deleted> {
+            self.reload.sweep_retention(now).await
+        }
+
+        /// One quality sweep at `now` (T-4018), as the minute loop runs it.
+        pub async fn sweep_quality(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Vec<crate::views::quality::Changed> {
+            self.reload.sweep_quality(now).await
         }
 
         /// Another pod over the same store: its own view table, loaded and
@@ -1167,6 +1203,24 @@ pub mod test_kit {
                 .with_surfaces(vec![Box::new(antares_api::Admin), mount(surface)])?;
             Ok(antares_api::router(state))
         }
+    }
+
+    /// [`ViewOps::scan`](super::ViewOps::scan) with `residual` under a `budget` of upstream
+    /// Entities read in upstream pages of `upstream`, and how many it read: the bound a test
+    /// crosses with a handful of Entities instead of [`RESIDUAL_SCAN`](super::RESIDUAL_SCAN).
+    ///
+    /// # Errors
+    /// [`ViewOps::scan`](super::ViewOps::scan)'s.
+    pub async fn scan_within(
+        view: &super::ViewOps,
+        caller: &super::Caller,
+        pushdown: &super::Pushdown,
+        residual: &super::residual::Program,
+        page: super::Page,
+        (budget, upstream): (usize, usize),
+    ) -> Result<(super::Scanned, usize), super::Refusal> {
+        view.fill(caller, pushdown, residual, page, (budget, upstream))
+            .await
     }
 
     /// A policy [`Filter`](super::policy::Filter) conditioned on `q` (4.9),

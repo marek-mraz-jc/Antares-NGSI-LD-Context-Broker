@@ -145,12 +145,24 @@ async fn the_restrictions_name_what_filter_and_orderby_refuse() {
     assert_eq!(status, StatusCode::OK, "{xml}");
     let unfilterable = paths(&xml, "FilterRestrictions", "NonFilterableProperties");
     let unsortable = paths(&xml, "SortRestrictions", "NonSortableProperties");
-    assert_eq!(unfilterable, unsortable, "{xml}");
+    // the surface sorts on the system members (T-3758) and filters on none
+    let system = |p: &String| p == "createdAt" || p == "modifiedAt";
+    assert_eq!(
+        unfilterable
+            .iter()
+            .filter(|p| !system(p))
+            .collect::<Vec<_>>(),
+        unsortable.iter().collect::<Vec<_>>(),
+        "{xml}"
+    );
+    assert!(unfilterable.iter().any(system), "{xml}");
     for name in ["tags", "_types", "scope"] {
         assert!(unfilterable.iter().any(|p| p == name), "{name}: {xml}");
     }
     for (option, served) in [
         ("$orderby", "speed%20desc"),
+        ("$orderby", "createdAt"),
+        ("$orderby", "modifiedAt%20desc"),
         ("$filter", "brand%20eq%20'x'"),
     ] {
         let (status, body) = send(
@@ -167,6 +179,9 @@ async fn the_restrictions_name_what_filter_and_orderby_refuse() {
             format!("{ROOT}/Car?$filter={name}%20eq%20null"),
             format!("{ROOT}/Car?$orderby={name}"),
         ] {
+            if uri.contains("$orderby") && !unsortable.contains(name) {
+                continue;
+            }
             let (status, body) = send(&app, Method::GET, &uri, None).await;
             assert!(
                 status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_IMPLEMENTED,
