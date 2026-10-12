@@ -70,25 +70,13 @@ async fn ws_a_removed_view_stops_delivery() -> Result<(), String> {
     Ok(())
 }
 
-/// T-4084: a batch upsert through one view (the HFP writer's) notifies a
-/// Subscription made over the socket of another view of the same tenant
-/// whose grant reads the type; an x-subscribe whose `q` is no NGSI-LD q is
-/// answered 400, as POST /subscriptions is.
+/// T-4084: an x-subscribe whose `q` is no NGSI-LD q is answered 400, as
+/// POST /subscriptions is. A write through another view reaching the socket
+/// is antares-broker's `views_matrix` test, which mounts the views surface.
 #[tokio::test(flavor = "multi_thread")]
-async fn ws_a_write_through_another_view_notifies_and_a_bad_q_is_refused() -> Result<(), String> {
+async fn ws_a_bad_q_is_refused() -> Result<(), String> {
     let b = broker(Limits::default()).await?;
     cars_view(&b).await?;
-    let writer = json!({
-        "id": "writer", "tenant": "city", "selector": ["Car"],
-        "rules": [{"types": ["Car"], "attributes": ["speed"]}],
-        "operations": ["batch_upsert"]
-    });
-    let (code, answer) = b
-        .http
-        .call("PUT", "/q/views/writer", &[], Some(&writer))
-        .await?;
-    assert!(code == 201 || code == 204, "{code} {answer}");
-
     let mut c = connect(b.addr, "/x/views/cars/ws", &[]).await?;
     let bad = c
         .subscribe(json!({"type": "Subscription", "entities": [{"type": "Car"}], "q": "speed>>"}))
@@ -100,23 +88,5 @@ async fn ws_a_write_through_another_view_notifies_and_a_bad_q_is_refused() -> Re
         "{bad}"
     );
     assert_eq!(status(&c.subscribe(cars()).await?), 201);
-
-    let batch = json!([{"id": "urn:ngsi-ld:Car:w", "type": "Car", "speed": {"type": "Property", "value": 7}}]);
-    let (code, answer) = b
-        .http
-        .call(
-            "POST",
-            "/x/views/writer/ngsi-ld/v1/entityOperations/upsert",
-            &[],
-            Some(&batch),
-        )
-        .await?;
-    assert!(code == 201 || code == 204, "{code} {answer}");
-    let n = c.notification().await?;
-    assert_eq!(
-        n.pointer("/body/data/0/speed/value"),
-        Some(&json!(7)),
-        "{n}"
-    );
     Ok(())
 }
