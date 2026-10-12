@@ -1724,8 +1724,13 @@ impl Condition {
     /// The condition `f` sets, or `None` when it selects every Entity.
     pub(crate) fn of(f: &Filter) -> Option<Self> {
         let c = Self::new(f);
-        (c.q.is_some() || c.scope_q.is_some() || !c.areas.is_empty() || c.rules.is_some())
-            .then_some(c)
+        (!c.selects_every()).then_some(c)
+    }
+
+    /// Whether the condition selects every Entity: no `q`, no `scopeQ`, no
+    /// area and no rules.
+    pub(crate) fn selects_every(&self) -> bool {
+        self.q.is_none() && self.scope_q.is_none() && self.areas.is_empty() && self.rules.is_none()
     }
 
     /// Whether the stored document `doc` is selected. A linked path in a
