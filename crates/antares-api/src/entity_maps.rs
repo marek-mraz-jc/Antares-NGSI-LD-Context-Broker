@@ -83,7 +83,9 @@ pub async fn update_entity_map(
             let s = e.as_str().filter(|s| dt(s).is_some()).ok_or_else(|| {
                 NgsiError::BadRequestData("expiresAt must be a DateTime (4.6.3)".into())
             })?;
-            doc["expiresAt"] = json!(s);
+            if let Some(o) = doc.as_object_mut() {
+                o.insert("expiresAt".into(), json!(s));
+            }
         }
         map_put(&st, &tenant, doc).await?;
         Ok::<_, ApiError>(no_content(&tenant))

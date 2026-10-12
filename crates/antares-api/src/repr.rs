@@ -2239,3 +2239,23 @@ mod type_rules_memo_tests {
         assert!(super::narrowing(&car).policy_reach.unwrap().rules.is_some());
     }
 }
+
+#[cfg(test)]
+mod t3932_projection_edges {
+    use super::*;
+    use antares_jsonld::Loader;
+
+    /// T-3932: the projection parser splits at the brace it found and counts
+    /// depth without overflow; a malformed or multi-byte term is a 400, never
+    /// a panic.
+    #[test]
+    fn malformed_and_multibyte_projections_are_refused() {
+        let ctx = Loader::new().core();
+        let deep = parse_projection("a{b{c}}", &ctx).expect("nested");
+        assert_eq!(proj_depth(&deep), 2);
+        assert_eq!(deep[0].raw, "a");
+        for bad in ["a{b", "a}", "a{}", "{", "}", ",", "a,,b", "é{ü|ö}", "a{é}"] {
+            assert!(parse_projection(bad, &ctx).is_err(), "{bad} is refused");
+        }
+    }
+}

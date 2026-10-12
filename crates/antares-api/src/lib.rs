@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! NGSI-LD HTTP binding: axum routers, thin
 //! handlers per spec operation.
-// T-3915: a panic on a request path is a remote DoS. Outside tests this
-// crate may not unwrap, expect or panic; indexing_slicing (107 sites) and
-// arithmetic_side_effects (81) join when T-3932 has rewritten them.
+// T-3915, T-3932: a panic on a request path is a remote DoS. Outside tests
+// this crate may not unwrap, expect, panic, index or overflow.
 #![cfg_attr(
     not(test),
     deny(
@@ -14,7 +13,9 @@
         clippy::unimplemented,
         clippy::dbg_macro,
         clippy::print_stdout,
-        clippy::print_stderr
+        clippy::print_stderr,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
     )
 )]
 #![cfg_attr(test, allow(clippy::unwrap_used))]

@@ -4780,3 +4780,19 @@ mod clause_4_21 {
         assert!(crate::repr::meta_projected(None, None, "type"));
     }
 }
+
+#[cfg(test)]
+mod t3932_time_of_day {
+    use super::seconds_of_day;
+
+    /// T-3932: a Time read with checked byte positions; a short or
+    /// multi-byte value is not a Time, never a panic.
+    #[test]
+    fn a_short_or_multibyte_time_is_none() {
+        assert_eq!(seconds_of_day("12:30:00Z"), Some(45_000.0));
+        assert_eq!(seconds_of_day("12:30:00.5"), Some(45_000.5));
+        for bad in ["", "12:3", "12:30", "1é:00:00", "12-30-00", "aa:bb:cc"] {
+            assert_eq!(seconds_of_day(bad), None, "{bad}");
+        }
+    }
+}
