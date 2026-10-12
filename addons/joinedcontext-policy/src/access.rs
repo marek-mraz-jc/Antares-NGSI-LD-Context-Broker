@@ -150,6 +150,66 @@ fn subject(caller: &Caller) -> Value {
     }
 }
 
+/// What decided one prospective request (README section 3, steps 1 to 3):
+/// the permission that matched, the prohibition that ended it, or nothing.
+#[derive(Debug, Clone, Copy)]
+pub enum Verdict<'t> {
+    /// A permission listing the action's clause and covering the type.
+    Granted(&'t Policy),
+    /// A prohibition listing the action's clause and covering the type,
+    /// which ends it whatever any permission says (GW8).
+    Prohibited(&'t Policy),
+    /// No permission grants it, or the view does not serve the action, or
+    /// the action is no Table 4.20-1 name.
+    NoGrant,
+}
+
+/// The [`Verdict`] on the operation named `action` on `entity_type`
+/// through a view that serves the operation-matrix rows `served` answers
+/// for. [`check`] and [`explain`] both read it, so they cannot disagree.
+#[must_use]
+pub fn verdict<'t>(
+    grants: &Grants<'t>,
+    action: &str,
+    entity_type: Option<&str>,
+    served: &dyn Fn(&str) -> bool,
+) -> Verdict<'t> {
+    let Some(clause) = names::clause(action) else {
+        return Verdict::NoGrant;
+    };
+    let through_view = OPERATIONS
+        .iter()
+        .any(|(n, rows)| *n == action && rows.iter().any(|r| served(r)));
+    if !through_view {
+        return Verdict::NoGrant;
+    }
+    let types: Vec<String> = entity_type
+        .map(|t| context().expand_key(t))
+        .into_iter()
+        .collect();
+    let lists = |p: &&&Policy| p.clauses.contains(clause);
+    if let Some(p) = grants
+        .prohibitions
+        .iter()
+        .filter(lists)
+        .find(|p| covers_types(p, &types))
+    {
+        return Verdict::Prohibited(p);
+    }
+    grants
+        .permissions
+        .iter()
+        .filter(lists)
+        .find(|p| {
+            types.is_empty()
+                || p.selectors.is_empty()
+                || p.selectors
+                    .iter()
+                    .any(|s| s.types.iter().any(|t| types.contains(t)))
+        })
+        .map_or(Verdict::NoGrant, |p| Verdict::Granted(p))
+}
+
 /// One `AuthZEN` decision for one prospective request (platform R51): the
 /// operation named `action` on `entity_type`, decided as the engine decides
 /// (README section 3, steps 1 to 3). A permission may name its assigner,
@@ -161,38 +221,8 @@ pub fn check(
     entity_type: Option<&str>,
     served: &dyn Fn(&str) -> bool,
 ) -> Value {
-    let refused = json!({"decision": false});
-    let Some(clause) = names::clause(action) else {
-        return refused;
-    };
-    let through_view = OPERATIONS
-        .iter()
-        .any(|(n, rows)| *n == action && rows.iter().any(|r| served(r)));
-    if !through_view {
-        return refused;
-    }
-    let types: Vec<String> = entity_type
-        .map(|t| context().expand_key(t))
-        .into_iter()
-        .collect();
-    let lists = |p: &&&Policy| p.clauses.contains(clause);
-    if grants
-        .prohibitions
-        .iter()
-        .filter(lists)
-        .any(|p| covers_types(p, &types))
-    {
-        return refused;
-    }
-    let granted = grants.permissions.iter().filter(lists).find(|p| {
-        types.is_empty()
-            || p.selectors.is_empty()
-            || p.selectors
-                .iter()
-                .any(|s| s.types.iter().any(|t| types.contains(t)))
-    });
-    match granted {
-        Some(p) => {
+    match verdict(grants, action, entity_type, served) {
+        Verdict::Granted(p) => {
             let mut context = Map::new();
             context.insert("reason".into(), json!("policy_grant_matched"));
             if let Some(assigner) = &p.source.assigner {
@@ -200,7 +230,36 @@ pub fn check(
             }
             json!({"decision": true, "context": context})
         }
-        None => refused,
+        Verdict::Prohibited(_) | Verdict::NoGrant => json!({"decision": false}),
+    }
+}
+
+/// The [`check`] decision with why, for the platform's access simulator
+/// (README section 4, EP-103): the reason, and the policy that decided it
+/// with its assigner, a refusal's prohibition included. Its reader is an
+/// administrator, who may read every policy.
+#[must_use]
+pub fn explain(
+    grants: &Grants<'_>,
+    action: &str,
+    entity_type: Option<&str>,
+    served: &dyn Fn(&str) -> bool,
+) -> Value {
+    let named = |p: &Policy, reason: &str| {
+        let mut context = Map::new();
+        context.insert("reason".into(), json!(reason));
+        context.insert("policy".into(), json!(p.id));
+        if let Some(assigner) = &p.source.assigner {
+            context.insert("assigner".into(), json!(assigner));
+        }
+        Value::Object(context)
+    };
+    match verdict(grants, action, entity_type, served) {
+        Verdict::Granted(p) => {
+            json!({"decision": true, "context": named(p, "policy_grant_matched")})
+        }
+        Verdict::Prohibited(p) => json!({"decision": false, "context": named(p, "prohibited")}),
+        Verdict::NoGrant => json!({"decision": false, "context": {"reason": "no_grant"}}),
     }
 }
 
@@ -425,6 +484,53 @@ mod tests {
             at(&check(&none, "queryEntity", None, &every), "/decision"),
             false
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explain_names_the_deciding_policy_and_agrees_with_the_check() -> Result<(), String> {
+        let t = table()?;
+        let public = caller(&[("x-jc-roles", "")]);
+        let grants = Grants::of(Some(&t), &public, Utc::now());
+        assert_eq!(
+            explain(&grants, "queryEntity", Some("AirQualityObserved"), &every),
+            json!({"decision": true, "context": {"reason": "policy_grant_matched",
+                   "policy": "read-air", "assigner": "did:web:city.example.org"}})
+        );
+        // the prohibition that ended it is named, a refusal's reason included (EP-103)
+        assert_eq!(
+            explain(&grants, "queryTemporal", Some("AirQualityObserved"), &every),
+            json!({"decision": false, "context": {"reason": "prohibited", "policy": "no-history"}})
+        );
+        for (action, ty) in [
+            ("queryEntity", Some("InternalIncident")),
+            ("deleteEntity", None),
+            ("retrieveEntity", Some("Expired")),
+            ("nosuch", None),
+        ] {
+            assert_eq!(
+                explain(&grants, action, ty, &every),
+                json!({"decision": false, "context": {"reason": "no_grant"}}),
+                "{action}"
+            );
+        }
+        let not_served = explain(&grants, "queryEntity", None, &|r| r == "retrieve_entity");
+        assert_eq!(at(&not_served, "/context/reason"), "no_grant");
+
+        // one verdict: the two answers never disagree on the decision
+        let steward = caller(&[("x-jc-subject", "eva"), ("x-jc-roles", "steward")]);
+        for who in [&public, &steward, &caller(&[])] {
+            let held = Grants::of(Some(&t), who, Utc::now());
+            for (action, _) in OPERATIONS {
+                for ty in [None, Some("AirQualityObserved"), Some("InternalIncident")] {
+                    assert_eq!(
+                        at(&explain(&held, action, ty, &every), "/decision"),
+                        at(&check(&held, action, ty, &every), "/decision"),
+                        "{action} {ty:?}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }
