@@ -364,6 +364,7 @@ lines = 1
 branches = 0
 reason = "the core @context is compiled in (every_pinned_context_parses_and_carries_an_at_context)"
 
+[[exclusion]]
 crate = "antares-ops"
 file = "src/scan.rs"
 function = "antares_ops::scan::read"
