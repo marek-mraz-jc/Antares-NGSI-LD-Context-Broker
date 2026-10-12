@@ -97,8 +97,6 @@ pub(crate) struct Translated {
     /// The Attribute terms the computed values read, for the pushdown's
     /// `attrs`.
     pub(crate) computed_reads: Vec<String>,
-    /// Whether a computed value reads `createdAt` or `modifiedAt`.
-    pub(crate) computed_system: bool,
 }
 
 /// One key of a surface sort (Q9, ADR-0028 rule 5).
@@ -364,8 +362,9 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
 }
 
 /// `$compute` (URL 5.1.10, Q16): each item as a residual value over the
-/// members of `set` into `out.computed`, with the terms and system members
-/// the values read. The scalar members, functions and arithmetic a `$filter`
+/// members of `set` into `out.computed`, with the terms the values read
+/// (a system member is no residual member here: `createdAt` is the model's
+/// or 501). The scalar members, functions and arithmetic a `$filter`
 /// residual takes; a navigation is a later round's.
 pub(crate) fn compute(
     items: &[Compute],
@@ -394,7 +393,6 @@ pub(crate) fn compute(
                 out.computed_reads.push(term.to_owned());
             }
         }
-        out.computed_system |= program.reads_system_members();
     }
     Ok(())
 }

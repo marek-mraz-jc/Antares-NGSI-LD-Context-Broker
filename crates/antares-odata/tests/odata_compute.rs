@@ -96,6 +96,17 @@ async fn send(
     (status, body)
 }
 
+/// The `tags` of a Car: `["blue"]`, Car 4's followed by 1100 more, a list a nested lambda
+/// walks past the evaluator's step bound.
+fn tags(n: u32) -> Value {
+    let more = (0..1100).map(|i| format!("t{i}")).filter(|_| n == 4);
+    Value::from(
+        std::iter::once("blue".to_owned())
+            .chain(more)
+            .collect::<Vec<_>>(),
+    )
+}
+
 async fn broker(hiding: bool) -> Result<(TestBroker, Router), String> {
     std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
     let b = TestBroker::new()
@@ -126,7 +137,7 @@ async fn broker(hiding: bool) -> Result<(TestBroker, Router), String> {
             format!("{CITY}since"): {"type": "Property",
                                      "value": {"@type": "DateTime", "@value": since}},
             format!("{CITY}note"): {"type": "Property", "value": "secret"},
-            format!("{CITY}tags"): {"type": "Property", "value": ["blue"]}
+            format!("{CITY}tags"): {"type": "Property", "value": tags(n)}
         });
         for (name, value) in [("label", label), ("owner", owner)] {
             if let (Some(v), Some(members)) = (value, car.as_object_mut()) {
@@ -285,6 +296,17 @@ async fn a_computed_name_filters_orders_and_is_selected() -> Result<(), String> 
     assert!(body["value"][0].get("speed").is_none(), "{body}");
     let context = body["@odata.context"].as_str().unwrap_or_default();
     assert!(context.ends_with("#Car(label,double)"), "{context}");
+    // a selected member the value reads is asked for once
+    let body = read(
+        &app,
+        &format!("{double}&$select=speed,double&$filter=seats eq 1"),
+    )
+    .await?;
+    assert_eq!(
+        (&body["value"][0]["speed"], &body["value"][0]["double"]),
+        (&json!(10.0), &json!(20.0)),
+        "{body}"
+    );
     let body = read(&app, &format!("{double}&$select=label&$filter=seats eq 1")).await?;
     assert!(body["value"][0].get("double").is_none(), "{body}");
     let body = read(&app, &format!("{double}&$select=*&$filter=seats eq 1")).await?;
@@ -368,6 +390,20 @@ async fn compute_is_refused_where_it_does_not_apply() -> Result<(), String> {
         ),
         (
             "Car?$compute=1 as x&$compute=2 as y",
+            StatusCode::BAD_REQUEST,
+        ),
+        // a $select a later round maps, beside $compute, on the set and on one Entity
+        (
+            "Car?$compute=1 as x&$select=@Core.Description",
+            StatusCode::NOT_IMPLEMENTED,
+        ),
+        (
+            "Car('urn:ngsi-ld:Car:1')?$compute=1 as x&$select=@Core.Description",
+            StatusCode::NOT_IMPLEMENTED,
+        ),
+        // past the evaluator's step bound on Car 4's long list: refused, never a guess
+        (
+            "Car?$compute=tags/any(a: tags/any(b: b eq 'zz')) as x",
             StatusCode::BAD_REQUEST,
         ),
     ] {

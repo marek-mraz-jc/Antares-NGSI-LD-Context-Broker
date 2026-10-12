@@ -178,7 +178,8 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
                 seen.push(name);
                 match (name, &computed) {
                     // parsed first
-                    (Name::Compute, Some((end, items))) if options.compute.is_none() => {
+                    // parsed first; a second one is the duplicate refused above
+                    (Name::Compute, Some((end, items))) => {
                         self.c.reset(*end);
                         options.compute = Some(items.clone());
                     }

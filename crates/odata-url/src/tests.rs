@@ -1560,6 +1560,7 @@ fn compute_refuses_what_is_no_compute_item() {
     // no `as`, no name, a name the type has, a name given twice, junk after the item
     syntax("Buildings?$compute=height", at("$compute=height"));
     syntax("Buildings?$compute=height as", at("$compute=height as"));
+    syntax("Buildings?$compute=height is h", at("$compute=height "));
     syntax("Buildings?$compute=height asx", at("$compute=height as"));
     syntax("Buildings?$compute=height as 1x", at("$compute=height as "));
     syntax(

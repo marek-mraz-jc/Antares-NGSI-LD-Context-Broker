@@ -458,7 +458,7 @@ pub(crate) fn query(
     let system = |names: Option<&[&str]>| {
         names.is_some_and(|n| n.iter().any(|m| matches!(*m, "createdAt" | "modifiedAt")))
     };
-    if system(picked) || nested.clone().any(system) || filter.computed_system {
+    if system(picked) || nested.clone().any(system) {
         q.push_str("&options=sysAttrs");
     }
     if joined {
@@ -535,7 +535,7 @@ fn pushdown(
             .map(|keys| keys.split(',').map(str::to_owned).collect())
             .unwrap_or_default(),
         attrs,
-        sys_attrs: system(picked) || filter.sort_system || filter.computed_system,
+        sys_attrs: system(picked) || filter.sort_system,
         context: (!filter.context.is_empty()).then(|| Value::Object(filter.context.clone())),
     }
 }
@@ -984,9 +984,10 @@ fn attach(
                 .map_err(|_| refusal(Refused::TooComplex, version))?;
             values.insert(name.clone(), value.unwrap_or(Value::Null));
         }
-        if let Some(members) = doc.as_object_mut() {
-            members.insert(COMPUTED.to_owned(), Value::Object(values));
-        }
+        // an Entity is a JSON object: the broker answers no other document
+        let _ = doc
+            .as_object_mut()
+            .map(|members| members.insert(COMPUTED.to_owned(), Value::Object(values)));
     }
     Ok(())
 }
