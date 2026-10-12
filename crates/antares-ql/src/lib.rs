@@ -710,6 +710,12 @@ impl<'a> Parser<'a> {
             // the other unquoted alternatives: a URI, a dateTime, a date or a
             // time, all of them compared as text
             "" => Err(bad(raw, "expected value")),
+            // A value that starts with an operator's character is a typo of
+            // the operator (`speed>>`), never the text ">" (T-4084).
+            _ if !regexp && raw.starts_with(['<', '>', '=', '!', '~']) => Err(bad(
+                raw,
+                "an unquoted value starts with no operator character (4.9); quote a text",
+            )),
             _ => Ok(QValue::Str(raw.to_owned())),
         }
     }
@@ -745,6 +751,25 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-4084: an unquoted value that starts with an operator's character is
+    /// a typo of the operator, refused rather than compared as text.
+    #[test]
+    fn an_unquoted_value_starting_with_an_operator_is_refused() {
+        for q in ["speed>>", "speed>=>", "speed==>1", "speed!=<"] {
+            assert!(parse_q(q).is_err(), "{q}");
+        }
+        for q in [
+            "speed>1",
+            "speed>-1",
+            "name==urn:ngsi-ld:Car:1",
+            "observedAt>2026-01-01T00:00:00Z",
+            "name==\">\"",
+            "name~=>.*",
+        ] {
+            assert!(parse_q(q).is_ok(), "{q}");
+        }
+    }
 
     /// RFC 3986 2.1: "%" and exactly two hex digits; anything shorter or
     /// signed stays as written, at the end of the input too (T-3468: the
