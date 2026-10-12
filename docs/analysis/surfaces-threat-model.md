@@ -299,6 +299,7 @@ One mapping, implemented once in `antares-ops` and rendered per surface. A messa
 | malformed input | 400 `BadRequestData` / `InvalidRequest` | 400, `code` `BadRequest`, `target` = the option name | `-32600` (envelope) or `-32602` (arguments) | close 1007 or 1008 | 400 |
 | a limit exceeded | 413 / 414 bare, 400, 403 `TooComplexQuery` / `TooManyResults` (bounds table, section 2.3) | the same status, `code` `LimitExceeded`, `message` names the limit, never the value that was hidden | `isError: true` naming the argument to narrow (MCP section 8) | close 1009 | 403 `TooManyResults` |
 | surface closed (M4) | 404 | 404 | 404 (HTTP) | upgrade 404 | 404 |
+| a remote `@context` the request names cannot be retrieved (`Refusal::ContextNotAvailable`, T-3947) | 504 `LdContextNotAvailable` (TS 104 176 6.3.2, as the root), fixed detail: never the URL or the fetch error | 504, `code` `InternalError` (`read.rs` `refused`) | tool result `isError: true` with status 504 and `title` | error message with status 504 and the same ProblemDetails | 504 `LdContextNotAvailable` |
 | inner failure | 500 `InternalError`, fixed detail and request id | 500, `code` `InternalError` | `-32603`, fixed message | close 1011 | 500 |
 
 The error codes in the OData column are proposals (the matrix: "OData leaves the code service-defined"). Tests: G9, O20, MC18, LK8 and `views_errors.rs::views_errors_carry_no_hidden_name_and_no_inner_detail` (proposed).

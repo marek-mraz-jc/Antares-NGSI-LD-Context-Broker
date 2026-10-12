@@ -205,6 +205,108 @@ paths:
               schema:
                 $ref: '#/components/schemas/ProblemDetails'
 
+  /q/tenants/{tenant}/digest:
+    parameters:
+      - $ref: '#/components/parameters/tenantPath'
+    get:
+      tags: [Tenants]
+      summary: Count and hash of one tenant's Entities
+      operationId: digestTenant
+      description: |
+        The Entity count, the history instance count and a hash over
+        every Entity's (id, `modifiedAt`) that does not depend on the
+        order a backend pages in (ADR-0030 rule 2). Read on both brokers
+        of a move, equal digests prove the copy.
+      security: [{}, {adminToken: []}]
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '200':
+          description: The digest.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tenant, entities, attrInstances, sha256]
+                properties:
+                  tenant: {type: string}
+                  entities: {type: integer, minimum: 0}
+                  attrInstances: {type: integer, minimum: 0}
+                  sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        '400':
+          $ref: '#/components/responses/BadTenant'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /q/tenants/{tenant}/export:
+    parameters:
+      - $ref: '#/components/parameters/tenantPath'
+    get:
+      tags: [Tenants]
+      summary: One tenant's Entities and history as NDJSON
+      operationId: exportTenant
+      description: |
+        A header line `{"antaresExport":1,"tenant":…}`, one line per
+        Entity and per history document as stored (system attributes
+        kept), then a trailer `{"end":true,"records":n}` (ADR-0030 rule
+        3). Not a point-in-time snapshot: hold the writers first.
+      security: [{}, {adminToken: []}]
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '200':
+          description: The export stream.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadTenant'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The tenant holds what v1 does not move (Subscriptions,
+            registrations, Snapshots, distributed subscriptions), named
+            with their counts (ADR-0030 rule 5).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /q/tenants/{tenant}/import:
+    parameters:
+      - $ref: '#/components/parameters/tenantPath'
+    post:
+      tags: [Tenants]
+      summary: Load an export into an empty tenant
+      operationId: importTenant
+      description: |
+        All or nothing into a tenant that holds nothing (ADR-0030 rule
+        4): a bad line, another tenant's header or a missing trailer
+        stops it, and it deletes what it wrote and nothing else. A line
+        is at most 16 MiB.
+      security: [{}, {adminToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema:
+              type: string
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '204':
+          description: Imported.
+        '400':
+          $ref: '#/components/responses/BadTenant'
+        '409':
+          description: The tenant already holds something, named with its counts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
   /q/dead-letters:
     get:
       tags: [Dead letters]

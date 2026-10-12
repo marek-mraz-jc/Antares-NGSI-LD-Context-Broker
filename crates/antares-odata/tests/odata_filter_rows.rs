@@ -377,3 +377,49 @@ async fn a_callers_geoq_moves_the_geo_filter_to_the_residual() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
 }
+
+/// T-4031: an evaluation past `antares_residual::MAX_STEPS` (a nested `any` over a list of
+/// 1100 items) is a filter too heavy to answer, the 400 `TooComplexQuery`, not a bare refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_evaluation_past_the_step_budget_is_too_complex_query() {
+    let (_b, app) = broker().await.unwrap_or_else(|e| panic!("{e}"));
+    let many: Vec<String> = (0..1100).map(|i| format!("t{i}")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let heavy = car(
+        3,
+        "2026-05-03T08:00:00Z",
+        &many,
+        &json!({"en": "grey"}),
+        "Active",
+        [1.0, 1.0],
+    );
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/ngsi-ld/v1/entities",
+        Some(&heavy.to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=tags/any(a:tags/any(b:b%20eq%20'zz'))"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "TooComplexQuery", "{body}");
+
+    // the same data under a filter within the budget answers
+    let (status, body) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=tags/any(a:a%20eq%20't7')"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ids(&body), ["urn:ngsi-ld:Car:3"]);
+}
