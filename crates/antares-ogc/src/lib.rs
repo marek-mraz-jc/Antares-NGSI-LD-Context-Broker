@@ -50,9 +50,9 @@ pub const SCHEMA_LIMITS: linkml_model::Limits = linkml_model::Limits {
     max_elements: 100_000,
 };
 
-/// The conformance classes `/conformance` declares (mapping rows C3, R1 to R5, W1 to W5, S1 to
-/// S3, S5, S7; Parts 4 and 5 are the drafts OGC 20-002r1 and 23-058r1). A view that offers no
-/// write answers each write 405 with the methods it offers (W4).
+/// The conformance classes the surface serves (mapping rows C3, R1 to R5, W1 to W5, S1 to S3,
+/// S5, S7; Parts 4 and 5 are the drafts OGC 20-002r1 and 23-058r1). A view's `/conformance`
+/// declares the Part 4 ones only as far as it offers their writes ([`conformance`]).
 pub const CONFORMANCE: [&str; 14] = [
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
@@ -69,6 +69,43 @@ pub const CONFORMANCE: [&str; 14] = [
     "http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/update",
     "http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/features",
 ];
+
+/// The Part 4 classes and the writes each needs (W1 to W3, W5). `features` names no write of its
+/// own: it is declared with either of the other two.
+const PART_4: [(&str, &[OperationId]); 3] = [
+    (
+        "http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/create-replace-delete",
+        &[
+            OperationId::CreateEntity,
+            OperationId::ReplaceEntity,
+            OperationId::DeleteEntity,
+        ],
+    ),
+    (
+        "http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/update",
+        &[OperationId::MergeEntity],
+    ),
+    (
+        "http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/features",
+        &[],
+    ),
+];
+
+/// C3, W4: the classes a view's `/conformance` declares. A Part 4 class is a promise of every
+/// write it names, so a view declares it only when it `offers` all of them; a read-only view
+/// declares none and answers each write 405.
+fn conformance(offers: &dyn Fn(OperationId) -> bool) -> Vec<&'static str> {
+    let declared = |ops: &[OperationId]| !ops.is_empty() && ops.iter().all(|op| offers(*op));
+    let writes = PART_4.iter().any(|(_, ops)| declared(ops));
+    CONFORMANCE
+        .into_iter()
+        .filter(|class| match PART_4.iter().find(|(c, _)| c == class) {
+            Some((_, [])) => writes,
+            Some((_, ops)) => declared(ops),
+            None => true,
+        })
+        .collect()
+}
 
 const JSON: &str = "application/json";
 const GEOJSON: &str = "application/geo+json";
@@ -207,7 +244,10 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
     };
     match (rest.as_slice(), pairs.is_empty()) {
         ([] | [""], true) => document(JSON, &at.landing()),
-        (["conformance"], true) => document(JSON, &json!({"conformsTo": CONFORMANCE})),
+        (["conformance"], true) => document(
+            JSON,
+            &json!({"conformsTo": conformance(&|op| view.allows(op))}),
+        ),
         (["api"], true) => document(
             OPENAPI,
             &api::document(&base, &collections, &|op| view.allows(op)),
@@ -539,6 +579,41 @@ mod tests {
         assert_eq!(
             Ogc.version_info().pointer("/endpoint"),
             Some(&json!("/x/views/{view}/ogc/features"))
+        );
+    }
+
+    #[test]
+    fn a_part_4_class_is_declared_only_with_every_write_it_names() {
+        let part_4 = |offered: &[OperationId]| -> Vec<&str> {
+            conformance(&|op| offered.contains(&op))
+                .into_iter()
+                .filter(|c| c.contains("ogcapi-features-4"))
+                .filter_map(|c| c.rsplit('/').next())
+                .collect()
+        };
+        let (create, replace, merge, delete) = (
+            OperationId::CreateEntity,
+            OperationId::ReplaceEntity,
+            OperationId::MergeEntity,
+            OperationId::DeleteEntity,
+        );
+        let none: [&str; 0] = [];
+        assert_eq!(part_4(&[OperationId::QueryEntities]), none);
+        assert_eq!(part_4(&[create]), none, "create alone is no class");
+        assert_eq!(part_4(&[create, replace]), none, "nor without delete");
+        assert_eq!(part_4(&[merge]), ["update", "features"]);
+        assert_eq!(
+            part_4(&[create, replace, delete]),
+            ["create-replace-delete", "features"]
+        );
+        assert_eq!(
+            part_4(&[create, replace, merge, delete]),
+            ["create-replace-delete", "update", "features"]
+        );
+        assert_eq!(
+            conformance(&|_| true),
+            CONFORMANCE,
+            "a view offering every write declares every class, in order"
         );
     }
 
