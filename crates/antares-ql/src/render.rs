@@ -200,15 +200,9 @@ mod tests {
     fn a_regexp_operand_keeps_its_own_backslashes() {
         for q in [r#"a~="^\d+$""#, r#"a!~="^[a-z]\.[0-9]{2}$""#] {
             let node = parse_q(q).expect(q);
-            let QNode::Cmp { value, .. } = &node else {
-                panic!("{q}: expected a comparison")
-            };
-            let QValue::Str(pattern) = value else {
-                panic!("{q}: expected a string operand")
-            };
             assert!(
-                pattern.contains('\\'),
-                "{q}: the regex kept its backslash: {pattern:?}"
+                matches!(&node, QNode::Cmp { value: QValue::Str(pattern), .. } if pattern.contains('\\')),
+                "{q}: the regex kept its backslash: {node:?}"
             );
             assert_eq!(parse_q(&node.to_string()).expect("re-parses"), node, "{q}");
         }

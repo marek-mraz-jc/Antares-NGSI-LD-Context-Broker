@@ -3193,3 +3193,263 @@ mod tests {
         assert!(!v18.contains_key("Snapshot"), "v1.8 predates Snapshot");
     }
 }
+
+/// The broker's hooks (write-through, usage bump, hosted lookup) and the
+/// fetch outcomes a loopback server can produce, against one loader.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod hooks {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    async fn serve() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let ttl_hits = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = req.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let (headers, body) = match path.as_str() {
+                    "/a.jsonld" => ("", r#"{"@context":{"a":"https://e.org/a"}}"#.to_owned()),
+                    "/nested.jsonld" => (
+                        "",
+                        r#"{"@context":["rel.jsonld",{"n":"https://e.org/n"}]}"#.to_owned(),
+                    ),
+                    "/rel.jsonld" => ("", r#"{"@context":{"r":"https://e.org/r"}}"#.to_owned()),
+                    "/ttl.jsonld" => {
+                        let i = ttl_hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            "Cache-Control: max-age=0\r\n",
+                            format!(r#"{{"@context":{{"t":"https://e.org/t{i}"}}}}"#),
+                        )
+                    }
+                    _ => ("", String::new()),
+                };
+                let resp = if path == "/big" {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n{}".to_owned()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn hooks_and_fetch_outcomes() {
+        let _ = Loader::default();
+        let base = serve().await;
+        let loader = Loader::with_policy(EgressPolicy {
+            allow_private: true,
+        });
+        let writes = Arc::new(AtomicUsize::new(0));
+        let w = Arc::clone(&writes);
+        loader.set_cache_writer(Arc::new(move |_, _, _| {
+            w.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }));
+        // the shared row of every URL is gone while `gone` is set; with
+        // `only_a` too, only a.jsonld's
+        let gone = Arc::new(AtomicBool::new(false));
+        let only_a = Arc::new(AtomicBool::new(false));
+        let (g, o) = (Arc::clone(&gone), Arc::clone(&only_a));
+        loader.set_usage_bump(Arc::new(move |_, url| {
+            let hit = !o.load(Ordering::SeqCst) || url.ends_with("/a.jsonld");
+            let exists = !(g.load(Ordering::SeqCst) && hit);
+            Box::pin(async move { exists })
+        }));
+        let alpha = TenantId::new("alpha").expect("tenant");
+        let beta = TenantId::new("beta").expect("tenant");
+        let owner = alpha.clone();
+        loader.set_local_lookup(Arc::new(move |_, url| {
+            let hit = url.ends_with("/hosted").then(|| {
+                (
+                    Some(owner.clone()),
+                    serde_json::json!({"h": "https://e.org/h"}),
+                )
+            });
+            Box::pin(async move { hit })
+        }));
+
+        let a = Value::String(format!("{base}/a.jsonld"));
+        let ctx = loader.resolve(&a).await.expect("fetch");
+        assert_eq!(ctx.expand_key("a"), "https://e.org/a");
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "a fresh fetch is written through"
+        );
+        loader.resolve(&a).await.expect("merged hit");
+        // the shared row was deleted elsewhere: the warm copy is not served,
+        // the rebuild fetches it, and the counted use, still finding no row,
+        // fetches and writes it once more
+        gone.store(true, Ordering::SeqCst);
+        loader.resolve(&a).await.expect("rebuilt");
+        assert_eq!(writes.load(Ordering::SeqCst), 3);
+        // one of two documents gone: the other one is counted once
+        let both = serde_json::json!([a.clone(), format!("{base}/rel.jsonld")]);
+        gone.store(false, Ordering::SeqCst);
+        loader.resolve(&both).await.expect("both");
+        gone.store(true, Ordering::SeqCst);
+        only_a.store(true, Ordering::SeqCst);
+        loader.resolve(&both).await.expect("both rebuilt");
+        gone.store(false, Ordering::SeqCst);
+        loader.resolve_quiet(&a).await.expect("quiet");
+        loader
+            .resolve_quiet_for(&alpha, &a)
+            .await
+            .expect("quiet for");
+
+        let ctx = loader
+            .resolve(&Value::String(format!("{base}/nested.jsonld")))
+            .await
+            .expect("nested");
+        assert_eq!(
+            ctx.expand_key("r"),
+            "https://e.org/r",
+            "a relative reference joins its base"
+        );
+        assert_eq!(ctx.expand_key("n"), "https://e.org/n");
+
+        let err = loader
+            .resolve(&Value::String(format!("{base}/big")))
+            .await
+            .expect_err("too large");
+        assert!(
+            matches!(err, NgsiError::LdContextNotAvailable(_)),
+            "{err:?}"
+        );
+
+        let ttl = Value::String(format!("{base}/ttl.jsonld"));
+        assert_eq!(
+            loader.resolve(&ttl).await.expect("ttl").expand_key("t"),
+            "https://e.org/t0"
+        );
+        assert_eq!(
+            loader
+                .resolve(&ttl)
+                .await
+                .expect("ttl again")
+                .expand_key("t"),
+            "https://e.org/t1",
+            "a stale document is fetched again and the new copy wins"
+        );
+
+        let hosted = Value::String(format!("{base}/hosted"));
+        let err = loader
+            .resolve_for(&beta, &hosted)
+            .await
+            .expect_err("foreign");
+        assert!(
+            matches!(err, NgsiError::LdContextNotAvailable(_)),
+            "{err:?}"
+        );
+        let ctx = loader.resolve_for(&alpha, &hosted).await.expect("own");
+        assert_eq!(ctx.expand_key("h"), "https://e.org/h");
+        let err = loader
+            .resolve(&hosted)
+            .await
+            .expect_err("no Tenant, an owned copy");
+        assert!(
+            matches!(err, NgsiError::LdContextNotAvailable(_)),
+            "{err:?}"
+        );
+
+        // a reload of a URL with no copy yet: nothing to keep
+        let err = loader
+            .refetch(&format!("{base}/missing"))
+            .await
+            .expect_err("empty body");
+        assert!(
+            matches!(err, NgsiError::LdContextNotAvailable(_)),
+            "{err:?}"
+        );
+        // the egress policy is asked before any connection
+        let strict = Loader::with_policy(EgressPolicy {
+            allow_private: false,
+        });
+        let err = strict.resolve(&a).await.expect_err("loopback denied");
+        assert!(
+            matches!(err, NgsiError::LdContextNotAvailable(_)),
+            "{err:?}"
+        );
+
+        let err = loader
+            .resolve(&serde_json::json!("rel.jsonld"))
+            .await
+            .expect_err("relative");
+        assert!(
+            matches!(err, NgsiError::LdContextNotAvailable(_)),
+            "{err:?}"
+        );
+        let err = loader
+            .resolve(&serde_json::json!(5))
+            .await
+            .expect_err("number");
+        assert!(matches!(err, NgsiError::BadRequestData(_)), "{err:?}");
+        loader
+            .resolve(&Value::Null)
+            .await
+            .expect("null is the core context");
+
+        loader
+            .seed_cached(
+                "http://s.example/c",
+                "lid-1",
+                "2020-01-01T00:00:00Z",
+                serde_json::json!({"s": "https://e.org/s"}),
+            )
+            .await;
+        assert_eq!(
+            loader.usage_get("lid-1").await.map(|u| u.url),
+            Some("http://s.example/c".into())
+        );
+        assert!(loader.usage_get("http://s.example/c").await.is_some());
+        loader.usage_remove("http://s.example/c").await;
+        assert!(loader.usage_get("lid-1").await.is_none());
+
+        assert_eq!(ttl_from_headers(Some("max-age=soon"), None), None);
+        assert_eq!(
+            ttl_from_headers(Some("no-cache"), None),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn private_and_embedded_addresses() {
+        let private = |s: &str| EgressPolicy::ip_is_private(s.parse().expect("ip"));
+        for ip in [
+            "169.254.1.1",
+            "::1",
+            "::",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::a00:1",
+        ] {
+            assert!(private(ip), "{ip}");
+        }
+        assert!(private("198.19.0.1"));
+        for ip in [
+            "8.8.8.8",
+            "192.1.0.1",
+            "192.0.1.1",
+            "198.20.0.1",
+            "2001:db8::1",
+            "::ffff:8.8.8.8",
+            "64:ff9b:1::a00:1",
+            "64:1::1",
+        ] {
+            assert!(!private(ip), "{ip}");
+        }
+    }
+}

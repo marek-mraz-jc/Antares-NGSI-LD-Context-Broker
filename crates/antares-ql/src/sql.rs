@@ -633,4 +633,25 @@ mod tests {
         let got = c(r#"a=="x\u0001 y""#).expect("compiles");
         assert!(got.binds[0].contains(r#""x\u0001 y""#), "{}", got.binds[0]);
     }
+
+    /// The edges of the subset (T-3912): a bare existence term, `<` and `<=`, a boolean, a
+    /// tab and a carriage return in a string, and the composite values `literal` never renders.
+    #[test]
+    fn existence_ordering_booleans_and_control_characters() {
+        let bound = |q: &str| c(q).map(|got| got.binds[0].clone()).expect(q);
+        assert!(
+            bound("temperature").ends_with(r#"."value""#),
+            "{}",
+            bound("temperature")
+        );
+        assert!(bound("temperature<20").ends_with("? (@ < 20)"));
+        assert!(bound("temperature<=20").ends_with("? (@ <= 20)"));
+        assert!(bound("open==true").ends_with("? (@ == true)"));
+        assert!(
+            bound(r#"a=="x\ty\rz""#).contains(r#""x\ty\rz""#),
+            "{}",
+            bound(r#"a=="x\ty\rz""#)
+        );
+        assert_eq!(literal(&QValue::List(vec![QValue::Num(1.0)])), None);
+    }
 }
