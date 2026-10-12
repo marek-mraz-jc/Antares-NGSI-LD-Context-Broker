@@ -67,10 +67,16 @@ pub fn slow_factor() -> u64 {
 /// turns the deny on for internet-exposed deployments.
 /// The DNS-pinning resolver and redirect cap that enforce it on the wire
 /// are `PolicyResolver` / `client_builder` below.
+/// `ANTARES_EGRESS_PRIVATE_HOSTS` names the in-cluster peers a deployment
+/// that denies private egress still reaches (T-3908).
 #[derive(Clone, Copy, Debug)]
 pub struct EgressPolicy {
     /// Whether fetches to private/loopback/link-local ranges are allowed.
     pub allow_private: bool,
+    /// Host names (lower case, no trailing dot) that may resolve to a
+    /// private address although `allow_private` is false. Never loopback,
+    /// `0.0.0.0/8` or instance metadata, and never an address literal.
+    pub private_hosts: &'static [String],
 }
 
 /// Programmatic stand-in for `ANTARES_EGRESS_ALLOW_PRIVATE` — wasm32 has
@@ -94,12 +100,78 @@ impl EgressPolicy {
     /// (the notifier's retry policy is another): each reads its own keys for
     /// its own type, so the shared name is the convention, not a copy.
     pub fn from_env() -> Self {
+        // read once per process: the list is a deployment's, not a request's
+        static HOSTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
         Self {
             allow_private: Self::allow_private_from(
                 std::env::var("ANTARES_EGRESS_ALLOW_PRIVATE")
                     .ok()
                     .as_deref(),
             ) || ALLOW_PRIVATE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed),
+            private_hosts: HOSTS.get_or_init(|| {
+                Self::private_hosts_from(
+                    std::env::var("ANTARES_EGRESS_PRIVATE_HOSTS")
+                        .ok()
+                        .as_deref(),
+                )
+            }),
+        }
+    }
+
+    /// `ANTARES_EGRESS_PRIVATE_HOSTS`: comma-separated host names, compared
+    /// case-insensitively and without a trailing dot; empty members and
+    /// spaces are dropped. An address literal is no name and is dropped too:
+    /// an address is judged by its range alone.
+    pub fn private_hosts_from(v: Option<&str>) -> Vec<String> {
+        v.unwrap_or_default()
+            .split(',')
+            .map(Self::host_key)
+            .filter(|h| {
+                !h.is_empty()
+                    && h.trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_err()
+            })
+            .collect()
+    }
+
+    /// A host name as the list holds it: trimmed, lower case, no trailing dot.
+    fn host_key(host: &str) -> String {
+        host.trim().trim_end_matches('.').to_ascii_lowercase()
+    }
+
+    /// Whether egress may dial `ip`, which `host` resolved to. Instance
+    /// metadata never; a private address only with `allow_private`, or for a
+    /// host the operator listed in `private_hosts`, and then never the local
+    /// host itself (loopback, `0.0.0.0/8`): the broker's own ports are no
+    /// peer, whatever name points there.
+    pub fn admits(&self, host: &str, ip: std::net::IpAddr) -> bool {
+        if Self::ip_is_metadata(ip) {
+            return false;
+        }
+        if self.allow_private || !Self::ip_is_private(ip) {
+            return true;
+        }
+        let key = Self::host_key(host);
+        key.trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_err()
+            && self.private_hosts.contains(&key)
+            && !Self::ip_is_local_host(ip)
+    }
+
+    /// The addresses that reach the host itself: IPv4 loopback and
+    /// `0.0.0.0/8` (which a Linux stack routes to the local host), IPv6
+    /// loopback and unspecified, in every IPv6 spelling of the IPv4 ones.
+    pub fn ip_is_local_host(ip: std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.octets()[0] == 0,
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || Self::embedded_v4(v6)
+                        .is_some_and(|v4| Self::ip_is_local_host(std::net::IpAddr::V4(v4)))
+            }
         }
     }
 
@@ -257,7 +329,7 @@ impl EgressPolicy {
                 .map_err(|_| format!("resolving {host}: timed out"))?
                 .map_err(|e| format!("resolving {host}: {e}"))?;
             for a in addrs {
-                if Self::ip_is_private(a.ip()) {
+                if !self.admits(host, a.ip()) {
                     // The denial reaches the client verbatim in the RFC 7807
                     // `detail`; naming the resolved address would turn the
                     // request parameter into an internal-DNS oracle.
@@ -333,14 +405,12 @@ pub struct PolicyResolver(EgressPolicy);
 #[cfg(not(target_arch = "wasm32"))]
 impl reqwest::dns::Resolve for PolicyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let allow_private = self.0.allow_private;
+        let policy = self.0;
         Box::pin(async move {
             let host = name.as_str().to_owned();
             let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
-            let kept: Vec<std::net::SocketAddr> = addrs
-                .filter(|a| !EgressPolicy::ip_is_metadata(a.ip()))
-                .filter(|a| allow_private || !EgressPolicy::ip_is_private(a.ip()))
-                .collect();
+            let kept: Vec<std::net::SocketAddr> =
+                addrs.filter(|a| policy.admits(&host, a.ip())).collect();
             if kept.is_empty() {
                 return Err(format!("egress to {host} denied (private range)").into());
             }
@@ -1507,16 +1577,98 @@ mod tests {
         use std::str::FromStr;
         let deny = PolicyResolver(EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         });
         let name = reqwest::dns::Name::from_str("localhost").expect("name");
         assert!(deny.resolve(name).await.is_err());
 
         let allow = PolicyResolver(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let name = reqwest::dns::Name::from_str("localhost").expect("name");
         let addrs = allow.resolve(name).await.expect("allowed");
         assert!(addrs.count() > 0);
+    }
+
+    /// T-3908: a host the operator lists reaches a private address with
+    /// private egress denied, an unlisted one does not, and no listing opens
+    /// the local host or instance metadata. An address literal is no name.
+    #[test]
+    fn listed_hosts_reach_private_peers_and_nothing_else() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().expect("ip");
+        let hosts: &'static [String] = vec![
+            "gateway.jc.svc.cluster.local".to_owned(),
+            "peer".to_owned(),
+            "localhost".to_owned(),
+            "10.0.0.5".to_owned(),
+        ]
+        .leak();
+        let p = EgressPolicy {
+            allow_private: false,
+            private_hosts: hosts,
+        };
+        assert!(p.admits("gateway.jc.svc.cluster.local", ip("10.43.0.12")));
+        assert!(p.admits("Gateway.JC.svc.cluster.local.", ip("10.43.0.12")));
+        assert!(p.admits("peer", ip("fd00::12")));
+        assert!(
+            p.admits("unlisted", ip("93.184.216.34")),
+            "public stays open"
+        );
+        assert!(!p.admits("unlisted", ip("10.43.0.12")));
+        assert!(!p.admits("gateway.jc.svc.cluster.local.evil", ip("10.43.0.12")));
+        for local in [
+            "127.0.0.1",
+            "127.9.9.9",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!p.admits("peer", ip(local)), "{local}");
+            assert!(!p.admits("localhost", ip(local)), "{local}");
+        }
+        for metadata in ["169.254.169.254", "100.100.100.200", "fd00:ec2::254"] {
+            assert!(!p.admits("peer", ip(metadata)), "{metadata}");
+        }
+        // a literal is judged by its range, even when the list carries it
+        assert!(!p.admits("10.0.0.5", ip("10.0.0.5")));
+        assert!(!p.admits("[fd00::12]", ip("fd00::12")));
+        // unset is today's behaviour
+        let open = EgressPolicy {
+            allow_private: true,
+            private_hosts: &[],
+        };
+        assert!(open.admits("anything", ip("10.43.0.12")));
+        assert!(!open.admits("anything", ip("169.254.169.254")));
+    }
+
+    #[test]
+    fn the_private_hosts_list_parses_names_only() {
+        assert_eq!(
+            EgressPolicy::private_hosts_from(Some(
+                " Gateway.jc.svc.cluster.local. , ,peer,,10.0.0.1,[::1], ::1 "
+            )),
+            vec!["gateway.jc.svc.cluster.local".to_owned(), "peer".to_owned()]
+        );
+        assert!(EgressPolicy::private_hosts_from(None).is_empty());
+        assert!(EgressPolicy::private_hosts_from(Some(" , ")).is_empty());
+    }
+
+    /// A listed name still dials nothing on the local host: the resolver and
+    /// the pre-flight check both refuse `localhost` listed.
+    #[tokio::test]
+    async fn a_listed_name_never_opens_the_local_host() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+        let hosts: &'static [String] = vec!["localhost".to_owned()].leak();
+        let p = EgressPolicy {
+            allow_private: false,
+            private_hosts: hosts,
+        };
+        let name = reqwest::dns::Name::from_str("localhost").expect("name");
+        assert!(PolicyResolver(p).resolve(name).await.is_err());
+        assert!(p.check_host("localhost", 80).await.is_err());
     }
 
     /// 5.5.6: "When a remote JSON-LD @context referenced by an incoming
@@ -1546,6 +1698,7 @@ mod tests {
         };
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         // unreachable → LdContextNotAvailable
         let err = loader
@@ -1588,6 +1741,7 @@ mod tests {
         assert!(
             client_builder(EgressPolicy {
                 allow_private: true,
+                private_hosts: &[],
             })
             .build()
             .is_ok(),
@@ -1623,6 +1777,7 @@ mod tests {
 
         let client = client_builder(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         })
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -1667,6 +1822,7 @@ mod tests {
         });
         let client = client_builder(EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         })
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -1731,6 +1887,7 @@ mod tests {
 
         let client = client_builder(EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         })
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -1820,6 +1977,7 @@ mod tests {
     async fn egress_policy_denies_private_ranges() {
         let deny = EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         };
         for host in [
             "127.0.0.1",
@@ -1851,6 +2009,7 @@ mod tests {
         );
         let allow = EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         };
         assert!(allow.check_host("127.0.0.1", 80).await.is_ok());
         // ...but the instance-metadata range is refused even then: allowing
@@ -1903,6 +2062,7 @@ mod tests {
         let url = format!("http://{addr}/ctx.jsonld");
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let ctx = loader
             .resolve(&Value::String(url.clone()))
@@ -1995,6 +2155,7 @@ mod tests {
         });
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let err = loader
             .resolve(&Value::String(format!("http://{addr}/big.jsonld")))
@@ -2044,6 +2205,7 @@ mod tests {
         });
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         loader
             .resolve(&Value::String(format!("http://{addr}/c.jsonld")))
@@ -2094,6 +2256,7 @@ mod tests {
         });
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         loader
             .resolve(&Value::String(format!("http://{addr}/c.jsonld")))
@@ -2127,6 +2290,7 @@ mod tests {
         });
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let e = loader
             .resolve(&Value::String(format!("http://{addr}/c.jsonld")))
@@ -2182,6 +2346,7 @@ mod tests {
         });
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let err = loader
             .resolve(&Value::String(format!("http://{addr}/root.jsonld")))
@@ -2201,6 +2366,7 @@ mod tests {
     async fn usage_registry_is_bounded() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         for i in 0..4100 {
             let _ = loader
@@ -2227,6 +2393,7 @@ mod tests {
     async fn unanswered_dns_lookup_denies_instead_of_hanging() {
         let deny = EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         };
         let started = std::time::Instant::now();
         let err = deny
@@ -2250,6 +2417,7 @@ mod tests {
     async fn fetch_cache_holds_a_byte_budget() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let mib = 1024 * 1024;
         let doc = Value::String("x".repeat(mib));
@@ -2296,6 +2464,7 @@ mod tests {
         });
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let url = Value::String(format!("http://{addr}/ctx.jsonld"));
         let ctx = loader.resolve(&url).await.expect("first resolve");
@@ -2318,6 +2487,7 @@ mod tests {
     async fn merged_cache_refuses_oversized_keys() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let mut big = serde_json::Map::new();
         for i in 0..2000 {
@@ -2353,6 +2523,7 @@ mod tests {
     async fn metadata_endpoint_is_denied_in_every_spelling() {
         let allow = EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         };
         for host in [
             "169.254.169.254",
@@ -2378,6 +2549,7 @@ mod tests {
     async fn metadata_deny_covers_the_cgnat_and_nat64_spellings() {
         let allow = EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         };
         for host in [
             "100.100.100.200",
@@ -2456,6 +2628,7 @@ mod tests {
     async fn metadata_and_private_denies_cover_the_6to4_spelling() {
         let allow = EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         };
         for host in [
             // 2002:169.254.169.254::
@@ -2472,6 +2645,7 @@ mod tests {
         }
         let deny = EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         };
         for host in [
             // 2002:127.0.0.1::
@@ -2504,6 +2678,7 @@ mod tests {
     async fn private_deny_covers_the_ranges_internal_services_sit_on() {
         let deny = EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         };
         for host in [
             "100.64.0.1",
@@ -2538,6 +2713,7 @@ mod tests {
     async fn private_range_denial_does_not_name_the_resolved_address() {
         let deny = EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         };
         // A NAME that resolves privately takes the resolver path — the one
         // that used to embed the answer. Where the name does not resolve the
@@ -2567,6 +2743,7 @@ mod tests {
     async fn client_side_context_caps_are_bad_request_not_gateway_errors() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let mut nested = serde_json::json!(["x"]);
         for _ in 0..12 {
@@ -2654,6 +2831,7 @@ mod tests {
     async fn clause_5_13_1_hosted_context_is_private_to_its_tenant() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let alpha = TenantId::new("alpha").expect("tenant");
         let beta = TenantId::new("beta").expect("tenant");
@@ -2710,6 +2888,7 @@ mod tests {
     async fn an_evicted_source_document_does_not_open_a_merged_hit_to_another_tenant() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let alpha = TenantId::new("alpha").expect("tenant");
         let beta = TenantId::new("beta").expect("tenant");
@@ -2753,6 +2932,7 @@ mod tests {
     async fn hosted_context_write_keeps_unrelated_merged_contexts() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let alpha = TenantId::new("alpha").expect("tenant");
         let beta = TenantId::new("beta").expect("tenant");

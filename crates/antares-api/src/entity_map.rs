@@ -92,7 +92,7 @@ pub(crate) async fn sweep_expired_maps(st: &AppState, tenant: &TenantId) -> usiz
     {
         return 0;
     }
-    let mut n = 0;
+    let mut n: usize = 0;
     for id in dead {
         if st
             .store
@@ -100,7 +100,7 @@ pub(crate) async fn sweep_expired_maps(st: &AppState, tenant: &TenantId) -> usiz
             .await
             .unwrap_or(false)
         {
-            n += 1;
+            n = n.saturating_add(1);
         }
     }
     n
@@ -169,14 +169,22 @@ pub(crate) async fn map_put(
     // duration" — the 5.14.2.4 update path carries a client-chosen instant, so
     // the ceiling binds here, at the one point every writer goes through. An
     // absent or unreadable expiry is left alone: 5.5.14 keeps it unusable.
-    let ceiling = chrono::Utc::now() + chrono::Duration::seconds(MAX_LIFETIME_SECS);
+    let now = chrono::Utc::now();
+    let ceiling = now
+        .checked_add_signed(chrono::Duration::seconds(MAX_LIFETIME_SECS))
+        .unwrap_or(now);
     if doc
         .get("expiresAt")
         .and_then(Value::as_str)
         .and_then(dt)
         .is_some_and(|e| e > ceiling)
     {
-        doc["expiresAt"] = json!(ceiling.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        if let Some(o) = doc.as_object_mut() {
+            o.insert(
+                "expiresAt".into(),
+                json!(ceiling.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            );
+        }
     }
     // The ceiling decides whether a NEW map fits; rewriting a map that is
     // already stored replaces a row that is already counted, so the paging
@@ -270,7 +278,11 @@ pub(crate) fn expires_at(params: &HashMap<String, String>) -> Result<String, Ngs
             .clamp(1, MAX_LIFETIME_SECS),
         None => DEFAULT_LIFETIME_SECS,
     };
-    Ok((chrono::Utc::now() + chrono::Duration::seconds(secs))
+    // `secs` is clamped to MAX_LIFETIME_SECS above, far inside chrono's range.
+    let now = chrono::Utc::now();
+    Ok(now
+        .checked_add_signed(chrono::Duration::seconds(secs))
+        .unwrap_or(now)
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
