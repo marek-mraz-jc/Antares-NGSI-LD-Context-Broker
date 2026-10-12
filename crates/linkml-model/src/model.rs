@@ -400,6 +400,25 @@ impl Model {
     pub fn class_slots(&self, class: &str) -> Vec<(&str, Slot)> {
         class_slots(&self.schema, class)
     }
+
+    /// Every class IRI with the IRIs of every slot it has, inherited ones
+    /// included: what a view of `*` shows (ADR-0023 rule 12), in the shape
+    /// a surface intersects a view's narrowing with.
+    #[must_use]
+    pub fn slot_iris_by_class(&self) -> BTreeMap<String, std::collections::BTreeSet<String>> {
+        self.schema
+            .classes
+            .keys()
+            .map(|class| {
+                let slots = self
+                    .class_slots(class)
+                    .iter()
+                    .map(|(slot, _)| self.slot_iri(slot))
+                    .collect();
+                (self.class_iri(class), slots)
+            })
+            .collect()
+    }
 }
 
 /// The class and its ancestors, root first; stops at a missing parent and

@@ -26,6 +26,7 @@ mod filter;
 mod names;
 mod paths;
 mod read;
+mod route;
 mod write;
 
 use antares_ops::{Caller, OperationId, Ops, Surface, ViewOps};
@@ -156,7 +157,7 @@ async fn respond(ops: &Ops, mut req: Request) -> Response {
                       request: ODataRequest,
                       headers: HeaderMap,
                       body: Bytes| async move {
-                    read::serve(&reads, &method, &caller, &request, &headers, &body).await
+                    route::serve(&reads, &method, &caller, &request, &headers, &body).await
                 },
             )
             .with_state(state.clone()),
@@ -280,7 +281,7 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
     }
     let schema = parsed(revision, &bytes)?;
     // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
-    let every = view.shows_every_name().then(|| edm::every(&schema));
+    let every = view.shows_every_name().then(|| schema.slot_iris_by_class());
     let edm = edm::build(
         id,
         &schema,

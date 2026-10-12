@@ -10,11 +10,10 @@
 
 use crate::edm::{base_member, Edm, Set, Shape};
 use crate::filter::{order, translate, Refused, Translated};
-use crate::paths;
 use antares_ops::{core_name, Caller, OperationId, OpsRequest, Refusal, ViewOps};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use odata_axum::{json_level, json_response, ODataErrorResponse, ODataRequest, ODataState};
+use odata_axum::{json_response, ODataErrorResponse, ODataState};
 use odata_json::{
     write_collection, write_entity, write_entity_references, Ctx, EntityValue, ODataVersion, Page,
     Resource,
@@ -39,78 +38,13 @@ pub(crate) struct Reads {
     pub(crate) state: Arc<ODataState>,
 }
 
-/// One request below the service root that is not the service or metadata
-/// document.
-pub(crate) async fn serve(
-    reads: &Reads,
-    method: &Method,
-    caller: &Caller,
-    request: &ODataRequest,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Response {
-    let version = request.version;
-    if method != Method::GET {
-        return crate::write::serve(reads, method, caller, request, headers, body).await;
-    }
-    let level = match json_level(request, headers, reads.state.max_header_len) {
-        Ok(level) => level,
-        Err(refused) => return refused.into_response(),
-    };
-    let ctx = Ctx {
-        service_root: &reads.state.service_root,
-        level,
-        version,
-        metadata_etag: reads.state.metadata_etag.as_deref(),
-    };
-    if let ODataUri::Entity { options } = &request.uri {
-        return dereference(reads, caller, &ctx, options)
-            .await
-            .unwrap_or_else(IntoResponse::into_response);
-    }
-    let (ODataUri::Resource { path, options }, None) = (&request.uri, later(&request.uri)) else {
-        return not_implemented(version).into_response();
-    };
-    let answer = match path.as_slice() {
-        [_, Segment::Ref] | [_, _, Segment::Ref] if shaped(options) => Err(no_properties(version)),
-        [Segment::EntitySet(set)] | [Segment::EntitySet(set), Segment::Ref] => {
-            collection(reads, caller, &ctx, set, path, options, headers).await
-        }
-        [Segment::EntitySet(set), Segment::Count] => {
-            count(reads, caller, set, options, version).await
-        }
-        [Segment::EntitySet(set), Segment::Key(key)] => {
-            entity(reads, caller, &ctx, set, key, options).await
-        }
-        [Segment::EntitySet(set), Segment::Key(key), Segment::Ref] if only_select(options) => {
-            paths::reference(reads, caller, &ctx, (set, key), options).await
-        }
-        // Below one Entity only `$select` applies (Q31 to Q33).
-        [_, _, ..] if !only_select(options) => Err(not_implemented(version)),
-        [Segment::EntitySet(set), Segment::Key(key), Segment::Property(name)] => {
-            paths::property(reads, caller, &ctx, (set, key, name), false, options).await
-        }
-        [Segment::EntitySet(set), Segment::Key(key), Segment::Property(name), Segment::Value] => {
-            paths::property(reads, caller, &ctx, (set, key, name), true, options).await
-        }
-        [Segment::EntitySet(set), Segment::Key(key), Segment::Navigation(nav)] => {
-            paths::related(reads, caller, &ctx, (set, key, nav), false, options).await
-        }
-        [Segment::EntitySet(set), Segment::Key(key), Segment::Navigation(nav), Segment::Ref] => {
-            paths::related(reads, caller, &ctx, (set, key, nav), true, options).await
-        }
-        _ => Err(not_implemented(version)),
-    };
-    answer.unwrap_or_else(IntoResponse::into_response)
-}
-
 /// `$entity?$id=` (Q23): the id, percent-decoded, is a URL of this service,
 /// absolute under its root or relative to it, that names one Entity by key
 /// and nothing else; it is read as that URL is. A missing `$id`, a broken
 /// escape or an id with query options of its own is `400`; any other id
 /// names no Entity here and is `404`, like a hidden one (O5). A foreign URL
 /// is never fetched.
-async fn dereference(
+pub(crate) async fn dereference(
     reads: &Reads,
     caller: &Caller,
     ctx: &Ctx<'_>,
@@ -151,32 +85,15 @@ async fn dereference(
     }
 }
 
-/// `text` with each `%XX` decoded; `None` for a broken escape or bytes that
-/// are no UTF-8.
-fn percent_decoded(text: &str) -> Option<String> {
-    let mut out = Vec::with_capacity(text.len());
-    let mut bytes = text.bytes();
-    while let Some(b) = bytes.next() {
-        out.push(if b == b'%' {
-            let hex = [bytes.next()?, bytes.next()?];
-            if !hex.iter().all(u8::is_ascii_hexdigit) {
-                return None;
-            }
-            u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?
-        } else {
-            b
-        });
-    }
-    String::from_utf8(out).ok()
-}
+use antares_ops::percent::decoded as percent_decoded;
 
 /// Whether `$select` or `$expand` asks for properties.
-fn shaped(options: &QueryOptions) -> bool {
+pub(crate) fn shaped(options: &QueryOptions) -> bool {
     options.select.is_some() || options.expand.is_some()
 }
 
 /// A reference has no properties to select or expand (URL 4.4).
-fn no_properties(version: ODataVersion) -> ODataErrorResponse {
+pub(crate) fn no_properties(version: ODataVersion) -> ODataErrorResponse {
     ODataErrorResponse::new(
         StatusCode::BAD_REQUEST,
         "BadRequest",
@@ -187,7 +104,7 @@ fn no_properties(version: ODataVersion) -> ODataErrorResponse {
 
 /// Whether no option but `$select` (and `$format`, `$schemaversion=*`,
 /// read before) is asked.
-fn only_select(options: &QueryOptions) -> bool {
+pub(crate) fn only_select(options: &QueryOptions) -> bool {
     options.filter.is_none()
         && options.expand.is_none()
         && options.orderby.is_none()
@@ -199,7 +116,7 @@ fn only_select(options: &QueryOptions) -> bool {
 
 /// Why a parsed URL is answered `501` in this round: a form or an option a
 /// later round maps. `None` for what this round serves.
-fn later(uri: &ODataUri) -> Option<&'static str> {
+pub(crate) fn later(uri: &ODataUri) -> Option<&'static str> {
     let ODataUri::Resource { options, .. } = uri else {
         return Some("this resource is not served");
     };
@@ -427,7 +344,7 @@ pub(crate) fn query(
     q
 }
 
-async fn collection(
+pub(crate) async fn collection(
     reads: &Reads,
     caller: &Caller,
     ctx: &Ctx<'_>,
@@ -530,7 +447,7 @@ async fn collection(
     Ok(json_response(version, ctx.level, body))
 }
 
-async fn count(
+pub(crate) async fn count(
     reads: &Reads,
     caller: &Caller,
     set_name: &str,
@@ -1102,19 +1019,7 @@ fn max_page(headers: &HeaderMap, max_len: usize) -> u64 {
         .unwrap_or(DEFAULT_PAGE)
 }
 
-/// Percent-encodes everything but RFC 3986 unreserved characters.
-pub(crate) fn encode(raw: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(raw.len());
-    for b in raw.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            out.push(char::from(b));
-        } else {
-            let _ = write!(out, "%{b:02X}");
-        }
-    }
-    out
-}
+pub(crate) use antares_ops::percent::encode;
 
 /// A refused or failed operation as an OData error with the same status.
 /// The text is fixed: no detail of the broker's reaches the caller.

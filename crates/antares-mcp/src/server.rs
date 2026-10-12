@@ -448,24 +448,7 @@ fn failed(answer: &Answer) -> CallToolResult {
     result
 }
 
-/// `s` with each `%XX` decoded once; `None` when an escape is broken or
-/// the bytes are no UTF-8.
-fn percent_decoded(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0usize;
-    while let Some(&b) = bytes.get(i) {
-        if b == b'%' {
-            let hex = s.get(i.saturating_add(1)..i.saturating_add(3))?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
-            i = i.saturating_add(3);
-        } else {
-            out.push(b);
-            i = i.saturating_add(1);
-        }
-    }
-    String::from_utf8(out).ok()
-}
+use antares_ops::percent::decoded as percent_decoded;
 
 impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {

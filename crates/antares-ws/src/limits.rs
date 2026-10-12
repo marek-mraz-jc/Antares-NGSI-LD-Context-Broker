@@ -5,6 +5,11 @@
 use serde_json::{json, Value};
 use std::time::Duration;
 
+/// The largest notification one connection is sent: the writer's buffer is
+/// bounded by it (threat F8), and a notification above it is a failed
+/// delivery the Subscription records, never a partial write.
+pub const MAX_NOTIFICATION_BYTES: usize = 1024 * 1024;
+
 /// The variable of the bound of the same name (the broker knows it as a config key).
 pub const QUEUE_ENV: &str = "ANTARES_WS_QUEUE";
 /// The variable of the bound of the same name (the broker knows it as a config key).
@@ -144,7 +149,7 @@ impl Limits {
             "pongSecs": self.pong_within.as_secs(),
             "maxMessageBytes": crate::envelope::MAX_MESSAGE_BYTES,
             "maxFrameBytes": crate::envelope::MAX_FRAME_BYTES,
-            "maxNotificationBytes": crate::hub::MAX_NOTIFICATION_BYTES,
+            "maxNotificationBytes": MAX_NOTIFICATION_BYTES,
             "maxJsonDepth": antares_ops::bounds::MAX_JSON_DEPTH,
         })
     }

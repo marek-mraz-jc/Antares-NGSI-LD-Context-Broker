@@ -38,6 +38,7 @@
 mod error;
 pub mod mapping;
 mod operation;
+pub mod percent;
 pub mod views;
 
 pub use error::{Refusal, INNER_DETAIL};
