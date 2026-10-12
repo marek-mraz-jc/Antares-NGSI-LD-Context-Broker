@@ -240,6 +240,16 @@ def check_view_diff():
         assert view_diff.diff(view, e1, offered, binds) == 1, "an offered operation owes nothing"
         gone = run("gone", [(b, "PASS"), (c, "PASS"), (d, "FAIL")])
         assert view_diff.diff(view, e1, gone, binds) == 1, "a TP that did not run must fail"
+        json.dump({"id": "v", "operations": ["create_subscription", "retrieve_subscription"]}, open(view, "w"))
+        sub = f"{root}/subscriptions/urn:ngsi-ld:Subscription:1"
+        rootsub = run("rootsub", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
+                      [(a, "GET", sub, [])])
+        assert view_diff.diff(view, e1, rootsub, binds) == 0, "a fixture's Subscription is not the view's (rule 9)"
+        ownsub = run("ownsub", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
+                     [(a, "POST", f"{root}/subscriptions", []), (a, "GET", sub, [])])
+        assert view_diff.diff(view, e1, ownsub, binds) == 1, "a Subscription made through the view owes nothing"
+        json.dump({"v": {a: "T-0000"}}, open(known, "w"))
+        assert view_diff.diff(view, e1, rootsub, binds) == 1, "a known TP that is owed now must fail"
         assert view_diff.diff(view, e1, f"{tmp}/nowhere", binds) == 1, "an empty run must fail"
 
         # T-3787: a view that hides types and Attributes owes the refusal of a read that names one,
