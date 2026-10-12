@@ -90,6 +90,34 @@ fn prune_expired_instances(doc: &mut Value, now: &str) -> bool {
     changed
 }
 
+/// Whether an internal doc's types include `type_iri` (retention, T-3900).
+fn typed(doc: &Value, type_iri: &str) -> bool {
+    match doc.get("type") {
+        Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some(type_iri)),
+        Some(Value::String(t)) => t == type_iri,
+        _ => false,
+    }
+}
+
+/// The instant an attribute instance is kept by, the same fallback the
+/// Postgres arm's `observed_at` column takes.
+fn instance_instant(inst: &Value) -> Option<&str> {
+    ["observedAt", "modifiedAt", "deletedAt", "createdAt"]
+        .iter()
+        .find_map(|k| inst.get(*k).and_then(Value::as_str))
+}
+
+/// `a` before `b`, compared as instants (4.6.3 allows a comma fraction), by
+/// bytes when either does not parse.
+fn earlier(a: &str, b: &str) -> bool {
+    let instant =
+        |s: &str| chrono::DateTime::parse_from_rfc3339(&filter::canonical_datetime(s)).ok();
+    match (instant(a), instant(b)) {
+        (Some(x), Some(y)) => x < y,
+        _ => a < b,
+    }
+}
+
 /// The 4.22 "now" the write paths judge `expiresAt` against — the same UTC-Z
 /// millisecond form the read boundary uses.
 fn now_stamp() -> String {
@@ -519,6 +547,108 @@ impl Store {
                 .flat_map(|d| d.values().filter_map(Value::as_array))
                 .map(|a| a.iter().filter(|i| i.is_object()).count() as u64)
                 .sum()
+        })
+    }
+
+    /// Retention of current state (T-3900): drop at most `batch` Entities of
+    /// `tenant` typed `type_iri` that carry no `expiresAt` and whose
+    /// `modifiedAt` is before `before`. Persisted per key in `file` mode;
+    /// `dry_run` counts them and drops none.
+    pub fn retain_current(
+        &self,
+        tenant: &TenantId,
+        type_iri: &str,
+        before: &str,
+        batch: usize,
+        dry_run: bool,
+    ) -> u64 {
+        on_blocking(true, || {
+            let mut inner = self.write_inner();
+            let Some(docs) = inner.entities.get_mut(tenant.as_str()) else {
+                return 0;
+            };
+            let dead: Vec<String> = docs
+                .iter()
+                .filter(|(_, doc)| {
+                    typed(doc, type_iri)
+                        && doc.get("expiresAt").is_none()
+                        && doc
+                            .get("modifiedAt")
+                            .and_then(Value::as_str)
+                            .is_some_and(|m| earlier(m, before))
+                })
+                .map(|(id, _)| id.clone())
+                .take(batch)
+                .collect();
+            for id in dead.iter().filter(|_| !dry_run) {
+                self.persist(T_ENTITIES, &key_bytes(tenant.as_str(), id), None);
+                docs.remove(id);
+            }
+            dead.len() as u64
+        })
+    }
+
+    /// Retention of history (T-3900): drop at most `batch` attribute
+    /// instances of `tenant`'s temporal documents typed `type_iri` whose
+    /// instant is before `before`; an attribute left without instances goes.
+    /// `dry_run` counts them and drops none.
+    pub fn retain_history(
+        &self,
+        tenant: &TenantId,
+        type_iri: &str,
+        before: &str,
+        batch: usize,
+        dry_run: bool,
+    ) -> u64 {
+        on_blocking(true, || {
+            let mut inner = self.write_inner();
+            let Some(docs) = inner.temporal.get_mut(tenant.as_str()) else {
+                return 0;
+            };
+            let mut left = batch;
+            let mut dropped = 0u64;
+            for (id, doc) in docs.iter_mut() {
+                if left == 0 {
+                    break;
+                }
+                if !typed(doc, type_iri) {
+                    continue;
+                }
+                let Some(obj) = doc.as_object_mut() else {
+                    continue;
+                };
+                let before_count = dropped;
+                let attrs: Vec<String> = obj
+                    .keys()
+                    .filter(|k| !antares_model::ENTITY_META_KEYS.contains(&k.as_str()))
+                    .cloned()
+                    .collect();
+                for k in attrs {
+                    let Some(arr) = obj.get_mut(&k).and_then(Value::as_array_mut) else {
+                        continue;
+                    };
+                    arr.retain(|inst| {
+                        let old =
+                            left > 0 && instance_instant(inst).is_some_and(|t| earlier(t, before));
+                        if old {
+                            left = left.saturating_sub(1);
+                            dropped = dropped.saturating_add(1);
+                        }
+                        dry_run || !old
+                    });
+                    if arr.is_empty() && !dry_run {
+                        obj.remove(&k);
+                    }
+                }
+                if dropped != before_count && !dry_run {
+                    self.persist(
+                        T_TEMPORAL_ENTITIES,
+                        &key_bytes(tenant.as_str(), id),
+                        Some(doc),
+                    );
+                }
+            }
+            dropped
         })
     }
 

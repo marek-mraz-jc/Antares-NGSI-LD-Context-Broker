@@ -38,6 +38,14 @@ pub enum Refusal {
         /// The id the log line carries.
         request_id: String,
     },
+    /// A count or a sort the store cannot apply needs more Entities read than one request may
+    /// (ADR-0028 rule 5): 400, so the caller narrows the query.
+    TooManyResults {
+        /// The most Entities one request reads (`RESIDUAL_SCAN`).
+        budget: usize,
+        /// How many the query selects.
+        size: usize,
+    },
     /// The broker is overloaded: try again after `retry_after` seconds.
     Overloaded {
         /// The `Retry-After` the broker answered with.
@@ -63,7 +71,7 @@ impl Refusal {
             Self::NotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             Self::NotSupported => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Denied(_) => StatusCode::FORBIDDEN,
-            Self::Malformed(_) => StatusCode::BAD_REQUEST,
+            Self::Malformed(_) | Self::TooManyResults { .. } => StatusCode::BAD_REQUEST,
             Self::Limit(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Inner { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Overloaded { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -100,6 +108,13 @@ impl Refusal {
                 "https://uri.etsi.org/ngsi-ld/errors/BadRequestData",
                 "BadRequestData",
                 (*why).to_owned(),
+            ),
+            Self::TooManyResults { budget, size } => (
+                "https://uri.etsi.org/ngsi-ld/errors/TooManyResults",
+                "TooManyResults",
+                format!(
+                    "the query selects {size} Entities and one request reads at most {budget}: narrow it"
+                ),
             ),
             Self::Inner { request_id } => (
                 "https://uri.etsi.org/ngsi-ld/errors/InternalError",

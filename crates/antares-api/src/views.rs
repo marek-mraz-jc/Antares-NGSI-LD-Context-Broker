@@ -177,6 +177,13 @@ pub fn with_view(
         // so the view has nothing of its own to narrow there.
         return engine;
     }
+    if crate::policy::NAME_READS.contains(&clause) {
+        // Serve @context (5.13.4) is offered through no view: refused here,
+        // as it was before NAME_READS took a narrowing (T-4009).
+        return Err(Denied(format!(
+            "{clause} serves no stored @context through a view"
+        )));
+    }
     if crate::policy::WRITE_BY_ID.contains(&clause) && CHECKED_WRITES.contains(&clause) {
         // Rule 7 as below, the engine's answer the condition its write
         // holds the stored Entity to (`gate`), checked beside the view's;
@@ -486,6 +493,9 @@ pub enum ViewEntry {
         /// only the view root reads; the broker carries it and never looks
         /// inside.
         mapping: Option<Attached>,
+        /// The view's own `@context` as written, which a surface reads the
+        /// NGSI-LD names a caller writes under (ADR-0028 rule 6).
+        context: Option<Arc<serde_json::Map<String, serde_json::Value>>>,
     },
     /// A stored view that failed validation: never served, named in
     /// `/q/health` with the reason.
@@ -929,12 +939,17 @@ impl WriteGuard {
 
     /// Every Relationship target an expanded fragment writes must be an
     /// Entity this view shows; an absent target answers as a hidden one.
+    /// A view that selects every Entity hides none, so an absent target
+    /// tells nothing and is written as at the root (T-3786).
     pub(crate) async fn targets(
         &self,
         st: &crate::state::AppState,
         tenant: &antares_model::TenantId,
         fragment: &serde_json::Value,
     ) -> Result<(), Denied> {
+        if self.sel.selects_every() {
+            return Ok(());
+        }
         for target in relationship_targets(fragment) {
             let doc = st
                 .store

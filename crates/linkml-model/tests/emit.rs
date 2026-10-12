@@ -257,3 +257,101 @@ fn every_builtin_type_maps_in_json_schema_and_turtle() {
         );
     }
 }
+
+/// The population cube of the platform's Model Tools fixture
+/// (`population-cube.linkml.yaml`, DM-60), resolved: three dimensions, a
+/// measure, and `source`, which has no role.
+fn population() -> Model {
+    let role = |r: &str| serde_json::json!({"qb_component": {"tag": "qb_component", "value": r}});
+    let doc = serde_json::json!({
+        "id": "https://banskabystrica.sk/ns/population", "name": "population",
+        "prefixes": {"bb": {"prefix_prefix": "bb", "prefix_reference": "https://banskabystrica.sk/ns/"}},
+        "default_prefix": "bb",
+        "classes": {
+            "PopulationObservation": {
+                "description": "The number of inhabitants of one district in one age band at the end of one year.",
+                "slots": ["refDistrict", "ageBand", "year", "population", "source"],
+                "annotations": {"qb_dsd": {"tag": "qb_dsd", "value": "true"}}
+            },
+            "District": {"slots": ["source"]},
+            "Bare": {"slots": ["source"], "annotations": {"qb_dsd": {"tag": "qb_dsd", "value": "true"}}}
+        },
+        "slots": {
+            "refDistrict": {"range": "uriorcurie", "required": true, "annotations": role("dimension")},
+            "ageBand": {"range": "AgeBand", "required": true, "annotations": role("dimension")},
+            "year": {"range": "integer", "required": true, "annotations": role("dimension")},
+            "population": {"range": "integer", "required": true, "annotations": role("measure"),
+                           "description": "Inhabitants with permanent residence."},
+            "source": {"range": "string"}
+        },
+        "enums": {"AgeBand": {"permissible_values": {"0-4": {}, "65+": {}}}}
+    });
+    Model::read(doc.to_string().as_bytes(), &LIMITS).unwrap_or_else(|e| unreachable!("{e}"))
+}
+
+/// DM-60: the cube of a Data Structure Definition names every component by
+/// its role, the OWL types them; a model without one has no cube.
+#[test]
+fn the_cube_names_each_component_by_its_role() {
+    const BB: &str = "https://banskabystrica.sk/ns/";
+    let m = population();
+    let cube = linkml_model::qb(&m).unwrap();
+    assert!(cube.contains("@prefix qb: <http://purl.org/linked-data/cube#> ."));
+    assert!(cube.contains(&format!(
+        "<{BB}PopulationObservationStructure> a qb:DataStructureDefinition"
+    )));
+    for dimension in ["refDistrict", "ageBand", "year"] {
+        assert!(
+            cube.contains(&format!("[ qb:dimension <{BB}{dimension}> ]")),
+            "{cube}"
+        );
+        assert!(cube.contains(&format!(
+            "<{BB}{dimension}> a rdf:Property, qb:DimensionProperty"
+        )));
+    }
+    assert!(cube.contains(&format!("[ qb:measure <{BB}population> ]")));
+    assert!(cube.contains(&format!(
+        "<{BB}population> a rdf:Property, qb:MeasureProperty"
+    )));
+    assert!(cube.contains(&format!(
+        "<{BB}PopulationObservation> rdfs:subClassOf qb:Observation"
+    )));
+    assert!(
+        !cube.contains(&format!("<{BB}source>")) && !cube.contains(&format!("<{BB}District>")),
+        "{cube}"
+    );
+
+    // a Data Structure Definition without a description or a component
+    assert!(
+        cube.contains(&format!(
+            "<{BB}BareStructure> a qb:DataStructureDefinition ;\n  rdfs:label \"Bare\" .\n"
+        )),
+        "{cube}"
+    );
+    let owl = linkml_model::owl(&m);
+    assert!(owl.contains("rdfs:subClassOf qb:Observation"), "{owl}");
+    assert!(owl.contains(&format!(
+        "<{BB}year> a owl:DatatypeProperty, qb:DimensionProperty"
+    )));
+    assert!(owl.contains(&format!(
+        "<{BB}population> a owl:DatatypeProperty, qb:MeasureProperty"
+    )));
+    assert!(
+        owl.contains(&format!("<{BB}source> a owl:DatatypeProperty ;")),
+        "{owl}"
+    );
+    let shacl = linkml_model::shacl(&m);
+    for component in ["refDistrict", "ageBand", "year", "population"] {
+        let at = shacl.find(&format!("sh:path <{BB}{component}>")).unwrap();
+        let shape = &shacl[at..shacl[at..].find(']').map_or(shacl.len(), |end| at + end)];
+        assert!(shape.contains("sh:minCount 1"), "{component}: {shape}");
+    }
+
+    let building = Model::read(
+        &std::fs::read(golden_dir().join("building.json")).unwrap(),
+        &LIMITS,
+    )
+    .unwrap();
+    assert_eq!(linkml_model::qb(&building), None);
+    assert!(!linkml_model::owl(&building).contains("qb:"));
+}

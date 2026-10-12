@@ -37,6 +37,8 @@ use std::sync::{Arc, Weak};
 
 mod preview;
 pub use preview::MAX_PREVIEW_LIMIT;
+pub mod quality;
+pub mod retention;
 pub mod rule_documents;
 
 /// How often, in milliseconds, every pod rebuilds its table from the store
@@ -168,6 +170,8 @@ pub struct Loaded {
     pub notes: Vec<String>,
     /// The compiled Mapping of a view of another model.
     pub mapping: Option<Arc<crate::mapping::Mapping>>,
+    /// The view's own `@context`, as written.
+    pub context: Option<Arc<serde_json::Map<String, Value>>>,
 }
 
 impl View {
@@ -293,6 +297,7 @@ impl View {
             operations,
             notes,
             mapping,
+            context: self.context.clone().map(Arc::new),
         };
         if self.q.is_some()
             && loaded
@@ -469,6 +474,7 @@ fn entry(doc: &Value) -> ViewEntry {
             mapping: l
                 .mapping
                 .map(|m| antares_api::views::Attached(m as Arc<dyn std::any::Any + Send + Sync>)),
+            context: l.context,
         },
         Err(reason) => ViewEntry::Invalid { reason },
     }
@@ -486,6 +492,12 @@ struct Reloader {
     policy: tokio::sync::Mutex<rule_documents::Cache>,
     /// [`SCHEMA_MAX_ENV`]; `None` refuses every schema write.
     schema_max: Option<usize>,
+    /// Every Tenant's retention rules, as the last reload found them.
+    retention: std::sync::RwLock<Arc<retention::Rules>>,
+    /// What this pod's sweeps deleted since it started, by Tenant, type and kind.
+    deleted: std::sync::Mutex<BTreeMap<(String, String, &'static str), u64>>,
+    /// Every Tenant's `maxAge` quality rules, as the last reload found them.
+    quality: std::sync::RwLock<Arc<quality::Rules>>,
 }
 
 impl Reloader {
@@ -494,11 +506,21 @@ impl Reloader {
         let docs = self.state.view_docs().await?;
         let mut next = HashMap::with_capacity(docs.len());
         let mut schemas = BTreeMap::new();
+        let mut retention_docs = Vec::new();
+        let mut quality_docs = Vec::new();
         for doc in docs {
             let Some(id) = doc.get("id").and_then(Value::as_str).map(str::to_owned) else {
                 tracing::warn!("a stored view document has no id; skipped");
                 continue;
             };
+            if let Some(tenant) = id.strip_prefix(retention::RETENTION_ID_PREFIX) {
+                retention_docs.push((tenant.to_owned(), doc));
+                continue;
+            }
+            if let Some(tenant) = id.strip_prefix(quality::QUALITY_ID_PREFIX) {
+                quality_docs.push((tenant.to_owned(), doc));
+                continue;
+            }
             if let Some(tenant) = id.strip_prefix(SCHEMA_ID_PREFIX) {
                 if let Some(text) = doc.get("text").and_then(Value::as_str) {
                     schemas.insert(tenant.to_owned(), Schema::new(text.as_bytes()));
@@ -526,6 +548,18 @@ impl Reloader {
             revision(table.iter().map(|(id, (doc, _))| (id.as_str(), doc))),
         );
         self.state.views.replace_schemas(schemas);
+        *self
+            .retention
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(retention::load(
+            retention_docs.iter().map(|(t, d)| (t.as_str(), d)),
+        ));
+        *self
+            .quality
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(quality::load(
+            quality_docs.iter().map(|(t, d)| (t.as_str(), d)),
+        ));
         *cache = next;
         drop(cache);
         rule_documents::reload(&self.state, &mut *self.policy.lock().await).await
@@ -586,6 +620,9 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
         cache: tokio::sync::Mutex::new(HashMap::new()),
         policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
         schema_max: schema_max(std::env::var(SCHEMA_MAX_ENV).ok())?,
+        retention: std::sync::RwLock::default(),
+        deleted: std::sync::Mutex::default(),
+        quality: std::sync::RwLock::default(),
     });
     reloader.reload().await?;
     // The routes live in the table the reloader fills; a strong handle there
@@ -596,6 +633,16 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|ms| *ms > 0)
         .unwrap_or(5000);
+    let sweeping = reloader.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(retention::SWEEP_EVERY);
+        loop {
+            tick.tick().await;
+            let now = chrono::Utc::now();
+            retention::sweep(&sweeping, now).await;
+            quality::sweep(&sweeping, now).await;
+        }
+    });
     let looping = reloader.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(every));
@@ -609,6 +656,20 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
 }
 
 impl Reloader {
+    fn quality_rules(&self) -> Arc<quality::Rules> {
+        self.quality
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn retention_rules(&self) -> Arc<retention::Rules> {
+        self.retention
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     async fn reload_or_log(&self) {
         if let Err(e) = self.reload().await {
             tracing::warn!(
@@ -625,6 +686,21 @@ impl Reloader {
 pub struct Reload(Arc<Reloader>);
 
 impl Reload {
+    /// One retention sweep at `now` over the rules the last reload found
+    /// (the loop [`install`] starts runs it every minute).
+    pub async fn sweep_retention(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<retention::Deleted> {
+        retention::sweep(&self.0, now).await
+    }
+
+    /// One quality sweep at `now` over the rules the last reload found (the
+    /// minute loop [`install`] starts runs it after the retention sweep).
+    pub async fn sweep_quality(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<quality::Changed> {
+        quality::sweep(&self.0, now).await
+    }
+
     /// Rebuild the table from the store now.
     ///
     /// # Errors
@@ -675,6 +751,8 @@ fn admin(r: &Weak<Reloader>) -> Router {
         )
         .merge(preview::routes(r))
         .merge(rule_documents::routes(r))
+        .merge(retention::routes(r))
+        .merge(quality::routes(r))
 }
 
 /// Run `f` with the reloader, or answer 503 once the runtime that ran
@@ -832,6 +910,16 @@ async fn put_schema(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Res
             ))
         }
     };
+    if let Some(slot) = member_slot(text) {
+        return Ok(problem(
+            StatusCode::BAD_REQUEST,
+            "BadRequestData",
+            &format!(
+                "slot {slot:?} is a member of an NGSI-LD Attribute, never an Attribute \
+                 name: no Entity can carry it; give the slot another name, one that says what it holds (pm10, not value)"
+            ),
+        ));
+    }
     let doc = serde_json::json!({"id": key, "text": text});
     let replaced = r.state.put_view_doc(&key, doc).await?;
     r.reload().await?;
@@ -841,6 +929,55 @@ async fn put_schema(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Res
         StatusCode::CREATED
     }
     .into_response())
+}
+
+/// Members of an Attribute instance an Entity also carries, or that the
+/// platform's core model (`ngsi-ld-core.linkml.yaml`, imported by every
+/// compiled data model) declares as slots of every Entity: a surface reads
+/// them as the Entity's own, so they stay allowed (T-3956).
+const ENTITY_SLOTS: [&str; 6] = [
+    "type",
+    "observedAt",
+    "createdAt",
+    "modifiedAt",
+    "deletedAt",
+    "expiresAt",
+];
+
+/// The first slot of a `LinkML` schema named after a member of an Attribute
+/// instance (`value`, `object`, `unitCode`, ...): no Entity can carry it as
+/// an Attribute, the expansion reads the key as that member. The schema's own
+/// slots, each class's slots and slot usages (T-3956).
+fn member_slot(text: &str) -> Option<String> {
+    let doc: serde_json::Value = serde_json::from_str(text).ok()?;
+    let keys = |v: Option<&serde_json::Value>| {
+        v.and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flat_map(|o| o.keys().cloned())
+            .collect::<Vec<_>>()
+    };
+    let mut names = keys(doc.get("slots"));
+    for class in doc
+        .get("classes")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flat_map(serde_json::Map::values)
+    {
+        names.extend(keys(class.get("slot_usage")));
+        names.extend(
+            class
+                .get("slots")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned),
+        );
+    }
+    names.into_iter().find(|n| {
+        antares_jsonld::RESERVED_MEMBERS.contains(&n.as_str())
+            && !ENTITY_SLOTS.contains(&n.as_str())
+    })
 }
 
 fn no_schema() -> Response {
@@ -1052,6 +1189,9 @@ mod tests {
             cache: tokio::sync::Mutex::new(HashMap::new()),
             policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
             schema_max: None,
+            retention: std::sync::RwLock::default(),
+            deleted: std::sync::Mutex::default(),
+            quality: std::sync::RwLock::default(),
         });
         let put = put_schema(r.clone(), "city".into(), Bytes::from_static(b"{}")).await;
         assert_eq!(put.map(|p| p.status()), Ok(StatusCode::SERVICE_UNAVAILABLE));

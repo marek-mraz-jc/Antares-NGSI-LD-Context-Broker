@@ -125,10 +125,12 @@ references), T-3737 (one `Content-Length` on `HEAD`), T-3738 (`$entity`
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| Minimal | 178 | 95 | 20 | 65.2 % |
-| Intermediate | 246 | 90 | 14 | 73.2 % |
-| Advanced | 200 | 303 | 64 | 39.8 % |
-| **All** (suite summary) | 624 | 488 | 98 | 56.1 % |
+| Minimal | 197 | 76 | 20 | 72.2 % |
+| Intermediate | 266 | 70 | 14 | 79.2 % |
+| Advanced | 275 | 247 | 45 | 52.7 % |
+| **All** (suite summary) | 738 | 393 | 79 | 65.3 % |
+
+Measured by surfaces-conformance 38257670683 on `e94cd14` (train 20261012-1301), written by tasks/train.
 
 One earlier pass was a skip after train 8, by the suite's own rule: `POST with
 nonexistent foreign key` posts a `ProductDescription` whose `ProductID` names
@@ -146,8 +148,9 @@ The first baseline (T-3714) stood at Minimal 37.5 %, Intermediate 28.2 % and
 Advanced 11.7 % (254 passed, 840 failed, 116 skipped).
 
 The suite skips whole test scripts on what `$metadata` declares:
-`KeyAsSegmentSupported` false on the container, search and compute
-unsupported on `Products`. Until T-3723 the container also declared
+`KeyAsSegmentSupported` false on the container. Until T-3750 and T-3936
+it also skipped the search and compute scripts, which `Products` declared
+unsupported. Until T-3723 the container also declared
 `BatchSupported` false, and the suite skipped every `$batch` script.
 
 ## 6. Failing areas
@@ -171,7 +174,9 @@ Each failing area is a task, or a decision with its reason:
 | Change sets and atomicity groups, Content-ID references | 11.4.9.1, 11.4.9.3, 19_json_batch | not supported, by design: ADR-0024 section 5 (W26), mapping row C18 |
 | A comparison or `in` between a property and a literal of another type answers 200 with no rows; an Int64 literal past its range is accepted | 11.3.6, 11.2.5.1, 5.1.1.5 | T-3725 |
 | Options inside `$expand(...)` other than `$select` and `$expand` (Q5) | 11.2.5.9, 11.3.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
-| `$apply`, `$compute`, `$index`, `$search`, `$deltatoken` and delta links | 11.2.5.4.x, 11.2.5.13, 11.2.4.1, 11.2.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
+| `$apply`, `$index`, `$deltatoken` and delta links | 11.2.5.4.x, 11.2.4.1, 11.2.8 | not supported, by design: ADR-0024 section 5 answers them 501; `$apply` is T-3937 |
+| `$compute` answered 501 | 11.2.5.13 | T-3936: served, each item evaluated per Entity on what the view shows |
+| `$search` answered 501 | 11.2.5.6 | T-3750: served over the String properties the view shows |
 | Filter functions outside the F-row subset (date and time, arithmetic, `length`, `indexof`, `substring`, `divby`, `matchesPattern`, `isof`, `cast`) | 11.3.1 to 11.3.4, 11.3.9, 11.5.x | not supported, by design: ADR-0024 section 5; the mapped rows still at 501 are T-3686 |
 | Actions and functions, bound or unbound | 11.2.10, 11.4.13, 12.1, 12.2 | not supported, by design: an NGSI-LD view has no operations (ADR-0024 section 5) |
 | Media entities and stream properties | 11.2.12 | not supported, by design: ADR-0024 section 5 |
