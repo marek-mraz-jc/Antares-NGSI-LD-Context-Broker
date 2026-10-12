@@ -221,11 +221,13 @@ their counts: v1 moves data only.
 
 #### POST /q/tenants/{tenant}/import
 
-Takes that stream into a tenant holding no Entity and no history (`409`
-otherwise), with the same tenant name in its header, entities before
-history, lines of at most 16 MiB. Any refused line, or a missing trailer,
-answers `400` naming the line and leaves the tenant as it was found. `204`
-when every record is in.
+Takes that stream into a tenant that holds nothing: no Entity, history,
+Subscription, registration, Snapshot, EntityMap, distributed subscription
+or hosted `@context` (`409` naming each count otherwise). The header names
+the same tenant, entities come before history, a line is at most 16 MiB.
+Any refused line, or a missing trailer, answers `400` naming the line; the
+import then deletes the Entities and history it wrote, by id, and nothing
+else. `204` when every record is in.
 
 ## Dead letters
 
