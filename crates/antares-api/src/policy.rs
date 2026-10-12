@@ -1120,6 +1120,21 @@ pub trait PolicyEngine: Send + Sync {
         })
     }
 
+    /// The probe a surface lists its operations by (MCP D-3, T-3784): one
+    /// Operation per clause, naming nothing, and each answer says whether
+    /// some request of that clause could be allowed for `subject`, never
+    /// whether this one is. The default decides the empty Operations as
+    /// [`decide_each`](Self::decide_each) would; an engine whose rules need
+    /// a type to answer a read overrides it, so a grant that takes the
+    /// queried types is offered, and a refusal of every request is not.
+    fn offers_each<'a>(
+        &'a self,
+        subject: &'a Subject,
+        ops: &'a [Operation<'a>],
+    ) -> DecisionsFuture<'a> {
+        self.decide_each(subject, ops)
+    }
+
     /// Fires once per notification document per subscription, before the
     /// egress check and the send (ADR-0014 `pre_notify`). Synchronous: it
     /// sits inside the delivery the broker is about to make, and an engine
@@ -1290,13 +1305,21 @@ pub async fn decide_each(
     subject: &Subject,
     ops: &[Operation<'_>],
 ) -> Vec<Decision> {
+    guarded(engine, ops, || engine.decide_each(subject, ops)).await
+}
+
+/// One batch answer of `engine` to `ops` from `ask`, failing closed as
+/// [`decide_each`] documents, each answer passed through [`resolve`].
+async fn guarded<'a>(
+    engine: &dyn PolicyEngine,
+    ops: &[Operation<'_>],
+    ask: impl FnOnce() -> DecisionsFuture<'a>,
+) -> Vec<Decision> {
     let all = |why: &str| vec![Decision::Deny(why.to_owned()); ops.len()];
     #[cfg(not(target_arch = "wasm32"))]
     let answer = {
         use futures_util::FutureExt as _;
-        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            engine.decide_each(subject, ops)
-        }));
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ask));
         let Ok(fut) = built else {
             tracing::error!("policy engine {} panicked; denying", engine.name());
             metrics::counter!("antares_policy_failures_total", "reason" => "panic").increment(1);
@@ -1324,7 +1347,7 @@ pub async fn decide_each(
         }
     };
     #[cfg(target_arch = "wasm32")]
-    let answer = engine.decide_each(subject, ops).await;
+    let answer = ask().await;
     if answer.len() != ops.len() {
         tracing::error!(
             "policy engine {} answered {} decisions for {} operations; denying",
@@ -1345,12 +1368,10 @@ pub async fn decide_each(
 /// Whether any request of each of `clauses` could be allowed for the caller
 /// of `headers`: one batch-shaped probe a surface lists its operations by
 /// (MCP D-3), never a decision on a request. Each clause is asked as an
-/// Operation that names nothing, through [`decide_each`], so it fails
-/// closed the same way (a panic, a timeout or a short answer hides every
-/// clause), and a narrowing on a clause that cannot be narrowed hides it.
-/// With no engine attached every clause is offered.
-// ponytail: no `PolicyEngine::offers` hook; an engine that has to answer a
-// probe differently from an empty Operation gets one when it exists.
+/// Operation that names nothing, through [`PolicyEngine::offers_each`],
+/// failing closed as [`decide_each`] does (a panic, a timeout or a short
+/// answer hides every clause), and a narrowing on a clause that cannot be
+/// narrowed hides it. With no engine attached every clause is offered.
 pub async fn offers(
     engine: Option<&dyn PolicyEngine>,
     tenant: &antares_model::TenantId,
@@ -1374,7 +1395,8 @@ pub async fn offers(
             stored: None,
         })
         .collect();
-    decide_each(engine, &subject_of(tenant, headers), &ops)
+    let subject = subject_of(tenant, headers);
+    guarded(engine, &ops, || engine.offers_each(&subject, &ops))
         .await
         .into_iter()
         .map(|d| !matches!(d, Decision::Deny(_)))

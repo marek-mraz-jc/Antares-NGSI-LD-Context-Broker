@@ -1340,11 +1340,7 @@ async fn compare(app: &Router, s: &Scenario) -> Vec<String> {
 
 /// Mismatches with a fix task filed: a failure of the surface whose text
 /// holds the needle is printed with its task instead of failing the case.
-const KNOWN_DIFF: [(&str, &str, &str); 1] = [
-    // the MCP tool list is filtered by one engine probe that names no type,
-    // which a policy that can refuse some type refuses
-    ("MCP", "unknown tool", "T-3784"),
-];
+const KNOWN_DIFF: [(&str, &str, &str); 0] = [];
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
