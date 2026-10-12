@@ -3307,6 +3307,7 @@ mod hooks {
         .await;
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let written: Arc<Mutex<Vec<String>>> = Arc::default();
         let w = Arc::clone(&written);
@@ -3373,12 +3374,14 @@ mod hooks {
     async fn refusals_on_the_wire() {
         let deny = Loader::with_policy(EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         });
         for url in ["http://127.0.0.1:1/x", "https://127.0.0.1:1/x"] {
             assert!(deny.resolve(&json!(url)).await.is_err(), "private {url}");
         }
         let open = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         assert!(open
             .refetch("http://127.0.0.1:9/never-cached")
@@ -3460,6 +3463,7 @@ mod hooks {
     async fn a_failed_lookup_denies() {
         let deny = EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         };
         assert!(deny
             .check_host_within("", 443, std::time::Duration::from_secs(5))
