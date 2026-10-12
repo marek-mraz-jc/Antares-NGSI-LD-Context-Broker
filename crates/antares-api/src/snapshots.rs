@@ -68,7 +68,11 @@ fn expires_at(meta: &Map<String, Value>) -> Result<String, NgsiError> {
             .clamp(1, MAX_LIFETIME_SECS),
         None => DEFAULT_LIFETIME_SECS,
     };
-    Ok((chrono::Utc::now() + chrono::Duration::seconds(secs))
+    // `secs` is clamped to MAX_LIFETIME_SECS above, far inside chrono's range.
+    let now = chrono::Utc::now();
+    Ok(now
+        .checked_add_signed(chrono::Duration::seconds(secs))
+        .unwrap_or(now)
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
@@ -497,7 +501,7 @@ async fn evict_over_cap(st: &AppState, tenant: &TenantId, keep: &str) {
         if metas.len() <= st.snapshot_cap {
             return;
         }
-        let over = metas.len() - st.snapshot_cap;
+        let over = metas.len().saturating_sub(st.snapshot_cap);
         metas.sort_by_key(|v| {
             (
                 v.get("snapshotPriority")
@@ -574,15 +578,15 @@ async fn fill_snapshot(st: &AppState, tenant: &TenantId, id: &str) {
     let mut detail = |r: Result<usize, NgsiError>| -> Value {
         match r {
             Ok(0) => {
-                n_empty += 1;
+                n_empty = n_empty.saturating_add(1);
                 json!({"resultStatus": "empty"})
             }
             Ok(_) => {
-                n_res += 1;
+                n_res = n_res.saturating_add(1);
                 json!({"resultStatus": "success"})
             }
             Err(e) => {
-                n_fail += 1;
+                n_fail = n_fail.saturating_add(1);
                 json!({"resultStatus": "failure",
                        "problemDetails": crate::negotiate::problem_value(&e)})
             }
@@ -599,9 +603,9 @@ async fn fill_snapshot(st: &AppState, tenant: &TenantId, id: &str) {
         if fill_cancelled(st, tenant, id, &synth).await {
             return;
         }
-        let r = run_query(st, tenant, &synth, q, &ctx, cap - copied).await;
+        let r = run_query(st, tenant, &synth, q, &ctx, cap.saturating_sub(copied)).await;
         if let Ok(n) = &r {
-            copied += n;
+            copied = copied.saturating_add(*n);
         }
         q_details.push(detail(r));
     }
@@ -615,9 +619,9 @@ async fn fill_snapshot(st: &AppState, tenant: &TenantId, id: &str) {
         if fill_cancelled(st, tenant, id, &synth).await {
             return;
         }
-        let r = run_temporal_query(st, tenant, &synth, id, q, cap - copied).await;
+        let r = run_temporal_query(st, tenant, &synth, id, q, cap.saturating_sub(copied)).await;
         if let Ok(n) = &r {
-            copied += n;
+            copied = copied.saturating_add(*n);
         }
         tq_details.push(detail(r));
     }
@@ -722,8 +726,8 @@ async fn run_query(
         }
         let rows = batch.rows;
         let got = batch.docs.len();
-        if n + got > budget {
-            return Err(too_many(n + got, budget));
+        if n.saturating_add(got) > budget {
+            return Err(too_many(n.saturating_add(got), budget));
         }
         // A write the store refuses fails the query. What this returns is
         // what the caller adds to `copied`, and `copied` decides both the
@@ -739,7 +743,7 @@ async fn run_query(
                     .await?;
             }
         }
-        n += got;
+        n = n.saturating_add(got);
         match crate::entities::next_scan_offset(offset, rows, 0, batch.paged, st.max_limit) {
             Some(next) => offset = next,
             None => break,
@@ -812,8 +816,8 @@ async fn run_temporal_query(
             .and_then(|v| v.as_array().cloned())
             .unwrap_or_default();
         let got = arr.len();
-        if n + got > budget {
-            return Err(too_many(n + got, budget));
+        if n.saturating_add(got) > budget {
+            return Err(too_many(n.saturating_add(got), budget));
         }
         for d in arr {
             let Some(eid) = d.get("id").and_then(Value::as_str) else {
@@ -852,13 +856,13 @@ async fn run_temporal_query(
             };
             if let Some(doc) = doc {
                 st.temporal.upsert(synth, eid, doc).await?;
-                n += 1;
+                n = n.saturating_add(1);
             }
         }
         if got < st.max_limit {
             break;
         }
-        offset += st.max_limit;
+        offset = offset.saturating_add(st.max_limit);
     }
     Ok(n)
 }
@@ -917,8 +921,8 @@ async fn send_notification(st: &AppState, meta: &Value) {
             "temporalSnapshotQueriesDetails",
         ),
     ] {
-        if let Some(v) = meta.get(from) {
-            body[to] = v.clone();
+        if let (Some(v), Some(body)) = (meta.get(from), body.as_object_mut()) {
+            body.insert(to.into(), v.clone());
         }
     }
     let mut req = st.http.post(uri).header("Content-Type", "application/json");

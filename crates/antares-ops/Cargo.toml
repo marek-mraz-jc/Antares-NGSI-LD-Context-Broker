@@ -13,7 +13,7 @@ role = "ops"
 
 [features]
 # A broker over the built-in store, for the surfaces' integration tests.
-test-kit = ["antares-api/test-kit"]
+test-kit = ["antares-api/test-kit", "antares-jsonld/fetch"]
 
 [dependencies]
 antares-api = { workspace = true, features = ["views"] }
