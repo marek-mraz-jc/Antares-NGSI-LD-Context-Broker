@@ -16,17 +16,17 @@
 crate = "antares-ops"
 file = "src/lib.rs"
 function = "Ops::run_in" # v0 mangling puts the impl between the crate and the type
-lines = 13
-branches = 2
-reason = "6 lines, 1 branch: a 503 comes from a store whose pool timed out (DB_OVERLOADED); the built-in store under test_kit has no pool, and the broker's own tests cover the 503 through their pool-wall driver. 7 lines, 1 branch: the two tracing::info! of the surface operation line repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/ops_log.rs covers the subscriber path and asserts what it logs"
+lines = 7
+branches = 1
+reason = "the two tracing::info! of the surface operation line repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/ops_log.rs covers the subscriber path and asserts what it logs (the 503 the excluded lines used to hold moved to `answered`, covered by every_api_answer_maps_to_what_a_surface_may_see, T-3947)"
 
 [[exclusion]]
 crate = "antares-ops"
 file = "src/lib.rs"
 function = "antares_ops::inner_failure"
-lines = 2
+lines = 3
 branches = 0
-reason = "tracing::warn! repeats the fields in its `log` fallback, which runs only with no subscriber set; ops_errors covers the subscriber path and asserts what it logs"
+reason = "one side of tracing::warn!: the unit test every_api_answer_maps_to_what_a_surface_may_see reaches it with no subscriber set, and since T-3947 no request of the test kit reaches an inner 5xx (the @context failure ops_errors used is a 504 LdContextNotAvailable now), so the subscriber side is not measured"
 
 [[exclusion]]
 crate = "antares-ops"

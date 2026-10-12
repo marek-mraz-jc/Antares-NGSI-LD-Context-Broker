@@ -38,12 +38,19 @@ pub enum Refusal {
         /// The id the log line carries.
         request_id: String,
     },
+    /// A remote JSON-LD `@context` the request names could not be retrieved
+    /// (TS 104 176 6.3.2, 504 `LdContextNotAvailable`). The URL is the
+    /// caller's own; the fetch error stays in the broker, the detail is fixed.
+    ContextNotAvailable,
     /// The broker is overloaded: try again after `retry_after` seconds.
     Overloaded {
         /// The `Retry-After` the broker answered with.
         retry_after: Option<HeaderValue>,
     },
 }
+
+/// The fixed detail of [`Refusal::ContextNotAvailable`].
+pub const CONTEXT_DETAIL: &str = "a JSON-LD @context the request names could not be retrieved";
 
 /// The fixed detail of an inner failure.
 pub const INNER_DETAIL: &str = "the operation failed inside the broker";
@@ -66,6 +73,7 @@ impl Refusal {
             Self::Malformed(_) => StatusCode::BAD_REQUEST,
             Self::Limit(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Inner { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ContextNotAvailable => StatusCode::GATEWAY_TIMEOUT,
             Self::Overloaded { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -105,6 +113,11 @@ impl Refusal {
                 "https://uri.etsi.org/ngsi-ld/errors/InternalError",
                 "InternalError",
                 format!("{INNER_DETAIL}; request id {request_id}"),
+            ),
+            Self::ContextNotAvailable => (
+                "https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable",
+                "LdContextNotAvailable",
+                CONTEXT_DETAIL.to_owned(),
             ),
             Self::Overloaded { retry_after } => {
                 let mut r = StatusCode::SERVICE_UNAVAILABLE.into_response();

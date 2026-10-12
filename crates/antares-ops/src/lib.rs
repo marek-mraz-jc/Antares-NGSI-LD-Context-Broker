@@ -40,7 +40,7 @@ pub mod mapping;
 mod operation;
 pub mod views;
 
-pub use error::{Refusal, INNER_DETAIL};
+pub use error::{Refusal, CONTEXT_DETAIL, INNER_DETAIL};
 pub use operation::OperationId;
 
 use antares_api::AppState;
@@ -482,19 +482,45 @@ impl Ops {
                 );
             }
         }
-        if !answer.status().is_server_error() {
-            return Ok(answer);
-        }
-        if answer.status() == StatusCode::SERVICE_UNAVAILABLE {
-            return Err(Refusal::Overloaded {
-                retry_after: answer
-                    .headers()
-                    .get(axum::http::header::RETRY_AFTER)
-                    .cloned(),
-            });
-        }
-        Err(inner_failure(op, answer).await)
+        answered(op, answer).await
     }
+}
+
+/// The API's answer as a surface gets it: a 5xx becomes a [`Refusal`], and
+/// only 503 and the API's own 504 `LdContextNotAvailable` keep their status.
+async fn answered(op: OperationId, answer: Response) -> Result<Response, Refusal> {
+    if !answer.status().is_server_error() {
+        return Ok(answer);
+    }
+    if answer.status() == StatusCode::SERVICE_UNAVAILABLE {
+        return Err(Refusal::Overloaded {
+            retry_after: answer
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .cloned(),
+        });
+    }
+    let status = answer.status();
+    let detail = axum::body::to_bytes(answer.into_body(), LOGGED_DETAIL_BYTES)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    // 6.3.2: a remote @context the caller named is the caller's to know
+    // about; a forward that timed out (also 504) stays an inner failure.
+    if context_not_available(status, &detail) {
+        return Err(Refusal::ContextNotAvailable);
+    }
+    Err(inner_failure(op, status, &detail))
+}
+
+/// Whether an inner answer is the NGSI-LD API's 504 `LdContextNotAvailable`
+/// (6.3.2), told apart from a forward's 504 by its problem type.
+fn context_not_available(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::GATEWAY_TIMEOUT
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|p| p.get("type")?.as_str().map(str::to_owned))
+            .is_some_and(|t| t == "https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable")
 }
 
 impl ViewOps {
@@ -699,21 +725,16 @@ impl ViewOps {
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
 /// Log an inner failure under a fresh id and answer with the id alone.
-async fn inner_failure(op: OperationId, answer: Response) -> Refusal {
+fn inner_failure(op: OperationId, status: StatusCode, detail: &str) -> Refusal {
     let request_id = format!(
         "ops-{:x}-{:x}",
         std::process::id(),
         NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
     );
-    let status = answer.status().as_u16();
-    let detail = axum::body::to_bytes(answer.into_body(), LOGGED_DETAIL_BYTES)
-        .await
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
     tracing::warn!(
         request_id,
         operation = op.id(),
-        status,
+        status = status.as_u16(),
         detail,
         "an operation failed inside the broker"
     );
@@ -1167,6 +1188,71 @@ pub mod test_kit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the NGSI-LD API's own 504 `LdContextNotAvailable` reaches a
+    /// surface as such; a forward's 504, another status or a body that is
+    /// no problem stays an inner failure (T-3947).
+    #[test]
+    fn only_the_apis_ld_context_504_is_passed_on() {
+        let ld = r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable","title":"LdContextNotAvailable","detail":"http://10.0.0.1/x"}"#;
+        let forward = r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/InternalError","detail":"https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable"}"#;
+        assert!(context_not_available(StatusCode::GATEWAY_TIMEOUT, ld));
+        assert!(!context_not_available(StatusCode::GATEWAY_TIMEOUT, forward));
+        assert!(!context_not_available(StatusCode::GATEWAY_TIMEOUT, ""));
+        assert!(!context_not_available(StatusCode::GATEWAY_TIMEOUT, "[1]"));
+        assert!(!context_not_available(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ld
+        ));
+    }
+
+    /// What a surface gets for each kind of API answer: success passes, a
+    /// 503 keeps its `Retry-After`, the API's 504 `LdContextNotAvailable`
+    /// keeps its status, any other 5xx (a forward's 504 included) is an
+    /// inner failure with an id and no inner text (T-3947).
+    #[tokio::test]
+    async fn every_api_answer_maps_to_what_a_surface_may_see() {
+        let answer = |status: StatusCode, body: &'static str| {
+            let mut r = Response::new(Body::from(body));
+            *r.status_mut() = status;
+            r
+        };
+        let op = OperationId::QueryEntities;
+        let ok = answered(op, answer(StatusCode::OK, "[]")).await;
+        assert!(ok.is_ok_and(|r| r.status() == StatusCode::OK));
+        let mut busy = answer(StatusCode::SERVICE_UNAVAILABLE, "");
+        busy.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from_static("6"),
+        );
+        assert_eq!(
+            answered(op, busy).await.err(),
+            Some(Refusal::Overloaded {
+                retry_after: Some(HeaderValue::from_static("6"))
+            })
+        );
+        let ld = r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable"}"#;
+        assert_eq!(
+            answered(op, answer(StatusCode::GATEWAY_TIMEOUT, ld))
+                .await
+                .err(),
+            Some(Refusal::ContextNotAvailable)
+        );
+        for (status, body) in [
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/InternalError","detail":"forward to http://10.0.0.1 timed out"}"#,
+            ),
+            (StatusCode::INTERNAL_SERVER_ERROR, "store said no"),
+        ] {
+            match answered(op, answer(status, body)).await.err() {
+                Some(Refusal::Inner { request_id }) => {
+                    assert!(request_id.starts_with("ops-"), "{status}: {request_id}");
+                }
+                other => panic!("{status}: {other:?}"),
+            }
+        }
+    }
 
     #[cfg(feature = "test-kit")]
     #[test]
