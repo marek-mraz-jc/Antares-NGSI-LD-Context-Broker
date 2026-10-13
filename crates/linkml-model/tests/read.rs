@@ -646,3 +646,23 @@ fn edm_types_and_flags_load_only_where_they_fit() {
         assert!(matches!(got, Err(Error::Malformed(_))), "{what}: {got:?}");
     }
 }
+
+#[test]
+fn slot_iris_by_class_include_inherited_slots_and_a_class_without_any() {
+    let doc = json!({
+        "id": "https://example.org/s", "name": "s",
+        "classes": {
+            "Place": {"slots": ["size"]},
+            "Room": {"is_a": "Place", "slots": ["floor"]},
+            "Marker": {}
+        },
+        "slots": {"size": {"range": "integer"}, "floor": {"range": "integer"}}
+    });
+    let m = load(&doc).unwrap();
+    let by_class = m.slot_iris_by_class();
+    let iris = |names: &[&str]| names.iter().map(|n| m.slot_iri(n)).collect();
+    assert_eq!(by_class.len(), 3);
+    assert_eq!(by_class[&m.class_iri("Place")], iris(&["size"]));
+    assert_eq!(by_class[&m.class_iri("Room")], iris(&["size", "floor"]));
+    assert!(by_class[&m.class_iri("Marker")].is_empty());
+}

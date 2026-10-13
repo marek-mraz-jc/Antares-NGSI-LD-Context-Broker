@@ -857,7 +857,17 @@ fn bad_tenant() -> Response {
 }
 
 async fn get_schema(r: Arc<Reloader>, tenant: String) -> Result<Response, String> {
-    let Some(key) = schema_key(&tenant) else {
+    stored_json(&r, schema_key(&tenant), no_schema).await
+}
+
+/// The JSON document stored under `key` as it was written, or `missing()`; a path that names no
+/// tenant (`key` is `None`) is `bad_tenant`. Schemas and retention documents are read this way.
+async fn stored_json(
+    r: &Reloader,
+    key: Option<String>,
+    missing: fn() -> Response,
+) -> Result<Response, String> {
+    let Some(key) = key else {
         return Ok(bad_tenant());
     };
     Ok(
@@ -874,7 +884,7 @@ async fn get_schema(r: Arc<Reloader>, tenant: String) -> Result<Response, String
                 text.to_owned(),
             )
                 .into_response(),
-            None => no_schema(),
+            None => missing(),
         },
     )
 }

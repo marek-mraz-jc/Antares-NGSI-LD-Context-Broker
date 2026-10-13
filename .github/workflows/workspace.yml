@@ -640,7 +640,12 @@ jobs:
         run: |
           for example in crates/${{ matrix.crate }}/examples/*.rs; do
             [ -e "$example" ] || continue
-            cargo run --locked -q -p ${{ matrix.crate }} --example "$(basename "$example" .rs)" -j 2
+            name=$(basename "$example" .rs)
+            # an example with `required-features` runs with them (gateway_expand needs `fetch`)
+            features=$(cargo metadata --locked --no-deps --format-version 1 | jq -r \
+              --arg c "${{ matrix.crate }}" --arg e "$name" \
+              '.packages[] | select(.name == $c) | .targets[] | select(.name == $e) | (.["required-features"] // []) | join(",")')
+            cargo run --locked -q -p ${{ matrix.crate }} ${features:+--features "$features"} --example "$name" -j 2
           done
       # the smallest broker build (every optional feature off) must compile
       - run: cargo check --locked -p antares-broker --no-default-features -j 2
