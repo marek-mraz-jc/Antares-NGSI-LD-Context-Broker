@@ -371,6 +371,35 @@ impl PgEntityStore {
         Ok(row.map(|r| r.get::<Value, _>(0)))
     }
 
+    /// Several Entities in one transaction (T-4085): one per id that exists,
+    /// keyed by id. A write's Relationship targets are read this way, so a
+    /// fragment with five Relationships costs one BEGIN, not five.
+    pub async fn get_many(
+        &self,
+        tenant: &TenantId,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Value>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        // 4.22: expired rows are invalid context until the sweep reaps them
+        let rows = sqlx::query(
+            "SELECT id, entity FROM entities WHERE tenant_id = $1 AND id = ANY($2)
+               AND (expires_at IS NULL OR expires_at > now())",
+        )
+        .bind(tenant.as_str())
+        .bind(ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>(0), r.get::<Value, _>(1)))
+            .collect())
+    }
+
     /// Returns the deleted document (the before-image, captured in the same
     /// transaction as the DELETE — never re-read outside it), `None` = absent.
     pub async fn delete(&self, tenant: &TenantId, id: &str) -> Result<Option<Value>, sqlx::Error> {

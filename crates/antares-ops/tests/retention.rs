@@ -350,6 +350,52 @@ async fn a_backlog_drains_in_batches_within_one_sweep() {
     );
 }
 
+/// T-4084: a sweep past its budget starts no further statement, and the next
+/// sweep goes on where it stopped, so a backlog never holds the database for
+/// the whole minute.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sweep_past_its_budget_stops_and_the_next_goes_on() {
+    let b = TestBroker::new().await.expect("broker");
+    let app = b.serve_mounted(Vec::new()).expect("app");
+    let put = send(
+        &app,
+        Method::PUT,
+        "/q/retention/city",
+        None,
+        Some(ONE_EACH.into()),
+    )
+    .await;
+    assert_eq!(put.0, StatusCode::CREATED);
+    let old: Vec<Value> = (0..1500)
+        .map(|i| json!({"type": "Property", "value": i, "observedAt": ago(60 + i64::from(i % 50))}))
+        .collect();
+    let history = json!({"id": "urn:v:budget", "type": V, SPEED: old});
+    let (s, body) = send(
+        &app,
+        Method::POST,
+        "/ngsi-ld/v1/temporal/entities",
+        Some("city"),
+        Some(history.to_string()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{body}");
+    let now = chrono::Utc::now();
+    assert!(
+        b.sweep_retention_within(now, std::time::Duration::ZERO)
+            .await
+            .is_empty(),
+        "a spent budget deletes nothing"
+    );
+    let deleted = b.sweep_retention(now).await;
+    assert_eq!(
+        deleted
+            .iter()
+            .map(|d| (d.kind, d.count))
+            .collect::<Vec<_>>(),
+        [("history", 1500)]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_preview_counts_without_deleting_and_the_totals_follow_the_sweeps() {
     let b = TestBroker::new().await.expect("broker");

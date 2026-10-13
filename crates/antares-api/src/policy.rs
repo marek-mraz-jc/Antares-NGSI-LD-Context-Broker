@@ -1544,7 +1544,7 @@ pub(crate) async fn temporal_pre_image(
 }
 
 /// The image of a stored document, with the types the body adds.
-fn image(stored: Option<Value>, body: Option<&Value>) -> PreImage {
+pub(crate) fn image(stored: Option<Value>, body: Option<&Value>) -> PreImage {
     let mut types: Vec<String> = Vec::new();
     for doc in stored.as_ref().into_iter().chain(body) {
         for t in entity_types(doc) {

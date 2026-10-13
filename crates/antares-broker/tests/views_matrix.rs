@@ -1534,3 +1534,87 @@ fn every_surface_answers_what_ngsi_ld_admits_for_generated_views_and_policies() 
         );
     }
 }
+
+/// T-4084, the dev shape: a public reader view's socket subscribes to Vehicle,
+/// and the pipeline's writer view creates, then updates, the Vehicle by
+/// batch upsert. Both writes reach the socket under the joinedcontext engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_through_a_writer_view_notifies_a_public_view_socket() {
+    let (app, _reload) = broker().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("an address").port();
+    let served = app.clone();
+    tokio::spawn(async move { axum::serve(listener, served).await });
+    let tenant = "hel";
+    let ops: Vec<&str> = antares_ops::OperationId::ALL
+        .iter()
+        .map(|op| op.id())
+        .collect();
+    let schema: Value = serde_json::from_str(SCHEMA).expect("the schema");
+    let policy = json!({"policies": [
+        {"id": "public-transport", "assignee": {"kind": "role", "id": "public"},
+         "operations": READS, "information": [{"entities": [{"type": "Vehicle"}]}]},
+        {"id": "pipes", "assignee": {"kind": "serviceAccount", "id": SEEDER},
+         "operations": ["5.6.1", "5.6.2", "5.6.3", "5.6.8", "5.6.9", "5.6.10"]}
+    ], "views": {"transport": ["public-transport"], "pipes": ["pipes"]}});
+    for (uri, doc) in [
+        (
+            "/q/views/transport".to_owned(),
+            json!({"id": "transport", "tenant": tenant, "operations": ops,
+                   "selector": ["Vehicle"], "rules": [{"types": ["Vehicle"], "attributes": ["speed"]}]}),
+        ),
+        (
+            "/q/views/pipes".to_owned(),
+            json!({"id": "pipes", "tenant": tenant, "operations": ops,
+                   "selector": ["*"], "rules": [{"types": ["*"], "attributes": ["*"]}]}),
+        ),
+        (format!("/q/schemas/{tenant}"), schema),
+        (format!("/q/policy/{tenant}"), policy),
+    ] {
+        let (status, _, body) = send(&app, "PUT", &uri, &[], Some(&doc)).await;
+        assert!(status.is_success(), "{uri}: {status} {body}");
+    }
+    let socket = tokio::task::spawn_blocking(move || {
+        let mut socket = Socket::open(
+            port,
+            "/x/views/transport/ws",
+            &[("x-jc-roles".to_owned(), String::new())],
+            Duration::from_millis(1500),
+        )
+        .expect("the socket");
+        let welcome = socket.next().unwrap_or_default();
+        assert_eq!(welcome["metadata"]["x-op"], "x-welcome", "{welcome}");
+        socket
+            .send(&json!({"metadata": {"x-op": "x-subscribe", "x-id": "s"},
+                          "body": {"type": "Subscription", "entities": [{"type": "Vehicle"}]}}))
+            .expect("sent");
+        let made = socket.next().unwrap_or_default();
+        assert_eq!(made["metadata"]["x-status"], 201, "{made}");
+        socket
+    })
+    .await
+    .expect("subscribed");
+    let writer = [("x-jc-client".to_owned(), SEEDER.to_owned())];
+    let uri = "/x/views/pipes/ngsi-ld/v1/entityOperations/upsert";
+    for speed in [10, 20] {
+        let batch = json!([{"id": "urn:ngsi-ld:Vehicle:hel.fi:helsinki:1", "type": "Vehicle",
+                            "speed": {"type": "Property", "value": speed}}]);
+        let (status, _, body) = send(&app, "POST", uri, &writer, Some(&batch)).await;
+        assert!(status.is_success(), "upsert {speed}: {status} {body}");
+    }
+    let messages = tokio::task::spawn_blocking(move || {
+        let mut socket = socket;
+        std::iter::from_fn(|| socket.next()).collect::<Vec<Value>>()
+    })
+    .await
+    .expect("read");
+    let speeds: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m["metadata"]["x-op"] == "x-notification")
+        .flat_map(|m| m["body"]["data"].as_array().into_iter().flatten())
+        .map(|e| &e["speed"]["value"])
+        .collect();
+    assert_eq!(speeds, [&json!(10), &json!(20)], "{messages:?}");
+}
