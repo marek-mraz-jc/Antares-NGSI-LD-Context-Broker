@@ -634,7 +634,7 @@ fn nested_lambdas_over_long_lists_hit_the_step_budget() {
 
 #[test]
 fn a_program_names_the_attributes_and_system_members_it_reads() -> Result<(), Error> {
-    use antares_residual::Spatial;
+    use ngsild_residual::Spatial;
     let at = |attrs: &[&str], member| Path::Attribute {
         attrs: attrs.iter().map(|a| (*a).to_owned()).collect(),
         member,

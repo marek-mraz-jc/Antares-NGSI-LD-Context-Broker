@@ -459,7 +459,7 @@ impl Program {
     /// `None` when it is unknown (a missing, hidden or mistyped operand), never a default.
     ///
     /// ```
-    /// use antares_residual::{compile, DateTime, Expr, Func, Lit, Path};
+    /// use ngsild_residual::{compile, DateTime, Expr, Func, Lit, Path};
     /// use serde_json::json;
     ///
     /// let double = Expr::Call(Func::Mul, vec![Expr::Path(Path::value("pm10")), Expr::Lit(Lit::Int(2))]);
