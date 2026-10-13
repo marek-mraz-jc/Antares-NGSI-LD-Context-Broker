@@ -54,7 +54,7 @@ pub const SCHEMA_LIMITS: linkml_model::Limits = linkml_model::Limits {
 /// The conformance classes the surface serves (mapping rows C3, R1 to R5, W1 to W5, S1 to S3,
 /// S5, S7, F1 to F16; Parts 4 and 5 are the drafts OGC 20-002r1 and 23-058r1, Part 3 is
 /// OGC 19-079r2 with CQL2 21-065r2). A view's `/conformance` declares the Part 4 ones only as
-/// far as it offers their writes ([`conformance`]).
+/// far as it offers their writes (the `conformance` handler).
 pub const CONFORMANCE: [&str; 32] = [
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
