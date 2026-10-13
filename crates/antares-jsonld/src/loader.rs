@@ -2404,7 +2404,11 @@ mod tests {
             )
             .await
             .expect_err("an unanswered lookup must be denied, never allowed");
-        assert!(err.contains("timed out"), "denial names the timeout: {err}");
+        // A resolver that answers NXDOMAIN before the zero timeout fires is a denial too.
+        assert!(
+            err.starts_with("resolving ctx.example.invalid: "),
+            "denial names the timeout or the failed lookup: {err}"
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "the caller must not wait on the resolver"
