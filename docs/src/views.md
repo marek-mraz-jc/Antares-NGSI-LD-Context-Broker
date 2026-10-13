@@ -78,6 +78,28 @@ same store operation (ADR-0023 rule 7):
 
 A refused write leaves the store as it was.
 
+### Conditional writes
+
+Retrieve Entity through a view answers an `ETag`: a strong entity tag of
+what the view shows of the stored Entity (`id`, `type`, `scope` and the
+Attributes a rule holding for it shows). A write to one Entity through the
+view (Update, Append, Merge and Replace Entity, Delete Entity, and the
+Attribute writes) honours `If-Match` (RFC 9110 13.1.1) inside the same store
+operation as the checks above (T-3789):
+
+- `If-Match: *` holds for an Entity the view shows; a list holds when one
+  of its strong tags equals the Entity's. A weak tag never holds.
+- When it does not hold the write is `412` with no body, and the store
+  keeps what it held. An Entity out of the view and an absent one are
+  both `412` under `If-Match`, so the answer still tells nothing about an
+  Entity the view hides.
+- A change to an Attribute the view hides leaves the tag as it was.
+- A batch ignores `If-Match`: it names no single Entity.
+
+The tag is a hash of the stored document (std `DefaultHasher`, 64 bits);
+a broker upgrade may change every tag, which a client meets as a `412` and
+a fresh read.
+
 Every operation a surface runs, through a view or not, writes one `info`
 line, `surface operation`, with `surface`, `view` and `tenant` (through a
 view), `operation` (its matrix id) and `status`. The line names no subject
@@ -112,6 +134,7 @@ effect on the Subscriptions already made:
 | `405` + `Allow` | the view serves other methods on this resource |
 | `422` | the view serves this method here, but not this operation of it (`?details=true`, for example) |
 | `400` | the request names an entity map (`entityMap`, `NGSILD-EntityMap`): maps are not served through a view |
+| `412` | a write's `If-Match` does not hold for what the view shows (section 3) |
 
 The view id is the raw path segment: `CARS`, `ca%72s` or `x/../cars` never
 reach the view `cars`. No refusal names a hidden Attribute or an inner

@@ -286,6 +286,12 @@ async fn retrieve_entity_inner(
     check_linked_projection(&repr, &join)?;
     antares_model::EntityId::new(id)?;
     let local_doc = st.store.get(&tenant, Kind::Entity, id).await?;
+    // T-3789: through a view, the tag a conditional write checks: of the
+    // stored document, before any federated merge; sent only with a 200
+    #[cfg(feature = "views")]
+    let etag = crate::views::WriteGuard::of(st, std::iter::empty())
+        .zip(local_doc.as_ref())
+        .map(|(g, d)| g.tag(d));
     let looped = crate::federation::via_loop(
         headers,
         &crate::federation::alias_for(&st.host_alias, &tenant),
@@ -457,6 +463,10 @@ async fn retrieve_entity_inner(
     let mut resp = respond_prefer(StatusCode::OK, payload, &ctx, accept, &tenant, headers);
     attach_warnings(&mut resp, &warnings);
     filter.mark(&st.host_alias, resp.headers_mut());
+    #[cfg(feature = "views")]
+    if let Some(tag) = etag.and_then(|t| axum::http::HeaderValue::from_str(&t).ok()) {
+        resp.headers_mut().insert(axum::http::header::ETAG, tag);
+    }
     Ok(resp)
 }
 
@@ -1612,7 +1622,8 @@ pub async fn delete_entity(
         // after, and the document that answered the test is not necessarily
         // the one the delete removes.
         #[cfg(feature = "views")]
-        let guard = crate::views::WriteGuard::of(&st, std::iter::empty());
+        let guard =
+            crate::views::WriteGuard::of(&st, std::iter::empty()).map(|g| g.matching(&headers));
         let keep = |d: &Value| {
             // gap G12: an Entity the engine's condition does not select is
             // not found
@@ -1621,7 +1632,7 @@ pub async fn delete_entity(
             }
             // ADR-0023 rule 7: an Entity out of the view is not found
             #[cfg(feature = "views")]
-            if guard.as_ref().is_some_and(|g| !g.sees(d)) {
+            if guard.as_ref().is_some_and(|g| !g.keeps(d)) {
                 return false;
             }
             crate::negotiate::matches_type_param(d, &params, &ctx)
@@ -1680,6 +1691,10 @@ pub async fn delete_entity(
             mirror_delete_entity(&st, &tenant, &id).await;
             Ok::<_, ApiError>(no_content(&tenant))
         } else {
+            #[cfg(feature = "views")]
+            if let Some(g) = &guard {
+                g.settled()?;
+            }
             Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into())
         }
     };
@@ -2080,7 +2095,8 @@ async fn merge_entity_inner(
         crate::attrs::attr_iris_of(&fragment)
             .iter()
             .map(String::as_str),
-    );
+    )
+    .map(|g| g.matching(headers));
     #[cfg(feature = "views")]
     if let Some(g) = &guard {
         g.targets(st, &tenant, &fragment).await?;
@@ -2224,7 +2240,7 @@ async fn merge_entity_inner(
         .await?;
     #[cfg(feature = "views")]
     if let Some(g) = &guard {
-        g.verdict()?;
+        g.settled()?;
     }
     match res {
         None => Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into()),
@@ -2512,6 +2528,11 @@ pub async fn replace_entity(
             // under the row lock, because between the two the target can be
             // deleted and a replace that writes anyway puts it back.
             if local_doc.is_none() {
+                // T-3789: under `If-Match`, out of the view and absent are both 412
+                #[cfg(feature = "views")]
+                if let Some(g) = crate::views::WriteGuard::of(&st, std::iter::empty()) {
+                    g.matching(&headers).settled()?;
+                }
                 return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
             }
             let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
@@ -2530,7 +2551,8 @@ pub async fn replace_entity(
                 crate::attrs::attr_iris_of(&expanded)
                     .iter()
                     .map(String::as_str),
-            );
+            )
+            .map(|g| g.matching(&headers));
             #[cfg(feature = "views")]
             if let Some(g) = &guard {
                 g.targets(&st, &tenant, &expanded).await?;
@@ -2569,7 +2591,7 @@ pub async fn replace_entity(
                 .await?;
             #[cfg(feature = "views")]
             if let Some(g) = &guard {
-                g.verdict()?;
+                g.settled()?;
             }
             return match res {
                 None => Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into()),
