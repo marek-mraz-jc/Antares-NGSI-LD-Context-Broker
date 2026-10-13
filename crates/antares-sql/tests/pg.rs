@@ -129,7 +129,7 @@ async fn rls_denies_cross_tenant_reads_and_writes() {
     // Non-superuser app role (idempotent), least privilege on the data tables.
     for stmt in [
         "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
-         EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
         "GRANT USAGE ON SCHEMA public TO antares_app",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
     ] {
@@ -222,7 +222,7 @@ async fn rls_scopes_hosted_contexts_and_shares_cached_ones() {
     let admin = pg::connect(&url, 5).await.expect("connect");
     for stmt in [
         "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
-         EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
         "GRANT USAGE ON SCHEMA public TO antares_app",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
     ] {
@@ -615,6 +615,42 @@ async fn the_postgres_store_keeps_the_driver_contract() {
     let prefix = format!("pgctr{run}");
     antares_store::contract::run_current_state_contract(&store, &a, &b, &prefix).await;
     antares_store::contract::run_temporal_contract(&store, &a, &b, &prefix).await;
+}
+
+/// T-3914: the same isolation walk as the in-process stores, on fresh
+/// Tenants (the purge empties `a`). `_` would be a LIKE wildcard; `x`
+/// extends the other name. The default Tenant is `b`, never purged.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_postgres_store_keeps_tenants_apart() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let t = |s: String| TenantId::new(&s).expect("tenant");
+    let pairs = [
+        (t(format!("iso{run}_b")), t(format!("iso{run}xb"))),
+        (t(format!("isp{run}xb")), t(format!("isp{run}_b"))),
+        (t(format!("isq{run}")), t(format!("isq{run}x"))),
+        (t(format!("isr{run}")), TenantId::default()),
+    ];
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    for (n, (a, b)) in pairs.iter().enumerate() {
+        for t in [a, b] {
+            pg::ensure_tenant(&pool, t).await.expect("tenant row");
+        }
+        antares_store::contract::run_tenant_isolation_contract(
+            &store,
+            &store,
+            a,
+            b,
+            &format!("pgiso{run}{n}"),
+        )
+        .await;
+    }
 }
 
 /// The tenants the broker mints for itself are not customer accounts, and

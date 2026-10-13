@@ -33,11 +33,14 @@ pub enum Artifact {
     Rdf,
     /// Markdown.
     Markdown,
+    /// The RDF Data Cube structure, only when a kept class is a Data
+    /// Structure Definition (DM-60).
+    Qb,
 }
 
 impl Artifact {
     /// Every document, in the order an agent should read them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::LinkMl,
         Self::JsonSchema,
         Self::Context,
@@ -45,6 +48,7 @@ impl Artifact {
         Self::Owl,
         Self::Rdf,
         Self::Markdown,
+        Self::Qb,
     ];
 
     /// The file name it is published under.
@@ -62,6 +66,7 @@ impl Artifact {
             Self::Owl => "model.owl.ttl",
             Self::Rdf => "model.rdf.ttl",
             Self::Markdown => "model.md",
+            Self::Qb => "model.qb.ttl",
         }
     }
 
@@ -76,22 +81,21 @@ impl Artifact {
             Self::LinkMl => "text/yaml",
             Self::JsonSchema => "application/schema+json",
             Self::Context => "application/ld+json",
-            Self::Shacl | Self::Rdf => "text/turtle",
+            Self::Shacl | Self::Rdf | Self::Qb => "text/turtle",
             Self::Owl => "text/turtle; profile=\"owl\"",
             Self::Markdown => "text/markdown",
         }
     }
 
     /// The document one path segment names: a file name, its short name, or
-    /// `model`, which `accept` picks the formalism of (L7). `model.qb.ttl`
-    /// and `qb` name nothing: the subset holds no Data Structure Definition
-    /// (L6).
+    /// `model`, which `accept` picks the formalism of (L7); `model` never
+    /// picks the cube, which a model has only when it declares one (L6).
     ///
     /// ```
     /// use antares_linkml::Artifact;
     /// assert_eq!(Artifact::of("shacl", ""), Some(Artifact::Shacl));
     /// assert_eq!(Artifact::of("model", "text/yaml"), Some(Artifact::LinkMl));
-    /// assert_eq!(Artifact::of("qb", ""), None);
+    /// assert_eq!(Artifact::of("qb", ""), Some(Artifact::Qb));
     /// ```
     #[must_use]
     pub fn of(segment: &str, accept: &str) -> Option<Self> {
@@ -103,6 +107,7 @@ impl Artifact {
             "model.owl.ttl" | "owl" => Some(Self::Owl),
             "model.rdf.ttl" | "rdf" => Some(Self::Rdf),
             "model.md" | "docs" => Some(Self::Markdown),
+            "model.qb.ttl" | "qb" => Some(Self::Qb),
             "model" => Some(Self::negotiated(accept)),
             _ => None,
         }
@@ -129,8 +134,10 @@ impl Artifact {
         }
     }
 
-    fn render(self, model: &Model) -> String {
-        match self {
+    /// The document of `model`; `None` for the cube of a model that
+    /// declares no Data Structure Definition, which then does not exist.
+    fn render(self, model: &Model) -> Option<String> {
+        Some(match self {
             Self::LinkMl => linkml_model::yaml(model),
             Self::JsonSchema => linkml_model::json_schema(model),
             Self::Context => linkml_model::context(model),
@@ -138,7 +145,8 @@ impl Artifact {
             Self::Owl => linkml_model::owl(model),
             Self::Rdf => linkml_model::rdfs(model),
             Self::Markdown => linkml_model::markdown(model),
-        }
+            Self::Qb => return linkml_model::qb(model),
+        })
     }
 }
 
@@ -168,7 +176,7 @@ impl Rendered {
         let major = major(model.schema().version.as_deref());
         let documents: Vec<(Artifact, Arc<[u8]>)> = Artifact::ALL
             .iter()
-            .map(|a| (*a, Arc::from(a.render(&model).into_bytes())))
+            .filter_map(|a| Some((*a, Arc::from(a.render(&model)?.into_bytes()))))
             .collect();
         let artifacts: Map<String, Value> = documents
             .iter()
@@ -181,7 +189,9 @@ impl Rendered {
         let s = model.schema();
         let mut described = Map::new();
         described.insert("name".into(), json!(s.name));
-        described.insert("version".into(), json!(major));
+        // a number, as the platform's index writes it (the SDK keeps only an integer, T-3963);
+        // `major` holds digits that fit a u64, so the fallback never fires
+        described.insert("version".into(), json!(major.parse::<u64>().unwrap_or(1)));
         described.insert("semver".into(), json!(s.version));
         described.insert("types".into(), json!(s.classes.keys().collect::<Vec<_>>()));
         described.insert("artifacts".into(), Value::Object(artifacts));
@@ -265,11 +275,11 @@ impl Rendered {
     }
 }
 
-/// The leading number of a semantic version, `1` for none.
+/// The leading number of a semantic version, `1` for none or for one past `u64`.
 fn major(version: Option<&str>) -> String {
     version
         .and_then(|v| v.split('.').next())
-        .filter(|m| !m.is_empty() && m.bytes().all(|b| b.is_ascii_digit()))
+        .filter(|m| m.bytes().all(|b| b.is_ascii_digit()) && m.parse::<u64>().is_ok())
         .unwrap_or("1")
         .to_owned()
 }
@@ -412,6 +422,7 @@ mod tests {
         assert_eq!(major(Some("v3")), "1");
         assert_eq!(major(Some(".1")), "1");
         assert_eq!(major(None), "1");
+        assert_eq!(major(Some("99999999999999999999999.0.0")), "1");
     }
 
     #[test]
@@ -471,8 +482,8 @@ mod tests {
         let model = &index["models"][0];
         assert_eq!(index["endpoint"], "v");
         assert_eq!(
-            (model["version"].as_str(), model["redacted"].as_bool()),
-            (Some("3"), Some(true))
+            (model["version"].as_u64(), model["redacted"].as_bool()),
+            (Some(3), Some(true))
         );
         let yaml = r.document(Artifact::LinkMl).expect("yaml");
         assert_eq!(
@@ -481,6 +492,27 @@ mod tests {
         );
         assert_eq!(model["artifacts"]["model.linkml.yaml"]["bytes"], yaml.len());
         assert_eq!(model["artifacts"].as_object().map(Map::len), Some(7));
+    }
+
+    /// The index's `version` is the major as a JSON integer, as the platform's index writes it:
+    /// 1 for a schema with no version, 2 for `2.3.0` (T-3963).
+    #[test]
+    fn the_index_version_is_an_integer() {
+        for (schema, want) in [
+            (&br#"{"id": "https://e.org/s", "name": "s"}"#[..], 1),
+            (
+                &br#"{"id": "https://e.org/s", "name": "s", "version": "2.3.0"}"#[..],
+                2,
+            ),
+        ] {
+            let r = Cache::default()
+                .get("v", &Arc::from(schema), &visible(&[]))
+                .expect("renders");
+            let index: Value = serde_json::from_slice(&r.index).expect("json");
+            assert!(index["models"][0]["version"].is_u64(), "{index}");
+            assert_eq!(index["models"][0]["version"], want);
+            assert_eq!(r.major, want.to_string());
+        }
     }
 
     #[test]

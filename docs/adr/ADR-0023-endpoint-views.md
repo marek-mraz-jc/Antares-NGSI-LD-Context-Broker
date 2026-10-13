@@ -155,6 +155,12 @@ does not list the tenant's contexts by default. A view that shows every
 name (rule 12) hides no term, so it lists them as the root does
 (T-3946). Add, Delete and Reload @context (13.2, 13.5) are writes and
 are offered only when allowlisted.
+The same holds at the root for a caller the engine narrows (T-4009): List
+and Serve @context (13.3, 13.4) take a `Filter` from the engine, read as
+"this caller sees fewer names than the tenant holds", and under one the
+list is the core `@context` alone and a stored `@context` is not found.
+The reference engine answers them with a narrowing unless the caller may
+query every Entity whole.
 
 ### 6. Joins: an out-of-view target is not embedded, its Relationship stays
 

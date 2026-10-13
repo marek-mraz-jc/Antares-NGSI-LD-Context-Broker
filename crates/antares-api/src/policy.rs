@@ -94,6 +94,13 @@ pub const FILTERABLE: [&str; 15] = [
 /// projects is a deny there ([`resolve`], T-3673).
 pub const RECORD_LISTS: [&str; 3] = ["5.8.4", "5.11.5", "5.10.2"];
 
+/// List and Serve @context (5.13.3, 5.13.4). A stored `@context` may define
+/// a term for an Attribute the caller may not see, so a narrowing there,
+/// whatever it holds, says the caller sees fewer names than the tenant
+/// holds: the list is the core `@context` alone and a stored one is not
+/// found (ADR-0023 rule 5, T-4009). [`resolve`] passes it through.
+pub const NAME_READS: [&str; 2] = ["5.13.3", "5.13.4"];
+
 /// Who is asking. The headers are the ones a deployment names for the
 /// seam to carry, copied verbatim and never interpreted: the broker does
 /// not know what a token is. They never leave this process — stripped from every
@@ -392,8 +399,10 @@ impl TimeBound {
         let t = self.at(now);
         let sub = i64::from(t.timestamp_subsec_nanos() % 1_000_000);
         let t = if up && sub > 0 {
-            t.checked_add_signed(chrono::Duration::nanoseconds(1_000_000 - sub))
-                .unwrap_or(t)
+            t.checked_add_signed(chrono::Duration::nanoseconds(
+                1_000_000_i64.saturating_sub(sub),
+            ))
+            .unwrap_or(t)
         } else {
             t
         };
@@ -1118,6 +1127,21 @@ pub trait PolicyEngine: Send + Sync {
         })
     }
 
+    /// The probe a surface lists its operations by (MCP D-3, T-3784): one
+    /// Operation per clause, naming nothing, and each answer says whether
+    /// some request of that clause could be allowed for `subject`, never
+    /// whether this one is. The default decides the empty Operations as
+    /// [`decide_each`](Self::decide_each) would; an engine whose rules need
+    /// a type to answer a read overrides it, so a grant that takes the
+    /// queried types is offered, and a refusal of every request is not.
+    fn offers_each<'a>(
+        &'a self,
+        subject: &'a Subject,
+        ops: &'a [Operation<'a>],
+    ) -> DecisionsFuture<'a> {
+        self.decide_each(subject, ops)
+    }
+
     /// Fires once per notification document per subscription, before the
     /// egress check and the send (ADR-0014 `pre_notify`). Synchronous: it
     /// sits inside the delivery the broker is about to make, and an engine
@@ -1206,7 +1230,7 @@ pub fn resolve(clause: &str, decision: Decision) -> Decision {
         Decision::Filter(f) if RECORD_LISTS.contains(&clause) && f.projects() => Decision::Deny(
             format!("{clause} lists records whole and a narrowing there cannot project"),
         ),
-        Decision::Filter(f) if !FILTERABLE.contains(&clause) => {
+        Decision::Filter(f) if !FILTERABLE.contains(&clause) && !NAME_READS.contains(&clause) => {
             if f.is_empty() {
                 Decision::Allow
             } else if WHOLE_TENANT.contains(&clause) {
@@ -1288,13 +1312,21 @@ pub async fn decide_each(
     subject: &Subject,
     ops: &[Operation<'_>],
 ) -> Vec<Decision> {
+    guarded(engine, ops, || engine.decide_each(subject, ops)).await
+}
+
+/// One batch answer of `engine` to `ops` from `ask`, failing closed as
+/// [`decide_each`] documents, each answer passed through [`resolve`].
+async fn guarded<'a>(
+    engine: &dyn PolicyEngine,
+    ops: &[Operation<'_>],
+    ask: impl FnOnce() -> DecisionsFuture<'a>,
+) -> Vec<Decision> {
     let all = |why: &str| vec![Decision::Deny(why.to_owned()); ops.len()];
     #[cfg(not(target_arch = "wasm32"))]
     let answer = {
         use futures_util::FutureExt as _;
-        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            engine.decide_each(subject, ops)
-        }));
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ask));
         let Ok(fut) = built else {
             tracing::error!("policy engine {} panicked; denying", engine.name());
             metrics::counter!("antares_policy_failures_total", "reason" => "panic").increment(1);
@@ -1322,7 +1354,7 @@ pub async fn decide_each(
         }
     };
     #[cfg(target_arch = "wasm32")]
-    let answer = engine.decide_each(subject, ops).await;
+    let answer = ask().await;
     if answer.len() != ops.len() {
         tracing::error!(
             "policy engine {} answered {} decisions for {} operations; denying",
@@ -1343,12 +1375,10 @@ pub async fn decide_each(
 /// Whether any request of each of `clauses` could be allowed for the caller
 /// of `headers`: one batch-shaped probe a surface lists its operations by
 /// (MCP D-3), never a decision on a request. Each clause is asked as an
-/// Operation that names nothing, through [`decide_each`], so it fails
-/// closed the same way (a panic, a timeout or a short answer hides every
-/// clause), and a narrowing on a clause that cannot be narrowed hides it.
-/// With no engine attached every clause is offered.
-// ponytail: no `PolicyEngine::offers` hook; an engine that has to answer a
-// probe differently from an empty Operation gets one when it exists.
+/// Operation that names nothing, through [`PolicyEngine::offers_each`],
+/// failing closed as [`decide_each`] does (a panic, a timeout or a short
+/// answer hides every clause), and a narrowing on a clause that cannot be
+/// narrowed hides it. With no engine attached every clause is offered.
 pub async fn offers(
     engine: Option<&dyn PolicyEngine>,
     tenant: &antares_model::TenantId,
@@ -1372,7 +1402,8 @@ pub async fn offers(
             stored: None,
         })
         .collect();
-    decide_each(engine, &subject_of(tenant, headers), &ops)
+    let subject = subject_of(tenant, headers);
+    guarded(engine, &ops, || engine.offers_each(&subject, &ops))
         .await
         .into_iter()
         .map(|d| !matches!(d, Decision::Deny(_)))
@@ -1513,7 +1544,7 @@ pub(crate) async fn temporal_pre_image(
 }
 
 /// The image of a stored document, with the types the body adds.
-fn image(stored: Option<Value>, body: Option<&Value>) -> PreImage {
+pub(crate) fn image(stored: Option<Value>, body: Option<&Value>) -> PreImage {
     let mut types: Vec<String> = Vec::new();
     for doc in stored.as_ref().into_iter().chain(body) {
         for t in entity_types(doc) {
@@ -1881,6 +1912,8 @@ pub async fn run_policy_contract(engine: &dyn PolicyEngine) {
             }
             // `decide` answers a condition on anything but a write by id as
             // a deny, so reaching here is the seam's fault, not the engine's.
+            // A contract harness (test-kit) fails by panicking, as asserts do.
+            #[allow(clippy::panic)]
             Decision::AllowIf(_) => panic!("{name}: a condition on {clause} passed the seam"),
         }
     }
@@ -1962,7 +1995,12 @@ impl PolicyEngine for Slow<'_> {
 
     fn decide<'a>(&'a self, subject: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
         Box::pin(async move {
-            tokio::time::sleep(*TIMEOUT * 2 + Duration::from_millis(50)).await;
+            tokio::time::sleep(
+                TIMEOUT
+                    .saturating_mul(2)
+                    .saturating_add(Duration::from_millis(50)),
+            )
+            .await;
             self.0.decide(subject, op).await
         })
     }

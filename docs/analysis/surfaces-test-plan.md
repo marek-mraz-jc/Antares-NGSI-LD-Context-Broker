@@ -138,7 +138,7 @@ CI jobs named below (all in Antares `.github/workflows/`):
   `publish-dev` waits for), `VIEWS_DIFF_SEED` the seed (3777, printed). A failure shrinks and
   prints the minimal case as a corpus file with its own `seed`: commit it with its `expect`
   written by hand and file the fix task. Mismatches with a task filed are listed in `KNOWN_DIFF`
-  (MCP "unknown tool", T-3784).
+  (none since T-3784).
 
 ## 4. Property tests (`proptest` 1.11.0, already a workspace dependency: `Cargo.lock:2329`, used by `antares-sql`)
 
