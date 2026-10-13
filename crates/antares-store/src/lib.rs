@@ -393,6 +393,22 @@ pub trait CurrentStateDriver: Send + Sync {
         kind: Kind,
         id: &str,
     ) -> Result<Option<Value>, NgsiError>;
+    /// Several Entities at once, keyed by id; an absent one has no entry. A
+    /// backend that can read them together overrides this (Postgres: one
+    /// transaction, T-4085); the default reads them one by one.
+    async fn get_entities(
+        &self,
+        tenant: &TenantId,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Value>, NgsiError> {
+        let mut found = std::collections::HashMap::with_capacity(ids.len());
+        for id in ids {
+            if let Some(doc) = self.get(tenant, Kind::Entity, id).await? {
+                found.insert((*id).to_owned(), doc);
+            }
+        }
+        Ok(found)
+    }
     /// Delete one document; `false` if it was absent.
     async fn delete(&self, tenant: &TenantId, kind: Kind, id: &str) -> Result<bool, NgsiError>;
     /// Delete one Entity, but only if `keep` accepts the stored document.
@@ -768,6 +784,93 @@ pub struct TemporalEvent {
     pub instance: Value,
 }
 
+/// [`TemporalDriver::event_list`]'s default: consecutive events of one Entity
+/// become one `temporal_append`; a scope change goes through `mutate`, in
+/// order. A driver that overrides `event_list` falls back to it.
+pub async fn drain_events<D: TemporalDriver + ?Sized>(
+    d: &D,
+    evs: &[TemporalEvent],
+) -> Result<(), NgsiError> {
+    let mut i = 0;
+    while i < evs.len() {
+        let (tenant, id) = (&evs[i].tenant, evs[i].entity_id.as_str());
+        let mut additions = serde_json::Map::new();
+        let mut shell = &evs[i].shell;
+        let mut j = i;
+        while j < evs.len() && evs[j].tenant == *tenant && evs[j].entity_id == id {
+            let ev = &evs[j];
+            shell = &ev.shell;
+            if ev.op == TemporalOp::ScopeChanged {
+                let inst = ev.instance.clone();
+                d.mutate(tenant, id, |doc| {
+                    let target = doc.as_object_mut().ok_or(())?;
+                    match target.get_mut("scope").and_then(Value::as_array_mut) {
+                        Some(arr) if arr.first().is_some_and(Value::is_object) => {
+                            arr.push(inst);
+                        }
+                        _ => {
+                            target.insert("scope".into(), Value::Array(vec![inst]));
+                        }
+                    }
+                    Ok::<(), ()>(())
+                })
+                .await?;
+            } else {
+                if let Some(arr) = additions
+                    .entry(ev.attr.clone())
+                    .or_insert_with(|| Value::Array(Vec::new()))
+                    .as_array_mut()
+                {
+                    arr.push(ev.instance.clone());
+                }
+            }
+            j += 1;
+        }
+        if !additions.is_empty() {
+            d.temporal_append(tenant, id, shell, &Value::Object(additions))
+                .await?;
+        }
+        i = j;
+    }
+    Ok(())
+}
+
+/// A drained request folded into one append per run of consecutive events of
+/// one Entity, as [`TemporalDriver::event_list`]'s default folds it: tenant,
+/// id, the last shell, the additions by Attribute. `None` when an event
+/// changes scope, which goes through `mutate` in order with the appends
+/// (T-4085: a driver that writes several appends at once takes this).
+pub fn fold_appends(evs: &[TemporalEvent]) -> Option<Vec<(&TenantId, &str, &Value, Value)>> {
+    if evs.iter().any(|ev| ev.op == TemporalOp::ScopeChanged) {
+        return None;
+    }
+    let mut out: Vec<(&TenantId, &str, &Value, Value)> = Vec::new();
+    for ev in evs {
+        let same = out
+            .last()
+            .is_some_and(|(t, id, _, _)| **t == ev.tenant && *id == ev.entity_id);
+        if !same {
+            out.push((
+                &ev.tenant,
+                &ev.entity_id,
+                &ev.shell,
+                Value::Object(serde_json::Map::new()),
+            ));
+        }
+        if let Some((_, _, shell, Value::Object(additions))) = out.last_mut() {
+            *shell = &ev.shell;
+            if let Some(arr) = additions
+                .entry(ev.attr.clone())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+            {
+                arr.push(ev.instance.clone());
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Temporal storage: the entity history (Temporal Evolution) plus the raw
 /// temporal documents the 5.6.13-5.6.16 edit paths operate on.
 ///
@@ -782,48 +885,7 @@ pub trait TemporalDriver: Send + Sync {
     /// single `temporal_append` (scope changes go through `mutate`, as
     /// 4.5.6 shapes them); a bulk writer overrides this and sees the batch.
     async fn event_list(&self, evs: &[TemporalEvent]) -> Result<(), NgsiError> {
-        let mut i = 0;
-        while i < evs.len() {
-            let (tenant, id) = (&evs[i].tenant, evs[i].entity_id.as_str());
-            let mut additions = serde_json::Map::new();
-            let mut shell = &evs[i].shell;
-            let mut j = i;
-            while j < evs.len() && evs[j].tenant == *tenant && evs[j].entity_id == id {
-                let ev = &evs[j];
-                shell = &ev.shell;
-                if ev.op == TemporalOp::ScopeChanged {
-                    let inst = ev.instance.clone();
-                    self.mutate(tenant, id, |doc| {
-                        let target = doc.as_object_mut().ok_or(())?;
-                        match target.get_mut("scope").and_then(Value::as_array_mut) {
-                            Some(arr) if arr.first().is_some_and(Value::is_object) => {
-                                arr.push(inst);
-                            }
-                            _ => {
-                                target.insert("scope".into(), Value::Array(vec![inst]));
-                            }
-                        }
-                        Ok::<(), ()>(())
-                    })
-                    .await?;
-                } else {
-                    if let Some(arr) = additions
-                        .entry(ev.attr.clone())
-                        .or_insert_with(|| Value::Array(Vec::new()))
-                        .as_array_mut()
-                    {
-                        arr.push(ev.instance.clone());
-                    }
-                }
-                j += 1;
-            }
-            if !additions.is_empty() {
-                self.temporal_append(tenant, id, shell, &Value::Object(additions))
-                    .await?;
-            }
-            i = j;
-        }
-        Ok(())
+        drain_events(self, evs).await
     }
     /// `false` = this deployment records no history (`NoTemporal`); the
     /// write path skips recording entirely.
@@ -1354,6 +1416,23 @@ mod tests {
     /// The drain folds one request's events into ONE append per entity run
     /// — a 2-attribute entity is one call carrying both, not two — and
     /// keeps production order across entities.
+    #[test]
+    fn fold_appends_is_one_append_per_entity_run_and_none_for_a_scope_change() {
+        let evs = [
+            ev(TemporalOp::AttrCreated, "urn:a", "speed", 1),
+            ev(TemporalOp::AttrCreated, "urn:a", "speed", 2),
+            ev(TemporalOp::AttrCreated, "urn:b", "speed", 3),
+            ev(TemporalOp::AttrCreated, "urn:a", "load", 4),
+        ];
+        let folded = fold_appends(&evs).expect("no scope change");
+        let ids: Vec<&str> = folded.iter().map(|(_, id, _, _)| *id).collect();
+        assert_eq!(ids, ["urn:a", "urn:b", "urn:a"]);
+        assert_eq!(folded[0].3["speed"].as_array().map(Vec::len), Some(2));
+        assert!(fold_appends(&[]).is_some_and(|f| f.is_empty()));
+        let scope = ev(TemporalOp::ScopeChanged, "urn:a", "scope", 5);
+        assert!(fold_appends(&[evs[0].clone(), scope]).is_none());
+    }
+
     #[tokio::test]
     async fn event_list_folds_a_request_into_one_append_per_entity_run() {
         let d = Recorder::default();
