@@ -1156,9 +1156,11 @@ pub(crate) async fn run_request(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
+    let bytes = reads
+        .view
+        .read_answer(answer.into_body())
         .await
-        .unwrap_or_default();
+        .map_err(|refusal| refused(refusal.status(), version))?;
     let docs = serde_json::from_slice::<Value>(&bytes)
         .into_iter()
         .flat_map(|doc| match doc {
@@ -1720,6 +1722,7 @@ pub(crate) fn refused(status: StatusCode, version: ODataVersion) -> ODataErrorRe
         StatusCode::METHOD_NOT_ALLOWED => "MethodNotAllowed",
         StatusCode::BAD_REQUEST => "BadRequest",
         StatusCode::SERVICE_UNAVAILABLE => "ServiceUnavailable",
+        StatusCode::PAYLOAD_TOO_LARGE => "PayloadTooLarge",
         _ => "InternalError",
     };
     ODataErrorResponse::new(status, code, "the request was refused").with_version(version)

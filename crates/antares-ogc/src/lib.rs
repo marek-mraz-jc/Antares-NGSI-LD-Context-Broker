@@ -207,9 +207,14 @@ async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
         return answer;
     }
     let (mut parts, body) = answer.into_parts();
-    let read = axum::body::to_bytes(body, usize::MAX)
-        .await
-        .unwrap_or_default();
+    let Ok(read) = ops.read_answer(body).await else {
+        let (parts, _) = problem(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            antares_ops::bounds::ANSWER_TOO_LARGE,
+        )
+        .into_parts();
+        return Response::from_parts(parts, axum::body::Body::empty());
+    };
     parts.headers.insert(CONTENT_LENGTH, read.len().into());
     Response::from_parts(parts, axum::body::Body::empty())
 }

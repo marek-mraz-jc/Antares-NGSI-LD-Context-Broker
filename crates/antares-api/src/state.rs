@@ -145,6 +145,9 @@ pub struct Shared {
     pub default_limit: usize,
     /// Hard ceiling on limit (TooManyResults guard).
     pub max_limit: usize,
+    /// The most bytes of one in-process answer a handler buffers
+    /// ([`crate::bounds::MAX_ANSWER_BYTES`]).
+    pub max_answer_bytes: usize,
     /// One shared outbound client, timeouts set at construction.
     pub http: antares_jsonld::HttpClient,
     /// Federation-forwarding client — longer deadline: the ETSI mock replies
@@ -503,6 +506,7 @@ impl AppState {
                 host_alias,
                 default_limit: 1000,
                 max_limit: 1000,
+                max_answer_bytes: crate::bounds::MAX_ANSWER_BYTES,
                 http: http.clone(),
                 fed_http: outbound_client(
                     egress_policy,

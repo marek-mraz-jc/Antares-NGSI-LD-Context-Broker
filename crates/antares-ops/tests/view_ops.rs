@@ -46,8 +46,29 @@ impl Surface for Probe {
             }
         };
         let mapped = ops.clone();
+        let reader = ops.clone();
         let named = ops.clone();
         Router::new()
+            .route(
+                "/{view}/read",
+                get(move |Path(id): Path<String>, caller: Caller| {
+                    let ops = reader.clone();
+                    async move {
+                        let Some(view) = ops.view(&id) else {
+                            return antares_ops::Refusal::NotFound.ngsi_ld();
+                        };
+                        let req = OpsRequest::new(Method::GET, "/ngsi-ld/v1/entities?type=Car");
+                        let read = match view.run(OperationId::QueryEntities, &caller, req).await {
+                            Ok(answer) => view.read_answer(answer.into_body()).await,
+                            Err(refusal) => Err(refusal),
+                        };
+                        match read {
+                            Ok(bytes) => bytes.into_response(),
+                            Err(refusal) => refusal.ngsi_ld(),
+                        }
+                    }
+                }),
+            )
             .route(
                 "/{view}/names",
                 get(move |Path(id): Path<String>, RawQuery(query): RawQuery| {
@@ -163,7 +184,10 @@ fn view(attributes: &[&str], operations: &[&str]) -> Value {
 }
 
 async fn broker() -> Result<(TestBroker, Router), String> {
-    let b = TestBroker::new().await?;
+    broker_on(TestBroker::new().await?).await
+}
+
+async fn broker_on(b: TestBroker) -> Result<(TestBroker, Router), String> {
     let app = b.serve(Probe)?;
     for (tenant, id) in [
         ("city", "urn:ngsi-ld:Car:1"),
@@ -330,6 +354,27 @@ async fn a_view_of_another_model_reaches_only_the_surface_that_asks_for_its_mapp
         a.json,
         json!({"view": true, "mapped": null}),
         "a view of the store's own model"
+    );
+}
+
+/// T-3773: a view's answer is read up to the broker's buffer bound; past it
+/// the surface gets `Refusal::Limit`, 413, never the whole body.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_answer_past_the_buffer_bound_is_413() {
+    let (_b, app) = broker().await.expect("broker");
+    let whole = send(&app, Method::GET, "/x/probe/cars/read", &[], None).await;
+    assert_eq!(whole.status, StatusCode::OK, "{}", whole.json);
+    assert_eq!(
+        whole.json.pointer("/0/id"),
+        Some(&json!("urn:ngsi-ld:Car:1"))
+    );
+    let small = TestBroker::with_max_answer_bytes(16).await.expect("broker");
+    let (_b, app) = broker_on(small).await.expect("broker");
+    let a = send(&app, Method::GET, "/x/probe/cars/read", &[], None).await;
+    assert_eq!(a.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", a.json);
+    assert_eq!(
+        a.json.get("detail"),
+        Some(&json!(antares_ops::bounds::ANSWER_TOO_LARGE))
     );
 }
 

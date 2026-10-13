@@ -11,16 +11,11 @@ use axum::http::request::Parts;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::Response;
 
-/// The largest answer the view root rebuilds, in bytes.
-pub const MAX_ANSWER_BYTES: usize = 64 * 1024 * 1024;
-
 /// Why a request that names its own `@context` is refused.
 pub const OWN_CONTEXT: &str =
     "a mapped view names its attributes by its own @context; send no Link header";
 /// Why a `GeoJSON` answer is refused.
 pub const NO_GEOJSON: &str = "a mapped view answers JSON and JSON-LD, not GeoJSON";
-/// Why an answer too large to rebuild is refused.
-pub const TOO_LARGE: &str = "the answer is larger than a mapped view rebuilds";
 
 /// Serve `op` through `view`, whose mapping is `mapping`. `path` is the
 /// request path below the view's API root.
@@ -154,9 +149,7 @@ async fn answer(
 ) -> Result<Response, Refusal> {
     let answer = view.run(op, caller, inner).await?;
     let (mut parts, body) = answer.into_parts();
-    let bytes = axum::body::to_bytes(body, MAX_ANSWER_BYTES)
-        .await
-        .map_err(|_| Refusal::Limit(TOO_LARGE))?;
+    let bytes = view.read_answer(body).await?;
     parts.headers.remove(header::CONTENT_LENGTH);
     if !parts.status.is_success() {
         // the broker words a refusal in the inner request's terms

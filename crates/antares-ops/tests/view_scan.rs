@@ -168,7 +168,10 @@ fn car(n: usize) -> Value {
 }
 
 async fn rig() -> Result<Rig, String> {
-    let broker = TestBroker::new().await?;
+    rig_on(TestBroker::new().await?).await
+}
+
+async fn rig_on(broker: TestBroker) -> Result<Rig, String> {
     let admin = broker.router();
     let view = json!({"id": "cars", "tenant": TENANT, "selector": ["Car"],
         "rules": [{"types": ["Car"], "attributes": ["colour", "speed", "tags"]}],
@@ -500,6 +503,19 @@ async fn scan_without_residual_is_one_page_and_store_errors_pass_through() {
         .body(Body::empty())
         .unwrap_or_default();
     assert_eq!(send(&rig.app, req).await.0, StatusCode::NOT_FOUND);
+}
+
+/// T-3773: a store page larger than the broker buffers for one request is 413, never read whole
+/// into memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_past_the_answer_bound_is_413() {
+    let broker = TestBroker::with_max_answer_bytes(64).await.expect("broker");
+    let rig = rig_on(broker).await.expect("rig");
+    for plan in [(pushdown(), None), (pushdown(), Some(odd()))] {
+        let (s, b) = rig.scan(plan, "size=4").await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{b}");
+        assert_eq!(b["detail"], antares_ops::bounds::ANSWER_TOO_LARGE);
+    }
 }
 
 /// The sorted member names of each served Entity.

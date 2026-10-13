@@ -124,7 +124,7 @@ impl ViewOps {
             page.start
         );
         let (mut batch, total, truncated) =
-            match read(self.query(caller, pushdown, &query).await?).await? {
+            match read(self, self.query(caller, pushdown, &query).await?).await? {
                 Ok(read) => read,
                 Err(answer) => return Ok(Scanned::Answer(answer)),
             };
@@ -174,7 +174,7 @@ impl ViewOps {
         let mut cap = budget;
         if page.whole {
             let counted = format!("{fixed}&limit=0&count=true");
-            match read(self.query(caller, pushdown, &counted).await?).await? {
+            match read(self, self.query(caller, pushdown, &counted).await?).await? {
                 Ok((_, total, _)) => {
                     // no count is no promise the answer fits
                     cap = total.unwrap_or(usize::MAX);
@@ -201,7 +201,7 @@ impl ViewOps {
                 return Ok(served(entities, next, count, (read_so_far, truncated)));
             }
             let query = format!("{fixed}&limit={limit}&offset={offset}");
-            let batch = match read(self.query(caller, pushdown, &query).await?).await? {
+            let batch = match read(self, self.query(caller, pushdown, &query).await?).await? {
                 Ok((batch, _, cut)) => {
                     truncated |= cut;
                     batch
@@ -344,8 +344,9 @@ fn join<'a>(names: impl Iterator<Item = &'a str>) -> String {
 
 /// The Entities of a successful Query Entities answer, its `NGSILD-Results-Count` and whether
 /// it warns its join walk was truncated, or the answer itself when the store answered with
-/// anything but a success.
-async fn read(answer: Response) -> Result<Result<Upstream, Response>, Refusal> {
+/// anything but a success. The body is read up to the broker's answer bound
+/// ([`ViewOps::read_answer`], T-3773).
+async fn read(view: &ViewOps, answer: Response) -> Result<Result<Upstream, Response>, Refusal> {
     if !answer.status().is_success() {
         return Ok(Err(answer));
     }
@@ -359,10 +360,8 @@ async fn read(answer: Response) -> Result<Result<Upstream, Response>, Refusal> {
         .get("NGSILD-Results-Count")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
-    let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
-        .await
-        .ok();
-    match bytes.and_then(|b| serde_json::from_slice(&b).ok()) {
+    let bytes = view.read_answer(answer.into_body()).await?;
+    match serde_json::from_slice(&bytes).ok() {
         Some(Value::Array(entities)) => Ok(Ok((entities, total, truncated))),
         _ => Err(Refusal::Malformed(
             "the store's answer is no list of Entities",
