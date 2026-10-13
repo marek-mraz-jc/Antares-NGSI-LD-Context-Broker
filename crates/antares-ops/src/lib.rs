@@ -800,6 +800,39 @@ pub fn is_core_term(name: &str) -> bool {
     CORE.term(name).is_some()
 }
 
+/// `schema` under the IRIs `shown` names its classes and slots by (T-3752): a class or slot
+/// whose own IRI the view does not show, but whose name read under the core @context it does,
+/// takes that IRI, the one the view, the engine and the stored Entities know it by (a view's
+/// names are read under the core @context, ADR-0020). A schema whose `class_uri` is another
+/// vocabulary's (`sdm:`) then still serves the Entities written with short names.
+///
+/// ```
+/// # use std::collections::{BTreeMap, BTreeSet};
+/// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s/", "name": "s",
+///   "classes": {"Car": {"class_uri": "https://sdm.org/Car"}}, "slots": {"speed": {}}}"#,
+///   &linkml_model::Limits { max_bytes: 999, max_depth: 4, max_elements: 9 }).unwrap();
+/// let core = "https://uri.etsi.org/ngsi-ld/default-context/";
+/// let shown = BTreeMap::from([(format!("{core}Car"), BTreeSet::from([format!("{core}speed")]))]);
+/// let viewed = antares_ops::as_shown(&m, &shown);
+/// assert_eq!(viewed.class_iri("Car"), format!("{core}Car"));
+/// assert_eq!(viewed.slot_iri("speed"), format!("{core}speed"));
+/// ```
+#[must_use]
+pub fn as_shown(
+    schema: &linkml_model::Model,
+    shown: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) -> linkml_model::Model {
+    let attrs: std::collections::BTreeSet<&String> = shown.values().flatten().collect();
+    let by_name = |known: &dyn Fn(&String) -> bool, name: &str, own: &str| {
+        let core = CORE.expand_key(name);
+        (!known(&own.to_owned()) && known(&core)).then_some(core)
+    };
+    schema.renamed(
+        |name, own| by_name(&|iri| shown.contains_key(iri), name, own),
+        |name, own| by_name(&|iri| attrs.contains(iri), name, own),
+    )
+}
+
 /// The core @context, read once.
 static CORE: std::sync::LazyLock<antares_jsonld::Context> =
     std::sync::LazyLock::new(antares_jsonld::core_context);

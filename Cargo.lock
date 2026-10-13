@@ -304,6 +304,7 @@ dependencies = [
  "axum",
  "chrono",
  "http-body-util",
+ "linkml-model",
  "metrics",
  "proptest",
  "serde",

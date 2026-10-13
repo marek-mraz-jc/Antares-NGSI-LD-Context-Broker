@@ -382,12 +382,14 @@ fn collections(view: &ViewOps) -> Option<BTreeMap<String, Collection>> {
     let (_, bytes) = view.schema()?;
     let schema = linkml_model::Model::read(&bytes, &SCHEMA_LIMITS).ok()?;
     // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
-    let shown = if view.shows_every_name() {
-        model::every(&schema)
-    } else {
-        view.shown_by_type()
-    };
-    Some(model::build(&schema, &shown))
+    if view.shows_every_name() {
+        return Some(model::build(&schema, &model::every(&schema)));
+    }
+    let shown = view.shown_by_type();
+    Some(model::build(
+        &antares_ops::as_shown(&schema, &shown),
+        &shown,
+    ))
 }
 
 /// No `Accept`, or one that takes some JSON or anything.
