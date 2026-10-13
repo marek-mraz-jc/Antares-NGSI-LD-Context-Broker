@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "antares-api"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "antares-jsonld",
  "antares-matcher",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "antares-jsonld"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "antares-model",
  "chrono",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "antares-matcher"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "antares-jsonld",
  "antares-model",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "antares-mcp"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "antares-ops",
  "axum",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "antares-model"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "antares-notifier"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "antares-jsonld",
  "antares-model",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "antares-ops"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "antares-api",
  "antares-jsonld",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "antares-ql"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "antares-jsonld",
  "antares-model",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "antares-residual"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "geo",
  "regex",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "antares-sql"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "antares-model",
  "antares-ql",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "antares-store"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "antares-jsonld",
  "antares-model",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "antares-ws"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "antares-ops",
  "axum",
@@ -1379,7 +1379,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "linkml-model"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "odata-batch"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "memchr",
  "serde_json",
@@ -1482,14 +1482,14 @@ dependencies = [
 
 [[package]]
 name = "odata-csdl"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "regex",
 ]
 
 [[package]]
 name = "odata-json"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "odata-csdl",
  "odata-url",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "odata-url"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "odata-csdl",
 ]

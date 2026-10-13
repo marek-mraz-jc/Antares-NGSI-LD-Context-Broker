@@ -2,6 +2,8 @@
 //! JSON-LD layer — hand-rolled NGSI-LD-subset processor: context processing,
 //! expansion with structural validation, compaction, caching loader with
 //! pinned core contexts.
+//!
+#![doc = include_str!("../README.md")]
 // T-3468: every surface calls into this crate on a request path, where a
 // panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
 // index out of bounds or overflow.

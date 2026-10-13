@@ -210,3 +210,10 @@ path = "fuzz_targets/residual_compile.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "model_names"
+path = "fuzz_targets/model_names.rs"
+test = false
+doc = false
+bench = false
