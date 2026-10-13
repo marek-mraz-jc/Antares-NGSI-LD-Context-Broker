@@ -9,7 +9,7 @@ use antares_ops::{Caller, OperationId, Ops, OpsRequest, Surface};
 use axum::body::Body;
 use axum::extract::{Path, RawQuery};
 use axum::http::{HeaderValue, Method, Request, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use http_body_util::BodyExt;
@@ -52,21 +52,7 @@ impl Surface for Probe {
             .route(
                 "/{view}/read",
                 get(move |Path(id): Path<String>, caller: Caller| {
-                    let ops = reader.clone();
-                    async move {
-                        let Some(view) = ops.view(&id) else {
-                            return antares_ops::Refusal::NotFound.ngsi_ld();
-                        };
-                        let req = OpsRequest::new(Method::GET, "/ngsi-ld/v1/entities?type=Car");
-                        let read = match view.run(OperationId::QueryEntities, &caller, req).await {
-                            Ok(answer) => view.read_answer(answer.into_body()).await,
-                            Err(refusal) => Err(refusal),
-                        };
-                        match read {
-                            Ok(bytes) => bytes.into_response(),
-                            Err(refusal) => refusal.ngsi_ld(),
-                        }
-                    }
+                    read_whole(reader.clone(), id, caller)
                 }),
             )
             .route(
@@ -142,6 +128,22 @@ impl Surface for Probe {
                     "/ngsi-ld/v1/entities?type=Car",
                 )),
             )
+    }
+}
+
+/// The view's Cars read whole through [`antares_ops::ViewOps::read_answer`] (T-3773).
+async fn read_whole(ops: Ops, id: String, caller: Caller) -> Response {
+    let Some(view) = ops.view(&id) else {
+        return antares_ops::Refusal::NotFound.ngsi_ld();
+    };
+    let req = OpsRequest::new(Method::GET, "/ngsi-ld/v1/entities?type=Car");
+    let read = match view.run(OperationId::QueryEntities, &caller, req).await {
+        Ok(answer) => view.read_answer(answer.into_body()).await,
+        Err(refusal) => Err(refusal),
+    };
+    match read {
+        Ok(bytes) => bytes.into_response(),
+        Err(refusal) => refusal.ngsi_ld(),
     }
 }
 
