@@ -290,7 +290,7 @@ pub enum Func {
 impl Func {
     /// How many arguments the function takes, at least and at most.
     #[must_use]
-    pub(crate) fn arity(self) -> (usize, usize) {
+    pub fn arity(self) -> (usize, usize) {
         match self {
             Self::Now | Self::MinDateTime | Self::MaxDateTime => (0, 0),
             Self::Length
