@@ -383,11 +383,11 @@ fn collections(view: &ViewOps) -> Option<BTreeMap<String, Collection>> {
     let schema = linkml_model::Model::read(&bytes, &SCHEMA_LIMITS).ok()?;
     // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
     if view.shows_every_name() {
-        return Some(model::build(&schema, &model::every(&schema)));
+        return Some(model::build(&schema, &schema.slot_iris_by_class()));
     }
     let shown = view.shown_by_type();
     Some(model::build(
-        &antares_ops::as_shown(&schema, &shown),
+        &schema.as_shown(&shown, antares_ops::core_iri),
         &shown,
     ))
 }
@@ -404,23 +404,7 @@ fn acceptable(headers: &HeaderMap) -> bool {
         })
 }
 
-/// A path segment percent-decoded, if it decodes to UTF-8.
-fn decode(segment: &str) -> Option<String> {
-    let bytes = segment.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while let Some(&b) = bytes.get(i) {
-        if b == b'%' {
-            let hex = segment.get(i.saturating_add(1)..i.saturating_add(3))?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
-            i = i.saturating_add(3);
-        } else {
-            out.push(b);
-            i = i.saturating_add(1);
-        }
-    }
-    String::from_utf8(out).ok()
-}
+use antares_ops::percent::decoded as decode;
 
 /// The link object of Part 1 (`rel`, `type`, `href`, Req 29).
 fn link(rel: &str, media: &str, href: &str) -> Value {

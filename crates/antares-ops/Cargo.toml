@@ -21,7 +21,6 @@ antares-jsonld = { workspace = true }
 antares-model = { workspace = true }
 antares-ql = { workspace = true }
 antares-residual = { workspace = true }
-linkml-model = { path = "../linkml-model" }
 axum = { version = "0.8", default-features = false, features = ["json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 metrics = { version = "0.24", default-features = false }

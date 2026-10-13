@@ -504,7 +504,7 @@ impl Program {
     ///
     /// # Errors
     ///
-    /// As [`eval`].
+    /// As [`Self::eval`].
     pub fn value(&self, entity: &Value) -> Result<Option<Value>, Error> {
         eval::run_value(&self.root, entity)
     }

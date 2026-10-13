@@ -197,7 +197,8 @@ async fn a_schema_of_another_vocabulary_serves_the_entities_the_view_names() -> 
     let a = get(&app, "/x/views/bikes/ogc/features/collections").await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     assert_eq!(
-        a.body["collections"][0]["id"], "Station",
+        a.body.pointer("/collections/0/id").and_then(Value::as_str),
+        Some("Station"),
         "listed by the name the view shows: {}",
         a.body
     );
@@ -213,9 +214,17 @@ async fn a_schema_of_another_vocabulary_serves_the_entities_the_view_names() -> 
         "{}",
         a.body
     );
-    let feature = &a.body["features"][0];
-    assert_eq!(feature["geometry"]["type"], "Point", "{feature}");
-    assert_eq!(feature["properties"]["bikes"], 4, "{feature}");
+    let feature = a.body.pointer("/features/0").cloned().unwrap_or_default();
+    assert_eq!(
+        feature.pointer("/geometry/type").and_then(Value::as_str),
+        Some("Point"),
+        "{feature}"
+    );
+    assert_eq!(
+        feature.pointer("/properties/bikes").and_then(Value::as_i64),
+        Some(4),
+        "{feature}"
+    );
     drop(broker);
     Ok(())
 }

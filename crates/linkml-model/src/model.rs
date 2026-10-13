@@ -389,6 +389,39 @@ impl Model {
         Self { schema }
     }
 
+    /// The model under the IRIs `shown` (type IRI to Attribute IRIs) knows its classes and
+    /// slots by (T-3752): a class or slot whose own IRI `shown` lacks, but whose name under
+    /// `expand` it holds, takes that IRI. A reader whose names are short names read under
+    /// another @context than the schema's vocabulary (a broker view's, ADR-0020) then still
+    /// finds them.
+    ///
+    /// ```
+    /// # use std::collections::{BTreeMap, BTreeSet};
+    /// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s/", "name": "s",
+    ///   "classes": {"Car": {"class_uri": "https://sdm.org/Car"}}, "slots": {"speed": {}}}"#,
+    ///   &linkml_model::Limits { max_bytes: 999, max_depth: 4, max_elements: 9 }).unwrap();
+    /// let shown = BTreeMap::from([("v:Car".to_owned(), BTreeSet::from(["v:speed".to_owned()]))]);
+    /// let viewed = m.as_shown(&shown, |name| format!("v:{name}"));
+    /// assert_eq!(viewed.class_iri("Car"), "v:Car");
+    /// assert_eq!(viewed.slot_iri("speed"), "v:speed");
+    /// ```
+    #[must_use]
+    pub fn as_shown(
+        &self,
+        shown: &BTreeMap<String, std::collections::BTreeSet<String>>,
+        expand: impl Fn(&str) -> String,
+    ) -> Self {
+        let attrs: std::collections::BTreeSet<&String> = shown.values().flatten().collect();
+        let by_name = |known: &dyn Fn(&String) -> bool, name: &str, own: &str| {
+            let short = expand(name);
+            (!known(&own.to_owned()) && known(&short)).then_some(short)
+        };
+        self.renamed(
+            |name, own| by_name(&|iri| shown.contains_key(iri), name, own),
+            |name, own| by_name(&|iri| attrs.contains(iri), name, own),
+        )
+    }
+
     /// What a slot's range names; `string` when it states none.
     ///
     /// ```
@@ -441,6 +474,25 @@ impl Model {
     #[must_use]
     pub fn class_slots(&self, class: &str) -> Vec<(&str, Slot)> {
         class_slots(&self.schema, class)
+    }
+
+    /// Every class IRI with the IRIs of every slot it has, inherited ones
+    /// included: what a view of `*` shows (ADR-0023 rule 12), in the shape
+    /// a surface intersects a view's narrowing with.
+    #[must_use]
+    pub fn slot_iris_by_class(&self) -> BTreeMap<String, std::collections::BTreeSet<String>> {
+        self.schema
+            .classes
+            .keys()
+            .map(|class| {
+                let slots = self
+                    .class_slots(class)
+                    .iter()
+                    .map(|(slot, _)| self.slot_iri(slot))
+                    .collect();
+                (self.class_iri(class), slots)
+            })
+            .collect()
     }
 }
 
