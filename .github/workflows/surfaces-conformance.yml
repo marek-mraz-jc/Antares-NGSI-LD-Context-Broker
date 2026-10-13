@@ -2,9 +2,9 @@ name: surfaces-conformance
 
 # The surfaces' conformance jobs (docs/analysis/surfaces-conformance.md
 # section 7). This file holds the MCP pair (T-3516), the OData suites
-# (T-3510, T-3714), the OGC ETS (T-3747), etsi-iop (T-3675), ws-conformance
-# (T-3518), linkml-conformance (T-3512) and etsi-full-all (T-3501); the other
-# surfaces add their jobs here.
+# (T-3510, T-3714), the OGC ETS (T-3747), etsi-iop (T-3675),
+# ws-conformance (T-3518), linkml-conformance (T-3512) and etsi-full-all
+# (T-3501); the other surfaces add their jobs here.
 #
 #   mcp-conformance  the official @modelcontextprotocol/conformance 0.1.16
 #                    against /x/views/all/mcp, both revisions it knows that

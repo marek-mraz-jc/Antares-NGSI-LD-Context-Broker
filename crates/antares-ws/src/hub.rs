@@ -4,7 +4,7 @@
 //! admission bounds (rule 10).
 
 use crate::envelope;
-use crate::limits::Limits;
+use crate::limits::{Limits, MAX_NOTIFICATION_BYTES};
 use antares_ops::{Caller, Ops, Outbound};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,11 +14,6 @@ use tokio::sync::Notify;
 
 /// The endpoint URI prefix of a connection (rule 4).
 pub const ENDPOINT_PREFIX: &str = "urn:antares:ws:";
-
-/// The largest notification one connection is sent: the writer's buffer is
-/// bounded by it (threat F8), and a notification above it is a failed
-/// delivery the Subscription records, never a partial write.
-pub const MAX_NOTIFICATION_BYTES: usize = 1024 * 1024;
 
 /// The digits of `u64::MAX`, the longest seq a notification can carry.
 const U64_MAX_DIGITS: usize = 20;

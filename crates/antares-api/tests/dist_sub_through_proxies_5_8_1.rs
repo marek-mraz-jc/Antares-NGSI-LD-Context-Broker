@@ -188,6 +188,20 @@ async fn a_subscription_crosses_two_organizations_through_four_proxy_hops() {
         "the copy must not carry the subscriber's own Subscription id: {copy}"
     );
 
+    // The proxy records the copy before the provider has stored it: wait
+    // until the provider lists it, or the write below can fire nothing.
+    let deadline = 200 * antares_api::state::slow_factor();
+    let mut stored = false;
+    for _ in 0..deadline {
+        let (code, list) = send(&provider, "GET", "/ngsi-ld/v1/subscriptions", None).await;
+        if code == StatusCode::OK && list.as_array().is_some_and(|l| !l.is_empty()) {
+            stored = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(stored, "the provider never stored the forwarded copy");
+
     // A write inside the provider organization fires the copy, the
     // notification comes back through the return chain, and the consumer
     // delivers it to the subscriber under the id the subscriber created.

@@ -406,6 +406,48 @@ Stated so they are not rediscovered. Each is measured, not guessed.
     `sweep_expired_registrations` against `sweep_expired_maps`: the same
     walk, collect and delete over a different `Kind` and liveness
     predicate).
+- Re-measured 2026-10-12 (T-4020) at 94 clones over 1156 lines, 28
+  signature groups and 43 names in more than one crate. Nightly rustdoc
+  refused three ambiguous `eval` links in `antares-residual` from 10-11 on
+  (T-3984 fixed them), so the gate again stopped before it measured while
+  the surface crates landed (`antares-ogc`, `ogc-cql2`, `antares-residual`,
+  `antares-icsr`, `antares-ws`, `antares-mcp` growth). What was one rule
+  written twice is merged: percent-coding is `antares_ops::percent` for
+  OData, OGC and MCP; the every-slot map a `*` view shows is
+  `linkml_model::Model::slot_iris_by_class`; `policy::Condition` is
+  `repr::PolicyReach`, the one selection a narrowing makes; OData's two
+  dispatchers moved into `route`, which also broke the module cycle
+  `read`/`write`/`below`/`paths` (and `antares-ws` keeps
+  `MAX_NOTIFICATION_BYTES` in `limits`, breaking `hub`/`limits`). What the
+  new floor holds beyond 10-10:
+  - 52 lines are benchmark fixtures (`benches/` of `antares-mcp`,
+    `antares-ops`, `antares-linkml`, `antares-icsr`, `antares-ws`): each
+    bench builds its own broker state, and a shared bench crate would be a
+    workspace member for setup code alone.
+  - 24 lines are `linkml_model::RawSchema` mirroring `Schema`: serde's
+    `try_from` reads the raw form with `deny_unknown_fields` and the two
+    declarations the subset implies, then checks them; the mirror is the
+    price of refusing unknown members.
+  - The rest are the surface crates' own entry points and token codecs:
+    `serve`, `respond`, `routes`, `problem`, `read_token`, `digest` and
+    `parse` exist once per protocol (OData, OGC API Features, MCP, the
+    WebSocket and view roots) because each answers its own wire format.
+    The paging tokens differ in what they bind (OData's remaining `$top`,
+    OGC's part index, MCP's tool and arguments), so one codec would carry
+    every protocol's fields. Same-name and same-signature groups of this
+    kind are the per-crate vocabulary, not repetition; MCP's `encode`
+    keeps `:` unescaped on purpose and stays its own.
+- Re-measured again 2026-10-12 with dev's retention and residual-scan work
+  merged (T-4020): clones stay at 94 over 1156 lines. Two new clones were
+  merged. Reading a stored schema or retention document is
+  `views::stored_json`, and the memory store's expiry prune and retention
+  sweep share `attribute_names`. Names in more than one crate rose from 43
+  to 48 by five words that each crate uses for its own job: `params` (OGC's
+  items query against the scan's pushdown string), `refusal` and `refused`
+  (an OData filter error, a view's 405/422/404, a retention document's
+  refusal), `retain` (the retention run, the outbox drain, one bounded
+  retention statement) and `selection` (temporal `attrs`/`pick` against
+  OData's entity selection). No two of them take or return the same thing.
 
 ## 9. To change X, touch Y
 
