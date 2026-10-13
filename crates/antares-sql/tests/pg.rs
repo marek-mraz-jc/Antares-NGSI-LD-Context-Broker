@@ -129,7 +129,7 @@ async fn rls_denies_cross_tenant_reads_and_writes() {
     // Non-superuser app role (idempotent), least privilege on the data tables.
     for stmt in [
         "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
-         EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
         "GRANT USAGE ON SCHEMA public TO antares_app",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
     ] {
@@ -222,7 +222,7 @@ async fn rls_scopes_hosted_contexts_and_shares_cached_ones() {
     let admin = pg::connect(&url, 5).await.expect("connect");
     for stmt in [
         "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
-         EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
         "GRANT USAGE ON SCHEMA public TO antares_app",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
     ] {
