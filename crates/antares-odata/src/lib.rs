@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod apply;
 mod batch;
 mod below;
 pub mod edm;
@@ -26,6 +27,7 @@ mod filter;
 mod names;
 mod paths;
 mod read;
+mod route;
 mod write;
 
 use antares_ops::{Caller, OperationId, Ops, Surface, ViewOps};
@@ -160,7 +162,7 @@ async fn respond(ops: &Ops, mut req: Request) -> Response {
                       request: ODataRequest,
                       headers: HeaderMap,
                       body: Bytes| async move {
-                    read::serve(&reads, &method, &caller, &request, &headers, &body).await
+                    route::serve(&reads, &method, &caller, &request, &headers, &body).await
                 },
             )
             .with_state(state.clone()),
@@ -170,7 +172,7 @@ async fn respond(ops: &Ops, mut req: Request) -> Response {
     if req.method() == Method::POST && req.uri().path() == format!("{inner_root}$batch") {
         let path_root = format!("{PREFIX}{inner_root}");
         let roots = (path_root.as_str(), inner_root.as_str());
-        return batch::serve(&routed, roots, req, state.url_limits.max_query_len).await;
+        return batch::serve(&routed, ops, roots, req, state.url_limits.max_query_len).await;
     }
     let Ok(resp) = routed.oneshot(req).await;
     resp
@@ -284,15 +286,16 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
     }
     let schema = parsed(revision, &bytes)?;
     // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
-    let every = view.shows_every_name().then(|| edm::every(&schema));
-    let edm = edm::build(
-        id,
-        &schema,
-        every.as_ref().unwrap_or(&key.1),
-        key.2,
-        version,
-    )
-    .ok()?;
+    let every = view.shows_every_name().then(|| schema.slot_iris_by_class());
+    // A view's names are the Entities' IRIs; the schema's may be another vocabulary's.
+    let viewed;
+    let schema = if every.is_some() {
+        &*schema
+    } else {
+        viewed = schema.as_shown(&key.1, antares_ops::core_iri);
+        &viewed
+    };
+    let edm = edm::build(id, schema, every.as_ref().unwrap_or(&key.1), key.2, version).ok()?;
     tracing::debug!(
         view = id,
         schema_revision = revision,

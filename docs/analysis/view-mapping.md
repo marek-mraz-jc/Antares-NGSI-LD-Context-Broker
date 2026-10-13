@@ -160,7 +160,7 @@ T-3669 implements sections 3 to 7 in `crates/antares-ops/src/mapping.rs` and `cr
 
 - **Names.** IR names are expanded through the view's `@context` over the core at load, and the target model's terms are the view's own. A request to a mapped view that sends a `Link` header is 400.
 - **The inner request.** The inner request runs under an inline `@context` (`OpsRequest::context`) of generated terms (`jcSrc0`, …, `jcSrcClass`), one per source IRI. A `q` name is a 7.2.3.2 name, so no IRI can appear in it. The rebuild reads each source Attribute under the key the broker compacts it to under that context.
-- **Other surfaces.** `Ops::view` returns `None` for a mapped view, so OData, MCP and WebSocket answer it as an unknown view. Only the view root takes it, through `Ops::mapped_view`.
+- **Other surfaces.** `Ops::view` returns `None` for a mapped view, so OData, OGC and WebSocket answer it as an unknown view. The view root and MCP take it through `Ops::mapped_view`, and `ViewOps::run` inverts and rebuilds for both (`crates/antares-ops/src/mapped.rs`, T-3817): MCP offers the reads of `mapping::READS` alone, and its input schemas name the target class and the slots the view can produce (`ViewOps::target_names`).
 - **Selector.** A mapped view's `selector` is the mapping's `sourceClass` and nothing else, which is stricter than section 3. Any other type would be served rebuilt as the target class.
 - **`valueMappings` inversion.** `==x` inverts to every key whose forward value is x, plus x itself when x is no key of the table. This is the precise form of the 4.2 cell: a value outside the table passes unchanged.
 - **`geoproperty` and `orderBy`.**

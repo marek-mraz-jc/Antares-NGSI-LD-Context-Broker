@@ -1544,7 +1544,7 @@ pub(crate) async fn temporal_pre_image(
 }
 
 /// The image of a stored document, with the types the body adds.
-fn image(stored: Option<Value>, body: Option<&Value>) -> PreImage {
+pub(crate) fn image(stored: Option<Value>, body: Option<&Value>) -> PreImage {
     let mut types: Vec<String> = Vec::new();
     for doc in stored.as_ref().into_iter().chain(body) {
         for t in entity_types(doc) {
@@ -1707,15 +1707,10 @@ fn record_image(doc: &Value) -> Value {
 /// ([`Decision::AllowIf`]), in the form a stored document is read in. The
 /// handler checks it inside the store's own read-modify-write, on the
 /// document the store is about to change.
-#[derive(Debug)]
-pub(crate) struct Condition {
-    q: Option<QNode>,
-    scope_q: Option<String>,
-    areas: Vec<GeoQuery>,
-    /// The rules with type and Attribute names expanded, the form a stored
-    /// document is in.
-    pub(crate) rules: Option<std::sync::Arc<Filter>>,
-}
+///
+/// The same selection a read's narrowing makes ([`crate::repr::PolicyReach`]),
+/// judged synchronously on one document.
+pub(crate) type Condition = crate::repr::PolicyReach;
 
 impl Condition {
     /// The selection `f` makes, whatever it projects.

@@ -38,11 +38,13 @@ pub enum Search {
     Or(Box<Search>, Box<Search>),
 }
 
-/// The value of `$search` after its `=`, up to the end of the option.
+/// The value of `$search` after its `=`, up to the end of the option; inside `$apply`'s
+/// `search(...)` (`closed`), up to its `CLOSE`.
 pub(crate) fn search(
     c: &mut Cursor<'_>,
     limits: &Limits,
     nodes: &mut usize,
+    closed: bool,
 ) -> Result<Search, UrlError> {
     c.bws();
     let mut p = Parser {
@@ -57,7 +59,12 @@ pub(crate) fn search(
         p.or()?
     };
     p.c.bws();
-    if !(p.c.at_end() || p.c.peek() == Some(b'&')) {
+    let end = if closed {
+        p.at_close()
+    } else {
+        p.c.at_end() || p.c.peek() == Some(b'&')
+    };
+    if !end {
         return Err(p.c.syntax("searchExpr"));
     }
     Ok(found)

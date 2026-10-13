@@ -1,8 +1,8 @@
 {
  "counts": {
   "FAIL": 393,
-  "PASS": 738,
-  "SKIP": 75
+  "PASS": 739,
+  "SKIP": 74
  },
  "results": {
   "[V4.01] 11.2.12_query_schemaversion :: $metadata accepts $schemaversion=*": "SKIP",
@@ -351,7 +351,7 @@
   "[V4] 11.2.5.1_query_filter :: $filter with gt operator": "PASS",
   "[V4] 11.2.5.1_query_filter :: $filter with parentheses": "PASS",
   "[V4] 11.2.5.2_query_select_orderby :: $orderby ascending": "PASS",
-  "[V4] 11.2.5.2_query_select_orderby :: $orderby ascending on a nullable property places nulls first and orders non-nulls": "SKIP",
+  "[V4] 11.2.5.2_query_select_orderby :: $orderby ascending on a nullable property places nulls first and orders non-nulls": "PASS",
   "[V4] 11.2.5.2_query_select_orderby :: $orderby descending": "PASS",
   "[V4] 11.2.5.2_query_select_orderby :: $orderby with multiple properties": "PASS",
   "[V4] 11.2.5.2_query_select_orderby :: $select with multiple properties": "FAIL",

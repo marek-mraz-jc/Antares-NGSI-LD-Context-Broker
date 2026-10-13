@@ -30,6 +30,7 @@
 - [Storage drivers](storage.md)
 - [Conformance](conformance.md)
 - [OData compliance](odata-compliance.md)
+- [OGC API - Features compliance](ogc-compliance.md)
 - [Performance](performance.md)
 - [Performance baseline](perf-baseline.md)
 - [Coverage](coverage.md)

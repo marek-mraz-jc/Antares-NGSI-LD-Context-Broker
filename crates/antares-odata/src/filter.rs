@@ -88,15 +88,37 @@ pub(crate) struct Translated {
     pub(crate) sort_reads: Vec<String>,
     /// Whether the surface sort reads `createdAt` or `modifiedAt`.
     pub(crate) sort_system: bool,
+    /// The keys of a pushed `orderBy`, for a read that finds an Entity
+    /// lacking one and sorts on the surface instead (T-3853).
+    pub(crate) pushed_keys: Vec<SortKey>,
     /// The `ngsild.*` parameters pushed beside the rest (`&scopeQ=…`,
     /// `&georel=…`), encoded (ADR-0028 rule 6).
     pub(crate) ngsild: String,
     /// The `$compute` items as residual values, name and value, in the
     /// request's order (Q16).
     pub(crate) computed: Vec<(String, RExpr)>,
+    /// The Edm type of each computed value, in the order of `computed`.
+    pub(crate) computed_types: Vec<&'static str>,
     /// The Attribute terms the computed values read, for the pushdown's
     /// `attrs`.
     pub(crate) computed_reads: Vec<String>,
+}
+
+impl Translated {
+    /// What selects the Entities, without the order, the residual or the
+    /// surface sort: the base of a count that asks about the same answer.
+    pub(crate) fn probe(&self) -> Self {
+        Self {
+            q: self.q.clone(),
+            ids: self.ids.clone(),
+            context: self.context.clone(),
+            linked: self.linked,
+            geo: self.geo.clone(),
+            expand_values: self.expand_values.clone(),
+            ngsild: self.ngsild.clone(),
+            ..Self::default()
+        }
+    }
 }
 
 /// One key of a surface sort (Q9, ADR-0028 rule 5).
@@ -358,6 +380,7 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
         })
         .collect();
     out.order = Some(pushed.join(","));
+    out.pushed_keys = keys;
     Ok(())
 }
 
@@ -384,8 +407,9 @@ pub(crate) fn compute(
         lambdas: Vec::new(),
     };
     for item in items {
-        let (value, _) = terms.residual_value(&item.expr)?;
+        let (value, edm) = terms.residual_value(&item.expr)?;
         out.computed.push((item.alias.clone(), value));
+        out.computed_types.push(edm);
     }
     for (_, program) in computed(out, now)? {
         for term in program.attributes() {
@@ -1350,6 +1374,20 @@ pub(crate) fn program(t: &Translated, now: DateTime) -> Result<Option<residual::
         many => RExpr::And(many.to_vec()),
     };
     compiled(&conjuncts, now).map(Some)
+}
+
+/// The residual of `t` as one program that holds for every Entity when `t` has none: a read
+/// of the whole answer.
+///
+/// # Errors
+/// As [`program`].
+pub(crate) fn whole(t: &Translated, now: DateTime) -> Result<residual::Program, Refused> {
+    compiled(&RExpr::And(t.residual.clone()), now)
+}
+
+/// Whether the Edm type `edm` is a number's.
+pub(crate) fn numeric(edm: &str) -> bool {
+    takes_arg(NUMBER, edm).is_ok()
 }
 
 /// `e` compiled under the evaluator's bounds.

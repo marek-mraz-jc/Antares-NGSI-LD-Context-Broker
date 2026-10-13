@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Coverage gate for the surfaces epic's new crates (surfaces-test-plan section 1, T-3491).
 
-Every crate whose `[package.metadata.antares] role` is `ops`, `surface` or `protocol` must cover
+Every crate whose `[package.metadata.antares] role` is `ops`, `surface`, `protocol` or `ngsild` must cover
 100 % of its lines and branches, minus what `ci/coverage-exclusions.toml` lists by crate, file and
 function with the uncovered line and branch counts and a reason. The list cannot rot: an entry
 whose function is gone, or whose counts no longer match what is uncovered there, is red too.
@@ -25,7 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 EXCLUSIONS = ROOT / "ci/coverage-exclusions.toml"
-ROLES = {"ops", "surface", "protocol"}
+ROLES = {"ops", "surface", "protocol", "ngsild"}
 
 
 def mangled(path: str) -> str:
@@ -142,7 +142,7 @@ def main() -> int:
     entries = exclusions()
     crates = new_crates()
     if not crates:
-        print("coverage-surfaces: no new crates (none has metadata.antares.role ops, surface or protocol)")
+        print("coverage-surfaces: no new crates (none has metadata.antares.role ops, surface, protocol or ngsild)")
         return 0
     errors = []
     for crate in crates:

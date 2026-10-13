@@ -259,6 +259,8 @@ async fn a_count_or_a_surface_sort_over_the_budget_is_400_and_a_page_is_served(
         format!("{ROOT}/Car?{filter}&$count=true"),
         format!("{ROOT}/Car/$count?{filter}"),
         format!("{ROOT}/Car?$orderby=createdAt"),
+        // an aggregate reads the whole answer: refused past the bound, never one over a part
+        format!("{ROOT}/Car?$apply=aggregate($count%20as%20n)"),
     ] {
         let answer = get(&app, &uri, &[]).await;
         assert_eq!(
@@ -469,33 +471,101 @@ async fn a_token_of_the_earlier_form_or_an_edited_cursor_is_handled() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_scanned_read_beside_a_join_stays_501_and_references_are_served() -> Result<(), String> {
+async fn a_scanned_read_beside_a_join_serves_the_expansion() -> Result<(), String> {
+    // T-3823: the scan reads the store's truncation warning, so a residual, a residual count
+    // and a surface sort may expand entities and follow a hop
     let (_b, app) = broker(CARS).await?;
     let residual = "$filter=not%20(speed%20gt%2020)";
-    // T-3823: the scan cannot see a truncated join walk, so no partial expansion is served
-    for uri in [
-        format!("{ROOT}/Car?{residual}&$expand=follows"),
-        format!("{ROOT}/Car?$orderby=createdAt&$expand=follows"),
-        format!("{ROOT}/Car?$count=true&{residual}&$expand=follows($select=label)"),
-    ] {
-        let answer = get(&app, &uri, &[]).await;
-        assert_eq!(
-            answer.status,
-            StatusCode::NOT_IMPLEMENTED,
-            "{uri}: {}",
-            answer.body
-        );
-    }
-    // a reference is no join, and a join without a residual is served as before
-    for uri in [
-        format!("{ROOT}/Car?{residual}&$expand=follows/$ref"),
-        format!("{ROOT}/Car?$filter=speed%20gt%2020&$expand=follows"),
+    let want = expected(|n| speed(n).is_none_or(|s| s <= 20));
+    for (uri, want) in [
+        (format!("{ROOT}/Car?{residual}&$expand=follows&$top=1000"), &want),
+        (format!("{ROOT}/Car?$orderby=createdAt&$expand=follows&$top=1000"), &expected(|_| true)),
+        (
+            format!("{ROOT}/Car?$count=true&{residual}&$expand=follows($select=label)&$top=1000"),
+            &want,
+        ),
+        (format!("{ROOT}/Car?{residual}&$expand=follows/$ref&$top=1000"), &want),
+        // every Car follows Car 1, of speed 1: a hop beside a residual
+        (
+            format!("{ROOT}/Car?$filter=follows/speed%20ge%201%20and%20not%20(speed%20gt%2020)&$top=1000"),
+            &want,
+        ),
     ] {
         let answer = get(&app, &uri, &[]).await;
         assert_eq!(answer.status, StatusCode::OK, "{uri}: {}", answer.body);
-        let first = answer.body.get("value").and_then(|v| v.get(0));
+        assert_eq!(ids(&answer.body), *want, "{uri}");
+        if uri.contains("$expand") {
+            let follows = &answer.body["value"][0]["follows"];
+            assert!(!follows.is_null(), "{uri}: {}", answer.body);
+        }
+    }
+    let counted = get(
+        &app,
+        &format!("{ROOT}/Car?$count=true&{residual}&$expand=follows"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        counted.body["@odata.count"],
+        json!(want.len()),
+        "{}",
+        counted.body
+    );
+    let label = get(
+        &app,
+        &format!("{ROOT}/Car?{residual}&$expand=follows($select=label)"),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        label.body["value"][0]["follows"]["label"], "car 1",
+        "{}",
+        label.body
+    );
+    // a system member selected inside the expansion is read with sysAttrs through the scan
+    let created = get(
+        &app,
+        &format!("{ROOT}/Car?{residual}&$expand=follows($select=createdAt)"),
+        &[],
+    )
+    .await;
+    let follows = &created.body["value"][0]["follows"];
+    assert!(follows["createdAt"].is_string(), "{}", created.body);
+    let hop = "$filter=follows/speed%20ge%201%20and%20not%20(speed%20gt%2020)";
+    let bare = get(&app, &format!("{ROOT}/Car/$count?{hop}"), &[]).await;
+    assert_eq!(bare.body, json!(want.len()), "{}", bare.body);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_past_the_lookup_budget_is_400_scanned_or_pushed() -> Result<(), String> {
+    // T-3823: Car 1 follows Car 2 more times than one request may look up (4.5.23.1); a
+    // partial expansion is never served, whether the store or the scan answers
+    let (_b, app) = broker(CARS).await?;
+    let long = json!({format!("{CITY}follows"): {"type": "ListRelationship",
+        "objectList": vec!["urn:ngsi-ld:Car:002"; 1001]}});
+    let status = put(
+        &app,
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:001/attrs",
+        long.to_string(),
+        Some("city"),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    for query in [
+        "$filter=speed%20lt%2030&$expand=follows",
+        "$filter=not%20(speed%20gt%2020)&$expand=follows",
+        "$orderby=createdAt&$expand=follows",
+    ] {
+        let answer = get(&app, &format!("{ROOT}/Car?{query}"), &[]).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::BAD_REQUEST,
+            "{query}: {}",
+            answer.body
+        );
         assert!(
-            first.and_then(|e| e.get("follows")).is_some(),
+            answer.body.to_string().contains("expansion reaches"),
             "{}",
             answer.body
         );
@@ -503,23 +573,23 @@ async fn a_scanned_read_beside_a_join_stays_501_and_references_are_served() -> R
     Ok(())
 }
 
+/// A key every Car holds stays pushed beside a residual: the store's order is
+/// URL 5.1.5's when nothing lacks the key (T-3853).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_hop_beside_a_residual_stays_501() -> Result<(), String> {
+async fn a_key_every_entity_holds_stays_pushed_beside_a_residual() -> Result<(), String> {
     let (_b, app) = broker(CARS).await?;
-    // a hop beside a residual is a join the scan cannot see truncated (T-3823)
-    let hop = "$filter=follows/speed%20gt%201%20and%20not%20(speed%20gt%2020)";
-    for uri in [
-        format!("{ROOT}/Car?{hop}"),
-        format!("{ROOT}/Car/$count?{hop}"),
-    ] {
-        let answer = get(&app, &uri, &[]).await;
-        assert_eq!(
-            answer.status,
-            StatusCode::NOT_IMPLEMENTED,
-            "{uri}: {}",
-            answer.body
-        );
-    }
+    let residual = "$filter=not%20(speed%20gt%2020)";
+    let by_label = |filter: &str| format!("{ROOT}/Car?{filter}&$orderby=label%20desc&$top=1000");
+    let answer = get(&app, &by_label(residual), &[]).await;
+    let pushed = get(
+        &app,
+        &by_label("$filter=speed%20le%2020%20or%20speed%20eq%20null"),
+        &[],
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(ids(&answer.body), ids(&pushed.body));
+    assert_eq!(ids(&answer.body).len(), 22);
     Ok(())
 }
 
@@ -676,5 +746,127 @@ async fn a_scanned_read_of_an_empty_tenant_or_a_refused_view_answers_as_a_pushed
     )
     .await;
     assert_eq!(empty.status, StatusCode::OK, "{}", empty.body);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_select_projects_and_never_selects() -> Result<(), String> {
+    // T-3822, URL 5.1.4: `$select` (and `ngsild.pick`/`ngsild.omit`) narrow members, never
+    // Entities: no Car holds `seen`, 6 hold no `speed`
+    let (_b, app) = broker(CARS).await?;
+    let all = expected(|_| true);
+    let unfiltered = expected(|n| speed(n).is_none_or(|s| s <= 20));
+    let cases = [
+        ("$select=seen", &all, Some("seen")),
+        ("$select=speed", &all, Some("speed")),
+        ("$select=seen,createdAt", &all, Some("seen")),
+        ("ngsild.pick=seen", &all, None),
+        ("ngsild.omit=speed,label,seen", &all, None),
+        ("$select=seen&$expand=follows", &all, Some("seen")),
+        (
+            "$select=seen&$filter=not%20(speed%20gt%2020)",
+            &unfiltered,
+            Some("seen"),
+        ),
+        (
+            "ngsild.pick=seen&$filter=not%20(speed%20gt%2020)",
+            &unfiltered,
+            None,
+        ),
+    ];
+    for (query, want, null) in cases {
+        let page = get(
+            &app,
+            &format!("{ROOT}/Car?{query}&$count=true&$top=1000"),
+            &[],
+        )
+        .await;
+        assert_eq!(page.status, StatusCode::OK, "{query}: {}", page.body);
+        assert_eq!(page.body["@odata.count"], json!(want.len()), "{query}");
+        assert_eq!(ids(&page.body), *want, "{query}");
+        if let Some(member) = null {
+            let first = &page.body["value"][0];
+            assert!(first.get(member).is_some(), "{query}: {first}");
+            assert!(first.get("label").is_none(), "{query}: {first}");
+        }
+    }
+    let no_speed = get(
+        &app,
+        &format!("{ROOT}/Car('urn:ngsi-ld:Car:005')?$select=speed"),
+        &[],
+    )
+    .await;
+    assert_eq!(no_speed.status, StatusCode::OK, "{}", no_speed.body);
+    assert_eq!(no_speed.body["speed"], Value::Null, "{}", no_speed.body);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn orderby_puts_a_missing_value_first_ascending_and_last_descending() -> Result<(), String> {
+    // T-3853, URL 5.1.5: null first ascending, last descending; ties in id order
+    let (_b, app) = broker(CARS).await?;
+    let id = |n: u32| format!("urn:ngsi-ld:Car:{n:03}");
+    let speedless: Vec<String> = (1..=CARS).filter(|n| speed(*n).is_none()).map(id).collect();
+    let mut fast: Vec<u32> = (1..=CARS).filter(|n| speed(*n).is_some()).collect();
+    let rising: Vec<String> = speedless
+        .iter()
+        .cloned()
+        .chain(fast.iter().copied().map(id))
+        .collect();
+    // the speedless tie on `speed`, so `label` orders them, as strings: "car 10" before "car 5"
+    let mut labelled = speedless.clone();
+    labelled.sort_by_key(|i| {
+        format!(
+            "car {}",
+            i.rsplit(':').next().unwrap_or("").trim_start_matches('0')
+        )
+    });
+    let by_label: Vec<String> = labelled
+        .into_iter()
+        .chain(fast.iter().copied().map(id))
+        .collect();
+    fast.reverse();
+    let falling: Vec<String> = fast
+        .into_iter()
+        .map(id)
+        .chain(speedless.iter().cloned())
+        .collect();
+    for (orderby, want) in [
+        ("speed", &rising),
+        ("speed%20desc", &falling),
+        ("speed,label", &by_label),
+        ("speed%20desc,id", &falling),
+    ] {
+        for page in [1000, 7] {
+            let got = chained(&app, &format!("{ROOT}/Car?$orderby={orderby}"), page).await?;
+            assert_eq!(got, *want, "$orderby={orderby}, pages of {page}");
+        }
+        // beside a residual, through the scan
+        let got = chained(
+            &app,
+            &format!("{ROOT}/Car?$orderby={orderby}&$filter=not%20(speed%20gt%2020)"),
+            4,
+        )
+        .await?;
+        let kept: Vec<String> = want
+            .iter()
+            .filter(|i| {
+                let n: u32 = i
+                    .rsplit(':')
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                speed(n).is_none_or(|s| s <= 20)
+            })
+            .cloned()
+            .collect();
+        assert_eq!(got, kept, "$orderby={orderby} beside a residual");
+    }
+    // a key every Entity holds stays the store's order
+    let labels = chained(&app, &format!("{ROOT}/Car?$orderby=label%20desc"), 7).await?;
+    let mut want: Vec<(String, String)> = (1..=CARS).map(|n| (format!("car {n}"), id(n))).collect();
+    want.sort();
+    want.reverse();
+    assert_eq!(labels, want.into_iter().map(|(_, i)| i).collect::<Vec<_>>());
     Ok(())
 }

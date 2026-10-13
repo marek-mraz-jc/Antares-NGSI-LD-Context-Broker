@@ -623,6 +623,9 @@ pub(crate) fn query_doc_params(
         match q.get(k) {
             None => {}
             Some(Value::String(s)) => {
+                if k == "scopeQ" {
+                    antares_ql::scope::check_scope_q(s)?;
+                }
                 vp.insert(k.into(), capped(k, s.clone())?);
             }
             Some(_) => return Err(bad(format!("Query {k} must be a string (5.2.23)"))),

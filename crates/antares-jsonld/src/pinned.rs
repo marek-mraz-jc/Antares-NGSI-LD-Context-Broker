@@ -269,9 +269,7 @@ mod tests {
             "id": "urn:ngsi-ld:Car:1", "type": "Car",
             "location": {"type": "GeoProperty", "value": {"type": "Point", "coordinates": [1.0, 2.0]}}
         });
-        let Value::Object(entity) = entity else {
-            unreachable!("an object literal")
-        };
+        let entity = entity.as_object().cloned().expect("an object literal");
         let out =
             crate::expand_entity(&entity, &ctx, crate::ExpandOpts::default()).expect("expand");
         assert!(
@@ -375,12 +373,73 @@ mod tests {
         }
         let core = pinned(CORE_CONTEXT).expect("the Core @context is pinned");
         assert!(
-            core.is_object() || core.is_array() || core.is_string(),
+            matches!(core, Value::Object(_) | Value::Array(_) | Value::String(_)),
             "the Core @context is not a usable @context value: {core}"
         );
         assert!(
             PINNED.iter().any(|(u, _)| *u == CORE_CONTEXT),
             "CORE_CONTEXT must be in the pinned table by URL, not merely resolvable"
         );
+    }
+
+    /// The edges of the pinned set (T-3912): which versions have a core URL, a relative
+    /// reference resolved against the document that holds it, an array merged member by
+    /// member, and a URL no loader serves.
+    #[test]
+    fn versions_relative_references_and_arrays() {
+        assert_eq!(
+            core_context_url("1.3"),
+            Some("https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.3.jsonld")
+        );
+        for refused in ["1", "1.99", "x.1", ".1", "1.", "1.3a"] {
+            assert_eq!(core_context_url(refused), None, "{refused}");
+        }
+
+        struct Two;
+        impl ContextLoader for Two {
+            fn load(&self, url: &str) -> Option<Value> {
+                match url {
+                    "https://example.org/a/outer.jsonld" => Some(serde_json::json!([
+                        "inner.jsonld",
+                        "https://example.org/abs.jsonld",
+                        "http://example.org/plain.jsonld"
+                    ])),
+                    "https://example.org/a/inner.jsonld" => {
+                        Some(serde_json::json!({"speed": "https://example.org/speed"}))
+                    }
+                    "https://example.org/abs.jsonld" => {
+                        Some(serde_json::json!({"size": "https://example.org/size"}))
+                    }
+                    "http://example.org/plain.jsonld" => {
+                        Some(serde_json::json!({"plain": "https://example.org/plain"}))
+                    }
+                    _ => None,
+                }
+            }
+        }
+        let ctx = resolve_with(
+            &Two,
+            &Value::String("https://example.org/a/outer.jsonld".into()),
+        )
+        .expect("resolve");
+        assert_eq!(ctx.expand_key("speed"), "https://example.org/speed");
+        assert_eq!(ctx.expand_key("size"), "https://example.org/size");
+        assert_eq!(ctx.expand_key("plain"), "https://example.org/plain");
+        assert!(resolve_with(&Two, &Value::String("https://example.org/b.jsonld".into())).is_err());
+        let missing = resolve_with(
+            &PinnedOnly,
+            &Value::String("https://example.org/none.jsonld".into()),
+        );
+        assert!(
+            matches!(missing, Err(NgsiError::LdContextNotAvailable(_))),
+            "{missing:?}"
+        );
+
+        let mut ctx = Context::default();
+        merge_context_value(
+            &mut ctx,
+            &serde_json::json!([{"speed": "https://example.org/speed"}, 5]),
+        );
+        assert_eq!(ctx.expand_key("speed"), "https://example.org/speed");
     }
 }

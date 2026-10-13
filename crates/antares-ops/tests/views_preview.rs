@@ -326,3 +326,15 @@ async fn a_preview_asks_the_engine_and_answers_its_refusal() {
     assert_eq!(s, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["type"], "urn:antares:error:AccessDenied");
 }
+
+/// T-3773: a preview page larger than the broker buffers for one request is
+/// 413, not held whole in memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preview_past_the_buffer_bound_is_413() {
+    let b = TestBroker::with_max_answer_bytes(32).await.expect("broker");
+    let app = b.serve(Nothing).expect("mounts");
+    seed(&app).await;
+    let (s, body) = preview(&app, "cars", "?type=Car", &view("cars", "speed>0")).await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body["detail"], antares_api::bounds::ANSWER_TOO_LARGE);
+}

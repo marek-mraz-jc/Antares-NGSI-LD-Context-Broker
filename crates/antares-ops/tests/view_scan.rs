@@ -101,10 +101,12 @@ impl Surface for Probe {
                                 entities,
                                 next,
                                 count,
+                                truncated,
                             },
                             read,
                         )) => Json(json!({
-                            "entities": entities, "next": next, "count": count, "read": read
+                            "entities": entities, "next": next, "count": count, "read": read,
+                            "truncated": truncated
                         }))
                         .into_response(),
                         Ok((Scanned::Answer(answer), _)) => answer,
@@ -166,7 +168,10 @@ fn car(n: usize) -> Value {
 }
 
 async fn rig() -> Result<Rig, String> {
-    let broker = TestBroker::new().await?;
+    rig_on(TestBroker::new().await?).await
+}
+
+async fn rig_on(broker: TestBroker) -> Result<Rig, String> {
     let admin = broker.router();
     let view = json!({"id": "cars", "tenant": TENANT, "selector": ["Car"],
         "rules": [{"types": ["Car"], "attributes": ["colour", "speed", "tags"]}],
@@ -498,4 +503,156 @@ async fn scan_without_residual_is_one_page_and_store_errors_pass_through() {
         .body(Body::empty())
         .unwrap_or_default();
     assert_eq!(send(&rig.app, req).await.0, StatusCode::NOT_FOUND);
+}
+
+/// T-3773: a store page larger than the broker buffers for one request is 413, never read whole
+/// into memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_past_the_answer_bound_is_413() {
+    let broker = TestBroker::with_max_answer_bytes(64).await.expect("broker");
+    let rig = rig_on(broker).await.expect("rig");
+    for plan in [(pushdown(), None), (pushdown(), Some(odd()))] {
+        let (s, b) = rig.scan(plan, "size=4").await;
+        assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{b}");
+        assert_eq!(b["detail"], antares_ops::bounds::ANSWER_TOO_LARGE);
+    }
+}
+
+/// The sorted member names of each served Entity.
+fn members(page: &Value) -> Vec<Vec<String>> {
+    page["entities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            let mut names: Vec<String> = e
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            names.sort_unstable();
+            names
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_selection_projects_and_never_selects() {
+    // T-3822: `attrs` also drops the Entities holding none of the names; `pick` only projects
+    let rig = rig().await.expect("rig");
+    let seen = Pushdown {
+        attrs: Some(vec!["seen".into()]),
+        ..pushdown()
+    };
+    let frame = vec!["id".to_owned(), "type".to_owned()];
+    // an IRI is one member name to `pick`, percent-encoded on the way
+    let iri = Pushdown {
+        attrs: Some(vec!["https://example.org/x#seen".into()]),
+        ..pushdown()
+    };
+    let (s, b) = rig.scan((iri, None), "size=1000&whole=1").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(ids(&b), expected(|_| true));
+    let (s, b) = rig.scan((seen.clone(), None), "size=1000&whole=1").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(
+        (ids(&b), b["count"].clone()),
+        (expected(|_| true), json!(15))
+    );
+    assert!(members(&b).iter().all(|m| *m == frame), "{b}");
+    // under a residual, which reads speed and serves it not
+    let (_, b) = rig.scan((seen, Some(odd())), "size=1000&whole=1").await;
+    assert_eq!(ids(&b), expected(|n| n % 2 == 1));
+    assert!(members(&b).iter().all(|m| *m == frame), "{b}");
+    // a name `pick` would read as another member is not pushed: the scan projects itself
+    let odd_name = Pushdown {
+        attrs: Some(vec!["colour".into(), "a-b.c_d~".into()]),
+        ..pushdown()
+    };
+    let shown = vec!["colour".to_owned(), "id".to_owned(), "type".to_owned()];
+    for residual in [None, Some(odd())] {
+        let (s, b) = rig.scan((odd_name.clone(), residual), "size=1000").await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert!(!ids(&b).is_empty(), "{b}");
+        assert!(members(&b).iter().all(|m| *m == shown), "{b}");
+    }
+}
+
+#[test]
+fn pickable_names_are_one_member() {
+    use antares_ops::pickable;
+    for name in [
+        "speed",
+        "a_b",
+        "https://uri.etsi.org/ngsi-ld/v1.8#x",
+        "urn:a.b",
+        "@id",
+    ] {
+        assert!(pickable(name), "{name}");
+    }
+    for name in ["", "a.b", "colour name", "a~", "-x", "a,b", "a{b}", "a|b"] {
+        assert!(!pickable(name), "{name}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_past_the_lookup_budget_is_reported_under_a_residual() {
+    // T-3823: the scan reads the store's `NGSILD-Warning`, so a surface can refuse a partial
+    // expansion. Hub 0 links Hub 1 more times than one request may look up (4.5.23.1).
+    let broker = TestBroker::new().await.expect("broker");
+    let admin = broker.router();
+    let view = json!({"id": "hubs", "tenant": TENANT, "selector": ["Hub"],
+        "rules": [{"types": ["Hub"], "attributes": ["to", "n"]}],
+        "operations": ["query_entities"]});
+    let (s, b) = send(&admin, with_body(Request::put("/q/views/hubs"), &view)).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    for (n, width) in [(0, 1001), (1, 1), (2, 1)] {
+        let hub = json!({"id": format!("urn:ngsi-ld:Hub:{n}"), "type": "Hub",
+            "n": {"type": "Property", "value": n},
+            "to": {"type": "ListRelationship", "objectList": vec!["urn:ngsi-ld:Hub:1"; width]}});
+        let (s, b) = send(
+            &admin,
+            with_body(Request::post("/ngsi-ld/v1/entities"), &hub),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+    }
+    let plan = Plan::default();
+    let app = broker.serve(Probe(plan.clone())).expect("serve");
+    let scan = |query: &str, n: Option<i64>| {
+        let residual = n.map(|n| {
+            Expr::Cmp(
+                Cmp::Ge,
+                Box::new(Expr::Path(Path::value("n"))),
+                Box::new(Expr::Lit(Lit::Int(n))),
+            )
+        });
+        *plan.lock().unwrap_or_else(PoisonError::into_inner) = (
+            Pushdown {
+                query: format!("type=Hub&join=inline&joinLevel=1{query}"),
+                ..pushdown()
+            },
+            residual,
+        );
+        let req = Request::get("/x/scan/hubs?size=10")
+            .header("NGSILD-Tenant", TENANT)
+            .body(Body::empty())
+            .unwrap_or_default();
+        send(&app, req)
+    };
+    for residual in [None, Some(0)] {
+        let (s, b) = scan("", residual).await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert_eq!(b["truncated"], true, "{residual:?}: {b}");
+        // past the long link list, the walk fits
+        let (_, b) = scan("&id=urn:ngsi-ld:Hub:1,urn:ngsi-ld:Hub:2", residual).await;
+        assert_eq!(b["truncated"], false, "{b}");
+        assert_eq!(b["entities"].as_array().map(Vec::len), Some(2), "{b}");
+    }
+    // the residual drops Hub 0, yet the page it was read in still says so
+    let (_, b) = scan("", Some(1)).await;
+    assert_eq!(
+        (b["truncated"].clone(), ids(&b).len()),
+        (json!(true), 2),
+        "{b}"
+    );
 }
