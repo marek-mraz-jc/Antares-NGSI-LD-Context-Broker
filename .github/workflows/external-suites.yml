@@ -81,6 +81,8 @@ jobs:
     needs: [selftest, plan]
     strategy:
       fail-fast: false
+      # 3 cells at a time: a full run held every runner and stalled the trains (T-3677)
+      max-parallel: 3
       matrix:
         variant: ${{ fromJSON(needs.plan.outputs.variants) }}
         store: ${{ fromJSON(needs.plan.outputs.stores) }}
@@ -193,6 +195,8 @@ jobs:
     needs: [plan, image]
     strategy:
       fail-fast: false
+      # 3 cells at a time: a full run held every runner and stalled the trains (T-3677)
+      max-parallel: 3
       matrix:
         variant: ${{ fromJSON(needs.plan.outputs.variants) }}
         store: ${{ fromJSON(needs.plan.outputs.stores) }}
