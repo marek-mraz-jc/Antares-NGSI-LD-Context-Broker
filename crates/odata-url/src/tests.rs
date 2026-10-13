@@ -1759,8 +1759,8 @@ fn after_an_aggregation_only_its_names_resolve() {
 #[test]
 fn apply_refuses_what_is_no_served_transformation() {
     for (query, offset) in [
-        ("topcount(2,height)", 17),
-        ("concat(identity,identity)", 17),
+        ("expand(sensors)", 17),
+        ("concat(identity,aggregate($count as n))", 17),
         ("rollup(name)", 17),
         ("ns.custom(1)", 17),
         ("groupby((rollup(name)))", 26),
@@ -1795,6 +1795,14 @@ fn apply_refuses_what_is_no_served_transformation() {
         ("groupby((name x))", 31),
         ("groupby((name),aggregate($count as n x))", 54),
         ("aggregate($count is n)", 34),
+        ("concat(identity)", 32),
+        ("concat(top(1),skip(1)", 38),
+        ("topcount(1 height)", 28),
+        ("topcount(1,height", 34),
+        ("search(blue", 28),
+        ("search()", 25),
+        ("compute(height as name)", 39),
+        ("compute(height as h)/compute(1 as h)", 52),
         ("aggregate($count as 1)", 37),
         ("aggregate($count as)", 36),
         ("aggregate(height with median as m)", 45),
@@ -1821,6 +1829,14 @@ fn apply_writes_its_canonical_form() {
         ),
         ("groupby((name))", "groupby((name))"),
         (
+            "topcount(2,height)/bottompercent(2.5,height)/search(a OR b)/compute(1 as c)",
+            "topcount(2,height)/bottompercent(2.5,height)/search(a%20OR%20b)/compute(1%20as%20c)",
+        ),
+        (
+            "concat(top(1)/identity,skip(2))",
+            "concat(top(1)/identity,skip(2))",
+        ),
+        (
             "aggregate(height with sum as s,height with min as lo,height with max as hi,\
              height with countdistinct as d)",
             "aggregate(height%20with%20sum%20as%20s,height%20with%20min%20as%20lo,\
@@ -1831,4 +1847,93 @@ fn apply_writes_its_canonical_form() {
         assert_eq!(uri.to_string(), format!("Buildings?$apply={canonical}"));
         assert_eq!(ok(&uri.to_string()), uri);
     }
+}
+
+#[test]
+fn apply_reads_partitions_concat_compute_and_search() {
+    let height = name("height");
+    let partition = |by, top, n: Literal| Transformation::Partition {
+        by,
+        top,
+        n: Expr::Literal(n),
+        expr: height.clone(),
+    };
+    assert_eq!(
+        apply_of(
+            "topcount(2,height)/topsum(10.5,height)/toppercent(50,height)/\
+             bottomcount(1,height)/bottomsum(3,height)/bottompercent(25,height)"
+        ),
+        vec![
+            partition(PartitionBy::Count, true, Literal::Int(2)),
+            partition(PartitionBy::Sum, true, Literal::Decimal("10.5".into())),
+            partition(PartitionBy::Percent, true, Literal::Int(50)),
+            partition(PartitionBy::Count, false, Literal::Int(1)),
+            partition(PartitionBy::Sum, false, Literal::Int(3)),
+            partition(PartitionBy::Percent, false, Literal::Int(25)),
+        ]
+    );
+    assert_eq!(
+        apply_of("search(blue OR red)/compute(height as h)"),
+        vec![
+            Transformation::Search(Search::Or(
+                Box::new(Search::Word("blue".into())),
+                Box::new(Search::Word("red".into()))
+            )),
+            Transformation::Compute(vec![Compute {
+                expr: height.clone(),
+                alias: "h".into()
+            }]),
+        ]
+    );
+    assert_eq!(
+        apply_of("concat(top(1),skip(1)/identity)"),
+        vec![Transformation::Concat(vec![
+            vec![Transformation::Top(1)],
+            vec![Transformation::Skip(1), Transformation::Identity],
+        ])]
+    );
+    unresolved("Buildings?$apply=topcount(1,nothing)", 28);
+}
+
+#[test]
+fn a_computed_name_and_the_names_a_concat_produces_resolve_after_them() {
+    // a `compute` name in the later transformations and options, the members stay
+    let o = options(
+        "Buildings?$apply=compute(height%20mul%202%20as%20h)/filter(h%20gt%201)\
+         &$filter=h%20gt%20height",
+    );
+    assert_eq!(o.apply.map(|a| a.len()), Some(2));
+    // what every aggregating branch produced, and nothing else
+    assert_eq!(
+        apply_of(
+            "concat(aggregate($count as n),groupby((name),aggregate($count as k)))\
+             /filter(n gt 1 or k gt 1 or name eq 'x')"
+        )
+        .len(),
+        2
+    );
+    // a name two branches produce resolves once
+    assert_eq!(
+        apply_of("concat(aggregate($count as n),aggregate($count as n))/filter(n gt 1)").len(),
+        2
+    );
+    unresolved(
+        "Buildings?$apply=concat(aggregate($count as n),groupby((name)))&$filter=height gt 1",
+        72,
+    );
+    // branches that keep the entities keep their members, never a branch's computed name
+    assert!(
+        options("Buildings?$apply=concat(top(1),compute(1 as c))&$filter=height gt 1")
+            .filter
+            .is_some()
+    );
+    unresolved(
+        "Buildings?$apply=concat(top(1),compute(1 as c))/filter(c eq 1)",
+        55,
+    );
+    assert!(Transformation::Concat(vec![vec![Transformation::GroupBy {
+        properties: Vec::new(),
+        aggregate: None
+    }]])
+    .aggregates());
 }

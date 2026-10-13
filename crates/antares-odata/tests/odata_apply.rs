@@ -378,8 +378,8 @@ async fn an_aggregate_never_counts_or_sums_what_the_view_or_the_engine_hides() -
 async fn apply_is_refused_where_it_does_not_apply() -> Result<(), String> {
     let (_b, app) = broker(false).await?;
     for (uri, want) in [
-        // the transformations T-3985 serves, a rollup, a custom aggregate
-        ("Car?$apply=topcount(2,seats)", StatusCode::NOT_IMPLEMENTED),
+        // a transformation not served, a rollup, a custom aggregate
+        ("Car?$apply=expand(owner)", StatusCode::NOT_IMPLEMENTED),
         (
             "Car?$apply=groupby((rollup(brand)))",
             StatusCode::NOT_IMPLEMENTED,
@@ -472,12 +472,187 @@ async fn the_metadata_says_which_transformations_apply() -> Result<(), String> {
         "skip",
         "aggregate",
         "groupby",
+        "topcount",
+        "bottompercent",
+        "concat",
+        "compute",
+        "search",
     ] {
         assert!(
             text.contains(&format!("<String>{word}</String>")),
             "{word}: {text}"
         );
     }
-    assert!(!text.contains("<String>topcount</String>"), "{text}");
+    assert!(!text.contains("<String>expand</String>"), "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn top_and_bottom_keep_the_highest_or_lowest_in_rank_order() -> Result<(), String> {
+    let (_b, app) = broker(false).await?;
+    for (apply, want) in [
+        ("topcount(2,seats)", &["5", "4"][..]),
+        ("bottomcount(2,seats)", &["1", "2"]),
+        ("topcount(0,seats)", &[]),
+        // the fewest whose sum reaches 9, the fewest from the bottom that reach 4
+        ("topsum(9,seats)", &["5", "4"]),
+        ("bottomsum(4,seats)", &["1", "2", "3"]),
+        // 50 and 20 percent of 15 seats
+        ("toppercent(50,seats)", &["5", "4"]),
+        ("bottompercent(20,seats)", &["1", "2"]),
+        ("toppercent(100,seats mul 2)", &["5", "4", "3", "2", "1"]),
+        // ties keep their order; an instance without a value is not ranked
+        ("topcount(3,brand)", &["1", "2", "3"]),
+        ("bottomcount(9,brand)", &["3", "4", "1", "2"]),
+        ("filter(seats lt 4)/topcount(9,seats)", &["3", "2", "1"]),
+    ] {
+        assert_eq!(ids(&app, apply).await?, want, "{apply}");
+    }
+    assert_eq!(
+        rows(
+            &app,
+            "groupby((brand),aggregate(seats with sum as s))/topcount(1,s)"
+        )
+        .await?,
+        json!([{"brand": "bmw", "s": 7}])
+    );
+    for apply in [
+        "topsum(5,brand)",
+        "bottompercent(5,since)",
+        "topcount(-1,seats)",
+        "topcount('two',seats)",
+        "topcount(seats,seats)",
+    ] {
+        let uri = format!("{ROOT}/Car?$apply={}", apply.replace(' ', "%20"));
+        let (status, body) = send(&app, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{apply}: {body}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn concat_answers_each_sequence_one_after_the_other() -> Result<(), String> {
+    let (_b, app) = broker(false).await?;
+    assert_eq!(
+        ids(&app, "concat(topcount(1,seats),bottomcount(1,seats))").await?,
+        ["5", "1"]
+    );
+    assert_eq!(
+        ids(
+            &app,
+            "filter(brand eq 'vw')/concat(identity,orderby(seats desc))/top(3)"
+        )
+        .await?,
+        ["1", "2", "2"]
+    );
+    // rows under every name of any sequence, null where a sequence has none
+    assert_eq!(
+        rows(
+            &app,
+            "concat(aggregate($count as n),groupby((brand),aggregate($count as k)))"
+        )
+        .await?,
+        json!([{"n": 5, "brand": null, "k": null},
+               {"n": null, "brand": "vw", "k": 2},
+               {"n": null, "brand": "bmw", "k": 2},
+               {"n": null, "brand": null, "k": 1}])
+    );
+    assert_eq!(
+        rows(
+            &app,
+            "groupby((brand),aggregate($count as n))/concat(topcount(1,n),bottomcount(1,n))"
+        )
+        .await?,
+        json!([{"brand": "vw", "n": 2}, {"brand": null, "n": 1}])
+    );
+    // a mix of Entities and rows is not served
+    let uri = format!("{ROOT}/Car?$apply=concat(identity,aggregate($count%20as%20n))");
+    let (status, body) = send(&app, Method::GET, &uri, None).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn compute_and_search_inside_apply() -> Result<(), String> {
+    let (_b, app) = broker(false).await?;
+    // a computed name is read later and written with the Entities
+    let body = read(
+        &app,
+        "$apply=compute(seats mul 2 as d)/filter(d gt 6)/orderby(d desc)",
+    )
+    .await?;
+    assert_eq!(body["value"][0]["id"], "urn:ngsi-ld:Car:5", "{body}");
+    assert_eq!(body["value"][0]["d"], 10, "{body}");
+    assert_eq!(body["value"].as_array().map(Vec::len), Some(2), "{body}");
+    assert_eq!(
+        rows(
+            &app,
+            "compute(seats mul 2 as d)/compute(d add 1 as e)/aggregate(e with sum as s)"
+        )
+        .await?,
+        json!([{"s": 35}])
+    );
+    assert_eq!(
+        rows(
+            &app,
+            "groupby((brand),aggregate(seats with sum as s))/compute(s mul 10 as t)/filter(t gt 60)"
+        )
+        .await?,
+        json!([{"brand": "bmw", "s": 7, "t": 70}])
+    );
+    assert_eq!(ids(&app, "search(vw)").await?, ["1", "2"]);
+    assert_eq!(
+        ids(&app, "search(vw OR bmw)/topcount(1,seats)").await?,
+        ["4"]
+    );
+    for (apply, want) in [
+        ("groupby((brand))/search(vw)", StatusCode::NOT_IMPLEMENTED),
+        ("compute(nothing as x)", StatusCode::BAD_REQUEST),
+        ("concat(identity,topsum(5,brand))", StatusCode::BAD_REQUEST),
+        (
+            "compute(brand as x)/aggregate(x with sum as s)",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let uri = format!("{ROOT}/Car?$apply={}", apply.replace(' ', "%20"));
+        let (status, body) = send(&app, Method::GET, &uri, None).await;
+        assert_eq!(status, want, "{apply}: {body}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ranking_concat_and_search_never_reach_what_is_hidden() -> Result<(), String> {
+    let (_b, app) = broker(true).await?;
+    // Car 5 is outside the scope, `owner` hidden by the engine
+    assert_eq!(ids(&app, "topcount(9,seats)").await?, ["4", "3", "2", "1"]);
+    assert_eq!(
+        ids(&app, "toppercent(100,seats)").await?,
+        ["4", "3", "2", "1"]
+    );
+    assert_eq!(ids(&app, "topcount(9,owner)").await?, Vec::<String>::new());
+    assert_eq!(
+        ids(&app, "concat(identity,bottomcount(1,seats))").await?,
+        ["1", "2", "3", "4", "1"]
+    );
+    assert_eq!(ids(&app, "search(Dan)").await?, Vec::<String>::new());
+    assert_eq!(
+        rows(
+            &app,
+            "compute(seats as k)/aggregate(k with sum as s,$count as n)"
+        )
+        .await?,
+        json!([{"s": 10, "n": 4}])
+    );
+    // the view hides `note`: an unknown name
+    for apply in [
+        "topcount(1,note)",
+        "compute(note as x)",
+        "concat(identity,filter(note eq 'x'))",
+    ] {
+        let uri = format!("{ROOT}/Car?$apply={}", apply.replace(' ', "%20"));
+        let (status, body) = send(&app, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{apply}: {body}");
+    }
     Ok(())
 }

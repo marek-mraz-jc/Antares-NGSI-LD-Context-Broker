@@ -7,7 +7,7 @@ mod service;
 use odata_url::{
     parse, ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath, Expr, Format,
     Geography, Key, KeyValue, Levels, Limits, Literal, MemberPath, Method, ODataUri, OrderBy,
-    Position, QueryOptions, Search, Segment, SelectItem, Shape, Transformation,
+    PartitionBy, Position, QueryOptions, Search, Segment, SelectItem, Shape, Transformation,
 };
 use proptest::prelude::*;
 use service::Service;
@@ -300,6 +300,14 @@ mod strategy {
             orderby.clone().prop_map(Transformation::OrderBy),
             any::<u64>().prop_map(Transformation::Top),
             any::<u64>().prop_map(Transformation::Skip),
+            (expr(), expr(), any::<bool>(), 0..3u8).prop_map(|(n, expr, top, by)| {
+                let by = match by {
+                    0 => PartitionBy::Count,
+                    1 => PartitionBy::Sum,
+                    _ => PartitionBy::Percent,
+                };
+                Transformation::Partition { by, top, n, expr }
+            }),
         ];
         let system = (
             prop::option::of(expr()),

@@ -1,24 +1,20 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! `$apply` (OData Data Aggregation 4.0 section 3): `identity`, `filter`, `orderby`, `top`,
-//! `skip`, `aggregate` and `groupby` (T-3937). The other transformations, rollup, custom
-//! aggregates and custom methods are not implemented (T-3985).
+//! `$apply` (OData Data Aggregation 4.0 section 3): `identity`, `filter`, `search`, `orderby`,
+//! `top`, `skip`, `compute`, `aggregate`, `groupby` (T-3937), the six of `topcount` to
+//! `bottompercent` and `concat` (T-3985). The hierarchy and join transformations, `expand`,
+//! `nest`, rollup, a transformation of the groups other than `aggregate`, custom aggregates and
+//! custom methods are not implemented.
 
 use crate::expr::{common_expr, Scope};
 use crate::model::{Member, Model};
 use crate::query::{member, unsigned, Query};
-use crate::{Aggregate, AggregateWith, Feature, Transformation, UrlError, UrlErrorKind};
+use crate::search::search;
+use crate::{
+    Aggregate, AggregateWith, Feature, PartitionBy, Transformation, UrlError, UrlErrorKind,
+};
 
 /// Data Aggregation 4.0 transformations the parser does not serve, and `rollup`.
-const OTHER: [&str; 18] = [
-    "topcount",
-    "bottomcount",
-    "topsum",
-    "bottomsum",
-    "toppercent",
-    "bottompercent",
-    "concat",
-    "compute",
-    "search",
+const OTHER: [&str; 9] = [
     "expand",
     "nest",
     "addnested",
@@ -28,6 +24,16 @@ const OTHER: [&str; 18] = [
     "descendants",
     "traverse",
     "rollup",
+];
+
+/// The transformations that keep the instances with the highest or lowest values.
+const PARTITIONS: [(&str, PartitionBy, bool); 6] = [
+    ("topcount", PartitionBy::Count, true),
+    ("topsum", PartitionBy::Sum, true),
+    ("toppercent", PartitionBy::Percent, true),
+    ("bottomcount", PartitionBy::Count, false),
+    ("bottomsum", PartitionBy::Sum, false),
+    ("bottompercent", PartitionBy::Percent, false),
 ];
 
 const METHODS: [(&str, AggregateWith); 5] = [
@@ -65,7 +71,7 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
             return Ok(Transformation::Identity);
         }
         if self.c.peek() == Some(b'.') || OTHER.contains(&word.as_str()) {
-            // a custom transformation (a function), or one T-3985 serves
+            // a custom transformation (a function), or one not served
             self.c.reset(start);
             return Err(self.c.not_implemented(Feature::Apply));
         }
@@ -86,9 +92,19 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
                 Transformation::Aggregate(items)
             }
             "groupby" => self.groupby(here)?,
-            _ => {
-                self.c.reset(start);
-                return Err(self.c.syntax("applyTrafo"));
+            "compute" => Transformation::Compute(self.compute(*here)?),
+            "search" => {
+                let limits = self.budget.limits;
+                Transformation::Search(search(self.c, limits, &mut self.budget.nodes, true)?)
+            }
+            "concat" => self.concat(here, start)?,
+            partition => {
+                let Some(&(_, by, top)) = PARTITIONS.iter().find(|(name, ..)| *name == partition)
+                else {
+                    self.c.reset(start);
+                    return Err(self.c.syntax("applyTrafo"));
+                };
+                self.partition(*here, by, top)?
             }
         };
         self.c.bws();
@@ -96,6 +112,67 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
             return Err(self.c.syntax("CLOSE"));
         }
         Ok(step)
+    }
+
+    /// `topcount` to `bottompercent` after its `OPEN`: `n, expr`.
+    fn partition(
+        &mut self,
+        here: Scope<'m>,
+        by: PartitionBy,
+        top: bool,
+    ) -> Result<Transformation, UrlError> {
+        let n = common_expr(self.c, self.model, here, &mut self.budget)?;
+        self.c.bws();
+        if !self.c.comma() {
+            return Err(self.c.syntax("COMMA"));
+        }
+        self.c.bws();
+        let expr = common_expr(self.c, self.model, here, &mut self.budget)?;
+        Ok(Transformation::Partition { by, top, n, expr })
+    }
+
+    /// `concat` after its `OPEN`: two or more sequences over the same input. Their results
+    /// follow one another, so they all keep the instances or all aggregate (the other mix is
+    /// not implemented); after sequences that aggregate, the names any of them produced resolve.
+    fn concat(&mut self, here: &mut Scope<'m>, start: usize) -> Result<Transformation, UrlError> {
+        let before = self.budget.computed.clone();
+        let mut branches: Vec<Vec<Transformation>> = Vec::new();
+        let mut produced: Vec<String> = Vec::new();
+        loop {
+            self.budget.computed.clone_from(&before);
+            let (steps, _) = self.apply(*here)?;
+            if steps.iter().any(Transformation::aggregates) {
+                for name in &self.budget.computed {
+                    if !produced.contains(name) {
+                        produced.push(name.clone());
+                    }
+                }
+            }
+            branches.push(steps);
+            self.c.bws();
+            if !self.c.comma() {
+                break;
+            }
+            self.c.bws();
+        }
+        if branches.len() < 2 {
+            return Err(self.c.syntax("COMMA"));
+        }
+        let aggregating = branches
+            .iter()
+            .filter(|b| b.iter().any(Transformation::aggregates));
+        match aggregating.count() {
+            0 => self.budget.computed = before,
+            n if n == branches.len() => {
+                *here = Scope::Primitive;
+                self.budget.computed = produced;
+            }
+            _ => {
+                self.c.reset(start);
+                return Err(self.c.not_implemented(Feature::Apply));
+            }
+        }
+        Ok(Transformation::Concat(branches))
     }
 
     /// After an aggregation only `properties` and the aliases of `items` resolve.

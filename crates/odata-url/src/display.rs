@@ -232,6 +232,24 @@ impl Display for Transformation {
                 }
                 f.write_str(")")
             }
+            Transformation::Partition { by, top, n, expr } => {
+                let side = if *top { "top" } else { "bottom" };
+                write!(f, "{side}{}({n},{expr})", by.as_str())
+            }
+            Transformation::Concat(branches) => {
+                let branches: Vec<String> = branches
+                    .iter()
+                    .map(|b| {
+                        b.iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    })
+                    .collect();
+                write!(f, "concat({})", branches.join(","))
+            }
+            Transformation::Compute(items) => write!(f, "compute({})", List(items)),
+            Transformation::Search(search) => write!(f, "search({search})"),
         }
     }
 }

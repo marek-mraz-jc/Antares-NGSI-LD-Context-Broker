@@ -398,7 +398,7 @@ Each is refused before any gate or store access with `501 Not Implemented` (Prot
 
 | id | OData feature | OData 4.01 section | request | HTTP status | OData error code |
 |---|---|---|---|---|---|
-| `odata_apply` | $apply | OData Data Aggregation extension (not part of Protocol or URL Conventions 4.01) | `query option $apply` | served since T-3937 (`query_entities`, one bounded scan aggregated by the surface); the other transformations 501 | - |
+| `odata_apply` | $apply | OData Data Aggregation extension (not part of Protocol or URL Conventions 4.01) | `query option $apply` | served since T-3937 and T-3985 (`query_entities`, one bounded scan aggregated by the surface); `expand`, `nest`, the join and hierarchy transformations and rollup 501 | - |
 | `odata_search` | $search | URL 5.1.7, Protocol 11.2.6.6 | `query option $search` | served since T-3750 (`query_entities`, a residual `$filter` conjunct) | - |
 | `odata_compute` | $compute | URL 5.1.10, Protocol 11.2.5.3 | `query option $compute` | served since T-3936 (the read's operation, a residual value per Entity) | - |
 | `odata_index` | $index | URL 5.1.11 | `query option $index` | 501 | `NotImplemented` |
