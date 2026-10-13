@@ -38,6 +38,14 @@ pub const SWEEP_EVERY: Duration = Duration::from_secs(60);
 /// a backlog drains over several minutes instead of holding one long lock.
 const BATCH: usize = 1000;
 const ROUNDS: usize = 50;
+/// How long one sweep of one pod may spend deleting: past it the sweep stops
+/// and the next minute goes on, so a backlog takes at most a quarter of each
+/// minute (T-4084: an 8-hour rule over a 117 GB history held Postgres at its
+/// limit and starved every other query of the broker).
+// ponytail: the rules run in the same order every sweep, so a backlog of
+// the first one delays the next until it drains; rotate the start if a
+// second backlog ever waits on a first.
+pub const SWEEP_BUDGET: Duration = Duration::from_secs(15);
 /// The most rows a preview counts per rule and kind, in one statement.
 pub const PREVIEW_CAP: usize = 100_000;
 /// The bounds a duration has to sit in: one minute to ten years.
@@ -82,6 +90,19 @@ pub type Rules = Vec<(TenantId, Vec<Rule>)>;
 /// # Errors
 /// Why `raw` is not one.
 pub fn parse_duration(raw: &str) -> Result<Duration, String> {
+    parse_duration_within(raw, SHORTEST, LONGEST)
+}
+
+/// A duration as [`parse_duration`] reads it, between `shortest` and
+/// `longest` (the quality sweep's `maxAge` starts at one second, T-4018).
+///
+/// # Errors
+/// Why `raw` is not one.
+pub fn parse_duration_within(
+    raw: &str,
+    shortest: Duration,
+    longest: Duration,
+) -> Result<Duration, String> {
     let bad = || format!("{raw:?} is not a duration such as PT5M, PT8H, P30D, 5m, 8h or 14d");
     let secs = if let Some(iso) = raw.strip_prefix('P') {
         let (days, time) = match iso.split_once('T') {
@@ -134,8 +155,12 @@ pub fn parse_duration(raw: &str) -> Result<Duration, String> {
             .ok_or_else(bad)?
     };
     let d = Duration::from_secs(secs);
-    if d < SHORTEST || d > LONGEST {
-        return Err(format!("{raw:?} is outside one minute to ten years"));
+    if d < shortest || d > longest {
+        return Err(format!(
+            "{raw:?} is outside {}s to {}s",
+            shortest.as_secs(),
+            longest.as_secs()
+        ));
     }
     Ok(d)
 }
@@ -212,7 +237,16 @@ pub struct Deleted {
 /// of [`BATCH`] rows. Logs, counts and totals per pod what it deleted, never
 /// what it held.
 pub(super) async fn sweep(r: &Reloader, now: chrono::DateTime<chrono::Utc>) -> Vec<Deleted> {
-    let out = retain(&r.state, &r.retention_rules(), now, false).await;
+    sweep_within(r, now, SWEEP_BUDGET).await
+}
+
+/// [`sweep`] with `budget` in place of [`SWEEP_BUDGET`].
+pub(super) async fn sweep_within(
+    r: &Reloader,
+    now: chrono::DateTime<chrono::Utc>,
+    budget: Duration,
+) -> Vec<Deleted> {
+    let out = retain(&r.state, &r.retention_rules(), now, false, budget).await;
     let mut totals = r
         .deleted
         .lock()
@@ -233,12 +267,16 @@ pub(super) async fn sweep(r: &Reloader, now: chrono::DateTime<chrono::Utc>) -> V
 
 /// What `rules` delete at `now`, or with `dry_run` would delete: a dry run
 /// counts at most [`PREVIEW_CAP`] rows per rule and kind in one statement.
+/// A delete starts no statement once `budget` has passed since it began.
 async fn retain(
     state: &AppState,
     rules: &Rules,
     now: chrono::DateTime<chrono::Utc>,
     dry_run: bool,
+    budget: Duration,
 ) -> Vec<Deleted> {
+    let started = std::time::Instant::now();
+    let mut spent = false;
     let (batch, rounds) = if dry_run {
         (PREVIEW_CAP, 1)
     } else {
@@ -260,6 +298,10 @@ async fn retain(
                     .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 let mut count = 0u64;
                 for _ in 0..rounds {
+                    if !dry_run && started.elapsed() >= budget {
+                        spent = true;
+                        break;
+                    }
                     let n = if kind == "entity" {
                         state
                             .store
@@ -291,6 +333,13 @@ async fn retain(
                         kind,
                         count,
                     });
+                }
+                if spent {
+                    tracing::info!(
+                        budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                        "retention sweep budget spent; the next sweep goes on"
+                    );
+                    return out;
                 }
             }
         }
@@ -395,7 +444,7 @@ async fn preview(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Respon
         return Ok(refusal);
     }
     let rules = vec![(t, parse(&body)?)];
-    let found = retain(&r.state, &rules, chrono::Utc::now(), true).await;
+    let found = retain(&r.state, &rules, chrono::Utc::now(), true, SWEEP_BUDGET).await;
     Ok(counts(
         found.into_iter().map(|d| (d.type_iri, d.kind, d.count)),
     ))

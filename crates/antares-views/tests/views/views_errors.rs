@@ -6,7 +6,7 @@
 //! view serves nothing.
 
 use crate::common::{fixture, get, put_view, send, CARS, FLEET};
-use antares_ops::INNER_DETAIL;
+use antares_ops::CONTEXT_DETAIL;
 use axum::http::{Method, StatusCode};
 use serde_json::json;
 
@@ -41,8 +41,15 @@ async fn views_errors_carry_no_hidden_name_and_no_inner_detail() -> Result<(), S
         None,
     )
     .await;
-    assert_eq!(a.status, StatusCode::INTERNAL_SERVER_ERROR, "{}", a.text);
-    assert!(a.text.contains(INNER_DETAIL), "{}", a.text);
+    // 6.3.2 as at the root (T-3947), with a fixed detail: never the URL or
+    // the fetch error.
+    assert_eq!(a.status, StatusCode::GATEWAY_TIMEOUT, "{}", a.text);
+    assert!(
+        a.text.contains("\"title\":\"LdContextNotAvailable\""),
+        "{}",
+        a.text
+    );
+    assert!(a.text.contains(CONTEXT_DETAIL), "{}", a.text);
     assert!(
         !a.text.contains("nowhere-7f3a") && !a.text.contains("127.0.0.1"),
         "{}",

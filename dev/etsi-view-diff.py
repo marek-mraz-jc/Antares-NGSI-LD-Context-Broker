@@ -116,6 +116,11 @@ def operation(method, url, binds):
     return best
 
 
+# A view serves only the Subscriptions made through it (ADR-0023 rule 9).
+OWN_SUBSCRIPTIONS = {"retrieve_subscription", "query_subscriptions",
+                     "update_subscription", "delete_subscription"}
+
+
 def core_terms(path=CORE_CONTEXT):
     """term -> IRI of the core @context, its compact IRIs resolved."""
     ctx = json.load(open(path))["@context"]
@@ -219,9 +224,11 @@ def lacking(message, hidden):
 def owed(requests, offered, binds, hidden=None):
     """Why the view refuses some request of a TP's body, or []."""
     why = []
+    made = False
     for r in requests:
         url, headers = r["url"], set(r.get("headers") or ())
         op = operation(r["method"], url, binds)
+        made = made or op == "create_subscription"
         if "ngsild-tenant" in headers:
             why.append(f"{r['method']} {op or url}: NGSILD-Tenant (ADR-0023 rule 10)")
         elif "ngsild-entitymap" in headers or "entityMap" in parse_qs(urlsplit(url).query):
@@ -230,6 +237,8 @@ def owed(requests, offered, binds, hidden=None):
             why.append(f"{r['method']} {urlsplit(url).path}: no operation binds it (ADR-0023 rule 4)")
         elif op not in offered:
             why.append(f"{r['method']} {op}: not offered (ADR-0023 rule 4)")
+        elif op in OWN_SUBSCRIPTIONS and not made:
+            why.append(f"{r['method']} {op}: a Subscription made at the root, not through the view (ADR-0023 rule 9)")
         elif hidden:
             why += [f"{r['method']} {op}: {w}" for w in hidden(url, r.get("body"), op)]
             if op in LISTINGS:
@@ -283,6 +292,8 @@ def diff(view_path, e1_dir, e2_dir, binds=None):
             why = lacking(messages.get(tp.split("::", 1)[-1]), hidden)
         if why:
             refusals.append({"tp": tp, "e1": a, "view": b, "owed": why})
+            if tp in known:
+                red.append(f"stale: {tp} is an owed refusal now; remove it from {os.path.basename(KNOWN)}")
         elif tp in known:
             explained += 1
             print(f"known ({known[tp]}): E1 {a}, view {b}: {tp}")

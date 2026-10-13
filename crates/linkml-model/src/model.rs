@@ -168,14 +168,24 @@ pub const EDM_TYPE_TAG: &str = "edm_type";
 
 /// The annotation tags whose value is `"true"` or `"false"` (T-3722): a
 /// slot's `odata_computed`, `odata_immutable`; a class's
-/// `odata_insertable`, `odata_updatable`, `odata_deletable`.
-pub const FLAG_TAGS: [&str; 5] = [
+/// `odata_insertable`, `odata_updatable`, `odata_deletable` and
+/// [`QB_DSD_TAG`].
+pub const FLAG_TAGS: [&str; 6] = [
     "odata_computed",
     "odata_immutable",
     "odata_insertable",
     "odata_updatable",
     "odata_deletable",
+    QB_DSD_TAG,
 ];
+
+/// The class annotation that makes a class an RDF Data Cube Data Structure
+/// Definition (DM-60): `"true"`, and its observations are its Entities.
+pub const QB_DSD_TAG: &str = "qb_dsd";
+
+/// The slot annotation that names a slot's role in a Data Structure
+/// Definition (DM-60): `dimension` or `measure`.
+pub const QB_COMPONENT_TAG: &str = "qb_component";
 
 /// The Edm types an `edm_type` annotation may name on a slot of range `b`.
 ///
@@ -674,6 +684,12 @@ fn check_slot(schema: &Schema, what: &str, slot: &Slot) -> Result<(), Error> {
         if tag == EDM_TYPE_TAG && !allowed.contains(&a.value.as_str()) {
             return malformed(format!(
                 "{what}: {EDM_TYPE_TAG} {:?} is not one of {allowed:?} for its range",
+                a.value
+            ));
+        }
+        if tag == QB_COMPONENT_TAG && !matches!(a.value.as_str(), "dimension" | "measure") {
+            return malformed(format!(
+                "{what}: {QB_COMPONENT_TAG} {:?} is neither \"dimension\" nor \"measure\"",
                 a.value
             ));
         }
