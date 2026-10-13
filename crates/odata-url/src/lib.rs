@@ -38,6 +38,7 @@
 
 #![forbid(unsafe_code)]
 
+mod apply;
 mod ast;
 mod cursor;
 mod display;
@@ -55,9 +56,9 @@ mod search;
 use std::borrow::Cow;
 
 pub use ast::{
-    ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key,
-    KeyValue, Levels, Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions,
-    Segment, SelectItem, Shape,
+    Aggregate, AggregateWith, ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath,
+    Expr, Format, Geography, Key, KeyValue, Levels, Literal, MemberPath, Method, ODataUri, OrderBy,
+    Position, QueryOptions, Segment, SelectItem, Shape, Transformation,
 };
 #[cfg(feature = "edm")]
 pub use edm::EdmModel;

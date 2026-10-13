@@ -6048,25 +6048,26 @@ operations:
 odata_without_ngsi_ld_operation:
 - id: odata_apply
   odata_feature: $apply
-  odata_section: OData Data Aggregation extension (not part of Protocol or URL Conventions 4.01)
+  odata_section: OData Data Aggregation extension 4.0 section 3 (not part of Protocol or URL Conventions 4.01)
   ts104175: null
   cim009: null
   kind: read
   surfaces:
     odata:
-      status: rejected
-      binding: query option $apply
-      http_status: 501
-      odata_error:
-        code: NotImplemented
-        message: '$apply is not offered: no NGSI-LD operation stands behind it'
+      status: supported
+      binding: query option $apply on an EntitySet read (identity, filter, orderby, top, skip, aggregate with sum, min,
+        max, average, countdistinct and $count, groupby by single properties), executed as one query_entities scan of
+        the whole answer, bounded by RESIDUAL_SCAN (ADR-0028, T-3937); each expression a residual value per Entity
       checks:
         adr0020_phase: none
         operation_fields: []
         filterable: false
         whole_tenant: false
         linked_entity_checks: []
-      note: refused before any gate or store access
+      note: aggregated on the answer the view and the engine admit, so a hidden Entity is never counted and a hidden
+        Attribute reads as absent; past the scan bound 400 TooManyResults, never a partial aggregate; topcount and the
+        other transformations, rollup and custom aggregates 501 (T-3985); beside $filter, $orderby, $select, $expand,
+        $search or $compute, on /$count, /$ref and one Entity 501
 - id: odata_search
   odata_feature: $search
   odata_section: URL 5.1.7, Protocol 11.2.6.6

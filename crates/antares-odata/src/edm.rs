@@ -749,13 +749,39 @@ fn container_capabilities() -> Vec<Annotation> {
         flag("QuerySegmentSupported", true),
         flag("CrossJoinSupported", false),
         flag("ComputeSupported", true),
+        // Q19: the `$apply` transformations served (T-3937)
+        Annotation::new(
+            "Aggregation.ApplySupported",
+            Expr::Record(vec![
+                (
+                    "Transformations".into(),
+                    Expr::Collection(
+                        [
+                            "identity",
+                            "filter",
+                            "orderby",
+                            "top",
+                            "skip",
+                            "aggregate",
+                            "groupby",
+                        ]
+                        .into_iter()
+                        .map(|t| Expr::String(t.into()))
+                        .collect(),
+                    ),
+                ),
+                // No `Rollup`: `Aggregation.RollupType/None` is an enum member of a vocabulary
+                // the clients do not load, and Microsoft.OData.Edm's validator refuses the whole
+                // $metadata over it (BadUnresolvedEnumMember); `rollup` answers 501 (T-3937).
+            ]),
+        ),
         flag("KeyAsSegmentSupported", false),
         flag("AsynchronousRequestsSupported", false),
     ]
 }
 
 fn references() -> Vec<Reference> {
-    ["Core", "Capabilities", "Validation"]
+    ["Core", "Capabilities", "Validation", "Aggregation"]
         .into_iter()
         .map(|alias| Reference {
             uri: format!("{VOCABULARIES}Org.OData.{alias}.V1.xml"),

@@ -89,6 +89,7 @@ root.
 | `$filter` | `q` and `id` (section 4) |
 | `$search` | one more `$filter` conjunct: a word or `"phrase"` matches when a single-valued String property the view shows contains it, case-insensitively; `NOT` before `AND` (or a space) before `OR`; evaluated by the residual on what the view and the engine admit, so a hidden property never matches (T-3750) |
 | `$compute` | `expr as name`, evaluated per Entity by the residual on what the view and the engine admit and written as a dynamic property; the name works in `$filter`, `$orderby` (sorted by the surface) and `$select`; a hidden Attribute reads as absent, so its computed value is `null` (T-3936) |
+| `$apply` | `identity`, `filter`, `orderby`, `top`, `skip`, `aggregate` (`sum`, `min`, `max`, `average`, `countdistinct`, `$count`) and `groupby` by single properties, in order, over the whole answer the view and the engine admit, read by one scan of at most 10,000 Entities (past it `400 TooManyResults`, never a partial aggregate); after an aggregation the rows carry only their names and no id; `sum`, `average`, `min` and `max` fold the non-null values and are `null` without one; `$top`, `$skip` and `$count` page and count the rows; `topcount` and the other transformations, rollup, custom aggregates, the other options beside it, `/$count`, `/$ref` and one Entity are `501` (T-3937) |
 | `$orderby` | `orderBy` on `id` and single-valued values, `;desc`; `createdAt`, `modifiedAt` sorted by the surface (section 4); a missing value first ascending, last descending: when any Entity lacks a key, the surface sorts |
 | `$select` | `pick` of `id`, `type`, `scope` and the selected Attributes and those a `$compute` reads (TS 104 175 4.21: a projection, so an Entity lacking every selected Attribute is still in the answer, its members `null`); `createdAt`/`modifiedAt` add `options=sysAttrs` and are picked. A name the 4.21 grammar would read as something else (a character outside `_:#/%-+@`, a dot in a short name) pushes no projection: the whole Entity is read and the surface projects it (T-3822) |
 | `$expand` | `join=inline&joinLevel=1` (section 5) |
@@ -267,7 +268,7 @@ Every `GET` answers `HEAD` too: the same status and headers, with the
 ## 7. Refusals and errors
 
 The OData features no NGSI-LD operation stands behind (matrix 7.1 of
-`docs/analysis/operation-matrix.yaml`: `$apply`,
+`docs/analysis/operation-matrix.yaml`:
 actions, functions, `$crossjoin`, `$all`, delta, media, and the rest) are
 refused with the status the matrix names, before any gate or store access.
 An upsert is the exception: it is the Merge or Replace Entity it names,
