@@ -235,6 +235,8 @@ jobs:
           SKIP_BUILD: "1"
           STOP_ON_ERROR: "0"
           CALLBACK_HOST: localhost
+          # the context forge-free.sh rewrote the suite to, so the pipeline rewrites nothing (T-3677)
+          SUITE_CONTEXT: http://127.0.0.1:8099/resources/jsonld-contexts/ngsi-ld-test-suite-compound.jsonld
           API_SURFACES: ${{ matrix.variant == 'full' && env.FULL_SURFACES || 'admin' }}
         run: |
           [ "$SMOKE" = true ] && export SUITES=Provision
