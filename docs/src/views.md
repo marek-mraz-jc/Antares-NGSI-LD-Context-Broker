@@ -125,6 +125,9 @@ effect on the Subscriptions already made:
 - Only the view a Subscription was made through reads, lists, updates or
   deletes it; another view answers `404`. The root sees every
   Subscription of its Tenant.
+- A Subscription made through a view is local: the broker makes no
+  distributed half for it (TS 104 175 5.8.1.4), so no Context Source
+  receives a Subscription the view could not narrow.
 
 ## 4. Refusals
 

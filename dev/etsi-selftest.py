@@ -212,10 +212,13 @@ def check_view_diff():
                 for key, status in rows:
                     w.writerow(["s", *key.split("::"), status])
             with open(f"{path}/requests.jsonl", "w") as fh:
-                for test, method, url, headers, *body in requests:
+                # a fixture's request has no test and names its suite file
+                for test, method, url, headers, *extra in requests:
                     line = {"test": test, "method": method, "url": url, "headers": headers}
-                    if body:
-                        line["body"] = body[0]
+                    if test is None:
+                        line.update(fixture=True, suite=extra[0])
+                    elif extra:
+                        line["body"] = extra[0]
                     fh.write(json.dumps(line) + "\n")
             return path
 
@@ -248,6 +251,17 @@ def check_view_diff():
         ownsub = run("ownsub", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
                      [(a, "POST", f"{root}/subscriptions", []), (a, "GET", sub, [])])
         assert view_diff.diff(view, e1, ownsub, binds) == 1, "a Subscription made through the view owes nothing"
+        # T-3945: after a suite fixture registered a Context Source at the root, an Entity write
+        # and a Subscription through the view stay local (rules 7 and 9)
+        json.dump({"id": "v", "operations": ["create_entity", "create_subscription"]}, open(view, "w"))
+        writes = [(a, "POST", f"{root}/entities", []), (a, "POST", f"{root}/subscriptions", [])]
+        registered = run("registered", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")], [
+            (None, "POST", "http://h/ngsi-ld/v1/csourceRegistrations/", [], "TP/s.robot"), *writes])
+        assert view_diff.diff(view, e1, registered, binds) == 0, "a write after a registration stays local"
+        why = json.load(open(f"{registered}/owed-refusals.json"))["refusals"][0]["owed"]
+        assert ["rule 7" in why[0], "rule 9" in why[1]] == [True, True], why
+        unregistered = run("unregistered", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")], writes)
+        assert view_diff.diff(view, e1, unregistered, binds) == 1, "without a registration a write owes nothing"
         json.dump({"v": {a: "T-0000"}}, open(known, "w"))
         assert view_diff.diff(view, e1, rootsub, binds) == 1, "a known TP that is owed now must fail"
         assert view_diff.diff(view, e1, f"{tmp}/nowhere", binds) == 1, "an empty run must fail"

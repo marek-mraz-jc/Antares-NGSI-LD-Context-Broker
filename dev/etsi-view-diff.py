@@ -16,10 +16,14 @@ Such a view also owes its narrowing (T-3980): a discovery listing names only
 what it shows, a join follows Relationships only into entities it shows, a
 query that names no type answers only the view's types, and
 an answer may lack an Attribute it does not show, when the TP's failure
-message (failures.csv) names only such Attributes as missing.
+message (failures.csv) names only such Attributes as missing;
+and an Entity write or a Subscription in a TP whose fixtures registered a
+Context Source, which no write through a view reaches (rule 7 is checked on the
+local store, so the write stays local; rule 9: a view's Subscription has no
+distributed half; T-3945).
 Names are expanded as the suite sends them: its own @context, then the core
 one, then the default vocabulary. The body requests come from the run's
-requests.jsonl (dev/etsi_setup_url.py records them).
+requests.jsonl (dev/etsi_setup_url.py records them, and, marked, the fixtures').
 
 Usage:
   etsi-view-diff.py <view.json> <e1-dir> <e2-dir>
@@ -212,6 +216,17 @@ def hidden_by(view, core):
     return hidden
 
 
+# The Entity writes a registration can forward (TS 104 175 4.3.6.2); through
+# a view they stay local and no Context Source receives them, since rule 7
+# is checked on the local store alone (ADR-0023 rule 7,
+# antares-api federation::write_regs).
+LOCAL_WRITES = {"create_entity", "replace_entity", "merge_entity", "delete_entity",
+                "purge_entities", "append_attributes", "update_attributes",
+                "partial_attribute_update", "replace_attribute", "set_attribute_value",
+                "delete_attribute", "batch_create", "batch_update", "batch_upsert",
+                "batch_merge", "batch_delete"}
+
+
 def lacking(message, hidden):
     """Why an answer may lack what the failure message says it lacks: every
     name it says is missing is an Attribute the view does not show; else []."""
@@ -221,10 +236,11 @@ def lacking(message, hidden):
     return [f"the answer lacks Attribute {n} the view does not show (ADR-0023 rule 2)" for n in sorted(names)]
 
 
-def owed(requests, offered, binds, hidden=None):
+def owed(requests, offered, binds, hidden=None, fixtures=()):
     """Why the view refuses some request of a TP's body, or []."""
     why = []
     made = False
+    registered = any(operation(f["method"], f["url"], binds) == "register_context_source" for f in fixtures)
     for r in requests:
         url, headers = r["url"], set(r.get("headers") or ())
         op = operation(r["method"], url, binds)
@@ -239,6 +255,12 @@ def owed(requests, offered, binds, hidden=None):
             why.append(f"{r['method']} {op}: not offered (ADR-0023 rule 4)")
         elif op in OWN_SUBSCRIPTIONS and not made:
             why.append(f"{r['method']} {op}: a Subscription made at the root, not through the view (ADR-0023 rule 9)")
+        elif registered and op in LOCAL_WRITES:
+            why.append(f"{r['method']} {op}: a fixture registered a Context Source, "
+                       "and a write through a view stays local (ADR-0023 rule 7)")
+        elif registered and op == "create_subscription":
+            why.append(f"{r['method']} {op}: a fixture registered a Context Source, "
+                       "and a Subscription through a view stays local (ADR-0023 rule 9)")
         elif hidden:
             why += [f"{r['method']} {op}: {w}" for w in hidden(url, r.get("body"), op)]
             if op in LISTINGS:
@@ -249,12 +271,16 @@ def owed(requests, offered, binds, hidden=None):
 
 
 def requests_of(d):
-    by_tp = {}
+    """(body requests by TP, fixture requests by TP and by suite file)."""
+    by_tp, fixtures = {}, {}
     for path in glob.glob(f"{d}/**/requests.jsonl", recursive=True):
         for line in open(path, encoding="utf-8"):
             r = json.loads(line)
-            by_tp.setdefault(r["test"], []).append(r)
-    return by_tp
+            if r.get("fixture"):
+                fixtures.setdefault(r["test"] or r.get("suite", ""), []).append(r)
+            else:
+                by_tp.setdefault(r["test"], []).append(r)
+    return by_tp, fixtures
 
 
 def messages_of(d):
@@ -276,7 +302,7 @@ def diff(view_path, e1_dir, e2_dir, binds=None):
     if red:
         print("\n".join(red))
         return 1
-    reqs = requests_of(e2_dir)
+    reqs, fixtures = requests_of(e2_dir)
     messages = messages_of(e2_dir)
     offered = set(view.get("operations") or [])
     hidden = hidden_by(view, core_terms())
@@ -287,7 +313,8 @@ def diff(view_path, e1_dir, e2_dir, binds=None):
             if tp in known:
                 red.append(f"stale: {tp} answers as E1 now; remove it from {os.path.basename(KNOWN)}")
             continue
-        why = owed(reqs.get(tp, []), offered, binds, hidden) if "did not run" not in (a, b) else []
+        made = fixtures.get(tp, []) + fixtures.get(tp.split("::")[0], [])
+        why = owed(reqs.get(tp, []), offered, binds, hidden, made) if "did not run" not in (a, b) else []
         if not why and "did not run" not in (a, b):
             why = lacking(messages.get(tp.split("::", 1)[-1]), hidden)
         if why:
