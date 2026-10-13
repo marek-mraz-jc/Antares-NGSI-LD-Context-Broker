@@ -2,7 +2,7 @@
 //! Part 5 (draft OGC 23-058r1): schemas, core roles, sortables and `sortby`, `properties`,
 //! feature references and `profile` (mapping rows S1 to S3, S5 to S7).
 
-use crate::common::{fixture, get, href, ids, local};
+use crate::common::{fixture, get, href, ids, local, send};
 use axum::http::StatusCode;
 use serde_json::{json, Value};
 
@@ -229,7 +229,9 @@ async fn properties_pushed_to_pick() -> Result<(), String> {
         a.body.pointer("/features/0"),
         Some(&json!({"type": "Feature", "id": "urn:ngsi-ld:Car:1",
                      "geometry": {"type": "Point", "coordinates": [17.1, 48.1]},
-                     "properties": {"speed": 10}})),
+                     "properties": {"speed": 10},
+                     "links": [{"rel": "describedby", "type": "application/schema+json",
+                                "href": "http://localhost:9090/x/views/city/ogc/features/collections/Car/schema"}]})),
         "{}",
         a.body
     );
@@ -317,5 +319,54 @@ async fn relationship_profiles() -> Result<(), String> {
     )
     .await;
     assert_eq!(profile(&stops.body), None, "no reference, no profile link");
+    Ok(())
+}
+
+/// A cube measure named `value` is refused at the schema PUT, naming the
+/// slot (T-3956); renamed, it shows in the collection's schema beside the
+/// other slots.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_renamed_from_value_shows_in_the_schema() -> Result<(), String> {
+    let f = fixture().await?;
+    let view = json!({"id": "cube", "tenant": "city", "selector": ["R"],
+        "rules": [{"types": ["R"], "attributes": ["pmValue", "pm"]}], "operations": ["query_entities"]});
+    let a = send(&f.app, "PUT", "/q/views/cube", &view.to_string(), &[]).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    // The fixture's schema (its default prefix maps R onto the Entity type)
+    // with a class R of two measures.
+    let schema = |measure: &str| {
+        let mut s: Value = serde_json::from_str(crate::common::SCHEMA).unwrap_or_default();
+        if let Some(classes) = s.get_mut("classes").and_then(Value::as_object_mut) {
+            classes.insert("R".into(), json!({"slots": [measure, "pm"]}));
+        }
+        if let Some(slots) = s.get_mut("slots").and_then(Value::as_object_mut) {
+            slots.insert(measure.into(), json!({"range": "float"}));
+            slots.insert("pm".into(), json!({"range": "float"}));
+        }
+        s.to_string()
+    };
+    let a = send(&f.app, "PUT", "/q/schemas/city", &schema("value"), &[]).await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    assert!(
+        a.body
+            .get("detail")
+            .and_then(Value::as_str)
+            .is_some_and(|d| d.contains("\"value\"")),
+        "{}",
+        a.body
+    );
+    let a = send(&f.app, "PUT", "/q/schemas/city", &schema("pmValue"), &[]).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    let a = get(&f.app, "/x/views/cube/ogc/features/collections/R/schema").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        keys(a.body.get("properties"))
+            .iter()
+            .filter(|k| *k == "pmValue" || *k == "pm")
+            .count(),
+        2,
+        "{}",
+        a.body
+    );
     Ok(())
 }

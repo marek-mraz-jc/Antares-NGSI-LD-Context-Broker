@@ -2,9 +2,9 @@ name: surfaces-conformance
 
 # The surfaces' conformance jobs (docs/analysis/surfaces-conformance.md
 # section 7). This file holds the MCP pair (T-3516), the OData suites
-# (T-3510, T-3714), etsi-iop (T-3675), ws-conformance (T-3518),
-# linkml-conformance (T-3512) and etsi-full-all (T-3501); the other surfaces
-# add their jobs here.
+# (T-3510, T-3714), the OGC ETS (T-3747), etsi-iop (T-3675),
+# ws-conformance (T-3518), linkml-conformance (T-3512) and etsi-full-all
+# (T-3501); the other surfaces add their jobs here.
 #
 #   mcp-conformance  the official @modelcontextprotocol/conformance 0.1.16
 #                    against /x/views/all/mcp, both revisions it knows that
@@ -22,6 +22,10 @@ name: surfaces-conformance
 #                    v1.0.3 (pinned by checksum) against view `compliance`
 #                    (its reference model, ci/odata-compliance), red on any
 #                    test ci/odata-compliance-baseline.json passes (T-3714)
+#   ogc-compliance-external  the OGC CITE ets-ogcapi-features10 (TEAM
+#                    Engine image pinned by digest) against view `all` and
+#                    each Endpoint kind of ci/views/ogc, red on any test
+#                    ci/ogc-compliance/<view>.json passes (T-3747, T-3831)
 #   ws-conformance   docs/api/asyncapi-ws.yaml validated by @asyncapi/cli
 #                    2.16.0, then joinedcontext-conformance tests/ws: the
 #                    scripted sessions of /x/views/all/ws, every message
@@ -36,6 +40,11 @@ name: surfaces-conformance
 #                    difference passes only as a refusal the view owes
 #                    (dev/etsi-view-diff.py) or a TP dev/etsi-view-known.json
 #                    names with its task (T-3501)
+#   etsi-full-restricted  nightly: the same suites through view
+#                    `etsi-restricted` (E4: Building and City, airQualityLevel
+#                    hidden, reads only), diffed with etsi-full-all's E1: a
+#                    difference passes only as a refusal the view owes, a
+#                    write, a hidden type or a hidden Attribute (T-3787)
 #   etsi-icsr        the ETSI DistributedOperations directory on broker1 of
 #                    the internal-csr image with ANTARES_SELF_URLS set to
 #                    its own URL, compared TP by TP with the vanilla image
@@ -54,7 +63,7 @@ name: surfaces-conformance
 # Pull requests to dev run the merge-request subset (both official
 # revisions, the parity suite trimmed to MCP_PARITY_CASES=5, the OData ABNF
 # and $metadata cases); the nightly run, v* tags and dispatch run
-# everything. The broker is the `full` build (views, mcp, odata, ws) with
+# everything. The broker is the `full` build (views, mcp, odata, ogc, ws) with
 # `linkml`,
 # loaded with ci/views (views, LinkML schemas, seed) by dev/views-rig.sh.
 on:
@@ -86,8 +95,10 @@ env:
   # joinedcontext-conformance (public) at the commit that carries the
   # broker's MCP parity table, the platform_only marker, tests/odata and
   # its client checks, tests/ws, the F21/F29 parity rows (T-3686), the
-  # bind-to-an-absent-target 400 (T-3760) and tests/linkml (T-3512)
-  CONFORMANCE_REF: 5e3722f143ede3cf768574acb050388044e9aa45
+  # bind-to-an-absent-target 400 (T-3760), tests/linkml (T-3512) and the
+  # OData parity rows the residual serves (T-3981), the last two together on
+  # conformance main since its merge of T-3512 (T-4003)
+  CONFORMANCE_REF: 2c6f70d3a41bb40e3bf0a33858396349e3d46d2d
   NIGHTLY: ${{ github.event_name != 'pull_request' && !inputs.fast }}
 
 jobs:
@@ -355,6 +366,81 @@ jobs:
         with:
           title: odata-compliance-external went red
           body: A test the NLstn OData compliance suite passed in ci/odata-compliance-baseline.json fails now.
+          log-file: gate.md
+
+  ogc-compliance-external:
+    name: ogc-compliance-external (${{ matrix.view }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One run per Endpoint kind (T-3831): `all` is the conformance Tenant's star
+    # view; the others read the `ogc` Tenant of ci/views/ogc (public, internal
+    # with the Part 4 writes, filtered by q, star, projection, a data cube).
+    strategy:
+      fail-fast: false
+      matrix:
+        view: [all, ogc-public, ogc-internal, ogc-filtered, ogc-star, ogc-projection, ogc-cube]
+    permissions:
+      contents: read
+      issues: write
+    env:
+      # ets-ogcapi-features10 1.8 on TEAM Engine 5.7, the last release (1.9 is a
+      # release candidate), pinned by digest; it tests Part 1 and Part 2 (CRS),
+      # no ETS tests Part 4 or Part 5 yet (docs/src/ogc-compliance.md)
+      TE_IMAGE: ogccite/ets-ogcapi-features10:1.8-teamengine-5.7@sha256:d884de89ac8dae6ea153766886c706f9ddf6ce172de0c4bd4bdd591d28bdaffe
+      IUT: http://localhost:9090/x/views/${{ matrix.view }}/ogc/features
+      BASELINE: ci/ogc-compliance/${{ matrix.view }}.json
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: broker-surfaces
+      - name: Start TEAM Engine, the broker and the views
+        run: |
+          chmod +x antares
+          # host network: TEAM Engine on 8080 reaches the broker at localhost:9090
+          docker run -d --name teamengine --network host "$TE_IMAGE"
+          ANTARES_HTTP_PORT=9090 ANTARES_API_SURFACES=admin,views,ogc \
+            ANTARES_SCHEMA_MAX_BYTES=1048576 ./antares > broker.log 2>&1 &
+          for _ in $(seq 1 100); do curl -sf -o /dev/null localhost:9090/q/health && break; sleep 0.2; done
+          dev/views-rig.sh http://localhost:9090
+          dev/views-rig.sh http://localhost:9090 ci/views/ogc
+          # the image's own public test account (ogctest), not a secret
+          for _ in $(seq 1 60); do
+            curl -fsS -m 5 -u ogctest:ogctest -o /dev/null localhost:8080/teamengine/rest/suites && break
+            sleep 5
+          done
+      - name: The ETS, gated by ci/ogc-compliance/<view>.json
+        run: |
+          dev/ogc-compliance/baseline.py --self-test
+          iut=$(jq -rn --arg u "$IUT" '$u|@uri')
+          curl -sS -m 1500 -u ogctest:ogctest -H 'Accept: application/xml' -o testng-results.xml \
+            "localhost:8080/teamengine/rest/suites/ogcapi-features-1.0/run?iut=$iut&noofcollections=-1" || true
+          set +e
+          dev/ogc-compliance/baseline.py check testng-results.xml "$BASELINE" > gate.md 2>&1
+          rc=$?
+          { echo "## OGC API - Features ETS (ets-ogcapi-features10 1.8), view ${{ matrix.view }}"; cat gate.md; } >> "$GITHUB_STEP_SUMMARY"
+          cat gate.md
+          exit $rc
+      - name: TEAM Engine log
+        if: always()
+        run: docker logs teamengine > teamengine.log 2>&1 || true
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: ogc-compliance-external-${{ matrix.view }}
+          path: |
+            testng-results.xml
+            gate.md
+            broker.log
+            teamengine.log
+          retention-days: 14
+      - name: File an issue on nightly failure
+        if: failure() && github.event_name == 'schedule'
+        uses: ./.github/actions/failure-issue
+        with:
+          title: ogc-compliance-external (${{ matrix.view }}) went red
+          body: A test the OGC API - Features ETS passed in ci/ogc-compliance/${{ matrix.view }}.json fails now.
           log-file: gate.md
 
   ws-conformance:
@@ -720,6 +806,83 @@ jobs:
             ${{ env.OUT }}/*-console.log
             ${{ env.OUT }}/**/log.html
           retention-days: 14
+
+  etsi-full-restricted-run:
+    name: etsi-full-restricted e4
+    if: ${{ github.event_name != 'pull_request' && !inputs.fast }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OUT: results/etsi-e4
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the full image
+        run: docker build --build-arg FEATURES=mqtt,views,mcp,odata,ws -t antares-local:latest .
+      - name: The serial suites through view etsi-restricted
+        env:
+          STORE: file
+          SUITES: CommonBehaviours,ContextInformation,ContextSource,jsonldContext,DistributedOperations
+          RESULTS_DIR: ${{ env.OUT }}
+          SKIP_BUILD: "1"
+          STOP_ON_ERROR: "0"
+          CALLBACK_HOST: localhost
+          API_SURFACES: admin,views
+          VIEWS: ci/views/etsi
+          NGSILD_BASE: /x/views/etsi-restricted/ngsi-ld/v1
+        run: ./dev/etsi-pipeline.sh || true
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: etsi-full-restricted-e4
+          path: |
+            ${{ env.OUT }}/tp-status.csv
+            ${{ env.OUT }}/requests.jsonl
+            ${{ env.OUT }}/run-summary.md
+            ${{ env.OUT }}/failures.csv
+            ${{ env.OUT }}/*-console.log
+            ${{ env.OUT }}/**/log.html
+          retention-days: 14
+
+  etsi-full-restricted:
+    name: etsi-full-restricted
+    needs: [etsi-full-all-run, etsi-full-restricted-run]
+    if: always() && needs.etsi-full-restricted-run.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: etsi-full-all-e1
+          path: in/e1
+      - uses: actions/download-artifact@v7
+        with:
+          name: etsi-full-restricted-e4
+          path: in/e4
+      - name: Through view etsi-restricted, every TP answers as the plain root or owes its refusal
+        # explicit bash is -eo pipefail: the diff's exit survives the tee
+        shell: bash
+        run: |
+          pip install --quiet pyyaml
+          python3 dev/etsi-view-diff.py ci/views/etsi/etsi-restricted.json in/e1 in/e4 | tee view-diff.txt
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: etsi-full-restricted-diff
+          path: |
+            view-diff.txt
+            in/e4/owed-refusals.json
+          retention-days: 14
+      - name: File an issue on nightly failure
+        if: failure() && github.event_name == 'schedule'
+        uses: ./.github/actions/failure-issue
+        with:
+          title: etsi-full-restricted went red
+          body: Through view etsi-restricted, an ETSI TP answers otherwise than at the plain root of the same image, and no write, hidden type or hidden Attribute of the view explains it.
+          log-file: view-diff.txt
 
   etsi-full-all:
     name: etsi-full-all

@@ -744,7 +744,7 @@ async fn read_body_capped(resp: reqwest::Response) -> Value {
         loop {
             match resp.chunk().await {
                 Ok(Some(c)) => {
-                    if buf.len() + c.len() > cap {
+                    if buf.len().saturating_add(c.len()) > cap {
                         tracing::warn!("federation response over the {cap}-byte cap, skipped");
                         return Value::Null;
                     }
@@ -807,16 +807,13 @@ where
 /// segment stops at the next `/`, so `/attrs/{name}/value` and
 /// `/attrs/{name}/{instanceId}` both name `{name}` and nothing more.
 fn path_attr_segment(url: &str) -> Option<(std::ops::Range<usize>, String)> {
-    let path_end = url.find('?').unwrap_or(url.len());
-    let at = url[..path_end].find("/attrs/")? + "/attrs/".len();
-    let rest = &url[at..path_end];
-    let end = at + rest.find('/').unwrap_or(rest.len());
-    (end > at).then(|| {
-        (
-            at..end,
-            crate::negotiate::percent_decode(&url.as_bytes()[at..end]),
-        )
-    })
+    let path = url.split_once('?').map_or(url, |(path, _)| path);
+    let (before, rest) = path.split_once("/attrs/")?;
+    let name = rest.split_once('/').map_or(rest, |(name, _)| name);
+    // `before` and "/attrs/" are a prefix of `url`, so the range lies inside it
+    let at = before.len().checked_add("/attrs/".len())?;
+    let end = at.checked_add(name.len())?;
+    (!name.is_empty()).then(|| (at..end, crate::negotiate::percent_decode(name.as_bytes())))
 }
 
 /// Table 5.2.9-2 and 5.2.34: one forward's outcome, booked on the
@@ -1044,7 +1041,7 @@ fn in_cooldown(st: &AppState, tenant: &TenantId, reg: &FedReg) -> bool {
 
 /// 5.2.34 timeout: the per-registration budget, below the 8 s ceiling.
 fn deadline_ms(reg: &FedReg) -> u32 {
-    let ceiling = 8_000 * crate::state::slow_factor();
+    let ceiling = crate::state::slow_factor().saturating_mul(8_000);
     reg.timeout_ms.map_or(ceiling, |t| t.min(ceiling)) as u32
 }
 
@@ -2722,7 +2719,9 @@ pub fn combine(parts: Vec<Part>, ok: Response, tenant: &TenantId) -> Response {
         return ok;
     }
     if parts.len() == 1 {
-        let p = &parts[0];
+        let Some(p) = parts.first() else {
+            return ok;
+        };
         let status = StatusCode::from_u16(p.status).unwrap_or(StatusCode::BAD_GATEWAY);
         let (etype, title) = match p.status {
             // 5.6.1.4/5.6.2…: an unsupported-operation part is the Conflict

@@ -45,15 +45,15 @@ struct Scope {
 
 impl Scope {
     fn new(terms: HashMap<String, TermDef>) -> Self {
+        // shortest, then lexicographically least, term first: the first
+        // claim on an IRI is the one that stays
+        let mut sorted: Vec<(&String, &TermDef)> = terms.iter().collect();
+        sorted.sort_unstable_by_key(|(t, _)| (t.len(), t.as_str()));
         let mut inverse: HashMap<String, String> = HashMap::new();
-        for (term, def) in &terms {
-            match inverse.get(&def.iri) {
-                Some(existing)
-                    if (existing.len(), existing.as_str()) <= (term.len(), term.as_str()) => {}
-                _ => {
-                    inverse.insert(def.iri.clone(), term.clone());
-                }
-            }
+        for (term, def) in sorted {
+            inverse
+                .entry(def.iri.clone())
+                .or_insert_with(|| term.clone());
         }
         Self { terms, inverse }
     }
@@ -302,7 +302,7 @@ impl Context {
     /// several documents cannot walk past it.
     fn charge(&mut self, iri: &str) -> Result<(), NgsiError> {
         self.bytes = self.bytes.saturating_add(iri.len());
-        if self.bytes > crate::loader::MAX_CONTEXT_BYTES {
+        if self.bytes > crate::pinned::MAX_CONTEXT_BYTES {
             return Err(NgsiError::BadRequestData(
                 "@context term definitions exceed the maximum size".into(),
             ));
@@ -667,6 +667,92 @@ mod tests {
     /// Expanded term-definition forms: @type/@container flags and a term
     /// aliased to a JSON-LD keyword (which must stay the keyword, not expand
     /// into the vocabulary).
+    /// A Core document's scoped contexts (Annex B): an object, an array of
+    /// objects, or a remote reference (not fetched, so it scopes nothing);
+    /// nested scopes stack, `outside` drops them, and a scoped term of the
+    /// same name keeps the outer term from compacting.
+    #[test]
+    fn core_scoped_contexts_stack_and_shadow() {
+        let mut c = Context::default();
+        c.merge_core_object(
+            json!({
+                "ex": "https://example.org/",
+                "name": "https://example.org/name",
+                "Car": {"@id": "ex:Car", "@context": {
+                    "@version": 1.1,
+                    "name": "https://example.org/carName",
+                    "wheels": {"@id": "ex:wheels"},
+                    "dupB": "https://example.org/dup",
+                    "dupA": "https://example.org/dup",
+                    "d": "https://example.org/dup",
+                    "skip": {"@type": "@id"},
+                    "bad": 3
+                }},
+                "Bus": {"@id": "ex:Bus", "@context": [
+                    {"seats": "ex:seats"},
+                    "https://example.org/remote.jsonld"
+                ]},
+                "Proof": {"@id": "ex:Proof", "@context": "https://example.org/remote.jsonld"},
+                "same1": "https://example.org/same",
+                "s2": "https://example.org/same"
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .unwrap();
+        c.freeze();
+
+        assert!(matches!(
+            c.within("https://example.org/Nothing"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(c.outside(), Cow::Borrowed(_)));
+        let car = c.within("https://example.org/Car").into_owned();
+        assert_eq!(car.expand_key("wheels"), "https://example.org/wheels");
+        assert!(car.term("skip").is_none_or(|d| d.iri != "skip"));
+        // the outer "name" IRI no longer compacts to "name" inside the Car scope
+        assert_ne!(car.compact_iri("https://example.org/name"), "name");
+        assert_eq!(car.compact_iri("https://example.org/carName"), "name");
+        assert_eq!(
+            car.compact_iri("https://example.org/dup"),
+            "d",
+            "shortest term wins"
+        );
+        let both = car.within("https://example.org/Bus").into_owned();
+        assert_eq!(both.expand_key("seats"), "https://example.org/seats");
+        assert_eq!(both.expand_key("wheels"), "https://example.org/wheels");
+        assert_eq!(both.compact_iri("https://example.org/same"), "s2");
+        let proof = c.within("https://example.org/Proof").into_owned();
+        assert_eq!(proof.expand_key("name"), "https://example.org/name");
+        let out = both.outside();
+        assert_eq!(out.expand_key("name"), "https://example.org/name");
+        assert_eq!(out.compact_iri("https://example.org/name"), "name");
+    }
+
+    /// `@id` values in a term definition: a prefix that is not
+    /// prefix-capable, an unknown prefix, a colon string that is no IRI, a
+    /// bare term, and a term whose own name is already an absolute IRI.
+    #[test]
+    fn definition_ids_that_do_not_expand_through_a_prefix() {
+        let c = ctx(json!({
+            "ex": "https://example.org/",
+            "rel": {"@id": "ex:rel"},
+            "viaRel": {"@id": "rel:x"},
+            "unknown": {"@id": "nope:x"},
+            "odd": {"@id": "1x:y"},
+            "bare": {"@id": "ex"},
+            "https://example.org/self": {"@type": "@id"}
+        }));
+        assert_eq!(c.term("viaRel").unwrap().iri, "rel:x");
+        assert_eq!(c.term("unknown").unwrap().iri, "nope:x");
+        assert_eq!(c.term("odd").unwrap().iri, "1x:y");
+        assert_eq!(c.term("bare").unwrap().iri, "https://example.org/");
+        assert_eq!(
+            c.term("https://example.org/self").unwrap().iri,
+            "https://example.org/self"
+        );
+    }
+
     #[test]
     fn expanded_definition_forms() {
         let c = ctx(json!({
@@ -675,13 +761,17 @@ mod tests {
             "kind": {"@id": "ex:kind", "@type": "@vocab"},
             "items": {"@id": "ex:items", "@container": "@list"},
             "alias": {"@id": "@type"},
-            "implicit": {"@type": "@id"}
+            "implicit": {"@type": "@id"},
+            "implicitList": {"@container": "@list"}
         }));
         let rel = c.term("rel").unwrap();
-        assert!(rel.type_is_id && !rel.type_is_vocab && !rel.container_list);
+        assert!(rel.type_is_id);
+        assert!(!rel.type_is_vocab);
+        assert!(!rel.container_list);
         assert_eq!(rel.iri, "https://example.org/rel");
         assert!(c.term("kind").unwrap().type_is_vocab);
         assert!(c.term("items").unwrap().container_list);
+        assert!(c.term("implicitList").unwrap().container_list);
         assert_eq!(c.term("alias").unwrap().iri, "@type");
         // no @id but @type present: the term maps into the vocabulary
         assert_eq!(

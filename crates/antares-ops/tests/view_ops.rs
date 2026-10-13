@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! `Ops::view` and `ViewOps::run` (ADR-0023 rules 4 and 10): a loaded view
 //! by id and nothing else, its allowlist, its one Tenant, and the narrowed
-//! handle following a reload.
+//! handle following a reload; the names a caller writes beside a standard's
+//! own query read in the view's @context (T-3758).
 
 use antares_ops::test_kit::TestBroker;
 use antares_ops::{Caller, OperationId, Ops, OpsRequest, Surface};
 use axum::body::Body;
-use axum::extract::Path;
+use axum::extract::{Path, RawQuery};
 use axum::http::{HeaderValue, Method, Request, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use http_body_util::BodyExt;
@@ -44,15 +46,68 @@ impl Surface for Probe {
             }
         };
         let mapped = ops.clone();
+        let reader = ops.clone();
+        let named = ops.clone();
         Router::new()
             .route(
+                "/{view}/read",
+                get(move |Path(id): Path<String>, caller: Caller| {
+                    read_whole(reader.clone(), id, caller)
+                }),
+            )
+            .route(
+                "/{view}/names",
+                get(move |Path(id): Path<String>, RawQuery(query): RawQuery| {
+                    let ops = named.clone();
+                    async move {
+                        let Some(view) = ops.view(&id) else {
+                            return antares_ops::Refusal::NotFound.ngsi_ld();
+                        };
+                        // the raw (still percent-encoded) `q=` and `names=`, as a surface reads them
+                        let query = query.unwrap_or_default();
+                        let raw = |key: &str| {
+                            query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+                                .unwrap_or_default()
+                                .to_owned()
+                        };
+                        let mut minted: Vec<String> = Vec::new();
+                        let q = view.rename_q(&raw("q"), &mut |iri| {
+                            minted.push(iri.to_owned());
+                            format!("t{}", minted.len())
+                        });
+                        let expanded = view.expand_names(&raw("names"));
+                        axum::Json(json!({
+                            "speed": view.expand_name("speed"),
+                            "q": q.map_err(|r| r.ngsi_ld().status().as_u16()),
+                            "minted": minted,
+                            "names": expanded.map_err(|r| r.ngsi_ld().status().as_u16()),
+                        }))
+                        .into_response()
+                    }
+                }),
+            )
+            .route(
                 "/{view}/mapping",
-                get(move |Path(id): Path<String>| {
+                get(move |Path(id): Path<String>, caller: Caller| {
                     let ops = mapped.clone();
                     async move {
+                        let view = ops.mapped_view(&id);
+                        // an operation the view does not allow, mapped or not
+                        let types = match &view {
+                            Some(v) => {
+                                let req = OpsRequest::new(Method::GET, "/ngsi-ld/v1/types");
+                                let run = v.run(OperationId::RetrieveEntityTypes, &caller, req);
+                                Some(run.await.map_or_else(|r| r.ngsi_ld().status(), |a| a.status()).as_u16())
+                            }
+                            None => None,
+                        };
                         axum::Json(json!({
                             "view": ops.view(&id).is_some(),
-                            "mapped": ops.mapped_view(&id).and_then(|v| v.mapping().map(|m| m.source_class().to_owned())),
+                            "mapped": view.as_ref().and_then(|v| v.mapping().map(|m| m.source_class().to_owned())),
+                            "names": view.as_ref().and_then(antares_ops::ViewOps::target_names),
+                            "types": types,
                         }))
                     }
                 }),
@@ -73,6 +128,22 @@ impl Surface for Probe {
                     "/ngsi-ld/v1/entities?type=Car",
                 )),
             )
+    }
+}
+
+/// The view's Cars read whole through [`antares_ops::ViewOps::read_answer`] (T-3773).
+async fn read_whole(ops: Ops, id: String, caller: Caller) -> Response {
+    let Some(view) = ops.view(&id) else {
+        return antares_ops::Refusal::NotFound.ngsi_ld();
+    };
+    let req = OpsRequest::new(Method::GET, "/ngsi-ld/v1/entities?type=Car");
+    let read = match view.run(OperationId::QueryEntities, &caller, req).await {
+        Ok(answer) => view.read_answer(answer.into_body()).await,
+        Err(refusal) => Err(refusal),
+    };
+    match read {
+        Ok(bytes) => bytes.into_response(),
+        Err(refusal) => refusal.ngsi_ld(),
     }
 }
 
@@ -127,7 +198,10 @@ fn view(attributes: &[&str], operations: &[&str]) -> Value {
 }
 
 async fn broker() -> Result<(TestBroker, Router), String> {
-    let b = TestBroker::new().await?;
+    broker_on(TestBroker::new().await?).await
+}
+
+async fn broker_on(b: TestBroker) -> Result<(TestBroker, Router), String> {
     let app = b.serve(Probe)?;
     for (tenant, id) in [
         ("city", "urn:ngsi-ld:Car:1"),
@@ -287,12 +361,134 @@ async fn a_view_of_another_model_reaches_only_the_surface_that_asks_for_its_mapp
     let a = send(&app, Method::GET, "/x/probe/mapped/mapping", &[], None).await;
     assert_eq!(
         a.json,
-        json!({"view": false, "mapped": "https://uri.etsi.org/ngsi-ld/default-context/Car"})
+        json!({"view": false, "mapped": "https://uri.etsi.org/ngsi-ld/default-context/Car",
+               "names": [["Vehicle"], ["velocity"]], "types": 405})
     );
     let a = send(&app, Method::GET, "/x/probe/cars/mapping", &[], None).await;
     assert_eq!(
-        a.json,
-        json!({"view": true, "mapped": null}),
-        "a view of the store's own model"
+        a.json["names"],
+        Value::Null,
+        "a view of the store's own model: {}",
+        a.json
     );
+    assert_eq!(a.json["mapped"], Value::Null);
+}
+
+/// T-3817: a mapped view names the slots it can produce from what its rules
+/// show of the source class: none shown names the constants alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mapped_view_names_the_slots_its_rules_can_produce() {
+    let (_b, app) = broker().await.expect("broker");
+    let slots = json!([
+        {"target": "velocity", "source": "speed", "kind": "rename"},
+        {"target": "hidden", "source": "secret", "kind": "rename"},
+        {"target": "maker", "kind": "constant", "value": "acme"}
+    ]);
+    for (id, rules, names) in [
+        (
+            "narrow",
+            json!([{"types": ["Car"], "attributes": ["speed"]}]),
+            json!(["maker", "velocity"]),
+        ),
+        (
+            "bare",
+            json!([{"types": ["Car"], "attributes": []}]),
+            json!(["maker"]),
+        ),
+        (
+            "both",
+            json!([{"types": ["Car"], "attributes": ["speed", "secret"]}]),
+            json!(["hidden", "maker", "velocity"]),
+        ),
+    ] {
+        let view = json!({
+            "id": id, "tenant": "city", "selector": ["Car"],
+            "rules": rules,
+            "operations": ["query_entities"],
+            "mapping": {"version": 2, "sourceClass": "Car", "targetClass": "Vehicle", "slots": slots}
+        });
+        let a = send(
+            &app,
+            Method::PUT,
+            &format!("/q/views/{id}"),
+            &[],
+            Some(&view),
+        )
+        .await;
+        assert_eq!(a.status, StatusCode::CREATED, "{}", a.json);
+        let a = send(
+            &app,
+            Method::GET,
+            &format!("/x/probe/{id}/mapping"),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(a.json["names"], json!([["Vehicle"], names]), "{id}");
+    }
+}
+
+/// T-3773: a view's answer is read up to the broker's buffer bound; past it
+/// the surface gets `Refusal::Limit`, 413, never the whole body.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_answer_past_the_buffer_bound_is_413() {
+    let (_b, app) = broker().await.expect("broker");
+    let whole = send(&app, Method::GET, "/x/probe/cars/read", &[], None).await;
+    assert_eq!(whole.status, StatusCode::OK, "{}", whole.json);
+    assert_eq!(
+        whole.json.pointer("/0/id"),
+        Some(&json!("urn:ngsi-ld:Car:1"))
+    );
+    let small = TestBroker::with_max_answer_bytes(16).await.expect("broker");
+    let (_b, app) = broker_on(small).await.expect("broker");
+    let a = send(&app, Method::GET, "/x/probe/cars/read", &[], None).await;
+    assert_eq!(a.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", a.json);
+    assert_eq!(
+        a.json.get("detail"),
+        Some(&json!(antares_ops::bounds::ANSWER_TOO_LARGE))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callers_names_read_in_the_views_context() {
+    let (_b, app) = broker().await.expect("broker");
+    let mut named = view(&["speed"], &["query_entities"]);
+    named["@context"] = json!({"speed": "https://example.org/speed"});
+    let a = send(&app, Method::PUT, "/q/views/cars", &[], Some(&named)).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.json);
+    let a = send(
+        &app,
+        Method::GET,
+        "/x/probe/cars/names?q=speed%3E1;colour.observedAt%3E2026-01-01T00:00:00Z&names=speed%2Ccolour",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(
+        a.json,
+        json!({
+            "speed": "https://example.org/speed",
+            "q": {"Ok": "t1>1;t2.observedAt>\"2026-01-01T00:00:00Z\""},
+            "minted": ["https://example.org/speed", "https://uri.etsi.org/ngsi-ld/default-context/colour"],
+            "names": {"Ok": ["https://example.org/speed", "https://uri.etsi.org/ngsi-ld/default-context/colour"]},
+        }),
+        "{}",
+        a.json
+    );
+    let a = send(
+        &app,
+        Method::GET,
+        "/x/probe/cars/names?q=%28speed&names=a,,b",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(
+        (a.json.get("q"), a.json.get("names")),
+        (Some(&json!({"Err": 400})), Some(&json!({"Err": 400}))),
+        "{}",
+        a.json
+    );
+    let a = send(&app, Method::GET, "/x/probe/nosuch/names", &[], None).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND);
 }

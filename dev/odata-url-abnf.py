@@ -55,6 +55,8 @@ def prefix(rule: str) -> str:
     if rule in ("queryOptions", "systemQueryOption", "customQueryOption", "filter", "select", "expand",
                 "orderby", "orderBy", "skiptoken", "deltatoken", "compute", "search"):
         return "Customers?"
+    if rule == "searchExpr":
+        return "Customers?$search="
     return "Customers?$filter=Items/" if rule == "anyExpr" else "Customers?$filter="
 
 

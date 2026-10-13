@@ -184,9 +184,9 @@ async fn upsert_temporal_local(
     // both see "absent", and the loser's create must NOT be silently
     // dropped (201 with a discarded payload). Loop: a lost create retries
     // as a merge, a mutate on a just-deleted doc retries as a create.
-    let mut attempts = 0;
+    let mut attempts: u8 = 0;
     loop {
-        attempts += 1;
+        attempts = attempts.saturating_add(1);
         if attempts > 16 {
             return Err(NgsiError::InternalError("upsert retry storm".into()).into());
         }
@@ -295,7 +295,7 @@ fn truncate(w: &mut Windowed, timeprop: &str, descending: bool) {
         .attrs
         .values()
         .filter(|insts| insts.len() > TEMPORAL_INSTANCE_LIMIT)
-        .filter_map(|insts| key(&insts[TEMPORAL_INSTANCE_LIMIT - 1]))
+        .filter_map(|insts| insts.get(TEMPORAL_INSTANCE_LIMIT - 1).and_then(key))
         .reduce(|a, b| if (b < a) != descending { b } else { a });
     let (mut ts_min, mut ts_max) = (None::<String>, None::<String>);
     for instances in w.attrs.values_mut() {
@@ -363,14 +363,13 @@ fn scope_match_intervals(doc: &Value, sq: &str) -> Vec<(String, Option<String>)>
                 })
                 .collect();
             states.sort_by_key(|(t, _)| dt_key(t));
-            (0..states.len())
-                .filter(|&n| scope_value_matches(sq, states[n].1))
-                .map(|n| {
-                    (
-                        states[n].0.to_owned(),
-                        states.get(n + 1).map(|(t, _)| (*t).to_owned()),
-                    )
-                })
+            // each state with the time the next one was set, the last open
+            let next = states.iter().skip(1).map(Some).chain(std::iter::once(None));
+            states
+                .iter()
+                .zip(next)
+                .filter(|((_, value), _)| scope_value_matches(sq, value))
+                .map(|((t, _), next)| ((*t).to_owned(), next.map(|(t, _)| (*t).to_owned())))
                 .collect()
         }
         Some(_) if crate::scope_matches(sq, doc) => vec![(String::new(), None)],
@@ -1196,7 +1195,7 @@ fn aggr_eligible(class: AggrClass, method: &str) -> bool {
 fn seconds_of_day(s: &str) -> Option<f64> {
     let t = s.strip_suffix('Z').unwrap_or(s);
     let b = t.as_bytes();
-    if b.len() < 8 || b[2] != b':' || b[5] != b':' {
+    if b.len() < 8 || b.get(2) != Some(&b':') || b.get(5) != Some(&b':') {
         return None;
     }
     let h: f64 = t.get(0..2)?.parse().ok()?;
@@ -1283,9 +1282,12 @@ fn render_aggregated(
             }
         }
         times.sort_by_key(|(t, _)| *t);
+        let Some(&(earliest, _)) = times.first() else {
+            continue;
+        };
         let anchor = tq
             .and_then(|tq| DateTime::parse_from_rfc3339(&tq.time_at).ok())
-            .unwrap_or(times[0].0);
+            .unwrap_or(earliest);
         // 4.5.19.1: "A duration of 0 second (e.g. expressed as "PT0S" or
         // "P0D") is valid and is interpreted as a duration spanning the whole
         // time range specified by the temporal query." The query names one
@@ -1296,7 +1298,9 @@ fn render_aggregated(
             let (Some(&(first, _)), Some(&(last_at, _))) = (times.first(), times.last()) else {
                 continue;
             };
-            let last = last_at + chrono::Duration::seconds(1);
+            let last = last_at
+                .checked_add_signed(chrono::Duration::seconds(1))
+                .unwrap_or(last_at);
             match tq {
                 Some(q) if q.timerel == "before" => (first, at(&q.time_at).unwrap_or(last)),
                 Some(q) if q.timerel == "between" => (
@@ -1316,7 +1320,7 @@ fn render_aggregated(
                         // checked throughout: an offset no representable
                         // date can hold puts the instant in one final
                         // open-ended bucket instead of panicking
-                        let idx = (t - anchor).num_seconds().div_euclid(sc);
+                        let idx = t.signed_duration_since(anchor).num_seconds().div_euclid(sc);
                         let bucket = idx
                             .checked_mul(sc)
                             .and_then(chrono::Duration::try_seconds)
@@ -1351,13 +1355,18 @@ fn render_aggregated(
                         // brackets the exact index within one step: binary-search
                         // between it and the anchor instead of walking there,
                         // which is O(log) however far the instant is.
-                        let approx = (i64::from(t.year() - anchor.year()) * 12
-                            + i64::from(t.month())
-                            - i64::from(anchor.month()))
-                        .div_euclid(i64::from(m));
-                        let (mut lo, mut hi) = (approx.min(0) - 1, approx.max(0) + 1);
-                        while hi - lo > 1 {
-                            let mid = lo + (hi - lo) / 2;
+                        let approx = i64::from(t.year())
+                            .saturating_sub(i64::from(anchor.year()))
+                            .saturating_mul(12)
+                            .saturating_add(i64::from(t.month()))
+                            .saturating_sub(i64::from(anchor.month()))
+                            .div_euclid(i64::from(m));
+                        let (mut lo, mut hi) = (
+                            approx.min(0).saturating_sub(1),
+                            approx.max(0).saturating_add(1),
+                        );
+                        while hi.saturating_sub(lo) > 1 {
+                            let mid = lo.saturating_add(hi.saturating_sub(lo).div_euclid(2));
                             if step(mid).is_some_and(|s| s <= t) {
                                 lo = mid;
                             } else {
@@ -1568,9 +1577,9 @@ async fn query_temporal_outer(
         eff.insert("limit".into(), st.max_limit.to_string());
         eff.insert("id".into(), chunk.join(","));
         let resp = query_temporal_inner(st, &eff, headers, &filter).await?;
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
             .await
-            .map_err(|_| NgsiError::InternalError("entityMap recheck read".into()))?;
+            .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;
         matching.extend(
             serde_json::from_slice::<Value>(&bytes)
                 .ok()
@@ -1586,7 +1595,7 @@ async fn query_temporal_outer(
             .filter(|eid| {
                 emap.get(eid.as_str())
                     .and_then(Value::as_array)
-                    .is_some_and(|a| a.len() == 1 && a[0] == "@none")
+                    .is_some_and(|a| matches!(a.as_slice(), [only] if only == "@none"))
                     && !matching.contains(eid.as_str())
             })
             .cloned()
@@ -1599,7 +1608,11 @@ async fn query_temporal_outer(
     // fix the query to the candidates that survived the recheck (5.5.14)
     let ids: Vec<&str> = candidates
         .iter()
-        .filter(|id| map["entityMap"].get(id.as_str()).is_some())
+        .filter(|id| {
+            map.get("entityMap")
+                .and_then(|m| m.get(id.as_str()))
+                .is_some()
+        })
         .map(String::as_str)
         .collect();
     params.insert(
@@ -2415,7 +2428,7 @@ pub(crate) async fn query_temporal_collected(
     };
     let mut matches = Vec::new();
     for mut doc in all {
-        let id = doc["id"].as_str().unwrap_or("");
+        let id = doc.get("id").and_then(Value::as_str).unwrap_or("");
         if let Some(ids) = &ids {
             if !ids.contains(&id) {
                 continue;
@@ -2745,8 +2758,8 @@ async fn retrieve_temporal_inner(
                     } else {
                         Some(0)
                     });
-                    match idx {
-                        Some(i) => (fed[i].1.clone(), Some(i)),
+                    match idx.and_then(|i| fed.get(i).map(|(_, d)| (d.clone(), i))) {
+                        Some((d, i)) => (d, Some(i)),
                         None => {
                             return Err(NgsiError::ResourceNotFound(format!(
                                 "temporal entity {id} not found"
@@ -3709,9 +3722,9 @@ pub(crate) async fn build_temporal_map(
     // Box::pin: build_temporal_map is reachable from query_temporal_inner
     // (entityMap=true), so this recursive edge needs indirection.
     let resp = Box::pin(query_temporal_inner(st, &eff, headers, filter)).await?;
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
         .await
-        .map_err(|e| NgsiError::InternalError(format!("temporal candidate read: {e}")))?;
+        .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;
     // 5.5.14: the map FIXES the Entities considered by every later request, so
     // an unreadable candidate set must fail rather than become "no candidates".
     let candidates: Value = serde_json::from_slice(&bytes)
@@ -4765,5 +4778,21 @@ mod clause_4_21 {
         assert!(!crate::repr::meta_projected(None, Some(&omit), "type"));
         assert!(crate::repr::meta_projected(None, Some(&omit), "id"));
         assert!(crate::repr::meta_projected(None, None, "type"));
+    }
+}
+
+#[cfg(test)]
+mod t3932_time_of_day {
+    use super::seconds_of_day;
+
+    /// T-3932: a Time read with checked byte positions; a short or
+    /// multi-byte value is not a Time, never a panic.
+    #[test]
+    fn a_short_or_multibyte_time_is_none() {
+        assert_eq!(seconds_of_day("12:30:00Z"), Some(45_000.0));
+        assert_eq!(seconds_of_day("12:30:00.5"), Some(45_000.5));
+        for bad in ["", "12:3", "12:30", "1é:00:00", "12-30-00", "aa:bb:cc"] {
+            assert_eq!(seconds_of_day(bad), None, "{bad}");
+        }
     }
 }

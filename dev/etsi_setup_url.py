@@ -8,8 +8,11 @@ fixtures, not the TP.
 
 The optional second argument is a file the listener appends one JSON line to
 for every request a TP's body sends (test, method, URL with its query,
-header names): dev/etsi-view-diff.py reads it to tell a refusal the view
-owes from a deviation.
+header names, and the JSON body it carries, up to 64 KiB), and for every
+request a fixture sends, marked `fixture` with the suite file it belongs to (a
+suite's setup has no test): dev/etsi-view-diff.py reads it to tell a refusal
+the view owes from a deviation, a hidden type or Attribute named in the body
+(T-3787) or a write after a fixture's registration (T-3945) included.
 
     robot --listener "dev/etsi_setup_url.py;http://localhost:9090/ngsi-ld/v1;requests.jsonl" ...
 """
@@ -21,6 +24,8 @@ from robot.libraries.BuiltIn import BuiltIn
 NAMES = ("${url}", "${temporal_api_url}")
 FIXTURE = ("SETUP", "TEARDOWN")
 METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+BODY = ("json", "data")
+MAX_BODY = 64 * 1024
 
 
 class etsi_setup_url:  # Robot takes the class named as its module
@@ -32,6 +37,7 @@ class etsi_setup_url:  # Robot takes the class named as its module
         self.under_test = None
         self.depth = 0
         self.test = None
+        self.suites = []
 
     def _point(self, at_setup):
         builtin = BuiltIn()
@@ -39,6 +45,12 @@ class etsi_setup_url:  # Robot takes the class named as its module
             self.under_test = {n: builtin.get_variable_value(n) for n in NAMES}
         for name in NAMES:
             builtin.set_global_variable(name, self.setup_url if at_setup else self.under_test[name])
+
+    def start_suite(self, data, result):
+        self.suites.append(str(data.source or "").split("ngsi-ld-test-suite/")[-1])
+
+    def end_suite(self, data, result):
+        self.suites.pop()
 
     def start_test(self, data, result):
         # the key dev/etsi-report.py's tp-status.csv gives the same TP
@@ -53,9 +65,14 @@ class etsi_setup_url:  # Robot takes the class named as its module
             if self.depth == 0:
                 self._point(at_setup=True)
             self.depth += 1
-        elif self.record and self.test and self.depth == 0 and data.name in METHODS \
-                and getattr(result, "owner", None) == "RequestsLibrary":
-            self._log(data.name, data.args)
+        # A step after a failure still starts, NOT RUN, and a variable an earlier step would have
+        # assigned does not exist: no request left, so nothing to record (T-4030).
+        elif self.record and data.name in METHODS \
+                and getattr(result, "owner", None) == "RequestsLibrary" and not result.not_run:
+            if self.depth > 0:
+                self._log(data.name, data.args, fixture=True)
+            elif self.test:
+                self._log(data.name, data.args)
 
     def end_keyword(self, data, result):
         if result.type in FIXTURE:
@@ -63,7 +80,7 @@ class etsi_setup_url:  # Robot takes the class named as its module
             if self.depth == 0:
                 self._point(at_setup=False)
 
-    def _log(self, method, args):
+    def _log(self, method, args, fixture=False):
         """The request as RequestsLibrary sends it: `url=` or the first
         positional argument, `headers=` resolved in the caller's scope."""
         builtin = BuiltIn()
@@ -71,7 +88,7 @@ class etsi_setup_url:  # Robot takes the class named as its module
         positional = []
         for arg in args:
             key, sep, value = str(arg).partition("=")
-            if sep and key in ("url", "headers", "params"):
+            if sep and key in ("url", "headers", "params") + BODY:
                 named[key] = value
             else:
                 positional.append(str(arg))
@@ -85,5 +102,28 @@ class etsi_setup_url:  # Robot takes the class named as its module
             url += ("&" if "?" in url else "?") + str(params)
         line = {"test": self.test, "method": method, "url": url,
                 "headers": sorted(str(k).lower() for k in headers) if isinstance(headers, dict) else []}
+        if fixture:
+            line.update(fixture=True, suite=self.suites[-1] if self.suites else "")
+        body = next((named[k] for k in BODY if k in named), None)
+        if body is not None:
+            line["body"] = self._json(builtin.replace_variables(body))
         with open(self.record, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line) + "\n")
+
+    @staticmethod
+    def _json(value):
+        """The body as JSON: a dict or list as Robot holds it, a string parsed,
+        anything larger than MAX_BODY or not JSON left out (None)."""
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8", "replace")
+        if isinstance(value, str):
+            if len(value) > MAX_BODY:
+                return None
+            try:
+                return json.loads(value)
+            except ValueError:
+                return None
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, default=str)
+            return value if len(text) <= MAX_BODY else None
+        return None

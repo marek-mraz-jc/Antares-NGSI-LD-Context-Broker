@@ -145,6 +145,9 @@ pub struct Shared {
     pub default_limit: usize,
     /// Hard ceiling on limit (TooManyResults guard).
     pub max_limit: usize,
+    /// The most bytes of one in-process answer a handler buffers
+    /// ([`crate::bounds::MAX_ANSWER_BYTES`]).
+    pub max_answer_bytes: usize,
     /// One shared outbound client, timeouts set at construction.
     pub http: antares_jsonld::HttpClient,
     /// Federation-forwarding client — longer deadline: the ETSI mock replies
@@ -407,13 +410,18 @@ impl AppState {
                         }
                     };
                     match row {
-                        // the row is what the store handed back, and `Value`'s
-                        // index panics on anything that is not an object; a row
-                        // that cannot carry the counters is left uncounted
+                        // the row is what the store handed back; a row that
+                        // cannot carry the counters is left uncounted
                         Ok(Some(mut doc)) if doc.is_object() => {
-                            let hits = doc["numberOfHits"].as_u64().unwrap_or(0) + 1;
-                            doc["numberOfHits"] = serde_json::json!(hits);
-                            doc["lastUsage"] = serde_json::json!(now_iso());
+                            if let Some(o) = doc.as_object_mut() {
+                                let hits = o
+                                    .get("numberOfHits")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0)
+                                    .saturating_add(1);
+                                o.insert("numberOfHits".into(), serde_json::json!(hits));
+                                o.insert("lastUsage".into(), serde_json::json!(now_iso()));
+                            }
                             if let Err(e) = store.context_put(tenant, &id, doc).await {
                                 tracing::warn!(
                                     "@context hit bump failed for {}: {e}",
@@ -454,7 +462,10 @@ impl AppState {
                     // it.
                     let owner = antares_store::context_row_owner(&row)
                         .and_then(|o| antares_model::TenantId::new_internal(o).ok());
-                    Some((owner, row["body"]["@context"].clone()))
+                    Some((
+                        owner,
+                        row.pointer("/body/@context").cloned().unwrap_or_default(),
+                    ))
                 })
             }));
         }
@@ -474,7 +485,7 @@ impl AppState {
         // notification delivery never names a transport.
         let http = outbound_client(
             egress_policy,
-            std::time::Duration::from_secs(5 * slow_factor()),
+            std::time::Duration::from_secs(slow_factor().saturating_mul(5)),
         );
         let mut sinks = antares_notifier::SinkRegistry::default();
         sinks.register(Box::new(antares_notifier::HttpSink::new(http.clone())));
@@ -495,10 +506,11 @@ impl AppState {
                 host_alias,
                 default_limit: 1000,
                 max_limit: 1000,
+                max_answer_bytes: crate::bounds::MAX_ANSWER_BYTES,
                 http: http.clone(),
                 fed_http: outbound_client(
                     egress_policy,
-                    std::time::Duration::from_secs(8 * slow_factor()),
+                    std::time::Duration::from_secs(slow_factor().saturating_mul(8)),
                 ),
                 sinks: Arc::new(sinks),
                 forward_transport: Arc::new(std::sync::OnceLock::new()),
@@ -609,6 +621,73 @@ impl AppState {
             .delete(&view_tenant()?, antares_store::Kind::View, id)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// One page of Tenant `t`'s Entities of one of `types`, each holding only
+    /// `attrs` (expanded IRIs), from match `offset` on; a store that cannot
+    /// page answers every match and the page is cut here. For maintenance
+    /// sweeps (T-4018): no view, no policy, no read hook.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn scan_entities(
+        &self,
+        t: &antares_model::TenantId,
+        types: &[String],
+        attrs: &[String],
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        // OR-of-AND groups (4.17): one group per type, so any of them matches.
+        let types: Vec<Vec<String>> = types.iter().map(|t| vec![t.clone()]).collect();
+        let filter = antares_store::filter::EntityFilter {
+            types: Some(&types),
+            attrs: Some(attrs),
+            page: Some(antares_store::filter::Page {
+                offset: i64::try_from(offset).unwrap_or(i64::MAX),
+                limit: i64::try_from(limit).unwrap_or(i64::MAX),
+                count: false,
+            }),
+            ..antares_store::filter::EntityFilter::default()
+        };
+        let found = self
+            .store
+            .query_entities(t, &filter)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(if found.paged {
+            found.rows
+        } else {
+            found.rows.into_iter().skip(offset).take(limit).collect()
+        })
+    }
+
+    /// Change each of Tenant `t`'s Entities `ids` under its row lock: `f`
+    /// edits the stored document and answers whether it changed it, and
+    /// only those are written, in place, as maintenance (no `modifiedAt`,
+    /// no history, no notification). The answer holds, per id, whether it
+    /// was written (`false` for an id that is gone).
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn mutate_entities(
+        &self,
+        t: &antares_model::TenantId,
+        ids: &[String],
+        mut f: impl FnMut(&str, &mut serde_json::Value) -> bool + Send,
+    ) -> Result<Vec<bool>, String> {
+        use antares_store::CurrentStateDriverExt;
+        let results = self
+            .store
+            .batch_mutate(t, ids, |id, doc| if f(id, doc) { Ok(()) } else { Err(()) })
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(results
+            .into_iter()
+            .map(|r| matches!(r, Some(Ok(()))))
+            .collect())
     }
 
     /// Every stored export grant (ADR-0025 rule 5), as written.
@@ -893,7 +972,10 @@ impl AppState {
         }
         let req = axum::http::Request::from_parts(parts, body);
         match INPROCESS_DEPTH
-            .scope(depth + 1, tower::ServiceExt::oneshot(router.clone(), req))
+            .scope(
+                depth.saturating_add(1),
+                tower::ServiceExt::oneshot(router.clone(), req),
+            )
             .await
         {
             Ok(r) => r,
@@ -912,9 +994,15 @@ impl AppState {
     /// is more stack than a worker thread has; on its own task each frame
     /// is polled from the scheduler, as a request over HTTP is. Dropping
     /// the returned future (a forward's timeout) aborts the task.
+    ///
+    /// The new task inherits no view: the call runs through `view` when one
+    /// is given ([`crate::policy::through_view`]), so the engine decides a
+    /// forward under a grant's view as a request through that view (T-3935),
+    /// and never by the view of the request that triggered the forward.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn call_on_task(
         &self,
+        view: Option<&str>,
         caller: axum::http::HeaderMap,
         req: axum::http::Request<axum::body::Body>,
     ) -> axum::response::Response {
@@ -927,8 +1015,12 @@ impl AppState {
             }
         }
         let st = self.clone();
+        let view = view.map(str::to_owned);
         let task = tokio::spawn(INPROCESS_DEPTH.scope(in_process_depth(), async move {
-            st.call(&caller, req).await
+            match view {
+                Some(id) => crate::policy::through_view(&id, st.call(&caller, req)).await,
+                None => st.call(&caller, req).await,
+            }
         }));
         let _abort = AbortOnDrop(task.abort_handle());
         task.await.unwrap_or_else(|_| {
@@ -1029,7 +1121,7 @@ fn outbound_client(
 ) -> antares_jsonld::HttpClient {
     let b = antares_jsonld::with_timeouts(
         antares_jsonld::client_builder(policy),
-        std::time::Duration::from_secs(2 * slow_factor()),
+        std::time::Duration::from_secs(slow_factor().saturating_mul(2)),
         total,
     );
     // the suite's notification receiver asserts header names

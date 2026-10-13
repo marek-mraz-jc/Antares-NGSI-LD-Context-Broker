@@ -35,8 +35,6 @@
 //! ```
 #![forbid(unsafe_code)]
 
-mod mapped;
-
 use antares_ops::{Caller, OperationId, Ops, OpsRequest, Refusal, Surface, ViewOps};
 use axum::extract::Request;
 use axum::http::{header, HeaderName, HeaderValue, Method};
@@ -145,13 +143,6 @@ async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
         Some(op) if served(&view, op) => op,
         _ => return refusal(&view, &parts.method, &path, query).ngsi_ld(),
     };
-    if let Some(mapping) = view.mapping() {
-        let id = id.to_owned();
-        return match mapped::serve(&view, mapping, op, caller, parts, body, &path).await {
-            Ok(answer) => rebase(answer, &id),
-            Err(refusal) => refusal.ngsi_ld(),
-        };
-    }
     let target = match query {
         Some(q) => format!("{path}?{q}"),
         None => path,

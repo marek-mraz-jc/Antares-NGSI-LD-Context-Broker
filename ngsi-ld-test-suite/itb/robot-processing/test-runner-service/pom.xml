@@ -7,7 +7,7 @@
 	<parent>
 		<groupId>org.springframework.boot</groupId>
 		<artifactId>spring-boot-starter-parent</artifactId>
-		<version>3.5.8</version>
+		<version>3.5.12</version>
 		<relativePath/>
 	</parent>
   	
@@ -18,6 +18,13 @@
   	
     <name>Test Runner Service</name>
     <description>Processing service to run Robot Framework tests</description>
+
+    <!-- Jackson through Spring Boot's BOM property, so core, annotations and
+         databind move together: 2.21.7 fixes CVE-2026-54512/54513/68497/91776/91777
+         (T-4019). -->
+    <properties>
+        <jackson-bom.version>2.21.7</jackson-bom.version>
+    </properties>
       
     <dependencies>
         <dependency>
@@ -40,7 +47,6 @@
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
       		  <artifactId>jackson-databind</artifactId>
-            <version>2.15.3</version>
       	</dependency>
             
         <dependency>

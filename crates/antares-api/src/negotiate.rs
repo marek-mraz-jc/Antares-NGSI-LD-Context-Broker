@@ -84,6 +84,12 @@ pub enum ApiError {
 
 impl From<crate::policy::Denied> for ApiError {
     fn from(d: crate::policy::Denied) -> Self {
+        // A view's composition bound is a limit on the request, not a
+        // refusal by policy: 400 naming it, never 403 (T-4079).
+        #[cfg(feature = "views")]
+        if d.0 == crate::views::TOO_MANY_RULES {
+            return Self::Ngsi(NgsiError::BadRequestData(d.0));
+        }
         Self::Denied(d.0)
     }
 }
@@ -499,7 +505,7 @@ fn split_unquoted(s: &str, sep: char) -> Vec<&str> {
             '>' if !quoted => angle = false,
             c if c == sep && !quoted && !angle => {
                 out.push(&s[start..i]);
-                start = i + c.len_utf8();
+                start = i.saturating_add(c.len_utf8());
             }
             _ => {}
         }
@@ -648,6 +654,11 @@ pub(crate) fn check_params(
         if !allowed.contains(&k.as_str()) {
             return Err(NgsiError::InvalidRequest(format!("unknown query parameter {k:?}")).into());
         }
+    }
+    // 4.19: a malformed scopeQ is refused before any read, at every
+    // operation that takes one (T-3959)
+    if let Some(s) = params.get("scopeQ") {
+        antares_ql::scope::check_scope_q(s)?;
     }
     Ok(())
 }

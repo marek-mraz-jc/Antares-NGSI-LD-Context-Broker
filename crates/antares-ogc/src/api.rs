@@ -19,6 +19,10 @@ fn refusals() -> Map<String, Value> {
             ("404", "no such resource in this view"),
             ("406", "the client accepts no JSON"),
             (
+                "501",
+                "a construct this endpoint does not serve (a LIKE pattern that is no literal, a conditional write)",
+            ),
+            (
                 "500",
                 "the broker failed; the detail is logged under a request id",
             ),
@@ -72,19 +76,32 @@ fn read(id: &str, summary: &str, media: &str, parameters: &[Value]) -> Map<Strin
 
 /// The problem schema and the query parameters the operations name.
 fn components() -> Value {
+    let mut parameters = json!({
+        "limit": {"name": "limit", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 10}},
+        "bbox": {"name": "bbox", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "array", "minItems": 4, "maxItems": 6, "oneOf": [{"minItems": 4, "maxItems": 4}, {"minItems": 6, "maxItems": 6}], "items": {"type": "number"}}},
+        "datetime": {"name": "datetime", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "string"}},
+        "next": {"name": "next", "in": "query", "required": false, "description": "the token of a next link", "schema": {"type": "string"}},
+        "sortby": {"name": "sortby", "in": "query", "required": false, "style": "form", "explode": false, "description": "[+|-]name of the collection's sortables", "schema": {"type": "array", "items": {"type": "string"}}},
+        "properties": {"name": "properties", "in": "query", "required": false, "style": "form", "explode": false, "description": "the properties of the collection's schema to return", "schema": {"type": "array", "items": {"type": "string"}}},
+        "crs": {"name": "crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
+        "bbox-crs": {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
+        "filter": {"name": "filter", "in": "query", "required": false, "description": "a CQL2 filter over the collection's queryables", "schema": {"type": "string"}},
+        "filter-lang": {"name": "filter-lang", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cql2-text", "cql2-json"], "default": "cql2-text"}},
+        "filter-crs": {"name": "filter-crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
+        "profile": {"name": "profile", "in": "query", "required": false, "style": "form", "explode": false, "description": "how references are written", "schema": {"type": "string", "enum": ["rel-as-key", "rel-as-uri", "rel-as-link"]}},
+    })
+    .as_object()
+    .cloned()
+    .unwrap_or_default();
+    parameters.extend(crate::items::NGSILD.iter().map(|name| {
+        (
+            format!("ngsild.{name}"),
+            json!({"name": format!("ngsild.{name}"), "in": "query", "required": false, "description": format!("the NGSI-LD Query Entities `{name}` (TS 104 176 7.2.3.1), ANDed into the query; it only narrows"), "schema": {"type": "string"}}),
+        )
+    }));
     json!({
         "schemas": {"problem": {"type": "object", "properties": {"type": {"type": "string"}, "title": {"type": "string"}, "status": {"type": "integer"}, "detail": {"type": "string"}}}},
-        "parameters": {
-            "limit": {"name": "limit", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 10}},
-            "bbox": {"name": "bbox", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "array", "oneOf": [{"minItems": 4, "maxItems": 4}, {"minItems": 6, "maxItems": 6}], "items": {"type": "number"}}},
-            "datetime": {"name": "datetime", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "string"}},
-            "next": {"name": "next", "in": "query", "required": false, "description": "the token of a next link", "schema": {"type": "string"}},
-            "sortby": {"name": "sortby", "in": "query", "required": false, "style": "form", "explode": false, "description": "[+|-]name of the collection's sortables", "schema": {"type": "array", "items": {"type": "string"}}},
-            "properties": {"name": "properties", "in": "query", "required": false, "style": "form", "explode": false, "description": "the properties of the collection's schema to return", "schema": {"type": "array", "items": {"type": "string"}}},
-            "crs": {"name": "crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
-            "bbox-crs": {"name": "bbox-crs", "in": "query", "required": false, "schema": {"type": "string", "format": "uri", "enum": [crs::CRS84, crs::CRS84H]}},
-            "profile": {"name": "profile", "in": "query", "required": false, "style": "form", "explode": false, "description": "how references are written", "schema": {"type": "string", "enum": ["rel-as-key", "rel-as-uri", "rel-as-link"]}},
-        },
+        "parameters": parameters,
     })
 }
 
@@ -109,6 +126,7 @@ fn collection_paths(
     for (which, summary) in [
         ("schema", "the schema of its Features"),
         ("sortables", "the properties sortby may name"),
+        ("queryables", "the properties a filter may name"),
     ] {
         paths.insert(
             format!("{at}/{which}"),
@@ -120,11 +138,22 @@ fn collection_paths(
             ),
         );
     }
+    // `queryables-query-parameters`: each scalar queryable as an equality.
+    let own: Vec<Value> = items_params
+        .iter()
+        .cloned()
+        .chain(
+            ["id"]
+                .into_iter()
+                .chain(c.properties.iter().filter(|p| p.sortable).map(|p| p.name.as_str()))
+                .map(|name| json!({"name": name, "in": "query", "required": false, "description": "the Features whose property equals the value", "schema": {"type": "string"}})),
+        )
+        .collect();
     let mut items = read(
         &format!("items-{}", c.id),
         "a page of Features",
         "application/geo+json",
-        items_params,
+        &own,
     );
     let mut item = read(
         &format!("item-{}", c.id),
@@ -208,6 +237,15 @@ pub(crate) fn document(
         "/collections".into(),
         get("collections", "the collections", "application/json", &[]),
     );
+    paths.insert(
+        "/functions".into(),
+        get(
+            "functions",
+            "the functions a filter may call: none",
+            "application/json",
+            &[],
+        ),
+    );
     let items_params = [
         json!({"$ref": "#/components/parameters/limit"}),
         json!({"$ref": "#/components/parameters/bbox"}),
@@ -218,7 +256,17 @@ pub(crate) fn document(
         json!({"$ref": "#/components/parameters/profile"}),
         json!({"$ref": "#/components/parameters/crs"}),
         json!({"$ref": "#/components/parameters/bbox-crs"}),
-    ];
+        json!({"$ref": "#/components/parameters/filter"}),
+        json!({"$ref": "#/components/parameters/filter-lang"}),
+        json!({"$ref": "#/components/parameters/filter-crs"}),
+    ]
+    .into_iter()
+    .chain(
+        crate::items::NGSILD
+            .iter()
+            .map(|name| json!({"$ref": format!("#/components/parameters/ngsild.{name}")})),
+    )
+    .collect::<Vec<_>>();
     let feature_id = [
         json!({"name": "featureId", "in": "path", "required": true, "schema": {"type": "string"}}),
         json!({"$ref": "#/components/parameters/properties"}),
@@ -280,9 +328,11 @@ mod tests {
                 "/collections/Car",
                 "/collections/Car/items",
                 "/collections/Car/items/{featureId}",
+                "/collections/Car/queryables",
                 "/collections/Car/schema",
                 "/collections/Car/sortables",
-                "/conformance"
+                "/conformance",
+                "/functions"
             ]
         );
         for (_, op) in doc

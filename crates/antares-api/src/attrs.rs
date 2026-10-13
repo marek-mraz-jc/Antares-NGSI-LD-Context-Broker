@@ -161,7 +161,8 @@ async fn write_attrs(
     let cond = Condition::of(&granted);
     #[cfg(feature = "views")]
     let guard =
-        crate::views::WriteGuard::of(st, attr_iris_of(&fragment).iter().map(String::as_str));
+        crate::views::WriteGuard::of(st, attr_iris_of(&fragment).iter().map(String::as_str))
+            .map(|g| g.matching(headers));
     #[cfg(feature = "views")]
     if let Some(g) = &guard {
         g.targets(st, &tenant, &fragment).await?;
@@ -233,7 +234,7 @@ async fn write_attrs(
             .await?;
         #[cfg(feature = "views")]
         if let Some(g) = &guard {
-            g.verdict()?;
+            g.settled()?;
         }
         Some(match res {
             None => Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into()),
@@ -755,12 +756,14 @@ fn merge_instance_sets(existing: &mut Value, incoming: &Value, no_overwrite: boo
             Some(p) => {
                 if !no_overwrite {
                     // keep original createdAt
-                    let created = cur[p].get("createdAt").cloned();
-                    cur[p] = ni.clone();
-                    if let (Some(o), Some(c)) = (cur[p].as_object_mut(), created) {
-                        o.insert("createdAt".into(), c);
+                    if let Some(slot) = cur.get_mut(p) {
+                        let created = slot.get("createdAt").cloned();
+                        *slot = ni.clone();
+                        if let (Some(o), Some(c)) = (slot.as_object_mut(), created) {
+                            o.insert("createdAt".into(), c);
+                        }
+                        any = true;
                     }
-                    any = true;
                 }
             }
             None => {
@@ -837,7 +840,7 @@ async fn partial_update_inner(
     .await?;
     let cond = Condition::of(&granted);
     #[cfg(feature = "views")]
-    let guard = crate::views::WriteGuard::of(st, [attr_iri.as_str()]);
+    let guard = crate::views::WriteGuard::of(st, [attr_iri.as_str()]).map(|g| g.matching(headers));
     #[cfg(feature = "views")]
     if let Some(g) = &guard {
         g.targets(
@@ -895,11 +898,11 @@ async fn partial_update_inner(
                         found = true;
                         if is_deletion {
                             existing.remove(p);
-                        } else {
+                        } else if let Some(slot) = existing.get_mut(p) {
                             // 5.6.4.4: the fragment may not change the Attribute type
                             if let (Some(ft), Some(et)) = (
                                 frag_inst.get("type").and_then(Value::as_str),
-                                existing[p].get("type").and_then(Value::as_str),
+                                slot.get("type").and_then(Value::as_str),
                             ) {
                                 if ft != et {
                                     return Err(NgsiError::BadRequestData(format!(
@@ -907,7 +910,7 @@ async fn partial_update_inner(
                                     )));
                                 }
                             }
-                            let t = antares_store::stored_object(&mut existing[p])?;
+                            let t = antares_store::stored_object(slot)?;
                             for (k, v) in antares_jsonld::expanded_object(&frag_inst)? {
                                 if matches!(k.as_str(), "createdAt" | "modifiedAt") {
                                     continue;
@@ -937,7 +940,7 @@ async fn partial_update_inner(
             .await?;
         #[cfg(feature = "views")]
         if let Some(g) = &guard {
-            g.verdict()?;
+            g.settled()?;
         }
         Some(single_attr_local(res, found, id, attr, &tenant))
     };
@@ -1032,7 +1035,8 @@ pub async fn replace_attr(
         .await?;
         let cond = Condition::of(&granted);
         #[cfg(feature = "views")]
-        let guard = crate::views::WriteGuard::of(&st, [attr_iri.as_str()]);
+        let guard =
+            crate::views::WriteGuard::of(&st, [attr_iri.as_str()]).map(|g| g.matching(&headers));
         #[cfg(feature = "views")]
         if let Some(g) = &guard {
             g.targets(&st, &tenant, &fragment).await?;
@@ -1081,11 +1085,11 @@ pub async fn replace_attr(
                     {
                         // 5.6.19: only the instance with the matching datasetId is
                         // replaced; its createdAt survives (055_01/055_02)
-                        if let Some(p) = existing.iter().position(|ci| {
+                        if let Some(slot) = existing.iter_mut().find(|ci| {
                             ci.get("datasetId").and_then(Value::as_str) == want_ds.as_deref()
                         }) {
                             found = true;
-                            let created = existing[p].get("createdAt").cloned();
+                            let created = slot.get("createdAt").cloned();
                             let mut ni = new_inst.clone();
                             if let Some(o) = ni.as_object_mut() {
                                 if let Some(c) = created {
@@ -1095,7 +1099,7 @@ pub async fn replace_attr(
                                 }
                                 o.insert("modifiedAt".into(), Value::String(ts.clone()));
                             }
-                            existing[p] = ni;
+                            *slot = ni;
                         }
                     }
                     if found {
@@ -1110,7 +1114,7 @@ pub async fn replace_attr(
                 .await?;
             #[cfg(feature = "views")]
             if let Some(g) = &guard {
-                g.verdict()?;
+                g.settled()?;
             }
             Some(single_attr_local(res, found, &id, &attr, &tenant))
         };
@@ -1227,7 +1231,7 @@ async fn set_attr_value_inner(
     .await?;
     let cond = Condition::of(&granted);
     #[cfg(feature = "views")]
-    let guard = crate::views::WriteGuard::of(st, [attr_iri.as_str()]);
+    let guard = crate::views::WriteGuard::of(st, [attr_iri.as_str()]).map(|g| g.matching(headers));
     #[cfg(feature = "views")]
     if let (Some(g), Some(j)) = (&guard, &judged) {
         g.targets(st, &tenant, j).await?;
@@ -1261,19 +1265,20 @@ async fn set_attr_value_inner(
                 let Some(existing) = target.get_mut(&attr_iri).and_then(Value::as_array_mut) else {
                     return Ok(());
                 };
-                let Some(p) = existing.iter().position(|ci| {
-                    ci.get("datasetId").and_then(Value::as_str) == want_ds.as_deref()
-                }) else {
+                let Some(slot) = existing
+                    .iter_mut()
+                    .find(|ci| ci.get("datasetId").and_then(Value::as_str) == want_ds.as_deref())
+                else {
                     return Ok(());
                 };
                 // from the instance under the lock, not the read above: a
                 // write in between must not be lost
-                refuse_null(Some(&existing[p]), &value)?;
-                let mut ni = with_value(&existing[p], attr, &attr_iri, &value, &ctx, observed)?;
+                refuse_null(Some(slot), &value)?;
+                let mut ni = with_value(slot, attr, &attr_iri, &value, &ctx, observed)?;
                 if let Some(o) = ni.as_object_mut() {
                     o.insert("modifiedAt".into(), Value::String(ts.clone()));
                 }
-                existing[p] = ni;
+                *slot = ni;
                 found = true;
                 target.insert("modifiedAt".into(), Value::String(ts.clone()));
                 #[cfg(feature = "views")]
@@ -1285,7 +1290,7 @@ async fn set_attr_value_inner(
             .await?;
         #[cfg(feature = "views")]
         if let Some(g) = &guard {
-            g.verdict()?;
+            g.settled()?;
         }
         Some(single_attr_local(res, found, id, attr, &tenant))
     };
@@ -1460,7 +1465,8 @@ async fn delete_attr_inner(
     let cond = Condition::of(&granted);
     #[cfg(feature = "views")]
     let guard =
-        crate::views::WriteGuard::of(st, (attr_iri != "scope").then_some(attr_iri.as_str()));
+        crate::views::WriteGuard::of(st, (attr_iri != "scope").then_some(attr_iri.as_str()))
+            .map(|g| g.matching(headers));
     let delete_all = params.get("deleteAll").map(String::as_str) == Some("true");
     let want_ds = crate::repr::target_dataset_id(params).map(String::from);
     let (regs, loop_answer) =
@@ -1531,7 +1537,7 @@ async fn delete_attr_inner(
             .await?;
         #[cfg(feature = "views")]
         if let Some(g) = &guard {
-            g.verdict()?;
+            g.settled()?;
         }
         // The temporal representation records the deletion (4.8 deletedAt).
         // An Entity held only temporally is not "held locally" (5.6.5.4): it

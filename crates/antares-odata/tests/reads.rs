@@ -91,8 +91,13 @@ fn car(n: u32, scope: &str, speed: f64) -> String {
 }
 
 async fn broker() -> Result<(TestBroker, Router), String> {
+    bounded(antares_ops::bounds::MAX_ANSWER_BYTES).await
+}
+
+/// [`broker`] buffering at most `bytes` of one in-process answer.
+async fn bounded(bytes: usize) -> Result<(TestBroker, Router), String> {
     std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
-    let b = TestBroker::new().await?;
+    let b = TestBroker::with_max_answer_bytes(bytes).await?;
     let app = b.serve(antares_odata::OData)?;
     let view = json!({
         "id": "cars", "tenant": "city",
@@ -186,6 +191,36 @@ async fn an_entity_set_is_the_narrowed_query_mapped_through_the_model() {
     );
 }
 
+/// T-3773: an NGSI-LD answer past the broker's buffer bound is the OData
+/// 413, never a 200 holding the whole body or an empty set.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_past_the_buffer_bound_is_413() {
+    let (_b, app) = bounded(512).await.expect("broker");
+    let got = send(&app, Method::GET, &format!("{ROOT}/Car"), None, &[]).await;
+    assert_eq!(got.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", got.body);
+    assert_eq!(
+        got.json()["error"]["code"],
+        "PayloadTooLarge",
+        "{}",
+        got.body
+    );
+    assert!(!got.body.contains("urn:ngsi-ld:Car"), "{}", got.body);
+    let one = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$top=1&$select=speed"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        one.status,
+        StatusCode::OK,
+        "a page under the bound still reads: {}",
+        one.body
+    );
+}
+
 /// A path-only context URL is read as a file path by Microsoft.OData.Core
 /// on Linux (T-3688): the documents name the service by absolute URL.
 #[tokio::test(flavor = "multi_thread")]
@@ -247,7 +282,7 @@ async fn top_and_skip_page_and_the_next_link_carries_the_rest() {
         .to_owned();
     assert!(
         next.starts_with(&format!(
-            "{PUBLIC}{ROOT}/Car?$filter=speed%20gt%201&$skiptoken=1.1."
+            "{PUBLIC}{ROOT}/Car?$filter=speed%20gt%201&$skiptoken=2.1.0.1."
         )),
         "{next}"
     );
@@ -477,8 +512,18 @@ async fn a_hidden_or_unknown_name_is_the_same_400() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_forms_of_later_rounds_are_501_and_read_only_writes_405() {
     let (_b, app) = broker().await.expect("broker");
+    // `not` is evaluated by the residual (T-3758)
+    let got = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$filter=not%20(speed%20gt%201)"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::OK, "{}", got.body);
+    assert_eq!(got.json()["value"], json!([]), "{}", got.body);
     for uri in [
-        "Car?$filter=not%20(speed%20gt%201)",
         "Car('urn:ngsi-ld:Car:1')?$filter=speed%20gt%201",
         "Car?$schemaversion=2",
         "$batch",

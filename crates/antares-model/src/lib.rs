@@ -2,6 +2,8 @@
 //! NGSI-LD data model (ETSI CIM 009 V1.9.1).
 //!
 //! Shapes and invariants only: no I/O, no clocks, no config.
+//!
+#![doc = include_str!("../README.md")]
 // T-3468: every surface calls into this crate on a request path, where a
 // panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
 // index out of bounds or overflow.
@@ -376,7 +378,8 @@ mod tests {
         // a bare P carries nothing to weigh, and is the only accepted shape
         // that carries nothing
         let bare = super::parse_iso_duration("P").expect("a bare P scans");
-        assert!(bare.empty && bare.whole);
+        assert!(bare.empty);
+        assert!(bare.whole);
         for bad in [
             "",
             "PT",

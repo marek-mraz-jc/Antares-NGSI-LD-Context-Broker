@@ -36,24 +36,25 @@ members = [
 ]
 # Fuzz harness: own lockfile/profile, built only by cargo-fuzz on
 # nightly (.github/workflows/fuzz.yml) — never part of the normal build.
-exclude = ["fuzz"]
+exclude = ["fuzz", "vendor/rumqttc"]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 license = "EUPL-1.2"
 repository = "https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker"
 rust-version = "1.97"
 
 [workspace.dependencies]
-antares-model = { path = "crates/antares-model" }
+antares-model = { path = "crates/antares-model", version = "0.2" }
 antares-store = { path = "crates/antares-store" }
-antares-jsonld = { path = "crates/antares-jsonld" }
-antares-ql = { path = "crates/antares-ql" }
+antares-jsonld = { path = "crates/antares-jsonld", version = "0.2" }
+antares-ql = { path = "crates/antares-ql", version = "0.2" }
+antares-residual = { path = "crates/antares-residual", version = "0.2" }
 antares-sql = { path = "crates/antares-sql", default-features = false }
 antares-bus = { path = "crates/antares-bus" }
 antares-api = { path = "crates/antares-api", default-features = false }
-antares-matcher = { path = "crates/antares-matcher" }
+antares-matcher = { path = "crates/antares-matcher", version = "0.2" }
 antares-notifier = { path = "crates/antares-notifier", default-features = false }
 antares-plugin-example = { path = "examples/plugin-example" }
 joinedcontext-policy = { path = "addons/joinedcontext-policy" }
@@ -274,3 +275,7 @@ unwrap_used = "warn"
 # clippy 1.98.0 runs this lint into >14 GB on the antares-api test target
 # (the CI runner dies with a bare SIGTERM); every other style lint stays on.
 needless_borrows_for_generic_args = "allow"
+
+# rumqttc 0.25.1 with rustls-webpki 0.103 until a release has it (vendor/rumqttc/README.md, T-4129).
+[patch.crates-io]
+rumqttc = { path = "vendor/rumqttc" }

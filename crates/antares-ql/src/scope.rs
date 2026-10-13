@@ -2,6 +2,7 @@
 //! Scope Query Language (CIM 009 clause 4.19), evaluated in memory over the
 //! entity's `scope` member.
 
+use antares_model::NgsiError;
 use serde_json::Value;
 
 /// Scope Query evaluation (4.19) — `|`/`,` = OR, `(a;b)` = AND (parenthesis
@@ -23,6 +24,65 @@ pub fn scope_matches(scope_q: &str, doc: &Value) -> bool {
             .split(';')
             .all(|pat| scopes.iter().any(|s| scope_pattern_matches(pat.trim(), s)))
     })
+}
+
+/// Checks a `scopeQ` against the 4.19 grammar before it is evaluated: a
+/// disjunction (`,` or `|`) of optionally parenthesized `;`-conjunctions of
+/// ScopeQs, each `/level(/level)*` with `+` a whole level and `#` only as the
+/// last one, or `/#`. An empty query, an empty group or pattern (`/a,,/b`,
+/// `/a;;/b`) or an empty level (`//a`) is a 400 BadRequestData: without this
+/// [`scope_matches`] skips the empty piece and answers a wider query than the
+/// one asked. Longer than [`MAX_SCOPE_Q_BYTES`] is a 403 TooComplexQuery.
+///
+/// # Errors
+/// [`NgsiError::BadRequestData`] or [`NgsiError::TooComplexQuery`] as above.
+pub fn check_scope_q(scope_q: &str) -> Result<(), NgsiError> {
+    if scope_q.len() > MAX_SCOPE_Q_BYTES {
+        return Err(NgsiError::TooComplexQuery(format!(
+            "scopeQ is longer than {MAX_SCOPE_Q_BYTES} bytes"
+        )));
+    }
+    let bad = |why: &str| NgsiError::BadRequestData(format!("invalid scopeQ {scope_q:?}: {why}"));
+    for group in scope_q.split([',', '|']) {
+        let group = group.trim();
+        let inner = match (group.strip_prefix('('), group.strip_suffix(')')) {
+            (Some(_), Some(_)) => group.get(1..group.len().saturating_sub(1)).unwrap_or(""),
+            (None, None) => group,
+            _ => return Err(bad("unbalanced parenthesis")),
+        };
+        if inner.is_empty() {
+            return Err(bad("empty group"));
+        }
+        for pat in inner.split(';') {
+            check_scope_pattern(pat.trim()).map_err(bad)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_scope_pattern(pat: &str) -> Result<(), &'static str> {
+    if pat.is_empty() {
+        return Err("empty pattern");
+    }
+    let Some(rest) = pat.strip_prefix('/') else {
+        return Err("a ScopeQ starts with '/'");
+    };
+    let levels: Vec<&str> = rest.split('/').collect();
+    let last = levels.len().saturating_sub(1);
+    for (i, level) in levels.iter().enumerate() {
+        match *level {
+            "" => return Err("empty scope level"),
+            "#" if i != last => return Err("'#' is only the last level"),
+            "#" | "+" => {}
+            l if l.contains(['#', '+', '(', ')', ';', ',', '|'])
+                || l.chars().any(char::is_whitespace) =>
+            {
+                return Err("reserved character inside a scope level");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// The Scope Query that selects what BOTH arguments select (4.19).
@@ -120,7 +180,7 @@ fn scope_pattern_matches(pat: &str, scope: &str) -> bool {
 
 #[cfg(test)]
 mod clause_4_19 {
-    use super::{intersect_scope_q, scope_matches};
+    use super::{check_scope_q, intersect_scope_q, scope_matches, MAX_SCOPE_Q_BYTES};
     use serde_json::json;
 
     fn doc(scopes: &[&str]) -> serde_json::Value {
@@ -288,5 +348,32 @@ mod clause_4_19 {
             intersect_scope_q("/#", &at(super::MAX_SCOPE_Q_BYTES + 1)),
             None
         );
+    }
+
+    /// 4.19 grammar: the shapes the examples use pass; an empty piece, a
+    /// level after `#`, or a missing leading `/` is a 400, never a silent
+    /// widening; past the ceiling is a 403.
+    #[test]
+    fn check_scope_q_follows_the_grammar() {
+        for ok in [
+            "/Madrid",
+            "/Madrid/+/ParqueNorte",
+            "/Madrid/#",
+            "/#",
+            "/Madrid,/Berlin",
+            "/Madrid|/Berlin",
+            "(/Madrid;/Gardens),/Berlin",
+            "/a;/b",
+        ] {
+            assert!(check_scope_q(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "", "/a,,/b", "/a;;/b", "//a", "/a/", "Madrid", "/a/#/b", "(/a;/b", "()", "/a b", "/a#",
+        ] {
+            let err = check_scope_q(bad).unwrap_err();
+            assert_eq!(err.status(), 400, "{bad:?}: {err}");
+        }
+        let long = "/a,".repeat(MAX_SCOPE_Q_BYTES);
+        assert_eq!(check_scope_q(&long).unwrap_err().status(), 403);
     }
 }

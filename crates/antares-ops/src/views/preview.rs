@@ -2,8 +2,10 @@
 //! `POST /q/views/{id}/preview` (gap G13): what a draft view would serve,
 //! before anyone stores it. The body is the candidate view document, checked
 //! as a PUT checks it; the request's query string is a Query Entities query
-//! (5.7.2) run through the candidate's narrowing in its Tenant, with no
-//! caller subject: a policy engine is asked as for an anonymous caller. The answer is the count and one bounded page. Nothing is
+//! (5.7.2) run through the candidate's narrowing in its Tenant, under the
+//! subject headers of the `/q` request (T-3813): the admin caller names whose
+//! reading it previews, and a request naming nobody is the cluster's own, as
+//! on every path. The answer is the count and one bounded page. Nothing is
 //! stored and the table is not reloaded. The narrowing is previewed whether
 //! or not the draft lists `query_entities` among its operations.
 
@@ -28,8 +30,11 @@ pub(super) fn routes(r: &Weak<Reloader>) -> Router {
     Router::new().route(
         "/views/{id}/preview",
         post(
-            move |Path(id): Path<String>, RawQuery(q): RawQuery, body: Bytes| {
-                serve(r.clone(), |r| preview(r, id, q, body))
+            move |Path(id): Path<String>,
+                  RawQuery(q): RawQuery,
+                  headers: HeaderMap,
+                  body: Bytes| {
+                serve(r.clone(), |r| preview(r, id, q, headers, body))
             },
         ),
     )
@@ -66,6 +71,7 @@ async fn preview(
     r: Arc<Reloader>,
     id: String,
     raw: Option<String>,
+    caller: HeaderMap,
     body: Bytes,
 ) -> Result<Response, String> {
     if body.len() > MAX_VIEW_BYTES {
@@ -87,11 +93,7 @@ async fn preview(
         .header("Accept", "application/json")
         .body(Body::empty())
         .map_err(|e| e.to_string())?;
-    let answer = r
-        .state
-        .with_view(loaded.view)
-        .call(&HeaderMap::new(), req)
-        .await;
+    let answer = r.state.with_view(loaded.view).call(&caller, req).await;
     // The admin caller reads a refusal as the broker gave it.
     if !answer.status().is_success() {
         return Ok(answer);
@@ -102,9 +104,13 @@ async fn preview(
         .and_then(|v: &HeaderValue| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or_default();
-    let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
-        .await
-        .map_err(|e| e.to_string())?;
+    let Ok(bytes) = axum::body::to_bytes(answer.into_body(), r.state.max_answer_bytes).await else {
+        return Ok(problem(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "BadRequestData",
+            antares_api::bounds::ANSWER_TOO_LARGE,
+        ));
+    };
     let entities: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     Ok(axum::Json(serde_json::json!({"count": count, "entities": entities})).into_response())
 }

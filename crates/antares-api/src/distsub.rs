@@ -134,9 +134,9 @@ async fn inbound_put(st: &AppState, remote_id: &str, tenant: &TenantId, own_id: 
             )
             .await
         {
-            tracing::warn!(
-                "subscription {own_id}: inbound mapping for {remote_id} not stored: {e}"
-            );
+            // Not the remote id: it is the key /ex/v1/remote-notify accepts
+            // a notification by, and a log line is no place for it (T-3915).
+            tracing::warn!("subscription {own_id}: inbound mapping not stored: {e}");
         }
     }
 }
@@ -249,13 +249,18 @@ pub(crate) async fn on_subscription_created(st: &AppState, tenant: &TenantId, su
     // `q` is deliberately absent: on a Context Source Registration
     // Subscription it would filter registration properties, not Entity
     // Attributes.
-    for k in CSR_MATCH_MEMBERS.iter().chain(["__context"].iter()) {
-        if let Some(v) = sub.get(k) {
-            doc[*k] = v.clone();
+    if let Some(o) = doc.as_object_mut() {
+        for k in CSR_MATCH_MEMBERS.iter().chain(["__context"].iter()) {
+            if let Some(v) = sub.get(k) {
+                o.insert((*k).to_owned(), v.clone());
+            }
         }
     }
-    if let Some(a) = sub.get("notification").and_then(|n| n.get("attributes")) {
-        doc["notification"]["attributes"] = a.clone();
+    if let (Some(a), Some(n)) = (
+        sub.get("notification").and_then(|n| n.get("attributes")),
+        doc.get_mut("notification").and_then(Value::as_object_mut),
+    ) {
+        n.insert("attributes".into(), a.clone());
     }
     let created = st
         .store
@@ -267,7 +272,9 @@ pub(crate) async fn on_subscription_created(st: &AppState, tenant: &TenantId, su
         });
     if created {
         let mut doc = ds_get(st, tenant, own_id).await;
-        doc["csr_sub"] = Value::String(csr_id.clone());
+        if let Some(o) = doc.as_object_mut() {
+            o.insert("csr_sub".into(), Value::String(csr_id.clone()));
+        }
         ds_put(st, tenant, own_id, doc).await;
         // 5.11.2.4 initial notification with all matching registrations —
         // this is what turns already-known registrations into newlyMatching
@@ -670,15 +677,19 @@ fn reduced_copy(
             let mut e = e.clone();
             // notification presentation arrayifies type — EntitySelector
             // wants the plain form back
-            if let Some(t) = e
-                .get("type")
-                .and_then(Value::as_array)
-                .and_then(|a| a.first())
-            {
-                e["type"] = t.clone();
-            }
-            if let Some(t) = e.get("type").and_then(Value::as_str) {
-                e["type"] = Value::String(ctx.expand_key(t));
+            if let Some(o) = e.as_object_mut() {
+                if let Some(t) = o
+                    .get("type")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                    .cloned()
+                {
+                    o.insert("type".into(), t);
+                }
+                if let Some(t) = o.get("type").and_then(Value::as_str) {
+                    let t = Value::String(ctx.expand_key(t));
+                    o.insert("type".into(), t);
+                }
             }
             e
         })

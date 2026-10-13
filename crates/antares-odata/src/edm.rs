@@ -190,29 +190,6 @@ pub struct Edm {
     pub sets: BTreeMap<String, Set>,
 }
 
-/// Every class of `schema` with every slot of it: what a view of `*` shows
-/// (ADR-0023 rule 12), which names no type for [`ViewOps::shown_by_type`].
-///
-/// [`ViewOps::shown_by_type`]: antares_ops::ViewOps::shown_by_type
-#[must_use]
-pub fn every(schema: &linkml_model::Model) -> Shown {
-    schema
-        .schema()
-        .classes
-        .keys()
-        .map(|class| {
-            let slots = schema.class_slots(class);
-            (
-                schema.class_iri(class),
-                slots
-                    .iter()
-                    .map(|(slot, _)| schema.slot_iri(slot))
-                    .collect(),
-            )
-        })
-        .collect()
-}
-
 /// Builds the model of view `view` from `schema` and what the view shows.
 /// A class the view does not show, a slot it does not show of that class,
 /// and a name with no CSDL form are left out; a Relationship whose target
@@ -632,7 +609,8 @@ fn written(slot: &linkml_model::Slot) -> Written {
 /// C2 to C16: the writes the view offers, none of them deep or an upsert,
 /// with the members no write may name ([`Shape::writable`], the computed
 /// ones are `Core.Computed`); counting; filtering and sorting on the
-/// members [`Shape::scalar`] admits and `id` (C11, C12); expanding one
+/// members [`Shape::scalar`] admits and `id` (C11, C12), sorting also on
+/// `createdAt` and `modifiedAt`; expanding one
 /// level (C13). Advisory: every request is still gated (O25).
 fn capabilities(
     members: &BTreeMap<String, Member>,
@@ -692,7 +670,7 @@ fn capabilities(
             vec![("Deletable", flag(writable.delete))],
         ),
         restriction("CountRestrictions", vec![("Countable", flag(true))]),
-        restriction("SearchRestrictions", vec![("Searchable", flag(false))]),
+        restriction("SearchRestrictions", vec![("Searchable", flag(true))]),
         restriction(
             "FilterRestrictions",
             vec![
@@ -708,7 +686,18 @@ fn capabilities(
             "SortRestrictions",
             vec![
                 ("Sortable", flag(true)),
-                ("NonSortableProperties", Expr::Collection(unserved)),
+                // `createdAt` and `modifiedAt` are sorted by the surface (T-3758)
+                (
+                    "NonSortableProperties",
+                    Expr::Collection(
+                        unserved
+                            .into_iter()
+                            .filter(|p| {
+                                !matches!(p, Expr::PropertyPath(n) if n == "createdAt" || n == "modifiedAt")
+                            })
+                            .collect(),
+                    ),
+                ),
             ],
         ),
         restriction(
@@ -759,14 +748,49 @@ fn container_capabilities() -> Vec<Annotation> {
         ),
         flag("QuerySegmentSupported", true),
         flag("CrossJoinSupported", false),
-        flag("ComputeSupported", false),
+        flag("ComputeSupported", true),
+        // Q19: the `$apply` transformations served (T-3937, T-3985)
+        Annotation::new(
+            "Aggregation.ApplySupported",
+            Expr::Record(vec![
+                (
+                    "Transformations".into(),
+                    Expr::Collection(
+                        [
+                            "identity",
+                            "filter",
+                            "orderby",
+                            "top",
+                            "skip",
+                            "aggregate",
+                            "groupby",
+                            "topcount",
+                            "topsum",
+                            "toppercent",
+                            "bottomcount",
+                            "bottomsum",
+                            "bottompercent",
+                            "concat",
+                            "compute",
+                            "search",
+                        ]
+                        .into_iter()
+                        .map(|t| Expr::String(t.into()))
+                        .collect(),
+                    ),
+                ),
+                // No `Rollup`: `Aggregation.RollupType/None` is an enum member of a vocabulary
+                // the clients do not load, and Microsoft.OData.Edm's validator refuses the whole
+                // $metadata over it (BadUnresolvedEnumMember); `rollup` answers 501 (T-3937).
+            ]),
+        ),
         flag("KeyAsSegmentSupported", false),
         flag("AsynchronousRequestsSupported", false),
     ]
 }
 
 fn references() -> Vec<Reference> {
-    ["Core", "Capabilities", "Validation"]
+    ["Core", "Capabilities", "Validation", "Aggregation"]
         .into_iter()
         .map(|alias| Reference {
             uri: format!("{VOCABULARIES}Org.OData.{alias}.V1.xml"),
@@ -1186,7 +1210,7 @@ mod tests {
     #[test]
     fn a_view_of_every_name_shows_every_class_with_every_slot() {
         let s = schema();
-        let every = every(&s);
+        let every = s.slot_iris_by_class();
         let car = &every[&s.class_iri("Car")];
         assert!(
             shown(&s, &[("Car", CAR_ALL)])[&s.class_iri("Car")].is_subset(car),

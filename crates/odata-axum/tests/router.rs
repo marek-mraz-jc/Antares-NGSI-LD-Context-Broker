@@ -48,6 +48,7 @@ fn state() -> ODataState {
         csdl_limits: odata_csdl::Limits::strict(),
         max_header_len: 64,
         metadata_etag: None,
+        custom_options: Vec::new(),
     }
 }
 
@@ -358,6 +359,52 @@ async fn unknown_system_and_custom_query_options_are_400_and_not_echoed() -> Res
     Ok(())
 }
 
+/// URL 5.2: the custom options the caller names are the only ones accepted, matched by their
+/// exact name; every other one stays 400.
+#[tokio::test]
+async fn only_the_custom_options_the_service_names_are_accepted() -> Result<(), String> {
+    let named = ODataState {
+        custom_options: vec!["ngsild.q".into()],
+        ..state()
+    };
+    let routes = Router::new()
+        .route("/{*rest}", routing::get(echo))
+        .with_state(Arc::new(named));
+    let app = || Router::new().nest("/odata", routes.clone());
+    let answer = get_with(app(), "/odata/Buildings?ngsild.q=height%3E1", &[V401]).await?;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body, "4.01 Buildings?ngsild.q=height%3E1");
+    let metadata = Router::new().nest_service(
+        "/odata",
+        metadata_router(Arc::new(ODataState {
+            custom_options: vec!["ngsild.q".into()],
+            ..state()
+        })),
+    );
+    let answer = get_with(metadata, "/odata/$metadata?ngsild.q=a", &[]).await?;
+    assert_eq!(
+        answer.status,
+        StatusCode::BAD_REQUEST,
+        "a named option is a resource's"
+    );
+    for uri in [
+        "/odata/Buildings?ngsild.q=a&mine=yes",
+        "/odata/Buildings?NGSILD.q=a",
+        "/odata/Buildings?ngsild.qq=a",
+        "/odata/$entity?$id=Buildings('b1')&ngsild.q=a",
+    ] {
+        let answer = get_with(app(), uri, &[]).await?;
+        assert_eq!(
+            answer.status,
+            StatusCode::BAD_REQUEST,
+            "{uri}: {}",
+            answer.body
+        );
+        assert!(!answer.body.contains("mine") && !answer.body.contains("NGSILD"));
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn the_callers_limits_hold_on_every_request() -> Result<(), String> {
     let short = ODataState {
@@ -422,7 +469,7 @@ async fn the_extractor_parses_below_the_service_root_and_answers_refusals_with_t
             "/odata/Buildings?$filter=width%20eq%201",
             StatusCode::BAD_REQUEST,
         ),
-        ("/odata/Buildings?$search=blue", StatusCode::NOT_IMPLEMENTED),
+        ("/odata/Buildings?$index=1", StatusCode::NOT_IMPLEMENTED),
         ("/odata/Buildings?$top=1&$top=2", StatusCode::BAD_REQUEST),
         ("/odata/Buildings?$top=x", StatusCode::BAD_REQUEST),
         ("/odata/Buildings?mine=yes", StatusCode::BAD_REQUEST),

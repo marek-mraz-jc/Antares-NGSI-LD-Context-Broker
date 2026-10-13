@@ -11,6 +11,8 @@
 //! index-shaped in the broker (candidate lookup by (tenant, type) /
 //! (tenant, watched attribute)); every predicate here evaluates one
 //! candidate self-contained.
+//!
+#![doc = include_str!("../README.md")]
 // T-3468: every surface calls into this crate on a request path, where a
 // panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
 // index out of bounds or overflow.
@@ -385,6 +387,48 @@ mod tests {
             selector_match(&s, &doc, &c),
             "watchedAttributes-only subscription"
         );
+    }
+
+    /// The edges of the selector and the conditions (T-3912, the `ngsild` coverage gate): a type
+    /// expression of 4.17, an `id` that is neither a String nor a String[] (Table 5.2.33-1), a
+    /// `q` or a `geoQ` the broker cannot read (it notifies nothing rather than everything), and
+    /// `coordinates` written as a JSON array instead of the string Table 5.2.13-1 shows.
+    #[test]
+    fn selector_and_condition_edges() {
+        let c = ctx();
+        let none = |_: &str| None;
+        let doc = vehicle(30.0, -3.7);
+        let typed = |t: String| json!({"entities": [{"type": t}]});
+        assert!(selector_match(
+            &typed(format!("{DC}/Bicycle|{DC}/Vehicle")),
+            &doc,
+            &c
+        ));
+        assert!(!selector_match(
+            &typed(format!("{DC}/Bicycle|{DC}/Car")),
+            &doc,
+            &c
+        ));
+        assert!(
+            !selector_match(&json!({"entities": [{"id": 7}]}), &doc, &c),
+            "id of no listed shape"
+        );
+
+        let mut s = sub();
+        s["q"] = json!("(speed>25");
+        assert!(antares_ql::parse_q("(speed>25").is_err());
+        assert!(!conditions_match(&s, &doc, &c, &none), "an unreadable q");
+        let mut s = sub();
+        s["geoQ"]["geometry"] = json!("Nothing");
+        assert!(!conditions_match(&s, &doc, &c, &none), "an unreadable geoQ");
+
+        let g = json!({"georel": "near;maxDistance==2000", "geometry": "Point", "coordinates": [-3.7, 40.4]});
+        assert_eq!(
+            geo_params(g.as_object().expect("object"))["coordinates"],
+            "[-3.7,40.4]"
+        );
+        let g = json!({"georel": "near;maxDistance==2000", "geometry": "Point"});
+        assert!(!geo_params(g.as_object().expect("object")).contains_key("coordinates"));
     }
 
     /// 4.9 EXAMPLE 13/14: a linked-entity term (`driver{name}`) resolves the

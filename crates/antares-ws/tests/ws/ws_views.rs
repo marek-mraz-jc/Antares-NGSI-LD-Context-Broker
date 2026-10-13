@@ -69,3 +69,24 @@ async fn ws_a_removed_view_stops_delivery() -> Result<(), String> {
     assert_eq!(refused.status(), 404);
     Ok(())
 }
+
+/// T-4084: an x-subscribe whose `q` is no NGSI-LD q is answered 400, as
+/// POST /subscriptions is. A write through another view reaching the socket
+/// is antares-broker's `views_matrix` test, which mounts the views surface.
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_a_bad_q_is_refused() -> Result<(), String> {
+    let b = broker(Limits::default()).await?;
+    cars_view(&b).await?;
+    let mut c = connect(b.addr, "/x/views/cars/ws", &[]).await?;
+    let bad = c
+        .subscribe(json!({"type": "Subscription", "entities": [{"type": "Car"}], "q": "speed>>"}))
+        .await?;
+    assert_eq!(status(&bad), 400, "{bad}");
+    assert_eq!(
+        bad.pointer("/body/type"),
+        Some(&json!("https://uri.etsi.org/ngsi-ld/errors/BadRequestData")),
+        "{bad}"
+    );
+    assert_eq!(status(&c.subscribe(cars()).await?), 201);
+    Ok(())
+}

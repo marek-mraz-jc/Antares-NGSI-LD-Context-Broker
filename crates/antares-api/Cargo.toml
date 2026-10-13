@@ -18,7 +18,7 @@ tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true }
 antares-model = { workspace = true }
 antares-store = { workspace = true }
-antares-jsonld = { workspace = true }
+antares-jsonld = { workspace = true, features = ["fetch"] }
 antares-ql = { workspace = true }
 antares-matcher = { workspace = true }
 # Test-only: the built-in memory/file store behind `AppState::new`, and the
@@ -31,6 +31,8 @@ sonic-rs = { workspace = true, optional = true }
 # consumer that builds this crate without the rest of the workspace (the
 # wasm crate) must not lose it to feature resolution.
 futures-util = { workspace = true, features = ["std"] }
+# ADR-0030: the tenant digest.
+sha2 = { workspace = true }
 chrono = { workspace = true }
 icu_collator = { workspace = true }
 icu_locale_core = { workspace = true }
@@ -89,6 +91,8 @@ views = []
 async-trait = { workspace = true }
 antares-api = { workspace = true, features = ["test-kit", "postgres"] }
 http-body-util = { workspace = true }
+# a paused clock runs a test to a 60 s deadline at once (T-4102)
+tokio = { workspace = true, features = ["test-util"] }
 # capturing subscriber: the tests that prove a credential is not logged
 tracing-subscriber = { workspace = true }
 

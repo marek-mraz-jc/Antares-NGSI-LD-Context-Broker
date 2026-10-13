@@ -180,8 +180,8 @@ fn paginate_impl(
             qp.join("&")
         ));
     };
-    if offset + limit < total && limit > 0 {
-        mk(offset + limit, "next");
+    if offset.saturating_add(limit) < total && limit > 0 {
+        mk(offset.saturating_add(limit), "next");
     }
     if offset > 0 {
         mk(offset.saturating_sub(limit.max(1)), "prev");
@@ -333,7 +333,7 @@ pub fn order_entities(
                 let iri = ctx.expand_key(head);
                 let inst = doc.get(&iri).and_then(Value::as_array)?.first()?;
                 let mut cur = inst;
-                for seg in &path[1..] {
+                for seg in path.iter().skip(1) {
                     match seg.as_str() {
                         "createdAt" | "modifiedAt" | "observedAt" | "datasetId" | "unitCode" => {
                             cur = cur.get(seg.as_str())?;
@@ -390,8 +390,8 @@ pub fn order_entities(
     fn is_date(s: &str) -> bool {
         let b = s.as_bytes();
         b.len() == 10
-            && b[4] == b'-'
-            && b[7] == b'-'
+            && b.get(4) == Some(&b'-')
+            && b.get(7) == Some(&b'-')
             && b.iter()
                 .enumerate()
                 .all(|(i, c)| matches!(i, 4 | 7) || c.is_ascii_digit())
@@ -399,13 +399,15 @@ pub fn order_entities(
     /// 4.6.3 Time: hh:mm:ss[.f*]Z.
     fn is_time(s: &str) -> bool {
         let b = s.as_bytes();
+        let digits =
+            |r: std::ops::Range<usize>| b.get(r).is_some_and(|d| d.iter().all(u8::is_ascii_digit));
         b.len() >= 9
-            && b[b.len() - 1] == b'Z'
-            && b[2] == b':'
-            && b[5] == b':'
-            && b[..2].iter().all(u8::is_ascii_digit)
-            && b[3..5].iter().all(u8::is_ascii_digit)
-            && b[6..8].iter().all(u8::is_ascii_digit)
+            && b.last() == Some(&b'Z')
+            && b.get(2) == Some(&b':')
+            && b.get(5) == Some(&b':')
+            && digits(0..2)
+            && digits(3..5)
+            && digits(6..8)
     }
     fn cmp_vals(
         a: &Option<Value>,
@@ -552,7 +554,7 @@ pub(crate) fn query_doc_params(
                     Some(Value::String(s)) => {
                         antares_model::EntityId::new(s)?;
                         ids.push(s.clone());
-                        with_id += 1;
+                        with_id = with_id.saturating_add(1);
                     }
                     Some(Value::Array(a)) => {
                         for i in a {
@@ -562,7 +564,7 @@ pub(crate) fn query_doc_params(
                             antares_model::EntityId::new(s)?;
                             ids.push(s.to_owned());
                         }
-                        with_id += 1;
+                        with_id = with_id.saturating_add(1);
                     }
                     Some(_) => {
                         return Err(bad(
@@ -574,7 +576,7 @@ pub(crate) fn query_doc_params(
                     None => {}
                     Some(Value::String(s)) => {
                         pats.push(s.clone());
-                        with_pat += 1;
+                        with_pat = with_pat.saturating_add(1);
                     }
                     Some(_) => {
                         return Err(bad(
@@ -621,6 +623,9 @@ pub(crate) fn query_doc_params(
         match q.get(k) {
             None => {}
             Some(Value::String(s)) => {
+                if k == "scopeQ" {
+                    antares_ql::scope::check_scope_q(s)?;
+                }
                 vp.insert(k.into(), capped(k, s.clone())?);
             }
             Some(_) => return Err(bad(format!("Query {k} must be a string (5.2.23)"))),

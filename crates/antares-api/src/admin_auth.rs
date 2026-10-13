@@ -23,7 +23,7 @@ pub const UNAUTHORIZED_TYPE: &str = "urn:antares:error:Unauthorized";
 
 /// The admin secret and whether `/q/metrics` is served without it.
 pub struct AdminAuth {
-    token: Box<[u8]>,
+    token: crate::secret::Secret,
     /// `/q/metrics` answers without the credential (a scraper that cannot
     /// send one); `false` puts it behind the credential like the rest.
     pub metrics_open: bool,
@@ -53,7 +53,7 @@ impl AdminAuth {
             ));
         }
         Ok(Self {
-            token: secret.as_bytes().into(),
+            token: crate::secret::Secret::new(secret),
             metrics_open,
         })
     }
@@ -95,7 +95,8 @@ impl AdminAuth {
         };
         let (scheme, rest) = value.split_at(space);
         let presented = rest.get(1..).unwrap_or_default();
-        scheme.eq_ignore_ascii_case(b"bearer") && constant_time_eq(&self.token, presented)
+        scheme.eq_ignore_ascii_case(b"bearer")
+            && constant_time_eq(self.token.expose().as_bytes(), presented)
     }
 }
 

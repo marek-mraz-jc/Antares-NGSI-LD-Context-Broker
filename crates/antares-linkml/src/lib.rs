@@ -176,10 +176,22 @@ async fn answer(
     // same 404 as a hidden one.
     let (types, attrs) = match wanted {
         Wanted::Class(name) if source.schema().classes.contains_key(name) => {
-            (vec![source.class_iri(name)], Vec::new())
+            let shown = view.shown_by_type();
+            (
+                vec![as_viewed(source.class_iri(name), name, shown.keys())],
+                Vec::new(),
+            )
         }
         Wanted::Slot(name) if source.schema().slots.contains_key(name) => {
-            (Vec::new(), vec![source.slot_iri(name)])
+            let shown = view.shown_by_type();
+            (
+                Vec::new(),
+                vec![as_viewed(
+                    source.slot_iri(name),
+                    name,
+                    shown.values().flatten(),
+                )],
+            )
         }
         Wanted::Class(_) | Wanted::Slot(_) => return Err(Refusal::NotFound),
         Wanted::Index | Wanted::Document { .. } => (Vec::new(), Vec::new()),
@@ -206,6 +218,21 @@ async fn answer(
         Wanted::Slot(name) => rendered.slot(name).map(|b| (render::JSON, b)),
     };
     found.ok_or(Refusal::NotFound)
+}
+
+/// The IRI the view knows schema element `name` by, the one the engine is asked about: its own
+/// when the view shows it (or names nothing, a `*` view), else the shown IRI the core @context
+/// reads `name` as, as `narrow` matches it (T-3645).
+fn as_viewed<'a>(own: String, name: &str, shown: impl Iterator<Item = &'a String>) -> String {
+    let shown: Vec<&String> = shown.collect();
+    if shown.contains(&&own) {
+        return own;
+    }
+    shown
+        .into_iter()
+        .find(|iri| antares_ops::core_name(iri) == name)
+        .cloned()
+        .unwrap_or(own)
 }
 
 /// `body` as `GET` or `HEAD` answers it: a strong `ETag` of the bytes,
