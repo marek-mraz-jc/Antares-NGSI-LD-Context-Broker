@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+mod apply;
 mod batch;
 mod below;
 pub mod edm;
@@ -171,7 +172,7 @@ async fn respond(ops: &Ops, mut req: Request) -> Response {
     if req.method() == Method::POST && req.uri().path() == format!("{inner_root}$batch") {
         let path_root = format!("{PREFIX}{inner_root}");
         let roots = (path_root.as_str(), inner_root.as_str());
-        return batch::serve(&routed, roots, req, state.url_limits.max_query_len).await;
+        return batch::serve(&routed, ops, roots, req, state.url_limits.max_query_len).await;
     }
     let Ok(resp) = routed.oneshot(req).await;
     resp

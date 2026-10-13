@@ -23,9 +23,9 @@ name: surfaces-conformance
 #                    (its reference model, ci/odata-compliance), red on any
 #                    test ci/odata-compliance-baseline.json passes (T-3714)
 #   ogc-compliance-external  the OGC CITE ets-ogcapi-features10 (TEAM
-#                    Engine image pinned by digest) against view `all`,
-#                    red on any test ci/ogc-compliance-baseline.json passes
-#                    (T-3747)
+#                    Engine image pinned by digest) against view `all` and
+#                    each Endpoint kind of ci/views/ogc, red on any test
+#                    ci/ogc-compliance/<view>.json passes (T-3747, T-3831)
 #   ws-conformance   docs/api/asyncapi-ws.yaml validated by @asyncapi/cli
 #                    2.16.0, then joinedcontext-conformance tests/ws: the
 #                    scripted sessions of /x/views/all/ws, every message
@@ -369,10 +369,17 @@ jobs:
           log-file: gate.md
 
   ogc-compliance-external:
-    name: ogc-compliance-external
+    name: ogc-compliance-external (${{ matrix.view }})
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # One run per Endpoint kind (T-3831): `all` is the conformance Tenant's star
+    # view; the others read the `ogc` Tenant of ci/views/ogc (public, internal
+    # with the Part 4 writes, filtered by q, star, projection, a data cube).
+    strategy:
+      fail-fast: false
+      matrix:
+        view: [all, ogc-public, ogc-internal, ogc-filtered, ogc-star, ogc-projection, ogc-cube]
     permissions:
       contents: read
       issues: write
@@ -381,7 +388,8 @@ jobs:
       # release candidate), pinned by digest; it tests Part 1 and Part 2 (CRS),
       # no ETS tests Part 4 or Part 5 yet (docs/src/ogc-compliance.md)
       TE_IMAGE: ogccite/ets-ogcapi-features10:1.8-teamengine-5.7@sha256:d884de89ac8dae6ea153766886c706f9ddf6ce172de0c4bd4bdd591d28bdaffe
-      IUT: http://localhost:9090/x/views/all/ogc/features
+      IUT: http://localhost:9090/x/views/${{ matrix.view }}/ogc/features
+      BASELINE: ci/ogc-compliance/${{ matrix.view }}.json
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v7
@@ -396,21 +404,22 @@ jobs:
             ANTARES_SCHEMA_MAX_BYTES=1048576 ./antares > broker.log 2>&1 &
           for _ in $(seq 1 100); do curl -sf -o /dev/null localhost:9090/q/health && break; sleep 0.2; done
           dev/views-rig.sh http://localhost:9090
+          dev/views-rig.sh http://localhost:9090 ci/views/ogc
           # the image's own public test account (ogctest), not a secret
           for _ in $(seq 1 60); do
             curl -fsS -m 5 -u ogctest:ogctest -o /dev/null localhost:8080/teamengine/rest/suites && break
             sleep 5
           done
-      - name: The ETS, gated by ci/ogc-compliance-baseline.json
+      - name: The ETS, gated by ci/ogc-compliance/<view>.json
         run: |
           dev/ogc-compliance/baseline.py --self-test
           iut=$(jq -rn --arg u "$IUT" '$u|@uri')
           curl -sS -m 1500 -u ogctest:ogctest -H 'Accept: application/xml' -o testng-results.xml \
             "localhost:8080/teamengine/rest/suites/ogcapi-features-1.0/run?iut=$iut&noofcollections=-1" || true
           set +e
-          dev/ogc-compliance/baseline.py check testng-results.xml ci/ogc-compliance-baseline.json > gate.md 2>&1
+          dev/ogc-compliance/baseline.py check testng-results.xml "$BASELINE" > gate.md 2>&1
           rc=$?
-          { echo "## OGC API - Features ETS (ets-ogcapi-features10 1.8)"; cat gate.md; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "## OGC API - Features ETS (ets-ogcapi-features10 1.8), view ${{ matrix.view }}"; cat gate.md; } >> "$GITHUB_STEP_SUMMARY"
           cat gate.md
           exit $rc
       - name: TEAM Engine log
@@ -419,7 +428,7 @@ jobs:
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: ogc-compliance-external
+          name: ogc-compliance-external-${{ matrix.view }}
           path: |
             testng-results.xml
             gate.md
@@ -430,8 +439,8 @@ jobs:
         if: failure() && github.event_name == 'schedule'
         uses: ./.github/actions/failure-issue
         with:
-          title: ogc-compliance-external went red
-          body: A test the OGC API - Features ETS passed in ci/ogc-compliance-baseline.json fails now.
+          title: ogc-compliance-external (${{ matrix.view }}) went red
+          body: A test the OGC API - Features ETS passed in ci/ogc-compliance/${{ matrix.view }}.json fails now.
           log-file: gate.md
 
   ws-conformance:

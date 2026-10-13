@@ -5,7 +5,7 @@ executable test suite, [ets-ogcapi-features10](https://github.com/opengeospatial
 the suite OGC certification uses. Our own tests (`crates/antares-ogc/tests`)
 check each row of `docs/analysis/ogc-features-mapping.md`. The ETS checks the
 endpoint from the outside, as a client would. This page records what the
-build passes today (T-3747).
+build passes today (T-3747), on every kind of Endpoint (T-3831).
 
 ## 1. The run
 
@@ -14,18 +14,22 @@ runs on every pull request to `dev`, nightly and on `v*` tags:
 
 1. It takes the `full` broker of the `build` job and starts it on port 9090
    with `ANTARES_API_SURFACES=admin,views,ogc`.
-2. It loads `ci/views` with `dev/views-rig.sh`. The target is view `all`,
-   collection `AirQualityObserved`, three seeded Entities with a `location`.
+2. It loads `ci/views`, then `ci/views/ogc`, with `dev/views-rig.sh`. The job
+   is a matrix over seven views, one per kind of Endpoint (section 7): `all`
+   reads the `conformance` Tenant (collection `AirQualityObserved`, three
+   seeded Entities with a `location`); the six `ogc-*` views read the `ogc`
+   Tenant, which adds the geometry-less class `Reading`.
 3. It starts TEAM Engine from the image
    `ogccite/ets-ogcapi-features10:1.8-teamengine-5.7`, pinned by digest
    (`sha256:d884de89…bdaffe`), on the host network.
 4. It asks TEAM Engine's REST API for a run of suite `ogcapi-features-1.0`
-   against `http://localhost:9090/x/views/all/ogc/features` with
+   against `http://localhost:9090/x/views/<view>/ogc/features` with
    `noofcollections=-1`, as `tests/ogc/run.sh` of joinedcontext-conformance
    (T-0057) does, and keeps the TestNG document it answers with.
-5. It gates the run with `dev/ogc-compliance/baseline.py check` (section 3).
+5. It gates the run with `dev/ogc-compliance/baseline.py check` against
+   `ci/ogc-compliance/<view>.json` (section 3).
 
-The artifact `ogc-compliance-external` holds the TestNG document, the gate's
+The artifact `ogc-compliance-external-<view>` holds the TestNG document, the gate's
 Markdown, the broker log and the TEAM Engine log. The job summary shows the
 per-class table. The job holds no secret: the broker's `/q` routes stay
 inside the runner, the TEAM Engine account `ogctest` is the image's public
@@ -38,10 +42,11 @@ cargo build -p antares-broker --features views,ogc
 ANTARES_HTTP_PORT=9090 ANTARES_API_SURFACES=admin,views,ogc \
   ANTARES_SCHEMA_MAX_BYTES=1048576 target/debug/antares &
 dev/views-rig.sh http://localhost:9090
+dev/views-rig.sh http://localhost:9090 ci/views/ogc
 docker run -d --network host ogccite/ets-ogcapi-features10:1.8-teamengine-5.7
 curl -u ogctest:ogctest -H 'Accept: application/xml' -o testng-results.xml \
   'localhost:8080/teamengine/rest/suites/ogcapi-features-1.0/run?iut=http%3A%2F%2Flocalhost%3A9090%2Fx%2Fviews%2Fall%2Fogc%2Ffeatures&noofcollections=-1'
-dev/ogc-compliance/baseline.py check testng-results.xml ci/ogc-compliance-baseline.json
+dev/ogc-compliance/baseline.py check testng-results.xml ci/ogc-compliance/all.json
 ```
 
 ## 2. Which parts an ETS tests
@@ -58,8 +63,8 @@ The job pins the 1.8 release; 1.9 is a release candidate.
 
 ## 3. The baseline and the regression gate
 
-`ci/ogc-compliance-baseline.json` records every test method of the run that
-is no TestNG configuration method (71 today). Each test is keyed
+`ci/ogc-compliance/<view>.json` records every test method of the view's run
+that is no TestNG configuration method (71 for view `all` today). Each test is keyed
 `Core :: FeaturesLimit.validateFeaturesWithLimitResponse_NumberMatched`
 (class, test class, method), with `#2`, `#3` added when a data provider runs a
 method again, and status `PASS`, `FAIL` or `SKIP`. `baseline.py check` fails
@@ -108,6 +113,39 @@ The first run, checked against the baseline, loses two passes and exits 1.
 A deliberate break proved the same in the job: run 38141708488 (`b1d1f11`) on a
 throwaway branch, which dropped the top-level `minItems` from the `bbox`
 schema again, went red on `Core :: FeaturesBBox.boundingBoxParameterDefinition`.
+
+## 7. Every kind of Endpoint
+
+The platform puts six kinds of Endpoint in front of this surface. Each is a
+view, and each runs the ETS on its own (`ci/views/ogc`, `ogc` Tenant;
+`all` is the conformance Tenant's star view). The table counts passed,
+failed and skipped tests, from local runs of the pinned image on
+`agent/worker-7/T-3831` (2026-10-12):
+
+| view | Endpoint kind | Core | CRS by Reference |
+|---|---|---|---|
+| `all` | star, conformance Tenant | 43 / 0 / 3 | 24 / 0 / 1 |
+| `ogc-public` | public: a type list, reads only | 43 / 0 / 3 | 24 / 0 / 1 |
+| `ogc-internal` | internal: the same with the Part 4 writes | 43 / 0 / 3 | 24 / 0 / 1 |
+| `ogc-filtered` | filtered by the view's `q` (`NO2>25`) | 43 / 0 / 3 | 24 / 0 / 1 |
+| `ogc-star` | star (ADR-0023 rule 12): both classes | 75 / 0 / 6 | 43 / 2 / 2 |
+| `ogc-projection` | projection: `temperature` and `location` | 43 / 0 / 3 | 24 / 0 / 1 |
+| `ogc-cube` | data cube observations: `Reading`, no geometry | 43 / 0 / 3 | 22 / 2 / 1 |
+
+The two failures of `ogc-star` and `ogc-cube` are the same ETS defect, kept as
+known failures in their baselines:
+`FeatureCrsParameterTransform.verifyFeatureCrsParameterTransformWithoutCrsParameter`
+(twice) throws a `NullPointerException` on a `Reading` Feature, whose
+`"geometry": null` RFC 7946 section 3.2 allows. The endpoint answers 200 with
+`Content-Crs` as the requirement asks; the test reads coordinates that a
+Feature without a geometry does not have.
+
+No ETS exists for Parts 3, 4 and 5 (section 2). The matrix test
+`crates/antares-ogc/tests/ogc/matrix.rs` runs every Part on the same six
+kinds, one cell per Part and kind. A cell holds, or the write cell of a view
+without writes asserts its 405 with `Allow`. In every column no feature,
+queryable or schema shows an attribute the view hides, and a filter on one
+is the same 400 as an unknown name.
 
 ## Related
 

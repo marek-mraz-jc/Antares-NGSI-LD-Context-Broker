@@ -36,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod mapped;
 pub mod mapping;
 mod names;
 mod operation;
@@ -78,7 +79,10 @@ pub use antares_model::{NgsiError, TenantId};
 /// The request bounds a surface applies to what it parses itself (a
 /// WebSocket message never passes the HTTP bounds layer).
 pub mod bounds {
-    pub use antares_api::bounds::{json_depth, MAX_BATCH_ITEMS, MAX_BODY_BYTES, MAX_JSON_DEPTH};
+    pub use antares_api::bounds::{
+        json_depth, ANSWER_TOO_LARGE, MAX_ANSWER_BYTES, MAX_BATCH_ITEMS, MAX_BODY_BYTES,
+        MAX_JSON_DEPTH,
+    };
 }
 
 /// The federation transport contract (ADR-0025 rule 8, ADR-0027 section 9),
@@ -357,6 +361,18 @@ impl Ops {
         }
     }
 
+    /// An answer's body read whole, up to the broker's `max_answer_bytes`
+    /// ([`bounds::MAX_ANSWER_BYTES`]): the page size bounds the Entities, not the
+    /// bytes, and every concurrent request holds its buffer.
+    ///
+    /// # Errors
+    /// [`Refusal::Limit`] with [`bounds::ANSWER_TOO_LARGE`] past the bound.
+    pub async fn read_answer(&self, body: Body) -> Result<axum::body::Bytes, Refusal> {
+        axum::body::to_bytes(body, self.state.max_answer_bytes)
+            .await
+            .map_err(|_| Refusal::Limit(bounds::ANSWER_TOO_LARGE))
+    }
+
     /// The operations of the loaded view `id`, or `None` when no view of
     /// that id is loaded: an unknown id, a view that failed validation and
     /// a removed one are the same answer.
@@ -543,6 +559,14 @@ impl ViewOps {
         self.mapping.as_deref()
     }
 
+    /// [`Ops::read_answer`] for an answer of this view.
+    ///
+    /// # Errors
+    /// [`Refusal::Limit`] past the bound.
+    pub async fn read_answer(&self, body: Body) -> Result<axum::body::Bytes, Refusal> {
+        self.inner.read_answer(body).await
+    }
+
     /// Whether the view allows `op`.
     #[must_use]
     pub fn allows(&self, op: OperationId) -> bool {
@@ -632,6 +656,26 @@ impl ViewOps {
         self.view.shows_every_name()
     }
 
+    /// The type and Attribute names a caller of a view of another model
+    /// uses: the target model's, limited to what the view's rules show of
+    /// the source class ([`mapping::Mapping::target_names`]); `None` for a
+    /// view of its stored model.
+    #[must_use]
+    pub fn target_names(&self) -> Option<(Vec<String>, Vec<String>)> {
+        let mapping = self.mapping.as_deref()?;
+        // a mapped view selects its source class alone, and names what it
+        // shows of it: never the `*` form
+        let shown: std::collections::BTreeSet<String> = self
+            .view
+            .narrowing()
+            .rules
+            .iter()
+            .filter(|rule| rule.types.iter().any(|t| t == mapping.source_class()))
+            .flat_map(|rule| rule.attributes.iter().cloned())
+            .collect();
+        Some(mapping.target_names(&shown))
+    }
+
     /// Each Entity type the view shows with the Attributes it shows of it,
     /// as expanded IRIs: the union of the view's rules, type by type. A
     /// surface that builds a model from a schema intersects it with this.
@@ -689,6 +733,22 @@ impl ViewOps {
     /// [`Refusal::Malformed`] when the caller names another Tenant, and
     /// everything [`Ops::run`] refuses.
     pub async fn run(
+        &self,
+        op: OperationId,
+        caller: &Caller,
+        req: OpsRequest,
+    ) -> Result<Response, Refusal> {
+        match &self.mapping {
+            // a view of another model inverts the request and rebuilds the
+            // answer, for every surface alike (G18)
+            Some(mapping) if self.allows(op) => mapped::serve(self, mapping, op, caller, req).await,
+            Some(_) => Err(Refusal::NotAllowed { allow: Vec::new() }),
+            None => self.run_unmapped(op, caller, req).await,
+        }
+    }
+
+    /// [`Self::run`] of a request already in the view's stored model.
+    pub(crate) async fn run_unmapped(
         &self,
         op: OperationId,
         caller: &Caller,
@@ -1170,6 +1230,21 @@ pub mod test_kit {
                 state: self.state.with_policy(engine),
                 reload: self.reload,
             }
+        }
+
+        /// [`TestBroker::new`] buffering at most `bytes` of one in-process
+        /// answer ([`crate::bounds::MAX_ANSWER_BYTES`] otherwise), set before
+        /// the view table is installed so `/q` previews hold it too; a test
+        /// reaches the bound without writing 64 MiB.
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn with_max_answer_bytes(bytes: usize) -> Result<Self, String> {
+            let mut state = AppState::new("antares-test".into());
+            state.max_answer_bytes = bytes;
+            antares_api::wire(&mut state).await;
+            let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
         }
 
         /// The same broker with the forward transport `make` builds

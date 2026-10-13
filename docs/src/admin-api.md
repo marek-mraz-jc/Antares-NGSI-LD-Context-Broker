@@ -71,6 +71,7 @@ progress). A memory-store broker answers:
     "deliveryLane": 64,
     "deliveryWidth": 64,
     "deliveryWidthPerTenant": 8,
+    "maxAnswerBytes": 67108864,
     "maxBatchItems": 1000,
     "maxBodyBytes": 4194304,
     "maxContextFetches": 32,

@@ -127,10 +127,10 @@ references), T-3737 (one `Content-Length` on `HEAD`), T-3738 (`$entity`
 |---|---:|---:|---:|---:|
 | Minimal | 197 | 76 | 20 | 72.2 % |
 | Intermediate | 266 | 70 | 14 | 79.2 % |
-| Advanced | 276 | 247 | 44 | 52.8 % |
-| **All** (suite summary) | 739 | 393 | 78 | 65.3 % |
+| Advanced | 304 | 221 | 42 | 57.9 % |
+| **All** (suite summary) | 767 | 367 | 76 | 67.6 % |
 
-Measured by surfaces-conformance 38353789076 on `14c8b10` (train 20261013-0509), written by tasks/train.
+Measured by surfaces-conformance 38363542161 on `af69ad5` (train 20261013-0704), written by tasks/train.
 
 One earlier pass was a skip after train 8, by the suite's own rule: `POST with
 nonexistent foreign key` posts a `ProductDescription` whose `ProductID` names
@@ -174,7 +174,8 @@ Each failing area is a task, or a decision with its reason:
 | Change sets and atomicity groups, Content-ID references | 11.4.9.1, 11.4.9.3, 19_json_batch | not supported, by design: ADR-0024 section 5 (W26), mapping row C18 |
 | A comparison or `in` between a property and a literal of another type answers 200 with no rows; an Int64 literal past its range is accepted | 11.3.6, 11.2.5.1, 5.1.1.5 | T-3725 |
 | Options inside `$expand(...)` other than `$select` and `$expand` (Q5) | 11.2.5.9, 11.3.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
-| `$apply`, `$index`, `$deltatoken` and delta links | 11.2.5.4.x, 11.2.4.1, 11.2.8 | not supported, by design: ADR-0024 section 5 answers them 501; `$apply` is T-3937 |
+| `$index`, `$deltatoken` and delta links | 11.2.4.1, 11.2.8 | not supported, by design: ADR-0024 section 5 answers them 501 |
+| `$apply` answered 501 | 11.2.5.4.x | T-3937: `identity`, `filter`, `orderby`, `top`, `skip`, `aggregate` and `groupby` served over the whole answer the view shows; T-3985 adds `topcount` to `bottompercent`, `concat`, `compute` and `search`; `expand`, `nest`, joins, hierarchies and rollup answer 501 |
 | `$compute` answered 501 | 11.2.5.13 | T-3936: served, each item evaluated per Entity on what the view shows |
 | `$search` answered 501 | 11.2.5.6 | T-3750: served over the String properties the view shows |
 | Filter functions outside the F-row subset (date and time, arithmetic, `length`, `indexof`, `substring`, `divby`, `matchesPattern`, `isof`, `cast`) | 11.3.1 to 11.3.4, 11.3.9, 11.5.x | not supported, by design: ADR-0024 section 5; the mapped rows still at 501 are T-3686 |

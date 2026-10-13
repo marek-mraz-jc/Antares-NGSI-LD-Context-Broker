@@ -131,7 +131,9 @@ pub enum LimitKind {
 pub enum Feature {
     /// `$index` (Q17).
     Index,
-    /// `$apply` (Q19).
+    /// A `$apply` transformation other than `identity`, `filter`, `orderby`, `top`, `skip`,
+    /// `aggregate` and `groupby` by single properties; custom aggregates and methods (Q19,
+    /// T-3985).
     Apply,
     /// `$deltatoken` (Q21).
     DeltaToken,
@@ -257,7 +259,7 @@ impl Feature {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Index => "$index",
-            Self::Apply => "$apply",
+            Self::Apply => "$apply transformation",
             Self::DeltaToken => "$deltatoken",
             Self::Root => "$root",
             Self::ImplicitVariable => "$it and $this",
