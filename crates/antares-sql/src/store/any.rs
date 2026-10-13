@@ -495,6 +495,30 @@ impl AnyStore {
         Ok(doc)
     }
 
+    /// [`Self::get`] of several Entities, in one transaction on Postgres
+    /// (T-4085); an absent or expired id has no entry.
+    pub async fn get_entities(
+        &self,
+        tenant: &TenantId,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Value>, NgsiError> {
+        let found: std::collections::HashMap<String, Value> = match self {
+            AnyStore::Mem(s) => ids
+                .iter()
+                .filter_map(|id| Some(((*id).to_owned(), s.get(tenant, Kind::Entity, id)?)))
+                .collect(),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.entities.get_many(tenant, ids).await.map_err(db)?,
+        };
+        let now = now_utc();
+        Ok(found
+            .into_iter()
+            .filter_map(|(id, mut d)| {
+                (!crate::store::filter::strip_expired(&mut d, &now)).then_some((id, d))
+            })
+            .collect())
+    }
+
     pub async fn delete(&self, tenant: &TenantId, kind: Kind, id: &str) -> Result<bool, NgsiError> {
         match self {
             AnyStore::Mem(s) => Ok(s.delete(tenant, kind, id).await),
@@ -1323,6 +1347,15 @@ mod db_error_tests {
 // the inherent methods above. New backends implement the traits directly —
 // this enum stays an implementation detail of the built-in backends, no
 // longer the API surface.
+/// The most Entities one history transaction appends (T-4085). Each append
+/// holds `FOR KEY SHARE` on its Entity until the commit, and a concurrent
+/// write's `FOR UPDATE` waits for it: a 1000-member page in one transaction
+/// would hold every other page over the same ids for the whole append (T-4123).
+/// Small requests, the HSL stream's, are one transaction.
+// ponytail: a fixed chunk; a measured one if lock waits still show on dev.
+#[cfg(feature = "postgres")]
+const HISTORY_CHUNK: usize = 64;
+
 #[async_trait::async_trait]
 impl antares_store::CurrentStateDriver for AnyStore {
     async fn ping(&self) -> Result<(), NgsiError> {
@@ -1401,6 +1434,13 @@ impl antares_store::CurrentStateDriver for AnyStore {
         id: &str,
     ) -> Result<Option<Value>, NgsiError> {
         AnyStore::get(self, tenant, kind, id).await
+    }
+    async fn get_entities(
+        &self,
+        tenant: &TenantId,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Value>, NgsiError> {
+        AnyStore::get_entities(self, tenant, ids).await
     }
     async fn delete(&self, tenant: &TenantId, kind: Kind, id: &str) -> Result<bool, NgsiError> {
         AnyStore::delete(self, tenant, kind, id).await
@@ -1654,6 +1694,19 @@ impl antares_store::TemporalDriver for AnyStore {
         additions: &Value,
     ) -> Result<(), NgsiError> {
         AnyStore::temporal_append(self, tenant, id, shell, additions).await
+    }
+    /// On Postgres a drained request is one transaction per
+    /// [`HISTORY_CHUNK`] Entities (T-4085); a scope change, and the memory
+    /// arm, take the default's append per Entity.
+    async fn event_list(&self, evs: &[antares_store::TemporalEvent]) -> Result<(), NgsiError> {
+        #[cfg(feature = "postgres")]
+        if let (AnyStore::Pg(p), Some(appends)) = (self, antares_store::fold_appends(evs)) {
+            for chunk in appends.chunks(HISTORY_CHUNK) {
+                p.temporal.append_many(chunk).await.map_err(db)?;
+            }
+            return Ok(());
+        }
+        antares_store::drain_events(self, evs).await
     }
     /// Only the Postgres arm pages in SQL, and only an exact prefilter
     /// makes that page the evaluator's page; the memory arm answers
