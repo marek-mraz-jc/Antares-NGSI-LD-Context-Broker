@@ -25,7 +25,7 @@ fn invalid_utf8_in_an_attribute_name_is_bad_request() {
 }
 
 #[test]
-fn a_self_intersecting_polygon_is_bad_request() {
+fn a_self_intersecting_polygon_is_evaluated_not_refused() {
     let params: HashMap<String, String> = [
         ("georel", "intersects"),
         ("geometry", "Polygon"),
@@ -34,7 +34,7 @@ fn a_self_intersecting_polygon_is_bad_request() {
     .into_iter()
     .map(|(k, v)| (k.to_owned(), v.to_owned()))
     .collect();
-    assert_eq!(GeoQuery::from_params(&params).unwrap_err().status(), 400);
+    assert!(GeoQuery::from_params(&params).is_ok_and(|g| g.is_some()));
 }
 
 #[test]
