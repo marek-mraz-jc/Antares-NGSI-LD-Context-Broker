@@ -28,9 +28,14 @@
         </Property>
         <Property Name="raw" Type="Edm.Untyped" Nullable="false"/>
         <Property Name="where" Type="t.Place"/>
-        <NavigationProperty Name="owner" Type="t.Thing" Nullable="false" Partner="parts"/>
+        <Property Name="ownerId" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="nextId" Type="Edm.Guid"/>
+        <NavigationProperty Name="owner" Type="t.Thing" Nullable="false" Partner="parts">
+          <ReferentialConstraint Property="ownerId" ReferencedProperty="id"/>
+        </NavigationProperty>
         <NavigationProperty Name="parts" Type="Collection(t.Thing)" Partner="owner"/>
         <NavigationProperty Name="next" Type="t.Base">
+          <ReferentialConstraint Property="nextId" ReferencedProperty="id"/>
           <Annotation Term="Core.Description" String="tab&#x9;here"/>
         </NavigationProperty>
         <Annotation Term="Core.Description" Qualifier="en" String="thing"/>

@@ -3,7 +3,7 @@
 //! section 5.6): the caller's grants and the `AuthZEN` check, answered from
 //! the table the engine decides with.
 
-use crate::access::{authzen, check, Grants};
+use crate::access::{authzen, check, explain, Grants};
 use crate::subject::Caller as JcCaller;
 use crate::{odrl, ucast, JoinedcontextPolicy};
 use antares_api::policy::Subject;
@@ -47,12 +47,17 @@ impl Surface for Access {
     }
 
     fn version_info(&self) -> Value {
-        serde_json::json!({"routes": ["/x/views/{view}/access", "/x/views/{view}/access/check"]})
+        serde_json::json!({"routes": [
+            "/x/views/{view}/access",
+            "/x/views/{view}/access/check",
+            "/x/views/{view}/access/explain",
+        ]})
     }
 
     fn router(&self, ops: Ops) -> Router {
         let (ops_get, engine_get) = (ops.clone(), self.engine.clone());
-        let (ops_check, engine_check) = (ops, self.engine.clone());
+        let (ops_check, engine_check) = (ops.clone(), self.engine.clone());
+        let (ops_explain, engine_explain) = (ops, self.engine.clone());
         Router::new()
             .route(
                 "/{view}/access",
@@ -66,7 +71,23 @@ impl Surface for Access {
                 "/{view}/access/check",
                 post(
                     move |Path(view): Path<String>, caller: Caller, body: Bytes| async move {
-                        decide(&ops_check, &engine_check, &view, &caller, &body)
+                        decide(&ops_check, &engine_check, &view, &caller, &body, check)
+                    },
+                )
+                .layer(DefaultBodyLimit::max(MAX_CHECK_BYTES)),
+            )
+            .route(
+                "/{view}/access/explain",
+                post(
+                    move |Path(view): Path<String>, caller: Caller, body: Bytes| async move {
+                        decide(
+                            &ops_explain,
+                            &engine_explain,
+                            &view,
+                            &caller,
+                            &body,
+                            explain,
+                        )
                     },
                 )
                 .layer(DefaultBodyLimit::max(MAX_CHECK_BYTES)),
@@ -108,7 +129,11 @@ fn document(
     };
     let table = engine.table(view.tenant());
     let who = caller_of(caller);
-    let grants = Grants::of(table.as_deref(), &who, chrono::Utc::now());
+    let grants = Grants::of(
+        table.as_deref().map(|t| t.through(Some(id))),
+        &who,
+        chrono::Utc::now(),
+    );
     let served = serves(&view);
     let accept = headers.get(ACCEPT).and_then(|v| v.to_str().ok());
     match representation(accept) {
@@ -136,12 +161,16 @@ fn typed(body: &str, media_type: &'static str) -> Response {
     ([(CONTENT_TYPE, media_type)], body.to_owned()).into_response()
 }
 
+/// How one prospective request is answered: [`check`] or [`explain`].
+type Answer = fn(&Grants<'_>, &str, Option<&str>, &dyn Fn(&str) -> bool) -> Value;
+
 fn decide(
     ops: &Ops,
     engine: &JoinedcontextPolicy,
     id: &str,
     caller: &Caller,
     body: &[u8],
+    answer: Answer,
 ) -> Response {
     let Some(view) = ops.view(id) else {
         return Refusal::NotFound.ngsi_ld();
@@ -155,8 +184,12 @@ fn decide(
     let entity_type = query.pointer("/resource/type").and_then(Value::as_str);
     let table = engine.table(view.tenant());
     let who = caller_of(caller);
-    let grants = Grants::of(table.as_deref(), &who, chrono::Utc::now());
-    let answer = check(&grants, action, entity_type, &serves(&view));
+    let grants = Grants::of(
+        table.as_deref().map(|t| t.through(Some(id))),
+        &who,
+        chrono::Utc::now(),
+    );
+    let answer = answer(&grants, action, entity_type, &serves(&view));
     typed(&answer.to_string(), "application/json")
 }
 

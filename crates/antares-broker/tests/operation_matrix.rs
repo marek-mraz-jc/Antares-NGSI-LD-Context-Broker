@@ -1197,7 +1197,16 @@ async fn the_websocket_column_is_served_as_the_matrix_states() {
             }
         };
         let open = |path: &str, tenant: Option<&str>| {
-            let mut ws = Socket::open(port, path, tenant).expect("the upgrade");
+            let mut ws = Socket::open(
+                port,
+                path,
+                &tenant
+                    .map(|t| ("NGSILD-Tenant".to_owned(), t.to_owned()))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                std::time::Duration::from_secs(2),
+            )
+            .expect("the upgrade");
             let welcome = ws.next().expect("the welcome");
             assert_eq!(welcome.pointer("/metadata/x-op"), Some(&json!("x-welcome")));
             engine.take();

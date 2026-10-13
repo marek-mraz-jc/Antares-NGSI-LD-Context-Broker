@@ -9,8 +9,8 @@ use std::fmt::Write as _;
 
 use serde_json::{json, Map, Value};
 
-use crate::model::{Builtin, Model, Range};
-use crate::schema::{Annotation, Slot};
+use crate::model::{Builtin, Model, Range, QB_COMPONENT_TAG, QB_DSD_TAG};
+use crate::schema::{Annotation, Slot, DEFAULT_RANGE, IMPORTS};
 
 // ---------------------------------------------------------------- YAML (L2)
 
@@ -140,7 +140,8 @@ fn slot_node(slot: &Slot) -> Node {
 /// # assert!(m.is_err(), "a newline in a name is refused at load");
 /// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "a: b #c"}"#,
 ///     &linkml_model::Limits { max_bytes: 999, max_depth: 4, max_elements: 9 }).unwrap();
-/// assert_eq!(linkml_model::yaml(&m), "\"id\": \"https://e.org/s\"\n\"name\": \"a: b #c\"\n");
+/// assert_eq!(linkml_model::yaml(&m), "\"id\": \"https://e.org/s\"\n\"name\": \"a: b #c\"\n\
+///     \"imports\":\n  - \"linkml:types\"\n\"default_range\": \"string\"\n");
 /// ```
 #[must_use]
 pub fn yaml(model: &Model) -> String {
@@ -150,6 +151,12 @@ pub fn yaml(model: &Model) -> String {
         ("name".to_owned(), Node::Str(s.name.clone())),
     ];
     opt(&mut top, "version", s.version.as_ref());
+    // what the subset implies, declared for every LinkML reader
+    top.push(("imports".to_owned(), Node::List(vec![IMPORTS.to_owned()])));
+    top.push((
+        "default_range".to_owned(),
+        Node::Str(DEFAULT_RANGE.to_owned()),
+    ));
     if !s.prefixes.is_empty() {
         let prefixes = s
             .prefixes
@@ -262,8 +269,15 @@ fn builtin_schema(b: Builtin) -> Map<String, Value> {
     }
 }
 
+/// Whether the slot holds a `GeoJSON` geometry (NGSI-LD 4.7), whatever its
+/// range says.
+fn geo(model: &Model, slot: &Slot) -> bool {
+    model.kind(slot) == "GeoProperty"
+}
+
 fn slot_schema(model: &Model, slot: &Slot) -> Value {
     let base = match model.range(slot) {
+        _ if geo(model, slot) => typed("object", None),
         Range::Type(b) => builtin_schema(b),
         // A relationship holds the target entity's id.
         Range::Class(_) => typed("string", Some("uri")),
@@ -349,23 +363,42 @@ pub fn json_schema(model: &Model) -> String {
 
 // ------------------------------------------------------- JSON-LD context (L4)
 
+/// The namespace the `xsd:` of [`Builtin::xsd`] stands for.
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
 /// The JSON-LD `@context` (row L4): every class and slot name mapped to its
 /// full IRI, and nothing else: no prefixes, so no term outside the model is
-/// named (threat LK6).
+/// named (threat LK6). A Relationship's value is the target's `@id`, a typed
+/// value carries its XSD datatype, so an Entity in keyValues reads as the
+/// SHACL shapes (L5) describe it; a string, an enum and a `GeoJSON` geometry
+/// stay as they are.
 ///
 /// ```
 /// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "s",
-///     "slots": {"size": {}}}"#,
+///     "classes": {"Room": {}}, "slots": {"name": {}, "size": {"range": "float"}, "in": {"range": "Room"}}}"#,
 ///     &linkml_model::Limits { max_bytes: 999, max_depth: 8, max_elements: 9 }).unwrap();
 /// let v: serde_json::Value = serde_json::from_str(&linkml_model::context(&m)).unwrap();
-/// assert_eq!(v["@context"]["size"], "https://e.org/s/size");
+/// assert_eq!(v["@context"]["name"], "https://e.org/s/name");
+/// assert_eq!(v["@context"]["size"]["@type"], "http://www.w3.org/2001/XMLSchema#float");
+/// assert_eq!(v["@context"]["in"]["@type"], "@id");
 /// ```
 #[must_use]
 pub fn context(model: &Model) -> String {
     let s = model.schema();
     let mut terms = Map::new();
-    for name in s.slots.keys() {
-        terms.insert(name.clone(), Value::String(model.slot_iri(name)));
+    for (name, slot) in &s.slots {
+        let iri = model.slot_iri(name);
+        let coerced = match model.range(slot) {
+            _ if geo(model, slot) => None,
+            Range::Class(_) => Some("@id".to_owned()),
+            Range::Type(Builtin::String) | Range::Enum(_) => None,
+            Range::Type(b) => Some(b.xsd().replacen("xsd:", XSD, 1)),
+        };
+        let term = match coerced {
+            Some(ty) => json!({"@id": iri, "@type": ty}),
+            None => Value::String(iri),
+        };
+        terms.insert(name.clone(), term);
     }
     for name in s.classes.keys() {
         terms.insert(name.clone(), Value::String(model.class_iri(name)));
@@ -466,6 +499,8 @@ pub fn shacl(model: &Model) -> String {
                 lit(slot_name)
             );
             match model.range(&slot) {
+                // a GeoJSON geometry: a node, whatever the range says
+                _ if geo(model, &slot) => {}
                 Range::Type(b) => {
                     let _ = write!(out, " ;\n{IN}{IN}sh:datatype {}", b.xsd());
                 }
@@ -525,7 +560,11 @@ fn rdf_range(model: &Model, slot: &Slot) -> String {
 #[must_use]
 pub fn owl(model: &Model) -> String {
     let s = model.schema();
+    let roles = cube_roles(model);
     let mut out = turtle_header("OWL ontology", &[("owl", "http://www.w3.org/2002/07/owl#")]);
+    if s.classes.keys().any(|c| is_dsd(model, c)) {
+        let _ = writeln!(out, "@prefix qb: <{QB}> .");
+    }
     let _ = write!(
         out,
         "\n<{}> a owl:Ontology ;\n  rdfs:label {}",
@@ -546,6 +585,9 @@ pub fn owl(model: &Model) -> String {
         if let Some(p) = &class.is_a {
             let _ = write!(out, " ;\n  rdfs:subClassOf <{}>", model.class_iri(p));
         }
+        if is_dsd(model, name) {
+            out.push_str(" ;\n  rdfs:subClassOf qb:Observation");
+        }
         if let Some(d) = &class.description {
             let _ = write!(out, " ;\n  rdfs:comment {}", lit(d));
         }
@@ -556,6 +598,10 @@ pub fn owl(model: &Model) -> String {
             "owl:ObjectProperty"
         } else {
             "owl:DatatypeProperty"
+        };
+        let kind = match roles.get(name.as_str()) {
+            Some(role) => format!("{kind}, {role}"),
+            None => kind.to_owned(),
         };
         let _ = write!(
             out,
@@ -573,6 +619,120 @@ pub fn owl(model: &Model) -> String {
         out.push_str(" .\n");
     }
     out
+}
+
+/// The W3C RDF Data Cube vocabulary (DM-60).
+const QB: &str = "http://purl.org/linked-data/cube#";
+
+/// Whether class `name` is a Data Structure Definition: annotated
+/// `qb_dsd: "true"` (DM-60).
+fn is_dsd(model: &Model, name: &str) -> bool {
+    model
+        .schema()
+        .classes
+        .get(name)
+        .and_then(|c| c.annotations.get(QB_DSD_TAG))
+        .is_some_and(|a| a.value == "true")
+}
+
+/// A slot's role in a cube, as the key a structure names it by and its
+/// property type; `None` for a slot without `qb_component`.
+fn component(slot: &Slot) -> Option<(&'static str, &'static str)> {
+    // the load refuses any value but these two
+    if slot.annotations.get(QB_COMPONENT_TAG)?.value == "dimension" {
+        Some(("qb:dimension", "qb:DimensionProperty"))
+    } else {
+        Some(("qb:measure", "qb:MeasureProperty"))
+    }
+}
+
+/// The cube property type of each slot that is a component of some Data
+/// Structure Definition of the model, by slot name.
+fn cube_roles(model: &Model) -> BTreeMap<&str, &'static str> {
+    model
+        .schema()
+        .classes
+        .keys()
+        .filter(|c| is_dsd(model, c))
+        .flat_map(|c| model.class_slots(c))
+        .filter_map(|(name, slot)| Some((name, component(&slot)?.1)))
+        .collect()
+}
+
+/// The RDF Data Cube structure (row L6, `model.qb.ttl`, DM-60): one
+/// `qb:DataStructureDefinition` per class that is one, its components the
+/// slots annotated `qb_component`, the class a subclass of
+/// `qb:Observation`. No `qb:order`: the vocabulary makes it optional, and a
+/// narrowed model may have dropped components. `None` when no class is a
+/// Data Structure Definition: the document does not exist then, it is not
+/// an empty cube.
+///
+/// ```
+/// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s", "name": "s",
+///     "classes": {"Count": {"slots": ["year", "n"],
+///                           "annotations": {"qb_dsd": {"tag": "qb_dsd", "value": "true"}}}},
+///     "slots": {"year": {"range": "integer",
+///                        "annotations": {"qb_component": {"tag": "qb_component", "value": "dimension"}}},
+///               "n": {"range": "integer",
+///                     "annotations": {"qb_component": {"tag": "qb_component", "value": "measure"}}}}}"#,
+///     &linkml_model::Limits { max_bytes: 999, max_depth: 8, max_elements: 99 }).unwrap();
+/// let ttl = linkml_model::qb(&m).unwrap();
+/// assert!(ttl.contains("<https://e.org/s/CountStructure> a qb:DataStructureDefinition"));
+/// assert!(ttl.contains("[ qb:measure <https://e.org/s/n> ]"));
+/// ```
+#[must_use]
+pub fn qb(model: &Model) -> Option<String> {
+    let s = model.schema();
+    let cubes: Vec<&String> = s.classes.keys().filter(|c| is_dsd(model, c)).collect();
+    if cubes.is_empty() {
+        return None;
+    }
+    let mut out = turtle_header("RDF Data Cube structure", &[("qb", QB)]);
+    for name in cubes {
+        let iri = model.class_iri(name);
+        let components: Vec<(&str, Slot, (&str, &str))> = model
+            .class_slots(name)
+            .into_iter()
+            .filter_map(|(n, slot)| {
+                let role = component(&slot)?;
+                Some((n, slot, role))
+            })
+            .collect();
+        let _ = write!(
+            out,
+            "\n<{iri}Structure> a qb:DataStructureDefinition ;\n  rdfs:label {}",
+            lit(name)
+        );
+        if let Some(d) = s.classes.get(name).and_then(|c| c.description.as_ref()) {
+            let _ = write!(out, " ;\n  rdfs:comment {}", lit(d));
+        }
+        let entries: Vec<String> = components
+            .iter()
+            .map(|(n, slot, (key, _))| {
+                format!("{IN}{IN}[ {key} <{}> ]", refined_iri(model, n, slot))
+            })
+            .collect();
+        if entries.is_empty() {
+            out.push_str(" .\n");
+        } else {
+            let _ = write!(out, " ;\n  qb:component\n{} .\n", entries.join(" ,\n"));
+        }
+        let _ = writeln!(out, "\n<{iri}> rdfs:subClassOf qb:Observation .");
+        for (n, slot, (_, kind)) in &components {
+            let _ = write!(
+                out,
+                "\n<{}> a rdf:Property, {kind} ;\n  rdfs:label {} ;\n  rdfs:range {}",
+                refined_iri(model, n, slot),
+                lit(n),
+                rdf_range(model, slot)
+            );
+            if let Some(d) = &slot.description {
+                let _ = write!(out, " ;\n  rdfs:comment {}", lit(d));
+            }
+            out.push_str(" .\n");
+        }
+    }
+    Some(out)
 }
 
 /// The RDFS rendering (row L6, `model.rdf.ttl`): classes, subclasses,

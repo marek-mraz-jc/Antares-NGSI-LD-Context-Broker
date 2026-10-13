@@ -37,11 +37,17 @@
 
 mod error;
 pub mod mapping;
+mod names;
 mod operation;
+mod scan;
 pub mod views;
 
-pub use error::{Refusal, INNER_DETAIL};
+/// The residual of a standard query (ADR-0028 rule 2), re-exported so a surface compiles into
+/// it through `antares-ops` alone (rule M2).
+pub use antares_residual as residual;
+pub use error::{Refusal, CONTEXT_DETAIL, INNER_DETAIL};
 pub use operation::OperationId;
+pub use scan::{Page, Pushdown, Scanned, RESIDUAL_SCAN, TOO_COMPLEX};
 
 use antares_api::AppState;
 use axum::body::Body;
@@ -50,7 +56,7 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -66,7 +72,7 @@ pub mod policy {
 /// delivers notifications (WebSocket).
 pub use antares_api::{build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound};
 /// The error a sink's endpoint check answers with.
-pub use antares_model::NgsiError;
+pub use antares_model::{NgsiError, TenantId};
 
 /// The request bounds a surface applies to what it parses itself (a
 /// WebSocket message never passes the HTTP bounds layer).
@@ -76,7 +82,7 @@ pub mod bounds {
 
 /// The federation transport contract (ADR-0025 rule 8, ADR-0027 section 9),
 /// for a crate that serves some forwards in process.
-pub use antares_api::{BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
+pub use antares_api::{AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport};
 
 /// The URL this broker is reached at (`ANTARES_PUBLIC_URL`, else the
 /// request's `Host`), for a surface whose documents name its resources by
@@ -117,9 +123,118 @@ pub struct Ops {
 pub struct ViewOps {
     inner: Ops,
     view: Arc<antares_api::views::CompiledView>,
-    tenant: String,
+    tenant: antares_model::TenantId,
     operations: Vec<OperationId>,
     mapping: Option<Arc<mapping::Mapping>>,
+    /// The core @context with the view's own merged in: what a name a caller
+    /// writes in an NGSI-LD parameter means here (`names.rs`).
+    names: Arc<antares_jsonld::Context>,
+}
+
+/// The Entity types a caller may see through a view and the Attributes
+/// each may show, as IRIs (ADR-0023 rule 5): made by [`ViewOps::visible`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Visible {
+    /// Each rule's types and the Attributes it shows; `None` for an
+    /// engine's grant over the whole Entity (`Rule::every_attribute`), which
+    /// shows every Attribute of its types.
+    rules: Vec<(BTreeSet<String>, Option<BTreeSet<String>>)>,
+    /// The filter's `pick` (empty keeps every name) and `omit`, applied to
+    /// every rule.
+    pick: BTreeSet<String>,
+    omit: BTreeSet<String>,
+    /// Attributes removed per type, on top of the rules.
+    omit_by_type: BTreeMap<String, BTreeSet<String>>,
+    /// A filter without rules narrows by none (a `*` view, ADR-0023 rule
+    /// 12): every type and every Attribute, less `pick` and `omit`.
+    every: bool,
+}
+
+impl Visible {
+    /// Whether an Entity of type `name` (an IRI or a core-context term) may
+    /// be seen.
+    ///
+    /// ```
+    /// assert!(!antares_ops::Visible::default().shows_type("Car"));
+    /// ```
+    #[must_use]
+    pub fn shows_type(&self, name: &str) -> bool {
+        let ty = expand(name);
+        self.every || self.rules.iter().any(|(types, _)| types.contains(&ty))
+    }
+
+    /// Whether an Entity of type `ty` may show Attribute `attr`.
+    ///
+    /// ```
+    /// assert!(!antares_ops::Visible::default().shows_attribute("Car", "speed"));
+    /// ```
+    #[must_use]
+    pub fn shows_attribute(&self, ty: &str, attr: &str) -> bool {
+        let (ty, attr) = (expand(ty), expand(attr));
+        let kept = (self.pick.is_empty() || self.pick.contains(&attr))
+            && !self.omit.contains(&attr)
+            && !self
+                .omit_by_type
+                .get(&ty)
+                .is_some_and(|gone| gone.contains(&attr));
+        kept && (self.every
+            || self.rules.iter().any(|(types, attrs)| {
+                types.contains(&ty) && attrs.as_ref().is_none_or(|a| a.contains(&attr))
+            }))
+    }
+
+    /// What `filter`'s rules show: each rule's types with its Attributes
+    /// (every one for a rule over the whole Entity), less what `pick` leaves
+    /// out and `omit` and `omit_by_type` remove; a filter without rules
+    /// shows every type and Attribute, less the same. A rule's condition is
+    /// not read: it decides which Entities show the Attributes, not which
+    /// Attributes there are.
+    ///
+    /// ```
+    /// use antares_ops::policy::{Filter, Rule};
+    /// let visible = antares_ops::Visible::from_filter(&Filter {
+    ///     rules: vec![Rule {
+    ///         types: vec!["https://e.org/Car".into()],
+    ///         attributes: vec!["https://e.org/speed".into(), "https://e.org/vin".into()],
+    ///         ..Rule::default()
+    ///     }],
+    ///     omit: vec!["https://e.org/vin".into()],
+    ///     ..Filter::default()
+    /// });
+    /// assert!(visible.shows_attribute("https://e.org/Car", "https://e.org/speed"));
+    /// assert!(!visible.shows_attribute("https://e.org/Car", "https://e.org/vin"));
+    /// ```
+    #[must_use]
+    pub fn from_filter(filter: &policy::Filter) -> Self {
+        let set =
+            |names: &[String]| -> BTreeSet<String> { names.iter().map(|n| expand(n)).collect() };
+        let rules = filter
+            .rules
+            .iter()
+            .map(|rule| {
+                let attrs = (!rule.every_attribute).then(|| set(&rule.attributes));
+                (set(&rule.types), attrs)
+            })
+            .collect();
+        Self {
+            rules,
+            pick: set(&filter.pick),
+            omit: set(&filter.omit),
+            omit_by_type: filter
+                .omit_by_type
+                .iter()
+                .map(|(t, attrs)| (expand(t), set(attrs)))
+                .collect(),
+            every: filter.rules.is_empty(),
+        }
+    }
+}
+
+/// `name` as an IRI under the core @context, as a view's names are kept.
+fn expand(name: &str) -> String {
+    static CORE: std::sync::LazyLock<antares_jsonld::Context> =
+        std::sync::LazyLock::new(antares_jsonld::core_context);
+    CORE.expand_key(name)
 }
 
 /// The headers of the request a surface is answering, as the HTTP layer
@@ -264,11 +379,14 @@ impl Ops {
             tenant,
             operations,
             mapping,
+            context,
             ..
         }) = table.get(id)
         else {
             return None;
         };
+        // The loader stored the tenant it validated, so this never refuses.
+        let tenant = antares_model::TenantId::new(tenant).ok()?;
         // the loader attaches nothing else, so a failed downcast is a view
         // no surface serves
         let mapping = match mapping {
@@ -282,12 +400,13 @@ impl Ops {
         let made = ViewOps {
             inner: Self::new(self.state.with_view(view.clone()), self.surface.clone()),
             view: view.clone(),
-            tenant: tenant.clone(),
+            tenant,
             operations: operations
                 .iter()
                 .filter_map(|o| OperationId::from_id(o))
                 .collect(),
             mapping,
+            names: Arc::new(names::of_view(context.as_deref())?),
         };
         // Only views loaded now stay cached: a removed one goes with the
         // first view served after its removal.
@@ -340,9 +459,17 @@ impl Ops {
             .body(req.body)
             .map_err(|_| Refusal::Malformed("the operation's target is not a URI"))?;
         *inner.headers_mut() = req.headers;
-        let answer = match req.context {
-            Some(context) => self.state.call_in_context(&caller.0, inner, context).await,
-            None => self.state.call(&caller.0, inner).await,
+        let call = async {
+            match req.context {
+                Some(context) => self.state.call_in_context(&caller.0, inner, context).await,
+                None => self.state.call(&caller.0, inner).await,
+            }
+        };
+        // The engine learns the view from the in-process scope, never from
+        // a header a client could send (ADR-0020 amendment, T-3702).
+        let answer = match view {
+            Some((id, _)) => antares_api::policy::through_view(id, call).await,
+            None => call.await,
         };
         if let Some(surface) = &self.surface {
             // Threat G10: which surface and view ran it; never the subject
@@ -366,19 +493,45 @@ impl Ops {
                 );
             }
         }
-        if !answer.status().is_server_error() {
-            return Ok(answer);
-        }
-        if answer.status() == StatusCode::SERVICE_UNAVAILABLE {
-            return Err(Refusal::Overloaded {
-                retry_after: answer
-                    .headers()
-                    .get(axum::http::header::RETRY_AFTER)
-                    .cloned(),
-            });
-        }
-        Err(inner_failure(op, answer).await)
+        answered(op, answer).await
     }
+}
+
+/// The API's answer as a surface gets it: a 5xx becomes a [`Refusal`], and
+/// only 503 and the API's own 504 `LdContextNotAvailable` keep their status.
+async fn answered(op: OperationId, answer: Response) -> Result<Response, Refusal> {
+    if !answer.status().is_server_error() {
+        return Ok(answer);
+    }
+    if answer.status() == StatusCode::SERVICE_UNAVAILABLE {
+        return Err(Refusal::Overloaded {
+            retry_after: answer
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .cloned(),
+        });
+    }
+    let status = answer.status();
+    let detail = axum::body::to_bytes(answer.into_body(), LOGGED_DETAIL_BYTES)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    // 6.3.2: a remote @context the caller named is the caller's to know
+    // about; a forward that timed out (also 504) stays an inner failure.
+    if context_not_available(status, &detail) {
+        return Err(Refusal::ContextNotAvailable);
+    }
+    Err(inner_failure(op, status, &detail))
+}
+
+/// Whether an inner answer is the NGSI-LD API's 504 `LdContextNotAvailable`
+/// (6.3.2), told apart from a forward's 504 by its problem type.
+fn context_not_available(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::GATEWAY_TIMEOUT
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|p| p.get("type")?.as_str().map(str::to_owned))
+            .is_some_and(|t| t == "https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable")
 }
 
 impl ViewOps {
@@ -395,10 +548,20 @@ impl ViewOps {
         self.operations.contains(&op)
     }
 
+    /// [`Ops::forward_in_process`] through this view: the forward is
+    /// served as a request to the view's Tenant through the view is, the
+    /// view's rules composed with that Tenant's engine (ADR-0023 rule 5,
+    /// ADR-0025 rule 5).
+    pub async fn forward_in_process(&self, req: BuiltForward<'_>, self_url: &str) -> ForwardAnswer {
+        self.inner
+            .forward_through(Some(self.view.id()), req, self_url)
+            .await
+    }
+
     /// The one Tenant the view serves (ADR-0023 rule 10).
     #[must_use]
     pub fn tenant(&self) -> &str {
-        &self.tenant
+        self.tenant.as_str()
     }
 
     /// The `LinkML` schema of the view's Tenant as written to
@@ -410,7 +573,7 @@ impl ViewOps {
         self.inner
             .state
             .views
-            .schema(&self.tenant)
+            .schema(self.tenant.as_str())
             .map(|s| (s.revision, s.bytes))
     }
 
@@ -419,6 +582,53 @@ impl ViewOps {
     #[must_use]
     pub fn shown_names(&self) -> (Vec<String>, Vec<String>) {
         self.view.shown_names()
+    }
+
+    /// What `caller` may see through the view for `op`, a read the view
+    /// allows: the view's rules composed with the engine's answer for the
+    /// operation's clause and the expanded `types` and `attrs` it names
+    /// (`effective = view ∧ engine`, ADR-0023 rule 5), asked once, in the
+    /// view's Tenant, failing closed as every gate does.
+    ///
+    /// # Errors
+    /// [`Refusal::NotAllowed`] when the view does not allow `op`,
+    /// [`Refusal::Denied`] when the engine refuses it.
+    pub async fn visible(
+        &self,
+        caller: &Caller,
+        op: OperationId,
+        types: &[String],
+        attrs: &[String],
+    ) -> Result<Visible, Refusal> {
+        let Some(clause) = op.gate_clause().filter(|_| self.allows(op)) else {
+            return Err(Refusal::NotAllowed { allow: Vec::new() });
+        };
+        let engine = match self.inner.state.policy.as_deref() {
+            None => Ok(antares_api::policy::unnarrowed()),
+            Some(engine) => {
+                let asked = policy::Operation {
+                    types,
+                    attrs,
+                    ..policy::Operation::new(clause)
+                };
+                let gated = antares_api::policy::gate(engine, &self.tenant, &caller.0, &asked);
+                // The engine learns the view in process (T-3702), as for a run.
+                antares_api::policy::through_view(self.view.id(), gated)
+                    .await
+                    .map(Arc::new)
+            }
+        };
+        antares_api::views::with_view(Some(&self.view), clause, engine)
+            .map(|f| Visible::from_filter(&f))
+            .map_err(|d| Refusal::Denied(d.0))
+    }
+
+    /// Whether the view shows every type and Attribute (ADR-0023 rule 12):
+    /// [`Self::shown_names`] and [`Self::shown_by_type`] are then empty and a
+    /// surface offers a name by its syntax alone.
+    #[must_use]
+    pub fn shows_every_name(&self) -> bool {
+        self.view.shows_every_name()
     }
 
     /// Each Entity type the view shows with the Attributes it shows of it,
@@ -445,27 +655,26 @@ impl ViewOps {
     /// view's Tenant (MCP D-3). The probe fails closed: an engine that fails
     /// it offers nothing.
     pub async fn offered(&self, caller: &Caller, ops: &[OperationId]) -> Vec<bool> {
-        let Ok(tenant) = antares_model::TenantId::new(&self.tenant) else {
-            return vec![false; ops.len()];
-        };
-        let asked: Vec<(usize, &'static str)> = ops
+        let asked = |op: &OperationId| self.allows(*op) && op.gate_clause().is_some();
+        let clauses: Vec<&'static str> = ops
             .iter()
-            .enumerate()
-            .filter(|(_, op)| self.allows(**op))
-            .filter_map(|(i, op)| op.gate_clause().map(|c| (i, c)))
+            .filter(|op| asked(op))
+            .filter_map(|op| op.gate_clause())
             .collect();
-        let clauses: Vec<&'static str> = asked.iter().map(|(_, c)| *c).collect();
-        let answers = antares_api::policy::offers(
-            self.inner.state.policy.as_deref(),
-            &tenant,
-            &caller.0,
-            &clauses,
+        let mut answers = antares_api::policy::through_view(
+            self.view.id(),
+            antares_api::policy::offers(
+                self.inner.state.policy.as_deref(),
+                &self.tenant,
+                &caller.0,
+                &clauses,
+            ),
         )
-        .await;
-        let given: std::collections::HashMap<usize, bool> =
-            asked.iter().map(|(i, _)| *i).zip(answers).collect();
-        (0..ops.len())
-            .map(|i| given.get(&i).copied().unwrap_or(false))
+        .await
+        .into_iter();
+        // The answers come in the order asked; a short answer offers nothing.
+        ops.iter()
+            .map(|op| asked(op) && answers.next().unwrap_or(false))
             .collect()
     }
 
@@ -497,7 +706,7 @@ impl ViewOps {
                     .to_str()
                     .ok()
                     .and_then(|t| antares_model::TenantId::new(t).ok())
-                    .is_some_and(|t| t.as_str() == self.tenant);
+                    .is_some_and(|t| t.as_str() == self.tenant.as_str());
                 if !same {
                     return Err(Refusal::Malformed(OTHER));
                 }
@@ -508,7 +717,7 @@ impl ViewOps {
         let mut headers = caller.0.clone();
         headers.insert(
             TENANT,
-            HeaderValue::from_str(&self.tenant).map_err(|_| Refusal::Malformed(OTHER))?,
+            HeaderValue::from_str(self.tenant.as_str()).map_err(|_| Refusal::Malformed(OTHER))?,
         );
         let mut answer = self
             .inner
@@ -516,7 +725,7 @@ impl ViewOps {
                 op,
                 &Caller(headers),
                 req,
-                Some((self.view.id(), &self.tenant)),
+                Some((self.view.id(), self.tenant.as_str())),
             )
             .await?;
         if !named {
@@ -529,21 +738,16 @@ impl ViewOps {
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
 /// Log an inner failure under a fresh id and answer with the id alone.
-async fn inner_failure(op: OperationId, answer: Response) -> Refusal {
+fn inner_failure(op: OperationId, status: StatusCode, detail: &str) -> Refusal {
     let request_id = format!(
         "ops-{:x}-{:x}",
         std::process::id(),
         NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
     );
-    let status = answer.status().as_u16();
-    let detail = axum::body::to_bytes(answer.into_body(), LOGGED_DETAIL_BYTES)
-        .await
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
     tracing::warn!(
         request_id,
         operation = op.id(),
-        status,
+        status = status.as_u16(),
         detail,
         "an operation failed inside the broker"
     );
@@ -580,10 +784,25 @@ pub trait Surface: Send + Sync + 'static {
 /// ```
 #[must_use]
 pub fn core_name(iri: &str) -> String {
-    static CORE: std::sync::LazyLock<antares_jsonld::Context> =
-        std::sync::LazyLock::new(antares_jsonld::core_context);
     CORE.compact_iri(iri)
 }
+
+/// Whether the core @context defines the term `name` (its keyword aliases `id` and `type`
+/// included), which a surface's own @context must not define again.
+///
+/// ```
+/// assert!(antares_ops::is_core_term("location"));
+/// assert!(antares_ops::is_core_term("value"));
+/// assert!(!antares_ops::is_core_term("speed"));
+/// ```
+#[must_use]
+pub fn is_core_term(name: &str) -> bool {
+    CORE.term(name).is_some()
+}
+
+/// The core @context, read once.
+static CORE: std::sync::LazyLock<antares_jsonld::Context> =
+    std::sync::LazyLock::new(antares_jsonld::core_context);
 
 /// `surface` as the broker mounts it.
 ///
@@ -647,39 +866,39 @@ impl Ops {
     /// the default Tenant and a snapshot is never inherited. The answer is
     /// read as an HTTP one is: the body up to the federation response cap,
     /// the source's `NGSILD-Warning` values up to their cap.
+    ///
+    /// Past [`antares_api::bounds::MAX_IN_PROCESS_CALL_DEPTH`] the forward
+    /// is not made, in process or over HTTP (rule 3): it answers 508 for an
+    /// `exclusive` or `redirect` registration, whose failure is the
+    /// operation's answer, and 504 otherwise, which the merge reports as
+    /// code 199 (6.3.17), as a loop is.
     pub async fn forward_in_process(&self, req: BuiltForward<'_>, self_url: &str) -> ForwardAnswer {
+        self.forward_through(None, req, self_url).await
+    }
+
+    /// [`Self::forward_in_process`] through the view `view` (T-3935): the
+    /// engine of the target learns it as for a request through that view.
+    async fn forward_through(
+        &self,
+        view: Option<&str>,
+        req: BuiltForward<'_>,
+        self_url: &str,
+    ) -> ForwardAnswer {
+        if antares_api::state::in_process_depth() >= antares_api::bounds::MAX_IN_PROCESS_CALL_DEPTH
+        {
+            let status = if req.proxied() { 508 } else { 504 };
+            return (status, serde_json::Value::Null, Vec::new());
+        }
         // A target outside `self_url` is the transport's mistake, and a
         // header 5.9.2 let through that HTTP could not send either: the
         // forward is not made in process, and the answer says so (502).
-        let inner = req
-            .target()
-            .and_then(|target| {
-                target
-                    .strip_prefix(self_url)
-                    .filter(|rest| rest.starts_with('/'))
-                    .map(str::to_owned)
-            })
-            .and_then(|path| {
-                let mut inner = axum::http::Request::builder()
-                    .method(req.method().clone())
-                    .uri(path);
-                for (name, value) in req.headers() {
-                    inner = inner.header(name.as_str(), value.as_str());
-                }
-                // The HTTP client states the length of what it sends.
-                let body = match req.body() {
-                    Some(bytes) => {
-                        inner = inner.header(axum::http::header::CONTENT_LENGTH, bytes.len());
-                        Body::from(bytes.to_vec())
-                    }
-                    None => Body::empty(),
-                };
-                inner.body(body).ok()
-            });
-        let Some(inner) = inner else {
+        let Some(inner) = in_process_request(&req, self_url) else {
             return (502, serde_json::Value::Null, Vec::new());
         };
-        let answer = self.state.call(req.subject(), inner).await;
+        let answer = self
+            .state
+            .call_on_task(view, req.subject().clone(), inner)
+            .await;
         let status = answer.status().as_u16();
         let warnings = answer
             .headers()
@@ -695,6 +914,82 @@ impl Ops {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or(serde_json::Value::Null);
         (status, body, warnings)
+    }
+}
+
+/// The request [`Ops::forward_in_process`] hands the router for `req`: its
+/// method, the path and query of its target after `self_url`, its headers
+/// and its payload with the length the HTTP client would state, and nothing
+/// else (ADR-0025 equivalence layer 1). `None` when the target does not lie
+/// under `self_url` or a header is one no request can carry.
+#[must_use]
+pub fn in_process_request(
+    req: &BuiltForward<'_>,
+    self_url: &str,
+) -> Option<axum::http::Request<Body>> {
+    let path = req.target().and_then(|target| {
+        target
+            .strip_prefix(self_url)
+            .filter(|rest| rest.starts_with('/'))
+            .map(str::to_owned)
+    })?;
+    let mut inner = axum::http::Request::builder()
+        .method(req.method().clone())
+        .uri(path);
+    for (name, value) in req.headers() {
+        inner = inner.header(name.as_str(), value.as_str());
+    }
+    // The HTTP client states the length of what it sends.
+    let body = match req.body() {
+        Some(bytes) => {
+            inner = inner.header(axum::http::header::CONTENT_LENGTH, bytes.len());
+            Body::from(bytes.to_vec())
+        }
+        None => Body::empty(),
+    };
+    inner.body(body).ok()
+}
+
+/// The export grants of internal context sources (ADR-0025 rule 5), kept
+/// under their reserved tenant, and the admin routes a module adds beside
+/// `/q/views`.
+impl Ops {
+    /// Every stored grant document.
+    ///
+    /// # Errors
+    /// The store's.
+    pub async fn grant_docs(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.state.grant_docs().await
+    }
+
+    /// The stored grant document `id`, if there is one.
+    ///
+    /// # Errors
+    /// The store's.
+    pub async fn grant_doc(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
+        self.state.grant_doc(id).await
+    }
+
+    /// Store grant document `id`; `true` when it replaced one.
+    ///
+    /// # Errors
+    /// The store's.
+    pub async fn put_grant_doc(&self, id: &str, doc: serde_json::Value) -> Result<bool, String> {
+        self.state.put_grant_doc(id, doc).await
+    }
+
+    /// Remove grant document `id`; `false` when there was none.
+    ///
+    /// # Errors
+    /// The store's.
+    pub async fn delete_grant_doc(&self, id: &str) -> Result<bool, String> {
+        self.state.delete_grant_doc(id).await
+    }
+
+    /// Serve `routes` on the admin surface, relative to `/q` and behind its
+    /// credential. Before the router is built.
+    pub fn add_admin(&self, routes: Router) {
+        self.state.views.add_admin(routes);
     }
 }
 
@@ -757,6 +1052,16 @@ pub mod test_kit {
     use super::{mount, AppState, Surface};
     use std::sync::Arc;
 
+    /// The `/q` credential [`TestBroker::with_admin_auth`] takes, for the
+    /// surface crates, which reach the API crate through this one alone.
+    pub use antares_api::admin_auth::AdminAuth;
+
+    /// Let this process forward to loopback and private addresses, as a
+    /// test's own listener is one (the egress policy refuses them otherwise).
+    pub fn allow_private_egress() {
+        antares_jsonld::allow_private_egress(true);
+    }
+
     /// One broker: the NGSI-LD API, the admin surface and the surfaces a
     /// test mounts, over one in-memory store.
     pub struct TestBroker {
@@ -772,6 +1077,17 @@ pub mod test_kit {
         /// The view table's.
         pub async fn new() -> Result<Self, String> {
             Self::with_sinks(Vec::new(), None).await
+        }
+
+        /// [`TestBroker::new`] over `state`, a test's own store (the Postgres
+        /// arm of the quality sweep's tests, T-4018).
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn over(mut state: AppState) -> Result<Self, String> {
+            antares_api::wire(&mut state).await;
+            let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
         }
 
         /// [`TestBroker::new`] delivering through `sinks` too (a surface's
@@ -792,9 +1108,32 @@ pub mod test_kit {
             if let Some(engine) = engine {
                 state = state.with_policy(engine);
             }
-            antares_api::wire(&mut state).await;
-            let reload = crate::views::install(&state).await?;
-            Ok(Self { state, reload })
+            Self::over(state).await
+        }
+
+        /// One retention sweep at `now` (T-3900), as the minute loop runs it.
+        pub async fn sweep_retention(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Vec<crate::views::retention::Deleted> {
+            self.reload.sweep_retention(now).await
+        }
+
+        /// One retention sweep at `now` that starts no statement after `budget`.
+        pub async fn sweep_retention_within(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+            budget: std::time::Duration,
+        ) -> Vec<crate::views::retention::Deleted> {
+            self.reload.sweep_retention_within(now, budget).await
+        }
+
+        /// One quality sweep at `now` (T-4018), as the minute loop runs it.
+        pub async fn sweep_quality(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Vec<crate::views::quality::Changed> {
+            self.reload.sweep_quality(now).await
         }
 
         /// Another pod over the same store: its own view table, loaded and
@@ -818,6 +1157,22 @@ pub mod test_kit {
                 state: self.state.with_policy(engine),
                 reload: self.reload,
             }
+        }
+
+        /// The same broker with the forward transport `make` builds
+        /// registered (ADR-0025 rule 8), as the composition root registers
+        /// it.
+        ///
+        /// # Errors
+        /// When a transport is registered already.
+        pub fn with_forward_transport(
+            self,
+            make: impl FnOnce(super::Ops) -> Arc<dyn super::ForwardTransport>,
+        ) -> Result<Self, String> {
+            Ok(Self {
+                state: super::with_forward_transport(self.state, make)?,
+                reload: self.reload,
+            })
         }
 
         /// The same broker with `/q` behind the admin credential (T-3569).
@@ -895,6 +1250,24 @@ pub mod test_kit {
         }
     }
 
+    /// [`ViewOps::scan`](super::ViewOps::scan) with `residual` under a `budget` of upstream
+    /// Entities read in upstream pages of `upstream`, and how many it read: the bound a test
+    /// crosses with a handful of Entities instead of [`RESIDUAL_SCAN`](super::RESIDUAL_SCAN).
+    ///
+    /// # Errors
+    /// [`ViewOps::scan`](super::ViewOps::scan)'s.
+    pub async fn scan_within(
+        view: &super::ViewOps,
+        caller: &super::Caller,
+        pushdown: &super::Pushdown,
+        residual: &super::residual::Program,
+        page: super::Page,
+        (budget, upstream): (usize, usize),
+    ) -> Result<(super::Scanned, usize), super::Refusal> {
+        view.fill(caller, pushdown, residual, page, (budget, upstream))
+            .await
+    }
+
     /// A policy [`Filter`](super::policy::Filter) conditioned on `q` (4.9),
     /// for a test engine's `AllowIf`: a surface reaches the query language
     /// through this crate alone (ADR-0027 rule M1).
@@ -914,6 +1287,85 @@ pub mod test_kit {
 mod tests {
     use super::*;
 
+    #[test]
+    fn core_terms_are_the_core_contexts_own() {
+        for term in ["id", "type", "value", "location", "observedAt"] {
+            assert!(is_core_term(term), "{term}");
+        }
+        for name in ["speed", "p0", "Location"] {
+            assert!(!is_core_term(name), "{name}");
+        }
+        assert_eq!(
+            core_name("https://uri.etsi.org/ngsi-ld/location"),
+            "location"
+        );
+    }
+
+    /// Only the NGSI-LD API's own 504 `LdContextNotAvailable` reaches a
+    /// surface as such; a forward's 504, another status or a body that is
+    /// no problem stays an inner failure (T-3947).
+    #[test]
+    fn only_the_apis_ld_context_504_is_passed_on() {
+        let ld = r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable","title":"LdContextNotAvailable","detail":"http://10.0.0.1/x"}"#;
+        let forward = r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/InternalError","detail":"https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable"}"#;
+        assert!(context_not_available(StatusCode::GATEWAY_TIMEOUT, ld));
+        assert!(!context_not_available(StatusCode::GATEWAY_TIMEOUT, forward));
+        assert!(!context_not_available(StatusCode::GATEWAY_TIMEOUT, ""));
+        assert!(!context_not_available(StatusCode::GATEWAY_TIMEOUT, "[1]"));
+        assert!(!context_not_available(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ld
+        ));
+    }
+
+    /// What a surface gets for each kind of API answer: success passes, a
+    /// 503 keeps its `Retry-After`, the API's 504 `LdContextNotAvailable`
+    /// keeps its status, any other 5xx (a forward's 504 included) is an
+    /// inner failure with an id and no inner text (T-3947).
+    #[tokio::test]
+    async fn every_api_answer_maps_to_what_a_surface_may_see() {
+        let answer = |status: StatusCode, body: &'static str| {
+            let mut r = Response::new(Body::from(body));
+            *r.status_mut() = status;
+            r
+        };
+        let op = OperationId::QueryEntities;
+        let ok = answered(op, answer(StatusCode::OK, "[]")).await;
+        assert!(ok.is_ok_and(|r| r.status() == StatusCode::OK));
+        let mut busy = answer(StatusCode::SERVICE_UNAVAILABLE, "");
+        busy.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from_static("6"),
+        );
+        assert_eq!(
+            answered(op, busy).await.err(),
+            Some(Refusal::Overloaded {
+                retry_after: Some(HeaderValue::from_static("6"))
+            })
+        );
+        let ld = r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable"}"#;
+        assert_eq!(
+            answered(op, answer(StatusCode::GATEWAY_TIMEOUT, ld))
+                .await
+                .err(),
+            Some(Refusal::ContextNotAvailable)
+        );
+        for (status, body) in [
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/InternalError","detail":"forward to http://10.0.0.1 timed out"}"#,
+            ),
+            (StatusCode::INTERNAL_SERVER_ERROR, "store said no"),
+        ] {
+            match answered(op, answer(status, body)).await.err() {
+                Some(Refusal::Inner { request_id }) => {
+                    assert!(request_id.starts_with("ops-"), "{status}: {request_id}");
+                }
+                other => panic!("{status}: {other:?}"),
+            }
+        }
+    }
+
     #[cfg(feature = "test-kit")]
     #[test]
     fn a_test_engine_condition_is_parsed_or_refused() {
@@ -924,6 +1376,144 @@ mod tests {
             Some("colour==\"red\"")
         );
         assert!(test_kit::q_filter("colour==").is_err());
+    }
+
+    #[test]
+    fn visible_names_are_the_rules_less_pick_omit_and_omit_by_type() {
+        let rule = |types: &[&str], attrs: &[&str]| policy::Rule {
+            types: types.iter().map(|t| (*t).to_owned()).collect(),
+            attributes: attrs.iter().map(|a| (*a).to_owned()).collect(),
+            ..policy::Rule::default()
+        };
+        let iri = |n: &str| format!("https://e.org/{n}");
+        let filter = policy::Filter {
+            rules: vec![
+                rule(&[&iri("Car")], &[&iri("speed"), &iri("owner"), &iri("vin")]),
+                rule(&[&iri("Bus")], &[&iri("speed"), &iri("vin")]),
+                rule(&[&iri("Car")], &[&iri("colour")]),
+            ],
+            pick: vec![iri("speed"), iri("owner"), iri("colour"), iri("vin")],
+            omit: vec![iri("owner")],
+            omit_by_type: BTreeMap::from([(iri("Bus"), vec![iri("vin")])]),
+            ..policy::Filter::default()
+        };
+        let v = Visible::from_filter(&filter);
+        assert!(v.shows_type(&iri("Car")));
+        assert!(v.shows_type(&iri("Bus")));
+        assert!(!v.shows_type(&iri("Tram")));
+        assert!(v.shows_attribute(&iri("Car"), &iri("speed")));
+        assert!(
+            v.shows_attribute(&iri("Car"), &iri("colour")),
+            "rules add up"
+        );
+        assert!(
+            !v.shows_attribute(&iri("Car"), &iri("owner")),
+            "omit removes"
+        );
+        assert!(v.shows_attribute(&iri("Car"), &iri("vin")));
+        assert!(
+            !v.shows_attribute(&iri("Bus"), &iri("vin")),
+            "omit_by_type removes"
+        );
+        assert!(!v.shows_attribute(&iri("Tram"), &iri("speed")));
+
+        let picked = Visible::from_filter(&policy::Filter {
+            pick: vec![iri("speed")],
+            ..filter
+        });
+        assert!(
+            !picked.shows_attribute(&iri("Car"), &iri("colour")),
+            "pick keeps"
+        );
+        // A core-context term is the IRI it expands to.
+        let core = Visible::from_filter(&policy::Filter {
+            rules: vec![rule(&["Car"], &["location"])],
+            ..policy::Filter::default()
+        });
+        assert!(core.shows_attribute(
+            "https://uri.etsi.org/ngsi-ld/default-context/Car",
+            "https://uri.etsi.org/ngsi-ld/location"
+        ));
+    }
+
+    /// A `*` view (ADR-0023 rule 12) narrows by no rule: every type and
+    /// Attribute shows, less `pick`, `omit` and `omit_by_type`; the
+    /// default still shows nothing.
+    #[test]
+    fn a_filter_without_rules_shows_every_name_less_pick_and_omit() {
+        let iri = |n: &str| format!("https://e.org/{n}");
+        let open = Visible::from_filter(&policy::Filter::default());
+        assert!(open.shows_type(&iri("Tram")));
+        assert!(open.shows_attribute(&iri("Tram"), &iri("speed")));
+        let narrowed = Visible::from_filter(&policy::Filter {
+            pick: vec![iri("speed"), iri("vin")],
+            omit: vec![iri("vin")],
+            omit_by_type: BTreeMap::from([(iri("Bus"), vec![iri("speed")])]),
+            ..policy::Filter::default()
+        });
+        assert_eq!(
+            [
+                narrowed.shows_attribute(&iri("Car"), &iri("speed")),
+                narrowed.shows_attribute(&iri("Car"), &iri("vin")),
+                narrowed.shows_attribute(&iri("Car"), &iri("colour")),
+                narrowed.shows_attribute(&iri("Bus"), &iri("speed")),
+            ],
+            [true, false, false, false]
+        );
+        assert!(!Visible::default().shows_type(&iri("Car")));
+    }
+
+    /// T-3798: an engine's grant over the whole Entity (`every_attribute`,
+    /// ADR-0023 rule 11 as amended by T-3637) shows every Attribute of its
+    /// types, less `pick`, `omit` and `omit_by_type`, and none of a type no
+    /// rule names.
+    #[test]
+    fn a_rule_over_the_whole_entity_shows_every_attribute_of_its_types() {
+        let iri = |n: &str| format!("https://e.org/{n}");
+        let whole = |types: &[&str]| policy::Rule {
+            types: types.iter().map(|t| iri(t)).collect(),
+            every_attribute: true,
+            ..policy::Rule::default()
+        };
+        let open = Visible::from_filter(&policy::Filter {
+            rules: vec![whole(&["Car"])],
+            ..policy::Filter::default()
+        });
+        assert_eq!(
+            [
+                open.shows_type(&iri("Car")),
+                open.shows_attribute(&iri("Car"), &iri("speed")),
+                open.shows_type(&iri("Bus")),
+                open.shows_attribute(&iri("Bus"), &iri("speed")),
+            ],
+            [true, true, false, false]
+        );
+        let narrowed = Visible::from_filter(&policy::Filter {
+            rules: vec![
+                whole(&["Car", "Bus"]),
+                policy::Rule {
+                    types: vec![iri("Tram")],
+                    attributes: vec![iri("speed")],
+                    ..policy::Rule::default()
+                },
+            ],
+            pick: vec![iri("speed"), iri("vin"), iri("colour")],
+            omit: vec![iri("vin")],
+            omit_by_type: BTreeMap::from([(iri("Bus"), vec![iri("colour")])]),
+            ..policy::Filter::default()
+        });
+        assert_eq!(
+            [
+                narrowed.shows_attribute(&iri("Car"), &iri("speed")),
+                narrowed.shows_attribute(&iri("Car"), &iri("colour")),
+                narrowed.shows_attribute(&iri("Car"), &iri("vin")),
+                narrowed.shows_attribute(&iri("Car"), &iri("owner")),
+                narrowed.shows_attribute(&iri("Bus"), &iri("colour")),
+                narrowed.shows_attribute(&iri("Tram"), &iri("colour")),
+                narrowed.shows_type(&iri("Truck")),
+            ],
+            [true, true, false, false, false, false, false]
+        );
     }
 
     #[test]

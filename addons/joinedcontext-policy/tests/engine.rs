@@ -42,6 +42,19 @@ async fn send(
     who: &[(&str, &str)],
     body: Option<&Value>,
 ) -> Result<(StatusCode, Value), String> {
+    exchange(st, method, uri, who, body)
+        .await
+        .map(|(status, _, body)| (status, body))
+}
+
+/// `send`, keeping the answer's headers.
+async fn exchange(
+    st: &AppState,
+    method: &str,
+    uri: &str,
+    who: &[(&str, &str)],
+    body: Option<&Value>,
+) -> Result<(StatusCode, axum::http::HeaderMap, Value), String> {
     let mut b = Request::builder().method(method).uri(uri);
     for (k, v) in who {
         b = b.header(*k, *v);
@@ -58,6 +71,7 @@ async fn send(
         .await
         .map_err(|e| e.to_string())?;
     let status = resp.status();
+    let headers = resp.headers().clone();
     let bytes = resp
         .into_body()
         .collect()
@@ -66,6 +80,7 @@ async fn send(
         .to_bytes();
     Ok((
         status,
+        headers,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     ))
 }
@@ -196,6 +211,62 @@ async fn an_anonymous_caller_gets_the_public_grant_as_a_rewrite() -> Res {
         send(&st, "GET", QUERY, &ANA, None).await?.0,
         StatusCode::FORBIDDEN
     );
+    Ok(())
+}
+
+/// K38, DS-02: a data-space participant reads what its agreement's Policy grants it, through
+/// the header the gateway sets from the transfer token, and none of the public grant.
+#[tokio::test]
+async fn a_participant_reads_what_its_agreement_grants_and_nothing_public() -> Res {
+    let did = "did:web:consumer.example";
+    let (st, _) = broker(doc(&[
+        grant("agreed", "did", did, &["5.7.2"], cars(&["colour"])),
+        grant("pub", "role", "public", &["5.7.2"], cars(&["speed"])),
+    ]))
+    .await?;
+    fleet(&st).await?;
+    let participant = [
+        ("x-jc-did", "did%3Aweb%3Aconsumer.example"),
+        ("x-jc-roles", "public"),
+    ];
+    let (code, list) = send(&st, "GET", QUERY, &participant, None).await?;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list), car_ids(&[1, 2, 3]));
+    let text = list.to_string();
+    assert!(text.contains("colour") && !text.contains("speed"), "{text}");
+    let other = [("x-jc-did", "did:web:other.example")];
+    assert_eq!(
+        send(&st, "GET", QUERY, &other, None).await?.0,
+        StatusCode::FORBIDDEN
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_anonymous_caller_gets_the_grant_of_the_endpoint_role_the_gateway_resolved() -> Res {
+    let (st, _) = broker(doc(&[grant(
+        "app",
+        "role",
+        "endpoint:p/e",
+        &["5.7.2"],
+        cars(&["speed"]),
+    )]))
+    .await?;
+    fleet(&st).await?;
+    // AP-97: the gateway pins the Endpoint's caller role for an anonymous caller it admits
+    let admitted = [("x-jc-roles", "endpoint%3Ap%2Fe")];
+    let (code, list) = send(&st, "GET", QUERY, &admitted, None).await?;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list), car_ids(&[1, 2, 3]));
+    // another Endpoint's role, or a realm role claimed beside it, grants nothing
+    for roles in ["endpoint%3Ap%2Fother", "admin", "endpoint:"] {
+        let other = [("x-jc-roles", roles)];
+        assert_eq!(
+            send(&st, "GET", QUERY, &other, None).await?.0,
+            StatusCode::FORBIDDEN,
+            "{roles}"
+        );
+    }
     Ok(())
 }
 
@@ -827,5 +898,330 @@ async fn a_conditional_grant_over_every_type_needs_the_types_named() -> Res {
     assert_eq!(ids(&list), car_ids(&[1, 3]));
     let (code, _) = send(&st, "GET", "/ngsi-ld/v1/entities?q=speed%3E0", &ANA, None).await?;
     assert_eq!(code, StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+/// T-3770: the gateway percent-encodes each name, so a Slovak group reaches the engine whole.
+#[tokio::test]
+async fn a_policy_for_a_group_with_a_diacritic_matches_its_encoded_member() -> Res {
+    let (st, _) = broker(doc(&[grant(
+        "sprava",
+        "group",
+        "doprava/správa",
+        &["5.7.2"],
+        cars(&["speed"]),
+    )]))
+    .await?;
+    fleet(&st).await?;
+    let jozo = [
+        ("x-jc-subject", "jo%C5%BEo"),
+        ("x-jc-groups", "city,doprava%2Fspr%C3%A1va"),
+    ];
+    let (code, list) = send(&st, "GET", QUERY, &jozo, None).await?;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list), car_ids(&[1, 2, 3]));
+    // a broken escape is that member dropped, never a wider caller
+    let broken = [
+        ("x-jc-subject", "jo%C5"),
+        ("x-jc-groups", "doprava%2Fspr%C3"),
+    ];
+    assert_eq!(
+        send(&st, "GET", QUERY, &broken, None).await?.0,
+        StatusCode::FORBIDDEN
+    );
+    Ok(())
+}
+
+/// `doc` with the views member (README section 2, T-3702).
+fn bound(policies: &[Value], views: Value) -> Value {
+    with(doc(policies), "views", views)
+}
+
+async fn through(
+    view: &str,
+    st: &AppState,
+    method: &str,
+    uri: &str,
+    who: &[(&str, &str)],
+    body: Option<&Value>,
+) -> Result<(StatusCode, Value), String> {
+    antares_api::policy::through_view(view, send(st, method, uri, who, body)).await
+}
+
+fn secrets() -> Value {
+    json!([{"entities": [{"type": "Secret"}]}])
+}
+
+/// T-3702: a subject holding Policy B reads nothing of B through a view
+/// bound to Policy A; the plain root still decides with both.
+#[tokio::test]
+async fn a_view_bound_to_one_policy_is_not_widened_by_another_the_caller_holds() -> Res {
+    let a = grant("a", "group", "city", &["5.7.1", "5.7.2"], cars(&[]));
+    let b = grant("b", "group", "city", &["5.7.1", "5.7.2"], secrets());
+    let (st, _) = broker(bound(&[a, b], json!({"cars": ["a"]}))).await?;
+    fleet(&st).await?;
+
+    let (code, list) = through("cars", &st, "GET", QUERY, &ANA, None).await?;
+    assert_eq!((code, ids(&list)), (StatusCode::OK, car_ids(&[1, 2, 3])));
+    let (code, body) = through(
+        "cars",
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Secret:1",
+        &ANA,
+        None,
+    )
+    .await?;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{body}");
+
+    let (code, list) = send(&st, "GET", QUERY, &ANA, None).await?;
+    let mut all = car_ids(&[1, 2, 3]);
+    all.push("urn:ngsi-ld:Secret:1".into());
+    assert_eq!((code, ids(&list)), (StatusCode::OK, all));
+    Ok(())
+}
+
+/// T-3702: an App's view is decided by the App's own grant and the space's
+/// prohibition alone: another grant of the same caller adds nothing there,
+/// and the prohibition still holds.
+#[tokio::test]
+async fn an_app_view_is_decided_by_its_own_grant_and_the_prohibition() -> Res {
+    const APP: [(&str, &str); 2] = [("x-jc-client", "app-x"), ("x-jc-groups", "city")];
+    let own = grant(
+        "own",
+        "serviceAccount",
+        "app-x",
+        &["5.7.1", "5.7.2"],
+        json!([
+            {"entities": [{"type": "Car"}, {"type": "Secret"}]}
+        ]),
+    );
+    let no_secret = with(
+        grant("no-secret", "group", "city", &["5.7.2"], secrets()),
+        "effect",
+        json!("prohibit"),
+    );
+    let writes = grant("writes", "group", "city", &["5.6.1"], cars(&[]));
+    let (st, _) = broker(bound(
+        &[own, no_secret, writes],
+        json!({"app-x": ["own", "no-secret"]}),
+    ))
+    .await?;
+    fleet(&st).await?;
+
+    let (code, list) = through(
+        "app-x",
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Car",
+        &APP,
+        None,
+    )
+    .await?;
+    assert_eq!((code, ids(&list)), (StatusCode::OK, car_ids(&[1, 2, 3])));
+    let (code, body) = through("app-x", &st, "GET", QUERY, &APP, None).await?;
+    assert_eq!(code, StatusCode::FORBIDDEN, "the prohibition holds: {body}");
+    let new = car(9, 1, "/geo/SK/BB");
+    let (code, body) = through(
+        "app-x",
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        &APP,
+        Some(&new),
+    )
+    .await?;
+    assert_eq!(
+        code,
+        StatusCode::FORBIDDEN,
+        "the other grant adds nothing: {body}"
+    );
+    let (code, body) = send(&st, "POST", "/ngsi-ld/v1/entities", &APP, Some(&new)).await?;
+    assert_eq!(
+        code,
+        StatusCode::CREATED,
+        "the plain root has every policy: {body}"
+    );
+    Ok(())
+}
+
+/// T-3702: a view the document does not list is decided by every policy.
+#[tokio::test]
+async fn a_view_not_listed_is_decided_by_every_policy() -> Res {
+    let a = grant("a", "group", "city", &["5.7.2"], cars(&[]));
+    let b = grant("b", "group", "city", &["5.7.2"], secrets());
+    let (st, _) = broker(bound(&[a, b], json!({"cars": ["a"]}))).await?;
+    fleet(&st).await?;
+    let (code, list) = through("elsewhere", &st, "GET", QUERY, &ANA, None).await?;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list).len(), 4, "{list}");
+    Ok(())
+}
+
+/// T-3702: a view naming a policy the document lacks, or one twice, is
+/// refused and the previous document keeps deciding; a view may list none.
+#[tokio::test]
+async fn a_view_list_that_does_not_match_the_document_is_refused() -> Res {
+    let a = grant("a", "group", "city", &["5.7.2"], cars(&[]));
+    let engine = JoinedcontextPolicy::new();
+    for views in [
+        json!({"cars": ["a", "a"]}),
+        json!({"cars": ["nope"]}),
+        json!({"cars": "a"}),
+    ] {
+        let refused = engine.load("default", &bound(std::slice::from_ref(&a), views.clone()));
+        assert!(refused.is_err(), "{views}");
+    }
+    engine.load(
+        "default",
+        &bound(std::slice::from_ref(&a), json!({"closed": []})),
+    )?;
+    let (st, _) = broker(bound(&[a], json!({"closed": []}))).await?;
+    fleet(&st).await?;
+    let (code, body) = through("closed", &st, "GET", QUERY, &ANA, None).await?;
+    assert_eq!(
+        code,
+        StatusCode::FORBIDDEN,
+        "a view listing nothing grants nothing: {body}"
+    );
+    Ok(())
+}
+
+/// T-3796 (MP-02): through a view, a filter on an attribute the grant does
+/// not show answers nothing and says which type it left out, as the gateway
+/// did; a filter on what it shows says nothing.
+#[tokio::test]
+async fn a_view_names_the_type_its_filter_left_out() -> Res {
+    let a = grant("a", "group", "city", &["5.7.1", "5.7.2"], cars(&["speed"]));
+    let (st, _) = broker(bound(&[a], json!({"cars": ["a"]}))).await?;
+    fleet(&st).await?;
+    let read = |uri: &'static str| {
+        let st = st.clone();
+        antares_api::policy::through_view("cars", async move {
+            exchange(&st, "GET", uri, &ANA, None).await
+        })
+    };
+
+    let (code, headers, list) = read("/ngsi-ld/v1/entities?type=Car&q=colour==%22red%22").await?;
+    assert_eq!((code, list), (StatusCode::OK, json!([])));
+    let warned: Vec<&str> = headers
+        .get_all("NGSILD-Warning")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    assert!(
+        warned.iter().any(|w| w.starts_with("199 ")
+            && w.contains("Car was not queried: this request selects or orders on an attribute")),
+        "{warned:?}"
+    );
+
+    let (code, headers, list) = read("/ngsi-ld/v1/entities?type=Car&q=speed%3E20").await?;
+    assert_eq!((code, ids(&list)), (StatusCode::OK, car_ids(&[2, 3])));
+    assert!(headers.get("NGSILD-Warning").is_none(), "{headers:?}");
+    Ok(())
+}
+
+/// The tool probe a surface lists by (T-3784): `alice` offered each clause
+/// under `policies`, as `antares_api::policy::offers` asks it.
+async fn offered(policies: &[Value], clauses: &[&'static str]) -> Result<Vec<bool>, String> {
+    let (_, engine) = broker(doc(policies)).await?;
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        "x-jc-subject",
+        axum::http::HeaderValue::from_static("alice"),
+    );
+    Ok(antares_api::policy::offers(
+        Some(engine.as_ref()),
+        &antares_model::TenantId::default(),
+        &headers,
+        clauses,
+    )
+    .await)
+}
+
+fn alice(id: &str, ops: &[&str]) -> Value {
+    json!({"id": id, "assignee": {"kind": "user", "id": "alice"}, "operations": ops})
+}
+
+/// A grant of every type under a condition takes the queried types, so a
+/// typed query is allowed and the probe offers the clause (T-3784, matrix
+/// scenario 34); without a grant, or under a prohibition of every type, it
+/// is not offered.
+#[tokio::test]
+async fn the_probe_offers_a_read_a_grant_without_information_takes_types_for() -> Res {
+    let city = with(alice("city", &["5.7.2"]), "q", json!("operator==\"city\""));
+    assert_eq!(
+        offered(std::slice::from_ref(&city), &["5.7.2"]).await?,
+        [true]
+    );
+    assert_eq!(offered(&[], &["5.7.2"]).await?, [false]);
+    let every = with(alice("no", &["5.7.2"]), "effect", json!("prohibit"));
+    assert_eq!(offered(&[city, every], &["5.7.2"]).await?, [false]);
+    Ok(())
+}
+
+/// A prohibition on one type leaves a grant on another offered; under a
+/// prohibition of every type a grant names, a read of another type is
+/// still narrowed, not refused, so the read is offered and the write is
+/// not (the T-3777 differential's shrunk cases).
+#[tokio::test]
+async fn the_probe_refuses_a_write_only_when_every_granted_type_is_prohibited() -> Res {
+    let on = |id: &str, t: &str| {
+        with(
+            alice(id, &["5.7.2", "5.6.3"]),
+            "information",
+            json!([{"entities": [{"type": t}]}]),
+        )
+    };
+    let no = |id: &str, t: &str| with(on(id, t), "effect", json!("prohibit"));
+    assert_eq!(
+        offered(
+            &[on("v", "Vehicle"), no("s", "Sensor")],
+            &["5.7.2", "5.6.3"]
+        )
+        .await?,
+        [true, true]
+    );
+    assert_eq!(
+        offered(&[on("s", "Sensor"), no("x", "Sensor")], &["5.7.2", "5.6.3"]).await?,
+        [true, false]
+    );
+    Ok(())
+}
+
+/// A notification is decided as a query naming the types it carries: under
+/// a grant of every type with a condition it is narrowed per type, not
+/// dropped for naming none (T-3784); with no Entity it names no type and is
+/// dropped.
+#[tokio::test]
+async fn a_notification_names_the_types_it_carries() -> Res {
+    use antares_api::policy::{NotifyDecision, Subject};
+    let (_, engine) = broker(doc(&[with(
+        alice("city", &["5.7.2"]),
+        "q",
+        json!("speed<50"),
+    )]))
+    .await?;
+    let subject = Subject {
+        tenant: antares_model::TenantId::default(),
+        headers: vec![("x-jc-subject".into(), "alice".into())],
+    };
+    let mut n = json!({"data": [car(1, 10, "/a")]});
+    match engine.pre_notify(&subject, &json!({}), &mut n) {
+        NotifyDecision::Filter(f) => {
+            let types: Vec<&str> = f
+                .rules
+                .iter()
+                .flat_map(|r| r.types.iter().map(String::as_str))
+                .collect();
+            assert_eq!(types, ["https://uri.etsi.org/ngsi-ld/default-context/Car"]);
+        }
+        other => return Err(format!("want a per-type narrowing, got {other:?}")),
+    }
+    let mut empty = json!({"data": []});
+    assert_eq!(
+        engine.pre_notify(&subject, &json!({}), &mut empty),
+        NotifyDecision::Drop
+    );
     Ok(())
 }

@@ -19,7 +19,7 @@ surfaces:
     status: served by antares-mcp, one tool per row (crates/antares-mcp/src/tools.rs TOOLS, T-3656)
   linkml:
     prefix: /x/views/{view}/linkml
-    status: proposal, read-only
+    status: implemented (T-3511), read-only
   websocket:
     prefix: /x/views/{view}/ws
     status: implemented (ADR-0026, T-3517, feature ws; the Tenant root /x/ws/ngsi-ld/v1 serves the same messages);
@@ -2853,16 +2853,14 @@ operations:
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
-      status: supported
-      binding: 'GET /x/views/{view}/linkml/schema (proposal): class list'
+      status: not_offered
+      binding: null
       checks:
-        adr0020_phase: on_request
-        operation_fields:
-        - clause
-        filterable: true
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
         whole_tenant: false
-        linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        linked_entity_checks: []
     websocket:
       status: not_offered
       binding: null
@@ -2928,7 +2926,7 @@ operations:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
       status: supported
-      binding: 'GET /x/views/{view}/linkml/schema (proposal): classes with slots'
+      binding: GET /x/views/{view}/linkml/schema/index.json and GET /x/views/{view}/linkml/schema/v{major}/{document}
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -2936,7 +2934,7 @@ operations:
         filterable: true
         whole_tenant: false
         linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        - 'none: schema only, no Entity data; class and slot names narrowed by the composed rules and the Filter pick/omit/omit_by_type'
     websocket:
       status: not_offered
       binding: null
@@ -3003,7 +3001,7 @@ operations:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
       status: supported
-      binding: GET /x/views/{view}/linkml/classes/{type} (proposal)
+      binding: GET /x/views/{view}/linkml/classes/{type}
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3012,7 +3010,7 @@ operations:
         filterable: true
         whole_tenant: false
         linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        - 'none: schema only, no Entity data; class and slot names narrowed by the composed rules and the Filter pick/omit/omit_by_type'
     websocket:
       status: not_offered
       binding: null
@@ -3075,16 +3073,14 @@ operations:
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
-      status: supported
-      binding: 'GET /x/views/{view}/linkml/schema (proposal): slot list'
+      status: not_offered
+      binding: null
       checks:
-        adr0020_phase: on_request
-        operation_fields:
-        - clause
-        filterable: true
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
         whole_tenant: false
-        linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        linked_entity_checks: []
     websocket:
       status: not_offered
       binding: null
@@ -3147,16 +3143,14 @@ operations:
         linked_entity_checks:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
-      status: supported
-      binding: 'GET /x/views/{view}/linkml/schema (proposal): slots with ranges'
+      status: not_offered
+      binding: null
       checks:
-        adr0020_phase: on_request
-        operation_fields:
-        - clause
-        filterable: true
+        adr0020_phase: none
+        operation_fields: []
+        filterable: false
         whole_tenant: false
-        linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        linked_entity_checks: []
     websocket:
       status: not_offered
       binding: null
@@ -3223,7 +3217,7 @@ operations:
         - 'none: the operation names no Entity and writes no Relationship'
     linkml:
       status: supported
-      binding: GET /x/views/{view}/linkml/slots/{attr} (proposal)
+      binding: GET /x/views/{view}/linkml/slots/{attr}
       checks:
         adr0020_phase: on_request
         operation_fields:
@@ -3232,7 +3226,7 @@ operations:
         filterable: true
         whole_tenant: false
         linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        - 'none: schema only, no Entity data; class and slot names narrowed by the composed rules and the Filter pick/omit/omit_by_type'
     websocket:
       status: not_offered
       binding: null
@@ -4995,17 +4989,14 @@ operations:
         whole_tenant: false
         linked_entity_checks: []
     linkml:
-      status: supported
-      binding: the LinkML schema's prefixes are read from the served @context (proposal)
+      status: not_offered
+      binding: null
       checks:
-        adr0020_phase: on_request
-        operation_fields:
-        - clause
-        - ids
+        adr0020_phase: none
+        operation_fields: []
         filterable: false
         whole_tenant: false
-        linked_entity_checks:
-        - 'none: schema only, no Entity data; attribute names narrowed by the Filter omit/pick (proposal)'
+        linked_entity_checks: []
     websocket:
       status: not_offered
       binding: null
@@ -6078,25 +6069,24 @@ odata_without_ngsi_ld_operation:
       note: refused before any gate or store access
 - id: odata_search
   odata_feature: $search
-  odata_section: URL 5.1.8, Protocol 11.2.6.6
+  odata_section: URL 5.1.7, Protocol 11.2.6.6
   ts104175: null
   cim009: null
   kind: read
   surfaces:
     odata:
-      status: rejected
-      binding: query option $search
-      http_status: 501
-      odata_error:
-        code: NotImplemented
-        message: '$search is not offered: no NGSI-LD operation stands behind it'
+      status: supported
+      binding: query option $search on an EntitySet read, its /$count and its $query, executed as query_entities with the
+        search as one more $filter conjunct over the view's single-valued String properties, evaluated by the residual
+        (ADR-0028, T-3750)
       checks:
         adr0020_phase: none
         operation_fields: []
         filterable: false
         whole_tenant: false
         linked_entity_checks: []
-      note: refused before any gate or store access
+      note: matched on the answer the view and the engine admit, so a hidden property or Entity never matches; on one
+        Entity or below it 501
 - id: odata_compute
   odata_feature: $compute
   odata_section: URL 5.1.10, Protocol 11.2.5.3
@@ -6105,19 +6095,19 @@ odata_without_ngsi_ld_operation:
   kind: read
   surfaces:
     odata:
-      status: rejected
-      binding: query option $compute
-      http_status: 501
-      odata_error:
-        code: NotImplemented
-        message: '$compute is not offered: no NGSI-LD operation stands behind it'
+      status: supported
+      binding: query option $compute on an EntitySet read, its /$count, its $query and one Entity, executed as the
+        read's query_entities or retrieve_entity; each item a residual value evaluated per Entity on the answer
+        (ADR-0028, T-3936), written as a dynamic property; its name is inlined into $filter and sorts as a surface
+        $orderby key
       checks:
         adr0020_phase: none
         operation_fields: []
         filterable: false
         whole_tenant: false
         linked_entity_checks: []
-      note: refused before any gate or store access
+      note: computed on the answer the view and the engine admit, so a hidden Attribute reads as absent (null); inside
+        $expand and below one Entity 501
 - id: odata_index
   odata_feature: $index
   odata_section: URL 5.1.11

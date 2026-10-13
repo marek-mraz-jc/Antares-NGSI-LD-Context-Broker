@@ -25,10 +25,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// How many rules a composed narrowing may hold: the pairs of a view's
-/// rules and an engine's are the product of two bounded lists, and the
-/// product is bounded again so neither side can make the other's allocation
-/// grow without limit.
+/// rules and an engine's that share a type are bounded, so neither side can
+/// make the other's allocation grow without limit. Pairs that share no type
+/// compose to nothing and are never counted (T-4079).
 pub const MAX_COMPOSED_RULES: usize = 4096;
+
+/// The refusal when [`MAX_COMPOSED_RULES`] is reached. A bound on the
+/// request, not a policy: answered 400 BadRequestData naming the bound,
+/// never 403, which reads as "no policy grants this" (T-4079).
+pub const TOO_MANY_RULES: &str = "the view and the policy compose to more than 4096 rules \
+     (MAX_COMPOSED_RULES); name fewer types in the request";
 
 /// A view as `gate!` applies it: the predicate `selector ∧ q ∧ scope_q ∧
 /// geo_q` and the per-rule allowlists (ADR-0023 rule 11), compiled once.
@@ -94,6 +100,33 @@ impl CompiledView {
         })
     }
 
+    /// The view that selects every type and shows every Attribute
+    /// (ADR-0023 rule 12): no rules, so the engine's answer stands, narrowed
+    /// by the view's own conditions alone.
+    #[must_use]
+    pub fn every(
+        q: Option<QNode>,
+        scope_q: Option<String>,
+        geo_q: Option<antares_ql::geo::GeoQuery>,
+    ) -> Self {
+        Self {
+            narrowing: Arc::new(Filter {
+                q: q.map(Box::new),
+                scope_q,
+                geo_q: geo_q.map(Box::new),
+                ..Filter::default()
+            }),
+            id: String::new(),
+        }
+    }
+
+    /// Whether the view shows every name ([`Self::every`]): [`Self::new`]
+    /// never compiles a view without rules.
+    #[must_use]
+    pub fn shows_every_name(&self) -> bool {
+        self.narrowing.rules.is_empty()
+    }
+
     /// The same view under the id the table serves it as.
     #[must_use]
     pub fn named(mut self, id: &str) -> Self {
@@ -150,6 +183,13 @@ pub fn with_view(
         // so the view has nothing of its own to narrow there.
         return engine;
     }
+    if crate::policy::NAME_READS.contains(&clause) {
+        // Serve @context (5.13.4) is offered through no view: refused here,
+        // as it was before NAME_READS took a narrowing (T-4009).
+        return Err(Denied(format!(
+            "{clause} serves no stored @context through a view"
+        )));
+    }
     if crate::policy::WRITE_BY_ID.contains(&clause) && CHECKED_WRITES.contains(&clause) {
         // Rule 7 as below, the engine's answer the condition its write
         // holds the stored Entity to (`gate`), checked beside the view's;
@@ -187,17 +227,53 @@ pub fn with_view(
     if narrows_nothing && crate::policy::FILTERABLE.contains(&clause) {
         return Ok(view.narrowing.clone());
     }
-    let composed = if narrows_nothing {
-        Filter::clone(view.narrowing())
-    } else {
-        compose(view.narrowing(), Arc::unwrap_or_clone(engine))?
-    };
-    match resolve(clause, Decision::Filter(composed)) {
-        Decision::Allow => Ok(crate::policy::unnarrowed()),
-        // `resolve` makes no condition of a filter
-        Decision::Filter(f) | Decision::AllowIf(f) => Ok(Arc::new(f)),
-        Decision::Deny(why) => Err(Denied(why)),
+    paired(view, clause, engine)
+}
+
+/// The view's narrowing paired with an engine's that narrows, for `clause`.
+/// An engine answers a caller with the same narrowing request after
+/// request, and composing a large view costs tens of microseconds (benches
+/// `views`, T-3778): the last answer is kept per thread and handed out again
+/// while the same view, clause and engine narrowing come back. It is keyed
+/// by the whole input (the view's `Arc` itself, held so its address cannot
+/// be reused; the clause; the engine's `Filter` by value), so it never
+/// answers for another (O16). A filter unequal to itself (a NaN) misses.
+/// The answer is the same `Arc` on a hit, so `repr::narrow_repr` finds its
+/// reach by pointer as well.
+fn paired(view: &CompiledView, clause: &str, engine: Arc<Filter>) -> Result<Arc<Filter>, Denied> {
+    type Last = (Arc<Filter>, String, Filter, Result<Arc<Filter>, Denied>);
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<Last>> = const { std::cell::RefCell::new(None) };
     }
+    let hit = LAST.with_borrow(|last| {
+        last.as_ref()
+            .filter(|l| Arc::ptr_eq(&l.0, &view.narrowing) && l.1 == clause && l.2 == *engine)
+            .map(|l| l.3.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let key = Filter::clone(&engine);
+    let composed = if *engine == Filter::default() {
+        Ok(Filter::clone(view.narrowing()))
+    } else {
+        compose(view.narrowing(), Arc::unwrap_or_clone(engine))
+    };
+    let answer = composed.and_then(
+        |composed| match resolve(clause, Decision::Filter(composed)) {
+            Decision::Allow => Ok(crate::policy::unnarrowed()),
+            // `resolve` makes no condition of a filter
+            Decision::Filter(f) | Decision::AllowIf(f) => Ok(Arc::new(f)),
+            Decision::Deny(why) => Err(Denied(why)),
+        },
+    );
+    LAST.set(Some((
+        view.narrowing.clone(),
+        clause.to_owned(),
+        key,
+        answer.clone(),
+    )));
+    answer
 }
 
 /// `a ∧ b` as one [`Filter`]: every member narrows and none widens. The
@@ -337,18 +413,35 @@ fn pair_rules(a: &[Rule], b: Vec<Rule>) -> Result<Vec<Rule>, Denied> {
         (false, true) => return Ok(a.to_vec()),
         (false, false) => {}
     }
-    if a.len().saturating_mul(b.len()) > MAX_COMPOSED_RULES {
-        return Err(Denied(format!(
-            "the view and the policy compose to more than {MAX_COMPOSED_RULES} rules"
-        )));
+    // Only a pair that shares a type composes to anything, so `b` is
+    // indexed by type and each rule of `a` meets only the rules it shares
+    // one with: an engine's rule per requested type no longer multiplies by
+    // every rule of the view (T-4079). The bound counts those pairs.
+    let ctx = crate::repr::policy_context();
+    let mut by_type: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, y) in b.iter().enumerate() {
+        for t in &y.types {
+            by_type.entry(ctx.expand_key(t)).or_default().push(index);
+        }
     }
+    let mut paired = 0usize;
     let mut out = Vec::new();
     for x in a {
-        for y in &b {
+        let mut meets: Vec<usize> = x
+            .types
+            .iter()
+            .filter_map(|t| by_type.get(&ctx.expand_key(t)))
+            .flatten()
+            .copied()
+            .collect();
+        meets.sort_unstable();
+        meets.dedup();
+        paired = paired.saturating_add(meets.len());
+        if paired > MAX_COMPOSED_RULES {
+            return Err(Denied(TOO_MANY_RULES.to_owned()));
+        }
+        for y in meets.into_iter().filter_map(|index| b.get(index)) {
             let types = shared(&x.types, y.types.clone());
-            if types.is_empty() {
-                continue;
-            }
             let Some((ids, id_patterns)) = and_ids(x, y)? else {
                 continue;
             };
@@ -390,6 +483,10 @@ pub const VIEW_TENANT: &str = "antares-views";
 /// (ADR-0020 amendment), one document per Tenant, keyed by its name.
 pub const POLICY_TENANT: &str = "antares-policy";
 
+/// The reserved tenant the export grants of internal context sources live
+/// under (ADR-0025 rule 5), one document per (target, source) pair.
+pub const GRANT_TENANT: &str = "antares-grants";
+
 /// What a surface crate attached to a loaded view, opaque to the broker.
 #[derive(Clone)]
 pub struct Attached(pub Arc<dyn std::any::Any + Send + Sync>);
@@ -419,6 +516,9 @@ pub enum ViewEntry {
         /// only the view root reads; the broker carries it and never looks
         /// inside.
         mapping: Option<Attached>,
+        /// The view's own `@context` as written, which a surface reads the
+        /// NGSI-LD names a caller writes under (ADR-0028 rule 6).
+        context: Option<Arc<serde_json::Map<String, serde_json::Value>>>,
     },
     /// A stored view that failed validation: never served, named in
     /// `/q/health` with the reason.
@@ -438,6 +538,8 @@ pub struct ViewTable {
     /// (threat V26): pods over one store report the same value.
     revision: std::sync::atomic::AtomicU64,
     admin: std::sync::OnceLock<axum::Router>,
+    /// Admin routes of other broker modules, merged beside the views'.
+    more_admin: std::sync::Mutex<Vec<axum::Router>>,
     policy: std::sync::RwLock<serde_json::Value>,
     schemas: std::sync::RwLock<Arc<BTreeMap<String, Schema>>>,
 }
@@ -608,9 +710,32 @@ impl ViewTable {
             .map_err(|_| "the /q/views routes are set already".to_owned())
     }
 
-    /// The `/q/views` routes, if a loader set them.
+    /// Add `routes` to the admin surface beside `/q/views` (relative to
+    /// `/q`, behind the same credential). Before the router is built: it
+    /// reads them once, when it mounts.
+    pub fn add_admin(&self, routes: axum::Router) {
+        self.more_admin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(routes);
+    }
+
+    /// The `/q/views` routes, if a loader set them, with every module's
+    /// [`Self::add_admin`] routes.
     pub fn admin(&self) -> Option<axum::Router> {
-        self.admin.get().cloned()
+        let more = self
+            .more_admin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let first = self.admin.get().cloned();
+        if first.is_none() && more.is_empty() {
+            return None;
+        }
+        Some(
+            more.into_iter()
+                .fold(first.unwrap_or_default(), axum::Router::merge),
+        )
     }
 }
 
@@ -669,7 +794,9 @@ pub(crate) fn watched_in(
         .unwrap_or_default();
     let kept: Vec<serde_json::Value> = watched
         .iter()
-        .filter(|w| w.as_str().is_some_and(|w| shown.iter().any(|s| s == w)))
+        .filter(|w| {
+            view.shows_every_name() || w.as_str().is_some_and(|w| shown.iter().any(|s| s == w))
+        })
         .cloned()
         .collect();
     if kept.is_empty() {
@@ -835,24 +962,47 @@ impl WriteGuard {
 
     /// Every Relationship target an expanded fragment writes must be an
     /// Entity this view shows; an absent target answers as a hidden one.
+    /// A view that selects every Entity hides none, so an absent target
+    /// tells nothing and is written as at the root (T-3786). The targets are
+    /// read together, in one transaction on Postgres (T-4085).
     pub(crate) async fn targets(
         &self,
         st: &crate::state::AppState,
         tenant: &antares_model::TenantId,
         fragment: &serde_json::Value,
     ) -> Result<(), Denied> {
-        for target in relationship_targets(fragment) {
-            let doc = st
-                .store
-                .get(tenant, antares_store::Kind::Entity, target)
-                .await
-                .ok()
-                .flatten();
-            if !doc.is_some_and(|d| self.sees(&d)) {
-                return Err(Denied(TARGET_NOT_SHOWN.to_owned()));
-            }
+        if self.sel.selects_every() {
+            return Ok(());
         }
-        Ok(())
+        let targets = relationship_targets(fragment);
+        if targets.is_empty() {
+            return Ok(());
+        }
+        // A store failure reads as absent, as a failed single read did.
+        let found = st
+            .store
+            .get_entities(tenant, &targets)
+            .await
+            .unwrap_or_default();
+        self.targets_in(fragment, &found)
+    }
+
+    /// [`Self::targets`] against Entities already read: `found` holds every
+    /// target that exists, keyed by id.
+    pub(crate) fn targets_in(
+        &self,
+        fragment: &serde_json::Value,
+        found: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<(), Denied> {
+        if self.sel.selects_every()
+            || relationship_targets(fragment)
+                .iter()
+                .all(|t| found.get(*t).is_some_and(|d| self.sees(d)))
+        {
+            Ok(())
+        } else {
+            Err(Denied(TARGET_NOT_SHOWN.to_owned()))
+        }
     }
 }
 
@@ -875,7 +1025,7 @@ pub(crate) async fn admits_new(
 
 /// The ids every Relationship and ListRelationship instance of an expanded
 /// Entity or fragment points at.
-fn relationship_targets(doc: &serde_json::Value) -> Vec<&str> {
+pub(crate) fn relationship_targets(doc: &serde_json::Value) -> Vec<&str> {
     let instances = doc
         .as_object()
         .into_iter()
@@ -951,6 +1101,52 @@ mod tests {
             with_view(Some(&view), "5.13.4", Ok(Arc::new(Filter::default()))).is_err(),
             "serving a stored @context is refused under a view"
         );
+    }
+
+    /// T-3778: the pairing kept per thread is handed out again for the same
+    /// view, clause and engine narrowing, and for nothing else (O16): another
+    /// narrowing, another clause or a reloaded view is paired afresh.
+    #[test]
+    fn the_kept_pairing_answers_only_its_own_input() {
+        let view = cars();
+        let one = Filter {
+            rules: vec![rule(&["Car"], Some("speed>10"), &["speed"])],
+            ..Filter::default()
+        };
+        let two = Filter {
+            rules: vec![rule(&["Car"], Some("speed>20"), &["speed"])],
+            ..Filter::default()
+        };
+        let paired = |v: &CompiledView, clause: &str, f: &Filter| {
+            with_view(Some(v), clause, Ok(Arc::new(f.clone())))
+        };
+        let first = paired(&view, "5.7.2", &one).expect("query");
+        assert_eq!(
+            *first,
+            compose(view.narrowing(), one.clone()).expect("pair")
+        );
+        let again = paired(&view, "5.7.2", &one).expect("query");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "the same input is not paired twice"
+        );
+        let other = paired(&view, "5.7.2", &two).expect("query");
+        assert_eq!(
+            *other,
+            compose(view.narrowing(), two.clone()).expect("pair")
+        );
+        assert_ne!(*other, *first);
+        // a clause `resolve` refuses a filter on is refused, kept pairing or not
+        assert!(paired(&view, "5.13.4", &one).is_err());
+        assert!(paired(&view, "5.13.4", &one).is_err());
+        assert_eq!(paired(&view, "5.7.2", &one).as_deref(), Ok(&*first));
+        let reloaded = cars();
+        let fresh = paired(&reloaded, "5.7.2", &one).expect("query");
+        assert!(
+            !Arc::ptr_eq(&fresh, &first),
+            "a reloaded view is paired afresh"
+        );
+        assert_eq!(*fresh, *first);
     }
 
     /// T-3673: Query Subscriptions keeps the engine's selection among the
@@ -1658,6 +1854,117 @@ mod tests {
         assert_eq!(
             with_view(Some(&cars()), "5.7.2", Err(Denied("no".into()))),
             Err(Denied("no".into()))
+        );
+    }
+
+    /// T-4079: the export asks a view for all 21 types of a space whose
+    /// policy grants 9. The engine answers one rule per requested type and
+    /// the view holds hundreds; only the pairs that share a type compose, so
+    /// the request is served with the 9 granted types instead of refused.
+    #[test]
+    fn twenty_one_requested_types_compose_per_type_not_as_a_product() {
+        let granted = [
+            "Vehicle",
+            "GtfsStop",
+            "TransitRoute",
+            "GtfsStation",
+            "GtfsAgency",
+            "GtfsRoute",
+            "GtfsShape",
+            "Alert",
+            "OffStreetParking",
+        ];
+        let requested: Vec<String> = granted
+            .iter()
+            .map(|t| (*t).to_owned())
+            .chain((0..12).map(|i| format!("Other{i}")))
+            .collect();
+        let view: Vec<Rule> = (0..300)
+            .map(|i| rule(&[granted[i % granted.len()]], None, &[]))
+            .collect();
+        let engine: Vec<Rule> = requested
+            .iter()
+            .map(|t| rule(&[t.as_str()], None, &[]))
+            .collect();
+        assert!(
+            view.len() * engine.len() > MAX_COMPOSED_RULES,
+            "the product alone was refused"
+        );
+        let pairs = pair_rules(&view, engine).expect("composes");
+        assert_eq!(
+            pairs.len(),
+            300,
+            "one pair per view rule, each with its own type"
+        );
+        let mut types: Vec<&str> = pairs
+            .iter()
+            .flat_map(|r| &r.types)
+            .map(String::as_str)
+            .collect();
+        types.sort_unstable();
+        types.dedup();
+        let mut want = granted.to_vec();
+        want.sort_unstable();
+        assert_eq!(
+            types, want,
+            "the bound never widens: the granted types alone"
+        );
+    }
+
+    /// T-4079: the bound still holds for pairs that do share a type, at
+    /// exactly MAX_COMPOSED_RULES, and its refusal names it.
+    #[test]
+    fn the_bound_counts_pairs_that_share_a_type() {
+        let view: Vec<Rule> = (0..MAX_COMPOSED_RULES)
+            .map(|_| rule(&["Car"], None, &[]))
+            .collect();
+        assert_eq!(
+            pair_rules(&view, vec![rule(&["Car"], None, &[])])
+                .expect("at the bound")
+                .len(),
+            MAX_COMPOSED_RULES
+        );
+        let two = vec![
+            rule(&["Car"], Some("speed>1"), &[]),
+            rule(&["Car"], Some("speed<9"), &[]),
+        ];
+        assert_eq!(
+            pair_rules(&view, two),
+            Err(Denied(TOO_MANY_RULES.to_owned()))
+        );
+        assert!(TOO_MANY_RULES.contains(&MAX_COMPOSED_RULES.to_string()));
+    }
+
+    /// T-4079: a bound on the request answers 400 BadRequestData naming it,
+    /// never the 403 a policy refusal is.
+    #[tokio::test]
+    async fn the_bound_answers_400_naming_it() {
+        use axum::response::IntoResponse;
+        let response =
+            crate::negotiate::ApiError::from(Denied(TOO_MANY_RULES.to_owned())).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes(),
+        )
+        .expect("json");
+        assert_eq!(
+            body["type"],
+            "https://uri.etsi.org/ngsi-ld/errors/BadRequestData"
+        );
+        assert!(body["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("MAX_COMPOSED_RULES"));
+        let other = crate::negotiate::ApiError::from(Denied("no".into())).into_response();
+        assert_eq!(
+            other.status(),
+            StatusCode::FORBIDDEN,
+            "a policy refusal stays 403"
         );
     }
 }

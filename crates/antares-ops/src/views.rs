@@ -37,6 +37,8 @@ use std::sync::{Arc, Weak};
 
 mod preview;
 pub use preview::MAX_PREVIEW_LIMIT;
+pub mod quality;
+pub mod retention;
 pub mod rule_documents;
 
 /// How often, in milliseconds, every pod rebuilds its table from the store
@@ -48,12 +50,20 @@ pub const RELOAD_ENV: &str = "ANTARES_VIEWS_RELOAD_MS";
 /// bytes. No default: unset, the broker takes no schema (T-3628).
 pub const SCHEMA_MAX_ENV: &str = "ANTARES_SCHEMA_MAX_BYTES";
 
+/// Every variable the view table reads. The broker accepts these as config
+/// keys from here, so a new one is added in this crate alone (T-3766).
+pub const ENV_KEYS: &[&str] = &[RELOAD_ENV, SCHEMA_MAX_ENV];
+
 /// The largest view document `/q/views` accepts, in bytes.
 pub const MAX_VIEW_BYTES: usize = 64 * 1024;
 
 /// The most rules one view holds (V23: the predicate is bounded at load;
 /// every request through the view evaluates each of them).
 pub const MAX_RULES: usize = 64;
+
+/// The one name that is no name: a view of every type and every
+/// Attribute writes it alone (ADR-0023 rule 12).
+pub const EVERY: &str = "*";
 
 /// The most names in one list of a view: its selector, a rule's types or
 /// Attributes, its operations.
@@ -160,6 +170,8 @@ pub struct Loaded {
     pub notes: Vec<String>,
     /// The compiled Mapping of a view of another model.
     pub mapping: Option<Arc<crate::mapping::Mapping>>,
+    /// The view's own `@context`, as written.
+    pub context: Option<Arc<serde_json::Map<String, Value>>>,
 }
 
 impl View {
@@ -177,6 +189,39 @@ impl View {
             return Err(format!("a view document is at most {MAX_VIEW_BYTES} bytes"));
         }
         serde_json::from_slice(bytes).map_err(|e| format!("not a view: {e}"))
+    }
+
+    /// Whether this is ADR-0023 rule 12's view of every type and every
+    /// Attribute: `selector ["*"]` and the one rule `{types ["*"],
+    /// attributes ["*"]}` with no condition of its own. `*` anywhere else is
+    /// an error, before any name is expanded, so no `@context` turns it into
+    /// a name.
+    fn is_every(&self) -> Result<bool, String> {
+        let star = |names: &[String]| names.iter().any(|n| n == EVERY);
+        let only = |names: &[String]| names.len() == 1 && star(names);
+        if !star(&self.selector)
+            && !self
+                .rules
+                .iter()
+                .any(|r| star(&r.types) || star(&r.attributes))
+        {
+            return Ok(false);
+        }
+        match self.rules.as_slice() {
+            [r] if only(&self.selector)
+                && only(&r.types)
+                && only(&r.attributes)
+                && r.q.is_none()
+                && r.scope_q.is_none()
+                && r.geo_q.is_none() =>
+            {
+                Ok(true)
+            }
+            _ => Err(format!(
+                "`{EVERY}` stands alone (ADR-0023 rule 12): selector [\"{EVERY}\"] and the one \
+                 rule {{\"types\": [\"{EVERY}\"], \"attributes\": [\"{EVERY}\"]}}"
+            )),
+        }
     }
 
     /// Validate the view and compile it (ADR-0023 rule 10): its id, its
@@ -205,18 +250,36 @@ impl View {
             ctx.merge_object(local)
                 .map_err(|e| format!("the view's @context: {e}"))?;
         }
-        let selector = expand_all("selector", &self.selector, &ctx)?;
-        if self.rules.len() > MAX_RULES {
-            return Err(format!("a view holds at most {MAX_RULES} rules"));
-        }
-        let rules = self
-            .rules
-            .iter()
-            .enumerate()
-            .map(|(i, r)| compile_rule(i, r, &ctx))
-            .collect::<Result<Vec<_>, _>>()?;
-        let notes = disclosures(&rules);
+        let (q, scope, geo) = (
+            parse_q("q", self.q.as_deref())?,
+            scope_q("scopeQ", self.scope_q.as_deref())?,
+            geo_q("geoQ", self.geo_q.as_ref())?,
+        );
         let operations = operations(&self.operations)?;
+        let (view, notes, selector) = if self.is_every()? {
+            (
+                CompiledView::every(q, scope, geo),
+                Vec::new(),
+                vec![EVERY.to_owned()],
+            )
+        } else {
+            let selector = expand_all("selector", &self.selector, &ctx)?;
+            if self.rules.len() > MAX_RULES {
+                return Err(format!("a view holds at most {MAX_RULES} rules"));
+            }
+            let rules = self
+                .rules
+                .iter()
+                .enumerate()
+                .map(|(i, r)| compile_rule(i, r, &ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            let notes = disclosures(&rules);
+            (
+                CompiledView::new(&selector, q, scope, geo, rules)?,
+                notes,
+                selector,
+            )
+        };
         let mapping = match &self.mapping {
             None => None,
             Some(ir) => Some(Arc::new(mapped(
@@ -227,20 +290,14 @@ impl View {
                 &operations,
             )?)),
         };
-        let view = CompiledView::new(
-            &selector,
-            parse_q("q", self.q.as_deref())?,
-            scope_q("scopeQ", self.scope_q.as_deref())?,
-            geo_q("geoQ", self.geo_q.as_ref())?,
-            rules,
-        )?
-        .named(&self.id);
+        let view = view.named(&self.id);
         let mut loaded = Loaded {
             view: Arc::new(view),
             tenant: tenant.as_str().to_owned(),
             operations,
             notes,
             mapping,
+            context: self.context.clone().map(Arc::new),
         };
         if self.q.is_some()
             && loaded
@@ -417,6 +474,7 @@ fn entry(doc: &Value) -> ViewEntry {
             mapping: l
                 .mapping
                 .map(|m| antares_api::views::Attached(m as Arc<dyn std::any::Any + Send + Sync>)),
+            context: l.context,
         },
         Err(reason) => ViewEntry::Invalid { reason },
     }
@@ -434,6 +492,12 @@ struct Reloader {
     policy: tokio::sync::Mutex<rule_documents::Cache>,
     /// [`SCHEMA_MAX_ENV`]; `None` refuses every schema write.
     schema_max: Option<usize>,
+    /// Every Tenant's retention rules, as the last reload found them.
+    retention: std::sync::RwLock<Arc<retention::Rules>>,
+    /// What this pod's sweeps deleted since it started, by Tenant, type and kind.
+    deleted: std::sync::Mutex<BTreeMap<(String, String, &'static str), u64>>,
+    /// Every Tenant's `maxAge` quality rules, as the last reload found them.
+    quality: std::sync::RwLock<Arc<quality::Rules>>,
 }
 
 impl Reloader {
@@ -442,11 +506,21 @@ impl Reloader {
         let docs = self.state.view_docs().await?;
         let mut next = HashMap::with_capacity(docs.len());
         let mut schemas = BTreeMap::new();
+        let mut retention_docs = Vec::new();
+        let mut quality_docs = Vec::new();
         for doc in docs {
             let Some(id) = doc.get("id").and_then(Value::as_str).map(str::to_owned) else {
                 tracing::warn!("a stored view document has no id; skipped");
                 continue;
             };
+            if let Some(tenant) = id.strip_prefix(retention::RETENTION_ID_PREFIX) {
+                retention_docs.push((tenant.to_owned(), doc));
+                continue;
+            }
+            if let Some(tenant) = id.strip_prefix(quality::QUALITY_ID_PREFIX) {
+                quality_docs.push((tenant.to_owned(), doc));
+                continue;
+            }
             if let Some(tenant) = id.strip_prefix(SCHEMA_ID_PREFIX) {
                 if let Some(text) = doc.get("text").and_then(Value::as_str) {
                     schemas.insert(tenant.to_owned(), Schema::new(text.as_bytes()));
@@ -474,6 +548,18 @@ impl Reloader {
             revision(table.iter().map(|(id, (doc, _))| (id.as_str(), doc))),
         );
         self.state.views.replace_schemas(schemas);
+        *self
+            .retention
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(retention::load(
+            retention_docs.iter().map(|(t, d)| (t.as_str(), d)),
+        ));
+        *self
+            .quality
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(quality::load(
+            quality_docs.iter().map(|(t, d)| (t.as_str(), d)),
+        ));
         *cache = next;
         drop(cache);
         rule_documents::reload(&self.state, &mut *self.policy.lock().await).await
@@ -534,6 +620,9 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
         cache: tokio::sync::Mutex::new(HashMap::new()),
         policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
         schema_max: schema_max(std::env::var(SCHEMA_MAX_ENV).ok())?,
+        retention: std::sync::RwLock::default(),
+        deleted: std::sync::Mutex::default(),
+        quality: std::sync::RwLock::default(),
     });
     reloader.reload().await?;
     // The routes live in the table the reloader fills; a strong handle there
@@ -544,6 +633,22 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|ms| *ms > 0)
         .unwrap_or(5000);
+    let sweeping = reloader.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(retention::SWEEP_EVERY);
+        // The first sweep a minute after start, not at once: an immediate one
+        // scheduled late would race the first writes (and the tests' own sweeps).
+        tick.reset();
+        // A sweep that outlasts its minute waits for the next one instead of
+        // the missed ticks firing back to back (T-4084).
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let now = chrono::Utc::now();
+            retention::sweep(&sweeping, now).await;
+            quality::sweep(&sweeping, now).await;
+        }
+    });
     let looping = reloader.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(every));
@@ -557,6 +662,20 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
 }
 
 impl Reloader {
+    fn quality_rules(&self) -> Arc<quality::Rules> {
+        self.quality
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn retention_rules(&self) -> Arc<retention::Rules> {
+        self.retention
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     async fn reload_or_log(&self) {
         if let Err(e) = self.reload().await {
             tracing::warn!(
@@ -573,6 +692,30 @@ impl Reloader {
 pub struct Reload(Arc<Reloader>);
 
 impl Reload {
+    /// One retention sweep at `now` over the rules the last reload found
+    /// (the loop [`install`] starts runs it every minute).
+    pub async fn sweep_retention(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<retention::Deleted> {
+        retention::sweep(&self.0, now).await
+    }
+
+    /// [`Self::sweep_retention`] that starts no statement after `budget`.
+    pub async fn sweep_retention_within(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        budget: std::time::Duration,
+    ) -> Vec<retention::Deleted> {
+        retention::sweep_within(&self.0, now, budget).await
+    }
+
+    /// One quality sweep at `now` over the rules the last reload found (the
+    /// minute loop [`install`] starts runs it after the retention sweep).
+    pub async fn sweep_quality(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<quality::Changed> {
+        quality::sweep(&self.0, now).await
+    }
+
     /// Rebuild the table from the store now.
     ///
     /// # Errors
@@ -623,6 +766,8 @@ fn admin(r: &Weak<Reloader>) -> Router {
         )
         .merge(preview::routes(r))
         .merge(rule_documents::routes(r))
+        .merge(retention::routes(r))
+        .merge(quality::routes(r))
 }
 
 /// Run `f` with the reloader, or answer 503 once the runtime that ran
@@ -780,6 +925,16 @@ async fn put_schema(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Res
             ))
         }
     };
+    if let Some(slot) = member_slot(text) {
+        return Ok(problem(
+            StatusCode::BAD_REQUEST,
+            "BadRequestData",
+            &format!(
+                "slot {slot:?} is a member of an NGSI-LD Attribute, never an Attribute \
+                 name: no Entity can carry it; give the slot another name, one that says what it holds (pm10, not value)"
+            ),
+        ));
+    }
     let doc = serde_json::json!({"id": key, "text": text});
     let replaced = r.state.put_view_doc(&key, doc).await?;
     r.reload().await?;
@@ -789,6 +944,55 @@ async fn put_schema(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Res
         StatusCode::CREATED
     }
     .into_response())
+}
+
+/// Members of an Attribute instance an Entity also carries, or that the
+/// platform's core model (`ngsi-ld-core.linkml.yaml`, imported by every
+/// compiled data model) declares as slots of every Entity: a surface reads
+/// them as the Entity's own, so they stay allowed (T-3956).
+const ENTITY_SLOTS: [&str; 6] = [
+    "type",
+    "observedAt",
+    "createdAt",
+    "modifiedAt",
+    "deletedAt",
+    "expiresAt",
+];
+
+/// The first slot of a `LinkML` schema named after a member of an Attribute
+/// instance (`value`, `object`, `unitCode`, ...): no Entity can carry it as
+/// an Attribute, the expansion reads the key as that member. The schema's own
+/// slots, each class's slots and slot usages (T-3956).
+fn member_slot(text: &str) -> Option<String> {
+    let doc: serde_json::Value = serde_json::from_str(text).ok()?;
+    let keys = |v: Option<&serde_json::Value>| {
+        v.and_then(serde_json::Value::as_object)
+            .into_iter()
+            .flat_map(|o| o.keys().cloned())
+            .collect::<Vec<_>>()
+    };
+    let mut names = keys(doc.get("slots"));
+    for class in doc
+        .get("classes")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flat_map(serde_json::Map::values)
+    {
+        names.extend(keys(class.get("slot_usage")));
+        names.extend(
+            class
+                .get("slots")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned),
+        );
+    }
+    names.into_iter().find(|n| {
+        antares_jsonld::RESERVED_MEMBERS.contains(&n.as_str())
+            && !ENTITY_SLOTS.contains(&n.as_str())
+    })
 }
 
 fn no_schema() -> Response {
@@ -860,6 +1064,17 @@ mod tests {
     }
 
     #[test]
+    fn a_mapped_view_serves_the_temporal_and_discovery_reads() {
+        let mut v = mapped();
+        v["operations"] = json!(crate::mapping::READS
+            .iter()
+            .map(|op| op.id())
+            .collect::<Vec<_>>());
+        let loaded = load(&v).map(|l| l.operations.len());
+        assert_eq!(loaded, Ok(11));
+    }
+
+    #[test]
     fn a_mapped_view_loads_with_its_mapping() {
         let loaded = load(&mapped());
         assert_eq!(
@@ -878,8 +1093,9 @@ mod tests {
             "create_subscription",
             "batch_upsert",
             "query_entities_post",
-            "retrieve_entity_types",
-            "temporal_query",
+            "temporal_query_post",
+            "temporal_upsert",
+            "create_temporal_entity_map",
         ] {
             let mut v = mapped();
             v["operations"] = json!(["query_entities", op]);
@@ -899,6 +1115,15 @@ mod tests {
         let mut v = mapped();
         v["mapping"]["version"] = json!(1);
         assert!(load(&v).err().unwrap_or_default().contains("version 1"));
+    }
+
+    #[test]
+    fn a_view_of_everything_takes_no_mapping() {
+        let mut v = mapped();
+        v["selector"] = json!([EVERY]);
+        v["rules"] = json!([{"types": [EVERY], "attributes": [EVERY]}]);
+        let e = load(&v).err().unwrap_or_default();
+        assert!(e.contains("sourceClass and nothing else"), "{e}");
     }
 
     #[test]
@@ -979,6 +1204,9 @@ mod tests {
             cache: tokio::sync::Mutex::new(HashMap::new()),
             policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
             schema_max: None,
+            retention: std::sync::RwLock::default(),
+            deleted: std::sync::Mutex::default(),
+            quality: std::sync::RwLock::default(),
         });
         let put = put_schema(r.clone(), "city".into(), Bytes::from_static(b"{}")).await;
         assert_eq!(put.map(|p| p.status()), Ok(StatusCode::SERVICE_UNAVAILABLE));

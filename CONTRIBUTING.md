@@ -40,12 +40,17 @@ ETSI badges describe `dev`; `:latest` and the versioned images describe
 
 1. Fork, then branch from `dev`: `git switch -c 5.6.6-delete-entity origin/dev`.
 2. Commit under the rules below: one change per commit, signed off.
+   Before the push, run `dev/preflight.sh`: every check CI runs only
+   there (clippy wall, all-features tests, each new test alone, machete,
+   the ledger, module rules, the vanilla gates, the SBOM, the docs gates,
+   the coverage gate) on the crates the branch touches, about 5 minutes
+   warm. A new CI-only check lands in `dev/preflight.sh` in the same
+   change, with a comment naming its CI step.
 3. Open the pull request into `dev`. `ci` runs on it; a first-time
    contributor's run waits for a maintainer to approve it.
 4. Keep the branch current with `git rebase origin/dev`, not by merging
-   `dev` into it. A conflict in the size column of `ARCHITECTURE.md` is
-   resolved by taking either side and running
-   `python3 dev/spec.py --write-sizes`, which rewrites every stale size.
+   `dev` into it. `ARCHITECTURE.md` names each crate and module without
+   its size; `python3 dev/spec.py sizes` prints the line counts.
 5. A maintainer lands it by rebase when every commit stands on its own,
    by squash when the branch is one change told in several commits.
 
@@ -63,12 +68,14 @@ What a pull request from a fork can and cannot do here:
   schedule or dispatch, never from a pull request.
 - Nothing a `v*` tag publishes is built from a cache.
 
-**As a maintainer.** Commit on `dev`, push a batch, then dispatch `ci`
-once for the batch (`ci` has no push trigger: a 40-minute pipeline that
-restarts on every push never finishes). A green dispatched run on `dev`
-publishes the `:dev` image. Every push to `dev` also runs `fast` (the
-workspace gate alone, about 15 minutes), which is what a review closes on;
-`ci` adds the ETSI matrix and the images and stays the per-batch gate.
+**As a maintainer.** Commit on `dev` and push a batch. Every push to
+`dev` runs `fast` (the workspace gate, about 15 minutes), which is what a
+review closes on. A green `fast` run starts `ci` on the same commit
+(`workflow_run`): the ETSI matrix and the arm64 build at once, no second
+workspace run, and a green run publishes the `:dev` image. A `fast` run
+that is not green starts nothing (its `ci` run cancels itself). A
+dispatch of `ci` by hand runs the workspace gate first unless
+`with_workspace` is false.
 Work that will stay red for more than a day
 lives on a topic branch and comes in by pull request like a fork's.
 

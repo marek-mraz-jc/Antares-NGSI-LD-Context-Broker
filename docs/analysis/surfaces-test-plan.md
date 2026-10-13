@@ -91,6 +91,55 @@ CI jobs named below (all in Antares `.github/workflows/`):
   MCP result count are equal; paging through each surface yields the same ids in the same order.
 - Job: `workspace-tests`.
 
+## 3a. View and policy matrix (T-3777)
+
+- File: `crates/antares-broker/tests/views_matrix.rs`, `--features full,jc-policy`; corpus
+  `crates/antares-broker/tests/views-matrix/`: one JSON file per scenario (a view, the
+  joinedcontext engine's policies, a caller, optional `steps`), a shared seed of 11 Entities
+  (`_seed.json`: three polygons, an edge point, scopes with several paths and none, an Attribute on
+  some Entities only, a multi-attribute, a LanguageProperty) and its LinkML schema (`_schema.json`).
+- Each scenario's `expect` (Entity id to Attribute names, or `denied`) is written by hand from the
+  seed, never read from the code under test.
+- Test `every_surface_answers_what_ngsi_ld_admits_in_every_scenario`: each scenario in a Tenant of
+  its own, read page by page through the NGSI-LD view (Link `next`), OData (`odata.maxpagesize`,
+  `@odata.nextLink`), OGC items (`next` links), MCP `query_entities` (cursor) and the NGSI-LD
+  temporal query (11.3.3 over `modifiedAt`), and notified over a WebSocket and an HTTP Subscription made
+  through the view as the caller before the seed is written (the broker wired with the engine,
+  as `main` wires it, so notifications are decided by it). Each must answer
+  exactly the expected ids and Attribute names, its count (`NGSILD-Results-Count`, `@odata.count`,
+  `numberMatched`, MCP `total`) the expected size. A retrieve by id (NGSI-LD and MCP `get_entity`)
+  of a seed Entity the scenario does not admit answers the bytes of an absent id; a denied caller
+  gets a refusal naming no seed Entity.
+- The temporal answer is the snapshot's less the Entities shown with their frame alone, unless the
+  scenario states `temporal`: a policy condition holds per instance (ADR-0023 rule 11), so a
+  `scopeQ` condition (scope has no history) hides every instance and a moved Entity keeps the
+  instances recorded while its rule held.
+- Query-language rows, each against the NGSI-LD query that means the same through the same view
+  and caller: OData `$filter=speed gt 40&$select=location,speed` against `q=speed>40` with `pick`,
+  and OGC `bbox=0,0,7,7&properties=speed` against a `geoQ` intersects with `pick` plus the
+  Vehicles without a shown `location` (`bbox` keeps them, Part 1 Req 24 C). A surface may refuse a
+  name the view hides with `400` where NGSI-LD omits it. Every pager stops after 50 pages, so a
+  next link without end is a mismatch, not a hang.
+- LinkML (a build with `linkml`, as CI's all-features): `classes/{class}` of each type through the
+  view as the caller, each kept class with its slot names. By default each admitted type with the
+  names its admitted Entities show, and none for a denied caller; a scenario states `linkml` where a
+  rule's condition drops the Entities but not the class (linkml.md 2).
+- A mismatch with a fix task filed is listed in the scenario's `known` (surface to task id) and
+  must still fail, so the fix removes the entry; the test prints the list.
+- Job: `workspace-tests` (all-features).
+- Test `every_surface_answers_what_ngsi_ld_admits_for_generated_views_and_policies`, the
+  differential: up to eight generated Vehicles and Sensors (each Attribute, a point on a 0..=12
+  grid and a scope present or not), a generated view (`*`, or one or both types with a
+  projection, and a `q`, an area `within` or `intersects` and a `scopeQ`, each or not) and none
+  or up to three generated policies for the caller (a type or both, `propertyNames` or the whole
+  Entity, the same conditions, one in four a prohibition). OData, OGC and MCP must answer what
+  NGSI-LD answers through the same view. All cases share one Tenant, the seed deleted after each.
+  `VIEWS_DIFF_CASES` sets the cases (200 in `fast`, 2 000 in ci's `views-differential` job, which
+  `publish-dev` waits for), `VIEWS_DIFF_SEED` the seed (3777, printed). A failure shrinks and
+  prints the minimal case as a corpus file with its own `seed`: commit it with its `expect`
+  written by hand and file the fix task. Mismatches with a task filed are listed in `KNOWN_DIFF`
+  (none since T-3784).
+
 ## 4. Property tests (`proptest` 1.11.0, already a workspace dependency: `Cargo.lock:2329`, used by `antares-sql`)
 
 | property | crate and file | generator |
@@ -139,7 +188,7 @@ the row whose mitigation the test proves.
 | `/types` and discovery leaks | `views_discovery_is_computed_from_the_view`, `metadata_never_names_a_hidden_type_or_attribute`, `mcp_discovery.rs::input_schemas_list_only_visible_names`, `linkml_view.rs::linkml_prefixes_and_context_hold_only_visible_terms` | views, odata, mcp, linkml | V7, O17, MC2, LK1, LK6 |
 | 404 vs 403 | `views_an_out_of_view_entity_is_not_found` (404 for out of view, equal bytes to absent), `views_writes.rs::a_create_of_an_out_of_view_id_reveals_only_that_the_id_is_taken` (409), engine `Deny` = 403 (`policy_gate_seam.rs`, exists) | `antares-views` | V5, V6 |
 | `$expand` / join to out-of-view | `views_join_omits_out_of_view_targets_and_keeps_the_relationship`, `odata_expand.rs::odata_expand_omits_out_of_view_targets`, `mcp_gate.rs::join_is_not_an_argument_until_the_target_is_checked`, `views_q.rs::a_linked_q_path_does_not_cross_into_an_out_of_view_entity` | views, odata, mcp | V8, V9, O5, MC16 (T-3470, T-3474) |
-| relationship write / deep insert / `$ref` to an invisible or read-only target | `views_writes.rs::a_relationship_target_must_be_visible_and_absent_answers_alike`, `odata_bind_to_hidden_or_missing_target_is_400_and_writes_nothing`, `odata_ref.rs::odata_bind_to_an_absent_target_answers_like_a_hidden_one`, `odata_deep_insert.rs::odata_deep_insert_is_501` | views, odata | V13, O14, O15 |
+| relationship write / deep insert / `$ref` to an invisible or read-only target | `views_writes.rs::a_relationship_target_must_be_visible_and_absent_answers_alike`, `odata_bind_to_hidden_or_missing_target_is_400_and_writes_nothing`, `odata_a_reference_to_a_hidden_or_missing_entity_is_400_and_writes_nothing`, `odata_ref.rs::odata_bind_to_an_absent_target_answers_like_a_hidden_one`, `odata_deep_insert.rs::odata_deep_insert_is_501` | views, odata | V13, O14, O15 |
 | write laundering (post-image leaves view) | `views_writes_check_pre_and_post_image_and_the_allowlist`, `views_writes.rs::a_replace_is_refused_when_the_stored_entity_holds_hidden_attributes`, `views_batch_is_decided_per_entity`, `odata_batch_members_are_gated_one_by_one` | views, odata | V10, V11, V12, O12 |
 | hidden-only change suppression in notifications | `views_notifications_drop_hidden_changes_and_strip_previous_value`, `mcp_listen.rs::a_change_to_a_hidden_attribute_sends_no_resource_update`, `ws_notifications_pass_pre_notify_under_the_subscriber` | views, mcp, ws | V14, V15, MC17, W5 |
 | cross-tenant via internal CSR | `icsr_grant.rs::icsr_a_registration_into_a_tenant_that_granted_nothing_is_refused`, `icsr_gate.rs::icsr_cross_tenant_read_without_an_engine_grant_is_refused`, `icsr_gate.rs::icsr_the_subject_is_the_callers_and_never_comes_from_the_registration`, `icsr_grant.rs::icsr_a_revoked_grant_stops_forwards_and_notifications` | `antares-icsr` | C1, C2, C3, C7 |

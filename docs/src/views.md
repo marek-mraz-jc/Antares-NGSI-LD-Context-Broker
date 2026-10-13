@@ -35,6 +35,11 @@ Purge and the temporal writes are not served through a view. A Batch
 Upsert member that exists out of the view is never overwritten: it takes
 the create half and answers 409, as a create of a taken id does.
 
+A view may select every type and show every Attribute with one form:
+`"selector": ["*"]` and the single rule `{"types": ["*"], "attributes":
+["*"]}` (ADR-0023 rule 12). Its `q`, `scopeQ`, `geoQ`, `operations` and
+Tenant still apply. `*` anywhere else is refused when the view loads.
+
 ## 2. What a client sees
 
 - An Entity is in the view when a rule names its type and the view's `q`,
@@ -119,4 +124,7 @@ and navigation properties, the LinkML surface) reads the Tenant's `LinkML`
 schema, written to [`/q/schemas/{tenant}`](admin-api.md#schemas). Every view
 of that Tenant sees the same schema and no view sees another Tenant's. The
 surface gets the bytes and a revision through `ViewOps::schema`, parses
-them under its own limits, and parses again only when the revision changes.
+them under its own limits, and parses again only when the revision changes. A view
+document carries no schema of its own: one with a `linkml` member is
+refused with `400` like any unknown member, so the Tenant's schema is the
+one source (T-3658).

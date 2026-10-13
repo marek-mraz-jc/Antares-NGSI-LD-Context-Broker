@@ -136,6 +136,10 @@ async fn respond(ops: &Ops, mut req: Request) -> Response {
         csdl_limits: odata_csdl::Limits::strict(),
         max_header_len: MAX_HEADER_LEN,
         metadata_etag,
+        custom_options: read::NGSILD_OPTIONS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
     });
     // The inner router matches its own path; the outer match goes.
     req.extensions_mut().remove::<MatchedPath>();
@@ -279,7 +283,16 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
         return Some(hit.clone());
     }
     let schema = parsed(revision, &bytes)?;
-    let edm = edm::build(id, &schema, &key.1, key.2, version).ok()?;
+    // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
+    let every = view.shows_every_name().then(|| edm::every(&schema));
+    let edm = edm::build(
+        id,
+        &schema,
+        every.as_ref().unwrap_or(&key.1),
+        key.2,
+        version,
+    )
+    .ok()?;
     tracing::debug!(
         view = id,
         schema_revision = revision,

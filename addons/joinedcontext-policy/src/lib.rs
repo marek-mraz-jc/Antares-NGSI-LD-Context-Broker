@@ -32,7 +32,7 @@ pub mod surface;
 pub mod ucast;
 
 use antares_api::policy::{
-    Decision, DecisionFuture, NotifyDecision, Operation, PolicyEngine, Subject,
+    Decision, DecisionFuture, DecisionsFuture, NotifyDecision, Operation, PolicyEngine, Subject,
 };
 use document::Table;
 use serde_json::Value;
@@ -76,10 +76,32 @@ impl JoinedcontextPolicy {
         self.tables.read().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The types of the Entities a notification carries, expanded: what
+    /// the query it answers named (README 3.8).
+    fn notified_types(notification: &Value) -> Vec<String> {
+        let ctx = document::context();
+        let mut out: Vec<String> = notification
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.get("type"))
+            .flat_map(|t| match t {
+                Value::String(one) => vec![one.as_str()],
+                Value::Array(many) => many.iter().filter_map(Value::as_str).collect(),
+                _ => Vec::new(),
+            })
+            .map(|t| ctx.expand_key(t))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     fn decide_now(&self, subject: &Subject, op: &Operation<'_>) -> Decision {
         let table = self.table(subject.tenant.as_str());
         decide::decide(
-            table.as_deref(),
+            table.as_deref().map(|t| t.through(subject.view())),
             &Caller::of(subject),
             op,
             chrono::Utc::now(),
@@ -96,16 +118,38 @@ impl PolicyEngine for JoinedcontextPolicy {
         Box::pin(std::future::ready(self.decide_now(subject, op)))
     }
 
+    fn offers_each<'a>(
+        &'a self,
+        subject: &'a Subject,
+        ops: &'a [Operation<'a>],
+    ) -> DecisionsFuture<'a> {
+        let table = self.table(subject.tenant.as_str());
+        let table = table.as_deref().map(|t| t.through(subject.view()));
+        let caller = Caller::of(subject);
+        let now = chrono::Utc::now();
+        Box::pin(std::future::ready(
+            ops.iter()
+                .map(|op| decide::probe(table, &caller, op, now))
+                .collect(),
+        ))
+    }
+
     /// A notification is the answer to a query by the Subscription's
-    /// stored subject, decided again at delivery: a revoked grant stops
-    /// the next one.
+    /// stored subject naming the types of the Entities it carries, decided
+    /// again at delivery: a revoked grant stops the next one, and a grant
+    /// that takes the queried types reads them (T-3784).
     fn pre_notify(
         &self,
         subject: &Subject,
         _sub: &Value,
-        _notification: &mut Value,
+        notification: &mut Value,
     ) -> NotifyDecision {
-        match self.decide_now(subject, &Operation::new("5.7.2")) {
+        let types = Self::notified_types(notification);
+        let op = Operation {
+            types: &types,
+            ..Operation::new("5.7.2")
+        };
+        match self.decide_now(subject, &op) {
             Decision::Allow => NotifyDecision::Deliver,
             Decision::Filter(f) => NotifyDecision::Filter(f),
             Decision::Deny(_) | Decision::AllowIf(_) => NotifyDecision::Drop,

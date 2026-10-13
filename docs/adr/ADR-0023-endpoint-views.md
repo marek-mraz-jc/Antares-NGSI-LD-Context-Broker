@@ -153,6 +153,12 @@ view's configuration names. A stored `@context` is the tenant's
 (ADR-0021), and one may define a term for a hidden Attribute, so a view
 does not list the tenant's contexts by default; Add, Delete and Reload
 @context (13.2, 13.5) are writes and are offered only when allowlisted.
+The same holds at the root for a caller the engine narrows (T-4009): List
+and Serve @context (13.3, 13.4) take a `Filter` from the engine, read as
+"this caller sees fewer names than the tenant holds", and under one the
+list is the core `@context` alone and a stored `@context` is not found.
+The reference engine answers them with a narrowing unless the caller may
+query every Entity whole.
 
 ### 6. Joins: an out-of-view target is not embedded, its Relationship stays
 
@@ -391,6 +397,42 @@ Decided (worker-1, owner may override): a flag beside the list, because a
 reserved name in the list would be compared as an Attribute IRI wherever
 the list is read; options: a flag, a reserved `*` member, an
 `Option<Set>`, which would change every reader of the list.
+
+### 12. A view that narrows nothing: `*`
+
+Added 2026-10-11 (T-3666). The confirmation below runs the ETSI suite
+through a view "that selects every type and hides nothing", and
+`surfaces-conformance.md` section 1 names it `all`. Rules 10 and 11 cannot
+say it: a selector names its types and a rule its Attributes, at most 256
+names a list and 64 rules, while the suite makes up types and Attributes
+as it goes. So a view may write one wildcard form, and only that one:
+
+```
+"selector": ["*"],
+"rules": [{"types": ["*"], "attributes": ["*"]}]
+```
+
+It selects every Entity type and shows every Attribute; the view's own
+`q`, `scopeQ` and `geoQ` still narrow, its `operations` still decide
+what it serves, and its Tenant stays pinned (rule 10). It compiles to a
+narrowing with no rules, which is what an engine's `Filter` without rules
+already means, so every rule above reads it unchanged: `view ∧ engine` is
+the engine's answer under the view's conditions.
+
+`*` is never a name: it is not expanded through the view's `@context`, so
+a vocabulary that defines a term `*` cannot widen a view. Any other use
+of `*` is a load error: beside a name in the same list, in a rule beside
+other rules, in a rule with a condition, as a rule's types with named
+Attributes or the other way round. Each of those would be a view rule over every type
+or every Attribute, which no view asks for; an engine says the whole
+Entity with `Rule::every_attribute` (rule 11, amended by T-3637).
+
+Decided (worker-2, owner may override): the whole-view wildcard alone,
+because it is what the confirmation and the conformance jobs need and it
+adds no member to `policy::Rule`; options: the whole-view wildcard
+(chosen), `*` per list (a rule over every type with named Attributes,
+named types with every Attribute), a boolean member `narrowsNothing`
+(a second way to say what `rules` already says).
 
 ## Threats and the rule that answers each
 

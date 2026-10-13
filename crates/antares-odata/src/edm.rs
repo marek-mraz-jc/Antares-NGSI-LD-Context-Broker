@@ -8,8 +8,8 @@
 use linkml_model::{edm_types, Builtin, Range, EDM_TYPE_TAG};
 use odata_csdl::{
     Annotation, CsdlVersion, EntityContainer, EntitySet, EntityType, Expr, Include, Model,
-    NavigationProperty, NavigationPropertyBinding, Property, Reference, Scale, Schema, Term,
-    TypeRef,
+    NavigationProperty, NavigationPropertyBinding, Property, Reference, ReferentialConstraint,
+    Scale, Schema, Term, TypeRef,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,6 +22,10 @@ const VOCABULARY_ALIAS: &str = "NgsiLd";
 const BASE: &str = "NgsiLd.Entity";
 
 const VOCABULARIES: &str = "https://oasis-tcs.github.io/odata-vocabularies/vocabularies/";
+
+/// The slot annotation that names the Property keying a navigation's
+/// target (R6, T-3761).
+pub const REFERENCE_TAG: &str = "odata_referential_constraint";
 
 /// The Entity types the view shows, each with the Attributes it shows, as
 /// expanded IRIs.
@@ -157,6 +161,9 @@ pub struct Set {
     pub identifier: Option<Identifier>,
     /// The writes the set takes: the view's, narrowed by the class (C10a).
     pub writable: Writable,
+    /// Each Property that keys the target of a navigation (R6, T-3761), by
+    /// its CSDL name: the target's EntitySet.
+    pub references: BTreeMap<String, String>,
 }
 
 /// A key taken from the model (E2a): its value `v` names the Entity
@@ -181,6 +188,29 @@ pub struct Edm {
     pub namespace: String,
     /// The EntitySets by name.
     pub sets: BTreeMap<String, Set>,
+}
+
+/// Every class of `schema` with every slot of it: what a view of `*` shows
+/// (ADR-0023 rule 12), which names no type for [`ViewOps::shown_by_type`].
+///
+/// [`ViewOps::shown_by_type`]: antares_ops::ViewOps::shown_by_type
+#[must_use]
+pub fn every(schema: &linkml_model::Model) -> Shown {
+    schema
+        .schema()
+        .classes
+        .keys()
+        .map(|class| {
+            let slots = schema.class_slots(class);
+            (
+                schema.class_iri(class),
+                slots
+                    .iter()
+                    .map(|(slot, _)| schema.slot_iri(slot))
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 /// Builds the model of view `view` from `schema` and what the view shows.
@@ -274,16 +304,15 @@ pub fn build(
         }
         set.annotations = capabilities(&members, writable, required);
         container.entity_sets.push(set);
+        let set = Set {
+            type_iri: schema.class_iri(class),
+            references: constrain(schema, class, &visible, &mut ty, &members),
+            members,
+            identifier,
+            writable,
+        };
         types.push(ty);
-        sets.insert(
-            name.clone(),
-            Set {
-                type_iri: schema.class_iri(class),
-                members,
-                identifier,
-                writable,
-            },
-        );
+        sets.insert(name.clone(), set);
     }
     container.annotations = container_capabilities();
     let mut own = Schema::new(namespace.clone());
@@ -298,6 +327,83 @@ pub fn build(
         namespace,
         sets,
     })
+}
+
+/// Row R6: each single-valued navigation of `class` whose slot names a
+/// Property with `odata_referential_constraint` gets a `ReferentialConstraint`
+/// to the target's key, when the view shows all three, the Property is
+/// not required and has the key's Edm type (CSDL XML 8.5). The Properties
+/// that hold, by CSDL name, with the target's EntitySet.
+fn constrain(
+    schema: &linkml_model::Model,
+    class: &str,
+    visible: &BTreeMap<&str, (String, &BTreeSet<String>)>,
+    ty: &mut EntityType,
+    members: &BTreeMap<String, Member>,
+) -> BTreeMap<String, String> {
+    let slots = schema.class_slots(class);
+    let mut references = BTreeMap::new();
+    for (name, slot) in &slots {
+        let (Some(dependent), Range::Class(target)) =
+            (slot.annotations.get(REFERENCE_TAG), schema.range(slot))
+        else {
+            continue;
+        };
+        // A navigation the view shows: its target is visible (R1).
+        let Some(nav) = mangle(name).and_then(|n| {
+            ty.navigation_properties
+                .iter_mut()
+                .find(|p| p.name == n && !p.ty.collection)
+        }) else {
+            continue;
+        };
+        let Some((set, key, key_edm)) = key_of(schema, target, visible) else {
+            continue;
+        };
+        let value = Shape::Value {
+            edm: key_edm,
+            collection: false,
+        };
+        let Some(property) = slots
+            .iter()
+            .find(|(n, s)| *n == dependent.value && s.required != Some(true))
+            .and_then(|(n, _)| mangle(n))
+            .filter(|m| members.get(m).is_some_and(|m| m.shape == value))
+        else {
+            continue;
+        };
+        nav.referential_constraints
+            .push(ReferentialConstraint::new(property.clone(), key));
+        references.insert(property, set);
+    }
+    references
+}
+
+/// The EntitySet of a visible class, its key's CSDL name and Edm type: the
+/// E2a key when the view shows it, `id` for a class without one (E2).
+fn key_of(
+    schema: &linkml_model::Model,
+    class: &str,
+    visible: &BTreeMap<&str, (String, &BTreeSet<String>)>,
+) -> Option<(String, String, &'static str)> {
+    let (set, attrs) = visible.get(class)?;
+    // As `build` keys a type (E2a): an identifier slot of a plain value.
+    let key = schema
+        .class_slots(class)
+        .into_iter()
+        .find_map(
+            |(name, slot)| match (slot.identifier, shape(schema, &slot, visible)) {
+                (Some(true), Shape::Value { edm, .. }) => Some((name, edm)),
+                _ => None,
+            },
+        );
+    let Some((name, edm)) = key else {
+        return Some((set.clone(), "id".to_owned(), "Edm.String"));
+    };
+    if !attrs.contains(&schema.slot_iri(name)) {
+        return None;
+    }
+    Some((set.clone(), mangle(name)?, edm))
 }
 
 /// A key member is required, and one a create may leave out is
@@ -526,7 +632,8 @@ fn written(slot: &linkml_model::Slot) -> Written {
 /// C2 to C16: the writes the view offers, none of them deep or an upsert,
 /// with the members no write may name ([`Shape::writable`], the computed
 /// ones are `Core.Computed`); counting; filtering and sorting on the
-/// members [`Shape::scalar`] admits and `id` (C11, C12); expanding one
+/// members [`Shape::scalar`] admits and `id` (C11, C12), sorting also on
+/// `createdAt` and `modifiedAt`; expanding one
 /// level (C13). Advisory: every request is still gated (O25).
 fn capabilities(
     members: &BTreeMap<String, Member>,
@@ -586,7 +693,7 @@ fn capabilities(
             vec![("Deletable", flag(writable.delete))],
         ),
         restriction("CountRestrictions", vec![("Countable", flag(true))]),
-        restriction("SearchRestrictions", vec![("Searchable", flag(false))]),
+        restriction("SearchRestrictions", vec![("Searchable", flag(true))]),
         restriction(
             "FilterRestrictions",
             vec![
@@ -602,7 +709,18 @@ fn capabilities(
             "SortRestrictions",
             vec![
                 ("Sortable", flag(true)),
-                ("NonSortableProperties", Expr::Collection(unserved)),
+                // `createdAt` and `modifiedAt` are sorted by the surface (T-3758)
+                (
+                    "NonSortableProperties",
+                    Expr::Collection(
+                        unserved
+                            .into_iter()
+                            .filter(|p| {
+                                !matches!(p, Expr::PropertyPath(n) if n == "createdAt" || n == "modifiedAt")
+                            })
+                            .collect(),
+                    ),
+                ),
             ],
         ),
         restriction(
@@ -653,7 +771,7 @@ fn container_capabilities() -> Vec<Annotation> {
         ),
         flag("QuerySegmentSupported", true),
         flag("CrossJoinSupported", false),
-        flag("ComputeSupported", false),
+        flag("ComputeSupported", true),
         flag("KeyAsSegmentSupported", false),
         flag("AsynchronousRequestsSupported", false),
     ]
@@ -798,6 +916,107 @@ mod tests {
         let mut out = Vec::new();
         odata_csdl::write_xml(&edm.csdl, &odata_csdl::Limits::strict(), &mut out).unwrap();
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn a_reference_annotation_is_a_constraint_only_when_the_view_shows_it_whole() {
+        let json = br#"{
+          "id": "https://example.org/shop", "name": "shop",
+          "classes": {
+            "Desc": {"slots": ["productId", "product", "products", "ownerRef", "owner", "maker", "boughtId", "bought",
+                               "lost", "flat", "missing"]},
+            "Product": {"slots": ["ID", "name"]},
+            "Person": {"slots": ["name"]}
+          },
+          "slots": {
+            "ID": {"identifier": true, "annotations": {"edm_type": {"tag": "edm_type", "value": "Edm.Guid"}}},
+            "name": {},
+            "productId": {"annotations": {"edm_type": {"tag": "edm_type", "value": "Edm.Guid"}}},
+            "product": {"range": "Product", "annotations": {"odata_referential_constraint": {"tag": "odata_referential_constraint", "value": "productId"}}},
+            "products": {"range": "Product", "multivalued": true, "annotations": {"odata_referential_constraint": {"tag": "odata_referential_constraint", "value": "productId"}}},
+            "ownerRef": {},
+            "owner": {"range": "Person", "annotations": {"odata_referential_constraint": {"tag": "odata_referential_constraint", "value": "ownerRef"}}},
+            "maker": {"range": "Product", "annotations": {"odata_referential_constraint": {"tag": "odata_referential_constraint", "value": "ownerRef"}}},
+            "boughtId": {"required": true, "annotations": {"edm_type": {"tag": "edm_type", "value": "Edm.Guid"}}},
+            "bought": {"range": "Product", "annotations": {"odata_referential_constraint": {"tag": "odata_referential_constraint", "value": "boughtId"}}},
+            "lost": {"range": "Product", "annotations": {"odata_referential_constraint": {"tag": "odata_referential_constraint", "value": "nothing"}}},
+            "flat": {"annotations": {"odata_referential_constraint": {"tag": "odata_referential_constraint", "value": "ownerRef"}}},
+            "missing": {"range": "Person", "annotations": {"odata_referential_constraint": {"tag": "odata_referential_constraint", "value": "ownerRef"}}}
+          }
+        }"#;
+        let limits = linkml_model::Limits {
+            max_bytes: 1 << 16,
+            max_depth: 16,
+            max_elements: 1024,
+        };
+        let s = linkml_model::Model::read(json, &limits).unwrap();
+        let every: Vec<&str> =
+            "productId product products ownerRef owner maker boughtId bought lost flat"
+                .split(' ')
+                .collect();
+        let constraints = |shown: &Shown| {
+            let edm = build("shop", &s, shown, Writable::default(), CsdlVersion::V4_01).unwrap();
+            let desc = &edm.sets["Desc"];
+            let ty = edm.csdl.schemas[1]
+                .entity_types
+                .iter()
+                .find(|t| t.name == "Desc")
+                .unwrap();
+            let navs: BTreeMap<String, Vec<ReferentialConstraint>> = ty
+                .navigation_properties
+                .iter()
+                .filter(|n| !n.referential_constraints.is_empty())
+                .map(|n| (n.name.clone(), n.referential_constraints.clone()))
+                .collect();
+            (navs, desc.references.clone())
+        };
+        let (navs, references) = constraints(&shown(
+            &s,
+            &[
+                ("Desc", &every),
+                ("Product", &["ID", "name"]),
+                ("Person", &["name"]),
+            ],
+        ));
+        // `products` is a collection, `maker` an Edm.String for a Guid key,
+        // `bought` required, `lost` names no slot, `flat` no class, and the
+        // view does not show `missing`.
+        assert_eq!(
+            navs,
+            BTreeMap::from([
+                (
+                    "owner".to_owned(),
+                    vec![ReferentialConstraint::new("ownerRef", "id")]
+                ),
+                (
+                    "product".to_owned(),
+                    vec![ReferentialConstraint::new("productId", "ID")]
+                ),
+            ])
+        );
+        assert_eq!(
+            references,
+            BTreeMap::from([
+                ("ownerRef".to_owned(), "Person".to_owned()),
+                ("productId".to_owned(), "Product".to_owned()),
+            ])
+        );
+        // The key, the Property or the target hidden: no constraint.
+        for (desc, product) in [
+            (&every[..], &["name"][..]),
+            (&["product", "owner"][..], &["ID", "name"][..]),
+        ] {
+            let (navs, references) = constraints(&shown(
+                &s,
+                &[("Desc", desc), ("Product", product), ("Person", &["name"])],
+            ));
+            assert_eq!(
+                (navs.get("product"), references.get("productId")),
+                (None, None),
+                "{desc:?} {product:?}"
+            );
+        }
+        assert!(constraints(&shown(&s, &[("Desc", &every)])).0.is_empty());
     }
 
     #[test]
@@ -974,6 +1193,23 @@ mod tests {
             CsdlVersion::V4_01
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_view_of_every_name_shows_every_class_with_every_slot() {
+        let s = schema();
+        let every = every(&s);
+        let car = &every[&s.class_iri("Car")];
+        assert!(
+            shown(&s, &[("Car", CAR_ALL)])[&s.class_iri("Car")].is_subset(car),
+            "every slot of Car, inherited ones too"
+        );
+        assert!(every.contains_key(&s.class_iri("Person")));
+        let edm = build("all", &s, &every, Writable::default(), CsdlVersion::V4_01).unwrap();
+        let xml = xml(&edm);
+        for set in ["Car", "Person"] {
+            assert!(xml.contains(&format!("<EntitySet Name=\"{set}\"")), "{xml}");
+        }
     }
 
     #[test]

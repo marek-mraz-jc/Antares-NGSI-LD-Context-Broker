@@ -20,10 +20,28 @@ token and strips them from every client request.
 | `x-jc-groups` | groups, comma separated |
 | `x-jc-roles` | roles, comma separated; the Endpoint roles (`endpoint:{project}/{endpoint}[/{role}]`) the gateway resolved for this request among them |
 | `x-jc-restricted` | `true` when the caller opted into the restricted signal (O-3 (b)) |
+| `x-jc-did` | the data-space participant a transfer token names (platform DS-02, map K38) |
+
+Each value, and each member of a list, is percent-encoded UTF-8 (RFC 3986:
+the unreserved characters `A-Z a-z 0-9 - . _ ~` stay as they are, every
+other byte is `%XX`), so a name with a diacritic or a comma travels whole
+(`doprava/správa` is `doprava%2Fspr%C3%A1va`). The engine splits a list on
+`,` first and decodes each member after, so an encoded comma never splits a
+name. A member that does not decode (a broken escape, bytes that are not
+UTF-8) is dropped alone and the rest kept; a `x-jc-subject` or
+`x-jc-client` that does not decode names nobody and still makes the caller
+not anonymous. Unencoded ASCII names read as before.
 
 A request with at least one of these headers is a platform caller. One with
-no `x-jc-subject` and no `x-jc-client` is anonymous and holds the role
-`public`, whatever `x-jc-roles` says beside it.
+`x-jc-did` is a data-space participant: it holds no role and no group,
+whatever `x-jc-roles` and `x-jc-groups` say beside it, so only the Policies
+compiled from its agreement (assignee `did`) grant it anything. One with no
+`x-jc-subject`, no `x-jc-client` and no `x-jc-did` is anonymous and holds the
+role `public` and, of what `x-jc-roles` says beside it, only the Endpoint
+caller roles `endpoint:{project}/{name}` (AP-97): the gateway resolves that
+role for every caller a public Endpoint admits, the anonymous one included,
+and it names that one Endpoint only. Any other role and every group the
+anonymous caller claims is dropped.
 
 A request with none of them comes from inside the cluster (the Portal's
 registration sync, plan 5.2 M22; nothing else reaches the broker, the
@@ -71,21 +89,24 @@ refused:
 | `id` | required, unique in the document; named by the access surface and in a load error, never in a refusal |
 | `effect` | `permit` (default) or `prohibit` |
 | `assigner` | optional: the party that granted it (a DID or URL), shown by the access surface (section 4); decides nothing |
-| `assignee.kind` | `user` (`x-jc-subject`), `group`, `role`, `serviceAccount` (`x-jc-client`); `did` is accepted and matches nobody until a header carries it |
+| `assignee.kind` | `user` (`x-jc-subject`), `group`, `role`, `serviceAccount` (`x-jc-client`); `did` (`x-jc-did`) |
 | `operations` | CIM 009 clauses (`5.6.1`, `5.7.2`, ...); the compiler expands the platform's operation names and groups |
 | `validity` | optional half-open `[from, to)`, RFC 3339 |
 | `information` | the grant's selectors; each `entities` member has a `type` (an IRI or a core term), at most one of `id` and `idPattern`; `propertyNames` and `relationshipNames` are the Attributes it shows, none = the whole Entity |
 | `q`, `scopeQ` | NGSI-LD query and scope query, on the Entity |
 | `geoQ` | `georel=…;geometry=…;coordinates=…[;geoproperty=…]` |
 | `temporalQ` | `timerel=before|after|between;timeAt=…[;endTimeAt=…]`, an instant or an ISO 8601 duration before now (`P-1D`) |
+| `views` | optional, beside `policies`: `{"{viewId}": ["policy id", …]}`. A request through a listed view (the subject's `@view`, ADR-0020 amendment) is decided by those policies alone; a view not listed, and the plain NGSI-LD root, by every policy. Each id must name a policy of the document, at most once per view; a view may list none (it then grants nothing) |
 
 A document that does not parse is refused and the previous one keeps
 deciding; a Tenant with no document denies every platform caller.
 
 ## 3. Decisions
 
-1. The policies that apply: the assignee is the caller, the clause is
-   listed, now is inside the validity.
+1. The policies that apply: those of the request's view when the document
+   lists it (`views`), every policy otherwise; of those, the ones whose
+   assignee is the caller, whose clause is listed and whose validity holds
+   now.
 2. A prohibition that applies and names no type, or a type the operation
    names, or applies to an operation naming no type: `Deny`.
 3. No permission applies: `Deny` (default deny).
@@ -116,15 +137,26 @@ deciding; a Tenant with no document denies every platform caller.
 7. A refusal says `no policy grants this operation` or `a policy prohibits
    this operation` and names no policy (platform GW6).
 8. A batch is decided member by member (`decide_each`); a notification is
-   decided again for the Subscription's stored subject as a query (5.7.2):
-   `Deny` drops it, a `Filter` narrows it.
+   decided again for the Subscription's stored subject as a query (5.7.2)
+   naming the types of the Entities it carries: `Deny` drops it, a `Filter`
+   narrows it (T-3784).
+9. The tool probe (`offers_each`, MCP D-3) asks whether some request of a
+   clause could be allowed, with an Operation naming nothing. A prohibition
+   without type refuses every clause it lists. Otherwise a read is offered
+   when a permission applies (a read of a type no prohibition names is
+   narrowed, never refused, rules 2 and 4); a write when a permission
+   without information applies, or one naming a type no prohibition covers
+   (a conditional prohibition counts as covering its whole type); a
+   whole-Tenant clause is decided as a request. A call is still decided by
+   rules 1 to 7 (T-3784).
 
 ## 4. The access surface
 
 `ANTARES_API_SURFACES=...,access` mounts `/x/views/{view}/access`, built
 with `jc-policy` and `views` (the platform image's `full,jc-policy`; plan
 section 5.6). It answers "what may I do through this
-view" from the same compiled table the engine decides with, so the
+view" from the same compiled table the engine decides with, narrowed to
+the view's policies when `views` lists it, so the
 description and the enforcement cannot drift (platform EP-60). The view
 names the Tenant; an unknown view is 404, the same as on every view
 surface.
@@ -133,6 +165,7 @@ surface.
 |---|---|
 | `GET access` | the caller's grants; the representation the `Accept` header names first, `application/json` otherwise (never 406) |
 | `POST access/check` | AuthZEN: `{"action": {"name": …}, "resource": {"type": …}}` → `{"decision": true, "context": {"reason": "policy_grant_matched", "assigner": …}}` or `{"decision": false}` |
+| `POST access/explain` | the same request and decision, with why: `context.reason` is `policy_grant_matched`, `prohibited` or `no_grant`, and `context.policy` (with its `assigner`) names the policy that decided, a refusal's too |
 
 | `Accept` | Representation |
 |---|---|
@@ -151,5 +184,15 @@ share with the lists. A policy without `information` shows the type `*`.
 What the caller holds and nothing else: only policies whose assignee is the
 caller and that are in force now; a type only somebody else may touch is
 absent, never listed as denied; a refusal of `access/check` names nothing
-(GW6). A request with no `x-jc-*` header is the cluster's own and holds no
+(GW6).
+
+`access/explain` is the platform's access simulator (EP-103, platform
+T-3881): the gateway asks it with the `x-jc-*` headers of the subject an
+administrator named, on its Portal-only `access/simulate` route, and passes
+the answer to the Portal. Its reader may read every policy, so a refusal
+names the prohibition that decided it. No gateway route forwards a caller's
+request to it, and the broker is reached through the gateway alone (the
+NetworkPolicy admits the gateway and the Portal), so a data caller never
+sees it. It decides exactly as `access/check` does: one function gives both
+their verdict. A request with no `x-jc-*` header is the cluster's own and holds no
 policy, so its document is empty.

@@ -744,7 +744,7 @@ async fn read_body_capped(resp: reqwest::Response) -> Value {
         loop {
             match resp.chunk().await {
                 Ok(Some(c)) => {
-                    if buf.len() + c.len() > cap {
+                    if buf.len().saturating_add(c.len()) > cap {
                         tracing::warn!("federation response over the {cap}-byte cap, skipped");
                         return Value::Null;
                     }
@@ -807,16 +807,13 @@ where
 /// segment stops at the next `/`, so `/attrs/{name}/value` and
 /// `/attrs/{name}/{instanceId}` both name `{name}` and nothing more.
 fn path_attr_segment(url: &str) -> Option<(std::ops::Range<usize>, String)> {
-    let path_end = url.find('?').unwrap_or(url.len());
-    let at = url[..path_end].find("/attrs/")? + "/attrs/".len();
-    let rest = &url[at..path_end];
-    let end = at + rest.find('/').unwrap_or(rest.len());
-    (end > at).then(|| {
-        (
-            at..end,
-            crate::negotiate::percent_decode(&url.as_bytes()[at..end]),
-        )
-    })
+    let path = url.split_once('?').map_or(url, |(path, _)| path);
+    let (before, rest) = path.split_once("/attrs/")?;
+    let name = rest.split_once('/').map_or(rest, |(name, _)| name);
+    // `before` and "/attrs/" are a prefix of `url`, so the range lies inside it
+    let at = before.len().checked_add("/attrs/".len())?;
+    let end = at.checked_add(name.len())?;
+    (!name.is_empty()).then(|| (at..end, crate::negotiate::percent_decode(name.as_bytes())))
 }
 
 /// Table 5.2.9-2 and 5.2.34: one forward's outcome, booked on the
@@ -872,6 +869,44 @@ pub trait ForwardTransport: Send + Sync {
     /// answer as they do over HTTP; the egress guard and the breaker do
     /// not, since no socket is opened.
     fn forward<'a>(&'a self, req: BuiltForward<'a>) -> Option<ForwardFuture<'a>>;
+
+    /// Whether Tenant `source` may store a registration whose forwards go
+    /// to `endpoint` in Tenant `target` (`None`: the default Tenant), asked
+    /// at 12.2.2 and 12.2.4 before anything is stored (ADR-0025 rule 5).
+    /// `Ok` for an endpoint this transport does not serve: its forwards go
+    /// over HTTP, as before. `Err` carries the reason of the 403.
+    fn admit<'a>(
+        &'a self,
+        _source: &'a TenantId,
+        _endpoint: &'a str,
+        _target: Option<&'a str>,
+    ) -> AdmitFuture<'a> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+/// What [`ForwardTransport::admit`] answers.
+pub type AdmitFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+
+/// The registered transport's [`ForwardTransport::admit`] for the
+/// registration document `doc` of `tenant`; `Ok` without a transport.
+pub(crate) async fn admit_registration(
+    st: &AppState,
+    tenant: &TenantId,
+    doc: &serde_json::Map<String, Value>,
+) -> Result<(), crate::policy::Denied> {
+    let (Some(transport), Some(endpoint)) = (
+        st.forward_transport.get(),
+        doc.get("endpoint").and_then(Value::as_str),
+    ) else {
+        return Ok(());
+    };
+    let target = doc.get("tenant").and_then(Value::as_str);
+    transport
+        .admit(tenant, endpoint, target)
+        .await
+        .map_err(crate::policy::Denied)
 }
 
 /// The request `federation::forward` built, as the HTTP client would send it: a
@@ -943,6 +978,13 @@ impl BuiltForward<'_> {
         &self.reg.reg_id
     }
 
+    /// Whether the registration is the `exclusive` or `redirect` kind
+    /// (9.3.3), whose single failure is the operation's answer (6.3.17).
+    #[must_use]
+    pub fn proxied(&self) -> bool {
+        self.reg.is_proxy()
+    }
+
     /// The registration's 5.2.9 `tenant`: the Tenant the forward targets,
     /// `None` for the default Tenant (4.14).
     #[must_use]
@@ -971,7 +1013,7 @@ fn in_cooldown(st: &AppState, tenant: &TenantId, reg: &FedReg) -> bool {
 
 /// 5.2.34 timeout: the per-registration budget, below the 8 s ceiling.
 fn deadline_ms(reg: &FedReg) -> u32 {
-    let ceiling = 8_000 * crate::state::slow_factor();
+    let ceiling = crate::state::slow_factor().saturating_mul(8_000);
     reg.timeout_ms.map_or(ceiling, |t| t.min(ceiling)) as u32
 }
 
@@ -2649,7 +2691,9 @@ pub fn combine(parts: Vec<Part>, ok: Response, tenant: &TenantId) -> Response {
         return ok;
     }
     if parts.len() == 1 {
-        let p = &parts[0];
+        let Some(p) = parts.first() else {
+            return ok;
+        };
         let status = StatusCode::from_u16(p.status).unwrap_or(StatusCode::BAD_GATEWAY);
         let (etype, title) = match p.status {
             // 5.6.1.4/5.6.2…: an unsupported-operation part is the Conflict
