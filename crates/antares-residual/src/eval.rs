@@ -535,6 +535,16 @@ fn call(func: Func, args: Vec<Option<Val<'_>>>) -> Option<Val<'_>> {
         Func::Div => arith(one, two, Some(i64::checked_div), |x, y| x / y),
         Func::DivBy => arith(one, two, None, |x, y| x / y),
         Func::Mod => arith(one, two, Some(i64::checked_rem), |x, y| x % y),
+        Func::Pow => match (one?, two?) {
+            (Val::Int(base), Val::Int(exp)) if *exp >= 0 => u32::try_from(*exp)
+                .ok()
+                .and_then(|exp| base.checked_pow(exp))
+                .map(Val::Int),
+            (base, exp) => {
+                let result = number(base)?.powf(number(exp)?);
+                result.is_finite().then_some(Val::Num(result))
+            }
+        },
         Func::Neg => match one? {
             Val::Int(i) => i.checked_neg().map(Val::Int),
             Val::Num(n) => Some(Val::Num(-n)),

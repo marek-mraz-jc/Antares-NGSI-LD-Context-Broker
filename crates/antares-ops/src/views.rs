@@ -636,6 +636,9 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
     let sweeping = reloader.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(retention::SWEEP_EVERY);
+        // The first sweep a minute after start, not at once: an immediate one
+        // scheduled late would race the first writes (and the tests' own sweeps).
+        tick.reset();
         // A sweep that outlasts its minute waits for the next one instead of
         // the missed ticks firing back to back (T-4084).
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

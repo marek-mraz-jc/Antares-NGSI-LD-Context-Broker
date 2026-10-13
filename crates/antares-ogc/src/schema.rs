@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! `/collections/{c}/schema` and `/collections/{c}/sortables` (mapping rows S1 to S3, S5,
+//! `/collections/{c}/schema`, `/collections/{c}/sortables` and `/collections/{c}/queryables`
+//! (mapping rows S1 to S3, S5, F1,
 //! OGC 23-058r1 Part 5): JSON Schema 2020-12 of the Features a collection serves, from the
 //! Tenant's `LinkML` schema intersected with what the view shows, so no hidden Attribute is
 //! named.
@@ -13,6 +14,11 @@ const DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
 /// The schema of `c` served at `id`: its `id`, its geometry and every property the view shows
 /// (`sortables`: only those `sortby` may name), in Feature order (`x-ogc-propertySeq`).
 pub(crate) fn document(c: &Collection, id: &str, sortables: bool) -> Value {
+    Value::Object(members(c, id, sortables))
+}
+
+/// The members of [`document`].
+fn members(c: &Collection, id: &str, sortables: bool) -> Map<String, Value> {
     let identity = fields([
         ("title", Some("id".into())),
         ("type", Some("string".into())),
@@ -43,14 +49,22 @@ pub(crate) fn document(c: &Collection, id: &str, sortables: bool) -> Value {
             (name, Value::Object(schema))
         })
         .collect();
-    Value::Object(fields([
+    fields([
         ("$schema", Some(DIALECT.into())),
         ("$id", Some(id.into())),
         ("type", Some("object".into())),
         ("title", Some(c.id.as_str().into())),
         ("description", c.description.as_deref().map(Value::from)),
         ("properties", Some(Value::Object(properties))),
-    ]))
+    ])
+}
+
+/// The queryables of `c` served at `id` (Part 3 `queryables`, F1): the properties of its schema,
+/// and no other (`additionalProperties: false`), so a filter names only what the view shows.
+pub(crate) fn queryables(c: &Collection, id: &str) -> Value {
+    let mut doc = members(c, id, false);
+    doc.insert("additionalProperties".into(), Value::Bool(false));
+    Value::Object(doc)
 }
 
 /// The members that are present, in order.

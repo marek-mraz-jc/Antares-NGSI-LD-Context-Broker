@@ -963,7 +963,8 @@ impl WriteGuard {
     /// Every Relationship target an expanded fragment writes must be an
     /// Entity this view shows; an absent target answers as a hidden one.
     /// A view that selects every Entity hides none, so an absent target
-    /// tells nothing and is written as at the root (T-3786).
+    /// tells nothing and is written as at the root (T-3786). The targets are
+    /// read together, in one transaction on Postgres (T-4085).
     pub(crate) async fn targets(
         &self,
         st: &crate::state::AppState,
@@ -973,18 +974,35 @@ impl WriteGuard {
         if self.sel.selects_every() {
             return Ok(());
         }
-        for target in relationship_targets(fragment) {
-            let doc = st
-                .store
-                .get(tenant, antares_store::Kind::Entity, target)
-                .await
-                .ok()
-                .flatten();
-            if !doc.is_some_and(|d| self.sees(&d)) {
-                return Err(Denied(TARGET_NOT_SHOWN.to_owned()));
-            }
+        let targets = relationship_targets(fragment);
+        if targets.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        // A store failure reads as absent, as a failed single read did.
+        let found = st
+            .store
+            .get_entities(tenant, &targets)
+            .await
+            .unwrap_or_default();
+        self.targets_in(fragment, &found)
+    }
+
+    /// [`Self::targets`] against Entities already read: `found` holds every
+    /// target that exists, keyed by id.
+    pub(crate) fn targets_in(
+        &self,
+        fragment: &serde_json::Value,
+        found: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<(), Denied> {
+        if self.sel.selects_every()
+            || relationship_targets(fragment)
+                .iter()
+                .all(|t| found.get(*t).is_some_and(|d| self.sees(d)))
+        {
+            Ok(())
+        } else {
+            Err(Denied(TARGET_NOT_SHOWN.to_owned()))
+        }
     }
 }
 
@@ -1007,7 +1025,7 @@ pub(crate) async fn admits_new(
 
 /// The ids every Relationship and ListRelationship instance of an expanded
 /// Entity or fragment points at.
-fn relationship_targets(doc: &serde_json::Value) -> Vec<&str> {
+pub(crate) fn relationship_targets(doc: &serde_json::Value) -> Vec<&str> {
     let instances = doc
         .as_object()
         .into_iter()

@@ -106,7 +106,9 @@ async fn unknown_and_invalid_parameters_are_400() -> Result<(), String> {
         format!("{ROOT}/collections?limit=1"),
         format!("{ROOT}/collections/Car?bbox=0,0,1,1"),
         format!("{ROOT}/collections/Car/items/urn:ngsi-ld:Car:1?limit=1"),
-        format!("{ROOT}/collections/Car/items?speed=10"),
+        // `speed=10` is a queryable parameter (Part 3, T-3745); an unknown name is not.
+        format!("{ROOT}/collections/Car/items?wheels=10"),
+        format!("{ROOT}/collections/Car/items?speed=fast"),
         format!("{ROOT}/collections/Car/items?crs=http://www.opengis.net/def/crs/EPSG/0/4326"),
         format!("{ROOT}/collections/Car/items?limit=0"),
         format!("{ROOT}/collections/Car/items?limit=10001"),

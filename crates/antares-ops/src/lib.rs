@@ -785,10 +785,25 @@ pub trait Surface: Send + Sync + 'static {
 /// ```
 #[must_use]
 pub fn core_name(iri: &str) -> String {
-    static CORE: std::sync::LazyLock<antares_jsonld::Context> =
-        std::sync::LazyLock::new(antares_jsonld::core_context);
     CORE.compact_iri(iri)
 }
+
+/// Whether the core @context defines the term `name` (its keyword aliases `id` and `type`
+/// included), which a surface's own @context must not define again.
+///
+/// ```
+/// assert!(antares_ops::is_core_term("location"));
+/// assert!(antares_ops::is_core_term("value"));
+/// assert!(!antares_ops::is_core_term("speed"));
+/// ```
+#[must_use]
+pub fn is_core_term(name: &str) -> bool {
+    CORE.term(name).is_some()
+}
+
+/// The core @context, read once.
+static CORE: std::sync::LazyLock<antares_jsonld::Context> =
+    std::sync::LazyLock::new(antares_jsonld::core_context);
 
 /// `surface` as the broker mounts it.
 ///
@@ -1272,6 +1287,20 @@ pub mod test_kit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_terms_are_the_core_contexts_own() {
+        for term in ["id", "type", "value", "location", "observedAt"] {
+            assert!(is_core_term(term), "{term}");
+        }
+        for name in ["speed", "p0", "Location"] {
+            assert!(!is_core_term(name), "{name}");
+        }
+        assert_eq!(
+            core_name("https://uri.etsi.org/ngsi-ld/location"),
+            "location"
+        );
+    }
 
     /// Only the NGSI-LD API's own 504 `LdContextNotAvailable` reaches a
     /// surface as such; a forward's 504, another status or a body that is
