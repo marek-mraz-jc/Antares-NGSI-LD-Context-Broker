@@ -254,6 +254,24 @@ struct TenantIndex {
     by_type: std::collections::HashMap<String, std::collections::HashSet<String>>,
     by_attr: std::collections::HashMap<String, std::collections::HashSet<String>>,
     broad: std::collections::HashSet<String>,
+    /// The [`tick`] each subscription first entered the mirror at; a later
+    /// write keeps it, so a PATCH does not make a subscription new again.
+    born: std::collections::HashMap<String, u64>,
+}
+
+/// One clock for both sides of a match: a change takes a tick when it is
+/// queued for matching, a subscription when it enters the mirror. A change
+/// queued before a subscription existed never reaches it, however late the
+/// matcher drains the queue (NGSI-LD notifies changes made after the
+/// subscription; ADR-0023 rule 9). Process-wide, which is the scope of the
+/// local bus.
+static CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The next instant of [`CLOCK`]; never 0, never repeated.
+pub(crate) fn tick() -> u64 {
+    CLOCK
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        .saturating_add(1)
 }
 
 /// Which index bucket(s) one stored subscription doc belongs in.
@@ -305,6 +323,7 @@ impl SubMirror {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let t = map.entry(tenant.to_owned()).or_default();
+        let born = t.born.remove(id);
         if let Some(old) = t.docs.remove(id) {
             match index_keys(&old) {
                 Keys::Types(ts) => {
@@ -356,6 +375,7 @@ impl SubMirror {
                 }
             }
             t.docs.insert(id.to_owned(), std::sync::Arc::new(d));
+            t.born.insert(id.to_owned(), born.unwrap_or_else(tick));
         }
         if map.get(tenant).is_some_and(|t| t.docs.is_empty()) {
             map.remove(tenant);
@@ -381,6 +401,18 @@ impl SubMirror {
         types: &[&str],
         changed_attrs: &[&str],
     ) -> Vec<std::sync::Arc<Value>> {
+        self.candidates_before(tenant, types, changed_attrs, u64::MAX)
+    }
+
+    /// [`SubMirror::candidates`] of a change queued at `queued` (a [`tick`]):
+    /// only the subscriptions that were in the mirror before it.
+    pub fn candidates_before(
+        &self,
+        tenant: &str,
+        types: &[&str],
+        changed_attrs: &[&str],
+        queued: u64,
+    ) -> Vec<std::sync::Arc<Value>> {
         let map = self
             .map
             .read()
@@ -400,6 +432,7 @@ impl SubMirror {
             }
         }
         ids.iter()
+            .filter(|id| t.born.get(**id).is_some_and(|b| *b < queued))
             .filter_map(|id| t.docs.get(*id).cloned())
             .collect()
     }
@@ -543,5 +576,44 @@ impl DocMirror {
             .keys()
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod born {
+    use super::{tick, SubMirror};
+    use serde_json::json;
+
+    fn ids(m: &SubMirror, queued: u64) -> Vec<String> {
+        let mut out: Vec<String> = m
+            .candidates_before("t", &["Car"], &[], queued)
+            .iter()
+            .filter_map(|d| d["id"].as_str().map(str::to_owned))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// T-4083: a change queued before a subscription entered the mirror is
+    /// not matched to it, however late it is drained; one queued after is.
+    #[test]
+    fn a_change_reaches_only_the_subscriptions_made_before_it() {
+        let m = SubMirror::default();
+        let sub = |id: &str| json!({"id": id, "entities": [{"type": "Car"}]});
+        m.apply("t", "s:old", Some(sub("s:old")));
+        let written = tick();
+        m.apply("t", "s:new", Some(sub("s:new")));
+        let later = tick();
+        assert_eq!(ids(&m, written), ["s:old"]);
+        assert_eq!(ids(&m, later), ["s:new", "s:old"]);
+        // a PATCH of the old one does not make it new again
+        m.apply("t", "s:old", Some(sub("s:old")));
+        assert_eq!(ids(&m, written), ["s:old"]);
+        // a deleted and recreated one is new
+        m.apply("t", "s:old", None);
+        m.apply("t", "s:old", Some(sub("s:old")));
+        assert_eq!(ids(&m, later), ["s:new"]);
+        // the unstamped path sees every subscription
+        assert_eq!(m.candidates("t", &["Car"], &[]).len(), 2);
     }
 }

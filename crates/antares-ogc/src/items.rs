@@ -3,11 +3,14 @@
 //! the query parameters, the Query Entities requests they become, and the Features of the
 //! answers.
 
+use crate::filter::Lowered;
 use crate::model::{Collection, Time};
 use crate::Problem;
-use antares_ops::{Caller, OperationId, OpsRequest, ViewOps};
-use axum::http::{Method, StatusCode};
+use antares_ops::residual::{self, Expr, Lit, Path, Spatial};
+use antares_ops::{Caller, Pushdown, Refusal, Scanned, ViewOps};
+use axum::http::StatusCode;
 use serde_json::{json, Map, Value};
+use std::fmt::Write as _;
 
 /// Features per page when the request names no `limit` (Part 1 `fc-limit-definition`).
 pub(crate) const DEFAULT_LIMIT: u64 = 10;
@@ -31,7 +34,24 @@ pub(crate) struct Params {
     pub profile: Profile,
     /// `crs` (R2): the CRS the answer's coordinates are in, CRS84 by default.
     pub crs: &'static str,
+    /// The NGSI-LD options beside the standard's own (ADR-0028 rule 6), by name without the
+    /// prefix, values verbatim.
+    pub ngsild: Vec<(&'static str, String)>,
+    /// `filter` and the queryables named as parameters (F1, F2), names checked.
+    pub filter: Option<ogc_cql2::Expr>,
 }
+
+/// The `ngsild.` options a collection's `items` declares (ADR-0028 rule 6): each narrows.
+pub(crate) const NGSILD: [&str; 8] = [
+    "q",
+    "scopeQ",
+    "georel",
+    "geometry",
+    "coordinates",
+    "geoproperty",
+    "pick",
+    "omit",
+];
 
 /// How a Feature writes a Relationship to a collection the view shows (Part 5
 /// `profiles-for-feature-references`); one to a class the view does not show stays its URN.
@@ -132,6 +152,7 @@ pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Param
         ..Params::default()
     };
     let mut seen: Vec<&str> = Vec::new();
+    let mut raw = crate::filter::Raw::default();
     for (name, value) in pairs {
         if seen.contains(&name.as_str()) {
             return Err(bad("a query parameter is repeated"));
@@ -156,10 +177,45 @@ pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Param
             "sortby" => p.sortby = sortby(c, value).ok_or_else(|| bad("sortby names properties of the collection's sortables, each [+|-]name"))?,
             "properties" => p.properties = Some(properties(c, value).ok_or_else(|| bad("properties names properties of the collection's schema"))?),
             "profile" => p.profile = profile(value).ok_or_else(|| bad("profile is one of rel-as-key, rel-as-uri and rel-as-link"))?,
-            _ => return Err(bad("the request names a query parameter this resource does not define")),
+            "filter" => raw.filter = Some(value.clone()),
+            "filter-lang" => raw.lang = Some(value.clone()),
+            "filter-crs" => raw.crs = Some(value.clone()),
+            other => match other.strip_prefix("ngsild.").and_then(|o| NGSILD.iter().find(|n| **n == o)) {
+                Some(option) => p.ngsild.push((option, value.clone())),
+                None if crate::filter::is_parameter(c, other) => raw.equals.push((other.to_owned(), value.clone())),
+                None => return Err(bad("the request names a query parameter this resource does not define")),
+            },
         }
     }
+    if p.option("pick").is_some() && p.option("omit").is_some() {
+        return Err(bad(
+            "ngsild.pick and ngsild.omit both select the properties; name one",
+        ));
+    }
+    p.filter = crate::filter::read(c, &raw)?;
+    if p.properties.is_some() && p.option("pick").is_some() {
+        return Err(bad(
+            "properties and ngsild.pick both select the properties; name one",
+        ));
+    }
     Ok(p)
+}
+
+impl Params {
+    /// The value of the `ngsild.` option `name`.
+    fn option(&self, name: &str) -> Option<&str> {
+        self.ngsild
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Whether an `ngsild.geo*` option holds the request's one geo query.
+    fn ngsild_geo(&self) -> bool {
+        self.ngsild
+            .iter()
+            .any(|(n, _)| n.starts_with("geo") || *n == "coordinates")
+    }
 }
 
 /// `minx,miny,maxx,maxy` or `minx,miny,minz,maxx,maxy,maxz` in CRS84; heights are dropped.
@@ -168,7 +224,13 @@ fn bbox(text: &str) -> Option<[f64; 4]> {
         .split(',')
         .map(|v| v.trim().parse().ok().filter(|v: &f64| v.is_finite()))
         .collect::<Option<_>>()?;
-    let [west, south, east, north] = match numbers.as_slice() {
+    corners(&numbers)
+}
+
+/// The corners of a CRS84 box of 4 or 6 numbers (a CQL2 `BBOX` too); heights are dropped, and a
+/// number that is not finite is out of range.
+pub(crate) fn corners(numbers: &[f64]) -> Option<[f64; 4]> {
+    let [west, south, east, north] = match numbers {
         [west, south, east, north] => [*west, *south, *east, *north],
         [west, south, low, east, north, high] if low <= high => [*west, *south, *east, *north],
         _ => return None,
@@ -256,7 +318,9 @@ pub(crate) fn encode(raw: &str) -> String {
 }
 
 /// The terms one collection's requests use: core-context names as they are, every other
-/// Attribute `p{n}` in the request's own `@context`, so the answer's keys are known.
+/// Attribute by its property name in the request's own `@context` (so an `ngsild.` option
+/// names it as `properties` does), or `p{n}` when that name is no NGSI-LD term or the core
+/// context already defines it; the answer's keys are then known.
 pub(crate) struct Terms {
     context: Map<String, Value>,
     by_iri: Vec<(String, String)>,
@@ -268,10 +332,29 @@ impl Terms {
             context: Map::new(),
             by_iri: Vec::new(),
         };
-        for iri in c.geometry.iter().chain(c.properties.iter().map(|p| &p.iri)) {
+        let span = c.properties.len().saturating_add(1);
+        let named = c
+            .geometry
+            .iter()
+            .map(|g| (g, None))
+            .chain(c.properties.iter().map(|p| (&p.iri, Some(p.name.as_str()))));
+        for (iri, name) in named {
             let core = antares_ops::core_name(iri);
             let term = if core == *iri {
-                let term = format!("p{}", t.context.len());
+                let free = |term: &str| {
+                    is_term(term)
+                        && !antares_ops::is_core_term(term)
+                        && !t.context.contains_key(term)
+                };
+                let term = match name.filter(|n| free(n)) {
+                    Some(name) => name.to_owned(),
+                    // Each Attribute takes one name, so among as many `p{n}` past the
+                    // terms so far as there are Attributes, one is free.
+                    None => (t.context.len()..=t.context.len().saturating_add(span))
+                        .map(|n| format!("p{n}"))
+                        .find(|term| free(term))
+                        .unwrap_or_default(),
+                };
                 t.context.insert(term.clone(), Value::from(iri.as_str()));
                 term
             } else {
@@ -290,14 +373,19 @@ impl Terms {
             .map_or(iri, |(_, t)| t.as_str())
     }
 
-    fn request(&self, target: String) -> OpsRequest {
-        let req = OpsRequest::new(Method::GET, target);
-        if self.context.is_empty() {
-            req
-        } else {
-            req.context(Value::Object(self.context.clone()))
-        }
+    /// The request's own `@context`, none when every term is the core context's.
+    fn context(&self) -> Option<Value> {
+        (!self.context.is_empty()).then(|| Value::Object(self.context.clone()))
     }
+}
+
+/// An Attribute name the NGSI-LD query grammar reads as one: a letter, then letters, digits
+/// and `_` (TS 104 176 7.2.3.1 `attrName`, without the `%` escapes no slot name needs).
+fn is_term(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && name.len() <= 256
 }
 
 /// The `q` the `datetime` parameter adds (C13, C14): the temporal geometry intersects the
@@ -342,29 +430,41 @@ fn time_q(
     (!parts.is_empty()).then(|| parts.join(";"))
 }
 
-/// The `orderBy` (S5) and `pick` (S6) a request adds; `pick` keeps `id`, `type` and the
-/// geometry, which every Feature carries.
-fn shape(c: &Collection, terms: &Terms, p: &Params) -> String {
-    let order: Vec<String> = p
-        .sortby
+/// The `orderBy` keys of `sortby` (S5).
+fn order(terms: &Terms, p: &Params) -> Vec<String> {
+    p.sortby
         .iter()
         .map(|(iri, desc)| format!("{};{}", terms.term(iri), if *desc { "desc" } else { "asc" }))
-        .collect();
-    let order = (!order.is_empty()).then(|| format!("&orderBy={}", encode(&order.join(","))));
+        .collect()
+}
+
+/// The `pick` of `properties` (S6) or `ngsild.pick`, and `ngsild.omit`; the `pick` of
+/// `properties` keeps `id`, `type` and the geometry, which every Feature carries, less what
+/// `ngsild.omit` names, as the broker takes no `omit` beside a `pick`.
+fn shape(c: &Collection, terms: &Terms, p: &Params) -> String {
+    let omitted: Vec<&str> = p
+        .option("omit")
+        .map_or_else(Vec::new, |o| o.split(',').collect());
     let pick = p.properties.as_ref().map(|keep| {
         let names: Vec<&str> = ["id", "type"]
             .into_iter()
             .chain(c.geometry.iter().map(|g| terms.term(g)))
             .chain(keep.iter().map(|iri| terms.term(iri)))
+            .filter(|name| !omitted.contains(name))
             .collect();
         format!("&pick={}", encode(&names.join(",")))
     });
-    order.into_iter().chain(pick).collect()
+    let omit = if pick.is_some() { None } else { Some("omit") };
+    let options = ["pick", "scopeQ"]
+        .into_iter()
+        .chain(omit)
+        .filter_map(|name| p.option(name).map(|v| format!("&{name}={}", encode(v))));
+    pick.into_iter().chain(options).collect()
 }
 
 /// The polygon(s) of a CRS84 box; one that crosses the antimeridian (its west edge east of
 /// its east edge) is two.
-fn bbox_geometry([west, south, east, north]: [f64; 4]) -> (&'static str, String) {
+pub(crate) fn bbox_geometry([west, south, east, north]: [f64; 4]) -> (&'static str, Value) {
     let ring = |from: f64, to: f64| {
         json!([[
             [from, south],
@@ -375,50 +475,170 @@ fn bbox_geometry([west, south, east, north]: [f64; 4]) -> (&'static str, String)
         ]])
     };
     if west <= east {
-        ("Polygon", ring(west, east).to_string())
+        ("Polygon", ring(west, east))
     } else {
         (
             "MultiPolygon",
-            json!([ring(west, 180.0), ring(-180.0, east)]).to_string(),
+            json!([ring(west, 180.0), ring(-180.0, east)]),
         )
     }
 }
 
-/// The Query Entities requests of one `items` request: one, or two when `bbox` must also
-/// keep the Features without a geometry (C12). Disjoint, served in this order.
-pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params) -> Vec<String> {
-    let base = format!(
-        "/ngsi-ld/v1/entities?type={}&format=simplified&count=true{}",
-        encode(&c.type_iri),
+/// One Query Entities an `items` request reads: the store's pushdown and the residual the
+/// scan evaluates over its answer (ADR-0028): the filter's conjuncts NGSI-LD cannot say, and
+/// the `bbox` when an `ngsild.geo*` option or the filter holds the request's one geo query.
+pub(crate) struct Part {
+    pub query: String,
+    pub residual: Option<Expr>,
+}
+
+/// The conjunction of residual conjuncts, none when there are none.
+fn conjunction(mut all: Vec<Expr>) -> Option<Expr> {
+    match all.len() {
+        0 => None,
+        1 => all.pop(),
+        _ => Some(Expr::And(all)),
+    }
+}
+
+/// The Query Entities of one `items` request: one, or two when `bbox` must also keep the
+/// Features without a geometry (C12). Disjoint, served in this order. `ngsild.q` and the
+/// filter's `q` join the request's own `q` with `;`, the other `ngsild.` options are pushed as
+/// they are. A part with a residual selects by [`attrs`], not by `pick`/`omit`, so the scan reads
+/// what the residual needs and drops it again.
+pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params, f: &Lowered) -> Vec<Part> {
+    let bbox = p.bbox.zip(c.geometry.as_deref());
+    let residual = !f.residual.is_empty() || (bbox.is_some() && p.ngsild_geo());
+    let projection = if residual {
+        p.option("scopeQ")
+            .map(|v| format!("&scopeQ={}", encode(v)))
+            .unwrap_or_default()
+    } else {
         shape(c, terms, p)
-    );
+    };
+    let mut base = format!("type={}{projection}", encode(&c.type_iri));
+    if p.ngsild_geo() {
+        for name in ["georel", "geometry", "coordinates", "geoproperty"] {
+            if let Some(value) = p.option(name) {
+                let _ = write!(base, "&{name}={}", encode(value));
+            }
+        }
+    }
+    if let (Some(geo), Some(geometry)) = (&f.geo, c.geometry.as_deref()) {
+        let _ = write!(
+            base,
+            "&georel={}&geometry={}&coordinates={}&geoproperty={}",
+            geo.rel,
+            geo.geometry
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            encode(
+                &geo.geometry
+                    .get("coordinates")
+                    .map(Value::to_string)
+                    .unwrap_or_default()
+            ),
+            encode(geometry)
+        );
+    }
     let time = p
         .datetime
         .as_ref()
         .and_then(|d| time_q(c.time.as_ref(), terms, d));
+    let theirs = p.option("q").map(|q| format!("({q})"));
     let with_q = |extra: Option<String>| {
-        let q: Vec<String> = time.iter().cloned().chain(extra).collect();
+        let q: Vec<String> = time
+            .iter()
+            .cloned()
+            .chain(extra)
+            .chain(theirs.clone())
+            .chain(f.q.iter().map(|q| format!("({q})")))
+            .collect();
         if q.is_empty() {
             base.clone()
         } else {
             format!("{base}&q={}", encode(&q.join(";")))
         }
     };
-    match (p.bbox, c.geometry.as_deref()) {
-        (Some(bbox), Some(geometry)) => {
-            let (kind, coordinates) = bbox_geometry(bbox);
-            vec![
-                format!(
-                    "{}&georel=intersects&geometry={kind}&coordinates={}&geoproperty={}",
-                    with_q(None),
-                    encode(&coordinates),
-                    encode(geometry)
-                ),
-                with_q(Some(format!("!{}", terms.term(geometry)))),
-            ]
+    let filtered = |extra: Option<Expr>| {
+        conjunction(
+            extra
+                .into_iter()
+                .chain(f.residual.iter().cloned())
+                .collect(),
+        )
+    };
+    let Some((bbox, geometry)) = bbox else {
+        return vec![Part {
+            query: with_q(None),
+            residual: filtered(None),
+        }];
+    };
+    let (kind, coordinates) = bbox_geometry(bbox);
+    let located = if p.ngsild_geo() {
+        Part {
+            query: with_q(None),
+            residual: filtered(Some(Expr::Spatial(
+                Spatial::Intersects,
+                Box::new(Expr::Path(Path::value(terms.term(geometry)))),
+                Box::new(Expr::Lit(Lit::Geometry(
+                    json!({ "type": kind, "coordinates": coordinates }),
+                ))),
+            ))),
         }
-        _ => vec![with_q(None)],
-    }
+    } else {
+        Part {
+            query: format!(
+                "{}&georel=intersects&geometry={kind}&coordinates={}&geoproperty={}",
+                with_q(None),
+                encode(&coordinates.to_string()),
+                encode(geometry)
+            ),
+            residual: filtered(None),
+        }
+    };
+    vec![
+        located,
+        Part {
+            query: with_q(Some(format!("!{}", terms.term(geometry)))),
+            residual: filtered(None),
+        },
+    ]
+}
+
+/// The Attributes a part with a residual selects: `properties` (with the geometry), else
+/// `ngsild.pick`, else every Attribute of the collection but `ngsild.omit`; all when none.
+fn attrs(c: &Collection, terms: &Terms, p: &Params) -> Option<Vec<String>> {
+    let omitted: Vec<&str> = p
+        .option("omit")
+        .map_or_else(Vec::new, |o| o.split(',').collect());
+    let names: Vec<String> = if let Some(keep) = &p.properties {
+        c.geometry
+            .iter()
+            .chain(keep)
+            .map(|iri| terms.term(iri).to_owned())
+            .collect()
+    } else if let Some(pick) = p.option("pick") {
+        pick.split(',')
+            .filter(|n| !matches!(*n, "id" | "type"))
+            .map(str::to_owned)
+            .collect()
+    } else if omitted.is_empty() {
+        return None;
+    } else {
+        c.geometry
+            .iter()
+            .chain(c.properties.iter().map(|prop| &prop.iri))
+            .map(|iri| terms.term(iri).to_owned())
+            .collect()
+    };
+    Some(
+        names
+            .into_iter()
+            .filter(|n| !omitted.contains(&n.as_str()))
+            .collect(),
+    )
 }
 
 /// The token of the next page: the part and the offset in it, and a digest of the request
@@ -435,11 +655,11 @@ pub(crate) fn digest(view: &str, collection: &str, pairs: &[(String, String)]) -
     hasher.finish()
 }
 
-fn token(part: usize, offset: u64, digest: u64) -> String {
+fn token(part: usize, offset: usize, digest: u64) -> String {
     format!("{part}.{offset}.{digest:016x}")
 }
 
-fn read_token(text: &str, digest: u64, parts: usize) -> Option<(usize, u64)> {
+fn read_token(text: &str, digest: u64, parts: usize) -> Option<(usize, usize)> {
     let mut it = text.split('.');
     let (Some(part), Some(offset), Some(tag), None) = (it.next(), it.next(), it.next(), it.next())
     else {
@@ -450,96 +670,208 @@ fn read_token(text: &str, digest: u64, parts: usize) -> Option<(usize, u64)> {
     Some((part, offset.parse().ok()?))
 }
 
-/// One Query Entities run through the view: its Entities and its count.
-async fn query(
-    view: &ViewOps,
-    caller: &Caller,
-    terms: &Terms,
-    target: String,
-) -> Result<(Vec<Value>, u64), Problem> {
-    let refused = |status| Problem(status, "the view refused the query");
-    let answer = view
-        .run(OperationId::QueryEntities, caller, terms.request(target))
-        .await
-        .map_err(|r| refused(r.status()))?;
-    if answer.status() == StatusCode::NOT_FOUND {
-        // A Tenant that holds nothing yet answers 404 (5.5.10): an empty collection.
-        return Ok((Vec::new(), 0));
-    }
-    if !answer.status().is_success() {
-        return Err(refused(answer.status()));
-    }
-    let total = answer
-        .headers()
-        .get("NGSILD-Results-Count")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let bytes = view
-        .read_answer(answer.into_body())
-        .await
-        .map_err(|r| Problem(r.status(), antares_ops::bounds::ANSWER_TOO_LARGE))?;
-    let docs = serde_json::from_slice::<Vec<Value>>(&bytes).unwrap_or_default();
-    Ok((docs, total))
-}
-
 /// One page of Features (C8 to C18).
 pub(crate) struct Page {
     pub features: Vec<Value>,
-    pub matched: u64,
+    /// `numberMatched`: exact, or `None` when a residual's answer is larger than the budget
+    /// lets one request count (ADR-0028 rule 5).
+    pub matched: Option<u64>,
     pub next: Option<String>,
 }
 
+/// One page through [`ViewOps::scan`] (ADR-0028 rules 4 and 5): each part read from the
+/// token's upstream offset until the page holds `limit`, the `next` token the part and the
+/// upstream offset just past the last Feature served; a short page with `next` is a page.
 pub(crate) async fn page(
     view: &ViewOps,
     caller: &Caller,
     c: &Collection,
     p: &Params,
     digest: u64,
-    base: &str,
+    refs: Refs<'_>,
 ) -> Result<Page, Problem> {
-    let refs = Refs {
-        profile: p.profile,
-        base,
-    };
     let terms = Terms::of(c);
-    let targets = targets(c, &terms, p);
+    // One geoQ per request (4.10): the filter's spatial conjunct is pushed only when neither
+    // `bbox` nor an `ngsild.geo*` option holds it.
+    let geo_free = !p.ngsild_geo() && (p.bbox.is_none() || c.geometry.is_none());
+    let lowered = match &p.filter {
+        Some(f) => crate::filter::lower(c, &terms, f, geo_free)?,
+        None => Lowered::default(),
+    };
+    let parts = targets(c, &terms, p, &lowered);
     let (start, offset) = match &p.next {
         None => (0, 0),
-        Some(t) => read_token(t, digest, targets.len())
+        Some(t) => read_token(t, digest, parts.len())
             .ok_or_else(|| bad("the next token does not belong to this request"))?,
     };
+    let limit = usize::try_from(p.limit).unwrap_or(usize::MAX);
     let mut out = Page {
         features: Vec::new(),
-        matched: 0,
+        matched: Some(0),
         next: None,
     };
-    for (part, target) in targets.into_iter().enumerate() {
-        let room = if part < start {
+    for (i, part) in parts.iter().enumerate() {
+        let residual = match &part.residual {
+            None => None,
+            Some(expr) => {
+                let now = now().ok_or(Problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the clock reads no time",
+                ))?;
+                Some(residual::compile(expr, now).map_err(|e| refused(&e))?)
+            }
+        };
+        let pushdown = Pushdown {
+            query: if residual.is_some() {
+                part.query.clone()
+            } else {
+                format!("{}&format=simplified", part.query)
+            },
+            order: order(&terms, p),
+            attrs: residual.as_ref().and_then(|_| attrs(c, &terms, p)),
+            sys_attrs: false,
+            context: terms.context(),
+        };
+        let at = if i == start { offset } else { 0 };
+        let room = if i < start {
             0
         } else {
-            p.limit
-                .saturating_sub(u64::try_from(out.features.len()).unwrap_or(u64::MAX))
+            limit.saturating_sub(out.features.len())
         };
-        let at = if part == start { offset } else { 0 };
-        let (docs, count) = query(
-            view,
-            caller,
-            &terms,
-            format!("{target}&limit={room}&offset={at}"),
-        )
-        .await?;
-        out.matched = out.matched.saturating_add(count);
-        let got = u64::try_from(docs.len()).unwrap_or(u64::MAX);
-        out.features.extend(
-            docs.iter()
-                .map(|d| Value::Object(feature(c, &terms, d, refs))),
-        );
-        if part >= start && out.next.is_none() && at.saturating_add(got) < count {
-            out.next = Some(token(part, at.saturating_add(got), digest));
+        let page = antares_ops::Page {
+            start: at,
+            size: room,
+            whole: residual.is_none(),
+        };
+        let (docs, next, count) =
+            scanned(view.scan(caller, &pushdown, residual.as_ref(), page).await)?;
+        let count = match (&residual, count) {
+            (None, count) => count,
+            // ponytail: the count reads the residual's answer again, within the budget; a
+            // count kept beside the cursor when one request reads both.
+            (Some(program), _) => {
+                let whole = antares_ops::Page {
+                    start: 0,
+                    size: 0,
+                    whole: true,
+                };
+                match view.scan(caller, &pushdown, Some(program), whole).await {
+                    Err(Refusal::TooManyResults { .. }) => None,
+                    answer => scanned(answer)?.2,
+                }
+            }
+        };
+        out.matched = out
+            .matched
+            .zip(count)
+            .map(|(m, n)| m.saturating_add(u64::try_from(n).unwrap_or(u64::MAX)));
+        let got = docs.len();
+        out.features.extend(docs.into_iter().map(|d| {
+            let d = if residual.is_some() { simplified(d) } else { d };
+            Value::Object(feature(c, &terms, &d, refs))
+        }));
+        if i < start || out.next.is_some() {
+            continue;
         }
+        // Without a residual the whole count says whether more remains past this page.
+        let next = match residual {
+            Some(_) => next,
+            None => count
+                .filter(|n| at.saturating_add(got) < *n)
+                .map(|_| at.saturating_add(got)),
+        };
+        // A part after the one that filled the page answers its whole count and, holding
+        // anything, starts the next page at its offset 0.
+        out.next = next.map(|next| token(i, next, digest));
     }
     Ok(out)
+}
+
+/// Why the residual refused the filter: too large (400), a construct it does not read with the
+/// standard's meaning (501), or one no filter of this collection can be (400).
+fn refused(e: &residual::Error) -> Problem {
+    match e {
+        residual::Error::TooComplex => bad(antares_ops::TOO_COMPLEX),
+        residual::Error::Unsupported(_) => Problem(
+            StatusCode::NOT_IMPLEMENTED,
+            "the filter uses a construct this endpoint does not evaluate (a LIKE pattern that is no literal, or a pattern construct)",
+        ),
+        residual::Error::Invalid(_) => bad("the filter is not valid: a LIKE pattern ending in its escape, or a geometry that is no GeoJSON geometry in CRS84"),
+    }
+}
+
+/// The time a residual's `now()` reads.
+fn now() -> Option<residual::DateTime> {
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_micros();
+    residual::DateTime::from_unix_micros(i64::try_from(micros).ok()?)
+}
+
+/// The Entities of a scan, its upstream continuation and its count.
+type Read = (Vec<Value>, Option<usize>, Option<usize>);
+
+/// The Entities of a scan, its upstream continuation and its count; a refused `ngsild.`
+/// option is the broker's own 400.
+fn scanned(answer: Result<Scanned, Refusal>) -> Result<Read, Problem> {
+    match answer {
+        Ok(Scanned::Page {
+            entities,
+            next,
+            count,
+        }) => Ok((entities, next, count)),
+        // A Tenant that holds nothing yet answers 404 (5.5.10): an empty collection.
+        Ok(Scanned::Answer(answer)) if answer.status() == StatusCode::NOT_FOUND => {
+            Ok((Vec::new(), None, Some(0)))
+        }
+        Ok(Scanned::Answer(answer)) if answer.status() == StatusCode::BAD_REQUEST => Err(bad(
+            "the query is not valid NGSI-LD; an ngsild. parameter takes NGSI-LD syntax",
+        )),
+        Ok(Scanned::Answer(answer)) => Err(Problem(answer.status(), "the view refused the query")),
+        Err(refused) => Err(Problem(refused.status(), "the view refused the query")),
+    }
+}
+
+/// A normalized Entity in the simplified form `feature` reads (TS 104 175 4.5.4): each
+/// Attribute its value, an Attribute of several instances the `dataset` map by `datasetId`
+/// (`@none` for the default one), as the broker writes it.
+fn simplified(mut doc: Value) -> Value {
+    let one = |attr: &Value| match attr {
+        Value::Object(m) => ["value", "object", "valueList", "objectList"]
+            .into_iter()
+            .find_map(|k| m.get(k).cloned())
+            .or_else(|| {
+                ["languageMap", "json", "vocab"]
+                    .into_iter()
+                    .find_map(|k| m.get(k).map(|v| json!({ k: v })))
+            })
+            .unwrap_or_else(|| attr.clone()),
+        other => other.clone(),
+    };
+    for (name, attr) in doc.as_object_mut().into_iter().flat_map(|m| m.iter_mut()) {
+        if matches!(name.as_str(), "id" | "type" | "scope" | "@context") {
+            continue;
+        }
+        let flat = match &*attr {
+            Value::Array(instances) => {
+                let dataset: Map<String, Value> = instances
+                    .iter()
+                    .map(|i| {
+                        let id = i
+                            .get("datasetId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("@none");
+                        (id.to_owned(), one(i))
+                    })
+                    .collect();
+                json!({ "dataset": dataset })
+            }
+            single => one(single),
+        };
+        *attr = flat;
+    }
+    doc
 }
 
 /// One Entity of `c` as a `GeoJSON` Feature (M2 to M5): `id` the URN, `geometry` the primary
@@ -570,15 +902,18 @@ pub(crate) fn feature(
             Some((p.name.clone(), value))
         })
         .collect();
-    Map::from_iter([
+    let id = doc.get("id").cloned().unwrap_or(Value::Null);
+    let links = id.as_str().map(|urn| refs.links(&c.id, urn));
+    let mut feature = Map::from_iter([
         ("type".to_owned(), json!("Feature")),
-        (
-            "id".to_owned(),
-            doc.get("id").cloned().unwrap_or(Value::Null),
-        ),
+        ("id".to_owned(), id),
         ("geometry".to_owned(), geometry),
         ("properties".to_owned(), Value::Object(properties)),
-    ])
+    ]);
+    if let Some(links) = links {
+        feature.insert("links".to_owned(), Value::from(links));
+    }
+    feature
 }
 
 /// How one request writes references (S7): the profile and the endpoint's URI.
@@ -586,9 +921,35 @@ pub(crate) fn feature(
 pub(crate) struct Refs<'a> {
     pub profile: Profile,
     pub base: &'a str,
+    /// Whether the view offers Retrieve Entity, so a Feature's canonical Entity answers (EP-38).
+    pub alternate: bool,
 }
 
 impl Refs<'_> {
+    /// EP-38: a Feature's `alternate` link to its Entity under the same view's NGSI-LD root,
+    /// when the view offers Retrieve Entity (never the Tenant's API, never a link to a 403), and
+    /// its `describedby` link to the collection's schema.
+    pub(crate) fn links(self, collection: &str, urn: &str) -> Vec<Value> {
+        let entity = self
+            .base
+            .strip_suffix("/ogc/features")
+            .filter(|_| self.alternate)
+            .map(|root| {
+                json!({
+                    "rel": "alternate",
+                    "type": "application/ld+json",
+                    "title": urn,
+                    "href": format!("{root}/ngsi-ld/v1/entities/{}", encode(urn)),
+                })
+            });
+        let schema = crate::link(
+            "describedby",
+            crate::SCHEMA,
+            &format!("{}/collections/{collection}/schema", self.base),
+        );
+        entity.into_iter().chain([schema]).collect()
+    }
+
     /// A reference to `urn` in the collection `target` the view shows, as `rel-as-uri` or
     /// `rel-as-link` write it (`rel-as-key` keeps the URN and never calls this).
     fn render(self, target: &str, urn: &str) -> Value {
@@ -622,14 +983,23 @@ pub(crate) async fn one(
     refs: Refs<'_>,
 ) -> Result<Map<String, Value>, Problem> {
     let terms = Terms::of(c);
-    let target = format!(
-        "/ngsi-ld/v1/entities?id={}&type={}&format=simplified{}",
-        encode(id),
-        encode(&c.type_iri),
-        shape(c, &terms, p)
-    );
-    match query(view, caller, &terms, target).await {
-        Ok((docs, _)) => docs.first().map(|d| feature(c, &terms, d, refs)),
+    let pushdown = Pushdown {
+        query: format!(
+            "id={}&type={}&format=simplified{}",
+            encode(id),
+            encode(&c.type_iri),
+            shape(c, &terms, p)
+        ),
+        context: terms.context(),
+        ..Pushdown::default()
+    };
+    let page = antares_ops::Page {
+        start: 0,
+        size: 1,
+        whole: false,
+    };
+    match scanned(view.scan(caller, &pushdown, None, page).await) {
+        Ok((docs, _, _)) => docs.first().map(|d| feature(c, &terms, d, refs)),
         Err(Problem(StatusCode::BAD_REQUEST, _)) => None,
         Err(refused) => return Err(refused),
     }
@@ -784,7 +1154,9 @@ mod tests {
         let (kind, coordinates) = bbox_geometry([170.0, -1.0, -170.0, 1.0]);
         assert_eq!(kind, "MultiPolygon");
         assert!(
-            coordinates.starts_with("[[[[170.0,-1.0],[180.0,-1.0]"),
+            coordinates
+                .to_string()
+                .starts_with("[[[[170.0,-1.0],[180.0,-1.0]"),
             "{coordinates}"
         );
     }
@@ -844,10 +1216,48 @@ mod tests {
     }
 
     #[test]
+    fn a_feature_links_its_entity_only_when_the_view_retrieves_it() {
+        let refs = |alternate| Refs {
+            profile: Profile::Key,
+            base: "http://h/x/views/city/ogc/features",
+            alternate,
+        };
+        let urn = "urn:ngsi-ld:Car:a#1";
+        assert_eq!(
+            refs(true).links("Car", urn),
+            [
+                json!({"rel": "alternate", "type": "application/ld+json", "title": urn,
+                       "href": "http://h/x/views/city/ngsi-ld/v1/entities/urn%3Angsi-ld%3ACar%3Aa%231"}),
+                json!({"rel": "describedby", "type": "application/schema+json",
+                       "href": "http://h/x/views/city/ogc/features/collections/Car/schema"}),
+            ]
+        );
+        let without = refs(false).links("Car", urn);
+        assert_eq!(without.len(), 1, "no Retrieve Entity, no alternate link");
+        assert_eq!(
+            without.first().and_then(|l| l.get("rel")),
+            Some(&json!("describedby"))
+        );
+        let terms = Terms::of(&car());
+        let nameless = feature(&car(), &terms, &json!({"type": "Car"}), refs(true));
+        assert_eq!(nameless.get("links"), None, "no id, nothing to link");
+        let elsewhere = Refs {
+            base: "http://h/other",
+            ..refs(true)
+        };
+        assert_eq!(
+            elsewhere.links("Car", urn).len(),
+            1,
+            "a base off the view has no entity root"
+        );
+    }
+
+    #[test]
     fn references_render_each_urn_of_an_object() {
         let refs = Refs {
             profile: Profile::Uri,
             base: "http://b",
+            alternate: false,
         };
         let render = |urn: &str| refs.render("Stop", urn);
         assert_eq!(
@@ -873,20 +1283,86 @@ mod tests {
             description: None,
             type_iri: "https://e.org/Car".into(),
             geometry: Some(crate::model::LOCATION.into()),
-            properties: vec![prop("speed", true)],
+            // A name the core context defines, one the query grammar cannot read, and a name
+            // another property's fallback term would take.
+            properties: vec![
+                prop("speed", true),
+                prop("value", false),
+                prop("max speed", false),
+                prop("p1", false),
+            ],
             time: None,
         };
         let t = Terms::of(&c);
         assert_eq!(t.term(crate::model::LOCATION), "location");
-        assert_eq!(t.term("https://e.org/speed"), "p0");
+        assert_eq!(t.term("https://e.org/speed"), "speed");
+        assert_eq!(t.term("https://e.org/value"), "p1");
+        assert_eq!(t.term("https://e.org/max speed"), "p2");
+        assert_eq!(t.term("https://e.org/p1"), "p3", "p1 is taken");
         assert_eq!(t.term("https://e.org/other"), "https://e.org/other");
-        assert_eq!(t.context.get("p0"), Some(&json!("https://e.org/speed")));
-        let _ = t.request("/ngsi-ld/v1/entities".into());
+        assert_eq!(t.context.get("speed"), Some(&json!("https://e.org/speed")));
+        assert_eq!(t.context.len(), 4);
+        let long = Terms::of(&Collection {
+            properties: vec![prop(&"x".repeat(257), false), prop("1st", false)],
+            ..c.clone()
+        });
+        assert_eq!(
+            long.term(&format!("https://e.org/{}", "x".repeat(257))),
+            "p0"
+        );
+        assert_eq!(long.term("https://e.org/1st"), "p1");
         let only_core = Terms::of(&Collection {
             properties: Vec::new(),
             ..c
         });
         assert!(only_core.context.is_empty());
-        let _ = only_core.request("/ngsi-ld/v1/entities".into());
+    }
+
+    #[test]
+    fn a_normalized_entity_reads_as_the_simplified_one() {
+        let doc = json!({
+            "id": "urn:ngsi-ld:Car:1", "type": "Car", "scope": ["/a"], "createdAt": "2026-01-01T00:00:00Z",
+            "speed": {"type": "Property", "value": 1},
+            "at": {"type": "Relationship", "object": "urn:ngsi-ld:Stop:1"},
+            "route": {"type": "ListProperty", "valueList": [1, 2]},
+            "stops": {"type": "ListRelationship", "objectList": [{"object": "urn:ngsi-ld:Stop:1"}]},
+            "name": {"type": "LanguageProperty", "languageMap": {"sk": "auto"}},
+            "raw": {"type": "JsonProperty", "json": {"a": 1}},
+            "kind": {"type": "VocabProperty", "vocab": "car"},
+            "odd": {"type": "Property"},
+            "seen": [
+                {"type": "Property", "value": "now"},
+                {"type": "Property", "value": "then", "datasetId": "urn:ngsi-ld:Dataset:old"}
+            ]
+        });
+        assert_eq!(
+            simplified(doc),
+            json!({
+                "id": "urn:ngsi-ld:Car:1", "type": "Car", "scope": ["/a"], "createdAt": "2026-01-01T00:00:00Z",
+                "speed": 1,
+                "at": "urn:ngsi-ld:Stop:1",
+                "route": [1, 2],
+                "stops": [{"object": "urn:ngsi-ld:Stop:1"}],
+                "name": {"languageMap": {"sk": "auto"}},
+                "raw": {"json": {"a": 1}},
+                "kind": {"vocab": "car"},
+                "odd": {"type": "Property"},
+                "seen": {"dataset": {"@none": "now", "urn:ngsi-ld:Dataset:old": "then"}}
+            })
+        );
+    }
+
+    #[test]
+    fn a_refused_residual_names_its_status() {
+        let status = |e| refused(&e).0;
+        assert_eq!(status(residual::Error::TooComplex), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status(residual::Error::Unsupported("x".into())),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            status(residual::Error::Invalid("x".into())),
+            StatusCode::BAD_REQUEST
+        );
     }
 }
