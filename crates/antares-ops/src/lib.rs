@@ -39,15 +39,16 @@ mod error;
 pub mod mapping;
 mod names;
 mod operation;
+pub mod percent;
 mod scan;
 pub mod views;
 
 /// The residual of a standard query (ADR-0028 rule 2), re-exported so a surface compiles into
 /// it through `antares-ops` alone (rule M2).
 pub use antares_residual as residual;
-pub use error::{Refusal, INNER_DETAIL};
+pub use error::{Refusal, CONTEXT_DETAIL, INNER_DETAIL};
 pub use operation::OperationId;
-pub use scan::{Page, Pushdown, Scanned, RESIDUAL_SCAN, TOO_COMPLEX};
+pub use scan::{pickable, Page, Pushdown, Scanned, RESIDUAL_SCAN, TOO_COMPLEX};
 
 use antares_api::AppState;
 use axum::body::Body;
@@ -493,19 +494,45 @@ impl Ops {
                 );
             }
         }
-        if !answer.status().is_server_error() {
-            return Ok(answer);
-        }
-        if answer.status() == StatusCode::SERVICE_UNAVAILABLE {
-            return Err(Refusal::Overloaded {
-                retry_after: answer
-                    .headers()
-                    .get(axum::http::header::RETRY_AFTER)
-                    .cloned(),
-            });
-        }
-        Err(inner_failure(op, answer).await)
+        answered(op, answer).await
     }
+}
+
+/// The API's answer as a surface gets it: a 5xx becomes a [`Refusal`], and
+/// only 503 and the API's own 504 `LdContextNotAvailable` keep their status.
+async fn answered(op: OperationId, answer: Response) -> Result<Response, Refusal> {
+    if !answer.status().is_server_error() {
+        return Ok(answer);
+    }
+    if answer.status() == StatusCode::SERVICE_UNAVAILABLE {
+        return Err(Refusal::Overloaded {
+            retry_after: answer
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .cloned(),
+        });
+    }
+    let status = answer.status();
+    let detail = axum::body::to_bytes(answer.into_body(), LOGGED_DETAIL_BYTES)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    // 6.3.2: a remote @context the caller named is the caller's to know
+    // about; a forward that timed out (also 504) stays an inner failure.
+    if context_not_available(status, &detail) {
+        return Err(Refusal::ContextNotAvailable);
+    }
+    Err(inner_failure(op, status, &detail))
+}
+
+/// Whether an inner answer is the NGSI-LD API's 504 `LdContextNotAvailable`
+/// (6.3.2), told apart from a forward's 504 by its problem type.
+fn context_not_available(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::GATEWAY_TIMEOUT
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|p| p.get("type")?.as_str().map(str::to_owned))
+            .is_some_and(|t| t == "https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable")
 }
 
 impl ViewOps {
@@ -712,21 +739,16 @@ impl ViewOps {
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
 /// Log an inner failure under a fresh id and answer with the id alone.
-async fn inner_failure(op: OperationId, answer: Response) -> Refusal {
+fn inner_failure(op: OperationId, status: StatusCode, detail: &str) -> Refusal {
     let request_id = format!(
         "ops-{:x}-{:x}",
         std::process::id(),
         NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
     );
-    let status = answer.status().as_u16();
-    let detail = axum::body::to_bytes(answer.into_body(), LOGGED_DETAIL_BYTES)
-        .await
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
     tracing::warn!(
         request_id,
         operation = op.id(),
-        status,
+        status = status.as_u16(),
         detail,
         "an operation failed inside the broker"
     );
@@ -763,10 +785,37 @@ pub trait Surface: Send + Sync + 'static {
 /// ```
 #[must_use]
 pub fn core_name(iri: &str) -> String {
-    static CORE: std::sync::LazyLock<antares_jsonld::Context> =
-        std::sync::LazyLock::new(antares_jsonld::core_context);
     CORE.compact_iri(iri)
 }
+
+/// Whether the core @context defines the term `name` (its keyword aliases `id` and `type`
+/// included), which a surface's own @context must not define again.
+///
+/// ```
+/// assert!(antares_ops::is_core_term("location"));
+/// assert!(antares_ops::is_core_term("value"));
+/// assert!(!antares_ops::is_core_term("speed"));
+/// ```
+#[must_use]
+pub fn is_core_term(name: &str) -> bool {
+    CORE.term(name).is_some()
+}
+
+/// The expanded IRI of the short name `name` under the core @context, as a view's names are
+/// read (ADR-0020); a surface rebases a schema onto a view's names with it (T-3752).
+///
+/// ```
+/// assert_eq!(antares_ops::core_iri("location"), "https://uri.etsi.org/ngsi-ld/location");
+/// assert_eq!(antares_ops::core_iri("Car"), "https://uri.etsi.org/ngsi-ld/default-context/Car");
+/// ```
+#[must_use]
+pub fn core_iri(name: &str) -> String {
+    CORE.expand_key(name)
+}
+
+/// The core @context, read once.
+static CORE: std::sync::LazyLock<antares_jsonld::Context> =
+    std::sync::LazyLock::new(antares_jsonld::core_context);
 
 /// `surface` as the broker mounts it.
 ///
@@ -1043,6 +1092,17 @@ pub mod test_kit {
             Self::with_sinks(Vec::new(), None).await
         }
 
+        /// [`TestBroker::new`] over `state`, a test's own store (the Postgres
+        /// arm of the quality sweep's tests, T-4018).
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn over(mut state: AppState) -> Result<Self, String> {
+            antares_api::wire(&mut state).await;
+            let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
+        }
+
         /// [`TestBroker::new`] delivering through `sinks` too (a surface's
         /// own notification binding, ADR-0026) and asking `engine`, both
         /// set before the notifier is wired, as the broker sets them, so
@@ -1061,9 +1121,7 @@ pub mod test_kit {
             if let Some(engine) = engine {
                 state = state.with_policy(engine);
             }
-            antares_api::wire(&mut state).await;
-            let reload = crate::views::install(&state).await?;
-            Ok(Self { state, reload })
+            Self::over(state).await
         }
 
         /// One retention sweep at `now` (T-3900), as the minute loop runs it.
@@ -1072,6 +1130,23 @@ pub mod test_kit {
             now: chrono::DateTime<chrono::Utc>,
         ) -> Vec<crate::views::retention::Deleted> {
             self.reload.sweep_retention(now).await
+        }
+
+        /// One retention sweep at `now` that starts no statement after `budget`.
+        pub async fn sweep_retention_within(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+            budget: std::time::Duration,
+        ) -> Vec<crate::views::retention::Deleted> {
+            self.reload.sweep_retention_within(now, budget).await
+        }
+
+        /// One quality sweep at `now` (T-4018), as the minute loop runs it.
+        pub async fn sweep_quality(
+            &self,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Vec<crate::views::quality::Changed> {
+            self.reload.sweep_quality(now).await
         }
 
         /// Another pod over the same store: its own view table, loaded and
@@ -1224,6 +1299,99 @@ pub mod test_kit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-3752: a view's short names expand as the core @context reads them.
+    #[test]
+    fn core_iri_expands_a_short_name_under_the_core_context() {
+        assert_eq!(
+            core_iri("location"),
+            "https://uri.etsi.org/ngsi-ld/location"
+        );
+        assert_eq!(
+            core_iri("BikeHireDockingStation"),
+            "https://uri.etsi.org/ngsi-ld/default-context/BikeHireDockingStation"
+        );
+        assert_eq!(core_iri("https://sdm.org/Car"), "https://sdm.org/Car");
+    }
+
+    #[test]
+    fn core_terms_are_the_core_contexts_own() {
+        for term in ["id", "type", "value", "location", "observedAt"] {
+            assert!(is_core_term(term), "{term}");
+        }
+        for name in ["speed", "p0", "Location"] {
+            assert!(!is_core_term(name), "{name}");
+        }
+        assert_eq!(
+            core_name("https://uri.etsi.org/ngsi-ld/location"),
+            "location"
+        );
+    }
+
+    /// Only the NGSI-LD API's own 504 `LdContextNotAvailable` reaches a
+    /// surface as such; a forward's 504, another status or a body that is
+    /// no problem stays an inner failure (T-3947).
+    #[test]
+    fn only_the_apis_ld_context_504_is_passed_on() {
+        let ld = r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable","title":"LdContextNotAvailable","detail":"http://10.0.0.1/x"}"#;
+        let forward = r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/InternalError","detail":"https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable"}"#;
+        assert!(context_not_available(StatusCode::GATEWAY_TIMEOUT, ld));
+        assert!(!context_not_available(StatusCode::GATEWAY_TIMEOUT, forward));
+        assert!(!context_not_available(StatusCode::GATEWAY_TIMEOUT, ""));
+        assert!(!context_not_available(StatusCode::GATEWAY_TIMEOUT, "[1]"));
+        assert!(!context_not_available(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ld
+        ));
+    }
+
+    /// What a surface gets for each kind of API answer: success passes, a
+    /// 503 keeps its `Retry-After`, the API's 504 `LdContextNotAvailable`
+    /// keeps its status, any other 5xx (a forward's 504 included) is an
+    /// inner failure with an id and no inner text (T-3947).
+    #[tokio::test]
+    async fn every_api_answer_maps_to_what_a_surface_may_see() {
+        let answer = |status: StatusCode, body: &'static str| {
+            let mut r = Response::new(Body::from(body));
+            *r.status_mut() = status;
+            r
+        };
+        let op = OperationId::QueryEntities;
+        let ok = answered(op, answer(StatusCode::OK, "[]")).await;
+        assert!(ok.is_ok_and(|r| r.status() == StatusCode::OK));
+        let mut busy = answer(StatusCode::SERVICE_UNAVAILABLE, "");
+        busy.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from_static("6"),
+        );
+        assert_eq!(
+            answered(op, busy).await.err(),
+            Some(Refusal::Overloaded {
+                retry_after: Some(HeaderValue::from_static("6"))
+            })
+        );
+        let ld = r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable"}"#;
+        assert_eq!(
+            answered(op, answer(StatusCode::GATEWAY_TIMEOUT, ld))
+                .await
+                .err(),
+            Some(Refusal::ContextNotAvailable)
+        );
+        for (status, body) in [
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/InternalError","detail":"forward to http://10.0.0.1 timed out"}"#,
+            ),
+            (StatusCode::INTERNAL_SERVER_ERROR, "store said no"),
+        ] {
+            match answered(op, answer(status, body)).await.err() {
+                Some(Refusal::Inner { request_id }) => {
+                    assert!(request_id.starts_with("ops-"), "{status}: {request_id}");
+                }
+                other => panic!("{status}: {other:?}"),
+            }
+        }
+    }
 
     #[cfg(feature = "test-kit")]
     #[test]

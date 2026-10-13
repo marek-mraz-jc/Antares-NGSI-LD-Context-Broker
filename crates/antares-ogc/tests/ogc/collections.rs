@@ -156,3 +156,75 @@ async fn a_view_of_everything_serves_every_collection() -> Result<(), String> {
     );
     Ok(())
 }
+
+/// T-3752 (dev, Helsinki): a schema whose classes and slots are another vocabulary's IRIs
+/// (`sdm:`, `location` as `geojson:geometry`) while the view and the stored Entities use short
+/// names read under the core @context. The collection is listed by its view name and its items
+/// are the Entities written with short names, its geometry the NGSI-LD `location`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_of_another_vocabulary_serves_the_entities_the_view_names() -> Result<(), String> {
+    crate::common::schemas_on();
+    let broker = antares_ops::test_kit::TestBroker::new().await?;
+    let app = broker.serve(antares_ogc::Ogc)?;
+    let schema = r#"{
+      "id": "https://hel.fi/models/helsinki", "name": "helsinki", "default_prefix": "sdm",
+      "prefixes": {"sdm": {"prefix_prefix": "sdm", "prefix_reference": "https://smartdatamodels.org/"},
+                   "geojson": {"prefix_prefix": "geojson", "prefix_reference": "https://purl.org/geojson/vocab#"}},
+      "classes": {"Station": {"class_uri": "sdm:Station", "slots": ["bikes", "location"]}},
+      "slots": {"bikes": {"slot_uri": "sdm:bikes", "range": "integer"},
+                "location": {"slot_uri": "geojson:geometry", "range": "string",
+                             "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}}}}
+    }"#;
+    let view = serde_json::json!({"id": "bikes", "tenant": "hel", "selector": ["Station"],
+        "rules": [{"types": ["Station"], "attributes": ["bikes", "location"]}],
+        "operations": ["query_entities"]});
+    let station = serde_json::json!({"id": "urn:ngsi-ld:Station:1", "type": "Station",
+        "bikes": {"type": "Property", "value": 4},
+        "location": {"type": "GeoProperty", "value": {"type": "Point", "coordinates": [24.95, 60.15]}}});
+    for (method, uri, body, headers) in [
+        ("PUT", "/q/views/bikes", view.to_string(), &[][..]),
+        ("PUT", "/q/schemas/hel", schema.to_owned(), &[][..]),
+        (
+            "POST",
+            "/ngsi-ld/v1/entities",
+            station.to_string(),
+            &[("NGSILD-Tenant", "hel")][..],
+        ),
+    ] {
+        let a = send(&app, method, uri, &body, headers).await;
+        assert_eq!(a.status, StatusCode::CREATED, "{uri}: {}", a.body);
+    }
+    let a = get(&app, "/x/views/bikes/ogc/features/collections").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        a.body.pointer("/collections/0/id").and_then(Value::as_str),
+        Some("Station"),
+        "listed by the name the view shows: {}",
+        a.body
+    );
+    let a = get(
+        &app,
+        "/x/views/bikes/ogc/features/collections/Station/items",
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        crate::common::ids(&a.body),
+        ["urn:ngsi-ld:Station:1"],
+        "{}",
+        a.body
+    );
+    let feature = a.body.pointer("/features/0").cloned().unwrap_or_default();
+    assert_eq!(
+        feature.pointer("/geometry/type").and_then(Value::as_str),
+        Some("Point"),
+        "{feature}"
+    );
+    assert_eq!(
+        feature.pointer("/properties/bikes").and_then(Value::as_i64),
+        Some(4),
+        "{feature}"
+    );
+    drop(broker);
+    Ok(())
+}

@@ -16,17 +16,17 @@
 crate = "antares-ops"
 file = "src/lib.rs"
 function = "Ops::run_in" # v0 mangling puts the impl between the crate and the type
-lines = 13
-branches = 2
-reason = "6 lines, 1 branch: a 503 comes from a store whose pool timed out (DB_OVERLOADED); the built-in store under test_kit has no pool, and the broker's own tests cover the 503 through their pool-wall driver. 7 lines, 1 branch: the two tracing::info! of the surface operation line repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/ops_log.rs covers the subscriber path and asserts what it logs"
+lines = 7
+branches = 1
+reason = "the two tracing::info! of the surface operation line repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/ops_log.rs covers the subscriber path and asserts what it logs (the 503 the excluded lines used to hold moved to `answered`, covered by every_api_answer_maps_to_what_a_surface_may_see, T-3947)"
 
 [[exclusion]]
 crate = "antares-ops"
 file = "src/lib.rs"
 function = "antares_ops::inner_failure"
-lines = 2
+lines = 3
 branches = 0
-reason = "tracing::warn! repeats the fields in its `log` fallback, which runs only with no subscriber set; ops_errors covers the subscriber path and asserts what it logs"
+reason = "one side of tracing::warn!: the unit test every_api_answer_maps_to_what_a_surface_may_see reaches it with no subscriber set, and since T-3947 no request of the test kit reaches an inner 5xx (the @context failure ops_errors used is a 504 LdContextNotAvailable now), so the subscriber side is not measured"
 
 [[exclusion]]
 crate = "antares-ops"
@@ -35,6 +35,14 @@ function = "antares_ops::views::inner"
 lines = 8
 branches = 0
 reason = "the view store failing: the built-in store under test_kit does not fail, and antares-ops may not name the store to put one that does in its place (module rule M2)"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/views.rs"
+function = "antares_ops::views::install"
+lines = 3
+branches = 0
+reason = "the minute loop's sweep body: its first tick is a minute after start (an immediate one raced the tests' own sweeps, T-3745), so no test runs it; tests call Reload::sweep_retention and sweep_quality, which run the same two sweeps"
 
 [[exclusion]]
 crate = "antares-ops"
@@ -56,9 +64,25 @@ reason = "the periodic reload failing on the store, which the built-in store doe
 crate = "antares-ops"
 file = "src/views/retention.rs"
 function = "antares_ops::views::retention::retain"
-lines = 2
+lines = 4
 branches = 0
-reason = "a retention statement failing on the store, which the built-in store under test_kit does not (see antares_ops::views::inner); tests/pg_retention.rs in antares-sql runs the Postgres statements themselves"
+reason = "2 lines: a retention statement failing on the store, which the built-in store under test_kit does not (see antares_ops::views::inner); tests/pg_retention.rs in antares-sql runs the Postgres statements themselves. 2 lines: the tracing::info! of a spent budget repeats its field in the `log` fallback, which runs only with no subscriber set; tests/retention.rs a_sweep_past_its_budget_stops_and_the_next_goes_on runs the spent path (T-4084)"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/views/quality.rs"
+function = "antares_ops::views::quality::sweep"
+lines = 6
+branches = 0
+reason = "tracing::info! repeats its fields in the `log` fallback, which runs only with no subscriber set; the counter beside it is what tests/quality.rs reads through the sweep's answer"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/views/quality.rs"
+function = "antares_ops::views::quality::judge_rule"
+lines = 8
+branches = 2
+reason = "6 lines, 1 branch: the scan or the in-place write failing on the store, which the built-in store under test_kit does not (see antares_ops::views::inner); tests/quality_pg.rs runs both on Postgres. 2 lines, 1 branch: a type with more than PAGE (1000) Entities read over a second page, which no test seeds"
 
 [[exclusion]]
 crate = "antares-mcp"
@@ -197,6 +221,14 @@ branches = 0
 reason = "an answer over MAX_ANSWER_BYTES (64 MiB): a test would have to store and page more than that through the test kit's in-memory store"
 
 [[exclusion]]
+crate = "antares-ops"
+file = "src/scan.rs"
+function = "antares_ops::scan::read"
+lines = 3
+branches = 0
+reason = "a successful Query Entities answer that is no JSON list: the scan asks the store for application/json and never forwards the outer Accept (tests/view_scan.rs asserts geo+json stays outside), so the store answers a list; the refusal stays as the trust boundary on the store's answer"
+
+[[exclusion]]
 crate = "antares-icsr"
 file = "src/grant.rs"
 function = "antares_icsr::grant::held"
@@ -251,11 +283,3 @@ function = "Internal::serve" # v0 mangling puts the impl between the crate and t
 lines = 21
 branches = 0
 reason = "2 lines: the grant store failing, which the built-in store under test_kit does not (module rule M2). 19 lines: the four tracing::info!/warn! of a forward made or not made repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/icsr_log.rs and icsr_gate.rs cover the subscriber path and assert what they log"
-
-[[exclusion]]
-crate = "antares-ops"
-file = "src/scan.rs"
-function = "antares_ops::scan::read"
-lines = 3
-branches = 0
-reason = "a successful Query Entities answer that is no JSON list: the scan asks the store for application/json and never forwards the outer Accept (tests/view_scan.rs asserts geo+json stays outside), so the store answers a list; the refusal stays as the trust boundary on the store's answer"

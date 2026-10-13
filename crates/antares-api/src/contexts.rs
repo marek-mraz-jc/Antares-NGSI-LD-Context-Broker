@@ -222,6 +222,20 @@ async fn find_entry(st: &AppState, tenant: &TenantId, id: &str) -> ApiResult<Opt
     Ok(None)
 }
 
+/// Whether the stored @contexts are shown: not through a view that hides a
+/// name (a view showing every name hides no term, rule 12, T-3946), and not to
+/// a caller the engine narrows (`policy::NAME_READS`), since one may define a
+/// term for an Attribute that caller may not see (ADR-0023 rule 5, T-4009).
+fn shows_stored(st: &AppState, narrowing: &crate::policy::Filter) -> bool {
+    #[cfg(feature = "views")]
+    if st.view.as_ref().is_some_and(|v| !v.shows_every_name()) {
+        return false;
+    }
+    #[cfg(not(feature = "views"))]
+    let _ = st;
+    narrowing.is_empty()
+}
+
 // ---------- POST /jsonldContexts (5.13.2) ----------
 
 /// 5.13.2.4 + 5.5.4: a JSON-LD local context is a string (IRI), an object of
@@ -315,7 +329,7 @@ pub async fn list_contexts(
         // resource — it serves the whole list, so a pagination parameter would
         // be accepted and silently ignored.
         check_params(&params, &["kind", "details", "local"])?;
-        gate!(st, &tenant, &headers, "5.13.3").await?;
+        let narrowing = gate!(st, &tenant, &headers, "5.13.3").await?;
 
         let details = details_param(&params)?;
         let kind_filter = params.get("kind");
@@ -334,16 +348,14 @@ pub async fn list_contexts(
             Option<antares_jsonld::CtxUsage>,
         )> = Vec::new();
         // ADR-0023 rule 5: a stored @context is the tenant's and may define
-        // a term for an Attribute a view hides, so through a view the list
-        // is the core @context alone (the pinned entries below).
-        #[cfg(feature = "views")]
-        let stored = if st.view.is_some() {
+        // a term for an Attribute a view hides, so through a view that hides
+        // a name the list is the core @context alone (the pinned entries
+        // below). The same for a caller the engine narrows (T-4009).
+        let stored = if !shows_stored(&st, &narrowing) {
             Vec::new()
         } else {
             st.store.context_list_meta(Some(&tenant)).await?
         };
-        #[cfg(not(feature = "views"))]
-        let stored = st.store.context_list_meta(Some(&tenant)).await?;
         for c in stored {
             let kind = c
                 .get("kind")
@@ -431,7 +443,7 @@ pub async fn serve_context(
     let go = async {
         let tenant = tenant_from(&headers)?;
         check_params(&params, &["details", "local", "core"])?;
-        gate!(st, &tenant, &headers, "5.13.4", ids: &[&id]).await?;
+        let narrowing = gate!(st, &tenant, &headers, "5.13.4", ids: &[&id]).await?;
         let details = details_param(&params)?;
         // TS 104 175 13.4.4: `core` with `details` is a BadRequest, and so is
         // a `core` that names no NGSI-LD version this build has a core for
@@ -444,9 +456,13 @@ pub async fn serve_context(
             })?),
             None => None,
         };
-        let entry = find_entry(&st, &tenant, &id)
-            .await?
-            .ok_or_else(|| NgsiError::ResourceNotFound(format!("@context {id} not found")))?;
+        let entry = match find_entry(&st, &tenant, &id).await? {
+            // a stored @context the list hides from this caller is as absent
+            // here, under a view and under a narrowing engine (T-4009)
+            Some(CtxEntry::Stored(_)) if !shows_stored(&st, &narrowing) => None,
+            entry => entry,
+        }
+        .ok_or_else(|| NgsiError::ResourceNotFound(format!("@context {id} not found")))?;
         // the user @context's location and the core one, for every kind: the
         // pair is two URLs, not the content a Cached entry never serves
         if let Some(core) = core {

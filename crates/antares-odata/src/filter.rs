@@ -88,6 +88,9 @@ pub(crate) struct Translated {
     pub(crate) sort_reads: Vec<String>,
     /// Whether the surface sort reads `createdAt` or `modifiedAt`.
     pub(crate) sort_system: bool,
+    /// The keys of a pushed `orderBy`, for a read that finds an Entity
+    /// lacking one and sorts on the surface instead (T-3853).
+    pub(crate) pushed_keys: Vec<SortKey>,
     /// The `ngsild.*` parameters pushed beside the rest (`&scopeQ=…`,
     /// `&georel=…`), encoded (ADR-0028 rule 6).
     pub(crate) ngsild: String,
@@ -99,6 +102,23 @@ pub(crate) struct Translated {
     /// The Attribute terms the computed values read, for the pushdown's
     /// `attrs`.
     pub(crate) computed_reads: Vec<String>,
+}
+
+impl Translated {
+    /// What selects the Entities, without the order, the residual or the
+    /// surface sort: the base of a count that asks about the same answer.
+    pub(crate) fn probe(&self) -> Self {
+        Self {
+            q: self.q.clone(),
+            ids: self.ids.clone(),
+            context: self.context.clone(),
+            linked: self.linked,
+            geo: self.geo.clone(),
+            expand_values: self.expand_values.clone(),
+            ngsild: self.ngsild.clone(),
+            ..Self::default()
+        }
+    }
 }
 
 /// One key of a surface sort (Q9, ADR-0028 rule 5).
@@ -360,6 +380,7 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
         })
         .collect();
     out.order = Some(pushed.join(","));
+    out.pushed_keys = keys;
     Ok(())
 }
 

@@ -702,3 +702,185 @@ async fn views_batch_upsert_holds_each_member_to_its_condition() -> Result<(), S
     assert_eq!(value(&f.app, "urn:ngsi-ld:Car:1", "speed").await, 11);
     Ok(())
 }
+
+/// `method path` through the view with `If-Match: tag`.
+async fn if_match(
+    app: &axum::Router,
+    (method, path, body): (Method, &str, Option<&Value>),
+    tag: &str,
+) -> Answer {
+    send(
+        app,
+        method,
+        &format!("{FLEET}{path}"),
+        &[("If-Match", tag)],
+        body,
+    )
+    .await
+}
+
+/// The `ETag` Retrieve Entity answers through the view.
+async fn tag_of(app: &axum::Router, id: &str) -> Result<String, String> {
+    let a = send(
+        app,
+        Method::GET,
+        &format!("{FLEET}/entities/{id}"),
+        &[],
+        None,
+    )
+    .await;
+    a.header("etag")
+        .ok_or(format!("no ETag: {} {:?}", a.status, a.headers))
+}
+
+/// Every write to one Entity a view serves, as `(method, path, body)`.
+fn single_writes(id: &str) -> Vec<(Method, String, Option<Value>)> {
+    let e = format!("/entities/{id}");
+    vec![
+        (
+            Method::PATCH,
+            format!("{e}/attrs"),
+            Some(json!({"speed": prop(&json!(11))})),
+        ),
+        (
+            Method::POST,
+            format!("{e}/attrs"),
+            Some(json!({"colour": prop(&json!("x"))})),
+        ),
+        (
+            Method::PATCH,
+            format!("{e}/attrs/speed"),
+            Some(json!({"value": 12})),
+        ),
+        (
+            Method::PUT,
+            format!("{e}/attrs/speed"),
+            Some(prop(&json!(13))),
+        ),
+        (
+            Method::PUT,
+            format!("{e}/attrs/speed/value"),
+            Some(json!(14)),
+        ),
+        (Method::DELETE, format!("{e}/attrs/colour"), None),
+        (
+            Method::PATCH,
+            e.clone(),
+            Some(json!({"speed": prop(&json!(15))})),
+        ),
+        (
+            Method::PUT,
+            e.clone(),
+            Some(json!({"id": id, "type": "Car", "speed": prop(&json!(16))})),
+        ),
+        (Method::DELETE, e, None),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conditional_write_holds_its_if_match_inside_the_store_write() -> Result<(), String> {
+    // T-3789 (R45): the tag is of what the view shows; If-Match is decided where rule 7 is
+    let f = fixture().await?;
+    let car1 = "urn:ngsi-ld:Car:1";
+    let tag = tag_of(&f.app, car1).await?;
+    assert!(
+        tag.starts_with('"') && tag.ends_with('"') && tag.len() == 18,
+        "{tag}"
+    );
+    // a write to a hidden Attribute, at the root, leaves the tag as it was
+    let root = format!("/ngsi-ld/v1/entities/{car1}/attrs");
+    let hidden = json!({"secret": prop(&json!(2))});
+    let a = send(
+        &f.app,
+        Method::PATCH,
+        &root,
+        &[("NGSILD-Tenant", "city")],
+        Some(&hidden),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.text);
+    assert_eq!(tag_of(&f.app, car1).await?, tag);
+    // a stale, weak or unquoted tag holds for no write, and nothing is written
+    let weak = format!("W/{tag}");
+    let bare = tag.trim_matches('"').to_owned();
+    for stale in ["\"0000000000000000\"", weak.as_str(), bare.as_str()] {
+        for (method, path, body) in single_writes(car1) {
+            let a = if_match(&f.app, (method.clone(), &path, body.as_ref()), stale).await;
+            assert_eq!(
+                a.status,
+                StatusCode::PRECONDITION_FAILED,
+                "{method} {path} {stale}: {}",
+                a.text
+            );
+            assert!(a.text.is_empty(), "{}", a.text);
+        }
+    }
+    let car = stored(&f.app, car1).await;
+    assert_eq!(
+        (
+            at(&car.json, "/speed/value"),
+            at(&car.json, "/colour/value")
+        ),
+        (&json!(10), &json!("red"))
+    );
+    // the tag, or one in a list, or `*`, holds; each write moves the tag
+    let speed = json!({"speed": prop(&json!(20))});
+    let path = format!("/entities/{car1}/attrs");
+    let listed = format!("\"x\", {tag}");
+    let a = if_match(&f.app, (Method::PATCH, &path, Some(&speed)), &listed).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.text);
+    assert_eq!(value(&f.app, car1, "speed").await, 20);
+    let moved = tag_of(&f.app, car1).await?;
+    assert_ne!(moved, tag);
+    let a = if_match(&f.app, (Method::PATCH, &path, Some(&speed)), &tag).await;
+    assert_eq!(
+        a.status,
+        StatusCode::PRECONDITION_FAILED,
+        "the old tag: {}",
+        a.text
+    );
+    for (method, path, body) in single_writes(car1) {
+        let a = if_match(&f.app, (method.clone(), &path, body.as_ref()), "*").await;
+        if method == Method::PUT && path.ends_with(car1) {
+            // the precondition holds; the replace would delete the hidden `secret`
+            refused(&a, NOT_WRITABLE)?;
+        } else {
+            assert!(
+                a.status.is_success(),
+                "{method} {path}: {} {}",
+                a.status,
+                a.text
+            );
+        }
+    }
+    // under If-Match an Entity out of the view and an absent one are both 412, and alike
+    for (hidden, absent) in single_writes("urn:ngsi-ld:Car:3")
+        .into_iter()
+        .zip(single_writes("urn:ngsi-ld:Car:0"))
+    {
+        let (method, path, body) = hidden;
+        let h = if_match(&f.app, (method.clone(), &path, body.as_ref()), "*").await;
+        let (method, path, body) = absent;
+        let a = if_match(&f.app, (method.clone(), &path, body.as_ref()), "*").await;
+        assert_eq!(
+            h.status,
+            StatusCode::PRECONDITION_FAILED,
+            "{method} {path}: {}",
+            h.text
+        );
+        assert_eq!((h.status, h.text), (a.status, a.text), "{method} {path}");
+    }
+    let car3 = stored(&f.app, "urn:ngsi-ld:Car:3").await;
+    assert_eq!(at(&car3.json, "/speed/value"), 90, "{}", car3.text);
+    // a batch names no one Entity: If-Match does not apply to it
+    let batch = json!([{"id": "urn:ngsi-ld:Car:2", "type": "Car", "speed": prop(&json!(30))}]);
+    let a = if_match(
+        &f.app,
+        (Method::POST, "/entityOperations/update", Some(&batch)),
+        "\"0000000000000000\"",
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.text);
+    assert_eq!(value(&f.app, "urn:ngsi-ld:Car:2", "speed").await, 30);
+    Ok(())
+}

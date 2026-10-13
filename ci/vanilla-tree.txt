@@ -865,6 +865,9 @@ antares-broker v0.1.3
 │   │           ├── tokio-util feature "codec" (*)
 │   │           ├── tokio-util feature "default" (*)
 │   │           ├── log feature "default" (*)
+│   │           ├── rustls-webpki feature "default"
+│   │           │   ├── rustls-webpki v0.103.15 (*)
+│   │           │   └── rustls-webpki feature "std" (*)
 │   │           ├── rustls-native-certs feature "default" (*)
 │   │           ├── fixedbitset feature "default"
 │   │           │   ├── fixedbitset v0.5.7
@@ -907,20 +910,6 @@ antares-broker v0.1.3
 │   │           │   └── rustls-pemfile feature "std"
 │   │           │       ├── rustls-pemfile v2.2.0 (*)
 │   │           │       └── rustls-pki-types feature "std" (*)
-│   │           ├── rustls-webpki feature "default"
-│   │           │   ├── rustls-webpki v0.102.8
-│   │           │   │   ├── ring v0.17.14 (*)
-│   │           │   │   ├── rustls-pki-types v1.15.1 (*)
-│   │           │   │   └── untrusted feature "default" (*)
-│   │           │   ├── rustls-webpki feature "ring"
-│   │           │   │   └── rustls-webpki v0.102.8 (*)
-│   │           │   └── rustls-webpki feature "std"
-│   │           │       ├── rustls-webpki v0.102.8 (*)
-│   │           │       ├── rustls-pki-types feature "std" (*)
-│   │           │       └── rustls-webpki feature "alloc"
-│   │           │           ├── rustls-webpki v0.102.8 (*)
-│   │           │           ├── ring feature "alloc" (*)
-│   │           │           └── rustls-pki-types feature "alloc" (*)
 │   │           └── tokio-stream feature "default"
 │   │               ├── tokio-stream v0.1.19
 │   │               │   ├── futures-core feature "default" (*)
@@ -2316,6 +2305,7 @@ antares-broker v0.1.3
 │   │       └── sqlx-postgres feature "uuid"
 │   │           ├── sqlx-postgres v0.9.0 (*)
 │   │           └── sqlx-core feature "uuid" (*)
+│   ├── sha2 v0.10.9 (*)
 │   ├── antares-jsonld feature "default" (*)
 │   ├── antares-jsonld feature "fetch" (*)
 │   ├── antares-model feature "default" (*)

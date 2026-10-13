@@ -37,6 +37,9 @@ schema: `docs/openapi/antares-admin.yaml`, rendered at
 | `GET /q/tenants` | Tenant names |
 | `GET /q/tenants/{tenant}` | What one tenant holds |
 | `DELETE /q/tenants/{tenant}` | Tenant purge |
+| `GET /q/tenants/{tenant}/digest` | Entity count, history count and a hash over (id, `modifiedAt`) |
+| `GET /q/tenants/{tenant}/export` | The tenant's Entities and history as NDJSON, system attributes kept |
+| `POST /q/tenants/{tenant}/import` | An export into an empty tenant, all or nothing |
 | `GET /q/dead-letters` | Notifications the delivery policy gave up on |
 | `GET`, `PUT`, `DELETE /q/retention/{tenant}` | How long a Tenant keeps each type ([Retention](#retention)) |
 | `POST /q/retention/{tenant}/preview`, `GET /q/retention/{tenant}/deleted` | What a retention document would delete now; what this pod's sweeps deleted ([Retention](#retention)) |
@@ -65,6 +68,7 @@ progress). A memory-store broker answers:
   "surfaces": { "admin": { "prefix": "/q", "routes": 8 } },
   "limits": {
     "changeQueue": 1024,
+    "deliveryLane": 64,
     "deliveryWidth": 64,
     "deliveryWidthPerTenant": 8,
     "maxBatchItems": 1000,
@@ -108,7 +112,7 @@ progress). A memory-store broker answers:
 | `temporalDrainErrors` | Post-response history writes that failed since start; the client's 2xx stands, the counter and a warning record the loss. |
 | `policy` | The policy engine this binary was started with (`ANTARES_POLICY`, `allow-all` unless a deployment registered another) and the deadline one decision gets (`ANTARES_POLICY_TIMEOUT_MS`). An engine that overruns it is a refusal, not a delay. In a `views` build, `documents` lists the engine's rule documents by tenant and revision, `loaded` or `refused` ([Policy rule documents](#policy-rule-documents)); `null` when the engine reads none. |
 | `surfaces` | The mounted admin surfaces by name, each with its prefix and route count. |
-| `limits` | The bounds wall: every `max*` cap in force and the `rejected*` counters of requests refused by it, plus the notification-pipeline ceilings (`changeQueue`, `deliveryWidth`, `deliveryWidthPerTenant`, `maxTrackedDestinations`). No request is rejected against those four — they are published because reaching one is what a dropped change or a stalled fan-out looks like from outside. |
+| `limits` | The bounds wall: every `max*` cap in force and the `rejected*` counters of requests refused by it, plus the notification-pipeline ceilings (`changeQueue`, `deliveryLane`, `deliveryWidth`, `deliveryWidthPerTenant`, `maxTrackedDestinations`). No request is rejected against those five — they are published because reaching one is what a dropped change or a stalled fan-out looks like from outside. Each subscription is delivered on a lane of its own, `deliveryLane` groups deep: a slow or dead endpoint fills its own lane, which drops for that subscription alone (counted in `antares_notification_lane_dropped_total`, logged with tenant and subscription), and never holds the matching of other subscriptions' changes. |
 | `memory` | jemalloc live (`allocatedBytes`) and resident (`residentBytes`) bytes. |
 | `commitQueueDepth`, `commitQueuePeak` | Present only for a store with a single committer to queue behind (`file`, and the browser build over OPFS): writers queued now and at peak. |
 | `bus` | `ANTARES_BUS=nats` only: `{mode, connected, reconnects}`. |
@@ -137,6 +141,7 @@ Prometheus text with the `antares_` prefix:
 | `antares_temporal_drain_errors_total` | Failed post-response history writes. |
 | `antares_notifications_sent_total`, `antares_notifications_retried_total`, `antares_notifications_failed_total` | Notification deliveries by outcome. |
 | `antares_notification_changes_dropped_total` | Change events the notifier dropped under back-pressure. |
+| `antares_notification_lane_dropped_total` | Entities a subscription's full delivery lane dropped: that subscriber is slower than its changes (the log line names tenant and subscription). |
 | `antares_claim_check_unresolved_total` | Changes too big for the bus whose kept outbox row was already reaped: the before-image is gone and the change notifies nobody. Non-zero means a matcher lagged past the retention window. |
 | `antares_retention_deleted_total` | Entities (`kind="entity"`) and attribute instances (`kind="history"`) the [retention](#retention) sweep deleted, by `tenant` and `type`. |
 | `antares_notification_task_panics_total` | Delivery tasks that panicked (a bug, never expected). |
@@ -192,6 +197,39 @@ Context Source, `400` for a name outside the tenant grammar. The default
 tenant is emptied and keeps existing. The path names the tenant; an
 `NGSILD-Tenant` header is ignored. Background in
 [operations](operations.md#tenants).
+
+
+### Moving a tenant to another broker
+
+ADR-0030. Hold the
+writers first: the export is not a point-in-time snapshot, and the digest
+proves the copy.
+
+#### GET /q/tenants/{tenant}/digest
+
+Answers `{"tenant","entities","attrInstances","sha256"}`. `sha256` is the
+sum modulo 2²⁵⁶ of `sha256(id ‖ 0x00 ‖ modifiedAt)` over the Entities, so
+two brokers agree whatever order they page in.
+
+#### GET /q/tenants/{tenant}/export
+
+Streams `application/x-ndjson`: a header `{"antaresExport":1,"tenant":…}`,
+one `{"kind":"entity","doc":…}` per Entity, then one
+`{"kind":"temporal","doc":…}` per history document, each as stored, and a
+trailer `{"end":true,"records":n}`. A stream that stops without the trailer
+was cut. A tenant holding Subscriptions, Registrations, Registration
+Subscriptions, Snapshots or distributed subscriptions answers `409` with
+their counts: v1 moves data only.
+
+#### POST /q/tenants/{tenant}/import
+
+Takes that stream into a tenant that holds nothing: no Entity, history,
+Subscription, registration, Snapshot, EntityMap, distributed subscription
+or hosted `@context` (`409` naming each count otherwise). The header names
+the same tenant, entities come before history, a line is at most 16 MiB.
+Any refused line, or a missing trailer, answers `400` naming the line; the
+import then deletes the Entities and history it wrote, by id, and nothing
+else. `204` when every record is in.
 
 ## Dead letters
 

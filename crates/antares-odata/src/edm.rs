@@ -190,29 +190,6 @@ pub struct Edm {
     pub sets: BTreeMap<String, Set>,
 }
 
-/// Every class of `schema` with every slot of it: what a view of `*` shows
-/// (ADR-0023 rule 12), which names no type for [`ViewOps::shown_by_type`].
-///
-/// [`ViewOps::shown_by_type`]: antares_ops::ViewOps::shown_by_type
-#[must_use]
-pub fn every(schema: &linkml_model::Model) -> Shown {
-    schema
-        .schema()
-        .classes
-        .keys()
-        .map(|class| {
-            let slots = schema.class_slots(class);
-            (
-                schema.class_iri(class),
-                slots
-                    .iter()
-                    .map(|(slot, _)| schema.slot_iri(slot))
-                    .collect(),
-            )
-        })
-        .collect()
-}
-
 /// Builds the model of view `view` from `schema` and what the view shows.
 /// A class the view does not show, a slot it does not show of that class,
 /// and a name with no CSDL form are left out; a Relationship whose target
@@ -1233,7 +1210,7 @@ mod tests {
     #[test]
     fn a_view_of_every_name_shows_every_class_with_every_slot() {
         let s = schema();
-        let every = every(&s);
+        let every = s.slot_iris_by_class();
         let car = &every[&s.class_iri("Car")];
         assert!(
             shown(&s, &[("Car", CAR_ALL)])[&s.class_iri("Car")].is_subset(car),
