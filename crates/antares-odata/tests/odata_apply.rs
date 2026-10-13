@@ -656,3 +656,29 @@ async fn ranking_concat_and_search_never_reach_what_is_hidden() -> Result<(), St
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn a_chain_of_concat_is_refused_before_it_outgrows_one_scan() -> Result<(), String> {
+    let (_b, app) = broker(false).await?;
+    // each step doubles the Entities: 2^40 of them would never fit in memory (T-4017)
+    let apply = ["concat(identity,identity)"; 40].join("/");
+    let started = std::time::Instant::now();
+    let (status, body) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?$apply={apply}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("TooManyResults"), "{body}");
+    assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
+    // a few doublings stay within the cap and answer every copy
+    assert_eq!(
+        ids(&app, &["concat(identity,identity)"; 3].join("/"))
+            .await?
+            .len(),
+        40
+    );
+    Ok(())
+}
