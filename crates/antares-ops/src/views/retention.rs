@@ -391,26 +391,7 @@ fn none() -> Response {
 }
 
 async fn get_doc(r: Arc<Reloader>, tenant: String) -> Result<Response, String> {
-    let Some(key) = key(&tenant) else {
-        return Ok(bad_tenant());
-    };
-    Ok(
-        match r
-            .state
-            .view_doc(&key)
-            .await?
-            .as_ref()
-            .and_then(|d| d.get("text"))
-            .and_then(Value::as_str)
-        {
-            Some(text) => (
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                text.to_owned(),
-            )
-                .into_response(),
-            None => none(),
-        },
-    )
+    super::stored_json(&r, key(&tenant), none).await
 }
 
 async fn put_doc(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Response, String> {

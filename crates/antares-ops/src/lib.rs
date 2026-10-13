@@ -39,6 +39,7 @@ mod error;
 pub mod mapping;
 mod names;
 mod operation;
+pub mod percent;
 mod scan;
 pub mod views;
 
@@ -47,7 +48,7 @@ pub mod views;
 pub use antares_residual as residual;
 pub use error::{Refusal, CONTEXT_DETAIL, INNER_DETAIL};
 pub use operation::OperationId;
-pub use scan::{Page, Pushdown, Scanned, RESIDUAL_SCAN, TOO_COMPLEX};
+pub use scan::{pickable, Page, Pushdown, Scanned, RESIDUAL_SCAN, TOO_COMPLEX};
 
 use antares_api::AppState;
 use axum::body::Body;
@@ -800,6 +801,18 @@ pub fn is_core_term(name: &str) -> bool {
     CORE.term(name).is_some()
 }
 
+/// The expanded IRI of the short name `name` under the core @context, as a view's names are
+/// read (ADR-0020); a surface rebases a schema onto a view's names with it (T-3752).
+///
+/// ```
+/// assert_eq!(antares_ops::core_iri("location"), "https://uri.etsi.org/ngsi-ld/location");
+/// assert_eq!(antares_ops::core_iri("Car"), "https://uri.etsi.org/ngsi-ld/default-context/Car");
+/// ```
+#[must_use]
+pub fn core_iri(name: &str) -> String {
+    CORE.expand_key(name)
+}
+
 /// The core @context, read once.
 static CORE: std::sync::LazyLock<antares_jsonld::Context> =
     std::sync::LazyLock::new(antares_jsonld::core_context);
@@ -1286,6 +1299,20 @@ pub mod test_kit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-3752: a view's short names expand as the core @context reads them.
+    #[test]
+    fn core_iri_expands_a_short_name_under_the_core_context() {
+        assert_eq!(
+            core_iri("location"),
+            "https://uri.etsi.org/ngsi-ld/location"
+        );
+        assert_eq!(
+            core_iri("BikeHireDockingStation"),
+            "https://uri.etsi.org/ngsi-ld/default-context/BikeHireDockingStation"
+        );
+        assert_eq!(core_iri("https://sdm.org/Car"), "https://sdm.org/Car");
+    }
 
     #[test]
     fn core_terms_are_the_core_contexts_own() {

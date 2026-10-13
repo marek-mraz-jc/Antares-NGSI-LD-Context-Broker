@@ -1618,3 +1618,74 @@ async fn a_write_through_a_writer_view_notifies_a_public_view_socket() {
         .collect();
     assert_eq!(speeds, [&json!(10), &json!(20)], "{messages:?}");
 }
+
+/// T-4133, ADR-N-049: the platform gateway's fan-out subscribes on a view whose own Policy
+/// grants only the role `public`, under its account and with no role, exactly as dev sends it.
+/// A listed view is decided by its listed policies alone: without the `@context-gateway` listing
+/// the subscription is refused 403 (dev, apply 67), with it the subscription is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_gateway_subscribes_on_a_public_view_only_where_it_is_listed() {
+    let (app, _reload) = broker().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("an address").port();
+    let served = app.clone();
+    tokio::spawn(async move { axum::serve(listener, served).await });
+    let tenant = "hel";
+    let ops: Vec<&str> = antares_ops::OperationId::ALL
+        .iter()
+        .map(|op| op.id())
+        .collect();
+    let schema: Value = serde_json::from_str(SCHEMA).expect("the schema");
+    let view = json!({"id": "transport", "tenant": tenant, "operations": ops,
+        "selector": ["Vehicle"], "rules": [{"types": ["Vehicle"], "attributes": ["speed"]}]});
+    for (uri, doc) in [
+        ("/q/views/transport".to_owned(), view),
+        (format!("/q/schemas/{tenant}"), schema),
+    ] {
+        let (status, _, body) = send(&app, "PUT", &uri, &[], Some(&doc)).await;
+        assert!(status.is_success(), "{uri}: {status} {body}");
+    }
+    for (listed, expected) in [
+        (json!(["public-transport"]), 403),
+        (json!(["public-transport", "@context-gateway"]), 201),
+    ] {
+        let policy = json!({"policies": [
+            {"id": "public-transport", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1", "5.7.2"], "information": [{"entities": [{"type": "Vehicle"}]}]},
+            {"id": "@context-gateway", "effect": "permit",
+             "assignee": {"kind": "serviceAccount", "id": "context-gateway"},
+             "operations": ["5.6.4", "5.6.5", "5.6.6", "5.7.1", "5.7.2", "5.7.5", "5.8.1", "5.8.3"]},
+        ], "views": {"transport": listed}});
+        let uri = format!("/q/policy/{tenant}");
+        let (status, _, body) = send(&app, "PUT", &uri, &[], Some(&policy)).await;
+        assert!(status.is_success(), "{uri}: {status} {body}");
+        let made = tokio::task::spawn_blocking(move || {
+            let mut socket = Socket::open(
+                port,
+                "/x/views/transport/ws",
+                &[
+                    ("x-jc-client".to_owned(), "context-gateway".to_owned()),
+                    ("x-jc-roles".to_owned(), String::new()),
+                ],
+                Duration::from_millis(1500),
+            )
+            .expect("the socket");
+            let _welcome = socket.next();
+            let body = json!({"type": "Subscription", "entities": [{"type": "*"}],
+                "notificationTrigger": ["entityCreated", "entityUpdated", "entityDeleted"],
+                "notification": {"format": "normalized"}});
+            socket
+                .send(&json!({"metadata": {"x-op": "x-subscribe", "x-id": "up"}, "body": body}))
+                .expect("sent");
+            socket.next().unwrap_or_default()
+        })
+        .await
+        .expect("ran");
+        assert_eq!(
+            made["metadata"]["x-status"], expected,
+            "listed {listed}: {made}"
+        );
+    }
+}

@@ -78,7 +78,7 @@ fn read(id: &str, summary: &str, media: &str, parameters: &[Value]) -> Map<Strin
 fn components() -> Value {
     let mut parameters = json!({
         "limit": {"name": "limit", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 10}},
-        "bbox": {"name": "bbox", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "array", "oneOf": [{"minItems": 4, "maxItems": 4}, {"minItems": 6, "maxItems": 6}], "items": {"type": "number"}}},
+        "bbox": {"name": "bbox", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "array", "minItems": 4, "maxItems": 6, "oneOf": [{"minItems": 4, "maxItems": 4}, {"minItems": 6, "maxItems": 6}], "items": {"type": "number"}}},
         "datetime": {"name": "datetime", "in": "query", "required": false, "style": "form", "explode": false, "schema": {"type": "string"}},
         "next": {"name": "next", "in": "query", "required": false, "description": "the token of a next link", "schema": {"type": "string"}},
         "sortby": {"name": "sortby", "in": "query", "required": false, "style": "form", "explode": false, "description": "[+|-]name of the collection's sortables", "schema": {"type": "array", "items": {"type": "string"}}},

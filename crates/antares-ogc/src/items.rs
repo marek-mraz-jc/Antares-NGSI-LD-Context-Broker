@@ -303,19 +303,7 @@ fn is_date_time(s: &str) -> bool {
     head && zone.is_some_and(|z| z.eq_ignore_ascii_case("z") || offset(z))
 }
 
-/// Percent-encodes everything but the unreserved characters.
-pub(crate) fn encode(raw: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(raw.len());
-    for b in raw.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            out.push(char::from(b));
-        } else {
-            let _ = write!(out, "%{b:02X}");
-        }
-    }
-    out
-}
+pub(crate) use antares_ops::percent::encode;
 
 /// The terms one collection's requests use: core-context names as they are, every other
 /// Attribute by its property name in the request's own `@context` (so an `ngsild.` option
@@ -642,14 +630,14 @@ fn attrs(c: &Collection, terms: &Terms, p: &Params) -> Option<Vec<String>> {
 }
 
 /// The token of the next page: the part and the offset in it, and a digest of the request
-/// without its `next` and of the view, so a token read under another view or query does not
-/// match (C16). ponytail: std `SipHash`; a forged token does no more than an offset, every
+/// without its `next` and `limit` and of the view, so a token read under another view or query
+/// does not match and a token read with another page size does (C16). ponytail: std `SipHash`; a forged token does no more than an offset, every
 /// page is narrowed by the store again.
 pub(crate) fn digest(view: &str, collection: &str, pairs: &[(String, String)]) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     (view, collection).hash(&mut hasher);
-    for pair in pairs.iter().filter(|(n, _)| n != "next") {
+    for pair in pairs.iter().filter(|(n, _)| n != "next" && n != "limit") {
         pair.hash(&mut hasher);
     }
     hasher.finish()
@@ -816,10 +804,12 @@ type Read = (Vec<Value>, Option<usize>, Option<usize>);
 /// option is the broker's own 400.
 fn scanned(answer: Result<Scanned, Refusal>) -> Result<Read, Problem> {
     match answer {
+        // no `ngsild.join` is forwarded (NGSILD), so no join walk is cut short
         Ok(Scanned::Page {
             entities,
             next,
             count,
+            ..
         }) => Ok((entities, next, count)),
         // A Tenant that holds nothing yet answers 404 (5.5.10): an empty collection.
         Ok(Scanned::Answer(answer)) if answer.status() == StatusCode::NOT_FOUND => {
@@ -1179,7 +1169,7 @@ mod tests {
         assert_ne!(digest("a", "Car", &[]), digest("b", "Car", &[]));
         assert_eq!(
             digest("a", "Car", &pairs(&[("limit", "1")])),
-            digest("a", "Car", &pairs(&[("limit", "1"), ("next", "x")]))
+            digest("a", "Car", &pairs(&[("limit", "2"), ("next", "x")]))
         );
     }
 
