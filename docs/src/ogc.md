@@ -12,6 +12,8 @@ GET /x/views/{view}/ogc/features/collections
 GET /x/views/{view}/ogc/features/collections/{collectionId}
 GET /x/views/{view}/ogc/features/collections/{collectionId}/schema
 GET /x/views/{view}/ogc/features/collections/{collectionId}/sortables
+GET /x/views/{view}/ogc/features/collections/{collectionId}/queryables
+GET /x/views/{view}/ogc/features/functions
 GET /x/views/{view}/ogc/features/collections/{collectionId}/items
 GET /x/views/{view}/ogc/features/collections/{collectionId}/items/{featureId}
 POST   /x/views/{view}/ogc/features/collections/{collectionId}/items
@@ -23,8 +25,9 @@ OPTIONS any of them
 
 Mount it with `ANTARES_API_SURFACES=admin,views,ogc`. The design is
 ADR-0029 and `docs/analysis/ogc-features-mapping.md`; this page is what
-the build serves today (T-3744, T-3754, T-3746): Part 1 Core, `geojson`
-and `oas30`, Part 2 CRS84 and CRS84h, from the Part 4 draft (OGC
+the build serves today (T-3744, T-3754, T-3746, T-3745): Part 1 Core,
+`geojson` and `oas30`, Part 2 CRS84 and CRS84h, Part 3 filtering with every
+CQL2 conformance class (section 4), from the Part 4 draft (OGC
 20-002r1) create, replace, update and delete, and from the Part 5 draft
 (OGC 23-058r1) schemas, core roles, sortables and feature references.
 `HEAD` answers like `GET` without the body.
@@ -50,9 +53,15 @@ endpoint (`404`). The collections carry no `extent`, and the
 
 ## 2. Items
 
-`/items` is one Query Entities of the collection's type through the view
-(`format=simplified`, `count=true`), so the view's `q` and the policy
-engine narrow Features, `numberMatched` and the next link alike.
+`/items` is a Query Entities of the collection's type through the view,
+paged by `ViewOps::scan` (ADR-0028 rules 4 to 6), so the view's `q` and the
+policy engine narrow Features, `numberMatched` and the next link alike. A
+property is named in the request's `@context` by its property name (by
+`p{n}` when the core context defines that name or the query grammar cannot
+read it), so an `ngsild.` option names it as `properties` does.
+`numberMatched` is exact; with a residual (`bbox` beside `ngsild.georel`) it
+is counted within the scan budget of 10 000 Entities and omitted beyond it,
+while the page and its `next` link are still served.
 
 | Parameter | Meaning |
 |---|---|
@@ -64,6 +73,9 @@ engine narrow Features, `numberMatched` and the next link alike.
 | `properties` | property names by commas, empty for none; an NGSI-LD `pick` that keeps `id`, `type` and the geometry |
 | `profile` | `rel-as-key` (default), `rel-as-uri` or `rel-as-link`, below |
 | `crs`, `bbox-crs` | CRS84 or CRS84h (the URI or `[OGC:CRS84]`); any other is `400` naming both. The answer carries `Content-Crs` |
+| `ngsild.q`, `ngsild.scopeQ` | an NGSI-LD `q` (joined to the request's own with `;`) or `scopeQ`; a broken one is `400` |
+| `ngsild.georel`, `ngsild.geometry`, `ngsild.coordinates`, `ngsild.geoproperty` | the request's one NGSI-LD `geoQ`; a `bbox` beside it is evaluated on what the store answers |
+| `ngsild.pick`, `ngsild.omit` | an NGSI-LD `pick` (not beside `properties`, `400`) or `omit` (beside `properties`, it removes from the selection) |
 
 Any other parameter, a repeated one, or a parameter on a resource that
 takes none is `400`; a property the view hides is refused like a
@@ -89,7 +101,40 @@ target Feature's URI (`rel-as-uri`) or `{"href", "title"}`
 (`rel-as-link`). A Relationship to a class the view does not show stays its
 URN in every profile.
 
-## 4. Writes
+## 4. Filtering (Part 3, CQL2)
+
+`/collections/{c}/queryables` is the collection's schema with
+`additionalProperties: false`: `id`, `geometry` and every property the view
+shows. `items` takes `filter` (`filter-lang` `cql2-text`, the default, or
+`cql2-json`; `filter-crs` CRS84 or CRS84h) and each scalar queryable as a
+parameter (`?speed=60` is `speed = 60`), `AND`ed with `bbox`, `datetime`
+and the `ngsild.` options. A name that is no queryable, hidden or
+misspelled, is the same `400`; so is a function call, as `/functions`
+lists none. Parsing is bounded by `ogc-cql2` (16 KiB, 32 levels, 4 096
+nodes).
+
+Each top-level conjunct is lowered with the meaning CQL2 gives it (three
+values: a missing or hidden value is unknown, also under `NOT`; arrays are
+sets; the temporal functions are relations of start and end, `..` an open
+end) and goes where NGSI-LD can say it exactly:
+
+| conjunct | where |
+|---|---|
+| `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN` of a scalar property and literals; `AND`/`OR` of such | `q` |
+| `IS NULL`, `IS NOT NULL` of a property | `q` (`!p`, `p`) |
+| `LIKE`, `CASEI(p) = CASEI('x')`, `CASEI(p) LIKE CASEI('x%')` | `q` `~=` with an anchored pattern, `(?i)` for `CASEI` |
+| `T_AFTER`, `T_BEFORE`, `T_EQUALS`, `T_DURING`, `T_INTERSECTS` of a time property and literals | `q` comparisons |
+| `A_OVERLAPS` of a `ListProperty` and literals | `q` `==a,b` |
+| one `S_INTERSECTS`, `S_WITHIN`, `S_CONTAINS`, `S_EQUALS`, `S_DISJOINT`, `S_OVERLAPS` of `geometry` and a literal, when neither `bbox` nor an `ngsild.geo*` option holds the request's one `geoQ` | `geoQ` |
+| everything else: `NOT`, `ACCENTI`, `S_TOUCHES`, `S_CROSSES`, a second spatial predicate, the other temporal and array functions, property-property comparisons, arithmetic (`+ - * / % div ^`) | the residual over the view's answer (ADR-0028) |
+
+The residual only drops Features the view already returned, so a filter
+never widens the view or its policy. Its scan reads at most 10 000
+Entities per request; `numberMatched` is omitted past that. A `LIKE`
+pattern that is no literal is `501`; a filter larger than the evaluator
+allows is `400`.
+
+## 5. Writes
 
 A view that offers `create_entity`, `replace_entity`, `merge_entity` or
 `delete_entity` takes `POST /items`, `PUT`, `PATCH` and `DELETE
@@ -112,7 +157,7 @@ and a `405` list in `Allow` the methods the view offers on the resource;
   atomic conditional write, and ignoring one could lose an update. A
   `Content-Crs` other than CRS84 or CRS84h is `400`.
 
-## 5. Refusals and errors
+## 6. Refusals and errors
 
 A method the view does not offer on a resource is `405` with `Allow`, a
 read whose `Accept` takes no JSON `406`. An error is `application/problem+json` (RFC 7807) with a fixed
