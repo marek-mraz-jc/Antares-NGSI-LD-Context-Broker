@@ -1300,6 +1300,20 @@ pub mod test_kit {
 mod tests {
     use super::*;
 
+    /// T-3752: a view's short names expand as the core @context reads them.
+    #[test]
+    fn core_iri_expands_a_short_name_under_the_core_context() {
+        assert_eq!(
+            core_iri("location"),
+            "https://uri.etsi.org/ngsi-ld/location"
+        );
+        assert_eq!(
+            core_iri("BikeHireDockingStation"),
+            "https://uri.etsi.org/ngsi-ld/default-context/BikeHireDockingStation"
+        );
+        assert_eq!(core_iri("https://sdm.org/Car"), "https://sdm.org/Car");
+    }
+
     #[test]
     fn core_terms_are_the_core_contexts_own() {
         for term in ["id", "type", "value", "location", "observedAt"] {
