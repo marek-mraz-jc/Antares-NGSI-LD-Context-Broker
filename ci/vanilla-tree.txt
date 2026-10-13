@@ -1,10 +1,10 @@
-antares-broker v0.1.3
-├── antares-api v0.1.3
-│   ├── antares-notifier v0.1.3
+antares-broker v0.2.0
+├── antares-api v0.2.0
+│   ├── antares-notifier v0.2.0
 │   │   ├── antares-jsonld feature "default"
-│   │   │   └── antares-jsonld v0.1.3
+│   │   │   └── antares-jsonld v0.2.0
 │   │   │       ├── antares-model feature "default"
-│   │   │       │   └── antares-model v0.1.3
+│   │   │       │   └── antares-model v0.2.0
 │   │   │       │       ├── serde feature "default"
 │   │   │       │       │   ├── serde v1.0.229
 │   │   │       │       │   │   ├── serde_core feature "result"
@@ -817,7 +817,7 @@ antares-broker v0.1.3
 │   │   │       ├── rustls feature "std" (*)
 │   │   │       └── rustls feature "tls12" (*)
 │   │   ├── antares-jsonld feature "fetch"
-│   │   │   └── antares-jsonld v0.1.3 (*)
+│   │   │   └── antares-jsonld v0.2.0 (*)
 │   │   ├── antares-model feature "default" (*)
 │   │   ├── serde_json feature "default" (*)
 │   │   ├── tokio feature "default" (*)
@@ -919,7 +919,7 @@ antares-broker v0.1.3
 │   │               └── tokio-stream feature "time"
 │   │                   ├── tokio-stream v0.1.19 (*)
 │   │                   └── tokio feature "time" (*)
-│   ├── antares-sql v0.1.3
+│   ├── antares-sql v0.2.0
 │   │   ├── futures-util v0.3.34 (*)
 │   │   ├── antares-model feature "default" (*)
 │   │   ├── serde_json feature "default" (*)
@@ -934,7 +934,7 @@ antares-broker v0.1.3
 │   │   ├── tokio feature "time" (*)
 │   │   ├── tracing feature "default" (*)
 │   │   ├── antares-ql feature "default"
-│   │   │   └── antares-ql v0.1.3
+│   │   │   └── antares-ql v0.2.0
 │   │   │       ├── geo v0.33.1
 │   │   │       │   ├── geographiclib-rs v0.2.7
 │   │   │       │   │   └── libm v0.2.16
@@ -1191,7 +1191,7 @@ antares-broker v0.1.3
 │   │   │               ├── regex-syntax feature "std" (*)
 │   │   │               └── regex-syntax feature "unicode" (*)
 │   │   ├── antares-store feature "default"
-│   │   │   └── antares-store v0.1.3
+│   │   │   └── antares-store v0.2.0
 │   │   │       ├── antares-jsonld feature "default" (*)
 │   │   │       ├── antares-model feature "default" (*)
 │   │   │       ├── serde_json feature "default" (*)
@@ -2332,7 +2332,7 @@ antares-broker v0.1.3
 │   ├── icu_locale_core feature "default"
 │   │   └── icu_locale_core v2.3.0 (*)
 │   ├── antares-matcher feature "default"
-│   │   └── antares-matcher v0.1.3
+│   │   └── antares-matcher v0.2.0
 │   │       ├── antares-jsonld feature "default" (*)
 │   │       ├── antares-model feature "default" (*)
 │   │       ├── serde_json feature "default" (*)
@@ -2639,12 +2639,12 @@ antares-broker v0.1.3
 ├── tower feature "default" (*)
 ├── tower feature "util" (*)
 ├── antares-sql feature "postgres"
-│   └── antares-sql v0.1.3 (*)
+│   └── antares-sql v0.2.0 (*)
 ├── antares-store feature "default" (*)
 ├── metrics feature "default" (*)
 ├── axum feature "default" (*)
 ├── antares-bus feature "default"
-│   └── antares-bus v0.1.3
+│   └── antares-bus v0.2.0
 │       ├── futures-util v0.3.34 (*)
 │       ├── antares-model feature "default" (*)
 │       ├── serde feature "default" (*)
@@ -3255,7 +3255,7 @@ antares-broker v0.1.3
         └── tracing-opentelemetry v0.33.0 (*)
 [dev-dependencies]
 ├── antares-api feature "test-kit"
-│   └── antares-api v0.1.3 (*)
+│   └── antares-api v0.2.0 (*)
 ├── serde_json feature "default" (*)
 ├── rumqttc feature "use-rustls-no-provider" (*)
 ├── async-trait feature "default" (*)
