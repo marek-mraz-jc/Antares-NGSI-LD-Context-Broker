@@ -11,12 +11,13 @@ rust-version.workspace = true
 [package.metadata.antares]
 role = "surface"
 feature = "ogc"
-protocols = ["linkml-model"]
+protocols = ["linkml-model", "ogc-cql2"]
 
 [dependencies]
 antares-ops = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["query"] }
 linkml-model = { path = "../linkml-model" }
+ogc-cql2 = { path = "../ogc-cql2" }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 uuid = { version = "1", default-features = false, features = ["v4"] }
 

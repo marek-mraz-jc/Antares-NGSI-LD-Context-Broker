@@ -62,12 +62,14 @@ Adopted from the threat model section 9.1 without change:
 | `antares-icsr` | internal context sources (ADR-0025) | `internal-csr` | `antares-ops` |
 | `odata-url`, `odata-csdl`, `odata-json`, `odata-batch`, `odata-axum` | protocol libraries (ADR-0024 decision 1) | none of their own | each other only; never an `antares-*` crate |
 | `linkml-model` | protocol library | none of its own | none in the workspace |
+| `antares-residual` | role `ops`: the residual evaluator of ADR-0028 (rule 2), pure, re-exported by `antares-ops` | none of its own | none in the workspace |
 
 `full = ["views", "odata", "mcp", "linkml", "ws", "internal-csr"]`;
 `default` stays `["mqtt"]` (`crates/antares-broker/Cargo.toml:56`), so
 the default build is vanilla. Every workspace package declares
-`[package.metadata.antares] role = "core" | "ops" | "surface" |
-"protocol" | "addon"` (threat model 9.1).
+`[package.metadata.antares] role = "core" | "ngsild" | "ops" | "surface" |
+"protocol" | "addon"` (threat model 9.1; `ngsild` and its rule M3 added by
+T-3910, `docs/analysis/ngsild-crates.md`).
 
 Decided (worker-2, owner may override): the threat model's feature names
 (`views`, `odata`, `mcp`, `linkml`, `ws`, `internal-csr`), not
@@ -197,7 +199,7 @@ instance type):
 | LinkML document | ≤ 5 ms p99 for a 100-class schema, cached per view revision | computed once per view revision |
 | WebSocket notification | delivery latency p99 ≤ 1.10× HTTP sink p99 to a local receiver (T-3626); ≤ 32 KiB resident per idle connection plus its queue | no socket opened per notification; one queue hop per connection |
 | internal CSR forward | p99 ≤ 0.5× the HTTP forward to the same broker | no socket, no TLS, no second JSON parse of the request line |
-| binary size | `full` release binary ≤ vanilla + 7 MiB (T-3744); each feature alone ≤ vanilla + 2 MiB, except `mcp` ≤ vanilla + 4.5 MiB (T-3662) and `odata` ≤ vanilla + 3.5 MiB (T-3705) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
+| binary size | `full` release binary ≤ vanilla + 10 MiB; each feature alone ≤ vanilla + 10 MiB (owner 2026-10-11: under 10 MiB of growth is fine, T-3775) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
 | vanilla | unchanged within the noise band of T-3467 | GOAL point 1 |
 
 A benchmark per row: criterion benches in each surface crate for the
@@ -255,6 +257,22 @@ Options: raise the `odata` budget (chosen), drop `float_roundtrip` (an
 feature over the feature it implies (changes the rule for every feature),
 size-optimise the OData crates (saves part of 0.6 MiB, still over 2 MiB).
 
+The `ogc` budget, measured 2026-10-11 by `dev/preflight` on the T-3745
+branch (stacked on T-3759), same build: vanilla 31 086 672 bytes;
+`views` 32 391 184 (+1.24 MiB); `ogc` 33 568 368 (+2.37 MiB). `ogc`
+implies `views`, so its own share is 1.13 MiB, inside the per-feature
+2 MiB. Part 3 (T-3745) brings the CQL2 text and JSON parser
+(`ogc-cql2`) and the residual evaluator (`antares-residual`, shared
+with `odata` in `full`) into the `ogc` build.
+
+Decided (worker-6, owner may override): `ogc` ≤ vanilla + 2.5 MiB,
+because its own share over `views` meets the 2 MiB rule and the rest
+is `views` plus the residual that OGC Part 3 needs for what `q` cannot
+say. Options: raise the `ogc` budget (chosen), push only what `q`
+says and answer 501 for the rest (drops most CQL2 conformance classes),
+measure each feature over the feature it implies (changes the rule for
+every feature).
+
 The `full` budget, measured 2026-10-11 in the `binary-size` job of `fast`
 (stripped thin-LTO release binary, x86_64): on dev 7b22710 (run
 38143777118) vanilla 31 110 424 bytes and `full` (views, mcp, odata, ws)
@@ -300,6 +318,12 @@ that one hop, and 1.10× is the noise margin the NGSI-LD view row already
 uses. Options: raise the bound (chosen), write to the socket from the
 notifier task (one slow client stalls every Subscription's delivery),
 keep the 1.0× bound (fails on noise alone, run 3 is below, run 5 above).
+
+Decided (owner, 2026-10-11, T-3775): one ceiling, `full` and each feature
+alone ≤ vanilla + 10 MiB. The per-feature 2 MiB rule and its exceptions
+(`mcp` 4.5, `odata` 3.5, `full` 6 then 7 MiB) cost a budget fight on every
+new surface and two red trains on 2026-10-11 for growth the owner accepts.
+The gate stays, so a surface that pulls in tens of MiB is still red.
 
 ### 7. Code rules for every new crate
 

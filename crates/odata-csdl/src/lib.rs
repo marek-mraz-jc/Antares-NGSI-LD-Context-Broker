@@ -57,8 +57,8 @@ pub use error::{CsdlError, Feature, LimitKind, Problem, ValidationError};
 pub use json::write_json;
 pub use model::{
     Annotation, ComplexType, CsdlVersion, EntityContainer, EntitySet, EntityType, Expr, Include,
-    Model, NavigationProperty, NavigationPropertyBinding, Property, Reference, Scale, Schema, Srid,
-    Term, TypeRef,
+    Model, NavigationProperty, NavigationPropertyBinding, Property, Reference,
+    ReferentialConstraint, Scale, Schema, Srid, Term, TypeRef,
 };
 pub use names::{is_namespace, is_simple_identifier};
 pub use validate::{validate, Limits};

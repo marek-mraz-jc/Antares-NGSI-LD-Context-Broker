@@ -166,7 +166,7 @@ jobs:
       # synchronous driver traits, so it is not going away; the drivers are
       # proven by the integration files that declare
       # `flavor = "multi_thread"` and by the postgres and timescale ETSI
-      # cells. The ten crates the crate-test step below names test their
+      # cells. The crates the crate-test step below names test their
       # library from their own tests/ directory, which `--lib` never runs,
       # so they are measured there, against their own tests (T-3715).
       # Nothing else is excluded: a file that in-crate tests COULD reach and
@@ -176,7 +176,7 @@ jobs:
           set -eo pipefail
           rc=0
           cargo llvm-cov --locked --workspace --lib --bins --summary-only \
-            --ignore-filename-regex 'antares-store/src/contract\.rs|antares-sql/src/store/pg/|crates/(antares-mcp|antares-odata|antares-ops|antares-views|antares-wasm|antares-ws|linkml-model|odata-axum|odata-batch|odata-json)/' \
+            --ignore-filename-regex 'antares-store/src/contract\.rs|antares-sql/src/store/pg/|crates/(antares-mcp|antares-odata|antares-ops|antares-views|antares-wasm|antares-ws|linkml-model|odata-axum|odata-batch|odata-json|ogc-cql2)/' \
             --fail-under-lines 82 --fail-under-functions 79 > unit-cov.txt || rc=$?
           { echo "### Coverage floor — unit (lib + bins)"; echo '```'
             cat unit-cov.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -200,7 +200,8 @@ jobs:
       # The crates whose library is tested from its own tests/ directory and
       # that the API step does not name: every test of the package runs
       # (lib, bins and tests/), and `-p` reports only these packages' files.
-      # Measured 2026-10-11: 98.96 % lines / 98.06 % functions (T-3715).
+      # Measured 2026-10-11: 98.96 % lines / 98.06 % functions (T-3715);
+      # ogc-cql2 joined 2026-10-12 at 100 % / 100 % (T-3984).
       - name: Crate test floor (crates tested from tests/)
         if: always()
         run: |
@@ -208,7 +209,7 @@ jobs:
           rc=0
           cargo llvm-cov --locked -p antares-mcp -p antares-odata -p antares-ops \
             -p antares-views -p antares-wasm -p antares-ws -p linkml-model \
-            -p odata-axum -p odata-batch -p odata-json --summary-only \
+            -p odata-axum -p odata-batch -p odata-json -p ogc-cql2 --summary-only \
             --fail-under-lines 96 --fail-under-functions 95 > crate-cov.txt || rc=$?
           { echo "### Coverage floor — crate tests"; echo '```'
             cat crate-cov.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -300,7 +301,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [antares-model, antares-ql, antares-matcher, linkml-model, odata-csdl, odata-url, odata-json, odata-batch]
+        crate: [antares-model, antares-ql, antares-matcher, linkml-model, odata-csdl, odata-url, odata-json, odata-batch, antares-residual]
     env:
           # ignore-leaks: crossbeam-epoch parks its per-thread handle in a thread-local
           # that Miri reports as leaked at exit; not a broker leak.

@@ -4,7 +4,7 @@
 //! names, and how it refuses.
 
 use antares_ops::policy::{
-    Decision, DecisionFuture, Filter, NotifyDecision, Operation, PolicyEngine, Subject,
+    Decision, DecisionFuture, Filter, NotifyDecision, Operation, PolicyEngine, Rule, Subject,
 };
 use antares_ops::test_kit::TestBroker;
 use axum::body::Body;
@@ -413,7 +413,7 @@ async fn an_oversized_schema_is_refused_and_the_surface_stays_closed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_schema_outside_the_subset_or_none_closes_the_surface() {
     let mut outside = schema();
-    outside["imports"] = json!(["linkml:types"]);
+    outside["imports"] = json!(["https://w3id.org/biolink/biolink-model"]);
     let app = broker(None, &view(&READS), Some(&outside))
         .await
         .expect("a broker");
@@ -594,4 +594,182 @@ async fn linkml_a_view_of_everything_serves_every_class_and_slot() {
         None,
         "nothing is left out"
     );
+}
+
+/// The population cube (DM-60): `PopulationObservation` is a Data Structure
+/// Definition with three dimensions and a measure; `District` is none.
+fn population() -> Value {
+    let role = |r: &str| json!({"qb_component": {"tag": "qb_component", "value": r}});
+    json!({
+      "id": "https://e.org/population", "name": "population",
+      "prefixes": {"bb": {"prefix_prefix": "bb", "prefix_reference": "https://e.org/bb/"}},
+      "default_prefix": "bb",
+      "classes": {
+        "PopulationObservation": {
+          "slots": ["refDistrict", "ageBand", "year", "population", "source"],
+          "annotations": {"qb_dsd": {"tag": "qb_dsd", "value": "true"}}
+        },
+        "District": {"slots": ["source"]}
+      },
+      "slots": {
+        "refDistrict": {"range": "uriorcurie", "required": true, "annotations": role("dimension")},
+        "ageBand": {"range": "string", "required": true, "annotations": role("dimension")},
+        "year": {"range": "integer", "required": true, "annotations": role("dimension")},
+        "population": {"range": "integer", "required": true, "annotations": role("measure")},
+        "source": {"range": "string"}
+      }
+    })
+}
+
+/// A view `cars` of the population schema showing `types` with `slots`.
+fn cube_view(types: &[&str], slots: &[&str]) -> Value {
+    let bb = |names: &[&str]| -> Vec<String> { names.iter().map(|n| format!("bb:{n}")).collect() };
+    json!({
+      "id": "cars", "tenant": "city", "@context": {"bb": "https://e.org/bb/"},
+      "selector": bb(types),
+      "rules": [{"types": bb(types), "attributes": bb(slots)}],
+      "operations": READS
+    })
+}
+
+const COMPONENTS: [&str; 5] = ["refDistrict", "ageBand", "year", "population", "source"];
+
+/// T-3805: a view that shows a Data Structure Definition serves its cube,
+/// lists it in the index, and answers `qb` with the same bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cube_of_a_shown_dsd_names_each_component_by_its_role() {
+    let view = cube_view(&["PopulationObservation", "District"], &COMPONENTS);
+    let app = broker(None, &view, Some(&population()))
+        .await
+        .expect("a broker");
+    let (s, h, cube) = get(&app, "schema/v1/model.qb.ttl").await;
+    assert_eq!(s, StatusCode::OK, "{cube}");
+    assert_eq!(h[header::CONTENT_TYPE], "text/turtle");
+    assert!(cube.contains(
+        "<https://e.org/bb/PopulationObservationStructure> a qb:DataStructureDefinition"
+    ));
+    for dimension in ["refDistrict", "ageBand", "year"] {
+        assert!(
+            cube.contains(&format!("[ qb:dimension <https://e.org/bb/{dimension}> ]")),
+            "{cube}"
+        );
+    }
+    assert!(cube.contains("[ qb:measure <https://e.org/bb/population> ]"));
+    assert!(
+        !cube.contains("bb/source>") && !cube.contains("bb/District>"),
+        "{cube}"
+    );
+    assert_eq!(get(&app, "schema/v1/qb").await.2, cube);
+    let (_, _, index) = get(&app, "schema/index.json").await;
+    assert!(index.contains("\"model.qb.ttl\""), "{index}");
+}
+
+/// T-3805, LK1/LK8: a dimension the view or the engine hides is no
+/// component; a model whose shown classes hold no Data Structure Definition
+/// has no cube, and its 404 is the one an unknown document gets.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hidden_dimension_or_dsd_leaves_no_trace_in_the_cube() {
+    let narrow = cube_view(&["PopulationObservation"], &["year", "population"]);
+    let app = broker(None, &narrow, Some(&population()))
+        .await
+        .expect("a broker");
+    let (s, _, cube) = get(&app, "schema/v1/model.qb.ttl").await;
+    assert_eq!(s, StatusCode::OK, "{cube}");
+    assert!(cube.contains("bb/year>") && cube.contains("bb/population>"));
+    assert!(
+        !cube.contains("ageBand") && !cube.contains("refDistrict"),
+        "{cube}"
+    );
+
+    let all = cube_view(&["PopulationObservation"], &COMPONENTS);
+    let engine = Arc::new(OmitAgeBand);
+    let app = broker(Some(engine), &all, Some(&population()))
+        .await
+        .expect("a broker");
+    let (_, _, cube) = get(&app, "schema/v1/model.qb.ttl").await;
+    assert!(
+        cube.contains("bb/year>") && !cube.contains("ageBand"),
+        "{cube}"
+    );
+
+    let districts = cube_view(&["District"], &["source"]);
+    let app = broker(None, &districts, Some(&population()))
+        .await
+        .expect("a broker");
+    let (s, _, absent) = get(&app, "schema/v1/model.qb.ttl").await;
+    let (_, _, unknown) = get(&app, "schema/v1/model.nothing").await;
+    assert_eq!((s, &absent), (StatusCode::NOT_FOUND, &unknown));
+    assert!(!absent.contains("PopulationObservation"));
+    let (_, _, index) = get(&app, "schema/index.json").await;
+    assert!(!index.contains("model.qb.ttl"), "{index}");
+    let (_, _, owl) = get(&app, "schema/v1/model.owl.ttl").await;
+    assert!(!owl.contains("qb:"), "{owl}");
+}
+
+/// Omits the `ageBand` dimension from every discovery answer, as a grant
+/// without it would.
+struct OmitAgeBand;
+
+impl PolicyEngine for OmitAgeBand {
+    fn name(&self) -> &'static str {
+        "omit-age-band"
+    }
+    fn decide<'a>(&'a self, _: &'a Subject, _: &'a Operation<'a>) -> DecisionFuture<'a> {
+        Box::pin(std::future::ready(Decision::Filter(Filter {
+            omit: vec!["https://e.org/bb/ageBand".into()],
+            ..Filter::default()
+        })))
+    }
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// Grants the whole Car Entity, as a Policy naming the type without
+/// `propertyNames` does (`Rule::every_attribute`, T-3637).
+struct WholeCar;
+
+impl PolicyEngine for WholeCar {
+    fn name(&self) -> &'static str {
+        "whole-car"
+    }
+    fn decide<'a>(&'a self, _: &'a Subject, _: &'a Operation<'a>) -> DecisionFuture<'a> {
+        Box::pin(std::future::ready(Decision::Filter(Filter {
+            rules: vec![Rule {
+                types: vec!["https://e.org/city/Car".into()],
+                every_attribute: true,
+                ..Rule::default()
+            }],
+            ..Filter::default()
+        })))
+    }
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// T-3798: under a grant over the whole Entity a view of `*` (ADR-0023
+/// rule 12, no rule of its own) keeps every slot of the granted class, and
+/// no class the grant does not name.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_grant_over_the_whole_entity_keeps_every_slot_of_its_class() {
+    let all = json!({
+      "id": "cars", "tenant": "city", "selector": ["*"],
+      "rules": [{"types": ["*"], "attributes": ["*"]}],
+      "operations": READS
+    });
+    let app = broker(Some(Arc::new(WholeCar)), &all, Some(&schema()))
+        .await
+        .expect("a broker");
+    let (s, _, car) = get(&app, "classes/Car").await;
+    assert_eq!(s, StatusCode::OK, "{car}");
+    let car: Value = serde_json::from_str(&car).expect("json");
+    let slots: Vec<&str> = car["slots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    assert_eq!(slots, ["speed", "owner", "fuel", "owner_secret"], "{car}");
+    assert_eq!(get(&app, "classes/Person").await.0, StatusCode::NOT_FOUND);
 }

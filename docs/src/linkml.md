@@ -35,7 +35,9 @@ ADR-0023 rule 5), never from the stored schema (LK1):
   shows;
 - a slot is kept on a class when a rule for that type shows the Attribute
   (`slot_uri`, else the default prefix and its name), less the engine's
-  `pick`, `omit` and `omit_by_type`; a rule's condition is not read;
+  `pick`, `omit` and `omit_by_type`; an engine's grant over the whole
+  Entity (a Policy naming the type without `propertyNames`) shows every
+  slot of its types; a rule's condition is not read;
 - `is_a` stays only when the parent is kept and shows nothing the child
   does not;
 - a range to a hidden class becomes `uriorcurie`, with the slot's kind
@@ -62,14 +64,25 @@ refusal never tells that the name is there (LK1).
 | `schema/v{major}/context.jsonld` or `.../context` | JSON-LD `@context` of the kept terms | 5.7.6 |
 | `schema/v{major}/model.shacl.ttl` or `.../shacl` | SHACL | 5.7.6 |
 | `schema/v{major}/model.owl.ttl`, `model.rdf.ttl`, `model.md` (`owl`, `rdf`, `docs`) | OWL, RDFS, Markdown | 5.7.6 |
+| `schema/v{major}/model.qb.ttl` or `.../qb` | the RDF Data Cube structure, only when a kept class is a Data Structure Definition (below) | 5.7.6 |
 | `schema/v{major}/model` | the formalism `Accept` names (Turtle is SHACL, `profile="owl"` OWL, YAML LinkML, Markdown, `ld+json` the context, else JSON Schema) | 5.7.6 |
 | `classes/{class}` | one class with its slots (JSON) | Retrieve Entity Type Information (5.7.7) |
 | `slots/{slot}` | one slot with its range, kind and the classes using it (JSON) | Retrieve Attribute Information (5.7.10) |
 
 `{major}` is the leading number of the schema's `version` (`1` when it has
-none). A hidden class or slot, an unknown major, `model.qb.ttl` (the
-subset holds no Data Structure Definition) and any other path answer `404`
-with the same body as one that does not exist (LK8).
+none). A hidden class or slot, an unknown major, the cube of a model whose
+kept classes hold no Data Structure Definition, and any other path answer
+`404` with the same body as one that does not exist (LK8).
+
+A class annotated `qb_dsd: "true"` is an RDF Data Cube Data Structure
+Definition (DM-60), and its slots annotated `qb_component: dimension` or
+`measure` are its components; any other value of either makes the schema
+one the subset cannot read, which closes the surface (LK4). `model.qb.ttl` has one `qb:DataStructureDefinition` per kept
+class that is one, its components the kept slots with a role, the class a
+subclass of `qb:Observation`; the OWL types the same class and slots. A
+dimension the view or the engine hides is no component, and a hidden
+Data Structure Definition leaves no cube: the index lists `model.qb.ttl`
+only when it exists.
 
 ## 4. Caching
 

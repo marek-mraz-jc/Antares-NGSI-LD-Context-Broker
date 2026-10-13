@@ -455,21 +455,53 @@ impl PgTemporalStore {
         shell: &Value,
         additions: &Value,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = super::begin(&self.pool).await?;
+        self.append_in(&mut tx, tenant, id, shell, additions)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// [`Self::append`] of a whole drained request in one transaction
+    /// (T-4085): a batch of N Entities costs one BEGIN, not N. Each append
+    /// keeps its own liveness check and tenant.
+    pub async fn append_many(
+        &self,
+        appends: &[(&TenantId, &str, &Value, Value)],
+    ) -> Result<(), sqlx::Error> {
+        if appends.is_empty() {
+            return Ok(());
+        }
+        let mut tx = super::begin(&self.pool).await?;
+        for (tenant, id, shell, additions) in appends {
+            self.append_in(&mut tx, tenant, id, shell, additions)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn append_in(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+        tenant: &TenantId,
+        id: &str,
+        shell: &Value,
+        additions: &Value,
+    ) -> Result<(), sqlx::Error> {
         let (types, scopes, created, modified) = extract(shell);
         let meta = meta_of(shell);
         let rows = decompose(additions);
-        let mut tx = super::begin(&self.pool).await?;
-        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        crate::store::pg::set_tenant(tx, tenant).await?;
         if !self.temporal_only {
             let live = sqlx::query(
                 "SELECT 1 FROM entities WHERE tenant_id = $1 AND id = $2 FOR KEY SHARE",
             )
             .bind(tenant.as_str())
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?;
             if live.is_none() {
-                tx.commit().await?;
                 return Ok(());
             }
         }
@@ -498,11 +530,9 @@ impl PgTemporalStore {
         .bind(&meta)
         .bind(&created)
         .bind(&modified)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        insert_rows(&mut tx, tenant, id, rows).await?;
-        tx.commit().await?;
-        Ok(())
+        insert_rows(tx, tenant, id, rows).await
     }
 
     pub async fn get(&self, tenant: &TenantId, id: &str) -> Result<Option<Value>, sqlx::Error> {
@@ -716,10 +746,12 @@ impl PgTemporalStore {
                 // refused range shape: reconstruct unpruned, window arbitrates.
                 // The default filter has neither range nor lastN, the two
                 // shapes the compiler can refuse: pinned by
-                // `the_unpruned_fallback_always_compiles`.
-                #[allow(clippy::expect_used)]
+                // `the_unpruned_fallback_always_compiles`. A request reaches
+                // this line: a refusal is an error, never a panic (T-3915).
                 None => attr_object_expr(&TemporalFilter::default(), n_where.saturating_add(1))
-                    .expect("no range/lastN always compiles"),
+                    .ok_or_else(|| {
+                        sqlx::Error::Protocol("the unpruned temporal shape did not compile".into())
+                    })?,
             },
         };
         binds.extend(extra.into_iter().map(B::Text));
@@ -825,11 +857,13 @@ impl PgTemporalStore {
     ) -> Result<Option<Value>, sqlx::Error> {
         // Same unpruned fallback as `query_inner`, and compiling for the
         // same reason: no range and no lastN is the shape that never refuses.
-        #[allow(clippy::expect_used)]
+        // A request reaches this line: a refusal here is an error, never a
+        // panic (T-3915).
         let (attr_expr, binds) = match attr_object_expr(f, 3) {
             Some(v) => v,
-            None => attr_object_expr(&TemporalFilter::default(), 3)
-                .expect("no range/lastN always compiles"),
+            None => attr_object_expr(&TemporalFilter::default(), 3).ok_or_else(|| {
+                sqlx::Error::Protocol("the unpruned temporal shape did not compile".into())
+            })?,
         };
         // 4.22: an expired entity is invalid → None (404), same as get().
         let sql = format!(

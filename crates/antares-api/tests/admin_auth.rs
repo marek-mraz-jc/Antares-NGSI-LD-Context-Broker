@@ -15,10 +15,13 @@ use tower::ServiceExt;
 const SECRET: &str = "a-test-secret-of-at-least-32-bytes!";
 
 /// Every guarded route, with a method it serves.
-const GUARDED: [(&str, &str); 7] = [
+const GUARDED: [(&str, &str); 10] = [
     ("GET", "/q/tenants"),
     ("GET", "/q/tenants/acme"),
     ("DELETE", "/q/tenants/acme"),
+    ("GET", "/q/tenants/acme/digest"),
+    ("GET", "/q/tenants/acme/export"),
+    ("POST", "/q/tenants/acme/import"),
     ("GET", "/q/dead-letters"),
     ("DELETE", "/q/dead-letters/urn:dl:1"),
     ("POST", "/q/dead-letters/urn:dl:1/replay"),

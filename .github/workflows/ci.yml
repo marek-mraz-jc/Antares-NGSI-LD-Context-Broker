@@ -107,6 +107,30 @@ jobs:
       contents: read
       actions: write # the summary job deletes the merged per-cell artifacts
 
+  views-differential:
+    # T-3777: the views differential at 2 000 cases (the workspace suite in
+    # `fast` runs it at the default 200): generated Entities, views and
+    # policies, every surface against NGSI-LD through the same view. A red
+    # run prints VIEWS_DIFF_SEED and the shrunk case as a corpus file.
+    name: Views differential (2 000 cases)
+    needs: workspace
+    if: ${{ !cancelled() && contains(fromJSON('["success", "skipped"]'), needs.workspace.result) && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      VIEWS_DIFF_CASES: "2000"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.HEAD_SHA }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: views-differential
+      - run: cargo test --locked -p antares-broker --features full,jc-policy,linkml,internal-csr --test views_matrix every_surface_answers_what_ngsi_ld_admits_for_generated -- --nocapture
+
   build-arm:
     permissions:
       contents: read
@@ -129,12 +153,13 @@ jobs:
     name: Publish the dev image to GHCR
     # Runs on dev publish :dev; PRs never do. All signals — workspace
     # tests, the cell matrix (quick preset, all 10 suites incl. IOP per
-    # cell) and the arm build — must be green.
+    # cell), the views differential and the arm build — must be green.
     if: >-
       github.ref == 'refs/heads/dev' && !cancelled()
       && contains(fromJSON('["success", "skipped"]'), needs.workspace.result)
       && needs.matrix.result == 'success' && needs.build-arm.result == 'success'
-    needs: [workspace, matrix, build-arm]
+      && needs.views-differential.result == 'success'
+    needs: [workspace, matrix, build-arm, views-differential]
     runs-on: ubuntu-latest
     permissions:
       packages: write
