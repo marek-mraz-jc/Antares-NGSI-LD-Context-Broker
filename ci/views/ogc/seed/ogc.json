@@ -1,0 +1,141 @@
+[
+  {
+    "id": "urn:ngsi-ld:AirQualityObserved:bb-1",
+    "type": "AirQualityObserved",
+    "temperature": {
+      "type": "Property",
+      "value": 11.5,
+      "observedAt": "2026-05-01T08:00:00Z"
+    },
+    "NO2": {
+      "type": "Property",
+      "value": 22,
+      "observedAt": "2026-05-01T08:00:00Z"
+    },
+    "location": {
+      "type": "GeoProperty",
+      "value": {
+        "type": "Point",
+        "coordinates": [
+          19.15,
+          48.73
+        ]
+      }
+    },
+    "scope": "/SK/BB",
+    "nearest": {
+      "type": "Relationship",
+      "object": "urn:ngsi-ld:AirQualityObserved:ba-1"
+    }
+  },
+  {
+    "id": "urn:ngsi-ld:AirQualityObserved:bb-2",
+    "type": "AirQualityObserved",
+    "temperature": {
+      "type": "Property",
+      "value": 9.0,
+      "observedAt": "2026-05-01T09:00:00Z"
+    },
+    "NO2": {
+      "type": "Property",
+      "value": 31,
+      "observedAt": "2026-05-01T09:00:00Z"
+    },
+    "location": {
+      "type": "GeoProperty",
+      "value": {
+        "type": "Point",
+        "coordinates": [
+          19.16,
+          48.74
+        ]
+      }
+    },
+    "scope": "/SK/BB"
+  },
+  {
+    "id": "urn:ngsi-ld:AirQualityObserved:ba-1",
+    "type": "AirQualityObserved",
+    "temperature": {
+      "type": "Property",
+      "value": 14.2,
+      "observedAt": "2026-05-01T10:00:00Z"
+    },
+    "NO2": {
+      "type": "Property",
+      "value": 40,
+      "observedAt": "2026-05-01T10:00:00Z"
+    },
+    "location": {
+      "type": "GeoProperty",
+      "value": {
+        "type": "Point",
+        "coordinates": [
+          17.11,
+          48.15
+        ]
+      }
+    },
+    "scope": "/SK/BA"
+  },
+  {
+    "id": "urn:ngsi-ld:Reading:1",
+    "type": "Reading",
+    "district": {
+      "type": "Property",
+      "value": "Kallio"
+    },
+    "month": {
+      "type": "Property",
+      "value": "2026-09"
+    },
+    "pm25": {
+      "type": "Property",
+      "value": 12.5
+    },
+    "note": {
+      "type": "Property",
+      "value": "internal"
+    }
+  },
+  {
+    "id": "urn:ngsi-ld:Reading:2",
+    "type": "Reading",
+    "district": {
+      "type": "Property",
+      "value": "Kallio"
+    },
+    "month": {
+      "type": "Property",
+      "value": "2026-09"
+    },
+    "pm25": {
+      "type": "Property",
+      "value": 31.0
+    },
+    "note": {
+      "type": "Property",
+      "value": "internal"
+    }
+  },
+  {
+    "id": "urn:ngsi-ld:Reading:3",
+    "type": "Reading",
+    "district": {
+      "type": "Property",
+      "value": "Vallila"
+    },
+    "month": {
+      "type": "Property",
+      "value": "2026-09"
+    },
+    "pm25": {
+      "type": "Property",
+      "value": 22.0
+    },
+    "note": {
+      "type": "Property",
+      "value": "internal"
+    }
+  }
+]
