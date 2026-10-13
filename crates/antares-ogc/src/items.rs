@@ -816,10 +816,12 @@ type Read = (Vec<Value>, Option<usize>, Option<usize>);
 /// option is the broker's own 400.
 fn scanned(answer: Result<Scanned, Refusal>) -> Result<Read, Problem> {
     match answer {
+        // no `ngsild.join` is forwarded (NGSILD), so no join walk is cut short
         Ok(Scanned::Page {
             entities,
             next,
             count,
+            ..
         }) => Ok((entities, next, count)),
         // A Tenant that holds nothing yet answers 404 (5.5.10): an empty collection.
         Ok(Scanned::Answer(answer)) if answer.status() == StatusCode::NOT_FOUND => {
