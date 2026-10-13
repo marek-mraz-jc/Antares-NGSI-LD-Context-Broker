@@ -286,14 +286,15 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
     let schema = parsed(revision, &bytes)?;
     // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
     let every = view.shows_every_name().then(|| schema.slot_iris_by_class());
-    let edm = edm::build(
-        id,
-        &schema,
-        every.as_ref().unwrap_or(&key.1),
-        key.2,
-        version,
-    )
-    .ok()?;
+    // A view's names are the Entities' IRIs; the schema's may be another vocabulary's.
+    let viewed;
+    let schema = if every.is_some() {
+        &*schema
+    } else {
+        viewed = schema.as_shown(&key.1, antares_ops::core_iri);
+        &viewed
+    };
+    let edm = edm::build(id, schema, every.as_ref().unwrap_or(&key.1), key.2, version).ok()?;
     tracing::debug!(
         view = id,
         schema_revision = revision,

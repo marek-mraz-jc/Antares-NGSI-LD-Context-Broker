@@ -357,6 +357,71 @@ impl Model {
         self.expand(uri.unwrap_or(name))
     }
 
+    /// The same model with the IRI `class` gives a class and `slot` gives a slot, by name and
+    /// own IRI, in place of its own; a name either answers `None` for keeps its IRI. For a
+    /// reader that knows the schema's names under other IRIs, a view's among them.
+    ///
+    /// ```
+    /// # let m = linkml_model::Model::read(br#"{"id": "https://e.org/s/", "name": "s",
+    /// #   "classes": {"Room": {}}, "slots": {"name": {}}}"#,
+    /// #     &linkml_model::Limits { max_bytes: 999, max_depth: 4, max_elements: 9 }).unwrap();
+    /// let r = m.renamed(|c, _| Some(format!("https://o.org/{c}")), |_, _| None);
+    /// assert_eq!(r.class_iri("Room"), "https://o.org/Room");
+    /// assert_eq!(r.slot_iri("name"), "https://e.org/s/name");
+    /// ```
+    #[must_use]
+    pub fn renamed(
+        &self,
+        class: impl Fn(&str, &str) -> Option<String>,
+        slot: impl Fn(&str, &str) -> Option<String>,
+    ) -> Self {
+        let mut schema = self.schema.clone();
+        for (name, c) in &mut schema.classes {
+            if let Some(iri) = class(name, &self.class_iri(name)) {
+                c.class_uri = Some(iri);
+            }
+        }
+        for (name, s) in &mut schema.slots {
+            if let Some(iri) = slot(name, &self.slot_iri(name)) {
+                s.slot_uri = Some(iri);
+            }
+        }
+        Self { schema }
+    }
+
+    /// The model under the IRIs `shown` (type IRI to Attribute IRIs) knows its classes and
+    /// slots by (T-3752): a class or slot whose own IRI `shown` lacks, but whose name under
+    /// `expand` it holds, takes that IRI. A reader whose names are short names read under
+    /// another @context than the schema's vocabulary (a broker view's, ADR-0020) then still
+    /// finds them.
+    ///
+    /// ```
+    /// # use std::collections::{BTreeMap, BTreeSet};
+    /// let m = linkml_model::Model::read(br#"{"id": "https://e.org/s/", "name": "s",
+    ///   "classes": {"Car": {"class_uri": "https://sdm.org/Car"}}, "slots": {"speed": {}}}"#,
+    ///   &linkml_model::Limits { max_bytes: 999, max_depth: 4, max_elements: 9 }).unwrap();
+    /// let shown = BTreeMap::from([("v:Car".to_owned(), BTreeSet::from(["v:speed".to_owned()]))]);
+    /// let viewed = m.as_shown(&shown, |name| format!("v:{name}"));
+    /// assert_eq!(viewed.class_iri("Car"), "v:Car");
+    /// assert_eq!(viewed.slot_iri("speed"), "v:speed");
+    /// ```
+    #[must_use]
+    pub fn as_shown(
+        &self,
+        shown: &BTreeMap<String, std::collections::BTreeSet<String>>,
+        expand: impl Fn(&str) -> String,
+    ) -> Self {
+        let attrs: std::collections::BTreeSet<&String> = shown.values().flatten().collect();
+        let by_name = |known: &dyn Fn(&String) -> bool, name: &str, own: &str| {
+            let short = expand(name);
+            (!known(&own.to_owned()) && known(&short)).then_some(short)
+        };
+        self.renamed(
+            |name, own| by_name(&|iri| shown.contains_key(iri), name, own),
+            |name, own| by_name(&|iri| attrs.contains(iri), name, own),
+        )
+    }
+
     /// What a slot's range names; `string` when it states none.
     ///
     /// ```
