@@ -244,7 +244,7 @@ async fn retain_and_read_back_hold_under_the_non_superuser_role() {
     let admin = pg::connect(&url, 5).await.expect("connect");
     for stmt in [
         "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
-         EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
         "GRANT USAGE ON SCHEMA public TO antares_app",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
     ] {

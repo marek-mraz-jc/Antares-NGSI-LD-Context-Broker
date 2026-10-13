@@ -771,7 +771,7 @@ pub(crate) async fn sweep_expired_registrations(st: &AppState, tenant: &TenantId
     {
         return 0;
     }
-    let mut n = 0;
+    let mut n: usize = 0;
     for id in dead {
         if st
             .store
@@ -779,7 +779,7 @@ pub(crate) async fn sweep_expired_registrations(st: &AppState, tenant: &TenantId
             .await
             .unwrap_or(false)
         {
-            n += 1;
+            n = n.saturating_add(1);
         }
     }
     n

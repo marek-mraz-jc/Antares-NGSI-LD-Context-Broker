@@ -469,7 +469,7 @@ async fn the_extractor_parses_below_the_service_root_and_answers_refusals_with_t
             "/odata/Buildings?$filter=width%20eq%201",
             StatusCode::BAD_REQUEST,
         ),
-        ("/odata/Buildings?$search=blue", StatusCode::NOT_IMPLEMENTED),
+        ("/odata/Buildings?$index=1", StatusCode::NOT_IMPLEMENTED),
         ("/odata/Buildings?$top=1&$top=2", StatusCode::BAD_REQUEST),
         ("/odata/Buildings?$top=x", StatusCode::BAD_REQUEST),
         ("/odata/Buildings?mine=yes", StatusCode::BAD_REQUEST),

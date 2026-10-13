@@ -50,7 +50,21 @@ async fn conformance_lists_what_is_served() -> Result<(), String> {
     let f = fixture().await?;
     let a = get(&f.app, &format!("{ROOT}/conformance")).await;
     assert_eq!(a.status, StatusCode::OK);
-    assert_eq!(a.body, json!({"conformsTo": antares_ogc::CONFORMANCE}));
+    let read_only: Vec<&str> = antares_ogc::CONFORMANCE
+        .into_iter()
+        .filter(|c| !c.contains("ogcapi-features-4"))
+        .collect();
+    assert_eq!(
+        a.body,
+        json!({"conformsTo": read_only}),
+        "a view that offers no write declares no Part 4 class (W4)"
+    );
+    let fleet = get(&f.app, "/x/views/fleet/ogc/features/conformance").await;
+    assert_eq!(
+        fleet.body,
+        json!({"conformsTo": antares_ogc::CONFORMANCE}),
+        "the fleet view offers all four writes"
+    );
     Ok(())
 }
 
@@ -92,7 +106,9 @@ async fn unknown_and_invalid_parameters_are_400() -> Result<(), String> {
         format!("{ROOT}/collections?limit=1"),
         format!("{ROOT}/collections/Car?bbox=0,0,1,1"),
         format!("{ROOT}/collections/Car/items/urn:ngsi-ld:Car:1?limit=1"),
-        format!("{ROOT}/collections/Car/items?speed=10"),
+        // `speed=10` is a queryable parameter (Part 3, T-3745); an unknown name is not.
+        format!("{ROOT}/collections/Car/items?wheels=10"),
+        format!("{ROOT}/collections/Car/items?speed=fast"),
         format!("{ROOT}/collections/Car/items?crs=http://www.opengis.net/def/crs/EPSG/0/4326"),
         format!("{ROOT}/collections/Car/items?limit=0"),
         format!("{ROOT}/collections/Car/items?limit=10001"),

@@ -110,9 +110,6 @@ fn elsewhere(rule: &str) -> Option<&'static str> {
 
 /// Rules that lie wholly outside the subset (T-3441): never accepted.
 const OUTSIDE: &[&str] = &[
-    "search",
-    "searchExpr",
-    "compute",
     "deltatoken",
     "isofExpr",
     "functionParameter",
@@ -133,6 +130,24 @@ const OUTSIDE: &[&str] = &[
     "geometryPolygon",
 ];
 
+/// Cases the parser answers otherwise than the file, by input: whether it accepts them, and why
+/// that answer is the right one.
+const DEVIATIONS: &[(&str, bool, &str)] = &[
+    (
+        // `customQueryOption = customName [ EQ customValue ]` matches the second `more`
+        "$search=more&more",
+        true,
+        "accepted: `&more` is a custom option",
+    ),
+    (
+        // the file's constraints make the computed name a complex collection property of every
+        // type, the flat model's too: a `$compute` name must differ from the type's names
+        "$compute=@Core.Messages as _at_Core_dot_Messages&$select=_at_Core_dot_Messages($top=5)",
+        false,
+        "refused: the computed name is a declared property",
+    ),
+];
+
 /// The URL around a case of `rule`.
 fn prefix(rule: &str) -> &'static str {
     match rule {
@@ -142,6 +157,7 @@ fn prefix(rule: &str) -> &'static str {
             "Customers?"
         }
         "anyExpr" => "Customers?$filter=Items/",
+        "searchExpr" => "Customers?$search=",
         _ => "Customers?$filter=",
     }
 }
@@ -185,7 +201,7 @@ fn literal_rule(rule: &str) -> Option<fn(&Literal) -> bool> {
         "primitiveLiteral" => |_| true,
         r if OUTSIDE.contains(&r)
             && !r.ends_with("Expr")
-            && !["search", "compute", "deltatoken", "functionParameter"].contains(&r) =>
+            && !["deltatoken", "functionParameter"].contains(&r) =>
         {
             |_| false
         }
@@ -203,11 +219,15 @@ const ONE_OPTION: &[&str] = &[
     "orderby",
     "orderBy",
     "skiptoken",
+    "search",
+    "compute",
 ];
 
 fn option_count(o: &QueryOptions) -> usize {
     let system = [
         o.filter.is_some(),
+        o.search.is_some(),
+        o.compute.is_some(),
         o.select.is_some(),
         o.expand.is_some(),
         o.orderby.is_some(),
@@ -251,6 +271,12 @@ fn matches_rule(rule: &str, uri: &ODataUri) -> bool {
 fn judge(case: &Value, model: &Flat, limits: &Limits) -> Option<(bool, String)> {
     let rule = case.get("Rule")?.as_str()?;
     let input = case.get("Input")?.as_str()?;
+    if let Some((_, accepted, why)) = DEVIATIONS.iter().find(|(i, _, _)| *i == input) {
+        let parsed = parse(&format!("{}{input}", prefix(rule)), model, limits);
+        if parsed.is_ok() == *accepted {
+            return Some((true, format!("deviation, {why}")));
+        }
+    }
     // The YAML is read without type inference, so `FailAt` may arrive as a string.
     let fail_at = case.get("FailAt").and_then(|v| {
         v.as_u64()

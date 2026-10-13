@@ -1,7 +1,8 @@
 name: image-jc
 
-# The joinedcontext platform's broker image (T-3636): the `full` surfaces
-# and the platform's policy engine (`--features full,jc-policy`), published
+# The joinedcontext platform's broker image (T-3636): the `full` surfaces,
+# the LinkML schema surface the gateway's schema routes forward to (T-3803)
+# and the platform's policy engine (`--features full,jc-policy,linkml`), published
 # as `antares-broker-jc` — never as `antares-broker`, which stays the
 # vanilla image full.yml releases. Before anything is pushed, the image
 # proves what it carries (its auditable dependency list holds every surface
@@ -26,9 +27,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FEATURES: full,jc-policy
+  FEATURES: full,jc-policy,linkml
   # what the jc image must carry, by crate name in its auditable list
-  CARRIES: antares-views antares-mcp antares-odata antares-ws joinedcontext-policy
+  CARRIES: antares-views antares-mcp antares-odata antares-ws antares-linkml joinedcontext-policy
 
 jobs:
   build:
@@ -63,6 +64,15 @@ jobs:
             fi
           done
           exit $rc
+      # T-3834: the bytes that get pushed carry no HIGH or CRITICAL with a fixed version; an
+      # exception is a .trivyignore line with its reason, task and expiry.
+      - name: No fixable HIGH or CRITICAL in the image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: antares-local:latest
+          severity: "HIGH,CRITICAL"
+          ignore-unfixed: true
+          exit-code: "1"
       - run: docker save antares-local:latest | gzip > antares-image.tgz
       - uses: actions/upload-artifact@v6
         with:
@@ -94,7 +104,7 @@ jobs:
           SKIP_BUILD: "1"
           STOP_ON_ERROR: "0"
           CALLBACK_HOST: localhost
-          API_SURFACES: admin,views,mcp,odata,ws
+          API_SURFACES: admin,views,mcp,odata,ws,linkml
         run: ./dev/etsi-pipeline.sh || true
       - name: Per-TP baseline (dev/etsi-baseline.json)
         env:

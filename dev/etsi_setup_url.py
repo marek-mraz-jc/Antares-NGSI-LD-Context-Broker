@@ -8,8 +8,9 @@ fixtures, not the TP.
 
 The optional second argument is a file the listener appends one JSON line to
 for every request a TP's body sends (test, method, URL with its query,
-header names): dev/etsi-view-diff.py reads it to tell a refusal the view
-owes from a deviation.
+header names, and the JSON body it carries, up to 64 KiB): dev/etsi-view-diff.py
+reads it to tell a refusal the view owes from a deviation, a hidden type or
+Attribute named in the body included (T-3787).
 
     robot --listener "dev/etsi_setup_url.py;http://localhost:9090/ngsi-ld/v1;requests.jsonl" ...
 """
@@ -21,6 +22,8 @@ from robot.libraries.BuiltIn import BuiltIn
 NAMES = ("${url}", "${temporal_api_url}")
 FIXTURE = ("SETUP", "TEARDOWN")
 METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+BODY = ("json", "data")
+MAX_BODY = 64 * 1024
 
 
 class etsi_setup_url:  # Robot takes the class named as its module
@@ -53,8 +56,10 @@ class etsi_setup_url:  # Robot takes the class named as its module
             if self.depth == 0:
                 self._point(at_setup=True)
             self.depth += 1
+        # A step after a failure still starts, NOT RUN, and a variable an earlier step would have
+        # assigned does not exist: no request left, so nothing to record (T-4030).
         elif self.record and self.test and self.depth == 0 and data.name in METHODS \
-                and getattr(result, "owner", None) == "RequestsLibrary":
+                and getattr(result, "owner", None) == "RequestsLibrary" and not result.not_run:
             self._log(data.name, data.args)
 
     def end_keyword(self, data, result):
@@ -71,7 +76,7 @@ class etsi_setup_url:  # Robot takes the class named as its module
         positional = []
         for arg in args:
             key, sep, value = str(arg).partition("=")
-            if sep and key in ("url", "headers", "params"):
+            if sep and key in ("url", "headers", "params") + BODY:
                 named[key] = value
             else:
                 positional.append(str(arg))
@@ -85,5 +90,26 @@ class etsi_setup_url:  # Robot takes the class named as its module
             url += ("&" if "?" in url else "?") + str(params)
         line = {"test": self.test, "method": method, "url": url,
                 "headers": sorted(str(k).lower() for k in headers) if isinstance(headers, dict) else []}
+        body = next((named[k] for k in BODY if k in named), None)
+        if body is not None:
+            line["body"] = self._json(builtin.replace_variables(body))
         with open(self.record, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line) + "\n")
+
+    @staticmethod
+    def _json(value):
+        """The body as JSON: a dict or list as Robot holds it, a string parsed,
+        anything larger than MAX_BODY or not JSON left out (None)."""
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8", "replace")
+        if isinstance(value, str):
+            if len(value) > MAX_BODY:
+                return None
+            try:
+                return json.loads(value)
+            except ValueError:
+                return None
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, default=str)
+            return value if len(text) <= MAX_BODY else None
+        return None

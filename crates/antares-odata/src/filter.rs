@@ -27,7 +27,9 @@ use crate::edm::{Member, Set, Shape};
 use antares_ops::residual::{
     self, Cmp, Date, DateTime, Expr as RExpr, Func, Lit, Member as RMember, Path, Spatial, Time,
 };
-use odata_url::{ArithOp, CompareOp, Expr, Geography, Literal, MemberPath, Method, OrderBy};
+use odata_url::{
+    ArithOp, CompareOp, Compute, Expr, Geography, Literal, MemberPath, Method, OrderBy, Search,
+};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
@@ -92,6 +94,12 @@ pub(crate) struct Translated {
     /// The `ngsild.*` parameters pushed beside the rest (`&scopeQ=…`,
     /// `&georel=…`), encoded (ADR-0028 rule 6).
     pub(crate) ngsild: String,
+    /// The `$compute` items as residual values, name and value, in the
+    /// request's order (Q16).
+    pub(crate) computed: Vec<(String, RExpr)>,
+    /// The Attribute terms the computed values read, for the pushdown's
+    /// `attrs`.
+    pub(crate) computed_reads: Vec<String>,
 }
 
 impl Translated {
@@ -129,6 +137,8 @@ pub(crate) enum SortBy {
     Value(String),
     /// `createdAt` or `modifiedAt` of the Entity.
     System(String),
+    /// The `$compute` value of this name.
+    Computed(String),
 }
 
 impl SortBy {
@@ -136,7 +146,7 @@ impl SortBy {
     fn key(&self) -> &str {
         match self {
             Self::Id => "id",
-            Self::Value(name) | Self::System(name) => name,
+            Self::Value(name) | Self::System(name) | Self::Computed(name) => name,
         }
     }
 }
@@ -207,6 +217,93 @@ pub(crate) fn translate(
     Ok(out)
 }
 
+/// `$search` (URL 5.1.7, Q14) as the `$filter` conjunct it means here: a word or phrase
+/// matches an Entity when one of its single-valued `Edm.String` properties the view shows holds
+/// it, case-insensitively (`tolower` on both sides); `NOT`, `AND` and `OR` as in a filter. An
+/// absent property holds nothing, so `NOT` of a term holds where every property is absent. A
+/// property the view or the engine hides is not in the answer the residual reads, so a search
+/// never matches through it. `None` when the search holds for every Entity.
+///
+/// Decided (worker-5, owner may override): substring matching over the String properties, no
+/// stemming or ranking, because the residual evaluator holds `contains` and `tolower` and an
+/// Entity either matches or not (5.1.7 leaves the matching rule to the service); options: whole
+/// words only, or the Relationships' object URIs too.
+pub(crate) fn searched(search: &Search, set: &Set) -> Option<Expr> {
+    let members: Vec<&str> = set
+        .members
+        .iter()
+        .filter(|(_, m)| {
+            matches!(
+                m.shape,
+                Shape::Value {
+                    edm: "Edm.String",
+                    collection: false
+                }
+            )
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if members.is_empty() {
+        // no property can hold a term: the search is a constant
+        return (!holds_nothing(search)).then_some(Expr::Literal(Literal::Bool(false)));
+    }
+    Some(matched(search, &members))
+}
+
+/// Whether `search` holds for an Entity whose properties hold no term.
+fn holds_nothing(search: &Search) -> bool {
+    match search {
+        Search::Word(_) | Search::Phrase(_) => false,
+        Search::Not(operand) => !holds_nothing(operand),
+        Search::And(left, right) => holds_nothing(left) && holds_nothing(right),
+        Search::Or(left, right) => holds_nothing(left) || holds_nothing(right),
+    }
+}
+
+/// `search` as a filter over `members`, at least one.
+fn matched(search: &Search, members: &[&str]) -> Expr {
+    let both =
+        |l: &Search, r: &Search| (Box::new(matched(l, members)), Box::new(matched(r, members)));
+    match search {
+        Search::Word(text) | Search::Phrase(text) => {
+            let needle = Literal::String(text.to_lowercase());
+            let one = |name: &str| {
+                let member = || {
+                    Expr::Member(MemberPath {
+                        variable: None,
+                        path: vec![name.to_owned()],
+                    })
+                };
+                let present = Expr::Compare(
+                    Box::new(member()),
+                    CompareOp::Ne,
+                    Box::new(Expr::Literal(Literal::Null)),
+                );
+                let holds = Expr::Call(
+                    Method::Contains,
+                    vec![
+                        Expr::Call(Method::ToLower, vec![member()]),
+                        Expr::Literal(needle.clone()),
+                    ],
+                );
+                Expr::And(Box::new(present), Box::new(holds))
+            };
+            let mut terms = members.iter().map(|name| one(name));
+            let first = terms.next().unwrap_or(Expr::Literal(Literal::Bool(false)));
+            terms.fold(first, |a, b| Expr::Or(Box::new(a), Box::new(b)))
+        }
+        Search::Not(operand) => Expr::Not(Box::new(matched(operand, members))),
+        Search::And(left, right) => {
+            let (l, r) = both(left, right);
+            Expr::And(l, r)
+        }
+        Search::Or(left, right) => {
+            let (l, r) = both(left, right);
+            Expr::Or(l, r)
+        }
+    }
+}
+
 /// Adds `$orderby` to `out` as `orderBy` (Q9) over the same terms: `id`, or
 /// a scalar Attribute; a member the model marks not sortable (C12) is 400,
 /// the base members and the other shapes are a later round's.
@@ -236,6 +333,9 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
         };
         let by = match single {
             None => return Err(Refused::Later),
+            Some(name) if out.computed.iter().any(|(c, _)| c == name) => {
+                SortBy::Computed(name.to_owned())
+            }
             Some("id") => SortBy::Id,
             // Q9: no Entity member `orderBy` names (7.2.3.1); the surface sorts
             Some(name @ ("createdAt" | "modifiedAt")) if !set.members.contains_key(name) => {
@@ -251,13 +351,16 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
             descending: item.descending,
         });
     }
-    if keys.iter().any(|k| matches!(k.by, SortBy::System(_))) {
+    if keys
+        .iter()
+        .any(|k| matches!(k.by, SortBy::System(_) | SortBy::Computed(_)))
+    {
         out.sort_system = true;
         out.sort_reads = keys
             .iter()
             .filter_map(|k| match &k.by {
                 SortBy::Value(term) => Some(term.clone()),
-                SortBy::Id | SortBy::System(_) => None,
+                SortBy::Id | SortBy::System(_) | SortBy::Computed(_) => None,
             })
             .collect();
         out.sort = Some(keys);
@@ -277,6 +380,98 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
     out.order = Some(pushed.join(","));
     out.pushed_keys = keys;
     Ok(())
+}
+
+/// `$compute` (URL 5.1.10, Q16): each item as a residual value over the
+/// members of `set` into `out.computed`, with the terms the values read
+/// (a system member is no residual member here: `createdAt` is the model's
+/// or 501). The scalar members, functions and arithmetic a `$filter`
+/// residual takes; a navigation is a later round's.
+pub(crate) fn compute(
+    items: &[Compute],
+    set: &Set,
+    aliases: &[(String, Literal)],
+    out: &mut Translated,
+    now: DateTime,
+) -> Result<(), Refused> {
+    let sets = BTreeMap::new();
+    let mut terms = Terms {
+        set,
+        sets: &sets,
+        aliases,
+        context: &mut out.context,
+        linked: false,
+        expand_values: Vec::new(),
+        lambdas: Vec::new(),
+    };
+    for item in items {
+        let (value, _) = terms.residual_value(&item.expr)?;
+        out.computed.push((item.alias.clone(), value));
+    }
+    for (_, program) in computed(out, now)? {
+        for term in program.attributes() {
+            if !out.computed_reads.iter().any(|t| t == term) {
+                out.computed_reads.push(term.to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The computed values of `t` as programs, by name.
+///
+/// # Errors
+/// As [`program`].
+pub(crate) fn computed(
+    t: &Translated,
+    now: DateTime,
+) -> Result<Vec<(String, residual::Program)>, Refused> {
+    t.computed
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), compiled(value, now)?)))
+        .collect()
+}
+
+/// `e` with each `$compute` name replaced by its expression: a filter on
+/// a computed value is a filter on what it computes.
+pub(crate) fn inlined(e: &Expr, items: &[Compute]) -> Expr {
+    let boxed = |e: &Expr| Box::new(inlined(e, items));
+    match e {
+        Expr::Member(MemberPath {
+            variable: None,
+            path,
+        }) => match path.as_slice() {
+            [name] => items
+                .iter()
+                .find(|c| c.alias == *name)
+                .map_or_else(|| e.clone(), |c| c.expr.clone()),
+            _ => e.clone(),
+        },
+        Expr::Compare(l, op, r) => Expr::Compare(boxed(l), *op, boxed(r)),
+        Expr::In(l, list) => Expr::In(boxed(l), list.clone()),
+        Expr::And(l, r) => Expr::And(boxed(l), boxed(r)),
+        Expr::Or(l, r) => Expr::Or(boxed(l), boxed(r)),
+        Expr::Not(inner) => Expr::Not(boxed(inner)),
+        Expr::Call(method, args) => {
+            Expr::Call(*method, args.iter().map(|a| inlined(a, items)).collect())
+        }
+        Expr::Arith(l, op, r) => Expr::Arith(boxed(l), *op, boxed(r)),
+        Expr::Neg(inner) => Expr::Neg(boxed(inner)),
+        Expr::Any { collection, lambda } => Expr::Any {
+            collection: collection.clone(),
+            lambda: lambda
+                .as_ref()
+                .map(|(variable, body)| (variable.clone(), boxed(body))),
+        },
+        Expr::All {
+            collection,
+            lambda: (variable, body),
+        } => Expr::All {
+            collection: collection.clone(),
+            lambda: (variable.clone(), boxed(body)),
+        },
+        Expr::Literal(_) | Expr::Alias(_) | Expr::Member(_) => e.clone(),
+    }
 }
 
 /// The operands of the top-level `and`s.
@@ -1175,13 +1370,16 @@ pub(crate) fn program(t: &Translated, now: DateTime) -> Result<Option<residual::
         [one] => one.clone(),
         many => RExpr::And(many.to_vec()),
     };
-    residual::compile(&conjuncts, now)
-        .map(Some)
-        .map_err(|e| match e {
-            residual::Error::TooComplex => Refused::TooComplex,
-            // this module builds no pattern, the one construct the evaluator may not support
-            residual::Error::Invalid(_) | residual::Error::Unsupported(_) => Refused::Bad,
-        })
+    compiled(&conjuncts, now).map(Some)
+}
+
+/// `e` compiled under the evaluator's bounds.
+fn compiled(e: &RExpr, now: DateTime) -> Result<residual::Program, Refused> {
+    residual::compile(e, now).map_err(|e| match e {
+        residual::Error::TooComplex => Refused::TooComplex,
+        // this module builds no pattern, the one construct the evaluator may not support
+        residual::Error::Invalid(_) | residual::Error::Unsupported(_) => Refused::Bad,
+    })
 }
 
 /// `v op p` read as `p op' v`.
@@ -2501,6 +2699,68 @@ mod tests {
         assert_eq!(
             translate(&bad, &timed, &BTreeMap::new(), &[]).map(|_| ()),
             Err(Refused::Bad)
+        );
+    }
+
+    /// `$search` folds to a constant where no String property can hold a term, and reads only
+    /// the single-valued String properties otherwise (T-3750).
+    #[test]
+    fn a_search_reads_the_string_properties_and_folds_without_them() {
+        let word = |w: &str| Box::new(Search::Word(w.into()));
+        let mut bare = set();
+        bare.members.retain(|name, _| name != "name");
+        let always = |s: &Search| searched(s, &bare);
+        assert_eq!(
+            always(&Search::Word("x".into())),
+            Some(lit(Literal::Bool(false)))
+        );
+        assert_eq!(always(&Search::Not(word("x"))), None);
+        assert_eq!(
+            always(&Search::Or(word("x"), Box::new(Search::Not(word("y"))))),
+            None
+        );
+        assert_eq!(
+            always(&Search::And(word("x"), Box::new(Search::Not(word("y"))))),
+            Some(lit(Literal::Bool(false)))
+        );
+        let not = |w: &str| Box::new(Search::Not(word(w)));
+        assert_eq!(always(&Search::And(not("x"), not("y"))), None);
+        assert_eq!(
+            always(&Search::And(not("x"), word("y"))),
+            Some(lit(Literal::Bool(false)))
+        );
+        assert_eq!(always(&Search::Or(not("x"), word("y"))), None);
+        // `name` is the one single-valued String: `tags` is a collection, `doc` no String
+        let one = searched(&Search::Phrase("A b".into()), &set());
+        let name = || m("name");
+        let want = Expr::And(
+            Box::new(cmp(name(), CompareOp::Ne, lit(Literal::Null))),
+            Box::new(Expr::Call(
+                Method::Contains,
+                vec![
+                    Expr::Call(Method::ToLower, vec![name()]),
+                    lit(Literal::String("a b".into())),
+                ],
+            )),
+        );
+        assert_eq!(one, Some(want.clone()));
+        let both = Search::And(word("x"), Box::new(Search::Or(word("y"), word("z"))));
+        assert!(matches!(
+            searched(&both, &set()),
+            Some(Expr::And(_, r)) if matches!(*r, Expr::Or(..))
+        ));
+        let negated = searched(&Search::Not(Box::new(Search::Phrase("A b".into()))), &set());
+        assert_eq!(negated, Some(Expr::Not(Box::new(want))));
+        let translated = translate(
+            &searched(&Search::Word("x".into()), &set()).unwrap_or(lit(Literal::Null)),
+            &set(),
+            &BTreeMap::new(),
+            &[],
+        );
+        // the presence is pushed as `q`, the case-insensitive match is the residual's
+        assert_eq!(
+            translated.ok().map(|t| (t.q.is_some(), t.residual.len())),
+            Some((true, 1))
         );
     }
 }

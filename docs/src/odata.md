@@ -87,8 +87,10 @@ root.
 | `{Set}('{id}')/$ref` | Retrieve Entity; the Entity's reference, `404` when hidden or absent; `$select` or `$expand` is `400` |
 | `POST {Set}/$query` | the same `GET`: the body's options (`text/plain` or a form) joined to the URL's |
 | `$filter` | `q` and `id` (section 4) |
+| `$search` | one more `$filter` conjunct: a word or `"phrase"` matches when a single-valued String property the view shows contains it, case-insensitively; `NOT` before `AND` (or a space) before `OR`; evaluated by the residual on what the view and the engine admit, so a hidden property never matches (T-3750) |
+| `$compute` | `expr as name`, evaluated per Entity by the residual on what the view and the engine admit and written as a dynamic property; the name works in `$filter`, `$orderby` (sorted by the surface) and `$select`; a hidden Attribute reads as absent, so its computed value is `null` (T-3936) |
 | `$orderby` | `orderBy` on `id` and single-valued values, `;desc`; `createdAt`, `modifiedAt` sorted by the surface (section 4); a missing value first ascending, last descending: when any Entity lacks a key, the surface sorts |
-| `$select` | `pick` of `id`, `type`, `scope` and the selected Attributes (TS 104 175 4.21: a projection, so an Entity lacking every selected Attribute is still in the answer, its members `null`); `createdAt`/`modifiedAt` add `options=sysAttrs` and are picked. A name the 4.21 grammar would read as something else (a character outside `_:#/%-+@`, a dot in a short name) pushes no projection: the whole Entity is read and the surface projects it (T-3822) |
+| `$select` | `pick` of `id`, `type`, `scope` and the selected Attributes and those a `$compute` reads (TS 104 175 4.21: a projection, so an Entity lacking every selected Attribute is still in the answer, its members `null`); `createdAt`/`modifiedAt` add `options=sysAttrs` and are picked. A name the 4.21 grammar would read as something else (a character outside `_:#/%-+@`, a dot in a short name) pushes no projection: the whole Entity is read and the surface projects it (T-3822) |
 | `$expand` | `join=inline&joinLevel=1` (section 5) |
 | `$top`, `$skip`, `Prefer: odata.maxpagesize` | `limit`, `offset`; a page is at most 1000, 100 by default |
 | `$count=true` | `@odata.count` from `NGSILD-Results-Count`, or counted by the surface (section 4) |
@@ -252,9 +254,9 @@ budget of 1000 lookups is `400`, never a partial answer. A nested
 Create, Merge or Replace, and Delete Entity, with the members no write
 names; `Countable`, `Filterable` and `Sortable` with the members they
 refuse (`NonFilterableProperties`, `NonSortableProperties`), `Expandable`
-one level, no upsert, deep insert, deep update or search, and
-`QuerySegmentSupported`. The container declares `BatchSupported` and
-`BatchSupport` (`multipart/mixed` and `application/json`, continue on
+one level, no upsert, deep insert or deep update, and `Searchable`. The
+container declares `QuerySegmentSupported`, `ComputeSupported`,
+`BatchSupported` and `BatchSupport` (`multipart/mixed` and `application/json`, continue on
 error, no Content-ID references; T-3723). The annotations are advisory:
 every request is still gated, and a read the engine denies is `403`
 whatever they say.
@@ -265,7 +267,7 @@ Every `GET` answers `HEAD` too: the same status and headers, with the
 ## 7. Refusals and errors
 
 The OData features no NGSI-LD operation stands behind (matrix 7.1 of
-`docs/analysis/operation-matrix.yaml`: `$apply`, `$search`, `$compute`,
+`docs/analysis/operation-matrix.yaml`: `$apply`,
 actions, functions, `$crossjoin`, `$all`, delta, media, and the rest) are
 refused with the status the matrix names, before any gate or store access.
 An upsert is the exception: it is the Merge or Replace Entity it names,

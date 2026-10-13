@@ -369,8 +369,6 @@ fn query_option_errors() {
         }
     );
     for (name, feature) in [
-        ("$search=blue", Feature::Search),
-        ("compute=1 as x", Feature::Compute),
         ("$index=1", Feature::Index),
         ("$deltatoken=x", Feature::DeltaToken),
         ("$apply=groupby((name))", Feature::Apply),
@@ -942,8 +940,8 @@ fn the_canonical_form_parses_back() {
 
 #[test]
 fn errors_name_themselves() {
-    let e = err("Buildings?$search=x");
-    assert_eq!(e.to_string(), "not implemented at byte 10: $search");
+    let e = err("Buildings?$index=1");
+    assert_eq!(e.to_string(), "not implemented at byte 10: $index");
     let e = err("Towers");
     assert_eq!(e.to_string(), "unknown name at byte 0");
     let e = err("Buildings?$top=1&$top=1");
@@ -971,8 +969,6 @@ fn every_feature_and_limit_has_its_own_name() {
     use Feature as F;
     use LimitKind as L;
     let features = [
-        F::Search,
-        F::Compute,
         F::Index,
         F::Apply,
         F::DeltaToken,
@@ -1300,7 +1296,8 @@ fn all_lambdas_parse() {
         filter("tags/all(t:t ne 'x') and rooms/any()"),
         Expr::And(..)
     ));
-    syntax("Buildings?$filter=tags/all()", past("tags/all("));
+    // past the `)`, as the OASIS runner reports `Products/all()`
+    syntax("Buildings?$filter=tags/all()", past("tags/all()"));
     unresolved(
         "Buildings?$filter=tags/all(t:t eq 'x') and t eq 'x'",
         past("tags/all(t:t eq 'x') and "),
@@ -1327,5 +1324,325 @@ fn arithmetic_and_lambdas_round_trip() {
         let canonical = ok(text).to_string();
         assert_eq!(canonical, text, "{text}");
         assert_eq!(ok(&canonical).to_string(), canonical, "{text}");
+    }
+}
+
+fn search_of(query: &str) -> Search {
+    options(&format!("Buildings?{query}"))
+        .search
+        .unwrap_or(Search::Word(String::new()))
+}
+
+#[test]
+fn search_reads_words_phrases_and_operators_with_their_precedence() {
+    use Search::{And, Not, Or, Phrase, Word};
+    let word = |w: &str| Box::new(Word(w.into()));
+    assert_eq!(search_of("$search=blue"), Word("blue".into()));
+    assert_eq!(search_of("search=blue"), Word("blue".into()));
+    // side by side is AND; NOT binds tighter than AND, AND tighter than OR (URL 5.1.7)
+    assert_eq!(search_of("$search=a b"), And(word("a"), word("b")));
+    assert_eq!(search_of("$search=a%20AND%20b"), And(word("a"), word("b")));
+    assert_eq!(
+        search_of("$search=a b OR c"),
+        Or(Box::new(And(word("a"), word("b"))), word("c"))
+    );
+    assert_eq!(
+        search_of("$search=a OR b c"),
+        Or(word("a"), Box::new(And(word("b"), word("c"))))
+    );
+    assert_eq!(
+        search_of("$search=NOT a b"),
+        And(Box::new(Not(word("a"))), word("b"))
+    );
+    assert_eq!(
+        search_of("$search=NOT (a OR b)"),
+        Not(Box::new(Or(word("a"), word("b"))))
+    );
+    assert_eq!(
+        search_of("$search=( a OR b ) c"),
+        And(Box::new(Or(word("a"), word("b"))), word("c"))
+    );
+    // a form encoder's `+` is a space; a plus in a word is written `%2B`
+    assert_eq!(search_of("$search=a+OR+b"), Or(word("a"), word("b")));
+    assert_eq!(search_of("$search=C%2B%2B"), Word("C++".into()));
+    // operators are upper case and need whitespace on both sides; otherwise they are words
+    assert_eq!(
+        search_of("$search=a or b"),
+        And(Box::new(And(word("a"), word("or"))), word("b"))
+    );
+    assert_eq!(search_of("$search=NOT"), Word("NOT".into()));
+    assert_eq!(search_of("$search=NOTE"), Word("NOTE".into()));
+    assert_eq!(search_of("$search=a OR"), And(word("a"), word("OR")));
+    // phrases keep spaces, parentheses and percent-decoded text
+    assert_eq!(
+        search_of("$search=\"dark red\" OR %22a (b)%22"),
+        Or(
+            Box::new(Phrase("dark red".into())),
+            Box::new(Phrase("a (b)".into()))
+        )
+    );
+    // `&` and `#` only percent-encoded; UTF-8 decoded; a quote inside a word
+    assert_eq!(search_of("$search=R%26D%23"), Word("R&D#".into()));
+    assert_eq!(search_of("$search=caf%C3%A9"), Word("café".into()));
+    assert_eq!(search_of("$search=it's"), Word("it's".into()));
+    // a literal `;` ends a word, a percent-encoded one is text (ABNF `searchWord`)
+    assert_eq!(search_of("$search=a%3Bb"), Word("a;b".into()));
+    syntax("Buildings?$search=a;b", "Buildings?$search=a".len());
+    // `searchExpr-incomplete` is one phrase, `''` a quote
+    assert_eq!(search_of("$search='it''s red'"), Phrase("it's red".into()));
+    // `+` is a space in a phrase too; `&` percent-encoded is text
+    assert_eq!(search_of("$search=%22a+b%22"), Phrase("a b".into()));
+    assert_eq!(search_of("$search='a+b%26c'"), Phrase("a b&c".into()));
+    // whitespace before the end of the option or the next one
+    assert_eq!(search_of("$search=a%20"), Word("a".into()));
+    let spaced = options("Buildings?$search=a%20&$top=1");
+    assert_eq!(
+        (spaced.search, spaced.top),
+        (Some(Word("a".into())), Some(1))
+    );
+    // the option ends at `&`
+    let both = options("Buildings?$search=a&$top=1");
+    assert_eq!((both.search, both.top), (Some(Word("a".into())), Some(1)));
+}
+
+#[test]
+fn search_refuses_what_is_no_search_expression() {
+    for query in [
+        "$search=",
+        "$search=%20",
+        "$search=(a",
+        "$search=a)",
+        "$search=()",
+        "$search=\"\"",
+        "$search=\"%20\"",
+        "$search=\"open",
+        "$search='open",
+        "$search=''",
+        "$search='x'y",
+        "$search=a%2",
+        "$search=%FF",
+        "$search=a;b",
+        "$search=a 'b",
+    ] {
+        let e = err(&format!("Buildings?{query}"));
+        assert!(
+            matches!(e.kind, UrlErrorKind::Syntax { .. }),
+            "{query}: {e:?}"
+        );
+    }
+    let dup = err("Buildings?$search=a&search=b");
+    assert_eq!(dup.to_string(), "system query option $search given twice");
+}
+
+#[test]
+fn search_is_bounded() {
+    let tight = Limits {
+        max_expr_depth: 2,
+        max_expr_nodes: 5,
+        max_literal_len: 4,
+        ..Limits::strict()
+    };
+    let limit = |q: &str| {
+        let e = err_within(&format!("Buildings?{q}"), &tight);
+        match e.kind {
+            UrlErrorKind::LimitExceeded { limit, .. } => limit,
+            other => panic!("{q}: {other:?}"),
+        }
+    };
+    assert_eq!(limit("$search=a b c d"), LimitKind::ExprNodes);
+    assert_eq!(limit("$search=NOT NOT NOT a"), LimitKind::ExprDepth);
+    assert_eq!(limit("$search=(((a)))"), LimitKind::ExprDepth);
+    assert_eq!(limit("$search=abcdef"), LimitKind::LiteralLength);
+    assert_eq!(limit("$search=\"abcdef\""), LimitKind::LiteralLength);
+    assert_eq!(limit("$search='abcdef'"), LimitKind::LiteralLength);
+    assert!(parse("Buildings?$search=NOT (a)", &Service, &tight).is_ok());
+}
+
+#[test]
+fn search_writes_its_canonical_form() {
+    for (query, written) in [
+        ("$search=a b OR c", "$search=a%20AND%20b%20OR%20c"),
+        ("$search=a (b OR c)", "$search=a%20AND%20(b%20OR%20c)"),
+        ("$search=NOT (a b)", "$search=NOT%20(a%20AND%20b)"),
+        ("$search=\"x y\"", "$search=%22x%20y%22"),
+        ("$search=C%2B%2B", "$search=C%2B%2B"),
+        ("$search=a OR", "$search=a%20AND%20%22OR%22"),
+    ] {
+        let uri = ok(&format!("Buildings?{query}"));
+        assert_eq!(uri.to_string(), format!("Buildings?{written}"), "{query}");
+        assert_eq!(ok(&uri.to_string()).to_string(), uri.to_string(), "{query}");
+    }
+}
+
+fn compute_of(query: &str) -> Vec<Compute> {
+    options(&format!("Buildings?{query}"))
+        .compute
+        .unwrap_or_default()
+}
+
+fn computed(expr: Expr, alias: &str) -> Compute {
+    Compute {
+        expr,
+        alias: alias.to_owned(),
+    }
+}
+
+#[test]
+fn compute_reads_items_and_its_names_resolve_in_the_other_options() {
+    let double = Expr::Arith(
+        Box::new(member(&["height"])),
+        ArithOp::Mul,
+        Box::new(int(2)),
+    );
+    assert_eq!(
+        compute_of("$compute=height mul 2 as double"),
+        [computed(double.clone(), "double")]
+    );
+    assert_eq!(
+        compute_of("compute=height mul 2 as double,tolower(name) AS low"),
+        [
+            computed(double, "double"),
+            computed(Expr::Call(Method::ToLower, vec![member(&["name"])]), "low"),
+        ]
+    );
+    // the names resolve in $filter, $orderby and $select, wherever $compute stands
+    let o = options(
+        "Buildings?$filter=double gt 10 and tags/any(t: t eq low)&$orderby=double desc\
+         &$select=name,double&$compute=height mul 2 as double,name as low",
+    );
+    assert_eq!(
+        o.filter,
+        Some(Expr::And(
+            Box::new(Expr::Compare(
+                Box::new(member(&["double"])),
+                CompareOp::Gt,
+                Box::new(int(10))
+            )),
+            Box::new(Expr::Any {
+                collection: MemberPath {
+                    variable: None,
+                    path: vec!["tags".into()]
+                },
+                lambda: Some((
+                    "t".into(),
+                    Box::new(Expr::Compare(
+                        Box::new(Expr::Member(MemberPath {
+                            variable: Some("t".into()),
+                            path: vec![]
+                        })),
+                        CompareOp::Eq,
+                        Box::new(member(&["low"]))
+                    ))
+                ))
+            })
+        ))
+    );
+    assert_eq!(
+        o.orderby,
+        Some(vec![OrderBy {
+            expr: member(&["double"]),
+            descending: true
+        }])
+    );
+    assert_eq!(
+        o.select,
+        Some(vec![
+            SelectItem::Path(vec!["name".into()]),
+            SelectItem::Path(vec!["double".into()])
+        ])
+    );
+    assert_eq!(o.compute.map(|c| c.len()), Some(2));
+}
+
+#[test]
+fn compute_refuses_what_is_no_compute_item() {
+    let at = |q: &str| format!("Buildings?{q}").len();
+    // no `as`, no name, a name the type has, a name given twice, junk after the item
+    syntax("Buildings?$compute=height", at("$compute=height"));
+    syntax("Buildings?$compute=height as", at("$compute=height as"));
+    syntax("Buildings?$compute=height is h", at("$compute=height "));
+    syntax("Buildings?$compute=height asx", at("$compute=height as"));
+    syntax("Buildings?$compute=height as 1x", at("$compute=height as "));
+    syntax(
+        "Buildings?$compute=height as name",
+        at("$compute=height as name"),
+    );
+    syntax(
+        "Buildings?$compute=height as h,name as h",
+        at("$compute=height as h,name as h"),
+    );
+    syntax(
+        "Buildings?$compute=height as h)",
+        at("$compute=height as h"),
+    );
+    // a computed name is the resource's: not past a path, not a lambda variable's member,
+    // not in a nested $select, not in an item beside it, not without $compute
+    unresolved(
+        "Buildings?$compute=height as h&$filter=address/h eq 1",
+        at("$compute=height as h&$filter=address/"),
+    );
+    unresolved(
+        "Buildings?$compute=height as h&$filter=rooms/any(r: r/h eq 1)",
+        at("$compute=height as h&$filter=rooms/any(r: r/"),
+    );
+    unresolved(
+        "Buildings?$compute=height as h&$expand=owner($select=h)",
+        at("$compute=height as h&$expand=owner($select="),
+    );
+    unresolved(
+        "Buildings?$compute=height as h,h as g",
+        at("$compute=height as h,"),
+    );
+    unresolved("Buildings?$filter=h eq 1", at("$filter="));
+    let dup = err("Buildings?$compute=height as h&compute=height as g");
+    assert_eq!(dup.to_string(), "system query option $compute given twice");
+    // nested in $expand it stays refused
+    refused(
+        "Buildings?$expand=owner($compute=1 as x)",
+        Feature::NestedOption,
+        at("$expand=owner("),
+    );
+    // and outside the query forms with every option
+    syntax("$batch?$compute=1 as x", "$batch?".len());
+}
+
+#[test]
+fn compute_is_bounded_by_the_expression_budget() {
+    let tight = Limits {
+        max_expr_nodes: 3,
+        ..Limits::strict()
+    };
+    let e = err_within(
+        "Buildings?$compute=height add 1 as a,height add 1 as b",
+        &tight,
+    );
+    assert!(
+        matches!(
+            e.kind,
+            UrlErrorKind::LimitExceeded {
+                limit: LimitKind::ExprNodes,
+                ..
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(parse("Buildings?$compute=height add 1 as a", &Service, &tight).is_ok());
+}
+
+#[test]
+fn compute_writes_its_canonical_form() {
+    for (query, written) in [
+        (
+            "$filter=d gt 1&$compute=height mul 2 as d",
+            "$compute=height%20mul%202%20as%20d&$filter=d%20gt%201",
+        ),
+        (
+            "compute=name as n,height as h&$select=n",
+            "$compute=name%20as%20n,height%20as%20h&$select=n",
+        ),
+    ] {
+        let uri = ok(&format!("Buildings?{query}"));
+        assert_eq!(uri.to_string(), format!("Buildings?{written}"), "{query}");
+        assert_eq!(ok(&uri.to_string()).to_string(), uri.to_string(), "{query}");
     }
 }

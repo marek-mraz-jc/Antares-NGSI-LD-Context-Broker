@@ -4,7 +4,7 @@
 //! and a request that is not the operation it names is refused.
 
 use antares_ops::test_kit::TestBroker;
-use antares_ops::{Caller, OperationId, Ops, OpsRequest, Refusal, Surface, INNER_DETAIL};
+use antares_ops::{Caller, OperationId, Ops, OpsRequest, Refusal, Surface, CONTEXT_DETAIL};
 use axum::body::Body;
 use axum::extract::Query;
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode};
@@ -131,10 +131,11 @@ async fn open(app: &Router) {
     assert_eq!(resp.status(), StatusCode::CREATED, "the view loads");
 }
 
-/// A `@context` nobody serves: the NGSI-LD answer is a 5xx naming it
-/// (`LdContextNotAvailable`); the surface gets a fixed detail and an id,
-/// and the log carries the detail under the same id. Current-thread, so the
-/// recording subscriber sees every event of the run.
+/// A `@context` nobody serves: the NGSI-LD answer is a 504 naming it
+/// (`LdContextNotAvailable`); the surface answers the same status and
+/// problem type (TS 104 176 6.3.2, T-3947) with a fixed detail, never the
+/// URL or the fetch error. Current-thread, so the recording subscriber sees
+/// every event of the run.
 #[tokio::test(flavor = "current_thread")]
 async fn an_inner_5xx_detail_never_reaches_the_surface() {
     let log = Log::default();
@@ -180,9 +181,12 @@ async fn an_inner_5xx_detail_never_reaches_the_surface() {
         &format!("/x/probe?path=/ngsi-ld/v1/entities%3Ftype%3DCar&context={ctx}"),
     )
     .await;
-    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert!(body.contains(INNER_DETAIL), "{body}");
-    assert!(body.contains("request id ops-"), "{body}");
+    assert_eq!(s, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert!(
+        body.contains("\"title\":\"LdContextNotAvailable\""),
+        "{body}"
+    );
+    assert!(body.contains(CONTEXT_DETAIL), "{body}");
     assert!(
         !body.contains("nowhere-7f3a") && !body.contains("127.0.0.1"),
         "no inner detail: {body}"
@@ -276,6 +280,7 @@ fn every_refusal_renders_with_its_status_and_no_echo() {
             },
             500,
         ),
+        (Refusal::ContextNotAvailable, 504),
         (
             Refusal::Overloaded {
                 retry_after: Some(HeaderValue::from_static("6")),

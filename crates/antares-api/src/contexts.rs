@@ -102,11 +102,11 @@ fn details_obj(
     });
     // numberOfHits/lastUsage only for kinds where the suite's arithmetic
     // expects them (Cached + ImplicitlyCreated; 053_04 vs 053_06)
-    if kind != "Hosted" {
+    if let (false, Some(m)) = (kind == "Hosted", o.as_object_mut()) {
         let hits = usage.map(|u| u.hits).unwrap_or(0);
-        o["numberOfHits"] = json!(hits);
+        m.insert("numberOfHits".into(), json!(hits));
         if let Some(u) = usage {
-            o["lastUsage"] = json!(u.last_usage);
+            m.insert("lastUsage".into(), json!(u.last_usage));
         }
     }
     o
@@ -169,14 +169,14 @@ fn row_visible(doc: &Value, tenant: &TenantId) -> bool {
 /// otherwise keep serving a document whose row is gone.
 pub async fn purge_tenant(st: &AppState, tenant: &TenantId) -> Result<(), NgsiError> {
     for row in st.store.context_list_meta(Some(tenant)).await? {
-        if row["kind"].as_str() == Some("Cached") || !row_visible(&row, tenant) {
+        if row.get("kind").and_then(Value::as_str) == Some("Cached") || !row_visible(&row, tenant) {
             continue;
         }
-        let Some(local_id) = row["localId"].as_str() else {
+        let Some(local_id) = row.get("localId").and_then(Value::as_str) else {
             continue;
         };
         st.store.context_delete(Some(tenant), local_id).await?;
-        if let Some(url) = row["url"].as_str() {
+        if let Some(url) = row.get("url").and_then(Value::as_str) {
             st.loader.usage_remove(url).await;
         }
     }
@@ -189,7 +189,7 @@ pub async fn purge_tenant(st: &AppState, tenant: &TenantId) -> Result<(), NgsiEr
 async fn find_entry(st: &AppState, tenant: &TenantId, id: &str) -> ApiResult<Option<CtxEntry>> {
     if let Some(doc) = st.store.context_get(Some(tenant), id).await? {
         // Cached rows are addressable by their deterministic localId too.
-        if doc["kind"].as_str() == Some("Cached") {
+        if doc.get("kind").and_then(Value::as_str) == Some("Cached") {
             return Ok(Some(cached_from_row(&doc)));
         }
         // another tenant's row is as absent as one that never existed
@@ -198,10 +198,9 @@ async fn find_entry(st: &AppState, tenant: &TenantId, id: &str) -> ApiResult<Opt
     // Stored entries are also addressable by their full URL (5.13.2.4): the
     // row key IS the URL's trailing segment, so this is one keyed lookup and
     // the row's own url still has to match the id.
-    if let Some(pos) = id.rfind("/ngsi-ld/v1/jsonldContexts/") {
-        let local_id = &id[pos + "/ngsi-ld/v1/jsonldContexts/".len()..];
+    if let Some((_, local_id)) = id.rsplit_once("/ngsi-ld/v1/jsonldContexts/") {
         if let Some(doc) = st.store.context_get(Some(tenant), local_id).await? {
-            if doc["url"].as_str() == Some(id) && row_visible(&doc, tenant) {
+            if doc.get("url").and_then(Value::as_str) == Some(id) && row_visible(&doc, tenant) {
                 return Ok(Some(CtxEntry::Stored(doc)));
             }
         }
@@ -215,12 +214,25 @@ async fn find_entry(st: &AppState, tenant: &TenantId, id: &str) -> ApiResult<Opt
     if id.starts_with("http://") || id.starts_with("https://") {
         let rid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, id.as_bytes()).to_string();
         if let Some(doc) = st.store.context_get(Some(tenant), &rid).await? {
-            if doc["kind"].as_str() == Some("Cached") {
+            if doc.get("kind").and_then(Value::as_str) == Some("Cached") {
                 return Ok(Some(cached_from_row(&doc)));
             }
         }
     }
     Ok(None)
+}
+
+/// Whether the stored @contexts are shown: not through a view, and not to a
+/// caller the engine narrows (`policy::NAME_READS`), since one may define a
+/// term for an Attribute that caller may not see (ADR-0023 rule 5, T-4009).
+fn shows_stored(st: &AppState, narrowing: &crate::policy::Filter) -> bool {
+    #[cfg(feature = "views")]
+    if st.view.is_some() {
+        return false;
+    }
+    #[cfg(not(feature = "views"))]
+    let _ = st;
+    narrowing.is_empty()
 }
 
 // ---------- POST /jsonldContexts (5.13.2) ----------
@@ -316,7 +328,7 @@ pub async fn list_contexts(
         // resource — it serves the whole list, so a pagination parameter would
         // be accepted and silently ignored.
         check_params(&params, &["kind", "details", "local"])?;
-        gate!(st, &tenant, &headers, "5.13.3").await?;
+        let narrowing = gate!(st, &tenant, &headers, "5.13.3").await?;
 
         let details = details_param(&params)?;
         let kind_filter = params.get("kind");
@@ -337,27 +349,39 @@ pub async fn list_contexts(
         // ADR-0023 rule 5: a stored @context is the tenant's and may define
         // a term for an Attribute a view hides, so through a view the list
         // is the core @context alone (the pinned entries below).
-        #[cfg(feature = "views")]
-        let stored = if st.view.is_some() {
+        // The same for a caller the engine narrows (T-4009).
+        let stored = if !shows_stored(&st, &narrowing) {
             Vec::new()
         } else {
             st.store.context_list_meta(Some(&tenant)).await?
         };
-        #[cfg(not(feature = "views"))]
-        let stored = st.store.context_list_meta(Some(&tenant)).await?;
         for c in stored {
-            let kind = c["kind"].as_str().unwrap_or("Hosted").to_owned();
+            let kind = c
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("Hosted")
+                .to_owned();
             if !keep(&kind) || !row_visible(&c, &tenant) {
                 continue;
             }
-            let url = c["url"].as_str().unwrap_or_default().to_owned();
+            let url = c
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
             // counters from the ROW (shared truth), never this instance's map
             let usage = Some(row_usage(&c));
             entries.push((
                 url,
-                c["localId"].as_str().unwrap_or_default().to_owned(),
+                c.get("localId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
                 kind,
-                c["createdAt"].as_str().unwrap_or_default().to_owned(),
+                c.get("createdAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
                 usage,
             ));
         }
@@ -418,7 +442,7 @@ pub async fn serve_context(
     let go = async {
         let tenant = tenant_from(&headers)?;
         check_params(&params, &["details", "local", "core"])?;
-        gate!(st, &tenant, &headers, "5.13.4", ids: &[&id]).await?;
+        let narrowing = gate!(st, &tenant, &headers, "5.13.4", ids: &[&id]).await?;
         let details = details_param(&params)?;
         // TS 104 175 13.4.4: `core` with `details` is a BadRequest, and so is
         // a `core` that names no NGSI-LD version this build has a core for
@@ -431,9 +455,13 @@ pub async fn serve_context(
             })?),
             None => None,
         };
-        let entry = find_entry(&st, &tenant, &id)
-            .await?
-            .ok_or_else(|| NgsiError::ResourceNotFound(format!("@context {id} not found")))?;
+        let entry = match find_entry(&st, &tenant, &id).await? {
+            // a stored @context the list hides from this caller is as absent
+            // here, under a view and under a narrowing engine (T-4009)
+            Some(CtxEntry::Stored(_)) if !shows_stored(&st, &narrowing) => None,
+            entry => entry,
+        }
+        .ok_or_else(|| NgsiError::ResourceNotFound(format!("@context {id} not found")))?;
         // the user @context's location and the core one, for every kind: the
         // pair is two URLs, not the content a Cached entry never serves
         if let Some(core) = core {
@@ -572,7 +600,7 @@ pub async fn delete_context(
                 Ok(no_content(&tenant))
             }
             CtxEntry::Stored(doc) => {
-                let lid = doc["localId"].as_str().unwrap_or(&id);
+                let lid = doc.get("localId").and_then(Value::as_str).unwrap_or(&id);
                 st.store.context_delete(Some(&tenant), lid).await?;
                 if let Some(url) = doc.get("url").and_then(Value::as_str) {
                     st.loader.usage_remove(url).await;
