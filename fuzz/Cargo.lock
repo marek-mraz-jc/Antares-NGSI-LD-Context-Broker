@@ -24,11 +24,7 @@ dependencies = [
 name = "antares-api"
 version = "0.2.0"
 dependencies = [
- "antares-jsonld",
- "antares-matcher",
- "antares-model",
  "antares-notifier",
- "antares-ql",
  "antares-store",
  "axum",
  "chrono",
@@ -37,6 +33,10 @@ dependencies = [
  "icu_collator",
  "icu_locale_core",
  "metrics",
+ "ngsild-jsonld",
+ "ngsild-matcher",
+ "ngsild-model",
+ "ngsild-ql",
  "reqwest",
  "send_wrapper",
  "serde_json",
@@ -55,49 +55,20 @@ name = "antares-fuzz"
 version = "0.0.0"
 dependencies = [
  "antares-api",
- "antares-jsonld",
  "antares-mcp",
- "antares-model",
  "antares-ops",
- "antares-ql",
- "antares-residual",
  "antares-sql",
  "antares-ws",
  "libfuzzer-sys",
  "linkml-model",
+ "ngsild-jsonld",
+ "ngsild-model",
+ "ngsild-ql",
+ "ngsild-residual",
  "odata-batch",
  "odata-csdl",
  "odata-json",
  "odata-url",
- "serde_json",
-]
-
-[[package]]
-name = "antares-jsonld"
-version = "0.2.0"
-dependencies = [
- "antares-model",
- "chrono",
- "futures-util",
- "gloo-timers",
- "moka",
- "reqwest",
- "rustls",
- "send_wrapper",
- "serde_json",
- "tokio",
- "uuid",
- "web-time",
-]
-
-[[package]]
-name = "antares-matcher"
-version = "0.2.0"
-dependencies = [
- "antares-jsonld",
- "antares-model",
- "antares-ql",
- "chrono",
  "serde_json",
 ]
 
@@ -116,20 +87,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "antares-model"
-version = "0.2.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
 name = "antares-notifier"
 version = "0.2.0"
 dependencies = [
- "antares-jsonld",
- "antares-model",
+ "ngsild-jsonld",
+ "ngsild-model",
  "serde_json",
  "tokio",
  "tracing",
@@ -140,13 +102,13 @@ name = "antares-ops"
 version = "0.2.0"
 dependencies = [
  "antares-api",
- "antares-jsonld",
- "antares-model",
- "antares-ql",
- "antares-residual",
  "axum",
  "chrono",
  "metrics",
+ "ngsild-jsonld",
+ "ngsild-model",
+ "ngsild-ql",
+ "ngsild-residual",
  "serde",
  "serde_json",
  "tokio",
@@ -154,39 +116,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "antares-ql"
-version = "0.2.0"
-dependencies = [
- "antares-jsonld",
- "antares-model",
- "geo",
- "geo-types",
- "geojson",
- "regex",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "antares-residual"
-version = "0.2.0"
-dependencies = [
- "geo",
- "regex",
- "serde_json",
- "unicode-normalization",
-]
-
-[[package]]
 name = "antares-sql"
 version = "0.2.0"
 dependencies = [
- "antares-model",
- "antares-ql",
  "antares-store",
  "async-trait",
  "chrono",
  "futures-util",
+ "ngsild-model",
+ "ngsild-ql",
  "redb",
  "serde_json",
  "tokio",
@@ -197,11 +135,11 @@ dependencies = [
 name = "antares-store"
 version = "0.2.0"
 dependencies = [
- "antares-jsonld",
- "antares-model",
- "antares-ql",
  "async-trait",
  "chrono",
+ "ngsild-jsonld",
+ "ngsild-model",
+ "ngsild-ql",
  "serde_json",
 ]
 
@@ -1460,6 +1398,68 @@ dependencies = [
  "smallvec",
  "tagptr",
  "uuid",
+]
+
+[[package]]
+name = "ngsild-jsonld"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "futures-util",
+ "gloo-timers",
+ "moka",
+ "ngsild-model",
+ "reqwest",
+ "rustls",
+ "send_wrapper",
+ "serde_json",
+ "tokio",
+ "uuid",
+ "web-time",
+]
+
+[[package]]
+name = "ngsild-matcher"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "ngsild-jsonld",
+ "ngsild-model",
+ "ngsild-ql",
+ "serde_json",
+]
+
+[[package]]
+name = "ngsild-model"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "ngsild-ql"
+version = "0.2.0"
+dependencies = [
+ "geo",
+ "geo-types",
+ "geojson",
+ "ngsild-jsonld",
+ "ngsild-model",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ngsild-residual"
+version = "0.2.0"
+dependencies = [
+ "geo",
+ "regex",
+ "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]

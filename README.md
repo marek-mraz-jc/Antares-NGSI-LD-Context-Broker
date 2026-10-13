@@ -203,7 +203,8 @@ number is produced.
 
 ## The NGSI-LD crates
 
-`antares-model`, `antares-jsonld`, `antares-ql`, `antares-matcher` and `antares-residual` hold the
+`ngsild-model`, `ngsild-jsonld`, `ngsild-ql`, `ngsild-matcher` and `ngsild-residual` (folders
+`crates/antares-*`, `antares_*` inside this workspace through `package =`, T-3962) hold the
 NGSI-LD data model, JSON-LD expansion, the query languages, subscription matching and the
 residual evaluator with no server, store or network in their default features (role `ngsild`,
 ADR-0027). Each has a README with a runnable example and the CIM 009 clauses it implements, and

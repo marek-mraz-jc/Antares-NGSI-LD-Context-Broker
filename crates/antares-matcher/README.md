@@ -1,4 +1,4 @@
-# antares-matcher
+# ngsild-matcher
 
 Subscription matching of ETSI GS CIM 009 V1.9.1 against one in-memory Entity: the predicates
 the Antares broker applies on its notification path, usable without a broker. A gateway or an
@@ -16,7 +16,7 @@ semantics (published as `ngsild-matcher` once released).
 
 ```rust
 use antares_jsonld::{core_context, expand_entity, ExpandOpts};
-use antares_matcher::would_notify;
+use ngsild_matcher::would_notify;
 use serde_json::json;
 
 let ctx = core_context();

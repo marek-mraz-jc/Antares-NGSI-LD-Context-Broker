@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use antares_ql::geo::GeoQuery;
-use antares_residual::{
+use ngsild_residual::{
     compile, eval, DateTime, Error, Expr, Lit, Path, Spatial, Truth, MAX_GEO_VERTICES,
 };
 use proptest::prelude::*;
@@ -297,7 +297,7 @@ fn multi_geometries_relate_by_their_members() -> Result<(), Error> {
 fn a_geometry_literal_compares_with_nothing() -> Result<(), Error> {
     let p = point(1.0, 1.0);
     let e = Expr::Cmp(
-        antares_residual::Cmp::Eq,
+        ngsild_residual::Cmp::Eq,
         Box::new(Expr::Path(Path::value("location"))),
         Box::new(Expr::Lit(Lit::Geometry(p.clone()))),
     );

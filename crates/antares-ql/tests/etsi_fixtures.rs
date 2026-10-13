@@ -8,9 +8,9 @@
     clippy::indexing_slicing
 )]
 use antares_jsonld::{core_context, expand_entity, Context, ExpandOpts};
-use antares_ql::eval::eval_q;
-use antares_ql::parse_q;
-use antares_ql::scope::{check_scope_q, scope_matches};
+use ngsild_ql::eval::eval_q;
+use ngsild_ql::parse_q;
+use ngsild_ql::scope::{check_scope_q, scope_matches};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 

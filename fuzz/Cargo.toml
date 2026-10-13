@@ -13,10 +13,10 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
-antares-ql = { path = "../crates/antares-ql" }
+antares-ql = { package = "ngsild-ql", path = "../crates/antares-ql" }
 antares-api = { path = "../crates/antares-api", default-features = false, features = ["fuzzing"] }
-antares-model = { path = "../crates/antares-model" }
-antares-jsonld = { path = "../crates/antares-jsonld" }
+antares-model = { package = "ngsild-model", path = "../crates/antares-model" }
+antares-jsonld = { package = "ngsild-jsonld", path = "../crates/antares-jsonld" }
 antares-ops = { path = "../crates/antares-ops" }
 # q_to_sql: the SQL compilers alone; the Postgres store is not linked.
 antares-sql = { path = "../crates/antares-sql", default-features = false }
@@ -27,7 +27,7 @@ odata-json = { path = "../crates/odata-json" }
 antares-mcp = { path = "../crates/antares-mcp", features = ["fuzzing"] }
 odata-batch = { path = "../crates/odata-batch" }
 antares-ws = { path = "../crates/antares-ws" }
-antares-residual = { path = "../crates/antares-residual" }
+antares-residual = { package = "ngsild-residual", path = "../crates/antares-residual" }
 
 [[bin]]
 name = "parse_q"

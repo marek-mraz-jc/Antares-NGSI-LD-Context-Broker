@@ -4,7 +4,7 @@
 //!
 //!     cargo run -p antares-model --example suite_ids [ngsi-ld-test-suite/data/entities]
 #![allow(clippy::print_stdout)]
-use antares_model::{check_attr_name, EntityId};
+use ngsild_model::{check_attr_name, EntityId};
 use serde_json::Value;
 use std::path::PathBuf;
 

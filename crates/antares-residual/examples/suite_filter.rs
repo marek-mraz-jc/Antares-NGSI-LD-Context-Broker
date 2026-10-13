@@ -4,7 +4,7 @@
 //!
 //!     cargo run -p antares-residual --example suite_filter [ngsi-ld-test-suite/data/entities]
 #![allow(clippy::print_stdout)]
-use antares_residual::{compile, eval, Cmp, DateTime, Expr, Lit, Path};
+use ngsild_residual::{compile, eval, Cmp, DateTime, Expr, Lit, Path};
 use serde_json::Value;
 use std::path::PathBuf;
 

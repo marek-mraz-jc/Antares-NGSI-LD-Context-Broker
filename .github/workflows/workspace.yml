@@ -139,7 +139,7 @@ jobs:
       # T-3911: the JSON-LD algorithms without the `fetch` loader build for
       # the browser with no network stack at all, the shape another project
       # embeds (rule M3).
-      - run: cargo check --locked --target wasm32-unknown-unknown -p antares-jsonld --no-default-features
+      - run: cargo check --locked --target wasm32-unknown-unknown -p ngsild-jsonld --no-default-features
       # --locked everywhere below: the image builds with it (Dockerfile), so
       # without it CI would gate on a dependency set the shipped binary never
       # used, and an out-of-date Cargo.lock would pass here and fail there.
@@ -624,7 +624,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [antares-model, antares-ql, antares-jsonld, antares-matcher, antares-residual, antares-store]
+        crate: [ngsild-model, ngsild-ql, ngsild-jsonld, ngsild-matcher, ngsild-residual, antares-store]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -638,7 +638,9 @@ jobs:
       # run, not only compile, or the README's promise is untested.
       - name: Examples run
         run: |
-          for example in crates/${{ matrix.crate }}/examples/*.rs; do
+          # T-3962: a package's folder is not its name (ngsild-model lives in crates/antares-model)
+          dir=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, os, sys; print(next(os.path.dirname(p["manifest_path"]) for p in json.load(sys.stdin)["packages"] if p["name"] == sys.argv[1]))' "${{ matrix.crate }}")
+          for example in "$dir"/examples/*.rs; do
             [ -e "$example" ] || continue
             name=$(basename "$example" .rs)
             # an example with `required-features` runs with them (gateway_expand needs `fetch`)
@@ -700,10 +702,10 @@ jobs:
       - name: cargo publish --dry-run (packaged files only)
         run: |
           cargo publish --dry-run --locked \
-            -p antares-model -p antares-jsonld -p antares-ql -p antares-matcher -p antares-residual
+            -p ngsild-model -p ngsild-jsonld -p ngsild-ql -p ngsild-matcher -p ngsild-residual
       - name: cargo package --list (what a release ships)
         run: |
-          for crate in antares-model antares-jsonld antares-ql antares-matcher antares-residual; do
+          for crate in ngsild-model ngsild-jsonld ngsild-ql ngsild-matcher ngsild-residual; do
             echo "== $crate: $(cargo package --locked --list -p "$crate" | wc -l) files"
           done
       - name: cargo-semver-checks against the last v* tag
@@ -711,8 +713,11 @@ jobs:
           base=$(git describe --tags --abbrev=0 --match 'v*')
           echo "baseline $base"
           # a crate the baseline tag does not have yet has no API to break
-          for crate in antares-model antares-jsonld antares-ql antares-matcher antares-residual; do
-            if git cat-file -e "$base:crates/$crate/Cargo.toml" 2>/dev/null; then
+          # a crate the baseline tag has under another package name (T-3962) has no API of that
+          # name to compare either
+          for crate in ngsild-model ngsild-jsonld ngsild-ql ngsild-matcher ngsild-residual; do
+            dir="crates/antares-${crate#ngsild-}"
+            if git show "$base:$dir/Cargo.toml" 2>/dev/null | grep -qx "name = \"$crate\""; then
               cargo semver-checks --baseline-rev "$base" -p "$crate"
             else
               echo "::notice::$crate is new since $base, no baseline to compare"

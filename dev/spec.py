@@ -776,7 +776,7 @@ def shared_crate_violations():
     wf = ROOT / ".github/workflows/workspace.yml"
     if not book.exists() or not wf.exists():
         return [f"{book if not book.exists() else wf}: missing"]
-    published = set(re.findall(r"^\| `(antares-[a-z]+)` \|", book.read_text(encoding="utf-8"), re.M))
+    published = set(re.findall(r"^\| `((?:antares|ngsild)-[a-z]+)` \|", book.read_text(encoding="utf-8"), re.M))
     gated = re.search(r"crate: \[([^\]]*)\]", wf.read_text(encoding="utf-8"))
     if not gated:
         return [f"{wf}: no shared-crate matrix to compare the chapter against"]

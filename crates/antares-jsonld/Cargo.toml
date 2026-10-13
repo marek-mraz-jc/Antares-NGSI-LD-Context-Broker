@@ -1,5 +1,5 @@
 [package]
-name = "antares-jsonld"
+name = "ngsild-jsonld"
 description = "JSON-LD layer: pinned core contexts, NGSI-LD expansion/compaction + structural validation; the caching HTTP Loader behind the `fetch` feature."
 version.workspace = true
 edition.workspace = true

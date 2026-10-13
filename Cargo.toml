@@ -46,15 +46,15 @@ repository = "https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker"
 rust-version = "1.97"
 
 [workspace.dependencies]
-antares-model = { path = "crates/antares-model", version = "0.2" }
+antares-model = { package = "ngsild-model", path = "crates/antares-model", version = "0.2" }
 antares-store = { path = "crates/antares-store" }
-antares-jsonld = { path = "crates/antares-jsonld", version = "0.2" }
-antares-ql = { path = "crates/antares-ql", version = "0.2" }
-antares-residual = { path = "crates/antares-residual", version = "0.2" }
+antares-jsonld = { package = "ngsild-jsonld", path = "crates/antares-jsonld", version = "0.2" }
+antares-ql = { package = "ngsild-ql", path = "crates/antares-ql", version = "0.2" }
+antares-residual = { package = "ngsild-residual", path = "crates/antares-residual", version = "0.2" }
 antares-sql = { path = "crates/antares-sql", default-features = false }
 antares-bus = { path = "crates/antares-bus" }
 antares-api = { path = "crates/antares-api", default-features = false }
-antares-matcher = { path = "crates/antares-matcher", version = "0.2" }
+antares-matcher = { package = "ngsild-matcher", path = "crates/antares-matcher", version = "0.2" }
 antares-notifier = { path = "crates/antares-notifier", default-features = false }
 antares-plugin-example = { path = "examples/plugin-example" }
 joinedcontext-policy = { path = "addons/joinedcontext-policy" }
@@ -207,7 +207,7 @@ codegen-units = 1
 overflow-checks = true
 codegen-units = 1
 
-[profile.release.package.antares-residual]
+[profile.release.package.ngsild-residual]
 overflow-checks = true
 codegen-units = 1
 

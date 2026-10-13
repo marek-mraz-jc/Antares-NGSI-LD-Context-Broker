@@ -5,7 +5,7 @@
 //!
 //!     cargo run -p antares-ql --example suite_scopes [ngsi-ld-test-suite]
 #![allow(clippy::print_stdout)]
-use antares_ql::scope::{check_scope_q, scope_matches};
+use ngsild_ql::scope::{check_scope_q, scope_matches};
 use serde_json::Value;
 use std::path::PathBuf;
 

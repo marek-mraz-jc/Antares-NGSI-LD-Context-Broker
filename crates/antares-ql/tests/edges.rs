@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! The T-3912 edge cases at the trust boundary: each answers a typed error, never a panic.
 #![allow(clippy::unwrap_used, clippy::panic)]
-use antares_ql::geo::GeoQuery;
-use antares_ql::scope::check_scope_q;
-use antares_ql::{parse_q, percent_decode};
+use ngsild_ql::geo::GeoQuery;
+use ngsild_ql::scope::check_scope_q;
+use ngsild_ql::{parse_q, percent_decode};
 use std::collections::HashMap;
 
 #[test]

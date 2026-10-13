@@ -4,7 +4,7 @@
 //! here without the crate's code, answers on the same Entity. The Entity's `GeoProperty` `g` is
 //! a grid point, or a value that is no geometry, related to a literal point or box (T-3756).
 
-use antares_residual::{compile, eval, Cmp, DateTime, Expr, Func, Lit, Path, Spatial, Truth};
+use ngsild_residual::{compile, eval, Cmp, DateTime, Expr, Func, Lit, Path, Spatial, Truth};
 use proptest::prelude::*;
 use serde_json::{json, Map, Value};
 

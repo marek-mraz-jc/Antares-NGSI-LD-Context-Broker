@@ -2,7 +2,7 @@
 //! `antares-residual` over a normalized NGSI-LD Entity: every path, operator and function, each
 //! with its unknown and mistyped rows (ADR-0028 rules 2 and 7).
 
-use antares_residual::{
+use ngsild_residual::{
     compile, eval, Cmp, Date, DateTime, Error, Expr, Func, Lit, Member, Path, Program, Time, Truth,
     MAX_DEPTH, MAX_NODES, MAX_STRING_BYTES,
 };
@@ -634,7 +634,7 @@ fn nested_lambdas_over_long_lists_hit_the_step_budget() {
 
 #[test]
 fn a_program_names_the_attributes_and_system_members_it_reads() -> Result<(), Error> {
-    use antares_residual::Spatial;
+    use ngsild_residual::Spatial;
     let at = |attrs: &[&str], member| Path::Attribute {
         attrs: attrs.iter().map(|a| (*a).to_owned()).collect(),
         member,
