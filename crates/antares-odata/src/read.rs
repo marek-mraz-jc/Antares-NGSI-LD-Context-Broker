@@ -15,8 +15,8 @@ use crate::filter::{
 };
 use antares_ops::residual::{DateTime, Expr as RExpr, Program};
 use antares_ops::{
-    core_name, Caller, OperationId, OpsRequest, Page as ScanPage, Pushdown, Refusal, Scanned,
-    ViewOps, RESIDUAL_SCAN, TOO_COMPLEX,
+    core_name, pickable, Caller, OperationId, OpsRequest, Page as ScanPage, Pushdown, Refusal,
+    Scanned, ViewOps, RESIDUAL_SCAN, TOO_COMPLEX,
 };
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -297,8 +297,10 @@ fn listed(picked: Option<&[&str]>, expansions: &[Expansion], version: ODataVersi
 }
 
 /// The NGSI-LD query of an EntitySet: its type, the Attributes selected
-/// (`attrs`, which takes IRIs; the core members always come, and the
-/// expanded Relationships), the system members only when selected (E6),
+/// (`pick`, a projection that keeps every Entity, unlike `attrs`; by IRI,
+/// with the core members and the expanded Relationships; none when an IRI
+/// is no 4.21 member name, and the surface projects), the system members
+/// only when selected (E6),
 /// `join=inline` one level deep for an expansion of entities or a `q` that
 /// follows a Relationship (5.7.2.4). A join
 /// follows every Relationship it is given (4.5.23), so it names the
@@ -310,21 +312,13 @@ pub(crate) fn query(
     expansions: &[Expansion],
     filter: &Translated,
 ) -> String {
-    let nested = expansions.iter().filter_map(|e| match &e.writes {
-        Writes::Entities(picked) => Some(picked.as_deref()),
-        Writes::Refs(_) => None,
-    });
-    let joined = filter.linked || nested.clone().count() > 0;
-    let structural: Vec<&str>;
+    let nested = nested(expansions);
+    let joined = joins(expansions, filter);
+    let frame: Vec<&str>;
     let picked = match picked {
         None if joined => {
-            structural = set
-                .members
-                .iter()
-                .filter(|(_, m)| !matches!(m.shape, Shape::Nav { .. }))
-                .map(|(name, _)| name.as_str())
-                .collect();
-            Some(structural.as_slice())
+            frame = structural(set);
+            Some(frame.as_slice())
         }
         picked => picked,
     };
@@ -333,13 +327,17 @@ pub(crate) fn query(
         q.push_str("&orderBy=");
         q.push_str(&encode(keys));
     }
+    let system = |names: Option<&[&str]>| {
+        names.is_some_and(|n| n.iter().any(|m| matches!(*m, "createdAt" | "modifiedAt")))
+    };
+    let sys = system(picked) || nested.clone().any(system);
     if let Some(names) = picked {
         // the computed values read their Attributes by term of the request's context
         let reads = filter
             .computed_reads
             .iter()
             .filter_map(|term| filter.context.get(term)?.as_str());
-        let mut attrs: Vec<String> = Vec::new();
+        let mut iris: Vec<&str> = Vec::new();
         for iri in names
             .iter()
             .filter_map(|name| set.members.get(*name))
@@ -347,26 +345,56 @@ pub(crate) fn query(
             .chain(expansions.iter().map(|e| e.iri))
             .chain(reads)
         {
-            let iri = encode(iri);
-            if !attrs.contains(&iri) {
-                attrs.push(iri);
+            if !iris.contains(&iri) {
+                iris.push(iri);
             }
         }
-        if !attrs.is_empty() {
-            q.push_str("&attrs=");
-            q.push_str(&attrs.join(","));
+        // ponytail: an unpickable IRI reads the whole Entity, and a join then
+        // walks every Relationship; mint terms (as `pushdown` does) if one is
+        // ever seen
+        if !iris.is_empty() && iris.iter().all(|iri| pickable(iri)) {
+            let own = ["id", "type", "scope"].into_iter().chain(
+                sys.then_some(["createdAt", "modifiedAt"])
+                    .into_iter()
+                    .flatten(),
+            );
+            let pick: Vec<String> = own.chain(iris).map(encode).collect();
+            q.push_str("&pick=");
+            q.push_str(&pick.join(","));
         }
     }
-    let system = |names: Option<&[&str]>| {
-        names.is_some_and(|n| n.iter().any(|m| matches!(*m, "createdAt" | "modifiedAt")))
-    };
-    if system(picked) || nested.clone().any(system) {
+    if sys {
         q.push_str("&options=sysAttrs");
     }
     if joined {
         q.push_str("&join=inline&joinLevel=1");
     }
     q
+}
+
+/// The `$select` of each expansion of entities.
+fn nested<'e>(expansions: &'e [Expansion]) -> impl Iterator<Item = Option<&'e [&'e str]>> + Clone {
+    expansions.iter().filter_map(|e| match &e.writes {
+        Writes::Entities(picked) => Some(picked.as_deref()),
+        Writes::Refs(_) => None,
+    })
+}
+
+/// Whether a read joins: an expansion of entities or a `q` that follows a
+/// Relationship (5.7.2.4).
+fn joins(expansions: &[Expansion], filter: &Translated) -> bool {
+    filter.linked || nested(expansions).next().is_some()
+}
+
+/// The members a join without `$select` projects to: every one but the
+/// navigations, so a navigation not expanded spends none of the walk's
+/// lookups.
+fn structural(set: &Set) -> Vec<&str> {
+    set.members
+        .iter()
+        .filter(|(_, m)| !matches!(m.shape, Shape::Nav { .. }))
+        .map(|(name, _)| name.as_str())
+        .collect()
 }
 
 /// Which Entities a query selects: its type, `id`, `q`, `geoQ`,
@@ -407,6 +435,15 @@ fn pushdown(
     expansions: &[Expansion],
     filter: &mut Translated,
 ) -> Pushdown {
+    let joined = joins(expansions, filter);
+    let frame: Vec<&str>;
+    let picked = match picked {
+        None if joined => {
+            frame = structural(set);
+            Some(frame.as_slice())
+        }
+        picked => picked,
+    };
     let attrs = picked.map(|names| {
         let iris = names
             .iter()
@@ -429,15 +466,19 @@ fn pushdown(
     let system = |names: Option<&[&str]>| {
         names.is_some_and(|n| n.iter().any(|m| matches!(*m, "createdAt" | "modifiedAt")))
     };
+    let mut query = selection(set, filter);
+    if joined {
+        query.push_str("&join=inline&joinLevel=1");
+    }
     Pushdown {
-        query: selection(set, filter),
+        query,
         order: filter
             .order
             .as_deref()
             .map(|keys| keys.split(',').map(str::to_owned).collect())
             .unwrap_or_default(),
         attrs,
-        sys_attrs: system(picked) || filter.sort_system,
+        sys_attrs: system(picked) || nested(expansions).any(system) || filter.sort_system,
         context: (!filter.context.is_empty()).then(|| Value::Object(filter.context.clone())),
     }
 }
@@ -516,15 +557,6 @@ async fn evaluated(
         counted,
         version,
     } = window;
-    let joined = filter.linked
-        || expansions
-            .iter()
-            .any(|e| matches!(e.writes, Writes::Entities(_)));
-    if joined {
-        // The scan reads no NGSILD-Warning: a join it walked could be
-        // truncated unseen (S1, O6), so a residual stays off a join.
-        return Err(not_implemented(version));
-    }
     let pushdown = pushdown(set, picked, expansions, filter);
     Ok(if counted || filter.sort.is_some() {
         // The whole answer, counted and sorted here (ADR-0028 rule 5); the
@@ -620,6 +652,7 @@ pub(crate) async fn collection(
         .unwrap_or(u64::MAX)
         .min(max_page(headers, reads.state.max_header_len))
         .min(MAX_PAGE);
+    nulls_first(reads, caller, set, &mut filter, version).await?;
     if filter.sort.is_some() && filter.residual.is_empty() {
         // a surface sort reads the whole answer through the scan: a residual that always holds
         filter.residual.push(RExpr::And(Vec::new()));
@@ -726,8 +759,6 @@ pub(crate) async fn count(
             .await?
             .1
         }
-        // A hop is evaluated under a join the scan cannot see truncated.
-        Some(_) if filter.linked => return Err(not_implemented(version)),
         Some(program) => {
             filter.sort = None;
             let pushdown = pushdown(set, None, &[], &mut filter);
@@ -1111,21 +1142,13 @@ pub(crate) async fn run_request(
     if !answer.status().is_success() {
         return Err(refused(answer.status(), version));
     }
-    // The join walk stopped at the broker's lookup budget (4.5.23.1): an
-    // OData client cannot see the NGSI-LD warning, so a partial expansion
-    // is refused (S1, O6, D9).
     let truncated = answer
         .headers()
         .get_all("NGSILD-Warning")
         .iter()
         .any(|w| w.as_bytes().windows(9).any(|at| at == b"truncated"));
     if truncated {
-        return Err(ODataErrorResponse::new(
-            StatusCode::BAD_REQUEST,
-            "BadRequest",
-            "the expansion reaches more Entities than one answer embeds: narrow it with $top or $filter",
-        )
-        .with_version(version));
+        return Err(truncated_join(version));
     }
     let total = answer
         .headers()
@@ -1471,6 +1494,64 @@ fn projected<'s>(
     )
 }
 
+/// URL 5.1.5 puts null first ascending and last descending; the store puts
+/// an Entity lacking an `orderBy` key after every value either way. One
+/// count of the Entities lacking a key decides: none, and the store's order
+/// is the standard's; any, and the read is sorted on the surface (T-3853).
+// ponytail: a sparse key over RESIDUAL_SCAN Entities is 400 TooManyResults;
+// split a single-key sort into "lacks it" and "holds it" reads if that matters
+async fn nulls_first(
+    reads: &Reads,
+    caller: &Caller,
+    set: &Set,
+    filter: &mut Translated,
+    version: ODataVersion,
+) -> Result<(), ODataErrorResponse> {
+    let terms: Vec<&str> = filter
+        .pushed_keys
+        .iter()
+        .filter_map(|k| match &k.by {
+            SortBy::Value(term) => Some(term.as_str()),
+            SortBy::Id | SortBy::System(_) | SortBy::Computed(_) => None,
+        })
+        .collect();
+    if filter.order.is_none() || terms.is_empty() {
+        return Ok(());
+    }
+    let lacking = terms
+        .iter()
+        .map(|t| format!("!{t}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let q = match &filter.q {
+        Some(q) => format!("({q});({lacking})"),
+        None => lacking,
+    };
+    let probe = Translated {
+        q: Some(q),
+        ..filter.probe()
+    };
+    let target = format!(
+        "/ngsi-ld/v1/entities?{}&limit=0&count=true",
+        query(set, None, &[], &probe)
+    );
+    let (_, lacking) = run(
+        reads,
+        caller,
+        OperationId::QueryEntities,
+        target,
+        &probe,
+        version,
+    )
+    .await?;
+    if lacking > 0 {
+        filter.sort_reads = terms.iter().map(|t| (*t).to_owned()).collect();
+        filter.sort = Some(std::mem::take(&mut filter.pushed_keys));
+        filter.order = None;
+    }
+    Ok(())
+}
+
 /// The request's residual as a program, `now` read once (ADR-0028 rule 2).
 fn residual_of(
     filter: &Translated,
@@ -1501,6 +1582,10 @@ async fn scanned(
     version: ODataVersion,
 ) -> Result<(Vec<Value>, Option<usize>), ODataErrorResponse> {
     match reads.view.scan(caller, pushdown, Some(program), page).await {
+        // T-3823: a scanned join is refused like a pushed one when the walk stopped short
+        Ok(Scanned::Page {
+            truncated: true, ..
+        }) => Err(truncated_join(version)),
         Ok(Scanned::Page { entities, next, .. }) => Ok((entities, next)),
         // A query answers 404 for a Tenant that holds nothing yet (5.5.10).
         Ok(Scanned::Answer(answer)) if answer.status() == StatusCode::NOT_FOUND => {
@@ -1525,6 +1610,18 @@ async fn scanned(
         .with_version(version)),
         Err(other) => Err(refused(other.status(), version)),
     }
+}
+
+/// The join walk stopped at the broker's lookup budget (4.5.23.1): an OData
+/// client cannot see the NGSI-LD warning, so a partial expansion is refused
+/// (S1, O6, D9).
+fn truncated_join(version: ODataVersion) -> ODataErrorResponse {
+    ODataErrorResponse::new(
+        StatusCode::BAD_REQUEST,
+        "BadRequest",
+        "the expansion reaches more Entities than one answer embeds: narrow it with $top or $filter",
+    )
+    .with_version(version)
 }
 
 /// `docs` in the order of `keys` (Q9, URL 5.1.5): null and missing values
@@ -1724,6 +1821,27 @@ mod tests {
         assert_eq!(objects(None), Vec::<String>::new());
         let relationship = json!({"object": ["a", 1], "objectList": [{"object": "b"}, "c", 2]});
         assert_eq!(objects(Some(&relationship)), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn select_is_a_pick_of_the_frame_and_none_when_an_iri_is_no_member_name() {
+        // T-3822: `pick`, never `attrs`, which drops the Entities holding none
+        let mut set = set();
+        let none = Translated::default();
+        let q = query(&set, Some(&["geo", "createdAt"]), &[], &none);
+        assert!(
+            q.ends_with(
+                "&pick=id,type,scope,createdAt,modifiedAt,https%3A%2F%2Fe.org%2Fm&options=sysAttrs"
+            ),
+            "{q}"
+        );
+        assert!(!q.contains("attrs="), "{q}");
+        set.members
+            .entry("geo".into())
+            .and_modify(|geo| geo.iri = "https://e.org/~m".into());
+        let q = query(&set, Some(&["geo"]), &[], &none);
+        assert!(!q.contains("pick="), "{q}");
+        assert!(!q.contains("attrs="), "{q}");
     }
 
     #[test]
