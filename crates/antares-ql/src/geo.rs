@@ -262,15 +262,6 @@ impl GeoQuery {
         }
         check_vertex_budget(&coordinates).map_err(bad)?;
         let query_geom = parse_geometry(&geometry, &coordinates).map_err(bad)?;
-        // RFC 7946 3.1.6 defers to Simple Features: a ring that crosses itself bounds no area, so
-        // every relation that reads the area (within, contains, intersects, overlaps, disjoint,
-        // near) would answer by the evaluator's accident, not the query; it is refused before any
-        // Entity is read. `equals` reads no area: a stored bow-tie is literally equal to itself.
-        if !matches!(rel, Georel::Equals) {
-            if let Err(invalid) = geo::algorithm::Validation::check_validation(&query_geom) {
-                return Err(bad(format!("the query geometry is not valid: {invalid}")));
-            }
-        }
         Ok(Some(Self {
             rel,
             geometry,
@@ -391,31 +382,23 @@ mod tests {
         assert!(!g.matches_geometry(&geoval("Point", json!([10.0, 60.001]))));
     }
 
-    /// A self-intersecting (bow-tie) ring bounds no area: every relation that reads one refuses it
-    /// with a 400 (T-3912), never a panic or a guess.
+    /// A self-intersecting (bow-tie) query ring is evaluated, not refused: ETSI `019_11_06`
+    /// queries `within` such a polygon and expects its match (T-3912). Every area relation answers
+    /// without a panic, and a point inside one lobe is `within` it.
     #[test]
-    fn an_area_relation_refuses_a_self_intersecting_ring() {
+    fn an_area_relation_evaluates_a_self_intersecting_ring() {
         let ring = "[[[0,0],[2,2],[2,0],[0,2],[0,0]]]";
+        let inside = geoval("Point", json!([1.8, 1.0]));
         for rel in [
-            "within",
             "contains",
             "intersects",
             "overlaps",
             "disjoint",
             "near;maxDistance==10",
         ] {
-            let params: HashMap<String, String> = [
-                ("georel", rel),
-                ("geometry", "Polygon"),
-                ("coordinates", ring),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect();
-            let err = GeoQuery::from_params(&params).unwrap_err();
-            assert_eq!(err.status(), 400, "{rel}: {err}");
-            assert!(err.to_string().contains("not valid"), "{rel}: {err}");
+            let _ = q(rel, "Polygon", ring).matches_geometry(&inside);
         }
+        assert!(q("within", "Polygon", ring).matches_geometry(&inside));
     }
 
     /// equals: a literally identical geometry is equal even where DE-9IM is
