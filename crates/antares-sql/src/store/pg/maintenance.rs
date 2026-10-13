@@ -411,6 +411,22 @@ async fn retain(
     };
     let mut tx = pool.begin().await?;
     crate::store::pg::set_service(&mut tx).await?;
+    // The rule's own Tenant as well: `temporal_entities` keeps the plain
+    // tenant policy (no service escape), so without it the history JOIN sees
+    // no row under the broker's role and deletes nothing (T-3900).
+    sqlx::query(crate::SET_TENANT_SQL)
+        .bind(tenant)
+        .execute(&mut *tx)
+        .await?;
+    if !dry_run {
+        // One batch that outlasts the sweep's budget (15 s, antares-ops
+        // retention) is cancelled rather than holding a connection and the
+        // database for minutes; the sweep logs it and the next minute retries
+        // (T-4084).
+        sqlx::query("SET LOCAL statement_timeout = '15s'")
+            .execute(&mut *tx)
+            .await?;
+    }
     // Both parts are the two constants above; every value is bound.
     let query = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(tenant)

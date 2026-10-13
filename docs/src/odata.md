@@ -90,8 +90,8 @@ root.
 | `$search` | one more `$filter` conjunct: a word or `"phrase"` matches when a single-valued String property the view shows contains it, case-insensitively; `NOT` before `AND` (or a space) before `OR`; evaluated by the residual on what the view and the engine admit, so a hidden property never matches (T-3750) |
 | `$compute` | `expr as name`, evaluated per Entity by the residual on what the view and the engine admit and written as a dynamic property; the name works in `$filter`, `$orderby` (sorted by the surface) and `$select`; a hidden Attribute reads as absent, so its computed value is `null` (T-3936) |
 | `$apply` | `identity`, `filter`, `search`, `orderby`, `top`, `skip`, `compute`, `aggregate` (`sum`, `min`, `max`, `average`, `countdistinct`, `$count`), `groupby` by single properties, `topcount` to `bottompercent` (only the instances with a value, in rank order) and `concat`, in order, over the whole answer the view and the engine admit, read by one scan of at most 10,000 Entities (past it `400 TooManyResults`, never a partial aggregate); after an aggregation the rows carry only their names and no id; `sum`, `average`, `min` and `max` fold the non-null values and are `null` without one; `$top`, `$skip` and `$count` page and count the rows; `expand`, `nest`, the join and hierarchy transformations, rollup, custom aggregates, a `concat` mixing Entities and rows, `search` after an aggregation, the other options beside it, `/$count`, `/$ref` and one Entity are `501` (T-3937, T-3985) |
-| `$orderby` | `orderBy` on `id` and single-valued values, `;desc`; `createdAt`, `modifiedAt` sorted by the surface (section 4) |
-| `$select` | `attrs`; `createdAt`/`modifiedAt` add `options=sysAttrs` |
+| `$orderby` | `orderBy` on `id` and single-valued values, `;desc`; `createdAt`, `modifiedAt` sorted by the surface (section 4); a missing value first ascending, last descending: when any Entity lacks a key, the surface sorts |
+| `$select` | `pick` of `id`, `type`, `scope` and the selected Attributes and those a `$compute` reads (TS 104 175 4.21: a projection, so an Entity lacking every selected Attribute is still in the answer, its members `null`); `createdAt`/`modifiedAt` add `options=sysAttrs` and are picked. A name the 4.21 grammar would read as something else (a character outside `_:#/%-+@`, a dot in a short name) pushes no projection: the whole Entity is read and the surface projects it (T-3822) |
 | `$expand` | `join=inline&joinLevel=1` (section 5) |
 | `$top`, `$skip`, `Prefer: odata.maxpagesize` | `limit`, `offset`; a page is at most 1000, 100 by default |
 | `$count=true` | `@odata.count` from `NGSILD-Results-Count`, or counted by the surface (section 4) |
@@ -221,9 +221,11 @@ the request's `$orderby` and then `id`, at most 10 000 per request: a page
 that runs out of budget is served short with its next link.
 `$count=true`, `/$count` and a `$orderby` on `createdAt` or `modifiedAt`
 read the whole answer, which is `400` `TooManyResults` when the broker
-counts more than 10 000 Entities. Such a read beside an `$expand` of
-entities, or with a navigation hop in the filter, is `501` until the scan
-can see a truncated join (T-3823).
+counts more than 10 000 Entities. Such a read may `$expand` entities and
+follow a navigation hop in the filter: the scan reads the broker's
+`NGSILD-Warning`, and a join walk any upstream page truncated at the
+lookup budget is the same `400` as a pushed read's (T-3823); a partial
+expansion is never served.
 
 The custom options `ngsild.q`, `ngsild.scopeQ`, `ngsild.georel`,
 `ngsild.geometry`, `ngsild.coordinates`, `ngsild.geoproperty`,

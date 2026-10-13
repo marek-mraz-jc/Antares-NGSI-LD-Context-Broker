@@ -267,6 +267,71 @@ async fn the_check_endpoint_answers_one_prospective_request() -> Res {
     Ok(())
 }
 
+/// `access_simulate_tests`: explain answers what check answers and names
+/// the policy that decided, a refusal by prohibition included (T-3881).
+#[tokio::test]
+async fn explain_names_the_policy_that_decided() -> Res {
+    let (_b, app, _) = setup().await?;
+    let explain = |who: &'static [(&'static str, &'static str)], query: Value| {
+        let app = app.clone();
+        async move {
+            let (status, media, body) = call(
+                &app,
+                "POST",
+                "/x/views/air/access/explain",
+                who,
+                Some(&query.to_string()),
+            )
+            .await?;
+            if status != StatusCode::OK || media != "application/json" {
+                return Err(format!("{status} {media} {body}"));
+            }
+            parse(&body)
+        }
+    };
+    let read =
+        json!({"action": {"name": "queryEntity"}, "resource": {"type": "AirQualityObserved"}});
+    assert_eq!(
+        explain(&ANONYMOUS, read.clone()).await?,
+        json!({"decision": true, "context": {"reason": "policy_grant_matched",
+               "policy": "ovzdusie/public-read", "assigner": CITY}})
+    );
+    let history =
+        json!({"action": {"name": "queryTemporal"}, "resource": {"type": "AirQualityObserved"}});
+    assert_eq!(
+        explain(&ANONYMOUS, history.clone()).await?,
+        json!({"decision": false, "context": {"reason": "prohibited",
+               "policy": "ovzdusie/no-public-history", "assigner": CITY}})
+    );
+    let incident =
+        json!({"action": {"name": "queryEntity"}, "resource": {"type": "InternalIncident"}});
+    assert_eq!(
+        explain(&ANONYMOUS, incident.clone()).await?,
+        json!({"decision": false, "context": {"reason": "no_grant"}})
+    );
+    // the steward's grant is named to the steward alone
+    assert_eq!(
+        at(
+            &explain(&STEWARD, incident.clone()).await?,
+            "/context/policy"
+        ),
+        "ovzdusie/steward-incidents"
+    );
+    for (who, query) in [
+        (&ANONYMOUS[..], &read),
+        (&ANONYMOUS[..], &history),
+        (&ANONYMOUS[..], &incident),
+        (&STEWARD[..], &incident),
+    ] {
+        assert_eq!(
+            at(&explain(who, query.clone()).await?, "/decision"),
+            at(&check(&app, who, query).await?, "/decision"),
+            "{query}"
+        );
+    }
+    Ok(())
+}
+
 /// `access_authzen_tests::the_access_surface_refuses_the_same_way_the_data_surface_does`
 #[tokio::test]
 async fn the_access_surface_refuses_the_same_way_the_data_surface_does() -> Res {
@@ -274,35 +339,27 @@ async fn the_access_surface_refuses_the_same_way_the_data_surface_does() -> Res 
     for (method, uri) in [
         ("GET", "/x/views/nosuch/access"),
         ("POST", "/x/views/nosuch/access/check"),
+        ("POST", "/x/views/nosuch/access/explain"),
     ] {
         let (status, _, body) = call(&app, method, uri, &ANONYMOUS, Some("{}")).await?;
         assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}: {body}");
     }
-    for body in ["{}", "not json", r#"{"action": {"name": 7}}"#] {
-        let (status, _, text) = call(
-            &app,
-            "POST",
-            "/x/views/air/access/check",
-            &ANONYMOUS,
-            Some(body),
-        )
-        .await?;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {text}");
+    for (uri, body) in ["check", "explain"].iter().flat_map(|route| {
+        ["{}", "not json", r#"{"action": {"name": 7}}"#]
+            .map(|body| (format!("/x/views/air/access/{route}"), body))
+    }) {
+        let (status, _, text) = call(&app, "POST", &uri, &ANONYMOUS, Some(body)).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}: {text}");
         assert!(
             !text.contains("not json"),
             "a refusal never echoes the body: {text}"
         );
     }
     let huge = format!(r#"{{"action": {{"name": "{}"}}}}"#, "a".repeat(70 * 1024));
-    let (status, _, _) = call(
-        &app,
-        "POST",
-        "/x/views/air/access/check",
-        &ANONYMOUS,
-        Some(&huge),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    for uri in ["/x/views/air/access/check", "/x/views/air/access/explain"] {
+        let (status, _, _) = call(&app, "POST", uri, &ANONYMOUS, Some(&huge)).await?;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+    }
     Ok(())
 }
 

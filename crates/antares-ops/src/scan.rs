@@ -28,7 +28,8 @@ pub struct Pushdown {
     /// The `orderBy` keys the store applies (TS 104 176 7.2.3.1); with a residual the scan ends
     /// them with `id`, so the upstream order is total.
     pub order: Vec<String>,
-    /// The Attributes the standard selects; `None` selects every one.
+    /// The Attributes the standard selects; `None` selects every one. The scan projects with
+    /// `pick` (TS 104 175 4.21), never `attrs`, which would also drop the Entities holding none.
     pub attrs: Option<Vec<String>>,
     /// Whether the standard asks for `createdAt` and `modifiedAt`.
     pub sys_attrs: bool,
@@ -59,6 +60,9 @@ pub enum Scanned {
         next: Option<usize>,
         /// The exact count of the answer, when the page asked for the whole of it.
         count: Option<usize>,
+        /// An upstream page said its join walk stopped at the lookup budget (an `NGSILD-Warning`
+        /// naming `truncated`, TS 104 175 4.5.23.1): some Linked Entity is missing.
+        truncated: bool,
     },
     /// The store's own answer to the pushdown when it was no success (a broken `q`: 400), for
     /// the surface to render as it renders [`ViewOps::run`]'s.
@@ -111,23 +115,29 @@ impl ViewOps {
         page: Page,
     ) -> Result<Scanned, Refusal> {
         let count = if page.whole { "&count=true" } else { "" };
+        let local = unpicked(pushdown, &[]);
         let query = format!(
             "{}{}&limit={}&offset={}{count}",
             pushdown.query,
-            params(pushdown, &pushdown.order, &[], false),
+            params(pushdown, &pushdown.order, &[], false, local.is_none()),
             page.size,
             page.start
         );
-        let (batch, total) = match read(self.query(caller, pushdown, &query).await?).await? {
-            Ok(read) => read,
-            Err(answer) => return Ok(Scanned::Answer(answer)),
-        };
+        let (mut batch, total, truncated) =
+            match read(self.query(caller, pushdown, &query).await?).await? {
+                Ok(read) => read,
+                Err(answer) => return Ok(Scanned::Answer(answer)),
+            };
+        for entity in &mut batch {
+            strip(entity, &[], false, local);
+        }
         let next = (!page.whole && batch.len() == page.size && page.size > 0)
             .then(|| page.start.saturating_add(batch.len()));
         Ok(Scanned::Page {
             entities: batch,
             next,
             count: total.filter(|_| page.whole),
+            truncated,
         })
     }
 
@@ -154,17 +164,18 @@ impl ViewOps {
             None => Vec::new(),
         };
         let system = program.reads_system_members() && !pushdown.sys_attrs;
+        let local = unpicked(pushdown, &extra);
         let fixed = format!(
             "{}{}",
             pushdown.query,
-            params(pushdown, &order, &extra, system)
+            params(pushdown, &order, &extra, system, local.is_none())
         );
         // a whole answer reads what the count announced, a page what the budget allows
         let mut cap = budget;
         if page.whole {
             let counted = format!("{fixed}&limit=0&count=true");
             match read(self.query(caller, pushdown, &counted).await?).await? {
-                Ok((_, total)) => {
+                Ok((_, total, _)) => {
                     // no count is no promise the answer fits
                     cap = total.unwrap_or(usize::MAX);
                     if cap > budget {
@@ -176,9 +187,9 @@ impl ViewOps {
         }
         let size = if page.whole { usize::MAX } else { page.size };
         let mut entities = Vec::new();
-        let (mut offset, mut read_so_far) = (page.start, 0usize);
+        let (mut offset, mut read_so_far, mut truncated) = (page.start, 0usize, false);
         if size == 0 {
-            return Ok(served(entities, None, None, read_so_far));
+            return Ok(served(entities, None, None, (read_so_far, truncated)));
         }
         loop {
             let limit = upstream.min(cap.saturating_sub(read_so_far));
@@ -187,11 +198,14 @@ impl ViewOps {
                 // full and is served short with its continuation.
                 let count = page.whole.then_some(entities.len());
                 let next = (!page.whole).then_some(offset);
-                return Ok(served(entities, next, count, read_so_far));
+                return Ok(served(entities, next, count, (read_so_far, truncated)));
             }
             let query = format!("{fixed}&limit={limit}&offset={offset}");
             let batch = match read(self.query(caller, pushdown, &query).await?).await? {
-                Ok((batch, _)) => batch,
+                Ok((batch, _, cut)) => {
+                    truncated |= cut;
+                    batch
+                }
                 Err(answer) => return Ok((Scanned::Answer(answer), read_so_far)),
             };
             let last = batch.len();
@@ -204,16 +218,17 @@ impl ViewOps {
                     Ok(_) => continue,
                     Err(_) => return Err(Refusal::Malformed(TOO_COMPLEX)),
                 }
-                strip(&mut entity, &extra, system);
+                strip(&mut entity, &extra, system, local);
                 entities.push(entity);
                 if entities.len() == size {
                     let more = !(ended && i.saturating_add(1) == last);
-                    return Ok(served(entities, more.then_some(offset), None, read_so_far));
+                    let next = more.then_some(offset);
+                    return Ok(served(entities, next, None, (read_so_far, truncated)));
                 }
             }
             if ended {
                 let count = page.whole.then_some(entities.len());
-                return Ok(served(entities, None, count, read_so_far));
+                return Ok(served(entities, None, count, (read_so_far, truncated)));
             }
         }
     }
@@ -237,38 +252,76 @@ fn served(
     entities: Vec<Value>,
     next: Option<usize>,
     count: Option<usize>,
-    read: usize,
+    (read, truncated): (usize, bool),
 ) -> (Scanned, usize) {
     (
         Scanned::Page {
             entities,
             next,
             count,
+            truncated,
         },
         read,
     )
 }
 
-/// `orderBy`, `attrs` and `options` of a pushdown, each `&`-prefixed.
-fn params(pushdown: &Pushdown, order: &[String], extra: &[&str], system: bool) -> String {
+/// `orderBy`, `pick` and `options` of a pushdown, each `&`-prefixed. `pick` keeps the
+/// Entity's own members (4.21 drops what it does not name) and the system ones when read.
+fn params(
+    pushdown: &Pushdown,
+    order: &[String],
+    extra: &[&str],
+    system: bool,
+    pick: bool,
+) -> String {
     let mut out = String::new();
     if !order.is_empty() {
         out.push_str("&orderBy=");
         out.push_str(&join(order.iter().map(String::as_str)));
     }
-    if let Some(selected) = &pushdown.attrs {
-        out.push_str("&attrs=");
+    let sys = pushdown.sys_attrs || system;
+    if let Some(selected) = pushdown.attrs.as_ref().filter(|_| pick) {
+        let own = ["id", "type", "scope"].into_iter().chain(
+            sys.then_some(["createdAt", "modifiedAt"])
+                .into_iter()
+                .flatten(),
+        );
+        out.push_str("&pick=");
         out.push_str(&join(
-            selected
-                .iter()
-                .map(String::as_str)
+            own.chain(selected.iter().map(String::as_str))
                 .chain(extra.iter().copied()),
         ));
     }
-    if pushdown.sys_attrs || system {
+    if sys {
         out.push_str("&options=sysAttrs");
     }
     out
+}
+
+/// The standard's selection when one of its names, or of those the residual adds, is not
+/// [`pickable`]: nothing is projected upstream and the scan projects to it itself.
+fn unpicked<'p>(pushdown: &'p Pushdown, extra: &[&str]) -> Option<&'p [String]> {
+    pushdown.attrs.as_deref().filter(|selected| {
+        !selected
+            .iter()
+            .map(String::as_str)
+            .chain(extra.iter().copied())
+            .all(pickable)
+    })
+}
+
+/// Whether `pick` (TS 104 175 4.21) reads `name` as the one Attribute it is: a short name
+/// without a dot (a dot is its sub-Attribute path) or an IRI (a `:` before any dot), in the
+/// characters the projection grammar takes.
+#[must_use]
+pub fn pickable(name: &str) -> bool {
+    let iri = name
+        .find(':')
+        .is_some_and(|colon| name.find('.').is_none_or(|dot| colon < dot));
+    name.starts_with(|c: char| c.is_ascii_alphanumeric() || "_:@#".contains(c))
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_:#/%-+@".contains(c) || (c == '.' && iri))
 }
 
 /// Comma-joined and percent-encoded but for RFC 3986 unreserved characters.
@@ -289,12 +342,18 @@ fn join<'a>(names: impl Iterator<Item = &'a str>) -> String {
     out
 }
 
-/// The Entities of a successful Query Entities answer and its `NGSILD-Results-Count`, or the
-/// answer itself when the store answered with anything but a success.
-async fn read(answer: Response) -> Result<Result<(Vec<Value>, Option<usize>), Response>, Refusal> {
+/// The Entities of a successful Query Entities answer, its `NGSILD-Results-Count` and whether
+/// it warns its join walk was truncated, or the answer itself when the store answered with
+/// anything but a success.
+async fn read(answer: Response) -> Result<Result<Upstream, Response>, Refusal> {
     if !answer.status().is_success() {
         return Ok(Err(answer));
     }
+    let truncated = answer
+        .headers()
+        .get_all("NGSILD-Warning")
+        .iter()
+        .any(|w| w.as_bytes().windows(9).any(|at| at == b"truncated"));
     let total = answer
         .headers()
         .get("NGSILD-Results-Count")
@@ -304,12 +363,15 @@ async fn read(answer: Response) -> Result<Result<(Vec<Value>, Option<usize>), Re
         .await
         .ok();
     match bytes.and_then(|b| serde_json::from_slice(&b).ok()) {
-        Some(Value::Array(entities)) => Ok(Ok((entities, total))),
+        Some(Value::Array(entities)) => Ok(Ok((entities, total, truncated))),
         _ => Err(Refusal::Malformed(
             "the store's answer is no list of Entities",
         )),
     }
 }
+
+/// One upstream page: its Entities, its count and whether its join walk was truncated.
+type Upstream = (Vec<Value>, Option<usize>, bool);
 
 /// The members of an Attribute that hold its value, never an Attribute of their own.
 const VALUES: [&str; 7] = [
@@ -322,15 +384,19 @@ const VALUES: [&str; 7] = [
     "vocab",
 ];
 
-/// Removes what only the residual asked for: the Attributes it added to `attrs`, and
+/// Removes what only the residual asked for: the Attributes it added to `pick`, and
 /// `createdAt`/`modifiedAt` of the Entity, its Attributes and their sub-Attributes when the
 /// standard did not ask for them (a value's own members stay; the scan reads
-/// `application/json`, so no `@context` member is there to keep).
-fn strip(entity: &mut Value, extra: &[&str], system: bool) {
+/// `application/json`, so no `@context` member is there to keep). With `local`, nothing was
+/// projected upstream and every Attribute it does not name goes.
+fn strip(entity: &mut Value, extra: &[&str], system: bool, local: Option<&[String]>) {
     // a Query Entities answer holds objects only
     entity.as_object_mut().into_iter().for_each(|members| {
         for name in extra {
             members.remove(*name);
+        }
+        if let Some(keep) = local {
+            members.retain(|k, _| antares_model::is_meta(k) || keep.iter().any(|s| s == k));
         }
         if system {
             unsystem(members);

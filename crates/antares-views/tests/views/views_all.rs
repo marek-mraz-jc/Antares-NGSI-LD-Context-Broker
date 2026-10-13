@@ -191,6 +191,47 @@ async fn views_all_writes_a_relationship_to_an_absent_entity_as_the_root_does() 
     Ok(())
 }
 
+/// List @contexts through `all` lists the Tenant's stored @contexts as the
+/// root does, every `kind` and `details` alike; a narrowing view still lists
+/// the core @context alone (`views_read`, ADR-0023 rule 5) (T-3946).
+#[tokio::test(flavor = "multi_thread")]
+async fn views_all_lists_the_stored_contexts_as_the_root_does() -> Result<(), String> {
+    let f = fixture().await?;
+    put_view(&f.app, &all_view()).await?;
+    let ctx = json!({"@context": {"secret": "https://example.org/secret"}});
+    let stored = send(
+        &f.app,
+        Method::POST,
+        "/ngsi-ld/v1/jsonldContexts",
+        &[("NGSILD-Tenant", "city")],
+        Some(&ctx),
+    )
+    .await;
+    assert_eq!(stored.status, StatusCode::CREATED, "{}", stored.text);
+    for query in [
+        "",
+        "?kind=Hosted",
+        "?details=false",
+        "?details=true",
+        "?details=true&kind=Hosted",
+        "?kind=Cached",
+    ] {
+        let path = format!("/jsonldContexts{query}");
+        let (d, v) = (direct(&f.app, &path).await, through(&f.app, &path).await);
+        assert_eq!(d.status, StatusCode::OK, "{path}: {}", d.text);
+        assert_eq!(v.status, d.status, "{path}: {}", v.text);
+        assert_eq!(v.json, d.json, "{path}");
+    }
+    let hosted = through(&f.app, "/jsonldContexts?kind=Hosted").await;
+    assert_eq!(
+        hosted.json.as_array().map(Vec::len),
+        Some(1),
+        "the stored @context: {}",
+        hosted.text
+    );
+    Ok(())
+}
+
 /// A write whose Entity id segment is empty is a malformed request through
 /// `all` as at the root (T-3948, ETSI `010_02_01`, `011_02_01`, `012_02_01`,
 /// `013_02_01`): 400 `BadRequestData`, not the 404 of a path no operation binds.

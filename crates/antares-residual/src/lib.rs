@@ -309,6 +309,9 @@ pub enum Func {
     DivBy,
     /// `a mod b`: the sign of `a`.
     Mod,
+    /// CQL2 `a ^ b`: an integer for two integers and an exponent from 0, a number otherwise;
+    /// an overflow or a result that is no finite number is unknown.
+    Pow,
     /// `-a`.
     Neg,
 }
@@ -501,7 +504,7 @@ impl Program {
     ///
     /// # Errors
     ///
-    /// As [`eval`].
+    /// As [`Self::eval`].
     pub fn value(&self, entity: &Value) -> Result<Option<Value>, Error> {
         eval::run_value(&self.root, entity)
     }
