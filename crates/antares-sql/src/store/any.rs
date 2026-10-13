@@ -1696,7 +1696,7 @@ impl antares_store::TemporalDriver for AnyStore {
         AnyStore::temporal_append(self, tenant, id, shell, additions).await
     }
     /// On Postgres a drained request is one transaction per
-    /// [`HISTORY_CHUNK`] Entities (T-4085); a scope change, and the memory
+    /// `HISTORY_CHUNK` Entities (T-4085); a scope change, and the memory
     /// arm, take the default's append per Entity.
     async fn event_list(&self, evs: &[antares_store::TemporalEvent]) -> Result<(), NgsiError> {
         #[cfg(feature = "postgres")]
