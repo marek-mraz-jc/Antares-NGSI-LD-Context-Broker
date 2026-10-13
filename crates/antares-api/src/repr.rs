@@ -229,17 +229,9 @@ fn reach_of(
     Option<std::sync::Arc<PolicyReach>>,
     Option<std::sync::Arc<crate::policy::Filter>>,
 ) {
-    let rules = type_rules(f);
-    let reach =
-        (f.q.is_some() || f.scope_q.is_some() || f.areas().next().is_some() || rules.is_some())
-            .then(|| {
-                std::sync::Arc::new(PolicyReach {
-                    q: f.q.as_deref().cloned(),
-                    scope_q: f.scope_q.clone(),
-                    areas: f.areas().cloned().collect(),
-                    rules: rules.clone(),
-                })
-            });
+    let reach = crate::policy::Condition::of(f);
+    let rules = reach.as_ref().and_then(|r| r.rules.clone());
+    let reach = reach.map(std::sync::Arc::new);
     (reach, rules)
 }
 
