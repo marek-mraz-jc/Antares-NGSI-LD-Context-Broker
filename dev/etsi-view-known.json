@@ -1,7 +1,4 @@
 {
- "etsi-restricted": {
-  "TP/NGSI-LD/ContextInformation/Subscription/SubscriptionNotificationBehaviour/046_21_02.robot::046_21_02 Check That A Notification Is Sent With Matching Entity": "T-3944: a subscription's setup answers 409 through view etsi-restricted where the root creates it (found by etsi-full-restricted run 38194367026)",
-  "TP/NGSI-LD/ContextInformation/Subscription/SubscriptionNotificationBehaviour/046_22_01.robot::046_22_01 Check That A Notification Is Sent With Matching Entity": "T-3944: a subscription's setup answers 409 through view etsi-restricted where the root creates it (found by etsi-full-restricted run 38194367026)"
- },
+ "etsi-restricted": {},
  "all": {}
 }
