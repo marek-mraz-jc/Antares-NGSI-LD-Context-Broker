@@ -39,6 +39,7 @@ mod error;
 pub mod mapping;
 mod names;
 mod operation;
+pub mod percent;
 mod scan;
 pub mod views;
 

@@ -9,22 +9,21 @@
 //! body is written in the normalized form, so no kind is guessed from a
 //! value. The other write forms answer `501` or `405` before any operation.
 
-use crate::below;
 use crate::edm::{Member, Set, Shape};
 use crate::filter::Translated;
 use crate::read::{
-    body_id, canonical_key, encode, entity, key_id, not_found, not_implemented, refused, resource,
-    run, run_request, set_of, written, Reads,
+    body_id, canonical_key, encode, entity, key_id, not_found, resource, run, run_request, set_of,
+    Reads,
 };
 use antares_ops::{Caller, OperationId, OpsRequest};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, IF_MATCH, IF_NONE_MATCH, LOCATION};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use odata_axum::{json_level, ODataErrorResponse, ODataRequest};
+use odata_axum::ODataErrorResponse;
 use odata_json::{
     read_entity_body, Bind, BodyError, BodyLimits, Ctx, ODataError, ODataVersion, Target, WriteKind,
 };
-use odata_url::{Key, ODataUri, QueryOptions, Segment};
+use odata_url::{Key, QueryOptions, Segment};
 use serde_json::{json, Map, Value};
 
 /// The NGSI-LD Null (8.4.2, 8.4.3): an update or a merge that names it
@@ -32,143 +31,10 @@ use serde_json::{json, Map, Value};
 pub(crate) const NGSI_LD_NULL: &str = "urn:ngsi-ld:null";
 
 /// One write request below the service root.
-pub(crate) async fn serve(
-    reads: &Reads,
-    method: &Method,
-    caller: &Caller,
-    request: &ODataRequest,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Response {
-    let version = request.version;
-    let ODataUri::Resource { path, options } = &request.uri else {
-        return written(method, &request.uri, version);
-    };
-    let form = match (method, path.as_slice()) {
-        (&Method::POST, [Segment::EntitySet(set)]) => Form::Create(set),
-        (&Method::PATCH, [Segment::EntitySet(set), Segment::Key(key)]) => {
-            Form::Change(set, key, WriteKind::Update)
-        }
-        (&Method::PUT, [Segment::EntitySet(set), Segment::Key(key)]) => {
-            Form::Change(set, key, WriteKind::Replace)
-        }
-        (&Method::DELETE, [Segment::EntitySet(set), Segment::Key(key)]) => Form::Delete(set, key),
-        (
-            &Method::PUT | &Method::PATCH | &Method::DELETE,
-            [Segment::EntitySet(set), Segment::Key(key), Segment::Property(name)],
-        )
-        | (
-            &Method::DELETE,
-            [Segment::EntitySet(set), Segment::Key(key), Segment::Property(name), Segment::Value],
-        ) => Form::Attribute(set, key, name, method.clone()),
-        (
-            &Method::PUT | &Method::DELETE,
-            [Segment::EntitySet(set), Segment::Key(key), Segment::Navigation(nav), Segment::Ref],
-        ) => Form::Reference(set, key, nav, method == Method::DELETE),
-        _ => return written(method, &request.uri, version),
-    };
-    let Some(op) = form.op(reads) else {
-        // W19: no operation removes one object of a Relationship.
-        return not_implemented(version).into_response();
-    };
-    // Rule 4: a write the view does not offer is refused before its body
-    // is read, whatever the body holds.
-    if !reads.view.allows(op) || !form.taken(reads) {
-        return refused(StatusCode::METHOD_NOT_ALLOWED, version).into_response();
-    }
-    // W32: the broker has no conditional write; options shape a read's
-    // answer, and a write answers no representation but a create's.
-    if headers.contains_key(IF_MATCH)
-        || headers.contains_key(IF_NONE_MATCH)
-        || *options != QueryOptions::default()
-    {
-        return not_implemented(version).into_response();
-    }
-    let level = match json_level(request, headers, reads.state.max_header_len) {
-        Ok(level) => level,
-        Err(refused) => return refused.into_response(),
-    };
-    let ctx = Ctx {
-        service_root: &reads.state.service_root,
-        level,
-        version,
-        metadata_etag: reads.state.metadata_etag.as_deref(),
-    };
-    let answer = match form {
-        Form::Create(set) => create(reads, caller, &ctx, set, headers, body).await,
-        Form::Change(set, key, kind) => change(reads, caller, &ctx, (set, key), kind, body).await,
-        Form::Delete(set, key) => delete(reads, caller, set, key, version).await,
-        Form::Attribute(set, key, name, method) => {
-            below::property(reads, caller, &ctx, (set, key, name), &method, body).await
-        }
-        Form::Reference(set, key, nav, _) => {
-            below::reference(reads, caller, &ctx, (set, key, nav), op, body).await
-        }
-    };
-    answer.unwrap_or_else(IntoResponse::into_response)
-}
-
-/// The write a method and a path stand for.
-enum Form<'u> {
-    Create(&'u str),
-    Change(&'u str, &'u Key, WriteKind),
-    Delete(&'u str, &'u Key),
-    /// A structural property: `PUT`, `PATCH` or `DELETE` (W10, W11, W13).
-    Attribute(&'u str, &'u Key, &'u str, Method),
-    /// A navigation's `$ref`: set (`false`) or removed (W16, W17, W20).
-    Reference(&'u str, &'u Key, &'u str, bool),
-}
-
-impl Form<'_> {
-    /// Whether the set's class takes this write (C10a): a create, a delete,
-    /// or an update of the Entity, a property or a reference.
-    fn taken(&self, reads: &Reads) -> bool {
-        let (Self::Create(set)
-        | Self::Change(set, ..)
-        | Self::Delete(set, _)
-        | Self::Attribute(set, ..)
-        | Self::Reference(set, ..)) = self;
-        // An unknown set is the write's own 404 (the path resolves against
-        // the same model first, so it does not get here).
-        reads.edm.sets.get(*set).is_none_or(|s| match self {
-            Self::Create(_) => s.writable.insert,
-            Self::Delete(..) => s.writable.delete,
-            _ => s.writable.update,
-        })
-    }
-
-    /// The operation the write is; `None` for a form none is (W19).
-    fn op(&self, reads: &Reads) -> Option<OperationId> {
-        Some(match self {
-            Self::Create(_) => OperationId::CreateEntity,
-            Self::Change(.., WriteKind::Replace) => OperationId::ReplaceEntity,
-            Self::Change(..) => OperationId::MergeEntity,
-            Self::Delete(..) => OperationId::DeleteEntity,
-            Self::Attribute(.., method) if method == Method::PUT => OperationId::ReplaceAttribute,
-            Self::Attribute(.., method) if method == Method::PATCH => {
-                OperationId::PartialAttributeUpdate
-            }
-            Self::Attribute(..) => OperationId::DeleteAttribute,
-            Self::Reference(set, _, nav, remove) => {
-                let collection = reads
-                    .edm
-                    .sets
-                    .get(*set)
-                    .is_some_and(|s| crate::paths::nav_of(s, nav).2);
-                match (collection, remove) {
-                    (true, true) => return None,
-                    (_, true) => OperationId::DeleteAttribute,
-                    (_, false) => OperationId::AppendAttributes,
-                }
-            }
-        })
-    }
-}
-
 /// `POST {Set}` (W1, W2): Create Entity of the set's type with the body's
 /// id, or a minted one when the body leaves out the key; `201` with the Entity as the view reads it and its `Location`, or
 /// `204` under `Prefer: return=minimal`.
-async fn create(
+pub(crate) async fn create(
     reads: &Reads,
     caller: &Caller,
     ctx: &Ctx<'_>,
@@ -263,7 +129,7 @@ fn minted(set: &Set, set_name: &str) -> (String, Value) {
 /// the set's type, `204`. A key in the body must be the URL's; an Entity
 /// that is absent, of another type or hidden is `404`, never created
 /// (W7).
-async fn change(
+pub(crate) async fn change(
     reads: &Reads,
     caller: &Caller,
     ctx: &Ctx<'_>,
@@ -308,7 +174,7 @@ async fn change(
 }
 
 /// `DELETE {Set}('{id}')` (W9): Delete Entity of the set's type, `204`.
-async fn delete(
+pub(crate) async fn delete(
     reads: &Reads,
     caller: &Caller,
     set_name: &str,

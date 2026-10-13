@@ -58,6 +58,16 @@ fn oldest_cached(contexts: &BTreeMap<String, Value>) -> Vec<String> {
         .collect()
 }
 
+/// The attribute names of an internal entity doc: every member but the
+/// entity's own (`ENTITY_META_KEYS`), collected so the doc can be changed
+/// while they are walked.
+fn attribute_names(obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    obj.keys()
+        .filter(|k| !antares_model::ENTITY_META_KEYS.contains(&k.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Drop attribute instances whose `expiresAt` passed (4.22) from an internal
 /// entity or temporal doc; an attribute whose last instance expired is
 /// removed entirely. Returns whether the doc changed.
@@ -66,12 +76,7 @@ fn prune_expired_instances(doc: &mut Value, now: &str) -> bool {
         return false;
     };
     let mut changed = false;
-    let attrs: Vec<String> = obj
-        .keys()
-        .filter(|k| !antares_model::ENTITY_META_KEYS.contains(&k.as_str()))
-        .cloned()
-        .collect();
-    for k in attrs {
+    for k in attribute_names(obj) {
         let Some(arr) = obj.get_mut(&k).and_then(Value::as_array_mut) else {
             continue;
         };
@@ -618,12 +623,7 @@ impl Store {
                     continue;
                 };
                 let before_count = dropped;
-                let attrs: Vec<String> = obj
-                    .keys()
-                    .filter(|k| !antares_model::ENTITY_META_KEYS.contains(&k.as_str()))
-                    .cloned()
-                    .collect();
-                for k in attrs {
+                for k in attribute_names(obj) {
                     let Some(arr) = obj.get_mut(&k).and_then(Value::as_array_mut) else {
                         continue;
                     };
