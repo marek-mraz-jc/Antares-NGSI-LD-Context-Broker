@@ -224,16 +224,15 @@ async fn answer(
 /// when the view shows it (or names nothing, a `*` view), else the shown IRI the core @context
 /// reads `name` as, as `narrow` matches it (T-3645).
 fn as_viewed<'a>(own: String, name: &str, shown: impl Iterator<Item = &'a String>) -> String {
-    let mut shown_as = None;
-    for iri in shown {
-        if *iri == own {
-            return own;
-        }
-        if shown_as.is_none() && antares_ops::core_name(iri) == name {
-            shown_as = Some(iri.clone());
-        }
+    let shown: Vec<&String> = shown.collect();
+    if shown.contains(&&own) {
+        return own;
     }
-    shown_as.unwrap_or(own)
+    shown
+        .into_iter()
+        .find(|iri| antares_ops::core_name(iri) == name)
+        .cloned()
+        .unwrap_or(own)
 }
 
 /// `body` as `GET` or `HEAD` answers it: a strong `ETag` of the bytes,

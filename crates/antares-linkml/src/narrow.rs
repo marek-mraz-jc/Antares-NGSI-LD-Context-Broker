@@ -50,31 +50,27 @@ pub(crate) fn narrow(
     view: &str,
 ) -> Result<(Model, bool), Error> {
     let s = source.schema();
-    let kept: BTreeSet<&str> = s
+    // Each visible class with the name the view knows its type by.
+    let typed: BTreeMap<&str, (&Class, String)> = s
         .classes
-        .keys()
-        .filter(|c| as_viewed(source, visible, c).is_some())
-        .map(String::as_str)
+        .iter()
+        .filter_map(|(c, class)| Some((c.as_str(), (class, as_viewed(source, visible, c)?))))
         .collect();
-    let shown = |class: &str| -> Shown {
-        let Some(ty) = as_viewed(source, visible, class) else {
-            return Vec::new();
-        };
+    let kept: BTreeSet<&str> = typed.keys().copied().collect();
+    let shown = |class: &str, ty: &str| -> Shown {
         source
             .class_slots(class)
             .into_iter()
             .filter(|(name, _)| {
-                visible.shows_attribute(&ty, &source.slot_iri(name))
-                    || visible.shows_attribute(&ty, name)
+                visible.shows_attribute(ty, &source.slot_iri(name))
+                    || visible.shows_attribute(ty, name)
             })
             .map(|(name, slot)| (name.to_owned(), slot))
             .collect()
     };
-    let per_class: BTreeMap<&str, (&Class, Shown)> = s
-        .classes
+    let per_class: BTreeMap<&str, (&Class, Shown)> = typed
         .iter()
-        .filter(|(c, _)| kept.contains(c.as_str()))
-        .map(|(c, class)| (c.as_str(), (class, shown(c))))
+        .map(|(c, (class, ty))| (*c, (*class, shown(c, ty))))
         .collect();
     let slot_names: BTreeSet<&str> = per_class
         .values()
