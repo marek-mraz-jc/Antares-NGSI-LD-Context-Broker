@@ -404,7 +404,7 @@ impl antares_ops::policy::PolicyEngine for ViewBound {
 #[tokio::test]
 async fn icsr_the_engine_decides_a_grant_view_forward_through_that_view() {
     let engine = Arc::new(ViewBound::default());
-    let (_b, app) = broker(Some(engine.clone())).await;
+    let (_b, app) = broker(Some(engine.clone()), Vec::new()).await;
     car(&app, "b", 1).await;
     let view = json!({"id": "b-speed", "tenant": "b", "selector": ["Car"],
                       "rules": [{"types": ["Car"], "attributes": ["speed"]}],
