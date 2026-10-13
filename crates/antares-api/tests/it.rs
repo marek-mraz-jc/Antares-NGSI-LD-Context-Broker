@@ -85,6 +85,7 @@ mod registration_expiry_5_9;
 mod registration_listing_5_10_2;
 mod response_key_order;
 mod scope_merge_null_5_5_12;
+mod scope_q_grammar_4_19;
 mod scope_target_5_6_5;
 mod security_regression;
 mod set_attribute_value_10_2_6;
