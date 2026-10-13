@@ -291,6 +291,23 @@ impl Mapping {
         &self.inner
     }
 
+    /// What a caller of the view names: the target class and each slot the
+    /// view can produce when it shows the source Attributes `shown`
+    /// (expanded IRIs), as discovery names them
+    /// ([`Self::rebuild_discovery`]); nothing of the source model.
+    #[must_use]
+    pub fn target_names(&self, shown: &BTreeSet<String>) -> (Vec<String>, Vec<String>) {
+        let present: BTreeSet<String> = self
+            .sources
+            .iter()
+            .map(|s| s.iri.clone())
+            .filter(|iri| shown.contains(iri))
+            .collect();
+        let mut slots: Vec<String> = self.shown(&present, true).map(|s| s.term.clone()).collect();
+        slots.sort();
+        (vec![self.target_class.clone()], slots)
+    }
+
     /// Read and compile one IR document. Names are expanded through `ctx`
     /// (the view's `@context` over the core); `served` is the view's own
     /// `@context`, which the rebuilt answer carries (the core when `None`).

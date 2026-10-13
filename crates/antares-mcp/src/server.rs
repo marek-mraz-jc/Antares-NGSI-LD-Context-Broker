@@ -105,6 +105,10 @@ impl Server {
     }
 
     fn names(&self) -> Names {
+        // a view of another model is named by its target model alone (G18)
+        if let Some((types, attributes)) = self.view.target_names() {
+            return Names::new(types, attributes);
+        }
         if self.view.shows_every_name() {
             return Names::every();
         }
