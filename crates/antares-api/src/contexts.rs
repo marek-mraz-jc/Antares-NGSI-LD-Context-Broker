@@ -222,12 +222,13 @@ async fn find_entry(st: &AppState, tenant: &TenantId, id: &str) -> ApiResult<Opt
     Ok(None)
 }
 
-/// Whether the stored @contexts are shown: not through a view, and not to a
-/// caller the engine narrows (`policy::NAME_READS`), since one may define a
+/// Whether the stored @contexts are shown: not through a view that hides a
+/// name (a view showing every name hides no term, rule 12, T-3946), and not to
+/// a caller the engine narrows (`policy::NAME_READS`), since one may define a
 /// term for an Attribute that caller may not see (ADR-0023 rule 5, T-4009).
 fn shows_stored(st: &AppState, narrowing: &crate::policy::Filter) -> bool {
     #[cfg(feature = "views")]
-    if st.view.is_some() {
+    if st.view.as_ref().is_some_and(|v| !v.shows_every_name()) {
         return false;
     }
     #[cfg(not(feature = "views"))]
@@ -347,9 +348,9 @@ pub async fn list_contexts(
             Option<antares_jsonld::CtxUsage>,
         )> = Vec::new();
         // ADR-0023 rule 5: a stored @context is the tenant's and may define
-        // a term for an Attribute a view hides, so through a view the list
-        // is the core @context alone (the pinned entries below).
-        // The same for a caller the engine narrows (T-4009).
+        // a term for an Attribute a view hides, so through a view that hides
+        // a name the list is the core @context alone (the pinned entries
+        // below). The same for a caller the engine narrows (T-4009).
         let stored = if !shows_stored(&st, &narrowing) {
             Vec::new()
         } else {

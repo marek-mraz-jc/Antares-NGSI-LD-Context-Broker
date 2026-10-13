@@ -666,3 +666,67 @@ fn slot_iris_by_class_include_inherited_slots_and_a_class_without_any() {
     assert_eq!(by_class[&m.class_iri("Room")], iris(&["size", "floor"]));
     assert!(by_class[&m.class_iri("Marker")].is_empty());
 }
+
+/// `renamed` takes an IRI by name and own IRI, leaves a name answered `None` as it was, and
+/// leaves the source model untouched; `class_slots` sees the renamed slot.
+#[test]
+fn renamed_gives_the_named_iris_and_keeps_the_rest() {
+    let doc = with("/classes/Hall", json!({"slots": ["size"]}));
+    let m = load(&doc).expect("loads");
+    let r = m.renamed(
+        |name, own| (name == "Room").then(|| format!("{own}-x")),
+        |name, _| (name == "size").then(|| "https://o.org/size".to_owned()),
+    );
+    assert_eq!(r.class_iri("Room"), format!("{}-x", m.class_iri("Room")));
+    assert_eq!(r.class_iri("Hall"), m.class_iri("Hall"));
+    assert_eq!(r.slot_iri("size"), "https://o.org/size");
+    assert_ne!(
+        m.slot_iri("size"),
+        "https://o.org/size",
+        "the source is unchanged"
+    );
+    let names: Vec<&str> = r.class_slots("Room").into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["size"]);
+}
+
+/// T-3752: `as_shown` gives a class or slot the IRI its short name expands to when `shown`
+/// holds that IRI and not its own; one shown by its own IRI, or not shown at all, keeps its own.
+#[test]
+fn as_shown_rebases_only_what_is_shown_by_its_short_name() {
+    let m = load(&json!({"id": "https://e.org/s/", "name": "s",
+        "prefixes": {"sdm": {"prefix_prefix": "sdm", "prefix_reference": "https://sdm.org/"}},
+        "classes": {"Car": {"class_uri": "sdm:Car", "slots": ["speed", "colour"]},
+                    "Bus": {"class_uri": "sdm:Bus"}, "Tram": {"class_uri": "sdm:Tram"}},
+        "slots": {"speed": {"slot_uri": "sdm:speed"}, "colour": {"slot_uri": "sdm:colour"}}}))
+    .expect("loads");
+    let expand = |name: &str| format!("https://v.org/{name}");
+    let shown = std::collections::BTreeMap::from([
+        (
+            expand("Car"),
+            std::collections::BTreeSet::from([
+                expand("speed"),
+                "https://sdm.org/colour".to_owned(),
+            ]),
+        ),
+        (
+            "https://sdm.org/Bus".to_owned(),
+            std::collections::BTreeSet::new(),
+        ),
+    ]);
+    let v = m.as_shown(&shown, expand);
+    assert_eq!(v.class_iri("Car"), "https://v.org/Car");
+    assert_eq!(
+        v.class_iri("Bus"),
+        "https://sdm.org/Bus",
+        "shown by its own IRI"
+    );
+    assert_eq!(
+        v.class_iri("Tram"),
+        "https://sdm.org/Tram",
+        "not shown at all"
+    );
+    assert_eq!(v.slot_iri("speed"), "https://v.org/speed");
+    assert_eq!(v.slot_iri("colour"), "https://sdm.org/colour");
+    let none = m.as_shown(&std::collections::BTreeMap::new(), expand);
+    assert_eq!(none.class_iri("Car"), "https://sdm.org/Car");
+}

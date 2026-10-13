@@ -151,8 +151,10 @@ can narrow them too, with `pick`/`omit` read as type and Attribute names.
 `/jsonldContexts` (13.3) lists the core `@context` and the contexts the
 view's configuration names. A stored `@context` is the tenant's
 (ADR-0021), and one may define a term for a hidden Attribute, so a view
-does not list the tenant's contexts by default; Add, Delete and Reload
-@context (13.2, 13.5) are writes and are offered only when allowlisted.
+does not list the tenant's contexts by default. A view that shows every
+name (rule 12) hides no term, so it lists them as the root does
+(T-3946). Add, Delete and Reload @context (13.2, 13.5) are writes and
+are offered only when allowlisted.
 The same holds at the root for a caller the engine narrows (T-4009): List
 and Serve @context (13.3, 13.4) take a `Filter` from the engine, read as
 "this caller sees fewer names than the tenant holds", and under one the

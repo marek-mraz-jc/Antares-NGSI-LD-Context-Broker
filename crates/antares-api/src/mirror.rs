@@ -404,7 +404,7 @@ impl SubMirror {
         self.candidates_before(tenant, types, changed_attrs, u64::MAX)
     }
 
-    /// [`SubMirror::candidates`] of a change queued at `queued` (a [`tick`]):
+    /// [`SubMirror::candidates`] of a change queued at `queued` (a `tick`):
     /// only the subscriptions that were in the mirror before it.
     pub fn candidates_before(
         &self,

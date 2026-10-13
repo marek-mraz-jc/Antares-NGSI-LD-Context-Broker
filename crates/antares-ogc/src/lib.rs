@@ -54,7 +54,7 @@ pub const SCHEMA_LIMITS: linkml_model::Limits = linkml_model::Limits {
 /// The conformance classes the surface serves (mapping rows C3, R1 to R5, W1 to W5, S1 to S3,
 /// S5, S7, F1 to F16; Parts 4 and 5 are the drafts OGC 20-002r1 and 23-058r1, Part 3 is
 /// OGC 19-079r2 with CQL2 21-065r2). A view's `/conformance` declares the Part 4 ones only as
-/// far as it offers their writes ([`conformance`]).
+/// far as it offers their writes (the `conformance` handler).
 pub const CONFORMANCE: [&str; 32] = [
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
@@ -382,12 +382,14 @@ fn collections(view: &ViewOps) -> Option<BTreeMap<String, Collection>> {
     let (_, bytes) = view.schema()?;
     let schema = linkml_model::Model::read(&bytes, &SCHEMA_LIMITS).ok()?;
     // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
-    let shown = if view.shows_every_name() {
-        schema.slot_iris_by_class()
-    } else {
-        view.shown_by_type()
-    };
-    Some(model::build(&schema, &shown))
+    if view.shows_every_name() {
+        return Some(model::build(&schema, &schema.slot_iris_by_class()));
+    }
+    let shown = view.shown_by_type();
+    Some(model::build(
+        &schema.as_shown(&shown, antares_ops::core_iri),
+        &shown,
+    ))
 }
 
 /// No `Accept`, or one that takes some JSON or anything.
