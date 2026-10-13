@@ -73,16 +73,16 @@ fn the_suite_fixtures_expand_and_its_negative_ones_are_refused() {
             fragment: !doc.contains_key("id"),
             ..ExpandOpts::default()
         };
-        match expand_entity(&doc, &ctx, opts) {
-            Ok(_) if !negative => ok += 1,
-            Err(e) if negative => {
-                assert_eq!(e.status(), 400, "{name}: {e}");
-                assert_eq!(e.to_problem_details().title, "BadRequestData", "{name}");
-                refused += 1;
-            }
-            Ok(_) => panic!("{name}: a negative fixture expanded"),
-            Err(e) => panic!("{name}: {e}"),
+        let out = expand_entity(&doc, &ctx, opts);
+        assert_eq!(out.is_err(), negative, "{name}: {out:?}");
+        if let Err(e) = out {
+            assert_eq!(e.status(), 400, "{name}: {e}");
+            assert_eq!(e.to_problem_details().title, "BadRequestData", "{name}");
+            refused += 1;
+        } else {
+            ok += 1;
         }
     }
-    assert!(ok > 60 && refused >= 8, "{ok} expanded, {refused} refused");
+    assert!(ok > 60, "{ok} expanded");
+    assert!(refused >= 8, "{refused} refused");
 }

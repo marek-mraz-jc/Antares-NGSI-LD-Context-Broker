@@ -271,26 +271,63 @@ impl Conditions {
 
 /// The members of a batch round a view lets through its Relationship check,
 /// each with the guard its store closure applies (ADR-0023 rule 7); the
-/// others land in E. Without a view every member goes, with no guard.
+/// others land in E. Without a view every member goes, with no guard. The
+/// round's targets are read together (T-4085), apart from those `known`
+/// already holds: Entities the batch read before its first write and does not
+/// itself write, so no round has changed them.
 #[cfg(feature = "views")]
 async fn view_guards(
     st: &AppState,
     tenant: &antares_model::TenantId,
     round: Vec<(String, Value)>,
+    known: &HashMap<String, Value>,
     out: &mut BatchOutcome,
 ) -> (
     Vec<(String, Value)>,
     HashMap<String, crate::views::WriteGuard>,
 ) {
+    let members: Vec<(String, Value, Option<crate::views::WriteGuard>)> = round
+        .into_iter()
+        .map(|(id, doc)| {
+            let names = crate::attrs::attr_iris_of(&doc);
+            let g = crate::views::WriteGuard::of(st, names.iter().map(String::as_str));
+            (id, doc, g)
+        })
+        .collect();
+    let mut missing: Vec<&str> = members
+        .iter()
+        .filter(|(_, _, g)| g.is_some())
+        .flat_map(|(_, doc, _)| crate::views::relationship_targets(doc))
+        .filter(|t| !known.contains_key(*t))
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    let mut found = if missing.is_empty() {
+        HashMap::new()
+    } else {
+        // A store failure reads as absent, as a failed single read did.
+        st.store
+            .get_entities(tenant, &missing)
+            .await
+            .unwrap_or_default()
+    };
+    for t in members
+        .iter()
+        .filter(|(_, _, g)| g.is_some())
+        .flat_map(|(_, doc, _)| crate::views::relationship_targets(doc))
+    {
+        if let Some(d) = known.get(t) {
+            found.entry(t.to_owned()).or_insert_with(|| d.clone());
+        }
+    }
     let mut guards = HashMap::new();
-    let mut kept = Vec::with_capacity(round.len());
-    for (id, doc) in round {
-        let names = crate::attrs::attr_iris_of(&doc);
-        let Some(g) = crate::views::WriteGuard::of(st, names.iter().map(String::as_str)) else {
+    let mut kept = Vec::with_capacity(members.len());
+    for (id, doc, g) in members {
+        let Some(g) = g else {
             kept.push((id, doc));
             continue;
         };
-        match g.targets(st, tenant, &doc).await {
+        match g.targets_in(&doc, &found) {
             Ok(()) => {
                 guards.insert(id.clone(), g);
                 kept.push((id, doc));
@@ -311,6 +348,7 @@ async fn view_guards(
 /// answering as Create Entity through the view does for a taken id. The ids
 /// created, in order.
 #[cfg(feature = "views")]
+#[allow(clippy::too_many_arguments)]
 async fn upsert_in_view(
     st: &AppState,
     tenant: &antares_model::TenantId,
@@ -318,9 +356,10 @@ async fn upsert_in_view(
     update_mode: bool,
     ts: &str,
     conds: &Conditions,
+    known: &HashMap<String, Value>,
     out: &mut BatchOutcome,
 ) -> Result<Vec<String>, NgsiError> {
-    let (round, guards) = view_guards(st, tenant, round, out).await;
+    let (round, guards) = view_guards(st, tenant, round, known, out).await;
     let ids: Vec<String> = round.iter().map(|(id, _)| id.clone()).collect();
     let docs: HashMap<&str, &Value> = round.iter().map(|(id, d)| (id.as_str(), d)).collect();
     let res = st
@@ -335,10 +374,15 @@ async fn upsert_in_view(
                     g.pre_whole(id, doc)?;
                 }
             }
+            let Some(&src) = docs.get(id) else {
+                return Err(NgsiError::InternalError(format!(
+                    "batch member {id} lost its document"
+                )));
+            };
             if update_mode {
-                merge_into(doc, docs[id], ts);
+                merge_into(doc, src, ts);
             } else {
-                let mut new = docs[id].clone();
+                let mut new = src.clone();
                 stamp_new(&mut new, ts);
                 // 4.8: a replaced Entity keeps the instant it was created.
                 if let (Some(o), Some(created)) = (new.as_object_mut(), doc.get("createdAt")) {
@@ -902,21 +946,65 @@ async fn batch_write(
         Ok(crate::policy::unnarrowed()),
     )?;
     let mut conds = Conditions::default();
+    // Entities read before the first write, which a view's Relationship check
+    // takes instead of reading them again (T-4085).
+    #[cfg(feature = "views")]
+    let mut known: HashMap<String, Value> = HashMap::new();
     if let Some(engine) = &st.policy {
-        let mut shown: Vec<(Option<String>, crate::policy::PreImage, Option<Value>)> = Vec::new();
-        for (item, ctx) in &items {
-            let id = item.get("id").and_then(Value::as_str).map(str::to_owned);
-            let body = match (item.as_object(), ctx.as_ref()) {
-                (Some(o), Ok(c)) => expand_entity(o, c, ExpandOpts::default()).ok(),
-                _ => None,
-            };
-            // ponytail: one store read per member, only with an engine
-            // attached; a batched read when large batches meet an engine.
+        let members: Vec<(Option<String>, Option<Value>)> = items
+            .iter()
+            .map(|(item, ctx)| {
+                let id = item.get("id").and_then(Value::as_str).map(str::to_owned);
+                let body = match (item.as_object(), ctx.as_ref()) {
+                    (Some(o), Ok(c)) => expand_entity(o, c, ExpandOpts::default()).ok(),
+                    _ => None,
+                };
+                (id, body)
+            })
+            .collect();
+        // One read for every member's pre-image and, under a view, every
+        // Relationship target the batch names (T-4085); a store failure reads
+        // as absent, as the per-member read did.
+        let mut wanted: Vec<&str> = members.iter().filter_map(|(id, _)| id.as_deref()).collect();
+        #[cfg(feature = "views")]
+        if st.view.is_some() {
+            wanted.extend(
+                members
+                    .iter()
+                    .filter_map(|(_, body)| body.as_ref())
+                    .flat_map(crate::views::relationship_targets),
+            );
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        let stored = if wanted.is_empty() {
+            HashMap::new()
+        } else {
+            st.store
+                .get_entities(&tenant, &wanted)
+                .await
+                .unwrap_or_default()
+        };
+        let mut shown: Vec<(Option<String>, crate::policy::PreImage, Option<Value>)> =
+            Vec::with_capacity(members.len());
+        for (id, body) in members {
             let pre = match &id {
-                Some(id) => crate::policy::pre_image(st, &tenant, id, body.as_ref()).await,
+                Some(id) => crate::policy::image(stored.get(id).cloned(), body.as_ref()),
                 None => crate::policy::PreImage::default(),
             };
             shown.push((id, pre, body));
+        }
+        // What the batch writes itself is read again by the round that needs it.
+        #[cfg(feature = "views")]
+        {
+            let written: std::collections::HashSet<&str> = shown
+                .iter()
+                .filter_map(|(id, _, _)| id.as_deref())
+                .collect();
+            known = stored
+                .into_iter()
+                .filter(|(id, _)| !written.contains(id.as_str()))
+                .collect();
         }
         let attrs: Vec<Vec<String>> = shown
             .iter()
@@ -1066,11 +1154,13 @@ async fn batch_write(
         let mut occurrence: HashMap<String, usize> = HashMap::new();
         for (id, doc) in prepped {
             let n = occurrence.entry(id.clone()).or_insert(0);
-            if rounds.len() <= *n {
-                rounds.push(Vec::new());
+            // `n` never passes `rounds.len()`: each id's count grows by one
+            // and a round is added the first time a count reaches it
+            match rounds.get_mut(*n) {
+                Some(round) => round.push((id, doc)),
+                None => rounds.push(vec![(id, doc)]),
             }
-            rounds[*n].push((id, doc));
-            *n += 1;
+            *n = n.saturating_add(1);
         }
     }
     for round in rounds {
@@ -1091,8 +1181,17 @@ async fn batch_write(
             BatchMode::Upsert => {
                 #[cfg(feature = "views")]
                 if st.view.is_some() {
-                    for id in upsert_in_view(st, &tenant, round, update_mode, &ts, &conds, &mut out)
-                        .await?
+                    for id in upsert_in_view(
+                        st,
+                        &tenant,
+                        round,
+                        update_mode,
+                        &ts,
+                        &conds,
+                        &known,
+                        &mut out,
+                    )
+                    .await?
                     {
                         any_created = true;
                         if !created_ids.contains(&id) {
@@ -1113,7 +1212,12 @@ async fn batch_write(
                         .store
                         .batch_mutate(&tenant, &ids, |id, doc| {
                             conds.pre(id, doc)?;
-                            merge_into(doc, docs[id], &ts);
+                            let Some(&src) = docs.get(id) else {
+                                return Err(NgsiError::InternalError(format!(
+                                    "batch member {id} lost its document"
+                                )));
+                            };
+                            merge_into(doc, src, &ts);
                             Ok::<(), NgsiError>(())
                         })
                         .await?;
@@ -1146,7 +1250,12 @@ async fn batch_write(
                             .store
                             .batch_mutate(&tenant, &ids, |id, doc| {
                                 conds.pre(id, doc)?;
-                                let mut new = docs[id].clone();
+                                let Some(&src) = docs.get(id) else {
+                                    return Err(NgsiError::InternalError(format!(
+                                        "batch member {id} lost its document"
+                                    )));
+                                };
+                                let mut new = src.clone();
                                 stamp_new(&mut new, &ts);
                                 // 4.8: a replaced Entity keeps the instant it was created.
                                 if let (Some(o), Some(created)) =
@@ -1197,7 +1306,7 @@ async fn batch_write(
             }
             BatchMode::Update | BatchMode::Merge => {
                 #[cfg(feature = "views")]
-                let (round, guards) = view_guards(st, &tenant, round, &mut out).await;
+                let (round, guards) = view_guards(st, &tenant, round, &known, &mut out).await;
                 let ids: Vec<String> = round.iter().map(|(id, _)| id.clone()).collect();
                 let docs: HashMap<&str, &Value> =
                     round.iter().map(|(id, d)| (id.as_str(), d)).collect();
@@ -1215,7 +1324,11 @@ async fn batch_write(
                         if let Some(g) = guard {
                             g.pre(id, doc)?;
                         }
-                        let expanded = docs[id];
+                        let Some(&expanded) = docs.get(id) else {
+                            return Err(NgsiError::InternalError(format!(
+                                "batch member {id} lost its document"
+                            )));
+                        };
                         if mode == BatchMode::Update && no_overwrite {
                             // noOverwrite is instance-level: only instances
                             // whose datasetId already exists are skipped
@@ -2262,9 +2375,10 @@ mod tests {
         // …but `coordinates` keeps its own ceiling: MAX_GEO_VERTICES, which a
         // legal polygon can spend more than MAX_URI_BYTES on. Capping it in
         // bytes too would refuse a geometry the broker advertises support for.
-        let ring: Vec<Value> = (0..600)
-            .map(|i| json!([f64::from(i) / 10_000.0, f64::from(i) / 10_000.0]))
-            .chain(std::iter::once(json!([0.0, 0.0])))
+        // A circle: a valid ring, as the area relations ask (T-3912).
+        let ring: Vec<Value> = (0..=600)
+            .map(|i| f64::from(i % 600) * std::f64::consts::TAU / 600.0)
+            .map(|a| json!([a.cos() / 100.0, a.sin() / 100.0]))
             .collect();
         let coords = json!([ring]);
         assert!(

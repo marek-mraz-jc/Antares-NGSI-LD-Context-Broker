@@ -149,6 +149,12 @@ pub static MAX_FOLD_DOCS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(
 /// (`antares_notification_changes_dropped_total`), so this number is the
 /// back-pressure a deployment has before delivery loss starts.
 pub const CHANGE_QUEUE: usize = 1024;
+/// Groups one subscription may have waiting for delivery. Each subscription
+/// is served on a lane of its own, so a slow or dead endpoint backs up its
+/// lane and never the matching of every other change (T-4086); a full lane
+/// drops the group for that subscription alone and counts it
+/// (`antares_notification_lane_dropped_total`).
+pub const DELIVERY_LANE: usize = 64;
 /// Notifications in flight at once per drain: one serial POST at a time
 /// capped a 9-subscription fan-out at ~600 POST/s and overflowed the ring.
 /// Deployment knob (ANTARES_DELIVERY_WIDTH): what a width is worth is a
@@ -233,6 +239,7 @@ impl LimitStats {
             "maxRegexCacheBytes": MAX_REGEX_CACHE_BYTES,
             "maxRegexProgramBytes": MAX_REGEX_PROGRAM_BYTES,
             "changeQueue": CHANGE_QUEUE,
+            "deliveryLane": DELIVERY_LANE,
             "deliveryWidth": *DELIVERY_WIDTH,
             "deliveryWidthPerTenant": *DELIVERY_WIDTH_PER_TENANT,
             "maxTrackedDestinations": MAX_TRACKED_DESTINATIONS,
@@ -261,7 +268,7 @@ pub fn json_depth(bytes: &[u8]) -> usize {
         match b {
             b'"' => in_str = true,
             b'{' | b'[' => {
-                depth += 1;
+                depth = depth.saturating_add(1);
                 max = max.max(depth);
             }
             b'}' | b']' => depth = depth.saturating_sub(1),
@@ -467,6 +474,7 @@ mod tests {
             keys,
             [
                 "changeQueue",
+                "deliveryLane",
                 "deliveryWidth",
                 "deliveryWidthPerTenant",
                 "maxBatchItems",

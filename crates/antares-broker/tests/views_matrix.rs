@@ -14,6 +14,10 @@
 //! seed Entity the scenario does not admit must answer the bytes an absent
 //! id gets. A denied caller gets a refusal naming no seed Entity.
 //!
+//! With `internal-csr`, each scenario is read once more through a
+//! registration of this broker in a second Tenant (ADR-0025): the forward
+//! must answer what the view admits, and nothing to a denied caller.
+//!
 //! A scenario may carry `steps`: a move of an Entity (written on the
 //! Tenant root, outside the engine) or a write by the caller through the
 //! view, each with the expected answer after it.
@@ -221,6 +225,12 @@ async fn broker() -> (Router, antares_ops::views::Reload) {
     let reload = antares_ops::views::install(&state)
         .await
         .expect("the view table");
+    #[cfg(feature = "internal-csr")]
+    let state = antares_ops::with_forward_transport(
+        state,
+        antares_icsr::transport(antares_icsr::SelfUrls::parse(SELF_URL).expect("a self URL")),
+    )
+    .expect("the internal transport");
     (antares_api::router(state), reload)
 }
 
@@ -325,9 +335,10 @@ fn text(v: &Value, key: &str) -> String {
         .to_owned()
 }
 
-/// A next link as a path below the view root.
+/// A next link as a path below the view root or the Tenant root.
 fn local(href: &str) -> String {
     href.find("/x/views/")
+        .or_else(|| href.find("/ngsi-ld/v1/"))
         .map_or(href, |i| &href[i..])
         .to_owned()
 }
@@ -363,11 +374,15 @@ async fn ngsi_ld(app: &Router, s: &Scenario, temporal: bool) -> Read {
 /// NGSI-LD `path` below the view root with `query`, following
 /// `Link: rel="next"`.
 async fn ngsi_ld_read(app: &Router, s: &Scenario, path: &str, query: &str) -> Read {
-    let who = with_tenant(s);
-    let mut uri = format!(
+    let uri = format!(
         "/x/views/{}/ngsi-ld/v1/{path}?{query}&limit={PAGE}&count=true",
         s.view()
     );
+    paged(app, &with_tenant(s), uri).await
+}
+
+/// NGSI-LD `uri` as `who`, following `Link: rel="next"`.
+async fn paged(app: &Router, who: &[(String, String)], mut uri: String) -> Read {
     let (mut out, mut twice, mut count) = (Answer::new(), Vec::new(), None);
     let mut pages = 0;
     loop {
@@ -375,7 +390,7 @@ async fn ngsi_ld_read(app: &Router, s: &Scenario, path: &str, query: &str) -> Re
         if pages > MAX_PAGES {
             return Read::Refused(StatusCode::LOOP_DETECTED, json!("a next link without end"));
         }
-        let (status, headers, body) = send(app, "GET", &uri, &who, None).await;
+        let (status, headers, body) = send(app, "GET", &uri, who, None).await;
         if status != StatusCode::OK {
             return Read::Refused(status, body);
         }
@@ -622,6 +637,99 @@ fn with_tenant(s: &Scenario) -> Vec<(String, String)> {
     let mut who = s.caller();
     who.push(tenant_header(s));
     who
+}
+
+/// The self URL the internal CSR row registers this broker by.
+#[cfg(feature = "internal-csr")]
+const SELF_URL: &str = "http://self.invalid";
+
+/// The Tenant whose registration reads the view of `s` in process.
+#[cfg(feature = "internal-csr")]
+fn source(s: &Scenario) -> String {
+    format!("{}-src", s.tenant)
+}
+
+/// Query Entities in the source Tenant of `s` as its caller, every page:
+/// the source holds no Entity of its own and one internal registration
+/// (ADR-0025) of this broker for the seed types in the Tenant of `s`, under
+/// that Tenant's grant naming the view of `s`. So the forward is the whole
+/// answer, decided by the view and its engine for the caller who asked.
+#[cfg(feature = "internal-csr")]
+async fn forward(app: &Router, s: &Scenario) -> Read {
+    let src = source(s);
+    let grant = json!({"target": s.tenant, "source": src, "view": s.view()});
+    // the source's own engine lets the caller query, whoever it is, and the
+    // seeder register: only the target's view and engine decide the answer
+    let mut policies: Vec<Value> = s
+        .caller()
+        .iter()
+        .flat_map(|(header, v)| {
+            let kind = match header.as_str() {
+                "x-jc-subject" => "user",
+                "x-jc-client" => "serviceAccount",
+                "x-jc-groups" => "group",
+                _ => "role",
+            };
+            v.split(',').map(move |id| (kind, id.trim().to_owned()))
+        })
+        .enumerate()
+        .map(|(n, (kind, id))| {
+            json!({"id": format!("caller-{n}"), "assignee": {"kind": kind, "id": id},
+                   "operations": READS})
+        })
+        .collect();
+    policies.extend([
+        // an anonymous caller holds role public alone, whatever it claims
+        json!({"id": "anonymous", "assignee": {"kind": "role", "id": "public"},
+               "operations": READS}),
+        json!({"id": "matrix-seed", "assignee": {"kind": "serviceAccount", "id": SEEDER},
+               "operations": ["5.9.2"]}),
+    ]);
+    let policy = json!({ "policies": policies });
+    for (uri, doc) in [
+        (format!("/q/grants/{}/{src}", s.tenant), grant),
+        (format!("/q/policy/{src}"), policy),
+    ] {
+        let (status, _, body) = send(app, "PUT", &uri, &[], Some(&doc)).await;
+        assert!(status.is_success(), "{}: {uri}: {status} {body}", s.name);
+    }
+    let registration = json!({
+        "id": "urn:ngsi-ld:ContextSourceRegistration:matrix",
+        "type": "ContextSourceRegistration",
+        "endpoint": SELF_URL,
+        "tenant": s.tenant,
+        "information": [{"entities": TYPES.map(|t| json!({"type": t}))}],
+    });
+    let seeder = vec![
+        ("x-jc-client".to_owned(), SEEDER.to_owned()),
+        ("NGSILD-Tenant".to_owned(), src.clone()),
+    ];
+    let uri = "/ngsi-ld/v1/csourceRegistrations";
+    let (status, _, body) = send(app, "POST", uri, &seeder, Some(&registration)).await;
+    // the differential's cases share one source Tenant and its registration
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::CONFLICT,
+        "{}: the registration: {status} {body}",
+        s.name
+    );
+    let mut who = s.caller();
+    who.push(("NGSILD-Tenant".to_owned(), src));
+    let uri = format!(
+        "/ngsi-ld/v1/entities?type={}&limit={PAGE}&count=true",
+        s.types().join(",")
+    );
+    paged(app, &who, uri).await
+}
+
+/// What a forward owes `want`: a denied caller gets the answer of no
+/// registration, nothing admitted (the merge reports the refusal as a
+/// warning, ADR-0025 C10).
+#[cfg(feature = "internal-csr")]
+fn forwarded(want: &Expect) -> Expect {
+    match want {
+        Expect::Denied => Expect::Admitted(Answer::new()),
+        admitted => admitted.clone(),
+    }
 }
 
 /// Every seed id, retrieved one by one through the NGSI-LD view and MCP
@@ -1067,6 +1175,13 @@ async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
         }
         check(&app, s, &want, &s.doc["temporal"], &mut failures).await;
         rows(&app, s, &want, &mut failures).await;
+        #[cfg(feature = "internal-csr")]
+        judge(
+            "internal CSR",
+            forward(&app, s).await,
+            &forwarded(&want),
+            &mut failures,
+        );
         #[cfg(feature = "linkml")]
         judge(
             "LinkML",
@@ -1092,7 +1207,9 @@ async fn every_surface_answers_what_ngsi_ld_admits_in_every_scenario() {
             |f: &str, surface: &str| f.starts_with(surface) || f.contains(&format!(": {surface}"));
         for (surface, task) in &known {
             // a surface this build does not serve has nothing to match
-            if surface == "LinkML" && !cfg!(feature = "linkml") {
+            if (surface == "LinkML" && !cfg!(feature = "linkml"))
+                || (surface == "internal CSR" && !cfg!(feature = "internal-csr"))
+            {
                 continue;
             }
             let hits = failures.iter().filter(|f| of(f, surface)).count();
@@ -1335,16 +1452,25 @@ async fn compare(app: &Router, s: &Scenario) -> Vec<String> {
     ] {
         same(surface, read, ngsi.clone(), false, &mut failures);
     }
+    #[cfg(feature = "internal-csr")]
+    {
+        let want = match ngsi {
+            Read::Entities(want, _) => Expect::Admitted(want),
+            Read::Refused(..) => Expect::Denied,
+        };
+        judge(
+            "internal CSR",
+            forward(app, s).await,
+            &forwarded(&want),
+            &mut failures,
+        );
+    }
     failures
 }
 
 /// Mismatches with a fix task filed: a failure of the surface whose text
 /// holds the needle is printed with its task instead of failing the case.
-const KNOWN_DIFF: [(&str, &str, &str); 1] = [
-    // the MCP tool list is filtered by one engine probe that names no type,
-    // which a policy that can refuse some type refuses
-    ("MCP", "unknown tool", "T-3784"),
-];
+const KNOWN_DIFF: [(&str, &str, &str); 0] = [];
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
@@ -1405,6 +1531,161 @@ fn every_surface_answers_what_ngsi_ld_admits_for_generated_views_and_policies() 
         panic!(
             "{e}\nVIEWS_DIFF_SEED={seed}: add the minimal case as a corpus file, its `expect` \
              written by hand, and file its fix task"
+        );
+    }
+}
+
+/// T-4084, the dev shape: a public reader view's socket subscribes to Vehicle,
+/// and the pipeline's writer view creates, then updates, the Vehicle by
+/// batch upsert. Both writes reach the socket under the joinedcontext engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_through_a_writer_view_notifies_a_public_view_socket() {
+    let (app, _reload) = broker().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("an address").port();
+    let served = app.clone();
+    tokio::spawn(async move { axum::serve(listener, served).await });
+    let tenant = "hel";
+    let ops: Vec<&str> = antares_ops::OperationId::ALL
+        .iter()
+        .map(|op| op.id())
+        .collect();
+    let schema: Value = serde_json::from_str(SCHEMA).expect("the schema");
+    let policy = json!({"policies": [
+        {"id": "public-transport", "assignee": {"kind": "role", "id": "public"},
+         "operations": READS, "information": [{"entities": [{"type": "Vehicle"}]}]},
+        {"id": "pipes", "assignee": {"kind": "serviceAccount", "id": SEEDER},
+         "operations": ["5.6.1", "5.6.2", "5.6.3", "5.6.8", "5.6.9", "5.6.10"]}
+    ], "views": {"transport": ["public-transport"], "pipes": ["pipes"]}});
+    for (uri, doc) in [
+        (
+            "/q/views/transport".to_owned(),
+            json!({"id": "transport", "tenant": tenant, "operations": ops,
+                   "selector": ["Vehicle"], "rules": [{"types": ["Vehicle"], "attributes": ["speed"]}]}),
+        ),
+        (
+            "/q/views/pipes".to_owned(),
+            json!({"id": "pipes", "tenant": tenant, "operations": ops,
+                   "selector": ["*"], "rules": [{"types": ["*"], "attributes": ["*"]}]}),
+        ),
+        (format!("/q/schemas/{tenant}"), schema),
+        (format!("/q/policy/{tenant}"), policy),
+    ] {
+        let (status, _, body) = send(&app, "PUT", &uri, &[], Some(&doc)).await;
+        assert!(status.is_success(), "{uri}: {status} {body}");
+    }
+    let socket = tokio::task::spawn_blocking(move || {
+        let mut socket = Socket::open(
+            port,
+            "/x/views/transport/ws",
+            &[("x-jc-roles".to_owned(), String::new())],
+            Duration::from_millis(1500),
+        )
+        .expect("the socket");
+        let welcome = socket.next().unwrap_or_default();
+        assert_eq!(welcome["metadata"]["x-op"], "x-welcome", "{welcome}");
+        socket
+            .send(&json!({"metadata": {"x-op": "x-subscribe", "x-id": "s"},
+                          "body": {"type": "Subscription", "entities": [{"type": "Vehicle"}]}}))
+            .expect("sent");
+        let made = socket.next().unwrap_or_default();
+        assert_eq!(made["metadata"]["x-status"], 201, "{made}");
+        socket
+    })
+    .await
+    .expect("subscribed");
+    let writer = [("x-jc-client".to_owned(), SEEDER.to_owned())];
+    let uri = "/x/views/pipes/ngsi-ld/v1/entityOperations/upsert";
+    for speed in [10, 20] {
+        let batch = json!([{"id": "urn:ngsi-ld:Vehicle:hel.fi:helsinki:1", "type": "Vehicle",
+                            "speed": {"type": "Property", "value": speed}}]);
+        let (status, _, body) = send(&app, "POST", uri, &writer, Some(&batch)).await;
+        assert!(status.is_success(), "upsert {speed}: {status} {body}");
+    }
+    let messages = tokio::task::spawn_blocking(move || {
+        let mut socket = socket;
+        std::iter::from_fn(|| socket.next()).collect::<Vec<Value>>()
+    })
+    .await
+    .expect("read");
+    let speeds: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m["metadata"]["x-op"] == "x-notification")
+        .flat_map(|m| m["body"]["data"].as_array().into_iter().flatten())
+        .map(|e| &e["speed"]["value"])
+        .collect();
+    assert_eq!(speeds, [&json!(10), &json!(20)], "{messages:?}");
+}
+
+/// T-4133, ADR-N-049: the platform gateway's fan-out subscribes on a view whose own Policy
+/// grants only the role `public`, under its account and with no role, exactly as dev sends it.
+/// A listed view is decided by its listed policies alone: without the `@context-gateway` listing
+/// the subscription is refused 403 (dev, apply 67), with it the subscription is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_gateway_subscribes_on_a_public_view_only_where_it_is_listed() {
+    let (app, _reload) = broker().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("an address").port();
+    let served = app.clone();
+    tokio::spawn(async move { axum::serve(listener, served).await });
+    let tenant = "hel";
+    let ops: Vec<&str> = antares_ops::OperationId::ALL
+        .iter()
+        .map(|op| op.id())
+        .collect();
+    let schema: Value = serde_json::from_str(SCHEMA).expect("the schema");
+    let view = json!({"id": "transport", "tenant": tenant, "operations": ops,
+        "selector": ["Vehicle"], "rules": [{"types": ["Vehicle"], "attributes": ["speed"]}]});
+    for (uri, doc) in [
+        ("/q/views/transport".to_owned(), view),
+        (format!("/q/schemas/{tenant}"), schema),
+    ] {
+        let (status, _, body) = send(&app, "PUT", &uri, &[], Some(&doc)).await;
+        assert!(status.is_success(), "{uri}: {status} {body}");
+    }
+    for (listed, expected) in [
+        (json!(["public-transport"]), 403),
+        (json!(["public-transport", "@context-gateway"]), 201),
+    ] {
+        let policy = json!({"policies": [
+            {"id": "public-transport", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1", "5.7.2"], "information": [{"entities": [{"type": "Vehicle"}]}]},
+            {"id": "@context-gateway", "effect": "permit",
+             "assignee": {"kind": "serviceAccount", "id": "context-gateway"},
+             "operations": ["5.6.4", "5.6.5", "5.6.6", "5.7.1", "5.7.2", "5.7.5", "5.8.1", "5.8.3"]},
+        ], "views": {"transport": listed}});
+        let uri = format!("/q/policy/{tenant}");
+        let (status, _, body) = send(&app, "PUT", &uri, &[], Some(&policy)).await;
+        assert!(status.is_success(), "{uri}: {status} {body}");
+        let made = tokio::task::spawn_blocking(move || {
+            let mut socket = Socket::open(
+                port,
+                "/x/views/transport/ws",
+                &[
+                    ("x-jc-client".to_owned(), "context-gateway".to_owned()),
+                    ("x-jc-roles".to_owned(), String::new()),
+                ],
+                Duration::from_millis(1500),
+            )
+            .expect("the socket");
+            let _welcome = socket.next();
+            let body = json!({"type": "Subscription", "entities": [{"type": "*"}],
+                "notificationTrigger": ["entityCreated", "entityUpdated", "entityDeleted"],
+                "notification": {"format": "normalized"}});
+            socket
+                .send(&json!({"metadata": {"x-op": "x-subscribe", "x-id": "up"}, "body": body}))
+                .expect("sent");
+            socket.next().unwrap_or_default()
+        })
+        .await
+        .expect("ran");
+        assert_eq!(
+            made["metadata"]["x-status"], expected,
+            "listed {listed}: {made}"
         );
     }
 }

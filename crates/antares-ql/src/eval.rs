@@ -903,10 +903,10 @@ mod clause_4_9_extensions {
             Some("category"),
             &ctx(),
         );
-        match ast {
-            QNode::Cmp { value, .. } => assert_eq!(value, QValue::Str("commercial".into())),
-            other => panic!("unexpected {other:?}"),
-        }
+        assert!(
+            matches!(&ast, QNode::Cmp { value: QValue::Str(s), .. } if s == "commercial"),
+            "{ast:?}"
+        );
     }
 
     /// 4.9 EXAMPLE 13/14: linked entity subquery attr{[Type:]path} follows
@@ -1119,9 +1119,11 @@ mod bounds_and_patterns {
             let q = format!(r#"brandName~="{p}""#);
             // an unparseable q is an equally acceptable outcome — what must
             // not happen is an accepted term that compiles the bomb
-            if let Ok(ast) = parse_q(&q) {
-                assert!(!eval_q(&ast, &e, &ctx, &|_| None), "matched: {q}");
-            }
+            let none = |_: &str| None::<Value>;
+            assert!(
+                !parse_q(&q).is_ok_and(|ast| eval_q(&ast, &e, &ctx, &none)),
+                "matched: {q}"
+            );
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
@@ -1229,9 +1231,8 @@ mod bounds_and_patterns {
             "type": [format!("{DC}Vehicle")],
             format!("{DC}speed"): [{"type": "Property", "unitCode": "KMH"}],
         });
-        assert!(!eval_q(&parse_q("speed").expect("q"), &bare, &ctx, &|_| {
-            None
-        }));
+        let none = |_: &str| None::<Value>;
+        assert!(!eval_q(&parse_q("speed").expect("q"), &bare, &ctx, &none));
     }
 
     /// 4.9 logical operators: `|` is OR, `;` is AND, `!` negates existence.
@@ -1436,11 +1437,10 @@ mod tests {
                 ]
             })
         };
+        let none = |_: &str| None::<Value>;
         let ast = parse_q(r#"color!="red""#).expect("q");
         assert!(
-            eval_q(&ast, &mk(json!(["blue", "black", "green"])), &ctx, &|_| {
-                None
-            }),
+            eval_q(&ast, &mk(json!(["blue", "black", "green"])), &ctx, &none),
             "no element equals red ⇒ matches"
         );
         assert!(
@@ -1645,5 +1645,171 @@ mod temporal_keys {
             Some("a")
         );
         assert_eq!(expansion_list(Some("a"), Some(" a ")), None);
+    }
+}
+
+/// The edges no clause example walks (T-3912, the `ngsild` coverage gate): a linked-entity term
+/// whose Relationship is missing or carries an `objectList`, a legacy dotted path that reaches
+/// nothing or a bracket under it, a LanguageProperty asked in a language it lacks or holding
+/// arrays, and the operator arms the parser never builds, which answer false.
+#[cfg(test)]
+mod edges {
+    use super::*;
+    use crate::parse_q;
+    use serde_json::json;
+
+    fn expand(doc: Value) -> Value {
+        antares_jsonld::expand_entity(
+            doc.as_object().expect("obj"),
+            &crate::test_core(),
+            antares_jsonld::ExpandOpts::default(),
+        )
+        .expect("expand")
+    }
+
+    fn q(doc: &Value, text: &str, lookup: EntityLookup) -> bool {
+        eval_q(
+            &parse_q(text).expect(text),
+            doc,
+            &crate::test_core(),
+            lookup,
+        )
+    }
+
+    #[test]
+    fn linked_terms_read_an_object_list_and_skip_what_is_not_a_link() {
+        let device = expand(json!({"id": "urn:ngsi-ld:Device:1", "type": "Device",
+            "humidity": {"type": "Property", "value": 40}}));
+        let lookup = |id: &str| (id == "urn:ngsi-ld:Device:1").then(|| device.clone());
+        let listed = expand(json!({"id": "urn:ngsi-ld:WS:1", "type": "WeatherStation",
+            "sensor": {"type": "ListRelationship", "objectList": [{"object": "urn:ngsi-ld:Device:1"}]}}));
+        assert!(q(&listed, "sensor{humidity}==40", &lookup), "objectList");
+        let mut odd = listed.clone();
+        let sensor = odd
+            .as_object_mut()
+            .expect("obj")
+            .values_mut()
+            .find(|v| v.is_array())
+            .expect("sensor");
+        sensor[0] = json!({"object": 7});
+        assert!(
+            !q(&odd, "sensor{humidity}==40", &lookup),
+            "an object that is no URI"
+        );
+        let none = expand(json!({"id": "urn:ngsi-ld:WS:2", "type": "WeatherStation"}));
+        assert!(
+            !q(&none, "sensor{humidity}==40", &lookup),
+            "no Relationship at all"
+        );
+    }
+
+    #[test]
+    fn dotted_paths_language_maps_and_compound_arrays() {
+        let doc = expand(json!({"id": "urn:ngsi-ld:B:1", "type": "Building",
+            "address": {"type": "Property", "value": {"street": {"name": "Main"}}},
+            "name": {"type": "LanguageProperty", "languageMap": {"en": ["Hall", "Room"], "fi": "Sali"}},
+            "rooms": {"type": "Property", "value": [{"n": [1, 2]}, {"n": 3}]}}));
+        let none = |_: &str| None;
+        assert!(q(&doc, "address.street[name]==\"Main\"", &none));
+        assert!(!q(&doc, "address.nothing==\"Main\"", &none));
+        assert!(q(&doc, "name[*]==\"Room\"", &none));
+        assert!(
+            !q(&doc, "name[sv]==\"Sali\"", &none),
+            "a language the map lacks"
+        );
+        assert!(q(&doc, "rooms[n]==2", &none));
+    }
+
+    #[test]
+    fn shapes_no_entity_expansion_produces_reach_nothing() {
+        let ctx = crate::test_core();
+        let mut out = Vec::new();
+        let en = ["en".to_owned()];
+        terminal(
+            &json!({"languageMap": "not a map"}),
+            Some(&en),
+            &ctx,
+            &mut out,
+        );
+        terminal(
+            &json!({"languageMap": {"en": "a"}}),
+            Some(&["en".to_owned(), "x".to_owned()]),
+            &ctx,
+            &mut out,
+        );
+        collect(
+            &json!({"neither": 1}),
+            &["street".to_owned()],
+            None,
+            &ctx,
+            &mut out,
+        );
+        collect(
+            &json!({"value": {"street": 1}}),
+            &["street".to_owned()],
+            Some(&en),
+            &ctx,
+            &mut out,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        let bare = QPath {
+            links: vec![],
+            path: vec![],
+            bracket: None,
+        };
+        assert!(resolve_targets(&json!({}), &bare, &ctx).is_empty());
+        assert_eq!(
+            temporal_key("12:00:00.1234567Z"),
+            None,
+            "seven fraction digits"
+        );
+        assert_eq!(
+            temporal_key("12:00:00.12a4Z"),
+            None,
+            "a fraction of no digits"
+        );
+        // bounds of two shapes are no interval on the temporal axis: string order decides
+        let (dt, time) = (
+            QValue::Str("2018-12-04T12:00:00Z".into()),
+            QValue::Str("12:00:00Z".into()),
+        );
+        assert!(!in_range(&json!("2018-12-05T00:00:00Z"), &dt, &time));
+        assert!(
+            !in_range(&json!("11:00:00Z"), &time, &dt),
+            "\"11:…\" sorts before \"12:…\""
+        );
+        let later = QValue::Str("2019-01-01T00:00:00Z".into());
+        assert!(
+            !in_range(&json!("11:00:00Z"), &dt, &later),
+            "a Time against two DateTimes"
+        );
+        assert!(
+            !in_range(&json!("2017-01-01T00:00:00Z"), &dt, &later),
+            "before the lower bound"
+        );
+    }
+
+    #[test]
+    fn the_arms_the_grammar_never_reaches_answer_false() {
+        let list = QValue::List(vec![QValue::Num(1.0)]);
+        let range = QValue::Range(Box::new(QValue::Num(0.0)), Box::new(QValue::Num(2.0)));
+        assert!(!compare(&json!(1), CmpOp::Gt, &list, None));
+        assert!(!compare(&json!(1), CmpOp::Gt, &range, None));
+        assert!(!compare(&json!(true), CmpOp::Gt, &QValue::Bool(true), None));
+        assert!(same_datatype(&json!(1), &list));
+        assert!(!in_range(
+            &json!(true),
+            &QValue::Bool(false),
+            &QValue::Bool(true)
+        ));
+        assert!(!num_cmp(1.0, CmpOp::Pattern, 1.0));
+        assert!(expand_vocab(&json!(5), &crate::test_core()) == json!(5));
+        // a Time and a DateTime are not two points on one axis: ordered as strings
+        assert!(compare(
+            &json!("12:00:00Z"),
+            CmpOp::Lt,
+            &QValue::Str("2018-12-04T12:00:00Z".into()),
+            None
+        ));
     }
 }

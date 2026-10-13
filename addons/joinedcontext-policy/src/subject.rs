@@ -17,6 +17,9 @@ pub const HEADERS: [&str; 6] = [
     "x-jc-did",
 ];
 
+/// The prefix of an Endpoint caller role, `endpoint:{project}/{name}` (AP-97).
+const ENDPOINT_ROLE: &str = "endpoint:";
+
 /// The caller of one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Caller {
@@ -35,7 +38,7 @@ pub struct Platform {
     pub client: Option<String>,
     /// `x-jc-groups`.
     pub groups: BTreeSet<String>,
-    /// `x-jc-roles`; exactly `public` for an anonymous caller.
+    /// `x-jc-roles`; for an anonymous caller `public` and the Endpoint caller roles alone.
     pub roles: BTreeSet<String>,
     /// `x-jc-restricted: true`: the caller wants a narrowed answer said.
     pub restricted: bool,
@@ -80,7 +83,13 @@ impl Caller {
                 list("x-jc-groups")
             },
             roles: if anonymous {
-                BTreeSet::from(["public".to_owned()])
+                // AP-97: the gateway resolves an Endpoint's caller role for every caller it
+                // admits, the anonymous one included; no other claimed role reaches them.
+                list("x-jc-roles")
+                    .into_iter()
+                    .filter(|r| r.strip_prefix(ENDPOINT_ROLE).is_some_and(|n| !n.is_empty()))
+                    .chain(["public".to_owned()])
+                    .collect()
             } else if participant {
                 BTreeSet::new()
             } else {
@@ -165,6 +174,25 @@ mod tests {
         assert_eq!(p.roles, BTreeSet::from(["public".to_owned()]));
         assert!(p.groups.is_empty());
         assert!(p.is(&assignee(Kind::Role, "public")));
+        assert!(!p.is(&assignee(Kind::Role, "admin")));
+        Ok(())
+    }
+
+    #[test]
+    fn an_anonymous_caller_keeps_the_endpoint_role_the_gateway_resolved() -> Result<(), String> {
+        let p = platform(caller(&[
+            (
+                "x-jc-roles",
+                "admin,endpoint%3Ap%2Fe,endpoint:,endpointx:p/e",
+            ),
+            ("x-jc-groups", "ops"),
+        ]))?;
+        assert_eq!(
+            p.roles,
+            BTreeSet::from(["endpoint:p/e".to_owned(), "public".to_owned()])
+        );
+        assert!(p.groups.is_empty(), "AP-97 carries no group");
+        assert!(p.is(&assignee(Kind::Role, "endpoint:p/e")));
         assert!(!p.is(&assignee(Kind::Role, "admin")));
         Ok(())
     }

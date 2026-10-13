@@ -236,7 +236,7 @@ async fn next_token_bound_to_view_and_query() -> Result<(), String> {
         .ok_or("a token")?;
     for other in [
         format!("/x/views/slow/ogc/features/collections/Car/items?limit=1&next={token}"),
-        format!("{CARS}?limit=2&next={token}"),
+        format!("{CARS}?limit=1&bbox=0,0,1,1&next={token}"),
         format!("{CARS}?limit=1&next={token}x"),
     ] {
         assert_eq!(
@@ -247,6 +247,15 @@ async fn next_token_bound_to_view_and_query() -> Result<(), String> {
     }
     assert_eq!(
         get(&f.app, &format!("{CARS}?limit=1&next={token}"))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    // the page size is no part of the request a token belongs to (ETS
+    // `validateFeaturesWithLimitResponse_NumberMatched` follows a token
+    // with another `limit`)
+    assert_eq!(
+        get(&f.app, &format!("{CARS}?limit=10000&next={token}"))
             .await
             .status,
         StatusCode::OK
@@ -400,6 +409,83 @@ async fn a_tenant_that_holds_nothing_is_an_empty_collection() -> Result<(), Stri
             a.body.get("features")
         ),
         (StatusCode::OK, Some(&json!(0)), Some(&json!([])))
+    );
+    Ok(())
+}
+
+/// The `href` of each link of `rel` on a Feature.
+fn feature_links(feature: &Value, rel: &str) -> Vec<String> {
+    feature
+        .get("links")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|l| l.get("rel").and_then(Value::as_str) == Some(rel))
+        .filter_map(|l| l.get("href").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_feature_links_its_entity_and_its_schema() -> Result<(), String> {
+    let f = fixture().await?;
+    let view = json!({"id": "linked", "tenant": "city", "selector": ["Car"],
+                      "rules": [{"types": ["Car"], "attributes": ["speed"]}],
+                      "operations": ["query_entities", "retrieve_entity"]});
+    let put = send(&f.app, "PUT", "/q/views/linked", &view.to_string(), &[]).await;
+    assert_eq!(put.status, StatusCode::CREATED, "{}", put.body);
+    let root = "http://localhost:9090/x/views";
+    let page = get(&f.app, "/x/views/linked/ogc/features/collections/Car/items").await;
+    let features = page.body.get("features").and_then(Value::as_array).cloned();
+    let features = features.ok_or("no features")?;
+    assert_eq!(features.len(), 4, "{}", page.body);
+    for feature in &features {
+        let urn = feature.get("id").and_then(Value::as_str).ok_or("no id")?;
+        let encoded = urn.replace(':', "%3A");
+        assert_eq!(
+            feature_links(feature, "alternate"),
+            [format!("{root}/linked/ngsi-ld/v1/entities/{encoded}")],
+            "EP-38: the Entity under the same view"
+        );
+        assert_eq!(
+            feature_links(feature, "describedby"),
+            [format!("{root}/linked/ogc/features/collections/Car/schema")]
+        );
+    }
+    let one = get(
+        &f.app,
+        "/x/views/linked/ogc/features/collections/Car/items/urn:ngsi-ld:Car:1",
+    )
+    .await;
+    assert_eq!(one.status, StatusCode::OK, "{}", one.body);
+    assert_eq!(
+        feature_links(&one.body, "alternate"),
+        [format!(
+            "{root}/linked/ngsi-ld/v1/entities/urn%3Angsi-ld%3ACar%3A1"
+        )]
+    );
+    assert_eq!(
+        feature_links(&one.body, "self").len(),
+        1,
+        "the item keeps its own links"
+    );
+    let schema = get(
+        &f.app,
+        &local(&feature_links(&one.body, "describedby").concat()),
+    )
+    .await;
+    assert_eq!(schema.status, StatusCode::OK, "the schema link answers");
+    let city = get(&f.app, CARS).await;
+    let any_alternate = city
+        .body
+        .get("features")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|f| !feature_links(f, "alternate").is_empty());
+    assert!(
+        !any_alternate,
+        "a view without Retrieve Entity links no Entity it would refuse"
     );
     Ok(())
 }

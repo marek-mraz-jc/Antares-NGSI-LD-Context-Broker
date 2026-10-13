@@ -159,6 +159,46 @@ impl Time {
     }
 }
 
+impl std::fmt::Display for Date {
+    /// `YYYY-MM-DD`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (year, month, day) = self.civil().ok_or(std::fmt::Error)?;
+        write!(f, "{year:04}-{month:02}-{day:02}")
+    }
+}
+
+impl std::fmt::Display for Time {
+    /// `hh:mm:ss`, and the fraction to the microsecond when there is one.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (hour, minute, second, micros) = self.fields().ok_or(std::fmt::Error)?;
+        write!(f, "{hour:02}:{minute:02}:{second:02}")?;
+        if micros > 0 {
+            let fraction = format!("{micros:06}");
+            write!(f, ".{}", fraction.trim_end_matches('0'))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for DateTime {
+    /// RFC 3339 in the offset it was written in, `Z` for UTC.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (date, time) = self.local().ok_or(std::fmt::Error)?;
+        write!(f, "{date}T{time}")?;
+        let minutes = self.offset.unsigned_abs();
+        match self.offset.signum() {
+            0 => f.write_str("Z"),
+            sign => write!(
+                f,
+                "{}{:02}:{:02}",
+                if sign < 0 { '-' } else { '+' },
+                minutes.checked_div(60).ok_or(std::fmt::Error)?,
+                minutes.checked_rem(60).ok_or(std::fmt::Error)?,
+            ),
+        }
+    }
+}
+
 /// Days from 1970-01-01 to a proleptic Gregorian date (H. Hinnant's `days_from_civil`).
 fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     let y = if month <= 2 {
@@ -415,6 +455,36 @@ mod tests {
         let (date, time) = before_epoch.unwrap_or((Date(0), Time(0)));
         assert_eq!(date.civil(), Some((1969, 12, 31)));
         assert_eq!(time.fields(), Some((23, 59, 59, 500_000)));
+    }
+
+    #[test]
+    fn each_writes_back_the_text_it_reads() {
+        for text in [
+            "2026-10-11T12:00:00Z",
+            "2026-10-11T12:00:00.5+02:30",
+            "0000-01-01T00:00:00Z",
+            "9999-12-31T23:59:59.999999+11:45",
+            "1969-12-31T23:59:59.000001Z",
+            "2026-10-11T07:00:00-05:30",
+        ] {
+            assert_eq!(
+                DateTime::parse(text).map(|d| d.to_string()),
+                Some(text.to_owned())
+            );
+        }
+        // seconds always, the fraction trimmed
+        assert_eq!(
+            DateTime::parse("2026-10-11T12:00+01:00").map(|d| d.to_string()),
+            Some("2026-10-11T12:00:00+01:00".to_owned())
+        );
+        assert_eq!(
+            Time::parse("01:02:03.120").map(|t| t.to_string()),
+            Some("01:02:03.12".to_owned())
+        );
+        assert_eq!(
+            Date::parse("0042-02-28").map(|d| d.to_string()),
+            Some("0042-02-28".to_owned())
+        );
     }
 
     #[test]

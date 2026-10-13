@@ -246,8 +246,9 @@ jobs:
           retention-days: 30
       # The ETSI resource sampler + its sample↔TP join fail silently when
       # broken (an empty column reads as "nothing happened") — check them here.
+      # robotframework at the suite's pin: the request recorder runs a two-test suite (T-4030).
       - name: ETSI sampling self-check
-        run: pip install --quiet pyyaml && python3 dev/etsi-selftest.py
+        run: pip install --quiet pyyaml robotframework==7.4.1 && python3 dev/etsi-selftest.py
       # The external-suites harness (T-3549): its comparator and adapters
       # decide verdicts, and a wrong one reads as a plausible pass.
       - name: External-suites harness self-check
@@ -641,7 +642,12 @@ jobs:
           dir=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, os, sys; print(next(os.path.dirname(p["manifest_path"]) for p in json.load(sys.stdin)["packages"] if p["name"] == sys.argv[1]))' "${{ matrix.crate }}")
           for example in "$dir"/examples/*.rs; do
             [ -e "$example" ] || continue
-            cargo run --locked -q -p ${{ matrix.crate }} --example "$(basename "$example" .rs)" -j 2
+            name=$(basename "$example" .rs)
+            # an example with `required-features` runs with them (gateway_expand needs `fetch`)
+            features=$(cargo metadata --locked --no-deps --format-version 1 | jq -r \
+              --arg c "${{ matrix.crate }}" --arg e "$name" \
+              '.packages[] | select(.name == $c) | .targets[] | select(.name == $e) | (.["required-features"] // []) | join(",")')
+            cargo run --locked -q -p ${{ matrix.crate }} ${features:+--features "$features"} --example "$name" -j 2
           done
       # the smallest broker build (every optional feature off) must compile
       - run: cargo check --locked -p antares-broker --no-default-features -j 2

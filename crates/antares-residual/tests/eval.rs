@@ -575,6 +575,12 @@ fn arithmetic_is_checked_and_rounding_keeps_integers() {
         (eq(f2(Func::Mod, i(-7), i(3)), i(-1)), T),
         (is_null(f2(Func::Mod, i(7), i(0))), T),
         (eq(f2(Func::Mod, n(7.5), i(2)), n(1.5)), T),
+        (eq(f2(Func::Pow, p("pm10"), i(2)), i(144)), T),
+        (eq(f2(Func::Pow, i(2), i(-1)), n(0.5)), T),
+        (eq(f2(Func::Pow, n(2.0), n(0.5)), n(2.0_f64.sqrt())), T),
+        (is_null(f2(Func::Pow, i(i64::MAX), i(2))), T),
+        (is_null(f2(Func::Pow, i(-8), n(0.5))), T),
+        (is_null(f2(Func::Pow, s("x"), i(2))), T),
         (eq(call(Func::Neg, vec![p("pm10")]), i(-12)), T),
         (eq(call(Func::Neg, vec![p("ratio")]), n(-2.5)), T),
         (is_null(call(Func::Neg, vec![i(i64::MIN)])), T),
@@ -624,4 +630,109 @@ fn nested_lambdas_over_long_lists_hit_the_step_budget() {
     let nested = any(p("l"), Some(any(p("l"), Some(never()))));
     assert_eq!(eval(&program(&nested), &long), Err(Error::TooComplex));
     assert_eq!(program(&one).eval(&long), Ok(F));
+}
+
+#[test]
+fn a_program_names_the_attributes_and_system_members_it_reads() -> Result<(), Error> {
+    use antares_residual::Spatial;
+    let at = |attrs: &[&str], member| Path::Attribute {
+        attrs: attrs.iter().map(|a| (*a).to_owned()).collect(),
+        member,
+        keys: Vec::new(),
+    };
+    let e = Expr::And(vec![
+        Expr::IsNull(Box::new(Expr::Path(Path::value("speed")))),
+        Expr::Any(Box::new(Expr::Path(Path::value("speed"))), None),
+        Expr::IsNull(Box::new(Expr::Path(Path::Id))),
+        Expr::Any(
+            Box::new(Expr::Path(Path::value("tags"))),
+            Some(Box::new(Expr::Cmp(
+                Cmp::Eq,
+                Box::new(Expr::Var {
+                    up: 0,
+                    keys: Vec::new(),
+                }),
+                Box::new(Expr::Path(at(&["speed", "accuracy"], Member::Value))),
+            ))),
+        ),
+        Expr::Spatial(
+            Spatial::Within,
+            Box::new(Expr::Path(Path::value("location"))),
+            Box::new(Expr::Lit(Lit::Geometry(
+                serde_json::json!({"type": "Point", "coordinates": [1, 1]}),
+            ))),
+        ),
+        Expr::All(
+            Box::new(Expr::Path(Path::value("links"))),
+            Box::new(Expr::IsNull(Box::new(Expr::Path(Path::value("tags"))))),
+        ),
+    ]);
+    let program = compile(&e, DateTime::MIN)?;
+    assert_eq!(program.attributes(), ["speed", "tags", "location", "links"]);
+    assert!(!program.reads_system_members());
+    for system in [
+        Expr::Path(Path::ModifiedAt),
+        Expr::Path(Path::CreatedAt),
+        Expr::Path(at(&["speed"], Member::CreatedAt)),
+        Expr::Not(Box::new(Expr::Path(at(
+            &["speed", "x"],
+            Member::ModifiedAt,
+        )))),
+    ] {
+        assert!(
+            compile(&system, DateTime::MIN)?.reads_system_members(),
+            "{system:?}"
+        );
+    }
+    let observed = compile(
+        &Expr::Path(at(&["speed"], Member::ObservedAt)),
+        DateTime::MIN,
+    )?;
+    assert!(!observed.reads_system_members());
+    assert_eq!(observed.attributes(), ["speed"]);
+    Ok(())
+}
+
+#[test]
+fn a_value_is_json_of_its_kind_and_unknown_is_none() {
+    let value = |e: Expr| program(&e).value(&entity());
+    let read = |attr: &str| value(Expr::Path(Path::value(attr)));
+    assert_eq!(read("flag"), Ok(Some(json!(true))));
+    assert_eq!(read("pm10"), Ok(Some(json!(12))));
+    assert_eq!(read("ratio"), Ok(Some(json!(2.5))));
+    assert_eq!(read("padded"), Ok(Some(json!("  x  "))));
+    assert_eq!(
+        read("when"),
+        Ok(Some(json!("2026-10-11T12:30:15.25+02:00")))
+    );
+    assert_eq!(read("day"), Ok(Some(json!("2026-10-11"))));
+    assert_eq!(read("at"), Ok(Some(json!("08:15:00"))));
+    assert_eq!(read("tags"), Ok(Some(json!(["a", "b", 3]))));
+    assert_eq!(
+        read("address"),
+        Ok(Some(json!({"city": "Bonn", "rooms": [{"n": 1}, {"n": 5}]})))
+    );
+    // missing, null, mistyped and overflowing are unknown, never a default
+    assert_eq!(read("absent"), Ok(None));
+    assert_eq!(read("nothing"), Ok(None));
+    assert_eq!(read("broken"), Ok(None));
+    let twice = |l: Lit| {
+        Expr::Call(
+            Func::Mul,
+            vec![Expr::Path(Path::value("huge")), Expr::Lit(l)],
+        )
+    };
+    assert_eq!(value(twice(Lit::Int(10))), Ok(None));
+    // a computed value: a function over two members, a comparison
+    let concat = Expr::Call(
+        Func::Concat,
+        vec![Expr::Path(Path::value("kind")), Expr::Path(Path::Id)],
+    );
+    assert_eq!(value(concat), Ok(Some(json!("Carurn:ngsi-ld:Station:1"))));
+    let over = Expr::Cmp(
+        Cmp::Gt,
+        Box::new(Expr::Path(Path::value("pm10"))),
+        Box::new(Expr::Lit(Lit::Int(10))),
+    );
+    assert_eq!(value(over), Ok(Some(json!(true))));
 }

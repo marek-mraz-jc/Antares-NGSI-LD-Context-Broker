@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! `Ops::view` and `ViewOps::run` (ADR-0023 rules 4 and 10): a loaded view
 //! by id and nothing else, its allowlist, its one Tenant, and the narrowed
-//! handle following a reload.
+//! handle following a reload; the names a caller writes beside a standard's
+//! own query read in the view's @context (T-3758).
 
 use antares_ops::test_kit::TestBroker;
 use antares_ops::{Caller, OperationId, Ops, OpsRequest, Surface};
 use axum::body::Body;
-use axum::extract::Path;
+use axum::extract::{Path, RawQuery};
 use axum::http::{HeaderValue, Method, Request, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use http_body_util::BodyExt;
@@ -44,7 +46,41 @@ impl Surface for Probe {
             }
         };
         let mapped = ops.clone();
+        let named = ops.clone();
         Router::new()
+            .route(
+                "/{view}/names",
+                get(move |Path(id): Path<String>, RawQuery(query): RawQuery| {
+                    let ops = named.clone();
+                    async move {
+                        let Some(view) = ops.view(&id) else {
+                            return antares_ops::Refusal::NotFound.ngsi_ld();
+                        };
+                        // the raw (still percent-encoded) `q=` and `names=`, as a surface reads them
+                        let query = query.unwrap_or_default();
+                        let raw = |key: &str| {
+                            query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+                                .unwrap_or_default()
+                                .to_owned()
+                        };
+                        let mut minted: Vec<String> = Vec::new();
+                        let q = view.rename_q(&raw("q"), &mut |iri| {
+                            minted.push(iri.to_owned());
+                            format!("t{}", minted.len())
+                        });
+                        let expanded = view.expand_names(&raw("names"));
+                        axum::Json(json!({
+                            "speed": view.expand_name("speed"),
+                            "q": q.map_err(|r| r.ngsi_ld().status().as_u16()),
+                            "minted": minted,
+                            "names": expanded.map_err(|r| r.ngsi_ld().status().as_u16()),
+                        }))
+                        .into_response()
+                    }
+                }),
+            )
             .route(
                 "/{view}/mapping",
                 get(move |Path(id): Path<String>| {
@@ -295,4 +331,48 @@ async fn a_view_of_another_model_reaches_only_the_surface_that_asks_for_its_mapp
         json!({"view": true, "mapped": null}),
         "a view of the store's own model"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_callers_names_read_in_the_views_context() {
+    let (_b, app) = broker().await.expect("broker");
+    let mut named = view(&["speed"], &["query_entities"]);
+    named["@context"] = json!({"speed": "https://example.org/speed"});
+    let a = send(&app, Method::PUT, "/q/views/cars", &[], Some(&named)).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.json);
+    let a = send(
+        &app,
+        Method::GET,
+        "/x/probe/cars/names?q=speed%3E1;colour.observedAt%3E2026-01-01T00:00:00Z&names=speed%2Ccolour",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(
+        a.json,
+        json!({
+            "speed": "https://example.org/speed",
+            "q": {"Ok": "t1>1;t2.observedAt>\"2026-01-01T00:00:00Z\""},
+            "minted": ["https://example.org/speed", "https://uri.etsi.org/ngsi-ld/default-context/colour"],
+            "names": {"Ok": ["https://example.org/speed", "https://uri.etsi.org/ngsi-ld/default-context/colour"]},
+        }),
+        "{}",
+        a.json
+    );
+    let a = send(
+        &app,
+        Method::GET,
+        "/x/probe/cars/names?q=%28speed&names=a,,b",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(
+        (a.json.get("q"), a.json.get("names")),
+        (Some(&json!({"Err": 400})), Some(&json!({"Err": 400}))),
+        "{}",
+        a.json
+    );
+    let a = send(&app, Method::GET, "/x/probe/nosuch/names", &[], None).await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND);
 }

@@ -712,6 +712,12 @@ impl<'a> Parser<'a> {
             // the other unquoted alternatives: a URI, a dateTime, a date or a
             // time, all of them compared as text
             "" => Err(bad(raw, "expected value")),
+            // A value that starts with an operator's character is a typo of
+            // the operator (`speed>>`), never the text ">" (T-4084).
+            _ if !regexp && raw.starts_with(['<', '>', '=', '!', '~']) => Err(bad(
+                raw,
+                "an unquoted value starts with no operator character (4.9); quote a text",
+            )),
             _ => Ok(QValue::Str(raw.to_owned())),
         }
     }
@@ -747,6 +753,25 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-4084: an unquoted value that starts with an operator's character is
+    /// a typo of the operator, refused rather than compared as text.
+    #[test]
+    fn an_unquoted_value_starting_with_an_operator_is_refused() {
+        for q in ["speed>>", "speed>=>", "speed==>1", "speed!=<"] {
+            assert!(parse_q(q).is_err(), "{q}");
+        }
+        for q in [
+            "speed>1",
+            "speed>-1",
+            "name==urn:ngsi-ld:Car:1",
+            "observedAt>2026-01-01T00:00:00Z",
+            "name==\">\"",
+            "name~=>.*",
+        ] {
+            assert!(parse_q(q).is_ok(), "{q}");
+        }
+    }
 
     /// RFC 3986 2.1: "%" and exactly two hex digits; anything shorter or
     /// signed stays as written, at the end of the input too (T-3468: the
@@ -801,10 +826,11 @@ mod tests {
             ("x==1e", QValue::Str("1e".into())),
             ("x==-", QValue::Str("-".into())),
         ] {
-            let QNode::Cmp { value, .. } = parse_q(q).expect(q) else {
-                panic!("{q} is a comparison");
-            };
-            assert_eq!(value, want, "{q}");
+            let node = parse_q(q).expect(q);
+            assert!(
+                matches!(&node, QNode::Cmp { value, .. } if *value == want),
+                "{q}: {node:?}"
+            );
         }
     }
 
@@ -862,13 +888,10 @@ mod tests {
     fn and_or_precedence() {
         // `a==1;b==2|c==3` == (a AND b) OR c per grammar: OR binds looser
         let q = parse_q("a==1;b==2|c==3").expect("parse");
-        match q {
-            QNode::Or(items) => {
-                assert_eq!(items.len(), 2);
-                assert!(matches!(items[0], QNode::And(_)));
-            }
-            other => panic!("expected Or, got {other:?}"),
-        }
+        assert!(
+            matches!(&q, QNode::Or(items) if items.len() == 2 && matches!(items[0], QNode::And(_))),
+            "{q:?}"
+        );
     }
 
     #[test]
@@ -1062,10 +1085,10 @@ mod tests {
             (r#"a=="""#, ""),
         ] {
             let node = parse_q(q).unwrap_or_else(|e| panic!("{q}: {e:?}"));
-            let QNode::Cmp { value, .. } = node else {
-                panic!("{q}: expected a comparison")
-            };
-            assert_eq!(value, QValue::Str(want.to_owned()), "{q}");
+            assert!(
+                matches!(&node, QNode::Cmp { value: QValue::Str(s), .. } if s == want),
+                "{q}: {node:?}"
+            );
         }
     }
 
@@ -1079,13 +1102,11 @@ mod tests {
             "an escaped quote leaves the string open"
         );
         let node = parse_q(r#"a=="ends with a backslash\\";b"#).expect("parses");
-        let QNode::And(items) = node else {
-            panic!("expected an And")
-        };
-        let QNode::Cmp { value, .. } = &items[0] else {
-            panic!("expected a comparison")
-        };
-        assert_eq!(value, &QValue::Str("ends with a backslash\\".to_owned()));
+        assert!(
+            matches!(&node, QNode::And(items)
+                if matches!(&items[0], QNode::Cmp { value: QValue::Str(s), .. } if s == "ends with a backslash\\")),
+            "{node:?}"
+        );
     }
 
     /// An escape RFC 8259 does not define is not a String, so the term is
@@ -1131,10 +1152,11 @@ mod complexity_tests {
             .map(|i| format!("a{i}==1"))
             .collect::<Vec<_>>()
             .join(";");
-        match parse_q(&huge) {
-            Err(NgsiError::TooComplexQuery(_)) => {}
-            other => panic!("expected TooComplexQuery, got {other:?}"),
-        }
+        let answer = parse_q(&huge);
+        assert!(
+            matches!(answer, Err(NgsiError::TooComplexQuery(_))),
+            "{answer:?}"
+        );
     }
 
     /// Regression: the parser once recursed per `(` with
@@ -1308,18 +1330,21 @@ mod complexity_tests {
     /// and a `..` past the next separator belongs to the next term.
     #[test]
     fn unquoted_scalars_and_where_a_range_stops() {
-        let QNode::Cmp { value, .. } = parse_q("a==false").expect("parse") else {
-            unreachable!("a comparison")
-        };
-        assert_eq!(value, QValue::Bool(false));
+        assert!(matches!(
+            parse_q("a==false").expect("parse"),
+            QNode::Cmp {
+                value: QValue::Bool(false),
+                ..
+            }
+        ));
         assert!(parse_q("a==").is_err());
         assert!(parse_q("a==;b==1").is_err());
         let range = parse_q("a==1;b==2..3").expect("parse");
         assert_eq!(range, parse_q("(a==1);(b==2..3)").expect("parse"));
-        let QNode::And(terms) = range else {
-            unreachable!("an And")
-        };
-        assert_eq!(terms.len(), 2);
+        assert!(
+            matches!(&range, QNode::And(terms) if terms.len() == 2),
+            "{range:?}"
+        );
     }
 
     /// The byte ceiling is inclusive: MAX_Q_BYTES parses, one more is
@@ -1447,26 +1472,35 @@ mod complexity_tests {
     /// Parsing grows with the `q`, not with its square: each unquoted value
     /// once looked for the Range `..` across the whole rest, so a chain of
     /// `n` comparisons scanned n²/2 terms (T-3706: the Miri job ran out of
-    /// time inside one 511-term parse). Eight times the terms may cost eight
-    /// times the time; the old scan cost about forty. Minimum of five runs,
-    /// so a busy runner's pause counts against neither size.
+    /// time inside one 511-term parse). Eight parses of a chain against one
+    /// parse of a chain eight times as long: linear, the two take the same
+    /// time (measured 1.04 to 1.24, also beside twelve busy cores); the old
+    /// scan took 5.1 times as long. Both are timed alternately and of about
+    /// the same length, so a loaded host slows both alike (T-4118: one small
+    /// and one large parse drifted from 9 to 18 under load, against a bound
+    /// of 20).
     #[test]
     #[cfg_attr(miri, ignore)] // a wall-clock ratio, measured natively
     fn parsing_a_chain_grows_linearly() {
+        use std::time::{Duration, Instant};
         let chain = |n: usize| vec!["a==1"; n].join(";");
-        let fastest = |q: &str| {
-            (0..5)
-                .map(|_| {
-                    let started = std::time::Instant::now();
-                    assert!(parse_narrowed_q(q).is_ok());
-                    started.elapsed()
-                })
-                .min()
-                .unwrap_or_default()
-        };
         let (small, large) = (chain(MAX_Q_NODES - 1), chain(MAX_NARROWED_Q_NODES - 1));
-        let ratio = fastest(&large).as_secs_f64() / fastest(&small).as_secs_f64().max(1e-9);
-        assert!(ratio < 20.0, "8x the terms took {ratio:.1}x the time");
+        let (mut eight_small, mut one_large) = (Duration::MAX, Duration::MAX);
+        for _ in 0..31 {
+            let started = Instant::now();
+            for _ in 0..8 {
+                assert!(parse_narrowed_q(&small).is_ok());
+            }
+            eight_small = eight_small.min(started.elapsed());
+            let started = Instant::now();
+            assert!(parse_narrowed_q(&large).is_ok());
+            one_large = one_large.min(started.elapsed());
+        }
+        let ratio = one_large.as_secs_f64() / eight_small.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 2.5,
+            "one 8x chain took {ratio:.2}x eight short ones"
+        );
     }
 
     /// The narrowed caps are ceilings too: past them a narrowed `q` is
@@ -1489,6 +1523,33 @@ mod complexity_tests {
         assert!(matches!(
             parse_q(&nested(MAX_Q_DEPTH + 1)),
             Err(NgsiError::TooComplexQuery(_))
+        ));
+    }
+}
+
+/// Two refusals of the grammar no other test spells, `<=` written back, and a `scope` member
+/// of neither shape 4.19 reads (T-3912).
+#[cfg(test)]
+mod edges {
+    use super::*;
+
+    #[test]
+    fn grammar_edges_and_the_written_form() {
+        let said = |q: &str| parse_q(q).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            said("sensor{Device,Car}==1").contains("expected ':'"),
+            "{}",
+            said("sensor{Device,Car}==1")
+        );
+        assert!(
+            said(r#"a~="abc"#).contains("unterminated string"),
+            "{}",
+            said(r#"a~="abc"#)
+        );
+        assert_eq!(parse_q("a<=1").expect("parse").to_string(), "a<=1");
+        assert!(!scope::scope_matches(
+            "/a",
+            &serde_json::json!({"scope": 5})
         ));
     }
 }
