@@ -8,7 +8,7 @@ use crate::model::{Member, Model};
 use crate::search::search;
 use crate::{
     Compute, ExpandItem, ExpandKind, ExpandPath, Feature, Format, Levels, LimitKind, OrderBy,
-    QueryOptions, SelectItem, UrlError, UrlErrorKind,
+    QueryOptions, SelectItem, Transformation, UrlError, UrlErrorKind,
 };
 
 /// Which options a URL form allows besides custom ones (ABNF `batchOptions`,
@@ -46,7 +46,8 @@ enum Name {
 }
 
 /// Names matched case-insensitively, with or without `$` (Protocol 4.01 11.2.1) unless the
-/// flag says `$` is required (`$skiptoken`, `$deltatoken` in the ABNF; `$apply`).
+/// flag says `$` is required (`$skiptoken`, `$deltatoken` in the ABNF; `$apply` in Data
+/// Aggregation 4.0).
 const NAMES: [(&str, bool, Name); 17] = [
     ("$filter", true, Name::Filter),
     ("$select", true, Name::Select),
@@ -80,7 +81,6 @@ impl Name {
         match self {
             Name::Index => Some(Feature::Index),
             Name::Deltatoken => Some(Feature::DeltaToken),
-            Name::Apply => Some(Feature::Apply),
             _ => None,
         }
     }
@@ -155,7 +155,11 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
         allowed: Allowed,
     ) -> Result<QueryOptions, UrlError> {
         let mut options = QueryOptions::default();
-        let computed = match allowed {
+        let (mut applied, scope) = match allowed {
+            Allowed::All => self.apply_first(scope)?,
+            Allowed::Format | Allowed::EntityId => (None, scope),
+        };
+        let mut computed = match allowed {
             Allowed::All => self.compute_first(scope)?,
             Allowed::Format | Allowed::EntityId => None,
         };
@@ -176,14 +180,21 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
                     return Err(self.c.error(UrlErrorKind::DuplicateOption(name.label())));
                 }
                 seen.push(name);
-                match (name, &computed) {
-                    // parsed first
-                    // parsed first; a second one is the duplicate refused above
-                    (Name::Compute, Some((end, items))) => {
-                        self.c.reset(*end);
-                        options.compute = Some(items.clone());
-                    }
-                    _ => self.system(scope, name, start, &mut options)?,
+                // parsed first; a second one is the duplicate refused above
+                let first = match name {
+                    Name::Apply => applied.take().map(|(end, steps)| {
+                        options.apply = Some(steps);
+                        end
+                    }),
+                    Name::Compute => computed.take().map(|(end, items)| {
+                        options.compute = Some(items);
+                        end
+                    }),
+                    _ => None,
+                };
+                match first {
+                    Some(end) => self.c.reset(end),
+                    None => self.system(scope, name, start, &mut options)?,
                 }
             } else if allowed == Allowed::All && self.c.at() {
                 self.alias(&mut options)?;
@@ -203,13 +214,9 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
         Ok(options)
     }
 
-    /// `$compute` before every other option (Protocol 11.2.1): its names resolve in the
-    /// others wherever it stands. Its items and where it ends, `None` without one; the first
-    /// one only, so a second is the duplicate the options loop answers.
-    fn compute_first(
-        &mut self,
-        scope: Scope<'m>,
-    ) -> Result<Option<(usize, Vec<Compute>)>, UrlError> {
+    /// The cursor after the `name=` of the first option `name`; unmoved and `false` without
+    /// one.
+    fn find(&mut self, name: Name) -> bool {
         let base = self.c.pos();
         // a raw `&` ends an option: inside a value it is percent-encoded
         let starts: Vec<usize> = std::iter::once(0)
@@ -222,21 +229,53 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
             .collect();
         for at in starts {
             self.c.reset(base.saturating_add(at));
-            if option_name(self.c, &[Name::Compute]).is_some() {
-                let items = self.compute(scope)?;
-                let end = self.c.pos();
-                self.c.reset(base);
-                return Ok(Some((end, items)));
+            if option_name(self.c, &[name]).is_some() {
+                return true;
             }
         }
         self.c.reset(base);
-        Ok(None)
+        false
+    }
+
+    /// `$apply` before every other option (Data Aggregation 4.0 section 3): the others name
+    /// what it produces. Its transformations and where it ends, `None` without one, and the
+    /// scope the other options resolve in.
+    #[allow(clippy::type_complexity)]
+    fn apply_first(
+        &mut self,
+        scope: Scope<'m>,
+    ) -> Result<(Option<(usize, Vec<Transformation>)>, Scope<'m>), UrlError> {
+        let base = self.c.pos();
+        if !self.find(Name::Apply) {
+            return Ok((None, scope));
+        }
+        let (steps, after) = self.apply(scope)?;
+        let end = self.c.pos();
+        self.c.reset(base);
+        Ok((Some((end, steps)), after))
+    }
+
+    /// `$compute` before every other option but `$apply` (Protocol 11.2.1): its names resolve
+    /// in the others wherever it stands. Its items and where it ends, `None` without one; the
+    /// first one only, so a second is the duplicate the options loop answers.
+    fn compute_first(
+        &mut self,
+        scope: Scope<'m>,
+    ) -> Result<Option<(usize, Vec<Compute>)>, UrlError> {
+        let base = self.c.pos();
+        if !self.find(Name::Compute) {
+            return Ok(None);
+        }
+        let items = self.compute(scope)?;
+        let end = self.c.pos();
+        self.c.reset(base);
+        Ok(Some((end, items)))
     }
 
     /// `computeItem *( COMMA computeItem )`, `computeItem = commonExpr RWS "as" RWS
     /// computedProperty`; a name the resource has, or one given twice, is refused. Each
     /// expression counts against the request's expression budget.
-    fn compute(&mut self, scope: Scope<'m>) -> Result<Vec<Compute>, UrlError> {
+    pub(crate) fn compute(&mut self, scope: Scope<'m>) -> Result<Vec<Compute>, UrlError> {
         let mut items: Vec<Compute> = Vec::new();
         loop {
             let expr = common_expr(self.c, self.model, scope, &mut self.budget)?;
@@ -247,7 +286,9 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
             let Some(alias) = self.c.identifier()? else {
                 return Err(self.c.syntax("computedProperty"));
             };
-            if member(self.model, scope, alias).is_some() || items.iter().any(|i| i.alias == alias)
+            if member(self.model, scope, alias).is_some()
+                || items.iter().any(|i| i.alias == alias)
+                || self.budget.computed.iter().any(|c| c == alias)
             {
                 self.c.reset(at);
                 return Err(self.c.syntax("computedProperty"));
@@ -257,7 +298,10 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
                 alias: alias.to_owned(),
             });
             if !self.c.comma() {
-                self.budget.computed = items.iter().map(|i| i.alias.clone()).collect();
+                // after the names an aggregating `$apply` produced
+                self.budget
+                    .computed
+                    .extend(items.iter().map(|i| i.alias.clone()));
                 return Ok(items);
             }
         }
@@ -288,7 +332,7 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
             Name::Skiptoken => options.skiptoken = Some(qchars(self.c, "skiptoken")?),
             Name::Search => {
                 let limits = self.budget.limits;
-                options.search = Some(search(self.c, limits, &mut self.budget.nodes)?);
+                options.search = Some(search(self.c, limits, &mut self.budget.nodes, false)?);
             }
             Name::Id => options.id = Some(qchars(self.c, "IRI-in-query")?),
             _ => options.schemaversion = Some(schemaversion(self.c)?),
@@ -316,7 +360,7 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
     }
 
     /// `$orderby`: `orderbyItem *( COMMA orderbyItem )`.
-    fn orderby(&mut self, scope: Scope<'m>) -> Result<Vec<OrderBy>, UrlError> {
+    pub(crate) fn orderby(&mut self, scope: Scope<'m>) -> Result<Vec<OrderBy>, UrlError> {
         let max = self.budget.limits.max_orderby_items;
         let mut items = Vec::new();
         loop {
@@ -622,7 +666,11 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
 }
 
 /// The member `name` of `scope`.
-fn member<'m, M: Model>(model: &'m M, scope: Scope<'_>, name: &str) -> Option<Member<'m>> {
+pub(crate) fn member<'m, M: Model>(
+    model: &'m M,
+    scope: Scope<'_>,
+    name: &str,
+) -> Option<Member<'m>> {
     match scope {
         Scope::Type(ty) => model.member(ty, name),
         Scope::Primitive => None,
@@ -630,7 +678,7 @@ fn member<'m, M: Model>(model: &'m M, scope: Scope<'_>, name: &str) -> Option<Me
 }
 
 /// `1*DIGIT` as a `u64`.
-fn unsigned(c: &mut Cursor<'_>) -> Result<u64, UrlError> {
+pub(crate) fn unsigned(c: &mut Cursor<'_>) -> Result<u64, UrlError> {
     let start = c.pos();
     let digits = c.digits();
     if digits.is_empty() {

@@ -13,15 +13,14 @@ use crate::filter::{
     compute, computed, inlined, mint, order, program, searched, translate, Refused, SortBy,
     SortKey, Translated,
 };
-use crate::paths;
 use antares_ops::residual::{DateTime, Expr as RExpr, Program};
 use antares_ops::{
-    core_name, Caller, OperationId, OpsRequest, Page as ScanPage, Pushdown, Refusal, Scanned,
-    ViewOps, RESIDUAL_SCAN, TOO_COMPLEX,
+    core_name, pickable, Caller, OperationId, OpsRequest, Page as ScanPage, Pushdown, Refusal,
+    Scanned, ViewOps, RESIDUAL_SCAN, TOO_COMPLEX,
 };
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use odata_axum::{json_level, json_response, ODataErrorResponse, ODataRequest, ODataState};
+use odata_axum::{json_response, ODataErrorResponse, ODataState};
 use odata_json::{
     write_collection, write_entity, write_entity_references, Ctx, EntityValue, ODataVersion, Page,
     Resource,
@@ -59,93 +58,13 @@ pub(crate) struct Reads {
     pub(crate) state: Arc<ODataState>,
 }
 
-/// One request below the service root that is not the service or metadata
-/// document.
-pub(crate) async fn serve(
-    reads: &Reads,
-    method: &Method,
-    caller: &Caller,
-    request: &ODataRequest,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Response {
-    let version = request.version;
-    if let ODataUri::Resource { path, options } = &request.uri {
-        let collection = matches!(
-            path.as_slice(),
-            [Segment::EntitySet(_)] | [Segment::EntitySet(_), Segment::Ref | Segment::Count]
-        );
-        if !(options.custom.is_empty() || collection && method == Method::GET) {
-            return ODataErrorResponse::new(
-                StatusCode::BAD_REQUEST,
-                "BadRequest",
-                "the ngsild options apply to reading a collection",
-            )
-            .with_version(version)
-            .into_response();
-        }
-    }
-    if method != Method::GET {
-        return crate::write::serve(reads, method, caller, request, headers, body).await;
-    }
-    let level = match json_level(request, headers, reads.state.max_header_len) {
-        Ok(level) => level,
-        Err(refused) => return refused.into_response(),
-    };
-    let ctx = Ctx {
-        service_root: &reads.state.service_root,
-        level,
-        version,
-        metadata_etag: reads.state.metadata_etag.as_deref(),
-    };
-    if let ODataUri::Entity { options } = &request.uri {
-        return dereference(reads, caller, &ctx, options)
-            .await
-            .unwrap_or_else(IntoResponse::into_response);
-    }
-    let (ODataUri::Resource { path, options }, None) = (&request.uri, later(&request.uri)) else {
-        return not_implemented(version).into_response();
-    };
-    let answer = match path.as_slice() {
-        [_, Segment::Ref] | [_, _, Segment::Ref] if shaped(options) => Err(no_properties(version)),
-        [Segment::EntitySet(set)] | [Segment::EntitySet(set), Segment::Ref] => {
-            collection(reads, caller, &ctx, set, path, options, headers).await
-        }
-        [Segment::EntitySet(set), Segment::Count] => {
-            count(reads, caller, set, options, version).await
-        }
-        [Segment::EntitySet(set), Segment::Key(key)] => {
-            entity(reads, caller, &ctx, set, key, options).await
-        }
-        [Segment::EntitySet(set), Segment::Key(key), Segment::Ref] if only_select(options) => {
-            paths::reference(reads, caller, &ctx, (set, key), options).await
-        }
-        // Below one Entity only `$select` applies (Q31 to Q33).
-        [_, _, ..] if !only_select(options) => Err(not_implemented(version)),
-        [Segment::EntitySet(set), Segment::Key(key), Segment::Property(name)] => {
-            paths::property(reads, caller, &ctx, (set, key, name), false, options).await
-        }
-        [Segment::EntitySet(set), Segment::Key(key), Segment::Property(name), Segment::Value] => {
-            paths::property(reads, caller, &ctx, (set, key, name), true, options).await
-        }
-        [Segment::EntitySet(set), Segment::Key(key), Segment::Navigation(nav)] => {
-            paths::related(reads, caller, &ctx, (set, key, nav), false, options).await
-        }
-        [Segment::EntitySet(set), Segment::Key(key), Segment::Navigation(nav), Segment::Ref] => {
-            paths::related(reads, caller, &ctx, (set, key, nav), true, options).await
-        }
-        _ => Err(not_implemented(version)),
-    };
-    answer.unwrap_or_else(IntoResponse::into_response)
-}
-
 /// `$entity?$id=` (Q23): the id, percent-decoded, is a URL of this service,
 /// absolute under its root or relative to it, that names one Entity by key
 /// and nothing else; it is read as that URL is. A missing `$id`, a broken
 /// escape or an id with query options of its own is `400`; any other id
 /// names no Entity here and is `404`, like a hidden one (O5). A foreign URL
 /// is never fetched.
-async fn dereference(
+pub(crate) async fn dereference(
     reads: &Reads,
     caller: &Caller,
     ctx: &Ctx<'_>,
@@ -186,32 +105,15 @@ async fn dereference(
     }
 }
 
-/// `text` with each `%XX` decoded; `None` for a broken escape or bytes that
-/// are no UTF-8.
-fn percent_decoded(text: &str) -> Option<String> {
-    let mut out = Vec::with_capacity(text.len());
-    let mut bytes = text.bytes();
-    while let Some(b) = bytes.next() {
-        out.push(if b == b'%' {
-            let hex = [bytes.next()?, bytes.next()?];
-            if !hex.iter().all(u8::is_ascii_hexdigit) {
-                return None;
-            }
-            u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?
-        } else {
-            b
-        });
-    }
-    String::from_utf8(out).ok()
-}
+use antares_ops::percent::decoded as percent_decoded;
 
 /// Whether `$select` or `$expand` asks for properties.
-fn shaped(options: &QueryOptions) -> bool {
+pub(crate) fn shaped(options: &QueryOptions) -> bool {
     options.select.is_some() || options.expand.is_some()
 }
 
 /// A reference has no properties to select or expand (URL 4.4).
-fn no_properties(version: ODataVersion) -> ODataErrorResponse {
+pub(crate) fn no_properties(version: ODataVersion) -> ODataErrorResponse {
     ODataErrorResponse::new(
         StatusCode::BAD_REQUEST,
         "BadRequest",
@@ -222,10 +124,11 @@ fn no_properties(version: ODataVersion) -> ODataErrorResponse {
 
 /// Whether no option but `$select` (and `$format`, `$schemaversion=*`,
 /// read before) is asked.
-fn only_select(options: &QueryOptions) -> bool {
+pub(crate) fn only_select(options: &QueryOptions) -> bool {
     options.filter.is_none()
         && options.search.is_none()
         && options.compute.is_none()
+        && options.apply.is_none()
         && options.expand.is_none()
         && options.orderby.is_none()
         && options.top.is_none()
@@ -236,7 +139,7 @@ fn only_select(options: &QueryOptions) -> bool {
 
 /// Why a parsed URL is answered `501` in this round: a form or an option a
 /// later round maps. `None` for what this round serves.
-fn later(uri: &ODataUri) -> Option<&'static str> {
+pub(crate) fn later(uri: &ODataUri) -> Option<&'static str> {
     let ODataUri::Resource { options, .. } = uri else {
         return Some("this resource is not served");
     };
@@ -395,8 +298,10 @@ fn listed(picked: Option<&[&str]>, expansions: &[Expansion], version: ODataVersi
 }
 
 /// The NGSI-LD query of an EntitySet: its type, the Attributes selected
-/// (`attrs`, which takes IRIs; the core members always come, and the
-/// expanded Relationships), the system members only when selected (E6),
+/// (`pick`, a projection that keeps every Entity, unlike `attrs`; by IRI,
+/// with the core members and the expanded Relationships; none when an IRI
+/// is no 4.21 member name, and the surface projects), the system members
+/// only when selected (E6),
 /// `join=inline` one level deep for an expansion of entities or a `q` that
 /// follows a Relationship (5.7.2.4). A join
 /// follows every Relationship it is given (4.5.23), so it names the
@@ -408,21 +313,13 @@ pub(crate) fn query(
     expansions: &[Expansion],
     filter: &Translated,
 ) -> String {
-    let nested = expansions.iter().filter_map(|e| match &e.writes {
-        Writes::Entities(picked) => Some(picked.as_deref()),
-        Writes::Refs(_) => None,
-    });
-    let joined = filter.linked || nested.clone().count() > 0;
-    let structural: Vec<&str>;
+    let nested = nested(expansions);
+    let joined = joins(expansions, filter);
+    let frame: Vec<&str>;
     let picked = match picked {
         None if joined => {
-            structural = set
-                .members
-                .iter()
-                .filter(|(_, m)| !matches!(m.shape, Shape::Nav { .. }))
-                .map(|(name, _)| name.as_str())
-                .collect();
-            Some(structural.as_slice())
+            frame = structural(set);
+            Some(frame.as_slice())
         }
         picked => picked,
     };
@@ -431,13 +328,17 @@ pub(crate) fn query(
         q.push_str("&orderBy=");
         q.push_str(&encode(keys));
     }
+    let system = |names: Option<&[&str]>| {
+        names.is_some_and(|n| n.iter().any(|m| matches!(*m, "createdAt" | "modifiedAt")))
+    };
+    let sys = system(picked) || nested.clone().any(system);
     if let Some(names) = picked {
         // the computed values read their Attributes by term of the request's context
         let reads = filter
             .computed_reads
             .iter()
             .filter_map(|term| filter.context.get(term)?.as_str());
-        let mut attrs: Vec<String> = Vec::new();
+        let mut iris: Vec<&str> = Vec::new();
         for iri in names
             .iter()
             .filter_map(|name| set.members.get(*name))
@@ -445,26 +346,56 @@ pub(crate) fn query(
             .chain(expansions.iter().map(|e| e.iri))
             .chain(reads)
         {
-            let iri = encode(iri);
-            if !attrs.contains(&iri) {
-                attrs.push(iri);
+            if !iris.contains(&iri) {
+                iris.push(iri);
             }
         }
-        if !attrs.is_empty() {
-            q.push_str("&attrs=");
-            q.push_str(&attrs.join(","));
+        // ponytail: an unpickable IRI reads the whole Entity, and a join then
+        // walks every Relationship; mint terms (as `pushdown` does) if one is
+        // ever seen
+        if !iris.is_empty() && iris.iter().all(|iri| pickable(iri)) {
+            let own = ["id", "type", "scope"].into_iter().chain(
+                sys.then_some(["createdAt", "modifiedAt"])
+                    .into_iter()
+                    .flatten(),
+            );
+            let pick: Vec<String> = own.chain(iris).map(encode).collect();
+            q.push_str("&pick=");
+            q.push_str(&pick.join(","));
         }
     }
-    let system = |names: Option<&[&str]>| {
-        names.is_some_and(|n| n.iter().any(|m| matches!(*m, "createdAt" | "modifiedAt")))
-    };
-    if system(picked) || nested.clone().any(system) {
+    if sys {
         q.push_str("&options=sysAttrs");
     }
     if joined {
         q.push_str("&join=inline&joinLevel=1");
     }
     q
+}
+
+/// The `$select` of each expansion of entities.
+fn nested<'e>(expansions: &'e [Expansion]) -> impl Iterator<Item = Option<&'e [&'e str]>> + Clone {
+    expansions.iter().filter_map(|e| match &e.writes {
+        Writes::Entities(picked) => Some(picked.as_deref()),
+        Writes::Refs(_) => None,
+    })
+}
+
+/// Whether a read joins: an expansion of entities or a `q` that follows a
+/// Relationship (5.7.2.4).
+fn joins(expansions: &[Expansion], filter: &Translated) -> bool {
+    filter.linked || nested(expansions).next().is_some()
+}
+
+/// The members a join without `$select` projects to: every one but the
+/// navigations, so a navigation not expanded spends none of the walk's
+/// lookups.
+fn structural(set: &Set) -> Vec<&str> {
+    set.members
+        .iter()
+        .filter(|(_, m)| !matches!(m.shape, Shape::Nav { .. }))
+        .map(|(name, _)| name.as_str())
+        .collect()
 }
 
 /// Which Entities a query selects: its type, `id`, `q`, `geoQ`,
@@ -499,12 +430,21 @@ fn selection(set: &Set, filter: &Translated) -> String {
 /// selected Attributes, the expanded ones and those the sort reads, each by
 /// a term of the request's own @context, so the scan tells apart what only
 /// the residual reads. `ViewOps::scan` sets `limit`, `offset` and `count`.
-fn pushdown(
+pub(crate) fn pushdown(
     set: &Set,
     picked: Option<&[&str]>,
     expansions: &[Expansion],
     filter: &mut Translated,
 ) -> Pushdown {
+    let joined = joins(expansions, filter);
+    let frame: Vec<&str>;
+    let picked = match picked {
+        None if joined => {
+            frame = structural(set);
+            Some(frame.as_slice())
+        }
+        picked => picked,
+    };
     let attrs = picked.map(|names| {
         let iris = names
             .iter()
@@ -527,15 +467,19 @@ fn pushdown(
     let system = |names: Option<&[&str]>| {
         names.is_some_and(|n| n.iter().any(|m| matches!(*m, "createdAt" | "modifiedAt")))
     };
+    let mut query = selection(set, filter);
+    if joined {
+        query.push_str("&join=inline&joinLevel=1");
+    }
     Pushdown {
-        query: selection(set, filter),
+        query,
         order: filter
             .order
             .as_deref()
             .map(|keys| keys.split(',').map(str::to_owned).collect())
             .unwrap_or_default(),
         attrs,
-        sys_attrs: system(picked) || filter.sort_system,
+        sys_attrs: system(picked) || nested(expansions).any(system) || filter.sort_system,
         context: (!filter.context.is_empty()).then(|| Value::Object(filter.context.clone())),
     }
 }
@@ -614,15 +558,6 @@ async fn evaluated(
         counted,
         version,
     } = window;
-    let joined = filter.linked
-        || expansions
-            .iter()
-            .any(|e| matches!(e.writes, Writes::Entities(_)));
-    if joined {
-        // The scan reads no NGSILD-Warning: a join it walked could be
-        // truncated unseen (S1, O6), so a residual stays off a join.
-        return Err(not_implemented(version));
-    }
     let pushdown = pushdown(set, picked, expansions, filter);
     Ok(if counted || filter.sort.is_some() {
         // The whole answer, counted and sorted here (ADR-0028 rule 5); the
@@ -637,23 +572,8 @@ async fn evaluated(
         if let Some(keys) = &filter.sort {
             sort(&mut docs, keys);
         }
-        let total = u64::try_from(docs.len()).unwrap_or(u64::MAX);
-        let from = cursor.saturating_add(skip);
-        let end = top.map_or(total, |top| total.min(from.saturating_add(top)));
-        let take = end.saturating_sub(from).min(page);
-        let docs: Vec<Value> = docs
-            .into_iter()
-            .skip(usize::try_from(from).unwrap_or(usize::MAX))
-            .take(usize::try_from(take).unwrap_or(usize::MAX))
-            .collect();
-        let served = u64::try_from(docs.len()).unwrap_or(u64::MAX);
-        let next = from.saturating_add(served);
-        Served {
-            docs,
-            total,
-            next: (served > 0 && next < end)
-                .then(|| link(next, 0, top.map(|top| top.saturating_sub(served)))),
-        }
+        let (docs, total, next) = paged(docs, (cursor, skip, top, page), link);
+        Served { docs, total, next }
     } else {
         // A page filled from the upstream cursor (ADR-0028 rule 4); the
         // `$skip` is of the filtered answer, so it is dropped here and
@@ -679,33 +599,15 @@ async fn evaluated(
     })
 }
 
-/// The page a collection read serves: its Entities, the count when asked,
-/// and the token of the next page.
-struct Served {
-    docs: Vec<Value>,
-    total: u64,
-    next: Option<String>,
-}
-
-async fn collection(
+/// Where a collection read starts: the cursor, `$skip` and `$top` of the request or of its
+/// token, and the page size.
+pub(crate) fn position(
     reads: &Reads,
-    caller: &Caller,
-    ctx: &Ctx<'_>,
-    set_name: &str,
-    path: &[Segment],
     options: &QueryOptions,
+    digest: u64,
     headers: &HeaderMap,
-) -> Result<Response, ODataErrorResponse> {
-    let version = ctx.version;
-    let set = set_of(reads, set_name, version)?;
-    let expansions =
-        expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
-    let mut filter = filtered(set, &reads.edm.sets, options, version)?;
-    let picked = selected_of(set, options.select.as_ref(), &filter.computed)
-        .map_err(|()| not_implemented(version))?;
-    let projection = ngsild(&reads.view, options, &mut filter, version)?;
-    let picked = projected(set, picked, &projection);
-    let digest = digest(&reads.state.service_root, path, options);
+    version: ODataVersion,
+) -> Result<(u64, u64, Option<u64>, u64), ODataErrorResponse> {
     let (cursor, skip, top) = match &options.skiptoken {
         None => (0, options.skip.unwrap_or(0), options.top),
         // The token carries both: a $skip or $top beside it is an edit.
@@ -718,6 +620,65 @@ async fn collection(
         .unwrap_or(u64::MAX)
         .min(max_page(headers, reads.state.max_header_len))
         .min(MAX_PAGE);
+    Ok((cursor, skip, top, page))
+}
+
+/// The page of a whole answer `items` from `cursor` past `skip`, at most `top` in all and
+/// `page` here: the items, the total, and the link to the next page.
+pub(crate) fn paged<T>(
+    items: Vec<T>,
+    (cursor, skip, top, page): (u64, u64, Option<u64>, u64),
+    link: &(dyn Fn(u64, u64, Option<u64>) -> String + Sync),
+) -> (Vec<T>, u64, Option<String>) {
+    let total = u64::try_from(items.len()).unwrap_or(u64::MAX);
+    let from = cursor.saturating_add(skip);
+    let end = top.map_or(total, |top| total.min(from.saturating_add(top)));
+    let take = end.saturating_sub(from).min(page);
+    let items: Vec<T> = items
+        .into_iter()
+        .skip(usize::try_from(from).unwrap_or(usize::MAX))
+        .take(usize::try_from(take).unwrap_or(usize::MAX))
+        .collect();
+    let served = u64::try_from(items.len()).unwrap_or(u64::MAX);
+    let next = from.saturating_add(served);
+    let next = (served > 0 && next < end)
+        .then(|| link(next, 0, top.map(|top| top.saturating_sub(served))));
+    (items, total, next)
+}
+
+/// The page a collection read serves: its Entities, the count when asked,
+/// and the token of the next page.
+struct Served {
+    docs: Vec<Value>,
+    total: u64,
+    next: Option<String>,
+}
+
+pub(crate) async fn collection(
+    reads: &Reads,
+    caller: &Caller,
+    ctx: &Ctx<'_>,
+    set_name: &str,
+    path: &[Segment],
+    options: &QueryOptions,
+    headers: &HeaderMap,
+) -> Result<Response, ODataErrorResponse> {
+    let version = ctx.version;
+    if options.apply.is_some() {
+        return crate::apply::collection(reads, caller, ctx, (set_name, path), options, headers)
+            .await;
+    }
+    let set = set_of(reads, set_name, version)?;
+    let expansions =
+        expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
+    let mut filter = filtered(set, &reads.edm.sets, options, version)?;
+    let picked = selected_of(set, options.select.as_ref(), &filter.computed)
+        .map_err(|()| not_implemented(version))?;
+    let projection = ngsild(&reads.view, options, &mut filter, version)?;
+    let picked = projected(set, picked, &projection);
+    let digest = digest(&reads.state.service_root, path, options);
+    let (cursor, skip, top, page) = position(reads, options, digest, headers, version)?;
+    nulls_first(reads, caller, set, &mut filter, version).await?;
     if filter.sort.is_some() && filter.residual.is_empty() {
         // a surface sort reads the whole answer through the scan: a residual that always holds
         filter.residual.push(RExpr::And(Vec::new()));
@@ -797,7 +758,7 @@ async fn collection(
     Ok(json_response(version, ctx.level, body))
 }
 
-async fn count(
+pub(crate) async fn count(
     reads: &Reads,
     caller: &Caller,
     set_name: &str,
@@ -805,6 +766,9 @@ async fn count(
     version: ODataVersion,
 ) -> Result<Response, ODataErrorResponse> {
     let set = set_of(reads, set_name, version)?;
+    if options.apply.is_some() {
+        return Err(not_implemented(version));
+    }
     let mut filter = filtered(set, &reads.edm.sets, options, version)?;
     ngsild(&reads.view, options, &mut filter, version)?;
     let total = match residual_of(&filter, version)? {
@@ -824,8 +788,6 @@ async fn count(
             .await?
             .1
         }
-        // A hop is evaluated under a join the scan cannot see truncated.
-        Some(_) if filter.linked => return Err(not_implemented(version)),
         Some(program) => {
             filter.sort = None;
             let pushdown = pushdown(set, None, &[], &mut filter);
@@ -856,7 +818,7 @@ pub(crate) async fn entity(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
-    if options.filter.is_some() || options.search.is_some() {
+    if options.filter.is_some() || options.search.is_some() || options.apply.is_some() {
         return Err(not_implemented(version));
     }
     // `$compute` alone: its values over the one Entity
@@ -958,13 +920,13 @@ fn computed_over(
 
 /// The name under which [`attach`] keeps an Entity's computed values: no
 /// Attribute name starts with `@` (a JSON-LD keyword), so none collides.
-const COMPUTED: &str = "@computed";
+pub(crate) const COMPUTED: &str = "@computed";
 
 /// Each of `docs` with its computed values, by name, `null` for an unknown
 /// one: computed over what the view and the engine let the Entity show, so
 /// a hidden Attribute reads as an absent one. A document that holds them
 /// already is left as it is.
-fn attach(
+pub(crate) fn attach(
     docs: &mut [Value],
     filter: &Translated,
     version: ODataVersion,
@@ -993,7 +955,7 @@ fn attach(
 }
 
 /// The OData error of a filter the surface does not take.
-fn refusal(refused: Refused, version: ODataVersion) -> ODataErrorResponse {
+pub(crate) fn refusal(refused: Refused, version: ODataVersion) -> ODataErrorResponse {
     match refused {
         Refused::Later => not_implemented(version),
         Refused::Bad => ODataErrorResponse::new(
@@ -1015,7 +977,7 @@ fn refusal(refused: Refused, version: ODataVersion) -> ODataErrorResponse {
 /// the request without its paging, so a token read under another view or
 /// another query does not match. ponytail: std `SipHash`; a forged token
 /// does no more than `$skip`, every page is narrowed by the store again.
-fn digest(root: &str, path: &[Segment], options: &QueryOptions) -> u64 {
+pub(crate) fn digest(root: &str, path: &[Segment], options: &QueryOptions) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
     let normal = ODataUri::Resource {
         path: path.to_vec(),
@@ -1036,7 +998,7 @@ fn digest(root: &str, path: &[Segment], options: &QueryOptions) -> u64 {
 /// residual page served, or the position in a counted or sorted answer;
 /// which one follows from the query the digest binds. A token of the form
 /// before T-3758 does not read.
-fn token(cursor: u64, skip: u64, top: Option<u64>, digest: u64) -> String {
+pub(crate) fn token(cursor: u64, skip: u64, top: Option<u64>, digest: u64) -> String {
     let top = top.map_or_else(|| "-".to_owned(), |t| t.to_string());
     format!("2.{cursor}.{skip}.{top}.{digest:016x}")
 }
@@ -1209,21 +1171,13 @@ pub(crate) async fn run_request(
     if !answer.status().is_success() {
         return Err(refused(answer.status(), version));
     }
-    // The join walk stopped at the broker's lookup budget (4.5.23.1): an
-    // OData client cannot see the NGSI-LD warning, so a partial expansion
-    // is refused (S1, O6, D9).
     let truncated = answer
         .headers()
         .get_all("NGSILD-Warning")
         .iter()
         .any(|w| w.as_bytes().windows(9).any(|at| at == b"truncated"));
     if truncated {
-        return Err(ODataErrorResponse::new(
-            StatusCode::BAD_REQUEST,
-            "BadRequest",
-            "the expansion reaches more Entities than one answer embeds: narrow it with $top or $filter",
-        )
-        .with_version(version));
+        return Err(truncated_join(version));
     }
     let total = answer
         .headers()
@@ -1231,9 +1185,11 @@ pub(crate) async fn run_request(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
+    let bytes = reads
+        .view
+        .read_answer(answer.into_body())
         .await
-        .unwrap_or_default();
+        .map_err(|refusal| refused(refusal.status(), version))?;
     let docs = serde_json::from_slice::<Value>(&bytes)
         .into_iter()
         .flat_map(|doc| match doc {
@@ -1456,7 +1412,7 @@ fn plain(value: Value) -> Value {
 /// residual when they take the one `geoQ`. Each name is read under the
 /// view's `@context` and written as a term of the request's own. What
 /// `ngsild.pick` and `ngsild.omit` name, as IRIs, is returned.
-fn ngsild(
+pub(crate) fn ngsild(
     view: &ViewOps,
     options: &QueryOptions,
     filter: &mut Translated,
@@ -1525,7 +1481,7 @@ fn ngsild(
 
 /// What `ngsild.pick` keeps and `ngsild.omit` drops, as IRIs.
 #[derive(Default)]
-struct Projection {
+pub(crate) struct Projection {
     pick: Option<Vec<String>>,
     omit: Option<Vec<String>>,
 }
@@ -1569,6 +1525,64 @@ fn projected<'s>(
     )
 }
 
+/// URL 5.1.5 puts null first ascending and last descending; the store puts
+/// an Entity lacking an `orderBy` key after every value either way. One
+/// count of the Entities lacking a key decides: none, and the store's order
+/// is the standard's; any, and the read is sorted on the surface (T-3853).
+// ponytail: a sparse key over RESIDUAL_SCAN Entities is 400 TooManyResults;
+// split a single-key sort into "lacks it" and "holds it" reads if that matters
+async fn nulls_first(
+    reads: &Reads,
+    caller: &Caller,
+    set: &Set,
+    filter: &mut Translated,
+    version: ODataVersion,
+) -> Result<(), ODataErrorResponse> {
+    let terms: Vec<&str> = filter
+        .pushed_keys
+        .iter()
+        .filter_map(|k| match &k.by {
+            SortBy::Value(term) => Some(term.as_str()),
+            SortBy::Id | SortBy::System(_) | SortBy::Computed(_) => None,
+        })
+        .collect();
+    if filter.order.is_none() || terms.is_empty() {
+        return Ok(());
+    }
+    let lacking = terms
+        .iter()
+        .map(|t| format!("!{t}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let q = match &filter.q {
+        Some(q) => format!("({q});({lacking})"),
+        None => lacking,
+    };
+    let probe = Translated {
+        q: Some(q),
+        ..filter.probe()
+    };
+    let target = format!(
+        "/ngsi-ld/v1/entities?{}&limit=0&count=true",
+        query(set, None, &[], &probe)
+    );
+    let (_, lacking) = run(
+        reads,
+        caller,
+        OperationId::QueryEntities,
+        target,
+        &probe,
+        version,
+    )
+    .await?;
+    if lacking > 0 {
+        filter.sort_reads = terms.iter().map(|t| (*t).to_owned()).collect();
+        filter.sort = Some(std::mem::take(&mut filter.pushed_keys));
+        filter.order = None;
+    }
+    Ok(())
+}
+
 /// The request's residual as a program, `now` read once (ADR-0028 rule 2).
 fn residual_of(
     filter: &Translated,
@@ -1578,7 +1592,7 @@ fn residual_of(
 }
 
 /// The wall clock; one before 1970 reads as 1970, one past 9999 as the last instant.
-fn now() -> DateTime {
+pub(crate) fn now() -> DateTime {
     let micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_micros());
@@ -1590,7 +1604,7 @@ fn now() -> DateTime {
 
 /// One `ViewOps::scan` of `program`: the Entities it served and the
 /// upstream offset to continue from.
-async fn scanned(
+pub(crate) async fn scanned(
     reads: &Reads,
     caller: &Caller,
     pushdown: &Pushdown,
@@ -1599,6 +1613,10 @@ async fn scanned(
     version: ODataVersion,
 ) -> Result<(Vec<Value>, Option<usize>), ODataErrorResponse> {
     match reads.view.scan(caller, pushdown, Some(program), page).await {
+        // T-3823: a scanned join is refused like a pushed one when the walk stopped short
+        Ok(Scanned::Page {
+            truncated: true, ..
+        }) => Err(truncated_join(version)),
         Ok(Scanned::Page { entities, next, .. }) => Ok((entities, next)),
         // A query answers 404 for a Tenant that holds nothing yet (5.5.10).
         Ok(Scanned::Answer(answer)) if answer.status() == StatusCode::NOT_FOUND => {
@@ -1623,6 +1641,18 @@ async fn scanned(
         .with_version(version)),
         Err(other) => Err(refused(other.status(), version)),
     }
+}
+
+/// The join walk stopped at the broker's lookup budget (4.5.23.1): an OData
+/// client cannot see the NGSI-LD warning, so a partial expansion is refused
+/// (S1, O6, D9).
+fn truncated_join(version: ODataVersion) -> ODataErrorResponse {
+    ODataErrorResponse::new(
+        StatusCode::BAD_REQUEST,
+        "BadRequest",
+        "the expansion reaches more Entities than one answer embeds: narrow it with $top or $filter",
+    )
+    .with_version(version)
 }
 
 /// `docs` in the order of `keys` (Q9, URL 5.1.5): null and missing values
@@ -1657,7 +1687,7 @@ fn sort_value<'d>(doc: &'d Value, by: &SortBy) -> Option<&'d Value> {
         .filter(|v| !v.is_null())
 }
 
-fn compare(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+pub(crate) fn compare(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
     use std::cmp::Ordering::{Equal, Greater, Less};
     let kind = |v: &Value| match v {
         Value::Null => 0,
@@ -1709,19 +1739,7 @@ fn max_page(headers: &HeaderMap, max_len: usize) -> u64 {
         .unwrap_or(DEFAULT_PAGE)
 }
 
-/// Percent-encodes everything but RFC 3986 unreserved characters.
-pub(crate) fn encode(raw: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(raw.len());
-    for b in raw.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            out.push(char::from(b));
-        } else {
-            let _ = write!(out, "%{b:02X}");
-        }
-    }
-    out
-}
+pub(crate) use antares_ops::percent::encode;
 
 /// A refused or failed operation as an OData error with the same status.
 /// The text is fixed: no detail of the broker's reaches the caller.
@@ -1733,6 +1751,7 @@ pub(crate) fn refused(status: StatusCode, version: ODataVersion) -> ODataErrorRe
         StatusCode::METHOD_NOT_ALLOWED => "MethodNotAllowed",
         StatusCode::BAD_REQUEST => "BadRequest",
         StatusCode::SERVICE_UNAVAILABLE => "ServiceUnavailable",
+        StatusCode::PAYLOAD_TOO_LARGE => "PayloadTooLarge",
         _ => "InternalError",
     };
     ODataErrorResponse::new(status, code, "the request was refused").with_version(version)
@@ -1834,6 +1853,27 @@ mod tests {
         assert_eq!(objects(None), Vec::<String>::new());
         let relationship = json!({"object": ["a", 1], "objectList": [{"object": "b"}, "c", 2]});
         assert_eq!(objects(Some(&relationship)), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn select_is_a_pick_of_the_frame_and_none_when_an_iri_is_no_member_name() {
+        // T-3822: `pick`, never `attrs`, which drops the Entities holding none
+        let mut set = set();
+        let none = Translated::default();
+        let q = query(&set, Some(&["geo", "createdAt"]), &[], &none);
+        assert!(
+            q.ends_with(
+                "&pick=id,type,scope,createdAt,modifiedAt,https%3A%2F%2Fe.org%2Fm&options=sysAttrs"
+            ),
+            "{q}"
+        );
+        assert!(!q.contains("attrs="), "{q}");
+        set.members
+            .entry("geo".into())
+            .and_modify(|geo| geo.iri = "https://e.org/~m".into());
+        let q = query(&set, Some(&["geo"]), &[], &none);
+        assert!(!q.contains("pick="), "{q}");
+        assert!(!q.contains("attrs="), "{q}");
     }
 
     #[test]

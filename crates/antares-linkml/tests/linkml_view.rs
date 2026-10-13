@@ -773,3 +773,71 @@ async fn a_grant_over_the_whole_entity_keeps_every_slot_of_its_class() {
     assert_eq!(slots, ["speed", "owner", "fuel", "owner_secret"], "{car}");
     assert_eq!(get(&app, "classes/Person").await.0, StatusCode::NOT_FOUND);
 }
+
+const CORE: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+
+/// Denies exactly the core-context IRIs of `Car` and `speed`: the names a view written with
+/// short names shows, so a refusal proves the engine was asked about those, not the schema's.
+struct NotCoreCarNotCoreSpeed;
+
+impl PolicyEngine for NotCoreCarNotCoreSpeed {
+    fn name(&self) -> &'static str {
+        "not-core-car-not-core-speed"
+    }
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        let named = |names: &[String], n: &str| names.iter().any(|x| *x == format!("{CORE}{n}"));
+        let d = if (op.clause == "5.7.7" && named(op.types, "Car"))
+            || (op.clause == "5.7.10" && named(op.attrs, "speed"))
+        {
+            Decision::Deny("not this one".into())
+        } else {
+            Decision::Allow
+        };
+        Box::pin(std::future::ready(d))
+    }
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// T-3645: a schema in another vocabulary (`sdm:`, as Model Tools renders helsinki's) and a view
+/// written with short names, as the Portal writes them. The surface shows what the view names,
+/// read under the core @context, keeps the model's own IRIs in what it serves, hides the rest,
+/// and asks the engine about the IRI the view shows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_of_another_vocabulary_serves_what_a_short_named_view_shows() {
+    let sdm = json!({
+      "id": "https://e.org/city", "name": "city",
+      "prefixes": {"sdm": {"prefix_prefix": "sdm",
+                           "prefix_reference": "https://smartdatamodels.org/"}},
+      "default_prefix": "sdm",
+      "classes": {"Car": {"slots": ["speed", "owner_secret"]},
+                  "Person": {"slots": ["name"]}},
+      "slots": {"speed": {"range": "float"}, "owner_secret": {}, "name": {}}
+    });
+    let short = json!({
+      "id": "cars", "tenant": "city",
+      "selector": ["Car"],
+      "rules": [{"types": ["Car"], "attributes": ["speed"]}],
+      "operations": READS
+    });
+    let app = broker(None, &short, Some(&sdm)).await.expect("a broker");
+    let (s, _, car) = get(&app, "classes/Car").await;
+    assert_eq!(s, StatusCode::OK, "{car}");
+    let car: Value = serde_json::from_str(&car).expect("json");
+    assert_eq!(car["iri"], "https://smartdatamodels.org/Car");
+    assert_eq!(get(&app, "slots/speed").await.0, StatusCode::OK);
+    for path in ["classes/Person", "slots/owner_secret", "slots/name"] {
+        assert_eq!(get(&app, path).await.0, StatusCode::NOT_FOUND, "{path}");
+    }
+    let (s, _, index) = get(&app, "schema/index.json").await;
+    assert_eq!(s, StatusCode::OK, "{index}");
+    assert!(!index.contains("Person"), "{index}");
+
+    let denied = broker(Some(Arc::new(NotCoreCarNotCoreSpeed)), &short, Some(&sdm))
+        .await
+        .expect("a broker");
+    for path in ["classes/Car", "slots/speed"] {
+        assert_eq!(get(&denied, path).await.0, StatusCode::NOT_FOUND, "{path}");
+    }
+}

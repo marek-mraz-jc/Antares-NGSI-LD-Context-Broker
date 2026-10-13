@@ -371,7 +371,6 @@ fn query_option_errors() {
     for (name, feature) in [
         ("$index=1", Feature::Index),
         ("$deltatoken=x", Feature::DeltaToken),
-        ("$apply=groupby((name))", Feature::Apply),
     ] {
         refused(&format!("Buildings?{name}"), feature, 10);
     }
@@ -1645,4 +1644,324 @@ fn compute_writes_its_canonical_form() {
         assert_eq!(uri.to_string(), format!("Buildings?{written}"), "{query}");
         assert_eq!(ok(&uri.to_string()).to_string(), uri.to_string(), "{query}");
     }
+}
+
+fn apply_of(query: &str) -> Vec<Transformation> {
+    options(&format!("Buildings?$apply={query}"))
+        .apply
+        .unwrap_or_default()
+}
+
+fn name(n: &str) -> Expr {
+    Expr::Member(MemberPath {
+        variable: None,
+        path: vec![n.into()],
+    })
+}
+
+#[test]
+fn apply_reads_each_served_transformation() {
+    let height = name("height");
+    assert_eq!(
+        apply_of("identity/filter(height%20gt%201)/orderby(name%20desc,height)/top(2)/skip(1)"),
+        vec![
+            Transformation::Identity,
+            Transformation::Filter(Expr::Compare(
+                Box::new(height.clone()),
+                CompareOp::Gt,
+                Box::new(Expr::Literal(Literal::Int(1)))
+            )),
+            Transformation::OrderBy(vec![
+                OrderBy {
+                    expr: name("name"),
+                    descending: true
+                },
+                OrderBy {
+                    expr: height.clone(),
+                    descending: false
+                }
+            ]),
+            Transformation::Top(2),
+            Transformation::Skip(1),
+        ]
+    );
+    let sum = |with, alias: &str| Aggregate::With {
+        expr: height.clone(),
+        with,
+        alias: alias.into(),
+    };
+    assert_eq!(
+        apply_of(
+            "aggregate(height with sum as s, height with MIN as lo,height with max as hi,\
+             height with average as avg,height with countdistinct as d,$count as n)"
+        ),
+        vec![Transformation::Aggregate(vec![
+            sum(AggregateWith::Sum, "s"),
+            sum(AggregateWith::Min, "lo"),
+            sum(AggregateWith::Max, "hi"),
+            sum(AggregateWith::Average, "avg"),
+            sum(AggregateWith::CountDistinct, "d"),
+            Aggregate::Count { alias: "n".into() },
+        ])]
+    );
+    assert_eq!(
+        apply_of("groupby( (name, built) , aggregate( $count as n ) )"),
+        vec![Transformation::GroupBy {
+            properties: vec!["name".into(), "built".into()],
+            aggregate: Some(vec![Aggregate::Count { alias: "n".into() }]),
+        }]
+    );
+    assert_eq!(
+        apply_of("groupby((name))"),
+        vec![Transformation::GroupBy {
+            properties: vec!["name".into()],
+            aggregate: None,
+        }]
+    );
+}
+
+#[test]
+fn after_an_aggregation_only_its_names_resolve() {
+    // in the later transformations and in the other options, wherever `$apply` stands
+    let o = options(
+        "Buildings?$filter=n%20gt%201&$apply=groupby((name),aggregate($count%20as%20n))\
+         /filter(n%20gt%200)/orderby(name)&$orderby=n&$select=name&$compute=n%20add%201%20as%20m",
+    );
+    assert_eq!(o.apply.map(|a| a.len()), Some(3));
+    assert_eq!(o.compute.map(|c| c.len()), Some(1));
+    // a member of the entities no longer resolves, nor the other's names
+    unresolved(
+        "Buildings?$apply=aggregate($count as n)&$filter=height gt 1",
+        48,
+    );
+    unresolved("Buildings?$apply=groupby((name))/filter(height gt 1)", 40);
+    unresolved(
+        "Buildings?$apply=aggregate($count as n)/groupby((name))",
+        49,
+    );
+    unresolved("Buildings?$apply=groupby((nothing))", 26);
+    // an aggregation over what an earlier one produced
+    assert_eq!(
+        apply_of("groupby((name),aggregate($count as n))/aggregate(n with sum as total)").len(),
+        2
+    );
+    // a `$compute` name may not repeat one `$apply` produced
+    syntax(
+        "Buildings?$apply=aggregate($count as n)&$compute=1 add 1 as n",
+        61,
+    );
+    // without an aggregation the entities' members stay
+    assert!(options("Buildings?$apply=top(1)&$filter=height gt 1")
+        .filter
+        .is_some());
+}
+
+#[test]
+fn apply_refuses_what_is_no_served_transformation() {
+    for (query, offset) in [
+        ("expand(sensors)", 17),
+        ("concat(identity,aggregate($count as n))", 17),
+        ("rollup(name)", 17),
+        ("ns.custom(1)", 17),
+        ("groupby((rollup(name)))", 26),
+        ("groupby((address/city))", 26),
+        ("groupby((address))", 26),
+        ("groupby((tags))", 26),
+        ("groupby((name.x))", 26),
+        ("groupby((name),topcount(1,height))", 32),
+        ("groupby((name),identity)", 32),
+        ("aggregate(height)", 33),
+        ("aggregate(height from name with sum as s)", 33),
+        ("aggregate(height with ns.f as s)", 39),
+        ("aggregate(height with)", 33),
+    ] {
+        refused(&format!("Buildings?$apply={query}"), Feature::Apply, offset);
+    }
+    for (query, offset) in [
+        ("", 17),
+        ("identity/", 26),
+        ("unknown(1)", 25),
+        ("filter", 23),
+        ("top(x)", 21),
+        ("top(1", 22),
+        ("groupby(name)", 25),
+        ("groupby(())", 26),
+        ("groupby((name)", 31),
+        ("groupby((name,name))", 35),
+        ("groupby((name),aggregate)", 41),
+        ("groupby((name),aggregate($count as n)", 54),
+        ("groupby((name),aggregate($count as name))", 56),
+        ("aggregate($count)", 33),
+        ("groupby((name x))", 31),
+        ("groupby((name),aggregate($count as n x))", 54),
+        ("aggregate($count is n)", 34),
+        ("concat(identity)", 32),
+        ("concat(top(1),skip(1)", 38),
+        ("topcount(1 height)", 28),
+        ("topcount(1,height", 34),
+        ("search(blue", 28),
+        ("search()", 25),
+        ("compute(height as name)", 39),
+        ("compute(height as h)/compute(1 as h)", 52),
+        ("aggregate($count as 1)", 37),
+        ("aggregate($count as)", 36),
+        ("aggregate(height with median as m)", 45),
+        ("aggregate(height with sum as s,$count as s)", 59),
+    ] {
+        syntax(&format!("Buildings?$apply={query}"), offset);
+    }
+    // `apply` without its `$` is a custom option
+    assert_eq!(options("Buildings?apply=x").custom.len(), 1);
+    let e = err("Buildings?$apply=identity&$apply=identity");
+    assert_eq!(e.kind, UrlErrorKind::DuplicateOption("$apply"));
+}
+
+#[test]
+fn apply_writes_its_canonical_form() {
+    for (query, canonical) in [
+        (
+            "identity/filter(height gt 1)/orderby(name desc)/top(2)/skip(1)",
+            "identity/filter(height%20gt%201)/orderby(name%20desc)/top(2)/skip(1)",
+        ),
+        (
+            "groupby((name,built),aggregate(height with average as a,$count as n))",
+            "groupby((name,built),aggregate(height%20with%20average%20as%20a,$count%20as%20n))",
+        ),
+        ("groupby((name))", "groupby((name))"),
+        (
+            "topcount(2,height)/bottompercent(2.5,height)/search(a OR b)/compute(1 as c)",
+            "topcount(2,height)/bottompercent(2.5,height)/search(a%20OR%20b)/compute(1%20as%20c)",
+        ),
+        (
+            "concat(top(1)/identity,skip(2))",
+            "concat(top(1)/identity,skip(2))",
+        ),
+        (
+            "aggregate(height with sum as s,height with min as lo,height with max as hi,\
+             height with countdistinct as d)",
+            "aggregate(height%20with%20sum%20as%20s,height%20with%20min%20as%20lo,\
+             height%20with%20max%20as%20hi,height%20with%20countdistinct%20as%20d)",
+        ),
+    ] {
+        let uri = ok(&format!("Buildings?$apply={query}"));
+        assert_eq!(uri.to_string(), format!("Buildings?$apply={canonical}"));
+        assert_eq!(ok(&uri.to_string()), uri);
+    }
+}
+
+#[test]
+fn apply_reads_partitions_concat_compute_and_search() {
+    let height = name("height");
+    let partition = |by, top, n: Literal| Transformation::Partition {
+        by,
+        top,
+        n: Expr::Literal(n),
+        expr: height.clone(),
+    };
+    assert_eq!(
+        apply_of(
+            "topcount(2,height)/topsum(10.5,height)/toppercent(50,height)/\
+             bottomcount(1,height)/bottomsum(3,height)/bottompercent(25,height)"
+        ),
+        vec![
+            partition(PartitionBy::Count, true, Literal::Int(2)),
+            partition(PartitionBy::Sum, true, Literal::Decimal("10.5".into())),
+            partition(PartitionBy::Percent, true, Literal::Int(50)),
+            partition(PartitionBy::Count, false, Literal::Int(1)),
+            partition(PartitionBy::Sum, false, Literal::Int(3)),
+            partition(PartitionBy::Percent, false, Literal::Int(25)),
+        ]
+    );
+    assert_eq!(
+        apply_of("search(blue OR red)/compute(height as h)"),
+        vec![
+            Transformation::Search(Search::Or(
+                Box::new(Search::Word("blue".into())),
+                Box::new(Search::Word("red".into()))
+            )),
+            Transformation::Compute(vec![Compute {
+                expr: height.clone(),
+                alias: "h".into()
+            }]),
+        ]
+    );
+    assert_eq!(
+        apply_of("concat(top(1),skip(1)/identity)"),
+        vec![Transformation::Concat(vec![
+            vec![Transformation::Top(1)],
+            vec![Transformation::Skip(1), Transformation::Identity],
+        ])]
+    );
+    unresolved("Buildings?$apply=topcount(1,nothing)", 28);
+}
+
+#[test]
+fn a_computed_name_and_the_names_a_concat_produces_resolve_after_them() {
+    // a `compute` name in the later transformations and options, the members stay
+    let o = options(
+        "Buildings?$apply=compute(height%20mul%202%20as%20h)/filter(h%20gt%201)\
+         &$filter=h%20gt%20height",
+    );
+    assert_eq!(o.apply.map(|a| a.len()), Some(2));
+    // what every aggregating branch produced, and nothing else
+    assert_eq!(
+        apply_of(
+            "concat(aggregate($count as n),groupby((name),aggregate($count as k)))\
+             /filter(n gt 1 or k gt 1 or name eq 'x')"
+        )
+        .len(),
+        2
+    );
+    // a name two branches produce resolves once
+    assert_eq!(
+        apply_of("concat(aggregate($count as n),aggregate($count as n))/filter(n gt 1)").len(),
+        2
+    );
+    unresolved(
+        "Buildings?$apply=concat(aggregate($count as n),groupby((name)))&$filter=height gt 1",
+        72,
+    );
+    // branches that keep the entities keep their members, never a branch's computed name
+    assert!(
+        options("Buildings?$apply=concat(top(1),compute(1 as c))&$filter=height gt 1")
+            .filter
+            .is_some()
+    );
+    unresolved(
+        "Buildings?$apply=concat(top(1),compute(1 as c))/filter(c eq 1)",
+        55,
+    );
+    assert!(Transformation::Concat(vec![vec![Transformation::GroupBy {
+        properties: Vec::new(),
+        aggregate: None
+    }]])
+    .aggregates());
+}
+
+#[test]
+fn apply_chains_and_nestings_cost_their_budget() {
+    let long = Limits {
+        max_query_len: 1 << 20,
+        ..Limits::strict()
+    };
+    let limit_of = |uri: &str| match err_within(uri, &long).kind {
+        UrlErrorKind::LimitExceeded { limit, .. } => Some(limit),
+        _ => None,
+    };
+    // a concat 200 deep is refused by depth, before the parser's stack grows with it (T-4017)
+    let deep = format!(
+        "Buildings?$apply={}identity{}",
+        "concat(identity,".repeat(200),
+        ")".repeat(200)
+    );
+    assert_eq!(limit_of(&deep), Some(LimitKind::ExprDepth));
+    // each transformation is a node: a chain past max_expr_nodes is refused
+    let chain = format!("Buildings?$apply={}", ["identity"; 300].join("/"));
+    assert_eq!(limit_of(&chain), Some(LimitKind::ExprNodes));
+    // within the budget both still parse
+    assert_eq!(apply_of(&["identity"; 40].join("/")).len(), 40);
+    assert_eq!(
+        apply_of("concat(concat(identity,identity),identity)").len(),
+        1
+    );
 }

@@ -38,6 +38,12 @@ its policy gate fires and the view narrows the answer as on the view root.
 the policy engine's probe does (D-3); a tool hidden either way answers like
 one that does not exist (`-32602 unknown tool`, MC1).
 
+A view of another model (one with a `mapping`, [views](views.md)) is
+served too (T-3817): its tools are the reads a mapping runs, every
+argument and answer is in the target model, and the input schemas name the
+target class and the slots the view can produce from what it shows, never
+a source name. Each call is inverted and rebuilt as on the view root.
+
 | Tool | Operation | Paged |
 |---|---|---|
 | `batch_query` | Query Entities, POST form (10.4.3) | yes |

@@ -38,11 +38,19 @@ reason = "the view store failing: the built-in store under test_kit does not fai
 
 [[exclusion]]
 crate = "antares-ops"
+file = "src/views.rs"
+function = "antares_ops::views::install"
+lines = 3
+branches = 0
+reason = "the minute loop's sweep body: its first tick is a minute after start (an immediate one raced the tests' own sweeps, T-3745), so no test runs it; tests call Reload::sweep_retention and sweep_quality, which run the same two sweeps"
+
+[[exclusion]]
+crate = "antares-ops"
 file = "src/views/preview.rs"
 function = "antares_ops::views::preview::preview"
-lines = 2
+lines = 1
 branches = 0
-reason = "the errors of building a request from a query axum already parsed and a tenant the loader validated, and of reading an in-memory body: neither can fail"
+reason = "the error of building a request from a query axum already parsed and a tenant the loader validated: it cannot fail"
 
 [[exclusion]]
 crate = "antares-ops"
@@ -56,9 +64,9 @@ reason = "the periodic reload failing on the store, which the built-in store doe
 crate = "antares-ops"
 file = "src/views/retention.rs"
 function = "antares_ops::views::retention::retain"
-lines = 2
+lines = 4
 branches = 0
-reason = "a retention statement failing on the store, which the built-in store under test_kit does not (see antares_ops::views::inner); tests/pg_retention.rs in antares-sql runs the Postgres statements themselves"
+reason = "2 lines: a retention statement failing on the store, which the built-in store under test_kit does not (see antares_ops::views::inner); tests/pg_retention.rs in antares-sql runs the Postgres statements themselves. 2 lines: the tracing::info! of a spent budget repeats its field in the `log` fallback, which runs only with no subscriber set; tests/retention.rs a_sweep_past_its_budget_stops_and_the_next_goes_on runs the spent path (T-4084)"
 
 [[exclusion]]
 crate = "antares-ops"
@@ -205,12 +213,12 @@ branches = 0
 reason = "the inner @context failing to merge: it maps generated terms to IRIs that compile already expanded and checked, which merge_object accepts; the arm keeps a refusal instead of an unwrap"
 
 [[exclusion]]
-crate = "antares-views"
-file = "src/mapped.rs"
-function = "antares_views::mapped::answer"
-lines = 1
+crate = "antares-ops"
+file = "src/scan.rs"
+function = "antares_ops::scan::read"
+lines = 3
 branches = 0
-reason = "an answer over MAX_ANSWER_BYTES (64 MiB): a test would have to store and page more than that through the test kit's in-memory store"
+reason = "a successful Query Entities answer that is no JSON list: the scan asks the store for application/json and never forwards the outer Accept (tests/view_scan.rs asserts geo+json stays outside), so the store answers a list; the refusal stays as the trust boundary on the store's answer"
 
 [[exclusion]]
 crate = "antares-icsr"
@@ -268,10 +276,372 @@ lines = 21
 branches = 0
 reason = "2 lines: the grant store failing, which the built-in store under test_kit does not (module rule M2). 19 lines: the four tracing::info!/warn! of a forward made or not made repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/icsr_log.rs and icsr_gate.rs cover the subscriber path and assert what they log"
 
+# antares-ql (role ngsild, T-3911/T-3912)
+
 [[exclusion]]
-crate = "antares-ops"
-file = "src/scan.rs"
-function = "antares_ops::scan::read"
+crate = "antares-ql"
+file = "src/eval.rs"
+function = "antares_ql::eval::compare"
+lines = 1
+branches = 0
+reason = "the closing `List | Range => false` arm: both are answered by the unfold guards at the top of the function before this match, so the arm only keeps the match exhaustive; eval::edges drives every reachable arm"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/regex.rs"
+function = "antares_ql::regex::compile"
+lines = 1
+branches = 1
+reason = "the cache's write lock poisoned: only a panic while another thread holds it poisons it, and a test that poisons the process-wide cache breaks every other test sharing it"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/regex.rs"
+function = "antares_ql::regex::q_node"
+lines = 1
+branches = 1
+reason = "the q cache's write lock poisoned: as for compile"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/regex.rs"
+function = "antares_ql::regex::geo_query"
+lines = 2
+branches = 2
+reason = "the geo cache full (MAX_REGEX_CACHE entries) and its write lock poisoned: filling the process-wide cache from a test evicts the entries geo_query_is_shared_per_key reads in parallel, and poisoning is as for compile; the eviction it calls is the one evict_lru_half's own tests drive"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/regex.rs"
+function = "antares_ql::regex::evict_lru_half"
+lines = 1
+branches = 1
+reason = "the `checked_sub` refusal: stamps holds one stamp per entry and keep is half the entries, so the index always exists; it stays a let-else so a future change to `keep` cannot index past the end"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/sql.rs"
+function = "antares_ql::sql::literal"
+lines = 1
+branches = 1
+reason = "an exponent form: Rust's f64 Display never writes one, so the refusal guards a future formatter, not today's"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/eval.rs"
+function = "expand_values_coercion"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/lib.rs"
+function = "unquoted_scalars_and_where_a_range_stops"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/lib.rs"
+function = "a_quoted_string_is_an_rfc_8259_string"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/lib.rs"
+function = "an_escaped_quote_does_not_end_the_string"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/lib.rs"
+function = "an_unquoted_token_is_a_number_only_when_rfc_8259_says_so"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/lib.rs"
+function = "and_or_precedence"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-ql"
+file = "src/render.rs"
+function = "a_regexp_operand_keeps_its_own_backslashes"
+lines = 0
+branches = 1
+reason = "test code: the refusal side of the test's own matches! assertion, taken only when the test fails"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/expand.rs"
+function = "antares_jsonld::expand::expand_instance"
 lines = 3
 branches = 0
-reason = "a successful Query Entities answer that is no JSON list: the scan asks the store for application/json and never forwards the outer Accept (tests/view_scan.rs asserts geo+json stays outside), so the store answers a list; the refusal stays as the trust boundary on the store's answer"
+reason = "the `_` arm of the attribute-type dispatch: every name in ATTR_TYPES has its own arm, which reserved_member_guards::every_declarable_attribute_type_is_dispatched_not_unreachable proves for each one; the arm turns a future omission into a 500 instead of a panic"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/expand.rs"
+function = "antares_jsonld::expand::parse_datetime"
+lines = 1
+branches = 2
+reason = "the `else` of the cut at byte 19: the slice pattern above already matched 19 ASCII bytes, so both `get` calls are always Some"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/expand.rs"
+function = "bench_expansion_rate"
+lines = 31
+branches = 0
+reason = "#[ignore] throughput bench, run by hand with --ignored, not by the gate"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/expand.rs"
+function = "clause_4_5_5_1_a_repeated_dataset_id_is_refused_at_any_position"
+lines = 1
+branches = 1
+reason = "the let-else panic of a test assertion, reached only when the assertion fails"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/expand.rs"
+function = "geojson_geometries_meet_the_rfc_7946_restrictions"
+lines = 1
+branches = 0
+reason = "the panic closure of a test assertion, reached only when a valid geometry is refused"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/expand.rs"
+function = "every_declarable_attribute_type_is_dispatched_not_unreachable"
+lines = 1
+branches = 1
+reason = "the Ok side of `if let Err`: every type there carries the wrong members on purpose, so the expansion always refuses it; the test asserts what the refusal is"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "EgressPolicy::check_host_within"  # v0 mangling puts the impl between the crate and the type
+lines = 3
+branches = 1
+reason = "the public-address side of the DNS answer loop: a unit test has no resolver that answers a public address, and an outbound lookup would make the test depend on the network; the private side is covered by egress_policy_denies_private_ranges"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "EgressPolicy::from_env"  # v0 mangling puts the impl between the crate and the type
+lines = 0
+branches = 1
+reason = "ANTARES_EGRESS_ALLOW_PRIVATE unset: the env var is process-wide, and tests set the policy through with_policy so they cannot race each other on it; egress_switch_ignores_case_and_whitespace covers the parser"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "EgressPolicy::ip_is_private"  # v0 mangling puts the impl between the crate and the type
+lines = 0
+branches = 2
+reason = "the IPv6 loopback and unspecified tests: ::1 and :: are IPv4-compatible spellings of 0.0.0.1 and 0.0.0.0, so embedded_v4 judges them private first and these two operands are never the deciding ones"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "Loader::bump_url"  # v0 mangling puts the impl between the crate and the type
+lines = 1
+branches = 1
+reason = "`min_by` over the usage map at its cap: the map holds MAX_USAGE_ENTRIES > 0 entries there, so it always yields one"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "Loader::fetch"  # v0 mangling puts the impl between the crate and the type
+lines = 4
+branches = 4
+reason = "a send error that is a timeout or a redirect, a chunk read error, the outer 10 s deadline and the second size check after the read loop: the first three need a network that stalls past reqwest's own timeouts (a_host_that_never_answers covers the retry path instead), and the read loop already refuses a body past MAX_CONTEXT_BYTES before the second check can see one"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "Loader::invalidate_merged_using"  # v0 mangling puts the impl between the crate and the type
+lines = 1
+branches = 0
+reason = "a merged entry whose URL list was evicted on its own: both caches are filled and evicted together, the arm keeps the invalidation fail-closed if they ever drift"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "Loader::merge_entry"  # v0 mangling puts the impl between the crate and the type
+lines = 6
+branches = 1
+reason = "a relative @context URL whose base does not parse (the base is always a URL that was just fetched) and a poisoned URL-list lock (fails closed): neither is reachable from a request"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "Loader::merged_hit_is_usable"  # v0 mangling puts the impl between the crate and the type
+lines = 1
+branches = 0
+reason = "a merged hit whose URL list is gone: the same paired eviction as invalidate_merged_using"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "Loader::resolve_counted"  # v0 mangling puts the impl between the crate and the type
+lines = 1
+branches = 1
+reason = "the refetch after a counted bump finds the row gone fails: the loopback server answers every fetch, and a failing one is the 5.5.6 path clause_5_5_6_unavailable_vs_invalid_remote_context covers; plus the unpinned core context, which every_pinned_context_parses_and_carries_an_at_context rules out"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "antares_jsonld::loader::allow_private_egress"
+lines = 3
+branches = 0
+reason = "the process-wide switch is for the broker's own tests; flipping it here would change the policy under every other loader test running in parallel"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "antares_jsonld::loader::client_builder"
+lines = 7
+branches = 4
+reason = "a redirect hop to a host name, to a metadata address, and ANTARES_EXTRA_CA_FILE: the redirect tests cover private IP literals, a name hop needs DNS, and the CA file is a process-wide env var"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "antares_jsonld::loader::slow_factor"
+lines = 1
+branches = 1
+reason = "ANTARES_TEST_SANITIZER is set only by the sanitizer workflow"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "hooks::serve"
+lines = 1
+branches = 1
+reason = "the mock server's accept loop never ends: the runtime drops it when the test returns, so the loop's exit and the end of its task are never reached"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "a_dropped_connection_is_retried_before_the_context_is_unavailable"
+lines = 1
+branches = 1
+reason = "the mock server's accept loop never ends: the runtime drops it when the test returns, so the loop's exit and the end of its task are never reached"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "a_host_that_never_answers_is_unavailable_after_one_retry"
+lines = 1
+branches = 1
+reason = "the mock server's accept loop never ends: the runtime drops it when the test returns, so the loop's exit and the end of its task are never reached"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "clause_5_13_5_4_reload_keeps_existing_on_failure_replaces_on_success"
+lines = 1
+branches = 1
+reason = "the mock server's accept loop never ends: the runtime drops it when the test returns, so the loop's exit and the end of its task are never reached"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "clause_5_5_6_unavailable_vs_invalid_remote_context"
+lines = 1
+branches = 1
+reason = "the mock server's accept loop never ends: the runtime drops it when the test returns, so the loop's exit and the end of its task are never reached"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "client_builder_caps_redirects"
+lines = 2
+branches = 1
+reason = "the mock server's accept loop never ends: the runtime drops it when the test returns, so the loop's exit and the end of its task are never reached"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "fetch_cap_stops_crawl_before_the_limit_is_passed"
+lines = 1
+branches = 1
+reason = "the mock server's accept loop never ends: the runtime drops it when the test returns, so the loop's exit and the end of its task are never reached"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "merged_cache_honours_the_context_lifetime"
+lines = 1
+branches = 1
+reason = "the mock server's accept loop never ends: the runtime drops it when the test returns, so the loop's exit and the end of its task are never reached"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "oversized_chunked_context_is_refused_at_the_cap"
+lines = 3
+branches = 5
+reason = "the mock server's accept loop never ends: the runtime drops it when the test returns, so the loop's exit and the end of its task are never reached; and the early returns when the client hangs up mid-stream, which the cap makes it do at a byte count the test does not pin"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "private_range_denial_does_not_name_the_resolved_address"
+lines = 0
+branches = 2
+reason = "the short-circuit sides of a test assertion, reached only when the denial names an address"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "redirect_to_private_ip_literal_is_blocked"
+lines = 1
+branches = 1
+reason = "the mock server's accept loop never ends: the runtime drops it when the test returns, so the loop's exit and the end of its task are never reached"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "redirect_to_private_ipv6_literal_is_blocked"
+lines = 6
+branches = 3
+reason = "the mock server's accept loop never ends: the runtime drops it when the test returns, so the loop's exit and the end of its task are never reached; the IPv6 target is never reached, which is what the test asserts"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/loader.rs"
+function = "the_second_attempt_waits_before_it_connects"
+lines = 1
+branches = 1
+reason = "the mock server's accept loop never ends: the runtime drops it when the test returns, so the loop's exit and the end of its task are never reached"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/minicache.rs"
+function = "insert"
+lines = 3
+branches = 3
+reason = "the eviction loop's `break` and the two `None` arms: the queue and the map hold the same keys (insert and invalidate keep them paired), so a queue key is always in the map and a key other than the inserted one exists whenever the budget is short"
+
+[[exclusion]]
+crate = "antares-jsonld"
+file = "src/pinned.rs"
+function = "antares_jsonld::pinned::resolve_with"
+lines = 1
+branches = 0
+reason = "the unpinned core context: every_pinned_context_parses_and_carries_an_at_context rules it out; the arm makes a broken pin a 500 instead of a panic"

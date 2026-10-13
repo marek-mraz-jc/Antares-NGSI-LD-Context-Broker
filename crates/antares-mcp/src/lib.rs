@@ -155,7 +155,8 @@ fn rpc_refusal(status: StatusCode, code: i32, message: &str) -> Response {
 }
 
 async fn serve(ops: &Ops, id: &str, caller: Caller, req: Request) -> Response {
-    let Some(view) = ops.view(id) else {
+    // a view of another model too: its reads run through the mapping
+    let Some(view) = ops.mapped_view(id) else {
         return Refusal::NotFound.ngsi_ld();
     };
     let (parts, body) = req.into_parts();

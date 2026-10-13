@@ -638,6 +638,30 @@ mod tests {
         assert_eq!(compact_entity_shallow(&json!("x"), &ctx), json!("x"));
     }
 
+    /// vocab members that are not IRIs (a number in the array, an object
+    /// instead of a string) pass through on both paths; an array of IRIs
+    /// compacts element by element in the simplified form too.
+    #[test]
+    fn vocab_members_that_are_not_iris_stay_verbatim() {
+        let ctx = ctx_of(json!({"cat": "https://example.org/cat"}));
+        let out = compact_instance(
+            &json!({"type": "VocabProperty",
+                    "vocab": ["https://example.org/cat", 3],
+                    "previousVocab": {"x": 1}}),
+            &ctx,
+        );
+        assert_eq!(out["vocab"], json!(["cat", 3]));
+        assert_eq!(out["previousVocab"], json!({"x": 1}));
+        let out = compact_entity_shallow(
+            &json!({"id": "urn:x", "type": "https://example.org/T",
+                    "https://example.org/a": {"vocab": ["https://example.org/cat", 3]},
+                    "https://example.org/b": {"vocab": {"x": 1}}}),
+            &ctx,
+        );
+        assert_eq!(out["https://example.org/a"], json!({"vocab": ["cat", 3]}));
+        assert_eq!(out["https://example.org/b"], json!({"vocab": {"x": 1}}));
+    }
+
     /// A "dataset" member whose value is not an object is left alone.
     #[test]
     fn simplified_dataset_edges() {

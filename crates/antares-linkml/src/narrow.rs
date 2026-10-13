@@ -26,6 +26,20 @@ pub(crate) const LIMITS: Limits = Limits {
 /// A class's slots a caller may see, each as the class refines it.
 type Shown = Vec<(String, Slot)>;
 
+/// The name `visible` knows class `class` by, `None` when it shows it under neither: the
+/// class's own IRI, or its name read under the core @context, which a view's rules, the engine
+/// and the stored Entities use (ADR-0020). A schema whose `class_uri` is another vocabulary's
+/// (`sdm:`) still shows the classes of a view written with short names (T-3645), as the OGC and
+/// `OData` surfaces read it (T-3752). A slot is matched the same way, under the type found here.
+fn as_viewed(source: &Model, visible: &Visible, class: &str) -> Option<String> {
+    let own = source.class_iri(class);
+    if visible.shows_type(&own) {
+        Some(own)
+    } else {
+        visible.shows_type(class).then(|| class.to_owned())
+    }
+}
+
 /// The source schema narrowed to `visible`, under the id
 /// `<source id>/views/<view>`, so a narrowed document never claims to be the
 /// full model (section 8 decision). The second value is whether anything of
@@ -36,26 +50,27 @@ pub(crate) fn narrow(
     view: &str,
 ) -> Result<(Model, bool), Error> {
     let s = source.schema();
-    let kept: BTreeSet<&str> = s
+    // Each visible class with the name the view knows its type by.
+    let typed: BTreeMap<&str, (&Class, String)> = s
         .classes
-        .keys()
-        .filter(|c| visible.shows_type(&source.class_iri(c)))
-        .map(String::as_str)
+        .iter()
+        .filter_map(|(c, class)| Some((c.as_str(), (class, as_viewed(source, visible, c)?))))
         .collect();
-    let shown = |class: &str| -> Shown {
-        let iri = source.class_iri(class);
+    let kept: BTreeSet<&str> = typed.keys().copied().collect();
+    let shown = |class: &str, ty: &str| -> Shown {
         source
             .class_slots(class)
             .into_iter()
-            .filter(|(name, _)| visible.shows_attribute(&iri, &source.slot_iri(name)))
+            .filter(|(name, _)| {
+                visible.shows_attribute(ty, &source.slot_iri(name))
+                    || visible.shows_attribute(ty, name)
+            })
             .map(|(name, slot)| (name.to_owned(), slot))
             .collect()
     };
-    let per_class: BTreeMap<&str, (&Class, Shown)> = s
-        .classes
+    let per_class: BTreeMap<&str, (&Class, Shown)> = typed
         .iter()
-        .filter(|(c, _)| kept.contains(c.as_str()))
-        .map(|(c, class)| (c.as_str(), (class, shown(c))))
+        .map(|(c, (class, ty))| (*c, (*class, shown(c, ty))))
         .collect();
     let slot_names: BTreeSet<&str> = per_class
         .values()
@@ -390,5 +405,43 @@ mod tests {
         let owner = &m.schema().slots["owner"];
         assert_eq!(owner.range.as_deref(), Some("Person"));
         assert_eq!(owner.inverse, None);
+    }
+
+    /// T-3645: a schema in another vocabulary (`sdm:`) and a view written with short names, as
+    /// the Portal writes them: the classes and slots the view names are shown, read under the
+    /// core @context, the rest stays hidden, and the document keeps the model's own IRIs.
+    #[test]
+    fn a_schema_of_another_vocabulary_shows_what_the_view_names() {
+        let source = model(
+            r#"{"id": "https://e.org/m", "name": "m",
+              "prefixes": {"sdm": {"prefix_prefix": "sdm",
+                                   "prefix_reference": "https://smartdatamodels.org/"}},
+              "default_prefix": "sdm",
+              "classes": {"BikeHireDockingStation": {"slots": ["status", "secretNote"]},
+                          "Depot": {"slots": ["status"]}},
+              "slots": {"status": {}, "secretNote": {}}}"#,
+        );
+        let core = |n: &str| format!("https://uri.etsi.org/ngsi-ld/default-context/{n}");
+        let v = antares_ops::Visible::from_filter(&Filter {
+            rules: vec![Rule {
+                types: vec![core("BikeHireDockingStation")],
+                attributes: vec![core("status")],
+                ..Rule::default()
+            }],
+            ..Filter::default()
+        });
+        assert!(!v.shows_type(&source.class_iri("BikeHireDockingStation")));
+        let (m, left_out) = narrow(&source, &v, "bikes").expect("narrowed");
+        assert!(left_out);
+        let s = m.schema();
+        assert_eq!(
+            s.classes.keys().collect::<Vec<_>>(),
+            ["BikeHireDockingStation"]
+        );
+        assert_eq!(s.slots.keys().collect::<Vec<_>>(), ["status"]);
+        assert_eq!(
+            m.class_iri("BikeHireDockingStation"),
+            "https://smartdatamodels.org/BikeHireDockingStation"
+        );
     }
 }

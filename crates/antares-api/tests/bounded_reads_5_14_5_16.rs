@@ -138,6 +138,39 @@ async fn clause_5_14_4_the_candidate_scan_is_read_a_page_at_a_time() {
     );
 }
 
+/// T-3773: the temporal candidate set behind an EntityMap, and the recheck
+/// a later page runs against it, are read up to the broker's buffer bound;
+/// past it the request is TooManyResults (5.5.6), not a body held whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_5_6_temporal_entity_map_reads_stop_at_the_byte_bound() {
+    let (mut st, _) = seeded().await;
+    let path = "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after\
+        &timeAt=2000-01-01T00:00:00Z&timeproperty=createdAt";
+    let (status, headers, body) = send(&st, "GET", &format!("{path}&entityMap=true"), None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let map = headers
+        .get("NGSILD-EntityMap")
+        .and_then(|v| v.to_str().ok())
+        .expect("NGSILD-EntityMap header")
+        .to_owned();
+    st.max_answer_bytes = 16;
+    let (status, _, body) = send(&st, "GET", &format!("{path}&entityMap=true"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the build: {body}");
+    assert_eq!(body["title"], "TooManyResults", "{body}");
+    assert_eq!(
+        body["detail"],
+        antares_api::bounds::ANSWER_TOO_LARGE,
+        "{body}"
+    );
+    let req = Request::builder()
+        .uri(path)
+        .header("NGSILD-EntityMap", map)
+        .body(Body::empty())
+        .unwrap();
+    let res = antares_api::router(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "the recheck");
+}
+
 /// The walks above against a store that really pages: the memory arm answers
 /// every query with the whole match set, so it can only prove what was asked
 /// for, never what a chunked walk does with the answer. Skips without

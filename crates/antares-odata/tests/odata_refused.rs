@@ -34,12 +34,6 @@ const SCHEMA: &str = r#"{
 type Headers = &'static [(&'static str, &'static str)];
 
 const ROWS: &[(&str, &str, &str, Headers)] = &[
-    (
-        "odata_apply",
-        "GET",
-        "Car?$apply=aggregate(speed%20with%20sum%20as%20s)",
-        &[],
-    ),
     ("odata_index", "GET", "Car?$index=1", &[]),
     ("odata_schemaversion", "GET", "Car?$schemaversion=2", &[]),
     (

@@ -7,7 +7,7 @@ mod service;
 use odata_url::{
     parse, ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath, Expr, Format,
     Geography, Key, KeyValue, Levels, Limits, Literal, MemberPath, Method, ODataUri, OrderBy,
-    Position, QueryOptions, Search, Segment, SelectItem, Shape,
+    PartitionBy, Position, QueryOptions, Search, Segment, SelectItem, Shape, Transformation,
 };
 use proptest::prelude::*;
 use service::Service;
@@ -285,12 +285,30 @@ mod strategy {
     }
 
     pub(crate) fn options() -> BoxedStrategy<QueryOptions> {
-        let orderby = prop::collection::vec((member(), any::<bool>()), 1..4).prop_map(|items| {
-            items
-                .into_iter()
-                .map(|(expr, descending)| OrderBy { expr, descending })
-                .collect()
-        });
+        let orderby = prop::collection::vec((member(), any::<bool>()), 1..4)
+            .prop_map(|items| {
+                items
+                    .into_iter()
+                    .map(|(expr, descending)| OrderBy { expr, descending })
+                    .collect()
+            })
+            .boxed();
+        // the transformations that keep the entities, so the other options' names resolve
+        let step = prop_oneof![
+            Just(Transformation::Identity),
+            expr().prop_map(Transformation::Filter),
+            orderby.clone().prop_map(Transformation::OrderBy),
+            any::<u64>().prop_map(Transformation::Top),
+            any::<u64>().prop_map(Transformation::Skip),
+            (expr(), expr(), any::<bool>(), 0..3u8).prop_map(|(n, expr, top, by)| {
+                let by = match by {
+                    0 => PartitionBy::Count,
+                    1 => PartitionBy::Sum,
+                    _ => PartitionBy::Percent,
+                };
+                Transformation::Partition { by, top, n, expr }
+            }),
+        ];
         let system = (
             prop::option::of(expr()),
             prop::option::of(select()),
@@ -309,12 +327,13 @@ mod strategy {
             prop::collection::vec(("[a-z]{1,4}", literal()), 0..3),
             prop::collection::vec(custom(), 0..3),
             prop::collection::vec(expr(), 0..3),
+            prop::option::of(prop::collection::vec(step, 1..4)),
         );
         (system, rest)
             .prop_map(
                 |(
                     (filter, select, expand, orderby, top, skip, count, format),
-                    (skiptoken, schemaversion, id, search, aliases, custom, computed),
+                    (skiptoken, schemaversion, id, search, aliases, custom, computed, apply),
                 )| {
                     let compute = (!computed.is_empty()).then(|| {
                         computed
@@ -330,6 +349,7 @@ mod strategy {
                         filter,
                         search,
                         compute,
+                        apply,
                         select,
                         expand,
                         orderby,
