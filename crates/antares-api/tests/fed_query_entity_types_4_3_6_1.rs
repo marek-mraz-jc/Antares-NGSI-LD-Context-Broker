@@ -48,37 +48,41 @@ async fn call(st: &AppState, req: Request<Body>) -> (StatusCode, Value) {
     )
 }
 
-/// The ids a `type=OffStreetParking,Vehicle` query returns when its only
-/// data comes from one source, registered with `information`, that answers
-/// with a Vehicle and an OffStreetParking.
-async fn ids_through(information: Value) -> Vec<String> {
+/// What a `type=OffStreetParking,Vehicle` query returns when its only data
+/// comes from one source, registered once per element of `registrations`
+/// (each an `information` array), that answers with a Vehicle and an
+/// OffStreetParking carrying `speed` and `totalSpotsNumber`.
+async fn query_through(registrations: &[Value]) -> Value {
     antares_jsonld::allow_private_egress(true);
     let port = source(
         r#"[{"id":"urn:ngsi-ld:Vehicle:1","type":"Vehicle","speed":{"type":"Property","value":1}},
-            {"id":"urn:ngsi-ld:OffStreetParking:1","type":"OffStreetParking","speed":{"type":"Property","value":2}}]"#,
+            {"id":"urn:ngsi-ld:OffStreetParking:1","type":"OffStreetParking","speed":{"type":"Property","value":2},
+             "totalSpotsNumber":{"type":"Property","value":3}}]"#,
     );
     let st = AppState::new("antares-fed-types".into());
-    let reg = json!({
-        "id": "urn:ngsi-ld:ContextSourceRegistration:src",
-        "type": "ContextSourceRegistration",
-        "mode": "inclusive",
-        "operations": ["federationOps"],
-        "information": information,
-        "endpoint": format!("http://127.0.0.1:{port}"),
-    })
-    .to_string();
-    let (status, _) = call(
-        &st,
-        Request::builder()
-            .method("POST")
-            .uri("/ngsi-ld/v1/csourceRegistrations")
-            .header("Content-Type", "application/json")
-            .header("Content-Length", reg.len())
-            .body(Body::from(reg))
-            .expect("request"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
+    for (n, information) in registrations.iter().enumerate() {
+        let reg = json!({
+            "id": format!("urn:ngsi-ld:ContextSourceRegistration:src{n}"),
+            "type": "ContextSourceRegistration",
+            "mode": "inclusive",
+            "operations": ["federationOps"],
+            "information": information,
+            "endpoint": format!("http://127.0.0.1:{port}"),
+        })
+        .to_string();
+        let (status, _) = call(
+            &st,
+            Request::builder()
+                .method("POST")
+                .uri("/ngsi-ld/v1/csourceRegistrations")
+                .header("Content-Type", "application/json")
+                .header("Content-Length", reg.len())
+                .body(Body::from(reg))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
 
     let (status, body) = call(
         &st,
@@ -90,6 +94,11 @@ async fn ids_through(information: Value) -> Vec<String> {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+async fn ids_through(information: Value) -> Vec<String> {
+    let body = query_through(&[information]).await;
     let mut ids: Vec<String> = body
         .as_array()
         .expect("array")
@@ -119,4 +128,24 @@ async fn an_info_without_entities_admits_every_type() {
         ids,
         ["urn:ngsi-ld:OffStreetParking:1", "urn:ngsi-ld:Vehicle:1"]
     );
+}
+
+/// ETSI IOP_003_02_02: one source registered twice, (OffStreetParking ×
+/// totalSpotsNumber) and (Vehicle × all). Its OffStreetParking contributes
+/// totalSpotsNumber only; its `speed` belongs to no registration.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_registrations_of_one_source_do_not_cross_their_scopes() {
+    let body = query_through(&[
+        json!([{"entities": [{"type": "OffStreetParking"}], "propertyNames": ["totalSpotsNumber"]}]),
+        json!([{"entities": [{"type": "Vehicle"}]}]),
+    ])
+    .await;
+    let parking = body
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|e| e["id"] == "urn:ngsi-ld:OffStreetParking:1")
+        .unwrap_or_else(|| panic!("{body}"));
+    assert!(parking.get("totalSpotsNumber").is_some(), "{body}");
+    assert!(parking.get("speed").is_none(), "{body}");
 }
