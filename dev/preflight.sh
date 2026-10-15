@@ -63,6 +63,8 @@ self_test() {
   # with --log as the train runs it: the final wait must not wait for its tee
   probe clean "" "--log $tmp/clean.log" ""
   grep -q '^preflight: [0-9]* steps' "$tmp/clean.log" || { echo "FAIL clean: --log holds no verdict"; bad=1; }
+  # a lane killed mid-step: that step and the lane read red, the run still ends with a verdict
+  PREFLIGHT_DIE_AT=vanilla-symbols probe dead-lane "vanilla-symbols|lane debug_lane" --no-coverage ""
   probe fmt fmt --no-coverage "sed -i '0,/^use /s//use  /' $lib"
   probe unused-dependency machete --no-coverage \
     "sed -i '/^axum = /a uuid = { version = \"1\", default-features = false }' crates/odata-axum/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
@@ -105,17 +107,21 @@ if ((selftest)); then
 fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/preflight.XXXXXX")
-mkdir -p "$work/res"
+mkdir -p "$work/res" "$work/done"
 start=$SECONDS
 
 # step <key> <name> <command...>: run, time, write one line to res/<key>; on
 # FAIL the tail too. The steps run side by side (T-4032), and the keys sort in
 # the serial order, so the report reads as it always did, each tail under its
-# own FAIL line.
+# own FAIL line. The FAIL goes in first and the verdict overwrites it, so a
+# step whose lane is killed under it reads red, never as a missing line.
 step() {
   local key=$1 name=$2 at=$SECONDS out
   shift 2
   out="$work/$key-${name//[^A-Za-z0-9_.-]/_}.txt"
+  { echo "FAIL $name 0s"; echo "    did not finish: its lane ended before the verdict"; } > "$work/res/$key"
+  # the self-test's lane that dies mid-step
+  [[ ${PREFLIGHT_DIE_AT:-} == "$name" ]] && kill -KILL "$BASHPID"
   if "$@" > "$out" 2>&1 < /dev/null; then
     echo "PASS $name $((SECONDS - at))s" > "$work/res/$key"
   else
@@ -127,10 +133,13 @@ step() {
 # so a small worker builds one thing at once as before, else one per 3 jobs, at
 # most 3. Each lane builds in a profile or target directory of its own (debug,
 # release, llvm-cov, fuzz), so no lane waits on another's lock. The steps
-# without a build run beside them unbounded.
+# without a build run beside them unbounded. Each cargo lane gets its share of
+# the jobs, never all of them: on a shared host the limit is memory during
+# linking, and three lanes of full CARGO_BUILD_JOBS link three times at once.
 total=${CARGO_BUILD_JOBS:-$(nproc)}
 slots=$((total < 6 ? 1 : total / 3 < 3 ? total / 3 : 3))
-lanes=()
+share=$((total / slots > 1 ? total / slots : 1))
+lanes=() lane_of=()
 lane() { # <function> [args...]
   local p live
   while :; do
@@ -139,9 +148,20 @@ lane() { # <function> [args...]
     ((${#live[@]} < slots)) && break
     wait -n "${live[@]}"
   done
-  bg "$@"
+  bg -j "$share" "$@"
 }
-bg() { "$@" & lanes+=($!); }
+# bg [-j JOBS] <function> [args...]: in the background; a lane that ends
+# before its last command (killed, out of memory, a shell error) leaves no
+# done marker and reads red below
+bg() {
+  if [[ $1 == -j ]]; then
+    { export CARGO_BUILD_JOBS=$2; shift 2; "$@"; touch "$work/done/$BASHPID"; } &
+  else
+    { "$@"; touch "$work/done/$BASHPID"; } &
+  fi
+  lanes+=($!)
+  lane_of[$!]=$([[ $1 == -j ]] && shift 2; [[ $1 == step ]] && echo "$3" || echo "$1")
+}
 
 mb=$(git merge-base "$base" HEAD) || { echo "preflight: no merge base with $base" >&2; exit 2; }
 changed=$({ git diff --name-only "$mb"; git ls-files --others --exclude-standard; } | sort -u)
@@ -301,6 +321,12 @@ bg step 15 env-docs dev/check-env-docs.sh
 # Our own pids only: a bare `wait` also waits for the `tee` behind --log
 # (bash 5.1+), which never exits while this shell holds its stdout.
 wait "${lanes[@]}"
+k=0
+for p in "${lanes[@]}"; do
+  [[ -e $work/done/$p ]] && continue
+  k=$((k + 1))
+  { echo "FAIL lane ${lane_of[$p]} 0s"; echo "    the lane ended before its last step: a step it never reached has no line"; } > "$work/res/99-$(printf %02d "$k")"
+done
 
 cat "$work"/res/*
 steps=$(cat "$work"/res/* | grep -c '^\(PASS\|FAIL\) ')
