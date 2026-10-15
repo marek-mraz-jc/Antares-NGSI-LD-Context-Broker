@@ -276,6 +276,22 @@ lines = 21
 branches = 0
 reason = "2 lines: the grant store failing, which the built-in store under test_kit does not (module rule M2). 19 lines: the four tracing::info!/warn! of a forward made or not made repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/icsr_log.rs and icsr_gate.rs cover the subscriber path and assert what they log"
 
+[[exclusion]]
+crate = "antares-icsr"
+file = "src/lib.rs"
+function = "Internal::deliver"
+lines = 10
+branches = 1
+reason = "8 lines: the two tracing::info! of the notification and its refusal repeat their fields in the `log` fallback, which runs only with no subscriber set; tests/icsr_notify.rs covers the subscriber path and asserts both lines. 2 lines, 1 branch: the grant store failing, which the built-in store under test_kit cannot be made to do"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/lib.rs"
+function = "Ops::notify_in_process"
+lines = 2
+branches = 1
+reason = "1 line, 1 branch: the depth bound is reached only inside a chain of MAX_IN_PROCESS_CALL_DEPTH in-process calls, whose task-local depth no test outside antares-api can set; tests/icsr_depth.rs covers the same bound for forwards. 1 line: the request builder fails only on an invalid URI or header, and the path is the transport's constant and the headers are fixed"
+
 # antares-ql (role ngsild, T-3911/T-3912)
 
 [[exclusion]]

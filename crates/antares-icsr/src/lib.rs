@@ -17,6 +17,11 @@
 //!   the depth bound (508 or 504, never HTTP), the response caps. A refusal
 //!   reaches the merge as 403, which it reports as code 299 with no text of
 //!   the target's (C10).
+//! - The notifications of a 5.8.1.4 Subscription copy whose endpoint is the
+//!   receiver path under a self URL (rule 7) are posted to that path through
+//!   the router, with no subject, after the copy's Tenant's grant for the
+//!   receiving Tenant is read again (C7). The receiving Tenant is the one
+//!   the inbound index maps the copy's `subscriptionId` to.
 //!
 //! ```
 //! # async fn demo() -> Result<(), String> {
@@ -33,8 +38,8 @@ mod grant;
 mod self_url;
 
 use antares_ops::{
-    AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport, OperationId, Ops,
-    TenantId,
+    AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport, NotifyFuture,
+    OperationId, Ops, TenantId,
 };
 use std::sync::Arc;
 
@@ -53,6 +58,10 @@ pub fn transport(selfs: SelfUrls) -> impl FnOnce(Ops) -> Arc<dyn ForwardTranspor
         Arc::new(Internal { ops, selfs })
     }
 }
+
+/// Where a 5.8.1.4 Subscription copy sends its notifications under this
+/// broker's public URL (ADR-0019).
+const RECEIVER: &str = "/ex/v1/remote-notify";
 
 /// The transport: serves the forwards whose target is a self URL.
 struct Internal {
@@ -91,6 +100,22 @@ impl ForwardTransport for Internal {
             }
         })
     }
+
+    fn notifies(&self, uri: &str) -> bool {
+        let Some(base) = self.selfs.matching(uri) else {
+            return false;
+        };
+        url::Url::parse(uri).is_ok_and(|u| String::from(u).strip_prefix(base) == Some(RECEIVER))
+    }
+
+    fn notify<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        _uri: &'a str,
+        notification: &'a serde_json::Value,
+    ) -> NotifyFuture<'a> {
+        Box::pin(self.deliver(tenant.as_str(), notification))
+    }
 }
 
 /// The refusal of a forward: 403, which the merge reports as code 299 and
@@ -98,6 +123,43 @@ impl ForwardTransport for Internal {
 const REFUSED: ForwardAnswer = (403, serde_json::Value::Null, Vec::new());
 
 impl Internal {
+    /// Deliver `notification` of a copy in Tenant `target` to the Tenant
+    /// that receives it, if `target` still grants that Tenant its data.
+    async fn deliver(&self, target: &str, notification: &serde_json::Value) -> Result<(), String> {
+        let copy = notification
+            .get("subscriptionId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("a notification without subscriptionId")?;
+        let source = self
+            .ops
+            .notification_receiver(copy)
+            .await
+            .ok_or("no distributed Subscription receives this notification")?;
+        match held(&self.ops, target, &source).await {
+            Ok(Some(g)) if g.allows(false) => {}
+            Ok(_) => {
+                tracing::info!(
+                    subscription = copy,
+                    source_tenant = source.as_str(),
+                    target_tenant = target,
+                    "an internal notification without a grant for it is not delivered"
+                );
+                return Err("no export grant".into());
+            }
+            Err(e) => {
+                tracing::error!(error = e.as_str(), "export grants: the store failed");
+                return Err("the export grant could not be read".into());
+            }
+        }
+        tracing::info!(
+            subscription = copy,
+            source_tenant = source.as_str(),
+            target_tenant = target,
+            "internal notification"
+        );
+        self.ops.notify_in_process(RECEIVER, notification).await
+    }
+
     /// Serve `req`, whose target `url` lies under `self_url`, in process if
     /// the target Tenant's grant allows it.
     async fn serve(&self, req: BuiltForward<'_>, url: String, self_url: &str) -> ForwardAnswer {

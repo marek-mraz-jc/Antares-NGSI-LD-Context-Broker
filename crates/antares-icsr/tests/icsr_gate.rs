@@ -73,7 +73,7 @@ fn seen_in(e: &Engine, tenant: &str) -> Vec<String> {
 /// Seeds `b` and `a`, the grant and the registration, as `admin` (allowed
 /// everywhere).
 async fn seeded(e: &Arc<Engine>) -> axum::Router {
-    let (_b, app) = broker(Some(e.clone() as Arc<dyn PolicyEngine>)).await;
+    let (_b, app) = broker(Some(e.clone() as Arc<dyn PolicyEngine>), Vec::new()).await;
     for tenant in ["a", "b"] {
         let doc = json!({"id": format!("urn:ngsi-ld:Car:{tenant}-1"), "type": "Car",
                          "speed": {"type": "Property", "value": 1}});
@@ -189,7 +189,7 @@ async fn icsr_a_target_error_reaches_the_source_without_its_detail() {
 /// the Tenant the request ran in.
 #[tokio::test]
 async fn icsr_without_tenant_targets_the_default_tenant() {
-    let (_b, app) = broker(None).await;
+    let (_b, app) = broker(None, Vec::new()).await;
     car(&app, "default", 1).await;
     car(&app, "a", 1).await;
     grant(&app, "default", "a", json!({})).await;

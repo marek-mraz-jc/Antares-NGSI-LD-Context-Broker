@@ -155,6 +155,17 @@ async fn inbound_get(st: &AppState, remote_id: &str) -> Option<(String, String)>
     ))
 }
 
+impl AppState {
+    /// The Tenant whose distributed Subscription receives the notifications
+    /// of the copy `subscription_id` (5.8.1.4), read from this broker's own
+    /// inbound index, never from the notification.
+    pub async fn notification_receiver(&self, subscription_id: &str) -> Option<String> {
+        inbound_get(self, subscription_id)
+            .await
+            .map(|(tenant, _)| tenant)
+    }
+}
+
 async fn inbound_delete(st: &AppState, remote_id: &str) {
     if let Some(idx) = ds_index_tenant() {
         let _ = st.store.delete(&idx, Kind::DistSub, remote_id).await;
