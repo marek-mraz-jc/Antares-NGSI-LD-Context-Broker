@@ -4207,3 +4207,90 @@ mod edges {
         assert!(parse_datetime("2020-01-01T00:00:00Z"));
     }
 }
+
+#[cfg(test)]
+mod null_member_tests {
+    use super::*;
+    use serde_json::json;
+
+    const SPEED: &str = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+
+    /// 5.5.12, 10.2.5.4: what removes a member from the patched instance.
+    #[test]
+    fn removes_member_is_null_the_ngsi_null_or_only_deletion_instances() {
+        assert!(removes_member(&Value::Null));
+        assert!(removes_member(&json!("urn:ngsi-ld:null")));
+        assert!(removes_member(&json!([
+            {"type": "Relationship", "object": "urn:ngsi-ld:null"},
+            "urn:ngsi-ld:null"
+        ])));
+        // an empty list deletes nothing, one live instance keeps the member
+        assert!(!removes_member(&json!([])));
+        assert!(!removes_member(&json!([
+            {"type": "Property", "value": "urn:ngsi-ld:null"},
+            {"type": "Property", "value": 1}
+        ])));
+        assert!(!removes_member(&json!({"type": "Property", "value": 1})));
+        assert!(!removes_member(&json!("urn:ngsi-ld:Thing:1")));
+    }
+
+    /// 10.2.5.4 / 10.2.9.4: observedAt and expiresAt set to the Null are kept as the deletion
+    /// marker in a partial update or merge input, and stay invalid DateTimes on create.
+    #[test]
+    fn observed_at_and_expires_at_null_only_in_null_allowing_inputs() {
+        let ctx = crate::core_context();
+        let doc = json!({"id": "urn:x", "type": "T",
+            "speed": {"type": "Property", "value": 1,
+                      "observedAt": "urn:ngsi-ld:null", "expiresAt": "urn:ngsi-ld:null"}});
+        let doc = doc.as_object().unwrap();
+        assert!(
+            expand_entity(doc, &ctx, ExpandOpts::default()).is_err(),
+            "create refuses the Null"
+        );
+        for opts in [
+            ExpandOpts {
+                fragment: true,
+                allow_null: true,
+                ..Default::default()
+            },
+            ExpandOpts {
+                fragment: true,
+                merge: true,
+                ..Default::default()
+            },
+        ] {
+            let out = expand_entity(doc, &ctx, opts).expect("the Null is a deletion marker here");
+            assert_eq!(out[SPEED][0]["observedAt"], "urn:ngsi-ld:null", "{opts:?}");
+            assert_eq!(out[SPEED][0]["expiresAt"], "urn:ngsi-ld:null", "{opts:?}");
+        }
+        // a real DateTime passes through, anything else is still refused under allow_null
+        let opts = ExpandOpts {
+            fragment: true,
+            allow_null: true,
+            ..Default::default()
+        };
+        let ok = json!({"speed": {"type": "Property", "value": 1, "observedAt": "2026-10-15T00:00:00Z"}});
+        let out = expand_entity(ok.as_object().unwrap(), &ctx, opts).expect("DateTime accepted");
+        assert_eq!(out[SPEED][0]["observedAt"], "2026-10-15T00:00:00Z");
+        for k in ["observedAt", "expiresAt"] {
+            let bad = json!({"speed": {"type": "Property", "value": 1, k: "urn:ngsi-ld:Thing:1"}});
+            assert!(
+                expand_entity(bad.as_object().unwrap(), &ctx, opts).is_err(),
+                "{k}"
+            );
+        }
+    }
+
+    /// 10.2.5.4 on the attribute path (5.6.4): the Null is kept for the patch to remove.
+    #[test]
+    fn attr_fragment_keeps_a_null_observed_at_and_expires_at() {
+        let ctx = crate::core_context();
+        let frag = json!({"type": "Property", "value": 1,
+            "observedAt": "urn:ngsi-ld:null", "expiresAt": "urn:ngsi-ld:null"});
+        let out = expand_attr_fragment(frag.as_object().unwrap(), &ctx).expect("Null accepted");
+        assert_eq!(out["observedAt"], "urn:ngsi-ld:null");
+        assert_eq!(out["expiresAt"], "urn:ngsi-ld:null");
+        let bad = json!({"type": "Property", "value": 1, "observedAt": "not a date"});
+        assert!(expand_attr_fragment(bad.as_object().unwrap(), &ctx).is_err());
+    }
+}
