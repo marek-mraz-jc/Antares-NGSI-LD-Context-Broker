@@ -79,6 +79,8 @@ class Adapter(unittest.TestCase):
         self.assertEqual(env["ANTARES_PUBLIC_URL"], "http://localhost:1027")
         self.assertEqual(env["ANTARES_DATA_DIR"], f"{self.d}/data/CP1")
         self.assertNotIn("ANTARES_DATABASE_URL", env)
+        # the broker refuses unknown ANTARES_* keys; ANTARES_TEST_* is reserved, this is not
+        self.assertNotIn("ANTARES_BIN", env)
 
     def test_a_coraine_only_flag_refuses_to_start(self):
         r = self.sh("coraineStart --apiPlugins admin")

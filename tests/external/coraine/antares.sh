@@ -86,7 +86,8 @@ coraineStart() {
       ;;
   esac
 
-  env "${env[@]}" "$ANTARES_BIN" > "/tmp/coraine.${role}.log" 2>&1 &
+  # the broker refuses an unknown ANTARES_* key; ANTARES_BIN is the harness's, not its (run 38806308784)
+  env -u ANTARES_BIN "${env[@]}" "$ANTARES_BIN" > "/tmp/coraine.${role}.log" 2>&1 &
   echo $! > "$COR_ROLE_PID_FILE"
   corAwaitPort "$COR_ROLE_PORT" 30
 }
