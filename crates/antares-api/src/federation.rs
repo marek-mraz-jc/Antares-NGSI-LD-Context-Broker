@@ -131,6 +131,11 @@ impl FedReg {
                 }
             }
         }
+        self.covers_types(obj, ctx)
+    }
+    /// The type half of `covers_item`: does the item's `type` name one of the
+    /// registration's EntityInfo types? No type to check ⇒ covered.
+    pub fn covers_types(&self, obj: &Map<String, Value>, ctx: &Context) -> bool {
         if !self.ent_types.is_empty() {
             let types: Vec<String> = match obj.get("type") {
                 Some(Value::String(t)) => vec![ctx.expand_key(t)],
@@ -570,6 +575,9 @@ pub async fn matching_regs(
             let mut ent_types = Vec::new();
             let mut ent_patterns = Vec::new();
             let mut ent_unrestricted = false;
+            // an info that names no type admits every type; ent_types empty
+            // is how every reader of it spells "no type restriction"
+            let mut any_type = false;
             for info in &infos {
                 // TS 104 175 9.4.2: attributeNames, else the deprecated pair
                 match antares_model::registration_attribute_names(info) {
@@ -598,13 +606,17 @@ pub async fn matching_regs(
                             Some(Value::String(t)) => ent_types.push(t.clone()),
                             Some(Value::Array(ts)) => ent_types
                                 .extend(ts.iter().filter_map(Value::as_str).map(str::to_owned)),
-                            _ => {}
+                            _ => any_type = true,
                         }
                     }
                 } else {
                     // an attributes-only RegistrationInfo imposes no id scope
                     ent_unrestricted = true;
+                    any_type = true;
                 }
+            }
+            if any_type {
+                ent_types.clear();
             }
             let tenant = doc.get("tenant").and_then(Value::as_str).map(str::to_owned);
             let csi = csi_of(doc);
@@ -699,7 +711,11 @@ fn merge_same_source(regs: Vec<FedReg>) -> Vec<FedReg> {
             _ => None,
         };
         o.ent_ids.extend(r.ent_ids);
-        o.ent_types.extend(r.ent_types);
+        if o.ent_types.is_empty() || r.ent_types.is_empty() {
+            o.ent_types.clear(); // either side admits every type
+        } else {
+            o.ent_types.extend(r.ent_types);
+        }
         o.ent_patterns.extend(r.ent_patterns);
         o.ent_unrestricted |= r.ent_unrestricted;
     }
@@ -2349,9 +2365,12 @@ pub async fn fed_query(
         if let Value::Array(a) = &body {
             // Scope gate — see admits_import.
             for c in a.iter().filter(|c| {
-                c.get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|i| admits_import(&reg, &spec, i))
+                // 4.3.6.1: a type outside the registration's EntityInfo is
+                // not this source's data, whatever the client asked for
+                c.as_object().is_some_and(|o| reg.covers_types(o, ctx))
+                    && c.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|i| admits_import(&reg, &spec, i))
             }) {
                 match import_entity(c, &reg, ctx) {
                     Some(doc) => out.push((reg.mode == "auxiliary", doc)),
@@ -2617,9 +2636,12 @@ pub async fn fed_query_temporal(
         if let Value::Array(a) = &body {
             // Same scope gate as the non-temporal query fan-out.
             for c in a.iter().filter(|c| {
-                c.get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|i| admits_import(&reg, &spec, i))
+                // 4.3.6.1: a type outside the registration's EntityInfo is
+                // not this source's data, whatever the client asked for
+                c.as_object().is_some_and(|o| reg.covers_types(o, ctx))
+                    && c.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|i| admits_import(&reg, &spec, i))
             }) {
                 match import_temporal(c, &reg, ctx) {
                     Some(doc) => out.push((reg.mode == "auxiliary", doc)),
@@ -4253,6 +4275,7 @@ mod same_source_merge {
         ]);
         assert_eq!(merged.len(), 1);
         assert!(merged[0].attrs.is_none());
+        assert!(merged[0].ent_types.is_empty(), "and to every type");
 
         let mut other_mode = reg("urn:r:2", "http://a", None, &[]);
         other_mode.mode = "exclusive".into();
