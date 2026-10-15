@@ -382,6 +382,25 @@ mod tests {
         assert!(!g.matches_geometry(&geoval("Point", json!([10.0, 60.001]))));
     }
 
+    /// A self-intersecting (bow-tie) query ring is evaluated, not refused: ETSI `019_11_06`
+    /// queries `within` such a polygon and expects its match (T-3912). Every area relation answers
+    /// without a panic, and a point inside one lobe is `within` it.
+    #[test]
+    fn an_area_relation_evaluates_a_self_intersecting_ring() {
+        let ring = "[[[0,0],[2,2],[2,0],[0,2],[0,0]]]";
+        let inside = geoval("Point", json!([1.8, 1.0]));
+        for rel in [
+            "contains",
+            "intersects",
+            "overlaps",
+            "disjoint",
+            "near;maxDistance==10",
+        ] {
+            let _ = q(rel, "Polygon", ring).matches_geometry(&inside);
+        }
+        assert!(q("within", "Polygon", ring).matches_geometry(&inside));
+    }
+
     /// equals: a literally identical geometry is equal even where DE-9IM is
     /// undefined, as for a self-intersecting (bow-tie) ring.
     #[test]
@@ -929,5 +948,82 @@ mod clause_4_10_grammar {
             let params = HashMap::from([(k.to_owned(), "Point".to_owned())]);
             assert!(GeoQuery::from_params(&params).is_err(), "{k}");
         }
+    }
+}
+
+/// Every refusal of `from_params` once, and a `geoproperty` other than `location` (T-3912).
+#[cfg(test)]
+mod edges {
+    use super::*;
+
+    fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn each_refusal_names_what_is_wrong() {
+        let point = [("geometry", "Point"), ("coordinates", "[1,2]")];
+        for (georel, extra, said) in [
+            ("near;maxDistance==far", &point[..], "invalid maxDistance"),
+            ("near;radius==1", &point[..], "invalid georel modifier"),
+            (
+                "near;minDistance==1;maxDistance==2",
+                &point[..],
+                "a single distance modifier",
+            ),
+            ("near", &point[..], "near requires"),
+            ("within", &[][..], "requires geometry"),
+            (
+                "within",
+                &[("geometry", "Circle"), ("coordinates", "[1,2]")][..],
+                "invalid geometry",
+            ),
+            (
+                "within",
+                &[("geometry", "Point")][..],
+                "requires coordinates",
+            ),
+            (
+                "within",
+                &[("geometry", "Point"), ("coordinates", "[1,")][..],
+                "invalid coordinates",
+            ),
+            (
+                "within",
+                &[("geometry", "Point"), ("coordinates", "{}")][..],
+                "must be a JSON array",
+            ),
+        ] {
+            let mut p = params(extra);
+            p.insert("georel".into(), georel.into());
+            let err = GeoQuery::from_params(&p)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(err.contains(said), "{georel} {extra:?}: {err}");
+        }
+        assert_eq!(count_positions(&serde_json::json!("x")), 0);
+    }
+
+    #[test]
+    fn a_named_geoproperty_is_the_one_read() {
+        let gq = GeoQuery::from_params(&params(&[
+            ("georel", "near;maxDistance==10"),
+            ("geometry", "Point"),
+            ("coordinates", "[1,2]"),
+            ("geoproperty", "position"),
+        ]))
+        .expect("valid")
+        .expect("a query");
+        let ctx = crate::test_core();
+        let at = |key: &str| {
+            serde_json::json!({ ctx.expand_key(key): [{"type": "GeoProperty",
+                "value": {"type": "Point", "coordinates": [1.0, 2.0]}}] })
+        };
+        assert!(gq.matches(&at("position"), &ctx));
+        assert!(!gq.matches(&at("location"), &ctx));
     }
 }

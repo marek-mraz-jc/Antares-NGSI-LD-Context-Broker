@@ -1,5 +1,12 @@
 {
+ "etsi-restricted": {
+  "TP/NGSI-LD/ContextInformation/Provision/TransientEntities/422_01.robot::422_01_06 Expired Entities And Attributes Are Gone": "T-3982: Buildings read as 404 through view etsi-restricted after the expiry where the root answers 200; owed by ADR-0023 rule 2 or a view bug (found by etsi-full-restricted run 38194367026)",
+  "TP/NGSI-LD/ContextInformation/Subscription/SubscriptionNotificationBehaviour/046_21_02.robot::046_21_02 Check That A Notification Is Sent With Matching Entity": "T-3944: a subscription's setup answers 409 through view etsi-restricted where the root creates it (found by etsi-full-restricted run 38194367026)",
+  "TP/NGSI-LD/ContextInformation/Subscription/SubscriptionNotificationBehaviour/046_22_01.robot::046_22_01 Check That A Notification Is Sent With Matching Entity": "T-3944: a subscription's setup answers 409 through view etsi-restricted where the root creates it (found by etsi-full-restricted run 38194367026)",
+  "TP/NGSI-LD/DistributedOperations/Provision/Entities/PurgeEntities/D017_01_red.robot::D017_01_red Purge Entities On The Context Source": "T-3945: distributed operations (forwarding, loop detection, registrations) answer differently through a view than at the root (view all and etsi-restricted; found by etsi-full-restricted run 38194367026)"
+ },
  "all": {
-  "TP/NGSI-LD/ContextInformation/Consumption/Entity/RetrieveEntity/454_01.robot::454_01 Simplified Representation Per Attribute Type": "T-3786: a Relationship to an absent Entity is refused through a view that shows every Entity"
+  "TP/NGSI-LD/DistributedOperations/Provision/BatchEntities/CreateBatchOfEntities/D012_01_red.robot::D012_01_red Batch Create Entities With Redirect Registration": "T-3945: distributed operations (forwarding, loop detection, registrations) answer differently through view all than at the root (found by the first etsi-full-all run, 38182955554)",
+  "TP/NGSI-LD/DistributedOperations/Provision/Entities/PurgeEntities/D017_01_red.robot::D017_01_red Purge Entities On The Context Source": "T-3945: distributed operations (forwarding, loop detection, registrations) answer differently through view all than at the root (found by the first etsi-full-all run, 38182955554)"
  }
 }

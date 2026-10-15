@@ -196,7 +196,7 @@ async fn a_query_body_joins_the_url_options_and_is_bounded() {
         ("application/json", "{}", StatusCode::UNSUPPORTED_MEDIA_TYPE),
         ("text/plain", "$filter=speed gt 1", StatusCode::BAD_REQUEST),
         ("text/plain", "$top=1&$top=2", StatusCode::BAD_REQUEST),
-        ("text/plain", "$search=fast", StatusCode::NOT_IMPLEMENTED),
+        ("text/plain", "$index=1", StatusCode::NOT_IMPLEMENTED),
     ] {
         let (status, body) = send(
             &app,

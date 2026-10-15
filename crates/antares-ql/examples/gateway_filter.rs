@@ -6,7 +6,7 @@
 //!
 //!     cargo run -p antares-ql --example gateway_filter -- 'speed>25|heading<90'
 
-use antares_ql::{parse_q, sql::compile_q, CmpOp, QNode, QPath, QValue};
+use ngsild_ql::{parse_q, sql::compile_q, CmpOp, QNode, QPath, QValue};
 
 fn main() {
     let incoming = std::env::args()

@@ -37,7 +37,11 @@ A request with at least one of these headers is a platform caller. One with
 whatever `x-jc-roles` and `x-jc-groups` say beside it, so only the Policies
 compiled from its agreement (assignee `did`) grant it anything. One with no
 `x-jc-subject`, no `x-jc-client` and no `x-jc-did` is anonymous and holds the
-role `public`, whatever `x-jc-roles` says beside it.
+role `public` and, of what `x-jc-roles` says beside it, only the Endpoint
+caller roles `endpoint:{project}/{name}` (AP-97): the gateway resolves that
+role for every caller a public Endpoint admits, the anonymous one included,
+and it names that one Endpoint only. Any other role and every group the
+anonymous caller claims is dropped.
 
 A request with none of them comes from inside the cluster (the Portal's
 registration sync, plan 5.2 M22; nothing else reaches the broker, the
@@ -161,6 +165,7 @@ surface.
 |---|---|
 | `GET access` | the caller's grants; the representation the `Accept` header names first, `application/json` otherwise (never 406) |
 | `POST access/check` | AuthZEN: `{"action": {"name": …}, "resource": {"type": …}}` → `{"decision": true, "context": {"reason": "policy_grant_matched", "assigner": …}}` or `{"decision": false}` |
+| `POST access/explain` | the same request and decision, with why: `context.reason` is `policy_grant_matched`, `prohibited` or `no_grant`, and `context.policy` (with its `assigner`) names the policy that decided, a refusal's too |
 
 | `Accept` | Representation |
 |---|---|
@@ -179,5 +184,15 @@ share with the lists. A policy without `information` shows the type `*`.
 What the caller holds and nothing else: only policies whose assignee is the
 caller and that are in force now; a type only somebody else may touch is
 absent, never listed as denied; a refusal of `access/check` names nothing
-(GW6). A request with no `x-jc-*` header is the cluster's own and holds no
+(GW6).
+
+`access/explain` is the platform's access simulator (EP-103, platform
+T-3881): the gateway asks it with the `x-jc-*` headers of the subject an
+administrator named, on its Portal-only `access/simulate` route, and passes
+the answer to the Portal. Its reader may read every policy, so a refusal
+names the prohibition that decided it. No gateway route forwards a caller's
+request to it, and the broker is reached through the gateway alone (the
+NetworkPolicy admits the gateway and the Portal), so a data caller never
+sees it. It decides exactly as `access/check` does: one function gives both
+their verdict. A request with no `x-jc-*` header is the cluster's own and holds no
 policy, so its document is empty.

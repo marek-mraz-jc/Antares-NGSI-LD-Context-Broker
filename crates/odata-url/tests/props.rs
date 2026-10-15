@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! AST → URL → AST (T-3503): every tree of the subset writes itself as a URL that parses back
-//! to the same tree, and that URL is its own canonical form.
+//! AST → URL → AST (T-3503, T-3749): every tree of the subset writes itself as a URL that parses
+//! back to the same tree, and that URL is its own canonical form.
 
 mod service;
 
 use odata_url::{
-    parse, CompareOp, ExpandItem, ExpandKind, ExpandPath, Expr, Format, Geography, Key, KeyValue,
-    Levels, Limits, Literal, MemberPath, Method, ODataUri, OrderBy, Position, QueryOptions,
-    Segment, SelectItem, Shape,
+    parse, ArithOp, CompareOp, Compute, ExpandItem, ExpandKind, ExpandPath, Expr, Format,
+    Geography, Key, KeyValue, Levels, Limits, Literal, MemberPath, Method, ODataUri, OrderBy,
+    PartitionBy, Position, QueryOptions, Search, Segment, SelectItem, Shape, Transformation,
 };
 use proptest::prelude::*;
 use service::Service;
@@ -114,12 +114,18 @@ mod strategy {
     }
 
     fn method() -> impl Strategy<Value = Method> {
-        prop_oneof![
-            Just(Method::Contains),
-            Just(Method::StartsWith),
-            Just(Method::EndsWith),
-            Just(Method::GeoIntersects),
-        ]
+        prop::sample::select(Method::all().collect::<Vec<_>>())
+    }
+
+    fn arith() -> impl Strategy<Value = ArithOp> {
+        prop::sample::select(vec![
+            ArithOp::Add,
+            ArithOp::Sub,
+            ArithOp::Mul,
+            ArithOp::Div,
+            ArithOp::DivBy,
+            ArithOp::Mod,
+        ])
     }
 
     fn lambda() -> impl Strategy<Value = Expr> {
@@ -134,12 +140,19 @@ mod strategy {
                 Box::new(Expr::Literal(Literal::Int(n))),
             )
         });
-        prop::option::of(body).prop_map(|body| Expr::Any {
-            collection: MemberPath {
-                variable: None,
-                path: vec!["rooms".into()],
+        let rooms = || MemberPath {
+            variable: None,
+            path: vec!["rooms".into()],
+        };
+        (prop::option::of(body), any::<bool>()).prop_map(move |(body, all)| match body {
+            Some(b) if all => Expr::All {
+                collection: rooms(),
+                lambda: ("r".to_owned(), Box::new(b)),
             },
-            lambda: body.map(|b| ("r".to_owned(), Box::new(b))),
+            body => Expr::Any {
+                collection: rooms(),
+                lambda: body.map(|b| ("r".to_owned(), Box::new(b))),
+            },
         })
     }
 
@@ -164,7 +177,16 @@ mod strategy {
                 inner.clone().prop_map(|e| Expr::Not(Box::new(e))),
                 (inner.clone(), prop::collection::vec(literal(), 0..4))
                     .prop_map(|(l, list)| Expr::In(Box::new(l), list)),
-                (method(), inner.clone(), inner).prop_map(|(m, a, b)| Expr::Call(m, vec![a, b])),
+                (method(), inner.clone(), inner.clone()).prop_map(|(m, a, b)| {
+                    let args = [a, b].into_iter().take(m.arity().0).collect();
+                    Expr::Call(m, args)
+                }),
+                (inner.clone(), arith(), inner.clone()).prop_map(|(l, op, r)| Expr::Arith(
+                    Box::new(l),
+                    op,
+                    Box::new(r)
+                )),
+                inner.prop_map(|e| Expr::Neg(Box::new(e))),
             ]
         })
         .boxed()
@@ -235,18 +257,58 @@ mod strategy {
         ]
     }
 
+    /// A `$search` tree: words with every character a word may hold, an operator's name
+    /// only as a phrase, phrases with spaces and quotes.
+    pub(crate) fn search() -> BoxedStrategy<Search> {
+        let word = "[a-zA-Z0-9é+&#%=!*,:@/?$~._-][a-zA-Z0-9é'+&#%=!*,:@/?$~._-]{0,6}"
+            .prop_filter("an operator's name", |w| {
+                !["AND", "OR", "NOT"].contains(&w.as_str())
+            })
+            .prop_map(Search::Word);
+        let phrase = "[a-z' ()&;+é]{0,5}[a-z]".prop_map(Search::Phrase);
+        prop_oneof![word, phrase]
+            .boxed()
+            .prop_recursive(4, 16, 2, |inner| {
+                prop_oneof![
+                    inner.clone().prop_map(|s| Search::Not(Box::new(s))),
+                    (inner.clone(), inner.clone())
+                        .prop_map(|(a, b)| Search::And(Box::new(a), Box::new(b))),
+                    (inner.clone(), inner).prop_map(|(a, b)| Search::Or(Box::new(a), Box::new(b))),
+                ]
+            })
+            .boxed()
+    }
+
     /// The name of a custom option: never a system option's, with or without `$`.
     fn custom() -> impl Strategy<Value = (String, Option<String>)> {
         ("x-[a-z]{1,6}", prop::option::of("[a-z0-9.~-]{0,8}"))
     }
 
     pub(crate) fn options() -> BoxedStrategy<QueryOptions> {
-        let orderby = prop::collection::vec((member(), any::<bool>()), 1..4).prop_map(|items| {
-            items
-                .into_iter()
-                .map(|(expr, descending)| OrderBy { expr, descending })
-                .collect()
-        });
+        let orderby = prop::collection::vec((member(), any::<bool>()), 1..4)
+            .prop_map(|items| {
+                items
+                    .into_iter()
+                    .map(|(expr, descending)| OrderBy { expr, descending })
+                    .collect()
+            })
+            .boxed();
+        // the transformations that keep the entities, so the other options' names resolve
+        let step = prop_oneof![
+            Just(Transformation::Identity),
+            expr().prop_map(Transformation::Filter),
+            orderby.clone().prop_map(Transformation::OrderBy),
+            any::<u64>().prop_map(Transformation::Top),
+            any::<u64>().prop_map(Transformation::Skip),
+            (expr(), expr(), any::<bool>(), 0..3u8).prop_map(|(n, expr, top, by)| {
+                let by = match by {
+                    0 => PartitionBy::Count,
+                    1 => PartitionBy::Sum,
+                    _ => PartitionBy::Percent,
+                };
+                Transformation::Partition { by, top, n, expr }
+            }),
+        ];
         let system = (
             prop::option::of(expr()),
             prop::option::of(select()),
@@ -261,17 +323,33 @@ mod strategy {
             prop::option::of("[a-zA-Z0-9]{1,8}"),
             prop::option::of(prop_oneof![Just("*".to_owned()), "[a-z0-9.]{1,6}"]),
             prop::option::of("[a-z]{1,8}"),
+            prop::option::of(search()),
             prop::collection::vec(("[a-z]{1,4}", literal()), 0..3),
             prop::collection::vec(custom(), 0..3),
+            prop::collection::vec(expr(), 0..3),
+            prop::option::of(prop::collection::vec(step, 1..4)),
         );
         (system, rest)
             .prop_map(
                 |(
                     (filter, select, expand, orderby, top, skip, count, format),
-                    (skiptoken, schemaversion, id, aliases, custom),
+                    (skiptoken, schemaversion, id, search, aliases, custom, computed, apply),
                 )| {
+                    let compute = (!computed.is_empty()).then(|| {
+                        computed
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, expr)| Compute {
+                                expr,
+                                alias: format!("c{i}"),
+                            })
+                            .collect()
+                    });
                     QueryOptions {
                         filter,
+                        search,
+                        compute,
+                        apply,
                         select,
                         expand,
                         orderby,

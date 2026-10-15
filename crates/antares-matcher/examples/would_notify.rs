@@ -5,7 +5,7 @@
 //!
 //!     cargo run -p antares-matcher --example would_notify
 
-use antares_matcher::would_notify;
+use ngsild_matcher::would_notify;
 use serde_json::json;
 
 fn main() {

@@ -1,11 +1,17 @@
 [package]
-name = "antares-jsonld"
+name = "ngsild-jsonld"
 description = "JSON-LD layer: pinned core contexts, NGSI-LD expansion/compaction + structural validation; the caching HTTP Loader behind the `fetch` feature."
 version.workspace = true
 edition.workspace = true
-publish = false
+publish = ["crates-io"]
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+# reads the vendored ETSI suite, which is not in the package
+exclude = ["tests/etsi_fixtures.rs"]
+keywords = ["ngsi-ld", "json-ld", "etsi", "linked-data", "fiware"]
+categories = ["parser-implementations", "encoding"]
 
 # ADR-0027 / surfaces-threat-model 9.1: checked by dev/check-module-rules.py.
 [package.metadata.antares]
@@ -25,6 +31,9 @@ fetch = [
     "dep:tokio", "dep:reqwest", "dep:rustls", "dep:moka", "dep:uuid",
     "dep:web-time", "dep:send_wrapper", "dep:gloo-timers", "dep:futures-util",
 ]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints]
 workspace = true

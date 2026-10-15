@@ -112,4 +112,11 @@ fn a_path_off_the_matrix_is_no_operation() {
         Some(OperationId::RetrieveAttributeValue),
         "the second path of a two-path binding"
     );
+    // An empty id is the operation with its id missing: the root refuses it
+    // as BadRequestData, and a view passes it on rather than answering 404
+    // (T-3948).
+    assert_eq!(
+        OperationId::of("POST", "/ngsi-ld/v1/entities//attrs", None),
+        Some(OperationId::AppendAttributes),
+    );
 }

@@ -14,6 +14,7 @@ mod mcp_errors;
 mod mcp_every;
 mod mcp_gate;
 mod mcp_listen;
+mod mcp_mapped;
 mod mcp_output;
 mod mcp_resources;
 mod mcp_transport;
