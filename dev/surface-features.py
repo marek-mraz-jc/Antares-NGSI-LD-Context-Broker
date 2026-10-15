@@ -15,7 +15,10 @@ surface joins by being declared, without a YAML edit.
 Budget: the "binary size" row of ADR-0027 section 6, read from the ADR so
 the gate cannot drift from it (`full` and each feature alone <= vanilla + 10 MiB, T-3775),
 measured as the size of the stripped release binary (the release profile strips
-symbols). The report is a Markdown table on stdout and, in GitHub Actions,
+symbols). The builds run in lanes of their own target directory, side by side
+when CARGO_BUILD_JOBS allows (T-4032): one lane below 8 jobs, else one per 4 jobs,
+at most 3, the jobs split between them. A lane builds its variants in a fixed
+order, so the size of a build does not depend on how many lanes there are. The report is a Markdown table on stdout and, in GitHub Actions,
 in the step summary.
 """
 
@@ -25,6 +28,7 @@ import pathlib
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 MIB = 1024 * 1024
 BROKER = "antares-broker"
@@ -97,20 +101,38 @@ def report(vanilla, rows):
     return "\n".join(lines) + "\n"
 
 
-def build(target_dir, features):
-    cmd = ["cargo", "build", "--release", "--locked", "-p", BROKER]
+def build(target_dir, features, jobs):
+    cmd = ["cargo", "build", "--release", "--locked", "-p", BROKER, "--jobs", str(jobs)]
     if features:
         cmd += ["--features", features]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env={**os.environ, "CARGO_TARGET_DIR": str(target_dir)})
     return pathlib.Path(target_dir, "release", "antares").stat().st_size
+
+
+def lanes(jobs, builds):
+    """How many builds run side by side: one below 8 jobs, so a small worker does not thrash,
+    else one per 4 jobs, at most 3 and never more than there are builds."""
+    return 1 if jobs < 8 else max(1, min(3, jobs // 4, builds))
 
 
 def sizes():
     meta = metadata()
-    target = meta["target_directory"]
-    vanilla = build(target, None)
+    target = pathlib.Path(meta["target_directory"])
+    features = [None] + surface_features(meta)
+    jobs = int(os.environ.get("CARGO_BUILD_JOBS") or os.cpu_count() or 1)
+    n = lanes(jobs, len(features))
+    # Lane 0 is the target directory itself, the others a directory of their own beside it: two
+    # release builds never share one, because cargo locks a profile directory per build.
+    dirs = [target] + [target / f"sizes-{k}" for k in range(1, n)]
+
+    def lane(k):
+        return {f: build(dirs[k], f, max(1, jobs // n)) for f in features[k::n]}
+
+    with ThreadPoolExecutor(n) as pool:
+        measured = {f: size for part in pool.map(lane, range(n)) for f, size in part.items()}
+    vanilla = measured[None]
     budget = budgets(ADR.read_text())
-    rows = verdicts(vanilla, {f: build(target, f) for f in surface_features(meta)}, budget)
+    rows = verdicts(vanilla, {f: measured[f] for f in features[1:]}, budget)
     text = report(vanilla, rows)
     print(text)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -154,6 +176,8 @@ def self_test():
     meta["packages"][0]["features"]["full"] = ["mcp"]
     if surface_features(meta) != ["mcp", "views", "full"]:
         sys.exit("self-test: full is not picked up")
+    if [lanes(j, 9) for j in (1, 3, 7, 8, 12, 16, 64)] != [1, 1, 1, 2, 3, 3, 3] or lanes(12, 2) != 2:
+        sys.exit("self-test: the lanes do not follow CARGO_BUILD_JOBS")
     print("surface-features: self-test passed")
 
 
