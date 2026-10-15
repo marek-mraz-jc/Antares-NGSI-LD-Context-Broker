@@ -26,7 +26,7 @@ use std::fmt::{self, Display, Formatter};
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Search {
-    /// A `searchWord`, decoded.
+    /// A `searchWord`, decoded; never `AND`, `OR` or `NOT`.
     Word(String),
     /// A `searchPhrase` without its quotes, decoded.
     Phrase(String),
@@ -247,6 +247,11 @@ impl Parser<'_, '_> {
         if bytes.is_empty() || bytes.first() == Some(&b'\'') {
             return Err(self.c.syntax("searchWord"));
         }
+        // An operator standing where it cannot operate (`$search=OR`) is searched for as text. It
+        // is a phrase, the one form it writes back to: written bare it would operate again.
+        if [&b"AND"[..], b"OR", b"NOT"].contains(&bytes.as_slice()) {
+            return Ok(Search::Phrase(self.text(bytes)?));
+        }
         Ok(Search::Word(self.text(bytes)?))
     }
 
@@ -310,7 +315,7 @@ impl Display for Search {
     /// `!*,:@/?$=` percent-encoded.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            // a word that is an operator keeps its meaning as a phrase
+            // a word built by hand as an operator keeps its meaning as a phrase
             Search::Word(w) if !["AND", "OR", "NOT"].contains(&w.as_str()) => encoded(f, w),
             Search::Word(p) | Search::Phrase(p) => {
                 f.write_str("%22")?;
