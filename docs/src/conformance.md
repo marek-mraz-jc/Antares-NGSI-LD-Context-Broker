@@ -154,6 +154,7 @@ cd ngsi-ld-test-suite && robot --variable url:http://localhost:9377/ngsi-ld/v1 \
   --variable notification_server_host:127.0.0.1 \
   --variable context_source_host:127.0.0.1 \
   --variable context_server_host:127.0.0.1 \
+  --variable mqtt_broker_host:ngsi-ld-test-suite-mosquitto-container \
   --outputdir /tmp/robot-566 TP/NGSI-LD/ContextInformation/Provision/Entities/DeleteEntity/566_01.robot
 ```
 
