@@ -118,7 +118,19 @@ jobs:
           path: stack/corLibs
       - name: Build corTest's tools (corLibs bootstrap)
         working-directory: stack/corLibs
-        run: ./bootstrap.sh
+        # bootstrap.sh clones every cor* sibling at main; each is held at its last commit before
+        # the coraine commit under test, or a later sibling outgrows coraine's headers (corDB's
+        # DbDriver.entityTypes of 2026-10-13 broke every cell against d313d87, T-3677).
+        run: |
+          NOBUILD=1 ./bootstrap.sh
+          before=$(git -C ../coraine log -1 --format=%cI)
+          for d in ../cor*/; do
+            case "$d" in ../corLibs/|../coraine/) continue ;; esac
+            c=$(git -C "$d" rev-list -1 --before="$before" HEAD)
+            [ -n "$c" ] || { echo "no commit of $d before $before"; exit 1; }
+            git -C "$d" checkout --quiet "$c" && echo "$d $c"
+          done
+          make -j"$(nproc)" di
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
