@@ -14,7 +14,12 @@ job summary of each run names its commit and its CPU.
 
 | run | commit | runner | artifact |
 |---|---|---|---|
-| [38135751509](https://github.com/marek-mraz-jc/Antares-NGSI-LD-Context-Broker/actions/runs/38135751509) | `f38a43a` (branch, T-3735) | GitHub `ubuntu-latest` | `perf-baseline` |
+| 38135751509 | `f38a43a` (branch, T-3735) | GitHub `ubuntu-latest` | `perf-baseline` |
+
+The run and its artifact are gone: on 2026-10-15 the Actions API answers 404
+for it and lists no `perf-baseline` run at all. The tables below are the
+numbers its job summary printed. A new run of the workflow on `f38a43a`
+measures them again.
 
 Concurrency 50 for every shape; p99 in milliseconds. Each store is
 seeded once before its rows, PostgreSQL is vacuumed, analysed and
