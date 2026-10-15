@@ -92,6 +92,7 @@ mod set_attribute_value_10_2_6;
 mod snapshots_5_16;
 mod split_entities_5_7_2;
 mod streaming_lists;
+mod sub_attribute_null_5_6_4;
 mod sub_index;
 mod subscription_listing_5_8_4;
 mod temporal_aggregated_query_4_5_19;

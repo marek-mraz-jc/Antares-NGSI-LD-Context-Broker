@@ -537,6 +537,16 @@ pub fn is_deletion_instance(inst: &Value) -> bool {
         })
 }
 
+/// Whether a fragment member removes its target member (5.5.12, 10.2.5.4): JSON null, the
+/// NGSI-LD Null, or a sub-Attribute every instance of which is a deletion instance.
+pub fn removes_member(v: &Value) -> bool {
+    v.is_null()
+        || is_ngsi_null(v)
+        || v.as_array().is_some_and(|instances| {
+            !instances.is_empty() && instances.iter().all(is_deletion_instance)
+        })
+}
+
 /// 4.18 Scope grammar: [/] ScopeLevel *(/ScopeLevel), ScopeLevel =
 /// unicodeLetter *(letter/digit/_) — shared by entity scopes and the 5.2.9
 /// registration scope member.
@@ -736,14 +746,24 @@ fn expand_common_members(
             out.insert("datasetId".into(), d);
         }
     }
-    if let Some(o) = obj.get("observedAt") {
+    // 5.5.12: in a merge (or partial update) input the NGSI-LD Null removes the member
+    let nulls = opts.allow_null || opts.merge;
+    for k in ["observedAt", "expiresAt"] {
+        if let Some(v) = obj.get(k).filter(|v| nulls && is_ngsi_null(v)) {
+            out.insert(k.into(), v.clone());
+        }
+    }
+    if let Some(o) = obj
+        .get("observedAt")
+        .filter(|v| !(nulls && is_ngsi_null(v)))
+    {
         let s = o
             .as_str()
             .filter(|s| parse_datetime(s))
             .ok_or_else(|| bad(format!("attribute {name}: invalid observedAt")))?;
         out.insert("observedAt".into(), Value::String(s.to_owned()));
     }
-    if let Some(e) = obj.get("expiresAt") {
+    if let Some(e) = obj.get("expiresAt").filter(|v| !(nulls && is_ngsi_null(v))) {
         // 4.22 transient attribute instances carry their own expiresAt.
         let s = e
             .as_str()
@@ -1185,6 +1205,11 @@ pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<V
             }
             // 4.6.3: both members are ISO 8601 DateTimes (4.8 observedAt,
             // 4.22 expiresAt) — the same check the full-instance path runs.
+            // 10.2.5.4: "NGSI-LD Nulls should be supported by this operation": the Null
+            // removes the member from the patched instance (5.5.12).
+            "observedAt" | "expiresAt" if is_ngsi_null(v) => {
+                out.insert(k.clone(), v.clone());
+            }
             "observedAt" | "expiresAt" => {
                 let sdt = v
                     .as_str()

@@ -339,9 +339,16 @@ teardown() {
 trap teardown EXIT
 
 # 4b. The suite's @context from this checkout, not from GitHub on dev
-# (T-3550): teardown puts the rewritten files back.
-SUITE_CONTEXT=$(RESULTS="$RESULTS" dev/etsi-local-context.sh start) \
-  || { echo "could not serve the suite context locally"; exit 1; }
+# (T-3550): teardown puts the rewritten files back. A caller that already
+# serves it and rewrote the suite to it (external-suites, forge-free.sh)
+# names it in SUITE_CONTEXT, as etsi-run.sh allows: a second rewrite would
+# hand the broker one URL and the expectations another (T-3677).
+local_context=0
+if [ -z "${SUITE_CONTEXT:-}" ]; then
+  SUITE_CONTEXT=$(RESULTS="$RESULTS" dev/etsi-local-context.sh start) \
+    || { echo "could not serve the suite context locally"; exit 1; }
+  local_context=1
+fi
 export SUITE_CONTEXT
 
 # 5. Serial suites against broker1 (STOP_ON_ERROR respected by etsi-run.sh).
@@ -406,7 +413,7 @@ fi
 
 # 7a. No TP may have resolved the suite context outside this run.
 context_status=0
-RESULTS="$RESULTS" dev/etsi-local-context.sh check | tee "$RESULTS/local-context-check.txt" \
+[ "$local_context" = 0 ] || RESULTS="$RESULTS" dev/etsi-local-context.sh check | tee "$RESULTS/local-context-check.txt" \
   || context_status=1
 
 # 7. Report: suite table, per-broker CPU/RSS, spike attribution, downloadable

@@ -81,6 +81,8 @@ jobs:
     needs: [selftest, plan]
     strategy:
       fail-fast: false
+      # 3 cells at a time: a full run held every runner and stalled the trains (T-3677)
+      max-parallel: 3
       matrix:
         variant: ${{ fromJSON(needs.plan.outputs.variants) }}
         store: ${{ fromJSON(needs.plan.outputs.stores) }}
@@ -193,6 +195,8 @@ jobs:
     needs: [plan, image]
     strategy:
       fail-fast: false
+      # 3 cells at a time: a full run held every runner and stalled the trains (T-3677)
+      max-parallel: 3
       matrix:
         variant: ${{ fromJSON(needs.plan.outputs.variants) }}
         store: ${{ fromJSON(needs.plan.outputs.stores) }}
@@ -225,8 +229,12 @@ jobs:
       - name: Serve the @contexts locally
         if: steps.forge.outputs.skip != '1'
         run: |
-          python3 -m http.server 8099 --bind 127.0.0.1 --directory ngsi-ld-test-suite > /dev/null 2>&1 &
-          tests/external/etsi/forge-free.sh ngsi-ld-test-suite http://127.0.0.1:8099
+          # 8099 is the IOP TPs' dead endpoint (IOP_EXT_ERR_01): a server there made the dead
+          # source answer, and no warning came (T-3677). A port no suite file names, checked.
+          clash=$(grep -rlw --include=*.robot --include=*.resource --include=*.py 8078 ngsi-ld-test-suite || true)
+          [ -z "$clash" ] || { echo "context port 8078 is named by: $clash"; exit 1; }
+          python3 -m http.server 8078 --bind 127.0.0.1 --directory ngsi-ld-test-suite > /dev/null 2>&1 &
+          tests/external/etsi/forge-free.sh ngsi-ld-test-suite http://127.0.0.1:8078
       - name: Run the suites
         if: steps.forge.outputs.skip != '1'
         env:
@@ -235,6 +243,8 @@ jobs:
           SKIP_BUILD: "1"
           STOP_ON_ERROR: "0"
           CALLBACK_HOST: localhost
+          # the context forge-free.sh rewrote the suite to, so the pipeline rewrites nothing (T-3677)
+          SUITE_CONTEXT: http://127.0.0.1:8078/resources/jsonld-contexts/ngsi-ld-test-suite-compound.jsonld
           API_SURFACES: ${{ matrix.variant == 'full' && env.FULL_SURFACES || 'admin' }}
         run: |
           [ "$SMOKE" = true ] && export SUITES=Provision

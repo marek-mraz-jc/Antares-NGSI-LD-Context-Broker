@@ -68,8 +68,12 @@ fi
 # FederationReset.py reads it from the environment (its Link header)
 export SUITE_CONTEXT="${SUITE_CONTEXT:-}"
 ( cd "$SUITE/resources"
-  sed -i "s|^url = .*|url = '$BROKER_URL'|" variables.py
-  sed -i "s|^temporal_api_url = .*|temporal_api_url = '$BROKER_URL'|" variables.py
+  # A suite whose own `url` names no /ngsi-ld/v1 adds the path itself (forge's later commits):
+  # it gets the broker's root, or every request went to /ngsi-ld/v1/ngsi-ld/v1 (T-3677).
+  api_url=$BROKER_URL
+  grep -q "^url = '.*/ngsi-ld/v1/\?'" variables.py || api_url=${BROKER_URL%/ngsi-ld/v1}
+  sed -i "s|^url = .*|url = '$api_url'|" variables.py
+  sed -i "s|^temporal_api_url = .*|temporal_api_url = '$api_url'|" variables.py
   sed -i "s|^notification_server_host = .*|notification_server_host = '$CALLBACK_HOST'|" variables.py
   sed -i "s|^context_source_host = .*|context_source_host = '$CALLBACK_HOST'|" variables.py
   sed -i "s|^context_server_host = .*|context_server_host = '$CALLBACK_HOST'|" variables.py

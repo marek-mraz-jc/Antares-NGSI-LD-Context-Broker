@@ -915,7 +915,9 @@ async fn partial_update_inner(
                                 if matches!(k.as_str(), "createdAt" | "modifiedAt") {
                                     continue;
                                 }
-                                if v.is_null() || antares_jsonld::is_ngsi_null(v) {
+                                // a member set to the Null, or a sub-Attribute whose every
+                                // instance is a deletion, leaves the instance (10.2.5.4)
+                                if antares_jsonld::removes_member(v) {
                                     t.remove(k);
                                 } else {
                                     t.insert(k.clone(), v.clone());
