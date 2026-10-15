@@ -217,6 +217,8 @@ def check_view_diff():
                     line = {"test": test, "method": method, "url": url, "headers": headers}
                     if test is None:
                         line.update(fixture=True, suite=extra[0])
+                        if len(extra) > 1:
+                            line["body"] = extra[1]
                     elif extra:
                         line["body"] = extra[0]
                     fh.write(json.dumps(line) + "\n")
@@ -291,6 +293,24 @@ def check_view_diff():
         shown = run("shown", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
                     [(d, "GET", f"{root}/entities?type=Building&attrs=name,location", [])])
         assert view_diff.diff(restricted, e1, shown, binds) == 1, "a read of shown names owes nothing"
+        # T-3982: a create the view refuses never makes the Entity, so a later TP naming it owes
+        # the 404; a fixture that makes it again at the root clears that
+        made = [
+            (a, "POST", f"{root}/entities/", [], {"id": "urn:B1", "type": "Building"}),
+            (a, "POST", f"{root}/entities", [], {"id": "urn:B2", "type": "Building"}),
+            (None, "POST", "http://h/ngsi-ld/v1/entities", [], "TP/s.robot", {"id": "urn:B2", "type": "Building"}),
+            (b, "GET", f"{root}/entities/urn%3AB1", []),
+            (c, "GET", f"{root}/entities/urn:B2", []),
+            (d, "GET", f"{root}/entities/urn:B3", []),
+        ]
+        unmade = run("unmade", [(a, "FAIL"), (b, "FAIL"), (c, "PASS"), (d, "PASS")], made)
+        assert view_diff.diff(restricted, e1, unmade, binds) == 0
+        why = {r["tp"]: r["owed"] for r in json.load(open(f"{unmade}/owed-refusals.json"))["refusals"]}
+        assert sorted(why) == [a, b] and "never made" in why[b][0], why
+        remade = run("remade", [(a, "FAIL"), (b, "FAIL"), (c, "FAIL"), (d, "PASS")], made)
+        assert view_diff.diff(restricted, e1, remade, binds) == 1, "an Entity a fixture made again owes nothing"
+        other = run("other", [(a, "FAIL"), (b, "FAIL"), (c, "PASS"), (d, "FAIL")], made)
+        assert view_diff.diff(restricted, e1, other, binds) == 1, "an Entity nobody tried to make owes nothing"
 
         # T-3980: names in the path, the type of an entity id read, an orderBy, a listing, a join, a
         # query naming no type, and an answer lacking only hidden Attributes are owed by the view
@@ -333,7 +353,8 @@ def check_view_diff():
                  if o.get("kind") == "read"}
         assert set(committed["operations"]) == reads, "etsi-restricted offers the matrix's reads"
     print("  view diff ok (owed refusals pass, a deviation, a stale known entry or a missing TP fails;"
-          " a hidden type or Attribute owes its refusal, a narrowing view its narrowing)")
+          " a hidden type or Attribute, or an Entity a refused create never made, owes its refusal,"
+          " a narrowing view its narrowing)")
 
 
 def check_view_residue():
