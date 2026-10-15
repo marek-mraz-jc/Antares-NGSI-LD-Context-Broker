@@ -664,6 +664,21 @@ fn op_set(r: &FedReg) -> std::collections::BTreeSet<&'static str> {
         .collect()
 }
 
+fn same_entity_scope(a: &FedReg, b: &FedReg) -> bool {
+    a.ent_ids == b.ent_ids
+        && a.ent_types == b.ent_types
+        && a.ent_patterns == b.ent_patterns
+        && a.ent_unrestricted == b.ent_unrestricted
+}
+
+fn covers_everything(r: &FedReg) -> bool {
+    r.attrs.is_none()
+        && r.ent_types.is_empty()
+        && r.ent_ids.is_empty()
+        && r.ent_patterns.is_empty()
+        && r.ent_unrestricted
+}
+
 /// Registrations naming the same Context Source (same endpoint, mode,
 /// tenant, contextSourceAlias, contextSourceInfo, localOnly) fold into ONE
 /// forwarded request (5.2.9: the alias identifies a source, so a different
@@ -682,6 +697,12 @@ fn op_set(r: &FedReg) -> std::collections::BTreeSet<&'static str> {
 /// itself twice with different operation lists and both lists cover the
 /// operation at hand; 4.5.5 merges the two answers by Entity id, so the
 /// caller sees the same data either way.
+///
+/// For the same reason they fold only when the union is exact: (Vehicle ×
+/// all) and (OffStreetParking × two attributes) would fold to
+/// (both types × all), and the source's whole OffStreetParking would be
+/// imported (ETSI IOP_003_02_02). Equal attribute scopes, equal entity
+/// scopes, or one side covering everything keep the union exact.
 fn merge_same_source(regs: Vec<FedReg>) -> Vec<FedReg> {
     let mut out: Vec<(FedReg, std::collections::BTreeSet<&'static str>)> = Vec::new();
     for r in regs {
@@ -694,6 +715,10 @@ fn merge_same_source(regs: Vec<FedReg>) -> Vec<FedReg> {
                 && o.csi == r.csi
                 && o.local_only == r.local_only
                 && *o_ops == ops
+                && (o.attrs == r.attrs
+                    || same_entity_scope(o, &r)
+                    || covers_everything(o)
+                    || covers_everything(&r))
         });
         let Some((o, _)) = same else {
             out.push((r, ops));
@@ -4241,6 +4266,8 @@ mod same_source_merge {
             ops: vec!["federationOps".into()],
             attrs: attrs.map(|a| a.iter().map(|s| (*s).to_owned()).collect()),
             ent_types: types.iter().map(|s| (*s).to_owned()).collect(),
+            // type-only EntityInfo, as the registration builder reads it
+            ent_unrestricted: true,
             ..FedReg::default()
         }
     }
@@ -4255,7 +4282,7 @@ mod same_source_merge {
                 "urn:r:2",
                 "http://a",
                 Some(&["heading", "speed"]),
-                &["Bike"],
+                &["Vehicle"],
             ),
             reg("urn:r:3", "http://b", Some(&["speed"]), &["Vehicle"]),
         ]);
@@ -4265,8 +4292,23 @@ mod same_source_merge {
             merged[0].attrs.as_deref(),
             Some(&["speed".to_owned(), "heading".to_owned()][..])
         );
-        assert_eq!(merged[0].ent_types, ["Vehicle", "Bike"]);
         assert_eq!(merged[1].endpoint, "http://b");
+
+        // equal attribute scopes: the types union
+        let merged = merge_same_source(vec![
+            reg("urn:r:1", "http://a", Some(&["speed"]), &["Vehicle"]),
+            reg("urn:r:2", "http://a", Some(&["speed"]), &["Bike"]),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].ent_types, ["Vehicle", "Bike"]);
+
+        // 4.3.6.1, ETSI IOP_003_02_02: (Vehicle × all) and (Bike × speed)
+        // folded would be (both × all), a scope neither registration declared
+        let merged = merge_same_source(vec![
+            reg("urn:r:1", "http://a", None, &["Vehicle"]),
+            reg("urn:r:2", "http://a", Some(&["speed"]), &["Bike"]),
+        ]);
+        assert_eq!(merged.len(), 2, "an inexact union stays two forwards");
 
         // an unscoped registration widens the merged one to everything
         let merged = merge_same_source(vec![
