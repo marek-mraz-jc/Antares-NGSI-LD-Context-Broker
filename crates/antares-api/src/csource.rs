@@ -1142,8 +1142,17 @@ pub async fn query_registrations(
                 "format",
                 "local",
                 "scopeQ",
+                "pick",
+                "omit",
             ],
         )?;
+        // Table 6.8.3.2-1: pick and omit, exclusive as in 4.21
+        if params.contains_key("pick") && params.contains_key("omit") {
+            return Err(NgsiError::BadRequestData(
+                "pick and omit are mutually exclusive (4.21)".into(),
+            )
+            .into());
+        }
         let accept = parse_accept(&headers)?;
         let ctx = request_context(&st.loader, &headers).await?;
         let narrowing = gate!(
@@ -1274,9 +1283,23 @@ pub async fn query_registrations(
             accept,
         )?;
         let sys = sys_attrs_asked(&params);
+        // ponytail: pick/omit name top-level registration members by their
+        // compacted name; the table's remarks are the Entity ones
+        let names =
+            |k: &str| -> Option<Vec<&str>> { params.get(k).map(|v| v.split(',').collect()) };
+        let (pick, omit) = (names("pick"), names("omit"));
         let payload: Vec<Value> = page
             .iter()
-            .map(|d| present_registration(d, &ctx, sys))
+            .map(|d| {
+                let mut r = present_registration(d, &ctx, sys);
+                if let Some(o) = r.as_object_mut() {
+                    o.retain(|k, _| {
+                        pick.as_ref().is_none_or(|p| p.contains(&k.as_str()))
+                            && omit.as_ref().is_none_or(|p| !p.contains(&k.as_str()))
+                    });
+                }
+                r
+            })
             .collect();
         let mut resp =
             crate::negotiate::respond_list(StatusCode::OK, payload, &ctx, accept, &tenant);
