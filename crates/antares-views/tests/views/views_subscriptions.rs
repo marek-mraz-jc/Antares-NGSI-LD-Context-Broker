@@ -111,7 +111,8 @@ fn only(n: &Value) -> Result<&Value, String> {
 /// Notification id and timestamps once held the old hidden salary "4321" (T-4250, fast run
 /// 38860860930: urn:ngsi-ld:Notification:3012fe29-bdc5-4321-...).
 fn leaks(n: &Value, hidden: &str) -> bool {
-    n["data"].to_string().contains(hidden)
+    n.get("data")
+        .is_some_and(|d| d.to_string().contains(hidden))
 }
 
 #[test]
