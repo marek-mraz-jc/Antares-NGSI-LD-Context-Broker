@@ -286,7 +286,7 @@ async fn views_join_omits_out_of_view_targets_and_keeps_the_relationship() -> Re
             a.text
         );
         assert!(
-            !a.text.contains("4321") && !a.text.contains("salary"),
+            !a.text.contains("987654") && !a.text.contains("salary"),
             "{uri}: the owner's hidden salary: {}",
             a.text
         );
