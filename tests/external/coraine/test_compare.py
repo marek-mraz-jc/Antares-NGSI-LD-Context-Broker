@@ -142,6 +142,64 @@ class Regex(unittest.TestCase):
         self.assertEqual(json.loads(compare.quote_bare_regex('{"a": REGEX(\\d+)}'))["a"], compare.RX + "\\d+")
         self.assertEqual(compare.quote_bare_regex('{"a": "\\"REGEX("}'), '{"a": "\\"REGEX("}')
 
+    def test_a_received_request_compares_its_ngsi_ld_headers_only(self):
+        # a dump of what a receiver got: the client's own transport headers
+        # (User-Agent, Host, Content-Length, Accept) are the implementation's
+        exp = {"verb": "POST", "url": "/n", "body": {}, "headers": {
+            "Content-Type": "application/json", "NGSILD-Tenant": "t",
+            "User-Agent": "REGEX(Coraine/.*)", "Host": "localhost:7701",
+            "Content-Length": "REGEX(\\d+)", "Accept": "application/json"}}
+        act = {"verb": "POST", "url": "/n", "body": {}, "headers": {
+            "content-type": "application/json", "ngsild-tenant": "t", "via": "1.1 antares"}}
+        self.assertTrue(compare.json_equal(exp, act))
+        act["headers"]["ngsild-tenant"] = "u"
+        self.assertFalse(compare.json_equal(exp, act))
+        del act["headers"]["ngsild-tenant"]
+        self.assertFalse(compare.json_equal(exp, act))
+
+    def test_link_headers_are_a_set(self):
+        # RFC 8288 orders no links; the query of a next link is the broker's to order
+        exp = ('HTTP/1.1 200 OK\nLink: </e?limit=1&offset=1>;rel="next"\n'
+               'Link: <https://c>; rel="ctx"\n\n')
+        act = ('HTTP/1.1 200 OK\nLink: <https://c>; rel="ctx"\n'
+               'Link: </e?offset=1&limit=1>; rel="next"\n\n')
+        self.assertIsNone(compare.normalised_diff(exp, act))
+        self.assertIsNotNone(compare.normalised_diff(exp, act.replace("offset=1", "offset=2")))
+
+    def test_a_bare_regex_glued_to_digits_or_ending_a_member(self):
+        body = compare.quote_bare_regex('{"d": 85REGEX(\\.\\d+),\n "e": REGEX(.*)\n "f": 1}')
+        obj = json.loads(body)
+        self.assertTrue(compare.json_equal(obj["d"], 85.25))
+        self.assertFalse(compare.json_equal(obj["d"], 86.25))
+        self.assertTrue(compare.json_equal(obj["e"], "2026-01-01T00:00:00Z"))
+        self.assertEqual(obj["f"], 1)
+        self.assertEqual(body.count("\n"), 2)
+
+    def test_a_bare_regex_with_quotes_matches_the_json_text(self):
+        obj = json.loads(compare.quote_bare_regex('{"q": REGEX("speed>.*")}'))
+        self.assertTrue(compare.json_equal(obj["q"], "speed>5"))
+        self.assertFalse(compare.json_equal(obj["q"], "speed<5"))
+
+    def test_a_case_pinned_to_one_coraine_backend(self):
+        one = "--NAME--\nx\n# REQUIRE_DB: corDB\n--TAGS--\nentity\n"
+        v, why = compare.verdict("/nonexistent/x", one, {}, {})
+        self.assertEqual(v, "not-applicable")
+        self.assertIn("corDB", why)
+        both = one.replace("corDB", "mongoc corDB")
+        self.assertNotEqual(compare.verdict("/nonexistent/x", both, {}, {})[0], "not-applicable")
+
+    def test_a_not_updated_reason_is_free_text(self):
+        # 5.2.19 NotUpdatedDetails "reason": "Reason for not having changed such Attribute"
+        exp = {"attributeName": "p", "reason": "Attribute exists"}
+        self.assertTrue(compare.json_equal(exp, {"attributeName": "p", "reason": "noOverwrite"}))
+        self.assertFalse(compare.json_equal(exp, {"attributeName": "q", "reason": "x"}))
+
+    def test_a_regex_backslash_inside_a_json_string_parses(self):
+        # Coraine writes "REGEX(\d+)" inside strings: not a JSON escape
+        body = compare.quote_bare_regex('{"a": "REGEX(\\d+)", "b": "x\\ny"}')
+        self.assertEqual(json.loads(body), {"a": "REGEX(\\d+)", "b": "x\ny"})
+        self.assertTrue(compare.json_equal(json.loads(body)["a"], "12"))
+
 
 class Verdicts(unittest.TestCase):
     def case(self, d, name, tags="entity", **files):

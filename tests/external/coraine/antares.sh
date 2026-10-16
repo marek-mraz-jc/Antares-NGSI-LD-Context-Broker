@@ -102,6 +102,8 @@ coraineStart() {
     ANTARES_STORE="$ANTARES_TEST_STORE"
     ANTARES_DATA_DIR="$dir"
     ANTARES_EGRESS_ALLOW_PRIVATE=true
+    # the spec sets no batch ceiling; Coraine upserts 1101 entities in one batch
+    ANTARES_MAX_BATCH_ITEMS=2000
     # each role is a source of its own (5.2.9 contextSourceAlias): one shared
     # default alias made every forward between two roles a loop (508)
     ANTARES_HOST_ALIAS="${alias:-antares-${role,,}}"

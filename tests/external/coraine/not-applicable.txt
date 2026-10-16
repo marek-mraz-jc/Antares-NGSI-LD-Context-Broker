@@ -42,3 +42,5 @@ name:troe_timescale_values reads Coraine's TimescaleDB tables with psql, behind 
 name:jsonld_contexts_lazy_reload writes @contexts into Coraine's MongoDB, behind the broker
 name:startup_cyclic_persisted_context writes @contexts into Coraine's MongoDB, behind the broker
 name:crash_report_idle kills the broker with a signal and reads Coraine's own crash-report format and readelf build id
+name:geo_attr_type_conflict pins a MongoDB 2dsphere index limit, which the case itself says is no NGSI-LD rule
+name:usage runs the coraine binary's -u usage text

@@ -81,6 +81,8 @@ class Adapter(unittest.TestCase):
         self.assertNotIn("ANTARES_DATABASE_URL", env)
         # the broker refuses unknown ANTARES_* keys; ANTARES_TEST_* is reserved, this is not
         self.assertNotIn("ANTARES_BIN", env)
+        # the spec sets no batch ceiling; Coraine upserts 1101 entities in one batch
+        self.assertEqual(env["ANTARES_MAX_BATCH_ITEMS"], "2000")
 
     def test_every_role_is_its_own_source_alias(self):
         # one shared default alias made every forward between two roles a loop (508)
