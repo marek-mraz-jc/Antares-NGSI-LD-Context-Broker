@@ -479,3 +479,170 @@ async fn a_preview_counts_without_deleting_and_the_totals_follow_the_sweeps() {
         assert_eq!(send(&app, method, uri, None, body).await.0, status, "{uri}");
     }
 }
+
+/// T-4275: a Vehicle records no history, a Stop in the same Tenant does.
+const VEHICLE_OFF: &str = r#"{"rules":[{"type":"https://example.org/Vehicle","history":"off"}]}"#;
+
+fn speed(v: i64, minutes: i64) -> Value {
+    json!({"type": "Property", "value": v, "observedAt": ago(minutes)})
+}
+
+/// A write of Tenant `city` that must succeed.
+async fn write(app: &Router, method: Method, uri: &str, body: Value) {
+    let (s, out) = send(app, method, uri, Some("city"), Some(body.to_string())).await;
+    assert!(s.is_success(), "{uri}: {s} {out}");
+}
+
+/// The temporal instances of an entity's speed in a Tenant.
+async fn instances(app: &Router, tenant: &str, id: &str) -> usize {
+    let uri = format!("/ngsi-ld/v1/temporal/entities/{id}");
+    let (_, body) = send(app, Method::GET, &uri, Some(tenant), None).await;
+    body.get(SPEED)
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+async fn history_off(app: &Router) {
+    let (s, _) = send(
+        app,
+        Method::PUT,
+        "/q/retention/city",
+        None,
+        Some(VEHICLE_OFF.into()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_type_with_history_off_records_nothing_on_any_write() {
+    let b = TestBroker::new().await.expect("broker");
+    let app = b.serve_mounted(Vec::new()).expect("app");
+    history_off(&app).await;
+
+    // Create, update, merge and batch upsert of a Vehicle: current state moves, history does not.
+    let new = json!({"id": "urn:v:2", "type": V, SPEED: speed(1, 3)});
+    write(&app, Method::POST, "/ngsi-ld/v1/entities", new).await;
+    let attrs = json!({SPEED: speed(2, 2)});
+    write(
+        &app,
+        Method::PATCH,
+        "/ngsi-ld/v1/entities/urn:v:2/attrs",
+        attrs,
+    )
+    .await;
+    write(
+        &app,
+        Method::PATCH,
+        "/ngsi-ld/v1/entities/urn:v:2",
+        json!({SPEED: speed(3, 1)}),
+    )
+    .await;
+    let batch = json!([{"id": "urn:v:2", "type": V, SPEED: speed(4, 0)},
+                       {"id": "urn:v:3", "type": [V, S], SPEED: speed(5, 0)}]);
+    write(
+        &app,
+        Method::POST,
+        "/ngsi-ld/v1/entityOperations/upsert",
+        batch,
+    )
+    .await;
+    let (_, now) = send(
+        &app,
+        Method::GET,
+        "/ngsi-ld/v1/entities/urn:v:2",
+        Some("city"),
+        None,
+    )
+    .await;
+    assert_eq!(now[SPEED]["value"], 4, "current state is written: {now}");
+    assert_eq!(instances(&app, "city", "urn:v:2").await, 0);
+    assert_eq!(
+        instances(&app, "city", "urn:v:3").await,
+        0,
+        "any type with history off is enough"
+    );
+
+    // A Stop in the same Tenant, and a Vehicle in another, still record.
+    let stop = json!({"id": "urn:s:2", "type": S, SPEED: speed(1, 0)});
+    write(&app, Method::POST, "/ngsi-ld/v1/entities", stop).await;
+    assert_eq!(instances(&app, "city", "urn:s:2").await, 1);
+    let other = json!({"id": "urn:v:2", "type": V, SPEED: speed(1, 0)}).to_string();
+    let (s, _) = send(
+        &app,
+        Method::POST,
+        "/ngsi-ld/v1/entities",
+        Some("port"),
+        Some(other),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    assert_eq!(
+        instances(&app, "port", "urn:v:2").await,
+        1,
+        "another Tenant keeps its history"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_type_with_history_off_loses_what_it_held_and_reads_empty() {
+    let b = TestBroker::new().await.expect("broker");
+    let app = b.serve_mounted(Vec::new()).expect("app");
+
+    // Before the rule: the Vehicle's history is recorded as it always was.
+    let old = json!({"id": "urn:v:old", "type": V, SPEED: speed(1, 3)});
+    write(&app, Method::POST, "/ngsi-ld/v1/entities", old).await;
+    let stop = json!({"id": "urn:s:2", "type": S, SPEED: speed(1, 0)});
+    write(&app, Method::POST, "/ngsi-ld/v1/entities", stop).await;
+    assert_eq!(instances(&app, "city", "urn:v:old").await, 1);
+    history_off(&app).await;
+
+    // The sweep removes what the Vehicle held before the rule, and only that.
+    let deleted = b.sweep_retention(chrono::Utc::now()).await;
+    assert_eq!(
+        deleted
+            .iter()
+            .map(|d| (d.tenant.as_str(), d.type_iri.as_str(), d.kind, d.count))
+            .collect::<Vec<_>>(),
+        [("city", V, "history", 1)]
+    );
+    assert_eq!(instances(&app, "city", "urn:v:old").await, 0);
+    assert_eq!(instances(&app, "city", "urn:s:2").await, 1);
+    let (s, page) = send(
+        &app,
+        Method::GET,
+        "/ngsi-ld/v1/temporal/entities?type=https%3A%2F%2Fexample.org%2FVehicle&timerel=after&timeAt=2000-01-01T00%3A00%3A00Z",
+        Some("city"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "an empty history is an answer, not an error: {page}"
+    );
+    assert!(
+        page.as_array().is_some_and(|items| items
+            .iter()
+            .all(|e| e[SPEED].as_array().is_none_or(Vec::is_empty))),
+        "{page}"
+    );
+
+    // The rule round-trips as written, and removing it records again.
+    let (_, doc) = send(&app, Method::GET, "/q/retention/city", None, None).await;
+    assert_eq!(
+        doc,
+        serde_json::from_str::<Value>(VEHICLE_OFF).unwrap_or_default()
+    );
+    let (s, _) = send(&app, Method::DELETE, "/q/retention/city", None, None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let attrs = json!({SPEED: speed(9, 0)});
+    write(
+        &app,
+        Method::PATCH,
+        "/ngsi-ld/v1/entities/urn:v:old/attrs",
+        attrs,
+    )
+    .await;
+    assert_eq!(instances(&app, "city", "urn:v:old").await, 1);
+}

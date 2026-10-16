@@ -182,13 +182,16 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
             } else {
                 "DESC NULLS LAST"
             };
+            let rows = newest_rows(f, first_bind, n_bind).unwrap_or_else(|| {
+                "attr_instances ai WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id"
+                    .to_owned()
+            });
             format!(
                 "COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (\
                    SELECT s.attr_id, jsonb_agg(s.data ORDER BY s.created_at, s.observed_at, s.instance_id) AS insts \
                    FROM (SELECT ai.*, rank() OVER (PARTITION BY ai.attr_id, ai.data ->> 'datasetId' \
                              ORDER BY {order_key} {dir}) AS rk \
-                         FROM attr_instances ai \
-                         WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{range_and}) s \
+                         FROM {rows}{range_and}) s \
                    WHERE s.rk <= ${n_bind}::bigint GROUP BY s.attr_id) g), '{{}}'::jsonb)"
             )
         }
@@ -211,6 +214,64 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
         }
     };
     Some((expr, binds))
+}
+
+/// lastN's candidate rows, read through the (tenant, entity, attr,
+/// observed_at DESC) btree instead of ranking every instance of the window:
+/// per Attribute, the rows at most 28 hours older than its N-th newest
+/// `observed_at`. A SUPERSET of what the rank keeps: the parsed column and
+/// the text key the rank orders on diverge by at most the two RFC 3339
+/// offsets (±14 h each), so a row more than 28 h older than the N-th newest
+/// has N rows strictly above it under either order. KPI histories of 22k
+/// instances per Entity passed the gateway's 30 s ranking all of them
+/// (T-4246); this reads about N plus 28 hours of rows per Attribute.
+///
+/// `None` (rank the whole window, as before) where the superset argument
+/// does not hold or no index serves it:
+/// - a timeproperty other than observedAt (no btree on its column);
+/// - firstN, and a window closed towards now (`before`, `between`): rows the
+///   window drops could raise the N-th newest above what it keeps;
+/// - an Attribute with any instance in a dataset: the rank partitions by
+///   datasetId, and a sparse dataset's newest may sit below the Attribute's
+///   N-th; such an Attribute keeps every row (`-infinity`), found through the
+///   partial index of migration 0009.
+fn newest_rows(f: &TemporalFilter<'_>, first_bind: usize, n_bind: usize) -> Option<String> {
+    if f.oldest_first || f.timeproperty != "observedAt" {
+        return None;
+    }
+    let window = match &f.range {
+        None => String::new(),
+        Some(r) if r.timerel == "any" => String::new(),
+        Some(r) if r.timerel == "after" => format!(
+            " AND {}",
+            crate::compile::temporal::column_range_bound(r, "t", first_bind.saturating_add(1))?
+        ),
+        Some(_) => return None,
+    };
+    // Distinct Attributes by a skip scan of the same btree; `OFFSET 0` keeps
+    // the instance read a parameterised index range per Attribute, which a
+    // hash join over the whole Entity would otherwise replace.
+    Some(format!(
+        "(WITH RECURSIVE a(attr) AS (\
+            SELECT min(x.attr_id) FROM attr_instances x \
+            WHERE x.tenant_id = m.tenant_id AND x.entity_id = m.id \
+          UNION ALL \
+            SELECT (SELECT min(x.attr_id) FROM attr_instances x \
+                    WHERE x.tenant_id = m.tenant_id AND x.entity_id = m.id AND x.attr_id > a.attr) \
+            FROM a WHERE a.attr IS NOT NULL) \
+          SELECT ai.* FROM a \
+          CROSS JOIN LATERAL (SELECT CASE WHEN EXISTS (SELECT 1 FROM attr_instances d \
+                WHERE d.tenant_id = m.tenant_id AND d.entity_id = m.id AND d.attr_id = a.attr \
+                AND d.dataset_id IS NOT NULL) THEN '-infinity'::timestamptz \
+              ELSE COALESCE((SELECT t.observed_at FROM attr_instances t \
+                WHERE t.tenant_id = m.tenant_id AND t.entity_id = m.id AND t.attr_id = a.attr{window} \
+                ORDER BY t.observed_at DESC OFFSET greatest(${n_bind}::bigint - 1, 0) LIMIT 1), \
+                '-infinity'::timestamptz) - interval '28 hours' END AS th) c \
+          CROSS JOIN LATERAL (SELECT * FROM attr_instances ai \
+            WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id AND ai.attr_id = a.attr \
+            AND ai.observed_at >= c.th OFFSET 0) ai \
+          WHERE a.attr IS NOT NULL) ai WHERE true"
+    ))
 }
 
 /// The 4.11 window over the instance rows `ai` of the meta row `m`: the
