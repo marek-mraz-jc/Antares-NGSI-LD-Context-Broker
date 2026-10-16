@@ -284,8 +284,12 @@ jobs:
       # shadow layout allows, and every instrumented test binary dies with
       # SIGSEGV before its first test (run 38850474298, T-4250;
       # google/sanitizers#1716). The runner's ASLR, not a check, changes.
+      # 28 bits was not enough on this arm64 runner (run 38884915143, T-4334):
+      # setarch -R runs cargo and every test binary it starts without address
+      # randomization at all, so the shadow layout always fits.
       - run: sudo sysctl -w vm.mmap_rnd_bits=28
       - run: >
+          setarch "$(uname -m)" -R
           cargo +nightly test -Zbuild-std
           --target aarch64-unknown-linux-gnu
           --workspace --exclude antares-broker --tests
