@@ -41,3 +41,4 @@ name:troe_timescale_temporal_tenant reads Coraine's TimescaleDB tables with psql
 name:troe_timescale_values reads Coraine's TimescaleDB tables with psql, behind the broker
 name:jsonld_contexts_lazy_reload writes @contexts into Coraine's MongoDB, behind the broker
 name:startup_cyclic_persisted_context writes @contexts into Coraine's MongoDB, behind the broker
+name:crash_report_idle kills the broker with a signal and reads Coraine's own crash-report format and readelf build id
