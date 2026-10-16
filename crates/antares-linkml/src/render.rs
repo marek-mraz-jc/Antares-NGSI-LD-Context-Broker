@@ -172,6 +172,13 @@ pub(crate) struct Rendered {
 }
 
 impl Rendered {
+    /// The bytes of its documents and index.
+    fn bytes(&self) -> usize {
+        self.documents
+            .iter()
+            .fold(self.index.len(), |n, (_, d)| n.saturating_add(d.len()))
+    }
+
     fn new(model: Model, view: &str, left_out: bool) -> Self {
         let major = major(model.schema().version.as_deref());
         let documents: Vec<(Artifact, Arc<[u8]>)> = Artifact::ALL
@@ -284,55 +291,45 @@ fn major(version: Option<&str>) -> String {
         .to_owned()
 }
 
-/// A stored schema's bytes and the model read from them.
-type Source = (Arc<[u8]>, Arc<Model>);
-
 struct Entry {
     view: String,
     schema: Arc<[u8]>,
     visible: Visible,
     rendered: Arc<Rendered>,
+    /// The bytes it holds: its documents and the schema they were made of.
+    weight: usize,
 }
+
+/// The bytes of rendered schemas one pod keeps (T-4354), beside the count
+/// bound: a view of a 1 MiB schema renders several MiB of documents.
+pub(crate) const MAX_BYTES: usize = 64 << 20;
 
 /// The rendered schemas of this pod, keyed by view id, the schema's bytes
 /// and the visible set (LK2: a visible set is part of the key, so no
 /// caller is answered from another's narrowing), at most
-/// [`CACHE_ENTRIES`](crate::CACHE_ENTRIES), the oldest dropped first.
+/// [`CACHE_ENTRIES`](crate::CACHE_ENTRIES) and [`MAX_BYTES`] of them, the
+/// oldest dropped first. The schema each is read from comes from
+/// [`linkml_model::cache`], one parse per revision shared with the `OData`
+/// surface.
 #[derive(Default)]
 pub(crate) struct Cache {
-    entries: Mutex<VecDeque<Entry>>,
-    /// Each stored schema as read, so a request that names a class or a
-    /// slot finds its IRI without reading the schema again.
-    sources: Mutex<VecDeque<Source>>,
+    entries: Mutex<(VecDeque<Entry>, usize)>,
 }
 
 impl Cache {
-    /// The stored schema `schema` of `view` as read; `None` when it does not
-    /// load (LK4: a metaslot outside the subset closes the view's LinkML
-    /// surface, the reason goes to the log).
-    pub(crate) fn source(&self, view: &str, schema: &Arc<[u8]>) -> Option<Arc<Model>> {
-        {
-            let sources = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
-            let hit = sources
-                .iter()
-                .find(|(bytes, _)| Arc::ptr_eq(bytes, schema) || bytes == schema);
-            if let Some((_, model)) = hit {
-                return Some(model.clone());
+    /// The stored schema `schema` of `view`, revision `revision`, as read;
+    /// `None` when it does not load (LK4: a metaslot outside the subset
+    /// closes the view's LinkML surface, the reason goes to the log once).
+    pub(crate) fn source(view: &str, revision: u64, schema: &[u8]) -> Option<Arc<Model>> {
+        match linkml_model::cache::read(revision, schema, &LIMITS) {
+            (Ok(model), _) => Some(model),
+            (Err(e), fresh) => {
+                if fresh {
+                    tracing::warn!(view, error = %e, "the view's LinkML schema does not load; its LinkML surface is closed");
+                }
+                None
             }
         }
-        let model = match Model::read(schema, &LIMITS) {
-            Ok(model) => Arc::new(model),
-            Err(e) => {
-                tracing::warn!(view, error = %e, "the view's LinkML schema does not load; its LinkML surface is closed");
-                return None;
-            }
-        };
-        let mut sources = self.sources.lock().unwrap_or_else(PoisonError::into_inner);
-        if sources.len() >= crate::CACHE_ENTRIES {
-            sources.pop_front();
-        }
-        sources.push_back((schema.clone(), model.clone()));
-        Some(model)
     }
 
     /// The rendered schema of `view` for `visible`, rendered on a miss;
@@ -340,12 +337,13 @@ impl Cache {
     pub(crate) fn get(
         &self,
         view: &str,
+        revision: u64,
         schema: &Arc<[u8]>,
         visible: &Visible,
     ) -> Option<Arc<Rendered>> {
         {
             let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-            let hit = entries.iter().find(|e| {
+            let hit = entries.0.iter().find(|e| {
                 e.view == view
                     && (Arc::ptr_eq(&e.schema, schema) || e.schema == *schema)
                     && e.visible == *visible
@@ -354,7 +352,7 @@ impl Cache {
                 return Some(e.rendered.clone());
             }
         }
-        let source = self.source(view, schema)?;
+        let source = Self::source(view, revision, schema)?;
         let rendered = match narrow(&source, visible, view) {
             Ok((model, left_out)) => Arc::new(Rendered::new(model, view, left_out)),
             Err(e) => {
@@ -362,25 +360,36 @@ impl Cache {
                 return None;
             }
         };
-        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        if entries.len() >= crate::CACHE_ENTRIES {
-            entries.pop_front();
+        let weight = rendered.bytes().saturating_add(schema.len());
+        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let (entries, held) = &mut *guard;
+        while !entries.is_empty()
+            && (entries.len() >= crate::CACHE_ENTRIES || held.saturating_add(weight) > MAX_BYTES)
+        {
+            if let Some(old) = entries.pop_front() {
+                *held = held.saturating_sub(old.weight);
+            }
         }
-        entries.push_back(Entry {
-            view: view.to_owned(),
-            schema: schema.clone(),
-            visible: visible.clone(),
-            rendered: rendered.clone(),
-        });
+        // One rendering past the whole budget is answered and not kept.
+        if weight <= MAX_BYTES {
+            *held = held.saturating_add(weight);
+            entries.push_back(Entry {
+                view: view.to_owned(),
+                schema: schema.clone(),
+                visible: visible.clone(),
+                rendered: rendered.clone(),
+                weight,
+            });
+        }
         Some(rendered)
     }
 
     #[cfg(test)]
-    fn sources(&self) -> usize {
-        self.sources
+    fn held(&self) -> usize {
+        self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .len()
+            .1
     }
 
     #[cfg(test)]
@@ -388,6 +397,7 @@ impl Cache {
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .0
             .len()
     }
 }
@@ -395,6 +405,14 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The revision a store gives `bytes`: their digest, as `Schema::new` makes it.
+    fn rev(bytes: &[u8]) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        bytes.hash(&mut h);
+        h.finish()
+    }
     use antares_ops::policy::{Filter, Rule};
 
     const SCHEMA: &[u8] = br#"{"id": "https://e.org/s", "name": "s", "version": "3.0.1",
@@ -430,21 +448,31 @@ mod tests {
         let cache = Cache::default();
         let schema: Arc<[u8]> = Arc::from(SCHEMA);
         let a = cache
-            .get("v", &schema, &visible(&["temperature"]))
+            .get("v", rev(&schema), &schema, &visible(&["temperature"]))
             .expect("renders");
         let again = cache
-            .get("v", &Arc::from(SCHEMA), &visible(&["temperature"]))
+            .get(
+                "v",
+                rev(SCHEMA),
+                &Arc::from(SCHEMA),
+                &visible(&["temperature"]),
+            )
             .expect("hit");
         assert!(
             Arc::ptr_eq(&a, &again),
             "same bytes, same visible set: one render"
         );
         let wider = cache
-            .get("v", &schema, &visible(&["temperature", "secret"]))
+            .get(
+                "v",
+                rev(&schema),
+                &schema,
+                &visible(&["temperature", "secret"]),
+            )
             .expect("renders");
         assert!(!Arc::ptr_eq(&a, &wider));
         let other_view = cache
-            .get("w", &schema, &visible(&["temperature"]))
+            .get("w", rev(&schema), &schema, &visible(&["temperature"]))
             .expect("renders");
         assert!(!Arc::ptr_eq(&a, &other_view));
         assert_eq!(cache.len(), 3);
@@ -457,26 +485,57 @@ mod tests {
         let cache = Cache::default();
         let schema: Arc<[u8]> = Arc::from(SCHEMA);
         for i in 0..=crate::CACHE_ENTRIES {
-            cache.get(&format!("v{i}"), &schema, &visible(&[]));
-            let own: Arc<[u8]> =
-                Arc::from(format!(r#"{{"id": "https://e.org/s{i}", "name": "s"}}"#).into_bytes());
-            cache.source("v", &own);
+            cache.get(&format!("v{i}"), rev(&schema), &schema, &visible(&[]));
         }
         assert_eq!(cache.len(), crate::CACHE_ENTRIES);
-        assert_eq!(cache.sources(), crate::CACHE_ENTRIES);
+    }
+
+    /// 20 schemas of 1 MiB, each rendered for two visible sets, stay under the byte bound
+    /// (T-4354): a count bound alone would hold 256 renderings of several MiB each.
+    #[test]
+    fn twenty_schemas_of_a_mebibyte_stay_under_the_byte_bound() {
+        let cache = Cache::default();
+        for n in 0..20 {
+            // Within the surface's 1 MiB, so every one renders.
+            let pad = "x".repeat(1_000_000);
+            let schema: Arc<[u8]> = Arc::from(
+                format!(
+                    r#"{{"id": "https://e.org/s", "name": "s", "version": "1.{n}",
+                      "classes": {{"Room": {{"slots": ["temperature"], "description": "{pad}"}}}},
+                      "slots": {{"temperature": {{}}}}}}"#
+                )
+                .into_bytes(),
+            );
+            assert!(schema.len() <= LIMITS.max_bytes);
+            for shown in [&[][..], &["temperature"][..]] {
+                cache
+                    .get("v", rev(&schema), &schema, &visible(shown))
+                    .expect("renders");
+            }
+            assert!(cache.held() <= MAX_BYTES, "{} > {MAX_BYTES}", cache.held());
+        }
+        // 40 renderings of several MiB each: the oldest went, the newest stayed.
+        assert!((1..40).contains(&cache.len()), "{}", cache.len());
     }
 
     #[test]
     fn a_schema_outside_the_subset_renders_nothing() {
         let bad: Arc<[u8]> =
             Arc::from(&br#"{"id": "https://e.org/s", "name": "s", "imports": []}"#[..]);
-        assert!(Cache::default().get("v", &bad, &visible(&[])).is_none());
+        assert!(Cache::default()
+            .get("v", rev(&bad), &bad, &visible(&[]))
+            .is_none());
     }
 
     #[test]
     fn the_index_lists_each_artifact_with_its_size_and_digest() {
         let r = Cache::default()
-            .get("v", &Arc::from(SCHEMA), &visible(&["temperature"]))
+            .get(
+                "v",
+                rev(SCHEMA),
+                &Arc::from(SCHEMA),
+                &visible(&["temperature"]),
+            )
             .expect("renders");
         let index: Value = serde_json::from_slice(&r.index).expect("json");
         let model = &index["models"][0];
@@ -506,7 +565,7 @@ mod tests {
             ),
         ] {
             let r = Cache::default()
-                .get("v", &Arc::from(schema), &visible(&[]))
+                .get("v", rev(schema), &Arc::from(schema), &visible(&[]))
                 .expect("renders");
             let index: Value = serde_json::from_slice(&r.index).expect("json");
             assert!(index["models"][0]["version"].is_u64(), "{index}");
@@ -532,17 +591,18 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_is_read_once_per_bytes_and_each_view_schema_pair_rendered_apart() {
+    fn a_schema_is_read_once_per_revision_and_each_view_schema_pair_rendered_apart() {
         let cache = Cache::default();
-        let a = cache.source("v", &Arc::from(SCHEMA)).expect("reads");
-        let again = cache.source("v", &Arc::from(SCHEMA)).expect("hit");
-        assert!(Arc::ptr_eq(&a, &again), "equal bytes, one read");
-        assert_eq!(cache.sources(), 1);
+        let a = Cache::source("v", rev(SCHEMA), SCHEMA).expect("reads");
+        let again = Cache::source("w", rev(SCHEMA), SCHEMA).expect("hit");
+        assert!(Arc::ptr_eq(&a, &again), "one revision, one read");
         let other: Arc<[u8]> = Arc::from(&br#"{"id": "https://e.org/t", "name": "t"}"#[..]);
         let first = cache
-            .get("v", &Arc::from(SCHEMA), &visible(&[]))
+            .get("v", rev(SCHEMA), &Arc::from(SCHEMA), &visible(&[]))
             .expect("renders");
-        let second = cache.get("v", &other, &visible(&[])).expect("renders");
+        let second = cache
+            .get("v", rev(&other), &other, &visible(&[]))
+            .expect("renders");
         assert!(!Arc::ptr_eq(&first, &second), "same view, another schema");
     }
 
@@ -568,7 +628,9 @@ mod tests {
             }],
             ..Filter::default()
         });
-        let r = Cache::default().get("v", &schema, &all).expect("renders");
+        let r = Cache::default()
+            .get("v", rev(&schema), &schema, &all)
+            .expect("renders");
         let json = |b: Option<Arc<[u8]>>| -> Value {
             serde_json::from_slice(&b.expect("served")).expect("json")
         };

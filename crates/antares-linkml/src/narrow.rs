@@ -17,11 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// `ANTARES_SCHEMA_MAX_BYTES` lets the schema table store (a larger schema
 /// closes the surface, LK7), a nesting deep enough for LinkML's JSON form,
 /// and as many elements as a large model holds.
-pub(crate) const LIMITS: Limits = Limits {
-    max_bytes: 1024 * 1024,
-    max_depth: 32,
-    max_elements: 20_000,
-};
+pub(crate) const LIMITS: Limits = linkml_model::SURFACE_LIMITS;
 
 /// A class's slots a caller may see, each as the class refines it.
 type Shown = Vec<(String, Slot)>;

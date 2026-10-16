@@ -17,6 +17,8 @@ protocols = ["linkml-model", "odata-axum", "odata-batch", "odata-csdl", "odata-j
 antares-ops = { workspace = true }
 axum = { version = "0.8", default-features = false }
 linkml-model = { path = "../linkml-model" }
+# The built-model cache, bounded by bytes (T-4354).
+moka = { version = "0.12", default-features = false, features = ["sync"] }
 odata-axum = { path = "../odata-axum" }
 odata-batch = { path = "../odata-batch" }
 odata-csdl = { path = "../odata-csdl" }
