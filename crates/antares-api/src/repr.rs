@@ -120,9 +120,19 @@ pub fn parse_repr(params: &HashMap<String, String>, ctx: &Context) -> Result<Rep
         r.omit = Some(parse_projection(o, ctx)?);
     }
     r.lang = params.get("lang").cloned();
-    r.dataset_id = params
-        .get("datasetId")
-        .map(|s| s.split(',').map(|d| d.trim().to_owned()).collect());
+    if let Some(list) = params.get("datasetId") {
+        let mut ids = Vec::new();
+        for d in list.split(',').map(str::trim) {
+            // Table 6.4.3.2-1: "Shall be valid URIs, "@none" for ... the default"
+            if d != "@none" && antares_model::EntityId::new(d).is_err() {
+                return Err(NgsiError::BadRequestData(format!(
+                    "datasetId {d:?} is not a URI"
+                )));
+            }
+            ids.push(d.to_owned());
+        }
+        r.dataset_id = Some(ids);
+    }
     Ok(r)
 }
 
@@ -1810,6 +1820,18 @@ mod clause_6_3_7 {
         assert!(!r.key_values && !r.concise, "normalized is neither");
         let r = parse_repr(&params(&[("options", "sysAttrs,keyValues")]), &ctx).expect("parse");
         assert!(r.sys_attrs && r.key_values);
+    }
+
+    /// Table 6.4.3.2-1 datasetId: "Shall be valid URIs, "@none" for including
+    /// the default Attribute instances" (Coraine url_param_datasetid_validation).
+    #[test]
+    fn a_dataset_id_parameter_is_a_uri_or_none() {
+        let ctx = Loader::new().core();
+        for bad in ["14", "urn:ds:1,14", ""] {
+            let e = parse_repr(&params(&[("datasetId", bad)]), &ctx).expect_err(bad);
+            assert!(matches!(e, NgsiError::BadRequestData(_)), "{bad}: {e:?}");
+        }
+        assert!(parse_repr(&params(&[("datasetId", "urn:ds:1,@none")]), &ctx).is_ok());
     }
 
     /// 4.21: pick, omit and attrs are mutually exclusive — any pair is a 400,
