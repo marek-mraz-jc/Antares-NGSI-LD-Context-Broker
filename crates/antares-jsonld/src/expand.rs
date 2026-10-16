@@ -1961,6 +1961,7 @@ mod tests {
         for ok in [
             serde_json::json!({"en": "x", "es": ["y"]}),
             serde_json::json!({"@none": "urn:ngsi-ld:null"}),
+            serde_json::json!("urn:ngsi-ld:null"),
         ] {
             let f = serde_json::json!({"languageMap": ok});
             assert!(

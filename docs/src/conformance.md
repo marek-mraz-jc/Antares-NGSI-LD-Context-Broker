@@ -204,14 +204,14 @@ code/test anchors its evidence cites. It adds no tests; it names where the
 next ones belong.
 
 310 leaf clauses carry 1661 SHALL statements; 117 of them have no Robot
-TP (338 SHALLs), 63 cite no code/test anchor.
+TP (338 SHALLs), 62 cite no code/test anchor.
 
 The fifteen untested clauses with the most SHALL statements:
 
 | clause | title | SHALL | robot TPs | code/test anchors |
 |---|---|---:|---:|---:|
 | 6.18.3.2 | Resource methods › GET | 23 | 0 | 1 |
-| 6.8.3.2 | Resource methods › GET | 17 | 0 | 0 |
+| 6.8.3.2 | Resource methods › GET | 17 | 0 | 1 |
 | 6.5.3.1 | Resource methods › GET | 11 | 0 | 0 |
 | 5.2.39 | EntityMap | 10 | 0 | 4 |
 | 4.2.3 | Cross Domain Ontology | 8 | 0 | 1 |
