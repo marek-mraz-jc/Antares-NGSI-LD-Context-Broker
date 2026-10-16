@@ -1165,10 +1165,13 @@ async fn build_data(
                 }
             }
             m.insert("deletedAt".into(), Value::String(now.to_owned()));
-            let attrs: Vec<String> = if entity_deleted_fired && show {
-                attr_keys(b) // showChanges: every attribute, tombstoned (046_37)
-            } else {
-                relevant_deleted_attrs.to_vec()
+            // 5.8.6: an Entity deletion notifies "only the deletedAt system
+            // property" unless showChanges, then every attribute, tombstoned
+            // (046_37); attributeDeleted alone names the attributes it fired for
+            let attrs: Vec<String> = match (entity_deleted_fired, show) {
+                (true, true) => attr_keys(b),
+                (true, false) => Vec::new(),
+                (false, _) => relevant_deleted_attrs.to_vec(),
             };
             for attr in attrs {
                 let insts: Vec<Value> = b
@@ -4393,6 +4396,33 @@ mod clause_5_8_6_deletion_payload {
                 .is_some_and(|a| a.iter().any(|i| i["value"] == json!(2))),
             "the surviving instance is still reported: {e}"
         );
+    }
+
+    /// 5.8.6: "If the notification was triggered by the deletion of an Entity
+    /// and the notification.showChanges member is not set to true, only the
+    /// deletedAt system property shall be provided", even when the same
+    /// deletion also fires attributeDeleted (Coraine subscription_notify_update_delete).
+    #[tokio::test]
+    async fn an_entity_deletion_notifies_deleted_at_only() {
+        let before = json!({
+            "id": "urn:ngsi-ld:Vehicle:gone",
+            "type": [format!("{DC}/Vehicle")],
+            format!("{DC}/speed"): [{"type": "Property", "value": 1}],
+        });
+        let entry = build(
+            &json!({"notification": {}}),
+            &before,
+            None,
+            &[format!("{DC}/speed")],
+            true,
+        )
+        .await;
+        assert!(entry.get("speed").is_none(), "{entry}");
+        assert!(
+            entry.get(format!("{DC}/speed").as_str()).is_none(),
+            "{entry}"
+        );
+        assert_eq!(entry["deletedAt"], json!("2026-01-01T00:00:00Z"));
     }
 
     /// 5.8.6 with sysAttrs and showChanges: the tombstone carries deletedAt
