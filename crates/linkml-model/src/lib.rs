@@ -21,6 +21,7 @@
 //! ```
 #![forbid(unsafe_code)]
 
+pub mod cache;
 mod error;
 mod model;
 mod schema;
@@ -29,7 +30,7 @@ mod write;
 pub use error::Error;
 pub use model::{
     edm_types, Builtin, Limits, Model, Range, EDM_TYPE_TAG, FLAG_TAGS, KIND_TAG, QB_COMPONENT_TAG,
-    QB_DSD_TAG,
+    QB_DSD_TAG, SURFACE_LIMITS,
 };
 pub use schema::{
     Annotation, Class, Enum, PermissibleValue, Prefix, Schema, Slot, Unit, DEFAULT_RANGE, IMPORTS,

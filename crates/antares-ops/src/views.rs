@@ -485,9 +485,12 @@ fn entry(doc: &Value) -> ViewEntry {
 /// table after the write's own reload.
 struct Reloader {
     state: AppState,
-    /// Each stored document and its entry, so an unchanged view is not
-    /// validated (and its notes not logged) again on every reload.
-    cache: tokio::sync::Mutex<HashMap<String, (Value, ViewEntry)>>,
+    /// Each stored document, its digest and what was made of it, so a reload
+    /// fetches only the documents whose digest changed and an unchanged view
+    /// is not validated (and its notes not logged) again (T-4354).
+    cache: tokio::sync::Mutex<HashMap<String, Held>>,
+    /// The bodies reloads fetched since the pod started.
+    fetched: std::sync::atomic::AtomicU64,
     /// The same for the policy engine's rule documents, per Tenant.
     policy: tokio::sync::Mutex<rule_documents::Cache>,
     /// [`SCHEMA_MAX_ENV`]; `None` refuses every schema write.
@@ -500,57 +503,105 @@ struct Reloader {
     quality: std::sync::RwLock<Arc<quality::Rules>>,
 }
 
+/// One stored document of the view tenant and what the reloader made of it.
+struct Held {
+    digest: u64,
+    doc: Value,
+    made: Made,
+}
+
+enum Made {
+    Retention(String),
+    Quality(String),
+    Schema(String, Option<Schema>),
+    View(ViewEntry),
+}
+
+impl Held {
+    fn new(id: &str, digest: u64, doc: Value) -> Self {
+        let made = if let Some(tenant) = id.strip_prefix(retention::RETENTION_ID_PREFIX) {
+            Made::Retention(tenant.to_owned())
+        } else if let Some(tenant) = id.strip_prefix(quality::QUALITY_ID_PREFIX) {
+            Made::Quality(tenant.to_owned())
+        } else if let Some(tenant) = id.strip_prefix(SCHEMA_ID_PREFIX) {
+            let schema = doc
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| Schema::new(text.as_bytes()));
+            if schema.is_none() {
+                tracing::warn!(tenant, "a stored schema document has no text; skipped");
+            }
+            Made::Schema(tenant.to_owned(), schema)
+        } else {
+            let e = entry(&doc);
+            log_entry(id, &e);
+            Made::View(e)
+        };
+        Self { digest, doc, made }
+    }
+}
+
 impl Reloader {
     async fn reload(&self) -> Result<(), String> {
         let mut cache = self.cache.lock().await;
-        let docs = self.state.view_docs().await?;
-        let mut next = HashMap::with_capacity(docs.len());
+        let listed = self.state.view_digests().await?;
+        let stale: Vec<&str> = listed
+            .iter()
+            .filter(|(id, d)| cache.get(id).is_none_or(|h| h.digest != *d))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        // Only the bodies whose digest moved, the first reload's being all of them. A body
+        // written between the two reads is held under the older digest and fetched again on
+        // the next reload; one deleted between them is in neither, and goes.
+        let mut fresh: HashMap<String, Value> = HashMap::with_capacity(stale.len());
+        for id in stale {
+            fresh.extend(
+                self.state
+                    .view_doc(id)
+                    .await?
+                    .map(|doc| (id.to_owned(), doc)),
+            );
+        }
+        self.fetched.fetch_add(
+            u64::try_from(fresh.len()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let next: HashMap<String, Held> = listed
+            .into_iter()
+            .filter_map(|(id, digest)| {
+                let held = match fresh.remove(&id) {
+                    Some(doc) => Held::new(&id, digest, doc),
+                    None => cache.remove(&id)?,
+                };
+                Some((id, held))
+            })
+            .collect();
+        let mut views = BTreeMap::new();
         let mut schemas = BTreeMap::new();
         let mut retention_docs = Vec::new();
         let mut quality_docs = Vec::new();
-        for doc in docs {
-            let Some(id) = doc.get("id").and_then(Value::as_str).map(str::to_owned) else {
-                tracing::warn!("a stored view document has no id; skipped");
-                continue;
-            };
-            if let Some(tenant) = id.strip_prefix(retention::RETENTION_ID_PREFIX) {
-                retention_docs.push((tenant.to_owned(), doc));
-                continue;
-            }
-            if let Some(tenant) = id.strip_prefix(quality::QUALITY_ID_PREFIX) {
-                quality_docs.push((tenant.to_owned(), doc));
-                continue;
-            }
-            if let Some(tenant) = id.strip_prefix(SCHEMA_ID_PREFIX) {
-                if let Some(text) = doc.get("text").and_then(Value::as_str) {
-                    schemas.insert(tenant.to_owned(), Schema::new(text.as_bytes()));
-                } else {
-                    tracing::warn!(tenant, "a stored schema document has no text; skipped");
+        for (id, held) in &next {
+            match &held.made {
+                Made::Retention(t) => retention_docs.push((t.as_str(), &held.doc)),
+                Made::Quality(t) => quality_docs.push((t.as_str(), &held.doc)),
+                Made::Schema(t, Some(schema)) => {
+                    schemas.insert(t.clone(), schema.clone());
                 }
-                continue;
-            }
-            let entry = match cache.remove(&id) {
-                Some((old, e)) if old == doc => e,
-                _ => {
-                    let e = entry(&doc);
-                    log_entry(&id, &e);
-                    e
+                Made::Schema(_, None) => {}
+                Made::View(e) => {
+                    views.insert(id, (&held.doc, e));
                 }
-            };
-            next.insert(id, (doc, entry));
+            }
         }
-        let table: BTreeMap<_, _> = next.iter().collect();
         self.state.views.replace(
-            table
+            views
                 .iter()
-                .map(|(id, (_, e))| ((*id).clone(), e.clone()))
+                .map(|(id, (_, e))| ((*id).clone(), (*e).clone()))
                 .collect(),
-            revision(table.iter().map(|(id, (doc, _))| (id.as_str(), doc))),
+            revision(views.iter().map(|(id, (doc, _))| (id.as_str(), *doc))),
         );
         self.state.views.replace_schemas(schemas);
-        let retention = Arc::new(retention::load(
-            retention_docs.iter().map(|(t, d)| (t.as_str(), d)),
-        ));
+        let retention = Arc::new(retention::load(retention_docs.into_iter()));
         *self
             .state
             .history_off
@@ -564,9 +615,8 @@ impl Reloader {
         *self
             .quality
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(quality::load(
-            quality_docs.iter().map(|(t, d)| (t.as_str(), d)),
-        ));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Arc::new(quality::load(quality_docs.into_iter()));
         *cache = next;
         drop(cache);
         rule_documents::reload(&self.state, &mut *self.policy.lock().await).await
@@ -625,6 +675,7 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
     let reloader = Arc::new(Reloader {
         state: state.clone(),
         cache: tokio::sync::Mutex::new(HashMap::new()),
+        fetched: std::sync::atomic::AtomicU64::new(0),
         policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
         schema_max: schema_max(std::env::var(SCHEMA_MAX_ENV).ok())?,
         retention: std::sync::RwLock::default(),
@@ -1219,6 +1270,7 @@ mod tests {
         let r = Arc::new(Reloader {
             state: AppState::new("antares-test".into()),
             cache: tokio::sync::Mutex::new(HashMap::new()),
+            fetched: std::sync::atomic::AtomicU64::new(0),
             policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
             schema_max: None,
             retention: std::sync::RwLock::default(),
@@ -1228,6 +1280,45 @@ mod tests {
         let put = put_schema(r.clone(), "city".into(), Bytes::from_static(b"{}")).await;
         assert_eq!(put.map(|p| p.status()), Ok(StatusCode::SERVICE_UNAVAILABLE));
         assert_eq!(r.state.view_doc("schema:city").await, Ok(None));
+    }
+
+    /// T-4354: the 5 s reload lists digests and fetches a body only when
+    /// its digest moved, and keeps the schema it already read.
+    #[tokio::test]
+    async fn an_unchanged_reload_fetches_no_bodies() {
+        let r = Reloader {
+            state: AppState::new("antares-test".into()),
+            cache: tokio::sync::Mutex::new(HashMap::new()),
+            fetched: std::sync::atomic::AtomicU64::new(0),
+            policy: tokio::sync::Mutex::new(rule_documents::Cache::new()),
+            schema_max: None,
+            retention: std::sync::RwLock::default(),
+            deleted: std::sync::Mutex::default(),
+            quality: std::sync::RwLock::default(),
+        };
+        let fetched = || r.fetched.load(std::sync::atomic::Ordering::Relaxed);
+        r.state.put_view_doc("v", base()).await.expect("view");
+        let schema = json!({"id": "schema:city", "text": "{\"id\": \"https://e.org/s\"}"});
+        r.state
+            .put_view_doc("schema:city", schema)
+            .await
+            .expect("schema");
+        r.reload().await.expect("first");
+        assert_eq!(fetched(), 2);
+        let held = r.state.views.schema("city").expect("schema").bytes;
+        r.reload().await.expect("unchanged");
+        assert_eq!(fetched(), 2, "an unchanged reload fetches nothing");
+        let kept = r.state.views.schema("city").expect("schema").bytes;
+        assert!(Arc::ptr_eq(&held, &kept), "the schema read once is kept");
+        let mut changed = base();
+        changed["selector"] = json!(["Bus"]);
+        r.state.put_view_doc("v", changed).await.expect("view");
+        r.reload().await.expect("changed");
+        assert_eq!(fetched(), 3, "only the changed body");
+        r.state.delete_view_doc("v").await.expect("gone");
+        r.reload().await.expect("deleted");
+        assert_eq!(fetched(), 3);
+        assert!(r.cache.lock().await.get("v").is_none());
     }
 
     #[test]

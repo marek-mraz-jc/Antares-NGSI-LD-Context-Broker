@@ -168,9 +168,9 @@ async fn answer(
     // A Tenant with no schema has its views' LinkML surface closed: the
     // same answer as a path that is not there. An oversized one never got
     // in (`ANTARES_SCHEMA_MAX_BYTES` refuses the write, LK7).
-    let (_, schema) = view.schema().ok_or(Refusal::NotFound)?;
+    let (revision, schema) = view.schema().ok_or(Refusal::NotFound)?;
     let schema = &schema;
-    let source = cache.source(id, schema).ok_or(Refusal::NotFound)?;
+    let source = render::Cache::source(id, revision, schema).ok_or(Refusal::NotFound)?;
     // The operation names what it asks about (operation-matrix.yaml
     // `operation_fields`): a class or slot the stored schema lacks is the
     // same 404 as a hidden one.
@@ -207,7 +207,9 @@ async fn answer(
         }
         other => other?,
     };
-    let rendered = cache.get(id, schema, &visible).ok_or(Refusal::NotFound)?;
+    let rendered = cache
+        .get(id, revision, schema, &visible)
+        .ok_or(Refusal::NotFound)?;
     let found = match wanted {
         Wanted::Index => Some((render::JSON, rendered.index.clone())),
         Wanted::Document { major, artifact } => (*major == rendered.major)
