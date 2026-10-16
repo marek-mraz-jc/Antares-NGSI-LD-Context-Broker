@@ -938,33 +938,41 @@ pub async fn create(
     {
         norm.insert(crate::policy::SUBJECT_MEMBER.into(), subject);
     }
-    // Array @context (>1 entry): the broker must host it at its own URL as an
-    // ImplicitlyCreated @context, surfaced via jsonldContext (5.13.1, 050_03)
+    // 5.8.1.4: "If not present, the jsonldContext field shall be initialized
+    // with the @context applicable for the Subscription" (5.5.5 when it has
+    // none). One URL is that URL; anything inline the broker hosts at its own
+    // URL as an ImplicitlyCreated @context (5.13.1, 050_03).
     if !norm.contains_key("jsonldContext") {
-        if let Value::Array(a) = &parsed.ctx.source {
-            if a.len() > 1 {
-                let local_id = uuid::Uuid::new_v4().to_string();
-                let url = format!("{}/{local_id}", crate::contexts::base_url(headers));
-                st.store
-                    .context_put(
-                        Some(&tenant),
-                        &local_id,
-                        serde_json::json!({
-                            "url": url,
-                            "localId": local_id,
-                            "kind": "ImplicitlyCreated",
-                            "createdAt": ts,
-                            // owned by the tenant whose subscription created it
-                            "owner": tenant.as_str(),
-                            "body": {"@context": parsed.ctx.source.clone()},
-                        }),
-                    )
-                    .await?;
-                st.loader
-                    .put_local_for(&tenant, url.clone(), parsed.ctx.source.clone())
-                    .await;
-                norm.insert("jsonldContext".into(), Value::String(url));
-            }
+        let one_url = match &parsed.ctx.source {
+            Value::Null => Some(antares_jsonld::CORE_CONTEXT.to_owned()),
+            Value::String(u) => Some(u.clone()),
+            Value::Array(a) if a.len() == 1 => a[0].as_str().map(str::to_owned),
+            _ => None,
+        };
+        if let Some(url) = one_url {
+            norm.insert("jsonldContext".into(), Value::String(url));
+        } else {
+            let local_id = uuid::Uuid::new_v4().to_string();
+            let url = format!("{}/{local_id}", crate::contexts::base_url(headers));
+            st.store
+                .context_put(
+                    Some(&tenant),
+                    &local_id,
+                    serde_json::json!({
+                        "url": url,
+                        "localId": local_id,
+                        "kind": "ImplicitlyCreated",
+                        "createdAt": ts,
+                        // owned by the tenant whose subscription created it
+                        "owner": tenant.as_str(),
+                        "body": {"@context": parsed.ctx.source.clone()},
+                    }),
+                )
+                .await?;
+            st.loader
+                .put_local_for(&tenant, url.clone(), parsed.ctx.source.clone())
+                .await;
+            norm.insert("jsonldContext".into(), Value::String(url));
         }
     }
     let doc = Value::Object(norm);
