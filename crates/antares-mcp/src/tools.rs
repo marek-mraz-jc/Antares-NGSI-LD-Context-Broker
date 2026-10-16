@@ -37,6 +37,11 @@ const TIMERELS: &[&str] = &["before", "after", "between"];
 /// The instant a history is ordered by (TS 104 175 4.11); `observedAt`
 /// when absent, so data without it needs another.
 const TIMEPROPERTIES: &[&str] = &["observedAt", "createdAt", "modifiedAt", "deletedAt"];
+/// The entity representations (6.3.7); `options=sysAttrs` rides as the
+/// `sysAttrs` flag, which [`query`] turns into the option.
+const FORMATS: &[&str] = &["normalized", "concise", "keyValues"];
+/// The temporal representations (6.3.7, 6.3.12).
+const TEMPORAL_FORMATS: &[&str] = &["normalized", "temporalValues", "aggregatedValues"];
 
 const GET_ENTITY: &[Arg] = &[
     req("id", Kind::Id),
@@ -46,6 +51,8 @@ const GET_ENTITY: &[Arg] = &[
     opt("lang", Kind::Text(64)),
     opt("join", Kind::Word(JOINS)),
     opt("joinLevel", Kind::Int(1, 3)),
+    opt("format", Kind::Word(FORMATS)),
+    opt("sysAttrs", Kind::Flag),
 ];
 
 const QUERY: &[Arg] = &[
@@ -65,6 +72,10 @@ const QUERY: &[Arg] = &[
     opt("lang", Kind::Text(64)),
     opt("join", Kind::Word(JOINS)),
     opt("joinLevel", Kind::Int(1, 3)),
+    opt("format", Kind::Word(FORMATS)),
+    opt("sysAttrs", Kind::Flag),
+    // 4.23 Entity Ordering, local scope only
+    opt("orderBy", Kind::Text(1024)),
     opt("count", Kind::Flag),
     opt("limit", Kind::Int(1, 1000)),
     opt("cursor", Kind::Text(crate::cursor::MAX_LEN)),
@@ -99,9 +110,36 @@ const TEMPORAL_ONE: &[Arg] = &[
     opt("lastN", Kind::Int(1, 100)),
     opt("aggrMethods", Kind::Text(256)),
     opt("aggrPeriodDuration", Kind::Text(64)),
+    opt("format", Kind::Word(TEMPORAL_FORMATS)),
+    opt("sysAttrs", Kind::Flag),
 ];
 
 const TEMPORAL_QUERY: &[Arg] = &[
+    opt("type", Kind::Types),
+    opt("id", Kind::Ids),
+    opt("attrs", Kind::Attrs),
+    opt("q", Kind::Text(4096)),
+    opt("scopeQ", Kind::Text(1024)),
+    opt("georel", Kind::Text(256)),
+    opt("geometry", Kind::Word(GEOMETRIES)),
+    opt("coordinates", Kind::Coordinates),
+    opt("geoproperty", Kind::Attr),
+    req("timerel", Kind::Word(TIMERELS)),
+    req("timeAt", Kind::Text(64)),
+    opt("endTimeAt", Kind::Text(64)),
+    opt("timeproperty", Kind::Word(TIMEPROPERTIES)),
+    opt("lastN", Kind::Int(1, 100)),
+    opt("aggrMethods", Kind::Text(256)),
+    opt("aggrPeriodDuration", Kind::Text(64)),
+    opt("format", Kind::Word(TEMPORAL_FORMATS)),
+    opt("sysAttrs", Kind::Flag),
+    opt("count", Kind::Flag),
+    opt("limit", Kind::Int(1, 1000)),
+    opt("cursor", Kind::Text(crate::cursor::MAX_LEN)),
+];
+
+/// The POST form: its conditions go into the Query document.
+const BATCH_TEMPORAL_QUERY: &[Arg] = &[
     opt("type", Kind::Types),
     opt("id", Kind::Ids),
     opt("attrs", Kind::Attrs),
@@ -280,7 +318,7 @@ pub(crate) const TOOLS: [ToolDef; 32] = [
         name: "batch_query_temporal",
         op: OperationId::TemporalQueryPost,
         description: "Query the history of Entities with a Query document (TS 104 175 11.3.3, POST form), a page of Entities at a time.",
-        args: TEMPORAL_QUERY,
+        args: BATCH_TEMPORAL_QUERY,
         key: "entities",
         paged: true,
         write: false,
@@ -539,12 +577,17 @@ fn one<'a>(args: &'a Args, name: &str) -> &'a str {
     }
 }
 
-/// The query string of `args` but those the tool handles itself.
+/// The query string of `args` but those the tool handles itself; the
+/// `sysAttrs` flag is the `options=sysAttrs` of 6.3.7.
 fn query(args: &Args, skip: &[&str], extra: &[(&str, String)]) -> String {
     let mut pairs: Vec<String> = args
         .iter()
         .filter(|(k, _)| !skip.contains(k))
-        .map(|(k, v)| format!("{k}={}", encode(&text(v))))
+        .filter_map(|(k, v)| match (*k, v) {
+            ("sysAttrs", Checked::Flag(true)) => Some("options=sysAttrs".to_owned()),
+            ("sysAttrs", _) => None,
+            _ => Some(format!("{k}={}", encode(&text(v)))),
+        })
         .collect();
     pairs.extend(extra.iter().map(|(k, v)| format!("{k}={}", encode(v))));
     if pairs.is_empty() {
@@ -852,6 +895,54 @@ mod tests {
             json!({"type": "Query", "entities": [{"type": ""}], "timerel": "after"}),
             "outside a temporal query a time member is an ordinary one"
         );
+    }
+
+    /// T-4258: a representation is the standard's: `format` as given,
+    /// `sysAttrs` as `options=sysAttrs`, `orderBy` as given; the POST
+    /// temporal form takes none of them into its document.
+    #[test]
+    fn format_sys_attrs_and_order_by_are_the_standard_parameters() {
+        let a = args(&[
+            ("type", Checked::Many(vec!["Car".into()])),
+            ("format", Checked::One("keyValues".into())),
+            ("sysAttrs", Checked::Flag(true)),
+            ("orderBy", Checked::One("speed;desc".into())),
+        ]);
+        let q = named("query_entities").map(|t| build(t, &a, 5, 0).target);
+        assert_eq!(
+            q.as_deref(),
+            Some("/ngsi-ld/v1/entities?format=keyValues&orderBy=speed%3Bdesc&options=sysAttrs&type=Car&limit=5&offset=0&count=true")
+        );
+        let off = args(&[
+            ("id", Checked::One("urn:ngsi-ld:Car:1".into())),
+            ("sysAttrs", Checked::Flag(false)),
+        ]);
+        let e = named("get_entity").map(|t| build(t, &off, 0, 0).target);
+        assert_eq!(e.as_deref(), Some("/ngsi-ld/v1/entities/urn:ngsi-ld:Car:1"));
+        let arg_names = |name: &str| -> Vec<&str> {
+            named(name).map_or(Vec::new(), |t| t.args.iter().map(|a| a.name).collect())
+        };
+        for name in [
+            "get_entity",
+            "query_entities",
+            "query_temporal",
+            "retrieve_temporal",
+        ] {
+            let names = arg_names(name);
+            assert_eq!(
+                (names.contains(&"format"), names.contains(&"sysAttrs")),
+                (true, true),
+                "{name}"
+            );
+        }
+        assert!(!arg_names("batch_query_temporal").contains(&"format"));
+        let kinds = |name: &str| {
+            named(name)
+                .and_then(|t| t.args.iter().find(|a| a.name == "format"))
+                .map(|a| a.kind)
+        };
+        assert_eq!(kinds("query_temporal"), Some(Kind::Word(TEMPORAL_FORMATS)));
+        assert_eq!(kinds("get_entity"), Some(Kind::Word(FORMATS)));
     }
 
     #[test]
