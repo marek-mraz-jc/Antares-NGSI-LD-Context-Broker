@@ -1138,6 +1138,17 @@ pub async fn update(
             }
             let target = antares_store::stored_object(doc)?;
             crate::apply_doc_fragment(target, &norm, &ts);
+            // 5.2.12 holds for the updated Subscription too: deleting both
+            // selectors is refused and nothing is written
+            let local_only = target.get("localOnly").and_then(Value::as_bool) == Some(true);
+            if !local_only
+                && !target.contains_key("entities")
+                && !target.contains_key("watchedAttributes")
+            {
+                return Err(NgsiError::BadRequestData(
+                    "one of entities or watchedAttributes is required (5.2.12)".into(),
+                ));
+            }
             Ok::<(), NgsiError>(())
         })
         .await?;
