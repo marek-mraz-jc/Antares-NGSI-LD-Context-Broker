@@ -107,6 +107,25 @@ fn only(n: &Value) -> Result<&Value, String> {
     }
 }
 
+/// Whether `hidden` shows in the Entities `n` carries. The envelope is left out: its random
+/// Notification id and timestamps once held the old hidden salary "4321" (T-4250, fast run
+/// 38860860930: urn:ngsi-ld:Notification:3012fe29-bdc5-4321-...).
+fn leaks(n: &Value, hidden: &str) -> bool {
+    n.get("data")
+        .is_some_and(|d| d.to_string().contains(hidden))
+}
+
+#[test]
+fn a_hidden_value_in_the_envelope_alone_is_no_leak() {
+    let n = json!({
+        "id": "urn:ngsi-ld:Notification:3012fe29-bdc5-4321-9876-543210987654",
+        "notifiedAt": "2026-10-16T09:43:21.987654Z",
+        "data": [{"id": "urn:ngsi-ld:Car:1", "colour": {"type": "Property", "value": "green"}}],
+    });
+    assert!(!leaks(&n, "4321") && !leaks(&n, "987654"));
+    assert!(leaks(&n, "green"));
+}
+
 /// `timesSent` of Subscription `id`, read through `root`.
 async fn times_sent(f: &Fixture, root: &str, id: &str) -> Option<u64> {
     let a = subs(f, Method::GET, root, &format!("/{id}"), None).await;
@@ -128,7 +147,7 @@ async fn views_notifications_drop_hidden_changes_and_strip_previous_value() -> R
     patch(
         &f,
         "1",
-        &json!({"secret": prop(&json!(3)), "colour": prop(&json!("green"))}),
+        &json!({"secret": prop(&json!(987_654.5)), "colour": prop(&json!("green"))}),
     )
     .await?;
     let n = next(&mut rx).await?;
@@ -140,8 +159,8 @@ async fn views_notifications_drop_hidden_changes_and_strip_previous_value() -> R
         Some(&json!("red")),
         "{n}"
     );
-    for hidden in ["secret", "\"3\"", "grey", "Car:3"] {
-        assert!(!n.to_string().contains(hidden), "{hidden} leaked: {n}");
+    for hidden in ["secret", "987654", "grey", "Car:3"] {
+        assert!(!leaks(&n, hidden), "{hidden} leaked: {n}");
     }
     assert!(car.get("speed").is_some(), "the shown Attributes stay: {n}");
     Ok(())
@@ -168,11 +187,8 @@ async fn views_notifications_join_only_what_the_view_shows() -> Result<(), Strin
         Some(&json!("Pat")),
         "{n}"
     );
-    // The entities alone: the envelope's random Notification id may hold "4321" (T-4250, fast
-    // run 38860860930: urn:ngsi-ld:Notification:3012fe29-bdc5-4321-...).
-    let shown = n.get("data").map(ToString::to_string).unwrap_or_default();
-    for hidden in ["4321", "salary", "Acme"] {
-        assert!(!shown.contains(hidden), "{hidden} leaked: {n}");
+    for hidden in ["987654", "salary", "Acme"] {
+        assert!(!leaks(&n, hidden), "{hidden} leaked: {n}");
     }
     Ok(())
 }
