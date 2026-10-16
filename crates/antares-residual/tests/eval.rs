@@ -578,6 +578,12 @@ fn arithmetic_is_checked_and_rounding_keeps_integers() {
         (eq(f2(Func::Pow, p("pm10"), i(2)), i(144)), T),
         (eq(f2(Func::Pow, i(2), i(-1)), n(0.5)), T),
         (eq(f2(Func::Pow, n(2.0), n(0.5)), n(2.0_f64.sqrt())), T),
+        // exact on every platform, Miri included: a division and a square root
+        (eq(f2(Func::Pow, i(2), i(-2)), n(0.25)), T),
+        (eq(f2(Func::Pow, n(4.0), n(0.5)), n(2.0)), T),
+        (is_null(f2(Func::Pow, i(0), i(-1))), T),
+        // past i64 the integer route has no answer, and powf still gives one
+        (cmp(Cmp::Gt, f2(Func::Pow, i(10), i(-30)), n(0.0)), T),
         (is_null(f2(Func::Pow, i(i64::MAX), i(2))), T),
         (is_null(f2(Func::Pow, i(-8), n(0.5))), T),
         (is_null(f2(Func::Pow, s("x"), i(2))), T),

@@ -540,8 +540,26 @@ fn call(func: Func, args: Vec<Option<Val<'_>>>) -> Option<Val<'_>> {
                 .ok()
                 .and_then(|exp| base.checked_pow(exp))
                 .map(Val::Int),
+            // `powf` is not correctly rounded and may differ by platform (Miri
+            // perturbs it on purpose); a division and `sqrt` are, so an integer
+            // to a negative integer power and a square root give one answer
+            // everywhere.
             (base, exp) => {
-                let result = number(base)?.powf(number(exp)?);
+                let exact = match (base, exp) {
+                    (Val::Int(b), Val::Int(e)) => u32::try_from(e.unsigned_abs())
+                        .ok()
+                        .and_then(|e| b.checked_pow(e))
+                        .map(|power| 1.0 / int_to_f64(power)),
+                    _ => None,
+                };
+                let (base, exp) = (number(base)?, number(exp)?);
+                let result = exact.unwrap_or_else(|| {
+                    if exp.to_bits() == 0.5_f64.to_bits() {
+                        base.sqrt()
+                    } else {
+                        base.powf(exp)
+                    }
+                });
                 result.is_finite().then_some(Val::Num(result))
             }
         },
