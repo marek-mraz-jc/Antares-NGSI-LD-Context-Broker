@@ -30,6 +30,30 @@ ANTARES_TEST_DIR="${ANTARES_TEST_DIR:-/tmp/antares-cortest}"
 # shellcheck source=/dev/null
 source "$CORAINE_DIR/test/funcTests/corTestFunctions.sh"
 
+# corCurl adds its own Content-Type and Accept, then the case's -H for either,
+# so a request carries two. Content-Type is a singleton (RFC 9110 5.3) and
+# Antares refuses two media types; two Accept lines combine into one list in
+# which corCurl's application/json, q=1, outranks what the case asked for.
+# Coraine honoured the case's, the last one, so curl, for every caller, sends
+# only the last Content-Type and the last Accept it is given.
+curl() {
+  local -a args=()
+  local ct="" accept=""
+  while [ "$#" != 0 ]; do
+    if [ "$1" = -H ] || [ "$1" = --header ]; then
+      case "${2,,}" in
+        content-type:*) ct="$2"; shift 2; continue ;;
+        accept:*) accept="$2"; shift 2; continue ;;
+      esac
+    fi
+    args+=("$1")
+    shift
+  done
+  [ -z "$accept" ] || args+=(-H "$accept")
+  [ -z "$ct" ] || args+=(-H "$ct")
+  command curl "${args[@]}"
+}
+
 # Coraine flag -> what Antares does without it:
 #   -dist, -distOps, --distributed   forwarding to registered sources is always on
 #   --troe <x>, --troeSync, --troe{Name,User,Host,Port} <x>

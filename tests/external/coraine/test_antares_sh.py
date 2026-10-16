@@ -127,6 +127,21 @@ class Adapter(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("unknown ANTARES_TEST_STORE", r.stderr)
 
+    def test_curl_sends_one_content_type_and_one_accept_the_last_given(self):
+        # corCurl adds its default Content-Type and Accept, then a case's own -H; the
+        # broker refuses two Content-Types, and two Accepts combine (RFC 9110 5.3)
+        os.makedirs(f"{self.d}/bin")
+        with open(f"{self.d}/bin/curl", "w") as fh:
+            fh.write('#!/bin/bash\nprintf "%s\\n" "$@"\n')
+        os.chmod(f"{self.d}/bin/curl", 0o755)
+        r = self.sh(f"PATH={self.d}/bin:$PATH; curl -s -H 'Content-Type: application/json' "
+                    "-H 'Accept: application/json' --header 'content-type: application/ld+json' "
+                    "-H 'Accept: application/geo+json;q=0.5' -d x")
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        self.assertEqual(r.stdout.split("\n")[:-1], [
+            "-s", "-d", "x", "-H", "Accept: application/geo+json;q=0.5",
+            "-H", "content-type: application/ld+json"])
+
     def test_postgres_needs_its_url(self):
         r = self.sh("coraineStart", store="postgres")
         self.assertNotEqual(r.returncode, 0)
