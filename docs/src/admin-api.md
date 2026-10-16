@@ -438,7 +438,8 @@ lose nothing. The document is stored beside the views under
 ```json
 {"rules": [
   {"type": "https://example.org/Vehicle", "current": "PT5M", "history": "PT8H"},
-  {"type": "https://example.org/Stop"}
+  {"type": "https://example.org/Stop"},
+  {"type": "https://example.org/School", "history": "off"}
 ]}
 ```
 
@@ -449,6 +450,14 @@ lose nothing. The document is stored beside the views under
   writer sent wins (4.22).
 - `history`: the type's attribute instances whose `observedAt` (else
   `modifiedAt`, `deletedAt`, `createdAt`) is older than that are deleted.
+- `history: "off"` (T-4275): the type keeps its current state only. The
+  write path records no attribute instance for an Entity whose types include
+  it, and the sweep deletes the instances it already holds, in the same
+  batches, so a temporal read of the type answers an empty history once they
+  are gone. Current state, subscriptions and notifications are unchanged. A
+  write through the temporal API (`POST /temporal/entities…`) is not gated,
+  and the next sweep removes it like the rest. A type with no `history`
+  keeps its whole history.
 - A duration is ISO 8601 (`PT5M`, `PT8H`, `P30D`, `P1DT12H`) or short
   (`90s`, `5m`, `8h`, `14d`), from one minute to ten years.
 
