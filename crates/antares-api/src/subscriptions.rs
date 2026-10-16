@@ -685,7 +685,9 @@ pub fn present_subscription(doc: &Value, ctx: &Context, sys_attrs: bool, csource
             serde_json::json!(["attributeCreated", "attributeUpdated"]),
         );
     }
-    // status (5.2.12 output): active | paused | expired
+    // status (Table 5.2.12-2): active | paused | expired; a failed delivery
+    // is notification.status (5.8.6). Only a CSR subscription itself turns
+    // "failed" (5.11.7: "Update the subscription status to "failed"").
     let expired = obj
         .get("expiresAt")
         .and_then(Value::as_str)
@@ -695,8 +697,8 @@ pub fn present_subscription(doc: &Value, ctx: &Context, sys_attrs: bool, csource
         "expired"
     } else if paused {
         "paused"
-    } else if obj.get("status").and_then(Value::as_str) == Some("failed") {
-        "failed" // 5.8.6 / 5.11.7 delivery-failure status
+    } else if csource && obj.get("status").and_then(Value::as_str) == Some("failed") {
+        "failed"
     } else {
         "active"
     };
