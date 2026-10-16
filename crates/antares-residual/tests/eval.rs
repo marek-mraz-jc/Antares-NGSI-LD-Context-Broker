@@ -577,7 +577,25 @@ fn arithmetic_is_checked_and_rounding_keeps_integers() {
         (eq(f2(Func::Mod, n(7.5), i(2)), n(1.5)), T),
         (eq(f2(Func::Pow, p("pm10"), i(2)), i(144)), T),
         (eq(f2(Func::Pow, i(2), i(-1)), n(0.5)), T),
-        (eq(f2(Func::Pow, n(2.0), n(0.5)), n(2.0_f64.sqrt())), T),
+        (eq(f2(Func::Pow, i(-2), i(-3)), n(-0.125)), T),
+        (is_null(f2(Func::Pow, i(0), i(-1))), T),
+        // A fractional power is as precise as the platform's `powf`, which Rust leaves open.
+        (
+            cmp(
+                Cmp::Gt,
+                f2(Func::Pow, n(2.0), n(0.5)),
+                n(std::f64::consts::SQRT_2 - 1e-9),
+            ),
+            T,
+        ),
+        (
+            cmp(
+                Cmp::Lt,
+                f2(Func::Pow, n(2.0), n(0.5)),
+                n(std::f64::consts::SQRT_2 + 1e-9),
+            ),
+            T,
+        ),
         (is_null(f2(Func::Pow, i(i64::MAX), i(2))), T),
         (is_null(f2(Func::Pow, i(-8), n(0.5))), T),
         (is_null(f2(Func::Pow, s("x"), i(2))), T),

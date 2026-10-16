@@ -540,6 +540,20 @@ fn call(func: Func, args: Vec<Option<Val<'_>>>) -> Option<Val<'_>> {
                 .ok()
                 .and_then(|exp| base.checked_pow(exp))
                 .map(Val::Int),
+            // An exact power and one rounding: `powf`'s precision is unspecified, so 2 ^ -1 is
+            // 0.5 on every platform only when it is 1 / 2 (Miri models the imprecision).
+            (Val::Int(base), Val::Int(exp))
+                if u32::try_from(exp.unsigned_abs())
+                    .ok()
+                    .and_then(|e| base.checked_pow(e))
+                    .is_some() =>
+            {
+                let power = u32::try_from(exp.unsigned_abs())
+                    .ok()
+                    .and_then(|e| base.checked_pow(e))?;
+                let result = 1.0 / int_to_f64(power);
+                result.is_finite().then_some(Val::Num(result))
+            }
             (base, exp) => {
                 let result = number(base)?.powf(number(exp)?);
                 result.is_finite().then_some(Val::Num(result))
