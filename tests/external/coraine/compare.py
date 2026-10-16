@@ -31,6 +31,7 @@ KEEP_HEADERS = ("location", "content-type", "ngsild-results-count", "link")
 PROBLEM_PREFIX = "https://uri.etsi.org/ngsi-ld/errors/"
 RX = "\x00RX:"  # an expected JSON value that was a bare REGEX(...)
 MARKER = "CORAINE-ONLY "
+HEADER_LINE = re.compile(r"([A-Za-z][A-Za-z0-9-]*):\s*(.*)")
 
 
 def regex_end(s, start):
@@ -194,6 +195,10 @@ def item_equal(exp, act):
         return json_equal(exp[1], act[1])
     if exp[0] == "header":
         return exp[1] == act[1] and text_matches(exp[2], act[2])
+    # a kept header a case prints as text: the name is case-insensitive (RFC 9110 5.1)
+    e, a = HEADER_LINE.match(exp[-1]), HEADER_LINE.match(act[-1])
+    if e and a and e[1].lower() == a[1].lower() and e[1].lower() in KEEP_HEADERS:
+        return text_matches(e[2], a[2])
     return text_matches(exp[-1], act[-1])
 
 

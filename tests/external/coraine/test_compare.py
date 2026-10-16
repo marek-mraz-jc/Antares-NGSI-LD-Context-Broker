@@ -104,6 +104,13 @@ class Normalised(unittest.TestCase):
         self.assertIsNone(compare.normalised_diff("count: REGEX([0-9]+)\n", "count: 4\n"))
         self.assertIsNotNone(compare.normalised_diff("a\n", ""))
 
+    def test_a_kept_header_printed_as_text_ignores_the_name_case(self):
+        # RFC 9110 5.1: field names are case-insensitive; the value still counts
+        exp = "NGSILD-Results-Count: 50\n"
+        self.assertIsNone(compare.normalised_diff(exp, "Ngsild-Results-Count: 50\n"))
+        self.assertIsNotNone(compare.normalised_diff(exp, "Ngsild-Results-Count: 51\n"))
+        self.assertIsNotNone(compare.normalised_diff("Count: 3\n", "count: 3\n"))
+
     def test_a_body_that_is_not_json_is_compared_as_text(self):
         self.assertIsNone(compare.normalised_diff("HTTP/1.1 200 OK\n\n{not json\n", "HTTP/1.1 200 OK\n\n{not json\n"))
         self.assertIsNotNone(compare.normalised_diff("HTTP/1.1 200 OK\n\n{not json\n", "HTTP/1.1 200 OK\n\n{not jsox\n"))
