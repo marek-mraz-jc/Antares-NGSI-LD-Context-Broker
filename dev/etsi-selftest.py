@@ -217,6 +217,8 @@ def check_view_diff():
                     line = {"test": test, "method": method, "url": url, "headers": headers}
                     if test is None:
                         line.update(fixture=True, suite=extra[0])
+                        if len(extra) > 1:
+                            line["body"] = extra[1]
                     elif extra:
                         line["body"] = extra[0]
                     fh.write(json.dumps(line) + "\n")
@@ -291,6 +293,24 @@ def check_view_diff():
         shown = run("shown", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
                     [(d, "GET", f"{root}/entities?type=Building&attrs=name,location", [])])
         assert view_diff.diff(restricted, e1, shown, binds) == 1, "a read of shown names owes nothing"
+        # T-3982: a create the view refuses never makes the Entity, so a later TP naming it owes
+        # the 404; a fixture that makes it again at the root clears that
+        made = [
+            (a, "POST", f"{root}/entities/", [], {"id": "urn:B1", "type": "Building"}),
+            (a, "POST", f"{root}/entities", [], {"id": "urn:B2", "type": "Building"}),
+            (None, "POST", "http://h/ngsi-ld/v1/entities", [], "TP/s.robot", {"id": "urn:B2", "type": "Building"}),
+            (b, "GET", f"{root}/entities/urn%3AB1", []),
+            (c, "GET", f"{root}/entities/urn:B2", []),
+            (d, "GET", f"{root}/entities/urn:B3", []),
+        ]
+        unmade = run("unmade", [(a, "FAIL"), (b, "FAIL"), (c, "PASS"), (d, "PASS")], made)
+        assert view_diff.diff(restricted, e1, unmade, binds) == 0
+        why = {r["tp"]: r["owed"] for r in json.load(open(f"{unmade}/owed-refusals.json"))["refusals"]}
+        assert sorted(why) == [a, b] and "never made" in why[b][0], why
+        remade = run("remade", [(a, "FAIL"), (b, "FAIL"), (c, "FAIL"), (d, "PASS")], made)
+        assert view_diff.diff(restricted, e1, remade, binds) == 1, "an Entity a fixture made again owes nothing"
+        other = run("other", [(a, "FAIL"), (b, "FAIL"), (c, "PASS"), (d, "FAIL")], made)
+        assert view_diff.diff(restricted, e1, other, binds) == 1, "an Entity nobody tried to make owes nothing"
 
         # T-3980: names in the path, the type of an entity id read, an orderBy, a listing, a join, a
         # query naming no type, and an answer lacking only hidden Attributes are owed by the view
@@ -333,7 +353,70 @@ def check_view_diff():
                  if o.get("kind") == "read"}
         assert set(committed["operations"]) == reads, "etsi-restricted offers the matrix's reads"
     print("  view diff ok (owed refusals pass, a deviation, a stale known entry or a missing TP fails;"
-          " a hidden type or Attribute owes its refusal, a narrowing view its narrowing)")
+          " a hidden type or Attribute, or an Entity a refused create never made, owes its refusal,"
+          " a narrowing view its narrowing)")
+
+
+def check_view_residue():
+    """T-3954: an Entity a TP created (setup or body) is deleted at the
+    setup root, local only and in its Tenant, once the TP is over; a 404 is
+    fine, and only creating requests count."""
+    import http.server
+    import threading
+    import types
+
+    # the listener's import; Robot itself is not needed by what runs here
+    for name in ("robot", "robot.libraries", "robot.libraries.BuiltIn"):
+        sys.modules.setdefault(name, types.ModuleType(name))
+    sys.modules["robot.libraries.BuiltIn"].BuiltIn = object
+    spec = importlib.util.spec_from_file_location("etsi_setup_url", f"{HERE}/etsi_setup_url.py")
+    listener = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(listener)
+
+    view = "http://h/x/views/all/ngsi-ld/v1"
+    ids = listener.created_ids
+    assert ids("POST", f"{view}/entities", {"id": "urn:a", "type": "T"}) == ["urn:a"]
+    assert ids("POST", f"{view}/entities/", {"id": "urn:a"}) == ["urn:a"], "D018_03 posts to entities/"
+    assert ids("POST", f"{view}/entityOperations/upsert?options=update",
+               [{"id": "urn:a"}, {"id": "urn:b"}, {"type": "T"}, "x"]) == ["urn:a", "urn:b"]
+    assert ids("POST", f"{view}/entityOperations/create", [{"id": "urn:c"}]) == ["urn:c"]
+    assert ids("POST", f"{view}/entityOperations/delete", ["urn:a"]) == []
+    assert ids("PATCH", f"{view}/entities", {"id": "urn:a"}) == []
+    assert ids("POST", f"{view}/entities/urn:a/attrs", {"id": "urn:a"}) == []
+    assert ids("POST", f"{view}/entities", None) == []
+
+    seen = []
+
+    class Root(http.server.BaseHTTPRequestHandler):
+        def do_DELETE(self):
+            seen.append((self.path, self.headers.get("NGSILD-Tenant")))
+            self.send_response(404 if "gone" in self.path else 204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Root)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        root = f"http://127.0.0.1:{server.server_port}/ngsi-ld/v1"
+        tp = listener.etsi_setup_url(root)
+        tp.created = [("urn:ngsi-ld:Vehicle:1", None), ("urn:ngsi-ld:Vehicle:1", None),
+                      ("urn:gone", None), ("urn:t#1", "city")]
+        tp.end_test(None, None)
+        assert seen == [
+            ("/ngsi-ld/v1/entities/urn%3Angsi-ld%3AVehicle%3A1?local=true", None),
+            ("/ngsi-ld/v1/entities/urn%3Agone?local=true", None),
+            ("/ngsi-ld/v1/entities/urn%3At%231?local=true", "city"),
+        ], seen
+        assert tp.created == [], "the list starts empty for the next TP"
+        seen.clear()
+        tp.end_test(None, None)
+        assert seen == [], "a TP that created nothing deletes nothing"
+    finally:
+        server.shutdown()
+    print("  view residue ok (created ids found, deleted once each at the root, local, in their Tenant)")
 
 
 def check_recorder():
@@ -376,5 +459,6 @@ if __name__ == "__main__":
     check_baseline()
     check_compare()
     check_view_diff()
+    check_view_residue()
     check_recorder()
     print("OK")

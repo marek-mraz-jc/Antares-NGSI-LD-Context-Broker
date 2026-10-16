@@ -924,7 +924,35 @@ pub trait ForwardTransport: Send + Sync {
     ) -> AdmitFuture<'a> {
         Box::pin(std::future::ready(Ok(())))
     }
+
+    /// Whether this transport delivers the notifications sent to `uri`
+    /// (ADR-0025 rule 7). Such a delivery opens no socket, so the egress
+    /// guard and the breaker do not judge it; `false` leaves it to the
+    /// binding of the URI's scheme, as before.
+    fn notifies(&self, _uri: &str) -> bool {
+        false
+    }
+
+    /// One attempt to deliver `notification`, which a Subscription of
+    /// Tenant `tenant` sends to `uri`, an endpoint [`Self::notifies`] took.
+    /// `Err` carries why it failed: a failed attempt under the 5.8.6 retry
+    /// and dead-letter policy, as an HTTP one is. No subject is carried:
+    /// delivery is broker-initiated (ADR-0020).
+    fn notify<'a>(
+        &'a self,
+        _tenant: &'a TenantId,
+        _uri: &'a str,
+        _notification: &'a Value,
+    ) -> NotifyFuture<'a> {
+        Box::pin(std::future::ready(Err(
+            "this transport delivers no notification".into(),
+        )))
+    }
 }
+
+/// What [`ForwardTransport::notify`] answers.
+pub type NotifyFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
 
 /// What [`ForwardTransport::admit`] answers.
 pub type AdmitFuture<'a> =

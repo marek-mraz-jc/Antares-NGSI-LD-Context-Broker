@@ -13,7 +13,7 @@ use serde_json::json;
 /// A query in t0 reaches t8 (eight in-process calls deep) and not t9.
 #[tokio::test]
 async fn icsr_past_the_depth_bound_no_forward_is_made() {
-    let (_b, app) = broker(None).await;
+    let (_b, app) = broker(None, Vec::new()).await;
     for n in 0..9u32 {
         let (source, target) = (format!("t{n}"), format!("t{}", n.saturating_add(1)));
         grant(&app, &target, &source, json!({})).await;

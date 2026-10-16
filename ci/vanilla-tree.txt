@@ -428,7 +428,7 @@ antares-broker v0.2.0
 │   │   │       │       ├── hyper-rustls feature "http1"
 │   │   │       │       │   ├── hyper-rustls v0.27.9
 │   │   │       │       │   │   ├── hyper v1.11.1 (*)
-│   │   │       │       │   │   ├── rustls v0.23.45
+│   │   │       │       │   │   ├── rustls v0.23.46
 │   │   │       │       │   │   │   ├── subtle v2.6.1
 │   │   │       │       │   │   │   ├── log feature "default" (*)
 │   │   │       │       │   │   │   ├── once_cell feature "alloc" (*)
@@ -474,7 +474,7 @@ antares-broker v0.2.0
 │   │   │       │       │   │   ├── tokio-rustls v0.26.4
 │   │   │       │       │   │   │   ├── tokio feature "default" (*)
 │   │   │       │       │   │   │   └── rustls feature "std"
-│   │   │       │       │   │   │       ├── rustls v0.23.45 (*)
+│   │   │       │       │   │   │       ├── rustls v0.23.46 (*)
 │   │   │       │       │   │   │       ├── once_cell feature "std" (*)
 │   │   │       │       │   │   │       ├── rustls-pki-types feature "std"
 │   │   │       │       │   │   │       │   ├── rustls-pki-types v1.15.1 (*)
@@ -532,7 +532,7 @@ antares-broker v0.2.0
 │   │   │       │       ├── hyper-rustls feature "tls12"
 │   │   │       │       │   ├── hyper-rustls v0.27.9 (*)
 │   │   │       │       │   ├── rustls feature "tls12"
-│   │   │       │       │   │   └── rustls v0.23.45 (*)
+│   │   │       │       │   │   └── rustls v0.23.46 (*)
 │   │   │       │       │   └── tokio-rustls feature "tls12"
 │   │   │       │       │       ├── tokio-rustls v0.26.4 (*)
 │   │   │       │       │       └── rustls feature "tls12" (*)
@@ -807,11 +807,11 @@ antares-broker v0.2.0
 │   │   │       ├── tokio feature "sync" (*)
 │   │   │       ├── tokio feature "time" (*)
 │   │   │       ├── rustls feature "logging"
-│   │   │       │   ├── rustls v0.23.45 (*)
+│   │   │       │   ├── rustls v0.23.46 (*)
 │   │   │       │   └── rustls feature "log"
-│   │   │       │       └── rustls v0.23.45 (*)
+│   │   │       │       └── rustls v0.23.46 (*)
 │   │   │       ├── rustls feature "ring"
-│   │   │       │   ├── rustls v0.23.45 (*)
+│   │   │       │   ├── rustls v0.23.46 (*)
 │   │   │       │   └── rustls-webpki feature "ring"
 │   │   │       │       └── rustls-webpki v0.103.15 (*)
 │   │   │       ├── rustls feature "std" (*)
@@ -1589,7 +1589,7 @@ antares-broker v0.2.0
 │   │   │   │   │       │       │       └── percent-encoding feature "alloc"
 │   │   │   │   │       │       │           └── percent-encoding v2.3.2
 │   │   │   │   │       │       ├── rustls feature "std"
-│   │   │   │   │       │       │   ├── rustls v0.23.45
+│   │   │   │   │       │       │   ├── rustls v0.23.46
 │   │   │   │   │       │       │   │   ├── subtle v2.6.1
 │   │   │   │   │       │       │   │   ├── once_cell feature "alloc"
 │   │   │   │   │       │       │   │   │   ├── once_cell v1.21.4
@@ -1639,7 +1639,7 @@ antares-broker v0.2.0
 │   │   │   │   │       │       │       ├── rustls-pki-types feature "std" (*)
 │   │   │   │   │       │       │       └── rustls-webpki feature "alloc" (*)
 │   │   │   │   │       │       ├── rustls feature "tls12"
-│   │   │   │   │       │       │   └── rustls v0.23.45 (*)
+│   │   │   │   │       │       │   └── rustls v0.23.46 (*)
 │   │   │   │   │       │       ├── serde_json feature "default"
 │   │   │   │   │       │       │   ├── serde_json v1.0.151
 │   │   │   │   │       │       │   │   ├── memchr v2.8.3
@@ -2286,7 +2286,7 @@ antares-broker v0.2.0
 │   │   │                       ├── sqlx-core feature "webpki-roots"
 │   │   │                       │   └── sqlx-core v0.9.0 (*)
 │   │   │                       └── rustls feature "ring"
-│   │   │                           ├── rustls v0.23.45 (*)
+│   │   │                           ├── rustls v0.23.46 (*)
 │   │   │                           └── rustls-webpki feature "ring"
 │   │   │                               └── rustls-webpki v0.103.15 (*)
 │   │   └── sqlx feature "uuid"

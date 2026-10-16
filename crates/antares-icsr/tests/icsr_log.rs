@@ -56,7 +56,7 @@ fn has(text: &str, message: &str, fields: &[&str]) -> bool {
 #[tokio::test]
 async fn icsr_grants_and_unmade_forwards_are_logged_without_the_subject() {
     logged();
-    let (_b, app) = broker(None).await;
+    let (_b, app) = broker(None, Vec::new()).await;
     car(&app, "b", 1).await;
     grant(&app, "b", "a", json!({})).await;
     let below = format!("{SELF_URL}/other");

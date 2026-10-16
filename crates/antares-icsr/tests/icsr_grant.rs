@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// 12.2.4); with a grant the registration is stored and B's Cars arrive.
 #[tokio::test]
 async fn icsr_a_registration_into_a_tenant_that_granted_nothing_is_refused() {
-    let (_b, app) = broker(None).await;
+    let (_b, app) = broker(None, Vec::new()).await;
     car(&app, "b", 1).await;
     let refused = register(&app, "a", "r1", Some("b"), json!({})).await;
     assert_eq!(refused.status, 403, "{}", refused.body);
@@ -66,10 +66,10 @@ async fn icsr_a_registration_into_a_tenant_that_granted_nothing_is_refused() {
 }
 
 /// C1, C7: a removed grant stops the next forward at once (299, no data),
-/// and one written again opens it. Notifications: T-3700.
+/// and one written again opens it. Notifications: `icsr_notify.rs`.
 #[tokio::test]
 async fn icsr_a_revoked_grant_stops_forwards() {
-    let (_b, app) = broker(None).await;
+    let (_b, app) = broker(None, Vec::new()).await;
     car(&app, "b", 1).await;
     grant(&app, "b", "a", json!({})).await;
     assert_eq!(
@@ -93,7 +93,7 @@ async fn icsr_a_revoked_grant_stops_forwards() {
 /// like an engine refusal and nothing lands in B.
 #[tokio::test]
 async fn icsr_a_write_forward_needs_a_read_write_grant() {
-    let (_b, app) = broker(None).await;
+    let (_b, app) = broker(None, Vec::new()).await;
     grant(&app, "b", "a", json!({})).await;
     let reg = register(
         &app,
@@ -142,7 +142,7 @@ async fn icsr_a_write_forward_needs_a_read_write_grant() {
 /// target, whatever a registration says.
 #[tokio::test]
 async fn icsr_an_internal_tenant_is_not_a_target() {
-    let (_b, app) = broker(None).await;
+    let (_b, app) = broker(None, Vec::new()).await;
     for target in ["antares-views", "antares-grants", "snap-1", "distsub-index"] {
         let path = format!("/q/grants/{target}/a");
         let doc = json!({"target": target, "source": "a"});
@@ -165,7 +165,7 @@ async fn icsr_an_internal_tenant_is_not_a_target() {
 /// exports nothing.
 #[tokio::test]
 async fn icsr_a_grant_view_narrows_what_the_target_exports() {
-    let (_b, app) = broker(None).await;
+    let (_b, app) = broker(None, Vec::new()).await;
     car(&app, "b", 1).await;
     for (id, tenant) in [("b-speed", "b"), ("c-speed", "c")] {
         let view = json!({"id": id, "tenant": tenant, "selector": ["Car"],
@@ -205,7 +205,7 @@ async fn icsr_a_grant_view_narrows_what_the_target_exports() {
 /// than its path, and answers 404 for a pair with none.
 #[tokio::test]
 async fn the_grant_routes_check_what_they_store() {
-    let (_b, app) = broker(None).await;
+    let (_b, app) = broker(None, Vec::new()).await;
     for (path, doc) in [
         ("/q/grants/b/a", json!({"target": "b", "source": "c"})),
         ("/q/grants/b/a", json!({"target": "c", "source": "a"})),
@@ -297,7 +297,7 @@ async fn icsr_a_stored_document_that_is_no_grant_of_its_pair_grants_nothing() {
 /// endpoint that is not this broker needs no grant to be stored.
 #[tokio::test]
 async fn icsr_a_forward_that_is_no_operation_or_that_the_grant_view_refuses_is_not_made() {
-    let (_b, app) = broker(None).await;
+    let (_b, app) = broker(None, Vec::new()).await;
     car(&app, "b", 1).await;
     let elsewhere = register(
         &app,
@@ -404,7 +404,7 @@ impl antares_ops::policy::PolicyEngine for ViewBound {
 #[tokio::test]
 async fn icsr_the_engine_decides_a_grant_view_forward_through_that_view() {
     let engine = Arc::new(ViewBound::default());
-    let (_b, app) = broker(Some(engine.clone())).await;
+    let (_b, app) = broker(Some(engine.clone()), Vec::new()).await;
     car(&app, "b", 1).await;
     let view = json!({"id": "b-speed", "tenant": "b", "selector": ["Car"],
                       "rules": [{"types": ["Car"], "attributes": ["speed"]}],

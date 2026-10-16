@@ -28,7 +28,7 @@ fn slots() {
 #[tokio::test]
 async fn icsr_a_two_tenant_cycle_ends_with_508() {
     slots();
-    let (_b, app) = broker(None).await;
+    let (_b, app) = broker(None, Vec::new()).await;
     grant(&app, "b", "a", json!({"access": "read-write"})).await;
     grant(&app, "a", "b", json!({"access": "read-write"})).await;
     let redirect = json!({"mode": "redirect", "operations": ["redirectionOps"],
@@ -87,7 +87,7 @@ impl PolicyEngine for Overlap {
 async fn icsr_in_process_forwards_count_against_the_federation_bounds() {
     slots();
     let engine = Arc::new(Overlap::default());
-    let (_b, app) = broker(Some(engine.clone() as Arc<dyn PolicyEngine>)).await;
+    let (_b, app) = broker(Some(engine.clone() as Arc<dyn PolicyEngine>), Vec::new()).await;
     for n in 1..=4 {
         let target = format!("t{n}");
         car(&app, &target, n).await;

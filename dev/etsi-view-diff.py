@@ -20,7 +20,10 @@ message (failures.csv) names only such Attributes as missing;
 and an Entity write or a Subscription in a TP whose fixtures registered a
 Context Source, which no write through a view reaches (rule 7 is checked on the
 local store, so the write stays local; rule 9: a view's Subscription has no
-distributed half; T-3945).
+distributed half; T-3945); and a request naming an Entity that an earlier
+TP's body created only through a request the view owes a refusal, so it never
+existed through the view (the restricted view refuses 422_01_05's create, and
+422_01_06 reads that Building; T-3982).
 Names are expanded as the suite sends them: its own @context, then the core
 one, then the default vocabulary. The body requests come from the run's
 requests.jsonl (dev/etsi_setup_url.py records them, and, marked, the fixtures').
@@ -270,6 +273,37 @@ def owed(requests, offered, binds, hidden=None, fixtures=()):
     return why
 
 
+CREATES = {"create_entity", "batch_create", "batch_upsert"}
+
+
+def never_made(d, offered, binds, hidden=None):
+    """TP -> why it names an Entity no request made: a TP body's create the view
+    owes a refusal leaves the Entity out of the store, and a later TP naming it
+    reads 404 where the root found it (T-3982). Requests are taken in the order
+    the run sent them; a create that went through, fixtures' included, makes the
+    Entity again."""
+    why = {}
+    for path in sorted(glob.glob(f"{d}/**/requests.jsonl", recursive=True)):
+        unmade = set()
+        for line in open(path, encoding="utf-8"):
+            r = json.loads(line)
+            op = operation(r["method"], r["url"], binds)
+            if op in CREATES:
+                body = r.get("body")
+                ids = {e["id"] for e in (body if isinstance(body, list) else [body])
+                       if isinstance(e, dict) and isinstance(e.get("id"), str)}
+                refused = not r.get("fixture") and owed([r], offered, binds, hidden)
+                unmade = unmade | ids if refused else unmade - ids
+                continue
+            m = re.search(r"/entities/([^/?]+)", urlsplit(r["url"]).path)
+            eid = unquote(m.group(1)) if m else None
+            if eid in unmade and not r.get("fixture") and r.get("test"):
+                why.setdefault(r["test"], []).append(
+                    f"{r['method']} {op or urlsplit(r['url']).path}: names {eid}, which an earlier "
+                    "create the view refused never made (ADR-0023 rule 4)")
+    return why
+
+
 def requests_of(d):
     """(body requests by TP, fixture requests by TP and by suite file)."""
     by_tp, fixtures = {}, {}
@@ -306,6 +340,7 @@ def diff(view_path, e1_dir, e2_dir, binds=None):
     messages = messages_of(e2_dir)
     offered = set(view.get("operations") or [])
     hidden = hidden_by(view, core_terms())
+    unmade = never_made(e2_dir, offered, binds, hidden)
     refusals, explained = [], 0
     for tp in sorted(e1.keys() | e2.keys()):
         a, b = e1.get(tp, "did not run"), e2.get(tp, "did not run")
@@ -314,7 +349,8 @@ def diff(view_path, e1_dir, e2_dir, binds=None):
                 red.append(f"stale: {tp} answers as E1 now; remove it from {os.path.basename(KNOWN)}")
             continue
         made = fixtures.get(tp, []) + fixtures.get(tp.split("::")[0], [])
-        why = owed(reqs.get(tp, []), offered, binds, hidden, made) if "did not run" not in (a, b) else []
+        why = (owed(reqs.get(tp, []), offered, binds, hidden, made) + unmade.get(tp, [])
+               if "did not run" not in (a, b) else [])
         if not why and "did not run" not in (a, b):
             why = lacking(messages.get(tp.split("::", 1)[-1]), hidden)
         if why:

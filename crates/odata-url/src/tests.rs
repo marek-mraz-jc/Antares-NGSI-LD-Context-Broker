@@ -1326,6 +1326,27 @@ fn arithmetic_and_lambdas_round_trip() {
     }
 }
 
+/// Fuzz run 38677615890 (`odata_url_parse`): `$search=OR` read as a word wrote itself `"OR"`, a
+/// phrase, so the canonical URL parsed to another tree.
+#[test]
+fn search_operator_read_as_text_round_trips() {
+    for query in [
+        "$search=OR",
+        "$search=AND",
+        "$search=NOT",
+        "$search=a%20OR",
+        "$search=(OR)",
+    ] {
+        let text = format!("Buildings?{query}");
+        let first = ok(&text);
+        let canonical = first.to_string();
+        assert_eq!(ok(&canonical), first, "{text} wrote {canonical}");
+    }
+    assert_eq!(search_of("$search=OR"), Search::Phrase("OR".into()));
+    // a word built by hand as an operator writes as the phrase it parses back to
+    assert_eq!(Search::Word("NOT".into()).to_string(), "%22NOT%22");
+}
+
 fn search_of(query: &str) -> Search {
     options(&format!("Buildings?{query}"))
         .search
@@ -1369,9 +1390,13 @@ fn search_reads_words_phrases_and_operators_with_their_precedence() {
         search_of("$search=a or b"),
         And(Box::new(And(word("a"), word("or"))), word("b"))
     );
-    assert_eq!(search_of("$search=NOT"), Word("NOT".into()));
+    // an operator where it cannot operate is searched for as text, a phrase
+    assert_eq!(search_of("$search=NOT"), Phrase("NOT".into()));
     assert_eq!(search_of("$search=NOTE"), Word("NOTE".into()));
-    assert_eq!(search_of("$search=a OR"), And(word("a"), word("OR")));
+    assert_eq!(
+        search_of("$search=a OR"),
+        And(word("a"), Box::new(Phrase("OR".into())))
+    );
     // phrases keep spaces, parentheses and percent-decoded text
     assert_eq!(
         search_of("$search=\"dark red\" OR %22a (b)%22"),
@@ -1466,6 +1491,9 @@ fn search_writes_its_canonical_form() {
         ("$search=\"x y\"", "$search=%22x%20y%22"),
         ("$search=C%2B%2B", "$search=C%2B%2B"),
         ("$search=a OR", "$search=a%20AND%20%22OR%22"),
+        // T-4205: a quote inside `'...'` is no `searchPhrase`; it writes back as it was read
+        ("$search='\"'", "$search=%27%22%27"),
+        ("$search='it''s \"x\"'", "$search=%27it%27%27s%20%22x%22%27"),
     ] {
         let uri = ok(&format!("Buildings?{query}"));
         assert_eq!(uri.to_string(), format!("Buildings?{written}"), "{query}");

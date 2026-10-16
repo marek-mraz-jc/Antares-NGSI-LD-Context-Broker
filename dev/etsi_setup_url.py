@@ -14,10 +14,23 @@ suite's setup has no test): dev/etsi-view-diff.py reads it to tell a refusal
 the view owes from a deviation, a hidden type or Attribute named in the body
 (T-3787) or a write after a fixture's registration (T-3945) included.
 
+A TP's teardown is written for the root, so a refusal or a local write the
+view owes can leave an Entity behind for the next TP's setup to trip over
+(409 against a redirect registration): a write through the view stays local
+where the root would forward it (ADR-0023 rule 7, D018_03), and a purge the
+view refuses leaves what the TP's setup created (D017_01_inc). So every
+Entity a TP creates, in its setup or its body (`POST /entities`,
+`entityOperations/create|upsert`), is deleted at the setup root with
+`local=true` once the TP and its teardown are over (T-3954). A suite setup's
+Entities are the suite's and stay.
+
     robot --listener "dev/etsi_setup_url.py;http://localhost:9090/ngsi-ld/v1;requests.jsonl" ...
 """
 
 import json
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from robot.libraries.BuiltIn import BuiltIn
 
@@ -26,6 +39,17 @@ FIXTURE = ("SETUP", "TEARDOWN")
 METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 BODY = ("json", "data")
 MAX_BODY = 64 * 1024
+CREATES = ("/entities", "/entityOperations/create", "/entityOperations/upsert")
+TENANT = "ngsild-tenant"
+
+
+def created_ids(method, url, body):
+    """The Entity ids a request creates: a POST to `/entities` carries one
+    Entity, to `entityOperations/create|upsert` a list of them."""
+    if method != "POST" or not urllib.parse.urlsplit(url).path.rstrip("/").endswith(CREATES):
+        return []
+    entities = body if isinstance(body, list) else [body]
+    return [e["id"] for e in entities if isinstance(e, dict) and isinstance(e.get("id"), str)]
 
 
 class etsi_setup_url:  # Robot takes the class named as its module
@@ -38,6 +62,7 @@ class etsi_setup_url:  # Robot takes the class named as its module
         self.depth = 0
         self.test = None
         self.suites = []
+        self.created = []  # (id, tenant) the running TP created
 
     def _point(self, at_setup):
         builtin = BuiltIn()
@@ -59,6 +84,24 @@ class etsi_setup_url:  # Robot takes the class named as its module
 
     def end_test(self, data, result):
         self.test = None
+        created, self.created = self.created, []
+        for entity_id, tenant in dict.fromkeys(created):
+            self._delete(entity_id, tenant)
+
+    def _delete(self, entity_id, tenant):
+        """Delete one Entity at the setup root, local only; an Entity the view
+        refused to create (404) or the teardown removed is fine."""
+        url = f"{self.setup_url}/entities/{urllib.parse.quote(entity_id, safe='')}?local=true"
+        req = urllib.request.Request(url, method="DELETE")
+        if tenant:
+            req.add_header("NGSILD-Tenant", tenant)
+        try:
+            urllib.request.urlopen(req, timeout=10).close()
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                print(f"etsi_setup_url: DELETE {url}: {e.code}")
+        except OSError as e:
+            print(f"etsi_setup_url: DELETE {url}: {e}")
 
     def start_keyword(self, data, result):
         if result.type in FIXTURE:
@@ -66,13 +109,20 @@ class etsi_setup_url:  # Robot takes the class named as its module
                 self._point(at_setup=True)
             self.depth += 1
         # A step after a failure still starts, NOT RUN, and a variable an earlier step would have
-        # assigned does not exist: no request left, so nothing to record (T-4030).
-        elif self.record and data.name in METHODS \
-                and getattr(result, "owner", None) == "RequestsLibrary" and not result.not_run:
-            if self.depth > 0:
-                self._log(data.name, data.args, fixture=True)
-            elif self.test:
-                self._log(data.name, data.args)
+        # assigned does not exist: no request left, so nothing to record or delete (T-4030).
+        elif data.name in METHODS and getattr(result, "owner", None) == "RequestsLibrary" \
+                and not result.not_run and (self.depth > 0 or self.test):
+            fixture = self.depth > 0
+            line = self._request(data.name, data.args)
+            tenant = line.pop("tenant", None)
+            if self.test:
+                self.created += [(i, tenant) for i in
+                                 created_ids(data.name, line["url"], line.get("body"))]
+            if self.record:
+                if fixture:
+                    line.update(fixture=True, suite=self.suites[-1] if self.suites else "")
+                with open(self.record, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(line) + "\n")
 
     def end_keyword(self, data, result):
         if result.type in FIXTURE:
@@ -80,7 +130,7 @@ class etsi_setup_url:  # Robot takes the class named as its module
             if self.depth == 0:
                 self._point(at_setup=False)
 
-    def _log(self, method, args, fixture=False):
+    def _request(self, method, args):
         """The request as RequestsLibrary sends it: `url=` or the first
         positional argument, `headers=` resolved in the caller's scope."""
         builtin = BuiltIn()
@@ -100,15 +150,16 @@ class etsi_setup_url:  # Robot takes the class named as its module
             params = "&".join(f"{k}={v}" for k, v in params.items())
         if params:
             url += ("&" if "?" in url else "?") + str(params)
+        headers = headers if isinstance(headers, dict) else {}
         line = {"test": self.test, "method": method, "url": url,
-                "headers": sorted(str(k).lower() for k in headers) if isinstance(headers, dict) else []}
-        if fixture:
-            line.update(fixture=True, suite=self.suites[-1] if self.suites else "")
+                "headers": sorted(str(k).lower() for k in headers)}
+        tenant = next((v for k, v in headers.items() if str(k).lower() == TENANT), None)
+        if tenant:
+            line["tenant"] = str(tenant)
         body = next((named[k] for k in BODY if k in named), None)
         if body is not None:
             line["body"] = self._json(builtin.replace_variables(body))
-        with open(self.record, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(line) + "\n")
+        return line
 
     @staticmethod
     def _json(value):

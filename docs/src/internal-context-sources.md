@@ -74,8 +74,20 @@ answered 508. A chain deeper than eight in-process calls is cut at the
 bound: the forward past it is not made, over HTTP neither, and the answer
 carries code 199 (508 for an `exclusive` or `redirect` registration).
 
-## 5. Not yet
+## 5. Notifications
 
-The notifications of a distributed Subscription created through an internal
-forward still reach `ANTARES_PUBLIC_URL/ex/v1/remote-notify` over HTTP and
-are not checked against the grant (ADR-0025 rule 7, T-3700).
+A Subscription in Tenant A that a registration of this broker matches is
+copied into Tenant B through the same in-process forward (5.8.1.4), under
+the grant. The copy notifies `ANTARES_PUBLIC_URL/ex/v1/remote-notify`. When
+that URL lies under a self URL, each notification is posted to the receiver
+path through the broker's own router, with no subject and no socket. The
+receiving Tenant is the one the broker's inbound index maps the copy's
+`subscriptionId` to, never a value of the notification. Before every
+attempt, retries and dead-letter replays included, B's grant for that Tenant
+is read again: without it the attempt is not made, the copy's status turns
+`failed`, and the 5.8.6 retry and dead-letter policy runs as for an HTTP
+failure. A removed grant stops the next notification at once.
+
+List `ANTARES_PUBLIC_URL` among the self URLs: a public URL that is not one
+sends the copy's notifications over HTTP, as a build without the feature
+does, and no grant is read for them.
