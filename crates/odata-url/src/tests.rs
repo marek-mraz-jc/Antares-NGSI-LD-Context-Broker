@@ -1491,6 +1491,9 @@ fn search_writes_its_canonical_form() {
         ("$search=\"x y\"", "$search=%22x%20y%22"),
         ("$search=C%2B%2B", "$search=C%2B%2B"),
         ("$search=a OR", "$search=a%20AND%20%22OR%22"),
+        // T-4205: a quote inside `'...'` is no `searchPhrase`; it writes back as it was read
+        ("$search='\"'", "$search=%27%22%27"),
+        ("$search='it''s \"x\"'", "$search=%27it%27%27s%20%22x%22%27"),
     ] {
         let uri = ok(&format!("Buildings?{query}"));
         assert_eq!(uri.to_string(), format!("Buildings?{written}"), "{query}");
