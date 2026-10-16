@@ -588,6 +588,26 @@ impl AnyStore {
         Ok(rows)
     }
 
+    /// Every document's id and digest (see `CurrentStateDriver::list_digests`):
+    /// a Postgres doc kind digests in the database, so no body leaves it.
+    pub async fn list_digests(
+        &self,
+        tenant: &TenantId,
+        kind: Kind,
+    ) -> Result<Vec<(String, u64)>, NgsiError> {
+        #[cfg(feature = "postgres")]
+        if let AnyStore::Pg(p) = self {
+            if !matches!(kind, Kind::Entity | Kind::Temporal) {
+                return p
+                    .docs
+                    .list_digests(tenant, doc_kind(kind)?)
+                    .await
+                    .map_err(db);
+            }
+        }
+        Ok(antares_store::digests(self.list(tenant, kind).await?))
+    }
+
     /// One id-ordered page of documents (see `CurrentStateDriver::list_page`).
     pub async fn list_page(
         &self,
@@ -1455,6 +1475,13 @@ impl antares_store::CurrentStateDriver for AnyStore {
     }
     async fn list(&self, tenant: &TenantId, kind: Kind) -> Result<Vec<Value>, NgsiError> {
         AnyStore::list(self, tenant, kind).await
+    }
+    async fn list_digests(
+        &self,
+        tenant: &TenantId,
+        kind: Kind,
+    ) -> Result<Vec<(String, u64)>, NgsiError> {
+        AnyStore::list_digests(self, tenant, kind).await
     }
     async fn list_page(
         &self,

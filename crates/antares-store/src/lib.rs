@@ -23,6 +23,21 @@ pub mod filter;
 use antares_model::{NgsiError, TenantId};
 use serde_json::Value;
 
+/// [`CurrentStateDriver::list_digests`] of documents read out: each one's
+/// `id` and a digest of its JSON text, a document without an id left out.
+#[must_use]
+pub fn digests(docs: Vec<Value>) -> Vec<(String, u64)> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    docs.into_iter()
+        .filter_map(|doc| {
+            let id = doc.get("id")?.as_str()?.to_owned();
+            let mut h = DefaultHasher::new();
+            doc.to_string().hash(&mut h);
+            Some((id, h.finish()))
+        })
+        .collect()
+}
+
 /// A stored document as the object it is. Every document a driver holds is a
 /// JSON object — `contract` asserts the shape on every backend — so a value
 /// that is not one means the driver returned something the contract forbids
@@ -434,6 +449,20 @@ pub trait CurrentStateDriver: Send + Sync {
     /// (5.5.6 TooManyResults). That is right for a client query and wrong
     /// for a reader that must see ALL of them — use [`Self::list_page`].
     async fn list(&self, tenant: &TenantId, kind: Kind) -> Result<Vec<Value>, NgsiError>;
+    /// Every document of this kind in the tenant as its id and a digest of
+    /// its body, for a reader that holds the bodies already and fetches only
+    /// the ones whose digest changed (T-4354). Two equal bodies have one
+    /// digest on one backend; nothing else is promised of it. Refused as
+    /// [`Self::list`] is. A backend that digests without reading the
+    /// documents out overrides this; the default reads them, which is
+    /// correct and no cheaper.
+    async fn list_digests(
+        &self,
+        tenant: &TenantId,
+        kind: Kind,
+    ) -> Result<Vec<(String, u64)>, NgsiError> {
+        Ok(digests(self.list(tenant, kind).await?))
+    }
     /// One id-ordered page of documents, for the internal readers that must
     /// see every one of them and so cannot be refused: ids strictly greater
     /// than `after`, at most `limit`. A short page means the end.

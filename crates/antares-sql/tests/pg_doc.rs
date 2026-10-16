@@ -935,3 +935,34 @@ async fn bookkeeping_only_registration_writes_leave_the_index_rows_alone() {
         .await
         .expect("cleanup");
 }
+
+/// T-4354: the view reload's read. An unchanged document keeps its digest,
+/// a changed one moves it, and the body never leaves the database.
+#[tokio::test(flavor = "multi_thread")]
+async fn list_digests_move_only_with_the_body() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let s = PgDocStore::new(pool.clone());
+    let t = TenantId::new("pgdigest").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    for (id, n) in [("a", 1), ("b", 2)] {
+        s.upsert(&t, DocKind::View, id, &json!({"id": id, "n": n}))
+            .await
+            .expect("insert");
+    }
+    let first = s.list_digests(&t, DocKind::View).await.expect("digests");
+    assert_eq!(
+        first.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(
+        s.list_digests(&t, DocKind::View).await.expect("again"),
+        first
+    );
+    s.upsert(&t, DocKind::View, "b", &json!({"id": "b", "n": 3}))
+        .await
+        .expect("update");
+    let next = s.list_digests(&t, DocKind::View).await.expect("digests");
+    assert_eq!(next[0], first[0]);
+    assert_ne!(next[1].1, first[1].1);
+}

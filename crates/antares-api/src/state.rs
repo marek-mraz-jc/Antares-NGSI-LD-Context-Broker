@@ -586,6 +586,19 @@ impl AppState {
             .map_err(|e| e.to_string())
     }
 
+    /// Every stored view document's id and digest, the bodies left in the
+    /// store (T-4354).
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn view_digests(&self) -> Result<Vec<(String, u64)>, String> {
+        self.store
+            .list_digests(&view_tenant()?, antares_store::Kind::View)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// The stored view document `id`, if there is one.
     ///
     /// # Errors
