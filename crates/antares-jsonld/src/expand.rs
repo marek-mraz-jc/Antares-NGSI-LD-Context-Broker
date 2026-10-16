@@ -1004,13 +1004,7 @@ fn expand_instance(
             let ok = if is_ngsi_null_langmap(lm) {
                 opts.allow_null
             } else {
-                lm.as_object().is_some_and(|m| {
-                    m.keys().all(|k| !k.is_empty())
-                        && m.values().all(|v| {
-                            v.is_string()
-                                || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
-                        })
-                })
+                valid_language_map(lm)
             };
             if !ok {
                 return Err(bad(format!("attribute {name}: invalid languageMap")));
@@ -1182,6 +1176,17 @@ fn expand_instance(
     Ok(Value::Object(out))
 }
 
+/// 4.5.18.2: "a JSON object consisting of a set of non-empty language tags
+/// ... or the language tag "@none"", each a string or an array of strings.
+fn valid_language_map(lm: &Value) -> bool {
+    lm.as_object().is_some_and(|m| {
+        m.keys().all(|k| !k.is_empty())
+            && m.values().all(|v| {
+                v.is_string() || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
+            })
+    })
+}
+
 /// Expand a PARTIAL-UPDATE attribute fragment (5.6.4): reserved members are
 /// kept, others become sub-attributes — and crucially NO attribute-type
 /// inference happens (a fragment `{providedBy: …}` patches the sub-attribute,
@@ -1242,6 +1247,11 @@ pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<V
                 if let Some(d) = dataset_id_member(v)? {
                     out.insert("datasetId".into(), d);
                 }
+            }
+            "languageMap"
+                if !(is_ngsi_null(v) || is_ngsi_null_langmap(v) || valid_language_map(v)) =>
+            {
+                return Err(bad("invalid languageMap in fragment (4.5.18.2)".into()));
             }
             _ if RESERVED_MEMBERS.contains(&k.as_str()) => {
                 out.insert(k.clone(), v.clone());
@@ -1931,6 +1941,33 @@ mod tests {
         let p = &out["https://uri.etsi.org/ngsi-ld/default-context/p"][0];
         assert_eq!(p["observedAt"], "2026-04-28T10:00:00.5Z");
         assert_eq!(p["expiresAt"], "2099-01-01T00:00:00.25Z");
+    }
+
+    /// 4.5.18.2: languageMap is "a JSON object"; a partial update fragment
+    /// is held to it as a create is (Coraine langprop_patch_attribute).
+    #[test]
+    fn a_fragment_language_map_is_an_object_of_strings() {
+        for bad in [
+            serde_json::json!(13),
+            serde_json::json!({"en": 1}),
+            serde_json::json!({"": "x"}),
+        ] {
+            let f = serde_json::json!({"languageMap": bad});
+            assert!(
+                expand_attr_fragment(f.as_object().unwrap(), &core()).is_err(),
+                "{bad}"
+            );
+        }
+        for ok in [
+            serde_json::json!({"en": "x", "es": ["y"]}),
+            serde_json::json!({"@none": "urn:ngsi-ld:null"}),
+        ] {
+            let f = serde_json::json!({"languageMap": ok});
+            assert!(
+                expand_attr_fragment(f.as_object().unwrap(), &core()).is_ok(),
+                "{ok}"
+            );
+        }
     }
 
     #[test]
