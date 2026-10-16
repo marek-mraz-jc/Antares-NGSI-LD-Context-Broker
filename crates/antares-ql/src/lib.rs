@@ -56,6 +56,27 @@ pub fn type_selection_matches(sel: &str, types: &[&str], ctx: &antares_jsonld::C
     })
 }
 
+/// The 4.17 grammar of a type selection: `EntityTypes = OrEntityType
+/// *(orOp OrEntityType)`, `OrEntityType = "(" EntityType *(";" EntityType)
+/// ")" / EntityType`, an EntityType never empty.
+pub fn check_type_selection(sel: &str) -> Result<(), NgsiError> {
+    let bad = || NgsiError::BadRequestData(format!("type {sel:?} violates the 4.17 grammar"));
+    for alt in sel.split([',', '|']).map(str::trim) {
+        let inner = match alt.strip_prefix('(') {
+            Some(rest) => rest.strip_suffix(')').ok_or_else(bad)?,
+            None if alt.contains(';') => return Err(bad()),
+            None => alt,
+        };
+        if inner
+            .split(';')
+            .any(|t| t.trim().is_empty() || t.contains(['(', ')']))
+        {
+            return Err(bad());
+        }
+    }
+    Ok(())
+}
+
 /// RFC 3986 percent-decoding of a query value (`q`, `scopeQ` in a
 /// subscription body may arrive encoded, 4.9).
 pub fn percent_decode(input: &[u8]) -> String {
@@ -1307,6 +1328,28 @@ mod complexity_tests {
         assert!(type_selection_matches("(Car;Bus)", &both, &ctx));
         assert!(!type_selection_matches("(Car;Bus)", &car_only, &ctx));
         assert!(!type_selection_matches("Bus", &[], &ctx));
+    }
+
+    /// 4.17 grammar: no empty EntityType, parentheses only around an
+    /// and-group, `;` only inside one (Coraine query_entities_errors).
+    #[test]
+    fn type_selection_grammar() {
+        for ok in [
+            "Car",
+            "Bus,Car",
+            "Bus|Car",
+            "(Car;Bus)",
+            "(Home;Vehicle)|Motorhome",
+            "https://e.org/T",
+            "(A)",
+        ] {
+            assert!(check_type_selection(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "(A;)", "A;", ";A", "()", "A,", ",A", "A;;B", "(A;B", "A)", "((A))", "",
+        ] {
+            assert!(check_type_selection(bad).is_err(), "{bad}");
+        }
     }
 
     /// 5.6.21.4: the referenced top-level names in source order, whether any

@@ -79,6 +79,17 @@ class Adapter(unittest.TestCase):
         self.assertEqual(env["ANTARES_PUBLIC_URL"], "http://localhost:1027")
         self.assertEqual(env["ANTARES_DATA_DIR"], f"{self.d}/data/CP1")
         self.assertNotIn("ANTARES_DATABASE_URL", env)
+        # the broker refuses unknown ANTARES_* keys; ANTARES_TEST_* is reserved, this is not
+        self.assertNotIn("ANTARES_BIN", env)
+        # the spec sets no batch ceiling; Coraine upserts 1101 entities in one batch
+        self.assertEqual(env["ANTARES_MAX_BATCH_ITEMS"], "2000")
+
+    def test_every_role_is_its_own_source_alias(self):
+        # one shared default alias made every forward between two roles a loop (508)
+        self.sh("coraineStart")
+        self.sh("coraineStart -role CP1 --csourceAlias cp1-alias")
+        self.assertEqual(self.env_of(1026)["ANTARES_HOST_ALIAS"], "antares-cb")
+        self.assertEqual(self.env_of(1027)["ANTARES_HOST_ALIAS"], "cp1-alias")
 
     def test_a_coraine_only_flag_refuses_to_start(self):
         r = self.sh("coraineStart --apiPlugins admin")
@@ -124,6 +135,21 @@ class Adapter(unittest.TestCase):
         r = self.sh("corDbDrop", store="mongo")
         self.assertEqual(r.returncode, 1)
         self.assertIn("unknown ANTARES_TEST_STORE", r.stderr)
+
+    def test_curl_sends_one_content_type_and_one_accept_the_last_given(self):
+        # corCurl adds its default Content-Type and Accept, then a case's own -H; the
+        # broker refuses two Content-Types, and two Accepts combine (RFC 9110 5.3)
+        os.makedirs(f"{self.d}/bin")
+        with open(f"{self.d}/bin/curl", "w") as fh:
+            fh.write('#!/bin/bash\nprintf "%s\\n" "$@"\n')
+        os.chmod(f"{self.d}/bin/curl", 0o755)
+        r = self.sh(f"PATH={self.d}/bin:$PATH; curl -s -H 'Content-Type: application/json' "
+                    "-H 'Accept: application/json' --header 'content-type: application/ld+json' "
+                    "-H 'Accept: application/geo+json;q=0.5' -d x")
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        self.assertEqual(r.stdout.split("\n")[:-1], [
+            "-s", "-d", "x", "-H", "Accept: application/geo+json;q=0.5",
+            "-H", "content-type: application/ld+json"])
 
     def test_postgres_needs_its_url(self):
         r = self.sh("coraineStart", store="postgres")

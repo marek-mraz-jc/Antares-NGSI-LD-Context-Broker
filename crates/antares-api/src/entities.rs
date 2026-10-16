@@ -2418,7 +2418,8 @@ fn merge_instance(target: &mut Value, frag: &Value, ts: &str) {
         if k == "createdAt" || k == "modifiedAt" {
             continue;
         }
-        if v.is_null() || is_ngsi_null(v) {
+        // a sub-Attribute whose instances are all deletions leaves too (10.2.9.4, T-3677)
+        if antares_jsonld::removes_member(v) {
             t.remove(k);
         } else if let (Some(cur), Some(patch)) =
             (t.get_mut(k).and_then(Value::as_object_mut), v.as_object())

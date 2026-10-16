@@ -153,6 +153,7 @@ Integration tests that need services are env-gated and skip loudly:
     --variable notification_server_host:127.0.0.1 \
     --variable context_source_host:127.0.0.1 \
     --variable context_server_host:127.0.0.1 \
+    --variable mqtt_broker_host:ngsi-ld-test-suite-mosquitto-container \
     TP/path/to/<tp>.robot
   ```
 

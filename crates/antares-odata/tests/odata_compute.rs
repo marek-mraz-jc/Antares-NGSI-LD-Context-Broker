@@ -129,7 +129,8 @@ async fn broker(hiding: bool) -> Result<(TestBroker, Router), String> {
         ),
     ];
     for (n, label, owner) in CARS {
-        let since = format!("2025-{n:02}-15T{n:02}:30:00+01:00");
+        // 4.6.3: a DateTime ends in Z, so every timestamp is UTC; an offset is refused.
+        let since = format!("2025-{n:02}-15T{n:02}:30:00Z");
         let mut car = json!({
             "id": format!("urn:ngsi-ld:Car:{n}"), "type": format!("{CITY}Car"),
             format!("{CITY}speed"): {"type": "Property", "value": f64::from(n) * 10.0},
@@ -220,7 +221,7 @@ async fn each_construct_is_computed_per_car() -> Result<(), String> {
             "startswith(label,'red') as v",
             json!([false, true, null, false]),
         ),
-        // dates in the offset they were written in
+        // dates as they were written, in UTC
         ("year(since) as v", json!([2025, 2025, 2025, 2025])),
         ("month(since) as v", json!([1, 2, 3, 4])),
         ("hour(since) as v", json!([1, 2, 3, 4])),
