@@ -1835,6 +1835,37 @@ async fn member_now(
     }
 }
 
+/// Whether `rules` decide an instance on the Entity's state at its time (a
+/// rule with a condition), which [`rules_per_instance`] rebuilds from the
+/// whole history. A rule of types, Attributes and windows decides each
+/// instance alone, so the store may prune to the query's window (T-4246).
+fn replays_state(rules: Option<&crate::policy::Filter>) -> bool {
+    rules.is_some_and(|r| r.rules.iter().any(crate::policy::Rule::is_conditional))
+}
+
+/// Whether the store's per-Attribute cap keeps every instance `rules` would
+/// show of the page: with no rules always; under rules only for lastN, when
+/// no rule reads state and every window stays open towards now, so the
+/// rules keep the newest instances of what they show. A window that closes
+/// before now, or firstN, would have the store keep instances the rules
+/// then drop (T-4246). Rule windows judge observedAt, so a window under a
+/// cap ordered by another `timeproperty` (a backfill: new createdAt, old
+/// observedAt) keeps the cap in the API too.
+fn cap_keeps_shown(
+    rules: Option<&crate::policy::Filter>,
+    page: &InstancePage,
+    timeprop: &str,
+) -> bool {
+    rules.is_none_or(|r| {
+        page.desc
+            && !replays_state(Some(r))
+            && r.rules.iter().all(|rule| {
+                rule.temporal.is_empty()
+                    || (timeprop == "observedAt" && rule.temporal.iter().all(|w| w.to.is_none()))
+            })
+    })
+}
+
 /// 5.7.4.4 S2/S3: the values filter and the geoquery are judged on the
 /// Attribute instances WITHIN the temporal-query interval, so an
 /// out-of-window instance must not satisfy either.
@@ -1897,17 +1928,23 @@ pub(crate) fn rules_per_instance(doc: &Value, rules: &crate::policy::Filter) -> 
         let Some(instances) = v.as_array().filter(|_| !deciding.is_empty()) else {
             continue;
         };
-        // ponytail: the state is rebuilt per instance, O(instances x history);
-        // sort each Attribute's history once if long histories show up
+        // ponytail: a condition rebuilds the state per instance, O(instances x
+        // history); sort each Attribute's history once if long histories show
+        // up under one. A rule without a condition reads no state: `typed`
+        // already selected the Entity by its types and ids, which is all
+        // `holds` reads of it, so only its windows decide (T-4246).
+        let reads_state = deciding.iter().any(|(r, _)| r.is_conditional());
         let kept: Vec<Value> = instances
             .iter()
             .filter(|inst| {
                 instant(inst).is_some_and(|t| {
-                    let state = state_at(doc, t);
+                    let state = reads_state.then(|| state_at(doc, t));
                     let observed = inst.get("observedAt").and_then(Value::as_str);
                     deciding.iter().any(|(r, reads)| {
-                        reads.iter().all(|a| state.get(a).is_some())
-                            && r.holds(&state, ctx)
+                        (!r.is_conditional()
+                            || state.as_ref().is_some_and(|state| {
+                                reads.iter().all(|a| state.get(a).is_some()) && r.holds(state, ctx)
+                            }))
                             && r.temporal
                                 .iter()
                                 .all(|w| observed.is_some_and(|o| w.admits(o, now)))
@@ -2323,17 +2360,26 @@ pub(crate) async fn query_temporal_collected(
             ids: ids.as_deref(),
             types: types.as_deref(),
             attrs: entity_attr_filter.as_deref(),
-            // rules rebuild each instance's state from the whole history
+            // a condition rebuilds each instance's state from the whole
+            // history; rules without one read only the window (T-4246)
             range: tq
                 .as_ref()
-                .filter(|_| !ruled)
+                .filter(|_| !replays_state(types_rule.as_deref()))
                 .map(|t| antares_store::filter::InstanceRange {
                     timerel: &t.timerel,
                     time_at: &t.time_at,
                     end_time_at: t.end_time_at.as_deref(),
                     timeproperty: &t.timeproperty,
                 }),
-            last_n: page_n.store_cap().filter(|_| exact_push && !ruled),
+            last_n: page_n.store_cap().filter(|_| {
+                exact_push
+                    && cap_keeps_shown(
+                        types_rule.as_deref(),
+                        &page_n,
+                        tq.as_ref()
+                            .map_or("observedAt", |t| t.timeproperty.as_str()),
+                    )
+            }),
             oldest_first: !page_n.desc,
             timeproperty: tq
                 .as_ref()
@@ -2702,23 +2748,31 @@ async fn retrieve_temporal_inner(
         reject_linked_projection(&trepr, "5.7.3.4")?;
         let page_n = trepr.page;
         antares_model::EntityId::new(id)?;
-        // ADR-0023 rule 11: rules rebuild each instance's state from the
-        // whole history, so nothing is pruned in the store under them
+        // ADR-0023 rule 11: a condition rebuilds each instance's state from
+        // the whole history, so the store prunes no instance under one; rules
+        // without one read only the window (T-4246)
         let types_rule = crate::repr::type_rules(&filter);
-        let ruled = types_rule.is_some();
+        let replays = replays_state(types_rule.as_deref());
         // Instance pruning pushed into the store (no q=/geo on retrieve,
         // so it is always safe here); window() below stays the arbiter.
         let tf = antares_store::filter::TemporalFilter {
             range: tq
                 .as_ref()
-                .filter(|_| !ruled)
+                .filter(|_| !replays)
                 .map(|t| antares_store::filter::InstanceRange {
                     timerel: &t.timerel,
                     time_at: &t.time_at,
                     end_time_at: t.end_time_at.as_deref(),
                     timeproperty: &t.timeproperty,
                 }),
-            last_n: page_n.store_cap().filter(|_| !ruled),
+            last_n: page_n.store_cap().filter(|_| {
+                cap_keeps_shown(
+                    types_rule.as_deref(),
+                    &page_n,
+                    tq.as_ref()
+                        .map_or("observedAt", |t| t.timeproperty.as_str()),
+                )
+            }),
             oldest_first: !page_n.desc,
             timeproperty: tq
                 .as_ref()
