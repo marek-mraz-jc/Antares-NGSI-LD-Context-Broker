@@ -74,6 +74,10 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, sqlx::Er
     connect_with(url, max_connections, std::time::Duration::from_secs(30)).await
 }
 
+/// How long a released connection may take to answer its liveness ping
+/// before it is dropped instead of going back to the pool (T-4298).
+pub const RELEASE_PING: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// [`connect`] with the per-session `statement_timeout` chosen by the
 /// deployment (`ANTARES_PG_STATEMENT_TIMEOUT_MS`).
 pub async fn connect_with(
@@ -91,6 +95,24 @@ pub async fn connect_with(
         .acquire_timeout(Duration::from_secs(5))
         .idle_timeout(Duration::from_secs(600))
         .max_lifetime(Duration::from_secs(1800))
+        // sqlx tests a released connection with a ping it never times out,
+        // and holds its pool slot until the ping answers. Through the mesh
+        // proxy, which accepts the bytes, a stream whose far side stalled
+        // never answers: on dev each such stream held a slot for hours, until
+        // all 20 were gone and every read answered 503 (T-4298). This ping is
+        // bounded; one that fails or runs out drops the socket at once, and
+        // the slot opens a fresh connection on demand. sqlx's own ping after
+        // it costs one more round trip on a connection that just answered.
+        .after_release(|conn, _meta| {
+            Box::pin(async move {
+                use sqlx::Connection;
+                match tokio::time::timeout(RELEASE_PING, conn.ping()).await {
+                    Ok(Ok(())) => Ok(true),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(sqlx::Error::PoolTimedOut),
+                }
+            })
+        })
         .after_connect(move |conn, _meta| {
             let session = session.clone();
             Box::pin(async move {
