@@ -369,11 +369,15 @@ async fn update_attrs_inner(
         |target, frag, ts, updated, not_updated| {
             // 5.6.2: scope updates only when the entity already has one
             if let Some(new_scope) = frag.get("scope") {
-                if target.contains_key("scope") {
-                    target.insert("scope".into(), new_scope.clone());
+                if !target.contains_key("scope") {
+                    not_updated.push(("scope".into(), "entity has no scope".into()));
+                } else if antares_jsonld::is_ngsi_null_list(new_scope) {
+                    // 5.5.12: the NGSI-LD Null removes the member, as on merge
+                    target.remove("scope");
                     updated.push("scope".into());
                 } else {
-                    not_updated.push(("scope".into(), "entity has no scope".into()));
+                    target.insert("scope".into(), new_scope.clone());
+                    updated.push("scope".into());
                 }
             }
             for (k, v) in frag {

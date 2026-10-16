@@ -366,6 +366,11 @@ pub fn expand_types(v: &Value, ctx: &Context) -> Result<Vec<Value>, NgsiError> {
     // is a JSON-LD-keyword alias in the @context (e.g. "type" → "@type") is
     // invalid (001_02_04).
     let one = |t: &str| -> Result<Value, NgsiError> {
+        // 4.5.0: the NGSI-LD Null asks for a deletion, and an Entity's type
+        // is mandatory (4.5.1): it is never a type, not even on a merge.
+        if is_ngsi_null(&Value::String(t.to_owned())) {
+            return Err(bad("the NGSI-LD Null is no Entity Type (4.5.0, 4.5.1)"));
+        }
         // 4.6.2: Entity Type names obey the name grammar (BadRequestData).
         if !valid_name(t) {
             return Err(bad(&format!(
@@ -1969,6 +1974,19 @@ mod tests {
                 "{ok}"
             );
         }
+    }
+
+    /// 4.5.0, 4.5.1: the NGSI-LD Null is never an Entity Type, alone or in
+    /// an array (Coraine entity_member_delete_and_null 12-13).
+    #[test]
+    fn the_ngsi_null_is_no_entity_type() {
+        for v in [
+            serde_json::json!("urn:ngsi-ld:null"),
+            serde_json::json!(["T", "urn:ngsi-ld:null"]),
+        ] {
+            assert!(expand_types(&v, &core()).is_err(), "{v}");
+        }
+        assert!(expand_types(&serde_json::json!("T"), &core()).is_ok());
     }
 
     #[test]

@@ -34,6 +34,7 @@ mod entity_map_paging_5_5_9;
 mod entity_map_store_failure_5_14;
 mod entity_maps_5_14;
 mod entity_maps_usage_5_7;
+mod entity_member_null_5_5_12;
 mod expiry_sub_attr_4_22;
 mod fed_entity_map_shape_5_2_39;
 mod fed_fanout_4_3_6;
