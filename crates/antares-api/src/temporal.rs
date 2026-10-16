@@ -3460,10 +3460,35 @@ pub async fn modify_temporal_instance(
         let obj = parsed.object(NgsiError::BadRequestData(
             "fragment must be a JSON object".into(),
         ))?;
-        let mut wrapper = Map::new();
+        let attr_iri = antares_jsonld::expand_attr_name(&attr, &parsed.ctx)?;
         let mut frag = obj.clone();
         frag.remove("@context");
-        wrapper.insert(attr.clone(), Value::Object(frag));
+        // 5.6.14.4 takes "the Attribute instance in the EntityTemporal
+        // Fragment": one keyed by the Attribute name. A bare instance (no
+        // such key, ETSI 016_01) is taken as that instance itself.
+        let named = (!frag.contains_key("type")).then_some(()).and_then(|()| {
+            frag.iter().find_map(|(k, v)| {
+                let is_attr = k == &attr
+                    || antares_jsonld::expand_attr_name(k, &parsed.ctx)
+                        .ok()
+                        .as_ref()
+                        == Some(&attr_iri);
+                is_attr.then(|| v.clone())
+            })
+        });
+        let frag =
+            match named {
+                Some(Value::Array(mut one)) if one.len() == 1 => one.remove(0),
+                Some(Value::Object(o)) => Value::Object(o),
+                Some(_) => return Err(NgsiError::BadRequestData(
+                    "the EntityTemporal Fragment holds one instance of the Attribute (5.6.14.4)"
+                        .into(),
+                )
+                .into()),
+                None => Value::Object(frag),
+            };
+        let mut wrapper = Map::new();
+        wrapper.insert(attr.clone(), frag);
         let expanded = expand_entity(
             &wrapper,
             &parsed.ctx,
@@ -3474,7 +3499,6 @@ pub async fn modify_temporal_instance(
                 ..Default::default()
             },
         )?;
-        let attr_iri = antares_jsonld::expand_attr_name(&attr, &parsed.ctx)?;
         let frag_inst = expanded
             .get(&attr_iri)
             .and_then(Value::as_array)
