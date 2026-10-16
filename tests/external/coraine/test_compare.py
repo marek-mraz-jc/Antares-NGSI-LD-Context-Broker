@@ -111,6 +111,14 @@ class Normalised(unittest.TestCase):
         self.assertIsNotNone(compare.normalised_diff(exp, "Ngsild-Results-Count: 51\n"))
         self.assertIsNotNone(compare.normalised_diff("Count: 3\n", "count: 3\n"))
 
+    def test_a_list_representation_id_is_the_implementations(self):
+        # TS 104 175 5.2.6.10: "URI that is unique within the system scope"
+        exp = '{"id": "urn:ngsi-ld:EntityTypeList:local", "type": "EntityTypeList", "typeList": ["Car"]}\n'
+        act = '{"id": "urn:ngsi-ld:EntityTypeList:9b1c", "type": "EntityTypeList", "typeList": ["Car"]}\n'
+        self.assertIsNone(compare.normalised_diff(exp, act))
+        self.assertIsNotNone(compare.normalised_diff(exp, act.replace("Car", "Bus")))
+        self.assertIsNotNone(compare.normalised_diff(exp.replace("EntityTypeList", "T"), act.replace("EntityTypeList", "T")))
+
     def test_a_body_that_is_not_json_is_compared_as_text(self):
         self.assertIsNone(compare.normalised_diff("HTTP/1.1 200 OK\n\n{not json\n", "HTTP/1.1 200 OK\n\n{not json\n"))
         self.assertIsNotNone(compare.normalised_diff("HTTP/1.1 200 OK\n\n{not json\n", "HTTP/1.1 200 OK\n\n{not jsox\n"))

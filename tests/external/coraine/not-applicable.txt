@@ -30,3 +30,14 @@ tag:docker Coraine's container image
 tag@memory:persistence the memory store keeps nothing across a restart by design
 tag@memory:persist the memory store keeps nothing across a restart by design
 tag@memory:restart the memory store keeps nothing across a restart by design
+tag:service Coraine's Service Execution extension (doc/service-execution.md); TS 104 175 Annex H.1: "There is currently no explicitly and precisely specified support for actuation in the NGSI-LD API"
+name:snapshot_temporal_capture reads Coraine's TimescaleDB tables with psql, behind the broker
+name:snapshot_temporal_lifecycle reads Coraine's TimescaleDB tables with psql, behind the broker
+name:storage_format_timescale reads Coraine's TimescaleDB tables with psql, behind the broker
+name:troe_timescale_basic reads Coraine's TimescaleDB tables with psql, behind the broker
+name:troe_timescale_hypertable reads Coraine's TimescaleDB tables with psql, behind the broker
+name:troe_timescale_geo_shapes reads Coraine's TimescaleDB tables with psql, behind the broker
+name:troe_timescale_temporal_tenant reads Coraine's TimescaleDB tables with psql, behind the broker
+name:troe_timescale_values reads Coraine's TimescaleDB tables with psql, behind the broker
+name:jsonld_contexts_lazy_reload writes @contexts into Coraine's MongoDB, behind the broker
+name:startup_cyclic_persisted_context writes @contexts into Coraine's MongoDB, behind the broker

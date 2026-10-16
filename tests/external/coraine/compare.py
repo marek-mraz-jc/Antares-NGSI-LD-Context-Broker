@@ -10,7 +10,8 @@ reads what `corTest --keep` left beside each case and gives one verdict:
   pass-normalised  equal once Coraine-only text is set aside: the status code,
                    Location, Content-Type media type, NGSILD-Results-Count and
                    Link headers, every JSON body member (ProblemDetails detail
-                   and title excepted, numbers to 1e-6, arrays in any order)
+                   and title excepted, the id of an EntityTypeList or AttributeList
+                   excepted, numbers to 1e-6, arrays in any order)
                    and every other output line are compared
   fail             anything else (the first difference is reported)
   not-applicable   named in not-applicable.txt by tag or name, or the case
@@ -31,6 +32,7 @@ KEEP_HEADERS = ("location", "content-type", "ngsild-results-count", "link")
 PROBLEM_PREFIX = "https://uri.etsi.org/ngsi-ld/errors/"
 RX = "\x00RX:"  # an expected JSON value that was a bare REGEX(...)
 MARKER = "CORAINE-ONLY "
+LIST_TYPES = ("EntityTypeList", "AttributeList")
 HEADER_LINE = re.compile(r"([A-Za-z][A-Za-z0-9-]*):\s*(.*)")
 
 
@@ -170,6 +172,8 @@ def json_equal(exp, act):
         drop = set()
         if str(exp.get("type", "")).startswith(PROBLEM_PREFIX):
             drop = {"detail", "title"}
+        elif exp.get("type") in LIST_TYPES:
+            drop = {"id"}  # 5.2.6.10: "URI that is unique within the system scope"
         ek, ak = set(exp) - drop, set(act) - drop
         return ek == ak and all(json_equal(exp[k], act[k]) for k in ek)
     if isinstance(exp, list) and isinstance(act, list):

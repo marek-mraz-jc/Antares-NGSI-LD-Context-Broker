@@ -82,6 +82,13 @@ class Adapter(unittest.TestCase):
         # the broker refuses unknown ANTARES_* keys; ANTARES_TEST_* is reserved, this is not
         self.assertNotIn("ANTARES_BIN", env)
 
+    def test_every_role_is_its_own_source_alias(self):
+        # one shared default alias made every forward between two roles a loop (508)
+        self.sh("coraineStart")
+        self.sh("coraineStart -role CP1 --csourceAlias cp1-alias")
+        self.assertEqual(self.env_of(1026)["ANTARES_HOST_ALIAS"], "antares-cb")
+        self.assertEqual(self.env_of(1027)["ANTARES_HOST_ALIAS"], "cp1-alias")
+
     def test_a_coraine_only_flag_refuses_to_start(self):
         r = self.sh("coraineStart --apiPlugins admin")
         self.assertEqual(r.returncode, 1)

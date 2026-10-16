@@ -70,10 +70,11 @@ antaresRoleDir() { echo "$ANTARES_TEST_DIR/$1"; }
 antaresRoleDb()  { echo "antares_${1,,}"; }
 
 coraineStart() {
-  local role="CB" saved=("$@")
+  local role="CB" alias="" saved=("$@")
   while [ $# -gt 0 ]; do
     case "$1" in
       -role) role="$2"; shift ;;
+      --csourceAlias) alias="$2"; shift ;;
       *)
         if [[ "$ANTARES_IGNORED_FLAGS" == *" $1 "* ]]; then :
         elif [[ "$ANTARES_IGNORED_VALUE_FLAGS" == *" $1 "* ]]; then shift
@@ -101,6 +102,9 @@ coraineStart() {
     ANTARES_STORE="$ANTARES_TEST_STORE"
     ANTARES_DATA_DIR="$dir"
     ANTARES_EGRESS_ALLOW_PRIVATE=true
+    # each role is a source of its own (5.2.9 contextSourceAlias): one shared
+    # default alias made every forward between two roles a loop (508)
+    ANTARES_HOST_ALIAS="${alias:-antares-${role,,}}"
   )
   case "$ANTARES_TEST_STORE" in
     postgres|timescale)
