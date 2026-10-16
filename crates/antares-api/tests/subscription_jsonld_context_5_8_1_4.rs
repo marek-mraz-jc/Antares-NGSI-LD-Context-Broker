@@ -125,3 +125,40 @@ async fn a_missing_jsonld_context_is_initialized_with_the_subscriptions_context(
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["@context"]["Vehicle"], "https://example.org/Vehicle");
 }
+
+/// 5.8.1.4 is about entity Subscriptions; a Context Source Registration
+/// Subscription keeps no jsonldContext it was not given (ETSI 044, 045).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_csource_subscription_gets_no_jsonld_context() {
+    let mut st = AppState::new("test-csub-jsonld-context".into());
+    antares_api::wire(&mut st).await;
+    let body = json!({
+        "id": "urn:CS1",
+        "type": "Subscription",
+        "entities": [{"type": "Vehicle"}],
+        "notification": {"endpoint": {"uri": "http://127.0.0.1:9/n"}},
+    })
+    .to_string();
+    let (status, err) = send(
+        &st,
+        Request::builder()
+            .method("POST")
+            .uri("/ngsi-ld/v1/csourceSubscriptions")
+            .header("Content-Type", "application/json")
+            .header("Content-Length", body.len())
+            .body(Body::from(body))
+            .expect("req"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{err}");
+    let (status, got) = send(
+        &st,
+        Request::builder()
+            .uri("/ngsi-ld/v1/csourceSubscriptions/urn:CS1")
+            .body(Body::empty())
+            .expect("req"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(got.get("jsonldContext").is_none(), "{got}");
+}

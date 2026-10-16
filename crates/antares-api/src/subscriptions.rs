@@ -957,8 +957,9 @@ pub async fn create(
     // 5.8.1.4: "If not present, the jsonldContext field shall be initialized
     // with the @context applicable for the Subscription" (5.5.5 when it has
     // none). One URL is that URL; anything inline the broker hosts at its own
-    // URL as an ImplicitlyCreated @context (5.13.1, 050_03).
-    if !norm.contains_key("jsonldContext") {
+    // URL as an ImplicitlyCreated @context (5.13.1, 050_03). A Context Source
+    // Registration Subscription (5.2.13) has no such initialisation.
+    if kind == Kind::Subscription && !norm.contains_key("jsonldContext") {
         let one_url = match &parsed.ctx.source {
             Value::Null => Some(antares_jsonld::CORE_CONTEXT.to_owned()),
             Value::String(u) => Some(u.clone()),
