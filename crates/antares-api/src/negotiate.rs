@@ -57,6 +57,10 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for CleanParams {
                     NgsiError::InvalidRequest(format!("repeated query parameter {k:?}")).into(),
                 );
             }
+            // 4.17: `type` is an Entity Type Selection on every route that takes it
+            if k == "type" && !v.is_empty() && v != "*" {
+                antares_ql::check_type_selection(&v)?;
+            }
             if !v.is_empty() {
                 map.insert(k, v);
             }

@@ -339,9 +339,16 @@ teardown() {
 trap teardown EXIT
 
 # 4b. The suite's @context from this checkout, not from GitHub on dev
-# (T-3550): teardown puts the rewritten files back.
-SUITE_CONTEXT=$(RESULTS="$RESULTS" dev/etsi-local-context.sh start) \
-  || { echo "could not serve the suite context locally"; exit 1; }
+# (T-3550): teardown puts the rewritten files back. A caller that already
+# serves it and rewrote the suite to it (external-suites, forge-free.sh)
+# names it in SUITE_CONTEXT, as etsi-run.sh allows: a second rewrite would
+# hand the broker one URL and the expectations another (T-3677).
+local_context=0
+if [ -z "${SUITE_CONTEXT:-}" ]; then
+  SUITE_CONTEXT=$(RESULTS="$RESULTS" dev/etsi-local-context.sh start) \
+    || { echo "could not serve the suite context locally"; exit 1; }
+  local_context=1
+fi
 export SUITE_CONTEXT
 
 # 5. Serial suites against broker1 (STOP_ON_ERROR respected by etsi-run.sh).
@@ -385,9 +392,13 @@ if ! .venv/bin/python -c "import HttpCtrl" >/dev/null 2>&1; then
   .venv/bin/python -c "import HttpCtrl" \
     || { echo "venv: HttpCtrl still broken — aborting"; exit 1; }
 fi
+# A suite whose own `url` names no /ngsi-ld/v1 adds the path itself (forge's later commits), as
+# etsi-run.sh does: with it the IOP TPs sent /ngsi-ld/v1/ngsi-ld/v1 and every setup got 404 (T-3677).
+iop_api=/ngsi-ld/v1
+grep -q "^url = '.*/ngsi-ld/v1/\?'" ngsi-ld-test-suite/resources/variables.py || iop_api=
 ( cd ngsi-ld-test-suite/resources
-  sed -i "s|^url = .*|url = 'http://localhost:9090/ngsi-ld/v1'|" variables.py
-  sed -i "s|^temporal_api_url = .*|temporal_api_url = 'http://localhost:9090/ngsi-ld/v1'|" variables.py
+  sed -i "s|^url = .*|url = 'http://localhost:9090$iop_api'|" variables.py
+  sed -i "s|^temporal_api_url = .*|temporal_api_url = 'http://localhost:9090$iop_api'|" variables.py
   sed -i "s|^notification_server_host = .*|notification_server_host = '${CALLBACK_HOST:-localhost}'|" variables.py
   sed -i "s|^context_source_host = .*|context_source_host = '${CALLBACK_HOST:-localhost}'|" variables.py
   sed -i "s|^context_server_host = .*|context_server_host = '${CALLBACK_HOST:-localhost}'|" variables.py
@@ -396,17 +407,17 @@ fi
 # output.xml (import error, unreachable broker), the artifact must still
 # say why — a 1 KB artifact with no clue is undebuggable in CI.
 ( cd ngsi-ld-test-suite && ../.venv/bin/robot --outputdir "../$RESULTS/IOP" \
-    --variable b1_url:http://localhost:9090/ngsi-ld/v1 \
-    --variable b2_url:http://localhost:9091/ngsi-ld/v1 \
-    --variable b3_url:http://localhost:9092/ngsi-ld/v1 \
-    --variable b4_url:http://localhost:9093/ngsi-ld/v1 \
-    --variable b5_url:http://localhost:9094/ngsi-ld/v1 \
+    --variable b1_url:http://localhost:9090$iop_api \
+    --variable b2_url:http://localhost:9091$iop_api \
+    --variable b3_url:http://localhost:9092$iop_api \
+    --variable b4_url:http://localhost:9093$iop_api \
+    --variable b5_url:http://localhost:9094$iop_api \
     IOP_TP ) 2>&1 | tee "$RESULTS/IOP-console.log" || true
 fi
 
 # 7a. No TP may have resolved the suite context outside this run.
 context_status=0
-RESULTS="$RESULTS" dev/etsi-local-context.sh check | tee "$RESULTS/local-context-check.txt" \
+[ "$local_context" = 0 ] || RESULTS="$RESULTS" dev/etsi-local-context.sh check | tee "$RESULTS/local-context-check.txt" \
   || context_status=1
 
 # 7. Report: suite table, per-broker CPU/RSS, spike attribution, downloadable

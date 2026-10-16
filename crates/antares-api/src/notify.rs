@@ -990,6 +990,8 @@ pub(crate) fn notif_shape(sub: &Value, ctx: &Context) -> NotifShape {
             .unwrap_or(false),
         key_values: matches!(format, "keyValues" | "simplified"),
         concise: format == "concise",
+        // Table 5.2.12-1: "Language filter to be applied to the query (clause 4.15)"
+        lang: sub.get("lang").and_then(Value::as_str).map(str::to_owned),
         ..Default::default()
     };
     let names = |key: &str| -> Option<Vec<String>> {
@@ -1163,10 +1165,13 @@ async fn build_data(
                 }
             }
             m.insert("deletedAt".into(), Value::String(now.to_owned()));
-            let attrs: Vec<String> = if entity_deleted_fired && show {
-                attr_keys(b) // showChanges: every attribute, tombstoned (046_37)
-            } else {
-                relevant_deleted_attrs.to_vec()
+            // 5.8.6: an Entity deletion notifies "only the deletedAt system
+            // property" unless showChanges, then every attribute, tombstoned
+            // (046_37); attributeDeleted alone names the attributes it fired for
+            let attrs: Vec<String> = match (entity_deleted_fired, show) {
+                (true, true) => attr_keys(b),
+                (true, false) => Vec::new(),
+                (false, _) => relevant_deleted_attrs.to_vec(),
             };
             for attr in attrs {
                 let insts: Vec<Value> = b
@@ -3347,6 +3352,24 @@ mod endpoint_tests {
         );
     }
 
+    /// Table 5.2.12-1 `lang`: "Language filter to be applied to the query
+    /// (clause 4.15)", the query being what a Notification carries; a
+    /// LanguageProperty arrives as a Property in the chosen language
+    /// (Coraine langprop_get_none, subscription_notify_langprop_array).
+    #[test]
+    fn the_subscription_lang_filters_the_notified_entity() {
+        let ctx = antares_jsonld::Loader::new().core();
+        let shape = notif_shape(&json!({"lang": "es", "notification": {}}), &ctx);
+        let doc = json!({"id": "urn:E1", "type": "T",
+            "https://example.org/L": [{"type": "LanguageProperty",
+                "languageMap": {"en": "one", "es": "uno"}}]});
+        let out = crate::repr::apply(&doc, &shape.repr);
+        let l = &out["https://example.org/L"][0];
+        assert_eq!(l["type"], "Property", "{out}");
+        assert_eq!(l["value"], "uno");
+        assert_eq!(l["lang"], "es");
+    }
+
     /// Table 5.2.15-1 `timeout`: honored, clamped, defaulted.
     #[test]
     fn endpoint_timeout_is_honored_clamped_and_defaulted() {
@@ -4396,6 +4419,33 @@ mod clause_5_8_6_deletion_payload {
         );
     }
 
+    /// 5.8.6: "If the notification was triggered by the deletion of an Entity
+    /// and the notification.showChanges member is not set to true, only the
+    /// deletedAt system property shall be provided", even when the same
+    /// deletion also fires attributeDeleted (Coraine subscription_notify_update_delete).
+    #[tokio::test]
+    async fn an_entity_deletion_notifies_deleted_at_only() {
+        let before = json!({
+            "id": "urn:ngsi-ld:Vehicle:gone",
+            "type": [format!("{DC}/Vehicle")],
+            format!("{DC}/speed"): [{"type": "Property", "value": 1}],
+        });
+        let entry = build(
+            &json!({"notification": {}}),
+            &before,
+            None,
+            &[format!("{DC}/speed")],
+            true,
+        )
+        .await;
+        assert!(entry.get("speed").is_none(), "{entry}");
+        assert!(
+            entry.get(format!("{DC}/speed").as_str()).is_none(),
+            "{entry}"
+        );
+        assert_eq!(entry["deletedAt"], json!("2026-01-01T00:00:00Z"));
+    }
+
     /// 5.8.6 with sysAttrs and showChanges: the tombstone carries deletedAt
     /// and the previous value of its own typed member.
     #[tokio::test]
@@ -4911,7 +4961,11 @@ mod delivery_policy_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_backoff_on_one_subscription_does_not_delay_another() {
-        let (st, t) = state(policy(2, 3_000));
+        // Both stretch under a sanitizer (ThreadSanitizer took 2 s for the
+        // two sends, T-4250); the bound stays a third of the backoff, so a
+        // backoff on the delivery path still fails it.
+        let slow = crate::state::slow_factor();
+        let (st, t) = state(policy(2, 3_000 * slow));
         let (dead, _) = flaky_endpoint(usize::MAX).await;
         let (live, live_hits) = flaky_endpoint(0).await;
         let a = subscribe(&st, &t, "urn:ngsi-ld:Subscription:a", &dead).await;
@@ -4921,8 +4975,9 @@ mod delivery_policy_tests {
         send(&st, &t, &b).await;
         assert_eq!(live_hits.load(Ordering::SeqCst), 1, "B delivered");
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "A's 3 s backoff must not sit on the delivery path: {:?}",
+            started.elapsed() < Duration::from_secs(slow),
+            "A's {} s backoff must not sit on the delivery path: {:?}",
+            3 * slow,
             started.elapsed()
         );
     }

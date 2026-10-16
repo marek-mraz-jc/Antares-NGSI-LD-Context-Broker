@@ -10,12 +10,16 @@ reads what `corTest --keep` left beside each case and gives one verdict:
   pass-normalised  equal once Coraine-only text is set aside: the status code,
                    Location, Content-Type media type, NGSILD-Results-Count and
                    Link headers, every JSON body member (ProblemDetails detail
-                   and title excepted, numbers to 1e-6, arrays in any order)
-                   and every other output line are compared
+                   and title excepted, the id of an EntityTypeList or AttributeList
+                   excepted, a NotUpdatedDetails reason excepted, numbers to 1e-6,
+                   arrays in any order; in a request a receiver dumped, the
+                   client's transport headers excepted) and every other output
+                   line are compared; Link headers as a set
   fail             anything else (the first difference is reported)
   not-applicable   named in not-applicable.txt by tag or name, or the case
                    started the broker with a Coraine-only flag (antares.sh
-                   prints "CORAINE-ONLY <flag>")
+                   prints "CORAINE-ONLY <flag>"), or the case pins one Coraine
+                   storage backend (REQUIRE_DB)
   error            INIT or RUN wrote stderr or exited non-zero
   skipped          corTest did not run it (its own SKIP_ or skip list)
 
@@ -31,6 +35,12 @@ KEEP_HEADERS = ("location", "content-type", "ngsild-results-count", "link")
 PROBLEM_PREFIX = "https://uri.etsi.org/ngsi-ld/errors/"
 RX = "\x00RX:"  # an expected JSON value that was a bare REGEX(...)
 MARKER = "CORAINE-ONLY "
+LIST_TYPES = ("EntityTypeList", "AttributeList")
+HEADER_LINE = re.compile(r"([A-Za-z][A-Za-z0-9-]*):\s*(.*)")
+# what an HTTP client adds on its own to a request a receiver dumps (RFC 9110)
+TRANSPORT_HEADERS = ("user-agent", "host", "content-length", "accept", "accept-encoding",
+                     "connection", "ngsild-attribute-format")
+ONE_BACKEND = re.compile(r"^# REQUIRE_DB:\s*(\S+)\s*$", re.M)
 
 
 def regex_end(s, start):
@@ -91,6 +101,9 @@ def quote_bare_regex(body):
         if in_str:
             out.append(c)
             if c == "\\" and i + 1 < n:
+                # a regex escape such as \d is no JSON escape: keep it literal
+                if body[i + 1] not in '"\\/bfnrtu':
+                    out.append("\\")
                 out.append(body[i + 1])
                 i += 2
                 continue
@@ -103,8 +116,16 @@ def quote_bare_regex(body):
         elif body.startswith("REGEX(", i):
             end = regex_end(body, i + 6)
             if end > 0:
-                out.append(json.dumps(RX + body[i + 6:end]))
+                # digits written before the REGEX are part of the same number
+                glued = ""
+                while out and (out[-1].isdigit() or out[-1] == "."):
+                    glued = out.pop() + glued
+                out.append(json.dumps(RX + re.escape(glued) + body[i + 6:end]))
                 i = end + 1
+                # REGEX(.*) at a line end matched the member's comma as well
+                rest = body[i:]
+                if re.match(r"[ \t]*\n\s*\"", rest):
+                    out.append(",")
                 continue
         out.append(c)
         i += 1
@@ -121,11 +142,17 @@ def items(text, expected):
         if re.match(r"HTTP/[0-9.]+ \d{3}", line):
             res.append(("status", line.split()[1]))
             i += 1
+            links = []
             while i < n and lines[i].strip():
                 name, _, value = lines[i].partition(":")
-                if name.strip().lower() in KEEP_HEADERS:
-                    res.append(("header", name.strip().lower(), header_value(name, value)))
+                lname = name.strip().lower()
+                if lname == "link":
+                    # RFC 8288 3: one header may join several link-values with commas
+                    links += [("header", "link", link_value(v)) for v in re.split(r",\s*(?=<)", value)]
+                elif lname in KEEP_HEADERS:
+                    res.append(("header", lname, header_value(name, value)))
                 i += 1
+            res.extend(sorted(links))  # RFC 8288 orders no links
             continue
         if line.lstrip()[:1] in ("{", "["):
             rest = "\n".join(lines[i:])
@@ -155,9 +182,20 @@ def header_value(name, value):
     return value
 
 
+def link_value(value):
+    """One Link header value with RFC 8288 spacing, and the query of its target in a fixed order."""
+    value = re.sub(r"\s*;\s*", "; ", value.strip())
+    m = re.match(r"<([^>?]*)\?([^>]*)>(.*)", value)
+    if m and "REGEX(" not in value:
+        value = f"<{m[1]}?{'&'.join(sorted(m[2].split('&')))}>{m[3]}"
+    return value
+
+
 def json_equal(exp, act):
     if isinstance(exp, str) and exp.startswith(RX):
-        shown = act if isinstance(act, str) else json.dumps(act)
+        # REGEX("...") was written against the JSON text, quotes included
+        quoted = exp[len(RX):].startswith('"')
+        shown = act if isinstance(act, str) and not quoted else json.dumps(act)
         return text_matches("REGEX(" + exp[len(RX):] + ")", shown)
     if isinstance(exp, bool) or isinstance(act, bool):
         return exp is act
@@ -169,6 +207,17 @@ def json_equal(exp, act):
         drop = set()
         if str(exp.get("type", "")).startswith(PROBLEM_PREFIX):
             drop = {"detail", "title"}
+        elif exp.get("type") in LIST_TYPES:
+            drop = {"id"}  # 5.2.6.10: "URI that is unique within the system scope"
+        elif "attributeName" in exp and "reason" in exp:
+            drop = {"reason"}  # 5.2.19 NotUpdatedDetails: free text
+        if "verb" in exp and isinstance(exp.get("headers"), dict) and isinstance(act.get("headers"), dict):
+            # a request a receiver dumped: header names are case-insensitive (RFC 9110 5.1)
+            ah = {k.lower(): v for k, v in act["headers"].items()}
+            for k, v in exp["headers"].items():
+                if k.lower() not in TRANSPORT_HEADERS and not (k.lower() in ah and json_equal(v, ah[k.lower()])):
+                    return False
+            drop = {"headers"}
         ek, ak = set(exp) - drop, set(act) - drop
         return ek == ak and all(json_equal(exp[k], act[k]) for k in ek)
     if isinstance(exp, list) and isinstance(act, list):
@@ -194,6 +243,10 @@ def item_equal(exp, act):
         return json_equal(exp[1], act[1])
     if exp[0] == "header":
         return exp[1] == act[1] and text_matches(exp[2], act[2])
+    # a kept header a case prints as text: the name is case-insensitive (RFC 9110 5.1)
+    e, a = HEADER_LINE.match(exp[-1]), HEADER_LINE.match(act[-1])
+    if e and a and e[1].lower() == a[1].lower() and e[1].lower() in KEEP_HEADERS:
+        return text_matches(e[2], a[2])
     return text_matches(exp[-1], act[-1])
 
 
@@ -257,6 +310,9 @@ def verdict(prefix, test_text, na_tags, na_names):
             return "not-applicable", f"tag {t}: {na_tags[t]}"
     if base in na_names:
         return "not-applicable", na_names[base]
+    one = ONE_BACKEND.search(test_text)
+    if one:
+        return "not-applicable", f"pins one Coraine storage backend (REQUIRE_DB: {one[1]})"
     errs = [(p, read(f"{prefix}.{p}.stderr") or "") for p in ("init", "run", "teardown")]
     for _, err in errs:
         m = re.search(MARKER + r"(\S+)", err)

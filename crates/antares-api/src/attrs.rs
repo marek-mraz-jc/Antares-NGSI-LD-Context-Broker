@@ -369,11 +369,15 @@ async fn update_attrs_inner(
         |target, frag, ts, updated, not_updated| {
             // 5.6.2: scope updates only when the entity already has one
             if let Some(new_scope) = frag.get("scope") {
-                if target.contains_key("scope") {
-                    target.insert("scope".into(), new_scope.clone());
+                if !target.contains_key("scope") {
+                    not_updated.push(("scope".into(), "entity has no scope".into()));
+                } else if antares_jsonld::is_ngsi_null_list(new_scope) {
+                    // 5.5.12: the NGSI-LD Null removes the member, as on merge
+                    target.remove("scope");
                     updated.push("scope".into());
                 } else {
-                    not_updated.push(("scope".into(), "entity has no scope".into()));
+                    target.insert("scope".into(), new_scope.clone());
+                    updated.push("scope".into());
                 }
             }
             for (k, v) in frag {
@@ -915,7 +919,9 @@ async fn partial_update_inner(
                                 if matches!(k.as_str(), "createdAt" | "modifiedAt") {
                                     continue;
                                 }
-                                if v.is_null() || antares_jsonld::is_ngsi_null(v) {
+                                // a member set to the Null, or a sub-Attribute whose every
+                                // instance is a deletion, leaves the instance (10.2.5.4)
+                                if antares_jsonld::removes_member(v) {
                                     t.remove(k);
                                 } else {
                                     t.insert(k.clone(), v.clone());
@@ -1540,27 +1546,16 @@ async fn delete_attr_inner(
             g.settled()?;
         }
         // The temporal representation records the deletion (4.8 deletedAt).
-        // An Entity held only temporally is not "held locally" (5.6.5.4): it
-        // answers ResourceNotFound and its evolution is left to 5.6.13. A
-        // REFUSED delete (the 5.6.5.4 type selector did not match) deleted
-        // nothing and leaves the attribute history untouched too.
-        let temporal_had = matches!(res, Some(Ok(_)))
-            && crate::history::mirror_delete_attr(
-                st,
-                &tenant,
-                id,
-                &attr_iri,
-                want_ds.as_deref(),
-                &ts,
-            )
-            .await;
-        Some(single_attr_local(
-            res,
-            found || temporal_had,
-            id,
-            attr,
-            &tenant,
-        ))
+        // Only what the Entity held is deleted (5.6.5.4: "If the target Entity
+        // does not contain the target Attribute then an error of type
+        // ResourceNotFound shall be raised"), so an Entity held only
+        // temporally, an Attribute already deleted and a refused delete (the
+        // type selector did not match) all leave the history untouched.
+        if found && matches!(res, Some(Ok(_))) {
+            crate::history::mirror_delete_attr(st, &tenant, id, &attr_iri, want_ds.as_deref(), &ts)
+                .await;
+        }
+        Some(single_attr_local(res, found, id, attr, &tenant))
     };
     if regs.is_empty() {
         // the local half is skipped only while registrations cover the

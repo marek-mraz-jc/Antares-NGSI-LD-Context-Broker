@@ -131,6 +131,11 @@ impl FedReg {
                 }
             }
         }
+        self.covers_types(obj, ctx)
+    }
+    /// The type half of `covers_item`: does the item's `type` name one of the
+    /// registration's EntityInfo types? No type to check ⇒ covered.
+    pub fn covers_types(&self, obj: &Map<String, Value>, ctx: &Context) -> bool {
         if !self.ent_types.is_empty() {
             let types: Vec<String> = match obj.get("type") {
                 Some(Value::String(t)) => vec![ctx.expand_key(t)],
@@ -570,6 +575,9 @@ pub async fn matching_regs(
             let mut ent_types = Vec::new();
             let mut ent_patterns = Vec::new();
             let mut ent_unrestricted = false;
+            // an info that names no type admits every type; ent_types empty
+            // is how every reader of it spells "no type restriction"
+            let mut any_type = false;
             for info in &infos {
                 // TS 104 175 9.4.2: attributeNames, else the deprecated pair
                 match antares_model::registration_attribute_names(info) {
@@ -598,13 +606,17 @@ pub async fn matching_regs(
                             Some(Value::String(t)) => ent_types.push(t.clone()),
                             Some(Value::Array(ts)) => ent_types
                                 .extend(ts.iter().filter_map(Value::as_str).map(str::to_owned)),
-                            _ => {}
+                            _ => any_type = true,
                         }
                     }
                 } else {
                     // an attributes-only RegistrationInfo imposes no id scope
                     ent_unrestricted = true;
+                    any_type = true;
                 }
+            }
+            if any_type {
+                ent_types.clear();
             }
             let tenant = doc.get("tenant").and_then(Value::as_str).map(str::to_owned);
             let csi = csi_of(doc);
@@ -652,6 +664,21 @@ fn op_set(r: &FedReg) -> std::collections::BTreeSet<&'static str> {
         .collect()
 }
 
+fn same_entity_scope(a: &FedReg, b: &FedReg) -> bool {
+    a.ent_ids == b.ent_ids
+        && a.ent_types == b.ent_types
+        && a.ent_patterns == b.ent_patterns
+        && a.ent_unrestricted == b.ent_unrestricted
+}
+
+fn covers_everything(r: &FedReg) -> bool {
+    r.attrs.is_none()
+        && r.ent_types.is_empty()
+        && r.ent_ids.is_empty()
+        && r.ent_patterns.is_empty()
+        && r.ent_unrestricted
+}
+
 /// Registrations naming the same Context Source (same endpoint, mode,
 /// tenant, contextSourceAlias, contextSourceInfo, localOnly) fold into ONE
 /// forwarded request (5.2.9: the alias identifies a source, so a different
@@ -670,6 +697,12 @@ fn op_set(r: &FedReg) -> std::collections::BTreeSet<&'static str> {
 /// itself twice with different operation lists and both lists cover the
 /// operation at hand; 4.5.5 merges the two answers by Entity id, so the
 /// caller sees the same data either way.
+///
+/// For the same reason they fold only when the union is exact: (Vehicle ×
+/// all) and (OffStreetParking × two attributes) would fold to
+/// (both types × all), and the source's whole OffStreetParking would be
+/// imported (ETSI IOP_003_02_02). Equal attribute scopes, equal entity
+/// scopes, or one side covering everything keep the union exact.
 fn merge_same_source(regs: Vec<FedReg>) -> Vec<FedReg> {
     let mut out: Vec<(FedReg, std::collections::BTreeSet<&'static str>)> = Vec::new();
     for r in regs {
@@ -682,6 +715,10 @@ fn merge_same_source(regs: Vec<FedReg>) -> Vec<FedReg> {
                 && o.csi == r.csi
                 && o.local_only == r.local_only
                 && *o_ops == ops
+                && (o.attrs == r.attrs
+                    || same_entity_scope(o, &r)
+                    || covers_everything(o)
+                    || covers_everything(&r))
         });
         let Some((o, _)) = same else {
             out.push((r, ops));
@@ -699,7 +736,11 @@ fn merge_same_source(regs: Vec<FedReg>) -> Vec<FedReg> {
             _ => None,
         };
         o.ent_ids.extend(r.ent_ids);
-        o.ent_types.extend(r.ent_types);
+        if o.ent_types.is_empty() || r.ent_types.is_empty() {
+            o.ent_types.clear(); // either side admits every type
+        } else {
+            o.ent_types.extend(r.ent_types);
+        }
         o.ent_patterns.extend(r.ent_patterns);
         o.ent_unrestricted |= r.ent_unrestricted;
     }
@@ -2377,9 +2418,12 @@ pub async fn fed_query(
         if let Value::Array(a) = &body {
             // Scope gate — see admits_import.
             for c in a.iter().filter(|c| {
-                c.get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|i| admits_import(&reg, &spec, i))
+                // 4.3.6.1: a type outside the registration's EntityInfo is
+                // not this source's data, whatever the client asked for
+                c.as_object().is_some_and(|o| reg.covers_types(o, ctx))
+                    && c.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|i| admits_import(&reg, &spec, i))
             }) {
                 match import_entity(c, &reg, ctx) {
                     Some(doc) => out.push((reg.mode == "auxiliary", doc)),
@@ -2645,9 +2689,12 @@ pub async fn fed_query_temporal(
         if let Value::Array(a) = &body {
             // Same scope gate as the non-temporal query fan-out.
             for c in a.iter().filter(|c| {
-                c.get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|i| admits_import(&reg, &spec, i))
+                // 4.3.6.1: a type outside the registration's EntityInfo is
+                // not this source's data, whatever the client asked for
+                c.as_object().is_some_and(|o| reg.covers_types(o, ctx))
+                    && c.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|i| admits_import(&reg, &spec, i))
             }) {
                 match import_temporal(c, &reg, ctx) {
                     Some(doc) => out.push((reg.mode == "auxiliary", doc)),
@@ -4247,6 +4294,8 @@ mod same_source_merge {
             ops: vec!["federationOps".into()],
             attrs: attrs.map(|a| a.iter().map(|s| (*s).to_owned()).collect()),
             ent_types: types.iter().map(|s| (*s).to_owned()).collect(),
+            // type-only EntityInfo, as the registration builder reads it
+            ent_unrestricted: true,
             ..FedReg::default()
         }
     }
@@ -4261,7 +4310,7 @@ mod same_source_merge {
                 "urn:r:2",
                 "http://a",
                 Some(&["heading", "speed"]),
-                &["Bike"],
+                &["Vehicle"],
             ),
             reg("urn:r:3", "http://b", Some(&["speed"]), &["Vehicle"]),
         ]);
@@ -4271,8 +4320,23 @@ mod same_source_merge {
             merged[0].attrs.as_deref(),
             Some(&["speed".to_owned(), "heading".to_owned()][..])
         );
-        assert_eq!(merged[0].ent_types, ["Vehicle", "Bike"]);
         assert_eq!(merged[1].endpoint, "http://b");
+
+        // equal attribute scopes: the types union
+        let merged = merge_same_source(vec![
+            reg("urn:r:1", "http://a", Some(&["speed"]), &["Vehicle"]),
+            reg("urn:r:2", "http://a", Some(&["speed"]), &["Bike"]),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].ent_types, ["Vehicle", "Bike"]);
+
+        // 4.3.6.1, ETSI IOP_003_02_02: (Vehicle × all) and (Bike × speed)
+        // folded would be (both × all), a scope neither registration declared
+        let merged = merge_same_source(vec![
+            reg("urn:r:1", "http://a", None, &["Vehicle"]),
+            reg("urn:r:2", "http://a", Some(&["speed"]), &["Bike"]),
+        ]);
+        assert_eq!(merged.len(), 2, "an inexact union stays two forwards");
 
         // an unscoped registration widens the merged one to everything
         let merged = merge_same_source(vec![
@@ -4281,6 +4345,7 @@ mod same_source_merge {
         ]);
         assert_eq!(merged.len(), 1);
         assert!(merged[0].attrs.is_none());
+        assert!(merged[0].ent_types.is_empty(), "and to every type");
 
         let mut other_mode = reg("urn:r:2", "http://a", None, &[]);
         other_mode.mode = "exclusive".into();

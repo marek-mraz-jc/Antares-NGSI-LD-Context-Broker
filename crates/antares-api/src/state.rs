@@ -42,6 +42,10 @@ impl std::str::FromStr for TemporalRecord {
     }
 }
 
+/// History gate 3's set (T-4275): the (Tenant, expanded type) pairs that
+/// record no history, shared by every clone of the state.
+pub type HistoryOff = Arc<std::sync::RwLock<std::collections::HashSet<(String, String)>>>;
+
 /// The handler `wire` installs for a notification that arrives on the
 /// internal distributed-subscription endpoint (5.8.1.4).
 pub type CsourceNotification = Arc<
@@ -254,6 +258,10 @@ pub struct Shared {
     /// instances the write path records into history. Default `All`, which
     /// the ETSI temporal suites assume.
     pub temporal_record: TemporalRecord,
+    /// History gate 3 (T-4275): the (Tenant, expanded type) pairs whose
+    /// retention rule says `history: "off"`. The views reload replaces the
+    /// set; an Entity with any of these types records no attribute instance.
+    pub history_off: HistoryOff,
     /// The base URL remote Context Sources reach THIS broker at — used as
     /// the notification endpoint of forwarded subscription copies
     /// (5.8.1.4). ANTARES_PUBLIC_URL, defaulting to
@@ -535,6 +543,7 @@ impl AppState {
                 csource_notification: None,
                 nats: false,
                 temporal_record: TemporalRecord::All,
+                history_off: HistoryOff::default(),
                 public_url,
                 snapshot_cap: 1024,
                 delivery: antares_notifier::DeliveryPolicy::default(),

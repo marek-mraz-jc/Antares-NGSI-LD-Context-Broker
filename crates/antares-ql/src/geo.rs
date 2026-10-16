@@ -222,6 +222,9 @@ impl GeoQuery {
                 return Err(bad(format!("invalid georel modifier {p:?}")));
             }
         }
+        if base != "near" && (max.is_some() || min.is_some()) {
+            return Err(bad(format!("georel {base} takes no distance (4.10)")));
+        }
         let rel = match base {
             "near" => {
                 if max.is_none() && min.is_none() {
@@ -657,6 +660,26 @@ mod tests {
             "an oversized ordering reference must be rejected"
         );
         assert!(parse_ref_geometry("Point", &json!([1.0, 2.0])).is_ok());
+    }
+
+    /// 4.10: only nearRel takes a distance (`withinRel = "within"`, and so on
+    /// for every other relation); Coraine query_entities_geo_errors.
+    #[test]
+    fn a_distance_belongs_to_near_only() {
+        for rel in [
+            "within;maxDistance==100",
+            "intersects;minDistance==1",
+            "disjoint;maxDistance==5",
+        ] {
+            let mut params = HashMap::new();
+            params.insert("georel".to_owned(), rel.to_owned());
+            params.insert("geometry".to_owned(), "Point".to_owned());
+            params.insert("coordinates".to_owned(), "[8,40]".to_owned());
+            assert!(
+                GeoQuery::from_params(&params).is_err(),
+                "{rel} must be rejected"
+            );
+        }
     }
 
     /// 4.10 PositiveNumber is an RFC 8259 Number — "inf"/"Infinity" and an

@@ -474,13 +474,22 @@ async fn clause_5_8_6_origin_csf_gates_inbound_notifications() {
             .any(|r| r.starts_with("DELETE /ngsi-ld/v1/subscriptions"))
     })
     .await;
-    let (status, _) = send(
-        &st,
-        "POST",
-        "/ex/v1/remote-notify",
-        Some(inbound("urn:ngsi-ld:Vehicle:gated")),
-    )
-    .await;
+    // the mapping goes right after the DELETE is sent (distsub.rs), so the
+    // first notification may still find it: poll until it is refused
+    let mut status = StatusCode::OK;
+    for _ in 0..50 * antares_api::state::slow_factor() {
+        (status, _) = send(
+            &st,
+            "POST",
+            "/ex/v1/remote-notify",
+            Some(inbound("urn:ngsi-ld:Vehicle:gated")),
+        )
+        .await;
+        if status == StatusCode::NOT_FOUND {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,

@@ -601,11 +601,17 @@ impl Reloader {
             revision(views.iter().map(|(id, (doc, _))| (id.as_str(), *doc))),
         );
         self.state.views.replace_schemas(schemas);
+        let retention = Arc::new(retention::load(retention_docs.into_iter()));
+        *self
+            .state
+            .history_off
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            retention::history_off(&retention);
         *self
             .retention
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Arc::new(retention::load(retention_docs.into_iter()));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = retention;
         *self
             .quality
             .write()

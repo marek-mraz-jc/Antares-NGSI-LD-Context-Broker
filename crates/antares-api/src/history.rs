@@ -80,7 +80,7 @@ pub(crate) async fn push(st: &AppState, ev: TemporalEvent) {
 /// Gate 1 (value-change) runs in the producer — an unchanged instance never
 /// becomes an event (`changed_instances`). Adding a gate = one more entry
 /// here; producers and drivers stay untouched.
-const GATES: &[fn(&AppState, &TemporalEvent) -> bool] = &[observed_gate];
+const GATES: &[fn(&AppState, &TemporalEvent) -> bool] = &[observed_gate, history_gate];
 
 /// Gate 2: ANTARES_TEMPORAL_RECORD. `all` admits everything; `observed`
 /// keeps only instances that carry `observedAt` — the spec's own
@@ -92,6 +92,26 @@ fn observed_gate(st: &AppState, ev: &TemporalEvent) -> bool {
         All => true,
         Observed => ev.instance.get("observedAt").is_some(),
         None => false,
+    }
+}
+
+/// Gate 3 (T-4275): a type whose retention rule says `history: "off"` keeps
+/// its current state only, so an Entity with any such type in its Tenant
+/// records no attribute instance.
+fn history_gate(st: &AppState, ev: &TemporalEvent) -> bool {
+    let off = st
+        .history_off
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if off.is_empty() {
+        return true;
+    }
+    let tenant = ev.tenant.as_str();
+    let off_type = |t: &str| off.contains(&(tenant.to_owned(), t.to_owned()));
+    match ev.shell.get("type") {
+        Some(Value::String(t)) => !off_type(t),
+        Some(Value::Array(ts)) => !ts.iter().filter_map(Value::as_str).any(off_type),
+        _ => true,
     }
 }
 
@@ -176,21 +196,18 @@ pub(crate) async fn mirror_delete_attr(
     attr_iri: &str,
     dataset_id: Option<&str>,
     ts: &str,
-) -> bool {
-    let mut had = false;
+) {
     let r = st
         .temporal
         .mutate(tenant, id, |doc| {
             // The mirror writes nothing into a document the temporal driver
-            // handed back in a shape the contract forbids; `had` stays false and
-            // the caller reports that nothing was mirrored.
+            // handed back in a shape the contract forbids.
             let Some(target) = doc.as_object_mut() else {
                 return Ok::<(), std::convert::Infallible>(());
             };
             if attr_iri == "scope" {
                 // scope deletion: a deleted scope is the NGSI-LD Null (4.18:
                 // urn:ngsi-ld:null appears only for deleted scopes; 4.5.0)
-                had = true;
                 let inst = serde_json::json!({
                     "type": "Property",
                     "value": "urn:ngsi-ld:null",
@@ -209,7 +226,6 @@ pub(crate) async fn mirror_delete_attr(
                 if arr.is_empty() {
                     return Ok(());
                 }
-                had = true;
                 let atype = arr
                     .first()
                     .and_then(|i| i.get("type"))
@@ -261,5 +277,4 @@ pub(crate) async fn mirror_delete_attr(
     if let Err(e) = r {
         tracing::warn!("temporal attr mirror failed: {e}");
     }
-    had
 }

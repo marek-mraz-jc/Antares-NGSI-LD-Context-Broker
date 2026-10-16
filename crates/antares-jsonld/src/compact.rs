@@ -115,8 +115,9 @@ pub fn compact_instance(inst: &Value, ctx: &Context) -> Value {
                 o => o.clone(),
             };
             out.insert(k.clone(), compacted);
-        } else if k == "objectType" {
-            out.insert("objectType".into(), compact_types(v, ctx));
+        } else if k == "objectType" || k == "valueType" {
+            // both are type coerced on input (4.5.2.2), so terms on output
+            out.insert(k.clone(), compact_types(v, ctx));
         } else if k == "entityTypeSealed" {
             // 4.5.2.2 / annex B: @vocab-coerced — compacts back to a term
             // exactly like a type name; entityIdSealed needs no arm (a
@@ -280,6 +281,23 @@ mod tests {
             .expect("expand");
         assert!(out.get(&format!("{DEFAULT}geometry")).is_some(), "{out}");
         assert_eq!(compact_entity(&out, &ctx), vehicle);
+    }
+
+    /// 4.5.2.2: valueType is type coerced into a datatype URI on input, so
+    /// it compacts back on output: the entity reads back as it was written
+    /// (Coraine value_type_subattr).
+    #[test]
+    fn a_value_type_round_trips() {
+        let ctx = std::sync::Arc::new(crate::core_context());
+        let e = json!({"id": "urn:E1", "type": "T",
+            "P1": {"type": "Property", "value": 1, "valueType": "Integer"}});
+        let out =
+            expand_entity(e.as_object().unwrap(), &ctx, ExpandOpts::default()).expect("expand");
+        assert_eq!(
+            out[&format!("{DEFAULT}P1")][0]["valueType"],
+            format!("{DEFAULT}Integer")
+        );
+        assert_eq!(compact_entity(&out, &ctx), e);
     }
 
     /// A property-scoped core context applies to everything inside the
