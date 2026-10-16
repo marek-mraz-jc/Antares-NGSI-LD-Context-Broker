@@ -1185,11 +1185,27 @@ fn expand_instance(
 /// ... or the language tag "@none"", each a string or an array of strings.
 fn valid_language_map(lm: &Value) -> bool {
     lm.as_object().is_some_and(|m| {
-        m.keys().all(|k| !k.is_empty())
+        m.keys().all(|k| k == "@none" || is_language_tag(k))
             && m.values().all(|v| {
                 v.is_string() || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
             })
     })
+}
+
+/// RFC 5646 section 2.1 well-formedness, as far as the shape goes: hyphen
+/// separated subtags of 1-8 letters or digits, led by a 2-8 letter language
+/// or the `x`/`i` singleton of a private-use or grandfathered tag.
+// ponytail: no registry lookup, so a well-formed but unregistered subtag passes
+fn is_language_tag(tag: &str) -> bool {
+    let mut subtags = tag.split('-');
+    let first = subtags.next().unwrap_or_default();
+    let lead = (2..=8).contains(&first.len()) && first.bytes().all(|b| b.is_ascii_alphabetic());
+    let singleton = matches!(first, "x" | "X" | "i" | "I");
+    let rest: Vec<&str> = subtags.collect();
+    (lead || (singleton && !rest.is_empty()))
+        && rest
+            .iter()
+            .all(|t| (1..=8).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// Expand a PARTIAL-UPDATE attribute fragment (5.6.4): reserved members are
@@ -1973,6 +1989,35 @@ mod tests {
                 expand_attr_fragment(f.as_object().unwrap(), &core()).is_ok(),
                 "{ok}"
             );
+        }
+    }
+
+    /// 4.5.18.2: languageMap keys are RFC 5646 language tags (Coraine
+    /// languagemap_key_rfc5646).
+    #[test]
+    fn language_map_keys_are_rfc_5646_tags() {
+        for ok in [
+            "en",
+            "en-US",
+            "zh-Hans-CN",
+            "x-private",
+            "i-klingon",
+            "@none",
+        ] {
+            assert!(valid_language_map(&serde_json::json!({ok: "t"})), "{ok}");
+        }
+        for bad in [
+            "",
+            "123",
+            "!!",
+            "en_US",
+            "en-",
+            "e",
+            "x",
+            "this is not a language",
+            "en-toolongsubtag",
+        ] {
+            assert!(!valid_language_map(&serde_json::json!({bad: "t"})), "{bad}");
         }
     }
 
