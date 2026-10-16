@@ -75,10 +75,11 @@ fn conditional() -> Rule {
     }
 }
 
-/// Records whether each temporal read asked the store for a range.
+/// Records, for each temporal read, whether it asked the store for a range
+/// and for a lastN cap.
 struct Recording {
     inner: Arc<dyn TemporalDriver>,
-    ranged: Mutex<Vec<bool>>,
+    ranged: Mutex<Vec<(bool, bool)>>,
 }
 
 #[async_trait::async_trait]
@@ -97,7 +98,10 @@ impl TemporalDriver for Recording {
         t: &TenantId,
         f: &filter::TemporalFilter<'_>,
     ) -> Result<filter::TemporalOutcome, NgsiError> {
-        self.ranged.lock().expect("lock").push(f.range.is_some());
+        self.ranged
+            .lock()
+            .expect("lock")
+            .push((f.range.is_some(), f.last_n.is_some()));
         self.inner.query_temporal(t, f).await
     }
     async fn get_temporal(
@@ -106,7 +110,10 @@ impl TemporalDriver for Recording {
         id: &str,
         f: &filter::TemporalFilter<'_>,
     ) -> Result<Option<Value>, NgsiError> {
-        self.ranged.lock().expect("lock").push(f.range.is_some());
+        self.ranged
+            .lock()
+            .expect("lock")
+            .push((f.range.is_some(), f.last_n.is_some()));
         self.inner.get_temporal(t, id, f).await
     }
     async fn get(&self, t: &TenantId, id: &str) -> Result<Option<Value>, NgsiError> {
@@ -211,7 +218,10 @@ async fn a_rule_without_a_condition_reads_only_the_window_and_shows_the_same() {
     assert_eq!(status, StatusCode::OK, "{one}");
     assert_eq!(speeds(&one), vec![7, 8, 9, 10], "{one}");
 
-    assert_eq!(*recording.ranged.lock().expect("lock"), vec![true, true]);
+    assert_eq!(
+        *recording.ranged.lock().expect("lock"),
+        vec![(true, false), (true, false)]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -235,5 +245,69 @@ async fn a_rule_with_a_condition_still_reads_the_whole_history() {
     assert_eq!(status, StatusCode::OK, "{one}");
     assert_eq!(speeds(&one), vec![7, 8, 9, 10], "{one}");
 
-    assert_eq!(*recording.ranged.lock().expect("lock"), vec![false, false]);
+    assert_eq!(
+        *recording.ranged.lock().expect("lock"),
+        vec![(false, false), (false, false)]
+    );
+}
+
+/// The newest `n` speeds through the query and the by-id read, and what the
+/// store was asked for.
+async fn last_two(rule: Rule) -> (Vec<i64>, Vec<i64>, Vec<(bool, bool)>) {
+    let (st, recording) = state(rule).await;
+    let (status, body) = send(
+        &st,
+        &format!("/ngsi-ld/v1/temporal/entities?type=Vehicle&{AFTER}&lastN=2"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, one) = send(
+        &st,
+        &format!("/ngsi-ld/v1/temporal/entities/{CAR}?{AFTER}&lastN=2"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    let asked = recording.ranged.lock().expect("lock").clone();
+    (speeds(&body[0]), speeds(&one), asked)
+}
+
+/// Rules whose windows stay open towards now keep the newest instances of
+/// what they show, so the store's lastN cap keeps what they would: the cap
+/// goes down with the range.
+#[tokio::test(flavor = "multi_thread")]
+async fn last_n_reaches_the_store_under_rules_that_keep_the_newest() {
+    let (query, one, asked) = last_two(plain()).await;
+    assert_eq!(query, vec![10, 9]);
+    assert_eq!(one, vec![10, 9]);
+    assert_eq!(asked, vec![(true, true), (true, true)]);
+}
+
+/// A window that closes before now hides the newest instances: a store cap
+/// would keep exactly those and the rule would then drop them, so the cap
+/// stays in the API and the answer is the newest the rule shows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_window_closed_before_now_keeps_last_n_out_of_the_store() {
+    let closed = Rule {
+        temporal: vec![Window {
+            from: None,
+            to: Some(TimeBound::At(
+                "2026-01-01T00:00:09Z".parse().expect("instant"),
+            )),
+        }],
+        ..plain()
+    };
+    let (query, one, asked) = last_two(closed).await;
+    assert_eq!(query, vec![8, 7]);
+    assert_eq!(one, vec![8, 7]);
+    assert_eq!(asked, vec![(true, false), (true, false)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_condition_keeps_last_n_out_of_the_store() {
+    let (query, one, asked) = last_two(conditional()).await;
+    assert_eq!(query, vec![10, 9]);
+    assert_eq!(one, vec![10, 9]);
+    assert_eq!(asked, vec![(false, false), (false, false)]);
 }

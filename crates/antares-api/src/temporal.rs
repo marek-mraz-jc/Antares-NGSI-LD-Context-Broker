@@ -1843,6 +1843,22 @@ fn replays_state(rules: Option<&crate::policy::Filter>) -> bool {
     rules.is_some_and(|r| r.rules.iter().any(crate::policy::Rule::is_conditional))
 }
 
+/// Whether the store's per-Attribute cap keeps every instance `rules` would
+/// show of the page: with no rules always; under rules only for lastN, when
+/// no rule reads state and every window stays open towards now, so the
+/// rules keep the newest instances of what they show. A window that closes
+/// before now, or firstN, would have the store keep instances the rules
+/// then drop (T-4246).
+fn cap_keeps_shown(rules: Option<&crate::policy::Filter>, page: &InstancePage) -> bool {
+    rules.is_none_or(|r| {
+        page.desc
+            && !replays_state(Some(r))
+            && r.rules
+                .iter()
+                .all(|rule| rule.temporal.iter().all(|w| w.to.is_none()))
+    })
+}
+
 /// 5.7.4.4 S2/S3: the values filter and the geoquery are judged on the
 /// Attribute instances WITHIN the temporal-query interval, so an
 /// out-of-window instance must not satisfy either.
@@ -2348,7 +2364,9 @@ pub(crate) async fn query_temporal_collected(
                     end_time_at: t.end_time_at.as_deref(),
                     timeproperty: &t.timeproperty,
                 }),
-            last_n: page_n.store_cap().filter(|_| exact_push && !ruled),
+            last_n: page_n
+                .store_cap()
+                .filter(|_| exact_push && cap_keeps_shown(types_rule.as_deref(), &page_n)),
             oldest_first: !page_n.desc,
             timeproperty: tq
                 .as_ref()
@@ -2721,7 +2739,6 @@ async fn retrieve_temporal_inner(
         // the whole history, so the store prunes no instance under one; rules
         // without one read only the window (T-4246)
         let types_rule = crate::repr::type_rules(&filter);
-        let ruled = types_rule.is_some();
         let replays = replays_state(types_rule.as_deref());
         // Instance pruning pushed into the store (no q=/geo on retrieve,
         // so it is always safe here); window() below stays the arbiter.
@@ -2735,7 +2752,9 @@ async fn retrieve_temporal_inner(
                     end_time_at: t.end_time_at.as_deref(),
                     timeproperty: &t.timeproperty,
                 }),
-            last_n: page_n.store_cap().filter(|_| !ruled),
+            last_n: page_n
+                .store_cap()
+                .filter(|_| cap_keeps_shown(types_rule.as_deref(), &page_n)),
             oldest_first: !page_n.desc,
             timeproperty: tq
                 .as_ref()
