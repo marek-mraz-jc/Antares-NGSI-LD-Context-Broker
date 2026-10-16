@@ -210,5 +210,8 @@ async fn no_migration_builds_a_partial_index_over_history() {
     .fetch_all(&pool)
     .await
     .expect("indexes");
-    assert!(partial.is_empty(), "partial indexes on attr_instances: {partial:?}");
+    assert!(
+        partial.is_empty(),
+        "partial indexes on attr_instances: {partial:?}"
+    );
 }
