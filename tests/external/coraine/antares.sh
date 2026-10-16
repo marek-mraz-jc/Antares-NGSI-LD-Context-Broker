@@ -193,7 +193,8 @@ corDbDrop() {
     memory) ;;
     file) rm -rf "${ANTARES_TEST_DIR:?}/${role:?}" ;;
     postgres|timescale)
-      psql "$ANTARES_TEST_PG/postgres" -q -c "DROP DATABASE IF EXISTS $(antaresRoleDb "$role") WITH (FORCE)" > /dev/null || return 1
+      # IF EXISTS on a missing database prints a NOTICE, and corTest fails an INIT on any stderr
+      PGOPTIONS="-c client_min_messages=warning" psql "$ANTARES_TEST_PG/postgres" -q -c "DROP DATABASE IF EXISTS $(antaresRoleDb "$role") WITH (FORCE)" > /dev/null || return 1
       ;;
     *) echo "corDbDrop: unknown ANTARES_TEST_STORE $ANTARES_TEST_STORE" >&2; return 1 ;;
   esac
