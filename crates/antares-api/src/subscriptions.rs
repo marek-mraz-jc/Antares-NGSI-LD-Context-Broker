@@ -946,7 +946,10 @@ pub async fn create(
         let one_url = match &parsed.ctx.source {
             Value::Null => Some(antares_jsonld::CORE_CONTEXT.to_owned()),
             Value::String(u) => Some(u.clone()),
-            Value::Array(a) if a.len() == 1 => a[0].as_str().map(str::to_owned),
+            Value::Array(a) => match a.as_slice() {
+                [one] => one.as_str().map(str::to_owned),
+                _ => None,
+            },
             _ => None,
         };
         if let Some(url) = one_url {
