@@ -538,8 +538,22 @@ fn norm_member(
             antares_ql::scope::check_scope_q(q)?;
             out.insert(k.to_owned(), v.clone());
         }
-        "lang" | "subscriptionName" | "name" | "description" | "jsonldContext"
-        | "ngsildConformance" | "datasetId" => {
+        "ngsildConformance" => {
+            // Table 5.2.12-1: "a semantically versioned string in the form major.minor"
+            let ok = v
+                .as_str()
+                .and_then(|s| s.split_once('.'))
+                .is_some_and(|(a, b)| {
+                    [a, b]
+                        .iter()
+                        .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+                });
+            if !ok {
+                return Err(bad("ngsildConformance must be major.minor (5.2.12)".into()));
+            }
+            out.insert(k.to_owned(), v.clone());
+        }
+        "lang" | "subscriptionName" | "name" | "description" | "jsonldContext" | "datasetId" => {
             out.insert(k.to_owned(), v.clone());
         }
         // tolerant reader: keep unknown members
@@ -1334,6 +1348,26 @@ mod tests {
                 &ctx,
             ),
             "a stored \"*\" subscription must match every Entity"
+        );
+    }
+
+    /// Table 5.2.12-1 ngsildConformance: "A semantically versioned string in
+    /// the form major.minor" (Coraine subscription_ngsild_conformance).
+    #[test]
+    fn ngsild_conformance_is_major_dot_minor() {
+        let ctx = Loader::new().core();
+        let sub = |v: Value| {
+            json!({"type": "Subscription", "entities": [{"type": "Building"}], "ngsildConformance": v,
+                   "notification": {"endpoint": {"uri": "http://localhost:1111/notify"}}})
+        };
+        for bad in [json!("oneDotFive"), json!("1"), json!("1.8.1"), json!(1.8)] {
+            assert!(
+                normalize_subscription(sub(bad.clone()).as_object().unwrap(), &ctx, false).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(
+            normalize_subscription(sub(json!("1.8")).as_object().unwrap(), &ctx, false).is_ok()
         );
     }
 
