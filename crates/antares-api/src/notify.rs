@@ -990,6 +990,8 @@ pub(crate) fn notif_shape(sub: &Value, ctx: &Context) -> NotifShape {
             .unwrap_or(false),
         key_values: matches!(format, "keyValues" | "simplified"),
         concise: format == "concise",
+        // Table 5.2.12-1: "Language filter to be applied to the query (clause 4.15)"
+        lang: sub.get("lang").and_then(Value::as_str).map(str::to_owned),
         ..Default::default()
     };
     let names = |key: &str| -> Option<Vec<String>> {
@@ -3324,6 +3326,24 @@ mod endpoint_tests {
             children.iter().any(|c| c.raw == "type"),
             "refDevice{{type}} must select `type` inside the Linked Entity"
         );
+    }
+
+    /// Table 5.2.12-1 `lang`: "Language filter to be applied to the query
+    /// (clause 4.15)", the query being what a Notification carries; a
+    /// LanguageProperty arrives as a Property in the chosen language
+    /// (Coraine langprop_get_none, subscription_notify_langprop_array).
+    #[test]
+    fn the_subscription_lang_filters_the_notified_entity() {
+        let ctx = antares_jsonld::Loader::new().core();
+        let shape = notif_shape(&json!({"lang": "es", "notification": {}}), &ctx);
+        let doc = json!({"id": "urn:E1", "type": "T",
+            "https://example.org/L": [{"type": "LanguageProperty",
+                "languageMap": {"en": "one", "es": "uno"}}]});
+        let out = crate::repr::apply(&doc, &shape.repr);
+        let l = &out["https://example.org/L"][0];
+        assert_eq!(l["type"], "Property", "{out}");
+        assert_eq!(l["value"], "uno");
+        assert_eq!(l["lang"], "es");
     }
 
     /// Table 5.2.15-1 `timeout`: honored, clamped, defaulted.
