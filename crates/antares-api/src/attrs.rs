@@ -1542,27 +1542,16 @@ async fn delete_attr_inner(
             g.settled()?;
         }
         // The temporal representation records the deletion (4.8 deletedAt).
-        // An Entity held only temporally is not "held locally" (5.6.5.4): it
-        // answers ResourceNotFound and its evolution is left to 5.6.13. A
-        // REFUSED delete (the 5.6.5.4 type selector did not match) deleted
-        // nothing and leaves the attribute history untouched too.
-        let temporal_had = matches!(res, Some(Ok(_)))
-            && crate::history::mirror_delete_attr(
-                st,
-                &tenant,
-                id,
-                &attr_iri,
-                want_ds.as_deref(),
-                &ts,
-            )
-            .await;
-        Some(single_attr_local(
-            res,
-            found || temporal_had,
-            id,
-            attr,
-            &tenant,
-        ))
+        // Only what the Entity held is deleted (5.6.5.4: "If the target Entity
+        // does not contain the target Attribute then an error of type
+        // ResourceNotFound shall be raised"), so an Entity held only
+        // temporally, an Attribute already deleted and a refused delete (the
+        // type selector did not match) all leave the history untouched.
+        if found && matches!(res, Some(Ok(_))) {
+            crate::history::mirror_delete_attr(st, &tenant, id, &attr_iri, want_ds.as_deref(), &ts)
+                .await;
+        }
+        Some(single_attr_local(res, found, id, attr, &tenant))
     };
     if regs.is_empty() {
         // the local half is skipped only while registrations cover the

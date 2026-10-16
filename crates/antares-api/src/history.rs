@@ -176,21 +176,18 @@ pub(crate) async fn mirror_delete_attr(
     attr_iri: &str,
     dataset_id: Option<&str>,
     ts: &str,
-) -> bool {
-    let mut had = false;
+) {
     let r = st
         .temporal
         .mutate(tenant, id, |doc| {
             // The mirror writes nothing into a document the temporal driver
-            // handed back in a shape the contract forbids; `had` stays false and
-            // the caller reports that nothing was mirrored.
+            // handed back in a shape the contract forbids.
             let Some(target) = doc.as_object_mut() else {
                 return Ok::<(), std::convert::Infallible>(());
             };
             if attr_iri == "scope" {
                 // scope deletion: a deleted scope is the NGSI-LD Null (4.18:
                 // urn:ngsi-ld:null appears only for deleted scopes; 4.5.0)
-                had = true;
                 let inst = serde_json::json!({
                     "type": "Property",
                     "value": "urn:ngsi-ld:null",
@@ -209,7 +206,6 @@ pub(crate) async fn mirror_delete_attr(
                 if arr.is_empty() {
                     return Ok(());
                 }
-                had = true;
                 let atype = arr
                     .first()
                     .and_then(|i| i.get("type"))
@@ -261,5 +257,4 @@ pub(crate) async fn mirror_delete_attr(
     if let Err(e) = r {
         tracing::warn!("temporal attr mirror failed: {e}");
     }
-    had
 }
