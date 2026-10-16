@@ -168,8 +168,11 @@ async fn views_notifications_join_only_what_the_view_shows() -> Result<(), Strin
         Some(&json!("Pat")),
         "{n}"
     );
+    // The entities alone: the envelope's random Notification id may hold "4321" (T-4250, fast
+    // run 38860860930: urn:ngsi-ld:Notification:3012fe29-bdc5-4321-...).
+    let shown = n["data"].to_string();
     for hidden in ["4321", "salary", "Acme"] {
-        assert!(!n.to_string().contains(hidden), "{hidden} leaked: {n}");
+        assert!(!shown.contains(hidden), "{hidden} leaked: {n}");
     }
     Ok(())
 }
