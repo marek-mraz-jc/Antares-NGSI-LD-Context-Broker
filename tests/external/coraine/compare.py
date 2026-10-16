@@ -147,7 +147,8 @@ def items(text, expected):
                 name, _, value = lines[i].partition(":")
                 lname = name.strip().lower()
                 if lname == "link":
-                    links.append(("header", "link", link_value(value)))
+                    # RFC 8288 3: one header may join several link-values with commas
+                    links += [("header", "link", link_value(v)) for v in re.split(r",\s*(?=<)", value)]
                 elif lname in KEEP_HEADERS:
                     res.append(("header", lname, header_value(name, value)))
                 i += 1

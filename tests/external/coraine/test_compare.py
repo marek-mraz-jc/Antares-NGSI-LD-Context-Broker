@@ -166,6 +166,14 @@ class Regex(unittest.TestCase):
         self.assertIsNone(compare.normalised_diff(exp, act))
         self.assertIsNotNone(compare.normalised_diff(exp, act.replace("offset=1", "offset=2")))
 
+    def test_one_link_header_may_join_several_link_values(self):
+        # RFC 8288 3: Link = #link-value, so one header line is a comma list
+        exp = ('HTTP/1.1 200 OK\nLink: </e?offset=0>; rel="prev"\n'
+               'Link: </e?offset=2>; rel="next"\n\n')
+        act = 'HTTP/1.1 200 OK\nLink: </e?offset=2>; rel="next", </e?offset=0>; rel="prev"\n\n'
+        self.assertIsNone(compare.normalised_diff(exp, act))
+        self.assertIsNotNone(compare.normalised_diff(exp, act.replace("offset=0", "offset=1")))
+
     def test_a_bare_regex_glued_to_digits_or_ending_a_member(self):
         body = compare.quote_bare_regex('{"d": 85REGEX(\\.\\d+),\n "e": REGEX(.*)\n "f": 1}')
         obj = json.loads(body)
