@@ -17,7 +17,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-      - run: uname -a; cat /proc/sys/vm/mmap_rnd_bits; grep -m1 -i 'model name\|CPU part' /proc/cpuinfo || true; cat /proc/meminfo | head -2; ulimit -a
+      - run: uname -a; sudo cat /proc/sys/vm/mmap_rnd_bits || true; head -2 /proc/meminfo; ulimit -a || true
       - run: sudo apt-get install -y -q gdb >/dev/null
       - name: a trivial TSan program, the control
         run: |
@@ -25,6 +25,7 @@ jobs:
           printf '[package]\nname="hello"\nversion="0.1.0"\nedition="2021"\n' > Cargo.toml
           printf 'fn main(){ let t=std::thread::spawn(||1); println!("hello {}", t.join().unwrap()); }\n#[test] fn t(){ assert_eq!(1,1); }\n' > src/main.rs
           RUSTFLAGS=-Zsanitizer=thread cargo +nightly build -q -Zbuild-std --target aarch64-unknown-linux-gnu --tests --bins
+          gdb -q -batch -ex run -ex bt --args ./target/aarch64-unknown-linux-gnu/debug/hello 2>&1 | tail -30 || true
           ./target/aarch64-unknown-linux-gnu/debug/hello || echo "hello exit $?"
           setarch "$(uname -m)" -R ./target/aarch64-unknown-linux-gnu/debug/hello || echo "hello -R exit $?"
           TSAN_OPTIONS=verbosity=2 ./target/aarch64-unknown-linux-gnu/debug/hello 2>&1 | head -40 || true
@@ -33,8 +34,9 @@ jobs:
           RUSTFLAGS: "-Zsanitizer=thread"
           ANTARES_TEST_SANITIZER: thread
         run: |
-          cargo +nightly test -q -Zbuild-std --target aarch64-unknown-linux-gnu -p antares-api --lib --no-run 2>&1 | tail -3
-          bin=$(ls -t target/aarch64-unknown-linux-gnu/debug/deps/antares_api-* | grep -v '\.d$' | head -1)
+          cargo +nightly test -Zbuild-std --target aarch64-unknown-linux-gnu -p antares-api --lib --no-run 2>&1 | tee /tmp/build.txt | tail -3
+          # nightly's build-dir layout puts the unit test binary under build/<pkg>/<hash>/out/
+          bin=$(sed -n 's/.*Executable unittests src\/lib.rs (\(.*\))$/\1/p' /tmp/build.txt | tail -1)
           echo "binary $bin"; file "$bin" || true
           (TSAN_OPTIONS="verbosity=2 suppressions=$PWD/dev/tsan-suppressions.txt" "$bin" --list 2>&1 | head -60) || true
           (setarch "$(uname -m)" -R "$bin" --list 2>&1 | tail -5) || echo "-R exit $?"
