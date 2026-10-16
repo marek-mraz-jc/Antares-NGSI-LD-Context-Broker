@@ -352,6 +352,13 @@ fn int_to_f64(i: i64) -> f64 {
     high * 4_294_967_296.0 + low
 }
 
+/// `base` to the power of `exp`'s magnitude, when it fits in an integer.
+fn inverse_power(base: i64, exp: i64) -> Option<i64> {
+    u32::try_from(exp.unsigned_abs())
+        .ok()
+        .and_then(|e| base.checked_pow(e))
+}
+
 fn number(v: &Val<'_>) -> Option<f64> {
     match v {
         Val::Int(i) => Some(int_to_f64(*i)),
@@ -540,18 +547,11 @@ fn call(func: Func, args: Vec<Option<Val<'_>>>) -> Option<Val<'_>> {
                 .ok()
                 .and_then(|exp| base.checked_pow(exp))
                 .map(Val::Int),
-            // An exact power and one rounding: `powf`'s precision is unspecified, so 2 ^ -1 is
-            // 0.5 on every platform only when it is 1 / 2 (Miri models the imprecision).
-            (Val::Int(base), Val::Int(exp))
-                if u32::try_from(exp.unsigned_abs())
-                    .ok()
-                    .and_then(|e| base.checked_pow(e))
-                    .is_some() =>
-            {
-                let power = u32::try_from(exp.unsigned_abs())
-                    .ok()
-                    .and_then(|e| base.checked_pow(e))?;
-                let result = 1.0 / int_to_f64(power);
+            // An exact power and one rounding where it fits: `powf`'s precision is unspecified,
+            // so 2 ^ -1 is 0.5 on every platform only as 1 / 2 (Miri models the imprecision).
+            // An integer exponent here is negative: a non-negative one is the arm above.
+            (Val::Int(base), Val::Int(exp)) if inverse_power(*base, *exp).is_some() => {
+                let result = 1.0 / inverse_power(*base, *exp).map_or(f64::NAN, int_to_f64);
                 result.is_finite().then_some(Val::Num(result))
             }
             (base, exp) => {

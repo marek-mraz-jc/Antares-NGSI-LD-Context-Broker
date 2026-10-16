@@ -579,6 +579,9 @@ fn arithmetic_is_checked_and_rounding_keeps_integers() {
         (eq(f2(Func::Pow, i(2), i(-1)), n(0.5)), T),
         (eq(f2(Func::Pow, i(-2), i(-3)), n(-0.125)), T),
         (is_null(f2(Func::Pow, i(0), i(-1))), T),
+        // Past an integer, the power is the platform's.
+        (cmp(Cmp::Gt, f2(Func::Pow, i(2), i(-100)), n(0.0)), T),
+        (cmp(Cmp::Lt, f2(Func::Pow, i(2), i(-100)), n(1e-29)), T),
         // A fractional power is as precise as the platform's `powf`, which Rust leaves open.
         (
             cmp(
