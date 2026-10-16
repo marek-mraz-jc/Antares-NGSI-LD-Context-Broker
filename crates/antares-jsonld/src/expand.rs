@@ -761,7 +761,7 @@ fn expand_common_members(
             .as_str()
             .filter(|s| parse_datetime(s))
             .ok_or_else(|| bad(format!("attribute {name}: invalid observedAt")))?;
-        out.insert("observedAt".into(), Value::String(s.to_owned()));
+        out.insert("observedAt".into(), Value::String(point_fraction(s)));
     }
     if let Some(e) = obj.get("expiresAt").filter(|v| !(nulls && is_ngsi_null(v))) {
         // 4.22 transient attribute instances carry their own expiresAt.
@@ -769,7 +769,7 @@ fn expand_common_members(
             .as_str()
             .filter(|s| parse_datetime(s))
             .ok_or_else(|| bad(format!("attribute {name}: invalid expiresAt")))?;
-        out.insert("expiresAt".into(), Value::String(s.to_owned()));
+        out.insert("expiresAt".into(), Value::String(point_fraction(s)));
     }
     if opts.sys {
         // 4.8/4.5.7: deletedAt marks a deletion instance in a Temporal
@@ -1448,6 +1448,15 @@ pub fn parse_datetime(s: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(&normalized).is_ok()
 }
 
+/// A DateTime `parse_datetime` accepted, with a comma fraction separator
+/// turned into the decimal point (4.6.3: the comma only "In requests").
+fn point_fraction(s: &str) -> String {
+    match s.get(19..20) {
+        Some(",") => format!("{}.{}", &s[..19], &s[20..]),
+        _ => s.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1908,6 +1917,20 @@ mod tests {
             let err = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default());
             assert!(err.is_err(), "{t}");
         }
+    }
+
+    /// 4.6.3: the fraction separator is "a decimal point"; "In requests, also
+    /// a comma ... may be used", so what is stored, and later answered, uses
+    /// the point (Coraine datetime_comma_separator).
+    #[test]
+    fn a_comma_fraction_is_stored_with_a_decimal_point() {
+        let doc = serde_json::json!({"id": "urn:a", "type": "T", "p": {"type": "Property", "value": 1,
+            "observedAt": "2026-04-28T10:00:00,5Z", "expiresAt": "2099-01-01T00:00:00,25Z"}});
+        let out = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default())
+            .expect("expand");
+        let p = &out["https://uri.etsi.org/ngsi-ld/default-context/p"][0];
+        assert_eq!(p["observedAt"], "2026-04-28T10:00:00.5Z");
+        assert_eq!(p["expiresAt"], "2099-01-01T00:00:00.25Z");
     }
 
     #[test]
