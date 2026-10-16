@@ -96,6 +96,12 @@ only add (`create_entity`, `create_subscription`, `batch_create`) say `false`.
 - **History.** The temporal tools take `timerel`, `timeAt`, `endTimeAt`,
   `lastN` and `timeproperty`; history without `observedAt` needs
   `timeproperty: "modifiedAt"` (or `createdAt`).
+- **Representation.** `get_entity`, `query_entities`, `query_temporal`
+  and `retrieve_temporal` take `format` (`normalized`, `concise`,
+  `keyValues`; on the temporal tools `normalized`, `temporalValues`,
+  `aggregatedValues`) and `sysAttrs`, sent as `options=sysAttrs` (6.3.7);
+  `query_entities` takes `orderBy` (4.23, local scope only). The POST
+  forms take none of them (T-4258).
 - **Joins.** `join` and `joinLevel` are arguments of `get_entity` and
   `query_entities`: the view checks every join target (T-3470), so a join
   never reaches an Entity out of view (MC16).
