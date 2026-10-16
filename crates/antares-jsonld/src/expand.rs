@@ -947,6 +947,9 @@ fn expand_instance(
                     "attribute {name}: JSON null is not a valid value (use \"urn:ngsi-ld:null\")"
                 )));
             }
+            if let Some(vo) = val.as_object().filter(|o| o.contains_key("@value")) {
+                check_value_object(name, vo, ctx)?;
+            }
             out.insert("value".into(), val.clone());
         }
         "GeoProperty" => {
@@ -1190,6 +1193,42 @@ fn valid_language_map(lm: &Value) -> bool {
                 v.is_string() || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
             })
     })
+}
+
+/// A Property value carrying `@value` is a JSON-LD value object (JSON-LD
+/// 1.1 section 9.5): "MUST NOT contain any other keys" than `@type`,
+/// `@language`, `@direction`, `@index` and `@context`, and a typed one's
+/// `@type` is an IRI string. Typed as `DateTime`, its `@value` is a 4.6.3
+/// DateTime.
+fn check_value_object(name: &str, vo: &Map<String, Value>, ctx: &Context) -> Result<(), NgsiError> {
+    let bad = |m: &str| Err(NgsiError::BadRequestData(format!("attribute {name}: {m}")));
+    if let Some(k) = vo.keys().find(|k| {
+        !matches!(
+            k.as_str(),
+            "@value" | "@type" | "@language" | "@direction" | "@index" | "@context"
+        )
+    }) {
+        return bad(&format!(
+            "value object member {k:?} is not allowed (JSON-LD 1.1 9.5)"
+        ));
+    }
+    match vo.get("@type") {
+        None => Ok(()),
+        Some(Value::String(t)) => {
+            let datetime = format!("{}DateTime", crate::context::NGSI_LD_BASE);
+            let is_datetime = ctx.expand_key(t) == datetime || *t == datetime;
+            if is_datetime
+                && !vo
+                    .get("@value")
+                    .and_then(Value::as_str)
+                    .is_some_and(parse_datetime)
+            {
+                return bad("a DateTime value object needs an ISO 8601 DateTime @value (4.6.3)");
+            }
+            Ok(())
+        }
+        Some(_) => bad("value object @type must be a string (JSON-LD 1.1 9.5)"),
+    }
 }
 
 /// RFC 5646 section 2.1 well-formedness, as far as the shape goes: hyphen
@@ -1989,6 +2028,37 @@ mod tests {
                 expand_attr_fragment(f.as_object().unwrap(), &core()).is_ok(),
                 "{ok}"
             );
+        }
+    }
+
+    /// JSON-LD 1.1 9.5 value objects and 4.6.3 DateTime in a Property value
+    /// (Coraine value_type_atvalue_validation, entity_attr_typed_value_object).
+    #[test]
+    fn a_property_value_object_is_checked() {
+        let attempt = |value: serde_json::Value| {
+            let doc = serde_json::json!({"id": "urn:ngsi-ld:E:1", "type": "T",
+                "p": {"type": "Property", "value": value}});
+            expand_entity(
+                doc.as_object().expect("object"),
+                &core(),
+                ExpandOpts::default(),
+            )
+        };
+        for bad in [
+            serde_json::json!({"@type": 1, "@value": "2018-12-04T12:00:00Z"}),
+            serde_json::json!({"@type": "DateTime", "a": 19, "@value": "2018-12-04T12:00:00Z"}),
+            serde_json::json!({"@type": "DateTime", "@value": 12}),
+            serde_json::json!({"@type": "DateTime", "@value": "banana"}),
+        ] {
+            assert!(attempt(bad.clone()).is_err(), "{bad}");
+        }
+        for ok in [
+            serde_json::json!({"@type": "DateTime", "@value": "2018-12-04T12:00:00Z"}),
+            serde_json::json!({"@type": "xsd:integer", "@value": 42}),
+            serde_json::json!({"@value": "plain", "@language": "en"}),
+            serde_json::json!({"a": 1, "b": 2}),
+        ] {
+            assert!(attempt(ok.clone()).is_ok(), "{ok}");
         }
     }
 
