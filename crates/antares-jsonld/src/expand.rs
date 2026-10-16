@@ -867,7 +867,11 @@ fn expand_instance(
         }
     };
 
-    let declared = obj.get("type").and_then(Value::as_str);
+    let declared = match obj.get("type") {
+        None => None,
+        Some(Value::String(t)) => Some(t.as_str()),
+        Some(t) => return Err(bad(format!("attribute {name}: type {t} is not a string"))),
+    };
     let attr_type: &str = match declared {
         Some(t) if ATTR_TYPES.contains(&t) => t,
         Some(t) if GEO_TYPES.contains(&t) && obj.contains_key("coordinates") => {
@@ -1889,6 +1893,21 @@ mod tests {
         assert_eq!(speed[0]["value"], 55);
         let brand = &out["https://uri.etsi.org/ngsi-ld/default-context/brand"];
         assert_eq!(brand.as_array().unwrap().len(), 2);
+    }
+
+    /// 4.5.2.2: "type": "Equal to "Property""; a type that is no string
+    /// names no attribute type (Coraine attribute_type_invalid).
+    #[test]
+    fn rejects_an_attribute_type_that_is_no_string() {
+        for t in [
+            serde_json::json!(42),
+            serde_json::json!(["Property"]),
+            serde_json::json!({}),
+        ] {
+            let doc = serde_json::json!({"id": "urn:a", "type": "T", "p": {"type": t, "value": 1}});
+            let err = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default());
+            assert!(err.is_err(), "{t}");
+        }
     }
 
     #[test]
