@@ -929,8 +929,9 @@ mod tests {
             "retrieve_temporal",
         ] {
             let names = arg_names(name);
-            assert!(
-                names.contains(&"format") && names.contains(&"sysAttrs"),
+            assert_eq!(
+                (names.contains(&"format"), names.contains(&"sysAttrs")),
+                (true, true),
                 "{name}"
             );
         }
@@ -940,8 +941,8 @@ mod tests {
                 .and_then(|t| t.args.iter().find(|a| a.name == "format"))
                 .map(|a| a.kind)
         };
-        assert!(matches!(kinds("query_temporal"), Some(Kind::Word(w)) if w == TEMPORAL_FORMATS));
-        assert!(matches!(kinds("get_entity"), Some(Kind::Word(w)) if w == FORMATS));
+        assert_eq!(kinds("query_temporal"), Some(Kind::Word(TEMPORAL_FORMATS)));
+        assert_eq!(kinds("get_entity"), Some(Kind::Word(FORMATS)));
     }
 
     #[test]
