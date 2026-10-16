@@ -314,7 +314,7 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
 /// with the LinkML surface (T-4354): read under the LinkML surface's bounds
 /// first, and under this surface's own only when those refuse it, so OData
 /// takes what it took before and a schema inside both is parsed once.
-fn parsed(revision: u64, bytes: &[u8]) -> Option<Arc<linkml_model::Model>> {
+fn parsed(revision: u64, bytes: &Arc<[u8]>) -> Option<Arc<linkml_model::Model>> {
     use linkml_model::cache;
     let (read, fresh) = match cache::read(revision, bytes, &linkml_model::SURFACE_LIMITS) {
         (Ok(model), fresh) => (Ok(model), fresh),
@@ -364,14 +364,15 @@ mod tests {
 
     #[test]
     fn a_revision_is_parsed_once_and_shared_with_the_linkml_bounds() {
-        let schema = br#"{"id": "https://e.org/odata-once", "name": "s"}"#;
+        let schema: &Arc<[u8]> = &br#"{"id": "https://e.org/odata-once", "name": "s"}"#[..].into();
         let first = parsed(9_001, schema).expect("reads");
         let again = parsed(9_001, schema).expect("reads");
         assert!(Arc::ptr_eq(&first, &again));
         // The LinkML surface asks the same revision under its bounds: no new parse.
         let (linkml, fresh) =
             linkml_model::cache::read(9_001, schema, &linkml_model::SURFACE_LIMITS);
-        assert!(!fresh && Arc::ptr_eq(&first, &linkml.expect("reads")));
+        assert!(!fresh);
+        assert!(Arc::ptr_eq(&first, &linkml.expect("reads")));
     }
 
     #[test]
@@ -382,10 +383,20 @@ mod tests {
             "[".repeat(36),
             "]".repeat(36)
         );
-        let (strict, _) =
-            linkml_model::cache::read(9_002, deep.as_bytes(), &linkml_model::SURFACE_LIMITS);
+        let deep: Arc<[u8]> = deep.into_bytes().into();
+        let (strict, _) = linkml_model::cache::read(9_002, &deep, &linkml_model::SURFACE_LIMITS);
         assert!(strict.is_err());
-        let loose = linkml_model::Model::read(deep.as_bytes(), &SCHEMA_LIMITS).is_ok();
-        assert_eq!(parsed(9_002, deep.as_bytes()).is_some(), loose);
+        let loose = linkml_model::Model::read(&deep, &SCHEMA_LIMITS).is_ok();
+        assert_eq!(parsed(9_002, &deep).is_some(), loose);
+    }
+
+    #[test]
+    fn an_unreadable_schema_stays_closed_and_is_read_once() {
+        let bad: Arc<[u8]> = b"{not json"[..].into();
+        assert!(parsed(9_003, &bad).is_none());
+        // Answered from the cache, the reason logged the first time only.
+        assert!(parsed(9_003, &bad).is_none());
+        let (read, fresh) = linkml_model::cache::read(9_003, &bad, &SCHEMA_LIMITS);
+        assert_eq!((read.is_err(), fresh), (true, false));
     }
 }

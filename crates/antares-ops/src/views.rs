@@ -550,37 +550,32 @@ impl Reloader {
             .filter(|(id, d)| cache.get(id).is_none_or(|h| h.digest != *d))
             .map(|(id, _)| id.as_str())
             .collect();
-        // The first reload reads every body in one list; a later one only
-        // those whose digest moved. A body written between the two reads is
-        // held under the older digest and fetched again on the next reload.
-        let mut fresh: HashMap<String, Value> = HashMap::new();
-        if cache.is_empty() && !stale.is_empty() {
-            for doc in self.state.view_docs().await? {
-                if let Some(id) = doc.get("id").and_then(Value::as_str) {
-                    fresh.insert(id.to_owned(), doc);
-                }
-            }
-        } else {
-            for id in stale {
-                if let Some(doc) = self.state.view_doc(id).await? {
-                    fresh.insert(id.to_owned(), doc);
-                }
-            }
+        // Only the bodies whose digest moved, the first reload's being all of them. A body
+        // written between the two reads is held under the older digest and fetched again on
+        // the next reload; one deleted between them is in neither, and goes.
+        let mut fresh: HashMap<String, Value> = HashMap::with_capacity(stale.len());
+        for id in stale {
+            fresh.extend(
+                self.state
+                    .view_doc(id)
+                    .await?
+                    .map(|doc| (id.to_owned(), doc)),
+            );
         }
         self.fetched.fetch_add(
             u64::try_from(fresh.len()).unwrap_or(u64::MAX),
             std::sync::atomic::Ordering::Relaxed,
         );
-        let mut next = HashMap::with_capacity(listed.len());
-        for (id, digest) in listed {
-            let held = match (fresh.remove(&id), cache.remove(&id)) {
-                (Some(doc), _) => Held::new(&id, digest, doc),
-                (None, Some(held)) => held,
-                // Deleted between the two reads.
-                (None, None) => continue,
-            };
-            next.insert(id, held);
-        }
+        let next: HashMap<String, Held> = listed
+            .into_iter()
+            .filter_map(|(id, digest)| {
+                let held = match fresh.remove(&id) {
+                    Some(doc) => Held::new(&id, digest, doc),
+                    None => cache.remove(&id)?,
+                };
+                Some((id, held))
+            })
+            .collect();
         let mut views = BTreeMap::new();
         let mut schemas = BTreeMap::new();
         let mut retention_docs = Vec::new();

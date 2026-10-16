@@ -574,20 +574,8 @@ impl AppState {
         st
     }
 
-    /// Every stored view document (ADR-0023 rule 10), as written.
-    ///
-    /// # Errors
-    /// The store's.
-    #[cfg(feature = "views")]
-    pub async fn view_docs(&self) -> Result<Vec<serde_json::Value>, String> {
-        self.store
-            .list(&view_tenant()?, antares_store::Kind::View)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    /// Every stored view document's id and digest, the bodies left in the
-    /// store (T-4354).
+    /// Every stored view document's (ADR-0023 rule 10) id and digest, the
+    /// bodies left in the store (T-4354).
     ///
     /// # Errors
     /// The store's.

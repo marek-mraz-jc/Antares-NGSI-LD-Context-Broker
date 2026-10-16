@@ -320,7 +320,7 @@ impl Cache {
     /// The stored schema `schema` of `view`, revision `revision`, as read;
     /// `None` when it does not load (LK4: a metaslot outside the subset
     /// closes the view's LinkML surface, the reason goes to the log once).
-    pub(crate) fn source(view: &str, revision: u64, schema: &[u8]) -> Option<Arc<Model>> {
+    pub(crate) fn source(view: &str, revision: u64, schema: &Arc<[u8]>) -> Option<Arc<Model>> {
         match linkml_model::cache::read(revision, schema, &LIMITS) {
             (Ok(model), _) => Some(model),
             (Err(e), fresh) => {
@@ -363,23 +363,18 @@ impl Cache {
         let weight = rendered.bytes().saturating_add(schema.len());
         let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let (entries, held) = &mut *guard;
-        while !entries.is_empty()
-            && (entries.len() >= crate::CACHE_ENTRIES || held.saturating_add(weight) > MAX_BYTES)
-        {
-            if let Some(old) = entries.pop_front() {
-                *held = held.saturating_sub(old.weight);
-            }
-        }
-        // One rendering past the whole budget is answered and not kept.
-        if weight <= MAX_BYTES {
-            *held = held.saturating_add(weight);
-            entries.push_back(Entry {
-                view: view.to_owned(),
-                schema: schema.clone(),
-                visible: visible.clone(),
-                rendered: rendered.clone(),
-                weight,
-            });
+        entries.push_back(Entry {
+            view: view.to_owned(),
+            schema: schema.clone(),
+            visible: visible.clone(),
+            rendered: rendered.clone(),
+            weight,
+        });
+        *held = held.saturating_add(weight);
+        // The oldest go first; a rendering past the whole budget alone would go too, answered
+        // and not kept (a 1 MiB schema renders a few MiB, so none does).
+        while entries.len() > crate::CACHE_ENTRIES || *held > MAX_BYTES {
+            *held = held.saturating_sub(entries.pop_front().map_or(0, |old| old.weight));
         }
         Some(rendered)
     }
@@ -522,9 +517,10 @@ mod tests {
     fn a_schema_outside_the_subset_renders_nothing() {
         let bad: Arc<[u8]> =
             Arc::from(&br#"{"id": "https://e.org/s", "name": "s", "imports": []}"#[..]);
-        assert!(Cache::default()
-            .get("v", rev(&bad), &bad, &visible(&[]))
-            .is_none());
+        let cache = Cache::default();
+        assert!(cache.get("v", rev(&bad), &bad, &visible(&[])).is_none());
+        // Refused again from the parse cache, the reason logged the first time only.
+        assert!(cache.get("v", rev(&bad), &bad, &visible(&[])).is_none());
     }
 
     #[test]
@@ -593,8 +589,8 @@ mod tests {
     #[test]
     fn a_schema_is_read_once_per_revision_and_each_view_schema_pair_rendered_apart() {
         let cache = Cache::default();
-        let a = Cache::source("v", rev(SCHEMA), SCHEMA).expect("reads");
-        let again = Cache::source("w", rev(SCHEMA), SCHEMA).expect("hit");
+        let a = Cache::source("v", rev(SCHEMA), &Arc::from(SCHEMA)).expect("reads");
+        let again = Cache::source("w", rev(SCHEMA), &Arc::from(SCHEMA)).expect("hit");
         assert!(Arc::ptr_eq(&a, &again), "one revision, one read");
         let other: Arc<[u8]> = Arc::from(&br#"{"id": "https://e.org/t", "name": "t"}"#[..]);
         let first = cache
