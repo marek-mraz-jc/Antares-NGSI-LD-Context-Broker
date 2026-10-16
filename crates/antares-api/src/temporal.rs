@@ -811,6 +811,19 @@ fn present_temporal(
                             o.remove("modifiedAt");
                             // 6.3.11: expiresAt is sysAttrs-gated too
                             o.remove("expiresAt");
+                            // ... and so are the sub-Attributes' own (4.8)
+                            for sub in o.values_mut() {
+                                let subs = match sub {
+                                    Value::Array(a) => a.iter_mut().collect(),
+                                    other => vec![other],
+                                };
+                                for so in subs.into_iter().filter_map(Value::as_object_mut) {
+                                    if so.contains_key("type") {
+                                        so.remove("createdAt");
+                                        so.remove("modifiedAt");
+                                    }
+                                }
+                            }
                         }
                     }
                     compact_instance(&ci, ctx)
