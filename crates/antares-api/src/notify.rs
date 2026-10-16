@@ -4911,7 +4911,11 @@ mod delivery_policy_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_backoff_on_one_subscription_does_not_delay_another() {
-        let (st, t) = state(policy(2, 3_000));
+        // Both stretch under a sanitizer (ThreadSanitizer took 2 s for the
+        // two sends, T-4250); the bound stays a third of the backoff, so a
+        // backoff on the delivery path still fails it.
+        let slow = crate::state::slow_factor();
+        let (st, t) = state(policy(2, 3_000 * slow));
         let (dead, _) = flaky_endpoint(usize::MAX).await;
         let (live, live_hits) = flaky_endpoint(0).await;
         let a = subscribe(&st, &t, "urn:ngsi-ld:Subscription:a", &dead).await;
@@ -4921,8 +4925,9 @@ mod delivery_policy_tests {
         send(&st, &t, &b).await;
         assert_eq!(live_hits.load(Ordering::SeqCst), 1, "B delivered");
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "A's 3 s backoff must not sit on the delivery path: {:?}",
+            started.elapsed() < Duration::from_secs(slow),
+            "A's {} s backoff must not sit on the delivery path: {:?}",
+            3 * slow,
             started.elapsed()
         );
     }
