@@ -971,7 +971,8 @@ pub async fn create(
         if let Some(url) = one_url {
             norm.insert("jsonldContext".into(), Value::String(url));
         } else {
-            let local_id = uuid::Uuid::new_v4().to_string();
+            // 5.13.2.4: "a locally unique identifier (URI)"
+            let local_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
             let url = format!("{}/{local_id}", crate::contexts::base_url(headers));
             st.store
                 .context_put(
