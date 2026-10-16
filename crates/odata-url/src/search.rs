@@ -317,6 +317,19 @@ impl Display for Search {
         match self {
             // a word built by hand as an operator keeps its meaning as a phrase
             Search::Word(w) if !["AND", "OR", "NOT"].contains(&w.as_str()) => encoded(f, w),
+            // A `searchPhrase` cannot hold a quotation mark; the `searchExpr-incomplete` that read
+            // one can, with `''` for a quote (T-4205). The parse yields such a phrase only as the
+            // whole expression, the one place that form is read again.
+            Search::Phrase(p) if p.contains('"') => {
+                f.write_str("%27")?;
+                for (n, part) in p.split('\'').enumerate() {
+                    if n > 0 {
+                        f.write_str("%27%27")?;
+                    }
+                    encoded(f, part)?;
+                }
+                f.write_str("%27")
+            }
             Search::Word(p) | Search::Phrase(p) => {
                 f.write_str("%22")?;
                 encoded(f, p)?;
