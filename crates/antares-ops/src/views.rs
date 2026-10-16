@@ -548,12 +548,19 @@ impl Reloader {
             revision(table.iter().map(|(id, (doc, _))| (id.as_str(), doc))),
         );
         self.state.views.replace_schemas(schemas);
+        let retention = Arc::new(retention::load(
+            retention_docs.iter().map(|(t, d)| (t.as_str(), d)),
+        ));
+        *self
+            .state
+            .history_off
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            retention::history_off(&retention);
         *self
             .retention
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(retention::load(
-            retention_docs.iter().map(|(t, d)| (t.as_str(), d)),
-        ));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = retention;
         *self
             .quality
             .write()

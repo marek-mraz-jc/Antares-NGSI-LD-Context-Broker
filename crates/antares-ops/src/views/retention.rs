@@ -48,6 +48,8 @@ const ROUNDS: usize = 50;
 pub const SWEEP_BUDGET: Duration = Duration::from_secs(15);
 /// The most rows a preview counts per rule and kind, in one statement.
 pub const PREVIEW_CAP: usize = 100_000;
+/// The cut of a `history: "off"` rule: every stored instant is before it.
+const OFF_CUT: &str = "9999-12-31T23:59:59.999Z";
 /// The bounds a duration has to sit in: one minute to ten years.
 const SHORTEST: Duration = Duration::from_secs(60);
 const LONGEST: Duration = Duration::from_hours(87_600);
@@ -79,6 +81,9 @@ pub struct Rule {
     pub current: Option<Duration>,
     /// How long an attribute instance is kept, if the rule says.
     pub history: Option<Duration>,
+    /// `history: "off"` (T-4275): nothing is recorded for the type, and what
+    /// it holds is swept.
+    pub history_off: bool,
 }
 
 /// Every Tenant's rules, as the last reload found them.
@@ -192,9 +197,16 @@ pub fn parse(body: &[u8]) -> Result<Vec<Rule>, String> {
             if !seen.insert(r.type_iri.clone()) {
                 return Err(format!("type {:?} has two rules", r.type_iri));
             }
+            let history_off = r.history.as_deref() == Some("off");
             Ok(Rule {
                 current: r.current.as_deref().map(parse_duration).transpose()?,
-                history: r.history.as_deref().map(parse_duration).transpose()?,
+                history: r
+                    .history
+                    .as_deref()
+                    .filter(|_| !history_off)
+                    .map(parse_duration)
+                    .transpose()?,
+                history_off,
                 type_iri: r.type_iri,
             })
         })
@@ -217,6 +229,19 @@ pub(super) fn load<'a>(docs: impl Iterator<Item = (&'a str, &'a Value)>) -> Rule
         }
     }
     rules
+}
+
+/// The (Tenant, type) pairs whose rule says `history: "off"`: the write
+/// path's history gate 3 (T-4275).
+pub(super) fn history_off(rules: &Rules) -> std::collections::HashSet<(String, String)> {
+    rules
+        .iter()
+        .flat_map(|(t, list)| {
+            list.iter()
+                .filter(|r| r.history_off)
+                .map(move |r| (t.as_str().to_owned(), r.type_iri.clone()))
+        })
+        .collect()
 }
 
 /// What one sweep deleted of one Tenant's type.
@@ -287,15 +312,20 @@ async fn retain(
         let tenant = t.as_str();
         for rule in list {
             for (kind, keep) in [("entity", rule.current), ("history", rule.history)] {
-                let Some(keep) = keep else {
-                    continue;
+                let before = if kind == "history" && rule.history_off {
+                    // Off keeps nothing, an instant stamped in the future included.
+                    OFF_CUT.to_owned()
+                } else {
+                    let Some(keep) = keep else {
+                        continue;
+                    };
+                    // A rule holds at most ten years, so the cut is always in range.
+                    chrono::Duration::from_std(keep)
+                        .ok()
+                        .and_then(|k| now.checked_sub_signed(k))
+                        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
                 };
-                // A rule holds at most ten years, so the cut is always in range.
-                let before = chrono::Duration::from_std(keep)
-                    .ok()
-                    .and_then(|k| now.checked_sub_signed(k))
-                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 let mut count = 0u64;
                 for _ in 0..rounds {
                     if !dry_run && started.elapsed() >= budget {
@@ -515,8 +545,22 @@ mod tests {
             rules.get(1).map(|r| (r.current, r.history)),
             Some((None, None))
         );
+        // T-4275: history "off" is no duration; any other word still is one or nothing.
+        let off =
+            parse(br#"{"rules":[{"type":"https://e.org/V","history":"off"}]}"#).unwrap_or_default();
+        assert_eq!(
+            off.first().map(|r| (r.history, r.history_off)),
+            Some((None, true))
+        );
+        assert_eq!(
+            history_off(&vec![(TenantId::new("city").expect("tenant"), off)]),
+            std::collections::HashSet::from([("city".to_owned(), "https://e.org/V".to_owned())])
+        );
+        assert!(rules.iter().all(|r| !r.history_off));
         for bad in [
-            &br#"{"rules":[{"type":"Vehicle","current":"PT5M"}]}"#[..],
+            &br#"{"rules":[{"type":"https://e.org/V","history":"Off"}]}"#[..],
+            br#"{"rules":[{"type":"https://e.org/V","history":"none"}]}"#,
+            br#"{"rules":[{"type":"Vehicle","current":"PT5M"}]}"#,
             br#"{"rules":[{"type":"https://e.org/V"},{"type":"https://e.org/V"}]}"#,
             br#"{"rules":[{"type":"https://e.org/V","current":"PT0M"}]}"#,
             br#"{"rules":[{"type":"https://e.org/V","ttl":"PT5M"}]}"#,

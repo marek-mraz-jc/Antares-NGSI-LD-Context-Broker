@@ -80,7 +80,7 @@ pub(crate) async fn push(st: &AppState, ev: TemporalEvent) {
 /// Gate 1 (value-change) runs in the producer — an unchanged instance never
 /// becomes an event (`changed_instances`). Adding a gate = one more entry
 /// here; producers and drivers stay untouched.
-const GATES: &[fn(&AppState, &TemporalEvent) -> bool] = &[observed_gate];
+const GATES: &[fn(&AppState, &TemporalEvent) -> bool] = &[observed_gate, history_gate];
 
 /// Gate 2: ANTARES_TEMPORAL_RECORD. `all` admits everything; `observed`
 /// keeps only instances that carry `observedAt` — the spec's own
@@ -92,6 +92,26 @@ fn observed_gate(st: &AppState, ev: &TemporalEvent) -> bool {
         All => true,
         Observed => ev.instance.get("observedAt").is_some(),
         None => false,
+    }
+}
+
+/// Gate 3 (T-4275): a type whose retention rule says `history: "off"` keeps
+/// its current state only, so an Entity with any such type in its Tenant
+/// records no attribute instance.
+fn history_gate(st: &AppState, ev: &TemporalEvent) -> bool {
+    let off = st
+        .history_off
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if off.is_empty() {
+        return true;
+    }
+    let tenant = ev.tenant.as_str();
+    let off_type = |t: &str| off.contains(&(tenant.to_owned(), t.to_owned()));
+    match ev.shell.get("type") {
+        Some(Value::String(t)) => !off_type(t),
+        Some(Value::Array(ts)) => !ts.iter().filter_map(Value::as_str).any(off_type),
+        _ => true,
     }
 }
 
