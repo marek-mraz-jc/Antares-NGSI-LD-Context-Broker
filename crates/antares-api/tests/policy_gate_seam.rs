@@ -2,9 +2,10 @@
 //! Every operation of the NGSI-LD API asks the policy engine, exactly once.
 //!
 //! This is the seam's own proof, not a review note (ADR-0020). The route
-//! list is read out of `router()`'s own source, so a route added without a
-//! gate cannot pass unnoticed: the test asks the router for every method of
-//! every path it declares and counts the engine's calls.
+//! list is the table `router()` mounts (`api_routes()`) and the methods are
+//! the router's own OPTIONS answer, so a route added without a gate cannot
+//! pass unnoticed: the test asks the router for every method of every path
+//! it serves and counts the engine's calls.
 //!
 //! Exactly once is the rule the placement follows: the gate belongs to the
 //! operation, taken where the request enters the handler, and the shared
@@ -75,58 +76,35 @@ impl PolicyEngine for Recording {
 /// about — the request names no Entity and reaches no store.
 const EXEMPT: [(&str, &str); 2] = [("PATCH", "/entities"), ("PUT", "/entities")];
 
-/// The router's own source, so the route list cannot drift from the routes.
-const ROUTER_SOURCE: &str = include_str!("../src/lib.rs");
-
-/// Every `(method, path)` the NGSI-LD router declares, read from the
-/// `.route(...)` calls of `router()`.
-fn declared_routes() -> Vec<(String, String)> {
-    // the `let api = Router::new()` chain of `router()`, ended by the `;`
-    // that closes it — the peer-facing and surface routers below it are not
-    // NGSI-LD operations and are not part of this walk
-    let body = {
-        let start = ROUTER_SOURCE.find("pub fn router").expect("router()");
-        let rest = &ROUTER_SOURCE[start..];
-        let chain = rest.find("let api = Router::new()").expect("the api chain");
-        let tail = &rest[chain..];
-        let mut depth = 0i32;
-        let mut in_str = false;
-        let mut escaped = false;
-        let mut end = tail.len();
-        for (i, c) in tail.char_indices() {
-            match c {
-                _ if escaped => escaped = false,
-                '\\' if in_str => escaped = true,
-                '"' => in_str = !in_str,
-                '(' if !in_str => depth += 1,
-                ')' if !in_str => depth -= 1,
-                ';' if !in_str && depth == 0 => {
-                    end = i;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        &tail[..end]
-    };
+/// Every `(method, path)` the NGSI-LD router serves: the paths are the
+/// table `router()` itself mounts, and the methods are the router's own
+/// answer to OPTIONS (the Allow set axum computes per path), so neither can
+/// drift from the routes, whatever comments or macros the source carries.
+async fn declared_routes() -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let mut rest = body;
-    while let Some(at) = rest.find(".route(") {
-        rest = &rest[at + ".route(".len()..];
-        // the path literal, then everything up to the matching close
-        let Some(q1) = rest.find('"') else { break };
-        let Some(q2) = rest[q1 + 1..].find('"') else {
-            break;
-        };
-        let path = rest[q1 + 1..q1 + 1 + q2].to_owned();
-        let seg_end = rest.find(".route(").unwrap_or(rest.len());
-        let seg = &rest[..seg_end];
-        for method in ["get", "post", "patch", "put", "delete"] {
-            if seg.contains(&format!("{method}(")) {
-                out.push((method.to_uppercase(), path.clone()));
+    for (path, _) in antares_api::api_routes() {
+        let resp = antares_api::router(AppState::new("me".into()))
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri(format!("/ngsi-ld/v1{}", concrete(path)))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let allow = resp
+            .headers()
+            .get("allow")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(!allow.is_empty(), "OPTIONS {path} named no method");
+        for method in allow.split(',').map(str::trim) {
+            if method != "OPTIONS" {
+                out.push((method.to_owned(), path.to_owned()));
             }
         }
-        rest = &rest[seg_end..];
     }
     out
 }
@@ -146,19 +124,22 @@ fn request_for(method: &str, path: &str) -> Request<Body> {
     let entity = json!({"id": "urn:ngsi-ld:Vehicle:policy:1", "type": "Vehicle",
                         "speed": {"type": "Property", "value": 1}});
     let fragment = json!({"speed": {"type": "Property", "value": 2}});
-    let (query, body): (&str, Value) = match (method, path) {
+    // HEAD is GET without the body (axum's get() serves both), so it needs
+    // what the GET needs to reach its gate
+    let reads_as = if method == "HEAD" { "GET" } else { method };
+    let (query, body): (&str, Value) = match (reads_as, path) {
         ("GET", "/entities") | ("DELETE", "/entities") => ("?type=Vehicle", Value::Null),
         ("GET", "/temporal/entities") => (
             "?type=Vehicle&timerel=after&timeAt=1970-01-01T00:00:00Z",
             Value::Null,
         ),
-        ("GET", "/entityMap") => ("?type=Vehicle", Value::Null),
-        ("GET", "/temporal/entityMap") => (
+        ("GET", "/entityMaps") => ("?type=Vehicle", Value::Null),
+        ("GET", "/temporal/entityMaps") => (
             "?type=Vehicle&timerel=after&timeAt=1970-01-01T00:00:00Z",
             Value::Null,
         ),
         ("DELETE", "/snapshots") => ("?q=status==%22completed%22", Value::Null),
-        ("POST", "/entityMap") | ("POST", "/temporal/entityMap") => (
+        ("POST", "/entityMaps") | ("POST", "/temporal/entityMaps") => (
             "",
             json!({"type": "Query", "entities": [{"type": "Vehicle"}]}),
         ),
@@ -208,9 +189,11 @@ fn request_for(method: &str, path: &str) -> Request<Body> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_route_asks_the_policy_engine_exactly_once() {
-    let routes = declared_routes();
+    let routes = declared_routes().await;
+    // 69 is what the source-text walk this replaced found, HEAD not counted
+    eprintln!("{} routes walked", routes.len());
     assert!(
-        routes.len() > 50,
+        routes.len() >= 69,
         "the route list came out empty or truncated: {routes:?}"
     );
     let mut wrong = Vec::new();
@@ -247,9 +230,9 @@ async fn every_route_asks_the_policy_engine_exactly_once() {
 /// `AllowAll` attached by hand — and the two answers must agree.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_built_in_answer_is_the_bypassed_answer() {
-    let routes = declared_routes();
+    let routes = declared_routes().await;
     assert!(
-        routes.len() > 50,
+        routes.len() >= 69,
         "the route list came out empty or truncated: {routes:?}"
     );
     assert!(
@@ -369,7 +352,7 @@ async fn the_subject_carries_no_header_the_deployment_did_not_name() {
 async fn a_route_that_names_a_resource_tells_the_engine_which_one() {
     let mut missing = Vec::new();
     let mut checked = 0;
-    for (method, path) in declared_routes() {
+    for (method, path) in declared_routes().await {
         if !path.contains("{id}") || EXEMPT.contains(&(method.as_str(), path.as_str())) {
             continue;
         }

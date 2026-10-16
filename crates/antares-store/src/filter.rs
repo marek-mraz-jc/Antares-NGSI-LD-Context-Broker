@@ -39,10 +39,15 @@ pub struct EntityFilter<'a> {
     /// `scopeQ=` verbatim (4.19); compiled over the `scopes` column
     pub scope_q: Option<&'a str>,
     /// `georel`/`geometry`/`coordinates`/`geoproperty` (4.10), compiled over
-    /// the extracted `location` column
-    pub geo: Option<&'a GeoSpec<'a>>,
+    /// the extracted `location` column. Every one must hold: the request's
+    /// own and a policy narrowing's (ADR-0023 rule 1). Empty = no geoquery.
+    pub geo: &'a [GeoSpec<'a>],
     /// term → IRI, the request context's expander (the AST holds terms)
     pub expand: &'a (dyn Fn(&str) -> String + Sync),
+    /// The request @context, for a store that evaluates `q` on documents
+    /// with the API's own evaluator (`antares_ql::eval::eval_q`). None = such
+    /// a store leaves `q` to the caller.
+    pub ctx: Option<&'a antares_jsonld::Context>,
     /// Pagination pushdown: applied ONLY when every present predicate
     /// compiled exactly (`decided`) — otherwise the caller's evaluator still
     /// has rows to drop and a SQL LIMIT would page over the wrong set. The
@@ -67,8 +72,9 @@ impl Default for EntityFilter<'_> {
             attrs: None,
             q: None,
             scope_q: None,
-            geo: None,
+            geo: &[],
             expand: &|t: &str| t.to_owned(),
+            ctx: None,
             page: None,
             keep_attrs: None,
             drop_attrs: None,
@@ -116,6 +122,9 @@ pub struct TemporalFilter<'a> {
     /// `lastN`: per-(attr, datasetId) RANK() cap — ties all kept, so the
     /// per-attr lastN the API applies afterwards always finds its instances
     pub last_n: Option<i64>,
+    /// the cap keeps the OLDEST instances instead (firstN, TS 104 176
+    /// 6.4.7.3); same RANK() semantics, ascending
+    pub oldest_first: bool,
     /// ordering key for the lastN cap (the request's timeproperty)
     pub timeproperty: &'a str,
     /// Entity-level LIMIT/OFFSET pushdown (without it a temporal query
@@ -138,8 +147,9 @@ pub struct TemporalFilter<'a> {
     /// whose windowed instances the EXISTS checks (per-instance rows carry
     /// extracted geometries for EVERY geoproperty, not just `location`).
     /// Superset like `q` — `GeoQuery::matches` stays the arbiter; rows with
-    /// an unextracted `geo_value` always survive.
-    pub geo: Option<(&'a GeoSpec<'a>, &'a str)>,
+    /// an unextracted `geo_value` always survive. Every one must hold, like
+    /// [`EntityFilter::geo`]; empty = no geoquery.
+    pub geo: &'a [(GeoSpec<'a>, String)],
     /// 4.5.19 aggregated representation computed by the backend: when a
     /// driver can bucket and aggregate the windowed instances itself it
     /// returns per-attribute aggregated objects instead of instance arrays
@@ -181,11 +191,12 @@ impl Default for TemporalFilter<'_> {
             attrs: None,
             range: None,
             last_n: None,
+            oldest_first: false,
             timeproperty: "observedAt",
             page: None,
             q: None,
             expand: &|t: &str| t.to_owned(),
-            geo: None,
+            geo: &[],
             aggregate: None,
         }
     }
@@ -291,7 +302,7 @@ mod tests {
         assert!(f.attrs.is_none());
         assert!(f.q.is_none());
         assert!(f.scope_q.is_none());
-        assert!(f.geo.is_none());
+        assert!(f.geo.is_empty());
         assert!(f.page.is_none(), "no LIMIT until the caller proves decided");
         assert!(f.keep_attrs.is_none());
         assert!(f.drop_attrs.is_none());
@@ -311,7 +322,7 @@ mod tests {
         assert!(f.last_n.is_none());
         assert!(f.page.is_none());
         assert!(f.q.is_none());
-        assert!(f.geo.is_none());
+        assert!(f.geo.is_empty());
         assert_eq!((f.expand)("speed"), "speed");
     }
 

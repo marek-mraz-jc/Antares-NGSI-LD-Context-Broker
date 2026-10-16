@@ -13,7 +13,7 @@
 //! can is never asked to do more.
 #![allow(clippy::unwrap_used)] // an unwrap here is the assertion
 
-mod common;
+use crate::common;
 
 use antares_api::AppState;
 use axum::body::Body;
@@ -136,6 +136,39 @@ async fn clause_5_14_4_the_candidate_scan_is_read_a_page_at_a_time() {
         0,
         "the candidate scan asked the store for the whole tenant"
     );
+}
+
+/// T-3773: the temporal candidate set behind an EntityMap, and the recheck
+/// a later page runs against it, are read up to the broker's buffer bound;
+/// past it the request is TooManyResults (5.5.6), not a body held whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_5_6_temporal_entity_map_reads_stop_at_the_byte_bound() {
+    let (mut st, _) = seeded().await;
+    let path = "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after\
+        &timeAt=2000-01-01T00:00:00Z&timeproperty=createdAt";
+    let (status, headers, body) = send(&st, "GET", &format!("{path}&entityMap=true"), None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let map = headers
+        .get("NGSILD-EntityMap")
+        .and_then(|v| v.to_str().ok())
+        .expect("NGSILD-EntityMap header")
+        .to_owned();
+    st.max_answer_bytes = 16;
+    let (status, _, body) = send(&st, "GET", &format!("{path}&entityMap=true"), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "the build: {body}");
+    assert_eq!(body["title"], "TooManyResults", "{body}");
+    assert_eq!(
+        body["detail"],
+        antares_api::bounds::ANSWER_TOO_LARGE,
+        "{body}"
+    );
+    let req = Request::builder()
+        .uri(path)
+        .header("NGSILD-EntityMap", map)
+        .body(Body::empty())
+        .unwrap();
+    let res = antares_api::router(st.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN, "the recheck");
 }
 
 /// The walks above against a store that really pages: the memory arm answers
@@ -338,4 +371,37 @@ mod paging_store {
             }
         }
     }
+}
+
+/// 5.8.6: a periodic Subscription whose stored `q` no longer parses (one
+/// stored percent-encoded before 5.2.12's read-as-written, T-3564) matches
+/// nothing, as `conditions_match` decides, so the sweep does not read the
+/// Entities of its types to throw them all away.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_8_6_a_periodic_subscription_with_an_unparseable_q_reads_nothing() {
+    let (st, spy) = seeded().await;
+    let tenant = antares_model::TenantId::new("default").expect("tenant");
+    let id = "urn:ngsi-ld:Subscription:stale-q";
+    let created = chrono::Utc::now() - chrono::Duration::seconds(10);
+    let sub = json!({"id": id, "type": "Subscription", "timeInterval": 1,
+        "createdAt": created.to_rfc3339(),
+        "entities": [{"type": "https://uri.etsi.org/ngsi-ld/default-context/Vehicle"}],
+        "q": "speed%3E10%29",
+        "notification": {"endpoint": {"uri": "http://127.0.0.1:9/n"}}});
+    st.store
+        .create(&tenant, antares_store::Kind::Subscription, id, sub.clone())
+        .await
+        .expect("subscription row");
+    // the sweep reads the indexed mirror the write path keeps
+    if let Some(m) = &st.sub_mirror {
+        m.apply(tenant.as_str(), id, Some(sub));
+    }
+
+    antares_api::notify::interval_tick(&st).await;
+
+    assert_eq!(
+        spy.unpaged_queries(),
+        0,
+        "the sweep read the Entities for a q that matches nothing"
+    );
 }

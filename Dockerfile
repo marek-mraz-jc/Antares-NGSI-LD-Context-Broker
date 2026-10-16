@@ -16,8 +16,9 @@ RUN apt-get update \
 # Release binaries embed their dependency list (SBOM) via
 # cargo-auditable — `cargo audit bin /antares` can then verify a shipped
 # broker against advisories with no source tree at hand. Installed (with chef)
-# BEFORE any source COPY so the layer caches across source changes.
-RUN cargo install cargo-chef cargo-auditable --locked
+# BEFORE any source COPY so the layer caches across source changes; both at
+# an exact version, as every build tool is (surfaces-threat-model 11.1).
+RUN cargo install cargo-chef@0.1.78 cargo-auditable@0.7.7 --locked
 # The pinned toolchain must be present from the first cargo invocation —
 # otherwise the dep layer compiles with the image's default toolchain and the
 # final build recompiles everything under the pinned one, defeating the cache.
@@ -29,12 +30,20 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS build
 COPY --from=planner /src/recipe.json recipe.json
+# The recipe holds workspace members only; vendor/rumqttc is a [patch] path crate outside them
+# (T-4129), so the cook needs its source to compile it with the other dependencies.
+COPY vendor/ vendor/
+# Cargo features of the broker (empty = the default, vanilla build). The
+# full cells of external-suites.yml build with --build-arg FEATURES=full,
+# image-jc.yml builds full,jc-policy,linkml as antares-broker-jc; the vanilla
+# antares-broker image never sets it.
+ARG FEATURES=""
 # Cook scoped to the shipped package so feature unification matches the real
 # build below — a workspace-wide cook can resolve different features and
 # quietly recompile deps anyway.
-RUN cargo chef cook --release -p antares-broker --recipe-path recipe.json --locked
+RUN cargo chef cook --release -p antares-broker ${FEATURES:+--features "$FEATURES"} --recipe-path recipe.json --locked
 COPY . .
-RUN cargo auditable build --release --locked -p antares-broker \
+RUN cargo auditable build --release --locked -p antares-broker ${FEATURES:+--features "$FEATURES"} \
  && mkdir /data-init
 
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2

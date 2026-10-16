@@ -174,6 +174,16 @@ pub fn begin(draining: &Arc<AtomicBool>, delay: Duration) {
 mod tests {
     use super::*;
 
+    /// The two drain variables are process-global: every test that sets or
+    /// clears them holds this, or a parallel test reads its value (T-3772).
+    static DRAIN_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn drain_env() -> std::sync::MutexGuard<'static, ()> {
+        DRAIN_ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A temporal driver that only records whether it was closed; every
     /// operation answers "no temporal store", the same shape as `NoTemporal`.
     struct CountsCloses(Arc<AtomicUsize>);
@@ -297,6 +307,7 @@ mod tests {
     /// proves the documented numbers are the ones that run.
     #[test]
     fn the_documented_drain_defaults_are_the_ones_the_binary_uses() {
+        let _env = drain_env();
         let book = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../docs/src/configuration.md"
@@ -362,6 +373,7 @@ mod tests {
     /// LB notice, 20 SECONDS of in-flight ceiling.
     #[test]
     fn drain_knobs_default_when_absent_and_refuse_garbage() {
+        let _env = drain_env();
         std::env::remove_var("ANTARES_DRAIN_DELAY_MS");
         std::env::remove_var("ANTARES_DRAIN_DEADLINE_SECS");
         assert_eq!(drain_delay().expect("absent"), Duration::from_millis(2000));

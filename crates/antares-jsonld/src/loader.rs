@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! Remote @context loading + caching + pinned core contexts.
+//! Remote @context loading and caching (feature `fetch`); the pinned core
+//! contexts it serves first live in `pinned`.
 
 use crate::context::Context;
+use crate::pinned::{
+    core_context, merge_context_value, pinned, CORE_CONTEXT, MAX_CONTEXT_BYTES, MAX_CONTEXT_URLS,
+};
 use antares_model::{NgsiError, TenantId};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -19,48 +23,6 @@ use web_time::Instant;
 use crate::minicache::Cache as BoundedCache;
 #[cfg(not(target_arch = "wasm32"))]
 use moka::sync::Cache as BoundedCache;
-
-/// Core context versions served from the build, never the network
-/// (uri.etsi.org serves an HTML landing page to plain HTTP clients).
-static PINNED: &[(&str, &str)] = &[
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.3.jsonld",
-        include_str!("../contexts/core-v1.6.jsonld"),
-    ),
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.4.jsonld",
-        include_str!("../contexts/core-v1.6.jsonld"),
-    ),
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.5.jsonld",
-        include_str!("../contexts/core-v1.6.jsonld"),
-    ),
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.6.jsonld",
-        include_str!("../contexts/core-v1.6.jsonld"),
-    ),
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.7.jsonld",
-        include_str!("../contexts/core-v1.7.jsonld"),
-    ),
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.8.jsonld",
-        include_str!("../contexts/core-v1.8.jsonld"),
-    ),
-    (
-        "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld",
-        include_str!("../contexts/core-v1.9.jsonld"),
-    ),
-];
-
-/// 4.4: "The NGSI-LD Core @context is publicly available at
-/// `https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld` and
-/// shall contain all the terms as mandated by annex B." It is what this broker
-/// advertises (the Link header of a `application/json` answer, the `@context`
-/// of an `ld+json` one, the context a forwarded request carries) and the
-/// document merged last when a request names no @context of its own. Older
-/// core versions stay in `PINNED` because a client may still reference one.
-pub const CORE_CONTEXT: &str = "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld";
 
 /// Usage bookkeeping for one externally-referenced @context URL (5.13.3.5:
 /// localId, createdAt, numberOfHits, lastUsage of "Cached" entries).
@@ -105,10 +67,16 @@ pub fn slow_factor() -> u64 {
 /// turns the deny on for internet-exposed deployments.
 /// The DNS-pinning resolver and redirect cap that enforce it on the wire
 /// are `PolicyResolver` / `client_builder` below.
+/// `ANTARES_EGRESS_PRIVATE_HOSTS` names the in-cluster peers a deployment
+/// that denies private egress still reaches (T-3908).
 #[derive(Clone, Copy, Debug)]
 pub struct EgressPolicy {
     /// Whether fetches to private/loopback/link-local ranges are allowed.
     pub allow_private: bool,
+    /// Host names (lower case, no trailing dot) that may resolve to a
+    /// private address although `allow_private` is false. Never loopback,
+    /// `0.0.0.0/8` or instance metadata, and never an address literal.
+    pub private_hosts: &'static [String],
 }
 
 /// Programmatic stand-in for `ANTARES_EGRESS_ALLOW_PRIVATE` — wasm32 has
@@ -132,12 +100,78 @@ impl EgressPolicy {
     /// (the notifier's retry policy is another): each reads its own keys for
     /// its own type, so the shared name is the convention, not a copy.
     pub fn from_env() -> Self {
+        // read once per process: the list is a deployment's, not a request's
+        static HOSTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
         Self {
             allow_private: Self::allow_private_from(
                 std::env::var("ANTARES_EGRESS_ALLOW_PRIVATE")
                     .ok()
                     .as_deref(),
             ) || ALLOW_PRIVATE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed),
+            private_hosts: HOSTS.get_or_init(|| {
+                Self::private_hosts_from(
+                    std::env::var("ANTARES_EGRESS_PRIVATE_HOSTS")
+                        .ok()
+                        .as_deref(),
+                )
+            }),
+        }
+    }
+
+    /// `ANTARES_EGRESS_PRIVATE_HOSTS`: comma-separated host names, compared
+    /// case-insensitively and without a trailing dot; empty members and
+    /// spaces are dropped. An address literal is no name and is dropped too:
+    /// an address is judged by its range alone.
+    pub fn private_hosts_from(v: Option<&str>) -> Vec<String> {
+        v.unwrap_or_default()
+            .split(',')
+            .map(Self::host_key)
+            .filter(|h| {
+                !h.is_empty()
+                    && h.trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_err()
+            })
+            .collect()
+    }
+
+    /// A host name as the list holds it: trimmed, lower case, no trailing dot.
+    fn host_key(host: &str) -> String {
+        host.trim().trim_end_matches('.').to_ascii_lowercase()
+    }
+
+    /// Whether egress may dial `ip`, which `host` resolved to. Instance
+    /// metadata never; a private address only with `allow_private`, or for a
+    /// host the operator listed in `private_hosts`, and then never the local
+    /// host itself (loopback, `0.0.0.0/8`): the broker's own ports are no
+    /// peer, whatever name points there.
+    pub fn admits(&self, host: &str, ip: std::net::IpAddr) -> bool {
+        if Self::ip_is_metadata(ip) {
+            return false;
+        }
+        if self.allow_private || !Self::ip_is_private(ip) {
+            return true;
+        }
+        let key = Self::host_key(host);
+        key.trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_err()
+            && self.private_hosts.contains(&key)
+            && !Self::ip_is_local_host(ip)
+    }
+
+    /// The addresses that reach the host itself: IPv4 loopback and
+    /// `0.0.0.0/8` (which a Linux stack routes to the local host), IPv6
+    /// loopback and unspecified, in every IPv6 spelling of the IPv4 ones.
+    pub fn ip_is_local_host(ip: std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.octets()[0] == 0,
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || Self::embedded_v4(v6)
+                        .is_some_and(|v4| Self::ip_is_local_host(std::net::IpAddr::V4(v4)))
+            }
         }
     }
 
@@ -246,7 +280,7 @@ impl EgressPolicy {
     /// name is resolved once, and any private address in the answer denies
     /// the fetch.
     pub async fn check_host(&self, host: &str, port: u16) -> Result<(), String> {
-        self.check_host_within(host, port, DNS_TIMEOUT * slow_factor() as u32)
+        self.check_host_within(host, port, DNS_TIMEOUT.saturating_mul(slow_factor() as u32))
             .await
     }
 
@@ -295,7 +329,7 @@ impl EgressPolicy {
                 .map_err(|_| format!("resolving {host}: timed out"))?
                 .map_err(|e| format!("resolving {host}: {e}"))?;
             for a in addrs {
-                if Self::ip_is_private(a.ip()) {
+                if !self.admits(host, a.ip()) {
                     // The denial reaches the client verbatim in the RFC 7807
                     // `detail`; naming the resolved address would turn the
                     // request parameter into an internal-DNS oracle.
@@ -371,14 +405,12 @@ pub struct PolicyResolver(EgressPolicy);
 #[cfg(not(target_arch = "wasm32"))]
 impl reqwest::dns::Resolve for PolicyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let allow_private = self.0.allow_private;
+        let policy = self.0;
         Box::pin(async move {
             let host = name.as_str().to_owned();
             let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
-            let kept: Vec<std::net::SocketAddr> = addrs
-                .filter(|a| !EgressPolicy::ip_is_metadata(a.ip()))
-                .filter(|a| allow_private || !EgressPolicy::ip_is_private(a.ip()))
-                .collect();
+            let kept: Vec<std::net::SocketAddr> =
+                addrs.filter(|a| policy.admits(&host, a.ip())).collect();
             if kept.is_empty() {
                 return Err(format!("egress to {host} denied (private range)").into());
             }
@@ -587,7 +619,9 @@ fn ttl_from_headers(
     if let Some(exp) = expires {
         // HTTP-date (RFC 7231); an unparsable or past Expires means "stale".
         let when = chrono::DateTime::parse_from_rfc2822(exp).ok()?;
-        let delta = when.with_timezone(&chrono::Utc) - chrono::Utc::now();
+        let delta = when
+            .with_timezone(&chrono::Utc)
+            .signed_duration_since(chrono::Utc::now());
         return Some(
             delta
                 .to_std()
@@ -598,20 +632,9 @@ fn ttl_from_headers(
     None
 }
 
-/// @context responses above this size are refused.
-pub(crate) const MAX_CONTEXT_BYTES: usize = 5 * 1024 * 1024;
-
 /// Cap on usage-registry entries (client-supplied URLs); past it, adding a
 /// new URL evicts the least recently used entry.
 const MAX_USAGE_ENTRIES: usize = 4096;
-
-/// Fetch-count cap per @context resolution — a hostile context tree must
-/// not turn one request into an unbounded crawl. Checked BEFORE each
-/// fetch, so at most this many URLs are ever contacted. Public because
-/// `/q/health` publishes the caps a request runs under, and a second
-/// constant carrying the same number is one that can drift from the one
-/// actually enforced.
-pub const MAX_CONTEXT_URLS: usize = 32;
 
 /// The merged-context cache is keyed by the SERIALIZED user @context, which
 /// an `application/ld+json` body may carry inline up to the body cap — 256
@@ -644,7 +667,7 @@ const MAX_MERGED_CACHE_TERMS: u64 = 2_000_000;
 const MAX_MERGED_ENTRIES: u64 = 256;
 
 /// The merged-context cache, bounded by TERMS held rather than by entries.
-#[cfg(not(target_arch = "wasm32"))]
+/// The same budget on wasm32: the minicache takes moka's weigher (T-3698).
 fn merged_cache() -> BoundedCache<String, Arc<Context>> {
     let floor = (MAX_MERGED_CACHE_TERMS / MAX_MERGED_ENTRIES) as u32;
     BoundedCache::builder()
@@ -657,16 +680,10 @@ fn merged_cache() -> BoundedCache<String, Arc<Context>> {
         .build()
 }
 
-/// wasm32: the FIFO minicache carries no weigher, and a browser tab's
-/// @context set is tiny — the entry bound is the bound there.
-#[cfg(target_arch = "wasm32")]
-fn merged_cache() -> BoundedCache<String, Arc<Context>> {
-    BoundedCache::new(MAX_MERGED_ENTRIES)
-}
-
 /// The fetched-document cache, bounded by BYTES: the weight of an entry is
-/// the size of the document it holds (floored, see above).
-#[cfg(not(target_arch = "wasm32"))]
+/// the size of the document it holds (floored, see above). A browser page
+/// that loads hostile @contexts holds 16 MiB of them at most, as the broker
+/// does.
 fn fetched_cache() -> BoundedCache<String, FetchedDoc> {
     // what one entry costs of the budget at minimum
     let floor = (MAX_FETCHED_CACHE_BYTES / MAX_FETCHED_ENTRIES) as u32;
@@ -678,13 +695,6 @@ fn fetched_cache() -> BoundedCache<String, FetchedDoc> {
                 .max(floor)
         })
         .build()
-}
-
-/// wasm32: the FIFO minicache carries no weigher, and a browser tab's
-/// @context set is tiny — the entry bound is the bound there.
-#[cfg(target_arch = "wasm32")]
-fn fetched_cache() -> BoundedCache<String, FetchedDoc> {
-    BoundedCache::new(MAX_FETCHED_ENTRIES)
 }
 
 #[derive(Clone)]
@@ -818,27 +828,13 @@ impl Loader {
         // here; without it no @context can ever be fetched.
         let client = with_timeouts(
             client_builder(policy),
-            std::time::Duration::from_secs(5 * slow_factor()),
-            std::time::Duration::from_secs(10 * slow_factor()),
+            std::time::Duration::from_secs(5u64.saturating_mul(slow_factor())),
+            std::time::Duration::from_secs(10u64.saturating_mul(slow_factor())),
         )
         .build()
         .expect("reqwest client");
         Self::with_client(policy, client)
     }
-}
-
-/// The pinned core `@context`, parsed and frozen, with no loader, client or
-/// cache behind it: the value every `Loader` pins, and what a test of
-/// expansion or matching needs on its own.
-#[allow(clippy::expect_used)]
-pub fn core_context() -> Context {
-    let mut core = Context::default();
-    // PINNED holds CORE_CONTEXT and every entry parses: pinned by
-    // `every_pinned_context_parses_and_carries_an_at_context`
-    merge_context_value(&mut core, &pinned(CORE_CONTEXT).expect("pinned core"));
-    core.freeze();
-    core.source = Value::String(CORE_CONTEXT.to_owned());
-    core
 }
 
 impl Loader {
@@ -944,7 +940,7 @@ impl Loader {
         {
             let mut map = self.usage.write().await;
             if let Some(u) = map.get_mut(url) {
-                u.hits += 1;
+                u.hits = u.hits.saturating_add(1);
                 u.last_usage = now;
             } else {
                 // hold the size bound: admitting a new URL past the cap
@@ -1138,9 +1134,10 @@ impl Loader {
         }
         // Core context last: its (protected) terms win — CIM 009 4.4.
         // CORE_CONTEXT is a PINNED entry and every entry parses: pinned by
-        // `every_pinned_context_parses_and_carries_an_at_context`.
-        #[allow(clippy::expect_used)]
-        let core = pinned(CORE_CONTEXT).expect("pinned core");
+        // `every_pinned_context_parses_and_carries_an_at_context`. A request
+        // reaches this line, so a broken pin is a 500, never a panic (T-3915).
+        let core = pinned(CORE_CONTEXT)
+            .ok_or_else(|| NgsiError::InternalError("the core @context is not pinned".into()))?;
         merge_context_value(&mut ctx, &core);
         ctx.freeze();
         ctx.source = user.clone();
@@ -1206,8 +1203,15 @@ impl Loader {
             match entry {
                 Value::Array(items) => {
                     for item in items {
-                        self.merge_entry(ctx, item, depth + 1, urls, base.clone(), tenant)
-                            .await?;
+                        self.merge_entry(
+                            ctx,
+                            item,
+                            depth.saturating_add(1),
+                            urls,
+                            base.clone(),
+                            tenant,
+                        )
+                        .await?;
                     }
                     Ok(())
                 }
@@ -1244,7 +1248,7 @@ impl Loader {
                     self.merge_entry(
                         ctx,
                         &doc,
-                        depth + 1,
+                        depth.saturating_add(1),
                         urls,
                         Some(std::sync::Arc::new(resolved)),
                         tenant,
@@ -1402,7 +1406,7 @@ impl Loader {
                     .await
                     .map_err(|e| err(format!("reading {url}: {e}")))?
                 {
-                    if buf.len() + chunk.len() > MAX_CONTEXT_BYTES {
+                    if buf.len().saturating_add(chunk.len()) > MAX_CONTEXT_BYTES {
                         return Err(err(format!("{url}: @context document too large")));
                     }
                     buf.extend_from_slice(&chunk);
@@ -1447,7 +1451,11 @@ impl Loader {
             url.to_owned(),
             FetchedDoc {
                 value: Arc::clone(&arc),
-                stale_at: ttl.map(|d| Instant::now() + d),
+                // past the clock's range the copy is stale at once, not never
+                stale_at: ttl.map(|d| {
+                    let now = Instant::now();
+                    now.checked_add(d).unwrap_or(now)
+                }),
                 // 5.13.1 "Cached": downloaded from a public URL, no Tenant
                 owner: None,
             },
@@ -1531,62 +1539,9 @@ impl Loader {
     }
 }
 
-/// The `@context` of a compiled-in document, or `None` for a URL that is not
-/// pinned. The bodies are `include_str!`-ed at build time, so a body that
-/// does not parse or carries no `@context` is a build defect rather than
-/// anything a request can cause —
-/// `every_pinned_context_parses_and_carries_an_at_context` fails on it.
-fn pinned(url: &str) -> Option<Value> {
-    let (_, body) = PINNED.iter().find(|(u, _)| *u == url)?;
-    let doc: Value = serde_json::from_str(body).ok()?;
-    doc.get("@context").cloned()
-}
-
-/// Merge a pre-parsed Core @context value (4.4: merged last, so it wins).
-fn merge_context_value(ctx: &mut Context, v: &Value) {
-    match v {
-        Value::Object(o) => {
-            let _ = ctx.merge_core_object(o);
-        }
-        Value::Array(items) => {
-            for i in items {
-                merge_context_value(ctx, i);
-            }
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `core_context` and the merge tail unwrap `pinned(CORE_CONTEXT)`,
-    /// because a broker without the Core @context cannot expand anything and
-    /// has no useful degraded mode. That is only safe while the compiled-in
-    /// table really does carry a parseable `@context` for every URL in it —
-    /// which is a property of the build, so it is checked here rather than
-    /// left to a comment. A pinned document that stops parsing fails this
-    /// test instead of the first request after deploy.
-    #[test]
-    fn every_pinned_context_parses_and_carries_an_at_context() {
-        assert!(!PINNED.is_empty(), "the pinned table is empty");
-        for (url, _) in PINNED {
-            assert!(
-                pinned(url).is_some(),
-                "pinned document {url} does not parse, or carries no @context"
-            );
-        }
-        let core = pinned(CORE_CONTEXT).expect("the Core @context is pinned");
-        assert!(
-            core.is_object() || core.is_array() || core.is_string(),
-            "the Core @context is not a usable @context value: {core}"
-        );
-        assert!(
-            PINNED.iter().any(|(u, _)| *u == CORE_CONTEXT),
-            "CORE_CONTEXT must be in the pinned table by URL, not merely resolvable"
-        );
-    }
 
     /// 4.4: "the Core @context is protected and shall remain immutable and
     /// invariant during expansion or compaction of terms. […] implementations
@@ -1622,16 +1577,98 @@ mod tests {
         use std::str::FromStr;
         let deny = PolicyResolver(EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         });
         let name = reqwest::dns::Name::from_str("localhost").expect("name");
         assert!(deny.resolve(name).await.is_err());
 
         let allow = PolicyResolver(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let name = reqwest::dns::Name::from_str("localhost").expect("name");
         let addrs = allow.resolve(name).await.expect("allowed");
         assert!(addrs.count() > 0);
+    }
+
+    /// T-3908: a host the operator lists reaches a private address with
+    /// private egress denied, an unlisted one does not, and no listing opens
+    /// the local host or instance metadata. An address literal is no name.
+    #[test]
+    fn listed_hosts_reach_private_peers_and_nothing_else() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().expect("ip");
+        let hosts: &'static [String] = vec![
+            "gateway.jc.svc.cluster.local".to_owned(),
+            "peer".to_owned(),
+            "localhost".to_owned(),
+            "10.0.0.5".to_owned(),
+        ]
+        .leak();
+        let p = EgressPolicy {
+            allow_private: false,
+            private_hosts: hosts,
+        };
+        assert!(p.admits("gateway.jc.svc.cluster.local", ip("10.43.0.12")));
+        assert!(p.admits("Gateway.JC.svc.cluster.local.", ip("10.43.0.12")));
+        assert!(p.admits("peer", ip("fd00::12")));
+        assert!(
+            p.admits("unlisted", ip("93.184.216.34")),
+            "public stays open"
+        );
+        assert!(!p.admits("unlisted", ip("10.43.0.12")));
+        assert!(!p.admits("gateway.jc.svc.cluster.local.evil", ip("10.43.0.12")));
+        for local in [
+            "127.0.0.1",
+            "127.9.9.9",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(!p.admits("peer", ip(local)), "{local}");
+            assert!(!p.admits("localhost", ip(local)), "{local}");
+        }
+        for metadata in ["169.254.169.254", "100.100.100.200", "fd00:ec2::254"] {
+            assert!(!p.admits("peer", ip(metadata)), "{metadata}");
+        }
+        // a literal is judged by its range, even when the list carries it
+        assert!(!p.admits("10.0.0.5", ip("10.0.0.5")));
+        assert!(!p.admits("[fd00::12]", ip("fd00::12")));
+        // unset is today's behaviour
+        let open = EgressPolicy {
+            allow_private: true,
+            private_hosts: &[],
+        };
+        assert!(open.admits("anything", ip("10.43.0.12")));
+        assert!(!open.admits("anything", ip("169.254.169.254")));
+    }
+
+    #[test]
+    fn the_private_hosts_list_parses_names_only() {
+        assert_eq!(
+            EgressPolicy::private_hosts_from(Some(
+                " Gateway.jc.svc.cluster.local. , ,peer,,10.0.0.1,[::1], ::1 "
+            )),
+            vec!["gateway.jc.svc.cluster.local".to_owned(), "peer".to_owned()]
+        );
+        assert!(EgressPolicy::private_hosts_from(None).is_empty());
+        assert!(EgressPolicy::private_hosts_from(Some(" , ")).is_empty());
+    }
+
+    /// A listed name still dials nothing on the local host: the resolver and
+    /// the pre-flight check both refuse `localhost` listed.
+    #[tokio::test]
+    async fn a_listed_name_never_opens_the_local_host() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+        let hosts: &'static [String] = vec!["localhost".to_owned()].leak();
+        let p = EgressPolicy {
+            allow_private: false,
+            private_hosts: hosts,
+        };
+        let name = reqwest::dns::Name::from_str("localhost").expect("name");
+        assert!(PolicyResolver(p).resolve(name).await.is_err());
+        assert!(p.check_host("localhost", 80).await.is_err());
     }
 
     /// 5.5.6: "When a remote JSON-LD @context referenced by an incoming
@@ -1661,6 +1698,7 @@ mod tests {
         };
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         // unreachable → LdContextNotAvailable
         let err = loader
@@ -1703,6 +1741,7 @@ mod tests {
         assert!(
             client_builder(EgressPolicy {
                 allow_private: true,
+                private_hosts: &[],
             })
             .build()
             .is_ok(),
@@ -1738,6 +1777,7 @@ mod tests {
 
         let client = client_builder(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         })
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -1782,6 +1822,7 @@ mod tests {
         });
         let client = client_builder(EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         })
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -1846,6 +1887,7 @@ mod tests {
 
         let client = client_builder(EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         })
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -1935,6 +1977,7 @@ mod tests {
     async fn egress_policy_denies_private_ranges() {
         let deny = EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         };
         for host in [
             "127.0.0.1",
@@ -1966,6 +2009,7 @@ mod tests {
         );
         let allow = EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         };
         assert!(allow.check_host("127.0.0.1", 80).await.is_ok());
         // ...but the instance-metadata range is refused even then: allowing
@@ -2018,6 +2062,7 @@ mod tests {
         let url = format!("http://{addr}/ctx.jsonld");
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let ctx = loader
             .resolve(&Value::String(url.clone()))
@@ -2110,6 +2155,7 @@ mod tests {
         });
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let err = loader
             .resolve(&Value::String(format!("http://{addr}/big.jsonld")))
@@ -2159,6 +2205,7 @@ mod tests {
         });
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         loader
             .resolve(&Value::String(format!("http://{addr}/c.jsonld")))
@@ -2209,6 +2256,7 @@ mod tests {
         });
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         loader
             .resolve(&Value::String(format!("http://{addr}/c.jsonld")))
@@ -2242,6 +2290,7 @@ mod tests {
         });
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let e = loader
             .resolve(&Value::String(format!("http://{addr}/c.jsonld")))
@@ -2297,6 +2346,7 @@ mod tests {
         });
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let err = loader
             .resolve(&Value::String(format!("http://{addr}/root.jsonld")))
@@ -2316,6 +2366,7 @@ mod tests {
     async fn usage_registry_is_bounded() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         for i in 0..4100 {
             let _ = loader
@@ -2342,6 +2393,7 @@ mod tests {
     async fn unanswered_dns_lookup_denies_instead_of_hanging() {
         let deny = EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         };
         let started = std::time::Instant::now();
         let err = deny
@@ -2352,7 +2404,11 @@ mod tests {
             )
             .await
             .expect_err("an unanswered lookup must be denied, never allowed");
-        assert!(err.contains("timed out"), "denial names the timeout: {err}");
+        // A resolver that answers NXDOMAIN before the zero timeout fires is a denial too.
+        assert!(
+            err.starts_with("resolving ctx.example.invalid: "),
+            "denial names the timeout or the failed lookup: {err}"
+        );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "the caller must not wait on the resolver"
@@ -2365,6 +2421,7 @@ mod tests {
     async fn fetch_cache_holds_a_byte_budget() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let mib = 1024 * 1024;
         let doc = Value::String("x".repeat(mib));
@@ -2411,6 +2468,7 @@ mod tests {
         });
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let url = Value::String(format!("http://{addr}/ctx.jsonld"));
         let ctx = loader.resolve(&url).await.expect("first resolve");
@@ -2433,6 +2491,7 @@ mod tests {
     async fn merged_cache_refuses_oversized_keys() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let mut big = serde_json::Map::new();
         for i in 0..2000 {
@@ -2468,6 +2527,7 @@ mod tests {
     async fn metadata_endpoint_is_denied_in_every_spelling() {
         let allow = EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         };
         for host in [
             "169.254.169.254",
@@ -2493,6 +2553,7 @@ mod tests {
     async fn metadata_deny_covers_the_cgnat_and_nat64_spellings() {
         let allow = EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         };
         for host in [
             "100.100.100.200",
@@ -2571,6 +2632,7 @@ mod tests {
     async fn metadata_and_private_denies_cover_the_6to4_spelling() {
         let allow = EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         };
         for host in [
             // 2002:169.254.169.254::
@@ -2587,6 +2649,7 @@ mod tests {
         }
         let deny = EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         };
         for host in [
             // 2002:127.0.0.1::
@@ -2619,6 +2682,7 @@ mod tests {
     async fn private_deny_covers_the_ranges_internal_services_sit_on() {
         let deny = EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         };
         for host in [
             "100.64.0.1",
@@ -2653,6 +2717,7 @@ mod tests {
     async fn private_range_denial_does_not_name_the_resolved_address() {
         let deny = EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         };
         // A NAME that resolves privately takes the resolver path — the one
         // that used to embed the answer. Where the name does not resolve the
@@ -2682,6 +2747,7 @@ mod tests {
     async fn client_side_context_caps_are_bad_request_not_gateway_errors() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let mut nested = serde_json::json!(["x"]);
         for _ in 0..12 {
@@ -2769,6 +2835,7 @@ mod tests {
     async fn clause_5_13_1_hosted_context_is_private_to_its_tenant() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let alpha = TenantId::new("alpha").expect("tenant");
         let beta = TenantId::new("beta").expect("tenant");
@@ -2825,6 +2892,7 @@ mod tests {
     async fn an_evicted_source_document_does_not_open_a_merged_hit_to_another_tenant() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let alpha = TenantId::new("alpha").expect("tenant");
         let beta = TenantId::new("beta").expect("tenant");
@@ -2868,6 +2936,7 @@ mod tests {
     async fn hosted_context_write_keeps_unrelated_merged_contexts() {
         let loader = Loader::with_policy(EgressPolicy {
             allow_private: true,
+            private_hosts: &[],
         });
         let alpha = TenantId::new("alpha").expect("tenant");
         let beta = TenantId::new("beta").expect("tenant");
@@ -2969,11 +3038,10 @@ mod tests {
         let core = Loader::new().core();
         for (term, iri) in [
             ("Snapshot", "https://uri.etsi.org/ngsi-ld/Snapshot"),
-            ("orderBy", "https://uri.etsi.org/ngsi-ld/orderBy"),
-            ("collation", "https://uri.etsi.org/ngsi-ld/collation"),
+            ("EntityMap", "https://uri.etsi.org/ngsi-ld/EntityMap"),
             ("valueType", "https://uri.etsi.org/ngsi-ld/hasValueType"),
             ("objectLists", "https://uri.etsi.org/ngsi-ld/hasObjectLists"),
-            ("aggrMethods", "https://uri.etsi.org/ngsi-ld/aggrMethods"),
+            ("notifiedAt", "https://uri.etsi.org/ngsi-ld/notifiedAt"),
         ] {
             assert_eq!(
                 core.expand_key(term),
@@ -2981,6 +3049,93 @@ mod tests {
                 "{term} must expand to its Annex B IRI, not through @vocab"
             );
         }
+        // TS 104 175 Annex B scopes these, so at top level they are not core
+        // terms and expand through @vocab like any other name.
+        for term in [
+            "orderBy",
+            "collation",
+            "aggrMethods",
+            "status",
+            "format",
+            "data",
+        ] {
+            assert_eq!(
+                core.expand_key(term),
+                format!("https://uri.etsi.org/ngsi-ld/default-context/{term}"),
+                "{term} is not a top-level core term"
+            );
+        }
+    }
+
+    /// TS 104 175 Annex B is the document the v1.9 URL resolves to (5.3.2.1
+    /// keeps the URL): 149 top-level members, 23 of them carrying a scoped
+    /// context, and the 61 CIM 009 top-level terms it scopes are gone from
+    /// the top level.
+    #[test]
+    fn pinned_v1_9_core_matches_ts_104175_annex_b() {
+        let core = pinned(CORE_CONTEXT).expect("pinned core");
+        let top = core.as_object().expect("an object @context");
+        assert_eq!(top.len(), 149, "Annex B top-level members");
+        let mut scoped: Vec<&str> = top
+            .iter()
+            .filter(|(_, d)| d.get("@context").is_some())
+            .map(|(t, _)| t.as_str())
+            .collect();
+        scoped.sort_unstable();
+        assert_eq!(
+            scoped,
+            [
+                "Attribute",
+                "AttributeList",
+                "ContextSourceIdentity",
+                "ContextSourceNotification",
+                "ContextSourceRegistration",
+                "EntityType",
+                "EntityTypeInfo",
+                "EntityTypeList",
+                "Feature",
+                "FeatureCollection",
+                "Notification",
+                "Query",
+                "Subscription",
+                "endpoint",
+                "geoQ",
+                "information",
+                "management",
+                "managementInterval",
+                "ngsildproof",
+                "notUpdated",
+                "notification",
+                "observationInterval",
+                "temporalQ",
+            ]
+        );
+        for term in [
+            "status", "format", "data", "attrs", "join", "timerel", "geometry", "accept",
+        ] {
+            assert!(!top.contains_key(term), "{term} is scoped only in Annex B");
+        }
+    }
+
+    /// TS 104 175 5.2.5: a term the core @context defines only inside a
+    /// scope may be redefined by a user @context ("still discouraged"); the
+    /// top-level core terms stay protected (4.4).
+    #[tokio::test]
+    async fn a_scoped_core_term_may_be_redefined_by_a_user_context() {
+        let ctx = Loader::new()
+            .resolve(&serde_json::json!({
+                "status": "https://example.org/status",
+                "location": "https://example.org/location"
+            }))
+            .await
+            .expect("resolve");
+        assert_eq!(ctx.expand_key("status"), "https://example.org/status");
+        assert_eq!(ctx.compact_iri("https://example.org/status"), "status");
+        assert_eq!(
+            ctx.expand_key("location"),
+            "https://uri.etsi.org/ngsi-ld/location",
+            "a top-level core term stays protected"
+        );
     }
 
     /// Annex B (normative), V1.9.1: the core @context served for the v1.9
@@ -3001,14 +3156,11 @@ mod tests {
             "Snapshot",
             "SnapshotNotification",
             "ExecutionResultDetails",
-            "aggrMethods",
-            "aggrParams",
-            "aggrPeriodDuration",
-            "collation",
+            // aggrMethods, aggrParams, aggrPeriodDuration, ordering: scoped
+            // under temporalQ and Query by TS 104 175 Annex B; collation and
+            // orderBy: gone from it
             "lastUsedAt",
             "ngsildproof",
-            "orderBy",
-            "ordering",
             "problemDetails",
             "resultStatus",
             "snapshotId",
@@ -3043,5 +3195,267 @@ mod tests {
             );
         }
         assert!(!v18.contains_key("Snapshot"), "v1.8 predates Snapshot");
+    }
+}
+
+/// The broker's hooks (write-through, usage bump, hosted lookup) and the
+/// fetch outcomes a loopback server can produce, against one loader.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod hooks {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    async fn serve() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let ttl_hits = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = req.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let (headers, body) = match path.as_str() {
+                    "/a.jsonld" => ("", r#"{"@context":{"a":"https://e.org/a"}}"#.to_owned()),
+                    "/nested.jsonld" => (
+                        "",
+                        r#"{"@context":["rel.jsonld",{"n":"https://e.org/n"}]}"#.to_owned(),
+                    ),
+                    "/rel.jsonld" => ("", r#"{"@context":{"r":"https://e.org/r"}}"#.to_owned()),
+                    "/ttl.jsonld" => {
+                        let i = ttl_hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            "Cache-Control: max-age=0\r\n",
+                            format!(r#"{{"@context":{{"t":"https://e.org/t{i}"}}}}"#),
+                        )
+                    }
+                    _ => ("", String::new()),
+                };
+                let resp = if path == "/big" {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n{}".to_owned()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn hooks_and_fetch_outcomes() {
+        let _ = Loader::default();
+        let base = serve().await;
+        let loader = Loader::with_policy(EgressPolicy {
+            allow_private: true,
+            private_hosts: &[],
+        });
+        let writes = Arc::new(AtomicUsize::new(0));
+        let w = Arc::clone(&writes);
+        loader.set_cache_writer(Arc::new(move |_, _, _| {
+            w.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }));
+        // the shared row of every URL is gone while `gone` is set; with
+        // `only_a` too, only a.jsonld's
+        let gone = Arc::new(AtomicBool::new(false));
+        let only_a = Arc::new(AtomicBool::new(false));
+        let (g, o) = (Arc::clone(&gone), Arc::clone(&only_a));
+        loader.set_usage_bump(Arc::new(move |_, url| {
+            let hit = !o.load(Ordering::SeqCst) || url.ends_with("/a.jsonld");
+            let exists = !(g.load(Ordering::SeqCst) && hit);
+            Box::pin(async move { exists })
+        }));
+        let alpha = TenantId::new("alpha").expect("tenant");
+        let beta = TenantId::new("beta").expect("tenant");
+        let owner = alpha.clone();
+        loader.set_local_lookup(Arc::new(move |_, url| {
+            let hit = url.ends_with("/hosted").then(|| {
+                (
+                    Some(owner.clone()),
+                    serde_json::json!({"h": "https://e.org/h"}),
+                )
+            });
+            Box::pin(async move { hit })
+        }));
+
+        let a = Value::String(format!("{base}/a.jsonld"));
+        let ctx = loader.resolve(&a).await.expect("fetch");
+        assert_eq!(ctx.expand_key("a"), "https://e.org/a");
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "a fresh fetch is written through"
+        );
+        loader.resolve(&a).await.expect("merged hit");
+        // the shared row was deleted elsewhere: the warm copy is not served,
+        // the rebuild fetches it, and the counted use, still finding no row,
+        // fetches and writes it once more
+        gone.store(true, Ordering::SeqCst);
+        loader.resolve(&a).await.expect("rebuilt");
+        assert_eq!(writes.load(Ordering::SeqCst), 3);
+        // one of two documents gone: the other one is counted once
+        let both = serde_json::json!([a.clone(), format!("{base}/rel.jsonld")]);
+        gone.store(false, Ordering::SeqCst);
+        loader.resolve(&both).await.expect("both");
+        gone.store(true, Ordering::SeqCst);
+        only_a.store(true, Ordering::SeqCst);
+        loader.resolve(&both).await.expect("both rebuilt");
+        gone.store(false, Ordering::SeqCst);
+        loader.resolve_quiet(&a).await.expect("quiet");
+        loader
+            .resolve_quiet_for(&alpha, &a)
+            .await
+            .expect("quiet for");
+
+        let ctx = loader
+            .resolve(&Value::String(format!("{base}/nested.jsonld")))
+            .await
+            .expect("nested");
+        assert_eq!(
+            ctx.expand_key("r"),
+            "https://e.org/r",
+            "a relative reference joins its base"
+        );
+        assert_eq!(ctx.expand_key("n"), "https://e.org/n");
+
+        let err = loader
+            .resolve(&Value::String(format!("{base}/big")))
+            .await
+            .expect_err("too large");
+        assert!(
+            matches!(err, NgsiError::LdContextNotAvailable(_)),
+            "{err:?}"
+        );
+
+        let ttl = Value::String(format!("{base}/ttl.jsonld"));
+        assert_eq!(
+            loader.resolve(&ttl).await.expect("ttl").expand_key("t"),
+            "https://e.org/t0"
+        );
+        assert_eq!(
+            loader
+                .resolve(&ttl)
+                .await
+                .expect("ttl again")
+                .expand_key("t"),
+            "https://e.org/t1",
+            "a stale document is fetched again and the new copy wins"
+        );
+
+        let hosted = Value::String(format!("{base}/hosted"));
+        let err = loader
+            .resolve_for(&beta, &hosted)
+            .await
+            .expect_err("foreign");
+        assert!(
+            matches!(err, NgsiError::LdContextNotAvailable(_)),
+            "{err:?}"
+        );
+        let ctx = loader.resolve_for(&alpha, &hosted).await.expect("own");
+        assert_eq!(ctx.expand_key("h"), "https://e.org/h");
+        let err = loader
+            .resolve(&hosted)
+            .await
+            .expect_err("no Tenant, an owned copy");
+        assert!(
+            matches!(err, NgsiError::LdContextNotAvailable(_)),
+            "{err:?}"
+        );
+
+        // a reload of a URL with no copy yet: nothing to keep
+        let err = loader
+            .refetch(&format!("{base}/missing"))
+            .await
+            .expect_err("empty body");
+        assert!(
+            matches!(err, NgsiError::LdContextNotAvailable(_)),
+            "{err:?}"
+        );
+        // the egress policy is asked before any connection
+        let strict = Loader::with_policy(EgressPolicy {
+            allow_private: false,
+            private_hosts: &[],
+        });
+        let err = strict.resolve(&a).await.expect_err("loopback denied");
+        assert!(
+            matches!(err, NgsiError::LdContextNotAvailable(_)),
+            "{err:?}"
+        );
+
+        let err = loader
+            .resolve(&serde_json::json!("rel.jsonld"))
+            .await
+            .expect_err("relative");
+        assert!(
+            matches!(err, NgsiError::LdContextNotAvailable(_)),
+            "{err:?}"
+        );
+        let err = loader
+            .resolve(&serde_json::json!(5))
+            .await
+            .expect_err("number");
+        assert!(matches!(err, NgsiError::BadRequestData(_)), "{err:?}");
+        loader
+            .resolve(&Value::Null)
+            .await
+            .expect("null is the core context");
+
+        loader
+            .seed_cached(
+                "http://s.example/c",
+                "lid-1",
+                "2020-01-01T00:00:00Z",
+                serde_json::json!({"s": "https://e.org/s"}),
+            )
+            .await;
+        assert_eq!(
+            loader.usage_get("lid-1").await.map(|u| u.url),
+            Some("http://s.example/c".into())
+        );
+        assert!(loader.usage_get("http://s.example/c").await.is_some());
+        loader.usage_remove("http://s.example/c").await;
+        assert!(loader.usage_get("lid-1").await.is_none());
+
+        assert_eq!(ttl_from_headers(Some("max-age=soon"), None), None);
+        assert_eq!(
+            ttl_from_headers(Some("no-cache"), None),
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn private_and_embedded_addresses() {
+        let private = |s: &str| EgressPolicy::ip_is_private(s.parse().expect("ip"));
+        for ip in [
+            "169.254.1.1",
+            "::1",
+            "::",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::a00:1",
+        ] {
+            assert!(private(ip), "{ip}");
+        }
+        assert!(private("198.19.0.1"));
+        for ip in [
+            "8.8.8.8",
+            "192.1.0.1",
+            "192.0.1.1",
+            "198.20.0.1",
+            "2001:db8::1",
+            "::ffff:8.8.8.8",
+            "64:ff9b:1::a00:1",
+            "64:1::1",
+        ] {
+            assert!(!private(ip), "{ip}");
+        }
     }
 }

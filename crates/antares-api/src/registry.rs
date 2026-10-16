@@ -27,6 +27,10 @@ pub fn present_registration(doc: &Value, ctx: &Context, sys_attrs: bool) -> Valu
     let mut out = Map::new();
     for (k, v) in obj {
         match k.as_str() {
+            // 5.2.9 has no member under this prefix: the creating subject
+            // (policy::SUBJECT_MEMBER) stays in the broker, in a response
+            // and in a 5.11 notification alike
+            k if k.starts_with("__") => continue,
             "createdAt" | "modifiedAt" if !sys_attrs => continue,
             "information" => {
                 let infos: Vec<Value> = v
@@ -61,7 +65,7 @@ pub fn present_registration(doc: &Value, ctx: &Context, sys_attrs: bool) -> Valu
                                 .collect();
                             ni.insert("entities".into(), Value::Array(nes));
                         }
-                        for names_key in ["propertyNames", "relationshipNames"] {
+                        for names_key in antares_model::REGISTRATION_ATTRIBUTE_MEMBERS {
                             if let Some(names) = ni.get(names_key).and_then(Value::as_array) {
                                 let nn: Vec<Value> = names
                                     .iter()
@@ -196,19 +200,11 @@ fn attrs_match_info(attrs: &Option<Vec<String>>, info: &Value) -> bool {
     if attrs.is_empty() {
         return true;
     }
-    let props = info.get("propertyNames").and_then(Value::as_array);
-    let rels = info.get("relationshipNames").and_then(Value::as_array);
-    if props.is_none() && rels.is_none() {
-        return true;
+    // TS 104 175 9.4.2: attributeNames, else the deprecated pair
+    match antares_model::registration_attribute_names(info) {
+        None => true,
+        Some(names) => names.iter().any(|n| attrs.iter().any(|w| w == n)),
     }
-    let has = |list: Option<&Vec<Value>>| {
-        list.is_some_and(|l| {
-            l.iter()
-                .filter_map(Value::as_str)
-                .any(|n| attrs.iter().any(|w| w == n))
-        })
-    };
-    has(props) || has(rels)
 }
 
 /// 5.12: the RegistrationInfo elements of `doc.information` that match `spec`.
@@ -242,7 +238,11 @@ pub(crate) fn csf_matches(csf: &antares_ql::QNode, reg: &Value, ctx: &Context) -
         serde_json::json!(["ContextSourceRegistration"]),
     );
     for (k, v) in obj {
-        if ["id", "type", "information", "createdAt", "modifiedAt"].contains(&k.as_str()) {
+        // the `__` members are the broker's (policy::SUBJECT_MEMBER), not
+        // Context Source Properties a client may filter on (T-3692)
+        if ["id", "type", "information", "createdAt", "modifiedAt"].contains(&k.as_str())
+            || k.starts_with("__")
+        {
             continue;
         }
         // a Context Source Property stored in attribute form (5.2.9) is an
@@ -312,7 +312,15 @@ pub fn csr_matches_subscription(sub: &Value, reg: &Value, ctx: &Context) -> bool
         if let Ok(Some(gq)) =
             antares_ql::geo::GeoQuery::from_params(&antares_matcher::geo_params(g))
         {
-            match reg.get("location") {
+            // Table 5.2.6.5.2-1: matched against the registration GeoJSON
+            // member `geoproperty` names (location, observationSpace,
+            // operationSpace), stored by its compacted name
+            let member = if gq.geoproperty.is_empty() {
+                "location".to_owned()
+            } else {
+                ctx.compact_iri(&ctx.expand_key(&gq.geoproperty))
+            };
+            match reg.get(&member) {
                 Some(geom) => {
                     if !gq.matches_geometry(geom) {
                         return false;
@@ -431,6 +439,94 @@ mod tests {
     use super::*;
     use antares_jsonld::Loader;
     use serde_json::json;
+
+    /// TS 104 175 Table 5.2.6.5.2-1: a CSR subscription's geoQ "is matched
+    /// against the specified Context Source Registration GeoJSON attributes,
+    /// e.g. location, observationSpace or operationSpace": `geoproperty`
+    /// names which one, `location` when it names none (12.4.2).
+    /// A csf reads the Registration's Context Source Properties, never the
+    /// broker's `__` members: a client whose `@context` maps a term onto
+    /// the member cannot learn the subject another Registration was created
+    /// by (T-3692), whatever form a broker member is stored in. The 4.9 grammar refuses `__subject` and a full IRI, so
+    /// a term is the only way to name it.
+    #[tokio::test]
+    async fn csf_never_reads_the_recorded_subject() {
+        let core = Loader::new().core();
+        let (iri, name) = (
+            core.expand_key("__subject"),
+            core.expand_key("registrationName"),
+        );
+        let other = core.expand_key("__other");
+        let ctx = Loader::new()
+            .resolve(&json!({"s": iri, "o": other, "n": name}))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let reg = json!({
+            "id": "urn:ngsi-ld:ContextSourceRegistration:s",
+            "type": "ContextSourceRegistration",
+            "information": [{"entities": [{"type": "Car"}]}],
+            "endpoint": "http://a.example.com",
+            "registrationName": "r",
+            "__subject": [["X-Subject", "alice"]],
+            // any broker member, whatever its form: one in Property form
+            // would match if the prefix were read
+            "__other": {"value": "alice"}
+        });
+        for q in ["s", "s[1]==\"alice\"", "s==\"alice\"", "o", "o==\"alice\""] {
+            let csf = antares_ql::parse_q(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert!(!csf_matches(&csf, &reg, &ctx), "{q}");
+        }
+        let named = antares_ql::parse_q("n").unwrap_or_else(|e| panic!("{e}"));
+        assert!(csf_matches(&named, &reg, &ctx), "a property still matches");
+    }
+
+    #[test]
+    fn clause_12_4_2_geoq_geoproperty_matches_observation_space() {
+        let ctx = Loader::new().core();
+        let point = |x: f64| json!({"type": "Point", "coordinates": [x, 0.5]});
+        let reg = json!({
+            "id": "urn:ngsi-ld:ContextSourceRegistration:geo",
+            "type": "ContextSourceRegistration",
+            "information": [{"entities": [{"type": "Building"}]}],
+            "endpoint": "http://a.example.com",
+            "location": point(5.0),
+            "observationSpace": point(0.5)
+        });
+        let sub = |geoproperty: Option<&str>| {
+            let mut geo = json!({"georel": "within", "geometry": "Polygon",
+                "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]});
+            if let Some(p) = geoproperty {
+                geo["geoproperty"] = json!(p);
+            }
+            json!({"entities": [{"type": "Building"}], "geoQ": geo})
+        };
+        assert!(csr_matches_subscription(
+            &sub(Some("observationSpace")),
+            &reg,
+            &ctx
+        ));
+        assert!(
+            csr_matches_subscription(
+                &sub(Some("https://uri.etsi.org/ngsi-ld/observationSpace")),
+                &reg,
+                &ctx
+            ),
+            "the expanded name names the same member"
+        );
+        assert!(
+            !csr_matches_subscription(&sub(None), &reg, &ctx),
+            "location is outside"
+        );
+        assert!(!csr_matches_subscription(
+            &sub(Some("location")),
+            &reg,
+            &ctx
+        ));
+        assert!(
+            !csr_matches_subscription(&sub(Some("operationSpace")), &reg, &ctx),
+            "a member the registration lacks matches nothing"
+        );
+    }
 
     /// 5.11.2.4: a csource subscription's csf matches the registration's
     /// own Context Source Properties, and its scopeQ matches the

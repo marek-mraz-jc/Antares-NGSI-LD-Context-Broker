@@ -10,37 +10,40 @@ Issue texts prepared for filing. Two targets:
 
 ---
 
-## 1. [suite] D018_01 asserts 508 Loop Detected for an *inclusive* registration
+## 1. [spec] CIM 009 6.3.17 and TS 104 175 9.7 disagree on a loop through an inclusive registration
 
-**Title:** D018_01 uses mode=inclusive but asserts the exclusive/redirect
-508 loop behaviour
+**Title:** 508 Loop Detected is scoped to a single exclusive or redirect
+source in 6.3.17, while TS 104 175 9.7 makes every detected loop an error
 
 **Body:**
 
 Test `D018_01 Loop Detection With Via Header` registers its Context Source
 with `mode=inclusive` (fixture
-`context-source-registration-vehicle-redirection-ops.jsonld` — note its
-`operations: ["redirectionOps"]` names an operation *group*, not a mode),
-replays the broker's own `Via` pseudonym on `DELETE /entities/{id}`, and
-asserts **508**.
+`context-source-registration-vehicle-redirection-ops.jsonld`), replays the
+broker's own `Via` pseudonym on `DELETE /entities/{id}`, and asserts
+**508**.
 
-GS CIM 009 V1.9.1 clause 6.3.17 (p. 278) scopes 508 to the case where
-"all of the data is held outside of the Context Broker and held in a
-single registered source" — i.e. **exclusive or redirect** registrations.
-For an inclusive registration, Table 6.3.18-2 (p. 279) makes the Via
-listing an input to registration *matching*: the looping source drops out
-of matching and the DELETE executes locally, so **204** is the conformant
-answer. A broker that returns 508 here refuses an operation it can serve
-from its own store.
+GS CIM 009 V1.9.1 clause 6.3.17 (p. 278), repeated in TS 104 176 6.3.5,
+scopes 508 to the case where "all of the data is held outside of the
+Context Broker and held in a single registered source", and Table 6.3.18-2
+(p. 279) makes the Via listing an input to registration matching, which
+reads as: drop the looping source, execute locally, answer 204.
 
-Corroborating: siblings D018_02/D018_03 carry the `additive-inclusive`
-tag; D018_01 does not, yet is the only one hardcoding `mode=inclusive` —
-the mode looks like a slip in a test whose assertion belongs to the
-redirect path.
+TS 104 175 clause 9.7 adds: "If the requested endpoint is also listed as
+previously encountered when a Context Source receives a call to that
+endpoint, this is an indication that a new loop has been detected. A
+suitable error shall be returned, indicating that the loop has been
+detected." Under 9.7 the 508 that D018_01 asserts is right whatever the
+registration mode, and the 6.3.17 scoping is the outdated text.
 
-**Proposed fix (in our fork):** switch D018_01's setup to `mode=redirect`,
-which puts the scenario inside the clause its assertion cites and keeps
-the subject of the test (Via replay ⇒ loop detected) intact.
+Antares follows 9.7 for writes (508 whenever the `Via` already names the
+broker, T-3459) and serves reads locally with a `199` warning, so a
+query that crosses its own registration still answers with local data.
+
+**Proposed fix (spec):** align 6.3.17 and TS 104 176 6.3.5 with TS 104 175
+9.7, and say whether a read that detects a loop may be served locally.
+Our fork's D018_01 setup uses `mode=redirect`, which passes under either
+reading.
 
 ---
 
@@ -296,6 +299,10 @@ not recover the NGSI-LD names.
 Suggest defining both as `"ngsi-ld:attributeCount"` and
 `"ngsi-ld:attributeDetails"`, the form the rest of the annex uses.
 
+Status: TS 104 175 V1.1.1 Annex B defines both that way, inside the
+`Attribute` and `EntityTypeInfo` scoped contexts; Antares pins that
+document for the v1.9 URL since T-3458.
+
 ## 12. [spec+suite] 4.19's ABNF derives no unparenthesized conjunction, but a test point sends one
 
 Clause 4.19 (V1.9.1 p. 98) defines the Scope Query Language as
@@ -332,3 +339,254 @@ disclose different sets of Entities for the same narrowed request.
 Suggest either extending `OrScopeQ` with an unparenthesized
 `ScopeQ *(andOp ScopeQ)` alternative and stating that `andOp` binds tighter
 than `orOp`, or parenthesizing the conjunction in `019_01_06`.
+
+## 13. [spec] TS 104 175 Table 5.2.6.5.2-1 calls `timeInterval` not applicable to CSR subscriptions; 12.4.2.4 and 12.4.7 define periodic CSR notification on it
+
+**Title:** TS 104 175: Table 5.2.6.5.2-1 and clauses 12.4.2.4/12.4.7 disagree on
+`timeInterval` for Context Source Registration subscriptions
+
+**Body:**
+
+Table 5.2.6.5.2-1 lists the Subscription members that "are not applicable and
+shall be ignored" when the Subscription is about Context Source Registrations
+(`notificationTrigger`, `q`, `expandValues`, `jsonKeys`, `lang`, `localOnly`,
+`splitEntities`, `throttling`) and counts `timeInterval` among the members
+that do not apply. Clause 12.4.2.4 and clause 12.4.7 nevertheless define a
+periodic Context Source Notification sent every `timeInterval` seconds for
+such a Subscription, the same way 5.8.x does for an Entity Subscription.
+
+An implementation that follows the table ignores `timeInterval` and sends
+change-driven notifications; one that follows 12.4.x sends periodic ones. A
+client cannot tell from the text which it gets.
+
+Antares follows 12.4.7 (periodic notification on `timeInterval`), since the
+behaviour clause is the more specific one, and pins the table's other
+members as ignored (`csource_subscription_ignored_members.rs`, T-3452).
+
+Suggest removing `timeInterval` from the table's not-applicable list, or, if
+the table is meant, removing the periodic paragraphs of 12.4.2.4 and 12.4.7.
+
+## 14. [spec] TS 104 176 clause 5 answers a successful HEAD with 204, its 7.x operation tables with 200
+
+**Title:** TS 104 176: clause 5 and the GET/HEAD tables of clause 7 give a
+successful HEAD two different status codes
+
+**Body:**
+
+Clause 5 (p. 22): "Where defined, a HEAD request shall function in the same
+manner as a GET request, but shall omit the body in the response. The
+response code 204 No Content shall be used on success."
+
+Every GET/HEAD operation table of clause 7 lists one response set for both
+verbs. For example, 7.3.3.1 "GET/HEAD" (p. 42-44) answers `200 OK` (and
+`201 Created` when an EntityMap was (re)created), with no separate row for
+HEAD.
+
+An implementation that follows clause 5 answers HEAD with 204, one that
+follows the tables answers 200. RFC 9110 9.3.2 expects the server to "send
+the same header fields in response to a HEAD request as it would have sent
+if the request method had been GET", so 204 also changes what a cache or a
+client probing a resource reads from the status line.
+
+Antares answers 200 (owner decision on T-3460), the status the tables and
+RFC 9110 give, and takes the HEAD request's @context from its Link header as
+6.2.4 requires (`contexts_5_13.rs::ts104176_6_2_4_head_takes_context_from_link`).
+
+Suggest dropping the 204 sentence from clause 5, or, if 204 is meant, adding
+a HEAD row with 204 to each GET/HEAD table of clause 7.
+
+---
+
+## 15. [suite] 020_17 to 020_20 delete an Attribute of an Entity that exists only as a temporal evolution
+
+**Title:** 020_17..020_20 set up with `POST /temporal/entities` alone, then
+call `DELETE /entities/{id}/attrs/{attrId}`
+
+**Body:**
+
+Delete Attribute (CIM 009 5.6.5.4) raises ResourceNotFound when no Entity
+is held locally; a temporal evolution created by 5.6.11 is not one, and
+5.6.13 is the operation that deletes from it. The setup creates only the
+temporal evolution, so a compliant broker answers 404 and writes no
+`deletedAt` instance. Suggest creating the current-state Entity in the
+setup and deleting it in the teardown, as the corrected fork does (forge
+commits f7c78f94 and 94789a66); Antares carries that fix and answers 404
+(`temporal_autorecord.rs::delete_attribute_of_a_temporal_only_entity_is_not_found`).
+
+---
+
+## 16. [suite] 020_19 and 020_20 expect a deleted scope as an empty array
+
+**Title:** the 020_19/020_20 expectations show a deleted scope as `[]`
+
+**Body:**
+
+CIM 009 4.18 reserves `urn:ngsi-ld:null` for deleted scopes, and 4.5.0
+uses it for every deleted element of the temporal representation. The
+expectation files carry `"value": []` (and `[]` in `temporalValues`).
+Suggest `"urn:ngsi-ld:null"`, as the corrected fork does (forge commit
+fad5ab03); Antares carries that fix
+(`temporal_autorecord.rs::deleted_scope_is_the_ngsi_ld_null_in_the_temporal_representation`).
+
+---
+
+## 17. [spec] TS 104 176 answers Create and Clone Snapshot with 202, CIM 009 with 201, and gives no version to ask for either
+
+**Title:** TS 104 176 13.2.3.1 and 13.4.3.1 change 201 Created to 202
+Accepted with no migration rule
+
+**Body:**
+
+CIM 009 V1.9.1 6.36.3.1 and 6.38.3.1 answer "201 Created" with the
+Location of the created snapshot. TS 104 176 13.2.3.1 and 13.4.3.1 answer
+"202 Accepted" with "the relative path of the snapshot being created". The
+snapshot fills after the answer in both texts (5.16.1.4: the status moves
+to `ready` when every query has run), so 202 fits the operation, but a
+client written against CIM 009 reads 202 as a different outcome, and the
+Snapshot TPs assert 201.
+
+A broker could serve both through `Prefer: ngsi-ld=<version>` (4.3.6.8,
+TS 104 175 9.5.3), except that TS 104 175 states no `major.minor` of its
+own, so no client can prefer it.
+
+Antares answers 201, the CIM 009 status it states conformance to, and
+records the conflict here (T-3555). Suggest giving the TS 104 175 family a
+version a `Prefer` header can name, or keeping 201 for a snapshot created
+synchronously and 202 only where the creation itself is deferred.
+
+---
+
+## 18. [suite] 021_08 expects speed instances that fail the query
+
+**Title:** the 021_08 expectation keeps every instance of the selected
+Entity, including those that fail `q`
+
+**Body:**
+
+CIM 009 5.7.4.4, last step: "include in their temporal representation only
+the Attribute instances ... which meet the temporal, query and geoquery
+restrictions". 021_08 queries `q=speed>90` and its expectation still lists
+the speed instances below 90. Suggest dropping them, as the corrected fork
+does (forge commit 9ca4213e); Antares carries that fix
+(`temporal_autorecord.rs::temporal_query_keeps_only_the_instances_that_meet_q`).
+The clause does not say how an instance meets a `q` over several
+Attributes; Antares keeps an instance when `q` holds on the Entity with that
+Attribute narrowed to that one instance.
+
+---
+
+## 19. [suite] 037_11 and 041_03 ask without Accept and expect ld+json pagination Links
+
+**Title:** 037_11/041_03 expect `type="application/ld+json"` on the
+pagination Links of an `application/json` response
+
+**Body:**
+
+CIM 009 6.3.10: the type Link Target Attribute "shall be exactly equal to
+the media type resulting from the original request". Both test points query
+without an Accept header, so the response is `application/json`, and still
+expect `type="application/ld+json"`. Suggest sending
+`Accept: application/ld+json`, as the corrected fork does (forge commit
+c4cdb0cf, and the same line in its 037_11); Antares carries that fix and
+types every pagination Link after the response media type
+(`registration_listing_5_10_2.rs::a_registration_page_link_carries_the_requested_media_type`).
+
+---
+
+## 20. [suite] 051_04_01 expects BadRequestData for an unknown @context id with reload=true
+
+**Title:** 051_04_01 expects 400 where 5.13.5.4 raises ResourceNotFound
+
+**Body:**
+
+CIM 009 5.13.5.4, second bullet: "If the @context identifier does not
+correspond to any existing entry in the @context storage, then an error of
+type ResourceNotFound shall be raised." The reload bullets that follow
+describe an existing @context by its kind. 051_04_01 deletes an unknown id
+with `reload=true` and expects 400 BadRequestData. Suggest 404
+ResourceNotFound, as the corrected fork does (forge commit 39921641);
+Antares carries that fix
+(`contexts_5_13.rs::clause_5_13_5_delete_and_reload_errors`).
+
+---
+
+## 21. [suite] 008_01 expects a second temporal upsert to overwrite instances at the same observedAt
+
+**Title:** the 008_01 expectation drops instances that the second
+`POST /temporal/entities` must add
+
+**Body:**
+
+CIM 009 5.6.11.4: for a known Temporal Evolution "all the Attribute
+instances included by the Temporal Evolution shall be added to the existing
+Entity as mandated by clause 5.6.12". An instance is identified by its
+system-generated instanceId, not by observedAt. The 008_01 expectation reuses
+the update payload, so instances that share an observedAt with the first
+POST are replaced and duplicates collapse. Suggest the union of both
+payloads, as the corrected fork does (forge commit 167fa185); Antares
+carries that fix
+(`temporal_dedup.rs::a_second_temporal_upsert_at_the_same_instant_appends`).
+
+---
+
+## 22. [suite] 046_22_08 reads a deleted three-instance Attribute as one object
+
+**Title:** 046_22_08 asserts `['name']['value']` on an Attribute whose three
+instances were deleted
+
+**Body:**
+
+`name` in building-multi-instances-attributes has the default instance and
+two datasetIds, and 046_22_08 deletes all of them. CIM 009 5.8.6 represents
+each deleted instance with the NGSI-LD Null and its datasetId, so the
+notification carries an Array of three, as it would for the live Attribute.
+The assertion indexes a single object. Suggest asserting three instances,
+each `urn:ngsi-ld:null`, as the corrected fork does (forge commit
+75ba471d); Antares carries that fix
+(`notify.rs::whole_attribute_versus_per_instance_deletion`).
+
+---
+
+## 23. [suite] 046_05 percent-encodes the q of a Subscription body
+
+**Title:** the 046_05 Subscription carries `q` as `name=="Eiffel%20Tower"`
+
+**Body:**
+
+CIM 009 Table 5.2.12-1 types a Subscription's `q` as a string holding a
+4.9 query, and the Subscription travels as a JSON body, not in a URI, so
+4.9's percent-encoding rule for query strings does not apply. Read as
+written, the q matches only an Entity whose name is the literal
+`Eiffel%20Tower`. Suggest `name=="Eiffel Tower"`, as the corrected fork
+does (forge commit cd2ef2ba); Antares carries that fix and reads the q as
+written (`antares-matcher::a_subscription_q_is_not_percent_decoded`).
+
+---
+
+## 24. [spec] TS 104 176 9.4.3.1 and 9.4.3.2 carry each other's headings
+
+**Title:** the `csourceSubscriptions` collection binds Create to a clause
+headed GET/HEAD and Query to one headed POST
+
+**Body:**
+
+TS 104 176 V1.1.1 clause 9.4.3.1 (p. 95) is headed "GET/HEAD" and reads:
+"This method is bound to the operation \"Create Context Source
+Registration Subscription\" ... clause 12.4.2, taking the context source
+registration subscription to be created from the HTTP request payload
+body". Clause 9.4.3.2 (p. 96) is headed "POST" and reads: "This method is
+associated to the operation \"Query Context Source Registration
+Subscriptions\" ... clause 12.4.5, providing the context source
+registration subscription data as part of the HTTP response payload body",
+with URL parameters in Table 9.4.3.2-1.
+
+A create takes a request body and a query takes URL parameters, so the
+bodies of the two clauses are right and their headings are swapped. Every
+other collection resource of the binding uses POST for create and
+GET/HEAD for query. Suggest heading 9.4.3.1 "POST" and 9.4.3.2
+"GET/HEAD".
+
+Antares serves POST for create and GET for query on
+`/ngsi-ld/v1/csourceSubscriptions` (`crates/antares-api/src/lib.rs`); the
+operation matrix records the swap (docs/analysis/operation-matrix.md,
+open question 9, T-3674).

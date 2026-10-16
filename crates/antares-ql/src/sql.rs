@@ -67,12 +67,14 @@ pub struct CompiledSql {
     pub binds: Vec<String>,
 }
 
-/// Compile `node` into a SQL predicate over column `col` (a `jsonb`).
+/// Compile `node` into a SQL predicate over column `col` (a `jsonb`). `col`
+/// is SQL text, so it is `'static`: a column the caller names in its own
+/// code, never a string a request carried (T-3464).
 /// `first_bind` is the 1-based number of the next free placeholder.
 /// `None` = this expression is outside the exact subset; filter in memory.
 pub fn compile_q(
     node: &QNode,
-    col: &str,
+    col: &'static str,
     first_bind: usize,
     expand: &dyn Fn(&str) -> String,
 ) -> Option<CompiledSql> {
@@ -88,7 +90,7 @@ pub fn compile_q(
 /// `cmp = None` is the existence form.
 pub fn compile_instance_leaf(
     cmp: Option<(CmpOp, &QValue)>,
-    col: &str,
+    col: &'static str,
     first: usize,
 ) -> Option<CompiledSql> {
     let mut binds = Vec::new();
@@ -98,7 +100,7 @@ pub fn compile_instance_leaf(
 
 fn emit(
     node: &QNode,
-    col: &str,
+    col: &'static str,
     first: usize,
     expand: &dyn Fn(&str) -> String,
     binds: &mut Vec<String>,
@@ -136,7 +138,7 @@ fn emit(
 fn join(
     items: &[QNode],
     sep: &str,
-    col: &str,
+    col: &'static str,
     first: usize,
     expand: &dyn Fn(&str) -> String,
     binds: &mut Vec<String>,
@@ -157,7 +159,7 @@ fn join(
 fn value_or(
     prefix: &str,
     cmp: Option<(CmpOp, &QValue)>,
-    col: &str,
+    col: &'static str,
     first: usize,
     binds: &mut Vec<String>,
 ) -> Option<String> {
@@ -179,7 +181,7 @@ fn value_or(
 pub fn value_or_filter(
     prefix: &str,
     filter: Option<&str>,
-    col: &str,
+    col: &'static str,
     first: usize,
     binds: &mut Vec<String>,
 ) -> String {
@@ -201,7 +203,10 @@ pub fn value_or_filter(
         // the OPERATOR form of jsonb_path_exists: identical lax semantics,
         // but the planner can match `@?` against the GIN jsonb_path_ops
         // index — the function form never uses it
-        parts.push(format!("{col} @? ${}::jsonpath", first + binds.len()));
+        parts.push(format!(
+            "{col} @? ${}::jsonpath",
+            first.saturating_add(binds.len())
+        ));
         binds.push(jp);
     }
     format!("({})", parts.join(" OR "))
@@ -345,7 +350,7 @@ pub fn quoted(s: &str) -> String {
 }
 
 fn jsonpath_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    let mut out = String::with_capacity(s.len().saturating_add(2));
     out.push('"');
     for c in s.chars() {
         match c {
@@ -594,5 +599,59 @@ mod tests {
         assert!(c(r#"name=="a".."m""#).is_none());
         // !~= is a regex — dialect mismatch, in-memory
         assert!(c(r#"name!~="^ab""#).is_none());
+    }
+
+    /// The equality and `[lang]` building blocks share Eq's table: a list
+    /// is an OR, a numeric range a closed interval, a string range and an
+    /// ordering on a list stay in memory.
+    #[test]
+    fn eq_and_lang_filters_follow_the_eq_table() {
+        let n = |x: f64| Box::new(QValue::Num(x));
+        let list = QValue::List(vec![QValue::Num(1.0), QValue::Num(2.0)]);
+        assert!(eq_filter(&list).is_some_and(|f| f.contains("||")));
+        assert!(eq_filter(&QValue::Range(n(1.0), n(2.0))).is_some_and(|f| f.contains(">=")));
+        let s = |x: &str| Box::new(QValue::Str(x.into()));
+        assert!(eq_filter(&QValue::Range(s("a"), s("b"))).is_none());
+        assert!(lang_filter(CmpOp::Ne, &list).is_none());
+        assert!(lang_filter(CmpOp::Ne, &QValue::Range(n(1.0), n(2.0))).is_none());
+        assert_eq!(lang_filter(CmpOp::Eq, &list), eq_filter(&list));
+    }
+
+    /// Linked-entity hops and trailing brackets stay in memory, for an
+    /// existence test as for a comparison; a control character in a
+    /// literal is escaped, a space is not (T-3531).
+    #[test]
+    fn hops_and_brackets_stay_in_memory_and_controls_are_escaped() {
+        for q in [
+            "sensor{humidity}==40",
+            "sensor{humidity}",
+            "a[b]==1",
+            "a[b]",
+        ] {
+            assert!(c(q).is_none(), "{q}");
+        }
+        let got = c(r#"a=="x\u0001 y""#).expect("compiles");
+        assert!(got.binds[0].contains(r#""x\u0001 y""#), "{}", got.binds[0]);
+    }
+
+    /// The edges of the subset (T-3912): a bare existence term, `<` and `<=`, a boolean, a
+    /// tab and a carriage return in a string, and the composite values `literal` never renders.
+    #[test]
+    fn existence_ordering_booleans_and_control_characters() {
+        let bound = |q: &str| c(q).map(|got| got.binds[0].clone()).expect(q);
+        assert!(
+            bound("temperature").ends_with(r#"."value""#),
+            "{}",
+            bound("temperature")
+        );
+        assert!(bound("temperature<20").ends_with("? (@ < 20)"));
+        assert!(bound("temperature<=20").ends_with("? (@ <= 20)"));
+        assert!(bound("open==true").ends_with("? (@ == true)"));
+        assert!(
+            bound(r#"a=="x\ty\rz""#).contains(r#""x\ty\rz""#),
+            "{}",
+            bound(r#"a=="x\ty\rz""#)
+        );
+        assert_eq!(literal(&QValue::List(vec![QValue::Num(1.0)])), None);
     }
 }

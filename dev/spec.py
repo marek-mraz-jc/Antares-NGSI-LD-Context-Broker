@@ -18,6 +18,7 @@ Commands:
     python3 dev/spec.py robot     # refresh the robot: field from suite tags
     python3 dev/spec.py status    # counts + per-chapter rollup
     python3 dev/spec.py gaps      # leaves with status not-implemented and no TPs
+    python3 dev/spec.py sizes     # lines of every crate and antares-api module
     python3 dev/spec.py check     # ledger integrity gate (exit 1 on violation):
                                   #   every clause file parses, status is in the
                                   #   enum, partial/staged carry notes, robot
@@ -692,7 +693,12 @@ def robot_recipe_violations():
     run = ROOT / "dev/etsi-run.sh"
     if not run.exists():
         return [f"{run}: the suite runner is missing"]
-    names = re.findall(r'sed -i "s\|\^(\w+) = ', run.read_text(encoding="utf-8"))
+    # Only the overrides the runner always makes: a `|| sed` that applies
+    # when the pipeline set something up (SUITE_CONTEXT, T-3550) has
+    # nothing a bare run could point it at, and its default stays right.
+    names = re.findall(
+        r'^\s*sed -i "s\|\^(\w+) = ', run.read_text(encoding="utf-8"), re.M
+    )
     if not names:
         return [f"{run}: no variables.py overrides to compare a recipe against"]
     out = []
@@ -712,48 +718,52 @@ def robot_recipe_violations():
     return out
 
 
-def architecture_size_violations():
-    """ARCHITECTURE.md sizes every crate and every `antares-api` module so a
-    reader can tell where the weight sits before opening anything. Typed by
-    hand they drift with the code and stop meaning anything: the sql crate was
-    published at 2 900 lines while it held 9 415, and the store crate at half
-    its size, which sends a reader to the wrong file for the biggest change in
-    the workspace. Rounding is the author's business — the check only refuses a
-    number that is no longer the right size."""
-    doc = ROOT / "ARCHITECTURE.md"
-    if not doc.exists():
-        return [f"{doc}: the code map is missing"]
-    out, tolerance = [], 0.10
+ROW = re.compile(r"^\| `([a-z_0-9.-]+)` \|", re.M)
+
+
+def architecture_sizes(root=ROOT):
+    """Lines of every crate's `src/` and of every `antares-api` module, by the
+    name its ARCHITECTURE.md row uses."""
 
     def lines_of(paths):
-        n = 0
-        for f in paths:
-            n += len(f.read_bytes().split(b"\n")) - 1
-        return n
+        return sum(len(f.read_bytes().split(b"\n")) - 1 for f in paths)
 
     sizes = {}
-    for d in sorted((ROOT / "crates").iterdir()):
+    for d in sorted((root / "crates").iterdir()):
         if (d / "src").is_dir():
             sizes[d.name] = lines_of(sorted((d / "src").rglob("*.rs")))
-    for f in sorted((ROOT / "crates/antares-api/src").glob("*.rs")):
+    for f in sorted((root / "crates/antares-api/src").glob("*.rs")):
         sizes[f.name] = lines_of([f])
+    return sizes
 
-    for line in doc.read_text(encoding="utf-8").splitlines():
-        row = re.match(r"\| `([a-z_0-9.-]+)` \| ([\d ]+) \|", line)
-        if not row or row.group(1) not in sizes:
-            continue
-        name, stated = row.group(1), int(row.group(2).replace(" ", ""))
-        actual = sizes[name]
-        if abs(stated - actual) > max(tolerance * actual, 2):
-            out.append(
-                f"ARCHITECTURE.md: sizes {name} at {stated} lines, it holds {actual}"
-            )
-    text = doc.read_text(encoding="utf-8")
-    for name in sorted(sizes):
-        if name.endswith(".rs"):
-            if not re.search(rf"^\| `{re.escape(name)}` \|", text, re.M):
-                out.append(f"ARCHITECTURE.md: the module table has no row for {name}")
-    return out
+
+def architecture_row_violations(root=ROOT):
+    """ARCHITECTURE.md has a row for every crate and every `antares-api` module,
+    so a reader finds what each one owns before opening it. The rows carry no
+    line counts (T-3762): every branch that grew a crate edited the same size
+    row, and two branches of one train conflicted there when their code did
+    not. `python3 dev/spec.py sizes` prints the weights on demand."""
+    doc = root / "ARCHITECTURE.md"
+    if not doc.exists():
+        return [f"{doc}: the code map is missing"]
+    rows = set(ROW.findall(doc.read_text(encoding="utf-8")))
+    return [
+        f"ARCHITECTURE.md: the {'module' if name.endswith('.rs') else 'crate'} table has no row for {name}"
+        for name in sorted(architecture_sizes(root))
+        if name not in rows
+    ]
+
+
+def rounded(n):
+    """A size as `sizes` prints it: exact below 100, then to the ten, the fifty
+    and the hundred."""
+    step = 1 if n < 100 else 10 if n < 1000 else 50 if n < 10000 else 100
+    return f"{(n + step // 2) // step * step:,}".replace(",", " ")
+
+
+def cmd_sizes(root=ROOT):
+    for name, n in architecture_sizes(root).items():
+        print(f"{name} {rounded(n)}")
 
 
 def shared_crate_violations():
@@ -766,7 +776,7 @@ def shared_crate_violations():
     wf = ROOT / ".github/workflows/workspace.yml"
     if not book.exists() or not wf.exists():
         return [f"{book if not book.exists() else wf}: missing"]
-    published = set(re.findall(r"^\| `(antares-[a-z]+)` \|", book.read_text(encoding="utf-8"), re.M))
+    published = set(re.findall(r"^\| `((?:antares|ngsild)-[a-z]+)` \|", book.read_text(encoding="utf-8"), re.M))
     gated = re.search(r"crate: \[([^\]]*)\]", wf.read_text(encoding="utf-8"))
     if not gated:
         return [f"{wf}: no shared-crate matrix to compare the chapter against"]
@@ -1036,7 +1046,7 @@ def cmd_check():
     errors.extend(book_fence_violations())
     errors.extend(suite_count_violations())
     errors.extend(robot_recipe_violations())
-    errors.extend(architecture_size_violations())
+    errors.extend(architecture_row_violations())
     errors.extend(shared_crate_violations())
     errors.extend(workflow_pin_violations())
     errors.extend(wrapped_literal_violations())
@@ -1058,4 +1068,5 @@ if __name__ == "__main__":
         "gaps": cmd_gaps,
         "check": cmd_check,
         "statements": cmd_statements,
+        "sizes": cmd_sizes,
     }.get(cmd, cmd_status)()

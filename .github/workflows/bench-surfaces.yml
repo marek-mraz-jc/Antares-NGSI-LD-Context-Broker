@@ -1,0 +1,68 @@
+name: bench-surfaces
+
+# The surface crates' benches against their ADR-0027 section 6 budget rows
+# (surfaces-test-plan section 10, T-3523): dev/perf/bench-surfaces.sh runs
+# each bench and writes one row per budget into the job summary.
+#
+#   nightly  the view, OData, MCP, $filter and $metadata benches
+#   weekly   the same plus the WebSocket fan-out and resident memory
+#
+# Report-only on these shared runners: a row past its budget is reported
+# `over` and fails nothing until T-3467's noise profile exists (ten
+# same-commit runs on the pinned perf-weekly instance type,
+# docs/src/performance.md); then the run sets ENFORCE. A bench that does
+# not run fails the job either way. The end-to-end rows (`view`, `odata`,
+# `mcp` beside `query`) are dev/perf/shapes.sh with BIN_SURFACES in
+# perf-weekly.yml.
+on:
+  schedule:
+    - cron: "41 1 * * *"
+    - cron: "41 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      weekly:
+        description: also run the WebSocket fan-out bench
+        type: boolean
+        default: false
+
+concurrency:
+  group: bench-surfaces
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench-surfaces:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-surfaces
+      - name: The benches against their budget rows
+        env:
+          OUT: results/bench-surfaces
+          WEEKLY: ${{ (github.event.schedule == '41 2 * * 0' || inputs.weekly) && '1' || '' }}
+        run: dev/perf/bench-surfaces.sh
+      - name: The table into the summary
+        if: always()
+        run: cat results/bench-surfaces/bench-surfaces.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: bench-surfaces
+          path: results/bench-surfaces/
+          retention-days: 30
+      - name: File an issue on a scheduled failure
+        if: failure() && github.event_name == 'schedule'
+        uses: ./.github/actions/failure-issue
+        with:
+          title: bench-surfaces went red
+          body: A surface bench did not run; the logs are in the bench-surfaces artifact.
+          log-file: results/bench-surfaces/bench-surfaces.md

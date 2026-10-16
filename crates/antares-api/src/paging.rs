@@ -120,6 +120,16 @@ pub fn paginate_accept(
     paginate_impl(st, params, matches, path, accept, None)
 }
 
+/// The media type a page Link names: "exactly equal to the media type
+/// resulting from the original request" (6.3.10, TS 104 176 6.4.7.3).
+pub(crate) fn link_media_type(accept: Accept) -> &'static str {
+    match accept {
+        Accept::LdJson => "application/ld+json",
+        Accept::Json => "application/json",
+        Accept::GeoJson => "application/geo+json",
+    }
+}
+
 fn paginate_impl(
     st: &AppState,
     params: &HashMap<String, String>,
@@ -136,9 +146,8 @@ fn paginate_impl(
     };
     let mut links = Vec::new();
     // csource resources: the suite string-compares links against
-    // `?other…&limit=N&offset=M` order with an unconditional ld+json type
-    // suffix (037_11, 041_03); entity lists keep sorted params + accept-based
-    // suffix (031_02).
+    // `?other…&limit=N&offset=M` order (037_11, 041_03); entity lists keep
+    // sorted params (031_02). The type suffix follows Accept for both.
     let csource_style = path.contains("csource");
     let mut mk = |off: usize, rel: &str| {
         let mut qp: Vec<String>;
@@ -165,16 +174,14 @@ fn paginate_impl(
         // 6.3.10: "At least, the type Link Target Attribute shall be included
         // ... and its value shall be exactly equal to the media type resulting
         // from the original request" — for EVERY media type, not just ld+json.
-        let ty = match accept {
-            _ if csource_style => ";type=\"application/ld+json\"",
-            Accept::LdJson => ";type=\"application/ld+json\"",
-            Accept::Json => ";type=\"application/json\"",
-            Accept::GeoJson => ";type=\"application/geo+json\"",
-        };
-        links.push(format!("<{path}?{}>; rel=\"{rel}\"{ty}", qp.join("&")));
+        let ty = link_media_type(accept);
+        links.push(format!(
+            "<{path}?{}>; rel=\"{rel}\";type=\"{ty}\"",
+            qp.join("&")
+        ));
     };
-    if offset + limit < total && limit > 0 {
-        mk(offset + limit, "next");
+    if offset.saturating_add(limit) < total && limit > 0 {
+        mk(offset.saturating_add(limit), "next");
     }
     if offset > 0 {
         mk(offset.saturating_sub(limit.max(1)), "prev");
@@ -326,7 +333,7 @@ pub fn order_entities(
                 let iri = ctx.expand_key(head);
                 let inst = doc.get(&iri).and_then(Value::as_array)?.first()?;
                 let mut cur = inst;
-                for seg in &path[1..] {
+                for seg in path.iter().skip(1) {
                     match seg.as_str() {
                         "createdAt" | "modifiedAt" | "observedAt" | "datasetId" | "unitCode" => {
                             cur = cur.get(seg.as_str())?;
@@ -383,8 +390,8 @@ pub fn order_entities(
     fn is_date(s: &str) -> bool {
         let b = s.as_bytes();
         b.len() == 10
-            && b[4] == b'-'
-            && b[7] == b'-'
+            && b.get(4) == Some(&b'-')
+            && b.get(7) == Some(&b'-')
             && b.iter()
                 .enumerate()
                 .all(|(i, c)| matches!(i, 4 | 7) || c.is_ascii_digit())
@@ -392,13 +399,15 @@ pub fn order_entities(
     /// 4.6.3 Time: hh:mm:ss[.f*]Z.
     fn is_time(s: &str) -> bool {
         let b = s.as_bytes();
+        let digits =
+            |r: std::ops::Range<usize>| b.get(r).is_some_and(|d| d.iter().all(u8::is_ascii_digit));
         b.len() >= 9
-            && b[b.len() - 1] == b'Z'
-            && b[2] == b':'
-            && b[5] == b':'
-            && b[..2].iter().all(u8::is_ascii_digit)
-            && b[3..5].iter().all(u8::is_ascii_digit)
-            && b[6..8].iter().all(u8::is_ascii_digit)
+            && b.last() == Some(&b'Z')
+            && b.get(2) == Some(&b':')
+            && b.get(5) == Some(&b':')
+            && digits(0..2)
+            && digits(3..5)
+            && digits(6..8)
     }
     fn cmp_vals(
         a: &Option<Value>,
@@ -545,7 +554,7 @@ pub(crate) fn query_doc_params(
                     Some(Value::String(s)) => {
                         antares_model::EntityId::new(s)?;
                         ids.push(s.clone());
-                        with_id += 1;
+                        with_id = with_id.saturating_add(1);
                     }
                     Some(Value::Array(a)) => {
                         for i in a {
@@ -555,7 +564,7 @@ pub(crate) fn query_doc_params(
                             antares_model::EntityId::new(s)?;
                             ids.push(s.to_owned());
                         }
-                        with_id += 1;
+                        with_id = with_id.saturating_add(1);
                     }
                     Some(_) => {
                         return Err(bad(
@@ -567,7 +576,7 @@ pub(crate) fn query_doc_params(
                     None => {}
                     Some(Value::String(s)) => {
                         pats.push(s.clone());
-                        with_pat += 1;
+                        with_pat = with_pat.saturating_add(1);
                     }
                     Some(_) => {
                         return Err(bad(
@@ -614,6 +623,9 @@ pub(crate) fn query_doc_params(
         match q.get(k) {
             None => {}
             Some(Value::String(s)) => {
+                if k == "scopeQ" {
+                    antares_ql::scope::check_scope_q(s)?;
+                }
                 vp.insert(k.into(), capped(k, s.clone())?);
             }
             Some(_) => return Err(bad(format!("Query {k} must be a string (5.2.23)"))),
@@ -895,12 +907,20 @@ pub(crate) fn temporal_q_params(
             Some(_) => return Err(bad(format!("temporalQ {k} must be a string (5.2.21)"))),
         }
     }
-    if let Some(n) = tq.get("lastN") {
-        let v = n
-            .as_u64()
-            .filter(|v| *v >= 1)
-            .ok_or_else(|| bad("temporalQ lastN must be a positive integer (5.2.21)".into()))?;
-        out.insert("lastN".into(), v.to_string());
+    // TS 104 175 5.2.5: firstN, lastN and offsetN are TemporalParams
+    // scoped within temporalQ; the query-string parser judges the pair
+    for (k, min, what) in [
+        ("lastN", 1, "a positive"),
+        ("firstN", 1, "a positive"),
+        ("offsetN", 0, "a non-negative"),
+    ] {
+        if let Some(n) = tq.get(k) {
+            let v = n
+                .as_u64()
+                .filter(|v| *v >= min)
+                .ok_or_else(|| bad(format!("temporalQ {k} must be {what} integer (5.2.21)")))?;
+            out.insert(k.into(), v.to_string());
+        }
     }
     match tq.get("aggrMethods") {
         None => {}

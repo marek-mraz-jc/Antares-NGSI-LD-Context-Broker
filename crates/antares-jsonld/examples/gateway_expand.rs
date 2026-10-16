@@ -7,8 +7,8 @@
 //!
 //!     cargo run -p antares-jsonld --example gateway_expand
 
-use antares_jsonld::loader::{client_builder, EgressPolicy, Loader};
-use antares_jsonld::{expand_entity, ExpandOpts};
+use ngsild_jsonld::loader::{client_builder, EgressPolicy, Loader};
+use ngsild_jsonld::{expand_entity, ExpandOpts};
 use serde_json::{json, Value};
 
 #[tokio::main(flavor = "current_thread")]

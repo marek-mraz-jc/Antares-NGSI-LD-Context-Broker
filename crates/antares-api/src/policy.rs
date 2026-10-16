@@ -21,15 +21,25 @@ use antares_ql::geo::GeoQuery;
 use antares_ql::QNode;
 use axum::http::HeaderMap;
 use serde_json::Value;
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::LazyLock;
+
+/// The `@context` [`Filter::project`] reads rule conditions with.
+static CORE_CONTEXT: LazyLock<antares_jsonld::Context> =
+    LazyLock::new(antares_jsonld::core_context);
 use std::time::Duration;
 
 /// What [`PolicyEngine::decide`] hands back. Boxed because an engine that
 /// asks a policy server has to await, and the trait must stay object-safe:
 /// the broker holds one `Arc<dyn PolicyEngine>` chosen at startup.
 pub type DecisionFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>>;
+
+/// What [`PolicyEngine::decide_each`] hands back: one [`Decision`] per
+/// Operation it was given, in the same order.
+pub type DecisionsFuture<'a> = Pin<Box<dyn Future<Output = Vec<Decision>> + Send + 'a>>;
 
 /// How long an engine has to answer before the broker stops waiting and
 /// denies. Deployment knob (`ANTARES_POLICY_TIMEOUT_MS`), read once at
@@ -38,13 +48,16 @@ pub type DecisionFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>
 /// either way — failing closed at 250 ms is the difference between a 403
 /// and a broker that stops accepting.
 pub static TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
-    let ms = std::env::var("ANTARES_POLICY_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n: &u64| *n > 0)
-        .unwrap_or(250);
-    Duration::from_millis(ms)
+    let env = std::env::var("ANTARES_POLICY_TIMEOUT_MS").ok();
+    Duration::from_millis(timeout_ms(env.as_deref()))
 });
+
+/// `ANTARES_POLICY_TIMEOUT_MS` in milliseconds: a positive integer, else 250.
+fn timeout_ms(env: Option<&str>) -> u64 {
+    env.and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(250)
+}
 
 /// The reasons the seam denies on its own, rather than on an engine's word.
 /// Fixed strings: they reach the client in a ProblemDetails `detail`, and
@@ -65,7 +78,28 @@ pub const WHOLE_TENANT: [&str; 4] = ["5.6.21", "5.16.1", "5.16.2", "5.16.7"];
 /// would perform in full an operation the engine believed it had narrowed.
 /// That is the one direction the seam may not fail in, so those clauses
 /// answer a narrowing as a deny ([`resolve`]).
-pub const FILTERABLE: [&str; 6] = ["5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.14.4", "5.14.5"];
+/// Discovery (5.7.5 to 5.7.10) is among them: ADR-0023 rule 5 computes it
+/// from the Entities the narrowing selects.
+/// Query Subscriptions (5.8.4, 5.11.5) and Query Registrations (5.10.2)
+/// narrow the list ([`RECORD_LISTS`]).
+pub const FILTERABLE: [&str; 15] = [
+    "5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.7.5", "5.7.6", "5.7.7", "5.7.8", "5.7.9", "5.7.10",
+    "5.14.4", "5.14.5", "5.8.4", "5.11.5", "5.10.2",
+];
+
+/// The FILTERABLE clauses that list Subscriptions or Registrations. A
+/// narrowing there selects which documents are listed, counted and paged,
+/// and projects nothing: those are the client's own 5.2.12 and 5.2.9
+/// records, not Entities with Attributes to drop, so a [`Filter`] that
+/// projects is a deny there ([`resolve`], T-3673).
+pub const RECORD_LISTS: [&str; 3] = ["5.8.4", "5.11.5", "5.10.2"];
+
+/// List and Serve @context (5.13.3, 5.13.4). A stored `@context` may define
+/// a term for an Attribute the caller may not see, so a narrowing there,
+/// whatever it holds, says the caller sees fewer names than the tenant
+/// holds: the list is the core `@context` alone and a stored one is not
+/// found (ADR-0023 rule 5, T-4009). [`resolve`] passes it through.
+pub const NAME_READS: [&str; 2] = ["5.13.3", "5.13.4"];
 
 /// Who is asking. The headers are the ones a deployment names for the
 /// seam to carry, copied verbatim and never interpreted: the broker does
@@ -76,6 +110,35 @@ pub const FILTERABLE: [&str; 6] = ["5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.14.4",
 pub struct Subject {
     pub tenant: antares_model::TenantId,
     pub headers: Vec<(String, String)>,
+}
+
+/// The name of the reserved pair in [`Subject::headers`] that says which view
+/// the request came through (ADR-0020 amendment, T-3702). `@` is no
+/// header-name character (RFC 9110 `tchar`), so no request can carry it:
+/// only [`through_view`] puts it there.
+pub const VIEW_PAIR: &str = "@view";
+
+tokio::task_local! {
+    /// The view the in-process request running in this task came through.
+    static VIEW: std::sync::Arc<str>;
+}
+
+/// Runs `f` as a request through the view `id`: every [`Subject`] built in
+/// it carries the [`VIEW_PAIR`]. The view surfaces' operation layer is the
+/// one caller; a request off the socket never runs inside it.
+pub async fn through_view<F: Future>(id: &str, f: F) -> F::Output {
+    VIEW.scope(std::sync::Arc::from(id), f).await
+}
+
+impl Subject {
+    /// The view the request came through, if it came through one.
+    #[must_use]
+    pub fn view(&self) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(name, _)| name == VIEW_PAIR)
+            .map(|(_, id)| id.as_str())
+    }
 }
 
 impl std::fmt::Debug for Subject {
@@ -107,6 +170,58 @@ pub struct Operation<'a> {
     pub geo: Option<&'a GeoQuery>,
     /// The request body of a write, expanded. `None` for a read.
     pub body: Option<&'a Value>,
+    /// What a write by id lands on, as stored (ADR-0023 rule 7): `None`
+    /// for a read, a create, or an id the tenant does not hold.
+    pub stored: Option<&'a StoredImage>,
+}
+
+/// The stored Entity a write by id changes, as an engine judges it
+/// (ADR-0023 rule 7, operation matrix item 2, T-3483): what the Entity is,
+/// not what the request says it is. Names only, expanded; never a value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredImage {
+    pub types: Vec<String>,
+    pub scope: Vec<String>,
+    pub attribute_names: Vec<String>,
+}
+
+impl StoredImage {
+    /// The image of one stored, expanded Entity document.
+    pub fn of(doc: &Value) -> Self {
+        let strings = |v: Option<&Value>| match v {
+            Some(Value::String(s)) => vec![s.clone()],
+            Some(Value::Array(a)) => a
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        };
+        Self {
+            types: strings(doc.get("type")),
+            scope: strings(doc.get("scope")),
+            attribute_names: doc
+                .as_object()
+                .map(|o| {
+                    o.keys()
+                        .filter(|k| {
+                            !k.starts_with("__")
+                                && !k.starts_with('@')
+                                && !matches!(
+                                    k.as_str(),
+                                    "id" | "type"
+                                        | "scope"
+                                        | "createdAt"
+                                        | "modifiedAt"
+                                        | "deletedAt"
+                                )
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// Shape and counts, never the payload: an `Operation` carries the
@@ -122,6 +237,7 @@ impl std::fmt::Debug for Operation<'_> {
             .field("scope_q", &self.scope_q.is_some())
             .field("geo", &self.geo.is_some())
             .field("body", &self.body.is_some())
+            .field("stored", &self.stored.is_some())
             .finish()
     }
 }
@@ -140,12 +256,14 @@ impl Operation<'_> {
             scope_q: None,
             geo: None,
             body: None,
+            stored: None,
         }
     }
 }
 
-/// What an engine may answer. There is no third state: an operation is
-/// allowed, refused, or allowed over less than it asked for.
+/// What an engine may answer: an operation is allowed, refused, allowed
+/// over less than it asked for, or allowed on a condition the stored Entity
+/// has to meet.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
     Allow,
@@ -156,26 +274,422 @@ pub enum Decision {
     /// Allowed over less. The caller cannot tell a hidden entity from an
     /// absent one.
     Filter(Filter),
+    /// Allowed only if the stored Entity the write lands on is one the
+    /// filter selects (gap G12): its `q`, `scopeQ`, areas and the types and
+    /// conditions of its `rules`, judged on stored values, which the
+    /// [`Operation`] does not carry. The store judges the document it is
+    /// about to change, inside the write's own read-modify-write, so a
+    /// concurrent write between this answer and the commit cannot carry the
+    /// write onto an Entity the filter no longer selects. An Entity it does
+    /// not select answers as an absent one. Honoured on [`WRITE_BY_ID`], with
+    /// a filter that selects and projects nothing; anywhere else a deny
+    /// ([`resolve`]).
+    AllowIf(Filter),
 }
 
-/// How much less. Every member narrows and none widens: the `q` and
-/// `scopeQ` are conjoined with the caller's own, `pick` keeps a subset of
+/// The writes by id a [`Decision::AllowIf`] can condition: each changes or
+/// deletes Entities that are already stored, by id, and judges each of them
+/// inside its store operation. A create has no stored Entity to judge; Batch
+/// Upsert updates the members its condition selects and creates none of the
+/// conditioned ones (T-3668). The temporal writes 5.6.12 to 5.6.15 judge the
+/// evolution's latest instances (`Condition::pre_evolution`); 5.6.16 is
+/// not one: the temporal seam has no delete that reads the document first.
+pub const WRITE_BY_ID: [&str; 16] = [
+    "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.17", "5.6.18", "5.6.19", "5.6.8", "5.6.9",
+    "5.6.10", "5.6.20", "5.6.12", "5.6.13", "5.6.14", "5.6.15",
+];
+
+/// Why a write conditioned on its stored Entity is refused rather than
+/// forwarded: a Context Source's copy is not in this store, so nothing here
+/// can judge it.
+pub const CONDITION_NOT_FORWARDED: &str =
+    "a write conditioned on the stored Entity is not forwarded to a Context Source";
+
+/// How much less. Every member narrows and none widens: the `q`, `scopeQ`
+/// and `geo_q` are conjoined with the caller's own, `pick` keeps a subset of
 /// the members, `omit` removes some.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Filter {
     /// Conjoined into the query the store runs, on the AST — never on the
     /// query string, where the 4.9 precedence of `;` against `|` would have
-    /// to be re-derived by whoever writes the rule.
-    pub q: Option<QNode>,
+    /// to be re-derived by whoever writes the rule. Boxed, like `geo_q`: a
+    /// parsed query is half the size of the struct, and every [`Decision`]
+    /// and [`NotifyDecision`] would carry it inline.
+    pub q: Option<Box<QNode>>,
     /// Conjoined the same way with the request's own `scopeQ` (4.18).
     pub scope_q: Option<String>,
+    /// An area the Entity must lie in (4.10), held beside the request's own
+    /// geoquery and never in its place: 7.2.5 lets a request carry one, so
+    /// the store query takes both and every one must hold (ADR-0023 rule 1).
+    /// A [`GeoQuery`] is only built by `GeoQuery::from_params`, which bounds
+    /// it like a request's. Boxed: a parsed geometry is large, and every
+    /// [`Decision`] would carry its size.
+    pub geo_q: Option<Box<GeoQuery>>,
+    /// Further areas, every one of which must hold as well: a view and an
+    /// engine that both narrow by area compose into `geo_q` and these
+    /// (ADR-0023 rule 1). An engine with one area leaves this empty; read
+    /// them all through [`Filter::areas`].
+    pub geo_also: Vec<GeoQuery>,
     /// Members removed from every document served.
     pub omit: Vec<String>,
     /// If non-empty, the only members served beside the document frame.
     pub pick: Vec<String>,
+    /// Attributes allowed per rule (ADR-0023 rule 11, gap G4): when
+    /// non-empty, an Entity is served only if at least one [`Rule`] holds
+    /// for it, and it keeps the union of the `attributes` of the rules that
+    /// hold, nothing else beside its frame. An Entity no rule holds for is
+    /// left out of the answer. Applied to every document the answer
+    /// carries, joined targets and notified Entities included, each by its
+    /// own rules. It intersects with `pick`: both narrow.
+    pub rules: Vec<Rule>,
+    /// Attributes removed per Entity type: an Entity loses every Attribute
+    /// any of its types omits.
+    pub omit_by_type: BTreeMap<String, Vec<String>>,
     /// Answer [`RESTRICTED_HEADER`]`: true`, so a client can know the
     /// answer was narrowed. Narrowing is otherwise silent.
     pub restricted: bool,
+    /// The engine's advisory, sent as `NGSILD-Warning` (TS 104 176 6.3.17,
+    /// gap G8): e.g. the Entity types a filter on an Attribute the caller
+    /// may not filter on left out, so a developer can tell that refusal
+    /// from an empty answer. The text is the engine's, never an echo of the
+    /// request, and names only what the caller may already see.
+    pub warning: Option<Warning>,
+    /// Windows of `observedAt` the instances of a temporal read (5.7.3,
+    /// 5.7.4) must fall into, every one of them (gap G6): the request's own
+    /// 4.11 window is clamped to them before the store runs, so the store
+    /// fetches no instance outside them. A window the request does not reach
+    /// answers nothing, never a refusal that tells where the grant ends. A
+    /// slice, not a `Vec`: every [`Decision`] carries a `Filter`'s size.
+    pub temporal: Box<[Window]>,
+}
+
+/// A half-open interval `[from, to)` of `observedAt`; an open end is the
+/// beginning or the end of time (gap G6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Window {
+    /// The earliest instant admitted.
+    pub from: Option<TimeBound>,
+    /// The first instant no longer admitted.
+    pub to: Option<TimeBound>,
+}
+
+/// One end of a [`Window`]: a fixed instant, or a duration before the
+/// moment the request is decided, so "the last 24 hours" slides with now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeBound {
+    /// This instant.
+    At(chrono::DateTime<chrono::Utc>),
+    /// This long before now.
+    Ago(chrono::Duration),
+}
+
+impl TimeBound {
+    fn at(self, now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        match self {
+            Self::At(t) => t,
+            Self::Ago(d) => now
+                .checked_sub_signed(d)
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+        }
+    }
+
+    /// The bound at `now` in milliseconds, the precision 4.11 accepts: a
+    /// start (`up`) rounds up and an end down, so rounding only narrows.
+    fn render(self, now: chrono::DateTime<chrono::Utc>, up: bool) -> String {
+        let t = self.at(now);
+        let sub = i64::from(t.timestamp_subsec_nanos() % 1_000_000);
+        let t = if up && sub > 0 {
+            t.checked_add_signed(chrono::Duration::nanoseconds(
+                1_000_000_i64.saturating_sub(sub),
+            ))
+            .unwrap_or(t)
+        } else {
+            t
+        };
+        t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+}
+
+impl Window {
+    /// Whether an instance observed at `observed_at` falls inside, the
+    /// bounds resolved against `now`; 4.11's half-open comparison.
+    #[must_use]
+    pub fn admits(&self, observed_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let t = antares_model::dt_key(observed_at);
+        self.from
+            .is_none_or(|b| t >= antares_model::dt_key(&b.render(now, true)))
+            && self
+                .to
+                .is_none_or(|b| t < antares_model::dt_key(&b.render(now, false)))
+    }
+}
+
+/// The text of a [`Filter::warning`]: printable ASCII on one line, at most
+/// [`Warning::MAX_LEN`] bytes, no `"` or `\`, so it travels as one quoted
+/// `warn-text` of an `NGSILD-Warning` value. Composed filters keep each
+/// side's text, at most [`Warning::MAX_TEXTS`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning(Box<[String]>); // a slice: every Decision carries a Filter's size
+
+impl Warning {
+    /// Bytes in one text.
+    pub const MAX_LEN: usize = 256;
+    /// Texts a composed filter keeps.
+    pub const MAX_TEXTS: usize = 4;
+
+    /// One advisory.
+    ///
+    /// # Errors
+    /// When `text` is empty, longer than [`Warning::MAX_LEN`], or holds a
+    /// character outside printable ASCII (a line break, a control
+    /// character), a `"` or a `\\`: it could not travel as one header line.
+    pub fn new(text: &str) -> Result<Self, String> {
+        if text.is_empty() || text.len() > Self::MAX_LEN {
+            return Err(format!(
+                "a policy warning holds 1 to {} bytes",
+                Self::MAX_LEN
+            ));
+        }
+        if !text
+            .bytes()
+            .all(|b| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\')
+        {
+            return Err(
+                "a policy warning is printable ASCII on one line, without '\"' or '\\\\'".into(),
+            );
+        }
+        Ok(Self(Box::new([text.to_owned()])))
+    }
+
+    /// The texts, in the order the filters were composed.
+    #[must_use]
+    pub fn texts(&self) -> &[String] {
+        &self.0
+    }
+
+    /// `a` and `b` as one: each text once, `a`'s first.
+    #[must_use]
+    pub fn join(a: Option<&Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                let mut texts = a.0.to_vec();
+                for t in b.0 {
+                    if !texts.contains(&t) {
+                        texts.push(t);
+                    }
+                }
+                texts.truncate(Self::MAX_TEXTS);
+                Some(Self(texts.into()))
+            }
+            (Some(a), None) => Some(a.clone()),
+            (None, b) => b,
+        }
+    }
+}
+
+/// One allowlist of a [`Filter`] (ADR-0023 rule 11): the Entities of
+/// `types` for which the condition holds show `attributes`. The condition
+/// (`q`, `scope_q`, `geo_q`, each optional) is the policy's: it is read on
+/// the stored Entity, which may carry Attributes the caller cannot see.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Rule {
+    /// Type names, at least one; a rule naming none holds for nothing.
+    pub types: Vec<String>,
+    /// On the Entity's own members. A linked path (4.9
+    /// `LinkedEntityRelation`) never holds: the visible set of one Entity
+    /// must not depend on another Entity the caller may not read.
+    pub q: Option<Box<QNode>>,
+    pub scope_q: Option<String>,
+    pub geo_q: Option<Box<GeoQuery>>,
+    /// Further areas the Entity must lie in, as [`Filter::geo_also`].
+    pub geo_also: Vec<GeoQuery>,
+    /// Entity ids the rule holds for (gap G2). With `id_patterns`, an
+    /// Entity is selected when its id is one of these or matches one of
+    /// them; both empty select every id.
+    pub ids: Vec<String>,
+    /// Regular expressions an Entity id may match instead, each anchored
+    /// at both ends. One that does not compile, or compiles past
+    /// `antares_ql::regex`'s bound, matches nothing (fail closed).
+    pub id_patterns: Vec<String>,
+    /// The Attributes an Entity this rule holds for shows.
+    pub attributes: Vec<String>,
+    /// The rule shows every Attribute, and `attributes` is not read
+    /// (ADR-0023 rule 11, amended by T-3637): an engine's grant over the
+    /// whole Entity. A view never sets it.
+    pub every_attribute: bool,
+    /// Windows of `observedAt` (gap G6): in a temporal read (5.7.3, 5.7.4)
+    /// an instance of these `attributes` is shown through this rule only if
+    /// it falls into every one. A current-state read shows what the rule
+    /// shows, as the gateway's grant windows did.
+    pub temporal: Vec<Window>,
+}
+
+impl Rule {
+    /// Every area the Entity must lie in: `geo_q` and `geo_also`.
+    pub fn areas(&self) -> impl Iterator<Item = &GeoQuery> {
+        self.geo_q.as_deref().into_iter().chain(&self.geo_also)
+    }
+
+    /// Whether the rule names `doc` by one of its types and, when it
+    /// narrows ids, by its id. Neither changes over an Entity's history,
+    /// so a temporal instance is selected the same way (unlike the
+    /// condition, [`Rule::is_conditional`]).
+    pub fn selects(&self, doc: &Value) -> bool {
+        // `entity_types` read in place: this runs per rule per Entity of a
+        // page, and the list it would allocate is read once.
+        let named = |t: &str| self.types.iter().any(|r| r == t);
+        let typed = match doc.get("type") {
+            Some(Value::String(t)) => named(t),
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).any(named),
+            _ => false,
+        };
+        typed
+            && match doc.get("id").and_then(Value::as_str) {
+                Some(id) => self.selects_id(id),
+                None => self.ids.is_empty() && self.id_patterns.is_empty(),
+            }
+    }
+
+    /// Whether the rule's `ids` and `id_patterns` select `id`.
+    pub fn selects_id(&self, id: &str) -> bool {
+        (self.ids.is_empty() && self.id_patterns.is_empty())
+            || self.ids.iter().any(|i| i == id)
+            || self.id_patterns.iter().any(|p| {
+                antares_ql::regex::compile(&format!("^(?:{p})$")).is_ok_and(|re| re.is_match(id))
+            })
+    }
+
+    /// Whether the rule has a condition beside its types.
+    pub fn is_conditional(&self) -> bool {
+        self.q.is_some() || self.scope_q.is_some() || self.areas().next().is_some()
+    }
+
+    /// Whether the rule holds for exactly the Entities of its types: no
+    /// condition, no ids, no id patterns (what [`Self::holds`] reads beside
+    /// the types).
+    pub fn admits_by_type_alone(&self) -> bool {
+        !self.is_conditional() && self.ids.is_empty() && self.id_patterns.is_empty()
+    }
+
+    /// Whether the rule holds for `doc`, an Entity in the form `ctx`
+    /// expands names to (the broker's internal form: expanded keys, each
+    /// Attribute an array of instances).
+    pub fn holds(&self, doc: &Value, ctx: &antares_jsonld::Context) -> bool {
+        self.selects(doc)
+            && self
+                .scope_q
+                .as_deref()
+                .is_none_or(|s| antares_ql::scope::scope_matches(s, doc))
+            && self.areas().all(|g| g.matches(doc, ctx))
+            && self.q.as_deref().is_none_or(|q| {
+                !q.has_linked_paths() && antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
+            })
+    }
+
+    /// The Attributes the condition reads, expanded through `ctx`: the head
+    /// of every `q` term and the geoquery's GeoProperty.
+    pub fn reads(&self, ctx: &antares_jsonld::Context) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .q
+            .as_deref()
+            .map(|q| {
+                q.attribute_paths()
+                    .into_iter()
+                    .filter_map(|p| p.split(['.', '[', '{']).next())
+                    .map(|h| ctx.expand_key(h))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for g in self.areas() {
+            out.push(if g.geoproperty.is_empty() {
+                antares_ql::geo::LOCATION_IRI.to_owned()
+            } else {
+                ctx.expand_key(&g.geoproperty)
+            });
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// ADR-0023 rule 11 disclosure: the Attributes the condition reads that
+    /// the rule does not show. Seeing the rule's Attributes tells the
+    /// caller the condition held, so these are what the visible set
+    /// discloses; the view loader reports them.
+    pub fn discloses(&self, ctx: &antares_jsonld::Context) -> Vec<String> {
+        if self.every_attribute {
+            return Vec::new();
+        }
+        self.reads(ctx)
+            .into_iter()
+            .filter(|r| !self.attributes.iter().any(|a| ctx.expand_key(a) == *r))
+            .collect()
+    }
+}
+
+/// The answer of a broker without an engine: a [`Filter`] that narrows
+/// nothing, one shared instance so asking costs no allocation.
+pub fn unnarrowed() -> std::sync::Arc<Filter> {
+    static NOTHING: LazyLock<std::sync::Arc<Filter>> =
+        LazyLock::new(|| std::sync::Arc::new(Filter::default()));
+    NOTHING.clone()
+}
+
+/// What a [`Filter`]'s rules let one Entity show: `only` (when set) is the
+/// union of the matched rules' Attributes, `omitted` what its types omit.
+#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// The names borrow from the rules that decided them, so judging an Entity
+/// copies no Attribute name (T-3697); [`Shown::into_owned`] and
+/// [`Shown::map_names`] give a set that outlives the rules.
+pub struct Shown<'a> {
+    pub only: Option<std::collections::BTreeSet<Cow<'a, str>>>,
+    pub omitted: std::collections::BTreeSet<Cow<'a, str>>,
+}
+
+impl Shown<'_> {
+    /// Nothing beside the frame: what a projection falls back to for an
+    /// Entity no rule holds for, should one reach it.
+    pub fn nothing() -> Self {
+        Shown {
+            only: Some(Default::default()),
+            omitted: Default::default(),
+        }
+    }
+
+    pub fn allows(&self, k: &str) -> bool {
+        self.only.as_ref().is_none_or(|o| o.contains(k)) && !self.omitted.contains(k)
+    }
+
+    /// The same set with every name mapped, for a document in another form.
+    pub fn map_names(&self, f: impl Fn(&str) -> String) -> Shown<'static> {
+        Shown {
+            only: self
+                .only
+                .as_ref()
+                .map(|o| o.iter().map(|n| Cow::Owned(f(n))).collect()),
+            omitted: self.omitted.iter().map(|n| Cow::Owned(f(n))).collect(),
+        }
+    }
+
+    /// The same set, owning its names.
+    pub fn into_owned(self) -> Shown<'static> {
+        let own = |n: Cow<'_, str>| Cow::Owned(n.into_owned());
+        Shown {
+            only: self.only.map(|o| o.into_iter().map(own).collect()),
+            omitted: self.omitted.into_iter().map(own).collect(),
+        }
+    }
+}
+
+/// The types of an Entity document: its `type` member, a string or an
+/// array of strings (5.2.4), in whatever form the document is in.
+pub fn entity_types(doc: &Value) -> Vec<&str> {
+    match doc.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// What identifies the document rather than describing it: 5.2.4 makes
@@ -184,12 +698,24 @@ pub struct Filter {
 const FRAME: [&str; 3] = ["id", "type", "@context"];
 
 impl Filter {
-    /// Apply `pick`/`omit` to one document by member name. This is the
-    /// reference semantics `run_policy_contract` holds an engine's answer
-    /// against; a served document is projected through the request's own
-    /// 5.5.2 representation instead (`repr::narrow_projection`), where the
-    /// names are expanded against the request `@context` first.
+    /// Every area the Entity must lie in: `geo_q` and `geo_also`.
+    pub fn areas(&self) -> impl Iterator<Item = &GeoQuery> {
+        self.geo_q.as_deref().into_iter().chain(&self.geo_also)
+    }
+
+    /// Apply `pick`/`omit` and the rules to one document by member name.
+    /// This is the reference semantics `run_policy_contract` holds an
+    /// engine's answer against; a served document is projected through the
+    /// request's own 5.5.2 representation instead
+    /// (`repr::narrow_projection`), where the names are expanded against
+    /// the request `@context` first. Rule conditions are read with the core
+    /// `@context`; a document no rule holds for keeps its frame here, while
+    /// the served paths leave it out.
     pub fn project(&self, doc: &mut Value) {
+        let shown = self.has_rules().then(|| {
+            self.shown(doc, &CORE_CONTEXT)
+                .unwrap_or_else(Shown::nothing)
+        });
         let Some(obj) = doc.as_object_mut() else {
             return;
         };
@@ -202,12 +728,205 @@ impl Filter {
             }
             obj.remove(name);
         }
+        if let Some(shown) = shown {
+            obj.retain(|k, _| FRAME.contains(&k.as_str()) || shown.allows(k));
+        }
     }
 
     /// True when the filter would change nothing, which is how an engine
     /// that means "allow" can say so with an empty `Filter`.
     pub fn is_empty(&self) -> bool {
-        self.q.is_none() && self.scope_q.is_none() && self.omit.is_empty() && self.pick.is_empty()
+        self.q.is_none()
+            && self.scope_q.is_none()
+            && self.areas().next().is_none()
+            && self.omit.is_empty()
+            && self.pick.is_empty()
+            && !self.has_rules()
+            && self.temporal.is_empty()
+    }
+
+    /// Whether the filter removes anything from what it selects: a
+    /// projection, a per-type omit, a rule's Attribute list or a temporal
+    /// window. A write condition ([`Decision::AllowIf`]) may not: the write
+    /// is performed whole or not at all.
+    pub fn projects(&self) -> bool {
+        !self.pick.is_empty()
+            || !self.omit.is_empty()
+            || !self.omit_by_type.is_empty()
+            || !self.temporal.is_empty()
+            || self
+                .rules
+                .iter()
+                .any(|r| !r.attributes.is_empty() || !r.temporal.is_empty())
+    }
+
+    /// Whether the filter carries rules or per-type omits (ADR-0023 rule 11).
+    pub fn has_rules(&self) -> bool {
+        !self.rules.is_empty() || !self.omit_by_type.is_empty()
+    }
+
+    /// Whether a rule holds for `doc` (every document without rules): what
+    /// [`Self::shown`] answers `Some` for, without building the set.
+    pub fn admits(&self, doc: &Value, ctx: &antares_jsonld::Context) -> bool {
+        self.rules.is_empty() || self.rules.iter().any(|r| r.holds(doc, ctx))
+    }
+
+    /// ADR-0023 rule 11: what `doc` may show, or `None` when `rules` is
+    /// non-empty and none holds for it (the Entity is out). An Entity sees
+    /// the union of the Attributes of the rules that hold for it, less what
+    /// any of its types omits. Names compare as written: the caller brings
+    /// rules and document into one form first (`repr::type_rules` expands
+    /// both), and `ctx` is the one the conditions' names expand through.
+    pub fn shown(&self, doc: &Value, ctx: &antares_jsonld::Context) -> Option<Shown<'_>> {
+        let only = if self.rules.is_empty() {
+            None
+        } else {
+            let mut held = self.rules.iter().filter(|r| r.holds(doc, ctx)).peekable();
+            held.peek()?;
+            let held: Vec<&Rule> = held.collect();
+            if held.iter().any(|r| r.every_attribute) {
+                None
+            } else {
+                Some(
+                    held.iter()
+                        .flat_map(|r| r.attributes.iter().map(|a| Cow::Borrowed(a.as_str())))
+                        .collect(),
+                )
+            }
+        };
+        if self.omit_by_type.is_empty() {
+            return Some(Shown {
+                only,
+                omitted: Default::default(),
+            });
+        }
+        let omitted = entity_types(doc)
+            .into_iter()
+            .filter_map(|t| self.omit_by_type.get(t))
+            .flatten()
+            .map(|a| Cow::Borrowed(a.as_str()))
+            .collect();
+        Some(Shown { only, omitted })
+    }
+
+    /// ADR-0023 rule 7 per rule (K22): a write is allowed only when its
+    /// post-image falls whole inside one rule that holds for it and shows
+    /// every Attribute the write names, none of which its types omit. The
+    /// check a view's engine runs before it allows a write.
+    pub fn admits_write(
+        &self,
+        post_image: &Value,
+        written: &[&str],
+        ctx: &antares_jsonld::Context,
+    ) -> bool {
+        let types = entity_types(post_image);
+        let omitted = |w: &str| {
+            types
+                .iter()
+                .filter_map(|t| self.omit_by_type.get(*t))
+                .any(|o| o.iter().any(|a| a == w))
+        };
+        if written.iter().any(|w| omitted(w)) {
+            return false;
+        }
+        self.rules.is_empty()
+            || self.rules.iter().any(|r| {
+                r.holds(post_image, ctx)
+                    && (r.every_attribute
+                        || written.iter().all(|w| r.attributes.iter().any(|a| a == w)))
+            })
+    }
+
+    /// Say the answer was narrowed, and add the engine's warning, when the
+    /// engine asked for either. Narrowing is otherwise silent: a caller
+    /// cannot tell an Entity it may not see from one that is not there.
+    /// `alias` is the warn-agent, this broker's host alias.
+    pub fn mark(&self, alias: &str, headers: &mut HeaderMap) {
+        if self.restricted {
+            headers.insert(
+                RESTRICTED_HEADER,
+                axum::http::HeaderValue::from_static("true"),
+            );
+        }
+        for text in self.warning.iter().flat_map(Warning::texts) {
+            // 199 Miscellaneous warning (RFC 7234 5.5), as the gateway's
+            // dropped-types warning was.
+            let value = crate::federation::warning(199, alias, text);
+            if let Ok(v) = axum::http::HeaderValue::from_str(&value) {
+                headers.append("NGSILD-Warning", v);
+            }
+        }
+    }
+
+    /// The request's temporal parameters with its 4.11 window clamped to
+    /// [`Filter::temporal`], resolved against now (gap G6), for every reader
+    /// after the gate: the store's instance range, the forward, the links.
+    /// `required` is the operation's (5.7.4 demands a window, 5.7.3 does
+    /// not), so a request that lacked one is still refused. The windows are
+    /// on `observedAt`: a request on another timeproperty is answered
+    /// nothing, since the store applies one range on one timeproperty.
+    ///
+    /// # Errors
+    /// The request's own 4.11 window is invalid.
+    pub fn narrow_window(
+        &self,
+        params: &std::collections::HashMap<String, String>,
+        required: bool,
+    ) -> Result<std::collections::HashMap<String, String>, antares_model::NgsiError> {
+        let mut out = params.clone();
+        if self.temporal.is_empty() {
+            return Ok(out);
+        }
+        let asked = crate::temporalq::TemporalQ::from_params(params, required)?;
+        let key = |s: &String| antares_model::dt_key(s);
+        let (mut from, mut to) = match &asked {
+            Some(tq) if tq.timeproperty != "observedAt" => {
+                let epoch = "1970-01-01T00:00:00Z".to_owned();
+                (Some(epoch.clone()), Some(epoch))
+            }
+            Some(tq) => match tq.timerel.as_str() {
+                "before" => (None, Some(tq.time_at.clone())),
+                "after" => (Some(tq.time_at.clone()), None),
+                "between" => (Some(tq.time_at.clone()), tq.end_time_at.clone()),
+                _ => (None, None),
+            },
+            None => (None, None),
+        };
+        let now = chrono::Utc::now();
+        for w in &self.temporal {
+            if let Some(b) = w.from.map(|b| b.render(now, true)) {
+                from = Some(match from {
+                    Some(f) if key(&f) >= key(&b) => f,
+                    _ => b,
+                });
+            }
+            if let Some(b) = w.to.map(|b| b.render(now, false)) {
+                to = Some(match to {
+                    Some(t) if key(&t) <= key(&b) => t,
+                    _ => b,
+                });
+            }
+        }
+        // `between` an instant and itself admits nothing: the answer is
+        // empty, as for a window over a period with no data
+        if let (Some(f), Some(t)) = (&from, &to) {
+            if key(f) >= key(t) {
+                to = Some(f.clone());
+            }
+        }
+        let (timerel, time_at, end) = match (from, to) {
+            (Some(f), Some(t)) => ("between", f, Some(t)),
+            (Some(f), None) => ("after", f, None),
+            (None, Some(t)) => ("before", t, None),
+            (None, None) => return Ok(out),
+        };
+        out.insert("timerel".into(), timerel.into());
+        out.insert("timeAt".into(), time_at);
+        match end {
+            Some(e) => out.insert("endTimeAt".into(), e),
+            None => out.remove("endTimeAt"),
+        };
+        Ok(out)
     }
 
     /// The request's own query parameters, narrowed by this decision.
@@ -226,32 +945,43 @@ impl Filter {
     /// Query — `antares_ql::scope::intersect_scope_q` writes it. Where the
     /// product cannot be written down the seam answers the only way that is
     /// not wider than the engine decided: it refuses.
-    /// Say the answer was narrowed, when the engine asked for it to be
-    /// said. Narrowing is otherwise silent: a caller cannot tell an Entity
-    /// it may not see from one that is not there.
-    pub fn mark_restricted(&self, headers: &mut HeaderMap) {
-        if self.restricted {
-            headers.insert(
-                RESTRICTED_HEADER,
-                axum::http::HeaderValue::from_static("true"),
-            );
-        }
-    }
-
+    ///
+    /// `geo_q` stays out of the parameters: they hold one geoquery (7.2.5)
+    /// and it is the request's. The narrowing's area reaches the store
+    /// query beside it through `repr::narrowing`.
+    ///
+    /// ADR-0023 rule 2: a term of the request's own `q` on an Attribute
+    /// this `pick`/`omit` hides reads as a term on an Attribute the Entity
+    /// does not have (see [`Filter::hide_terms`]). `ctx` is the request's,
+    /// the one its `q` terms expand through.
     pub fn narrow_params(
         &self,
         params: &std::collections::HashMap<String, String>,
+        ctx: &antares_jsonld::Context,
     ) -> Result<std::collections::HashMap<String, String>, Denied> {
         let mut out = params.clone();
-        if let Some(extra) = &self.q {
-            let narrowed = match out.get("q").map(|q| antares_ql::parse_q(q)).transpose() {
-                Ok(Some(own)) => QNode::And(vec![own, extra.clone()]),
-                Ok(None) => extra.clone(),
-                // the request's own `q` is parsed and refused long before a
-                // filter reaches it; an unparsable one here is a caller that
-                // narrowed something it never validated
-                Err(_) => return Err(Denied(ENGINE_FAILED.to_owned())),
-            };
+        // the request's own `q` is parsed and refused long before a filter
+        // reaches it; an unparsable one here is a caller that narrowed
+        // something it never validated
+        let own = match out.get("q").map(|q| antares_ql::parse_q(q)).transpose() {
+            Ok(own) => own.map(|own| self.hide_terms(own, ctx)),
+            Err(_) => return Err(Denied(ENGINE_FAILED.to_owned())),
+        };
+        // threat V23: the policy part is held to its share of the narrowed
+        // caps on its own, so whether it fits never depends on the caller's
+        // `q` (see `antares_ql::parse_narrowed_q`)
+        if self
+            .q
+            .as_deref()
+            .is_some_and(|q| !antares_ql::fits_policy_q(q))
+        {
+            return Err(Denied(ENGINE_FAILED.to_owned()));
+        }
+        let narrowed = match (own, &self.q) {
+            (Some(own), Some(extra)) => Some(QNode::And(vec![own, (**extra).clone()])),
+            (own, extra) => own.or_else(|| extra.as_deref().cloned()),
+        };
+        if let Some(narrowed) = narrowed {
             out.insert("q".to_owned(), narrowed.to_string());
         }
         if let Some(scope) = &self.scope_q {
@@ -263,6 +993,72 @@ impl Filter {
             out.insert("scopeQ".to_owned(), narrowed);
         }
         Ok(out)
+    }
+}
+
+impl Filter {
+    /// Whether this `pick`/`omit` hides the Attribute a q term names as
+    /// `written`, `iri` once expanded. A pick narrows Attributes only: the
+    /// system members it never names stay readable, as in the projection.
+    fn hides(&self, written: &str, iri: &str) -> bool {
+        let named = |names: &[String]| {
+            names
+                .iter()
+                .any(|n| crate::repr::policy_context().expand_key(n) == iri)
+        };
+        named(&self.omit)
+            || (!self.pick.is_empty()
+                && antares_ql::is_non_system_attr(written)
+                && !named(&self.pick))
+    }
+
+    /// ADR-0023 rule 2 (T-3482): a term on an Attribute this narrowing
+    /// hides reads as a term on one the Entity does not have — a
+    /// comparison or `attr` is false, `!attr` is true — so the hidden value
+    /// is never compared, on the store path or in memory. The q grammar
+    /// has no constants, so false is written `a;!a` and true `a|!a`, on
+    /// the hidden name itself: both hold whatever the Entity carries. The
+    /// path's top Attribute decides, so a sub-attribute or a hop through a
+    /// hidden Relationship is as hidden as the Attribute. Per-type rules
+    /// are not read here: their q is read on what the rules show
+    /// (`repr::client_q`).
+    pub fn hide_terms(&self, node: QNode, ctx: &antares_jsonld::Context) -> QNode {
+        if self.omit.is_empty() && self.pick.is_empty() {
+            return node;
+        }
+        let constant = |top: &str, holds: bool| {
+            let is = |negated| QNode::Exists {
+                path: antares_ql::QPath::dotted(vec![top.to_owned()]),
+                negated,
+            };
+            let pair = vec![is(false), is(true)];
+            if holds {
+                QNode::Or(pair)
+            } else {
+                QNode::And(pair)
+            }
+        };
+        let hidden = |path: &antares_ql::QPath| {
+            path.top()
+                .filter(|top| self.hides(top, &ctx.expand_key(top)))
+                .map(str::to_owned)
+        };
+        match node {
+            QNode::And(nodes) => {
+                QNode::And(nodes.into_iter().map(|n| self.hide_terms(n, ctx)).collect())
+            }
+            QNode::Or(nodes) => {
+                QNode::Or(nodes.into_iter().map(|n| self.hide_terms(n, ctx)).collect())
+            }
+            QNode::Cmp { path, op, value } => match hidden(&path) {
+                Some(top) => constant(&top, false),
+                None => QNode::Cmp { path, op, value },
+            },
+            QNode::Exists { path, negated } => match hidden(&path) {
+                Some(top) => constant(&top, negated),
+                None => QNode::Exists { path, negated },
+            },
+        }
     }
 }
 
@@ -311,6 +1107,41 @@ pub trait PolicyEngine: Send + Sync {
     /// operation and before any fan-out (ADR-0014 `on_request`).
     fn decide<'a>(&'a self, subject: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a>;
 
+    /// Fires once per batch (5.6.7 to 5.6.10, 5.6.20) with one Operation
+    /// per member, so a batch is refused member by member and the allowed
+    /// members are applied (207). The answer holds one Decision per
+    /// Operation, in order; an answer of any other length denies the whole
+    /// batch. The default asks [`decide`](Self::decide) once per member; an
+    /// engine that asks a server overrides it to ask once.
+    fn decide_each<'a>(
+        &'a self,
+        subject: &'a Subject,
+        ops: &'a [Operation<'a>],
+    ) -> DecisionsFuture<'a> {
+        Box::pin(async move {
+            let mut out = Vec::with_capacity(ops.len());
+            for op in ops {
+                out.push(self.decide(subject, op).await);
+            }
+            out
+        })
+    }
+
+    /// The probe a surface lists its operations by (MCP D-3, T-3784): one
+    /// Operation per clause, naming nothing, and each answer says whether
+    /// some request of that clause could be allowed for `subject`, never
+    /// whether this one is. The default decides the empty Operations as
+    /// [`decide_each`](Self::decide_each) would; an engine whose rules need
+    /// a type to answer a read overrides it, so a grant that takes the
+    /// queried types is offered, and a refusal of every request is not.
+    fn offers_each<'a>(
+        &'a self,
+        subject: &'a Subject,
+        ops: &'a [Operation<'a>],
+    ) -> DecisionsFuture<'a> {
+        self.decide_each(subject, ops)
+    }
+
     /// Fires once per notification document per subscription, before the
     /// egress check and the send (ADR-0014 `pre_notify`). Synchronous: it
     /// sits inside the delivery the broker is about to make, and an engine
@@ -322,6 +1153,30 @@ pub trait PolicyEngine: Send + Sync {
         sub: &Value,
         notification: &mut Value,
     ) -> NotifyDecision;
+
+    /// Whether the engine reads rule documents through
+    /// [`load`](Self::load) (ADR-0020 amendment). No by default: `/q/policy`
+    /// then answers 404, as it does for a broker without an engine.
+    fn loads_documents(&self) -> bool {
+        false
+    }
+
+    /// Take `document` as the rule document of `tenant`, or drop that
+    /// Tenant's document when it is `Value::Null`. An `Err` leaves the
+    /// engine as it was: the previous document keeps deciding. The reason
+    /// goes back to the admin caller who wrote the document and nowhere
+    /// else, so it may name parts of it. The default refuses every
+    /// document.
+    ///
+    /// # Errors
+    /// Why the engine refuses the document.
+    fn load(&self, tenant: &str, document: &Value) -> Result<(), String> {
+        let _ = (tenant, document);
+        Err(format!(
+            "the policy engine {:?} reads no rule documents",
+            self.name()
+        ))
+    }
 }
 
 /// The name of the engine the broker ships, which is also the name
@@ -365,7 +1220,17 @@ impl PolicyEngine for AllowAll {
 /// means refuse. An empty `Filter` asks for nothing and is an allow.
 pub fn resolve(clause: &str, decision: Decision) -> Decision {
     match decision {
-        Decision::Filter(f) if !FILTERABLE.contains(&clause) => {
+        Decision::AllowIf(_) if !WRITE_BY_ID.contains(&clause) => Decision::Deny(format!(
+            "{clause} is not a write by id and cannot be conditioned on the stored Entity"
+        )),
+        Decision::AllowIf(f) if f.projects() => {
+            Decision::Deny("a write condition selects Entities and projects nothing".into())
+        }
+        Decision::AllowIf(f) if Condition::of(&f).is_none() => Decision::Allow,
+        Decision::Filter(f) if RECORD_LISTS.contains(&clause) && f.projects() => Decision::Deny(
+            format!("{clause} lists records whole and a narrowing there cannot project"),
+        ),
+        Decision::Filter(f) if !FILTERABLE.contains(&clause) && !NAME_READS.contains(&clause) => {
             if f.is_empty() {
                 Decision::Allow
             } else if WHOLE_TENANT.contains(&clause) {
@@ -438,6 +1303,113 @@ pub async fn decide(engine: &dyn PolicyEngine, subject: &Subject, op: &Operation
     }
 }
 
+/// [`decide`] for a batch: one answer per Operation, failing closed the
+/// same way. A panic, a timeout (one [`TIMEOUT`] for the whole batch) or an
+/// answer whose length does not match the batch denies every member, and
+/// each answer passes [`resolve`] for its own clause.
+pub async fn decide_each(
+    engine: &dyn PolicyEngine,
+    subject: &Subject,
+    ops: &[Operation<'_>],
+) -> Vec<Decision> {
+    guarded(engine, ops, || engine.decide_each(subject, ops)).await
+}
+
+/// One batch answer of `engine` to `ops` from `ask`, failing closed as
+/// [`decide_each`] documents, each answer passed through [`resolve`].
+async fn guarded<'a>(
+    engine: &dyn PolicyEngine,
+    ops: &[Operation<'_>],
+    ask: impl FnOnce() -> DecisionsFuture<'a>,
+) -> Vec<Decision> {
+    let all = |why: &str| vec![Decision::Deny(why.to_owned()); ops.len()];
+    #[cfg(not(target_arch = "wasm32"))]
+    let answer = {
+        use futures_util::FutureExt as _;
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(ask));
+        let Ok(fut) = built else {
+            tracing::error!("policy engine {} panicked; denying", engine.name());
+            metrics::counter!("antares_policy_failures_total", "reason" => "panic").increment(1);
+            return all(ENGINE_FAILED);
+        };
+        let guarded = std::panic::AssertUnwindSafe(fut).catch_unwind();
+        match tokio::time::timeout(*TIMEOUT, guarded).await {
+            Ok(Ok(d)) => d,
+            Ok(Err(_)) => {
+                tracing::error!("policy engine {} panicked; denying", engine.name());
+                metrics::counter!("antares_policy_failures_total", "reason" => "panic")
+                    .increment(1);
+                return all(ENGINE_FAILED);
+            }
+            Err(_) => {
+                tracing::error!(
+                    "policy engine {} did not answer within {:?}; denying",
+                    engine.name(),
+                    *TIMEOUT
+                );
+                metrics::counter!("antares_policy_failures_total", "reason" => "timeout")
+                    .increment(1);
+                return all(ENGINE_TIMED_OUT);
+            }
+        }
+    };
+    #[cfg(target_arch = "wasm32")]
+    let answer = ask().await;
+    if answer.len() != ops.len() {
+        tracing::error!(
+            "policy engine {} answered {} decisions for {} operations; denying",
+            engine.name(),
+            answer.len(),
+            ops.len()
+        );
+        metrics::counter!("antares_policy_failures_total", "reason" => "length").increment(1);
+        return all(ENGINE_FAILED);
+    }
+    answer
+        .into_iter()
+        .zip(ops)
+        .map(|(d, op)| resolve(op.clause, d))
+        .collect()
+}
+
+/// Whether any request of each of `clauses` could be allowed for the caller
+/// of `headers`: one batch-shaped probe a surface lists its operations by
+/// (MCP D-3), never a decision on a request. Each clause is asked as an
+/// Operation that names nothing, through [`PolicyEngine::offers_each`],
+/// failing closed as [`decide_each`] does (a panic, a timeout or a short
+/// answer hides every clause), and a narrowing on a clause that cannot be
+/// narrowed hides it. With no engine attached every clause is offered.
+pub async fn offers(
+    engine: Option<&dyn PolicyEngine>,
+    tenant: &antares_model::TenantId,
+    headers: &HeaderMap,
+    clauses: &[&'static str],
+) -> Vec<bool> {
+    let Some(engine) = engine else {
+        return vec![true; clauses.len()];
+    };
+    let ops: Vec<Operation<'_>> = clauses
+        .iter()
+        .map(|clause| Operation {
+            clause,
+            ids: &[],
+            types: &[],
+            attrs: &[],
+            q: None,
+            scope_q: None,
+            geo: None,
+            body: None,
+            stored: None,
+        })
+        .collect();
+    let subject = subject_of(tenant, headers);
+    guarded(engine, &ops, || engine.offers_each(&subject, &ops))
+        .await
+        .into_iter()
+        .map(|d| !matches!(d, Decision::Deny(_)))
+        .collect()
+}
+
 /// Ask the engine about one notification, and fail closed: an engine that
 /// panics drops the notification. The document it was handed may already be
 /// half-edited, and the broker cannot know which half — so it is not sent.
@@ -496,6 +1468,9 @@ pub fn subject_of(tenant: &antares_model::TenantId, headers: &HeaderMap) -> Subj
             }
         }
     }
+    if let Ok(view) = VIEW.try_with(std::sync::Arc::clone) {
+        carried.push((VIEW_PAIR.to_owned(), view.to_string()));
+    }
     Subject {
         tenant: tenant.clone(),
         headers: carried,
@@ -510,6 +1485,79 @@ pub fn subject_of(tenant: &antares_model::TenantId, headers: &HeaderMap) -> Subj
 /// broker's, so a member added later inherits every one of those rules
 /// instead of a new list to forget.
 pub(crate) const SUBJECT_MEMBER: &str = "__subject";
+
+/// What a write by id hands the engine about the Entity it lands on.
+#[derive(Debug, Default)]
+pub(crate) struct PreImage {
+    /// The stored Entity's types joined with the ones the request body
+    /// names: an engine judging by type judges the Entity the write changes
+    /// and what it changes it to (ADR-0020).
+    pub types: Vec<String>,
+    /// The stored Entity itself ([`Operation::stored`]).
+    pub stored: Option<StoredImage>,
+}
+
+/// The [`PreImage`] of a write by id. The store is read once per request,
+/// and only with an engine attached, so vanilla reads nothing more. An
+/// absent Entity or a store error gives no stored image, and the write
+/// answers it as before.
+///
+/// Decided (worker-2, T-3483, owner may override): the write still reads
+/// the Entity again inside its own store operation. Handing it this image,
+/// read outside the store's transaction, would turn a concurrent write
+/// into a lost update; the gate's read is the one the type lookup already
+/// made, so no read is added.
+pub(crate) async fn pre_image(
+    st: &crate::state::AppState,
+    tenant: &antares_model::TenantId,
+    id: &str,
+    body: Option<&Value>,
+) -> PreImage {
+    if st.policy.is_none() {
+        return PreImage::default();
+    }
+    let stored = st
+        .store
+        .get(tenant, antares_store::Kind::Entity, id)
+        .await
+        .ok()
+        .flatten();
+    image(stored, body)
+}
+
+/// The [`PreImage`] of a temporal write by id (5.6.12 to 5.6.16, T-3607):
+/// the Entity's temporal evolution, which a history-only Entity has
+/// without a current state, else its current state. Read only with an
+/// engine attached, as [`pre_image`].
+pub(crate) async fn temporal_pre_image(
+    st: &crate::state::AppState,
+    tenant: &antares_model::TenantId,
+    id: &str,
+) -> PreImage {
+    if st.policy.is_none() {
+        return PreImage::default();
+    }
+    match st.temporal.get(tenant, id).await.ok().flatten() {
+        Some(evolution) => image(Some(evolution), None),
+        None => pre_image(st, tenant, id, None).await,
+    }
+}
+
+/// The image of a stored document, with the types the body adds.
+pub(crate) fn image(stored: Option<Value>, body: Option<&Value>) -> PreImage {
+    let mut types: Vec<String> = Vec::new();
+    for doc in stored.as_ref().into_iter().chain(body) {
+        for t in entity_types(doc) {
+            if !types.iter().any(|o| o == t) {
+                types.push(t.to_owned());
+            }
+        }
+    }
+    PreImage {
+        types,
+        stored: stored.as_ref().map(StoredImage::of),
+    }
+}
 
 /// The stored form of a subject: only the headers a deployment named, since
 /// the tenant is where the subscription already lives. `None` when the
@@ -565,7 +1613,7 @@ pub(crate) fn belongs_to(doc: &Value, subject: &Subject) -> bool {
 pub struct Denied(pub String);
 
 /// The one call a handler makes. Every operation passes through it exactly
-/// once, which is what `every_route_asks_the_policy_engine_once` asserts by
+/// once, which is what `every_route_asks_the_policy_engine_exactly_once` asserts by
 /// walking the router with a counting engine.
 ///
 /// The returned [`Filter`] is what the answer has to be narrowed by; an
@@ -578,9 +1626,230 @@ pub async fn gate(
 ) -> Result<Filter, Denied> {
     match decide(engine, &subject_of(tenant, headers), op).await {
         Decision::Allow => Ok(Filter::default()),
-        Decision::Filter(f) => Ok(f),
+        // On a write by id the filter is the condition ([`Condition::of`]);
+        // `resolve` lets an `AllowIf` through nowhere else, and turns a
+        // `Filter` there into a deny, so a handler of such a clause reads
+        // what it gets back as the condition and nothing else.
+        Decision::Filter(f) | Decision::AllowIf(f) => Ok(f),
         Decision::Deny(why) => Err(Denied(why)),
     }
+}
+
+/// [`gate`](fn@gate) for a batch: per member the refusal reason, or the
+/// condition its stored Entity has to meet (empty when there is none). A
+/// batch writes its members whole, so a `Filter` on a member is a refusal
+/// ([`resolve`]: no batch clause is FILTERABLE).
+pub async fn gate_each(
+    engine: &dyn PolicyEngine,
+    tenant: &antares_model::TenantId,
+    headers: &HeaderMap,
+    ops: &[Operation<'_>],
+) -> Vec<Result<Filter, String>> {
+    decide_each(engine, &subject_of(tenant, headers), ops)
+        .await
+        .into_iter()
+        .map(|d| match d {
+            Decision::Deny(why) => Err(why),
+            Decision::AllowIf(f) => Ok(f),
+            Decision::Allow | Decision::Filter(_) => Ok(Filter::default()),
+        })
+        .collect()
+}
+
+/// A stored Subscription or Registration as a [`Condition`] reads it: `id`,
+/// `type` and `scope` as an Entity carries them, every other member one
+/// Property holding its value, and `subject` the carried header values of
+/// the subject that created it ([`SUBJECT_MEMBER`]), one instance each, so
+/// an engine selects the caller's own with `q=subject=="<its value>"`. A
+/// member a client wrote under `subject` is not the subject and is left
+/// out, as are the broker's other `__` members.
+// ponytail: values only, without the header names; an engine whose two
+// headers can carry the same value tells them apart by a rule's ids.
+fn record_image(doc: &Value) -> Value {
+    let ctx = crate::repr::policy_context();
+    let mut out = serde_json::Map::new();
+    for (k, v) in doc.as_object().into_iter().flatten() {
+        match k.as_str() {
+            "id" | "scope" => {
+                out.insert(k.clone(), v.clone());
+            }
+            "type" => {
+                let t = v
+                    .as_str()
+                    .map_or_else(|| v.clone(), |t| ctx.expand_key(t).into());
+                out.insert(k.clone(), t);
+            }
+            "subject" => {}
+            k if k.starts_with("__") => {}
+            k => {
+                out.insert(ctx.expand_key(k), serde_json::json!([{ "value": v }]));
+            }
+        }
+    }
+    let mut carried: Vec<(String, String)> = doc
+        .get(SUBJECT_MEMBER)
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    // The view is where the creator came from, not who they are: a view
+    // id equal to some user's name must not select that user's documents.
+    carried.retain(|(name, _)| name != VIEW_PAIR);
+    if !carried.is_empty() {
+        let values = carried
+            .into_iter()
+            .map(|(_, v)| serde_json::json!({ "value": v }));
+        out.insert(ctx.expand_key("subject"), values.collect());
+    }
+    Value::Object(out)
+}
+
+/// What a write by id needs of the Entity it lands on
+/// ([`Decision::AllowIf`]), in the form a stored document is read in. The
+/// handler checks it inside the store's own read-modify-write, on the
+/// document the store is about to change.
+///
+/// The same selection a read's narrowing makes ([`crate::repr::PolicyReach`]),
+/// judged synchronously on one document.
+pub(crate) type Condition = crate::repr::PolicyReach;
+
+impl Condition {
+    /// The selection `f` makes, whatever it projects.
+    pub(crate) fn new(f: &Filter) -> Self {
+        Self {
+            q: f.q.as_deref().cloned(),
+            scope_q: f.scope_q.clone(),
+            areas: f.areas().cloned().collect(),
+            rules: crate::repr::type_rules(f),
+        }
+    }
+
+    /// The condition `f` sets, or `None` when it selects every Entity.
+    pub(crate) fn of(f: &Filter) -> Option<Self> {
+        let c = Self::new(f);
+        (!c.selects_every()).then_some(c)
+    }
+
+    /// Whether the condition selects every Entity: no `q`, no `scopeQ`, no
+    /// area and no rules.
+    pub(crate) fn selects_every(&self) -> bool {
+        self.q.is_none() && self.scope_q.is_none() && self.areas.is_empty() && self.rules.is_none()
+    }
+
+    /// Whether the stored document `doc` is selected. A linked path in a
+    /// `q` never holds, as in a rule (ADR-0023 rule 11): the check runs
+    /// inside the store's write and reads no other Entity.
+    pub(crate) fn holds(&self, doc: &Value) -> bool {
+        let ctx = crate::repr::policy_context();
+        crate::repr::shown(self.rules.as_deref(), doc).is_some()
+            && self
+                .scope_q
+                .as_deref()
+                .is_none_or(|s| crate::scope_matches(s, doc))
+            && self.areas.iter().all(|g| g.matches(doc, ctx))
+            && self.q.as_ref().is_none_or(|q| {
+                !q.has_linked_paths() && antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
+            })
+    }
+
+    /// Whether a Subscription or Registration is selected (T-3673): the
+    /// condition read over [`record_image`] of the stored document.
+    pub(crate) fn holds_for_record(&self, doc: &Value) -> bool {
+        self.holds(&record_image(doc))
+    }
+
+    /// Inside the store closure: an Entity the condition does not select is
+    /// not found, the answer an absent one gets.
+    pub(crate) fn pre(
+        cond: Option<&Self>,
+        id: &str,
+        doc: &Value,
+    ) -> Result<(), antares_model::NgsiError> {
+        if cond.is_none_or(|c| c.holds(doc)) {
+            Ok(())
+        } else {
+            Err(antares_model::NgsiError::ResourceNotFound(format!(
+                "entity {id} not found"
+            )))
+        }
+    }
+
+    /// [`Condition::pre`] on a Temporal Evolution, inside the temporal
+    /// store's closure: judged on [`latest_image`], and one it does not
+    /// select is the absent evolution the temporal writes answer.
+    pub(crate) fn pre_evolution(
+        cond: Option<&Self>,
+        id: &str,
+        doc: &Value,
+    ) -> Result<(), antares_model::NgsiError> {
+        if cond.is_none_or(|c| c.holds(&latest_image(doc))) {
+            Ok(())
+        } else {
+            Err(antares_model::NgsiError::ResourceNotFound(format!(
+                "temporal entity {id} not found"
+            )))
+        }
+    }
+
+    /// A conditioned write that would reach a Context Source is refused:
+    /// nothing in this store can judge the Source's copy.
+    pub(crate) fn unforwarded(cond: Option<&Self>, forwards: bool) -> Result<(), Denied> {
+        if cond.is_some() && forwards {
+            Err(Denied(CONDITION_NOT_FORWARDED.to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// A Temporal Evolution as the Entity it now is: each Attribute keeps its
+/// latest instance per `datasetId` (the greatest `observedAt`, else
+/// `createdAt`; the later one on a tie) and a temporal `scope` the value of
+/// its latest instance. A condition judged on every instance would let a
+/// value the Entity held once select it for good.
+// ponytail: instances without a time compare as the earliest; the temporal
+// writes stamp `createdAt` on every instance they store.
+pub(crate) fn latest_image(doc: &Value) -> Value {
+    let time = |i: &Value| {
+        ["observedAt", "createdAt"]
+            .iter()
+            .find_map(|k| i.get(*k).and_then(Value::as_str))
+            .map(antares_model::dt_key)
+            .unwrap_or_default()
+    };
+    let mut out = serde_json::Map::new();
+    for (k, v) in doc.as_object().into_iter().flatten() {
+        let instances = match v.as_array() {
+            Some(a) if !antares_model::is_meta(k) || k == "scope" => a,
+            _ => {
+                out.insert(k.clone(), v.clone());
+                continue;
+            }
+        };
+        if !instances.iter().all(Value::is_object) {
+            out.insert(k.clone(), v.clone());
+            continue;
+        }
+        let mut latest: Vec<&Value> = Vec::new();
+        for i in instances {
+            let ds = i.get("datasetId");
+            match latest.iter_mut().find(|l| l.get("datasetId") == ds) {
+                Some(l) if time(i) >= time(l) => *l = i,
+                Some(_) => {}
+                None => latest.push(i),
+            }
+        }
+        let kept = if k == "scope" {
+            latest
+                .first()
+                .and_then(|i| i.get("value"))
+                .cloned()
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Array(latest.into_iter().cloned().collect())
+        };
+        out.insert(k.clone(), kept);
+    }
+    Value::Object(out)
 }
 
 /// The members of a JSON object, or nothing when it is not one.
@@ -636,6 +1905,11 @@ pub async fn run_policy_contract(engine: &dyn PolicyEngine) {
                     );
                 }
             }
+            // `decide` answers a condition on anything but a write by id as
+            // a deny, so reaching here is the seam's fault, not the engine's.
+            // A contract harness (test-kit) fails by panicking, as asserts do.
+            #[allow(clippy::panic)]
+            Decision::AllowIf(_) => panic!("{name}: a condition on {clause} passed the seam"),
         }
     }
 
@@ -716,7 +1990,12 @@ impl PolicyEngine for Slow<'_> {
 
     fn decide<'a>(&'a self, subject: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
         Box::pin(async move {
-            tokio::time::sleep(*TIMEOUT * 2 + Duration::from_millis(50)).await;
+            tokio::time::sleep(
+                TIMEOUT
+                    .saturating_mul(2)
+                    .saturating_add(Duration::from_millis(50)),
+            )
+            .await;
             self.0.decide(subject, op).await
         })
     }
@@ -729,7 +2008,350 @@ impl PolicyEngine for Slow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `admits` is `shown(..).is_some()` without the set (T-3667).
+    #[test]
+    fn admits_is_whether_shown_answers() {
+        let ctx = antares_jsonld::core_context();
+        let car = serde_json::json!({"id": "urn:ngsi-ld:Car:1", "type": "Car"});
+        let rule = |t: &str| Rule {
+            types: vec![t.to_owned()],
+            ..Rule::default()
+        };
+        let cases = [
+            Filter::default(),
+            Filter {
+                omit_by_type: BTreeMap::from([("Car".to_owned(), vec!["speed".to_owned()])]),
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("Car")],
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("User")],
+                ..Filter::default()
+            },
+            Filter {
+                rules: vec![rule("User"), rule("Car")],
+                ..Filter::default()
+            },
+        ];
+        let admitted: Vec<bool> = cases.iter().map(|f| f.admits(&car, &ctx)).collect();
+        assert_eq!(admitted, [true, true, true, false, true]);
+        for f in &cases {
+            assert_eq!(f.admits(&car, &ctx), f.shown(&car, &ctx).is_some(), "{f:?}");
+        }
+    }
+
+    /// T-3684: an engine that keeps the trait's defaults reads no rule
+    /// documents (ADR-0020 amendment): it says so, so `/q/policy` answers
+    /// 404, and a document handed to it anyway is refused, never taken.
+    #[test]
+    fn an_engine_on_the_defaults_reads_no_rule_documents() {
+        assert!(!AllowAll.loads_documents());
+        let refused = AllowAll.load("city", &serde_json::json!({"rules": []}));
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains(BUILT_IN_NAME)),
+            "{refused:?}"
+        );
+    }
+
+    /// T-3684: `offers` answers one verdict per clause, in the clauses'
+    /// order, false for a Deny; with no engine every clause is offered.
+    #[tokio::test]
+    async fn offers_answers_each_clause_in_order() {
+        struct DenyRetrieve;
+        impl PolicyEngine for DenyRetrieve {
+            fn name(&self) -> &str {
+                "deny-retrieve"
+            }
+            fn decide<'a>(&'a self, _s: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+                Box::pin(std::future::ready(if op.clause == "retrieveEntity" {
+                    Decision::Deny("no".into())
+                } else {
+                    Decision::Allow
+                }))
+            }
+            fn pre_notify(&self, _s: &Subject, _sub: &Value, _n: &mut Value) -> NotifyDecision {
+                NotifyDecision::Deliver
+            }
+        }
+        let (tenant, headers) = (antares_model::TenantId::default(), HeaderMap::new());
+        let clauses = ["queryEntity", "retrieveEntity", "queryTemporal"];
+        assert_eq!(
+            offers(Some(&DenyRetrieve), &tenant, &headers, &clauses).await,
+            [true, false, true]
+        );
+        assert_eq!(offers(None, &tenant, &headers, &clauses).await, [true; 3]);
+    }
+
+    /// T-3482: only the caller's own q is rewritten; the engine's
+    /// condition may read what it hides from the caller.
+    #[test]
+    fn a_hidden_term_is_rewritten_and_the_engines_own_q_is_not() {
+        let filter = Filter {
+            omit: vec!["salary".into()],
+            q: Some(Box::new(antares_ql::parse_q("salary>0").expect("q"))),
+            ..Filter::default()
+        };
+        let ctx = antares_jsonld::core_context();
+        let params = std::collections::HashMap::from([(
+            "q".to_owned(),
+            "salary==1|!salary|name==\"x\"".to_owned(),
+        )]);
+        let out = filter.narrow_params(&params, &ctx).expect("narrowed");
+        assert_eq!(
+            out["q"],
+            "(salary;!salary|(salary|!salary)|name==\"x\");salary>0"
+        );
+        let nothing_hidden = Filter::default();
+        let out = nothing_hidden
+            .narrow_params(&params, &ctx)
+            .expect("narrowed");
+        assert_eq!(out["q"], params["q"]);
+    }
     use futures_util::FutureExt as _;
+
+    const NS: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+
+    fn iri(n: &str) -> String {
+        format!("{NS}{n}")
+    }
+
+    /// Zone A: the square (0,0)-(1,1).
+    fn zone_a() -> Box<GeoQuery> {
+        let params = std::collections::HashMap::from([
+            ("georel".to_owned(), "within".to_owned()),
+            ("geometry".to_owned(), "Polygon".to_owned()),
+            (
+                "coordinates".to_owned(),
+                "[[[0,0],[1,0],[1,1],[0,1],[0,0]]]".to_owned(),
+            ),
+        ]);
+        Box::new(
+            GeoQuery::from_params(&params)
+                .expect("geoquery")
+                .expect("present"),
+        )
+    }
+
+    fn rule(t: &str, attrs: &[&str]) -> Rule {
+        Rule {
+            types: vec![iri(t)],
+            attributes: attrs.iter().map(|a| iri(a)).collect(),
+            ..Rule::default()
+        }
+    }
+
+    /// `{Car in zone A: speed, location, status}`, `{Car: status}`,
+    /// `{User: name}`, in the internal form `repr::type_rules` produces.
+    fn zones() -> Filter {
+        Filter {
+            rules: vec![
+                Rule {
+                    geo_q: Some(zone_a()),
+                    attributes: vec![
+                        iri("speed"),
+                        antares_ql::geo::LOCATION_IRI.to_owned(),
+                        iri("status"),
+                    ],
+                    ..rule("Car", &[])
+                },
+                rule("Car", &["status"]),
+                rule("User", &["name"]),
+            ],
+            ..Filter::default()
+        }
+    }
+
+    fn car(lon: f64) -> Value {
+        json!({"id": "urn:ngsi-ld:Car:1", "type": [iri("Car")],
+               (iri("speed")): [{"type": "Property", "value": 80}],
+               (iri("status")): [{"type": "Property", "value": "ok"}],
+               "https://uri.etsi.org/ngsi-ld/location": [{"type": "GeoProperty",
+                   "value": {"type": "Point", "coordinates": [lon, 0.5]}}]})
+    }
+
+    fn ctx() -> antares_jsonld::Context {
+        antares_jsonld::core_context()
+    }
+
+    /// Gap G2: a rule that narrows ids selects by id, and a document with no
+    /// id only when it narrows none.
+    #[test]
+    fn a_rule_selects_by_type_and_id() {
+        let any = rule("Car", &["speed"]);
+        let one = Rule {
+            ids: vec!["urn:ngsi-ld:Car:1".into()],
+            ..rule("Car", &["speed"])
+        };
+        let doc = car(0.5);
+        let anonymous = json!({"type": [iri("Car")]});
+        assert!(any.selects(&doc) && one.selects(&doc));
+        assert!(any.selects(&anonymous), "no id narrowing, no id needed");
+        assert!(!one.selects(&anonymous), "an id narrowing needs an id");
+        assert!(!one.selects(&json!({"id": "urn:ngsi-ld:Car:2", "type": [iri("Car")]})));
+        assert!(!one.selects(&json!({"id": "urn:ngsi-ld:Car:1", "type": [iri("Bus")]})));
+    }
+
+    /// ADR-0023 rule 11: the union over the rules that hold, nothing for an
+    /// Entity none holds for, and an omit on any type wins.
+    #[test]
+    fn shown_is_the_union_of_the_rules_that_hold_and_any_omit_wins() {
+        let f = zones();
+        let ctx = ctx();
+        let inside = f.shown(&car(0.5), &ctx).expect("in view");
+        let outside = f.shown(&car(5.0), &ctx).expect("in view");
+        assert!(inside.allows(&iri("speed")) && inside.allows(&iri("status")));
+        assert!(!outside.allows(&iri("speed")), "speed only in zone A");
+        assert!(outside.allows(&iri("status")));
+        let robot = json!({"id": "urn:ngsi-ld:Robot:1", "type": [iri("Robot")]});
+        assert_eq!(f.shown(&robot, &ctx), None, "no rule holds: out");
+        let both = json!({"id": "urn:x", "type": [iri("Car"), iri("User")],
+                          (iri("name")): [{"type": "Property", "value": "n"}]});
+        let shown = f.shown(&both, &ctx).expect("in view");
+        assert!(
+            shown.allows(&iri("name")) && shown.allows(&iri("status")),
+            "union"
+        );
+        let omitting = Filter {
+            omit_by_type: BTreeMap::from([(iri("User"), vec![iri("status")])]),
+            ..zones()
+        };
+        let shown = omitting.shown(&both, &ctx).expect("in view");
+        assert!(!shown.allows(&iri("status")), "an omit on any type wins");
+        let only_omit = Filter {
+            omit_by_type: omitting.omit_by_type.clone(),
+            ..Filter::default()
+        };
+        let shown = only_omit.shown(&robot, &ctx).expect("no rules: in");
+        assert!(shown.allows(&iri("serial")), "no rules: omit alone");
+    }
+
+    /// A rule whose `q` follows a link never holds (fail closed), and a
+    /// rule naming no type holds for nothing.
+    #[test]
+    fn a_rule_reading_a_link_or_naming_no_type_never_holds() {
+        let ctx = ctx();
+        let linked = Rule {
+            q: Some(Box::new(
+                antares_ql::parse_q("ownedBy{name}==\"x\"").expect("q"),
+            )),
+            ..rule("Car", &["speed"])
+        };
+        assert!(linked.q.as_deref().is_some_and(QNode::has_linked_paths));
+        assert!(!linked.holds(&car(0.5), &ctx));
+        let negated = Rule {
+            q: Some(Box::new(antares_ql::parse_q("!ownedBy{name}").expect("q"))),
+            ..rule("Car", &["speed"])
+        };
+        assert!(!negated.holds(&car(0.5), &ctx), "not even negated");
+        assert!(!Rule::default().holds(&car(0.5), &ctx));
+        let local = Rule {
+            q: Some(Box::new(antares_ql::parse_q("speed>50").expect("q"))),
+            ..rule("Car", &["status"])
+        };
+        assert!(local.holds(&car(0.5), &ctx));
+    }
+
+    /// ADR-0023 rule 7 per rule (K22): a write must fall whole inside one
+    /// rule that shows every Attribute it names.
+    #[test]
+    fn write_that_adds_speed_outside_zone_a_is_refused() {
+        let f = zones();
+        let ctx = ctx();
+        let speed = iri("speed");
+        let status = iri("status");
+        assert!(f.admits_write(&car(0.5), &[&speed, &status], &ctx));
+        assert!(
+            !f.admits_write(&car(5.0), &[&speed], &ctx),
+            "speed outside A"
+        );
+        assert!(f.admits_write(&car(5.0), &[&status], &ctx));
+        let name = iri("name");
+        assert!(
+            !f.admits_write(&car(0.5), &[&speed, &name], &ctx),
+            "no one rule shows both"
+        );
+        let robot = json!({"id": "urn:ngsi-ld:Robot:1", "type": [iri("Robot")]});
+        assert!(!f.admits_write(&robot, &[], &ctx), "outside every rule");
+    }
+
+    /// A rule over every Attribute admits a write naming any of them, and
+    /// discloses nothing it reads (T-3637).
+    #[test]
+    fn a_rule_over_every_attribute_admits_any_written_name() {
+        let ctx = ctx();
+        let whole = Rule {
+            every_attribute: true,
+            q: Some(Box::new(antares_ql::parse_q("speed>50").expect("q"))),
+            ..rule("Car", &[])
+        };
+        let f = Filter {
+            rules: vec![whole.clone()],
+            ..Filter::default()
+        };
+        let (speed, name) = (iri("speed"), iri("name"));
+        assert!(f.admits_write(&car(0.5), &[&speed, &name], &ctx));
+        let narrow = Filter {
+            rules: vec![rule("Car", &[])],
+            ..Filter::default()
+        };
+        assert!(!narrow.admits_write(&car(0.5), &[&speed], &ctx));
+        assert!(whole.discloses(&ctx).is_empty());
+    }
+
+    /// The loader's disclosure report: zone A's rule reads `location` and
+    /// shows it, so it discloses nothing; a rule on `speed>100` showing only
+    /// `status` discloses `speed`.
+    #[test]
+    fn discloses_names_what_the_condition_reads_and_the_rule_does_not_show() {
+        let ctx = ctx();
+        assert!(zones().rules[0].discloses(&ctx).is_empty());
+        let fast = Rule {
+            q: Some(Box::new(antares_ql::parse_q("speed>100").expect("q"))),
+            geo_q: Some(zone_a()),
+            ..rule("Car", &["status"])
+        };
+        assert_eq!(
+            fast.discloses(&ctx),
+            vec![
+                iri("speed"),
+                "https://uri.etsi.org/ngsi-ld/location".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn project_keeps_the_union_and_the_frame() {
+        let f = Filter {
+            rules: vec![
+                Rule {
+                    types: vec!["Car".to_owned()],
+                    attributes: vec!["speed".to_owned(), "email".to_owned()],
+                    ..Rule::default()
+                },
+                Rule {
+                    types: vec!["User".to_owned()],
+                    attributes: vec!["name".to_owned()],
+                    ..Rule::default()
+                },
+            ],
+            omit_by_type: BTreeMap::from([("User".to_owned(), vec!["email".to_owned()])]),
+            ..Filter::default()
+        };
+        let mut doc = json!({"id": "urn:x", "type": ["Car", "User"], "@context": "c",
+                             "speed": 1, "name": 2, "email": 3, "serial": 4});
+        f.project(&mut doc);
+        assert_eq!(
+            doc,
+            json!({"id": "urn:x", "type": ["Car", "User"], "@context": "c",
+                   "speed": 1, "name": 2})
+        );
+    }
     use serde_json::json;
 
     fn subject() -> Subject {
@@ -886,7 +2508,7 @@ mod tests {
         }
         // and every other clause outside FILTERABLE, because the handler
         // there never reads the Filter
-        for clause in ["5.6.1", "5.6.6", "5.8.1", "5.9.2", "5.13.2", "5.7.5"] {
+        for clause in ["5.6.1", "5.6.6", "5.8.1", "5.9.2", "5.13.2", "5.8.4"] {
             assert!(
                 matches!(resolve(clause, narrowed.clone()), Decision::Deny(_)),
                 "{clause} dropped a narrowing instead of refusing it"
@@ -902,8 +2524,21 @@ mod tests {
             omit: vec!["speed".into()],
             ..Filter::default()
         });
+        let selected = Decision::Filter(Filter {
+            scope_q: Some("/mine".into()),
+            ..Filter::default()
+        });
         for clause in FILTERABLE {
-            assert_eq!(resolve(clause, narrowed.clone()), narrowed, "{clause}");
+            assert_eq!(resolve(clause, selected.clone()), selected, "{clause}");
+            if RECORD_LISTS.contains(&clause) {
+                // a record list selects and never projects (T-3673)
+                assert!(matches!(
+                    resolve(clause, narrowed.clone()),
+                    Decision::Deny(_)
+                ));
+            } else {
+                assert_eq!(resolve(clause, narrowed.clone()), narrowed, "{clause}");
+            }
         }
     }
 
@@ -1010,5 +2645,731 @@ mod tests {
             }
         );
         assert!(!printed.contains("BB-123-XY"), "{printed}");
+    }
+
+    /// T-3552: the policy survivors of mutants run 38073511508.
+    #[test]
+    fn the_timeout_takes_a_positive_integer_or_falls_back() {
+        assert_eq!(timeout_ms(None), 250);
+        assert_eq!(timeout_ms(Some("0")), 250, "zero would deny every request");
+        assert_eq!(timeout_ms(Some("x")), 250);
+        assert_eq!(timeout_ms(Some("1")), 1);
+        assert_eq!(timeout_ms(Some("300")), 300);
+    }
+
+    #[test]
+    fn a_single_string_counts_as_a_one_element_list() {
+        let doc = json!({"type": "T", "scope": "/a"});
+        assert_eq!(entity_types(&doc), ["T"]);
+        assert_eq!(StoredImage::of(&doc).scope, ["/a"]);
+        let listed = json!({"type": ["T", "U"], "scope": ["/a", "/b"]});
+        assert_eq!(entity_types(&listed), ["T", "U"]);
+        assert_eq!(StoredImage::of(&listed).scope, ["/a", "/b"]);
+    }
+
+    #[test]
+    fn an_operation_logs_its_shape_and_never_its_payload() {
+        let op = Operation::new("5.6.1");
+        let shown = format!("{op:?}");
+        assert!(shown.starts_with("Operation {"), "{shown}");
+        assert!(shown.contains("clause: \"5.6.1\""), "{shown}");
+        assert!(shown.contains("ids: 0"), "{shown}");
+    }
+
+    #[test]
+    fn a_rule_is_conditional_on_any_one_of_its_conditions() {
+        let plain = rule("Car", &["speed"]);
+        assert!(!plain.is_conditional());
+        let q = Rule {
+            q: Some(Box::new(antares_ql::parse_q("speed>1").expect("q"))),
+            ..plain.clone()
+        };
+        let scope = Rule {
+            scope_q: Some("/a".to_owned()),
+            ..plain.clone()
+        };
+        assert!(q.is_conditional() && scope.is_conditional());
+    }
+
+    #[test]
+    fn shown_nothing_admits_no_attribute() {
+        let nothing = Shown::nothing();
+        assert_eq!(nothing.only, Some(Default::default()));
+        assert!(!nothing.allows(&iri("name")));
+    }
+
+    #[test]
+    fn a_write_is_refused_only_for_the_attribute_its_type_omits() {
+        let ctx = ctx();
+        let f = Filter {
+            omit_by_type: BTreeMap::from([(iri("User"), vec![iri("status")])]),
+            ..Filter::default()
+        };
+        let user = json!({"id": "urn:x", "type": [iri("User")]});
+        assert!(f.admits_write(&user, &[iri("name").as_str()], &ctx));
+        assert!(!f.admits_write(&user, &[iri("status").as_str()], &ctx));
+    }
+
+    /// T-3552 (mutants run 38081990103): the image of a stored Entity names
+    /// its Attributes, never what frames, dates or annotates it.
+    #[test]
+    fn a_stored_image_names_attributes_only() {
+        let doc = json!({"id": "urn:ngsi-ld:Car:1", "type": [iri("Car")], "scope": ["/a"],
+                         "createdAt": "t", "modifiedAt": "t", "deletedAt": "t",
+                         "@context": [], "__tenant": "acme",
+                         (iri("speed")): [{"type": "Property", "value": 1}]});
+        let image = StoredImage::of(&doc);
+        assert_eq!(image.types, vec![iri("Car")]);
+        assert_eq!(image.scope, vec!["/a".to_owned()]);
+        assert_eq!(image.attribute_names, vec![iri("speed")]);
+    }
+
+    #[test]
+    fn mapping_the_names_maps_both_sets() {
+        let shown = Shown {
+            only: Some(std::collections::BTreeSet::from([Cow::Borrowed("a")])),
+            omitted: std::collections::BTreeSet::from([Cow::Borrowed("b")]),
+        };
+        let mapped = shown.map_names(str::to_uppercase);
+        assert_eq!(
+            mapped.only,
+            Some(std::collections::BTreeSet::from([Cow::Borrowed("A")]))
+        );
+        assert_eq!(
+            mapped.omitted,
+            std::collections::BTreeSet::from([Cow::Borrowed("B")])
+        );
+    }
+
+    /// T-3729: a notification's shown set outlives its rules unchanged; an
+    /// empty set would show the whole Entity.
+    #[test]
+    fn an_owned_shown_set_keeps_both_sets() {
+        let shown = Shown {
+            only: Some(std::collections::BTreeSet::from([Cow::Borrowed("a")])),
+            omitted: std::collections::BTreeSet::from([Cow::Borrowed("b")]),
+        };
+        let owned = shown.clone().into_owned();
+        assert_eq!(owned, shown);
+        assert!(owned.allows("a") && !owned.allows("b") && !owned.allows("c"));
+    }
+
+    /// T-3729: only a rule with no condition, ids or id patterns admits by
+    /// type alone, the one the store may page as a type selection.
+    #[test]
+    fn a_rule_admits_by_type_alone_only_without_condition_or_ids() {
+        let typed = Rule {
+            types: vec![iri("Car")],
+            ..Rule::default()
+        };
+        assert!(typed.admits_by_type_alone());
+        for narrowed in [
+            Rule {
+                ids: vec!["urn:ngsi-ld:Car:1".into()],
+                ..typed.clone()
+            },
+            Rule {
+                id_patterns: vec!["urn:.*".into()],
+                ..typed.clone()
+            },
+            Rule {
+                scope_q: Some("/a/#".into()),
+                ..typed.clone()
+            },
+        ] {
+            assert!(!narrowed.admits_by_type_alone(), "{narrowed:?}");
+        }
+    }
+
+    /// T-3729: the broker's `__` members of a stored Subscription or
+    /// Registration are no Attributes a condition reads.
+    #[test]
+    fn a_record_image_leaves_the_brokers_members_out() {
+        let image = record_image(&json!({"id": "urn:ngsi-ld:Subscription:1",
+            "type": "Subscription", "__tenant": "acme", "description": "d"}));
+        let keys: Vec<&String> = image
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys.len(), 3, "{image}");
+        assert!(keys.iter().all(|k| !k.contains("__")), "{image}");
+    }
+
+    #[test]
+    fn a_filter_says_its_areas_its_rules_and_its_restriction() {
+        let both = Filter {
+            geo_q: Some(zone_a()),
+            geo_also: vec![*zone_a()],
+            ..Filter::default()
+        };
+        assert_eq!(both.areas().count(), 2);
+        let also = Filter {
+            geo_also: vec![*zone_a()],
+            ..Filter::default()
+        };
+        assert_eq!(also.areas().count(), 1);
+        assert!(!also.is_empty());
+
+        assert!(!Filter::default().has_rules());
+        assert!(zones().has_rules(), "rules alone");
+        let omits = Filter {
+            omit_by_type: BTreeMap::from([(iri("User"), vec![iri("status")])]),
+            ..Filter::default()
+        };
+        assert!(omits.has_rules(), "per-type omits alone");
+
+        let mut headers = HeaderMap::new();
+        Filter::default().mark("me", &mut headers);
+        assert!(headers.get(RESTRICTED_HEADER).is_none());
+        assert!(headers.get("NGSILD-Warning").is_none());
+        Filter {
+            restricted: true,
+            ..Filter::default()
+        }
+        .mark("me", &mut headers);
+        assert_eq!(
+            headers.get(RESTRICTED_HEADER).and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        assert!(headers.get("NGSILD-Warning").is_none(), "only when set");
+    }
+
+    /// G6: the request's window clamped to the narrowing's, written back
+    /// into the parameters; nothing changes without windows, a missing or
+    /// invalid window stays refused, and no overlap is a window of nothing.
+    #[test]
+    fn a_temporal_window_is_clamped_into_the_parameters() {
+        let p = |pairs: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let t = |s: &str| TimeBound::At(s.parse().unwrap());
+        let between = Filter {
+            temporal: Box::new([Window {
+                from: Some(t("2026-01-01T01:00:00Z")),
+                to: Some(t("2026-01-01T02:00:00Z")),
+            }]),
+            ..Filter::default()
+        };
+        let odd = p(&[("timerel", "sideways")]);
+        assert_eq!(
+            Filter::default().narrow_window(&odd, true).unwrap(),
+            odd,
+            "no windows, no reading"
+        );
+        assert!(
+            between.narrow_window(&p(&[]), true).is_err(),
+            "5.7.4 still demands a window"
+        );
+        assert!(between.narrow_window(&odd, false).is_err());
+
+        let out = between.narrow_window(&p(&[]), false).unwrap();
+        assert_eq!(out["timerel"], "between");
+        assert_eq!(out["timeAt"], "2026-01-01T01:00:00.000Z");
+        assert_eq!(out["endTimeAt"], "2026-01-01T02:00:00.000Z");
+
+        let out = between
+            .narrow_window(
+                &p(&[("timerel", "after"), ("timeAt", "2026-01-01T01:30:00Z")]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            (out["timerel"].as_str(), out["timeAt"].as_str()),
+            ("between", "2026-01-01T01:30:00Z")
+        );
+
+        let out = between
+            .narrow_window(
+                &p(&[("timerel", "before"), ("timeAt", "2025-01-01T00:00:00Z")]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            out["timeAt"], out["endTimeAt"],
+            "no overlap: between an instant and itself"
+        );
+
+        let open = Filter {
+            temporal: Box::new([Window {
+                from: None,
+                to: Some(t("2026-01-01T02:00:00Z")),
+            }]),
+            ..Filter::default()
+        };
+        let out = open
+            .narrow_window(
+                &p(&[
+                    ("timerel", "between"),
+                    ("timeAt", "2025-01-01T00:00:00Z"),
+                    ("endTimeAt", "2027-01-01T00:00:00Z"),
+                ]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            (out["timeAt"].as_str(), out["endTimeAt"].as_str()),
+            ("2025-01-01T00:00:00Z", "2026-01-01T02:00:00.000Z")
+        );
+        let out = open.narrow_window(&p(&[]), false).unwrap();
+        assert_eq!(out["timerel"], "before");
+        assert!(!out.contains_key("endTimeAt"));
+        let empty = Filter {
+            temporal: Box::new([Window::default()]),
+            ..Filter::default()
+        };
+        assert_eq!(
+            empty.narrow_window(&p(&[]), false).unwrap(),
+            p(&[]),
+            "an unbounded window narrows nothing"
+        );
+
+        // a relative start rounds up to the millisecond, an end down
+        let slide = Filter {
+            temporal: Box::new([Window {
+                from: Some(TimeBound::Ago(chrono::Duration::nanoseconds(1))),
+                to: Some(TimeBound::Ago(chrono::Duration::nanoseconds(1))),
+            }]),
+            ..Filter::default()
+        };
+        let out = slide.narrow_window(&p(&[]), false).unwrap();
+        assert!(antares_model::dt_key(&out["timeAt"]) >= antares_model::dt_key(&out["endTimeAt"]));
+
+        // the windows are on observedAt: a request on another timeproperty
+        // is answered nothing, even one whose own window overlaps
+        let out = between
+            .narrow_window(
+                &p(&[
+                    ("timerel", "after"),
+                    ("timeAt", "2026-01-01T01:30:00Z"),
+                    ("timeproperty", "modifiedAt"),
+                ]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(out["timeAt"], out["endTimeAt"], "{out:?}");
+        assert_eq!(out["timeAt"], "2026-01-01T01:00:00.000Z", "{out:?}");
+    }
+
+    /// A bound renders to the millisecond 4.11 takes: a start rounds up
+    /// (only ever by less than a millisecond), an end down, an exact
+    /// millisecond stays; a window is half-open on those renderings.
+    #[test]
+    fn a_bound_rounds_only_inward_and_a_window_is_half_open() {
+        let at = |ns: u32| {
+            TimeBound::At(chrono::DateTime::from_timestamp(1_767_225_600, ns).expect("an instant"))
+        };
+        let now = chrono::Utc::now();
+        for (ns, start, end) in [
+            (0, "00.000", "00.000"),
+            (500, "00.001", "00.000"),
+            (999_000, "00.001", "00.000"),
+            (1_000_500, "00.002", "00.001"),
+        ] {
+            assert_eq!(
+                at(ns).render(now, true),
+                format!("2026-01-01T00:00:{start}Z"),
+                "start at {ns} ns"
+            );
+            assert_eq!(
+                at(ns).render(now, false),
+                format!("2026-01-01T00:00:{end}Z"),
+                "end at {ns} ns"
+            );
+        }
+        let w = Window {
+            from: Some(at(0)),
+            to: Some(at(2_000_000)),
+        };
+        assert!(
+            !w.admits("2025-12-31T23:59:59.999Z", now),
+            "before the start"
+        );
+        assert!(
+            w.admits("2026-01-01T00:00:00.000Z", now),
+            "the start is inside"
+        );
+        assert!(w.admits("2026-01-01T00:00:00.001Z", now), "inside");
+        assert!(
+            !w.admits("2026-01-01T00:00:00.002Z", now),
+            "the end is outside"
+        );
+        assert!(!w.admits("2026-01-01T00:00:00.003Z", now), "after the end");
+    }
+
+    /// T-3668: an evolution is judged as the Entity it now is, per
+    /// Attribute and `datasetId`, whatever order its instances are stored in.
+    #[test]
+    fn the_latest_image_keeps_the_latest_instance_per_dataset() {
+        let i = |v: &str, at: &str, ds: Option<&str>| {
+            let mut i = serde_json::json!({"type": "Property", "value": v, "observedAt": at});
+            if let Some(ds) = ds {
+                i["datasetId"] = ds.into();
+            }
+            i
+        };
+        let doc = serde_json::json!({
+            "id": "urn:ngsi-ld:V:1",
+            "type": ["V"],
+            "zone": [
+                i("A", "2026-01-01T00:00:02Z", None),
+                i("B", "2026-01-01T00:00:01Z", None),
+                i("C", "2026-01-01T00:00:01Z", Some("urn:ds:1")),
+                i("D", "2026-01-01T00:00:03Z", Some("urn:ds:1")),
+                i("E", "2026-01-01T00:00:02Z", None),
+            ],
+            "scope": [
+                {"type": "Property", "value": ["/old"], "observedAt": "2026-01-01T00:00:01Z"},
+                {"type": "Property", "value": ["/new"], "observedAt": "2026-01-01T00:00:02Z"},
+            ],
+            "modifiedAt": "2026-01-01T00:00:03Z",
+        });
+        let img = latest_image(&doc);
+        let zone: Vec<&str> = img["zone"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i["value"].as_str())
+            .collect();
+        assert_eq!(zone, ["E", "D"], "a tie goes to the later one");
+        assert_eq!(img["scope"], serde_json::json!(["/new"]));
+        assert_eq!(img["type"], doc["type"]);
+        assert_eq!(img["modifiedAt"], doc["modifiedAt"]);
+        let plain = serde_json::json!({"id": "urn:ngsi-ld:V:1", "scope": "/a"});
+        assert_eq!(latest_image(&plain), plain);
+    }
+
+    /// G8: the engine's warning travels as one `NGSILD-Warning` value per
+    /// text, and a text that could not be one header line is refused.
+    #[test]
+    fn a_condition_holds_only_on_a_write_by_id_and_only_as_a_selection() {
+        let zone = Filter {
+            q: Some(Box::new(antares_ql::parse_q("zone==\"A\"").expect("q"))),
+            ..Filter::default()
+        };
+        let conditioned = Decision::AllowIf(zone.clone());
+        for clause in WRITE_BY_ID {
+            assert_eq!(
+                resolve(clause, conditioned.clone()),
+                conditioned,
+                "{clause}"
+            );
+            assert_eq!(
+                resolve(clause, Decision::AllowIf(Filter::default())),
+                Decision::Allow,
+                "{clause}: an empty condition selects everything"
+            );
+        }
+        for clause in ["5.6.1", "5.6.7", "5.6.16", "5.6.21", "5.7.1", "5.8.1"] {
+            assert!(
+                matches!(resolve(clause, conditioned.clone()), Decision::Deny(_)),
+                "{clause}"
+            );
+        }
+        for projecting in [
+            Filter {
+                pick: vec!["speed".into()],
+                ..zone.clone()
+            },
+            Filter {
+                omit: vec!["speed".into()],
+                ..zone.clone()
+            },
+            Filter {
+                temporal: Box::new([Window::default()]),
+                ..zone.clone()
+            },
+            Filter {
+                omit_by_type: BTreeMap::from([("Vehicle".into(), vec!["speed".into()])]),
+                ..zone.clone()
+            },
+            Filter {
+                rules: vec![Rule {
+                    types: vec!["Vehicle".into()],
+                    temporal: vec![Window::default()],
+                    ..Rule::default()
+                }],
+                ..Filter::default()
+            },
+        ] {
+            assert!(
+                matches!(
+                    resolve("5.6.2", Decision::AllowIf(projecting.clone())),
+                    Decision::Deny(_)
+                ),
+                "{projecting:?}"
+            );
+        }
+
+        let dc = "https://uri.etsi.org/ngsi-ld/default-context/";
+        let doc = |z: &str| {
+            serde_json::json!({"id": "urn:ngsi-ld:Vehicle:v", "type": [format!("{dc}Vehicle")],
+                               format!("{dc}zone"): [{"type": "Property", "value": z}]})
+        };
+        let c = Condition::of(&zone).expect("a condition");
+        assert!(c.holds(&doc("A")) && !c.holds(&doc("B")));
+        assert!(Condition::pre(Some(&c), "urn:ngsi-ld:Vehicle:v", &doc("A")).is_ok());
+        assert!(matches!(
+            Condition::pre(Some(&c), "urn:ngsi-ld:Vehicle:v", &doc("B")),
+            Err(antares_model::NgsiError::ResourceNotFound(m))
+                if m == "entity urn:ngsi-ld:Vehicle:v not found"
+        ));
+        assert!(Condition::pre(None, "urn:ngsi-ld:Vehicle:v", &doc("B")).is_ok());
+        let linked = Filter {
+            q: Some(Box::new(
+                antares_ql::parse_q("owner.zone==\"A\"").expect("q"),
+            )),
+            ..Filter::default()
+        };
+        assert!(
+            !Condition::of(&linked)
+                .expect("a condition")
+                .holds(&doc("A")),
+            "a linked path reads no other Entity inside the write, so it never holds"
+        );
+        let scoped = Filter {
+            scope_q: Some("/a".to_owned()),
+            ..Filter::default()
+        };
+        assert!(
+            Condition::of(&scoped).is_some(),
+            "a scopeQ alone selects: it is a condition"
+        );
+        let vehicles = Condition::of(&Filter {
+            rules: vec![Rule {
+                types: vec!["Vehicle".into()],
+                ..Rule::default()
+            }],
+            ..Filter::default()
+        })
+        .expect("a type rule alone selects: it is a condition");
+        let car = serde_json::json!({"id": "urn:ngsi-ld:Car:c", "type": [format!("{dc}Car")]});
+        assert!(vehicles.holds(&doc("B")) && !vehicles.holds(&car));
+        assert!(Condition::of(&Filter::default()).is_none());
+        assert!(Condition::unforwarded(Some(&c), false).is_ok());
+        assert!(Condition::unforwarded(None, true).is_ok());
+        assert_eq!(
+            Condition::unforwarded(Some(&c), true),
+            Err(Denied(CONDITION_NOT_FORWARDED.into()))
+        );
+    }
+
+    #[test]
+    fn a_warning_is_one_header_line_or_refused() {
+        let left_out = Warning::new("types left out by the filter: Building").unwrap();
+        let mut headers = HeaderMap::new();
+        Filter {
+            warning: Some(left_out.clone()),
+            ..Filter::default()
+        }
+        .mark("me", &mut headers);
+        let sent: Vec<_> = headers
+            .get_all("NGSILD-Warning")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(sent, ["199 me \"types left out by the filter: Building\""]);
+
+        for bad in [
+            "a\nb",
+            "a\rb",
+            "tab\there",
+            "say \"x\"",
+            "back\\slash",
+            "é",
+            "",
+        ] {
+            assert!(Warning::new(bad).is_err(), "{bad:?}");
+        }
+        assert!(Warning::new(&"x".repeat(Warning::MAX_LEN)).is_ok());
+        assert!(Warning::new(&"x".repeat(Warning::MAX_LEN + 1)).is_err());
+
+        let other = Warning::new("other").unwrap();
+        let joined = Warning::join(Some(&left_out), Some(other.clone())).unwrap();
+        assert_eq!(joined.texts().len(), 2);
+        assert_eq!(
+            Warning::join(Some(&left_out), Some(left_out.clone())),
+            Some(left_out.clone())
+        );
+        assert_eq!(
+            Warning::join(None, Some(other.clone())),
+            Some(other.clone())
+        );
+        assert_eq!(Warning::join(Some(&other), None), Some(other));
+        let many = (0..10).fold(None, |acc: Option<Warning>, i| {
+            Warning::join(acc.as_ref(), Some(Warning::new(&format!("w{i}")).unwrap()))
+        });
+        assert_eq!(many.unwrap().texts().len(), Warning::MAX_TEXTS);
+    }
+
+    #[test]
+    fn only_a_pick_or_an_omit_hides_a_term() {
+        let speed = iri("speed");
+        assert!(!Filter::default().hides("speed", &speed));
+        let pick = Filter {
+            pick: vec!["status".into()],
+            ..Filter::default()
+        };
+        assert!(pick.hides("speed", &speed));
+        assert!(!pick.hides("status", &iri("status")));
+        let omit = Filter {
+            omit: vec!["speed".into()],
+            ..Filter::default()
+        };
+        assert!(omit.hides("speed", &speed));
+    }
+
+    /// Refuses upserts, allows the rest; `short` answers one decision
+    /// fewer than it was asked for.
+    struct Batch {
+        short: bool,
+    }
+
+    impl PolicyEngine for Batch {
+        fn name(&self) -> &str {
+            "batch"
+        }
+        fn decide<'a>(&'a self, _s: &'a Subject, o: &'a Operation<'a>) -> DecisionFuture<'a> {
+            Box::pin(std::future::ready(if o.clause == "5.6.8" {
+                Decision::Deny("no upserts".into())
+            } else {
+                Decision::Allow
+            }))
+        }
+        fn decide_each<'a>(
+            &'a self,
+            s: &'a Subject,
+            ops: &'a [Operation<'a>],
+        ) -> DecisionsFuture<'a> {
+            Box::pin(async move {
+                let mut out = Vec::new();
+                for op in ops {
+                    out.push(self.decide(s, op).await);
+                }
+                if self.short {
+                    out.pop();
+                }
+                out
+            })
+        }
+        fn pre_notify(&self, _s: &Subject, _sub: &Value, _n: &mut Value) -> NotifyDecision {
+            NotifyDecision::Deliver
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_answered_member_by_member_and_a_short_answer_denies_all() {
+        let ops = [Operation::new("5.6.7"), Operation::new("5.6.8")];
+        let each = decide_each(&Batch { short: false }, &subject(), &ops).await;
+        assert_eq!(
+            each,
+            vec![Decision::Allow, Decision::Deny("no upserts".into())]
+        );
+        let short = decide_each(&Batch { short: true }, &subject(), &ops).await;
+        assert_eq!(short, vec![Decision::Deny(ENGINE_FAILED.to_owned()); 2]);
+        let gated = gate_each(
+            &Batch { short: false },
+            &antares_model::TenantId::default(),
+            &HeaderMap::new(),
+            &ops,
+        )
+        .await;
+        assert_eq!(
+            gated,
+            vec![Ok(Filter::default()), Err("no upserts".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pre_image_joins_stored_and_written_types_once_each() {
+        let tenant = antares_model::TenantId::default();
+        let id = "urn:ngsi-ld:Car:pre";
+        let stored = json!({"id": id, "type": [iri("Car")],
+                            (iri("speed")): [{"type": "Property", "value": 1}]});
+        let body = json!({"type": [iri("Car"), iri("Vehicle")]});
+        let bare = crate::state::AppState::new("pre-image".into());
+        bare.store
+            .create(&tenant, antares_store::Kind::Entity, id, stored)
+            .await
+            .expect("create");
+        let none = pre_image(&bare, &tenant, id, Some(&body)).await;
+        assert!(
+            none.types.is_empty() && none.stored.is_none(),
+            "no engine, no read"
+        );
+        let st = bare.with_policy(std::sync::Arc::new(AllowAll));
+        let image = pre_image(&st, &tenant, id, Some(&body)).await;
+        assert_eq!(image.types, vec![iri("Car"), iri("Vehicle")]);
+        assert_eq!(
+            image.stored.map(|s| s.attribute_names),
+            Some(vec![iri("speed")])
+        );
+    }
+
+    /// T-3702: a subject built inside a view's scope names the view, one
+    /// built outside names none, and no request can carry the pair.
+    #[tokio::test]
+    async fn a_subject_names_the_view_it_came_through_and_nothing_else_can() {
+        let tenant = antares_model::TenantId::default();
+        let plain = subject_of(&tenant, &HeaderMap::new());
+        assert_eq!(plain.view(), None);
+        let inside = through_view("cars", async { subject_of(&tenant, &HeaderMap::new()) }).await;
+        assert_eq!(inside.view(), Some("cars"));
+        let nested = through_view(
+            "cars",
+            through_view("bikes", async { subject_of(&tenant, &HeaderMap::new()) }),
+        )
+        .await;
+        assert_eq!(nested.view(), Some("bikes"), "the innermost view decides");
+        assert!(
+            axum::http::HeaderName::from_bytes(VIEW_PAIR.as_bytes()).is_err(),
+            "{VIEW_PAIR} must not be a header name a client could send"
+        );
+    }
+
+    /// T-3702: the view is stored with the subject (a notification is
+    /// decided for it), and a condition never reads it as one of the
+    /// creator's values.
+    #[test]
+    fn the_view_is_stored_with_the_subject_and_never_read_as_its_value() {
+        let tenant = antares_model::TenantId::default();
+        let subject = Subject {
+            tenant: tenant.clone(),
+            headers: vec![
+                ("x-jc-subject".into(), "ana".into()),
+                (VIEW_PAIR.into(), "ana".into()),
+            ],
+        };
+        let mut doc = json!({"id": "urn:ngsi-ld:Subscription:1", "type": "Subscription"});
+        if let (Some(o), Some(member)) = (doc.as_object_mut(), subject_member(&subject)) {
+            o.insert(SUBJECT_MEMBER.into(), member);
+        }
+        let stored = stored_subject(&tenant, &doc);
+        assert_eq!(stored.view(), Some("ana"));
+        assert!(belongs_to(&doc, &subject));
+        let through_other = Subject {
+            tenant: tenant.clone(),
+            headers: vec![
+                ("x-jc-subject".into(), "ana".into()),
+                (VIEW_PAIR.into(), "bikes".into()),
+            ],
+        };
+        assert!(
+            !belongs_to(&doc, &through_other),
+            "another view, another creator"
+        );
+        let image = record_image(&doc);
+        let values: Vec<&Value> = image
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, _)| k.ends_with("subject"))
+            .flat_map(|(_, v)| v.as_array().into_iter().flatten())
+            .collect();
+        assert_eq!(values, [&json!({"value": "ana"})], "{image}");
     }
 }

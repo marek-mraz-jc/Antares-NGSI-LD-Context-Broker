@@ -8,7 +8,21 @@
 //! and `Clone`, and renders back to `q=` syntax through `Display`, so a
 //! gateway can inspect or rewrite a query (strip an attribute, AND in an
 //! authorization predicate) and forward it with the broker's own semantics.
-#![cfg_attr(not(test), warn(clippy::expect_used))]
+//!
+#![doc = include_str!("../README.md")]
+// T-3468: every surface calls into this crate on a request path, where a
+// panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
+// index out of bounds or overflow.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
 #![deny(missing_docs)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
@@ -20,6 +34,15 @@ pub mod scope;
 pub mod sql;
 
 use antares_model::NgsiError;
+
+/// The pinned core `@context`, parsed once for every test of the crate:
+/// under Miri one parse takes minutes (T-3706).
+#[cfg(test)]
+pub(crate) fn test_core() -> std::sync::Arc<antares_jsonld::Context> {
+    static CORE: std::sync::LazyLock<std::sync::Arc<antares_jsonld::Context>> =
+        std::sync::LazyLock::new(|| std::sync::Arc::new(antares_jsonld::core_context()));
+    std::sync::Arc::clone(&CORE)
+}
 
 /// Entity Type Selection Language (4.17) match against expanded type IRIs:
 /// `,`/`|` = OR of alternatives, `(a;b)` = AND within one alternative.
@@ -37,22 +60,26 @@ pub fn type_selection_matches(sel: &str, types: &[&str], ctx: &antares_jsonld::C
 /// subscription body may arrive encoded, 4.9).
 pub fn percent_decode(input: &[u8]) -> String {
     let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        if input[i] == b'%' && i + 2 < input.len() {
-            // from_str_radix accepts a leading sign, so "%+1" would decode as
-            // 0x01. RFC 3986 clause 2.1 admits two hex digits and nothing else.
-            let hex = std::str::from_utf8(&input[i + 1..i + 3])
-                .ok()
-                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
-            if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+    let mut rest = input;
+    while let Some((&b, tail)) = rest.split_first() {
+        // from_str_radix accepts a leading sign, so "%+1" would decode as
+        // 0x01. RFC 3986 clause 2.1 admits two hex digits and nothing else.
+        let decoded = (b == b'%')
+            .then(|| tail.get(..2))
+            .flatten()
+            .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match decoded {
+            Some(v) => {
+                out.push(v);
+                rest = tail.get(2..).unwrap_or_default();
+            }
+            None => {
                 out.push(b);
-                i += 3;
-                continue;
+                rest = tail;
             }
         }
-        out.push(input[i]);
-        i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -234,14 +261,14 @@ pub enum QValue {
 /// Longest `q=` accepted, before parsing. The URI cap is 8 KiB but a POST
 /// query body carries `q` too, where the only other ceiling is the 4 MiB body
 /// limit — so the string needs its own bound at the one entry point.
-const MAX_Q_BYTES: usize = 4096;
+pub const MAX_Q_BYTES: usize = 4096;
 
 /// Nesting depth ceiling. `(` costs three stack frames (`or_expr` → `and_expr`
 /// → `term`), and a Rust stack overflow is a guard-page abort, NOT a catchable
 /// panic — no tower layer can contain it, so the parser must refuse before it
 /// recurses rather than be rescued afterwards. 64 is far past any real query
 /// and far below the ~2 MiB tokio worker stack.
-const MAX_Q_DEPTH: usize = 64;
+pub const MAX_Q_DEPTH: usize = 64;
 
 /// AST size cap — checked after parsing, which is safe once depth and
 /// length are bounded first. Public because `/q/health` publishes it: a
@@ -258,17 +285,57 @@ pub fn parse_q(input: &str) -> Result<QNode, NgsiError> {
             "q expression exceeds {MAX_Q_BYTES} bytes"
         )));
     }
+    parse_capped(input, MAX_Q_DEPTH, MAX_Q_NODES)
+}
+
+/// Paren depth a narrowed `q` may reach: the caller's [`MAX_Q_DEPTH`], one
+/// more where a hidden term becomes `(a;!a)`, one more for the conjunction,
+/// and a policy part held below it by [`fits_policy_q`].
+const MAX_NARROWED_Q_DEPTH: usize = 2 * MAX_Q_DEPTH;
+
+/// Nodes a narrowed `q` may hold: the caller's [`MAX_Q_NODES`], each term of
+/// it at most three once a hidden-Attribute rewrite has turned it into
+/// `(a;!a)`, the conjunction, and a policy part held below the rest by
+/// [`fits_policy_q`].
+pub const MAX_NARROWED_Q_NODES: usize = 8 * MAX_Q_NODES;
+
+/// Nodes the policy part of a narrowed `q` (an engine's, a view's, or both
+/// joined) may hold: what [`MAX_NARROWED_Q_NODES`] leaves after the
+/// rewritten caller part and the conjunction.
+const MAX_POLICY_Q_NODES: usize = MAX_NARROWED_Q_NODES - 3 * MAX_Q_NODES - 1;
+
+/// Parse a `q` the broker wrote by joining the caller's own `q` (already
+/// through [`parse_q`]) with a policy part that passed [`fits_policy_q`]
+/// (threat V23). The caps are the sum of the two, so a caller `q` that
+/// [`parse_q`] accepts is never refused here: the size of a predicate the
+/// caller cannot see changes no answer. No byte cap: the text is rendered
+/// from those two trees, and a rendered number is longer than the one
+/// written (`1e300`), so bytes would count the renderer, not the caller.
+pub fn parse_narrowed_q(input: &str) -> Result<QNode, NgsiError> {
+    parse_capped(input, MAX_NARROWED_Q_DEPTH, MAX_NARROWED_Q_NODES)
+}
+
+/// Whether a policy `q` stays inside the share of the narrowed caps the
+/// caller's part leaves it, so [`parse_narrowed_q`] accepts every join of
+/// it with a caller `q` that [`parse_q`] accepts. Judged on the tree alone,
+/// so the verdict is the same for every caller.
+pub fn fits_policy_q(node: &QNode) -> bool {
+    q_nodes(node) <= MAX_POLICY_Q_NODES && paren_depth(node) < MAX_NARROWED_Q_DEPTH
+}
+
+fn parse_capped(input: &str, depth: usize, nodes: usize) -> Result<QNode, NgsiError> {
     let mut p = Parser {
         rest: input.trim(),
         depth: 0,
+        max_depth: depth,
     };
     let node = p.or_expr()?;
     if !p.rest.is_empty() {
         return Err(bad(input, "trailing input"));
     }
-    if q_nodes(&node) > MAX_Q_NODES {
+    if q_nodes(&node) > nodes {
         return Err(NgsiError::TooComplexQuery(format!(
-            "q expression exceeds {MAX_Q_NODES} nodes"
+            "q expression exceeds {nodes} nodes"
         )));
     }
     Ok(node)
@@ -283,7 +350,7 @@ pub fn parse_q(input: &str) -> Result<QNode, NgsiError> {
 /// would compare against a number where the term named text.
 fn is_json_number(s: &str) -> bool {
     let s = s.strip_prefix('-').unwrap_or(s);
-    let digits = |t: &str| t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let digits = |t: &str| t.bytes().take_while(u8::is_ascii_digit).count();
     let int = digits(s);
     if int == 0 || (int > 1 && s.starts_with('0')) {
         return false;
@@ -307,8 +374,24 @@ fn is_json_number(s: &str) -> bool {
 
 fn q_nodes(n: &QNode) -> usize {
     match n {
-        QNode::And(xs) | QNode::Or(xs) => 1 + xs.iter().map(q_nodes).sum::<usize>(),
+        QNode::And(xs) | QNode::Or(xs) => xs.iter().map(q_nodes).fold(1, usize::saturating_add),
         _ => 1,
+    }
+}
+
+/// The parentheses `n` renders with at its deepest, as `render.rs` writes
+/// them: a group inside `;` and an `|` inside `|` are parenthesised.
+fn paren_depth(n: &QNode) -> usize {
+    let deepest = |xs: &[QNode], wrapped: fn(&QNode) -> bool| {
+        xs.iter()
+            .map(|x| paren_depth(x).saturating_add(usize::from(wrapped(x))))
+            .max()
+            .unwrap_or(0)
+    };
+    match n {
+        QNode::And(xs) => deepest(xs, |x| matches!(x, QNode::And(_) | QNode::Or(_))),
+        QNode::Or(xs) => deepest(xs, |x| matches!(x, QNode::Or(_))),
+        _ => 0,
     }
 }
 
@@ -320,6 +403,8 @@ struct Parser<'a> {
     rest: &'a str,
     /// open parentheses currently on the stack (see `MAX_Q_DEPTH`)
     depth: usize,
+    /// the ceiling on `depth`: `MAX_Q_DEPTH` for a caller's `q`
+    max_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -352,14 +437,15 @@ impl<'a> Parser<'a> {
     fn term(&mut self) -> Result<QNode, NgsiError> {
         if self.eat('(') {
             // refuse BEFORE recursing — an overflow here aborts the process
-            self.depth += 1;
-            if self.depth > MAX_Q_DEPTH {
+            self.depth = self.depth.saturating_add(1);
+            if self.depth > self.max_depth {
                 return Err(NgsiError::TooComplexQuery(format!(
-                    "q expression nests deeper than {MAX_Q_DEPTH}"
+                    "q expression nests deeper than {}",
+                    self.max_depth
                 )));
             }
             let node = self.or_expr()?;
-            self.depth -= 1;
+            self.depth = self.depth.saturating_sub(1);
             if !self.eat(')') {
                 return Err(bad(self.rest, "expected ')'"));
             }
@@ -383,36 +469,40 @@ impl<'a> Parser<'a> {
     fn qpath(&mut self) -> Result<QPath, NgsiError> {
         let mut links = Vec::new();
         let mut braces = 0usize;
-        let mut name = self.name_token()?;
+        let mut name = self.name()?;
         // LinkedEntityRelation: AttrName{ [EntityType(,EntityType)*:] … }
         while self.eat('{') {
-            braces += 1;
+            braces = braces.saturating_add(1);
             if braces > 8 {
                 return Err(NgsiError::TooComplexQuery(
                     "q linked-entity path nests deeper than 8".into(),
                 ));
             }
             let mut types = Vec::new();
-            let mut inner = self.name_token()?;
+            let mut inner = self.name()?;
             if self.rest.starts_with(',') || self.rest.starts_with(':') {
                 types.push(inner);
                 while self.eat(',') {
-                    types.push(self.name_token()?);
+                    types.push(self.name()?);
                 }
                 if !self.eat(':') {
                     return Err(bad(self.rest, "expected ':' after EntityType hints"));
                 }
-                inner = self.name_token()?;
+                inner = self.name()?;
             }
             links.push(Link { attr: name, types });
             name = inner;
         }
         let mut path = vec![name];
         while self.eat('.') {
-            path.push(self.name_token()?);
+            path.push(self.name()?);
         }
         let bracket = if self.eat('[') {
+            // spacing inside the bracket is insignificant, so `[ *a]` is
+            // `[*a]` (refused) and never the member name `*a`
+            self.rest = self.rest.trim_start();
             let b = if self.eat('*') {
+                self.rest = self.rest.trim_start();
                 vec!["*".to_owned()]
             } else {
                 let mut b = vec![self.name_token()?];
@@ -440,12 +530,13 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// One path segment: everything up to a structural delimiter.
+    /// One path segment: everything up to a structural delimiter or a
+    /// space of any kind.
     fn name_token(&mut self) -> Result<String, NgsiError> {
         self.rest = self.rest.trim_start();
         let end = self
             .rest
-            .find(|c: char| "=!<>~;|(),.{}[]: ".contains(c))
+            .find(|c: char| c.is_whitespace() || "=!<>~;|(),.{}[]:".contains(c))
             .unwrap_or(self.rest.len());
         let (raw, rest) = self.rest.split_at(end);
         if raw.is_empty() {
@@ -454,6 +545,21 @@ impl<'a> Parser<'a> {
         // spacing around the segment is insignificant (`a ==1`, `a ; b`)
         self.rest = rest.trim_start();
         Ok(raw.to_owned())
+    }
+
+    /// A segment that is a name in the 7.2.3.2 grammar (`AttrName`,
+    /// `EntityType`): the 5.2.2.3 rule every stored name already obeys, so a
+    /// query never names what no entity can hold.
+    fn name(&mut self) -> Result<String, NgsiError> {
+        let at = self.rest;
+        let name = self.name_token()?;
+        if !antares_jsonld::valid_name(&name) {
+            return Err(bad(
+                at,
+                "an attribute or type name is a letter followed by letters, digits or '_'",
+            ));
+        }
+        Ok(name)
     }
 
     fn cmp_op(&mut self) -> Option<CmpOp> {
@@ -577,10 +683,13 @@ impl<'a> Parser<'a> {
             .rest
             .find(|c: char| ";|(),".contains(c))
             .unwrap_or(self.rest.len());
-        let end = match self.rest.find("..") {
-            Some(d) if d < stop => d,
-            _ => stop,
-        };
+        // the Range separator is looked for in this token only: across the
+        // whole rest, every term rescanned the terms after it (T-3706)
+        let end = self
+            .rest
+            .get(..stop)
+            .and_then(|token| token.find(".."))
+            .unwrap_or(stop);
         let (raw, rest) = self.rest.split_at(end);
         let raw = raw.trim();
         // The unquoted alternatives are `dateTime`/`date`/`time` (4.6.3), a
@@ -593,13 +702,22 @@ impl<'a> Parser<'a> {
         match raw {
             "true" => Ok(QValue::Bool(true)),
             "false" => Ok(QValue::Bool(false)),
+            // RFC 8259 section 6 lets a receiver limit the range: a Number
+            // past f64 is refused, as serde_json refuses it in a body, so no
+            // comparison runs against a value no Entity can hold
             _ if is_json_number(raw) => match raw.parse::<f64>() {
-                Ok(n) => Ok(QValue::Num(n)),
-                Err(_) => Ok(QValue::Str(raw.to_owned())),
+                Ok(n) if n.is_finite() => Ok(QValue::Num(n)),
+                _ => Err(bad(raw, "Number is out of range (RFC 8259 section 6)")),
             },
             // the other unquoted alternatives: a URI, a dateTime, a date or a
             // time, all of them compared as text
             "" => Err(bad(raw, "expected value")),
+            // A value that starts with an operator's character is a typo of
+            // the operator (`speed>>`), never the text ">" (T-4084).
+            _ if !regexp && raw.starts_with(['<', '>', '=', '!', '~']) => Err(bad(
+                raw,
+                "an unquoted value starts with no operator character (4.9); quote a text",
+            )),
             _ => Ok(QValue::Str(raw.to_owned())),
         }
     }
@@ -611,12 +729,12 @@ impl<'a> Parser<'a> {
     /// way that reads as either.
     fn json_string_end(s: &str) -> Option<usize> {
         let b = s.as_bytes();
-        let mut i = 1;
-        while i < b.len() {
-            match b[i] {
-                b'\\' => i += 2,
-                b'"' => return Some(i + 1),
-                _ => i += 1,
+        let mut i = 1usize;
+        while let Some(&c) = b.get(i) {
+            match c {
+                b'\\' => i = i.saturating_add(2),
+                b'"' => return i.checked_add(1),
+                _ => i = i.saturating_add(1),
             }
         }
         None
@@ -635,6 +753,45 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-4084: an unquoted value that starts with an operator's character is
+    /// a typo of the operator, refused rather than compared as text.
+    #[test]
+    fn an_unquoted_value_starting_with_an_operator_is_refused() {
+        for q in ["speed>>", "speed>=>", "speed==>1", "speed!=<"] {
+            assert!(parse_q(q).is_err(), "{q}");
+        }
+        for q in [
+            "speed>1",
+            "speed>-1",
+            "name==urn:ngsi-ld:Car:1",
+            "observedAt>2026-01-01T00:00:00Z",
+            "name==\">\"",
+            "name~=>.*",
+        ] {
+            assert!(parse_q(q).is_ok(), "{q}");
+        }
+    }
+
+    /// RFC 3986 2.1: "%" and exactly two hex digits; anything shorter or
+    /// signed stays as written, at the end of the input too (T-3468: the
+    /// decoder walks the bytes without indexing past them).
+    #[test]
+    fn percent_decode_takes_two_hex_digits_and_nothing_else() {
+        for (input, want) in [
+            ("", ""),
+            ("%", "%"),
+            ("%4", "%4"),
+            ("a%41", "aA"),
+            ("%41%", "A%"),
+            ("%+1", "%+1"),
+            ("%zz%2", "%zz%2"),
+            ("%C3%A9", "\u{e9}"),
+            ("\u{e9}%20x", "\u{e9} x"),
+        ] {
+            assert_eq!(percent_decode(input.as_bytes()), want, "{input:?}");
+        }
+    }
 
     /// 4.9 p.85: "`Number` shall be a number as mandated by the JSON
     /// Specification, following the ABNF Grammar, production rule named
@@ -669,11 +826,49 @@ mod tests {
             ("x==1e", QValue::Str("1e".into())),
             ("x==-", QValue::Str("-".into())),
         ] {
-            let QNode::Cmp { value, .. } = parse_q(q).expect(q) else {
-                panic!("{q} is a comparison");
-            };
-            assert_eq!(value, want, "{q}");
+            let node = parse_q(q).expect(q);
+            assert!(
+                matches!(&node, QNode::Cmp { value, .. } if *value == want),
+                "{q}: {node:?}"
+            );
         }
+    }
+
+    /// RFC 8259 section 6: "This specification allows implementations to
+    /// set limits on the range and precision of numbers accepted." A Number
+    /// past f64 is refused, as an entity body holding it is (serde_json);
+    /// read as infinity it would compare against values no Entity can hold
+    /// and render as `inf`, which parses back as a String (found by the
+    /// parse_q fuzz target, fuzz/regressions/parse_q).
+    /// 4.9 `[*]` is the whole bracket, never the start of a member name,
+    /// and spacing inside the bracket is insignificant: `m[ *a]` was read
+    /// as the member `*a` and rendered as `m[*a]`, which is refused (found
+    /// by the parse_q fuzz target, fuzz/regressions/parse_q).
+    #[test]
+    fn a_star_in_a_bracket_is_the_whole_bracket_whatever_the_spacing() {
+        for q in ["m[*a]!=c", "m[ *a]!=c", "m[\t*a]!=c"] {
+            assert!(parse_q(q).is_err(), "{q:?}");
+        }
+        for q in ["m[*]==\"x\"", "m[ * ]==\"x\"", "m[\t*\t]==\"x\""] {
+            let node = parse_q(q).expect(q);
+            assert_eq!(node.to_string(), "m[*]==\"x\"", "{q:?}");
+        }
+    }
+
+    #[test]
+    fn a_number_past_the_float_range_is_refused() {
+        for q in ["A>8e44444", "x==-1e400", "x==1e309..2", "x==1..1E+999"] {
+            assert!(
+                matches!(parse_q(q), Err(NgsiError::BadRequestData(_))),
+                "{q}: {:?}",
+                parse_q(q)
+            );
+        }
+        // below the range is not past it: an underflow is the nearest value
+        assert_eq!(
+            parse_q("x==1e-400").expect("underflow"),
+            parse_q("x==0").expect("zero")
+        );
     }
 
     #[test]
@@ -693,13 +888,10 @@ mod tests {
     fn and_or_precedence() {
         // `a==1;b==2|c==3` == (a AND b) OR c per grammar: OR binds looser
         let q = parse_q("a==1;b==2|c==3").expect("parse");
-        match q {
-            QNode::Or(items) => {
-                assert_eq!(items.len(), 2);
-                assert!(matches!(items[0], QNode::And(_)));
-            }
-            other => panic!("expected Or, got {other:?}"),
-        }
+        assert!(
+            matches!(&q, QNode::Or(items) if items.len() == 2 && matches!(items[0], QNode::And(_))),
+            "{q:?}"
+        );
     }
 
     #[test]
@@ -713,6 +905,50 @@ mod tests {
                 value: QValue::Num(80.5)
             }
         );
+    }
+
+    /// TS 104 175 7.2.3.2 / 5.2.2.3: an attribute path, a linked-entity
+    /// attribute and an EntityType hint are names (`unicodeLetter
+    /// *(unicodeLetter / unicodeNumber / "_")`); anything else is
+    /// BadRequestData rather than a name no entity can hold. Found by the
+    /// parse_q fuzz target's render round-trip (T-3463):
+    /// `(?\n<&3|$$\t)` parsed as the attributes "?\n" and "$$", and the
+    /// tab before `)` was dropped where the one at the end was kept.
+    #[test]
+    fn attribute_names_follow_the_name_grammar() {
+        for refused in [
+            "(?\n<&3|$$\t)",
+            "$$",
+            "brand-name==1",
+            "1st==1",
+            "a\tb==1",
+            "speed.$x==1",
+            "rel{T-1:name}==1",
+            "rel-x{name}==1",
+        ] {
+            assert!(
+                matches!(parse_q(refused), Err(NgsiError::BadRequestData(_))),
+                "{refused:?} parsed"
+            );
+        }
+        for accepted in [
+            "speed==1",
+            "speed\t==1",
+            "(speed\t)",
+            "temperature_2==1",
+            "größe>1",
+            "owner{works{name}}==\"x\"",
+            "rel{Building,Room:name}",
+            "color[en-GB]==\"red\"",
+            "address[city]==\"Berlin\"",
+            "speed.observedAt>\"2020-01-01T00:00:00Z\"",
+        ] {
+            assert!(
+                parse_q(accepted).is_ok(),
+                "{accepted:?} refused: {:?}",
+                parse_q(accepted)
+            );
+        }
     }
 
     #[test]
@@ -849,10 +1085,10 @@ mod tests {
             (r#"a=="""#, ""),
         ] {
             let node = parse_q(q).unwrap_or_else(|e| panic!("{q}: {e:?}"));
-            let QNode::Cmp { value, .. } = node else {
-                panic!("{q}: expected a comparison")
-            };
-            assert_eq!(value, QValue::Str(want.to_owned()), "{q}");
+            assert!(
+                matches!(&node, QNode::Cmp { value: QValue::Str(s), .. } if s == want),
+                "{q}: {node:?}"
+            );
         }
     }
 
@@ -866,13 +1102,11 @@ mod tests {
             "an escaped quote leaves the string open"
         );
         let node = parse_q(r#"a=="ends with a backslash\\";b"#).expect("parses");
-        let QNode::And(items) = node else {
-            panic!("expected an And")
-        };
-        let QNode::Cmp { value, .. } = &items[0] else {
-            panic!("expected a comparison")
-        };
-        assert_eq!(value, &QValue::Str("ends with a backslash\\".to_owned()));
+        assert!(
+            matches!(&node, QNode::And(items)
+                if matches!(&items[0], QNode::Cmp { value: QValue::Str(s), .. } if s == "ends with a backslash\\")),
+            "{node:?}"
+        );
     }
 
     /// An escape RFC 8259 does not define is not a String, so the term is
@@ -918,10 +1152,11 @@ mod complexity_tests {
             .map(|i| format!("a{i}==1"))
             .collect::<Vec<_>>()
             .join(";");
-        match parse_q(&huge) {
-            Err(NgsiError::TooComplexQuery(_)) => {}
-            other => panic!("expected TooComplexQuery, got {other:?}"),
-        }
+        let answer = parse_q(&huge);
+        assert!(
+            matches!(answer, Err(NgsiError::TooComplexQuery(_))),
+            "{answer:?}"
+        );
     }
 
     /// Regression: the parser once recursed per `(` with
@@ -1054,6 +1289,267 @@ mod complexity_tests {
         assert!(matches!(
             parse_q("a!=1"),
             Ok(QNode::Cmp { op: CmpOp::Ne, .. })
+        ));
+    }
+
+    /// 4.17: `,`/`|` is OR, `(a;b)` is AND inside one alternative; names are
+    /// expanded against the @context before they are compared.
+    #[test]
+    fn type_selection_or_and_and() {
+        let ctx = crate::test_core();
+        let d = |t: &str| format!("https://uri.etsi.org/ngsi-ld/default-context/{t}");
+        let (car, bus) = (d("Car"), d("Bus"));
+        let both = [car.as_str(), bus.as_str()];
+        let car_only = [car.as_str()];
+        assert!(type_selection_matches("Car", &car_only, &ctx));
+        assert!(type_selection_matches("Bus,Car", &car_only, &ctx));
+        assert!(type_selection_matches("Bus|Car", &car_only, &ctx));
+        assert!(type_selection_matches("(Car;Bus)", &both, &ctx));
+        assert!(!type_selection_matches("(Car;Bus)", &car_only, &ctx));
+        assert!(!type_selection_matches("Bus", &[], &ctx));
+    }
+
+    /// 5.6.21.4: the referenced top-level names in source order, whether any
+    /// path hops a Linked Entity, and the deepest hop chain.
+    #[test]
+    fn referenced_paths_and_link_depth() {
+        let q = parse_q("speed>1;(brand==\"x\"|sensor{humidity}==2);!owner").expect("parse");
+        assert_eq!(q.attribute_paths(), ["speed", "brand", "sensor", "owner"]);
+        assert!(q.has_linked_paths());
+        assert_eq!(q.max_link_depth(), 1);
+        let flat = parse_q("speed>1|brand==\"x\"").expect("parse");
+        assert!(!flat.has_linked_paths());
+        assert_eq!(flat.max_link_depth(), 0);
+        assert!(is_non_system_attr("speed"));
+        for sys in SYSTEM_ATTRS {
+            assert!(!is_non_system_attr(sys), "{sys}");
+        }
+    }
+
+    /// The unquoted value: `false` is a Boolean, an empty value is refused,
+    /// and a `..` past the next separator belongs to the next term.
+    #[test]
+    fn unquoted_scalars_and_where_a_range_stops() {
+        assert!(matches!(
+            parse_q("a==false").expect("parse"),
+            QNode::Cmp {
+                value: QValue::Bool(false),
+                ..
+            }
+        ));
+        assert!(parse_q("a==").is_err());
+        assert!(parse_q("a==;b==1").is_err());
+        let range = parse_q("a==1;b==2..3").expect("parse");
+        assert_eq!(range, parse_q("(a==1);(b==2..3)").expect("parse"));
+        assert!(
+            matches!(&range, QNode::And(terms) if terms.len() == 2),
+            "{range:?}"
+        );
+    }
+
+    /// The byte ceiling is inclusive: MAX_Q_BYTES parses, one more is
+    /// TooComplexQuery (T-3531 mutant: `>` → `>=`).
+    #[test]
+    fn a_query_of_exactly_the_byte_ceiling_parses() {
+        let at = |n: usize| format!("a==\"{}\"", "x".repeat(n - 5));
+        assert_eq!(at(MAX_Q_BYTES).len(), MAX_Q_BYTES);
+        assert!(parse_q(&at(MAX_Q_BYTES)).is_ok());
+        assert!(matches!(
+            parse_q(&at(MAX_Q_BYTES + 1)),
+            Err(NgsiError::TooComplexQuery(_))
+        ));
+    }
+
+    /// The node budget: a flat chain within the depth limit but past
+    /// MAX_Q_NODES is 400 TooComplexQuery, one node fewer parses.
+    #[test]
+    fn a_query_past_the_node_budget_is_too_complex() {
+        let chain = |n: usize| vec!["a==1"; n].join(";");
+        assert!(parse_q(&chain(MAX_Q_NODES - 1)).is_ok());
+        assert!(matches!(
+            parse_q(&chain(MAX_Q_NODES)),
+            Err(NgsiError::TooComplexQuery(_))
+        ));
+    }
+
+    /// Threat V23: the narrowed caps are the caller's and the policy's
+    /// summed. The largest, the deepest and the longest-rendering `q` a
+    /// caller may send, each term rewritten as a hidden one (`(a;!a)`) and
+    /// joined with the largest and the deepest policy `q` that fits, still
+    /// parse, so the policy's size decides no caller's answer.
+    #[test]
+    #[cfg_attr(miri, ignore)] // a cap-sized input: past the weekly Miri job's 90 min (T-3706)
+    fn every_join_of_an_accepted_q_and_a_fitting_policy_parses() {
+        fn hidden(n: QNode) -> QNode {
+            match n {
+                QNode::And(xs) => QNode::And(xs.into_iter().map(hidden).collect()),
+                QNode::Or(xs) => QNode::Or(xs.into_iter().map(hidden).collect()),
+                _ => QNode::And(vec![parse_q("a").expect("a"), parse_q("!a").expect("!a")]),
+            }
+        }
+        let leaf = || parse_q("b==1").expect("leaf");
+        let mut deep = "a==1".to_owned();
+        for i in 0..MAX_Q_DEPTH {
+            deep = format!("a==1{}({deep})", if i % 2 == 0 { ';' } else { '|' });
+        }
+        let callers = [
+            vec!["a==1"; MAX_Q_NODES - 1].join(";"),
+            deep,
+            vec!["a==1e300"; MAX_Q_BYTES / 9].join(";"),
+        ];
+        let wide = QNode::Or(vec![leaf(); MAX_POLICY_Q_NODES - 1]);
+        // bounded, so a `paren_depth` that stops counting fails here rather
+        // than loop (T-3684: the mutants that did timed out)
+        let mut tall = QNode::And(vec![leaf(), leaf()]);
+        for _ in 0..MAX_NARROWED_Q_DEPTH {
+            if paren_depth(&tall) >= MAX_NARROWED_Q_DEPTH - 1 {
+                break;
+            }
+            tall = QNode::And(vec![leaf(), tall]);
+        }
+        assert_eq!(paren_depth(&tall), MAX_NARROWED_Q_DEPTH - 1);
+        for policy in [&wide, &tall] {
+            assert!(fits_policy_q(policy));
+            for caller in &callers {
+                let own = parse_q(caller).expect("an accepted q");
+                for own in [hidden(own.clone()), own] {
+                    let joined = QNode::And(vec![own, policy.clone()]).to_string();
+                    assert!(parse_narrowed_q(&joined).is_ok(), "{}", &joined[..64]);
+                }
+            }
+        }
+        // the last rendering is past the caller's byte cap, which does not
+        // apply to the broker's own text
+        assert!(callers[2].len() <= MAX_Q_BYTES);
+        assert!(parse_q(&callers[2]).expect("q").to_string().len() > MAX_Q_BYTES);
+        // one node or one level more is a policy that does not fit
+        assert!(!fits_policy_q(&QNode::Or(vec![leaf(); MAX_POLICY_Q_NODES])));
+        assert!(!fits_policy_q(&QNode::And(vec![leaf(), tall])));
+    }
+
+    /// `paren_depth` counts the parentheses the renderer writes: a group
+    /// inside `;`, an `|` inside `|`, never a `;` inside `|`.
+    #[test]
+    fn paren_depth_is_the_rendered_one() {
+        for (q, depth) in [
+            ("a", 0),
+            ("a|b;c", 0),
+            ("a;(b|c)", 1),
+            ("a|(b|c)", 1),
+            ("a;(b;(c|d))", 2),
+        ] {
+            let node = parse_q(q).expect("q");
+            assert_eq!(paren_depth(&node), depth, "{q}");
+            let rendered = node.to_string();
+            let mut open = 0usize;
+            let deepest = rendered.chars().fold(0, |deepest, c| {
+                open = match c {
+                    '(' => open + 1,
+                    ')' => open - 1,
+                    _ => open,
+                };
+                deepest.max(open)
+            });
+            assert_eq!(deepest, depth, "{rendered}");
+        }
+    }
+
+    /// How the narrowed caps are made up (T-3684): the depth is the
+    /// caller's twice over, half for the caller's part and its rewrite,
+    /// half for the policy; the nodes are the caller's rewritten part (each
+    /// term at most three), the conjunction, and the policy share, to the
+    /// node. Each cap is used symbolically everywhere else, so only these
+    /// equations notice one drifting.
+    #[test]
+    fn the_narrowed_caps_add_up() {
+        assert_eq!(MAX_NARROWED_Q_DEPTH, 2 * MAX_Q_DEPTH);
+        assert_eq!(
+            3 * MAX_Q_NODES + 1 + MAX_POLICY_Q_NODES,
+            MAX_NARROWED_Q_NODES
+        );
+    }
+
+    /// Parsing grows with the `q`, not with its square: each unquoted value
+    /// once looked for the Range `..` across the whole rest, so a chain of
+    /// `n` comparisons scanned n²/2 terms (T-3706: the Miri job ran out of
+    /// time inside one 511-term parse). Eight parses of a chain against one
+    /// parse of a chain eight times as long: linear, the two take the same
+    /// time (measured 1.04 to 1.24, also beside twelve busy cores); the old
+    /// scan took 5.1 times as long. Both are timed alternately and of about
+    /// the same length, so a loaded host slows both alike (T-4118: one small
+    /// and one large parse drifted from 9 to 18 under load, against a bound
+    /// of 20).
+    #[test]
+    #[cfg_attr(miri, ignore)] // a wall-clock ratio, measured natively
+    fn parsing_a_chain_grows_linearly() {
+        use std::time::{Duration, Instant};
+        let chain = |n: usize| vec!["a==1"; n].join(";");
+        let (small, large) = (chain(MAX_Q_NODES - 1), chain(MAX_NARROWED_Q_NODES - 1));
+        let (mut eight_small, mut one_large) = (Duration::MAX, Duration::MAX);
+        for _ in 0..31 {
+            let started = Instant::now();
+            for _ in 0..8 {
+                assert!(parse_narrowed_q(&small).is_ok());
+            }
+            eight_small = eight_small.min(started.elapsed());
+            let started = Instant::now();
+            assert!(parse_narrowed_q(&large).is_ok());
+            one_large = one_large.min(started.elapsed());
+        }
+        let ratio = one_large.as_secs_f64() / eight_small.as_secs_f64().max(1e-9);
+        assert!(
+            ratio < 2.5,
+            "one 8x chain took {ratio:.2}x eight short ones"
+        );
+    }
+
+    /// The narrowed caps are ceilings too: past them a narrowed `q` is
+    /// TooComplexQuery, as a caller's is past [`MAX_Q_NODES`].
+    #[test]
+    #[cfg_attr(miri, ignore)] // a cap-sized input: past the weekly Miri job's 90 min (T-3706)
+    fn a_narrowed_q_past_its_caps_is_too_complex() {
+        let chain = |n: usize| vec!["a==1"; n].join(";");
+        assert!(parse_narrowed_q(&chain(MAX_NARROWED_Q_NODES - 1)).is_ok());
+        assert!(matches!(
+            parse_narrowed_q(&chain(MAX_NARROWED_Q_NODES)),
+            Err(NgsiError::TooComplexQuery(_))
+        ));
+        let nested = |d: usize| format!("{}a==1{}", "(".repeat(d), ")".repeat(d));
+        assert!(parse_narrowed_q(&nested(MAX_NARROWED_Q_DEPTH)).is_ok());
+        assert!(matches!(
+            parse_narrowed_q(&nested(MAX_NARROWED_Q_DEPTH + 1)),
+            Err(NgsiError::TooComplexQuery(_))
+        ));
+        assert!(matches!(
+            parse_q(&nested(MAX_Q_DEPTH + 1)),
+            Err(NgsiError::TooComplexQuery(_))
+        ));
+    }
+}
+
+/// Two refusals of the grammar no other test spells, `<=` written back, and a `scope` member
+/// of neither shape 4.19 reads (T-3912).
+#[cfg(test)]
+mod edges {
+    use super::*;
+
+    #[test]
+    fn grammar_edges_and_the_written_form() {
+        let said = |q: &str| parse_q(q).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            said("sensor{Device,Car}==1").contains("expected ':'"),
+            "{}",
+            said("sensor{Device,Car}==1")
+        );
+        assert!(
+            said(r#"a~="abc"#).contains("unterminated string"),
+            "{}",
+            said(r#"a~="abc"#)
+        );
+        assert_eq!(parse_q("a<=1").expect("parse").to_string(), "a<=1");
+        assert!(!scope::scope_matches(
+            "/a",
+            &serde_json::json!({"scope": 5})
         ));
     }
 }

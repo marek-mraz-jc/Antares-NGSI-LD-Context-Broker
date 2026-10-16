@@ -28,6 +28,8 @@ Every optional capability is one cargo feature plus a registration in
 | `antares-broker` | `console` | off | `tokio-console` support; only arms under `RUSTFLAGS="--cfg tokio_unstable"` |
 | `antares-broker` | `mqtt` | on | forwards `antares-api/mqtt`; off, MQTT endpoints fail at subscription creation. Measured on one release build: 27.2 → 26.0 MB binary, 58.1 → 55.4 MiB idle RSS |
 | `antares-broker` | `plugin-example` | off | the reference plugin (`examples/plugin-example`): one more backend, surface, notification binding, policy engine and façade route, all from outside `crates/`. Never in a shipped build |
+| `antares-broker` | `jc-policy` | off | the joinedcontext platform's policy engine (`addons/joinedcontext-policy`, `ANTARES_POLICY=joinedcontext`): the Tenant's Policy rules from `/q/policy/{tenant}`, decided on the gateway's `x-jc-*` headers. Built only into the platform image |
+| `antares-broker` | `full` | off | every surface in one binary: `views`, `mcp`, `odata`, `ws` (ADR-0027). The vanilla image never sets it; `image-jc.yml` builds `full,jc-policy` as `antares-broker-jc` |
 
 The browser artifact (`antares-wasm`) is the one build with `postgres`
 off: it drives the same router over the memory store and the OPFS shadow.
@@ -156,9 +158,15 @@ projecting the entities it carries.
 The `Operation` an engine is given names the clause, the ids, types and
 attributes the request selects, its `q`, `scopeQ` and geo query, and a
 write's body — every name already expanded, so an engine never has to
-carry a JSON-LD context. A batch is one operation carrying every Entity id
-its array names, asked once before any item is written, so a rule written
-over ids reaches the same verdict whichever surface the caller used. The
+carry a JSON-LD context. A batch is decided member by member through
+`decide_each`, before any item is written: each member is the Operation its
+single-Entity write would be (its id, its stored and named types, its
+Attributes, its body), so a rule reaches the same verdict whichever surface
+the caller used. A refused member is reported in the batch's `errors` with
+the AccessDenied problem and the others are applied (`207`); a batch refused
+whole is a `403`. The default `decide_each` calls `decide` per member; an
+engine that asks a server overrides it to ask once, and an answer of the
+wrong length denies the whole batch. The
 same holds for the resources that are not Entities: a Subscription, a
 Context Source Registration, a Snapshot, an EntityMap or a stored
 `@context` is named by its own id, whether the request carries it in the
@@ -168,11 +176,33 @@ process: the seam strips those headers from every forwarded request and
 keeps them out of notifications, logs and dead letters.
 
 A `Filter` is only honoured where the broker can serve less than it was
-asked for: retrieve and query Entities, the two temporal reads, and the
-EntityMap creations behind them (`policy::FILTERABLE`). Return one on any
+asked for: retrieve and query Entities, the two temporal reads, the
+EntityMap creations behind them, and the `/types` and `/attributes`
+discovery reads, where `omit` names a type or an Attribute to hide
+(`policy::FILTERABLE`). Return one on any
 other operation — a create, a delete, a subscription, a registration — and
 the seam answers 403 rather than dropping it; decide those with `Allow` or
 `Deny`.
+
+A write by id whose grant depends on what the stored Entity holds (a zone,
+a status, an owner) is answered `AllowIf(filter)`: the `Operation` shows
+the engine the stored types, scope and Attribute names, never the values,
+so the engine hands the condition to the store instead. The write is
+applied only if the stored Entity matches the filter's `q`, `scopeQ`, areas
+and the types and conditions of its rules, judged inside the store's own
+read-modify-write on the very document it changes, so a concurrent write
+between the decision and the commit cannot carry it onto an Entity the
+condition no longer selects. An Entity it does not select answers `404`
+exactly as an absent one does; a batch judges each member by its own
+Entity and reports the others in `errors`, and a Batch Upsert member under
+a condition never creates: absent, it answers the same `404` (T-3668). The
+temporal writes 5.6.12 to 5.6.15 judge the condition on the evolution's
+latest instance per Attribute and `datasetId` (T-3668); a
+conditioned write that would
+be forwarded to a Context Source is refused (`403`). `AllowIf` holds on the
+clauses in `policy::WRITE_BY_ID` and selects only: on any other clause, or
+with a `pick`, `omit`, `omit_by_type`, `temporal` or a rule's Attribute
+list or windows, the seam answers 403.
 
 A `Filter` may only narrow. Its `q` and `scopeQ` are conjoined into the
 condition the store already had — a `scopeQ` by the 4.19 distribution, so a
@@ -180,12 +210,34 @@ caller filtering by Scope of its own is served the Scopes both select and
 never a Scope the engine ruled out — and `pick`/`omit` project members out
 of every document the answer carries, the Entities `join=` reaches over a
 Relationship included; there is no member it can add and no row it can
-widen the answer to. A `pick`/`omit` name is read in the core `@context`,
+widen the answer to. Its areas, `geo_q` and the list `geo_also`, each
+narrow too: the store query holds them beside the request's own geoquery
+and every one must hold, so a view and an engine that both narrow by area
+compose into one `Filter` with both (`Filter::areas()` reads them all). An
+engine with one area sets `geo_q` and leaves `geo_also` empty. Its `rules`
+allow Attributes per rule (ADR-0023 rule 11): an Entity is served only when
+a rule selects it by one of its `types` and, if the rule lists `ids` or
+`id_patterns`, by its id (an id pattern is anchored at both ends, and one
+that does not compile matches nothing), and the rule's condition holds; it
+keeps the union of those rules' `attributes`. A `pick`/`omit` name is read in the core `@context`,
 never in the caller's, so a request cannot rebind the term a rule names
 and step out from under it; write the rule as an IRI and it is used as written, write it
 as a short name and it means what the default `@context` says. Set
 `restricted` and a narrowed read answers `Antares-Results-Restricted: true`,
-so an operator can tell a short answer from an empty one. Three limits are the seam's, not the engine's: an
+so an operator can tell a short answer from an empty one. Set `warning`
+(a `Warning::new(text)`: printable ASCII on one line, at most 256 bytes, no
+`"` or `\`, refused otherwise) and every read it narrows answers
+`NGSILD-Warning: 199 {alias} "{text}"`, for instance to name the types a
+filter on an Attribute the caller may not filter on left out; the text is the
+engine's, names only what the caller may already see, and a view composed
+with the engine keeps it. Set `temporal` (windows of `observedAt`, each end a
+`TimeBound::At(instant)` or a `TimeBound::Ago(duration)` resolved when the
+request is decided) and a temporal read (5.7.3, 5.7.4) has its own 4.11
+window clamped to every one of them before the store runs, the forward to a
+Context Source included; a window the grant does not reach answers nothing,
+not a refusal, and a request on another `timeproperty` answers nothing. A
+`Rule` may carry windows too: its Attributes' instances outside them are not
+shown through it. Three limits are the seam's, not the engine's: an
 operation over everything the tenant holds — delete-by-type, purge, the
 whole-tenant snapshot clauses — is `Allow` or `Deny` and never a `Filter`,
 because doing it to less than it says is a data-loss bug; a `Filter` on a
@@ -210,6 +262,20 @@ build and before the image build, and refuses a dependency tree naming a
 crate under `examples/` or any engine or façade crate; `k8s-smoke` then
 asserts the deployed image reports `allow-all` and no surface beyond
 `admin`.
+
+Every workspace package names its place in that layering in
+`[package.metadata.antares] role`: `core`, `ngsild`, `ops`, `surface`,
+`protocol` or `addon` (ADR-0027). `dev/check-module-rules.py` reads `cargo
+metadata` and refuses a package without one, a protocol crate that depends
+on an `antares-*` crate, an `ngsild` crate (pure NGSI-LD, embeddable
+outside the broker) that links by default anything but other `ngsild`
+crates and the external crates `NGSILD_EXTERNAL` names (rule M3), a surface that is not its own optional feature of
+`antares-broker` or reaches past `antares-ops` and its protocols, an
+`antares-ops` that depends on or re-exports the store, a broker `default`
+that links any of them, and an ops, surface or protocol crate without the
+full `[lints]` table or with a default-featured registry dependency it gives
+no reason for. Its `--self-test` runs first, on a synthetic workspace with
+each violation planted once.
 
 Adding one is a struct implementing the trait plus an entry in
 `POLICY_SHELF` (`crates/antares-broker/src/main.rs`); no core crate
@@ -243,6 +309,15 @@ contract and then answers real requests through the router;
 `ngsi-ld-test-suite/AntaresSpecificTests/policy_engine.robot` does the same
 against a running broker, and `.github/workflows/examples.yml` runs the
 conformance suite on `allow-all` and that folder on the engine, in one job.
+
+`addons/joinedcontext-policy` is the engine a deployment runs in
+production: the joinedcontext platform loads each Tenant's Policy rules
+through `/q/policy/{tenant}` and the engine decides on the caller the
+gateway forwards. Its README is the rule document contract, and
+`addons/joinedcontext-policy/tests/engine.rs` holds it through the router. The
+same addon ships the `access` surface (`/x/views/{view}/access`, README
+section 4): the caller's grants and the AuthZEN check, read from the table
+the engine decides with.
 
 ### Façades for another standard
 

@@ -35,6 +35,19 @@ pub struct Repr {
     /// not.
     pub policy_pick: Option<Vec<ProjNode>>,
     pub policy_omit: Option<Vec<ProjNode>>,
+    /// The narrowing's row predicate, carried down the join walk like the
+    /// policy projection: a Linked Entity is read the way the Linking Entity
+    /// was (5.7.1.4), so one outside the narrowing is not embedded.
+    pub policy_reach: Option<std::sync::Arc<PolicyReach>>,
+    /// The narrowing's rules (ADR-0023 rule 11), names expanded
+    /// ([`type_rules`]). Each document is judged by its own rules, so this
+    /// too travels down the join walk unchanged.
+    pub policy_types: Option<std::sync::Arc<crate::policy::Filter>>,
+    /// The client's own `q`, apart from the engine's ([`note_reads`]): under
+    /// rules it is evaluated on each Entity as it is shown, so an Attribute
+    /// a matched rule does not show is absent to it (ADR-0023 rule 11, rule
+    /// 2 per Entity). `None` unless `policy_types` is set.
+    pub policy_client_q: Option<antares_ql::QNode>,
     pub lang: Option<String>,
     /// datasetId= instance filter; entry "@none" selects default instances.
     pub dataset_id: Option<Vec<String>>,
@@ -181,13 +194,302 @@ pub fn narrow_projection(
 /// The Entity frame survives a policy pick — 5.2.4 makes `id` and `type`
 /// the Entity, and a document without them is not one — which is why the
 /// policy pick is applied to Attributes and never to the core members.
-pub fn narrow_repr(r: &mut Repr, f: &crate::policy::Filter) {
+pub fn narrow_repr(r: &mut Repr, f: &std::sync::Arc<crate::policy::Filter>) {
+    // A view or an engine answers every request with the same narrowing,
+    // and the gate hands it out as one shared `Arc`: its reach is built
+    // once and handed out again while that `Arc` comes back. The memo
+    // holds the `Arc` itself, so its address cannot be reused by another
+    // Filter while it is kept, and `ptr_eq` never answers for rules other
+    // than its own (O16).
+    type Reached = (
+        std::sync::Arc<crate::policy::Filter>,
+        Option<std::sync::Arc<PolicyReach>>,
+        Option<std::sync::Arc<crate::policy::Filter>>,
+    );
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<Reached>> = const { std::cell::RefCell::new(None) };
+    }
+    let hit = LAST.with_borrow(|last| {
+        last.as_ref()
+            .filter(|l| std::sync::Arc::ptr_eq(&l.0, f))
+            .map(|l| (l.1.clone(), l.2.clone()))
+    });
+    let (reach, rules) = hit.unwrap_or_else(|| {
+        let built = reach_of(f);
+        LAST.set(Some((f.clone(), built.0.clone(), built.1.clone())));
+        built
+    });
+    fill(r, f, reach, rules);
+}
+
+/// The reach of `f` and its expanded rules, built afresh.
+fn reach_of(
+    f: &crate::policy::Filter,
+) -> (
+    Option<std::sync::Arc<PolicyReach>>,
+    Option<std::sync::Arc<crate::policy::Filter>>,
+) {
+    let reach = crate::policy::Condition::of(f);
+    let rules = reach.as_ref().and_then(|r| r.rules.clone());
+    let reach = reach.map(std::sync::Arc::new);
+    (reach, rules)
+}
+
+fn fill(
+    r: &mut Repr,
+    f: &crate::policy::Filter,
+    reach: Option<std::sync::Arc<PolicyReach>>,
+    rules: Option<std::sync::Arc<crate::policy::Filter>>,
+) {
+    if reach.is_some() {
+        r.policy_reach = reach;
+    }
     if !f.omit.is_empty() {
         r.policy_omit = Some(policy_nodes(&f.omit));
     }
     if !f.pick.is_empty() {
         r.policy_pick = Some(policy_nodes(&f.pick));
     }
+    r.policy_types = rules;
+}
+
+/// The narrowing's rules with every type and Attribute name expanded
+/// against [`POLICY_CONTEXT`], the form an internal document's keys and
+/// `type` values are in; `None` when the narrowing has none. Conditions
+/// stay as written: [`shown`] reads them through the same context.
+pub(crate) fn type_rules(
+    f: &crate::policy::Filter,
+) -> Option<std::sync::Arc<crate::policy::Filter>> {
+    if !f.has_rules() {
+        return None;
+    }
+    // The expansion is a function of the rules alone, and a view or an
+    // engine answers every request with the same ones: the last expansion
+    // is kept per thread and handed out again while its rules come back
+    // (T-3667). It is keyed by the whole input, so it never answers for
+    // rules other than its own (O16).
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(crate::policy::Filter, std::sync::Arc<crate::policy::Filter>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let hit = LAST.with_borrow(|last| {
+        last.as_ref()
+            .filter(|l| l.0.rules == f.rules && l.0.omit_by_type == f.omit_by_type)
+            .map(|l| l.1.clone())
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let expand = |names: &[String]| -> Vec<String> {
+        names.iter().map(|n| POLICY_CONTEXT.expand_key(n)).collect()
+    };
+    let expanded = std::sync::Arc::new(crate::policy::Filter {
+        rules: f
+            .rules
+            .iter()
+            .map(|r| crate::policy::Rule {
+                types: expand(&r.types),
+                attributes: expand(&r.attributes),
+                q: r.q.clone(),
+                scope_q: r.scope_q.clone(),
+                geo_q: r.geo_q.clone(),
+                geo_also: r.geo_also.clone(),
+                ids: r.ids.clone(),
+                id_patterns: r.id_patterns.clone(),
+                every_attribute: r.every_attribute,
+                temporal: r.temporal.clone(),
+            })
+            .collect(),
+        omit_by_type: f
+            .omit_by_type
+            .iter()
+            .map(|(t, attrs)| (POLICY_CONTEXT.expand_key(t), expand(attrs)))
+            .collect(),
+        ..crate::policy::Filter::default()
+    });
+    let key = crate::policy::Filter {
+        rules: f.rules.clone(),
+        omit_by_type: f.omit_by_type.clone(),
+        ..crate::policy::Filter::default()
+    };
+    LAST.set(Some((key, expanded.clone())));
+    Some(expanded)
+}
+
+/// What the expanded `rules` let the INTERNAL document `doc` show: every
+/// member without rules, `None` when no rule holds for it.
+pub(crate) fn shown<'a>(
+    rules: Option<&'a crate::policy::Filter>,
+    doc: &Value,
+) -> Option<crate::policy::Shown<'a>> {
+    match rules {
+        None => Some(crate::policy::Shown::default()),
+        Some(f) => f.shown(doc, &POLICY_CONTEXT),
+    }
+}
+
+/// The client's own `q` as the query path reads it (4.9 `expandValues`
+/// applied), from the request as sent.
+pub(crate) fn client_q(
+    params: &HashMap<String, String>,
+    ctx: &Context,
+) -> Result<Option<antares_ql::QNode>, NgsiError> {
+    params
+        .get("q")
+        .map(|q| {
+            Ok(antares_ql::eval::apply_expand_values(
+                antares_ql::parse_q(q)?,
+                antares_ql::eval::expansion_list(
+                    params.get("expandValues").map(String::as_str),
+                    params.get("jsonKeys").map(String::as_str),
+                )
+                .as_deref(),
+                ctx,
+            ))
+        })
+        .transpose()
+}
+
+/// [`narrowing`] holding the client's own `q` as well, for a caller that
+/// runs a query under the narrowing ([`note_reads`]).
+pub(crate) fn narrowing_reading(
+    f: &crate::policy::Filter,
+    client_params: &HashMap<String, String>,
+    ctx: &Context,
+) -> Result<Repr, NgsiError> {
+    let mut r = narrowing(f);
+    note_reads(&mut r, client_params, ctx)?;
+    Ok(r)
+}
+
+/// Record the client's own `q` on a narrowed representation, before the
+/// engine's is conjoined into the parameters; nothing to do without rules.
+pub(crate) fn note_reads(
+    r: &mut Repr,
+    client_params: &HashMap<String, String>,
+    ctx: &Context,
+) -> Result<(), NgsiError> {
+    if r.policy_types.is_some() {
+        r.policy_client_q = client_q(client_params, ctx)?;
+    }
+    Ok(())
+}
+
+/// Order `docs` by what each one shows, so `orderBy` on an Attribute the
+/// narrowing hides orders as if it were absent (ADR-0023 rule 2, 7.6.2.2)
+/// and never by the hidden value. Without a projecting narrowing, `order`
+/// runs on `docs` as they are.
+pub(crate) fn order_as_shown<E>(
+    docs: &mut Vec<Value>,
+    narrow: Option<&Repr>,
+    order: impl FnOnce(&mut Vec<Value>) -> Result<(), E>,
+) -> Result<(), E> {
+    let Some(r) = narrow
+        .filter(|r| r.policy_pick.is_some() || r.policy_omit.is_some() || r.policy_types.is_some())
+    else {
+        return order(docs);
+    };
+    // the position travels under a key no expanded IRI or core member can
+    // take, and comes back off the ordered views
+    const AT: &str = " position";
+    let mut views: Vec<Value> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let mut v = policy_view(d, r);
+            if let Some(o) = v.as_object_mut() {
+                o.insert(AT.to_owned(), Value::from(i));
+            }
+            v
+        })
+        .collect();
+    order(&mut views)?;
+    let mut slots: Vec<Option<Value>> = std::mem::take(docs).into_iter().map(Some).collect();
+    *docs = views
+        .iter()
+        .filter_map(|v| v.get(AT).and_then(Value::as_u64))
+        .filter_map(|i| slots.get_mut(usize::try_from(i).ok()?)?.take())
+        .collect();
+    Ok(())
+}
+
+/// The rows a narrowing admits (ADR-0020 `Filter::q`, `scope_q` and its
+/// areas).
+#[derive(Debug, Clone)]
+pub struct PolicyReach {
+    pub q: Option<antares_ql::QNode>,
+    pub scope_q: Option<String>,
+    /// Every area the narrowing holds; each must hold (ADR-0023 rule 1).
+    pub areas: Vec<antares_ql::geo::GeoQuery>,
+    /// The narrowing's expanded rules: an Entity none of them holds for is
+    /// not admitted (ADR-0023 rule 11).
+    pub rules: Option<std::sync::Arc<crate::policy::Filter>>,
+}
+
+/// Whether the narrowing admits the INTERNAL document `doc`; no narrowing
+/// admits everything. The one check the retrieve answer and every joined
+/// Entity go through, so a join cannot reach a row the retrieve hides.
+pub(crate) async fn policy_admits(
+    st: &AppState,
+    tenant: &TenantId,
+    ctx: &Context,
+    reach: Option<&PolicyReach>,
+    doc: &Value,
+) -> bool {
+    let Some(reach) = reach else {
+        return true;
+    };
+    if shown(reach.rules.as_deref(), doc).is_none() {
+        return false;
+    }
+    if let Some(scope) = &reach.scope_q {
+        if !crate::scope_matches(scope, doc) {
+            return false;
+        }
+    }
+    if !reach.areas.iter().all(|geo| geo.matches(doc, ctx)) {
+        return false;
+    }
+    match &reach.q {
+        Some(ast) => {
+            crate::notify::linked_eval(st, tenant, None, |l| {
+                antares_ql::eval::eval_q(ast, doc, ctx, l)
+            })
+            .await
+        }
+        None => true,
+    }
+}
+
+/// The INTERNAL document `doc` as the narrowing lets it be read: the
+/// Entity frame and the Attributes the policy projection keeps.
+pub(crate) fn policy_view(doc: &Value, r: &Repr) -> Value {
+    if r.policy_pick.is_none() && r.policy_omit.is_none() && r.policy_types.is_none() {
+        return doc.clone();
+    }
+    let shown = shown(r.policy_types.as_deref(), doc).unwrap_or_else(crate::policy::Shown::nothing);
+    match doc.as_object() {
+        Some(obj) => Value::Object(
+            obj.iter()
+                .filter(|(k, _)| {
+                    is_meta(k)
+                        || (policy_projected(r.policy_pick.as_deref(), r.policy_omit.as_deref(), k)
+                            && shown.allows(k))
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        None => doc.clone(),
+    }
+}
+
+/// The narrowing half of a representation alone, for a caller that holds
+/// the Filter but builds no representation of its own.
+pub fn narrowing(f: &crate::policy::Filter) -> Repr {
+    let mut r = Repr::default();
+    let (reach, rules) = reach_of(f);
+    fill(&mut r, f, reach, rules);
+    r
 }
 
 /// The same `pick`/`omit` names in the form an already-compacted document
@@ -206,9 +508,18 @@ pub fn compacted_filter(f: &crate::policy::Filter, ctx: &Context) -> crate::poli
             .map(|n| ctx.compact_iri(&n.iri))
             .collect()
     };
+    let by_type = |m: &std::collections::BTreeMap<String, Vec<String>>| {
+        m.iter()
+            .map(|(t, attrs)| (ctx.compact_iri(&POLICY_CONTEXT.expand_key(t)), names(attrs)))
+            .collect()
+    };
+    // the rules' conditions read the stored Entity, not this compacted
+    // one: the notification path evaluates them itself (`notify::shown_now`)
     crate::policy::Filter {
         pick: names(&f.pick),
         omit: names(&f.omit),
+        rules: Vec::new(),
+        omit_by_type: by_type(&f.omit_by_type),
         ..f.clone()
     }
 }
@@ -222,6 +533,11 @@ pub fn compacted_filter(f: &crate::policy::Filter, ctx: &Context) -> crate::poli
 /// the caller sends. ADR-0020 asks an engine to write its rules as IRIs and
 /// those pass through unchanged; a short name is read here the way a name a
 /// request does not define is read anywhere else.
+/// [`POLICY_CONTEXT`], for the rule conditions read outside this module.
+pub(crate) fn policy_context() -> &'static Context {
+    &POLICY_CONTEXT
+}
+
 static POLICY_CONTEXT: std::sync::LazyLock<Context> =
     std::sync::LazyLock::new(antares_jsonld::core_context);
 
@@ -252,7 +568,7 @@ pub fn proj_depth(nodes: &[ProjNode]) -> usize {
     nodes
         .iter()
         .map(|n| match &n.children {
-            Some(c) => 1 + proj_depth(c),
+            Some(c) => proj_depth(c).saturating_add(1),
             None => 0,
         })
         .max()
@@ -301,12 +617,13 @@ pub(crate) fn parse_projection(s: &str, ctx: &Context) -> Result<Vec<ProjNode>, 
         let mut start = 0usize;
         for (i, c) in s.char_indices() {
             match c {
-                '{' => depth += 1,
+                '{' => depth = depth.saturating_add(1),
                 '}' => depth = depth.checked_sub(1)?,
                 // 4.21 orOp = | / , — both split at the same depth
                 ',' | '|' if depth == 0 => {
                     out.push(&s[start..i]);
-                    start = i + 1;
+                    // the separator is one byte
+                    start = i.saturating_add(1);
                 }
                 _ => {}
             }
@@ -323,17 +640,27 @@ pub(crate) fn parse_projection(s: &str, ctx: &Context) -> Result<Vec<ProjNode>, 
             if t.is_empty() {
                 return Err(bad("empty projection member"));
             }
-            let (head_part, children) = match t.find('{') {
-                Some(i) => {
-                    let inner = t[i + 1..]
+            let (head_part, children) = match t.split_once('{') {
+                Some((head, rest)) => {
+                    let inner = rest
                         .strip_suffix('}')
                         .ok_or_else(|| bad("unclosed brace"))?;
-                    (&t[..i], Some(parse_nodes(inner, ctx)?))
+                    (head, Some(parse_nodes(inner, ctx)?))
                 }
                 None => (t, None),
             };
-            let head = head_part.split('.').next().unwrap_or(head_part);
-            if head.is_empty() || head_part.split('.').any(str::is_empty) {
+            // An IRI (a `:` before any `.`) is one Attribute name (5.5.7):
+            // the dotted path is a short name's syntax only.
+            let iri = match (head_part.find(':'), head_part.find('.')) {
+                (Some(colon), Some(dot)) => colon < dot,
+                (colon, _) => colon.is_some(),
+            };
+            let head = if iri {
+                head_part
+            } else {
+                head_part.split('.').next().unwrap_or(head_part)
+            };
+            if head.is_empty() || (!iri && head_part.split('.').any(str::is_empty)) {
                 return Err(bad("empty path segment"));
             }
             if !head
@@ -418,6 +745,9 @@ pub fn apply(doc: &Value, r: &Repr) -> Value {
     let Some(obj) = doc.as_object() else {
         return doc.clone();
     };
+    // an Entity no rule holds for was left out before it got here; one that
+    // arrives anyway shows its frame only
+    let shown = shown(r.policy_types.as_deref(), doc).unwrap_or_else(crate::policy::Shown::nothing);
     let mut out = Map::new();
     for (k, v) in obj {
         let is_meta = ENTITY_META.contains(&k.as_str());
@@ -454,7 +784,9 @@ pub fn apply(doc: &Value, r: &Repr) -> Value {
                 continue;
             }
         }
-        if !policy_projected(r.policy_pick.as_deref(), r.policy_omit.as_deref(), k) {
+        if !policy_projected(r.policy_pick.as_deref(), r.policy_omit.as_deref(), k)
+            || !shown.allows(k)
+        {
             continue;
         }
         let raw: Vec<Value> = v.as_array().cloned().unwrap_or_else(|| vec![v.clone()]);
@@ -699,6 +1031,8 @@ fn joined_repr(parent: &crate::repr::Repr, key_compact: &str, key_iri: &str) -> 
         // travels to every document the answer carries
         policy_pick: parent.policy_pick.clone(),
         policy_omit: parent.policy_omit.clone(),
+        policy_reach: parent.policy_reach.clone(),
+        policy_types: parent.policy_types.clone(),
         ..Default::default()
     };
     if let Some(pick) = &parent.pick {
@@ -798,96 +1132,77 @@ pub async fn inline_join_beyond(
     walk.complete
 }
 
-async fn inline_join_walk(
-    st: &AppState,
-    tenant: &TenantId,
+/// One place in a compacted document where Linked Entities join: the JSON
+/// pointer of a Relationship instance (or, simplified, of its URI string),
+/// the representation its targets take, how they are written, and their ids.
+struct Slot {
+    at: String,
+    child: crate::repr::Repr,
+    kind: SlotKind,
+    targets: Vec<String>,
+}
+
+enum SlotKind {
+    /// 4.5.23.2 normalized: the targets go under "entity".
+    Entity,
+    /// 4.5.22.2: a ListRelationship's targets go under "entityList".
+    EntityList,
+    /// simplified: the URI string itself is replaced by the target.
+    Replace,
+}
+
+/// A key as one JSON pointer segment (RFC 6901: `~` and `/` escaped).
+fn segment(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// The join slots of one compacted document, in document order.
+fn slots_of(
     ctx: &antares_jsonld::Context,
     repr: &crate::repr::Repr,
-    compacted: &mut Value,
-    level: usize,
-    walk: &mut JoinWalk,
-) {
-    let Some(obj) = compacted.as_object_mut() else {
-        return;
+    doc: &Value,
+    at: &str,
+) -> Vec<Slot> {
+    let mut out = Vec::new();
+    let Some(obj) = doc.as_object() else {
+        return out;
     };
     let metas = ["id", "type", "scope", "createdAt", "modifiedAt", "@context"];
-    for (k, v) in obj.iter_mut() {
+    for (k, v) in obj {
         if metas.contains(&k.as_str()) {
             continue;
         }
         let child = joined_repr(repr, k, &ctx.expand_key(k));
-        // boxed: an async fn cannot recurse inline
-        Box::pin(inline_join_value(
-            st, tenant, ctx, repr, &child, v, level, walk,
-        ))
-        .await;
+        slots_in(repr, &child, v, format!("{at}/{}", segment(k)), &mut out);
     }
+    out
 }
 
-async fn lookup_joined(
-    st: &AppState,
-    tenant: &TenantId,
-    ctx: &antares_jsonld::Context,
-    child: &crate::repr::Repr,
-    id: &str,
-    level: usize,
-    walk: &mut JoinWalk,
-) -> Option<Value> {
-    if walk.budget == 0 {
-        walk.complete = false;
-        return None;
-    }
-    walk.budget -= 1;
-    let target = st
-        .store
-        .get(tenant, Kind::Entity, id)
-        .await
-        .ok()
-        .flatten()?;
-    let shaped = apply(&target, child);
-    let mut c = compact_for(child, &shaped, ctx);
-    if level > 1 {
-        if walk.seen.insert(id.to_owned()) {
-            inline_join_walk(st, tenant, ctx, child, &mut c, level - 1, walk).await;
-        } else {
-            // 4.5.23.1: an already-resolved target is a loop or a duplicate —
-            // it is still embedded, but its own links are not walked again.
-            walk.complete = false;
-        }
-    }
-    Some(c)
-}
-
-#[allow(clippy::too_many_arguments)] // one param per piece of the traversal's state
-async fn inline_join_value(
-    st: &AppState,
-    tenant: &TenantId,
-    ctx: &antares_jsonld::Context,
+fn slots_in(
     repr: &crate::repr::Repr,
     child: &crate::repr::Repr,
-    v: &mut Value,
-    level: usize,
-    walk: &mut JoinWalk,
+    v: &Value,
+    at: String,
+    out: &mut Vec<Slot>,
 ) {
+    let slot = |kind, targets| Slot {
+        at: at.clone(),
+        child: child.clone(),
+        kind,
+        targets,
+    };
     match v {
         Value::Array(items) => {
-            for i in items {
-                // boxed: an async fn cannot recurse inline
-                Box::pin(inline_join_value(
-                    st, tenant, ctx, repr, child, i, level, walk,
-                ))
-                .await;
+            for (i, item) in items.iter().enumerate() {
+                slots_in(repr, child, item, format!("{at}/{i}"), out);
             }
         }
+        Value::Object(_) if repr.key_values => {}
         Value::Object(inst) => {
-            if repr.key_values {
-                return;
-            }
-            // 4.5.22.2: a ListRelationship's targets join under the
-            // output-only "entityList" member (always an array). The
-            // compacted objectList carries {"object": URI} entries.
+            // 4.5.22.2: the compacted objectList carries {"object": URI}
+            // entries (or bare URIs).
             if let Some(Value::Array(ol)) = inst.get("objectList") {
-                let targets: Vec<String> = ol
+                let targets = ol
                     .iter()
                     .filter_map(|e| match e {
                         Value::String(id) => Some(id.clone()),
@@ -897,18 +1212,10 @@ async fn inline_join_value(
                         _ => None,
                     })
                     .collect();
-                let mut joined: Vec<Value> = Vec::new();
-                for id in &targets {
-                    if let Some(j) = lookup_joined(st, tenant, ctx, child, id, level, walk).await {
-                        joined.push(j);
-                    }
-                }
-                if !joined.is_empty() {
-                    inst.insert("entityList".into(), Value::Array(joined));
-                }
+                out.push(slot(SlotKind::EntityList, targets));
                 return;
             }
-            let targets: Vec<String> = match inst.get("object") {
+            let targets = match inst.get("object") {
                 Some(Value::String(id)) => vec![id.clone()],
                 Some(Value::Array(a)) => a
                     .iter()
@@ -917,30 +1224,137 @@ async fn inline_join_value(
                     .collect(),
                 _ => return,
             };
-            let mut joined: Vec<Value> = Vec::new();
-            for id in &targets {
-                if let Some(j) = lookup_joined(st, tenant, ctx, child, id, level, walk).await {
-                    joined.push(j);
-                }
-            }
-            if joined.is_empty() {
-                return;
-            }
-            let e = if joined.len() == 1 {
-                joined.remove(0)
-            } else {
-                Value::Array(joined)
-            };
-            inst.insert("entity".into(), e);
+            out.push(slot(SlotKind::Entity, targets));
         }
-        // simplified: relationship value is the object URI string
-        Value::String(id) if repr.key_values => {
-            if let Some(joined) = lookup_joined(st, tenant, ctx, child, id, level, walk).await {
-                *v = joined;
-            }
-        }
+        Value::String(id) if repr.key_values => out.push(slot(SlotKind::Replace, vec![id.clone()])),
         _ => {}
     }
+}
+
+/// TS 104 175 7.7.4 Depth of retrieval: the walk goes breadth-first, one
+/// depth at a time, so the first time an Entity is met is at its shallowest
+/// depth, and that is where its own Linked Entities expand; every later
+/// encounter embeds it without walking it again (4.5.23.1). Depth-first, an
+/// Entity met first deep spent its one expansion there and stayed bare at
+/// depth 1. The lookup budget and the `seen` set are the same ones.
+async fn inline_join_walk(
+    st: &AppState,
+    tenant: &TenantId,
+    ctx: &antares_jsonld::Context,
+    repr: &crate::repr::Repr,
+    compacted: &mut Value,
+    level: usize,
+    walk: &mut JoinWalk,
+) {
+    let mut frontier = vec![(String::new(), repr.clone(), level)];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for (at, repr, level) in frontier {
+            let slots = match compacted.pointer(&at) {
+                Some(doc) => slots_of(ctx, &repr, doc, &at),
+                None => continue,
+            };
+            for slot in slots {
+                let mut joined = Vec::new();
+                for id in &slot.targets {
+                    if let Some(found) =
+                        lookup_joined(st, tenant, ctx, &slot.child, id, level, walk).await
+                    {
+                        joined.push(found);
+                    }
+                }
+                if joined.is_empty() {
+                    continue;
+                }
+                let Some(place) = compacted.pointer_mut(&slot.at) else {
+                    continue;
+                };
+                let single = joined.len() == 1;
+                let (docs, expand): (Vec<Value>, Vec<bool>) = joined.into_iter().unzip();
+                let at = match slot.kind {
+                    SlotKind::Replace => {
+                        *place = docs.into_iter().next().unwrap_or(Value::Null);
+                        vec![slot.at.clone()]
+                    }
+                    SlotKind::EntityList => {
+                        let count = docs.len();
+                        if let Some(inst) = place.as_object_mut() {
+                            inst.insert("entityList".into(), Value::Array(docs));
+                        }
+                        (0..count)
+                            .map(|i| format!("{}/entityList/{i}", slot.at))
+                            .collect()
+                    }
+                    SlotKind::Entity if single => {
+                        if let Some(inst) = place.as_object_mut() {
+                            inst.insert(
+                                "entity".into(),
+                                docs.into_iter().next().unwrap_or(Value::Null),
+                            );
+                        }
+                        vec![format!("{}/entity", slot.at)]
+                    }
+                    SlotKind::Entity => {
+                        let count = docs.len();
+                        if let Some(inst) = place.as_object_mut() {
+                            inst.insert("entity".into(), Value::Array(docs));
+                        }
+                        (0..count)
+                            .map(|i| format!("{}/entity/{i}", slot.at))
+                            .collect()
+                    }
+                };
+                for (child_at, expand) in at.into_iter().zip(expand) {
+                    if expand {
+                        next.push((child_at, slot.child.clone(), level.saturating_sub(1)));
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+}
+
+/// One Linked Entity read under the walk's budget and the narrowing: the
+/// compacted target, and whether its own links are expanded (the first time
+/// it is met, while depth remains). A target outside the narrowing reads as
+/// absent, like a dangling link.
+async fn lookup_joined(
+    st: &AppState,
+    tenant: &TenantId,
+    ctx: &antares_jsonld::Context,
+    child: &crate::repr::Repr,
+    id: &str,
+    level: usize,
+    walk: &mut JoinWalk,
+) -> Option<(Value, bool)> {
+    if walk.budget == 0 {
+        walk.complete = false;
+        return None;
+    }
+    walk.budget = walk.budget.saturating_sub(1);
+    let target = st
+        .store
+        .get(tenant, Kind::Entity, id)
+        .await
+        .ok()
+        .flatten()?;
+    if !policy_admits(st, tenant, ctx, child.policy_reach.as_deref(), &target).await {
+        return None;
+    }
+    let shaped = apply(&target, child);
+    let c = compact_for(child, &shaped, ctx);
+    let mut expand = false;
+    if level > 1 {
+        if walk.seen.insert(id.to_owned()) {
+            expand = true;
+        } else {
+            // 4.5.23.1: an already-resolved target is a loop or a duplicate —
+            // it is still embedded, but its own links are not walked again.
+            walk.complete = false;
+        }
+    }
+    Some((c, expand))
 }
 
 /// Linked Entity Retrieval, flattened form (4.5.23.3): collect targets with
@@ -951,12 +1365,13 @@ async fn inline_join_value(
 pub async fn collect_flat(
     st: &AppState,
     tenant: &TenantId,
+    ctx: &Context,
     repr: &crate::repr::Repr,
     internal_doc: &Value,
     level: usize,
     out: &mut std::collections::BTreeMap<String, (Value, crate::repr::Repr)>,
 ) -> bool {
-    collect_flat_beyond(st, tenant, repr, internal_doc, level, out, &[], &mut {
+    collect_flat_beyond(st, tenant, ctx, repr, internal_doc, level, out, &[], &mut {
         MAX_JOIN_LOOKUPS
     })
     .await
@@ -968,6 +1383,7 @@ pub async fn collect_flat(
 pub async fn collect_flat_beyond(
     st: &AppState,
     tenant: &TenantId,
+    ctx: &Context,
     repr: &crate::repr::Repr,
     internal_doc: &Value,
     level: usize,
@@ -981,88 +1397,104 @@ pub async fn collect_flat_beyond(
         *budget,
     );
     walk.seen.extend(out.keys().cloned());
-    collect_flat_walk(st, tenant, repr, internal_doc, level, out, &mut walk).await;
+    collect_flat_walk(st, tenant, ctx, repr, internal_doc, level, out, &mut walk).await;
     *budget = walk.budget;
     walk.complete
 }
 
+/// Breadth-first like [`inline_join_walk`] (TS 104 175 7.7.4): every Entity
+/// of one depth is collected before the next depth is read, so an Entity is
+/// walked from its shallowest occurrence and its Linked Entities get the
+/// depth that occurrence leaves.
 #[allow(clippy::too_many_arguments)] // one param per piece of the traversal's state
 async fn collect_flat_walk(
     st: &AppState,
     tenant: &TenantId,
+    ctx: &Context,
     repr: &crate::repr::Repr,
     internal_doc: &Value,
     level: usize,
     out: &mut std::collections::BTreeMap<String, (Value, crate::repr::Repr)>,
     walk: &mut JoinWalk,
 ) {
-    let Some(obj) = internal_doc.as_object() else {
-        return;
-    };
-    for (k, v) in obj {
-        if is_meta(k) {
-            continue;
-        }
-        // only traverse relationships that survive THIS doc's projection
-        if let Some(pick) = &repr.pick {
-            if !pick.iter().any(|n| n.iri == *k || n.raw == *k) {
+    let mut frontier = vec![(internal_doc.clone(), repr.clone(), level)];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for (doc, repr, level) in &frontier {
+            let Some(obj) = doc.as_object() else {
                 continue;
-            }
-        }
-        if let Some(omit) = &repr.omit {
-            if omit
-                .iter()
-                .any(|n| (n.iri == *k || n.raw == *k) && n.children.is_none())
-            {
-                continue;
-            }
-        }
-        // a Relationship the subject may not see is not a road either
-        if !policy_projected(repr.policy_pick.as_deref(), repr.policy_omit.as_deref(), k) {
-            continue;
-        }
-        let Some(instances) = v.as_array() else {
-            continue;
-        };
-        let child = joined_repr(repr, k, k);
-        for inst in instances {
-            // Relationship objects plus ListRelationship objectList targets
-            // (internal form stores bare URIs) — 4.5.23.3 appends both kinds
-            // of Linked Entities to the flattened array.
-            let targets: Vec<&str> = match (inst.get("object"), inst.get("objectList")) {
-                (Some(Value::String(id)), _) => vec![id.as_str()],
-                (Some(Value::Array(a)), _) => a.iter().filter_map(Value::as_str).collect(),
-                (None, Some(Value::Array(a))) => a.iter().filter_map(Value::as_str).collect(),
-                _ => continue,
             };
-            for id in targets {
-                if walk.seen.contains(id) {
+            let shown = shown(repr.policy_types.as_deref(), doc)
+                .unwrap_or_else(crate::policy::Shown::nothing);
+            for (k, v) in obj {
+                if is_meta(k) {
                     continue;
                 }
-                if walk.budget == 0 {
-                    walk.complete = false;
-                    return;
+                // only traverse relationships that survive THIS doc's projection
+                if let Some(pick) = &repr.pick {
+                    if !pick.iter().any(|n| n.iri == *k || n.raw == *k) {
+                        continue;
+                    }
                 }
-                walk.budget -= 1;
-                if let Some(target) = st.store.get(tenant, Kind::Entity, id).await.ok().flatten() {
-                    walk.seen.insert(id.to_owned());
-                    out.insert(id.to_owned(), (target.clone(), child.clone()));
-                    if level > 1 {
-                        // boxed: an async fn cannot recurse inline
-                        Box::pin(collect_flat_walk(
-                            st,
-                            tenant,
-                            &child,
-                            &target,
-                            level - 1,
-                            out,
-                            walk,
-                        ))
-                        .await;
+                if let Some(omit) = &repr.omit {
+                    if omit
+                        .iter()
+                        .any(|n| (n.iri == *k || n.raw == *k) && n.children.is_none())
+                    {
+                        continue;
+                    }
+                }
+                // a Relationship the subject may not see is not a road either
+                if !policy_projected(repr.policy_pick.as_deref(), repr.policy_omit.as_deref(), k)
+                    || !shown.allows(k)
+                {
+                    continue;
+                }
+                let Some(instances) = v.as_array() else {
+                    continue;
+                };
+                let child = joined_repr(repr, k, k);
+                for inst in instances {
+                    // Relationship objects plus ListRelationship objectList targets
+                    // (internal form stores bare URIs) — 4.5.23.3 appends both kinds
+                    // of Linked Entities to the flattened array.
+                    let targets: Vec<&str> = match (inst.get("object"), inst.get("objectList")) {
+                        (Some(Value::String(id)), _) => vec![id.as_str()],
+                        (Some(Value::Array(a)), _) => a.iter().filter_map(Value::as_str).collect(),
+                        (None, Some(Value::Array(a))) => {
+                            a.iter().filter_map(Value::as_str).collect()
+                        }
+                        _ => continue,
+                    };
+                    for id in targets {
+                        if walk.seen.contains(id) {
+                            continue;
+                        }
+                        if walk.budget == 0 {
+                            walk.complete = false;
+                            return;
+                        }
+                        walk.budget = walk.budget.saturating_sub(1);
+                        let Some(target) =
+                            st.store.get(tenant, Kind::Entity, id).await.ok().flatten()
+                        else {
+                            continue;
+                        };
+                        if !policy_admits(st, tenant, ctx, child.policy_reach.as_deref(), &target)
+                            .await
+                        {
+                            continue;
+                        }
+                        walk.seen.insert(id.to_owned());
+                        out.insert(id.to_owned(), (target.clone(), child.clone()));
+                        if *level > 1 {
+                            next.push((target, child.clone(), level.saturating_sub(1)));
+                        }
                     }
                 }
             }
         }
+        frontier = next;
     }
 }
 
@@ -1110,8 +1542,10 @@ fn geo_value_of(attr: &Value) -> Value {
     let inst = match attr {
         Value::Array(a) => match a.iter().find(|i| i.get("datasetId").is_none()) {
             Some(default) => default.clone(),
-            None if a.len() == 1 => a[0].clone(),
-            None => return Value::Null,
+            None => match a.as_slice() {
+                [only] => only.clone(),
+                _ => return Value::Null,
+            },
         },
         other => other.clone(),
     };
@@ -1708,5 +2142,112 @@ mod clause_6_3_7 {
         let empty = to_geojson_collection(vec![], None);
         assert_eq!(empty["type"], "FeatureCollection");
         assert_eq!(empty["features"], json!([]));
+    }
+}
+
+#[cfg(test)]
+mod type_rules_memo_tests {
+    use super::type_rules;
+    use crate::policy::{Filter, Rule};
+    use std::collections::BTreeMap;
+
+    fn filter(t: &str, attr: &str) -> Filter {
+        Filter {
+            rules: vec![Rule {
+                types: vec![t.to_owned()],
+                attributes: vec![attr.to_owned()],
+                ..Rule::default()
+            }],
+            ..Filter::default()
+        }
+    }
+
+    const DEFAULT: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+
+    /// The memo answers only for the rules it was made from: alternating
+    /// filters (two views, two subjects) each get their own expansion.
+    #[test]
+    fn the_memo_answers_only_for_its_own_rules() {
+        let (car, user) = (filter("Car", "speed"), filter("User", "name"));
+        for f in [&car, &user, &car, &car, &user] {
+            let got = type_rules(f).unwrap();
+            let r = &f.rules[0];
+            assert_eq!(got.rules[0].types, vec![format!("{DEFAULT}{}", r.types[0])]);
+            assert_eq!(
+                got.rules[0].attributes,
+                vec![format!("{DEFAULT}{}", r.attributes[0])]
+            );
+        }
+        let omitting = Filter {
+            omit_by_type: BTreeMap::from([("Car".to_owned(), vec!["speed".to_owned()])]),
+            ..car.clone()
+        };
+        let got = type_rules(&omitting).unwrap();
+        assert_eq!(
+            got.omit_by_type.get(&format!("{DEFAULT}Car")),
+            Some(&vec![format!("{DEFAULT}speed")])
+        );
+        assert!(type_rules(&car).unwrap().omit_by_type.is_empty());
+        assert!(type_rules(&Filter::default()).is_none());
+    }
+
+    /// T-3697: the reach memo answers for the one `Arc` it holds. The same
+    /// `Arc` gets the same reach back; another `Arc`, even one with equal
+    /// content, or a narrowing that was dropped and rebuilt, gets its own,
+    /// so a reach never outlives the Filter it was made from.
+    #[test]
+    fn the_reach_memo_answers_only_for_its_own_arc() {
+        use std::sync::Arc;
+        let reach = |f: &Arc<Filter>| {
+            let mut r = super::Repr::default();
+            super::narrow_repr(&mut r, f);
+            r
+        };
+        let car = Arc::new(filter("Car", "speed"));
+        let user = Arc::new(filter("User", "name"));
+        let (a, b) = (reach(&car), reach(&car));
+        let (ra, rb) = (a.policy_reach.unwrap(), b.policy_reach.unwrap());
+        assert!(Arc::ptr_eq(&ra, &rb), "the same Arc reuses its reach");
+        for (f, t) in [(&user, "User"), (&car, "Car"), (&user, "User")] {
+            let got = reach(f).policy_reach.unwrap();
+            let rules = got.rules.as_ref().unwrap();
+            assert_eq!(rules.rules[0].types, vec![format!("{DEFAULT}{t}")]);
+        }
+        let twin = Arc::new(filter("Car", "speed"));
+        let own = reach(&twin).policy_reach.unwrap();
+        assert!(
+            !Arc::ptr_eq(&own, &ra),
+            "an equal Filter in another Arc builds its own"
+        );
+        assert_eq!(own.rules, ra.rules);
+        let narrowed = Arc::new(Filter {
+            q: Some(Box::new(antares_ql::parse_q("speed>1").expect("q"))),
+            ..Filter::default()
+        });
+        assert!(reach(&narrowed).policy_reach.unwrap().q.is_some());
+        let open = crate::policy::unnarrowed();
+        let none = reach(&open);
+        assert!(none.policy_reach.is_none() && none.policy_types.is_none());
+        assert!(super::narrowing(&car).policy_reach.unwrap().rules.is_some());
+    }
+}
+
+#[cfg(test)]
+mod t3932_projection_edges {
+    use super::*;
+    use antares_jsonld::Loader;
+
+    /// T-3932: the projection parser splits at the brace it found and counts
+    /// depth without overflow; a malformed or multi-byte term is a 400, never
+    /// a panic.
+    #[test]
+    fn malformed_and_multibyte_projections_are_refused() {
+        let ctx = Loader::new().core();
+        let deep = parse_projection("a{b{c}}", &ctx).expect("nested");
+        assert_eq!(proj_depth(&deep), 2);
+        assert_eq!(deep[0].raw, "a");
+        for bad in ["a{b", "a}", "a{}", "{", "}", ",", "a,,b", "é{ü|ö}", "a{é}"] {
+            assert!(parse_projection(bad, &ctx).is_err(), "{bad} is refused");
+        }
     }
 }

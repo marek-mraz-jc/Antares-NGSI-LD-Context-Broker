@@ -54,7 +54,7 @@ pub fn dt_key_sql(e: &str) -> String {
 /// window stays the arbiter.
 pub fn compile_instance_range(
     r: &InstanceRange<'_>,
-    el: &str,
+    el: &'static str,
     first_bind: usize,
 ) -> Option<CompiledSql> {
     let tp = format!("${first_bind}");
@@ -68,11 +68,11 @@ pub fn compile_instance_range(
         "any" => present,
         "before" => {
             binds.push(antares_store::filter::canonical_datetime(r.time_at).into_owned());
-            format!("{present} AND {ts} < {}", at(first_bind + 1))
+            format!("{present} AND {ts} < {}", at(first_bind.saturating_add(1)))
         }
         "after" => {
             binds.push(antares_store::filter::canonical_datetime(r.time_at).into_owned());
-            format!("{present} AND {ts} >= {}", at(first_bind + 1))
+            format!("{present} AND {ts} >= {}", at(first_bind.saturating_add(1)))
         }
         "between" => {
             let end = r.end_time_at?;
@@ -80,8 +80,8 @@ pub fn compile_instance_range(
             binds.push(antares_store::filter::canonical_datetime(end).into_owned());
             format!(
                 "{present} AND {ts} >= {} AND {ts} < {}",
-                at(first_bind + 1),
-                at(first_bind + 2)
+                at(first_bind.saturating_add(1)),
+                at(first_bind.saturating_add(2))
             )
         }
         _ => return None,
@@ -101,7 +101,11 @@ pub fn compile_instance_range(
 /// jsonb text extraction the exact predicate runs on never uses an index.
 /// Only timeproperties with a parsed column compile; others prune by text
 /// alone (`None`).
-pub fn column_range_bound(r: &InstanceRange<'_>, alias: &str, time_bind: usize) -> Option<String> {
+pub fn column_range_bound(
+    r: &InstanceRange<'_>,
+    alias: &'static str,
+    time_bind: usize,
+) -> Option<String> {
     // `deleted_at` is the one nullable column of the four (0001_init.sql):
     // its bound must let NULL rows through to the text predicate, which
     // decides membership either way. `observed_at`, `created_at` and
@@ -121,7 +125,7 @@ pub fn column_range_bound(r: &InstanceRange<'_>, alias: &str, time_bind: usize) 
             format!(
                 "{alias}.{col} >= ${time_bind}::timestamptz - interval '48 hours' \
                  AND {alias}.{col} < ${}::timestamptz + interval '48 hours'",
-                time_bind + 1
+                time_bind.saturating_add(1)
             )
         }
         _ => return None,

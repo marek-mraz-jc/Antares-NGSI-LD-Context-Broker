@@ -325,6 +325,23 @@ fn check_endpoint_params(ep: &Map<String, Value>) -> Result<(), NgsiError> {
         {
             return Err(bad(format!("invalid endpoint accept {acc:?}")));
         }
+        // TS 104 243 5.2, Table 5.2-2: an MQTT message's metadata
+        // Content-Type is "application/json" or "application/ld+json"; the
+        // binding has no GeoJSON. Refused here, at create and at update,
+        // rather than published under a Content-Type the table forbids.
+        let scheme = ep
+            .get("uri")
+            .and_then(Value::as_str)
+            .and_then(|uri| uri.split_once("://"))
+            .map(|(scheme, _)| scheme.to_ascii_lowercase());
+        if acc == "application/geo+json" && matches!(scheme.as_deref(), Some("mqtt" | "mqtts")) {
+            return Err(bad(format!(
+                "endpoint.accept {acc:?} is not available for an {} endpoint: the MQTT \
+                 binding sends \"application/json\" or \"application/ld+json\" \
+                 (TS 104 243 Table 5.2-2)",
+                scheme.as_deref().unwrap_or_default()
+            )));
+        }
     }
     Ok(())
 }
@@ -404,14 +421,9 @@ fn norm_member(
         }
         "q" => {
             let q = v.as_str().ok_or_else(|| bad("q must be a string".into()))?;
-            // Validate the string the MATCHER will parse. `conditions_match`
-            // percent-decodes first (4.9, 046_05), so validating the raw
-            // form would let `%28%28%28…` through create-time checks and
-            // only become thousands of real parens at notification time —
-            // inside a spawned task, where the parser's own limits are the
-            // last line of defence.
-            let decoded = crate::negotiate::percent_decode(q.as_bytes());
-            antares_ql::parse_q(&decoded)?;
+            // Validate the string the MATCHER will parse: a JSON string,
+            // read as written (5.2.12, 046_05), never percent-decoded.
+            antares_ql::parse_q(q)?;
             out.insert("q".into(), v.clone());
         }
         "geoQ" => {
@@ -519,7 +531,14 @@ fn norm_member(
         // is __subject. The prefix as a whole is the broker's, so a member
         // added later cannot be forgotten here.
         k if k.starts_with("__") => return Ok(()),
-        "scopeQ" | "lang" | "subscriptionName" | "name" | "description" | "jsonldContext"
+        "scopeQ" => {
+            let q = v
+                .as_str()
+                .ok_or_else(|| bad("scopeQ must be a string (5.2.12)".into()))?;
+            antares_ql::scope::check_scope_q(q)?;
+            out.insert(k.to_owned(), v.clone());
+        }
+        "lang" | "subscriptionName" | "name" | "description" | "jsonldContext"
         | "ngsildConformance" | "datasetId" => {
             out.insert(k.to_owned(), v.clone());
         }
@@ -747,6 +766,84 @@ async fn check_jsonld_context(
 /// clauses: 5.8 for Subscriptions, 5.11 for Context Source Registration
 /// Subscriptions. The seam is asked about the operation the caller actually
 /// made.
+/// What a Subscription names, for the policy gate (ADR-0020): the types of
+/// its entity selectors, its watchedAttributes, its q and its geoQ, as
+/// normalization expanded them.
+fn sub_members(norm: &Map<String, Value>) -> crate::entities::ReadMembers {
+    let strings = |key: &str, member: Option<&str>| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for v in norm
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let s = match member {
+                Some(m) => v.get(m).and_then(Value::as_str),
+                None => v.as_str(),
+            };
+            if let Some(s) = s.filter(|s| !out.iter().any(|o| o == s)) {
+                out.push(s.to_owned());
+            }
+        }
+        out
+    };
+    crate::entities::ReadMembers {
+        types: strings("entities", Some("type")),
+        attrs: strings("watchedAttributes", None),
+        q: norm
+            .get("q")
+            .and_then(Value::as_str)
+            .and_then(|q| antares_ql::parse_q(q).ok()),
+        geo: norm
+            .get("geoQ")
+            .and_then(Value::as_object)
+            .and_then(|g| {
+                antares_ql::geo::GeoQuery::from_params(&crate::notify::geo_params(g)).ok()
+            })
+            .flatten(),
+    }
+}
+
+/// Whether `st` serves through an endpoint view (ADR-0023).
+#[cfg(feature = "views")]
+fn through_a_view(st: &AppState) -> bool {
+    st.view.is_some()
+}
+
+/// A vanilla build serves through no view.
+#[cfg(not(feature = "views"))]
+fn through_a_view(_: &AppState) -> bool {
+    false
+}
+
+/// Whether the stored Subscription `doc` is one `st` may serve: through a
+/// view, only that view's own (rule 9, threat V24); at the root, all.
+#[cfg(feature = "views")]
+fn own(st: &AppState, doc: &Value) -> bool {
+    st.view.is_none() || crate::views::owns(st.view.as_deref(), doc)
+}
+
+/// A vanilla build serves every Subscription of the tenant.
+#[cfg(not(feature = "views"))]
+fn own(_: &AppState, _: &Value) -> bool {
+    true
+}
+
+/// ADR-0023 rule 9: `watchedAttributes` through a view keeps the Attributes
+/// the view shows, and naming none of them is 400.
+#[cfg(feature = "views")]
+fn view_watched(
+    view: &crate::views::CompiledView,
+    norm: &mut Map<String, Value>,
+) -> Result<(), NgsiError> {
+    if let Some(Value::Array(w)) = norm.get("watchedAttributes") {
+        let kept = crate::views::watched_in(view, w).map_err(NgsiError::BadRequestData)?;
+        norm.insert("watchedAttributes".into(), Value::Array(kept));
+    }
+    Ok(())
+}
+
 fn clause_of(kind: Kind, sub: &'static str, csub: &'static str) -> &'static str {
     if kind == Kind::CSourceSubscription {
         csub
@@ -773,14 +870,33 @@ pub async fn create(
     // told which one is being claimed. A body that names none leaves the
     // list empty, which is right: there is no client choice to decide about.
     let named = obj.get("id").and_then(Value::as_str);
+    let mut norm = normalize_subscription(obj, &parsed.ctx, false)?;
+    let shown = match &st.policy {
+        Some(_) => sub_members(&norm),
+        None => crate::entities::ReadMembers::default(),
+    };
     gate!(
         st, &tenant, headers, clause_of(kind, "5.8.1", "5.11.2"),
         ids: named.as_slice(),
+        types: &shown.types,
+        attrs: &shown.attrs,
+        q: shown.q.as_ref(),
+        scope_q: norm.get("scopeQ").and_then(Value::as_str),
+        geo: shown.geo.as_ref(),
     )
     .await?;
-    let mut norm = normalize_subscription(obj, &parsed.ctx, false)?;
     check_endpoint(st, &norm)?;
     check_jsonld_context(st, &tenant, &norm).await?;
+    // ADR-0023 rule 9: a Subscription made through a view watches only what
+    // the view shows, and carries the view's id to match and deliver under.
+    #[cfg(feature = "views")]
+    if let Some(view) = st.view.as_deref() {
+        view_watched(view, &mut norm)?;
+        norm.insert(
+            crate::views::VIEW_MEMBER.into(),
+            Value::String(view.id().to_owned()),
+        );
+    }
     let id = match norm.get("id").and_then(Value::as_str) {
         Some(id) => id.to_owned(),
         None => {
@@ -856,7 +972,7 @@ pub async fn create(
         return Err(NgsiError::AlreadyExists(format!("subscription {id} already exists")).into());
     }
     st.sub_changed(&tenant, kind, &id, Some(&doc));
-    if kind == Kind::Subscription {
+    if kind == Kind::Subscription && !through_a_view(st) {
         // 5.8.1.4: a distributed Subscription creates its internal Context
         // Source Registration Subscription (consumer half)
         crate::distsub::on_subscription_created(st, &tenant, &doc).await;
@@ -894,6 +1010,7 @@ pub async fn retrieve(
         .store
         .get(&tenant, kind, id)
         .await?
+        .filter(|d| own(st, d))
         .ok_or_else(|| NgsiError::ResourceNotFound(format!("subscription {id} not found")))?;
     let sys = sys_attrs_asked(params);
     let payload = present_subscription(&doc, &ctx, sys, kind == Kind::CSourceSubscription);
@@ -915,7 +1032,8 @@ pub async fn list(
     )?;
     let accept = parse_accept(headers)?;
     let ctx = request_context(&st.loader, headers).await?;
-    gate!(st, &tenant, headers, clause_of(kind, "5.8.4", "5.11.5")).await?;
+    let narrowing = gate!(st, &tenant, headers, clause_of(kind, "5.8.4", "5.11.5")).await?;
+    let cond = crate::policy::Condition::of(&narrowing);
     // 5.5.9.1: "only up to a maximum of L NGSI-LD Elements are RETRIEVED
     // and returned". 5.8.4 takes no filter parameters — `check_params`
     // above is the whole list — so the tenant IS the match set and the
@@ -923,7 +1041,23 @@ pub async fn list(
     // here made a tenant at the document ceiling unable to list at all,
     // because that read is the one carrying the ceiling for client queries.
     let (offset, limit, _) = crate::paging::page_params(st, params)?;
-    let (page_docs, total) = st.store.list_slice(&tenant, kind, offset, limit).await?;
+    // A view or a policy narrowing selects among the tenant's Subscriptions,
+    // so the count and the window are over that selection (T-3673).
+    let (page_docs, total) = if through_a_view(st) || cond.is_some() {
+        // ponytail: a scan of the tenant's Subscriptions; a `__view` column
+        // with an index when views or narrowings hold many.
+        let own: Vec<Value> = st
+            .store
+            .list(&tenant, kind)
+            .await?
+            .into_iter()
+            .filter(|d| own(st, d) && cond.as_ref().is_none_or(|c| c.holds_for_record(d)))
+            .collect();
+        let total = own.len();
+        (own.into_iter().skip(offset).take(limit).collect(), total)
+    } else {
+        st.store.list_slice(&tenant, kind, offset, limit).await?
+    };
     let (page, count_hdr, links) = crate::paging::paginate_pre_accept(
         st,
         params,
@@ -972,10 +1106,23 @@ pub async fn update(
     let norm = normalize_subscription(obj, &parsed.ctx, true)?;
     check_endpoint(st, &norm)?;
     check_jsonld_context(st, &tenant, &norm).await?;
+    #[cfg(feature = "views")]
+    let norm = {
+        let mut norm = norm;
+        if let Some(view) = st.view.as_deref() {
+            view_watched(view, &mut norm)?;
+        }
+        norm
+    };
     let ts = now_iso();
     let res = st
         .store
         .mutate(&tenant, kind, id, |doc| {
+            if !own(st, doc) {
+                return Err(NgsiError::ResourceNotFound(format!(
+                    "subscription {id} not found"
+                )));
+            }
             let target = antares_store::stored_object(doc)?;
             crate::apply_doc_fragment(target, &norm, &ts);
             Ok::<(), NgsiError>(())
@@ -996,7 +1143,7 @@ pub async fn update(
                 let doc = st.store.get(&tenant, kind, id).await?;
                 st.sub_changed(&tenant, kind, id, doc.as_ref());
             }
-            if kind == Kind::Subscription {
+            if kind == Kind::Subscription && !through_a_view(st) {
                 // 5.8.2.4: the CSR subscription and the mapped remote
                 // subscriptions follow the update (5.11.3)
                 crate::distsub::on_subscription_updated(st, &tenant, id).await;
@@ -1020,6 +1167,18 @@ pub async fn delete(
         .map_err(|_| NgsiError::BadRequestData(format!("invalid subscription id {id:?}")))?;
     check_params(params, &["local"])?;
     gate!(st, &tenant, headers, clause_of(kind, "5.8.5", "5.11.6"), ids: &[id]).await?;
+    // ponytail: read, then delete; a Subscription of another view or the
+    // root recreated under this id between the two is deleted with it. A
+    // conditional delete for Subscriptions when that race matters.
+    if through_a_view(st)
+        && !st
+            .store
+            .get(&tenant, kind, id)
+            .await?
+            .is_some_and(|d| own(st, &d))
+    {
+        return Err(NgsiError::ResourceNotFound(format!("subscription {id} not found")).into());
+    }
     if st.store.delete(&tenant, kind, id).await? {
         st.sub_changed(&tenant, kind, id, None);
         if kind == Kind::Subscription {
@@ -1621,17 +1780,16 @@ mod tests {
         }
     }
 
-    /// Table 5.2.12-1: q is "A valid query string as per clause 4.9". The
-    /// matcher percent-decodes before parsing (4.9), so the DECODED form is
-    /// what must be validated here — otherwise an encoded paren bomb passes
-    /// creation and only unfolds inside the notification task.
+    /// Table 5.2.12-1: q is "A valid query string as per clause 4.9", the
+    /// same string the matcher parses — read as written, so an encoded form
+    /// is not a query the matcher could ever run.
     #[test]
-    fn clause_5_2_12_q_is_validated_in_its_decoded_form() {
+    fn clause_5_2_12_q_is_validated_as_written() {
         assert!(norm(&sub(json!({"q": "temperature>20"}))).is_ok());
         assert!(norm(&sub(json!({"q": "(("}))).is_err());
         assert!(
             norm(&sub(json!({"q": "%28%28%28"}))).is_err(),
-            "a percent-encoded unbalanced expression must be rejected at creation"
+            "percent signs are not part of the 4.9 grammar"
         );
         assert!(norm(&sub(json!({"q": 5}))).is_err());
     }
@@ -1702,6 +1860,36 @@ mod tests {
     }
 
     // ---------- 5.2.14 / 5.2.15 notification parameters ----------
+
+    /// TS 104 243 5.2, Table 5.2-2: an MQTT notification's
+    /// `metadata.Content-Type` is "application/json" or
+    /// "application/ld+json", taken from `endpoint.accept`. A Subscription
+    /// asking an mqtt[s] endpoint for GeoJSON is refused at create and at
+    /// update (a fragment replaces `notification` whole); an HTTP endpoint
+    /// keeps it (TS 104 175 5.2.15).
+    #[test]
+    fn ts104243_5_2_mqtt_endpoint_refuses_geojson_accept() {
+        let doc = |uri: &str, accept: &str| {
+            sub(json!({"notification": {"endpoint": {"uri": uri, "accept": accept}}}))
+        };
+        for uri in ["mqtt://broker:1883/topic", "MQTTS://broker/t/sub"] {
+            for normalize in [norm, frag] {
+                let err = normalize(&doc(uri, "application/geo+json"))
+                    .expect_err("an mqtt endpoint cannot carry GeoJSON");
+                assert!(
+                    matches!(&err, NgsiError::BadRequestData(why)
+                        if why.contains("application/json") && why.contains("application/ld+json")),
+                    "{err:?}"
+                );
+                for accept in ["application/json", "application/ld+json"] {
+                    assert!(normalize(&doc(uri, accept)).is_ok(), "{uri} {accept}");
+                }
+            }
+        }
+        for normalize in [norm, frag] {
+            assert!(normalize(&doc("http://a/x", "application/geo+json")).is_ok());
+        }
+    }
 
     /// Table 5.2.15-1 Endpoint: uri is mandatory and a valid URI; cooldown
     /// and timeout are Numbers "Greater than 0"; accept is one of the three

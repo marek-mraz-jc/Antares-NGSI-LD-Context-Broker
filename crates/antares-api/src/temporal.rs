@@ -184,9 +184,9 @@ async fn upsert_temporal_local(
     // both see "absent", and the loser's create must NOT be silently
     // dropped (201 with a discarded payload). Loop: a lost create retries
     // as a merge, a mutate on a just-deleted doc retries as a create.
-    let mut attempts = 0;
+    let mut attempts: u8 = 0;
     loop {
-        attempts += 1;
+        attempts = attempts.saturating_add(1);
         if attempts > 16 {
             return Err(NgsiError::InternalError("upsert retry storm".into()).into());
         }
@@ -210,66 +210,10 @@ async fn upsert_temporal_local(
                         }
                         target.insert("type".into(), Value::Array(cur));
                     }
-                    for (k, v) in antares_jsonld::expanded_object(&expanded)? {
-                        if is_meta(k) {
-                            continue;
-                        }
-                        let incoming = v.as_array().cloned().unwrap_or_default();
-                        match target.get_mut(k).and_then(Value::as_array_mut) {
-                            Some(cur) => {
-                                // 5.6.11: instances merge by (datasetId, observedAt)
-                                for ni in incoming {
-                                    let key = (
-                                        ni.get("datasetId")
-                                            .and_then(Value::as_str)
-                                            .map(String::from),
-                                        ni.get("observedAt")
-                                            .and_then(Value::as_str)
-                                            .map(String::from),
-                                    );
-                                    let pos = cur.iter().position(|ci| {
-                                        (
-                                            ci.get("datasetId")
-                                                .and_then(Value::as_str)
-                                                .map(String::from),
-                                            ci.get("observedAt")
-                                                .and_then(Value::as_str)
-                                                .map(String::from),
-                                        ) == key
-                                            && key.1.is_some()
-                                    });
-                                    match pos {
-                                        // A correction, not a new instance: it
-                                        // keeps the instanceId its client was
-                                        // handed and the createdAt it was created
-                                        // at, which is 5.6.14.4's rule for the
-                                        // same kind of in-place change ("The
-                                        // createdAt property of the concerned
-                                        // instance shall remain unchanged").
-                                        // `stamp_temporal_instances` has already put a
-                                        // fresh pair on the incoming instance.
-                                        Some(p) => {
-                                            let mut ni = ni;
-                                            for keep in ["instanceId", "createdAt"] {
-                                                let Some(had) = cur[p].get(keep).cloned() else {
-                                                    continue;
-                                                };
-                                                if let Some(o) = ni.as_object_mut() {
-                                                    o.insert(keep.to_owned(), had);
-                                                }
-                                            }
-                                            cur[p] = ni;
-                                        }
-                                        None => cur.push(ni),
-                                    }
-                                }
-                            }
-                            None => {
-                                target.insert(k.clone(), Value::Array(incoming));
-                            }
-                        }
-                    }
-                    target.insert("modifiedAt".into(), Value::String(ts.clone()));
+                    // 5.6.11.4: the instances "shall be added" as 5.6.12
+                    // mandates; identity is the instanceId, never observedAt
+                    antares_jsonld::expanded_object(&expanded)?;
+                    add_temporal_instances(doc, &expanded, &ts);
                     Ok::<(), NgsiError>(())
                 })
                 .await?;
@@ -301,6 +245,12 @@ struct Windowed {
     ts_min: Option<String>,
     ts_max: Option<String>,
     truncated: bool,
+    /// some Attribute holds instances past this page in its order: the
+    /// response links to the next page (6.4.7.3)
+    more: bool,
+    /// the fewest instances an Attribute the ceiling cut shortened still
+    /// served (`truncate`): how far the next offsetN page may move
+    cut_served: Option<usize>,
 }
 
 /// NGSI-LD 6.3.10: the most instances of one Attribute the broker serves in
@@ -323,12 +273,21 @@ const TEMPORAL_INSTANCE_LIMIT: usize = 9;
 /// ceiling instant among the over-full ones (ties at that instant kept),
 /// and a client continuing from the advertised range-end misses no instance
 /// of any attribute. An attribute lying entirely beyond the boundary comes
-/// back empty on this page.
+/// back empty on this page. ETSI 020_14 checks exactly that (T-3612; the
+/// per-Attribute count of T-3456 failed it on every store).
+///
+/// An Attribute the boundary cut shorter than the ceiling holds the next
+/// page's instances at a smaller offset than the boundary Attribute, so the
+/// next offsetN Link moves by the fewest instances a cut Attribute served
+/// (`cut_served`): it repeats, never skips. One cut to nothing leaves no
+/// offsetN that continues it, and the Link continues by time from the
+/// boundary instead (`interval_links`, T-3613).
 fn truncate(w: &mut Windowed, timeprop: &str, descending: bool) {
     if w.max_per_attr <= TEMPORAL_INSTANCE_LIMIT {
         return;
     }
     w.truncated = true;
+    w.more = true;
     w.max_per_attr = TEMPORAL_INSTANCE_LIMIT;
     let key = |inst: &Value| inst.get(timeprop).and_then(Value::as_str).map(dt_key);
     // the tightest ceiling instant: earliest forwards, latest backwards
@@ -336,15 +295,22 @@ fn truncate(w: &mut Windowed, timeprop: &str, descending: bool) {
         .attrs
         .values()
         .filter(|insts| insts.len() > TEMPORAL_INSTANCE_LIMIT)
-        .filter_map(|insts| key(&insts[TEMPORAL_INSTANCE_LIMIT - 1]))
+        .filter_map(|insts| insts.get(TEMPORAL_INSTANCE_LIMIT - 1).and_then(key))
         .reduce(|a, b| if (b < a) != descending { b } else { a });
     let (mut ts_min, mut ts_max) = (None::<String>, None::<String>);
     for instances in w.attrs.values_mut() {
+        let before = instances.len();
         match &boundary {
             Some(bd) => instances.retain(|inst| {
                 key(inst).is_none_or(|k| if descending { k >= *bd } else { k <= *bd })
             }),
             None => instances.truncate(TEMPORAL_INSTANCE_LIMIT),
+        }
+        if instances.len() < before {
+            w.cut_served = Some(
+                w.cut_served
+                    .map_or(instances.len(), |c| c.min(instances.len())),
+            );
         }
         for inst in instances.iter() {
             if let Some(t) = inst.get(timeprop).and_then(Value::as_str) {
@@ -358,6 +324,16 @@ fn truncate(w: &mut Windowed, timeprop: &str, descending: bool) {
         }
     }
     (w.ts_min, w.ts_max) = (ts_min, ts_max);
+}
+
+/// The instant a cut page ends at in its order: the boundary `truncate`
+/// kept every Attribute to.
+fn cut_boundary(w: &Windowed, desc: bool) -> Option<&str> {
+    if desc {
+        w.ts_min.as_deref()
+    } else {
+        w.ts_max.as_deref()
+    }
 }
 
 /// 5.7.4.4 S4/S7: does a scope VALUE (string or array of strings) match the
@@ -387,14 +363,13 @@ fn scope_match_intervals(doc: &Value, sq: &str) -> Vec<(String, Option<String>)>
                 })
                 .collect();
             states.sort_by_key(|(t, _)| dt_key(t));
-            (0..states.len())
-                .filter(|&n| scope_value_matches(sq, states[n].1))
-                .map(|n| {
-                    (
-                        states[n].0.to_owned(),
-                        states.get(n + 1).map(|(t, _)| (*t).to_owned()),
-                    )
-                })
+            // each state with the time the next one was set, the last open
+            let next = states.iter().skip(1).map(Some).chain(std::iter::once(None));
+            states
+                .iter()
+                .zip(next)
+                .filter(|((_, value), _)| scope_value_matches(sq, value))
+                .map(|((t, _), next)| ((*t).to_owned(), next.map(|(t, _)| (*t).to_owned())))
                 .collect()
         }
         Some(_) if crate::scope_matches(sq, doc) => vec![(String::new(), None)],
@@ -413,7 +388,7 @@ fn scope_set_time(i: &Value) -> Option<&str> {
 fn window(
     doc: &Value,
     tq: Option<&TemporalQ>,
-    last_n: Option<usize>,
+    page: InstancePage,
     attrs_filter: Option<&Vec<String>>,
     omit: Option<&Vec<crate::repr::ProjNode>>,
     dataset: Option<&Vec<String>>,
@@ -425,6 +400,8 @@ fn window(
         ts_min: None,
         ts_max: None,
         truncated: false,
+        cut_served: None,
+        more: false,
     };
     let Some(obj) = doc.as_object() else { return w };
     for (k, v) in obj {
@@ -491,12 +468,20 @@ fn window(
             let tb = b.get(timeprop).and_then(Value::as_str).unwrap_or("");
             dt_key(ta).cmp(&dt_key(tb))
         });
-        if let Some(n) = last_n {
-            if instances.len() > n {
-                instances = instances.split_off(instances.len() - n);
-            }
-            // lastN delivers newest-first (DESC), Scorpio parity
+        // 6.4.7.3: lastN pages newest first, firstN and neither oldest first
+        if page.desc {
             instances.reverse();
+        }
+        // Table 6.4.7.3-2: an offsetN past the end "should be assumed to be
+        // equal to the size of the result set, i.e. only the last element
+        // of the result set is to be returned"
+        let skip = page.offset.min(instances.len().saturating_sub(1));
+        instances.drain(..skip);
+        if let Some(n) = page.n {
+            if instances.len() > n {
+                instances.truncate(n);
+                w.more = true;
+            }
         }
         if instances.is_empty() {
             continue;
@@ -523,7 +508,7 @@ fn content_range(
     ts_min: Option<&str>,
     ts_max: Option<&str>,
     tq: Option<&TemporalQ>,
-    last_n: Option<usize>,
+    page: InstancePage,
 ) -> Option<String> {
     if !truncated {
         return None;
@@ -533,7 +518,7 @@ fn content_range(
     // on the pair keeps the timerel and the query that produced it together,
     // so no arm can reach for a query that is not there.
     let named = tq.filter(|t| t.timerel != "any");
-    let (start, end) = if last_n.is_none() {
+    let (start, end) = if !page.desc {
         let start = match named.map(|t| (t.timerel.as_str(), t)) {
             Some(("after" | "between", t)) => t.time_at.clone(),
             _ => data_min.to_owned(),
@@ -549,9 +534,103 @@ fn content_range(
     };
     // start/end bound the instances actually returned; the size is the length
     // of the complete representation the client asked for — the requested
-    // lastN, or "*" when the window leaves it unknown.
-    let size = last_n.map_or_else(|| "*".to_owned(), |n| n.to_string());
+    // firstN or lastN, or "*" when the window leaves it unknown.
+    let size = page.n.map_or_else(|| "*".to_owned(), |n| n.to_string());
     Some(format!("date-time {start}-{end}/{size}"))
+}
+
+/// TS 104 176 6.4.7.3: the Links to the neighbouring instance pages, each
+/// the request with offsetN moved by one page and typed with the response
+/// media type. Ascending pages run forward in time, so their next page is
+/// `intervalafter` and their previous one `intervalbefore`; lastN pages run
+/// backward and swap the two. `step` is the page size served per Attribute.
+///
+/// A page the ceiling cut moves its next Link by `cut`, the fewest
+/// instances a cut Attribute served (see `truncate`). When that is none at
+/// all, no offsetN continues every Attribute, and the next Link asks for the
+/// time past `boundary` instead (the window's end the cut moved): `after`
+/// it ascending, which repeats the instances at the boundary instant once
+/// (4.11 `after` is inclusive), `before` it descending, which is exact.
+fn interval_links(
+    params: &HashMap<String, String>,
+    path: &str,
+    accept: Accept,
+    page: InstancePage,
+    more: bool,
+    step: usize,
+    cut: Option<(usize, &str)>,
+) -> Vec<String> {
+    let (forward, back) = match page.desc {
+        false => ("intervalafter", "intervalbefore"),
+        true => ("intervalbefore", "intervalafter"),
+    };
+    // the request with `set` replacing its own values of those names
+    let link = |set: Vec<(&str, String)>, rel: &str| {
+        let mut qp: Vec<String> = params
+            .iter()
+            .filter(|(k, _)| k.as_str() != "offsetN" && !set.iter().any(|(s, _)| s == k))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .chain(set.iter().map(|(k, v)| (*k, v.as_str())))
+            .map(|(k, v)| format!("{k}={}", crate::paging::query_value(v)))
+            .collect();
+        qp.sort();
+        format!(
+            "<{path}?{}>; rel=\"{rel}\";type=\"{}\"",
+            qp.join("&"),
+            crate::paging::link_media_type(accept)
+        )
+    };
+    let offset = |n: usize| vec![("offsetN", n.to_string())];
+    let mut links = Vec::new();
+    if more {
+        match cut {
+            None => links.push(link(offset(page.offset.saturating_add(step)), forward)),
+            Some((0, boundary)) => {
+                links.push(link(resume_after(params, page.desc, boundary), forward))
+            }
+            Some((served, _)) => {
+                links.push(link(
+                    offset(page.offset.saturating_add(served.min(step))),
+                    forward,
+                ));
+            }
+        }
+    }
+    if page.offset > 0 {
+        links.push(link(offset(page.offset.saturating_sub(step)), back));
+    }
+    links
+}
+
+/// ponytail: ascending, a page whose boundary instant holds a whole page of
+/// one Attribute's instances links to itself; offsetN by time would fix it.
+///
+/// The request's time window moved past `boundary` in the page order: the
+/// window's other end stays (4.11: `between` is inclusive of `timeAt`,
+/// exclusive of `endTimeAt`).
+fn resume_after(
+    params: &HashMap<String, String>,
+    desc: bool,
+    boundary: &str,
+) -> Vec<(&'static str, String)> {
+    let rel = params.get("timerel").map(String::as_str);
+    let (at, end) = (params.get("timeAt"), params.get("endTimeAt"));
+    let b = boundary.to_owned();
+    let between = |from: String, to: String| {
+        vec![
+            ("timerel", "between".to_owned()),
+            ("timeAt", from),
+            ("endTimeAt", to),
+        ]
+    };
+    match (desc, rel, at, end) {
+        (false, Some("between"), _, Some(e)) | (false, Some("before"), Some(e), _) => {
+            between(b, e.clone())
+        }
+        (false, ..) => vec![("timerel", "after".to_owned()), ("timeAt", b)],
+        (true, Some("between" | "after"), Some(a), _) => between(a.clone(), b),
+        (true, ..) => vec![("timerel", "before".to_owned()), ("timeAt", b)],
+    }
 }
 
 /// Render one temporal entity from its windowed data.
@@ -743,14 +822,86 @@ fn present_temporal(
     Ok(Value::Object(out))
 }
 
+/// TS 104 176 6.4.7.3: which instances of each Attribute one response
+/// carries. firstN pages oldest first, lastN newest first, neither oldest
+/// first; offsetN skips that many in the chosen order.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+pub(crate) struct InstancePage {
+    /// lastN: newest first
+    desc: bool,
+    /// the firstN or lastN asked for
+    n: Option<usize>,
+    /// offsetN
+    offset: usize,
+}
+
+impl InstancePage {
+    /// firstN, lastN and offsetN, validated: N positive (5.2.21), offsetN
+    /// not negative (Table 6.4.7.3-2), both at most i64::MAX (bound as a
+    /// `bigint` they would wrap negative and silently select nothing).
+    /// firstN asks for ascending order and lastN for descending; one page
+    /// cannot be both, so the pair is BadRequestData.
+    fn parse(params: &HashMap<String, String>) -> Result<Self, NgsiError> {
+        let count = |name: &str, min: usize| -> Result<Option<usize>, NgsiError> {
+            params
+                .get(name)
+                .map(|v| {
+                    v.parse::<usize>()
+                        .ok()
+                        .filter(|n| *n >= min && *n <= i64::MAX as usize)
+                        .ok_or_else(|| NgsiError::BadRequestData(format!("invalid {name} {v:?}")))
+                })
+                .transpose()
+        };
+        let (first, last) = (count("firstN", 1)?, count("lastN", 1)?);
+        if first.is_some() && last.is_some() {
+            return Err(NgsiError::BadRequestData(
+                "firstN pages ascending and lastN descending: give one of them (6.4.7.3)".into(),
+            ));
+        }
+        Ok(Self {
+            desc: last.is_some(),
+            n: first.or(last),
+            offset: count("offsetN", 0)?.unwrap_or(0),
+        })
+    }
+
+    /// The most instances of one Attribute a page holds: N, or the broker's
+    /// ceiling when N is above it or absent (6.4.7.3 "whichever is smaller").
+    fn size(&self) -> usize {
+        self.n
+            .map_or(TEMPORAL_INSTANCE_LIMIT, |n| n.min(TEMPORAL_INSTANCE_LIMIT))
+    }
+
+    /// How far one page moves offsetN: its size, or N itself for an
+    /// aggregated representation, which the ceiling never cuts.
+    fn step(&self, aggregated: bool) -> usize {
+        match (aggregated, self.n) {
+            (true, Some(n)) => n,
+            _ => self.size(),
+        }
+    }
+
+    /// The per-Attribute cap a store may apply before the window: every
+    /// instance up to the end of this page in its order, and one more, so
+    /// the window still sees whether a next page exists.
+    fn store_cap(&self) -> Option<i64> {
+        self.n.map(|n| {
+            n.saturating_add(self.offset)
+                .saturating_add(1)
+                .min(i64::MAX as usize) as i64
+        })
+    }
+}
+
 /// Parsed temporal representation params (options/format/lastN/pick/omit/
 /// datasetId/aggregation), fully validated up front.
 #[derive(Default, Clone)]
-struct TRepr {
+pub(crate) struct TRepr {
     temporal_values: bool,
     aggregated: bool,
     sys: bool,
-    last_n: Option<usize>,
+    page: InstancePage,
     pick: Option<Vec<crate::repr::ProjNode>>,
     omit: Option<Vec<crate::repr::ProjNode>>,
     dataset_id: Option<Vec<String>>,
@@ -761,7 +912,7 @@ struct TRepr {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-enum AggrPeriod {
+pub(crate) enum AggrPeriod {
     /// PT0S / absent: one bucket over the whole range
     #[default]
     Whole,
@@ -772,7 +923,7 @@ enum AggrPeriod {
     Months(u32, i64),
 }
 
-fn parse_aggr_period(s: &str) -> Option<AggrPeriod> {
+pub(crate) fn parse_aggr_period(s: &str) -> Option<AggrPeriod> {
     let d = antares_model::parse_iso_duration(s)?;
     // saturating: an absurd magnitude must not panic (debug) or wrap
     // (release) — f64→int `as` casts already saturate, guard the ops.
@@ -822,7 +973,10 @@ fn reject_linked_projection(trepr: &TRepr, clause: &str) -> Result<(), NgsiError
     Ok(())
 }
 
-fn parse_trepr(params: &HashMap<String, String>, ctx: &Context) -> Result<TRepr, NgsiError> {
+pub(crate) fn parse_trepr(
+    params: &HashMap<String, String>,
+    ctx: &Context,
+) -> Result<TRepr, NgsiError> {
     let mut r = TRepr {
         lang: params.get("lang").cloned(),
         ..TRepr::default()
@@ -877,26 +1031,7 @@ fn parse_trepr(params: &HashMap<String, String>, ctx: &Context) -> Result<TRepr,
     r.dataset_id = params
         .get("datasetId")
         .map(|s| s.split(',').map(|d| d.trim().to_owned()).collect());
-    r.last_n = match params.get("lastN") {
-        Some(n) => {
-            // 5.2.21: lastN is a POSITIVE integer — 0 is outside the value
-            // space.
-            let v = n
-                .parse::<usize>()
-                .ok()
-                .filter(|v| *v >= 1)
-                .ok_or_else(|| NgsiError::BadRequestData(format!("invalid lastN {n:?}")))?;
-            // Above i64::MAX it wraps negative when bound as the RANK cap
-            // (`rk <= $n::bigint`), silently returning an empty set.
-            if v > i64::MAX as usize {
-                return Err(NgsiError::BadRequestData(format!(
-                    "lastN {v} is out of range"
-                )));
-            }
-            Some(v)
-        }
-        None => None,
-    };
+    r.page = InstancePage::parse(params)?;
     if let Some(m) = params.get("aggrMethods") {
         for method in m.split(',') {
             let method = method.trim();
@@ -1060,7 +1195,7 @@ fn aggr_eligible(class: AggrClass, method: &str) -> bool {
 fn seconds_of_day(s: &str) -> Option<f64> {
     let t = s.strip_suffix('Z').unwrap_or(s);
     let b = t.as_bytes();
-    if b.len() < 8 || b[2] != b':' || b[5] != b':' {
+    if b.len() < 8 || b.get(2) != Some(&b':') || b.get(5) != Some(&b':') {
         return None;
     }
     let h: f64 = t.get(0..2)?.parse().ok()?;
@@ -1147,9 +1282,12 @@ fn render_aggregated(
             }
         }
         times.sort_by_key(|(t, _)| *t);
+        let Some(&(earliest, _)) = times.first() else {
+            continue;
+        };
         let anchor = tq
             .and_then(|tq| DateTime::parse_from_rfc3339(&tq.time_at).ok())
-            .unwrap_or(times[0].0);
+            .unwrap_or(earliest);
         // 4.5.19.1: "A duration of 0 second (e.g. expressed as "PT0S" or
         // "P0D") is valid and is interpreted as a duration spanning the whole
         // time range specified by the temporal query." The query names one
@@ -1160,7 +1298,9 @@ fn render_aggregated(
             let (Some(&(first, _)), Some(&(last_at, _))) = (times.first(), times.last()) else {
                 continue;
             };
-            let last = last_at + chrono::Duration::seconds(1);
+            let last = last_at
+                .checked_add_signed(chrono::Duration::seconds(1))
+                .unwrap_or(last_at);
             match tq {
                 Some(q) if q.timerel == "before" => (first, at(&q.time_at).unwrap_or(last)),
                 Some(q) if q.timerel == "between" => (
@@ -1180,7 +1320,7 @@ fn render_aggregated(
                         // checked throughout: an offset no representable
                         // date can hold puts the instant in one final
                         // open-ended bucket instead of panicking
-                        let idx = (t - anchor).num_seconds().div_euclid(sc);
+                        let idx = t.signed_duration_since(anchor).num_seconds().div_euclid(sc);
                         let bucket = idx
                             .checked_mul(sc)
                             .and_then(chrono::Duration::try_seconds)
@@ -1215,13 +1355,18 @@ fn render_aggregated(
                         // brackets the exact index within one step: binary-search
                         // between it and the anchor instead of walking there,
                         // which is O(log) however far the instant is.
-                        let approx = (i64::from(t.year() - anchor.year()) * 12
-                            + i64::from(t.month())
-                            - i64::from(anchor.month()))
-                        .div_euclid(i64::from(m));
-                        let (mut lo, mut hi) = (approx.min(0) - 1, approx.max(0) + 1);
-                        while hi - lo > 1 {
-                            let mid = lo + (hi - lo) / 2;
+                        let approx = i64::from(t.year())
+                            .saturating_sub(i64::from(anchor.year()))
+                            .saturating_mul(12)
+                            .saturating_add(i64::from(t.month()))
+                            .saturating_sub(i64::from(anchor.month()))
+                            .div_euclid(i64::from(m));
+                        let (mut lo, mut hi) = (
+                            approx.min(0).saturating_sub(1),
+                            approx.max(0).saturating_add(1),
+                        );
+                        while hi.saturating_sub(lo) > 1 {
+                            let mid = lo.saturating_add(hi.saturating_sub(lo).div_euclid(2));
                             if step(mid).is_some_and(|s| s <= t) {
                                 lo = mid;
                             } else {
@@ -1389,9 +1534,16 @@ async fn query_temporal_outer(
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
-    let filter =
-        gate!(st, &tenant, headers, "5.7.4", scope_q: params.get("scopeQ").map(String::as_str))
-            .await?;
+    let named = crate::entities::ReadMembers::of(st, headers, &params).await;
+    let filter = gate!(
+        st, &tenant, headers, "5.7.4",
+        scope_q: params.get("scopeQ").map(String::as_str),
+        q: named.q.as_ref(),
+        types: &named.types,
+        attrs: &named.attrs,
+        geo: named.geo.as_ref(),
+    )
+    .await?;
     let Some(map_ref) = single_header(headers, "NGSILD-EntityMap")? else {
         return query_temporal_inner(st, &params, headers, &filter).await;
     };
@@ -1425,9 +1577,9 @@ async fn query_temporal_outer(
         eff.insert("limit".into(), st.max_limit.to_string());
         eff.insert("id".into(), chunk.join(","));
         let resp = query_temporal_inner(st, &eff, headers, &filter).await?;
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
             .await
-            .map_err(|_| NgsiError::InternalError("entityMap recheck read".into()))?;
+            .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;
         matching.extend(
             serde_json::from_slice::<Value>(&bytes)
                 .ok()
@@ -1443,7 +1595,7 @@ async fn query_temporal_outer(
             .filter(|eid| {
                 emap.get(eid.as_str())
                     .and_then(Value::as_array)
-                    .is_some_and(|a| a.len() == 1 && a[0] == "@none")
+                    .is_some_and(|a| matches!(a.as_slice(), [only] if only == "@none"))
                     && !matching.contains(eid.as_str())
             })
             .cloned()
@@ -1456,7 +1608,11 @@ async fn query_temporal_outer(
     // fix the query to the candidates that survived the recheck (5.5.14)
     let ids: Vec<&str> = candidates
         .iter()
-        .filter(|id| map["entityMap"].get(id.as_str()).is_some())
+        .filter(|id| {
+            map.get("entityMap")
+                .and_then(|m| m.get(id.as_str()))
+                .is_some()
+        })
         .map(String::as_str)
         .collect();
     params.insert(
@@ -1582,6 +1738,8 @@ fn respond_aggregated(
         ts_min: None,
         ts_max: None,
         truncated: false,
+        cut_served: None,
+        more: false,
     };
     let mut payload: Vec<Value> = Vec::new();
     for d in &page {
@@ -1634,14 +1792,216 @@ fn type_and_attrs_match(
     true
 }
 
+/// ADR-0023 rule 8, for every narrowing: a history is served while the
+/// narrowing's own predicates (its `q`, `scopeQ` and areas) hold for the
+/// Entity as it is now, so an Entity that left the narrowing takes its
+/// history with it. Its rules' conditions are not read here: rule 11 reads
+/// them per instance. An Entity held only temporally (11.2.2) has no state
+/// now, and its history `held` is the only state it has: the predicates
+/// hold when some instance satisfies them, as the query's window check
+/// reads them; `held` absent leaves that to the caller's own check.
+async fn member_now(
+    st: &AppState,
+    tenant: &TenantId,
+    ctx: &Context,
+    filter: &crate::policy::Filter,
+    id: &str,
+    held: Option<&Value>,
+) -> ApiResult<bool> {
+    let Some(reach) = crate::repr::narrowing(filter).policy_reach else {
+        return Ok(true);
+    };
+    if reach.q.is_none() && reach.scope_q.is_none() && reach.areas.is_empty() {
+        return Ok(true);
+    }
+    let reach = crate::repr::PolicyReach {
+        rules: None,
+        ..(*reach).clone()
+    };
+    match st
+        .store
+        .get(tenant, antares_store::Kind::Entity, id)
+        .await?
+    {
+        Some(doc) => Ok(crate::repr::policy_admits(st, tenant, ctx, Some(&reach), &doc).await),
+        None => Ok(held.is_none_or(|h| {
+            let areas: Vec<&antares_ql::geo::GeoQuery> = reach.areas.iter().collect();
+            window_conditions_match(h, None, reach.q.as_ref(), &areas, ctx)
+                && reach
+                    .scope_q
+                    .as_deref()
+                    .is_none_or(|sq| scope_window_retain(&mut h.clone(), sq, None, "observedAt"))
+        })),
+    }
+}
+
+/// Whether `rules` decide an instance on the Entity's state at its time (a
+/// rule with a condition), which [`rules_per_instance`] rebuilds from the
+/// whole history. A rule of types, Attributes and windows decides each
+/// instance alone, so the store may prune to the query's window (T-4246).
+fn replays_state(rules: Option<&crate::policy::Filter>) -> bool {
+    rules.is_some_and(|r| r.rules.iter().any(crate::policy::Rule::is_conditional))
+}
+
+/// Whether the store's per-Attribute cap keeps every instance `rules` would
+/// show of the page: with no rules always; under rules only for lastN, when
+/// no rule reads state and every window stays open towards now, so the
+/// rules keep the newest instances of what they show. A window that closes
+/// before now, or firstN, would have the store keep instances the rules
+/// then drop (T-4246). Rule windows judge observedAt, so a window under a
+/// cap ordered by another `timeproperty` (a backfill: new createdAt, old
+/// observedAt) keeps the cap in the API too.
+fn cap_keeps_shown(
+    rules: Option<&crate::policy::Filter>,
+    page: &InstancePage,
+    timeprop: &str,
+) -> bool {
+    rules.is_none_or(|r| {
+        page.desc
+            && !replays_state(Some(r))
+            && r.rules.iter().all(|rule| {
+                rule.temporal.is_empty()
+                    || (timeprop == "observedAt" && rule.temporal.iter().all(|w| w.to.is_none()))
+            })
+    })
+}
+
 /// 5.7.4.4 S2/S3: the values filter and the geoquery are judged on the
 /// Attribute instances WITHIN the temporal-query interval, so an
 /// out-of-window instance must not satisfy either.
+/// ADR-0023 rule 11, temporal per instance: an instance of an Attribute
+/// is kept only where a rule showing the Attribute held at the instance's
+/// time (`observedAt`, else `modifiedAt`). A rule without a condition holds
+/// at every time; a conditional one is read on the Entity's state at that
+/// time ([`state_at`]) and does not hold where a member its condition reads
+/// has no instance yet, or where it reads `scope`, which keeps no history:
+/// a state that cannot be rebuilt hides the instance (fail closed). `None`
+/// when no rule names one of the Entity's types.
+pub(crate) fn rules_per_instance(doc: &Value, rules: &crate::policy::Filter) -> Option<Value> {
+    let ctx = crate::repr::policy_context();
+    let types = crate::policy::entity_types(doc);
+    let typed: Vec<&crate::policy::Rule> = rules.rules.iter().filter(|r| r.selects(doc)).collect();
+    if !rules.rules.is_empty() && typed.is_empty() {
+        return None;
+    }
+    let omitted: std::collections::BTreeSet<&str> = types
+        .iter()
+        .filter_map(|t| rules.omit_by_type.get(*t))
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    // a rule with windows decides per instance too (gap G6)
+    let per_instance = |r: &crate::policy::Rule| r.is_conditional() || !r.temporal.is_empty();
+    let always: std::collections::BTreeSet<&str> = typed
+        .iter()
+        .filter(|r| !per_instance(r))
+        .flat_map(|r| r.attributes.iter().map(String::as_str))
+        .collect();
+    let conditional: Vec<(&crate::policy::Rule, Vec<String>)> = typed
+        .iter()
+        .filter(|r| per_instance(r) && r.scope_q.is_none())
+        .map(|r| (*r, r.reads(ctx)))
+        .collect();
+    // an unconditioned rule over every Attribute keeps every instance
+    let every = typed.iter().any(|r| !per_instance(r) && r.every_attribute);
+    let now = chrono::Utc::now();
+    let Some(obj) = doc.as_object() else {
+        return Some(doc.clone());
+    };
+    let mut out = Map::new();
+    for (k, v) in obj {
+        if is_meta(k) {
+            out.insert(k.clone(), v.clone());
+            continue;
+        }
+        if omitted.contains(k.as_str()) {
+            continue;
+        }
+        if rules.rules.is_empty() || every || always.contains(k.as_str()) {
+            out.insert(k.clone(), v.clone());
+            continue;
+        }
+        let deciding: Vec<&(&crate::policy::Rule, Vec<String>)> = conditional
+            .iter()
+            .filter(|(r, _)| r.every_attribute || r.attributes.iter().any(|a| a == k))
+            .collect();
+        let Some(instances) = v.as_array().filter(|_| !deciding.is_empty()) else {
+            continue;
+        };
+        // ponytail: a condition rebuilds the state per instance, O(instances x
+        // history); sort each Attribute's history once if long histories show
+        // up under one. A rule without a condition reads no state: `typed`
+        // already selected the Entity by its types and ids, which is all
+        // `holds` reads of it, so only its windows decide (T-4246).
+        let reads_state = deciding.iter().any(|(r, _)| r.is_conditional());
+        let kept: Vec<Value> = instances
+            .iter()
+            .filter(|inst| {
+                instant(inst).is_some_and(|t| {
+                    let state = reads_state.then(|| state_at(doc, t));
+                    let observed = inst.get("observedAt").and_then(Value::as_str);
+                    deciding.iter().any(|(r, reads)| {
+                        (!r.is_conditional()
+                            || state.as_ref().is_some_and(|state| {
+                                reads.iter().all(|a| state.get(a).is_some()) && r.holds(state, ctx)
+                            }))
+                            && r.temporal
+                                .iter()
+                                .all(|w| observed.is_some_and(|o| w.admits(o, now)))
+                    })
+                })
+            })
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            out.insert(k.clone(), Value::Array(kept));
+        }
+    }
+    Some(Value::Object(out))
+}
+
+/// When an instance holds: its `observedAt`, else its `modifiedAt`.
+fn instant(inst: &Value) -> Option<&str> {
+    inst.get("observedAt")
+        .or_else(|| inst.get("modifiedAt"))
+        .and_then(Value::as_str)
+}
+
+/// The Entity as it stood at `t`, rebuilt from its history: the frame, and
+/// for each Attribute the latest instance at or before `t`, if any.
+fn state_at(doc: &Value, t: &str) -> Value {
+    let at = dt_key(t);
+    let Some(obj) = doc.as_object() else {
+        return Value::Null;
+    };
+    let mut out = Map::new();
+    for (k, v) in obj {
+        if is_meta(k) {
+            if k == "id" || k == "type" {
+                out.insert(k.clone(), v.clone());
+            }
+            continue;
+        }
+        let latest = v
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|inst| instant(inst).map(|i| (dt_key(i), inst)))
+            .filter(|(i, _)| *i <= at)
+            .max_by(|a, b| a.0.cmp(&b.0))
+            .map(|(_, inst)| inst.clone());
+        if let Some(inst) = latest {
+            out.insert(k.clone(), Value::Array(vec![inst]));
+        }
+    }
+    Value::Object(out)
+}
+
 fn window_conditions_match(
     doc: &Value,
     tq: Option<&TemporalQ>,
     q_ast: Option<&antares_ql::QNode>,
-    geo: Option<&antares_ql::geo::GeoQuery>,
+    geos: &[&antares_ql::geo::GeoQuery],
     ctx: &Context,
 ) -> bool {
     // 5.7.4.4 S2/S3: the values filter and geoquery are checked against
@@ -1663,12 +2023,58 @@ fn window_conditions_match(
             return false;
         }
     }
-    if let Some(g) = geo {
-        if !g.matches(&eval_doc, ctx) {
-            return false;
+    geos.iter().all(|g| g.matches(&eval_doc, ctx))
+}
+
+/// 5.7.4.4 S9: of each Attribute `q` reads, keep the instances that meet
+/// the query: an instance meets it when `q` holds on the Entity with that
+/// Attribute narrowed to the one instance (the other Attributes in the
+/// window), so a term on another Attribute still acts at Entity level.
+fn retain_q_instances(
+    doc: &mut Value,
+    tq: Option<&TemporalQ>,
+    ast: &antares_ql::QNode,
+    ctx: &Context,
+) {
+    let mut heads: Vec<String> = ast
+        .attribute_paths()
+        .into_iter()
+        .filter_map(|p| p.split(['.', '[', '{']).next().map(|h| ctx.expand_key(h)))
+        .collect();
+    heads.sort();
+    heads.dedup();
+    let mut eval_doc = doc.clone();
+    if let (Some(tqv), Some(o)) = (tq, eval_doc.as_object_mut()) {
+        for (k, v) in o.iter_mut() {
+            if !is_meta(k) {
+                if let Some(arr) = v.as_array_mut() {
+                    arr.retain(|inst| tqv.instance_matches(inst));
+                }
+            }
         }
     }
-    true
+    let (Some(obj), Value::Object(eval)) = (doc.as_object_mut(), &mut eval_doc) else {
+        return;
+    };
+    for head in heads {
+        let Some(arr) = obj.get_mut(&head).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let windowed = eval.get(&head).cloned();
+        arr.retain(|inst| {
+            eval.insert(head.clone(), Value::Array(vec![inst.clone()]));
+            // `eval` is lent back as a document for the one evaluation
+            let probe = Value::Object(std::mem::take(eval));
+            let holds = antares_ql::eval::eval_q(ast, &probe, ctx, &|_| None);
+            if let Value::Object(m) = probe {
+                *eval = m;
+            }
+            holds
+        });
+        if let Some(w) = windowed {
+            eval.insert(head, w);
+        }
+    }
 }
 
 /// 5.7.4.4 S4 — and S7: the federation merge precedes this check, so
@@ -1756,6 +2162,8 @@ pub(crate) async fn query_temporal_collected(
             "aggrMethods",
             "aggrPeriodDuration",
             "lastN",
+            "firstN",
+            "offsetN",
             "limit",
             "offset",
             "count",
@@ -1799,26 +2207,46 @@ pub(crate) async fn query_temporal_collected(
     // ADR-0020: the engine's narrowing joins the request's own filters after
     // 5.7.4.4's "too wide" judgement, which is about what the client asked
     // for. Everything below reads the narrowed query, the forward included.
-    let narrowed = filter.narrow_params(params)?;
+    // ADR-0023 rule 11: the rules, and the client's own q apart from the
+    // engine's, read on each Entity as its rules show it
+    let types_rule = crate::repr::type_rules(filter);
+    let ruled = types_rule.is_some();
+    let client_q = if ruled {
+        crate::repr::client_q(params, &ctx)?
+    } else {
+        None
+    };
+    let narrowed = filter.narrow_window(&filter.narrow_params(params, &ctx)?, true)?;
     let params = &narrowed;
-    let q_ast = params.get("q").map(|q| parse_q(q)).transpose()?.map(|ast| {
-        antares_ql::eval::apply_expand_values(
-            ast,
-            antares_ql::eval::expansion_list(
-                params.get("expandValues").map(String::as_str),
-                params.get("jsonKeys").map(String::as_str),
+    let q_ast = params
+        .get("q")
+        .map(|q| antares_ql::parse_narrowed_q(q))
+        .transpose()?
+        .map(|ast| {
+            antares_ql::eval::apply_expand_values(
+                ast,
+                antares_ql::eval::expansion_list(
+                    params.get("expandValues").map(String::as_str),
+                    params.get("jsonKeys").map(String::as_str),
+                )
+                .as_deref(),
+                &ctx,
             )
-            .as_deref(),
-            &ctx,
-        )
-    });
+        });
+    // under rules only the engine's own q reaches the store and the stored
+    // history; the client's waits for the shown one
+    let q_ast = if ruled {
+        filter.q.as_deref().cloned()
+    } else {
+        q_ast
+    };
     let scope_q = params.get("scopeQ").map(String::as_str);
     let tq = TemporalQ::from_params(params, true)?;
     let mut trepr = parse_trepr(params, &ctx)?;
     crate::repr::narrow_projection(&mut trepr.pick, &mut trepr.omit, filter, &ctx)?;
     // 5.7.4.4: {…} projection is Linked Entity retrieval — unconditional 400
     reject_linked_projection(&trepr, "5.7.4.4")?;
-    let last_n = trepr.last_n;
+    let page_n = trepr.page;
 
     let ids: Option<Vec<&str>> = params.get("id").map(|s| s.split(',').collect());
     // 5.7.4.4: an invalid URI in the id list is BadRequestData
@@ -1841,8 +2269,23 @@ pub(crate) async fn query_temporal_collected(
     });
     let attrs_filter = selection(&trepr);
     // only the attrs= param excludes entities; pick is projection-only
-    let entity_attr_filter = trepr.attrs.clone();
-    let geo = antares_ql::geo::GeoQuery::from_params(params)?;
+    let (entity_attr_filter, shown_attrs) = if ruled {
+        (None, trepr.attrs.clone())
+    } else {
+        (trepr.attrs.clone(), None)
+    };
+    // the request's own geoquery and the narrowing's area, all of which
+    // must hold (ADR-0023 rule 1); under rules the request's reads the
+    // shown history
+    let own_geo = antares_ql::geo::GeoQuery::from_params(params)?;
+    let (geos, shown_geos): (
+        Vec<&antares_ql::geo::GeoQuery>,
+        Vec<&antares_ql::geo::GeoQuery>,
+    ) = if ruled {
+        (filter.areas().collect(), own_geo.iter().collect())
+    } else {
+        (own_geo.iter().chain(filter.areas()).collect(), Vec::new())
+    };
 
     // Push entity narrowing (ids/types/attrs) and instance-window
     // pruning (range + RANK()-capped lastN) into the store. The loop below
@@ -1855,7 +2298,7 @@ pub(crate) async fn query_temporal_collected(
     // (q/geo still drop entities after SQL) wait for exactness.
     // scopeQ joins q/geo here: the 4.18 validity filter drops entities and
     // instances AFTER SQL, so a pushed page/lastN cap would under-return.
-    let exact_push = q_ast.is_none() && geo.is_none() && scope_q.is_none();
+    let exact_push = q_ast.is_none() && geos.is_empty() && scope_q.is_none();
     // Entity-page pushdown: a temporal query used to materialize the
     // tenant's ENTIRE history. Pushed only when every filter the store
     // cannot see is absent — same gate family as the entity-query pushdown.
@@ -1874,15 +2317,22 @@ pub(crate) async fn query_temporal_collected(
             .q_pushdown_exact(ast, r.as_ref(), &|t| ctx.expand_key(t))
     });
     let (p_offset, p_limit, _) = crate::paging::page_params(st, params)?;
+    // rule 8 drops Entities after the store answered, so the store may not
+    // page under a narrowing that reads the state now (`ponytail:` one read
+    // per Entity; push it into the store query when it shows up)
+    let narrowed_now =
+        filter.q.is_some() || filter.scope_q.is_some() || filter.areas().next().is_some();
     // 5.7.4.4 + 5.5.9: pagination applies to the MERGED federated union, so
     // the store may only pre-page when nothing will federate — otherwise
     // page 1 is local-page + every remote row (matrix-9 IOP_EXT_TMP_03_04).
-    let push_page = (exact_push || (geo.is_none() && scope_q.is_none() && q_page_exact))
+    let push_page = (exact_push || (geos.is_empty() && scope_q.is_none() && q_page_exact))
+        && !ruled
         && id_pattern.is_none()
         && params.get("orderBy").is_none()
         && params.get("datasetId").is_none()
         && params.get("pick").is_none()
         && p_limit > 0
+        && !narrowed_now
         && !crate::federation::would_federate(st, &tenant, &ctx, params, headers).await?;
     // 4.5.19 computed by the store: the numeric bucket matrix per attribute
     // comes back aggregated when nothing after the store call could change
@@ -1894,7 +2344,7 @@ pub(crate) async fn query_temporal_collected(
         && exact_push
         && push_page
         && trepr.omit.is_none()
-        && last_n.is_none()
+        && page_n == InstancePage::default()
         && !matches!(trepr.aggr_period, AggrPeriod::Months(..))
         && params.get("entityMap").map(String::as_str) != Some("true")
         && trepr
@@ -1905,21 +2355,32 @@ pub(crate) async fn query_temporal_collected(
     // futures are Send; the store call itself is synchronous)
     let outcome = {
         let expand = |t: &str| ctx.expand_key(t);
-        let geo_pre = geo.as_ref().map(|g| g.to_instance_spec(&ctx));
+        let geo_pre: Vec<_> = geos.iter().map(|g| g.to_instance_spec(&ctx)).collect();
         let tf = antares_store::filter::TemporalFilter {
             ids: ids.as_deref(),
             types: types.as_deref(),
             attrs: entity_attr_filter.as_deref(),
-            range: tq.as_ref().map(|t| antares_store::filter::InstanceRange {
-                timerel: &t.timerel,
-                time_at: &t.time_at,
-                end_time_at: t.end_time_at.as_deref(),
-                timeproperty: &t.timeproperty,
+            // a condition rebuilds each instance's state from the whole
+            // history; rules without one read only the window (T-4246)
+            range: tq
+                .as_ref()
+                .filter(|_| !replays_state(types_rule.as_deref()))
+                .map(|t| antares_store::filter::InstanceRange {
+                    timerel: &t.timerel,
+                    time_at: &t.time_at,
+                    end_time_at: t.end_time_at.as_deref(),
+                    timeproperty: &t.timeproperty,
+                }),
+            last_n: page_n.store_cap().filter(|_| {
+                exact_push
+                    && cap_keeps_shown(
+                        types_rule.as_deref(),
+                        &page_n,
+                        tq.as_ref()
+                            .map_or("observedAt", |t| t.timeproperty.as_str()),
+                    )
             }),
-            last_n: match (last_n, exact_push) {
-                (Some(n), true) => Some(n as i64),
-                _ => None,
-            },
+            oldest_first: !page_n.desc,
             timeproperty: tq
                 .as_ref()
                 .map_or("observedAt", |t| t.timeproperty.as_str()),
@@ -1930,7 +2391,7 @@ pub(crate) async fn query_temporal_collected(
             }),
             q: q_ast.as_ref(),
             expand: &expand,
-            geo: geo_pre.as_ref().map(|(s, iri)| (s, iri.as_str())),
+            geo: &geo_pre,
             aggregate: push_agg.then_some(antares_store::filter::Aggregate {
                 methods: &trepr.aggr_methods,
                 period_secs: match trepr.aggr_period {
@@ -2013,7 +2474,7 @@ pub(crate) async fn query_temporal_collected(
     };
     let mut matches = Vec::new();
     for mut doc in all {
-        let id = doc["id"].as_str().unwrap_or("");
+        let id = doc.get("id").and_then(Value::as_str).unwrap_or("");
         if let Some(ids) = &ids {
             if !ids.contains(&id) {
                 continue;
@@ -2030,14 +2491,34 @@ pub(crate) async fn query_temporal_collected(
         if !type_and_attrs_match(&doc, types.as_ref(), entity_attr_filter.as_ref()) {
             continue;
         }
-        if (q_ast.is_some() || geo.is_some())
-            && !window_conditions_match(&doc, tq.as_ref(), q_ast.as_ref(), geo.as_ref(), &ctx)
+        if (q_ast.is_some() || !geos.is_empty())
+            && !window_conditions_match(&doc, tq.as_ref(), q_ast.as_ref(), &geos, &ctx)
         {
             continue;
+        }
+        if let Some(ast) = &q_ast {
+            retain_q_instances(&mut doc, tq.as_ref(), ast, &ctx);
         }
         if let Some(sq) = scope_q {
             if !scope_window_retain(&mut doc, sq, tq.as_ref(), timeprop.as_str()) {
                 continue;
+            }
+        }
+        if let Some(rules) = types_rule.as_deref() {
+            let Some(shown) = rules_per_instance(&doc, rules) else {
+                continue;
+            };
+            doc = shown;
+            if !type_and_attrs_match(&doc, None, shown_attrs.as_ref()) {
+                continue;
+            }
+            if (client_q.is_some() || !shown_geos.is_empty())
+                && !window_conditions_match(&doc, tq.as_ref(), client_q.as_ref(), &shown_geos, &ctx)
+            {
+                continue;
+            }
+            if let Some(ast) = &client_q {
+                retain_q_instances(&mut doc, tq.as_ref(), ast, &ctx);
             }
         }
         // entity qualifies only if some instance falls in the window
@@ -2052,6 +2533,16 @@ pub(crate) async fn query_temporal_collected(
         });
         if !any_instance {
             continue;
+        }
+        if narrowed_now {
+            let id = doc
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if !member_now(st, &tenant, &ctx, filter, &id, None).await? {
+                continue;
+            }
         }
         matches.push(doc);
     }
@@ -2070,20 +2561,41 @@ pub(crate) async fn query_temporal_collected(
     let core_only_pick = attrs_filter.as_ref().is_some_and(Vec::is_empty);
     let mut payload: Vec<Value> = Vec::new();
     let (mut g_trunc, mut g_min, mut g_maxts) = (false, None::<String>, None::<String>);
+    let mut g_more = false;
+    // the next page's move: the fewest instances any Entity's cut Attribute
+    // served, and the boundary every Entity's cut reached (`interval_links`)
+    let (mut g_cut, mut g_bound) = (None::<usize>, None::<String>);
+    // ADR-0023 rule 11: each Entity's history was narrowed by its rules in
+    // the loop above, before the window, so lastN counts only what may be
+    // seen (rule 8)
     for d in &page {
         let mut w = window(
             d,
             tq.as_ref(),
-            last_n,
+            page_n,
             attrs_filter.as_ref(),
             trepr.omit.as_ref(),
             trepr.dataset_id.as_ref(),
             &timeprop,
         );
         if !trepr.aggregated {
-            truncate(&mut w, &timeprop, last_n.is_some());
+            truncate(&mut w, &timeprop, page_n.desc);
         }
         g_trunc |= w.truncated;
+        g_more |= w.more;
+        if let Some(c) = w.cut_served {
+            g_cut = Some(g_cut.map_or(c, |g| g.min(c)));
+        }
+        if let Some(b) = w.truncated.then(|| cut_boundary(&w, page_n.desc)).flatten() {
+            // the earliest boundary forwards, the latest backwards: no
+            // Entity's instance past its own boundary is left behind
+            if g_bound
+                .as_deref()
+                .is_none_or(|g| (dt_key(b) < dt_key(g)) != page_n.desc)
+            {
+                g_bound = Some(b.to_owned());
+            }
+        }
         if let Some(m) = &w.ts_min {
             if g_min.as_deref().is_none_or(|c| dt_key(m) < dt_key(c)) {
                 g_min = Some(m.clone());
@@ -2115,7 +2627,7 @@ pub(crate) async fn query_temporal_collected(
             g_min.as_deref(),
             g_maxts.as_deref(),
             tq.as_ref(),
-            last_n,
+            page_n,
         )
     };
     let status = if cr.is_some() {
@@ -2131,6 +2643,19 @@ pub(crate) async fn query_temporal_collected(
         }
     }
     attach_paging(&mut resp, count_hdr, &links);
+    attach_paging(
+        &mut resp,
+        None,
+        &interval_links(
+            params,
+            "/ngsi-ld/v1/temporal/entities",
+            accept,
+            page_n,
+            g_more,
+            page_n.step(trepr.aggregated),
+            g_cut.zip(g_bound.as_deref()),
+        ),
+    );
     // 6.18.3.2: entityMap=true — the temporal EntityMap for this query is
     // (re)created; the response carries NGSILD-EntityMap and 201 Created.
     if params.get("entityMap").map(String::as_str) == Some("true") {
@@ -2142,7 +2667,7 @@ pub(crate) async fn query_temporal_collected(
             }
         }
     }
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 
@@ -2193,6 +2718,8 @@ async fn retrieve_temporal_inner(
                 "endTimeAt",
                 "timeproperty",
                 "lastN",
+                "firstN",
+                "offsetN",
                 "aggrMethods",
                 "aggrPeriodDuration",
                 "options",
@@ -2209,6 +2736,9 @@ async fn retrieve_temporal_inner(
         let accept = parse_accept(headers)?;
         let ctx = request_context(&st.loader, headers).await?;
         let filter = gate!(st, &tenant, headers, "5.7.3", ids: &[id]).await?;
+        // gap G6: every reader below takes the window clamped to the grant
+        let windowed = filter.narrow_window(params, false)?;
+        let params = &windowed;
         let tq = TemporalQ::from_params(params, false)?;
         let mut trepr = parse_trepr(params, &ctx)?;
         crate::repr::narrow_projection(&mut trepr.pick, &mut trepr.omit, &filter, &ctx)?;
@@ -2216,18 +2746,34 @@ async fn retrieve_temporal_inner(
         // use of Linked Entity retrieval, an error of type BadRequestData
         // shall be raised" — unconditional, temporal defines no join.
         reject_linked_projection(&trepr, "5.7.3.4")?;
-        let last_n = trepr.last_n;
+        let page_n = trepr.page;
         antares_model::EntityId::new(id)?;
+        // ADR-0023 rule 11: a condition rebuilds each instance's state from
+        // the whole history, so the store prunes no instance under one; rules
+        // without one read only the window (T-4246)
+        let types_rule = crate::repr::type_rules(&filter);
+        let replays = replays_state(types_rule.as_deref());
         // Instance pruning pushed into the store (no q=/geo on retrieve,
         // so it is always safe here); window() below stays the arbiter.
         let tf = antares_store::filter::TemporalFilter {
-            range: tq.as_ref().map(|t| antares_store::filter::InstanceRange {
-                timerel: &t.timerel,
-                time_at: &t.time_at,
-                end_time_at: t.end_time_at.as_deref(),
-                timeproperty: &t.timeproperty,
+            range: tq
+                .as_ref()
+                .filter(|_| !replays)
+                .map(|t| antares_store::filter::InstanceRange {
+                    timerel: &t.timerel,
+                    time_at: &t.time_at,
+                    end_time_at: t.end_time_at.as_deref(),
+                    timeproperty: &t.timeproperty,
+                }),
+            last_n: page_n.store_cap().filter(|_| {
+                cap_keeps_shown(
+                    types_rule.as_deref(),
+                    &page_n,
+                    tq.as_ref()
+                        .map_or("observedAt", |t| t.timeproperty.as_str()),
+                )
             }),
-            last_n: last_n.map(|n| n as i64),
+            oldest_first: !page_n.desc,
             timeproperty: tq
                 .as_ref()
                 .map_or("observedAt", |t| t.timeproperty.as_str()),
@@ -2266,8 +2812,8 @@ async fn retrieve_temporal_inner(
                     } else {
                         Some(0)
                     });
-                    match idx {
-                        Some(i) => (fed[i].1.clone(), Some(i)),
+                    match idx.and_then(|i| fed.get(i).map(|(_, d)| (d.clone(), i))) {
+                        Some((d, i)) => (d, Some(i)),
                         None => {
                             return Err(NgsiError::ResourceNotFound(format!(
                                 "temporal entity {id} not found"
@@ -2293,6 +2839,21 @@ async fn retrieve_temporal_inner(
                 NgsiError::ResourceNotFound(format!("temporal entity {id} not found"))
             })?
         };
+        // ADR-0020, ADR-0023 rules 3 and 8: an Entity outside the
+        // narrowing now is the 404 of an absent one
+        if !member_now(st, &tenant, &ctx, &filter, id, Some(&doc)).await? {
+            return Err(
+                NgsiError::ResourceNotFound(format!("temporal entity {id} not found")).into(),
+            );
+        }
+        // ADR-0023 rule 11: the history its rules show, before anything
+        // reads it; no rule for its types is the 404 of an absent Entity
+        let doc = match types_rule.as_deref() {
+            Some(r) => rules_per_instance(&doc, r).ok_or_else(|| {
+                NgsiError::ResourceNotFound(format!("temporal entity {id} not found"))
+            })?,
+            None => doc,
+        };
         let attrs_filter = selection(&trepr);
         // 5.7.3: attrs matching nothing ⇒ 404. A `pick` may name core members
         // instead — 5.7.3.3 admits "id", "type", "scope" or an Attribute name
@@ -2313,14 +2874,14 @@ async fn retrieve_temporal_inner(
         let mut w = window(
             &doc,
             tq.as_ref(),
-            last_n,
+            page_n,
             attrs_filter.as_ref(),
             trepr.omit.as_ref(),
             trepr.dataset_id.as_ref(),
             &timeprop,
         );
         if !trepr.aggregated {
-            truncate(&mut w, &timeprop, last_n.is_some());
+            truncate(&mut w, &timeprop, page_n.desc);
         }
         let cr = if trepr.aggregated {
             None
@@ -2330,7 +2891,7 @@ async fn retrieve_temporal_inner(
                 w.ts_min.as_deref(),
                 w.ts_max.as_deref(),
                 tq.as_ref(),
-                last_n,
+                page_n,
             )
         };
         let payload = present_temporal(&doc, &w, &ctx, &trepr, tq.as_ref(), &timeprop)?;
@@ -2348,13 +2909,29 @@ async fn retrieve_temporal_inner(
             StatusCode::OK
         };
         let mut resp = respond(status, payload, &ctx, accept, &tenant);
+        attach_paging(
+            &mut resp,
+            None,
+            &interval_links(
+                params,
+                &format!(
+                    "/ngsi-ld/v1/temporal/entities/{}",
+                    crate::federation::path_segment(id)
+                ),
+                accept,
+                page_n,
+                w.more,
+                page_n.step(trepr.aggregated),
+                w.cut_served.zip(cut_boundary(&w, page_n.desc)),
+            ),
+        );
         if let Some(cr) = cr {
             if let Ok(v) = cr.parse() {
                 resp.headers_mut().insert("Content-Range", v);
             }
         }
         crate::paging::attach_warnings(&mut resp, &warnings);
-        filter.mark_restricted(resp.headers_mut());
+        filter.mark(&st.host_alias, resp.headers_mut());
         Ok(resp)
     }
 }
@@ -2453,7 +3030,14 @@ pub async fn delete_temporal(
         // 5.6.16.4: forward to registrations supporting the operation;
         // unsupported proxy modes are Conflict.
         let ctx = st.loader.core();
-        gate!(st, &tenant, &headers, "5.6.16", ids: &[&id]).await?;
+        let pre = crate::policy::temporal_pre_image(&st, &tenant, &id).await;
+        gate!(
+            st, &tenant, &headers, "5.6.16",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+        )
+        .await?;
         let regs = match temporal_write_regs(&st, &tenant, &headers, &ctx, &params, &id).await {
             Ok(regs) => regs,
             Err(refused) => return Ok(*refused),
@@ -2499,7 +3083,15 @@ pub async fn add_temporal_attrs(
         let obj = parsed.object(NgsiError::BadRequestData(
             "fragment must be a JSON object".into(),
         ))?;
-        gate!(st, &tenant, &headers, "5.6.12", ids: &[&id]).await?;
+        let pre = crate::policy::temporal_pre_image(&st, &tenant, &id).await;
+        let granted = gate!(
+            st, &tenant, &headers, "5.6.12",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+        )
+        .await?;
+        let cond = crate::policy::Condition::of(&granted);
         // 5.6.12 input is pushed history — the 4.5.7 deleted-instance
         // representation is legal (5.5.4 temporal exception), hence
         // allow_null (mirrors 5.6.11).
@@ -2533,6 +3125,7 @@ pub async fn add_temporal_attrs(
             crate::federation::WritePlan::Answered(r) => return Ok(*r),
             crate::federation::WritePlan::Forward(regs) => regs,
         };
+        crate::policy::Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
         if !regs.is_empty() {
             let mut parts = Vec::new();
             let mut fwd = Vec::new();
@@ -2613,6 +3206,7 @@ pub async fn add_temporal_attrs(
         let res = st
             .temporal
             .mutate(&tenant, &id, |doc| {
+                crate::policy::Condition::pre_evolution(cond.as_ref(), &id, doc)?;
                 add_temporal_instances(doc, &expanded, &ts);
                 Ok::<(), NgsiError>(())
             })
@@ -2668,7 +3262,15 @@ pub async fn delete_temporal_attr(
         antares_model::check_attr_name(&attr)?;
         check_params(&params, &["datasetId", "deleteAll", "local"])?;
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.6.13", ids: &[&id]).await?;
+        let pre = crate::policy::temporal_pre_image(&st, &tenant, &id).await;
+        let granted = gate!(
+            st, &tenant, &headers, "5.6.13",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+        )
+        .await?;
+        let cond = crate::policy::Condition::of(&granted);
         let attr_iri = antares_jsonld::expand_attr_name(&attr, &ctx)?;
         let delete_all = params.get("deleteAll").map(String::as_str) == Some("true");
         let want_ds = crate::repr::target_dataset_id(&params).map(String::from);
@@ -2676,11 +3278,13 @@ pub async fn delete_temporal_attr(
             Ok(regs) => regs,
             Err(refused) => return Ok(*refused),
         };
+        crate::policy::Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
         let mut found = false;
         let ts = now_iso();
         let res = st
             .temporal
             .mutate(&tenant, &id, |doc| {
+                crate::policy::Condition::pre_evolution(cond.as_ref(), &id, doc)?;
                 let target = antares_store::stored_object(doc)?;
                 if delete_all
                     || (want_ds.is_none()
@@ -2884,7 +3488,15 @@ pub async fn modify_temporal_instance(
         antares_model::EntityId::new(&instance_id)
             .map_err(|_| NgsiError::BadRequestData("invalid instance id".into()))?;
         check_params(&params, &["local"])?;
-        gate!(st, &tenant, &headers, "5.6.14", ids: &[&id]).await?;
+        let pre = crate::policy::temporal_pre_image(&st, &tenant, &id).await;
+        let granted = gate!(
+            st, &tenant, &headers, "5.6.14",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+        )
+        .await?;
+        let cond = crate::policy::Condition::of(&granted);
         let parsed = parse_body(&st.loader, &headers, &body, BodyKind::MergePatch).await?;
         let obj = parsed.object(NgsiError::BadRequestData(
             "fragment must be a JSON object".into(),
@@ -2915,11 +3527,13 @@ pub async fn modify_temporal_instance(
                 Ok(regs) => regs,
                 Err(refused) => return Ok(*refused),
             };
+        crate::policy::Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
         let ts = now_iso();
         let mut found = false;
         let res = st
             .temporal
             .mutate(&tenant, &id, |doc| {
+                crate::policy::Condition::pre_evolution(cond.as_ref(), &id, doc)?;
                 let target = antares_store::stored_object(doc)?;
                 if let Some(arr) = target.get_mut(&attr_iri).and_then(Value::as_array_mut) {
                     if let Some(inst) = arr.iter_mut().find(|i| {
@@ -2994,17 +3608,27 @@ pub async fn delete_temporal_instance(
             .map_err(|_| NgsiError::BadRequestData("invalid instance id".into()))?;
         check_params(&params, &["local"])?;
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.6.15", ids: &[&id]).await?;
+        let pre = crate::policy::temporal_pre_image(&st, &tenant, &id).await;
+        let granted = gate!(
+            st, &tenant, &headers, "5.6.15",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+        )
+        .await?;
+        let cond = crate::policy::Condition::of(&granted);
         let attr_iri = antares_jsonld::expand_attr_name(&attr, &ctx)?;
         let regs = match temporal_write_regs(&st, &tenant, &headers, &ctx, &params, &id).await {
             Ok(regs) => regs,
             Err(refused) => return Ok(*refused),
         };
+        crate::policy::Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
         let mut found = false;
         let ts = now_iso();
         let res = st
             .temporal
             .mutate(&tenant, &id, |doc| {
+                crate::policy::Condition::pre_evolution(cond.as_ref(), &id, doc)?;
                 let target = antares_store::stored_object(doc)?;
                 if let Some(arr) = target.get_mut(&attr_iri).and_then(Value::as_array_mut) {
                     let before = arr.len();
@@ -3068,8 +3692,6 @@ pub async fn batch_temporal_query(
             &["limit", "offset", "count", "options", "format", "local"],
         )?;
         parse_accept(&headers)?;
-        let filter = gate!(st, &tenant, &headers, "5.7.4").await?;
-
         let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
         let q = parsed.object(NgsiError::BadRequestData(
             "query body must be an object".into(),
@@ -3082,6 +3704,17 @@ pub async fn batch_temporal_query(
         // and aggrParams (5.2.44).
         let mut vp: HashMap<String, String> = params.clone();
         crate::paging::query_doc_params(q, true, &mut vp)?;
+        // ADR-0020: the engine is shown every member of the Query body
+        let named = crate::entities::ReadMembers::with_ctx(&st, &vp, &parsed.ctx);
+        let filter = gate!(
+            st, &tenant, &headers, "5.7.4",
+            q: named.q.as_ref(),
+            scope_q: vp.get("scopeQ").map(String::as_str),
+            types: &named.types,
+            attrs: &named.attrs,
+            geo: named.geo.as_ref(),
+        )
+        .await?;
         query_temporal_inner(&st, &vp, &headers, &filter).await
     };
     go.await.unwrap_or_else(|e| e.into_response())
@@ -3143,9 +3776,9 @@ pub(crate) async fn build_temporal_map(
     // Box::pin: build_temporal_map is reachable from query_temporal_inner
     // (entityMap=true), so this recursive edge needs indirection.
     let resp = Box::pin(query_temporal_inner(st, &eff, headers, filter)).await?;
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
         .await
-        .map_err(|e| NgsiError::InternalError(format!("temporal candidate read: {e}")))?;
+        .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;
     // 5.5.14: the map FIXES the Entities considered by every later request, so
     // an unreadable candidate set must fail rather than become "no candidates".
     let candidates: Value = serde_json::from_slice(&bytes)
@@ -3312,9 +3945,18 @@ mod clause_6_3_10 {
     }
 
     async fn windowed(doc: &Value, tq: Option<&TemporalQ>, last_n: Option<usize>) -> Windowed {
-        let mut w = window(doc, tq, last_n, None, None, None, "observedAt");
+        let mut w = window(doc, tq, page(last_n), None, None, None, "observedAt");
         truncate(&mut w, "observedAt", last_n.is_some());
         w
+    }
+
+    /// The page of a request naming lastN, or neither firstN nor lastN.
+    fn page(last_n: Option<usize>) -> InstancePage {
+        InstancePage {
+            desc: last_n.is_some(),
+            n: last_n,
+            offset: 0,
+        }
     }
 
     fn observed(w: &Windowed) -> Vec<&str> {
@@ -3355,7 +3997,7 @@ mod clause_6_3_10 {
                 w.ts_min.as_deref(),
                 w.ts_max.as_deref(),
                 Some(&q),
-                None
+                page(None)
             ),
             Some(format!(
                 "date-time 2019-01-01T00:00:00Z-{}/*",
@@ -3378,6 +4020,42 @@ mod clause_6_3_10 {
             .iter()
             .filter_map(|i| i["observedAt"].as_str().map(str::to_owned))
             .max()
+    }
+
+    /// T-3613: the time continuation keeps the window's other end, and
+    /// moves the end the page reached in its order.
+    #[test]
+    fn a_page_cut_to_nothing_resumes_past_its_boundary() {
+        let p = |kv: &[(&str, &str)]| -> HashMap<String, String> {
+            kv.iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let (a, b, e) = (
+            "2020-01-01T00:00:00Z",
+            "2020-01-01T00:08:00Z",
+            "2020-01-02T00:00:00Z",
+        );
+        let between = |from: &str, to: &str| {
+            vec![
+                ("timerel", "between".to_owned()),
+                ("timeAt", from.to_owned()),
+                ("endTimeAt", to.to_owned()),
+            ]
+        };
+        let one =
+            |rel: &str, at: &str| vec![("timerel", rel.to_owned()), ("timeAt", at.to_owned())];
+        let window = p(&[("timerel", "between"), ("timeAt", a), ("endTimeAt", e)]);
+        assert_eq!(resume_after(&window, false, b), between(b, e));
+        assert_eq!(resume_after(&window, true, b), between(a, b));
+        let before = p(&[("timerel", "before"), ("timeAt", e)]);
+        assert_eq!(resume_after(&before, false, b), between(b, e));
+        assert_eq!(resume_after(&before, true, b), one("before", b));
+        let after = p(&[("timerel", "after"), ("timeAt", a)]);
+        assert_eq!(resume_after(&after, false, b), one("after", b));
+        assert_eq!(resume_after(&after, true, b), between(a, b));
+        assert_eq!(resume_after(&p(&[]), false, b), one("after", b));
+        assert_eq!(resume_after(&p(&[]), true, b), one("before", b));
     }
 
     /// 6.3.10: the partial content IS the representation the Content-Range
@@ -3446,7 +4124,7 @@ mod clause_6_3_10 {
                 w.ts_min.as_deref(),
                 w.ts_max.as_deref(),
                 None,
-                Some(20)
+                page(Some(20))
             ),
             Some(format!(
                 "date-time {}-{}/20",
@@ -3475,7 +4153,7 @@ mod clause_6_3_10 {
                 w.ts_min.as_deref(),
                 w.ts_max.as_deref(),
                 None,
-                None
+                page(None)
             ),
             Some(format!(
                 "date-time {}-{}/*",
@@ -3499,7 +4177,7 @@ mod clause_6_3_10 {
                 w.ts_min.as_deref(),
                 w.ts_max.as_deref(),
                 None,
-                None
+                page(None)
             ),
             None
         );
@@ -3762,6 +4440,8 @@ mod clause_4_5_19 {
             ts_min: times.first().map(|s| (*s).to_owned()),
             ts_max: times.last().map(|s| (*s).to_owned()),
             truncated: false,
+            cut_served: None,
+            more: false,
         }
     }
 
@@ -3930,6 +4610,8 @@ mod clause_4_5_19 {
             ts_min: times.first().cloned(),
             ts_max: times.last().cloned(),
             truncated: false,
+            cut_served: None,
+            more: false,
         }
     }
 
@@ -4150,5 +4832,21 @@ mod clause_4_21 {
         assert!(!crate::repr::meta_projected(None, Some(&omit), "type"));
         assert!(crate::repr::meta_projected(None, Some(&omit), "id"));
         assert!(crate::repr::meta_projected(None, None, "type"));
+    }
+}
+
+#[cfg(test)]
+mod t3932_time_of_day {
+    use super::seconds_of_day;
+
+    /// T-3932: a Time read with checked byte positions; a short or
+    /// multi-byte value is not a Time, never a panic.
+    #[test]
+    fn a_short_or_multibyte_time_is_none() {
+        assert_eq!(seconds_of_day("12:30:00Z"), Some(45_000.0));
+        assert_eq!(seconds_of_day("12:30:00.5"), Some(45_000.5));
+        for bad in ["", "12:3", "12:30", "1é:00:00", "12-30-00", "aa:bb:cc"] {
+            assert_eq!(seconds_of_day(bad), None, "{bad}");
+        }
     }
 }

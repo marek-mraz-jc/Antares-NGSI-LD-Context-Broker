@@ -1,0 +1,109 @@
+name: fast
+
+# The fast lane (T-3710): the workspace gate alone, on every push to dev,
+# about 15 minutes. A review closes on it (tasks/ci), so a task does not wait
+# for the ETSI matrix and the images. ci.yml is unchanged and still runs per
+# train: the workspace gate again, then the quick ETSI matrix, the arm64
+# build and the :dev image. Nothing moves out of ci.yml; the vanilla checks
+# (rule M3: the committed feature tree, the symbol gate with its --metadata
+# walk, the SBOM) are part of workspace.yml, so they now answer a push in
+# the fast lane too.
+#
+#   push to dev ──→ fast: workspace.yml            (closes reviews)
+#                         ‖ surfaces-conformance.yml (fast: true) when the
+#                           push touches a surface path (T-3765)
+#   dispatch per train ──→ ci: workspace.yml → ETSI matrix, images
+#
+# The surface subset (build, odata-conformance, odata-compliance-external)
+# runs beside the workspace gate, so a lost conformance pass is red on the
+# push that lost it. A dispatch compares against `base`, or runs the subset
+# when it names none.
+#
+# A train is tested on train/<stamp> and dev then fast-forwards to that same
+# sha (T-3776): the push to dev finds the green fast run on its sha and skips
+# every job, so one train costs one fast run. A dispatch always runs.
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: the ref the surface paths are compared against (empty runs the subset)
+        required: false
+        default: ""
+
+# One push per train: a newer push supersedes the run of the older one.
+concurrency:
+  group: fast-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  proven:
+    name: Already green on this sha
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: read
+    outputs:
+      green: ${{ steps.ask.outputs.green }}
+    steps:
+      - id: ask
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          green=false
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            # a failed question runs everything: the answer must prove the sha, never assume it
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$GITHUB_SHA&status=success&per_page=30" \
+              --jq '[.workflow_runs[] | select(.path == ".github/workflows/fast.yml" and .id != (env.GITHUB_RUN_ID | tonumber)) | .id] | join(" ")') || runs=
+            [ -n "$runs" ] && green=true && echo "green fast run(s) on $GITHUB_SHA: $runs"
+          fi
+          echo "green=$green" | tee -a "$GITHUB_OUTPUT"
+
+  workspace:
+    name: Workspace tests
+    needs: proven
+    if: needs.proven.outputs.green != 'true'
+    uses: ./.github/workflows/workspace.yml
+
+  changes:
+    name: Surface paths
+    needs: proven
+    if: needs.proven.outputs.green != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      surfaces: ${{ steps.diff.outputs.surfaces }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BASE: ${{ inputs.base || github.event.before }}
+        run: |
+          paths='^(crates/(antares-odata|odata-[^/]+|antares-views|antares-ops|antares-ogc|ogc-[^/]+)/|ci/odata-compliance|ci/views/|dev/odata-compliance/|dev/views-rig\.sh$|\.github/workflows/(fast|surfaces-conformance)\.yml$)'
+          if ! git rev-parse -q --verify "${BASE:-none}^{commit}" > /dev/null; then
+            hit=true # no base to compare with (a dispatch, a new branch): run it
+          elif git diff --name-only "$BASE" HEAD | grep -qE "$paths"; then
+            hit=true
+          else
+            hit=false
+          fi
+          echo "surfaces=$hit" | tee -a "$GITHUB_OUTPUT"
+
+  surfaces:
+    name: Surfaces conformance
+    needs: changes
+    if: needs.changes.outputs.surfaces == 'true'
+    # the nightly failure issue step is in the called file; it never runs
+    # on a push, but the job may ask for no more than its caller grants
+    permissions:
+      contents: read
+      issues: write
+    uses: ./.github/workflows/surfaces-conformance.yml
+    with:
+      fast: true

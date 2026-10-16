@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-mod common;
+use crate::common;
 use common::net::{proxy, strip_scope_q, verbatim};
 
 /// The 100 Entities the principal may see and the 3 it may not.

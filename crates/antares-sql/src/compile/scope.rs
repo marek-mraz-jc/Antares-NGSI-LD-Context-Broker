@@ -29,7 +29,7 @@ const MAX_SCOPE_Q_BYTES: usize = 4096;
 
 /// Compile `scope_q` into a predicate over `col` (a `text[]`).
 /// `None` = outside the exact subset; the caller filters in memory.
-pub fn compile_scope_q(scope_q: &str, col: &str, first_bind: usize) -> Option<CompiledSql> {
+pub fn compile_scope_q(scope_q: &str, col: &'static str, first_bind: usize) -> Option<CompiledSql> {
     // A NUL has no representation in a `text` value, so binding one raises in
     // the database — a 500 in `postgres` mode for a query `memory` mode
     // answers (`antares_ql::sql::literal` refuses one for the same reason).
@@ -54,7 +54,7 @@ pub fn compile_scope_q(scope_q: &str, col: &str, first_bind: usize) -> Option<Co
             // empty list is false.
             and_parts.push(format!(
                 "EXISTS (SELECT 1 FROM unnest({col}) AS s WHERE s ~ ${})",
-                first_bind + binds.len()
+                first_bind.saturating_add(binds.len())
             ));
             binds.push(re);
         }
@@ -82,7 +82,7 @@ fn pattern_regex(pat: &str) -> Option<String> {
     }
     let mut out = String::from("^/*");
     for (i, seg) in segs.iter().enumerate() {
-        let last = i == segs.len() - 1;
+        let last = i.saturating_add(1) == segs.len();
         if *seg == "#" {
             if !last {
                 return None; // non-terminal `#` never matches; refuse to guess

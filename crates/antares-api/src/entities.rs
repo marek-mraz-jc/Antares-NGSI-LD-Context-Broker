@@ -92,7 +92,7 @@ async fn create_entity_inner(
     let id = antares_jsonld::expanded_id(&expanded)?.to_owned();
 
     // distributed create (4.3.6, 6.4.3.1)
-    let types: Option<Vec<String>> = expanded["type"].as_array().map(|a| {
+    let types: Option<Vec<String>> = expanded.get("type").and_then(Value::as_array).map(|a| {
         a.iter()
             .filter_map(Value::as_str)
             .map(str::to_owned)
@@ -119,6 +119,11 @@ async fn create_entity_inner(
         body: Some(&expanded),
     )
     .await?;
+    // ADR-0023 rule 7: a create through a view writes an Entity the view
+    // selects, with Attributes it shows and Relationships to Entities it
+    // shows, or nothing at all.
+    #[cfg(feature = "views")]
+    crate::views::admits_new(st, &tenant, &expanded).await?;
     let regs = match crate::federation::write_plan(st, &tenant, &spec, &parsed.ctx, params, headers)
         .await?
     {
@@ -267,13 +272,26 @@ async fn retrieve_entity_inner(
         .into());
     }
     let ctx = request_context(&st.loader, headers).await?;
-    let filter = gate!(st, &tenant, headers, "5.7.1", ids: &[id]).await?;
+    let named = ReadMembers::with_ctx(st, params, &ctx);
+    let filter = gate!(
+        st, &tenant, headers, "5.7.1",
+        ids: &[id],
+        types: &named.types,
+        attrs: &named.attrs,
+    )
+    .await?;
     let mut repr = parse_repr(params, &ctx)?;
     crate::repr::narrow_repr(&mut repr, &filter);
     let join = parse_join(params)?;
     check_linked_projection(&repr, &join)?;
     antares_model::EntityId::new(id)?;
     let local_doc = st.store.get(&tenant, Kind::Entity, id).await?;
+    // T-3789: through a view, the tag a conditional write checks: of the
+    // stored document, before any federated merge; sent only with a 200
+    #[cfg(feature = "views")]
+    let etag = crate::views::WriteGuard::of(st, std::iter::empty())
+        .zip(local_doc.as_ref())
+        .map(|(g, d)| g.tag(d));
     let looped = crate::federation::via_loop(
         headers,
         &crate::federation::alias_for(&st.host_alias, &tenant),
@@ -363,23 +381,15 @@ async fn retrieve_entity_inner(
     // 5.7.1.4 answers an absent one — "If the NGSI-LD Entity does not
     // exist, an error of type ResourceNotFound shall be raised" — because a
     // refusal here would tell the caller the Entity is there.
-    if let Some(ast) = &filter.q {
-        if !crate::notify::linked_eval(st, &tenant, |l| {
-            antares_ql::eval::eval_q(ast, &doc, &ctx, l)
-        })
-        .await
-        {
-            return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
-        }
+    if !crate::repr::policy_admits(st, &tenant, &ctx, repr.policy_reach.as_deref(), &doc).await {
+        return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
     }
-    if let Some(scope) = &filter.scope_q {
-        if !crate::scope_matches(scope, &doc) {
-            return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
-        }
-    }
-    // 5.7.1: attrs projection with no matching attribute ⇒ 404
+    // 5.7.1: attrs projection with no matching attribute ⇒ 404, read on the
+    // Entity as the narrowing shows it: a hidden Attribute is absent, or
+    // the 404 would tell the caller it is there (ADR-0023 rule 2)
     if let Some(want) = &repr.attrs {
-        if !want.iter().any(|a| doc.get(a).is_some()) {
+        let shown = crate::repr::policy_view(&doc, &repr);
+        if !want.iter().any(|a| shown.get(a).is_some()) {
             return Err(NgsiError::ResourceNotFound(format!(
                 "entity {id} has none of the requested attributes"
             ))
@@ -417,6 +427,7 @@ async fn retrieve_entity_inner(
                 let complete = collect_flat_beyond(
                     st,
                     &tenant,
+                    &ctx,
                     &repr,
                     &doc,
                     *level,
@@ -451,7 +462,11 @@ async fn retrieve_entity_inner(
     };
     let mut resp = respond_prefer(StatusCode::OK, payload, &ctx, accept, &tenant, headers);
     attach_warnings(&mut resp, &warnings);
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
+    #[cfg(feature = "views")]
+    if let Some(tag) = etag.and_then(|t| axum::http::HeaderValue::from_str(&t).ok()) {
+        resp.headers_mut().insert(axum::http::header::ETAG, tag);
+    }
     Ok(resp)
 }
 
@@ -564,10 +579,14 @@ async fn query_entities_outer(
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     let q_ast = params.get("q").map(|q| parse_q(q)).transpose()?;
+    let named = ReadMembers::of(st, headers, &params).await;
     let filter = gate!(
         st, &tenant, headers, "5.7.2",
         q: q_ast.as_ref(),
         scope_q: params.get("scopeQ").map(String::as_str),
+        types: &named.types,
+        attrs: &named.attrs,
+        geo: named.geo.as_ref(),
     )
     .await?;
     let Some(map_ref) = single_header(headers, "NGSILD-EntityMap")? else {
@@ -610,6 +629,7 @@ async fn query_entities_outer(
     // EntityMaps exist for the distributed case. count=true walks every
     // candidate (the total needs each id checked), still chunk-bounded.
     let ids: Vec<String> = crate::entity_map::candidate_ids(&map, &params);
+    let narrow = crate::repr::narrowing_reading(&filter, &params, &ctx)?;
     let looped = crate::federation::via_loop(
         headers,
         &crate::federation::alias_for(&st.host_alias, &tenant),
@@ -631,7 +651,7 @@ async fn query_entities_outer(
         } else {
             Vec::new()
         };
-        let docs = filter_entities_fed(st, &tenant, &p, &ctx, fed).await?;
+        let docs = filter_entities_fed(st, &tenant, &p, &ctx, fed, Some(&narrow)).await?;
         let matched: std::collections::HashSet<&str> = docs
             .iter()
             .filter_map(|d| d.get("id").and_then(Value::as_str))
@@ -641,20 +661,20 @@ async fn query_entities_outer(
                 let local_only = emap
                     .get(id)
                     .and_then(Value::as_array)
-                    .is_some_and(|a| a.len() == 1 && a[0] == "@none");
+                    .is_some_and(|a| matches!(a.as_slice(), [only] if only == "@none"));
                 if local_only && !matched.contains(id.as_str()) {
                     emap.remove(id);
                 }
             }
         }
-        visited += chunk.len();
+        visited = visited.saturating_add(chunk.len());
         for id in chunk {
             if !matched.contains(id.as_str()) {
                 continue;
             }
-            total += 1;
+            total = total.saturating_add(1);
             if skipped < offset {
-                skipped += 1;
+                skipped = skipped.saturating_add(1);
             } else if page_ids.len() < limit {
                 page_ids.push(id.clone());
             } else {
@@ -670,7 +690,7 @@ async fn query_entities_outer(
         }
     }
     if count {
-        more = total > offset + limit;
+        more = total > offset.saturating_add(limit);
     }
     crate::entity_map::map_put(st, &tenant, map.clone()).await?;
     // fix the final fetch to exactly the page's survivors (5.5.14: an empty
@@ -708,7 +728,7 @@ async fn query_entities_outer(
     // 6.3.10 links from the original query — the inner call saw offset 0
     // over exactly one page, so it emitted none
     for (off, rel, cond) in [
-        (offset + limit, "next", more && limit > 0),
+        (offset.saturating_add(limit), "next", more && limit > 0),
         (offset.saturating_sub(limit.max(1)), "prev", offset > 0),
     ] {
         if !cond {
@@ -738,7 +758,7 @@ async fn query_entities_inner(
     st: &AppState,
     params: &HashMap<String, String>,
     headers: &HeaderMap,
-    filter: &crate::policy::Filter,
+    filter: &std::sync::Arc<crate::policy::Filter>,
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     check_params(params, crate::negotiate::QUERY_PARAMS)?;
@@ -754,12 +774,18 @@ async fn query_entities_inner(
         params,
         params.get("q").map(|q| parse_q(q)).transpose()?.as_ref(),
     );
+    // what the client's own query reads, before the engine's q joins it
+    // (ADR-0023 rule 11)
+    let client_params = params;
     // Everything below reads the narrowed query: the store push-down, the
     // local re-check 5.7.2.4 runs over merged results, and the query the
     // request is forwarded with.
-    let narrowed = filter.narrow_params(params)?;
+    let narrowed = filter.narrow_params(params, &ctx)?;
     let params = &narrowed;
-    let q_ast = params.get("q").map(|q| parse_q(q)).transpose()?;
+    let q_ast = params
+        .get("q")
+        .map(|q| antares_ql::parse_narrowed_q(q))
+        .transpose()?;
     // 5.7.2.4 validation bullets (p.201), in the spec's own order.
     if params.get("type").map(String::as_str) == Some("*")
         && params.get("local").map(String::as_str) == Some("false")
@@ -803,6 +829,7 @@ async fn query_entities_inner(
 
     let mut repr = parse_repr(params, &ctx)?;
     crate::repr::narrow_repr(&mut repr, filter);
+    crate::repr::note_reads(&mut repr, client_params, &ctx)?;
     let join = parse_join(params)?;
     check_linked_projection(&repr, &join)?;
     // 5.7.2.4: filter conditions using Linked Entity attributes need join,
@@ -869,13 +896,18 @@ async fn query_entities_inner(
         params,
         &ctx,
         fed,
-        push_page.then_some((p_offset, p_limit)),
-        push_proj.then_some(&repr),
+        Pushdown {
+            page: push_page.then_some((p_offset, p_limit)),
+            proj: push_proj.then_some(&repr),
+        },
+        Some(&repr),
     )
     .await?;
     let mut matches = filtered.docs;
     if let Some(spec) = params.get("orderBy") {
-        order_entities(&mut matches, spec, params, &ctx)?;
+        crate::repr::order_as_shown(&mut matches, Some(&repr), |m| {
+            order_entities(m, spec, params, &ctx)
+        })?;
     }
     let (page, count_hdr, links) = if filtered.paged {
         let total = filtered.total.unwrap_or(matches.len());
@@ -918,6 +950,7 @@ async fn query_entities_inner(
                     complete &= collect_flat_beyond(
                         st,
                         &tenant,
+                        &ctx,
                         &repr,
                         doc,
                         *level,
@@ -963,7 +996,7 @@ async fn query_entities_inner(
             }
         }
     }
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 
@@ -997,9 +1030,10 @@ pub async fn filter_entities_fed(
     params: &HashMap<String, String>,
     ctx: &antares_jsonld::Context,
     fed: Vec<(bool, Value)>,
+    narrow: Option<&crate::repr::Repr>,
 ) -> ApiResult<Vec<Value>> {
     Ok(
-        filter_entities_paged(st, tenant, params, ctx, fed, None, None)
+        filter_entities_paged(st, tenant, params, ctx, fed, Pushdown::default(), narrow)
             .await?
             .docs,
     )
@@ -1047,31 +1081,181 @@ fn proj_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -
 /// mandatory — IS pushed: the store returns no rows and counts the match set,
 /// which is the same count the scan derives from a materialized one, without
 /// materializing 100 million documents to throw them away.
+/// The client's type selection (OR of AND groups, `None` = any type) with
+/// one of the rules' types required in every group: `(a;b)|c` under rules
+/// of `T` and `U` selects `(a;b;T)|(a;b;U)|(c;T)|(c;U)`, and a group that
+/// already names one of them stays as it is (`(a;T)` selects no more than
+/// `(a;T;U)`). `None` when the rules name no type, so a selection is never
+/// dropped into "any".
+fn judged_types<'a>(
+    client: Option<&'a [Vec<String>]>,
+    rules: &crate::policy::Filter,
+) -> Option<std::borrow::Cow<'a, [Vec<String>]>> {
+    let mut union: Vec<&String> = rules.rules.iter().flat_map(|r| &r.types).collect();
+    union.sort();
+    union.dedup();
+    if union.is_empty() {
+        return None;
+    }
+    let named = |g: &Vec<String>| g.iter().any(|t| union.contains(&t));
+    if let Some(groups) = client.filter(|c| c.iter().all(named)) {
+        return Some(std::borrow::Cow::Borrowed(groups));
+    }
+    let any = [Vec::new()];
+    Some(std::borrow::Cow::Owned(
+        client
+            .unwrap_or(&any)
+            .iter()
+            .flat_map(|g| -> Vec<Vec<String>> {
+                if named(g) {
+                    return vec![g.clone()];
+                }
+                union
+                    .iter()
+                    .map(|t| {
+                        let mut g = g.clone();
+                        g.push((*t).clone());
+                        g
+                    })
+                    .collect()
+            })
+            .collect(),
+    ))
+}
+
 fn page_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -> bool {
     fed_is_empty && !params.contains_key("idPattern") && !params.contains_key("orderBy")
 }
 
-/// The full filtering path (5.7.2). `page` = (offset, limit) to push into the
+/// Entity Type Selection Language (4.17): `,`/`|` = OR, `(a;b)` = AND.
+/// Table 6.4.3.2-1: `"*"` selects every Entity Type, i.e. no type predicate
+/// at all. Expanding it as a term yields an IRI nothing matches, which is
+/// how `type=*` silently returned an empty array.
+fn type_selection(
+    params: &HashMap<String, String>,
+    ctx: &antares_jsonld::Context,
+) -> Option<Vec<Vec<String>>> {
+    params.get("type").filter(|s| *s != "*").map(|s| {
+        s.split([',', '|'])
+            .map(|alt| {
+                alt.trim()
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+                    .split(';')
+                    .map(|t| ctx.expand_key(t.trim()))
+                    .collect()
+            })
+            .collect()
+    })
+}
+
+/// The expanded `attrs` list of a query.
+fn attr_list(
+    params: &HashMap<String, String>,
+    ctx: &antares_jsonld::Context,
+) -> Option<Vec<String>> {
+    params
+        .get("attrs")
+        .map(|s| s.split(',').map(|t| ctx.expand_key(t.trim())).collect())
+}
+
+/// What a read names, for the policy gate (ADR-0020: "`Operation` is the
+/// expanded request"): the types of its type selector, its `attrs`, its
+/// `q` and its GeoQuery, expanded with the request @context exactly as the
+/// store query uses them. Built only with an engine attached. A member
+/// that does not parse is left out, and the read refuses it after the gate
+/// as before.
+#[derive(Default)]
+pub(crate) struct ReadMembers {
+    pub types: Vec<String>,
+    pub attrs: Vec<String>,
+    pub q: Option<antares_ql::QNode>,
+    pub geo: Option<antares_ql::geo::GeoQuery>,
+}
+
+impl ReadMembers {
+    pub(crate) fn with_ctx(
+        st: &AppState,
+        params: &HashMap<String, String>,
+        ctx: &antares_jsonld::Context,
+    ) -> Self {
+        if st.policy.is_none() {
+            return Self::default();
+        }
+        let mut types: Vec<String> = Vec::new();
+        for t in type_selection(params, ctx).into_iter().flatten().flatten() {
+            if !types.contains(&t) {
+                types.push(t);
+            }
+        }
+        Self {
+            types,
+            attrs: attr_list(params, ctx).unwrap_or_default(),
+            q: params
+                .get("q")
+                .and_then(|q| antares_ql::parse_narrowed_q(q).ok()),
+            geo: antares_ql::geo::GeoQuery::from_params(params)
+                .ok()
+                .flatten(),
+        }
+    }
+
+    /// Same, for a gate taken before the request @context is resolved.
+    pub(crate) async fn of(
+        st: &AppState,
+        headers: &HeaderMap,
+        params: &HashMap<String, String>,
+    ) -> Self {
+        if st.policy.is_none() {
+            return Self::default();
+        }
+        match request_context(&st.loader, headers).await {
+            Ok(ctx) => Self::with_ctx(st, params, &ctx),
+            Err(_) => Self::default(),
+        }
+    }
+}
+
+/// What the store may be asked to do beyond filtering; see
+/// [`filter_entities_paged`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Pushdown<'a> {
+    pub page: Option<(usize, usize)>,
+    pub proj: Option<&'a crate::repr::Repr>,
+}
+
+/// The full filtering path (5.7.2). `push.page` = (offset, limit) to push into the
 /// store — pass it ONLY when every filter the store cannot see is absent
 /// (idPattern, federation, orderBy); the store still refuses unless its own
-/// predicates compiled exactly. `proj` = the parsed representation, offered
-/// for projection pushdown (pick/omit/attrs top-level heads) under the same
-/// exactness gate.
+/// predicates compiled exactly. `push.proj` = the parsed representation,
+/// offered for projection pushdown (pick/omit/attrs top-level heads) under
+/// the same exactness gate. `narrow` = the caller's policy narrowing, which
+/// a linked q term reads its targets through (ADR-0020, T-3474).
 pub async fn filter_entities_paged(
     st: &AppState,
     tenant: &TenantId,
     params: &HashMap<String, String>,
     ctx: &antares_jsonld::Context,
     fed: Vec<(bool, Value)>,
-    page: Option<(usize, usize)>,
-    proj: Option<&crate::repr::Repr>,
+    push: Pushdown<'_>,
+    narrow: Option<&crate::repr::Repr>,
 ) -> ApiResult<Filtered> {
+    let Pushdown { page, proj } = push;
     // a pushed page over local rows cannot be merged with federated
     // candidates — refuse here so no caller can create that page
     let page = if fed.is_empty() { page } else { None };
     // and neither can a pushed projection: the store's answer is only the
     // final answer when nothing downstream still needs the stripped members
     let proj = proj.filter(|_| proj_pushdown_allowed(fed.is_empty(), params));
+    // ADR-0023 rule 11: under rules the store answers the policy's own
+    // predicates over the stored Entity, and the loop below decides which
+    // rules hold and evaluates the client's predicates on the Entity as it
+    // is shown, so the client's page is cut in the store only where the
+    // store can judge the rules itself (`judged` below).
+    let rules = narrow.and_then(|r| r.policy_types.as_deref());
+    let client_page = page;
+    let page = if rules.is_some() { None } else { page };
+    let proj = if rules.is_some() { None } else { proj };
     let ids: Option<Vec<&str>> = params.get("id").map(|s| s.split(',').collect());
     if let Some(ids) = &ids {
         for id in ids {
@@ -1090,32 +1274,17 @@ pub async fn filter_entities_paged(
         }
         None => None,
     };
-    // Entity Type Selection Language (4.17): `,`/`|` = OR, `(a;b)` = AND.
-    // Table 6.4.3.2-1: `"*"` selects every Entity Type, i.e. no type predicate
-    // at all. Expanding it as a term yields an IRI nothing matches, which is
-    // how `type=*` silently returned an empty array.
-    let type_sel: Option<Vec<Vec<String>>> = params.get("type").filter(|s| *s != "*").map(|s| {
-        s.split([',', '|'])
-            .map(|alt| {
-                alt.trim()
-                    .trim_start_matches('(')
-                    .trim_end_matches(')')
-                    .split(';')
-                    .map(|t| ctx.expand_key(t.trim()))
-                    .collect()
-            })
-            .collect()
-    });
-    let attr_filter: Option<Vec<String>> = params
-        .get("attrs")
-        .map(|s| s.split(',').map(|t| ctx.expand_key(t.trim())).collect());
+    let type_sel = type_selection(params, ctx);
+    let attr_filter = attr_list(params, ctx);
     let q_ast = match params.get("q") {
         // 4.9 expandValues: "attributes whose values should be expanded
         // against the supplied @context using JSON-LD type coercion prior to
         // executing the query" (EXAMPLE 12), less the Attributes jsonKeys
         // declares uninterpretable as JSON-LD.
+        // the query may be narrowed: every caller parsed its own `q` with
+        // `parse_q` before (threat V23)
         Some(q) => Some(antares_ql::eval::apply_expand_values(
-            parse_q(q)?,
+            antares_ql::parse_narrowed_q(q)?,
             antares_ql::eval::expansion_list(
                 params.get("expandValues").map(String::as_str),
                 params.get("jsonKeys").map(String::as_str),
@@ -1126,7 +1295,67 @@ pub async fn filter_entities_paged(
         None => None,
     };
     let scope_q = params.get("scopeQ");
-    let geo = antares_ql::geo::GeoQuery::from_params(params)?;
+    // The request's own geoquery (7.2.5 allows one) and the narrowing's
+    // area: every one must hold (ADR-0023 rule 1), so a caller's area
+    // cannot widen the policy's.
+    let own_geo = antares_ql::geo::GeoQuery::from_params(params)?;
+    let policy_geo = narrow
+        .and_then(|r| r.policy_reach.as_deref())
+        .map(|reach| reach.areas.as_slice())
+        .unwrap_or_default();
+    let geos: Vec<&antares_ql::geo::GeoQuery> = own_geo.iter().chain(policy_geo).collect();
+    // under rules the client's q, attrs and geoQ read the shown Entity, and
+    // only the engine's own q and area reach the store and the stored one
+    let client_q = narrow.and_then(|r| r.policy_client_q.as_ref());
+    let engine_q = narrow
+        .and_then(|r| r.policy_reach.as_deref())
+        .and_then(|reach| reach.q.as_ref());
+    let (q_ast, shown_q) = if rules.is_some() {
+        (engine_q.cloned(), client_q)
+    } else {
+        (q_ast, None)
+    };
+    let (geos, shown_geos): (Vec<_>, Vec<_>) = if rules.is_some() {
+        (policy_geo.iter().collect(), own_geo.iter().collect())
+    } else {
+        (geos, Vec::new())
+    };
+    let (attr_filter, shown_attrs) = if rules.is_some() {
+        (None, attr_filter)
+    } else {
+        (attr_filter, None)
+    };
+    let reads_shown = shown_attrs.is_some() || !shown_geos.is_empty() || shown_q.is_some();
+    // Rules that select by type alone admit exactly the Entities of their
+    // types. When the client reads nothing on the shown Entity either, the
+    // store takes those types as one more selection, and pages and counts
+    // as at the root (T-3667: a page of one read every Entity the policy
+    // admits).
+    let judged = rules
+        .filter(|f| {
+            f.rules
+                .iter()
+                .all(crate::policy::Rule::admits_by_type_alone)
+        })
+        .filter(|_| !reads_shown)
+        .and_then(|f| judged_types(type_sel.as_deref(), f));
+    let page = if judged.is_some() { client_page } else { page };
+    // Otherwise, without `count` the answer needs the matches up to the
+    // page's end and one more (whether a next page exists): the store is
+    // read in pages of its own, doubling, until that many held.
+    // ponytail: `count=true` under conditional rules still reads every
+    // Entity the policy admits; compile the rules' OR and the shown-set
+    // predicates to SQL if that shows up
+    let enough = match client_page {
+        Some((offset, limit))
+            if rules.is_some()
+                && judged.is_none()
+                && params.get("count").map(String::as_str) != Some("true") =>
+        {
+            offset.checked_add(limit).and_then(|n| n.checked_add(1))
+        }
+        _ => None,
+    };
 
     // Hand the store what it can filter on. A backend that can push
     // the predicate down (postgres/timescale) returns fewer rows — and says
@@ -1135,14 +1364,16 @@ pub async fn filter_entities_paged(
     // skip re-deciding. A backend that cannot (memory/file) returns the
     // snapshot and the loop stays the arbiter.
     let expand = |t: &str| ctx.expand_key(t);
-    let geo_spec = geo.as_ref().and_then(|g| g.to_sql_spec(ctx));
+    let geo_specs: Vec<_> = geos.iter().filter_map(|g| g.to_sql_spec(ctx)).collect();
     // A geo query whose spec declined to compile (non-default geoproperty) is
     // INVISIBLE to the store — the store would truthfully claim `decided`
     // about what it saw, projection would strip the very member the evaluator
     // still needs, and a pushed page would page over the wrong set. Forfeit
-    // every pushdown up front and mask `decided` after.
-    let geo_uncompiled = geo.is_some() && geo_spec.is_none();
+    // every pushdown up front and mask `decided` after. The specs that did
+    // compile still narrow the rows.
+    let geo_uncompiled = geo_specs.len() < geos.len();
     let page = if geo_uncompiled { None } else { page };
+    let enough = enough.filter(|_| !geo_uncompiled);
     let proj = proj.filter(|_| !geo_uncompiled);
     // pick (or attrs) heads to keep / whole-attr omit heads to drop; core
     // members are never SQL-dropped (only `://` IRIs qualify) — repr::apply
@@ -1171,111 +1402,169 @@ pub async fn filter_entities_paged(
     // post-merge loop below applies them instead (`decided` is already
     // false whenever `fed` is non-empty).
     let split_agg = crate::federation::split_entities(params) && !fed.is_empty();
-    let outcome = st
-        .store
-        .query_entities(
-            tenant,
-            &antares_store::filter::EntityFilter {
-                ids: ids.as_deref(),
-                // 5.2.33: id takes precedence over idPattern, so the literal
-                // narrows only when no id selector was given
-                id_literal: if ids.is_none() {
-                    params
-                        .get("idPattern")
-                        .and_then(|p| antares_store::filter::id_pattern_literal(p))
-                } else {
-                    None
-                },
-                types: type_sel.as_deref(),
-                attrs: if split_agg {
-                    None
-                } else {
-                    attr_filter.as_deref()
-                },
-                q: if split_agg { None } else { q_ast.as_ref() },
-                scope_q: if split_agg {
-                    None
-                } else {
-                    scope_q.map(String::as_str)
-                },
-                geo: if split_agg { None } else { geo_spec.as_ref() },
-                expand: &expand,
-                page: page.map(|(offset, limit)| antares_store::filter::Page {
-                    offset: offset as i64,
-                    limit: limit as i64,
-                    count: params.get("count").map(String::as_str) == Some("true"),
-                }),
-                keep_attrs: keep_attrs.as_deref(),
-                drop_attrs: drop_attrs.as_deref(),
-            },
-        )
-        .await?;
-    let decided = outcome.decided && fed.is_empty() && !geo_uncompiled;
-    let paged = outcome.paged && fed.is_empty();
-    let total = outcome.total.map(|t| t as usize);
-    let rows = outcome.rows.len();
-    let all = crate::federation::merge_candidates(outcome.rows, fed);
     // the id list is client-sized (a POST query body carries an array with no
     // count of its own) and the candidate set is store-sized, so the two are
     // never multiplied together
     let id_set: Option<std::collections::HashSet<&str>> =
         ids.as_ref().map(|v| v.iter().copied().collect());
     let mut out = Vec::new();
-    for doc in all {
-        let id = doc["id"].as_str().unwrap_or("");
-        if let Some(ids) = &id_set {
-            if !decided && !ids.contains(id) {
-                continue;
+    let (mut paged, mut total): (bool, Option<usize>);
+    let mut rows = 0usize;
+    let mut fed_once = Some(fed);
+    // the store page under `enough`: (offset, limit), the limit doubling
+    let mut read = (0usize, enough.unwrap_or(0));
+    'scan: loop {
+        let outcome = st
+            .store
+            .query_entities(
+                tenant,
+                &antares_store::filter::EntityFilter {
+                    ids: ids.as_deref(),
+                    // 5.2.33: id takes precedence over idPattern, so the literal
+                    // narrows only when no id selector was given
+                    id_literal: if ids.is_none() {
+                        params
+                            .get("idPattern")
+                            .and_then(|p| antares_store::filter::id_pattern_literal(p))
+                    } else {
+                        None
+                    },
+                    types: judged.as_deref().or(type_sel.as_deref()),
+                    attrs: if split_agg {
+                        None
+                    } else {
+                        attr_filter.as_deref()
+                    },
+                    q: if split_agg { None } else { q_ast.as_ref() },
+                    scope_q: if split_agg {
+                        None
+                    } else {
+                        scope_q.map(String::as_str)
+                    },
+                    geo: if split_agg { &[] } else { &geo_specs },
+                    expand: &expand,
+                    ctx: Some(ctx),
+                    page: match enough {
+                        Some(_) => Some(antares_store::filter::Page {
+                            offset: read.0 as i64,
+                            limit: read.1 as i64,
+                            count: false,
+                        }),
+                        None => page.map(|(offset, limit)| antares_store::filter::Page {
+                            offset: offset as i64,
+                            limit: limit as i64,
+                            count: params.get("count").map(String::as_str) == Some("true"),
+                        }),
+                    },
+                    keep_attrs: keep_attrs.as_deref(),
+                    drop_attrs: drop_attrs.as_deref(),
+                },
+            )
+            .await?;
+        let fed = fed_once.take().unwrap_or_default();
+        let store_paged = outcome.paged;
+        let decided = outcome.decided && fed.is_empty() && !geo_uncompiled;
+        paged = store_paged && fed.is_empty() && enough.is_none();
+        total = outcome.total.map(|t| t as usize);
+        let got = outcome.rows.len();
+        rows = rows.saturating_add(got);
+        let all = crate::federation::merge_candidates(outcome.rows, fed);
+        for doc in all {
+            let id = doc.get("id").and_then(Value::as_str).unwrap_or("");
+            if let Some(ids) = &id_set {
+                if !decided && !ids.contains(id) {
+                    continue;
+                }
+            }
+            // 5.2.33: "id takes precedence over idPattern" — the pattern only
+            // filters when no id selector was given.
+            if ids.is_none() {
+                if let Some(re) = &id_pattern {
+                    // idPattern is invisible to the store — applied even when
+                    // decided
+                    if !re.is_match(id) {
+                        continue;
+                    }
+                }
+            }
+            if !decided {
+                if let Some(sel) = &type_sel {
+                    let etypes: Vec<&str> = doc
+                        .get("type")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    let matched = sel
+                        .iter()
+                        .any(|and_group| and_group.iter().all(|w| etypes.contains(&w.as_str())));
+                    if !matched {
+                        continue;
+                    }
+                }
+                if let Some(attrs) = &attr_filter {
+                    if !attrs.iter().any(|a| doc.get(a).is_some()) {
+                        continue;
+                    }
+                }
+                if let Some(ast) = &q_ast {
+                    // 4.9 linked-entity subqueries (attr{path}) resolve through
+                    // the local store, same tenant, under the caller's narrowing
+                    let narrow = narrow.map(|r| (r, ctx));
+                    if !crate::notify::linked_eval(st, tenant, narrow, |l| {
+                        eval_q(ast, &doc, ctx, l)
+                    })
+                    .await
+                    {
+                        continue;
+                    }
+                }
+                if let Some(sq) = scope_q {
+                    if !crate::scope_matches(sq, &doc) {
+                        continue;
+                    }
+                }
+                if !geos.iter().all(|g| g.matches(&doc, ctx)) {
+                    continue;
+                }
+            }
+            if let (Some(rules), Some(r)) = (rules, narrow) {
+                if !rules.admits(&doc, crate::repr::policy_context()) {
+                    continue;
+                }
+                // the Entity as shown is built only for a client predicate
+                // that reads it
+                if reads_shown {
+                    let view = crate::repr::policy_view(&doc, r);
+                    if let Some(attrs) = &shown_attrs {
+                        if !attrs.iter().any(|a| view.get(a).is_some()) {
+                            continue;
+                        }
+                    }
+                    if !shown_geos.iter().all(|g| g.matches(&view, ctx)) {
+                        continue;
+                    }
+                    if let Some(ast) = shown_q {
+                        let narrow = narrow.map(|r| (r, ctx));
+                        if !crate::notify::linked_eval(st, tenant, narrow, |l| {
+                            eval_q(ast, &view, ctx, l)
+                        })
+                        .await
+                        {
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push(doc);
+            if enough.is_some_and(|n| out.len() >= n) {
+                break 'scan;
             }
         }
-        // 5.2.33: "id takes precedence over idPattern" — the pattern only
-        // filters when no id selector was given.
-        if ids.is_none() {
-            if let Some(re) = &id_pattern {
-                // idPattern is invisible to the store — applied even when
-                // decided
-                if !re.is_match(id) {
-                    continue;
-                }
-            }
+        // a store that could not page answered with every row it holds
+        if enough.is_none() || !store_paged || got < read.1 {
+            break;
         }
-        if !decided {
-            if let Some(sel) = &type_sel {
-                let etypes: Vec<&str> = doc["type"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(Value::as_str).collect())
-                    .unwrap_or_default();
-                let matched = sel
-                    .iter()
-                    .any(|and_group| and_group.iter().all(|w| etypes.contains(&w.as_str())));
-                if !matched {
-                    continue;
-                }
-            }
-            if let Some(attrs) = &attr_filter {
-                if !attrs.iter().any(|a| doc.get(a).is_some()) {
-                    continue;
-                }
-            }
-            if let Some(ast) = &q_ast {
-                // 4.9 linked-entity subqueries (attr{path}) resolve through
-                // the local store, same tenant.
-                if !crate::notify::linked_eval(st, tenant, |l| eval_q(ast, &doc, ctx, l)).await {
-                    continue;
-                }
-            }
-            if let Some(sq) = scope_q {
-                if !crate::scope_matches(sq, &doc) {
-                    continue;
-                }
-            }
-            if let Some(g) = &geo {
-                if !g.matches(&doc, ctx) {
-                    continue;
-                }
-            }
-        }
-        out.push(doc);
+        read = (read.0.saturating_add(got), read.1.saturating_mul(2));
     }
     Ok(Filtered {
         docs: out,
@@ -1302,7 +1591,15 @@ pub async fn delete_entity(
         // the client meant, and the delete then removes an Entity the
         // client's selector excluded.
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.6.6", ids: &[&id]).await?;
+        let pre = crate::policy::pre_image(&st, &tenant, &id, None).await;
+        let granted = gate!(
+            st, &tenant, &headers, "5.6.6",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+        )
+        .await?;
+        let cond = crate::policy::Condition::of(&granted);
         // 4.17/5.6.6.4: the type selector gates the target — a registration
         // for a different type must not receive the forwarded delete.
         let spec = crate::registry::CsrSpec {
@@ -1318,12 +1615,28 @@ pub async fn delete_entity(
             crate::federation::WritePlan::Answered(r) => return Ok(*r),
             crate::federation::WritePlan::Forward(regs) => regs,
         };
+        crate::policy::Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
         // 5.6.6.4: the ?type selector narrows the target — an entity of a
         // non-matching type is "not known" for this delete. The selector is
         // tested inside the delete, under the row lock: read first and delete
         // after, and the document that answered the test is not necessarily
         // the one the delete removes.
-        let keep = |d: &Value| crate::negotiate::matches_type_param(d, &params, &ctx);
+        #[cfg(feature = "views")]
+        let guard =
+            crate::views::WriteGuard::of(&st, std::iter::empty()).map(|g| g.matching(&headers));
+        let keep = |d: &Value| {
+            // gap G12: an Entity the engine's condition does not select is
+            // not found
+            if cond.as_ref().is_some_and(|c| !c.holds(d)) {
+                return false;
+            }
+            // ADR-0023 rule 7: an Entity out of the view is not found
+            #[cfg(feature = "views")]
+            if guard.as_ref().is_some_and(|g| !g.keeps(d)) {
+                return false;
+            }
+            crate::negotiate::matches_type_param(d, &params, &ctx)
+        };
         if !regs.is_empty() {
             let proxy_match = regs.iter().any(|r| r.is_proxy());
             let mut parts = Vec::new();
@@ -1378,6 +1691,10 @@ pub async fn delete_entity(
             mirror_delete_entity(&st, &tenant, &id).await;
             Ok::<_, ApiError>(no_content(&tenant))
         } else {
+            #[cfg(feature = "views")]
+            if let Some(g) = &guard {
+                g.settled()?;
+            }
             Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into())
         }
     };
@@ -1448,7 +1765,7 @@ pub(crate) fn next_scan_offset(
     if !paged || rows < chunk {
         return None;
     }
-    Some(offset + rows.saturating_sub(left_the_set))
+    Some(offset.saturating_add(rows.saturating_sub(left_the_set)))
 }
 
 /// 5.6.21.4 "And thereafter": with no Attribute-name list, delete every
@@ -1471,7 +1788,11 @@ async fn purge_locally(
             params,
             ctx,
             Vec::new(),
-            Some((offset, PURGE_CHUNK)),
+            Pushdown {
+                page: Some((offset, PURGE_CHUNK)),
+                proj: None,
+            },
+            // 5.6.21.4 refuses linked q terms before a purge runs
             None,
         )
         .await?;
@@ -1502,7 +1823,7 @@ async fn purge_locally(
                         }
                     }
                     if target.len() != before {
-                        changed += 1;
+                        changed = changed.saturating_add(1);
                     }
                     Ok::<(), NgsiError>(())
                 })
@@ -1522,7 +1843,7 @@ async fn purge_locally(
             let mut gone = 0usize;
             for (id, deleted) in ids.iter().zip(st.store.batch_delete(tenant, &ids).await?) {
                 if deleted {
-                    gone += 1;
+                    gone = gone.saturating_add(1);
                     mirror_delete_entity(st, tenant, id).await;
                 }
             }
@@ -1757,7 +2078,29 @@ async fn merge_entity_inner(
             ..Default::default()
         },
     )?;
-    gate!(st, &tenant, headers, "5.6.17", ids: &[id], body: Some(&fragment)).await?;
+    let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await;
+    let granted = gate!(
+        st, &tenant, headers, "5.6.17",
+        ids: &[id],
+        types: &pre.types,
+        stored: pre.stored.as_ref(),
+        attrs: &crate::attrs::attr_iris_of(&fragment),
+        body: Some(&fragment),
+    )
+    .await?;
+    let cond = crate::policy::Condition::of(&granted);
+    #[cfg(feature = "views")]
+    let guard = crate::views::WriteGuard::of(
+        st,
+        crate::attrs::attr_iris_of(&fragment)
+            .iter()
+            .map(String::as_str),
+    )
+    .map(|g| g.matching(headers));
+    #[cfg(feature = "views")]
+    if let Some(g) = &guard {
+        g.targets(st, &tenant, &fragment).await?;
+    }
     // 5.6.17.3: a common observedAt timestamp to use across merged
     // Attributes, and a common language tag for merged LanguageMaps.
     let observed_at = params.get("observedAt").map(String::as_str);
@@ -1782,6 +2125,7 @@ async fn merge_entity_inner(
         crate::federation::WritePlan::Answered(r) => return Ok(*r),
         crate::federation::WritePlan::Forward(regs) => regs,
     };
+    crate::policy::Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
     if !regs.is_empty() {
         let proxies: Vec<&crate::federation::FedReg> =
             regs.iter().filter(|r| r.is_proxy()).collect();
@@ -1873,6 +2217,11 @@ async fn merge_entity_inner(
     let res = st
         .store
         .mutate(&tenant, Kind::Entity, id, |doc| {
+            crate::policy::Condition::pre(cond.as_ref(), id, doc)?;
+            #[cfg(feature = "views")]
+            if let Some(g) = &guard {
+                g.pre(id, doc)?;
+            }
             // 5.6.17.4: the ?type selector narrows the merge target
             if !crate::negotiate::matches_type_param(doc, params, &parsed.ctx) {
                 return Err(NgsiError::ResourceNotFound(format!(
@@ -1882,9 +2231,17 @@ async fn merge_entity_inner(
             let mut frag = fragment.clone();
             apply_common_lang(doc, &mut frag, lang);
             merge_into(doc, &frag, &ts);
+            #[cfg(feature = "views")]
+            if let Some(g) = &guard {
+                g.post(doc)?;
+            }
             Ok::<(), NgsiError>(())
         })
         .await?;
+    #[cfg(feature = "views")]
+    if let Some(g) = &guard {
+        g.settled()?;
+    }
     match res {
         None => Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into()),
         Some(Err(e)) => Err(e.into()),
@@ -2028,7 +2385,9 @@ pub fn merge_into(doc: &mut Value, fragment: &Value, ts: &str) {
                         }
                         (true, None) => {}
                         (false, Some(p)) => {
-                            merge_instance(&mut cur[p], &fi, ts);
+                            if let Some(ci) = cur.get_mut(p) {
+                                merge_instance(ci, &fi, ts);
+                            }
                         }
                         (false, None) => {
                             let mut ni = fi.clone();
@@ -2110,14 +2469,47 @@ pub async fn replace_entity(
         // (5.6.18: an unknown target is 404 before body validation), so the
         // header context is resolved on its own here.
         let ctx0 = request_context(&st.loader, &headers).await?;
-        gate!(st, &tenant, &headers, "5.6.18", ids: &[&id]).await?;
+        // The engine is shown the replacement. The body is read for it
+        // leniently: a body that does not parse is not the engine's to
+        // judge, and the replace below refuses it as before, after the
+        // 404 an unknown target answers first (057_03).
+        let shown = match &st.policy {
+            Some(_) => parse_body(&st.loader, &headers, &body, BodyKind::Standard)
+                .await
+                .ok()
+                .and_then(|p| {
+                    let obj = p.object(NgsiError::BadRequestData(String::new())).ok()?;
+                    expand_entity(obj, &p.ctx, ExpandOpts::default()).ok()
+                }),
+            None => None,
+        };
+        let pre = crate::policy::pre_image(&st, &tenant, &id, shown.as_ref()).await;
+        let granted = gate!(
+            st, &tenant, &headers, "5.6.18",
+            ids: &[&id],
+            types: &pre.types,
+            stored: pre.stored.as_ref(),
+            attrs: &shown.as_ref().map(crate::attrs::attr_iris_of).unwrap_or_default(),
+            body: shown.as_ref(),
+        )
+        .await?;
+        let cond = crate::policy::Condition::of(&granted);
         // 5.6.18.4: the ?type selector narrows the target — a non-matching
         // entity is "not known" for this replace.
         let local_doc = st
             .store
             .get(&tenant, Kind::Entity, &id)
             .await?
-            .filter(|d| crate::negotiate::matches_type_param(d, &params, &ctx0));
+            .filter(|d| crate::negotiate::matches_type_param(d, &params, &ctx0))
+            // gap G12: an Entity the engine's condition does not select is
+            // not found, before the body is read, as an absent target is
+            .filter(|d| cond.as_ref().is_none_or(|c| c.holds(d)));
+        // ADR-0023 rule 3: out of the view is not found, before the body is
+        // read, as an absent target is (057_03)
+        #[cfg(feature = "views")]
+        let local_doc = local_doc.filter(|d| {
+            crate::views::WriteGuard::of(&st, std::iter::empty()).is_none_or(|g| g.sees(d))
+        });
         let spec = crate::registry::CsrSpec {
             ids: Some(vec![id.clone()]),
             ..Default::default()
@@ -2129,12 +2521,18 @@ pub async fn replace_entity(
                 crate::federation::WritePlan::Answered(r) => return Ok(*r),
                 crate::federation::WritePlan::Forward(regs) => regs,
             };
+        crate::policy::Condition::unforwarded(cond.as_ref(), !regs.is_empty())?;
         if regs.is_empty() {
             // 5.6.18: an unknown target is 404 before body validation (057_03).
             // The read above answers that; the write below decides again
             // under the row lock, because between the two the target can be
             // deleted and a replace that writes anyway puts it back.
             if local_doc.is_none() {
+                // T-3789: under `If-Match`, out of the view and absent are both 412
+                #[cfg(feature = "views")]
+                if let Some(g) = crate::views::WriteGuard::of(&st, std::iter::empty()) {
+                    g.matching(&headers).settled()?;
+                }
                 return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
             }
             let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
@@ -2142,14 +2540,31 @@ pub async fn replace_entity(
                 "entity must be a JSON object".into(),
             ))?;
             let mut expanded = expand_entity(obj, &parsed.ctx, ExpandOpts::default())?;
-            if expanded["id"].as_str() != Some(id.as_str()) {
+            if expanded.get("id").and_then(Value::as_str) != Some(id.as_str()) {
                 return Err(NgsiError::BadRequestData("entity id mismatch".into()).into());
             }
             let ts = now_iso();
             stamp_new(&mut expanded, &ts);
+            #[cfg(feature = "views")]
+            let guard = crate::views::WriteGuard::of(
+                &st,
+                crate::attrs::attr_iris_of(&expanded)
+                    .iter()
+                    .map(String::as_str),
+            )
+            .map(|g| g.matching(&headers));
+            #[cfg(feature = "views")]
+            if let Some(g) = &guard {
+                g.targets(&st, &tenant, &expanded).await?;
+            }
             let res = st
                 .store
                 .mutate(&tenant, Kind::Entity, &id, |doc| {
+                    crate::policy::Condition::pre(cond.as_ref(), &id, doc)?;
+                    #[cfg(feature = "views")]
+                    if let Some(g) = &guard {
+                        g.pre_whole(&id, doc)?;
+                    }
                     // 5.6.18.4: the ?type selector narrows the target here too —
                     // the type of the row being written is the one that counts
                     if !crate::negotiate::matches_type_param(doc, &params, &ctx0) {
@@ -2167,9 +2582,17 @@ pub async fn replace_entity(
                         o.insert("createdAt".into(), created);
                     }
                     *doc = expanded.clone();
+                    #[cfg(feature = "views")]
+                    if let Some(g) = &guard {
+                        g.post(doc)?;
+                    }
                     Ok::<(), NgsiError>(())
                 })
                 .await?;
+            #[cfg(feature = "views")]
+            if let Some(g) = &guard {
+                g.settled()?;
+            }
             return match res {
                 None => Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into()),
                 Some(Err(e)) => Err(e.into()),
@@ -2181,7 +2604,7 @@ pub async fn replace_entity(
             "entity must be a JSON object".into(),
         ))?;
         let expanded = expand_entity(obj, &parsed.ctx, ExpandOpts::default())?;
-        if expanded["id"].as_str() != Some(id.as_str()) {
+        if expanded.get("id").and_then(Value::as_str) != Some(id.as_str()) {
             return Err(NgsiError::BadRequestData("entity id mismatch".into()).into());
         }
         let mut parts = Vec::new();
@@ -2311,7 +2734,12 @@ async fn retrieve_attr_inner(
     let tenant = tenant_from(headers)?;
     check_params(params, &["options", "format", "lang", "datasetId", "local"])?;
     let ctx = request_context(&st.loader, headers).await?;
-    let filter = gate!(st, &tenant, headers, "5.7.1", ids: &[id]).await?;
+    let filter = gate!(
+        st, &tenant, headers, "5.7.1",
+        ids: &[id],
+        attrs: &antares_jsonld::expand_attr_name(attr, &ctx).ok().into_iter().collect::<Vec<_>>(),
+    )
+    .await?;
     let mut repr = parse_repr(params, &ctx)?;
     crate::repr::narrow_repr(&mut repr, &filter);
     antares_model::EntityId::new(id)?;
@@ -2321,10 +2749,17 @@ async fn retrieve_attr_inner(
         .get(&tenant, Kind::Entity, id)
         .await?
         .ok_or_else(|| NgsiError::ResourceNotFound(format!("entity {id} not found")))?;
+    // ADR-0020, ADR-0023 rule 3: the Attribute of an Entity outside the
+    // narrowing is the Attribute of an absent one, as Retrieve Entity
+    // answers it, whatever the Attribute's own visibility.
+    if !crate::repr::policy_admits(st, &tenant, &ctx, repr.policy_reach.as_deref(), &doc).await {
+        return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
+    }
     let attr_iri = antares_jsonld::expand_attr_name(attr, &ctx)?;
-    let node = doc.get(&attr_iri).ok_or_else(|| {
-        NgsiError::ResourceNotFound(format!("entity {id} has no attribute {attr}"))
-    })?;
+    // One answer for an Attribute the Entity lacks and one the narrowing
+    // hides (ADR-0023 rule 2).
+    let lacks = || NgsiError::ResourceNotFound(format!("entity {id} has no attribute {attr}"));
+    let node = doc.get(&attr_iri).ok_or_else(lacks)?;
     // Compact through the entity pipeline so the attribute serializes exactly
     // as it would inside a full retrieve.
     let mini = serde_json::json!({
@@ -2335,10 +2770,7 @@ async fn retrieve_attr_inner(
     let shaped = crate::repr::apply(&mini, &repr);
     let compacted = compact_for(&repr, &shaped, &ctx);
     let key = ctx.compact_iri(&attr_iri);
-    let member = compacted
-        .get(&key)
-        .cloned()
-        .ok_or_else(|| NgsiError::ResourceNotFound(format!("attribute {attr} not present")))?;
+    let member = compacted.get(&key).cloned().ok_or_else(lacks)?;
     let body = if value_only {
         // #15: the bare value — value / object / languageMap, whichever the
         // attribute type carries; multi-instance attributes yield an array.
@@ -2364,7 +2796,7 @@ async fn retrieve_attr_inner(
     };
     let accept = parse_accept(headers)?;
     let mut resp = respond(StatusCode::OK, body, &ctx, accept, &tenant);
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 
@@ -2399,7 +2831,8 @@ pub(crate) async fn build_query_map(
         .into());
     }
     // the candidate set is the NARROWED query's (ADR-0020)
-    let narrowed = filter.narrow_params(params)?;
+    let narrowed = filter.narrow_params(params, ctx)?;
+    let narrow = crate::repr::narrowing_reading(filter, params, ctx)?;
     let params = &narrowed;
     // 5.14.4.4: invalid entity ids / csf are BadRequestData
     if let Some(ids) = params.get("id") {
@@ -2437,8 +2870,11 @@ pub(crate) async fn build_query_map(
             &eff,
             ctx,
             Vec::new(),
-            Some((offset, st.max_limit)),
-            None,
+            Pushdown {
+                page: Some((offset, st.max_limit)),
+                proj: None,
+            },
+            Some(&narrow),
         )
         .await?;
         for d in &batch.docs {
@@ -3708,5 +4144,61 @@ mod clause_4_8_system_attributes {
                 "{method} {path} let the client stamp the document: {served}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod judged_types_tests {
+    use super::judged_types;
+    use crate::policy::{Filter, Rule};
+    use std::borrow::Cow;
+
+    fn rules(types: &[&[&str]]) -> Filter {
+        Filter {
+            rules: types
+                .iter()
+                .map(|t| Rule {
+                    types: t.iter().map(|s| (*s).to_owned()).collect(),
+                    ..Rule::default()
+                })
+                .collect(),
+            ..Filter::default()
+        }
+    }
+
+    fn sel(groups: &[&[&str]]) -> Vec<Vec<String>> {
+        groups
+            .iter()
+            .map(|g| g.iter().map(|s| (*s).to_owned()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_selection_naming_a_rule_type_in_every_group_is_kept_as_is() {
+        let client = sel(&[&["a", "T"], &["U"]]);
+        let got = judged_types(Some(&client), &rules(&[&["T"], &["U"]]));
+        assert!(matches!(got, Some(Cow::Borrowed(g)) if g == client.as_slice()));
+    }
+
+    #[test]
+    fn a_group_naming_no_rule_type_takes_each_in_turn() {
+        let client = sel(&[&["a", "b"], &["T"]]);
+        let got = judged_types(Some(&client), &rules(&[&["U", "T"], &["T"]]));
+        assert_eq!(
+            got.as_deref(),
+            Some(sel(&[&["a", "b", "T"], &["a", "b", "U"], &["T"]]).as_slice())
+        );
+    }
+
+    #[test]
+    fn no_client_selection_selects_the_rule_types() {
+        let got = judged_types(None, &rules(&[&["T"], &["U"]]));
+        assert_eq!(got.as_deref(), Some(sel(&[&["T"], &["U"]]).as_slice()));
+    }
+
+    #[test]
+    fn rules_without_types_judge_nothing() {
+        assert!(judged_types(None, &rules(&[&[]])).is_none());
+        assert!(judged_types(Some(&sel(&[&["a"]])), &Filter::default()).is_none());
     }
 }

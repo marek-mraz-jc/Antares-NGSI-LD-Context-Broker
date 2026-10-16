@@ -107,7 +107,9 @@ fn evict_lru_half<V>(map: &mut HashMap<Box<str>, Entry<V>>) {
     stamps.sort_unstable();
     // `keep` newest survive; a tie on the boundary stamp keeps both, which
     // costs at most a few entries over the half and never a bound.
-    let cut = stamps[stamps.len() - keep];
+    let Some(&cut) = stamps.len().checked_sub(keep).and_then(|i| stamps.get(i)) else {
+        return;
+    };
     map.retain(|_, e| e.1.load(Ordering::Relaxed) >= cut);
 }
 
@@ -116,7 +118,11 @@ fn evict_lru_half<V>(map: &mut HashMap<Box<str>, Entry<V>>) {
 type Cache<V> = LazyLock<RwLock<HashMap<Box<str>, Entry<V>>>>;
 
 static CACHE: Cache<(Outcome, usize)> = LazyLock::new(|| RwLock::new(HashMap::new()));
-static COMPILES: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// Compilations on this thread. Per thread, so a test counts its own cache misses and never
+    /// those of a test running beside it (T-3534); a compile runs on the caller's thread.
+    static COMPILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 static BYTES: AtomicUsize = AtomicUsize::new(0);
 
 fn build(pattern: &str, limit: usize) -> Result<regex::Regex, regex::Error> {
@@ -136,7 +142,7 @@ pub fn compile(pattern: &str) -> Result<Arc<regex::Regex>, String> {
     {
         return hit.map_err(String::from);
     }
-    COMPILES.fetch_add(1, Ordering::Relaxed);
+    COMPILES.with(|n| n.set(n.get().saturating_add(1)));
     // Compiled OUTSIDE the lock — a pattern compile must never serialize the
     // matcher — and a poisoned lock degrades to "compile every time", never
     // to a failed request.
@@ -175,9 +181,9 @@ pub fn cached(pattern: &str) -> Option<Arc<regex::Regex>> {
     })
 }
 
-/// Compilations performed since process start (i.e. cache misses).
+/// Compilations performed on the calling thread (i.e. its cache misses).
 pub fn compiles() -> u64 {
-    COMPILES.load(Ordering::Relaxed)
+    COMPILES.with(std::cell::Cell::get)
 }
 
 /// Patterns currently retained — never above `MAX_REGEX_CACHE`.
@@ -430,6 +436,60 @@ mod tests {
                 "what the ceiling admits, the cache retains: {p:?}"
             );
         }
+    }
+
+    /// Below the bounds nothing is evicted: a parsed q, a built geoQ and
+    /// 300 small programs all stay retained, and the counters report them
+    /// (T-3531 mutants on the eviction conditions and the byte charge).
+    #[test]
+    fn below_the_bounds_every_entry_is_kept() {
+        let _serial = serial_lock();
+        let a = q_node("keep_a>1").expect("valid q");
+        q_node("keep_b>1").expect("valid q");
+        assert!(Arc::ptr_eq(&a, &q_node("keep_a>1").expect("valid q")));
+
+        let builds = std::cell::Cell::new(0);
+        let build = || {
+            builds.set(builds.get() + 1);
+            crate::geo::GeoQuery::from_params(&HashMap::from([
+                ("georel".to_owned(), "near;maxDistance==10".to_owned()),
+                ("geometry".to_owned(), "Point".to_owned()),
+                ("coordinates".to_owned(), "[1,2]".to_owned()),
+            ]))
+            .ok()
+            .flatten()
+        };
+        geo_query("keep-geo-a", build).expect("geo");
+        geo_query("keep-geo-b", build).expect("geo");
+        geo_query("keep-geo-a", build).expect("geo");
+        assert_eq!(builds.get(), 2, "the first geoQ was evicted");
+
+        let patterns: Vec<String> = (0..300).map(|i| format!("^keep-{i}$")).collect();
+        for p in &patterns {
+            compile(p).expect("compiles");
+        }
+        let missing = patterns.iter().filter(|p| cached(p).is_none()).count();
+        assert_eq!(missing, 0, "{missing} of 300 small programs were evicted");
+        assert!(len() >= 300);
+        // the documented tier, written out: a small program costs 32 KiB
+        assert!(retained_bytes() >= 300 * 32 * 1024);
+    }
+
+    /// The byte budget evicts on its own, before the entry count does:
+    /// programs past the 32 KiB tier are charged 256 KiB each, so ~260 of
+    /// them overrun MAX_REGEX_CACHE_BYTES long before MAX_REGEX_CACHE.
+    #[test]
+    fn the_byte_budget_evicts_before_the_entry_count() {
+        let _serial = serial_lock();
+        for i in 0..300 {
+            compile(&format!("^[a-z]{{{}}}$", 3000 + i)).expect("compiles");
+            assert!(
+                retained_bytes() <= MAX_REGEX_CACHE_BYTES,
+                "after {i}: {} bytes retained",
+                retained_bytes()
+            );
+        }
+        assert!(len() < MAX_REGEX_CACHE);
     }
 
     /// The same q text parses once and every caller shares the tree; an

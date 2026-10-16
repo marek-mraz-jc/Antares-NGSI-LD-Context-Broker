@@ -12,32 +12,60 @@ members = [
     "crates/antares-notifier",
     "crates/antares-broker",
     "crates/antares-wasm",
+    "crates/antares-ops",
+    "crates/linkml-model",
+    "crates/odata-csdl",
+    "crates/odata-url",
+    "crates/odata-json",
+    "crates/odata-batch",
+    "crates/odata-axum",
+    "crates/ogc-cql2",
+    "crates/antares-residual",
+    "crates/antares-views",
+    "crates/antares-mcp",
+    "crates/antares-linkml",
+    "crates/antares-odata",
+    "crates/antares-ogc",
+    "crates/antares-ws",
+    "crates/antares-icsr",
     # The reference plugin: built and tested with the workspace so the
     # driver, routing and notification seams cannot drift from it.
     "examples/plugin-example",
+    # The joinedcontext platform's policy engine (ADR-0020 addon).
+    "addons/joinedcontext-policy",
 ]
 # Fuzz harness: own lockfile/profile, built only by cargo-fuzz on
 # nightly (.github/workflows/fuzz.yml) — never part of the normal build.
-exclude = ["fuzz"]
+exclude = ["fuzz", "vendor/rumqttc"]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 license = "EUPL-1.2"
 repository = "https://github.com/joinedcontext/Antares-NGSI-LD-Context-Broker"
 rust-version = "1.97"
 
 [workspace.dependencies]
-antares-model = { path = "crates/antares-model" }
+antares-model = { package = "ngsild-model", path = "crates/antares-model", version = "0.2" }
 antares-store = { path = "crates/antares-store" }
-antares-jsonld = { path = "crates/antares-jsonld" }
-antares-ql = { path = "crates/antares-ql" }
+antares-jsonld = { package = "ngsild-jsonld", path = "crates/antares-jsonld", version = "0.2" }
+antares-ql = { package = "ngsild-ql", path = "crates/antares-ql", version = "0.2" }
+antares-residual = { package = "ngsild-residual", path = "crates/antares-residual", version = "0.2" }
 antares-sql = { path = "crates/antares-sql", default-features = false }
 antares-bus = { path = "crates/antares-bus" }
 antares-api = { path = "crates/antares-api", default-features = false }
-antares-matcher = { path = "crates/antares-matcher" }
+antares-matcher = { package = "ngsild-matcher", path = "crates/antares-matcher", version = "0.2" }
 antares-notifier = { path = "crates/antares-notifier", default-features = false }
 antares-plugin-example = { path = "examples/plugin-example" }
+joinedcontext-policy = { path = "addons/joinedcontext-policy" }
+antares-ops = { path = "crates/antares-ops" }
+antares-views = { path = "crates/antares-views" }
+antares-mcp = { path = "crates/antares-mcp" }
+antares-linkml = { path = "crates/antares-linkml" }
+antares-odata = { path = "crates/antares-odata" }
+antares-ogc = { path = "crates/antares-ogc" }
+antares-ws = { path = "crates/antares-ws" }
+antares-icsr = { path = "crates/antares-icsr" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 # The storage driver seams are object-safe AND asynchronous, which no
@@ -58,13 +86,18 @@ icu_collator = "2"
 icu_locale_core = "2"
 uuid = { version = "1", features = ["v4", "v5"] }
 regex = "1"
+# Property tests (T-3462): the q/scopeQ/geoQ pushdown against the evaluator.
+proptest = { version = "1", default-features = false, features = ["std"] }
 axum = "0.8"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "http1", "http2", "tokio"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["normalize-path", "cors"] }
+tower-http = { version = "0.7", features = ["cors", "catch-panic"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SHA-256 of the access surface's ODRL rules (joinedcontext-policy); the
+# version sqlx and ed25519-dalek already build.
+sha2 = { version = "0.10", default-features = false }
 redb = "4.1"
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
 # The crypto provider for mqtts. rumqttc is built provider-less
@@ -143,6 +176,84 @@ debug = "line-tables-only"
 # .dep-v0 section survives), thin LTO for smaller + slightly faster code.
 strip = "symbols"
 lto = "thin"
+# Integer overflow panics instead of wrapping: within 3 % of unchecked on
+# the stable perf-baseline shapes (docs/src/perf-baseline.md, T-3552).
+overflow-checks = true
+
+# ADR-0027 section 6 (T-3712): `full` measured +6.81 MiB over vanilla.
+# Request-path surface crates (and rmcp) build as one codegen unit, which
+# drops the copies of generics each unit inlined; cold ones (admin reload,
+# $metadata, $batch, schemas) build for size: +5.58 MiB, OData/MCP benches
+# within host noise. opt-level "s" everywhere reached +4.92 MiB but cost
+# 16-26 % on the OData and MCP benches. Vanilla links none of these crates.
+# surfaces-threat-model 10.1: the new crates keep overflow checks in release.
+[profile.release.package.antares-ops]
+overflow-checks = true
+opt-level = "s"
+
+[profile.release.package.linkml-model]
+overflow-checks = true
+opt-level = "s"
+
+[profile.release.package.odata-csdl]
+overflow-checks = true
+opt-level = "s"
+
+[profile.release.package.odata-url]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.ogc-cql2]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.ngsild-residual]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.odata-json]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.odata-batch]
+overflow-checks = true
+opt-level = "s"
+
+[profile.release.package.odata-axum]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-views]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-mcp]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-linkml]
+overflow-checks = true
+
+[profile.release.package.antares-odata]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-ogc]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-ws]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.rmcp]
+codegen-units = 1
+
+[profile.release.package.schemars]
+opt-level = "s"
+
+[profile.release.package.antares-icsr]
+overflow-checks = true
 
 [profile.wasm-release]
 inherits = "release"
@@ -164,3 +275,7 @@ unwrap_used = "warn"
 # clippy 1.98.0 runs this lint into >14 GB on the antares-api test target
 # (the CI runner dies with a bare SIGTERM); every other style lint stays on.
 needless_borrows_for_generic_args = "allow"
+
+# rumqttc 0.25.1 with rustls-webpki 0.103 until a release has it (vendor/rumqttc/README.md, T-4129).
+[patch.crates-io]
+rumqttc = { path = "vendor/rumqttc" }

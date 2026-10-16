@@ -9,8 +9,10 @@ info:
 
     `/q/` is the operator surface: liveness, readiness, Prometheus text,
     the tenant inventory and purge, and the dead-letter admin. It carries
-    no NGSI-LD semantics, adds no authentication of its own and belongs
-    behind the gateway. A worker pod (`ANTARES_ROLES` without `api`)
+    no NGSI-LD semantics and belongs behind the gateway. With
+    `ANTARES_ADMIN_TOKEN_FILE` set, every `/q/` route except health and
+    readiness also asks for that bearer secret (`/q/metrics` unless
+    `ANTARES_ADMIN_METRICS=open`); unset, the broker asks for none. A worker pod (`ANTARES_ROLES` without `api`)
     serves these routes and nothing else.
 
     `/ex/v1/` is the peer-facing wire between brokers (5.8.1.4), versioned
@@ -25,8 +27,9 @@ info:
     name: EUPL-1.2
     url: https://joinup.ec.europa.eu/collection/eupl/eupl-text-eupl-12
 
-# Deliberately none: the broker takes no authentication decision of its own;
-# the gateway in front of it does (the policy seam only narrows).
+# None on the NGSI-LD side: the gateway in front of the broker authenticates
+# (the policy seam only narrows). The admin routes below name the optional
+# admin bearer secret (T-3569) themselves.
 security: []
 
 servers:
@@ -108,7 +111,10 @@ paths:
         Prometheus exposition text with the `antares_` prefix. `404` until
         the broker installs a recorder (`ANTARES_TELEMETRY`); the metric
         names are listed in the Admin API chapter of the book.
+      security: [{}, {adminToken: []}]
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: Exposition text.
           content:
@@ -127,7 +133,10 @@ paths:
         The names, sorted, and nothing else: at the 10 000-tenant target a
         list carrying per-kind counts would cost a count per kind per
         tenant on one request. Pick a name and read its detail.
+      security: [{}, {adminToken: []}]
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: The tenant names.
           content:
@@ -151,7 +160,10 @@ paths:
         (CIM 009 5.5.10) and is readable even when empty. `createdAt` is
         present on Postgres, where the `tenants` table records it. The
         path names the tenant; an `NGSILD-Tenant` header is ignored.
+      security: [{}, {adminToken: []}]
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: The tenant and its counts.
           content:
@@ -172,7 +184,10 @@ paths:
         tenant is emptied and keeps existing. Deleted subscriptions and
         registrations are announced to the bus mirrors the way an API
         delete is.
+      security: [{}, {adminToken: []}]
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '204':
           description: Purged.
         '400':
@@ -185,6 +200,108 @@ paths:
             lives at a Context Source. Delete that Subscription first
             (5.8.5.4 removes the copy at its source); a purge never
             orphans it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /q/tenants/{tenant}/digest:
+    parameters:
+      - $ref: '#/components/parameters/tenantPath'
+    get:
+      tags: [Tenants]
+      summary: Count and hash of one tenant's Entities
+      operationId: digestTenant
+      description: |
+        The Entity count, the history instance count and a hash over
+        every Entity's (id, `modifiedAt`) that does not depend on the
+        order a backend pages in (ADR-0030 rule 2). Read on both brokers
+        of a move, equal digests prove the copy.
+      security: [{}, {adminToken: []}]
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '200':
+          description: The digest.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tenant, entities, attrInstances, sha256]
+                properties:
+                  tenant: {type: string}
+                  entities: {type: integer, minimum: 0}
+                  attrInstances: {type: integer, minimum: 0}
+                  sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        '400':
+          $ref: '#/components/responses/BadTenant'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /q/tenants/{tenant}/export:
+    parameters:
+      - $ref: '#/components/parameters/tenantPath'
+    get:
+      tags: [Tenants]
+      summary: One tenant's Entities and history as NDJSON
+      operationId: exportTenant
+      description: |
+        A header line `{"antaresExport":1,"tenant":…}`, one line per
+        Entity and per history document as stored (system attributes
+        kept), then a trailer `{"end":true,"records":n}` (ADR-0030 rule
+        3). Not a point-in-time snapshot: hold the writers first.
+      security: [{}, {adminToken: []}]
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '200':
+          description: The export stream.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadTenant'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The tenant holds what v1 does not move (Subscriptions,
+            registrations, Snapshots, distributed subscriptions), named
+            with their counts (ADR-0030 rule 5).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /q/tenants/{tenant}/import:
+    parameters:
+      - $ref: '#/components/parameters/tenantPath'
+    post:
+      tags: [Tenants]
+      summary: Load an export into an empty tenant
+      operationId: importTenant
+      description: |
+        All or nothing into a tenant that holds nothing (ADR-0030 rule
+        4): a bad line, another tenant's header or a missing trailer
+        stops it, and it deletes what it wrote and nothing else. A line
+        is at most 16 MiB.
+      security: [{}, {adminToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/x-ndjson:
+            schema:
+              type: string
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '204':
+          description: Imported.
+        '400':
+          $ref: '#/components/responses/BadTenant'
+        '409':
+          description: The tenant already holds something, named with its counts.
           content:
             application/json:
               schema:
@@ -213,7 +330,10 @@ paths:
             type: integer
             minimum: 1
             default: 100
+      security: [{}, {adminToken: []}]
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '200':
           description: The letters.
           content:
@@ -240,7 +360,10 @@ paths:
       description: |
         The letter is the only copy of a notification the delivery policy
         gave up on; this is the one route that discards it.
+      security: [{}, {adminToken: []}]
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '204':
           description: Dropped.
         '400':
@@ -260,7 +383,10 @@ paths:
         Re-sends the stored request once through the same binding, under
         the egress policy of the moment. On success the letter is gone;
         on failure it is kept with its attempt history extended.
+      security: [{}, {adminToken: []}]
       responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '204':
           description: Delivered; the letter is deleted.
         '400':
@@ -353,7 +479,32 @@ components:
         examples:
           - urn:ngsi-ld:DeadLetter:6f1c2e7a-8e1b-4c1f-9d3a-2b6a0f5e7c11
 
+  securitySchemes:
+    adminToken:
+      type: http
+      scheme: bearer
+      description: The secret in `ANTARES_ADMIN_TOKEN_FILE`, when the deployment set one.
+
   responses:
+    Unauthorized:
+      description: The broker has an admin secret and the request did not carry it as a bearer token.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+            examples:
+              - Bearer realm="antares-admin"
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+          examples:
+            unauthorized:
+              value:
+                type: urn:antares:error:Unauthorized
+                title: Unauthorized
+                status: 401
+                detail: this admin route requires the broker's admin bearer token
     BadTenant:
       description: A name outside the tenant grammar, or one of the broker's internal names.
       content:

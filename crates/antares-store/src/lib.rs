@@ -68,6 +68,11 @@ pub enum Kind {
     /// Notifications a delivery policy gave up on (dead letters), kept
     /// under the subscription's tenant for replay.
     DeadLetter,
+    /// Endpoint views (ADR-0023 rule 10): configuration the `views` build
+    /// serves, under the reserved tenant `antares-views`, and the policy
+    /// engine's rule documents (ADR-0020 amendment) under `antares-policy`.
+    /// No NGSI-LD route reads or writes this kind.
+    View,
 }
 
 /// The four store backends, decided ONCE at startup and threaded as a value —
@@ -388,6 +393,22 @@ pub trait CurrentStateDriver: Send + Sync {
         kind: Kind,
         id: &str,
     ) -> Result<Option<Value>, NgsiError>;
+    /// Several Entities at once, keyed by id; an absent one has no entry. A
+    /// backend that can read them together overrides this (Postgres: one
+    /// transaction, T-4085); the default reads them one by one.
+    async fn get_entities(
+        &self,
+        tenant: &TenantId,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Value>, NgsiError> {
+        let mut found = std::collections::HashMap::with_capacity(ids.len());
+        for id in ids {
+            if let Some(doc) = self.get(tenant, Kind::Entity, id).await? {
+                found.insert((*id).to_owned(), doc);
+            }
+        }
+        Ok(found)
+    }
     /// Delete one document; `false` if it was absent.
     async fn delete(&self, tenant: &TenantId, kind: Kind, id: &str) -> Result<bool, NgsiError>;
     /// Delete one Entity, but only if `keep` accepts the stored document.
@@ -516,6 +537,23 @@ pub trait CurrentStateDriver: Send + Sync {
     /// return 0).
     async fn sweep_expired(&self) -> usize {
         0
+    }
+    /// Retention of one Entity type in one Tenant (`/q/retention`, T-3900):
+    /// delete at most `batch` Entities whose types include `type_iri`, that
+    /// carry no `expiresAt` of their own (a writer's 4.22 stamp wins) and
+    /// were last modified before `before`, a UTC DateTime. Returns how many
+    /// were deleted, or with `dry_run` would be, deleting nothing; a driver
+    /// without current state has none.
+    async fn retain_current(
+        &self,
+        tenant: &TenantId,
+        type_iri: &str,
+        before: &str,
+        batch: usize,
+        dry_run: bool,
+    ) -> Result<u64, NgsiError> {
+        let _ = (tenant, type_iri, before, batch, dry_run);
+        Ok(0)
     }
     /// Table 5.2.9-2 forward bookkeeping: stamp one distributed operation on
     /// a registration and hand back the stored document. `None` means the row
@@ -746,6 +784,93 @@ pub struct TemporalEvent {
     pub instance: Value,
 }
 
+/// [`TemporalDriver::event_list`]'s default: consecutive events of one Entity
+/// become one `temporal_append`; a scope change goes through `mutate`, in
+/// order. A driver that overrides `event_list` falls back to it.
+pub async fn drain_events<D: TemporalDriver + ?Sized>(
+    d: &D,
+    evs: &[TemporalEvent],
+) -> Result<(), NgsiError> {
+    let mut i = 0;
+    while i < evs.len() {
+        let (tenant, id) = (&evs[i].tenant, evs[i].entity_id.as_str());
+        let mut additions = serde_json::Map::new();
+        let mut shell = &evs[i].shell;
+        let mut j = i;
+        while j < evs.len() && evs[j].tenant == *tenant && evs[j].entity_id == id {
+            let ev = &evs[j];
+            shell = &ev.shell;
+            if ev.op == TemporalOp::ScopeChanged {
+                let inst = ev.instance.clone();
+                d.mutate(tenant, id, |doc| {
+                    let target = doc.as_object_mut().ok_or(())?;
+                    match target.get_mut("scope").and_then(Value::as_array_mut) {
+                        Some(arr) if arr.first().is_some_and(Value::is_object) => {
+                            arr.push(inst);
+                        }
+                        _ => {
+                            target.insert("scope".into(), Value::Array(vec![inst]));
+                        }
+                    }
+                    Ok::<(), ()>(())
+                })
+                .await?;
+            } else {
+                if let Some(arr) = additions
+                    .entry(ev.attr.clone())
+                    .or_insert_with(|| Value::Array(Vec::new()))
+                    .as_array_mut()
+                {
+                    arr.push(ev.instance.clone());
+                }
+            }
+            j += 1;
+        }
+        if !additions.is_empty() {
+            d.temporal_append(tenant, id, shell, &Value::Object(additions))
+                .await?;
+        }
+        i = j;
+    }
+    Ok(())
+}
+
+/// A drained request folded into one append per run of consecutive events of
+/// one Entity, as [`TemporalDriver::event_list`]'s default folds it: tenant,
+/// id, the last shell, the additions by Attribute. `None` when an event
+/// changes scope, which goes through `mutate` in order with the appends
+/// (T-4085: a driver that writes several appends at once takes this).
+pub fn fold_appends(evs: &[TemporalEvent]) -> Option<Vec<(&TenantId, &str, &Value, Value)>> {
+    if evs.iter().any(|ev| ev.op == TemporalOp::ScopeChanged) {
+        return None;
+    }
+    let mut out: Vec<(&TenantId, &str, &Value, Value)> = Vec::new();
+    for ev in evs {
+        let same = out
+            .last()
+            .is_some_and(|(t, id, _, _)| **t == ev.tenant && *id == ev.entity_id);
+        if !same {
+            out.push((
+                &ev.tenant,
+                &ev.entity_id,
+                &ev.shell,
+                Value::Object(serde_json::Map::new()),
+            ));
+        }
+        if let Some((_, _, shell, Value::Object(additions))) = out.last_mut() {
+            *shell = &ev.shell;
+            if let Some(arr) = additions
+                .entry(ev.attr.clone())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+            {
+                arr.push(ev.instance.clone());
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Temporal storage: the entity history (Temporal Evolution) plus the raw
 /// temporal documents the 5.6.13-5.6.16 edit paths operate on.
 ///
@@ -760,48 +885,7 @@ pub trait TemporalDriver: Send + Sync {
     /// single `temporal_append` (scope changes go through `mutate`, as
     /// 4.5.6 shapes them); a bulk writer overrides this and sees the batch.
     async fn event_list(&self, evs: &[TemporalEvent]) -> Result<(), NgsiError> {
-        let mut i = 0;
-        while i < evs.len() {
-            let (tenant, id) = (&evs[i].tenant, evs[i].entity_id.as_str());
-            let mut additions = serde_json::Map::new();
-            let mut shell = &evs[i].shell;
-            let mut j = i;
-            while j < evs.len() && evs[j].tenant == *tenant && evs[j].entity_id == id {
-                let ev = &evs[j];
-                shell = &ev.shell;
-                if ev.op == TemporalOp::ScopeChanged {
-                    let inst = ev.instance.clone();
-                    self.mutate(tenant, id, |doc| {
-                        let target = doc.as_object_mut().ok_or(())?;
-                        match target.get_mut("scope").and_then(Value::as_array_mut) {
-                            Some(arr) if arr.first().is_some_and(Value::is_object) => {
-                                arr.push(inst);
-                            }
-                            _ => {
-                                target.insert("scope".into(), Value::Array(vec![inst]));
-                            }
-                        }
-                        Ok::<(), ()>(())
-                    })
-                    .await?;
-                } else {
-                    if let Some(arr) = additions
-                        .entry(ev.attr.clone())
-                        .or_insert_with(|| Value::Array(Vec::new()))
-                        .as_array_mut()
-                    {
-                        arr.push(ev.instance.clone());
-                    }
-                }
-                j += 1;
-            }
-            if !additions.is_empty() {
-                self.temporal_append(tenant, id, shell, &Value::Object(additions))
-                    .await?;
-            }
-            i = j;
-        }
-        Ok(())
+        drain_events(self, evs).await
     }
     /// `false` = this deployment records no history (`NoTemporal`); the
     /// write path skips recording entirely.
@@ -812,6 +896,23 @@ pub trait TemporalDriver: Send + Sync {
     /// without history reports 0.
     async fn attr_instance_count(&self, tenant: &TenantId) -> Result<u64, NgsiError> {
         let _ = tenant;
+        Ok(0)
+    }
+    /// Retention of one Entity type's history in one Tenant (`/q/retention`,
+    /// T-3900): delete at most `batch` attribute instances of Entities whose
+    /// types include `type_iri` and whose instant (`observedAt`, else
+    /// `modifiedAt`, `deletedAt`, `createdAt`) is before `before`, a UTC
+    /// DateTime. Returns how many were deleted, or with `dry_run` would be,
+    /// deleting nothing; a driver without history has none.
+    async fn retain_history(
+        &self,
+        tenant: &TenantId,
+        type_iri: &str,
+        before: &str,
+        batch: usize,
+        dry_run: bool,
+    ) -> Result<u64, NgsiError> {
+        let _ = (tenant, type_iri, before, batch, dry_run);
         Ok(0)
     }
     /// Remove the whole history of one tenant; nothing to do without history.
@@ -1315,6 +1416,23 @@ mod tests {
     /// The drain folds one request's events into ONE append per entity run
     /// — a 2-attribute entity is one call carrying both, not two — and
     /// keeps production order across entities.
+    #[test]
+    fn fold_appends_is_one_append_per_entity_run_and_none_for_a_scope_change() {
+        let evs = [
+            ev(TemporalOp::AttrCreated, "urn:a", "speed", 1),
+            ev(TemporalOp::AttrCreated, "urn:a", "speed", 2),
+            ev(TemporalOp::AttrCreated, "urn:b", "speed", 3),
+            ev(TemporalOp::AttrCreated, "urn:a", "load", 4),
+        ];
+        let folded = fold_appends(&evs).expect("no scope change");
+        let ids: Vec<&str> = folded.iter().map(|(_, id, _, _)| *id).collect();
+        assert_eq!(ids, ["urn:a", "urn:b", "urn:a"]);
+        assert_eq!(folded[0].3["speed"].as_array().map(Vec::len), Some(2));
+        assert!(fold_appends(&[]).is_some_and(|f| f.is_empty()));
+        let scope = ev(TemporalOp::ScopeChanged, "urn:a", "scope", 5);
+        assert!(fold_appends(&[evs[0].clone(), scope]).is_none());
+    }
+
     #[tokio::test]
     async fn event_list_folds_a_request_into_one_append_per_entity_run() {
         let d = Recorder::default();

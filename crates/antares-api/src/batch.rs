@@ -192,6 +192,261 @@ impl BatchOutcome {
     }
 }
 
+/// 5.2.17 BatchEntityError for a member the policy engine refused: the
+/// AccessDenied problem a refused single-Entity write answers with (ADR-0020).
+fn denied_entry(id: Option<&str>, why: &str) -> Value {
+    json!({
+        "entityId": id.unwrap_or("unknown"),
+        "error": {
+            "type": crate::policy::ACCESS_DENIED_TYPE,
+            "title": crate::policy::ACCESS_DENIED_TITLE,
+            "status": StatusCode::FORBIDDEN.as_u16(),
+            "detail": why,
+        },
+    })
+}
+
+/// The reason a batch is refused whole: every member was refused, so the
+/// answer is the 403 a single refusal gives, carrying the first reason.
+fn whole_refusal(refused: &[Result<crate::policy::Filter, String>]) -> Option<String> {
+    if refused.iter().all(Result::is_err) {
+        refused.first().and_then(|r| r.clone().err())
+    } else {
+        None
+    }
+}
+
+/// The conditions the engine set on the allowed members (gap G12), by id.
+/// One id named by several members holds to every condition any of them
+/// carries: a round writes each id once, so the strictest reading is the
+/// one that never applies a member's write past its own condition.
+#[derive(Default)]
+struct Conditions(HashMap<String, Vec<crate::policy::Condition>>);
+
+impl Conditions {
+    fn add(&mut self, id: Option<&str>, granted: &crate::policy::Filter) {
+        if let (Some(id), Some(c)) = (id, crate::policy::Condition::of(granted)) {
+            self.0.entry(id.to_owned()).or_default().push(c);
+        }
+    }
+
+    fn holds(&self, id: &str, doc: &Value) -> bool {
+        self.0
+            .get(id)
+            .is_none_or(|cs| cs.iter().all(|c| c.holds(doc)))
+    }
+
+    /// Inside the store closure: a member whose stored Entity a condition
+    /// does not select is not found, as an absent one is.
+    fn pre(&self, id: &str, doc: &Value) -> Result<(), NgsiError> {
+        if self.holds(id, doc) {
+            Ok(())
+        } else {
+            Err(Self::not_found(id))
+        }
+    }
+
+    /// Whether a condition holds `id`: an upsert of it may update an Entity
+    /// the condition selects and never creates one (5.6.8, T-3668).
+    fn has(&self, id: &str) -> bool {
+        self.0.contains_key(id)
+    }
+
+    /// The one answer for a conditioned member that is absent or not
+    /// selected, so the two cannot be told apart.
+    fn not_found(id: &str) -> NgsiError {
+        NgsiError::ResourceNotFound(format!("entity {id} not found"))
+    }
+
+    fn unforwarded(&self, forwards: bool) -> Result<(), crate::policy::Denied> {
+        if forwards && !self.0.is_empty() {
+            Err(crate::policy::Denied(
+                crate::policy::CONDITION_NOT_FORWARDED.to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The members of a batch round a view lets through its Relationship check,
+/// each with the guard its store closure applies (ADR-0023 rule 7); the
+/// others land in E. Without a view every member goes, with no guard. The
+/// round's targets are read together (T-4085), apart from those `known`
+/// already holds: Entities the batch read before its first write and does not
+/// itself write, so no round has changed them.
+#[cfg(feature = "views")]
+async fn view_guards(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    round: Vec<(String, Value)>,
+    known: &HashMap<String, Value>,
+    out: &mut BatchOutcome,
+) -> (
+    Vec<(String, Value)>,
+    HashMap<String, crate::views::WriteGuard>,
+) {
+    let members: Vec<(String, Value, Option<crate::views::WriteGuard>)> = round
+        .into_iter()
+        .map(|(id, doc)| {
+            let names = crate::attrs::attr_iris_of(&doc);
+            let g = crate::views::WriteGuard::of(st, names.iter().map(String::as_str));
+            (id, doc, g)
+        })
+        .collect();
+    let mut missing: Vec<&str> = members
+        .iter()
+        .filter(|(_, _, g)| g.is_some())
+        .flat_map(|(_, doc, _)| crate::views::relationship_targets(doc))
+        .filter(|t| !known.contains_key(*t))
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    let mut found = if missing.is_empty() {
+        HashMap::new()
+    } else {
+        // A store failure reads as absent, as a failed single read did.
+        st.store
+            .get_entities(tenant, &missing)
+            .await
+            .unwrap_or_default()
+    };
+    for t in members
+        .iter()
+        .filter(|(_, _, g)| g.is_some())
+        .flat_map(|(_, doc, _)| crate::views::relationship_targets(doc))
+    {
+        if let Some(d) = known.get(t) {
+            found.entry(t.to_owned()).or_insert_with(|| d.clone());
+        }
+    }
+    let mut guards = HashMap::new();
+    let mut kept = Vec::with_capacity(members.len());
+    for (id, doc, g) in members {
+        let Some(g) = g else {
+            kept.push((id, doc));
+            continue;
+        };
+        match g.targets_in(&doc, &found) {
+            Ok(()) => {
+                guards.insert(id.clone(), g);
+                kept.push((id, doc));
+            }
+            Err(crate::policy::Denied(why)) => out.errors.push(denied_entry(Some(&id), &why)),
+        }
+    }
+    (kept, guards)
+}
+
+/// One round of a Batch Upsert under a view, member by member (ADR-0023
+/// rule 7, T-3594): a stored Entity the view shows is replaced, or with
+/// `options=update` updated, under the store's lock between the pre-image
+/// and post-image checks; a replace counts every Attribute the Entity holds
+/// as written, so one holding a hidden Attribute is refused (D6). An absent
+/// id, and one out of the view, take the create path: the Entity is created
+/// in the view or refused, and an out-of-view one is never overwritten,
+/// answering as Create Entity through the view does for a taken id. The ids
+/// created, in order.
+#[cfg(feature = "views")]
+#[allow(clippy::too_many_arguments)]
+async fn upsert_in_view(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    round: Vec<(String, Value)>,
+    update_mode: bool,
+    ts: &str,
+    conds: &Conditions,
+    known: &HashMap<String, Value>,
+    out: &mut BatchOutcome,
+) -> Result<Vec<String>, NgsiError> {
+    let (round, guards) = view_guards(st, tenant, round, known, out).await;
+    let ids: Vec<String> = round.iter().map(|(id, _)| id.clone()).collect();
+    let docs: HashMap<&str, &Value> = round.iter().map(|(id, d)| (id.as_str(), d)).collect();
+    let res = st
+        .store
+        .batch_mutate(tenant, &ids, |id, doc| {
+            conds.pre(id, doc)?;
+            let guard = guards.get(id);
+            if let Some(g) = guard {
+                if update_mode {
+                    g.pre(id, doc)?;
+                } else {
+                    g.pre_whole(id, doc)?;
+                }
+            }
+            let Some(&src) = docs.get(id) else {
+                return Err(NgsiError::InternalError(format!(
+                    "batch member {id} lost its document"
+                )));
+            };
+            if update_mode {
+                merge_into(doc, src, ts);
+            } else {
+                let mut new = src.clone();
+                stamp_new(&mut new, ts);
+                // 4.8: a replaced Entity keeps the instant it was created.
+                if let (Some(o), Some(created)) = (new.as_object_mut(), doc.get("createdAt")) {
+                    o.insert("createdAt".into(), created.clone());
+                }
+                *doc = new;
+            }
+            if let Some(g) = guard {
+                g.post(doc)?;
+            }
+            Ok::<(), NgsiError>(())
+        })
+        .await?;
+    let mut creates = Vec::new();
+    for ((id, doc), r) in round.into_iter().zip(res) {
+        if let Some(crate::policy::Denied(why)) = guards.get(&id).and_then(|g| g.verdict().err()) {
+            out.errors.push(denied_entry(Some(&id), &why));
+            continue;
+        }
+        match r {
+            Some(Ok(())) => {
+                if !out.success.contains(&Value::String(id.clone())) {
+                    out.success.push(Value::String(id));
+                }
+            }
+            // a conditioned member never creates: absent or not selected,
+            // it is not found
+            None | Some(Err(NgsiError::ResourceNotFound(_))) if conds.has(&id) => {
+                out.errors
+                    .push(err_entry(Some(&id), &Conditions::not_found(&id)));
+            }
+            // absent, or out of the view: the pre-image answers not found
+            None | Some(Err(NgsiError::ResourceNotFound(_))) => creates.push((id, doc)),
+            Some(Err(e)) => out.errors.push(err_entry(Some(&id), &e)),
+        }
+    }
+    let mut kept = Vec::with_capacity(creates.len());
+    for (id, mut doc) in creates {
+        match crate::views::admits_new(st, tenant, &doc).await {
+            Ok(()) => {
+                stamp_new(&mut doc, ts);
+                kept.push((id, doc));
+            }
+            Err(crate::policy::Denied(why)) => out.errors.push(denied_entry(Some(&id), &why)),
+        }
+    }
+    let mut created = Vec::new();
+    if kept.is_empty() {
+        return Ok(created);
+    }
+    let ids: Vec<String> = kept.iter().map(|(id, _)| id.clone()).collect();
+    let flags = st.store.batch_create(tenant, kept).await?;
+    for (id, ok) in ids.into_iter().zip(flags) {
+        if !ok {
+            let e = NgsiError::AlreadyExists(format!("entity {id} already exists"));
+            out.errors.push(err_entry(Some(&id), &e));
+        } else if !out.success.contains(&Value::String(id.clone())) {
+            out.success.push(Value::String(id.clone()));
+            created.push(id);
+        }
+    }
+    Ok(created)
+}
+
 fn err_entry(id: Option<&str>, e: &NgsiError) -> Value {
     json!({
         "entityId": id.unwrap_or("unknown"),
@@ -202,6 +457,20 @@ fn err_entry(id: Option<&str>, e: &NgsiError) -> Value {
 /// 5.2.17 BatchEntityError for a failed forwarded part — the remote status
 /// and detail travel inside the ProblemDetails (5.6.7.4/5.6.10.4: remote
 /// error results merge into E).
+/// The status a Context Source put in a batch error entry, when it is an
+/// HTTP error status; anything else (absent, not a number, outside 400..=599,
+/// past u16) is the status its response came back with. A plain `as u16`
+/// wrapped 65 736 to 200 and reported the failure as a success.
+fn remote_status(entry: &Value, fallback: u16) -> u16 {
+    entry
+        .get("error")
+        .and_then(|p| p.get("status"))
+        .and_then(Value::as_u64)
+        .and_then(|s| u16::try_from(s).ok())
+        .filter(|s| (400..=599).contains(s))
+        .unwrap_or(fallback)
+}
+
 fn err_remote(id: Option<&str>, status: u16, detail: &str) -> Value {
     let etype = match status {
         400 => "BadRequestData",
@@ -263,11 +532,7 @@ fn merge_remote_batch(
                     else {
                         continue;
                     };
-                    let remote = e
-                        .get("error")
-                        .and_then(|p| p.get("status"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(u64::from(status)) as u16;
+                    let remote = remote_status(e, status);
                     err.push(err_remote(
                         Some(id),
                         remote,
@@ -659,23 +924,139 @@ async fn batch_write(
     };
     let update_mode = has_option("update");
     let no_overwrite = has_option("noOverwrite");
-    let items = parse_batch(st, &tenant, headers, body).await?;
+    let mut items = parse_batch(st, &tenant, headers, body).await?;
+    let mut out = BatchOutcome {
+        success: vec![],
+        errors: vec![],
+    };
+    // ADR-0020 per member (T-3480): before any item is written and before
+    // any forward, the engine decides each member as the single-Entity write
+    // would — its id, its types (stored and written), its Attributes and its
+    // expanded body. A refused member lands in E with the AccessDenied
+    // problem and the rest are applied (207); a batch refused whole is the
+    // 403 it always was. An entry that does not expand is shown by its id
+    // alone and left to the local arm to report.
+    // ADR-0023 rule 7 under an endpoint view: every batch write is decided
+    // per member on the stored Entities below; an engine narrowing still
+    // refuses it whole, as `gate!` refuses a narrowed write.
+    #[cfg(feature = "views")]
+    crate::views::with_view(
+        st.view.as_deref(),
+        mode.clause(),
+        Ok(crate::policy::unnarrowed()),
+    )?;
+    let mut conds = Conditions::default();
+    // Entities read before the first write, which a view's Relationship check
+    // takes instead of reading them again (T-4085).
+    #[cfg(feature = "views")]
+    let mut known: HashMap<String, Value> = HashMap::new();
+    if let Some(engine) = &st.policy {
+        let members: Vec<(Option<String>, Option<Value>)> = items
+            .iter()
+            .map(|(item, ctx)| {
+                let id = item.get("id").and_then(Value::as_str).map(str::to_owned);
+                let body = match (item.as_object(), ctx.as_ref()) {
+                    (Some(o), Ok(c)) => expand_entity(o, c, ExpandOpts::default()).ok(),
+                    _ => None,
+                };
+                (id, body)
+            })
+            .collect();
+        // One read for every member's pre-image and, under a view, every
+        // Relationship target the batch names (T-4085); a store failure reads
+        // as absent, as the per-member read did.
+        let mut wanted: Vec<&str> = members.iter().filter_map(|(id, _)| id.as_deref()).collect();
+        #[cfg(feature = "views")]
+        if st.view.is_some() {
+            wanted.extend(
+                members
+                    .iter()
+                    .filter_map(|(_, body)| body.as_ref())
+                    .flat_map(crate::views::relationship_targets),
+            );
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        let stored = if wanted.is_empty() {
+            HashMap::new()
+        } else {
+            st.store
+                .get_entities(&tenant, &wanted)
+                .await
+                .unwrap_or_default()
+        };
+        let mut shown: Vec<(Option<String>, crate::policy::PreImage, Option<Value>)> =
+            Vec::with_capacity(members.len());
+        for (id, body) in members {
+            let pre = match &id {
+                Some(id) => crate::policy::image(stored.get(id).cloned(), body.as_ref()),
+                None => crate::policy::PreImage::default(),
+            };
+            shown.push((id, pre, body));
+        }
+        // What the batch writes itself is read again by the round that needs it.
+        #[cfg(feature = "views")]
+        {
+            let written: std::collections::HashSet<&str> = shown
+                .iter()
+                .filter_map(|(id, _, _)| id.as_deref())
+                .collect();
+            known = stored
+                .into_iter()
+                .filter(|(id, _)| !written.contains(id.as_str()))
+                .collect();
+        }
+        let attrs: Vec<Vec<String>> = shown
+            .iter()
+            .map(|(_, _, b)| {
+                b.as_ref()
+                    .and_then(Value::as_object)
+                    .map(|o| {
+                        o.keys()
+                            .filter(|k| !matches!(k.as_str(), "id" | "type" | "scope" | "@context"))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        let ids: Vec<Vec<&str>> = shown
+            .iter()
+            .map(|(id, _, _)| id.as_deref().into_iter().collect())
+            .collect();
+        let ops: Vec<crate::policy::Operation<'_>> = shown
+            .iter()
+            .zip(&ids)
+            .zip(&attrs)
+            .map(|(((_, pre, body), ids), attrs)| crate::policy::Operation {
+                ids,
+                types: &pre.types,
+                attrs,
+                body: body.as_ref(),
+                stored: pre.stored.as_ref(),
+                ..crate::policy::Operation::new(mode.clause())
+            })
+            .collect();
+        let asking = crate::snapshots::asking_tenant(st, &tenant).await;
+        let refused = crate::policy::gate_each(engine.as_ref(), &asking, headers, &ops).await;
+        drop(ops);
+        if let Some(why) = whole_refusal(&refused) {
+            return Err(crate::policy::Denied(why).into());
+        }
+        let mut verdicts = refused.into_iter().zip(shown);
+        items.retain(|_| match verdicts.next() {
+            Some((Err(why), (id, _, _))) => {
+                out.errors.push(denied_entry(id.as_deref(), &why));
+                false
+            }
+            Some((Ok(granted), (id, _, _))) => {
+                conds.add(id.as_deref(), &granted);
+                true
+            }
+            None => true,
+        });
+    }
     let (spec, fwd_items) = batch_spec(&items);
-    // ADR-0020: one verdict for the whole array, before any item is written
-    // and before any forward — the batch is one operation (5.6.7 to 5.6.20)
-    // and a per-item gate would let half of it land on a refusal. The
-    // engine is given what the array names, the same members the
-    // single-Entity write hands it: an engine that decides by Entity id,
-    // type or Attribute has to reach the same verdict whether the request
-    // came one Entity at a time or as one array.
-    let gate_ids: Vec<&str> = spec.ids.iter().flatten().map(String::as_str).collect();
-    gate!(
-        st, &tenant, headers, mode.clause(),
-        ids: &gate_ids,
-        types: spec.types.as_deref().unwrap_or(&[]),
-        attrs: spec.attrs.as_deref().unwrap_or(&[]),
-    )
-    .await?;
     let fed_regs =
         match crate::federation::write_plan(st, &tenant, &spec, &st.loader.core(), params, headers)
             .await?
@@ -683,10 +1064,7 @@ async fn batch_write(
             crate::federation::WritePlan::Answered(r) => return Ok(*r),
             crate::federation::WritePlan::Forward(regs) => regs,
         };
-    let mut out = BatchOutcome {
-        success: vec![],
-        errors: vec![],
-    };
+    conds.unforwarded(!fed_regs.is_empty())?;
     let mut created_ids: Vec<String> = vec![];
     let mut any_created = false;
     let proxies: Vec<&crate::federation::FedReg> =
@@ -776,11 +1154,13 @@ async fn batch_write(
         let mut occurrence: HashMap<String, usize> = HashMap::new();
         for (id, doc) in prepped {
             let n = occurrence.entry(id.clone()).or_insert(0);
-            if rounds.len() <= *n {
-                rounds.push(Vec::new());
+            // `n` never passes `rounds.len()`: each id's count grows by one
+            // and a round is added the first time a count reaches it
+            match rounds.get_mut(*n) {
+                Some(round) => round.push((id, doc)),
+                None => rounds.push(vec![(id, doc)]),
             }
-            rounds[*n].push((id, doc));
-            *n += 1;
+            *n = n.saturating_add(1);
         }
     }
     for round in rounds {
@@ -799,6 +1179,27 @@ async fn batch_write(
                 }
             }
             BatchMode::Upsert => {
+                #[cfg(feature = "views")]
+                if st.view.is_some() {
+                    for id in upsert_in_view(
+                        st,
+                        &tenant,
+                        round,
+                        update_mode,
+                        &ts,
+                        &conds,
+                        &known,
+                        &mut out,
+                    )
+                    .await?
+                    {
+                        any_created = true;
+                        if !created_ids.contains(&id) {
+                            created_ids.push(id);
+                        }
+                    }
+                    continue;
+                }
                 // options=update: merge into existing rows first; ids that
                 // turn out absent (or vanish mid-flight) fall through to the
                 // replace batch — never a silent success (TOCTOU fix).
@@ -810,7 +1211,13 @@ async fn batch_write(
                     let res = st
                         .store
                         .batch_mutate(&tenant, &ids, |id, doc| {
-                            merge_into(doc, docs[id], &ts);
+                            conds.pre(id, doc)?;
+                            let Some(&src) = docs.get(id) else {
+                                return Err(NgsiError::InternalError(format!(
+                                    "batch member {id} lost its document"
+                                )));
+                            };
+                            merge_into(doc, src, &ts);
                             Ok::<(), NgsiError>(())
                         })
                         .await?;
@@ -822,11 +1229,58 @@ async fn batch_write(
                                     out.success.push(Value::String(id.clone()));
                                 }
                             }
+                            None if conds.has(id) => out
+                                .errors
+                                .push(err_entry(Some(id), &Conditions::not_found(id))),
                             None => replaces.push((id.clone(), expanded.clone())),
                         }
                     }
                 } else {
-                    replaces = round;
+                    // a conditioned member is replaced only inside the
+                    // store's read of it, where its condition is judged
+                    let (conditioned, free): (Vec<_>, Vec<_>) =
+                        round.into_iter().partition(|(id, _)| conds.has(id));
+                    replaces = free;
+                    if !conditioned.is_empty() {
+                        let ids: Vec<String> =
+                            conditioned.iter().map(|(id, _)| id.clone()).collect();
+                        let docs: HashMap<&str, &Value> =
+                            conditioned.iter().map(|(id, d)| (id.as_str(), d)).collect();
+                        let res = st
+                            .store
+                            .batch_mutate(&tenant, &ids, |id, doc| {
+                                conds.pre(id, doc)?;
+                                let Some(&src) = docs.get(id) else {
+                                    return Err(NgsiError::InternalError(format!(
+                                        "batch member {id} lost its document"
+                                    )));
+                                };
+                                let mut new = src.clone();
+                                stamp_new(&mut new, &ts);
+                                // 4.8: a replaced Entity keeps the instant it was created.
+                                if let (Some(o), Some(created)) =
+                                    (new.as_object_mut(), doc.get("createdAt"))
+                                {
+                                    o.insert("createdAt".into(), created.clone());
+                                }
+                                *doc = new;
+                                Ok::<(), NgsiError>(())
+                            })
+                            .await?;
+                        for (id, r) in ids.iter().zip(res) {
+                            match r {
+                                Some(Ok(())) => {
+                                    if !out.success.contains(&Value::String(id.clone())) {
+                                        out.success.push(Value::String(id.clone()));
+                                    }
+                                }
+                                Some(Err(e)) => out.errors.push(err_entry(Some(id), &e)),
+                                None => out
+                                    .errors
+                                    .push(err_entry(Some(id), &Conditions::not_found(id))),
+                            }
+                        }
+                    }
                 }
                 if !replaces.is_empty() {
                     for (_, doc) in replaces.iter_mut() {
@@ -851,6 +1305,8 @@ async fn batch_write(
                 }
             }
             BatchMode::Update | BatchMode::Merge => {
+                #[cfg(feature = "views")]
+                let (round, guards) = view_guards(st, &tenant, round, &known, &mut out).await;
                 let ids: Vec<String> = round.iter().map(|(id, _)| id.clone()).collect();
                 let docs: HashMap<&str, &Value> =
                     round.iter().map(|(id, d)| (id.as_str(), d)).collect();
@@ -861,7 +1317,18 @@ async fn batch_write(
                 let res = st
                     .store
                     .batch_mutate(&tenant, &ids, |id, doc| {
-                        let expanded = docs[id];
+                        conds.pre(id, doc)?;
+                        #[cfg(feature = "views")]
+                        let guard = guards.get(id);
+                        #[cfg(feature = "views")]
+                        if let Some(g) = guard {
+                            g.pre(id, doc)?;
+                        }
+                        let Some(&expanded) = docs.get(id) else {
+                            return Err(NgsiError::InternalError(format!(
+                                "batch member {id} lost its document"
+                            )));
+                        };
                         if mode == BatchMode::Update && no_overwrite {
                             // noOverwrite is instance-level: only instances
                             // whose datasetId already exists are skipped
@@ -897,10 +1364,21 @@ async fn batch_write(
                         } else {
                             merge_into(doc, expanded, &ts);
                         }
+                        #[cfg(feature = "views")]
+                        if let Some(g) = guard {
+                            g.post(doc)?;
+                        }
                         Ok::<(), NgsiError>(())
                     })
                     .await?;
                 for ((id, _), r) in round.iter().zip(res) {
+                    #[cfg(feature = "views")]
+                    if let Some(crate::policy::Denied(why)) =
+                        guards.get(id).and_then(|g| g.verdict().err())
+                    {
+                        out.errors.push(denied_entry(Some(id), &why));
+                        continue;
+                    }
                     match r {
                         None => out.errors.push(err_entry(
                             Some(id),
@@ -923,6 +1401,18 @@ async fn batch_write(
                 }
             }
         }
+    }
+    // ADR-0023 rule 7 per member: a create through a view lands in it.
+    #[cfg(feature = "views")]
+    if st.view.is_some() {
+        let mut kept = Vec::with_capacity(pending_creates.len());
+        for (id, doc) in pending_creates {
+            match crate::views::admits_new(st, &tenant, &doc).await {
+                Ok(()) => kept.push((id, doc)),
+                Err(crate::policy::Denied(why)) => out.errors.push(denied_entry(Some(&id), &why)),
+            }
+        }
+        pending_creates = kept;
     }
     // The collected creates, one multi-row statement, one transaction.
     if !pending_creates.is_empty() {
@@ -1138,14 +1628,70 @@ pub async fn batch_delete(
             ))
             .into());
         }
-        // ADR-0020, as for the write batches: one verdict for the whole
-        // array, carrying the Entity ids it names. The body has to be read
-        // to know them, so the gate sits behind the parse the way the
-        // single-Entity delete sits behind its path parameter.
-        let gate_ids: Vec<&str> = ids.iter().filter_map(Value::as_str).collect();
-        gate!(st, &tenant, &headers, "5.6.10", ids: &gate_ids).await?;
+        let mut out = BatchOutcome {
+            success: vec![],
+            errors: vec![],
+        };
+        // ADR-0020 per member, as for the write batches (T-3480): each id
+        // is decided as the single-Entity delete decides it, with the types
+        // stored under it. The body has to be read to know them, so the gate
+        // sits behind the parse the way the single-Entity delete sits behind
+        // its path parameter. A refused id lands in E, the rest are deleted.
+        let mut ids: Vec<&Value> = ids.iter().collect();
+        let mut conds = Conditions::default();
+        #[cfg(feature = "views")]
+        crate::views::with_view(
+            st.view.as_deref(),
+            "5.6.10",
+            Ok(crate::policy::unnarrowed()),
+        )?;
+        if let Some(engine) = &st.policy {
+            let mut pres: Vec<crate::policy::PreImage> = Vec::new();
+            for id in &ids {
+                pres.push(match id.as_str() {
+                    Some(id) => crate::policy::pre_image(&st, &tenant, id, None).await,
+                    None => crate::policy::PreImage::default(),
+                });
+            }
+            let one: Vec<Vec<&str>> = ids
+                .iter()
+                .map(|v| v.as_str().into_iter().collect())
+                .collect();
+            let ops: Vec<crate::policy::Operation<'_>> = one
+                .iter()
+                .zip(&pres)
+                .map(|(ids, pre)| crate::policy::Operation {
+                    ids,
+                    types: &pre.types,
+                    stored: pre.stored.as_ref(),
+                    ..crate::policy::Operation::new("5.6.10")
+                })
+                .collect();
+            let asking = crate::snapshots::asking_tenant(&st, &tenant).await;
+            let refused = crate::policy::gate_each(engine.as_ref(), &asking, &headers, &ops).await;
+            if let Some(why) = whole_refusal(&refused) {
+                return Err(crate::policy::Denied(why).into());
+            }
+            let mut verdicts = refused.into_iter();
+            ids.retain(|id| match verdicts.next() {
+                Some(Err(why)) => {
+                    out.errors.push(denied_entry(id.as_str(), &why));
+                    false
+                }
+                Some(Ok(granted)) => {
+                    conds.add(id.as_str(), &granted);
+                    true
+                }
+                None => true,
+            });
+        }
         let spec = crate::registry::CsrSpec {
-            ids: Some(gate_ids.iter().map(|id| (*id).to_owned()).collect()),
+            ids: Some(
+                ids.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_owned)
+                    .collect(),
+            ),
             ..Default::default()
         };
         let regs = match crate::federation::write_plan(
@@ -1161,17 +1707,41 @@ pub async fn batch_delete(
             crate::federation::WritePlan::Answered(r) => return Ok(*r),
             crate::federation::WritePlan::Forward(regs) => regs,
         };
-        let mut out = BatchOutcome {
-            success: vec![],
-            errors: vec![],
-        };
+        conds.unforwarded(!regs.is_empty())?;
         // One multi-row DELETE for the whole batch; flags in input order.
         let id_strs: Vec<String> = ids
             .iter()
+            .copied()
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect();
-        let mut flags = st.store.batch_delete(&tenant, &id_strs).await?.into_iter();
+        // Under an endpoint view or an engine's condition each delete reads
+        // its Entity under the lock and leaves one out of the view, or one
+        // the condition does not select, which then answers as absent
+        // (ADR-0023 rule 7, gap G12).
+        #[cfg(feature = "views")]
+        let guard = crate::views::WriteGuard::of(&st, std::iter::empty());
+        #[cfg(feature = "views")]
+        let judged = guard.is_some() || !conds.0.is_empty();
+        #[cfg(not(feature = "views"))]
+        let judged = !conds.0.is_empty();
+        let flags = if judged {
+            let mut flags = Vec::with_capacity(id_strs.len());
+            for id in &id_strs {
+                let keep = |d: &Value| {
+                    #[cfg(feature = "views")]
+                    if guard.as_ref().is_some_and(|g| !g.sees(d)) {
+                        return false;
+                    }
+                    conds.holds(id, d)
+                };
+                flags.push(st.store.delete_entity_if(&tenant, id, &keep).await?);
+            }
+            flags
+        } else {
+            st.store.batch_delete(&tenant, &id_strs).await?
+        };
+        let mut flags = flags.into_iter();
         let mut local_ok: std::collections::HashSet<String> = Default::default();
         let mut local_miss: Vec<String> = Vec::new();
         for id in ids {
@@ -1343,7 +1913,6 @@ async fn batch_query_inner(
     )?;
     // POST query IS Query Entities: geo+json is a valid Accept here (6.3.15)
     let accept = parse_accept_geo(headers)?;
-    let filter = gate!(st, &tenant, headers, "5.7.2").await?;
     let parsed = parse_body(&st.loader, headers, body, BodyKind::Standard).await?;
     let q = parsed.object(NgsiError::BadRequestData(
         "query body must be an object".into(),
@@ -1357,6 +1926,17 @@ async fn batch_query_inner(
     if let Some(l) = params.get("local") {
         vp.insert("local".into(), l.clone());
     }
+    // ADR-0020: the engine is shown every member of the Query body
+    let named = crate::entities::ReadMembers::with_ctx(st, &vp, &parsed.ctx);
+    let filter = gate!(
+        st, &tenant, headers, "5.7.2",
+        q: named.q.as_ref(),
+        scope_q: vp.get("scopeQ").map(String::as_str),
+        types: &named.types,
+        attrs: &named.attrs,
+        geo: named.geo.as_ref(),
+    )
+    .await?;
     // 5.7.2.4 (p. 201): "At least one of the following input data shall be
     // provided: a) selector of Entity Types; b) list of Attribute names,
     // including at least one non-system Attribute; c) NGSI-LD Query,
@@ -1387,7 +1967,10 @@ async fn batch_query_inner(
     // after the "too wide" judgement — which is about what the client asked
     // for. Everything below reads the narrowed query, the forwarded one
     // included.
-    let vp = filter.narrow_params(&vp)?;
+    // what the client's own Query reads, before the engine's q joins it
+    // (ADR-0023 rule 11)
+    let narrow = crate::repr::narrowing_reading(&filter, &vp, &parsed.ctx)?;
+    let vp = filter.narrow_params(&vp, &parsed.ctx)?;
     let fed = if crate::federation::active(&vp)
         && !crate::federation::via_loop(
             headers,
@@ -1407,12 +1990,15 @@ async fn batch_query_inner(
         Vec::new()
     };
     let mut matches =
-        crate::entities::filter_entities_fed(st, &tenant, &vp, &parsed.ctx, fed).await?;
+        crate::entities::filter_entities_fed(st, &tenant, &vp, &parsed.ctx, fed, Some(&narrow))
+            .await?;
     let mut page_params = params.clone();
     page_params.extend(vp.clone());
     // 5.2.43 ordering: same 4.23 keys as the GET twin, applied pre-pagination
     if let Some(spec) = page_params.get("orderBy") {
-        crate::paging::order_entities(&mut matches, spec, &page_params, &parsed.ctx)?;
+        crate::repr::order_as_shown(&mut matches, Some(&narrow), |m| {
+            crate::paging::order_entities(m, spec, &page_params, &parsed.ctx)
+        })?;
     }
     let (page, count_hdr, _links) = paginate(
         st,
@@ -1466,6 +2052,7 @@ async fn batch_query_inner(
                     crate::repr::collect_flat_beyond(
                         st,
                         &tenant,
+                        &parsed.ctx,
                         &repr,
                         doc,
                         *level,
@@ -1500,12 +2087,24 @@ async fn batch_query_inner(
             resp.headers_mut().insert("NGSILD-Results-Count", v);
         }
     }
-    filter.mark_restricted(resp.headers_mut());
+    filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
 }
 
 #[cfg(test)]
 mod tests {
+    /// T-3531: a remote error status is taken only when it is one.
+    #[test]
+    fn remote_status_takes_only_an_http_error_status() {
+        use serde_json::json;
+        let e = |s: Value| json!({"error": {"status": s}});
+        assert_eq!(super::remote_status(&e(json!(404)), 207), 404);
+        assert_eq!(super::remote_status(&e(json!(65_736)), 207), 207);
+        assert_eq!(super::remote_status(&e(json!(200)), 207), 207);
+        assert_eq!(super::remote_status(&e(json!("404")), 207), 207);
+        assert_eq!(super::remote_status(&json!({}), 500), 500);
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -1776,9 +2375,10 @@ mod tests {
         // …but `coordinates` keeps its own ceiling: MAX_GEO_VERTICES, which a
         // legal polygon can spend more than MAX_URI_BYTES on. Capping it in
         // bytes too would refuse a geometry the broker advertises support for.
-        let ring: Vec<Value> = (0..600)
-            .map(|i| json!([f64::from(i) / 10_000.0, f64::from(i) / 10_000.0]))
-            .chain(std::iter::once(json!([0.0, 0.0])))
+        // A circle: a valid ring, as the area relations ask (T-3912).
+        let ring: Vec<Value> = (0..=600)
+            .map(|i| f64::from(i % 600) * std::f64::consts::TAU / 600.0)
+            .map(|a| json!([a.cos() / 100.0, a.sin() / 100.0]))
             .collect();
         let coords = json!([ring]);
         assert!(

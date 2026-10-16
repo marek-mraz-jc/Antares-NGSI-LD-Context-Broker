@@ -79,7 +79,7 @@ ${sub_id}=      urn:ngsi-ld:Subscription:distsub5814
 
     &{headers}=    Create Dictionary    Content-Type=application/json
     ${sub}=    Set Variable
-    ...    {"id": "${sub_id}", "type": "Subscription", "entities": [{"type": "Vehicle"}], "q": "speed>50;brandName==%22Tesla%22", "splitEntities": true, "notification": {"endpoint": {"uri": "http://${context_source_host}:${context_source_port}/notify"}}}
+    ...    {"id": "${sub_id}", "type": "Subscription", "entities": [{"type": "Vehicle"}], "q": "speed>50;brandName==\\"Tesla\\"", "splitEntities": true, "notification": {"endpoint": {"uri": "http://${context_source_host}:${context_source_port}/notify"}}}
     ${response}=    POST    url=${url}/subscriptions    data=${sub}    headers=${headers}    expected_status=any
     Check Response Status Code    201    ${response.status_code}
 

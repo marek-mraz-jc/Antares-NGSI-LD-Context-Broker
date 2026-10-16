@@ -10,6 +10,10 @@
 //! Literal values are inlined (EXPLAIN cannot carry extended-protocol binds);
 //! this is test-only SQL, never a pattern for request paths.
 
+// Every test here talks to the Postgres store, which only exists with the
+// `postgres` feature; without it the file builds to nothing (T-3465).
+#![cfg(feature = "postgres")]
+
 use antares_sql::store::pg;
 
 macro_rules! require_db {
@@ -211,5 +215,53 @@ async fn geo_predicate_bitmap_ors_gist_and_ambiguous_indexes() {
     assert!(
         plan.contains("i_entities_loc_ambiguous") || plan.contains("BitmapOr"),
         "ambiguous arm no longer index-shaped — plan:\n{plan}"
+    );
+}
+
+/// The entity query must run unprepared. A prepared statement switches to a
+/// generic plan after five runs on a connection, and the generic plan cannot
+/// see that `@ > 100` is something `jsonb_path_ops` cannot narrow: it ORs one
+/// GIN scan per `q` alternative, each returning the whole type, then
+/// rechecks and sorts every row. perf-baseline measured that at 100 000
+/// Vehicles as 1.6 s per request instead of 1.5 ms, and 503s at 50 clients
+/// (T-3735). An unprepared statement is planned with its values every time.
+#[tokio::test]
+async fn the_entity_query_is_not_left_prepared() {
+    use antares_jsonld::core_context;
+    use antares_model::TenantId;
+    use antares_sql::store::pg::entity::{EntityFilter, PgEntityStore};
+
+    let url = require_db!();
+    // one connection, so the statement cache read below is the query's own
+    let pool = pg::connect(&url, 1).await.expect("connect");
+    let tenant = TenantId::new("pgunprepared").expect("tenant");
+    pg::ensure_tenant(&pool, &tenant).await.expect("tenant row");
+    let store = PgEntityStore::new(pool.clone());
+    let ctx = core_context();
+    let expand = |term: &str| ctx.expand_key(term);
+    let q = antares_ql::parse_q(r#"speed>100;brand=="Tesla""#).expect("q");
+    for _ in 0..6 {
+        store
+            .query(
+                &tenant,
+                &EntityFilter {
+                    q: Some(&q),
+                    expand: &expand,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("query");
+    }
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT statement FROM pg_prepared_statements WHERE statement LIKE '%FROM entities WHERE%'",
+    )
+    .persistent(false)
+    .fetch_all(&pool)
+    .await
+    .expect("prepared statements");
+    assert!(
+        left.is_empty(),
+        "the entity query stayed prepared: {left:?}"
     );
 }

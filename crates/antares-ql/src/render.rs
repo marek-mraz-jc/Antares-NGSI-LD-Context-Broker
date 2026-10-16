@@ -13,8 +13,9 @@ impl fmt::Display for QNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             // `;` binds tighter than `|`: an Or inside an And needs the
-            // parentheses back, nothing else does.
-            QNode::And(items) => join(f, items, ";", |n| matches!(n, QNode::Or(_))),
+            // parentheses back. A group nested in its own operator keeps them
+            // too, since the parser keeps `(a;b);c` as a nested And.
+            QNode::And(items) => join(f, items, ";", |n| matches!(n, QNode::Or(_) | QNode::And(_))),
             QNode::Or(items) => join(f, items, "|", |n| matches!(n, QNode::Or(_))),
             // 4.9: a `RegExp` operand is not a `quotedStr`, so it is not
             // escaped as one — the backslashes in it are the pattern's.
@@ -134,6 +135,9 @@ mod tests {
             "flag==true",
             "a;b|c;d",
             "a|(b;c)|d",
+            // fuzz/regressions/parse_q: a parenthesised And inside an And
+            "l|Q;Q|(cImm;m;mmm);i",
+            "(a;b);c",
         ] {
             let node = parse_q(q).expect(q);
             let rendered = node.to_string();
@@ -196,15 +200,9 @@ mod tests {
     fn a_regexp_operand_keeps_its_own_backslashes() {
         for q in [r#"a~="^\d+$""#, r#"a!~="^[a-z]\.[0-9]{2}$""#] {
             let node = parse_q(q).expect(q);
-            let QNode::Cmp { value, .. } = &node else {
-                panic!("{q}: expected a comparison")
-            };
-            let QValue::Str(pattern) = value else {
-                panic!("{q}: expected a string operand")
-            };
             assert!(
-                pattern.contains('\\'),
-                "{q}: the regex kept its backslash: {pattern:?}"
+                matches!(&node, QNode::Cmp { value: QValue::Str(pattern), .. } if pattern.contains('\\')),
+                "{q}: the regex kept its backslash: {node:?}"
             );
             assert_eq!(parse_q(&node.to_string()).expect("re-parses"), node, "{q}");
         }

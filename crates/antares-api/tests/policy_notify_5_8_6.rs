@@ -198,6 +198,13 @@ async fn stored_sub(st: &AppState) -> Value {
 
 const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a test listens for a notification that may or must not come:
+/// 1.5 s, stretched under a sanitizer, whose slowdown once held an allowed
+/// joined notification past a flat 1.5 s (strict TSan, T-3706).
+fn listen() -> std::time::Duration {
+    std::time::Duration::from_millis(1500 * antares_api::state::slow_factor())
+}
+
 /// 5.11.7 increments `timesSent` for a notification that "shall be sent",
 /// and Table 5.2.14.2-1 defines it as the number of times the notification
 /// HAS BEEN sent. A dropped one never was: no POST, no stamp, no count —
@@ -210,9 +217,7 @@ async fn a_dropped_notification_is_no_attempt_at_all() {
     fire(&st, "urn:ngsi-ld:Vehicle:dropped").await;
 
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(listen(), rx.recv()).await.is_err(),
         "a dropped notification was delivered anyway"
     );
     let n = stored_sub(&st).await;
@@ -331,7 +336,7 @@ async fn a_pick_leaves_the_entity_frame_and_nothing_it_did_not_name() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_notification_filter_that_carries_a_query_is_dropped() {
     let (st, _) = state(NotifyDecision::Filter(Filter {
-        q: Some(antares_ql::parse_q("speed<50").expect("q")),
+        q: Some(Box::new(antares_ql::parse_q("speed<50").expect("q"))),
         ..Filter::default()
     }))
     .await;
@@ -342,9 +347,7 @@ async fn a_notification_filter_that_carries_a_query_is_dropped() {
     fire(&st, "urn:ngsi-ld:Vehicle:qfilter").await;
 
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(1500), rx.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(listen(), rx.recv()).await.is_err(),
         "a narrowing the broker cannot apply was reported as applied"
     );
     let n = stored_sub(&st).await;
@@ -446,4 +449,195 @@ async fn the_stored_subject_is_in_no_representation_and_no_client_can_set_it() {
         vec![("x-subject".to_owned(), "alice".to_owned())],
         "a client body rewrote the stored subject"
     );
+}
+
+/// A joined notification (5.2.14.1 `join`) under a narrowing that hides
+/// rows: the joined target is not delivered. A row predicate is refused on
+/// this path (ADR-0020), so the whole notification goes, which hides the
+/// target and does not tell hidden from absent. `Deliver` sends the
+/// joined target, so the drop is the narrowing's doing (T-3470).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joined_notification_does_not_carry_a_target_the_narrowing_hides() {
+    for (answer, delivered) in [
+        (NotifyDecision::Deliver, true),
+        (
+            NotifyDecision::Filter(Filter {
+                q: Some(Box::new(antares_ql::parse_q("public==true").expect("q"))),
+                ..Filter::default()
+            }),
+            false,
+        ),
+    ] {
+        let (st, _) = state(answer).await;
+        let (uri, mut rx) = capture().await;
+        let (code, body) = call(
+            &st,
+            "POST",
+            "entities",
+            None,
+            Some(json!({"id": "urn:ngsi-ld:Person:hidden", "type": "Person",
+                        "name": {"type": "Property", "value": "Hid"}})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        let (code, body) = call(
+            &st,
+            "POST",
+            "subscriptions",
+            Some("alice"),
+            Some(
+                json!({"type": "Subscription", "entities": [{"type": "Vehicle"}],
+                        "notification": {"endpoint": {"uri": uri},
+                                         "join": "inline", "joinLevel": 1}}),
+            ),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        let (code, body) = call(
+            &st,
+            "POST",
+            "entities",
+            None,
+            Some(json!({"id": "urn:ngsi-ld:Vehicle:j", "type": "Vehicle",
+                        "public": {"type": "Property", "value": true},
+                        "owner": {"type": "Relationship",
+                                  "object": "urn:ngsi-ld:Person:hidden"}})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        let got = tokio::time::timeout(listen(), rx.recv()).await;
+        match got {
+            Ok(Some(n)) => {
+                assert!(delivered, "a narrowed join was delivered: {n}");
+                assert!(n.to_string().contains("Hid"), "join not rendered: {n}");
+            }
+            _ => assert!(!delivered, "the allowed joined notification never came"),
+        }
+    }
+}
+
+/// A Subscription's q is a query (Table 5.2.12-1) and a linked term in it
+/// reads the linked Entity as the query does. Whether it may read
+/// `salary` is decided by the subscriber's narrowing, and the notification
+/// path learns that narrowing only from pre_notify, after the condition
+/// has already run. So a narrowing that projects is not one this path can
+/// claim to have applied to a linked condition, and the notification is
+/// not sent. Under `Deliver` it is, so the drop is the narrowing's doing
+/// (T-3474).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_condition_under_a_projecting_narrowing_is_not_an_oracle() {
+    for (answer, delivered) in [
+        (NotifyDecision::Deliver, true),
+        (
+            NotifyDecision::Filter(Filter {
+                omit: vec!["https://uri.etsi.org/ngsi-ld/default-context/salary".into()],
+                ..Filter::default()
+            }),
+            false,
+        ),
+    ] {
+        let (st, _) = state(answer).await;
+        let (uri, mut rx) = capture().await;
+        let (code, body) = call(
+            &st,
+            "POST",
+            "entities",
+            None,
+            Some(json!({"id": "urn:ngsi-ld:Person:rich", "type": "Person",
+                        "salary": {"type": "Property", "value": 90000}})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        let (code, body) = call(
+            &st,
+            "POST",
+            "subscriptions",
+            Some("alice"),
+            Some(
+                json!({"type": "Subscription", "entities": [{"type": "Vehicle"}],
+                        "q": "owner{salary}>50000",
+                        "notification": {"endpoint": {"uri": uri}}}),
+            ),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        let (code, body) = call(
+            &st,
+            "POST",
+            "entities",
+            None,
+            Some(json!({"id": "urn:ngsi-ld:Vehicle:l", "type": "Vehicle",
+                        "owner": {"type": "Relationship",
+                                  "object": "urn:ngsi-ld:Person:rich"}})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        let got = tokio::time::timeout(listen(), rx.recv()).await;
+        match got {
+            Ok(Some(n)) => assert!(delivered, "the hidden salary decided a notification: {n}"),
+            _ => assert!(!delivered, "the allowed linked condition never notified"),
+        }
+    }
+}
+
+/// ADR-0020: the projection reaches every document the notification
+/// carries, an Entity embedded by `join=inline` (4.5.23.2) among them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notification_projection_reaches_the_inline_joined_entity() {
+    for format in ["normalized", "keyValues"] {
+        let (st, _) = state(NotifyDecision::Filter(Filter {
+            omit: vec!["https://uri.etsi.org/ngsi-ld/default-context/salary".into()],
+            ..Filter::default()
+        }))
+        .await;
+        let (uri, mut rx) = capture().await;
+        let (code, body) = call(
+            &st,
+            "POST",
+            "entities",
+            None,
+            Some(json!({"id": "urn:ngsi-ld:Person:paid", "type": "Person",
+                    "name": {"type": "Property", "value": "Pat"},
+                    "salary": {"type": "Property", "value": 90000}})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        let (code, body) = call(
+            &st,
+            "POST",
+            "subscriptions",
+            Some("alice"),
+            Some(
+                json!({"type": "Subscription", "entities": [{"type": "Vehicle"}],
+                    "notification": {"endpoint": {"uri": uri},
+                                     "join": "inline", "joinLevel": 1}}),
+            ),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        let (code, body) = call(
+            &st,
+            "POST",
+            "entities",
+            None,
+            Some(json!({"id": "urn:ngsi-ld:Vehicle:p", "type": "Vehicle",
+                    "owner": {"type": "Relationship", "object": "urn:ngsi-ld:Person:paid"}})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        let n = tokio::time::timeout(WAIT, rx.recv())
+            .await
+            .ok()
+            .flatten()
+            .expect("notification");
+        let text = n.to_string();
+        assert!(
+            text.contains("Pat"),
+            "the joined Entity is embedded: {text}"
+        );
+        assert!(
+            !text.contains("90000"),
+            "{format}: the omitted member rode the join: {text}"
+        );
+    }
 }

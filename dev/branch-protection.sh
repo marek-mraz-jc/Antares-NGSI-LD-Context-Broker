@@ -104,6 +104,14 @@ ruleset protect-main refs/heads/main '[]' "[ $hard,
   $(pull_request '["merge"]'),
   $(checks "Source of the change" \
            "Workspace tests / Workspace tests" \
+           "Workspace tests / Workspace tests (no-default-features)" \
+           "Workspace tests / Workspace tests (all-features)" \
+           "Workspace tests / Workspace tests (file-store)" \
+           "Workspace tests / Each feature alone (workspace)" \
+           "Workspace tests / Each feature alone (antares-api)" \
+           "Workspace tests / Each feature alone (antares-broker)" \
+           "Workspace tests / Each feature alone (antares-notifier)" \
+           "Workspace tests / Each feature alone (antares-sql)" \
            "ETSI cell matrix / Matrix summary" \
            "Browser build (wasm32)" \
            "wasm Node tier (serial suites)") ]"
@@ -112,7 +120,17 @@ ruleset protect-main refs/heads/main '[]' "[ $hard,
 ruleset dev-pull-requests refs/heads/dev "$admins" "[
   $(pull_request '["rebase", "squash"]'),
   $(checks "Workspace tests / Workspace tests" \
-           "ETSI cell matrix / Matrix summary") ]"
+           "Workspace tests / Workspace tests (no-default-features)" \
+           "Workspace tests / Workspace tests (all-features)" \
+           "Workspace tests / Workspace tests (file-store)" \
+           "Workspace tests / Each feature alone (workspace)" \
+           "Workspace tests / Each feature alone (antares-api)" \
+           "Workspace tests / Each feature alone (antares-broker)" \
+           "Workspace tests / Each feature alone (antares-notifier)" \
+           "Workspace tests / Each feature alone (antares-sql)" \
+           "ETSI cell matrix / Matrix summary" \
+           "mcp-conformance" \
+           "mcp-suites") ]"
 
 # 4. Actions and outside contributors. A workflow gets a read-only token
 #    unless it asks for more, no workflow approves a pull request, and a

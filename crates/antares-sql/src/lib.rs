@@ -4,7 +4,19 @@
 //! The q= compiler emits parameterized SQL — structure from the
 //! compiler, values as binds ONLY. The sqlx store implementations live in
 //! `store`; migrations live in `migrations/`.
-#![cfg_attr(not(test), warn(clippy::expect_used))]
+// T-3468: every surface calls into this crate on a request path, where a
+// panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
+// index out of bounds or overflow.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub mod compile;

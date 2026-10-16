@@ -6,13 +6,19 @@ edition.workspace = true
 publish = false
 license.workspace = true
 rust-version.workspace = true
+# One integration-test binary, tests/it.rs, plus the [[test]] entries below (T-3540).
+autotests = false
+
+# ADR-0027 / surfaces-threat-model 9.1: checked by dev/check-module-rules.py.
+[package.metadata.antares]
+role = "core"
 
 [dependencies]
 tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true }
 antares-model = { workspace = true }
 antares-store = { workspace = true }
-antares-jsonld = { workspace = true }
+antares-jsonld = { workspace = true, features = ["fetch"] }
 antares-ql = { workspace = true }
 antares-matcher = { workspace = true }
 # Test-only: the built-in memory/file store behind `AppState::new`, and the
@@ -25,6 +31,8 @@ sonic-rs = { workspace = true, optional = true }
 # consumer that builds this crate without the rest of the workspace (the
 # wasm crate) must not lose it to feature resolution.
 futures-util = { workspace = true, features = ["std"] }
+# ADR-0030: the tenant digest.
+sha2 = { workspace = true }
 chrono = { workspace = true }
 icu_collator = { workspace = true }
 icu_locale_core = { workspace = true }
@@ -69,6 +77,13 @@ postgres = ["test-kit", "antares-sql/postgres"]
 # sonic-rs on the batch-ingest hot path (x86_64/aarch64); serde_json is
 # always the compiled fallback.
 sonic = ["dep:sonic-rs"]
+# `antares_api::fuzzing`: the request parsers, reachable by the fuzz targets
+# under fuzz/ (T-3463). Adds no dependency and no route; no broker build
+# turns it on.
+fuzzing = []
+# Endpoint views (ADR-0023): the composition hook `gate!` applies when a
+# state carries a view. Off in the vanilla build; pulled by antares-ops.
+views = []
 
 [dev-dependencies]
 # the storage seams are object-safe AND asynchronous: a test double
@@ -76,8 +91,75 @@ sonic = ["dep:sonic-rs"]
 async-trait = { workspace = true }
 antares-api = { workspace = true, features = ["test-kit", "postgres"] }
 http-body-util = { workspace = true }
+# a paused clock runs a test to a 60 s deadline at once (T-4102)
+tokio = { workspace = true, features = ["test-util"] }
 # capturing subscriber: the tests that prove a credential is not logged
 tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
+[[test]]
+# own process: sets ANTARES_MAX_BODY_BYTES
+name = "csource_notification_bound"
+path = "tests/csource_notification_bound.rs"
+
+[[test]]
+# own process: installs the global tracing subscriber
+name = "csi_credential_4_3_6_5"
+path = "tests/csi_credential_4_3_6_5.rs"
+
+[[test]]
+# own process: sets ANTARES_PUBLIC_URL
+name = "dist_sub_through_proxies_5_8_1"
+path = "tests/dist_sub_through_proxies_5_8_1.rs"
+
+[[test]]
+# own process: sets ANTARES_PUBLIC_URL
+name = "dist_subs_5_8"
+path = "tests/dist_subs_5_8.rs"
+
+[[test]]
+# own process: sets ANTARES_PUBLIC_URL
+name = "forward_transport_adr0025"
+path = "tests/forward_transport_adr0025.rs"
+
+[[test]]
+# own process: sets ANTARES_MAX_FED_RESPONSE_BYTES
+name = "fed_bounds_5_7"
+path = "tests/fed_bounds_5_7.rs"
+
+[[test]]
+# own process: sets ANTARES_POLICY_SUBJECT_HEADERS
+name = "facade_seam_f0"
+path = "tests/facade_seam_f0.rs"
+
+[[test]]
+# own process: sets ANTARES_POLICY_SUBJECT_HEADERS
+name = "policy_maps_snapshots_5_14_5_16"
+path = "tests/policy_maps_snapshots_5_14_5_16.rs"
+
+[[test]]
+# own process: sets ANTARES_POLICY_SUBJECT_HEADERS
+name = "policy_notify_5_8_6"
+path = "tests/policy_notify_5_8_6.rs"
+
+[[test]]
+# own process: sets ANTARES_POLICY_SUBJECT_HEADERS (T-3692: as a module of
+# `it` it raced the first request of another module for the header list)
+name = "policy_record_lists_5_8_4"
+path = "tests/policy_record_lists_5_8_4.rs"
+
+[[test]]
+# own process: sets ANTARES_POLICY_SUBJECT_HEADERS and ANTARES_PUBLIC_URL
+name = "policy_subject_on_the_wire_p6"
+path = "tests/policy_subject_on_the_wire_p6.rs"
+
+[[test]]
+# own process: sets and removes ANTARES_PUBLIC_URL and ANTARES_HTTP_PORT
+name = "public_url_default_5_8_1"
+path = "tests/public_url_default_5_8_1.rs"

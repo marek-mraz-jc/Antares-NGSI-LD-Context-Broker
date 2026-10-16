@@ -26,6 +26,19 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 /// another release is not, and a caller that retries it reports the timeout
 /// instead of the cause. Only the history errors are permanent: an execution
 /// failure can be a lock the next attempt gets.
+/// The filter values a stored text column can equal. PostgreSQL `text` holds
+/// no NUL, so a request string carrying one names nothing the store holds;
+/// binding it would raise `22021` and turn a query that matches nothing into
+/// an error (T-3464). Callers bind what this keeps.
+pub(crate) fn storable<S: AsRef<str>>(values: &[S]) -> Vec<String> {
+    values
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|v| !v.contains('\0'))
+        .map(str::to_owned)
+        .collect()
+}
+
 pub fn is_schema_mismatch(e: &sqlx::Error) -> bool {
     use sqlx::migrate::MigrateError::{
         Dirty, VersionMismatch, VersionMissing, VersionNotPresent, VersionTooNew, VersionTooOld,

@@ -29,7 +29,10 @@ use std::sync::Arc;
 const DEFAULT_TRIGGERS: &[&str] = &["attributeCreated", "attributeUpdated"];
 /// Depth of the change→matcher queue, the same ring size the local bus uses.
 /// Held with the other published ceilings so `/q/health` reports it.
-use crate::bounds::{CHANGE_QUEUE, DELIVERY_WIDTH, DELIVERY_WIDTH_PER_TENANT};
+use crate::bounds::{CHANGE_QUEUE, DELIVERY_LANE, DELIVERY_WIDTH};
+// the per-tenant slots of the native delivery pool (`tenant_slots`)
+#[cfg(not(target_arch = "wasm32"))]
+use crate::bounds::DELIVERY_WIDTH_PER_TENANT;
 static CHANGES_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TASK_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Hand a batch to the matcher queue: counted as pending on acceptance,
@@ -38,11 +41,12 @@ static TASK_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// caller's transaction: this ring lives in the process and a full one
 /// drops, which is why the drop is counted.
 fn queue_for_matching(
-    tx: &tokio::sync::mpsc::Sender<Vec<Change>>,
+    tx: &tokio::sync::mpsc::Sender<(u64, Vec<Change>)>,
     pending: &std::sync::atomic::AtomicUsize,
     changes: Vec<Change>,
 ) {
-    if tx.try_send(changes).is_ok() {
+    // stamped now, after the write: a subscription made later never matches it
+    if tx.try_send((crate::mirror::tick(), changes)).is_ok() {
         pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     } else {
         note_drop();
@@ -52,6 +56,12 @@ fn queue_for_matching(
 /// Changes dropped because the matcher queue was full, since process start.
 pub(crate) fn changes_dropped() -> u64 {
     CHANGES_DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Groups dropped from a full delivery lane, since process start (T-4086).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn lane_drops() -> u64 {
+    LANE_DROPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Panics absorbed at the notification-task boundary, since process start.
@@ -78,9 +88,12 @@ async fn subs_for(
     tenant: &TenantId,
     types: &[&str],
     changed: &[&str],
+    queued: u64,
 ) -> Vec<Arc<Value>> {
     match &st.sub_mirror {
-        Some(m) => m.candidates(tenant.as_str(), types, changed),
+        Some(m) => m.candidates_before(tenant.as_str(), types, changed, queued),
+        // ponytail: the scan reads subscriptions as they are now, so a change
+        // drained late may reach one made after it; only the never-wired path.
         // The scan is the fallback, so its own failure may not be read as
         // "this tenant has no subscriptions" either: that is the silence
         // the mirror seed refuses to install.
@@ -197,7 +210,7 @@ pub(crate) async fn wire_matcher(state: &mut AppState) {
     // inline delivery at a time, so behind one slow subscriber an unbounded
     // queue grows until the process dies. Bounded instead: a full queue drops
     // the change and counts it.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<Change>>(CHANGE_QUEUE);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Vec<Change>)>(CHANGE_QUEUE);
     let flush_tx = tx.clone();
     let flush_pending = state.pending_changes.clone();
     state.change_flush = Some(Arc::new(move |changes: Vec<Change>| {
@@ -232,21 +245,27 @@ pub(crate) async fn wire_matcher(state: &mut AppState) {
     let st = state.clone();
     let pending = state.pending_changes.clone();
     crate::spawn_loop(async move {
-        while let Some(mut batch) = rx.recv().await {
-            let mut taken = 1;
+        while let Some((queued, first)) = rx.recv().await {
+            let mut batch: Vec<(u64, Change)> = first.into_iter().map(|c| (queued, c)).collect();
+            let mut taken: usize = 1;
             // everything already queued behind it rides the same pass
             while batch.len() < CHANGE_BATCH {
                 match rx.try_recv() {
-                    Ok(c) => {
-                        batch.extend(c);
-                        taken += 1;
+                    Ok((queued, c)) => {
+                        batch.extend(c.into_iter().map(|c| (queued, c)));
+                        taken = taken.saturating_add(1);
                     }
                     Err(_) => break,
                 }
             }
             let st = st.clone();
-            guarded(async move { process_changes(&st, batch).await }).await;
-            pending.fetch_sub(taken, std::sync::atomic::Ordering::SeqCst);
+            // The batch stays pending until its last group is delivered: the
+            // groups leave on their subscriptions' lanes, after this drain.
+            let done = Arc::new(BatchDone {
+                pending: pending.clone(),
+                taken,
+            });
+            guarded(async move { process_queued(&st, batch, Some(done)).await }).await;
         }
     });
     let st = state.clone();
@@ -545,7 +564,17 @@ fn sub_str<'a>(sub: &'a Value, key: &str) -> Option<&'a str> {
 /// one. The first pass that misses nothing is the answer. Every miss of a
 /// pass is fetched together, so the pass count is the depth of the link
 /// chain rather than the number of entities it touches.
-pub(crate) async fn linked_eval<F>(st: &AppState, tenant: &TenantId, mut eval: F) -> bool
+///
+/// `narrow` is the caller's narrowing (ADR-0020) with the @context its
+/// policy q is read against: a hop into an Entity it does not admit reads
+/// as a hop into a missing one, and a resolved target loses the Attributes
+/// its projection hides before the evaluator sees it (ADR-0023 rule 2).
+pub(crate) async fn linked_eval<F>(
+    st: &AppState,
+    tenant: &TenantId,
+    narrow: Option<(&crate::repr::Repr, &Context)>,
+    mut eval: F,
+) -> bool
 where
     F: for<'a> FnMut(antares_ql::eval::EntityLookup<'a>) -> bool,
 {
@@ -568,16 +597,245 @@ where
             return out;
         }
         for uri in missed {
-            let doc = st
+            let mut doc = st
                 .store
                 .get(tenant, Kind::Entity, &uri)
                 .await
                 .ok()
                 .flatten();
+            if let (Some(d), Some((r, ctx))) = (&doc, narrow) {
+                // boxed: the admission check evaluates the policy's own q,
+                // which comes back here
+                let admitted = Box::pin(crate::repr::policy_admits(
+                    st,
+                    tenant,
+                    ctx,
+                    r.policy_reach.as_deref(),
+                    d,
+                ))
+                .await;
+                doc = admitted.then(|| crate::repr::policy_view(d, r));
+            }
             cache.insert(uri, doc);
         }
     }
     eval(&|uri: &str| cache.get(uri).cloned().flatten())
+}
+
+/// What each Entity of a notification's `data` (and each one it embeds)
+/// shows under the expanded `rules`, read on its stored state now, names
+/// compacted the way `data` is. An Entity the store no longer holds, that
+/// `reach` does not admit, or that no rule holds for, maps to `None`.
+async fn shown_now(
+    st: &AppState,
+    tenant: &TenantId,
+    rules: &crate::policy::Filter,
+    reach: Option<&crate::repr::PolicyReach>,
+    data: &Value,
+    ctx: &Context,
+) -> HashMap<String, Option<crate::policy::Shown<'static>>> {
+    fn ids<'a>(v: &'a Value, out: &mut std::collections::BTreeSet<&'a str>) {
+        match v {
+            Value::Object(o) => {
+                if let (Some(id), Some(_)) = (o.get("id").and_then(Value::as_str), o.get("type")) {
+                    out.insert(id);
+                }
+                o.values().for_each(|v| ids(v, out));
+            }
+            Value::Array(a) => a.iter().for_each(|v| ids(v, out)),
+            _ => {}
+        }
+    }
+    let mut wanted = std::collections::BTreeSet::new();
+    ids(data, &mut wanted);
+    let mut out = HashMap::new();
+    for id in wanted {
+        let mut stored = st.store.get(tenant, Kind::Entity, id).await.ok().flatten();
+        if let (Some(d), Some(_)) = (&stored, reach) {
+            let ctx = crate::repr::policy_context();
+            if !crate::repr::policy_admits(st, tenant, ctx, reach, d).await {
+                stored = None;
+            }
+        }
+        let shown = stored
+            .and_then(|d| crate::repr::shown(Some(rules), &d))
+            .map(|s| s.map_names(|n| ctx.compact_iri(n)));
+        out.insert(id.to_owned(), shown);
+    }
+    out
+}
+
+/// The entry of `shown` for the Entity `e`; `None` when `e` is no Entity.
+fn entity_shown<'a>(
+    shown: &'a HashMap<String, Option<crate::policy::Shown<'static>>>,
+    e: &Value,
+) -> Option<Option<&'a crate::policy::Shown<'static>>> {
+    let id = e.get("id").and_then(Value::as_str)?;
+    Some(shown.get(id).and_then(Option::as_ref))
+}
+
+/// Strip a compacted notified Entity to what [`shown_now`] says it shows,
+/// and every Entity it embeds the same way: an embedded one no rule holds
+/// for is not embedded (ADR-0023 rule 6), its Relationship stays.
+fn project_shown(
+    shown: &HashMap<String, Option<crate::policy::Shown<'static>>>,
+    e: &mut Value,
+    key_values: bool,
+) {
+    let allowed = entity_shown(shown, e).flatten().cloned();
+    let Some(obj) = e.as_object_mut() else {
+        return;
+    };
+    let allowed = allowed.unwrap_or_else(crate::policy::Shown::nothing);
+    obj.retain(|k, _| k == "@context" || antares_model::is_meta(k) || allowed.allows(k));
+    for v in obj.values_mut() {
+        let instances: Vec<&mut Value> = match v {
+            Value::Array(a) => a.iter_mut().collect(),
+            other => vec![other],
+        };
+        for inst in instances {
+            if key_values {
+                if inst.get("id").is_some() && inst.get("type").is_some() {
+                    match entity_shown(shown, inst) {
+                        Some(Some(_)) => project_shown(shown, inst, key_values),
+                        _ => {
+                            let id = inst.get("id").cloned().unwrap_or(Value::Null);
+                            *inst = id;
+                        }
+                    }
+                }
+                continue;
+            }
+            let Some(o) = inst.as_object_mut() else {
+                continue;
+            };
+            if let Some(j) = o.get("entity") {
+                if matches!(entity_shown(shown, j), Some(Some(_))) {
+                    if let Some(j) = o.get_mut("entity") {
+                        project_shown(shown, j, key_values);
+                    }
+                } else {
+                    o.remove("entity");
+                }
+            }
+            if let Some(Value::Array(a)) = o.get_mut("entityList") {
+                a.retain(|j| matches!(entity_shown(shown, j), Some(Some(_))));
+                for j in a.iter_mut() {
+                    project_shown(shown, j, key_values);
+                }
+            }
+        }
+    }
+}
+
+/// ADR-0020: a narrowing reaches every document the answer carries, so the
+/// projection runs on each Entity `join=inline` embedded (4.5.23.2): under
+/// `entity`/`entityList` normalized, in place of the object URI simplified.
+fn project_joined(f: &crate::policy::Filter, e: &mut Value, key_values: bool) {
+    f.project(e);
+    let Some(obj) = e.as_object_mut() else {
+        return;
+    };
+    for v in obj.values_mut() {
+        let instances: Vec<&mut Value> = match v {
+            Value::Array(a) => a.iter_mut().collect(),
+            other => vec![other],
+        };
+        for inst in instances {
+            if key_values {
+                if inst.get("id").is_some() && inst.get("type").is_some() {
+                    project_joined(f, inst, key_values);
+                }
+                continue;
+            }
+            let Some(o) = inst.as_object_mut() else {
+                continue;
+            };
+            for m in ["entity", "entityList"] {
+                match o.get_mut(m) {
+                    Some(Value::Array(a)) => {
+                        for j in a {
+                            project_joined(f, j, key_values);
+                        }
+                    }
+                    Some(j @ Value::Object(_)) => project_joined(f, j, key_values),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// ADR-0023 rule 9: what a Subscription made through `view` sees of the
+/// changed Entity `doc` (internal form): the Attributes the view shows of it,
+/// the document with only those, and the view's narrowing for a linked
+/// condition to read targets through; `None` when the view does not select
+/// the Entity.
+#[cfg(feature = "views")]
+async fn view_sees(
+    st: &AppState,
+    tenant: &TenantId,
+    view: &crate::views::CompiledView,
+    doc: &Value,
+) -> Option<(crate::policy::Shown<'static>, Value, crate::repr::Repr)> {
+    let repr = crate::repr::narrowing(view.narrowing());
+    let ctx = crate::repr::policy_context();
+    if !crate::repr::policy_admits(st, tenant, ctx, repr.policy_reach.as_deref(), doc).await {
+        return None;
+    }
+    let shown = crate::repr::shown(repr.policy_types.as_deref(), doc)?.into_owned();
+    let seen = crate::repr::policy_view(doc, &repr);
+    Some((shown, seen, repr))
+}
+
+/// ADR-0023 rule 9 on a notification about to leave: each notified Entity,
+/// and each one it embeds, read under `view` on its stored state now; the
+/// ones the view does not select are dropped (embedded ones unembedded,
+/// rule 6), the rest keep the Attributes the view shows, `previousValue`
+/// included. `false` when no Entity is left to notify.
+#[cfg(feature = "views")]
+async fn view_project(
+    st: &AppState,
+    tenant: &TenantId,
+    sub: &Value,
+    view: &crate::views::CompiledView,
+    body: &mut Value,
+    ctx: &Context,
+) -> bool {
+    let repr = crate::repr::narrowing(view.narrowing());
+    let Some(rules) = repr.policy_types.as_deref() else {
+        return true;
+    };
+    let key_values = matches!(
+        sub.get("notification")
+            .and_then(|n| n.get("format"))
+            .and_then(Value::as_str),
+        Some("keyValues" | "simplified")
+    );
+    let shown = shown_now(
+        st,
+        tenant,
+        rules,
+        repr.policy_reach.as_deref(),
+        &body["data"],
+        ctx,
+    )
+    .await;
+    let Some(arr) = body.get_mut("data").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    arr.retain(|e| matches!(entity_shown(&shown, e), Some(Some(_))));
+    for e in arr.iter_mut() {
+        project_shown(&shown, e, key_values);
+    }
+    !arr.is_empty()
+}
+
+/// Whether the Subscription's q follows a Relationship (4.9
+/// LinkedEntityRelation).
+fn linked_condition(sub: &Value) -> bool {
+    sub_str(sub, "q")
+        .is_some_and(|q| antares_ql::regex::q_node(q).is_some_and(|n| n.has_linked_paths()))
 }
 
 pub(crate) use antares_matcher::{
@@ -788,8 +1046,8 @@ pub(crate) fn notif_shape(sub: &Value, ctx: &Context) -> NotifShape {
             let level = (n
                 .and_then(|n| n.get("joinLevel"))
                 .and_then(Value::as_u64)
-                .unwrap_or(1) as usize)
-                .min(crate::bounds::MAX_JOIN_LEVEL);
+                .map_or(1, |n| usize::try_from(n).unwrap_or(usize::MAX)))
+            .min(crate::bounds::MAX_JOIN_LEVEL);
             (j.to_owned(), level)
         });
     NotifShape {
@@ -863,24 +1121,12 @@ async fn build_data(
                     if gone.is_empty() {
                         continue;
                     }
-                    let attr_absent = doc.get(attr).is_none();
-                    let tss: Vec<Value> = if attr_absent {
-                        // whole attribute deleted at once: ONE tombstone,
-                        // no datasetId (046_22_08)
-                        let base = gone
-                            .iter()
-                            .find(|i| instance_ds(i).is_none())
-                            .unwrap_or(&gone[0]);
-                        let mut ts = tombstone(base, sys, show, now);
-                        if let Some(o) = ts.as_object_mut() {
-                            o.remove("datasetId");
-                        }
-                        vec![ts]
-                    } else {
-                        gone.iter()
-                            .map(|di| tombstone(di, sys, show, now))
-                            .collect()
-                    };
+                    // one tombstone per deleted instance, each with its
+                    // datasetId, deleteAll included (046_22_08)
+                    let tss: Vec<Value> = gone
+                        .iter()
+                        .map(|di| tombstone(di, sys, show, now))
+                        .collect();
                     let Some(target) = doc.as_object_mut() else {
                         continue;
                     };
@@ -946,7 +1192,7 @@ async fn build_data(
         Some((mode, level)) if mode == "flat" => {
             let main_id = internal.get("id").and_then(Value::as_str).unwrap_or("");
             let mut linked = std::collections::BTreeMap::new();
-            crate::repr::collect_flat(st, tenant, &shape.repr, &internal, *level, &mut linked)
+            crate::repr::collect_flat(st, tenant, ctx, &shape.repr, &internal, *level, &mut linked)
                 .await;
             data.push(main);
             for (id, (ldoc, lrepr)) in linked {
@@ -1020,6 +1266,24 @@ pub async fn process_change(
 /// travels in one notification, so a batch of N entities is one POST with N
 /// data entries (and timesSent moves by one), never N POSTs.
 pub(crate) async fn process_changes(st: &AppState, changes: Vec<Change>) {
+    process_queued(
+        st,
+        changes.into_iter().map(|c| (u64::MAX, c)).collect(),
+        None,
+    )
+    .await;
+}
+
+/// [`process_changes`] of changes each stamped with the [`crate::mirror::tick`]
+/// they were queued at.
+///
+/// With `done` (the matcher queue's drain), each group is handed to its
+/// subscription's lane and the drain goes on to the next batch: a slow or
+/// dead endpoint holds its own lane, never the matching of every other
+/// change (T-4086). `done` falls when the last group of the batch has left.
+/// Without it (a bus event, a direct call), the groups are delivered before
+/// this returns.
+async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>, done: Option<Arc<BatchDone>>) {
     let mut groups: Vec<Matched> = Vec::new();
     // (tenant, subscription id) → its group. A scan for the group would be
     // linear in the subscriptions already matched, and a drain of
@@ -1029,8 +1293,19 @@ pub(crate) async fn process_changes(st: &AppState, changes: Vec<Change>) {
     let mut index: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
     let mut ctx_memo = CtxMemo::new();
-    for (tenant_str, before, after) in changes {
-        for m in matches_for(st, &tenant_str, before, after, &mut ctx_memo).await {
+    for (queued, (tenant_str, before, after)) in changes {
+        let matched = matches_for(st, &tenant_str, before, after, queued, &mut ctx_memo);
+        #[cfg(not(target_arch = "wasm32"))]
+        let matched = match tokio::time::timeout(STEP_DEADLINE, matched).await {
+            Ok(m) => m,
+            Err(_) => {
+                note_stall("match", &tenant_str, "");
+                continue;
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        let matched = matched.await;
+        for m in matched {
             let key = (
                 m.tenant.as_str().to_owned(),
                 m.sub
@@ -1040,7 +1315,11 @@ pub(crate) async fn process_changes(st: &AppState, changes: Vec<Change>) {
                     .to_owned(),
             );
             match index.get(&key) {
-                Some(&i) => groups[i].data.extend(m.data),
+                Some(&i) => {
+                    if let Some(group) = groups.get_mut(i) {
+                        group.data.extend(m.data);
+                    }
+                }
                 None => {
                     index.insert(key, groups.len());
                     groups.push(m);
@@ -1049,8 +1328,16 @@ pub(crate) async fn process_changes(st: &AppState, changes: Vec<Change>) {
         }
     }
     // Groups are distinct subscriptions, so they leave concurrently; a
-    // subscription's changes in this drain are already one group, and the
-    // next drain starts only after this one, so per-subscription order holds.
+    // subscription's changes in this drain are already one group. On a lane
+    // its groups leave in drain order; awaited, the next pass starts only
+    // after this one. Either way per-subscription order holds.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(done) = done {
+        for g in groups {
+            to_lane(st, g, &done);
+        }
+        return;
+    }
     // Each group is its own task: a group's bookkeeping reads and writes
     // await the store, and one task's `for_each_concurrent` would still put
     // every group's round-trips on a single task's poll budget.
@@ -1059,10 +1346,7 @@ pub(crate) async fn process_changes(st: &AppState, changes: Vec<Change>) {
         let mut set = tokio::task::JoinSet::new();
         for g in groups {
             let st = st.clone();
-            set.spawn(async move {
-                let _permits = delivery_permits(&g.tenant).await;
-                deliver(&st, &g.tenant, &g.sub, g.data, &g.ctx).await;
-            });
+            set.spawn(async move { deliver_group(&st, g).await });
         }
         while let Some(joined) = set.join_next().await {
             if joined.is_err() {
@@ -1072,6 +1356,7 @@ pub(crate) async fn process_changes(st: &AppState, changes: Vec<Change>) {
     }
     #[cfg(target_arch = "wasm32")]
     {
+        drop(done);
         use futures_util::StreamExt;
         futures_util::stream::iter(groups)
             .for_each_concurrent(*DELIVERY_WIDTH, |g| async move {
@@ -1081,10 +1366,208 @@ pub(crate) async fn process_changes(st: &AppState, changes: Vec<Change>) {
     }
 }
 
+/// One group out: the delivery permits, then the delivery, each bounded by
+/// [`STEP_DEADLINE`].
+#[cfg(not(target_arch = "wasm32"))]
+async fn deliver_group(st: &AppState, g: Matched) {
+    let id = g.sub.get("id").and_then(Value::as_str).unwrap_or_default();
+    let Ok(_permits) = tokio::time::timeout(STEP_DEADLINE, delivery_permits(&g.tenant)).await
+    else {
+        note_stall("permits", g.tenant.as_str(), id);
+        return;
+    };
+    let delivered = deliver(st, &g.tenant, &g.sub, g.data, &g.ctx);
+    if tokio::time::timeout(STEP_DEADLINE, delivered)
+        .await
+        .is_err()
+    {
+        note_stall("deliver", g.tenant.as_str(), id);
+    }
+}
+
+/// A drained batch still owed to its subscribers: while any of its groups
+/// waits on a lane, the batch counts as pending, so a shutdown drain that
+/// waits for zero closes the pool only after the last delivery.
+pub(crate) struct BatchDone {
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    taken: usize,
+}
+
+impl Drop for BatchDone {
+    fn drop(&mut self) {
+        self.pending
+            .fetch_sub(self.taken, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// One group waiting on its subscription's lane, holding its batch pending.
+#[cfg(not(target_arch = "wasm32"))]
+struct LaneJob {
+    st: AppState,
+    group: Matched,
+    _batch: Arc<BatchDone>,
+}
+
+/// (tenant, subscription id) → the lane its groups wait on. An entry lives
+/// while its lane has work: the lane's task removes it when it finds the
+/// lane empty, under this lock, so a group is never sent to a lane nobody
+/// serves.
+#[cfg(not(target_arch = "wasm32"))]
+type Lanes = std::sync::Mutex<HashMap<(String, String), tokio::sync::mpsc::Sender<LaneJob>>>;
+#[cfg(not(target_arch = "wasm32"))]
+static LANES: std::sync::LazyLock<Lanes> = std::sync::LazyLock::new(Lanes::default);
+
+/// Hand one group to its subscription's lane, opening the lane when there is
+/// none. A full lane drops the group for that subscription alone, counted
+/// and named (T-4086): the drain never waits for a subscriber.
+#[cfg(not(target_arch = "wasm32"))]
+fn to_lane(st: &AppState, group: Matched, batch: &Arc<BatchDone>) {
+    use tokio::sync::mpsc::error::TrySendError;
+    let key = (
+        group.tenant.as_str().to_owned(),
+        group
+            .sub
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    );
+    let job = LaneJob {
+        st: st.clone(),
+        group,
+        _batch: batch.clone(),
+    };
+    // A poisoned map is a panic in some past hand-off; what it holds is
+    // senders, rebuilt on the next group either way.
+    let mut lanes = LANES.lock().unwrap_or_else(|p| p.into_inner());
+    let job = match lanes.get(&key) {
+        Some(lane) => match lane.try_send(job) {
+            Ok(()) => return,
+            Err(TrySendError::Full(job)) => {
+                note_lane_drop(&key, job.group.data.len());
+                return;
+            }
+            // its task is gone (a panic past the guard): open a new lane
+            Err(TrySendError::Closed(job)) => job,
+        },
+        None => job,
+    };
+    let (lane, rx) = tokio::sync::mpsc::channel(DELIVERY_LANE);
+    if lane.try_send(job).is_err() {
+        // a fresh channel always has room; nothing to serve otherwise
+        return;
+    }
+    lanes.insert(key.clone(), lane);
+    drop(lanes);
+    tokio::spawn(run_lane(key, rx));
+}
+
+/// Serve one subscription's lane in order until it is empty, then retire it.
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_lane(key: (String, String), mut rx: tokio::sync::mpsc::Receiver<LaneJob>) {
+    // a group the last fold had no room for leads the next notification
+    let mut carry = None;
+    loop {
+        let job = match carry.take().map_or_else(|| rx.try_recv().ok(), Some) {
+            Some(job) => job,
+            None => {
+                // Looked at again under the map's lock, which every sender
+                // holds while it sends: a group cannot arrive between this
+                // look and the removal.
+                let mut lanes = LANES.lock().unwrap_or_else(|p| p.into_inner());
+                match rx.try_recv() {
+                    Ok(job) => job,
+                    Err(_) => {
+                        lanes.remove(&key);
+                        return;
+                    }
+                }
+            }
+        };
+        let (st, group, batches, rest) = fold(job, &mut rx);
+        carry = rest;
+        guarded(async move { deliver_group(&st, group).await }).await;
+        drop(batches);
+    }
+}
+
+/// What waits behind `job` on its lane leaves in the same notification, as
+/// a drain folds one subscription's changes into one group: a lane keeps up
+/// by sending fewer, larger notifications, not by queueing one per change.
+/// The fold stops before a group that would take the notification past
+/// [`CHANGE_BATCH`] entities and hands that group back, so a backed-up lane
+/// sends several bounded POSTs, never its whole depth in one. The newest
+/// group carries the subscription as it reads now; the batches stay pending
+/// until the delivery ends.
+#[cfg(not(target_arch = "wasm32"))]
+fn fold(
+    job: LaneJob,
+    rx: &mut tokio::sync::mpsc::Receiver<LaneJob>,
+) -> (AppState, Matched, Vec<Arc<BatchDone>>, Option<LaneJob>) {
+    let LaneJob {
+        st,
+        mut group,
+        _batch,
+    } = job;
+    let mut batches = vec![_batch];
+    while let Ok(next) = rx.try_recv() {
+        if group.data.len().saturating_add(next.group.data.len()) > CHANGE_BATCH {
+            return (st, group, batches, Some(next));
+        }
+        let mut data = std::mem::take(&mut group.data);
+        data.extend(next.group.data);
+        group = Matched { data, ..next.group };
+        batches.push(next._batch);
+    }
+    (st, group, batches, None)
+}
+
+/// Groups a full lane refused: counted by entity, and named by tenant and
+/// subscription in the log, so an operator can tell which subscriber fell
+/// behind and lost changes (T-4086).
+#[cfg(not(target_arch = "wasm32"))]
+fn note_lane_drop(key: &(String, String), entities: usize) {
+    let n = LANE_DROPS
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    metrics::counter!("antares_notification_lane_dropped_total").increment(entities as u64);
+    if n == 1 || n.is_multiple_of(100) {
+        tracing::warn!(
+            "subscription {} of tenant {} is slower than its changes: {entities} entities dropped from its delivery lane ({n} groups so far, all subscriptions)",
+            key.1,
+            key.0
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static LANE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long one step of a drain may take: matching one change, waiting for
+/// one group's delivery permits, or that delivery. A drain waits for all of
+/// its groups and the next drain for it, so a step that never ends stops
+/// notifications for every Subscription of the process (T-4102). A send is
+/// at most 30 s (`endpoint_timeout_ms`), so a live step stays well inside.
+#[cfg(not(target_arch = "wasm32"))]
+const STEP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A step abandoned at [`STEP_DEADLINE`]: counted and named, so the wait
+/// that never ended is in the log.
+#[cfg(not(target_arch = "wasm32"))]
+fn note_stall(step: &'static str, tenant: &str, sub: &str) {
+    metrics::counter!("antares_notification_stalls_total", "step" => step).increment(1);
+    tracing::warn!(
+        "notification step {step} abandoned after {}s (tenant {tenant}, subscription {sub}); the drain goes on",
+        STEP_DEADLINE.as_secs()
+    );
+}
+
 /// A change the full queue refused: counted, and said once per thousand so
 /// a 40 % delivery gap is visible in the log and not only on the counter.
 fn note_drop() {
-    let n = CHANGES_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let n = CHANGES_DROPPED
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
     metrics::counter!("antares_notification_changes_dropped_total").increment(1);
     if n == 1 || n.is_multiple_of(1000) {
         tracing::warn!("notification change queue full: {n} changes dropped so far (delivery slower than the write rate)");
@@ -1134,6 +1617,7 @@ async fn matches_for(
     tenant_str: &str,
     before: Option<Value>,
     after: Option<Value>,
+    queued: u64,
     ctx_memo: &mut CtxMemo,
 ) -> Vec<Matched> {
     let mut out = Vec::new();
@@ -1158,21 +1642,49 @@ async fn matches_for(
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
     let changed_keys: Vec<&str> = changes.iter().map(|(k, _)| k.as_str()).collect();
-    let subs = subs_for(st, &tenant, &types, &changed_keys).await;
+    let subs = subs_for(st, &tenant, &types, &changed_keys, queued).await;
     for sub in subs {
         if !is_active(&sub) || sub.get("timeInterval").is_some() {
             continue;
         }
+        // ADR-0023 rule 9: a Subscription made through a view matches what
+        // the view shows of the Entity now: its conditions read only the
+        // shown Attributes (rule 2), and a change to hidden ones alone is no
+        // change at all, so its timing does not leak.
+        #[cfg(feature = "views")]
+        let seen = match crate::views::of_subscription(st, &tenant, &sub) {
+            None => None,
+            Some(None) => continue,
+            Some(Some(view)) => match view_sees(st, &tenant, &view, eval_doc).await {
+                Some(seen) => Some(seen),
+                None => continue,
+            },
+        };
+        #[cfg(feature = "views")]
+        let (eval_doc, narrow) = match &seen {
+            Some((_, doc, repr)) => (doc, Some((repr, crate::repr::policy_context()))),
+            None => (eval_doc, None),
+        };
+        #[cfg(not(feature = "views"))]
+        let narrow = None;
         let triggers = triggers_of(&sub);
         // which attribute-level changes this sub cares about
         let watched: Option<Vec<&str>> = sub
             .get("watchedAttributes")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect());
-        let relevant: Vec<&(String, ChangeClass)> = changes
+        #[cfg_attr(not(feature = "views"), expect(unused_mut))]
+        let mut relevant: Vec<&(String, ChangeClass)> = changes
             .iter()
             .filter(|(k, _)| watched.as_ref().is_none_or(|w| w.contains(&k.as_str())))
             .collect();
+        #[cfg(feature = "views")]
+        if let Some((shown, _, _)) = &seen {
+            relevant.retain(|(k, _)| shown.allows(k));
+            if relevant.is_empty() {
+                continue;
+            }
+        }
         let attr_trigger_fired = relevant.iter().any(|(_, c)| {
             let t = match c {
                 ChangeClass::Created => "attributeCreated",
@@ -1190,7 +1702,11 @@ async fn matches_for(
         if !selector_match(&sub, eval_doc, &ctx) {
             continue;
         }
-        if !linked_eval(st, &tenant, |l| conditions_match(&sub, eval_doc, &ctx, l)).await {
+        if !linked_eval(st, &tenant, narrow, |l| {
+            conditions_match(&sub, eval_doc, &ctx, l)
+        })
+        .await
+        {
             continue;
         }
         if throttled(&sub) {
@@ -1464,6 +1980,12 @@ pub async fn interval_tick(st: &AppState) {
             } else {
                 None
             };
+            // a stored q that no longer parses (one percent-encoded before
+            // 5.2.12's read-as-written) matches nothing, as conditions_match
+            // decides: no Entity to read and no Notification to send
+            if sub_str(&sub, "q").is_some_and(|q| antares_ql::regex::q_node(q).is_none()) {
+                continue;
+            }
             let ctx = sub_context(st, &tenant, &sub).await;
             let now = now_iso();
             // 5.8.6: the periodic Notification "shall include all the
@@ -1487,12 +2009,10 @@ pub async fn interval_tick(st: &AppState) {
             let rows = {
                 let expand = |t: &str| ctx.expand_key(t);
                 let id_refs: Vec<&str> = ids.iter().flatten().map(String::as_str).collect();
-                // q values in subscription bodies may be percent-encoded (4.9);
-                // parses shared per distinct expression text, as in
-                // conditions_match — the sweep re-runs per due subscription
-                let q_ast = sub_str(&sub, "q").and_then(|q| {
-                    antares_ql::regex::q_node(&crate::negotiate::percent_decode(q.as_bytes()))
-                });
+                // q is read as written (5.2.12); parses shared per distinct
+                // expression text, as in conditions_match — the sweep
+                // re-runs per due subscription
+                let q_ast = sub_str(&sub, "q").and_then(antares_ql::regex::q_node);
                 let geo = sub.get("geoQ").and_then(Value::as_object).and_then(|g| {
                     let key = serde_json::to_string(g).unwrap_or_default();
                     antares_ql::regex::geo_query(&key, || {
@@ -1507,7 +2027,7 @@ pub async fn interval_tick(st: &AppState) {
                     types: (!type_groups.is_empty()).then_some(type_groups.as_slice()),
                     q: q_ast.as_deref(),
                     scope_q: sub_str(&sub, "scopeQ"),
-                    geo: geo_spec.as_ref(),
+                    geo: geo_spec.as_slice(),
                     expand: &expand,
                     ..Default::default()
                 };
@@ -1522,7 +2042,8 @@ pub async fn interval_tick(st: &AppState) {
             let mut matching: Vec<Value> = Vec::new();
             for d in rows {
                 if !selector_match(&sub, &d, &ctx)
-                    || !linked_eval(st, &tenant, |l| conditions_match(&sub, &d, &ctx, l)).await
+                    || !linked_eval(st, &tenant, None, |l| conditions_match(&sub, &d, &ctx, l))
+                        .await
                 {
                     continue;
                 }
@@ -1632,7 +2153,7 @@ pub async fn interval_tick(st: &AppState) {
         if sweep_csubs {
             let _ = m.next_csub_sweep_ms.compare_exchange(
                 csub_clock,
-                next_csub.min(now_ms + CSUB_SWEEP_BACKSTOP_MS),
+                next_csub.min(now_ms.saturating_add(CSUB_SWEEP_BACKSTOP_MS)),
                 Relaxed,
                 Relaxed,
             );
@@ -1674,9 +2195,9 @@ fn chunk_by_bytes(data: Vec<Value>, cap: usize) -> Vec<Vec<Value>> {
     for item in data {
         let n = serde_json::to_vec(&item).map(|b| b.len()).unwrap_or(0);
         match out.last_mut() {
-            Some(run) if size + n <= cap => {
+            Some(run) if size.saturating_add(n) <= cap => {
                 run.push(item);
-                size += n;
+                size = size.saturating_add(n);
             }
             _ => {
                 out.push(vec![item]);
@@ -2043,8 +2564,10 @@ async fn deliver_as(
     // either. `is_open` returning false IS the half-open probe, so the
     // check stays exactly once per attempt.
     // A binding that opens no socket has no destination for the policy or
-    // the breaker to judge; every network binding is policed below.
-    let policed = st.sinks.sink_for_uri(uri).is_some_and(|s| s.network());
+    // the breaker to judge, nor has a delivery the forward transport makes
+    // in process; every other network binding is policed below.
+    let policed =
+        in_process(st, uri).is_none() && st.sinks.sink_for_uri(uri).is_some_and(|s| s.network());
     if policed && st.egress.is_open(tenant.as_str(), uri) {
         tracing::debug!(
             "notification to {} short-circuited (breaker open)",
@@ -2064,8 +2587,8 @@ async fn deliver_as(
         "notifiedAt": now,
         "data": data,
     });
-    if let Some(r) = trigger_reason {
-        body["triggerReason"] = Value::String(r.into());
+    if let (Some(r), Some(body)) = (trigger_reason, body.as_object_mut()) {
+        body.insert("triggerReason".into(), Value::String(r.into()));
     }
     // ADR-0020: the engine sees the notification the broker means to send,
     // before it is encoded — the data entities are still the 5.2.14.1
@@ -2095,20 +2618,78 @@ async fn deliver_as(
             crate::policy::NotifyDecision::Filter(f) => {
                 // a condition the notification path cannot re-run is not a
                 // narrowing it can claim to have applied
-                if f.q.is_some() || f.scope_q.is_some() {
+                if f.q.is_some() || f.scope_q.is_some() || f.areas().next().is_some() {
                     tracing::error!(
                         "policy engine {} narrowed a notification with a query; dropping it",
                         engine.name()
                     );
                     return;
                 }
+                // a linked condition already read the target unprojected
+                // (T-3474): the narrowing came too late to apply to it
+                if (!f.omit.is_empty() || !f.pick.is_empty() || f.has_rules())
+                    && linked_condition(sub)
+                {
+                    tracing::debug!(
+                        "subscription {sub_id} has a linked q under a projecting narrowing; dropping"
+                    );
+                    return;
+                }
+                let rules = crate::repr::type_rules(&f).filter(|r| !r.rules.is_empty());
                 let f = crate::repr::compacted_filter(&f, ctx);
+                let n = sub.get("notification");
+                let key_values = matches!(
+                    n.and_then(|n| n.get("format")).and_then(Value::as_str),
+                    Some("keyValues" | "simplified")
+                );
                 if let Some(arr) = body.get_mut("data").and_then(Value::as_array_mut) {
                     for e in arr.iter_mut() {
-                        f.project(e);
+                        project_joined(&f, e, key_values);
+                    }
+                }
+                // ADR-0023 rule 11: the rules read each Entity's stored state
+                // now, so one that left zone A carries no `speed`, nor a
+                // `previousValue` of it, and one no rule holds for is not
+                // notified at all
+                if let Some(rules) = rules {
+                    let shown = shown_now(
+                        st,
+                        tenant,
+                        &rules,
+                        None,
+                        body.get("data").unwrap_or(&Value::Null),
+                        ctx,
+                    )
+                    .await;
+                    if let Some(arr) = body.get_mut("data").and_then(Value::as_array_mut) {
+                        arr.retain(|e| matches!(entity_shown(&shown, e), Some(Some(_))));
+                        for e in arr.iter_mut() {
+                            project_shown(&shown, e, key_values);
+                        }
+                        if arr.is_empty() {
+                            tracing::debug!(
+                                "subscription {sub_id}: no notified Entity is in the narrowing now; dropping"
+                            );
+                            return;
+                        }
                     }
                 }
             }
+        }
+    }
+    // ADR-0023 rule 9: a Subscription made through a view is delivered
+    // under the view as the table serves it now, before the bookkeeping
+    // below: a removed view sends nothing, and an Entity the view no longer
+    // selects is not notified.
+    #[cfg(feature = "views")]
+    if let Some(view) = crate::views::of_subscription(st, tenant, sub) {
+        let Some(view) = view else {
+            tracing::debug!("subscription {sub_id}: its view is gone; dropping");
+            return;
+        };
+        if !view_project(st, tenant, sub, &view, &mut body, ctx).await {
+            tracing::debug!("subscription {sub_id}: no notified Entity is in its view; dropping");
+            return;
         }
     }
     // 5.8.6: a subscription's ngsildConformance pins the notification format —
@@ -2142,12 +2723,18 @@ async fn deliver_as(
                         && kv.get("value").and_then(Value::as_str) == Some("body=json")
                 })
             });
-        let entities = body["data"].as_array().cloned().unwrap_or_default();
+        let entities = body
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let mut fc = crate::repr::to_geojson_collection(entities, None);
-        if !prefer_body_json {
-            fc["@context"] = crate::negotiate::served_context(ctx);
+        if let (false, Some(fc)) = (prefer_body_json, fc.as_object_mut()) {
+            fc.insert("@context".into(), crate::negotiate::served_context(ctx));
         }
-        body["data"] = fc;
+        if let Some(body) = body.as_object_mut() {
+            body.insert("data".into(), fc);
+        }
     }
     let receiver_info = kv_pairs(ep.get("receiverInfo"));
 
@@ -2231,7 +2818,7 @@ async fn deliver_as(
     let first = if refused {
         Err((false, "refused by egress policy".to_owned()))
     } else {
-        send_outbound(st, uri, timeout_ms, &outbound).await
+        send_outbound(st, tenant, uri, timeout_ms, &outbound).await
     };
     let (ok, timed_out) = match &first {
         Ok(()) => (true, false),
@@ -2286,7 +2873,7 @@ async fn deliver_as(
                     // when delivering the notification" — an output-only
                     // member implementations shall generate.
                     let failed = n.get("timesFailed").and_then(Value::as_i64).unwrap_or(0);
-                    n.insert("timesFailed".into(), json!(failed + 1));
+                    n.insert("timesFailed".into(), json!(failed.saturating_add(1)));
                     n.insert("status".into(), Value::String("failed".into()));
                 }
                 failed_doc = Some(doc.clone());
@@ -2348,15 +2935,30 @@ fn strip_reserved_markers(info: &mut Vec<(String, String)>) {
     });
 }
 
+/// The forward transport, when it delivers the notifications sent to `uri`
+/// in process (ADR-0025 rule 7).
+fn in_process<'a>(st: &'a AppState, uri: &str) -> Option<&'a Arc<dyn crate::ForwardTransport>> {
+    st.forward_transport.get().filter(|t| t.notifies(uri))
+}
+
 /// One attempt on the wire, through the binding the registry holds for the
-/// endpoint's scheme (6.3.8). `Err((timed_out, why))`: only a timeout-class
-/// failure feeds the breaker — an endpoint that answers is alive.
+/// endpoint's scheme (6.3.8), or in process when the forward transport
+/// takes the endpoint (ADR-0025 rule 7), on every attempt, retries and
+/// replays included. `Err((timed_out, why))`: only a timeout-class failure
+/// feeds the breaker — an endpoint that answers is alive.
 async fn send_outbound(
     st: &AppState,
+    tenant: &TenantId,
     uri: &str,
     timeout_ms: u32,
     outbound: &Outbound,
 ) -> Result<(), (bool, String)> {
+    if let Some(transport) = in_process(st, uri) {
+        return transport
+            .notify(tenant, uri, &outbound.body)
+            .await
+            .map_err(|e| (false, e));
+    }
     let Some(sink) = st.sinks.sink_for_uri(uri) else {
         return Err((
             false,
@@ -2417,8 +3019,8 @@ async fn retry_and_settle(
         {
             return;
         }
-        made += 1;
-        match send_outbound(st, uri, timeout_ms, &outbound).await {
+        made = made.saturating_add(1);
+        match send_outbound(st, tenant, uri, timeout_ms, &outbound).await {
             Ok(()) => {
                 st.egress.record_success(tenant.as_str(), uri);
                 metrics::counter!("antares_notifications_retried_total", "outcome" => "ok")
@@ -2463,7 +3065,11 @@ async fn retry_and_settle(
     let letter = dead_letter(
         sub_id, uri, timeout_ms, &outbound, made, &first_err, &last_err, &first_at,
     );
-    let id = letter["id"].as_str().unwrap_or_default().to_owned();
+    let id = letter
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     match st.store.create(tenant, Kind::DeadLetter, &id, letter).await {
         Ok(_) => {
             DEAD_LETTERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2477,7 +3083,9 @@ async fn retry_and_settle(
 }
 
 /// The dead-letter document: everything a replay needs to send the very
-/// same request again, plus the attempt history.
+/// same request again, plus the attempt history. Written by the native
+/// retry loop (`retry_and_settle`) alone.
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)] // one param per stored letter member
 fn dead_letter(
     sub_id: &str,
@@ -2489,7 +3097,7 @@ fn dead_letter(
     last_err: &str,
     first_at: &str,
 ) -> Value {
-    let mut doc = json!({
+    json!({
         "id": format!("urn:ngsi-ld:DeadLetter:{}", uuid::Uuid::new_v4()),
         "type": "DeadLetter",
         "subscriptionId": sub_id,
@@ -2500,30 +3108,42 @@ fn dead_letter(
         "lastError": last_err,
         "firstAt": first_at,
         "lastAt": now_iso(),
-    });
-    doc["binding"] = json!(antares_notifier::SinkRegistry::scheme_of(uri));
-    doc["payload"] = outbound.body.clone();
-    doc["accept"] = json!(outbound.accept);
-    doc["link"] = json!(outbound.link);
-    doc["receiverInfo"] = json!(outbound.receiver_info);
-    doc["notifierInfo"] = json!(outbound.notifier_info);
-    doc
+        "binding": antares_notifier::SinkRegistry::scheme_of(uri),
+        "payload": outbound.body.clone(),
+        "accept": outbound.accept,
+        "link": outbound.link,
+        "receiverInfo": outbound.receiver_info,
+        "notifierInfo": outbound.notifier_info,
+    })
+}
+
+/// The deadline a dead letter was written with. It is read back from
+/// storage, so a value past u32 caps at the 30 s ceiling of
+/// [`endpoint_timeout_ms`] instead of wrapping to a short deadline.
+fn letter_timeout_ms(letter: &Value) -> u32 {
+    letter["timeoutMs"]
+        .as_u64()
+        .map_or(5_000, |t| u32::try_from(t.min(30_000)).unwrap_or(30_000))
 }
 
 /// Replay one dead letter through the same binding, once. `Ok` = delivered
 /// (the caller deletes the letter); `Err` carries the failure text.
-pub(crate) async fn replay_dead_letter(st: &AppState, letter: &Value) -> Result<(), String> {
+pub(crate) async fn replay_dead_letter(
+    st: &AppState,
+    tenant: &TenantId,
+    letter: &Value,
+) -> Result<(), String> {
     let uri = letter["uri"].as_str().ok_or("dead letter without uri")?;
-    let timeout_ms = letter["timeoutMs"].as_u64().unwrap_or(5_000) as u32;
+    let timeout_ms = letter_timeout_ms(letter);
     let outbound = Outbound::from_dead_letter(letter)?;
     // the egress policy of the moment applies, exactly as for a fresh send
-    if st.sinks.sink_for_uri(uri).is_some_and(|s| s.network()) {
+    if in_process(st, uri).is_none() && st.sinks.sink_for_uri(uri).is_some_and(|s| s.network()) {
         st.egress
             .check_destination(uri)
             .await
             .map_err(|e| e.to_string())?;
     }
-    send_outbound(st, uri, timeout_ms, &outbound)
+    send_outbound(st, tenant, uri, timeout_ms, &outbound)
         .await
         .map_err(|(_, e)| e)
 }
@@ -3017,6 +3637,18 @@ mod change_pipeline {
         );
     }
 
+    /// T-3531: a stored deadline past u32 caps instead of wrapping.
+    #[test]
+    fn a_dead_letter_deadline_caps_instead_of_wrapping() {
+        use serde_json::json;
+        assert_eq!(letter_timeout_ms(&json!({})), 5_000);
+        assert_eq!(letter_timeout_ms(&json!({"timeoutMs": 2_000})), 2_000);
+        assert_eq!(
+            letter_timeout_ms(&json!({"timeoutMs": 4_294_967_396u64})),
+            30_000
+        );
+    }
+
     /// 5.8.6: a matching change notifies, and a panic around ONE change must
     /// not end notification delivery for the process — the NEXT change still
     /// notifies. The lock poisoning here used to make the matcher itself
@@ -3062,21 +3694,60 @@ mod change_pipeline {
         );
     }
 
-    /// The matcher queue is bounded: behind a stalled subscriber the excess
-    /// changes are dropped and counted instead of growing without limit.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn overflowing_change_queue_drops_and_counts() {
-        // stages a race between producer and a parked consumer; under a
-        // sanitizer's slowdown the producer never outruns the queue
-        // (same for the file store: fsync per create is slower than the drain)
-        if std::env::var_os("ANTARES_TEST_SANITIZER").is_some()
-            || std::env::var("ANTARES_TEST_STORE").is_ok_and(|s| s == "file")
-        {
-            return;
+    /// T-4086: a backed-up lane folds into notifications of at most
+    /// CHANGE_BATCH entities; a group that does not fit leads the next one,
+    /// and a single group larger than that still leaves whole.
+    #[tokio::test]
+    async fn lane_fold_stops_at_change_batch() {
+        let st = AppState::new("antares-lane-fold".into());
+        let pending: Arc<AtomicUsize> = Arc::default();
+        let job = |n: usize| {
+            pending.fetch_add(1, Ordering::SeqCst);
+            LaneJob {
+                st: st.clone(),
+                group: Matched {
+                    tenant: TenantId::new("default").expect("tenant"),
+                    sub: Arc::new(json!({"id": "urn:ngsi-ld:Subscription:fold"})),
+                    ctx: antares_jsonld::Loader::new().core(),
+                    data: vec![json!({}); n],
+                },
+                _batch: Arc::new(BatchDone {
+                    pending: pending.clone(),
+                    taken: 1,
+                }),
+            }
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(DELIVERY_LANE);
+        for n in [100, 100, 100, CHANGE_BATCH + 1, 1] {
+            assert!(tx.try_send(job(n)).is_ok(), "lane has room");
         }
+        let mut sizes = Vec::new();
+        let mut next = rx.try_recv().ok();
+        while let Some(first) = next {
+            let (_, group, batches, rest) = fold(first, &mut rx);
+            sizes.push((group.data.len(), batches.len()));
+            next = rest.or_else(|| rx.try_recv().ok());
+        }
+        assert_eq!(
+            sizes,
+            [(200, 2), (100, 1), (CHANGE_BATCH + 1, 1), (1, 1)],
+            "folds stop before CHANGE_BATCH; an oversized group leaves alone"
+        );
+        assert_eq!(pending.load(Ordering::SeqCst), 0, "every batch released");
+    }
+
+    /// T-4086: behind a subscriber that never answers, a burst of a whole
+    /// matcher queue reaches a healthy subscriber in full. The stalled one
+    /// backs up its own lane, which drops and counts; the matcher queue,
+    /// shared by every subscription, drops nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stalled_subscriber_costs_only_its_own_lane() {
+        // the file store's fsync per create is slower than a 5 s stall frees
+        // lane room, so its lane never fills; the healthy half still runs
+        let file_store = std::env::var("ANTARES_TEST_STORE").is_ok_and(|s| s == "file");
         crate::allow_private();
-        // accepts, reads nothing, never answers — the serial consumer parks
-        // on the first delivery for the endpoint's whole timeout
+        // accepts, reads nothing, never answers: every delivery waits out the
+        // outbound client's timeout
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         std::thread::spawn(move || {
@@ -3085,28 +3756,60 @@ mod change_pipeline {
                 held.push(s);
             }
         });
-        let mut st = AppState::new("antares-queue-bound".into());
-        crate::wire(&mut st).await;
-        // the stall is bounded by the outbound client's own 5 s timeout, not
-        // by endpoint.timeout: after each timeout the consumer frees another
-        // CHANGE_BATCH slots, and on a slow runner a single-queue-depth loop
-        // fits inside that window and never overflows (seen in CI). Produce
-        // several queue depths and stop at the first counted drop — the
-        // producer only has to outpace the drain, not beat one window.
-        subscribe(&st, "staller", &format!("http://{addr}/notify"), 30_000).await;
-        let before = changes_dropped();
-        for n in 0..(4 * CHANGE_QUEUE) {
-            assert_eq!(create_vehicle(&st, 1_000 + n).await, 201);
-            if changes_dropped() > before {
-                break;
-            }
-        }
-        assert!(
-            changes_dropped() > before,
-            "a full matcher queue must drop and count, not grow (dropped {} → {})",
-            before,
-            changes_dropped()
+        // an endpoint that answers at once and keeps every entity id it got
+        let seen: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Arc::default();
+        let got = seen.clone();
+        let healthy = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let healthy_addr = healthy.local_addr().expect("addr");
+        let app = axum::Router::new().route(
+            "/notify",
+            axum::routing::post(move |body: axum::Json<Value>| {
+                let got = got.clone();
+                async move {
+                    let mut got = got.lock().expect("ids");
+                    for e in body.0["data"].as_array().into_iter().flatten() {
+                        got.insert(e["id"].as_str().unwrap_or_default().to_owned());
+                    }
+                    axum::http::StatusCode::OK
+                }
+            }),
         );
+        tokio::spawn(async move { axum::serve(healthy, app).await.expect("serve") });
+        let mut st = AppState::new("antares-stalled-lane".into());
+        crate::wire(&mut st).await;
+        subscribe(&st, "staller", &format!("http://{addr}/notify"), 30_000).await;
+        subscribe(
+            &st,
+            "healthy",
+            &format!("http://{healthy_addr}/notify"),
+            30_000,
+        )
+        .await;
+        let (queue_before, lane_before) = (changes_dropped(), lane_drops());
+        for n in 0..CHANGE_QUEUE {
+            assert_eq!(create_vehicle(&st, 1_000 + n).await, 201);
+        }
+        let received = || seen.lock().expect("ids").len();
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(30 * crate::state::slow_factor());
+        while received() < CHANGE_QUEUE && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            received(),
+            CHANGE_QUEUE,
+            "the healthy subscriber must get every change of the burst (matcher queue dropped {})",
+            changes_dropped() - queue_before
+        );
+        assert_eq!(changes_dropped(), queue_before, "the matcher queue dropped");
+        if !file_store {
+            assert!(
+                lane_drops() > lane_before,
+                "the stalled subscriber's lane must drop and count, not grow"
+            );
+        }
     }
 
     /// Every accepted change is counted until its pass has run, so a drain
@@ -3481,9 +4184,10 @@ mod clause_5_8_6_deletion_payload {
         }
     }
 
-    /// 5.8.6: a whole Attribute deleted at once is ONE tombstone with no
-    /// datasetId, while losing individual instances tombstones each lost
-    /// datasetId and leaves the survivors untouched.
+    /// 5.8.6: every deleted instance is its own tombstone carrying its
+    /// datasetId, whether the whole Attribute went at once (deleteAll, forge
+    /// 75ba471d, 046_22_08) or single instances did, and survivors stay
+    /// untouched. A multi-instance Attribute is an Array, deleted or not.
     #[tokio::test]
     async fn whole_attribute_versus_per_instance_deletion() {
         let three = json!([
@@ -3512,10 +4216,18 @@ mod clause_5_8_6_deletion_payload {
         )
         .await;
         let got = insts(&entry, "speed");
-        assert_eq!(got.len(), 1, "a whole-attribute deletion is one tombstone");
+        assert_eq!(got.len(), 3, "one tombstone per deleted instance: {got:?}");
+        let mut ds: Vec<Option<&Value>> = got.iter().map(|i| i.get("datasetId")).collect();
+        ds.sort_by_key(|d| d.and_then(Value::as_str));
+        assert_eq!(
+            ds,
+            [None, Some(&json!("urn:ds:a")), Some(&json!("urn:ds:b"))],
+            "each tombstone keeps its datasetId"
+        );
         assert!(
-            got[0].get("datasetId").is_none(),
-            "the single tombstone carries no datasetId"
+            got.iter()
+                .all(|i| i.get("value") == Some(&json!("urn:ngsi-ld:null"))),
+            "{got:?}"
         );
 
         // one instance gone, two survive
@@ -4246,6 +4958,7 @@ mod delivery_policy_tests {
         // the rest of its life
         st.egress = Arc::new(crate::egress::Egress::new(antares_jsonld::EgressPolicy {
             allow_private: false,
+            private_hosts: &[],
         }));
         let (uri, hits) = flaky_endpoint(0).await;
         let sub = subscribe(&st, &t, SUB_ID, &uri).await;
@@ -4259,6 +4972,37 @@ mod delivery_policy_tests {
         assert!(
             letters(&st, &t).await.is_empty(),
             "a policy verdict is not a transport failure"
+        );
+        assert_eq!(
+            notification(&st, &t, SUB_ID).await["status"],
+            json!("failed")
+        );
+    }
+
+    /// T-3908: listing a name in `private_hosts` never opens the broker's own
+    /// host. A subscription naming `localhost` is refused at delivery like
+    /// any private destination: nothing leaves, the status is failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listed_name_on_the_local_host_is_refused_at_delivery() {
+        let (mut st, t) = state(policy(3, 50));
+        let hosts: &'static [String] = vec!["localhost".to_owned()].leak();
+        st.egress = Arc::new(crate::egress::Egress::new(antares_jsonld::EgressPolicy {
+            allow_private: false,
+            private_hosts: hosts,
+        }));
+        let (uri, hits) = flaky_endpoint(0).await;
+        let uri = uri.replace("127.0.0.1", "localhost");
+        let sub = subscribe(&st, &t, SUB_ID, &uri).await;
+        send(&st, &t, &sub).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "nothing reaches the local host"
+        );
+        assert!(
+            letters(&st, &t).await.is_empty(),
+            "a policy verdict, not a transport failure"
         );
         assert_eq!(
             notification(&st, &t, SUB_ID).await["status"],

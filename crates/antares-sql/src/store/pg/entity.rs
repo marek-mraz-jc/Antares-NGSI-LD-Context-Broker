@@ -371,6 +371,35 @@ impl PgEntityStore {
         Ok(row.map(|r| r.get::<Value, _>(0)))
     }
 
+    /// Several Entities in one transaction (T-4085): one per id that exists,
+    /// keyed by id. A write's Relationship targets are read this way, so a
+    /// fragment with five Relationships costs one BEGIN, not five.
+    pub async fn get_many(
+        &self,
+        tenant: &TenantId,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Value>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        // 4.22: expired rows are invalid context until the sweep reaps them
+        let rows = sqlx::query(
+            "SELECT id, entity FROM entities WHERE tenant_id = $1 AND id = ANY($2)
+               AND (expires_at IS NULL OR expires_at > now())",
+        )
+        .bind(tenant.as_str())
+        .bind(ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>(0), r.get::<Value, _>(1)))
+            .collect())
+    }
+
     /// Returns the deleted document (the before-image, captured in the same
     /// transaction as the DELETE — never re-read outside it), `None` = absent.
     pub async fn delete(&self, tenant: &TenantId, id: &str) -> Result<Option<Value>, sqlx::Error> {
@@ -499,40 +528,56 @@ impl PgEntityStore {
         let mut decided = true;
 
         if let Some(ids) = f.ids {
-            binds.push(Bind::TextArr(ids.iter().map(|s| s.to_string()).collect()));
+            binds.push(Bind::TextArr(super::storable(ids)));
             wheres.push(format!("id = ANY(${})", binds.len()));
         }
         // 5.2.33 idPattern: the literal the regex forces is a plain string
         // test on the id column, exact as a narrowing; the regex itself stays
         // with the caller, so `decided` is untouched.
         if let Some(l) = f.id_literal {
-            binds.push(Bind::Text(l.text.to_owned()));
-            wheres.push(if l.anchored {
-                format!("starts_with(id, ${})", binds.len())
+            if l.text.contains('\0') {
+                // no stored id holds a NUL (`storable`)
+                wheres.push("false".to_owned());
             } else {
-                format!("position(${} in id) > 0", binds.len())
-            });
+                binds.push(Bind::Text(l.text.to_owned()));
+                wheres.push(if l.anchored {
+                    format!("starts_with(id, ${})", binds.len())
+                } else {
+                    format!("position(${} in id) > 0", binds.len())
+                });
+            }
         }
         // OR of AND-groups, mirroring the Entity Type Selection Language
         // (4.17) the caller already parsed: `types @> ARRAY[…]` per group.
         if let Some(groups) = f.types {
             let mut ors = Vec::with_capacity(groups.len());
-            for g in groups {
+            // a group naming a type with a NUL needs a type no entity has
+            for g in groups
+                .iter()
+                .filter(|g| super::storable(g).len() == g.len())
+            {
                 binds.push(Bind::TextArr(g.clone()));
                 ors.push(format!("types @> ${}", binds.len()));
             }
             if !ors.is_empty() {
                 wheres.push(format!("({})", ors.join(" OR ")));
+            } else if !groups.is_empty() {
+                wheres.push("false".to_owned());
             }
         }
         // `attrs`: the entity carries at least one of them — jsonb `?|`,
         // exactly the evaluator's `any(|a| doc.get(a).is_some())`.
         if let Some(attrs) = f.attrs {
-            binds.push(Bind::TextArr(attrs.to_vec()));
+            binds.push(Bind::TextArr(super::storable(attrs)));
             wheres.push(format!("entity ?| ${}", binds.len()));
         }
         if let Some(node) = f.q {
-            match crate::compile::q::compile_q(node, "entity", binds.len() + 1, f.expand) {
+            match crate::compile::q::compile_q(
+                node,
+                "entity",
+                binds.len().saturating_add(1),
+                f.expand,
+            ) {
                 Some(c) => {
                     wheres.push(c.sql);
                     binds.extend(c.binds.into_iter().map(Bind::Path));
@@ -542,12 +587,14 @@ impl PgEntityStore {
         }
         if let Some(sq) = f.scope_q {
             decided = false;
-            if let Some(c) = crate::compile::scope::compile_scope_q(sq, "scopes", binds.len() + 1) {
+            if let Some(c) =
+                crate::compile::scope::compile_scope_q(sq, "scopes", binds.len().saturating_add(1))
+            {
                 wheres.push(c.sql);
                 binds.extend(c.binds.into_iter().map(Bind::Text));
             }
         }
-        if let Some(spec) = f.geo {
+        for spec in f.geo {
             decided = false;
             // A client may send a self-intersecting polygon. GEOS raises on
             // one (`side location conflict`), which would turn a query into a
@@ -556,8 +603,11 @@ impl PgEntityStore {
             // identical: invalid ⇒ no pushdown, evaluator decides. Stored
             // geometries can't be invalid — the write path NULLs those.
             if self.geometry_is_valid(spec).await {
-                if let Some(c) = crate::compile::geo::compile_geo(spec, "location", binds.len() + 1)
-                {
+                if let Some(c) = crate::compile::geo::compile_geo(
+                    spec,
+                    "location",
+                    binds.len().saturating_add(1),
+                ) {
                     wheres.push(c.sql);
                     // geo binds first, then the numeric ones — the order
                     // `compile_geo` numbered its placeholders in.
@@ -581,7 +631,7 @@ impl PgEntityStore {
         let mut select = "entity".to_owned();
         if decided {
             if let Some(keep) = f.keep_attrs {
-                binds.push(Bind::TextArr(keep.to_vec()));
+                binds.push(Bind::TextArr(super::storable(keep)));
                 select = format!(
                     "(SELECT COALESCE(jsonb_object_agg(t.k, t.v), '{{}}'::jsonb) \
                       FROM jsonb_each(entity) AS t(k, v) \
@@ -589,7 +639,7 @@ impl PgEntityStore {
                     binds.len()
                 );
             } else if let Some(drop) = f.drop_attrs {
-                binds.push(Bind::TextArr(drop.to_vec()));
+                binds.push(Bind::TextArr(super::storable(drop)));
                 select = format!(
                     "(SELECT COALESCE(jsonb_object_agg(t.k, t.v), '{{}}'::jsonb) \
                       FROM jsonb_each(entity) AS t(k, v) \
@@ -614,7 +664,13 @@ impl PgEntityStore {
         // construction: `sql` is built from this function's own literals
         // plus `$n` placeholders — no caller-supplied text reaches it.
         // The audit lives here, next to the builder.
-        let mut qy = sqlx::query(sqlx::AssertSqlSafe(sql.clone()));
+        // Unprepared: a prepared statement goes to a generic plan after five
+        // runs on a connection, and that plan cannot tell a selective `@?`
+        // from one `jsonb_path_ops` cannot narrow. It ORs one GIN scan per
+        // `q` alternative over the whole type: 1.6 s instead of 1.5 ms at
+        // 100 000 entities (T-3735). The text varies with every q, geo and
+        // projection shape, so the statement cache saved little anyway.
+        let mut qy = sqlx::query(sqlx::AssertSqlSafe(sql.clone())).persistent(false);
         for b in &binds {
             qy = match b {
                 Bind::Text(s) | Bind::Path(s) => qy.bind(s),
@@ -645,7 +701,11 @@ impl PgEntityStore {
         if let Some(p) = f.page.as_ref().filter(|_| paged && !counted) {
             let more = docs.len() as i64 > p.limit;
             docs.truncate(p.limit as usize);
-            total = Some(p.offset + docs.len() as i64 + i64::from(more));
+            total = Some(
+                p.offset
+                    .saturating_add(docs.len() as i64)
+                    .saturating_add(i64::from(more)),
+            );
         }
         // an off-the-end counted page returns zero rows and no window
         // total — count the match set separately so links/count stay correct
@@ -654,7 +714,9 @@ impl PgEntityStore {
                 "SELECT count(*) FROM entities WHERE {}",
                 wheres.join(" AND ")
             );
-            let mut cq = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql));
+            // unprepared for the same reason as the statement above
+            let mut cq =
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql)).persistent(false);
             // same wheres ⇒ same bind prefix; stop before the
             // projection/page binds, which the count statement lacks
             for b in binds.iter().take(where_binds) {

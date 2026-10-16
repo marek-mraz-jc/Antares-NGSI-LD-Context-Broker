@@ -6,8 +6,8 @@
 #
 # Routes are read from the router rather than from a list kept by hand: the
 # `Admin` surface's own `PATHS` array with the methods its `router` mounts,
-# and every other literal `.route(...)` that is not inside the `let api =
-# ...` statement nested under the API root. A surface an addon mounts under
+# and every other literal `.route(...)` (the API root's routes are the
+# `api_routes()` table, never a literal `.route`). A surface an addon mounts under
 # `/x` is the addon's to document; the `/x` contract itself is a heading here.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -74,16 +74,16 @@ a, b = statement(lib, "let [health_p")
 names = re.split(r"\s*,\s*", lib[a:b].split("[", 1)[1].split("]", 1)[0])
 by_name = dict(zip(names, paths, strict=True))
 a, b = statement(lib, "let [health_p")
-admin_from = lib.index("fn router(&self, _st: AppState) -> Router<AppState> {")
+admin_from = lib.index("impl ApiSurface for Admin {")
 for off, arg, chain in calls(lib):
     if off > admin_from and arg in by_name:
         routes.update((m, "/q" + by_name[arg]) for m in methods_of(chain))
 
-# 2. Every literal route outside the API nest — a spec resource is the
-#    ledger's, not the book's.
-api_from, api_to = statement(lib, "let api = Router::new()")
+# 2. Every literal route: the API nest is `api_routes()`, a table of tuples
+#    mounted by `api.route(path, methods)`, so a spec resource never shows up
+#    here as a literal (T-3544) — it is the ledger's, not the book's.
 for off, arg, chain in calls(lib):
-    if api_from <= off <= api_to or not arg.startswith('"'):
+    if not arg.startswith('"'):
         continue
     routes.update((m, arg.strip('"')) for m in methods_of(chain))
 

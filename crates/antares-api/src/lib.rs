@@ -1,7 +1,23 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! NGSI-LD HTTP binding: axum routers, thin
 //! handlers per spec operation.
-#![cfg_attr(not(test), warn(clippy::expect_used))]
+// T-3915, T-3932: a panic on a request path is a remote DoS. Outside tests
+// this crate may not unwrap, expect, panic, index or overflow.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::dbg_macro,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 // the Send proof of the spawned snapshot fill walks temporal → entity map
 // futures deeper than the default 128 (nightly: recursion_depth_exceeding_limit)
@@ -16,7 +32,8 @@
 ///
 /// The named members go into the [`policy::Operation`]; every other member
 /// keeps the empty default of `Operation::new`. The awaited value is the
-/// `Filter` the engine narrowed the operation to, or the refusal that
+/// `Filter` the engine narrowed the operation to, shared (`Arc`) so a
+/// view's compiled narrowing reaches the handler uncopied, or the refusal that
 /// becomes a 403. It is a macro because a gate reads as one line at the
 /// call site and the alternative is the same eight lines in every handler.
 ///
@@ -27,8 +44,8 @@
 macro_rules! gate {
     ($st:expr, $tenant:expr, $headers:expr, $clause:expr $(, $field:ident: $value:expr)* $(,)?) => {
         async {
-            match &$st.policy {
-                None => Ok($crate::policy::Filter::default()),
+            let answer = match &$st.policy {
+                None => Ok($crate::policy::unnarrowed()),
                 Some(engine) => {
                     $crate::policy::gate(
                         engine.as_ref(),
@@ -40,12 +57,19 @@ macro_rules! gate {
                         },
                     )
                     .await
+                    .map(std::sync::Arc::new)
                 }
-            }
+            };
+            // A state served through an endpoint view adds the view's
+            // narrowing to the engine's (ADR-0023, T-3494).
+            #[cfg(feature = "views")]
+            let answer = $crate::views::with_view($st.view.as_deref(), $clause, answer);
+            answer
         }
     };
 }
 
+pub mod admin_auth;
 pub(crate) mod attrs;
 pub(crate) mod batch;
 pub mod bounds;
@@ -58,6 +82,9 @@ pub(crate) mod entities;
 pub(crate) mod entity_map;
 pub(crate) mod entity_maps;
 pub(crate) mod federation;
+// The request parsers for the fuzz targets (T-3463); never in a broker build.
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 pub mod history;
 pub mod mirror;
 pub mod negotiate;
@@ -66,15 +93,30 @@ pub(crate) mod paging;
 pub mod policy;
 pub(crate) mod registry;
 pub(crate) mod repr;
+pub mod secret;
 pub(crate) mod snapshots;
 pub(crate) mod stamp;
 pub mod state;
 pub(crate) mod subscriptions;
 pub(crate) mod temporal;
 pub(crate) mod temporalq;
+pub(crate) mod tenant_move;
 pub(crate) mod types_attrs;
+// The composition hook of endpoint views (ADR-0023, ADR-0027 section 5);
+// never in a vanilla build.
+#[cfg(feature = "views")]
+pub mod views;
 
 pub use antares_notifier::DeliveryPolicy;
+// The sink contract, so a surface reaches it through this crate and names no
+// antares-notifier (ADR-0027 section 1, rule M2).
+pub use antares_notifier::{
+    build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
+};
+pub use contexts::public_base;
+pub use federation::{
+    AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport, NotifyFuture,
+};
 pub use state::{AppState, TemporalRecord};
 
 /// Spawn for both targets — tokio natively, the JS microtask queue on
@@ -139,7 +181,7 @@ pub use antares_notifier::http::page_sink;
 use antares_model::{NgsiError, TenantId, API_ROOT};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, MethodRouter};
 use axum::Router;
 use negotiate::{echo_tenant, respond, tenant_from, ApiError};
 
@@ -197,8 +239,10 @@ pub fn ops_router(state: AppState) -> Router {
 }
 
 /// The broker's own operational surface: health, readiness, metrics, the
-/// tenant list and purge, and the dead-letter admin. Gateway-protected like
-/// every `/q` route — the broker adds no authentication of its own.
+/// tenant list and purge, and the dead-letter admin. Health and readiness
+/// are always open; the rest sits behind the admin credential when the
+/// state carries one (`admin_auth.rs`, T-3569), `/q/metrics` unless the
+/// deployment left it open for a scraper.
 pub struct Admin;
 
 impl Admin {
@@ -206,12 +250,15 @@ impl Admin {
     /// count `/q/health` reports. The destructuring in `router` binds one
     /// name per entry, so a route added to one and not the other does not
     /// compile.
-    const PATHS: [&'static str; 8] = [
+    const PATHS: [&'static str; 11] = [
         "/health",
         "/ready",
         "/metrics",
         "/tenants",
         "/tenants/{tenant}",
+        "/tenants/{tenant}/digest",
+        "/tenants/{tenant}/export",
+        "/tenants/{tenant}/import",
         "/dead-letters",
         "/dead-letters/{id}",
         "/dead-letters/{id}/replay",
@@ -227,20 +274,41 @@ impl ApiSurface for Admin {
         "/q"
     }
 
-    fn router(&self, _st: AppState) -> Router<AppState> {
-        let [health_p, ready_p, metrics_p, tenants_p, tenant_p, dl_p, dl_id_p, replay_p] =
+    fn router(&self, st: AppState) -> Router<AppState> {
+        let [health_p, ready_p, metrics_p, tenants_p, tenant_p, digest_p, export_p, import_p, dl_p, dl_id_p, replay_p] =
             Self::PATHS;
-        Router::new()
-            .route(health_p, get(health))
-            .route(ready_p, get(ready))
-            // Prometheus text format. 404 until the broker installs the
-            // renderer — the api crate never depends on an exporter.
-            .route(metrics_p, get(metrics_endpoint))
+        let guard = axum::middleware::from_fn_with_state(st.clone(), admin_auth::require);
+        // Prometheus text format. 404 until the broker installs the
+        // renderer — the api crate never depends on an exporter.
+        let metrics = Router::new().route(metrics_p, get(metrics_endpoint));
+        let metrics = if st.admin_auth.as_ref().is_some_and(|a| !a.metrics_open) {
+            metrics.route_layer(guard.clone())
+        } else {
+            metrics
+        };
+        let routes = Router::new()
             .route(tenants_p, get(tenants_list))
             .route(tenant_p, get(tenant_get).delete(tenant_purge))
+            // ADR-0030: a Tenant's move to another broker.
+            .route(digest_p, get(tenant_move::digest))
+            .route(export_p, get(tenant_move::export))
+            .route(import_p, post(tenant_move::import))
             .route(dl_p, get(dead_letters_list))
             .route(dl_id_p, delete(dead_letter_delete))
-            .route(replay_p, post(dead_letter_replay))
+            .route(replay_p, post(dead_letter_replay));
+        // `/q/views` (ADR-0023 rule 10), when a loader set it: views are
+        // written here, so they sit behind the admin credential with the
+        // rest of /q.
+        #[cfg(feature = "views")]
+        let routes = match st.views.admin() {
+            Some(views) => routes.merge(views.with_state(())),
+            None => routes,
+        };
+        routes
+            .route_layer(guard)
+            .route(health_p, get(health))
+            .route(ready_p, get(ready))
+            .merge(metrics)
     }
 
     fn version_info(&self) -> serde_json::Value {
@@ -290,14 +358,16 @@ pub async fn sweep_expired_docs(st: &AppState) -> usize {
     let Ok(tenants) = st.store.tenant_ids().await else {
         return 0;
     };
-    let mut n = 0;
+    let mut n: usize = 0;
     for name in tenants {
         let Ok(tenant) = antares_model::TenantId::new(&name) else {
             continue;
         };
-        n += csource::sweep_expired_registrations(st, &tenant).await;
-        n += snapshots::sweep_expired_snapshots(st, &tenant).await;
-        n += entity_map::sweep_expired_maps(st, &tenant).await;
+        // Each sweep counts documents it deleted, far below `usize::MAX`.
+        n = n
+            .saturating_add(csource::sweep_expired_registrations(st, &tenant).await)
+            .saturating_add(snapshots::sweep_expired_snapshots(st, &tenant).await)
+            .saturating_add(entity_map::sweep_expired_maps(st, &tenant).await);
     }
     n
 }
@@ -312,152 +382,258 @@ pub async fn wired_state(host_alias: &str) -> AppState {
     st
 }
 
-pub fn router(state: AppState) -> Router {
-    let api = Router::new()
+/// The NGSI-LD API, path by path: `router()` mounts exactly these under the
+/// API root, and the policy seam's own test walks the same list, asking the
+/// router (OPTIONS, the Allow set) which methods each path serves.
+pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
+    vec![
         // entities (6.4/6.5)
-        .route(
+        (
             "/entities",
             post(entities::create_entity)
                 .get(entities::query_entities)
                 .delete(entities::purge_entities)
                 .patch(missing_entity_id)
                 .put(missing_entity_id),
-        )
-        .route(
+        ),
+        (
             "/entities/{id}",
             get(entities::retrieve_entity)
                 .patch(entities::merge_entity)
                 .put(entities::replace_entity)
                 .delete(entities::delete_entity),
-        )
+        ),
         // attrs (6.6/6.7)
-        .route(
+        (
             "/entities/{id}/attrs",
             post(attrs::append_attrs).patch(attrs::update_attrs),
-        )
-        .route(
+        ),
+        (
             "/entities/{id}/attrs/{attr}",
             // GET is the 2.0 #14 pre-adoption
             get(entities::retrieve_entity_attr)
                 .patch(attrs::partial_update_attr)
                 .put(attrs::replace_attr)
                 .delete(attrs::delete_attr),
-        )
-        // 2.0 #15 pre-adoption: the bare attribute value
-        .route(
+        ),
+        // 2.0 #15 pre-adoption: the bare attribute value, and PUT is Set
+        // Attribute Value (TS 104 176 7.6.3.2)
+        (
             "/entities/{id}/attrs/{attr}/value",
-            get(entities::retrieve_entity_attr_value),
-        )
+            get(entities::retrieve_entity_attr_value).put(attrs::set_attr_value),
+        ),
         // batch (6.14–6.17, 6.23, 6.31)
-        .route("/entityOperations/create", post(batch::batch_create))
-        .route("/entityOperations/upsert", post(batch::batch_upsert))
-        .route("/entityOperations/update", post(batch::batch_update))
-        .route("/entityOperations/delete", post(batch::batch_delete))
-        .route("/entityOperations/merge", post(batch::batch_merge))
-        .route("/entityOperations/query", post(batch::batch_query))
+        ("/entityOperations/create", post(batch::batch_create)),
+        ("/entityOperations/upsert", post(batch::batch_upsert)),
+        ("/entityOperations/update", post(batch::batch_update)),
+        ("/entityOperations/delete", post(batch::batch_delete)),
+        ("/entityOperations/merge", post(batch::batch_merge)),
+        ("/entityOperations/query", post(batch::batch_query)),
         // EntityMaps (5.14; 6.32/6.34/6.35)
-        .route(
+        (
             "/entityMaps",
             get(entity_maps::create_entity_map).post(entity_maps::create_entity_map_post),
-        )
-        .route(
+        ),
+        (
             "/entityMaps/{id}",
             get(entity_maps::retrieve_entity_map)
                 .patch(entity_maps::update_entity_map)
                 .delete(entity_maps::delete_entity_map),
-        )
-        .route(
+        ),
+        (
             "/temporal/entityMaps",
             get(entity_maps::create_temporal_entity_map)
                 .post(entity_maps::create_temporal_entity_map_post),
-        )
+        ),
         // subscriptions (6.10/6.11)
-        .route(
+        (
             "/subscriptions",
             post(subscriptions::create_subscription).get(subscriptions::query_subscriptions),
-        )
-        .route(
+        ),
+        (
             "/subscriptions/{id}",
             get(subscriptions::retrieve_subscription)
                 .patch(subscriptions::update_subscription)
                 .delete(subscriptions::delete_subscription),
-        )
+        ),
         // csourceRegistrations (6.8/6.9)
-        .route(
+        (
             "/csourceRegistrations",
             post(csource::create_registration).get(csource::query_registrations),
-        )
-        .route(
+        ),
+        (
             "/csourceRegistrations/{id}",
             get(csource::retrieve_registration)
                 .patch(csource::update_registration)
                 .delete(csource::delete_registration),
-        )
+        ),
         // csourceSubscriptions (6.12/6.13)
-        .route(
+        (
             "/csourceSubscriptions",
             post(subscriptions::create_csource_subscription)
                 .get(subscriptions::query_csource_subscriptions),
-        )
-        .route(
+        ),
+        (
             "/csourceSubscriptions/{id}",
             get(subscriptions::retrieve_csource_subscription)
                 .patch(subscriptions::update_csource_subscription)
                 .delete(subscriptions::delete_csource_subscription),
-        )
+        ),
         // temporal (6.18–6.22, 6.24)
-        .route(
+        (
             "/temporal/entities",
             post(temporal::upsert_temporal).get(temporal::query_temporal),
-        )
-        .route(
+        ),
+        (
             "/temporal/entities/{id}",
             get(temporal::retrieve_temporal).delete(temporal::delete_temporal),
-        )
-        .route(
+        ),
+        (
             "/temporal/entities/{id}/attrs",
             post(temporal::add_temporal_attrs),
-        )
-        .route(
+        ),
+        (
             "/temporal/entities/{id}/attrs/{attr}",
             delete(temporal::delete_temporal_attr),
-        )
-        .route(
+        ),
+        (
             "/temporal/entities/{id}/attrs/{attr}/{instance}",
             patch(temporal::modify_temporal_instance).delete(temporal::delete_temporal_instance),
-        )
-        .route(
+        ),
+        (
             "/temporal/entityOperations/query",
             post(temporal::batch_temporal_query),
-        )
+        ),
         // discovery (6.25–6.28)
-        .route("/types", get(types_attrs::entity_types))
-        .route("/types/{type}", get(types_attrs::entity_type_info))
-        .route("/attributes", get(types_attrs::attributes))
-        .route("/attributes/{attr}", get(types_attrs::attribute_info))
+        ("/types", get(types_attrs::entity_types)),
+        ("/types/{type}", get(types_attrs::entity_type_info)),
+        ("/attributes", get(types_attrs::attributes)),
+        ("/attributes/{attr}", get(types_attrs::attribute_info)),
         // jsonldContexts (6.29/6.30)
-        .route(
+        (
             "/jsonldContexts",
             post(contexts::add_context).get(contexts::list_contexts),
-        )
-        .route(
+        ),
+        (
             "/jsonldContexts/{id}",
             get(contexts::serve_context).delete(contexts::delete_context),
-        )
+        ),
         // snapshots (5.16; 6.36-6.38, optional API group — offered)
-        .route(
+        (
             "/snapshots",
             post(snapshots::create_snapshot).delete(snapshots::purge_snapshots),
-        )
-        .route(
+        ),
+        (
             "/snapshots/{id}",
             get(snapshots::retrieve_snapshot)
                 .patch(snapshots::update_snapshot)
                 .delete(snapshots::delete_snapshot),
-        )
-        .route("/snapshots/{id}/clone", post(snapshots::clone_snapshot))
+        ),
+        ("/snapshots/{id}/clone", post(snapshots::clone_snapshot)),
         // info (6.33)
-        .route("/info/sourceIdentity", get(source_identity));
+        ("/info/sourceIdentity", get(source_identity)),
+    ]
+}
+
+/// The broker's whole HTTP surface, under trailing-slash normalization: every
+/// host of it (the binary, the browser build, an in-process forward, a test)
+/// serves `/entities/{id}/attrs/` as `/entities/{id}/attrs`, the form 5.6.2
+/// and 5.6.3 forwards are sent in (T-3701).
+pub fn router(state: AppState) -> Router {
+    let served = routes(state);
+    Router::new().fallback_service(tower::util::MapRequest::new(
+        served,
+        trim_trailing_slash::<axum::body::Body>,
+    ))
+}
+
+/// tower-http's `NormalizePath::trim_trailing_slash`, except below a view's
+/// OData service (`/x/views/{view}/odata/`): OData 4.01 Part 2 section 4 has
+/// no empty path segment, so `Products/` is a malformed URL there and not a
+/// spelling of `Products` (T-3731), and the path reaches the OData parser as
+/// sent. Anywhere else, trailing slashes and a leading `//` collapse to one
+/// path, `/` alone for a path of slashes.
+pub fn trim_trailing_slash<B>(mut req: axum::http::Request<B>) -> axum::http::Request<B> {
+    let path = req.uri().path();
+    if !path.ends_with('/') && !path.starts_with("//") {
+        return req;
+    }
+    let below_odata = path
+        .strip_prefix(surface::VIEW_ROOT)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, rest)| rest.starts_with("odata/"));
+    if below_odata {
+        return req;
+    }
+    let trimmed = format!("/{}", path.trim_matches('/'));
+    let path_and_query = match req.uri().query() {
+        Some(query) => format!("{trimmed}?{query}"),
+        None => trimmed,
+    };
+    let mut parts = req.uri().clone().into_parts();
+    // A path cut from a valid one stays valid; were it ever not, the request
+    // goes on as sent rather than failing here.
+    if let Ok(pq) = path_and_query.parse() {
+        parts.path_and_query = Some(pq);
+        if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+            *req.uri_mut() = uri;
+        }
+    }
+    req
+}
+
+#[cfg(test)]
+mod trim_trailing_slash_tests {
+    use super::trim_trailing_slash;
+
+    fn trimmed(uri: &str) -> String {
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(())
+            .unwrap_or_default();
+        trim_trailing_slash(req).uri().to_string()
+    }
+
+    /// The NGSI-LD API and every other surface: tower-http's trim, the query
+    /// kept. A view's OData service: as sent (T-3731).
+    #[test]
+    fn trims_everywhere_but_a_views_odata_service() {
+        for (sent, served) in [
+            ("/ngsi-ld/v1/entities/", "/ngsi-ld/v1/entities"),
+            (
+                "/ngsi-ld/v1/entities//?type=Car",
+                "/ngsi-ld/v1/entities?type=Car",
+            ),
+            ("//ngsi-ld/v1/entities", "/ngsi-ld/v1/entities"),
+            ("/", "/"),
+            ("///", "/"),
+            ("/x/views/", "/x/views"),
+            ("/x/views/a/", "/x/views/a"),
+            (
+                "/x/views/a/ngsi-ld/v1/entities/",
+                "/x/views/a/ngsi-ld/v1/entities",
+            ),
+            ("/x/views/a/odata", "/x/views/a/odata"),
+            ("/x/views/a/odata/v4/", "/x/views/a/odata/v4/"),
+            ("/x/views/a/odata/v4/Car/", "/x/views/a/odata/v4/Car/"),
+            (
+                "/x/views/a/odata/v4/Car//?$top=1",
+                "/x/views/a/odata/v4/Car//?$top=1",
+            ),
+            ("/q/views/odata/", "/q/views/odata"),
+        ] {
+            assert_eq!(trimmed(sent), served, "{sent}");
+        }
+    }
+}
+
+fn routes(state: AppState) -> Router {
+    let api = api_routes()
+        .into_iter()
+        .fold(Router::new(), |api, (path, methods)| {
+            api.route(path, methods)
+        });
 
     // 5.8.1.4 consumer half: where forwarded subscription copies point their
     // notifications; remapped to the original subscriber. CIM 009 defines no
@@ -479,14 +655,28 @@ pub fn router(state: AppState) -> Router {
 
     // Every registered surface, each under its own reserved prefix — the
     // admin one by default. `with_surface` already refused a prefix outside
-    // /q and /x and any overlap, so the merge here cannot shadow a route.
+    // /q and /x and any overlap, so the merge here cannot shadow a route;
+    // the view surfaces share the view root (ADR-0027 section 1), where
+    // axum's merge refuses two equal routes.
     // The caps are the broker's, not the API nest's: these routes carry the
     // bounds wall and the body limit for the same reason the peer-facing
     // notification endpoint above does — /q deletes Tenants and replays dead
     // letters, and a deployment's own /x routes are no less a way in.
     let mut surfaces = Router::new();
+    let mut view_root: Option<Router<AppState>> = None;
     for s in state.surfaces.iter() {
-        surfaces = surfaces.nest(s.prefix(), s.router(state.clone()));
+        let routes = s.router(state.clone());
+        if s.prefix() == surface::VIEW_ROOT {
+            view_root = Some(match view_root {
+                Some(shared) => shared.merge(routes),
+                None => routes,
+            });
+        } else {
+            surfaces = surfaces.nest(s.prefix(), routes);
+        }
+    }
+    if let Some(shared) = view_root {
+        surfaces = surfaces.nest(surface::VIEW_ROOT, shared);
     }
     let surfaces = surfaces
         .layer(axum::extract::DefaultBodyLimit::max(
@@ -554,15 +744,28 @@ pub fn router(state: AppState) -> Router {
                 .layer(axum::middleware::from_fn(echo_tenant_layer)),
         )
         .fallback(not_found)
+        // T-3531: a panicking handler answers 500 instead of unwinding the
+        // connection task; inside the metrics layer so the 500 is counted.
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_500))
         // outermost on purpose: axum attaches the 405 Allow header in the
         // Router itself, above any nested layer — only a layer wrapping the
         // WHOLE router sees it.
         .layer(axum::middleware::from_fn(options_204))
+        // TS 104 176 6.3.2: an unrecognised verb is 501 before any routing,
+        // so the method router's 405 stays the answer for a recognised one.
+        .layer(axum::middleware::from_fn(unrecognised_method_501))
         // Outermost so the duration covers the full stack.
         .layer(axum::middleware::from_fn(http_metrics_layer))
         // absent knob = no layer at all: a bare OPTIONS keeps its 204 + Allow
         .layer(tower::util::option_layer(cors_layer()))
         .with_state(state)
+}
+
+/// A handler that panicked: 500 InternalError, and the broker goes on
+/// serving. The panic message stays in the log (the default hook prints it),
+/// never in the body, where it could carry a stored value.
+fn panic_500(_: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    ApiError::from(NgsiError::InternalError("the request failed".into())).into_response()
 }
 
 /// Browser access is off unless ANTARES_CORS_ORIGINS names the origins
@@ -768,6 +971,21 @@ async fn http_metrics_layer(
     resp
 }
 
+/// TS 104 176 6.3.2: "Not Implemented (501) ... when a client invokes an
+/// HTTP verb that is unrecognized or not implemented". The recognised set is
+/// the one [`metric_method`] names; CONNECT, TRACE and every extension
+/// method are 501. A bare status like 6.3.4's 411 and 415: the error table
+/// names no error type for it.
+async fn unrecognised_method_501(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    if metric_method(req.method().as_str()) == "OTHER" {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
+    next.run(req).await
+}
+
 /// 2.0 #59 pre-adoption: OPTIONS → 204 No Content + the Allow set the
 /// method router computed. Non-OPTIONS traffic passes through untouched.
 async fn options_204(
@@ -808,15 +1026,20 @@ async fn health(
     } else {
         StatusCode::OK
     };
-    let mut body = serde_json::json!({
-        "status": if draining { "DRAINING" } else { "UP" },
-        "store": state.store_name,
-        "temporal": state.temporal_name.as_deref().unwrap_or("none"),
-        // Version surface: workspace version + build-time git hash
-        // (build.rs), both asserted against the checkout by health_is_up.
-        "version": env!("CARGO_PKG_VERSION"),
-        "commit": env!("ANTARES_GIT_HASH"),
-    });
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "status".into(),
+        (if draining { "DRAINING" } else { "UP" }).into(),
+    );
+    body.insert("store".into(), state.store_name.clone().into());
+    body.insert(
+        "temporal".into(),
+        state.temporal_name.as_deref().unwrap_or("none").into(),
+    );
+    // Version surface: workspace version + build-time git hash
+    // (build.rs), both asserted against the checkout by health_is_up.
+    body.insert("version".into(), env!("CARGO_PKG_VERSION").into());
+    body.insert("commit".into(), env!("ANTARES_GIT_HASH").into());
     // What each driver runs on — engine, server version, extensions — so an
     // operator can tell two deployments of the same backend name apart. Both
     // seams answer from state captured at startup; a driver with nothing to
@@ -826,7 +1049,7 @@ async fn health(
         ("temporalInfo", state.temporal.version_info()),
     ] {
         if info.as_object().is_some_and(|m| !m.is_empty()) {
-            body[key] = info;
+            body.insert(key.into(), info);
         }
     }
     // Where commits serialize behind one writer, the queue depth (current,
@@ -834,64 +1057,84 @@ async fn health(
     // without such a committer reports nothing, so the branch is the
     // driver's, not a backend name read here.
     if let Some((depth, peak)) = state.store.commit_queue() {
-        body["commitQueueDepth"] = depth.into();
-        body["commitQueuePeak"] = peak.into();
+        body.insert("commitQueueDepth".into(), depth.into());
+        body.insert("commitQueuePeak".into(), peak.into());
     }
     // The policy engine this binary was started with, and how long it has
     // to answer before the seam denies for it (ADR-0020). An operator
     // reading `allow-all` here knows no engine is attached.
-    body["policy"] = serde_json::json!({
-        "engine": state.policy_name(),
-        "timeoutMs": u64::try_from(policy::TIMEOUT.as_millis()).unwrap_or(u64::MAX),
-    });
+    let mut policy = serde_json::Map::new();
+    policy.insert("engine".into(), state.policy_name().into());
+    policy.insert(
+        "timeoutMs".into(),
+        u64::try_from(policy::TIMEOUT.as_millis())
+            .unwrap_or(u64::MAX)
+            .into(),
+    );
     // Configured caps + rejection counters, for observability.
-    body["limits"] = state.limits.snapshot();
+    body.insert("limits".into(), state.limits.snapshot());
     // History events a driver failed to record after the write stood.
-    body["temporalDrainErrors"] = history::drain_errors().into();
+    body.insert("temporalDrainErrors".into(), history::drain_errors().into());
     // What this binary serves beside the NGSI-LD API: one entry per mounted
     // surface, its prefix and whatever the surface reports about itself.
-    body["surfaces"] = serde_json::Value::Object(
-        state
-            .surfaces
-            .iter()
-            .map(|s| {
-                let mut info = match s.version_info() {
-                    serde_json::Value::Object(m) => m,
-                    other => {
-                        let mut m = serde_json::Map::new();
-                        m.insert("info".into(), other);
-                        m
-                    }
-                };
-                info.insert("prefix".into(), s.prefix().into());
-                (s.name().to_owned(), serde_json::Value::Object(info))
-            })
-            .collect(),
+    body.insert(
+        "surfaces".into(),
+        serde_json::Value::Object(
+            state
+                .surfaces
+                .iter()
+                .map(|s| {
+                    let mut info = match s.version_info() {
+                        serde_json::Value::Object(m) => m,
+                        other => {
+                            let mut m = serde_json::Map::new();
+                            m.insert("info".into(), other);
+                            m
+                        }
+                    };
+                    info.insert("prefix".into(), s.prefix().into());
+                    (s.name().to_owned(), serde_json::Value::Object(info))
+                })
+                .collect(),
+        ),
     );
     // Endpoint schemes this deployment can deliver notifications to: the
     // registered bindings (6.3.8, clause 7, and any a deployment added).
     // A subscription naming a scheme absent here is refused at creation.
-    body["notificationSchemes"] = state.sinks.schemes().into();
+    body.insert("notificationSchemes".into(), state.sinks.schemes().into());
     // Notifications the delivery policy gave up on (this process, since start).
-    body["deadLetters"] = notify::dead_letters_written().into();
+    body.insert("deadLetters".into(), notify::dead_letters_written().into());
+    // Each stored view, loaded or invalid with the reason (ADR-0023 rule 10).
+    #[cfg(feature = "views")]
+    {
+        body.insert("views".into(), state.views.report());
+        // Which documents the table was loaded from (threat V26): two pods
+        // reporting two values serve two predicates.
+        body.insert("viewsRevision".into(), state.views.revision().into());
+        // The engine's rule documents by tenant and revision, loaded or
+        // refused (ADR-0020 amendment); never the documents themselves.
+        policy.insert("documents".into(), state.views.policy_report());
+        body.insert("schemas".into(), state.views.schema_report());
+    }
     // Changes the bounded matcher queue dropped (this process, since start).
-    body["changesDropped"] = notify::changes_dropped().into();
+    body.insert("changesDropped".into(), notify::changes_dropped().into());
     // Panics absorbed at the notification-task boundary, each one a change
     // whose notification was lost. Reported here and not only through the
     // metrics facade: the recorder is installed by ANTARES_TELEMETRY, which
     // is off by default, so this endpoint is where a default deployment can
     // see it at all.
-    body["taskPanics"] = notify::task_panics().into();
+    body.insert("taskPanics".into(), notify::task_panics().into());
     // Jemalloc heap stats (RSS ≈ live×1.2 is the target).
     if let Some(mem) = &state.mem_stats {
-        body["memory"] = mem();
+        body.insert("memory".into(), mem());
     }
     // Bus visibility: present only when the nats wiring installed the
     // provider — bus=local carries NO bus member.
     if let Some(bus) = &state.bus_stats {
-        body["bus"] = bus();
+        body.insert("bus".into(), bus());
     }
-    (code, axum::Json(body))
+    body.insert("policy".into(), serde_json::Value::Object(policy));
+    (code, axum::Json(serde_json::Value::Object(body)))
 }
 
 /// The tenant an admin dead-letter call addresses: `?tenant=` (default
@@ -1009,7 +1252,7 @@ async fn dead_letter_replay(
         }
         Err(e) => return ApiError::from(e).into_response(),
     };
-    match notify::replay_dead_letter(&st, &letter).await {
+    match notify::replay_dead_letter(&st, &tenant, &letter).await {
         Ok(()) => match st.store.delete(&tenant, Kind::DeadLetter, &id).await {
             Ok(_) => StatusCode::NO_CONTENT.into_response(),
             Err(e) => ApiError::from(e).into_response(),
@@ -1027,7 +1270,7 @@ async fn dead_letter_replay(
                         .get("attempts")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0)
-                        + 1;
+                        .saturating_add(1);
                     letter.insert("attempts".into(), n.into());
                     letter.insert("lastError".into(), serde_json::Value::String(w));
                     letter.insert("lastAt".into(), serde_json::Value::String(ts));
@@ -1125,7 +1368,9 @@ async fn tenant_get(
         },
     });
     if let Some(c) = stats.created_at {
-        row["createdAt"] = serde_json::Value::String(c);
+        if let Some(row) = row.as_object_mut() {
+            row.insert("createdAt".into(), serde_json::Value::String(c));
+        }
     }
     (StatusCode::OK, axum::Json(row)).into_response()
 }
@@ -1275,8 +1520,8 @@ async fn ready(
         "status": if ready { "READY" } else { "NOT_READY" },
         "store": store_ok,
     });
-    if let Some(b) = bus {
-        body["bus"] = b;
+    if let (Some(b), Some(body)) = (bus, body.as_object_mut()) {
+        body.insert("bus".into(), b);
     }
     let code = if ready {
         StatusCode::OK
@@ -1382,6 +1627,39 @@ mod tests {
         assert_eq!(metric_method("BAZQUX"), "OTHER");
         // methods are case-sensitive tokens (RFC 9110 9.1)
         assert_eq!(metric_method("get"), "OTHER");
+    }
+
+    /// TS 104 176 6.3.2: a verb the broker does not recognise or implement
+    /// is 501; a recognised verb a resource does not serve stays 405 with
+    /// its Allow set, and OPTIONS stays 204.
+    #[tokio::test]
+    async fn an_unrecognised_verb_is_501_and_an_unserved_one_405() {
+        let send = |method: &'static str, uri: &'static str| {
+            app().oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("req"),
+            )
+        };
+        for (method, uri) in [
+            ("FOO", "/ngsi-ld/v1/entities"),
+            ("FOO", "/ngsi-ld/v1/entities/urn:ngsi-ld:X:1"),
+            ("TRACE", "/ngsi-ld/v1/entities"),
+            ("CONNECT", "/ngsi-ld/v1/entities"),
+            ("get", "/ngsi-ld/v1/entities"),
+        ] {
+            let resp = send(method, uri).await.expect("resp");
+            assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{method} {uri}");
+        }
+        let resp = send("GET", "/ngsi-ld/v1/entityOperations/create")
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(resp.headers().get("allow").is_some(), "405 keeps Allow");
+        let resp = send("OPTIONS", "/ngsi-ld/v1/entities").await.expect("resp");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -2697,6 +2975,95 @@ mod tests {
             .await
             .expect("resp");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// TS 104 179 5.2.3/5.2.4: a Sealed Attribute is an Attribute with an
+    /// `ngsildproof` sub-property (entityIdSealed, entityTypeSealed, value =
+    /// the W3C proof). Nested under a Property it survives create, a merge
+    /// that adds a second Sealed Attribute, and retrieval, untouched: a
+    /// relaying broker altering it breaks the proof (INT-4).
+    #[tokio::test]
+    async fn ts104179_5_2_3_nested_sealed_attribute_round_trips_through_merge() {
+        let id = "urn:ngsi-ld:Car:sealed1";
+        let proof = |member: &str, value: &str| {
+            serde_json::json!({
+                "type": "Property",
+                "entityIdSealed": id,
+                "entityTypeSealed": "Car",
+                "value": {
+                    "type": "DataIntegrityProof",
+                    "cryptosuite": "eddsa-rdfc-2022",
+                    "created": "2026-10-10T17:00:00Z",
+                    "verificationMethod": format!("did:web:a.example#{member}"),
+                    "proofPurpose": "assertionMethod",
+                    "proofValue": value
+                }
+            })
+        };
+        let color = proof(
+            "color",
+            "z3FXQjecWufY46yg5abdVZsXqLhxhueuSoZgNSARiKBk9czhSePTF",
+        );
+        let parked = proof(
+            "parkedAt",
+            "z58DAdFfa9SkqZMVPxAQpic7ndSayn1PzZs6ZjWp1CktyGesjuTSw",
+        );
+        let send = |method: &str, uri: &str, doc: serde_json::Value| {
+            let body = doc.to_string();
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len())
+                .body(Body::from(body))
+                .expect("req")
+        };
+        let app = app();
+        let created = serde_json::json!({
+            "id": id, "type": "Car",
+            "color": {"type": "Property", "value": "red", "ngsildproof": color}
+        });
+        let resp = app
+            .clone()
+            .oneshot(send("POST", "/ngsi-ld/v1/entities", created))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let merge = serde_json::json!({
+            "parkedAt": {"type": "Property", "value": "P1", "ngsildproof": parked}
+        });
+        let resp = app
+            .clone()
+            .oneshot(send("PATCH", &format!("/ngsi-ld/v1/entities/{id}"), merge))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/ngsi-ld/v1/entities/{id}?options=normalized"))
+                    .body(Body::empty())
+                    .expect("req"),
+            )
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let doc = body_json(resp).await;
+        for (attribute, sealed) in [("color", &color), ("parkedAt", &parked)] {
+            let served = &doc[attribute]["ngsildproof"];
+            assert_eq!(
+                served, sealed,
+                "{attribute}: the Sealed Attribute changed: {doc}"
+            );
+            assert_eq!(
+                served["value"].to_string(),
+                sealed["value"].to_string(),
+                "{attribute}: the proof is not byte-equal"
+            );
+            assert_eq!(served["entityTypeSealed"], "Car", "the original term");
+        }
+        assert_eq!(doc["color"]["value"], "red");
+        assert_eq!(doc["parkedAt"]["value"], "P1");
     }
 
     #[tokio::test]

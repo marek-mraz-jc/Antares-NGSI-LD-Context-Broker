@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Self-check for the ETSI resource-sampling pair.
+"""Self-check for the ETSI resource-sampling pair and the per-TP baseline gate.
 
 The two pieces with real logic in them: the sampler's /proc parsing, and the
 report's sample↔TP interval join. Both fail silently if they break — an empty
@@ -9,6 +9,7 @@ check. std-only, no framework.
 Run: python3 dev/etsi-selftest.py
 """
 import csv
+import json
 import os
 import subprocess
 import sys
@@ -90,6 +91,9 @@ def check_join():
         rollup = list(csv.DictReader(open(f"{tmp}/resource-by-test.csv")))
         assert any(r["test"] == "001_01 First" and r["samples"] == "1" for r in rollup), rollup
 
+        tps = {r["test"]: r["status"] for r in csv.DictReader(open(f"{tmp}/tp-status.csv"))}
+        assert tps == {"001_01 First": "PASS", "002_01 Second": "FAIL"}, tps
+
         summary = open(f"{tmp}/run-summary.md").read()
         assert "002_01 Second" in summary, "the failure must reach the summary"
         assert open(f"{tmp}/gate-status.txt").read().strip() == "FAIL", \
@@ -97,8 +101,364 @@ def check_join():
         print(f"  join ok ({len(got)} samples labelled, gate FAIL on a red suite)")
 
 
+def check_baseline():
+    """dev/etsi-baseline.py: a TP that flips red or stops running fails the
+    gate and is named; a new passing TP only asks for a baseline update."""
+    tps = ["TP/a.robot::001_01 First", "TP/a.robot::002_01 Second"]
+    with tempfile.TemporaryDirectory() as tmp:
+        base = f"{tmp}/baseline.json"
+        with open(base, "w") as fh:
+            json.dump({"tps": tps, "mqtt_tps": tps[1:]}, fh)
+
+        def gate(rows, stores="memory", mqtt_off=""):
+            cell = f"{tmp}/cells/ETSI-cell-memory"
+            os.makedirs(cell, exist_ok=True)
+            with open(f"{cell}/tp-status.csv", "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["suite", "source", "test", "status"])
+                for key, status in rows:
+                    source, name = key.split("::")
+                    w.writerow(["Demo", source, name, status])
+            env = {**os.environ, "BASELINE": base, "STORES": stores, "MQTT_OFF": mqtt_off}
+            return subprocess.run([sys.executable, f"{HERE}/etsi-baseline.py", "check",
+                                   f"{tmp}/cells"], env=env, capture_output=True, text=True)
+
+        green = gate([(t, "PASS") for t in tps])
+        assert green.returncode == 0, green.stdout
+        flipped = gate([(tps[0], "PASS"), (tps[1], "FAIL")])
+        assert flipped.returncode != 0, "a flipped TP must fail the gate"
+        assert "FAIL: TP/a.robot::002_01 Second" in flipped.stdout, flipped.stdout
+        gone = gate([(tps[0], "PASS")])
+        assert gone.returncode != 0, "a TP that stopped running must fail the gate"
+        assert "did not run: TP/a.robot::002_01 Second" in gone.stdout, gone.stdout
+        new = gate([(t, "PASS") for t in tps] + [("TP/b.robot::003_01 Third", "PASS")])
+        assert new.returncode == 0, new.stdout
+        assert "ratchet: update baseline: TP/b.robot::003_01 Third" in new.stdout, new.stdout
+        # a cell running with MQTT=0 may lack the MQTT TPs, and only those
+        assert gate([(tps[0], "PASS")], mqtt_off="memory").returncode == 0
+        assert gate([(tps[1], "PASS")], mqtt_off="memory").returncode != 0
+        absent = gate([(t, "PASS") for t in tps], stores="memory file")
+        assert absent.returncode != 0 and "file: no tp-status.csv" in absent.stdout, absent.stdout
+    print("  baseline ok (flip and vanish fail, a new pass asks for a ratchet)")
+
+
+def check_compare():
+    """dev/etsi-baseline.py compare: a TP whose verdict differs between the
+    vanilla and the full run, or that ran in one only, fails and is named;
+    the same failure in both is not a difference; an empty run fails."""
+    with tempfile.TemporaryDirectory() as tmp:
+
+        def run(name, rows):
+            d = f"{tmp}/{name}"
+            os.makedirs(d, exist_ok=True)
+            with open(f"{d}/tp-status.csv", "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["suite", "source", "test", "status"])
+                for key, status in rows:
+                    source, test = key.split("::")
+                    w.writerow(["IOP", source, test, status])
+            return d
+
+        def compare(a, b):
+            return subprocess.run([sys.executable, f"{HERE}/etsi-baseline.py", "compare", a, b],
+                                  capture_output=True, text=True)
+
+        one, two = "IOP_TP/a.robot::IOP_001 One", "IOP_TP/a.robot::IOP_002 Two"
+        vanilla = run("vanilla", [(one, "PASS"), (two, "FAIL")])
+        same = compare(vanilla, run("same", [(one, "PASS"), (two, "FAIL")]))
+        assert same.returncode == 0, same.stdout
+        flipped = compare(vanilla, run("flipped", [(one, "FAIL"), (two, "FAIL")]))
+        assert flipped.returncode != 0 and f"vanilla PASS, full FAIL: {one}" in flipped.stdout, flipped.stdout
+        gone = compare(vanilla, run("gone", [(two, "FAIL")]))
+        assert gone.returncode != 0 and f"vanilla PASS, full did not run: {one}" in gone.stdout, gone.stdout
+        empty = compare(vanilla, run("empty", []))
+        assert empty.returncode != 0 and "no TP ran" in empty.stdout, empty.stdout
+        missing = compare(vanilla, f"{tmp}/nowhere")
+        assert missing.returncode != 0, missing.stdout
+    print("  compare ok (a flip or a TP in one run only fails, a shared failure does not)")
+
+
+def check_view_diff():
+    """dev/etsi-view-diff.py: a TP that differs through the view passes only
+    when its body sent a request the view does not offer, an entity map or a
+    Tenant, or the known file names it; a known TP that answers as E1 again,
+    a deviation nobody owes and a TP that did not run fail."""
+    vd = importlib.util.spec_from_file_location("view_diff", f"{HERE}/etsi-view-diff.py")
+    view_diff = importlib.util.module_from_spec(vd)
+    vd.loader.exec_module(view_diff)
+    binds = view_diff.bindings()
+    root = "http://h/x/views/v/ngsi-ld/v1"
+    for method, url, op in [
+        ("GET", f"{root}/entities/urn:a", "retrieve_entity"),
+        ("GET", f"{root}/types?details=true", "retrieve_entity_type_details"),
+        ("GET", f"{root}/types", "retrieve_entity_types"),
+        ("GET", f"{root}/entities/urn:a/attrs/p/value", "retrieve_attribute_value"),
+        ("POST", f"{root}/entityOperations/upsert?options=update", "batch_upsert"),
+        ("POST", f"{root}/entities/", "create_entity"),
+        ("GET", f"{root}/nothing", None),
+        ("GET", "http://h/q/health", None),
+    ]:
+        assert view_diff.operation(method, url, binds) == op, (method, url)
+
+    a, b, c, d = (f"TP/s.robot::00{i} T" for i in range(4))
+    with tempfile.TemporaryDirectory() as tmp:
+
+        def run(name, rows, requests=()):
+            path = f"{tmp}/{name}"
+            os.makedirs(path)
+            with open(f"{path}/tp-status.csv", "w", newline="") as fh:
+                w = csv.writer(fh)
+                w.writerow(["suite", "source", "test", "status"])
+                for key, status in rows:
+                    w.writerow(["s", *key.split("::"), status])
+            with open(f"{path}/requests.jsonl", "w") as fh:
+                # a fixture's request has no test and names its suite file
+                for test, method, url, headers, *extra in requests:
+                    line = {"test": test, "method": method, "url": url, "headers": headers}
+                    if test is None:
+                        line.update(fixture=True, suite=extra[0])
+                        if len(extra) > 1:
+                            line["body"] = extra[1]
+                    elif extra:
+                        line["body"] = extra[0]
+                    fh.write(json.dumps(line) + "\n")
+            return path
+
+        view = f"{tmp}/view.json"
+        json.dump({"id": "v", "operations": ["retrieve_entity", "create_entity"]}, open(view, "w"))
+        known = f"{tmp}/known.json"
+        json.dump({"v": {d: "T-0000"}}, open(known, "w"))
+        view_diff.KNOWN = known
+        e1 = run("e1", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "PASS")])
+        owed = run("owed", [(a, "FAIL"), (b, "FAIL"), (c, "FAIL"), (d, "FAIL")], [
+            (a, "POST", f"{root}/entityOperations/upsert", []),
+            (b, "GET", f"{root}/entities/urn:x?entityMap=true", []),
+            (c, "GET", f"{root}/entities/urn:x", ["ngsild-tenant"]),
+        ])
+        assert view_diff.diff(view, e1, owed, binds) == 0
+        refusals = json.load(open(f"{owed}/owed-refusals.json"))["refusals"]
+        assert [r["tp"] for r in refusals] == [a, b, c], refusals
+        stale = run("stale", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "PASS")])
+        assert view_diff.diff(view, e1, stale, binds) == 1, "a known TP answering as E1 must fail"
+        offered = run("offered", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
+                      [(a, "POST", f"{root}/entities", [])])
+        assert view_diff.diff(view, e1, offered, binds) == 1, "an offered operation owes nothing"
+        gone = run("gone", [(b, "PASS"), (c, "PASS"), (d, "FAIL")])
+        assert view_diff.diff(view, e1, gone, binds) == 1, "a TP that did not run must fail"
+        json.dump({"id": "v", "operations": ["create_subscription", "retrieve_subscription"]}, open(view, "w"))
+        sub = f"{root}/subscriptions/urn:ngsi-ld:Subscription:1"
+        rootsub = run("rootsub", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
+                      [(a, "GET", sub, [])])
+        assert view_diff.diff(view, e1, rootsub, binds) == 0, "a fixture's Subscription is not the view's (rule 9)"
+        ownsub = run("ownsub", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
+                     [(a, "POST", f"{root}/subscriptions", []), (a, "GET", sub, [])])
+        assert view_diff.diff(view, e1, ownsub, binds) == 1, "a Subscription made through the view owes nothing"
+        # T-3945: after a suite fixture registered a Context Source at the root, an Entity write
+        # and a Subscription through the view stay local (rules 7 and 9)
+        json.dump({"id": "v", "operations": ["create_entity", "create_subscription"]}, open(view, "w"))
+        writes = [(a, "POST", f"{root}/entities", []), (a, "POST", f"{root}/subscriptions", [])]
+        registered = run("registered", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")], [
+            (None, "POST", "http://h/ngsi-ld/v1/csourceRegistrations/", [], "TP/s.robot"), *writes])
+        assert view_diff.diff(view, e1, registered, binds) == 0, "a write after a registration stays local"
+        why = json.load(open(f"{registered}/owed-refusals.json"))["refusals"][0]["owed"]
+        assert ["rule 7" in why[0], "rule 9" in why[1]] == [True, True], why
+        unregistered = run("unregistered", [(a, "FAIL"), (b, "PASS"), (c, "PASS"), (d, "FAIL")], writes)
+        assert view_diff.diff(view, e1, unregistered, binds) == 1, "without a registration a write owes nothing"
+        json.dump({"v": {a: "T-0000"}}, open(known, "w"))
+        assert view_diff.diff(view, e1, rootsub, binds) == 1, "a known TP that is owed now must fail"
+        assert view_diff.diff(view, e1, f"{tmp}/nowhere", binds) == 1, "an empty run must fail"
+
+        # T-3787: a view that hides types and Attributes owes the refusal of a read that names one,
+        # in the query or in the body, under the names the suite's @context gives them
+        restricted = f"{tmp}/restricted.json"
+        json.dump({"id": "r", "operations": ["retrieve_entity", "query_entities", "query_entities_post"],
+                   "selector": ["https://ngsi-ld-test-suite/context#Building"],
+                   "rules": [{"types": ["https://ngsi-ld-test-suite/context#Building"],
+                              "attributes": ["https://ngsi-ld-test-suite/context#name",
+                                             "https://uri.etsi.org/ngsi-ld/location"]}]},
+                  open(restricted, "w"))
+        view_diff.KNOWN = f"{tmp}/none.json"
+        hidden = run("hidden", [(a, "FAIL"), (b, "FAIL"), (c, "FAIL"), (d, "PASS")], [
+            (a, "GET", f"{root}/entities?type=Vehicle", []),
+            (b, "GET", f"{root}/entities?type=Building&q=airQualityLevel>2", []),
+            (c, "POST", f"{root}/entityOperations/query", [],
+             {"type": "Query", "entities": [{"type": "Building"}], "attrs": ["name", "airQualityLevel"]}),
+            (d, "GET", f"{root}/entities?type=Building&attrs=name,location", []),
+        ])
+        assert view_diff.diff(restricted, e1, hidden, binds) == 0
+        why = {r["tp"]: r["owed"] for r in json.load(open(f"{hidden}/owed-refusals.json"))["refusals"]}
+        assert sorted(why) == [a, b, c], why
+        assert "type Vehicle" in why[a][0] and "Attribute airQualityLevel" in why[b][0], why
+        assert any("airQualityLevel" in w for w in why[c]), why
+        shown = run("shown", [(a, "PASS"), (b, "PASS"), (c, "PASS"), (d, "FAIL")],
+                    [(d, "GET", f"{root}/entities?type=Building&attrs=name,location", [])])
+        assert view_diff.diff(restricted, e1, shown, binds) == 1, "a read of shown names owes nothing"
+        # T-3982: a create the view refuses never makes the Entity, so a later TP naming it owes
+        # the 404; a fixture that makes it again at the root clears that
+        made = [
+            (a, "POST", f"{root}/entities/", [], {"id": "urn:B1", "type": "Building"}),
+            (a, "POST", f"{root}/entities", [], {"id": "urn:B2", "type": "Building"}),
+            (None, "POST", "http://h/ngsi-ld/v1/entities", [], "TP/s.robot", {"id": "urn:B2", "type": "Building"}),
+            (b, "GET", f"{root}/entities/urn%3AB1", []),
+            (c, "GET", f"{root}/entities/urn:B2", []),
+            (d, "GET", f"{root}/entities/urn:B3", []),
+        ]
+        unmade = run("unmade", [(a, "FAIL"), (b, "FAIL"), (c, "PASS"), (d, "PASS")], made)
+        assert view_diff.diff(restricted, e1, unmade, binds) == 0
+        why = {r["tp"]: r["owed"] for r in json.load(open(f"{unmade}/owed-refusals.json"))["refusals"]}
+        assert sorted(why) == [a, b] and "never made" in why[b][0], why
+        remade = run("remade", [(a, "FAIL"), (b, "FAIL"), (c, "FAIL"), (d, "PASS")], made)
+        assert view_diff.diff(restricted, e1, remade, binds) == 1, "an Entity a fixture made again owes nothing"
+        other = run("other", [(a, "FAIL"), (b, "FAIL"), (c, "PASS"), (d, "FAIL")], made)
+        assert view_diff.diff(restricted, e1, other, binds) == 1, "an Entity nobody tried to make owes nothing"
+
+        # T-3980: names in the path, the type of an entity id read, an orderBy, a listing, a join, a
+        # query naming no type, and an answer lacking only hidden Attributes are owed by the view
+        json.dump({"id": "r", "operations": ["retrieve_entity", "query_entities", "retrieve_attributes",
+                                             "retrieve_attribute_info", "retrieve_entity_type_info",
+                                             "temporal_retrieve"],
+                   "selector": ["https://ngsi-ld-test-suite/context#Building"],
+                   "rules": [{"types": ["https://ngsi-ld-test-suite/context#Building"],
+                              "attributes": ["https://ngsi-ld-test-suite/context#name"]}]},
+                  open(restricted, "w"))
+        e, f, g, h, i, j, k, m = (f"TP/s.robot::01{n} T" for n in range(8))
+        e1n = run("e1n", [(t, "PASS") for t in (e, f, g, h, i, j, k, m)])
+        narrowed = run("narrowed", [(t, "FAIL") for t in (e, f, g, h, i, j, k, m)], [
+            (e, "GET", f"{root}/attributes/airQualityLevel", []),
+            (f, "GET", f"{root}/temporal/entities/urn:ngsi-ld:Vehicle:7", []),
+            (g, "GET", f"{root}/entities?type=Building&orderBy=rankProbe", []),
+            (h, "GET", f"{root}/attributes?details=false", []),
+            (i, "GET", f"{root}/entities/urn:ngsi-ld:Building:1?join=inline&joinLevel=2", []),
+            (j, "GET", f"{root}/entities?q=name==%22x%22", []),
+            (k, "GET", f"{root}/entities/urn:ngsi-ld:Building:2", []),
+            (m, "GET", f"{root}/entities/urn:ngsi-ld:Building:3", []),
+        ])
+        with open(f"{narrowed}/failures.csv", "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["suite", "test", "message"])
+            w.writerow(["s", "011 T", "never read: a request names it"])
+            w.writerow(["s", "016 T", "Item root['https://ngsi-ld-test-suite/context#airQualityLevel'] removed from dictionary."])
+            w.writerow(["s", "017 T", "Item root['name'] removed from dictionary. KeyError: 'airQualityLevel'"])
+        assert view_diff.diff(restricted, e1n, narrowed, binds) == 1, "an answer lacking a shown Attribute owes nothing"
+        why = {r["tp"]: " ".join(r["owed"]) for r in json.load(open(f"{narrowed}/owed-refusals.json"))["refusals"]}
+        assert sorted(why) == [e, f, g, h, i, j, k], why
+        assert "Attribute airQualityLevel" in why[e] and "type Vehicle" in why[f], why
+        assert "Attribute rankProbe" in why[g] and "lists only" in why[h] and "join" in why[i], why
+        assert "naming no type" in why[j] and "lacks Attribute" in why[k], why
+        assert view_diff.lacking("Item root['name'] removed from dictionary.", view_diff.hidden_by(
+            json.load(open(restricted)), view_diff.core_terms())) == [], "a shown Attribute is not owed"
+        assert view_diff.lacking("anything", None) == [], "a view that shows every name owes no lack"
+        committed = json.load(open(f"{HERE}/../ci/views/etsi/etsi-restricted.json"))
+        reads = {o["id"] for o in __import__("yaml").safe_load(open(view_diff.MATRIX))["operations"]
+                 if o.get("kind") == "read"}
+        assert set(committed["operations"]) == reads, "etsi-restricted offers the matrix's reads"
+    print("  view diff ok (owed refusals pass, a deviation, a stale known entry or a missing TP fails;"
+          " a hidden type or Attribute, or an Entity a refused create never made, owes its refusal,"
+          " a narrowing view its narrowing)")
+
+
+def check_view_residue():
+    """T-3954: an Entity a TP created (setup or body) is deleted at the
+    setup root, local only and in its Tenant, once the TP is over; a 404 is
+    fine, and only creating requests count."""
+    import http.server
+    import threading
+    import types
+
+    # the listener's import; Robot itself is not needed by what runs here
+    for name in ("robot", "robot.libraries", "robot.libraries.BuiltIn"):
+        sys.modules.setdefault(name, types.ModuleType(name))
+    sys.modules["robot.libraries.BuiltIn"].BuiltIn = object
+    spec = importlib.util.spec_from_file_location("etsi_setup_url", f"{HERE}/etsi_setup_url.py")
+    listener = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(listener)
+
+    view = "http://h/x/views/all/ngsi-ld/v1"
+    ids = listener.created_ids
+    assert ids("POST", f"{view}/entities", {"id": "urn:a", "type": "T"}) == ["urn:a"]
+    assert ids("POST", f"{view}/entities/", {"id": "urn:a"}) == ["urn:a"], "D018_03 posts to entities/"
+    assert ids("POST", f"{view}/entityOperations/upsert?options=update",
+               [{"id": "urn:a"}, {"id": "urn:b"}, {"type": "T"}, "x"]) == ["urn:a", "urn:b"]
+    assert ids("POST", f"{view}/entityOperations/create", [{"id": "urn:c"}]) == ["urn:c"]
+    assert ids("POST", f"{view}/entityOperations/delete", ["urn:a"]) == []
+    assert ids("PATCH", f"{view}/entities", {"id": "urn:a"}) == []
+    assert ids("POST", f"{view}/entities/urn:a/attrs", {"id": "urn:a"}) == []
+    assert ids("POST", f"{view}/entities", None) == []
+
+    seen = []
+
+    class Root(http.server.BaseHTTPRequestHandler):
+        def do_DELETE(self):
+            seen.append((self.path, self.headers.get("NGSILD-Tenant")))
+            self.send_response(404 if "gone" in self.path else 204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Root)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        root = f"http://127.0.0.1:{server.server_port}/ngsi-ld/v1"
+        tp = listener.etsi_setup_url(root)
+        tp.created = [("urn:ngsi-ld:Vehicle:1", None), ("urn:ngsi-ld:Vehicle:1", None),
+                      ("urn:gone", None), ("urn:t#1", "city")]
+        tp.end_test(None, None)
+        assert seen == [
+            ("/ngsi-ld/v1/entities/urn%3Angsi-ld%3AVehicle%3A1?local=true", None),
+            ("/ngsi-ld/v1/entities/urn%3Agone?local=true", None),
+            ("/ngsi-ld/v1/entities/urn%3At%231?local=true", "city"),
+        ], seen
+        assert tp.created == [], "the list starts empty for the next TP"
+        seen.clear()
+        tp.end_test(None, None)
+        assert seen == [], "a TP that created nothing deletes nothing"
+    finally:
+        server.shutdown()
+    print("  view residue ok (created ids found, deleted once each at the root, local, in their Tenant)")
+
+
+def check_recorder():
+    """dev/etsi_setup_url.py records what a TP body sends, and nothing a failure left NOT RUN
+    (T-4030: Robot still starts those steps, and their variables do not exist)."""
+    with tempfile.TemporaryDirectory() as d:
+        # a stand-in for RequestsLibrary: the listener reads the owner's name, never the library
+        open(f"{d}/RequestsLibrary.py", "w").write("def post(url, data=None, headers=None, expected_status=None):\n    pass\n")
+        open(f"{d}/t.robot", "w").write("""*** Settings ***
+Library    RequestsLibrary
+*** Variables ***
+${url}    http://127.0.0.1:9/ngsi-ld/v1
+${temporal_api_url}    http://127.0.0.1:9/ngsi-ld/v1/temporal
+*** Test Cases ***
+Runs
+    &{headers}=    Create Dictionary    Content-Type=application/json
+    POST    url=${url}/entities    data={"id": "urn:ngsi-ld:T:1"}    headers=${headers}
+After A Failure
+    Should Be Equal    1    2
+    ${notify_url}=    Set Variable    ${url}/notify
+    POST    url=${notify_url}    data={}
+""")
+        record = f"{d}/requests.jsonl"
+        run = subprocess.run(
+            [sys.executable, "-m", "robot", "--pythonpath", d, "--output", "NONE", "--report", "NONE",
+             "--log", "NONE", "--listener", f"{HERE}/etsi_setup_url.py;http://127.0.0.1:9/ngsi-ld/v1;{record}",
+             f"{d}/t.robot"], capture_output=True, text=True)
+        assert "failed:" not in run.stdout + run.stderr, run.stdout + run.stderr
+        lines = [json.loads(l) for l in open(record)]
+        assert [(l["test"].split("::")[1], l["url"], l["headers"], l["body"]) for l in lines] == [
+            ("Runs", "http://127.0.0.1:9/ngsi-ld/v1/entities", ["content-type"], {"id": "urn:ngsi-ld:T:1"})
+        ], lines
+    print("  recorder ok (a step that runs is recorded, a NOT RUN one is not and raises nothing)")
+
+
 if __name__ == "__main__":
     print("etsi sampling self-check")
     check_proc_parsing()
     check_join()
+    check_baseline()
+    check_compare()
+    check_view_diff()
+    check_view_residue()
+    check_recorder()
     print("OK")

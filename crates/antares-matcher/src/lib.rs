@@ -11,7 +11,21 @@
 //! index-shaped in the broker (candidate lookup by (tenant, type) /
 //! (tenant, watched attribute)); every predicate here evaluates one
 //! candidate self-contained.
-#![cfg_attr(not(test), warn(clippy::expect_used))]
+//!
+#![doc = include_str!("../README.md")]
+// T-3468: every surface calls into this crate on a request path, where a
+// panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
+// index out of bounds or overflow.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
 #![deny(missing_docs)]
 
 use antares_jsonld::Context;
@@ -120,10 +134,9 @@ pub fn geo_params(g: &Map<String, Value>) -> std::collections::HashMap<String, S
 /// conditions must hold.
 pub fn conditions_match(sub: &Value, doc: &Value, ctx: &Context, lookup: EntityLookup) -> bool {
     if let Some(q) = sub_str(sub, "q") {
-        // q values in subscription bodies may be percent-encoded (4.9, 046_05)
-        let q = antares_ql::percent_decode(q.as_bytes());
+        // a JSON string, read as written: no percent-decoding (5.2.12, 046_05)
         // parsed once per distinct q text, not once per event per candidate
-        match antares_ql::regex::q_node(&q) {
+        match antares_ql::regex::q_node(q) {
             Some(node) => {
                 // Table 5.2.12-1 gives the Subscription the `expandValues`
                 // and `jsonKeys` pair 4.9 gives the query, and this
@@ -195,7 +208,9 @@ pub fn throttled(sub: &Value) -> bool {
         return false;
     };
     chrono::DateTime::parse_from_rfc3339(last).is_ok_and(|t| {
-        (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_milliseconds()
+        chrono::Utc::now()
+            .signed_duration_since(t.with_timezone(&chrono::Utc))
+            .num_milliseconds()
             < (secs * 1000.0) as i64
     })
 }
@@ -286,12 +301,20 @@ mod tests {
         );
     }
 
+    /// The lookup of a test with no store: every linked Entity is absent.
+    fn no_store(_: &str) -> Option<Value> {
+        None
+    }
+
     /// 5.8.6: every predicate holds → the change would notify.
     #[test]
     fn matching_change_notifies() {
-        assert!(would_notify(&sub(), &vehicle(30.0, -3.7), &ctx(), &|_| {
-            None
-        }));
+        assert!(would_notify(
+            &sub(),
+            &vehicle(30.0, -3.7),
+            &ctx(),
+            &no_store
+        ));
     }
 
     /// Each predicate alone refuses: q (4.9), geoQ (4.10), selector type,
@@ -339,6 +362,14 @@ mod tests {
             !throttled(&s),
             "an old lastNotification is outside the window"
         );
+        // the window is in seconds: 10 s ago is inside 60 s and outside 5 s
+        let ago = (chrono::Utc::now() - chrono::Duration::seconds(10))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        s["notification"]["lastNotification"] = json!(ago);
+        s["throttling"] = json!(60);
+        assert!(throttled(&s), "10 s ago, 60 s window");
+        s["throttling"] = json!(5);
+        assert!(!throttled(&s), "10 s ago, 5 s window");
     }
 
     /// 5.2.33 Table 5.2.33-1: `id` takes precedence over `idPattern`, and a
@@ -358,6 +389,48 @@ mod tests {
         );
     }
 
+    /// The edges of the selector and the conditions (T-3912, the `ngsild` coverage gate): a type
+    /// expression of 4.17, an `id` that is neither a String nor a String[] (Table 5.2.33-1), a
+    /// `q` or a `geoQ` the broker cannot read (it notifies nothing rather than everything), and
+    /// `coordinates` written as a JSON array instead of the string Table 5.2.13-1 shows.
+    #[test]
+    fn selector_and_condition_edges() {
+        let c = ctx();
+        let none = |_: &str| None;
+        let doc = vehicle(30.0, -3.7);
+        let typed = |t: String| json!({"entities": [{"type": t}]});
+        assert!(selector_match(
+            &typed(format!("{DC}/Bicycle|{DC}/Vehicle")),
+            &doc,
+            &c
+        ));
+        assert!(!selector_match(
+            &typed(format!("{DC}/Bicycle|{DC}/Car")),
+            &doc,
+            &c
+        ));
+        assert!(
+            !selector_match(&json!({"entities": [{"id": 7}]}), &doc, &c),
+            "id of no listed shape"
+        );
+
+        let mut s = sub();
+        s["q"] = json!("(speed>25");
+        assert!(antares_ql::parse_q("(speed>25").is_err());
+        assert!(!conditions_match(&s, &doc, &c, &none), "an unreadable q");
+        let mut s = sub();
+        s["geoQ"]["geometry"] = json!("Nothing");
+        assert!(!conditions_match(&s, &doc, &c, &none), "an unreadable geoQ");
+
+        let g = json!({"georel": "near;maxDistance==2000", "geometry": "Point", "coordinates": [-3.7, 40.4]});
+        assert_eq!(
+            geo_params(g.as_object().expect("object"))["coordinates"],
+            "[-3.7,40.4]"
+        );
+        let g = json!({"georel": "near;maxDistance==2000", "geometry": "Point"});
+        assert!(!geo_params(g.as_object().expect("object")).contains_key("coordinates"));
+    }
+
     /// 4.9 EXAMPLE 13/14: a linked-entity term (`driver{name}`) resolves the
     /// Relationship object through `lookup`; without a store it cannot match.
     #[test]
@@ -374,24 +447,47 @@ mod tests {
         };
         assert!(conditions_match(&s, &doc, &c, &store));
         assert!(
-            !conditions_match(&s, &doc, &c, &|_| None),
+            !conditions_match(&s, &doc, &c, &no_store),
             "no store, no match"
         );
     }
 
-    /// 4.19: `scopeQ` is a condition like `q`; a percent-encoded `q` (as a
-    /// subscription body may carry it) decodes before evaluation.
+    /// 4.19: `scopeQ` is a condition like `q`.
     #[test]
-    fn scope_q_and_percent_encoded_q() {
+    fn scope_q_is_a_condition() {
         let c = ctx();
         let mut doc = vehicle(30.0, -3.7);
         doc["scope"] = json!(["/Madrid/Centre"]);
         let mut s = sub();
         s["scopeQ"] = json!("/Madrid/#");
-        s["q"] = json!("speed%3E25");
-        assert!(conditions_match(&s, &doc, &c, &|_| None));
+        assert!(conditions_match(&s, &doc, &c, &no_store));
         s["scopeQ"] = json!("/Paris/#");
-        assert!(!conditions_match(&s, &doc, &c, &|_| None));
+        assert!(!conditions_match(&s, &doc, &c, &no_store));
+    }
+
+    /// Table 5.2.12-1: a Subscription's `q` is a JSON string, not part of a
+    /// URI, so it is read as written: `%20` is three characters (forge
+    /// cd2ef2ba, 046_05).
+    #[test]
+    fn a_subscription_q_is_not_percent_decoded() {
+        let c = ctx();
+        let named = |name: &str| {
+            expand(json!({
+                "id": "urn:ngsi-ld:Vehicle:A1",
+                "type": "Vehicle",
+                "name": {"type": "Property", "value": name}
+            }))
+        };
+        let mut s = sub();
+        s.as_object_mut().expect("object").remove("geoQ");
+        s["q"] = json!("name==\"Eiffel%20Tower\"");
+        assert!(conditions_match(
+            &s,
+            &named("Eiffel%20Tower"),
+            &c,
+            &no_store
+        ));
+        assert!(!conditions_match(&s, &named("Eiffel Tower"), &c, &no_store));
     }
 
     /// Table 5.2.33-1 `type`: "A valid type selection string as per clause

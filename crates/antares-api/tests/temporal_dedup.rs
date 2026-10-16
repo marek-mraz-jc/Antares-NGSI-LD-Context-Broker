@@ -181,78 +181,69 @@ async fn dataset_ids_keep_their_own_instances_at_one_observed_at() {
 
 const UP: &str = "urn:ngsi-ld:D:up";
 
-/// A correction is not a new instance. 5.6.11.4 sends the Temporal Evolution
-/// through 5.6.12, whose rule is that instances "shall be added"; the in-tree
-/// ETSI fixtures require an instance at the same (datasetId, observedAt) to be
-/// corrected in place instead, and 5.6.14.4 — the clause for the same kind of
-/// in-place change — says "The createdAt property of the concerned instance
-/// shall remain unchanged". So the surviving instance keeps the instanceId the
-/// client was handed and the createdAt it was created at; only its value and
-/// modifiedAt move.
+/// 5.6.11.4 sends a known Temporal Evolution through 5.6.12: its instances
+/// "shall be added to the existing" one. Instance identity is the
+/// system-generated instanceId, never observedAt, so a second upsert at the
+/// same instant appends (forge 167fa185, 008_01). Each instanceId the client
+/// was handed still addresses its own instance.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_upsert_correction_keeps_the_instance_it_corrects() {
+async fn a_second_temporal_upsert_at_the_same_instant_appends() {
     let st = state().await;
     let post = |speed: Value| {
         json!({"id": UP, "type": "D", "speed": [{"type": "Property", "value": speed,
                "observedAt": T1}]})
     };
-    let (s, b) = req(
-        &st,
-        "POST",
-        "/ngsi-ld/v1/temporal/entities",
-        Some(post(json!(120))),
-    )
-    .await;
-    assert!(s.is_success(), "{s} {b}");
-
-    let read = || async {
-        let (s, doc) = req(
+    for v in [120, 121] {
+        let (s, b) = req(
             &st,
-            "GET",
-            &format!("/ngsi-ld/v1/temporal/entities/{UP}?options=sysAttrs"),
-            None,
+            "POST",
+            "/ngsi-ld/v1/temporal/entities",
+            Some(post(json!(v))),
         )
         .await;
-        assert_eq!(s, 200, "{doc}");
-        let mut all = instances(&doc, "speed");
-        assert_eq!(all.len(), 1, "one instant, one instance: {doc}");
-        all.remove(0)
-    };
-    let before = read().await;
-    let iid = before["instanceId"]
-        .as_str()
-        .expect("instanceId")
-        .to_owned();
-
-    let (s, b) = req(
+        assert!(s.is_success(), "{s} {b}");
+    }
+    let (s, doc) = req(
         &st,
-        "POST",
-        "/ngsi-ld/v1/temporal/entities",
-        Some(post(json!(121))),
-    )
-    .await;
-    assert!(s.is_success(), "{s} {b}");
-    let after = read().await;
-
-    assert_eq!(after["value"], 121, "the correction landed: {after}");
-    assert_eq!(
-        after["instanceId"], before["instanceId"],
-        "the corrected instance lost the id its client holds: {after}"
-    );
-    assert_eq!(
-        after["createdAt"], before["createdAt"],
-        "createdAt shall remain unchanged: {after}"
-    );
-
-    // and the id the client holds still addresses it (5.6.14 / 5.6.15)
-    let (s, b) = req(
-        &st,
-        "DELETE",
-        &format!("/ngsi-ld/v1/temporal/entities/{UP}/attrs/speed/{iid}"),
+        "GET",
+        &format!("/ngsi-ld/v1/temporal/entities/{UP}"),
         None,
     )
     .await;
-    assert_eq!(s, 204, "the instanceId still names the instance: {b}");
+    assert_eq!(s, 200, "{doc}");
+    let speed = instances(&doc, "speed");
+    let mut values: Vec<i64> = speed.iter().filter_map(|i| i["value"].as_i64()).collect();
+    values.sort_unstable();
+    assert_eq!(values, [120, 121], "both instances are kept: {doc}");
+    assert_ne!(speed[0]["instanceId"], speed[1]["instanceId"], "{doc}");
+
+    // the first instanceId still names its own instance (5.6.15)
+    let first = speed
+        .iter()
+        .find(|i| i["value"] == 120)
+        .and_then(|i| i["instanceId"].as_str())
+        .expect("instanceId of 120")
+        .to_owned();
+    let (s, b) = req(
+        &st,
+        "DELETE",
+        &format!("/ngsi-ld/v1/temporal/entities/{UP}/attrs/speed/{first}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, 204, "{b}");
+    let (_, doc) = req(
+        &st,
+        "GET",
+        &format!("/ngsi-ld/v1/temporal/entities/{UP}"),
+        None,
+    )
+    .await;
+    let left: Vec<Value> = instances(&doc, "speed")
+        .iter()
+        .map(|i| i["value"].clone())
+        .collect();
+    assert_eq!(left, [json!(121)], "only the 120 instance went: {doc}");
 }
 
 const AR: &str = "urn:ngsi-ld:D:ar";

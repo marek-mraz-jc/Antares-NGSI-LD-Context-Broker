@@ -28,12 +28,12 @@ jobs:
     # keep the arm runner, they run fine there.
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
+    env: &workspace-env
       # Live PostGIS for the antares-sql integration tests — without this
       # they skip vacuously and CI proves nothing about the Pg store.
       ANTARES_TEST_DATABASE_URL: postgresql://antares:antares@localhost:15432/antares
       CARGO_TERM_COLOR: always
-    services:
+    services: &workspace-services
       postgis:
         image: ghcr.io/baosystems/postgis:17-3.5
         env:
@@ -91,10 +91,12 @@ jobs:
       # (.config/nextest.toml, profile `ci`) — dev/unit-report-site.py folds
       # those into the /reports/unit/ page. Plain `cargo test` leaves no
       # machine-readable trace behind.
-      - uses: taiki-e/install-action@nextest
+      - &nextest
+        uses: taiki-e/install-action@nextest
       # Live MQTT server for the clause-7 e2e — without the env var the
       # test skips vacuously and CI proves nothing about MQTT delivery.
-      - name: Start mosquitto for the MQTT e2e
+      - &mosquitto
+        name: Start mosquitto for the MQTT e2e
         run: |
           sudo apt-get install -y -qq mosquitto
           printf 'allow_anonymous true\nlistener 1883\n' | sudo tee /etc/mosquitto/conf.d/antares-e2e.conf
@@ -103,7 +105,8 @@ jobs:
       # Live NATS (JetStream) for the bus tests + the 2-instance roles e2e.
       # A `docker run` step, not a service: services cannot pass the `-js`
       # command argument the JetStream engine needs.
-      - name: Start NATS (JetStream) for the bus tests
+      - &nats
+        name: Start NATS (JetStream) for the bus tests
         run: |
           docker run -d --name nats -p 4222:4222 nats:2-alpine -js
           echo "ANTARES_TEST_NATS_URL=nats://127.0.0.1:4222" >> "$GITHUB_ENV"
@@ -112,7 +115,8 @@ jobs:
       # real pass. Every `SKIP: <VAR> not set` marker in the tree must name a
       # variable this job supplies, so a new gate either gets its service here
       # or turns the build red.
-      - name: no test skips vacuously
+      - &no-vacuous-skip
+        name: no test skips vacuously
         run: |
           vars=$(grep -rhoE 'SKIP: [A-Z_]+(( / )[A-Z_]+)* not set' crates/ \
                    --include='*.rs' \
@@ -132,6 +136,10 @@ jobs:
       # moves under everyone's feet takes the wasm32 arm down silently. A
       # check here costs one target and keeps the arm honest per commit.
       - run: cargo check --locked --target wasm32-unknown-unknown -p antares-wasm
+      # T-3911: the JSON-LD algorithms without the `fetch` loader build for
+      # the browser with no network stack at all, the shape another project
+      # embeds (rule M3).
+      - run: cargo check --locked --target wasm32-unknown-unknown -p ngsild-jsonld --no-default-features
       # --locked everywhere below: the image builds with it (Dockerfile), so
       # without it CI would gate on a dependency set the shipped binary never
       # used, and an out-of-date Cargo.lock would pass here and fail there.
@@ -147,7 +155,9 @@ jobs:
               docker stats --no-stream --format '  {{.Name}} {{.MemUsage}}' 2>/dev/null
             done ) &
           SAMPLER=$!
-          cargo clippy --locked --workspace --all-targets -- -D warnings
+          # --all-features: code behind a feature (policy addons, mqtt, the
+          # plugin example) is held to the same wall (finding F7, T-3490).
+          cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
           kill $SAMPLER
       # `fuzz/` is not a workspace member (its targets need libFuzzer's
       # sanitizer flags to LINK), so the wall above never looks at it and a
@@ -167,19 +177,13 @@ jobs:
       # --run-ignored all: that would also pull in the release-only timing gate.
       - name: Tests that need a live database
         run: |
-          dev/unit-junit.sh ignored-db-api -p antares-api \
-            --test split_entities_5_7_2 --test temporal_fed_paging_5_7_4 \
-            --run-ignored ignored-only
+          dev/unit-junit.sh ignored-db-api -p antares-api --test it \
+            --run-ignored ignored-only \
+            -E 'test(/^(split_entities_5_7_2|temporal_fed_paging_5_7_4)::/)'
           dev/unit-junit.sh ignored-db-broker -p antares-broker --bin antares \
             --run-ignored ignored-only outbox_flush_waits
-      # The API tests once more on the on-disk redb store: AppState::new
-      # composes a fresh file store per state under this harness variable,
-      # so every test that passed on memory has to pass on the durable
-      # backend too — no second copy of the tests.
-      - run: ANTARES_TEST_STORE=file dev/unit-junit.sh file-store -p antares-api
-      # feature matrix: no defaults + all features
-      - run: dev/unit-junit.sh no-default-features --workspace --no-default-features
-      - run: dev/unit-junit.sh all-features --workspace --all-features
+      # file-store, no-default-features and all-features: the feature-sets
+      # job below, beside this one
       # Same store tests, timescale temporal mode (hypertable DDL branch,
       # compression-vs-RLS ordering, backend detection).
       - name: Store tests against the timescale temporal mode
@@ -204,19 +208,53 @@ jobs:
           name: unit-junit
           path: unit-junit/
           if-no-files-found: warn
-      # License gate (nothing links TSL — Timescale is talked to
-      # over SQL only) + advisories. A pinned release binary, not the
-      # cargo-deny-action, so the job stays portable across runner archs.
-      - name: cargo-deny (licenses + advisories)
+      # Every deny.toml check on every change (T-3475): licenses (nothing
+      # links TSL — Timescale is talked to over SQL only), advisories, bans
+      # (wildcards, banned crates) and sources (crates.io only, no unknown
+      # git or registry). bans and sources ran only in the weekly sweep, so
+      # a dependency from an unlisted git source merged green. A pinned
+      # release binary, not the cargo-deny-action, so the job stays portable
+      # across runner archs.
+      - name: cargo-deny (licenses, advisories, bans, sources)
         run: |
           V=0.20.2
           curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${V}/cargo-deny-${V}-$(uname -m)-unknown-linux-musl.tar.gz" \
             | tar xz -C "$HOME/.cargo/bin" --strip-components=1 --wildcards '*/cargo-deny'
-          cargo deny --log-level warn check licenses advisories
+          cargo deny --log-level warn check all
+      # Supply chain per run (surfaces-threat-model 11.1, T-3489), every
+      # tool at an exact version. cargo-audit reads Cargo.lock whole and
+      # fails on any warning (unmaintained, yanked) too; it ignores exactly
+      # what deny.toml ignores, so the two tools cannot drift. machete needs
+      # no build. The SBOMs are the broker's: vanilla (grepped for every
+      # surface, ops and protocol crate, rule M3) and full once that feature
+      # exists.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2,cargo-machete@0.9.2,cargo-cyclonedx@0.5.9
+      - name: cargo-audit
+        run: |
+          python3 dev/advisory-ignores.py --self-test
+          cargo audit --deny warnings $(python3 dev/advisory-ignores.py)
+      - name: cargo-machete
+        run: cargo machete
+      - name: SBOM (vanilla and full)
+        run: dev/sbom.sh sbom
+      - uses: actions/upload-artifact@v6
+        with:
+          name: sbom
+          path: sbom/*.cdx.json
+          retention-days: 30
       # The ETSI resource sampler + its sample↔TP join fail silently when
       # broken (an empty column reads as "nothing happened") — check them here.
+      # robotframework at the suite's pin: the request recorder runs a two-test suite (T-4030).
       - name: ETSI sampling self-check
-        run: python3 dev/etsi-selftest.py
+        run: pip install --quiet pyyaml robotframework==7.4.1 && python3 dev/etsi-selftest.py
+      # The external-suites harness (T-3549): its comparator and adapters
+      # decide verdicts, and a wrong one reads as a plausible pass.
+      - name: External-suites harness self-check
+        run: |
+          python3 -m unittest discover -s tests/external/coraine
+          python3 -m unittest discover -s tests/external/etsi
       # Same failure shape one layer over: the merged coverage table counts
       # functions from lcov FN records, and a wrong key there prints a
       # plausible percentage rather than an error.
@@ -226,7 +264,7 @@ jobs:
       # drops out of every count — make that (and status typos, robot drift)
       # a red build instead.
       - name: conformance ledger check
-        run: pip install --quiet pyyaml && python3 dev/spec.py check
+        run: pip install --quiet pyyaml && python3 dev/spec.py check && python3 dev/spec_test.py
 
       - name: Env-var docs check
         run: ./dev/check-env-docs.sh
@@ -256,6 +294,39 @@ jobs:
       # clean one.
       - name: No addon in the shipped build
         run: ./dev/check-no-addon.sh
+      # Rule M3 proven twice more (ADR-0027 section 3, surfaces-threat-model
+      # 9.5): what the default build compiles is a committed file, so a
+      # change to vanilla shows in the diff of the commit that makes it
+      # (refresh: dev/vanilla-tree.sh > ci/vanilla-tree.txt); and the
+      # vanilla debug binary carries no symbol of a surface, ops or protocol
+      # crate and refuses a surface it was not built with. Both self-test
+      # against a build with an addon.
+      - name: Vanilla feature tree is committed
+        run: dev/vanilla-tree.sh | diff -u ci/vanilla-tree.txt -
+      - name: Vanilla binary links no surface
+        run: ./dev/check-vanilla-symbols.sh
+      # Module rules M1 and M2 (ADR-0027, surfaces-threat-model 9.3/9.4):
+      # every package declares its role, a surface reaches the store only
+      # through antares-ops, a protocol crate knows nothing of antares-*.
+      # The self-test plants each violation once before the real check runs.
+      - name: Module rules
+        run: |
+          python3 dev/check-module-rules.py --self-test
+          python3 dev/check-module-rules.py
+      # Every STRIDE row of the surfaces threat model names a test, and the
+      # test exists once the crate that owns it does (surfaces-test-plan.md
+      # section 8, T-3492): a threat cannot lose its test silently. The
+      # self-test plants each red case first.
+      - name: Threat-model tests exist
+        run: |
+          python3 dev/threat-tests.py --self-test
+          python3 dev/threat-tests.py
+      # Security invariants as code-graph queries (T-3587): dev/security.cypher
+      # against ci/cg-allowlist.txt. cg is owner tooling a runner cannot
+      # install yet, so CI runs the checker's self-test; the graph run itself
+      # is `dev/cg-invariants.py` after `cg build`, before every hand merge.
+      - name: cg invariants checker
+        run: python3 dev/cg-invariants.py --selftest
       # SQL-injection guard: dynamically assembled SQL (AssertSqlSafe, or an
       # sqlx query built with format!) belongs to the antares-sql backend
       # source and nowhere else. Everything a request supplies reaches the
@@ -291,6 +362,238 @@ jobs:
             | grep -v 'crates/antares-jsonld/src/loader.rs:'
 
 
+  feature-sets:
+    # The suite once more on another store or feature set. The three passes
+    # ran one after another in the job above, 640 s of its 24 min (run
+    # 38141581358: no-default-features 245 s, all-features 270 s,
+    # file-store 125 s) and the whole `fast` lane waited on them; a cell
+    # each runs beside it, with the same databases, brokers and skip guard
+    # (T-3710).
+    name: Workspace tests (${{ matrix.set }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env: *workspace-env
+    services: *workspace-services
+    strategy:
+      fail-fast: false
+      matrix:
+        set: [no-default-features, all-features, file-store]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+          cache-on-failure: true
+          key: feature-sets-${{ matrix.set }}
+      - *nextest
+      - *mosquitto
+      - *nats
+      - *no-vacuous-skip
+      - name: The workspace suite without default features
+        if: matrix.set == 'no-default-features'
+        run: dev/unit-junit.sh no-default-features --workspace --no-default-features
+      - name: The workspace suite with every feature
+        if: matrix.set == 'all-features'
+        run: dev/unit-junit.sh all-features --workspace --all-features
+      # AppState::new composes a fresh redb file store per state under this
+      # harness variable, so every API test that passed on memory has to pass
+      # on the durable backend too — no second copy of the tests.
+      - name: The API tests on the on-disk store
+        if: matrix.set == 'file-store'
+        run: ANTARES_TEST_STORE=file dev/unit-junit.sh file-store -p antares-api
+      # dev/fold-reports.sh folds these into the job above's unit-junit
+      - name: Unit JUnit bundle
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: unit-junit-${{ matrix.set }}
+          path: unit-junit/
+          if-no-files-found: warn
+
+  fuzz-smoke:
+    # surfaces-test-plan.md section 5 (T-3492): a parser change does not merge
+    # unfuzzed. Every fuzz target the pull request touches (its source, its
+    # crash corpus, or a crate it reaches through the manifests; a manifest
+    # or lock change touches all) replays its committed crashes and fuzzes
+    # for 30 s with a 512 MB malloc cap. A dispatch run has no base and runs
+    # every target. fuzz.yml keeps the long twice-weekly runs.
+    name: Fuzz smoke (touched targets, 30 s each)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Target selection self-test
+        run: python3 dev/fuzz-smoke.py --self-test
+      - name: Targets this change touches
+        id: pick
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          targets=$(python3 dev/fuzz-smoke.py --list ${BASE:+--base "$BASE"} | paste -sd' ')
+          echo "touched: ${targets:-none}"
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+      - if: steps.pick.outputs.targets != ''
+        uses: dtolnay/rust-toolchain@nightly
+      - if: steps.pick.outputs.targets != ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - if: steps.pick.outputs.targets != ''
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Replay and fuzz the touched targets
+        if: steps.pick.outputs.targets != ''
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: python3 dev/fuzz-smoke.py --run ${BASE:+--base "$BASE"}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fuzz-smoke-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  features:
+    # GOAL point 2 (T-3465): every cargo feature builds, lints and tests on
+    # its own. The feature-sets job checks no-default and all-features, where a
+    # feature that only compiles next to another one passes unseen; this one
+    # takes each feature alone. A new feature joins it by being declared:
+    # cargo-hack enumerates them from the manifests.
+    # Excluded: `console` (antares-broker), the tokio-console hook for local
+    # debugging, which needs RUSTFLAGS="--cfg tokio_unstable" and is never in
+    # a release (crates/antares-broker/Cargo.toml).
+    # One entry per feature-carrying crate (measured 2026-10-10, 8 jobs:
+    # check of all 26 combinations 144 s, clippy of the 18 140 s, one
+    # antares-api test run 165 s x 7 features, one antares-broker run 69 s x
+    # 4): a single job would pass 15 minutes on a runner, a split one stays
+    # well under.
+    name: Each feature alone (${{ matrix.package }}${{ matrix.partition && format(' {0}', matrix.partition) || '' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # `package`, not `crate`: dev/spec.py reads the first `crate:` matrix
+        # as the shared-crates one
+        package: [workspace, antares-broker, antares-notifier, antares-sql]
+        # antares-api's seven feature runs took 24 min in one job (run
+        # 38064052714): cargo-hack's --partition deals them to four runners
+        # (T-3540).
+        include:
+          - { package: antares-api, partition: 1/4 }
+          - { package: antares-api, partition: 2/4 }
+          - { package: antares-api, partition: 3/4 }
+          - { package: antares-api, partition: 4/4 }
+          # ADR-0027 section 6 (T-3493): the stripped release binary per
+          # surface feature against vanilla; not a crate, so no clippy or
+          # test step runs for it.
+          - { package: binary-size }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+          key: features-${{ matrix.package }}-${{ strategy.job-index }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: Every crate builds with each of its features alone
+        if: matrix.package == 'workspace'
+        run: cargo hack check --locked --workspace --exclude antares-wasm --each-feature --exclude-features console
+      - name: Clippy with each feature alone
+        if: matrix.package != 'workspace' && matrix.package != 'binary-size'
+        run: cargo hack clippy --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }} --all-targets -- -D warnings
+      - name: Tests with each feature alone
+        if: matrix.package != 'workspace' && matrix.package != 'binary-size'
+        run: cargo hack test --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }}
+      # The budget is ADR-0027 section 6's "binary size" row, read from the
+      # ADR (`full` and each feature alone <= vanilla + 10 MiB, T-3775); the table goes to the step summary.
+      - name: Binary size per surface feature
+        if: matrix.package == 'binary-size'
+        run: |
+          python3 dev/surface-features.py --self-test
+          python3 dev/surface-features.py sizes
+
+  coverage-surfaces:
+    # Every new crate of the surfaces epic (metadata.antares.role ops,
+    # surface or protocol) covers 100 % of its lines and branches, minus
+    # what ci/coverage-exclusions.toml lists with a reason; an entry that
+    # is covered now or names a gone function is red too (surfaces-test-plan
+    # section 1, T-3491). A new crate joins by its role, without a YAML
+    # edit; with none yet the gate says so and passes. Existing crates keep
+    # T-3468's 95 % floor. Nightly for llvm-cov's --branch.
+    name: Coverage of the new crates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+          key: coverage-surfaces
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Coverage gate self-test
+        run: python3 dev/coverage-gate.py --self-test
+      - name: 100 % lines and branches, minus the listed exclusions
+        run: python3 dev/coverage-gate.py
+
+  odata-csdl-conformance:
+    # The `$metadata` odata-csdl writes, against the OASIS artefacts pinned by
+    # ADR-0024 decision 6 (fetched with a checksum, never vendored): edmx.xsd
+    # via xmllint, csdl.schema.json via ajv, the OASIS xml2json converter, and
+    # every annotation term against the pinned vocabularies (T-3502).
+    name: OData CSDL against the OASIS schemas
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+          key: odata-csdl-conformance
+      - name: xmllint
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libxml2-utils
+      - name: Schemas, converter and vocabulary terms
+        run: python3 dev/odata-csdl-conformance.py
+
+  odata-url-abnf:
+    # odata_url_abnf_testcases: the 840 OASIS ABNF test cases (odata-abnf at the
+    # commit ADR-0024 decision 3 pins, fetched with a checksum, never vendored)
+    # through odata-url, counted per rule and outcome (T-3503).
+    name: OData URLs against the OASIS ABNF test cases
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+          key: odata-url-abnf
+      - run: pip install --quiet --disable-pip-version-check pyyaml==6.0.3
+      - name: odata_url_abnf_testcases
+        run: python3 dev/odata-url-abnf.py
+
   msrv:
     # The declared rust-version stays PROVEN as stable moves on.
     name: MSRV check (1.97)
@@ -321,7 +624,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [antares-model, antares-ql, antares-jsonld, antares-matcher, antares-store]
+        crate: [ngsild-model, ngsild-ql, ngsild-jsonld, ngsild-matcher, ngsild-residual, antares-store]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -331,6 +634,21 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
       - run: cargo check --locked -p ${{ matrix.crate }} -j 2
       - run: cargo test --locked -p ${{ matrix.crate }} -j 2
+      # T-3912: each example reads real NGSI-LD input from the ETSI suite's fixtures; it has to
+      # run, not only compile, or the README's promise is untested.
+      - name: Examples run
+        run: |
+          # T-3962: a package's folder is not its name (ngsild-model lives in crates/antares-model)
+          dir=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, os, sys; print(next(os.path.dirname(p["manifest_path"]) for p in json.load(sys.stdin)["packages"] if p["name"] == sys.argv[1]))' "${{ matrix.crate }}")
+          for example in "$dir"/examples/*.rs; do
+            [ -e "$example" ] || continue
+            name=$(basename "$example" .rs)
+            # an example with `required-features` runs with them (gateway_expand needs `fetch`)
+            features=$(cargo metadata --locked --no-deps --format-version 1 | jq -r \
+              --arg c "${{ matrix.crate }}" --arg e "$name" \
+              '.packages[] | select(.name == $c) | .targets[] | select(.name == $e) | (.["required-features"] // []) | join(",")')
+            cargo run --locked -q -p ${{ matrix.crate }} ${features:+--features "$features"} --example "$name" -j 2
+          done
       # the smallest broker build (every optional feature off) must compile
       - run: cargo check --locked -p antares-broker --no-default-features -j 2
         if: matrix.crate == 'antares-store'
@@ -360,3 +678,48 @@ jobs:
              | grep -E '^(antares-api|antares-broker|antares-sql|sqlx|axum|redb) '; then
             echo "::error::${{ matrix.crate }} depends on the broker or a storage backend"; exit 1
           fi
+
+  ngsild-publish:
+    # T-3912: the NGSI-LD crates build from their packaged files alone (no path-only dependency,
+    # the README packaged with its doctest), in dependency order, as a release would publish
+    # them; and a breaking change to their public API is a visible line against the last v* tag.
+    name: NGSI-LD crates (package, semver)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # cargo-semver-checks builds the baseline from the last tag
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@0.50.0
+      - name: cargo publish --dry-run (packaged files only)
+        run: |
+          cargo publish --dry-run --locked \
+            -p ngsild-model -p ngsild-jsonld -p ngsild-ql -p ngsild-matcher -p ngsild-residual
+      - name: cargo package --list (what a release ships)
+        run: |
+          for crate in ngsild-model ngsild-jsonld ngsild-ql ngsild-matcher ngsild-residual; do
+            echo "== $crate: $(cargo package --locked --list -p "$crate" | wc -l) files"
+          done
+      - name: cargo-semver-checks against the last v* tag
+        run: |
+          base=$(git describe --tags --abbrev=0 --match 'v*')
+          echo "baseline $base"
+          # a crate the baseline tag does not have yet has no API to break
+          # a crate the baseline tag has under another package name (T-3962) has no API of that
+          # name to compare either
+          for crate in ngsild-model ngsild-jsonld ngsild-ql ngsild-matcher ngsild-residual; do
+            dir="crates/antares-${crate#ngsild-}"
+            if git show "$base:$dir/Cargo.toml" 2>/dev/null | grep -qx "name = \"$crate\""; then
+              cargo semver-checks --baseline-rev "$base" -p "$crate"
+            else
+              echo "::notice::$crate is new since $base, no baseline to compare"
+            fi
+          done

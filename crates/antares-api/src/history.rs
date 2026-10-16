@@ -188,12 +188,12 @@ pub(crate) async fn mirror_delete_attr(
                 return Ok::<(), std::convert::Infallible>(());
             };
             if attr_iri == "scope" {
-                // scope deletion: temporal scope becomes an instance array with
-                // value [] (the 020_19/020_20 shape)
+                // scope deletion: a deleted scope is the NGSI-LD Null (4.18:
+                // urn:ngsi-ld:null appears only for deleted scopes; 4.5.0)
                 had = true;
                 let inst = serde_json::json!({
                     "type": "Property",
-                    "value": [],
+                    "value": "urn:ngsi-ld:null",
                     "instanceId": format!("urn:ngsi-ld:Instance:{}", uuid::Uuid::new_v4()),
                     "deletedAt": ts,
                 });

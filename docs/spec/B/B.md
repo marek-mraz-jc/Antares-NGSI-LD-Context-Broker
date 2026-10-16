@@ -2,18 +2,22 @@
 clause: B
 title: 'Annex B (normative): Core NGSI-LD @context definition'
 pages: 365-371
-status: implemented
-evidence: 'antares-jsonld loader.rs pinned(): the Annex B core @context (v1.9 document, 206 terms transcribed
-  from pages 365-371) compiled in alongside v1.3-v1.8, resolvable without network (tests pinned_versions_resolve_without_network,
-  the_v1_9_core_context_carries_the_terms_v1_9_added); the annex Scoped Context on ngsildproof merges
-  through Context::merge_core_object, outside 5.5.7''s user-@context prohibition; protected core terms
-  win on merge (4.4)'
-notes: 'the DEFAULT core (CORE_CONTEXT) is the v1.9 document 4.4 names, so a request carrying no @context
-  of its own is answered under the Annex B terms of this version; v1.3-v1.8 stay pinned for a client that
-  references one, and a resolve of an older URL sees the union of that document and the v1.9 core merged
-  last. The Scoped Context the annex defines on ngsildproof is dropped rather than applied: entityIdSealed
-  and entityTypeSealed are copied under their own names instead of expanding through the scoped mapping,
-  which needs a per-term active context to fix.'
+status: partial
+evidence: 'antares-jsonld loader.rs pinned(): the v1.9 URL resolves to the TS 104 175 V1.1.1 Annex B document
+  (owner decision T-3458; TS 104 175 5.3.2.1 keeps the URL), 149 top-level terms and 23 type- or property-scoped
+  contexts, compiled in alongside v1.3-v1.8 and resolvable without network (tests pinned_v1_9_core_matches_ts_104175_annex_b,
+  pinned_versions_resolve_without_network, the_v1_9_core_context_carries_the_terms_v1_9_added). The scoped
+  contexts merge through Context::merge_core_object, outside the user-@context prohibition, and apply
+  through Context::within: a type-scoped one to the members of an Entity of that type, a property-scoped
+  one to everything below the Attribute (compact.rs tests a_type_scoped_term_expands_inside_its_type_only,
+  a_property_scoped_term_expands_inside_its_property); protected top-level core terms win on merge (4.4)'
+notes: 'Gap against this clause: the document served is TS 104 175''s, so the 61 terms CIM 009 V1.9.1
+  defines at top level and TS 104 175 scopes (status, format, data, attrs, join, timerel, geometry, accept,
+  ...) expand through @vocab outside their scope, and a user @context may redefine them (TS 104 175 5.2.5).
+  The remote W3C data-integrity context inside the ngsildproof scope is not fetched. v1.3-v1.8 stay pinned
+  for a client that references one, and a resolve of an older URL sees the union of that document and
+  the v1.9 core merged last. TS 104 175 B: the core @context content and its scoped terms changed; checked
+  in delta 3.4, non-compliant until T-3458.'
 robot: []
 ---
 

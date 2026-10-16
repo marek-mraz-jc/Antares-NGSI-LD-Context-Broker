@@ -83,7 +83,9 @@ pub async fn update_entity_map(
             let s = e.as_str().filter(|s| dt(s).is_some()).ok_or_else(|| {
                 NgsiError::BadRequestData("expiresAt must be a DateTime (4.6.3)".into())
             })?;
-            doc["expiresAt"] = json!(s);
+            if let Some(o) = doc.as_object_mut() {
+                o.insert("expiresAt".into(), json!(s));
+            }
         }
         map_put(&st, &tenant, doc).await?;
         Ok::<_, ApiError>(no_content(&tenant))
@@ -133,6 +135,8 @@ fn allowed_temporal_create_params() -> Vec<&'static str> {
         "aggrMethods",
         "aggrPeriodDuration",
         "lastN",
+        "firstN",
+        "offsetN",
     ]);
     v
 }
@@ -150,13 +154,6 @@ async fn create_map(
 ) -> Response {
     let go = async {
         let tenant = tenant_from(&headers)?;
-        let filter = gate!(
-            st,
-            &tenant,
-            &headers,
-            if temporal { "5.14.5" } else { "5.14.4" }
-        )
-        .await?;
         let allowed = if temporal {
             allowed_temporal_create_params()
         } else {
@@ -168,6 +165,17 @@ async fn create_map(
             Some(b) => query_body_params(b, &params, temporal)?,
             None => params,
         };
+        // ADR-0020: the engine is shown the query the map pages
+        let named = crate::entities::ReadMembers::of(&st, &headers, &vp).await;
+        let filter = gate!(
+            st, &tenant, &headers, if temporal { "5.14.5" } else { "5.14.4" },
+            q: named.q.as_ref(),
+            scope_q: vp.get("scopeQ").map(String::as_str),
+            types: &named.types,
+            attrs: &named.attrs,
+            geo: named.geo.as_ref(),
+        )
+        .await?;
         check_params(&vp, &allowed)?;
         let accept = parse_accept(&headers)?;
         let ctx = request_context(&st.loader, &headers).await?;
@@ -180,7 +188,7 @@ async fn create_map(
             crate::entities::build_query_map(&st, &tenant, &headers, &ctx, &vp, &filter).await?
         };
         let mut resp = created_response(doc, &ctx, accept, &tenant);
-        filter.mark_restricted(resp.headers_mut());
+        filter.mark(&st.host_alias, resp.headers_mut());
         Ok::<_, ApiError>(resp)
     };
     go.await.unwrap_or_else(|e| e.into_response())

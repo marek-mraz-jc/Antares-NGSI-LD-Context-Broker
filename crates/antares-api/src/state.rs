@@ -66,6 +66,30 @@ static PROPAGATED: [axum::http::HeaderName; 3] = [
     axum::http::HeaderName::from_static("link"),
 ];
 
+#[cfg(feature = "views")]
+tokio::task_local! {
+    /// The @context an in-process caller names for its request
+    /// ([`AppState::call_in_context`]). It takes the place of the `Link`
+    /// header, which the outer client chose and the caller cannot vouch for.
+    static INPROCESS_CONTEXT: Arc<serde_json::Value>;
+}
+
+/// The @context of the in-process call this task is inside, if its caller
+/// named one.
+#[cfg(feature = "views")]
+pub(crate) fn inprocess_context() -> Option<Arc<serde_json::Value>> {
+    INPROCESS_CONTEXT.try_with(Arc::clone).ok()
+}
+
+/// How many [`AppState::call`] frames the running task is inside: zero
+/// outside an in-process call. A caller that must not reach the router past
+/// [`crate::bounds::MAX_IN_PROCESS_CALL_DEPTH`] reads it to answer for
+/// itself rather than take the router's 500 (ADR-0025 rule 3).
+#[must_use]
+pub fn in_process_depth() -> usize {
+    INPROCESS_DEPTH.try_with(|d| *d).unwrap_or(0)
+}
+
 tokio::task_local! {
     /// How many [`AppState::call`] frames this task is already inside, held
     /// against [`crate::bounds::MAX_IN_PROCESS_CALL_DEPTH`]. Absent outside a
@@ -73,8 +97,32 @@ tokio::task_local! {
     static INPROCESS_DEPTH: usize;
 }
 
+/// The broker's state as every handler and layer receives it. Cloned at
+/// every middleware layer and extractor of every request, so a clone is
+/// three reference counts: the per-process part sits behind one `Arc`
+/// ([`Shared`], read through `Deref`), and only what a narrowed state
+/// changes, the view and its in-process router memo, is held per state.
+/// Writing a shared field (`DerefMut`) copies the shared part when another
+/// state holds it, so a write made before serving is never seen by a state
+/// cloned earlier, as it was when every field was copied.
 #[derive(Clone)]
 pub struct AppState {
+    shared: Arc<Shared>,
+    /// The endpoint view every operation through this state is narrowed to
+    /// (ADR-0023); `None` serves the NGSI-LD API as it is.
+    #[cfg(feature = "views")]
+    pub view: Option<Arc<crate::views::CompiledView>>,
+    /// The router [`AppState::call`] serves in-process requests through,
+    /// built on first use. Empty until a façade actually calls: building it
+    /// costs about 1.5 ms, which is worth memoizing per state and not worth
+    /// paying in a host that never makes an in-process call.
+    pub(crate) inbound: Arc<std::sync::OnceLock<axum::Router>>,
+}
+
+/// The per-process part of [`AppState`]: every handle and setting a state
+/// and its narrowed copies share.
+#[derive(Clone)]
+pub struct Shared {
     pub store: Arc<dyn CurrentStateDriver>,
     /// The temporal driver — by default the same backend instance as
     /// `store`; a deployment may load a different one (or none).
@@ -97,6 +145,9 @@ pub struct AppState {
     pub default_limit: usize,
     /// Hard ceiling on limit (TooManyResults guard).
     pub max_limit: usize,
+    /// The most bytes of one in-process answer a handler buffers
+    /// ([`crate::bounds::MAX_ANSWER_BYTES`]).
+    pub max_answer_bytes: usize,
     /// One shared outbound client, timeouts set at construction.
     pub http: antares_jsonld::HttpClient,
     /// Federation-forwarding client — longer deadline: the ETSI mock replies
@@ -109,11 +160,14 @@ pub struct AppState {
     /// own reserved prefix; `with_surface` adds one. The admin surface is
     /// here by default.
     pub surfaces: Arc<Vec<Box<dyn crate::ApiSurface>>>,
-    /// The router [`AppState::call`] serves in-process requests through,
-    /// built on first use. Empty until a façade actually calls: building it
-    /// costs about 1.5 ms, which is worth memoizing per state and not worth
-    /// paying in a host that never makes an in-process call.
-    pub(crate) inbound: Arc<std::sync::OnceLock<axum::Router>>,
+    /// The transport every federation forward asks before the socket
+    /// (ADR-0025 rule 8): shared by every clone, so a state made before the
+    /// transport was registered (the one an `Ops` holds) forwards through it
+    /// too. Empty in vanilla: every forward is HTTP.
+    pub(crate) forward_transport: Arc<std::sync::OnceLock<Arc<dyn crate::ForwardTransport>>>,
+    /// The views this pod serves (ADR-0023 rule 10), shared by every clone.
+    #[cfg(feature = "views")]
+    pub views: Arc<crate::views::ViewTable>,
     /// Bounds-wall rejection counters (exported by /q/health).
     pub limits: Arc<crate::bounds::LimitStats>,
     /// Allocator stats provider (set by the broker; None in tests/wasm).
@@ -133,6 +187,9 @@ pub struct AppState {
     /// boxing a future or arming a timer, so a broker with no engine pays
     /// nothing for the seam.
     pub policy: Option<Arc<dyn crate::policy::PolicyEngine>>,
+    /// The `/q` admin credential ([`AppState::with_admin_auth`]); `None`
+    /// serves `/q` without one, as the broker did before T-3569.
+    pub admin_auth: Option<Arc<crate::admin_auth::AdminAuth>>,
     /// Set the moment SIGTERM arrives, BEFORE the listener stops
     /// accepting — `/q/health` then answers 503 DRAINING so the load balancer
     /// takes this instance out while its socket still works.
@@ -210,6 +267,20 @@ pub struct AppState {
     /// How a notification is delivered: attempts, backoff, age ceiling.
     /// Default = one attempt (5.8.6 as written).
     pub delivery: antares_notifier::DeliveryPolicy,
+}
+
+impl std::ops::Deref for AppState {
+    type Target = Shared;
+
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
+}
+
+impl std::ops::DerefMut for AppState {
+    fn deref_mut(&mut self) -> &mut Shared {
+        Arc::make_mut(&mut self.shared)
+    }
 }
 
 impl AppState {
@@ -339,13 +410,18 @@ impl AppState {
                         }
                     };
                     match row {
-                        // the row is what the store handed back, and `Value`'s
-                        // index panics on anything that is not an object; a row
-                        // that cannot carry the counters is left uncounted
+                        // the row is what the store handed back; a row that
+                        // cannot carry the counters is left uncounted
                         Ok(Some(mut doc)) if doc.is_object() => {
-                            let hits = doc["numberOfHits"].as_u64().unwrap_or(0) + 1;
-                            doc["numberOfHits"] = serde_json::json!(hits);
-                            doc["lastUsage"] = serde_json::json!(now_iso());
+                            if let Some(o) = doc.as_object_mut() {
+                                let hits = o
+                                    .get("numberOfHits")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0)
+                                    .saturating_add(1);
+                                o.insert("numberOfHits".into(), serde_json::json!(hits));
+                                o.insert("lastUsage".into(), serde_json::json!(now_iso()));
+                            }
                             if let Err(e) = store.context_put(tenant, &id, doc).await {
                                 tracing::warn!(
                                     "@context hit bump failed for {}: {e}",
@@ -386,7 +462,10 @@ impl AppState {
                     // it.
                     let owner = antares_store::context_row_owner(&row)
                         .and_then(|o| antares_model::TenantId::new_internal(o).ok());
-                    Some((owner, row["body"]["@context"].clone()))
+                    Some((
+                        owner,
+                        row.pointer("/body/@context").cloned().unwrap_or_default(),
+                    ))
                 })
             }));
         }
@@ -406,51 +485,60 @@ impl AppState {
         // notification delivery never names a transport.
         let http = outbound_client(
             egress_policy,
-            std::time::Duration::from_secs(5 * slow_factor()),
+            std::time::Duration::from_secs(slow_factor().saturating_mul(5)),
         );
         let mut sinks = antares_notifier::SinkRegistry::default();
         sinks.register(Box::new(antares_notifier::HttpSink::new(http.clone())));
         #[cfg(feature = "mqtt")]
         sinks.register(Box::new(antares_notifier::mqtt::MqttSink::default()));
         Self {
-            store,
-            temporal,
-            store_name: store_name.to_owned(),
-            temporal_name,
-            loader,
-            started: Instant::now(),
-            started_at: now_iso(),
-            host_alias,
-            default_limit: 1000,
-            max_limit: 1000,
-            http: http.clone(),
-            fed_http: outbound_client(
-                egress_policy,
-                std::time::Duration::from_secs(8 * slow_factor()),
-            ),
-            sinks: Arc::new(sinks),
+            #[cfg(feature = "views")]
+            view: None,
             inbound: Arc::new(std::sync::OnceLock::new()),
-            surfaces: Arc::new(vec![Box::new(crate::Admin)]),
-            limits: Arc::new(crate::bounds::LimitStats::default()),
-            mem_stats: None,
-            bus_stats: None,
-            egress: Arc::new(crate::egress::Egress::new(egress_policy)),
-            policy: None,
-            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pending_changes: Arc::default(),
-            sub_sync: None,
-            sub_mirror: None,
-            change_flush: None,
-            reg_sync: None,
-            reg_fail_sync: None,
-            reg_mirror: None,
-            metrics_render: None,
-            csource_notification: None,
-            nats: false,
-            temporal_record: TemporalRecord::All,
-            public_url,
-            snapshot_cap: 1024,
-            delivery: antares_notifier::DeliveryPolicy::default(),
+            shared: Arc::new(Shared {
+                store,
+                temporal,
+                store_name: store_name.to_owned(),
+                temporal_name,
+                loader,
+                started: Instant::now(),
+                started_at: now_iso(),
+                host_alias,
+                default_limit: 1000,
+                max_limit: 1000,
+                max_answer_bytes: crate::bounds::MAX_ANSWER_BYTES,
+                http: http.clone(),
+                fed_http: outbound_client(
+                    egress_policy,
+                    std::time::Duration::from_secs(slow_factor().saturating_mul(8)),
+                ),
+                sinks: Arc::new(sinks),
+                forward_transport: Arc::new(std::sync::OnceLock::new()),
+                #[cfg(feature = "views")]
+                views: Arc::default(),
+                surfaces: Arc::new(vec![Box::new(crate::Admin)]),
+                limits: Arc::new(crate::bounds::LimitStats::default()),
+                mem_stats: None,
+                bus_stats: None,
+                egress: Arc::new(crate::egress::Egress::new(egress_policy)),
+                policy: None,
+                admin_auth: None,
+                draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                pending_changes: Arc::default(),
+                sub_sync: None,
+                sub_mirror: None,
+                change_flush: None,
+                reg_sync: None,
+                reg_fail_sync: None,
+                reg_mirror: None,
+                metrics_render: None,
+                csource_notification: None,
+                nats: false,
+                temporal_record: TemporalRecord::All,
+                public_url,
+                snapshot_cap: 1024,
+                delivery: antares_notifier::DeliveryPolicy::default(),
+            }),
         }
     }
 
@@ -462,6 +550,247 @@ impl AppState {
     pub fn with_policy(mut self, engine: Arc<dyn crate::policy::PolicyEngine>) -> Self {
         self.policy = Some(engine);
         self
+    }
+
+    /// Puts every `/q` route except health and readiness (and metrics, when
+    /// `auth` leaves them open) behind `auth`'s bearer secret. Set before
+    /// the router is built: the admin surface reads it when it mounts.
+    #[must_use]
+    pub fn with_admin_auth(mut self, auth: crate::admin_auth::AdminAuth) -> Self {
+        self.admin_auth = Some(Arc::new(auth));
+        self
+    }
+
+    /// This state narrowed to `view`: every operation served through the
+    /// returned state, and everything it spawns or calls in-process, is
+    /// composed with the view (ADR-0023). It shares the store and every
+    /// other handle; the in-process router memo is its own, so a call
+    /// through it never reuses a router built without the view.
+    #[cfg(feature = "views")]
+    pub fn with_view(&self, view: Arc<crate::views::CompiledView>) -> Self {
+        let mut st = self.clone();
+        st.view = Some(view);
+        st.inbound = Arc::new(std::sync::OnceLock::new());
+        st
+    }
+
+    /// Every stored view document (ADR-0023 rule 10), as written.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn view_docs(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.store
+            .list(&view_tenant()?, antares_store::Kind::View)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The stored view document `id`, if there is one.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn view_doc(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
+        self.store
+            .get(&view_tenant()?, antares_store::Kind::View, id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Store view document `id`; `true` when it replaced one. The caller
+    /// validated it: the store keeps what it is given.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn put_view_doc(&self, id: &str, doc: serde_json::Value) -> Result<bool, String> {
+        self.store
+            .upsert(&view_tenant()?, antares_store::Kind::View, id, doc)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove view document `id`; `false` when there was none.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn delete_view_doc(&self, id: &str) -> Result<bool, String> {
+        self.store
+            .delete(&view_tenant()?, antares_store::Kind::View, id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// One page of Tenant `t`'s Entities of one of `types`, each holding only
+    /// `attrs` (expanded IRIs), from match `offset` on; a store that cannot
+    /// page answers every match and the page is cut here. For maintenance
+    /// sweeps (T-4018): no view, no policy, no read hook.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn scan_entities(
+        &self,
+        t: &antares_model::TenantId,
+        types: &[String],
+        attrs: &[String],
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        // OR-of-AND groups (4.17): one group per type, so any of them matches.
+        let types: Vec<Vec<String>> = types.iter().map(|t| vec![t.clone()]).collect();
+        let filter = antares_store::filter::EntityFilter {
+            types: Some(&types),
+            attrs: Some(attrs),
+            page: Some(antares_store::filter::Page {
+                offset: i64::try_from(offset).unwrap_or(i64::MAX),
+                limit: i64::try_from(limit).unwrap_or(i64::MAX),
+                count: false,
+            }),
+            ..antares_store::filter::EntityFilter::default()
+        };
+        let found = self
+            .store
+            .query_entities(t, &filter)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(if found.paged {
+            found.rows
+        } else {
+            found.rows.into_iter().skip(offset).take(limit).collect()
+        })
+    }
+
+    /// Change each of Tenant `t`'s Entities `ids` under its row lock: `f`
+    /// edits the stored document and answers whether it changed it, and
+    /// only those are written, in place, as maintenance (no `modifiedAt`,
+    /// no history, no notification). The answer holds, per id, whether it
+    /// was written (`false` for an id that is gone).
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn mutate_entities(
+        &self,
+        t: &antares_model::TenantId,
+        ids: &[String],
+        mut f: impl FnMut(&str, &mut serde_json::Value) -> bool + Send,
+    ) -> Result<Vec<bool>, String> {
+        use antares_store::CurrentStateDriverExt;
+        let results = self
+            .store
+            .batch_mutate(t, ids, |id, doc| if f(id, doc) { Ok(()) } else { Err(()) })
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(results
+            .into_iter()
+            .map(|r| matches!(r, Some(Ok(()))))
+            .collect())
+    }
+
+    /// Every stored export grant (ADR-0025 rule 5), as written.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn grant_docs(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.store
+            .list(&grant_tenant()?, antares_store::Kind::View)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The stored export grant `id`, if there is one.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn grant_doc(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
+        self.store
+            .get(&grant_tenant()?, antares_store::Kind::View, id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Store export grant `id`; `true` when it replaced one. The caller
+    /// validated it.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn put_grant_doc(&self, id: &str, doc: serde_json::Value) -> Result<bool, String> {
+        self.store
+            .upsert(&grant_tenant()?, antares_store::Kind::View, id, doc)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove export grant `id`; `false` when there was none.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn delete_grant_doc(&self, id: &str) -> Result<bool, String> {
+        self.store
+            .delete(&grant_tenant()?, antares_store::Kind::View, id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Every stored policy rule document (ADR-0020 amendment), as written.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn policy_docs(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.store
+            .list(&policy_tenant()?, antares_store::Kind::View)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The stored policy rule document of `tenant`, if there is one.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn policy_doc(&self, tenant: &str) -> Result<Option<serde_json::Value>, String> {
+        self.store
+            .get(&policy_tenant()?, antares_store::Kind::View, tenant)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Store the policy rule document of `tenant`; `true` when it replaced
+    /// one. The caller bounded it and the engine took it.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn put_policy_doc(
+        &self,
+        tenant: &str,
+        doc: serde_json::Value,
+    ) -> Result<bool, String> {
+        self.store
+            .upsert(&policy_tenant()?, antares_store::Kind::View, tenant, doc)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove the policy rule document of `tenant`; `false` when there was
+    /// none.
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn delete_policy_doc(&self, tenant: &str) -> Result<bool, String> {
+        self.store
+            .delete(&policy_tenant()?, antares_store::Kind::View, tenant)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// The engine `/q/health` reports. No engine reports the built-in name:
@@ -490,6 +819,27 @@ impl AppState {
             None => tracing::warn!("sink registry already shared; binding not registered"),
         }
         self
+    }
+
+    /// Register the transport every federation forward asks before the
+    /// socket (ADR-0025 rule 8, as amended by ADR-0027 section 9). A
+    /// forward it answers `None` for goes over HTTP as before. Every clone
+    /// of this state shares the one slot, before or after this call. The
+    /// transport usually holds such a clone, so it lives as long as the
+    /// state's last clone does: register it in a host that keeps its state
+    /// for the life of the process, as the broker does.
+    ///
+    /// # Errors
+    /// When a transport is already registered: a second one would leave
+    /// the choice between them to registration order.
+    pub fn with_forward_transport(
+        self,
+        transport: Arc<dyn crate::ForwardTransport>,
+    ) -> Result<Self, String> {
+        self.forward_transport
+            .set(transport)
+            .map_err(|_| "a forward transport is already registered".to_owned())?;
+        Ok(self)
     }
 
     /// Mount one more HTTP surface (`/q`, `/x`, or below `/x`). A prefix
@@ -578,7 +928,7 @@ impl AppState {
         // serves would call itself for as long as the stack lasts, and
         // every frame builds a router. The chain is counted per task, so a
         // façade over a façade is served and a loop is not.
-        let depth = INPROCESS_DEPTH.try_with(|d| *d).unwrap_or(0);
+        let depth = in_process_depth();
         if depth >= crate::bounds::MAX_IN_PROCESS_CALL_DEPTH {
             return crate::negotiate::ApiError::from(antares_model::NgsiError::InternalError(
                 format!(
@@ -622,7 +972,10 @@ impl AppState {
         }
         let req = axum::http::Request::from_parts(parts, body);
         match INPROCESS_DEPTH
-            .scope(depth + 1, tower::ServiceExt::oneshot(router.clone(), req))
+            .scope(
+                depth.saturating_add(1),
+                tower::ServiceExt::oneshot(router.clone(), req),
+            )
             .await
         {
             Ok(r) => r,
@@ -633,6 +986,66 @@ impl AppState {
             ))
             .into_response(),
         }
+    }
+
+    /// [`AppState::call`] on a task of its own, at the caller's in-process
+    /// depth. A chain of calls each awaiting the next polls every frame
+    /// inside the one before it, and a few federation handlers deep that
+    /// is more stack than a worker thread has; on its own task each frame
+    /// is polled from the scheduler, as a request over HTTP is. Dropping
+    /// the returned future (a forward's timeout) aborts the task.
+    ///
+    /// The new task inherits no view: the call runs through `view` when one
+    /// is given ([`crate::policy::through_view`]), so the engine decides a
+    /// forward under a grant's view as a request through that view (T-3935),
+    /// and never by the view of the request that triggered the forward.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn call_on_task(
+        &self,
+        view: Option<&str>,
+        caller: axum::http::HeaderMap,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+        /// Aborts the task when the forward waiting on it is dropped.
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let st = self.clone();
+        let view = view.map(str::to_owned);
+        let task = tokio::spawn(INPROCESS_DEPTH.scope(in_process_depth(), async move {
+            match view {
+                Some(id) => crate::policy::through_view(&id, st.call(&caller, req)).await,
+                None => st.call(&caller, req).await,
+            }
+        }));
+        let _abort = AbortOnDrop(task.abort_handle());
+        task.await.unwrap_or_else(|_| {
+            crate::negotiate::ApiError::from(antares_model::NgsiError::InternalError(
+                "the in-process call failed".into(),
+            ))
+            .into_response()
+        })
+    }
+
+    /// [`AppState::call`] with the terms of the request defined by
+    /// `context` (a JSON-LD `@context` value, resolved as a body's would
+    /// be) instead of a `Link` header: a surface that writes a `q` naming
+    /// Attributes outside the core @context says what its names mean, and
+    /// no header of the outer client changes it.
+    #[cfg(feature = "views")]
+    pub async fn call_in_context(
+        &self,
+        caller: &axum::http::HeaderMap,
+        req: axum::http::Request<axum::body::Body>,
+        context: Arc<serde_json::Value>,
+    ) -> axum::response::Response {
+        INPROCESS_CONTEXT
+            .scope(context, self.call(caller, req))
+            .await
     }
 
     /// Temporal auto-recording happens synchronously in the write path in
@@ -708,7 +1121,7 @@ fn outbound_client(
 ) -> antares_jsonld::HttpClient {
     let b = antares_jsonld::with_timeouts(
         antares_jsonld::client_builder(policy),
-        std::time::Duration::from_secs(2 * slow_factor()),
+        std::time::Duration::from_secs(slow_factor().saturating_mul(2)),
         total,
     );
     // the suite's notification receiver asserts header names
@@ -761,6 +1174,21 @@ async fn hosted_row_id(
 /// Server-managed timestamp, ISO 8601 UTC with milliseconds.
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[cfg(feature = "views")]
+fn view_tenant() -> Result<antares_model::TenantId, String> {
+    antares_model::TenantId::new_internal(crate::views::VIEW_TENANT).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "views")]
+fn grant_tenant() -> Result<antares_model::TenantId, String> {
+    antares_model::TenantId::new_internal(crate::views::GRANT_TENANT).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "views")]
+fn policy_tenant() -> Result<antares_model::TenantId, String> {
+    antares_model::TenantId::new_internal(crate::views::POLICY_TENANT).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1027,5 +1455,33 @@ mod jsonld_context_locality_5_13 {
             serde_json::json!("Cached"),
             "the fetched document is this broker's Cached copy (5.13.1)"
         );
+    }
+}
+
+#[cfg(all(test, feature = "test-kit"))]
+mod clone_cost {
+    use super::*;
+
+    /// T-3689: every middleware layer and extractor of a request clones the
+    /// state; a clone copies no String, no client and no handle.
+    #[test]
+    fn a_clone_shares_the_per_process_part() {
+        let a = AppState::new("antares-test".into());
+        let b = a.clone();
+        assert!(std::ptr::eq(&a.http, &b.http), "the HTTP client is copied");
+        assert!(std::ptr::eq(&a.fed_http, &b.fed_http));
+        assert!(std::ptr::eq(a.public_url.as_ptr(), b.public_url.as_ptr()));
+        assert!(std::ptr::eq(a.store_name.as_ptr(), b.store_name.as_ptr()));
+    }
+
+    /// A setting written before serving is the writer's own: a state cloned
+    /// earlier keeps what it had, as it did when every field was copied.
+    #[test]
+    fn a_write_after_a_clone_is_not_seen_by_the_clone() {
+        let a = AppState::new("antares-test".into());
+        let mut c = a.clone();
+        c.max_limit = 7;
+        assert_eq!((a.max_limit, c.max_limit), (1000, 7));
+        assert!(!std::ptr::eq(&a.http, &c.http));
     }
 }

@@ -7,6 +7,10 @@ publish = false
 license.workspace = true
 rust-version.workspace = true
 
+# ADR-0027 / surfaces-threat-model 9.1: checked by dev/check-module-rules.py.
+[package.metadata.antares]
+role = "core"
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -15,7 +19,7 @@ crate-type = ["cdylib", "rlib"]
 # (workspace decls are default-features=false; NOTHING re-enables them here.)
 antares-api = { workspace = true }
 antares-sql = { workspace = true }
-antares-jsonld = { workspace = true }
+antares-jsonld = { workspace = true, features = ["fetch"] }
 tower = { workspace = true }
 tracing = { workspace = true }
 # `now_or_never`: the JS constructors cannot await the wiring's memory-arm

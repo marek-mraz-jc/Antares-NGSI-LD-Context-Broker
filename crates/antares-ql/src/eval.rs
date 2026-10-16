@@ -191,7 +191,7 @@ fn resolve_qpath(
         }
     }
     let rest = QPath {
-        links: qp.links[1..].to_vec(),
+        links: qp.links.get(1..).unwrap_or_default().to_vec(),
         path: qp.path.clone(),
         bracket: qp.bracket.clone(),
     };
@@ -204,11 +204,14 @@ fn resolve_qpath(
         let Some(linked) = lookup(uri) else { continue };
         // EXAMPLE 14 type hint: only consider target entities of these types
         if !link.types.is_empty() {
-            let matched = linked["type"].as_array().is_some_and(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .any(|t| link.types.iter().any(|hint| ctx.expand_key(hint) == t))
-            });
+            let matched = linked
+                .get("type")
+                .and_then(Value::as_array)
+                .is_some_and(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .any(|t| link.types.iter().any(|hint| ctx.expand_key(hint) == t))
+                });
             if !matched {
                 continue;
             }
@@ -230,7 +233,13 @@ fn resolve_targets(entity: &Value, qp: &QPath, ctx: &Context) -> Vec<(TargetKind
     };
     let mut out = Vec::new();
     for inst in instances {
-        collect(inst, &qp.path[1..], qp.bracket.as_deref(), ctx, &mut out);
+        collect(
+            inst,
+            qp.path.get(1..).unwrap_or_default(),
+            qp.bracket.as_deref(),
+            ctx,
+            &mut out,
+        );
     }
     out
 }
@@ -242,16 +251,30 @@ fn collect(
     ctx: &Context,
     out: &mut Vec<(TargetKind, Value)>,
 ) {
-    if rest.is_empty() {
+    let Some((seg, tail)) = rest.split_first() else {
         terminal(inst, bracket, ctx, out);
         return;
-    }
-    let seg = &rest[0];
+    };
     // 1. sub-attribute step (expanded key)
     let iri = ctx.expand_key(seg);
+    // 0. a core member of the instance, kept under its own name by
+    // expansion: `temperature.observedAt>=...` (4.9 EXAMPLE 8) and
+    // `unitCode`, each a plain value and the last segment
+    if tail.is_empty() && bracket.is_none() {
+        let core = iri
+            .strip_prefix("https://uri.etsi.org/ngsi-ld/")
+            .filter(|name| matches!(*name, "observedAt" | "unitCode"));
+        if let Some(v) = core
+            .and_then(|name| inst.get(name))
+            .filter(|v| v.is_string())
+        {
+            push_target(TargetKind::Value, v, out);
+            return;
+        }
+    }
     if let Some(subs) = inst.get(&iri).and_then(Value::as_array) {
         for s in subs {
-            collect(s, &rest[1..], bracket, ctx, out);
+            collect(s, tail, bracket, ctx, out);
         }
         return;
     }
@@ -293,10 +316,8 @@ fn terminal(
         (None, _) => push_target(kind, v, out),
         (Some(b), TargetKind::LanguageMap) => {
             let Some(map) = v.as_object() else { return };
-            if b.len() != 1 {
-                return;
-            }
-            if b[0] == "*" {
+            let [lang] = b else { return };
+            if lang == "*" {
                 // any language: ONE array target so that != requires no
                 // matching value in ANY language (4.9 Unequal, color[*])
                 let mut all = Vec::new();
@@ -307,15 +328,29 @@ fn terminal(
                     }
                 }
                 out.push((kind, Value::Array(all)));
-            } else if let Some(val) = map.get(&b[0]) {
+            } else if let Some(val) = map.get(lang) {
                 out.push((kind, val.clone()));
             }
         }
         (Some(b), _) => {
             // MemberExpression into the compound value; undefined result =
-            // "the target element shall be considered as non-existent"
-            if let Some(nested) = navigate(v, b) {
-                push_target(kind, nested, out);
+            // "the target element shall be considered as non-existent".
+            // Several reached (through an array of JSON objects) are ONE
+            // array target, so == holds when one equals and != when none
+            // does, as over [*] above (TS 104 175 7.2.3.4 conditions 8, 9)
+            match reach(v, b).as_slice() {
+                [] => {}
+                [one] => push_target(kind, one, out),
+                several => {
+                    let mut all = Vec::new();
+                    for val in several {
+                        match val {
+                            Value::Array(a) => all.extend(a.iter().cloned()),
+                            other => all.push((*other).clone()),
+                        }
+                    }
+                    push_target(kind, &Value::Array(all), out);
+                }
             }
         }
     }
@@ -336,6 +371,24 @@ fn navigate<'a>(v: &'a Value, path: &[String]) -> Option<&'a Value> {
         cur = cur.get(seg)?;
     }
     Some(cur)
+}
+
+/// The values a trailing `[path]` reaches inside `v`. Through an array it
+/// reaches into each JSON object of it (TS 104 175 7.2.3.4 conditions 8 and
+/// 9), so one path may reach several values; none reached is a non-existent
+/// target.
+fn reach<'a>(v: &'a Value, path: &[String]) -> Vec<&'a Value> {
+    let mut cur = vec![v];
+    for seg in path {
+        cur = cur
+            .into_iter()
+            .flat_map(|c| match c {
+                Value::Array(items) => items.iter().filter_map(|i| i.get(seg)).collect(),
+                other => other.get(seg).into_iter().collect::<Vec<_>>(),
+            })
+            .collect();
+    }
+    cur
 }
 
 /// 4.9 target value: annex C.6 lets a Property value be written as a JSON-LD
@@ -463,7 +516,7 @@ fn compare(target: &Value, op: CmpOp, want: &QValue, re: Option<&regex::Regex>) 
             // considered shall be a temporal one" (EXAMPLE 8 of the clause is
             // exactly this: `?q=temperature.observedAt>=2017-12-24T12:00:00Z`).
             // Equality stays a string comparison: `==` also lowers to a
-            // jsonpath string compare in `antares_ql::sql`, and widening it
+            // jsonpath string compare in `ngsild_ql::sql`, and widening it
             // here alone would make the memory and Postgres arms disagree.
             if matches!(op, CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le) {
                 if let (Some(tk), Some(sk)) = (temporal_key(t), temporal_key(s)) {
@@ -510,10 +563,7 @@ fn compare(target: &Value, op: CmpOp, want: &QValue, re: Option<&regex::Regex>) 
 /// why the two are not one function.
 fn temporal_key(s: &str) -> Option<String> {
     let body = s.strip_suffix('Z')?;
-    let (base, frac) = match body.find(['.', ',']) {
-        Some(i) => (&body[..i], &body[i + 1..]),
-        None => (body, ""),
-    };
+    let (base, frac) = body.split_once(['.', ',']).unwrap_or((body, ""));
     // hh:mm:ss (Time) or YYYY-MM-DDThh:mm:ss (DateTime). What counts as a
     // DateTime is 4.6.3's shape, and it is decided by the one function every
     // other layer asks: a length of nineteen is not a date, and treating an
@@ -577,7 +627,7 @@ mod clause_4_9_extensions {
     use serde_json::json;
 
     fn ctx() -> std::sync::Arc<Context> {
-        antares_jsonld::core_context().into()
+        crate::test_core()
     }
 
     fn expand(doc: serde_json::Value) -> Value {
@@ -592,6 +642,26 @@ mod clause_4_9_extensions {
     fn q(doc: &Value, q: &str) -> bool {
         let ast = parse_q(q).expect(q);
         eval_q(&ast, doc, &ctx(), &|_| None)
+    }
+
+    /// 4.9 EXAMPLE 8 (and 7.2.3.2 EXAMPLE 9 of the API):
+    /// `temperature.observedAt>=...` compares the Property's `observedAt`.
+    #[test]
+    fn observed_at_is_a_sub_attribute_path() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "temperature": {"type": "Property", "value": 20,
+                "observedAt": "2017-12-24T13:00:00Z"}}));
+        assert!(q(&e, "temperature.observedAt>=2017-12-24T12:00:00Z"));
+        assert!(!q(&e, "temperature.observedAt<2017-12-24T12:00:00Z"));
+        assert!(q(&e, "temperature.observedAt==2017-12-24T13:00:00Z"));
+        assert!(!q(&e, "humidity.observedAt>=2017-12-24T12:00:00Z"));
+        let unit = expand(json!({"id": "urn:x", "type": "T",
+            "temperature": {"type": "Property", "value": 20, "unitCode": "CEL"}}));
+        assert!(q(&unit, r#"temperature.unitCode=="CEL""#));
+        assert!(
+            !q(&unit, "temperature.observedAt>=2017-12-24T12:00:00Z"),
+            "absent"
+        );
     }
 
     /// 4.9 EXAMPLE 9/10/11: trailing [path] navigates the compound value
@@ -621,6 +691,32 @@ mod clause_4_9_extensions {
         // existence through the bracket: defined member exists, missing not
         assert!(q(&e, "address[city]"));
         assert!(!q(&e, "address[postcode]"));
+    }
+
+    /// TS 104 175 7.2.3.4 conditions 8 and 9: a trailing path into a value
+    /// that is an array of JSON objects matches if one of the objects holds
+    /// it (its example: `address[city]==Berlin` over London and Berlin), and
+    /// `!=` then needs none of them to equal; the same over a ListProperty
+    /// and a JsonProperty.
+    #[test]
+    fn trailing_path_matches_inside_an_array_of_json_objects() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "address": {"type": "Property",
+                "value": [{"city": "London"}, {"city": "Berlin", "zip": "10115"}]},
+            "stops": {"type": "ListProperty",
+                "valueList": [{"city": "Rome"}, {"city": "Oslo"}]},
+            "raw": {"type": "JsonProperty",
+                "json": [{"to": {"city": "Kyiv"}}, {"to": {"city": "Lima"}}]}}));
+        assert!(q(&e, r#"address[city]=="Berlin""#));
+        assert!(q(&e, r#"address[city]=="Berlin","Tokyo""#));
+        assert!(!q(&e, r#"address[city]=="Rome""#));
+        assert!(!q(&e, r#"address[city]!="Berlin""#), "one element equals");
+        assert!(q(&e, r#"address[city]!="Rome""#));
+        assert!(q(&e, "address[zip]"), "held by one object");
+        assert!(!q(&e, "address[street]"));
+        assert!(q(&e, r#"stops[city]=="Oslo""#));
+        assert!(q(&e, r#"raw[to.city]=="Lima""#));
+        assert!(!q(&e, r#"raw[to.city]=="Rome""#));
     }
 
     /// 4.9 Equal/Unequal languageMap semantics: [lang] targets one language,
@@ -670,6 +766,108 @@ mod clause_4_9_extensions {
         );
     }
 
+    /// A vocab list expands term by term; any member equal to the URI matches.
+    #[test]
+    fn vocab_list_expands_every_term() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "category": {"type": "VocabProperty", "vocab": ["commercial", "public"]}}));
+        assert!(q(
+            &e,
+            r#"category=="https://uri.etsi.org/ngsi-ld/default-context/public""#
+        ));
+        assert!(!q(&e, r#"category=="public""#));
+    }
+
+    /// Every 4.9 operator on a number, a boolean and a string: booleans
+    /// answer only `==`/`!=`, a pattern never matches a number.
+    #[test]
+    fn every_operator_on_numbers_booleans_and_strings() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "n": {"type": "Property", "value": 5},
+            "b": {"type": "Property", "value": true},
+            "s": {"type": "Property", "value": "m"}}));
+        for (query, want) in [
+            ("n!=4", true),
+            ("n!=5", false),
+            ("n>=5", true),
+            ("n<=4", false),
+            ("n<6", true),
+            (r#"n~="5""#, false),
+            ("b==true", true),
+            ("b!=false", true),
+            ("b!=true", false),
+            (r#"s>="m""#, true),
+            (r#"s<"n""#, true),
+            (r#"s<="l""#, false),
+        ] {
+            assert_eq!(q(&e, query), want, "{query}");
+        }
+    }
+
+    /// T-3531 mutants: every ordering operator at its own boundary, on
+    /// numbers, plain strings and DateTimes — equal is outside `<`/`>` and
+    /// inside `<=`/`>=`.
+    #[test]
+    fn ordering_operators_at_the_boundary() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "n": {"type": "Property", "value": 5},
+            "s": {"type": "Property", "value": "m"},
+            "t": {"type": "Property", "value": "2020-01-01T00:00:00Z"}}));
+        for (query, want) in [
+            ("n>5", false),
+            ("n<5", false),
+            ("n>4", true),
+            ("n<=5", true),
+            (r#"s>"m""#, false),
+            (r#"s<"m""#, false),
+            ("t<2020-01-01T00:00:00Z", false),
+            ("t<2020-01-01T00:00:00.5Z", true),
+            ("t>2020-01-01T00:00:00Z", false),
+            ("t<=2020-01-01T00:00:00Z", true),
+        ] {
+            assert_eq!(q(&e, query), want, "{query}");
+        }
+    }
+
+    /// 4.9 p.90: a Range includes both ends. A string range orders as
+    /// strings; a temporal one only when all three are one shape, so a
+    /// mixed range falls back to string order (`.5Z` sorts before `Z`).
+    #[test]
+    fn ranges_include_both_ends_and_mix_shapes_as_strings() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "s": {"type": "Property", "value": "m"},
+            "t": {"type": "Property", "value": "2020-01-01T00:00:00.5Z"}}));
+        for (query, want) in [
+            (r#"s=="a".."z""#, true),
+            (r#"s=="n".."z""#, false),
+            (r#"s=="a".."l""#, false),
+            (r#"s=="m".."m""#, true),
+            ("t==2020-01-01T00:00:00Z..2020-01-02T00:00:00Z", true),
+            ("t==2020-01-01T00:00:00Z..23:59:59Z", false),
+        ] {
+            assert_eq!(q(&e, query), want, "{query}");
+        }
+    }
+
+    /// The legacy dotted step into a Property's object value, and a
+    /// Relationship whose `object` is an array of URIs (each one followed).
+    #[test]
+    fn value_paths_and_object_arrays() {
+        let e = expand(json!({"id": "urn:x", "type": "T",
+            "address": {"type": "Property", "value": {"city": "Berlin"}}}));
+        assert!(q(&e, r#"address.city=="Berlin""#));
+        assert!(!q(&e, r#"address.city=="Rome""#));
+        let d = |t: &str| format!("https://uri.etsi.org/ngsi-ld/default-context/{t}");
+        let station = json!({"id": "urn:ngsi-ld:WS:1", "type": [d("WeatherStation")],
+            d("sensor"): [{"type": "Relationship",
+                "object": ["urn:ngsi-ld:Device:0", "urn:ngsi-ld:Device:345"]}]});
+        let device = expand(json!({"id": "urn:ngsi-ld:Device:345", "type": "Device",
+            "humidity": {"type": "Property", "value": 40}}));
+        let lookup = |id: &str| (id == "urn:ngsi-ld:Device:345").then(|| device.clone());
+        let ast = parse_q("sensor{humidity}==40").expect("parse");
+        assert!(eval_q(&ast, &station, &ctx(), &lookup));
+    }
+
     /// 4.9: "If the target element corresponds to a Relationship or
     /// ListRelationship, the combination of such target element with any
     /// operator different than equal or unequal shall result in not matching."
@@ -705,10 +903,10 @@ mod clause_4_9_extensions {
             Some("category"),
             &ctx(),
         );
-        match ast {
-            QNode::Cmp { value, .. } => assert_eq!(value, QValue::Str("commercial".into())),
-            other => panic!("unexpected {other:?}"),
-        }
+        assert!(
+            matches!(&ast, QNode::Cmp { value: QValue::Str(s), .. } if s == "commercial"),
+            "{ast:?}"
+        );
     }
 
     /// 4.9 EXAMPLE 13/14: linked entity subquery attr{[Type:]path} follows
@@ -817,7 +1015,7 @@ mod bounds_and_patterns {
     const DC: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
 
     fn ctx() -> std::sync::Arc<Context> {
-        antares_jsonld::core_context().into()
+        crate::test_core()
     }
 
     fn with_value(attr: &str, v: Value) -> Value {
@@ -921,9 +1119,11 @@ mod bounds_and_patterns {
             let q = format!(r#"brandName~="{p}""#);
             // an unparseable q is an equally acceptable outcome — what must
             // not happen is an accepted term that compiles the bomb
-            if let Ok(ast) = parse_q(&q) {
-                assert!(!eval_q(&ast, &e, &ctx, &|_| None), "matched: {q}");
-            }
+            let none = |_: &str| None::<Value>;
+            assert!(
+                !parse_q(&q).is_ok_and(|ast| eval_q(&ast, &e, &ctx, &none)),
+                "matched: {q}"
+            );
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
@@ -1031,9 +1231,8 @@ mod bounds_and_patterns {
             "type": [format!("{DC}Vehicle")],
             format!("{DC}speed"): [{"type": "Property", "unitCode": "KMH"}],
         });
-        assert!(!eval_q(&parse_q("speed").expect("q"), &bare, &ctx, &|_| {
-            None
-        }));
+        let none = |_: &str| None::<Value>;
+        assert!(!eval_q(&parse_q("speed").expect("q"), &bare, &ctx, &none));
     }
 
     /// 4.9 logical operators: `|` is OR, `;` is AND, `!` negates existence.
@@ -1077,7 +1276,7 @@ mod tests {
 
     #[test]
     fn comparisons_and_paths() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let e = entity();
         for (q, want) in [
             ("speed>80", true),
@@ -1103,7 +1302,7 @@ mod tests {
     /// (`?q=temperature.observedAt>=2017-12-24T12:00:00Z`).
     #[test]
     fn dates_and_times_order_temporally_across_fraction_spellings() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let at = |v: &str| {
             json!({
                 "id": "urn:ngsi-ld:Vehicle:3",
@@ -1199,7 +1398,7 @@ mod tests {
         // type of the Query Term value are different, then they shall be
         // considered unequal" — so `!=` MATCHES. Equal carries the mirror rule
         // ("considered as not matching"); the asymmetry is deliberate.
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let e = json!({
             "id": "urn:ngsi-ld:Vehicle:2",
             "type": ["https://uri.etsi.org/ngsi-ld/default-context/Vehicle"],
@@ -1228,7 +1427,7 @@ mod tests {
         // 4.9 Unequal, p.91: "The target value does not include any of the list
         // values, if the target value is an array (e.g. matches
         // ["blue","black","green"], but not ["blue","red","green"])."
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let mk = |vals: Value| {
             json!({
                 "id": "urn:ngsi-ld:Vehicle:3",
@@ -1238,11 +1437,10 @@ mod tests {
                 ]
             })
         };
+        let none = |_: &str| None::<Value>;
         let ast = parse_q(r#"color!="red""#).expect("q");
         assert!(
-            eval_q(&ast, &mk(json!(["blue", "black", "green"])), &ctx, &|_| {
-                None
-            }),
+            eval_q(&ast, &mk(json!(["blue", "black", "green"])), &ctx, &none),
             "no element equals red ⇒ matches"
         );
         assert!(
@@ -1255,7 +1453,7 @@ mod tests {
     /// array examples verbatim.
     #[test]
     fn value_list_semantics() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let mk = |v: Value| {
             json!({
                 "id": "urn:ngsi-ld:Vehicle:4",
@@ -1300,7 +1498,7 @@ mod tests {
     /// 4.9 Range — Equal p.90 ("both included") and Unequal p.91.
     #[test]
     fn range_semantics() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let mk = |v: Value| {
             json!({
                 "id": "urn:ngsi-ld:Vehicle:5",
@@ -1346,7 +1544,7 @@ mod tests {
     /// matching" — deliberately NOT the `!=` type-mismatch rule.
     #[test]
     fn not_pattern_semantics() {
-        let ctx = antares_jsonld::core_context();
+        let ctx = crate::test_core();
         let mk = |v: Value| {
             json!({
                 "id": "urn:ngsi-ld:Vehicle:7",
@@ -1416,5 +1614,202 @@ mod temporal_keys {
             temporal_key("2020-01-01T00:00:00.500000Z")
         );
         assert!(temporal_key("2020-01-01T00:00:00Z") < temporal_key("2020-01-01T00:00:00.5Z"));
+    }
+
+    /// 4.9 expandValues: only the named top-level attributes' values are
+    /// expanded, inside And/Or and lists; others and non-strings stay.
+    #[test]
+    fn expand_values_rewrites_only_the_named_attributes() {
+        let ctx = crate::test_core();
+        let male = "https://uri.etsi.org/ngsi-ld/default-context/Male";
+        let q = crate::parse_q(
+            "gender==\"Male\";(kind==\"Male\"|gender==\"Male\",\"Female\");gender==1",
+        )
+        .expect("parse");
+        assert_eq!(apply_expand_values(q.clone(), None, &ctx), q);
+        let want = crate::parse_q(&format!(
+            "gender==\"{male}\";(kind==\"Male\"|gender==\"{male}\",\"{female}\");gender==1",
+            female = male.replace("Male", "Female")
+        ))
+        .expect("parse");
+        assert_eq!(apply_expand_values(q, Some("gender, other"), &ctx), want);
+    }
+
+    /// 4.9: a name in jsonKeys is never expanded; nothing left is None.
+    #[test]
+    fn expansion_list_drops_json_keys() {
+        assert_eq!(expansion_list(None, Some("a")), None);
+        assert_eq!(expansion_list(Some("a,b"), None).as_deref(), Some("a,b"));
+        assert_eq!(
+            expansion_list(Some("a, b"), Some("b")).as_deref(),
+            Some("a")
+        );
+        assert_eq!(expansion_list(Some("a"), Some(" a ")), None);
+    }
+}
+
+/// The edges no clause example walks (T-3912, the `ngsild` coverage gate): a linked-entity term
+/// whose Relationship is missing or carries an `objectList`, a legacy dotted path that reaches
+/// nothing or a bracket under it, a LanguageProperty asked in a language it lacks or holding
+/// arrays, and the operator arms the parser never builds, which answer false.
+#[cfg(test)]
+mod edges {
+    use super::*;
+    use crate::parse_q;
+    use serde_json::json;
+
+    fn expand(doc: Value) -> Value {
+        antares_jsonld::expand_entity(
+            doc.as_object().expect("obj"),
+            &crate::test_core(),
+            antares_jsonld::ExpandOpts::default(),
+        )
+        .expect("expand")
+    }
+
+    fn q(doc: &Value, text: &str, lookup: EntityLookup) -> bool {
+        eval_q(
+            &parse_q(text).expect(text),
+            doc,
+            &crate::test_core(),
+            lookup,
+        )
+    }
+
+    #[test]
+    fn linked_terms_read_an_object_list_and_skip_what_is_not_a_link() {
+        let device = expand(json!({"id": "urn:ngsi-ld:Device:1", "type": "Device",
+            "humidity": {"type": "Property", "value": 40}}));
+        let lookup = |id: &str| (id == "urn:ngsi-ld:Device:1").then(|| device.clone());
+        let listed = expand(json!({"id": "urn:ngsi-ld:WS:1", "type": "WeatherStation",
+            "sensor": {"type": "ListRelationship", "objectList": [{"object": "urn:ngsi-ld:Device:1"}]}}));
+        assert!(q(&listed, "sensor{humidity}==40", &lookup), "objectList");
+        let mut odd = listed.clone();
+        let sensor = odd
+            .as_object_mut()
+            .expect("obj")
+            .values_mut()
+            .find(|v| v.is_array())
+            .expect("sensor");
+        sensor[0] = json!({"object": 7});
+        assert!(
+            !q(&odd, "sensor{humidity}==40", &lookup),
+            "an object that is no URI"
+        );
+        let none = expand(json!({"id": "urn:ngsi-ld:WS:2", "type": "WeatherStation"}));
+        assert!(
+            !q(&none, "sensor{humidity}==40", &lookup),
+            "no Relationship at all"
+        );
+    }
+
+    #[test]
+    fn dotted_paths_language_maps_and_compound_arrays() {
+        let doc = expand(json!({"id": "urn:ngsi-ld:B:1", "type": "Building",
+            "address": {"type": "Property", "value": {"street": {"name": "Main"}}},
+            "name": {"type": "LanguageProperty", "languageMap": {"en": ["Hall", "Room"], "fi": "Sali"}},
+            "rooms": {"type": "Property", "value": [{"n": [1, 2]}, {"n": 3}]}}));
+        let none = |_: &str| None;
+        assert!(q(&doc, "address.street[name]==\"Main\"", &none));
+        assert!(!q(&doc, "address.nothing==\"Main\"", &none));
+        assert!(q(&doc, "name[*]==\"Room\"", &none));
+        assert!(
+            !q(&doc, "name[sv]==\"Sali\"", &none),
+            "a language the map lacks"
+        );
+        assert!(q(&doc, "rooms[n]==2", &none));
+    }
+
+    #[test]
+    fn shapes_no_entity_expansion_produces_reach_nothing() {
+        let ctx = crate::test_core();
+        let mut out = Vec::new();
+        let en = ["en".to_owned()];
+        terminal(
+            &json!({"languageMap": "not a map"}),
+            Some(&en),
+            &ctx,
+            &mut out,
+        );
+        terminal(
+            &json!({"languageMap": {"en": "a"}}),
+            Some(&["en".to_owned(), "x".to_owned()]),
+            &ctx,
+            &mut out,
+        );
+        collect(
+            &json!({"neither": 1}),
+            &["street".to_owned()],
+            None,
+            &ctx,
+            &mut out,
+        );
+        collect(
+            &json!({"value": {"street": 1}}),
+            &["street".to_owned()],
+            Some(&en),
+            &ctx,
+            &mut out,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        let bare = QPath {
+            links: vec![],
+            path: vec![],
+            bracket: None,
+        };
+        assert!(resolve_targets(&json!({}), &bare, &ctx).is_empty());
+        assert_eq!(
+            temporal_key("12:00:00.1234567Z"),
+            None,
+            "seven fraction digits"
+        );
+        assert_eq!(
+            temporal_key("12:00:00.12a4Z"),
+            None,
+            "a fraction of no digits"
+        );
+        // bounds of two shapes are no interval on the temporal axis: string order decides
+        let (dt, time) = (
+            QValue::Str("2018-12-04T12:00:00Z".into()),
+            QValue::Str("12:00:00Z".into()),
+        );
+        assert!(!in_range(&json!("2018-12-05T00:00:00Z"), &dt, &time));
+        assert!(
+            !in_range(&json!("11:00:00Z"), &time, &dt),
+            "\"11:…\" sorts before \"12:…\""
+        );
+        let later = QValue::Str("2019-01-01T00:00:00Z".into());
+        assert!(
+            !in_range(&json!("11:00:00Z"), &dt, &later),
+            "a Time against two DateTimes"
+        );
+        assert!(
+            !in_range(&json!("2017-01-01T00:00:00Z"), &dt, &later),
+            "before the lower bound"
+        );
+    }
+
+    #[test]
+    fn the_arms_the_grammar_never_reaches_answer_false() {
+        let list = QValue::List(vec![QValue::Num(1.0)]);
+        let range = QValue::Range(Box::new(QValue::Num(0.0)), Box::new(QValue::Num(2.0)));
+        assert!(!compare(&json!(1), CmpOp::Gt, &list, None));
+        assert!(!compare(&json!(1), CmpOp::Gt, &range, None));
+        assert!(!compare(&json!(true), CmpOp::Gt, &QValue::Bool(true), None));
+        assert!(same_datatype(&json!(1), &list));
+        assert!(!in_range(
+            &json!(true),
+            &QValue::Bool(false),
+            &QValue::Bool(true)
+        ));
+        assert!(!num_cmp(1.0, CmpOp::Pattern, 1.0));
+        assert!(expand_vocab(&json!(5), &crate::test_core()) == json!(5));
+        // a Time and a DateTime are not two points on one axis: ordered as strings
+        assert!(compare(
+            &json!("12:00:00Z"),
+            CmpOp::Lt,
+            &QValue::Str("2018-12-04T12:00:00Z".into()),
+            None
+        ));
     }
 }

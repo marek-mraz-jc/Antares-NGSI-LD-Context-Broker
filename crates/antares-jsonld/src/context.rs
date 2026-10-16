@@ -8,7 +8,9 @@
 
 use antares_model::NgsiError;
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// The default vocabulary IRI the core context sets: unknown terms expand here.
 pub const DEFAULT_VOCAB: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
@@ -32,23 +34,57 @@ pub struct TermDef {
     pub prefix_ok: bool,
 }
 
+/// The term definitions a scoped context of the Core document brings into
+/// force inside a node of its type or under its property (TS 104 175 Annex B).
+#[derive(Debug, Default)]
+struct Scope {
+    terms: HashMap<String, TermDef>,
+    /// IRI → term, the same tie-break as [`Context::freeze`].
+    inverse: HashMap<String, String>,
+}
+
+impl Scope {
+    fn new(terms: HashMap<String, TermDef>) -> Self {
+        // shortest, then lexicographically least, term first: the first
+        // claim on an IRI is the one that stays
+        let mut sorted: Vec<(&String, &TermDef)> = terms.iter().collect();
+        sorted.sort_unstable_by_key(|(t, _)| (t.len(), t.as_str()));
+        let mut inverse: HashMap<String, String> = HashMap::new();
+        for (term, def) in sorted {
+            inverse
+                .entry(def.iri.clone())
+                .or_insert_with(|| term.clone());
+        }
+        Self { terms, inverse }
+    }
+}
+
 /// A processed (merged, frozen) JSON-LD @context: term map, its inverse for
 /// compaction, and the `@vocab` fallback.
-#[derive(Debug, Default)]
+///
+/// The maps sit behind `Arc` so [`Context::within`] can hand out a view with
+/// a scoped context on top without copying the term map of a large @context.
+#[derive(Debug, Default, Clone)]
 pub struct Context {
-    terms: HashMap<String, TermDef>,
+    terms: Arc<HashMap<String, TermDef>>,
     /// IRI → term for compaction (built after merge; shortest term wins).
-    inverse: HashMap<String, String>,
+    inverse: Arc<HashMap<String, String>>,
     /// Prefix compaction index, built by [`Context::freeze`]: the IRI of
     /// every prefix-capable term → the term to write it as, with the ties
     /// already resolved. Probing it by candidate LENGTH keeps `compact_iri`
     /// off a walk over the whole term map, whose cost an @context of 20 000
     /// terms would otherwise multiply into every attribute of every entity
     /// in a response.
-    prefixes: HashMap<String, String>,
+    prefixes: Arc<HashMap<String, String>>,
     /// The distinct lengths of the `prefixes` keys, longest first — the only
     /// candidate cut points, so the longest match is the first hit.
-    prefix_lens: Vec<usize>,
+    prefix_lens: Arc<Vec<usize>>,
+    /// The Core document's scoped contexts, by the IRI of the type or
+    /// property term that carries each (TS 104 175 Annex B: 23 of them).
+    scopes: Arc<HashMap<String, Arc<Scope>>>,
+    /// The scoped terms in force in this view, consulted before `terms`;
+    /// `None` outside every scope.
+    inner: Option<Arc<Scope>>,
     /// `@vocab`: the base unknown terms expand against.
     pub vocab: String,
     /// The @context value to hand back in responses (Link header / body):
@@ -71,13 +107,10 @@ impl Context {
 
     /// Merge one raw `@context` object of a Core @context document.
     ///
-    /// 5.5.7 bars Scoped Contexts from the *user* @context, and says why:
-    /// they "could be used to modify terms defined in the Core @context or
-    /// to reshape NGSI-LD Elements during the expansion of terms". The Core
-    /// @context is the thing being protected, not a thing to protect
-    /// against, and Annex B (V1.9.1) defines one Scoped Context of its own,
-    /// on `ngsildproof`. Merging that document as a user @context would
-    /// reject the normative core.
+    /// TS 104 175 5.3.2.1: "Whereas the core NGSI-LD @context contains
+    /// JSON-LD Scoped Contexts, the user @context shall not contain JSON-LD
+    /// Scoped Contexts". Annex B carries 23 of them; each is kept by the IRI
+    /// of its term and brought into force by [`Context::within`].
     pub fn merge_core_object(&mut self, obj: &Map<String, Value>) -> Result<(), NgsiError> {
         self.merge_definitions(obj, false)
     }
@@ -100,7 +133,7 @@ impl Context {
             }
             if let Some(s) = def.as_str() {
                 if is_absolute_iri(s) {
-                    self.terms.insert(
+                    Arc::make_mut(&mut self.terms).insert(
                         term.clone(),
                         TermDef {
                             iri: s.to_owned(),
@@ -120,7 +153,7 @@ impl Context {
                 Value::String(s) => {
                     let iri = self.expand_iri_for_def(s);
                     self.charge(&iri)?;
-                    self.terms.insert(
+                    Arc::make_mut(&mut self.terms).insert(
                         term.clone(),
                         TermDef {
                             iri,
@@ -134,10 +167,7 @@ impl Context {
                     // Contexts — a per-term @context could override core
                     // terms or reshape elements during expansion →
                     // BadRequestData. A Core document carries its own
-                    // (Annex B defines one) and is merged without this.
-                    // ponytail: a Core Scoped Context is dropped rather than
-                    // applied, so its inner terms expand through @vocab;
-                    // honouring it needs a per-term active context.
+                    // (TS 104 175 Annex B: 23) and is merged without this.
                     if user_context && o.contains_key("@context") {
                         return Err(NgsiError::BadRequestData(format!(
                             "term {term:?}: JSON-LD Scoped Contexts are not \
@@ -163,26 +193,104 @@ impl Context {
                         }
                     };
                     self.charge(&id)?;
-                    let t = o.get("@type").and_then(Value::as_str).unwrap_or("");
-                    let c = o.get("@container").and_then(Value::as_str).unwrap_or("");
-                    self.terms.insert(
-                        term.clone(),
-                        TermDef {
-                            iri: id,
-                            type_is_id: t == "@id",
-                            type_is_vocab: t == "@vocab",
-                            container_list: c == "@list",
-                            prefix_ok: o.get("@prefix").and_then(Value::as_bool).unwrap_or(false),
-                        },
-                    );
+                    if let Some(scoped) = o.get("@context") {
+                        let scope = self.scope_of(scoped);
+                        Arc::make_mut(&mut self.scopes).insert(id.clone(), Arc::new(scope));
+                    }
+                    Arc::make_mut(&mut self.terms).insert(term.clone(), definition(id, o));
                 }
                 Value::Null => {
-                    self.terms.remove(term);
+                    Arc::make_mut(&mut self.terms).remove(term);
                 }
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    /// The term definitions of a Core scoped context (an object, or an array
+    /// whose objects are merged in order). A remote document inside it, the
+    /// W3C data-integrity context `ngsildproof` names, is not fetched: its
+    /// terms expand through @vocab, as they did before Annex B scoped them.
+    fn scope_of(&self, scoped: &Value) -> Scope {
+        let mut terms = HashMap::new();
+        let objects: Vec<&Map<String, Value>> = match scoped {
+            Value::Object(o) => vec![o],
+            Value::Array(items) => items.iter().filter_map(Value::as_object).collect(),
+            _ => Vec::new(),
+        };
+        for obj in objects {
+            for (term, def) in obj.iter().filter(|(t, _)| !t.starts_with('@')) {
+                let def = match def {
+                    Value::String(s) => TermDef {
+                        iri: self.expand_iri_for_def(s),
+                        ..Default::default()
+                    },
+                    Value::Object(o) => match o.get("@id").and_then(Value::as_str) {
+                        Some(id) => definition(self.expand_iri_for_def(id), o),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                terms.insert(term.clone(), def);
+            }
+        }
+        Scope::new(terms)
+    }
+
+    /// This context with the scoped context of the type or property `iri`
+    /// in force on top of the scopes already in force, or itself when the
+    /// Core document scopes nothing under `iri` (TS 104 175 Annex B, 5.2.5).
+    /// A type-scoped context covers the members of a node of that type and
+    /// is not handed further down; a property-scoped one covers everything
+    /// below the property (JSON-LD 1.1 4.1.8, `@propagate`).
+    pub fn within(&self, iri: &str) -> Cow<'_, Context> {
+        let Some(scope) = self.scopes.get(iri) else {
+            return Cow::Borrowed(self);
+        };
+        let inner = match &self.inner {
+            None => Arc::clone(scope),
+            Some(outer) => {
+                let mut terms = outer.terms.clone();
+                terms.extend(scope.terms.iter().map(|(t, d)| (t.clone(), d.clone())));
+                Arc::new(Scope::new(terms))
+            }
+        };
+        Cow::Owned(Context {
+            inner: Some(inner),
+            ..self.clone()
+        })
+    }
+
+    /// This context with the type-scoped contexts of every one of `types`
+    /// (expanded IRIs) in force, in lexicographic order as JSON-LD 1.1
+    /// applies them.
+    pub fn within_types<'a>(&'a self, types: &[&str]) -> Cow<'a, Context> {
+        let mut sorted = types.to_vec();
+        sorted.sort_unstable();
+        let mut view = Cow::Borrowed(self);
+        for t in sorted {
+            let next = match view.within(t) {
+                Cow::Owned(c) => Some(c),
+                Cow::Borrowed(_) => None,
+            };
+            if let Some(c) = next {
+                view = Cow::Owned(c);
+            }
+        }
+        view
+    }
+
+    /// The same context outside every scope: what a node below a
+    /// type-scoped one sees.
+    pub fn outside(&self) -> Cow<'_, Context> {
+        if self.inner.is_none() {
+            return Cow::Borrowed(self);
+        }
+        Cow::Owned(Context {
+            inner: None,
+            ..self.clone()
+        })
     }
 
     /// 5.5.6: an `@context` that "is invalid" is BadRequestData. The term map
@@ -193,8 +301,8 @@ impl Context {
     /// occupy, on the Context rather than per call so a chain split across
     /// several documents cannot walk past it.
     fn charge(&mut self, iri: &str) -> Result<(), NgsiError> {
-        self.bytes += iri.len();
-        if self.bytes > crate::loader::MAX_CONTEXT_BYTES {
+        self.bytes = self.bytes.saturating_add(iri.len());
+        if self.bytes > crate::pinned::MAX_CONTEXT_BYTES {
             return Err(NgsiError::BadRequestData(
                 "@context term definitions exceed the maximum size".into(),
             ));
@@ -233,7 +341,7 @@ impl Context {
     /// Build the compaction inverse map. Call once after all merges.
     pub fn freeze(&mut self) {
         let mut inv: HashMap<String, String> = HashMap::new();
-        for (term, def) in &self.terms {
+        for (term, def) in self.terms.iter() {
             match inv.get(&def.iri) {
                 Some(existing)
                     if (existing.len(), existing.as_str()) <= (term.len(), term.as_str()) => {}
@@ -242,13 +350,13 @@ impl Context {
                 }
             }
         }
-        self.inverse = inv;
+        self.inverse = Arc::new(inv);
         // The prefix index carries the same tie-break the inverse map does
         // (shortest term, then lexicographic): `terms` is a randomly-seeded
         // HashMap, so an unresolved tie would pick a different prefix in
         // each process.
         let mut pfx: HashMap<String, String> = HashMap::new();
-        for (term, def) in &self.terms {
+        for (term, def) in self.terms.iter() {
             if !def.prefix_ok || def.iri.is_empty() {
                 continue;
             }
@@ -264,13 +372,17 @@ impl Context {
         lens.sort_unstable();
         lens.dedup();
         lens.reverse();
-        self.prefixes = pfx;
-        self.prefix_lens = lens;
+        self.prefixes = Arc::new(pfx);
+        self.prefix_lens = Arc::new(lens);
     }
 
-    /// The definition of `term`, if the context defines it.
+    /// The definition of `term`, if the context defines it (the scoped
+    /// definition first, inside a scope).
     pub fn term(&self, term: &str) -> Option<&TermDef> {
-        self.terms.get(term)
+        self.inner
+            .as_ref()
+            .and_then(|s| s.terms.get(term))
+            .or_else(|| self.terms.get(term))
     }
 
     /// How many terms this context defines. The merged-context cache charges
@@ -284,7 +396,7 @@ impl Context {
 
     /// Expand a key/term in vocab position (attribute names, type values).
     pub fn expand_key(&self, key: &str) -> String {
-        if let Some(def) = self.terms.get(key) {
+        if let Some(def) = self.term(key) {
             return def.iri.clone();
         }
         if let Some((prefix, suffix)) = key.split_once(':') {
@@ -310,15 +422,25 @@ impl Context {
     /// (`ngsi-ld:default-context/x`) — JSON-LD compaction semantics the
     /// conformance suite depends on.
     pub fn compact_iri(&self, iri: &str) -> String {
-        if let Some(term) = self.inverse.get(iri) {
+        if let Some(term) = self.inner.as_ref().and_then(|s| s.inverse.get(iri)) {
             return term.clone();
+        }
+        if let Some(term) = self.inverse.get(iri) {
+            // a scoped term of the same name means something else here
+            if self
+                .inner
+                .as_ref()
+                .is_none_or(|s| !s.terms.contains_key(term))
+            {
+                return term.clone();
+            }
         }
         let vocab = vocab_or_default(&self.vocab);
         for v in [vocab, DEFAULT_VOCAB] {
             if let Some(rest) = iri.strip_prefix(v) {
                 let round_trips = !rest.is_empty()
                     && !rest.contains(':')
-                    && self.terms.get(rest).is_none_or(|d| d.iri == iri);
+                    && self.term(rest).is_none_or(|d| d.iri == iri);
                 if round_trips {
                     return rest.to_owned();
                 }
@@ -331,7 +453,7 @@ impl Context {
         // which makes the first hit the longest match — instead of walking
         // every term. A 20 000-term vocabulary is an ordinary document, and
         // this runs once per attribute of every entity in a response.
-        for &n in &self.prefix_lens {
+        for &n in self.prefix_lens.iter() {
             if n >= iri.len() || !iri.is_char_boundary(n) {
                 continue;
             }
@@ -340,6 +462,19 @@ impl Context {
             }
         }
         iri.to_owned()
+    }
+}
+
+/// A term definition from its JSON-LD object form and resolved `@id`.
+fn definition(iri: String, o: &Map<String, Value>) -> TermDef {
+    let t = o.get("@type").and_then(Value::as_str).unwrap_or("");
+    let c = o.get("@container").and_then(Value::as_str).unwrap_or("");
+    TermDef {
+        iri,
+        type_is_id: t == "@id",
+        type_is_vocab: t == "@vocab",
+        container_list: c == "@list",
+        prefix_ok: o.get("@prefix").and_then(Value::as_bool).unwrap_or(false),
     }
 }
 
@@ -532,6 +667,92 @@ mod tests {
     /// Expanded term-definition forms: @type/@container flags and a term
     /// aliased to a JSON-LD keyword (which must stay the keyword, not expand
     /// into the vocabulary).
+    /// A Core document's scoped contexts (Annex B): an object, an array of
+    /// objects, or a remote reference (not fetched, so it scopes nothing);
+    /// nested scopes stack, `outside` drops them, and a scoped term of the
+    /// same name keeps the outer term from compacting.
+    #[test]
+    fn core_scoped_contexts_stack_and_shadow() {
+        let mut c = Context::default();
+        c.merge_core_object(
+            json!({
+                "ex": "https://example.org/",
+                "name": "https://example.org/name",
+                "Car": {"@id": "ex:Car", "@context": {
+                    "@version": 1.1,
+                    "name": "https://example.org/carName",
+                    "wheels": {"@id": "ex:wheels"},
+                    "dupB": "https://example.org/dup",
+                    "dupA": "https://example.org/dup",
+                    "d": "https://example.org/dup",
+                    "skip": {"@type": "@id"},
+                    "bad": 3
+                }},
+                "Bus": {"@id": "ex:Bus", "@context": [
+                    {"seats": "ex:seats"},
+                    "https://example.org/remote.jsonld"
+                ]},
+                "Proof": {"@id": "ex:Proof", "@context": "https://example.org/remote.jsonld"},
+                "same1": "https://example.org/same",
+                "s2": "https://example.org/same"
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .unwrap();
+        c.freeze();
+
+        assert!(matches!(
+            c.within("https://example.org/Nothing"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(c.outside(), Cow::Borrowed(_)));
+        let car = c.within("https://example.org/Car").into_owned();
+        assert_eq!(car.expand_key("wheels"), "https://example.org/wheels");
+        assert!(car.term("skip").is_none_or(|d| d.iri != "skip"));
+        // the outer "name" IRI no longer compacts to "name" inside the Car scope
+        assert_ne!(car.compact_iri("https://example.org/name"), "name");
+        assert_eq!(car.compact_iri("https://example.org/carName"), "name");
+        assert_eq!(
+            car.compact_iri("https://example.org/dup"),
+            "d",
+            "shortest term wins"
+        );
+        let both = car.within("https://example.org/Bus").into_owned();
+        assert_eq!(both.expand_key("seats"), "https://example.org/seats");
+        assert_eq!(both.expand_key("wheels"), "https://example.org/wheels");
+        assert_eq!(both.compact_iri("https://example.org/same"), "s2");
+        let proof = c.within("https://example.org/Proof").into_owned();
+        assert_eq!(proof.expand_key("name"), "https://example.org/name");
+        let out = both.outside();
+        assert_eq!(out.expand_key("name"), "https://example.org/name");
+        assert_eq!(out.compact_iri("https://example.org/name"), "name");
+    }
+
+    /// `@id` values in a term definition: a prefix that is not
+    /// prefix-capable, an unknown prefix, a colon string that is no IRI, a
+    /// bare term, and a term whose own name is already an absolute IRI.
+    #[test]
+    fn definition_ids_that_do_not_expand_through_a_prefix() {
+        let c = ctx(json!({
+            "ex": "https://example.org/",
+            "rel": {"@id": "ex:rel"},
+            "viaRel": {"@id": "rel:x"},
+            "unknown": {"@id": "nope:x"},
+            "odd": {"@id": "1x:y"},
+            "bare": {"@id": "ex"},
+            "https://example.org/self": {"@type": "@id"}
+        }));
+        assert_eq!(c.term("viaRel").unwrap().iri, "rel:x");
+        assert_eq!(c.term("unknown").unwrap().iri, "nope:x");
+        assert_eq!(c.term("odd").unwrap().iri, "1x:y");
+        assert_eq!(c.term("bare").unwrap().iri, "https://example.org/");
+        assert_eq!(
+            c.term("https://example.org/self").unwrap().iri,
+            "https://example.org/self"
+        );
+    }
+
     #[test]
     fn expanded_definition_forms() {
         let c = ctx(json!({
@@ -540,13 +761,17 @@ mod tests {
             "kind": {"@id": "ex:kind", "@type": "@vocab"},
             "items": {"@id": "ex:items", "@container": "@list"},
             "alias": {"@id": "@type"},
-            "implicit": {"@type": "@id"}
+            "implicit": {"@type": "@id"},
+            "implicitList": {"@container": "@list"}
         }));
         let rel = c.term("rel").unwrap();
-        assert!(rel.type_is_id && !rel.type_is_vocab && !rel.container_list);
+        assert!(rel.type_is_id);
+        assert!(!rel.type_is_vocab);
+        assert!(!rel.container_list);
         assert_eq!(rel.iri, "https://example.org/rel");
         assert!(c.term("kind").unwrap().type_is_vocab);
         assert!(c.term("items").unwrap().container_list);
+        assert!(c.term("implicitList").unwrap().container_list);
         assert_eq!(c.term("alias").unwrap().iri, "@type");
         // no @id but @type present: the term maps into the vocabulary
         assert_eq!(

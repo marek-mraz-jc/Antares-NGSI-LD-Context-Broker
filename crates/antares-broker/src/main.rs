@@ -8,6 +8,8 @@
 mod shutdown;
 mod telemetry;
 mod wiring;
+#[cfg(feature = "ws")]
+mod ws_relay;
 
 use antares_api::AppState;
 
@@ -20,6 +22,10 @@ const KNOWN_KEYS: &[&str] = &[
     // reach this one at (the reduced-copy notification endpoint); defaults
     // to http://{host_alias}.
     "ANTARES_PUBLIC_URL",
+    // Internal context sources (ADR-0025 rule 1): the URLs this deployment
+    // answers under. Accepted in every build: one without the
+    // `internal-csr` feature says once that it does not read it.
+    "ANTARES_SELF_URLS",
     "ANTARES_ROLES",
     // The example policy engine's rules document; accepted only in a build
     // that carries the engine, so a release binary rejects it like any
@@ -41,6 +47,9 @@ const KNOWN_KEYS: &[&str] = &[
     // brokers federate inside private networks); a hardened deployment sets
     // this to false to arm the SSRF wall.
     "ANTARES_EGRESS_ALLOW_PRIVATE",
+    // Host names that may still resolve to a private address while the wall
+    // is armed: the in-cluster peers (T-3908); never loopback or metadata.
+    "ANTARES_EGRESS_PRIVATE_HOSTS",
     // Refuse to start when the DB role bypasses RLS (production gate;
     // default off so the dev/ETSI superuser stack still boots).
     "ANTARES_REQUIRE_RLS",
@@ -65,6 +74,10 @@ const KNOWN_KEYS: &[&str] = &[
     // The HTTP surfaces mounted beside the NGSI-LD API root, comma-separated;
     // default `admin` (/q). An unknown name is fatal and names the shelf.
     "ANTARES_API_SURFACES",
+    // The /q admin credential (T-3569): a file holding the bearer secret,
+    // and whether /q/metrics answers without it (token | open).
+    "ANTARES_ADMIN_TOKEN_FILE",
+    "ANTARES_ADMIN_METRICS",
     // Drain: the LB notice window, and the ceiling on waiting for
     // in-flight requests once the listener has closed.
     "ANTARES_DRAIN_DELAY_MS",
@@ -127,6 +140,29 @@ const KNOWN_KEYS: &[&str] = &[
     "ANTARES_MIGRATE",
 ];
 
+/// The keys of each surface this binary was built with, listed by the crate
+/// that reads them: a surface's new variable lands in its own crate, not in
+/// this file, which every surface branch used to edit (T-3766).
+const SURFACE_KEYS: &[&[&str]] = &[
+    // the view table's reload interval and LinkML schema bound
+    #[cfg(feature = "views")]
+    antares_ops::views::ENV_KEYS,
+    // hosts, origins, result budget, the confirmation key, tool endpoints
+    #[cfg(feature = "mcp")]
+    antares_mcp::ENV_KEYS,
+    // the WebSocket channel's bounds (ADR-0026 rules 6 to 10)
+    #[cfg(feature = "ws")]
+    antares_ws::ENV_KEYS,
+];
+
+/// Every config key this binary accepts.
+fn known_keys() -> impl Iterator<Item = &'static str> {
+    KNOWN_KEYS
+        .iter()
+        .chain(SURFACE_KEYS.iter().flat_map(|keys| keys.iter()))
+        .copied()
+}
+
 /// Jemalloc with decay-based purging — RSS returns to ~live×1.2 when idle;
 /// tune via MALLOC_CONF (e.g. dirty_decay_ms). Deliberately not glibc
 /// malloc, whose arena fragmentation never gives memory back.
@@ -144,7 +180,7 @@ fn unknown_config_key(key: &str) -> bool {
     if !key.starts_with("ANTARES_") || key.starts_with("ANTARES_TEST_") {
         return false;
     }
-    if KNOWN_KEYS.contains(&key) {
+    if known_keys().any(|known| known == key) {
         return false;
     }
     // kubelet service-link shapes for the Services OUR manifests ship
@@ -230,7 +266,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              (an unknown ANTARES_* key is fatal at startup).\n",
             env!("CARGO_PKG_VERSION")
         );
-        for key in KNOWN_KEYS {
+        for key in known_keys() {
             println!("  {key}");
         }
         return Ok(());
@@ -260,7 +296,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (key, _) in std::env::vars_os() {
         let key = key.to_string_lossy();
         if unknown_config_key(&key) {
-            return Err(format!("unknown config key {key} (known: {KNOWN_KEYS:?})").into());
+            let known: Vec<&str> = known_keys().collect();
+            return Err(format!("unknown config key {key} (known: {known:?})").into());
         }
     }
 
@@ -454,9 +491,33 @@ type SurfaceCtor = fn() -> Box<dyn antares_api::ApiSurface>;
 /// surface would drop out here.
 const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("admin", || Box::new(antares_api::Admin)),
+    #[cfg(feature = "views")]
+    ("views", || antares_ops::mount(antares_views::Views)),
+    #[cfg(feature = "mcp")]
+    ("mcp", || antares_ops::mount(antares_mcp::Mcp)),
+    #[cfg(feature = "linkml")]
+    ("linkml", || antares_ops::mount(antares_linkml::Linkml)),
+    #[cfg(feature = "odata")]
+    ("odata", || antares_ops::mount(antares_odata::OData)),
+    #[cfg(feature = "ogc")]
+    ("ogc", || antares_ops::mount(antares_ogc::Ogc)),
+    #[cfg(feature = "ws")]
+    ("ws", || antares_ops::mount(antares_ws::Ws::process())),
+    #[cfg(all(feature = "ws", feature = "views"))]
+    ("ws-views", || {
+        antares_ops::mount(antares_ws::ViewWs::process())
+    }),
     #[cfg(feature = "plugin-example")]
     ("example", || {
         Box::new(antares_plugin_example::ExampleSurface)
+    }),
+    // The joinedcontext engine's access surface reads the table the
+    // engine of this process decides with (addon README section 4).
+    #[cfg(all(feature = "jc-policy", feature = "views"))]
+    (joinedcontext_policy::surface::NAME, || {
+        antares_ops::mount(joinedcontext_policy::surface::Access::new(
+            joinedcontext_policy::JoinedcontextPolicy::process(),
+        ))
     }),
 ];
 
@@ -511,6 +572,10 @@ const POLICY_SHELF: &[(&str, PolicyCtor)] = &[
     #[cfg(feature = "plugin-example")]
     (antares_plugin_example::POLICY_NAME, || {
         std::sync::Arc::new(antares_plugin_example::ExamplePolicy::from_env())
+    }),
+    #[cfg(feature = "jc-policy")]
+    (joinedcontext_policy::POLICY_NAME, || {
+        joinedcontext_policy::JoinedcontextPolicy::process()
     }),
 ];
 
@@ -669,7 +734,10 @@ async fn build_builtin(
             Ok((AnyStore::Mem(Store::open_file(&dir)?), None))
         }
         StoreMode::Postgres | StoreMode::Timescale => {
+            // The URL carries the database password: held as a Secret so no
+            // error or log line below can print it (T-3915).
             let url = std::env::var("ANTARES_DATABASE_URL")
+                .map(antares_api::secret::Secret::new)
                 .map_err(|_| format!("ANTARES_STORE={mode} requires ANTARES_DATABASE_URL"))?;
             let pool_size = parse_pg_pool(std::env::var("ANTARES_PG_POOL").ok().as_deref())?;
             let statement_timeout = parse_pg_statement_timeout(
@@ -680,7 +748,12 @@ async fn build_builtin(
             // The DB container may still be booting — bounded retry, then die.
             let mut last = String::new();
             for _ in 0..30 {
-                match antares_sql::store::pg::connect_with(&url, pool_size, statement_timeout).await
+                match antares_sql::store::pg::connect_with(
+                    url.expose(),
+                    pool_size,
+                    statement_timeout,
+                )
+                .await
                 {
                     Ok(pool) => {
                         // The temporal backend is what the migrations actually
@@ -877,9 +950,67 @@ async fn run(
     // A notification binding compiled in from outside the workspace mounts
     // exactly like the two shipped ones: one registration, no core-crate
     // edit. It is not in a release build — the feature is off by default,
-    // so the shipped binary serves network schemes only.
+    // so the shipped binary serves network schemes only. Every sink before
+    // `views::install`: the registry is sealed once the state is shared.
     #[cfg(feature = "plugin-example")]
-    let mut state = state.with_sink(Box::new(antares_plugin_example::MemorySink::new()));
+    {
+        state = state.with_sink(Box::new(antares_plugin_example::MemorySink::new()));
+    }
+    // The WebSocket channel (ADR-0026): its sink beside HTTP and MQTT, over
+    // the hub its two surfaces share. A mistyped bound stops the broker.
+    #[cfg(feature = "ws")]
+    {
+        antares_ws::Limits::from_env(|k| std::env::var(k).ok())?;
+        state = state.with_sink(Box::new(antares_ws::Sink::new(antares_ws::Hub::process())));
+    }
+    // The MCP surface's resource subscriptions (MCP section 5): an
+    // in-process sink that flags a URI on a stream this process holds.
+    #[cfg(feature = "mcp")]
+    {
+        state = state.with_sink(Box::new(antares_mcp::Sink));
+    }
+    // Endpoint views (ADR-0023 rule 10): the stored views loaded into the
+    // table every surface that serves through views opens on, `/q/views`
+    // and `/q/policy` on the admin surface, and the reload that keeps every
+    // pod's table within one interval of the store. After the engine: the
+    // reload hands it its rule documents (ADR-0020 amendment).
+    #[cfg(feature = "views")]
+    antares_ops::views::install(&state).await?;
+    // Internal context sources (ADR-0025): a registration whose endpoint is
+    // a self URL is served in process under the target's export grant, and
+    // `/q/grants` joins the admin surface. No self URL, no transport: every
+    // forward stays HTTP. An entry that is no self URL stops the broker.
+    #[cfg(feature = "internal-csr")]
+    {
+        let selfs = antares_icsr::SelfUrls::parse(
+            &std::env::var(antares_icsr::SELF_URLS_ENV).unwrap_or_default(),
+        )?;
+        if !selfs.is_empty() {
+            state = antares_ops::with_forward_transport(state, antares_icsr::transport(selfs))?;
+        }
+    }
+    #[cfg(not(feature = "internal-csr"))]
+    if std::env::var_os("ANTARES_SELF_URLS").is_some() {
+        tracing::warn!(
+            "ANTARES_SELF_URLS is set and this build has no internal-csr feature: \
+             every federation forward goes over HTTP"
+        );
+    }
+    // The /q admin credential, before the router mounts the admin surface.
+    // Unconfigured, /q serves as before and says so once, here.
+    match antares_api::admin_auth::AdminAuth::from_config(
+        std::env::var("ANTARES_ADMIN_TOKEN_FILE").ok().as_deref(),
+        std::env::var("ANTARES_ADMIN_METRICS").ok().as_deref(),
+    )? {
+        Some(auth) => {
+            tracing::info!("/q admin routes require the admin token ({auth:?})");
+            state = state.with_admin_auth(auth);
+        }
+        None => tracing::warn!(
+            "/q admin routes (tenants, dead letters, metrics) answer without a credential: \
+             ANTARES_ADMIN_TOKEN_FILE is unset"
+        ),
+    }
     // /q/metrics renders through this closure (None without the
     // `telemetry` feature — the endpoint answers 404); the sampler feeds
     // the process-level gauges the whole run.
@@ -907,7 +1038,13 @@ async fn run(
         // consumers per role, topology asserted before traffic.
         let url = std::env::var("ANTARES_NATS_URL")
             .map_err(|_| "ANTARES_BUS=nats requires ANTARES_NATS_URL")?;
-        wiring::wire_nats(&mut state, &url, roles).await?;
+        let bus = wiring::wire_nats(&mut state, &url, roles).await?;
+        // ADR-0026 rule 5: a notifier pod reaches the socket another pod
+        // holds over core NATS request/reply.
+        #[cfg(feature = "ws")]
+        antares_ws::Hub::process().set_relay(std::sync::Arc::new(ws_relay::NatsRelay::new(bus)));
+        #[cfg(not(feature = "ws"))]
+        drop(bus);
     } else {
         antares_api::wire(&mut state).await; // in-process matcher + notifier + interval firing
     }
@@ -1035,10 +1172,7 @@ async fn run(
     } else {
         antares_api::ops_router(state)
     };
-    let app = tower::Layer::layer(
-        &tower_http::normalize_path::NormalizePathLayer::trim_trailing_slash(),
-        routed,
-    );
+    let app: App = tower::util::MapRequest::new(routed, antares_api::trim_trailing_slash);
 
     // A connection that never finishes its request headers must not hold a
     // slot forever; hyper closes it after this timeout.
@@ -1194,8 +1328,10 @@ fn accept_backoff(e: &std::io::Error) -> bool {
     )
 }
 
-/// The served app: the router under trailing-slash normalization.
-type App = tower_http::normalize_path::NormalizePath<axum::Router>;
+/// The served app: the router under trailing-slash normalization, which
+/// leaves a view's OData paths as sent (T-3731).
+type App =
+    tower::util::MapRequest<axum::Router, fn(axum::extract::Request) -> axum::extract::Request>;
 
 /// One accepted connection. Split out of the accept loop so the drain's
 /// notice window serves connections with identical behaviour, and so the
@@ -1228,7 +1364,10 @@ fn serve(
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(header_read_timeout)
             .title_case_headers(true);
-        let conn = builder.serve_connection(hyper_util::rt::TokioIo::new(stream), svc);
+        // With upgrades: a WebSocket surface answers 101 and takes the
+        // stream (ADR-0026); without an upgrading route nothing changes.
+        let conn =
+            builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), svc);
         let mut conn = std::pin::pin!(conn);
         // On drain, close an IDLE keep-alive connection immediately —
         // hyper finishes any active request first, then closes. Without this
@@ -1323,6 +1462,22 @@ mod config_key_tests {
     /// deployment knob is a CrashLoopBackOff and the knob cannot be used at
     /// all. Scans the sources rather than restating the list, so the check
     /// keeps holding as crates add knobs.
+    /// The MCP surface names its variables by constant, which the source
+    /// scan below cannot see; a key missing here stops the broker at start.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn known_keys_hold_the_mcp_surface_variables() {
+        for key in [
+            antares_mcp::ALLOWED_HOSTS_ENV,
+            antares_mcp::ALLOWED_ORIGINS_ENV,
+            antares_mcp::MAX_RESULT_BYTES_ENV,
+            antares_mcp::REQUEST_STATE_KEY_FILE_ENV,
+            antares_mcp::SUBSCRIPTION_ENDPOINTS_ENV,
+        ] {
+            assert!(!unknown_config_key(key), "{key}");
+        }
+    }
+
     #[test]
     fn known_keys_cover_every_variable_the_workspace_reads() {
         let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1364,6 +1519,52 @@ mod config_key_tests {
             missing.is_empty(),
             "KNOWN_KEYS is missing variables the workspace reads: {missing:#?}"
         );
+    }
+
+    /// The test above finds a key a crate reads as a literal; a surface reads
+    /// through a `*_ENV` const instead, which the broker accepts only when
+    /// the crate lists it in its `ENV_KEYS`. With every surface built, each
+    /// such const under `crates/` has to be a key the broker knows.
+    #[cfg(feature = "full")]
+    #[test]
+    fn every_env_const_of_a_surface_crate_is_a_known_key() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates dir")
+            .to_path_buf();
+        let mut declared = Vec::new();
+        let mut stack = vec![crates];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read_dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let src = std::fs::read_to_string(&path).unwrap_or_default();
+                    for line in src.lines() {
+                        let Some(rest) = line.trim_start().strip_prefix("pub const ") else {
+                            continue;
+                        };
+                        let Some((name, value)) = rest.split_once(": &str = \"") else {
+                            continue;
+                        };
+                        if name.ends_with("_ENV") {
+                            let key = value.trim_end_matches("\";").to_owned();
+                            declared.push(format!("{key} ({name} in {})", path.display()));
+                            if key.starts_with("ANTARES_") {
+                                assert!(
+                                    super::known_keys().any(|k| k == key),
+                                    "{key} ({name} in {}) is no ENV_KEYS entry",
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // the scan itself must find the surface consts it guards
+        assert!(declared.len() >= 14, "found only {declared:#?}");
     }
 }
 
@@ -1640,6 +1841,33 @@ mod api_surface_tests {
         );
     }
 
+    /// The view root is on the shelf of a `views` build, under `/x/views`.
+    #[cfg(feature = "views")]
+    #[test]
+    fn a_views_build_shelves_the_view_root() {
+        assert_eq!(names(Some("admin,views")), vec!["admin", "views"]);
+        let root = api_surfaces(Some("views")).expect("selection")[0].1();
+        assert_eq!(root.prefix(), "/x/views");
+    }
+
+    /// The LinkML surface shares the view root (ADR-0027 section 1).
+    #[cfg(feature = "linkml")]
+    #[test]
+    fn a_linkml_build_shelves_the_linkml_surface_on_the_view_root() {
+        assert_eq!(names(Some("views,linkml")), vec!["views", "linkml"]);
+        let linkml = api_surfaces(Some("linkml")).expect("selection")[0].1();
+        assert_eq!(linkml.prefix(), "/x/views");
+    }
+
+    /// The MCP surface shares the view root (ADR-0027 section 1).
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn an_mcp_build_shelves_the_mcp_surface_on_the_view_root() {
+        assert_eq!(names(Some("views,mcp")), vec!["views", "mcp"]);
+        let mcp = api_surfaces(Some("mcp")).expect("selection")[0].1();
+        assert_eq!(mcp.prefix(), "/x/views");
+    }
+
     /// An empty selection is fatal too: readiness, health and metrics are
     /// the admin surface, so a pod without one can never report itself up.
     #[test]
@@ -1647,6 +1875,57 @@ mod api_surface_tests {
         for raw in ["", " ", ",", " , "] {
             let err = api_surfaces(Some(raw)).expect_err(&format!("{raw:?} selects nothing"));
             assert!(err.contains("ANTARES_API_SURFACES"), "{err}");
+        }
+    }
+
+    /// `full` is every surface in one binary (T-3636): the platform image
+    /// selects them all by name.
+    #[cfg(feature = "full")]
+    #[test]
+    fn the_full_build_shelves_every_surface() {
+        let names = "admin,views,mcp,odata,ws,ws-views";
+        let picked = api_surfaces(Some(names)).expect("every surface is on the shelf");
+        assert_eq!(picked.len(), names.split(',').count());
+    }
+
+    /// Rule M3, the route half (surfaces-threat-model 9.5 item 4): with no
+    /// surface feature the shelf is the admin surface alone, and a path of
+    /// every surface prefix (ADR-0023 to ADR-0027) is unrouted. A surface
+    /// that lands without its feature gate turns this red.
+    #[cfg(not(any(feature = "plugin-example", feature = "views", feature = "ws")))]
+    #[tokio::test]
+    async fn the_vanilla_shelf_is_admin_alone() {
+        use tower::ServiceExt;
+
+        let shelf: Vec<&str> = SURFACE_SHELF.iter().map(|(n, _)| *n).collect();
+        assert_eq!(shelf, vec!["admin"]);
+        let surfaces = api_surfaces(None)
+            .expect("selection")
+            .iter()
+            .map(|(_, build)| build())
+            .collect();
+        let state = antares_api::AppState::new("antares-test".into())
+            .with_surfaces(surfaces)
+            .expect("the admin surface mounts");
+        let app = antares_api::router(state);
+        for path in [
+            "/x/views",
+            "/x/views/all/ngsi-ld/v1/entities",
+            "/x/views/all/odata/v4/$metadata",
+            "/x/views/all/mcp",
+            "/x/views/all/linkml",
+            "/x/views/all/ws",
+            "/x/example/v1",
+        ] {
+            let request = axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let response = app.clone().oneshot(request).await.expect("answered");
+            assert_eq!(
+                response.status(),
+                404,
+                "{path} is routed in the vanilla build"
+            );
         }
     }
 }
@@ -1663,7 +1942,7 @@ mod policy_shelf_tests {
     /// against it. A release build carries no other — an engine reaches the
     /// shelf only through an off-by-default feature, so this assertion is
     /// what "no addon in the shipped build" means for the policy seam.
-    #[cfg(not(feature = "plugin-example"))]
+    #[cfg(not(any(feature = "plugin-example", feature = "jc-policy")))]
     #[test]
     fn the_shipped_build_carries_only_the_built_in_engine() {
         assert_eq!(shelf(), vec!["allow-all"]);
@@ -1711,6 +1990,53 @@ mod policy_shelf_tests {
                 .is_some(),
             "an engine selected without rules would otherwise allow everything"
         );
+    }
+
+    /// The access surface is on the shelf beside the platform's engine, and
+    /// both are the one engine of the process: what the surface shows is
+    /// the table the broker decides with (T-3638).
+    #[cfg(all(feature = "jc-policy", feature = "views"))]
+    #[test]
+    fn the_access_surface_reads_the_engine_the_broker_decides_with() {
+        let picked = api_surfaces(Some("admin,views,access")).expect("access is on the shelf");
+        let access = picked[2].1();
+        assert_eq!(access.name(), "access");
+        assert_eq!(access.prefix(), "/x/views");
+        let (_, build) = policy_engine(Some(joinedcontext_policy::POLICY_NAME)).expect("engine");
+        let engine = build();
+        let shared = joinedcontext_policy::JoinedcontextPolicy::process();
+        engine
+            .load("t3638", &serde_json::json!({"policies": []}))
+            .expect("an empty document loads");
+        assert!(
+            shared.table("t3638").is_some(),
+            "the surface's engine saw the load"
+        );
+        engine
+            .load("t3638", &serde_json::Value::Null)
+            .expect("a removal");
+        assert!(shared.table("t3638").is_none());
+    }
+
+    /// The platform's engine is selected by name, and with no document
+    /// loaded it denies a platform caller (T-3637).
+    #[cfg(feature = "jc-policy")]
+    #[tokio::test]
+    async fn the_platform_engine_is_on_the_shelf_and_fails_closed() {
+        let name = joinedcontext_policy::POLICY_NAME;
+        let (selected, build) = policy_engine(Some(name)).expect("selection");
+        assert_eq!(selected, name);
+        let engine = build();
+        assert!(engine.loads_documents());
+        let subject = antares_api::policy::Subject {
+            tenant: antares_model::TenantId::default(),
+            headers: vec![("x-jc-subject".into(), "ana".into())],
+        };
+        let op = antares_api::policy::Operation::new("5.7.2");
+        assert!(matches!(
+            engine.decide(&subject, &op).await,
+            antares_api::policy::Decision::Deny(_)
+        ));
     }
 }
 

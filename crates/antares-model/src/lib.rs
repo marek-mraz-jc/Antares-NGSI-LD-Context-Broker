@@ -2,7 +2,21 @@
 //! NGSI-LD data model (ETSI CIM 009 V1.9.1).
 //!
 //! Shapes and invariants only: no I/O, no clocks, no config.
-#![cfg_attr(not(test), warn(clippy::expect_used))]
+//!
+#![doc = include_str!("../README.md")]
+// T-3468: every surface calls into this crate on a request path, where a
+// panic is a remote DoS. Outside tests it may not unwrap, expect, panic,
+// index out of bounds or overflow.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
 #![deny(missing_docs)]
 
 pub mod error;
@@ -53,6 +67,40 @@ impl serde::Serialize for SpecOrder<'_> {
 /// (serializing a `Value` cannot fail).
 pub fn ordered_vec(v: &serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&SpecOrder(v)).unwrap_or_default()
+}
+
+/// TS 104 175 Table 5.2.6.6.5-1: the RegistrationInfo members that name
+/// the Attributes a registration scopes. `attributeNames` replaces the
+/// deprecated pair, which is "only used if attributeNames is not present".
+pub const REGISTRATION_ATTRIBUTE_MEMBERS: [&str; 3] =
+    ["attributeNames", "propertyNames", "relationshipNames"];
+
+/// The Attribute names one RegistrationInfo scopes (TS 104 175 9.4.2):
+/// `attributeNames` when present, else `propertyNames` and
+/// `relationshipNames` together; `None` when it names none, so the
+/// registration scopes every Attribute of its entities. The one reading
+/// every matcher shares: a matcher that reads only the old pair treats an
+/// `attributeNames`-only registration as unscoped and forwards it every
+/// query.
+pub fn registration_attribute_names(info: &serde_json::Value) -> Option<Vec<&str>> {
+    fn strings(list: &[serde_json::Value]) -> Vec<&str> {
+        list.iter().filter_map(serde_json::Value::as_str).collect()
+    }
+    let names = |key: &str| info.get(key).and_then(serde_json::Value::as_array);
+    if let Some(attributes) = names("attributeNames") {
+        return Some(strings(attributes));
+    }
+    let (properties, relationships) = (names("propertyNames"), names("relationshipNames"));
+    if properties.is_none() && relationships.is_none() {
+        return None;
+    }
+    Some(
+        properties
+            .into_iter()
+            .chain(relationships)
+            .flat_map(|list| strings(list))
+            .collect(),
+    )
 }
 
 /// 5.2.4 Entity, Table 5.2.4-1, with the common members of Table 5.2.2-1:
@@ -156,8 +204,12 @@ pub fn parse_iso_duration(s: &str) -> Option<IsoDuration> {
             let i = p.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == ','))?;
             let (num, rest) = p.split_at(i);
             let unit = rest.chars().next()?;
-            let slot = units.iter().skip(next).position(|u| *u == unit)? + next;
-            next = slot + 1;
+            let (slot, _) = units
+                .iter()
+                .enumerate()
+                .skip(next)
+                .find(|(_, u)| **u == unit)?;
+            next = slot.saturating_add(1);
             if !num.bytes().any(|b| b.is_ascii_digit()) {
                 return None;
             }
@@ -167,7 +219,7 @@ pub fn parse_iso_duration(s: &str) -> Option<IsoDuration> {
             if !value.is_finite() {
                 return None;
             }
-            out[slot] = value;
+            *out.get_mut(slot)? = value;
             any = true;
             p = &rest[unit.len_utf8()..];
         }
@@ -246,6 +298,23 @@ pub fn has_dot_segment(attr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::dt_key;
+
+    #[test]
+    fn attribute_names_come_first_and_the_old_pair_only_without_them() {
+        use super::registration_attribute_names as names;
+        use serde_json::json;
+        let both = json!({"attributeNames": ["speed"], "propertyNames": ["brand"],
+                          "relationshipNames": ["owner"]});
+        assert_eq!(names(&both), Some(vec!["speed"]));
+        let old = json!({"propertyNames": ["brand"], "relationshipNames": ["owner"]});
+        assert_eq!(names(&old), Some(vec!["brand", "owner"]));
+        assert_eq!(
+            names(&json!({"relationshipNames": ["owner"]})),
+            Some(vec!["owner"])
+        );
+        assert_eq!(names(&json!({"entities": []})), None);
+        assert_eq!(names(&json!({"attributeNames": []})), Some(vec![]));
+    }
     #[test]
     fn meta_members_are_the_non_attribute_members_of_an_entity() {
         for k in [
@@ -309,7 +378,8 @@ mod tests {
         // a bare P carries nothing to weigh, and is the only accepted shape
         // that carries nothing
         let bare = super::parse_iso_duration("P").expect("a bare P scans");
-        assert!(bare.empty && bare.whole);
+        assert!(bare.empty);
+        assert!(bare.whole);
         for bad in [
             "",
             "PT",
@@ -383,5 +453,46 @@ mod tests {
             assert!(!super::is_meta(k), "{k:?} is an Attribute, not a member");
             assert!(!super::ENTITY_META_KEYS.contains(&k), "{k:?}");
         }
+    }
+
+    /// Egress order: `id` then `type` lead every object, at every depth,
+    /// arrays included; scalars pass through untouched.
+    #[test]
+    fn spec_order_leads_with_id_and_type_at_every_depth() {
+        use serde_json::json;
+        let v =
+            json!({"z": 1, "type": "T", "a": [{"value": 2, "type": "Property"}], "id": "urn:x"});
+        let out = String::from_utf8(super::ordered_vec(&v)).expect("utf-8");
+        assert_eq!(
+            out,
+            r#"{"id":"urn:x","type":"T","a":[{"type":"Property","value":2}],"z":1}"#
+        );
+        assert_eq!(super::ordered_vec(&json!(null)), b"null");
+        assert_eq!(super::ordered_vec(&json!({})), b"{}");
+    }
+
+    /// 4.6.2: a name is non-empty, from the allowed characters, and never a
+    /// dot-segment however it is percent-spelled.
+    #[test]
+    fn attribute_names_and_dot_segments() {
+        use super::{check_attr_name, has_dot_segment};
+        for ok in ["speed", "ngsi-ld:x", "https://e.org/a#b", "a%20b", "a.b"] {
+            assert!(check_attr_name(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "", "@id", "a b", "a(b)", "..", "a/./b", "%2E%2e", "a%2F..", "ü",
+        ] {
+            assert!(check_attr_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(has_dot_segment("x/%2e"));
+        assert!(!has_dot_segment("..a"));
+    }
+
+    /// A magnitude that overflows f64 is not a duration.
+    #[test]
+    fn a_duration_too_large_for_f64_is_refused() {
+        let huge = format!("P{}Y", "9".repeat(400));
+        assert!(super::parse_iso_duration(&huge).is_none());
+        assert!(super::parse_iso_duration("P1Y").is_some());
     }
 }

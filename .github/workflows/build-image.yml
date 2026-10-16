@@ -25,6 +25,12 @@ on:
         description: "amd64 (default) or arm64"
         type: string
         default: amd64
+      ref:
+        # the commit to test (ci.yml under workflow_run passes the head_sha
+        # of the green fast run; empty is the triggering commit)
+        description: "commit to check out (empty: the triggering commit)"
+        type: string
+        default: ""
 
 # Builds and uploads an image tarball as an artifact; nothing is
 # published from here, so the token only has to read the checkout.
@@ -41,6 +47,8 @@ jobs:
       ART: ${{ inputs.arch == 'arm64' && 'antares-image-arm64' || 'antares-image' }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: docker/setup-buildx-action@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -58,7 +66,7 @@ jobs:
           tags: antares-local:${{ env.TAG }}
           build-args: |
             VERSION=${{ github.ref_name }}
-            REVISION=${{ github.sha }}
+            REVISION=${{ inputs.ref || github.sha }}
           load: true
           # The layer cache is read by everything but a release and written
           # only by this repository's own branches: a pull request starts
@@ -66,6 +74,27 @@ jobs:
           # is built from the sources alone.
           cache-from: ${{ !startsWith(github.ref, 'refs/tags/') && format('type=gha{0}', inputs.arch == 'arm64' && ',scope=arm64' || '') || '' }}
           cache-to: ${{ github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/') && format('type=gha,mode=max{0}', inputs.arch == 'arm64' && ',scope=arm64' || '') || '' }}
+
+      # Rule M3 on the shipped artefact (surfaces-threat-model 9.5 item 3):
+      # /antares is stripped, so its symbols say nothing; the package list
+      # `cargo auditable` embeds (Dockerfile) does, and no surface, ops or
+      # protocol crate may be in it.
+      - name: The image's /antares links no surface
+        run: |
+          cargo install --locked rust-audit-info@0.5.4
+          id=$(docker create "antares-local:$TAG")
+          docker cp "$id:/antares" ./antares-image-bin
+          docker rm "$id"
+          ./dev/check-vanilla-symbols.sh --audit-info ./antares-image-bin
+
+      # The shipped binary against the advisory database, from the package
+      # list cargo-auditable embeds: what a vulnerable crate in the image
+      # looks like even when Cargo.lock has moved on. Same ignore list as
+      # workspace.yml's cargo-audit, read from deny.toml.
+      - name: cargo audit bin
+        run: |
+          cargo install --locked cargo-audit@0.22.2
+          cargo audit --deny warnings $(python3 dev/advisory-ignores.py) bin ./antares-image-bin
 
       - name: Export it for the downstream jobs
         run: docker save "antares-local:$TAG" | gzip > "$ART.tgz"

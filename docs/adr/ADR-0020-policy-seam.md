@@ -57,9 +57,13 @@ PolicyEngine: Send + Sync {
 `Subject { tenant, headers }` carries the identity headers named by
 `ANTARES_POLICY_SUBJECT_HEADERS`, opaque to the broker — it parses no
 credential and validates no token. `Operation` is the expanded request:
-clause, ids, types, attrs, `q`, `scopeQ`, geo, body. `Decision` is
-`Allow`, `Deny(String)` or `Filter(Filter)`; `Filter` carries a `q`, a
-`scopeQ`, `omit`, `pick` and `restricted`.
+clause, ids, types, attrs, `q`, `scopeQ`, geo, body, and for a write by
+id the stored Entity's image (`stored`: types, scope, Attribute names;
+ADR-0023 rule 7). `Decision` is
+`Allow`, `Deny(String)`, `Filter(Filter)` or `AllowIf(Filter)` (gap G12,
+T-3634); `Filter` carries a `q`, a
+`scopeQ`, a list of areas (`geo_q` and `geo_also`, all of which must hold;
+T-3543), `omit`, `pick` and `restricted`.
 
 **Two phases**, both already in ADR-0014's table:
 
@@ -74,9 +78,11 @@ clause, ids, types, attrs, `q`, `scopeQ`, geo, body. `Decision` is
 |---|---|
 | `Allow` | nothing |
 | `Deny` | 403 with ProblemDetails whose `type` is an Antares URI — Table 6.3.2-1 has no access-denied type, so this is an Antares decision with its own `AntaresSpecificTests` and a 6.3.2 ledger note |
-| `Filter` | narrows: the `q` and the `scopeQ` are conjoined into the query the store runs and travel on forwards, `omit`/`pick` go through the 5.2.14.1 projection the notification path already has, and a merged federated result is filtered after the merge |
+| `Filter` | narrows: the `q` and the `scopeQ` are conjoined into the query the store runs and travel on forwards; the `geo_q` joins the request's own geoquery in the store query's list of geo predicates, all of which must hold (ADR-0023 rule 1, T-3484), and is checked again after a federated merge; `omit`/`pick` go through the 5.2.14.1 projection the notification path already has, and a merged federated result is filtered after the merge |
 | `Filter { restricted: true }` | the same, plus `Antares-Results-Restricted: true` (see the amendment) |
 | `Filter` on anything outside `policy::FILTERABLE` | answered as `Deny` — there is no narrowed form of "delete everything", and no handler outside that list reads the filter at all |
+| `AllowIf` on a write by id (`policy::WRITE_BY_ID`) | the write is applied only if the stored Entity matches the filter's `q`, `scopeQ`, areas and the types and conditions of its rules, judged inside the store's own read-modify-write on the document it is about to change; an Entity it does not select answers 404 with the body an absent one gets; a batch judges each member by its own Entity; a write that would be forwarded to a Context Source is refused (403), since no copy there can be judged here (T-3634) |
+| `AllowIf` anywhere else, or with a projection (`pick`, `omit`, `omit_by_type`, `temporal`, a rule's Attribute list or windows) | answered as `Deny`: a create and Delete Temporal Evolution (5.6.16, the temporal seam has no conditional delete) have no stored Entity to judge in their write, and a write is performed whole or not at all; an empty condition is `Allow`. Batch Upsert is a write by id since T-3668: a conditioned member updates or replaces the Entity its condition selects and never creates, so an absent one answers the same 404 as one the condition does not select. So are the temporal writes 5.6.12 to 5.6.15 (T-3668): the condition is judged inside the temporal store's read-modify-write on the evolution's latest instances, one per Attribute and `datasetId` (greatest `observedAt`, else `createdAt`), and one it does not select answers the 404 an absent evolution gets; under a view they stay refused (rule 7 has no temporal write guard) |
 
 The conjunction is made on the `antares-ql` AST, never on the query
 string, so the precedence trap a gateway rewrite has to distribute around
@@ -94,8 +100,10 @@ either.
 
 A narrowing is refused where it cannot be applied. Only the reads in
 `policy::FILTERABLE` hand the `Filter` to the code that serves the answer:
-retrieve and query Entities, their two temporal twins, and the EntityMap
-creations those queries page through. Every other operation is performed
+retrieve and query Entities, their two temporal twins, the EntityMap
+creations those queries page through, and discovery (5.7.5 to 5.7.10,
+which ADR-0023 rule 5 computes from the Entities the narrowing selects).
+Every other operation is performed
 whole — a create writes its Entity or does not — so a `Filter` there would
 be dropped, and the broker would do in full what the engine believed it had
 narrowed. That is the one direction the seam may not fail in, so those
@@ -214,6 +222,72 @@ standard is silent, Antares answers in its own namespace and says so.
 Nothing else changes — the header is still advisory, still sent only when
 the engine sets `restricted`, and a narrowing is otherwise silent.
 
+## Amendment: rule documents through `/q/policy`, one image per engine
+
+An engine has no route of its own (surfaces live under `/x/`,
+`crates/antares-api/src/surface.rs`) and, before this amendment, no hook
+to receive data, so a rule table could only be compiled into the engine
+or read by it from somewhere the broker does not control. ADR-0014 rule 3
+asks for configuration "reloaded at runtime from the stores the broker
+already has", and every pod must serve the same revision.
+
+The seam therefore gains one hook and one document table:
+
+- `PolicyEngine::load(tenant, &Value) -> Result<(), String>` hands the
+  engine the rule document of one Tenant (`Value::Null` unloads it), and
+  `PolicyEngine::loads_documents() -> bool` says whether the engine reads
+  documents at all. Both default to no: `load` refuses, and the built-in
+  `AllowAll` and a broker without an engine answer `/q/policy` 404. A
+  refused document leaves the engine's state as it was, so the previous
+  revision keeps deciding.
+- `/q/policy` (GET, the table) and `/q/policy/{tenant}` (GET, PUT,
+  DELETE), served by `antares-ops` beside `/q/views` and behind the same
+  admin credential. The document is opaque JSON: the engine owns its
+  schema, so the broker bounds it (64 KiB, depth and element count) and
+  validates nothing else. A PUT the engine refuses answers 400 with the
+  engine's reason and is not stored.
+- Documents are stored under the reserved tenant `antares-policy`, with a
+  revision the broker counts, and reloaded with the view table (every
+  `ANTARES_VIEWS_RELOAD_MS` and after every write on the pod that took
+  it). A stored revision the engine refuses on reload (written by another
+  version, or by hand) is listed in `/q/health` under
+  `policy.documents.refused` by tenant and revision only. The document,
+  and the engine's reason, never reach a log or `/q/health`: a rule
+  document says who may read what.
+
+The table needs the `views` feature, as `/q/views` does. A vanilla broker
+has neither the routes nor the reserved tenant's documents, and its tree
+is unchanged.
+
+The sentence "built and run by `examples.yml` alone" above is narrowed: a
+deployment that runs an engine may build its own image from the same
+Dockerfile with the engine's feature, one image per engine. That image is
+never published as `antares-broker`, the Antares release image and every
+conformance cell keep `AllowAll`, and the deployment image claims no
+conformance, as the paragraph above already says of any engine.
+
+## Amendment: the view a request came through
+
+An engine that binds its rules per endpoint has to know which view a
+request came through, and a client must not be able to name one: a view
+whose Endpoint binds fewer Policies than the Tenant holds would otherwise
+be a way around a prohibition the plain root applies (platform T-3702).
+
+`Subject.headers` therefore carries one reserved pair, `("@view", id)`,
+when the request reached the broker through `/x/views/{id}/` (any view
+surface; `antares-ops` runs the inner request inside that scope).
+`Subject::view()` returns it. `@` is no header-name character (RFC 9110
+`tchar`), so no request, inner or outer, can carry the pair: the broker
+adds it from the in-process call alone, after the headers a deployment
+named. The pair is persisted with the rest of the subject (a
+Subscription, an EntityMap, a Snapshot, a registration), so a
+notification is decided for the view the Subscription was created
+through, and two subjects that differ only in their view are different
+creators. It is never served: the stored subject stays a `__` member.
+
+An engine that does not bind per view ignores the pair, as it ignores
+every header it was not told about; `AllowAll` is unchanged.
+
 ## Consequences
 
 - ADR-0014's phase table gains no row: the seam is a named user of two
@@ -243,6 +317,20 @@ the engine sets `restricted`, and a narrowing is otherwise silent.
 
 ## Confirmation
 
+- Every Notification body passes `pre_notify` once, in
+  `notify::deliver_as`, its only caller outside tests (cg: `MATCH
+  (c:Symbol)-[:CALLS]->(f:Symbol {path:'antares_api::policy::pre_notify'})
+  WHERE NOT c.is_test RETURN c.path`). The 5.8.6 inbound path
+  (`distsub::remote_notify`) delivers through it under the ORIGINAL
+  Subscription's stored subject
+  (`distsub::tests::a_remote_notification_is_narrowed_for_the_original_subscriber`).
+  Two sends stay outside the seam on purpose, because neither carries an
+  Entity: the `urn:antares:distsub:` endpoint, which hands Context Source
+  Notification data to the broker's own handler and reaches no receiver,
+  and the 5.16.6 SnapshotNotification (`snapshots::send_notification`),
+  whose body is the snapshot's status and the per-query details of the
+  creator's own gated request, sent to the endpoint that creator named
+  (operation matrix section 8, items 11 and 13).
 - `run_policy_contract` (behind `test-kit`, the contract an addon
   engine's own tests call): a `Filter` never widens — the engine's answer
   is run through the projection and asserted a subset of the unfiltered

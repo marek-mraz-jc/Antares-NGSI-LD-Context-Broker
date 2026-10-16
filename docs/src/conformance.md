@@ -33,9 +33,9 @@ Current counts (`python3 dev/spec.py status`):
 
 ```text
 947 sections
-  implemented       477
+  implemented       476
   informative       468
-  partial             2
+  partial             3
   robot-tagged       193
 ```
 
@@ -55,7 +55,7 @@ surface the official set leaves untested, either clause-numbered (`566_01`
 for 5.6.6, `5510_01` for 5.5.10, `4233_01` for 4.23.3) or slotted into the
 ETSI family they extend, and all following the same conventions and tagged
 with their clause so the ledger picks them up. Every file expands to test
-cases; one full run of a native cell is 1822 test cases:
+cases; one full run of a native cell is 1823 test cases:
 
 | suite | test cases |
 |---|---|
@@ -66,7 +66,7 @@ cases; one full run of a native cell is 1822 test cases:
 | Snapshot | 5 |
 | Subscription | 156 |
 | ContextSource | 145 |
-| DistributedOperations | 134 |
+| DistributedOperations | 135 |
 | IOP | 286 |
 | jsonldContext | 68 |
 
@@ -79,7 +79,7 @@ than a CIM 009 requirement, with the reason the behaviour exists.
 
 ## The matrix
 
-The same 1822 cases run once per native cell; `wasm-file` runs 1810 of
+The same 1823 cases run once per native cell; `wasm-file` runs 1811 of
 them, the twelve MQTT cases having no broker socket to run against in the
 browser build. Every push gates on the quick preset; the full preset runs
 twice a week, on `v*` tags and on dispatch, and is what the report page and
@@ -95,10 +95,19 @@ the badges render.
 | timescale-nats | as above on TimescaleDB | full | same, on the temporal-heavy backend |
 | wasm-file | browser artifact over the file store | full | five Node shims driving the WebAssembly build; MQTT excluded, the browser has no broker socket |
 
-A native cell passes at 1822/1822, `wasm-file` at 1810/1810.
+A native cell passes at 1823/1823, `wasm-file` at 1811/1811.
 `dev/etsi-matrix-summary.py` folds the per-cell results into one table and
 lists every failure across the matrix; a release requires that list to be
 empty.
+
+A smaller green run is still green, so the matrix also gates per TP.
+`dev/etsi-baseline.json` names every TP a cell runs, keyed by file and
+name, with the vendored suite's tree hash and the spec version it covers.
+`dev/etsi-baseline.py check` fails a cell where a baseline TP did not pass
+or did not run, and names it. `wasm-file` may lack only the 12 MQTT TPs. A
+TP that passes and is not yet listed prints `ratchet: update baseline`;
+regenerate the file with `dev/etsi-baseline.py write <results-dir>` from a
+green run, or from a `robot --dryrun` folded by `dev/etsi-report.py`.
 
 ## Running a suite locally
 
@@ -119,6 +128,17 @@ running), `MEM_LIMIT_MB` (per-broker peak-RSS gate), `ROLES_SPLIT=1
 ROLL_DURING_RUN=1` (reproduce a `-nats` cell), `WASM=1 WASM_DOCKER=1
 STORE=file` (reproduce the wasm cell). Results land in `results/$STORE`
 with Robot's own `log.html` per suite.
+
+The suite names its own `@context` by a raw.githubusercontent.com URL on
+`dev`, in `variables.py` and in 331 data and expectation files. A pipeline
+run instead serves `resources/jsonld-contexts/` from the checkout on port
+8079 (`dev/etsi-local-context.sh`; it refuses a port a suite file names, the
+IOP mocks own 8089). It rewrites that URL for the length of
+the run and puts the files back in teardown, so a commit is tested with its
+own context file and a GitHub outage fails nothing. The cell fails when a
+file still names the GitHub URL, or when no broker fetched the context from
+the local server (`local-context-check.txt` and `local-context/access.log`
+in the cell artifact).
 
 For a single clause during development, one broker without Docker is
 enough. `resources/variables.py` carries the suite's own compose addresses
@@ -146,7 +166,7 @@ carries the fix. The current list:
 
 | # | target | finding |
 |---|---|---|
-| 1 | suite | `D018_01` asserts 508 Loop Detected for an inclusive registration |
+| 1 | spec | CIM 009 6.3.17 scopes 508 to a single exclusive or redirect source; TS 104 175 9.7 makes every detected loop an error (`D018_01`) |
 | 2 | suite | nine official `_exc` TPs create exclusive registrations that 4.3.6.3 forbids |
 | 3 | suite | `LdContextNotAvailable` fixtures assert 503; V1.9.1 mandates 504 |
 | 4 | spec | 5.3.4 SnapshotNotification: member naming conflict and a phantom `snapshotReady` |
@@ -157,6 +177,18 @@ carries the fix. The current list:
 | 9 | suite | three temporal TPs assert `Content-Range` unit `date-time`; 6.3.10 mandates `DateTime` |
 | 10 | spec | 4.5.19.0's unbounded period count contradicts the aggregation fixtures |
 | 11 | spec | Annex B maps `attributeCount`/`attributeDetails` to bare terms |
+| 13 | spec | TS 104 175 Table 5.2.6.5.2-1 calls `timeInterval` not applicable to CSR subscriptions; 12.4.2.4/12.4.7 define periodic CSR notification |
+| 14 | spec | TS 104 176 clause 5 answers a successful HEAD with 204, its 7.x GET/HEAD tables with 200 (Antares: 200) |
+| 15 | suite | 020_17 to 020_20 delete an Attribute of an Entity held only as a temporal evolution; 5.6.5.4 answers 404 |
+| 16 | suite | 020_19 and 020_20 expect a deleted scope as `[]`; 4.18 makes it `urn:ngsi-ld:null` |
+| 17 | spec | TS 104 176 answers Create and Clone Snapshot with 202, CIM 009 with 201, and names no version a client can prefer (Antares: 201) |
+| 18 | suite | 021_08 expects temporal instances that fail `q`; 5.7.4.4 keeps only those that meet it |
+| 19 | suite | 037_11 and 041_03 query without Accept and expect ld+json pagination Links; 6.3.10 types them after the response |
+| 20 | suite | 051_04_01 expects 400 for an unknown @context id with `reload=true`; 5.13.5.4 raises ResourceNotFound first |
+| 21 | suite | 008_01 expects a second temporal upsert to replace instances at the same observedAt; 5.6.11.4 adds them |
+| 22 | suite | 046_22_08 reads a deleted three-instance Attribute as one object; 5.8.6 tombstones each instance with its datasetId |
+| 23 | suite | 046_05 percent-encodes the q of a Subscription body; Table 5.2.12-1 makes it a JSON string read as written |
+| 24 | spec | TS 104 176 9.4.3.1 and 9.4.3.2 carry each other's headings: Create Context Source Registration Subscription is headed GET/HEAD, Query is headed POST; Antares serves POST for create, GET for query |
 
 Filing is manual; each entry carries the clause quotation and the
 proposed fix so it can be pasted into the ETSI tracker as is.

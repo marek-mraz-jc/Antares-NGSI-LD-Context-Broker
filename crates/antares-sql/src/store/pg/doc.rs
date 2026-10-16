@@ -26,6 +26,7 @@ pub enum DocKind {
     EntityMap,
     DistSub,
     DeadLetter,
+    View,
 }
 
 impl DocKind {
@@ -38,15 +39,18 @@ impl DocKind {
             DocKind::EntityMap => "entity_map_docs",
             DocKind::DistSub => "dist_subs",
             DocKind::DeadLetter => "dead_letters",
+            DocKind::View => "views",
         }
     }
     fn doc_column(self) -> &'static str {
         match self {
             DocKind::Subscription | DocKind::CSourceSubscription => "subscription",
             DocKind::Registration => "registration",
-            DocKind::Snapshot | DocKind::EntityMap | DocKind::DistSub | DocKind::DeadLetter => {
-                "doc"
-            }
+            DocKind::Snapshot
+            | DocKind::EntityMap
+            | DocKind::DistSub
+            | DocKind::DeadLetter
+            | DocKind::View => "doc",
         }
     }
     fn has_bookkeeping(self) -> bool {
@@ -205,8 +209,14 @@ pub fn index_rows(reg: &Value) -> Vec<Value> {
                 })
                 .unwrap_or_default()
         };
-        let props = names("propertyNames");
-        let rels = names("relationshipNames");
+        // TS 104 175 9.4.2: attributeNames, else the deprecated pair. The
+        // table has no column for a name of either kind, so an
+        // attributeNames entry is indexed as a property_name: the index is
+        // a flattened copy, the matchers read the registration itself.
+        let (props, rels) = match info.get("attributeNames") {
+            Some(_) => (names("attributeNames"), Vec::new()),
+            None => (names("propertyNames"), names("relationshipNames")),
+        };
         let entities: Vec<Option<&Value>> = match info.get("entities").and_then(Value::as_array) {
             Some(a) if !a.is_empty() => a.iter().map(Some).collect(),
             _ => vec![None],
@@ -777,15 +787,15 @@ impl PgDocStore {
         // statement to one — measured as a sequential scan of csource_index,
         // exactly the read this function exists to avoid.
         let mut wheres = String::new();
-        let mut n = 1; // $1 = tenant_id
+        let mut n: usize = 1; // $1 = tenant_id
         if types.is_some() {
-            n += 1;
+            n = n.saturating_add(1);
             wheres.push_str(&format!(
                 " AND (x.entity_type IS NULL OR x.entity_type = ANY(${n}))"
             ));
         }
         if ids.is_some() {
-            n += 1;
+            n = n.saturating_add(1);
             wheres.push_str(&format!(
                 " AND (x.entity_id IS NULL OR x.id_pattern IS NOT NULL \
                    OR x.entity_id = ANY(${n}))"
@@ -799,16 +809,16 @@ impl PgDocStore {
                  ON x.tenant_id = r.tenant_id AND x.registration_id = r.id
               WHERE r.tenant_id = $1{wheres}
               ORDER BY r.id LIMIT ${}",
-            n + 1
+            n.saturating_add(1)
         );
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         let mut q = sqlx::query(sqlx::AssertSqlSafe(sql.clone())).bind(tenant.as_str());
         if let Some(types) = types {
-            q = q.bind(types);
+            q = q.bind(super::storable(types));
         }
         if let Some(ids) = ids {
-            q = q.bind(ids);
+            q = q.bind(super::storable(ids));
         }
         let rows = q.bind(MAX_UNDECIDED_ROWS).fetch_all(&mut *tx).await?;
         tx.commit().await?;
@@ -1110,5 +1120,24 @@ mod tests {
         let rows = index_rows(&bare);
         assert_eq!(rows.len(), 1);
         assert!(rows[0]["property_name"].is_null() && rows[0]["relationship_name"].is_null());
+    }
+
+    /// TS 104 175 9.4.2 (T-3451): `attributeNames` scopes the rows, and the
+    /// deprecated pair beside it is not indexed.
+    #[test]
+    fn attribute_names_are_indexed_and_the_old_pair_beside_them_is_not() {
+        let reg = json!({
+            "endpoint": "e",
+            "information": [{"entities": [{"type": "T"}],
+                             "attributeNames": ["speed", "owner"],
+                             "propertyNames": ["brand"]}]
+        });
+        let rows = index_rows(&reg);
+        let mut names: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r["property_name"].as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["owner", "speed"]);
     }
 }

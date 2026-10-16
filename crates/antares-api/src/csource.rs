@@ -55,7 +55,12 @@ fn norm_registration_info(v: &Value, ctx: &Context) -> Result<Value, NgsiError> 
         let io = info
             .as_object()
             .ok_or_else(|| bad("information entries must be objects".into()))?;
-        for key in ["entities", "propertyNames", "relationshipNames"] {
+        for key in [
+            "entities",
+            "attributeNames",
+            "propertyNames",
+            "relationshipNames",
+        ] {
             if let Some(n) = io.get(key).and_then(Value::as_array).map(Vec::len) {
                 if n > MAX_INFO_MEMBERS {
                     return Err(bad(format!(
@@ -136,8 +141,9 @@ fn norm_registration_info(v: &Value, ctx: &Context) -> Result<Value, NgsiError> 
                     }
                     ni.insert("entities".into(), Value::Array(nes));
                 }
-                "propertyNames" | "relationshipNames" => {
-                    // 5.2.10: "Empty array is not allowed"
+                "attributeNames" | "propertyNames" | "relationshipNames" => {
+                    // 5.2.10, TS 104 175 Table 5.2.6.6.5-1: "Empty array is
+                    // not allowed"
                     let names = iv
                         .as_array()
                         .filter(|a| !a.is_empty())
@@ -204,6 +210,19 @@ fn check_context_source_info(v: &Value) -> Result<(), NgsiError> {
         // first forward
         let sval = value.as_str();
         match key.to_ascii_lowercase().as_str() {
+            // TS 104 175 9.5.1: "As Tenant information, if applicable, is
+            // directly specified in the CSourceRegistration, it shall not
+            // be part of contextSourceInfo." A forward never sends it
+            // (`federation::CSI_SKIP`); refusing it here tells the client
+            // its routing would not happen, instead of forwarding silently
+            // to the default tenant.
+            "ngsild-tenant" => {
+                return Err(bad(
+                    "contextSourceInfo must not carry NGSILD-Tenant: set the \
+                     registration's tenant member instead (9.5.1)"
+                        .into(),
+                ));
+            }
             "accept" | "contenttype" => {
                 if !matches!(sval, Some("application/json" | "application/ld+json")) {
                     return Err(bad(format!(
@@ -304,6 +323,11 @@ fn norm_reg_member(
         // what "ignore" says, alongside the 4.8 system attributes.
         "@context" | "createdAt" | "modifiedAt" | "status" | "timesSent" | "timesFailed"
         | "lastSuccess" | "lastFailure" => return Ok(()),
+        // The `__` prefix is the broker's (`policy::SUBJECT_MEMBER`): this
+        // only sees a create body or a 5.9.3 fragment, so dropping it here
+        // stops a client from seeding the subject a Registration was
+        // created by and from replacing it later (T-3692).
+        k if k.starts_with("__") => return Ok(()),
         "id" => {
             let id = v
                 .as_str()
@@ -596,10 +620,9 @@ async fn check_entity_conflict(
         .map(Vec::as_slice)
         .unwrap_or_default();
     for info in infos {
-        let attrs: Vec<String> = ["propertyNames", "relationshipNames"]
-            .iter()
-            .flat_map(|k| info.get(*k).and_then(Value::as_array).into_iter().flatten())
-            .filter_map(Value::as_str)
+        let attrs: Vec<String> = antares_model::registration_attribute_names(info)
+            .unwrap_or_default()
+            .into_iter()
             .map(str::to_owned)
             .collect();
         let ents = info
@@ -748,7 +771,7 @@ pub(crate) async fn sweep_expired_registrations(st: &AppState, tenant: &TenantId
     {
         return 0;
     }
-    let mut n = 0;
+    let mut n: usize = 0;
     for id in dead {
         if st
             .store
@@ -756,7 +779,7 @@ pub(crate) async fn sweep_expired_registrations(st: &AppState, tenant: &TenantId
             .await
             .unwrap_or(false)
         {
-            n += 1;
+            n = n.saturating_add(1);
         }
     }
     n
@@ -778,11 +801,8 @@ pub fn validate_exclusive(doc: &Map<String, Value>) -> Result<(), NgsiError> {
         .map(Vec::as_slice)
         .unwrap_or_default();
     for info in infos {
-        let has_attrs = ["propertyNames", "relationshipNames"].iter().any(|k| {
-            info.get(*k)
-                .and_then(Value::as_array)
-                .is_some_and(|a| !a.is_empty())
-        });
+        let has_attrs = antares_model::registration_attribute_names(info)
+            .is_some_and(|names| !names.is_empty());
         if !has_attrs {
             return Err(bad("an exclusive registration shall define Attributes"));
         }
@@ -856,11 +876,9 @@ pub async fn check_proxied_overlap(
             return Ok(());
         }
         for info in infos {
-            let attrs: Vec<String> = ["propertyNames", "relationshipNames"]
-                .iter()
-                .filter_map(|k| info.get(*k).and_then(Value::as_array))
-                .flatten()
-                .filter_map(Value::as_str)
+            let attrs: Vec<String> = antares_model::registration_attribute_names(info)
+                .unwrap_or_default()
+                .into_iter()
                 .map(str::to_owned)
                 .collect();
             let empty = Vec::new();
@@ -944,6 +962,45 @@ async fn registration_write_lock(tenant: &TenantId) -> tokio::sync::OwnedMutexGu
     lock.lock_owned().await
 }
 
+/// The expanded types and Attribute names a registration's information
+/// names, for the policy gate (ADR-0020), each once.
+fn info_members(norm: &Map<String, Value>) -> (Vec<String>, Vec<String>) {
+    let (mut types, mut attrs): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let add = |out: &mut Vec<String>, v: Option<&Value>| {
+        let names: Vec<&str> = match v {
+            Some(Value::String(s)) => vec![s.as_str()],
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        for n in names {
+            if !out.iter().any(|o| o == n) {
+                out.push(n.to_owned());
+            }
+        }
+    };
+    for info in norm
+        .get("information")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for e in info
+            .get("entities")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            add(&mut types, e.get("type"));
+        }
+        // every name the request carries, the deprecated pair beside
+        // attributeNames included: the engine judges what was sent
+        for k in antares_model::REGISTRATION_ATTRIBUTE_MEMBERS {
+            add(&mut attrs, info.get(k));
+        }
+    }
+    (types, attrs)
+}
+
 // ---------- handlers ----------
 
 pub async fn create_registration(
@@ -962,8 +1019,15 @@ pub async fn create_registration(
         // ADR-0020: 5.9.2 lets the client choose the registration id, and
         // it is in hand here — see the same note on subscription create.
         let named = obj.get("id").and_then(Value::as_str);
-        gate!(st, &tenant, &headers, "5.9.2", ids: named.as_slice()).await?;
         let mut norm = normalize_registration(obj, &parsed.ctx, false)?;
+        let (types, attrs) = info_members(&norm);
+        gate!(
+            st, &tenant, &headers, "5.9.2",
+            ids: named.as_slice(),
+            types: &types,
+            attrs: &attrs,
+        )
+        .await?;
         let id = match norm.get("id").and_then(Value::as_str) {
             Some(id) => id.to_owned(),
             None => {
@@ -976,6 +1040,15 @@ pub async fn create_registration(
             }
         };
         validate_auxiliary_ops(&norm)?;
+        crate::federation::admit_registration(&st, &tenant, &norm).await?;
+        // The creating subject, kept as a Subscription keeps it: an engine
+        // narrows Query Registrations (5.10.2) by the subject the broker
+        // recorded, never by a member the client wrote (T-3692).
+        if let Some(subject) =
+            crate::policy::subject_member(&crate::policy::subject_of(&tenant, &headers))
+        {
+            norm.insert(crate::policy::SUBJECT_MEMBER.into(), subject);
+        }
         let doc = {
             let _serialized = registration_write_lock(&tenant).await;
             take_live_registration(&st, &tenant, &id).await?;
@@ -1073,11 +1146,12 @@ pub async fn query_registrations(
         )?;
         let accept = parse_accept(&headers)?;
         let ctx = request_context(&st.loader, &headers).await?;
-        gate!(
+        let narrowing = gate!(
             st, &tenant, &headers, "5.10.2",
             scope_q: params.get("scopeQ").map(String::as_str),
         )
         .await?;
+        let cond = crate::policy::Condition::of(&narrowing);
         let bad = NgsiError::BadRequestData;
         let mut spec = CsrSpec::default();
         if let Some(s) = params.get("id") {
@@ -1189,7 +1263,7 @@ pub async fn query_registrations(
                     _ => return false,
                 }
             }
-            csr_matches(&spec, doc, &ctx)
+            csr_matches(&spec, doc, &ctx) && cond.as_ref().is_none_or(|c| c.holds_for_record(doc))
         };
         let matches = collect_matching(&st, &tenant, keep, *crate::bounds::MAX_FOLD_DOCS).await?;
         let (page, count_hdr, links) = crate::paging::paginate_accept(
@@ -1350,6 +1424,7 @@ pub async fn update_registration(
                 validate_exclusive(&merged)?;
                 // 5.9.3.4: the mode-specific rules apply to the merged document
                 validate_auxiliary_ops(&merged)?;
+                crate::federation::admit_registration(&st, &tenant, &merged).await?;
                 check_entity_conflict(&st, &tenant, &merged).await?;
                 check_proxied_overlap(&st, &tenant, &merged, Some(&id), &parsed.ctx).await?;
             }

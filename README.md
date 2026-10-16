@@ -24,8 +24,8 @@ broker running in your browser, yes in the browser 😅
 - **Small.** About 35 MiB average RSS while the complete ETSI suite runs,
   about 9 MiB idle. The whole store ladder fits where a JVM heap alone
   would not.
-- **Conformant.** 1822/1822 ETSI CIM 009 V1.9.1 test cases green in every
-  native store mode, and 1810/1810 in the browser build, where the MQTT
+- **Conformant.** 1823/1823 ETSI CIM 009 V1.9.1 test cases green in every
+  native store mode, and 1811/1811 in the browser build, where the MQTT
   cases have no socket to run against
   ([per-store report with Robot drill-down](https://antaresbroker.joinedcontext.com/reports/latest/)).
   The ledger covers the whole spec text, one file per clause, in `docs/spec/`.
@@ -200,6 +200,22 @@ The weekly scale run measures a fixed fraction of these rows on rented
 hardware and publishes the broker's and Postgres's memory and CPU per
 phase; the [Performance](docs/src/performance.md) chapter says how each
 number is produced.
+
+## The NGSI-LD crates
+
+`ngsild-model`, `ngsild-jsonld`, `ngsild-ql`, `ngsild-matcher` and `ngsild-residual` (folders
+`crates/antares-*`, `antares_*` inside this workspace through `package =`, T-3962) hold the
+NGSI-LD data model, JSON-LD expansion, the query languages, subscription matching and the
+residual evaluator with no server, store or network in their default features (role `ngsild`,
+ADR-0027). Each has a README with a runnable example and the CIM 009 clauses it implements, and
+builds from its packaged files alone (`cargo publish --dry-run` in `workspace.yml`). They are
+published to crates.io by `.github/workflows/release-crates.yml` from a `v*` tag only, through
+crates.io trusted publishing (no stored token) with SLSA provenance on every `.crate`.
+
+Yanking a bad version: run `cargo yank --version <x.y.z> <crate>` with an owner's crates.io login
+for every crate of the release that carries the defect, open an issue that names the version and
+the defect, and release the fix as a new patch version from a new tag. A yank stops new lockfiles
+from choosing the version; it does not delete it or break a build that already locked it.
 
 ## Repository layout
 

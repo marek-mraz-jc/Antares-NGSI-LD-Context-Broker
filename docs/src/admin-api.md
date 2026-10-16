@@ -10,6 +10,20 @@ deployment mounted. Everything else the broker answers is CIM 009, and the
 pod (`ANTARES_ROLES` without `api`) serves only these routes. Errors use the
 same problem-details shape as the NGSI-LD API.
 
+A deployment can also put `/q/` behind a secret of the broker's own, so a
+network position is not the only thing between a caller and a tenant purge.
+`ANTARES_ADMIN_TOKEN_FILE` names a file holding it (a mounted Secret, at
+least 32 bytes, one trailing line break ignored). With it set, every `/q/`
+route except `GET /q/health` and `GET /q/ready` answers `401` with
+`WWW-Authenticate: Bearer realm="antares-admin"` and the problem type
+`urn:antares:error:Unauthorized` unless the request carries
+`Authorization: Bearer <secret>`; the comparison does not stop at the first
+differing byte. `GET /q/metrics` is guarded too unless
+`ANTARES_ADMIN_METRICS=open`, for a scraper that cannot send a header. The
+broker reads the file once at start, refuses to start when it is unreadable
+or too short, and never logs the secret. Unset, `/q/` asks for nothing and
+the broker logs one warning at start saying so.
+
 The same routes as an OpenAPI document, with every status code and response
 schema: `docs/openapi/antares-admin.yaml`, rendered at
 <https://antaresbroker.joinedcontext.com/openapi/admin.html> (see the
@@ -23,7 +37,12 @@ schema: `docs/openapi/antares-admin.yaml`, rendered at
 | `GET /q/tenants` | Tenant names |
 | `GET /q/tenants/{tenant}` | What one tenant holds |
 | `DELETE /q/tenants/{tenant}` | Tenant purge |
+| `GET /q/tenants/{tenant}/digest` | Entity count, history count and a hash over (id, `modifiedAt`) |
+| `GET /q/tenants/{tenant}/export` | The tenant's Entities and history as NDJSON, system attributes kept |
+| `POST /q/tenants/{tenant}/import` | An export into an empty tenant, all or nothing |
 | `GET /q/dead-letters` | Notifications the delivery policy gave up on |
+| `GET`, `PUT`, `DELETE /q/retention/{tenant}` | How long a Tenant keeps each type ([Retention](#retention)) |
+| `POST /q/retention/{tenant}/preview`, `GET /q/retention/{tenant}/deleted` | What a retention document would delete now; what this pod's sweeps deleted ([Retention](#retention)) |
 | `POST /q/dead-letters/{id}/replay` | One more delivery attempt |
 | `DELETE /q/dead-letters/{id}` | Drop a dead letter |
 | `POST /ex/v1/remote-notify` | The 5.8.1.4 receiver other brokers post to |
@@ -49,8 +68,10 @@ progress). A memory-store broker answers:
   "surfaces": { "admin": { "prefix": "/q", "routes": 8 } },
   "limits": {
     "changeQueue": 1024,
+    "deliveryLane": 64,
     "deliveryWidth": 64,
     "deliveryWidthPerTenant": 8,
+    "maxAnswerBytes": 67108864,
     "maxBatchItems": 1000,
     "maxBodyBytes": 4194304,
     "maxContextFetches": 32,
@@ -90,9 +111,9 @@ progress). A memory-store broker answers:
 | `changesDropped` | Changes the bounded matcher queue refused since start, each one a notification never matched: delivery is slower than the write rate. |
 | `taskPanics` | Panics absorbed at the notification-task boundary since start, each one a lost notification. Reported here because the Prometheus recorder is off unless `ANTARES_TELEMETRY` is set. |
 | `temporalDrainErrors` | Post-response history writes that failed since start; the client's 2xx stands, the counter and a warning record the loss. |
-| `policy` | The policy engine this binary was started with (`ANTARES_POLICY`, `allow-all` unless a deployment registered another) and the deadline one decision gets (`ANTARES_POLICY_TIMEOUT_MS`). An engine that overruns it is a refusal, not a delay. |
+| `policy` | The policy engine this binary was started with (`ANTARES_POLICY`, `allow-all` unless a deployment registered another) and the deadline one decision gets (`ANTARES_POLICY_TIMEOUT_MS`). An engine that overruns it is a refusal, not a delay. In a `views` build, `documents` lists the engine's rule documents by tenant and revision, `loaded` or `refused` ([Policy rule documents](#policy-rule-documents)); `null` when the engine reads none. |
 | `surfaces` | The mounted admin surfaces by name, each with its prefix and route count. |
-| `limits` | The bounds wall: every `max*` cap in force and the `rejected*` counters of requests refused by it, plus the notification-pipeline ceilings (`changeQueue`, `deliveryWidth`, `deliveryWidthPerTenant`, `maxTrackedDestinations`). No request is rejected against those four — they are published because reaching one is what a dropped change or a stalled fan-out looks like from outside. |
+| `limits` | The bounds wall: every `max*` cap in force and the `rejected*` counters of requests refused by it, plus the notification-pipeline ceilings (`changeQueue`, `deliveryLane`, `deliveryWidth`, `deliveryWidthPerTenant`, `maxTrackedDestinations`). No request is rejected against those five — they are published because reaching one is what a dropped change or a stalled fan-out looks like from outside. Each subscription is delivered on a lane of its own, `deliveryLane` groups deep: a slow or dead endpoint fills its own lane, which drops for that subscription alone (counted in `antares_notification_lane_dropped_total`, logged with tenant and subscription), and never holds the matching of other subscriptions' changes. |
 | `memory` | jemalloc live (`allocatedBytes`) and resident (`residentBytes`) bytes. |
 | `commitQueueDepth`, `commitQueuePeak` | Present only for a store with a single committer to queue behind (`file`, and the browser build over OPFS): writers queued now and at peak. |
 | `bus` | `ANTARES_BUS=nats` only: `{mode, connected, reconnects}`. |
@@ -121,7 +142,9 @@ Prometheus text with the `antares_` prefix:
 | `antares_temporal_drain_errors_total` | Failed post-response history writes. |
 | `antares_notifications_sent_total`, `antares_notifications_retried_total`, `antares_notifications_failed_total` | Notification deliveries by outcome. |
 | `antares_notification_changes_dropped_total` | Change events the notifier dropped under back-pressure. |
+| `antares_notification_lane_dropped_total` | Entities a subscription's full delivery lane dropped: that subscriber is slower than its changes (the log line names tenant and subscription). |
 | `antares_claim_check_unresolved_total` | Changes too big for the bus whose kept outbox row was already reaped: the before-image is gone and the change notifies nobody. Non-zero means a matcher lagged past the retention window. |
+| `antares_retention_deleted_total` | Entities (`kind="entity"`) and attribute instances (`kind="history"`) the [retention](#retention) sweep deleted, by `tenant` and `type`. |
 | `antares_notification_task_panics_total` | Delivery tasks that panicked (a bug, never expected). |
 | `antares_change_lag_seconds` | Age of the change a notifier is handling. |
 | `antares_policy_failures_total` | Decisions the policy seam had to make itself because the engine did not, by reason (`panic`, `timeout`). Always zero under the built-in `allow-all` engine. |
@@ -176,6 +199,39 @@ tenant is emptied and keeps existing. The path names the tenant; an
 `NGSILD-Tenant` header is ignored. Background in
 [operations](operations.md#tenants).
 
+
+### Moving a tenant to another broker
+
+ADR-0030. Hold the
+writers first: the export is not a point-in-time snapshot, and the digest
+proves the copy.
+
+#### GET /q/tenants/{tenant}/digest
+
+Answers `{"tenant","entities","attrInstances","sha256"}`. `sha256` is the
+sum modulo 2²⁵⁶ of `sha256(id ‖ 0x00 ‖ modifiedAt)` over the Entities, so
+two brokers agree whatever order they page in.
+
+#### GET /q/tenants/{tenant}/export
+
+Streams `application/x-ndjson`: a header `{"antaresExport":1,"tenant":…}`,
+one `{"kind":"entity","doc":…}` per Entity, then one
+`{"kind":"temporal","doc":…}` per history document, each as stored, and a
+trailer `{"end":true,"records":n}`. A stream that stops without the trailer
+was cut. A tenant holding Subscriptions, Registrations, Registration
+Subscriptions, Snapshots or distributed subscriptions answers `409` with
+their counts: v1 moves data only.
+
+#### POST /q/tenants/{tenant}/import
+
+Takes that stream into a tenant that holds nothing: no Entity, history,
+Subscription, registration, Snapshot, EntityMap, distributed subscription
+or hosted `@context` (`409` naming each count otherwise). The header names
+the same tenant, entities come before history, a line is at most 16 MiB.
+Any refused line, or a missing trailer, answers `400` naming the line; the
+import then deletes the Entities and history it wrote, by id, and nothing
+else. `204` when every record is in.
+
 ## Dead letters
 
 A letter carries the subscription id, tenant, endpoint, headers, body,
@@ -202,6 +258,236 @@ letter kept, `404` when the tenant holds no such letter.
 
 `?tenant=` — `204`, or `404` when the tenant holds no such letter.
 
+## Views
+
+Only in a broker built with the `views` feature (ADR-0023 rule 10); a
+vanilla broker answers `404` here. A view is configuration: these routes
+validate it, store it under the reserved tenant `antares-views` and reload
+the pod's view table before they answer; every other pod reloads within
+`ANTARES_VIEWS_RELOAD_MS` (default 5000). `/q/health` lists each view
+(`loaded` with its tenant, operation count and loader notes, or `invalid`
+with the reason) under `views`, and each surface that serves through views
+as `open` or `closed` under `surfaces`: no view loaded, every route of such
+a surface answers `404`. `viewsRevision` is sixteen hex digits, a digest of
+the stored view documents the table was loaded from: every pod over one
+store reports the same value once it has reloaded, so two values mean two
+pods serving two predicates.
+
+```json
+{
+  "id": "cars", "tenant": "city",
+  "@context": {"a": "https://a.example/"},
+  "selector": ["Car"],
+  "q": "speed>0", "scopeQ": "/city/#",
+  "geoQ": {"georel": "within", "geometry": "Polygon", "coordinates": [[[0,0],[1,0],[1,1],[0,0]]]},
+  "rules": [{"types": ["Car"], "q": "status==\"moving\"", "attributes": ["speed", "a:name"]}],
+  "operations": ["query_entities", "retrieve_entity"]
+}
+```
+
+`id` is `[a-z0-9-]{1,63}`; `tenant` is a client tenant; `selector`,
+`rules[].types` and `rules[].attributes` expand through the view's own
+`@context` (inline, over the core context); every `q` is read against the
+core context; `operations` are row ids of `docs/analysis/operation-matrix.yaml`.
+No member has a default that serves more: an empty selector, rule list or
+operation list is refused. Bounds: 64 KiB per document, 64 rules, 256 names
+per list, 4096 bytes per `q` or `scopeQ`.
+
+### GET /q/views
+
+The table, as `/q/health` lists it.
+
+### GET /q/views/{id}
+
+The stored document, or `404`.
+
+### PUT /q/views/{id}
+
+`201` created, `204` replaced; `400` with the first reason the view cannot
+be served (nothing is stored), `413` over 64 KiB.
+
+### DELETE /q/views/{id}
+
+`204`, or `404` when there is no such view.
+
+### POST /q/views/{id}/preview
+
+What a draft would serve, before it is stored (the Portal's view writer).
+The body is the candidate view document, checked as a PUT checks it; the
+request's query string is a Query Entities query (5.7.2), run in the
+draft's tenant through its narrowing under the subject headers of this
+request (`ANTARES_POLICY_SUBJECT_HEADERS`): the admin caller names whose
+reading it previews (the platform's Portal: a member's `x-jc-*`, or
+`x-jc-roles: public` for the anonymous reading), and a request naming nobody
+is the cluster's own caller, as on every other path (T-3813). `limit` is at most 100
+(default 20) and any `count` is replaced by `count=true`. The answer is
+`{"count": 2, "entities": [...]}`, the count of the whole narrowed set and
+one page. Nothing is stored and no table reloads. `400` with the loader's
+reason for a draft that cannot be served or a `limit` over 100, `413` over
+64 KiB; a refusal of the query itself (no `type`, `attrs`, `q` or `georel`,
+an unknown tenant, the engine's denial) comes back as the API gave it. No
+view root reaches this route: a view serves only the operations of the
+matrix.
+
+## Export grants
+
+Only in a broker built with the `internal-csr` feature and started with
+`ANTARES_SELF_URLS` set (ADR-0025 rule 5): a Tenant's consent to another
+Tenant's registrations reading it in process. See
+[Internal context sources](internal-context-sources.md) for what a grant
+allows; bound: 4 KiB per document.
+
+### GET /q/grants
+
+Every stored grant.
+
+### GET /q/grants/{target}/{source}
+
+The grant `target` holds for `source`, or `404`.
+
+### PUT /q/grants/{target}/{source}
+
+`{"target", "source", "access"?, "view"?}`: `201` created, `204` replaced;
+`400` when the document is no grant, names a Tenant no client can, or names
+another pair than the path (nothing is stored).
+
+### DELETE /q/grants/{target}/{source}
+
+`204`, or `404` when there is no such grant. The next forward that needed it
+is not made.
+
+## Policy rule documents
+
+Only in a broker built with the `views` feature and started with a policy
+engine that reads rule documents (ADR-0020 amendment); with `allow-all`, or
+an engine that reads none, every route here answers `404`. A rule document
+belongs to one client tenant and is opaque to the broker: the engine owns
+its schema. The broker bounds it (64 KiB, 32 levels of nesting, 8192 JSON
+values), hands it to the engine, and stores it under the reserved tenant
+`antares-policy` with a revision it counts. The table reloads with the view
+table: the pod that took a write before it answers, every other pod within
+`ANTARES_VIEWS_RELOAD_MS`. A stored revision the engine refuses on reload
+(written by another version, or by hand) leaves the previous revision
+deciding. `/q/health` lists the documents under `policy.documents` by
+tenant and revision only; neither a document nor the engine's reason is
+logged.
+
+```json
+{"loaded": [{"tenant": "city", "revision": 3}], "refused": []}
+```
+
+### GET /q/policy
+
+The table, as `/q/health` lists it.
+
+### GET /q/policy/{tenant}
+
+`{"tenant": "city", "revision": 3, "document": {...}}`, or `404`; `400`
+for a name that is not a client tenant.
+
+### PUT /q/policy/{tenant}
+
+The body is the document. `201` created, `204` replaced; `400` for no JSON,
+`null`, a depth or value count over its bound, or the engine's reason for
+refusing it (nothing is stored, the previous revision keeps deciding);
+`413` over 64 KiB.
+
+### DELETE /q/policy/{tenant}
+
+`204`, and the engine drops the tenant's document; `404` when there is
+none.
+
+## Schemas
+
+Only in a broker built with the `views` feature (T-3628). Each Tenant has at
+most one `LinkML` schema, in its JSON serialisation, resolved (imports and
+`is_a` folded): the model a surface such as OData or LinkML reads for value
+types, relationship targets and kinds (`docs/analysis/odata-linkml-mapping.md`
+3.1). The broker checks only its size and that it is JSON; the surface parses
+it, so a schema it cannot read closes that surface for the Tenant's views and
+the surface says so in `/q/health`. The document is stored beside the views
+under `antares-views` and reloaded with them; `/q/health` lists each Tenant's
+`bytes` and `revision` under `schemas`, never the document.
+
+The path names the Tenant, and only one a client can name; nothing in the
+body does.
+
+### GET /q/schemas/{tenant}
+
+The schema as written, `application/json`, or `404`.
+
+### PUT /q/schemas/{tenant}
+
+`201` created, `204` replaced. `413` over `ANTARES_SCHEMA_MAX_BYTES`, `400`
+when the body is not JSON or the path names no client tenant; nothing is
+stored. `503` while `ANTARES_SCHEMA_MAX_BYTES` is unset: the operator names
+the bound before any schema is taken.
+
+### DELETE /q/schemas/{tenant}
+
+`204`, or `404` when the Tenant has no schema.
+
+## Retention
+
+Only in a broker built with the `views` feature (T-3900). Each Tenant has at
+most one retention document: how long it keeps each Entity type's current
+state and history. A type without a rule, and a Tenant without a document,
+lose nothing. The document is stored beside the views under
+`antares-views` and reloaded with them.
+
+```json
+{"rules": [
+  {"type": "https://example.org/Vehicle", "current": "PT5M", "history": "PT8H"},
+  {"type": "https://example.org/Stop"}
+]}
+```
+
+- `type` is the expanded type IRI, as the store holds it; one rule per type,
+  at most 256 rules.
+- `current`: an Entity of that type that carries no `expiresAt` of its own
+  and has not been modified for that long is deleted. An `expiresAt` the
+  writer sent wins (4.22).
+- `history`: the type's attribute instances whose `observedAt` (else
+  `modifiedAt`, `deletedAt`, `createdAt`) is older than that are deleted.
+- A duration is ISO 8601 (`PT5M`, `PT8H`, `P30D`, `P1DT12H`) or short
+  (`90s`, `5m`, `8h`, `14d`), from one minute to ten years.
+
+Every pod sweeps once a minute, each rule in statements of at most 1000 rows
+and at most 50 statements a sweep, logs per Tenant and type the count it
+deleted, never ids or values, and counts it in
+`antares_retention_deleted_total{tenant,type,kind}` (`kind` is `entity` or
+`history`). `ANTARES_TEMPORAL_RETENTION_DAYS` stays the broker-wide horizon
+beside it.
+
+### GET /q/retention/{tenant}
+
+`200` with the document as written, `404` when the Tenant has none, `400`
+for a name outside the tenant grammar.
+
+### PUT /q/retention/{tenant}
+
+`201` created, `204` replaced. `400` for a document that is not one (an
+unknown member, a short type name, a type named twice, a duration out of
+bounds), `413` over 64 KiB; nothing is stored.
+
+### DELETE /q/retention/{tenant}
+
+`204`, or `404` when the Tenant has no document.
+
+### POST /q/retention/{tenant}/preview
+
+The body is a retention document, checked as `PUT` checks it, and nothing is
+stored or deleted. `200` with `{"counts": [{"type", "kind", "count"}]}`: per
+type and kind (`entity`, `history`) what a sweep now would delete, at most
+100 000 each; a type that would lose nothing is not listed. `400` and `413` as
+`PUT`.
+
+### GET /q/retention/{tenant}/deleted
+
+`200` with `{"counts": [{"type", "kind", "count"}]}`: what this pod's sweeps
+deleted of the Tenant since the pod started. Every pod sweeps the same rules,
+so a pod's totals are its share; `antares_retention_deleted_total` sums them.
+
 ## The peer-facing wire
 
 ### POST /ex/v1/remote-notify
@@ -220,6 +506,11 @@ Subscription id, so a Context Source learns nothing about the subscriber and
 cannot address any other subscription. That key resolves through the stored
 mapping to the tenant and the local subscription; the request's
 `NGSILD-Tenant` header is not read on this route at all.
+
+Who may post: whoever holds a key. Each key is a random UUID minted for one
+subscription copy and sent only to the Context Source that copy went to, so
+the key is the peer's credential for that one subscription. A caller without
+one gets `404` before any store write or delivery (ADR-0019).
 
 `200` when the notification was accepted — including when the mapping
 resolves but nothing was left to deliver. `400` for a body that is not JSON,

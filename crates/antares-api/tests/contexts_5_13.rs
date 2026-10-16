@@ -290,7 +290,7 @@ async fn clause_5_13_4_serve_errors() {
 
 /// 5.13.5.4: delete → 204 (no body) and the entry is gone; second delete →
 /// 404; reload on a non-Cached kind → 400; malformed reload flag → 400;
-/// unknown id without reload → 404.
+/// unknown id → 404 with or without reload.
 #[tokio::test(flavor = "multi_thread")]
 async fn clause_5_13_5_delete_and_reload_errors() {
     let st = state();
@@ -334,16 +334,19 @@ async fn clause_5_13_5_delete_and_reload_errors() {
     let (status, _, _) = delete(&st, "/ngsi-ld/v1/jsonldContexts/urn:ngsi-ld:none").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // unknown id with reload=true → 400: the reload bullets only distinguish
-    // Cached vs not-Cached (5.13.5.4), and the 404 rule is restated inside
-    // the reload=false bullet — the official suite pins this reading
-    // (051_04_01).
-    let (status, _, _) = delete(
+    // unknown id with reload=true → 404: the second bullet of 5.13.5.4
+    // ("does not correspond to any existing entry") holds before the reload
+    // bullets, which describe an existing @context (forge 39921641, 051_04_01)
+    let (status, _, body) = delete(
         &st,
         "/ngsi-ld/v1/jsonldContexts/urn:ngsi-ld:none?reload=true",
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body["type"], "https://uri.etsi.org/ngsi-ld/errors/ResourceNotFound",
+        "{body}"
+    );
 }
 
 /// Request carrying an explicit NGSILD-Tenant (6.3.14).
@@ -682,4 +685,121 @@ async fn clause_5_5_10_a_batch_does_not_resolve_another_tenants_context() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "nothing was stored: {body}");
+}
+
+/// TS 104 176 6.2.4: "If the request verb is GET, HEAD or DELETE, then the
+/// associated JSON-LD @context shall be obtained from a Link header". A HEAD
+/// naming a user @context resolves its terms through it (the attribute `A1`
+/// of that @context is found, and is not found under the core context), and
+/// the answer names the same @context in its own Link header, with no body.
+/// The status stays 200, the 7.3.3.1 table's (owner decision on T-3460;
+/// clause 5's 204 is raise 14 in docs/upstream/etsi-raises.md).
+#[tokio::test(flavor = "multi_thread")]
+async fn ts104176_6_2_4_head_takes_context_from_link() {
+    let st = state();
+    let loc = add_hosted(&st).await;
+    let (_, _, meta) = get(&st, &format!("{loc}?details=true")).await;
+    let url = meta["URL"]
+        .as_str()
+        .expect("stored @context URL")
+        .to_owned();
+    let link = format!(
+        "<{url}>; rel=\"http://www.w3.org/ns/json-ld#context\"; type=\"application/ld+json\""
+    );
+    let body = json!({"id": "urn:ngsi-ld:Device:head", "type": "Device",
+                      "A1": {"type": "Property", "value": 1}})
+    .to_string();
+    let (status, _, created) = send(
+        &st,
+        Request::builder()
+            .method("POST")
+            .uri("/ngsi-ld/v1/entities")
+            .header("Content-Type", "application/json")
+            .header("Content-Length", body.len())
+            .header("Link", &link)
+            .body(Body::from(body))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let head = |link: Option<&str>| {
+        let mut req = Request::builder()
+            .method("HEAD")
+            .uri("/ngsi-ld/v1/entities/urn:ngsi-ld:Device:head/attrs/A1");
+        if let Some(link) = link {
+            req = req.header("Link", link);
+        }
+        req.body(Body::empty()).expect("request")
+    };
+    let (status, headers, body) = send(&st, head(Some(&link))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, Value::Null, "a HEAD answer has no body");
+    let echoed = headers
+        .get("Link")
+        .and_then(|l| l.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        echoed.contains(&url),
+        "the answer names the @context it used: {echoed:?}"
+    );
+
+    let (status, _, _) = send(&st, head(None)).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "under the core @context `A1` is another attribute, which the Entity does not hold"
+    );
+}
+
+/// TS 104 175 13.4.3 and 13.4.4: `core=<major.minor>` answers a two-URL
+/// @context, the user @context's location and the core @context of that
+/// version; `core` with `details`, or a `core` that names no version, is a
+/// BadRequest.
+#[tokio::test(flavor = "multi_thread")]
+async fn ts104175_13_4_4_core_answers_the_user_and_core_urls() {
+    let st = state();
+    let loc = add_hosted(&st).await;
+    let (status, _, meta) = get(&st, &format!("{loc}?details=true")).await;
+    assert_eq!(status, StatusCode::OK, "{meta}");
+    let user_url = meta["URL"].as_str().expect("URL").to_owned();
+
+    let (status, _, body) = get(&st, &format!("{loc}?core=1.9")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!([
+            user_url,
+            "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld"
+        ])
+    );
+    let (_, _, body) = get(&st, &format!("{loc}?core=1.8")).await;
+    assert_eq!(
+        body[1], "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.8.jsonld",
+        "{body}"
+    );
+
+    // a Cached entry answers the pair too: the URLs are not its content
+    let core = "https%3A%2F%2Furi.etsi.org%2Fngsi-ld%2Fv1%2Fngsi-ld-core-context-v1.9.jsonld";
+    let (status, _, body) = get(&st, &format!("/ngsi-ld/v1/jsonldContexts/{core}?core=1.9")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(2), "{body}");
+
+    for bad in [
+        "core=1.9&details=true",
+        "core=1",
+        "core=1.9.0",
+        "core=v1.9",
+        "core=9.9",
+    ] {
+        let (status, _, body) = get(&st, &format!("{loc}?{bad}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+        assert_eq!(
+            body["type"], "https://uri.etsi.org/ngsi-ld/errors/BadRequestData",
+            "{bad}: {body}"
+        );
+    }
+    // the unknown id is still ResourceNotFound
+    let (status, _, _) = get(&st, "/ngsi-ld/v1/jsonldContexts/urn:ngsi-ld:none?core=1.9").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

@@ -188,7 +188,7 @@ fn candidates_are_a_superset_of_the_naive_reference() {
 /// docs; 100k lookups in well under a second proves the index is doing the
 /// work, and the 1k-vs-10k timing ratio proves it is not a hidden scan.
 #[test]
-#[ignore = "release-mode perf gate: cargo test --release -p antares-api --test sub_index -- --ignored"]
+#[ignore = "release-mode perf gate: cargo test --release -p antares-api --test it sub_index:: -- --ignored"]
 fn ten_thousand_subs_lookup_does_not_scale_with_sub_count() {
     let lookup_time = |total: usize| {
         let m = SubMirror::default();

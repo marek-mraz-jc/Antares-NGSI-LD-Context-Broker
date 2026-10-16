@@ -26,11 +26,6 @@
             "observedAt":"2020-08-01T12:03:00Z"
          },
          {
-             "type": "Property",
-             "value": 80,
-             "observedAt": "2020-08-01T12:05:00Z"
-         },
-         {
             "type":"Property",
             "value":100,
             "observedAt":"2020-08-01T12:07:00Z"
@@ -62,11 +57,6 @@
             "type":"Property",
             "value":120,
             "observedAt":"2020-09-01T12:03:00Z"
-         },
-         {
-             "type": "Property",
-             "value": 80,
-             "observedAt": "2020-09-01T12:05:00Z"
          },
          {
             "type":"Property",
