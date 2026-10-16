@@ -107,6 +107,7 @@ mod temporal_lang_5_7_4;
 mod temporal_matrix;
 mod temporal_pagination_7_4_2_5;
 mod temporal_projection_5_7_3;
+mod temporal_rules_window;
 mod temporal_scope_5_7_4;
 mod temporal_values_4_5_9;
 mod tenant_header_6_3_14;
