@@ -1848,14 +1848,21 @@ fn replays_state(rules: Option<&crate::policy::Filter>) -> bool {
 /// no rule reads state and every window stays open towards now, so the
 /// rules keep the newest instances of what they show. A window that closes
 /// before now, or firstN, would have the store keep instances the rules
-/// then drop (T-4246).
-fn cap_keeps_shown(rules: Option<&crate::policy::Filter>, page: &InstancePage) -> bool {
+/// then drop (T-4246). Rule windows judge observedAt, so a window under a
+/// cap ordered by another `timeproperty` (a backfill: new createdAt, old
+/// observedAt) keeps the cap in the API too.
+fn cap_keeps_shown(
+    rules: Option<&crate::policy::Filter>,
+    page: &InstancePage,
+    timeprop: &str,
+) -> bool {
     rules.is_none_or(|r| {
         page.desc
             && !replays_state(Some(r))
-            && r.rules
-                .iter()
-                .all(|rule| rule.temporal.iter().all(|w| w.to.is_none()))
+            && r.rules.iter().all(|rule| {
+                rule.temporal.is_empty()
+                    || (timeprop == "observedAt" && rule.temporal.iter().all(|w| w.to.is_none()))
+            })
     })
 }
 
@@ -2364,9 +2371,15 @@ pub(crate) async fn query_temporal_collected(
                     end_time_at: t.end_time_at.as_deref(),
                     timeproperty: &t.timeproperty,
                 }),
-            last_n: page_n
-                .store_cap()
-                .filter(|_| exact_push && cap_keeps_shown(types_rule.as_deref(), &page_n)),
+            last_n: page_n.store_cap().filter(|_| {
+                exact_push
+                    && cap_keeps_shown(
+                        types_rule.as_deref(),
+                        &page_n,
+                        tq.as_ref()
+                            .map_or("observedAt", |t| t.timeproperty.as_str()),
+                    )
+            }),
             oldest_first: !page_n.desc,
             timeproperty: tq
                 .as_ref()
@@ -2752,9 +2765,14 @@ async fn retrieve_temporal_inner(
                     end_time_at: t.end_time_at.as_deref(),
                     timeproperty: &t.timeproperty,
                 }),
-            last_n: page_n
-                .store_cap()
-                .filter(|_| cap_keeps_shown(types_rule.as_deref(), &page_n)),
+            last_n: page_n.store_cap().filter(|_| {
+                cap_keeps_shown(
+                    types_rule.as_deref(),
+                    &page_n,
+                    tq.as_ref()
+                        .map_or("observedAt", |t| t.timeproperty.as_str()),
+                )
+            }),
             oldest_first: !page_n.desc,
             timeproperty: tq
                 .as_ref()

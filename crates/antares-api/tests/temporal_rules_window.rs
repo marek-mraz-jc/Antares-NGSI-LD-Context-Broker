@@ -142,10 +142,19 @@ impl TemporalDriver for Recording {
 }
 
 async fn state(rule: Rule) -> (AppState, Arc<Recording>) {
+    state_with(rule, &[]).await
+}
+
+/// [`state`] with `more` appended to the evolution before the rule applies.
+async fn state_with(rule: Rule, more: &[Value]) -> (AppState, Arc<Recording>) {
     let mut st = AppState::new("me".into());
     antares_api::wire(&mut st).await;
     let (status, body) = send(&st, "/ngsi-ld/v1/temporal/entities", Some(evolution())).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+    for doc in more {
+        let (status, body) = send(&st, "/ngsi-ld/v1/temporal/entities", Some(doc.clone())).await;
+        assert!(status.is_success(), "{status} {body}");
+    }
     let recording = Arc::new(Recording {
         inner: st.temporal.clone(),
         ranged: Mutex::new(Vec::new()),
@@ -310,4 +319,41 @@ async fn a_condition_keeps_last_n_out_of_the_store() {
     assert_eq!(query, vec![10, 9]);
     assert_eq!(one, vec![10, 9]);
     assert_eq!(asked, vec![(false, false), (false, false)]);
+}
+
+/// Rule windows judge observedAt. Ordered by createdAt, the newest
+/// instances can be a backfill whose observedAt the window drops, so a
+/// store cap would answer with nothing: the cap stays in the API.
+#[tokio::test(flavor = "multi_thread")]
+async fn last_n_by_another_timeproperty_stays_out_of_the_store() {
+    let instances: Vec<Value> = [100, 101]
+        .iter()
+        .map(|v| json!({"type": "Property", "value": v, "observedAt": "2025-12-31T00:00:00Z"}))
+        .collect();
+    let backfill = json!({"id": CAR, "type": "Vehicle", "speed": instances});
+    let (st, recording) = state_with(plain(), &[backfill]).await;
+    let q = "timeproperty=createdAt&timerel=after&timeAt=2000-01-01T00:00:00Z&lastN=2";
+    let (status, body) = send(
+        &st,
+        &format!("/ngsi-ld/v1/temporal/entities?type=Vehicle&{q}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let query = speeds(&body[0]);
+    let (status, one) = send(
+        &st,
+        &format!("/ngsi-ld/v1/temporal/entities/{CAR}?{q}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(query.len(), 2, "{body}");
+    assert_eq!(speeds(&one).len(), 2, "{one}");
+    assert!(
+        query.iter().chain(&speeds(&one)).all(|v| *v <= 10),
+        "the window drops the backfill"
+    );
+    let asked = recording.ranged.lock().expect("lock").clone();
+    assert_eq!(asked, vec![(true, false), (true, false)]);
 }
