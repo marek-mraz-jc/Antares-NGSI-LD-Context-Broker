@@ -280,6 +280,10 @@ jobs:
         with:
           components: rust-src
       - uses: Swatinem/rust-cache@v2
+      # ubuntu-24.04 randomizes mmap with 32 bits (33 on arm64), past what TSan's fixed shadow
+      # layout allows: every instrumented binary dies with SIGSEGV before main (run 38850474298,
+      # antares-api's lib tests, no test started). 28 bits is the layout TSan expects.
+      - run: sudo sysctl -w vm.mmap_rnd_bits=28
       - run: >
           cargo +nightly test -Zbuild-std
           --target aarch64-unknown-linux-gnu
