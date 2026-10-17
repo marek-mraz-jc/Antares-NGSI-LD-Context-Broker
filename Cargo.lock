@@ -243,7 +243,10 @@ dependencies = [
 name = "antares-ogc"
 version = "0.2.0"
 dependencies = [
+ "antares-mcp",
+ "antares-odata",
  "antares-ops",
+ "antares-views",
  "axum",
  "http-body-util",
  "linkml-model",
