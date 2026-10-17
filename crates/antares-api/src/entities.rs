@@ -1064,23 +1064,54 @@ fn proj_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -
     fed_is_empty && !params.contains_key("orderBy")
 }
 
-/// Whether the store may be asked to cut the page (ORDER BY id +
-/// LIMIT/OFFSET). Only when nothing outside it still narrows or reorders the
-/// match set:
-///
-/// * federated candidates are merged in afterwards, and 5.7.2.4 applies the
-///   query, geoquery, Scope query and Attribute filters only after that
-///   aggregation — so a SQL page would be cut from the wrong set;
-/// * `idPattern` is not part of the store filter, so it drops rows the SQL
-///   page already counted;
-/// * `orderBy` orders the whole match set by the value of the ordering member
-///   (4.23) before the page is cut, and that comparison order is the
-///   evaluator's.
-///
-/// `limit=0` — the count-only shape of 6.3.10, where `count=true` is
-/// mandatory — IS pushed: the store returns no rows and counts the match set,
-/// which is the same count the scan derives from a materialized one, without
-/// materializing 100 million documents to throw them away.
+/// Whether `q` reads only Attributes that every rule of a type in `groups`
+/// shows and the narrowing's own projection keeps, in the form the store
+/// compiles exactly: one Attribute per term, no Linked Entity hop, no system
+/// member. An Entity of those types shows at least what one such rule shows,
+/// so on those Attributes it answers `q` as stored and as shown alike.
+fn reads_only_shown(
+    q: &antares_ql::QNode,
+    rules: &crate::policy::Filter,
+    groups: &[Vec<String>],
+    narrow: Option<&crate::repr::Repr>,
+    expand: &dyn Fn(&str) -> String,
+) -> bool {
+    if antares_ql::sql::compile_q(q, "entity", 1, expand).is_none()
+        || !rules.omit_by_type.is_empty()
+    {
+        return false;
+    }
+    // every rule naming a type the request selects
+    let selected: Vec<&crate::policy::Rule> = rules
+        .rules
+        .iter()
+        .filter(|r| {
+            r.types
+                .iter()
+                .any(|t| groups.iter().flatten().any(|g| g == t))
+        })
+        .collect();
+    let heads = |nodes: &Option<Vec<crate::repr::ProjNode>>| {
+        nodes
+            .as_ref()
+            .map(|n| n.iter().map(|n| n.iri.clone()).collect::<Vec<_>>())
+    };
+    let pick = narrow.and_then(|r| heads(&r.policy_pick));
+    let omit = narrow
+        .and_then(|r| heads(&r.policy_omit))
+        .unwrap_or_default();
+    !selected.is_empty()
+        && q.attribute_paths().into_iter().all(|name| {
+            let iri = expand(name);
+            antares_ql::is_non_system_attr(name)
+                && !omit.contains(&iri)
+                && pick.as_ref().is_none_or(|p| p.contains(&iri))
+                && selected
+                    .iter()
+                    .all(|r| r.every_attribute || r.attributes.contains(&iri))
+        })
+}
+
 /// The client's type selection (OR of AND groups, `None` = any type) with
 /// one of the rules' types required in every group: `(a;b)|c` under rules
 /// of `T` and `U` selects `(a;b;T)|(a;b;U)|(c;T)|(c;U)`, and a group that
@@ -1123,6 +1154,23 @@ fn judged_types<'a>(
     ))
 }
 
+/// Whether the store may be asked to cut the page (ORDER BY id +
+/// LIMIT/OFFSET). Only when nothing outside it still narrows or reorders the
+/// match set:
+///
+/// * federated candidates are merged in afterwards, and 5.7.2.4 applies the
+///   query, geoquery, Scope query and Attribute filters only after that
+///   aggregation — so a SQL page would be cut from the wrong set;
+/// * `idPattern` is not part of the store filter, so it drops rows the SQL
+///   page already counted;
+/// * `orderBy` orders the whole match set by the value of the ordering member
+///   (4.23) before the page is cut, and that comparison order is the
+///   evaluator's.
+///
+/// `limit=0` — the count-only shape of 6.3.10, where `count=true` is
+/// mandatory — IS pushed: the store returns no rows and counts the match set,
+/// which is the same count the scan derives from a materialized one, without
+/// materializing 100 million documents to throw them away.
 fn page_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -> bool {
     fed_is_empty && !params.contains_key("idPattern") && !params.contains_key("orderBy")
 }
@@ -1310,6 +1358,7 @@ pub async fn filter_entities_paged(
     let engine_q = narrow
         .and_then(|r| r.policy_reach.as_deref())
         .and_then(|reach| reach.q.as_ref());
+    let client_and_engine_q = q_ast.clone();
     let (q_ast, shown_q) = if rules.is_some() {
         (engine_q.cloned(), client_q)
     } else {
@@ -1331,14 +1380,36 @@ pub async fn filter_entities_paged(
     // store takes those types as one more selection, and pages and counts
     // as at the root (T-3667: a page of one read every Entity the policy
     // admits).
-    let judged = rules
+    let by_type = rules
         .filter(|f| {
             f.rules
                 .iter()
                 .all(crate::policy::Rule::admits_by_type_alone)
         })
-        .filter(|_| !reads_shown)
-        .and_then(|f| judged_types(type_sel.as_deref(), f));
+        .and_then(|f| Some((f, judged_types(type_sel.as_deref(), f)?)));
+    // So too when the client's `q` reads only Attributes that every rule of
+    // the types it selects shows: on those, the Entity as stored and as shown
+    // answer it alike (T-4289: `count=true` with a `q`, which every OGC and
+    // OData read sends, read every Entity the policy admits and hit the
+    // store's TooManyResults ceiling).
+    let q_alike = shown_attrs.is_none()
+        && shown_geos.is_empty()
+        && by_type
+            .as_ref()
+            .zip(shown_q)
+            .is_some_and(|((f, groups), q)| {
+                reads_only_shown(q, f, groups, narrow, &|t: &str| ctx.expand_key(t))
+            });
+    let judged = by_type
+        .filter(|_| !reads_shown || q_alike)
+        .map(|(_, groups)| groups);
+    // the client's own `q` (with the engine's, as the parameters carry them)
+    // reaches the store only where it reads the shown Entity alike
+    let q_ast = if judged.is_some() && q_alike {
+        client_and_engine_q
+    } else {
+        q_ast
+    };
     let page = if judged.is_some() { client_page } else { page };
     // Otherwise, without `count` the answer needs the matches up to the
     // page's end and one more (whether a next page exists): the store is
@@ -1460,11 +1531,7 @@ pub async fn filter_entities_paged(
                     expand: &expand,
                     ctx: Some(ctx),
                     page: match enough.or(counting.map(|_| 0)) {
-                        Some(_) => Some(antares_store::filter::Page {
-                            offset: read.0 as i64,
-                            limit: read.1 as i64,
-                            count: false,
-                        }),
+                        Some(_) => Some(store_page(read)),
                         None => page.map(|(offset, limit)| antares_store::filter::Page {
                             offset: offset as i64,
                             limit: limit as i64,
@@ -2465,7 +2532,8 @@ fn merge_instance(target: &mut Value, frag: &Value, ts: &str) {
         if k == "createdAt" || k == "modifiedAt" {
             continue;
         }
-        if v.is_null() || is_ngsi_null(v) {
+        // a sub-Attribute whose instances are all deletions leaves too (10.2.9.4, T-3677)
+        if antares_jsonld::removes_member(v) {
             t.remove(k);
         } else if let (Some(cur), Some(patch)) =
             (t.get_mut(k).and_then(Value::as_object_mut), v.as_object())
@@ -2941,8 +3009,29 @@ pub(crate) async fn build_query_map(
     crate::entity_map::merge_and_store_map(st, tenant, headers, ctx, params, false, emap).await
 }
 
+/// The store page of the conditional-rules scan as the store's `i64` binds,
+/// saturating: `enough` is the client's offset plus limit, so an offset near
+/// `i64::MAX` (which `page_params` admits) and the doubling limit pass it,
+/// and an `as` cast wraps negative, a LIMIT postgres refuses (500).
+fn store_page((offset, limit): (usize, usize)) -> antares_store::filter::Page {
+    antares_store::filter::Page {
+        offset: i64::try_from(offset).unwrap_or(i64::MAX),
+        limit: i64::try_from(limit).unwrap_or(i64::MAX),
+        count: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_scan_page_past_i64_saturates_and_never_wraps_negative() {
+        let past = usize::try_from(i64::MAX).unwrap_or(usize::MAX) + 11;
+        let p = super::store_page((past, usize::MAX));
+        assert_eq!((p.offset, p.limit), (i64::MAX, i64::MAX));
+        let p = super::store_page((20, 41));
+        assert_eq!((p.offset, p.limit, p.count), (20, 41, false));
+    }
+
     use super::merge_into;
     use serde_json::json;
 

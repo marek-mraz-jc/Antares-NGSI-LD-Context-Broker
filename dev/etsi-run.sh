@@ -68,11 +68,18 @@ fi
 # FederationReset.py reads it from the environment (its Link header)
 export SUITE_CONTEXT="${SUITE_CONTEXT:-}"
 ( cd "$SUITE/resources"
-  sed -i "s|^url = .*|url = '$BROKER_URL'|" variables.py
-  sed -i "s|^temporal_api_url = .*|temporal_api_url = '$BROKER_URL'|" variables.py
+  # A suite whose own `url` names no /ngsi-ld/v1 adds the path itself (forge's later commits):
+  # it gets the broker's root, or every request went to /ngsi-ld/v1/ngsi-ld/v1 (T-3677).
+  api_url=$BROKER_URL
+  grep -q "^url = '.*/ngsi-ld/v1/\?'" variables.py || api_url=${BROKER_URL%/ngsi-ld/v1}
+  sed -i "s|^url = .*|url = '$api_url'|" variables.py
+  sed -i "s|^temporal_api_url = .*|temporal_api_url = '$api_url'|" variables.py
   sed -i "s|^notification_server_host = .*|notification_server_host = '$CALLBACK_HOST'|" variables.py
   sed -i "s|^context_source_host = .*|context_source_host = '$CALLBACK_HOST'|" variables.py
   sed -i "s|^context_server_host = .*|context_server_host = '$CALLBACK_HOST'|" variables.py
+  # the 058 TPs reach the mosquitto the pipeline starts by its container name, as the vendored
+  # suite names it; forge's later commits say 127.0.0.1, where nothing listens (T-3677)
+  sed -i "s|^mqtt_broker_host = .*|mqtt_broker_host = 'ngsi-ld-test-suite-mosquitto-container'|" variables.py
   # the suite context the pipeline serves from this checkout (T-3550)
   [ -z "${SUITE_CONTEXT:-}" ] \
     || sed -i "s|^ngsild_test_suite_context = .*|ngsild_test_suite_context = '$SUITE_CONTEXT'|" variables.py )

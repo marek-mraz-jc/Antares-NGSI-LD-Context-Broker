@@ -97,8 +97,10 @@ env:
   # its client checks, tests/ws, the F21/F29 parity rows (T-3686), the
   # bind-to-an-absent-target 400 (T-3760), tests/linkml (T-3512) and the
   # OData parity rows the residual serves (T-3981), the last two together on
-  # conformance main since its merge of T-3512 (T-4003)
-  CONFORMANCE_REF: 2c6f70d3a41bb40e3bf0a33858396349e3d46d2d
+  # conformance main since its merge of T-3512 (T-4003); plus the broker parity
+  # cases for T-4258's format/sysAttrs/orderBy, one commit on top (branch
+  # pin/antares-surfaces, same change as conformance main 494cd93)
+  CONFORMANCE_REF: ebf84502b243163ee912e7d57cc26d6dc1e7a6f4
   NIGHTLY: ${{ github.event_name != 'pull_request' && !inputs.fast }}
 
 jobs:

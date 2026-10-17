@@ -732,6 +732,37 @@ impl PgDocStore {
     /// broker target is the broker's memory, not the database's. A tenant that
     /// reaches the ceiling is refused with TooManyResults (5.5.6) rather than
     /// served a silent prefix.
+    /// Every doc's id and the first 64 bits of the md5 of its text, under
+    /// `list`'s ceiling: the bodies stay in the database (T-4354).
+    pub async fn list_digests(
+        &self,
+        tenant: &TenantId,
+        kind: DocKind,
+    ) -> Result<Vec<(String, u64)>, sqlx::Error> {
+        let sql = format!(
+            "SELECT id, left(md5({}::text), 16) FROM {} WHERE tenant_id = $1 ORDER BY id LIMIT $2",
+            kind.doc_column(),
+            kind.table()
+        );
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+            .bind(tenant.as_str())
+            .bind(MAX_UNDECIDED_ROWS)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        check_ceiling(false, rows.len(), MAX_UNDECIDED_ROWS)?;
+        rows.into_iter()
+            .map(|r| {
+                let hex: String = r.get(1);
+                u64::from_str_radix(&hex, 16)
+                    .map(|d| (r.get::<String, _>(0), d))
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))
+            })
+            .collect()
+    }
+
     pub async fn list(&self, tenant: &TenantId, kind: DocKind) -> Result<Vec<Value>, sqlx::Error> {
         let sql = format!(
             "SELECT {} FROM {} WHERE tenant_id = $1 ORDER BY id LIMIT $2",

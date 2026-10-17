@@ -104,6 +104,21 @@ class Normalised(unittest.TestCase):
         self.assertIsNone(compare.normalised_diff("count: REGEX([0-9]+)\n", "count: 4\n"))
         self.assertIsNotNone(compare.normalised_diff("a\n", ""))
 
+    def test_a_kept_header_printed_as_text_ignores_the_name_case(self):
+        # RFC 9110 5.1: field names are case-insensitive; the value still counts
+        exp = "NGSILD-Results-Count: 50\n"
+        self.assertIsNone(compare.normalised_diff(exp, "Ngsild-Results-Count: 50\n"))
+        self.assertIsNotNone(compare.normalised_diff(exp, "Ngsild-Results-Count: 51\n"))
+        self.assertIsNotNone(compare.normalised_diff("Count: 3\n", "count: 3\n"))
+
+    def test_a_list_representation_id_is_the_implementations(self):
+        # TS 104 175 5.2.6.10: "URI that is unique within the system scope"
+        exp = '{"id": "urn:ngsi-ld:EntityTypeList:local", "type": "EntityTypeList", "typeList": ["Car"]}\n'
+        act = '{"id": "urn:ngsi-ld:EntityTypeList:9b1c", "type": "EntityTypeList", "typeList": ["Car"]}\n'
+        self.assertIsNone(compare.normalised_diff(exp, act))
+        self.assertIsNotNone(compare.normalised_diff(exp, act.replace("Car", "Bus")))
+        self.assertIsNotNone(compare.normalised_diff(exp.replace("EntityTypeList", "T"), act.replace("EntityTypeList", "T")))
+
     def test_a_body_that_is_not_json_is_compared_as_text(self):
         self.assertIsNone(compare.normalised_diff("HTTP/1.1 200 OK\n\n{not json\n", "HTTP/1.1 200 OK\n\n{not json\n"))
         self.assertIsNotNone(compare.normalised_diff("HTTP/1.1 200 OK\n\n{not json\n", "HTTP/1.1 200 OK\n\n{not jsox\n"))
@@ -126,6 +141,72 @@ class Regex(unittest.TestCase):
         self.assertEqual(compare.quote_bare_regex('{"a": "REGEX(.*)"}'), '{"a": "REGEX(.*)"}')
         self.assertEqual(json.loads(compare.quote_bare_regex('{"a": REGEX(\\d+)}'))["a"], compare.RX + "\\d+")
         self.assertEqual(compare.quote_bare_regex('{"a": "\\"REGEX("}'), '{"a": "\\"REGEX("}')
+
+    def test_a_received_request_compares_its_ngsi_ld_headers_only(self):
+        # a dump of what a receiver got: the client's own transport headers
+        # (User-Agent, Host, Content-Length, Accept) are the implementation's
+        exp = {"verb": "POST", "url": "/n", "body": {}, "headers": {
+            "Content-Type": "application/json", "NGSILD-Tenant": "t",
+            "User-Agent": "REGEX(Coraine/.*)", "Host": "localhost:7701",
+            "Content-Length": "REGEX(\\d+)", "Accept": "application/json"}}
+        act = {"verb": "POST", "url": "/n", "body": {}, "headers": {
+            "content-type": "application/json", "ngsild-tenant": "t", "via": "1.1 antares"}}
+        self.assertTrue(compare.json_equal(exp, act))
+        act["headers"]["ngsild-tenant"] = "u"
+        self.assertFalse(compare.json_equal(exp, act))
+        del act["headers"]["ngsild-tenant"]
+        self.assertFalse(compare.json_equal(exp, act))
+
+    def test_link_headers_are_a_set(self):
+        # RFC 8288 orders no links; the query of a next link is the broker's to order
+        exp = ('HTTP/1.1 200 OK\nLink: </e?limit=1&offset=1>;rel="next"\n'
+               'Link: <https://c>; rel="ctx"\n\n')
+        act = ('HTTP/1.1 200 OK\nLink: <https://c>; rel="ctx"\n'
+               'Link: </e?offset=1&limit=1>; rel="next"\n\n')
+        self.assertIsNone(compare.normalised_diff(exp, act))
+        self.assertIsNotNone(compare.normalised_diff(exp, act.replace("offset=1", "offset=2")))
+
+    def test_one_link_header_may_join_several_link_values(self):
+        # RFC 8288 3: Link = #link-value, so one header line is a comma list
+        exp = ('HTTP/1.1 200 OK\nLink: </e?offset=0>; rel="prev"\n'
+               'Link: </e?offset=2>; rel="next"\n\n')
+        act = 'HTTP/1.1 200 OK\nLink: </e?offset=2>; rel="next", </e?offset=0>; rel="prev"\n\n'
+        self.assertIsNone(compare.normalised_diff(exp, act))
+        self.assertIsNotNone(compare.normalised_diff(exp, act.replace("offset=0", "offset=1")))
+
+    def test_a_bare_regex_glued_to_digits_or_ending_a_member(self):
+        body = compare.quote_bare_regex('{"d": 85REGEX(\\.\\d+),\n "e": REGEX(.*)\n "f": 1}')
+        obj = json.loads(body)
+        self.assertTrue(compare.json_equal(obj["d"], 85.25))
+        self.assertFalse(compare.json_equal(obj["d"], 86.25))
+        self.assertTrue(compare.json_equal(obj["e"], "2026-01-01T00:00:00Z"))
+        self.assertEqual(obj["f"], 1)
+        self.assertEqual(body.count("\n"), 2)
+
+    def test_a_bare_regex_with_quotes_matches_the_json_text(self):
+        obj = json.loads(compare.quote_bare_regex('{"q": REGEX("speed>.*")}'))
+        self.assertTrue(compare.json_equal(obj["q"], "speed>5"))
+        self.assertFalse(compare.json_equal(obj["q"], "speed<5"))
+
+    def test_a_case_pinned_to_one_coraine_backend(self):
+        one = "--NAME--\nx\n# REQUIRE_DB: corDB\n--TAGS--\nentity\n"
+        v, why = compare.verdict("/nonexistent/x", one, {}, {})
+        self.assertEqual(v, "not-applicable")
+        self.assertIn("corDB", why)
+        both = one.replace("corDB", "mongoc corDB")
+        self.assertNotEqual(compare.verdict("/nonexistent/x", both, {}, {})[0], "not-applicable")
+
+    def test_a_not_updated_reason_is_free_text(self):
+        # 5.2.19 NotUpdatedDetails "reason": "Reason for not having changed such Attribute"
+        exp = {"attributeName": "p", "reason": "Attribute exists"}
+        self.assertTrue(compare.json_equal(exp, {"attributeName": "p", "reason": "noOverwrite"}))
+        self.assertFalse(compare.json_equal(exp, {"attributeName": "q", "reason": "x"}))
+
+    def test_a_regex_backslash_inside_a_json_string_parses(self):
+        # Coraine writes "REGEX(\d+)" inside strings: not a JSON escape
+        body = compare.quote_bare_regex('{"a": "REGEX(\\d+)", "b": "x\\ny"}')
+        self.assertEqual(json.loads(body), {"a": "REGEX(\\d+)", "b": "x\ny"})
+        self.assertTrue(compare.json_equal(json.loads(body)["a"], "12"))
 
 
 class Verdicts(unittest.TestCase):

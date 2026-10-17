@@ -14,7 +14,7 @@ use crate::Error;
 /// let limits = linkml_model::Limits { max_bytes: 1 << 20, max_depth: 32, max_elements: 10_000 };
 /// assert_eq!(limits.max_depth, 32);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Limits {
     /// Size of the JSON document, checked before it is parsed.
     pub max_bytes: usize,
@@ -24,6 +24,15 @@ pub struct Limits {
     /// annotations, unit mappings and permissible values, together.
     pub max_elements: usize,
 }
+
+/// The bounds a surface reads a stored schema under (threat LK7): the LinkML
+/// surface's, and the first the `OData` surface tries, so the two share one
+/// parse of a schema inside them ([`crate::cache`], T-4354).
+pub const SURFACE_LIMITS: Limits = Limits {
+    max_bytes: 1024 * 1024,
+    max_depth: 32,
+    max_elements: 20_000,
+};
 
 /// The LinkML built-in types the subset maps.
 ///

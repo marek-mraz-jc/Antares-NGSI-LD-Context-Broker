@@ -40,6 +40,24 @@ symbol = "antares_api::tenant_purge"
 [[endpoint]]
 channel = "http"
 role = "provides"
+key = "GET /q/tenants/{tenant}/digest"
+symbol = "antares_api::tenant_move::digest"
+
+[[endpoint]]
+channel = "http"
+role = "provides"
+key = "GET /q/tenants/{tenant}/export"
+symbol = "antares_api::tenant_move::export"
+
+[[endpoint]]
+channel = "http"
+role = "provides"
+key = "POST /q/tenants/{tenant}/import"
+symbol = "antares_api::tenant_move::import"
+
+[[endpoint]]
+channel = "http"
+role = "provides"
 key = "GET /q/dead-letters"
 symbol = "antares_api::dead_letters_list"
 

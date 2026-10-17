@@ -122,6 +122,15 @@ async fn insert_rows(
     if rows.is_empty() {
         return Ok(());
     }
+    // The Attributes given an instance in a dataset (migration 0009): lastN
+    // keeps every row of these, so the read needs to know them.
+    let mut in_dataset: Vec<String> = rows
+        .iter()
+        .filter(|r| r["dataset_id"].is_string())
+        .filter_map(|r| r["attr_id"].as_str().map(str::to_owned))
+        .collect();
+    in_dataset.sort_unstable();
+    in_dataset.dedup();
     // geo_value: extracted per instance when the value LOOKS like a GeoJSON
     // geometry; try_geomfromgeojson (0001_init.sql) maps anything PostGIS rejects to
     // NULL, which the S3 prefilter treats as "reaches the evaluator".
@@ -150,6 +159,19 @@ async fn insert_rows(
     .bind(Value::Array(rows))
     .execute(&mut *tx)
     .await?;
+    if !in_dataset.is_empty() {
+        // Every caller writes the Entity's temporal row before its instances.
+        sqlx::query(
+            "UPDATE temporal_entities
+             SET dataset_attrs = ARRAY(SELECT DISTINCT x FROM unnest(dataset_attrs || $3) AS x ORDER BY x)
+             WHERE tenant_id = $1 AND id = $2 AND NOT dataset_attrs @> $3",
+        )
+        .bind(tenant.as_str())
+        .bind(entity_id)
+        .bind(&in_dataset)
+        .execute(&mut *tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -234,7 +256,7 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
 /// - an Attribute with any instance in a dataset: the rank partitions by
 ///   datasetId, and a sparse dataset's newest may sit below the Attribute's
 ///   N-th; such an Attribute keeps every row (`-infinity`), found through the
-///   partial index of migration 0009.
+///   Entity's `dataset_attrs` (migration 0009), which the write path keeps.
 fn newest_rows(f: &TemporalFilter<'_>, first_bind: usize, n_bind: usize) -> Option<String> {
     if f.oldest_first || f.timeproperty != "observedAt" {
         return None;
@@ -260,9 +282,7 @@ fn newest_rows(f: &TemporalFilter<'_>, first_bind: usize, n_bind: usize) -> Opti
                     WHERE x.tenant_id = m.tenant_id AND x.entity_id = m.id AND x.attr_id > a.attr) \
             FROM a WHERE a.attr IS NOT NULL) \
           SELECT ai.* FROM a \
-          CROSS JOIN LATERAL (SELECT CASE WHEN EXISTS (SELECT 1 FROM attr_instances d \
-                WHERE d.tenant_id = m.tenant_id AND d.entity_id = m.id AND d.attr_id = a.attr \
-                AND d.dataset_id IS NOT NULL) THEN '-infinity'::timestamptz \
+          CROSS JOIN LATERAL (SELECT CASE WHEN a.attr = ANY(m.dataset_attrs) THEN '-infinity'::timestamptz \
               ELSE COALESCE((SELECT t.observed_at FROM attr_instances t \
                 WHERE t.tenant_id = m.tenant_id AND t.entity_id = m.id AND t.attr_id = a.attr{window} \
                 ORDER BY t.observed_at DESC OFFSET greatest(${n_bind}::bigint - 1, 0) LIMIT 1), \

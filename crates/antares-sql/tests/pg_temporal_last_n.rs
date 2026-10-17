@@ -126,6 +126,17 @@ async fn last_n_keeps_what_ranking_the_whole_window_keeps() {
         SPEED: speed, LEVEL: level,
     });
     assert!(s.create(&t, id, &doc).await.expect("create"));
+    // The write records the Attribute with dataset instances (migration 0009),
+    // which is what keeps the sparse dataset below from being cut.
+    let listed: Vec<String> = sqlx::query_scalar(
+        "SELECT unnest(dataset_attrs) FROM temporal_entities WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(t.as_str())
+    .bind(id)
+    .fetch_all(&pool)
+    .await
+    .expect("dataset_attrs");
+    assert_eq!(listed, vec![LEVEL.to_owned()]);
 
     let expand = |t: &str| t.to_owned();
     for (after, n) in [
@@ -182,4 +193,25 @@ async fn last_n_keeps_what_ranking_the_whole_window_keeps() {
 /// `2026-01-01T00:00:00Z` plus `h` hours, without a date library.
 fn chrono_free(h: usize) -> String {
     format!("2026-01-{:02}T{:02}:00:00Z", 1 + h / 24, h % 24)
+}
+
+/// T-4310: no migration builds an index over the history it would have to read
+/// in full. A partial index on `attr_instances` (the first 0009) reads every
+/// partition under a lock that blocks INSERT; on dev that was ~145 GB.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_migration_builds_a_partial_index_over_history() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 2).await.expect("connect");
+    let partial: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname::text FROM pg_index i
+         JOIN pg_class c ON c.oid = i.indexrelid
+         WHERE i.indrelid = 'attr_instances'::regclass AND i.indpred IS NOT NULL",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("indexes");
+    assert!(
+        partial.is_empty(),
+        "partial indexes on attr_instances: {partial:?}"
+    );
 }

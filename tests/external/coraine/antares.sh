@@ -30,6 +30,30 @@ ANTARES_TEST_DIR="${ANTARES_TEST_DIR:-/tmp/antares-cortest}"
 # shellcheck source=/dev/null
 source "$CORAINE_DIR/test/funcTests/corTestFunctions.sh"
 
+# corCurl adds its own Content-Type and Accept, then the case's -H for either,
+# so a request carries two. Content-Type is a singleton (RFC 9110 5.3) and
+# Antares refuses two media types; two Accept lines combine into one list in
+# which corCurl's application/json, q=1, outranks what the case asked for.
+# Coraine honoured the case's, the last one, so curl, for every caller, sends
+# only the last Content-Type and the last Accept it is given.
+curl() {
+  local -a args=()
+  local ct="" accept=""
+  while [ "$#" != 0 ]; do
+    if [ "$1" = -H ] || [ "$1" = --header ]; then
+      case "${2,,}" in
+        content-type:*) ct="$2"; shift 2; continue ;;
+        accept:*) accept="$2"; shift 2; continue ;;
+      esac
+    fi
+    args+=("$1")
+    shift
+  done
+  [ -z "$accept" ] || args+=(-H "$accept")
+  [ -z "$ct" ] || args+=(-H "$ct")
+  command curl "${args[@]}"
+}
+
 # Coraine flag -> what Antares does without it:
 #   -dist, -distOps, --distributed   forwarding to registered sources is always on
 #   --troe <x>, --troeSync, --troe{Name,User,Host,Port} <x>
@@ -46,10 +70,11 @@ antaresRoleDir() { echo "$ANTARES_TEST_DIR/$1"; }
 antaresRoleDb()  { echo "antares_${1,,}"; }
 
 coraineStart() {
-  local role="CB" saved=("$@")
+  local role="CB" alias="" saved=("$@")
   while [ $# -gt 0 ]; do
     case "$1" in
       -role) role="$2"; shift ;;
+      --csourceAlias) alias="$2"; shift ;;
       *)
         if [[ "$ANTARES_IGNORED_FLAGS" == *" $1 "* ]]; then :
         elif [[ "$ANTARES_IGNORED_VALUE_FLAGS" == *" $1 "* ]]; then shift
@@ -77,6 +102,11 @@ coraineStart() {
     ANTARES_STORE="$ANTARES_TEST_STORE"
     ANTARES_DATA_DIR="$dir"
     ANTARES_EGRESS_ALLOW_PRIVATE=true
+    # the spec sets no batch ceiling; Coraine upserts 1101 entities in one batch
+    ANTARES_MAX_BATCH_ITEMS=2000
+    # each role is a source of its own (5.2.9 contextSourceAlias): one shared
+    # default alias made every forward between two roles a loop (508)
+    ANTARES_HOST_ALIAS="${alias:-antares-${role,,}}"
   )
   case "$ANTARES_TEST_STORE" in
     postgres|timescale)
@@ -86,7 +116,8 @@ coraineStart() {
       ;;
   esac
 
-  env "${env[@]}" "$ANTARES_BIN" > "/tmp/coraine.${role}.log" 2>&1 &
+  # the broker refuses an unknown ANTARES_* key; ANTARES_BIN is the harness's, not its (run 38806308784)
+  env -u ANTARES_BIN "${env[@]}" "$ANTARES_BIN" > "/tmp/coraine.${role}.log" 2>&1 &
   echo $! > "$COR_ROLE_PID_FILE"
   corAwaitPort "$COR_ROLE_PORT" 30
 }
@@ -162,7 +193,8 @@ corDbDrop() {
     memory) ;;
     file) rm -rf "${ANTARES_TEST_DIR:?}/${role:?}" ;;
     postgres|timescale)
-      psql "$ANTARES_TEST_PG/postgres" -q -c "DROP DATABASE IF EXISTS $(antaresRoleDb "$role") WITH (FORCE)" > /dev/null || return 1
+      # IF EXISTS on a missing database prints a NOTICE, and corTest fails an INIT on any stderr
+      PGOPTIONS="-c client_min_messages=warning" psql "$ANTARES_TEST_PG/postgres" -q -c "DROP DATABASE IF EXISTS $(antaresRoleDb "$role") WITH (FORCE)" > /dev/null || return 1
       ;;
     *) echo "corDbDrop: unknown ANTARES_TEST_STORE $ANTARES_TEST_STORE" >&2; return 1 ;;
   esac

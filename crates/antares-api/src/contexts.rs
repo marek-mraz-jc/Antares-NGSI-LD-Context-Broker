@@ -284,7 +284,8 @@ pub async fn add_context(
         if !valid_context_shape(&ctx_val) {
             return Err(NgsiError::BadRequestData("invalid JSON-LD @context value".into()).into());
         }
-        let local_id = uuid::Uuid::new_v4().to_string();
+        // 5.13.2.4: "a locally unique identifier (URI)"
+        let local_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
         let url = format!("{}/{local_id}", base_url(&headers));
         let doc = json!({
             "url": url,
@@ -802,6 +803,11 @@ mod tests {
             .and_then(|l| l.rsplit('/').next())
             .expect("Location names the new @context")
             .to_owned();
+        // 5.13.2.4: "a locally unique identifier (URI) is generated"
+        assert!(
+            antares_model::EntityId::new(&local_id).is_ok(),
+            "{local_id} is a URI"
+        );
         let url = Value::String(format!("{}/{local_id}", base_url(&headers)));
 
         let ctx = st

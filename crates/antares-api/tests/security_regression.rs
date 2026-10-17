@@ -331,3 +331,23 @@ async fn a_percent_encoded_key_cannot_smuggle_a_repeat_past_the_guard() {
         );
     }
 }
+
+/// 4.17: a type selection outside the grammar (an empty EntityType, a
+/// dangling `;`) selects nothing a client could have meant; it is
+/// BadRequestData on every route that takes `type` (Coraine query_entities_errors).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_type_selection_outside_the_4_17_grammar_is_refused() {
+    let st = AppState::new("test".into());
+    for uri in [
+        "/ngsi-ld/v1/entities?type=(A%3B)",
+        "/ngsi-ld/v1/entities?type=A,",
+        "/ngsi-ld/v1/temporal/entities?type=%3BA",
+    ] {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request");
+        assert_eq!(send(&st, req).await, StatusCode::BAD_REQUEST, "{uri}");
+    }
+}

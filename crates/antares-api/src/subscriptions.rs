@@ -538,8 +538,22 @@ fn norm_member(
             antares_ql::scope::check_scope_q(q)?;
             out.insert(k.to_owned(), v.clone());
         }
-        "lang" | "subscriptionName" | "name" | "description" | "jsonldContext"
-        | "ngsildConformance" | "datasetId" => {
+        "ngsildConformance" => {
+            // Table 5.2.12-1: "a semantically versioned string in the form major.minor"
+            let ok = v
+                .as_str()
+                .and_then(|s| s.split_once('.'))
+                .is_some_and(|(a, b)| {
+                    [a, b]
+                        .iter()
+                        .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+                });
+            if !ok {
+                return Err(bad("ngsildConformance must be major.minor (5.2.12)".into()));
+            }
+            out.insert(k.to_owned(), v.clone());
+        }
+        "lang" | "subscriptionName" | "name" | "description" | "jsonldContext" | "datasetId" => {
             out.insert(k.to_owned(), v.clone());
         }
         // tolerant reader: keep unknown members
@@ -685,7 +699,9 @@ pub fn present_subscription(doc: &Value, ctx: &Context, sys_attrs: bool, csource
             serde_json::json!(["attributeCreated", "attributeUpdated"]),
         );
     }
-    // status (5.2.12 output): active | paused | expired
+    // status (Table 5.2.12-2): active | paused | expired; a failed delivery
+    // is notification.status (5.8.6). Only a CSR subscription itself turns
+    // "failed" (5.11.7: "Update the subscription status to "failed"").
     let expired = obj
         .get("expiresAt")
         .and_then(Value::as_str)
@@ -695,8 +711,8 @@ pub fn present_subscription(doc: &Value, ctx: &Context, sys_attrs: bool, csource
         "expired"
     } else if paused {
         "paused"
-    } else if obj.get("status").and_then(Value::as_str) == Some("failed") {
-        "failed" // 5.8.6 / 5.11.7 delivery-failure status
+    } else if csource && obj.get("status").and_then(Value::as_str) == Some("failed") {
+        "failed"
     } else {
         "active"
     };
@@ -938,33 +954,46 @@ pub async fn create(
     {
         norm.insert(crate::policy::SUBJECT_MEMBER.into(), subject);
     }
-    // Array @context (>1 entry): the broker must host it at its own URL as an
-    // ImplicitlyCreated @context, surfaced via jsonldContext (5.13.1, 050_03)
-    if !norm.contains_key("jsonldContext") {
-        if let Value::Array(a) = &parsed.ctx.source {
-            if a.len() > 1 {
-                let local_id = uuid::Uuid::new_v4().to_string();
-                let url = format!("{}/{local_id}", crate::contexts::base_url(headers));
-                st.store
-                    .context_put(
-                        Some(&tenant),
-                        &local_id,
-                        serde_json::json!({
-                            "url": url,
-                            "localId": local_id,
-                            "kind": "ImplicitlyCreated",
-                            "createdAt": ts,
-                            // owned by the tenant whose subscription created it
-                            "owner": tenant.as_str(),
-                            "body": {"@context": parsed.ctx.source.clone()},
-                        }),
-                    )
-                    .await?;
-                st.loader
-                    .put_local_for(&tenant, url.clone(), parsed.ctx.source.clone())
-                    .await;
-                norm.insert("jsonldContext".into(), Value::String(url));
-            }
+    // 5.8.1.4: "If not present, the jsonldContext field shall be initialized
+    // with the @context applicable for the Subscription" (5.5.5 when it has
+    // none). One URL is that URL; anything inline the broker hosts at its own
+    // URL as an ImplicitlyCreated @context (5.13.1, 050_03). A Context Source
+    // Registration Subscription (5.2.13) has no such initialisation.
+    if kind == Kind::Subscription && !norm.contains_key("jsonldContext") {
+        let one_url = match &parsed.ctx.source {
+            Value::Null => Some(antares_jsonld::CORE_CONTEXT.to_owned()),
+            Value::String(u) => Some(u.clone()),
+            Value::Array(a) => match a.as_slice() {
+                [one] => one.as_str().map(str::to_owned),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(url) = one_url {
+            norm.insert("jsonldContext".into(), Value::String(url));
+        } else {
+            // 5.13.2.4: "a locally unique identifier (URI)"
+            let local_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
+            let url = format!("{}/{local_id}", crate::contexts::base_url(headers));
+            st.store
+                .context_put(
+                    Some(&tenant),
+                    &local_id,
+                    serde_json::json!({
+                        "url": url,
+                        "localId": local_id,
+                        "kind": "ImplicitlyCreated",
+                        "createdAt": ts,
+                        // owned by the tenant whose subscription created it
+                        "owner": tenant.as_str(),
+                        "body": {"@context": parsed.ctx.source.clone()},
+                    }),
+                )
+                .await?;
+            st.loader
+                .put_local_for(&tenant, url.clone(), parsed.ctx.source.clone())
+                .await;
+            norm.insert("jsonldContext".into(), Value::String(url));
         }
     }
     let doc = Value::Object(norm);
@@ -1125,6 +1154,17 @@ pub async fn update(
             }
             let target = antares_store::stored_object(doc)?;
             crate::apply_doc_fragment(target, &norm, &ts);
+            // 5.2.12 holds for the updated Subscription too: deleting both
+            // selectors is refused and nothing is written
+            let local_only = target.get("localOnly").and_then(Value::as_bool) == Some(true);
+            if !local_only
+                && !target.contains_key("entities")
+                && !target.contains_key("watchedAttributes")
+            {
+                return Err(NgsiError::BadRequestData(
+                    "one of entities or watchedAttributes is required (5.2.12)".into(),
+                ));
+            }
             Ok::<(), NgsiError>(())
         })
         .await?;
@@ -1310,6 +1350,26 @@ mod tests {
                 &ctx,
             ),
             "a stored \"*\" subscription must match every Entity"
+        );
+    }
+
+    /// Table 5.2.12-1 ngsildConformance: "A semantically versioned string in
+    /// the form major.minor" (Coraine subscription_ngsild_conformance).
+    #[test]
+    fn ngsild_conformance_is_major_dot_minor() {
+        let ctx = Loader::new().core();
+        let sub = |v: Value| {
+            json!({"type": "Subscription", "entities": [{"type": "Building"}], "ngsildConformance": v,
+                   "notification": {"endpoint": {"uri": "http://localhost:1111/notify"}}})
+        };
+        for bad in [json!("oneDotFive"), json!("1"), json!("1.8.1"), json!(1.8)] {
+            assert!(
+                normalize_subscription(sub(bad.clone()).as_object().unwrap(), &ctx, false).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(
+            normalize_subscription(sub(json!("1.8")).as_object().unwrap(), &ctx, false).is_ok()
         );
     }
 

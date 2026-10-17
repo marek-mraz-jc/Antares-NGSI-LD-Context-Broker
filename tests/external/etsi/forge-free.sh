@@ -3,7 +3,8 @@
 # <base-url> instead of forge.etsi.org or GitHub (T-3549), so an outage of
 # either never fails a run. Every raw URL of a suite file (forge or GitHub)
 # becomes <base-url>/<path in the suite>; serve the suite root there, e.g.:
-#   python3 -m http.server 8099 --bind 127.0.0.1 --directory <suite-dir>
+#   python3 -m http.server 8078 --bind 127.0.0.1 --directory <suite-dir>
+# (not 8099: the IOP TPs use that port as a dead endpoint)
 # The prefix alone is rewritten, so a URL split over two string literals
 # (libraries/FederationReset.py) is caught as well.
 # The rewrite is committed in the suite's git checkout: dev/etsi-pipeline.sh

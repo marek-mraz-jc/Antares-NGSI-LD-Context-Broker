@@ -119,6 +119,42 @@ async fn tenant_upsert_is_idempotent() {
     b.expect("second");
 }
 
+/// The non-superuser role the RLS tests connect as (idempotent). Two tests of this binary
+/// run it at once, and two concurrent GRANTs on one schema fail with "tuple concurrently
+/// updated" (strict run 38884915143, T-4334): one transaction-scoped advisory lock queues them.
+async fn app_role(admin: &sqlx::PgPool) {
+    let mut tx = admin.begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock(4334)")
+        .execute(&mut *tx)
+        .await
+        .expect("advisory lock");
+    for stmt in [
+        "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
+        "GRANT USAGE ON SCHEMA public TO antares_app",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
+    ] {
+        sqlx::query(stmt).execute(&mut *tx).await.expect(stmt);
+    }
+    tx.commit().await.expect("commit");
+}
+
+/// T-4334: the RLS tests' role setup holds when every test of the binary runs it at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_app_role_setup_runs_concurrently() {
+    let url = require_db!();
+    let admin = pg::connect(&url, 10).await.expect("connect");
+    let runs: Vec<_> = (0..8)
+        .map(|_| {
+            let admin = admin.clone();
+            tokio::spawn(async move { app_role(&admin).await })
+        })
+        .collect();
+    for run in runs {
+        run.await.expect("a concurrent role setup");
+    }
+}
+
 /// RLS denial: connect as a NON-superuser role (superusers bypass
 /// RLS) and prove a tenant sees zero foreign rows even with tenant-less SQL.
 #[tokio::test]
@@ -127,14 +163,7 @@ async fn rls_denies_cross_tenant_reads_and_writes() {
     let admin = pg::connect(&url, 5).await.expect("connect");
 
     // Non-superuser app role (idempotent), least privilege on the data tables.
-    for stmt in [
-        "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
-         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
-        "GRANT USAGE ON SCHEMA public TO antares_app",
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
-    ] {
-        sqlx::query(stmt).execute(&admin).await.expect(stmt);
-    }
+    app_role(&admin).await;
 
     let app_url = url.replace("antares:antares@", "antares_app:app@");
     assert_ne!(
@@ -220,14 +249,7 @@ async fn rls_denies_cross_tenant_reads_and_writes() {
 async fn rls_scopes_hosted_contexts_and_shares_cached_ones() {
     let url = require_db!();
     let admin = pg::connect(&url, 5).await.expect("connect");
-    for stmt in [
-        "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
-         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
-        "GRANT USAGE ON SCHEMA public TO antares_app",
-        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
-    ] {
-        sqlx::query(stmt).execute(&admin).await.expect(stmt);
-    }
+    app_role(&admin).await;
     let app_url = url.replace("antares:antares@", "antares_app:app@");
     let app = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)

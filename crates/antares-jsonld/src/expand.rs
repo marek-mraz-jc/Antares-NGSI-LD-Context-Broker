@@ -366,6 +366,11 @@ pub fn expand_types(v: &Value, ctx: &Context) -> Result<Vec<Value>, NgsiError> {
     // is a JSON-LD-keyword alias in the @context (e.g. "type" → "@type") is
     // invalid (001_02_04).
     let one = |t: &str| -> Result<Value, NgsiError> {
+        // 4.5.0: the NGSI-LD Null asks for a deletion, and an Entity's type
+        // is mandatory (4.5.1): it is never a type, not even on a merge.
+        if is_ngsi_null(&Value::String(t.to_owned())) {
+            return Err(bad("the NGSI-LD Null is no Entity Type (4.5.0, 4.5.1)"));
+        }
         // 4.6.2: Entity Type names obey the name grammar (BadRequestData).
         if !valid_name(t) {
             return Err(bad(&format!(
@@ -534,6 +539,16 @@ pub fn is_deletion_instance(inst: &Value) -> bool {
                 || o.get("vocab").is_some_and(is_ngsi_null)
                 || o.get("valueList").is_some_and(is_ngsi_null_list)
                 || o.get("objectList").is_some_and(is_ngsi_null_list)
+        })
+}
+
+/// Whether a fragment member removes its target member (5.5.12, 10.2.5.4): JSON null, the
+/// NGSI-LD Null, or a sub-Attribute every instance of which is a deletion instance.
+pub fn removes_member(v: &Value) -> bool {
+    v.is_null()
+        || is_ngsi_null(v)
+        || v.as_array().is_some_and(|instances| {
+            !instances.is_empty() && instances.iter().all(is_deletion_instance)
         })
 }
 
@@ -736,20 +751,30 @@ fn expand_common_members(
             out.insert("datasetId".into(), d);
         }
     }
-    if let Some(o) = obj.get("observedAt") {
+    // 5.5.12: in a merge (or partial update) input the NGSI-LD Null removes the member
+    let nulls = opts.allow_null || opts.merge;
+    for k in ["observedAt", "expiresAt"] {
+        if let Some(v) = obj.get(k).filter(|v| nulls && is_ngsi_null(v)) {
+            out.insert(k.into(), v.clone());
+        }
+    }
+    if let Some(o) = obj
+        .get("observedAt")
+        .filter(|v| !(nulls && is_ngsi_null(v)))
+    {
         let s = o
             .as_str()
             .filter(|s| parse_datetime(s))
             .ok_or_else(|| bad(format!("attribute {name}: invalid observedAt")))?;
-        out.insert("observedAt".into(), Value::String(s.to_owned()));
+        out.insert("observedAt".into(), Value::String(point_fraction(s)));
     }
-    if let Some(e) = obj.get("expiresAt") {
+    if let Some(e) = obj.get("expiresAt").filter(|v| !(nulls && is_ngsi_null(v))) {
         // 4.22 transient attribute instances carry their own expiresAt.
         let s = e
             .as_str()
             .filter(|s| parse_datetime(s))
             .ok_or_else(|| bad(format!("attribute {name}: invalid expiresAt")))?;
-        out.insert("expiresAt".into(), Value::String(s.to_owned()));
+        out.insert("expiresAt".into(), Value::String(point_fraction(s)));
     }
     if opts.sys {
         // 4.8/4.5.7: deletedAt marks a deletion instance in a Temporal
@@ -847,7 +872,11 @@ fn expand_instance(
         }
     };
 
-    let declared = obj.get("type").and_then(Value::as_str);
+    let declared = match obj.get("type") {
+        None => None,
+        Some(Value::String(t)) => Some(t.as_str()),
+        Some(t) => return Err(bad(format!("attribute {name}: type {t} is not a string"))),
+    };
     let attr_type: &str = match declared {
         Some(t) if ATTR_TYPES.contains(&t) => t,
         Some(t) if GEO_TYPES.contains(&t) && obj.contains_key("coordinates") => {
@@ -918,6 +947,9 @@ fn expand_instance(
                     "attribute {name}: JSON null is not a valid value (use \"urn:ngsi-ld:null\")"
                 )));
             }
+            if let Some(vo) = val.as_object().filter(|o| o.contains_key("@value")) {
+                check_value_object(name, vo, ctx)?;
+            }
             out.insert("value".into(), val.clone());
         }
         "GeoProperty" => {
@@ -980,13 +1012,7 @@ fn expand_instance(
             let ok = if is_ngsi_null_langmap(lm) {
                 opts.allow_null
             } else {
-                lm.as_object().is_some_and(|m| {
-                    m.keys().all(|k| !k.is_empty())
-                        && m.values().all(|v| {
-                            v.is_string()
-                                || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
-                        })
-                })
+                valid_language_map(lm)
             };
             if !ok {
                 return Err(bad(format!("attribute {name}: invalid languageMap")));
@@ -1158,6 +1184,69 @@ fn expand_instance(
     Ok(Value::Object(out))
 }
 
+/// 4.5.18.2: "a JSON object consisting of a set of non-empty language tags
+/// ... or the language tag "@none"", each a string or an array of strings.
+fn valid_language_map(lm: &Value) -> bool {
+    lm.as_object().is_some_and(|m| {
+        m.keys().all(|k| k == "@none" || is_language_tag(k))
+            && m.values().all(|v| {
+                v.is_string() || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
+            })
+    })
+}
+
+/// A Property value carrying `@value` is a JSON-LD value object (JSON-LD
+/// 1.1 section 9.5): "MUST NOT contain any other keys" than `@type`,
+/// `@language`, `@direction`, `@index` and `@context`, and a typed one's
+/// `@type` is an IRI string. Typed as `DateTime`, its `@value` is a 4.6.3
+/// DateTime.
+fn check_value_object(name: &str, vo: &Map<String, Value>, ctx: &Context) -> Result<(), NgsiError> {
+    let bad = |m: &str| Err(NgsiError::BadRequestData(format!("attribute {name}: {m}")));
+    if let Some(k) = vo.keys().find(|k| {
+        !matches!(
+            k.as_str(),
+            "@value" | "@type" | "@language" | "@direction" | "@index" | "@context"
+        )
+    }) {
+        return bad(&format!(
+            "value object member {k:?} is not allowed (JSON-LD 1.1 9.5)"
+        ));
+    }
+    match vo.get("@type") {
+        None => Ok(()),
+        Some(Value::String(t)) => {
+            let datetime = format!("{}DateTime", crate::context::NGSI_LD_BASE);
+            let is_datetime = ctx.expand_key(t) == datetime || *t == datetime;
+            if is_datetime
+                && !vo
+                    .get("@value")
+                    .and_then(Value::as_str)
+                    .is_some_and(parse_datetime)
+            {
+                return bad("a DateTime value object needs an ISO 8601 DateTime @value (4.6.3)");
+            }
+            Ok(())
+        }
+        Some(_) => bad("value object @type must be a string (JSON-LD 1.1 9.5)"),
+    }
+}
+
+/// RFC 5646 section 2.1 well-formedness, as far as the shape goes: hyphen
+/// separated subtags of 1-8 letters or digits, led by a 2-8 letter language
+/// or the `x`/`i` singleton of a private-use or grandfathered tag.
+// ponytail: no registry lookup, so a well-formed but unregistered subtag passes
+fn is_language_tag(tag: &str) -> bool {
+    let mut subtags = tag.split('-');
+    let first = subtags.next().unwrap_or_default();
+    let lead = (2..=8).contains(&first.len()) && first.bytes().all(|b| b.is_ascii_alphabetic());
+    let singleton = matches!(first, "x" | "X" | "i" | "I");
+    let rest: Vec<&str> = subtags.collect();
+    (lead || (singleton && !rest.is_empty()))
+        && rest
+            .iter()
+            .all(|t| (1..=8).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
 /// Expand a PARTIAL-UPDATE attribute fragment (5.6.4): reserved members are
 /// kept, others become sub-attributes — and crucially NO attribute-type
 /// inference happens (a fragment `{providedBy: …}` patches the sub-attribute,
@@ -1185,6 +1274,11 @@ pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<V
             }
             // 4.6.3: both members are ISO 8601 DateTimes (4.8 observedAt,
             // 4.22 expiresAt) — the same check the full-instance path runs.
+            // 10.2.5.4: "NGSI-LD Nulls should be supported by this operation": the Null
+            // removes the member from the patched instance (5.5.12).
+            "observedAt" | "expiresAt" if is_ngsi_null(v) => {
+                out.insert(k.clone(), v.clone());
+            }
             "observedAt" | "expiresAt" => {
                 let sdt = v
                     .as_str()
@@ -1213,6 +1307,11 @@ pub fn expand_attr_fragment(obj: &Map<String, Value>, ctx: &Context) -> Result<V
                 if let Some(d) = dataset_id_member(v)? {
                     out.insert("datasetId".into(), d);
                 }
+            }
+            "languageMap"
+                if !(is_ngsi_null(v) || is_ngsi_null_langmap(v) || valid_language_map(v)) =>
+            {
+                return Err(bad("invalid languageMap in fragment (4.5.18.2)".into()));
             }
             _ if RESERVED_MEMBERS.contains(&k.as_str()) => {
                 out.insert(k.clone(), v.clone());
@@ -1417,6 +1516,15 @@ pub fn parse_datetime(s: &str) -> bool {
     // real calendar date/time, not just digits in the right slots
     let normalized = format!("{seconds}Z");
     chrono::DateTime::parse_from_rfc3339(&normalized).is_ok()
+}
+
+/// A DateTime `parse_datetime` accepted, with a comma fraction separator
+/// turned into the decimal point (4.6.3: the comma only "In requests").
+fn point_fraction(s: &str) -> String {
+    match s.get(19..20) {
+        Some(",") => format!("{}.{}", &s[..19], &s[20..]),
+        _ => s.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -1864,6 +1972,136 @@ mod tests {
         assert_eq!(speed[0]["value"], 55);
         let brand = &out["https://uri.etsi.org/ngsi-ld/default-context/brand"];
         assert_eq!(brand.as_array().unwrap().len(), 2);
+    }
+
+    /// 4.5.2.2: "type": "Equal to "Property""; a type that is no string
+    /// names no attribute type (Coraine attribute_type_invalid).
+    #[test]
+    fn rejects_an_attribute_type_that_is_no_string() {
+        for t in [
+            serde_json::json!(42),
+            serde_json::json!(["Property"]),
+            serde_json::json!({}),
+        ] {
+            let doc = serde_json::json!({"id": "urn:a", "type": "T", "p": {"type": t, "value": 1}});
+            let err = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default());
+            assert!(err.is_err(), "{t}");
+        }
+    }
+
+    /// 4.6.3: the fraction separator is "a decimal point"; "In requests, also
+    /// a comma ... may be used", so what is stored, and later answered, uses
+    /// the point (Coraine datetime_comma_separator).
+    #[test]
+    fn a_comma_fraction_is_stored_with_a_decimal_point() {
+        let doc = serde_json::json!({"id": "urn:a", "type": "T", "p": {"type": "Property", "value": 1,
+            "observedAt": "2026-04-28T10:00:00,5Z", "expiresAt": "2099-01-01T00:00:00,25Z"}});
+        let out = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default())
+            .expect("expand");
+        let p = &out["https://uri.etsi.org/ngsi-ld/default-context/p"][0];
+        assert_eq!(p["observedAt"], "2026-04-28T10:00:00.5Z");
+        assert_eq!(p["expiresAt"], "2099-01-01T00:00:00.25Z");
+    }
+
+    /// 4.5.18.2: languageMap is "a JSON object"; a partial update fragment
+    /// is held to it as a create is (Coraine langprop_patch_attribute).
+    #[test]
+    fn a_fragment_language_map_is_an_object_of_strings() {
+        for bad in [
+            serde_json::json!(13),
+            serde_json::json!({"en": 1}),
+            serde_json::json!({"": "x"}),
+        ] {
+            let f = serde_json::json!({"languageMap": bad});
+            assert!(
+                expand_attr_fragment(f.as_object().unwrap(), &core()).is_err(),
+                "{bad}"
+            );
+        }
+        for ok in [
+            serde_json::json!({"en": "x", "es": ["y"]}),
+            serde_json::json!({"@none": "urn:ngsi-ld:null"}),
+            serde_json::json!("urn:ngsi-ld:null"),
+        ] {
+            let f = serde_json::json!({"languageMap": ok});
+            assert!(
+                expand_attr_fragment(f.as_object().unwrap(), &core()).is_ok(),
+                "{ok}"
+            );
+        }
+    }
+
+    /// JSON-LD 1.1 9.5 value objects and 4.6.3 DateTime in a Property value
+    /// (Coraine value_type_atvalue_validation, entity_attr_typed_value_object).
+    #[test]
+    fn a_property_value_object_is_checked() {
+        let attempt = |value: serde_json::Value| {
+            let doc = serde_json::json!({"id": "urn:ngsi-ld:E:1", "type": "T",
+                "p": {"type": "Property", "value": value}});
+            expand_entity(
+                doc.as_object().expect("object"),
+                &core(),
+                ExpandOpts::default(),
+            )
+        };
+        for bad in [
+            serde_json::json!({"@type": 1, "@value": "2018-12-04T12:00:00Z"}),
+            serde_json::json!({"@type": "DateTime", "a": 19, "@value": "2018-12-04T12:00:00Z"}),
+            serde_json::json!({"@type": "DateTime", "@value": 12}),
+            serde_json::json!({"@type": "DateTime", "@value": "banana"}),
+        ] {
+            assert!(attempt(bad.clone()).is_err(), "{bad}");
+        }
+        for ok in [
+            serde_json::json!({"@type": "DateTime", "@value": "2018-12-04T12:00:00Z"}),
+            serde_json::json!({"@type": "xsd:integer", "@value": 42}),
+            serde_json::json!({"@value": "plain", "@language": "en"}),
+            serde_json::json!({"a": 1, "b": 2}),
+        ] {
+            assert!(attempt(ok.clone()).is_ok(), "{ok}");
+        }
+    }
+
+    /// 4.5.18.2: languageMap keys are RFC 5646 language tags (Coraine
+    /// languagemap_key_rfc5646).
+    #[test]
+    fn language_map_keys_are_rfc_5646_tags() {
+        for ok in [
+            "en",
+            "en-US",
+            "zh-Hans-CN",
+            "x-private",
+            "i-klingon",
+            "@none",
+        ] {
+            assert!(valid_language_map(&serde_json::json!({ok: "t"})), "{ok}");
+        }
+        for bad in [
+            "",
+            "123",
+            "!!",
+            "en_US",
+            "en-",
+            "e",
+            "x",
+            "this is not a language",
+            "en-toolongsubtag",
+        ] {
+            assert!(!valid_language_map(&serde_json::json!({bad: "t"})), "{bad}");
+        }
+    }
+
+    /// 4.5.0, 4.5.1: the NGSI-LD Null is never an Entity Type, alone or in
+    /// an array (Coraine entity_member_delete_and_null 12-13).
+    #[test]
+    fn the_ngsi_null_is_no_entity_type() {
+        for v in [
+            serde_json::json!("urn:ngsi-ld:null"),
+            serde_json::json!(["T", "urn:ngsi-ld:null"]),
+        ] {
+            assert!(expand_types(&v, &core()).is_err(), "{v}");
+        }
+        assert!(expand_types(&serde_json::json!("T"), &core()).is_ok());
     }
 
     #[test]
@@ -4180,5 +4418,92 @@ mod edges {
         assert!(!parse_datetime("2020Z"));
         assert!(!parse_datetime("2020-01-0xT00:00:00Z"));
         assert!(parse_datetime("2020-01-01T00:00:00Z"));
+    }
+}
+
+#[cfg(test)]
+mod null_member_tests {
+    use super::*;
+    use serde_json::json;
+
+    const SPEED: &str = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+
+    /// 5.5.12, 10.2.5.4: what removes a member from the patched instance.
+    #[test]
+    fn removes_member_is_null_the_ngsi_null_or_only_deletion_instances() {
+        assert!(removes_member(&Value::Null));
+        assert!(removes_member(&json!("urn:ngsi-ld:null")));
+        assert!(removes_member(&json!([
+            {"type": "Relationship", "object": "urn:ngsi-ld:null"},
+            "urn:ngsi-ld:null"
+        ])));
+        // an empty list deletes nothing, one live instance keeps the member
+        assert!(!removes_member(&json!([])));
+        assert!(!removes_member(&json!([
+            {"type": "Property", "value": "urn:ngsi-ld:null"},
+            {"type": "Property", "value": 1}
+        ])));
+        assert!(!removes_member(&json!({"type": "Property", "value": 1})));
+        assert!(!removes_member(&json!("urn:ngsi-ld:Thing:1")));
+    }
+
+    /// 10.2.5.4 / 10.2.9.4: observedAt and expiresAt set to the Null are kept as the deletion
+    /// marker in a partial update or merge input, and stay invalid DateTimes on create.
+    #[test]
+    fn observed_at_and_expires_at_null_only_in_null_allowing_inputs() {
+        let ctx = crate::core_context();
+        let doc = json!({"id": "urn:x", "type": "T",
+            "speed": {"type": "Property", "value": 1,
+                      "observedAt": "urn:ngsi-ld:null", "expiresAt": "urn:ngsi-ld:null"}});
+        let doc = doc.as_object().unwrap();
+        assert!(
+            expand_entity(doc, &ctx, ExpandOpts::default()).is_err(),
+            "create refuses the Null"
+        );
+        for opts in [
+            ExpandOpts {
+                fragment: true,
+                allow_null: true,
+                ..Default::default()
+            },
+            ExpandOpts {
+                fragment: true,
+                merge: true,
+                ..Default::default()
+            },
+        ] {
+            let out = expand_entity(doc, &ctx, opts).expect("the Null is a deletion marker here");
+            assert_eq!(out[SPEED][0]["observedAt"], "urn:ngsi-ld:null", "{opts:?}");
+            assert_eq!(out[SPEED][0]["expiresAt"], "urn:ngsi-ld:null", "{opts:?}");
+        }
+        // a real DateTime passes through, anything else is still refused under allow_null
+        let opts = ExpandOpts {
+            fragment: true,
+            allow_null: true,
+            ..Default::default()
+        };
+        let ok = json!({"speed": {"type": "Property", "value": 1, "observedAt": "2026-10-15T00:00:00Z"}});
+        let out = expand_entity(ok.as_object().unwrap(), &ctx, opts).expect("DateTime accepted");
+        assert_eq!(out[SPEED][0]["observedAt"], "2026-10-15T00:00:00Z");
+        for k in ["observedAt", "expiresAt"] {
+            let bad = json!({"speed": {"type": "Property", "value": 1, k: "urn:ngsi-ld:Thing:1"}});
+            assert!(
+                expand_entity(bad.as_object().unwrap(), &ctx, opts).is_err(),
+                "{k}"
+            );
+        }
+    }
+
+    /// 10.2.5.4 on the attribute path (5.6.4): the Null is kept for the patch to remove.
+    #[test]
+    fn attr_fragment_keeps_a_null_observed_at_and_expires_at() {
+        let ctx = crate::core_context();
+        let frag = json!({"type": "Property", "value": 1,
+            "observedAt": "urn:ngsi-ld:null", "expiresAt": "urn:ngsi-ld:null"});
+        let out = expand_attr_fragment(frag.as_object().unwrap(), &ctx).expect("Null accepted");
+        assert_eq!(out["observedAt"], "urn:ngsi-ld:null");
+        assert_eq!(out["expiresAt"], "urn:ngsi-ld:null");
+        let bad = json!({"type": "Property", "value": 1, "observedAt": "not a date"});
+        assert!(expand_attr_fragment(bad.as_object().unwrap(), &ctx).is_err());
     }
 }

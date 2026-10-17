@@ -40,8 +40,7 @@ use axum::routing::any;
 use axum::Router;
 use odata_axum::{ODataErrorResponse, ODataRequest, ODataState};
 use odata_csdl::CsdlVersion;
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock};
 use tower::ServiceExt as _;
 
 /// Where the surface is mounted; the view id and `odata/v4` follow.
@@ -58,11 +57,9 @@ pub const SCHEMA_LIMITS: linkml_model::Limits = linkml_model::Limits {
 /// The longest request header the surface reads (`Accept`, `OData-*`).
 pub const MAX_HEADER_LEN: usize = 4096;
 
-/// How many parsed schemas a pod keeps, by revision.
-const SCHEMA_CACHE: usize = 64;
-
-/// How many built models a pod keeps (T-3441 7.3).
-const MODEL_CACHE: usize = 256;
+/// The bytes of built models a pod keeps (T-3441 7.3, T-4354), each weighed
+/// by its CSDL document's XML: 256 views of one ordinary model fit.
+const MODEL_CACHE_BYTES: u64 = 64 << 20;
 
 /// The OData surface.
 #[derive(Debug, Clone, Copy, Default)]
@@ -262,7 +259,12 @@ type Built = (Arc<edm::Edm>, Arc<odata_csdl::Model>, Option<String>);
 /// The model of `view` at `version`, built once per key on this pod (O21),
 /// `None` when its Tenant has no schema this surface can read.
 fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
-    static CACHE: LazyLock<Mutex<HashMap<ModelKey, Built>>> = LazyLock::new(Mutex::default);
+    static CACHE: LazyLock<moka::sync::Cache<ModelKey, (Built, u32)>> = LazyLock::new(|| {
+        moka::sync::Cache::builder()
+            .max_capacity(MODEL_CACHE_BYTES)
+            .weigher(|_key: &ModelKey, value: &(Built, u32)| value.1)
+            .build()
+    });
     let (revision, bytes) = view.schema()?;
     let shown = view.shown_by_type();
     let writable = edm::Writable {
@@ -277,12 +279,8 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
         revision,
         version == CsdlVersion::V4_01,
     );
-    if let Some(hit) = CACHE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&key)
-    {
-        return Some(hit.clone());
+    if let Some((hit, _)) = CACHE.get(&key) {
+        return Some(hit);
     }
     let schema = parsed(revision, &bytes)?;
     // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
@@ -302,48 +300,32 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
         "the view's OData model was built"
     );
     let etag = odata_axum::metadata_etag(&edm.csdl, &odata_csdl::Limits::strict());
+    let mut xml = Vec::new();
+    // ponytail: the document is written a second time for its weight, once per built key.
+    let weight = odata_csdl::write_xml(&edm.csdl, &odata_csdl::Limits::strict(), &mut xml)
+        .map_or(u32::MAX, |()| u32::try_from(xml.len()).unwrap_or(u32::MAX))
+        .max(4096);
     let built = (Arc::new(edm.clone()), Arc::new(edm.csdl), etag);
-    remember(
-        &mut CACHE.lock().unwrap_or_else(PoisonError::into_inner),
-        MODEL_CACHE,
-        key,
-        built.clone(),
-    );
+    CACHE.insert(key, (built.clone(), weight));
     Some(built)
 }
 
-/// The schema of `bytes`, parsed once per revision on this pod.
-fn parsed(revision: u64, bytes: &[u8]) -> Option<Arc<linkml_model::Model>> {
-    type Cache = Mutex<HashMap<u64, Option<Arc<linkml_model::Model>>>>;
-    static CACHE: LazyLock<Cache> = LazyLock::new(Cache::default);
-    if let Some(hit) = CACHE
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&revision)
-    {
-        return hit.clone();
-    }
-    let read = linkml_model::Model::read(bytes, &SCHEMA_LIMITS)
-        .map(Arc::new)
-        .inspect_err(|e| unreadable(revision, e))
-        .ok();
-    remember(
-        &mut CACHE.lock().unwrap_or_else(PoisonError::into_inner),
-        SCHEMA_CACHE,
-        revision,
-        read.clone(),
-    );
-    read
-}
-
-/// Keeps `value` under `key` in a cache of at most `max` entries.
-/// ponytail: a full cache is dropped whole; an LRU when one pod serves more
-/// views or schemas at once than the bound.
-fn remember<K: std::hash::Hash + Eq, V>(cache: &mut HashMap<K, V>, max: usize, key: K, value: V) {
-    if cache.len() >= max {
-        cache.clear();
-    }
-    cache.insert(key, value);
+/// The schema of `bytes`, parsed once per revision on this pod and shared
+/// with the LinkML surface (T-4354): read under the LinkML surface's bounds
+/// first, and under this surface's own only when those refuse it, so OData
+/// takes what it took before and a schema inside both is parsed once.
+fn parsed(revision: u64, bytes: &Arc<[u8]>) -> Option<Arc<linkml_model::Model>> {
+    use linkml_model::cache;
+    let (read, fresh) = match cache::read(revision, bytes, &linkml_model::SURFACE_LIMITS) {
+        (Ok(model), fresh) => (Ok(model), fresh),
+        (Err(_), _) => cache::read(revision, bytes, &SCHEMA_LIMITS),
+    };
+    read.inspect_err(|e| {
+        if fresh {
+            unreadable(revision, e);
+        }
+    })
+    .ok()
 }
 
 /// Logged once per revision on this pod: the result is cached.
@@ -381,14 +363,40 @@ mod tests {
     }
 
     #[test]
-    fn the_parse_cache_stays_bounded() {
-        let schema = br#"{"id": "https://e.org/s", "name": "s"}"#;
-        for revision in 0..=u64::try_from(SCHEMA_CACHE).unwrap_or(u64::MAX) {
-            assert!(parsed(revision, schema).is_some());
-        }
-        assert!(
-            parsed(1 << 40, schema).is_some(),
-            "past the bound: the cache starts over"
+    fn a_revision_is_parsed_once_and_shared_with_the_linkml_bounds() {
+        let schema: &Arc<[u8]> = &br#"{"id": "https://e.org/odata-once", "name": "s"}"#[..].into();
+        let first = parsed(9_001, schema).expect("reads");
+        let again = parsed(9_001, schema).expect("reads");
+        assert!(Arc::ptr_eq(&first, &again));
+        // The LinkML surface asks the same revision under its bounds: no new parse.
+        let (linkml, fresh) =
+            linkml_model::cache::read(9_001, schema, &linkml_model::SURFACE_LIMITS);
+        assert!(!fresh);
+        assert!(Arc::ptr_eq(&first, &linkml.expect("reads")));
+    }
+
+    #[test]
+    fn a_schema_past_the_linkml_bounds_still_reads_under_odatas_own() {
+        // 40 levels deep: past LinkML's 32, inside OData's 64, as before T-4354.
+        let deep = format!(
+            r#"{{"id": "https://e.org/deep", "name": "s", "classes": {{"Room": {{"annotations": {{"a": {{"tag": "a", "value": {}1{}}}}}}}}}}}"#,
+            "[".repeat(36),
+            "]".repeat(36)
         );
+        let deep: Arc<[u8]> = deep.into_bytes().into();
+        let (strict, _) = linkml_model::cache::read(9_002, &deep, &linkml_model::SURFACE_LIMITS);
+        assert!(strict.is_err());
+        let loose = linkml_model::Model::read(&deep, &SCHEMA_LIMITS).is_ok();
+        assert_eq!(parsed(9_002, &deep).is_some(), loose);
+    }
+
+    #[test]
+    fn an_unreadable_schema_stays_closed_and_is_read_once() {
+        let bad: Arc<[u8]> = b"{not json"[..].into();
+        assert!(parsed(9_003, &bad).is_none());
+        // Answered from the cache, the reason logged the first time only.
+        assert!(parsed(9_003, &bad).is_none());
+        let (read, fresh) = linkml_model::cache::read(9_003, &bad, &SCHEMA_LIMITS);
+        assert_eq!((read.is_err(), fresh), (true, false));
     }
 }

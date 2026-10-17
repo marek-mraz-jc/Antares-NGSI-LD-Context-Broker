@@ -361,7 +361,7 @@ async fn seed(app: &Router) -> Result<(), String> {
         "city",
         &json!({
             "id": "urn:ngsi-ld:Person:p", "type": "Person",
-            "name": prop(&json!("Pat")), "salary": prop(&json!(4321)),
+            "name": prop(&json!("Pat")), "salary": prop(&json!(987_654.5)),
             "employer": rel("urn:ngsi-ld:Org:o")
         }),
     )

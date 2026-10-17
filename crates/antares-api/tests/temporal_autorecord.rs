@@ -565,6 +565,44 @@ async fn delete_attribute_of_a_temporal_only_entity_is_not_found() {
     assert!(!b.contains("deletedAt"), "nothing recorded: {b}");
 }
 
+/// 5.6.5.4: "If the target Entity does not contain the target Attribute then
+/// an error of type ResourceNotFound shall be raised." The Attribute's
+/// recorded history is no Attribute of the Entity: deleting it twice, or a
+/// scope the Entity never had, answers 404 and records no second deletion
+/// (Coraine entity_attr_crud, entity_member_delete_and_null).
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_an_attribute_the_entity_no_longer_has_is_not_found() {
+    let mut st = AppState::new("test".into());
+    antares_api::wire(&mut st).await;
+    let body = r#"{"id":"urn:ngsi-ld:Rec:d1","type":"Rec",
+        "brand":{"type":"Property","value":"A"},"speed":{"type":"Property","value":1}}"#;
+    let (s, b) = send(&st, req("POST", "/ngsi-ld/v1/entities", Some(body))).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let brand = "/ngsi-ld/v1/entities/urn:ngsi-ld:Rec:d1/attrs/brand";
+    let (s, b) = send(&st, req("DELETE", brand, None)).await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{b}");
+    let (s, b) = send(&st, req("DELETE", brand, None)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
+    let scope = "/ngsi-ld/v1/entities/urn:ngsi-ld:Rec:d1/attrs/scope";
+    let (s, b) = send(&st, req("DELETE", scope, None)).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{b}");
+    let (s, b) = send(
+        &st,
+        req(
+            "GET",
+            "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Rec:d1",
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(
+        b.matches("deletedAt").count(),
+        1,
+        "one deletion recorded: {b}"
+    );
+}
+
 /// 4.18 and 4.5.0: a deleted scope reads as the NGSI-LD Null in the
 /// temporal representation, not as an empty array (forge fix fad5ab03,
 /// TP 020_19 and 020_20).

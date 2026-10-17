@@ -24,7 +24,7 @@ async fn views_errors_carry_no_hidden_name_and_no_inner_detail() -> Result<(), S
         let a = get(&f.app, &format!("{CARS}{uri}")).await;
         assert!(a.status.is_client_error(), "{uri}: {}", a.text);
         for hidden in [
-            "secret", "salary", "Acme", "4321", "Car:3\"", "Org\"", "speed<80",
+            "secret", "salary", "Acme", "987654", "Car:3\"", "Org\"", "speed<80",
         ] {
             assert!(!a.text.contains(hidden), "{uri} names {hidden}: {}", a.text);
         }

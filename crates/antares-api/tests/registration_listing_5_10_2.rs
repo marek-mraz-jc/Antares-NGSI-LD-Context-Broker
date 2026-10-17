@@ -350,3 +350,34 @@ async fn a_registration_page_link_carries_the_requested_media_type() {
         );
     }
 }
+
+/// Table 6.8.3.2-1 lists `pick` and `omit` among the URL parameters "that
+/// shall be supported": they project the members of each registration
+/// returned, and exclude each other (4.21). Coraine csource-reg-discovery-filters.
+#[tokio::test(flavor = "multi_thread")]
+async fn pick_and_omit_project_the_returned_registrations() {
+    let st = AppState::new("me".into());
+    seed(&st, 1, "Vehicle").await;
+    let (status, body, _) = get(
+        &st,
+        "/ngsi-ld/v1/csourceRegistrations?type=Vehicle&omit=endpoint",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body[0].get("endpoint").is_none(), "{body}");
+    assert!(body[0].get("information").is_some(), "{body}");
+    let (status, body, _) = get(
+        &st,
+        "/ngsi-ld/v1/csourceRegistrations?type=Vehicle&pick=id,endpoint",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let keys: Vec<&String> = body[0].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["endpoint", "id"], "{body}");
+    let (status, body, _) = get(
+        &st,
+        "/ngsi-ld/v1/csourceRegistrations?type=Vehicle&pick=id&omit=endpoint",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}

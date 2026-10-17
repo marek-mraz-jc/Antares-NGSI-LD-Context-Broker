@@ -263,7 +263,12 @@ jobs:
     # don't reach rustdoc's test binaries).
     name: ThreadSanitizer (weekly)
     if: github.event.schedule != '41 2 * * *'
-    runs-on: ubuntu-24.04-arm
+    # x86_64, not arm64: on ubuntu-24.04-arm every TSan binary, a hello world
+    # included, died with SIGSEGV inside __tsan::Initialize: the runtime calls
+    # __aarch64_swp1_acq, which -Zbuild-std takes from an instrumented
+    # compiler_builtins, and its func-entry hook runs before the thread state
+    # exists (probe run 38913148697, T-4367). Same tests, same flags.
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
       RUSTFLAGS: "-Zsanitizer=thread"
@@ -280,9 +285,12 @@ jobs:
         with:
           components: rust-src
       - uses: Swatinem/rust-cache@v2
+      # The runner's kernel randomizes mmap with more bits than TSan's fixed
+      # shadow layout allows (google/sanitizers#1716, run 38850474298, T-4250).
+      - run: sudo sysctl -w vm.mmap_rnd_bits=28
       - run: >
           cargo +nightly test -Zbuild-std
-          --target aarch64-unknown-linux-gnu
+          --target x86_64-unknown-linux-gnu
           --workspace --exclude antares-broker --tests
 
   miri:
