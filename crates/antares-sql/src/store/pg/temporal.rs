@@ -112,13 +112,68 @@ fn decompose(doc: &Value) -> Vec<Value> {
     rows
 }
 
-/// Multi-row instance upsert inside the caller's transaction.
+/// `ANTARES_TEMPORAL_DEDUP=off` records a row per write again; anything else,
+/// or unset, records a new instance only (T-4507, see [`unseen`]).
+fn temporal_dedup() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ANTARES_TEMPORAL_DEDUP").as_deref() != Ok("off"))
+}
+
+/// An instance's stamps: two instances that differ only in these are the same
+/// observation (CIM 009 4.5: a static Property is one instance).
+const STAMPS: &str = "ARRAY['instanceId','createdAt','modifiedAt']";
+
+/// The geometry column of an instance row `e` (see `insert_rows`).
+const GEO_VALUE: &str = "CASE WHEN jsonb_typeof(e->'data'->'value') = 'object'
+                      AND e->'data'->'value'->>'type' IN
+                          ('Point','MultiPoint','LineString','MultiLineString',
+                           'Polygon','MultiPolygon')
+                     THEN try_geomfromgeojson((e->'data'->'value')::text) END";
+
+/// The rows of one append that are new observations (T-4507): of rows equal
+/// but for their stamps, the first, and of rows with an `observedAt`, one per
+/// (attribute, datasetId, observedAt). What the table already holds is
+/// `insert_rows`'s to compare.
+fn unseen(rows: Vec<Value>) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    rows.into_iter()
+        .filter(|r| {
+            let data = &r["data"];
+            let what = if data.get("observedAt").is_some() {
+                r["observed_at"].clone()
+            } else {
+                let mut d = data.clone();
+                if let Some(o) = d.as_object_mut() {
+                    for k in ["instanceId", "createdAt", "modifiedAt"] {
+                        o.remove(k);
+                    }
+                }
+                d
+            };
+            seen.insert((
+                r["attr_id"].to_string(),
+                r["dataset_id"].to_string(),
+                what.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Multi-row instance upsert inside the caller's transaction. With `dedup`
+/// (the auto-recording append) a row is written only when it is a new
+/// observation (T-4507): an instance with an `observedAt` already stored for
+/// its (attribute, datasetId) is updated in place, keeping its instanceId,
+/// and one without is skipped when the newest stored instance holds the same
+/// value. tenant_id is part of every comparison.
 async fn insert_rows(
     tx: &mut sqlx::PgConnection,
     tenant: &TenantId,
     entity_id: &str,
     rows: Vec<Value>,
+    dedup: bool,
 ) -> Result<(), sqlx::Error> {
+    let dedup = dedup && temporal_dedup();
+    let rows = if dedup { unseen(rows) } else { rows };
     if rows.is_empty() {
         return Ok(());
     }
@@ -134,29 +189,59 @@ async fn insert_rows(
     // geo_value: extracted per instance when the value LOOKS like a GeoJSON
     // geometry; try_geomfromgeojson (0001_init.sql) maps anything PostGIS rejects to
     // NULL, which the S3 prefilter treats as "reaches the evaluator".
-    sqlx::query(
+    let rows = Value::Array(rows);
+    // The stored instance of the same (attribute, datasetId) a row of `e` repeats.
+    let same = "x.tenant_id = $1 AND x.entity_id = $2 AND x.attr_id = e->>'attr_id'
+                AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
+                AND x.instance_id <> e->>'instance_id'";
+    if dedup {
+        // Same observedAt, another value: that observation was corrected.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE attr_instances x
+             SET data = jsonb_set(e->'data', '{{instanceId}}', to_jsonb(x.instance_id)),
+                 modified_at = (e->>'modified_at')::timestamptz,
+                 deleted_at = (e->>'deleted_at')::timestamptz, geo_value = {GEO_VALUE}
+             FROM jsonb_array_elements($3::jsonb) AS e
+             WHERE e->'data' ? 'observedAt' AND {same}
+               AND x.observed_at = (e->>'observed_at')::timestamptz
+               AND x.data - {STAMPS} IS DISTINCT FROM (e->'data') - {STAMPS}"
+        )))
+        .bind(tenant.as_str())
+        .bind(entity_id)
+        .bind(&rows)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // `$4` off: today's row per write. On: a row with an observedAt already
+    // stored, or without one equal to the newest stored instance, is no new
+    // observation. Both probes ride (tenant_id, entity_id, attr_id, observed_at DESC).
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO attr_instances
            (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at,
             created_at, modified_at, deleted_at, data, geo_value)
          SELECT $1, $2, e->>'attr_id', e->>'instance_id', e->>'dataset_id',
                 (e->>'observed_at')::timestamptz, (e->>'created_at')::timestamptz,
                 (e->>'modified_at')::timestamptz, (e->>'deleted_at')::timestamptz,
-                e->'data',
-                CASE WHEN jsonb_typeof(e->'data'->'value') = 'object'
-                      AND e->'data'->'value'->>'type' IN
-                          ('Point','MultiPoint','LineString','MultiLineString',
-                           'Polygon','MultiPolygon')
-                     THEN try_geomfromgeojson((e->'data'->'value')::text) END
+                e->'data', {GEO_VALUE}
          FROM jsonb_array_elements($3::jsonb) AS e
+         WHERE NOT $4 OR NOT EXISTS (
+           SELECT 1 FROM attr_instances x WHERE {same} AND CASE
+             WHEN e->'data' ? 'observedAt' THEN x.observed_at = (e->>'observed_at')::timestamptz
+             ELSE x.data - {STAMPS} = (e->'data') - {STAMPS} AND x.observed_at = (
+               SELECT max(y.observed_at) FROM attr_instances y
+               WHERE y.tenant_id = $1 AND y.entity_id = $2 AND y.attr_id = e->>'attr_id'
+                 AND y.dataset_id IS NOT DISTINCT FROM e->>'dataset_id')
+           END)
          ON CONFLICT (tenant_id, entity_id, attr_id, instance_id, observed_at)
            DO UPDATE SET data = EXCLUDED.data, modified_at = EXCLUDED.modified_at,
                          dataset_id = EXCLUDED.dataset_id,
                          deleted_at = EXCLUDED.deleted_at,
-                         geo_value = EXCLUDED.geo_value",
-    )
+                         geo_value = EXCLUDED.geo_value"
+    )))
     .bind(tenant.as_str())
     .bind(entity_id)
-    .bind(Value::Array(rows))
+    .bind(&rows)
+    .bind(dedup)
     .execute(&mut *tx)
     .await?;
     if !in_dataset.is_empty() {
@@ -512,7 +597,7 @@ impl PgTemporalStore {
         .await?
         .rows_affected();
         if n == 1 {
-            insert_rows(&mut tx, tenant, id, rows).await?;
+            insert_rows(&mut tx, tenant, id, rows, false).await?;
         }
         tx.commit().await?;
         Ok(n == 1)
@@ -613,7 +698,7 @@ impl PgTemporalStore {
         .bind(&modified)
         .execute(&mut **tx)
         .await?;
-        insert_rows(tx, tenant, id, rows).await
+        insert_rows(tx, tenant, id, rows, true).await
     }
 
     pub async fn get(&self, tenant: &TenantId, id: &str) -> Result<Option<Value>, sqlx::Error> {
@@ -1062,7 +1147,7 @@ impl PgTemporalStore {
                     .execute(&mut *tx)
                     .await?;
                 }
-                insert_rows(&mut tx, tenant, id, upserts).await?;
+                insert_rows(&mut tx, tenant, id, upserts, false).await?;
                 sqlx::query(
                     "UPDATE temporal_entities SET meta = $3, types = $4, scopes = $5,
                        modified_at = $6::timestamptz

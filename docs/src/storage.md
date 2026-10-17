@@ -82,6 +82,16 @@ it (`crates/antares-api/src/history.rs`):
    one updates current state and leaves no history; `none` records nothing
    from the entity endpoints while the temporal API itself still stores what
    it is given.
+3. **New observation**, in the Postgres and TimescaleDB stores
+   (`ANTARES_TEMPORAL_DEDUP`, default on): an instance with an `observedAt`
+   is one row per (Attribute, datasetId, observedAt), and a new value at the
+   same instant corrects that row in place; an instance without one is
+   written only when its value differs from the newest stored instance. Gate
+   1 compares with the current entity; this one compares with history, so an
+   upsert that recreates an Attribute with an unchanged value adds no row.
+   Unchanged values are not repeated in the temporal representation
+   (CIM 009 4.5: a static Property is one instance). `off` writes a row per
+   admitted event, as before T-4507.
 
 `observed` is a narrowing, not a tidying: an Entity created through the Core
 API with no `observedAt` has no temporal evolution at all under it, and a
