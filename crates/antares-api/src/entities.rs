@@ -1414,9 +1414,17 @@ pub async fn filter_entities_paged(
     // Otherwise, without `count` the answer needs the matches up to the
     // page's end and one more (whether a next page exists): the store is
     // read in pages of its own, doubling, until that many held.
-    // ponytail: `count=true` under conditional rules still reads every
-    // Entity the policy admits; compile the rules' OR and the shown-set
-    // predicates to SQL if that shows up
+    // `count=true` under conditional rules needs every match counted: the
+    // store is read in pages of its own to the end, only the client's window
+    // is kept, and the scan stops at MAX_FOLD_DOCS (T-4516). One flat read
+    // refused a dataset's count once its type held MAX_UNDECIDED_ROWS.
+    // ponytail: still reads every Entity the policy admits; compile the
+    // rules' OR and the shown-set predicates to SQL if that shows up
+    let counting = client_page.filter(|_| {
+        rules.is_some()
+            && judged.is_none()
+            && params.get("count").map(String::as_str) == Some("true")
+    });
     let enough = match client_page {
         Some((offset, limit))
             if rules.is_some()
@@ -1445,6 +1453,7 @@ pub async fn filter_entities_paged(
     let geo_uncompiled = geo_specs.len() < geos.len();
     let page = if geo_uncompiled { None } else { page };
     let enough = enough.filter(|_| !geo_uncompiled);
+    let counting = counting.filter(|_| !geo_uncompiled);
     let proj = proj.filter(|_| !geo_uncompiled);
     // pick (or attrs) heads to keep / whole-attr omit heads to drop; core
     // members are never SQL-dropped (only `://` IRIs qualify) — repr::apply
@@ -1482,8 +1491,14 @@ pub async fn filter_entities_paged(
     let (mut paged, mut total): (bool, Option<usize>);
     let mut rows = 0usize;
     let mut fed_once = Some(fed);
-    // the store page under `enough`: (offset, limit), the limit doubling
-    let mut read = (0usize, enough.unwrap_or(0));
+    // the store page under `enough` or `counting`: (offset, limit), the limit
+    // doubling up to COUNT_CHUNK
+    const COUNT_CHUNK: usize = 8192;
+    let mut read = (
+        0usize,
+        enough.unwrap_or(if counting.is_some() { 1024 } else { 0 }),
+    );
+    let mut matched = 0usize;
     'scan: loop {
         let outcome = st
             .store
@@ -1515,7 +1530,7 @@ pub async fn filter_entities_paged(
                     geo: if split_agg { &[] } else { &geo_specs },
                     expand: &expand,
                     ctx: Some(ctx),
-                    page: match enough {
+                    page: match enough.or(counting.map(|_| 0)) {
                         Some(_) => Some(store_page(read)),
                         None => page.map(|(offset, limit)| antares_store::filter::Page {
                             offset: offset as i64,
@@ -1622,16 +1637,48 @@ pub async fn filter_entities_paged(
                     }
                 }
             }
+            if let Some((offset, limit)) = counting {
+                // ORDER BY id is the store's order, so the k-th match is the
+                // k-th Entity of the client's page
+                if matched.checked_sub(offset).is_some_and(|k| k < limit) {
+                    out.push(doc);
+                }
+                matched = matched.saturating_add(1);
+                continue;
+            }
             out.push(doc);
             if enough.is_some_and(|n| out.len() >= n) {
                 break 'scan;
             }
         }
         // a store that could not page answered with every row it holds
-        if enough.is_none() || !store_paged || got < read.1 {
+        if (enough.is_none() && counting.is_none()) || !store_paged || got < read.1 {
             break;
         }
-        read = (read.0.saturating_add(got), read.1.saturating_mul(2));
+        if counting.is_some() && rows >= *crate::bounds::MAX_FOLD_DOCS {
+            return Err(NgsiError::TooManyResults(format!(
+                "counting this query read more than {} entities; narrow it",
+                *crate::bounds::MAX_FOLD_DOCS
+            ))
+            .into());
+        }
+        read = (
+            read.0.saturating_add(got),
+            if counting.is_some() {
+                read.1.saturating_mul(2).min(COUNT_CHUNK)
+            } else {
+                read.1.saturating_mul(2)
+            },
+        );
+    }
+    if counting.is_some() {
+        // the store paged to the end, or answered every row it holds at once
+        return Ok(Filtered {
+            docs: out,
+            paged: true,
+            total: Some(matched),
+            rows,
+        });
     }
     Ok(Filtered {
         docs: out,

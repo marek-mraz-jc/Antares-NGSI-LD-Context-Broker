@@ -973,6 +973,42 @@ async fn count_and_paging_consistent_with_rule_union() {
     );
 }
 
+/// T-4516: a count under conditional rules reads the store a page at a
+/// time, never as one unpaged read: that one hit the store's 10 000-row
+/// ceiling and answered TooManyResults for a dataset of a large type, while
+/// the window and the total stay those of the rule union.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_count_under_conditional_rules_reads_the_store_in_pages() {
+    let mut st = state(Filter {
+        rules: vec![Rule {
+            geo_q: Some(zone_a()),
+            ..rule("Car", &["speed"])
+        }],
+        ..Filter::default()
+    })
+    .await;
+    for i in 0..7 {
+        let x = if i % 2 == 0 { 0.5 } else { 5.0 };
+        create(
+            &st,
+            json!({"id": format!("urn:ngsi-ld:Car:{i}"), "type": "Car",
+                   "speed": prop(json!(i)), "location": point(x)}),
+        )
+        .await;
+    }
+    let spy = Arc::new(crate::common::Double::passthrough(st.store.clone()));
+    st.store = spy.clone();
+    let base = "/ngsi-ld/v1/entities?type=Car&count=true&q=speed%3E1";
+    assert_eq!(count(&st, &format!("{base}&limit=0")).await, Some(3));
+    let uri = format!("{base}&limit=2&offset=1");
+    assert_eq!(count(&st, &uri).await, Some(3), "{uri}");
+    assert_eq!(
+        ids(&send(&st, "GET", &uri, None).await.1),
+        ["urn:ngsi-ld:Car:4", "urn:ngsi-ld:Car:6"]
+    );
+    assert_eq!(spy.unpaged_queries(), 0, "the count read the store unpaged");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn car_leaving_zone_a_loses_speed_on_next_read() {
     let st = state(zones()).await;
@@ -1381,7 +1417,8 @@ async fn a_q_on_shown_attributes_is_paged_in_the_store_and_a_hidden_one_is_not()
         "the shown q was not handed to the store with a page"
     );
     // `email` is a User's, hidden by its rule: the store reads the admitted
-    // Entities whole and the shown User has no `email` to match.
+    // Entities without the q, in pages since T-4516, and the shown User has
+    // no `email` to match: a pushed q would have found Ana.
     let (code, body) = send(
         &st,
         "GET",
@@ -1393,7 +1430,7 @@ async fn a_q_on_shown_attributes_is_paged_in_the_store_and_a_hidden_one_is_not()
     assert_eq!(body, json!([]));
     assert_eq!(
         spy.unpaged_queries(),
-        1,
-        "a q on a hidden Attribute was pushed to the store"
+        0,
+        "the count under a hidden q read the store unpaged"
     );
 }
