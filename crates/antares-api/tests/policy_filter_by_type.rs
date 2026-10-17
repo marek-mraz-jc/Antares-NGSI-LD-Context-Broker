@@ -1349,3 +1349,51 @@ async fn a_client_q_under_type_rules_reads_the_entity_as_shown() {
     let (one, next) = page(&st, "/ngsi-ld/v1/entities?type=Car&q=speed%3E=3&limit=1").await;
     assert_eq!((one.len(), next), (1, true));
 }
+
+/// T-4289: under rules that admit by type alone, a client `q` on Attributes
+/// every rule shows reaches the store with a page, `count=true` included, as
+/// OGC API Features and OData send it; Postgres then counts in SQL instead
+/// of reading every Entity the policy admits into its TooManyResults
+/// ceiling. A `q` on an Attribute a rule hides stays on the shown Entity:
+/// the store is asked for the policy's Entities whole, and the hidden value
+/// still matches nothing.
+#[tokio::test]
+async fn a_q_on_shown_attributes_is_paged_in_the_store_and_a_hidden_one_is_not() {
+    let mut st = state(picks(&[("Car", &["speed", "colour"]), ("User", &["name"])])).await;
+    seed(&st).await;
+    let spy = Arc::new(crate::common::Double::passthrough(st.store.clone()));
+    st.store = spy.clone();
+    let (code, body) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Car&q=colour==%22red%22&count=true&limit=1",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(
+        members(&body).keys().collect::<Vec<_>>(),
+        ["urn:ngsi-ld:Car:1"]
+    );
+    assert_eq!(
+        spy.unpaged_queries(),
+        0,
+        "the shown q was not handed to the store with a page"
+    );
+    // `email` is a User's, hidden by its rule: the store reads the admitted
+    // Entities whole and the shown User has no `email` to match.
+    let (code, body) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=User&q=email==%22ana@example.org%22&count=true",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body, json!([]));
+    assert_eq!(
+        spy.unpaged_queries(),
+        1,
+        "a q on a hidden Attribute was pushed to the store"
+    );
+}
