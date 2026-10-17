@@ -1445,11 +1445,7 @@ pub async fn filter_entities_paged(
                     expand: &expand,
                     ctx: Some(ctx),
                     page: match enough {
-                        Some(_) => Some(antares_store::filter::Page {
-                            offset: read.0 as i64,
-                            limit: read.1 as i64,
-                            count: false,
-                        }),
+                        Some(_) => Some(store_page(read)),
                         None => page.map(|(offset, limit)| antares_store::filter::Page {
                             offset: offset as i64,
                             limit: limit as i64,
@@ -2895,8 +2891,29 @@ pub(crate) async fn build_query_map(
     crate::entity_map::merge_and_store_map(st, tenant, headers, ctx, params, false, emap).await
 }
 
+/// The store page of the conditional-rules scan as the store's `i64` binds,
+/// saturating: `enough` is the client's offset plus limit, so an offset near
+/// `i64::MAX` (which `page_params` admits) and the doubling limit pass it,
+/// and an `as` cast wraps negative, a LIMIT postgres refuses (500).
+fn store_page((offset, limit): (usize, usize)) -> antares_store::filter::Page {
+    antares_store::filter::Page {
+        offset: i64::try_from(offset).unwrap_or(i64::MAX),
+        limit: i64::try_from(limit).unwrap_or(i64::MAX),
+        count: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_scan_page_past_i64_saturates_and_never_wraps_negative() {
+        let past = usize::try_from(i64::MAX).unwrap_or(usize::MAX) + 11;
+        let p = super::store_page((past, usize::MAX));
+        assert_eq!((p.offset, p.limit), (i64::MAX, i64::MAX));
+        let p = super::store_page((20, 41));
+        assert_eq!((p.offset, p.limit, p.count), (20, 41, false));
+    }
+
     use super::merge_into;
     use serde_json::json;
 
