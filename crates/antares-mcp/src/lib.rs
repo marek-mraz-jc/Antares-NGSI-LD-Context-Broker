@@ -25,6 +25,7 @@ mod confirm;
 mod cursor;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
+mod guide;
 mod listen;
 mod schema;
 mod server;
