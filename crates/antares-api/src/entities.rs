@@ -1064,29 +1064,6 @@ fn proj_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -
     fed_is_empty && !params.contains_key("orderBy")
 }
 
-/// Whether the store may be asked to cut the page (ORDER BY id +
-/// LIMIT/OFFSET). Only when nothing outside it still narrows or reorders the
-/// match set:
-///
-/// * federated candidates are merged in afterwards, and 5.7.2.4 applies the
-///   query, geoquery, Scope query and Attribute filters only after that
-///   aggregation — so a SQL page would be cut from the wrong set;
-/// * `idPattern` is not part of the store filter, so it drops rows the SQL
-///   page already counted;
-/// * `orderBy` orders the whole match set by the value of the ordering member
-///   (4.23) before the page is cut, and that comparison order is the
-///   evaluator's.
-///
-/// `limit=0` — the count-only shape of 6.3.10, where `count=true` is
-/// mandatory — IS pushed: the store returns no rows and counts the match set,
-/// which is the same count the scan derives from a materialized one, without
-/// materializing 100 million documents to throw them away.
-/// The client's type selection (OR of AND groups, `None` = any type) with
-/// one of the rules' types required in every group: `(a;b)|c` under rules
-/// of `T` and `U` selects `(a;b;T)|(a;b;U)|(c;T)|(c;U)`, and a group that
-/// already names one of them stays as it is (`(a;T)` selects no more than
-/// `(a;T;U)`). `None` when the rules name no type, so a selection is never
-/// dropped into "any".
 /// Whether `q` reads only Attributes that every rule of a type in `groups`
 /// shows and the narrowing's own projection keeps, in the form the store
 /// compiles exactly: one Attribute per term, no Linked Entity hop, no system
@@ -1135,6 +1112,12 @@ fn reads_only_shown(
         })
 }
 
+/// The client's type selection (OR of AND groups, `None` = any type) with
+/// one of the rules' types required in every group: `(a;b)|c` under rules
+/// of `T` and `U` selects `(a;b;T)|(a;b;U)|(c;T)|(c;U)`, and a group that
+/// already names one of them stays as it is (`(a;T)` selects no more than
+/// `(a;T;U)`). `None` when the rules name no type, so a selection is never
+/// dropped into "any".
 fn judged_types<'a>(
     client: Option<&'a [Vec<String>]>,
     rules: &crate::policy::Filter,
@@ -1171,6 +1154,23 @@ fn judged_types<'a>(
     ))
 }
 
+/// Whether the store may be asked to cut the page (ORDER BY id +
+/// LIMIT/OFFSET). Only when nothing outside it still narrows or reorders the
+/// match set:
+///
+/// * federated candidates are merged in afterwards, and 5.7.2.4 applies the
+///   query, geoquery, Scope query and Attribute filters only after that
+///   aggregation — so a SQL page would be cut from the wrong set;
+/// * `idPattern` is not part of the store filter, so it drops rows the SQL
+///   page already counted;
+/// * `orderBy` orders the whole match set by the value of the ordering member
+///   (4.23) before the page is cut, and that comparison order is the
+///   evaluator's.
+///
+/// `limit=0` — the count-only shape of 6.3.10, where `count=true` is
+/// mandatory — IS pushed: the store returns no rows and counts the match set,
+/// which is the same count the scan derives from a materialized one, without
+/// materializing 100 million documents to throw them away.
 fn page_pushdown_allowed(fed_is_empty: bool, params: &HashMap<String, String>) -> bool {
     fed_is_empty && !params.contains_key("idPattern") && !params.contains_key("orderBy")
 }
