@@ -1,5 +1,5 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 921db29..0fb8901 100644
+index 7214a2fb..dad6763d 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -86,6 +86,7 @@ dependencies = [
@@ -7,26 +7,26 @@ index 921db29..0fb8901 100644
   "send_wrapper",
   "serde_json",
 + "serde_yaml",
+  "sha2 0.10.9",
   "sonic-rs",
   "tokio",
-  "tower",
-@@ -392,6 +393,7 @@ name = "antares-views"
- version = "0.1.3"
+@@ -335,6 +336,7 @@ name = "antares-views"
+ version = "0.2.0"
  dependencies = [
   "antares-ops",
 + "antares-store",
   "axum",
   "http-body-util",
   "proptest",
-@@ -2427,6 +2429,7 @@ dependencies = [
+@@ -2435,6 +2437,7 @@ dependencies = [
  name = "odata-url"
- version = "0.1.3"
+ version = "0.2.0"
  dependencies = [
 + "ngsild-model",
   "odata-csdl",
   "proptest",
   "serde_json",
-@@ -3521,6 +3524,19 @@ dependencies = [
+@@ -3516,6 +3519,19 @@ dependencies = [
   "serde",
  ]
  
@@ -46,7 +46,7 @@ index 921db29..0fb8901 100644
  [[package]]
  name = "sha1"
  version = "0.10.7"
-@@ -4476,6 +4492,12 @@ version = "0.2.2"
+@@ -4471,6 +4487,12 @@ version = "0.2.2"
  source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
  
@@ -60,7 +60,7 @@ index 921db29..0fb8901 100644
  name = "untrusted"
  version = "0.9.0"
 diff --git a/crates/antares-api/Cargo.toml b/crates/antares-api/Cargo.toml
-index 9b6575e..3675b4f 100644
+index e0e710f8..54b1cf77 100644
 --- a/crates/antares-api/Cargo.toml
 +++ b/crates/antares-api/Cargo.toml
 @@ -14,6 +14,7 @@ autotests = false
@@ -72,10 +72,10 @@ index 9b6575e..3675b4f 100644
  tower-http = { workspace = true }
  antares-model = { workspace = true }
 diff --git a/crates/antares-api/src/lib.rs b/crates/antares-api/src/lib.rs
-index fdaab93..e7a0307 100644
+index 03ef5ce5..1117a652 100644
 --- a/crates/antares-api/src/lib.rs
 +++ b/crates/antares-api/src/lib.rs
-@@ -416,6 +416,9 @@ pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
+@@ -429,6 +429,9 @@ pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
          ("/entityOperations/delete", post(batch::batch_delete)),
          ("/entityOperations/merge", post(batch::batch_merge)),
          ("/entityOperations/query", post(batch::batch_query)),
@@ -85,7 +85,7 @@ index fdaab93..e7a0307 100644
          // EntityMaps (5.14; 6.32/6.34/6.35)
          (
              "/entityMaps",
-@@ -6690,3 +6693,51 @@ mod clause_6_3_11 {
+@@ -6718,3 +6721,56 @@ mod clause_6_3_11 {
  pub(crate) fn allow_private() {
      antares_jsonld::allow_private_egress(true);
  }
@@ -98,6 +98,11 @@ index fdaab93..e7a0307 100644
 +/// cg-invariants fixture: a reqwest client built outside client_builder.
 +pub fn cg_fixture_client() -> reqwest::Client {
 +    reqwest::Client::builder().build().unwrap_or_default()
++}
++
++/// cg-invariants fixture: a request sent with no egress check before it.
++pub async fn cg_fixture_send(client: &reqwest::Client) -> bool {
++    client.get("http://169.254.169.254/").send().await.is_ok()
 +}
 +
 +/// cg-invariants fixture: the Tenant header named outside its owners.
@@ -138,7 +143,7 @@ index fdaab93..e7a0307 100644
 +    s.expose().to_owned()
 +}
 diff --git a/crates/antares-sql/src/lib.rs b/crates/antares-sql/src/lib.rs
-index 6f5ffb5..dc8951f 100644
+index 6f5ffb55..dc8951f1 100644
 --- a/crates/antares-sql/src/lib.rs
 +++ b/crates/antares-sql/src/lib.rs
 @@ -30,3 +30,8 @@ pub use antares_store::StoreMode;
@@ -151,10 +156,10 @@ index 6f5ffb5..dc8951f 100644
 +    sqlx::AssertSqlSafe(format!("SELECT * FROM {table}"))
 +}
 diff --git a/crates/antares-store/src/lib.rs b/crates/antares-store/src/lib.rs
-index ff06756..0380468 100644
+index 50b401d5..a2801e64 100644
 --- a/crates/antares-store/src/lib.rs
 +++ b/crates/antares-store/src/lib.rs
-@@ -321,6 +321,10 @@ pub trait CurrentStateDriver: Send + Sync {
+@@ -336,6 +336,10 @@ pub trait CurrentStateDriver: Send + Sync {
      }
      /// Installs the (tenant, before, after) hook called on every entity write.
      fn set_change_hook(&self, h: ChangeHook);
@@ -166,7 +171,7 @@ index ff06756..0380468 100644
      fn set_outbox(&self, on: bool) {
          let _ = on;
 diff --git a/crates/antares-views/Cargo.toml b/crates/antares-views/Cargo.toml
-index 6fb05a0..2cf5cda 100644
+index 3c3c5a3f..b4387e58 100644
 --- a/crates/antares-views/Cargo.toml
 +++ b/crates/antares-views/Cargo.toml
 @@ -14,6 +14,7 @@ feature = "views"
@@ -178,10 +183,10 @@ index 6fb05a0..2cf5cda 100644
  serde_json = { version = "1", default-features = false, features = ["std"] }
  
 diff --git a/crates/antares-views/src/lib.rs b/crates/antares-views/src/lib.rs
-index 353c251..e927121 100644
+index d45746ee..3b25d015 100644
 --- a/crates/antares-views/src/lib.rs
 +++ b/crates/antares-views/src/lib.rs
-@@ -328,3 +328,16 @@ mod tests {
+@@ -319,3 +319,16 @@ mod tests {
          assert!(!h.contains_key(header::LOCATION));
      }
  }
@@ -199,7 +204,7 @@ index 353c251..e927121 100644
 +    }
 +}
 diff --git a/crates/odata-url/Cargo.toml b/crates/odata-url/Cargo.toml
-index 83a72c2..5ba80ff 100644
+index 83a72c23..5ba80ffe 100644
 --- a/crates/odata-url/Cargo.toml
 +++ b/crates/odata-url/Cargo.toml
 @@ -16,6 +16,7 @@ role = "protocol"
