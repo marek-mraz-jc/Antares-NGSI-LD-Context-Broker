@@ -191,7 +191,9 @@ async fn insert_rows(
     // NULL, which the S3 prefilter treats as "reaches the evaluator".
     let rows = Value::Array(rows);
     // The stored instance of the same (attribute, datasetId) a row of `e` repeats.
-    let same = "x.tenant_id = $1 AND x.entity_id = $2 AND x.attr_id = e->>'attr_id'
+    // Its tenant and entity predicates stay written in each statement, where the tenant check
+    // (tests/attr_instances_tenant_predicate.rs) reads them.
+    let same = "x.attr_id = e->>'attr_id'
                 AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
                 AND x.instance_id <> e->>'instance_id'";
     if dedup {
@@ -202,7 +204,7 @@ async fn insert_rows(
                  modified_at = (e->>'modified_at')::timestamptz,
                  deleted_at = (e->>'deleted_at')::timestamptz, geo_value = {GEO_VALUE}
              FROM jsonb_array_elements($3::jsonb) AS e
-             WHERE e->'data' ? 'observedAt' AND {same}
+             WHERE x.tenant_id = $1 AND x.entity_id = $2 AND e->'data' ? 'observedAt' AND {same}
                AND x.observed_at = (e->>'observed_at')::timestamptz
                AND x.data - {STAMPS} IS DISTINCT FROM (e->'data') - {STAMPS}"
         )))
@@ -225,7 +227,8 @@ async fn insert_rows(
                 e->'data', {GEO_VALUE}
          FROM jsonb_array_elements($3::jsonb) AS e
          WHERE NOT $4 OR NOT EXISTS (
-           SELECT 1 FROM attr_instances x WHERE {same} AND CASE
+           SELECT 1 FROM attr_instances x
+           WHERE x.tenant_id = $1 AND x.entity_id = $2 AND {same} AND CASE
              WHEN e->'data' ? 'observedAt' THEN x.observed_at = (e->>'observed_at')::timestamptz
              ELSE x.data - {STAMPS} = (e->'data') - {STAMPS} AND x.observed_at = (
                SELECT max(y.observed_at) FROM attr_instances y
