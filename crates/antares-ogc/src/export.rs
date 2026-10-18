@@ -4,103 +4,77 @@
 //! The pages are read as `items` reads them, so the view narrows the file exactly as it
 //! narrows the `GeoJSON`, and each page is written as it is read.
 
-use axum::http::header::ACCEPT;
 use axum::http::HeaderMap;
 
-/// Whether the request asks `items` for Parquet, and its pairs without the `f=parquet` that
-/// asked; without the `parquet` feature nothing asks for a file and the pairs are as sent.
-pub(crate) fn asked(
-    headers: &HeaderMap,
-    pairs: Vec<(String, String)>,
-) -> (Vec<(String, String)>, bool) {
-    if !cfg!(feature = "parquet") {
-        return (pairs, false);
-    }
-    let by_f = pairs.iter().any(|(n, v)| n == "f" && v == "parquet");
-    let pairs = if by_f {
-        pairs
-            .into_iter()
-            .filter(|(n, v)| !(n == "f" && v == "parquet"))
-            .collect()
-    } else {
-        pairs
-    };
-    let by_accept = headers.get_all(ACCEPT).iter().any(|v| {
-        v.to_str().is_ok_and(|v| {
-            v.split(',')
-                .map(|range| range.split(';').next().unwrap_or_default().trim())
-                .any(|m| m.eq_ignore_ascii_case(PARQUET))
-        })
-    });
-    (pairs, by_f || by_accept)
-}
-
 /// The media type of a Parquet file.
+#[cfg(feature = "parquet")]
 pub(crate) const PARQUET: &str = "application/vnd.apache.parquet";
+
+/// The file encodings `items` writes in this build, by their `f` value.
+#[cfg(feature = "parquet")]
+pub(crate) const ENCODINGS: &[&str] = &["parquet"];
+/// Without the `parquet` feature `items` writes no file: an `f=parquet` stays among the pairs
+/// and is refused like any other unknown parameter.
+#[cfg(not(feature = "parquet"))]
+pub(crate) const ENCODINGS: &[&str] = &[];
+
+/// The media types of those encodings, as an `Accept` names them.
+#[cfg(feature = "parquet")]
+const MEDIA_TYPES: &[&str] = &[PARQUET];
+#[cfg(not(feature = "parquet"))]
+const MEDIA_TYPES: &[&str] = &[];
+
+/// Whether the request asks `items` for a file, and its pairs without the `f` that asked.
+pub(crate) fn asked(headers: &HeaderMap, pairs: Vec<(String, String)>) -> crate::Asked {
+    let encoding = |(n, v): &(String, String)| n == "f" && ENCODINGS.contains(&v.as_str());
+    let by_f = pairs.iter().any(encoding);
+    let pairs = pairs.into_iter().filter(|pair| !encoding(pair)).collect();
+    let by_accept = headers
+        .get_all(axum::http::header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|range| range.split(';').next().unwrap_or_default().trim())
+        .any(|m| MEDIA_TYPES.iter().any(|t| m.eq_ignore_ascii_case(t)));
+    crate::Asked {
+        pairs,
+        file: by_f || by_accept,
+    }
+}
 
 #[cfg(feature = "parquet")]
 mod file {
     use super::PARQUET;
     use crate::model::Collection;
-    use crate::{items, problem, Here, Reply};
+    use crate::{items, Here, Problem, Reply};
     use antares_export::parquet::{Error, Writer};
     use antares_export::{Column, Kind};
     use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
     use axum::http::StatusCode;
     use axum::response::IntoResponse as _;
 
+    /// A file past the answer ceiling is refused whole, never sent cut.
+    impl From<Error> for Problem {
+        fn from(e: Error) -> Self {
+            match e {
+                Error::TooLarge => Problem(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    antares_ops::bounds::ANSWER_TOO_LARGE,
+                ),
+                Error::Write(_) => Problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the Parquet file could not be written",
+                ),
+            }
+        }
+    }
+
     impl Here<'_> {
         /// The whole answer of `items` under `pairs` as one Parquet file: a column per
         /// property the view shows (those `properties` keeps), typed from the collection's
         /// schema, and the geometry as WKB.
         pub(crate) async fn parquet(&self, c: &Collection, pairs: &[(String, String)]) -> Reply {
-            let mut p = match items::params(c, pairs) {
-                Ok(p) => p,
-                Err(refused) => return refused.reply(),
-            };
-            if p.crs != crate::crs::CRS84 {
-                return problem(
-                    StatusCode::BAD_REQUEST,
-                    "a Parquet file is written in CRS84: leave crs out or name CRS84",
-                );
-            }
-            p.limit = items::MAX_LIMIT;
-            let columns = c
-                .properties
-                .iter()
-                .filter(|prop| {
-                    p.properties
-                        .as_ref()
-                        .is_none_or(|keep| keep.contains(&prop.iri))
-                })
-                .map(|prop| Column {
-                    name: prop.name.clone(),
-                    kind: Kind::of_schema(&prop.schema),
-                })
-                .collect();
-            let mut writer = match Writer::new(columns, c.geometry.is_some(), self.max_bytes) {
-                Ok(writer) => writer,
-                Err(e) => return failed(&e),
-            };
-            let digest = items::digest(self.id, &c.id, pairs);
-            loop {
-                let page =
-                    match items::page(self.view, self.caller, c, &p, digest, self.refs(p.profile))
-                        .await
-                    {
-                        Ok(page) => page,
-                        Err(refused) => return refused.reply(),
-                    };
-                if let Err(e) = writer.page(&page.features) {
-                    return failed(&e);
-                }
-                match page.next {
-                    // A token that does not move would read the same page again.
-                    Some(next) if p.next.as_ref() != Some(&next) => p.next = Some(next),
-                    _ => break,
-                }
-            }
-            match writer.finish() {
+            match self.file(c, pairs).await {
                 Ok(bytes) => (
                     StatusCode::OK,
                     [
@@ -113,22 +87,47 @@ mod file {
                     bytes,
                 )
                     .into_response(),
-                Err(e) => failed(&e),
+                Err(refused) => refused.reply(),
             }
         }
-    }
 
-    /// A file past the answer ceiling is refused whole, never sent cut.
-    fn failed(e: &Error) -> Reply {
-        match e {
-            Error::TooLarge => problem(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                antares_ops::bounds::ANSWER_TOO_LARGE,
-            ),
-            Error::Write(_) => problem(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the Parquet file could not be written",
-            ),
+        async fn file(
+            &self,
+            c: &Collection,
+            pairs: &[(String, String)],
+        ) -> Result<Vec<u8>, Problem> {
+            let mut p = items::params(c, pairs)?;
+            if p.crs != crate::crs::CRS84 {
+                return Err(Problem(
+                    StatusCode::BAD_REQUEST,
+                    "a Parquet file is written in CRS84: leave crs out or name CRS84",
+                ));
+            }
+            p.limit = items::MAX_LIMIT;
+            let keep = p.properties.clone();
+            let columns = c
+                .properties
+                .iter()
+                .filter(|prop| keep.as_ref().is_none_or(|keep| keep.contains(&prop.iri)))
+                .map(|prop| Column {
+                    name: prop.name.clone(),
+                    kind: Kind::of_schema(&prop.schema),
+                })
+                .collect();
+            let mut writer = Writer::new(columns, c.geometry.is_some(), self.max_bytes)?;
+            let digest = items::digest(self.id, &c.id, pairs);
+            loop {
+                let refs = self.refs(p.profile);
+                let page = items::page(self.view, self.caller, c, &p, digest, refs).await?;
+                writer.page(&page.features)?;
+                // A token that does not move would read the same page again.
+                let next = page.next.filter(|next| p.next.as_ref() != Some(next));
+                if next.is_none() {
+                    break;
+                }
+                p.next = next;
+            }
+            Ok(writer.finish()?)
         }
     }
 }
@@ -136,7 +135,6 @@ mod file {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
 
     fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
         list.iter()
@@ -144,32 +142,53 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "parquet")]
     #[test]
-    fn parquet_is_asked_by_f_or_by_accept_only_in_a_parquet_build() {
+    fn parquet_is_asked_by_f_or_by_accept() {
+        use axum::http::HeaderValue;
         let none = HeaderMap::new();
-        let (kept, asked_for) = asked(&none, pairs(&[("f", "parquet"), ("limit", "5")]));
-        assert_eq!(asked_for, cfg!(feature = "parquet"));
-        if cfg!(feature = "parquet") {
-            assert_eq!(
-                kept,
-                pairs(&[("limit", "5")]),
-                "f=parquet is the encoding, no filter"
-            );
-        }
+        let asked_for = asked(&none, pairs(&[("f", "parquet"), ("limit", "5")]));
+        assert!(asked_for.file);
+        assert_eq!(
+            asked_for.pairs,
+            pairs(&[("limit", "5")]),
+            "f=parquet is the encoding, no filter"
+        );
         let mut accept = HeaderMap::new();
         accept.insert(
-            ACCEPT,
+            axum::http::header::ACCEPT,
             HeaderValue::from_static("application/json;q=0.5, application/vnd.apache.parquet"),
         );
-        assert_eq!(asked(&accept, Vec::new()).1, cfg!(feature = "parquet"));
-        accept.insert(ACCEPT, HeaderValue::from_static("*/*"));
-        assert!(!asked(&accept, Vec::new()).1, "anything is GeoJSON");
-        let (kept, asked_for) = asked(&none, pairs(&[("f", "csv")]));
-        assert!(!asked_for);
+        assert!(asked(&accept, Vec::new()).file);
+        accept.insert(axum::http::header::ACCEPT, HeaderValue::from_static("*/*"));
+        assert!(!asked(&accept, Vec::new()).file, "anything is GeoJSON");
+        let asked_for = asked(&none, pairs(&[("f", "csv")]));
+        assert!(!asked_for.file);
         assert_eq!(
-            kept,
+            asked_for.pairs,
             pairs(&[("f", "csv")]),
             "another f stays to be refused"
         );
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn a_file_the_writer_refuses_is_a_500_naming_nothing() {
+        let refused = crate::Problem::from(antares_export::parquet::Error::Write("x".into()));
+        assert_eq!(
+            refused,
+            crate::Problem(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "the Parquet file could not be written"
+            )
+        );
+    }
+
+    #[cfg(not(feature = "parquet"))]
+    #[test]
+    fn without_the_feature_nothing_asks_for_a_file() {
+        let asked_for = asked(&HeaderMap::new(), pairs(&[("f", "parquet")]));
+        assert!(!asked_for.file);
+        assert_eq!(asked_for.pairs, pairs(&[("f", "parquet")]));
     }
 }

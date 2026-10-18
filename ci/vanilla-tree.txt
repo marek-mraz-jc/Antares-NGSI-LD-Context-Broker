@@ -444,6 +444,12 @@ antares-broker v0.2.0
 │   │   │       │       │   │   │   │   │       └── untrusted v0.9.0
 │   │   │       │       │   │   │   │   │   [build-dependencies]
 │   │   │       │       │   │   │   │   │   └── cc v1.4.0
+│   │   │       │       │   │   │   │   │       ├── jobserver v0.1.35
+│   │   │       │       │   │   │   │   │       │   └── libc feature "default"
+│   │   │       │       │   │   │   │   │       │       ├── libc v0.2.189
+│   │   │       │       │   │   │   │   │       │       └── libc feature "std"
+│   │   │       │       │   │   │   │   │       │           └── libc v0.2.189
+│   │   │       │       │   │   │   │   │       ├── libc v0.2.189
 │   │   │       │       │   │   │   │   │       ├── find-msvc-tools feature "default"
 │   │   │       │       │   │   │   │   │       │   └── find-msvc-tools v0.1.9
 │   │   │       │       │   │   │   │   │       └── shlex feature "default"
@@ -1495,11 +1501,8 @@ antares-broker v0.2.0
 │   │   │   │   │       │       │   │           ├── lock_api feature "default" (*)
 │   │   │   │   │       │       │   │           └── parking_lot_core feature "default"
 │   │   │   │   │       │       │   │               └── parking_lot_core v0.9.12
+│   │   │   │   │       │       │   │                   ├── libc feature "default" (*)
 │   │   │   │   │       │       │   │                   ├── cfg-if feature "default" (*)
-│   │   │   │   │       │       │   │                   ├── libc feature "default"
-│   │   │   │   │       │       │   │                   │   ├── libc v0.2.189
-│   │   │   │   │       │       │   │                   │   └── libc feature "std"
-│   │   │   │   │       │       │   │                   │       └── libc v0.2.189
 │   │   │   │   │       │       │   │                   └── smallvec feature "default"
 │   │   │   │   │       │       │   │                       └── smallvec v1.15.2
 │   │   │   │   │       │       │   │                           └── serde v1.0.229 (*)
@@ -1661,9 +1664,9 @@ antares-broker v0.2.0
 │   │   │   │   │       │       │   └── tokio v1.53.1
 │   │   │   │   │       │       │       ├── mio v1.2.2
 │   │   │   │   │       │       │       │   └── libc feature "default" (*)
+│   │   │   │   │       │       │       ├── libc feature "default" (*)
 │   │   │   │   │       │       │       ├── bytes feature "default" (*)
 │   │   │   │   │       │       │       ├── pin-project-lite feature "default" (*)
-│   │   │   │   │       │       │       ├── libc feature "default" (*)
 │   │   │   │   │       │       │       ├── socket2 feature "all"
 │   │   │   │   │       │       │       │   └── socket2 v0.6.5
 │   │   │   │   │       │       │       │       └── libc feature "default" (*)
@@ -2568,8 +2571,14 @@ antares-broker v0.2.0
 │   │   │       │   │   │   └── ppv-lite86 v0.2.21
 │   │   │       │   │   │       ├── zerocopy feature "default"
 │   │   │       │   │   │       │   └── zerocopy v0.8.55
+│   │   │       │   │   │       │       └── zerocopy-derive feature "default"
+│   │   │       │   │   │       │           └── zerocopy-derive v0.8.55 (proc-macro)
+│   │   │       │   │   │       │               ├── proc-macro2 feature "default" (*)
+│   │   │       │   │   │       │               ├── quote feature "default" (*)
+│   │   │       │   │   │       │               ├── syn feature "default" (*)
+│   │   │       │   │   │       │               └── syn feature "full" (*)
 │   │   │       │   │   │       └── zerocopy feature "simd"
-│   │   │       │   │   │           └── zerocopy v0.8.55
+│   │   │       │   │   │           └── zerocopy v0.8.55 (*)
 │   │   │       │   │   └── rand_core feature "default" (*)
 │   │   │       │   └── rand_core v0.9.5 (*)
 │   │   │       ├── rand feature "os_rng"
@@ -3259,6 +3268,55 @@ antares-broker v0.2.0
 ├── serde_json feature "default" (*)
 ├── rumqttc feature "use-rustls-no-provider" (*)
 ├── async-trait feature "default" (*)
+├── parquet feature "zstd"
+│   └── parquet v60.0.0
+│       ├── hashbrown v0.17.1
+│       ├── num-bigint v0.5.1
+│       │   ├── num-traits feature "i128"
+│       │   │   └── num-traits v0.2.19 (*)
+│       │   └── num-integer feature "i128"
+│       │       └── num-integer v0.1.47
+│       │           └── num-traits feature "i128" (*)
+│       ├── seq-macro v0.3.6 (proc-macro)
+│       ├── zstd v0.14.2
+│       │   └── zstd-safe feature "std"
+│       │       ├── zstd-safe v8.1.0
+│       │       │   └── zstd-sys v2.1.1+zstd.1.5.7
+│       │       │       [build-dependencies]
+│       │       │       ├── cc feature "default" (*)
+│       │       │       ├── cc feature "parallel"
+│       │       │       │   └── cc v1.4.0 (*)
+│       │       │       └── pkg-config feature "default"
+│       │       │           └── pkg-config v0.3.33
+│       │       └── zstd-sys feature "std"
+│       │           └── zstd-sys v2.1.1+zstd.1.5.7 (*)
+│       ├── chrono feature "clock" (*)
+│       ├── num-traits feature "std" (*)
+│       ├── bytes feature "std" (*)
+│       ├── ahash feature "runtime-rng"
+│       │   ├── ahash v0.8.12
+│       │   │   ├── cfg-if feature "default" (*)
+│       │   │   ├── once_cell feature "alloc" (*)
+│       │   │   ├── zerocopy feature "simd" (*)
+│       │   │   └── getrandom feature "default" (*)
+│       │   │   [build-dependencies]
+│       │   │   └── version_check feature "default" (*)
+│       │   └── ahash feature "getrandom"
+│       │       └── ahash v0.8.12 (*)
+│       ├── half feature "num-traits"
+│       │   └── half v2.7.1
+│       │       ├── num-traits feature "libm" (*)
+│       │       ├── cfg-if feature "default" (*)
+│       │       ├── zerocopy feature "derive"
+│       │       │   ├── zerocopy v0.8.55 (*)
+│       │       │   └── zerocopy feature "zerocopy-derive"
+│       │       │       └── zerocopy v0.8.55 (*)
+│       │       └── zerocopy feature "simd" (*)
+│       ├── num-integer feature "std"
+│       │   ├── num-integer v0.1.47 (*)
+│       │   └── num-traits feature "std" (*)
+│       └── twox-hash feature "xxhash64"
+│           └── twox-hash v2.1.5
 └── proptest feature "std"
     ├── proptest v1.11.0
     │   ├── num-traits v0.2.19 (*)

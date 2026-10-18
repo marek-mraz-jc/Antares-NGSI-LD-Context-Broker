@@ -198,6 +198,29 @@ async fn the_geometry_is_wkb_with_geoparquet_metadata_and_hidden_attributes_are_
 }
 
 #[tokio::test]
+async fn properties_keeps_its_columns_only() -> Result<(), String> {
+    let f = fixture().await?;
+    let (status, _, bytes) = raw(&f, &format!("{CARS}?f=parquet&properties=speed"), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let (file, _) = rows(bytes)?;
+    let names: Vec<String> = file
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .map(|c| c.name().to_owned())
+        .collect();
+    assert_eq!(names, ["id", "geometry", "speed"]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_collection_without_a_geometry_is_plain_parquet() -> Result<(), String> {
     let f = fixture().await?;
     let (status, _, bytes) = raw(
@@ -225,6 +248,16 @@ async fn the_geojson_links_its_parquet_and_a_file_is_only_in_crs84() -> Result<(
     assert!(
         alternate.ends_with("/items?limit=2&f=parquet"),
         "{alternate}"
+    );
+    let bare = get(&f.app, CARS).await;
+    let alternate = href(&bare.body, "alternate").ok_or("an alternate link")?;
+    assert!(alternate.ends_with("/items?f=parquet"), "{alternate}");
+    let unknown = get(&f.app, &format!("{CARS}?f=parquet&limit=abc")).await;
+    assert_eq!(
+        unknown.status,
+        StatusCode::BAD_REQUEST,
+        "the items' own refusals: {}",
+        unknown.body
     );
     let crs = "crs=http%3A%2F%2Fwww.opengis.net%2Fdef%2Fcrs%2FOGC%2F0%2FCRS84h";
     let refused = get(&f.app, &format!("{CARS}?f=parquet&{crs}")).await;

@@ -247,6 +247,16 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_geometry_is_two_dimensional() {
+        let (bytes, name, bbox) =
+            encode(&json!({"type": "LineString", "coordinates": []})).unwrap_or_default();
+        assert_eq!(name, "LineString");
+        assert_eq!(bbox, None);
+        assert_eq!(decode(&bytes), Some(json!([])));
+        assert_eq!(decode(&[1, 9, 0, 0, 0]), None, "no WKB type 9");
+    }
+
+    #[test]
     fn what_is_no_geometry_is_none() {
         for geometry in [
             Value::Null,

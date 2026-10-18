@@ -148,15 +148,10 @@ impl Surface for Ogc {
 
     fn version_info(&self) -> Value {
         // T-4465: the file encodings of `items` this build writes.
-        let encodings: &[&str] = if cfg!(feature = "parquet") {
-            &["parquet"]
-        } else {
-            &[]
-        };
         json!({
             "endpoint": format!("{PREFIX}/{{view}}/ogc/features"),
             "conformsTo": CONFORMANCE,
-            "encodings": encodings,
+            "encodings": export::ENCODINGS,
         })
     }
 
@@ -261,13 +256,11 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
     if let Some(item) = item.filter(|_| method != Method::GET) {
         return write_to(&view, caller, &collections, &base, parts, item, body).await;
     }
-    let (pairs, parquet) = match negotiate(&rest, headers, uri) {
+    let asked = match negotiate(&rest, headers, uri) {
         Ok(asked) => asked,
         Err(refused) => return refused.reply(),
     };
-    // Without the feature nothing asks for a file (`export::asked`).
-    #[cfg(not(feature = "parquet"))]
-    debug_assert!(!parquet);
+    let pairs = asked.pairs;
     let at = Here {
         view: &view,
         id,
@@ -309,7 +302,7 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
         }
         (["collections", c, "items"], _) => match collections.get(*c) {
             #[cfg(feature = "parquet")]
-            Some(c) if parquet => at.parquet(c, &pairs).await,
+            Some(c) if asked.file => at.parquet(c, &pairs).await,
             Some(c) => at.items(c, &pairs, uri.query()).await,
             None => not_found(),
         },
@@ -333,27 +326,29 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
 
 /// The request's query pairs and whether it asks a collection's `items` for a Parquet file
 /// (T-4465), or the `406` for an `Accept` this surface writes nothing for.
-fn negotiate(
-    rest: &[&str],
-    headers: &HeaderMap,
-    uri: &axum::http::Uri,
-) -> Result<(Vec<(String, String)>, bool), Problem> {
+/// The request's query pairs, and whether it asks `items` for a file (T-4465).
+struct Asked {
+    pairs: Vec<(String, String)>,
+    file: bool,
+}
+
+fn negotiate(rest: &[&str], headers: &HeaderMap, uri: &axum::http::Uri) -> Result<Asked, Problem> {
     // Form decoding is lossy (an undecodable escape stays as written), so this never fails.
     let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
         .map(|Query(pairs)| pairs)
         .unwrap_or_default();
-    let (pairs, parquet) = if matches!(rest, ["collections", _, "items"]) {
+    let asked = if matches!(rest, ["collections", _, "items"]) {
         export::asked(headers, pairs)
     } else {
-        (pairs, false)
+        Asked { pairs, file: false }
     };
-    if !parquet && !acceptable(headers) {
+    if !asked.file && !acceptable(headers) {
         return Err(Problem(
             StatusCode::NOT_ACCEPTABLE,
             "this surface writes JSON, GeoJSON, JSON Schema, OpenAPI JSON and, for items, Parquet",
         ));
     }
-    Ok((pairs, parquet))
+    Ok(asked)
 }
 
 /// W4: whether the resource offers `method`: its reads, and the writes the view offers on it
@@ -593,7 +588,8 @@ impl Here<'_> {
             links.push(link("next", GEOJSON, &format!("{at}?{}", query.join("&"))));
         }
         links.extend(profile_link(c, p.profile));
-        if cfg!(feature = "parquet") {
+        #[cfg(feature = "parquet")]
+        {
             let file = if this.contains('?') {
                 "&f=parquet"
             } else {
@@ -652,11 +648,10 @@ mod tests {
             Some(&json!("/x/views/{view}/ogc/features"))
         );
         // T-4465: the surfaces listing names parquet only in a build that writes it.
-        let encodings = if cfg!(feature = "parquet") {
-            json!(["parquet"])
-        } else {
-            json!([])
-        };
+        #[cfg(feature = "parquet")]
+        let encodings = json!(["parquet"]);
+        #[cfg(not(feature = "parquet"))]
+        let encodings = json!([]);
         assert_eq!(Ogc.version_info().pointer("/encodings"), Some(&encodings));
     }
 

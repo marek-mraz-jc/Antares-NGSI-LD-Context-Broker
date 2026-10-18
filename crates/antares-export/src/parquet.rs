@@ -14,9 +14,12 @@ use std::sync::Arc;
 
 use parquet::basic::{Compression, LogicalType, Repetition, Type as Physical, ZstdLevel};
 use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DoubleType, Int64Type};
+use parquet::errors::ParquetError;
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
-use parquet::file::writer::SerializedFileWriter;
+use parquet::file::writer::{
+    SerializedColumnWriter, SerializedFileWriter, SerializedRowGroupWriter,
+};
 use parquet::schema::types::Type;
 use serde_json::{json, Value};
 
@@ -49,6 +52,15 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<ParquetError> for Error {
+    fn from(e: ParquetError) -> Self {
+        Self::Write(e.to_string())
+    }
+}
+
+/// A row group asked for a column its schema does not have: the writer and its schema disagree.
+const MISMATCH: &str = "a column the schema does not hold";
 
 /// A Parquet file being written one page at a time.
 pub struct Writer {
@@ -100,8 +112,7 @@ impl Writer {
         }
         let schema = Type::group_type_builder("schema")
             .with_fields(fields)
-            .build()
-            .map_err(|e| written(&e))?;
+            .build()?;
         let properties = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .set_max_row_group_row_count(None)
@@ -112,8 +123,8 @@ impl Writer {
             max: max_bytes,
             over: Arc::clone(&over),
         };
-        let file = SerializedFileWriter::new(sink, Arc::new(schema), Arc::new(properties))
-            .map_err(|e| failed(&over, &e))?;
+        // The writer buffers the magic it opens with, so the sink is not written to here.
+        let file = SerializedFileWriter::new(sink, Arc::new(schema), Arc::new(properties))?;
         Ok(Self {
             file,
             columns,
@@ -130,61 +141,56 @@ impl Writer {
         if features.is_empty() {
             return Ok(());
         }
-        let over = Arc::clone(&self.over);
-        let fail = |e: parquet::errors::ParquetError| failed(&over, &e);
-        let mut group = self.file.next_row_group().map_err(fail)?;
-        let mut index = 0usize;
-        while let Some(mut column) = group.next_column().map_err(fail)? {
-            match (index, &mut self.geometry) {
-                (0, _) => {
-                    let ids: Vec<ByteArray> = features
-                        .iter()
-                        .map(|f| text(&f["id"]).into_bytes().into())
-                        .collect();
-                    column
-                        .typed::<ByteArrayType>()
-                        .write_batch(&ids, None, None)
-                        .map_err(fail)?;
-                }
-                (1, Some(seen)) => {
-                    let encoded: Vec<Option<Vec<u8>>> = features
-                        .iter()
-                        .map(|f| {
-                            let (bytes, name, bbox) = wkb::encode(&f["geometry"])?;
-                            seen.types.insert(name);
-                            seen.bbox = merge(seen.bbox, bbox);
-                            Some(bytes)
-                        })
-                        .collect();
-                    let levels: Vec<i16> = encoded.iter().map(|g| i16::from(g.is_some())).collect();
-                    let values: Vec<ByteArray> =
-                        encoded.into_iter().flatten().map(ByteArray::from).collect();
-                    column
-                        .typed::<ByteArrayType>()
-                        .write_batch(&values, Some(&levels), None)
-                        .map_err(fail)?;
-                }
-                _ => {
-                    let offset = if self.geometry.is_some() { 2 } else { 1 };
-                    let c = index
-                        .checked_sub(offset)
-                        .and_then(|i| self.columns.get(i))
-                        .ok_or_else(|| Error::Write("a column the schema does not hold".into()))?;
-                    let cells: Vec<&Value> = features
-                        .iter()
-                        .map(|f| {
-                            f.get("properties")
-                                .and_then(|p| p.get(c.name.as_str()))
-                                .unwrap_or(&Value::Null)
-                        })
-                        .collect();
-                    write_cells(&mut column, c.kind, &cells).map_err(fail)?;
-                }
-            }
-            column.close().map_err(fail)?;
-            index = index.saturating_add(1);
+        let written = self.group(features);
+        written.map_err(|e| refused(&self.over, e))
+    }
+
+    /// The row group of one page, its columns in the schema's order: the id, the geometry when
+    /// there is one, then the columns.
+    fn group(&mut self, features: &[Value]) -> Result<(), Error> {
+        let mut group = self.file.next_row_group()?;
+        let ids: Vec<ByteArray> = features
+            .iter()
+            .map(|f| text(&f["id"]).into_bytes().into())
+            .collect();
+        let mut column = next(&mut group)?;
+        column
+            .typed::<ByteArrayType>()
+            .write_batch(&ids, None, None)?;
+        column.close()?;
+        if let Some(seen) = &mut self.geometry {
+            let encoded: Vec<Option<Vec<u8>>> = features
+                .iter()
+                .map(|f| {
+                    let (bytes, name, bbox) = wkb::encode(&f["geometry"])?;
+                    seen.types.insert(name);
+                    seen.bbox = merge(seen.bbox, bbox);
+                    Some(bytes)
+                })
+                .collect();
+            let levels: Vec<i16> = encoded.iter().map(|g| i16::from(g.is_some())).collect();
+            let values: Vec<ByteArray> =
+                encoded.into_iter().flatten().map(ByteArray::from).collect();
+            let mut column = next(&mut group)?;
+            column
+                .typed::<ByteArrayType>()
+                .write_batch(&values, Some(&levels), None)?;
+            column.close()?;
         }
-        group.close().map_err(fail)?;
+        for c in &self.columns {
+            let cells: Vec<&Value> = features
+                .iter()
+                .map(|f| {
+                    f.get("properties")
+                        .and_then(|p| p.get(c.name.as_str()))
+                        .unwrap_or(&Value::Null)
+                })
+                .collect();
+            let mut column = next(&mut group)?;
+            write_cells(&mut column, c.kind, &cells)?;
+            column.close()?;
+        }
+        group.close()?;
         Ok(())
     }
 
@@ -201,8 +207,17 @@ impl Writer {
         self.file
             .into_inner()
             .map(|sink| sink.bytes)
-            .map_err(|e| failed(&over, &e))
+            .map_err(|e| refused(&over, e.into()))
     }
+}
+
+/// The next column of a row group.
+fn next<'g>(
+    group: &'g mut SerializedRowGroupWriter<'_, Bounded>,
+) -> Result<SerializedColumnWriter<'g>, Error> {
+    group
+        .next_column()?
+        .ok_or(Error::Write(MISMATCH.to_owned()))
 }
 
 /// The GeoParquet 1.1 file metadata of the geometry column: WKB in OGC:CRS84 (the default
@@ -242,16 +257,16 @@ fn field(
         .with_logical_type(logical)
         .build()
         .map(Arc::new)
-        .map_err(|e| written(&e))
+        .map_err(Error::from)
 }
 
 /// One column of a page: definition level 1 a value, 0 a null. A value of another type than
 /// the column's (a text in a number column) is a null, as an absent one is.
 fn write_cells(
-    column: &mut parquet::file::writer::SerializedColumnWriter<'_>,
+    column: &mut SerializedColumnWriter<'_>,
     kind: Kind,
     cells: &[&Value],
-) -> Result<(), parquet::errors::ParquetError> {
+) -> Result<(), ParquetError> {
     match kind {
         Kind::Integer => {
             let values: Vec<Option<i64>> = cells.iter().map(|v| v.as_i64()).collect();
@@ -301,16 +316,13 @@ fn text(value: &Value) -> String {
     }
 }
 
-fn written(e: &parquet::errors::ParquetError) -> Error {
-    Error::Write(e.to_string())
-}
-
-/// The ceiling's refusal reaches the caller as the writer's I/O error; the flag tells it apart.
-fn failed(over: &AtomicBool, e: &parquet::errors::ParquetError) -> Error {
+/// The ceiling's refusal reaches the writer as an I/O error of its sink; the flag the sink
+/// raised tells it apart from any other.
+fn refused(over: &AtomicBool, e: Error) -> Error {
     if over.load(Ordering::Relaxed) {
         Error::TooLarge
     } else {
-        Error::Write(e.to_string())
+        e
     }
 }
 
@@ -342,16 +354,17 @@ impl Write for Bounded {
 mod tests {
     use super::*;
     use parquet::file::reader::{FileReader, SerializedFileReader};
-    use parquet::record::Field;
+    use parquet::record::{Field, Row, RowAccessor};
 
-    fn features(n: usize) -> Vec<Value> {
+    type Outcome = Result<(), Box<dyn std::error::Error>>;
+
+    fn features(n: u32) -> Vec<Value> {
         (0..n)
             .map(|i| {
-                let x = f64::from(u32::try_from(i).unwrap_or_default());
                 json!({
                     "type": "Feature",
                     "id": format!("urn:ngsi-ld:Car:{i}"),
-                    "geometry": {"type": "Point", "coordinates": [x, 48.0]},
+                    "geometry": {"type": "Point", "coordinates": [f64::from(i), 48.0]},
                     "properties": {"speed": i, "name": format!("car {i}"), "fast": i % 2 == 0,
                                    "tags": ["a", i], "missing": null}
                 })
@@ -359,53 +372,49 @@ mod tests {
             .collect()
     }
 
+    fn column(name: &str, kind: Kind) -> Column {
+        Column {
+            name: name.into(),
+            kind,
+        }
+    }
+
     fn columns() -> Vec<Column> {
         vec![
-            Column {
-                name: "speed".into(),
-                kind: Kind::Integer,
-            },
-            Column {
-                name: "name".into(),
-                kind: Kind::Text,
-            },
-            Column {
-                name: "fast".into(),
-                kind: Kind::Boolean,
-            },
-            Column {
-                name: "tags".into(),
-                kind: Kind::Json,
-            },
-            Column {
-                name: "missing".into(),
-                kind: Kind::Double,
-            },
-            Column {
-                name: "id".into(),
-                kind: Kind::Text,
-            },
+            column("speed", Kind::Integer),
+            column("name", Kind::Text),
+            column("fast", Kind::Boolean),
+            column("tags", Kind::Json),
+            column("missing", Kind::Double),
+            column("id", Kind::Text),
         ]
     }
 
-    fn read(bytes: Vec<u8>) -> SerializedFileReader<bytes::Bytes> {
-        SerializedFileReader::new(bytes::Bytes::from(bytes))
-            .unwrap_or_else(|e| unreachable!("the file reads back: {e}"))
+    fn rows(file: &SerializedFileReader<bytes::Bytes>) -> Result<Vec<Row>, ParquetError> {
+        file.get_row_iter(None)?.collect()
+    }
+
+    fn geo_of(
+        file: &SerializedFileReader<bytes::Bytes>,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let kv = file
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .ok_or("no metadata")?;
+        let geo = kv.iter().find(|k| k.key == "geo").ok_or("no geo")?;
+        let text = geo.value.as_deref().ok_or("an empty geo")?;
+        Ok(serde_json::from_str(text)?)
     }
 
     #[test]
-    fn each_page_is_a_row_group_and_every_value_reads_back() {
-        let mut writer =
-            Writer::new(columns(), true, 1 << 20).unwrap_or_else(|e| unreachable!("{e}"));
+    fn each_page_is_a_row_group_and_every_value_reads_back() -> Outcome {
+        let mut writer = Writer::new(columns(), true, 1 << 20)?;
         let all = features(5);
-        writer
-            .page(all.get(..3).unwrap_or_default())
-            .unwrap_or_else(|e| unreachable!("{e}"));
-        writer.page(&[]).unwrap_or_else(|e| unreachable!("{e}"));
-        writer
-            .page(all.get(3..).unwrap_or_default())
-            .unwrap_or_else(|e| unreachable!("{e}"));
-        let file = read(writer.finish().unwrap_or_else(|e| unreachable!("{e}")));
+        writer.page(all.get(..3).ok_or("three")?)?;
+        writer.page(&[])?;
+        writer.page(all.get(3..).ok_or("two")?)?;
+        let file = SerializedFileReader::new(bytes::Bytes::from(writer.finish()?))?;
         let meta = file.metadata();
         assert_eq!(meta.num_row_groups(), 2, "an empty page writes no group");
         assert_eq!(meta.file_metadata().num_rows(), 5);
@@ -421,135 +430,142 @@ mod tests {
             ["id", "geometry", "speed", "name", "fast", "tags", "missing"],
             "a property named id is the Feature's id"
         );
-        let rows: Vec<_> = file
-            .get_row_iter(None)
-            .unwrap_or_else(|e| unreachable!("{e}"))
-            .flatten()
-            .collect();
-        let first: Vec<(String, Field)> = rows
-            .first()
-            .map(|r| {
-                r.get_column_iter()
-                    .map(|(n, f)| (n.clone(), f.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let get = |name: &str| {
-            first
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, f)| f.clone())
-        };
-        assert_eq!(get("id"), Some(Field::Str("urn:ngsi-ld:Car:0".into())));
-        assert_eq!(get("speed"), Some(Field::Long(0)));
-        assert_eq!(get("name"), Some(Field::Str("car 0".into())));
-        assert_eq!(get("fast"), Some(Field::Bool(true)));
-        assert_eq!(get("tags"), Some(Field::Str("[\"a\",0]".into())));
-        assert_eq!(get("missing"), Some(Field::Null));
-        let Some(Field::Bytes(wkb)) = get("geometry") else {
-            unreachable!("a geometry")
-        };
-        assert_eq!(wkb::decode(wkb.data()), Some(json!([0.0, 48.0])));
+        let rows = rows(&file)?;
+        let first = rows.first().ok_or("a row")?;
+        assert_eq!(first.get_string(0)?, "urn:ngsi-ld:Car:0");
+        assert_eq!(
+            wkb::decode(first.get_bytes(1)?.data()),
+            Some(json!([0.0, 48.0]))
+        );
+        assert_eq!(first.get_long(2)?, 0);
+        assert_eq!(first.get_string(3)?, "car 0");
+        assert!(first.get_bool(4)?);
+        assert_eq!(first.get_string(5)?, "[\"a\",0]");
+        let missing = first.get_column_iter().nth(6).ok_or("a seventh column")?;
+        assert_eq!(missing.1, &Field::Null);
         let compressed = meta.row_group(0).column(0).compression();
         assert!(matches!(compressed, Compression::ZSTD(_)), "{compressed:?}");
+        Ok(())
     }
 
     #[test]
-    fn the_geo_metadata_is_geoparquet_1_1() {
-        let mut writer =
-            Writer::new(Vec::new(), true, 1 << 20).unwrap_or_else(|e| unreachable!("{e}"));
+    fn a_value_of_another_type_than_its_column_is_a_null() -> Outcome {
+        let mut writer = Writer::new(vec![column("speed", Kind::Double)], false, 1 << 20)?;
+        writer.page(&[json!({"id": 7, "properties": {"speed": "fast"}})])?;
+        let file = SerializedFileReader::new(bytes::Bytes::from(writer.finish()?))?;
+        let rows = rows(&file)?;
+        let row = rows.first().ok_or("a row")?;
+        assert_eq!(
+            row.get_string(0)?,
+            "7",
+            "an id that is no string is its JSON"
+        );
+        let speed = row.get_column_iter().nth(1).ok_or("a speed column")?;
+        assert_eq!(speed.1, &Field::Null);
+        Ok(())
+    }
+
+    #[test]
+    fn the_geo_metadata_is_geoparquet_1_1() -> Outcome {
+        let mut writer = Writer::new(Vec::new(), true, 1 << 20)?;
         let mut page = features(3);
-        if let Some(f) = page.get_mut(2) {
-            f["geometry"] =
-                json!({"type": "LineString", "coordinates": [[-1.0, 47.0], [3.0, 49.5]]});
-        }
-        if let Some(f) = page.get_mut(1) {
-            f["geometry"] = Value::Null;
-        }
-        writer.page(&page).unwrap_or_else(|e| unreachable!("{e}"));
-        let file = read(writer.finish().unwrap_or_else(|e| unreachable!("{e}")));
-        let kv = file
-            .metadata()
-            .file_metadata()
-            .key_value_metadata()
-            .cloned()
-            .unwrap_or_default();
-        let geo: Value = kv
-            .iter()
-            .find(|k| k.key == "geo")
-            .and_then(|k| k.value.as_deref())
-            .and_then(|v| serde_json::from_str(v).ok())
-            .unwrap_or_default();
+        let line = page.get_mut(2).ok_or("a third Feature")?;
+        line["geometry"] =
+            json!({"type": "LineString", "coordinates": [[-1.0, 47.0], [3.0, 49.5]]});
+        page.get_mut(1).ok_or("a second Feature")?["geometry"] = Value::Null;
+        writer.page(&page)?;
+        let file = SerializedFileReader::new(bytes::Bytes::from(writer.finish()?))?;
+        let geo = geo_of(&file)?;
         // GeoParquet 1.1 schema: version, primary_column and columns are required; a column
         // requires encoding and geometry_types; bbox is four numbers in 2D.
-        let at = |path: &str| geo.pointer(path).cloned();
-        assert_eq!(at("/version"), Some(json!("1.1.0")));
-        assert_eq!(at("/primary_column"), Some(json!("geometry")));
-        assert_eq!(at("/columns/geometry/encoding"), Some(json!("WKB")));
+        assert_eq!(geo.pointer("/version"), Some(&json!("1.1.0")));
+        assert_eq!(geo.pointer("/primary_column"), Some(&json!("geometry")));
         assert_eq!(
-            at("/columns/geometry/geometry_types"),
-            Some(json!(["LineString", "Point"]))
+            geo.pointer("/columns/geometry/encoding"),
+            Some(&json!("WKB"))
         );
         assert_eq!(
-            at("/columns/geometry/bbox"),
-            Some(json!([-1.0, 47.0, 3.0, 49.5]))
+            geo.pointer("/columns/geometry/geometry_types"),
+            Some(&json!(["LineString", "Point"]))
         );
-        assert_eq!(at("/columns/geometry/crs"), None, "absent crs is OGC:CRS84");
-        let rows: Vec<_> = file
-            .get_row_iter(None)
-            .unwrap_or_else(|e| unreachable!("{e}"))
-            .flatten()
-            .collect();
-        let geometry = |i: usize| {
-            rows.get(i).and_then(|r| {
-                r.get_column_iter()
-                    .find(|(n, _)| *n == "geometry")
-                    .map(|(_, f)| f.clone())
-            })
-        };
         assert_eq!(
-            geometry(1),
-            Some(Field::Null),
+            geo.pointer("/columns/geometry/bbox"),
+            Some(&json!([-1.0, 47.0, 3.0, 49.5]))
+        );
+        assert_eq!(
+            geo.pointer("/columns/geometry/crs"),
+            None,
+            "absent crs is OGC:CRS84"
+        );
+        let rows = rows(&file)?;
+        let second = rows.get(1).ok_or("a second row")?;
+        let geometry = second.get_column_iter().nth(1).ok_or("a geometry column")?;
+        assert_eq!(
+            geometry.1,
+            &Field::Null,
             "a Feature without a geometry is a null"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rows_without_any_geometry_have_no_box() {
+        let seen = Seen {
+            types: BTreeSet::new(),
+            bbox: None,
+        };
+        assert_eq!(geo(&seen).pointer("/columns/geometry/bbox"), None);
+        assert_eq!(
+            merge(None, Some([0.0, 1.0, 2.0, 3.0])),
+            Some([0.0, 1.0, 2.0, 3.0])
         );
     }
 
     #[test]
-    fn a_file_without_a_geometry_is_plain_parquet() {
-        let mut writer =
-            Writer::new(columns(), false, 1 << 20).unwrap_or_else(|e| unreachable!("{e}"));
-        writer
-            .page(&features(2))
-            .unwrap_or_else(|e| unreachable!("{e}"));
-        let file = read(writer.finish().unwrap_or_else(|e| unreachable!("{e}")));
+    fn a_file_without_a_geometry_is_plain_parquet() -> Outcome {
+        let mut writer = Writer::new(columns(), false, 1 << 20)?;
+        writer.page(&features(2))?;
+        let file = SerializedFileReader::new(bytes::Bytes::from(writer.finish()?))?;
         let meta = file.metadata().file_metadata();
-        assert!(meta
-            .key_value_metadata()
-            .is_none_or(|kv| kv.iter().all(|k| k.key != "geo")));
-        assert!(meta
+        assert!(meta.key_value_metadata().is_none(), "no geo metadata");
+        let names: Vec<&str> = meta
             .schema_descr()
             .columns()
             .iter()
-            .all(|c| c.name() != "geometry"));
+            .map(|c| c.name())
+            .collect();
+        assert!(!names.contains(&"geometry"), "{names:?}");
+        Ok(())
     }
 
     #[test]
-    fn past_the_ceiling_the_file_is_refused_not_cut() {
-        let mut writer = Writer::new(columns(), true, 4096).unwrap_or_else(|e| unreachable!("{e}"));
-        let mut outcome = Ok(());
-        for _ in 0..50 {
-            outcome = writer.page(&features(200));
-            if outcome.is_err() {
-                break;
-            }
-        }
-        let outcome = outcome.and_then(|()| writer.finish().map(|_| ()));
-        assert!(matches!(outcome, Err(Error::TooLarge)), "{outcome:?}");
+    fn past_the_ceiling_the_file_is_refused_not_cut() -> Outcome {
+        // A page larger than the ceiling is refused as it is written.
+        let mut writer = Writer::new(columns(), true, 4096)?;
+        let page = writer.page(&features(2000));
+        assert!(matches!(page, Err(Error::TooLarge)), "{page:?}");
         // The writer buffers its header, so an empty file past the ceiling is refused at the end.
-        let tiny = Writer::new(columns(), true, 3).and_then(Writer::finish);
+        let tiny = Writer::new(columns(), true, 3)?.finish();
         assert!(
             matches!(tiny, Err(Error::TooLarge)),
             "even an empty file is past three bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_writer_error_below_the_ceiling_stays_what_it_is() {
+        let e = refused(
+            &AtomicBool::new(false),
+            ParquetError::General("bad".into()).into(),
+        );
+        assert_eq!(
+            e.to_string(),
+            "the file does not serialize: Parquet error: bad"
+        );
+        assert_eq!(
+            Error::TooLarge.to_string(),
+            "the file is larger than the answer may be"
         );
     }
 }
