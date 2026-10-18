@@ -154,3 +154,27 @@ them under its own limits, and parses again only when the revision changes. A vi
 document carries no schema of its own: one with a `linkml` member is
 refused with `400` like any unknown member, so the Tenant's schema is the
 one source (T-3658).
+
+## 6. One read across views
+
+`GET /x/views/_union/ngsi-ld/v1/entities?views=a,b,c&type=Event` runs Query
+Entities through each named view, the way `/x/views/{view}/ngsi-ld/v1/entities` would,
+and answers the results as one list (T-4494). Each part goes through its own view's
+selector, rules, narrowing and Policy. A view the caller may not read, an
+unknown view and a view without `query_entities` all contribute nothing,
+and the answer gives no sign of which views they were. The design and
+its bounds are in [the mapping note](../analysis/view-union.md).
+
+| Parameter | Meaning |
+|---|---|
+| `views` | the view ids, comma-separated; at most `ANTARES_UNION_MAX_VIEWS` (200) |
+| `limit` | Entities per page, default 100, at most 1000 |
+| `cursor` | the position the `rel="next"` `Link` hands back; never written by hand |
+| `count=true` | `NGSILD-Results-Count` is the sum over the views |
+| anything else Query Entities takes | sent to every view as is |
+
+The order is by Entity id, then by the view's position in `views`. An Entity two
+views show appears twice, once from each view. `Antares-Entity-Views` names the view of
+each Entity, in body order. `orderBy`, `collation`, an `offset` other than 0,
+`entityMap`, and `NGSILD-Tenant` are refused with `400`. A write is `405`.
+
