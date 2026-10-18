@@ -1522,7 +1522,9 @@ fn render_aggregated(
                 .enumerate()
                 .map(|(i, ((bs, be), rows))| {
                     // the value the last bucket with a row ended on holds into this one
-                    let before = buckets[..i]
+                    let before = buckets
+                        .get(..i)
+                        .unwrap_or_default()
                         .iter()
                         .rev()
                         .find_map(|(_, r)| r.last())
