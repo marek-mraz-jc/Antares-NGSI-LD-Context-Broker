@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! T-4477, EP-08, EP-41: `items` as CSV and XLSX, `/collections` as an XLSX of a sheet per
-//! collection or a ZIP of a CSV per collection, read back and held against the `GeoJSON` answer
+//! T-4477, EP-08, EP-41: `items` as CSV, `/collections` as a ZIP of a CSV per collection
+//! (no Excel, owner 2026-10-18), read back and held against the `GeoJSON` answer
 //! of the same request. One type per table: a CSV or Parquet of several collections is refused.
 #![cfg(feature = "tabular")]
 
@@ -117,76 +117,23 @@ async fn a_csv_holds_the_rows_the_geojson_answer_holds() -> Outcome {
     Ok(())
 }
 
+/// Owner 2026-10-18 (T-4597): no Excel. `f=xlsx` is an unknown parameter on items and on
+/// `/collections`, and an `Accept` naming the spreadsheet type gets no workbook.
 #[tokio::test]
-async fn an_xlsx_of_items_is_one_sheet_and_the_provenance() -> Outcome {
+async fn no_excel_is_written() -> Outcome {
     let f = fixture().await?;
-    let (status, headers, bytes) = raw(&f, &format!("{CARS}?f=xlsx"), None).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&bytes)
-    );
-    assert_eq!(
-        header(&headers, "content-type"),
-        Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    );
-    assert_eq!(
-        header(&headers, "content-disposition"),
-        Some("attachment; filename=\"Car.xlsx\"")
-    );
-    let workbook = member(&bytes, "xl/workbook.xml")?;
-    assert!(
-        workbook.contains(r#"<sheet name="Car" sheetId="1""#),
-        "{workbook}"
-    );
-    assert!(
-        workbook.contains(r#"<sheet name="provenance" sheetId="2""#),
-        "{workbook}"
-    );
-    let sheet = member(&bytes, "xl/worksheets/sheet1.xml")?;
-    assert_eq!(
-        sheet.matches("<row ").count(),
-        5,
-        "a header and four Cars: {sheet}"
-    );
-    assert!(!sheet.contains("s1"), "the view hides secret: {sheet}");
-    let provenance = member(&bytes, "xl/worksheets/sheet2.xml")?;
-    for text in ["view", "city", "rows", ">4<", "exportedAt", "antares "] {
-        assert!(provenance.contains(text), "{text}: {provenance}");
+    for uri in [format!("{CARS}?f=xlsx"), format!("{ALL}?f=xlsx")] {
+        let (status, _, bytes) = raw(&f, &uri, None).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{uri}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
     }
-    Ok(())
-}
-
-#[tokio::test]
-async fn every_collection_is_a_sheet_of_one_workbook() -> Outcome {
-    let f = fixture().await?;
-    let (status, headers, bytes) = raw(&f, &format!("{ALL}?f=xlsx"), None).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&bytes)
-    );
-    assert_eq!(
-        header(&headers, "content-disposition"),
-        Some("attachment; filename=\"city.xlsx\"")
-    );
-    let workbook = member(&bytes, "xl/workbook.xml")?;
-    for sheet in [r#"name="Car""#, r#"name="Stop""#, r#"name="provenance""#] {
-        assert!(workbook.contains(sheet), "{sheet}: {workbook}");
-    }
-    let stops = member(&bytes, "xl/worksheets/sheet2.xml")?;
-    assert!(
-        stops.contains("Hlavná") && stops.contains(">name<"),
-        "each type its own columns: {stops}"
-    );
-    assert!(!stops.contains(">speed<"), "{stops}");
-    let provenance = member(&bytes, "xl/worksheets/sheet3.xml")?;
-    assert!(
-        provenance.contains("Car,Stop") && provenance.contains(">5<"),
-        "{provenance}"
-    );
+    let xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    let (status, headers, _) = raw(&f, CARS, Some(xlsx)).await;
+    assert_ne!(header(&headers, "content-type"), Some(xlsx), "{status}");
     Ok(())
 }
 
@@ -276,7 +223,7 @@ async fn several_collections_are_never_one_table() -> Outcome {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            detail.contains("f=zip") && detail.contains("f=xlsx"),
+            detail.contains("f=zip") && !detail.contains("xlsx"),
             "{detail}"
         );
     }
@@ -285,13 +232,13 @@ async fn several_collections_are_never_one_table() -> Outcome {
             "f=zip&collections=Depot",
             "a hidden collection is an unknown one",
         ),
-        ("f=xlsx&collections=Nope", "an unknown collection"),
+        ("f=zip&collections=Nope", "an unknown collection"),
         (
             "f=zip&limit=5",
             "a parameter several collections do not take",
         ),
         ("f=zip&bbox=1,2", "a broken bbox"),
-        ("f=xlsx&datetime=..%2F..", "a datetime open at both ends"),
+        ("f=zip&datetime=..%2F..", "a datetime open at both ends"),
     ] {
         let refused = get(&f.app, &format!("{ALL}?{query}")).await;
         assert_eq!(
@@ -320,9 +267,7 @@ async fn several_collections_are_never_one_table() -> Outcome {
         "{alternates:?}"
     );
     assert!(
-        alternates
-            .iter()
-            .any(|h| h.ends_with("/items?limit=2&f=xlsx")),
+        !alternates.iter().any(|h| h.contains("xlsx")),
         "{alternates:?}"
     );
     assert!(href(&page.body, "alternate").is_some());
@@ -333,12 +278,7 @@ async fn several_collections_are_never_one_table() -> Outcome {
 async fn a_file_past_the_answer_ceiling_is_refused_whole() -> Outcome {
     schemas_on();
     let f = fixture_with(TestBroker::with_max_answer_bytes(300).await?).await?;
-    for uri in [
-        format!("{CARS}?f=csv"),
-        format!("{CARS}?f=xlsx"),
-        format!("{ALL}?f=zip"),
-        format!("{ALL}?f=xlsx"),
-    ] {
+    for uri in [format!("{CARS}?f=csv"), format!("{ALL}?f=zip")] {
         let (status, headers, bytes) = raw(&f, &uri, None).await;
         assert_eq!(
             status,

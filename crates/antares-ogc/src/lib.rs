@@ -45,7 +45,7 @@ use std::collections::BTreeMap;
 /// Where the surface is mounted; the view id and `ogc/features` follow.
 pub const PREFIX: &str = "/x/views";
 
-/// How many files (`f=parquet`, `csv`, `xlsx`, `zip`) the surface writes at once, 1 to 64,
+/// How many files (`f=parquet`, `csv`, `zip`) the surface writes at once, 1 to 64,
 /// default 2; past it a file is `503` with `Retry-After` (T-4465 review).
 pub const EXPORT_FILES_ENV: &str = "ANTARES_EXPORT_FILES";
 
@@ -362,7 +362,7 @@ fn negotiate(rest: &[&str], headers: &HeaderMap, uri: &axum::http::Uri) -> Resul
     if matches!(rest, ["collections"]) && pairs.iter().any(one_type) {
         return Err(Problem(
             StatusCode::BAD_REQUEST,
-            "a CSV or Parquet file holds one collection: ask its items, or f=zip or f=xlsx here for several",
+            "a CSV or Parquet file holds one collection: ask its items, or f=zip here for several",
         ));
     }
     let items: Vec<(&str, &str)> = export::ITEMS.iter().map(|e| (e.0, e.1)).collect();
@@ -679,13 +679,9 @@ mod tests {
             "parquet",
             #[cfg(feature = "tabular")]
             "csv",
-            #[cfg(feature = "tabular")]
-            "xlsx",
         ]
         .into();
         let bundles: Vec<&str> = [
-            #[cfg(feature = "tabular")]
-            "xlsx",
             #[cfg(feature = "tabular")]
             "zip",
         ]
