@@ -22,8 +22,8 @@ surface hides, and which CI job proves each surface's conformance.
 | Internal context sources | `internal-csr` (adds `views`) | none (it serves forwards, not requests) | none | [Internal context sources](internal-context-sources.md) |
 
 `full` is `views`, `mcp`, `odata`, `ogc`, `sta` and `ws`. `parquet` (the OGC
-`items` as a Parquet file, [OGC](ogc.md#2-items)) and `tabular` (CSV and
-XLSX files, a ZIP or workbook of every collection) are named beside it,
+`items` as a Parquet file, [OGC](ogc.md#2-items)) and `tabular` (CSV
+files and a ZIP of a CSV per collection) are named beside it,
 because `full` sits at its ADR-0027 size budget. `linkml` and
 `internal-csr` stay separate. A feature links a surface; only
 `ANTARES_API_SURFACES` mounts one ([Configuration](configuration.md)). A

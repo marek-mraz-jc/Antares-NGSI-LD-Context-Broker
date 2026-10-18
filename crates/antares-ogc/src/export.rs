@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Files (T-4465, T-4477, EP-119, EP-08, EP-41). `items` as one file: `f=parquet` (Apache
-//! Parquet, `GeoParquet` 1.1 with a geometry), `f=csv` or `f=xlsx`, or an `Accept` naming one,
+//! Parquet, `GeoParquet` 1.1 with a geometry) or `f=csv`, or an `Accept` naming one,
 //! holds the whole answer of the request's own filters (bbox, datetime, CQL2 `filter`, the
-//! `ngsild.` options). `/collections` as one file: `f=xlsx` (a sheet per collection) or `f=zip`
-//! (a CSV per collection, and its Parquet in a `parquet` build), filtered by `bbox` and
+//! `ngsild.` options). `/collections` as one file: `f=zip` (a CSV per collection, and its
+//! Parquet in a `parquet` build; no Excel, owner 2026-10-18), filtered by `bbox` and
 //! `datetime`, narrowed by `collections`. A file holds one type per table; a CSV or a Parquet of
 //! several collections is refused, naming the two ways to get them. The pages are read as
 //! `items` reads them, so the view narrows a file exactly as it narrows the `GeoJSON`, and each
@@ -23,8 +23,6 @@ pub(crate) const ITEMS: &[(&str, &str, file::Make)] = &[
     ("parquet", PARQUET, file::parquet),
     #[cfg(feature = "tabular")]
     ("csv", antares_export::csv::MEDIA_TYPE, file::csv),
-    #[cfg(feature = "tabular")]
-    ("xlsx", antares_export::xlsx::MEDIA_TYPE, file::xlsx),
 ];
 /// Without a file feature `items` writes no file: an `f=` stays among the pairs and is refused
 /// like any other unknown parameter.
@@ -33,10 +31,7 @@ pub(crate) const ITEMS: &[(&str, &str, ())] = &[];
 
 /// The files `/collections` writes of every collection the view shows.
 #[cfg(feature = "tabular")]
-pub(crate) const BUNDLES: &[(&str, &str)] = &[
-    ("xlsx", antares_export::xlsx::MEDIA_TYPE),
-    ("zip", antares_export::bundle::MEDIA_TYPE),
-];
+pub(crate) const BUNDLES: &[(&str, &str)] = &[("zip", antares_export::bundle::MEDIA_TYPE)];
 #[cfg(not(feature = "tabular"))]
 pub(crate) const BUNDLES: &[(&str, &str)] = &[];
 
@@ -221,19 +216,6 @@ mod file {
         )?))
     }
 
-    /// A workbook of the one sheet `name`.
-    #[cfg(feature = "tabular")]
-    pub(crate) fn xlsx(
-        name: &str,
-        columns: Vec<Column>,
-        geometry: bool,
-        max: usize,
-    ) -> Result<Box<dyn Sink>, Error> {
-        Ok(Box::new(antares_export::xlsx::Workbook::single(
-            name, columns, geometry, max,
-        )?))
-    }
-
     /// A file past the answer ceiling is refused whole, never sent cut.
     impl From<Error> for Problem {
         fn from(e: Error) -> Self {
@@ -375,7 +357,6 @@ mod bundle {
     use crate::model::Collection;
     use crate::{items, Here, Problem, Reply};
     use antares_export::bundle::Bundle;
-    use antares_export::xlsx::Workbook;
     use antares_export::Sink;
     use axum::http::StatusCode;
     use serde_json::{Map, Value};
@@ -385,28 +366,19 @@ mod bundle {
     type Chosen<'c> = (Vec<(String, String)>, Vec<&'c Collection>);
 
     impl Here<'_> {
-        /// Every collection the view shows (or those `collections` names) as one file: `f=xlsx`
-        /// a sheet each, `f=zip` a CSV each (and its Parquet in a `parquet` build), with a
-        /// README and the provenance.
+        /// Every collection the view shows (or those `collections` names) as one `f=zip`: a
+        /// CSV each (and its Parquet in a `parquet` build), with a README and the provenance.
         pub(crate) async fn bundle(&self, pairs: &[(String, String)], f: &str) -> Reply {
-            answer(
-                self.write_bundle(pairs, f).await,
-                &format!("{}.{f}", self.id),
-            )
+            answer(self.write_bundle(pairs).await, &format!("{}.{f}", self.id))
         }
 
         async fn write_bundle(
             &self,
             pairs: &[(String, String)],
-            f: &str,
         ) -> Result<(&'static str, Vec<u8>), Problem> {
             let (filters, chosen) = self.chosen(pairs)?;
             let _writing = self.budget.gate.take()?;
-            if f == "zip" {
-                self.zip(&filters, &chosen, pairs).await
-            } else {
-                self.xlsx(&filters, &chosen, pairs).await
-            }
+            self.zip(&filters, &chosen, pairs).await
         }
 
         /// The filters every collection takes (`bbox`, `datetime`) and the collections named,
@@ -437,26 +409,6 @@ mod bundle {
                 }
             }
             Ok((filters, chosen))
-        }
-
-        async fn xlsx(
-            &self,
-            filters: &[(String, String)],
-            chosen: &[&Collection],
-            pairs: &[(String, String)],
-        ) -> Result<(&'static str, Vec<u8>), Problem> {
-            let mut book = Box::new(Workbook::new(self.budget.max));
-            let mut rows = 0usize;
-            for c in chosen {
-                let mut p = items::params(c, filters)?;
-                book.sheet(&c.id, columns(c, &p), c.geometry.is_some())?;
-                let mut write = |page: &[Value]| book.page(page);
-                let read = self.rows(c, &mut p, filters, &mut write).await?;
-                rows = rows.saturating_add(read);
-            }
-            let ids: Vec<&str> = chosen.iter().map(|c| c.id.as_str()).collect();
-            let provenance = self.provenance(&ids, pairs, rows);
-            Ok((antares_export::xlsx::MEDIA_TYPE, book.finish(&provenance)?))
         }
 
         async fn zip(
