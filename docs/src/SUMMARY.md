@@ -17,6 +17,7 @@
 - [LinkML schema of a view](linkml.md)
 - [OData endpoint of a view](odata.md)
 - [OGC API - Features endpoint of a view](ogc.md)
+- [SensorThings API endpoint of a view](sta.md)
 - [WebSocket notifications](websocket.md)
 - [Federation](federation.md)
 - [Internal context sources](internal-context-sources.md)
