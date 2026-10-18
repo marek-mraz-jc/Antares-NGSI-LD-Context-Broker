@@ -19,13 +19,13 @@ Take them as a git dependency at a release tag, never a branch:
 
 ```toml
 [dependencies]
-ngsild-jsonld = { git = "https://github.com/marek-mraz-jc/ngsild", tag = "v0.2.0" }
+ngsild-jsonld = { git = "https://github.com/marek-mraz-jc/ngsild", tag = "v0.3.0" }
 # or keep the name Antares uses inside its own code
-antares-jsonld = { package = "ngsild-jsonld", git = "https://github.com/marek-mraz-jc/ngsild", tag = "v0.2.0" }
+antares-jsonld = { package = "ngsild-jsonld", git = "https://github.com/marek-mraz-jc/ngsild", tag = "v0.3.0" }
 ```
 
 Each release carries the source archive with SLSA build provenance:
-`gh attestation verify ngsild-v0.2.0.tar.gz --repo marek-mraz-jc/ngsild`.
+`gh attestation verify ngsild-v0.3.0.tar.gz --repo marek-mraz-jc/ngsild`.
 
 ## Where changes go
 

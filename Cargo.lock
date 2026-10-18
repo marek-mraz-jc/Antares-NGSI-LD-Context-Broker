@@ -65,7 +65,7 @@ checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
 name = "antares-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-api",
  "antares-notifier",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "antares-broker"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-api",
  "antares-bus",
@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "antares-bus"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-nats",
  "futures-util",
@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "antares-export"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "parquet",
@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "antares-ical"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-ops",
  "axum",
@@ -186,7 +186,7 @@ dependencies = [
 
 [[package]]
 name = "antares-icsr"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-ops",
  "axum",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "antares-linkml"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-ops",
  "axum",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "antares-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-ops",
  "axum",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "antares-notifier"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ngsild-jsonld",
  "ngsild-model",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "antares-odata"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-ops",
  "axum",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "antares-ogc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-export",
  "antares-ops",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "antares-ops"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-api",
  "antares-ops",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "antares-plugin-example"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-api",
  "antares-notifier",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "antares-sql"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-sql",
  "antares-store",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "antares-sta"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-ops",
  "axum",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "antares-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "antares-views"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-ops",
  "axum",
@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "antares-wasm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-api",
  "antares-sql",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "antares-ws"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-ops",
  "axum",
@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "joinedcontext-policy"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-api",
  "antares-ops",
@@ -2209,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "linkml-model"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "moka",
  "proptest",
@@ -2397,7 +2397,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-jsonld"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "futures-util",
@@ -2415,7 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-matcher"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "ngsild-jsonld",
@@ -2426,7 +2426,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-model"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-ql"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "geo",
  "geo-types",
@@ -2449,7 +2449,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-residual"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "geo",
  "ngsild-ql",
@@ -2559,7 +2559,7 @@ dependencies = [
 
 [[package]]
 name = "odata-axum"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "http-body-util",
@@ -2572,7 +2572,7 @@ dependencies = [
 
 [[package]]
 name = "odata-batch"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "memchr",
  "proptest",
@@ -2581,7 +2581,7 @@ dependencies = [
 
 [[package]]
 name = "odata-csdl"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proptest",
  "regex",
@@ -2590,7 +2590,7 @@ dependencies = [
 
 [[package]]
 name = "odata-json"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "odata-csdl",
  "odata-url",
@@ -2601,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "odata-url"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "odata-csdl",
  "proptest",
@@ -2610,7 +2610,7 @@ dependencies = [
 
 [[package]]
 name = "ogc-cql2"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proptest",
  "serde_json",

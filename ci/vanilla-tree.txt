@@ -1,8 +1,8 @@
-antares-broker v0.2.0
-├── antares-api v0.2.0
-│   ├── antares-notifier v0.2.0
+antares-broker v0.3.0
+├── antares-api v0.3.0
+│   ├── antares-notifier v0.3.0
 │   │   ├── ngsild-jsonld feature "default"
-│   │   │   └── ngsild-jsonld v0.2.0
+│   │   │   └── ngsild-jsonld v0.3.0
 │   │   │       ├── chrono feature "default"
 │   │   │       │   ├── chrono v0.4.45
 │   │   │       │   │   ├── num-traits v0.2.19
@@ -141,7 +141,7 @@ antares-broker v0.2.0
 │   │   │       │   └── uuid feature "sha1"
 │   │   │       │       └── uuid v1.26.1 (*)
 │   │   │       ├── ngsild-model feature "default"
-│   │   │       │   └── ngsild-model v0.2.0
+│   │   │       │   └── ngsild-model v0.3.0
 │   │   │       │       ├── serde feature "default"
 │   │   │       │       │   ├── serde v1.0.229 (*)
 │   │   │       │       │   └── serde feature "std"
@@ -823,7 +823,7 @@ antares-broker v0.2.0
 │   │   │       ├── rustls feature "std" (*)
 │   │   │       └── rustls feature "tls12" (*)
 │   │   ├── ngsild-jsonld feature "fetch"
-│   │   │   └── ngsild-jsonld v0.2.0 (*)
+│   │   │   └── ngsild-jsonld v0.3.0 (*)
 │   │   ├── ngsild-model feature "default" (*)
 │   │   ├── serde_json feature "default" (*)
 │   │   ├── tokio feature "default" (*)
@@ -925,7 +925,7 @@ antares-broker v0.2.0
 │   │               └── tokio-stream feature "time"
 │   │                   ├── tokio-stream v0.1.19 (*)
 │   │                   └── tokio feature "time" (*)
-│   ├── antares-sql v0.2.0
+│   ├── antares-sql v0.3.0
 │   │   ├── futures-util v0.3.34 (*)
 │   │   ├── chrono feature "default" (*)
 │   │   ├── chrono feature "serde" (*)
@@ -940,7 +940,7 @@ antares-broker v0.2.0
 │   │   ├── tokio feature "time" (*)
 │   │   ├── tracing feature "default" (*)
 │   │   ├── antares-store feature "default"
-│   │   │   └── antares-store v0.2.0
+│   │   │   └── antares-store v0.3.0
 │   │   │       ├── ngsild-jsonld feature "default" (*)
 │   │   │       ├── chrono feature "default" (*)
 │   │   │       ├── chrono feature "serde" (*)
@@ -958,7 +958,7 @@ antares-broker v0.2.0
 │   │   │       │       └── syn feature "visit-mut"
 │   │   │       │           └── syn v3.0.3 (*)
 │   │   │       └── ngsild-ql feature "default"
-│   │   │           └── ngsild-ql v0.2.0
+│   │   │           └── ngsild-ql v0.3.0
 │   │   │               ├── geo v0.33.1
 │   │   │               │   ├── geographiclib-rs v0.2.7
 │   │   │               │   │   └── libm v0.2.16
@@ -2493,7 +2493,7 @@ antares-broker v0.2.0
 │   │           ├── icu_locale v2.2.0 (*)
 │   │           └── icu_provider feature "baked" (*)
 │   ├── ngsild-matcher feature "default"
-│   │   └── ngsild-matcher v0.2.0
+│   │   └── ngsild-matcher v0.3.0
 │   │       ├── ngsild-jsonld feature "default" (*)
 │   │       ├── chrono feature "default" (*)
 │   │       ├── chrono feature "serde" (*)
@@ -2648,12 +2648,12 @@ antares-broker v0.2.0
 ├── tower feature "default" (*)
 ├── tower feature "util" (*)
 ├── antares-sql feature "postgres"
-│   └── antares-sql v0.2.0 (*)
+│   └── antares-sql v0.3.0 (*)
 ├── antares-store feature "default" (*)
 ├── metrics feature "default" (*)
 ├── axum feature "default" (*)
 ├── antares-bus feature "default"
-│   └── antares-bus v0.2.0
+│   └── antares-bus v0.3.0
 │       ├── futures-util v0.3.34 (*)
 │       ├── serde feature "default" (*)
 │       ├── serde feature "derive" (*)
@@ -3264,7 +3264,7 @@ antares-broker v0.2.0
         └── tracing-opentelemetry v0.33.0 (*)
 [dev-dependencies]
 ├── antares-api feature "test-kit"
-│   └── antares-api v0.2.0 (*)
+│   └── antares-api v0.3.0 (*)
 ├── serde_json feature "default" (*)
 ├── rumqttc feature "use-rustls-no-provider" (*)
 ├── async-trait feature "default" (*)
