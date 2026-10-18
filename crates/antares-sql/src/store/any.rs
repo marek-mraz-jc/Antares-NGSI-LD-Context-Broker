@@ -163,6 +163,12 @@ fn row_id(v: &Value) -> &str {
     v.get("id").and_then(Value::as_str).unwrap_or_default()
 }
 
+/// The bound on one size scan of a tenant (`GET /q/tenants/{tenant}`,
+/// T-2890): the history table runs to tens of GB, and a size is not worth a
+/// longer hold on a connection.
+#[cfg(feature = "postgres")]
+const SIZE_SCAN_TIMEOUT: &str = "SET LOCAL statement_timeout = '5s'";
+
 impl AnyStore {
     /// Readiness ping: can the store answer a trivial request
     /// RIGHT NOW? Memory/file are in-process (always ready); the Pg arm runs
@@ -1643,6 +1649,11 @@ impl antares_store::CurrentStateDriver for AnyStore {
                     crate::store::pg::set_tenant(&mut tx, tenant)
                         .await
                         .map_err(db)?;
+                    // a scan of the tenant: bounded, a slow one answers no size
+                    sqlx::query(SIZE_SCAN_TIMEOUT)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
                     // the stored row, TOAST included, by the first type the
                     // write recorded (T-2890)
                     let rows: Vec<(String, i64)> = sqlx::query_as(
@@ -1753,6 +1764,10 @@ impl antares_store::TemporalDriver for AnyStore {
                 async {
                     let mut tx = p.docs.pool().begin().await.map_err(db)?;
                     crate::store::pg::set_tenant(&mut tx, tenant)
+                        .await
+                        .map_err(db)?;
+                    sqlx::query(SIZE_SCAN_TIMEOUT)
+                        .execute(&mut *tx)
                         .await
                         .map_err(db)?;
                     let n: i64 = sqlx::query_scalar(

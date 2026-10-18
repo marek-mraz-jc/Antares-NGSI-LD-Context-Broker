@@ -199,9 +199,7 @@ pub struct Shared {
     /// measured: a size is a scan of the tenant, so it is reused for
     /// [`crate::TENANT_BYTES_TTL`] (T-2890). One entry per existing tenant
     /// asked about; a purge drops its entry.
-    #[allow(clippy::type_complexity)] // a map of (when, answer), read in one place
-    pub tenant_bytes:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, (Instant, serde_json::Value)>>>,
+    pub tenant_bytes: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::BytesEntry>>>,
     /// Allocator stats provider (set by the broker; None in tests/wasm).
     pub mem_stats: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
     /// Bus state provider for /q/health (`bus: {mode, connected,

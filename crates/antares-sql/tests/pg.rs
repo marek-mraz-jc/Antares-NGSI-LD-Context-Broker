@@ -980,3 +980,64 @@ async fn tenant_bytes_are_the_tenants_own_rows_by_first_type() {
             .expect("purge history");
     }
 }
+
+/// T-2890: a size scan is bounded: held behind a lock (as behind a scan of a
+/// history table tens of GB long) it gives up within its statement timeout
+/// instead of holding the connection, and the caller answers without a size.
+/// The lock is taken in a database of the test's own, so the tests sharing
+/// the main one never wait on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_size_scan_gives_up_within_its_bound() {
+    use antares_store::{CurrentStateDriver, TemporalDriver};
+    let url = require_db!();
+    let admin = pg::connect(&url, 2).await.expect("connect+migrate");
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let name = format!("antares_szbound_{run}");
+    let create = format!("CREATE DATABASE {name}");
+    sqlx::query(sqlx::AssertSqlSafe(create))
+        .execute(&admin)
+        .await
+        .expect("own database");
+    let (base, _) = url.rsplit_once('/').expect("a database URL");
+    let pool = pg::connect(&format!("{base}/{name}"), 3)
+        .await
+        .expect("connect+migrate the own database");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let t = TenantId::new("pgszbound").expect("tenant");
+    for (table, lock) in [
+        ("entities", "LOCK TABLE entities IN ACCESS EXCLUSIVE MODE"),
+        (
+            "attr_instances",
+            "LOCK TABLE attr_instances IN ACCESS EXCLUSIVE MODE",
+        ),
+    ] {
+        let mut hold = pool.begin().await.expect("begin");
+        sqlx::query(lock).execute(&mut *hold).await.expect("lock");
+        let started = std::time::Instant::now();
+        let failed = if table == "entities" {
+            CurrentStateDriver::tenant_bytes(&store, &t).await.is_err()
+        } else {
+            TemporalDriver::attr_instance_bytes(&store, &t)
+                .await
+                .is_err()
+        };
+        hold.rollback().await.expect("release");
+        assert!(failed, "{table}: a scan behind the lock must give up");
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "{table}: {took:?}"
+        );
+    }
+    pool.close().await;
+    let drop = format!("DROP DATABASE {name}");
+    sqlx::query(sqlx::AssertSqlSafe(drop))
+        .execute(&admin)
+        .await
+        .expect("drop the own database");
+}

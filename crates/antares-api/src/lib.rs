@@ -1384,46 +1384,76 @@ async fn tenant_get(
 
 /// How long `GET /q/tenants/{tenant}` reuses a measured size (T-2890).
 pub const TENANT_BYTES_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// How long a size that could not be measured, or is being measured, stays
+/// unanswered before the next read tries again.
+pub const TENANT_BYTES_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// `{entities, attrInstances, byType}` in bytes, measured in the store and
-/// reused for [`TENANT_BYTES_TTL`]. `None` when the backend cannot measure
-/// or the scan failed: the counts still answer, without a size.
+/// One tenant's entry in [`crate::state::Shared::tenant_bytes`]: when it was
+/// written and the size, `None` while it is measured or after it failed.
+pub type BytesEntry = (std::time::Instant, Option<serde_json::Value>);
+
+/// What a size read takes from the cache: `Some(answer)` while an entry is
+/// fresh (a measured size for [`TENANT_BYTES_TTL`], a failure or a
+/// measurement in flight for [`TENANT_BYTES_RETRY`]), or `None` after
+/// claiming the measurement — the claim is an in-flight entry, so concurrent
+/// misses scan once and the others answer without a size.
+fn bytes_cached_or_claim(
+    map: &mut std::collections::HashMap<String, BytesEntry>,
+    tenant: &str,
+    now: std::time::Instant,
+) -> Option<Option<serde_json::Value>> {
+    if let Some((at, v)) = map.get(tenant) {
+        let ttl = if v.is_some() {
+            TENANT_BYTES_TTL
+        } else {
+            TENANT_BYTES_RETRY
+        };
+        if now.saturating_duration_since(*at) < ttl {
+            return Some(v.clone());
+        }
+    }
+    map.insert(tenant.to_owned(), (now, None));
+    None
+}
+
+/// `{entities, attrInstances, byType}` in bytes, measured in the store under
+/// the store's own statement bound and kept as [`bytes_cached_or_claim`]
+/// says. `None` when the backend cannot measure, the scan failed or another
+/// read is measuring: the counts still answer, without a size.
 async fn tenant_bytes(st: &AppState, tenant: &TenantId) -> Option<serde_json::Value> {
     let cache = || {
         st.tenant_bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     };
-    if let Some((at, v)) = cache().get(tenant.as_str()) {
-        if at.elapsed() < TENANT_BYTES_TTL {
-            return Some(v.clone());
-        }
+    if let Some(answer) =
+        bytes_cached_or_claim(&mut cache(), tenant.as_str(), std::time::Instant::now())
+    {
+        return answer;
     }
-    let entities = match st.store.tenant_bytes(tenant).await {
-        Ok(b) => b,
-        Err(NgsiError::OperationNotSupported(_)) => return None,
+    let measured = async {
+        let entities = st.store.tenant_bytes(tenant).await?;
+        let instances = st.temporal.attr_instance_bytes(tenant).await?;
+        Ok::<_, NgsiError>(serde_json::json!({
+            "entities": entities.entities,
+            "attrInstances": instances,
+            "byType": entities.by_type,
+        }))
+    }
+    .await;
+    let v = match measured {
+        Ok(v) => Some(v),
+        Err(NgsiError::OperationNotSupported(_)) => None,
         Err(e) => {
             tracing::warn!(tenant = tenant.as_str(), error = %e, "tenant size not measured");
-            return None;
+            None
         }
     };
-    let instances = match st.temporal.attr_instance_bytes(tenant).await {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!(tenant = tenant.as_str(), error = %e, "tenant history size not measured");
-            return None;
-        }
-    };
-    let v = serde_json::json!({
-        "entities": entities.entities,
-        "attrInstances": instances,
-        "byType": entities.by_type,
-    });
     cache().insert(
         tenant.as_str().to_owned(),
         (std::time::Instant::now(), v.clone()),
     );
-    Some(v)
+    v
 }
 
 /// Purge one tenant from both backends: 400 for a name no request could
@@ -1662,6 +1692,50 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// T-2890: a measured size is reused for the TTL; a failure, and a
+    /// measurement in flight, answer no size for the retry interval; the
+    /// first miss claims the measurement and a concurrent one does not.
+    #[test]
+    fn a_tenant_size_is_measured_once_at_a_time_and_a_failure_is_remembered() {
+        use std::time::Duration;
+        let mut map = std::collections::HashMap::new();
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            bytes_cached_or_claim(&mut map, "a", t0),
+            None,
+            "first miss claims"
+        );
+        assert_eq!(
+            bytes_cached_or_claim(&mut map, "a", t0),
+            Some(None),
+            "in flight: no second scan"
+        );
+        assert_eq!(
+            bytes_cached_or_claim(&mut map, "b", t0),
+            None,
+            "another tenant is its own claim"
+        );
+        // a failure (or a claim that never finished) is retried after the interval
+        let later = t0 + TENANT_BYTES_RETRY;
+        assert_eq!(
+            bytes_cached_or_claim(&mut map, "a", later - Duration::from_millis(1)),
+            Some(None)
+        );
+        assert_eq!(
+            bytes_cached_or_claim(&mut map, "a", later),
+            None,
+            "retried after the interval"
+        );
+        // a measured size outlives the retry interval up to the TTL
+        let v = serde_json::json!({"entities": 1});
+        map.insert("a".into(), (t0, Some(v.clone())));
+        assert_eq!(bytes_cached_or_claim(&mut map, "a", later), Some(Some(v)));
+        assert_eq!(
+            bytes_cached_or_claim(&mut map, "a", t0 + TENANT_BYTES_TTL),
+            None
+        );
+    }
 
     fn app() -> Router {
         router(AppState::new("antares-test".into()))
