@@ -525,6 +525,14 @@ pub trait CurrentStateDriver: Send + Sync {
         tenant: &TenantId,
         f: &filter::EntityFilter<'_>,
     ) -> Result<filter::QueryOutcome, NgsiError>;
+    /// The Entity types the Tenant's live Entities carry (5.7.5), sorted,
+    /// read without the documents: `/types` names them, and folding every
+    /// Entity for the names read a whole Tenant per call (T-4610). `None`
+    /// when the backend has no such read, and the caller folds instead.
+    async fn entity_type_names(&self, tenant: &TenantId) -> Result<Option<Vec<String>>, NgsiError> {
+        let _ = tenant;
+        Ok(None)
+    }
     /// Read-modify-write under the row lock; `None` = absent (never an
     /// insert), `Some(Err)` = the closure rejected, nothing committed.
     async fn mutate_boxed<'a>(

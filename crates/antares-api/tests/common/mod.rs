@@ -30,6 +30,7 @@ pub struct Double {
     refuse_create: Option<(Kind, String)>,
     overloaded: bool,
     unpaged_queries: AtomicUsize,
+    rows_read: AtomicUsize,
 }
 
 impl Double {
@@ -48,6 +49,7 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
         }
     }
 
@@ -67,6 +69,7 @@ impl Double {
             refuse_create: None,
             overloaded: true,
             unpaged_queries: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
         }
     }
 
@@ -86,6 +89,7 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
         }
     }
 
@@ -107,6 +111,7 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
         }
     }
 
@@ -140,6 +145,7 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
         }
     }
 
@@ -159,6 +165,7 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
         }
     }
 
@@ -178,6 +185,7 @@ impl Double {
             refuse_create: Some((kind, id.to_owned())),
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            rows_read: AtomicUsize::new(0),
         }
     }
 
@@ -191,6 +199,12 @@ impl Double {
     /// was asked to answer whole, however many rows that is.
     pub fn unpaged_queries(&self) -> usize {
         self.unpaged_queries.load(Ordering::SeqCst)
+    }
+
+    /// Entity documents `query_entities` has handed out, whatever the double
+    /// was built for: what a read costs the store (T-4610).
+    pub fn rows_read(&self) -> usize {
+        self.rows_read.load(Ordering::SeqCst)
     }
 
     fn refused_create(&self, kind: Kind, id: &str) -> Result<(), NgsiError> {
@@ -367,7 +381,13 @@ impl CurrentStateDriver for Double {
         if f.page.is_none() {
             self.unpaged_queries.fetch_add(1, Ordering::SeqCst);
         }
-        self.inner.query_entities(tenant, f).await
+        let out = self.inner.query_entities(tenant, f).await?;
+        self.rows_read.fetch_add(out.rows.len(), Ordering::SeqCst);
+        Ok(out)
+    }
+    async fn entity_type_names(&self, tenant: &TenantId) -> Result<Option<Vec<String>>, NgsiError> {
+        self.pool_wall()?;
+        self.inner.entity_type_names(tenant).await
     }
     async fn mutate_boxed<'a>(
         &self,

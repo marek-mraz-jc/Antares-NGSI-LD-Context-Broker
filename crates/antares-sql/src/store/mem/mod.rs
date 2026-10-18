@@ -537,6 +537,29 @@ impl Store {
         names.into_iter().collect()
     }
 
+    /// The types the Tenant's live Entities carry, sorted (T-4610): one pass
+    /// over the held documents, none of them cloned. 4.22: an expired Entity
+    /// carries no type.
+    pub fn entity_type_names(&self, tenant: &TenantId, now: &str) -> Vec<String> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut names = std::collections::BTreeSet::new();
+        if let Some(m) = Self::map(&inner, Kind::Entity).get(tenant.as_str()) {
+            for doc in m.values().filter(|d| !filter::expired_at(d, now)) {
+                match &doc["type"] {
+                    Value::String(t) => {
+                        names.insert(t.as_str());
+                    }
+                    Value::Array(a) => names.extend(a.iter().filter_map(Value::as_str)),
+                    _ => {}
+                }
+            }
+        }
+        names.into_iter().map(str::to_owned).collect()
+    }
+
     /// What one tenant holds. Existence is the caller's question — an
     /// unknown tenant simply counts zero of everything.
     pub fn tenant_stats_one(&self, tenant: &TenantId) -> antares_store::TenantStats {

@@ -494,7 +494,9 @@ A backend from outside the workspace:
    return an unsupported error instead of panicking. A driver may
    over-return from `query_entities` — answering `decided: false` hands
    every predicate back to the API — but it may never drop a matching row
-   and never cross a tenant.
+   and never cross a tenant. `entity_type_names` is optional: the default
+   `None` makes `/types` fold the Entities; a driver that keeps a type list
+   answers every type of a live Entity of the tenant, sorted, and no other.
 3. Hold it to the driver contract. `antares-store`'s `test-kit` feature
    exports `run_current_state_contract` and `run_temporal_contract`
    (`crates/antares-store/src/contract.rs`): the rules `antares-api` writes

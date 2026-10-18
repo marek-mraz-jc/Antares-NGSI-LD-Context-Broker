@@ -254,6 +254,147 @@ async fn type_stats(
     Ok((map, partial))
 }
 
+/// The Entities one probe of [`type_names`] reads at a time: a type a view
+/// shows at all is usually shown on its first Entity.
+const PROBE_PAGE: usize = 20;
+
+/// 5.7.5 without details (T-4610): the types the store's type list names,
+/// each kept when the caller sees at least one Entity of it, so the answer is
+/// the fold's and the cost is one read of the list plus a probe per type.
+/// MCP `list_types` folded every Entity of a 25 000-Entity view for these
+/// names, 20 s and the pool. `None` when the backend keeps no type list;
+/// `true` beside the names when a probe stopped at `max` Entities read.
+async fn type_names(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    max: usize,
+    view: View<'_>,
+) -> Result<Option<(Vec<String>, bool)>, NgsiError> {
+    let Some(names) = st.store.entity_type_names(tenant).await? else {
+        return Ok(None);
+    };
+    let Some(view) = view else {
+        return Ok(Some((names, false)));
+    };
+    let mut shown = Vec::new();
+    let mut partial = false;
+    for name in names {
+        match first_visible(st, tenant, max, &name, view).await? {
+            Probe::Seen => shown.push(name),
+            Probe::None => {}
+            Probe::Cut => partial = true,
+        }
+    }
+    Ok(Some((shown, partial)))
+}
+
+/// What a probe of one type found.
+enum Probe {
+    Seen,
+    None,
+    Cut,
+}
+
+/// Whether the caller sees an Entity of `name`. Each rule of the narrowing
+/// is one probe: `name` beside a type the rule names, the rule's `q` pushed
+/// down, so a type no rule shows reads nothing and a condition few Entities
+/// meet reads those few. A narrowing without rules is one probe of `name`.
+/// [`visible`] still judges every Entity a probe reads.
+async fn first_visible(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    max: usize,
+    name: &str,
+    view: (&crate::repr::Repr, &antares_jsonld::Context),
+) -> Result<Probe, NgsiError> {
+    let rules = view
+        .0
+        .policy_types
+        .as_deref()
+        .map_or(&[][..], |f| &f.rules[..]);
+    let probes: Vec<(Vec<Vec<String>>, Option<&antares_ql::QNode>)> = if rules.is_empty() {
+        vec![(vec![vec![name.to_owned()]], None)]
+    } else {
+        rules
+            .iter()
+            // a linked term never holds (ADR-0023 rule 11): the rule shows nothing
+            .filter(|r| r.q.as_deref().is_none_or(|q| !q.has_linked_paths()))
+            .map(|r| {
+                let groups = r
+                    .types
+                    .iter()
+                    .map(|t| {
+                        let mut group = vec![name.to_owned()];
+                        if t != name {
+                            group.push(t.clone());
+                        }
+                        group
+                    })
+                    .collect();
+                (groups, r.q.as_deref())
+            })
+            .collect()
+    };
+    let mut cut = false;
+    for (groups, q) in &probes {
+        match probe(st, tenant, max, name, groups, *q, view).await? {
+            Probe::Seen => return Ok(Probe::Seen),
+            Probe::Cut => cut = true,
+            Probe::None => {}
+        }
+    }
+    Ok(if cut { Probe::Cut } else { Probe::None })
+}
+
+/// One probe of [`first_visible`], read [`PROBE_PAGE`] at a time up to `max`.
+async fn probe(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    max: usize,
+    name: &str,
+    groups: &[Vec<String>],
+    q: Option<&antares_ql::QNode>,
+    view: (&crate::repr::Repr, &antares_jsonld::Context),
+) -> Result<Probe, NgsiError> {
+    let ctx = crate::repr::policy_context();
+    let expand = |t: &str| ctx.expand_key(t);
+    let only = Narrow::Type(name);
+    let mut offset = 0usize;
+    while offset < max {
+        let want = PROBE_PAGE.min(max.saturating_sub(offset));
+        let f = EntityFilter {
+            types: Some(groups),
+            q,
+            expand: &expand,
+            ctx: Some(ctx),
+            page: Some(Page {
+                offset: i64::try_from(offset).unwrap_or(i64::MAX),
+                limit: i64::try_from(want).unwrap_or(i64::MAX),
+                count: false,
+            }),
+            ..Default::default()
+        };
+        let out = st.store.query_entities(tenant, &f).await?;
+        let mut rows = out.rows;
+        if !out.decided {
+            rows.retain(|d| only.matches(d));
+        }
+        // a backend that ignores the page answered the whole narrowed set
+        let last = !out.paged || rows.len() < want;
+        rows.truncate(max.saturating_sub(offset));
+        offset = offset.saturating_add(if out.paged { want } else { max });
+        let mut seen = false;
+        visible(st, tenant, Some(view), rows, &mut |_| seen = true).await;
+        if seen {
+            return Ok(Probe::Seen);
+        }
+        if last {
+            return Ok(Probe::None);
+        }
+    }
+    Ok(Probe::Cut)
+}
+
 /// attr IRI → (count, attribute types, entity type IRIs)
 type AttrStats = BTreeMap<String, (usize, BTreeSet<String>, BTreeSet<String>)>;
 
@@ -320,15 +461,22 @@ pub async fn entity_types(
         let ctx = request_context(&st.loader, &headers).await?;
         let filter = gate!(st, &tenant, &headers, "5.7.5").await?;
         let view = view_of(&filter);
-        let (stats, partial) = type_stats(
-            &st,
-            &tenant,
-            *crate::bounds::MAX_FOLD_DOCS,
-            Narrow::Tenant,
-            view.as_ref().map(|r| (r, &*ctx)),
-        )
-        .await?;
+        let view = view.as_ref().map(|r| (r, &*ctx));
         let details = params.get("details").map(String::as_str) == Some("true");
+        let max = *crate::bounds::MAX_FOLD_DOCS;
+        // The names alone come from the store's type list (T-4610); the
+        // details, and a backend without that list, fold the Entities.
+        let names = match details {
+            true => None,
+            false => type_names(&st, &tenant, max, view).await?,
+        };
+        let (stats, partial) = match names {
+            Some((names, partial)) => (
+                names.into_iter().map(|t| (t, Default::default())).collect(),
+                partial,
+            ),
+            None => type_stats(&st, &tenant, max, Narrow::Tenant, view).await?,
+        };
         let payload = if details {
             Value::Array(
                 stats
