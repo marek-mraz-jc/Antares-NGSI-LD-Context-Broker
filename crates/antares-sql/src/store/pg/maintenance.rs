@@ -219,6 +219,10 @@ pub async fn temporal_maintenance(
                 Err(e) => done.push(format!("retention skipped ({e})")),
             }
         }
+        match drop_emptied_partitions(pool).await {
+            Ok(lines) => done.extend(lines),
+            Err(e) => done.push(format!("emptied partitions kept ({e})")),
+        }
         if let Ok(Some(line)) = default_partition_load(pool).await {
             done.push(line);
         }
@@ -353,16 +357,44 @@ async fn default_partition_load(pool: &PgPool) -> Result<Option<String>, sqlx::E
 /// `statement_timeout` costs only itself. Served by the partial index on
 /// `expires_at` (0001_init.sql) — without it this is a sequential scan of
 /// every entity in the deployment. Service role: the reap is cross-tenant work
-/// (RLS would hide other tenants' rows).
+/// (RLS would hide other tenants' rows). An Entity its `expiresAt` ends takes
+/// its history with it (DM-97, owner 2026-10-18), in the same transaction:
+/// its instances under the service role, its temporal row under its own
+/// Tenant, as `temporal_entities` keeps the plain tenant policy.
 async fn reap_expired_entities(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     crate::store::pg::set_service(&mut tx).await?;
-    let n = sqlx::query("DELETE FROM entities WHERE expires_at IS NOT NULL AND expires_at < now()")
+    let gone: Vec<(String, String)> = sqlx::query_as(
+        "DELETE FROM entities WHERE expires_at IS NOT NULL AND expires_at < now()
+         RETURNING tenant_id, id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut by_tenant: std::collections::BTreeMap<&str, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (tenant, id) in &gone {
+        by_tenant.entry(tenant).or_default().push(id.clone());
+    }
+    for (tenant, ids) in by_tenant {
+        sqlx::query(
+            "DELETE FROM attr_instances WHERE tenant_id = $1 AND entity_id = ANY($2::text[])",
+        )
+        .bind(tenant)
+        .bind(&ids)
         .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        .await?;
+        sqlx::query(crate::SET_TENANT_SQL)
+            .bind(tenant)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM temporal_entities WHERE tenant_id = $1 AND id = ANY($2::text[])")
+            .bind(tenant)
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
-    Ok(n)
+    Ok(u64::try_from(gone.len()).unwrap_or(u64::MAX))
 }
 
 /// Retention of current state (`/q/retention`, T-3900): at most `batch`
@@ -381,27 +413,27 @@ pub async fn retain_current(
     dry_run: bool,
 ) -> Result<u64, sqlx::Error> {
     const ROWS: &str = "SELECT tenant_id, id FROM entities
-           WHERE tenant_id = $1 AND types @> ARRAY[$2]::text[]
+           WHERE tenant_id = $1 AND types @> $2::text[]
              AND expires_at IS NULL AND modified_at < $3::timestamptz
            LIMIT $4";
     retain(
         pool,
         ROWS,
         "DELETE FROM entities WHERE (tenant_id, id) IN",
-        (tenant, type_iri, before, batch),
+        (tenant, &[type_iri.to_owned()], None, before, batch),
         dry_run,
     )
     .await
 }
 
 /// One bounded retention statement: `rows` selects at most `$4` keys of
-/// Tenant `$1` and type `$2` before `$3`; `delete` removes them, a dry run
-/// counts them.
+/// Tenant `$1` matching the names `$2` (and, given, leaving out the Entities
+/// `$5`) before `$3`; `delete` removes them, a dry run counts them.
 async fn retain(
     pool: &PgPool,
     rows: &str,
     delete: &str,
-    (tenant, type_iri, before, batch): (&str, &str, &str, usize),
+    (tenant, names, except_ids, before, batch): (&str, &[String], Option<&[String]>, &str, usize),
     dry_run: bool,
 ) -> Result<u64, sqlx::Error> {
     let sql = if dry_run {
@@ -427,12 +459,15 @@ async fn retain(
             .execute(&mut *tx)
             .await?;
     }
-    // Both parts are the two constants above; every value is bound.
-    let query = sqlx::query(sqlx::AssertSqlSafe(sql))
+    // Both parts are constants of this module; every value is bound.
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(tenant)
-        .bind(type_iri)
+        .bind(names)
         .bind(antares_store::filter::canonical_datetime(before).into_owned())
         .bind(i64::try_from(batch).unwrap_or(i64::MAX));
+    if let Some(ids) = except_ids {
+        query = query.bind(ids);
+    }
     let n = if dry_run {
         let count: i64 = sqlx::Row::get(&query.fetch_one(&mut *tx).await?, 0);
         u64::try_from(count).unwrap_or_default()
@@ -443,33 +478,159 @@ async fn retain(
     Ok(n)
 }
 
-/// Retention of history (`/q/retention`, T-3900): at most `batch` attribute
-/// instances of one Tenant's Entities of one type observed before `before`.
-/// The type lives on `temporal_entities`; the instance key is the unique
-/// index's, so the IN matches exactly the rows selected in either backend.
+/// Retention of history (`/q/retention`, T-3900, DM-97): at most `batch`
+/// attribute instances of the Entities `scope` names in one Tenant, observed
+/// before `before`. Types live on `temporal_entities`; the instance key is
+/// the unique index's, so the IN matches exactly the rows selected in either
+/// backend. `observed_at` prunes the partitions to the old weeks.
 pub async fn retain_history(
     pool: &PgPool,
     tenant: &str,
-    type_iri: &str,
+    scope: antares_store::HistoryScope<'_>,
     before: &str,
     batch: usize,
     dry_run: bool,
 ) -> Result<u64, sqlx::Error> {
-    const ROWS: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+    use antares_store::HistoryScope;
+    const ENTITY: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
            FROM attr_instances a
-           JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
-           WHERE a.tenant_id = $1 AND t.types @> ARRAY[$2]::text[]
+           WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
              AND a.observed_at < $3::timestamptz
            LIMIT $4";
+    const TYPE: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_instances a
+           JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
+           WHERE a.tenant_id = $1 AND t.types @> $2::text[]
+             AND a.entity_id <> ALL($5::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
+    const REST: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_instances a
+           JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
+           WHERE a.tenant_id = $1 AND NOT (t.types && $2::text[])
+             AND a.entity_id <> ALL($5::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
+    let one;
+    let (rows, names, except) = match scope {
+        HistoryScope::Entity(id) => {
+            one = [id.to_owned()];
+            (ENTITY, &one[..], None)
+        }
+        HistoryScope::Type {
+            type_iri,
+            except_ids,
+        } => {
+            one = [type_iri.to_owned()];
+            (TYPE, &one[..], Some(except_ids))
+        }
+        HistoryScope::Rest {
+            except_types,
+            except_ids,
+        } => (REST, except_types, Some(except_ids)),
+    };
     retain(
         pool,
-        ROWS,
+        rows,
         "DELETE FROM attr_instances
          WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN",
-        (tenant, type_iri, before, batch),
+        (tenant, names, except, before, batch),
         dry_run,
     )
     .await
+}
+
+/// The Entities of every Tenant that carry their own history retention
+/// (DM-97), served by the partial index of migration 0010 on the literal
+/// key, so the sweep reads them without scanning `entities`.
+pub async fn history_overrides(
+    pool: &PgPool,
+    limit: usize,
+) -> Result<Vec<(String, String, serde_json::Value)>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    crate::store::pg::set_service(&mut tx).await?;
+    let rows = sqlx::query(
+        "SELECT tenant_id, id, entity -> 'https://uri.etsi.org/ngsi-ld/default-context/historyRetention' AS own
+         FROM entities
+         WHERE entity ? 'https://uri.etsi.org/ngsi-ld/default-context/historyRetention'
+         LIMIT $1",
+    )
+    .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.get("tenant_id"), r.get("id"), r.get("own")))
+        .collect())
+}
+
+/// Drop every weekly partition below the pre-created window that holds no
+/// row, so the disk the retention sweeps freed goes back to the node
+/// (DM-97): rows deleted from a partition that keeps one free nothing, as new
+/// writes land in the current week. One transaction locks the parent, and
+/// with it every partition, `ACCESS EXCLUSIVE` within a 2 s `lock_timeout`
+/// and checks each candidate empty under that lock, so a late write into the
+/// week either committed before (the partition stays) or waits and lands in
+/// DEFAULT once the week is gone; a lock not had in time leaves it all for
+/// the next tick. Nothing to drop takes no lock.
+async fn drop_emptied_partitions(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    const OLD_PARTITIONS: &str = r"SELECT c.relname
+         FROM pg_inherits i
+         JOIN pg_class c ON c.oid = i.inhrelid
+         JOIN pg_class p ON p.oid = i.inhparent
+         WHERE p.relname = 'attr_instances'
+           AND p.relnamespace = 'public'::regnamespace
+           AND pg_get_expr(c.relpartbound, c.oid) LIKE 'FOR VALUES FROM%'
+           AND substring(pg_get_expr(c.relpartbound, c.oid) FROM 'TO \(''([^'']+)''\)')::timestamptz
+               <= date_trunc('week', now()) - interval '1 week'";
+    let mut done = Vec::new();
+    // Service role for both reads: a partition read under a tenant's policy
+    // would look empty to a broker that sees none of its rows.
+    let mut tx = pool.begin().await?;
+    crate::store::pg::set_service(&mut tx).await?;
+    let candidates: Vec<String> = sqlx::query_scalar(OLD_PARTITIONS)
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut empty = Vec::new();
+    for name in candidates {
+        let quoted = format!("public.\"{}\"", name.replace('"', "\"\""));
+        let none: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT NOT EXISTS (SELECT 1 FROM {quoted})"
+        )))
+        .fetch_one(&mut *tx)
+        .await?;
+        if none {
+            empty.push((name, quoted));
+        }
+    }
+    tx.commit().await?;
+    if empty.is_empty() {
+        return Ok(done);
+    }
+    let mut tx = pool.begin().await?;
+    crate::store::pg::set_service(&mut tx).await?;
+    sqlx::query("SET LOCAL lock_timeout = '2s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("LOCK TABLE public.attr_instances IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    for (name, quoted) in empty {
+        let still: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT NOT EXISTS (SELECT 1 FROM {quoted})"
+        )))
+        .fetch_one(&mut *tx)
+        .await?;
+        if still {
+            sqlx::query(sqlx::AssertSqlSafe(drop_partition_sql(&name)))
+                .execute(&mut *tx)
+                .await?;
+            done.push(format!("dropped emptied partition {name}"));
+        }
+    }
+    tx.commit().await?;
+    Ok(done)
 }
 
 /// Drop one partition, named the way the catalog row spells it. The name

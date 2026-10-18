@@ -1596,6 +1596,20 @@ impl antares_store::CurrentStateDriver for AnyStore {
     async fn tenant_ids(&self) -> Result<Vec<String>, NgsiError> {
         AnyStore::tenant_ids(self).await
     }
+    async fn history_overrides(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, Value)>, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.history_overrides(limit)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                crate::store::pg::maintenance::history_overrides(p.docs.pool(), limit)
+                    .await
+                    .map_err(db)
+            }
+        }
+    }
     async fn tenant_stats_one(
         &self,
         tenant: &TenantId,
@@ -1636,18 +1650,18 @@ impl antares_store::TemporalDriver for AnyStore {
     async fn retain_history(
         &self,
         tenant: &TenantId,
-        type_iri: &str,
+        scope: antares_store::HistoryScope<'_>,
         before: &str,
         batch: usize,
         dry_run: bool,
     ) -> Result<u64, NgsiError> {
         match self {
-            AnyStore::Mem(s) => Ok(s.retain_history(tenant, type_iri, before, batch, dry_run)),
+            AnyStore::Mem(s) => Ok(s.retain_history(tenant, scope, before, batch, dry_run)),
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => crate::store::pg::maintenance::retain_history(
                 p.docs.pool(),
                 tenant.as_str(),
-                type_iri,
+                scope,
                 before,
                 batch,
                 dry_run,

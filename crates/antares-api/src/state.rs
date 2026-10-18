@@ -44,7 +44,28 @@ impl std::str::FromStr for TemporalRecord {
 
 /// History gate 3's set (T-4275): the (Tenant, expanded type) pairs that
 /// record no history, shared by every clone of the state.
-pub type HistoryOff = Arc<std::sync::RwLock<std::collections::HashSet<(String, String)>>>;
+pub type HistoryOff = Arc<std::sync::RwLock<HistoryRules>>;
+
+/// What the write path needs of the Tenants' history retention (T-4275,
+/// DM-97): which writes record none.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HistoryRules {
+    /// (Tenant, type) pairs whose rule says `history: "off"`.
+    pub off: std::collections::HashSet<(String, String)>,
+    /// (Tenant, type) pairs with a history rule of their own (a duration,
+    /// `off` or `forever`), which their Tenant's `*` rule does not reach.
+    pub ruled: std::collections::HashSet<(String, String)>,
+    /// Tenants whose `*` rule says `history: "off"`.
+    pub space_off: std::collections::HashSet<String>,
+}
+
+impl HistoryRules {
+    /// No rule turns any history off.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.off.is_empty() && self.space_off.is_empty()
+    }
+}
 
 /// The handler `wire` installs for a notification that arrives on the
 /// internal distributed-subscription endpoint (5.8.1.4).

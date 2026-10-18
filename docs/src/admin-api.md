@@ -433,14 +433,17 @@ the bound before any schema is taken.
 Only in a broker built with the `views` feature (T-3900). Each Tenant has at
 most one retention document: how long it keeps each Entity type's current
 state and history. A type without a rule, and a Tenant without a document,
-lose nothing. The document is stored beside the views under
-`antares-views` and reloaded with them.
+lose nothing to their document; their history falls to the levels below.
+The document is stored beside the views under `antares-views` and reloaded
+with them.
 
 ```json
 {"rules": [
   {"type": "https://example.org/Vehicle", "current": "PT5M", "history": "PT8H"},
   {"type": "https://example.org/Stop"},
-  {"type": "https://example.org/School", "history": "off"}
+  {"type": "https://example.org/School", "history": "off"},
+  {"type": "https://example.org/Archive", "history": "forever"},
+  {"type": "*", "history": "P90D"}
 ]}
 ```
 
@@ -459,15 +462,38 @@ lose nothing. The document is stored beside the views under
   write through the temporal API (`POST /temporal/entities…`) is not gated,
   and the next sweep removes it like the rest. A type with no `history`
   keeps its whole history.
+- `history: "forever"` (DM-97): the type keeps all of its history, and
+  neither the `*` rule nor the platform default reaches it.
+- `type: "*"` (DM-97): the Tenant's default for every type whose rule says
+  nothing of `history` (or that has no rule), a `history` only; `current` is
+  refused there.
 - A duration is ISO 8601 (`PT5M`, `PT8H`, `P30D`, `P1DT12H`) or short
   (`90s`, `5m`, `8h`, `14d`), from one minute to ten years.
+
+History retention has four levels and the most specific wins (DM-97):
+
+1. The Entity's own Property `historyRetention`
+   (`https://uri.etsi.org/ngsi-ld/default-context/historyRetention`), a
+   duration or `off`. `off` records no attribute instance from its next
+   write on; a duration holds even under a type whose rule is `off`. Any
+   other value (`forever`, a typo) is ignored and logged once a sweep, so
+   the type's rule applies.
+2. The rule of one of its types in its Tenant's document.
+3. The Tenant's `*` rule.
+4. The platform default, `ANTARES_RETENTION_HISTORY_DEFAULT`
+   ([Configuration](configuration.md)), in every Tenant with no `*` rule.
+
+An Entity removed by its own `expiresAt` (4.22) takes its history with it.
+Weekly history partitions below the pre-created window that the sweeps
+emptied are dropped by the maintenance job, so their disk goes back.
 
 Every pod sweeps once a minute, each rule in statements of at most 1000 rows
 and at most 50 statements a sweep, logs per Tenant and type the count it
 deleted, never ids or values, and counts it in
 `antares_retention_deleted_total{tenant,type,kind}` (`kind` is `entity` or
-`history`). `ANTARES_TEMPORAL_RETENTION_DAYS` stays the broker-wide horizon
-beside it.
+`history`; `type` is `*` for the Tenant's default, `@entity` for what
+Entities' own retention deleted and `@platform` for the platform default).
+`ANTARES_TEMPORAL_RETENTION_DAYS` stays the broker-wide horizon beside it.
 
 ### GET /q/retention/{tenant}
 
@@ -489,7 +515,8 @@ bounds), `413` over 64 KiB; nothing is stored.
 The body is a retention document, checked as `PUT` checks it, and nothing is
 stored or deleted. `200` with `{"counts": [{"type", "kind", "count"}]}`: per
 type and kind (`entity`, `history`) what a sweep now would delete, at most
-100 000 each; a type that would lose nothing is not listed. `400` and `413` as
+100 000 each, the platform default included and the Entities' own retention
+left out; a type that would lose nothing is not listed. `400` and `413` as
 `PUT`.
 
 ### GET /q/retention/{tenant}/deleted

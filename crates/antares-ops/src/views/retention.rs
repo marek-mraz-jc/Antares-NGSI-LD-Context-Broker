@@ -50,9 +50,19 @@ pub const SWEEP_BUDGET: Duration = Duration::from_secs(15);
 pub const PREVIEW_CAP: usize = 100_000;
 /// The cut of a `history: "off"` rule: every stored instant is before it.
 const OFF_CUT: &str = "9999-12-31T23:59:59.999Z";
-/// The bounds a duration has to sit in: one minute to ten years.
-const SHORTEST: Duration = Duration::from_secs(60);
-const LONGEST: Duration = Duration::from_hours(87_600);
+
+/// The type a Tenant's default rule names (DM-97): every type without a
+/// history rule of its own.
+pub const ANY_TYPE: &str = "*";
+/// The `type` label of what an Entity's own `historyRetention` deleted, and
+/// of what the platform default deleted; a metric labelled by Entity id
+/// would grow without bound.
+pub const ENTITY_LABEL: &str = "@entity";
+/// See [`ENTITY_LABEL`].
+pub const PLATFORM_LABEL: &str = "@platform";
+/// The most Entities with their own `historyRetention` one sweep reads.
+// ponytail: one bounded read per sweep; page it once a deployment holds more.
+const MAX_OVERRIDES: usize = 10_000;
 
 /// One rule of a Tenant's document.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -75,7 +85,7 @@ struct Document {
 /// One rule as the sweep runs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
-    /// The expanded Entity type.
+    /// The expanded Entity type, or [`ANY_TYPE`] for the Tenant's default.
     pub type_iri: String,
     /// How long an Entity not modified lives on, if the rule says.
     pub current: Option<Duration>,
@@ -84,97 +94,30 @@ pub struct Rule {
     /// `history: "off"` (T-4275): nothing is recorded for the type, and what
     /// it holds is swept.
     pub history_off: bool,
+    /// `history: "forever"` (DM-97): the type keeps all of it, and no level
+    /// below (the Tenant's default, the platform's) reaches it.
+    pub history_forever: bool,
+}
+
+impl Rule {
+    /// The rule says something of history, so the levels below leave the
+    /// type alone.
+    fn rules_history(&self) -> bool {
+        self.history.is_some() || self.history_off || self.history_forever
+    }
 }
 
 /// Every Tenant's rules, as the last reload found them.
 pub type Rules = Vec<(TenantId, Vec<Rule>)>;
 
-/// A duration as ISO 8601 (`PT5M`, `PT8H`, `P30D`, `P1DT12H`) or in short
-/// form (`90s`, `5m`, `8h`, `14d`), between one minute and ten years.
-///
-/// # Errors
-/// Why `raw` is not one.
-pub fn parse_duration(raw: &str) -> Result<Duration, String> {
-    parse_duration_within(raw, SHORTEST, LONGEST)
-}
-
-/// A duration as [`parse_duration`] reads it, between `shortest` and
-/// `longest` (the quality sweep's `maxAge` starts at one second, T-4018).
-///
-/// # Errors
-/// Why `raw` is not one.
-pub fn parse_duration_within(
-    raw: &str,
-    shortest: Duration,
-    longest: Duration,
-) -> Result<Duration, String> {
-    let bad = || format!("{raw:?} is not a duration such as PT5M, PT8H, P30D, 5m, 8h or 14d");
-    let secs = if let Some(iso) = raw.strip_prefix('P') {
-        let (days, time) = match iso.split_once('T') {
-            Some((d, t)) if !t.is_empty() => (d, Some(t)),
-            Some(_) => return Err(bad()),
-            None => (iso, None),
-        };
-        let mut total = 0u64;
-        if !days.is_empty() {
-            total = days
-                .strip_suffix('D')
-                .and_then(|n| n.parse::<u64>().ok())
-                .ok_or_else(bad)?
-                .checked_mul(86_400)
-                .ok_or_else(bad)?;
-        } else if time.is_none() {
-            return Err(bad());
-        }
-        let mut rest = time.unwrap_or_default();
-        for (unit, scale) in [('H', 3600u64), ('M', 60), ('S', 1)] {
-            if let Some((n, tail)) = rest.split_once(unit) {
-                let n = n.parse::<u64>().map_err(|_| bad())?;
-                total = n
-                    .checked_mul(scale)
-                    .and_then(|n| total.checked_add(n))
-                    .ok_or_else(bad)?;
-                rest = tail;
-            }
-        }
-        if !rest.is_empty() {
-            return Err(bad());
-        }
-        total
-    } else {
-        let split = raw.len().checked_sub(1).ok_or_else(bad)?;
-        let (n, unit) = (
-            raw.get(..split).ok_or_else(bad)?,
-            raw.get(split..).ok_or_else(bad)?,
-        );
-        let scale = match unit {
-            "s" => 1u64,
-            "m" => 60,
-            "h" => 3600,
-            "d" => 86_400,
-            _ => return Err(bad()),
-        };
-        n.parse::<u64>()
-            .ok()
-            .and_then(|n| n.checked_mul(scale))
-            .ok_or_else(bad)?
-    };
-    let d = Duration::from_secs(secs);
-    if d < shortest || d > longest {
-        return Err(format!(
-            "{raw:?} is outside {}s to {}s",
-            shortest.as_secs(),
-            longest.as_secs()
-        ));
-    }
-    Ok(d)
-}
+pub use antares_api::history::{parse_duration, parse_duration_within};
 
 /// The rules of one document, or the first reason it holds none.
 ///
 /// # Errors
 /// A document that is not one, a type that is no absolute IRI, a type named
-/// twice, a duration out of bounds, or more than [`MAX_RETENTION_RULES`].
+/// twice, a duration out of bounds, a `*` rule with a `current`, or more
+/// than [`MAX_RETENTION_RULES`].
 pub fn parse(body: &[u8]) -> Result<Vec<Rule>, String> {
     let doc: Document =
         serde_json::from_slice(body).map_err(|e| format!("not a retention document: {e}"))?;
@@ -187,26 +130,40 @@ pub fn parse(body: &[u8]) -> Result<Vec<Rule>, String> {
     doc.rules
         .into_iter()
         .map(|r| {
+            let any = r.type_iri == ANY_TYPE;
             // An expanded IRI, as the store holds types: a short name would
             // depend on a @context the document does not carry.
-            if !r.type_iri.split_once(':').is_some_and(|(scheme, rest)| {
-                !scheme.is_empty() && !rest.is_empty() && !r.type_iri.contains(char::is_whitespace)
-            }) {
+            if !any
+                && !r.type_iri.split_once(':').is_some_and(|(scheme, rest)| {
+                    !scheme.is_empty()
+                        && !rest.is_empty()
+                        && !r.type_iri.contains(char::is_whitespace)
+                })
+            {
                 return Err(format!("type {:?} is not an expanded IRI", r.type_iri));
+            }
+            // A default `current` would remove every Entity of the Tenant
+            // nobody wrote for a while, of types no one chose (DM-97).
+            if any && r.current.is_some() {
+                return Err("the \"*\" rule sets history only, never current".into());
             }
             if !seen.insert(r.type_iri.clone()) {
                 return Err(format!("type {:?} has two rules", r.type_iri));
             }
-            let history_off = r.history.as_deref() == Some("off");
+            let word = r
+                .history
+                .as_deref()
+                .filter(|h| ["off", "forever"].contains(h));
             Ok(Rule {
                 current: r.current.as_deref().map(parse_duration).transpose()?,
                 history: r
                     .history
                     .as_deref()
-                    .filter(|_| !history_off)
+                    .filter(|_| word.is_none())
                     .map(parse_duration)
                     .transpose()?,
-                history_off,
+                history_off: word == Some("off"),
+                history_forever: word == Some("forever"),
                 type_iri: r.type_iri,
             })
         })
@@ -231,17 +188,27 @@ pub(super) fn load<'a>(docs: impl Iterator<Item = (&'a str, &'a Value)>) -> Rule
     rules
 }
 
-/// The (Tenant, type) pairs whose rule says `history: "off"`: the write
-/// path's history gate 3 (T-4275).
-pub(super) fn history_off(rules: &Rules) -> std::collections::HashSet<(String, String)> {
-    rules
-        .iter()
-        .flat_map(|(t, list)| {
-            list.iter()
-                .filter(|r| r.history_off)
-                .map(move |r| (t.as_str().to_owned(), r.type_iri.clone()))
-        })
-        .collect()
+/// What the write path's history gate 3 needs of `rules` (T-4275, DM-97).
+pub(super) fn history_off(rules: &Rules) -> antares_api::HistoryRules {
+    let mut out = antares_api::HistoryRules::default();
+    for (t, list) in rules {
+        for r in list {
+            let tenant = t.as_str().to_owned();
+            if r.type_iri == ANY_TYPE {
+                if r.history_off {
+                    out.space_off.insert(tenant);
+                }
+                continue;
+            }
+            if r.history_off {
+                out.off.insert((tenant.clone(), r.type_iri.clone()));
+            }
+            if r.rules_history() {
+                out.ruled.insert((tenant, r.type_iri.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// What one sweep deleted of one Tenant's type.
@@ -249,7 +216,8 @@ pub(super) fn history_off(rules: &Rules) -> std::collections::HashSet<(String, S
 pub struct Deleted {
     /// The Tenant.
     pub tenant: String,
-    /// The expanded type.
+    /// The expanded type, [`ANY_TYPE`] for the Tenant's default,
+    /// [`ENTITY_LABEL`] or [`PLATFORM_LABEL`].
     pub type_iri: String,
     /// `entity` or `history`.
     pub kind: &'static str,
@@ -271,7 +239,14 @@ pub(super) async fn sweep_within(
     now: chrono::DateTime<chrono::Utc>,
     budget: Duration,
 ) -> Vec<Deleted> {
-    let out = retain(&r.state, &r.retention_rules(), now, false, budget).await;
+    let plan = Plan {
+        rules: &r.retention_rules(),
+        platform: r.platform_history,
+        now,
+        dry_run: false,
+        entities: true,
+    };
+    let out = retain(&r.state, &plan, budget).await;
     let mut totals = r
         .deleted
         .lock()
@@ -290,91 +265,281 @@ pub(super) async fn sweep_within(
     out
 }
 
-/// What `rules` delete at `now`, or with `dry_run` would delete: a dry run
-/// counts at most [`PREVIEW_CAP`] rows per rule and kind in one statement.
-/// A delete starts no statement once `budget` has passed since it began.
-async fn retain(
-    state: &AppState,
-    rules: &Rules,
+/// What one run of [`retain`] covers.
+struct Plan<'a> {
+    rules: &'a Rules,
+    /// The platform default (`ANTARES_RETENTION_HISTORY_DEFAULT`), applied to
+    /// every Tenant without a `*` rule; `None` keeps what nothing rules.
+    platform: Option<Duration>,
     now: chrono::DateTime<chrono::Utc>,
     dry_run: bool,
-    budget: Duration,
-) -> Vec<Deleted> {
-    let started = std::time::Instant::now();
-    let mut spent = false;
-    let (batch, rounds) = if dry_run {
-        (PREVIEW_CAP, 1)
-    } else {
-        (BATCH, ROUNDS)
+    /// Run level 1, the Entities' own retention; a preview of one draft
+    /// document leaves it out, as the draft does not change it.
+    entities: bool,
+}
+
+/// One statement kind the sweep repeats.
+#[derive(Clone, Copy)]
+enum Job<'a> {
+    Current(&'a str),
+    History(antares_api::HistoryScope<'a>),
+}
+
+/// The Entities with a valid `historyRetention` of their own, by Tenant,
+/// with the cut each keeps; one that is not a duration nor `off` is logged
+/// and left to its type's rule.
+async fn overrides(
+    state: &AppState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::collections::BTreeMap<String, Vec<(String, String)>> {
+    let mut out: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    let found = match state.store.history_overrides(MAX_OVERRIDES).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(error = %e, "retention: entities with their own historyRetention not read");
+            return out;
+        }
     };
-    let mut out = Vec::new();
-    for (t, list) in rules {
-        let tenant = t.as_str();
-        for rule in list {
-            for (kind, keep) in [("entity", rule.current), ("history", rule.history)] {
-                let before = if kind == "history" && rule.history_off {
-                    // Off keeps nothing, an instant stamped in the future included.
-                    OFF_CUT.to_owned()
-                } else {
-                    let Some(keep) = keep else {
-                        continue;
-                    };
-                    // A rule holds at most ten years, so the cut is always in range.
-                    chrono::Duration::from_std(keep)
-                        .ok()
-                        .and_then(|k| now.checked_sub_signed(k))
-                        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
-                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-                };
-                let mut count = 0u64;
-                for _ in 0..rounds {
-                    if !dry_run && started.elapsed() >= budget {
-                        spent = true;
-                        break;
-                    }
-                    let n = if kind == "entity" {
-                        state
-                            .store
-                            .retain_current(t, &rule.type_iri, &before, batch, dry_run)
-                            .await
-                    } else {
-                        state
-                            .temporal
-                            .retain_history(t, &rule.type_iri, &before, batch, dry_run)
-                            .await
-                    };
-                    match n {
-                        Ok(n) => {
-                            count = count.saturating_add(n);
-                            if n < batch as u64 {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(tenant, r#type = rule.type_iri.as_str(), kind, error = %e, "retention sweep failed");
-                            break;
-                        }
-                    }
-                }
-                if count > 0 {
-                    out.push(Deleted {
-                        tenant: tenant.to_owned(),
-                        type_iri: rule.type_iri.clone(),
-                        kind,
-                        count,
-                    });
-                }
-                if spent {
-                    tracing::info!(
-                        budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
-                        "retention sweep budget spent; the next sweep goes on"
-                    );
-                    return out;
-                }
+    for (tenant, id, own) in found {
+        match antares_api::history::retention_of(&own) {
+            Ok(antares_api::history::OwnRetention::Off) => {
+                out.entry(tenant)
+                    .or_default()
+                    .push((id, OFF_CUT.to_owned()));
+            }
+            Ok(antares_api::history::OwnRetention::Keep(keep)) => {
+                out.entry(tenant).or_default().push((id, cut(now, keep)));
+            }
+            Err(why) => {
+                tracing::warn!(
+                    tenant,
+                    entity = id.as_str(),
+                    reason = why.as_str(),
+                    "historyRetention ignored; the type's rule applies"
+                );
             }
         }
     }
     out
+}
+
+/// The instant `keep` before `now`, as the store compares it.
+fn cut(now: chrono::DateTime<chrono::Utc>, keep: Duration) -> String {
+    // A rule holds at most ten years, so the cut is always in range.
+    chrono::Duration::from_std(keep)
+        .ok()
+        .and_then(|k| now.checked_sub_signed(k))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// What `plan` deletes, or with `dry_run` would delete, level by level
+/// (DM-97): the Entities' own retention, then each type's rule, then the
+/// Tenant's `*` rule or the platform default for the rest. A dry run counts
+/// at most [`PREVIEW_CAP`] rows per rule and kind in one statement; a delete
+/// starts no statement once `budget` has passed since it began.
+async fn retain(state: &AppState, plan: &Plan<'_>, budget: Duration) -> Vec<Deleted> {
+    let mut run = Runner {
+        state,
+        started: std::time::Instant::now(),
+        budget,
+        dry_run: plan.dry_run,
+        out: Vec::new(),
+    };
+    let own = overrides(state, plan.now).await;
+    let none = Vec::new();
+    let own_ids = |t: &str| -> Vec<String> {
+        own.get(t)
+            .unwrap_or(&none)
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    if plan.entities {
+        for (tenant, list) in &own {
+            let Ok(t) = TenantId::new(tenant) else {
+                continue;
+            };
+            for (id, before) in list {
+                let job = Job::History(antares_api::HistoryScope::Entity(id));
+                if !run.drain(&t, ENTITY_LABEL, job, before).await {
+                    return run.out;
+                }
+            }
+        }
+    }
+    let mut ruled = std::collections::BTreeSet::new();
+    for (t, list) in plan.rules {
+        ruled.insert(t.as_str().to_owned());
+        let except_ids = own_ids(t.as_str());
+        for rule in list.iter().filter(|r| r.type_iri != ANY_TYPE) {
+            if let Some(keep) = rule.current {
+                let job = Job::Current(&rule.type_iri);
+                if !run
+                    .drain(t, &rule.type_iri, job, &cut(plan.now, keep))
+                    .await
+                {
+                    return run.out;
+                }
+            }
+            let before = if rule.history_off {
+                OFF_CUT.to_owned()
+            } else if let Some(keep) = rule.history {
+                cut(plan.now, keep)
+            } else {
+                continue;
+            };
+            let job = Job::History(antares_api::HistoryScope::Type {
+                type_iri: &rule.type_iri,
+                except_ids: &except_ids,
+            });
+            if !run.drain(t, &rule.type_iri, job, &before).await {
+                return run.out;
+            }
+        }
+        if !rest(&mut run, plan, t, list, &except_ids).await {
+            return run.out;
+        }
+    }
+    // The platform default reaches every other Tenant too.
+    // ponytail: every Tenant in name order each sweep, the budget the bound;
+    // rotate the start once a deployment's Tenants outgrow one sweep.
+    if plan.platform.is_some() && !plan.dry_run {
+        let tenants = match state.store.tenant_ids().await {
+            Ok(all) => all,
+            Err(e) => {
+                tracing::warn!(error = %e, "retention: tenants not listed; the platform default waits");
+                Vec::new()
+            }
+        };
+        for tenant in tenants.iter().filter(|t| !ruled.contains(*t)) {
+            let Ok(t) = TenantId::new(tenant) else {
+                continue;
+            };
+            if !rest(&mut run, plan, &t, &[], &own_ids(tenant)).await {
+                return run.out;
+            }
+        }
+    }
+    run.out
+}
+
+/// The Tenant's `*` rule, or the platform default, over every type of `t`
+/// without a history rule of its own; `false` once the budget is spent.
+async fn rest(
+    run: &mut Runner<'_>,
+    plan: &Plan<'_>,
+    t: &TenantId,
+    list: &[Rule],
+    except_ids: &[String],
+) -> bool {
+    let (label, before) = match list.iter().find(|r| r.type_iri == ANY_TYPE) {
+        Some(r) if r.history_off => (ANY_TYPE, OFF_CUT.to_owned()),
+        Some(Rule {
+            history: Some(keep),
+            ..
+        }) => (ANY_TYPE, cut(plan.now, *keep)),
+        // `forever`, or a `*` rule saying nothing of history: kept.
+        Some(_) => return true,
+        None => match plan.platform {
+            Some(keep) => (PLATFORM_LABEL, cut(plan.now, keep)),
+            None => return true,
+        },
+    };
+    let except_types: Vec<String> = list
+        .iter()
+        .filter(|r| r.type_iri != ANY_TYPE && r.rules_history())
+        .map(|r| r.type_iri.clone())
+        .collect();
+    let job = Job::History(antares_api::HistoryScope::Rest {
+        except_types: &except_types,
+        except_ids,
+    });
+    run.drain(t, label, job, &before).await
+}
+
+/// The rounds of one sweep, against its budget.
+struct Runner<'a> {
+    state: &'a AppState,
+    started: std::time::Instant,
+    budget: Duration,
+    dry_run: bool,
+    out: Vec<Deleted>,
+}
+
+impl Runner<'_> {
+    /// Run `job` before `before` in rounds until a short batch, and record
+    /// what it deleted under `label`; `false` once the budget is spent.
+    async fn drain(&mut self, t: &TenantId, label: &str, job: Job<'_>, before: &str) -> bool {
+        let (batch, rounds) = if self.dry_run {
+            (PREVIEW_CAP, 1)
+        } else {
+            (BATCH, ROUNDS)
+        };
+        let tenant = t.as_str();
+        let kind = match job {
+            Job::Current(_) => "entity",
+            Job::History(_) => "history",
+        };
+        let mut count = 0u64;
+        let mut spent = false;
+        for _ in 0..rounds {
+            if !self.dry_run && self.started.elapsed() >= self.budget {
+                spent = true;
+                break;
+            }
+            let n = match job {
+                Job::Current(type_iri) => {
+                    self.state
+                        .store
+                        .retain_current(t, type_iri, before, batch, self.dry_run)
+                        .await
+                }
+                Job::History(scope) => {
+                    self.state
+                        .temporal
+                        .retain_history(t, scope, before, batch, self.dry_run)
+                        .await
+                }
+            };
+            match n {
+                Ok(n) => {
+                    count = count.saturating_add(n);
+                    if n < batch as u64 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(tenant, r#type = label, kind, error = %e, "retention sweep failed");
+                    break;
+                }
+            }
+        }
+        if count > 0 {
+            if let Some(d) = self
+                .out
+                .iter_mut()
+                .find(|d| d.tenant == tenant && d.type_iri == label && d.kind == kind)
+            {
+                d.count = d.count.saturating_add(count);
+            } else {
+                self.out.push(Deleted {
+                    tenant: tenant.to_owned(),
+                    type_iri: label.to_owned(),
+                    kind,
+                    count,
+                });
+            }
+        }
+        if spent {
+            tracing::info!(
+                budget_ms = u64::try_from(self.budget.as_millis()).unwrap_or(u64::MAX),
+                "retention sweep budget spent; the next sweep goes on"
+            );
+        }
+        !spent
+    }
 }
 
 /// `/q/retention/{tenant}`: GET the document as written, PUT one, DELETE
@@ -474,7 +639,14 @@ async fn preview(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Respon
         return Ok(refusal);
     }
     let rules = vec![(t, parse(&body)?)];
-    let found = retain(&r.state, &rules, chrono::Utc::now(), true, SWEEP_BUDGET).await;
+    let plan = Plan {
+        rules: &rules,
+        platform: r.platform_history,
+        now: chrono::Utc::now(),
+        dry_run: true,
+        entities: false,
+    };
+    let found = retain(&r.state, &plan, SWEEP_BUDGET).await;
     Ok(counts(
         found.into_iter().map(|d| (d.type_iri, d.kind, d.count)),
     ))
@@ -552,9 +724,14 @@ mod tests {
             off.first().map(|r| (r.history, r.history_off)),
             Some((None, true))
         );
+        let pair = ("city".to_owned(), "https://e.org/V".to_owned());
         assert_eq!(
             history_off(&vec![(TenantId::new("city").expect("tenant"), off)]),
-            std::collections::HashSet::from([("city".to_owned(), "https://e.org/V".to_owned())])
+            antares_api::HistoryRules {
+                off: std::collections::HashSet::from([pair.clone()]),
+                ruled: std::collections::HashSet::from([pair]),
+                space_off: std::collections::HashSet::new(),
+            }
         );
         assert!(rules.iter().all(|r| !r.history_off));
         for bad in [
@@ -569,6 +746,44 @@ mod tests {
             br#"{"rules":[{"type":"https://e.org/A Vehicle"}]}"#,
             br#"{"rules":{}}"#,
             b"not json",
+        ] {
+            assert!(parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    /// DM-97: the `*` rule is the Tenant's default, history only; `forever`
+    /// is a word like `off`, and a type with a history rule of any kind is
+    /// out of the default's reach while a `current`-only rule is not.
+    #[test]
+    fn the_star_rule_is_history_only_and_forever_rules_a_type() {
+        let doc = br#"{"rules":[{"type":"*","history":"off"},
+                                 {"type":"https://e.org/Keep","history":"forever"},
+                                 {"type":"https://e.org/Now","current":"PT5M"},
+                                 {"type":"https://e.org/Week","history":"P7D"}]}"#;
+        let rules = parse(doc).unwrap_or_default();
+        assert_eq!(rules.len(), 4);
+        assert_eq!(
+            rules
+                .get(1)
+                .map(|r| (r.history, r.history_off, r.history_forever)),
+            Some((None, false, true))
+        );
+        let gate = history_off(&vec![(TenantId::new("city").expect("tenant"), rules)]);
+        let pair = |t: &str| ("city".to_owned(), format!("https://e.org/{t}"));
+        assert_eq!(
+            gate.space_off,
+            std::collections::HashSet::from(["city".to_owned()])
+        );
+        assert!(gate.off.is_empty());
+        assert_eq!(
+            gate.ruled,
+            std::collections::HashSet::from([pair("Keep"), pair("Week")])
+        );
+        for bad in [
+            &br#"{"rules":[{"type":"*","current":"PT5M"}]}"#[..],
+            br#"{"rules":[{"type":"*","history":"P7D"},{"type":"*"}]}"#,
+            br#"{"rules":[{"type":"**","history":"P7D"}]}"#,
+            br#"{"rules":[{"type":"*","history":"always"}]}"#,
         ] {
             assert!(parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
         }

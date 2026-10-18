@@ -440,6 +440,9 @@ pub async fn record_temporal_change(
     let Some(id) = after.get("id").and_then(Value::as_str) else {
         return;
     };
+    if !crate::history::records_history(st, tenant, after) {
+        return;
+    }
     let mut shell = Map::new();
     for k in ["id", "type", "createdAt", "modifiedAt", "scope"] {
         if let Some(v) = after.get(k) {
