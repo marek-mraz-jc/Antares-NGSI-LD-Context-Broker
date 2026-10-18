@@ -147,11 +147,14 @@ impl Surface for Ogc {
     }
 
     fn version_info(&self) -> Value {
-        // T-4465: the file encodings of `items` this build writes.
+        // T-4465, T-4477: the files `items` and `/collections` write in this build.
+        let encodings: Vec<&str> = export::ITEMS.iter().map(|e| e.0).collect();
+        let bundles: Vec<&str> = export::BUNDLES.iter().map(|e| e.0).collect();
         json!({
             "endpoint": format!("{PREFIX}/{{view}}/ogc/features"),
             "conformsTo": CONFORMANCE,
-            "encodings": export::ENCODINGS,
+            "encodings": encodings,
+            "bundles": bundles,
         })
     }
 
@@ -267,7 +270,7 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
         base: &base,
         caller,
         collections: &collections,
-        #[cfg(feature = "parquet")]
+        #[cfg(any(feature = "parquet", feature = "tabular"))]
         max_bytes: ops.max_answer_bytes(),
     };
     match (rest.as_slice(), pairs.is_empty()) {
@@ -280,6 +283,10 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
             OPENAPI,
             &api::document(&base, &collections, &|op| view.allows(op)),
         ),
+        #[cfg(feature = "tabular")]
+        (["collections"], _) if asked.file.is_some() => {
+            at.bundle(&pairs, asked.file.unwrap_or_default()).await
+        }
         (["collections"], true) => document(JSON, &at.collections()),
         (["collections", c], true) => match collections.get(*c) {
             Some(c) => document(JSON, &at.collection(c)),
@@ -301,8 +308,10 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
             }
         }
         (["collections", c, "items"], _) => match collections.get(*c) {
-            #[cfg(feature = "parquet")]
-            Some(c) if asked.file => at.parquet(c, &pairs).await,
+            #[cfg(any(feature = "parquet", feature = "tabular"))]
+            Some(c) if asked.file.is_some() => {
+                at.file(c, &pairs, asked.file.unwrap_or_default()).await
+            }
             Some(c) => at.items(c, &pairs, uri.query()).await,
             None => not_found(),
         },
@@ -324,28 +333,36 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
     }
 }
 
-/// The request's query pairs and whether it asks a collection's `items` for a Parquet file
-/// (T-4465), or the `406` for an `Accept` this surface writes nothing for.
-/// The request's query pairs, and whether it asks `items` for a file (T-4465).
+/// The request's query pairs, and the file it asks for by its `f` value (T-4465, T-4477).
 struct Asked {
     pairs: Vec<(String, String)>,
-    file: bool,
+    file: Option<&'static str>,
 }
 
+/// The request's [`Asked`], the `400` for a CSV or Parquet of several collections, or the `406`
+/// for an `Accept` this surface writes nothing for.
 fn negotiate(rest: &[&str], headers: &HeaderMap, uri: &axum::http::Uri) -> Result<Asked, Problem> {
     // Form decoding is lossy (an undecodable escape stays as written), so this never fails.
     let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
         .map(|Query(pairs)| pairs)
         .unwrap_or_default();
-    let asked = if matches!(rest, ["collections", _, "items"]) {
-        export::asked(headers, pairs)
-    } else {
-        Asked { pairs, file: false }
+    let one_type = |(n, v): &(String, String)| n == "f" && export::ONE_TYPE.contains(&v.as_str());
+    if matches!(rest, ["collections"]) && pairs.iter().any(one_type) {
+        return Err(Problem(
+            StatusCode::BAD_REQUEST,
+            "a CSV or Parquet file holds one collection: ask its items, or f=zip or f=xlsx here for several",
+        ));
+    }
+    let items: Vec<(&str, &str)> = export::ITEMS.iter().map(|e| (e.0, e.1)).collect();
+    let asked = match rest {
+        ["collections", _, "items"] => export::asked(headers, pairs, &items),
+        ["collections"] => export::asked(headers, pairs, export::BUNDLES),
+        _ => Asked { pairs, file: None },
     };
-    if !asked.file && !acceptable(headers) {
+    if asked.file.is_none() && !acceptable(headers) {
         return Err(Problem(
             StatusCode::NOT_ACCEPTABLE,
-            "this surface writes JSON, GeoJSON, JSON Schema, OpenAPI JSON and, for items, Parquet",
+            "this surface writes JSON, GeoJSON, JSON Schema, OpenAPI JSON and the files of /api",
         ));
     }
     Ok(asked)
@@ -482,7 +499,7 @@ struct Here<'a> {
     caller: &'a Caller,
     collections: &'a BTreeMap<String, Collection>,
     /// The ceiling a file this surface assembles is written under (T-4465).
-    #[cfg(feature = "parquet")]
+    #[cfg(any(feature = "parquet", feature = "tabular"))]
     max_bytes: usize,
 }
 
@@ -588,14 +605,10 @@ impl Here<'_> {
             links.push(link("next", GEOJSON, &format!("{at}?{}", query.join("&"))));
         }
         links.extend(profile_link(c, p.profile));
-        #[cfg(feature = "parquet")]
-        {
-            let file = if this.contains('?') {
-                "&f=parquet"
-            } else {
-                "?f=parquet"
-            };
-            links.push(link("alternate", export::PARQUET, &format!("{this}{file}")));
+        let separator = if this.contains('?') { '&' } else { '?' };
+        for e in export::ITEMS {
+            let (f, media) = (e.0, e.1);
+            links.push(link("alternate", media, &format!("{this}{separator}f={f}")));
         }
         let returned = page.features.len();
         let mut body = json!({
@@ -647,12 +660,26 @@ mod tests {
             Ogc.version_info().pointer("/endpoint"),
             Some(&json!("/x/views/{view}/ogc/features"))
         );
-        // T-4465: the surfaces listing names parquet only in a build that writes it.
-        #[cfg(feature = "parquet")]
-        let encodings = json!(["parquet"]);
-        #[cfg(not(feature = "parquet"))]
-        let encodings = json!([]);
-        assert_eq!(Ogc.version_info().pointer("/encodings"), Some(&encodings));
+        // T-4465, T-4477: the surfaces listing names a file only in a build that writes it.
+        let encodings: Vec<&str> = [
+            #[cfg(feature = "parquet")]
+            "parquet",
+            #[cfg(feature = "tabular")]
+            "csv",
+            #[cfg(feature = "tabular")]
+            "xlsx",
+        ]
+        .into();
+        let bundles: Vec<&str> = [
+            #[cfg(feature = "tabular")]
+            "xlsx",
+            #[cfg(feature = "tabular")]
+            "zip",
+        ]
+        .into();
+        let info = Ogc.version_info();
+        assert_eq!(info.pointer("/encodings"), Some(&json!(encodings)));
+        assert_eq!(info.pointer("/bundles"), Some(&json!(bundles)));
     }
 
     #[test]

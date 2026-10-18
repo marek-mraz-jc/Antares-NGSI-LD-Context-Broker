@@ -14,4 +14,5 @@ mod oas30;
 mod parquet;
 mod scan;
 mod schemas;
+mod tabular;
 mod write;

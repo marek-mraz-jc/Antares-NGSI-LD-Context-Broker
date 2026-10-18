@@ -10,7 +10,8 @@
 //! 'CALLERS lower;'`): `antares_odata::filter` (`$filter`), `antares_ogc::filter` (CQL2, bbox,
 //! datetime), `antares_mcp::tools::build` (`query_entities` arguments) and the NGSI-LD root
 //! itself. With the `parquet` feature the OGC form is asked a second time as a Parquet file
-//! (`f=parquet`, T-4465) and its `id` column must hold the same ids. A surface added without a column here is a review finding.
+//! (`f=parquet`, T-4465) and its `id` column must hold the same ids; with `tabular` it is asked as a
+//! CSV (`f=csv`, T-4477) too. A surface added without a column here is a review finding.
 //!
 //! It lives in the broker's tests because a surface crate may dev-depend on no other surface
 //! (module rule surface-dev); it runs with the `ogc`, `odata` and `mcp` features (`full`).
@@ -469,6 +470,35 @@ async fn ogc_parquet(app: &Router, form: &str) -> Result<Vec<String>, String> {
     Ok(sorted(ids))
 }
 
+/// The OGC form asked as a CSV file: the first field of every row below the header.
+#[cfg(feature = "tabular")]
+async fn ogc_csv(app: &Router, form: &str) -> Result<Vec<String>, String> {
+    let (key, value) = form.split_once('=').ok_or("a key=value form")?;
+    let uri = format!(
+        "/x/views/{VIEW}/ogc/features/collections/Vehicle/items?{}",
+        query(&[(key, value), ("f", "csv")])
+    );
+    let req = Request::builder().uri(&uri).header("Host", "localhost");
+    let Ok(resp) = app
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap_or_default())
+        .await;
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .map_err(|e| e.to_string())?;
+    let csv = String::from_utf8_lossy(&bytes);
+    if status != StatusCode::OK {
+        return Err(format!("{uri}: {status} {csv}"));
+    }
+    Ok(sorted(
+        csv.split("\r\n")
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split(',').next().unwrap_or_default().to_owned()),
+    ))
+}
+
 async fn mcp(app: &Router, q: &str, georel: Option<&str>) -> Result<Vec<String>, String> {
     let mut arguments = json!({"type": ["Vehicle"], "limit": 1000});
     if let Some(map) = arguments.as_object_mut() {
@@ -547,6 +577,8 @@ async fn every_surface_selects_what_the_case_selects() -> Result<(), String> {
                 answers.push(("ogc", ogc(&app, form).await));
                 #[cfg(feature = "parquet")]
                 answers.push(("ogc parquet", ogc_parquet(&app, form).await));
+                #[cfg(feature = "tabular")]
+                answers.push(("ogc csv", ogc_csv(&app, form).await));
             }
             None => unexpressed.push(format!("{}: ogc", case.id)),
         }

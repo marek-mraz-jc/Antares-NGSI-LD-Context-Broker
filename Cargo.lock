@@ -259,6 +259,7 @@ dependencies = [
  "antares-ops",
  "axum",
  "bytes",
+ "chrono",
  "http-body-util",
  "linkml-model",
  "ogc-cql2",
@@ -267,6 +268,7 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+ "zip",
 ]
 
 [[package]]

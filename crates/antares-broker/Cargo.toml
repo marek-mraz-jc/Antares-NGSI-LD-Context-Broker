@@ -110,6 +110,10 @@ ogc = ["views", "dep:antares-ogc"]
 # in `full`: `full` sits at its ADR-0027 size budget (vanilla + 10 MiB) and
 # Parquet with zstd crosses it; the platform image names it beside `full`.
 parquet = ["ogc", "antares-ogc/parquet"]
+# OGC API - Features items as CSV and XLSX, and /collections as an XLSX or a
+# ZIP bundle of every collection (T-4477): `f=csv|xlsx|zip`. Beside `full`
+# for the same budget reason as `parquet`.
+tabular = ["ogc", "antares-ogc/tabular"]
 
 # The WebSocket notification channel (ADR-0026, T-3517): `/x/ws/ngsi-ld/v1`
 # (`ANTARES_API_SURFACES=...,ws`), and with `views` also
@@ -123,7 +127,7 @@ internal-csr = ["views", "dep:antares-icsr"]
 
 # Every surface the broker serves (ADR-0027 Consequences, T-3636): what
 # `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
-# sets it; the platform image builds `full,jc-policy,linkml,parquet` (image-jc.yml).
+# sets it; the platform image builds `full,jc-policy,linkml,parquet,tabular` (image-jc.yml).
 full = ["views", "mcp", "odata", "ogc", "ws"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
