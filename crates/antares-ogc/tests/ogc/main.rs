@@ -11,6 +11,7 @@ mod geojson;
 mod items;
 mod matrix;
 mod oas30;
+mod parquet;
 mod scan;
 mod schemas;
 mod write;

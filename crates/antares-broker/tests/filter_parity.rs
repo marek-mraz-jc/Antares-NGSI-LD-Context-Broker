@@ -9,7 +9,8 @@
 //! The surface entry points the cases reach, the ones that turn a filter into `q` (`cg q -e
 //! 'CALLERS lower;'`): `antares_odata::filter` (`$filter`), `antares_ogc::filter` (CQL2, bbox,
 //! datetime), `antares_mcp::tools::build` (`query_entities` arguments) and the NGSI-LD root
-//! itself. A surface added without a column here is a review finding.
+//! itself. With the `parquet` feature the OGC form is asked a second time as a Parquet file
+//! (`f=parquet`, T-4465) and its `id` column must hold the same ids. A surface added without a column here is a review finding.
 //!
 //! It lives in the broker's tests because a surface crate may dev-depend on no other surface
 //! (module rule surface-dev); it runs with the `ogc`, `odata` and `mcp` features (`full`).
@@ -431,6 +432,43 @@ async fn ogc(app: &Router, form: &str) -> Result<Vec<String>, String> {
     Ok(ids_at(&body, "/features"))
 }
 
+/// The OGC form asked as a Parquet file: the ids of its `id` column.
+#[cfg(feature = "parquet")]
+async fn ogc_parquet(app: &Router, form: &str) -> Result<Vec<String>, String> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let (key, value) = form.split_once('=').ok_or("a key=value form")?;
+    let uri = format!(
+        "/x/views/{VIEW}/ogc/features/collections/Vehicle/items?{}",
+        query(&[(key, value), ("f", "parquet")])
+    );
+    let req = Request::builder().uri(&uri).header("Host", "localhost");
+    let Ok(resp) = app
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap_or_default())
+        .await;
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .map_err(|e| e.to_string())?;
+    if status != StatusCode::OK {
+        return Err(format!(
+            "{uri}: {status} {}",
+            String::from_utf8_lossy(&bytes)
+        ));
+    }
+    let file = SerializedFileReader::new(bytes).map_err(|e| format!("{uri}: {e}"))?;
+    let rows = file.get_row_iter(None).map_err(|e| e.to_string())?;
+    let mut ids = Vec::new();
+    for row in rows {
+        let row = row.map_err(|e| e.to_string())?;
+        match row.get_column_iter().find(|(name, _)| *name == "id") {
+            Some((_, parquet::record::Field::Str(id))) => ids.push(id.clone()),
+            other => return Err(format!("{uri}: a row without an id: {other:?}")),
+        }
+    }
+    Ok(sorted(ids))
+}
+
 async fn mcp(app: &Router, q: &str, georel: Option<&str>) -> Result<Vec<String>, String> {
     let mut arguments = json!({"type": ["Vehicle"], "limit": 1000});
     if let Some(map) = arguments.as_object_mut() {
@@ -505,7 +543,11 @@ async fn every_surface_selects_what_the_case_selects() -> Result<(), String> {
             None => unexpressed.push(format!("{}: odata", case.id)),
         }
         match &case.ogc {
-            Some(form) => answers.push(("ogc", ogc(&app, form).await)),
+            Some(form) => {
+                answers.push(("ogc", ogc(&app, form).await));
+                #[cfg(feature = "parquet")]
+                answers.push(("ogc parquet", ogc_parquet(&app, form).await));
+            }
             None => unexpressed.push(format!("{}: ogc", case.id)),
         }
         for (surface, got) in answers {

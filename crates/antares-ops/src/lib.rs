@@ -363,6 +363,13 @@ impl Ops {
         }
     }
 
+    /// The most bytes one answer may hold (`max_answer_bytes`, [`bounds::MAX_ANSWER_BYTES`]):
+    /// the ceiling a surface that assembles a file itself writes under (T-4465).
+    #[must_use]
+    pub fn max_answer_bytes(&self) -> usize {
+        self.state.max_answer_bytes
+    }
+
     /// An answer's body read whole, up to the broker's `max_answer_bytes`
     /// ([`bounds::MAX_ANSWER_BYTES`]): the page size bounds the Entities, not the
     /// bytes, and every concurrent request holds its buffer.

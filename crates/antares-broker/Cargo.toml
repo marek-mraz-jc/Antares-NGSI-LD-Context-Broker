@@ -104,6 +104,10 @@ odata = ["views", "dep:antares-odata"]
 # `/x/views/{view}/ogc/features`, collections from the Tenant's LinkML schema
 # intersected with the view (`ANTARES_API_SURFACES=admin,views,ogc`).
 ogc = ["views", "dep:antares-ogc"]
+# OGC API - Features items as Apache Parquet and GeoParquet 1.1 (T-4465,
+# EP-119): `f=parquet` or `Accept: application/vnd.apache.parquet`, through
+# the optional antares-export crate; a build without it writes no file.
+parquet = ["ogc", "antares-ogc/parquet"]
 
 # The WebSocket notification channel (ADR-0026, T-3517): `/x/ws/ngsi-ld/v1`
 # (`ANTARES_API_SURFACES=...,ws`), and with `views` also
@@ -118,7 +122,7 @@ internal-csr = ["views", "dep:antares-icsr"]
 # Every surface the broker serves (ADR-0027 Consequences, T-3636): what
 # `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
 # sets it; the platform image builds `full,jc-policy,linkml` (image-jc.yml).
-full = ["views", "mcp", "odata", "ogc", "ws"]
+full = ["views", "mcp", "odata", "ogc", "parquet", "ws"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
 # Unix-only: the wasm target keeps the default allocator.
@@ -137,6 +141,8 @@ rumqttc = { workspace = true }
 serde_json = { workspace = true }
 # the views differential (T-3777): generated views and policies
 proptest = { workspace = true }
+# the filter parity table reads the OGC Parquet file back (T-4465)
+parquet = { version = "60", default-features = false, features = ["zstd"] }
 
 [lints]
 workspace = true

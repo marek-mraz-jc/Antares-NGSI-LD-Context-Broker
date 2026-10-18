@@ -22,6 +22,7 @@
 
 mod api;
 mod crs;
+mod export;
 mod filter;
 mod items;
 mod model;
@@ -146,7 +147,17 @@ impl Surface for Ogc {
     }
 
     fn version_info(&self) -> Value {
-        json!({"endpoint": format!("{PREFIX}/{{view}}/ogc/features"), "conformsTo": CONFORMANCE})
+        // T-4465: the file encodings of `items` this build writes.
+        let encodings: &[&str] = if cfg!(feature = "parquet") {
+            &["parquet"]
+        } else {
+            &[]
+        };
+        json!({
+            "endpoint": format!("{PREFIX}/{{view}}/ogc/features"),
+            "conformsTo": CONFORMANCE,
+            "encodings": encodings,
+        })
     }
 
     fn router(&self, ops: Ops) -> Router {
@@ -250,22 +261,21 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
     if let Some(item) = item.filter(|_| method != Method::GET) {
         return write_to(&view, caller, &collections, &base, parts, item, body).await;
     }
-    if !acceptable(headers) {
-        return problem(
-            StatusCode::NOT_ACCEPTABLE,
-            "this surface writes JSON, GeoJSON, JSON Schema and OpenAPI JSON",
-        );
-    }
-    // Form decoding is lossy (an undecodable escape stays as written), so this never fails.
-    let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
-        .map(|Query(pairs)| pairs)
-        .unwrap_or_default();
+    let (pairs, parquet) = match negotiate(&rest, headers, uri) {
+        Ok(asked) => asked,
+        Err(refused) => return refused.reply(),
+    };
+    // Without the feature nothing asks for a file (`export::asked`).
+    #[cfg(not(feature = "parquet"))]
+    debug_assert!(!parquet);
     let at = Here {
         view: &view,
         id,
         base: &base,
         caller,
         collections: &collections,
+        #[cfg(feature = "parquet")]
+        max_bytes: ops.max_answer_bytes(),
     };
     match (rest.as_slice(), pairs.is_empty()) {
         ([] | [""], true) => document(JSON, &at.landing()),
@@ -298,6 +308,8 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
             }
         }
         (["collections", c, "items"], _) => match collections.get(*c) {
+            #[cfg(feature = "parquet")]
+            Some(c) if parquet => at.parquet(c, &pairs).await,
             Some(c) => at.items(c, &pairs, uri.query()).await,
             None => not_found(),
         },
@@ -317,6 +329,31 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
         ),
         _ => not_found(),
     }
+}
+
+/// The request's query pairs and whether it asks a collection's `items` for a Parquet file
+/// (T-4465), or the `406` for an `Accept` this surface writes nothing for.
+fn negotiate(
+    rest: &[&str],
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+) -> Result<(Vec<(String, String)>, bool), Problem> {
+    // Form decoding is lossy (an undecodable escape stays as written), so this never fails.
+    let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
+        .map(|Query(pairs)| pairs)
+        .unwrap_or_default();
+    let (pairs, parquet) = if matches!(rest, ["collections", _, "items"]) {
+        export::asked(headers, pairs)
+    } else {
+        (pairs, false)
+    };
+    if !parquet && !acceptable(headers) {
+        return Err(Problem(
+            StatusCode::NOT_ACCEPTABLE,
+            "this surface writes JSON, GeoJSON, JSON Schema, OpenAPI JSON and, for items, Parquet",
+        ));
+    }
+    Ok((pairs, parquet))
 }
 
 /// W4: whether the resource offers `method`: its reads, and the writes the view offers on it
@@ -449,6 +486,9 @@ struct Here<'a> {
     base: &'a str,
     caller: &'a Caller,
     collections: &'a BTreeMap<String, Collection>,
+    /// The ceiling a file this surface assembles is written under (T-4465).
+    #[cfg(feature = "parquet")]
+    max_bytes: usize,
 }
 
 impl Here<'_> {
@@ -553,6 +593,14 @@ impl Here<'_> {
             links.push(link("next", GEOJSON, &format!("{at}?{}", query.join("&"))));
         }
         links.extend(profile_link(c, p.profile));
+        if cfg!(feature = "parquet") {
+            let file = if this.contains('?') {
+                "&f=parquet"
+            } else {
+                "?f=parquet"
+            };
+            links.push(link("alternate", export::PARQUET, &format!("{this}{file}")));
+        }
         let returned = page.features.len();
         let mut body = json!({
             "type": "FeatureCollection",
@@ -603,6 +651,13 @@ mod tests {
             Ogc.version_info().pointer("/endpoint"),
             Some(&json!("/x/views/{view}/ogc/features"))
         );
+        // T-4465: the surfaces listing names parquet only in a build that writes it.
+        let encodings = if cfg!(feature = "parquet") {
+            json!(["parquet"])
+        } else {
+            json!([])
+        };
+        assert_eq!(Ogc.version_info().pointer("/encodings"), Some(&encodings));
     }
 
     #[test]

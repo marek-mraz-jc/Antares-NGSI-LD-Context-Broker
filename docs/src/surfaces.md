@@ -20,7 +20,8 @@ surface hides, and which CI job proves each surface's conformance.
 | WebSocket notifications | `ws` | `ws`, and `ws-views` for a view | `/x/ws/ngsi-ld/v1`, `/x/views/{view}/ws` | [WebSocket notifications](websocket.md) |
 | Internal context sources | `internal-csr` (adds `views`) | none (it serves forwards, not requests) | none | [Internal context sources](internal-context-sources.md) |
 
-`full` is `views`, `mcp`, `odata`, `ogc` and `ws`. `linkml` and
+`full` is `views`, `mcp`, `odata`, `ogc`, `parquet` (the OGC `items`
+as a Parquet file, [OGC](ogc.md#2-items)) and `ws`. `linkml` and
 `internal-csr` stay separate. A feature links a surface; only
 `ANTARES_API_SURFACES` mounts one ([Configuration](configuration.md)). A
 name the binary was not built with stops the broker at start.

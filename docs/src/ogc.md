@@ -83,6 +83,25 @@ misspelt one. `/items/{featureId}` takes `properties`, `profile` and `crs` and
 is one Query Entities by `id` and type: an Entity the view hides, of another type, absent, or an id
 that is no URI is `404`.
 
+A `parquet` build (in `full`) also writes `/items` as one file (T-4465,
+EP-119): `f=parquet` or `Accept: application/vnd.apache.parquet` returns
+the whole answer of the request's filters (`bbox`, `datetime`, `filter`,
+`properties`, the `ngsild.` options) as Apache Parquet,
+`Content-Disposition: attachment; filename="{collectionId}.parquet"`. The
+file has an `id` column, a column per property the view shows (typed from
+the collection's schema: text, 64-bit integer, double, boolean, anything
+structured as JSON text) and, when the collection has a geometry, a
+`geometry` column of ISO WKB with GeoParquet 1.1 `geo` metadata (encoding,
+geometry types, bounding box; no `crs`, which means CRS84). A collection
+without a geometry is plain Parquet. The surface reads the answer page by
+page (1 000 Features) and writes each page as one row group, ZSTD
+compressed, so it holds one page of Features at a time. A file larger than
+the answer ceiling (64 MiB, `limits.maxAnswerBytes` in `/q/health`) is `413`, never a cut
+file; a `crs` other than CRS84 is `400`, and so is `f=parquet` on a
+single Feature. Every GeoJSON page of `/items` carries an `alternate` link
+to its file. `/q/health` lists `"encodings": ["parquet"]` under the
+surface, empty in a build without the feature.
+
 ## 3. Schemas and references
 
 `/schema` is a JSON Schema 2020-12 document (`application/schema+json`)
