@@ -18,6 +18,7 @@ use crate::schema::{Annotation, Slot, DEFAULT_RANGE, IMPORTS};
 enum Node {
     Str(String),
     Bool(bool),
+    Int(i64),
     /// Never empty: an empty list is left out, as LinkML reads a missing
     /// list (the round-trip property test fails on a `null` here).
     List(Vec<String>),
@@ -56,6 +57,9 @@ fn render(out: &mut String, indent: usize, map: &[(String, Node)]) {
             }
             Node::Bool(b) => {
                 let _ = writeln!(out, " {b}");
+            }
+            Node::Int(i) => {
+                let _ = writeln!(out, " {i}");
             }
             Node::List(items) => {
                 out.push('\n');
@@ -127,6 +131,10 @@ fn slot_node(slot: &Slot) -> Node {
     }
     annotations(&mut m, &slot.annotations);
     opt(&mut m, "description", slot.description.as_ref());
+    if let Some(rank) = slot.rank {
+        m.push(("rank".to_owned(), Node::Int(rank)));
+    }
+    opt(&mut m, "title", slot.title.as_ref());
     Node::Map(m)
 }
 
@@ -483,6 +491,13 @@ fn percent(name: &str) -> String {
 #[must_use]
 pub fn shacl(model: &Model) -> String {
     let mut out = turtle_header("SHACL shapes", &[("sh", "http://www.w3.org/ns/shacl#")]);
+    let ns = model.namespace();
+    // The two display groups (DM-103): a class's key attributes, and the rest.
+    let _ = write!(
+        out,
+        "\n<{ns}SummaryGroup>\n  a sh:PropertyGroup ;\n  sh:order 0 ;\n  rdfs:label \"Základné\"@sk, \"Summary\"@en .\n\
+         \n<{ns}DetailGroup>\n  a sh:PropertyGroup ;\n  sh:order 1 ;\n  rdfs:label \"Detail\"@sk, \"Detail\"@en .\n"
+    );
     for name in model.schema().classes.keys() {
         let _ = write!(
             out,
@@ -491,12 +506,20 @@ pub fn shacl(model: &Model) -> String {
             percent(name),
             model.class_iri(name)
         );
-        for (slot_name, slot) in model.class_slots(name) {
+        for (order, summary, slot_name, slot) in display_order(model, name) {
             let _ = write!(
                 out,
                 " ;\n  sh:property [\n{IN}{IN}sh:path <{}> ;\n{IN}{IN}sh:name {}",
                 refined_iri(model, slot_name, &slot),
                 lit(slot_name)
+            );
+            for (lang, text) in labels(&slot) {
+                let _ = write!(out, ", {}@{lang}", lit(&text));
+            }
+            let group = if summary { "Summary" } else { "Detail" };
+            let _ = write!(
+                out,
+                " ;\n{IN}{IN}sh:order {order} ;\n{IN}{IN}sh:group <{ns}{group}Group>"
             );
             match model.range(&slot) {
                 // a GeoJSON geometry: a node, whatever the range says
@@ -535,6 +558,84 @@ pub fn shacl(model: &Model) -> String {
         out.push_str(" .\n");
     }
     out
+}
+
+/// The slots shown last unless ranked, in this order (DM-98).
+const SYSTEM: &[&str] = &["location", "dateCreated", "dateModified", "type", "id"];
+
+/// How many slots are a class's key attributes when it marks none (DM-99).
+const FIRST: usize = 4;
+
+/// A tagged value as a flag: `true` as the model tools write it.
+fn marked(slot: &Slot, tag: &str) -> bool {
+    slot.annotations.get(tag).is_some_and(|a| a.value == "true")
+}
+
+/// The slot's `label` annotation, JSON text of a language map, as
+/// (language, text) pairs; a tag that is no language tag is skipped so it
+/// cannot end the literal (DM-100).
+fn labels(slot: &Slot) -> Vec<(String, String)> {
+    let Some(label) = slot.annotations.get("label") else {
+        return Vec::new();
+    };
+    let map: BTreeMap<String, String> = serde_json::from_str(&label.value).unwrap_or_default();
+    map.into_iter()
+        .filter(|(lang, _)| {
+            !lang.is_empty()
+                && lang.len() <= 35
+                && lang.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        .collect()
+}
+
+/// The display order of a class's slots (DM-98, DM-99, the order
+/// `jc_core::display_order` computes): ranked ones first, lower first; then
+/// its own slots as written and the inherited ones, nearest ancestor first;
+/// `location`, `dateCreated`, `dateModified`, `type`, `id` last unless
+/// ranked. Each comes with its place and whether it is a key attribute: the
+/// slots annotated `summary`, else the first four that are not `hidden`.
+fn display_order<'a>(model: &'a Model, class: &str) -> Vec<(usize, bool, &'a str, Slot)> {
+    let schema = model.schema();
+    let mut written: Vec<&str> = Vec::new();
+    let mut next = Some(class);
+    // At most one step per class, so an `is_a` cycle cannot loop.
+    for _ in 0..=schema.classes.len() {
+        let Some(declared) = next.and_then(|n| schema.classes.get(n)) else {
+            break;
+        };
+        for slot in &declared.slots {
+            if !written.contains(&slot.as_str()) {
+                written.push(slot);
+            }
+        }
+        next = declared.is_a.as_deref();
+    }
+    let mut slots = model.class_slots(class);
+    slots.sort_by_key(|(name, slot)| {
+        let place = written.iter().position(|w| w == name).unwrap_or(usize::MAX);
+        match (slot.rank, SYSTEM.iter().position(|s| s == name)) {
+            (Some(rank), _) => (0, rank, place),
+            (None, Some(at)) => (2, 0, at),
+            (None, None) => (1, 0, place),
+        }
+    });
+    let any = slots.iter().any(|(_, slot)| marked(slot, "summary"));
+    let mut first = 0;
+    slots
+        .into_iter()
+        .enumerate()
+        .map(|(order, (name, slot))| {
+            let summary = if any {
+                marked(&slot, "summary")
+            } else if !marked(&slot, "hidden") && first < FIRST {
+                first = first.saturating_add(1);
+                true
+            } else {
+                false
+            };
+            (order, summary, name, slot)
+        })
+        .collect()
 }
 
 /// The `rdfs:range` of a slot: an `xsd:` datatype, a class IRI, or
