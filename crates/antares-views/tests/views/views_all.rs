@@ -232,6 +232,17 @@ async fn context_source() -> Result<(String, Arc<Mutex<Vec<String>>>), String> {
 
 /// What the Context Source received whose request line starts with `start`,
 /// after giving a forward made in the background `wait` to arrive.
+/// 10 under a sanitizer (`ANTARES_TEST_SANITIZER`, set by the strict workflow), 1 otherwise: the
+/// stretch `antares_jsonld::slow_factor` gives every outbound deadline. A `ThreadSanitizer` run held the
+/// root's forwarded Subscription past a flat 5 s (strict 39095897849, T-4564).
+fn slow_factor() -> u64 {
+    if std::env::var_os("ANTARES_TEST_SANITIZER").is_some() {
+        10
+    } else {
+        1
+    }
+}
+
 async fn received(seen: &Mutex<Vec<String>>, start: &str, wait: Duration) -> usize {
     let since = tokio::time::Instant::now();
     loop {
@@ -334,7 +345,7 @@ async fn views_all_keeps_writes_and_subscriptions_off_context_sources() -> Resul
     )
     .await;
     assert_eq!(sub.status, StatusCode::CREATED, "{}", sub.text);
-    let long = Duration::from_secs(5);
+    let long = Duration::from_secs(5 * slow_factor());
     assert!(
         received(&seen, "POST /ngsi-ld/v1/entities", long).await > 0,
         "the root forwards the write: {seen:?}"

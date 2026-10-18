@@ -164,6 +164,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)] // 40 MiB parsed: past the weekly Miri job's 90 min (strict 39095897849, T-4564)
     fn forty_schemas_of_a_mebibyte_stay_under_the_byte_cap() {
         // 40 MiB asked for, 32 MiB held at most.
         for n in 0..40u64 {
