@@ -113,11 +113,12 @@ pub use antares_notifier::DeliveryPolicy;
 pub use antares_notifier::{
     build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
 };
+pub use antares_store::{HistoryScope, HISTORY_RETENTION};
 pub use contexts::public_base;
 pub use federation::{
     AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport, NotifyFuture,
 };
-pub use state::{AppState, TemporalRecord};
+pub use state::{AppState, HistoryRules, TemporalRecord};
 
 /// Spawn for both targets — tokio natively, the JS microtask queue on
 /// wasm32 (no tokio runtime exists in a browser). Call sites are identical;

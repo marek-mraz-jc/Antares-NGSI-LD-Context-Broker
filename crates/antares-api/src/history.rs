@@ -16,6 +16,7 @@ use antares_model::TenantId;
 use antares_store::{TemporalDriverExt as _, TemporalEvent};
 use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static DRAIN_ERRORS: AtomicU64 = AtomicU64::new(0);
 
@@ -78,9 +79,10 @@ pub(crate) async fn push(st: &AppState, ev: TemporalEvent) {
 
 /// The gate chain: an event enters history only if every gate admits it.
 /// Gate 1 (value-change) runs in the producer — an unchanged instance never
-/// becomes an event (`changed_instances`). Adding a gate = one more entry
+/// becomes an event (`changed_instances`) — and so does gate 3, retention
+/// ([`records_history`]), which needs the whole Entity. Adding a gate = one more entry
 /// here; producers and drivers stay untouched.
-const GATES: &[fn(&AppState, &TemporalEvent) -> bool] = &[observed_gate, history_gate];
+const GATES: &[fn(&AppState, &TemporalEvent) -> bool] = &[observed_gate];
 
 /// Gate 2: ANTARES_TEMPORAL_RECORD. `all` admits everything; `observed`
 /// keeps only instances that carry `observedAt` — the spec's own
@@ -95,24 +97,162 @@ fn observed_gate(st: &AppState, ev: &TemporalEvent) -> bool {
     }
 }
 
-/// Gate 3 (T-4275): a type whose retention rule says `history: "off"` keeps
-/// its current state only, so an Entity with any such type in its Tenant
-/// records no attribute instance.
-fn history_gate(st: &AppState, ev: &TemporalEvent) -> bool {
-    let off = st
+/// An Entity's own history retention (DM-97), read from its
+/// [`antares_store::HISTORY_RETENTION`] Property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnRetention {
+    /// `off`: the Entity keeps its current state only.
+    Off,
+    /// A duration: its history is kept that long, whatever its type says.
+    Keep(Duration),
+}
+
+/// What the Entity document `doc` (expanded, as stored) says of its own
+/// history: `None` when it carries no `historyRetention`, `Some(Err)` with
+/// the reason when the value is neither a duration nor `off` (a typo,
+/// `forever`), which the rules of its type then override.
+pub fn own_retention(doc: &Value) -> Option<Result<OwnRetention, String>> {
+    doc.get(antares_store::HISTORY_RETENTION).map(retention_of)
+}
+
+/// What one stored `historyRetention` Property (one instance, or an array
+/// whose first instance counts) says.
+///
+/// # Errors
+/// Why it is neither a duration nor `off`.
+pub fn retention_of(own: &Value) -> Result<OwnRetention, String> {
+    let first = match own {
+        Value::Array(all) => all.first(),
+        one => Some(one),
+    };
+    let Some(raw) = first.and_then(|p| p.get("value")).and_then(Value::as_str) else {
+        return Err("historyRetention is not a Property with a string value".into());
+    };
+    if raw == "off" {
+        Ok(OwnRetention::Off)
+    } else {
+        parse_duration(raw).map(OwnRetention::Keep)
+    }
+}
+
+/// Gate 3 (T-4275, DM-97), run in the producer where the whole Entity is at
+/// hand: whether a write of `doc` in `tenant` records history. The most
+/// specific level wins: the Entity's own `historyRetention`, then the rule
+/// of one of its types (any `off` among them records nothing), then the
+/// Tenant's `*` rule.
+pub(crate) fn records_history(st: &AppState, tenant: &TenantId, doc: &Value) -> bool {
+    match own_retention(doc) {
+        Some(Ok(OwnRetention::Off)) => return false,
+        Some(Ok(OwnRetention::Keep(_))) => return true,
+        Some(Err(_)) | None => {}
+    }
+    let rules = st
         .history_off
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if off.is_empty() {
+    if rules.is_empty() {
         return true;
     }
-    let tenant = ev.tenant.as_str();
-    let off_type = |t: &str| off.contains(&(tenant.to_owned(), t.to_owned()));
-    match ev.shell.get("type") {
-        Some(Value::String(t)) => !off_type(t),
-        Some(Value::Array(ts)) => !ts.iter().filter_map(Value::as_str).any(off_type),
-        _ => true,
+    let tenant = tenant.as_str();
+    let types: Vec<&str> = match doc.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let has = |set: &std::collections::HashSet<(String, String)>| {
+        types
+            .iter()
+            .any(|t| set.contains(&(tenant.to_owned(), (*t).to_owned())))
+    };
+    if has(&rules.off) {
+        return false;
     }
+    has(&rules.ruled) || !rules.space_off.contains(tenant)
+}
+
+/// The bounds a duration has to sit in: one minute to ten years.
+const SHORTEST: Duration = Duration::from_secs(60);
+const LONGEST: Duration = Duration::from_hours(87_600);
+
+/// A duration as ISO 8601 (`PT5M`, `PT8H`, `P30D`, `P1DT12H`) or in short
+/// form (`90s`, `5m`, `8h`, `14d`), between one minute and ten years.
+///
+/// # Errors
+/// Why `raw` is not one.
+pub fn parse_duration(raw: &str) -> Result<Duration, String> {
+    parse_duration_within(raw, SHORTEST, LONGEST)
+}
+
+/// A duration as [`parse_duration`] reads it, between `shortest` and
+/// `longest` (the quality sweep's `maxAge` starts at one second, T-4018).
+///
+/// # Errors
+/// Why `raw` is not one.
+pub fn parse_duration_within(
+    raw: &str,
+    shortest: Duration,
+    longest: Duration,
+) -> Result<Duration, String> {
+    let bad = || format!("{raw:?} is not a duration such as PT5M, PT8H, P30D, 5m, 8h or 14d");
+    let secs = if let Some(iso) = raw.strip_prefix('P') {
+        let (days, time) = match iso.split_once('T') {
+            Some((d, t)) if !t.is_empty() => (d, Some(t)),
+            Some(_) => return Err(bad()),
+            None => (iso, None),
+        };
+        let mut total = 0u64;
+        if !days.is_empty() {
+            total = days
+                .strip_suffix('D')
+                .and_then(|n| n.parse::<u64>().ok())
+                .ok_or_else(bad)?
+                .checked_mul(86_400)
+                .ok_or_else(bad)?;
+        } else if time.is_none() {
+            return Err(bad());
+        }
+        let mut rest = time.unwrap_or_default();
+        for (unit, scale) in [('H', 3600u64), ('M', 60), ('S', 1)] {
+            if let Some((n, tail)) = rest.split_once(unit) {
+                let n = n.parse::<u64>().map_err(|_| bad())?;
+                total = n
+                    .checked_mul(scale)
+                    .and_then(|n| total.checked_add(n))
+                    .ok_or_else(bad)?;
+                rest = tail;
+            }
+        }
+        if !rest.is_empty() {
+            return Err(bad());
+        }
+        total
+    } else {
+        let split = raw.len().checked_sub(1).ok_or_else(bad)?;
+        let (n, unit) = (
+            raw.get(..split).ok_or_else(bad)?,
+            raw.get(split..).ok_or_else(bad)?,
+        );
+        let scale = match unit {
+            "s" => 1u64,
+            "m" => 60,
+            "h" => 3600,
+            "d" => 86_400,
+            _ => return Err(bad()),
+        };
+        n.parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(scale))
+            .ok_or_else(bad)?
+    };
+    let d = Duration::from_secs(secs);
+    if d < shortest || d > longest {
+        return Err(format!(
+            "{raw:?} is outside {}s to {}s",
+            shortest.as_secs(),
+            longest.as_secs()
+        ));
+    }
+    Ok(d)
 }
 
 /// The consumer side: one `event_list` call per drained batch.

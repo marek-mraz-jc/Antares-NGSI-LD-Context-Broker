@@ -1225,6 +1225,18 @@ pub mod test_kit {
             Ok(Self { state, reload })
         }
 
+        /// [`TestBroker::new`] with the platform's history retention set
+        /// to `keep`, as `ANTARES_RETENTION_HISTORY_DEFAULT` sets it (DM-97).
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn with_platform_history(keep: std::time::Duration) -> Result<Self, String> {
+            let mut state = AppState::new("antares-test".into());
+            antares_api::wire(&mut state).await;
+            let reload = crate::views::install_with(&state, Some(keep)).await?;
+            Ok(Self { state, reload })
+        }
+
         /// [`TestBroker::new`] delivering through `sinks` too (a surface's
         /// own notification binding, ADR-0026) and asking `engine`, both
         /// set before the notifier is wired, as the broker sets them, so

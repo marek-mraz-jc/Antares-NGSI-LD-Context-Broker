@@ -584,6 +584,17 @@ pub trait CurrentStateDriver: Send + Sync {
         let _ = (tenant, type_iri, before, batch, dry_run);
         Ok(0)
     }
+    /// The Entities, across every Tenant, that carry a [`HISTORY_RETENTION`]
+    /// Property (DM-97): at most `limit` of (tenant, id, the Property as
+    /// stored). Cross-tenant maintenance, like the 4.22 reap; a driver
+    /// without current state has none.
+    async fn history_overrides(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, Value)>, NgsiError> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
     /// Table 5.2.9-2 forward bookkeeping: stamp one distributed operation on
     /// a registration and hand back the stored document. `None` means the row
     /// is gone — the registration was deleted while its forward was in
@@ -900,6 +911,34 @@ pub fn fold_appends(evs: &[TemporalEvent]) -> Option<Vec<(&TenantId, &str, &Valu
     Some(out)
 }
 
+/// The expanded name of the Property an Entity carries its own history
+/// retention in (DM-97, ADR-N-046 2.3): a duration or `off`, the most
+/// specific level, beside `expiresAt`, which ends the Entity itself.
+pub const HISTORY_RETENTION: &str = "https://uri.etsi.org/ngsi-ld/default-context/historyRetention";
+
+/// The Entities of one Tenant a history retention statement reaches (DM-97).
+#[derive(Debug, Clone, Copy)]
+pub enum HistoryScope<'a> {
+    /// One Entity, by its own `historyRetention`.
+    Entity(&'a str),
+    /// The Entities with this type, but not `except_ids`, which carry their
+    /// own retention.
+    Type {
+        /// The expanded type.
+        type_iri: &'a str,
+        /// Entities left out.
+        except_ids: &'a [String],
+    },
+    /// The Entities with none of `except_types` and not in `except_ids`:
+    /// what a Tenant's or the platform's default reaches.
+    Rest {
+        /// Types with a rule of their own.
+        except_types: &'a [String],
+        /// Entities left out.
+        except_ids: &'a [String],
+    },
+}
+
 /// Temporal storage: the entity history (Temporal Evolution) plus the raw
 /// temporal documents the 5.6.13-5.6.16 edit paths operate on.
 ///
@@ -927,21 +966,21 @@ pub trait TemporalDriver: Send + Sync {
         let _ = tenant;
         Ok(0)
     }
-    /// Retention of one Entity type's history in one Tenant (`/q/retention`,
-    /// T-3900): delete at most `batch` attribute instances of Entities whose
-    /// types include `type_iri` and whose instant (`observedAt`, else
-    /// `modifiedAt`, `deletedAt`, `createdAt`) is before `before`, a UTC
-    /// DateTime. Returns how many were deleted, or with `dry_run` would be,
-    /// deleting nothing; a driver without history has none.
+    /// Retention of history in one Tenant (`/q/retention`, T-3900, DM-97):
+    /// delete at most `batch` attribute instances of the Entities `scope`
+    /// names whose instant (`observedAt`, else `modifiedAt`, `deletedAt`,
+    /// `createdAt`) is before `before`, a UTC DateTime. Returns how many were
+    /// deleted, or with `dry_run` would be, deleting nothing; a driver
+    /// without history has none.
     async fn retain_history(
         &self,
         tenant: &TenantId,
-        type_iri: &str,
+        scope: HistoryScope<'_>,
         before: &str,
         batch: usize,
         dry_run: bool,
     ) -> Result<u64, NgsiError> {
-        let _ = (tenant, type_iri, before, batch, dry_run);
+        let _ = (tenant, scope, before, batch, dry_run);
         Ok(0)
     }
     /// Remove the whole history of one tenant; nothing to do without history.
