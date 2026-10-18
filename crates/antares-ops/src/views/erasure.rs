@@ -128,10 +128,9 @@ async fn erase(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Response
     if let Some(why) = invalid(&req) {
         return Ok(refused(&why));
     }
-    let counts = apply(&r.state, &t, &req.entities, req.attrs.as_deref(), None).await?;
     let id = antares_api::erasure::record_id();
     let key = format!("{ERASURE_ID_PREFIX}{}:{id}", t.as_str());
-    let record = json!({
+    let mut record = json!({
         "id": key,
         "operation": "erase",
         "tenant": t.as_str(),
@@ -141,8 +140,14 @@ async fn erase(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Response
         "actor": req.actor,
         "reason": req.reason,
         "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        "counts": counts,
     });
+    // the tombstone first: nothing is deleted without one, and an erasure
+    // that fails halfway is finished by the next start's re-apply
+    r.state.put_view_doc(&key, record.clone()).await?;
+    let counts = apply(&r.state, &t, &req.entities, req.attrs.as_deref(), None).await?;
+    if let Some(o) = record.as_object_mut() {
+        o.insert("counts".into(), counts.clone());
+    }
     r.state.put_view_doc(&key, record.clone()).await?;
     r.reload().await?;
     tracing::info!(tenant = t.as_str(), erasure = %id, %counts, "personal data erased");
