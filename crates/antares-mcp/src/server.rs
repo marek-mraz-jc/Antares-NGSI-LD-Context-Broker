@@ -2,9 +2,11 @@
 //! The MCP server of one view, for one request: discovery, the tool list
 //! and calls, and the resources (MCP sections 3, 4, 6 and 8).
 
+use crate::budget::{self, State};
 use crate::confirm;
 use crate::listen::{self, LIFETIME, MAX_URIS, SCHEME};
-use crate::schema::{self, Checked, Names};
+use crate::schema::{self, Args, Checked, Names};
+use crate::summary::{self, Basis, BasisReason};
 use crate::tools::{self, Built, ToolDef, TOOLS};
 use crate::units;
 use crate::{cursor, MAX_RESULT_BYTES_ENV};
@@ -276,6 +278,147 @@ impl Server {
 
     /// `describe_type` (T-4537): `get_type` through the view, so the gate decides as it does for
     /// it, then the type's guide as text first and JSON after, with what `get_type` answered.
+    /// `summarize` (T-4680): loads the caller's rows of one type through the
+    /// same `QueryEntities` run as `query_entities`, within the budget the
+    /// server's load allows, and answers their profile, never the rows.
+    async fn summarize(
+        &self,
+        tool: &'static ToolDef,
+        given: &serde_json::Map<String, Value>,
+    ) -> CallToolResult {
+        let mut args = match schema::check_all(tool.args, given, &self.names()) {
+            Ok(args) => args,
+            Err(why) => return refused(&why),
+        };
+        let entity_type = match args.get("type") {
+            Some(Checked::Many(types)) if types.len() == 1 => types.first().cloned(),
+            _ => None,
+        };
+        let Some(entity_type) = entity_type else {
+            return refused("argument type: summarize takes exactly one type");
+        };
+        let lang = match args.get("lang") {
+            Some(Checked::One(s)) => Some(s.clone()),
+            _ => None,
+        };
+        args.insert("format", Checked::One("normalized".into()));
+        args.insert("count", Checked::Flag(true));
+        let started = std::time::Instant::now();
+        let state = budget::current_state();
+        metrics::counter!("antares_summary_state_total", "state" => state.as_str()).increment(1);
+        let Some(_permit) = budget::acquire_permit(
+            &budget::CONCURRENCY,
+            *budget::SUMMARY_CONCURRENCY,
+            state,
+            budget::PERMIT_WAIT,
+        )
+        .await
+        else {
+            return refused("the server is busy; retry after 2 seconds");
+        };
+        let loaded = match self.load(tool, args, state).await {
+            Ok(loaded) => loaded,
+            Err(failure) => return failure,
+        };
+        tracing::info!(
+            view = %self.id,
+            tool = tool.name,
+            state = state.as_str(),
+            rows = loaded.rows.len(),
+            "mcp summary"
+        );
+        let basis = Basis {
+            loaded: loaded.rows.len(),
+            total: loaded.total,
+            reason: loaded.reason,
+            skipped: loaded.skipped,
+        };
+        let mut profile = summary::profile(&loaded.rows, loaded.total, basis, lang.as_deref());
+        profile.entity_type = entity_type;
+        let wide = |n: usize| f64::from(u32::try_from(n).unwrap_or(u32::MAX));
+        metrics::histogram!("antares_summary_rows").record(wide(loaded.rows.len()));
+        metrics::histogram!("antares_summary_bytes").record(wide(loaded.bytes));
+        metrics::histogram!("antares_summary_ms").record(started.elapsed().as_secs_f64() * 1000.0);
+        let mut result = CallToolResult::structured(profile.to_json());
+        result.content = vec![ContentBlock::text(summary::render(&profile))];
+        result
+    }
+
+    /// The pages of a summary's rows within the state's row and byte budget;
+    /// the first page carries the broker's count, and a Tight state loads none.
+    async fn load(
+        &self,
+        tool: &'static ToolDef,
+        mut args: Args,
+        state: State,
+    ) -> Result<Loaded, CallToolResult> {
+        let allowed = budget::budget_for(state);
+        let mut out = Loaded {
+            rows: Vec::new(),
+            bytes: 0,
+            skipped: 0,
+            total: None,
+            reason: if state == State::Tight {
+                BasisReason::Tight
+            } else {
+                BasisReason::All
+            },
+        };
+        let mut offset = 0u64;
+        loop {
+            let want = allowed.max_rows.saturating_sub(out.rows.len()).min(1000);
+            let first = offset == 0;
+            let limit = u64::try_from(want).unwrap_or(1000);
+            let answer = self
+                .run(tool.op, tools::build(tool, &args, limit, offset))
+                .await;
+            if !answer.status.is_success() {
+                return Err(failed(&answer));
+            }
+            if first {
+                out.total = answer.count;
+                args.remove("count");
+            }
+            let page = match answer.body {
+                Value::Array(page) => page,
+                _ => Vec::new(),
+            };
+            let got = page.len();
+            for row in page {
+                match budget::admit(&row, out.bytes, allowed.max_bytes) {
+                    budget::Admit::Keep(size) => {
+                        out.bytes = out.bytes.saturating_add(size);
+                        out.rows.push(row);
+                    }
+                    budget::Admit::Skip => out.skipped = out.skipped.saturating_add(1),
+                    budget::Admit::Full => {
+                        out.reason = BasisReason::MemoryLimit;
+                        return Ok(out);
+                    }
+                }
+                if out.rows.len() >= allowed.max_rows {
+                    break;
+                }
+            }
+            if want == 0 || got < want {
+                return Ok(out);
+            }
+            if out.rows.len() >= allowed.max_rows {
+                let seen =
+                    u64::try_from(out.rows.len().saturating_add(out.skipped)).unwrap_or(u64::MAX);
+                if out.total.is_none_or(|t| t > seen) {
+                    out.reason = if state == State::Busy {
+                        BasisReason::Busy
+                    } else {
+                        BasisReason::RowLimit
+                    };
+                }
+                return Ok(out);
+            }
+            offset = offset.saturating_add(u64::try_from(got).unwrap_or(u64::MAX));
+        }
+    }
+
     async fn describe(
         &self,
         tool: &'static ToolDef,
@@ -386,6 +529,15 @@ impl Server {
         }
         CallToolResult::structured(Value::Object(out))
     }
+}
+
+/// The rows a summary loaded and what stopped it (T-4680).
+struct Loaded {
+    rows: Vec<Value>,
+    bytes: usize,
+    skipped: usize,
+    total: Option<u64>,
+    reason: BasisReason,
 }
 
 /// Ends a stream however its `listen` ends: forgets it and deletes its
@@ -680,6 +832,9 @@ impl ServerHandler for Server {
         let given = request.arguments.unwrap_or_default();
         if describe {
             return Ok(self.describe(tool, &given).await.into());
+        }
+        if request.name == "summarize" {
+            return Ok(self.summarize(tool, &given).await.into());
         }
         Ok(self.call(tool, &given).await.into())
     }

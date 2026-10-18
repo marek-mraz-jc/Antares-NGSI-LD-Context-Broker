@@ -62,12 +62,27 @@ a source name. Each call is inverted and rebuilt as on the view root.
 | `query_entities` | Query Entities (10.4.3) | yes |
 | `query_temporal` | Temporal Query (11.3.3) | yes |
 | `retrieve_temporal` | Temporal Retrieve (11.3.2) | no |
+| `summarize` | Query Entities (10.4.3), Entity type summary profile | no |
 
 `describe_type` is listed wherever `get_type` is and runs the same gated
 operation; its answer opens with the type's query guide as text (time axis,
 place, filters, example calls, naming only shown attributes), then the same
 guide as JSON under `guide` beside what `get_type` answers (T-4537). A shown
 type no Entity has yet still gets its guide.
+
+`summarize` (T-4680) runs `query_entities`' operation and is listed wherever
+it is. It answers a profile of one Entity type instead of its Entities: the
+broker's count of what the caller reads and, per Attribute, statistics over at
+most 1,000 of those Entities (min, max, mean, median, standard deviation,
+percentiles, a histogram, the most common values, the bounding box of a
+GeoProperty), plus five sample Entities, as terse text and as JSON under
+`summary`. `basis` says what the statistics cover. The budget follows the
+broker's load, read from its cgroup and the node's `MemAvailable`: 1,000 rows
+and 32 MiB when normal, 250 rows and 8 MiB when busy, and only the count when
+tight; a row over 1 MiB is skipped and counted. At most four summaries run at
+once (a busy one runs alone); one that waits 2 s for its turn is a tool error
+saying so. Use it for a broad question; use `query_entities` for specific
+Entities.
 
 The write tools (section 3) are listed the same way:
 

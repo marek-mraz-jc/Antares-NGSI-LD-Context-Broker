@@ -45,11 +45,15 @@ async fn input_schemas_list_only_visible_names() -> Result<(), String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_tool_list_is_the_allowlist_filtered_by_the_engine() -> Result<(), String> {
     let f = fixture().await?;
-    assert_eq!(tool_names(&f.app, "few").await, vec!["query_entities"]);
+    // `summarize` reads through the same operation, so the same view offers it (T-4680).
+    assert_eq!(
+        tool_names(&f.app, "few").await,
+        vec!["query_entities", "summarize"]
+    );
     let all = tool_names(&f.app, "cars").await;
     assert_eq!(
         all.len(),
-        14,
+        15,
         "every read tool but the Subscription ones, and describe_type: {all:?}"
     );
     let f = fixture_with(Some(Arc::new(NoTypes))).await?;
@@ -60,7 +64,7 @@ async fn the_tool_list_is_the_allowlist_filtered_by_the_engine() -> Result<(), S
             "clause 5.7.5 serves both: {less:?}"
         );
     }
-    assert_eq!(less.len(), 12, "{less:?}");
+    assert_eq!(less.len(), 13, "{less:?}");
     Ok(())
 }
 

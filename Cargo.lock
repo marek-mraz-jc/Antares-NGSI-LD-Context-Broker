@@ -223,6 +223,7 @@ dependencies = [
  "axum",
  "chrono",
  "http-body-util",
+ "metrics",
  "rmcp",
  "serde_json",
  "tokio",
