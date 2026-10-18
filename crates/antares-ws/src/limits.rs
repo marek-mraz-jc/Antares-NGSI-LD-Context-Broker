@@ -15,6 +15,8 @@ pub const QUEUE_ENV: &str = "ANTARES_WS_QUEUE";
 /// The variable of the bound of the same name (the broker knows it as a config key).
 pub const RESUME_GRACE_ENV: &str = "ANTARES_WS_RESUME_GRACE_SECS";
 /// The variable of the bound of the same name (the broker knows it as a config key).
+pub const SUBSCRIPTION_LEASE_ENV: &str = "ANTARES_WS_SUBSCRIPTION_LEASE_SECS";
+/// The variable of the bound of the same name (the broker knows it as a config key).
 pub const MAX_LIFETIME_ENV: &str = "ANTARES_WS_MAX_LIFETIME_SECS";
 /// The variable of the bound of the same name (the broker knows it as a config key).
 pub const MAX_CONNECTIONS_ENV: &str = "ANTARES_WS_MAX_CONNECTIONS";
@@ -30,6 +32,7 @@ pub const ALLOWED_ORIGINS_ENV: &str = "ANTARES_WS_ALLOWED_ORIGINS";
 pub const ENV_KEYS: &[&str] = &[
     QUEUE_ENV,
     RESUME_GRACE_ENV,
+    SUBSCRIPTION_LEASE_ENV,
     MAX_LIFETIME_ENV,
     MAX_CONNECTIONS_ENV,
     MAX_CONNECTIONS_PER_TENANT_ENV,
@@ -46,6 +49,10 @@ pub struct Limits {
     /// `ANTARES_WS_RESUME_GRACE_SECS`: how long a closed connection's
     /// Subscriptions and ring wait for a resume.
     pub resume_grace: Duration,
+    /// `ANTARES_WS_SUBSCRIPTION_LEASE_SECS`: the most a Subscription made
+    /// over a socket lives past its last renewal, so one a dead process
+    /// held expires (rule 7a).
+    pub subscription_lease: Duration,
     /// `ANTARES_WS_MAX_LIFETIME_SECS`: a socket ends at this age (W7).
     pub max_lifetime: Duration,
     /// `ANTARES_WS_MAX_CONNECTIONS` (W2).
@@ -71,6 +78,7 @@ impl Default for Limits {
         Self {
             queue: 256,
             resume_grace: Duration::from_secs(30),
+            subscription_lease: Duration::from_secs(300),
             max_lifetime: Duration::from_secs(300),
             max_connections: 10_000,
             max_connections_per_tenant: 1_000,
@@ -110,9 +118,22 @@ impl Limits {
         let secs = |name: &str, default: Duration| -> Result<Duration, String> {
             Ok(set(name)?.map_or(default, Duration::from_secs))
         };
+        let resume_grace = secs(RESUME_GRACE_ENV, d.resume_grace)?;
+        let subscription_lease = secs(SUBSCRIPTION_LEASE_ENV, d.subscription_lease)?;
+        // the last renewal is at most a third of the lease and one Ping old
+        // when a socket closes; the grace must end before the lease does
+        let floor = resume_grace.saturating_add(d.ping_every).saturating_mul(2);
+        if subscription_lease <= floor {
+            return Err(format!(
+                "{SUBSCRIPTION_LEASE_ENV}={} must exceed {} (twice the resume grace plus the Ping interval)",
+                subscription_lease.as_secs(),
+                floor.as_secs()
+            ));
+        }
         Ok(Self {
             queue: count(QUEUE_ENV, d.queue)?,
-            resume_grace: secs(RESUME_GRACE_ENV, d.resume_grace)?,
+            resume_grace,
+            subscription_lease,
             max_lifetime: secs(MAX_LIFETIME_ENV, d.max_lifetime)?,
             max_connections: count(MAX_CONNECTIONS_ENV, d.max_connections)?,
             max_connections_per_tenant: count(
@@ -139,6 +160,7 @@ impl Limits {
         json!({
             "queue": self.queue,
             "resumeGraceSecs": self.resume_grace.as_secs(),
+            "subscriptionLeaseSecs": self.subscription_lease.as_secs(),
             "maxLifetimeSecs": self.max_lifetime.as_secs(),
             "maxConnections": self.max_connections,
             "maxConnectionsPerTenant": self.max_connections_per_tenant,
@@ -177,6 +199,19 @@ mod tests {
             assert!(e.is_err(), "{bad}");
         }
         assert_eq!(Limits::default().health().get("queue"), Some(&json!(256)));
+        // a lease the grace could outlast stops the broker
+        let short = Limits::from_env(|k| (k == SUBSCRIPTION_LEASE_ENV).then(|| "120".to_owned()));
+        assert!(short.is_err(), "{short:?}");
+        let long = Limits::from_env(|k| match k {
+            "ANTARES_WS_SUBSCRIPTION_LEASE_SECS" => Some("121".into()),
+            _ => None,
+        })?;
+        assert_eq!(long.subscription_lease, Duration::from_secs(121));
+        let graced = Limits::from_env(|k| (k == RESUME_GRACE_ENV).then(|| "300".to_owned()));
+        assert!(
+            graced.is_err(),
+            "the default lease is shorter than this grace"
+        );
         Ok(())
     }
 }

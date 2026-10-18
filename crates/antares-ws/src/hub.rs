@@ -56,6 +56,9 @@ struct State {
     lost: Option<(u64, u64)>,
     /// The Subscriptions this connection made, with their `showChanges`.
     subs: BTreeMap<String, bool>,
+    /// The `expiresAt` the client asked of a Subscription, earlier or later
+    /// than its lease (rule 7a).
+    wishes: BTreeMap<String, String>,
     /// The socket serving it now, by generation; `None` within grace.
     attached: Option<u64>,
     generation: u64,
@@ -105,7 +108,23 @@ impl Conn {
     }
 
     pub fn forget(&self, sub: &str) {
-        lock(&self.state).subs.remove(sub);
+        let mut st = lock(&self.state);
+        st.subs.remove(sub);
+        st.wishes.remove(sub);
+    }
+
+    /// The `expiresAt` the client asked of `sub`, `None` for no expiry.
+    pub fn want(&self, sub: &str, wish: Option<String>) {
+        let mut st = lock(&self.state);
+        match wish {
+            Some(w) => st.wishes.insert(sub.to_owned(), w),
+            None => st.wishes.remove(sub),
+        };
+    }
+
+    /// What [`Conn::want`] last recorded for `sub`.
+    pub fn wish(&self, sub: &str) -> Option<String> {
+        lock(&self.state).wishes.get(sub).cloned()
     }
 
     pub fn is_attached(&self, generation: u64) -> bool {
