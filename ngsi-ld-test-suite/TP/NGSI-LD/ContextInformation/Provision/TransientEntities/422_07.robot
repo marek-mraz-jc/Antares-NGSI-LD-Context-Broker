@@ -7,12 +7,12 @@ Documentation       4.22 × Temporal Evolution (Antares extension TP). What crea
 ...                 it appends NOTHING; (c) a transient attribute's instances carry
 ...                 its expiresAt (5.2.5: expiry of "the storage of the Property"),
 ...                 so at expiry its history vanishes from temporal reads while the
-...                 durable sibling's history stays; (d) entity-level expiry kills
-...                 the CURRENT state only — the Temporal Evolution survives,
-...                 mirroring Delete Entity (5.6.6) semantics where history also
-...                 outlives the entity (CIM 009 is silent on cascading expiry to
-...                 the temporal evolution; the delete analogy is the documented
-...                 Antares reading).
+...                 durable sibling's history stays; (d) entity-level expiry takes
+...                 the Entity's Temporal Evolution with it (CIM 009 is silent on
+...                 cascading expiry to the temporal evolution; the platform's
+...                 DM-97, owner 2026-10-18, decides it: an Entity its own
+...                 expiresAt removes loses its history, T-4414). Delete Entity
+...                 (5.6.6) still leaves history in place.
 
 Library             DateTime
 Resource            ${EXECDIR}/resources/ApiUtils/Common.resource
@@ -85,7 +85,7 @@ ${TEMPORAL_QS}          timerel=before&timeAt=2030-01-01T00:00:00Z&timeproperty=
     ${steady}=    Evaluate    [v[0] for v in $body["steady"]["values"]]
     Should Be Equal    ${steady}    ${{[100]}}    durable history intact, exact values
 
-422_07_03 Entity Expiry Kills Current State But History Survives
+422_07_03 Entity Expiry Takes Current State And History
     [Tags]    transient    4_22    troe
     ${eid_ent}=    Generate Random Building Entity Id
     Set Suite Variable    ${eid_ent}
@@ -103,11 +103,9 @@ ${TEMPORAL_QS}          timerel=before&timeAt=2030-01-01T00:00:00Z&timeproperty=
     Sleep    ${EXPIRY_SECONDS + 2}s
     ${response}=    Retrieve Entity    id=${eid_ent}    context=${ngsild_test_suite_context}
     Check Response Status Code    404    ${response.status_code}
+    # DM-97 (owner 2026-10-18, T-4414): the expiry sweep removes the Entity's history with it
     ${response}=    Temporal Retrieve    ${eid_ent}
-    Check Response Status Code    200    ${response.status_code}
-    ${values}=    Temporal Values Of    ${eid_ent}    temperature
-    ${nums}=    Evaluate    sorted(v[0] for v in $values)
-    Should Be Equal    ${nums}    ${{[7, 8]}}    the attribute's full history outlives the entity
+    Check Response Status Code    404    ${response.status_code}
 
 
 *** Keywords ***
