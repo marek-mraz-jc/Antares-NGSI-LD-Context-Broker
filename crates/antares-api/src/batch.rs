@@ -913,6 +913,10 @@ async fn batch_write(
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     check_params(params, &["options", "local"])?;
+    // T-4562: a batch runs only inside the in-flight budget, held until it answers.
+    let _admitted = crate::bounds::admit_batch(body.len())
+        .await
+        .ok_or(ApiError::Overloaded(crate::negotiate::RETRY_AFTER_SECONDS))?;
     // 6.3.7: `options` is a comma separated list of strings, so a mode is
     // selected when it appears as ONE MEMBER of the list — never by
     // whole-string equality. 6.15.3.1 replace (default) | update for
