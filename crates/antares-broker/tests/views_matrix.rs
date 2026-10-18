@@ -427,10 +427,13 @@ async fn odata(app: &Router, s: &Scenario) -> Read {
 }
 
 /// The OData EntitySets of `types` with the options `extra`, following
-/// `@odata.nextLink`; a set the view does not serve (404) holds nothing.
+/// `@odata.nextLink`; a set the view does not serve (404) holds nothing, and
+/// one it refuses (403) too, as a read naming several types leaves a refused
+/// one out (T-4455): refused only when every set is.
 async fn odata_read(app: &Router, s: &Scenario, types: &[String], extra: &str) -> Read {
     let who = with_tenant(s);
     let (mut out, mut twice, mut total) = (Answer::new(), Vec::new(), 0u64);
+    let mut refused = Vec::new();
     for t in types {
         let mut uri = format!("/x/views/{}/odata/v4/{t}?$count=true{extra}", s.view());
         let mut first = true;
@@ -444,6 +447,10 @@ async fn odata_read(app: &Router, s: &Scenario, types: &[String], extra: &str) -
             }
             let (status, _, body) = send(app, "GET", &uri, &paged, None).await;
             if status == StatusCode::NOT_FOUND && first {
+                break;
+            }
+            if status == StatusCode::FORBIDDEN && first {
+                refused.push(Read::Refused(status, body));
                 break;
             }
             if status != StatusCode::OK {
@@ -481,6 +488,11 @@ async fn odata_read(app: &Router, s: &Scenario, types: &[String], extra: &str) -
             }
         }
     }
+    if !types.is_empty() && refused.len() == types.len() {
+        if let Some(refusal) = refused.pop() {
+            return refusal;
+        }
+    }
     if !twice.is_empty() {
         out.insert(format!("twice: {twice:?}"), BTreeSet::new());
     }
@@ -496,10 +508,13 @@ async fn ogc(app: &Router, s: &Scenario) -> Read {
 
 /// OGC API Features items of the collections `types` with the parameters
 /// `extra`, following `rel=next`; a collection the view does not serve
-/// (404) holds nothing.
+/// (404) holds nothing, and one it refuses (403) too, as a read naming
+/// several types leaves a refused one out (T-4455): refused only when every
+/// collection is.
 async fn ogc_read(app: &Router, s: &Scenario, types: &[String], extra: &str) -> Read {
     let who = with_tenant(s);
     let (mut out, mut twice, mut total) = (Answer::new(), Vec::new(), 0u64);
+    let mut refused = Vec::new();
     for t in types {
         let mut uri = format!(
             "/x/views/{}/ogc/features/collections/{t}/items?limit={PAGE}{extra}",
@@ -514,6 +529,10 @@ async fn ogc_read(app: &Router, s: &Scenario, types: &[String], extra: &str) -> 
             }
             let (status, _, body) = send(app, "GET", &uri, &who, None).await;
             if status == StatusCode::NOT_FOUND && first {
+                break;
+            }
+            if status == StatusCode::FORBIDDEN && first {
+                refused.push(Read::Refused(status, body));
                 break;
             }
             if status != StatusCode::OK {
@@ -557,6 +576,11 @@ async fn ogc_read(app: &Router, s: &Scenario, types: &[String], extra: &str) -> 
                 Some(n) => uri = n,
                 None => break,
             }
+        }
+    }
+    if !types.is_empty() && refused.len() == types.len() {
+        if let Some(refusal) = refused.pop() {
+            return refusal;
         }
     }
     if !twice.is_empty() {

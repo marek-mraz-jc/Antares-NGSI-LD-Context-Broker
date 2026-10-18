@@ -328,7 +328,12 @@ async fn a_prohibition_overrides_a_permission_that_would_have_matched() -> Res {
     let all = grant("all", "group", "city", &["5.7.2"], json!([]));
     let (st, _) = broker(doc(&[all, deny])).await?;
     fleet(&st).await?;
+    // a read naming the prohibited type beside others leaves it out (T-4455)
     let (code, body) = send(&st, "GET", QUERY, &ANA, None).await?;
+    assert_eq!((code, ids(&body)), (StatusCode::OK, car_ids(&[1, 2, 3])));
+    assert!(!body.to_string().contains("no-secret"), "{body}");
+    // a read naming only the prohibited type is refused
+    let (code, body) = send(&st, "GET", "/ngsi-ld/v1/entities?type=Secret", &ANA, None).await?;
     assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
     assert!(!body.to_string().contains("no-secret"), "{body}");
     // asking for a type it does not name is not prohibited
@@ -1020,6 +1025,20 @@ async fn an_app_view_is_decided_by_its_own_grant_and_the_prohibition() -> Res {
     .await?;
     assert_eq!((code, ids(&list)), (StatusCode::OK, car_ids(&[1, 2, 3])));
     let (code, body) = through("app-x", &st, "GET", QUERY, &APP, None).await?;
+    assert_eq!(
+        (code, ids(&body)),
+        (StatusCode::OK, car_ids(&[1, 2, 3])),
+        "the prohibition leaves Secret out"
+    );
+    let (code, body) = through(
+        "app-x",
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Secret",
+        &APP,
+        None,
+    )
+    .await?;
     assert_eq!(code, StatusCode::FORBIDDEN, "the prohibition holds: {body}");
     let new = car(9, 1, "/geo/SK/BB");
     let (code, body) = through(

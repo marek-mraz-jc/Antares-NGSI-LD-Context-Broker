@@ -356,7 +356,7 @@ async fn write_tools_are_offered_only_where_the_view_allows_them() -> Result<(),
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    assert_eq!(tools.len(), 30, "{}", listed.text);
+    assert_eq!(tools.len(), 31, "{}", listed.text);
     let hint = |name: &str, hint: &str| {
         tools
             .iter()

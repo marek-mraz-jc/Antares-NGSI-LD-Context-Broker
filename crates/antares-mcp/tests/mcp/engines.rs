@@ -25,6 +25,10 @@ pub struct NoTypes;
 /// names nothing, passes and the call is refused at its gate.
 pub struct NoNamedTypes;
 
+/// Denies the information of a named type (clause 5.7.7), so the probe passes and
+/// `get_type` and `describe_type` are refused at their gate.
+pub struct NoTypeInfo;
+
 /// Denies Create Subscription (clause 5.8.1): a stream watches nothing.
 pub struct NoSubscriptions;
 
@@ -79,6 +83,23 @@ impl PolicyEngine for NoNamedTypes {
             Decision::Allow
         } else {
             Decision::Deny("denied: speed<80 on secret".into())
+        };
+        Box::pin(std::future::ready(d))
+    }
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        notify()
+    }
+}
+
+impl PolicyEngine for NoTypeInfo {
+    fn name(&self) -> &'static str {
+        "no-type-info"
+    }
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        let d = if op.clause != "5.7.7" || op.types.is_empty() {
+            Decision::Allow
+        } else {
+            Decision::Deny("denied: the type is not shared".into())
         };
         Box::pin(std::future::ready(d))
     }

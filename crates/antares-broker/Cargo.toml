@@ -55,6 +55,7 @@ antares-mcp = { workspace = true, optional = true }
 antares-linkml = { workspace = true, optional = true }
 antares-odata = { workspace = true, optional = true }
 antares-ogc = { workspace = true, optional = true }
+antares-sta = { workspace = true, optional = true }
 antares-ws = { workspace = true, optional = true }
 antares-icsr = { workspace = true, optional = true }
 
@@ -114,6 +115,10 @@ parquet = ["ogc", "antares-ogc/parquet"]
 # ZIP bundle of every collection (T-4477): `f=csv|xlsx|zip`. Beside `full`
 # for the same budget reason as `parquet`.
 tabular = ["ogc", "antares-ogc/tabular"]
+# `/x/views/{view}/sta/v1.1`, OGC SensorThings API v1.1 Sensing read only, from
+# the view's Query, Retrieve and temporal answers (T-4462,
+# `ANTARES_API_SURFACES=admin,views,sta`).
+sta = ["views", "dep:antares-sta"]
 
 # The WebSocket notification channel (ADR-0026, T-3517): `/x/ws/ngsi-ld/v1`
 # (`ANTARES_API_SURFACES=...,ws`), and with `views` also
@@ -128,7 +133,7 @@ internal-csr = ["views", "dep:antares-icsr"]
 # Every surface the broker serves (ADR-0027 Consequences, T-3636): what
 # `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
 # sets it; the platform image builds `full,jc-policy,linkml,parquet,tabular` (image-jc.yml).
-full = ["views", "mcp", "odata", "ogc", "ws"]
+full = ["views", "mcp", "odata", "ogc", "sta", "ws"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
 # Unix-only: the wasm target keeps the default allocator.

@@ -90,12 +90,15 @@ pub(crate) fn build(
     let mut out = BTreeMap::new();
     for (&class_name, &(class, attrs)) in &classes {
         let type_iri = schema.class_iri(class_name);
-        let slots: Vec<Prop> = schema
+        let mut slots: Vec<Prop> = schema
             .class_slots(class_name)
             .into_iter()
             .map(|(name, slot)| prop(schema, name, &slot, |c| classes.contains_key(c)))
             .filter(|p| attrs.contains(&p.iri))
             .collect();
+        if let Some(guide) = antares_ops::guide::of(class_name) {
+            guided(guide, &mut slots);
+        }
         let role = |wanted: &str| {
             slots
                 .iter()
@@ -130,6 +133,51 @@ pub(crate) fn build(
         );
     }
     out
+}
+
+/// The roles the type's query guide gives (T-4537) to the shown slots, where the schema
+/// annotates none of that kind: the time axis and a `GeoProperty` place.
+fn guided(guide: &antares_ops::guide::Guide, slots: &mut [Prop]) {
+    use antares_ops::guide::Time;
+    let annotated = |slots: &[Prop], roles: &[&str]| {
+        slots
+            .iter()
+            .any(|p| p.role.as_deref().is_some_and(|r| roles.contains(&r)))
+    };
+    let give = |slots: &mut [Prop], name: &str, role: &str| {
+        for p in slots
+            .iter_mut()
+            .filter(|p| p.name == name && p.role.is_none())
+        {
+            p.role = Some(role.to_owned());
+        }
+    };
+    let times = [
+        "primary-instant",
+        "primary-interval-start",
+        "primary-interval-end",
+    ];
+    if !annotated(slots, &times) {
+        let names: Vec<String> = slots.iter().map(|p| p.name.clone()).collect();
+        match guide.time_in(|a| names.iter().any(|n| n == a)) {
+            Some(Time::Instant(at)) => give(slots, at, "primary-instant"),
+            Some(Time::Range(start, end)) => {
+                give(slots, start, "primary-interval-start");
+                give(slots, end, "primary-interval-end");
+            }
+            None => {}
+        }
+    }
+    if !annotated(slots, &["primary-geometry"]) {
+        let place = guide.place.iter().find(|a| {
+            slots
+                .iter()
+                .any(|p| p.name == **a && p.kind == "GeoProperty")
+        });
+        if let Some(place) = place {
+            give(slots, place, "primary-geometry");
+        }
+    }
 }
 
 /// One slot as a Feature property: its value's JSON Schema by NGSI-LD kind and range, as

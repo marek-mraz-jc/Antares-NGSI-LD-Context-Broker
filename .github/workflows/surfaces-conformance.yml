@@ -99,8 +99,9 @@ env:
   # OData parity rows the residual serves (T-3981), the last two together on
   # conformance main since its merge of T-3512 (T-4003); plus the broker parity
   # cases for T-4258's format/sysAttrs/orderBy, one commit on top (branch
-  # pin/antares-surfaces, same change as conformance main 494cd93)
-  CONFORMANCE_REF: ebf84502b243163ee912e7d57cc26d6dc1e7a6f4
+  # pin/antares-surfaces, same change as conformance main 494cd93), and the
+  # describe_type parity case (T-4537, T-4559; conformance main 2594d95)
+  CONFORMANCE_REF: 78d0e18aca152f8fbee221ced7579c8e32ac5dcc
   NIGHTLY: ${{ github.event_name != 'pull_request' && !inputs.fast }}
 
 jobs:
