@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "antares-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-notifier",
  "antares-store",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "antares-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-ops",
  "axum",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "antares-notifier"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ngsild-jsonld",
  "ngsild-model",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "antares-ops"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-api",
  "axum",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "antares-sql"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-store",
  "async-trait",
@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "antares-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "antares-ws"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "antares-ops",
  "axum",
@@ -1319,7 +1319,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "linkml-model"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "moka",
  "serde",
@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-jsonld"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "futures-util",
@@ -1423,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-matcher"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "ngsild-jsonld",
@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-model"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-ql"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "geo",
  "geo-types",
@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "ngsild-residual"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "geo",
  "regex",
@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "odata-batch"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "memchr",
  "serde_json",
@@ -1485,14 +1485,14 @@ dependencies = [
 
 [[package]]
 name = "odata-csdl"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "regex",
 ]
 
 [[package]]
 name = "odata-json"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "odata-csdl",
  "odata-url",
@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "odata-url"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "odata-csdl",
 ]
