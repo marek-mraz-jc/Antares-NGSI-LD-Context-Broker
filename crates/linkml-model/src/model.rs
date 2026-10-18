@@ -557,6 +557,8 @@ fn refine(slot: &mut Slot, usage: &Slot) {
     over(&mut slot.inverse, usage.inverse.as_ref());
     over(&mut slot.unit, usage.unit.as_ref());
     over(&mut slot.description, usage.description.as_ref());
+    over(&mut slot.rank, usage.rank.as_ref());
+    over(&mut slot.title, usage.title.as_ref());
     slot.annotations.extend(
         usage
             .annotations

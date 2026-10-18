@@ -355,3 +355,112 @@ fn the_cube_names_each_component_by_its_role() {
     assert_eq!(linkml_model::qb(&building), None);
     assert!(!linkml_model::owl(&building).contains("qb:"));
 }
+
+/// T-4672 (DM-98…DM-103): the SHACL carries the display order as
+/// `sh:order`, the key attributes and the rest as two `sh:PropertyGroup`s,
+/// each label as a language-tagged `sh:name`, and `rank`/`title` survive the
+/// LinkML round trip. A tag that is no language tag never reaches Turtle.
+#[test]
+fn shacl_carries_the_display_order_groups_and_labels() {
+    let doc = serde_json::json!({
+        "id": "https://e.org/s", "name": "s",
+        "classes": {
+            "Thing": {"slots": ["located"]},
+            "Event": {
+                "is_a": "Thing",
+                "slots": ["id", "name", "description", "startDate", "located"],
+                "slot_usage": {
+                    "startDate": {"rank": 1, "annotations": {
+                        "summary": {"tag": "summary", "value": "true"},
+                        "label": {"tag": "label", "value": "{\"sk\":\"Začiatok\",\"en\":\"Start\",\"x\\\" ; a <y>\":\"bad\"}"}
+                    }},
+                    "name": {"annotations": {"summary": {"tag": "summary", "value": "true"}}}
+                }
+            }
+        },
+        "slots": {
+            "id": {}, "name": {"title": "Name"}, "description": {}, "startDate": {"range": "datetime"},
+            "located": {}
+        }
+    });
+    let model = Model::read(doc.to_string().as_bytes(), &LIMITS).unwrap();
+    let shapes = linkml_model::shacl(&model);
+    let event = shapes.split("<https://e.org/s/EventShape>").nth(1).unwrap();
+    let event = event.split(" .\n").next().unwrap();
+    let order: Vec<&str> = event
+        .split("sh:property [")
+        .skip(1)
+        .map(|p| {
+            p.split("sh:name \"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(order, ["startDate", "name", "description", "located", "id"]);
+    let property = |name: &str| {
+        event
+            .split("sh:property [")
+            .find(|p| p.contains(&format!("sh:name \"{name}\"")))
+            .unwrap()
+    };
+    let start = property("startDate");
+    assert!(
+        start.contains("sh:name \"startDate\", \"Start\"@en, \"Začiatok\"@sk"),
+        "{start}"
+    );
+    assert!(
+        start.contains("sh:order 0") && start.contains("SummaryGroup>"),
+        "{start}"
+    );
+    assert!(
+        !start.contains("bad"),
+        "a hostile language tag is skipped: {start}"
+    );
+    assert!(property("name").contains("SummaryGroup>"));
+    assert!(
+        property("description").contains("sh:order 2")
+            && property("description").contains("DetailGroup>")
+    );
+    assert!(
+        property("id").contains("DetailGroup>"),
+        "id stays last and out of the summary"
+    );
+    assert_eq!(shapes.matches("a sh:PropertyGroup").count(), 2);
+
+    let yaml = linkml_model::yaml(&model);
+    assert!(
+        yaml.contains("\"rank\": 1") && yaml.contains("\"title\": \"Name\""),
+        "{yaml}"
+    );
+}
+
+/// T-4672: a class that marks no key attribute takes its first four that
+/// are not hidden.
+#[test]
+fn without_summary_annotations_the_first_four_shown_slots_are_the_summary() {
+    let doc = serde_json::json!({
+        "id": "https://e.org/s", "name": "s",
+        "classes": {"Room": {"slots": ["a", "b", "c", "d", "e"],
+            "slot_usage": {"b": {"annotations": {"hidden": {"tag": "hidden", "value": "true"}}}}}},
+        "slots": {"a": {}, "b": {}, "c": {}, "d": {}, "e": {}}
+    });
+    let model = Model::read(doc.to_string().as_bytes(), &LIMITS).unwrap();
+    let shapes = linkml_model::shacl(&model);
+    let summary: Vec<&str> = shapes
+        .split("sh:property [")
+        .skip(1)
+        .filter(|p| p.contains("SummaryGroup>"))
+        .map(|p| {
+            p.split("sh:name \"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(summary, ["a", "c", "d", "e"]);
+}
