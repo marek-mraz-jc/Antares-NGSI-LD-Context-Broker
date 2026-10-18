@@ -340,7 +340,8 @@ pub fn install_csource_notification(state: &mut AppState) {
 }
 
 /// 4.22 for the documents that carry their own `expiresAt`: Registrations,
-/// Snapshots and EntityMaps. The store's own sweep reaps Entities, which is
+/// Snapshots and EntityMaps, and the leased Subscriptions of WebSocket
+/// connections (ADR-0026 rule 7a). The store's own sweep reaps Entities, which is
 /// what 4.22 names; these three are refused by every read once their expiry
 /// passes but nothing collected them, so they stayed for the life of the
 /// broker. Each kind is reaped by the predicate its own reader uses, so the
@@ -367,7 +368,8 @@ pub async fn sweep_expired_docs(st: &AppState) -> usize {
         n = n
             .saturating_add(csource::sweep_expired_registrations(st, &tenant).await)
             .saturating_add(snapshots::sweep_expired_snapshots(st, &tenant).await)
-            .saturating_add(entity_map::sweep_expired_maps(st, &tenant).await);
+            .saturating_add(entity_map::sweep_expired_maps(st, &tenant).await)
+            .saturating_add(subscriptions::sweep_expired_socket_subscriptions(st, &tenant).await);
     }
     n
 }
@@ -4336,6 +4338,62 @@ mod tests {
                 .is_none(),
             "the sweep left the row behind"
         );
+        assert_eq!(sweep_expired_docs(&st).await, 0, "the sweep is idempotent");
+    }
+
+    /// ADR-0026 rule 7a (T-4543): a socket Subscription whose lease passed
+    /// belongs to a connection no process holds, and the sweep deletes it;
+    /// a live lease, and a client's own expired Subscription, stay.
+    #[tokio::test]
+    async fn the_sweep_deletes_a_socket_subscription_whose_lease_passed() {
+        use antares_store::Kind;
+        let st = AppState::new("antares-sweep".into());
+        let t = antares_model::TenantId::default();
+        let sub = |id: &str, uri: &str, expires: &str| {
+            serde_json::json!({
+                "id": id,
+                "type": "Subscription",
+                "entities": [{"type": "Car"}],
+                "expiresAt": expires,
+                "notification": {"endpoint": {"uri": uri}},
+            })
+        };
+        let seeds = [
+            (
+                "urn:ngsi-ld:Subscription:ws-dead",
+                "urn:antares:ws:gone",
+                "2000-01-01T00:00:00Z",
+            ),
+            (
+                "urn:ngsi-ld:Subscription:ws-live",
+                "urn:antares:ws:here",
+                "2999-01-01T00:00:00Z",
+            ),
+            (
+                "urn:ngsi-ld:Subscription:http",
+                "http://n.example.com/n",
+                "2000-01-01T00:00:00Z",
+            ),
+        ];
+        for (id, uri, expires) in seeds {
+            st.store
+                .create(&t, Kind::Subscription, id, sub(id, uri, expires))
+                .await
+                .expect("seed");
+        }
+        assert_eq!(
+            sweep_expired_docs(&st).await,
+            1,
+            "only the lapsed lease goes"
+        );
+        for (id, _, _) in seeds {
+            let kept = st
+                .store
+                .get(&t, Kind::Subscription, id)
+                .await
+                .expect("store");
+            assert_eq!(kept.is_some(), id != seeds[0].0, "{id}");
+        }
         assert_eq!(sweep_expired_docs(&st).await, 0, "the sweep is idempotent");
     }
 

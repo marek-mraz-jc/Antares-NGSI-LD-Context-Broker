@@ -69,6 +69,7 @@ progress). A memory-store broker answers:
   "limits": {
     "changeQueue": 1024,
     "deliveryLane": 64,
+    "deliveryLaneBytes": 268435456,
     "deliveryWidth": 64,
     "deliveryWidthPerTenant": 8,
     "maxAnswerBytes": 67108864,
