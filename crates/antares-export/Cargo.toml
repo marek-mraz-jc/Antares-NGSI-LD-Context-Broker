@@ -1,6 +1,6 @@
 [package]
 name = "antares-export"
-description = "File encodings of a page-by-page answer: Apache Parquet and GeoParquet 1.1 (feature `parquet`), written one row group per page under a byte ceiling (T-4465, EP-119)."
+description = "File encodings of a page-by-page answer under a byte ceiling: Apache Parquet and GeoParquet 1.1 (feature `parquet`, T-4465, EP-119), CSV (`csv`), XLSX (`xlsx`) and a ZIP bundle (`zip`) (T-4477)."
 version.workspace = true
 edition.workspace = true
 publish = false
@@ -15,10 +15,18 @@ role = "protocol"
 default = []
 # Apache Parquet and GeoParquet 1.1, zstd-compressed, no arrow.
 parquet = ["dep:parquet"]
+# RFC 4180 CSV, no dependency.
+csv = []
+# Office Open XML workbooks: the XML is written here, the container by `zip`.
+xlsx = ["dep:zip"]
+# A ZIP bundle of files.
+zip = ["dep:zip"]
 
 [dependencies]
 parquet = { version = "60", default-features = false, features = ["zstd"], optional = true }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# 9.0.1, the version the context-gateway locks (T-4478 removes it there)
+zip = { version = "9.0.1", default-features = false, features = ["deflate"], optional = true }
 
 [dev-dependencies]
 bytes = { version = "1", default-features = false }

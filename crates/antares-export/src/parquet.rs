@@ -23,35 +23,10 @@ use parquet::file::writer::{
 use parquet::schema::types::Type;
 use serde_json::{json, Value};
 
-use crate::{wkb, Column, Kind};
+use crate::{distinct, text, wkb, Column, Error, Kind, Sink, GEOMETRY, ID};
 
 /// The media type of a Parquet file.
 pub const MEDIA_TYPE: &str = "application/vnd.apache.parquet";
-
-/// The column holding each Feature's id.
-pub const ID: &str = "id";
-/// The column holding each Feature's geometry as WKB.
-pub const GEOMETRY: &str = "geometry";
-
-/// Why no file was written.
-#[derive(Debug)]
-pub enum Error {
-    /// The file grew past the ceiling it was given.
-    TooLarge,
-    /// The writer refused the schema or a value.
-    Write(String),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TooLarge => f.write_str("the file is larger than the answer may be"),
-            Self::Write(why) => write!(f, "the file does not serialize: {why}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 impl From<ParquetError> for Error {
     fn from(e: ParquetError) -> Self {
@@ -86,11 +61,7 @@ impl Writer {
     /// # Errors
     /// [`Error::Write`] when the schema does not build.
     pub fn new(columns: Vec<Column>, geometry: bool, max_bytes: usize) -> Result<Self, Error> {
-        let mut named = BTreeSet::from([ID.to_owned(), GEOMETRY.to_owned()]);
-        let columns: Vec<Column> = columns
-            .into_iter()
-            .filter(|c| named.insert(c.name.clone()))
-            .collect();
+        let columns = distinct(columns);
         let mut fields = vec![field(
             ID,
             Physical::BYTE_ARRAY,
@@ -131,18 +102,6 @@ impl Writer {
             geometry: geometry.then(Seen::default),
             over,
         })
-    }
-
-    /// One page of `GeoJSON` Features as one row group; an empty page writes nothing.
-    ///
-    /// # Errors
-    /// [`Error::TooLarge`] past the ceiling, [`Error::Write`] when the writer refuses a value.
-    pub fn page(&mut self, features: &[Value]) -> Result<(), Error> {
-        if features.is_empty() {
-            return Ok(());
-        }
-        let written = self.group(features);
-        written.map_err(|e| refused(&self.over, e))
     }
 
     /// The row group of one page, its columns in the schema's order: the id, the geometry when
@@ -193,15 +152,28 @@ impl Writer {
         group.close()?;
         Ok(())
     }
+}
 
-    /// The whole file, its footer and the `geo` metadata written.
-    ///
-    /// # Errors
-    /// [`Error::TooLarge`] when the footer does not fit under the ceiling.
-    pub fn finish(mut self) -> Result<Vec<u8>, Error> {
+impl Sink for Writer {
+    /// One page as one row group; an empty page writes nothing.
+    fn page(&mut self, features: &[Value]) -> Result<(), Error> {
+        if features.is_empty() {
+            return Ok(());
+        }
+        let written = self.group(features);
+        written.map_err(|e| refused(&self.over, e))
+    }
+
+    /// The footer: the `geo` metadata when there is a geometry, and each provenance pair as
+    /// a key-value of the file.
+    fn finish(mut self: Box<Self>, provenance: &[(String, String)]) -> Result<Vec<u8>, Error> {
         if let Some(seen) = &self.geometry {
             self.file
                 .append_key_value_metadata(KeyValue::new("geo".to_owned(), geo(seen).to_string()));
+        }
+        for (key, value) in provenance {
+            self.file
+                .append_key_value_metadata(KeyValue::new(key.clone(), value.clone()));
         }
         let over = Arc::clone(&self.over);
         self.file
@@ -308,14 +280,6 @@ fn split<T>(values: Vec<Option<T>>) -> (Vec<i16>, Vec<T>) {
     (levels, values.into_iter().flatten().collect())
 }
 
-/// A string as itself, anything else as its JSON text.
-fn text(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
 /// The ceiling's refusal reaches the writer as an I/O error of its sink; the flag the sink
 /// raised tells it apart from any other.
 fn refused(over: &AtomicBool, e: Error) -> Error {
@@ -414,7 +378,7 @@ mod tests {
         writer.page(all.get(..3).ok_or("three")?)?;
         writer.page(&[])?;
         writer.page(all.get(3..).ok_or("two")?)?;
-        let file = SerializedFileReader::new(bytes::Bytes::from(writer.finish()?))?;
+        let file = SerializedFileReader::new(bytes::Bytes::from(Box::new(writer).finish(&[])?))?;
         let meta = file.metadata();
         assert_eq!(meta.num_row_groups(), 2, "an empty page writes no group");
         assert_eq!(meta.file_metadata().num_rows(), 5);
@@ -452,7 +416,7 @@ mod tests {
     fn a_value_of_another_type_than_its_column_is_a_null() -> Outcome {
         let mut writer = Writer::new(vec![column("speed", Kind::Double)], false, 1 << 20)?;
         writer.page(&[json!({"id": 7, "properties": {"speed": "fast"}})])?;
-        let file = SerializedFileReader::new(bytes::Bytes::from(writer.finish()?))?;
+        let file = SerializedFileReader::new(bytes::Bytes::from(Box::new(writer).finish(&[])?))?;
         let rows = rows(&file)?;
         let row = rows.first().ok_or("a row")?;
         assert_eq!(
@@ -474,7 +438,7 @@ mod tests {
             json!({"type": "LineString", "coordinates": [[-1.0, 47.0], [3.0, 49.5]]});
         page.get_mut(1).ok_or("a second Feature")?["geometry"] = Value::Null;
         writer.page(&page)?;
-        let file = SerializedFileReader::new(bytes::Bytes::from(writer.finish()?))?;
+        let file = SerializedFileReader::new(bytes::Bytes::from(Box::new(writer).finish(&[])?))?;
         let geo = geo_of(&file)?;
         // GeoParquet 1.1 schema: version, primary_column and columns are required; a column
         // requires encoding and geometry_types; bbox is four numbers in 2D.
@@ -525,9 +489,25 @@ mod tests {
     fn a_file_without_a_geometry_is_plain_parquet() -> Outcome {
         let mut writer = Writer::new(columns(), false, 1 << 20)?;
         writer.page(&features(2))?;
-        let file = SerializedFileReader::new(bytes::Bytes::from(writer.finish()?))?;
+        let file = SerializedFileReader::new(bytes::Bytes::from(Box::new(writer).finish(&[])?))?;
         let meta = file.metadata().file_metadata();
         assert!(meta.key_value_metadata().is_none(), "no geo metadata");
+        let mut writer = Writer::new(Vec::new(), false, 1 << 20)?;
+        writer.page(&features(1))?;
+        let provenance = [("view".to_owned(), "city".to_owned())];
+        let file =
+            SerializedFileReader::new(bytes::Bytes::from(Box::new(writer).finish(&provenance)?))?;
+        let kv = file
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .ok_or("provenance")?;
+        assert_eq!(kv.len(), 1, "the provenance, no geo");
+        let view = kv.first().ok_or("a pair")?;
+        assert_eq!(
+            (view.key.as_str(), view.value.as_deref()),
+            ("view", Some("city"))
+        );
         let names: Vec<&str> = meta
             .schema_descr()
             .columns()
@@ -545,7 +525,7 @@ mod tests {
         let page = writer.page(&features(2000));
         assert!(matches!(page, Err(Error::TooLarge)), "{page:?}");
         // The writer buffers its header, so an empty file past the ceiling is refused at the end.
-        let tiny = Writer::new(columns(), true, 3)?.finish();
+        let tiny = Box::new(Writer::new(columns(), true, 3)?).finish(&[]);
         assert!(
             matches!(tiny, Err(Error::TooLarge)),
             "even an empty file is past three bytes"

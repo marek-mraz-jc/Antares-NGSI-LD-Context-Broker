@@ -47,8 +47,8 @@ mod file {
     use super::PARQUET;
     use crate::model::Collection;
     use crate::{items, Here, Problem, Reply};
-    use antares_export::parquet::{Error, Writer};
-    use antares_export::{Column, Kind};
+    use antares_export::parquet::Writer;
+    use antares_export::{Column, Error, Kind, Sink};
     use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
     use axum::http::StatusCode;
     use axum::response::IntoResponse as _;
@@ -127,7 +127,7 @@ mod file {
                 }
                 p.next = next;
             }
-            Ok(writer.finish()?)
+            Ok(Box::new(writer).finish(&[])?)
         }
     }
 }
@@ -174,7 +174,7 @@ mod tests {
     #[cfg(feature = "parquet")]
     #[test]
     fn a_file_the_writer_refuses_is_a_500_naming_nothing() {
-        let refused = crate::Problem::from(antares_export::parquet::Error::Write("x".into()));
+        let refused = crate::Problem::from(antares_export::Error::Write("x".into()));
         assert_eq!(
             refused,
             crate::Problem(
