@@ -278,11 +278,54 @@ struct Plan<'a> {
     entities: bool,
 }
 
-/// One statement kind the sweep repeats.
-#[derive(Clone, Copy)]
-enum Job<'a> {
-    Current(&'a str),
-    History(antares_api::HistoryScope<'a>),
+/// One statement kind the sweep repeats, owning what it names.
+enum Job {
+    /// Current state of one type (DM-83).
+    Current(String),
+    /// History of one Entity, by its own `historyRetention`.
+    Entity(String),
+    /// History of one type, but not the Entities that rule themselves.
+    Type {
+        type_iri: String,
+        except_ids: Vec<String>,
+    },
+    /// History of every type without a history rule of its own.
+    Rest {
+        except_types: Vec<String>,
+        except_ids: Vec<String>,
+    },
+}
+
+impl Job {
+    /// The history the job reaches, or the type whose current state it does.
+    fn scope(&self) -> Result<antares_api::HistoryScope<'_>, &str> {
+        match self {
+            Job::Current(type_iri) => Err(type_iri),
+            Job::Entity(id) => Ok(antares_api::HistoryScope::Entity(id)),
+            Job::Type {
+                type_iri,
+                except_ids,
+            } => Ok(antares_api::HistoryScope::Type {
+                type_iri,
+                except_ids,
+            }),
+            Job::Rest {
+                except_types,
+                except_ids,
+            } => Ok(antares_api::HistoryScope::Rest {
+                except_types,
+                except_ids,
+            }),
+        }
+    }
+}
+
+/// One job of one Tenant before one cut, recorded under `label`.
+struct Step {
+    tenant: TenantId,
+    label: String,
+    job: Job,
+    before: String,
 }
 
 /// The Entities with a valid `historyRetention` of their own, by Tenant,
@@ -302,15 +345,9 @@ async fn overrides(
         }
     };
     for (tenant, id, own) in found {
-        match antares_api::history::retention_of(&own) {
-            Ok(antares_api::history::OwnRetention::Off) => {
-                out.entry(tenant)
-                    .or_default()
-                    .push((id, OFF_CUT.to_owned()));
-            }
-            Ok(antares_api::history::OwnRetention::Keep(keep)) => {
-                out.entry(tenant).or_default().push((id, cut(now, keep)));
-            }
+        let before = match antares_api::history::retention_of(&own) {
+            Ok(antares_api::history::OwnRetention::Off) => OFF_CUT.to_owned(),
+            Ok(antares_api::history::OwnRetention::Keep(keep)) => cut(now, keep),
             Err(why) => {
                 tracing::warn!(
                     tenant,
@@ -318,8 +355,10 @@ async fn overrides(
                     reason = why.as_str(),
                     "historyRetention ignored; the type's rule applies"
                 );
+                continue;
             }
-        }
+        };
+        out.entry(tenant).or_default().push((id, before));
     }
     out
 }
@@ -334,38 +373,38 @@ fn cut(now: chrono::DateTime<chrono::Utc>, keep: Duration) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-/// What `plan` deletes, or with `dry_run` would delete, level by level
-/// (DM-97): the Entities' own retention, then each type's rule, then the
-/// Tenant's `*` rule or the platform default for the rest. A dry run counts
-/// at most [`PREVIEW_CAP`] rows per rule and kind in one statement; a delete
-/// starts no statement once `budget` has passed since it began.
-async fn retain(state: &AppState, plan: &Plan<'_>, budget: Duration) -> Vec<Deleted> {
-    let mut run = Runner {
-        state,
-        started: std::time::Instant::now(),
-        budget,
-        dry_run: plan.dry_run,
-        out: Vec::new(),
-    };
+/// The steps of `plan`, level by level (DM-97): the Entities' own retention,
+/// then each type's rule, then the Tenant's `*` rule or the platform default
+/// for the rest of every Tenant.
+async fn steps(state: &AppState, plan: &Plan<'_>) -> Vec<Step> {
     let own = overrides(state, plan.now).await;
-    let none = Vec::new();
     let own_ids = |t: &str| -> Vec<String> {
         own.get(t)
-            .unwrap_or(&none)
-            .iter()
+            .into_iter()
+            .flatten()
             .map(|(id, _)| id.clone())
             .collect()
     };
+    let step = |tenant: &TenantId, label: &str, job, before| Step {
+        tenant: tenant.clone(),
+        label: label.to_owned(),
+        job,
+        before,
+    };
+    let mut out = Vec::new();
     if plan.entities {
-        for (tenant, list) in &own {
-            let Ok(t) = TenantId::new(tenant) else {
-                continue;
-            };
+        // A name the store hands back is a Tenant's; one that is not has nothing to sweep.
+        let tenants = own
+            .iter()
+            .filter_map(|(t, list)| Some((TenantId::new(t).ok()?, list)));
+        for (t, list) in tenants {
             for (id, before) in list {
-                let job = Job::History(antares_api::HistoryScope::Entity(id));
-                if !run.drain(&t, ENTITY_LABEL, job, before).await {
-                    return run.out;
-                }
+                out.push(step(
+                    &t,
+                    ENTITY_LABEL,
+                    Job::Entity(id.clone()),
+                    before.clone(),
+                ));
             }
         }
     }
@@ -375,88 +414,83 @@ async fn retain(state: &AppState, plan: &Plan<'_>, budget: Duration) -> Vec<Dele
         let except_ids = own_ids(t.as_str());
         for rule in list.iter().filter(|r| r.type_iri != ANY_TYPE) {
             if let Some(keep) = rule.current {
-                let job = Job::Current(&rule.type_iri);
-                if !run
-                    .drain(t, &rule.type_iri, job, &cut(plan.now, keep))
-                    .await
-                {
-                    return run.out;
-                }
+                let job = Job::Current(rule.type_iri.clone());
+                out.push(step(t, &rule.type_iri, job, cut(plan.now, keep)));
             }
-            let before = if rule.history_off {
-                OFF_CUT.to_owned()
-            } else if let Some(keep) = rule.history {
-                cut(plan.now, keep)
-            } else {
-                continue;
+            let before = match (rule.history_off, rule.history) {
+                (true, _) => OFF_CUT.to_owned(),
+                (false, Some(keep)) => cut(plan.now, keep),
+                (false, None) => continue,
             };
-            let job = Job::History(antares_api::HistoryScope::Type {
-                type_iri: &rule.type_iri,
-                except_ids: &except_ids,
-            });
-            if !run.drain(t, &rule.type_iri, job, &before).await {
-                return run.out;
-            }
+            let job = Job::Type {
+                type_iri: rule.type_iri.clone(),
+                except_ids: except_ids.clone(),
+            };
+            out.push(step(t, &rule.type_iri, job, before));
         }
-        if !rest(&mut run, plan, t, list, &except_ids).await {
-            return run.out;
-        }
+        out.extend(rest(plan, t, list, except_ids));
     }
     // The platform default reaches every other Tenant too.
     // ponytail: every Tenant in name order each sweep, the budget the bound;
     // rotate the start once a deployment's Tenants outgrow one sweep.
     if plan.platform.is_some() && !plan.dry_run {
-        let tenants = match state.store.tenant_ids().await {
-            Ok(all) => all,
-            Err(e) => {
-                tracing::warn!(error = %e, "retention: tenants not listed; the platform default waits");
-                Vec::new()
-            }
-        };
-        for tenant in tenants.iter().filter(|t| !ruled.contains(*t)) {
-            let Ok(t) = TenantId::new(tenant) else {
-                continue;
-            };
-            if !rest(&mut run, plan, &t, &[], &own_ids(tenant)).await {
-                return run.out;
-            }
+        let tenants = state.store.tenant_ids().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "retention: tenants not listed; the platform default waits");
+            Vec::new()
+        });
+        let others = tenants
+            .iter()
+            .filter(|t| !ruled.contains(*t))
+            .filter_map(|t| TenantId::new(t).ok());
+        for t in others {
+            let except_ids = own_ids(t.as_str());
+            out.extend(rest(plan, &t, &[], except_ids));
         }
     }
-    run.out
+    out
 }
 
-/// The Tenant's `*` rule, or the platform default, over every type of `t`
-/// without a history rule of its own; `false` once the budget is spent.
-async fn rest(
-    run: &mut Runner<'_>,
-    plan: &Plan<'_>,
-    t: &TenantId,
-    list: &[Rule],
-    except_ids: &[String],
-) -> bool {
+/// The step of the Tenant's `*` rule, or of the platform default, over every
+/// type of `t` without a history rule of its own; none when it keeps all.
+fn rest(plan: &Plan<'_>, t: &TenantId, list: &[Rule], except_ids: Vec<String>) -> Option<Step> {
     let (label, before) = match list.iter().find(|r| r.type_iri == ANY_TYPE) {
         Some(r) if r.history_off => (ANY_TYPE, OFF_CUT.to_owned()),
-        Some(Rule {
-            history: Some(keep),
-            ..
-        }) => (ANY_TYPE, cut(plan.now, *keep)),
-        // `forever`, or a `*` rule saying nothing of history: kept.
-        Some(_) => return true,
-        None => match plan.platform {
-            Some(keep) => (PLATFORM_LABEL, cut(plan.now, keep)),
-            None => return true,
-        },
+        Some(r) => (ANY_TYPE, cut(plan.now, r.history?)),
+        None => (PLATFORM_LABEL, cut(plan.now, plan.platform?)),
     };
-    let except_types: Vec<String> = list
+    let except_types = list
         .iter()
         .filter(|r| r.type_iri != ANY_TYPE && r.rules_history())
         .map(|r| r.type_iri.clone())
         .collect();
-    let job = Job::History(antares_api::HistoryScope::Rest {
-        except_types: &except_types,
-        except_ids,
-    });
-    run.drain(t, label, job, &before).await
+    Some(Step {
+        tenant: t.clone(),
+        label: label.to_owned(),
+        job: Job::Rest {
+            except_types,
+            except_ids,
+        },
+        before,
+    })
+}
+
+/// What `plan` deletes, or with `dry_run` would delete, step by step: a dry
+/// run counts at most [`PREVIEW_CAP`] rows per step in one statement; a
+/// delete starts no statement once `budget` has passed since it began.
+async fn retain(state: &AppState, plan: &Plan<'_>, budget: Duration) -> Vec<Deleted> {
+    let mut run = Runner {
+        state,
+        started: std::time::Instant::now(),
+        budget,
+        dry_run: plan.dry_run,
+        out: Vec::new(),
+    };
+    for step in steps(state, plan).await {
+        if !run.drain(&step).await {
+            break;
+        }
+    }
+    run.out
 }
 
 /// The rounds of one sweep, against its budget.
@@ -469,19 +503,18 @@ struct Runner<'a> {
 }
 
 impl Runner<'_> {
-    /// Run `job` before `before` in rounds until a short batch, and record
-    /// what it deleted under `label`; `false` once the budget is spent.
-    async fn drain(&mut self, t: &TenantId, label: &str, job: Job<'_>, before: &str) -> bool {
+    /// Run `step` in rounds until a short batch, and record what it deleted
+    /// under its label; `false` once the budget is spent.
+    async fn drain(&mut self, step: &Step) -> bool {
         let (batch, rounds) = if self.dry_run {
             (PREVIEW_CAP, 1)
         } else {
             (BATCH, ROUNDS)
         };
+        let (t, label, before) = (&step.tenant, step.label.as_str(), step.before.as_str());
         let tenant = t.as_str();
-        let kind = match job {
-            Job::Current(_) => "entity",
-            Job::History(_) => "history",
-        };
+        let scope = step.job.scope();
+        let kind = if scope.is_ok() { "history" } else { "entity" };
         let mut count = 0u64;
         let mut spent = false;
         for _ in 0..rounds {
@@ -489,17 +522,17 @@ impl Runner<'_> {
                 spent = true;
                 break;
             }
-            let n = match job {
-                Job::Current(type_iri) => {
-                    self.state
-                        .store
-                        .retain_current(t, type_iri, before, batch, self.dry_run)
-                        .await
-                }
-                Job::History(scope) => {
+            let n = match scope {
+                Ok(scope) => {
                     self.state
                         .temporal
                         .retain_history(t, scope, before, batch, self.dry_run)
+                        .await
+                }
+                Err(type_iri) => {
+                    self.state
+                        .store
+                        .retain_current(t, type_iri, before, batch, self.dry_run)
                         .await
                 }
             };
@@ -517,20 +550,12 @@ impl Runner<'_> {
             }
         }
         if count > 0 {
-            if let Some(d) = self
-                .out
-                .iter_mut()
-                .find(|d| d.tenant == tenant && d.type_iri == label && d.kind == kind)
-            {
-                d.count = d.count.saturating_add(count);
-            } else {
-                self.out.push(Deleted {
-                    tenant: tenant.to_owned(),
-                    type_iri: label.to_owned(),
-                    kind,
-                    count,
-                });
-            }
+            self.out.push(Deleted {
+                tenant: tenant.to_owned(),
+                type_iri: label.to_owned(),
+                kind,
+                count,
+            });
         }
         if spent {
             tracing::info!(

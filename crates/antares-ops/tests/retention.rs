@@ -789,3 +789,80 @@ async fn an_entity_with_history_off_records_none_and_its_own_duration_records() 
         assert_eq!(instances(&app, "city", id).await, recorded, "{id}");
     }
 }
+
+/// DM-97: the sweep deletes all the history of an Entity whose own value is
+/// `off`, leaves one with a value it cannot read (`forever`) to its type's
+/// rule, and a Tenant whose `*` rule is `forever` keeps everything the
+/// platform default would take.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entity_off_loses_its_history_and_forever_holds_the_platform_back() {
+    let b = TestBroker::with_platform_history(std::time::Duration::from_secs(600))
+        .await
+        .expect("broker");
+    let app = b.serve_mounted(Vec::new()).expect("app");
+    let city = json!({"rules": [{"type": V, "history": "PT30M"}]}).to_string();
+    let (s, _) = send(&app, Method::PUT, "/q/retention/city", None, Some(city)).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let harbor = json!({"rules": [{"type": "*", "history": "forever"}]}).to_string();
+    let (s, _) = send(&app, Method::PUT, "/q/retention/harbor", None, Some(harbor)).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let dock = json!({"rules": [{"type": "*", "history": "off"}]}).to_string();
+    let (s, _) = send(&app, Method::PUT, "/q/retention/dock", None, Some(dock)).await;
+    assert_eq!(s, StatusCode::CREATED);
+    for (tenant, id, ty, minutes) in [
+        ("city", "urn:v:off", V, &[3, 1][..]),
+        ("city", "urn:v:off2", V, &[2][..]),
+        ("city", "urn:v:typo", V, &[35, 25]),
+        ("harbor", "urn:s:1", S, &[600, 300]),
+        ("dock", "urn:s:1", S, &[2]),
+        ("port", "urn:s:1", S, &[15, 5]),
+    ] {
+        seed_history(&app, tenant, id, ty, minutes).await;
+    }
+    // A preview counts the platform default too, for a draft without a `*` rule.
+    let (s, preview) = send(
+        &app,
+        Method::POST,
+        "/q/retention/port/preview",
+        None,
+        Some(json!({"rules": []}).to_string()),
+    )
+    .await;
+    assert_eq!(
+        (s, preview["counts"].clone()),
+        (
+            StatusCode::OK,
+            json!([{"type": "@platform", "kind": "history", "count": 1}])
+        )
+    );
+    own_retention(&app, "city", "urn:v:off", V, "off").await;
+    own_retention(&app, "city", "urn:v:off2", V, "off").await;
+    own_retention(&app, "city", "urn:v:typo", V, "forever").await;
+
+    let deleted = b.sweep_retention(chrono::Utc::now()).await;
+    let mut seen: Vec<_> = deleted
+        .iter()
+        .map(|d| (d.tenant.as_str(), d.type_iri.as_str(), d.count))
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        [
+            ("city", "@entity", 1),
+            ("city", "@entity", 2),
+            ("city", V, 1),
+            ("dock", "*", 1),
+            ("port", "@platform", 1)
+        ]
+    );
+    for (tenant, id, left) in [
+        ("dock", "urn:s:1", 0),
+        ("port", "urn:s:1", 1),
+        ("city", "urn:v:off", 0),
+        ("city", "urn:v:off2", 0),
+        ("city", "urn:v:typo", 1),
+        ("harbor", "urn:s:1", 2),
+    ] {
+        assert_eq!(instances(&app, tenant, id).await, left, "{tenant} {id}");
+    }
+}

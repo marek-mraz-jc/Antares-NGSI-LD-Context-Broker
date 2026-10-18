@@ -1297,6 +1297,20 @@ mod tests {
         }
     }
 
+    /// DM-97: the platform default is a duration or unset; anything else stops the start.
+    #[test]
+    fn the_platform_history_is_a_duration_or_unset() {
+        assert_eq!(platform_history(None), Ok(None));
+        assert_eq!(
+            platform_history(Some(" P28D ".into())),
+            Ok(Some(std::time::Duration::from_hours(28 * 24)))
+        );
+        for bad in ["28", "forever", "PT30S"] {
+            let err = platform_history(Some(bad.into())).expect_err(bad);
+            assert!(err.starts_with(HISTORY_DEFAULT_ENV), "{err}");
+        }
+    }
+
     #[tokio::test]
     async fn without_a_bound_no_schema_is_taken_or_stored() {
         let r = Arc::new(Reloader {
