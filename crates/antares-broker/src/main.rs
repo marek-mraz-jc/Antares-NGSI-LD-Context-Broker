@@ -133,6 +133,8 @@ const KNOWN_KEYS: &[&str] = &[
     "ANTARES_DELIVERY_LANE_BYTES",
     // Batch write bodies in flight at once, in bytes (T-4562).
     "ANTARES_BATCH_INFLIGHT_BYTES",
+    // Batch writes running at once, each holding a connection (T-4624).
+    "ANTARES_BATCH_INFLIGHT",
     // 5.7.2.4 fan-out ceiling: how many matching registrations one
     // distributed operation may contact.
     "ANTARES_FED_FANOUT",

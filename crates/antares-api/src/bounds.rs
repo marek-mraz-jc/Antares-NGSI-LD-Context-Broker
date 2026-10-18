@@ -207,10 +207,61 @@ pub const BATCH_ADMIT_WAIT: std::time::Duration = std::time::Duration::from_secs
 static BATCH_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*BATCH_INFLIGHT_BYTES));
 
+/// Batch writes running at once, whatever their size. Each holds a database
+/// connection for as long as it runs, so a stream of small batches has to
+/// leave the rest of the pool to the reads: 811 vehicle upserts in two
+/// minutes held all 20 of a dev broker's and a visitor's read waited 4 s for
+/// one (T-4624). Deployment knob (ANTARES_BATCH_INFLIGHT), read once at first
+/// use; keep it under `ANTARES_PG_POOL`.
+pub static BATCH_INFLIGHT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    count_from(
+        std::env::var("ANTARES_BATCH_INFLIGHT").ok().as_deref(),
+        8,
+        u32::MAX as usize,
+    )
+});
+static BATCH_RUNNING: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*BATCH_INFLIGHT));
+
 /// The admission of a batch body of `bytes`, held for as long as the batch
-/// runs; `None` when no share freed inside [`BATCH_ADMIT_WAIT`].
-pub async fn admit_batch(bytes: usize) -> Option<tokio::sync::SemaphorePermit<'static>> {
-    admit(&BATCH_SLOTS, *BATCH_INFLIGHT_BYTES, bytes, BATCH_ADMIT_WAIT).await
+/// runs: its share of [`BATCH_INFLIGHT_BYTES`] and one of [`BATCH_INFLIGHT`]
+/// slots; `None` when they did not free inside [`BATCH_ADMIT_WAIT`].
+pub async fn admit_batch(bytes: usize) -> Option<Admitted> {
+    admit_both(
+        (&BATCH_SLOTS, *BATCH_INFLIGHT_BYTES),
+        (&BATCH_RUNNING, *BATCH_INFLIGHT),
+        bytes,
+        BATCH_ADMIT_WAIT,
+    )
+    .await
+}
+
+/// A running batch's share of the byte budget and its slot.
+pub type Admitted = (
+    tokio::sync::SemaphorePermit<'static>,
+    tokio::sync::SemaphorePermit<'static>,
+);
+
+async fn admit_both<'a>(
+    bytes_budget: (&'a tokio::sync::Semaphore, usize),
+    running: (&'a tokio::sync::Semaphore, usize),
+    bytes: usize,
+    wait: std::time::Duration,
+) -> Option<(
+    tokio::sync::SemaphorePermit<'a>,
+    tokio::sync::SemaphorePermit<'a>,
+)> {
+    // One wait for both: the slot gets what the byte share left of it.
+    let started = std::time::Instant::now();
+    let share = admit(bytes_budget.0, bytes_budget.1, bytes, wait).await?;
+    let slot = admit(
+        running.0,
+        running.1,
+        1,
+        wait.saturating_sub(started.elapsed()),
+    )
+    .await?;
+    Some((share, slot))
 }
 
 async fn admit(
@@ -326,6 +377,7 @@ impl LimitStats {
             "maxRegexProgramBytes": MAX_REGEX_PROGRAM_BYTES,
             "changeQueue": CHANGE_QUEUE,
             "deliveryLane": DELIVERY_LANE,
+            "batchInflight": *BATCH_INFLIGHT,
             "batchInflightBytes": *BATCH_INFLIGHT_BYTES,
             "deliveryLaneBytes": *DELIVERY_LANE_BYTES,
             "deliveryWidth": *DELIVERY_WIDTH,
@@ -561,6 +613,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "batchInflight",
                 "batchInflightBytes",
                 "changeQueue",
                 "deliveryLane",
@@ -839,5 +892,36 @@ mod tests {
         drop(huge);
         assert!(admit(&slots, 10, 0, wait).await.is_some());
         assert_eq!(slots.available_permits(), 10, "every share came back");
+    }
+
+    /// T-4624: small batches each fit the byte budget, yet only as many run
+    /// as there are slots, so the rest of the pool stays with the reads; a
+    /// batch refused a slot gives its byte share back.
+    #[tokio::test]
+    async fn only_so_many_batches_run_at_once_however_small() {
+        let (bytes, running) = (
+            tokio::sync::Semaphore::new(1000),
+            tokio::sync::Semaphore::new(2),
+        );
+        let wait = std::time::Duration::from_millis(50);
+        let admit = || admit_both((&bytes, 1000), (&running, 2), 10, wait);
+        let first = admit().await.expect("a slot");
+        let second = admit().await.expect("a slot");
+        assert!(
+            admit().await.is_none(),
+            "two run, the third waits and is refused"
+        );
+        assert_eq!(
+            bytes.available_permits(),
+            980,
+            "the refused one's share came back"
+        );
+        drop(first);
+        let third = admit().await.expect("a freed slot");
+        drop((second, third));
+        assert_eq!(
+            (bytes.available_permits(), running.available_permits()),
+            (1000, 2)
+        );
     }
 }
