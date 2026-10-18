@@ -372,7 +372,7 @@ fn shacl_carries_the_display_order_groups_and_labels() {
                 "slot_usage": {
                     "startDate": {"rank": 1, "annotations": {
                         "summary": {"tag": "summary", "value": "true"},
-                        "label": {"tag": "label", "value": "{\"sk\":\"Začiatok\",\"en\":\"Start\",\"x\\\" ; a <y>\":\"bad\"}"}
+                        "label": {"tag": "label", "value": "{\"sk\":\"Začiatok\",\"en\":\"Start\",\"x\\\" ; a <y>\":\"bad\",\"\":\"empty\",\"abcdefghij-abcdefghij-abcdefghij-abcd\":\"long\"}"}
                     }},
                     "name": {"annotations": {"summary": {"tag": "summary", "value": "true"}}}
                 }
@@ -416,8 +416,8 @@ fn shacl_carries_the_display_order_groups_and_labels() {
         "{start}"
     );
     assert!(
-        !start.contains("bad"),
-        "a hostile language tag is skipped: {start}"
+        !start.contains("bad") && !start.contains("empty") && !start.contains("long"),
+        "a hostile, empty or over-long language tag is skipped: {start}"
     );
     assert!(property("name").contains("SummaryGroup>"));
     assert!(
