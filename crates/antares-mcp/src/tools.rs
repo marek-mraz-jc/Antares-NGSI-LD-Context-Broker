@@ -965,4 +965,30 @@ mod tests {
             "a missing path member is empty"
         );
     }
+
+    /// Every argument name of `args`, those of nested objects included.
+    fn argument_names(args: &[Arg], out: &mut Vec<&'static str>) {
+        for arg in args {
+            out.push(arg.name);
+            if let Kind::Object(inner) | Kind::ListOf(inner, _) = arg.kind {
+                argument_names(inner, out);
+            }
+        }
+    }
+
+    /// T-4532: an argument a tool takes is explained in the primer, so a new one without its
+    /// line fails here.
+    #[test]
+    fn every_tool_argument_is_explained_in_the_primer() {
+        let words: std::collections::BTreeSet<&str> = crate::PRIMER
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .collect();
+        let mut names = Vec::new();
+        for tool in &TOOLS {
+            argument_names(tool.args, &mut names);
+        }
+        let unexplained: Vec<&str> = names.into_iter().filter(|n| !words.contains(n)).collect();
+        assert!(unexplained.is_empty(), "not in the primer: {unexplained:?}");
+        assert!(crate::PRIMER.len() < 4_400, "{}", crate::PRIMER.len());
+    }
 }
