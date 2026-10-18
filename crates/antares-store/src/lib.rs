@@ -1037,6 +1037,18 @@ pub trait TemporalDriver: Send + Sync {
         let _ = (tenant, scope, before, batch, dry_run);
         Ok(0)
     }
+    /// Every version of the rows of one Entity's history (T-4665, platform
+    /// ADR-N-054 2.4), by expanded Attribute name: each instance with its
+    /// `version` and `provenance`, a superseded one with `supersededAt`,
+    /// oldest first per measurement. A driver that keeps no versions has none.
+    async fn versions(
+        &self,
+        tenant: &TenantId,
+        entity_id: &str,
+    ) -> Result<serde_json::Map<String, Value>, NgsiError> {
+        let _ = (tenant, entity_id);
+        Ok(serde_json::Map::new())
+    }
     /// Remove the whole history of one tenant; nothing to do without history.
     async fn purge_tenant(&self, tenant: &TenantId) -> Result<(), NgsiError> {
         let _ = tenant;

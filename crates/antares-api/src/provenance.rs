@@ -22,7 +22,7 @@ const MAX_REQUEST_ID: usize = 128;
 /// being `gateway` (None: no caller is believed).
 pub fn of_request(headers: &HeaderMap, gateway: Option<&str>) -> Value {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let believed = gateway.is_some_and(|g| header("l5d-client-id") == Some(g));
+    let believed = from_gateway(headers, gateway);
     let mut out = Map::new();
     let channel = header("jc-provenance-channel")
         .filter(|c| believed && CHANNELS.contains(c))
@@ -51,6 +51,25 @@ pub fn of_request(headers: &HeaderMap, gateway: Option<&str>) -> Value {
     Value::Object(out)
 }
 
+/// Whether the request may read `versions=all` (ADR-N-054 2.4): the
+/// gateway grants it with `JC-Read-Versions: true` once the space's Policy
+/// granted the caller `readVersions`; nobody else can.
+pub fn may_read_versions(headers: &HeaderMap, gateway: Option<&str>) -> bool {
+    from_gateway(headers, gateway)
+        && headers
+            .get("jc-read-versions")
+            .is_some_and(|v| v.as_bytes() == b"true")
+}
+
+/// Does the request carry the gateway's mesh identity `gateway`?
+fn from_gateway(headers: &HeaderMap, gateway: Option<&str>) -> bool {
+    gateway.is_some_and(|g| {
+        headers
+            .get("l5d-client-id")
+            .is_some_and(|v| v.as_bytes() == g.as_bytes())
+    })
+}
+
 /// `provenance` with its `operation`.
 pub fn with_operation(provenance: &Value, operation: &str) -> Value {
     let mut out = provenance.clone();
@@ -67,17 +86,17 @@ fn plain(text: &str, max: usize) -> bool {
 
 /// `%XX`-decoded UTF-8; `None` for a broken escape or bytes that are not UTF-8.
 fn percent_decoded(raw: &str) -> Option<String> {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
-            i += 3;
+    let mut out = Vec::with_capacity(raw.len());
+    let mut bytes = raw.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hex = [bytes.next()?, bytes.next()?];
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            out.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
         } else {
-            out.push(bytes[i]);
-            i += 1;
+            out.push(b);
         }
     }
     String::from_utf8(out).ok()
@@ -128,6 +147,21 @@ mod tests {
     }
 
     #[test]
+    fn versions_are_read_only_where_the_gateway_grants_them() {
+        let grant = [("l5d-client-id", GATEWAY), ("jc-read-versions", "true")];
+        assert!(may_read_versions(&headers(&grant), Some(GATEWAY)));
+        assert!(!may_read_versions(&headers(&grant), None));
+        assert!(!may_read_versions(
+            &headers(&[("l5d-client-id", "x.y"), ("jc-read-versions", "true")]),
+            Some(GATEWAY)
+        ));
+        assert!(!may_read_versions(
+            &headers(&[("l5d-client-id", GATEWAY), ("jc-read-versions", "yes")]),
+            Some(GATEWAY)
+        ));
+    }
+
+    #[test]
     fn a_value_out_of_shape_is_left_out() {
         let long = "x".repeat(MAX_REASON + 1);
         let h = headers(&[
@@ -139,6 +173,8 @@ mod tests {
         ]);
         assert_eq!(of_request(&h, Some(GATEWAY)), json!({"channel": "api"}));
         assert_eq!(percent_decoded("%zz"), None);
+        assert_eq!(percent_decoded("%+1"), None, "a sign is no hex digit");
+        assert_eq!(percent_decoded("50%"), None, "an escape cut short");
         assert_eq!(percent_decoded("%C3"), None, "half a character");
         assert_eq!(percent_decoded("N%C3%A1m"), Some("Nám".into()));
         assert_eq!(

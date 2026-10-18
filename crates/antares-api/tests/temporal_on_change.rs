@@ -178,3 +178,87 @@ async fn a_correction_of_the_same_instant_is_recorded_whatever_the_deadband() {
         "the instant's row now holds the corrected value"
     );
 }
+
+/// The Spot `id` written `bikes` (onChange) and `count` (its own `every`)
+/// with the same minute series, as a replayed bike station.
+async fn replayed(st: &AppState, id: &str, series: &[(f64, u32)]) {
+    let writes: Vec<(Value, u32)> = series.iter().map(|&(v, m)| (json!(v), m)).collect();
+    recorded(st, id, "bikes", &writes).await;
+    for (value, m) in series {
+        let (s, b) = req(
+            st,
+            "PATCH",
+            &format!("/ngsi-ld/v1/entities/{id}/attrs"),
+            Some(json!({"count": {"type": "Property", "value": value,
+                         "observedAt": format!("2026-10-18T07:{m:02}:00Z")}})),
+        )
+        .await;
+        assert_eq!(s, 204, "{b}");
+    }
+}
+
+fn station() -> Option<Recording> {
+    Some(Recording {
+        default: on_change(60, None),
+        attributes: [(format!("{CORE}count"), None)].into_iter().collect(),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_window_starts_at_the_level_an_on_change_attribute_held() {
+    let st = state(station()).await;
+    let id = "urn:ngsi-ld:Spot:carry";
+    replayed(&st, id, &[(5.0, 0), (5.0, 1), (7.0, 2)]).await;
+    let (s, doc) = req(
+        &st,
+        "GET",
+        &format!("/ngsi-ld/v1/temporal/entities/{id}?timerel=after&timeAt=2026-10-18T07:01:30Z"),
+        None,
+    )
+    .await;
+    assert_eq!(s, 200, "{doc}");
+    let at = |attr: &str| -> Vec<Value> {
+        match &doc[attr] {
+            Value::Array(a) => a.iter().map(|r| r["observedAt"].clone()).collect(),
+            v => vec![v["observedAt"].clone()],
+        }
+    };
+    // bikes held 5 from 07:00 when the window opened; count has a row of its own
+    assert_eq!(
+        at("bikes"),
+        [json!("2026-10-18T07:00:00Z"), json!("2026-10-18T07:02:00Z")]
+    );
+    assert_eq!(at("count"), [json!("2026-10-18T07:02:00Z")]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_time_weighted_average_of_on_change_rows_is_the_average_of_every_row() {
+    let st = state(station()).await;
+    let id = "urn:ngsi-ld:Spot:bikes";
+    let series = [5.0, 5.0, 5.0, 7.0, 7.0, 3.0, 3.0, 3.0, 3.0, 6.0];
+    let minutes: Vec<(f64, u32)> = series.iter().copied().zip(0..).collect();
+    replayed(&st, id, &minutes).await;
+    let window = "timerel=between&timeAt=2026-10-18T07:00:00Z&endTimeAt=2026-10-18T07:10:00Z";
+    let aggregated = |methods: &str| {
+        format!(
+            "/ngsi-ld/v1/temporal/entities/{id}?options=aggregatedValues\
+             &aggrPeriodDuration=PT0S&aggrMethods={methods}&{window}"
+        )
+    };
+    let (s, doc) = req(&st, "GET", &aggregated("avg,min,max"), None).await;
+    assert_eq!(s, 200, "{doc}");
+    // bikes keeps 4 of the 10 rows; weighted by the minutes each held, its
+    // mean is the plain mean of all 10 that count kept
+    assert_eq!(doc["bikes"]["avg"][0][0], json!(4.7), "{doc}");
+    assert_eq!(doc["count"]["avg"][0][0], json!(4.7), "{doc}");
+    assert_eq!(doc["bikes"]["min"][0][0], json!(3.0));
+    assert_eq!(doc["bikes"]["max"][0][0], json!(7.0));
+
+    // A left-out row is not a zero: sum and totalCount mean nothing on bikes.
+    for method in ["sum", "totalCount"] {
+        let (s, doc) = req(&st, "GET", &aggregated(method), None).await;
+        assert_eq!(s, 400, "{method}: {doc}");
+        let detail = doc["detail"].as_str().unwrap_or_default();
+        assert!(detail.starts_with("aggregation-not-meaningful"), "{doc}");
+    }
+}

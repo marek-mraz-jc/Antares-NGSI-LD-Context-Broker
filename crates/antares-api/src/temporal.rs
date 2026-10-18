@@ -251,6 +251,10 @@ struct Windowed {
     /// the fewest instances an Attribute the ceiling cut shortened still
     /// served (`truncate`): how far the next offsetN page may move
     cut_served: Option<usize>,
+    /// Attributes their type records `onChange` (ADR-N-054 2.5): each value
+    /// holds until the next row, so a window starts at the level carried in
+    /// and an aggregation weighs a value by the time it held
+    held: std::collections::HashSet<String>,
 }
 
 /// NGSI-LD 6.3.10: the most instances of one Attribute the broker serves in
@@ -326,6 +330,39 @@ fn truncate(w: &mut Windowed, timeprop: &str, descending: bool) {
     (w.ts_min, w.ts_max) = (ts_min, ts_max);
 }
 
+/// Each instance of `w` replaced by its chain of versions in `chains` (the
+/// store's `versions`), the same measurement being the same Attribute,
+/// `observedAt` and `datasetId` (ADR-N-054 2.4). An instance the store keeps
+/// no version of stays as it is.
+fn with_versions(w: &mut Windowed, chains: &Map<String, Value>) {
+    let key = |i: &Value| {
+        (
+            i.get("observedAt").and_then(Value::as_str).map(dt_key),
+            i.get("datasetId").cloned(),
+        )
+    };
+    for (attr, instances) in &mut w.attrs {
+        let Some(chain) = chains.get(attr).and_then(Value::as_array) else {
+            continue;
+        };
+        *instances = instances
+            .iter()
+            .flat_map(|inst| {
+                let own: Vec<Value> = chain
+                    .iter()
+                    .filter(|v| key(v) == key(inst))
+                    .cloned()
+                    .collect();
+                if own.is_empty() {
+                    vec![inst.clone()]
+                } else {
+                    own
+                }
+            })
+            .collect();
+    }
+}
+
 /// The instant a cut page ends at in its order: the boundary `truncate`
 /// kept every Attribute to.
 fn cut_boundary(w: &Windowed, desc: bool) -> Option<&str> {
@@ -385,6 +422,8 @@ fn scope_set_time(i: &Value) -> Option<&str> {
         .find_map(|k| i.get(*k).and_then(Value::as_str))
 }
 
+// seven of the request's own plus the Attributes the type records onChange
+#[allow(clippy::too_many_arguments)]
 fn window(
     doc: &Value,
     tq: Option<&TemporalQ>,
@@ -393,6 +432,7 @@ fn window(
     omit: Option<&Vec<crate::repr::ProjNode>>,
     dataset: Option<&Vec<String>>,
     timeprop: &str,
+    held: std::collections::HashSet<String>,
 ) -> Windowed {
     let mut w = Windowed {
         attrs: std::collections::BTreeMap::new(),
@@ -402,6 +442,7 @@ fn window(
         truncated: false,
         cut_served: None,
         more: false,
+        held,
     };
     let Some(obj) = doc.as_object() else { return w };
     for (k, v) in obj {
@@ -424,19 +465,39 @@ fn window(
                 continue;
             }
         }
+        let of_dataset = |inst: &&Value| match (dataset, inst.get("datasetId")) {
+            (None, _) => true,
+            (Some(want), Some(Value::String(have))) => want.iter().any(|w| w == have),
+            (Some(want), None) => want.iter().any(|w| w == "@none"),
+            _ => false,
+        };
         let mut instances: Vec<Value> = v
             .as_array()
-            .cloned()
-            .unwrap_or_default()
             .into_iter()
+            .flatten()
+            .filter(of_dataset)
             .filter(|inst| tq.is_none_or(|tq| tq.instance_matches(inst)))
-            .filter(|inst| match (dataset, inst.get("datasetId")) {
-                (None, _) => true,
-                (Some(want), Some(Value::String(have))) => want.iter().any(|w| w == have),
-                (Some(want), None) => want.iter().any(|w| w == "@none"),
-                _ => false,
-            })
+            .cloned()
             .collect();
+        // ADR-N-054 2.5 (DM-117): an `onChange` Attribute held its last row
+        // before the window when the window opened, so that row comes along.
+        let start = tq.and_then(|t| match t.timerel.as_str() {
+            "after" | "between" => Some(dt_key(&t.time_at)),
+            _ => None,
+        });
+        if let (true, Some(start)) = (w.held.contains(k), &start) {
+            let key = |i: &&Value| i.get(timeprop).and_then(Value::as_str).map(dt_key);
+            let carry = v
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(of_dataset)
+                .filter(|i| key(i).is_some_and(|t| t < *start))
+                .max_by_key(key);
+            if let Some(c) = carry {
+                instances.push(c.clone());
+            }
+        }
         // 4.18/C.5.16: the scope valid AT the window start was set at or
         // before it — carry the latest pre-window instance into the
         // representation (a temporal scope stays valid until replaced).
@@ -1294,6 +1355,20 @@ fn render_aggregated(
                 )));
             }
         }
+        // ADR-N-054 2.5 (DM-118): an `onChange` Attribute leaves out the rows
+        // that repeat a value, and a left-out row is not a zero.
+        let held = w.held.contains(k);
+        if let Some(method) = r
+            .aggr_methods
+            .iter()
+            .find(|m| held && matches!(m.as_str(), "sum" | "totalCount"))
+        {
+            return Err(NgsiError::InvalidRequest(format!(
+                "aggregation-not-meaningful: {method} over {}, which records a row only \
+                 when its value changes (ADR-N-054 2.5)",
+                ctx.compact_iri(k)
+            )));
+        }
         times.sort_by_key(|(t, _)| *t);
         let Some(&(earliest, _)) = times.first() else {
             continue;
@@ -1324,6 +1399,12 @@ fn render_aggregated(
                 _ => (first, last),
             }
         };
+        // the row carried in from before the window holds from its start
+        if held {
+            for (t, _) in &mut times {
+                *t = (*t).max(whole.0);
+            }
+        }
         // bucket boundaries
         let bucket_of =
             |t: DateTime<FixedOffset>| -> (DateTime<FixedOffset>, DateTime<FixedOffset>) {
@@ -1400,12 +1481,13 @@ fn render_aggregated(
                 }
             };
         type Bucket = (DateTime<FixedOffset>, DateTime<FixedOffset>);
-        let mut buckets: Vec<(Bucket, Vec<&Value>)> = Vec::new();
-        for (t, v) in &times {
-            let b = bucket_of(*t);
+        type Rows<'a> = Vec<(DateTime<FixedOffset>, &'a Value)>;
+        let mut buckets: Vec<(Bucket, Rows)> = Vec::new();
+        for &(t, v) in &times {
+            let b = bucket_of(t);
             match buckets.last_mut() {
-                Some((bb, vals)) if bb.0 == b.0 => vals.push(v),
-                _ => buckets.push((b, vec![v])),
+                Some((bb, rows)) if bb.0 == b.0 => rows.push((t, v)),
+                _ => buckets.push((b, vec![(t, v)])),
             }
         }
         let mut attr_out = Map::new();
@@ -1420,8 +1502,21 @@ fn render_aggregated(
         for method in &r.aggr_methods {
             let rows: Vec<Value> = buckets
                 .iter()
-                .map(|((bs, be), vals)| {
-                    let val = aggregate_bucket(method, class, vals);
+                .enumerate()
+                .map(|(i, ((bs, be), rows))| {
+                    // the value the previous bucket ended on holds into this one
+                    let before = i
+                        .checked_sub(1)
+                        .and_then(|p| buckets.get(p))
+                        .and_then(|(_, r)| r.last())
+                        .map(|&(_, v)| v);
+                    let weighted = (held && method == "avg")
+                        .then(|| time_weighted_avg(class, rows, before, *bs, (*be).min(whole.1)))
+                        .flatten();
+                    let val = weighted.unwrap_or_else(|| {
+                        let vals: Vec<&Value> = rows.iter().map(|&(_, v)| v).collect();
+                        aggregate_bucket(method, class, &vals)
+                    });
                     Value::Array(vec![val, Value::String(fmt(*bs)), Value::String(fmt(*be))])
                 })
                 .collect();
@@ -1430,6 +1525,39 @@ fn render_aggregated(
         out.insert(ctx.compact_iri(k), Value::Object(attr_out));
     }
     Ok(out)
+}
+
+/// The mean of a bucket from `start` to `end` whose `rows` (time, value) each
+/// hold until the next, `before` holding until the first (ADR-N-054 2.5);
+/// `None` for a class with no number or a bucket no value held for a moment.
+fn time_weighted_avg(
+    class: AggrClass,
+    rows: &[(chrono::DateTime<chrono::FixedOffset>, &Value)],
+    before: Option<&Value>,
+    start: chrono::DateTime<chrono::FixedOffset>,
+    end: chrono::DateTime<chrono::FixedOffset>,
+) -> Option<Value> {
+    if class == AggrClass::TimeOfDay {
+        return None;
+    }
+    let held = before
+        .map(|v| (start, v))
+        .into_iter()
+        .chain(rows.iter().copied());
+    let until = rows
+        .iter()
+        .skip(usize::from(before.is_none()))
+        .map(|&(t, _)| t)
+        .chain([end]);
+    let (mut weighted, mut span) = (0.0, 0.0);
+    for ((from, v), to) in held.zip(until) {
+        let secs = to.signed_duration_since(from).num_milliseconds() as f64 / 1000.0;
+        if let (Some(x), true) = (numeric_of(class, v), secs > 0.0) {
+            weighted += x * secs;
+            span += secs;
+        }
+    }
+    (span > 0.0).then(|| serde_json::json!(weighted / span))
 }
 
 /// One bucket, one method — per-class semantics from Tables 4.5.19.1-1/2/3.
@@ -1753,6 +1881,7 @@ fn respond_aggregated(
         truncated: false,
         cut_served: None,
         more: false,
+        held: Default::default(),
     };
     let mut payload: Vec<Value> = Vec::new();
     for d in &page {
@@ -2354,6 +2483,7 @@ pub(crate) async fn query_temporal_collected(
     // aggregated here as before. A store that cannot (memory) or a
     // non-numeric value class leaves `outcome.aggregated` false.
     let push_agg = trepr.aggregated
+        && !crate::history::records_on_change(st, &tenant)
         && exact_push
         && push_page
         && trepr.omit.is_none()
@@ -2590,6 +2720,7 @@ pub(crate) async fn query_temporal_collected(
             trepr.omit.as_ref(),
             trepr.dataset_id.as_ref(),
             &timeprop,
+            crate::history::held_attrs(st, &tenant, d),
         );
         if !trepr.aggregated {
             truncate(&mut w, &timeprop, page_n.desc);
@@ -2744,8 +2875,28 @@ async fn retrieve_temporal_inner(
                 "datasetId",
                 "entityMap",
                 "entityMapLifetime",
+                "versions",
             ],
         )?;
+        // T-4665, ADR-N-054 2.4: the chain of each measurement, for a caller
+        // the space's Policy granted `readVersions` (the gateway says so)
+        let versions = match params.get("versions").map(String::as_str) {
+            None => false,
+            Some("all") => true,
+            Some(other) => {
+                return Err(NgsiError::BadRequestData(format!(
+                    "versions takes only `all`, not {other:?}"
+                ))
+                .into())
+            }
+        };
+        if versions && !crate::provenance::may_read_versions(headers, st.provenance_from.as_deref())
+        {
+            return Err(ApiError::Denied(
+                "versions=all needs readVersions, which the space's Policy grants through the gateway"
+                    .into(),
+            ));
+        }
         let accept = parse_accept(headers)?;
         let ctx = request_context(&st.loader, headers).await?;
         let filter = gate!(st, &tenant, headers, "5.7.3", ids: &[id]).await?;
@@ -2892,9 +3043,14 @@ async fn retrieve_temporal_inner(
             trepr.omit.as_ref(),
             trepr.dataset_id.as_ref(),
             &timeprop,
+            crate::history::held_attrs(st, &tenant, &doc),
         );
         if !trepr.aggregated {
             truncate(&mut w, &timeprop, page_n.desc);
+            // after the cut: lastN counts measurements, never versions (DM-119)
+            if versions {
+                with_versions(&mut w, &st.temporal.versions(&tenant, id).await?);
+            }
         }
         let cr = if trepr.aggregated {
             None
@@ -3982,7 +4138,16 @@ mod clause_6_3_10 {
     }
 
     async fn windowed(doc: &Value, tq: Option<&TemporalQ>, last_n: Option<usize>) -> Windowed {
-        let mut w = window(doc, tq, page(last_n), None, None, None, "observedAt");
+        let mut w = window(
+            doc,
+            tq,
+            page(last_n),
+            None,
+            None,
+            None,
+            "observedAt",
+            Default::default(),
+        );
         truncate(&mut w, "observedAt", last_n.is_some());
         w
     }
@@ -4479,6 +4644,7 @@ mod clause_4_5_19 {
             truncated: false,
             cut_served: None,
             more: false,
+            held: Default::default(),
         }
     }
 
@@ -4649,6 +4815,7 @@ mod clause_4_5_19 {
             truncated: false,
             cut_served: None,
             more: false,
+            held: Default::default(),
         }
     }
 

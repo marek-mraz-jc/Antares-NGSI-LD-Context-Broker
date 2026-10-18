@@ -790,6 +790,45 @@ impl PgTemporalStore {
         Ok(n == 1)
     }
 
+    /// Every version of the rows of one Entity's history (T-4665, ADR-N-054
+    /// 2.4) by Attribute: each instance with its `version` and `provenance`,
+    /// a superseded one with `supersededAt`, oldest first per measurement.
+    pub async fn versions(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+    ) -> Result<serde_json::Map<String, Value>, sqlx::Error> {
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        let rows: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT attr_id, data || jsonb_build_object('version', version) || jsonb_strip_nulls( \
+                 jsonb_build_object('provenance', provenance, 'supersededAt', \
+                   to_char(superseded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))) \
+             FROM (SELECT attr_id, observed_at, dataset_id, version, data, provenance, superseded_at \
+                     FROM attr_versions WHERE tenant_id = $1 AND entity_id = $2 \
+                   UNION ALL \
+                   SELECT attr_id, observed_at, dataset_id, version, data, provenance, NULL \
+                     FROM attr_instances WHERE tenant_id = $1 AND entity_id = $2) v \
+             ORDER BY attr_id, observed_at, dataset_id NULLS FIRST, version",
+        )
+        .bind(tenant.as_str())
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut out = serde_json::Map::new();
+        for (attr, instance) in rows {
+            if let Some(list) = out
+                .entry(attr)
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+            {
+                list.push(instance);
+            }
+        }
+        Ok(out)
+    }
+
     /// Temporal query: entity narrowing (ids/types/attrs) in the WHERE,
     /// instance pruning (range + lastN cap) in the reconstruction, and —
     /// when the caller passes a page — entity qualification + LIMIT/OFFSET

@@ -119,6 +119,7 @@ mod temporal_rules_window;
 mod temporal_scope_5_7_4;
 mod temporal_sub_attr_sys_4_8;
 mod temporal_values_4_5_9;
+mod temporal_versions_2_4;
 mod tenant_header_6_3_14;
 mod tenant_isolation;
 mod tenant_move;

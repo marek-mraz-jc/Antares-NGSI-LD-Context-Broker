@@ -97,7 +97,7 @@ pub(crate) fn backfilled(doc: &Value, attr: &str, current: &Value, incoming: &Va
             attr: attr.to_owned(),
             instance,
         };
-        return BUFFER.try_with(|b| b.borrow_mut().push(event)).is_ok();
+        BUFFER.try_with(|b| b.borrow_mut().push(event)).is_ok()
     }
     #[cfg(target_arch = "wasm32")]
     false
@@ -263,6 +263,51 @@ static LAST_ROWS: std::sync::LazyLock<std::sync::Mutex<LastRows>> =
 // heartbeat between them.
 const LAST_ROWS_MAX: usize = 500_000;
 
+/// The Attributes of the temporal `doc` its type records `onChange`
+/// (ADR-N-054 2.5): a query carries their level into a window and weighs
+/// their values by the time each held.
+pub(crate) fn held_attrs(
+    st: &AppState,
+    tenant: &TenantId,
+    doc: &Value,
+) -> std::collections::HashSet<String> {
+    let rules = st
+        .history_off
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (false, Some(obj)) = (rules.recording.is_empty(), doc.as_object()) else {
+        return Default::default();
+    };
+    let types: Vec<&str> = match obj.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let recordings: Vec<_> = types
+        .iter()
+        .filter_map(|t| {
+            rules
+                .recording
+                .get(&(tenant.as_str().to_owned(), (*t).to_owned()))
+        })
+        .collect();
+    obj.keys()
+        .filter(|k| recordings.iter().any(|r| r.of(k).is_some()))
+        .cloned()
+        .collect()
+}
+
+/// Does some type of `tenant` record an Attribute `onChange`? Its
+/// aggregations are then computed here, never pushed into the store.
+pub(crate) fn records_on_change(st: &AppState, tenant: &TenantId) -> bool {
+    st.history_off
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .recording
+        .keys()
+        .any(|(t, _)| t == tenant.as_str())
+}
+
 /// Gate 4 (T-4665, ADR-N-054 2.2): whether an instance of `attr`, changed
 /// on the Entity `entity` with `types` in `tenant`, writes a row. `every`
 /// (no rule) always does; `onChange` when its value moved past the
@@ -319,7 +364,10 @@ pub(crate) fn admits_change(
         Some((was, when)) if at == *when => payload != *was,
         Some((_, when)) if at < *when => return true,
         Some((was, when)) => {
-            (at - *when).to_std().is_ok_and(|d| d >= mode.heartbeat) || moved(&mode, was, &payload)
+            at.signed_duration_since(*when)
+                .to_std()
+                .is_ok_and(|d| d >= mode.heartbeat)
+                || moved(&mode, was, &payload)
         }
     };
     if writes {

@@ -777,7 +777,10 @@ fn merge_instance_sets(
         match pos {
             Some(p) => {
                 let older = backfill
-                    .is_some_and(|(doc, attr)| crate::history::backfilled(doc, attr, &cur[p], ni));
+                    .zip(cur.get(p))
+                    .is_some_and(|((doc, attr), current)| {
+                        crate::history::backfilled(doc, attr, current, ni)
+                    });
                 if older {
                     any = true;
                 } else if !no_overwrite {
