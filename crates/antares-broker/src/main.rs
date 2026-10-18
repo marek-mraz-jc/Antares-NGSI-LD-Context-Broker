@@ -42,6 +42,9 @@ const KNOWN_KEYS: &[&str] = &[
     // `observed` records only instances carrying observedAt; `none`
     // auto-records nothing (temporal API + reads stay on).
     "ANTARES_TEMPORAL_RECORD",
+    // History dedup on append (T-4507): `off` records an instance equal to the
+    // newest one again; anything else (default) skips it.
+    "ANTARES_TEMPORAL_DEDUP",
     "ANTARES_DATA_DIR",
     // Egress: private-range destinations are ALLOWED by default (ADR-0010 —
     // brokers federate inside private networks); a hardened deployment sets
@@ -505,6 +508,8 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("odata", || antares_ops::mount(antares_odata::OData)),
     #[cfg(feature = "ogc")]
     ("ogc", || antares_ops::mount(antares_ogc::Ogc)),
+    #[cfg(feature = "sta")]
+    ("sta", || antares_ops::mount(antares_sta::Sta)),
     #[cfg(feature = "ws")]
     ("ws", || antares_ops::mount(antares_ws::Ws::process())),
     #[cfg(all(feature = "ws", feature = "views"))]

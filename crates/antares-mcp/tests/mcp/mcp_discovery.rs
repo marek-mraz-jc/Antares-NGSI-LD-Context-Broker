@@ -49,8 +49,8 @@ async fn the_tool_list_is_the_allowlist_filtered_by_the_engine() -> Result<(), S
     let all = tool_names(&f.app, "cars").await;
     assert_eq!(
         all.len(),
-        13,
-        "every read tool but the Subscription ones: {all:?}"
+        14,
+        "every read tool but the Subscription ones, and describe_type: {all:?}"
     );
     let f = fixture_with(Some(Arc::new(NoTypes))).await?;
     let less = tool_names(&f.app, "cars").await;
@@ -60,7 +60,7 @@ async fn the_tool_list_is_the_allowlist_filtered_by_the_engine() -> Result<(), S
             "clause 5.7.5 serves both: {less:?}"
         );
     }
-    assert_eq!(less.len(), 11, "{less:?}");
+    assert_eq!(less.len(), 12, "{less:?}");
     Ok(())
 }
 

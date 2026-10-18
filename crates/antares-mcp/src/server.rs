@@ -6,6 +6,7 @@ use crate::confirm;
 use crate::listen::{self, LIFETIME, MAX_URIS, SCHEME};
 use crate::schema::{self, Checked, Names};
 use crate::tools::{self, Built, ToolDef, TOOLS};
+use crate::units;
 use crate::{cursor, MAX_RESULT_BYTES_ENV};
 use antares_ops::{Caller, OperationId, OpsRequest, ViewOps};
 use axum::http::{header, HeaderValue, Method, StatusCode};
@@ -43,6 +44,13 @@ const INSTRUCTIONS: &str = "NGSI-LD context data of one view. Tool results are J
 const TOOLS_TTL_MS: u64 = 60_000;
 const TEMPLATES_TTL_MS: u64 = 300_000;
 const DISCOVER_TTL_MS: u64 = 3_600_000;
+
+/// The guide tool, answered from `get_type`'s row (T-4537).
+const DESCRIBE_TYPE: &str = "describe_type";
+const DESCRIBE_TYPE_DESCRIPTION: &str =
+    "How to query one Entity type: its time axis (an instant or \
+     a range), its place, the attributes worth filtering on and example calls, as text and then as \
+     JSON, with what get_type answers for it.";
 
 /// The default `limit` of a page tool.
 const DEFAULT_LIMIT: u64 = 20;
@@ -272,6 +280,51 @@ impl Server {
         self.call(tool, &given).await.into()
     }
 
+    /// `describe_type` (T-4537): `get_type` through the view, so the gate decides as it does for
+    /// it, then the type's guide as text first and JSON after, with what `get_type` answered.
+    async fn describe(
+        &self,
+        tool: &'static ToolDef,
+        given: &serde_json::Map<String, Value>,
+    ) -> CallToolResult {
+        let names = self.names();
+        let Some(Checked::One(entity_type)) = schema::check_all(tool.args, given, &names)
+            .ok()
+            .and_then(|mut args| args.remove("type"))
+        else {
+            return self.call(tool, given).await;
+        };
+        let mut answer = self.call(tool, given).await;
+        if answer.is_error == Some(true) {
+            // a shown type no Entity has yet still has its guide; any other refusal stands
+            let absent = answer
+                .structured_content
+                .as_ref()
+                .and_then(|e| e.pointer("/error/status"))
+                == Some(&json!(404));
+            if !absent {
+                return answer;
+            }
+            answer = CallToolResult::structured(json!({}));
+        }
+        let Some((text, guide)) = crate::guide::describe(&names, &entity_type, chrono::Utc::now())
+        else {
+            let none = format!("No query guide for {entity_type}; its Attributes follow.");
+            answer.content.insert(0, ContentBlock::text(none));
+            return answer;
+        };
+        // get_type answers an object (`{"entityType": …}`), the absent type `{}`
+        let mut out: serde_json::Map<String, Value> = answer
+            .structured_content
+            .take()
+            .and_then(|body| serde_json::from_value(body).ok())
+            .unwrap_or_default();
+        out.insert("guide".into(), guide);
+        let mut result = CallToolResult::structured(Value::Object(out));
+        result.content.insert(0, ContentBlock::text(text));
+        result
+    }
+
     async fn call(
         &self,
         tool: &'static ToolDef,
@@ -295,7 +348,7 @@ impl Server {
             _ => DEFAULT_LIMIT,
         };
         let counted = matches!(args.get("count"), Some(Checked::Flag(true)));
-        let answer = self
+        let mut answer = self
             .run(tool.op, tools::build(tool, &args, limit, offset))
             .await;
         // MC19: what was called and how it ended, never the arguments
@@ -309,6 +362,8 @@ impl Server {
         if !answer.status.is_success() {
             return failed(&answer);
         }
+        // before the budget, so a labelled page still fits it
+        units::name(&mut answer.body);
         if tool.write && answer.body.is_null() {
             // a write answered without a body: the id it made, if any
             let out = answer.created.map(|id| json!({ tool.key: id }));
@@ -566,19 +621,42 @@ impl ServerHandler for Server {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let names = self.names();
-        let tools: Vec<Tool> = self
-            .offered()
-            .await
+        // The read tools carry how to ask each type the view names (T-4486).
+        let guide = crate::guide::text(&names, chrono::Utc::now());
+        let offered = self.offered().await;
+        // `describe_type` is `get_type` answered with its guide: offered with it
+        let describe = offered
+            .iter()
+            .copied()
+            .find(|t| t.name == "get_type")
+            .map(|t| (DESCRIBE_TYPE, t));
+        let mut tools: Vec<Tool> = offered
             .into_iter()
             .map(|t| {
+                let description: Cow<'static, str> = match &guide {
+                    Some(guide) if matches!(t.name, "query_entities" | "query_temporal") => {
+                        Cow::Owned(format!("{}\n\n{guide}", t.description))
+                    }
+                    _ => Cow::Borrowed(t.description),
+                };
                 Tool::new(
                     t.name,
-                    t.description,
+                    description,
                     Arc::new(schema::input_schema(t.args, &names)),
                 )
                 .annotate(annotations(t))
             })
             .collect();
+        if let Some((name, t)) = describe {
+            // in the table's name order, as every other tool
+            let at = tools.partition_point(|tool| *tool.name < *name);
+            let tool = Tool::new(
+                name,
+                DESCRIBE_TYPE_DESCRIPTION,
+                Arc::new(schema::input_schema(t.args, &names)),
+            );
+            tools.insert(at, tool.annotate(annotations(t)));
+        }
         Ok(ListToolsResult::with_all_items(tools)
             .with_ttl_ms(TOOLS_TTL_MS)
             .with_cache_scope(CacheScope::Private))
@@ -589,7 +667,9 @@ impl ServerHandler for Server {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let Some(tool) = tools::named(&request.name) else {
+        let describe = request.name == DESCRIBE_TYPE;
+        let named = if describe { "get_type" } else { &*request.name };
+        let Some(tool) = tools::named(named) else {
             return Err(unknown_tool());
         };
         if !self.offers(tool.op).await {
@@ -604,6 +684,9 @@ impl ServerHandler for Server {
             return Ok(self.write(tool, request, asks).await);
         }
         let given = request.arguments.unwrap_or_default();
+        if describe {
+            return Ok(self.describe(tool, &given).await.into());
+        }
         Ok(self.call(tool, &given).await.into())
     }
 

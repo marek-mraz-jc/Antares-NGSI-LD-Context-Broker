@@ -25,10 +25,12 @@ mod confirm;
 mod cursor;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
+mod guide;
 mod listen;
 mod schema;
 mod server;
 mod tools;
+mod units;
 
 use antares_ops::{Caller, Ops, Refusal, Surface};
 use axum::extract::{Path, Request};

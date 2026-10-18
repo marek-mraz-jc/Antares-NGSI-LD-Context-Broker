@@ -1129,3 +1129,144 @@ async fn a_comma_seconds_fraction_survives_the_geo_prefilter() {
         );
     }
 }
+
+/// T-4507: an auto-recorded append writes a row only for a new observation.
+/// With observedAt: one row per (attribute, datasetId, observedAt), a new
+/// value at the same observedAt corrects that row in place. Without: a row
+/// only when the value differs from the newest stored one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unchanged_append_records_no_new_instance() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let s = PgTemporalStore::new(pool.clone());
+    let t = TenantId::new("pgtempdedup").expect("tenant");
+    let other = TenantId::new("pgtempdedup2").expect("tenant");
+    let id = "urn:ngsi-ld:Vehicle:dedup";
+    for tenant in [&t, &other] {
+        pg::ensure_tenant(&pool, tenant).await.expect("tenant row");
+        let _ = s.delete(tenant, id).await;
+        ensure_entity(&pool, tenant, id).await;
+    }
+    let speed = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+    let name = "https://uri.etsi.org/ngsi-ld/default-context/name";
+    let shell = json!({"id": id, "type": "Vehicle",
+        "createdAt": "2026-08-15T09:00:00Z", "modifiedAt": "2026-08-15T09:00:00Z"});
+    let mut n = 0;
+    let mut append = |tenant: &TenantId, adds: serde_json::Value| {
+        n += 1;
+        let at = format!("2026-08-15T09:{n:02}:00Z");
+        // Every write stamps a fresh instanceId and modifiedAt, as the API does.
+        let mut adds = adds;
+        for (k, a) in adds.as_object_mut().expect("attrs").iter_mut() {
+            for (j, i) in a.as_array_mut().expect("instances").iter_mut().enumerate() {
+                i["instanceId"] =
+                    json!(format!("urn:ngsi-ld:Instance:{k}-{n}-{j}").replace("https://", ""));
+                i["modifiedAt"] = json!(at);
+                i["createdAt"] = json!("2026-08-15T09:00:00Z");
+            }
+        }
+        (tenant.clone(), adds)
+    };
+    let rows = |tenant: &TenantId, attr: &str| {
+        let (pool, tenant, attr) = (pool.clone(), tenant.as_str().to_owned(), attr.to_owned());
+        async move {
+            sqlx::query_as::<_, (String, Option<String>, serde_json::Value)>(
+                "SELECT instance_id, dataset_id, data FROM attr_instances
+                 WHERE tenant_id = $1 AND entity_id = $2 AND attr_id = $3 ORDER BY observed_at",
+            )
+            .bind(tenant)
+            .bind(id)
+            .bind(attr)
+            .fetch_all(&pool)
+            .await
+            .expect("rows")
+        }
+    };
+    let observed =
+        |v: i64, at: &str| json!({speed: [{"type": "Property", "value": v, "observedAt": at}]});
+
+    for _ in 0..3 {
+        let (tn, adds) = append(&t, observed(10, "2026-08-15T08:00:00Z"));
+        s.append(&tn, id, &shell, &adds).await.expect("append");
+    }
+    assert_eq!(
+        rows(&t, speed).await.len(),
+        1,
+        "three unchanged writes, one instance"
+    );
+    let (tn, adds) = append(&t, observed(10, "2026-08-15T08:05:00Z"));
+    s.append(&tn, id, &shell, &adds).await.expect("append");
+    assert_eq!(
+        rows(&t, speed).await.len(),
+        2,
+        "a new observedAt is a new instance"
+    );
+    let kept = rows(&t, speed).await[1].0.clone();
+    let (tn, adds) = append(&t, observed(11, "2026-08-15T08:05:00Z"));
+    s.append(&tn, id, &shell, &adds).await.expect("append");
+    let got = rows(&t, speed).await;
+    assert_eq!(
+        got.len(),
+        2,
+        "a corrected value at the same observedAt stays one instance"
+    );
+    assert_eq!(
+        (got[1].0.as_str(), &got[1].2["value"]),
+        (kept.as_str(), &json!(11))
+    );
+    assert_eq!(
+        got[1].2["instanceId"],
+        json!(kept),
+        "the instance keeps its id"
+    );
+
+    // Without observedAt: compared with the newest stored value.
+    let plain = |v: &str| json!({name: [{"type": "Property", "value": v}]});
+    for v in ["a", "a", "b", "b", "a"] {
+        let (tn, adds) = append(&t, plain(v));
+        s.append(&tn, id, &shell, &adds).await.expect("append");
+    }
+    let got = rows(&t, name).await;
+    let values: Vec<_> = got.iter().map(|r| r.2["value"].clone()).collect();
+    assert_eq!(
+        values,
+        [json!("a"), json!("b"), json!("a")],
+        "a change, and a change back, are recorded"
+    );
+
+    // Two datasetIds are two series; two equal entries in one append are one.
+    let both = |v: i64| {
+        json!({speed: [
+        {"type": "Property", "value": v, "observedAt": "2026-08-15T07:00:00Z", "datasetId": "urn:ds:a"},
+        {"type": "Property", "value": v, "observedAt": "2026-08-15T07:00:00Z", "datasetId": "urn:ds:b"},
+        {"type": "Property", "value": v, "observedAt": "2026-08-15T07:00:00Z", "datasetId": "urn:ds:b"}]})
+    };
+    let (tn, adds) = append(&t, both(5));
+    s.append(&tn, id, &shell, &adds).await.expect("append");
+    let (tn, adds) = append(&t, both(5));
+    s.append(&tn, id, &shell, &adds).await.expect("append");
+    let mut sets: Vec<_> = rows(&t, speed)
+        .await
+        .into_iter()
+        .filter_map(|r| r.1)
+        .collect();
+    sets.sort();
+    assert_eq!(sets, ["urn:ds:a", "urn:ds:b"]);
+
+    // Another tenant's identical history never suppresses this tenant's.
+    let (tn, adds) = append(&other, observed(10, "2026-08-15T08:00:00Z"));
+    s.append(&tn, id, &shell, &adds).await.expect("append");
+    assert_eq!(rows(&other, speed).await.len(), 1);
+
+    // The reconstructed evolution reads the same series.
+    let doc = s.get(&t, id).await.expect("get").expect("present");
+    assert_eq!(doc[name].as_array().map(Vec::len), Some(3), "{doc}");
+    for tenant in [&t, &other] {
+        let _ = s.delete(tenant, id).await;
+        sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
+            .bind(tenant.as_str())
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+}

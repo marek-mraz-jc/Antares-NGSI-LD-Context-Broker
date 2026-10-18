@@ -112,6 +112,7 @@ dependencies = [
  "antares-ops",
  "antares-plugin-example",
  "antares-sql",
+ "antares-sta",
  "antares-store",
  "antares-views",
  "antares-ws",
@@ -192,6 +193,7 @@ version = "0.2.0"
 dependencies = [
  "antares-ops",
  "axum",
+ "chrono",
  "http-body-util",
  "rmcp",
  "serde_json",
@@ -314,6 +316,18 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "antares-sta"
+version = "0.2.0"
+dependencies = [
+ "antares-ops",
+ "axum",
+ "http-body-util",
+ "serde_json",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

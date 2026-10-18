@@ -352,7 +352,13 @@ pub async fn fixture_with(engine: Option<Arc<dyn PolicyEngine>>) -> Result<Fixtu
             "city",
             &json!({
                 "id": format!("urn:ngsi-ld:Car:{id}"), "type": "Car",
-                "speed": prop(&json!(speed)), "colour": prop(&json!("red")),
+                // Car:1 carries a Rec 20 code, read back with its unit label
+                "speed": if id == "1" {
+                    json!({"type": "Property", "value": speed, "unitCode": "KMH"})
+                } else {
+                    prop(&json!(speed))
+                },
+                "colour": prop(&json!("red")),
                 "secret": prop(&json!("s3cr3t")),
                 "note": {"type": "Relationship", "object": format!("urn:ngsi-ld:Car:{note}")}
             }),

@@ -48,6 +48,7 @@ a source name. Each call is inverted and rebuilt as on the view root.
 |---|---|---|
 | `batch_query` | Query Entities, POST form (10.4.3) | yes |
 | `batch_query_temporal` | Temporal Query, POST form (11.3.3) | yes |
+| `describe_type` | Retrieve Available Entity Type Information (10.6.5), with the type's query guide | no |
 | `get_attribute` | Retrieve Available Attribute Information (10.6.8) | no |
 | `get_attribute_value` | Retrieve Attribute Value (10.4.4) | no |
 | `get_entity` | Retrieve Entity (10.4.2) | no |
@@ -61,6 +62,12 @@ a source name. Each call is inverted and rebuilt as on the view root.
 | `query_entities` | Query Entities (10.4.3) | yes |
 | `query_temporal` | Temporal Query (11.3.3) | yes |
 | `retrieve_temporal` | Temporal Retrieve (11.3.2) | no |
+
+`describe_type` is listed wherever `get_type` is and runs the same gated
+operation; its answer opens with the type's query guide as text (time axis,
+place, filters, example calls, naming only shown attributes), then the same
+guide as JSON under `guide` beside what `get_type` answers (T-4537). A shown
+type no Entity has yet still gets its guide.
 
 The write tools (section 3) are listed the same way:
 
@@ -179,6 +186,12 @@ One result's structured content is at most `ANTARES_MCP_MAX_RESULT_BYTES`
   and the arguments it was made for (MC20);
 - one item past the budget is a tool error naming `pick` or `attrs` (or
   `lastN` for history); nothing is ever cut (MC5).
+
+Every `unitCode` of a tool result that is a UN/CEFACT Recommendation 20
+common code gains `unit`, the symbol a person reads (`GQ` → `µg/m³`), or
+Rec 20's name for a unit with no symbol; a `unit` already there stays. The
+label is added before the budget is applied. The stored entity and the
+NGSI-LD answers keep the code alone.
 
 ## 5. Resources
 
