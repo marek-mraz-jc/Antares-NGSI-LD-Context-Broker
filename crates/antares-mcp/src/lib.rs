@@ -72,6 +72,7 @@ pub const ENV_KEYS: &[&str] = &[
     SUBSCRIPTION_ENDPOINTS_ENV,
 ];
 
+pub use antares_ops::PRIMER;
 pub use listen::Sink;
 pub use schema::SUBSCRIPTION_ENDPOINTS_ENV;
 
