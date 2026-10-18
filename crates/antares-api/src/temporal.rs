@@ -1483,12 +1483,29 @@ fn render_aggregated(
         type Bucket = (DateTime<FixedOffset>, DateTime<FixedOffset>);
         type Rows<'a> = Vec<(DateTime<FixedOffset>, &'a Value)>;
         let mut buckets: Vec<(Bucket, Rows)> = Vec::new();
+        // An onChange attribute held its value through a period no row fell in: that period
+        // answers the value, as `every` would have, up to the window's end (T-4669).
+        let fill = |buckets: &mut Vec<(Bucket, Rows)>, until: DateTime<FixedOffset>| {
+            while let Some(end) = buckets.last().map(|((_, end), _)| *end) {
+                let gap = bucket_of(end);
+                if end >= until || end >= whole.1 || gap.0 < end {
+                    break;
+                }
+                buckets.push((gap, Vec::new()));
+            }
+        };
         for &(t, v) in &times {
             let b = bucket_of(t);
+            if held {
+                fill(&mut buckets, b.0);
+            }
             match buckets.last_mut() {
                 Some((bb, rows)) if bb.0 == b.0 => rows.push((t, v)),
                 _ => buckets.push((b, vec![(t, v)])),
             }
+        }
+        if held {
+            fill(&mut buckets, whole.1);
         }
         let mut attr_out = Map::new();
         // 4.5.19.0: the member is labelled "Property" for Properties and
@@ -1504,17 +1521,20 @@ fn render_aggregated(
                 .iter()
                 .enumerate()
                 .map(|(i, ((bs, be), rows))| {
-                    // the value the previous bucket ended on holds into this one
-                    let before = i
-                        .checked_sub(1)
-                        .and_then(|p| buckets.get(p))
-                        .and_then(|(_, r)| r.last())
+                    // the value the last bucket with a row ended on holds into this one
+                    let before = buckets[..i]
+                        .iter()
+                        .rev()
+                        .find_map(|(_, r)| r.last())
                         .map(|&(_, v)| v);
                     let weighted = (held && method == "avg")
                         .then(|| time_weighted_avg(class, rows, before, *bs, (*be).min(whole.1)))
                         .flatten();
                     let val = weighted.unwrap_or_else(|| {
-                        let vals: Vec<&Value> = rows.iter().map(|&(_, v)| v).collect();
+                        let vals: Vec<&Value> = match (rows.is_empty(), before) {
+                            (true, Some(v)) => vec![v],
+                            _ => rows.iter().map(|&(_, v)| v).collect(),
+                        };
                         aggregate_bucket(method, class, &vals)
                     });
                     Value::Array(vec![val, Value::String(fmt(*bs)), Value::String(fmt(*be))])
