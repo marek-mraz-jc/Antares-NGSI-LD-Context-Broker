@@ -569,14 +569,22 @@ impl ServerHandler for Server {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let names = self.names();
+        // The read tools carry how to ask each type the view names (T-4486).
+        let guide = crate::guide::text(&names, chrono::Utc::now());
         let tools: Vec<Tool> = self
             .offered()
             .await
             .into_iter()
             .map(|t| {
+                let description: Cow<'static, str> = match &guide {
+                    Some(guide) if matches!(t.name, "query_entities" | "query_temporal") => {
+                        Cow::Owned(format!("{}\n\n{guide}", t.description))
+                    }
+                    _ => Cow::Borrowed(t.description),
+                };
                 Tool::new(
                     t.name,
-                    t.description,
+                    description,
                     Arc::new(schema::input_schema(t.args, &names)),
                 )
                 .annotate(annotations(t))
