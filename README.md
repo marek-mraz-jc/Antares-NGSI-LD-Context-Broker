@@ -208,14 +208,21 @@ number is produced.
 NGSI-LD data model, JSON-LD expansion, the query languages, subscription matching and the
 residual evaluator with no server, store or network in their default features (role `ngsild`,
 ADR-0027). Each has a README with a runnable example and the CIM 009 clauses it implements, and
-builds from its packaged files alone (`cargo publish --dry-run` in `workspace.yml`). They are
-published to crates.io by `.github/workflows/release-crates.yml` from a `v*` tag only, through
-crates.io trusted publishing (no stored token) with SLSA provenance on every `.crate`.
+builds from its packaged files alone (`cargo publish --dry-run` in `workspace.yml`).
 
-Yanking a bad version: run `cargo yank --version <x.y.z> <crate>` with an owner's crates.io login
-for every crate of the release that carries the defect, open an issue that names the version and
-the defect, and release the fix as a new patch version from a new tag. A yank stops new lockfiles
-from choosing the version; it does not delete it or break a build that already locked it.
+They are released through their own repository,
+[marek-mraz-jc/ngsild](https://github.com/marek-mraz-jc/ngsild), and taken from there as a git
+dependency at a `v*` tag (no crates.io for now, owner decision 2026-10-18, T-3913). They are
+still changed here only: `python3 dev/ngsild-export.py <dir>` writes that repository's tree
+from this checkout (the five crates, a root manifest of the workspace entries they inherit, the
+pruned lockfile), and `dev/ngsild-export.test.sh` proves the tree builds and passes its tests on
+its own. To release: replace the clone's content with the export, commit, tag
+`v<workspace version>`, push; the tag's workflow there tests the workspace and publishes a GitHub
+release whose source archive carries SLSA build provenance.
+
+A bad release: never move or delete a pushed tag. Mark its GitHub release "do not use" with the
+defect, open an issue naming the version, and release the fix as the next patch version from a
+new tag.
 
 ## Repository layout
 
