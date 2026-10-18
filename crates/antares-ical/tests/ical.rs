@@ -4,7 +4,8 @@
 //! an Attribute the view hides is in no `VEVENT`.
 //!
 //! The Tenant `city` holds five Events and a `Meeting`. The view `city` shows `Event` without
-//! its `organizer` and hides `Meeting`; `places` shows `Place` alone.
+//! its `organizer` and hides `Meeting`; `places` shows `Place` alone; `every` shows every type;
+//! `void` reads the empty Tenant `void`; `writes` allows Create Entity alone.
 
 #![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
@@ -92,6 +93,12 @@ async fn fixture() -> (TestBroker, Router) {
                "rules": [{"types": ["Event"], "attributes": ["name", "startDate", "endDate", "description", "address", "location", "url"]}]}),
         json!({"id": "places", "tenant": "city", "selector": ["Place"], "operations": reads,
                "rules": [{"types": ["Place"], "attributes": ["name"]}]}),
+        json!({"id": "every", "tenant": "city", "selector": ["*"], "operations": reads,
+               "rules": [{"types": ["*"], "attributes": ["*"]}]}),
+        json!({"id": "void", "tenant": "void", "selector": ["Event"], "operations": reads,
+               "rules": [{"types": ["Event"], "attributes": ["name", "startDate"]}]}),
+        json!({"id": "writes", "tenant": "city", "selector": ["Event"], "operations": ["create_entity"],
+               "rules": [{"types": ["Event"], "attributes": ["name", "startDate"]}]}),
     ];
     for view in views {
         let id = view["id"].as_str().expect("id");
@@ -270,4 +277,69 @@ async fn a_bad_window_a_view_without_events_and_a_write_are_refused() {
     assert_eq!(a.status, StatusCode::METHOD_NOT_ALLOWED);
     let a = send(&app, "HEAD", feed, "").await;
     assert_eq!((a.status, a.body.as_str()), (StatusCode::OK, ""));
+}
+
+#[tokio::test]
+async fn a_view_of_every_type_serves_its_events_alone() {
+    let (_broker, app) = fixture().await;
+    let a = send(&app, "GET", "/x/views/every/ical/v1/events.ics", "").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        uids(&parse(&a.body)),
+        [
+            "urn:ngsi-ld:Event:jarmok",
+            "urn:ngsi-ld:Event:koncert",
+            "urn:ngsi-ld:Event:silvester"
+        ]
+    );
+    assert!(!a.body.contains("Meeting"), "{}", a.body);
+}
+
+#[tokio::test]
+async fn an_empty_tenant_is_an_empty_calendar_and_a_refused_read_a_502() {
+    let (_broker, app) = fixture().await;
+    let a = send(&app, "GET", "/x/views/void/ical/v1/events.ics", "").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert!(events(&parse(&a.body)).is_empty(), "{}", a.body);
+    let a = send(&app, "GET", "/x/views/writes/ical/v1/events.ics", "").await;
+    assert_eq!(a.status, StatusCode::BAD_GATEWAY, "{}", a.body);
+    let a = send(&app, "OPTIONS", "/x/views/city/ical/v1/events.ics", "").await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn a_feed_reads_every_page_and_refuses_past_its_bound() {
+    use antares_ops::Surface as _;
+    assert_eq!(
+        antares_ical::Ical.version_info()["endpoint"],
+        "/x/views/{view}/ical/v1/events.ics"
+    );
+    let (_broker, app) = fixture().await;
+    let add = |from: usize, to: usize| {
+        let app = app.clone();
+        async move {
+            let batch: Vec<Value> = (from..to)
+                .map(|i| {
+                    json!({"id": format!("urn:ngsi-ld:Event:bulk-{i:05}"), "type": "Event",
+                                "name": prop("Trh"), "startDate": prop("2026-10-20")})
+                })
+                .collect();
+            let body = Value::Array(batch).to_string();
+            let a = send(&app, "POST", "/ngsi-ld/v1/entityOperations/create", &body).await;
+            assert!(a.status.is_success(), "{}", a.body);
+        }
+    };
+    // past one upstream page of 100
+    add(0, 250).await;
+    let a = send(&app, "GET", "/x/views/city/ical/v1/events.ics", "").await;
+    assert_eq!(a.status, StatusCode::OK);
+    assert_eq!(events(&parse(&a.body)).len(), 253);
+    let mut at = 250;
+    while at < antares_ops::RESIDUAL_SCAN {
+        let next = (at + 1000).min(antares_ops::RESIDUAL_SCAN);
+        add(at, next).await;
+        at = next;
+    }
+    let a = send(&app, "GET", "/x/views/city/ical/v1/events.ics", "").await;
+    assert_eq!(a.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", a.body);
 }

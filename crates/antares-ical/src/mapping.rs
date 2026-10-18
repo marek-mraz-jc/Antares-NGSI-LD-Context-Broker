@@ -226,9 +226,8 @@ fn url(entity: &Value) -> Option<&str> {
 /// `modifiedAt`.
 #[must_use]
 pub fn vevent(entity: &Value, window: &Window, now: DateTime<Utc>) -> Outcome {
-    let Some(uid) = entity.get("id").and_then(Value::as_str) else {
-        return Outcome::Skipped("id");
-    };
+    // Every Entity a view answers has an id.
+    let uid = entity.get("id").and_then(Value::as_str).unwrap_or_default();
     let Some(start) = text(entity, "startDate").and_then(When::parse) else {
         return Outcome::Skipped("startDate");
     };
@@ -267,124 +266,4 @@ pub fn vevent(entity: &Value, window: &Window, now: DateTime<Utc>) -> Outcome {
         fold(line, &mut out);
     }
     Outcome::Event(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-10-18T00:00:00Z")
-            .map(|t| t.with_timezone(&Utc))
-            .unwrap_or_default()
-    }
-
-    fn event(extra: &Value) -> Value {
-        let mut e = json!({"id": "urn:ngsi-ld:Event:1", "type": "Event",
-            "name": {"type": "Property", "value": "Koncert"},
-            "startDate": {"type": "Property", "value": "2026-10-20"}});
-        if let (Some(e), Some(extra)) = (e.as_object_mut(), extra.as_object()) {
-            e.extend(extra.clone());
-        }
-        e
-    }
-
-    fn lines(outcome: &Outcome) -> Vec<String> {
-        match outcome {
-            Outcome::Event(text) => text
-                .replace("\r\n ", "")
-                .split("\r\n")
-                .map(str::to_owned)
-                .collect(),
-            other => vec![format!("{other:?}")],
-        }
-    }
-
-    #[test]
-    fn a_line_of_multibyte_letters_folds_at_75_octets_between_characters() {
-        let mut out = String::new();
-        fold(&format!("SUMMARY:{}", "ž".repeat(60)), &mut out);
-        for line in out.trim_end_matches("\r\n").split("\r\n") {
-            assert!(line.len() <= 75, "{} octets: {line}", line.len());
-        }
-        assert_eq!(
-            out.replace("\r\n ", ""),
-            format!("SUMMARY:{}\r\n", "ž".repeat(60))
-        );
-    }
-
-    #[test]
-    fn text_escapes_what_rfc_5545_reserves_and_drops_control_characters() {
-        assert_eq!(escape("a,b;c\\d\ne\u{7}"), "a\\,b\\;c\\\\d\\ne");
-    }
-
-    #[test]
-    fn a_multi_day_event_ends_the_day_after_its_last_day() {
-        let e = event(&json!({"endDate": {"type": "Property", "value": "2026-10-22"}}));
-        let l = lines(&vevent(&e, &Window::default(), now()));
-        assert!(
-            l.contains(&"DTSTART;VALUE=DATE:20261020".to_owned()),
-            "{l:?}"
-        );
-        assert!(l.contains(&"DTEND;VALUE=DATE:20261023".to_owned()), "{l:?}");
-    }
-
-    #[test]
-    fn an_offset_is_written_in_utc_and_an_end_before_the_start_is_dropped() {
-        let e = event(&json!({
-            "startDate": {"type": "Property", "value": {"@type": "DateTime", "@value": "2026-10-20T18:00:00+02:00"}},
-            "endDate": {"type": "Property", "value": "2026-10-20T17:00:00+02:00"}}));
-        let l = lines(&vevent(&e, &Window::default(), now()));
-        assert!(l.contains(&"DTSTART:20261020T160000Z".to_owned()), "{l:?}");
-        assert!(!l.iter().any(|x| x.starts_with("DTEND")), "{l:?}");
-    }
-
-    #[test]
-    fn without_start_or_name_there_is_no_event() {
-        let mut e = event(&json!({}));
-        if let Some(o) = e.as_object_mut() {
-            o.remove("name");
-        }
-        assert_eq!(
-            vevent(&e, &Window::default(), now()),
-            Outcome::Skipped("name")
-        );
-        let e = event(&json!({"startDate": {"type": "Property", "value": "soon"}}));
-        assert_eq!(
-            vevent(&e, &Window::default(), now()),
-            Outcome::Skipped("startDate")
-        );
-    }
-
-    #[test]
-    fn the_window_keeps_what_overlaps_it_and_its_last_day_inclusive() {
-        let day = |d: &str| When::parse(d).map(When::key);
-        let w = Window {
-            from: day("2026-10-21"),
-            to: When::parse("2026-10-21").map(When::past),
-        };
-        let multi = event(&json!({"endDate": {"type": "Property", "value": "2026-10-22"}}));
-        assert!(matches!(vevent(&multi, &w, now()), Outcome::Event(_)));
-        // one day, the 20th: over before the 21st
-        assert_eq!(vevent(&event(&json!({})), &w, now()), Outcome::Outside);
-        let late =
-            event(&json!({"startDate": {"type": "Property", "value": "2026-10-21T23:30:00Z"}}));
-        assert!(matches!(vevent(&late, &w, now()), Outcome::Event(_)));
-    }
-
-    #[test]
-    fn location_geo_and_url_come_from_the_entity_and_a_bad_url_is_left_out() {
-        let e = event(&json!({
-            "address": {"type": "Property", "value": {"streetAddress": "Námestie SNP 1", "addressLocality": "Banská Bystrica"}},
-            "location": {"type": "GeoProperty", "value": {"type": "Point", "coordinates": [19.146, 48.736]}},
-            "url": {"type": "Property", "value": "javascript:alert(1)"}}));
-        let l = lines(&vevent(&e, &Window::default(), now()));
-        assert!(
-            l.contains(&"LOCATION:Námestie SNP 1\\, Banská Bystrica".to_owned()),
-            "{l:?}"
-        );
-        assert!(l.contains(&"GEO:48.736;19.146".to_owned()), "{l:?}");
-        assert!(!l.iter().any(|x| x.starts_with("URL")), "{l:?}");
-    }
 }

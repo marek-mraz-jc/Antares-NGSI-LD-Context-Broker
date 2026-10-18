@@ -245,7 +245,7 @@ async fn feed(
             Some(n) if n >= RESIDUAL_SCAN => {
                 return Err(Problem(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    "the view holds more events than one feed serves",
+                    "the view holds as many events as one feed reads or more",
                 ))
             }
             Some(n) => start = n,

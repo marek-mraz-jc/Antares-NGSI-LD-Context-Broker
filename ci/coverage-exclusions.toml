@@ -661,3 +661,11 @@ function = "ngsild_jsonld::pinned::resolve_with"
 lines = 1
 branches = 0
 reason = "the unpinned core context: every_pinned_context_parses_and_carries_an_at_context rules it out; the arm makes a broken pin a 500 instead of a panic"
+
+[[exclusion]]
+crate = "antares-ical"
+file = "src/lib.rs"
+function = "antares_ical::feed"
+lines = 0
+branches = 1
+reason = "the false side of the 404 guard on Scanned::Answer: the feed's Query Entities is a fixed `type=` list from the view (or `local=true`), so the test kit's memory store answers it 200 or 404 and never 400 or 5xx; the refused read is covered as Err by an_empty_tenant_is_an_empty_calendar_and_a_refused_read_a_502 (view `writes`) and lands on the same arm"
