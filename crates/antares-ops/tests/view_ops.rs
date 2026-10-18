@@ -108,6 +108,8 @@ impl Surface for Probe {
                             "mapped": view.as_ref().and_then(|v| v.mapping().map(|m| m.source_class().to_owned())),
                             "names": view.as_ref().and_then(antares_ops::ViewOps::target_names),
                             "types": types,
+                            // the ceiling a surface writing a file itself stays under (T-4465)
+                            "maxAnswerBytes": ops.max_answer_bytes(),
                         }))
                     }
                 }),
@@ -362,7 +364,8 @@ async fn a_view_of_another_model_reaches_only_the_surface_that_asks_for_its_mapp
     assert_eq!(
         a.json,
         json!({"view": false, "mapped": "https://uri.etsi.org/ngsi-ld/default-context/Car",
-               "names": [["Vehicle"], ["velocity"]], "types": 405})
+               "names": [["Vehicle"], ["velocity"]], "types": 405,
+               "maxAnswerBytes": antares_ops::bounds::MAX_ANSWER_BYTES})
     );
     let a = send(&app, Method::GET, "/x/probe/cars/mapping", &[], None).await;
     assert_eq!(

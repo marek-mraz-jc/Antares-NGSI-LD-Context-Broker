@@ -83,6 +83,57 @@ misspelt one. `/items/{featureId}` takes `properties`, `profile` and `crs` and
 is one Query Entities by `id` and type: an Entity the view hides, of another type, absent, or an id
 that is no URI is `404`.
 
+A `parquet` build (`--features full,parquet`; not in `full`, which sits at
+its ADR-0027 size budget) also writes `/items` as one file (T-4465,
+EP-119): `f=parquet` or `Accept: application/vnd.apache.parquet` returns
+the whole answer of the request's filters (`bbox`, `datetime`, `filter`,
+`properties`, the `ngsild.` options) as Apache Parquet,
+`Content-Disposition: attachment; filename="{collectionId}.parquet"`. The
+file has an `id` column, a column per property the view shows (typed from
+the collection's schema: text, 64-bit integer, double, boolean, anything
+structured as JSON text) and, when the collection has a geometry, a
+`geometry` column of ISO WKB with GeoParquet 1.1 `geo` metadata (encoding,
+geometry types, bounding box; no `crs`, which means CRS84). A collection
+without a geometry is plain Parquet. The surface reads the answer page by
+page (1 000 Features) and writes each page as one row group, ZSTD
+compressed, so it holds one page of Features at a time. A file larger than
+the answer ceiling (64 MiB, `limits.maxAnswerBytes` in `/q/health`) is `413`, never a cut
+file; a `crs` other than CRS84 is `400`, and so is `f=parquet` on a
+single Feature. Every GeoJSON page of `/items` carries an `alternate` link
+to its file. `/q/health` lists `"encodings": ["parquet"]` under the
+surface, empty in a build without the feature.
+
+A `tabular` build (`--features full,tabular`, beside `full` for the same
+budget) writes `/items` as CSV and XLSX too (T-4477, EP-08, EP-41):
+`f=csv` or `Accept: text/csv` returns RFC 4180 CSV
+(`text/csv; charset=utf-8; header=present`, CRLF, UTF-8 without a byte
+order mark), `f=xlsx` or the spreadsheetml media type an Office Open XML
+workbook of one sheet named after the collection and a `provenance`
+sheet. The columns are the Parquet file's: `id`, `geometry` as GeoJSON
+text, a column per property the view shows; a text cell that starts with
+`=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`, so no
+spreadsheet runs it as a formula. A CSV or Parquet file holds one
+collection: `f=csv` or `f=parquet` on `/collections` is `400`. Several
+collections come as one download from `/collections`: `f=xlsx` (or its
+media type) a workbook with a sheet per collection, `f=zip` (or
+`Accept: application/zip`) a ZIP of `{collectionId}.csv` per collection
+(and `{collectionId}.parquet` in a build with `parquet` too), a
+`README.md` naming every file and a `provenance.json`. Both take
+`collections` (a comma list of collection ids; one the view does not show
+is `400`), `bbox` and `datetime`, applied to every collection; any other
+parameter is `400`. The provenance names the view, the collections, the
+query, the row count, the time of export and the broker version. The
+answer ceiling holds for the whole file: past it, `413`. Every GeoJSON
+page of `/items` carries an `alternate` link per file type the build
+writes; `/q/health` lists them under `encodings` and the `/collections`
+downloads under `bundles`.
+
+A file is held whole in memory until it is sent, so the surface writes at
+most `ANTARES_EXPORT_FILES` files at once (default 2,
+[Configuration](configuration.md)), Parquet, CSV, XLSX and ZIP together.
+One more is `503` with `Retry-After: 6`, never queued; `/q/health` shows
+the cap as `limits.exportFiles`.
+
 ## 3. Schemas and references
 
 `/schema` is a JSON Schema 2020-12 document (`application/schema+json`)
