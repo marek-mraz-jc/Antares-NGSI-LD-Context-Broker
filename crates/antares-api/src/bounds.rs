@@ -221,8 +221,19 @@ async fn admit(
 ) -> Option<tokio::sync::SemaphorePermit<'_>> {
     // capped at the whole budget, so the largest body is admitted once it runs alone
     let weight = bytes.clamp(1, budget) as u32;
-    match tokio::time::timeout(wait, slots.acquire_many(weight)).await {
-        Ok(Ok(permit)) => Some(permit),
+    #[cfg(not(target_arch = "wasm32"))]
+    let admitted = tokio::time::timeout(wait, slots.acquire_many(weight))
+        .await
+        .ok()
+        .and_then(Result::ok);
+    // the wasm build has no tokio timer: a batch is admitted only when its share is free now
+    #[cfg(target_arch = "wasm32")]
+    let admitted = {
+        let _ = wait;
+        slots.try_acquire_many(weight).ok()
+    };
+    match admitted {
+        Some(permit) => Some(permit),
         _ => {
             metrics::counter!("antares_batch_overloaded_total").increment(1);
             None
