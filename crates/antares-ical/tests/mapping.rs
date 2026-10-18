@@ -14,7 +14,10 @@ fn now() -> DateTime<Utc> {
 }
 
 fn prop(v: Value) -> Value {
-    json!({"type": "Property", "value": v})
+    Value::Object(Map::from_iter([
+        ("type".to_owned(), json!("Property")),
+        ("value".to_owned(), v),
+    ]))
 }
 
 /// An Event starting `2026-10-20` named `Koncert`, with `extra` members set or replaced.
