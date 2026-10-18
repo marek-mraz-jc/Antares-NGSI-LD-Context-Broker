@@ -15,6 +15,7 @@ feature = "views"
 [dependencies]
 antares-ops = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["query"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [dev-dependencies]

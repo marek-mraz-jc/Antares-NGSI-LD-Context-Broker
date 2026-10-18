@@ -18,4 +18,5 @@ mod views_read;
 mod views_routing;
 mod views_subscriptions;
 mod views_tenant;
+mod views_union;
 mod views_writes;

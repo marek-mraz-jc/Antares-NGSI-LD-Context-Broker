@@ -152,6 +152,9 @@ const SURFACE_KEYS: &[&[&str]] = &[
     // the view table's reload interval and LinkML schema bound
     #[cfg(feature = "views")]
     antares_ops::views::ENV_KEYS,
+    // the most views one read across views names (T-4494)
+    #[cfg(feature = "views")]
+    antares_views::ENV_KEYS,
     // hosts, origins, result budget, the confirmation key, tool endpoints
     #[cfg(feature = "mcp")]
     antares_mcp::ENV_KEYS,
