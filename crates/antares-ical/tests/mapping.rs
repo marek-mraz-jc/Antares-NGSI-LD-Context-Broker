@@ -1,0 +1,240 @@
+// SPDX-License-Identifier: EUPL-1.2
+//! `antares_ical::mapping`: one Entity as one `VEVENT` (docs/analysis/ical-mapping.md).
+
+#![allow(clippy::expect_used, clippy::panic)]
+
+use antares_ical::mapping::{escape, fold, vevent, Outcome, When, Window};
+use chrono::{DateTime, Utc};
+use serde_json::{json, Map, Value};
+
+fn now() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2026-10-18T00:00:00Z")
+        .expect("time")
+        .with_timezone(&Utc)
+}
+
+fn prop(v: Value) -> Value {
+    Value::Object(Map::from_iter([
+        ("type".to_owned(), json!("Property")),
+        ("value".to_owned(), v),
+    ]))
+}
+
+/// An Event starting `2026-10-20` named `Koncert`, with `extra` members set or replaced.
+fn event(extra: &[(&str, Value)]) -> Value {
+    let mut e = Map::new();
+    e.insert("id".into(), json!("urn:ngsi-ld:Event:1"));
+    e.insert("type".into(), json!("Event"));
+    e.insert("name".into(), prop(json!("Koncert")));
+    e.insert("startDate".into(), prop(json!("2026-10-20")));
+    for (k, v) in extra {
+        e.insert((*k).to_owned(), v.clone());
+    }
+    Value::Object(e)
+}
+
+/// The unfolded lines of an `Outcome::Event`, or the outcome's name.
+fn lines(outcome: &Outcome) -> Vec<String> {
+    match outcome {
+        Outcome::Event(text) => text
+            .replace("\r\n ", "")
+            .split("\r\n")
+            .map(str::to_owned)
+            .collect(),
+        other => vec![format!("{other:?}")],
+    }
+}
+
+fn feed(extra: &[(&str, Value)]) -> Vec<String> {
+    lines(&vevent(&event(extra), &Window::default(), now()))
+}
+
+fn has(l: &[String], line: &str) -> bool {
+    l.iter().any(|x| x == line)
+}
+
+#[test]
+fn a_line_of_multibyte_letters_folds_at_75_octets_between_characters() {
+    let mut out = String::new();
+    fold(&format!("SUMMARY:{}", "ž".repeat(60)), &mut out);
+    for line in out.trim_end_matches("\r\n").split("\r\n") {
+        assert!(line.len() <= 75, "{} octets: {line}", line.len());
+    }
+    assert_eq!(
+        out.replace("\r\n ", ""),
+        format!("SUMMARY:{}\r\n", "ž".repeat(60))
+    );
+}
+
+#[test]
+fn text_escapes_what_rfc_5545_reserves_keeps_a_tab_and_drops_control_characters() {
+    assert_eq!(escape("a,b;c\\d\ne\u{7}\tf"), "a\\,b\\;c\\\\d\\ne\tf");
+}
+
+#[test]
+fn a_multi_day_event_ends_the_day_after_its_last_day() {
+    let l = feed(&[("endDate", prop(json!("2026-10-22")))]);
+    assert!(has(&l, "DTSTART;VALUE=DATE:20261020"), "{l:?}");
+    assert!(has(&l, "DTEND;VALUE=DATE:20261023"), "{l:?}");
+}
+
+#[test]
+fn a_date_start_with_a_time_end_ends_the_day_after_that_time() {
+    let l = feed(&[("endDate", prop(json!("2026-10-21T10:00:00Z")))]);
+    assert!(has(&l, "DTEND;VALUE=DATE:20261022"), "{l:?}");
+}
+
+#[test]
+fn an_offset_is_written_in_utc_and_an_end_before_the_start_is_dropped() {
+    let l = feed(&[
+        (
+            "startDate",
+            prop(json!({"@type": "DateTime", "@value": "2026-10-20T18:00:00+02:00"})),
+        ),
+        ("endDate", prop(json!("2026-10-20T17:00:00+02:00"))),
+    ]);
+    assert!(has(&l, "DTSTART:20261020T160000Z"), "{l:?}");
+    assert!(!l.iter().any(|x| x.starts_with("DTEND")), "{l:?}");
+}
+
+#[test]
+fn a_utc_start_with_a_date_or_floating_end_ends_in_utc() {
+    let start = ("startDate", prop(json!("2026-10-20T18:00:00Z")));
+    let l = feed(&[start.clone(), ("endDate", prop(json!("2026-10-21")))]);
+    assert!(has(&l, "DTEND:20261022T000000Z"), "{l:?}");
+    let l = feed(&[start, ("endDate", prop(json!("2026-10-20T20:00:00")))]);
+    assert!(has(&l, "DTEND:20261020T200000Z"), "{l:?}");
+}
+
+#[test]
+fn a_floating_start_stays_floating_and_its_end_takes_its_type() {
+    let start = ("startDate", prop(json!("2026-10-20T18:00:00")));
+    let l = feed(&[
+        start.clone(),
+        ("endDate", prop(json!("2026-10-20T20:00:00Z"))),
+    ]);
+    assert!(has(&l, "DTSTART:20261020T180000"), "{l:?}");
+    assert!(has(&l, "DTEND:20261020T200000"), "{l:?}");
+    let l = feed(&[start, ("endDate", prop(json!("2026-10-20")))]);
+    assert!(has(&l, "DTEND:20261021T000000"), "{l:?}");
+}
+
+#[test]
+fn without_start_or_name_there_is_no_event() {
+    let mut e = event(&[]);
+    e.as_object_mut().expect("object").remove("name");
+    assert_eq!(
+        vevent(&e, &Window::default(), now()),
+        Outcome::Skipped("name")
+    );
+    assert_eq!(
+        feed(&[("startDate", prop(json!("soon")))]),
+        ["Skipped(\"startDate\")"]
+    );
+    assert_eq!(feed(&[("name", prop(json!("  ")))]), ["Skipped(\"name\")"]);
+}
+
+#[test]
+fn the_window_keeps_what_overlaps_it_and_its_last_day_inclusive() {
+    let w = Window {
+        from: When::parse("2026-10-21").map(When::key),
+        to: When::parse("2026-10-21").map(When::past),
+    };
+    let multi = event(&[("endDate", prop(json!("2026-10-22")))]);
+    assert!(matches!(vevent(&multi, &w, now()), Outcome::Event(_)));
+    // one day, the 20th: over before the 21st
+    assert_eq!(vevent(&event(&[]), &w, now()), Outcome::Outside);
+    let late = event(&[("startDate", prop(json!("2026-10-21T23:30:00Z")))]);
+    assert!(matches!(vevent(&late, &w, now()), Outcome::Event(_)));
+    let later = event(&[("startDate", prop(json!("2026-10-22T00:00:00Z")))]);
+    assert_eq!(vevent(&later, &w, now()), Outcome::Outside);
+}
+
+#[test]
+fn location_geo_and_url_come_from_the_entity_and_a_bad_url_is_left_out() {
+    let l = feed(&[
+        (
+            "address",
+            prop(json!({"streetAddress": "Námestie SNP 1", "addressLocality": "Banská Bystrica"})),
+        ),
+        (
+            "location",
+            json!({"type": "GeoProperty", "value": {"type": "Point", "coordinates": [19.146, 48.736]}}),
+        ),
+        ("url", prop(json!("javascript:alert(1)"))),
+    ]);
+    assert!(
+        has(&l, "LOCATION:Námestie SNP 1\\, Banská Bystrica"),
+        "{l:?}"
+    );
+    assert!(has(&l, "GEO:48.736;19.146"), "{l:?}");
+    assert!(!l.iter().any(|x| x.starts_with("URL")), "{l:?}");
+    let l = feed(&[("url", prop(json!("http://bb.sk/e/1")))]);
+    assert!(has(&l, "URL:http://bb.sk/e/1"), "{l:?}");
+    let l = feed(&[("url", prop(json!("https://bb.sk/a b")))]);
+    assert!(!l.iter().any(|x| x.starts_with("URL")), "{l:?}");
+}
+
+#[test]
+fn an_address_as_text_is_the_location_and_an_empty_one_none() {
+    let l = feed(&[("address", prop(json!("Kapitulská 23")))]);
+    assert!(has(&l, "LOCATION:Kapitulská 23"), "{l:?}");
+    let l = feed(&[("address", prop(json!({"streetAddress": " "})))]);
+    assert!(!l.iter().any(|x| x.starts_with("LOCATION")), "{l:?}");
+    let l = feed(&[("address", prop(json!(" ")))]);
+    assert!(!l.iter().any(|x| x.starts_with("LOCATION")), "{l:?}");
+}
+
+#[test]
+fn a_geometry_other_than_a_point_or_off_the_globe_has_no_geo() {
+    let line = json!({"type": "GeoProperty", "value": {"type": "LineString", "coordinates": [[19.1, 48.7], [19.2, 48.8]]}});
+    let off =
+        json!({"type": "GeoProperty", "value": {"type": "Point", "coordinates": [19.1, 98.7]}});
+    for location in [line, off] {
+        let l = feed(&[("location", location)]);
+        assert!(!l.iter().any(|x| x.starts_with("GEO")), "{l:?}");
+    }
+}
+
+#[test]
+fn the_default_instance_and_the_first_language_are_read() {
+    let l = feed(&[
+        (
+            "name",
+            json!([
+                {"type": "Property", "value": "iné", "datasetId": "urn:ngsi-ld:Dataset:x"},
+                {"type": "Property", "value": "Hlavný názov"}
+            ]),
+        ),
+        (
+            "description",
+            json!({"type": "LanguageProperty", "languageMap": {"en": "Concert", "sk": "Koncert"}}),
+        ),
+    ]);
+    assert!(has(&l, "SUMMARY:Hlavný názov"), "{l:?}");
+    assert!(has(&l, "DESCRIPTION:Concert"), "{l:?}");
+    let only = feed(&[(
+        "name",
+        json!([{"type": "Property", "value": "jediný", "datasetId": "urn:ngsi-ld:Dataset:x"}]),
+    )]);
+    assert!(has(&only, "SUMMARY:jediný"), "{only:?}");
+    assert_eq!(feed(&[("name", json!([]))]), ["Skipped(\"name\")"]);
+}
+
+#[test]
+fn an_sdm_iri_names_the_same_attribute_and_modified_at_stamps_the_event() {
+    let l = feed(&[
+        (
+            "https://smartdatamodels.org/dataModel.Event/url",
+            prop(json!("https://bb.sk/e/1")),
+        ),
+        ("modifiedAt", json!("2026-10-01T08:00:00Z")),
+    ]);
+    assert!(has(&l, "URL:https://bb.sk/e/1"), "{l:?}");
+    assert!(has(&l, "DTSTAMP:20261001T080000Z"), "{l:?}");
+    assert!(has(&l, "LAST-MODIFIED:20261001T080000Z"), "{l:?}");
+    // without modifiedAt the request time stamps it and nothing is last-modified
+    let l = feed(&[]);
+    assert!(has(&l, "DTSTAMP:20261018T000000Z"), "{l:?}");
+    assert!(!l.iter().any(|x| x.starts_with("LAST-MODIFIED")), "{l:?}");
+}

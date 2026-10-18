@@ -2,7 +2,7 @@ name: image-jc
 
 # The joinedcontext platform's broker image (T-3636): the `full` surfaces,
 # the LinkML schema surface the gateway's schema routes forward to (T-3803)
-# and the platform's policy engine (`--features full,jc-policy,linkml,parquet,tabular`), published
+# and the platform's policy engine (`--features full,jc-policy,linkml,parquet,tabular,ical`), published
 # as `antares-broker-jc` — never as `antares-broker`, which stays the
 # vanilla image full.yml releases. Before anything is pushed, the image
 # proves what it carries (its auditable dependency list holds every surface
@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  FEATURES: full,jc-policy,linkml,parquet,tabular
+  FEATURES: full,jc-policy,linkml,parquet,tabular,ical
   # what the jc image must carry, by crate name in its auditable list
   CARRIES: antares-views antares-mcp antares-odata antares-ws antares-linkml joinedcontext-policy
 

@@ -516,6 +516,8 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("ogc", || antares_ops::mount(antares_ogc::Ogc)),
     #[cfg(feature = "sta")]
     ("sta", || antares_ops::mount(antares_sta::Sta)),
+    #[cfg(feature = "ical")]
+    ("ical", || antares_ops::mount(antares_ical::Ical)),
     #[cfg(feature = "ws")]
     ("ws", || antares_ops::mount(antares_ws::Ws::process())),
     #[cfg(all(feature = "ws", feature = "views"))]
