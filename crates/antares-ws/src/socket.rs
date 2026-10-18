@@ -5,6 +5,7 @@
 
 use crate::envelope::{self, ClientOp, Unread};
 use crate::hub::{Conn, Hub, Next, Runner};
+use crate::limits::Limits;
 use antares_ops::{Caller, OperationId, OpsRequest};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -128,10 +129,53 @@ async fn retrieve(conn: &Conn, id: &str) -> Option<Value> {
     run(conn, OperationId::RetrieveSubscription, req).await.1
 }
 
+/// The NGSI-LD Null a fragment removes a member with (4.5.0).
+const NULL: &str = "urn:ngsi-ld:null";
+
+/// The `expiresAt` a socket Subscription is given (rule 7a): the lease
+/// from now, or the client's own `wish` when it is earlier. A wish that is
+/// no `DateTime` is passed on as it is, for the operation to refuse.
+fn leased(wish: Option<&str>, lease: std::time::Duration) -> String {
+    let until = chrono::Duration::from_std(lease)
+        .ok()
+        .and_then(|d| chrono::Utc::now().checked_add_signed(d))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
+    match wish {
+        Some(w) => match chrono::DateTime::parse_from_rfc3339(w) {
+            Ok(at) if at < until => w.to_owned(),
+            Ok(_) => until.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            Err(_) => w.to_owned(),
+        },
+        None => until.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    }
+}
+
+/// Renew the lease of every Subscription `conn` made (rule 7a); one deleted
+/// meanwhile (over HTTP, or by the sweep) is forgotten.
+async fn renew(conn: &Conn, lease: std::time::Duration) {
+    for sub in conn.subscriptions() {
+        let mut fragment = Map::new();
+        let until = leased(conn.wish(&sub).as_deref(), lease);
+        fragment.insert("expiresAt".into(), Value::String(until));
+        let path = format!("/ngsi-ld/v1/subscriptions/{}", segment(&sub));
+        let req = json_request(Method::PATCH, path, &fragment);
+        let (status, answer) = run(conn, OperationId::UpdateSubscription, req).await;
+        tracing::debug!(connection = %conn.id, subscription = %sub, status, ?answer, "websocket subscription lease renewed");
+        if status == StatusCode::NOT_FOUND.as_u16() {
+            conn.forget(&sub);
+        }
+    }
+}
+
 /// `x-subscribe`: Create Subscription (10.5.2) with this connection as the
 /// endpoint; a body naming another endpoint is refused (W6), past
 /// `max_subscriptions` too (W9).
-async fn subscribe(conn: &Conn, max: usize, mut body: Map<String, Value>) -> (u16, Option<Value>) {
+async fn subscribe(
+    conn: &Conn,
+    limits: &Limits,
+    mut body: Map<String, Value>,
+) -> (u16, Option<Value>) {
+    let max = limits.max_subscriptions;
     if conn.subscription_count() >= max {
         return bad(&format!("a connection makes at most {max} Subscriptions"));
     }
@@ -177,6 +221,13 @@ async fn subscribe(conn: &Conn, max: usize, mut body: Map<String, Value>) -> (u1
             })),
         );
     }
+    let wish = match body.get("expiresAt") {
+        None => None,
+        Some(Value::String(w)) => Some(w.clone()),
+        Some(_) => return bad("expiresAt is a DateTime"),
+    };
+    let until = leased(wish.as_deref(), limits.subscription_lease);
+    body.insert("expiresAt".into(), Value::String(until));
     conn.record(&id, show_changes(&body).unwrap_or(false));
     let req = json_request(Method::POST, "/ngsi-ld/v1/subscriptions".into(), &body);
     let (status, answer) = run(conn, OperationId::CreateSubscription, req).await;
@@ -184,13 +235,32 @@ async fn subscribe(conn: &Conn, max: usize, mut body: Map<String, Value>) -> (u1
         conn.forget(&id);
         return (status, answer);
     }
+    conn.want(&id, wish);
     (status, retrieve(conn, &id).await)
 }
 
 /// `x-update`: Update Subscription (10.5.3) of one this connection made.
-async fn update(conn: &Conn, id: &str, fragment: Map<String, Value>) -> (u16, Option<Value>) {
+async fn update(
+    conn: &Conn,
+    limits: &Limits,
+    id: &str,
+    mut fragment: Map<String, Value>,
+) -> (u16, Option<Value>) {
     if !conn.owns(id) {
         return not_found();
+    }
+    // a new expiresAt is a new wish under the same lease; removing it
+    // leaves only the lease
+    let wish = match fragment.get("expiresAt") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(w)) if w == NULL => Some(None),
+        Some(Value::String(w)) => Some(Some(w.clone())),
+        Some(_) => return bad("expiresAt is a DateTime"),
+    };
+    if let Some(w) = &wish {
+        let until = leased(w.as_deref(), limits.subscription_lease);
+        fragment.insert("expiresAt".into(), Value::String(until));
     }
     match named_endpoint(&fragment) {
         None => {}
@@ -211,6 +281,9 @@ async fn update(conn: &Conn, id: &str, fragment: Map<String, Value>) -> (u16, Op
     }
     if let Some(show) = show_changes(&fragment) {
         conn.record(id, show);
+    }
+    if let Some(w) = wish {
+        conn.want(id, w);
     }
     (status, retrieve(conn, id).await)
 }
@@ -239,6 +312,8 @@ struct Session {
     socket: WebSocket,
     heard: Instant,
     ponged: Instant,
+    /// When this socket last renewed the connection's leases.
+    renewed: Instant,
     first: bool,
 }
 
@@ -313,13 +388,11 @@ impl Session {
         };
         let id = message.id;
         let (status, body) = match message.op {
-            ClientOp::Subscribe(body) => {
-                subscribe(&self.conn, self.hub.limits.max_subscriptions, body).await
-            }
+            ClientOp::Subscribe(body) => subscribe(&self.conn, &self.hub.limits, body).await,
             ClientOp::Update {
                 subscription,
                 fragment,
-            } => update(&self.conn, &subscription, fragment).await,
+            } => update(&self.conn, &self.hub.limits, &subscription, fragment).await,
             ClientOp::Unsubscribe { subscription } => unsubscribe(&self.conn, &subscription).await,
             ClientOp::Resume {
                 connection,
@@ -360,6 +433,9 @@ impl Session {
         if !self.send_all(replay).await {
             return Some(End::Gone);
         }
+        // the leases did not move while no socket held the connection
+        renew(&self.conn, self.hub.limits.subscription_lease).await;
+        self.renewed = Instant::now();
         // what was queued while the socket was away follows
         self.conn.wake.notify_one();
         None
@@ -396,6 +472,12 @@ impl Session {
         }
         if self.conn.subscription_count() == 0 && now.duration_since(self.heard) > limits.idle {
             return Some(self.closing(code::NORMAL, "idle").await);
+        }
+        if now.duration_since(self.renewed)
+            >= limits.subscription_lease.checked_div(3).unwrap_or_default()
+        {
+            self.renewed = now;
+            renew(&self.conn, limits.subscription_lease).await;
         }
         let ping = self.write(Message::Ping(Vec::new().into())).await;
         (!ping).then_some(End::Gone)
@@ -448,6 +530,7 @@ pub(crate) async fn serve(hub: Arc<Hub>, conn: Arc<Conn>, socket: WebSocket) {
         socket,
         heard: now,
         ponged: now,
+        renewed: now,
         first: true,
     };
     let end = session.run().await;
@@ -507,6 +590,25 @@ mod tests {
             "urn:ngsi-ld:Subscription:1"
         );
         assert_eq!(segment("urn:x:a/b?c#d e"), "urn:x:a%2Fb%3Fc%23d%20e");
+    }
+
+    #[test]
+    fn a_lease_keeps_an_earlier_wish_and_passes_a_wrong_one_on() {
+        let lease = std::time::Duration::from_secs(60);
+        let now = chrono::Utc::now();
+        let until = |s: &str| chrono::DateTime::parse_from_rfc3339(s).map(|t| t.to_utc());
+        let free = until(&leased(None, lease)).unwrap_or(now);
+        assert!(free > now);
+        assert!(free <= chrono::Utc::now() + chrono::Duration::seconds(60));
+        let held = until(&leased(Some("2999-01-01T00:00:00Z"), lease)).unwrap_or(now);
+        assert!(held < chrono::Utc::now() + chrono::Duration::seconds(61));
+        assert_eq!(
+            leased(Some("2020-01-01T00:00:00Z"), lease),
+            "2020-01-01T00:00:00Z"
+        );
+        assert_eq!(leased(Some("tomorrow"), lease), "tomorrow");
+        // a lease past every DateTime is the last one
+        assert!(leased(None, std::time::Duration::MAX).starts_with("+262142-12-31"));
     }
 
     #[test]

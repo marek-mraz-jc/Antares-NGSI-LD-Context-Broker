@@ -66,6 +66,12 @@ no longer holds), then what was queued meanwhile. Another subject, another
 tenant or view, a wrong token or a resume that is not the first message
 is `404`. After the grace the connection's Subscriptions are deleted.
 
+Each Subscription made over a socket is leased: its `expiresAt` is at most
+`ANTARES_WS_SUBSCRIPTION_LEASE_SECS` ahead (an earlier one you ask for is
+kept), and the broker renews it while the socket is attached. A broker that
+dies without its grace leaves Subscriptions that expire within the lease and
+are deleted by the expiry sweep.
+
 A socket ends at `ANTARES_WS_MAX_LIFETIME_SECS` with `x-closing`
 `lifetime`; the client resumes on a new one, so a revoked credential stops
 at the next reconnect. A connection without Subscriptions that sends
