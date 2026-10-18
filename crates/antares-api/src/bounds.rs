@@ -164,6 +164,21 @@ pub const CHANGE_QUEUE: usize = 1024;
 /// drops the group for that subscription alone and counts it
 /// (`antares_notification_lane_dropped_total`).
 pub const DELIVERY_LANE: usize = 64;
+/// What every delivery lane together may hold, in estimated heap bytes of
+/// the entities waiting in them. [`DELIVERY_LANE`] counts groups, and a
+/// group is up to a drain's worth of entities copied for that subscription
+/// alone, so twenty subscriptions behind slow receivers under a batch upsert
+/// flood held 64 groups of 100 3 KB entities each and took the process past
+/// its 1536 MiB limit in seconds (T-4549). Past this the group is dropped
+/// for that subscription and counted, as a full lane drops it. Deployment
+/// knob (ANTARES_DELIVERY_LANE_BYTES), read once at first use.
+pub static DELIVERY_LANE_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    count_from(
+        std::env::var("ANTARES_DELIVERY_LANE_BYTES").ok().as_deref(),
+        256 * 1024 * 1024,
+        usize::MAX,
+    )
+});
 /// Notifications in flight at once per drain: one serial POST at a time
 /// capped a 9-subscription fan-out at ~600 POST/s and overflowed the ring.
 /// Deployment knob (ANTARES_DELIVERY_WIDTH): what a width is worth is a
@@ -250,6 +265,7 @@ impl LimitStats {
             "maxRegexProgramBytes": MAX_REGEX_PROGRAM_BYTES,
             "changeQueue": CHANGE_QUEUE,
             "deliveryLane": DELIVERY_LANE,
+            "deliveryLaneBytes": *DELIVERY_LANE_BYTES,
             "deliveryWidth": *DELIVERY_WIDTH,
             "deliveryWidthPerTenant": *DELIVERY_WIDTH_PER_TENANT,
             "maxTrackedDestinations": MAX_TRACKED_DESTINATIONS,
@@ -485,6 +501,7 @@ mod tests {
             [
                 "changeQueue",
                 "deliveryLane",
+                "deliveryLaneBytes",
                 "deliveryWidth",
                 "deliveryWidthPerTenant",
                 "maxAnswerBytes",
