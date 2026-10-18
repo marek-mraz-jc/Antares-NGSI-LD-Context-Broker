@@ -132,9 +132,8 @@ mod tests {
       }
     }"#;
 
-    fn event_queryables(shown: &[&str]) -> Value {
-        let model =
-            Model::read(EVENTS.as_bytes(), &LIMITS).unwrap_or_else(|e| unreachable!("{e:?}"));
+    fn queryables_of(schema: &str, shown: &[&str]) -> Result<Value, String> {
+        let model = Model::read(schema.as_bytes(), &LIMITS).map_err(|e| format!("{e:?}"))?;
         let attrs: BTreeSet<String> = shown
             .iter()
             .map(|a| match *a {
@@ -144,10 +143,12 @@ mod tests {
             .collect();
         let view = BTreeMap::from([("https://example.org/sdm/Event".to_owned(), attrs)]);
         let collections = build(&model, &view);
-        let event = collections
-            .get("Event")
-            .unwrap_or_else(|| unreachable!("Event is shown"));
-        queryables(event, "q")
+        let event = collections.get("Event").ok_or("Event is shown")?;
+        Ok(queryables(event, "q"))
+    }
+
+    fn event_queryables(shown: &[&str]) -> Result<Value, String> {
+        queryables_of(EVENTS, shown)
     }
 
     fn role<'v>(doc: &'v Value, name: &str) -> Option<&'v str> {
@@ -156,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn an_event_marks_its_interval_and_place_and_puts_its_filters_first() {
+    fn an_event_marks_its_interval_and_place_and_puts_its_filters_first() -> Result<(), String> {
         let doc = event_queryables(&[
             "description",
             "name",
@@ -165,7 +166,7 @@ mod tests {
             "category",
             "location",
             "organizer",
-        ]);
+        ])?;
         assert_eq!(role(&doc, "startDate"), Some("primary-interval-start"));
         assert_eq!(role(&doc, "endDate"), Some("primary-interval-end"));
         assert_eq!(role(&doc, "geometry"), Some("primary-geometry"));
@@ -184,15 +185,41 @@ mod tests {
         assert_eq!(seq("name"), Some(4), "{order:?}");
         assert_eq!(seq("organizer"), Some(5), "{order:?}");
         assert!(seq("description") > seq("organizer"), "{order:?}");
+        Ok(())
     }
 
     #[test]
-    fn a_hidden_end_leaves_the_start_an_instant_and_names_nothing_hidden() {
-        let doc = event_queryables(&["name", "startDate"]);
+    fn a_hidden_end_leaves_the_start_an_instant_and_names_nothing_hidden() -> Result<(), String> {
+        let doc = event_queryables(&["name", "startDate"])?;
         assert_eq!(role(&doc, "startDate"), Some("primary-instant"));
         let text = doc.to_string();
         for hidden in ["endDate", "geometry", "category", "organizer"] {
             assert!(!text.contains(hidden), "{hidden}: {text}");
         }
+        let bare = event_queryables(&["name"])?.to_string();
+        assert!(!bare.contains("primary-"), "no axis shown, no role: {bare}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_schemas_own_roles_win_over_the_guide() -> Result<(), String> {
+        // startDate annotated an instant and `where` the geometry: the guide adds neither
+        let annotated = EVENTS
+            .replace(
+                r#""startDate": {"range": "datetime"}"#,
+                r#""startDate": {"range": "datetime", "annotations": {"ogc_role": {"tag": "ogc_role", "value": "primary-instant"}}}"#,
+            )
+            .replace(
+                r#""organizer": {"range": "string"}"#,
+                r#""organizer": {"range": "string", "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}, "ogc_role": {"tag": "ogc_role", "value": "primary-geometry"}}}"#,
+            );
+        let doc = queryables_of(
+            &annotated,
+            &["startDate", "endDate", "location", "organizer"],
+        )?;
+        assert_eq!(role(&doc, "startDate"), Some("primary-instant"));
+        assert_eq!(role(&doc, "endDate"), None);
+        assert_eq!(role(&doc, "location"), None);
+        Ok(())
     }
 }

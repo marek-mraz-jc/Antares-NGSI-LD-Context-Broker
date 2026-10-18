@@ -3,8 +3,10 @@
 //! time axis is the `startDate..endDate` range and how to ask for this week, and names no
 //! attribute the view hides; `describe_type` answers one type's guide as text, then JSON (T-4537).
 
-use crate::common::{call, fixture, put_view, rpc, READS};
+use crate::common::{call, fixture, fixture_with, put_view, rpc, READS};
+use crate::engines::NoTypeInfo;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 fn description<'a>(tools: &'a Value, name: &str) -> &'a str {
     tools
@@ -88,5 +90,15 @@ async fn describe_type_answers_the_guide_text_first_and_nothing_for_a_hidden_typ
         hidden.text
     );
     assert!(!hidden.text.contains("location"), "{}", hidden.text);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn describe_type_a_gate_denies_answers_the_refusal_and_no_guide() -> Result<(), String> {
+    let f = fixture_with(Some(Arc::new(NoTypeInfo))).await?;
+    let a = call(&f.app, "cars", "describe_type", json!({"type": "Car"})).await;
+    assert!(a.is_error(), "{}", a.text);
+    assert!(a.text.contains("403"), "{}", a.text);
+    assert!(a.structured().get("guide").is_none(), "{}", a.text);
     Ok(())
 }

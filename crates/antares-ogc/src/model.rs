@@ -145,9 +145,9 @@ fn guided(guide: &antares_ops::guide::Guide, slots: &mut [Prop]) {
             .any(|p| p.role.as_deref().is_some_and(|r| roles.contains(&r)))
     };
     let give = |slots: &mut [Prop], name: &str, role: &str| {
-        if let Some(p) = slots
+        for p in slots
             .iter_mut()
-            .find(|p| p.name == name && p.role.is_none())
+            .filter(|p| p.name == name && p.role.is_none())
         {
             p.role = Some(role.to_owned());
         }
@@ -172,7 +172,7 @@ fn guided(guide: &antares_ops::guide::Guide, slots: &mut [Prop]) {
         let place = guide.place.iter().find(|a| {
             slots
                 .iter()
-                .any(|p| p.name == **a && p.kind == "GeoProperty" && p.role.is_none())
+                .any(|p| p.name == **a && p.kind == "GeoProperty")
         });
         if let Some(place) = place {
             give(slots, place, "primary-geometry");

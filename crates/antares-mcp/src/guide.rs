@@ -237,13 +237,17 @@ mod tests {
                                "place": ["location"], "filters": ["name"]})
         );
         assert_eq!(describe(&view, "Vehicle", saturday()), None);
+        let (_, vehicle) = describe(&names(&["Vehicle"], &["location"]), "Vehicle", saturday())
+            .ok_or("a vehicle guide")?;
+        assert_eq!(
+            vehicle.get("time"),
+            Some(&serde_json::json!({"instant": "location.observedAt"}))
+        );
         assert_eq!(describe(&view, "Thing", saturday()), None);
         let bare = describe(&names(&["Event"], &["name"]), "Event", saturday());
         let shown = format!("{bare:?}");
-        assert!(
-            !shown.contains("startDate") && !shown.contains("location"),
-            "{shown}"
-        );
+        assert!(!shown.contains("startDate"), "{shown}");
+        assert!(!shown.contains("location"), "{shown}");
         Ok(())
     }
 }

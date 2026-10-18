@@ -312,12 +312,14 @@ impl Server {
             answer.content.insert(0, ContentBlock::text(none));
             return answer;
         };
-        let structured = answer.structured_content.take();
-        let mut out = json!({ "guide": guide });
-        if let (Some(Value::Object(body)), Some(map)) = (structured, out.as_object_mut()) {
-            map.extend(body);
-        }
-        let mut result = CallToolResult::structured(out);
+        // get_type answers an object (`{"entityType": …}`), the absent type `{}`
+        let mut out: serde_json::Map<String, Value> = answer
+            .structured_content
+            .take()
+            .and_then(|body| serde_json::from_value(body).ok())
+            .unwrap_or_default();
+        out.insert("guide".into(), guide);
+        let mut result = CallToolResult::structured(Value::Object(out));
         result.content.insert(0, ContentBlock::text(text));
         result
     }
