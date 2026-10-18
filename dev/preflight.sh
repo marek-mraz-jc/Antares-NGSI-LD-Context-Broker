@@ -269,20 +269,9 @@ PY' _ "$c"
   done
 }
 
-# workspace.yml "Binary size per surface feature" (ADR-0027 section 6
-# budget, train 10): release builds of vanilla and each surface feature, when
-# a manifest, the broker or a crate of role surface, ops or protocol changed.
-# The longest lane, so it starts first.
-if grep -qE '(^|/)Cargo\.(toml|lock)$|^crates/antares-broker/' <<< "$changed" ||
-  python3 - "${crates[@]}" <<'PY'
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("gate", "dev/coverage-gate.py")
-g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
-sys.exit(0 if any(c["name"] in sys.argv[1:] for c in g.new_crates()) else 1)
-PY
-then
-  lane step 13 binary-size python3 dev/surface-features.py sizes
-fi
+# The binary size per surface feature (ADR-0027 section 6) is fast's own job (workspace.yml
+# "Binary size per surface feature"); preflight ran the same release builds again and took ~16
+# of its 18 minutes on a train (T-4134), so it is left to fast.
 lane debug_lane
 if ((cover)); then
   roles=$(python3 - "${crates[@]}" <<'PY'
