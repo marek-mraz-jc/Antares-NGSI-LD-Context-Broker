@@ -34,6 +34,73 @@ tokio::task_local! {
     static BUFFER: std::cell::RefCell<Vec<TemporalEvent>>;
     static CHANGES: std::cell::RefCell<Vec<crate::mirror::Change>>;
     static PROVENANCE: Value;
+    static TENANT: Option<TenantId>;
+}
+
+/// `ANTARES_HISTORY_BACKFILL=on` (T-4665, ADR-N-054 2.1): a Core API write of
+/// an instance older than the one the Entity holds goes to history only.
+/// Off (the default) keeps NGSI-LD's replace, which the ETSI suites assume.
+fn backfill_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ANTARES_HISTORY_BACKFILL").as_deref() == Ok("on"))
+}
+
+/// Whether `incoming`, about to replace `current` of `attr` on the Entity
+/// `doc` (expanded, as stored), is a backfill: both observed and `incoming`
+/// the older. A backfill is recorded into the request's history here, and
+/// the caller keeps `current`. Outside a request, or with backfill off,
+/// nothing is one.
+pub(crate) fn backfilled(doc: &Value, attr: &str, current: &Value, incoming: &Value) -> bool {
+    if !backfill_on() {
+        return false;
+    }
+    let at = |i: &Value| {
+        i.get("observedAt").and_then(Value::as_str).and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&antares_store::filter::canonical_datetime(s)).ok()
+        })
+    };
+    let (Some(was), Some(now)) = (at(current), at(incoming)) else {
+        return false;
+    };
+    let Some(id) = doc.get("id").and_then(Value::as_str) else {
+        return false;
+    };
+    if now >= was {
+        return false;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let Ok(Some(tenant)) = TENANT.try_with(Clone::clone) else {
+            return false;
+        };
+        let mut instance = incoming.clone();
+        if let Some(o) = instance.as_object_mut() {
+            let iid = crate::notify::instance_id(id, attr, o);
+            o.entry("instanceId".to_owned())
+                .or_insert(Value::String(iid));
+            o.insert(
+                antares_store::PROVENANCE_KEY.to_owned(),
+                provenance("backfill"),
+            );
+        }
+        let mut shell = Map::new();
+        for k in ["id", "type", "createdAt", "modifiedAt", "scope"] {
+            if let Some(v) = doc.get(k) {
+                shell.insert(k.to_owned(), v.clone());
+            }
+        }
+        let event = TemporalEvent {
+            op: antares_store::TemporalOp::AttrModified,
+            tenant,
+            entity_id: id.to_owned(),
+            shell: Value::Object(shell),
+            attr: attr.to_owned(),
+            instance,
+        };
+        return BUFFER.try_with(|b| b.borrow_mut().push(event)).is_ok();
+    }
+    #[cfg(target_arch = "wasm32")]
+    false
 }
 
 /// The provenance of the request in flight with its `operation`
@@ -419,15 +486,19 @@ pub(crate) async fn layer(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let provenance = crate::provenance::of_request(req.headers(), st.provenance_from.as_deref());
+    let tenant = crate::negotiate::tenant_from(req.headers()).ok();
     let (resp, evs, changes) = BUFFER
         .scope(std::cell::RefCell::new(Vec::new()), async {
             CHANGES
                 .scope(std::cell::RefCell::new(Vec::new()), async {
                     PROVENANCE
-                        .scope(provenance, async {
-                            let resp = next.run(req).await;
-                            (resp, BUFFER.with(|b| b.take()), CHANGES.with(|c| c.take()))
-                        })
+                        .scope(
+                            provenance,
+                            TENANT.scope(tenant, async {
+                                let resp = next.run(req).await;
+                                (resp, BUFFER.with(|b| b.take()), CHANGES.with(|c| c.take()))
+                            }),
+                        )
                         .await
                 })
                 .await

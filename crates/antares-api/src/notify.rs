@@ -531,7 +531,11 @@ pub async fn record_temporal_change(
 /// gave each spelling its own instance and left the correction's target in
 /// place beside it — the failure 4.5.7 calls severe "in the case of
 /// modification or deletion requests for legal reasons".
-fn instance_id(entity: &str, attr: &str, inst: &serde_json::Map<String, Value>) -> String {
+pub(crate) fn instance_id(
+    entity: &str,
+    attr: &str,
+    inst: &serde_json::Map<String, Value>,
+) -> String {
     let u = match inst.get("observedAt").and_then(Value::as_str) {
         Some(at) => {
             let ds = inst
