@@ -16,8 +16,6 @@ pub mod csv;
 pub mod parquet;
 #[cfg(feature = "parquet")]
 mod wkb;
-#[cfg(feature = "xlsx")]
-pub mod xlsx;
 
 /// The column holding each Feature's id.
 pub const ID: &str = "id";
@@ -26,7 +24,7 @@ pub const GEOMETRY: &str = "geometry";
 
 /// What one member of a ZIP container costs beside its bytes: its local header, its entry in
 /// the central directory and a data descriptor, with room for a path of up to 60 bytes.
-#[cfg(any(feature = "xlsx", feature = "zip"))]
+#[cfg(feature = "zip")]
 pub(crate) const PART_OVERHEAD: usize = 256;
 
 /// Why no file was written.
@@ -49,14 +47,14 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-#[cfg(any(feature = "xlsx", feature = "zip"))]
+#[cfg(feature = "zip")]
 impl From<::zip::result::ZipError> for Error {
     fn from(e: ::zip::result::ZipError) -> Self {
         Self::Write(e.to_string())
     }
 }
 
-#[cfg(any(feature = "xlsx", feature = "zip"))]
+#[cfg(feature = "zip")]
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::Write(e.to_string())
@@ -128,7 +126,7 @@ pub struct Column {
 
 /// The columns a file holds: a column named like the id, the geometry or an earlier column is
 /// left out, because the Feature's own member holds that name.
-#[cfg(any(feature = "parquet", feature = "csv", feature = "xlsx"))]
+#[cfg(any(feature = "parquet", feature = "csv"))]
 pub(crate) fn distinct(columns: Vec<Column>) -> Vec<Column> {
     let mut named = std::collections::BTreeSet::from([ID.to_owned(), GEOMETRY.to_owned()]);
     columns
@@ -138,7 +136,7 @@ pub(crate) fn distinct(columns: Vec<Column>) -> Vec<Column> {
 }
 
 /// The header of a table: `id`, `geometry` when there is one, then the columns.
-#[cfg(any(feature = "csv", feature = "xlsx"))]
+#[cfg(feature = "csv")]
 pub(crate) fn header(columns: &[Column], geometry: bool) -> Vec<Value> {
     let mut header = vec![Value::from(ID)];
     if geometry {
@@ -149,7 +147,7 @@ pub(crate) fn header(columns: &[Column], geometry: bool) -> Vec<Value> {
 }
 
 /// One Feature's cells in the header's order; a property the Feature lacks is a null.
-#[cfg(any(feature = "csv", feature = "xlsx"))]
+#[cfg(feature = "csv")]
 pub(crate) fn cells<'f>(feature: &'f Value, columns: &[Column], geometry: bool) -> Vec<&'f Value> {
     static NULL: Value = Value::Null;
     let member = |name: &str| feature.get(name).unwrap_or(&NULL);
@@ -167,7 +165,7 @@ pub(crate) fn cells<'f>(feature: &'f Value, columns: &[Column], geometry: bool) 
 }
 
 /// A cell as text: a string as it stands, a null empty, anything else as its JSON.
-#[cfg(any(feature = "parquet", feature = "csv", feature = "xlsx"))]
+#[cfg(any(feature = "parquet", feature = "csv"))]
 pub(crate) fn text(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
@@ -179,7 +177,7 @@ pub(crate) fn text(value: &Value) -> String {
 /// A text cell a spreadsheet would read as a formula (`=`, `+`, `-`, `@`, a tab or a carriage
 /// return first) gets a leading `'`, so it stays text (OWASP, CSV injection). A number is no
 /// text cell and stays as it is.
-#[cfg(any(feature = "csv", feature = "xlsx"))]
+#[cfg(feature = "csv")]
 pub(crate) fn guarded(value: &Value) -> String {
     match value {
         Value::String(s) if s.starts_with(['=', '+', '-', '@', '\t', '\r']) => format!("'{s}"),
@@ -224,7 +222,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(feature = "xlsx", feature = "zip"))]
+    #[cfg(feature = "zip")]
     #[test]
     fn an_archive_error_is_a_write_error() {
         let zip = Error::from(::zip::result::ZipError::FileNotFound);
@@ -233,7 +231,7 @@ mod tests {
         assert_eq!(io, Error::Write("disk".into()));
     }
 
-    #[cfg(any(feature = "parquet", feature = "csv", feature = "xlsx"))]
+    #[cfg(any(feature = "parquet", feature = "csv"))]
     #[test]
     fn a_cell_is_its_text() {
         assert_eq!(text(&Value::Null), "");
@@ -242,7 +240,7 @@ mod tests {
         assert_eq!(text(&json!([1, "x"])), "[1,\"x\"]");
     }
 
-    #[cfg(any(feature = "csv", feature = "xlsx"))]
+    #[cfg(feature = "csv")]
     #[test]
     fn a_formula_stays_text_and_a_negative_number_a_number() {
         for (cell, written) in [
@@ -260,7 +258,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "csv", feature = "xlsx"))]
+    #[cfg(feature = "csv")]
     #[test]
     fn a_row_follows_its_header() {
         let columns = distinct(vec![

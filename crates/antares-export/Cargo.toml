@@ -1,6 +1,6 @@
 [package]
 name = "antares-export"
-description = "File encodings of a page-by-page answer under a byte ceiling: Apache Parquet and GeoParquet 1.1 (feature `parquet`, T-4465, EP-119), CSV (`csv`), XLSX (`xlsx`) and a ZIP bundle (`zip`) (T-4477)."
+description = "File encodings of a page-by-page answer under a byte ceiling: Apache Parquet and GeoParquet 1.1 (feature `parquet`, T-4465, EP-119), CSV (`csv`) and a ZIP bundle (`zip`) (T-4477)."
 version.workspace = true
 edition.workspace = true
 publish = false
@@ -17,8 +17,6 @@ default = []
 parquet = ["dep:parquet"]
 # RFC 4180 CSV, no dependency.
 csv = []
-# Office Open XML workbooks: the XML is written here, the container by `zip`.
-xlsx = ["dep:zip"]
 # A ZIP bundle of files.
 zip = ["dep:zip"]
 

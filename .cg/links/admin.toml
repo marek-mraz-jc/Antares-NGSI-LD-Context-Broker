@@ -78,3 +78,12 @@ channel = "http"
 role = "provides"
 key = "POST /ex/v1/remote-notify"
 symbol = "antares_api::distsub::remote_notify"
+
+# The NGSI-LD API of a view (antares-views, T-3643): one catch-all route under /x/views, its
+# handler a closure around `serve`, so no regex keys it. The context-gateway's pinned view hops
+# (its .cg/links/gateway.toml) join this key across the two graphs (T-4594, dev/cg-audit.py).
+[[endpoint]]
+channel = "http"
+role = "provides"
+key = "ANY /x/views/{view}/ngsi-ld/v1/{rest}"
+symbol = "antares_views::serve"

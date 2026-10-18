@@ -104,21 +104,19 @@ to its file. `/q/health` lists `"encodings": ["parquet"]` under the
 surface, empty in a build without the feature.
 
 A `tabular` build (`--features full,tabular`, beside `full` for the same
-budget) writes `/items` as CSV and XLSX too (T-4477, EP-08, EP-41):
+budget) writes `/items` as CSV too (T-4477, EP-08, EP-41; no Excel, owner
+2026-10-18, so `f=xlsx` is `400`):
 `f=csv` or `Accept: text/csv` returns RFC 4180 CSV
 (`text/csv; charset=utf-8; header=present`, CRLF, UTF-8 without a byte
-order mark), `f=xlsx` or the spreadsheetml media type an Office Open XML
-workbook of one sheet named after the collection and a `provenance`
-sheet. The columns are the Parquet file's: `id`, `geometry` as GeoJSON
+order mark). The columns are the Parquet file's: `id`, `geometry` as GeoJSON
 text, a column per property the view shows; a text cell that starts with
 `=`, `+`, `-`, `@`, a tab or a carriage return gets a leading `'`, so no
 spreadsheet runs it as a formula. A CSV or Parquet file holds one
 collection: `f=csv` or `f=parquet` on `/collections` is `400`. Several
-collections come as one download from `/collections`: `f=xlsx` (or its
-media type) a workbook with a sheet per collection, `f=zip` (or
+collections come as one download from `/collections`: `f=zip` (or
 `Accept: application/zip`) a ZIP of `{collectionId}.csv` per collection
 (and `{collectionId}.parquet` in a build with `parquet` too), a
-`README.md` naming every file and a `provenance.json`. Both take
+`README.md` naming every file and a `provenance.json`. It takes
 `collections` (a comma list of collection ids; one the view does not show
 is `400`), `bbox` and `datetime`, applied to every collection; any other
 parameter is `400`. The provenance names the view, the collections, the
@@ -130,7 +128,7 @@ downloads under `bundles`.
 
 A file is held whole in memory until it is sent, so the surface writes at
 most `ANTARES_EXPORT_FILES` files at once (default 2,
-[Configuration](configuration.md)), Parquet, CSV, XLSX and ZIP together.
+[Configuration](configuration.md)), Parquet, CSV and ZIP together.
 One more is `503` with `Retry-After: 6`, never queued; `/q/health` shows
 the cap as `limits.exportFiles`.
 
