@@ -77,10 +77,20 @@ pub(crate) fn asked(
     }
 }
 
+/// How many files a router writes at once: `raw` when it is 1 to 64, else 2 (T-4465 review).
+pub(crate) fn files_of(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse().ok())
+        .filter(|n| (1..=64).contains(n))
+        .unwrap_or(2)
+}
+
 /// A media type or range without its parameters.
 fn essence(media: &str) -> &str {
     media.split(';').next().unwrap_or_default().trim()
 }
+
+#[cfg(any(feature = "parquet", feature = "tabular"))]
+pub(crate) use file::{Budget, Gate};
 
 #[cfg(any(feature = "parquet", feature = "tabular"))]
 mod file {
@@ -88,10 +98,97 @@ mod file {
     use crate::model::Collection;
     use crate::{items, Here, Problem, Reply};
     use antares_export::{Column, Error, Kind, Sink};
-    use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
-    use axum::http::StatusCode;
+    use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE, RETRY_AFTER};
+    use axum::http::{HeaderValue, StatusCode};
     use axum::response::IntoResponse as _;
     use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// The refusal past the cap of files written at once.
+    pub(crate) const BUSY: Problem = Problem(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the broker is writing as many files as it writes at once: try again later",
+    );
+
+    /// The files one router writes at once (T-4465 review, `ANTARES_EXPORT_FILES`): each holds
+    /// up to the answer ceiling in memory and reads its collections whole, so a request past
+    /// the cap is refused, never queued.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Gate {
+        writing: Arc<AtomicUsize>,
+        cap: usize,
+    }
+
+    /// A file being written; dropping it frees its place.
+    pub(crate) struct Slot(Arc<AtomicUsize>);
+
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// What a file this surface writes is held to: the answer ceiling and the cap of files
+    /// written at once.
+    pub(crate) struct Budget {
+        pub(crate) max: usize,
+        pub(crate) gate: Gate,
+    }
+
+    impl Budget {
+        /// The broker's ceiling and the gate the router put on the request.
+        pub(crate) fn of(ops: &antares_ops::Ops, parts: &axum::http::request::Parts) -> Self {
+            Self {
+                max: ops.max_answer_bytes(),
+                gate: parts.extensions.get().cloned().unwrap_or_default(),
+            }
+        }
+    }
+
+    impl Gate {
+        pub(crate) fn new(cap: usize) -> Self {
+            Self {
+                writing: Arc::new(AtomicUsize::new(0)),
+                cap,
+            }
+        }
+
+        /// A place for one more file, or [`BUSY`] when `cap` are being written.
+        pub(crate) fn take(&self) -> Result<Slot, Problem> {
+            self.writing
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    n.checked_add(1).filter(|more| *more <= self.cap)
+                })
+                .map(|_| Slot(Arc::clone(&self.writing)))
+                .map_err(|_| BUSY)
+        }
+    }
+
+    /// The cap the deployment set.
+    impl Default for Gate {
+        fn default() -> Self {
+            Self::new(super::files_of(
+                std::env::var(crate::EXPORT_FILES_ENV).ok().as_deref(),
+            ))
+        }
+    }
+
+    /// A written file to save, or its refusal; a `503` says when to ask again.
+    pub(crate) fn answer(written: Result<(&str, Vec<u8>), Problem>, name: &str) -> Reply {
+        match written {
+            Ok((media, bytes)) => attachment(media, name, bytes),
+            Err(refused) => {
+                let mut reply = refused.reply();
+                if refused == BUSY {
+                    reply
+                        .headers_mut()
+                        .insert(RETRY_AFTER, HeaderValue::from_static("6"));
+                }
+                reply
+            }
+        }
+    }
 
     /// A writer of one collection's file: its name (a sheet's), its columns, whether it has a
     /// geometry, and the ceiling.
@@ -193,10 +290,7 @@ mod file {
             pairs: &[(String, String)],
             f: &str,
         ) -> Reply {
-            match self.write_file(c, pairs, f).await {
-                Ok((media, bytes)) => attachment(media, &format!("{}.{f}", c.id), bytes),
-                Err(refused) => refused.reply(),
-            }
+            answer(self.write_file(c, pairs, f).await, &format!("{}.{f}", c.id))
         }
 
         async fn write_file(
@@ -207,6 +301,7 @@ mod file {
         ) -> Result<(&'static str, Vec<u8>), Problem> {
             let missing = Problem(StatusCode::NOT_ACCEPTABLE, "no such file");
             let (_, media, make) = ITEMS.iter().find(|e| e.0 == f).ok_or(missing)?;
+            let _writing = self.budget.gate.take()?;
             let mut p = items::params(c, pairs)?;
             if p.crs != crate::crs::CRS84 {
                 return Err(Problem(
@@ -215,7 +310,7 @@ mod file {
                 ));
             }
             let geometry = c.geometry.is_some();
-            let mut sink = make(&c.id, columns(c, &p), geometry, self.max_bytes)?;
+            let mut sink = make(&c.id, columns(c, &p), geometry, self.budget.max)?;
             let mut write = |page: &[Value]| sink.page(page);
             let rows = self.rows(c, &mut p, pairs, &mut write).await?;
             let provenance = self.provenance(&[c.id.as_str()], pairs, rows);
@@ -275,7 +370,7 @@ mod file {
 
 #[cfg(feature = "tabular")]
 mod bundle {
-    use super::file::{attachment, columns};
+    use super::file::{answer, columns};
     use crate::model::Collection;
     use crate::{items, Here, Problem, Reply};
     use antares_export::bundle::Bundle;
@@ -293,14 +388,23 @@ mod bundle {
         /// a sheet each, `f=zip` a CSV each (and its Parquet in a `parquet` build), with a
         /// README and the provenance.
         pub(crate) async fn bundle(&self, pairs: &[(String, String)], f: &str) -> Reply {
-            let written = match self.chosen(pairs) {
-                Ok((filters, chosen)) if f == "zip" => self.zip(&filters, &chosen, pairs).await,
-                Ok((filters, chosen)) => self.xlsx(&filters, &chosen, pairs).await,
-                Err(refused) => Err(refused),
-            };
-            match written {
-                Ok((media, bytes)) => attachment(media, &format!("{}.{f}", self.id), bytes),
-                Err(refused) => refused.reply(),
+            answer(
+                self.write_bundle(pairs, f).await,
+                &format!("{}.{f}", self.id),
+            )
+        }
+
+        async fn write_bundle(
+            &self,
+            pairs: &[(String, String)],
+            f: &str,
+        ) -> Result<(&'static str, Vec<u8>), Problem> {
+            let (filters, chosen) = self.chosen(pairs)?;
+            let _writing = self.budget.gate.take()?;
+            if f == "zip" {
+                self.zip(&filters, &chosen, pairs).await
+            } else {
+                self.xlsx(&filters, &chosen, pairs).await
             }
         }
 
@@ -340,7 +444,7 @@ mod bundle {
             chosen: &[&Collection],
             pairs: &[(String, String)],
         ) -> Result<(&'static str, Vec<u8>), Problem> {
-            let mut book = Box::new(Workbook::new(self.max_bytes));
+            let mut book = Box::new(Workbook::new(self.budget.max));
             let mut rows = 0usize;
             for c in chosen {
                 let mut p = items::params(c, filters)?;
@@ -360,12 +464,12 @@ mod bundle {
             chosen: &[&Collection],
             pairs: &[(String, String)],
         ) -> Result<(&'static str, Vec<u8>), Problem> {
-            let mut bundle = Bundle::new(self.max_bytes);
+            let mut bundle = Bundle::new(self.budget.max);
             let mut files = Vec::new();
             let mut rows = 0usize;
             for c in chosen {
                 let mut p = items::params(c, filters)?;
-                let (geometry, max) = (c.geometry.is_some(), self.max_bytes);
+                let (geometry, max) = (c.geometry.is_some(), self.budget.max);
                 let mut sinks: Vec<(&str, Box<dyn Sink>)> = vec![
                     (
                         "csv",
@@ -496,5 +600,42 @@ mod tests {
                 "the file could not be written"
             )
         );
+    }
+
+    #[test]
+    fn the_cap_of_files_is_one_to_64_else_two() {
+        assert_eq!(files_of(None), 2);
+        assert_eq!(files_of(Some("5")), 5);
+        for wrong in ["0", "65", "-1", "two", ""] {
+            assert_eq!(files_of(Some(wrong)), 2, "{wrong}");
+        }
+    }
+
+    #[cfg(any(feature = "parquet", feature = "tabular"))]
+    #[test]
+    fn the_third_file_at_once_is_refused_with_retry_after() {
+        let gate = file::Gate::new(2);
+        let first = gate.take();
+        let second = gate.take();
+        assert!(first.is_ok(), "the first file");
+        assert!(second.is_ok(), "the second file");
+        let third = gate.take().err();
+        assert_eq!(third, Some(file::BUSY));
+        let reply = file::answer(Err(file::BUSY), "Car.csv");
+        assert_eq!(reply.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            reply.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("6"))
+        );
+        drop(first);
+        assert!(gate.take().is_ok(), "a written file frees its place");
+        let refused = file::answer(
+            Err(crate::Problem(axum::http::StatusCode::BAD_REQUEST, "x")),
+            "a",
+        );
+        assert!(refused
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none());
     }
 }

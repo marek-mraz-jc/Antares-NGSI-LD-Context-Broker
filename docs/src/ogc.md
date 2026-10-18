@@ -128,6 +128,12 @@ page of `/items` carries an `alternate` link per file type the build
 writes; `/q/health` lists them under `encodings` and the `/collections`
 downloads under `bundles`.
 
+A file is held whole in memory until it is sent, so the surface writes at
+most `ANTARES_EXPORT_FILES` files at once (default 2,
+[Configuration](configuration.md)), Parquet, CSV, XLSX and ZIP together.
+One more is `503` with `Retry-After: 6`, never queued; `/q/health` shows
+the cap as `limits.exportFiles`.
+
 ## 3. Schemas and references
 
 `/schema` is a JSON Schema 2020-12 document (`application/schema+json`)

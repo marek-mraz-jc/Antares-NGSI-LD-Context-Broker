@@ -155,6 +155,9 @@ const SURFACE_KEYS: &[&[&str]] = &[
     // hosts, origins, result budget, the confirmation key, tool endpoints
     #[cfg(feature = "mcp")]
     antares_mcp::ENV_KEYS,
+    // how many files the OGC surface writes at once
+    #[cfg(feature = "ogc")]
+    antares_ogc::ENV_KEYS,
     // the WebSocket channel's bounds (ADR-0026 rules 6 to 10)
     #[cfg(feature = "ws")]
     antares_ws::ENV_KEYS,

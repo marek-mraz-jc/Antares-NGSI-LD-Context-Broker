@@ -45,6 +45,13 @@ use std::collections::BTreeMap;
 /// Where the surface is mounted; the view id and `ogc/features` follow.
 pub const PREFIX: &str = "/x/views";
 
+/// How many files (`f=parquet`, `csv`, `xlsx`, `zip`) the surface writes at once, 1 to 64,
+/// default 2; past it a file is `503` with `Retry-After` (T-4465 review).
+pub const EXPORT_FILES_ENV: &str = "ANTARES_EXPORT_FILES";
+
+/// The variables this surface reads.
+pub const ENV_KEYS: &[&str] = &[EXPORT_FILES_ENV];
+
 /// The bounds a Tenant's schema is read under (threat LK7), as the `OData` surface reads it.
 pub const SCHEMA_LIMITS: linkml_model::Limits = linkml_model::Limits {
     max_bytes: 16 << 20,
@@ -155,6 +162,7 @@ impl Surface for Ogc {
             "conformsTo": CONFORMANCE,
             "encodings": encodings,
             "bundles": bundles,
+            "limits": {"exportFiles": export::files_of(std::env::var(EXPORT_FILES_ENV).ok().as_deref())},
         })
     }
 
@@ -163,10 +171,14 @@ impl Surface for Ogc {
             let ops = ops.clone();
             async move { serve(&ops, &caller, req).await }
         });
-        Router::new()
+        let router = Router::new()
             .route("/{view}/ogc/features", handler.clone())
             .route("/{view}/ogc/features/", handler.clone())
-            .route("/{view}/ogc/features/{*rest}", handler)
+            .route("/{view}/ogc/features/{*rest}", handler);
+        // T-4465 review: one cap on the files this router writes at once.
+        #[cfg(any(feature = "parquet", feature = "tabular"))]
+        let router = router.layer(axum::Extension(export::Gate::default()));
+        router
     }
 }
 
@@ -271,7 +283,7 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
         caller,
         collections: &collections,
         #[cfg(any(feature = "parquet", feature = "tabular"))]
-        max_bytes: ops.max_answer_bytes(),
+        budget: export::Budget::of(ops, parts),
     };
     match (rest.as_slice(), pairs.is_empty()) {
         ([] | [""], true) => document(JSON, &at.landing()),
@@ -498,9 +510,10 @@ struct Here<'a> {
     base: &'a str,
     caller: &'a Caller,
     collections: &'a BTreeMap<String, Collection>,
-    /// The ceiling a file this surface assembles is written under (T-4465).
+    /// The ceiling a file this surface assembles is written under and the files the router is
+    /// writing (T-4465).
     #[cfg(any(feature = "parquet", feature = "tabular"))]
-    max_bytes: usize,
+    budget: export::Budget,
 }
 
 impl Here<'_> {
@@ -680,6 +693,7 @@ mod tests {
         let info = Ogc.version_info();
         assert_eq!(info.pointer("/encodings"), Some(&json!(encodings)));
         assert_eq!(info.pointer("/bundles"), Some(&json!(bundles)));
+        assert_eq!(info.pointer("/limits/exportFiles"), Some(&json!(2)));
     }
 
     #[test]
