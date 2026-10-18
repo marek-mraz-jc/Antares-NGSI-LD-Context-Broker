@@ -67,6 +67,7 @@ progress). A memory-store broker answers:
   "policy": { "engine": "allow-all", "timeoutMs": 250 },
   "surfaces": { "admin": { "prefix": "/q", "routes": 8 } },
   "limits": {
+    "batchInflight": 8,
     "batchInflightBytes": 4194304,
     "changeQueue": 1024,
     "deliveryLane": 64,

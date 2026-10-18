@@ -866,3 +866,37 @@ async fn an_entity_off_loses_its_history_and_forever_holds_the_platform_back() {
         assert_eq!(instances(&app, tenant, id).await, left, "{tenant} {id}");
     }
 }
+
+/// T-4624, owner 2026-10-18: a vehicle keeps at most an hour of track. One
+/// sweep removes its positions older than an hour and keeps the newer ones;
+/// a Stop of the same Tenant, and a Vehicle of a Tenant without the rule,
+/// keep everything.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vehicle_keeps_an_hour_of_track_and_nothing_else_loses_any() {
+    let b = TestBroker::new().await.expect("broker");
+    let app = b.serve_mounted(Vec::new()).expect("app");
+    let rules = json!({"rules": [{"type": V, "history": "PT1H"}]}).to_string();
+    let (s, _) = send(&app, Method::PUT, "/q/retention/city", None, Some(rules)).await;
+    assert_eq!(s, StatusCode::CREATED);
+    for (tenant, id, ty) in [
+        ("city", "urn:v:bus", V),
+        ("city", "urn:s:stop", S),
+        ("port", "urn:v:ferry", V),
+    ] {
+        seed_history(&app, tenant, id, ty, &[180, 61, 59, 5]).await;
+    }
+
+    let deleted = b.sweep_retention(chrono::Utc::now()).await;
+    let gone: Vec<_> = deleted
+        .iter()
+        .map(|d| (d.tenant.as_str(), d.type_iri.as_str(), d.kind, d.count))
+        .collect();
+    assert_eq!(gone, [("city", V, "history", 2)]);
+    for (tenant, id, left) in [
+        ("city", "urn:v:bus", 2),
+        ("city", "urn:s:stop", 4),
+        ("port", "urn:v:ferry", 4),
+    ] {
+        assert_eq!(instances(&app, tenant, id).await, left, "{tenant} {id}");
+    }
+}
