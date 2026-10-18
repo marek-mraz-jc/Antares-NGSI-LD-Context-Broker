@@ -50,4 +50,7 @@ jobs:
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" "ngsild-${GITHUB_REF_NAME}.tar.gz" --title "ngsild $GITHUB_REF_NAME" --notes "From Antares-NGSI-LD-Context-Broker $(cat SOURCE). Verify: gh attestation verify ngsild-${GITHUB_REF_NAME}.tar.gz --repo $GITHUB_REPOSITORY"
+        run: |
+          gh release create "$GITHUB_REF_NAME" "ngsild-${GITHUB_REF_NAME}.tar.gz" \
+            --title "ngsild $GITHUB_REF_NAME" \
+            --notes "From Antares-NGSI-LD-Context-Broker $(cat SOURCE). Verify the archive with: gh attestation verify ngsild-${GITHUB_REF_NAME}.tar.gz --repo $GITHUB_REPOSITORY"
