@@ -45,6 +45,8 @@ pub mod percent;
 mod scan;
 pub mod views;
 
+/// The NGSI-LD primer a surface tells a model (T-4532), through `antares-ops` alone (rule M2).
+pub use antares_ql::PRIMER;
 /// The residual of a standard query (ADR-0028 rule 2), re-exported so a surface compiles into
 /// it through `antares-ops` alone (rule M2).
 pub use antares_residual as residual;
@@ -362,6 +364,13 @@ impl Ops {
             views: Arc::default(),
             surface,
         }
+    }
+
+    /// The most bytes one answer may hold (`max_answer_bytes`, [`bounds::MAX_ANSWER_BYTES`]):
+    /// the ceiling a surface that assembles a file itself writes under (T-4465).
+    #[must_use]
+    pub fn max_answer_bytes(&self) -> usize {
+        self.state.max_answer_bytes
     }
 
     /// An answer's body read whole, up to the broker's `max_answer_bytes`
@@ -1213,6 +1222,18 @@ pub mod test_kit {
         pub async fn over(mut state: AppState) -> Result<Self, String> {
             antares_api::wire(&mut state).await;
             let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
+        }
+
+        /// [`TestBroker::new`] with the platform's history retention set
+        /// to `keep`, as `ANTARES_RETENTION_HISTORY_DEFAULT` sets it (DM-97).
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn with_platform_history(keep: std::time::Duration) -> Result<Self, String> {
+            let mut state = AppState::new("antares-test".into());
+            antares_api::wire(&mut state).await;
+            let reload = crate::views::install_with(&state, Some(keep)).await?;
             Ok(Self { state, reload })
         }
 

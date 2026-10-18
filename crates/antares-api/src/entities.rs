@@ -1492,11 +1492,17 @@ pub async fn filter_entities_paged(
     let mut rows = 0usize;
     let mut fed_once = Some(fed);
     // the store page under `enough` or `counting`: (offset, limit), the limit
-    // doubling up to COUNT_CHUNK
-    const COUNT_CHUNK: usize = 8192;
+    // doubling up to COUNT_CHUNK. Under `enough` only the client's window is
+    // kept, as under `counting`: holding every match up to the page's end made
+    // a deep page of a large dataset hold the whole dataset, read in one
+    // statement, and four of them took the broker past its limit (T-4562).
+    const COUNT_CHUNK: usize = 2048;
+    let window = client_page.filter(|_| enough.is_some());
     let mut read = (
         0usize,
-        enough.unwrap_or(if counting.is_some() { 1024 } else { 0 }),
+        enough
+            .map(|n| n.min(COUNT_CHUNK))
+            .unwrap_or(if counting.is_some() { 1024 } else { 0 }),
     );
     let mut matched = 0usize;
     'scan: loop {
@@ -1646,10 +1652,18 @@ pub async fn filter_entities_paged(
                 matched = matched.saturating_add(1);
                 continue;
             }
-            out.push(doc);
-            if enough.is_some_and(|n| out.len() >= n) {
-                break 'scan;
+            if let Some((offset, limit)) = window {
+                // the window and one match past it, which says a next page exists
+                if matched >= offset {
+                    out.push(doc);
+                }
+                matched = matched.saturating_add(1);
+                if out.len() > limit {
+                    break 'scan;
+                }
+                continue;
             }
+            out.push(doc);
         }
         // a store that could not page answered with every row it holds
         if (enough.is_none() && counting.is_none()) || !store_paged || got < read.1 {
@@ -1664,12 +1678,23 @@ pub async fn filter_entities_paged(
         }
         read = (
             read.0.saturating_add(got),
-            if counting.is_some() {
-                read.1.saturating_mul(2).min(COUNT_CHUNK)
-            } else {
-                read.1.saturating_mul(2)
-            },
+            read.1.saturating_mul(2).min(COUNT_CHUNK),
         );
+    }
+    if let Some((offset, limit)) = window {
+        // the smallest total consistent with "a next page exists"
+        let more = out.len() > limit;
+        out.truncate(limit);
+        return Ok(Filtered {
+            total: Some(
+                offset
+                    .saturating_add(out.len())
+                    .saturating_add(usize::from(more)),
+            ),
+            docs: out,
+            paged: true,
+            rows,
+        });
     }
     if counting.is_some() {
         // the store paged to the end, or answered every row it holds at once

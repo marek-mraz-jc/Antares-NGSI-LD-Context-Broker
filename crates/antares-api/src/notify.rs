@@ -440,6 +440,9 @@ pub async fn record_temporal_change(
     let Some(id) = after.get("id").and_then(Value::as_str) else {
         return;
     };
+    if !crate::history::records_history(st, tenant, after) {
+        return;
+    }
     let mut shell = Map::new();
     for k in ["id", "type", "createdAt", "modifiedAt", "scope"] {
         if let Some(v) = after.get(k) {
@@ -1246,6 +1249,12 @@ fn triggers_of(sub: &Value) -> Vec<&str> {
 /// the first notification back indefinitely.
 const CHANGE_BATCH: usize = 256;
 
+/// The estimated heap one drain's groups may hold before they leave for their
+/// lanes (T-4562): an eighth of what the lanes hold together.
+#[cfg(not(target_arch = "wasm32"))]
+static DRAIN_BYTES: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| *crate::bounds::DELIVERY_LANE_BYTES / 8);
+
 /// One matched (subscription, entity) pair before delivery.
 struct Matched {
     tenant: TenantId,
@@ -1298,6 +1307,9 @@ async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>, done: Option
     let mut index: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
     let mut ctx_memo = CtxMemo::new();
+    // estimated heap of the groups this drain holds (T-4562)
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut held = 0usize;
     for (queued, (tenant_str, before, after)) in changes {
         let matched = matches_for(st, &tenant_str, before, after, queued, &mut ctx_memo);
         #[cfg(not(target_arch = "wasm32"))]
@@ -1311,6 +1323,13 @@ async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>, done: Option
         #[cfg(target_arch = "wasm32")]
         let matched = matched.await;
         for m in matched {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                held = m
+                    .data
+                    .iter()
+                    .fold(held, |n, e| n.saturating_add(heap_estimate(e)));
+            }
             let key = (
                 m.tenant.as_str().to_owned(),
                 m.sub
@@ -1329,6 +1348,21 @@ async fn process_queued(st: &AppState, changes: Vec<(u64, Change)>, done: Option
                     index.insert(key, groups.len());
                     groups.push(m);
                 }
+            }
+        }
+        // A drain of CHANGE_BATCH large changes over many subscriptions held
+        // a shaped copy per (subscription, entity) until its end: 256 changes
+        // of 3 KB entities times 20 subscriptions was 750 MB (T-4562). Past
+        // DRAIN_BYTES the groups so far leave for their lanes; a lane is
+        // FIFO, so a subscription's changes still leave in drain order.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(done) = &done {
+            if held > *DRAIN_BYTES {
+                for g in groups.drain(..) {
+                    to_lane(st, g, done);
+                }
+                index.clear();
+                held = 0;
             }
         }
     }
@@ -1467,23 +1501,40 @@ impl Drop for Held {
     }
 }
 
-/// What `v` costs on the heap, estimated: a node per value, the bytes of
-/// its strings and keys. Cheap next to the serialization a delivery does,
-/// and close enough to keep the lanes under their budget.
+/// What `v` costs on the heap, estimated from how serde_json lays it out:
+/// an object is a `BTreeMap`, whose every leaf node is about 640 bytes
+/// however few of its eleven slots it fills, so the two-member `{"type",
+/// "value"}` of an attribute instance costs a whole node (T-4562: counting
+/// a slot per member read 268 MB of lanes that held 620 MB); an array is its
+/// capacity of slots; a string its bytes, rounded to the allocator's
+/// 16-byte classes. Cheap next to the serialization a delivery does.
 #[cfg(not(target_arch = "wasm32"))]
 fn heap_estimate(v: &Value) -> usize {
-    const NODE: usize = std::mem::size_of::<Value>();
+    std::mem::size_of::<Value>().saturating_add(owned_heap(v))
+}
+
+/// The heap `v` owns beyond its own slot.
+#[cfg(not(target_arch = "wasm32"))]
+fn owned_heap(v: &Value) -> usize {
+    const LEAF: usize = 640;
+    const SLOT: usize = std::mem::size_of::<Value>();
+    let text = |len: usize| len.next_multiple_of(16);
     match v {
-        Value::String(s) => NODE.saturating_add(s.len()),
+        Value::String(s) => text(s.len()),
         Value::Array(items) => items
             .iter()
-            .fold(NODE, |n, item| n.saturating_add(heap_estimate(item))),
-        Value::Object(map) => map.iter().fold(NODE, |n, (k, item)| {
-            n.saturating_add(NODE)
-                .saturating_add(k.len())
-                .saturating_add(heap_estimate(item))
-        }),
-        _ => NODE,
+            .fold(items.capacity().saturating_mul(SLOT), |n, item| {
+                n.saturating_add(owned_heap(item))
+            }),
+        // nodes fill to about two thirds once a map has more than one
+        Value::Object(map) => map.iter().fold(
+            LEAF.saturating_mul(map.len().div_ceil(8).max(1)),
+            |n, (k, item)| {
+                n.saturating_add(text(k.len()))
+                    .saturating_add(owned_heap(item))
+            },
+        ),
+        _ => 0,
     }
 }
 
@@ -3879,6 +3930,15 @@ mod change_pipeline {
         assert!(
             estimate > text,
             "the estimate counts the nodes, not only the text: {estimate} <= {text}"
+        );
+        // T-4562: two objects are two map nodes of about 640 bytes each, however
+        // few members they hold
+        assert!(estimate >= 2 * 640, "{estimate}");
+        let wide: serde_json::Map<String, Value> =
+            (0..24).map(|k| (format!("a{k}"), Value::Null)).collect();
+        assert!(
+            heap_estimate(&Value::Object(wide)) >= 3 * 640,
+            "24 members need three nodes"
         );
     }
 

@@ -26,6 +26,12 @@
 #![deny(missing_docs)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+/// What a model is told before it calls an NGSI-LD tool (T-4532, EP-116): that the API is
+/// standard NGSI-LD, the query language and every tool argument. One text: Antares' per-view MCP
+/// sends it as its instructions, the joinedcontext gateway's hub prepends only its catalogue
+/// lines. Static: it names no data (MC11).
+pub const PRIMER: &str = include_str!("primer.md");
+
 pub mod eval;
 pub mod geo;
 pub mod regex;

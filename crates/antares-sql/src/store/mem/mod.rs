@@ -104,6 +104,22 @@ fn typed(doc: &Value, type_iri: &str) -> bool {
     }
 }
 
+/// Whether `scope` reaches the temporal document `id` (DM-97).
+fn in_scope(id: &str, doc: &Value, scope: antares_store::HistoryScope<'_>) -> bool {
+    use antares_store::HistoryScope;
+    match scope {
+        HistoryScope::Entity(one) => id == one,
+        HistoryScope::Type {
+            type_iri,
+            except_ids,
+        } => typed(doc, type_iri) && !except_ids.iter().any(|e| e == id),
+        HistoryScope::Rest {
+            except_types,
+            except_ids,
+        } => !except_types.iter().any(|t| typed(doc, t)) && !except_ids.iter().any(|e| e == id),
+    }
+}
+
 /// The instant an attribute instance is kept by, the same fallback the
 /// Postgres arm's `observed_at` column takes.
 fn instance_instant(inst: &Value) -> Option<&str> {
@@ -458,6 +474,12 @@ impl Store {
                 docs.remove(&id);
                 reaped = reaped.saturating_add(1);
             }
+            // Its history goes with it (DM-97, owner 2026-10-18).
+            if let Some(docs) = inner.temporal.get_mut(&tenant) {
+                if docs.remove(&id).is_some() {
+                    self.persist(T_TEMPORAL_ENTITIES, &key_bytes(&tenant, &id), None);
+                }
+            }
         }
         let Inner {
             entities, temporal, ..
@@ -513,6 +535,29 @@ impl Store {
             );
         }
         names.into_iter().collect()
+    }
+
+    /// The types the Tenant's live Entities carry, sorted (T-4610): one pass
+    /// over the held documents, none of them cloned. 4.22: an expired Entity
+    /// carries no type.
+    pub fn entity_type_names(&self, tenant: &TenantId, now: &str) -> Vec<String> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut names = std::collections::BTreeSet::new();
+        if let Some(m) = Self::map(&inner, Kind::Entity).get(tenant.as_str()) {
+            for doc in m.values().filter(|d| !filter::expired_at(d, now)) {
+                match &doc["type"] {
+                    Value::String(t) => {
+                        names.insert(t.as_str());
+                    }
+                    Value::Array(a) => names.extend(a.iter().filter_map(Value::as_str)),
+                    _ => {}
+                }
+            }
+        }
+        names.into_iter().map(str::to_owned).collect()
     }
 
     /// What one tenant holds. Existence is the caller's question — an
@@ -593,14 +638,34 @@ impl Store {
         })
     }
 
-    /// Retention of history (T-3900): drop at most `batch` attribute
-    /// instances of `tenant`'s temporal documents typed `type_iri` whose
+    /// The Entities of every Tenant carrying their own history retention
+    /// (DM-97), at most `limit`, with the Property as stored.
+    pub fn history_overrides(&self, limit: usize) -> Vec<(String, String, Value)> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .entities
+            .iter()
+            .flat_map(|(tenant, docs)| {
+                docs.iter().filter_map(move |(id, doc)| {
+                    doc.get(antares_store::HISTORY_RETENTION)
+                        .map(|own| (tenant.clone(), id.clone(), own.clone()))
+                })
+            })
+            .take(limit)
+            .collect()
+    }
+
+    /// Retention of history (T-3900, DM-97): drop at most `batch` attribute
+    /// instances of the `tenant`'s temporal documents `scope` names whose
     /// instant is before `before`; an attribute left without instances goes.
     /// `dry_run` counts them and drops none.
     pub fn retain_history(
         &self,
         tenant: &TenantId,
-        type_iri: &str,
+        scope: antares_store::HistoryScope<'_>,
         before: &str,
         batch: usize,
         dry_run: bool,
@@ -616,7 +681,7 @@ impl Store {
                 if left == 0 {
                     break;
                 }
-                if !typed(doc, type_iri) {
+                if !in_scope(id, doc, scope) {
                     continue;
                 }
                 let Some(obj) = doc.as_object_mut() else {

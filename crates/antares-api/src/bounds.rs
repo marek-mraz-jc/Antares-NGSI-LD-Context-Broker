@@ -170,15 +170,76 @@ pub const DELIVERY_LANE: usize = 64;
 /// alone, so twenty subscriptions behind slow receivers under a batch upsert
 /// flood held 64 groups of 100 3 KB entities each and took the process past
 /// its 1536 MiB limit in seconds (T-4549). Past this the group is dropped
-/// for that subscription and counted, as a full lane drops it. Deployment
-/// knob (ANTARES_DELIVERY_LANE_BYTES), read once at first use.
+/// for that subscription and counted, as a full lane drops it. 128 MiB
+/// leaves room for a running batch, which costs as much again (T-4562).
+/// Deployment knob (ANTARES_DELIVERY_LANE_BYTES), read once at first use.
 pub static DELIVERY_LANE_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
     count_from(
         std::env::var("ANTARES_DELIVERY_LANE_BYTES").ok().as_deref(),
-        256 * 1024 * 1024,
+        128 * 1024 * 1024,
         usize::MAX,
     )
 });
+/// Batch write bodies in flight at once, in bytes. One batch costs about a
+/// hundred times its body while it runs: the parsed items, their expansion
+/// for the policy check, the stored pre-images, the forward copy, the rows
+/// and the change events, so a 1000-entity upsert of 3 MB held about 300 MB
+/// and eight of them at once took the process past its 1536 MiB limit
+/// (T-4562); two at once were 480 MB live, so the default runs one batch of
+/// that size beside small ones. A batch waits for its share and is answered 503 with
+/// `Retry-After` when none frees inside [`BATCH_ADMIT_WAIT`]; one batch is
+/// always admitted alone, however large. Deployment knob
+/// (ANTARES_BATCH_INFLIGHT_BYTES), read once at first use.
+pub static BATCH_INFLIGHT_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    count_from(
+        std::env::var("ANTARES_BATCH_INFLIGHT_BYTES")
+            .ok()
+            .as_deref(),
+        4 * 1024 * 1024,
+        u32::MAX as usize,
+    )
+});
+/// How long a batch waits for its share of [`BATCH_INFLIGHT_BYTES`]. A waiting
+/// batch holds only its body, and the batches ahead of it take well under a
+/// second each, so it waits long enough for a queue of dozens to drain; a
+/// client timeout of 30 s still sees the 503 first.
+pub const BATCH_ADMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+static BATCH_SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*BATCH_INFLIGHT_BYTES));
+
+/// The admission of a batch body of `bytes`, held for as long as the batch
+/// runs; `None` when no share freed inside [`BATCH_ADMIT_WAIT`].
+pub async fn admit_batch(bytes: usize) -> Option<tokio::sync::SemaphorePermit<'static>> {
+    admit(&BATCH_SLOTS, *BATCH_INFLIGHT_BYTES, bytes, BATCH_ADMIT_WAIT).await
+}
+
+async fn admit(
+    slots: &tokio::sync::Semaphore,
+    budget: usize,
+    bytes: usize,
+    wait: std::time::Duration,
+) -> Option<tokio::sync::SemaphorePermit<'_>> {
+    // capped at the whole budget, so the largest body is admitted once it runs alone
+    let weight = bytes.clamp(1, budget) as u32;
+    #[cfg(not(target_arch = "wasm32"))]
+    let admitted = tokio::time::timeout(wait, slots.acquire_many(weight))
+        .await
+        .ok()
+        .and_then(Result::ok);
+    // the wasm build has no tokio timer: a batch is admitted only when its share is free now
+    #[cfg(target_arch = "wasm32")]
+    let admitted = {
+        let _ = wait;
+        slots.try_acquire_many(weight).ok()
+    };
+    match admitted {
+        Some(permit) => Some(permit),
+        _ => {
+            metrics::counter!("antares_batch_overloaded_total").increment(1);
+            None
+        }
+    }
+}
 /// Notifications in flight at once per drain: one serial POST at a time
 /// capped a 9-subscription fan-out at ~600 POST/s and overflowed the ring.
 /// Deployment knob (ANTARES_DELIVERY_WIDTH): what a width is worth is a
@@ -265,6 +326,7 @@ impl LimitStats {
             "maxRegexProgramBytes": MAX_REGEX_PROGRAM_BYTES,
             "changeQueue": CHANGE_QUEUE,
             "deliveryLane": DELIVERY_LANE,
+            "batchInflightBytes": *BATCH_INFLIGHT_BYTES,
             "deliveryLaneBytes": *DELIVERY_LANE_BYTES,
             "deliveryWidth": *DELIVERY_WIDTH,
             "deliveryWidthPerTenant": *DELIVERY_WIDTH_PER_TENANT,
@@ -499,6 +561,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "batchInflightBytes",
                 "changeQueue",
                 "deliveryLane",
                 "deliveryLaneBytes",
@@ -750,5 +813,31 @@ mod tests {
         );
         let deep = "[".repeat(100) + &"]".repeat(100);
         assert_eq!(json_depth(deep.as_bytes()), 100);
+    }
+
+    /// T-4562: batches run inside their byte budget. A second one that does
+    /// not fit waits and is refused when nothing frees; a body larger than
+    /// the whole budget still runs alone; a finished batch frees its share.
+    #[tokio::test]
+    async fn batches_wait_for_their_share_of_the_in_flight_budget() {
+        let slots = tokio::sync::Semaphore::new(10);
+        let wait = std::time::Duration::from_millis(50);
+        let first = admit(&slots, 10, 6, wait).await.expect("fits");
+        assert!(
+            admit(&slots, 10, 6, wait).await.is_none(),
+            "6 + 6 is past 10"
+        );
+        let small = admit(&slots, 10, 4, wait).await.expect("6 + 4 fits");
+        drop((first, small));
+        let huge = admit(&slots, 10, 1 << 30, wait)
+            .await
+            .expect("alone, a huge body runs");
+        assert!(
+            admit(&slots, 10, 0, wait).await.is_none(),
+            "an empty body still counts one"
+        );
+        drop(huge);
+        assert!(admit(&slots, 10, 0, wait).await.is_some());
+        assert_eq!(slots.available_permits(), 10, "every share came back");
     }
 }

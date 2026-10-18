@@ -371,6 +371,24 @@ impl PgEntityStore {
         Ok(row.map(|r| r.get::<Value, _>(0)))
     }
 
+    /// The types the Tenant's live Entities carry, sorted (T-4610). The
+    /// statement reads the `types` column and never an `entity` document, so
+    /// `/types` over a Tenant of any size costs one index-sized pass.
+    pub async fn type_names(&self, tenant: &TenantId) -> Result<Vec<String>, sqlx::Error> {
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        // 4.22: expired rows are invalid context until the sweep reaps them
+        let names = sqlx::query_scalar(
+            "SELECT DISTINCT t FROM entities, unnest(types) AS t WHERE tenant_id = $1
+               AND (expires_at IS NULL OR expires_at > now()) ORDER BY t",
+        )
+        .bind(tenant.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(names)
+    }
+
     /// Several Entities in one transaction (T-4085): one per id that exists,
     /// keyed by id. A write's Relationship targets are read this way, so a
     /// fragment with five Relationships costs one BEGIN, not five.

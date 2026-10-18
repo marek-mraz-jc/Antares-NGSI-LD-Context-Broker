@@ -22,6 +22,7 @@
 
 mod api;
 mod crs;
+mod export;
 mod filter;
 mod items;
 mod model;
@@ -43,6 +44,13 @@ use std::collections::BTreeMap;
 
 /// Where the surface is mounted; the view id and `ogc/features` follow.
 pub const PREFIX: &str = "/x/views";
+
+/// How many files (`f=parquet`, `csv`, `zip`) the surface writes at once, 1 to 64,
+/// default 2; past it a file is `503` with `Retry-After` (T-4465 review).
+pub const EXPORT_FILES_ENV: &str = "ANTARES_EXPORT_FILES";
+
+/// The variables this surface reads.
+pub const ENV_KEYS: &[&str] = &[EXPORT_FILES_ENV];
 
 /// The bounds a Tenant's schema is read under (threat LK7), as the `OData` surface reads it.
 pub const SCHEMA_LIMITS: linkml_model::Limits = linkml_model::Limits {
@@ -146,7 +154,16 @@ impl Surface for Ogc {
     }
 
     fn version_info(&self) -> Value {
-        json!({"endpoint": format!("{PREFIX}/{{view}}/ogc/features"), "conformsTo": CONFORMANCE})
+        // T-4465, T-4477: the files `items` and `/collections` write in this build.
+        let encodings: Vec<&str> = export::ITEMS.iter().map(|e| e.0).collect();
+        let bundles: Vec<&str> = export::BUNDLES.iter().map(|e| e.0).collect();
+        json!({
+            "endpoint": format!("{PREFIX}/{{view}}/ogc/features"),
+            "conformsTo": CONFORMANCE,
+            "encodings": encodings,
+            "bundles": bundles,
+            "limits": {"exportFiles": export::files_of(std::env::var(EXPORT_FILES_ENV).ok().as_deref())},
+        })
     }
 
     fn router(&self, ops: Ops) -> Router {
@@ -154,10 +171,14 @@ impl Surface for Ogc {
             let ops = ops.clone();
             async move { serve(&ops, &caller, req).await }
         });
-        Router::new()
+        let router = Router::new()
             .route("/{view}/ogc/features", handler.clone())
             .route("/{view}/ogc/features/", handler.clone())
-            .route("/{view}/ogc/features/{*rest}", handler)
+            .route("/{view}/ogc/features/{*rest}", handler);
+        // T-4465 review: one cap on the files this router writes at once.
+        #[cfg(any(feature = "parquet", feature = "tabular"))]
+        let router = router.layer(axum::Extension(export::Gate::default()));
+        router
     }
 }
 
@@ -250,22 +271,19 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
     if let Some(item) = item.filter(|_| method != Method::GET) {
         return write_to(&view, caller, &collections, &base, parts, item, body).await;
     }
-    if !acceptable(headers) {
-        return problem(
-            StatusCode::NOT_ACCEPTABLE,
-            "this surface writes JSON, GeoJSON, JSON Schema and OpenAPI JSON",
-        );
-    }
-    // Form decoding is lossy (an undecodable escape stays as written), so this never fails.
-    let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
-        .map(|Query(pairs)| pairs)
-        .unwrap_or_default();
+    let asked = match negotiate(&rest, headers, uri) {
+        Ok(asked) => asked,
+        Err(refused) => return refused.reply(),
+    };
+    let pairs = asked.pairs;
     let at = Here {
         view: &view,
         id,
         base: &base,
         caller,
         collections: &collections,
+        #[cfg(any(feature = "parquet", feature = "tabular"))]
+        budget: export::Budget::of(ops, parts),
     };
     match (rest.as_slice(), pairs.is_empty()) {
         ([] | [""], true) => document(JSON, &at.landing()),
@@ -277,6 +295,10 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
             OPENAPI,
             &api::document(&base, &collections, &|op| view.allows(op)),
         ),
+        #[cfg(feature = "tabular")]
+        (["collections"], _) if asked.file.is_some() => {
+            at.bundle(&pairs, asked.file.unwrap_or_default()).await
+        }
         (["collections"], true) => document(JSON, &at.collections()),
         (["collections", c], true) => match collections.get(*c) {
             Some(c) => document(JSON, &at.collection(c)),
@@ -298,6 +320,10 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
             }
         }
         (["collections", c, "items"], _) => match collections.get(*c) {
+            #[cfg(any(feature = "parquet", feature = "tabular"))]
+            Some(c) if asked.file.is_some() => {
+                at.file(c, &pairs, asked.file.unwrap_or_default()).await
+            }
             Some(c) => at.items(c, &pairs, uri.query()).await,
             None => not_found(),
         },
@@ -317,6 +343,41 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
         ),
         _ => not_found(),
     }
+}
+
+/// The request's query pairs, and the file it asks for by its `f` value (T-4465, T-4477).
+struct Asked {
+    pairs: Vec<(String, String)>,
+    file: Option<&'static str>,
+}
+
+/// The request's [`Asked`], the `400` for a CSV or Parquet of several collections, or the `406`
+/// for an `Accept` this surface writes nothing for.
+fn negotiate(rest: &[&str], headers: &HeaderMap, uri: &axum::http::Uri) -> Result<Asked, Problem> {
+    // Form decoding is lossy (an undecodable escape stays as written), so this never fails.
+    let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
+        .map(|Query(pairs)| pairs)
+        .unwrap_or_default();
+    let one_type = |(n, v): &(String, String)| n == "f" && export::ONE_TYPE.contains(&v.as_str());
+    if matches!(rest, ["collections"]) && pairs.iter().any(one_type) {
+        return Err(Problem(
+            StatusCode::BAD_REQUEST,
+            "a CSV or Parquet file holds one collection: ask its items, or f=zip here for several",
+        ));
+    }
+    let items: Vec<(&str, &str)> = export::ITEMS.iter().map(|e| (e.0, e.1)).collect();
+    let asked = match rest {
+        ["collections", _, "items"] => export::asked(headers, pairs, &items),
+        ["collections"] => export::asked(headers, pairs, export::BUNDLES),
+        _ => Asked { pairs, file: None },
+    };
+    if asked.file.is_none() && !acceptable(headers) {
+        return Err(Problem(
+            StatusCode::NOT_ACCEPTABLE,
+            "this surface writes JSON, GeoJSON, JSON Schema, OpenAPI JSON and the files of /api",
+        ));
+    }
+    Ok(asked)
 }
 
 /// W4: whether the resource offers `method`: its reads, and the writes the view offers on it
@@ -449,6 +510,10 @@ struct Here<'a> {
     base: &'a str,
     caller: &'a Caller,
     collections: &'a BTreeMap<String, Collection>,
+    /// The ceiling a file this surface assembles is written under and the files the router is
+    /// writing (T-4465).
+    #[cfg(any(feature = "parquet", feature = "tabular"))]
+    budget: export::Budget,
 }
 
 impl Here<'_> {
@@ -553,6 +618,11 @@ impl Here<'_> {
             links.push(link("next", GEOJSON, &format!("{at}?{}", query.join("&"))));
         }
         links.extend(profile_link(c, p.profile));
+        let separator = if this.contains('?') { '&' } else { '?' };
+        for e in export::ITEMS {
+            let (f, media) = (e.0, e.1);
+            links.push(link("alternate", media, &format!("{this}{separator}f={f}")));
+        }
         let returned = page.features.len();
         let mut body = json!({
             "type": "FeatureCollection",
@@ -603,6 +673,23 @@ mod tests {
             Ogc.version_info().pointer("/endpoint"),
             Some(&json!("/x/views/{view}/ogc/features"))
         );
+        // T-4465, T-4477: the surfaces listing names a file only in a build that writes it.
+        let encodings: Vec<&str> = [
+            #[cfg(feature = "parquet")]
+            "parquet",
+            #[cfg(feature = "tabular")]
+            "csv",
+        ]
+        .into();
+        let bundles: Vec<&str> = [
+            #[cfg(feature = "tabular")]
+            "zip",
+        ]
+        .into();
+        let info = Ogc.version_info();
+        assert_eq!(info.pointer("/encodings"), Some(&json!(encodings)));
+        assert_eq!(info.pointer("/bundles"), Some(&json!(bundles)));
+        assert_eq!(info.pointer("/limits/exportFiles"), Some(&json!(2)));
     }
 
     #[test]

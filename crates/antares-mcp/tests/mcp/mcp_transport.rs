@@ -174,6 +174,11 @@ async fn the_legacy_handshake_offers_no_write_tool() -> Result<(), String> {
         a.text
     );
     assert!(a.headers.get("mcp-session-id").is_none());
+    // T-4532: the one NGSI-LD primer is what a client is told.
+    assert_eq!(
+        a.result().get("instructions").and_then(Value::as_str),
+        Some(antares_mcp::PRIMER)
+    );
     let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).to_string();
     let legacy = post_raw(
         &f.app,

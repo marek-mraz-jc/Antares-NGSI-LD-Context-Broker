@@ -22,7 +22,11 @@ surface hides, and which CI job proves each surface's conformance.
 | WebSocket notifications | `ws` | `ws`, and `ws-views` for a view | `/x/ws/ngsi-ld/v1`, `/x/views/{view}/ws` | [WebSocket notifications](websocket.md) |
 | Internal context sources | `internal-csr` (adds `views`) | none (it serves forwards, not requests) | none | [Internal context sources](internal-context-sources.md) |
 
-`full` is `views`, `mcp`, `odata`, `ogc`, `sta`, `ical` and `ws`. `linkml` and
+`full` is `views`, `mcp`, `odata`, `ogc`, `sta` and `ws`. `parquet` (the OGC
+`items` as a Parquet file, [OGC](ogc.md#2-items)), `tabular` (CSV
+files and a ZIP of a CSV per collection) and `ical` (a view's Events as an
+iCalendar feed, [iCalendar](ical.md)) are named beside it,
+because `full` sits at its ADR-0027 size budget. `linkml` and
 `internal-csr` stay separate. A feature links a surface; only
 `ANTARES_API_SURFACES` mounts one ([Configuration](configuration.md)). A
 name the binary was not built with stops the broker at start.

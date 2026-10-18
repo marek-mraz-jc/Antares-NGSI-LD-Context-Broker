@@ -35,7 +35,7 @@ COPY --from=planner /src/recipe.json recipe.json
 COPY vendor/ vendor/
 # Cargo features of the broker (empty = the default, vanilla build). The
 # full cells of external-suites.yml build with --build-arg FEATURES=full,
-# image-jc.yml builds full,jc-policy,linkml as antares-broker-jc; the vanilla
+# image-jc.yml builds full,jc-policy,linkml,parquet,tabular,ical as antares-broker-jc; the vanilla
 # antares-broker image never sets it.
 ARG FEATURES=""
 # Cook scoped to the shipped package so feature unification matches the real
@@ -51,10 +51,13 @@ COPY --from=build /src/target/release/antares /antares
 # jemalloc decay tuning, measured: without a background
 # thread, freed pages only purge on ALLOCATION activity — an idle broker
 # after a burst parked ~48 MiB of dead pages forever; with it, RSS decays
-# back toward live×1.2 within seconds. Both env spellings: tikv-jemalloc
-# reads _RJEM_MALLOC_CONF (prefixed build), MALLOC_CONF covers unprefixed.
-ENV MALLOC_CONF=background_thread:true,narenas:4,dirty_decay_ms:10000,muzzy_decay_ms:10000 \
-    _RJEM_MALLOC_CONF=background_thread:true,narenas:4,dirty_decay_ms:10000,muzzy_decay_ms:10000
+# back toward live×1.2 within seconds. Under a batch upsert flood the 10 s
+# decays kept RSS at live×1.5 (1.39 GiB of a 1.5 GiB limit); 1 s dirty and no
+# muzzy stage held it at live×1.3, the same throughput (T-4562). Both env
+# spellings: tikv-jemalloc reads _RJEM_MALLOC_CONF (prefixed build),
+# MALLOC_CONF covers unprefixed.
+ENV MALLOC_CONF=background_thread:true,narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0 \
+    _RJEM_MALLOC_CONF=background_thread:true,narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0
 # Pre-create /data owned by nonroot (65532): a fresh named volume inherits the
 # mountpoint's ownership, so `file` mode can write without running as root —
 # distroless has no shell to chown at runtime.

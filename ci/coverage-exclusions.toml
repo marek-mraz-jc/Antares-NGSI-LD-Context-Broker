@@ -39,7 +39,7 @@ reason = "the view store failing: the built-in store under test_kit does not fai
 [[exclusion]]
 crate = "antares-ops"
 file = "src/views.rs"
-function = "antares_ops::views::install"
+function = "antares_ops::views::install_with"
 lines = 3
 branches = 0
 reason = "the minute loop's sweep body: its first tick is a minute after start (an immediate one raced the tests' own sweeps, T-3745), so no test runs it; tests call Reload::sweep_retention and sweep_quality, which run the same two sweeps"
@@ -63,7 +63,23 @@ reason = "the periodic reload failing on the store, which the built-in store doe
 [[exclusion]]
 crate = "antares-ops"
 file = "src/views/retention.rs"
-function = "antares_ops::views::retention::retain"
+function = "antares_ops::views::retention::overrides"
+lines = 7
+branches = 1
+reason = "2 lines and the branch: a read that fills MAX_OVERRIDES (10 000 Entities that rule themselves), which no test writes; the unit test without_every_entity_that_rules_itself_no_history_runs_by_type_or_tenant runs what follows from it in levels. 2 lines: the store failing to list the Entities with their own historyRetention, which the built-in store under test_kit does not (see antares_ops::views::inner); tests/pg_retention.rs in antares-sql runs the Postgres read itself. 3 lines: the tracing::warn! of an unreadable value repeats its fields in the `log` fallback, which runs only with no subscriber set; tests/retention.rs an_entity_off_loses_its_history_and_forever_holds_the_platform_back runs that path (T-4414)"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/views/retention.rs"
+function = "antares_ops::views::retention::steps"
+lines = 3
+branches = 1
+reason = "the store failing to list its Tenants for the platform default, which the built-in store under test_kit does not (see antares_ops::views::inner); the branch: a partial read of the Entities that rule themselves, see overrides above (T-4414)"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/views/retention.rs"
+function = "Runner::drain" # v0 mangling puts the impl between the crate and the type
 lines = 4
 branches = 0
 reason = "2 lines: a retention statement failing on the store, which the built-in store under test_kit does not (see antares_ops::views::inner); tests/pg_retention.rs in antares-sql runs the Postgres statements themselves. 2 lines: the tracing::info! of a spent budget repeats its field in the `log` fallback, which runs only with no subscriber set; tests/retention.rs a_sweep_past_its_budget_stops_and_the_next_goes_on runs the spent path (T-4084)"

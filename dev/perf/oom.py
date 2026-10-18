@@ -12,7 +12,12 @@ the same tenant, and SUBS subscriptions on that type whose receiver answers afte
 is in this process. Every second the container's memory is read from `docker stats`; the run
 fails when the container dies (OOMKilled) and prints the peak, the read p95 and the counts.
 
-Env: ENTITIES (10000), BATCH (100), FLOOD (20), SUBS (20), SLOW_S (2), READERS (4).
+Env: ENTITIES (10000), BATCH (100), FLOOD (20), SUBS (20), SLOW_S (2), READERS (4), FLOODERS (4,
+the upserts in flight at once), DISCOVERERS (0, clients asking the view for /types and
+/attributes with details, the whole-tenant fold that OOMKilled dev at start, T-4562).
+
+The broker's allocator settings matter to the result: run it with the image's
+`_RJEM_MALLOC_CONF` (Dockerfile) or the peak reads higher than dev's.
 """
 
 import json
@@ -36,6 +41,8 @@ FLOOD = float(os.environ.get("FLOOD", "20"))
 SUBS = int(os.environ.get("SUBS", "20"))
 SLOW_S = float(os.environ.get("SLOW_S", "2"))
 READERS = int(os.environ.get("READERS", "4"))
+FLOODERS = int(os.environ.get("FLOODERS", "4"))
+DISCOVERERS = int(os.environ.get("DISCOVERERS", "0"))
 TENANT = os.environ.get("TENANT", "oomrig")
 TYPE = "CityWork"
 SINK_PORT = 42079
@@ -87,7 +94,8 @@ def setup():
     view = {
         "id": TENANT, "tenant": TENANT, "selector": ["*"],
         "rules": [{"types": ["*"], "attributes": ["*"]}],
-        "operations": ["retrieve_entity", "query_entities", "query_entities_post"],
+        "operations": ["retrieve_entity", "query_entities", "query_entities_post", "retrieve_entity_types",
+                       "retrieve_entity_type_details", "retrieve_attributes", "retrieve_attribute_details"],
     }
     status, body = call("PUT", f"/q/views/{TENANT}", view)
     assert status in (201, 204), (status, body)
@@ -150,10 +158,18 @@ def main():
             upserts[0] += 1
             if status not in (201, 204):
                 failures[0] += 1
-            time.sleep(max(0.0, 4 / FLOOD - (time.monotonic() - t)))
+            time.sleep(max(0.0, FLOODERS / FLOOD - (time.monotonic() - t)))
+
+    def discoverer():
+        while time.monotonic() < stop:
+            for what in ("types", "attributes"):
+                status, _ = call("GET", f"/x/views/{TENANT}/ngsi-ld/v1/{what}?details=true", timeout=120)
+                if status != 200:
+                    failures[0] += 1
 
     threads = [threading.Thread(target=reader, daemon=True) for _ in range(READERS)]
-    threads += [threading.Thread(target=flooder, daemon=True) for _ in range(4)]
+    threads += [threading.Thread(target=discoverer, daemon=True) for _ in range(DISCOVERERS)]
+    threads += [threading.Thread(target=flooder, daemon=True) for _ in range(FLOODERS)]
     for t in threads:
         t.start()
     peak, died = 0.0, None

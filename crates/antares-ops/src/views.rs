@@ -50,9 +50,15 @@ pub const RELOAD_ENV: &str = "ANTARES_VIEWS_RELOAD_MS";
 /// bytes. No default: unset, the broker takes no schema (T-3628).
 pub const SCHEMA_MAX_ENV: &str = "ANTARES_SCHEMA_MAX_BYTES";
 
+/// The platform's history retention (DM-97): attribute instances of an
+/// Entity that no `historyRetention`, type rule or `*` rule of its Tenant
+/// covers are deleted once older than this duration (`P28D`). Unset keeps
+/// them.
+pub const HISTORY_DEFAULT_ENV: &str = "ANTARES_RETENTION_HISTORY_DEFAULT";
+
 /// Every variable the view table reads. The broker accepts these as config
 /// keys from here, so a new one is added in this crate alone (T-3766).
-pub const ENV_KEYS: &[&str] = &[RELOAD_ENV, SCHEMA_MAX_ENV];
+pub const ENV_KEYS: &[&str] = &[RELOAD_ENV, SCHEMA_MAX_ENV, HISTORY_DEFAULT_ENV];
 
 /// The largest view document `/q/views` accepts, in bytes.
 pub const MAX_VIEW_BYTES: usize = 64 * 1024;
@@ -501,6 +507,9 @@ struct Reloader {
     deleted: std::sync::Mutex<BTreeMap<(String, String, &'static str), u64>>,
     /// Every Tenant's `maxAge` quality rules, as the last reload found them.
     quality: std::sync::RwLock<Arc<quality::Rules>>,
+    /// The platform's history retention for what no Entity, type or Tenant
+    /// rules ([`HISTORY_DEFAULT_ENV`], DM-97); `None` keeps it.
+    platform_history: Option<std::time::Duration>,
 }
 
 /// One stored document of the view tenant and what the reloader made of it.
@@ -663,6 +672,15 @@ fn schema_max(raw: Option<String>) -> Result<Option<usize>, String> {
     }
 }
 
+/// [`HISTORY_DEFAULT_ENV`]: `None` unset; a value that is no duration is an
+/// error, so a typo never silently keeps or deletes everything.
+fn platform_history(raw: Option<String>) -> Result<Option<std::time::Duration>, String> {
+    raw.map(|raw| {
+        retention::parse_duration(raw.trim()).map_err(|e| format!("{HISTORY_DEFAULT_ENV}: {e}"))
+    })
+    .transpose()
+}
+
 /// Load the stored views into `state`'s table, serve `/q/views`,
 /// `/q/schemas` and `/q/policy` on its admin surface, and reload the table
 /// every [`RELOAD_ENV`] milliseconds. Call it once, after the policy engine
@@ -672,6 +690,19 @@ fn schema_max(raw: Option<String>) -> Result<Option<usize>, String> {
 /// # Errors
 /// The store's, or routes set already.
 pub async fn install(state: &AppState) -> Result<Reload, String> {
+    install_with(
+        state,
+        platform_history(std::env::var(HISTORY_DEFAULT_ENV).ok())?,
+    )
+    .await
+}
+
+/// [`install`] with the platform's history retention given, not read from
+/// [`HISTORY_DEFAULT_ENV`].
+pub(crate) async fn install_with(
+    state: &AppState,
+    platform_history: Option<std::time::Duration>,
+) -> Result<Reload, String> {
     let reloader = Arc::new(Reloader {
         state: state.clone(),
         cache: tokio::sync::Mutex::new(HashMap::new()),
@@ -681,6 +712,7 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
         retention: std::sync::RwLock::default(),
         deleted: std::sync::Mutex::default(),
         quality: std::sync::RwLock::default(),
+        platform_history,
     });
     reloader.reload().await?;
     // The routes live in the table the reloader fills; a strong handle there
@@ -1265,6 +1297,20 @@ mod tests {
         }
     }
 
+    /// DM-97: the platform default is a duration or unset; anything else stops the start.
+    #[test]
+    fn the_platform_history_is_a_duration_or_unset() {
+        assert_eq!(platform_history(None), Ok(None));
+        assert_eq!(
+            platform_history(Some(" P28D ".into())),
+            Ok(Some(std::time::Duration::from_hours(28 * 24)))
+        );
+        for bad in ["28", "forever", "PT30S"] {
+            let err = platform_history(Some(bad.into())).expect_err(bad);
+            assert!(err.starts_with(HISTORY_DEFAULT_ENV), "{err}");
+        }
+    }
+
     #[tokio::test]
     async fn without_a_bound_no_schema_is_taken_or_stored() {
         let r = Arc::new(Reloader {
@@ -1276,6 +1322,7 @@ mod tests {
             retention: std::sync::RwLock::default(),
             deleted: std::sync::Mutex::default(),
             quality: std::sync::RwLock::default(),
+            platform_history: None,
         });
         let put = put_schema(r.clone(), "city".into(), Bytes::from_static(b"{}")).await;
         assert_eq!(put.map(|p| p.status()), Ok(StatusCode::SERVICE_UNAVAILABLE));
@@ -1295,6 +1342,7 @@ mod tests {
             retention: std::sync::RwLock::default(),
             deleted: std::sync::Mutex::default(),
             quality: std::sync::RwLock::default(),
+            platform_history: None,
         };
         let fetched = || r.fetched.load(std::sync::atomic::Ordering::Relaxed);
         r.state.put_view_doc("v", base()).await.expect("view");

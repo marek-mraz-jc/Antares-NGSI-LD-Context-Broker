@@ -106,6 +106,16 @@ odata = ["views", "dep:antares-odata"]
 # `/x/views/{view}/ogc/features`, collections from the Tenant's LinkML schema
 # intersected with the view (`ANTARES_API_SURFACES=admin,views,ogc`).
 ogc = ["views", "dep:antares-ogc"]
+# OGC API - Features items as Apache Parquet and GeoParquet 1.1 (T-4465,
+# EP-119): `f=parquet` or `Accept: application/vnd.apache.parquet`, through
+# the optional antares-export crate; a build without it writes no file. Not
+# in `full`: `full` sits at its ADR-0027 size budget (vanilla + 10 MiB) and
+# Parquet with zstd crosses it; the platform image names it beside `full`.
+parquet = ["ogc", "antares-ogc/parquet"]
+# OGC API - Features items as CSV, and /collections as a ZIP bundle of a CSV
+# per collection (T-4477; no Excel, owner 2026-10-18): `f=csv|zip`. Beside `full`
+# for the same budget reason as `parquet`.
+tabular = ["ogc", "antares-ogc/tabular"]
 # `/x/views/{view}/sta/v1.1`, OGC SensorThings API v1.1 Sensing read only, from
 # the view's Query, Retrieve and temporal answers (T-4462,
 # `ANTARES_API_SURFACES=admin,views,sta`).
@@ -126,8 +136,9 @@ internal-csr = ["views", "dep:antares-icsr"]
 
 # Every surface the broker serves (ADR-0027 Consequences, T-3636): what
 # `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
-# sets it; the platform image builds `full,jc-policy,linkml` (image-jc.yml).
-full = ["views", "mcp", "odata", "ogc", "sta", "ical", "ws"]
+# sets it; the platform image builds `full,jc-policy,linkml,parquet,tabular,ical`
+# (image-jc.yml): those three sit beside `full`, which is at its ADR-0027 size budget.
+full = ["views", "mcp", "odata", "ogc", "sta", "ws"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
 # Unix-only: the wasm target keeps the default allocator.
@@ -146,6 +157,8 @@ rumqttc = { workspace = true }
 serde_json = { workspace = true }
 # the views differential (T-3777): generated views and policies
 proptest = { workspace = true }
+# the filter parity table reads the OGC Parquet file back (T-4465)
+parquet = { version = "60", default-features = false, features = ["zstd"] }
 
 [lints]
 workspace = true

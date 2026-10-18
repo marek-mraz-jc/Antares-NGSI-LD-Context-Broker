@@ -754,6 +754,17 @@ impl AnyStore {
         Ok(outcome)
     }
 
+    /// The Entity types of the Tenant's live Entities, sorted, read without
+    /// the documents (T-4610): the `types` column on Postgres, the held
+    /// documents' `type` on the memory arm.
+    pub async fn entity_type_names(&self, tenant: &TenantId) -> Result<Vec<String>, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.entity_type_names(tenant, &now_utc())),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.entities.type_names(tenant).await.map_err(db),
+        }
+    }
+
     /// Query Temporal Evolution with entity narrowing, instance-window
     /// pruning AND entity paging pushed down. Same
     /// contract: the API's window() is the arbiter; the memory arm returns
@@ -1516,6 +1527,9 @@ impl antares_store::CurrentStateDriver for AnyStore {
     ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
         AnyStore::query_entities(self, tenant, f).await
     }
+    async fn entity_type_names(&self, tenant: &TenantId) -> Result<Option<Vec<String>>, NgsiError> {
+        AnyStore::entity_type_names(self, tenant).await.map(Some)
+    }
     async fn mutate_boxed<'a>(
         &self,
         tenant: &TenantId,
@@ -1596,6 +1610,20 @@ impl antares_store::CurrentStateDriver for AnyStore {
     async fn tenant_ids(&self) -> Result<Vec<String>, NgsiError> {
         AnyStore::tenant_ids(self).await
     }
+    async fn history_overrides(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, Value)>, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.history_overrides(limit)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                crate::store::pg::maintenance::history_overrides(p.docs.pool(), limit)
+                    .await
+                    .map_err(db)
+            }
+        }
+    }
     async fn tenant_stats_one(
         &self,
         tenant: &TenantId,
@@ -1636,18 +1664,18 @@ impl antares_store::TemporalDriver for AnyStore {
     async fn retain_history(
         &self,
         tenant: &TenantId,
-        type_iri: &str,
+        scope: antares_store::HistoryScope<'_>,
         before: &str,
         batch: usize,
         dry_run: bool,
     ) -> Result<u64, NgsiError> {
         match self {
-            AnyStore::Mem(s) => Ok(s.retain_history(tenant, type_iri, before, batch, dry_run)),
+            AnyStore::Mem(s) => Ok(s.retain_history(tenant, scope, before, batch, dry_run)),
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => crate::store::pg::maintenance::retain_history(
                 p.docs.pool(),
                 tenant.as_str(),
-                type_iri,
+                scope,
                 before,
                 batch,
                 dry_run,

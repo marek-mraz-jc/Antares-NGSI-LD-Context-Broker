@@ -115,7 +115,11 @@ only add (`create_entity`, `create_subscription`, `batch_create`) say `false`.
 - **Results** are `structuredContent` under one key (`entity`,
   `entities`, ...) plus the same JSON as a text block. Descriptions and
   instructions are fixed strings; no stored value ever appears in one
-  (MC11).
+  (MC11). The instructions are the NGSI-LD primer (`antares_ql::PRIMER`,
+  T-4532): the API's standard, the order of work, the query language and
+  every tool argument, a test failing on an argument without its line.
+  The joinedcontext gateway's MCP hub sends the same text after its own
+  catalogue lines.
 - **Errors.** A failed operation is a tool result with `isError: true`,
   text `"{status} {title}"` and structured `{"error": {type, title,
   status}}`; the problem's `detail` stays inside (MC18). An operation the

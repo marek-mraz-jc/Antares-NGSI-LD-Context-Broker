@@ -26,6 +26,7 @@ members = [
     "crates/antares-linkml",
     "crates/antares-odata",
     "crates/antares-ogc",
+    "crates/antares-export",
     "crates/antares-sta",
     "crates/antares-ical",
     "crates/antares-ws",
@@ -66,6 +67,7 @@ antares-mcp = { path = "crates/antares-mcp" }
 antares-linkml = { path = "crates/antares-linkml" }
 antares-odata = { path = "crates/antares-odata" }
 antares-ogc = { path = "crates/antares-ogc" }
+antares-export = { path = "crates/antares-export" }
 antares-sta = { path = "crates/antares-sta" }
 antares-ical = { path = "crates/antares-ical" }
 antares-ws = { path = "crates/antares-ws" }

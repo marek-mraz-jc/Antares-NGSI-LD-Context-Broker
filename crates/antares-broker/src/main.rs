@@ -131,6 +131,8 @@ const KNOWN_KEYS: &[&str] = &[
     "ANTARES_DELIVERY_WIDTH_PER_TENANT",
     // Estimated heap every delivery lane may hold at once (T-4549).
     "ANTARES_DELIVERY_LANE_BYTES",
+    // Batch write bodies in flight at once, in bytes (T-4562).
+    "ANTARES_BATCH_INFLIGHT_BYTES",
     // 5.7.2.4 fan-out ceiling: how many matching registrations one
     // distributed operation may contact.
     "ANTARES_FED_FANOUT",
@@ -152,9 +154,15 @@ const SURFACE_KEYS: &[&[&str]] = &[
     // the view table's reload interval and LinkML schema bound
     #[cfg(feature = "views")]
     antares_ops::views::ENV_KEYS,
+    // the most views one read across views names (T-4494)
+    #[cfg(feature = "views")]
+    antares_views::ENV_KEYS,
     // hosts, origins, result budget, the confirmation key, tool endpoints
     #[cfg(feature = "mcp")]
     antares_mcp::ENV_KEYS,
+    // how many files the OGC surface writes at once
+    #[cfg(feature = "ogc")]
+    antares_ogc::ENV_KEYS,
     // the WebSocket channel's bounds (ADR-0026 rules 6 to 10)
     #[cfg(feature = "ws")]
     antares_ws::ENV_KEYS,
