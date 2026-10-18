@@ -350,6 +350,7 @@ version = "0.2.0"
 dependencies = [
  "antares-ops",
  "axum",
+ "futures-util",
  "http-body-util",
  "proptest",
  "serde_json",

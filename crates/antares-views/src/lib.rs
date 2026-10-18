@@ -42,6 +42,11 @@ use axum::response::Response;
 use axum::routing::any;
 use axum::Router;
 
+pub mod union;
+
+/// The variables this crate reads, for the broker's unknown-key check.
+pub const ENV_KEYS: &[&str] = &[union::MAX_VIEWS_ENV];
+
 /// Where the view root mounts.
 pub const PREFIX: &str = "/x/views";
 
@@ -113,13 +118,22 @@ impl Surface for Views {
     }
 
     fn router(&self, ops: Ops) -> Router {
-        Router::new().route(
-            "/{view}/ngsi-ld/v1/{*rest}",
-            any(move |caller: Caller, req: Request| {
-                let ops = ops.clone();
-                async move { serve(&ops, &caller, req).await }
-            }),
-        )
+        let union_ops = ops.clone();
+        Router::new()
+            .route(
+                union::ROUTE,
+                any(move |caller: Caller, req: Request| {
+                    let ops = union_ops.clone();
+                    async move { union::serve(&ops, &caller, req).await }
+                }),
+            )
+            .route(
+                "/{view}/ngsi-ld/v1/{*rest}",
+                any(move |caller: Caller, req: Request| {
+                    let ops = ops.clone();
+                    async move { serve(&ops, &caller, req).await }
+                }),
+            )
     }
 }
 
