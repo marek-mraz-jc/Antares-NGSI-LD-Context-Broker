@@ -180,6 +180,12 @@ One result's structured content is at most `ANTARES_MCP_MAX_RESULT_BYTES`
 - one item past the budget is a tool error naming `pick` or `attrs` (or
   `lastN` for history); nothing is ever cut (MC5).
 
+Every `unitCode` of a tool result that is a UN/CEFACT Recommendation 20
+common code gains `unit`, the symbol a person reads (`GQ` → `µg/m³`), or
+Rec 20's name for a unit with no symbol; a `unit` already there stays. The
+label is added before the budget is applied. The stored entity and the
+NGSI-LD answers keep the code alone.
+
 ## 5. Resources
 
 | URI | What |

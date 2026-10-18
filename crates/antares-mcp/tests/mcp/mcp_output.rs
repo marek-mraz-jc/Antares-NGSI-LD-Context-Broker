@@ -315,3 +315,25 @@ async fn one_history_past_the_budget_names_last_n() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// A Rec 20 `unitCode` is read back with the unit a person reads beside
+/// it, in the structured result and in its text; the code stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_unit_code_is_read_back_with_its_label() -> Result<(), String> {
+    let f = fixture().await?;
+    let a = call(
+        &f.app,
+        "cars",
+        "get_entity",
+        json!({"id": "urn:ngsi-ld:Car:1"}),
+    )
+    .await;
+    assert!(!a.is_error(), "{}", a.text);
+    let speed = a.structured().pointer("/entity/speed").cloned();
+    assert_eq!(
+        speed,
+        Some(json!({"type": "Property", "value": 10, "unitCode": "KMH", "unit": "km/h"}))
+    );
+    assert!(a.text.contains("km/h"), "{}", a.text);
+    Ok(())
+}

@@ -6,6 +6,7 @@ use crate::confirm;
 use crate::listen::{self, LIFETIME, MAX_URIS, SCHEME};
 use crate::schema::{self, Checked, Names};
 use crate::tools::{self, Built, ToolDef, TOOLS};
+use crate::units;
 use crate::{cursor, MAX_RESULT_BYTES_ENV};
 use antares_ops::{Caller, OperationId, OpsRequest, ViewOps};
 use axum::http::{header, HeaderValue, Method, StatusCode};
@@ -295,7 +296,7 @@ impl Server {
             _ => DEFAULT_LIMIT,
         };
         let counted = matches!(args.get("count"), Some(Checked::Flag(true)));
-        let answer = self
+        let mut answer = self
             .run(tool.op, tools::build(tool, &args, limit, offset))
             .await;
         // MC19: what was called and how it ended, never the arguments
@@ -309,6 +310,8 @@ impl Server {
         if !answer.status.is_success() {
             return failed(&answer);
         }
+        // before the budget, so a labelled page still fits it
+        units::name(&mut answer.body);
         if tool.write && answer.body.is_null() {
             // a write answered without a body: the id it made, if any
             let out = answer.created.map(|id| json!({ tool.key: id }));
