@@ -1725,6 +1725,73 @@ impl antares_store::TemporalDriver for AnyStore {
             AnyStore::Pg(p) => p.temporal.versions(tenant, entity_id).await.map_err(db),
         }
     }
+    async fn erase(
+        &self,
+        tenant: &TenantId,
+        entity_id: &str,
+        attrs: Option<&[String]>,
+        before: Option<&str>,
+    ) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(_) => {
+                let instant = |t: &str| {
+                    chrono::DateTime::parse_from_rfc3339(
+                        &antares_store::filter::canonical_datetime(t),
+                    )
+                    .ok()
+                };
+                // an instance goes when it was observed at or before the cut;
+                // a cut that is no DateTime erases nothing
+                let cut = before.map(instant);
+                let goes = |i: &Value| match cut {
+                    None => true,
+                    Some(cut) => {
+                        let at = i
+                            .get("observedAt")
+                            .and_then(Value::as_str)
+                            .and_then(instant);
+                        cut.zip(at).is_some_and(|(cut, at)| at <= cut)
+                    }
+                };
+                let erased = AnyStore::mutate(self, tenant, Kind::Temporal, entity_id, |doc| {
+                    let o = doc.as_object_mut().ok_or(())?;
+                    let mut n = 0u64;
+                    for (k, v) in o.iter_mut() {
+                        let named = attrs.is_none_or(|a| a.contains(k));
+                        let Some(list) = v.as_array_mut().filter(|_| named) else {
+                            continue;
+                        };
+                        if !list.iter().all(Value::is_object) {
+                            continue; // the Entity's own `type` list
+                        }
+                        let was = list.len();
+                        list.retain(|i| !goes(i));
+                        let gone = was.saturating_sub(list.len());
+                        n = n.saturating_add(u64::try_from(gone).unwrap_or(u64::MAX));
+                    }
+                    let emptied = o
+                        .values()
+                        .filter_map(Value::as_array)
+                        .all(|l| l.is_empty() || !l.iter().all(Value::is_object));
+                    Ok::<_, ()>((n, emptied))
+                })
+                .await?;
+                let Some(Ok((n, emptied))) = erased else {
+                    return Ok(0);
+                };
+                if attrs.is_none() && emptied {
+                    AnyStore::delete(self, tenant, Kind::Temporal, entity_id).await?;
+                }
+                Ok(n)
+            }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p
+                .temporal
+                .erase(tenant, entity_id, attrs, before)
+                .await
+                .map_err(db),
+        }
+    }
     async fn retain_history(
         &self,
         tenant: &TenantId,

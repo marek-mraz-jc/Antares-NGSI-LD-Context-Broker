@@ -83,6 +83,7 @@ pub(crate) mod entity_map;
 pub(crate) mod entity_maps;
 pub(crate) mod federation;
 // The request parsers for the fuzz targets (T-3463); never in a broker build.
+pub mod erasure;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 pub mod history;

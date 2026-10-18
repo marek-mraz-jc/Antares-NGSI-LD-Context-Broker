@@ -37,6 +37,7 @@ use std::sync::{Arc, Weak};
 
 mod preview;
 pub use preview::MAX_PREVIEW_LIMIT;
+pub mod erasure;
 pub mod quality;
 pub mod retention;
 pub mod rule_documents;
@@ -520,6 +521,8 @@ struct Held {
 }
 
 enum Made {
+    /// An erasure record (T-4665): kept, read by `erasure`, made into nothing.
+    Erasure,
     Retention(String),
     Quality(String),
     Schema(String, Option<Schema>),
@@ -528,7 +531,9 @@ enum Made {
 
 impl Held {
     fn new(id: &str, digest: u64, doc: Value) -> Self {
-        let made = if let Some(tenant) = id.strip_prefix(retention::RETENTION_ID_PREFIX) {
+        let made = if id.starts_with(erasure::ERASURE_ID_PREFIX) {
+            Made::Erasure
+        } else if let Some(tenant) = id.strip_prefix(retention::RETENTION_ID_PREFIX) {
             Made::Retention(tenant.to_owned())
         } else if let Some(tenant) = id.strip_prefix(quality::QUALITY_ID_PREFIX) {
             Made::Quality(tenant.to_owned())
@@ -596,7 +601,7 @@ impl Reloader {
                 Made::Schema(t, Some(schema)) => {
                     schemas.insert(t.clone(), schema.clone());
                 }
-                Made::Schema(_, None) => {}
+                Made::Erasure | Made::Schema(_, None) => {}
                 Made::View(e) => {
                     views.insert(id, (&held.doc, e));
                 }
@@ -715,6 +720,8 @@ pub(crate) async fn install_with(
         platform_history,
     });
     reloader.reload().await?;
+    // DM-127: what was erased before a restore is gone before this pod serves
+    erasure::reapply(&reloader).await;
     // The routes live in the table the reloader fills; a strong handle there
     // would keep the state alive through itself.
     state.views.set_admin(admin(&Arc::downgrade(&reloader)))?;
@@ -857,6 +864,7 @@ fn admin(r: &Weak<Reloader>) -> Router {
         .merge(preview::routes(r))
         .merge(rule_documents::routes(r))
         .merge(retention::routes(r))
+        .merge(erasure::routes(r))
         .merge(quality::routes(r))
 }
 

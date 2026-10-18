@@ -790,6 +790,54 @@ impl PgTemporalStore {
         Ok(n == 1)
     }
 
+    /// Erasure (T-4665, ADR-N-054 2.6): the rows of `attrs` of one Entity,
+    /// current and superseded, observed at or before `before` (`None`: all);
+    /// `attrs` `None` takes every Attribute, and the Entity's history itself
+    /// once it holds no row. How many rows went.
+    pub async fn erase(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+        attrs: Option<&[String]>,
+        before: Option<&str>,
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        let names = attrs.map(<[String]>::to_vec);
+        let mut n = 0u64;
+        for sql in [
+            "DELETE FROM attr_instances WHERE tenant_id = $1 AND entity_id = $2 \
+             AND ($3::text[] IS NULL OR attr_id = ANY($3)) \
+             AND ($4::timestamptz IS NULL OR observed_at <= $4::timestamptz)",
+            "DELETE FROM attr_versions WHERE tenant_id = $1 AND entity_id = $2 \
+             AND ($3::text[] IS NULL OR attr_id = ANY($3)) \
+             AND ($4::timestamptz IS NULL OR observed_at <= $4::timestamptz)",
+        ] {
+            let gone = sqlx::query(sql)
+                .bind(tenant.as_str())
+                .bind(id)
+                .bind(&names)
+                .bind(before)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            n = n.saturating_add(gone);
+        }
+        if attrs.is_none() {
+            sqlx::query(
+                "DELETE FROM temporal_entities t WHERE t.tenant_id = $1 AND t.id = $2 \
+                 AND NOT EXISTS (SELECT 1 FROM attr_instances a \
+                                 WHERE a.tenant_id = t.tenant_id AND a.entity_id = t.id)",
+            )
+            .bind(tenant.as_str())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(n)
+    }
+
     /// Every version of the rows of one Entity's history (T-4665, ADR-N-054
     /// 2.4) by Attribute: each instance with its `version` and `provenance`,
     /// a superseded one with `supersededAt`, oldest first per measurement.

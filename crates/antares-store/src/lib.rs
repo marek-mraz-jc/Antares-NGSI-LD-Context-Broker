@@ -1049,6 +1049,21 @@ pub trait TemporalDriver: Send + Sync {
         let _ = (tenant, entity_id);
         Ok(serde_json::Map::new())
     }
+    /// Erasure (T-4665, platform ADR-N-054 2.6): every row of `attrs` of one
+    /// Entity, the current version and every superseded one, observed at or
+    /// before `before` (a UTC DateTime; `None`: every row); `attrs` `None`
+    /// takes every Attribute, and the Entity's history itself once it holds
+    /// no row. Answers how many rows went; a driver without history has none.
+    async fn erase(
+        &self,
+        tenant: &TenantId,
+        entity_id: &str,
+        attrs: Option<&[String]>,
+        before: Option<&str>,
+    ) -> Result<u64, NgsiError> {
+        let _ = (tenant, entity_id, attrs, before);
+        Ok(0)
+    }
     /// Remove the whole history of one tenant; nothing to do without history.
     async fn purge_tenant(&self, tenant: &TenantId) -> Result<(), NgsiError> {
         let _ = tenant;

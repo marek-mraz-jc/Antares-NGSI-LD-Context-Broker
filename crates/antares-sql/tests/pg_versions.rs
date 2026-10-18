@@ -193,3 +193,36 @@ async fn a_deleted_instance_leaves_its_last_version() {
     assert_eq!((kept[0].0, &kept[0].1), (1, &json!(5.0)));
     clean(&pool, t.as_str()).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_retention_takes_the_superseded_versions_along() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let t = TenantId::new("pgversionsret").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    clean(&pool, t.as_str()).await;
+    let s = PgTemporalStore::new(pool.clone());
+    let id = "urn:ngsi-ld:Vehicle:v3";
+    ensure_entity(&pool, &t, id).await;
+    let shell = json!({"id": id, "type": "Vehicle"});
+    let at = "2026-10-18T09:00:00Z";
+    for (v, by) in [(1.0, "a"), (2.0, "b")] {
+        s.append(&t, id, &shell, &reading(v, at, by))
+            .await
+            .expect("append");
+    }
+    assert_eq!(chain(&pool, t.as_str(), at).await.len(), 2);
+    let gone = pg::maintenance::retain_history(
+        &pool,
+        t.as_str(),
+        antares_store::HistoryScope::Entity(id),
+        "2026-10-18T10:00:00Z",
+        100,
+        false,
+    )
+    .await
+    .expect("retain");
+    assert_eq!(gone, 2, "the current row and its superseded version");
+    assert!(chain(&pool, t.as_str(), at).await.is_empty());
+    clean(&pool, t.as_str()).await;
+}

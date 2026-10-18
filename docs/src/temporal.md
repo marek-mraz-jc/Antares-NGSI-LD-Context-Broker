@@ -31,6 +31,35 @@ The seed value `21.5` carried no `observedAt`, so it appears only under
 `timeproperty=modifiedAt` (below), never in the default `observedAt`
 history.
 
+### Versions, provenance and late values
+
+A history row is one measurement: an Attribute, its `datasetId` and its
+`observedAt` (platform ADR-N-054 2.1). Sending the same value again for the
+same instant stores nothing new. A different value for the same instant is
+a correction: on postgres and timescale the row becomes version 2 and
+version 1 is kept, with when it was superseded, in `attr_versions`. A
+revert to the old value is version 3, never a rewrite. The memory and file
+drivers keep the current version only.
+
+Each row carries its provenance: `channel` (`api`, `pipeline`, `ui`,
+`import`, `backfill`, `mqtt`), `actor`, `operation` (`create`, `update`,
+`correct`, `backfill`, `delete`), `reason` and `requestId`. The broker
+believes the `JC-Provenance-Channel`, `JC-Provenance-Actor`, `JC-Reason`
+(percent-encoded) and `X-Request-Id` headers only from the mesh identity
+`ANTARES_PROVENANCE_FROM` names in `l5d-client-id`; from anyone else a
+write is `channel: api` with no actor. A read never returns provenance as
+data, except through `versions=all` (below).
+
+With `ANTARES_HISTORY_BACKFILL=on`, a value whose `observedAt` is older
+than the current one's is a backfill: it goes into history with
+`operation: backfill` and leaves the current state untouched. Off (the
+default), it replaces the current value as NGSI-LD says.
+
+A type's retention rule may record history `onChange` instead of every
+write ([Retention](admin-api.md#retention)): a row only when the value
+moves past its `deadband` (numbers) or `minDistance` (metres, GeoProperty),
+when a value of the same instant is corrected, and once per `heartbeat`.
+
 ## Querying
 
 `timerel` is `before`, `after` or `between` around `timeAt` (and
@@ -145,6 +174,14 @@ typed value, `{"@type": "DateTime", "@value": "..."}`, or as a string with
 and a `Time` also has an `avg`, returned as a `Time`. A plain JSON string
 is ordered lexicographically and has no average.
 
+An Attribute its type records `onChange` holds each value until the next
+row. A window that opens after its last row carries that row in, so a
+chart starts at the level the Attribute held. `avg` weighs each value by
+the time it held inside the bucket, and `min` and `max` see the carried
+value. `sum` and `totalCount` answer `400` with a detail starting
+`aggregation-not-meaningful`: the rows left out repeat a value, they are
+not zeros.
+
 On postgres and timescale the aggregation runs in SQL when the query is
 exact there: no `q`, `geoQ` or `scopeQ`, the page pushed down, no `omit`,
 second-granular period, and only numeric or boolean values in the
@@ -152,6 +189,19 @@ window. Any other shape, and every query on the memory and file drivers,
 reconstructs the instances and aggregates in the broker. The result is
 the same; the SQL path was measured at 5.7 s → 0.59 s for 50 entities
 with 150k instances.
+
+A Tenant that records any type `onChange` aggregates in the broker.
+
+### Every version of a measurement
+
+`versions=all` on `GET /temporal/entities/{id}` replaces each instance with
+its chain, oldest first: every version carries `version` and `provenance`,
+and a superseded one `supersededAt`. `lastN` and the other page limits
+count measurements, then each brings all its versions. The broker answers
+it only when the request carries the gateway's mesh identity
+(`ANTARES_PROVENANCE_FROM`) and `JC-Read-Versions: true`, which the gateway
+sets once the space's Policy granted the caller `readVersions`; otherwise
+`403`. Any value other than `all` is a `400`.
 
 ### Pagination
 
