@@ -163,6 +163,12 @@ fn row_id(v: &Value) -> &str {
     v.get("id").and_then(Value::as_str).unwrap_or_default()
 }
 
+/// The bound on one size scan of a tenant (`GET /q/tenants/{tenant}`,
+/// T-2890): the history table runs to tens of GB, and a size is not worth a
+/// longer hold on a connection.
+#[cfg(feature = "postgres")]
+const SIZE_SCAN_TIMEOUT: &str = "SET LOCAL statement_timeout = '5s'";
+
 impl AnyStore {
     /// Readiness ping: can the store answer a trivial request
     /// RIGHT NOW? Memory/file are in-process (always ready); the Pg arm runs
@@ -1630,6 +1636,46 @@ impl antares_store::CurrentStateDriver for AnyStore {
     ) -> Result<Option<antares_store::TenantStats>, NgsiError> {
         AnyStore::tenant_stats_one(self, tenant).await
     }
+    async fn tenant_bytes(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<antares_store::TenantBytes, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.tenant_bytes(tenant)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                async {
+                    let mut tx = p.docs.pool().begin().await.map_err(db)?;
+                    crate::store::pg::set_tenant(&mut tx, tenant)
+                        .await
+                        .map_err(db)?;
+                    // a scan of the tenant: bounded, a slow one answers no size
+                    sqlx::query(SIZE_SCAN_TIMEOUT)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                    // the stored row, TOAST included, by the first type the
+                    // write recorded (T-2890)
+                    let rows: Vec<(String, i64)> = sqlx::query_as(
+                        "SELECT coalesce(types[1], ''), sum(pg_column_size(e.*))::bigint
+                           FROM entities e WHERE tenant_id = $1 GROUP BY 1",
+                    )
+                    .bind(tenant.as_str())
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                    let mut out = antares_store::TenantBytes::default();
+                    for (ty, n) in rows {
+                        let n = n.max(0) as u64;
+                        out.entities = out.entities.saturating_add(n);
+                        out.by_type.insert(ty, n);
+                    }
+                    Ok(out)
+                }
+                .await
+            }
+        }
+    }
     async fn purge_tenant(&self, tenant: &TenantId) -> Result<bool, NgsiError> {
         AnyStore::purge_tenant(self, tenant).await
     }
@@ -1705,6 +1751,34 @@ impl antares_store::TemporalDriver for AnyStore {
                     .await
                     .map_err(db)?;
                     Ok(n as u64)
+                }
+                .await
+            }
+        }
+    }
+    async fn attr_instance_bytes(&self, tenant: &TenantId) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.attr_instance_bytes(tenant)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                async {
+                    let mut tx = p.docs.pool().begin().await.map_err(db)?;
+                    crate::store::pg::set_tenant(&mut tx, tenant)
+                        .await
+                        .map_err(db)?;
+                    sqlx::query(SIZE_SCAN_TIMEOUT)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                    let n: i64 = sqlx::query_scalar(
+                        "SELECT coalesce(sum(pg_column_size(a.*)), 0)::bigint
+                           FROM attr_instances a WHERE tenant_id = $1",
+                    )
+                    .bind(tenant.as_str())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                    Ok(n.max(0) as u64)
                 }
                 .await
             }

@@ -724,3 +724,86 @@ async fn purge_goes_ahead_when_no_copy_lives_at_a_context_source() {
         "the purge took the Subscription with it"
     );
 }
+
+async fn put(st: &AppState, doc: Value, tenant: &str) {
+    let (s, b) = send(st, "POST", "/ngsi-ld/v1/entities", Some(doc), Some(tenant)).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+}
+
+/// T-2890: one tenant answers its size in bytes beside its counts, measured
+/// in the store by the Entity's first type, reused for a while (it is a scan)
+/// and measured afresh once a purge removed what it measured.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_tenant_answers_its_size_by_type_and_a_purge_measures_it_again() {
+    let st = state().await;
+    seed(&st, "sizea", "urn:ngsi-ld:Room:1").await;
+    put(&st, entity("urn:ngsi-ld:Room:2"), "sizea").await;
+    put(
+        &st,
+        json!({"id": "urn:ngsi-ld:Bridge:1", "type": ["Bridge", "Room"]}),
+        "sizea",
+    )
+    .await;
+    seed(&st, "sizeb", "urn:ngsi-ld:Room:3").await;
+
+    let (s, one) = send(&st, "GET", "/q/tenants/sizea", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{one}");
+    let bytes = &one["bytes"];
+    let by_type = bytes["byType"].as_object().expect("byType");
+    assert_eq!(by_type.len(), 2, "one key per first type: {one}");
+    let sum: u64 = by_type.values().filter_map(Value::as_u64).sum();
+    assert_eq!(
+        bytes["entities"].as_u64(),
+        Some(sum),
+        "the types sum to the whole: {one}"
+    );
+    let room = by_type
+        .iter()
+        .find(|(k, _)| k.ends_with("Room"))
+        .expect("Room")
+        .1;
+    let bridge = by_type
+        .iter()
+        .find(|(k, _)| k.ends_with("Bridge"))
+        .expect("Bridge")
+        .1;
+    assert!(
+        room.as_u64() > bridge.as_u64(),
+        "two Rooms outweigh one Bridge: {one}"
+    );
+    assert!(
+        bytes["attrInstances"].as_u64().is_some_and(|n| n > 0),
+        "{one}"
+    );
+
+    // a scan, so a second read within the TTL answers the measured size
+    put(&st, entity("urn:ngsi-ld:Room:4"), "sizea").await;
+    let (_, again) = send(&st, "GET", "/q/tenants/sizea", None, None).await;
+    assert_eq!(again["bytes"], *bytes, "reused within the TTL");
+    assert_eq!(
+        again["counts"]["entities"], 4,
+        "the counts are never cached: {again}"
+    );
+
+    // the other tenant is measured on its own rows
+    let (_, other) = send(&st, "GET", "/q/tenants/sizeb", None, None).await;
+    assert_eq!(
+        other["bytes"]["byType"].as_object().map(|m| m.len()),
+        Some(1),
+        "{other}"
+    );
+
+    let (s, _) = send(&st, "DELETE", "/q/tenants/sizea", None, None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    put(&st, entity("urn:ngsi-ld:Room:5"), "sizea").await;
+    let (_, after) = send(&st, "GET", "/q/tenants/sizea", None, None).await;
+    assert_eq!(
+        after["bytes"]["byType"].as_object().map(|m| m.len()),
+        Some(1),
+        "measured again: {after}"
+    );
+    assert!(
+        after["bytes"]["entities"].as_u64() < bytes["entities"].as_u64(),
+        "{after}"
+    );
+}

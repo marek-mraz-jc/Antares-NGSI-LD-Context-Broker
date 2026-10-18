@@ -858,3 +858,186 @@ async fn a_purge_waits_for_an_in_flight_write_in_the_same_tenant() {
         .await
         .expect("cleanup");
 }
+
+/// T-2890: a tenant's size is measured in its own rows, by the Entity's first
+/// type, so the types sum to the whole; history is measured apart, and
+/// another tenant's rows (RLS and the predicate both) never count.
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_bytes_are_the_tenants_own_rows_by_first_type() {
+    use antares_store::{CurrentStateDriver, Kind, TemporalDriver};
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let a = TenantId::new(&format!("pgsz{run}")).expect("tenant");
+    let b = TenantId::new(&format!("pgsz{run}x")).expect("tenant");
+    let doc = |id: &str, ty: serde_json::Value| {
+        serde_json::json!({
+            "id": id, "type": ty,
+            "createdAt": "2026-08-04T09:00:00Z", "modifiedAt": "2026-08-04T09:00:00Z",
+            "n": {"type": "Property", "value": 1, "observedAt": "2026-08-04T09:00:00Z"}
+        })
+    };
+    let empty = CurrentStateDriver::tenant_bytes(&store, &a)
+        .await
+        .expect("bytes");
+    assert_eq!(
+        empty,
+        antares_store::TenantBytes::default(),
+        "no rows, no bytes"
+    );
+    for t in [&a, &b] {
+        pg::ensure_tenant(&pool, t).await.expect("tenant row");
+    }
+    for (id, ty) in [
+        ("urn:x:1", serde_json::json!("Room")),
+        ("urn:x:2", serde_json::json!("Room")),
+        ("urn:x:3", serde_json::json!(["Bridge", "Room"])),
+    ] {
+        assert!(
+            CurrentStateDriver::create(&store, &a, Kind::Entity, id, doc(id, ty))
+                .await
+                .expect("create")
+        );
+    }
+    let big = serde_json::json!({"id": "urn:x:9", "type": "Room", "pad": {"type": "Property", "value": "x".repeat(4000)}});
+    CurrentStateDriver::create(&store, &b, Kind::Entity, "urn:x:9", big)
+        .await
+        .expect("create in b");
+    let size = CurrentStateDriver::tenant_bytes(&store, &a)
+        .await
+        .expect("bytes");
+    assert_eq!(
+        size.by_type.keys().collect::<Vec<_>>(),
+        ["Bridge", "Room"],
+        "{size:?}"
+    );
+    assert!(
+        size.by_type["Room"] > size.by_type["Bridge"],
+        "two rows outweigh one: {size:?}"
+    );
+    assert_eq!(
+        size.entities,
+        size.by_type.values().sum::<u64>(),
+        "{size:?}"
+    );
+    let other = CurrentStateDriver::tenant_bytes(&store, &b)
+        .await
+        .expect("bytes");
+    assert!(
+        other.entities > 0 && size.entities > 0,
+        "{size:?} {other:?}"
+    );
+    assert_eq!(other.by_type.len(), 1, "{other:?}");
+
+    assert_eq!(
+        TemporalDriver::attr_instance_bytes(&store, &a)
+            .await
+            .expect("n"),
+        0
+    );
+    TemporalDriver::create(
+        &store,
+        &a,
+        "urn:x:1",
+        doc("urn:x:1", serde_json::json!("Room")),
+    )
+    .await
+    .expect("temporal");
+    store
+        .temporal_append(
+            &a,
+            "urn:x:1",
+            &doc("urn:x:1", serde_json::json!("Room")),
+            &serde_json::json!({"n": [{"type": "Property", "value": 2,
+                "observedAt": "2026-08-04T09:01:00Z", "instanceId": "urn:i:1"}]}),
+        )
+        .await
+        .expect("append");
+    assert!(
+        TemporalDriver::attr_instance_bytes(&store, &a)
+            .await
+            .expect("n")
+            > 0
+    );
+    assert_eq!(
+        TemporalDriver::attr_instance_bytes(&store, &b)
+            .await
+            .expect("n"),
+        0
+    );
+    for t in [&a, &b] {
+        CurrentStateDriver::purge_tenant(&store, t)
+            .await
+            .expect("purge");
+        TemporalDriver::purge_tenant(&store, t)
+            .await
+            .expect("purge history");
+    }
+}
+
+/// T-2890: a size scan is bounded: held behind a lock (as behind a scan of a
+/// history table tens of GB long) it gives up within its statement timeout
+/// instead of holding the connection, and the caller answers without a size.
+/// The lock is taken in a database of the test's own, so the tests sharing
+/// the main one never wait on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_size_scan_gives_up_within_its_bound() {
+    use antares_store::{CurrentStateDriver, TemporalDriver};
+    let url = require_db!();
+    let admin = pg::connect(&url, 2).await.expect("connect+migrate");
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let name = format!("antares_szbound_{run}");
+    let create = format!("CREATE DATABASE {name}");
+    sqlx::query(sqlx::AssertSqlSafe(create))
+        .execute(&admin)
+        .await
+        .expect("own database");
+    let (base, _) = url.rsplit_once('/').expect("a database URL");
+    let pool = pg::connect(&format!("{base}/{name}"), 3)
+        .await
+        .expect("connect+migrate the own database");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let t = TenantId::new("pgszbound").expect("tenant");
+    for (table, lock) in [
+        ("entities", "LOCK TABLE entities IN ACCESS EXCLUSIVE MODE"),
+        (
+            "attr_instances",
+            "LOCK TABLE attr_instances IN ACCESS EXCLUSIVE MODE",
+        ),
+    ] {
+        let mut hold = pool.begin().await.expect("begin");
+        sqlx::query(lock).execute(&mut *hold).await.expect("lock");
+        let started = std::time::Instant::now();
+        let failed = if table == "entities" {
+            CurrentStateDriver::tenant_bytes(&store, &t).await.is_err()
+        } else {
+            TemporalDriver::attr_instance_bytes(&store, &t)
+                .await
+                .is_err()
+        };
+        hold.rollback().await.expect("release");
+        assert!(failed, "{table}: a scan behind the lock must give up");
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "{table}: {took:?}"
+        );
+    }
+    pool.close().await;
+    let drop = format!("DROP DATABASE {name}");
+    sqlx::query(sqlx::AssertSqlSafe(drop))
+        .execute(&admin)
+        .await
+        .expect("drop the own database");
+}
