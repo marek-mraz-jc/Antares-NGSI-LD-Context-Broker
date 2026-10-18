@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! `GeoJSON` geometries as ISO well-known binary, little-endian (OGC 06-103r4, as GeoParquet 1.1
 //! encodes `WKB`): the seven geometry types, two or three coordinates per position.
 

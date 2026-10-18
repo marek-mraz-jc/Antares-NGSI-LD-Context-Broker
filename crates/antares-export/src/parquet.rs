@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! Apache Parquet, and GeoParquet 1.1 when the Features carry a geometry (T-4465, EP-119).
 //!
 //! The file is written while the answer is paged: each page becomes one row group, zstd

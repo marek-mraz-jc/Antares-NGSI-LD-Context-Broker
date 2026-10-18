@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! A ZIP bundle of files (T-4477, EP-41, EP-43): one per collection and a README with the
 //! provenance, so a colleague can open the download without the platform. The members are
 //! counted against the ceiling as they go in, before compression and with their headers, so

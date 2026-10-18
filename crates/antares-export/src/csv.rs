@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! RFC 4180 CSV of one collection (T-4477, EP-08, EP-44): a header row, then one row per
 //! Feature, CRLF line ends, UTF-8 without a byte order mark (the gateway's CSV has none). The
 //! rows go into a buffer that refuses to grow past the ceiling, so a file past it is an error

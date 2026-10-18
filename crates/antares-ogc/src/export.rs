@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! Files (T-4465, T-4477, EP-119, EP-08, EP-41). `items` as one file: `f=parquet` (Apache
 //! Parquet, `GeoParquet` 1.1 with a geometry), `f=csv` or `f=xlsx`, or an `Accept` naming one,
 //! holds the whole answer of the request's own filters (bbox, datetime, CQL2 `filter`, the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! File encodings of an answer read page by page (T-4465, T-4477, EP-119, EP-08, EP-41). Each
 //! encoding sits behind its own feature and none depends on a surface: a surface hands over
 //! `GeoJSON` Features one page at a time with the columns its schema gives, the encoder writes

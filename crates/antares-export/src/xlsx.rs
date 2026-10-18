@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! Office Open XML workbooks (T-4477, EP-44, EP-45): one sheet per collection, named by it, its
 //! columns from that collection's schema, and a `provenance` sheet of what produced the file.
 //! Written by hand as the gateway did, because a grid of inline strings and numbers is the whole
