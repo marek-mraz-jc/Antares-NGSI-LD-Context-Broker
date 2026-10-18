@@ -1009,6 +1009,62 @@ async fn a_count_under_conditional_rules_reads_the_store_in_pages() {
     assert_eq!(spy.unpaged_queries(), 0, "the count read the store unpaged");
 }
 
+/// The next-page `Link` of a GET, announced only when one exists.
+async fn link(st: &AppState, uri: &str) -> Option<String> {
+    antares_api::router(st.clone())
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .headers()
+        .get_all("Link")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.contains("rel=\"next\""))
+        .map(str::to_owned)
+}
+
+/// T-4562: a page without count under conditional rules keeps only the
+/// client's window while it scans, never every match before it, and still
+/// answers the right ids and a next Link only when more match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_under_conditional_rules_keeps_only_its_window() {
+    let mut st = state(Filter {
+        rules: vec![Rule {
+            geo_q: Some(zone_a()),
+            ..rule("Car", &["speed"])
+        }],
+        ..Filter::default()
+    })
+    .await;
+    for i in 0..9 {
+        let x = if i % 2 == 0 { 0.5 } else { 5.0 };
+        create(
+            &st,
+            json!({"id": format!("urn:ngsi-ld:Car:{i}"), "type": "Car",
+                   "speed": prop(json!(i)), "location": point(x)}),
+        )
+        .await;
+    }
+    let spy = Arc::new(crate::common::Double::passthrough(st.store.clone()));
+    st.store = spy.clone();
+    let base = "/ngsi-ld/v1/entities?type=Car&q=speed%3E1&limit=2";
+    let first = format!("{base}&offset=1");
+    assert_eq!(
+        ids(&send(&st, "GET", &first, None).await.1),
+        ["urn:ngsi-ld:Car:4", "urn:ngsi-ld:Car:6"]
+    );
+    assert!(link(&st, &first).await.is_some(), "no next Link");
+    let last = format!("{base}&offset=3");
+    assert_eq!(
+        ids(&send(&st, "GET", &last, None).await.1),
+        ["urn:ngsi-ld:Car:8"]
+    );
+    assert_eq!(link(&st, &last).await, None);
+    let past = format!("{base}&offset=9");
+    assert!(ids(&send(&st, "GET", &past, None).await.1).is_empty());
+    assert_eq!(spy.unpaged_queries(), 0, "the page read the store unpaged");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn car_leaving_zone_a_loses_speed_on_next_read() {
     let st = state(zones()).await;

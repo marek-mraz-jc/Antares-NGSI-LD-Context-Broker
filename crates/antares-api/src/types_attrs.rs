@@ -43,21 +43,31 @@ impl Narrow<'_> {
     }
 }
 
-/// At most `max` of the entities the fold needs, plus whether more exist. The
-/// narrowing and the page are pushed into the datastore, so on a backend that
-/// takes them the ceiling bounds the rows MATERIALIZED and it bounds them over
-/// the narrowed set — a 5.7.7 request about one type reads that type, not the
-/// tenant. A backend that ignores them (`decided == false`) hands back its own
-/// row set, and the predicate above plus the truncation here reproduce the
-/// same answer. Asking for one row past `max` is what makes the overflow
+/// The entities a fold reads at once. A fold used to read all of them in one
+/// statement, up to the 100 000 of `ANTARES_DISCOVERY_SCAN_MAX`: a `/types`
+/// over a 25 000-entity tenant held every document at once and took the
+/// broker past its 1536 MiB limit within seconds of a start (T-4562). Page by
+/// page, a fold holds one page and the sets it folds into.
+const SCAN_PAGE: usize = 500;
+
+/// Hands `each` at most `max` of the entities the fold needs, as the caller's
+/// narrowing shows them, and answers whether more exist. The narrowing and
+/// the page are pushed into the datastore, so on a backend that takes them
+/// the ceiling bounds the rows READ and it bounds them over the narrowed set:
+/// a 5.7.7 request about one type reads that type, not the tenant. A backend
+/// that ignores the page (`paged == false`) hands back its own row set, and
+/// the predicate above plus the truncation here reproduce the same answer.
+/// Asking for one row past what is still wanted is what makes the overflow
 /// visible; `total`, when the backend reports it, is the exact pre-page count.
-async fn scan(
+async fn scan_each(
     st: &AppState,
     tenant: &antares_model::TenantId,
     max: usize,
     only: Narrow<'_>,
     view: View<'_>,
-) -> Result<(Vec<Value>, bool), NgsiError> {
+    page: usize,
+    mut each: impl FnMut(Value),
+) -> Result<bool, NgsiError> {
     let groups: Vec<Vec<String>> = match only {
         Narrow::Type(t) => vec![vec![t.to_owned()]],
         _ => Vec::new(),
@@ -66,41 +76,82 @@ async fn scan(
         Narrow::Attr(a) => vec![a.to_owned()],
         _ => Vec::new(),
     };
-    let f = EntityFilter {
-        types: (!groups.is_empty()).then_some(&groups[..]),
-        attrs: (!attrs.is_empty()).then_some(&attrs[..]),
-        page: Some(Page {
-            offset: 0,
-            limit: max.saturating_add(1).min(i64::MAX as usize) as i64,
-            count: false,
-        }),
-        ..Default::default()
-    };
-    let out = st.store.query_entities(tenant, &f).await?;
-    let mut rows = out.rows;
-    if !out.decided {
-        rows.retain(|d| only.matches(d));
-    }
-    let more = out.total.map_or(rows.len() > max, |t| {
-        t > i64::try_from(max).unwrap_or(i64::MAX)
-    });
-    rows.truncate(max);
-    // ADR-0023 rule 5: discovery answers from what the narrowing selects
-    // ponytail: the ceiling counts rows before the narrowing, so a narrowed
-    // fold can stop short of `max` visible rows; push q into the filter if
-    // that shows up
-    if let Some((r, ctx)) = view {
-        let mut kept = Vec::with_capacity(rows.len());
-        for d in rows {
-            if hides_a_type(r, &d)
-                || !crate::repr::policy_admits(st, tenant, ctx, r.policy_reach.as_deref(), &d).await
-            {
-                continue;
+    let mut offset = 0usize;
+    loop {
+        let want = max.saturating_sub(offset).min(page.max(1));
+        let f = EntityFilter {
+            types: (!groups.is_empty()).then_some(&groups[..]),
+            attrs: (!attrs.is_empty()).then_some(&attrs[..]),
+            page: Some(Page {
+                offset: i64::try_from(offset).unwrap_or(i64::MAX),
+                limit: i64::try_from(want.saturating_add(1)).unwrap_or(i64::MAX),
+                count: false,
+            }),
+            ..Default::default()
+        };
+        let out = st.store.query_entities(tenant, &f).await?;
+        let mut rows = out.rows;
+        let more = if out.paged {
+            rows.len() > want
+        } else {
+            // the whole (narrowed) set came back at once: the ceiling is cut here
+            if !out.decided {
+                rows.retain(|d| only.matches(d));
             }
-            kept.push(crate::repr::policy_view(&d, r));
+            let more = out.total.map_or(rows.len() > max, |t| {
+                t > i64::try_from(max).unwrap_or(i64::MAX)
+            });
+            rows.truncate(max);
+            visible(st, tenant, view, rows, &mut each).await;
+            return Ok(more);
+        };
+        rows.truncate(want);
+        offset = offset.saturating_add(rows.len());
+        visible(st, tenant, view, rows, &mut each).await;
+        if !more || want == 0 {
+            return Ok(more);
         }
-        rows = kept;
+        if offset >= max {
+            return Ok(true);
+        }
     }
+}
+
+/// ADR-0023 rule 5: discovery answers from what the narrowing selects.
+/// ponytail: the ceiling counts rows before the narrowing, so a narrowed fold
+/// can stop short of `max` visible rows; push q into the filter if that shows up
+async fn visible(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    view: View<'_>,
+    rows: Vec<Value>,
+    each: &mut impl FnMut(Value),
+) {
+    let Some((r, ctx)) = view else {
+        rows.into_iter().for_each(each);
+        return;
+    };
+    for d in rows {
+        if hides_a_type(r, &d)
+            || !crate::repr::policy_admits(st, tenant, ctx, r.policy_reach.as_deref(), &d).await
+        {
+            continue;
+        }
+        each(crate::repr::policy_view(&d, r));
+    }
+}
+
+/// The rows of [`scan_each`] collected, for the tests that look at them.
+#[cfg(test)]
+async fn scan(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    max: usize,
+    only: Narrow<'_>,
+    view: View<'_>,
+) -> Result<(Vec<Value>, bool), NgsiError> {
+    let mut rows = Vec::new();
+    let more = scan_each(st, tenant, max, only, view, 2, |d| rows.push(d)).await?;
     Ok((rows, more))
 }
 
@@ -163,8 +214,7 @@ async fn type_stats(
     view: View<'_>,
 ) -> Result<(TypeStats, bool), NgsiError> {
     let mut map: TypeStats = BTreeMap::new();
-    let (rows, partial) = scan(st, tenant, max, only, view).await?;
-    for doc in rows {
+    let partial = scan_each(st, tenant, max, only, view, SCAN_PAGE, |doc| {
         let mut attrs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         if let Some(o) = doc.as_object() {
             for (k, v) in o {
@@ -199,7 +249,8 @@ async fn type_stats(
                 }
             }
         }
-    }
+    })
+    .await?;
     Ok((map, partial))
 }
 
@@ -215,8 +266,7 @@ async fn attr_stats(
     view: View<'_>,
 ) -> Result<(AttrStats, bool), NgsiError> {
     let mut map: AttrStats = BTreeMap::new();
-    let (rows, partial) = scan(st, tenant, max, only, view).await?;
-    for doc in rows {
+    let partial = scan_each(st, tenant, max, only, view, SCAN_PAGE, |doc| {
         let etypes: Vec<String> = doc
             .get("type")
             .and_then(Value::as_array)
@@ -246,7 +296,8 @@ async fn attr_stats(
                 e.2.extend(etypes.iter().cloned());
             }
         }
-    }
+    })
+    .await?;
     Ok((map, partial))
 }
 

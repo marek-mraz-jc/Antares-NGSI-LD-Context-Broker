@@ -102,7 +102,7 @@ impl From<crate::policy::Denied> for ApiError {
 /// acquire timeout before answering, so a retry sooner than that walks into
 /// the same wall; one second past it is the first moment the queue can have
 /// moved.
-const RETRY_AFTER_SECONDS: u64 = 6;
+pub(crate) const RETRY_AFTER_SECONDS: u64 = 6;
 
 impl From<NgsiError> for ApiError {
     fn from(e: NgsiError) -> Self {
