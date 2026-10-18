@@ -276,10 +276,21 @@ async fn type_names(
     let Some(view) = view else {
         return Ok(Some((names, false)));
     };
+    let mut beside = Vec::new();
+    for rule in rules_of(view) {
+        beside.push(match rule.types.is_empty() {
+            true => None,
+            false => st
+                .store
+                .entity_types_beside(tenant, &rule.types)
+                .await?
+                .map(|t| t.into_iter().collect::<BTreeSet<String>>()),
+        });
+    }
     let mut shown = Vec::new();
     let mut partial = false;
     for name in names {
-        match first_visible(st, tenant, max, &name, view).await? {
+        match first_visible(st, tenant, max, &name, view, &beside).await? {
             Probe::Seen => shown.push(name),
             Probe::None => {}
             Probe::Cut => partial = true,
@@ -295,46 +306,64 @@ enum Probe {
     Cut,
 }
 
+/// The rules a probe follows: a linked term never holds (ADR-0023 rule 11),
+/// so a rule with one shows nothing and is not probed.
+fn rules_of<'a>(
+    view: (&'a crate::repr::Repr, &antares_jsonld::Context),
+) -> impl Iterator<Item = &'a crate::policy::Rule> {
+    view.0
+        .policy_types
+        .as_deref()
+        .map_or(&[][..], |f| &f.rules[..])
+        .iter()
+        .filter(|r| r.q.as_deref().is_none_or(|q| !q.has_linked_paths()))
+}
+
 /// Whether the caller sees an Entity of `name`. Each rule of the narrowing
-/// is one probe: `name` beside a type the rule names, the rule's `q` pushed
-/// down, so a type no rule shows reads nothing and a condition few Entities
-/// meet reads those few. A narrowing without rules is one probe of `name`.
-/// [`visible`] still judges every Entity a probe reads.
+/// is one probe, the rule's `q` pushed down, so a condition few Entities meet
+/// reads those few. A rule naming `name` probes `name` alone; a
+/// rule naming other types probes `name` beside each of them, and only when
+/// `beside` (per rule, from the store) says an Entity carries both: on
+/// Postgres such a two-type group with no match walked the Tenant's whole
+/// primary key for its `ORDER BY id LIMIT` (T-4683, 17 s for `list_types`).
+/// A narrowing without rules is one probe of `name`. [`visible`] still judges
+/// every Entity a probe reads.
 async fn first_visible(
     st: &AppState,
     tenant: &antares_model::TenantId,
     max: usize,
     name: &str,
     view: (&crate::repr::Repr, &antares_jsonld::Context),
+    beside: &[Option<BTreeSet<String>>],
 ) -> Result<Probe, NgsiError> {
-    let rules = view
+    let alone = || vec![vec![name.to_owned()]];
+    let mut probes: Vec<(Vec<Vec<String>>, Option<&antares_ql::QNode>)> = Vec::new();
+    for (i, r) in rules_of(view).enumerate() {
+        let groups = if r.types.iter().any(|t| t == name) {
+            alone()
+        } else if r.types.is_empty()
+            || beside
+                .get(i)
+                .and_then(Option::as_ref)
+                .is_some_and(|b| !b.contains(name))
+        {
+            continue;
+        } else {
+            r.types
+                .iter()
+                .map(|t| vec![name.to_owned(), t.clone()])
+                .collect()
+        };
+        probes.push((groups, r.q.as_deref()));
+    }
+    if view
         .0
         .policy_types
         .as_deref()
-        .map_or(&[][..], |f| &f.rules[..]);
-    let probes: Vec<(Vec<Vec<String>>, Option<&antares_ql::QNode>)> = if rules.is_empty() {
-        vec![(vec![vec![name.to_owned()]], None)]
-    } else {
-        rules
-            .iter()
-            // a linked term never holds (ADR-0023 rule 11): the rule shows nothing
-            .filter(|r| r.q.as_deref().is_none_or(|q| !q.has_linked_paths()))
-            .map(|r| {
-                let groups = r
-                    .types
-                    .iter()
-                    .map(|t| {
-                        let mut group = vec![name.to_owned()];
-                        if t != name {
-                            group.push(t.clone());
-                        }
-                        group
-                    })
-                    .collect();
-                (groups, r.q.as_deref())
-            })
-            .collect()
-    };
+        .is_none_or(|f| f.rules.is_empty())
+    {
+        probes.push((alone(), None));
+    }
     let mut cut = false;
     for (groups, q) in &probes {
         match probe(st, tenant, max, name, groups, *q, view).await? {

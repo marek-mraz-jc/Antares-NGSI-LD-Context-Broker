@@ -541,6 +541,28 @@ impl Store {
     /// over the held documents, none of them cloned. 4.22: an expired Entity
     /// carries no type.
     pub fn entity_type_names(&self, tenant: &TenantId, now: &str) -> Vec<String> {
+        self.entity_types_where(tenant, now, |_| true)
+    }
+
+    /// The types of the live Entities that carry one of `any_of`, sorted
+    /// (T-4683).
+    pub fn entity_types_beside(
+        &self,
+        tenant: &TenantId,
+        any_of: &[String],
+        now: &str,
+    ) -> Vec<String> {
+        self.entity_types_where(tenant, now, |types| {
+            types.iter().any(|t| any_of.iter().any(|a| a == t))
+        })
+    }
+
+    fn entity_types_where(
+        &self,
+        tenant: &TenantId,
+        now: &str,
+        keep: impl Fn(&[&str]) -> bool,
+    ) -> Vec<String> {
         let inner = self
             .inner
             .read()
@@ -548,12 +570,13 @@ impl Store {
         let mut names = std::collections::BTreeSet::new();
         if let Some(m) = Self::map(&inner, Kind::Entity).get(tenant.as_str()) {
             for doc in m.values().filter(|d| !filter::expired_at(d, now)) {
-                match &doc["type"] {
-                    Value::String(t) => {
-                        names.insert(t.as_str());
-                    }
-                    Value::Array(a) => names.extend(a.iter().filter_map(Value::as_str)),
-                    _ => {}
+                let types: Vec<&str> = match &doc["type"] {
+                    Value::String(t) => vec![t.as_str()],
+                    Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+                    _ => Vec::new(),
+                };
+                if keep(&types) {
+                    names.extend(types);
                 }
             }
         }

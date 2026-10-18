@@ -125,6 +125,7 @@ mod tenant_purge_large;
 mod tenants_admin;
 mod throttling_5_2_12;
 mod type_selector_context_5_6_6;
+mod types_list_pg;
 mod types_list_without_bodies;
 mod write_race_5_6;
 

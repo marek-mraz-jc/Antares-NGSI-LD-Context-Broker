@@ -371,22 +371,62 @@ impl PgEntityStore {
         Ok(row.map(|r| r.get::<Value, _>(0)))
     }
 
-    /// The types the Tenant's live Entities carry, sorted (T-4610). The
-    /// statement reads the `types` column and never an `entity` document, so
-    /// `/types` over a Tenant of any size costs one index-sized pass.
+    /// The types the Tenant's live Entities carry, sorted (T-4610): the
+    /// names from the type catalogue the writes keep (migration 0012,
+    /// T-4683), each kept while the types index finds a live Entity of it.
+    /// No `entity` document and no pass over the Tenant's rows.
     pub async fn type_names(&self, tenant: &TenantId) -> Result<Vec<String>, sqlx::Error> {
+        self.catalogued(tenant, None).await
+    }
+
+    /// The catalogued types a live Entity carries, beside one of `any_of`
+    /// when given. 4.22: expired rows are invalid context until the sweep
+    /// reaps them.
+    async fn catalogued(
+        &self,
+        tenant: &TenantId,
+        any_of: Option<&[String]>,
+    ) -> Result<Vec<String>, sqlx::Error> {
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
-        // 4.22: expired rows are invalid context until the sweep reaps them
-        let names = sqlx::query_scalar(
-            "SELECT DISTINCT t FROM entities, unnest(types) AS t WHERE tenant_id = $1
-               AND (expires_at IS NULL OR expires_at > now()) ORDER BY t",
-        )
-        .bind(tenant.as_str())
-        .fetch_all(&mut *tx)
-        .await?;
+        // the overlap is its own statement, so the types index serves it
+        const ALL: &str = "SELECT c.type FROM entity_types c WHERE c.tenant_id = $1
+               AND EXISTS (SELECT 1 FROM entities e WHERE e.tenant_id = c.tenant_id
+                 AND e.types @> ARRAY[c.type]
+                 AND (e.expires_at IS NULL OR e.expires_at > now()))
+             ORDER BY c.type";
+        const BESIDE: &str = "SELECT c.type FROM entity_types c WHERE c.tenant_id = $1
+               AND EXISTS (SELECT 1 FROM entities e WHERE e.tenant_id = c.tenant_id
+                 AND e.types @> ARRAY[c.type] AND e.types && $2
+                 AND (e.expires_at IS NULL OR e.expires_at > now()))
+             ORDER BY c.type";
+        let names = match any_of {
+            None => {
+                sqlx::query_scalar(ALL)
+                    .bind(tenant.as_str())
+                    .fetch_all(&mut *tx)
+                    .await?
+            }
+            Some(of) => {
+                sqlx::query_scalar(BESIDE)
+                    .bind(tenant.as_str())
+                    .bind(super::storable(of))
+                    .fetch_all(&mut *tx)
+                    .await?
+            }
+        };
         tx.commit().await?;
         Ok(names)
+    }
+
+    /// The types of the Tenant's live Entities that carry one of `any_of`,
+    /// sorted (T-4683): one probe of the types index per catalogued type.
+    pub async fn types_beside(
+        &self,
+        tenant: &TenantId,
+        any_of: &[String],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        self.catalogued(tenant, Some(any_of)).await
     }
 
     /// Several Entities in one transaction (T-4085): one per id that exists,

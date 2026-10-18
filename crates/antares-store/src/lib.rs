@@ -545,6 +545,18 @@ pub trait CurrentStateDriver: Send + Sync {
         let _ = tenant;
         Ok(None)
     }
+    /// The types the Tenant's live Entities carry when they also carry one
+    /// of `any_of`, sorted (T-4683): a view's rule names its types, and a
+    /// type the rule does not name is shown only on an Entity of both. `None`
+    /// when the backend has no such read, and the caller probes every type.
+    async fn entity_types_beside(
+        &self,
+        tenant: &TenantId,
+        any_of: &[String],
+    ) -> Result<Option<Vec<String>>, NgsiError> {
+        let _ = (tenant, any_of);
+        Ok(None)
+    }
     /// Read-modify-write under the row lock; `None` = absent (never an
     /// insert), `Some(Err)` = the closure rejected, nothing committed.
     async fn mutate_boxed<'a>(

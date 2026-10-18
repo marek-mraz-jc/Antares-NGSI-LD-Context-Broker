@@ -771,6 +771,20 @@ impl AnyStore {
         }
     }
 
+    /// The types of the Tenant's live Entities that carry one of `any_of`,
+    /// sorted (T-4683): the types index on Postgres, one pass in memory.
+    pub async fn entity_types_beside(
+        &self,
+        tenant: &TenantId,
+        any_of: &[String],
+    ) -> Result<Vec<String>, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.entity_types_beside(tenant, any_of, &now_utc())),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.entities.types_beside(tenant, any_of).await.map_err(db),
+        }
+    }
+
     /// Query Temporal Evolution with entity narrowing, instance-window
     /// pruning AND entity paging pushed down. Same
     /// contract: the API's window() is the arbiter; the memory arm returns
@@ -1197,6 +1211,7 @@ impl AnyStore {
                         "dist_subs",
                         "dead_letters",
                         "views",
+                        "entity_types",
                         // ADR-0021: `tenant_id` is GENERATED from the row's kind
                         // and owner, so a Cached row's is NULL and this DELETE
                         // takes only what the Tenant stored itself.
@@ -1535,6 +1550,15 @@ impl antares_store::CurrentStateDriver for AnyStore {
     }
     async fn entity_type_names(&self, tenant: &TenantId) -> Result<Option<Vec<String>>, NgsiError> {
         AnyStore::entity_type_names(self, tenant).await.map(Some)
+    }
+    async fn entity_types_beside(
+        &self,
+        tenant: &TenantId,
+        any_of: &[String],
+    ) -> Result<Option<Vec<String>>, NgsiError> {
+        AnyStore::entity_types_beside(self, tenant, any_of)
+            .await
+            .map(Some)
     }
     async fn mutate_boxed<'a>(
         &self,
