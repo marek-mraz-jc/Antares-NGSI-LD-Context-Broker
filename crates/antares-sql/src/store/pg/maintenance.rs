@@ -570,10 +570,12 @@ pub async fn history_overrides(
 /// (DM-97): rows deleted from a partition that keeps one free nothing, as new
 /// writes land in the current week. One transaction locks the parent, and
 /// with it every partition, `ACCESS EXCLUSIVE` within a 2 s `lock_timeout`
-/// and checks each candidate empty under that lock, so a late write into the
-/// week either committed before (the partition stays) or waits and lands in
-/// DEFAULT once the week is gone; a lock not had in time leaves it all for
-/// the next tick. Nothing to drop takes no lock.
+/// and checks the candidates empty under that lock in one statement held to
+/// a 2 s `statement_timeout`, so a late write into the week either committed
+/// before (the partition stays) or waits and lands in DEFAULT once the week
+/// is gone, and no history read or write waits longer than both bounds; a
+/// lock not had in time, or a check that a week of dead rows slows past its
+/// bound, leaves it all for the next tick. Nothing to drop takes no lock.
 async fn drop_emptied_partitions(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     const OLD_PARTITIONS: &str = r"SELECT c.relname
          FROM pg_inherits i
@@ -613,21 +615,30 @@ async fn drop_emptied_partitions(pool: &PgPool) -> Result<Vec<String>, sqlx::Err
     sqlx::query("SET LOCAL lock_timeout = '2s'")
         .execute(&mut *tx)
         .await?;
+    sqlx::query("SET LOCAL statement_timeout = '2s'")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("LOCK TABLE public.attr_instances IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *tx)
         .await?;
-    for (name, quoted) in empty {
-        let still: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT NOT EXISTS (SELECT 1 FROM {quoted})"
-        )))
-        .fetch_one(&mut *tx)
+    // The candidates by position, so no name is spelled into the statement twice.
+    let still_sql = empty
+        .iter()
+        .enumerate()
+        .map(|(i, (_, quoted))| format!("SELECT {i} WHERE NOT EXISTS (SELECT 1 FROM {quoted})"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let still: Vec<i32> = sqlx::query_scalar(sqlx::AssertSqlSafe(still_sql))
+        .fetch_all(&mut *tx)
         .await?;
-        if still {
-            sqlx::query(sqlx::AssertSqlSafe(drop_partition_sql(&name)))
-                .execute(&mut *tx)
-                .await?;
-            done.push(format!("dropped emptied partition {name}"));
-        }
+    for (name, _) in still
+        .into_iter()
+        .filter_map(|i| usize::try_from(i).ok().and_then(|i| empty.get(i)))
+    {
+        sqlx::query(sqlx::AssertSqlSafe(drop_partition_sql(name)))
+            .execute(&mut *tx)
+            .await?;
+        done.push(format!("dropped emptied partition {name}"));
     }
     tx.commit().await?;
     Ok(done)

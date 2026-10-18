@@ -329,21 +329,32 @@ struct Step {
 }
 
 /// The Entities with a valid `historyRetention` of their own, by Tenant,
-/// with the cut each keeps; one that is not a duration nor `off` is logged
-/// and left to its type's rule.
+/// with the cut each keeps, and whether that is all of them; one that is not
+/// a duration nor `off` is logged and left to its type's rule.
 async fn overrides(
     state: &AppState,
     now: chrono::DateTime<chrono::Utc>,
-) -> std::collections::BTreeMap<String, Vec<(String, String)>> {
+    cap: usize,
+) -> (
+    std::collections::BTreeMap<String, Vec<(String, String)>>,
+    bool,
+) {
     let mut out: std::collections::BTreeMap<String, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
-    let found = match state.store.history_overrides(MAX_OVERRIDES).await {
+    let found = match state.store.history_overrides(cap).await {
         Ok(found) => found,
         Err(e) => {
             tracing::warn!(error = %e, "retention: entities with their own historyRetention not read");
-            return out;
+            return (out, false);
         }
     };
+    let whole = found.len() < cap;
+    if !whole {
+        tracing::warn!(
+            cap,
+            "retention: more entities carry their own historyRetention than one sweep reads; only their own retention runs"
+        );
+    }
     for (tenant, id, own) in found {
         let before = match antares_api::history::retention_of(&own) {
             Ok(antares_api::history::OwnRetention::Off) => OFF_CUT.to_owned(),
@@ -360,7 +371,7 @@ async fn overrides(
         };
         out.entry(tenant).or_default().push((id, before));
     }
-    out
+    (out, whole)
 }
 
 /// The instant `keep` before `now`, as the store compares it.
@@ -375,9 +386,32 @@ fn cut(now: chrono::DateTime<chrono::Utc>, keep: Duration) -> String {
 
 /// The steps of `plan`, level by level (DM-97): the Entities' own retention,
 /// then each type's rule, then the Tenant's `*` rule or the platform default
-/// for the rest of every Tenant.
+/// for the rest of every Tenant. History by type or by Tenant runs only when
+/// every Entity that rules itself is known, as one left out of the exceptions
+/// would lose what it asked to keep longer.
 async fn steps(state: &AppState, plan: &Plan<'_>) -> Vec<Step> {
-    let own = overrides(state, plan.now).await;
+    let (own, whole) = overrides(state, plan.now, MAX_OVERRIDES).await;
+    // ponytail: every Tenant in name order each sweep, the budget the bound;
+    // rotate the start once a deployment's Tenants outgrow one sweep.
+    let tenants = if plan.platform.is_some() && !plan.dry_run && whole {
+        state.store.tenant_ids().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "retention: tenants not listed; the platform default waits");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+    levels(plan, &own, whole, &tenants)
+}
+
+/// [`steps`] once the Entities that rule themselves (`own`, all of them when
+/// `whole`) and the Tenants the platform default reaches are read.
+fn levels(
+    plan: &Plan<'_>,
+    own: &std::collections::BTreeMap<String, Vec<(String, String)>>,
+    whole: bool,
+    tenants: &[String],
+) -> Vec<Step> {
     let own_ids = |t: &str| -> Vec<String> {
         own.get(t)
             .into_iter()
@@ -417,6 +451,9 @@ async fn steps(state: &AppState, plan: &Plan<'_>) -> Vec<Step> {
                 let job = Job::Current(rule.type_iri.clone());
                 out.push(step(t, &rule.type_iri, job, cut(plan.now, keep)));
             }
+            if !whole {
+                continue;
+            }
             let before = match (rule.history_off, rule.history) {
                 (true, _) => OFF_CUT.to_owned(),
                 (false, Some(keep)) => cut(plan.now, keep),
@@ -428,24 +465,18 @@ async fn steps(state: &AppState, plan: &Plan<'_>) -> Vec<Step> {
             };
             out.push(step(t, &rule.type_iri, job, before));
         }
-        out.extend(rest(plan, t, list, except_ids));
+        if whole {
+            out.extend(rest(plan, t, list, except_ids));
+        }
     }
     // The platform default reaches every other Tenant too.
-    // ponytail: every Tenant in name order each sweep, the budget the bound;
-    // rotate the start once a deployment's Tenants outgrow one sweep.
-    if plan.platform.is_some() && !plan.dry_run {
-        let tenants = state.store.tenant_ids().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "retention: tenants not listed; the platform default waits");
-            Vec::new()
-        });
-        let others = tenants
-            .iter()
-            .filter(|t| !ruled.contains(*t))
-            .filter_map(|t| TenantId::new(t).ok());
-        for t in others {
-            let except_ids = own_ids(t.as_str());
-            out.extend(rest(plan, &t, &[], except_ids));
-        }
+    let others = tenants
+        .iter()
+        .filter(|t| whole && !ruled.contains(*t))
+        .filter_map(|t| TenantId::new(t).ok());
+    for t in others {
+        let except_ids = own_ids(t.as_str());
+        out.extend(rest(plan, &t, &[], except_ids));
     }
     out
 }
@@ -839,5 +870,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("city", 1)]
         );
+    }
+
+    /// T-4414: a read of the Entities that rule themselves that fills the
+    /// cap, or fails, may leave one out of the exceptions, so only their own
+    /// steps and current state run.
+    #[test]
+    fn without_every_entity_that_rules_itself_no_history_runs_by_type_or_tenant() {
+        let t = TenantId::new("city").unwrap_or_else(|e| panic!("{e:?}"));
+        let rules = vec![(
+            t,
+            parse(br#"{"rules":[{"type":"https://e.org/V","current":"P1D","history":"P30D"},{"type":"*","history":"P7D"}]}"#)
+                .unwrap_or_default(),
+        )];
+        let plan = Plan {
+            rules: &rules,
+            platform: Some(Duration::from_hours(24)),
+            now: chrono::Utc::now(),
+            dry_run: false,
+            entities: true,
+        };
+        let own = std::collections::BTreeMap::from([(
+            "city".to_owned(),
+            vec![(
+                "urn:ngsi-ld:V:1".to_owned(),
+                "2025-01-01T00:00:00.000Z".to_owned(),
+            )],
+        )]);
+        let jobs = |whole, tenants: &[String]| {
+            levels(&plan, &own, whole, tenants)
+                .into_iter()
+                .map(|s| match s.job {
+                    Job::Current(_) => "current",
+                    Job::Entity(_) => "entity",
+                    Job::Type { .. } => "type",
+                    Job::Rest { .. } => "rest",
+                })
+                .collect::<Vec<_>>()
+        };
+        let port = ["port".to_owned()];
+        assert_eq!(
+            jobs(true, &port),
+            ["entity", "current", "type", "rest", "rest"]
+        );
+        assert_eq!(jobs(false, &port), ["entity", "current"]);
     }
 }
