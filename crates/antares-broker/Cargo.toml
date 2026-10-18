@@ -106,7 +106,9 @@ odata = ["views", "dep:antares-odata"]
 ogc = ["views", "dep:antares-ogc"]
 # OGC API - Features items as Apache Parquet and GeoParquet 1.1 (T-4465,
 # EP-119): `f=parquet` or `Accept: application/vnd.apache.parquet`, through
-# the optional antares-export crate; a build without it writes no file.
+# the optional antares-export crate; a build without it writes no file. Not
+# in `full`: `full` sits at its ADR-0027 size budget (vanilla + 10 MiB) and
+# Parquet with zstd crosses it; the platform image names it beside `full`.
 parquet = ["ogc", "antares-ogc/parquet"]
 
 # The WebSocket notification channel (ADR-0026, T-3517): `/x/ws/ngsi-ld/v1`
@@ -121,8 +123,8 @@ internal-csr = ["views", "dep:antares-icsr"]
 
 # Every surface the broker serves (ADR-0027 Consequences, T-3636): what
 # `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
-# sets it; the platform image builds `full,jc-policy,linkml` (image-jc.yml).
-full = ["views", "mcp", "odata", "ogc", "parquet", "ws"]
+# sets it; the platform image builds `full,jc-policy,linkml,parquet` (image-jc.yml).
+full = ["views", "mcp", "odata", "ogc", "ws"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
 # Unix-only: the wasm target keeps the default allocator.

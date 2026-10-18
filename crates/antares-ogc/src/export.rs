@@ -184,11 +184,10 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "parquet"))]
     #[test]
-    fn without_the_feature_nothing_asks_for_a_file() {
+    fn f_asks_for_a_file_only_in_a_build_that_writes_it() {
         let asked_for = asked(&HeaderMap::new(), pairs(&[("f", "parquet")]));
-        assert!(!asked_for.file);
-        assert_eq!(asked_for.pairs, pairs(&[("f", "parquet")]));
+        assert_eq!(asked_for.file, ENCODINGS.contains(&"parquet"));
+        assert_eq!(asked_for.pairs.is_empty(), asked_for.file);
     }
 }
