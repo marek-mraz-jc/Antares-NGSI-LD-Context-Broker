@@ -487,11 +487,30 @@ pub async fn record_temporal_change(
         };
         let Some(av) = after.get(&k) else { continue };
         // gate 1, value-change: an unchanged instance produces no event
+        let types: Vec<&str> = match after.get("type") {
+            Some(Value::String(t)) => vec![t.as_str()],
+            Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        let operation = if op == TemporalOp::AttrCreated {
+            "create"
+        } else {
+            "update"
+        };
         for mut inst in changed_instances(before.and_then(|b| b.get(&k)), av) {
+            if !crate::history::admits_change(st, tenant, &types, id, &k, &inst) {
+                continue;
+            }
             if let Some(o) = inst.as_object_mut() {
                 let iid = instance_id(id, &k, &*o);
                 o.entry("instanceId".to_owned())
                     .or_insert_with(|| Value::String(iid));
+                // Who wrote it, for the store's column (T-4665); a store
+                // takes it out before it keeps the instance.
+                o.insert(
+                    antares_store::PROVENANCE_KEY.to_owned(),
+                    crate::history::provenance(operation),
+                );
             }
             crate::history::push(st, event(op, &k, inst)).await;
         }

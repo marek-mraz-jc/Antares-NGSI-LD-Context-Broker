@@ -834,7 +834,13 @@ impl AnyStore {
                     let target = doc.as_object_mut().ok_or(())?;
                     if let Some(adds) = additions.as_object() {
                         for (k, v) in adds {
-                            let incoming: Vec<Value> = v.as_array().cloned().unwrap_or_default();
+                            let mut incoming: Vec<Value> =
+                                v.as_array().cloned().unwrap_or_default();
+                            // ponytail: the memory store keeps no provenance and no
+                            // versions (T-4665); Postgres does.
+                            incoming.iter_mut().for_each(|i| {
+                                antares_store::take_provenance(i);
+                            });
                             match target.get_mut(k).and_then(Value::as_array_mut) {
                                 // same instanceId = the same instance corrected
                                 // (the pg arm's ON CONFLICT DO UPDATE)
@@ -1801,6 +1807,7 @@ impl antares_store::TemporalDriver for AnyStore {
                     // attr_instances tenant-predicate check reads literals
                     for sql in [
                         "DELETE FROM attr_instances WHERE tenant_id = $1",
+                        "DELETE FROM attr_versions WHERE tenant_id = $1",
                         "DELETE FROM temporal_entities WHERE tenant_id = $1",
                     ] {
                         sqlx::query(sql)
@@ -1892,7 +1899,17 @@ impl antares_store::TemporalDriver for AnyStore {
         id: &str,
         f: antares_store::MutateFn<'a>,
     ) -> Result<Option<Result<(), ()>>, NgsiError> {
-        AnyStore::mutate(self, tenant, Kind::Temporal, id, f).await
+        // Postgres takes the provenance into its column in decompose; the
+        // memory store keeps none, so neither arm answers it as data.
+        let keeps_none = matches!(self, AnyStore::Mem(_));
+        AnyStore::mutate(self, tenant, Kind::Temporal, id, move |doc: &mut Value| {
+            let done = f(doc);
+            if keeps_none {
+                antares_store::strip_provenance(doc);
+            }
+            done
+        })
+        .await
     }
 }
 

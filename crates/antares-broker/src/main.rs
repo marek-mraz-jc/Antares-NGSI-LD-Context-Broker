@@ -949,6 +949,9 @@ async fn run(
         .as_deref()
         .unwrap_or("all")
         .parse()?;
+    state.provenance_from = std::env::var("ANTARES_PROVENANCE_FROM")
+        .ok()
+        .filter(|g| !g.trim().is_empty());
     // The surfaces mounted beside the NGSI-LD API root, from configuration
     // rather than from a hard-wired list: the selection replaces what the
     // default mounting put there, before the state is shared.

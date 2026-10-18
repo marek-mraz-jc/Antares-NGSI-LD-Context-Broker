@@ -937,6 +937,28 @@ pub fn fold_appends(evs: &[TemporalEvent]) -> Option<Vec<(&TenantId, &str, &Valu
     Some(out)
 }
 
+/// The member an attribute instance carries its write's provenance in from
+/// the API to the temporal store (T-4665, platform ADR-N-054 2.3): `channel`,
+/// `actor`, `operation`, `reason`, `requestId`. A store takes it out of the
+/// instance before it keeps the instance, whoever put it there, so no read
+/// ever answers it as data; a JSON-LD keyword is never an attribute member.
+pub const PROVENANCE_KEY: &str = "@provenance";
+
+/// Takes [`PROVENANCE_KEY`] out of an instance, returning what it held.
+pub fn take_provenance(instance: &mut Value) -> Option<Value> {
+    instance.as_object_mut()?.remove(PROVENANCE_KEY)
+}
+
+/// Takes [`PROVENANCE_KEY`] out of every instance of a temporal document:
+/// what a store that keeps no provenance does before it keeps the document.
+pub fn strip_provenance(doc: &mut Value) {
+    for instances in doc.as_object_mut().into_iter().flat_map(|d| d.values_mut()) {
+        for instance in instances.as_array_mut().into_iter().flatten() {
+            take_provenance(instance);
+        }
+    }
+}
+
 /// The expanded name of the Property an Entity carries its own history
 /// retention in (DM-97, ADR-N-046 2.3): a duration or `off`, the most
 /// specific level, beside `expiresAt`, which ends the Entity itself.

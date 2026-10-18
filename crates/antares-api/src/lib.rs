@@ -91,6 +91,7 @@ pub mod negotiate;
 pub mod notify;
 pub(crate) mod paging;
 pub mod policy;
+pub mod provenance;
 pub(crate) mod registry;
 pub(crate) mod repr;
 pub mod secret;
@@ -118,7 +119,7 @@ pub use contexts::public_base;
 pub use federation::{
     AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport, NotifyFuture,
 };
-pub use state::{AppState, HistoryRules, TemporalRecord};
+pub use state::{AppState, HistoryRules, OnChange, Recording, TemporalRecord};
 
 /// Spawn for both targets — tokio natively, the JS microtask queue on
 /// wasm32 (no tokio runtime exists in a browser). Call sites are identical;
