@@ -2052,4 +2052,72 @@ mod tests {
             "a policy refusal stays 403"
         );
     }
+
+    /// T-4455, T-4078: the gateway's read of a space with no selector names every type the
+    /// space holds. Through a view of those 21 types whose engine grants 9 it is one request:
+    /// the granted types' Entities, counted and paged by one cursor, and nothing of a type the
+    /// engine does not grant, neither in the count nor in any page.
+    #[tokio::test]
+    async fn every_type_of_a_space_is_read_through_a_view_in_one_request() {
+        let types: Vec<String> = (0..21).map(|i| format!("T{i:02}")).collect();
+        let engine = Filter {
+            rules: types
+                .iter()
+                .take(9)
+                .map(|t| rule(&[t.as_str()], None, &["value"]))
+                .collect(),
+            ..Filter::default()
+        };
+        let st = seeded(Some(engine)).await;
+        for t in &types {
+            for n in 0..2 {
+                let doc = json!({"id": format!("urn:ngsi-ld:{t}:{n}"), "type": t,
+                    "value": {"type": "Property", "value": n},
+                    "hidden": {"type": "Property", "value": n}});
+                let (s, b, _) = send(&st, "POST", "/ngsi-ld/v1/entities", Some(doc)).await;
+                assert_eq!(s, StatusCode::CREATED, "{s} {b}");
+            }
+        }
+        let rules = (0..300)
+            .map(|i| rule(&[types[i % types.len()].as_str()], None, &["value"]))
+            .collect();
+        let view = st.with_view(Arc::new(
+            CompiledView::new(&types, None, None, None, rules).expect("view"),
+        ));
+        let next_of = |h: &axum::http::HeaderMap| {
+            h.get_all("Link")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(", <"))
+                .find(|l| l.contains("rel=\"next\""))
+                .and_then(|l| l.trim_start_matches('<').split_once('>'))
+                .map(|(target, _)| target.to_owned())
+        };
+        let mut next = Some(format!(
+            "/ngsi-ld/v1/entities?type={}&count=true&limit=5",
+            types.join(",")
+        ));
+        let (mut seen, mut pages) = (Vec::new(), 0);
+        while let Some(path) = next {
+            let (s, body, headers) = send(&view, "GET", &path, None).await;
+            assert_eq!(s, StatusCode::OK, "{path}: {body}");
+            if pages == 0 {
+                assert_eq!(headers["NGSILD-Results-Count"], "18", "9 types, 2 each");
+            }
+            for entity in body.as_array().expect("an array") {
+                assert!(entity.get("hidden").is_none(), "{entity}");
+            }
+            seen.extend(ids(&body));
+            next = next_of(&headers);
+            pages += 1;
+        }
+        assert_eq!(pages, 4, "18 Entities in pages of 5");
+        seen.sort();
+        let want: Vec<String> = types
+            .iter()
+            .take(9)
+            .flat_map(|t| (0..2).map(move |n| format!("urn:ngsi-ld:{t}:{n}")))
+            .collect();
+        assert_eq!(seen, want, "each granted Entity once, no other");
+    }
 }

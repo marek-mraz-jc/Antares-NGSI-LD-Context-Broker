@@ -66,11 +66,24 @@ pub fn decide(
         .filter(|p| p.clauses.contains(op.clause))
         .collect();
     let types = entity_types(op);
+    let prohibited = |types: &[String]| {
+        applying
+            .iter()
+            .any(|p| p.prohibit && covers_types(p, types))
+    };
+    // A read that names types is decided per type, as a read of each alone would be (T-4455):
+    // a type a prohibition covers is left out and the others are read. Any other operation,
+    // and a read naming no type, is refused whole.
+    let per_type = FILTERABLE.contains(&op.clause) && !types.is_empty();
+    let (types, refused): (Vec<String>, Vec<String>) = if per_type {
+        types
+            .into_iter()
+            .partition(|t| !prohibited(std::slice::from_ref(t)))
+    } else {
+        (types, Vec::new())
+    };
     // GW6: a refusal names no policy, so a caller cannot map the rules
-    if applying
-        .iter()
-        .any(|p| p.prohibit && covers_types(p, &types))
-    {
+    if (per_type && types.is_empty()) || (!per_type && prohibited(&types)) {
         return Decision::Deny(PROHIBITED.into());
     }
     let grants: Vec<&Policy> = applying.into_iter().filter(|p| !p.prohibit).collect();
@@ -78,7 +91,7 @@ pub fn decide(
         return Decision::Deny(NOT_GRANTED.into());
     }
     if FILTERABLE.contains(&op.clause) {
-        read(&grants, op, &types, platform)
+        read(&grants, op, (&types, &refused), platform)
     } else if WHOLE_TENANT.contains(&op.clause) {
         if grants.iter().any(|p| unconditional_whole(p)) {
             Decision::Allow
@@ -208,9 +221,16 @@ fn names(table: &Table, caller: &Platform, now: DateTime<Utc>) -> Decision {
     })
 }
 
-/// A read: one rule per selector of every grant (ADR-0023 rule 11).
-fn read(grants: &[&Policy], op: &Operation<'_>, types: &[String], caller: &Platform) -> Decision {
-    if grants.iter().any(|p| unconditional_whole(p)) {
+/// A read: one rule per selector of every grant (ADR-0023 rule 11), none of which shows a type
+/// of `refused`, the requested types a prohibition covers (T-4455).
+fn read(
+    grants: &[&Policy],
+    op: &Operation<'_>,
+    (types, refused): (&[String], &[String]),
+    caller: &Platform,
+) -> Decision {
+    // With a type left out, a whole grant is a rule per type read, never the whole Tenant.
+    if refused.is_empty() && grants.iter().any(|p| unconditional_whole(p)) {
         return Decision::Allow;
     }
     let mut rules: Vec<Rule> = Vec::new();
@@ -226,6 +246,16 @@ fn read(grants: &[&Policy], op: &Operation<'_>, types: &[String], caller: &Platf
             }));
         } else {
             rules.extend(p.selectors.iter().cloned());
+        }
+    }
+    if !refused.is_empty() {
+        for rule in &mut rules {
+            rule.types.retain(|t| !refused.contains(t));
+        }
+        rules.retain(|rule| !rule.types.is_empty());
+        if rules.is_empty() {
+            // No rule at all would show everything; one naming no type holds for nothing.
+            rules.push(Rule::default());
         }
     }
     Decision::Filter(Filter {
@@ -525,6 +555,64 @@ mod tests {
             with(&cars, "5.7.2", &[iri("Bus")], &[], None, false),
             Decision::Deny(NOT_GRANTED.into()),
             "another type is not prohibited, nor granted"
+        );
+        Ok(())
+    }
+
+    /// T-4455: a read naming several types is decided per type. The prohibited type is left
+    /// out of every rule and of the warning and the other is read; refused whole only when
+    /// every type it names is prohibited. A write naming a prohibited type is still refused.
+    #[test]
+    fn a_read_of_several_types_leaves_out_the_prohibited_one() -> Result<(), String> {
+        let prohibit_bus = json!({"id": "no-bus", "assignee": {"kind": "role", "id": "r"},
+            "effect": "prohibit", "operations": ["5.7.2", "5.6.1"],
+            "information": [{"entities": [{"type": "Bus"}]}]});
+        let both = [iri("Car"), iri("Bus")];
+        let selected = compile(&json!({"policies": [
+            {"id": "read", "assignee": {"kind": "role", "id": "r"},
+             "operations": ["5.7.2", "5.6.1"],
+             "information": [{"entities": [{"type": "Car"}, {"type": "Bus"}]}]},
+            prohibit_bus.clone()]}))?;
+        let whole = compile(&json!({"policies": [
+            {"id": "read", "assignee": {"kind": "role", "id": "r"},
+             "operations": ["5.7.2", "5.6.1"], "information": []},
+            prohibit_bus]}))?;
+        for t in [&selected, &whole] {
+            let Decision::Filter(f) = with(t, "5.7.2", &both, &[], None, false) else {
+                return Err("a read of Car and Bus reads Car".into());
+            };
+            let shown: Vec<&String> = f.rules.iter().flat_map(|r| &r.types).collect();
+            assert_eq!(shown, [&iri("Car")], "no rule shows Bus");
+            assert!(f.rules.iter().all(|r| r.every_attribute));
+            assert!(f.warning.is_none(), "the refusal names nothing");
+            assert_eq!(
+                with(t, "5.7.2", &[iri("Bus")], &[], None, false),
+                Decision::Deny(PROHIBITED.into())
+            );
+            assert_eq!(
+                with(t, "5.6.1", &both, &[], None, false),
+                Decision::Deny(PROHIBITED.into()),
+                "a write is refused whole"
+            );
+        }
+        assert_eq!(
+            with(&whole, "5.7.2", &car(), &[], None, false),
+            Decision::Allow,
+            "nothing left out: the whole grant"
+        );
+        // a grant of Bus alone, read with Car beside it: no rule shows anything
+        let bus_only = compile(&json!({"policies": [
+            {"id": "read", "assignee": {"kind": "role", "id": "r"}, "operations": ["5.7.2"],
+             "information": [{"entities": [{"type": "Bus"}]}]},
+            {"id": "no-bus", "assignee": {"kind": "role", "id": "r"}, "effect": "prohibit",
+             "operations": ["5.7.2"], "information": [{"entities": [{"type": "Bus"}]}]}]}))?;
+        let Decision::Filter(f) = with(&bus_only, "5.7.2", &both, &[], None, false) else {
+            return Err("a read of Car and Bus is narrowed".into());
+        };
+        assert_eq!(
+            f.rules,
+            vec![Rule::default()],
+            "a rule that holds for nothing"
         );
         Ok(())
     }
