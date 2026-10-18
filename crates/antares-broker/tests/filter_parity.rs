@@ -11,14 +11,18 @@
 //! datetime), `antares_mcp::tools::build` (`query_entities` arguments) and the NGSI-LD root
 //! itself. A surface added without a column here is a review finding.
 //!
+//! It lives in the broker's tests because a surface crate may dev-depend on no other surface
+//! (module rule surface-dev); it runs with the `ogc`, `odata` and `mcp` features (`full`).
+//!
 //! Beside the table: a filter on the attribute the view hides is the unknown name it is on every
 //! surface (no row passes through it), and a malformed filter is a 400, never a 500.
 
-use antares_ops::test_kit::TestBroker;
+#![cfg(all(feature = "ogc", feature = "odata", feature = "mcp"))]
+
+use antares_api::AppState;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
-use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use std::fmt::Write as _;
 use tower::ServiceExt;
@@ -290,11 +294,9 @@ async fn send(
         .oneshot(req.body(Body::from(body.to_owned())).unwrap_or_default())
         .await;
     let status = resp.status();
-    let bytes = resp
-        .into_body()
-        .collect()
+    let bytes = resp.into_body();
+    let bytes = axum::body::to_bytes(bytes, usize::MAX)
         .await
-        .map(http_body_util::Collected::to_bytes)
         .unwrap_or_default();
     (
         status,
@@ -318,15 +320,26 @@ fn ids_at(body: &Value, list: &str) -> Vec<String> {
     )
 }
 
-async fn broker() -> Result<(TestBroker, Router), String> {
+/// The broker over the built-in store with the four surfaces the table asks mounted, as
+/// `surfaces_equivalence` builds it; the view table's reload handle lives as long as the router.
+async fn broker() -> Result<(antares_ops::views::Reload, Router), String> {
     std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
-    let broker = TestBroker::new().await?;
-    let app = broker.serve_mounted(vec![
+    let mut state = AppState::new("filter-parity".into());
+    antares_api::wire(&mut state).await;
+    let surfaces: Vec<Box<dyn antares_api::ApiSurface>> = vec![
+        Box::new(antares_api::Admin),
+        antares_ops::mount(antares_views::Views),
         antares_ops::mount(antares_odata::OData),
         antares_ops::mount(antares_ogc::Ogc),
         antares_ops::mount(antares_mcp::Mcp),
-        antares_ops::mount(antares_views::Views),
-    ])?;
+    ];
+    let state = state
+        .with_surfaces(surfaces)
+        .map_err(|e| format!("the surfaces mount: {e:?}"))?;
+    let broker = antares_ops::views::install(&state)
+        .await
+        .map_err(|e| format!("the view table: {e:?}"))?;
+    let app = antares_api::router(state);
     let view = json!({
         "id": VIEW, "tenant": "city", "selector": ["Vehicle"],
         "rules": [{"types": ["Vehicle"], "attributes": ["vehicleType", "speed", "fuelType", "name", "dateObserved", "location"]}],

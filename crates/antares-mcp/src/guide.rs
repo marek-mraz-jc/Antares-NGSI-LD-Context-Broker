@@ -301,12 +301,22 @@ mod tests {
     }
 
     #[test]
+    fn half_a_range_is_an_instant_and_a_type_without_filters_says_none() -> Result<(), String> {
+        let event =
+            text(&names(&["Event"], &["startDate", "location"]), saturday()).ok_or("a guide")?;
+        assert!(event.contains("time startDate (an instant)"), "{event}");
+        let poi = text(&names(&["PointOfInterest"], &["location"]), saturday()).ok_or("a guide")?;
+        assert!(poi.contains("PointOfInterest: no time axis."), "{poi}");
+        assert!(!poi.contains("Filter on"), "{poi}");
+        assert!(shows(&Names::every(), "anything"));
+        Ok(())
+    }
+
+    #[test]
     fn a_hidden_attribute_is_never_named_and_an_unknown_type_has_no_line() -> Result<(), String> {
         let guide = text(&names(&["Event", "Thing"], &["name"]), saturday()).ok_or("a guide")?;
-        assert!(
-            !guide.contains("startDate") && !guide.contains("location"),
-            "{guide}"
-        );
+        assert!(!guide.contains("startDate"), "{guide}");
+        assert!(!guide.contains("location"), "{guide}");
         assert!(guide.contains("Event: no time axis."), "{guide}");
         assert!(!guide.contains("Thing"), "{guide}");
         assert_eq!(text(&names(&["Thing"], &["name"]), saturday()), None);
