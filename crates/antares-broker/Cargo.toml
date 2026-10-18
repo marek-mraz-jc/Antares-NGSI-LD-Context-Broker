@@ -56,6 +56,7 @@ antares-linkml = { workspace = true, optional = true }
 antares-odata = { workspace = true, optional = true }
 antares-ogc = { workspace = true, optional = true }
 antares-sta = { workspace = true, optional = true }
+antares-ical = { workspace = true, optional = true }
 antares-ws = { workspace = true, optional = true }
 antares-icsr = { workspace = true, optional = true }
 
@@ -109,6 +110,9 @@ ogc = ["views", "dep:antares-ogc"]
 # the view's Query, Retrieve and temporal answers (T-4462,
 # `ANTARES_API_SURFACES=admin,views,sta`).
 sta = ["views", "dep:antares-sta"]
+# `/x/views/{view}/ical/v1/events.ics`, the view's SDM Events as an iCalendar
+# (RFC 5545) feed, read only (T-4487, `ANTARES_API_SURFACES=admin,views,ical`).
+ical = ["views", "dep:antares-ical"]
 
 # The WebSocket notification channel (ADR-0026, T-3517): `/x/ws/ngsi-ld/v1`
 # (`ANTARES_API_SURFACES=...,ws`), and with `views` also
@@ -123,7 +127,7 @@ internal-csr = ["views", "dep:antares-icsr"]
 # Every surface the broker serves (ADR-0027 Consequences, T-3636): what
 # `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
 # sets it; the platform image builds `full,jc-policy,linkml` (image-jc.yml).
-full = ["views", "mcp", "odata", "ogc", "sta", "ws"]
+full = ["views", "mcp", "odata", "ogc", "sta", "ical", "ws"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).
 # Unix-only: the wasm target keeps the default allocator.

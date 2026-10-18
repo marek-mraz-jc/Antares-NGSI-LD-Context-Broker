@@ -27,6 +27,7 @@ members = [
     "crates/antares-odata",
     "crates/antares-ogc",
     "crates/antares-sta",
+    "crates/antares-ical",
     "crates/antares-ws",
     "crates/antares-icsr",
     # The reference plugin: built and tested with the workspace so the
@@ -66,6 +67,7 @@ antares-linkml = { path = "crates/antares-linkml" }
 antares-odata = { path = "crates/antares-odata" }
 antares-ogc = { path = "crates/antares-ogc" }
 antares-sta = { path = "crates/antares-sta" }
+antares-ical = { path = "crates/antares-ical" }
 antares-ws = { path = "crates/antares-ws" }
 antares-icsr = { path = "crates/antares-icsr" }
 
@@ -244,6 +246,10 @@ codegen-units = 1
 overflow-checks = true
 
 [profile.release.package.antares-sta]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-ical]
 overflow-checks = true
 codegen-units = 1
 

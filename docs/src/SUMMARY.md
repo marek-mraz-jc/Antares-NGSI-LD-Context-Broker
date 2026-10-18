@@ -18,6 +18,7 @@
 - [OData endpoint of a view](odata.md)
 - [OGC API - Features endpoint of a view](ogc.md)
 - [SensorThings API endpoint of a view](sta.md)
+- [iCalendar feed of a view](ical.md)
 - [WebSocket notifications](websocket.md)
 - [Federation](federation.md)
 - [Internal context sources](internal-context-sources.md)
