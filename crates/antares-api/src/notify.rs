@@ -1405,12 +1405,86 @@ impl Drop for BatchDone {
     }
 }
 
-/// One group waiting on its subscription's lane, holding its batch pending.
+/// One group waiting on its subscription's lane, holding its batch pending
+/// and its bytes on the lanes' ledger.
 #[cfg(not(target_arch = "wasm32"))]
 struct LaneJob {
     st: AppState,
     group: Matched,
     _batch: Arc<BatchDone>,
+    _held: Held,
+}
+
+/// The estimated heap bytes every delivery lane holds, against
+/// [`crate::bounds::DELIVERY_LANE_BYTES`] (T-4549).
+#[cfg(not(target_arch = "wasm32"))]
+struct Ledger(std::sync::atomic::AtomicUsize);
+
+#[cfg(not(target_arch = "wasm32"))]
+static LANE_LEDGER: Ledger = Ledger(std::sync::atomic::AtomicUsize::new(0));
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Ledger {
+    /// `bytes` more on the ledger, or `None` when they would take it past
+    /// `budget`. A group larger than the whole budget is still taken on an
+    /// empty ledger, so one big change is delivered rather than never.
+    fn take(&'static self, bytes: usize, budget: usize) -> Option<Held> {
+        use std::sync::atomic::Ordering;
+        self.0
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                let after = used.saturating_add(bytes);
+                (used == 0 || after <= budget).then_some(after)
+            })
+            .ok()?;
+        metrics::gauge!("antares_notification_lane_bytes").increment(bytes as f64);
+        Some(Held {
+            ledger: self,
+            bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn used(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Bytes a waiting group holds on the [`Ledger`], given back when the group
+/// is delivered or dropped.
+#[cfg(not(target_arch = "wasm32"))]
+struct Held {
+    ledger: &'static Ledger,
+    bytes: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.ledger
+            .0
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+        metrics::gauge!("antares_notification_lane_bytes").decrement(self.bytes as f64);
+    }
+}
+
+/// What `v` costs on the heap, estimated: a node per value, the bytes of
+/// its strings and keys. Cheap next to the serialization a delivery does,
+/// and close enough to keep the lanes under their budget.
+#[cfg(not(target_arch = "wasm32"))]
+fn heap_estimate(v: &Value) -> usize {
+    const NODE: usize = std::mem::size_of::<Value>();
+    match v {
+        Value::String(s) => NODE.saturating_add(s.len()),
+        Value::Array(items) => items
+            .iter()
+            .fold(NODE, |n, item| n.saturating_add(heap_estimate(item))),
+        Value::Object(map) => map.iter().fold(NODE, |n, (k, item)| {
+            n.saturating_add(NODE)
+                .saturating_add(k.len())
+                .saturating_add(heap_estimate(item))
+        }),
+        _ => NODE,
+    }
 }
 
 /// (tenant, subscription id) → the lane its groups wait on. An entry lives
@@ -1437,10 +1511,22 @@ fn to_lane(st: &AppState, group: Matched, batch: &Arc<BatchDone>) {
             .unwrap_or_default()
             .to_owned(),
     );
+    let bytes = group
+        .data
+        .iter()
+        .fold(0usize, |n, entity| n.saturating_add(heap_estimate(entity)));
+    let Some(held) = LANE_LEDGER.take(bytes, *crate::bounds::DELIVERY_LANE_BYTES) else {
+        // every lane together holds its budget: this subscription loses the
+        // group, counted and named like a full lane's, and the process keeps
+        // its memory (T-4549)
+        note_lane_drop(&key, group.data.len());
+        return;
+    };
     let job = LaneJob {
         st: st.clone(),
         group,
         _batch: batch.clone(),
+        _held: held,
     };
     // A poisoned map is a panic in some past hand-off; what it holds is
     // senders, rebuilt on the next group either way.
@@ -1496,6 +1582,16 @@ async fn run_lane(key: (String, String), mut rx: tokio::sync::mpsc::Receiver<Lan
     }
 }
 
+/// A fold: the state, the merged group, the batches and ledger bytes it
+/// holds until delivered, and the job it had no room for.
+#[cfg(not(target_arch = "wasm32"))]
+type Folded = (
+    AppState,
+    Matched,
+    Vec<(Arc<BatchDone>, Held)>,
+    Option<LaneJob>,
+);
+
 /// What waits behind `job` on its lane leaves in the same notification, as
 /// a drain folds one subscription's changes into one group: a lane keeps up
 /// by sending fewer, larger notifications, not by queueing one per change.
@@ -1505,16 +1601,14 @@ async fn run_lane(key: (String, String), mut rx: tokio::sync::mpsc::Receiver<Lan
 /// group carries the subscription as it reads now; the batches stay pending
 /// until the delivery ends.
 #[cfg(not(target_arch = "wasm32"))]
-fn fold(
-    job: LaneJob,
-    rx: &mut tokio::sync::mpsc::Receiver<LaneJob>,
-) -> (AppState, Matched, Vec<Arc<BatchDone>>, Option<LaneJob>) {
+fn fold(job: LaneJob, rx: &mut tokio::sync::mpsc::Receiver<LaneJob>) -> Folded {
     let LaneJob {
         st,
         mut group,
         _batch,
+        _held,
     } = job;
-    let mut batches = vec![_batch];
+    let mut batches = vec![(_batch, _held)];
     while let Ok(next) = rx.try_recv() {
         if group.data.len().saturating_add(next.group.data.len()) > CHANGE_BATCH {
             return (st, group, batches, Some(next));
@@ -1522,7 +1616,7 @@ fn fold(
         let mut data = std::mem::take(&mut group.data);
         data.extend(next.group.data);
         group = Matched { data, ..next.group };
-        batches.push(next._batch);
+        batches.push((next._batch, next._held));
     }
     (st, group, batches, None)
 }
@@ -3738,6 +3832,7 @@ mod change_pipeline {
                     pending: pending.clone(),
                     taken: 1,
                 }),
+                _held: LANE_LEDGER.take(0, usize::MAX).expect("no budget"),
             }
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(DELIVERY_LANE);
@@ -3757,6 +3852,34 @@ mod change_pipeline {
             "folds stop before CHANGE_BATCH; an oversized group leaves alone"
         );
         assert_eq!(pending.load(Ordering::SeqCst), 0, "every batch released");
+    }
+
+    /// T-4549: the lanes together hold at most their byte budget; a group
+    /// past it is refused, a group larger than the budget still leaves when
+    /// nothing else waits, and what a group held is given back when it goes.
+    #[test]
+    fn the_lanes_hold_at_most_their_byte_budget() {
+        let ledger: &'static Ledger = Box::leak(Box::new(Ledger(Default::default())));
+        let first = ledger.take(600, 1000).expect("room");
+        assert!(ledger.take(500, 1000).is_none(), "past the budget");
+        let second = ledger.take(400, 1000).expect("exactly the budget");
+        assert_eq!(ledger.used(), 1000);
+        drop(first);
+        assert_eq!(ledger.used(), 400, "a delivered group gives its bytes back");
+        drop(second);
+        let alone = ledger
+            .take(5000, 1000)
+            .expect("one oversized group on an empty ledger");
+        assert!(ledger.take(1, 1000).is_none(), "nothing beside it");
+        drop(alone);
+        assert_eq!(ledger.used(), 0);
+        let entity = json!({"id": "urn:ngsi-ld:CityWork:1", "status": {"type": "Property", "value": "ongoing"}});
+        let estimate = heap_estimate(&entity);
+        let text = serde_json::to_vec(&entity).map(|b| b.len()).unwrap_or(0);
+        assert!(
+            estimate > text,
+            "the estimate counts the nodes, not only the text: {estimate} <= {text}"
+        );
     }
 
     /// T-4086: behind a subscriber that never answers, a burst of a whole

@@ -126,6 +126,8 @@ const KNOWN_KEYS: &[&str] = &[
     // whole broker, and the share of that width one tenant may hold.
     "ANTARES_DELIVERY_WIDTH",
     "ANTARES_DELIVERY_WIDTH_PER_TENANT",
+    // Estimated heap every delivery lane may hold at once (T-4549).
+    "ANTARES_DELIVERY_LANE_BYTES",
     // 5.7.2.4 fan-out ceiling: how many matching registrations one
     // distributed operation may contact.
     "ANTARES_FED_FANOUT",
