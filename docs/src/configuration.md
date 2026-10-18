@@ -87,6 +87,7 @@ here).
 | `ANTARES_NOTIFY_MAX_AGE_SECS` | `300` | No retry starts later than this after the first attempt. When the attempts or the age run out the notification becomes a dead letter (`/q/dead-letters`, see [operations](operations.md#notification-delivery)). |
 | `ANTARES_DELIVERY_WIDTH` | `64` | Notifications in flight at once across the whole broker. A slot is held until the endpoint answers, so the number that fits depends on the subscribers: local sinks free a slot in milliseconds, a remote endpoint sitting at its 30 s timeout (Table 5.2.15-1) holds one for the whole timeout. Published as `deliveryWidth` in `/q/health`. |
 | `ANTARES_DELIVERY_WIDTH_PER_TENANT` | `8` | Of that width, what one tenant may hold, capped at the width. Without it a single tenant with enough dead endpoints holds every slot and nothing leaves the broker for anyone else. Published as `deliveryWidthPerTenant`. |
+| `ANTARES_DELIVERY_LANE_BYTES` | `268435456` (256 MiB) | Estimated heap all subscription delivery lanes may hold at once, across every tenant (T-4549). A change group that would push the total past it is not queued: that subscription's lane counts a drop (`antares_notification_lane_dropped_total`), as a full lane does. One group is always admitted into empty lanes. The held bytes are the gauge `antares_notification_lane_bytes`; published as `deliveryLaneBytes` in `/q/health`. |
 
 ## Lifecycle & observability
 
