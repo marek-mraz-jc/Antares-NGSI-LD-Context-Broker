@@ -223,6 +223,17 @@ reason (an existence oracle on connection ids would otherwise appear).
 After the grace period the connection's Subscriptions are deleted
 through 10.5.6 (Delete Subscription, gated as 5.8.5) like any client delete.
 
+A connection lives in one process, its Subscriptions in the store: a
+process that ends without its grace (a crash, an OOM kill) would leave them
+behind, matching every change for a socket nobody holds (T-4543). So every
+Subscription made over a socket carries a lease: its `expiresAt` is at most
+`ANTARES_WS_SUBSCRIPTION_LEASE_SECS` (default 300 s) ahead, an earlier
+`expiresAt` the client asks is kept, and the heartbeat of an attached socket
+renews it every third of the lease (a resume renews it at once). An expired
+one notifies nothing (5.8.1.4), and the expiry sweep deletes a socket
+Subscription whose lease has passed. The lease must exceed twice the grace
+plus the Ping interval, so a connection within its grace never lapses.
+
 ### 8. Identity: bound at upgrade, limited by lifetime
 
 The gateway authenticates the upgrade request, as it authenticates every

@@ -1313,6 +1313,48 @@ route4!(
     "5.11 Context Source Registration Subscription"
 );
 
+/// The endpoint of a Subscription made over a WebSocket (ADR-0026 rule 4).
+const SOCKET_ENDPOINT: &str = "urn:antares:ws:";
+
+/// ADR-0026 rule 7a: a Subscription made over a WebSocket carries a lease
+/// its socket renews; one whose lease passed belongs to a connection no
+/// process holds any more (it died without its grace) and is deleted as the
+/// grace would have. A client's own expired Subscription stays, readable as
+/// `expired` (5.8.1.4).
+pub(crate) async fn sweep_expired_socket_subscriptions(st: &AppState, tenant: &TenantId) -> usize {
+    let mut dead: Vec<String> = Vec::new();
+    let walked = crate::csource::walk_docs(st, tenant, Kind::Subscription, |doc| {
+        let socket = doc
+            .pointer("/notification/endpoint/uri")
+            .and_then(Value::as_str)
+            .is_some_and(|uri| uri.starts_with(SOCKET_ENDPOINT));
+        if socket && crate::registry::reg_expired(&doc) {
+            if let Some(id) = doc.get("id").and_then(Value::as_str) {
+                dead.push(id.to_owned());
+            }
+        }
+        Ok(())
+    })
+    .await;
+    if walked.is_err() {
+        return 0;
+    }
+    let mut n: usize = 0;
+    for id in dead {
+        if st
+            .store
+            .delete(tenant, Kind::Subscription, &id)
+            .await
+            .unwrap_or(false)
+        {
+            st.sub_changed(tenant, Kind::Subscription, &id, None);
+            crate::distsub::on_subscription_deleted(st, tenant, &id).await;
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
