@@ -1316,7 +1316,7 @@
   "TP/NGSI-LD/ContextInformation/Provision/TransientEntities/422_06.robot::422_06_01 Whole Replace Clears Expiry Partial Update And Merge Preserve It",
   "TP/NGSI-LD/ContextInformation/Provision/TransientEntities/422_07.robot::422_07_01 Attribute Writes Append History ExpiresAt Alone Does Not",
   "TP/NGSI-LD/ContextInformation/Provision/TransientEntities/422_07.robot::422_07_02 Transient Attribute History Evaporates Durable History Stays",
-  "TP/NGSI-LD/ContextInformation/Provision/TransientEntities/422_07.robot::422_07_03 Entity Expiry Kills Current State But History Survives",
+  "TP/NGSI-LD/ContextInformation/Provision/TransientEntities/422_07.robot::422_07_03 Entity Expiry Takes Current State And History",
   "TP/NGSI-LD/ContextInformation/Provision/TransientEntities/422_08.robot::422_08_01 ExpiresAt Is Writable On Every Attribute Type",
   "TP/NGSI-LD/ContextInformation/Provision/TransientEntities/422_08.robot::422_08_02 Dataset Instance Expires Independently Of The Default Instance",
   "TP/NGSI-LD/ContextInformation/Provision/TransientEntities/422_08.robot::422_08_03 Malformed ExpiresAt Is BadRequestData At Entity And Attribute Level",
