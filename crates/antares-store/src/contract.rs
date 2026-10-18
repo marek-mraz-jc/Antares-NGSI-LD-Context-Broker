@@ -123,6 +123,17 @@ pub async fn run_current_state_contract(
         "a rejected mutate must commit nothing"
     );
 
+    // A type list, where the driver keeps one, names the type of a live
+    // Entity (T-4610): `/types` answers from it without a fold.
+    if let Some(names) = d.entity_type_names(a).await.expect("type list") {
+        assert!(
+            names
+                .iter()
+                .any(|t| t == "https://uri.etsi.org/ngsi-ld/default-context/T"),
+            "the type list must name the type of a live Entity: {names:?}"
+        );
+    }
+
     // Tenant isolation, on every read and every write path.
     assert!(
         d.get(b, Kind::Entity, &e1).await.expect("get").is_none(),

@@ -6,7 +6,7 @@ ADR-0013): the core names the traits and no backend.
 
 | Trait | Surface | Chosen by |
 |---|---|---|
-| `CurrentStateDriver` | create / get / delete / list / upsert, the batch operations, `query_entities`, `matching_registrations`, `sweep_expired`, tenant inventory and purge, `@context` documents, ping / close / version, commit-queue depth, change hook and outbox wiring. | `ANTARES_STORE` |
+| `CurrentStateDriver` | create / get / delete / list / upsert, the batch operations, `query_entities`, `entity_type_names` (the `/types` list, T-4610), `matching_registrations`, `sweep_expired`, tenant inventory and purge, `@context` documents, ping / close / version, commit-queue depth, change hook and outbox wiring. | `ANTARES_STORE` |
 | `TemporalDriver` | `temporal_append`, `query_temporal`, `get_temporal`, the temporal delete paths (CIM 009 5.6.13 to 5.6.16), the temporal-entity documents, and the event intake (`event` / `event_list`) that the post-response drain feeds. `supported()` tells the API whether history exists at all, and `close()` / `version_info()` mirror the current-state seam — a temporal driver on a backend of its own has its own pool to drain and its own version to report. | `ANTARES_TEMPORAL` |
 
 `AppState` carries one `Arc<dyn CurrentStateDriver>` and one

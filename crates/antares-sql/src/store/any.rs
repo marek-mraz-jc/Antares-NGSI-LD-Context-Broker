@@ -754,6 +754,17 @@ impl AnyStore {
         Ok(outcome)
     }
 
+    /// The Entity types of the Tenant's live Entities, sorted, read without
+    /// the documents (T-4610): the `types` column on Postgres, the held
+    /// documents' `type` on the memory arm.
+    pub async fn entity_type_names(&self, tenant: &TenantId) -> Result<Vec<String>, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.entity_type_names(tenant, &now_utc())),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.entities.type_names(tenant).await.map_err(db),
+        }
+    }
+
     /// Query Temporal Evolution with entity narrowing, instance-window
     /// pruning AND entity paging pushed down. Same
     /// contract: the API's window() is the arbiter; the memory arm returns
@@ -1515,6 +1526,9 @@ impl antares_store::CurrentStateDriver for AnyStore {
         f: &crate::store::filter::EntityFilter<'_>,
     ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
         AnyStore::query_entities(self, tenant, f).await
+    }
+    async fn entity_type_names(&self, tenant: &TenantId) -> Result<Option<Vec<String>>, NgsiError> {
+        AnyStore::entity_type_names(self, tenant).await.map(Some)
     }
     async fn mutate_boxed<'a>(
         &self,

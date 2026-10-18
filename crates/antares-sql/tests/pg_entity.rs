@@ -1075,3 +1075,66 @@ async fn clause_4_9_a_typed_value_is_not_dropped_by_the_pushdown() {
         assert_eq!(q!(&f), want, "{term}");
     }
 }
+
+/// T-4610: the type list reads the `types` column, sorted and distinct, of
+/// the Tenant's live Entities alone: an expired Entity and another Tenant's
+/// add nothing, and a type an Entity carries beside another is listed.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_type_list_is_the_live_tenants_distinct_types() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgEntityStore::new(pool.clone());
+    let t = TenantId::new("pgtypenames").expect("tenant");
+    let other = TenantId::new("pgtypenames2").expect("tenant");
+    for tenant in [&t, &other] {
+        pg::ensure_tenant(&pool, tenant).await.expect("tenant row");
+    }
+    let docs = [
+        (&t, "urn:ngsi-ld:A:1", json!(["A"]), None),
+        (&t, "urn:ngsi-ld:A:2", json!(["A"]), None),
+        (&t, "urn:ngsi-ld:AB:1", json!(["B", "A"]), None),
+        (
+            &t,
+            "urn:ngsi-ld:C:1",
+            json!(["C"]),
+            Some("2020-01-01T00:00:00Z"),
+        ),
+        (&other, "urn:ngsi-ld:D:1", json!(["D"]), None),
+    ];
+    for (tenant, id, types, expires) in &docs {
+        let _ = s.delete(tenant, id).await;
+        let mut doc = json!({"id": id, "type": types, "createdAt": "2026-10-18T00:00:00Z",
+                             "modifiedAt": "2026-10-18T00:00:00Z"});
+        if let Some(at) = expires {
+            doc["expiresAt"] = json!(at);
+        }
+        assert!(s.create(tenant, id, &doc).await.expect("create"));
+    }
+    assert_eq!(s.type_names(&t).await.expect("types"), ["A", "B"]);
+    assert_eq!(s.type_names(&other).await.expect("types"), ["D"]);
+    let empty = TenantId::new("pgtypenames3").expect("tenant");
+    assert!(s.type_names(&empty).await.expect("types").is_empty());
+    for (tenant, id, ..) in &docs {
+        let _ = s.delete(tenant, id).await;
+    }
+}
+
+/// T-4610: a type list the caller stops waiting for (an MCP call cancelled
+/// at its timeout) hands its connection back: on a pool of one, the next
+/// read still gets it, again and again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_type_list_returns_its_connection() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 1).await.expect("connect");
+    let s = PgEntityStore::new(pool.clone());
+    let t = TenantId::new("pgtypecancel").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    for wait in [0u64, 50, 200, 500, 1_000, 2_000] {
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_micros(wait), s.type_names(&t)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), s.type_names(&t))
+            .await
+            .expect("the one connection came back")
+            .expect("the list reads");
+    }
+}
