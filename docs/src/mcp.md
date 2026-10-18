@@ -48,6 +48,7 @@ a source name. Each call is inverted and rebuilt as on the view root.
 |---|---|---|
 | `batch_query` | Query Entities, POST form (10.4.3) | yes |
 | `batch_query_temporal` | Temporal Query, POST form (11.3.3) | yes |
+| `describe_type` | Retrieve Available Entity Type Information (10.6.5), with the type's query guide | no |
 | `get_attribute` | Retrieve Available Attribute Information (10.6.8) | no |
 | `get_attribute_value` | Retrieve Attribute Value (10.4.4) | no |
 | `get_entity` | Retrieve Entity (10.4.2) | no |
@@ -61,6 +62,12 @@ a source name. Each call is inverted and rebuilt as on the view root.
 | `query_entities` | Query Entities (10.4.3) | yes |
 | `query_temporal` | Temporal Query (11.3.3) | yes |
 | `retrieve_temporal` | Temporal Retrieve (11.3.2) | no |
+
+`describe_type` is listed wherever `get_type` is and runs the same gated
+operation; its answer opens with the type's query guide as text (time axis,
+place, filters, example calls, naming only shown attributes), then the same
+guide as JSON under `guide` beside what `get_type` answers (T-4537). A shown
+type no Entity has yet still gets its guide.
 
 The write tools (section 3) are listed the same way:
 

@@ -889,6 +889,14 @@ async fn the_mcp_column_is_served_as_the_matrix_states() {
         let engine = Clauses::default();
         let (app, _reload) = broker(engine.clone(), &writes).await;
         let mut listed = mcp_tools(&app, view).await;
+        // `describe_type` is `get_type`'s row answered with its guide (T-4537), not a row
+        let guide = listed.iter().position(|t| t == "describe_type");
+        assert_eq!(
+            guide.is_some(),
+            listed.iter().any(|t| t == "get_type"),
+            "{view}: describe_type is listed exactly where get_type is: {listed:?}"
+        );
+        listed.retain(|t| t != "describe_type");
         listed.sort();
         let mut want: Vec<String> = rows
             .iter()

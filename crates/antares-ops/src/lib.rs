@@ -36,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+pub mod guide;
 mod mapped;
 pub mod mapping;
 mod names;
