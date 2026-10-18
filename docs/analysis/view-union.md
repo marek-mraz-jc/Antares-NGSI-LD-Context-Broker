@@ -56,15 +56,15 @@ caller may read, because that would disclose the other views.
   count, and a view that contributes nothing adds nothing.
 - **Bounds.** The union buffers at most 2000 Entities across all views at once. Each view is asked for
   `min(limit, 2000 / views)` Entities per page, and is asked again when its buffer runs out. At most 16 views are
-  asked at the same time. One view's page may be at most 32 MiB, or the union answers 400. Each part is also held to
+  asked at the same time. A page from one view larger than 32 MiB makes the union answer 400. Each part is also held to
   the broker's own budgets (`limit`, the `RESIDUAL_SCAN` of a conditional count, the batch and lane bounds), as a
   direct read is.
 - **Writes.** Every method but `GET` and `HEAD` answers 405 with `Allow: GET, HEAD`.
 
 ## 4. A view the caller may not read
 
-A view that is unknown, does not allow `query_entities`, or whose Policy refuses the caller (401, 403, 404, or a
-refusal of the view) contributes nothing: no Entity, no count, no id, and no sign of which view refused. A request
+A view that is unknown, does not allow `query_entities`, or whose Policy refuses the caller (401, 403 or 404)
+contributes nothing: no Entity, no count, no id, and no sign of which view refused. A request
 that is wrong for every view alike (a malformed `q`, an unknown geometry) answers with the first such view's 400. A
 failure inside the broker answers 500 with a request id, and a view's 503 answers 503. The union never answers a
 partial page as if it were complete.
@@ -78,15 +78,15 @@ id per Entity, in body order. A view id is `[a-z0-9-]`, so the list is plain com
 
 ## 6. @context
 
-Each view is asked for `application/ld+json`, so every Entity carries its own `@context`. Views of another model
-(G18) can answer under different contexts.
+Each view is asked for `application/ld+json`, so every Entity carries its own `@context`. Every view compacts its
+answer under the same context: the caller's `Link` if it sent one, otherwise the core context. A view of another
+model (G18) answers under the core context too.
 
 | Request | Answer |
 |---|---|
 | `Accept: application/ld+json` | the Entities as the views answered them, each with its own `@context` |
-| `application/json`, no `Accept`, `*/*` or `application/*` | the `@context` is moved into a `Link` header when every Entity in the page names the same single context URL |
-| `application/json` and the views answer under different contexts | 406, naming `application/ld+json` |
-| any other `Accept` | 406 |
+| `application/json`, no `Accept`, `*/*` or `application/*` | each Entity's `@context` is removed and named once, in a `Link` header |
+| any other `Accept` | 406, naming `application/ld+json` |
 
 ## 7. Data sources
 

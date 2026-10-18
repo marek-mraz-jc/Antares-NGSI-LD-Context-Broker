@@ -37,13 +37,15 @@ const LD: &str = "application/ld+json";
 
 /// The variable naming the most views one union read may name (200).
 pub const MAX_VIEWS_ENV: &str = "ANTARES_UNION_MAX_VIEWS";
-static MAX_VIEWS: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var(MAX_VIEWS_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
+static MAX_VIEWS: LazyLock<usize> =
+    LazyLock::new(|| views_bound(std::env::var(MAX_VIEWS_ENV).ok()));
+
+/// The bound `ANTARES_UNION_MAX_VIEWS` names; 200 when it names no positive count.
+fn views_bound(var: Option<String>) -> usize {
+    var.and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
         .unwrap_or(200)
-});
+}
 
 /// The union read of `req` as `caller`.
 pub async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
@@ -63,7 +65,8 @@ pub async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
     };
     match run(ops, caller, &parts.headers, &ask).await {
         Ok(page) => page.answer(&ask, json),
-        Err(answer) => *answer,
+        Err(Stop::Refused(refusal)) => refusal.ngsi_ld(),
+        Err(Stop::Answer(answer)) => *answer,
     }
 }
 
@@ -87,9 +90,11 @@ impl Ask {
         if parts.headers.contains_key("ngsild-entitymap") {
             return Err(Refusal::Malformed(crate::NO_MAPS));
         }
+        // a query that is no form encoding decodes to nothing, so its
+        // `views` counts as percent-encoded below
         let decoded = axum::extract::Query::<Vec<(String, String)>>::try_from_uri(&parts.uri)
-            .map_err(|_| Refusal::Malformed("the query is no form encoding"))?
-            .0;
+            .map(|q| q.0)
+            .unwrap_or_default();
         for (key, _) in &decoded {
             match key.as_str() {
                 "orderBy" | "collation" => {
@@ -232,8 +237,19 @@ struct Page {
     next: Option<String>,
 }
 
-/// The answer that ends a union early.
-type Stop = Box<Response>;
+/// What ends a union early: a refusal of the operation layer, or the answer
+/// a view gave that every view would give alike.
+enum Stop {
+    Refused(Refusal),
+    Answer(Box<Response>),
+}
+
+impl From<Refusal> for Stop {
+    fn from(refusal: Refusal) -> Self {
+        Self::Refused(refusal)
+    }
+}
+
 /// One view's page: its Entities and count, `None` when it gives nothing.
 type Fetched = Result<Option<(Vec<Value>, u64)>, Stop>;
 
@@ -271,18 +287,17 @@ async fn run(ops: &Ops, caller: &Caller, headers: &HeaderMap, ask: &Ask) -> Resu
     while docs.len() < ask.limit {
         refill(&mut parts, caller, headers, ask, chunk, false, &mut total).await?;
         let head = parts
-            .iter()
+            .iter_mut()
             .enumerate()
-            .filter_map(|(i, p)| p.buf.front().map(|d| (id_of(d), i)))
-            .min()
-            .map(|(_, i)| i);
-        let Some((i, part)) = head.and_then(|i| parts.get_mut(i).map(|p| (i, p))) else {
+            .filter(|(_, p)| !p.buf.is_empty())
+            .min_by(|(i, a), (j, b)| {
+                (a.buf.front().map(id_of), i).cmp(&(b.buf.front().map(id_of), j))
+            });
+        let Some((i, part)) = head else {
             break;
         };
-        if let Some(doc) = part.buf.pop_front() {
-            part.read = part.read.saturating_add(1);
-            docs.push((doc, i));
-        }
+        part.read = part.read.saturating_add(1);
+        docs.extend(part.buf.pop_front().map(|doc| (doc, i)));
     }
     let more = ask.limit > 0 && parts.iter().any(|p| !p.buf.is_empty() || !p.done);
     let next = more.then(|| {
@@ -315,24 +330,21 @@ async fn refill(
     count: bool,
     total: &mut u64,
 ) -> Result<(), Stop> {
-    let jobs: Vec<(usize, ViewOps, u64)> = parts
+    let empty = |p: &Part| p.buf.is_empty() && !p.done;
+    // a part without a view is done from the start
+    let jobs: Vec<(ViewOps, u64)> = parts
         .iter()
-        .enumerate()
-        .filter(|(_, p)| p.buf.is_empty() && !p.done)
-        .filter_map(|(i, p)| p.view.clone().map(|v| (i, v, p.read)))
+        .filter(|p| empty(p))
+        .filter_map(|p| p.view.clone().map(|v| (v, p.read)))
         .collect();
-    let answers: Vec<(usize, Fetched)> = stream::iter(jobs)
-        .map(|(i, view, offset)| async move {
-            let target = ask.target(offset, limit, count);
-            (i, read(&view, caller, headers, target).await)
+    let answers: Vec<Fetched> = stream::iter(jobs)
+        .map(|(view, offset)| async move {
+            read(&view, caller, headers, ask.target(offset, limit, count)).await
         })
-        .buffer_unordered(WIDTH)
+        .buffered(WIDTH)
         .collect()
         .await;
-    for (i, answer) in answers {
-        let Some(part) = parts.get_mut(i) else {
-            continue;
-        };
+    for (part, answer) in parts.iter_mut().filter(|p| empty(p)).zip(answers) {
         match answer? {
             Some((docs, n)) => {
                 *total = total.saturating_add(n);
@@ -357,49 +369,31 @@ async fn read(view: &ViewOps, caller: &Caller, headers: &HeaderMap, target: Stri
         }
     }
     let req = req.header(header::ACCEPT, HeaderValue::from_static(LD));
-    let answer = match view.run(OperationId::QueryEntities, caller, req).await {
-        Ok(answer) => answer,
-        Err(
-            Refusal::NotFound
-            | Refusal::NotAllowed { .. }
-            | Refusal::NotSupported
-            | Refusal::Denied(_)
-            | Refusal::Closed,
-        ) => return Ok(None),
-        Err(other) => return Err(Box::new(other.ngsi_ld())),
-    };
-    let status = answer.status();
+    // the union asks each view only for an operation it allows, without a
+    // Tenant, so what the layer refuses it refuses for every view alike
+    let answer = view.run(OperationId::QueryEntities, caller, req).await?;
+    match answer.status() {
+        StatusCode::OK => {}
+        // the view's Policy refuses the caller: no sign which view it was
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => {
+            return Ok(None)
+        }
+        _ => return Err(Stop::Answer(Box::new(answer))),
+    }
     let count = answer
         .headers()
         .get("ngsild-results-count")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let (head, body) = answer.into_parts();
-    let bytes = to_bytes(body, PAGE_BYTES).await.map_err(|_| {
-        Box::new(
-            Refusal::Limit("a view's page is over the 32 MiB a read across views takes").ngsi_ld(),
-        )
-    })?;
-    if status == StatusCode::OK {
-        let docs = serde_json::from_slice(&bytes)
-            .map_err(|_| Box::new(Refusal::Limit("a view answered no Entity list").ngsi_ld()))?;
-        return Ok(Some((docs, count)));
-    }
-    // 403 is also TooManyResults (6.3.2), which every view would answer alike
-    let too_many = serde_json::from_slice::<Value>(&bytes)
+    let docs = to_bytes(answer.into_body(), PAGE_BYTES)
+        .await
         .ok()
-        .and_then(|p| p.get("type").and_then(Value::as_str).map(str::to_owned))
-        .is_some_and(|t| t.ends_with("/TooManyResults"));
-    match status {
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND if !too_many => {
-            Ok(None)
-        }
-        _ => Err(Box::new(Response::from_parts(
-            head,
-            axum::body::Body::from(bytes),
-        ))),
-    }
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or(Refusal::Limit(
+            "a view's page is over the 32 MiB a read across views takes",
+        ))?;
+    Ok(Some((docs, count)))
 }
 
 impl Page {
@@ -412,24 +406,23 @@ impl Page {
         let mut docs: Vec<Value> = self.docs.into_iter().map(|(d, _)| d).collect();
         let mut response_headers = HeaderMap::new();
         let content = if json {
-            match one_context(&docs) {
-                Ok(context) => {
-                    for d in &mut docs {
-                        if let Some(o) = d.as_object_mut() {
-                            o.remove("@context");
-                        }
-                    }
-                    if let Some(url) = context {
-                        let link = format!(
-                            "<{url}>; rel=\"http://www.w3.org/ns/json-ld#context\"; type=\"{LD}\""
-                        );
-                        response_headers
-                            .extend(HeaderValue::from_str(&link).ok().map(|v| (header::LINK, v)));
-                    }
-                    "application/json"
-                }
-                Err(()) => return not_acceptable(),
+            // every view compacts under the caller's Link or the core
+            // @context alike, so the first Entity names the page's
+            let link = docs
+                .first()
+                .and_then(|d| d.get("@context"))
+                .and_then(Value::as_str)
+                .map(|url| {
+                    format!("<{url}>; rel=\"http://www.w3.org/ns/json-ld#context\"; type=\"{LD}\"")
+                });
+            for o in docs.iter_mut().filter_map(Value::as_object_mut) {
+                o.remove("@context");
             }
+            response_headers.extend(
+                link.and_then(|l| HeaderValue::from_str(&l).ok())
+                    .map(|v| (header::LINK, v)),
+            );
+            "application/json"
         } else {
             LD
         };
@@ -464,55 +457,41 @@ impl Page {
     }
 }
 
-/// The one context URL every Entity of `docs` names, `None` for no Entity;
-/// `Err` when they name different ones or more than a URL.
-fn one_context(docs: &[Value]) -> Result<Option<String>, ()> {
-    let mut seen: Option<&str> = None;
-    for d in docs {
-        let url = match d.get("@context") {
-            Some(Value::String(s)) => s.as_str(),
-            Some(Value::Array(a)) if a.len() == 1 => a.first().and_then(Value::as_str).ok_or(())?,
-            _ => return Err(()),
-        };
-        match seen {
-            Some(s) if s != url => return Err(()),
-            _ => seen = Some(url),
-        }
-    }
-    Ok(seen.map(str::to_owned))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ask(query: &str) -> Result<Ask, Refusal> {
+    fn ask(query: &str) -> Option<Ask> {
         let req = axum::http::Request::builder()
             .uri(format!("/x/views{ROUTE}?{query}"))
             .body(())
-            .map_err(|_| Refusal::Malformed("test uri"))?;
-        Ask::of(&req.into_parts().0)
-    }
-
-    fn refused(query: &str) -> bool {
-        ask(query).is_err()
+            .unwrap_or_default();
+        Ask::of(&req.into_parts().0).ok()
     }
 
     #[test]
-    fn the_union_reads_its_own_parameters_and_passes_the_rest() -> Result<(), String> {
-        let a = ask("type=Car&views=b,a,b,%20&q=speed%3E1&count=true&limit=5")
-            .map_err(|r| format!("{r:?}"))?;
-        assert_eq!(a.views, ["b", "a"]);
-        assert_eq!(a.offsets, [0, 0]);
-        assert_eq!((a.limit, a.count), (5, true));
-        assert_eq!(a.rest, ["type=Car", "q=speed%3E1"]);
+    fn the_union_reads_its_own_parameters_and_passes_the_rest() {
+        let a = ask("type=Car&views=b,a,b,%20&&q=speed%3E1&count=true&limit=5");
         assert_eq!(
-            a.target(7, 3, false),
-            "/ngsi-ld/v1/entities?type=Car&q=speed%3E1&limit=3&offset=7"
+            a.as_ref()
+                .map(|a| (&a.views[..], &a.offsets[..], a.limit, a.count, &a.rest[..])),
+            Some((
+                &["b".to_owned(), "a".to_owned()][..],
+                &[0, 0][..],
+                5,
+                true,
+                &["type=Car".to_owned(), "q=speed%3E1".to_owned()][..]
+            ))
         );
-        let c = ask("views=a,b&cursor=4.0").map_err(|r| format!("{r:?}"))?;
-        assert_eq!((c.offsets, c.limit), (vec![4, 0], DEFAULT_LIMIT));
-        Ok(())
+        assert_eq!(
+            a.map(|a| a.target(7, 3, false)).as_deref(),
+            Some("/ngsi-ld/v1/entities?type=Car&q=speed%3E1&limit=3&offset=7")
+        );
+        let c = ask("views=a,b&cursor=4.0&offset=0");
+        assert_eq!(
+            c.map(|c| (c.offsets, c.limit, c.count)),
+            Some((vec![4, 0], DEFAULT_LIMIT, false))
+        );
     }
 
     #[test]
@@ -531,31 +510,36 @@ mod tests {
             "vi%65ws=a",
             "views=a&entityMap=true",
         ] {
-            assert!(refused(query), "{query}");
+            assert!(ask(query).is_none(), "{query}");
         }
         let many: Vec<String> = (0..=200).map(|i| format!("v{i}")).collect();
-        assert!(refused(&format!("views={}", many.join(","))));
-        assert!(!refused("views=a&offset=0&limit=0"));
+        assert!(ask(&format!("views={}", many.join(","))).is_none());
+        assert!(ask("views=a&offset=0&limit=0").is_some());
     }
 
     #[test]
-    fn plain_json_keeps_one_context_or_none() {
-        let core = serde_json::json!({"id": "a", "@context": "c"});
-        let arr = serde_json::json!({"id": "b", "@context": ["c"]});
-        let other = serde_json::json!({"id": "c", "@context": "d"});
-        assert_eq!(one_context(&[]), Ok(None));
-        assert_eq!(one_context(&[core.clone(), arr]), Ok(Some("c".to_owned())));
-        assert_eq!(one_context(&[core, other]), Err(()));
+    fn the_views_bound_is_a_positive_count_or_200() {
+        assert_eq!(views_bound(Some("5".into())), 5);
+        for var in [None, Some("0".into()), Some("x".into())] {
+            assert_eq!(views_bound(var), 200);
+        }
+    }
+
+    #[test]
+    fn json_json_ld_or_nothing() {
+        let accept = |v: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::ACCEPT, HeaderValue::from_static(v));
+            wants_json(&h)
+        };
         assert_eq!(wants_json(&HeaderMap::new()), Some(true));
+        assert_eq!(accept("application/ld+json"), Some(false));
+        assert_eq!(accept("*/*"), Some(true));
+        assert_eq!(accept("application/geo+json"), None);
         let mut h = HeaderMap::new();
         h.insert(
             header::ACCEPT,
-            HeaderValue::from_static("application/ld+json"),
-        );
-        assert_eq!(wants_json(&h), Some(false));
-        h.insert(
-            header::ACCEPT,
-            HeaderValue::from_static("application/geo+json"),
+            HeaderValue::from_bytes(b"\xff").unwrap_or(HeaderValue::from_static("x/y")),
         );
         assert_eq!(wants_json(&h), None);
     }

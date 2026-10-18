@@ -278,3 +278,89 @@ async fn two_hundred_views_answer_one_page_in_time() -> Result<(), String> {
     assert!(took < Duration::from_secs(10), "200 views took {took:?}");
     Ok(())
 }
+
+/// What the operation layer refuses for every view (a remote `@context`
+/// it cannot fetch) is the union's answer; an entity map is never built
+/// through it; a page of nothing is still a page.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_every_view_refuses_alike_is_the_answer() -> Result<(), String> {
+    let f = fixture().await?;
+    let context = send(
+        &f.app,
+        Method::GET,
+        &format!("{UNION}?views=cars&type=Car"),
+        &[(
+            "Link",
+            "<http://127.0.0.1:1/ctx.jsonld>; rel=\"http://www.w3.org/ns/json-ld#context\"; type=\"application/ld+json\"",
+        )],
+        None,
+    )
+    .await;
+    assert_eq!(
+        context.status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "{}",
+        context.text
+    );
+    let map = send(
+        &f.app,
+        Method::GET,
+        &format!("{UNION}?views=cars&type=Car"),
+        &[("NGSILD-EntityMap", "urn:ngsi-ld:EntityMap:x")],
+        None,
+    )
+    .await;
+    assert_eq!(map.status, StatusCode::BAD_REQUEST, "{}", map.text);
+    let nothing = send(
+        &f.app,
+        Method::GET,
+        &format!("{UNION}?views=nope&type=Car"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(
+        (nothing.status, nothing.json.clone()),
+        (StatusCode::OK, json!([]))
+    );
+    assert!(
+        nothing.headers.get("link").is_none(),
+        "no Entity names no context"
+    );
+    let none = union(&f.app, "views=cars&type=Car&limit=0").await;
+    assert_eq!(
+        (none.status, none.json.clone()),
+        (StatusCode::OK, json!([]))
+    );
+    assert_eq!(none.link("next"), None);
+    Ok(())
+}
+
+/// The next link keeps `count=true`, and every page counts the whole union.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_page_counts_the_whole_union() -> Result<(), String> {
+    let f = fixture().await?;
+    let first = union(&f.app, "views=cars,fleet&type=Car&limit=3&count=true").await;
+    assert_eq!(first.ids().len(), 3, "{}", first.text);
+    let next = first.link("next").ok_or("no next link")?;
+    assert!(next.contains("count=true"), "{next}");
+    let second = send(&f.app, Method::GET, &next, &[LD], None).await;
+    assert_eq!(second.ids(), ["urn:ngsi-ld:Car:2"], "{}", second.text);
+    let counted = union(&f.app, "views=cars,fleet&type=Car&limit=0&count=true").await;
+    assert_eq!(counted.json, json!([]), "{}", counted.text);
+    assert_eq!(counted.link("next"), None);
+    for page in [&first, &second, &counted] {
+        assert_eq!(page.header("NGSILD-Results-Count").as_deref(), Some("4"));
+    }
+    let head = send(
+        &f.app,
+        Method::HEAD,
+        &format!("{UNION}?views=cars&type=Car&count=true"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(head.status, StatusCode::OK);
+    assert_eq!(head.header("NGSILD-Results-Count").as_deref(), Some("2"));
+    Ok(())
+}
