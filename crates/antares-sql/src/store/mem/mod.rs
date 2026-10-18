@@ -600,6 +600,45 @@ impl Store {
         })
     }
 
+    /// The serialized size of the tenant's Entities, by first type (T-2890).
+    pub fn tenant_bytes(&self, tenant: &TenantId) -> antares_store::TenantBytes {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = antares_store::TenantBytes::default();
+        for doc in inner
+            .entities
+            .get(tenant.as_str())
+            .into_iter()
+            .flat_map(BTreeMap::values)
+        {
+            let n = serde_json::to_vec(doc).map_or(0, |v| v.len() as u64);
+            let ty = match doc.get("type") {
+                Some(Value::String(t)) => t.as_str(),
+                Some(Value::Array(a)) => a.first().and_then(Value::as_str).unwrap_or(""),
+                _ => "",
+            };
+            out.entities = out.entities.saturating_add(n);
+            let t = out.by_type.entry(ty.to_owned()).or_default();
+            *t = t.saturating_add(n);
+        }
+        out
+    }
+
+    /// The serialized size of the tenant's temporal documents.
+    pub fn attr_instance_bytes(&self, tenant: &TenantId) -> u64 {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.temporal.get(tenant.as_str()).map_or(0, |docs| {
+            docs.values()
+                .map(|d| serde_json::to_vec(d).map_or(0, |v| v.len() as u64))
+                .sum()
+        })
+    }
+
     /// Retention of current state (T-3900): drop at most `batch` Entities of
     /// `tenant` typed `type_iri` that carry no `expiresAt` and whose
     /// `modifiedAt` is before `before`. Persisted per key in `file` mode;

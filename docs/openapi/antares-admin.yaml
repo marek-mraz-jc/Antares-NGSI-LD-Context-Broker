@@ -156,7 +156,7 @@ paths:
       summary: What one tenant holds
       operationId: getTenant
       description: |
-        `200` with the per-kind counts. The default tenant always exists
+        `200` with the per-kind counts and `bytes`, its size. The default tenant always exists
         (CIM 009 5.5.10) and is readable even when empty. `createdAt` is
         present on Postgres, where the `tenants` table records it. The
         path names the tenant; an `NGSILD-Tenant` header is ignored.
@@ -696,6 +696,28 @@ components:
             attrInstances:
               type: integer
               description: Temporal attribute instances held for the tenant.
+          additionalProperties: false
+        bytes:
+          type: object
+          description: |
+            Storage the tenant takes, measured in the store (T-2890): the
+            stored rows on Postgres (`pg_column_size`, TOAST included), the
+            serialized documents in memory. A scan of the tenant, so one
+            measurement is reused for 5 minutes and a purge drops it. Absent
+            when the backend cannot measure or the scan failed.
+          required: [entities, attrInstances, byType]
+          properties:
+            entities:
+              type: integer
+              description: Bytes of every current-state Entity.
+            attrInstances:
+              type: integer
+              description: Bytes of the temporal attribute instances.
+            byType:
+              type: object
+              description: Entity bytes by the Entity's first type, as stored (expanded IRI); the values sum to `entities`.
+              additionalProperties:
+                type: integer
           additionalProperties: false
       additionalProperties: false
 

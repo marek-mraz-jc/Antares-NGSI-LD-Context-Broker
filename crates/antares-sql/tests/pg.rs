@@ -858,3 +858,125 @@ async fn a_purge_waits_for_an_in_flight_write_in_the_same_tenant() {
         .await
         .expect("cleanup");
 }
+
+/// T-2890: a tenant's size is measured in its own rows, by the Entity's first
+/// type, so the types sum to the whole; history is measured apart, and
+/// another tenant's rows (RLS and the predicate both) never count.
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_bytes_are_the_tenants_own_rows_by_first_type() {
+    use antares_store::{CurrentStateDriver, Kind, TemporalDriver};
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let a = TenantId::new(&format!("pgsz{run}")).expect("tenant");
+    let b = TenantId::new(&format!("pgsz{run}x")).expect("tenant");
+    let doc = |id: &str, ty: serde_json::Value| {
+        serde_json::json!({
+            "id": id, "type": ty,
+            "createdAt": "2026-08-04T09:00:00Z", "modifiedAt": "2026-08-04T09:00:00Z",
+            "n": {"type": "Property", "value": 1, "observedAt": "2026-08-04T09:00:00Z"}
+        })
+    };
+    let empty = CurrentStateDriver::tenant_bytes(&store, &a)
+        .await
+        .expect("bytes");
+    assert_eq!(
+        empty,
+        antares_store::TenantBytes::default(),
+        "no rows, no bytes"
+    );
+    for t in [&a, &b] {
+        pg::ensure_tenant(&pool, t).await.expect("tenant row");
+    }
+    for (id, ty) in [
+        ("urn:x:1", serde_json::json!("Room")),
+        ("urn:x:2", serde_json::json!("Room")),
+        ("urn:x:3", serde_json::json!(["Bridge", "Room"])),
+    ] {
+        assert!(
+            CurrentStateDriver::create(&store, &a, Kind::Entity, id, doc(id, ty))
+                .await
+                .expect("create")
+        );
+    }
+    let big = serde_json::json!({"id": "urn:x:9", "type": "Room", "pad": {"type": "Property", "value": "x".repeat(4000)}});
+    CurrentStateDriver::create(&store, &b, Kind::Entity, "urn:x:9", big)
+        .await
+        .expect("create in b");
+    let size = CurrentStateDriver::tenant_bytes(&store, &a)
+        .await
+        .expect("bytes");
+    assert_eq!(
+        size.by_type.keys().collect::<Vec<_>>(),
+        ["Bridge", "Room"],
+        "{size:?}"
+    );
+    assert!(
+        size.by_type["Room"] > size.by_type["Bridge"],
+        "two rows outweigh one: {size:?}"
+    );
+    assert_eq!(
+        size.entities,
+        size.by_type.values().sum::<u64>(),
+        "{size:?}"
+    );
+    let other = CurrentStateDriver::tenant_bytes(&store, &b)
+        .await
+        .expect("bytes");
+    assert!(
+        other.entities > 0 && size.entities > 0,
+        "{size:?} {other:?}"
+    );
+    assert_eq!(other.by_type.len(), 1, "{other:?}");
+
+    assert_eq!(
+        TemporalDriver::attr_instance_bytes(&store, &a)
+            .await
+            .expect("n"),
+        0
+    );
+    TemporalDriver::create(
+        &store,
+        &a,
+        "urn:x:1",
+        doc("urn:x:1", serde_json::json!("Room")),
+    )
+    .await
+    .expect("temporal");
+    store
+        .temporal_append(
+            &a,
+            "urn:x:1",
+            &doc("urn:x:1", serde_json::json!("Room")),
+            &serde_json::json!({"n": [{"type": "Property", "value": 2,
+                "observedAt": "2026-08-04T09:01:00Z", "instanceId": "urn:i:1"}]}),
+        )
+        .await
+        .expect("append");
+    assert!(
+        TemporalDriver::attr_instance_bytes(&store, &a)
+            .await
+            .expect("n")
+            > 0
+    );
+    assert_eq!(
+        TemporalDriver::attr_instance_bytes(&store, &b)
+            .await
+            .expect("n"),
+        0
+    );
+    for t in [&a, &b] {
+        CurrentStateDriver::purge_tenant(&store, t)
+            .await
+            .expect("purge");
+        TemporalDriver::purge_tenant(&store, t)
+            .await
+            .expect("purge history");
+    }
+}

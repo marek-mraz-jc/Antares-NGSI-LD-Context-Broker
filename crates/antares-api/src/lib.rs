@@ -1357,6 +1357,7 @@ async fn tenant_get(
         Err(e) => return ApiError::from(e).into_response(),
     };
     let instances = st.temporal.attr_instance_count(&tenant).await.unwrap_or(0);
+    let bytes = tenant_bytes(&st, &tenant).await;
     let mut row = serde_json::json!({
         "tenant": stats.tenant,
         "counts": {
@@ -1370,12 +1371,59 @@ async fn tenant_get(
             "attrInstances": instances,
         },
     });
-    if let Some(c) = stats.created_at {
-        if let Some(row) = row.as_object_mut() {
+    if let Some(row) = row.as_object_mut() {
+        if let Some(c) = stats.created_at {
             row.insert("createdAt".into(), serde_json::Value::String(c));
+        }
+        if let Some(b) = bytes {
+            row.insert("bytes".into(), b);
         }
     }
     (StatusCode::OK, axum::Json(row)).into_response()
+}
+
+/// How long `GET /q/tenants/{tenant}` reuses a measured size (T-2890).
+pub const TENANT_BYTES_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `{entities, attrInstances, byType}` in bytes, measured in the store and
+/// reused for [`TENANT_BYTES_TTL`]. `None` when the backend cannot measure
+/// or the scan failed: the counts still answer, without a size.
+async fn tenant_bytes(st: &AppState, tenant: &TenantId) -> Option<serde_json::Value> {
+    let cache = || {
+        st.tenant_bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if let Some((at, v)) = cache().get(tenant.as_str()) {
+        if at.elapsed() < TENANT_BYTES_TTL {
+            return Some(v.clone());
+        }
+    }
+    let entities = match st.store.tenant_bytes(tenant).await {
+        Ok(b) => b,
+        Err(NgsiError::OperationNotSupported(_)) => return None,
+        Err(e) => {
+            tracing::warn!(tenant = tenant.as_str(), error = %e, "tenant size not measured");
+            return None;
+        }
+    };
+    let instances = match st.temporal.attr_instance_bytes(tenant).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(tenant = tenant.as_str(), error = %e, "tenant history size not measured");
+            return None;
+        }
+    };
+    let v = serde_json::json!({
+        "entities": entities.entities,
+        "attrInstances": instances,
+        "byType": entities.by_type,
+    });
+    cache().insert(
+        tenant.as_str().to_owned(),
+        (std::time::Instant::now(), v.clone()),
+    );
+    Some(v)
 }
 
 /// Purge one tenant from both backends: 400 for a name no request could
@@ -1501,6 +1549,10 @@ async fn tenant_purge(
     if let Err(e) = crate::contexts::purge_tenant(&st, &tenant).await {
         return ApiError::from(e).into_response();
     }
+    st.tenant_bytes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(tenant.as_str());
     StatusCode::NO_CONTENT.into_response()
 }
 

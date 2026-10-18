@@ -181,6 +181,18 @@ pub struct TenantStats {
     pub dist_subs: u64,
 }
 
+/// How many bytes one tenant's Entities take in the store (T-2890), measured
+/// there and never estimated: the stored row on Postgres, the serialized
+/// document in memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TenantBytes {
+    /// Every Entity of the tenant.
+    pub entities: u64,
+    /// The same bytes by the Entity's first type, so the values sum to
+    /// `entities`.
+    pub by_type: std::collections::BTreeMap<String, u64>,
+}
+
 /// The read-modify-write closure as the object-safe seam carries it. The
 /// typed `Result<T, E>` travels through [`CurrentStateDriverExt::mutate`]'s
 /// side slot; the boxed closure only signals commit (`Ok`) vs reject
@@ -652,6 +664,12 @@ pub trait CurrentStateDriver: Send + Sync {
         let _ = tenant;
         Err(NgsiError::OperationNotSupported("tenant inventory".into()))
     }
+    /// The bytes one tenant's Entities take; a scan of the tenant, so the
+    /// caller caches it.
+    async fn tenant_bytes(&self, tenant: &TenantId) -> Result<TenantBytes, NgsiError> {
+        let _ = tenant;
+        Err(NgsiError::OperationNotSupported("tenant size".into()))
+    }
     /// Remove every current-state document of one tenant; `false` when the
     /// tenant did not exist. The default Tenant is emptied but keeps
     /// existing.
@@ -971,6 +989,12 @@ pub trait TemporalDriver: Send + Sync {
     /// Stored attribute instances of one tenant (inventory); a driver
     /// without history reports 0.
     async fn attr_instance_count(&self, tenant: &TenantId) -> Result<u64, NgsiError> {
+        let _ = tenant;
+        Ok(0)
+    }
+    /// The bytes those attribute instances take in the store; a driver
+    /// without history reports 0.
+    async fn attr_instance_bytes(&self, tenant: &TenantId) -> Result<u64, NgsiError> {
         let _ = tenant;
         Ok(0)
     }

@@ -195,6 +195,13 @@ pub struct Shared {
     pub views: Arc<crate::views::ViewTable>,
     /// Bounds-wall rejection counters (exported by /q/health).
     pub limits: Arc<crate::bounds::LimitStats>,
+    /// `GET /q/tenants/{tenant}` sizes by tenant with the instant they were
+    /// measured: a size is a scan of the tenant, so it is reused for
+    /// [`crate::TENANT_BYTES_TTL`] (T-2890). One entry per existing tenant
+    /// asked about; a purge drops its entry.
+    #[allow(clippy::type_complexity)] // a map of (when, answer), read in one place
+    pub tenant_bytes:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (Instant, serde_json::Value)>>>,
     /// Allocator stats provider (set by the broker; None in tests/wasm).
     pub mem_stats: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
     /// Bus state provider for /q/health (`bus: {mode, connected,
@@ -547,6 +554,7 @@ impl AppState {
                 views: Arc::default(),
                 surfaces: Arc::new(vec![Box::new(crate::Admin)]),
                 limits: Arc::new(crate::bounds::LimitStats::default()),
+                tenant_bytes: Arc::default(),
                 mem_stats: None,
                 bus_stats: None,
                 egress: Arc::new(crate::egress::Egress::new(egress_policy)),
