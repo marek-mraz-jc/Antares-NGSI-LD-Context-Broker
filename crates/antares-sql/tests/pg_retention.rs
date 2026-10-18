@@ -471,6 +471,16 @@ async fn a_past_partition_the_sweeps_emptied_is_dropped_and_a_held_one_stays() {
             .expect("catalog")
         }
     };
+    let store = PgTemporalStore::new(pool.clone());
+    // A row an earlier run left in DEFAULT would block the week's partition.
+    let _ = store.delete(&tenant, "urn:v:held").await;
+    // Hold the maintenance claim while the weeks are made and one is filled,
+    // so a parallel test's run cannot drop the held week while it is empty.
+    let mut claim = pool.begin().await.expect("claim");
+    sqlx::query("SELECT name FROM maintenance_jobs WHERE name = 'temporal_partitions' FOR UPDATE")
+        .fetch_optional(&mut *claim)
+        .await
+        .expect("claim row");
     for (name, lo, hi) in [
         ("attr_instances_2001w02", "2001-01-08", "2001-01-15"),
         ("attr_instances_2001w03", "2001-01-15", "2001-01-22"),
@@ -482,8 +492,6 @@ async fn a_past_partition_the_sweeps_emptied_is_dropped_and_a_held_one_stays() {
         .await
         .expect("partition");
     }
-    let store = PgTemporalStore::new(pool.clone());
-    let _ = store.delete(&tenant, "urn:v:held").await;
     let doc = json!({
         "id": "urn:v:held", "type": [V], "createdAt": "2001-01-16T00:00:00Z", "modifiedAt": "2001-01-16T00:00:00Z",
         "https://example.org/speed": [{"type": "Property", "value": 1, "observedAt": "2001-01-16T00:00:00Z", "instanceId": "urn:i:held"}]
@@ -492,6 +500,7 @@ async fn a_past_partition_the_sweeps_emptied_is_dropped_and_a_held_one_stays() {
         .create(&tenant, "urn:v:held", &doc)
         .await
         .expect("create"));
+    claim.commit().await.expect("release");
     // Another test's maintenance may hold the claim; the winner drops.
     let mut done = String::new();
     for _ in 0..50 {

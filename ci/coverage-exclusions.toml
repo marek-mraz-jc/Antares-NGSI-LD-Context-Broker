@@ -64,17 +64,17 @@ reason = "the periodic reload failing on the store, which the built-in store doe
 crate = "antares-ops"
 file = "src/views/retention.rs"
 function = "antares_ops::views::retention::overrides"
-lines = 5
-branches = 0
-reason = "2 lines: the store failing to list the Entities with their own historyRetention, which the built-in store under test_kit does not (see antares_ops::views::inner); tests/pg_retention.rs in antares-sql runs the Postgres read itself. 3 lines: the tracing::warn! of an unreadable value repeats its fields in the `log` fallback, which runs only with no subscriber set; tests/retention.rs an_entity_off_loses_its_history_and_forever_holds_the_platform_back runs that path (T-4414)"
+lines = 7
+branches = 1
+reason = "2 lines and the branch: a read that fills MAX_OVERRIDES (10 000 Entities that rule themselves), which no test writes; the unit test without_every_entity_that_rules_itself_no_history_runs_by_type_or_tenant runs what follows from it in levels. 2 lines: the store failing to list the Entities with their own historyRetention, which the built-in store under test_kit does not (see antares_ops::views::inner); tests/pg_retention.rs in antares-sql runs the Postgres read itself. 3 lines: the tracing::warn! of an unreadable value repeats its fields in the `log` fallback, which runs only with no subscriber set; tests/retention.rs an_entity_off_loses_its_history_and_forever_holds_the_platform_back runs that path (T-4414)"
 
 [[exclusion]]
 crate = "antares-ops"
 file = "src/views/retention.rs"
 function = "antares_ops::views::retention::steps"
 lines = 3
-branches = 0
-reason = "the store failing to list its Tenants for the platform default, which the built-in store under test_kit does not (see antares_ops::views::inner) (T-4414)"
+branches = 1
+reason = "the store failing to list its Tenants for the platform default, which the built-in store under test_kit does not (see antares_ops::views::inner); the branch: a partial read of the Entities that rule themselves, see overrides above (T-4414)"
 
 [[exclusion]]
 crate = "antares-ops"
