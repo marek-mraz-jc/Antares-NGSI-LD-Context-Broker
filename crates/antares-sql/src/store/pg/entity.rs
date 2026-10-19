@@ -186,59 +186,112 @@ async fn enqueue_change(
 /// that carries no page (idPattern, federation, orderBy) has at all.
 pub const MAX_UNDECIDED_ROWS: i64 = 10_000;
 
+/// One named type, the selection almost every type page carries: the bind
+/// numbers of the type and of `ARRAY[type]`. `types @> $n` cannot serve it:
+/// `arraycontains` is not leakproof, so under the tables' RLS Postgres keeps
+/// it out of every index condition and pages the whole Tenant through
+/// `entities_pkey` (T-4781: 18 req/s on prod). The split reads two
+/// leakproof index paths instead: the Entities whose first type it is
+/// (`i_entities_first_type_id`), and the few of two or more types that carry
+/// it later (`i_entities_multi_type_id`). Both arms are disjoint and their
+/// union is exactly `types @> ARRAY[type]`.
+#[derive(Clone, Copy)]
+struct OneType {
+    first: usize,
+    all: usize,
+}
+
+/// The full WHERE of each arm the statement reads: one, or the two of a
+/// `OneType` split.
+fn arms(wheres: &[String], one: Option<OneType>) -> Vec<String> {
+    let base = wheres.join(" AND ");
+    match one {
+        None => vec![base],
+        Some(OneType { first, all }) => vec![
+            format!("{base} AND types[1] = ${first}"),
+            format!(
+                "{base} AND cardinality(types) > 1 \
+                 AND types[1] IS DISTINCT FROM ${first} AND types @> ${all}"
+            ),
+        ],
+    }
+}
+
+/// count=true's total: a count per arm over exactly the page's WHERE, never
+/// a window over the page statement (that kept every matching row, body and
+/// all, until the last one was read).
+fn count_sql(wheres: &[String], one: Option<OneType>) -> String {
+    let counts: Vec<String> = arms(wheres, one)
+        .iter()
+        .map(|w| format!("(SELECT count(*) FROM entities WHERE {w})"))
+        .collect();
+    format!("SELECT {}", counts.join(" + "))
+}
+
 /// The statement, split out of `query` so its pagination shape is
 /// assertable without a database. Either LIMIT/OFFSET over an exactly
-/// decided set (`true`, `count(*) OVER ()` rides along for the pre-LIMIT
-/// total) or the flat `MAX_UNDECIDED_ROWS` safety LIMIT — never no LIMIT.
+/// decided set (`true`; one row past the page answers "is there a next
+/// page", the total is `count_sql`'s) or the flat `MAX_UNDECIDED_ROWS`
+/// safety LIMIT — never no LIMIT. A split reads each arm in id order up to
+/// what the page can need and merges them.
 fn query_sql(
     select: &str,
     wheres: &[String],
+    one: Option<OneType>,
     page: Option<&Page>,
     decided: bool,
     binds: &mut Vec<Bind>,
 ) -> (String, bool) {
-    let wheres = wheres.join(" AND ");
-    match page.filter(|_| decided) {
-        // count=true: the window total rides the statement. Otherwise one
-        // row past the page answers "is there a next page" — the window
-        // count made Postgres visit the whole match set before LIMIT
-        // (2.9 s p99 for 20 rows out of 10 000).
-        Some(p) => {
-            let total = if p.count {
-                ", count(*) OVER () AS total"
-            } else {
-                ""
+    let page = page.filter(|_| decided);
+    // Saturating: the caller's limit is only bounded by `i64::MAX`
+    // (`ANTARES_DISCOVERY_SCAN_MAX` clamps to exactly that), and one past
+    // the largest page is still the largest page.
+    let limit = page.map_or(MAX_UNDECIDED_ROWS, |p| p.limit.saturating_add(1));
+    binds.push(Bind::Int(limit));
+    let lim = binds.len();
+    let offset = page.map_or(String::new(), |p| {
+        binds.push(Bind::Int(p.offset));
+        format!(" OFFSET ${}", binds.len())
+    });
+    let arms = arms(wheres, one);
+    let sql = match arms.as_slice() {
+        [w] => format!(
+            "SELECT {select} AS entity FROM entities WHERE {w} ORDER BY id LIMIT ${lim}{offset}"
+        ),
+        _ => {
+            let each = match page {
+                Some(p) => {
+                    binds.push(Bind::Int(limit.saturating_add(p.offset)));
+                    binds.len()
+                }
+                None => lim,
             };
-            // Saturating: the caller's limit is only bounded by `i64::MAX`
-            // (`ANTARES_DISCOVERY_SCAN_MAX` clamps to exactly that), and one
-            // past the largest page is still the largest page.
-            binds.push(Bind::Int(if p.count {
-                p.limit
-            } else {
-                p.limit.saturating_add(1)
-            }));
-            let lim = binds.len();
-            binds.push(Bind::Int(p.offset));
-            (
-                format!(
-                    "SELECT {select} AS entity{total} \
-                     FROM entities WHERE {wheres} ORDER BY id LIMIT ${lim} OFFSET ${}",
-                    binds.len()
-                ),
-                true,
+            let parts: Vec<String> = arms
+                .iter()
+                .map(|w| {
+                    format!("(SELECT id, entity FROM entities WHERE {w} ORDER BY id LIMIT ${each})")
+                })
+                .collect();
+            format!(
+                "SELECT {select} AS entity FROM ({}) AS entities \
+                 ORDER BY id LIMIT ${lim}{offset}",
+                parts.join(" UNION ALL ")
             )
         }
-        None => {
-            binds.push(Bind::Int(MAX_UNDECIDED_ROWS));
-            (
-                format!(
-                    "SELECT {select} AS entity FROM entities WHERE {wheres} \
-                     ORDER BY id LIMIT ${}",
-                    binds.len()
-                ),
-                false,
-            )
-        }
+    };
+    (sql, page.is_some())
+}
+
+/// The total a pushed page shows by itself, `None` when only `count_sql`
+/// can tell it. Uncounted, the smallest total consistent with "a next page
+/// exists", enough for the next/prev links and never shown as a count;
+/// counted, a last page that holds rows (or the first, empty one).
+fn page_total(p: &Page, rows: usize, more: bool) -> Option<i64> {
+    let seen = p.offset.saturating_add(rows as i64);
+    match (p.count, more) {
+        (false, _) => Some(seen.saturating_add(i64::from(more))),
+        (true, false) if rows > 0 || p.offset == 0 => Some(seen),
+        (true, _) => None,
     }
 }
 
@@ -629,7 +682,22 @@ impl PgEntityStore {
         }
         // OR of AND-groups, mirroring the Entity Type Selection Language
         // (4.17) the caller already parsed: `types @> ARRAY[…]` per group.
-        if let Some(groups) = f.types {
+        // One group of one type is the `OneType` split instead.
+        let mut one = None;
+        if let Some([g]) = f.types {
+            if let [t] = g.as_slice() {
+                if !t.contains('\0') {
+                    binds.push(Bind::Text(t.clone()));
+                    let first = binds.len();
+                    binds.push(Bind::TextArr(g.clone()));
+                    one = Some(OneType {
+                        first,
+                        all: binds.len(),
+                    });
+                }
+            }
+        }
+        if let Some(groups) = f.types.filter(|_| one.is_none()) {
             let mut ors = Vec::with_capacity(groups.len());
             // a group naming a type with a NUL needs a type no entity has
             for g in groups
@@ -730,14 +798,13 @@ impl PgEntityStore {
         }
 
         // Pagination pushdown: ORDER BY id is the store's default order
-        // either way; `count(*) OVER ()` rides the same statement so the
-        // caller gets the pre-LIMIT total for count= and the next/prev
-        // links. When the page cannot be pushed the statement still carries
+        // either way; the total for count= comes from `count_sql` below,
+        // only when the page itself cannot tell it. When the page cannot be pushed the statement still carries
         // the safety LIMIT — without one, a single undecided request (any
         // `scopeQ`, any `georel`, a `q=` shape the compiler declined)
         // materializes the whole tenant into the Vec below.
         let ceiling = MAX_UNDECIDED_ROWS;
-        let (sql, paged) = query_sql(&select, &wheres, f.page.as_ref(), decided, &mut binds);
+        let (sql, paged) = query_sql(&select, &wheres, one, f.page.as_ref(), decided, &mut binds);
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         // sqlx 0.9 makes dynamic SQL opt-in. The assertion holds by
@@ -768,35 +835,25 @@ impl PgEntityStore {
             use futures_util::TryStreamExt;
             let mut stream = qy.fetch(&mut *tx);
             while let Some(row) = stream.try_next().await? {
-                if counted && docs.is_empty() {
-                    total = Some(row.get::<i64, _>(1));
-                }
                 docs.push(row.get::<Value, _>(0));
             }
         }
         check_ceiling(paged, docs.len(), ceiling)?;
-        // uncounted page: the extra row says a next page exists; the
-        // total handed back is the smallest one consistent with that,
-        // enough for the next/prev links and never shown as a count
-        if let Some(p) = f.page.as_ref().filter(|_| paged && !counted) {
+        // the extra row says a next page exists. Uncounted, the total
+        // handed back is the smallest one consistent with that, enough for
+        // the next/prev links and never shown as a count; counted, a last
+        // page that holds rows is the total itself.
+        if let Some(p) = f.page.as_ref().filter(|_| paged) {
             let more = docs.len() as i64 > p.limit;
             docs.truncate(p.limit as usize);
-            total = Some(
-                p.offset
-                    .saturating_add(docs.len() as i64)
-                    .saturating_add(i64::from(more)),
-            );
+            total = page_total(p, docs.len(), more);
         }
-        // an off-the-end counted page returns zero rows and no window
-        // total — count the match set separately so links/count stay correct
+        // count=true with more rows past the page, or an off-the-end page:
+        // count the match set under the same WHERE, binds and transaction
         if counted && total.is_none() {
-            let count_sql = format!(
-                "SELECT count(*) FROM entities WHERE {}",
-                wheres.join(" AND ")
-            );
             // unprepared for the same reason as the statement above
-            let mut cq =
-                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql)).persistent(false);
+            let mut cq = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql(&wheres, one)))
+                .persistent(false);
             // same wheres ⇒ same bind prefix; stop before the
             // projection/page binds, which the count statement lacks
             for b in binds.iter().take(where_binds) {
@@ -1572,17 +1629,109 @@ mod tests {
     }
 
     /// 5.5.9.1: a query SQL decided exactly keeps the pushed page — LIMIT
-    /// and OFFSET, with the window total that feeds count= and the
-    /// next/prev pointers.
+    /// and OFFSET. count=true carries no window either (T-4781): the window
+    /// kept every match, body and all, before the LIMIT could cut.
     #[test]
     fn a_decided_page_pushes_limit_and_offset() {
         let mut binds = vec![Bind::Text("t".to_owned())];
-        let (sql, paged) = query_sql("entity", &wheres(), Some(&page(20, 10)), true, &mut binds);
+        let (sql, paged) = query_sql(
+            "entity",
+            &wheres(),
+            None,
+            Some(&page(20, 10)),
+            true,
+            &mut binds,
+        );
         assert!(paged);
         assert!(sql.contains("LIMIT $2 OFFSET $3"), "{sql}");
-        assert!(sql.contains("count(*) OVER ()"), "{sql}");
-        assert!(matches!(binds[1], Bind::Int(10)));
+        assert!(!sql.contains("OVER"), "{sql}");
+        assert!(matches!(binds[1], Bind::Int(11)));
         assert!(matches!(binds[2], Bind::Int(20)));
+    }
+
+    /// T-4781: one named type reads two leakproof index arms, each in id
+    /// order and bounded by what the page can need, never `types @>` alone
+    /// (which RLS keeps out of every index condition).
+    #[test]
+    fn one_type_pages_through_two_bounded_arms() {
+        let mut binds = vec![
+            Bind::Text("t".to_owned()),
+            Bind::Text("T".to_owned()),
+            Bind::TextArr(vec!["T".to_owned()]),
+        ];
+        let one = Some(OneType { first: 2, all: 3 });
+        let (sql, paged) = query_sql(
+            "entity",
+            &wheres(),
+            one,
+            Some(&page(20, 10)),
+            true,
+            &mut binds,
+        );
+        assert!(paged);
+        assert_eq!(
+            sql,
+            "SELECT entity AS entity FROM (\
+             (SELECT id, entity FROM entities WHERE tenant_id = $1 AND types[1] = $2 \
+             ORDER BY id LIMIT $6) UNION ALL \
+             (SELECT id, entity FROM entities WHERE tenant_id = $1 AND cardinality(types) > 1 \
+             AND types[1] IS DISTINCT FROM $2 AND types @> $3 ORDER BY id LIMIT $6)) AS entities \
+             ORDER BY id LIMIT $4 OFFSET $5"
+        );
+        assert!(matches!(binds[3], Bind::Int(11)));
+        assert!(matches!(binds[4], Bind::Int(20)));
+        assert!(
+            matches!(binds[5], Bind::Int(31)),
+            "each arm: offset + limit + 1"
+        );
+        // the undecided ceiling bounds each arm and the merge alike
+        let mut binds = vec![Bind::Text("t".to_owned())];
+        let (sql, paged) = query_sql("entity", &wheres(), one, None, false, &mut binds);
+        assert!(!paged);
+        assert_eq!(sql.matches("LIMIT $2").count(), 3, "{sql}");
+        assert!(!sql.contains("OFFSET"), "{sql}");
+    }
+
+    /// count=false never asks for a count; count=true asks only when the
+    /// page cannot show the total: more rows past it, or an off-the-end page.
+    #[test]
+    fn only_a_counted_page_that_cannot_show_its_total_asks_for_a_count() {
+        let p = |offset, count| Page {
+            offset,
+            limit: 10,
+            count,
+        };
+        for (offset, rows, more) in [(0, 10, true), (20, 0, false), (20, 3, false), (0, 0, false)] {
+            assert!(page_total(&p(offset, false), rows, more).is_some());
+        }
+        assert_eq!(page_total(&p(20, false), 10, true), Some(31));
+        assert_eq!(page_total(&p(0, true), 10, true), None);
+        assert_eq!(page_total(&p(20, true), 0, false), None, "off the end");
+        assert_eq!(page_total(&p(20, true), 3, false), Some(23), "last page");
+        assert_eq!(
+            page_total(&p(0, true), 0, false),
+            Some(0),
+            "nothing matches"
+        );
+    }
+
+    /// The count runs over exactly the page's arms: the same WHERE and the
+    /// same binds, a count per arm, no window.
+    #[test]
+    fn the_count_reads_the_same_arms_as_the_page() {
+        let w = vec!["tenant_id = $1".to_owned(), "entity ?| $4".to_owned()];
+        assert_eq!(
+            count_sql(&w, None),
+            "SELECT (SELECT count(*) FROM entities WHERE tenant_id = $1 AND entity ?| $4)"
+        );
+        let sql = count_sql(&w, Some(OneType { first: 2, all: 3 }));
+        assert_eq!(
+            sql,
+            "SELECT (SELECT count(*) FROM entities WHERE tenant_id = $1 AND entity ?| $4 \
+             AND types[1] = $2) + (SELECT count(*) FROM entities WHERE tenant_id = $1 \
+             AND entity ?| $4 AND cardinality(types) > 1 AND types[1] IS DISTINCT FROM $2 \
+             AND types @> $3)"
+        );
     }
 
     /// 6.3.10: without count=true no total is owed, so the statement carries
@@ -1596,7 +1745,7 @@ mod tests {
             limit: 10,
             count: false,
         };
-        let (sql, paged) = query_sql("entity", &wheres(), Some(&p), true, &mut binds);
+        let (sql, paged) = query_sql("entity", &wheres(), None, Some(&p), true, &mut binds);
         assert!(paged);
         assert!(!sql.contains("count(*) OVER ()"), "{sql}");
         assert!(sql.contains("LIMIT $2 OFFSET $3"), "{sql}");
@@ -1618,7 +1767,7 @@ mod tests {
             limit: i64::MAX,
             count: false,
         };
-        let (sql, paged) = query_sql("entity", &wheres(), Some(&p), true, &mut binds);
+        let (sql, paged) = query_sql("entity", &wheres(), None, Some(&p), true, &mut binds);
         assert!(paged);
         assert!(sql.contains("LIMIT $2"), "{sql}");
         assert!(
@@ -1634,7 +1783,14 @@ mod tests {
     #[test]
     fn an_undecided_query_carries_a_safety_limit_and_no_offset() {
         let mut binds = vec![Bind::Text("t".to_owned())];
-        let (sql, paged) = query_sql("entity", &wheres(), Some(&page(20, 10)), false, &mut binds);
+        let (sql, paged) = query_sql(
+            "entity",
+            &wheres(),
+            None,
+            Some(&page(20, 10)),
+            false,
+            &mut binds,
+        );
         assert!(!paged);
         assert!(sql.contains("LIMIT $2"), "{sql}");
         assert!(!sql.contains("OFFSET"), "offset cannot be pushed: {sql}");
@@ -1650,13 +1806,13 @@ mod tests {
     #[test]
     fn a_query_without_a_page_falls_back_to_the_ceiling() {
         let mut binds = vec![Bind::Text("t".to_owned())];
-        let (sql, paged) = query_sql("entity", &wheres(), None, false, &mut binds);
+        let (sql, paged) = query_sql("entity", &wheres(), None, None, false, &mut binds);
         assert!(!paged);
         assert!(sql.contains("LIMIT $2"), "{sql}");
         assert!(matches!(binds[1], Bind::Int(MAX_UNDECIDED_ROWS)));
         // an exactly decided query with no page is materialized whole too
         let mut binds = vec![Bind::Text("t".to_owned())];
-        let (sql, _) = query_sql("entity", &wheres(), None, true, &mut binds);
+        let (sql, _) = query_sql("entity", &wheres(), None, None, true, &mut binds);
         assert!(sql.contains("LIMIT $2"), "{sql}");
     }
 

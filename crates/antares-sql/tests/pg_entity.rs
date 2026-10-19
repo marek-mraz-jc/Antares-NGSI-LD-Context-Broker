@@ -1211,3 +1211,96 @@ async fn a_cancelled_type_list_returns_its_connection() {
             .expect("the list reads");
     }
 }
+
+/// T-4781: one named type is read as two arms, the Entities whose first
+/// type it is and those of several types that carry it later. The merged
+/// page must keep id order across both, every page and the count must be
+/// exactly `types @> ARRAY[T]`, and nothing of another type or another
+/// Tenant may enter.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_type_page_merges_both_arms_in_id_order_with_the_exact_count() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgEntityStore::new(pool.clone());
+    let ex = |t: &str| format!("https://uri.etsi.org/ngsi-ld/default-context/{t}");
+    let t = TenantId::new("pgonetype").expect("tenant");
+    let other = TenantId::new("pgonetype2").expect("tenant");
+    for (tenant, name) in [(&t, "pgonetype"), (&other, "pgonetype2")] {
+        pg::ensure_tenant(&pool, tenant).await.expect("tenant row");
+        sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
+            .bind(name)
+            .execute(&pool)
+            .await
+            .expect("clean");
+    }
+    // A first on :1 :3 :5, A second on :2 :4, B alone on :6, A in the other Tenant
+    let seed = [
+        (&t, 1, vec!["A"]),
+        (&t, 2, vec!["B", "A"]),
+        (&t, 3, vec!["A"]),
+        (&t, 4, vec!["C", "A"]),
+        (&t, 5, vec!["A", "B"]),
+        (&t, 6, vec!["B"]),
+        (&other, 7, vec!["A"]),
+    ];
+    for (tenant, n, types) in &seed {
+        let id = format!("urn:ngsi-ld:X:{n}");
+        let types: Vec<String> = types.iter().map(|t| ex(t)).collect();
+        assert!(s
+            .create(
+                tenant,
+                &id,
+                &json!({"id": id, "type": types, "createdAt": "2026-08-04T09:00:00Z",
+                        "modifiedAt": "2026-08-04T09:00:00Z"}),
+            )
+            .await
+            .expect("create"));
+    }
+    let groups = vec![vec![ex("A")]];
+    let page = |offset, count| {
+        let groups = &groups;
+        let s = &s;
+        let t = &t;
+        async move {
+            s.query(
+                t,
+                &antares_sql::store::pg::entity::EntityFilter {
+                    types: Some(groups),
+                    page: Some(antares_sql::store::pg::entity::Page {
+                        offset,
+                        limit: 2,
+                        count,
+                    }),
+                    expand: &ex,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("query")
+        }
+    };
+    let ids = |out: &antares_sql::store::pg::entity::QueryOutcome| -> Vec<String> {
+        out.rows
+            .iter()
+            .map(|d| d["id"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    };
+    let mut seen = Vec::new();
+    for offset in [0, 2, 4] {
+        let out = page(offset, true).await;
+        assert_eq!(out.total, Some(5), "count at offset {offset}");
+        seen.extend(ids(&out));
+    }
+    assert_eq!(
+        seen,
+        (1..=5)
+            .map(|n| format!("urn:ngsi-ld:X:{n}"))
+            .collect::<Vec<_>>()
+    );
+    let out = page(10, true).await;
+    assert!(out.rows.is_empty());
+    assert_eq!(out.total, Some(5), "an off-the-end page still counts");
+    let out = page(2, false).await;
+    assert_eq!(ids(&out), ["urn:ngsi-ld:X:3", "urn:ngsi-ld:X:4"]);
+    assert_eq!(out.total, Some(5), "uncounted: one past the page");
+}
