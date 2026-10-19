@@ -1056,3 +1056,91 @@ async fn a_tenant_size_scan_gives_up_within_its_bound() {
         .await
         .expect("drop the own database");
 }
+
+/// T-4669: a history append holds `FOR KEY SHARE` on its Entity until it
+/// commits. A write of that Entity goes through (it changes no key), and only
+/// a DELETE waits for the append, which is the one thing the lock is for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_passes_an_in_flight_history_append_and_a_delete_waits() {
+    use antares_store::Kind;
+    use std::time::Duration;
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let t = TenantId::new(&format!("pgks{run}")).expect("tenant");
+    let id = "urn:ngsi-ld:BikeHireDockingStation:001";
+    let doc = |n: i64| {
+        serde_json::json!({
+            "id": id, "type": "BikeHireDockingStation",
+            "createdAt": "2026-10-19T09:00:00Z", "modifiedAt": "2026-10-19T09:00:00Z",
+            "n": {"type": "Property", "value": n}
+        })
+    };
+    store
+        .create(&t, Kind::Entity, id, doc(1))
+        .await
+        .expect("create");
+
+    // the append in flight, as `append_in` takes it
+    let mut append = pool.begin().await.expect("begin");
+    pg::set_tenant(&mut append, &t).await.expect("set_tenant");
+    sqlx::query("SELECT 1 FROM entities WHERE tenant_id = $1 AND id = $2 FOR KEY SHARE")
+        .bind(t.as_str())
+        .bind(id)
+        .fetch_optional(&mut *append)
+        .await
+        .expect("key share");
+
+    let upserted = tokio::time::timeout(
+        Duration::from_secs(3),
+        store.batch_upsert(&t, vec![(id.to_owned(), doc(2))]),
+    )
+    .await;
+    assert!(
+        matches!(upserted, Ok(Ok(_))),
+        "a batch upsert waited on the history append: {upserted:?}"
+    );
+    let mutated = tokio::time::timeout(
+        Duration::from_secs(3),
+        store.mutate::<(), ()>(&t, Kind::Entity, id, |e| {
+            e["n"]["value"] = serde_json::json!(3);
+            Ok(())
+        }),
+    )
+    .await;
+    assert!(
+        matches!(mutated, Ok(Ok(Some(Ok(()))))),
+        "a patch waited on the history append: {mutated:?}"
+    );
+
+    let mut delete = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL lock_timeout = '750ms'")
+        .execute(&mut *delete)
+        .await
+        .expect("lock_timeout");
+    pg::set_tenant(&mut delete, &t).await.expect("set_tenant");
+    let blocked = sqlx::query("DELETE FROM entities WHERE tenant_id = $1 AND id = $2")
+        .bind(t.as_str())
+        .bind(id)
+        .execute(&mut *delete)
+        .await;
+    assert!(
+        blocked.is_err(),
+        "a delete stepped over an in-flight history append"
+    );
+    drop(delete);
+    append.commit().await.expect("commit");
+
+    assert!(store.delete(&t, Kind::Entity, id).await.expect("delete"));
+    sqlx::query("DELETE FROM tenants WHERE tenant_id = $1")
+        .bind(t.as_str())
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+}

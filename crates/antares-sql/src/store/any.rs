@@ -1413,10 +1413,10 @@ mod db_error_tests {
 // this enum stays an implementation detail of the built-in backends, no
 // longer the API surface.
 /// The most Entities one history transaction appends (T-4085). Each append
-/// holds `FOR KEY SHARE` on its Entity until the commit, and a concurrent
-/// write's `FOR UPDATE` waits for it: a 1000-member page in one transaction
-/// would hold every other page over the same ids for the whole append (T-4123).
-/// Small requests, the HSL stream's, are one transaction.
+/// holds `FOR KEY SHARE` on its Entity until the commit, which only a DELETE
+/// of that Entity waits for (writes lock `FOR NO KEY UPDATE`, T-4669); a
+/// 1000-member page in one transaction would hold such a delete for the whole
+/// append (T-4123). Small requests, the HSL stream's, are one transaction.
 // ponytail: a fixed chunk; a measured one if lock waits still show on dev.
 #[cfg(feature = "postgres")]
 const HISTORY_CHUNK: usize = 64;
@@ -1938,10 +1938,15 @@ impl antares_store::TemporalDriver for AnyStore {
     async fn event_list(&self, evs: &[antares_store::TemporalEvent]) -> Result<(), NgsiError> {
         #[cfg(feature = "postgres")]
         if let (AnyStore::Pg(p), Some(appends)) = (self, antares_store::fold_appends(evs)) {
+            // One chunk that fails (a lock timeout) loses its own Entities'
+            // history, never the rest of the request's (T-4669).
+            let mut first = None;
             for chunk in appends.chunks(HISTORY_CHUNK) {
-                p.temporal.append_many(chunk).await.map_err(db)?;
+                if let Err(e) = p.temporal.append_many(chunk).await {
+                    first.get_or_insert(e);
+                }
             }
-            return Ok(());
+            return first.map_or(Ok(()), |e| Err(db(e)));
         }
         antares_store::drain_events(self, evs).await
     }
