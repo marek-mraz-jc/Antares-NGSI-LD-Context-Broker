@@ -8,8 +8,8 @@
 //! classifies by, T-4498), never typed per view; a role names only an attribute the view shows,
 //! so the guide never names one it hides. A type the table does not know gets no guide line.
 
-use crate::schema::Names;
-use antares_ops::guide::{Guide, Time, GUIDES};
+use crate::schema::{Args, Checked, Names};
+use antares_ops::guide::{long_text, Guide, Time, GUIDES};
 
 /// Whether the view shows `attribute`: its leading name, before a `.` or `[`.
 fn shows(names: &Names, attribute: &str) -> bool {
@@ -78,6 +78,17 @@ fn line(guide: &Guide, names: &Names, week: &(String, String)) -> Option<String>
     if !filters.is_empty() {
         parts.push(format!("Filter on {}.", filters.join(", ")));
     }
+    let long: Vec<&str> = long_text(t)
+        .iter()
+        .copied()
+        .filter(|a| shows(names, a))
+        .collect();
+    if !long.is_empty() {
+        parts.push(format!(
+            "{} is left out unless asked for in attrs or pick.",
+            long.join(", ")
+        ));
+    }
     Some(parts.join(" "))
 }
 
@@ -94,6 +105,43 @@ pub(crate) fn text(names: &Names, now: chrono::DateTime<chrono::Utc>) -> Option<
         .filter_map(|g| line(g, names, &week))
         .collect();
     (!lines.is_empty()).then(|| format!("Query guide, per type:\n{}", lines.join("\n")))
+}
+
+/// A read that names no `attrs` or `pick` leaves out the long text attributes (T-4582) of the
+/// types it asks for, or of every type the view shows when it names none, by adding them to `omit`.
+pub(crate) fn lean(args: &mut Args, names: &Names) {
+    if args.contains_key("attrs") || args.contains_key("pick") {
+        return;
+    }
+    let types: Vec<&str> = match args.get("type") {
+        Some(Checked::Many(types)) => types.iter().map(String::as_str).collect(),
+        _ => GUIDES
+            .iter()
+            .map(|g| g.entity_type)
+            .filter(|t| names.has_type(t))
+            .collect(),
+    };
+    let mut long: Vec<String> = Vec::new();
+    for attribute in types.into_iter().flat_map(long_text) {
+        if shows(names, attribute) && !long.iter().any(|a| a == attribute) {
+            long.push((*attribute).to_owned());
+        }
+    }
+    if long.is_empty() {
+        return;
+    }
+    match args.get_mut("omit") {
+        Some(Checked::Many(omit)) => {
+            for attribute in long {
+                if !omit.contains(&attribute) {
+                    omit.push(attribute);
+                }
+            }
+        }
+        _ => {
+            args.insert("omit", Checked::Many(long));
+        }
+    }
 }
 
 /// The guide of one type the view shows (`describe_type`, T-4537): its line, then the same as
@@ -135,6 +183,86 @@ mod tests {
             types.iter().map(|t| (*t).to_owned()).collect(),
             attributes.iter().map(|a| (*a).to_owned()).collect(),
         )
+    }
+
+    fn omit_of(args: &Args) -> Option<Vec<String>> {
+        match args.get("omit") {
+            Some(Checked::Many(v)) => Some(v.clone()),
+            _ => None,
+        }
+    }
+
+    fn typed(types: &[&str]) -> Args {
+        let mut args = Args::new();
+        args.insert(
+            "type",
+            Checked::Many(types.iter().map(|t| (*t).to_owned()).collect()),
+        );
+        args
+    }
+
+    #[test]
+    fn an_article_read_leaves_out_its_body_unless_named() {
+        let view = names(&["Article", "Event"], &["name", "content", "dateGmt"]);
+        let mut query = typed(&["Article"]);
+        lean(&mut query, &view);
+        assert_eq!(omit_of(&query), Some(vec!["content".to_owned()]));
+        // retrieve_entity names no type: every type the view shows counts
+        let mut one = Args::new();
+        lean(&mut one, &view);
+        assert_eq!(omit_of(&one), Some(vec!["content".to_owned()]));
+        for asked in ["attrs", "pick"] {
+            let mut named = typed(&["Article"]);
+            named.insert(asked, Checked::Many(vec!["id".into(), "content".into()]));
+            lean(&mut named, &view);
+            assert_eq!(omit_of(&named), None, "{asked}");
+        }
+        let mut more = typed(&["Article"]);
+        more.insert("omit", Checked::Many(vec!["url".into(), "content".into()]));
+        lean(&mut more, &view);
+        assert_eq!(
+            omit_of(&more),
+            Some(vec!["url".to_owned(), "content".to_owned()])
+        );
+        let mut other = typed(&["Article", "Article"]);
+        other.insert("omit", Checked::Many(vec!["url".into()]));
+        lean(&mut other, &view);
+        assert_eq!(
+            omit_of(&other),
+            Some(vec!["url".to_owned(), "content".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_type_without_long_text_or_a_view_hiding_it_reads_as_before() {
+        let view = names(&["Article", "Event"], &["name", "content"]);
+        let mut events = typed(&["Event"]);
+        lean(&mut events, &view);
+        assert_eq!(omit_of(&events), None);
+        let hidden = names(&["Article"], &["name"]);
+        let mut articles = typed(&["Article"]);
+        lean(&mut articles, &hidden);
+        assert_eq!(omit_of(&articles), None);
+        let mut any = Args::new();
+        lean(&mut any, &names(&["Event"], &["content"]));
+        assert_eq!(omit_of(&any), None);
+    }
+
+    #[test]
+    fn the_article_guide_says_its_body_is_left_out() -> Result<(), String> {
+        let shown = text(
+            &names(&["Article"], &["name", "content", "dateGmt"]),
+            saturday(),
+        )
+        .ok_or("a guide")?;
+        assert!(
+            shown.contains("content is left out unless asked for in attrs or pick."),
+            "{shown}"
+        );
+        assert!(shown.contains("time dateGmt (an instant)"), "{shown}");
+        let hidden = text(&names(&["Article"], &["name"]), saturday()).ok_or("a guide")?;
+        assert!(!hidden.contains("content"), "{hidden}");
+        Ok(())
     }
 
     #[test]
