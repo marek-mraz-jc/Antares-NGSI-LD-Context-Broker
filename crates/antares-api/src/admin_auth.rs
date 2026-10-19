@@ -194,6 +194,10 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(!constant_time_eq(b"ab", b"abc"));
+        // two wrong bytes whose differences cancel under XOR: an accumulator
+        // that XORs instead of ORs would admit this guess (T-4778 mutant)
+        assert!(!constant_time_eq(b"abc", b"`cc"));
+        assert!(!auth().admits(Some(b"Bearer 1023456789abcdef0123456789abcdef")));
     }
 
     #[test]
