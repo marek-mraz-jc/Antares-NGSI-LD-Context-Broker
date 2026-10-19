@@ -910,6 +910,37 @@ pub fn mount<S: Surface>(surface: S) -> Box<dyn antares_api::ApiSurface> {
     })
 }
 
+/// The methods a read-only surface answers.
+pub const READ_ONLY_METHODS: &str = "GET, HEAD, OPTIONS";
+
+/// A read-only surface's answer to `method`: `OPTIONS` lists [`READ_ONLY_METHODS`], any method but
+/// `GET` and `HEAD` is the surface's own `refused` answer with that list in `Allow`, and `HEAD` is
+/// `get`'s answer without its body.
+pub async fn read_only(
+    method: &Method,
+    refused: impl FnOnce() -> Response,
+    get: impl std::future::Future<Output = Response>,
+) -> Response {
+    let allow = HeaderValue::from_static(READ_ONLY_METHODS);
+    if method == Method::OPTIONS {
+        return axum::response::IntoResponse::into_response((
+            StatusCode::NO_CONTENT,
+            [(axum::http::header::ALLOW, allow)],
+        ));
+    }
+    if method != Method::GET && method != Method::HEAD {
+        let mut reply = refused();
+        reply.headers_mut().insert(axum::http::header::ALLOW, allow);
+        return reply;
+    }
+    let reply = get.await;
+    if method == Method::HEAD {
+        let (parts, _) = reply.into_parts();
+        return Response::from_parts(parts, Body::empty());
+    }
+    reply
+}
+
 /// Register the forward transport `make` builds over the broker's
 /// operations: every federation forward asks it first, and a forward it
 /// does not serve goes over HTTP (ADR-0025 rule 8). The composition root

@@ -27,9 +27,9 @@ use antares_ops::{
     Caller, OperationId, Ops, OpsRequest, Page, Pushdown, Refusal, Scanned, Surface, ViewOps,
 };
 use axum::extract::{Query, Request};
-use axum::http::header::{ALLOW, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::request::Parts;
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
 use axum::Router;
@@ -58,9 +58,6 @@ const CONFORMANCE: [&str; 3] = [
     "http://www.opengis.net/spec/iot_sensing/1.1/req/resource-path",
     "http://www.opengis.net/spec/iot_sensing/1.1/req/request-data",
 ];
-
-/// The methods a read-only surface answers.
-const ALLOWED: &str = "GET, HEAD, OPTIONS";
 
 /// The start of every location history a HistoricalLocations page reads.
 const EPOCH: &str = "1970-01-01T00:00:00Z";
@@ -139,39 +136,25 @@ type Done = Result<Value, Problem>;
 
 async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
     let (parts, _) = req.into_parts();
-    let method = &parts.method;
-    if method == Method::OPTIONS {
-        return (
-            StatusCode::NO_CONTENT,
-            [(ALLOW, HeaderValue::from_static(ALLOWED))],
-        )
-            .into_response();
-    }
-    if method != Method::GET && method != Method::HEAD {
-        let mut reply = Problem(
+    let refused = || {
+        Problem(
             StatusCode::METHOD_NOT_ALLOWED,
             "this surface is read only".into(),
         )
-        .reply();
-        reply
-            .headers_mut()
-            .insert(ALLOW, HeaderValue::from_static(ALLOWED));
-        return reply;
-    }
-    let reply = match respond(ops, caller, &parts).await {
-        Ok(doc) => (
-            StatusCode::OK,
-            [(CONTENT_TYPE, "application/json")],
-            doc.to_string(),
-        )
-            .into_response(),
-        Err(problem) => problem.reply(),
+        .reply()
     };
-    if method == Method::HEAD {
-        let (parts, _) = reply.into_parts();
-        return Response::from_parts(parts, axum::body::Body::empty());
-    }
-    reply
+    antares_ops::read_only(&parts.method, refused, async {
+        match respond(ops, caller, &parts).await {
+            Ok(doc) => (
+                StatusCode::OK,
+                [(CONTENT_TYPE, "application/json")],
+                doc.to_string(),
+            )
+                .into_response(),
+            Err(problem) => problem.reply(),
+        }
+    })
+    .await
 }
 
 /// One request below `/{view}/sta/v1.1`: a view id is `[a-z0-9-]`, so its raw segment is its id.
