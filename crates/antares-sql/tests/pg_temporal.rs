@@ -1258,6 +1258,44 @@ async fn an_unchanged_append_records_no_new_instance() {
     s.append(&tn, id, &shell, &adds).await.expect("append");
     assert_eq!(rows(&other, speed).await.len(), 1);
 
+    // T-4669: without observedAt each datasetId is compared with its own newest
+    // row; the first write of a series has none and is recorded.
+    let note = "https://uri.etsi.org/ngsi-ld/default-context/note";
+    let in_set =
+        |ds: &str, v: &str| json!({note: [{"type": "Property", "value": v, "datasetId": ds}]});
+    for (ds, v) in [
+        ("urn:ds:a", "x"),
+        ("urn:ds:b", "x"),
+        ("urn:ds:a", "x"),
+        ("urn:ds:b", "y"),
+    ] {
+        let (tn, adds) = append(&t, in_set(ds, v));
+        s.append(&tn, id, &shell, &adds).await.expect("append");
+    }
+    let got: Vec<_> = rows(&t, note)
+        .await
+        .into_iter()
+        .map(|r| (r.1.unwrap_or_default(), r.2["value"].clone()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("urn:ds:a".to_owned(), json!("x")),
+            ("urn:ds:b".to_owned(), json!("x")),
+            ("urn:ds:b".to_owned(), json!("y"))
+        ],
+        "a repeat in one series is skipped, a change in the other recorded"
+    );
+    // The newest row resent under its own instanceId with another value is a
+    // correction of that row, not a skip and not a second row.
+    let newest = rows(&t, note).await.pop().expect("a row");
+    let fix = json!({note: [{"type": "Property", "value": "z", "datasetId": "urn:ds:b",
+        "instanceId": newest.0, "createdAt": "2026-08-15T09:00:00Z", "modifiedAt": newest.2["modifiedAt"]}]});
+    s.append(&t, id, &shell, &fix).await.expect("append");
+    let got = rows(&t, note).await;
+    assert_eq!(got.len(), 3, "still three rows");
+    assert_eq!(got[2].2["value"], json!("z"), "the newest row corrected");
+
     // The reconstructed evolution reads the same series.
     let doc = s.get(&t, id).await.expect("get").expect("present");
     assert_eq!(doc[name].as_array().map(Vec::len), Some(3), "{doc}");

@@ -137,6 +137,18 @@ const GEO_VALUE: &str = "CASE WHEN jsonb_typeof(e->'data'->'value') = 'object'
                            'Polygon','MultiPolygon')
                      THEN try_geomfromgeojson((e->'data'->'value')::text) END";
 
+/// Whether the newest stored instance of row `e`'s (attribute, datasetId) is
+/// another instance with the same value (T-4507): one row read by the index
+/// (tenant_id, entity_id, attr_id, observed_at DESC), false when none is stored.
+const NEWEST_REPEATS: &str = "COALESCE((
+             SELECT x.instance_id <> e->>'instance_id'
+                    AND x.data - ARRAY['instanceId','createdAt','modifiedAt']
+                        = (e->'data') - ARRAY['instanceId','createdAt','modifiedAt']
+             FROM attr_instances x
+             WHERE x.tenant_id = $1 AND x.entity_id = $2 AND x.attr_id = e->>'attr_id'
+               AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
+             ORDER BY x.observed_at DESC LIMIT 1), false)";
+
 /// The rows of one append that are new observations (T-4507): of rows equal
 /// but for their stamps, the first, and of rows with an `observedAt`, one per
 /// (attribute, datasetId, observedAt). What the table already holds is
@@ -249,7 +261,10 @@ async fn insert_rows(
     }
     // `$4` off: today's row per write. On: a row with an observedAt already
     // stored, or without one equal to the newest stored instance, is no new
-    // observation. Both probes ride (tenant_id, entity_id, attr_id, observed_at DESC).
+    // observation. Both probes ride (tenant_id, entity_id, attr_id, observed_at DESC)
+    // and read one row: the second is NEWEST_REPEATS, never a scan of the
+    // attribute's whole history (T-4669: that scan cost ~90 ms a station at a
+    // month of history, and a minute's batch of 2,063 stations recorded nothing).
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO attr_instances
            (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at,
@@ -259,15 +274,13 @@ async fn insert_rows(
                 (e->>'modified_at')::timestamptz, (e->>'deleted_at')::timestamptz,
                 e->'data', {GEO_VALUE}, NULLIF(e->'provenance', 'null'::jsonb)
          FROM jsonb_array_elements($3::jsonb) AS e
-         WHERE NOT $4 OR NOT EXISTS (
-           SELECT 1 FROM attr_instances x
-           WHERE x.tenant_id = $1 AND x.entity_id = $2 AND {same} AND CASE
-             WHEN e->'data' ? 'observedAt' THEN x.observed_at = (e->>'observed_at')::timestamptz
-             ELSE x.data - {STAMPS} = (e->'data') - {STAMPS} AND x.observed_at = (
-               SELECT max(y.observed_at) FROM attr_instances y
-               WHERE y.tenant_id = $1 AND y.entity_id = $2 AND y.attr_id = e->>'attr_id'
-                 AND y.dataset_id IS NOT DISTINCT FROM e->>'dataset_id')
-           END)
+         WHERE NOT $4 OR NOT CASE
+           WHEN e->'data' ? 'observedAt' THEN EXISTS (
+             SELECT 1 FROM attr_instances x
+             WHERE x.tenant_id = $1 AND x.entity_id = $2 AND {same}
+               AND x.observed_at = (e->>'observed_at')::timestamptz)
+           ELSE {NEWEST_REPEATS}
+         END
          ON CONFLICT (tenant_id, entity_id, attr_id, instance_id, observed_at)
            DO UPDATE SET data = EXCLUDED.data, modified_at = EXCLUDED.modified_at,
                          dataset_id = EXCLUDED.dataset_id,
@@ -1333,6 +1346,19 @@ impl PgTemporalStore {
 mod tests {
     use super::*;
     use crate::compile::temporal::InstanceRange;
+
+    /// T-4669: the dedup of an instance without observedAt reads the newest
+    /// stored row through the index and nothing older. A correlated max()
+    /// compared row by row read the attribute's whole history per write
+    /// (~90 ms a station at a month deep, measured in the task).
+    #[test]
+    fn the_newest_row_probe_reads_one_row() {
+        assert!(NEWEST_REPEATS.contains("ORDER BY x.observed_at DESC LIMIT 1"));
+        assert!(!NEWEST_REPEATS.to_lowercase().contains("max("));
+        // Its stamps are the ones every other comparison here ignores.
+        assert!(NEWEST_REPEATS.contains(&STAMPS["ARRAY".len()..]));
+        assert!(NEWEST_REPEATS.contains("x.tenant_id = $1 AND x.entity_id = $2"));
+    }
 
     /// Two callers fall back to `attr_object_expr(&TemporalFilter::default())`
     /// when a range is outside the compiler's exact subset, and unwrap it:
