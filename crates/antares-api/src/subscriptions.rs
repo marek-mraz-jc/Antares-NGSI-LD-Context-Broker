@@ -868,6 +868,48 @@ fn clause_of(kind: Kind, sub: &'static str, csub: &'static str) -> &'static str 
     }
 }
 
+/// Query Entities: the clause a socket's own Subscription is decided as.
+const WATCH: &str = "5.7.2";
+
+/// ADR-0026 rule 4 (T-4755): whether `uri` is the endpoint of the
+/// connection making this very call. The sink is the test, as it is for
+/// the endpoint itself: it accepts a socket URI only inside that
+/// connection's call, so HTTP and any other connection answer `false`.
+fn own_socket(st: &AppState, uri: Option<&str>) -> bool {
+    uri.is_some_and(|u| u.starts_with(SOCKET_ENDPOINT) && st.sinks.require(u, &[]).is_ok())
+}
+
+fn endpoint_uri(sub: &Map<String, Value>) -> Option<&str> {
+    sub.get("notification")?
+        .get("endpoint")?
+        .get("uri")?
+        .as_str()
+}
+
+/// The clause an operation on the stored Subscription `id` is decided as:
+/// [`WATCH`] when its endpoint is the calling socket, `sub` otherwise.
+async fn clause_on(
+    st: &AppState,
+    tenant: &TenantId,
+    kind: Kind,
+    id: &str,
+    sub: &'static str,
+    csub: &'static str,
+) -> Result<&'static str, ApiError> {
+    if kind == Kind::Subscription {
+        let doc = st.store.get(tenant, kind, id).await?;
+        if own_socket(
+            st,
+            doc.as_ref()
+                .and_then(Value::as_object)
+                .and_then(endpoint_uri),
+        ) {
+            return Ok(WATCH);
+        }
+    }
+    Ok(clause_of(kind, sub, csub))
+}
+
 pub async fn create(
     st: &AppState,
     kind: Kind,
@@ -891,8 +933,9 @@ pub async fn create(
         Some(_) => sub_members(&norm),
         None => crate::entities::ReadMembers::default(),
     };
+    let watch = kind == Kind::Subscription && own_socket(st, endpoint_uri(&norm));
     gate!(
-        st, &tenant, headers, clause_of(kind, "5.8.1", "5.11.2"),
+        st, &tenant, headers, if watch { WATCH } else { clause_of(kind, "5.8.1", "5.11.2") },
         ids: named.as_slice(),
         types: &shown.types,
         attrs: &shown.attrs,
@@ -1034,7 +1077,8 @@ pub async fn retrieve(
     check_params(params, &["options", "format", "sysAttrs", "local"])?;
     let accept = parse_accept(headers)?;
     let ctx = request_context(&st.loader, headers).await?;
-    gate!(st, &tenant, headers, clause_of(kind, "5.8.3", "5.11.4"), ids: &[id]).await?;
+    let clause = clause_on(st, &tenant, kind, id, "5.8.3", "5.11.4").await?;
+    gate!(st, &tenant, headers, clause, ids: &[id]).await?;
     let doc = st
         .store
         .get(&tenant, kind, id)
@@ -1122,7 +1166,8 @@ pub async fn update(
     antares_model::EntityId::new(id)
         .map_err(|_| NgsiError::BadRequestData(format!("invalid subscription id {id:?}")))?;
     check_params(params, &["local"])?;
-    gate!(st, &tenant, headers, clause_of(kind, "5.8.2", "5.11.3"), ids: &[id]).await?;
+    let clause = clause_on(st, &tenant, kind, id, "5.8.2", "5.11.3").await?;
+    gate!(st, &tenant, headers, clause, ids: &[id]).await?;
     let parsed = parse_body(&st.loader, headers, body, BodyKind::MergePatch).await?;
     let obj = parsed.object(NgsiError::BadRequestData(
         "fragment must be a JSON object".into(),
@@ -1133,6 +1178,12 @@ pub async fn update(
         }
     }
     let norm = normalize_subscription(obj, &parsed.ctx, true)?;
+    // a fragment that moves the endpoint off the socket is no watch
+    let mut watch = clause == WATCH;
+    if watch && endpoint_uri(&norm).is_some_and(|u| !own_socket(st, Some(u))) {
+        gate!(st, &tenant, headers, "5.8.2", ids: &[id]).await?;
+        watch = false;
+    }
     check_endpoint(st, &norm)?;
     check_jsonld_context(st, &tenant, &norm).await?;
     #[cfg(feature = "views")]
@@ -1147,7 +1198,9 @@ pub async fn update(
     let res = st
         .store
         .mutate(&tenant, kind, id, |doc| {
-            if !own(st, doc) {
+            // a watch decided on the stored socket endpoint holds only
+            // while it is still that endpoint
+            if !own(st, doc) || (watch && !own_socket(st, doc.as_object().and_then(endpoint_uri))) {
                 return Err(NgsiError::ResourceNotFound(format!(
                     "subscription {id} not found"
                 )));
@@ -1206,7 +1259,8 @@ pub async fn delete(
     antares_model::EntityId::new(id)
         .map_err(|_| NgsiError::BadRequestData(format!("invalid subscription id {id:?}")))?;
     check_params(params, &["local"])?;
-    gate!(st, &tenant, headers, clause_of(kind, "5.8.5", "5.11.6"), ids: &[id]).await?;
+    let clause = clause_on(st, &tenant, kind, id, "5.8.5", "5.11.6").await?;
+    gate!(st, &tenant, headers, clause, ids: &[id]).await?;
     // ponytail: read, then delete; a Subscription of another view or the
     // root recreated under this id between the two is deleted with it. A
     // conditional delete for Subscriptions when that race matters.

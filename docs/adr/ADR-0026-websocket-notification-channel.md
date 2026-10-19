@@ -143,6 +143,29 @@ removed, hidden-only changes not sent, `watchedAttributes` intersected)
 hold because the Subscription is a view Subscription when it is made on
 `/x/views/{view}/ws`; nothing in the sink knows views.
 
+**Watching is a read (T-4755).** A Subscription whose endpoint is the
+connection making the request is decided by the engine as Query Entities
+(5.7.2) with the Subscription's types, Attributes, `q` and `geoQ`, for
+create, retrieve, update and delete alike; every other Subscription keeps
+its 5.8.x clause. The socket's own Subscription carries nothing a reader
+does not already get by polling: `deliver_as` runs `pre_notify` under the
+stored subject for every notification and drops the rows and Attributes
+the caller may not read (rule 8), so a read grant may watch what it may
+query and nothing more. The test is the sink's own (`parse_endpoint`
+accepts the URI only inside that connection's call), so an HTTP request,
+or another connection, naming the URI keeps the 5.8.x clause and is then
+400 as above. An update decided as a read leaves the endpoint a socket:
+a fragment naming any other endpoint keeps 5.8.2, and the stored
+Subscription is checked again inside the write.
+
+Decided (worker-4, owner may override): a read decides the socket's own
+Subscriptions, because a WebSocket Endpoint is how a reader watches, the
+gateway relays every socket as its caller (ADR-N-049 amended), and a
+5.8.1 grant would also let that caller create HTTP Subscriptions to any
+host the egress guard admits. Options: decide as 5.7.2 (chosen); require
+5.8.1 of every WebSocket reader; let the gateway's own account subscribe
+and filter in the gateway (the duplicate filter T-4755 removes).
+
 ### 5. Extensions, all `x-`
 
 | member | where | meaning |
