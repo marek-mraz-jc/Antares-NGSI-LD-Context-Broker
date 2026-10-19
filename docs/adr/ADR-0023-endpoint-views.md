@@ -351,9 +351,16 @@ amendment is the special case "one rule per type, no condition".
   served. A rule without a condition holds at every `t`. An Entity is
   answered when at least one instance survives.
 - **Writes (rule 7 per rule, K22).** The post-image must fall inside at
-  least one rule that allows every Attribute the write names; a write that
-  would move an Entity into a zone where it shows more is allowed only if
-  the writer's rule allows those Attributes.
+  least one rule, and every Attribute the write names must be allowed by a
+  rule that holds for the post-image: a write sets what the Entity then
+  shows, the union of its rules. A write that would move an Entity into a
+  zone where it shows more is allowed only if a rule holding there allows
+  those Attributes. Decided (worker-5, owner may override, T-4753): the
+  union, not one rule covering every name, because a view splits a type's
+  list past 256 names over several rules and the one-rule check refused
+  every row naming one name of each part (17,025 rows of the BBSK open data
+  on prod), and two writes, one per rule, already reached the same state;
+  options: union of holding rules, one rule per write.
 - **Disclosure, documented.** The attribute set reveals which rule matched:
   seeing `speed` means "in zone A". The view loader reports, in `/q/health`
   and the view's describe output, every rule whose condition reads an

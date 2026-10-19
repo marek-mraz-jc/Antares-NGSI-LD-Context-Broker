@@ -809,10 +809,13 @@ impl Filter {
         Some(Shown { only, omitted })
     }
 
-    /// ADR-0023 rule 7 per rule (K22): a write is allowed only when its
-    /// post-image falls whole inside one rule that holds for it and shows
-    /// every Attribute the write names, none of which its types omit. The
-    /// check a view's engine runs before it allows a write.
+    /// ADR-0023 rule 7 per rule (K22): a write is allowed only when some
+    /// rule holds for its post-image and every Attribute the write names is
+    /// shown by a rule that holds, none of which its types omit: the write
+    /// sets what the Entity then shows, the union of its rules. One rule
+    /// need not show them all, so a type whose list a view splits over
+    /// several rules is written whole (T-4753). The check a view's engine
+    /// runs before it allows a write.
     pub fn admits_write(
         &self,
         post_image: &Value,
@@ -829,12 +832,19 @@ impl Filter {
         if written.iter().any(|w| omitted(w)) {
             return false;
         }
-        self.rules.is_empty()
-            || self.rules.iter().any(|r| {
-                r.holds(post_image, ctx)
-                    && (r.every_attribute
-                        || written.iter().all(|w| r.attributes.iter().any(|a| a == w)))
-            })
+        if self.rules.is_empty() {
+            return true;
+        }
+        let holding: Vec<&Rule> = self
+            .rules
+            .iter()
+            .filter(|r| r.holds(post_image, ctx))
+            .collect();
+        !holding.is_empty()
+            && (holding.iter().any(|r| r.every_attribute)
+                || written
+                    .iter()
+                    .all(|w| holding.iter().any(|r| r.attributes.iter().any(|a| a == w))))
     }
 
     /// Say the answer was narrowed, and add the engine's warning, when the
@@ -2257,8 +2267,8 @@ mod tests {
         assert!(local.holds(&car(0.5), &ctx));
     }
 
-    /// ADR-0023 rule 7 per rule (K22): a write must fall whole inside one
-    /// rule that shows every Attribute it names.
+    /// ADR-0023 rule 7 per rule (K22): a write names only Attributes the
+    /// rules that hold for its post-image show.
     #[test]
     fn write_that_adds_speed_outside_zone_a_is_refused() {
         let f = zones();
@@ -2278,6 +2288,24 @@ mod tests {
         );
         let robot = json!({"id": "urn:ngsi-ld:Robot:1", "type": [iri("Robot")]});
         assert!(!f.admits_write(&robot, &[], &ctx), "outside every rule");
+    }
+
+    /// A type's list split over two rules of the same types (the Portal
+    /// splits past 256 names) is written whole: a write naming one name of
+    /// each part is admitted, and a name neither part shows is still refused
+    /// (T-4753: 17,025 open-data rows refused on prod).
+    #[test]
+    fn a_write_across_a_split_list_is_admitted_and_an_unlisted_name_refused() {
+        let ctx = ctx();
+        let f = Filter {
+            rules: vec![rule("Car", &["speed"]), rule("Car", &["status"])],
+            ..Filter::default()
+        };
+        let (speed, status, name) = (iri("speed"), iri("status"), iri("name"));
+        assert!(f.admits_write(&car(5.0), &[&speed, &status], &ctx));
+        assert!(!f.admits_write(&car(5.0), &[&speed, &name], &ctx));
+        let user = json!({"id": "urn:ngsi-ld:User:1", "type": [iri("User")]});
+        assert!(!f.admits_write(&user, &[&speed], &ctx), "no rule holds");
     }
 
     /// A rule over every Attribute admits a write naming any of them, and
