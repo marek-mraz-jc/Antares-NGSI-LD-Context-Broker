@@ -307,6 +307,33 @@ pub async fn run_current_state_contract(
             "paged implies decided: a LIMIT over an undecided set pages the wrong rows"
         );
     }
+    // Keyset (T-4683): `after_id` is optional too, but a driver that pages
+    // must honour it, or a discovery walk reads its first page forever.
+    let first = std::cmp::min(e1.as_str(), e2.as_str());
+    let after = d
+        .query_entities(
+            a,
+            &crate::filter::EntityFilter {
+                ids: Some(&ids_ref),
+                after_id: Some(first),
+                page: Some(crate::filter::Page {
+                    offset: 0,
+                    limit: 10,
+                    count: false,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query_entities");
+    if after.paged {
+        assert!(
+            after.rows.iter().all(|r| r["id"].as_str() > Some(first)),
+            "a paging driver returns only ids after `after_id`: {:?}",
+            after.rows
+        );
+        assert_eq!(after.rows.len(), 1, "the one id after {first} is kept");
+    }
 
     // `subscription_tenants` is the iteration domain the interval sweep and
     // both mirror hydrations walk. A backend may return MORE tenants than

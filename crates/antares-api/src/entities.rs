@@ -1546,6 +1546,7 @@ pub async fn filter_entities_paged(
                     },
                     keep_attrs: keep_attrs.as_deref(),
                     drop_attrs: drop_attrs.as_deref(),
+                    after_id: None,
                 },
             )
             .await?;

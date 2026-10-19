@@ -76,14 +76,25 @@ async fn scan_each(
         Narrow::Attr(a) => vec![a.to_owned()],
         _ => Vec::new(),
     };
-    let mut offset = 0usize;
+    // `read` counts toward the ceiling; `last` is the keyset cursor (T-4683).
+    // A backend that ignores `after_id` hands page one back again (its first
+    // id is `head`; compared for equality, so the store's collation never
+    // matters): the walk then falls back to OFFSET from where it is.
+    let mut read = 0usize;
+    let mut last: Option<String> = None;
+    let mut head: Option<String> = None;
+    let mut keyset = true;
     loop {
-        let want = max.saturating_sub(offset).min(page.max(1));
+        let want = max.saturating_sub(read).min(page.max(1));
         let f = EntityFilter {
             types: (!groups.is_empty()).then_some(&groups[..]),
             attrs: (!attrs.is_empty()).then_some(&attrs[..]),
+            after_id: last.as_deref().filter(|_| keyset),
             page: Some(Page {
-                offset: i64::try_from(offset).unwrap_or(i64::MAX),
+                offset: match keyset {
+                    true => 0,
+                    false => i64::try_from(read).unwrap_or(i64::MAX),
+                },
                 limit: i64::try_from(want.saturating_add(1)).unwrap_or(i64::MAX),
                 count: false,
             }),
@@ -91,6 +102,14 @@ async fn scan_each(
         };
         let out = st.store.query_entities(tenant, &f).await?;
         let mut rows = out.rows;
+        let first = rows.first().and_then(|d| d["id"].as_str());
+        if out.paged && keyset && last.is_some() && first.is_some() && first == head.as_deref() {
+            keyset = false;
+            continue;
+        }
+        if head.is_none() {
+            head = first.map(str::to_owned);
+        }
         let more = if out.paged {
             rows.len() > want
         } else {
@@ -106,12 +125,17 @@ async fn scan_each(
             return Ok(more);
         };
         rows.truncate(want);
-        offset = offset.saturating_add(rows.len());
+        read = read.saturating_add(rows.len());
+        last = rows
+            .last()
+            .and_then(|d| d["id"].as_str())
+            .map(str::to_owned)
+            .or(last);
         visible(st, tenant, view, rows, &mut each).await;
         if !more || want == 0 {
             return Ok(more);
         }
-        if offset >= max {
+        if read >= max {
             return Ok(true);
         }
     }
@@ -996,6 +1020,30 @@ mod discovery_folds {
             .expect("stats");
         assert_eq!(types.len(), 5);
         assert!(!partial);
+    }
+
+    /// T-4683: the fold walks by keyset, one page after the last id it read,
+    /// so every Entity is handed over exactly once and in id order, also when
+    /// a page holds a single row (an OFFSET walk re-read every skipped row:
+    /// 57 s for `/types?details=true` over one prod tenant).
+    #[tokio::test]
+    async fn a_keyset_walk_hands_each_entity_over_once() {
+        let st = AppState::new("test".into());
+        for i in [3, 0, 4, 1, 2] {
+            let id = format!("urn:ngsi-ld:B:{i}");
+            seed(&st, "ta", &id, json!({"id": id, "type": [BUILDING]})).await;
+        }
+        for page in [1, 2, 500] {
+            let mut ids = Vec::new();
+            let more = scan_each(&st, &tid("ta"), ALL, Narrow::Tenant, None, page, |d| {
+                ids.push(d["id"].as_str().map(str::to_owned));
+            })
+            .await
+            .expect("scan");
+            let want: Vec<_> = (0..5).map(|i| Some(format!("urn:ngsi-ld:B:{i}"))).collect();
+            assert_eq!(ids, want, "page {page}");
+            assert!(!more, "page {page}: the whole tenant was read");
+        }
     }
 
     /// A complete answer carries no warning; a truncated one carries exactly
