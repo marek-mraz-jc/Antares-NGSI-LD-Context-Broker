@@ -1,24 +1,17 @@
 name: image-jc
 
-# The joinedcontext platform's broker image (T-3636): the `full` surfaces,
-# the LinkML schema surface the gateway's schema routes forward to (T-3803)
-# and the platform's policy engine (`--features full,jc-policy,linkml,parquet,tabular,ical`), published
-# as `antares-broker-jc` — never as `antares-broker`, which stays the
-# vanilla image full.yml releases. Before anything is pushed, the image
-# proves what it carries (its auditable dependency list holds every surface
-# and the engine) and that it is still the broker: its plain root on
-# `ANTARES_POLICY=allow-all` passes every TP of dev/etsi-baseline.json,
-# TP by TP, like a vanilla cell. ship.yml pushes, signs and attests the
-# image; this workflow is its nightly ETSI proof.
-#
-# T-4721 (owner order 2026-10-19): ship.yml builds, checks and publishes the
-# jc image on every dev push in minutes. This workflow keeps the long ETSI
-# proof of the same image, nightly and on dispatch, and publishes nothing, so
-# one workflow alone publishes `antares-broker-jc`. It used to run on:
+# The nightly full test of the joinedcontext platform's broker image
+# (`antares-broker-jc`, T-3636; never `antares-broker`, which full.yml releases).
+# ship.yml builds, checks and publishes the image on every dev push in minutes
+# as `dev-<N>`. This workflow takes the newest `dev-<N>` by digest, re-scans
+# it, runs every ETSI suite on its plain root on `ANTARES_POLICY=allow-all`
+# against dev/etsi-baseline.json TP by TP, and only then adds `:<N>` and
+# `:latest` to the same digest with the full-tests attestation (T-4721, owner
+# order 2026-10-19: the long ETSI run is never on the publish path).
+# It used to build and publish on:
 #   push:
 #     branches: [dev]
 #     paths: [crates/**, addons/**, Cargo.toml, Cargo.lock, Dockerfile, .github/workflows/image-jc.yml]
-# with a publish job behind the ETSI one.
 on:
   schedule:
     - cron: "7 2 * * *"
@@ -28,46 +21,40 @@ concurrency:
   group: image-jc-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  FEATURES: full,jc-policy,linkml,parquet,tabular,ical
-  # what the jc image must carry, by crate name in its auditable list
-  CARRIES: antares-views antares-mcp antares-odata antares-ws antares-linkml joinedcontext-policy
-
 jobs:
   build:
-    name: Build the jc image
+    # T-4721: the full tests promote, they never rebuild. This takes the newest image ship.yml
+    # published on dev (`dev-<N>`, built and smoke-tested) by digest, and the promote job below
+    # adds `:<N>` and `:latest` to that same digest when the ETSI run on it is green.
+    name: Take the newest ship image
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     permissions:
       contents: read
+      actions: read
+    outputs:
+      n: ${{ steps.pick.outputs.n }}
+      digest: ${{ steps.pick.outputs.digest }}
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v7
-      - name: Build with the platform's features
+      - id: pick
         run: |
-          docker build --build-arg FEATURES="$FEATURES" \
-            --build-arg VERSION=dev --build-arg REVISION="$GITHUB_SHA" \
-            -t antares-local:latest .
-      - name: SBOM of the built image (syft reads the cargo-auditable list)
-        uses: anchore/sbom-action@v0
-        with:
-          image: antares-local:latest
-          format: spdx-json
-          output-file: antares-broker-jc.sbom.spdx.json
-          upload-artifact: false
-      - name: The image carries every surface and the engine
-        run: |
-          rc=0
-          for crate in $CARRIES; do
-            if jq -e --arg c "$crate" '[.packages[].name] | index($c)' \
-                 antares-broker-jc.sbom.spdx.json >/dev/null; then
-              echo "carries $crate"
-            else
-              echo "MISSING $crate"; rc=1
-            fi
-          done
-          exit $rc
-      # T-3834: the bytes that get pushed carry no HIGH or CRITICAL with a fixed version; an
-      # exception is a .trivyignore line with its reason, task and expiry.
+          set -euo pipefail
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ship.yml/runs?branch=dev&status=success&per_page=1" \
+                  --jq '.workflow_runs[0] // empty | "\(.run_number) \(.head_sha)"')
+          [ -n "$run" ] || { echo "no green ship run on dev: nothing to test"; exit 1; }
+          read -r n sha <<<"$run"
+          img="ghcr.io/${GITHUB_REPOSITORY_OWNER}/antares-broker-jc"
+          docker pull -q "$img:dev-$n"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$img:dev-$n")
+          digest=${digest#*@}
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "no digest for $img:dev-$n"; exit 1; }
+          docker tag "$img:dev-$n" antares-local:latest
+          echo "n=$n" >> "$GITHUB_OUTPUT"; echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "testing \`$img@$digest\` (dev-$n, commit ${sha::7})" >> "$GITHUB_STEP_SUMMARY"
+      # T-3834, re-run nightly on the published bytes: an advisory published since ship scanned
+      # them turns this red and nothing is promoted.
       - name: No fixable HIGH or CRITICAL in the image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -79,9 +66,7 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: antares-image-jc
-          path: |
-            antares-image.tgz
-            antares-broker-jc.sbom.spdx.json
+          path: antares-image.tgz
           retention-days: 3
 
   etsi:
@@ -122,3 +107,39 @@ jobs:
             cells/ETSI-cell-file/tp-status.csv
             cells/ETSI-cell-file/**/log.html
           retention-days: 30
+
+  promote:
+    # `:<N>` and `:latest` mean "passed the full tests": added to the digest the ETSI run tested,
+    # with the full-tests attestation a tier=production namespace requires (T-4721). The ship
+    # signature is bound to the digest and carries over; a red ETSI run promotes nothing.
+    name: Promote the tested digest to :<N> and :latest
+    needs: [build, etsi]
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless
+    env:
+      N: ${{ needs.build.outputs.n }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: sigstore/cosign-installer@v3
+      - run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          img="ghcr.io/${{ github.repository_owner }}/antares-broker-jc"
+          cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/ship.yml@refs/heads/dev" \
+            "$img@$DIGEST" > /dev/null
+          docker buildx imagetools create --tag "$img:$N" --tag "$img:latest" "$img@$DIGEST"
+          for tag in "$N" latest; do
+            got=$(docker buildx imagetools inspect "$img:$tag" --format '{{json .Manifest}}' | jq -r .digest)
+            [ "$got" = "$DIGEST" ] || { echo "$img:$tag points at $got, not $DIGEST"; exit 1; }
+          done
+          jq -n --arg d "$DIGEST" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{digest: $d, suites: [{name: "etsi-pipeline (jc image, file store, dev/etsi-baseline.json)", run: $run}]}' > full-tests.json
+          cosign attest --yes --type https://joinedcontext.com/attestations/full-tests/v1 --predicate full-tests.json "$img@$DIGEST"
+          echo "## Promoted \`$img@$DIGEST\` (dev-$N) to \`:$N\` and \`:latest\`, full-tests attested" >> "$GITHUB_STEP_SUMMARY"
