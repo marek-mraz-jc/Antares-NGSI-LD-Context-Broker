@@ -298,6 +298,8 @@ async fn append_attrs_inner(
         body,
         &APPEND,
         |target, frag, ts, updated, not_updated| {
+            // The Entity as a backfill names it (T-4665).
+            let shell = serde_json::json!({"id": target.get("id"), "type": target.get("type")});
             // appended scope: overwrite replaces; noOverwrite unions (010_07)
             if let Some(new_scope) = frag.get("scope") {
                 if target.contains_key("scope") && no_overwrite {
@@ -333,7 +335,12 @@ async fn append_attrs_inner(
                         updated.push(k.clone());
                     }
                     Some(existing) => {
-                        let merged = merge_instance_sets(existing, &incoming, no_overwrite);
+                        let merged = merge_instance_sets(
+                            existing,
+                            &incoming,
+                            no_overwrite,
+                            Some((&shell, k)),
+                        );
                         if merged {
                             updated.push(k.clone());
                         } else {
@@ -367,6 +374,8 @@ async fn update_attrs_inner(
         body,
         &UPDATE,
         |target, frag, ts, updated, not_updated| {
+            // The Entity as a backfill names it (T-4665).
+            let shell = serde_json::json!({"id": target.get("id"), "type": target.get("type")});
             // 5.6.2: scope updates only when the entity already has one
             if let Some(new_scope) = frag.get("scope") {
                 if !target.contains_key("scope") {
@@ -402,7 +411,7 @@ async fn update_attrs_inner(
                         updated.push(k.clone());
                     }
                     Some(existing) => {
-                        merge_instance_sets(existing, &incoming, false);
+                        merge_instance_sets(existing, &incoming, false, Some((&shell, k)));
                         if existing.as_array().is_some_and(Vec::is_empty) {
                             target.remove(k);
                         }
@@ -739,7 +748,16 @@ fn combine_single_attr(
 /// Merge incoming instances into an existing instance array by datasetId.
 /// Deletion-marker instances (urn:ngsi-ld:null) remove the matched instance.
 /// Returns false when nothing was applied (noOverwrite and all existed).
-fn merge_instance_sets(existing: &mut Value, incoming: &Value, no_overwrite: bool) -> bool {
+///
+/// `backfill` names the Entity (its id and type) and the attribute: an
+/// instance older than the one it would replace goes to history only then
+/// (T-4665, [`crate::history::backfilled`]).
+fn merge_instance_sets(
+    existing: &mut Value,
+    incoming: &Value,
+    no_overwrite: bool,
+    backfill: Option<(&Value, &str)>,
+) -> bool {
     let (Some(cur), Some(inc)) = (existing.as_array_mut(), incoming.as_array()) else {
         return false;
     };
@@ -758,7 +776,14 @@ fn merge_instance_sets(existing: &mut Value, incoming: &Value, no_overwrite: boo
         }
         match pos {
             Some(p) => {
-                if !no_overwrite {
+                let older = backfill
+                    .zip(cur.get(p))
+                    .is_some_and(|((doc, attr), current)| {
+                        crate::history::backfilled(doc, attr, current, ni)
+                    });
+                if older {
+                    any = true;
+                } else if !no_overwrite {
                     // keep original createdAt
                     if let Some(slot) = cur.get_mut(p) {
                         let created = slot.get("createdAt").cloned();
@@ -2216,7 +2241,7 @@ mod clause_5_5_8 {
              "observedAt": "2022-03-14T13:00:00.000Z"},
             {"type": "Property", "value": 8, "datasetId": "urn:ngsi-ld:Dataset:b"}
         ]);
-        assert!(merge_instance_sets(&mut existing, &incoming, false));
+        assert!(merge_instance_sets(&mut existing, &incoming, false, None));
         let arr = existing.as_array().unwrap();
         assert_eq!(arr.len(), 3, "default replaced + a kept + b added");
         let default = arr
@@ -2237,7 +2262,7 @@ mod clause_5_5_8 {
             {"type": "Property", "value": "urn:ngsi-ld:null",
              "datasetId": "urn:ngsi-ld:Dataset:a"}
         ]);
-        assert!(merge_instance_sets(&mut existing, &deletion, false));
+        assert!(merge_instance_sets(&mut existing, &deletion, false, None));
         let arr = existing.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert!(
@@ -2261,7 +2286,7 @@ mod clause_5_5_8 {
             {"type": "Property", "value": 2},
             {"type": "Property", "value": 3, "datasetId": "urn:ngsi-ld:Dataset:n"}
         ]);
-        assert!(merge_instance_sets(&mut existing, &incoming, true));
+        assert!(merge_instance_sets(&mut existing, &incoming, true, None));
         let arr = existing.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(

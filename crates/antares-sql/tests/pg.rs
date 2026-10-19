@@ -448,8 +448,19 @@ async fn purge_tenant_empties_every_tenant_table() {
             )
             .await
             .expect("append");
+        // Another value for the same instant: a correction, which keeps v1 in attr_versions.
+        store
+            .temporal_append(
+                t,
+                "urn:x:1",
+                &doc("urn:x:1"),
+                &serde_json::json!({"n": [{"type": "Property", "value": 3,
+                    "observedAt": "2026-08-04T09:01:00Z", "instanceId": "urn:i:1"}]}),
+            )
+            .await
+            .expect("correction");
     }
-    const TABLES: [&str; 15] = [
+    const TABLES: [&str; 16] = [
         "entities",
         "entity_types",
         "jsonld_contexts",
@@ -465,6 +476,7 @@ async fn purge_tenant_empties_every_tenant_table() {
         "views",
         "temporal_entities",
         "attr_instances",
+        "attr_versions",
     ];
     let count = |table: &'static str, t: &TenantId| {
         let pool = pool.clone();

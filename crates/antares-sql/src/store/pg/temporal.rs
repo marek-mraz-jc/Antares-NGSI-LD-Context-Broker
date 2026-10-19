@@ -96,6 +96,9 @@ fn decompose(doc: &Value) -> Vec<Value> {
                     .or_else(|| ts("deletedAt"))
                     .or_else(|| ts("createdAt"))
                     .unwrap_or(std::borrow::Cow::Borrowed("1970-01-01T00:00:00Z"));
+                // Provenance is a column, never data (T-4665).
+                let mut data = i.clone();
+                let provenance = antares_store::take_provenance(&mut data);
                 rows.push(serde_json::json!({
                     "attr_id": attr,
                     "instance_id": instance_id,
@@ -104,7 +107,8 @@ fn decompose(doc: &Value) -> Vec<Value> {
                     "created_at": ts("createdAt").unwrap_or_else(|| observed.clone()),
                     "modified_at": ts("modifiedAt").unwrap_or(observed),
                     "deleted_at": ts("deletedAt"),
-                    "data": i,
+                    "data": data,
+                    "provenance": provenance,
                 }));
             }
         }
@@ -122,6 +126,9 @@ fn temporal_dedup() -> bool {
 /// An instance's stamps: two instances that differ only in these are the same
 /// observation (CIM 009 4.5: a static Property is one instance).
 const STAMPS: &str = "ARRAY['instanceId','createdAt','modifiedAt']";
+
+/// The provenance of a row `e` that corrects the stored one (ADR-N-054 2.3).
+const CORRECTED: &str = "jsonb_set(COALESCE(NULLIF(e->'provenance', 'null'::jsonb), '{}'::jsonb), '{operation}', '\"correct\"')";
 
 /// The geometry column of an instance row `e` (see `insert_rows`).
 const GEO_VALUE: &str = "CASE WHEN jsonb_typeof(e->'data'->'value') = 'object'
@@ -196,11 +203,37 @@ async fn insert_rows(
     let same = "x.attr_id = e->>'attr_id'
                 AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
                 AND x.instance_id <> e->>'instance_id'";
+    // A row a write replaces with another value is a correction: the stored
+    // version is kept in attr_versions before the row below takes the next
+    // version number in place (T-4665, ADR-N-054 2.1, 2.4). Its two targets
+    // are the two below: the same instanceId (the upsert's conflict), and with
+    // `dedup` the same (attribute, datasetId, observedAt).
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO attr_versions
+           (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at, version, data, provenance)
+         SELECT x.tenant_id, x.entity_id, x.attr_id, x.instance_id, x.dataset_id, x.observed_at,
+                x.version, x.data, x.provenance
+         FROM jsonb_array_elements($3::jsonb) AS e
+         JOIN attr_instances x ON x.tenant_id = $1 AND x.entity_id = $2
+           AND x.attr_id = e->>'attr_id' AND x.observed_at = (e->>'observed_at')::timestamptz
+         WHERE (x.instance_id = e->>'instance_id'
+                OR ($4 AND e->'data' ? 'observedAt'
+                    AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'))
+           AND x.data - {STAMPS} IS DISTINCT FROM (e->'data') - {STAMPS}
+         ON CONFLICT DO NOTHING"
+    )))
+    .bind(tenant.as_str())
+    .bind(entity_id)
+    .bind(&rows)
+    .bind(dedup)
+    .execute(&mut *tx)
+    .await?;
     if dedup {
         // Same observedAt, another value: that observation was corrected.
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE attr_instances x
              SET data = jsonb_set(e->'data', '{{instanceId}}', to_jsonb(x.instance_id)),
+                 version = x.version + 1, provenance = {CORRECTED},
                  modified_at = (e->>'modified_at')::timestamptz,
                  deleted_at = (e->>'deleted_at')::timestamptz, geo_value = {GEO_VALUE}
              FROM jsonb_array_elements($3::jsonb) AS e
@@ -220,11 +253,11 @@ async fn insert_rows(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO attr_instances
            (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at,
-            created_at, modified_at, deleted_at, data, geo_value)
+            created_at, modified_at, deleted_at, data, geo_value, provenance)
          SELECT $1, $2, e->>'attr_id', e->>'instance_id', e->>'dataset_id',
                 (e->>'observed_at')::timestamptz, (e->>'created_at')::timestamptz,
                 (e->>'modified_at')::timestamptz, (e->>'deleted_at')::timestamptz,
-                e->'data', {GEO_VALUE}
+                e->'data', {GEO_VALUE}, NULLIF(e->'provenance', 'null'::jsonb)
          FROM jsonb_array_elements($3::jsonb) AS e
          WHERE NOT $4 OR NOT EXISTS (
            SELECT 1 FROM attr_instances x
@@ -239,7 +272,11 @@ async fn insert_rows(
            DO UPDATE SET data = EXCLUDED.data, modified_at = EXCLUDED.modified_at,
                          dataset_id = EXCLUDED.dataset_id,
                          deleted_at = EXCLUDED.deleted_at,
-                         geo_value = EXCLUDED.geo_value"
+                         geo_value = EXCLUDED.geo_value,
+                         version = attr_instances.version + 1,
+                         provenance = jsonb_set(COALESCE(EXCLUDED.provenance, '{{}}'::jsonb),
+                                                '{{operation}}', '\"correct\"')
+           WHERE attr_instances.data - {STAMPS} IS DISTINCT FROM EXCLUDED.data - {STAMPS}"
     )))
     .bind(tenant.as_str())
     .bind(entity_id)
@@ -260,6 +297,26 @@ async fn insert_rows(
         .execute(&mut *tx)
         .await?;
     }
+    Ok(())
+}
+
+/// Removes every instance and every kept version of one Entity: what 5.6.16
+/// and an expired Entity's reap take, versions included (ADR-N-054 2.4).
+async fn wipe_instances(
+    tx: &mut sqlx::PgConnection,
+    tenant: &TenantId,
+    id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM attr_instances WHERE tenant_id = $1 AND entity_id = $2")
+        .bind(tenant.as_str())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM attr_versions WHERE tenant_id = $1 AND entity_id = $2")
+        .bind(tenant.as_str())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     Ok(())
 }
 
@@ -577,11 +634,7 @@ impl PgTemporalStore {
         .await?
         .rows_affected();
         if reaped == 1 {
-            sqlx::query("DELETE FROM attr_instances WHERE tenant_id = $1 AND entity_id = $2")
-                .bind(tenant.as_str())
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            wipe_instances(&mut tx, tenant, id).await?;
         }
         let n = sqlx::query(
             "INSERT INTO temporal_entities
@@ -731,14 +784,97 @@ impl PgTemporalStore {
         // reap or a create replaces it; wiping it here would destroy the
         // history behind a 404.
         if n == 1 {
-            sqlx::query("DELETE FROM attr_instances WHERE tenant_id = $1 AND entity_id = $2")
-                .bind(tenant.as_str())
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            wipe_instances(&mut tx, tenant, id).await?;
         }
         tx.commit().await?;
         Ok(n == 1)
+    }
+
+    /// Erasure (T-4665, ADR-N-054 2.6): the rows of `attrs` of one Entity,
+    /// current and superseded, observed at or before `before` (`None`: all);
+    /// `attrs` `None` takes every Attribute, and the Entity's history itself
+    /// once it holds no row. How many rows went.
+    pub async fn erase(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+        attrs: Option<&[String]>,
+        before: Option<&str>,
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        let names = attrs.map(<[String]>::to_vec);
+        let mut n = 0u64;
+        for sql in [
+            "DELETE FROM attr_instances WHERE tenant_id = $1 AND entity_id = $2 \
+             AND ($3::text[] IS NULL OR attr_id = ANY($3)) \
+             AND ($4::timestamptz IS NULL OR observed_at <= $4::timestamptz)",
+            "DELETE FROM attr_versions WHERE tenant_id = $1 AND entity_id = $2 \
+             AND ($3::text[] IS NULL OR attr_id = ANY($3)) \
+             AND ($4::timestamptz IS NULL OR observed_at <= $4::timestamptz)",
+        ] {
+            let gone = sqlx::query(sql)
+                .bind(tenant.as_str())
+                .bind(id)
+                .bind(&names)
+                .bind(before)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            n = n.saturating_add(gone);
+        }
+        if attrs.is_none() {
+            sqlx::query(
+                "DELETE FROM temporal_entities t WHERE t.tenant_id = $1 AND t.id = $2 \
+                 AND NOT EXISTS (SELECT 1 FROM attr_instances a \
+                                 WHERE a.tenant_id = t.tenant_id AND a.entity_id = t.id)",
+            )
+            .bind(tenant.as_str())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(n)
+    }
+
+    /// Every version of the rows of one Entity's history (T-4665, ADR-N-054
+    /// 2.4) by Attribute: each instance with its `version` and `provenance`,
+    /// a superseded one with `supersededAt`, oldest first per measurement.
+    pub async fn versions(
+        &self,
+        tenant: &TenantId,
+        id: &str,
+    ) -> Result<serde_json::Map<String, Value>, sqlx::Error> {
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        let rows: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT attr_id, data || jsonb_build_object('version', version) || jsonb_strip_nulls( \
+                 jsonb_build_object('provenance', provenance, 'supersededAt', \
+                   to_char(superseded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))) \
+             FROM (SELECT attr_id, observed_at, dataset_id, version, data, provenance, superseded_at \
+                     FROM attr_versions WHERE tenant_id = $1 AND entity_id = $2 \
+                   UNION ALL \
+                   SELECT attr_id, observed_at, dataset_id, version, data, provenance, NULL \
+                     FROM attr_instances WHERE tenant_id = $1 AND entity_id = $2) v \
+             ORDER BY attr_id, observed_at, dataset_id NULLS FIRST, version",
+        )
+        .bind(tenant.as_str())
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let mut out = serde_json::Map::new();
+        for (attr, instance) in rows {
+            if let Some(list) = out
+                .entry(attr)
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+            {
+                list.push(instance);
+            }
+        }
+        Ok(out)
     }
 
     /// Temporal query: entity narrowing (ids/types/attrs) in the WHERE,
@@ -1138,6 +1274,24 @@ impl PgTemporalStore {
                     .cloned()
                     .collect();
                 if !deletes.is_empty() {
+                    // 5.6.15 deletes an instance: its last version is kept,
+                    // so a deletion is never without a record (T-4665).
+                    sqlx::query(
+                        "INSERT INTO attr_versions
+                           (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at,
+                            version, data, provenance)
+                         SELECT t.tenant_id, t.entity_id, t.attr_id, t.instance_id, t.dataset_id,
+                                t.observed_at, t.version, t.data, t.provenance
+                         FROM attr_instances t JOIN jsonb_array_elements($3::jsonb) AS e
+                           ON t.attr_id = e->>'a' AND t.instance_id = e->>'i'
+                         WHERE t.tenant_id = $1 AND t.entity_id = $2
+                         ON CONFLICT DO NOTHING",
+                    )
+                    .bind(tenant.as_str())
+                    .bind(id)
+                    .bind(Value::Array(deletes.clone()))
+                    .execute(&mut *tx)
+                    .await?;
                     sqlx::query(
                         "DELETE FROM attr_instances t
                          USING jsonb_array_elements($3::jsonb) AS e

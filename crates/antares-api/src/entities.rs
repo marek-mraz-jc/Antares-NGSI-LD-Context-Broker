@@ -2460,6 +2460,8 @@ fn apply_common_lang(target: &Value, fragment: &mut Value, lang: Option<&str>) {
 
 /// JSON Merge-Patch over internal docs (5.5.12).
 pub fn merge_into(doc: &mut Value, fragment: &Value, ts: &str) {
+    // The Entity as a backfill names it (T-4665): id and type, before the merge.
+    let shell = serde_json::json!({"id": doc.get("id"), "type": doc.get("type")});
     let (Some(target), Some(frag)) = (doc.as_object_mut(), fragment.as_object()) else {
         return;
     };
@@ -2525,7 +2527,9 @@ pub fn merge_into(doc: &mut Value, fragment: &Value, ts: &str) {
                         (true, None) => {}
                         (false, Some(p)) => {
                             if let Some(ci) = cur.get_mut(p) {
-                                merge_instance(ci, &fi, ts);
+                                if !crate::history::backfilled(&shell, k, ci, &fi) {
+                                    merge_instance(ci, &fi, ts);
+                                }
                             }
                         }
                         (false, None) => {

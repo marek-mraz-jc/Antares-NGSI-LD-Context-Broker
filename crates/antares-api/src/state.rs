@@ -46,9 +46,36 @@ impl std::str::FromStr for TemporalRecord {
 /// record no history, shared by every clone of the state.
 pub type HistoryOff = Arc<std::sync::RwLock<HistoryRules>>;
 
+/// When an attribute recorded `onChange` writes a row (T-4665, platform
+/// ADR-N-054 2.2): when its value moved past `deadband` (a number) or
+/// `min_distance` metres (a Point), or differs at all (anything else), or
+/// `heartbeat` passed since its last row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OnChange {
+    pub heartbeat: std::time::Duration,
+    pub deadband: Option<f64>,
+    pub min_distance: Option<f64>,
+}
+
+/// How one type records history: `None` is `every` (a row per write with a
+/// new `observedAt`), for the type and per expanded attribute.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Recording {
+    pub default: Option<OnChange>,
+    pub attributes: std::collections::HashMap<String, Option<OnChange>>,
+}
+
+impl Recording {
+    /// How `attr` records: its own setting, else the type's.
+    #[must_use]
+    pub fn of(&self, attr: &str) -> Option<OnChange> {
+        self.attributes.get(attr).copied().unwrap_or(self.default)
+    }
+}
+
 /// What the write path needs of the Tenants' history retention (T-4275,
 /// DM-97): which writes record none.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct HistoryRules {
     /// (Tenant, type) pairs whose rule says `history: "off"`.
     pub off: std::collections::HashSet<(String, String)>,
@@ -57,6 +84,8 @@ pub struct HistoryRules {
     pub ruled: std::collections::HashSet<(String, String)>,
     /// Tenants whose `*` rule says `history: "off"`.
     pub space_off: std::collections::HashSet<String>,
+    /// (Tenant, type) pairs whose rule records some attribute `onChange`.
+    pub recording: std::collections::HashMap<(String, String), Recording>,
 }
 
 impl HistoryRules {
@@ -284,6 +313,9 @@ pub struct Shared {
     /// instances the write path records into history. Default `All`, which
     /// the ETSI temporal suites assume.
     pub temporal_record: TemporalRecord,
+    /// The mesh identity of the gateway whose provenance headers the broker
+    /// believes (ANTARES_PROVENANCE_FROM, T-4665); `None` believes nobody.
+    pub provenance_from: Option<String>,
     /// History gate 3 (T-4275): the (Tenant, expanded type) pairs whose
     /// retention rule says `history: "off"`. The views reload replaces the
     /// set; an Entity with any of these types records no attribute instance.
@@ -570,6 +602,7 @@ impl AppState {
                 csource_notification: None,
                 nats: false,
                 temporal_record: TemporalRecord::All,
+                provenance_from: None,
                 history_off: HistoryOff::default(),
                 public_url,
                 snapshot_cap: 1024,
