@@ -699,7 +699,7 @@ pub(super) fn routes(weak: &Weak<Reloader>) -> Router {
                 serve(totals.clone(), |r| async move { Ok(deleted(&r, &tenant)) })
             }),
         )
-        .route("/retention/{tenant}", DOC.route(weak))
+        .route("/retention/{tenant}", DOC.handlers(weak))
 }
 
 static DOC: super::TextDoc = super::TextDoc {

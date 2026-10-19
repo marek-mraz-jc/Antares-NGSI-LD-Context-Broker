@@ -1068,7 +1068,7 @@ impl TextDoc {
     }
 
     /// GET the document as written, PUT one, DELETE it.
-    fn route(&'static self, weak: &Weak<Reloader>) -> axum::routing::MethodRouter {
+    fn handlers(&'static self, weak: &Weak<Reloader>) -> axum::routing::MethodRouter {
         let (read, write, remove) = (weak.clone(), weak.clone(), weak.clone());
         get(move |Path(t): Path<String>| {
             serve(read.clone(), move |r| async move {

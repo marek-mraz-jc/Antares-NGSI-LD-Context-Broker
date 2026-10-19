@@ -385,7 +385,7 @@ async fn judge_rule(
 
 /// `/q/quality/{tenant}`: GET the document as written, PUT one, DELETE it.
 pub(super) fn routes(weak: &Weak<Reloader>) -> Router {
-    Router::new().route("/quality/{tenant}", DOC.route(weak))
+    Router::new().route("/quality/{tenant}", DOC.handlers(weak))
 }
 
 static DOC: super::TextDoc = super::TextDoc {
