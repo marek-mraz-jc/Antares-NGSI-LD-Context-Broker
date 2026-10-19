@@ -606,6 +606,11 @@ impl PgEntityStore {
             binds.push(Bind::TextArr(super::storable(ids)));
             wheres.push(format!("id = ANY(${})", binds.len()));
         }
+        // keyset: the pkey (tenant_id, id) seeks straight to the next page
+        if let Some(after) = f.after_id {
+            binds.push(Bind::Text(after.to_owned()));
+            wheres.push(format!("id > ${}", binds.len()));
+        }
         // 5.2.33 idPattern: the literal the regex forces is a plain string
         // test on the id column, exact as a narrowing; the regex itself stays
         // with the caller, so `decided` is untouched.

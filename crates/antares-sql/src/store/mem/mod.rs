@@ -1133,14 +1133,18 @@ impl Store {
                 && q.is_none_or(|(q, ctx)| antares_ql::eval::eval_q(q, doc, ctx, &|_| None))
         };
         // ids name at most what the client sent: look each up, in id order
-        let candidates: Box<dyn Iterator<Item = (&String, &Value)>> = match f.ids {
-            Some(ids) => {
+        let candidates: Box<dyn Iterator<Item = (&String, &Value)>> = match (f.ids, f.after_id) {
+            (Some(ids), after) => {
                 let mut want: Vec<&str> = ids.to_vec();
                 want.sort_unstable();
                 want.dedup();
+                want.retain(|id| after.is_none_or(|a| *id > a));
                 Box::new(want.into_iter().filter_map(|id| m.get_key_value(id)))
             }
-            None => Box::new(m.iter()),
+            (None, Some(a)) => Box::new(
+                m.range::<str, _>((std::ops::Bound::Excluded(a), std::ops::Bound::Unbounded)),
+            ),
+            (None, None) => Box::new(m.iter()),
         };
         let hits = candidates
             .filter(|(id, doc)| matches(id, doc))

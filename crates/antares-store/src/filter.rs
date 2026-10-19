@@ -61,6 +61,13 @@ pub struct EntityFilter<'a> {
     /// Projection pushdown (`omit`, top-level entries only): drop exactly
     /// these attr IRIs. Same `decided` gate.
     pub drop_attrs: Option<&'a [String]>,
+    /// Keyset (T-4683): only the Entities whose id sorts after this one, in
+    /// the store's id order. A walk over a whole set passes the last id it
+    /// read instead of a growing `offset`, so every page is an index seek and
+    /// each row is read once: an OFFSET walk re-reads every row it skips, and
+    /// `/types?details=true` over a 25 000-Entity tenant took 57 s. Exact, so
+    /// `decided` is untouched.
+    pub after_id: Option<&'a str>,
 }
 
 impl Default for EntityFilter<'_> {
@@ -78,6 +85,7 @@ impl Default for EntityFilter<'_> {
             page: None,
             keep_attrs: None,
             drop_attrs: None,
+            after_id: None,
         }
     }
 }

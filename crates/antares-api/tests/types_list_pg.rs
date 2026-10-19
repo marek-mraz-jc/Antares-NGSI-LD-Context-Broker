@@ -61,8 +61,12 @@ fn view() -> Filter {
 }
 
 async fn types(st: &AppState, tenant: &str) -> (StatusCode, Value, Duration) {
+    types_at(st, tenant, "/ngsi-ld/v1/types").await
+}
+
+async fn types_at(st: &AppState, tenant: &str, uri: &str) -> (StatusCode, Value, Duration) {
     let req = Request::builder()
-        .uri("/ngsi-ld/v1/types")
+        .uri(uri)
         .header("NGSILD-Tenant", tenant)
         .body(Body::empty())
         .expect("request");
@@ -160,6 +164,85 @@ async fn a_views_type_list_over_100k_entities_answers_in_under_200_ms() {
         best < Duration::from_millis(200),
         "/types took {best:?} at best of 5"
     );
+
+    antares_sql::sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(&pool)
+        .await
+        .expect("clean");
+}
+
+/// `GET /types?details=true` folds every Entity (5.7.5 gives attributeNames,
+/// which no catalogue keeps). Over 100 000 Entities the fold reads each row
+/// once by keyset (T-4683): with OFFSET paging every page re-read the rows
+/// before it, 57-59 s on one prod tenant, holding three pool sessions. Local
+/// debug build: 11 s by OFFSET, under 2 s by keyset; the bound sits between.
+#[tokio::test(flavor = "multi_thread")]
+async fn type_details_over_100k_entities_read_each_row_once() {
+    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+        return;
+    };
+    let pool = antares_sql::store::pg::connect(&url, 5)
+        .await
+        .expect("connect");
+    let tenant = format!("td{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let tid = TenantId::new(&tenant).expect("tenant");
+    antares_sql::store::pg::ensure_tenant(&pool, &tid)
+        .await
+        .expect("tenant row");
+    let mut tx = pool.begin().await.expect("tx");
+    antares_sql::sqlx::query("SELECT set_config('antares.tenant', $1, true)")
+        .bind(&tenant)
+        .execute(&mut *tx)
+        .await
+        .expect("tenant setting");
+    antares_sql::sqlx::query(
+        "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
+         SELECT $1, 'urn:ngsi-ld:' || t || ':' || lpad(n::text, 6, '0'),
+                jsonb_build_object('id', 'urn:ngsi-ld:' || t || ':' || lpad(n::text, 6, '0'),
+                                   'type', jsonb_build_array($2 || t),
+                                   $2 || 'zone', jsonb_build_array(
+                                       jsonb_build_object('type', 'Property', 'value', 'b'))),
+                ARRAY[$2 || t], now(), now()
+           FROM unnest(ARRAY['Car','Bus','Stop','Tree','Lamp']) AS t,
+                generate_series(1, 20000) AS n",
+    )
+    .bind(&tenant)
+    .bind(DEFAULT)
+    .execute(&mut *tx)
+    .await
+    .expect("entities");
+    tx.commit().await.expect("commit");
+    antares_sql::sqlx::query("ANALYZE entities")
+        .execute(&pool)
+        .await
+        .expect("analyze");
+
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let mut st = AppState::with_store("me".into(), Arc::new(store), "postgres");
+    antares_api::wire(&mut st).await;
+
+    let (code, body, took) = types_at(&st, &tenant, "/ngsi-ld/v1/types?details=true").await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let names: Vec<&str> = body
+        .as_array()
+        .expect("an EntityType array")
+        .iter()
+        .filter_map(|t| t["typeName"].as_str())
+        .collect();
+    assert_eq!(names, ["Bus", "Car", "Lamp", "Stop", "Tree"], "{body}");
+    assert!(
+        body.as_array()
+            .into_iter()
+            .flatten()
+            .all(|t| t["attributeNames"] == serde_json::json!(["zone"])),
+        "{body}"
+    );
+    eprintln!("details over 100 000 Entities: {took:?}");
+    assert!(took < Duration::from_secs(5), "details took {took:?}");
 
     antares_sql::sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
         .bind(&tenant)
