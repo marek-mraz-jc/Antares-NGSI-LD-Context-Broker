@@ -21,18 +21,13 @@
 //! stays as it was (so the mark never holds off retention), and it leaves no
 //! history and sends no notification.
 
-use super::{bad_tenant, problem, serve, Reloader};
+use super::Reloader;
 use antares_api::AppState;
 use antares_model::TenantId;
-use axum::body::Bytes;
-use axum::extract::Path;
-use axum::http::StatusCode;
-use axum::response::Response;
-use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 use std::time::Duration;
 
 /// The id prefix a Tenant's quality document is stored under, beside the
@@ -390,54 +385,15 @@ async fn judge_rule(
 
 /// `/q/quality/{tenant}`: GET the document as written, PUT one, DELETE it.
 pub(super) fn routes(weak: &Weak<Reloader>) -> Router {
-    let (read, write, remove) = (weak.clone(), weak.clone(), weak.clone());
-    Router::new().route(
-        "/quality/{tenant}",
-        get(move |Path(t): Path<String>| serve(read.clone(), |r| get_doc(r, t)))
-            .put(move |Path(t): Path<String>, body: Bytes| {
-                serve(write.clone(), |r| put_doc(r, t, body))
-            })
-            .delete(move |Path(t): Path<String>| serve(remove.clone(), |r| delete_doc(r, t))),
-    )
+    Router::new().route("/quality/{tenant}", DOC.route(weak))
 }
 
-fn key(tenant: &str) -> Option<String> {
-    super::tenant_key(QUALITY_ID_PREFIX, tenant)
-}
-
-fn none() -> Response {
-    problem(
-        StatusCode::NOT_FOUND,
-        "ResourceNotFound",
-        "no quality document for this tenant",
-    )
-}
-
-async fn get_doc(r: Arc<Reloader>, tenant: String) -> Result<Response, String> {
-    super::stored_json(&r, key(&tenant), none).await
-}
-
-async fn put_doc(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Response, String> {
-    let Some(key) = key(&tenant) else {
-        return Ok(bad_tenant());
-    };
-    if body.len() > MAX_QUALITY_BYTES {
-        return Ok(problem(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "BadRequestData",
-            &format!("a quality document is at most {MAX_QUALITY_BYTES} bytes"),
-        ));
-    }
-    if let Err(why) = parse(&body) {
-        return Ok(problem(StatusCode::BAD_REQUEST, "BadRequestData", &why));
-    }
-    let text = String::from_utf8_lossy(&body).into_owned();
-    super::store(&r, &key, json!({"id": key, "text": text})).await
-}
-
-async fn delete_doc(r: Arc<Reloader>, tenant: String) -> Result<Response, String> {
-    super::remove_stored(&r, key(&tenant), none).await
-}
+static DOC: super::TextDoc = super::TextDoc {
+    prefix: QUALITY_ID_PREFIX,
+    what: "quality",
+    max: MAX_QUALITY_BYTES,
+    check: |body| parse(body).map(drop),
+};
 
 #[cfg(test)]
 mod tests {

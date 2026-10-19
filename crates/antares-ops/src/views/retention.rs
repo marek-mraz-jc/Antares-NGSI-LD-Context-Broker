@@ -11,12 +11,11 @@
 //! (deleting twice what is already gone deletes nothing), in bounded batches,
 //! and counts what it deleted in `antares_retention_deleted_total`.
 
-use super::{bad_tenant, problem, serve, Reloader};
+use super::{bad_tenant, serve, Reloader};
 use antares_api::AppState;
 use antares_model::TenantId;
 use axum::body::Bytes;
 use axum::extract::Path;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -686,7 +685,6 @@ impl Runner<'_> {
 /// it; `POST …/preview` counts what a document would delete now, `GET
 /// …/deleted` totals what this pod's sweeps deleted since it started.
 pub(super) fn routes(weak: &Weak<Reloader>) -> Router {
-    let (read, write, remove) = (weak.clone(), weak.clone(), weak.clone());
     let (count, totals) = (weak.clone(), weak.clone());
     Router::new()
         .route(
@@ -701,56 +699,15 @@ pub(super) fn routes(weak: &Weak<Reloader>) -> Router {
                 serve(totals.clone(), |r| async move { Ok(deleted(&r, &tenant)) })
             }),
         )
-        .route(
-            "/retention/{tenant}",
-            get(move |Path(t): Path<String>| serve(read.clone(), |r| get_doc(r, t)))
-                .put(move |Path(t): Path<String>, body: Bytes| {
-                    serve(write.clone(), |r| put_doc(r, t, body))
-                })
-                .delete(move |Path(t): Path<String>| serve(remove.clone(), |r| delete_doc(r, t))),
-        )
+        .route("/retention/{tenant}", DOC.route(weak))
 }
 
-fn key(tenant: &str) -> Option<String> {
-    super::tenant_key(RETENTION_ID_PREFIX, tenant)
-}
-
-fn none() -> Response {
-    problem(
-        StatusCode::NOT_FOUND,
-        "ResourceNotFound",
-        "no retention document for this tenant",
-    )
-}
-
-async fn get_doc(r: Arc<Reloader>, tenant: String) -> Result<Response, String> {
-    super::stored_json(&r, key(&tenant), none).await
-}
-
-async fn put_doc(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Response, String> {
-    let Some(key) = key(&tenant) else {
-        return Ok(bad_tenant());
-    };
-    if let Some(refusal) = refused(&body) {
-        return Ok(refusal);
-    }
-    let text = String::from_utf8_lossy(&body).into_owned();
-    super::store(&r, &key, serde_json::json!({"id": key, "text": text})).await
-}
-
-/// The document `body` would be refused for, as `put_doc` answers it.
-fn refused(body: &[u8]) -> Option<Response> {
-    if body.len() > MAX_RETENTION_BYTES {
-        return Some(problem(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "BadRequestData",
-            &format!("a retention document is at most {MAX_RETENTION_BYTES} bytes"),
-        ));
-    }
-    parse(body)
-        .err()
-        .map(|why| problem(StatusCode::BAD_REQUEST, "BadRequestData", &why))
-}
+static DOC: super::TextDoc = super::TextDoc {
+    prefix: RETENTION_ID_PREFIX,
+    what: "retention",
+    max: MAX_RETENTION_BYTES,
+    check: |body| parse(body).map(drop),
+};
 
 fn counts(rows: impl Iterator<Item = (String, &'static str, u64)>) -> Response {
     let rows: Vec<Value> = rows
@@ -763,7 +720,7 @@ async fn preview(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Respon
     let Ok(t) = TenantId::new(&tenant) else {
         return Ok(bad_tenant());
     };
-    if let Some(refusal) = refused(&body) {
+    if let Some(refusal) = DOC.refused(&body) {
         return Ok(refusal);
     }
     let rules = vec![(t, parse(&body)?)];
@@ -795,10 +752,6 @@ fn deleted(r: &Reloader, tenant: &str) -> Response {
             .filter(|((owner, _, _), _)| owner == t.as_str())
             .map(|((_, ty, kind), count)| (ty, kind, count)),
     )
-}
-
-async fn delete_doc(r: Arc<Reloader>, tenant: String) -> Result<Response, String> {
-    super::remove_stored(&r, key(&tenant), none).await
 }
 
 #[cfg(test)]

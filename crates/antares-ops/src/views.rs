@@ -954,7 +954,7 @@ async fn get_schema(r: Arc<Reloader>, tenant: String) -> Result<Response, String
 async fn stored_json(
     r: &Reloader,
     key: Option<String>,
-    missing: fn() -> Response,
+    missing: impl FnOnce() -> Response,
 ) -> Result<Response, String> {
     let Some(key) = key else {
         return Ok(bad_tenant());
@@ -1000,7 +1000,7 @@ async fn store(r: &Reloader, key: &str, doc: Value) -> Result<Response, String> 
 async fn remove_stored(
     r: &Reloader,
     key: Option<String>,
-    missing: fn() -> Response,
+    missing: impl FnOnce() -> Response,
 ) -> Result<Response, String> {
     let Some(key) = key else {
         return Ok(bad_tenant());
@@ -1018,6 +1018,74 @@ fn tenant_key(prefix: &str, tenant: &str) -> Option<String> {
     antares_model::TenantId::new(tenant)
         .ok()
         .map(|t| format!("{prefix}{}", t.as_str()))
+}
+
+/// A per-tenant document kept as the text it was written in (quality, retention): its key prefix,
+/// the noun its answers use, its size cap and the parser a PUT must pass.
+struct TextDoc {
+    prefix: &'static str,
+    what: &'static str,
+    max: usize,
+    check: fn(&[u8]) -> Result<(), String>,
+}
+
+impl TextDoc {
+    fn key(&self, tenant: &str) -> Option<String> {
+        tenant_key(self.prefix, tenant)
+    }
+
+    fn missing(&self) -> Response {
+        problem(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("no {} document for this tenant", self.what),
+        )
+    }
+
+    /// The answer a PUT of `body` is refused with, if it is.
+    fn refused(&self, body: &[u8]) -> Option<Response> {
+        if body.len() > self.max {
+            return Some(problem(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "BadRequestData",
+                &format!("a {} document is at most {} bytes", self.what, self.max),
+            ));
+        }
+        (self.check)(body)
+            .err()
+            .map(|why| problem(StatusCode::BAD_REQUEST, "BadRequestData", &why))
+    }
+
+    async fn put(&self, r: &Reloader, tenant: &str, body: &[u8]) -> Result<Response, String> {
+        let Some(key) = self.key(tenant) else {
+            return Ok(bad_tenant());
+        };
+        if let Some(refusal) = self.refused(body) {
+            return Ok(refusal);
+        }
+        let text = String::from_utf8_lossy(body).into_owned();
+        store(r, &key, serde_json::json!({"id": key, "text": text})).await
+    }
+
+    /// GET the document as written, PUT one, DELETE it.
+    fn route(&'static self, weak: &Weak<Reloader>) -> axum::routing::MethodRouter {
+        let (read, write, remove) = (weak.clone(), weak.clone(), weak.clone());
+        get(move |Path(t): Path<String>| {
+            serve(read.clone(), move |r| async move {
+                stored_json(&r, self.key(&t), || self.missing()).await
+            })
+        })
+        .put(move |Path(t): Path<String>, body: Bytes| {
+            serve(write.clone(), move |r| async move {
+                self.put(&r, &t, &body).await
+            })
+        })
+        .delete(move |Path(t): Path<String>| {
+            serve(remove.clone(), move |r| async move {
+                remove_stored(&r, self.key(&t), || self.missing()).await
+            })
+        })
+    }
 }
 
 /// The rules of the stored `what` documents among `docs`, by Tenant: a stored document that no
