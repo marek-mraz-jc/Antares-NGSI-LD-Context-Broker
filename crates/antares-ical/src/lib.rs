@@ -22,8 +22,8 @@ pub mod mapping;
 use antares_ops::percent::{decoded, encode};
 use antares_ops::{Caller, Ops, Page, Pushdown, Scanned, Surface, ViewOps, RESIDUAL_SCAN};
 use axum::extract::{Query, Request};
-use axum::http::header::{ALLOW, CONTENT_TYPE};
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderName, StatusCode};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
 use axum::Router;
@@ -42,9 +42,6 @@ pub const SKIPPED: &str = "antares_surface_records_skipped_total";
 
 /// The header a feed reports how many Events it left out in.
 pub const SKIPPED_HEADER: &str = "antares-skipped-records";
-
-/// The methods a read-only surface answers.
-const ALLOWED: &str = "GET, HEAD, OPTIONS";
 
 /// The Entities one upstream page reads.
 const PAGE: usize = 100;
@@ -96,41 +93,24 @@ const NOT_FOUND: Problem = Problem(StatusCode::NOT_FOUND, "no such calendar");
 
 async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
     let (parts, _) = req.into_parts();
-    let method = &parts.method;
-    if method == Method::OPTIONS {
-        return (
-            StatusCode::NO_CONTENT,
-            [(ALLOW, HeaderValue::from_static(ALLOWED))],
-        )
-            .into_response();
-    }
-    if method != Method::GET && method != Method::HEAD {
-        let mut reply =
-            Problem(StatusCode::METHOD_NOT_ALLOWED, "this surface is read only").reply();
-        reply
-            .headers_mut()
-            .insert(ALLOW, HeaderValue::from_static(ALLOWED));
-        return reply;
-    }
-    // `/{view}/ical/v1/events.ics`: a view id is `[a-z0-9-]`, so its raw segment is its id.
-    let view = parts.uri.path().split('/').nth(1).unwrap_or_default();
-    let reply = match feed(ops, caller, view, &parts.uri).await {
-        Ok((body, skipped)) => (
-            StatusCode::OK,
-            [
-                (CONTENT_TYPE, "text/calendar; charset=utf-8".to_owned()),
-                (HeaderName::from_static(SKIPPED_HEADER), skipped.to_string()),
-            ],
-            body,
-        )
-            .into_response(),
-        Err(problem) => problem.reply(),
-    };
-    if method == Method::HEAD {
-        let (parts, _) = reply.into_parts();
-        return Response::from_parts(parts, axum::body::Body::empty());
-    }
-    reply
+    let refused = || Problem(StatusCode::METHOD_NOT_ALLOWED, "this surface is read only").reply();
+    antares_ops::read_only(&parts.method, refused, async {
+        // `/{view}/ical/v1/events.ics`: a view id is `[a-z0-9-]`, so its raw segment is its id.
+        let view = parts.uri.path().split('/').nth(1).unwrap_or_default();
+        match feed(ops, caller, view, &parts.uri).await {
+            Ok((body, skipped)) => (
+                StatusCode::OK,
+                [
+                    (CONTENT_TYPE, "text/calendar; charset=utf-8".to_owned()),
+                    (HeaderName::from_static(SKIPPED_HEADER), skipped.to_string()),
+                ],
+                body,
+            )
+                .into_response(),
+            Err(problem) => problem.reply(),
+        }
+    })
+    .await
 }
 
 /// The `from` and `to` of the query string; any other parameter is a calendar client's own.

@@ -94,6 +94,19 @@ fn doc_kind(kind: Kind) -> Result<DocKind, NgsiError> {
     }
 }
 
+/// A transaction scoped to one tenant: begun, then RLS set for it first.
+#[cfg(feature = "postgres")]
+async fn tenant_tx(
+    p: &PgBackend,
+    tenant: &TenantId,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, NgsiError> {
+    let mut tx = p.docs.pool().begin().await.map_err(db)?;
+    crate::store::pg::set_tenant(&mut tx, tenant)
+        .await
+        .map_err(db)?;
+    Ok(tx)
+}
+
 /// Postgres backend bundle: one pool, three table-family stores, plus the
 /// change hook (the memory store emits its own; here the seam emits).
 #[cfg(feature = "postgres")]
@@ -1139,11 +1152,8 @@ impl AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 async {
-                    let mut tx = p.docs.pool().begin().await.map_err(db)?;
+                    let mut tx = tenant_tx(p, tenant).await?;
                     // the tenant setting is what the RLS-guarded counts see
-                    crate::store::pg::set_tenant(&mut tx, tenant)
-                        .await
-                        .map_err(db)?;
                     let created_at: Option<String> = sqlx::query_scalar(
                         "SELECT created_at::text FROM tenants WHERE tenant_id = $1",
                     )
@@ -1190,10 +1200,7 @@ impl AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 async {
-                    let mut tx = p.docs.pool().begin().await.map_err(db)?;
-                    crate::store::pg::set_tenant(&mut tx, tenant)
-                        .await
-                        .map_err(db)?;
+                    let mut tx = tenant_tx(p, tenant).await?;
                     let known = sqlx::query_scalar::<_, i32>(
                         "SELECT 1 FROM tenants WHERE tenant_id = $1 FOR UPDATE",
                     )
@@ -1675,10 +1682,7 @@ impl antares_store::CurrentStateDriver for AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 async {
-                    let mut tx = p.docs.pool().begin().await.map_err(db)?;
-                    crate::store::pg::set_tenant(&mut tx, tenant)
-                        .await
-                        .map_err(db)?;
+                    let mut tx = tenant_tx(p, tenant).await?;
                     // a scan of the tenant: bounded, a slow one answers no size
                     sqlx::query(SIZE_SCAN_TIMEOUT)
                         .execute(&mut *tx)
@@ -1851,10 +1855,7 @@ impl antares_store::TemporalDriver for AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 async {
-                    let mut tx = p.docs.pool().begin().await.map_err(db)?;
-                    crate::store::pg::set_tenant(&mut tx, tenant)
-                        .await
-                        .map_err(db)?;
+                    let mut tx = tenant_tx(p, tenant).await?;
                     let n: i64 = sqlx::query_scalar(
                         "SELECT count(*) FROM attr_instances WHERE tenant_id = $1",
                     )
@@ -1874,10 +1875,7 @@ impl antares_store::TemporalDriver for AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 async {
-                    let mut tx = p.docs.pool().begin().await.map_err(db)?;
-                    crate::store::pg::set_tenant(&mut tx, tenant)
-                        .await
-                        .map_err(db)?;
+                    let mut tx = tenant_tx(p, tenant).await?;
                     sqlx::query(SIZE_SCAN_TIMEOUT)
                         .execute(&mut *tx)
                         .await
@@ -1905,10 +1903,7 @@ impl antares_store::TemporalDriver for AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 async {
-                    let mut tx = p.docs.pool().begin().await.map_err(db)?;
-                    crate::store::pg::set_tenant(&mut tx, tenant)
-                        .await
-                        .map_err(db)?;
+                    let mut tx = tenant_tx(p, tenant).await?;
                     // whole statements, not a spliced table name: the
                     // attr_instances tenant-predicate check reads literals
                     for sql in [

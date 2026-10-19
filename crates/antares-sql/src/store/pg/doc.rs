@@ -725,13 +725,6 @@ impl PgDocStore {
         ))
     }
 
-    /// Every doc of one kind for one tenant, id-ordered.
-    ///
-    /// Bounded: without a LIMIT this statement materializes a whole tenant's
-    /// subscriptions/registrations into one `Vec`, which at the 100 000-per-
-    /// broker target is the broker's memory, not the database's. A tenant that
-    /// reaches the ceiling is refused with TooManyResults (5.5.6) rather than
-    /// served a silent prefix.
     /// Every doc's id and the first 64 bits of the md5 of its text, under
     /// `list`'s ceiling: the bodies stay in the database (T-4354).
     pub async fn list_digests(
@@ -739,21 +732,10 @@ impl PgDocStore {
         tenant: &TenantId,
         kind: DocKind,
     ) -> Result<Vec<(String, u64)>, sqlx::Error> {
-        let sql = format!(
-            "SELECT id, left(md5({}::text), 16) FROM {} WHERE tenant_id = $1 ORDER BY id LIMIT $2",
-            kind.doc_column(),
-            kind.table()
-        );
-        let mut tx = super::begin(&self.pool).await?;
-        crate::store::pg::set_tenant(&mut tx, tenant).await?;
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
-            .bind(tenant.as_str())
-            .bind(MAX_UNDECIDED_ROWS)
-            .fetch_all(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        check_ceiling(false, rows.len(), MAX_UNDECIDED_ROWS)?;
-        rows.into_iter()
+        let select = format!("id, left(md5({}::text), 16)", kind.doc_column());
+        self.every_row(tenant, kind, &select)
+            .await?
+            .into_iter()
             .map(|r| {
                 let hex: String = r.get(1);
                 u64::from_str_radix(&hex, 16)
@@ -763,22 +745,39 @@ impl PgDocStore {
             .collect()
     }
 
+    /// Every doc of one kind for one tenant, id-ordered.
     pub async fn list(&self, tenant: &TenantId, kind: DocKind) -> Result<Vec<Value>, sqlx::Error> {
+        let rows = self.every_row(tenant, kind, kind.doc_column()).await?;
+        Ok(rows.into_iter().map(|r| r.get::<Value, _>(0)).collect())
+    }
+
+    /// `select` of every row of one kind for one tenant, id-ordered.
+    ///
+    /// Bounded: without a LIMIT this statement materializes a whole tenant's
+    /// subscriptions/registrations into one `Vec`, which at the 100 000-per-
+    /// broker target is the broker's memory, not the database's. A tenant that
+    /// reaches the ceiling is refused with TooManyResults (5.5.6) rather than
+    /// served a silent prefix.
+    async fn every_row(
+        &self,
+        tenant: &TenantId,
+        kind: DocKind,
+        select: &str,
+    ) -> Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> {
         let sql = format!(
-            "SELECT {} FROM {} WHERE tenant_id = $1 ORDER BY id LIMIT $2",
-            kind.doc_column(),
+            "SELECT {select} FROM {} WHERE tenant_id = $1 ORDER BY id LIMIT $2",
             kind.table()
         );
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(tenant.as_str())
             .bind(MAX_UNDECIDED_ROWS)
             .fetch_all(&mut *tx)
             .await?;
         tx.commit().await?;
         check_ceiling(false, rows.len(), MAX_UNDECIDED_ROWS)?;
-        Ok(rows.into_iter().map(|r| r.get::<Value, _>(0)).collect())
+        Ok(rows)
     }
 
     /// 5.12: the registrations that may take part in an operation on these

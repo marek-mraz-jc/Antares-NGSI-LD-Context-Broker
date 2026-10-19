@@ -928,22 +928,13 @@ async fn put_one(r: Arc<Reloader>, id: String, body: Bytes) -> Result<Response, 
         Ok((doc, _)) => doc,
         Err(why) => return Ok(problem(StatusCode::BAD_REQUEST, "BadRequestData", &why)),
     };
-    let replaced = r.state.put_view_doc(&id, doc).await?;
-    r.reload().await?;
-    Ok(if replaced {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::CREATED
-    }
-    .into_response())
+    store(&r, &id, doc).await
 }
 
 /// The key of `tenant`'s schema, `None` when the path names no Tenant a
 /// client can.
 fn schema_key(tenant: &str) -> Option<String> {
-    antares_model::TenantId::new(tenant)
-        .ok()
-        .map(|t| format!("{SCHEMA_ID_PREFIX}{}", t.as_str()))
+    tenant_key(SCHEMA_ID_PREFIX, tenant)
 }
 
 fn bad_tenant() -> Response {
@@ -963,7 +954,7 @@ async fn get_schema(r: Arc<Reloader>, tenant: String) -> Result<Response, String
 async fn stored_json(
     r: &Reloader,
     key: Option<String>,
-    missing: fn() -> Response,
+    missing: impl FnOnce() -> Response,
 ) -> Result<Response, String> {
     let Some(key) = key else {
         return Ok(bad_tenant());
@@ -988,14 +979,135 @@ async fn stored_json(
 }
 
 async fn delete_schema(r: Arc<Reloader>, tenant: String) -> Result<Response, String> {
-    let Some(key) = schema_key(&tenant) else {
+    remove_stored(&r, schema_key(&tenant), no_schema).await
+}
+
+/// Store `doc` under `key` and answer once this pod's table holds it: 201 for a new document,
+/// 204 for one it replaced.
+async fn store(r: &Reloader, key: &str, doc: Value) -> Result<Response, String> {
+    let replaced = r.state.put_view_doc(key, doc).await?;
+    r.reload().await?;
+    Ok(if replaced {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::CREATED
+    }
+    .into_response())
+}
+
+/// Delete the document stored under `key` and reload, or `missing()`; a path that names no tenant
+/// (`key` is `None`) is `bad_tenant`. Schemas, quality and retention documents are deleted this way.
+async fn remove_stored(
+    r: &Reloader,
+    key: Option<String>,
+    missing: impl FnOnce() -> Response,
+) -> Result<Response, String> {
+    let Some(key) = key else {
         return Ok(bad_tenant());
     };
     if !r.state.delete_view_doc(&key).await? {
-        return Ok(no_schema());
+        return Ok(missing());
     }
     r.reload().await?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// The key `prefix{tenant}` of a Tenant's stored document, `None` when the path names no Tenant a
+/// client can.
+fn tenant_key(prefix: &str, tenant: &str) -> Option<String> {
+    antares_model::TenantId::new(tenant)
+        .ok()
+        .map(|t| format!("{prefix}{}", t.as_str()))
+}
+
+/// A per-tenant document kept as the text it was written in (quality, retention): its key prefix,
+/// the noun its answers use, its size cap and the parser a PUT must pass.
+struct TextDoc {
+    prefix: &'static str,
+    what: &'static str,
+    max: usize,
+    check: fn(&[u8]) -> Result<(), String>,
+}
+
+impl TextDoc {
+    fn key(&self, tenant: &str) -> Option<String> {
+        tenant_key(self.prefix, tenant)
+    }
+
+    fn missing(&self) -> Response {
+        problem(
+            StatusCode::NOT_FOUND,
+            "ResourceNotFound",
+            &format!("no {} document for this tenant", self.what),
+        )
+    }
+
+    /// The answer a PUT of `body` is refused with, if it is.
+    fn refused(&self, body: &[u8]) -> Option<Response> {
+        if body.len() > self.max {
+            return Some(problem(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "BadRequestData",
+                &format!("a {} document is at most {} bytes", self.what, self.max),
+            ));
+        }
+        (self.check)(body)
+            .err()
+            .map(|why| problem(StatusCode::BAD_REQUEST, "BadRequestData", &why))
+    }
+
+    async fn put(&self, r: &Reloader, tenant: &str, body: &[u8]) -> Result<Response, String> {
+        let Some(key) = self.key(tenant) else {
+            return Ok(bad_tenant());
+        };
+        if let Some(refusal) = self.refused(body) {
+            return Ok(refusal);
+        }
+        let text = String::from_utf8_lossy(body).into_owned();
+        store(r, &key, serde_json::json!({"id": key, "text": text})).await
+    }
+
+    /// GET the document as written, PUT one, DELETE it.
+    fn handlers(&'static self, weak: &Weak<Reloader>) -> axum::routing::MethodRouter {
+        let (read, write, remove) = (weak.clone(), weak.clone(), weak.clone());
+        get(move |Path(t): Path<String>| {
+            serve(read.clone(), move |r| async move {
+                stored_json(&r, self.key(&t), || self.missing()).await
+            })
+        })
+        .put(move |Path(t): Path<String>, body: Bytes| {
+            serve(write.clone(), move |r| async move {
+                self.put(&r, &t, &body).await
+            })
+        })
+        .delete(move |Path(t): Path<String>| {
+            serve(remove.clone(), move |r| async move {
+                remove_stored(&r, self.key(&t), || self.missing()).await
+            })
+        })
+    }
+}
+
+/// The rules of the stored `what` documents among `docs`, by Tenant: a stored document that no
+/// longer parses is skipped with a warning, so the sweep acts on nothing for that Tenant rather
+/// than guess.
+fn tenant_rules<'a, R>(
+    docs: impl Iterator<Item = (&'a str, &'a Value)>,
+    parse: fn(&[u8]) -> Result<R, String>,
+    what: &str,
+) -> Vec<(antares_model::TenantId, R)> {
+    let mut rules = Vec::new();
+    for (tenant, doc) in docs {
+        let body = doc.get("text").and_then(Value::as_str).unwrap_or_default();
+        match antares_model::TenantId::new(tenant)
+            .map_err(|e| e.to_string())
+            .and_then(|t| Ok((t, parse(body.as_bytes())?)))
+        {
+            Ok(rule) => rules.push(rule),
+            Err(e) => tracing::warn!(tenant, error = %e, "{what} document skipped"),
+        }
+    }
+    rules
 }
 
 /// Bound, check, store, and answer once this pod's table holds the write.
@@ -1043,15 +1155,7 @@ async fn put_schema(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Res
             ),
         ));
     }
-    let doc = serde_json::json!({"id": key, "text": text});
-    let replaced = r.state.put_view_doc(&key, doc).await?;
-    r.reload().await?;
-    Ok(if replaced {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::CREATED
-    }
-    .into_response())
+    store(&r, &key, serde_json::json!({"id": key, "text": text})).await
 }
 
 /// Members of an Attribute instance an Entity also carries, or that the

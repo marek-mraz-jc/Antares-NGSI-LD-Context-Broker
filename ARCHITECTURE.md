@@ -453,6 +453,35 @@ Stated so they are not rediscovered. Each is measured, not guessed.
   refusal), `retain` (the retention run, the outbox drain, one bounded
   retention statement) and `selection` (temporal `attrs`/`pick` against
   OData's entity selection). No two of them take or return the same thing.
+- Re-measured 2026-10-19 (T-4722) with dev's MCP summary, iCal, STA, OData
+  `$apply`, quality and erasure work merged: the gate stood at 110 clones
+  over 1339 lines and 59 names. Merged: a view document is stored, deleted
+  and keyed by tenant through `views::store`, `remove_stored` and
+  `tenant_key`, and quality and retention documents share one
+  `views::TextDoc` route; iCal and STA answer `OPTIONS`, refused methods
+  and `HEAD` through `antares_ops::read_only`; OData's read and `$apply`
+  build their page links with `read::page_link`; `AnyStore`'s per-tenant
+  statements open one `tenant_tx`; and `PgDocStore::list` and
+  `list_digests` read through one bounded `every_row`. That leaves 100
+  clones over 1222 lines. What stays above the 10-12 floor:
+  - 20 lines are `antares-mcp`'s argument tables (`QUERY`, `BATCH_QUERY`,
+    the three temporal tools): each tool lists its own arguments with its
+    own required set, and stable Rust cannot concatenate const slices, so
+    a shared table would be a macro that hides the list a reviewer checks.
+  - 20 lines are two `examples/suite_*` runners pairwise (`antares-model`
+    against `antares-residual`, `antares-jsonld` against `antares-ql`):
+    each example is a crate's own self-contained conformance runner.
+  - The rest are 9 to 13 line blocks inside one handler each in
+    `antares-api` (`attrs`, `temporal`, `federation`, `tenant_move`), two
+    test tables in `odata-url`, the surface `router` boilerplate of OGC and
+    STA, and the argument check that opens MCP's `call` and `summarize`.
+  Names in more than one crate rose from 48 to 59: six left the list and
+  seventeen joined it, again one word per crate's own job:
+  `admit`, `check`, `collection`, `erase`, `feature`, `fit`, `fold`,
+  `members`, `negotiate`, `one`, `profile`, `scanned`, `steps`, `text`,
+  `visible` and `window` take and return different things in each crate,
+  and `mirrored` flips OData's `CompareOp` and CQL2's `Cmp`, two enums of
+  two grammars.
 
 ## 9. To change X, touch Y
 

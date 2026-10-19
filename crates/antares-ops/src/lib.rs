@@ -910,6 +910,37 @@ pub fn mount<S: Surface>(surface: S) -> Box<dyn antares_api::ApiSurface> {
     })
 }
 
+/// The methods a read-only surface answers.
+pub const READ_ONLY_METHODS: &str = "GET, HEAD, OPTIONS";
+
+/// A read-only surface's answer to `method`: `OPTIONS` lists [`READ_ONLY_METHODS`], any method but
+/// `GET` and `HEAD` is the surface's own `refused` answer with that list in `Allow`, and `HEAD` is
+/// `get`'s answer without its body.
+pub async fn read_only(
+    method: &Method,
+    refused: impl FnOnce() -> Response,
+    get: impl std::future::Future<Output = Response>,
+) -> Response {
+    let allow = HeaderValue::from_static(READ_ONLY_METHODS);
+    if method == Method::OPTIONS {
+        return axum::response::IntoResponse::into_response((
+            StatusCode::NO_CONTENT,
+            [(axum::http::header::ALLOW, allow)],
+        ));
+    }
+    if method != Method::GET && method != Method::HEAD {
+        let mut reply = refused();
+        reply.headers_mut().insert(axum::http::header::ALLOW, allow);
+        return reply;
+    }
+    let reply = get.await;
+    if method == Method::HEAD {
+        let (parts, _) = reply.into_parts();
+        return Response::from_parts(parts, Body::empty());
+    }
+    reply
+}
+
 /// Register the forward transport `make` builds over the broker's
 /// operations: every federation forward asks it first, and a forward it
 /// does not serve goes over HTTP (ADR-0025 rule 8). The composition root
@@ -1723,5 +1754,38 @@ mod tests {
         assert_eq!(req.headers.len(), 1);
         assert_eq!(req.headers["content-type"], "application/json");
         assert_eq!(axum::body::HttpBody::size_hint(&req.body).exact(), Some(2));
+    }
+
+    /// `read_only`: `OPTIONS` names the methods, a write is the surface's refusal with `Allow`,
+    /// `HEAD` keeps `GET`'s headers and drops its body, and `GET` is answered whole.
+    #[tokio::test]
+    async fn a_read_only_surface_answers_each_method() {
+        let get = || async { Response::new(Body::from("doc")) };
+        let refused = || {
+            let mut r = Response::new(Body::empty());
+            *r.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+            r
+        };
+        let body = |r: Response| async {
+            axum::body::to_bytes(r.into_body(), 64)
+                .await
+                .map(|b| b.to_vec())
+                .unwrap_or_default()
+        };
+
+        let options = read_only(&Method::OPTIONS, refused, get()).await;
+        assert_eq!(options.status(), StatusCode::NO_CONTENT);
+        assert_eq!(options.headers()["allow"], READ_ONLY_METHODS);
+
+        let post = read_only(&Method::POST, refused, get()).await;
+        assert_eq!(post.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(post.headers()["allow"], READ_ONLY_METHODS);
+
+        let head = read_only(&Method::HEAD, refused, get()).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(body(head).await, b"");
+
+        let got = read_only(&Method::GET, refused, get()).await;
+        assert_eq!(body(got).await, b"doc");
     }
 }
