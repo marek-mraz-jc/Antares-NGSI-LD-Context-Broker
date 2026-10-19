@@ -8,8 +8,10 @@ A surface feature is one that pulls in a crate of role `surface`
 surface joins by being declared, without a YAML edit.
 
   dev/surface-features.py list         comma-separated, for cargo hack
-  dev/surface-features.py sizes        build vanilla and each surface feature
-                                       release, report, gate against the budget
+  dev/surface-features.py sizes [k/n] build vanilla and each surface feature
+                                       release, report, gate against the budget;
+                                       with k/n only every n-th feature from the
+                                       k-th, beside its own vanilla build (T-4680)
   dev/surface-features.py --self-test  the gate is red on a synthetic overrun
 
 Budget: the "binary size" row of ADR-0027 section 6, read from the ADR so
@@ -115,10 +117,22 @@ def lanes(jobs, builds):
     return 1 if jobs < 8 else max(1, min(3, jobs // 4, builds))
 
 
-def sizes():
+def share(features, part):
+    """The features of partition `k/n` (1-based, cargo-hack's notation); all of them for None."""
+    if part is None:
+        return features
+    m = re.fullmatch(r"([1-9][0-9]*)/([1-9][0-9]*)", part)
+    if not m or int(m[1]) > int(m[2]):
+        sys.exit(f"partition {part!r}: want k/n with 1 <= k <= n")
+    k, n = int(m[1]), int(m[2])
+    return features[k - 1::n]
+
+
+def sizes(part=None):
     meta = metadata()
     target = pathlib.Path(meta["target_directory"])
-    features = [None] + surface_features(meta)
+    # Every partition measures vanilla itself: a size is only comparable within one runner.
+    features = [None] + share(surface_features(meta), part)
     jobs = int(os.environ.get("CARGO_BUILD_JOBS") or os.cpu_count() or 1)
     n = lanes(jobs, len(features))
     # Lane 0 is the target directory itself, the others a directory of their own beside it: two
@@ -178,6 +192,12 @@ def self_test():
         sys.exit("self-test: full is not picked up")
     if [lanes(j, 9) for j in (1, 3, 7, 8, 12, 16, 64)] != [1, 1, 1, 2, 3, 3, 3] or lanes(12, 2) != 2:
         sys.exit("self-test: the lanes do not follow CARGO_BUILD_JOBS")
+    names = ["ical", "mcp", "views", "ws", "full"]
+    parts = [share(names, f"{k}/3") for k in (1, 2, 3)]
+    if parts != [["ical", "ws"], ["mcp", "full"], ["views"]] or share(names, None) != names:
+        sys.exit(f"self-test: partitions {parts}")
+    if sorted(sum(parts, [])) != sorted(names):
+        sys.exit("self-test: the partitions do not cover every feature once")
     print("surface-features: self-test passed")
 
 
@@ -185,8 +205,8 @@ if __name__ == "__main__":
     mode = sys.argv[1:] or ["list"]
     if mode == ["--self-test"]:
         self_test()
-    elif mode == ["sizes"]:
-        sizes()
+    elif mode[0] == "sizes" and len(mode) <= 2:
+        sizes(mode[1] if len(mode) == 2 else None)
     elif mode == ["list"]:
         print(",".join(surface_features(metadata())))
     else:
