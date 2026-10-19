@@ -103,6 +103,7 @@ mod subscription_status_5_2_12;
 mod temporal_aggregated_query_4_5_19;
 mod temporal_attr_writes_5_6_13;
 mod temporal_autorecord;
+mod temporal_bikes_week;
 mod temporal_content_range_6_3_10;
 mod temporal_dedup;
 mod temporal_drain;
