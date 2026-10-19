@@ -1744,7 +1744,10 @@ impl antares_store::TemporalDriver for AnyStore {
     ) -> Result<serde_json::Map<String, Value>, NgsiError> {
         match self {
             // ponytail: memory keeps no versions or provenance
-            AnyStore::Mem(_) => Ok(serde_json::Map::new()),
+            AnyStore::Mem(_) => {
+                let _ = (tenant, entity_id);
+                Ok(serde_json::Map::new())
+            }
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => p.temporal.versions(tenant, entity_id).await.map_err(db),
         }
