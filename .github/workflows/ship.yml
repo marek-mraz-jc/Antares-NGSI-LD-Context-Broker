@@ -104,7 +104,7 @@ jobs:
             || fail "/types does not list the created type"
           echo "create 201, read back, /types lists Smoke"
         env:
-          SMOKE_ENV: ${{ inputs.smoke_env || 'ANTARES_HTTP_PORT=9999' }} # TEMP: red-smoke proof, reverted next
+          SMOKE_ENV: ${{ inputs.smoke_env }}
       - uses: sigstore/cosign-installer@v3
         if: github.ref == 'refs/heads/dev'
       - name: Push the tested bytes, sign and attest by digest
