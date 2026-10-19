@@ -21,6 +21,7 @@
 //! ```
 #![forbid(unsafe_code)]
 
+mod budget;
 mod confirm;
 mod cursor;
 #[cfg(feature = "fuzzing")]
@@ -29,6 +30,7 @@ mod guide;
 mod listen;
 mod schema;
 mod server;
+mod summary;
 mod tools;
 mod units;
 
@@ -62,6 +64,25 @@ pub const MAX_RESULT_BYTES_ENV: &str = "ANTARES_MCP_MAX_RESULT_BYTES";
 /// own and a confirmation answers only the process that asked.
 pub const REQUEST_STATE_KEY_FILE_ENV: &str = "ANTARES_MCP_REQUEST_STATE_KEY_FILE";
 
+/// Adaptive summary budget environment variables (T-4680).
+pub const SUMMARY_BUSY_MEMORY_PCT_ENV: &str = "ANTARES_SUMMARY_BUSY_MEMORY_PCT";
+/// Pod memory percentage threshold for Tight state.
+pub const SUMMARY_TIGHT_MEMORY_PCT_ENV: &str = "ANTARES_SUMMARY_TIGHT_MEMORY_PCT";
+/// CPU pressure threshold for Busy state.
+pub const SUMMARY_BUSY_CPU_AVG10_ENV: &str = "ANTARES_SUMMARY_BUSY_CPU_AVG10";
+/// CPU pressure threshold for Tight state.
+pub const SUMMARY_TIGHT_CPU_AVG10_ENV: &str = "ANTARES_SUMMARY_TIGHT_CPU_AVG10";
+/// The node's `MemAvailable` in MiB below which a summary is Busy.
+pub const SUMMARY_BUSY_NODE_MIB_ENV: &str = "ANTARES_SUMMARY_BUSY_NODE_MIB";
+/// The node's `MemAvailable` in MiB below which a summary is Tight.
+pub const SUMMARY_TIGHT_NODE_MIB_ENV: &str = "ANTARES_SUMMARY_TIGHT_NODE_MIB";
+/// Normal row budget for summary.
+pub const SUMMARY_ROWS_ENV: &str = "ANTARES_SUMMARY_ROWS";
+/// Normal byte budget for summary.
+pub const SUMMARY_MAX_BYTES_ENV: &str = "ANTARES_SUMMARY_MAX_BYTES";
+/// Concurrency limit for summary tasks.
+pub const SUMMARY_CONCURRENCY_ENV: &str = "ANTARES_SUMMARY_CONCURRENCY";
+
 /// Every variable this crate reads. The broker accepts these as config keys
 /// from here, so a new one is added in this crate alone (T-3766).
 pub const ENV_KEYS: &[&str] = &[
@@ -70,6 +91,15 @@ pub const ENV_KEYS: &[&str] = &[
     MAX_RESULT_BYTES_ENV,
     REQUEST_STATE_KEY_FILE_ENV,
     SUBSCRIPTION_ENDPOINTS_ENV,
+    SUMMARY_BUSY_CPU_AVG10_ENV,
+    SUMMARY_BUSY_MEMORY_PCT_ENV,
+    SUMMARY_BUSY_NODE_MIB_ENV,
+    SUMMARY_CONCURRENCY_ENV,
+    SUMMARY_MAX_BYTES_ENV,
+    SUMMARY_ROWS_ENV,
+    SUMMARY_TIGHT_CPU_AVG10_ENV,
+    SUMMARY_TIGHT_MEMORY_PCT_ENV,
+    SUMMARY_TIGHT_NODE_MIB_ENV,
 ];
 
 pub use antares_ops::PRIMER;

@@ -18,5 +18,6 @@ mod mcp_listen;
 mod mcp_mapped;
 mod mcp_output;
 mod mcp_resources;
+mod mcp_summary;
 mod mcp_transport;
 mod mcp_writes;

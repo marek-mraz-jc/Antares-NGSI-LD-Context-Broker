@@ -81,6 +81,15 @@ here).
 | `ANTARES_WS_MAX_LIFETIME_SECS` | `300` | Builds with the `ws` feature only: a socket ends at this age with `x-closing` `lifetime` and 1000, and the client resumes on a new one, so a revoked credential stops at the next reconnect (W7). |
 | `ANTARES_MCP_REQUEST_STATE_KEY_FILE` | unset: a key per process | Builds with the `mcp` feature only: a file of at least 32 bytes, mounted from a Secret, whose bytes seal a write tool's `requestState` (HMAC-SHA256), so a confirmation answers every replica. Unreadable or shorter: every write tool call is refused. Never logged. |
 | `ANTARES_MCP_SUBSCRIPTION_ENDPOINTS` | unset: none | Builds with the `mcp` feature only: comma-separated notification endpoints `create_subscription` and `update_subscription` may name; an entry ending in `/` allows every URI below it. |
+| `ANTARES_SUMMARY_ROWS` | `1000` | Builds with the `mcp` feature only: the most Entities the [`summarize`](mcp.md) tool loads for its statistics when the broker is not busy (T-4680). Values outside 1 to 5000 are clamped. |
+| `ANTARES_SUMMARY_MAX_BYTES` | `33554432` (32 MiB) | Builds with the `mcp` feature only: the most bytes of Entities one summary keeps when the broker is not busy; it stops loading at the budget and says so in `basis`. A busy broker uses 8 MiB. |
+| `ANTARES_SUMMARY_CONCURRENCY` | `4` | Builds with the `mcp` feature only: how many summaries run at once; a summary on a busy broker runs alone, and one that waits 2 s for its turn is a tool error. |
+| `ANTARES_SUMMARY_BUSY_MEMORY_PCT` | `70` | Builds with the `mcp` feature only: the share of the container's cgroup memory limit in use above which a summary takes the busy budget (250 Entities). |
+| `ANTARES_SUMMARY_TIGHT_MEMORY_PCT` | `85` | Builds with the `mcp` feature only: the share above which a summary loads no Entities and answers the count alone. |
+| `ANTARES_SUMMARY_BUSY_CPU_AVG10` | `30` | Builds with the `mcp` feature only: the cgroup `cpu.pressure` `some avg10` above which a summary takes the busy budget. |
+| `ANTARES_SUMMARY_TIGHT_CPU_AVG10` | `60` | Builds with the `mcp` feature only: the `cpu.pressure` `some avg10` above which a summary answers the count alone. |
+| `ANTARES_SUMMARY_BUSY_NODE_MIB` | `1536` | Builds with the `mcp` feature only: the node's `MemAvailable` in MiB below which a summary takes the busy budget. |
+| `ANTARES_SUMMARY_TIGHT_NODE_MIB` | `819` | Builds with the `mcp` feature only: the node's `MemAvailable` in MiB below which a summary answers the count alone. A signal the broker cannot read (no cgroup v2) never makes the state worse. |
 | `ANTARES_EXTRA_CA_FILE` | unset | PEM bundle of ADDITIONAL trust anchors for egress TLS (private CAs). Egress TLS trusts the host's certificate store (`/etc/ssl/certs` on Linux; the shipped image carries one), and this widens it. Verification itself is never disableable. |
 
 ## Notification delivery
