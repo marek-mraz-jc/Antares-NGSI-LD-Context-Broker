@@ -1,0 +1,124 @@
+name: ship
+
+# The jc broker image on every dev push, in minutes (T-4721): build with the
+# layer cache (cargo-chef's dependency layer is reused, only our crates
+# compile), prove what the image carries, gate on trivy, start it and make one
+# real NGSI-LD round trip, then push, sign and attest by digest. The long ETSI
+# run on the image stays in image-jc.yml, nightly and on dispatch: it is no
+# longer in the way of a publish (owner order 2026-10-19).
+on:
+  push:
+    branches: [dev]
+    paths:
+      - "crates/**"
+      - "addons/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Dockerfile"
+      - ".github/workflows/ship.yml"
+  workflow_dispatch:
+    inputs:
+      smoke_env:
+        description: "NAME=value given to the smoke container (a bad one proves the smoke goes red)"
+        required: false
+        default: ""
+
+concurrency:
+  group: ship-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FEATURES: full,jc-policy,linkml,parquet,tabular,ical
+  # what the jc image must carry, by crate name in its auditable list
+  CARRIES: antares-views antares-mcp antares-odata antares-ws antares-linkml joinedcontext-policy
+
+jobs:
+  ship:
+    name: Build, check, push, sign and attest the jc image
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # cosign keyless
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      - name: Build with the platform's features (layer cache on GHA)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: antares-local:latest
+          build-args: |
+            FEATURES=${{ env.FEATURES }}
+            VERSION=dev
+            REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=antares-jc
+          cache-to: type=gha,scope=antares-jc,mode=max
+      - name: SBOM of the built image (syft reads the cargo-auditable list)
+        uses: anchore/sbom-action@v0
+        with:
+          image: antares-local:latest
+          format: spdx-json
+          output-file: antares-broker-jc.sbom.spdx.json
+          upload-artifact: false
+      - name: The image carries every surface and the engine
+        run: |
+          rc=0
+          for crate in $CARRIES; do
+            if jq -e --arg c "$crate" '[.packages[].name] | index($c)' \
+                 antares-broker-jc.sbom.spdx.json >/dev/null; then
+              echo "carries $crate"
+            else
+              echo "MISSING $crate"; rc=1
+            fi
+          done
+          exit $rc
+      # T-3834: no HIGH or CRITICAL with a fixed version; an exception is a
+      # .trivyignore line with its reason, task and expiry.
+      - name: No fixable HIGH or CRITICAL in the image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: antares-local:latest
+          severity: "HIGH,CRITICAL"
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: The image starts and answers one NGSI-LD round trip
+        run: |
+          docker run -d --name broker -p 9090:9090 -e ANTARES_POLICY=allow-all \
+            ${SMOKE_ENV:+-e "$SMOKE_ENV"} antares-local:latest
+          for _ in $(seq 30); do curl -sf localhost:9090/q/health >/dev/null && break; sleep 1; done
+          fail() { echo "SMOKE: $1"; docker logs broker | tail -40; exit 1; }
+          curl -sf localhost:9090/q/health >/dev/null || fail "not healthy after 30 s"
+          id=urn:ngsi-ld:Smoke:ship-1
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:9090/ngsi-ld/v1/entities \
+            -H 'Content-Type: application/json' \
+            -d "{\"id\":\"$id\",\"type\":\"Smoke\",\"n\":{\"type\":\"Property\",\"value\":1}}")
+          [ "$code" = 201 ] || fail "create answered $code"
+          curl -sf "localhost:9090/ngsi-ld/v1/entities/$id" | jq -e '.n.value == 1' >/dev/null \
+            || fail "the created entity does not read back"
+          curl -sf localhost:9090/ngsi-ld/v1/types | jq -e 'tostring | contains("Smoke")' >/dev/null \
+            || fail "/types does not list the created type"
+          echo "create 201, read back, /types lists Smoke"
+        env:
+          SMOKE_ENV: ${{ inputs.smoke_env }}
+      - uses: sigstore/cosign-installer@v3
+        if: github.ref == 'refs/heads/dev'
+      - name: Push the tested bytes, sign and attest by digest
+        if: github.ref == 'refs/heads/dev'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          IMG=ghcr.io/${{ github.repository_owner }}/antares-broker-jc
+          SHA=${GITHUB_SHA::7}
+          docker tag antares-local:latest "$IMG:$SHA"
+          docker tag antares-local:latest "$IMG:dev"
+          docker push -q "$IMG:$SHA"
+          docker push -q "$IMG:dev"
+          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMG:$SHA")
+          case "$DIGEST" in "$IMG@sha256:"*) ;; *) echo "no digest for $IMG:$SHA: $DIGEST"; exit 1 ;; esac
+          cosign sign --yes "$DIGEST"
+          cosign attest --yes --type spdxjson --predicate antares-broker-jc.sbom.spdx.json "$DIGEST"
+          echo "## Published \`$DIGEST\` (tags \`$SHA\`, \`dev\`; features \`$FEATURES\`; signed, SPDX attested)" >> "$GITHUB_STEP_SUMMARY"
