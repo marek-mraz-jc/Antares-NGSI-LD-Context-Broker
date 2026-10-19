@@ -48,6 +48,7 @@ mod forward_context_4_3_6_6;
 mod id_routing_5_12;
 mod internal_tenant_leaks;
 mod join_budget_4_5_23;
+mod module_boundaries;
 mod narrowing_through_proxies_5_7_2;
 mod no_change_no_notify_5_6;
 mod no_overwrite_5_6_3;

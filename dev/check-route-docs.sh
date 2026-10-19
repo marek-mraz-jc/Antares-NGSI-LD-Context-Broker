@@ -15,8 +15,9 @@ cd "$(dirname "$0")/.."
 python3 - <<'PY'
 import re, sys, pathlib
 
-SRC = pathlib.Path("crates/antares-api/src/lib.rs")
-lib = SRC.read_text()
+# the route table and layers live in router.rs, the Admin surface in ops.rs (T-4773)
+SRC = pathlib.Path("crates/antares-api/src")
+lib = "\n".join((SRC / f).read_text() for f in ("lib.rs", "router.rs", "ops.rs"))
 METHODS = ("get", "post", "put", "patch", "delete", "head", "options")
 
 
