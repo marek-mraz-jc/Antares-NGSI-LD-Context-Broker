@@ -262,3 +262,39 @@ async fn a_time_weighted_average_of_on_change_rows_is_the_average_of_every_row()
         assert!(detail.starts_with("aggregation-not-meaningful"), "{doc}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_attribute_fills_no_period_past_now_and_refuses_too_many() {
+    let st = state(station()).await;
+    let id = "urn:ngsi-ld:Spot:far";
+    replayed(&st, id, &[(5.0, 0), (7.0, 2)]).await;
+    let aggregated = |period: &str| {
+        format!(
+            "/ngsi-ld/v1/temporal/entities/{id}?options=aggregatedValues&attrs=bikes\
+             &aggrPeriodDuration={period}&aggrMethods=avg&timerel=between\
+             &timeAt=2026-10-18T07:00:00Z&endTimeAt=9999-12-31T00:00:00Z"
+        )
+    };
+    // a day per period: the held value fills up to now, not to the year 9999
+    let started = std::time::Instant::now();
+    let (s, doc) = req(&st, "GET", &aggregated("P1D"), None).await;
+    assert_eq!(s, 200, "{doc}");
+    let days = doc["bikes"]["avg"].as_array().map_or(0, Vec::len);
+    let first = chrono::DateTime::parse_from_rfc3339("2026-10-18T07:00:00Z").expect("instant");
+    let since = chrono::Utc::now()
+        .fixed_offset()
+        .signed_duration_since(first)
+        .num_days();
+    assert!(
+        days >= 1 && days <= usize::try_from(since + 2).unwrap_or(usize::MAX),
+        "{days}: {doc}"
+    );
+    // a second per period from then to now is more periods than one answer holds
+    let (s, doc) = req(&st, "GET", &aggregated("PT1S"), None).await;
+    assert_eq!(s, 400, "{doc}");
+    assert!(
+        doc["detail"].as_str().unwrap_or_default().contains("10000"),
+        "{doc}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}

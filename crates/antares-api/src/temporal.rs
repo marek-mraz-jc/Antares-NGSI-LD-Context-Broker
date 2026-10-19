@@ -263,6 +263,9 @@ struct Windowed {
 /// 200 at <=5, so any limit in (5,20) is spec-valid; 9 keeps margin.
 const TEMPORAL_INSTANCE_LIMIT: usize = 9;
 
+/// The most periods an aggregated `onChange` Attribute answers, rows and held gaps together.
+const MAX_HELD_BUCKETS: usize = 10_000;
+
 /// 6.3.10: the ceiling is a CUT, not a label. An Attribute holding more
 /// instances than the broker serves at once is truncated to the ceiling in
 /// the query direction, and the 206 + Content-Range then describes the
@@ -1484,11 +1487,18 @@ fn render_aggregated(
         type Rows<'a> = Vec<(DateTime<FixedOffset>, &'a Value)>;
         let mut buckets: Vec<(Bucket, Rows)> = Vec::new();
         // An onChange attribute held its value through a period no row fell in: that period
-        // answers the value, as `every` would have, up to the window's end (T-4669).
-        let fill = |buckets: &mut Vec<(Bucket, Rows)>, until: DateTime<FixedOffset>| {
+        // answers the value, as `every` would have, up to the window's end, never past now,
+        // and at most MAX_HELD_BUCKETS of them: a far edge and PT1S is refused, not allocated (T-4669).
+        let edge = whole.1.min(chrono::Utc::now().fixed_offset());
+        let mut refused = false;
+        let mut fill = |buckets: &mut Vec<(Bucket, Rows)>, until: DateTime<FixedOffset>| {
             while let Some(end) = buckets.last().map(|((_, end), _)| *end) {
                 let gap = bucket_of(end);
-                if end >= until || end >= whole.1 || gap.0 < end {
+                if end >= until || end >= edge || gap.0 < end {
+                    break;
+                }
+                if buckets.len() >= MAX_HELD_BUCKETS {
+                    refused = true;
                     break;
                 }
                 buckets.push((gap, Vec::new()));
@@ -1507,6 +1517,24 @@ fn render_aggregated(
         if held {
             fill(&mut buckets, whole.1);
         }
+        if refused {
+            return Err(NgsiError::BadRequestData(format!(
+                "aggrPeriodDuration splits the window of {} into more than {MAX_HELD_BUCKETS} \
+                 periods; ask a longer period or a shorter window",
+                ctx.compact_iri(k)
+            )));
+        }
+        // the value the last bucket with a row ended on holds into the next one
+        let carried: Vec<Option<&Value>> = buckets
+            .iter()
+            .scan(None, |last, (_, rows)| {
+                let before = *last;
+                if let Some(&(_, v)) = rows.last() {
+                    *last = Some(v);
+                }
+                Some(before)
+            })
+            .collect();
         let mut attr_out = Map::new();
         // 4.5.19.0: the member is labelled "Property" for Properties and
         // "Relationship" for Relationships.
@@ -1519,16 +1547,8 @@ fn render_aggregated(
         for method in &r.aggr_methods {
             let rows: Vec<Value> = buckets
                 .iter()
-                .enumerate()
-                .map(|(i, ((bs, be), rows))| {
-                    // the value the last bucket with a row ended on holds into this one
-                    let before = buckets
-                        .get(..i)
-                        .unwrap_or_default()
-                        .iter()
-                        .rev()
-                        .find_map(|(_, r)| r.last())
-                        .map(|&(_, v)| v);
+                .zip(&carried)
+                .map(|(((bs, be), rows), &before)| {
                     let weighted = (held && method == "avg")
                         .then(|| time_weighted_avg(class, rows, before, *bs, (*be).min(whole.1)))
                         .flatten();
