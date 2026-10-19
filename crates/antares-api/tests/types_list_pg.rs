@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! `GET /types` through a view on Postgres answers in under 200 ms over
-//! 100 000 Entities (T-4683). Probing a type a rule does not name as the
-//! two-type group `[name, ruleType]` matched nothing and walked the Tenant's
-//! whole primary key for its `ORDER BY id LIMIT`: 17 s for MCP `list_types`
-//! on dev, and the assistant routed without the source. Skips loudly without
-//! `ANTARES_TEST_DATABASE_URL` (container recipe in `antares-sql/tests/pg.rs`).
+//! `GET /types` through a view on Postgres over 100 000 Entities (T-4683).
+//! Probing a type a rule does not name as the two-type group
+//! `[name, ruleType]` matched nothing and walked the Tenant's whole primary
+//! key for its `ORDER BY id LIMIT`: 17 s for MCP `list_types` on dev, and the
+//! assistant routed without the source. The guard is the plan, which cannot
+//! flake: Postgres names no Stop or Lamp beside a rule's type, so neither is
+//! probed (`types_attrs::probe_plan` asserts what that read leaves out). The
+//! clock only catches the walk: 1 s at best of five, where the fixed path
+//! takes 41-91 ms locally and about 200 ms on a shared runner (T-4736).
+//! `ANTARES_TEST_TYPES_BUDGET_MS=200` on a quiet machine checks the 200 ms claim.
+//! Skips loudly without `ANTARES_TEST_DATABASE_URL` (container recipe in
+//! `antares-sql/tests/pg.rs`).
 #![cfg(feature = "postgres")]
 
 use antares_api::policy::{
@@ -87,9 +93,10 @@ async fn types_at(st: &AppState, tenant: &str, uri: &str) -> (StatusCode, Value,
 }
 
 /// 20 000 Entities of each of five types in zone `b`, one Car in zone `a`
-/// that is a Tree too: through the view, Bus, Car and Tree, in under 200 ms.
+/// that is a Tree too: through the view, Bus, Car and Tree, with no probe of
+/// Stop or Lamp, inside the budget.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_views_type_list_over_100k_entities_answers_in_under_200_ms() {
+async fn a_views_type_list_over_100k_entities_probes_no_empty_group() {
     let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
         eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
         return;
@@ -141,6 +148,19 @@ async fn a_views_type_list_over_100k_entities_answers_in_under_200_ms() {
     let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
         pool.clone(),
     ));
+    // the plan's input: what the view's rule types carry beside them
+    for (rule, other) in [("Car", Some("Tree")), ("Bus", None)] {
+        let beside = store
+            .entity_types_beside(&tid, &[iri(rule)])
+            .await
+            .expect("beside");
+        if let Some(other) = other {
+            assert!(beside.contains(&iri(other)), "{rule}: {beside:?}");
+        }
+        for empty in ["Stop", "Lamp"] {
+            assert!(!beside.contains(&iri(empty)), "{rule}: {beside:?}");
+        }
+    }
     let mut st = AppState::with_store("me".into(), Arc::new(store), "postgres")
         .with_policy(Arc::new(Narrowing(view())));
     antares_api::wire(&mut st).await;
@@ -160,9 +180,14 @@ async fn a_views_type_list_over_100k_entities_answers_in_under_200_ms() {
         );
         best = best.min(took);
     }
+    let budget = std::env::var("ANTARES_TEST_TYPES_BUDGET_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(Duration::from_secs(1), Duration::from_millis);
+    eprintln!("/types over 100 000 Entities: {best:?} at best of 5");
     assert!(
-        best < Duration::from_millis(200),
-        "/types took {best:?} at best of 5"
+        best < budget,
+        "/types took {best:?} at best of 5, budget {budget:?}"
     );
 
     antares_sql::sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
