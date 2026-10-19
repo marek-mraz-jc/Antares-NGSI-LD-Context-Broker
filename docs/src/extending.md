@@ -497,6 +497,9 @@ A backend from outside the workspace:
    and never cross a tenant. `entity_type_names` is optional: the default
    `None` makes `/types` fold the Entities; a driver that keeps a type list
    answers every type of a live Entity of the tenant, sorted, and no other.
+   `entity_types_beside` is optional the same way: the types of the live
+   Entities that carry one of the given types; `None` makes `/types` under
+   a view probe every type beside each type a rule names.
 3. Hold it to the driver contract. `antares-store`'s `test-kit` feature
    exports `run_current_state_contract` and `run_temporal_contract`
    (`crates/antares-store/src/contract.rs`): the rules `antares-api` writes
