@@ -1183,6 +1183,12 @@ async fn the_websocket_column_is_served_as_the_matrix_states() {
         if binding.contains("then Retrieve Subscription") {
             c.push(retrieve);
         }
+        // ADR-0026 rule 4 (T-4755): the socket's own Subscription is
+        // decided as Query Entities, whatever its row's own clause
+        let c = c
+            .into_iter()
+            .map(|c| if c.starts_with("5.8.") { "5.7.2" } else { c })
+            .collect();
         asks.push((op, c));
     }
     assert!(pushed, "no row states the notification push");
