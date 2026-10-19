@@ -145,9 +145,10 @@ async fn erase(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Response
     // that fails halfway is finished by the next start's re-apply
     r.state.put_view_doc(&key, record.clone()).await?;
     let counts = apply(&r.state, &t, &req.entities, req.attrs.as_deref(), None).await?;
-    if let Some(o) = record.as_object_mut() {
-        o.insert("counts".into(), counts.clone());
-    }
+    // a json! object always; no branch is left that no request could take
+    let _ = record
+        .as_object_mut()
+        .map(|o| o.insert("counts".into(), counts.clone()));
     r.state.put_view_doc(&key, record.clone()).await?;
     r.reload().await?;
     tracing::info!(tenant = t.as_str(), erasure = %id, %counts, "personal data erased");
@@ -236,6 +237,15 @@ mod tests {
         assert!(with("reason", json!(" ")).is_some());
         assert!(with("actor", json!("")).is_some());
         assert!(with("subject", json!("jane.doe@example.org")).is_some());
+        assert!(with("subject", json!("")).is_some());
+        assert!(with("subject", json!("a".repeat(MAX_SUBJECT + 1))).is_some());
+        let many: Vec<String> = (0..=MAX_ENTITIES).map(|n| format!("urn:a:{n}")).collect();
+        assert!(with("entities", json!(many)).is_some());
+        assert!(with("attrs", json!(["https://e.org/a\u{7}"])).is_some());
+        assert!(with("attrs", json!(["https://e.org/rider"])).is_none());
+        assert!(with("actor", json!("a".repeat(MAX_ACTOR + 1))).is_some());
+        assert!(with("reason", json!("a".repeat(MAX_REASON + 1))).is_some());
+        assert!(with("subject", json!(null)).is_none());
         assert!(serde_json::from_value::<Request>(json!({
             "entities": ["urn:a:b"], "actor": "a", "reason": "r", "value": "x"
         }))

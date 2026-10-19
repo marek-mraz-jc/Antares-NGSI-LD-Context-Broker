@@ -120,9 +120,8 @@ impl RecordDoc {
     /// setting is out of place otherwise.
     fn parse(&self) -> Result<Option<antares_api::OnChange>, String> {
         let bound = |name: &str, v: Option<f64>| match v {
-            Some(v) if !(v.is_finite() && v >= 0.0) => {
-                Err(format!("{name} must be a number of at least 0"))
-            }
+            // JSON carries no NaN or infinity, so the sign is the whole check
+            Some(v) if v < 0.0 => Err(format!("{name} must be a number of at least 0")),
             _ => Ok(v),
         };
         match self.record.as_deref() {
@@ -1040,6 +1039,11 @@ mod tests {
             Some(5.0)
         );
         assert!(rules[1].recording.is_none(), "every, the default");
+        let by_attribute = parse(
+            br#"{"rules":[{"type":"https://e.org/V","attributes":{"https://e.org/a":{"record":"onChange","heartbeat":"PT1H"}}}]}"#,
+        )
+        .expect("an attribute alone records onChange");
+        assert!(by_attribute[0].recording.is_some());
         let gate = history_off(&vec![(TenantId::new("city").expect("tenant"), rules)]);
         assert_eq!(gate.recording.len(), 1);
         for (bad, says) in [
@@ -1050,6 +1054,12 @@ mod tests {
             (br#"{"rules":[{"type":"https://e.org/V","attributes":{"speed":{"record":"every"}}}]}"#, "expanded IRI"),
             (br#"{"rules":[{"type":"*","history":"P30D","record":"onChange","heartbeat":"PT1H"}]}"#, "never how"),
             (br#"{"rules":[{"type":"https://e.org/V","attributes":{"https://e.org/a":{"ttl":1}}}]}"#, "unknown field"),
+            (br#"{"rules":[{"type":"https://e.org/V","heartbeat":"PT1H"}]}"#, "belong"),
+            (br#"{"rules":[{"type":"https://e.org/V","minDistance":1}]}"#, "belong"),
+            (br#"{"rules":[{"type":"https://e.org/V","record":"onChange","heartbeat":"soon"}]}"#, "not a duration"),
+            (br#"{"rules":[{"type":"https://e.org/V","record":"onChange","heartbeat":"PT1H","minDistance":-1}]}"#, "at least 0"),
+            (br#"{"rules":[{"type":"https://e.org/V","attributes":{"https://e.org/a b":{"record":"every"}}}]}"#, "expanded IRI"),
+            (br#"{"rules":[{"type":"*","history":"P30D","attributes":{"https://e.org/a":{"record":"every"}}}]}"#, "never how"),
         ] {
             let err = parse(bad).expect_err("refused");
             assert!(err.contains(says), "{err}");

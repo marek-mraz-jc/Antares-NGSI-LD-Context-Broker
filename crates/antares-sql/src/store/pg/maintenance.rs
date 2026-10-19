@@ -540,42 +540,67 @@ pub async fn retain_history(
              AND a.entity_id <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
            LIMIT $4";
+    // A measurement past retention takes its superseded versions along
+    // (T-4665): the same three selections over `attr_versions`, written out so
+    // every statement on `attr_instances` stays a literal the tenant guard
+    // reads (tests/attr_instances_tenant_predicate.rs).
+    const V_ENTITY: &str =
+        "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_versions a
+           WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
+    const V_TYPE: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_versions a
+           JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
+           WHERE a.tenant_id = $1 AND t.types @> $2::text[]
+             AND a.entity_id <> ALL($5::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
+    const V_REST: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_versions a
+           JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
+           WHERE a.tenant_id = $1 AND NOT (t.types && $2::text[])
+             AND a.entity_id <> ALL($5::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
     let one;
-    let (rows, names, except) = match scope {
+    let (rows, versions, names, except) = match scope {
         HistoryScope::Entity(id) => {
             one = [id.to_owned()];
-            (ENTITY, &one[..], None)
+            (ENTITY, V_ENTITY, &one[..], None)
         }
         HistoryScope::Type {
             type_iri,
             except_ids,
         } => {
             one = [type_iri.to_owned()];
-            (TYPE, &one[..], Some(except_ids))
+            (TYPE, V_TYPE, &one[..], Some(except_ids))
         }
         HistoryScope::Rest {
             except_types,
             except_ids,
-        } => (REST, except_types, Some(except_ids)),
+        } => (REST, V_REST, except_types, Some(except_ids)),
     };
-    // a measurement past retention takes its superseded versions along (T-4665)
-    let mut n = 0u64;
-    for table in ["attr_instances", "attr_versions"] {
-        n = n.saturating_add(
-            retain(
-                pool,
-                &rows.replace("FROM attr_instances", &format!("FROM {table}")),
-                &format!(
-                    "DELETE FROM {table}
-                     WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN"
-                ),
-                (tenant, names, except, before, batch),
-                dry_run,
-            )
-            .await?,
-        );
-    }
-    Ok(n)
+    let current = retain(
+        pool,
+        rows,
+        "DELETE FROM attr_instances
+         WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN",
+        (tenant, names, except, before, batch),
+        dry_run,
+    )
+    .await?;
+    let superseded = retain(
+        pool,
+        versions,
+        "DELETE FROM attr_versions
+         WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN",
+        (tenant, names, except, before, batch),
+        dry_run,
+    )
+    .await?;
+    Ok(current.saturating_add(superseded))
 }
 
 /// The Entities of every Tenant that carry their own history retention
