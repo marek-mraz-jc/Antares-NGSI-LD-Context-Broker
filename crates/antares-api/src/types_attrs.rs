@@ -360,9 +360,38 @@ async fn first_visible(
     view: (&crate::repr::Repr, &antares_jsonld::Context),
     beside: &[Option<BTreeSet<String>>],
 ) -> Result<Probe, NgsiError> {
+    let rules: Vec<_> = rules_of(view).collect();
+    let unruled = view
+        .0
+        .policy_types
+        .as_deref()
+        .is_none_or(|f| f.rules.is_empty());
+    let probes = plan(name, &rules, unruled, beside);
+    let mut cut = false;
+    for (groups, q) in &probes {
+        match probe(st, tenant, max, name, groups, *q, view).await? {
+            Probe::Seen => return Ok(Probe::Seen),
+            Probe::Cut => cut = true,
+            Probe::None => {}
+        }
+    }
+    Ok(if cut { Probe::Cut } else { Probe::None })
+}
+
+type Plan<'a> = Vec<(Vec<Vec<String>>, Option<&'a antares_ql::QNode>)>;
+
+/// The probes [`first_visible`] sends for `name`: the type groups of each
+/// one and the `q` it pushes down. A type no rule shows and no Entity
+/// carries beside a rule's type gets none, so it reads nothing (T-4683).
+fn plan<'a>(
+    name: &str,
+    rules: &[&'a crate::policy::Rule],
+    unruled: bool,
+    beside: &[Option<BTreeSet<String>>],
+) -> Plan<'a> {
     let alone = || vec![vec![name.to_owned()]];
-    let mut probes: Vec<(Vec<Vec<String>>, Option<&antares_ql::QNode>)> = Vec::new();
-    for (i, r) in rules_of(view).enumerate() {
+    let mut probes = Plan::new();
+    for (i, r) in rules.iter().enumerate() {
         let groups = if r.types.iter().any(|t| t == name) {
             alone()
         } else if r.types.is_empty()
@@ -380,23 +409,10 @@ async fn first_visible(
         };
         probes.push((groups, r.q.as_deref()));
     }
-    if view
-        .0
-        .policy_types
-        .as_deref()
-        .is_none_or(|f| f.rules.is_empty())
-    {
+    if unruled {
         probes.push((alone(), None));
     }
-    let mut cut = false;
-    for (groups, q) in &probes {
-        match probe(st, tenant, max, name, groups, *q, view).await? {
-            Probe::Seen => return Ok(Probe::Seen),
-            Probe::Cut => cut = true,
-            Probe::None => {}
-        }
-    }
-    Ok(if cut { Probe::Cut } else { Probe::None })
+    probes
 }
 
 /// One probe of [`first_visible`], read [`PROBE_PAGE`] at a time up to `max`.
@@ -1270,5 +1286,68 @@ mod discovery_folds {
             !stats.contains_key(SENSOR),
             "a type with no instances left must not be listed"
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_plan {
+    use super::*;
+    use crate::policy::Rule;
+
+    fn rule(types: &[&str], q: Option<&str>) -> Rule {
+        Rule {
+            types: types.iter().map(|t| (*t).to_owned()).collect(),
+            q: q.map(|q| Box::new(antares_ql::parse_q(q).expect("q"))),
+            ..Rule::default()
+        }
+    }
+
+    fn groups(p: &Plan<'_>) -> Vec<Vec<Vec<String>>> {
+        p.iter().map(|(g, _)| g.clone()).collect()
+    }
+
+    fn set(types: &[&str]) -> Option<BTreeSet<String>> {
+        Some(types.iter().map(|t| (*t).to_owned()).collect())
+    }
+
+    /// The view of `types_list_pg`: Cars in zone `a`, every Bus; one Car is a
+    /// Tree too. A type no Entity carries beside a rule's type is not probed
+    /// at all: that empty two-type group walked a whole Tenant (T-4683), and
+    /// a count of probes cannot flake on a slow runner the way a clock does.
+    #[test]
+    fn a_type_beside_no_rule_type_sends_no_probe() {
+        let (car, bus) = (rule(&["Car"], Some("zone==\"a\"")), rule(&["Bus"], None));
+        let rules = [&car, &bus];
+        let beside = [set(&["Car", "Tree"]), set(&["Bus"])];
+        for name in ["Stop", "Lamp"] {
+            assert!(plan(name, &rules, false, &beside).is_empty(), "{name}");
+        }
+        let car_plan = plan("Car", &rules, false, &beside);
+        assert_eq!(groups(&car_plan), [vec![vec!["Car".to_owned()]]]);
+        assert!(car_plan[0].1.is_some(), "the rule's q is pushed down");
+        assert_eq!(
+            groups(&plan("Tree", &rules, false, &beside)),
+            [vec![vec!["Tree".to_owned(), "Car".to_owned()]]]
+        );
+        assert_eq!(
+            groups(&plan("Bus", &rules, false, &beside)),
+            [vec![vec!["Bus".to_owned()]]]
+        );
+    }
+
+    /// A store without the `beside` read still probes beside each rule's
+    /// types, so it answers right, only slower; no rules is one bare probe.
+    #[test]
+    fn without_beside_every_rule_type_is_probed_and_no_rules_probe_alone() {
+        let car = rule(&["Car"], None);
+        assert_eq!(
+            groups(&plan("Stop", &[&car], false, &[None])),
+            [vec![vec!["Stop".to_owned(), "Car".to_owned()]]]
+        );
+        assert_eq!(
+            groups(&plan("Stop", &[], true, &[])),
+            [vec![vec!["Stop".to_owned()]]]
+        );
+        assert!(plan("Stop", &[&rule(&[], None)], false, &[None]).is_empty());
     }
 }
