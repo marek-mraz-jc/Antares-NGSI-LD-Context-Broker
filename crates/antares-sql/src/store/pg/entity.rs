@@ -389,14 +389,30 @@ impl PgEntityStore {
     ) -> Result<Vec<String>, sqlx::Error> {
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
-        // the overlap is its own statement, so the types index serves it
-        const ALL: &str = "SELECT c.type FROM entity_types c WHERE c.tenant_id = $1
-               AND EXISTS (SELECT 1 FROM entities e WHERE e.tenant_id = c.tenant_id
-                 AND e.types @> ARRAY[c.type]
-                 AND (e.expires_at IS NULL OR e.expires_at > now()))
+        // A type is live when it is some live Entity's first type, which a
+        // skip scan of the first-type btree reads as one index probe per
+        // type, or else, beside another, on an Entity of two or more types,
+        // which the partial GIN alone indexes (0012). The plain types GIN
+        // built a bitmap of every Entity of each type: 18 ms for five types
+        // of 20 000, and a generic plan chose a sequential scan for an
+        // EXISTS on the btree; this is 0.1 ms either way.
+        const ALL: &str = "WITH RECURSIVE firsts AS (
+               SELECT (SELECT min(e.types[1]) FROM entities e WHERE e.tenant_id = $1
+                         AND (e.expires_at IS NULL OR e.expires_at > now())) AS ty
+               UNION ALL
+               SELECT (SELECT min(e.types[1]) FROM entities e
+                        WHERE e.tenant_id = $1 AND e.types[1] > f.ty
+                          AND (e.expires_at IS NULL OR e.expires_at > now()))
+                 FROM firsts f WHERE f.ty IS NOT NULL)
+             SELECT c.type FROM entity_types c WHERE c.tenant_id = $1
+               AND (c.type IN (SELECT ty FROM firsts WHERE ty IS NOT NULL)
+                 OR EXISTS (SELECT 1 FROM entities e WHERE e.tenant_id = c.tenant_id
+                      AND cardinality(e.types) > 1 AND e.types @> ARRAY[c.type]
+                      AND (e.expires_at IS NULL OR e.expires_at > now())))
              ORDER BY c.type";
         const BESIDE: &str = "SELECT c.type FROM entity_types c WHERE c.tenant_id = $1
                AND EXISTS (SELECT 1 FROM entities e WHERE e.tenant_id = c.tenant_id
+                 AND cardinality(e.types) > 1
                  AND e.types @> ARRAY[c.type] AND e.types && $2
                  AND (e.expires_at IS NULL OR e.expires_at > now()))
              ORDER BY c.type";
@@ -419,8 +435,9 @@ impl PgEntityStore {
         Ok(names)
     }
 
-    /// The types of the Tenant's live Entities that carry one of `any_of`,
-    /// sorted (T-4683): one probe of the types index per catalogued type.
+    /// The types of the Tenant's live Entities of two or more types that carry
+    /// one of `any_of`, sorted (T-4683): one probe of the multi-type index per
+    /// catalogued type.
     pub async fn types_beside(
         &self,
         tenant: &TenantId,

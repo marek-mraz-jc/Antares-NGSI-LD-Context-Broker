@@ -1169,9 +1169,12 @@ async fn the_type_catalogue_follows_every_write() {
     .await
     .expect("upsert");
     assert_eq!(s.type_names(&t).await.expect("types"), ["W", "X", "Y"]);
-    assert_eq!(
-        s.types_beside(&t, &["W".into()]).await.expect("beside"),
-        ["W"]
+    assert!(
+        s.types_beside(&t, &["W".into()])
+            .await
+            .expect("beside")
+            .is_empty(),
+        "an Entity of W alone carries nothing beside W"
     );
     assert!(s
         .types_beside(&t, &["Z".into()])

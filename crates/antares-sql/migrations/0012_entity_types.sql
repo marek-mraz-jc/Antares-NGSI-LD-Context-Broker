@@ -16,6 +16,15 @@ CREATE TABLE entity_types (
   PRIMARY KEY (tenant_id, type)
 );
 
+-- The catalogue's liveness check: a skip scan of the first-type btree finds
+-- each type some Entity carries first in one probe; a type carried only
+-- beside another sits on an Entity of two or more types, few of a Tenant's
+-- Entities, which a partial GIN holds alone. The plain types GIN built a
+-- bitmap of every Entity of each type (18 ms for five types of 20 000).
+CREATE INDEX i_entities_first_type ON entities (tenant_id, (types[1]));
+CREATE INDEX i_entities_types_multi ON entities USING gin (tenant_id, types)
+  WHERE cardinality(types) > 1;
+
 CREATE FUNCTION note_entity_types() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   INSERT INTO entity_types (tenant_id, type)

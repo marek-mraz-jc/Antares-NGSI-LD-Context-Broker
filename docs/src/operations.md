@@ -329,10 +329,10 @@ The script, step by step:
 
 1. `\copy` the file into an `UNLOGGED` staging table; the `jsonb` cast is
    the only parser the payload meets.
-2. Drop the five secondary indexes (`i_entities_location`,
+2. Drop the seven secondary indexes (`i_entities_location`,
    `i_entities_jsonb`, `i_entities_types`, `i_entities_loc_ambiguous`,
-   `i_entities_expires`); the primary key stays because the insert needs
-   it.
+   `i_entities_expires`, `i_entities_first_type`, `i_entities_types_multi`);
+   the primary key stays because the insert needs it.
 3. Derive the columns the store derives on write: `types`, `scopes`,
    `created_at`/`modified_at` (the document's values, else `now()`),
    `expires_at`, and `location` from the default GeoProperty when it has
@@ -341,7 +341,7 @@ The script, step by step:
    then judge that row in the broker instead of the index.
 4. `INSERT … ON CONFLICT (tenant_id, id) DO NOTHING`: a row that already
    exists is left as it is, the loader never overwrites API-written data.
-5. Rebuild the five indexes and `ANALYZE entities`.
+5. Rebuild the seven indexes and `ANALYZE entities`.
 
 Three lines offered, one of them an id the API had already created:
 

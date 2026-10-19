@@ -553,7 +553,7 @@ impl Store {
         now: &str,
     ) -> Vec<String> {
         self.entity_types_where(tenant, now, |types| {
-            types.iter().any(|t| any_of.iter().any(|a| a == t))
+            types.len() > 1 && types.iter().any(|t| any_of.iter().any(|a| a == t))
         })
     }
 
