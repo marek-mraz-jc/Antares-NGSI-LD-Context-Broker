@@ -265,3 +265,96 @@ async fn the_entity_query_is_not_left_prepared() {
         "the entity query stayed prepared: {left:?}"
     );
 }
+
+/// T-4781: one type page as the broker's own role sees it. Under RLS a
+/// predicate that is not leakproof (`types @> …`, `cardinality`) is never an
+/// index condition, so the old `types @> ARRAY[T] ORDER BY id LIMIT n` walked
+/// `entities_pkey` through the whole Tenant for 20 rows. Both arms of the
+/// store's split must reach their index with the type in the index
+/// condition, in id order, and the count must read the indexes alone.
+/// Shapes copied from `query_sql`/`count_sql` (their unit tests pin the
+/// text); run as a non-superuser, since a superuser skips RLS and hides it.
+#[tokio::test]
+async fn a_type_page_reads_its_type_through_an_index_under_rls() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query("SELECT pg_advisory_xact_lock(4334)")
+        .execute(&mut *tx)
+        .await
+        .expect("advisory lock");
+    for stmt in [
+        "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
+        "GRANT USAGE ON SCHEMA public TO antares_app",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
+        "DELETE FROM entities WHERE tenant_id = 'pgexplain-types'",
+        // ids sort by type, as `urn:ngsi-ld:<Type>:…` ids do: B's rows sit
+        // behind all of A's in `entities_pkey`
+        "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
+         SELECT 'pgexplain-types', 'urn:ngsi-ld:' || t || ':' || lpad(g::text, 6, '0'),
+                '{}', ARRAY['https://x/' || t], now(), now()
+           FROM (VALUES ('A', 20000), ('B', 2000)) v(t, n), generate_series(1, n) g",
+        "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
+         SELECT 'pgexplain-types', 'urn:ngsi-ld:C:' || g, '{}',
+                ARRAY['https://x/C', 'https://x/B'], now(), now()
+           FROM generate_series(1, 50) g",
+    ] {
+        sqlx::query(stmt).execute(&mut *tx).await.expect(stmt);
+    }
+    tx.commit().await.expect("seed");
+    // autovacuum keeps the visibility map that index-only scans need; a
+    // freshly seeded table has none yet
+    sqlx::query("VACUUM ANALYZE entities")
+        .execute(&pool)
+        .await
+        .expect("vacuum");
+
+    let w = "tenant_id = 'pgexplain-types' AND (expires_at IS NULL OR expires_at > now())";
+    let first = format!("{w} AND types[1] = 'https://x/B'");
+    let later = format!(
+        "{w} AND cardinality(types) > 1 AND types[1] IS DISTINCT FROM 'https://x/B' \
+         AND types @> ARRAY['https://x/B']"
+    );
+    let page = format!(
+        "SELECT entity AS entity FROM (\
+         (SELECT id, entity FROM entities WHERE {first} ORDER BY id LIMIT 41) UNION ALL \
+         (SELECT id, entity FROM entities WHERE {later} ORDER BY id LIMIT 41)) AS entities \
+         ORDER BY id LIMIT 21 OFFSET 20"
+    );
+    let count = format!(
+        "SELECT (SELECT count(*) FROM entities WHERE {first}) \
+         + (SELECT count(*) FROM entities WHERE {later})"
+    );
+    for (what, sql, scan) in [
+        ("page", &page, "Index Scan"),
+        ("count", &count, "Index Only Scan"),
+    ] {
+        let mut tx = pool.begin().await.expect("tx");
+        for s in [
+            "SET LOCAL enable_seqscan = off",
+            "SET LOCAL ROLE antares_app",
+            "SELECT set_config('antares.tenant', 'pgexplain-types', true)",
+        ] {
+            sqlx::query(s).execute(&mut *tx).await.expect(s);
+        }
+        let plan: Vec<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN (FORMAT TEXT) {sql}")))
+                .fetch_all(&mut *tx)
+                .await
+                .expect("explain");
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains(&format!("{scan} using i_entities_first_type_id"))
+                && plan.lines().any(|l| l.contains("Index Cond")
+                    && l.contains("types[1]")
+                    && l.contains("'https://x/B'"))
+                && plan.contains(&format!("{scan} using i_entities_multi_type_id")),
+            "the {what} no longer reads its type through the type indexes — plan:\n{plan}"
+        );
+        assert!(
+            !plan.contains("entities_pkey") && !plan.contains("Seq Scan"),
+            "the {what} walks the whole Tenant — plan:\n{plan}"
+        );
+    }
+}
