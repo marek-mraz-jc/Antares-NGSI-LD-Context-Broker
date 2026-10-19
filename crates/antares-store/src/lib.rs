@@ -950,6 +950,28 @@ pub fn fold_appends(evs: &[TemporalEvent]) -> Option<Vec<(&TenantId, &str, &Valu
     Some(out)
 }
 
+/// The member an attribute instance carries its write's provenance in from
+/// the API to the temporal store (T-4665, platform ADR-N-054 2.3): `channel`,
+/// `actor`, `operation`, `reason`, `requestId`. A store takes it out of the
+/// instance before it keeps the instance, whoever put it there, so no read
+/// ever answers it as data; a JSON-LD keyword is never an attribute member.
+pub const PROVENANCE_KEY: &str = "@provenance";
+
+/// Takes [`PROVENANCE_KEY`] out of an instance, returning what it held.
+pub fn take_provenance(instance: &mut Value) -> Option<Value> {
+    instance.as_object_mut()?.remove(PROVENANCE_KEY)
+}
+
+/// Takes [`PROVENANCE_KEY`] out of every instance of a temporal document:
+/// what a store that keeps no provenance does before it keeps the document.
+pub fn strip_provenance(doc: &mut Value) {
+    for instances in doc.as_object_mut().into_iter().flat_map(|d| d.values_mut()) {
+        for instance in instances.as_array_mut().into_iter().flatten() {
+            take_provenance(instance);
+        }
+    }
+}
+
 /// The expanded name of the Property an Entity carries its own history
 /// retention in (DM-97, ADR-N-046 2.3): a duration or `off`, the most
 /// specific level, beside `expiresAt`, which ends the Entity itself.
@@ -1026,6 +1048,33 @@ pub trait TemporalDriver: Send + Sync {
         dry_run: bool,
     ) -> Result<u64, NgsiError> {
         let _ = (tenant, scope, before, batch, dry_run);
+        Ok(0)
+    }
+    /// Every version of the rows of one Entity's history (T-4665, platform
+    /// ADR-N-054 2.4), by expanded Attribute name: each instance with its
+    /// `version` and `provenance`, a superseded one with `supersededAt`,
+    /// oldest first per measurement. A driver that keeps no versions has none.
+    async fn versions(
+        &self,
+        tenant: &TenantId,
+        entity_id: &str,
+    ) -> Result<serde_json::Map<String, Value>, NgsiError> {
+        let _ = (tenant, entity_id);
+        Ok(serde_json::Map::new())
+    }
+    /// Erasure (T-4665, platform ADR-N-054 2.6): every row of `attrs` of one
+    /// Entity, the current version and every superseded one, observed at or
+    /// before `before` (a UTC DateTime; `None`: every row); `attrs` `None`
+    /// takes every Attribute, and the Entity's history itself once it holds
+    /// no row. Answers how many rows went; a driver without history has none.
+    async fn erase(
+        &self,
+        tenant: &TenantId,
+        entity_id: &str,
+        attrs: Option<&[String]>,
+        before: Option<&str>,
+    ) -> Result<u64, NgsiError> {
+        let _ = (tenant, entity_id, attrs, before);
         Ok(0)
     }
     /// Remove the whole history of one tenant; nothing to do without history.

@@ -102,6 +102,8 @@ module's header comment.
 | `conformance.rs` | 6.3.21 version negotiation |
 | `repr.rs` | 6.3.7, 4.5.4 representations: normalized, concise, keyValues, sysAttrs; 4.5.23 Linked Entity Retrieval (inline and flat, the lookup budget) and the 4.5.16 GeoJSON Feature/FeatureCollection shapes — what every module needs to render a document |
 | `history.rs` | the producer side of temporal recording: the per-request change buffer and the 4.5.7/4.5.8 delete mirrors that record a deleted Entity or Attribute in history |
+| `provenance.rs` | who and what wrote a request's history (platform ADR-N-054 2.3): the gateway's `JC-Provenance-*`, `JC-Reason` and `X-Request-Id` headers, believed only from the mesh identity `ANTARES_PROVENANCE_FROM` names in `l5d-client-id`; otherwise `channel: api` with no actor |
+| `erasure.rs` | erasure of personal data (ADR-N-054 2.6) from the current state, every history version and the dead letters; `antares-ops` `views/erasure.rs` serves `/q/erasures/{tenant}`, keeps the content-free tombstone and re-applies it on start |
 | `stamp.rs` | 4.8, 5.2.4 system attributes of a write: `createdAt`/`modifiedAt` on the entity and on every attribute instance |
 | `mirror.rs` | the change event and the two document mirrors (`Change`, `DocMirror`, `SubMirror`, `TenantIndex`) that state, notify and history share, with the registration index (`reg_keys`, `bucketed`, `matching`) the federation read path selects candidates through; names no other module |
 | `bounds.rs` | every cap: body, URI, JSON depth, batch, fan-out, in-flight, regex program size, and the notification pipeline's queue depth and delivery widths; all reported by `/q/health`, which a test over this module's own source keeps true |

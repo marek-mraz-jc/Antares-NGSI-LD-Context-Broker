@@ -83,6 +83,7 @@ pub(crate) mod entity_map;
 pub(crate) mod entity_maps;
 pub(crate) mod federation;
 // The request parsers for the fuzz targets (T-3463); never in a broker build.
+pub mod erasure;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 pub mod history;
@@ -91,6 +92,7 @@ pub mod negotiate;
 pub mod notify;
 pub(crate) mod paging;
 pub mod policy;
+pub mod provenance;
 pub(crate) mod registry;
 pub(crate) mod repr;
 pub mod secret;
@@ -118,7 +120,7 @@ pub use contexts::public_base;
 pub use federation::{
     AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport, NotifyFuture,
 };
-pub use state::{AppState, HistoryRules, TemporalRecord};
+pub use state::{AppState, HistoryRules, OnChange, Recording, TemporalRecord};
 
 /// Spawn for both targets — tokio natively, the JS microtask queue on
 /// wasm32 (no tokio runtime exists in a browser). Call sites are identical;

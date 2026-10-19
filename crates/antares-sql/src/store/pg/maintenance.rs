@@ -212,6 +212,17 @@ pub async fn temporal_maintenance(
     // parent and the DEFAULT purge grows with stored volume, so one lock
     // contention or one statement timeout would otherwise roll back the
     // partition pre-creation that keeps ingest writable.
+    // The superseded versions (T-4665) live in one plain table beside the
+    // partitions or chunks, and go with the platform retention all the same.
+    if let Some(days) = retention_days {
+        match versions_retention(pool, days).await {
+            Ok(0) => {}
+            Ok(n) => done.push(format!(
+                "deleted {n} superseded versions older than {days}d"
+            )),
+            Err(e) => done.push(format!("version retention skipped ({e})")),
+        }
+    }
     if backend == TemporalBackend::Partitioned {
         if let Some(days) = retention_days {
             match plain_retention(pool, days).await {
@@ -257,6 +268,21 @@ pub async fn temporal_maintenance(
         done.push("nothing to do".into());
     }
     Ok(done.join("; "))
+}
+
+/// The superseded versions older than `days` days, on both backends.
+async fn versions_retention(pool: &PgPool, days: i64) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    crate::store::pg::set_service(&mut tx).await?;
+    let n = sqlx::query(
+        "DELETE FROM attr_versions WHERE observed_at < now() - make_interval(days => $1::int)",
+    )
+    .bind(days)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(n)
 }
 
 /// Plain-mode retention, in its own transaction: drop every weekly partition
@@ -376,13 +402,16 @@ async fn reap_expired_entities(pool: &PgPool) -> Result<u64, sqlx::Error> {
         by_tenant.entry(tenant).or_default().push(id.clone());
     }
     for (tenant, ids) in by_tenant {
-        sqlx::query(
+        for sql in [
             "DELETE FROM attr_instances WHERE tenant_id = $1 AND entity_id = ANY($2::text[])",
-        )
-        .bind(tenant)
-        .bind(&ids)
-        .execute(&mut *tx)
-        .await?;
+            "DELETE FROM attr_versions WHERE tenant_id = $1 AND entity_id = ANY($2::text[])",
+        ] {
+            sqlx::query(sql)
+                .bind(tenant)
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query(crate::SET_TENANT_SQL)
             .bind(tenant)
             .execute(&mut *tx)
@@ -511,25 +540,49 @@ pub async fn retain_history(
              AND a.entity_id <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
            LIMIT $4";
+    // A measurement past retention takes its superseded versions along
+    // (T-4665): the same three selections over `attr_versions`, written out so
+    // every statement on `attr_instances` stays a literal the tenant guard
+    // reads (tests/attr_instances_tenant_predicate.rs).
+    const V_ENTITY: &str =
+        "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_versions a
+           WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
+    const V_TYPE: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_versions a
+           JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
+           WHERE a.tenant_id = $1 AND t.types @> $2::text[]
+             AND a.entity_id <> ALL($5::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
+    const V_REST: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_versions a
+           JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
+           WHERE a.tenant_id = $1 AND NOT (t.types && $2::text[])
+             AND a.entity_id <> ALL($5::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
     let one;
-    let (rows, names, except) = match scope {
+    let (rows, versions, names, except) = match scope {
         HistoryScope::Entity(id) => {
             one = [id.to_owned()];
-            (ENTITY, &one[..], None)
+            (ENTITY, V_ENTITY, &one[..], None)
         }
         HistoryScope::Type {
             type_iri,
             except_ids,
         } => {
             one = [type_iri.to_owned()];
-            (TYPE, &one[..], Some(except_ids))
+            (TYPE, V_TYPE, &one[..], Some(except_ids))
         }
         HistoryScope::Rest {
             except_types,
             except_ids,
-        } => (REST, except_types, Some(except_ids)),
+        } => (REST, V_REST, except_types, Some(except_ids)),
     };
-    retain(
+    let current = retain(
         pool,
         rows,
         "DELETE FROM attr_instances
@@ -537,7 +590,17 @@ pub async fn retain_history(
         (tenant, names, except, before, batch),
         dry_run,
     )
-    .await
+    .await?;
+    let superseded = retain(
+        pool,
+        versions,
+        "DELETE FROM attr_versions
+         WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN",
+        (tenant, names, except, before, batch),
+        dry_run,
+    )
+    .await?;
+    Ok(current.saturating_add(superseded))
 }
 
 /// The Entities of every Tenant that carry their own history retention
@@ -695,16 +758,16 @@ fn adopt_default_rows_sql(suffix: &str, lo: &str, hi: &str) -> [String; 3] {
 async fn reap_expired_instances(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     crate::store::pg::set_service(&mut tx).await?;
-    let n = sqlx::query(
-        // try_timestamptz (0001_init.sql), not a bare cast: `expiresAt` is
-        // jsonb TEXT and a stamp PostgreSQL cannot parse would abort this
-        // DELETE for the whole deployment, every tick, forever.
-        "DELETE FROM attr_instances
-         WHERE try_timestamptz(data->>'expiresAt') < now()",
-    )
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    let mut n = 0u64;
+    // try_timestamptz (0001_init.sql), not a bare cast: `expiresAt` is
+    // jsonb TEXT and a stamp PostgreSQL cannot parse would abort this
+    // DELETE for the whole deployment, every tick, forever.
+    for sql in [
+        "DELETE FROM attr_instances WHERE try_timestamptz(data->>'expiresAt') < now()",
+        "DELETE FROM attr_versions WHERE try_timestamptz(data->>'expiresAt') < now()",
+    ] {
+        n = n.saturating_add(sqlx::query(sql).execute(&mut *tx).await?.rows_affected());
+    }
     tx.commit().await?;
     Ok(n)
 }

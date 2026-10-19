@@ -109,6 +109,11 @@ name = "csource_notification_bound"
 path = "tests/csource_notification_bound.rs"
 
 [[test]]
+# own process: sets ANTARES_HISTORY_BACKFILL
+name = "temporal_backfill"
+path = "tests/temporal_backfill.rs"
+
+[[test]]
 # own process: installs the global tracing subscriber
 name = "csi_credential_4_3_6_5"
 path = "tests/csi_credential_4_3_6_5.rs"

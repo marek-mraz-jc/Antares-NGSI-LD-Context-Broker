@@ -471,6 +471,23 @@ with them.
   refused there.
 - A duration is ISO 8601 (`PT5M`, `PT8H`, `P30D`, `P1DT12H`) or short
   (`90s`, `5m`, `8h`, `14d`), from one minute to ten years.
+- `record` (T-4665, platform ADR-N-054 2.2): `every` (the default) writes a
+  history row for each new `observedAt`, even with the same value;
+  `onChange` writes one when the value changed, with `heartbeat` (a
+  duration, required) the longest gap between two rows. `deadband` (a
+  number) holds back a numeric move no larger than it; `minDistance` (in
+  metres) a GeoProperty move no longer than it. A correction of the same
+  instant is always recorded.
+- `attributes`: per expanded Attribute name, its own `record`, `heartbeat`,
+  `deadband` and `minDistance`, overriding the type's; `{"record": "every"}`
+  keeps a count per interval whole under an `onChange` type. `record` and
+  `attributes` are refused on the `*` rule.
+
+```json
+{"rules": [{"type": "https://example.org/ParkingSpot", "record": "onChange",
+  "heartbeat": "PT1H", "deadband": 0.5,
+  "attributes": {"https://example.org/count": {"record": "every"}}}]}
+```
 
 History retention has four levels and the most specific wins (DM-97):
 
@@ -526,6 +543,44 @@ left out; a type that would lose nothing is not listed. `400` and `413` as
 `200` with `{"counts": [{"type", "kind", "count"}]}`: what this pod's sweeps
 deleted of the Tenant since the pod started. Every pod sweeps the same rules,
 so a pod's totals are its share; `antares_retention_deleted_total` sums them.
+
+## Erasure
+
+Only in a broker built with the `views` feature (T-4665, platform ADR-N-054
+2.6, GDPR Art. 17). The admin credential is the erasure scope: the Portal
+holds it, finds the Entities that name a data subject with the subject's
+`q` over current state and history, and erases them here once the space's
+Policy granted its caller `personalData`.
+
+### POST /q/erasures/{tenant}
+
+```json
+{"entities": ["urn:ngsi-ld:BikeTrip:t1"],
+ "attrs": ["https://example.org/rider"],
+ "subject": "5e884898da280471",
+ "actor": "steward-1", "reason": "Art. 17 request 2026-10-18"}
+```
+
+`entities` names 1 to 1000 Entity ids; `attrs` (expanded names) narrows the
+erasure to those Attributes, and without it the whole Entity goes.
+`subject` is the subject's keyed hash, for the log only: a value that looks
+like anything else is refused. `actor` and `reason` are required. The
+broker deletes the Attributes (or Entities) from the current state, every
+history row and every superseded version of them, and the dead letters that
+name the Entities, then stores one record beside the retention documents:
+`201` with `{"id", "operation": "erase", "tenant", "entities", "attrs",
+"subject", "actor", "reason", "at", "counts": {"entities", "history",
+"deadLetters"}}`. The record holds no value. `400` for a request that is
+not one, nothing erased.
+
+Every pod applies every record again when it starts, so data a restore
+brought back is erased before the pod serves. A re-applied erasure keeps
+what was written after its `at`: an Entity created later, an Attribute
+stamped later, a history row observed later.
+
+### GET /q/erasures/{tenant}
+
+`200` with the Tenant's erasure records, oldest first.
 
 ## The peer-facing wire
 

@@ -33,6 +33,84 @@ pub fn drain_errors() -> u64 {
 tokio::task_local! {
     static BUFFER: std::cell::RefCell<Vec<TemporalEvent>>;
     static CHANGES: std::cell::RefCell<Vec<crate::mirror::Change>>;
+    static PROVENANCE: Value;
+    static TENANT: Option<TenantId>;
+}
+
+/// `ANTARES_HISTORY_BACKFILL=on` (T-4665, ADR-N-054 2.1): a Core API write of
+/// an instance older than the one the Entity holds goes to history only.
+/// Off (the default) keeps NGSI-LD's replace, which the ETSI suites assume.
+fn backfill_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ANTARES_HISTORY_BACKFILL").as_deref() == Ok("on"))
+}
+
+/// Whether `incoming`, about to replace `current` of `attr` on the Entity
+/// `doc` (expanded, as stored), is a backfill: both observed and `incoming`
+/// the older. A backfill is recorded into the request's history here, and
+/// the caller keeps `current`. Outside a request, or with backfill off,
+/// nothing is one.
+pub(crate) fn backfilled(doc: &Value, attr: &str, current: &Value, incoming: &Value) -> bool {
+    if !backfill_on() {
+        return false;
+    }
+    let at = |i: &Value| {
+        i.get("observedAt").and_then(Value::as_str).and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&antares_store::filter::canonical_datetime(s)).ok()
+        })
+    };
+    let (Some(was), Some(now)) = (at(current), at(incoming)) else {
+        return false;
+    };
+    let Some(id) = doc.get("id").and_then(Value::as_str) else {
+        return false;
+    };
+    if now >= was {
+        return false;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let Ok(Some(tenant)) = TENANT.try_with(Clone::clone) else {
+            return false;
+        };
+        let mut instance = incoming.clone();
+        if let Some(o) = instance.as_object_mut() {
+            let iid = crate::notify::instance_id(id, attr, o);
+            o.entry("instanceId".to_owned())
+                .or_insert(Value::String(iid));
+            o.insert(
+                antares_store::PROVENANCE_KEY.to_owned(),
+                provenance("backfill"),
+            );
+        }
+        let mut shell = Map::new();
+        for k in ["id", "type", "createdAt", "modifiedAt", "scope"] {
+            if let Some(v) = doc.get(k) {
+                shell.insert(k.to_owned(), v.clone());
+            }
+        }
+        let event = TemporalEvent {
+            op: antares_store::TemporalOp::AttrModified,
+            tenant,
+            entity_id: id.to_owned(),
+            shell: Value::Object(shell),
+            attr: attr.to_owned(),
+            instance,
+        };
+        BUFFER.try_with(|b| b.borrow_mut().push(event)).is_ok()
+    }
+    #[cfg(target_arch = "wasm32")]
+    false
+}
+
+/// The provenance of the request in flight with its `operation`
+/// (T-4665); outside a request, a write of the broker's own: `api`.
+pub(crate) fn provenance(operation: &str) -> Value {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok(p) = PROVENANCE.try_with(|p| crate::provenance::with_operation(p, operation)) {
+        return p;
+    }
+    crate::provenance::with_operation(&serde_json::json!({"channel": "api"}), operation)
 }
 
 /// Buffer one entity change for the request in flight so the matcher
@@ -170,6 +248,180 @@ pub(crate) fn records_history(st: &AppState, tenant: &TenantId, doc: &Value) -> 
     has(&rules.ruled) || !rules.space_off.contains(tenant)
 }
 
+/// The last row each attribute recorded `onChange` wrote, by (Tenant,
+/// Entity, attribute, datasetId): its payload and its time (T-4665).
+type LastRows = std::collections::HashMap<
+    (String, String, String, String),
+    (Value, chrono::DateTime<chrono::Utc>),
+>;
+static LAST_ROWS: std::sync::LazyLock<std::sync::Mutex<LastRows>> =
+    std::sync::LazyLock::new(Default::default);
+/// The most attributes [`LAST_ROWS`] remembers.
+// ponytail: one map per process, cleared when full or restarted; the next
+// write of each attribute then records a row, which costs a row, never one
+// lost. A shared store if replicas ever record far more than one row per
+// heartbeat between them.
+const LAST_ROWS_MAX: usize = 500_000;
+
+/// The Attributes of the temporal `doc` its type records `onChange`
+/// (ADR-N-054 2.5): a query carries their level into a window and weighs
+/// their values by the time each held.
+pub(crate) fn held_attrs(
+    st: &AppState,
+    tenant: &TenantId,
+    doc: &Value,
+) -> std::collections::HashSet<String> {
+    let rules = st
+        .history_off
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (false, Some(obj)) = (rules.recording.is_empty(), doc.as_object()) else {
+        return Default::default();
+    };
+    let types: Vec<&str> = match obj.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let recordings: Vec<_> = types
+        .iter()
+        .filter_map(|t| {
+            rules
+                .recording
+                .get(&(tenant.as_str().to_owned(), (*t).to_owned()))
+        })
+        .collect();
+    obj.keys()
+        .filter(|k| recordings.iter().any(|r| r.of(k).is_some()))
+        .cloned()
+        .collect()
+}
+
+/// Does some type of `tenant` record an Attribute `onChange`? Its
+/// aggregations are then computed here, never pushed into the store.
+pub(crate) fn records_on_change(st: &AppState, tenant: &TenantId) -> bool {
+    st.history_off
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .recording
+        .keys()
+        .any(|(t, _)| t == tenant.as_str())
+}
+
+/// Gate 4 (T-4665, ADR-N-054 2.2): whether an instance of `attr`, changed
+/// on the Entity `entity` with `types` in `tenant`, writes a row. `every`
+/// (no rule) always does; `onChange` when its value moved past the
+/// deadband or minimum distance since the attribute's last row, when it
+/// differs at all from a row of the same `observedAt` (a correction), when
+/// it is older than that row (a backfill), or once the heartbeat passed.
+pub(crate) fn admits_change(
+    st: &AppState,
+    tenant: &TenantId,
+    types: &[&str],
+    entity: &str,
+    attr: &str,
+    instance: &Value,
+) -> bool {
+    let mode = {
+        let rules = st
+            .history_off
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if rules.recording.is_empty() {
+            return true;
+        }
+        types.iter().find_map(|t| {
+            rules
+                .recording
+                .get(&(tenant.as_str().to_owned(), (*t).to_owned()))
+                .and_then(|r| r.of(attr))
+        })
+    };
+    let Some(mode) = mode else { return true };
+    let at = instance
+        .get("observedAt")
+        .and_then(Value::as_str)
+        .and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&antares_store::filter::canonical_datetime(s)).ok()
+        })
+        .map_or_else(chrono::Utc::now, |t| t.with_timezone(&chrono::Utc));
+    let payload = payload_of(instance);
+    let key = (
+        tenant.as_str().to_owned(),
+        entity.to_owned(),
+        attr.to_owned(),
+        instance
+            .get("datasetId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    );
+    let mut last = LAST_ROWS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let writes = match last.get(&key) {
+        None => true,
+        Some((was, when)) if at == *when => payload != *was,
+        Some((_, when)) if at < *when => return true,
+        Some((was, when)) => {
+            at.signed_duration_since(*when)
+                .to_std()
+                .is_ok_and(|d| d >= mode.heartbeat)
+                || moved(&mode, was, &payload)
+        }
+    };
+    if writes {
+        if last.len() >= LAST_ROWS_MAX {
+            last.clear();
+        }
+        last.insert(key, (payload, at));
+    }
+    writes
+}
+
+/// An instance without its stamps and provenance: what a row records.
+fn payload_of(instance: &Value) -> Value {
+    let mut p = instance.clone();
+    if let Some(o) = p.as_object_mut() {
+        for k in [
+            "instanceId",
+            "observedAt",
+            "createdAt",
+            "modifiedAt",
+            antares_store::PROVENANCE_KEY,
+        ] {
+            o.remove(k);
+        }
+    }
+    p
+}
+
+/// Whether `now` moved from `was` enough to be a row under `mode`.
+fn moved(mode: &crate::state::OnChange, was: &Value, now: &Value) -> bool {
+    let number = |v: &Value| v.get("value").and_then(Value::as_f64);
+    if let (Some(band), Some(a), Some(b)) = (mode.deadband, number(was), number(now)) {
+        return (a - b).abs() > band;
+    }
+    let point = |v: &Value| {
+        let g = v.get("value")?;
+        let c = g.get("coordinates")?.as_array()?;
+        (g.get("type")?.as_str()? == "Point").then_some((c.first()?.as_f64()?, c.get(1)?.as_f64()?))
+    };
+    if let (Some(metres), Some(a), Some(b)) = (mode.min_distance, point(was), point(now)) {
+        return haversine(a, b) > metres;
+    }
+    was != now
+}
+
+/// Metres between two (longitude, latitude) points on a sphere of the
+/// Earth's mean radius: within a fraction of a percent at a city's scale.
+fn haversine((lon1, lat1): (f64, f64), (lon2, lat2): (f64, f64)) -> f64 {
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let (dp, dl) = ((lat2 - lat1).to_radians(), (lon2 - lon1).to_radians());
+    let a = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+    2.0 * 6_371_008.8 * a.sqrt().asin()
+}
+
 /// The bounds a duration has to sit in: one minute to ten years.
 const SHORTEST: Duration = Duration::from_secs(60);
 const LONGEST: Duration = Duration::from_hours(87_600);
@@ -281,12 +533,21 @@ pub(crate) async fn layer(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    let provenance = crate::provenance::of_request(req.headers(), st.provenance_from.as_deref());
+    let tenant = crate::negotiate::tenant_from(req.headers()).ok();
     let (resp, evs, changes) = BUFFER
         .scope(std::cell::RefCell::new(Vec::new()), async {
             CHANGES
                 .scope(std::cell::RefCell::new(Vec::new()), async {
-                    let resp = next.run(req).await;
-                    (resp, BUFFER.with(|b| b.take()), CHANGES.with(|c| c.take()))
+                    PROVENANCE
+                        .scope(
+                            provenance,
+                            TENANT.scope(tenant, async {
+                                let resp = next.run(req).await;
+                                (resp, BUFFER.with(|b| b.take()), CHANGES.with(|c| c.take()))
+                            }),
+                        )
+                        .await
                 })
                 .await
         })
@@ -409,6 +670,7 @@ pub(crate) async fn mirror_delete_attr(
                     Value::String(format!("urn:ngsi-ld:Instance:{}", uuid::Uuid::new_v4())),
                 );
                 inst.insert("deletedAt".into(), Value::String(ts.to_owned()));
+                inst.insert(antares_store::PROVENANCE_KEY.into(), provenance("delete"));
                 arr.push(Value::Object(inst));
             }
             Ok(())

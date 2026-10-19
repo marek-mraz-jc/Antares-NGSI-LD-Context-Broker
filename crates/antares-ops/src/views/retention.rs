@@ -65,8 +65,8 @@ pub const PLATFORM_LABEL: &str = "@platform";
 const MAX_OVERRIDES: usize = 10_000;
 
 /// One rule of a Tenant's document.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RuleDoc {
     #[serde(rename = "type")]
     type_iri: String,
@@ -74,6 +74,79 @@ struct RuleDoc {
     current: Option<String>,
     #[serde(default)]
     history: Option<String>,
+    /// How the type records history (T-4665, ADR-N-054 2.2): `every` or
+    /// `onChange`, with the three settings after it.
+    #[serde(default)]
+    record: Option<String>,
+    #[serde(default)]
+    heartbeat: Option<String>,
+    #[serde(default)]
+    deadband: Option<f64>,
+    #[serde(default)]
+    min_distance: Option<f64>,
+    /// Per expanded attribute: how it records, overriding the type.
+    #[serde(default)]
+    attributes: std::collections::BTreeMap<String, RecordDoc>,
+}
+
+impl RuleDoc {
+    /// The type's own `record` and its settings.
+    fn record(&self) -> RecordDoc {
+        RecordDoc {
+            record: self.record.clone(),
+            heartbeat: self.heartbeat.clone(),
+            deadband: self.deadband,
+            min_distance: self.min_distance,
+        }
+    }
+}
+
+/// `record` and its settings, of a type or of one attribute.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RecordDoc {
+    #[serde(default)]
+    record: Option<String>,
+    #[serde(default)]
+    heartbeat: Option<String>,
+    #[serde(default)]
+    deadband: Option<f64>,
+    #[serde(default)]
+    min_distance: Option<f64>,
+}
+
+impl RecordDoc {
+    /// `Ok(None)` for `every`, `Ok(Some)` for `onChange`; the reason a
+    /// setting is out of place otherwise.
+    fn parse(&self) -> Result<Option<antares_api::OnChange>, String> {
+        let bound = |name: &str, v: Option<f64>| match v {
+            // JSON carries no NaN or infinity, so the sign is the whole check
+            Some(v) if v < 0.0 => Err(format!("{name} must be a number of at least 0")),
+            _ => Ok(v),
+        };
+        match self.record.as_deref() {
+            Some("onChange") => Ok(Some(antares_api::OnChange {
+                heartbeat: parse_duration(
+                    self.heartbeat
+                        .as_deref()
+                        .ok_or("record onChange needs a heartbeat")?,
+                )?,
+                deadband: bound("deadband", self.deadband)?,
+                min_distance: bound("minDistance", self.min_distance)?,
+            })),
+            None | Some("every") => {
+                if self.heartbeat.is_some()
+                    || self.deadband.is_some()
+                    || self.min_distance.is_some()
+                {
+                    Err("heartbeat, deadband and minDistance belong to record onChange".into())
+                } else {
+                    Ok(None)
+                }
+            }
+            Some(other) => Err(format!("record {other:?} is neither every nor onChange")),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,7 +156,7 @@ struct Document {
 }
 
 /// One rule as the sweep runs it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Rule {
     /// The expanded Entity type, or [`ANY_TYPE`] for the Tenant's default.
     pub type_iri: String,
@@ -97,6 +170,8 @@ pub struct Rule {
     /// `history: "forever"` (DM-97): the type keeps all of it, and no level
     /// below (the Tenant's default, the platform's) reaches it.
     pub history_forever: bool,
+    /// How it records history, when some attribute records `onChange`.
+    pub recording: Option<antares_api::Recording>,
 }
 
 impl Rule {
@@ -150,6 +225,21 @@ pub fn parse(body: &[u8]) -> Result<Vec<Rule>, String> {
             if !seen.insert(r.type_iri.clone()) {
                 return Err(format!("type {:?} has two rules", r.type_iri));
             }
+            if any && (r.record() != RecordDoc::default() || !r.attributes.is_empty()) {
+                return Err("the \"*\" rule sets history only, never how a type records".into());
+            }
+            let mut recording = antares_api::Recording {
+                default: r.record().parse()?,
+                ..Default::default()
+            };
+            for (attr, doc) in &r.attributes {
+                if !attr.contains(':') || attr.contains(char::is_whitespace) {
+                    return Err(format!("attribute {attr:?} is not an expanded IRI"));
+                }
+                recording.attributes.insert(attr.clone(), doc.parse()?);
+            }
+            let records_on_change =
+                recording.default.is_some() || recording.attributes.values().any(Option::is_some);
             let word = r
                 .history
                 .as_deref()
@@ -164,6 +254,7 @@ pub fn parse(body: &[u8]) -> Result<Vec<Rule>, String> {
                     .transpose()?,
                 history_off: word == Some("off"),
                 history_forever: word == Some("forever"),
+                recording: records_on_change.then_some(recording),
                 type_iri: r.type_iri,
             })
         })
@@ -202,6 +293,10 @@ pub(super) fn history_off(rules: &Rules) -> antares_api::HistoryRules {
             }
             if r.history_off {
                 out.off.insert((tenant.clone(), r.type_iri.clone()));
+            }
+            if let Some(recording) = &r.recording {
+                out.recording
+                    .insert((tenant.clone(), r.type_iri.clone()), recording.clone());
             }
             if r.rules_history() {
                 out.ruled.insert((tenant, r.type_iri.clone()));
@@ -787,6 +882,7 @@ mod tests {
                 off: std::collections::HashSet::from([pair.clone()]),
                 ruled: std::collections::HashSet::from([pair]),
                 space_off: std::collections::HashSet::new(),
+                recording: std::collections::HashMap::new(),
             }
         );
         assert!(rules.iter().all(|r| !r.history_off));
@@ -914,5 +1010,59 @@ mod tests {
             ["entity", "current", "type", "rest", "rest"]
         );
         assert_eq!(jobs(false, &port), ["entity", "current"]);
+    }
+
+    /// T-4665: a type records `every` unless it says `onChange` with a
+    /// heartbeat; an attribute may say otherwise; settings out of place, a
+    /// short name and a `*` rule that names a recording are refused.
+    #[test]
+    fn a_rule_says_how_its_type_records_and_each_attribute_may_differ() {
+        let rules = parse(
+            br#"{"rules":[{"type":"https://e.org/Spot","history":"P90D","record":"onChange",
+                 "heartbeat":"PT1H","deadband":1,
+                 "attributes":{"https://e.org/count":{"record":"every"},
+                               "https://e.org/location":{"record":"onChange","heartbeat":"PT15M","minDistance":5}}},
+                {"type":"https://e.org/Flow","history":"P30D"}]}"#,
+        )
+        .expect("rules");
+        let spot = rules[0].recording.as_ref().expect("onChange");
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(
+            spot.of("https://e.org/status")
+                .map(|m| (m.heartbeat, m.deadband)),
+            Some((hour, Some(1.0)))
+        );
+        assert_eq!(spot.of("https://e.org/count"), None, "every");
+        assert_eq!(
+            spot.of("https://e.org/location")
+                .and_then(|m| m.min_distance),
+            Some(5.0)
+        );
+        assert!(rules[1].recording.is_none(), "every, the default");
+        let by_attribute = parse(
+            br#"{"rules":[{"type":"https://e.org/V","attributes":{"https://e.org/a":{"record":"onChange","heartbeat":"PT1H"}}}]}"#,
+        )
+        .expect("an attribute alone records onChange");
+        assert!(by_attribute[0].recording.is_some());
+        let gate = history_off(&vec![(TenantId::new("city").expect("tenant"), rules)]);
+        assert_eq!(gate.recording.len(), 1);
+        for (bad, says) in [
+            (&br#"{"rules":[{"type":"https://e.org/V","record":"onChange"}]}"#[..], "heartbeat"),
+            (br#"{"rules":[{"type":"https://e.org/V","record":"sometimes"}]}"#, "neither"),
+            (br#"{"rules":[{"type":"https://e.org/V","deadband":1}]}"#, "belong"),
+            (br#"{"rules":[{"type":"https://e.org/V","record":"onChange","heartbeat":"PT1H","deadband":-1}]}"#, "at least 0"),
+            (br#"{"rules":[{"type":"https://e.org/V","attributes":{"speed":{"record":"every"}}}]}"#, "expanded IRI"),
+            (br#"{"rules":[{"type":"*","history":"P30D","record":"onChange","heartbeat":"PT1H"}]}"#, "never how"),
+            (br#"{"rules":[{"type":"https://e.org/V","attributes":{"https://e.org/a":{"ttl":1}}}]}"#, "unknown field"),
+            (br#"{"rules":[{"type":"https://e.org/V","heartbeat":"PT1H"}]}"#, "belong"),
+            (br#"{"rules":[{"type":"https://e.org/V","minDistance":1}]}"#, "belong"),
+            (br#"{"rules":[{"type":"https://e.org/V","record":"onChange","heartbeat":"soon"}]}"#, "not a duration"),
+            (br#"{"rules":[{"type":"https://e.org/V","record":"onChange","heartbeat":"PT1H","minDistance":-1}]}"#, "at least 0"),
+            (br#"{"rules":[{"type":"https://e.org/V","attributes":{"https://e.org/a b":{"record":"every"}}}]}"#, "expanded IRI"),
+            (br#"{"rules":[{"type":"*","history":"P30D","attributes":{"https://e.org/a":{"record":"every"}}}]}"#, "never how"),
+        ] {
+            let err = parse(bad).expect_err("refused");
+            assert!(err.contains(says), "{err}");
+        }
     }
 }
