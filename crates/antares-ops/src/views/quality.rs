@@ -27,7 +27,7 @@ use antares_model::TenantId;
 use axum::body::Bytes;
 use axum::extract::Path;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
@@ -162,18 +162,7 @@ pub fn parse(body: &[u8]) -> Result<Vec<Rule>, String> {
 /// stored document that no longer parses is skipped with a warning, so the
 /// sweep marks nothing for that Tenant rather than guess.
 pub(super) fn load<'a>(docs: impl Iterator<Item = (&'a str, &'a Value)>) -> Rules {
-    let mut rules = Rules::new();
-    for (tenant, doc) in docs {
-        let body = doc.get("text").and_then(Value::as_str).unwrap_or_default();
-        match TenantId::new(tenant)
-            .map_err(|e| e.to_string())
-            .and_then(|t| Ok((t, parse(body.as_bytes())?)))
-        {
-            Ok(rule) => rules.push(rule),
-            Err(e) => tracing::warn!(tenant, error = %e, "quality document skipped"),
-        }
-    }
-    rules
+    super::tenant_rules(docs, parse, "quality")
 }
 
 /// What one sweep changed for one rule of one Tenant.
@@ -413,9 +402,7 @@ pub(super) fn routes(weak: &Weak<Reloader>) -> Router {
 }
 
 fn key(tenant: &str) -> Option<String> {
-    TenantId::new(tenant)
-        .ok()
-        .map(|t| format!("{QUALITY_ID_PREFIX}{}", t.as_str()))
+    super::tenant_key(QUALITY_ID_PREFIX, tenant)
 }
 
 fn none() -> Response {
@@ -427,26 +414,7 @@ fn none() -> Response {
 }
 
 async fn get_doc(r: Arc<Reloader>, tenant: String) -> Result<Response, String> {
-    let Some(key) = key(&tenant) else {
-        return Ok(bad_tenant());
-    };
-    Ok(
-        match r
-            .state
-            .view_doc(&key)
-            .await?
-            .as_ref()
-            .and_then(|d| d.get("text"))
-            .and_then(Value::as_str)
-        {
-            Some(text) => (
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                text.to_owned(),
-            )
-                .into_response(),
-            None => none(),
-        },
-    )
+    super::stored_json(&r, key(&tenant), none).await
 }
 
 async fn put_doc(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Response, String> {
@@ -464,28 +432,11 @@ async fn put_doc(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Respon
         return Ok(problem(StatusCode::BAD_REQUEST, "BadRequestData", &why));
     }
     let text = String::from_utf8_lossy(&body).into_owned();
-    let replaced = r
-        .state
-        .put_view_doc(&key, json!({"id": key, "text": text}))
-        .await?;
-    r.reload().await?;
-    Ok(if replaced {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::CREATED
-    }
-    .into_response())
+    super::store(&r, &key, json!({"id": key, "text": text})).await
 }
 
 async fn delete_doc(r: Arc<Reloader>, tenant: String) -> Result<Response, String> {
-    let Some(key) = key(&tenant) else {
-        return Ok(bad_tenant());
-    };
-    if !r.state.delete_view_doc(&key).await? {
-        return Ok(none());
-    }
-    r.reload().await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
+    super::remove_stored(&r, key(&tenant), none).await
 }
 
 #[cfg(test)]
