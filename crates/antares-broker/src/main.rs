@@ -59,6 +59,12 @@ const KNOWN_KEYS: &[&str] = &[
     // Temporal retention horizon in days; absent = keep forever (a
     // maintenance job must never default to dropping data).
     "ANTARES_TEMPORAL_RETENTION_DAYS",
+    // T-4665: a value older than the current one goes to history only
+    // (`on`); off keeps NGSI-LD's last-write-wins.
+    "ANTARES_HISTORY_BACKFILL",
+    // T-4665: the gateway's mesh identity; only it is believed in its
+    // provenance headers. Unset, every write is `channel: api`.
+    "ANTARES_PROVENANCE_FROM",
     // 4.22 GC interval (memory/file arm); default 900 s, the ETSI stack runs
     // at 2 s so the transient TPs (422_01) exercise the sweep itself.
     "ANTARES_SWEEP_SECS",

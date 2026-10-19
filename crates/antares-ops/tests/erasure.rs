@@ -293,3 +293,50 @@ async fn an_erasure_leaves_no_value_and_a_restart_erases_restored_data_on_postgr
     };
     erasure_over(store, "postgres", &tenant, rows).await;
 }
+
+/// A tenant that is no tenant, a body past the limit or not a request is
+/// refused before anything is stored; a pod that starts over a record it
+/// cannot read skips it, and over a sound store erases nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_request_is_refused_and_a_broken_record_is_skipped() {
+    let store = Arc::new(AnyStore::Mem(antares_sql::store::Store::default()));
+    let (_b, app) = broker(&store, "memory").await;
+    let tenant = format!("er{}", run_id());
+    let erasures = format!("/q/erasures/{tenant}");
+    let ok = json!({"entities": [A], "actor": "steward", "reason": "Art. 17"});
+    for (uri, body) in [
+        ("/q/erasures/a%20b", Some(ok.clone())),
+        ("/q/erasures/a%20b", None),
+        (
+            erasures.as_str(),
+            Some(json!({"pad": "x".repeat(300 * 1024)})),
+        ),
+        (erasures.as_str(), Some(json!("not a request"))),
+    ] {
+        let method = if body.is_some() {
+            Method::POST
+        } else {
+            Method::GET
+        };
+        let (s, b) = send(&app, method, uri, None, body).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{uri}: {b}");
+    }
+    let (s, log) = send(&app, Method::GET, &erasures, None, None).await;
+    assert_eq!((s, log), (StatusCode::OK, json!([])));
+
+    let (s, b) = send(&app, Method::POST, &erasures, None, Some(ok)).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    store
+        .upsert(
+            &TenantId::new_internal(antares_api::views::VIEW_TENANT).expect("view tenant"),
+            Kind::View,
+            &format!("erasure:{tenant}:broken"),
+            json!({"id": format!("erasure:{tenant}:broken"), "operation": "erase"}),
+        )
+        .await
+        .expect("broken record");
+    let (_again, app) = broker(&store, "memory").await;
+    let (s, log) = send(&app, Method::GET, &erasures, None, None).await;
+    assert_eq!(s, StatusCode::OK, "{log}");
+    assert_eq!(log.as_array().map(Vec::len), Some(2), "{log}");
+}
