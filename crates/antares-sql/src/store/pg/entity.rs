@@ -371,22 +371,79 @@ impl PgEntityStore {
         Ok(row.map(|r| r.get::<Value, _>(0)))
     }
 
-    /// The types the Tenant's live Entities carry, sorted (T-4610). The
-    /// statement reads the `types` column and never an `entity` document, so
-    /// `/types` over a Tenant of any size costs one index-sized pass.
+    /// The types the Tenant's live Entities carry, sorted (T-4610): the
+    /// names from the type catalogue the writes keep (migration 0012,
+    /// T-4683), each kept while the types index finds a live Entity of it.
+    /// No `entity` document and no pass over the Tenant's rows.
     pub async fn type_names(&self, tenant: &TenantId) -> Result<Vec<String>, sqlx::Error> {
+        self.catalogued(tenant, None).await
+    }
+
+    /// The catalogued types a live Entity carries, beside one of `any_of`
+    /// when given. 4.22: expired rows are invalid context until the sweep
+    /// reaps them.
+    async fn catalogued(
+        &self,
+        tenant: &TenantId,
+        any_of: Option<&[String]>,
+    ) -> Result<Vec<String>, sqlx::Error> {
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
-        // 4.22: expired rows are invalid context until the sweep reaps them
-        let names = sqlx::query_scalar(
-            "SELECT DISTINCT t FROM entities, unnest(types) AS t WHERE tenant_id = $1
-               AND (expires_at IS NULL OR expires_at > now()) ORDER BY t",
-        )
-        .bind(tenant.as_str())
-        .fetch_all(&mut *tx)
-        .await?;
+        // A type is live when it is some live Entity's first type, which a
+        // skip scan of the first-type btree reads as one index probe per
+        // type, or else, beside another, on an Entity of two or more types,
+        // which the partial GIN alone indexes (0012). The plain types GIN
+        // built a bitmap of every Entity of each type: 18 ms for five types
+        // of 20 000, and a generic plan chose a sequential scan for an
+        // EXISTS on the btree; this is 0.1 ms either way.
+        const ALL: &str = "WITH RECURSIVE firsts AS (
+               SELECT (SELECT min(e.types[1]) FROM entities e WHERE e.tenant_id = $1
+                         AND (e.expires_at IS NULL OR e.expires_at > now())) AS ty
+               UNION ALL
+               SELECT (SELECT min(e.types[1]) FROM entities e
+                        WHERE e.tenant_id = $1 AND e.types[1] > f.ty
+                          AND (e.expires_at IS NULL OR e.expires_at > now()))
+                 FROM firsts f WHERE f.ty IS NOT NULL)
+             SELECT c.type FROM entity_types c WHERE c.tenant_id = $1
+               AND (c.type IN (SELECT ty FROM firsts WHERE ty IS NOT NULL)
+                 OR EXISTS (SELECT 1 FROM entities e WHERE e.tenant_id = c.tenant_id
+                      AND cardinality(e.types) > 1 AND e.types @> ARRAY[c.type]
+                      AND (e.expires_at IS NULL OR e.expires_at > now())))
+             ORDER BY c.type";
+        const BESIDE: &str = "SELECT c.type FROM entity_types c WHERE c.tenant_id = $1
+               AND EXISTS (SELECT 1 FROM entities e WHERE e.tenant_id = c.tenant_id
+                 AND cardinality(e.types) > 1
+                 AND e.types @> ARRAY[c.type] AND e.types && $2
+                 AND (e.expires_at IS NULL OR e.expires_at > now()))
+             ORDER BY c.type";
+        let names = match any_of {
+            None => {
+                sqlx::query_scalar(ALL)
+                    .bind(tenant.as_str())
+                    .fetch_all(&mut *tx)
+                    .await?
+            }
+            Some(of) => {
+                sqlx::query_scalar(BESIDE)
+                    .bind(tenant.as_str())
+                    .bind(super::storable(of))
+                    .fetch_all(&mut *tx)
+                    .await?
+            }
+        };
         tx.commit().await?;
         Ok(names)
+    }
+
+    /// The types of the Tenant's live Entities of two or more types that carry
+    /// one of `any_of`, sorted (T-4683): one probe of the multi-type index per
+    /// catalogued type.
+    pub async fn types_beside(
+        &self,
+        tenant: &TenantId,
+        any_of: &[String],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        self.catalogued(tenant, Some(any_of)).await
     }
 
     /// Several Entities in one transaction (T-4085): one per id that exists,

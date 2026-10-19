@@ -46,7 +46,8 @@ INSERT INTO tenants (tenant_id) SELECT DISTINCT tenant_id FROM bulk_stage ON CON
 -- exactly the set the migrations leave in place (0005 dropped the scopes
 -- and modified_at indexes as dead weight; do not bring them back)
 DROP INDEX IF EXISTS i_entities_location, i_entities_jsonb, i_entities_types,
-  i_entities_loc_ambiguous, i_entities_expires;
+  i_entities_loc_ambiguous, i_entities_expires, i_entities_first_type,
+  i_entities_types_multi;
 
 -- the store's extract_location rule: the default GeoProperty, exactly one
 -- instance, a GeoJSON geometry (not a collection); anything else with the
@@ -93,6 +94,9 @@ CREATE INDEX i_entities_jsonb    ON entities USING gin  (entity jsonb_path_ops);
 CREATE INDEX i_entities_types    ON entities USING gin  (tenant_id, types);
 CREATE INDEX i_entities_loc_ambiguous ON entities (tenant_id) WHERE location_ambiguous;
 CREATE INDEX i_entities_expires ON entities (expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX i_entities_first_type ON entities (tenant_id, (types[1]));
+CREATE INDEX i_entities_types_multi ON entities USING gin (tenant_id, types)
+  WHERE cardinality(types) > 1;
 
 ANALYZE entities;
 SQL

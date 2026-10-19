@@ -72,6 +72,8 @@ async fn migrations_apply_and_indexes_exist() {
         "i_entities_jsonb",
         "i_entities_types",
         "i_entities_loc_ambiguous",
+        "i_entities_first_type",
+        "i_entities_types_multi",
     ] {
         let n: i64 = sqlx::query(
             "SELECT count(*) FROM pg_indexes WHERE tablename = 'entities' AND indexname = $1",
@@ -458,8 +460,9 @@ async fn purge_tenant_empties_every_tenant_table() {
             .await
             .expect("correction");
     }
-    const TABLES: [&str; 15] = [
+    const TABLES: [&str; 16] = [
         "entities",
+        "entity_types",
         "jsonld_contexts",
         "subscriptions",
         "csource_subscriptions",

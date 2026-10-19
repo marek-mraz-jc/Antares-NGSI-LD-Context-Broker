@@ -1119,6 +1119,79 @@ async fn the_type_list_is_the_live_tenants_distinct_types() {
     }
 }
 
+/// T-4683: the type catalogue keeps up with the writes. A create, a
+/// retyping patch and an upsert list their new types at once; a type whose
+/// last Entity went is no longer listed; `types_beside` names only the types
+/// an Entity carries beside the asked ones.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_type_catalogue_follows_every_write() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgEntityStore::new(pool.clone());
+    let t = TenantId::new("pgtypecatalogue").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let doc = |id: &str, types: serde_json::Value| {
+        json!({"id": id, "type": types, "createdAt": "2026-10-18T00:00:00Z",
+               "modifiedAt": "2026-10-18T00:00:00Z"})
+    };
+    for id in ["urn:ngsi-ld:X:1", "urn:ngsi-ld:W:1"] {
+        let _ = s.delete(&t, id).await;
+    }
+    assert!(s.type_names(&t).await.expect("types").is_empty());
+
+    assert!(s
+        .create(&t, "urn:ngsi-ld:X:1", &doc("urn:ngsi-ld:X:1", json!(["X"])))
+        .await
+        .expect("create"));
+    assert_eq!(s.type_names(&t).await.expect("types"), ["X"]);
+
+    let patched = s
+        .mutate(&t, "urn:ngsi-ld:X:1", |d| {
+            d["type"] = json!(["X", "Y"]);
+            Ok::<(), ()>(())
+        })
+        .await
+        .expect("mutate");
+    assert!(matches!(patched, Some(Ok(()))));
+    assert_eq!(s.type_names(&t).await.expect("types"), ["X", "Y"]);
+    assert_eq!(
+        s.types_beside(&t, &["Y".into()]).await.expect("beside"),
+        ["X", "Y"]
+    );
+
+    s.batch_upsert_replace(
+        &t,
+        &[(
+            "urn:ngsi-ld:W:1".into(),
+            doc("urn:ngsi-ld:W:1", json!(["W"])),
+        )],
+    )
+    .await
+    .expect("upsert");
+    assert_eq!(s.type_names(&t).await.expect("types"), ["W", "X", "Y"]);
+    assert!(
+        s.types_beside(&t, &["W".into()])
+            .await
+            .expect("beside")
+            .is_empty(),
+        "an Entity of W alone carries nothing beside W"
+    );
+    assert!(s
+        .types_beside(&t, &["Z".into()])
+        .await
+        .expect("beside")
+        .is_empty());
+
+    assert!(s
+        .delete(&t, "urn:ngsi-ld:X:1")
+        .await
+        .expect("delete")
+        .is_some());
+    assert_eq!(s.type_names(&t).await.expect("types"), ["W"]);
+    let _ = s.delete(&t, "urn:ngsi-ld:W:1").await;
+    assert!(s.type_names(&t).await.expect("types").is_empty());
+}
+
 /// T-4610: a type list the caller stops waiting for (an MCP call cancelled
 /// at its timeout) hands its connection back: on a pool of one, the next
 /// read still gets it, again and again.
