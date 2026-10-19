@@ -23,9 +23,11 @@ on:
         required: false
         default: ""
 
+# Not cancel-in-progress: a cancel between `docker push` and `cosign sign` would leave a pushed,
+# unsigned tag; a run is a few minutes, so queue per ref instead.
 concurrency:
   group: ship-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   FEATURES: full,jc-policy,linkml,parquet,tabular,ical
@@ -113,12 +115,14 @@ jobs:
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           IMG=ghcr.io/${{ github.repository_owner }}/antares-broker-jc
           SHA=${GITHUB_SHA::7}
-          docker tag antares-local:latest "$IMG:$SHA"
-          docker tag antares-local:latest "$IMG:dev"
-          docker push -q "$IMG:$SHA"
-          docker push -q "$IMG:dev"
+          # dev-<N>: built and smoke-tested (N = this workflow's run number); `:<N>` and
+          # `:latest` are added to the same digest only by the full-test promote (T-4721).
+          for tag in "$SHA" "sha-$SHA" "dev-$GITHUB_RUN_NUMBER" dev; do
+            docker tag antares-local:latest "$IMG:$tag"
+            docker push -q "$IMG:$tag"
+          done
           DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMG:$SHA")
           case "$DIGEST" in "$IMG@sha256:"*) ;; *) echo "no digest for $IMG:$SHA: $DIGEST"; exit 1 ;; esac
           cosign sign --yes "$DIGEST"
           cosign attest --yes --type spdxjson --predicate antares-broker-jc.sbom.spdx.json "$DIGEST"
-          echo "## Published \`$DIGEST\` (tags \`$SHA\`, \`dev\`; features \`$FEATURES\`; signed, SPDX attested)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Published \`$DIGEST\` (tags \`$SHA\`, \`sha-$SHA\`, \`dev-$GITHUB_RUN_NUMBER\`, \`dev\`; features \`$FEATURES\`; signed, SPDX attested)" >> "$GITHUB_STEP_SUMMARY"
