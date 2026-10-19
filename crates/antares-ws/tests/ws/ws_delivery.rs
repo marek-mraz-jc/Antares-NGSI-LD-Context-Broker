@@ -93,6 +93,88 @@ async fn ws_notifications_pass_pre_notify_under_the_subscriber() -> Result<(), S
     silent(&mut eve, Duration::from_millis(800)).await
 }
 
+/// Grants reads alone: no Subscription operation for anyone, and no read
+/// for `eve`.
+struct Reader;
+
+impl PolicyEngine for Reader {
+    fn name(&self) -> &'static str {
+        "reader"
+    }
+
+    fn decide<'a>(&'a self, s: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        let eve = s
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case(USER) && v == "eve");
+        let refused = op.clause.starts_with("5.8.") || (eve && op.clause == "5.7.2");
+        Box::pin(std::future::ready(if refused {
+            Decision::Deny(format!("{} is not granted", op.clause))
+        } else {
+            Decision::Allow
+        }))
+    }
+
+    fn pre_notify(&self, _s: &Subject, _sub: &Value, _n: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// T-4755: a socket's own Subscription is decided as Query Entities: a
+/// read grant watches, updates and ends it over the socket, while the same
+/// caller makes and reads no Subscription over HTTP, and a caller who may
+/// not read watches nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_a_read_grant_watches_over_its_own_socket_alone() -> Result<(), String> {
+    let b = broker_asking(Limits::default(), Some(Arc::new(Reader))).await?;
+    let mut ann = connect(b.addr, "/x/ws/ngsi-ld/v1", &[(USER, "ann")]).await?;
+    let made = ann.subscribe(cars()).await?;
+    assert_eq!(status(&made), 201, "{made}");
+    let id = text(&made, "/body/id");
+    b.http.car(None, "urn:ngsi-ld:Car:1", 10).await?;
+    ann.notification().await?;
+    ann.send(
+        json!({"x-op": "x-update", "x-subscription": id, "x-id": "u"}),
+        Some(json!({"throttling": 5})),
+    )
+    .await?;
+    let updated = ann.result().await?;
+    assert_eq!(status(&updated), 204, "{updated}");
+    let path = format!("/ngsi-ld/v1/subscriptions/{id}");
+    let (code, answer) = b.http.call("GET", &path, &[(USER, "ann")], None).await?;
+    assert_eq!(code, 403, "{answer}");
+    let fragment = json!({"throttling": 1});
+    let (code, answer) = b
+        .http
+        .call("PATCH", &path, &[(USER, "ann")], Some(&fragment))
+        .await?;
+    assert_eq!(code, 403, "{answer}");
+    let (code, answer) = b.http.call("DELETE", &path, &[(USER, "ann")], None).await?;
+    assert_eq!(code, 403, "{answer}");
+    let http = with(
+        cars(),
+        &["notification", "endpoint"],
+        json!({"uri": "http://127.0.0.1:9/n"}),
+    );
+    let (code, answer) = b
+        .http
+        .call(
+            "POST",
+            "/ngsi-ld/v1/subscriptions",
+            &[(USER, "ann")],
+            Some(&http),
+        )
+        .await?;
+    assert_eq!(code, 403, "{answer}");
+    ann.send(json!({"x-op": "x-unsubscribe", "x-subscription": id}), None)
+        .await?;
+    assert_eq!(status(&ann.result().await?), 204);
+    let mut eve = connect(b.addr, "/x/ws/ngsi-ld/v1", &[(USER, "eve")]).await?;
+    let refused = eve.subscribe(cars()).await?;
+    assert_eq!(status(&refused), 403, "{refused}");
+    Ok(())
+}
+
 /// `throttling` and `cooldown` are applied before the sink is asked: a
 /// second change inside the throttling window is not sent, and a cooldown,
 /// which only follows a failed notification (5.2.12), lets the second change
