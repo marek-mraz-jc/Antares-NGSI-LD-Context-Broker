@@ -209,12 +209,19 @@ pub struct Slot {
     #[serde(default)]
     pub unit: Option<Unit>,
     /// Tagged values, keyed by tag; `ngsi_ld_kind` (DM-05), `edm_type` (T-3720),
-    /// `odata_computed` and `odata_immutable` (T-3722) are read.
+    /// `odata_computed` and `odata_immutable` (T-3722) are read, and `summary`,
+    /// `label` (JSON text of a language map) and `hidden` (DM-99…DM-101, T-4672).
     #[serde(default)]
     pub annotations: BTreeMap<String, Annotation>,
     /// Free text.
     #[serde(default)]
     pub description: Option<String>,
+    /// Where the slot stands in its class's display order, lower first (DM-98).
+    #[serde(default)]
+    pub rank: Option<i64>,
+    /// The slot's human-readable name.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// A unit: `ucum_code`, `symbol`, `exact_mappings` (a `unece:` CURIE among them).
