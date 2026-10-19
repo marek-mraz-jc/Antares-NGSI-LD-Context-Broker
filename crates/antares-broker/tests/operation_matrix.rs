@@ -896,7 +896,13 @@ async fn the_mcp_column_is_served_as_the_matrix_states() {
             listed.iter().any(|t| t == "get_type"),
             "{view}: describe_type is listed exactly where get_type is: {listed:?}"
         );
-        listed.retain(|t| t != "describe_type");
+        // `summarize` is `query_entities`' row answered as a profile (T-4680), not a row
+        assert_eq!(
+            listed.iter().any(|t| t == "summarize"),
+            listed.iter().any(|t| t == "query_entities"),
+            "{view}: summarize is listed exactly where query_entities is: {listed:?}"
+        );
+        listed.retain(|t| t != "describe_type" && t != "summarize");
         listed.sort();
         let mut want: Vec<String> = rows
             .iter()

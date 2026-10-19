@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! The tools (MCP 3.5, 32 rows): each is one row of the operation matrix,
+//! The tools (MCP 3.5, 33 rows): each is one row of the operation matrix,
 //! and a call is one NGSI-LD request of that operation, built from checked
 //! arguments only. A write tool runs only after the person confirmed the
 //! call (MCP 3.4, `crate::confirm`).
@@ -167,6 +167,18 @@ const PAGE_ONLY: &[Arg] = &[
     opt("limit", Kind::Int(1, 1000)),
     opt("cursor", Kind::Text(crate::cursor::MAX_LEN)),
 ];
+/// `summarize` (T-4680): one type and the filters of `query_entities`; it
+/// pages by itself, so no `limit` or `cursor`.
+const SUMMARIZE: &[Arg] = &[
+    req("type", Kind::Types),
+    opt("q", Kind::Text(4096)),
+    opt("scopeQ", Kind::Text(1024)),
+    opt("georel", Kind::Text(256)),
+    opt("geometry", Kind::Word(GEOMETRIES)),
+    opt("coordinates", Kind::Coordinates),
+    opt("geoproperty", Kind::Attr),
+    opt("lang", Kind::Text(64)),
+];
 const NONE: &[Arg] = &[];
 const ATTR_VALUE: &[Arg] = &[req("id", Kind::Id), req("attrId", Kind::Attr)];
 const TYPE_ONLY: &[Arg] = &[req("type", Kind::Type)];
@@ -276,7 +288,7 @@ const fn write(
 }
 
 /// Every tool, sorted by name (2026-07-28: a deterministic order).
-pub(crate) const TOOLS: [ToolDef; 32] = [
+pub(crate) const TOOLS: [ToolDef; 33] = [
     write(
         "append_attributes",
         OperationId::AppendAttributes,
@@ -507,6 +519,15 @@ pub(crate) const TOOLS: [ToolDef; 32] = [
         description: "Read the history of one Entity (TS 104 175 11.3.2) between timeAt and endTimeAt; lastN bounds each Attribute's instances.",
         args: TEMPORAL_ONE,
         key: "entity",
+        paged: false,
+        write: false,
+    },
+    ToolDef {
+        name: "summarize",
+        op: OperationId::QueryEntities,
+        description: "Profile one Entity type: its count and, per Attribute, statistics (min, max, mean, median, the most common values, the area) over at most 1,000 of the Entities the caller reads, and five of them. Use it for a broad question; use query_entities for specific Entities.",
+        args: SUMMARIZE,
+        key: "summary",
         paged: false,
         write: false,
     },
@@ -809,10 +830,16 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort_unstable();
         assert_eq!(names, sorted);
-        let mut ops: Vec<&str> = TOOLS.iter().map(|t| t.op.id()).collect();
+        // `summarize` (T-4680) reads through `query_entities`' operation and
+        // answers a profile of it; every other tool is its operation's own row.
+        let mut ops: Vec<&str> = TOOLS
+            .iter()
+            .filter(|t| t.name != "summarize")
+            .map(|t| t.op.id())
+            .collect();
         ops.sort_unstable();
         ops.dedup();
-        assert_eq!(ops.len(), TOOLS.len());
+        assert_eq!(ops.len(), TOOLS.len().saturating_sub(1));
     }
 
     #[test]

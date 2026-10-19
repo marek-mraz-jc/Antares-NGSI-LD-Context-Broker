@@ -2,9 +2,11 @@
 //! The MCP server of one view, for one request: discovery, the tool list
 //! and calls, and the resources (MCP sections 3, 4, 6 and 8).
 
+use crate::budget;
 use crate::confirm;
 use crate::listen::{self, LIFETIME, MAX_URIS, SCHEME};
 use crate::schema::{self, Checked, Names};
+use crate::summary::{self, Basis};
 use crate::tools::{self, Built, ToolDef, TOOLS};
 use crate::units;
 use crate::{cursor, MAX_RESULT_BYTES_ENV};
@@ -274,6 +276,75 @@ impl Server {
         self.call(tool, &given).await.into()
     }
 
+    /// `summarize` (T-4680): loads the caller's rows of one type through the
+    /// same `QueryEntities` run as `query_entities`, within the budget the
+    /// server's load allows ([`budget::load`]), and answers their profile, never the rows.
+    async fn summarize(
+        &self,
+        tool: &'static ToolDef,
+        given: &serde_json::Map<String, Value>,
+    ) -> CallToolResult {
+        let mut args = match schema::check_all(tool.args, given, &self.names()) {
+            Ok(args) => args,
+            Err(why) => return refused(&why),
+        };
+        let entity_type = match args.get("type") {
+            Some(Checked::Many(types)) if types.len() == 1 => types.first().cloned(),
+            _ => None,
+        };
+        let Some(entity_type) = entity_type else {
+            return refused("argument type: summarize takes exactly one type");
+        };
+        let lang = match args.get("lang") {
+            Some(Checked::One(s)) => Some(s.clone()),
+            _ => None,
+        };
+        args.insert("format", Checked::One("normalized".into()));
+        args.insert("count", Checked::Flag(true));
+        let started = std::time::Instant::now();
+        let state = budget::current_state();
+        metrics::counter!("antares_summary_state_total", "state" => state.as_str()).increment(1);
+        let fetch = |limit, offset| {
+            let built = tools::build(tool, &args, limit, offset);
+            async move {
+                let answer = self.run(tool.op, built).await;
+                log_call(&self.id, tool, answer.status);
+                if answer.status.is_success() {
+                    Ok((answer.count, answer.body))
+                } else {
+                    Err(failed(&answer))
+                }
+            }
+        };
+        let loaded = match budget::load(
+            &budget::CONCURRENCY,
+            *budget::SUMMARY_CONCURRENCY,
+            state,
+            budget::budget_for(state),
+            fetch,
+        )
+        .await
+        {
+            Ok(loaded) => loaded,
+            Err(failure) => return failure,
+        };
+        let basis = Basis {
+            loaded: loaded.rows.len(),
+            total: loaded.total,
+            reason: loaded.reason,
+            skipped: loaded.skipped,
+        };
+        let mut profile = summary::profile(&loaded.rows, loaded.total, basis, lang.as_deref());
+        profile.entity_type = entity_type;
+        let wide = |n: usize| f64::from(u32::try_from(n).unwrap_or(u32::MAX));
+        metrics::histogram!("antares_summary_rows").record(wide(loaded.rows.len()));
+        metrics::histogram!("antares_summary_bytes").record(wide(loaded.bytes));
+        metrics::histogram!("antares_summary_ms").record(started.elapsed().as_secs_f64() * 1000.0);
+        let mut result = CallToolResult::structured(profile.to_json());
+        result.content = vec![ContentBlock::text(summary::render(&profile))];
+        result
+    }
+
     /// `describe_type` (T-4537): `get_type` through the view, so the gate decides as it does for
     /// it, then the type's guide as text first and JSON after, with what `get_type` answered.
     async fn describe(
@@ -345,14 +416,7 @@ impl Server {
         let mut answer = self
             .run(tool.op, tools::build(tool, &args, limit, offset))
             .await;
-        // MC19: what was called and how it ended, never the arguments
-        tracing::info!(
-            view = %self.id,
-            tool = tool.name,
-            operation = tool.op.id(),
-            status = answer.status.as_u16(),
-            "mcp tool call"
-        );
+        log_call(&self.id, tool, answer.status);
         if !answer.status.is_success() {
             return failed(&answer);
         }
@@ -458,6 +522,24 @@ fn whole(tool: &ToolDef, body: &Value) -> CallToolResult {
         return too_large(tool);
     }
     CallToolResult::structured(out)
+}
+
+/// MC19: what was called and how it ended, never the arguments.
+fn log_call(view: &str, tool: &ToolDef, status: StatusCode) {
+    tracing::info!(
+        view = %view,
+        tool = tool.name,
+        operation = tool.op.id(),
+        status = status.as_u16(),
+        "mcp tool call"
+    );
+}
+
+/// The summary's permits did not come in time.
+impl From<budget::Busy> for CallToolResult {
+    fn from(_: budget::Busy) -> Self {
+        refused("the server is busy; retry after 2 seconds")
+    }
 }
 
 /// A refused argument: the rule, never the value.
@@ -681,6 +763,9 @@ impl ServerHandler for Server {
         if describe {
             return Ok(self.describe(tool, &given).await.into());
         }
+        if request.name == "summarize" {
+            return Ok(self.summarize(tool, &given).await.into());
+        }
         Ok(self.call(tool, &given).await.into())
     }
 
@@ -783,6 +868,13 @@ impl ServerHandler for Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_summary_without_its_permits_is_answered_busy() {
+        let busy = CallToolResult::from(budget::Busy);
+        assert_eq!(busy.is_error, Some(true));
+        assert!(format!("{:?}", busy.content).contains("the server is busy; retry after 2 seconds"));
+    }
 
     #[test]
     fn a_page_is_cut_between_rows_never_inside_one() {
