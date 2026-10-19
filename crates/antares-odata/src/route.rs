@@ -68,6 +68,11 @@ pub(crate) async fn serve(
     };
     let answer = match path.as_slice() {
         [_, Segment::Ref] | [_, _, Segment::Ref] if shaped(options) => Err(no_properties(version)),
+        [Segment::EntitySet(set)] | [Segment::EntitySet(set), Segment::Ref]
+            if options.apply.is_some() =>
+        {
+            crate::apply::collection(reads, caller, &ctx, (set, path), options, headers).await
+        }
         [Segment::EntitySet(set)] | [Segment::EntitySet(set), Segment::Ref] => {
             collection(reads, caller, &ctx, set, path, options, headers).await
         }

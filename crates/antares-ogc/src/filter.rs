@@ -15,7 +15,7 @@
 //! A name that is no queryable of the collection, hidden or misspelled, is the same 400 before
 //! any operation (F16); a function name is 400 too, as `/functions` lists none (F14).
 
-use crate::items::{bbox_geometry, corners};
+use crate::crs::{bbox_geometry, corners};
 use crate::model::Collection;
 use crate::Problem;
 use antares_ops::residual::{Cmp, Date, DateTime, Expr, Func, Lit, Path, Spatial};
@@ -162,7 +162,7 @@ pub(crate) struct Lowered {
 /// Lowers `filter` for `c` under `terms`; `geo_free` when the request has no other geo query.
 pub(crate) fn lower(
     c: &Collection,
-    terms: &crate::items::Terms,
+    terms: &crate::terms::Terms,
     filter: &Cql,
     geo_free: bool,
 ) -> Result<Lowered, Problem> {
@@ -255,7 +255,7 @@ impl Bound {
 
 struct Lower<'a> {
     c: &'a Collection,
-    terms: &'a crate::items::Terms,
+    terms: &'a crate::terms::Terms,
     /// The text of each date and date-time literal, which `q` writes as sent.
     stamps: Vec<(Lit, String)>,
 }
@@ -929,8 +929,8 @@ fn like(pattern: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::items::Terms;
     use crate::model::Prop;
+    use crate::terms::Terms;
 
     fn prop(name: &str, ty: &str, kind: &str, sortable: bool) -> Prop {
         Prop {

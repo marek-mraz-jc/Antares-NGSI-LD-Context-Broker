@@ -664,10 +664,6 @@ pub(crate) async fn collection(
     headers: &HeaderMap,
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
-    if options.apply.is_some() {
-        return crate::apply::collection(reads, caller, ctx, (set_name, path), options, headers)
-            .await;
-    }
     let set = set_of(reads, set_name, version)?;
     let expansions =
         expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;

@@ -27,6 +27,7 @@ mod filter;
 mod items;
 mod model;
 mod schema;
+mod terms;
 mod write;
 
 use antares_ops::{Caller, OperationId, Ops, Surface, ViewOps};

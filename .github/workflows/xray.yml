@@ -43,6 +43,8 @@ jobs:
         run: ./dev/dup-check.sh
       - name: Module graph gate
         if: always()
+        # bash, so pipefail: through tee the gate's own exit code fails the step (T-4722).
+        shell: bash
         run: python3 dev/module-graph.py | tee results/dup/module-graph.txt
       - name: Step summary
         if: always()

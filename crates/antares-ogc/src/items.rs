@@ -3,8 +3,10 @@
 //! the query parameters, the Query Entities requests they become, and the Features of the
 //! answers.
 
+use crate::crs::{bbox_geometry, corners};
 use crate::filter::Lowered;
 use crate::model::{Collection, Time};
+use crate::terms::Terms;
 use crate::Problem;
 use antares_ops::residual::{self, Expr, Lit, Path, Spatial};
 use antares_ops::{Caller, Pushdown, Refusal, Scanned, ViewOps};
@@ -227,20 +229,6 @@ fn bbox(text: &str) -> Option<[f64; 4]> {
     corners(&numbers)
 }
 
-/// The corners of a CRS84 box of 4 or 6 numbers (a CQL2 `BBOX` too); heights are dropped, and a
-/// number that is not finite is out of range.
-pub(crate) fn corners(numbers: &[f64]) -> Option<[f64; 4]> {
-    let [west, south, east, north] = match numbers {
-        [west, south, east, north] => [*west, *south, *east, *north],
-        [west, south, low, east, north, high] if low <= high => [*west, *south, *east, *north],
-        _ => return None,
-    };
-    let lon = |x: f64| (-180.0..=180.0).contains(&x);
-    let lat = |y: f64| (-90.0..=90.0).contains(&y);
-    (lon(west) && lon(east) && lat(south) && lat(north) && south <= north)
-        .then_some([west, south, east, north])
-}
-
 /// An instant (both ends the same) or `start/end` with `..` or empty for an open end; both
 /// ends open is refused (Part 1 Req 26 F).
 fn datetime(text: &str) -> Option<(Option<String>, Option<String>)> {
@@ -304,77 +292,6 @@ fn is_date_time(s: &str) -> bool {
 }
 
 pub(crate) use antares_ops::percent::encode;
-
-/// The terms one collection's requests use: core-context names as they are, every other
-/// Attribute by its property name in the request's own `@context` (so an `ngsild.` option
-/// names it as `properties` does), or `p{n}` when that name is no NGSI-LD term or the core
-/// context already defines it; the answer's keys are then known.
-pub(crate) struct Terms {
-    context: Map<String, Value>,
-    by_iri: Vec<(String, String)>,
-}
-
-impl Terms {
-    pub(crate) fn of(c: &Collection) -> Self {
-        let mut t = Self {
-            context: Map::new(),
-            by_iri: Vec::new(),
-        };
-        let span = c.properties.len().saturating_add(1);
-        let named = c
-            .geometry
-            .iter()
-            .map(|g| (g, None))
-            .chain(c.properties.iter().map(|p| (&p.iri, Some(p.name.as_str()))));
-        for (iri, name) in named {
-            let core = antares_ops::core_name(iri);
-            let term = if core == *iri {
-                let free = |term: &str| {
-                    is_term(term)
-                        && !antares_ops::is_core_term(term)
-                        && !t.context.contains_key(term)
-                };
-                let term = match name.filter(|n| free(n)) {
-                    Some(name) => name.to_owned(),
-                    // Each Attribute takes one name, so among as many `p{n}` past the
-                    // terms so far as there are Attributes, one is free.
-                    None => (t.context.len()..=t.context.len().saturating_add(span))
-                        .map(|n| format!("p{n}"))
-                        .find(|term| free(term))
-                        .unwrap_or_default(),
-                };
-                t.context.insert(term.clone(), Value::from(iri.as_str()));
-                term
-            } else {
-                core
-            };
-            t.by_iri.push((iri.clone(), term));
-        }
-        t
-    }
-
-    /// The term of an Attribute of the collection.
-    pub(crate) fn term<'a>(&'a self, iri: &'a str) -> &'a str {
-        self.by_iri
-            .iter()
-            .find(|(i, _)| i == iri)
-            .map_or(iri, |(_, t)| t.as_str())
-    }
-
-    /// The request's own `@context`, none when every term is the core context's.
-    fn context(&self) -> Option<Value> {
-        (!self.context.is_empty()).then(|| Value::Object(self.context.clone()))
-    }
-}
-
-/// An Attribute name the NGSI-LD query grammar reads as one: a letter, then letters, digits
-/// and `_` (TS 104 176 7.2.3.1 `attrName`, without the `%` escapes no slot name needs).
-fn is_term(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
-        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        && name.len() <= 256
-}
 
 /// The `q` the `datetime` parameter adds (C13, C14): the temporal geometry intersects the
 /// interval, or the Feature has none.
@@ -448,28 +365,6 @@ fn shape(c: &Collection, terms: &Terms, p: &Params) -> String {
         .chain(omit)
         .filter_map(|name| p.option(name).map(|v| format!("&{name}={}", encode(v))));
     pick.into_iter().chain(options).collect()
-}
-
-/// The polygon(s) of a CRS84 box; one that crosses the antimeridian (its west edge east of
-/// its east edge) is two.
-pub(crate) fn bbox_geometry([west, south, east, north]: [f64; 4]) -> (&'static str, Value) {
-    let ring = |from: f64, to: f64| {
-        json!([[
-            [from, south],
-            [to, south],
-            [to, north],
-            [from, north],
-            [from, south]
-        ]])
-    };
-    if west <= east {
-        ("Polygon", ring(west, east))
-    } else {
-        (
-            "MultiPolygon",
-            json!([ring(west, 180.0), ring(-180.0, east)]),
-        )
-    }
 }
 
 /// One Query Entities an `items` request reads: the store's pushdown and the residual the
