@@ -26,8 +26,8 @@ use crate::filter::{
     compute, computed, inlined, mint, numeric, searched, whole, Refused, Translated,
 };
 use crate::read::{
-    attach, compare, digest, entity_value, ngsild, not_implemented, now, paged, position, pushdown,
-    refusal, resource, scanned, set_of, token, Reads,
+    attach, compare, digest, entity_value, ngsild, not_implemented, now, page_link, paged,
+    position, pushdown, refusal, resource, scanned, set_of, token, Reads,
 };
 use antares_ops::{Caller, Page as ScanPage, RESIDUAL_SCAN};
 use axum::http::{HeaderMap, StatusCode};
@@ -38,8 +38,8 @@ use odata_json::{
     Page,
 };
 use odata_url::{
-    Aggregate, AggregateWith, Compute, Expr, Literal, MemberPath, ODataUri, PartitionBy,
-    QueryOptions, Segment, Transformation,
+    Aggregate, AggregateWith, Compute, Expr, Literal, MemberPath, PartitionBy, QueryOptions,
+    Segment, Transformation,
 };
 use serde_json::{Map, Value};
 use std::borrow::Cow;
@@ -104,17 +104,7 @@ pub(crate) async fn collection(
     let digest = digest(&reads.state.service_root, path, options);
     let window = position(reads, options, digest, headers, version)?;
     let link = |cursor: u64, skip: u64, top: Option<u64>| {
-        let rest = QueryOptions {
-            skip: None,
-            top: None,
-            skiptoken: Some(token(cursor, skip, top, digest)),
-            ..options.clone()
-        };
-        let uri = ODataUri::Resource {
-            path: path.to_vec(),
-            options: rest,
-        };
-        format!("{}{uri}", reads.state.service_root)
+        page_link(reads, path, options, token(cursor, skip, top, digest))
     };
     let counted = options.count == Some(true);
     match frame {

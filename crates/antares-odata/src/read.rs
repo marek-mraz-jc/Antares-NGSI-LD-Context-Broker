@@ -686,17 +686,7 @@ pub(crate) async fn collection(
     let residual = residual_of(&filter, version)?;
     let counted = options.count == Some(true);
     let link = |cursor: u64, skip: u64, top: Option<u64>| {
-        let rest = QueryOptions {
-            skip: None,
-            top: None,
-            skiptoken: Some(token(cursor, skip, top, digest)),
-            ..options.clone()
-        };
-        let uri = ODataUri::Resource {
-            path: path.to_vec(),
-            options: rest,
-        };
-        format!("{}{uri}", reads.state.service_root)
+        page_link(reads, path, options, token(cursor, skip, top, digest))
     };
     let window = Window {
         cursor,
@@ -998,6 +988,25 @@ pub(crate) fn digest(root: &str, path: &[Segment], options: &QueryOptions) -> u6
 /// residual page served, or the position in a counted or sorted answer;
 /// which one follows from the query the digest binds. A token of the form
 /// before T-3758 does not read.
+/// The URL of the page of the answer to `path` with `options` that `skiptoken` names.
+pub(crate) fn page_link(
+    reads: &Reads,
+    path: &[Segment],
+    options: &QueryOptions,
+    skiptoken: String,
+) -> String {
+    let uri = ODataUri::Resource {
+        path: path.to_vec(),
+        options: QueryOptions {
+            skip: None,
+            top: None,
+            skiptoken: Some(skiptoken),
+            ..options.clone()
+        },
+    };
+    format!("{}{uri}", reads.state.service_root)
+}
+
 pub(crate) fn token(cursor: u64, skip: u64, top: Option<u64>, digest: u64) -> String {
     let top = top.map_or_else(|| "-".to_owned(), |t| t.to_string());
     format!("2.{cursor}.{skip}.{top}.{digest:016x}")
