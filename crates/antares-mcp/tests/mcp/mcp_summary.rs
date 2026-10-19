@@ -97,6 +97,14 @@ async fn summarize_profiles_entity_type_with_statistics_and_samples() -> Result<
         .and_then(Value::as_f64);
     assert_eq!(temp_max, TEMPS.last().copied());
 
+    // the area every location covers, from the GeoJSON's positions
+    assert_eq!(
+        structured.pointer("/attributes/location/bbox"),
+        Some(&json!([10.0, 20.0, 17.0, 27.0])),
+        "{}",
+        a.text
+    );
+
     assert!(a.text.contains("type=Device"), "{}", a.text);
     assert!(
         a.text.contains(&format!("count={created_count}")),
@@ -178,6 +186,32 @@ async fn summarize_validates_type_argument() -> Result<(), String> {
     .await;
     assert!(two_types.is_error(), "{}", two_types.text);
 
+    // the same type twice is still two
+    let twice = call(
+        &f.app,
+        "devices",
+        "summarize",
+        json!({"type": ["Device", "Device"]}),
+    )
+    .await;
+    assert!(twice.text.contains("exactly one type"), "{}", twice.text);
+
+    // a query the broker refuses is its status and title, as query_entities answers it
+    let bad_q = call(
+        &f.app,
+        "devices",
+        "summarize",
+        json!({"type": ["Device"], "q": ")xyzzy("}),
+    )
+    .await;
+    assert!(bad_q.is_error(), "{}", bad_q.text);
+    assert_eq!(
+        bad_q.structured().pointer("/error/status"),
+        Some(&json!(400)),
+        "{}",
+        bad_q.text
+    );
+
     Ok(())
 }
 
@@ -215,5 +249,22 @@ async fn summarize_appears_in_tools_list_as_read_only() -> Result<(), String> {
         call_res.text
     );
 
+    Ok(())
+}
+
+/// `lang` picks the language a sample's `LanguageProperty` name is shown in.
+#[tokio::test(flavor = "multi_thread")]
+async fn summarize_names_samples_in_the_asked_language() -> Result<(), String> {
+    let f = fixture().await?;
+    setup_devices(&f.app).await?;
+    let a = call(
+        &f.app,
+        "devices",
+        "summarize",
+        json!({"type": ["Device"], "lang": "en"}),
+    )
+    .await;
+    assert!(!a.is_error(), "{}", a.text);
+    assert!(a.text.contains("type=Device"), "{}", a.text);
     Ok(())
 }

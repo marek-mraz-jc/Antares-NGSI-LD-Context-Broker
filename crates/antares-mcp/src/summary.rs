@@ -419,17 +419,11 @@ fn attr_to_json(attr: &AttrStat) -> Value {
     }
 }
 
+/// The day of an RFC 3339 instant or of a `YYYY-MM-DD` date.
 fn parse_rfc3339_or_date(s: &str) -> Option<String> {
-    if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
-        if let Some(date_part) = s.get(..10) {
-            return Some(date_part.to_owned());
-        }
-        return Some(s.to_owned());
-    }
-    if chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok() {
-        return Some(s.to_owned());
-    }
-    None
+    let valid = chrono::DateTime::parse_from_rfc3339(s).is_ok()
+        || chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok();
+    valid.then(|| s.get(..10)).flatten().map(str::to_owned)
 }
 
 fn extract_coords(val: &Value, out: &mut Vec<(f64, f64)>) {
@@ -570,14 +564,13 @@ pub(crate) fn profile(
     let (attr_presences, observed_at) = collect_presences_and_dates(rows);
     let (top12, other_attributes) = rank_attributes(&attr_presences);
 
-    let mut attributes = Vec::new();
-    for attr_name in &top12 {
-        if let Some(values) = attr_presences.get(attr_name) {
-            if let Some(stat) = analyze_attribute(attr_name, values, total_loaded, lang) {
-                attributes.push(stat);
-            }
-        }
-    }
+    let attributes: Vec<AttrStat> = top12
+        .iter()
+        .filter_map(|name| {
+            let values = attr_presences.get(name)?;
+            Some(analyze_attribute(name, values, total_loaded, lang))
+        })
+        .collect();
 
     let sample_attrs: Vec<String> = attributes
         .iter()
@@ -717,7 +710,8 @@ fn analyze_geo(name: &str, values: &[&Value]) -> Option<AttrStat> {
     let mut entity_centres = Vec::new();
     for v in values {
         let mut coords = Vec::new();
-        if let Some(geom) = v.as_object().and_then(|o| o.get("value")) {
+        // the GeoJSON's positions: `value` is the geometry object, never a bare array
+        if let Some(geom) = v.pointer("/value/coordinates") {
             extract_coords(geom, &mut coords);
         }
         if !coords.is_empty() {
@@ -761,27 +755,13 @@ fn analyze_geo(name: &str, values: &[&Value]) -> Option<AttrStat> {
     })
 }
 
+/// The `p` quantile of `sorted`, linear between its neighbours; 0 when empty.
 fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    if sorted.len() == 1 {
-        return *sorted.first().unwrap_or(&0.0);
-    }
-    let n_sub_1 = sorted.len().saturating_sub(1);
-    let idx = p * to_f64(n_sub_1);
-    let k = (0..=n_sub_1)
-        .rev()
-        .find(|&i| to_f64(i) <= idx)
-        .unwrap_or(0)
-        .min(n_sub_1);
-    let f = idx - to_f64(k);
-    let current = *sorted.get(k).unwrap_or(&0.0);
-    if let Some(&next) = sorted.get(k.saturating_add(1)) {
-        current + f * (next - current)
-    } else {
-        current
-    }
+    let last = sorted.len().saturating_sub(1);
+    let idx = p * to_f64(last);
+    let k = (0..=last).rev().find(|&i| to_f64(i) <= idx).unwrap_or(0);
+    let at = |i: usize| sorted.get(i).copied().unwrap_or(0.0);
+    at(k) + (idx - to_f64(k)) * (at(k.saturating_add(1).min(last)) - at(k))
 }
 
 fn compute_histogram(
@@ -793,17 +773,12 @@ fn compute_histogram(
     let mut hist = Vec::new();
     if max > min {
         let width = (max - min) / 5.0;
-        let mut counts = [0usize; 5];
-        for &x in numbers {
-            let b = (0..5)
+        let bucket = |x: f64| {
+            (0..5)
                 .rev()
                 .find(|&i| x >= min + to_f64(i) * width)
                 .unwrap_or(0)
-                .min(4);
-            if let Some(c) = counts.get_mut(b) {
-                *c = c.saturating_add(1);
-            }
-        }
+        };
         for i in 0..5 {
             let start = min + to_f64(i) * width;
             let end = if i == 4 {
@@ -811,7 +786,7 @@ fn compute_histogram(
             } else {
                 min + to_f64(i.saturating_add(1)) * width
             };
-            let cnt = *counts.get(i).unwrap_or(&0);
+            let cnt = numbers.iter().filter(|&&x| bucket(x) == i).count();
             hist.push((start, end, cnt));
         }
     } else {
@@ -852,16 +827,7 @@ fn analyze_number(name: &str, values: &[&Value], total_loaded: usize) -> Option<
     let min = *numbers.first().unwrap_or(&0.0);
     let max = *numbers.last().unwrap_or(&0.0);
     let mean = numbers.iter().sum::<f64>() / to_f64(num_count);
-    let median = if num_count % 2 == 1 {
-        *numbers
-            .get(num_count.checked_div(2).unwrap_or(0))
-            .unwrap_or(&0.0)
-    } else {
-        let mid = num_count.checked_div(2).unwrap_or(0);
-        let left = *numbers.get(mid.saturating_sub(1)).unwrap_or(&0.0);
-        let right = *numbers.get(mid).unwrap_or(&0.0);
-        f64::midpoint(left, right)
-    };
+    let median = percentile(&numbers, 0.5);
 
     let stddev = if num_count <= 1 {
         0.0
@@ -947,21 +913,17 @@ fn analyze_datetime(name: &str, values: &[&Value]) -> Option<AttrStat> {
     let n = values.len();
     let mut dates = Vec::new();
     for v in values {
-        let Some(obj) = v.as_object() else { continue };
-        if let Some(s) = obj.get("value").and_then(Value::as_str) {
-            if let Some(d) = parse_rfc3339_or_date(s) {
-                dates.push(d);
-                continue;
-            }
-        }
-        if let Some(sub) = obj.get("value").and_then(Value::as_object) {
-            if sub.get("@type").and_then(Value::as_str) == Some("DateTime") {
-                if let Some(s) = sub.get("@value").and_then(Value::as_str) {
-                    if let Some(d) = parse_rfc3339_or_date(s) {
-                        dates.push(d);
-                    }
-                }
-            }
+        // a plain string, or a typed `{"@type": "DateTime", "@value": …}`
+        let value = v.get("value");
+        let typed = value
+            .filter(|x| x.get("@type").and_then(Value::as_str) == Some("DateTime"))
+            .and_then(|x| x.get("@value"));
+        if let Some(d) = value
+            .and_then(Value::as_str)
+            .or_else(|| typed.and_then(Value::as_str))
+            .and_then(parse_rfc3339_or_date)
+        {
+            dates.push(d);
         }
     }
     if dates.is_empty() || dates.len() < n.checked_div(2).unwrap_or(0) {
@@ -1040,34 +1002,18 @@ fn analyze_attribute(
     values: &[&Value],
     total_loaded: usize,
     lang: Option<&str>,
-) -> Option<AttrStat> {
-    let n = values.len();
-    if n == 0 {
-        return None;
-    }
-    if let Some(rel) = analyze_relationship(name, values) {
-        return Some(rel);
-    }
-    if let Some(geo) = analyze_geo(name, values) {
-        return Some(geo);
-    }
-    if let Some(num) = analyze_number(name, values, total_loaded) {
-        return Some(num);
-    }
-    if let Some(b) = analyze_boolean(name, values) {
-        return Some(b);
-    }
-    if let Some(dt) = analyze_datetime(name, values) {
-        return Some(dt);
-    }
-    if let Some(cat) = analyze_category_or_text(name, values, total_loaded, lang) {
-        return Some(cat);
-    }
-    Some(AttrStat::Structured {
-        name: name.to_string(),
-        n,
-        share_present: to_f64(n) / to_f64(total_loaded),
-    })
+) -> AttrStat {
+    analyze_relationship(name, values)
+        .or_else(|| analyze_geo(name, values))
+        .or_else(|| analyze_number(name, values, total_loaded))
+        .or_else(|| analyze_boolean(name, values))
+        .or_else(|| analyze_datetime(name, values))
+        .or_else(|| analyze_category_or_text(name, values, total_loaded, lang))
+        .unwrap_or_else(|| AttrStat::Structured {
+            name: name.to_string(),
+            n: values.len(),
+            share_present: to_f64(values.len()) / to_f64(total_loaded),
+        })
 }
 
 /// Format a float to up to 3 significant figures, or whole for integers.
@@ -1433,6 +1379,11 @@ mod tests {
             .collect()
     }
 
+    /// `path` of `v`, `null` when it is not there.
+    fn at<'a>(v: &'a Value, path: &str) -> &'a Value {
+        v.pointer(path).unwrap_or(&Value::Null)
+    }
+
     #[test]
     fn bridge_statistics_are_exact() {
         let rows = bridge_fixture();
@@ -1444,31 +1395,32 @@ mod tests {
         };
         let p = profile(&rows, Some(10), basis, None);
         assert_eq!(p.entity_type, "Bridge");
-
-        let year = p.attributes.iter().find(|a| a.name() == "yearBuilt");
-        assert!(matches!(
-            year,
-            Some(AttrStat::Number { n: 10, min, max, mean, median, unit_code: Some(u), .. })
-            if (*min - 1900.0).abs() < f64::EPSILON
-                && (*max - 1990.0).abs() < f64::EPSILON
-                && (*mean - 1945.0).abs() < f64::EPSILON
-                && (*median - 1945.0).abs() < f64::EPSILON
-                && u == "ANN"
-        ));
-
-        let cat = p.attributes.iter().find(|a| a.name() == "category");
-        assert!(matches!(
-            cat,
-            Some(AttrStat::Category { distinct: 2, top5, .. })
-            if top5.first().map(|t| (t.0.as_str(), t.1)) == Some(("cestny", 6))
-        ));
-
-        let rel = p.attributes.iter().find(|a| a.name() == "connectedTo");
-        assert!(matches!(
-            rel,
-            Some(AttrStat::Relationship { top3, .. })
-            if top3.first().map(|t| (t.0.as_str(), t.1)) == Some(("urn:ngsi-ld:Road:1", 7))
-        ));
+        let json = p.to_json();
+        let year = at(&json, "/attributes/yearBuilt");
+        let got: Vec<&Value> = ["n", "min", "max", "mean", "median", "unitCode"]
+            .iter()
+            .map(|k| at(year, &format!("/{k}")))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                &json!(10),
+                &json!(1900.0),
+                &json!(1990.0),
+                &json!(1945.0),
+                &json!(1945.0),
+                &json!("ANN")
+            ]
+        );
+        assert_eq!(at(&json, "/attributes/category/distinct"), &json!(2));
+        assert_eq!(
+            at(&json, "/attributes/category/top5/0"),
+            &json!({"value": "cestny", "count": 6, "pct": 60.0})
+        );
+        assert_eq!(
+            at(&json, "/attributes/connectedTo/top3/0"),
+            &json!({"target": "urn:ngsi-ld:Road:1", "count": 7})
+        );
 
         let text = render(&p);
         assert!(text.contains("type=Bridge"));
@@ -1479,22 +1431,19 @@ mod tests {
 
     #[test]
     fn thirty_attributes_fit_within_budget() {
-        let mut entity = json!({
-            "id": "urn:ngsi-ld:Test:1",
-            "type": "Test"
-        });
-        if let Some(map) = entity.as_object_mut() {
-            for i in 0usize..30usize {
-                map.insert(
-                    format!("attr_{i:02}"),
-                    json!({
-                        "type": "Property",
-                        "value": i.saturating_mul(10)
-                    }),
-                );
-            }
+        let mut map = serde_json::Map::new();
+        map.insert("id".into(), json!("urn:ngsi-ld:Test:1"));
+        map.insert("type".into(), json!("Test"));
+        for i in 0usize..30usize {
+            map.insert(
+                format!("attr_{i:02}"),
+                json!({
+                    "type": "Property",
+                    "value": i.saturating_mul(10)
+                }),
+            );
         }
-        let rows = vec![entity; 5];
+        let rows = vec![Value::Object(map); 5];
         let basis = Basis {
             loaded: 5,
             total: Some(5),
@@ -1504,6 +1453,7 @@ mod tests {
         let p = profile(&rows, Some(5), basis, None);
         assert_eq!(p.attributes.len(), 12);
         assert_eq!(p.other_attributes.len(), 18);
+        assert_eq!(at(&p.to_json(), "/otherAttributes/0"), &json!("attr_12"));
 
         let rendered = render(&p);
         assert!(rendered.len() <= 6000);
@@ -1539,5 +1489,469 @@ mod tests {
         assert!(text.contains("count=40"), "{text}");
         assert!(!text.contains("count=0"), "{text}");
         assert!(!text.contains("no entities found"), "{text}");
+    }
+
+    fn basis(loaded: usize, reason: BasisReason) -> Basis {
+        Basis {
+            loaded,
+            total: None,
+            reason,
+            skipped: 0,
+        }
+    }
+
+    /// One entity of `attrs`, each `{"type": "Property", "value": v}` unless already an object.
+    fn entity(i: usize, attrs: Vec<(&str, Value)>) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert("id".into(), json!(format!("urn:ngsi-ld:T:{i}")));
+        map.insert("type".into(), json!("T"));
+        for (k, v) in attrs {
+            map.insert(k.into(), v);
+        }
+        Value::Object(map)
+    }
+
+    /// Rows with one attribute of every kind, and the shapes each kind must survive.
+    fn every_kind() -> Vec<Value> {
+        let long = "Most·Slovenského·národného·povstania ".repeat(4);
+        (0u32..12)
+            .map(|i| {
+                let fi = f64::from(i);
+                let first = i == 0;
+                entity(usize::try_from(i).unwrap_or(0), vec![
+                    ("name", json!({"type": "LanguageProperty", "languageMap": {"sk": format!("{long}{i}"), "en": format!("Place {i}")}})),
+                    // decimals, a missing value, an outlier on each side, a date that is none
+                    ("level", if first {
+                        json!({"type": "Property", "value": null, "observedAt": "2026-09-30"})
+                    } else if i == 1 {
+                        json!({"type": "Property", "value": -900.0, "observedAt": "soon"})
+                    } else {
+                        json!({"type": "Property", "value": if i == 11 { 950.5 } else { 0.05 + fi * 0.1 }, "unitCode": "", "observedAt": format!("2026-10-{:02}T08:00:00Z", i.saturating_add(1))})
+                    }),
+                    ("open", json!({"type": "Property", "value": i % 3 == 0})),
+                    ("built", if i % 2 == 0 {
+                        json!({"type": "Property", "value": {"@type": "DateTime", "@value": format!("19{:02}-05-01T00:00:00Z", i.saturating_add(50))}})
+                    } else {
+                        json!({"type": "Property", "value": format!("19{:02}-05-01", i.saturating_add(50))})
+                    }),
+                    // six kinds: the top five and the rest as other
+                    ("kind", json!({"type": "Property", "value": char::from(b'a'.saturating_add(u8::try_from(i % 6).unwrap_or(0))).to_string()})),
+                    ("area", json!({"type": "GeoProperty", "value": {"type": "Polygon", "coordinates": [[[17.0 + fi, 48.0], [17.5 + fi, 48.5], [17.0 + fi, 48.5], [17.0 + fi, 48.0]]]}})),
+                    ("owner", json!({"type": "Relationship", "object": format!("urn:ngsi-ld:Org:{}", i % 2)})),
+                    ("address", json!({"type": "Property", "value": {"streetAddress": format!("Ulica {i}")}})),
+                    ("note", json!({"type": "Property", "value": if first { "not-a-date".to_owned() } else { format!("free text {i}") }})),
+                ])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_kind_is_profiled_and_rendered() {
+        let rows = every_kind();
+        let p = profile(
+            &rows,
+            None,
+            basis(rows.len(), BasisReason::RowLimit),
+            Some("en"),
+        );
+        assert_eq!(
+            p.observed_at,
+            Some(("2026-09-30".into(), "2026-10-12".into()))
+        );
+        // the English name, from the language map
+        assert_eq!(
+            p.samples.first().and_then(|s| s.name.as_deref()),
+            Some("Place 0")
+        );
+
+        let json = p.to_json();
+        assert_eq!(at(&json, "/basis/reason"), &json!("RowLimit"));
+        assert_eq!(at(&json, "/count"), &Value::Null);
+        assert_eq!(at(&json, "/observedAt/min"), &json!("2026-09-30"));
+        let kinds: Vec<(&str, &Value)> = [
+            "level", "open", "built", "kind", "area", "owner", "address", "note",
+        ]
+        .into_iter()
+        .map(|a| (a, at(&json, &format!("/attributes/{a}/kind"))))
+        .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("level", &json!("number")),
+                ("open", &json!("boolean")),
+                ("built", &json!("dateTime")),
+                ("kind", &json!("category")),
+                ("area", &json!("geo")),
+                ("owner", &json!("relationship")),
+                ("address", &json!("structured")),
+                ("note", &json!("text")),
+            ]
+        );
+        let level = at(&json, "/attributes/level");
+        assert_eq!(
+            (
+                at(level, "/n"),
+                at(level, "/nulls"),
+                at(level, "/outliers"),
+                at(level, "/unitCode"),
+                at(level, "/top3")
+            ),
+            (&json!(11), &json!(1), &json!(2), &Value::Null, &Value::Null)
+        );
+        assert_eq!(at(&json, "/attributes/open/n"), &json!(12));
+        assert_eq!(at(&json, "/attributes/built/min"), &json!("1950-05-01"));
+        assert_eq!(
+            (
+                at(&json, "/attributes/kind/distinct"),
+                at(&json, "/attributes/kind/other")
+            ),
+            (&json!(6), &json!(2))
+        );
+        assert_eq!(
+            at(&json, "/attributes/area/bbox"),
+            &json!([17.0, 48.0, 28.5, 48.5])
+        );
+        assert_eq!(at(&json, "/attributes/owner/distinct"), &json!(2));
+        assert_eq!(at(&json, "/attributes/address/n"), &json!(12));
+        assert_eq!(at(&json, "/attributes/note/n"), &json!(12));
+        assert_eq!(at(&json, "/samples/0/name"), &json!("Place 0"));
+
+        let text = render(&p);
+        for part in [
+            "count=12 basis=12 of unknown (first by id)",
+            "observedAt: min=2026-09-30 max=2026-10-12",
+            "nulls=1",
+            "outliers=2",
+            "other=2",
+            "name=\"Place 0\"",
+        ] {
+            assert!(text.contains(part), "{part}: {text}");
+        }
+        assert!(!text.contains("free text"), "{text}");
+    }
+
+    #[test]
+    fn a_name_without_the_asked_language_is_its_first_and_is_cut_at_80() {
+        let rows = every_kind();
+        // `en` sorts before `sk`: the first entry of the map
+        let p = profile(&rows, Some(12), basis(12, BasisReason::All), Some("hu"));
+        assert_eq!(
+            p.samples.first().and_then(|s| s.name.as_deref()),
+            Some("Place 0")
+        );
+        let p = profile(&rows, Some(12), basis(12, BasisReason::All), None);
+        assert_eq!(
+            p.samples.first().and_then(|s| s.name.as_deref()),
+            Some("Place 0")
+        );
+        let named = |name: Value| {
+            let rows = [entity(1, vec![("name", name)])];
+            profile(&rows, Some(1), basis(1, BasisReason::All), None)
+                .samples
+                .first()
+                .and_then(|s| s.name.clone())
+        };
+        assert_eq!(
+            named(json!({"type": "Property", "value": "x".repeat(100)})).map(|n| n.chars().count()),
+            Some(80)
+        );
+        assert_eq!(named(json!({"type": "LanguageProperty"})), None);
+        assert_eq!(
+            named(json!({"type": "LanguageProperty", "languageMap": {}})),
+            None
+        );
+        assert_eq!(
+            named(json!({"type": "LanguageProperty", "languageMap": {"sk": 1}})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_sample_value_is_its_target_text_number_flag_or_json_cut_at_80() {
+        let long = "y".repeat(100);
+        let cases = [
+            (
+                json!({"type": "Relationship", "object": "urn:ngsi-ld:Org:1"}),
+                "urn:ngsi-ld:Org:1".to_owned(),
+            ),
+            (
+                json!({"type": "Relationship"}),
+                "{\"type\":\"Relationship\"}".to_owned(),
+            ),
+            (json!({"value": long}), "y".repeat(80)),
+            (json!({"value": "short"}), "short".to_owned()),
+            (json!({"value": 2.5}), "2.50".to_owned()),
+            (json!({"value": true}), "true".to_owned()),
+            (json!({"value": [1, 2]}), "{\"value\":[1,2]}".to_owned()),
+            (json!([long]), format!("[\"{}", "y".repeat(78))),
+        ];
+        for (node, want) in cases {
+            assert_eq!(format_sample_value(&node, None), want, "{node}");
+        }
+    }
+
+    #[test]
+    fn rows_that_are_no_objects_and_values_of_no_kind_are_skipped() {
+        let rows = vec![
+            json!("not an entity"),
+            entity(
+                1,
+                vec![
+                    ("a", json!({"type": "Property", "value": 1})),
+                    ("b", json!({"type": "Property", "value": "x"})),
+                ],
+            ),
+            entity(
+                2,
+                vec![
+                    ("a", json!({"type": "Property", "value": "one"})),
+                    ("b", json!({"type": "Property", "value": "y"})),
+                ],
+            ),
+            entity(3, vec![("a", json!("bare"))]),
+        ];
+        let p = profile(&rows, Some(4), basis(4, BasisReason::All), None);
+        assert_eq!(p.entity_type, "");
+        assert_eq!(p.samples.len(), 3);
+        // entity 3 has no `b`: its sample leaves it out
+        assert_eq!(p.samples.last().map(|s| s.values.len()), Some(1));
+        // a sampled attribute an entity lacks is left out of its sample
+        let few = [
+            entity(1, vec![("a", json!({"type": "Property", "value": 1}))]),
+            entity(2, vec![("a", json!({"type": "Property", "value": 2}))]),
+            entity(3, vec![("z", json!({"type": "Property", "value": "x"}))]),
+        ];
+        let lacking = profile(&few, Some(3), basis(3, BasisReason::All), None);
+        let sampled: Vec<usize> = lacking.samples.iter().map(|s| s.values.len()).collect();
+        assert_eq!(sampled, [1, 1, 0]);
+        let json = p.to_json();
+        assert_eq!(
+            (
+                at(&json, "/attributes/a/kind"),
+                at(&json, "/attributes/b/kind")
+            ),
+            (&json!("number"), &json!("text"))
+        );
+        // a geometry with too few numbers or none, a relationship without an object
+        let geo = analyze_geo(
+            "g",
+            &[
+                &json!({"type": "GeoProperty", "value": {"coordinates": [["a"], [1.0, "b"]]}}),
+                &json!({"type": "GeoProperty"}),
+            ],
+        );
+        assert_eq!(
+            geo.map(|g| attr_to_json(&g)),
+            Some(
+                json!({"kind": "geo", "n": 2, "bbox": [0.0, 0.0, 0.0, 0.0], "centroid": [0.0, 0.0]})
+            )
+        );
+        let rel = analyze_relationship("r", &[&json!({"type": "Relationship"})]);
+        assert_eq!(
+            rel.map(|r| attr_to_json(&r)),
+            Some(json!({"kind": "relationship", "n": 1, "distinct": 0, "top3": []}))
+        );
+        let text = AttrStat::Text {
+            name: "t".into(),
+            n: 1,
+            share_present: 1.0,
+        };
+        assert_eq!(number_to_json(&text), Value::Null);
+        assert_eq!(render_number_stat(&text), "");
+    }
+
+    #[test]
+    fn a_kind_needs_half_of_the_values() {
+        let v = |x: Value| json!({"type": "Property", "value": x});
+        let half = |a: Value, b: Value, c: Value| [v(a), v(b), v(c), v(json!("z"))];
+        let kind_of = |values: &[Value]| {
+            let refs: Vec<&Value> = values.iter().collect();
+            at(
+                &attr_to_json(&analyze_attribute("a", &refs, values.len(), None)),
+                "/kind",
+            )
+            .clone()
+        };
+        // one number, one flag, one date in four: none of those kinds
+        assert_eq!(
+            kind_of(&half(json!(1), json!("p"), json!("q"))),
+            json!("text")
+        );
+        assert_eq!(
+            kind_of(&half(json!(true), json!("p"), json!("q"))),
+            json!("text")
+        );
+        assert_eq!(
+            kind_of(&half(json!("2026-01-01"), json!("p"), json!("q"))),
+            json!("text")
+        );
+        // a date object without its value, a bare value: no date
+        let odd = [
+            json!({"type": "Property", "value": {"@type": "DateTime"}}),
+            json!("bare"),
+        ];
+        assert_eq!(kind_of(&odd), json!("structured"));
+        // one string in four is no category either
+        assert_eq!(
+            kind_of(&[v(json!("p")), v(json!([1])), v(json!([2])), v(json!([3]))]),
+            json!("structured")
+        );
+        // more than 20 kinds is text, however often each recurs
+        let many: Vec<Value> = (0..44).map(|i| v(json!(format!("k{}", i % 22)))).collect();
+        assert_eq!(kind_of(&many), json!("text"));
+        // an integer past i64 still counts, it just has no top value
+        let huge = [v(json!(1e20)), v(json!(1e20))];
+        let refs: Vec<&Value> = huge.iter().collect();
+        let stat = attr_to_json(&analyze_attribute("a", &refs, 2, None));
+        assert_eq!(at(&stat, "/top3"), &json!([]));
+    }
+
+    #[test]
+    fn one_value_has_no_spread_and_one_bucket() {
+        let rows = vec![entity(
+            1,
+            vec![(
+                "a",
+                json!({"type": "Property", "value": 7, "unitCode": "MTR"}),
+            )],
+        )];
+        let p = profile(&rows, Some(1), basis(1, BasisReason::All), None);
+        let a = at(&p.to_json(), "/attributes/a").clone();
+        assert_eq!(
+            (
+                at(&a, "/stddev"),
+                at(&a, "/hist"),
+                at(&a, "/top3"),
+                at(&a, "/unitCode")
+            ),
+            (
+                &json!(0.0),
+                &json!([{"start": 7.0, "end": 7.0, "count": 1}]),
+                &json!([{"value": 7, "count": 1}]),
+                &json!("MTR")
+            )
+        );
+        assert!(percentile(&[], 0.5).abs() < f64::EPSILON);
+        assert!((percentile(&[1.0, 3.0], 1.0) - 3.0).abs() < f64::EPSILON);
+        assert!((percentile(&[1.0, 3.0], 0.5) - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_number_reads_with_three_significant_figures() {
+        let cases = [
+            (f64::NAN, "0"),
+            (f64::INFINITY, "0"),
+            (12.0, "12"),
+            (123.4, "123"),
+            (12.34, "12.3"),
+            (1.234, "1.23"),
+            (0.1234, "0.123"),
+            (0.01234, "0.0123"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(fmt_num(v), want, "{v}");
+        }
+    }
+
+    #[test]
+    fn the_basis_says_why_loading_stopped() {
+        let mut b = Basis {
+            loaded: 3,
+            total: Some(9),
+            reason: BasisReason::All,
+            skipped: 2,
+        };
+        let says = |b: &Basis| (render_basis(b), b.reason.as_str());
+        assert_eq!(says(&b), ("3 of 9 (all), 2 skipped (>1MiB)".into(), "All"));
+        b.reason = BasisReason::MemoryLimit;
+        assert_eq!(
+            says(&b),
+            (
+                "3 of 9 (stopped by memory limit), 2 skipped (>1MiB)".into(),
+                "MemoryLimit"
+            )
+        );
+        b.reason = BasisReason::Busy;
+        assert_eq!(
+            says(&b),
+            ("3 of 9 (server busy), 2 skipped (>1MiB)".into(), "Busy")
+        );
+        b.reason = BasisReason::Tight;
+        assert_eq!(
+            says(&b),
+            ("summary unavailable now, server busy".into(), "Tight")
+        );
+    }
+
+    #[test]
+    fn a_tight_server_answers_the_count_alone() {
+        let rows = every_kind();
+        let p = profile(&rows, Some(12), basis(0, BasisReason::Tight), None);
+        assert_eq!(p.attributes, Vec::new());
+        let json = p.to_json();
+        assert_eq!(
+            at(&json, "/unavailable"),
+            &json!("summary unavailable now, server busy")
+        );
+        assert_eq!(at(&json, "/attributes"), &Value::Null);
+        let text = render(&p);
+        assert!(
+            text.contains("count=12 basis=summary unavailable now"),
+            "{text}"
+        );
+        assert_eq!(text.lines().count(), 1, "{text}");
+        // no count from the broker: the loaded rows count
+        let p = profile(&[], None, basis(0, BasisReason::Tight), None);
+        assert!(render(&p).contains("count=0"));
+    }
+
+    #[test]
+    fn a_profile_without_samples_renders_none() {
+        let rows = every_kind();
+        let mut p = profile(&rows, Some(12), basis(12, BasisReason::All), None);
+        p.samples.clear();
+        assert!(!render(&p).contains("sampleEntities"));
+    }
+
+    #[test]
+    fn an_answer_past_6000_characters_drops_samples_then_statistics_then_lines() {
+        let wide = |name_len: usize, attrs: usize| -> Vec<Value> {
+            let names: Vec<String> = (0..attrs)
+                .map(|a| format!("{a:02}{}", "n".repeat(name_len)))
+                .collect();
+            (0..5)
+                .map(|i| {
+                    entity(
+                        i,
+                        names
+                            .iter()
+                            .map(|n| {
+                                (
+                                    n.as_str(),
+                                    json!({"type": "Property", "value": "v".repeat(70)}),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect()
+        };
+        let shape = |name_len: usize, attrs: usize| {
+            let rows = wide(name_len, attrs);
+            let text = render(&profile(&rows, Some(5), basis(5, BasisReason::All), None));
+            (
+                text.len() <= 6000,
+                text.contains("sampleEntities"),
+                text.contains("otherAttributes: "),
+                text.lines().count(),
+            )
+        };
+        // samples alone overflow: they go, every statistic stays
+        assert_eq!(shape(300, 5), (true, false, false, 6));
+        // the statistics overflow too: the last ones are only named
+        let (fits, _, named, _) = shape(450, 12);
+        assert_eq!((fits, named), (true, true));
+        // even the names overflow: whole lines are cut
+        assert_eq!(shape(1000, 12), (true, false, false, 1));
     }
 }

@@ -79,6 +79,7 @@ dependencies = [
  "antares-ops",
  "axum",
  "chrono",
+ "metrics",
  "rmcp",
  "serde_json",
  "tokio",
