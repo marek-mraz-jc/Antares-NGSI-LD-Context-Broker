@@ -100,8 +100,10 @@ env:
   # conformance main since its merge of T-3512 (T-4003); plus the broker parity
   # cases for T-4258's format/sysAttrs/orderBy, one commit on top (branch
   # pin/antares-surfaces, same change as conformance main 494cd93), and the
-  # describe_type parity case (T-4537, T-4559; conformance main 2594d95)
-  CONFORMANCE_REF: 78d0e18aca152f8fbee221ced7579c8e32ac5dcc
+  # describe_type parity case (T-4537, T-4559; conformance main 2594d95). Now conformance main
+  # 81e6396, which holds both of those and the summarize row the gateway's readOnly summarize
+  # tool needs (T-4680; train 0716-1 red on test_the_matrix_is_covered without it).
+  CONFORMANCE_REF: 81e63965a1238c8e159bc594af94104257853bde
   NIGHTLY: ${{ github.event_name != 'pull_request' && !inputs.fast }}
 
 jobs:
