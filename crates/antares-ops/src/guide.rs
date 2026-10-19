@@ -122,12 +122,31 @@ pub const GUIDES: &[Guide] = &[
         filters: &["intensity", "averageVehicleSpeed", "congested"],
     },
     Guide {
+        entity_type: "Article",
+        time: &[Time::Instant("dateGmt")],
+        place: &[],
+        filters: &["name", "isPartOf"],
+    },
+    Guide {
         entity_type: "PointOfInterest",
         time: &[],
         place: &["location", "address"],
         filters: &["category", "name"],
     },
 ];
+
+/// The long text attributes of a type (T-4582): a read leaves them out unless the caller names
+/// them, so a page of 50 Articles is headlines, not 240 KB of bodies.
+const LONG_TEXT: &[(&str, &[&str])] = &[("Article", &["content"])];
+
+/// The long text attributes of `entity_type`; empty for a type without one.
+#[must_use]
+pub fn long_text(entity_type: &str) -> &'static [&'static str] {
+    LONG_TEXT
+        .iter()
+        .find(|(t, _)| *t == entity_type)
+        .map_or(&[], |(_, attrs)| *attrs)
+}
 
 impl Guide {
     /// The first time axis whose attributes all pass `shows`.
@@ -162,5 +181,12 @@ mod tests {
         );
         assert_eq!(event.and_then(|g| g.time_in(|_| false)), None);
         assert!(of("Thing").is_none());
+    }
+
+    #[test]
+    fn an_article_body_is_long_text_and_other_types_have_none() {
+        assert_eq!(long_text("Article"), ["content"]);
+        assert_eq!(long_text("Event"), [] as [&str; 0]);
+        assert_eq!(long_text("Thing"), [] as [&str; 0]);
     }
 }

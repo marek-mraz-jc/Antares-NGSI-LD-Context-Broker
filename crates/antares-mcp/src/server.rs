@@ -395,10 +395,17 @@ impl Server {
         tool: &'static ToolDef,
         given: &serde_json::Map<String, Value>,
     ) -> CallToolResult {
-        let mut args = match schema::check_all(tool.args, given, &self.names()) {
+        let names = self.names();
+        let mut args = match schema::check_all(tool.args, given, &names) {
             Ok(args) => args,
             Err(why) => return refused(&why),
         };
+        if matches!(
+            tool.op,
+            OperationId::QueryEntities | OperationId::RetrieveEntity
+        ) {
+            crate::guide::lean(&mut args, &names);
+        }
         let cursor = args.remove("cursor");
         let digest = cursor::digest(tool.name, &args);
         let offset = match cursor {
