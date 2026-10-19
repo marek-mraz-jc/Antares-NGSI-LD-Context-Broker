@@ -29,7 +29,7 @@ Every optional capability is one cargo feature plus a registration in
 | `antares-broker` | `mqtt` | on | forwards `antares-api/mqtt`; off, MQTT endpoints fail at subscription creation. Measured on one release build: 27.2 → 26.0 MB binary, 58.1 → 55.4 MiB idle RSS |
 | `antares-broker` | `plugin-example` | off | the reference plugin (`examples/plugin-example`): one more backend, surface, notification binding, policy engine and façade route, all from outside `crates/`. Never in a shipped build |
 | `antares-broker` | `jc-policy` | off | the joinedcontext platform's policy engine (`addons/joinedcontext-policy`, `ANTARES_POLICY=joinedcontext`): the Tenant's Policy rules from `/q/policy/{tenant}`, decided on the gateway's `x-jc-*` headers. Built only into the platform image |
-| `antares-broker` | `full` | off | every surface in one binary: `views`, `mcp`, `odata`, `ws` (ADR-0027). The vanilla image never sets it; `image-jc.yml` builds `full,jc-policy` as `antares-broker-jc` |
+| `antares-broker` | `full` | off | every surface in one binary: `views`, `mcp`, `odata`, `ws` (ADR-0027). The vanilla image never sets it; `ship.yml` builds and publishes `full,jc-policy` as `antares-broker-jc` on every dev push (`image-jc.yml` proves it against ETSI nightly) |
 
 The browser artifact (`antares-wasm`) is the one build with `postgres`
 off: it drives the same router over the memory store and the OPFS shadow.

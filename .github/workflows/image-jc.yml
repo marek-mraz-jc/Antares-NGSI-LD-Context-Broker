@@ -8,18 +8,20 @@ name: image-jc
 # proves what it carries (its auditable dependency list holds every surface
 # and the engine) and that it is still the broker: its plain root on
 # `ANTARES_POLICY=allow-all` passes every TP of dev/etsi-baseline.json,
-# TP by TP, like a vanilla cell. Only then is it pushed, signed by digest
-# and given its own SBOM.
+# TP by TP, like a vanilla cell. ship.yml pushes, signs and attests the
+# image; this workflow is its nightly ETSI proof.
+#
+# T-4721 (owner order 2026-10-19): ship.yml builds, checks and publishes the
+# jc image on every dev push in minutes. This workflow keeps the long ETSI
+# proof of the same image, nightly and on dispatch, and publishes nothing, so
+# one workflow alone publishes `antares-broker-jc`. It used to run on:
+#   push:
+#     branches: [dev]
+#     paths: [crates/**, addons/**, Cargo.toml, Cargo.lock, Dockerfile, .github/workflows/image-jc.yml]
+# with a publish job behind the ETSI one.
 on:
-  push:
-    branches: [dev]
-    paths:
-      - "crates/**"
-      - "addons/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "Dockerfile"
-      - ".github/workflows/image-jc.yml"
+  schedule:
+    - cron: "7 2 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -120,37 +122,3 @@ jobs:
             cells/ETSI-cell-file/tp-status.csv
             cells/ETSI-cell-file/**/log.html
           retention-days: 30
-
-  publish:
-    name: Push, sign and attest the jc image
-    needs: etsi
-    if: github.ref == 'refs/heads/dev'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      packages: write
-      id-token: write # cosign keyless
-    steps:
-      - uses: actions/download-artifact@v7
-        with:
-          name: antares-image-jc
-      - uses: sigstore/cosign-installer@v3
-      - name: Push the tested bytes, sign and attest by digest
-        env:
-          # through the environment, never spliced into the script text
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          docker load < antares-image.tgz
-          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          IMG=ghcr.io/${{ github.repository_owner }}/antares-broker-jc
-          SHA=${GITHUB_SHA::7}
-          docker tag antares-local:latest "$IMG:$SHA"
-          docker tag antares-local:latest "$IMG:dev"
-          docker push -q "$IMG:$SHA"
-          docker push -q "$IMG:dev"
-          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMG:$SHA")
-          case "$DIGEST" in "$IMG@sha256:"*) ;; *) echo "no digest for $IMG:$SHA: $DIGEST"; exit 1 ;; esac
-          cosign sign --yes "$DIGEST"
-          cosign attest --yes --type spdxjson --predicate antares-broker-jc.sbom.spdx.json "$DIGEST"
-          echo "## Published \`$DIGEST\` (tags \`$SHA\`, \`dev\`; features \`$FEATURES\`; signed, SPDX attested)" >> "$GITHUB_STEP_SUMMARY"
