@@ -902,9 +902,15 @@ impl PgEntityStore {
         Ok(rows.into_iter().map(|r| r.get::<Value, _>(0)).collect())
     }
 
-    /// Read-modify-write: row lock via `SELECT … FOR UPDATE`, closure
+    /// Read-modify-write: row lock via `SELECT … FOR NO KEY UPDATE`, closure
     /// applied in Rust, `version` bumped under the lock. Two racing PATCHes
     /// serialize in Postgres, neither is lost. `Ok(None)` = entity absent.
+    ///
+    /// No write changes the key (tenant_id, id), so the lock is the one the
+    /// UPDATE itself takes: it serializes writers and leaves the history
+    /// append's `FOR KEY SHARE` alone (T-4669: a `FOR UPDATE` here waited on
+    /// every in-flight append and made the append wait on it in turn, until
+    /// `lock_timeout` dropped the history of a whole drained request).
     pub async fn mutate<T, E>(
         &self,
         tenant: &TenantId,
@@ -917,7 +923,7 @@ impl PgEntityStore {
         // the same answer the retrieve it would follow already gives.
         let row = sqlx::query(
             "SELECT entity FROM entities WHERE tenant_id = $1 AND id = $2
-               AND (expires_at IS NULL OR expires_at > now()) FOR UPDATE",
+               AND (expires_at IS NULL OR expires_at > now()) FOR NO KEY UPDATE",
         )
         .bind(tenant.as_str())
         .bind(id)
@@ -1126,9 +1132,10 @@ impl PgEntityStore {
     /// `INSERT … ON CONFLICT DO UPDATE` for the whole batch, one transaction.
     /// Returns a created-flag per input item (input order; duplicates of one
     /// id report the first outcome). Before-images for the change events are
-    /// captured by a single `FOR UPDATE` select in the same transaction.
-    /// Returns per input item: (created?, before-image) — the before-image is
-    /// for the caller's change hook and comes from the same-tx FOR UPDATE.
+    /// captured by a single `FOR NO KEY UPDATE` select in the same
+    /// transaction (see [`Self::mutate`]). Returns per input item: (created?,
+    /// before-image) — the before-image is for the caller's change hook and
+    /// comes from the same-tx lock.
     ///
     /// 5.6.8.4: "Create the Entity locally if it does not exist (i.e. no
     /// Entity with the same Entity ID is present) executing the behaviour
@@ -1163,7 +1170,7 @@ impl PgEntityStore {
             "SELECT id, entity,
                     (expires_at IS NOT NULL AND expires_at <= now()) AS expired
              FROM entities WHERE tenant_id = $1 AND id = ANY($2)
-             ORDER BY id FOR UPDATE",
+             ORDER BY id FOR NO KEY UPDATE",
         )
         .bind(tenant.as_str())
         .bind(&ids)
@@ -1253,7 +1260,8 @@ impl PgEntityStore {
     }
 
     /// Batch read-modify-write — ONE transaction,
-    /// all rows locked in a single ordered `FOR UPDATE` select, the closure
+    /// all rows locked in a single ordered `FOR NO KEY UPDATE` select (see
+    /// [`Self::mutate`]), the closure
     /// applied per doc in Rust, and ONE multi-row UPDATE writeback. Per-item
     /// results align with `ids`: `None` = absent, `Some(Err)` = the closure
     /// rejected that item (its write is skipped, the rest proceed).
@@ -1275,7 +1283,7 @@ impl PgEntityStore {
             "SELECT id, entity FROM entities
           WHERE tenant_id = $1 AND id = ANY($2)
             AND (expires_at IS NULL OR expires_at > now())
-         ORDER BY id FOR UPDATE",
+         ORDER BY id FOR NO KEY UPDATE",
         )
         .bind(tenant.as_str())
         .bind(ids)
