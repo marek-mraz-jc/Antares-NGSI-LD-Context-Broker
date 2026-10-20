@@ -17,7 +17,9 @@
 
 use antares_ql::geo::{GeoSpec, Rel};
 use antares_ql::parse_q;
-use antares_sql::compile::{geo::compile_geo, q::compile_q, scope::compile_scope_q};
+use antares_sql::compile::{
+    geo::compile_geo, q::compile_q, qprefilter::compile_prefilter, scope::compile_scope_q,
+};
 use proptest::prelude::*;
 use serde_json::json;
 
@@ -161,6 +163,39 @@ proptest! {
                 prop_assert!(c.geo_binds.iter().any(|b| b.contains("coordinates")));
             }
         }
+    }
+}
+
+proptest! {
+    /// The temporal store's `q` prefilter (store/pg/temporal.rs) spells its
+    /// own attribute keys into the statement; a payload in a string value or
+    /// a bracketed member name reaches only the binds (T-4778).
+    #[test]
+    fn temporal_prefilter_carries_request_text_only_in_binds(p in payload()) {
+        let member = p.replace(['[', ']', '"', ';', '|', ',', '(', ')', '.', '=', '!', '<', '>', '~'], "x");
+        for q in [format!("name==\"{p}\""), format!("name[{member}]==\"x\""), format!("name[{member}]")] {
+            let Ok(ast) = parse_q(&q) else { continue };
+            if let Some(c) = compile_prefilter(&ast, None, "m", 1, &expand) {
+                for leak in ["inj7q", "DROP", "pg_sleep", "--", "/*", ";", "\\", "\u{2019}", "\u{FF07}"] {
+                    prop_assert!(!c.sql.contains(leak), "q={q:?} wrote {leak:?} into {}", c.sql);
+                }
+                if p.contains("inj7q") {
+                    prop_assert!(c.binds.iter().any(|b| b.contains("inj7q")), "q={q:?} binds {:?}", c.binds);
+                }
+            }
+        }
+    }
+}
+
+/// The property above is not vacuous: a member name and a value both
+/// compile, and land in the binds.
+#[test]
+fn the_temporal_prefilter_binds_member_and_value() {
+    for q in ["name[inj7q]==\"x\"", "name==\"inj7q\""] {
+        let ast = parse_q(q).expect("parses");
+        let c = compile_prefilter(&ast, None, "m", 1, &expand).expect("compiles");
+        assert!(!c.sql.contains("inj7q"), "{}", c.sql);
+        assert!(c.binds.iter().any(|b| b.contains("inj7q")), "{:?}", c.binds);
     }
 }
 
