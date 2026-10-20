@@ -34,7 +34,9 @@ here).
 | `ANTARES_TEMPORAL_RETENTION_DAYS` | unset (keep forever) | Temporal history retention; the sweep job prunes older attribute instances. Applies to the temporal half wherever it lives: a `file` store with `postgres` history still runs the job. |
 | `ANTARES_TEMPORAL_DEDUP` | `on` | `off` records a history row for every admitted write; on, the Postgres stores record a new observation only (Storage, "What enters history"). |
 | `ANTARES_TEMPORAL_INSTANCE_LIMIT` | `1000` | Most instances of one Attribute a temporal response serves before it answers 206 with a Content-Range (6.3.10): a week of a 10-minute sensor. The ETSI suite's brokers set `9`, since its 206 cases create 20 instances. The MCP tools advertise it as their `lastN` maximum. |
-| `ANTARES_MAX_LIMIT` | `1000` | Most Entities one query page answers (`limit`; past it 403 TooManyResults), and the default page size. The MCP tools advertise it as their `limit` maximum. |
+| `ANTARES_MAX_LIMIT` | `1000` | Most Entities one query page answers (`limit`; past it 403 TooManyResults). The MCP tools advertise it as their `limit` maximum. |
+| `ANTARES_DEFAULT_LIMIT` | `100` | Entities a query page answers when the request names no `limit`; a `Link: rel="next"` names the next page. Never above `ANTARES_MAX_LIMIT`. The MCP tools advertise it as their `limit` default. |
+| `ANTARES_TEMPORAL_DEFAULT_INSTANCES` | `100` | Instances of one Attribute a temporal response serves when the request names no `lastN`/`firstN`; past it the answer is 206 with a Content-Range, as at the ceiling. Never above `ANTARES_TEMPORAL_INSTANCE_LIMIT` (the ETSI brokers at `9` stay at 9). The MCP tools advertise it as their `lastN` default. |
 | `ANTARES_SWEEP_SECS` | `900` | Cadence of the background GC sweep (expired entities/registrations, 4.22) — identical across store modes. |
 
 ## NATS scale-out

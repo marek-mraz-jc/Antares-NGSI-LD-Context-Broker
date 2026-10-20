@@ -203,6 +203,9 @@ pub struct Shared {
     /// serves ([`crate::bounds::temporal_instance_limit`]); the ETSI suite's
     /// brokers and its unit cases run with 9.
     pub temporal_instance_limit: usize,
+    /// The instances of one Attribute served when no lastN/firstN is asked
+    /// ([`crate::bounds::temporal_default_instances`]), at most the ceiling.
+    pub temporal_default_instances: usize,
     /// The most bytes of one in-process answer a handler buffers
     /// ([`crate::bounds::MAX_ANSWER_BYTES`]).
     pub max_answer_bytes: usize,
@@ -574,9 +577,10 @@ impl AppState {
                 started: Instant::now(),
                 started_at: now_iso(),
                 host_alias,
-                default_limit: *crate::bounds::MAX_LIMIT,
+                default_limit: *crate::bounds::DEFAULT_LIMIT,
                 max_limit: *crate::bounds::MAX_LIMIT,
                 temporal_instance_limit: crate::bounds::temporal_instance_limit(),
+                temporal_default_instances: crate::bounds::temporal_default_instances(),
                 max_answer_bytes: crate::bounds::MAX_ANSWER_BYTES,
                 http: http.clone(),
                 fed_http: outbound_client(

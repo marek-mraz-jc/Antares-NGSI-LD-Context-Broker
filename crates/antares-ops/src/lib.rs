@@ -83,8 +83,9 @@ pub use antares_model::{NgsiError, TenantId};
 /// WebSocket message never passes the HTTP bounds layer).
 pub mod bounds {
     pub use antares_api::bounds::{
-        json_depth, temporal_instance_limit, ANSWER_TOO_LARGE, MAX_ANSWER_BYTES, MAX_BATCH_ITEMS,
-        MAX_BODY_BYTES, MAX_JSON_DEPTH, MAX_LIMIT,
+        json_depth, temporal_default_instances, temporal_instance_limit, ANSWER_TOO_LARGE,
+        DEFAULT_LIMIT, MAX_ANSWER_BYTES, MAX_BATCH_ITEMS, MAX_BODY_BYTES, MAX_JSON_DEPTH,
+        MAX_LIMIT,
     };
 }
 

@@ -50,6 +50,10 @@ const KNOWN_KEYS: &[&str] = &[
     // the Entities of one query page (default 1000). T-4800.
     "ANTARES_TEMPORAL_INSTANCE_LIMIT",
     "ANTARES_MAX_LIMIT",
+    // The defaults when a request names no lastN / limit (100 each, never
+    // above the ceilings above). T-4804.
+    "ANTARES_TEMPORAL_DEFAULT_INSTANCES",
+    "ANTARES_DEFAULT_LIMIT",
     "ANTARES_DATA_DIR",
     // Egress: private-range destinations are ALLOWED by default (ADR-0010 —
     // brokers federate inside private networks); a hardened deployment sets

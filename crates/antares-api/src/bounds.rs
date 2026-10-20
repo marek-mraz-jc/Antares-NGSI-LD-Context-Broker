@@ -56,15 +56,27 @@ pub static MAX_BATCH_ITEMS: std::sync::LazyLock<usize> = std::sync::LazyLock::ne
         .unwrap_or(1_000)
 });
 /// Deployment knob (ANTARES_MAX_LIMIT): the most Entities one query page
-/// answers (`limit`, 6.3.9; past it 403 TooManyResults) and the default page
-/// size. 1,000 unless set; read once at first use, and advertised by the MCP
-/// tools as their `limit` maximum (T-4800).
+/// answers (`limit`, 6.3.9; past it 403 TooManyResults). 1,000 unless set;
+/// read once at first use, and advertised by the MCP tools as their `limit`
+/// maximum (T-4800).
 pub static MAX_LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
     std::env::var("ANTARES_MAX_LIMIT")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
         .unwrap_or(1_000)
+});
+/// Deployment knob (ANTARES_DEFAULT_LIMIT): the Entities a query page answers
+/// when the request names no `limit` (6.3.9 leaves it to the broker); the
+/// next page is Linked. 100 unless set, never above [`MAX_LIMIT`] (owner,
+/// T-4804); advertised by the MCP tools as their `limit` default.
+pub static DEFAULT_LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("ANTARES_DEFAULT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(100)
+        .min(*MAX_LIMIT)
 });
 /// Deployment knob (ANTARES_TEMPORAL_INSTANCE_LIMIT): NGSI-LD 6.3.10, the
 /// most instances of one Attribute a temporal response serves; past it the
@@ -86,6 +98,27 @@ pub static TEMPORAL_INSTANCE_LIMIT: std::sync::LazyLock<usize> = std::sync::Lazy
 /// [`TEMPORAL_INSTANCE_LIMIT`].
 pub fn temporal_instance_limit() -> usize {
     *TEMPORAL_INSTANCE_LIMIT
+}
+
+/// Deployment knob (ANTARES_TEMPORAL_DEFAULT_INSTANCES): the instances of one
+/// Attribute a temporal response serves when the request names no
+/// lastN/firstN; past it the answer is cut and 206 like the ceiling's.
+/// 100 unless set, never above [`temporal_instance_limit`], so the ETSI
+/// brokers (ceiling 9) keep 9 (owner, T-4804). Read once at first use into
+/// `AppState::temporal_default_instances`.
+pub static TEMPORAL_DEFAULT_INSTANCES: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("ANTARES_TEMPORAL_DEFAULT_INSTANCES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(100)
+            .min(temporal_instance_limit())
+    });
+
+/// [`TEMPORAL_DEFAULT_INSTANCES`].
+pub fn temporal_default_instances() -> usize {
+    *TEMPORAL_DEFAULT_INSTANCES
 }
 // Deployment knob (ANTARES_MAX_FED_RESPONSE_BYTES): ceiling on one forwarded
 // (4.3.6) response body. The spec sets no ceiling; an over-cap peer part
@@ -394,7 +427,9 @@ impl LimitStats {
             "maxGeoVertices": MAX_GEO_VERTICES,
             "maxBatchItems": *MAX_BATCH_ITEMS,
             "maxLimit": *MAX_LIMIT,
+            "defaultLimit": *DEFAULT_LIMIT,
             "temporalInstanceLimit": temporal_instance_limit(),
+            "temporalDefaultInstances": temporal_default_instances(),
             "maxAnswerBytes": MAX_ANSWER_BYTES,
             "maxFoldDocs": *MAX_FOLD_DOCS,
             "maxFedResponseBytes": *MAX_FED_RESPONSE_BYTES,
@@ -650,6 +685,7 @@ mod tests {
                 "batchInflight",
                 "batchInflightBytes",
                 "changeQueue",
+                "defaultLimit",
                 "deliveryLane",
                 "deliveryLaneBytes",
                 "deliveryWidth",
@@ -678,6 +714,7 @@ mod tests {
                 "rejectedBodyTooDeep",
                 "rejectedBodyTooLarge",
                 "rejectedUriTooLong",
+                "temporalDefaultInstances",
                 "temporalInstanceLimit",
             ],
             "no member beyond the caps, the pipeline ceilings and the counters"

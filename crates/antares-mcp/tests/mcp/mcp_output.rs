@@ -339,8 +339,8 @@ async fn a_unit_code_is_read_back_with_its_label() -> Result<(), String> {
     Ok(())
 }
 
-/// T-4800: a history the broker cut at its instance ceiling (1,000: 206 +
-/// Content-Range) carries `more` with the window that continues it, and a
+/// T-4800, T-4804: a history the broker cut (no lastN: at its default of
+/// 100, 206 + Content-Range) carries `more` with the window that continues it, and a
 /// `lastN` page with older instances says how to go on.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cut_history_names_the_window_that_continues_it() -> Result<(), String> {
@@ -375,7 +375,7 @@ async fn a_cut_history_names_the_window_that_continues_it() -> Result<(), String
     let more = a.structured().get("more").cloned().unwrap_or_default();
     assert_eq!(
         more.get("next"),
-        Some(&json!({"timerel": "after", "timeAt": at(999)}))
+        Some(&json!({"timerel": "after", "timeAt": at(99)}))
     );
 
     let mut last = after;

@@ -938,17 +938,18 @@ impl InstancePage {
     }
 
     /// The most instances of one Attribute a page holds: N, or the broker's
-    /// ceiling when N is above it or absent (6.4.7.3 "whichever is smaller").
-    fn size(&self, limit: usize) -> usize {
-        self.n.map_or(limit, |n| n.min(limit))
+    /// ceiling when N is above it (6.4.7.3 "whichever is smaller"); with no
+    /// N, the broker's default, at most the ceiling (T-4804).
+    fn size(&self, default: usize, limit: usize) -> usize {
+        self.n.map_or(default.min(limit), |n| n.min(limit))
     }
 
     /// How far one page moves offsetN: its size, or N itself for an
     /// aggregated representation, which the ceiling never cuts.
-    fn step(&self, aggregated: bool, limit: usize) -> usize {
+    fn step(&self, aggregated: bool, default: usize, limit: usize) -> usize {
         match (aggregated, self.n) {
             (true, Some(n)) => n,
-            _ => self.size(limit),
+            _ => self.size(default, limit),
         }
     }
 
@@ -2758,7 +2759,12 @@ pub(crate) async fn query_temporal_collected(
             crate::history::held_attrs(st, &tenant, d),
         );
         if !trepr.aggregated {
-            truncate(&mut w, &timeprop, page_n.desc, st.temporal_instance_limit);
+            truncate(
+                &mut w,
+                &timeprop,
+                page_n.desc,
+                page_n.size(st.temporal_default_instances, st.temporal_instance_limit),
+            );
         }
         g_trunc |= w.truncated;
         g_more |= w.more;
@@ -2831,7 +2837,11 @@ pub(crate) async fn query_temporal_collected(
             accept,
             page_n,
             g_more,
-            page_n.step(trepr.aggregated, st.temporal_instance_limit),
+            page_n.step(
+                trepr.aggregated,
+                st.temporal_default_instances,
+                st.temporal_instance_limit,
+            ),
             g_cut.zip(g_bound.as_deref()),
         ),
     );
@@ -3081,7 +3091,12 @@ async fn retrieve_temporal_inner(
             crate::history::held_attrs(st, &tenant, &doc),
         );
         if !trepr.aggregated {
-            truncate(&mut w, &timeprop, page_n.desc, st.temporal_instance_limit);
+            truncate(
+                &mut w,
+                &timeprop,
+                page_n.desc,
+                page_n.size(st.temporal_default_instances, st.temporal_instance_limit),
+            );
             // after the cut: lastN counts measurements, never versions (DM-119)
             if versions {
                 with_versions(&mut w, &st.temporal.versions(&tenant, id).await?);
@@ -3125,7 +3140,11 @@ async fn retrieve_temporal_inner(
                 accept,
                 page_n,
                 w.more,
-                page_n.step(trepr.aggregated, st.temporal_instance_limit),
+                page_n.step(
+                    trepr.aggregated,
+                    st.temporal_default_instances,
+                    st.temporal_instance_limit,
+                ),
                 w.cut_served.zip(cut_boundary(&w, page_n.desc)),
             ),
         );
@@ -4309,6 +4328,63 @@ mod clause_6_3_10 {
                 five_minute(CEILING - 1)
             ))
         );
+    }
+
+    /// T-4804 (owner: default 100, maximum 1,000): with no lastN a request
+    /// gets the broker's default of 100 instances per Attribute, cut with a
+    /// 206 range ending at the 100th; lastN=1000 gets all 1,000.
+    #[test]
+    fn no_last_n_serves_the_default_100_and_last_n_1000_serves_1000() {
+        assert_eq!(
+            crate::bounds::temporal_default_instances(),
+            100,
+            "ANTARES_TEMPORAL_DEFAULT_INSTANCES is unset in tests"
+        );
+        let served = |n: usize, last_n: Option<usize>| {
+            let speed: Vec<Value> = (0..n)
+                .map(|i| json!({"type": "Property", "value": i, "observedAt": five_minute(i)}))
+                .collect();
+            let doc = json!({"id": "urn:ngsi-ld:WeatherObserved:1", "type": "WeatherObserved", "speed": speed});
+            let q = tq("after", "2026-10-01T00:00:00Z");
+            let mut w = window(
+                &doc,
+                Some(&q),
+                page(last_n),
+                None,
+                None,
+                None,
+                "observedAt",
+                Default::default(),
+            );
+            let cut = page(last_n).size(
+                crate::bounds::temporal_default_instances(),
+                crate::bounds::temporal_instance_limit(),
+            );
+            truncate(&mut w, "observedAt", last_n.is_some(), cut);
+            (w, q)
+        };
+        let (w, q) = served(101, None);
+        assert!(w.truncated && w.more);
+        assert_eq!(w.attrs["speed"].len(), 100);
+        assert_eq!(
+            content_range(
+                w.truncated,
+                w.ts_min.as_deref(),
+                w.ts_max.as_deref(),
+                Some(&q),
+                page(None)
+            ),
+            Some(format!(
+                "date-time 2026-10-01T00:00:00Z-{}/*",
+                five_minute(99)
+            ))
+        );
+        let (w, _) = served(1000, Some(1000));
+        assert!(!w.truncated);
+        assert_eq!(w.attrs["speed"].len(), 1000);
+        // the ETSI brokers' ceiling of 9 stays below the default
+        assert_eq!(page(None).size(100, ETSI_LIMIT), ETSI_LIMIT);
+        assert_eq!(page(Some(1000)).size(100, 1000), 1000);
     }
 
     /// Two attributes, `speed` minutes 0..n and `heading` minutes 5..m.
