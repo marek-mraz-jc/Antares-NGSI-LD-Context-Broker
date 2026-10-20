@@ -512,6 +512,8 @@ fn fwd_query(params: &HashMap<String, String>, keys: &[&str]) -> Vec<(String, St
 }
 
 /// Attribute IRIs of an expanded fragment (entity meta members excluded).
+/// `expiresAt` is an Entity member a writer sets (4.22); `deletedAt` stays
+/// counted, so a view refuses a client that sends it.
 pub(crate) fn attr_iris_of(fragment: &Value) -> Vec<String> {
     fragment
         .as_object()
@@ -520,7 +522,7 @@ pub(crate) fn attr_iris_of(fragment: &Value) -> Vec<String> {
                 .filter(|k| {
                     !matches!(
                         k.as_str(),
-                        "id" | "type" | "scope" | "createdAt" | "modifiedAt"
+                        "id" | "type" | "scope" | "createdAt" | "modifiedAt" | "expiresAt"
                     )
                 })
                 .cloned()

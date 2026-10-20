@@ -1602,6 +1602,38 @@ mod tests {
         );
     }
 
+    /// `expiresAt` is an Entity member (4.22, Table 5.2.4-1), not an
+    /// Attribute: a write through a view that carries it lands, and a hidden
+    /// Attribute beside it is still refused.
+    #[tokio::test]
+    async fn an_entity_expires_at_passes_a_view() {
+        let st = seeded(None).await;
+        let view = st.with_view(Arc::new(cars()));
+        let at = "2099-01-01T00:00:00Z";
+        let batch = json!([{"id": "urn:ngsi-ld:Car:7", "type": "Car", "expiresAt": at}]);
+        let (s, body, _) = send(
+            &view,
+            "POST",
+            "/ngsi-ld/v1/entityOperations/upsert",
+            Some(batch),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{body}");
+        let car = json!({"id": "urn:ngsi-ld:Car:6", "type": "Car", "expiresAt": at});
+        let (s, body, _) = send(&view, "POST", "/ngsi-ld/v1/entities", Some(car)).await;
+        assert_eq!(s, StatusCode::CREATED, "{body}");
+        let hidden = json!([{"id": "urn:ngsi-ld:Car:5", "type": "Car", "expiresAt": at,
+            "secret": {"type": "Property", "value": 1}}]);
+        let (s, body, _) = send(
+            &view,
+            "POST",
+            "/ngsi-ld/v1/entityOperations/upsert",
+            Some(hidden),
+        )
+        .await;
+        assert_ne!(s, StatusCode::CREATED, "{body}");
+    }
+
     #[test]
     fn a_view_that_names_nothing_is_refused() {
         assert!(
