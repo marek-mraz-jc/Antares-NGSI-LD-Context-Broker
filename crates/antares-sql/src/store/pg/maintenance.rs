@@ -752,13 +752,20 @@ fn adopt_default_rows_sql(suffix: &str, lo: &str, hi: &str) -> [String; 3] {
     ]
 }
 
-/// The 4.22 expired-instance DELETE, isolated so a deadlock with concurrent
-/// ingest never poisons the main maintenance transaction. Service role: the
-/// reap is cross-tenant work (RLS would hide other tenants' rows).
+/// Entities whose stored current state one tick rewrites at most; the rest
+/// wait for the next tick, earliest expiry first.
+const PRUNE_BATCH: i64 = 1000;
+
+/// The 4.22 expired-instance reap: the current state's expired instances
+/// (pruned from `entities.entity`), then the history rows. Isolated so a
+/// deadlock with concurrent ingest never poisons the main maintenance
+/// transaction. Service role: the reap is cross-tenant work (RLS would hide
+/// other tenants' rows).
 async fn reap_expired_instances(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     crate::store::pg::set_service(&mut tx).await?;
-    let mut n = 0u64;
+    // The current state first, then the history rows, in one transaction.
+    let mut n = super::entity::prune_expired_current(&mut tx, PRUNE_BATCH).await?;
     // try_timestamptz (0001_init.sql), not a bare cast: `expiresAt` is
     // jsonb TEXT and a stamp PostgreSQL cannot parse would abort this
     // DELETE for the whole deployment, every tick, forever.

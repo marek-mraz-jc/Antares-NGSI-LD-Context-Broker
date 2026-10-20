@@ -1634,6 +1634,167 @@ mod tests {
         assert_ne!(s, StatusCode::CREATED, "{body}");
     }
 
+    /// Every write path a view checks (create, batch create/upsert/update,
+    /// update and append Attributes, merge-patch, replace) as `(method, uri,
+    /// body)`, each carrying `extra` beside a listed Attribute.
+    fn write_paths(extra: &Value) -> Vec<(&'static str, String, Value)> {
+        let with = |mut v: Value| {
+            for (k, x) in extra.as_object().expect("members") {
+                v[k] = x.clone();
+            }
+            v
+        };
+        let at = |id: &str| format!("/ngsi-ld/v1/entities/urn:ngsi-ld:Car:{id}");
+        let speed = json!({"type": "Property", "value": 3});
+        let entity = |id: &str| {
+            with(json!({"id": format!("urn:ngsi-ld:Car:{id}"), "type": "Car", "speed": speed}))
+        };
+        vec![
+            ("POST", "/ngsi-ld/v1/entities".into(), entity("20")),
+            (
+                "POST",
+                "/ngsi-ld/v1/entityOperations/create".into(),
+                json!([entity("21")]),
+            ),
+            (
+                "POST",
+                "/ngsi-ld/v1/entityOperations/upsert".into(),
+                json!([entity("22")]),
+            ),
+            (
+                "POST",
+                "/ngsi-ld/v1/entityOperations/update".into(),
+                json!([entity("0")]),
+            ),
+            (
+                "PATCH",
+                format!("{}/attrs", at("1")),
+                with(json!({"speed": speed})),
+            ),
+            (
+                "POST",
+                format!("{}/attrs", at("2")),
+                with(json!({"colour": {"type": "Property", "value": "green"}})),
+            ),
+            ("PATCH", at("3"), with(json!({"speed": speed}))),
+            ("PUT", at("4"), entity("4")),
+        ]
+    }
+
+    /// Reads one Car with its system members, outside any view.
+    async fn stored(st: &AppState, id: &str) -> Value {
+        let uri = format!("/ngsi-ld/v1/entities/urn:ngsi-ld:Car:{id}?options=sysAttrs");
+        let (s, e, _) = send(st, "GET", &uri, None).await;
+        assert_eq!(s, StatusCode::OK, "{uri}: {e}");
+        e
+    }
+
+    /// The Car ids [`write_paths`] writes, and whether that path sets an
+    /// Entity member: Update Attributes (5.6.2) changes existing Attributes
+    /// only, so its `expiresAt` is no Attribute and lands nowhere.
+    const WRITTEN: [(&str, bool); 8] = [
+        ("20", true),
+        ("21", true),
+        ("22", true),
+        ("0", true),
+        ("1", false),
+        ("2", true),
+        ("3", true),
+        ("4", true),
+    ];
+
+    /// An Entity `expiresAt` (4.22), a merge's NGSI-LD Null for it and an
+    /// Attribute's own `expiresAt` land through a view that lists only the
+    /// data Attributes, on every write path; the stored Entity carries the
+    /// member, never an Attribute of that name.
+    #[tokio::test]
+    async fn every_write_path_carries_expires_at_through_a_view() {
+        let at = "2099-01-01T00:00:00Z";
+        let past = json!({"type": "Property", "value": 1, "expiresAt": "2000-01-01T00:00:00Z"});
+        for extra in [json!({"expiresAt": at}), json!({"speed": past})] {
+            let st = seeded(None).await;
+            let view = st.with_view(Arc::new(cars()));
+            for (method, uri, body) in write_paths(&extra) {
+                let (s, out, _) = send(&view, method, &uri, Some(body)).await;
+                assert!(
+                    s.is_success() && s != StatusCode::MULTI_STATUS,
+                    "{method} {uri} {extra}: {s} {out}"
+                );
+            }
+            for (id, sets) in WRITTEN {
+                let e = stored(&st, id).await;
+                assert!(e.get(NGSI_EXPIRES).is_none(), "no Attribute expiresAt: {e}");
+                if extra.get("expiresAt").is_some() {
+                    assert_eq!(e.get("expiresAt").is_some(), sets, "{id}: {e}");
+                } else {
+                    assert!(
+                        e.get("speed").is_none(),
+                        "an expired instance reads as gone: {e}"
+                    );
+                }
+            }
+        }
+        let st = seeded(None).await;
+        let view = st.with_view(Arc::new(cars()));
+        let uri = "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:3";
+        let (s, out, _) = send(&view, "PATCH", uri, Some(json!({"expiresAt": at}))).await;
+        assert!(s.is_success(), "{out}");
+        assert_eq!(stored(&st, "3").await["expiresAt"], json!(at));
+        let (s, out, _) = send(
+            &view,
+            "PATCH",
+            uri,
+            Some(json!({"expiresAt": "urn:ngsi-ld:null"})),
+        )
+        .await;
+        assert!(s.is_success(), "merge removal: {out}");
+        let e = stored(&st, "3").await;
+        assert!(e.get("expiresAt").is_none(), "{e}");
+    }
+
+    const NGSI_EXPIRES: &str = "https://uri.etsi.org/ngsi-ld/default-context/expiresAt";
+
+    /// System members never widen a view: `expiresAt` beside an Attribute
+    /// the view does not list is refused on every write path.
+    #[tokio::test]
+    async fn a_system_member_never_lets_a_write_name_a_hidden_attribute() {
+        let hidden = json!({"expiresAt": "2099-01-01T00:00:00Z",
+            "secret": {"type": "Property", "value": 1}});
+        let st = seeded(None).await;
+        let view = st.with_view(Arc::new(cars()));
+        for (method, uri, body) in write_paths(&hidden) {
+            let (s, out, _) = send(&view, method, &uri, Some(body)).await;
+            assert!(
+                !s.is_success() || s == StatusCode::MULTI_STATUS,
+                "{method} {uri}: {s} {out}"
+            );
+            assert!(
+                out.to_string().contains(NOT_WRITABLE),
+                "{method} {uri}: {out}"
+            );
+        }
+    }
+
+    /// `deletedAt` is the broker's alone (5.2.2: a producer's copy "shall"
+    /// be ignored): a client sending it writes through a view on every path,
+    /// and nothing of it is stored.
+    #[tokio::test]
+    async fn a_client_deleted_at_is_ignored_on_every_write_path() {
+        let st = seeded(None).await;
+        let view = st.with_view(Arc::new(cars()));
+        for (method, uri, body) in write_paths(&json!({"deletedAt": "2000-01-01T00:00:00Z"})) {
+            let (s, out, _) = send(&view, method, &uri, Some(body)).await;
+            assert!(
+                s.is_success() && s != StatusCode::MULTI_STATUS,
+                "{method} {uri}: {s} {out}"
+            );
+        }
+        for (id, _) in WRITTEN {
+            let e = stored(&st, id).await;
+            assert!(!e.to_string().contains("deletedAt"), "{id}: {e}");
+        }
+    }
+
     #[test]
     fn a_view_that_names_nothing_is_refused() {
         assert!(
