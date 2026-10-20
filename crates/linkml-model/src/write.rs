@@ -238,6 +238,7 @@ pub fn yaml(model: &Model) -> String {
                             opt(&mut pv, "text", v.text.as_ref());
                             opt(&mut pv, "description", v.description.as_ref());
                             opt(&mut pv, "meaning", v.meaning.as_ref());
+                            annotations(&mut pv, &v.annotations);
                             (t.clone(), Node::Map(pv))
                         })
                         .collect();

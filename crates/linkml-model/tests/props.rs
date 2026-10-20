@@ -236,6 +236,7 @@ fn enums_of(s: &Shape, names: &[String]) -> BTreeMap<String, Enum> {
                         text: even(j).then(|| key.clone()),
                         description: d.clone(),
                         meaning: Some(format!("ex:v{j}")),
+                        annotations: Default::default(),
                     };
                     (key, v)
                 })
