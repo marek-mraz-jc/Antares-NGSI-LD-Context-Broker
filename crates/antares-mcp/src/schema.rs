@@ -197,8 +197,12 @@ fn schema_of(kind: Kind, names: &Names) -> Value {
         Kind::Text(max) => json!({"type": "string", "maxLength": max}),
         Kind::Word(words) => json!({"type": "string", "enum": words}),
         Kind::Int(min, max) => json!({"type": "integer", "minimum": min, "maximum": max}),
-        Kind::Limit => json!({"type": "integer", "minimum": 1, "maximum": limit_max()}),
-        Kind::LastN => json!({"type": "integer", "minimum": 1, "maximum": last_n_max()}),
+        Kind::Limit => json!({
+            "type": "integer", "minimum": 1, "maximum": limit_max(), "default": limit_default()
+        }),
+        Kind::LastN => json!({
+            "type": "integer", "minimum": 1, "maximum": last_n_max(), "default": last_n_default()
+        }),
         Kind::Flag => json!({"type": "boolean"}),
         Kind::Coordinates => json!({"type": "array", "maxItems": 1000}),
         Kind::Entity => json!({
@@ -372,6 +376,16 @@ fn limit_max() -> u64 {
 /// The `lastN` ceiling: the broker's 6.3.10 setting (T-4800).
 fn last_n_max() -> u64 {
     u64::try_from(antares_ops::bounds::temporal_instance_limit()).unwrap_or(u64::MAX)
+}
+
+/// The `limit` a call without one gets: the broker's default page (T-4804).
+pub(crate) fn limit_default() -> u64 {
+    u64::try_from(*antares_ops::bounds::DEFAULT_LIMIT).unwrap_or(u64::MAX)
+}
+
+/// The instances per Attribute a history call without `lastN` gets (T-4804).
+fn last_n_default() -> u64 {
+    u64::try_from(antares_ops::bounds::temporal_default_instances()).unwrap_or(u64::MAX)
 }
 
 /// An integer `v` in `min..=max`, or the rule it broke.
@@ -663,6 +677,15 @@ mod tests {
         assert!(one(Kind::Limit, json!(1001)).is_err());
         assert_eq!(one(Kind::LastN, json!(1000)), Ok(Checked::Int(1000)));
         assert!(one(Kind::LastN, json!(1001)).is_err());
+        // T-4804: and the schema names the broker's defaults, 100 unless set
+        for kind in [Kind::Limit, Kind::LastN] {
+            let s = schema_of(kind, &n);
+            let number = |name: &str| s.get(name).and_then(Value::as_u64);
+            assert_eq!(
+                (number("default"), number("maximum")),
+                (Some(100), Some(1000))
+            );
+        }
         assert!(one(Kind::Int(1, 3), json!(4)).is_err());
         assert!(one(Kind::Int(1, 3), json!(-1)).is_err());
         assert!(one(Kind::Flag, json!("true")).is_err());

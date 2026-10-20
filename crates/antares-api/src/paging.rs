@@ -1037,6 +1037,22 @@ mod tests {
         assert!(format!("{err:?}").contains("TooManyResults"));
     }
 
+    /// T-4804 (owner: default 100, maximum 1,000): a request naming no
+    /// `limit` gets 100 Entities and a next Link; `limit=1000` gets 1,000.
+    #[test]
+    fn no_limit_answers_the_default_100_and_limit_1000_answers_1000() {
+        let st = state();
+        assert_eq!(
+            (st.default_limit, *crate::bounds::DEFAULT_LIMIT),
+            (100, 100)
+        );
+        let (page, _, links) = paginate(&st, &params(&[]), items(1001), "/e").unwrap();
+        assert_eq!(page.len(), 100);
+        assert!(links.iter().any(|l| l.contains("rel=\"next\"")));
+        let (page, _, _) = paginate(&st, &params(&[("limit", "1000")]), items(1001), "/e").unwrap();
+        assert_eq!(page.len(), 1000);
+    }
+
     /// 4.13: the result count is relayed "whenever this is requested by the
     /// client" — and only then.
     #[test]

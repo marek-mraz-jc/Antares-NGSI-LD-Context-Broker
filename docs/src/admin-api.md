@@ -70,6 +70,7 @@ progress). A memory-store broker answers:
     "batchInflight": 8,
     "batchInflightBytes": 4194304,
     "changeQueue": 1024,
+    "defaultLimit": 100,
     "deliveryLane": 64,
     "deliveryLaneBytes": 134217728,
     "deliveryWidth": 64,
@@ -98,6 +99,7 @@ progress). A memory-store broker answers:
     "rejectedBodyTooDeep": 0,
     "rejectedBodyTooLarge": 0,
     "rejectedUriTooLong": 0,
+    "temporalDefaultInstances": 100,
     "temporalInstanceLimit": 1000
   },
   "memory": { "allocatedBytes": 5671592, "residentBytes": 24051712 }
@@ -118,7 +120,7 @@ progress). A memory-store broker answers:
 | `temporalDrainErrors` | Post-response history writes that failed since start; the client's 2xx stands, the counter and a warning record the loss. |
 | `policy` | The policy engine this binary was started with (`ANTARES_POLICY`, `allow-all` unless a deployment registered another) and the deadline one decision gets (`ANTARES_POLICY_TIMEOUT_MS`). An engine that overruns it is a refusal, not a delay. In a `views` build, `documents` lists the engine's rule documents by tenant and revision, `loaded` or `refused` ([Policy rule documents](#policy-rule-documents)); `null` when the engine reads none. |
 | `surfaces` | The mounted admin surfaces by name, each with its prefix and route count. |
-| `limits` | The bounds wall: every `max*` cap in force and the `rejected*` counters of requests refused by it, plus the notification-pipeline ceilings (`changeQueue`, `deliveryLane`, `deliveryWidth`, `deliveryWidthPerTenant`, `maxTrackedDestinations`). No request is rejected against those five — they are published because reaching one is what a dropped change or a stalled fan-out looks like from outside. Each subscription is delivered on a lane of its own, `deliveryLane` groups deep: a slow or dead endpoint fills its own lane, which drops for that subscription alone (counted in `antares_notification_lane_dropped_total`, logged with tenant and subscription), and never holds the matching of other subscriptions' changes. |
+| `limits` | The bounds wall: every `max*` cap in force, the page defaults (`defaultLimit`, `temporalDefaultInstances`: what a request naming no `limit` or `lastN` gets) and the `rejected*` counters of requests refused by it, plus the notification-pipeline ceilings (`changeQueue`, `deliveryLane`, `deliveryWidth`, `deliveryWidthPerTenant`, `maxTrackedDestinations`). No request is rejected against those five — they are published because reaching one is what a dropped change or a stalled fan-out looks like from outside. Each subscription is delivered on a lane of its own, `deliveryLane` groups deep: a slow or dead endpoint fills its own lane, which drops for that subscription alone (counted in `antares_notification_lane_dropped_total`, logged with tenant and subscription), and never holds the matching of other subscriptions' changes. |
 | `memory` | jemalloc live (`allocatedBytes`) and resident (`residentBytes`) bytes. |
 | `commitQueueDepth`, `commitQueuePeak` | Present only for a store with a single committer to queue behind (`file`, and the browser build over OPFS): writers queued now and at peak. |
 | `bus` | `ANTARES_BUS=nats` only: `{mode, connected, reconnects}`. |

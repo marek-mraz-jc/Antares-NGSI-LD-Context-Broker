@@ -48,9 +48,6 @@ const DESCRIBE_TYPE_DESCRIPTION: &str =
      a range), its place, the attributes worth filtering on and example calls, as text and then as \
      JSON, with what get_type answers for it.";
 
-/// The default `limit` of a page tool.
-const DEFAULT_LIMIT: u64 = 20;
-
 /// The most bytes of one inner answer read before it is refused as too
 /// large; the result budget is far below it.
 const MAX_INNER_BYTES: usize = 32 * 1024 * 1024;
@@ -435,7 +432,7 @@ impl Server {
         };
         let limit = match args.get("limit") {
             Some(Checked::Int(n)) => *n,
-            _ => DEFAULT_LIMIT,
+            _ => schema::limit_default(),
         };
         let counted = matches!(args.get("count"), Some(Checked::Flag(true)));
         let mut answer = self
@@ -561,8 +558,9 @@ fn whole(tool: &ToolDef, body: &Value, extra: serde_json::Map<String, Value>) ->
 }
 
 /// What one call of a read tool serves, from the broker's own settings
-/// (`ANTARES_MAX_LIMIT`, `ANTARES_TEMPORAL_INSTANCE_LIMIT`), so a connector
-/// knows the page before it asks (owner, T-4800).
+/// (`ANTARES_DEFAULT_LIMIT`, `ANTARES_MAX_LIMIT`,
+/// `ANTARES_TEMPORAL_DEFAULT_INSTANCES`, `ANTARES_TEMPORAL_INSTANCE_LIMIT`),
+/// so a connector knows the page before it asks (owner, T-4800, T-4804).
 fn limits_note(tool: &str) -> Option<String> {
     let thousands = |n: usize| {
         let digits = n.to_string();
@@ -575,21 +573,25 @@ fn limits_note(tool: &str) -> Option<String> {
         }
         out
     };
+    let history = || {
+        format!(
+            "Default {} values per Attribute per call, maximum {} (lastN); a longer span pages \
+             with the returned `more.next` range or uses aggrMethods (e.g. avg with \
+             aggrPeriodDuration PT1H).",
+            thousands(antares_ops::bounds::temporal_default_instances()),
+            thousands(antares_ops::bounds::temporal_instance_limit())
+        )
+    };
     match tool {
         "query_entities" => Some(format!(
-            "At most {} Entities per call (limit); more pages with nextCursor.",
+            "Default {} Entities per call, maximum {} (limit); more pages with nextCursor.",
+            thousands(*antares_ops::bounds::DEFAULT_LIMIT),
             thousands(*antares_ops::bounds::MAX_LIMIT)
         )),
-        "batch_query_temporal" => Some(format!(
-            "At most {} values per Attribute per call; a longer span pages with the returned \
-             `more.next` range or uses aggrMethods (e.g. avg with aggrPeriodDuration PT1H).",
-            thousands(antares_ops::bounds::temporal_instance_limit())
-        )),
+        "batch_query_temporal" => Some(history()),
         "query_temporal" | "retrieve_temporal" => Some(format!(
-            "At most {} values per Attribute per call; a longer span pages with the returned \
-             `more.next` range or uses aggrMethods (e.g. avg with aggrPeriodDuration PT1H). \
-             A window over a day answers hourly averages unless format or lastN asks raw values.",
-            thousands(antares_ops::bounds::temporal_instance_limit())
+            "{} A window over a day answers hourly averages unless format or lastN asks raw values.",
+            history()
         )),
         _ => None,
     }
@@ -1146,8 +1148,9 @@ mod tests {
         assert_eq!(more(&after, Some("bytes 0-9/10"), false), None);
     }
 
-    /// T-4800: the read tools advertise the broker's own ceilings (1,000
-    /// each unless set), and the temporal ones how to read past them.
+    /// T-4800, T-4804: the read tools advertise the broker's own defaults
+    /// and ceilings (100 and 1,000 each unless set), and the temporal ones
+    /// how to read past them.
     #[test]
     fn the_read_tools_advertise_the_broker_ceilings() {
         for tool in [
@@ -1157,7 +1160,9 @@ mod tests {
         ] {
             let note = limits_note(tool).unwrap_or_default();
             assert!(
-                note.starts_with("At most 1,000 values per Attribute per call"),
+                note.starts_with(
+                    "Default 100 values per Attribute per call, maximum 1,000 (lastN)"
+                ),
                 "{note}"
             );
             assert!(note.contains("more.next"), "{note}");
@@ -1165,7 +1170,7 @@ mod tests {
         }
         let note = limits_note("query_entities").unwrap_or_default();
         assert!(
-            note.starts_with("At most 1,000 Entities per call"),
+            note.starts_with("Default 100 Entities per call, maximum 1,000 (limit)"),
             "{note}"
         );
         assert_eq!(limits_note("get_entity"), None);

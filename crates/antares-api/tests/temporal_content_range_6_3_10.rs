@@ -71,9 +71,15 @@ fn served_instants(body: &Value) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn clause_6_3_10_the_advertised_range_covers_every_entity_in_the_body() {
     let st = AppState::new("me".into());
-    // one instance past the broker's ceiling each (T-4800: whatever it is
-    // set to), so both evolutions are cut and the whole result is partial
-    let n = u32::try_from(antares_api::bounds::temporal_instance_limit()).expect("ceiling") + 1;
+    // one instance past what a request naming no lastN is served (T-4804:
+    // the default, at most the ceiling), so both evolutions are cut and the
+    // whole result is partial
+    let n = u32::try_from(
+        st.temporal_default_instances
+            .min(st.temporal_instance_limit),
+    )
+    .expect("default")
+        + 1;
     let at = |i: u32, frac: &str| format!("2020-01-01T{:02}:{:02}:00{frac}Z", i / 60, i % 60);
     let plain: Vec<String> = (0..n).map(|i| at(i, "")).collect();
     let plain: Vec<&str> = plain.iter().map(String::as_str).collect();
