@@ -1050,6 +1050,19 @@ pub trait TemporalDriver: Send + Sync {
         let _ = (tenant, scope, before, batch, dry_run);
         Ok(0)
     }
+    /// Retention by partition (T-4906): drop every stored slice of history
+    /// whose rows all belong to Tenants in `floors` and lie before that
+    /// Tenant's floor, a UTC DateTime no rule of the Tenant keeps rows below.
+    /// A slice holding a row of any other Tenant stays. Returns one line per
+    /// slice dropped; a driver that stores history in no droppable slices
+    /// drops none, and the row sweep does the work.
+    async fn drop_retained_history(
+        &self,
+        floors: &[(String, String)],
+    ) -> Result<Vec<String>, NgsiError> {
+        let _ = floors;
+        Ok(Vec::new())
+    }
     /// Every version of the rows of one Entity's history (T-4665, platform
     /// ADR-N-054 2.4), by expanded Attribute name: each instance with its
     /// `version` and `provenance`, a superseded one with `supersededAt`,

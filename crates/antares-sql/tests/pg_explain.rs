@@ -377,3 +377,116 @@ async fn a_type_page_reads_its_type_through_an_index_under_rls() {
         );
     }
 }
+
+/// T-4906: the history write's probes read the weeks that can hold the
+/// instance, not every weekly partition of the Entity (dev 2026-10-19: the
+/// dedup UPDATE's join read w37..w42 cold, 7-15 s a write). Shapes copied
+/// from `insert_rows` in store/pg/temporal.rs; a generic plan, as sqlx's
+/// prepared statements get, run as the RLS-bound role.
+#[tokio::test]
+async fn the_history_write_probes_read_only_the_weeks_that_can_hold_the_instance() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    if pg::maintenance::detect_temporal_backend(&pool).await
+        != Ok(pg::maintenance::TemporalBackend::Partitioned)
+    {
+        eprintln!("SKIP: attr_instances is not natively partitioned here");
+        return;
+    }
+    // A row of a Tenant no retention names keeps each week from being dropped
+    // as emptied by a parallel test.
+    for (name, lo, hi) in [
+        ("attr_instances_2003w10", "2003-03-03", "2003-03-10"),
+        ("attr_instances_2003w11", "2003-03-10", "2003-03-17"),
+        ("attr_instances_2003w12", "2003-03-17", "2003-03-24"),
+    ] {
+        for stmt in [
+            format!("CREATE TABLE IF NOT EXISTS {name} PARTITION OF attr_instances FOR VALUES FROM ('{lo}') TO ('{hi}')"),
+            format!(
+                "INSERT INTO attr_instances (tenant_id, entity_id, attr_id, instance_id, observed_at,
+                                             created_at, modified_at, data)
+                 VALUES ('pgexplain-weeks', 'urn:v:w', 'a', 'urn:i:{lo}', '{lo}', '{lo}', '{lo}', '{{}}')
+                 ON CONFLICT DO NOTHING"
+            ),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(stmt.clone()))
+                .execute(&pool)
+                .await
+                .expect(&stmt);
+        }
+    }
+    // The role's grants, under the lock the type-page test takes for its own:
+    // two GRANTs at once fail with "tuple concurrently updated".
+    let mut tx = pool.begin().await.expect("tx");
+    for stmt in [
+        "SELECT pg_advisory_xact_lock(4334)",
+        "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
+         EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
+        "GRANT USAGE ON SCHEMA public TO antares_app",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
+    ] {
+        sqlx::query(stmt).execute(&mut *tx).await.expect(stmt);
+    }
+    tx.commit().await.expect("grants");
+    let by_observed_at = "SELECT 1 FROM jsonb_array_elements($3) AS e WHERE EXISTS (
+           SELECT 1 FROM attr_instances x
+           WHERE x.tenant_id = $1 AND x.entity_id = $2 AND x.attr_id = e->>'attr_id'
+             AND x.observed_at = (e->>'observed_at')::timestamptz
+             AND x.observed_at BETWEEN $4::timestamptz AND $5::timestamptz)";
+    let newest = "SELECT (SELECT x.instance_id FROM attr_instances x
+           WHERE x.tenant_id = $1 AND x.entity_id = $2 AND x.attr_id = e->>'attr_id'
+             AND x.observed_at >= date_trunc('week', now()) - interval '1 week'
+             AND $4::text IS NOT NULL AND $5::text IS NOT NULL
+           ORDER BY x.observed_at DESC LIMIT 1) FROM jsonb_array_elements($3) AS e";
+    let args = "('pgexplain-weeks', 'urn:v:w', '[{\"attr_id\": \"a\", \"observed_at\": \"2003-03-12T00:00:00Z\"}]', \
+                 '2003-03-12T00:00:00Z', '2003-03-12T00:00:00Z')";
+    for (what, sql) in [("observedAt", by_observed_at), ("newest", newest)] {
+        let mut tx = pool.begin().await.expect("tx");
+        for s in [
+            "SET LOCAL plan_cache_mode = force_generic_plan",
+            "SET LOCAL ROLE antares_app",
+            "SELECT set_config('antares.tenant', 'pgexplain-weeks', true)",
+        ] {
+            sqlx::query(s).execute(&mut *tx).await.expect(s);
+        }
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PREPARE t4906_probe(text, text, jsonb, text, text) AS {sql}"
+        )))
+        .execute(&mut *tx)
+        .await
+        .expect("prepare");
+        let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (FORMAT TEXT) EXECUTE t4906_probe{args}"
+        )))
+        .fetch_all(&mut *tx)
+        .await
+        .expect("explain");
+        let plan = plan.join("\n");
+        sqlx::query("DEALLOCATE t4906_probe")
+            .execute(&mut *tx)
+            .await
+            .expect("deallocate");
+        tx.rollback().await.expect("rollback");
+        let weeks: std::collections::BTreeSet<&str> = plan
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| w.starts_with("attr_instances_2"))
+            // the partition's own name, not its index's
+            .filter_map(|w| w.get(.."attr_instances_2003w11".len()))
+            .collect();
+        match what {
+            "observedAt" => assert_eq!(
+                weeks.into_iter().collect::<Vec<_>>(),
+                ["attr_instances_2003w11"],
+                "the {what} probe reads one week — plan:\n{plan}"
+            ),
+            _ => assert!(
+                !weeks.iter().any(|w| w.starts_with("attr_instances_2003")),
+                "the {what} probe reads past weeks — plan:\n{plan}"
+            ),
+        }
+        assert!(
+            !plan.contains("attr_instances_default") || what == "newest",
+            "the {what} probe reads DEFAULT — plan:\n{plan}"
+        );
+    }
+}

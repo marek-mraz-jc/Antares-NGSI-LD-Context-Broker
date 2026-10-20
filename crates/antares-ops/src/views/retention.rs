@@ -599,12 +599,66 @@ async fn retain(state: &AppState, plan: &Plan<'_>, budget: Duration) -> Vec<Dele
         dry_run: plan.dry_run,
         out: Vec::new(),
     };
-    for step in steps(state, plan).await {
+    let steps = steps(state, plan).await;
+    // Partitions every Tenant in them outlived go whole, before the row sweep
+    // spends its budget on their rows.
+    let floors = floors(plan, &steps);
+    if !plan.dry_run && !floors.is_empty() {
+        dropped(state.temporal.drop_retained_history(&floors).await);
+    }
+    for step in steps {
         if !run.drain(&step).await {
             break;
         }
     }
     run.out
+}
+
+/// The floor of every Tenant whose whole history `steps` reach (T-4906): the
+/// oldest cut of its history steps, when one of them is the rest of its
+/// types (its `*` rule or the platform default) and no rule of it keeps a
+/// type forever. No step keeps a row of it below the floor, so a past
+/// partition of only such rows can go whole instead of row by row. The cuts
+/// share one format ([`cut`], [`OFF_CUT`]), so the oldest sorts first.
+fn floors(plan: &Plan<'_>, steps: &[Step]) -> Vec<(String, String)> {
+    let mut out: std::collections::BTreeMap<&str, (bool, &str)> = std::collections::BTreeMap::new();
+    for s in steps {
+        let rest = match s.job {
+            Job::Current(_) => continue,
+            Job::Rest { .. } => true,
+            Job::Entity(_) | Job::Type { .. } => false,
+        };
+        let floor = out
+            .entry(s.tenant.as_str())
+            .or_insert((false, s.before.as_str()));
+        floor.0 |= rest;
+        floor.1 = floor.1.min(s.before.as_str());
+    }
+    let forever = |t: &str| {
+        plan.rules.iter().any(|(rt, list)| {
+            rt.as_str() == t
+                && list
+                    .iter()
+                    .any(|r| r.history_forever && r.type_iri != ANY_TYPE)
+        })
+    };
+    out.into_iter()
+        .filter(|(t, (rest, _))| *rest && !forever(t))
+        .map(|(t, (_, floor))| (t.to_owned(), floor.to_owned()))
+        .collect()
+}
+
+/// Log what the partition drop before the row sweep did (T-4906); a failure
+/// leaves the partitions to the row sweep.
+fn dropped(result: Result<Vec<String>, antares_model::NgsiError>) {
+    match result {
+        Ok(lines) => lines
+            .iter()
+            .for_each(|line| tracing::info!(what = line.as_str(), "retention dropped history")),
+        Err(e) => {
+            tracing::warn!(error = %e, "retention: partitions not dropped; the row sweep goes on");
+        }
+    }
 }
 
 /// The rounds of one sweep, against its budget.
@@ -933,6 +987,73 @@ mod tests {
             ["entity", "current", "type", "rest", "rest"]
         );
         assert_eq!(jobs(false, &port), ["entity", "current"]);
+    }
+
+    /// T-4906: a Tenant's floor is its oldest history cut, and only a Tenant
+    /// whose every row some step reaches has one: none without a `*` rule or
+    /// platform default, none with a type kept forever, none while the
+    /// Entities that rule themselves are not all read.
+    #[test]
+    fn a_tenant_floor_is_its_oldest_cut_and_only_when_every_row_is_ruled() {
+        let tenant = |n: &str| TenantId::new(n).unwrap_or_else(|e| panic!("{e:?}"));
+        let doc = |d: &[u8]| parse(d).unwrap_or_else(|e| panic!("{e}"));
+        let rules = vec![
+            // mixed: a type kept 30 days, the rest 7, one Entity a year
+            (tenant("city"), doc(br#"{"rules":[{"type":"https://e.org/V","history":"P30D"},{"type":"*","history":"P7D"}]}"#)),
+            // a type kept forever: no row of the Tenant may go by partition
+            (tenant("port"), doc(br#"{"rules":[{"type":"https://e.org/V","history":"forever"},{"type":"*","history":"P7D"}]}"#)),
+            // no `*` rule and no platform default: the other types keep all
+            (tenant("farm"), doc(br#"{"rules":[{"type":"https://e.org/V","history":"P1D"}]}"#)),
+        ];
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-20T00:00:00Z")
+            .expect("instant")
+            .with_timezone(&chrono::Utc);
+        let own = std::collections::BTreeMap::from([(
+            "city".to_owned(),
+            vec![(
+                "urn:ngsi-ld:V:1".to_owned(),
+                cut(now, Duration::from_hours(24 * 365)),
+            )],
+        )]);
+        let floors_of = |platform, whole, tenants: &[String]| {
+            let plan = Plan {
+                rules: &rules,
+                platform,
+                now,
+                dry_run: false,
+                entities: true,
+            };
+            floors(&plan, &levels(&plan, &own, whole, tenants))
+        };
+        assert_eq!(
+            floors_of(None, true, &[]),
+            [("city".to_owned(), "2025-10-20T00:00:00.000Z".to_owned())]
+        );
+        // the platform default gives a Tenant without any document a floor
+        let quiet = ["quiet".to_owned()];
+        assert_eq!(
+            floors_of(Some(Duration::from_hours(48)), true, &quiet),
+            [
+                ("city".to_owned(), "2025-10-20T00:00:00.000Z".to_owned()),
+                ("farm".to_owned(), "2026-10-18T00:00:00.000Z".to_owned()),
+                ("quiet".to_owned(), "2026-10-18T00:00:00.000Z".to_owned()),
+            ]
+        );
+        assert_eq!(
+            floors_of(Some(Duration::from_hours(48)), false, &quiet),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    /// T-4906: what the drop did is logged, and a failure is no panic.
+    #[test]
+    fn a_partition_drop_is_logged_and_a_failed_one_leaves_the_row_sweep() {
+        dropped(Ok(vec![
+            "dropped partition attr_instances_2026w38".to_owned()
+        ]));
+        dropped(Err(antares_model::NgsiError::InternalError(
+            "lock timeout".into(),
+        )));
     }
 
     /// T-4665: a type records `every` unless it says `onChange` with a
