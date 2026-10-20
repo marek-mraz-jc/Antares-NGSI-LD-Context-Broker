@@ -128,6 +128,34 @@ async fn ws_an_oversized_or_too_deep_client_message_closes_the_connection() -> R
     Ok(())
 }
 
+/// W9: a client that sends one frame past its burst gets `x-closing`
+/// `rate` and the close code 1008; every frame within the burst is
+/// answered, and another client of the tenant is not touched.
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_a_client_past_its_message_rate_is_closed_with_1008() -> Result<(), String> {
+    let b = broker(Limits {
+        messages_per_sec: 1,
+        message_burst: 3,
+        ..Limits::default()
+    })
+    .await?;
+    let mut other = connect(b.addr, ROOT, &[]).await?;
+    let mut c = connect(b.addr, ROOT, &[]).await?;
+    for _ in 0..4 {
+        c.send_text("{}".to_owned()).await?;
+    }
+    let (code, seen) = c.closed().await?;
+    assert_eq!(code, 1008, "{seen:?}");
+    let answered = seen.iter().filter(|m| status(m) == 400).count();
+    assert_eq!(answered, 3, "the burst is answered: {seen:?}");
+    assert!(
+        seen.iter().any(|m| text(m, "/metadata/x-reason") == "rate"),
+        "{seen:?}"
+    );
+    assert_eq!(status(&other.subscribe(cars()).await?), 201);
+    Ok(())
+}
+
 /// Past `max_subscriptions` on one connection `x-subscribe` answers 400 and
 /// creates nothing; deleting one makes room again.
 #[tokio::test(flavor = "multi_thread")]

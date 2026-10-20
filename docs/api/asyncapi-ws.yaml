@@ -275,7 +275,7 @@ components:
               x-op: { const: x-closing }
               x-reason:
                 type: string
-                enum: [lifetime, overflow, view-removed, shutdown, idle]
+                enum: [lifetime, overflow, view-removed, shutdown, idle, rate]
 
   schemas:
     connectionId:
