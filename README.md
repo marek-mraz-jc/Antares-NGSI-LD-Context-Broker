@@ -122,6 +122,47 @@ latest release. Images are multi-arch (amd64, arm64). The
 role-split fleet (`--roles api,matcher,notifier,temporal,registry`) and
 the Kubernetes manifests are in [Deployment](docs/src/deployment.md).
 
+## Antares without the platform
+
+Antares is its own product: the joinedcontext platform's surfaces and
+extensions are Cargo features, and the default build carries none of them.
+`cargo build -p antares-broker` and the `ghcr.io/joinedcontext/antares-broker`
+image (signed with cosign, SPDX and CycloneDX SBOMs on every release) serve
+NGSI-LD (ETSI GS CIM 009 V1.9.1) and the `/q` admin surface, nothing else.
+The platform builds `antares-broker-jc` with
+`--features full,jc-policy,linkml,parquet,tabular,ical`.
+
+```bash
+docker compose -f compose-files/docker-compose-postgres.yml up   # broker + PostGIS only
+```
+
+What the vanilla build leaves out, and the feature that adds it back:
+
+| Platform behaviour | Feature |
+|---|---|
+| `JC-Provenance-Channel`, `JC-Provenance-Actor`, `JC-Reason`, `X-Request-Id` recorded into history; temporal `versions=all` (a 400 `unknown query parameter` in vanilla) | `jc` (implied by `jc-policy`) |
+| the platform's Policy engine (`ANTARES_POLICY=joinedcontext`) | `jc-policy` |
+| Endpoint views and their surfaces: MCP, LinkML, OData, OGC API Features, SensorThings, iCalendar, WebSocket | `views`, `mcp`, `linkml`, `odata`, `ogc`, `sta`, `ical`, `ws`, `full` |
+
+What the vanilla build keeps, each an implementation choice the
+specification leaves to the broker:
+
+- **Page sizes**: 100 Entities when the request names no `limit`, at most
+  1000 (`ANTARES_DEFAULT_LIMIT`, `ANTARES_MAX_LIMIT`); 6.3.9 leaves both to
+  the broker; a larger `limit` is a 403 TooManyResults (5.5.6).
+- **Pre-adopted routes**: `GET /entities/{id}/attrs/{attr}` and
+  `/entities/{id}/attrs/{attr}/value` (NGSI-LD 2.0 items 14 and 15, TS 104 176
+  7.6.3.2). They add read paths and change no 1.9.1 operation.
+- **`POST /ex/v1/remote-notify`**: the callback of distributed subscriptions
+  (5.8.1.4). The specification requires the forwarding and leaves the
+  callback URL to the broker; `/ex/` keeps it outside `/ngsi-ld/v1`.
+
+CI holds the line: `dev/check-vanilla-symbols.sh` refuses a vanilla binary
+that links a surface crate or the `jc` code, `ci/vanilla-tree.txt` pins its
+dependency tree, and the ETSI quick matrix runs on the vanilla image every
+commit. Each release's notes carry the compliance statement: suite version
+and tree, pass count, and the local suite edits.
+
 ## Browser build
 
 The broker compiles to `wasm32-unknown-unknown` and answers `/ngsi-ld/v1/*`

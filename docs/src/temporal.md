@@ -194,6 +194,10 @@ A Tenant that records any type `onChange` aggregates in the broker.
 
 ### Every version of a measurement
 
+A platform extension, in `jc` builds only (the platform image, T-4854):
+vanilla Antares answers `versions` with 400 `unknown query parameter` and
+records every write's provenance as `channel: api`.
+
 `versions=all` on `GET /temporal/entities/{id}` replaces each instance with
 its chain, oldest first: every version carries `version` and `provenance`,
 and a superseded one `supersededAt`. `lastN` and the other page limits

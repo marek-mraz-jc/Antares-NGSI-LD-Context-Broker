@@ -82,7 +82,11 @@ plugin-example = ["dep:antares-plugin-example"]
 # `ANTARES_POLICY=joinedcontext`, the Tenant's Policy rules loaded through
 # `/q/policy/{tenant}`. Only the platform image builds it (T-3636); vanilla
 # Antares ships `allow-all`.
-jc-policy = ["dep:joinedcontext-policy"]
+jc-policy = ["dep:joinedcontext-policy", "jc"]
+# The platform's NGSI-LD extensions without its engine (antares-api `jc`,
+# T-4854): provenance headers into history and temporal `versions=all`.
+# jc-policy turns it on; vanilla Antares carries neither.
+jc = ["antares-api/jc"]
 # Endpoint views (ADR-0023): the view table, `/q/views` on the admin surface
 # and its reload, and the view root `/x/views/{view}/ngsi-ld/v1`
 # (`ANTARES_API_SURFACES=admin,views`). Off by default: a vanilla broker

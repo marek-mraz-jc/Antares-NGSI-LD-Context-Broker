@@ -31,6 +31,10 @@ cd "$(dirname "$0")/.."
 
 # Rust paths, as `nm --demangle` prints them.
 SYMBOLS='(^|[^A-Za-z0-9_])(antares_(ops|views|odata|ogc|mcp|linkml|ws|icsr|plugin_[a-z_]+)|joinedcontext_[a-z_]+|odata_(url|csdl|json|batch|axum)|linkml_model|ogc_cql2|rmcp|tungstenite)::'
+# The platform's NGSI-LD extensions inside antares-api (feature `jc`, T-4854):
+# the gateway's provenance headers and `versions=all`. No crate of their own,
+# so the package modes cannot see them; this pattern is checked on the binary.
+JC_SYMBOLS='antares_api::provenance::(may_read_versions|from_gateway|percent_decoded)'
 # The same crates as package names, as the auditable list carries them.
 PACKAGES='^(antares-(ops|views|odata|ogc|mcp|linkml|ws|icsr|plugin-.+)|joinedcontext-.+|odata-.+|linkml-model|ogc-cql2|rmcp|tungstenite)$'
 
@@ -102,15 +106,21 @@ metadata
 
 # Wherever cargo puts it (CARGO_TARGET_DIR included).
 bin="$(cargo metadata --locked --format-version 1 --no-deps | jq -r .target_directory)/debug/antares"
-symbols() { nm --defined-only --demangle "$1" | grep -E "$SYMBOLS" || true; }
+symbols() { nm --defined-only --demangle "$1" | grep -E "$SYMBOLS|$JC_SYMBOLS" || true; }
 scratch=$(mktemp -d)
 trap 'rm -rf "${scratch:?}"' EXIT
 
 # Self-test first, so the binary left behind is the vanilla one.
-cargo build --locked -p antares-broker --features plugin-example
+cargo build --locked -p antares-broker --features plugin-example,jc
 cp "$bin" "$scratch/addon"
-[ -n "$(symbols "$scratch/addon")" ] || {
+# a here-string, not a pipe: grep -q stops early and pipefail would read nm's SIGPIPE as a miss
+addon=$(symbols "$scratch/addon")
+grep -Evq "$JC_SYMBOLS" <<<"$addon" || {
   echo "self-test failed: the pattern finds no symbol in a build that DOES link plugin-example"
+  exit 1
+}
+grep -Eq "$JC_SYMBOLS" <<<"$addon" || {
+  echo "self-test failed: the jc pattern finds no symbol in a build that DOES carry jc"
   exit 1
 }
 
@@ -119,7 +129,7 @@ total=$(nm --defined-only "$bin" | wc -l)
 [ "$total" -gt 10000 ] || { echo "nm read $total symbols: the gate would pass vacuously"; exit 1; }
 found=$(symbols "$bin")
 if [ -n "$found" ]; then
-  echo "SURFACE CODE LINKED INTO THE VANILLA BINARY:"
+  echo "SURFACE OR PLATFORM (jc) CODE LINKED INTO THE VANILLA BINARY:"
   printf '%s\n' "$found" | head -40
   exit 1
 fi

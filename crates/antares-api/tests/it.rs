@@ -131,6 +131,7 @@ mod throttling_5_2_12;
 mod type_selector_context_5_6_6;
 mod types_list_pg;
 mod types_list_without_bodies;
+mod vanilla_jc_extensions;
 mod write_race_5_6;
 
 /// Every file under tests/ runs: a `mod` line here, or its own `[[test]]` in Cargo.toml.

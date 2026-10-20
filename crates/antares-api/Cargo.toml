@@ -84,6 +84,12 @@ fuzzing = []
 # Endpoint views (ADR-0023): the composition hook `gate!` applies when a
 # state carries a view. Off in the vanilla build; pulled by antares-ops.
 views = []
+# The joinedcontext platform's NGSI-LD extensions (T-4665, T-4854): the
+# gateway's JC-Provenance-Channel/-Actor, JC-Reason and X-Request-Id recorded
+# into history, and temporal `versions=all` behind JC-Read-Versions. Off in
+# the vanilla build: there every write is `channel: api` whatever its
+# headers say, and `versions` is an unknown query parameter (400).
+jc = []
 
 [dev-dependencies]
 # the storage seams are object-safe AND asynchronous: a test double
