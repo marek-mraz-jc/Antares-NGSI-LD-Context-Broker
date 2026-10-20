@@ -5096,3 +5096,173 @@ mod t3932_time_of_day {
         }
     }
 }
+
+#[cfg(test)]
+mod t4794_held_values_scopes_and_versions {
+    use super::{
+        aggregate_bucket, scope_match_intervals, time_weighted_avg, with_versions, AggrClass,
+        Windowed,
+    };
+    use serde_json::{json, Map, Value};
+
+    fn at(s: &str) -> chrono::DateTime<chrono::FixedOffset> {
+        chrono::DateTime::parse_from_rfc3339(s).expect("instant")
+    }
+
+    /// ADR-N-054 2.5: an onChange value weighs by the time it held, the
+    /// level carried in holding from the bucket's start.
+    #[test]
+    fn an_on_change_mean_weighs_each_value_by_the_time_it_held() {
+        let (start, end) = (at("2026-01-01T00:00:00Z"), at("2026-01-01T01:00:00Z"));
+        let (ten, twenty, text) = (json!(10), json!(20), json!("x"));
+        let rows = [(at("2026-01-01T00:15:00Z"), &twenty)];
+        // 10 for 15 minutes, then 20 for 45: 17.5
+        assert_eq!(
+            time_weighted_avg(AggrClass::Number, &rows, Some(&ten), start, end),
+            Some(json!(17.5))
+        );
+        // nothing carried in: the first row holds to the end
+        assert_eq!(
+            time_weighted_avg(AggrClass::Number, &rows, None, start, end),
+            Some(json!(20.0))
+        );
+        // no number, or no moment held, is no mean
+        let words = [(at("2026-01-01T00:15:00Z"), &text)];
+        assert_eq!(
+            time_weighted_avg(AggrClass::Number, &words, None, start, end),
+            None
+        );
+        assert_eq!(
+            time_weighted_avg(AggrClass::Number, &[], None, start, end),
+            None
+        );
+        assert_eq!(
+            time_weighted_avg(AggrClass::TimeOfDay, &rows, Some(&ten), start, end),
+            None
+        );
+    }
+
+    /// 4.18 over a Temporal Evolution: a Scope holds from the time it was
+    /// set until the next one; a plain scope holds for all time.
+    #[test]
+    fn a_scope_matches_from_the_time_it_was_set_until_the_next() {
+        let doc = json!({"scope": [
+            {"type": "Property", "value": "/b", "observedAt": "2026-02-01T00:00:00Z"},
+            {"type": "Property", "value": "/a", "modifiedAt": "2026-01-01T00:00:00Z"},
+            {"type": "Property", "value": "urn:ngsi-ld:null", "createdAt": "2026-03-01T00:00:00Z"},
+            {"type": "Property", "value": ["/a", "/c"], "observedAt": "2026-04-01T00:00:00Z"},
+            {"type": "Property", "value": "/a"}
+        ]});
+        assert_eq!(
+            scope_match_intervals(&doc, "/a"),
+            vec![
+                (
+                    "2026-01-01T00:00:00Z".to_owned(),
+                    Some("2026-02-01T00:00:00Z".to_owned())
+                ),
+                ("2026-04-01T00:00:00Z".to_owned(), None),
+            ],
+            "the deleted scope matches nothing, an unstamped instance is skipped"
+        );
+        assert!(scope_match_intervals(&doc, "/z").is_empty());
+        assert_eq!(
+            scope_match_intervals(&json!({"scope": "/a"}), "/a"),
+            vec![(String::new(), None)]
+        );
+        assert!(scope_match_intervals(&json!({"scope": "/a"}), "/b").is_empty());
+        assert!(scope_match_intervals(&json!({}), "/a").is_empty());
+    }
+
+    /// ADR-N-054 2.4: `versions=all` replaces an instance by every version
+    /// of the same measurement; one with no version stays.
+    #[test]
+    fn versions_replace_the_same_measurement_only() {
+        let speed = "https://x/speed";
+        let mut w = Windowed {
+            attrs: [
+                (
+                    speed.to_owned(),
+                    vec![
+                        json!({"value": 2, "observedAt": "2026-01-01T00:00:00Z"}),
+                        json!({"value": 5, "observedAt": "2026-01-02T00:00:00Z"}),
+                    ],
+                ),
+                ("https://x/other".to_owned(), vec![json!({"value": 1})]),
+            ]
+            .into_iter()
+            .collect(),
+            max_per_attr: 100,
+            ts_min: None,
+            ts_max: None,
+            truncated: false,
+            more: false,
+            cut_served: None,
+            held: Default::default(),
+        };
+        let mut chains = Map::new();
+        chains.insert(
+            speed.to_owned(),
+            json!([
+                {"value": 1, "observedAt": "2026-01-01T00:00:00.000Z"},
+                {"value": 2, "observedAt": "2026-01-01T00:00:00Z"},
+                {"value": 9, "observedAt": "2026-01-01T00:00:00Z", "datasetId": "urn:d"},
+            ]),
+        );
+        with_versions(&mut w, &chains);
+        let values: Vec<&Value> = w.attrs[speed].iter().map(|i| &i["value"]).collect();
+        assert_eq!(values, [&json!(1), &json!(2), &json!(5)]);
+        assert_eq!(w.attrs["https://x/other"], [json!({"value": 1})]);
+    }
+
+    /// Tables 4.5.19.1-1/2/3: each method over numbers, a List counted by
+    /// its length, text ordered as written; an overflow is null, never an
+    /// out-of-range float.
+    #[test]
+    fn each_method_folds_a_bucket_by_its_class() {
+        let (two, four, six) = (json!(2), json!(4), json!(6));
+        let nums = [&two, &four, &six];
+        let agg = |m: &str| aggregate_bucket(m, AggrClass::Number, &nums);
+        assert_eq!(agg("min"), json!(2.0));
+        assert_eq!(agg("max"), json!(6.0));
+        assert_eq!(agg("sum"), json!(12.0));
+        assert_eq!(agg("avg"), json!(4.0));
+        assert_eq!(agg("sumsq"), json!(56.0));
+        let sd = agg("stddev").as_f64().expect("stddev");
+        assert!((sd - (8.0f64 / 3.0).sqrt()).abs() < 1e-12, "{sd}");
+        assert_eq!(agg("totalCount"), json!(3));
+        assert_eq!(agg("unknown"), Value::Null);
+        for m in ["min", "max", "avg", "stddev"] {
+            assert_eq!(
+                aggregate_bucket(m, AggrClass::Number, &[]),
+                Value::Null,
+                "{m}"
+            );
+        }
+        let huge = json!(f64::MAX);
+        assert_eq!(
+            aggregate_bucket("sum", AggrClass::Number, &[&huge, &huge]),
+            Value::Null
+        );
+
+        let (short, long) = (json!(["a"]), json!(["a", "b", "c"]));
+        assert_eq!(
+            aggregate_bucket("max", AggrClass::List, &[&short, &long]),
+            json!(3.0)
+        );
+        let (b, a) = (json!("b"), json!("a"));
+        assert_eq!(
+            aggregate_bucket("min", AggrClass::Text, &[&b, &a]),
+            json!("a")
+        );
+        assert_eq!(
+            aggregate_bucket("max", AggrClass::Text, &[&b, &a]),
+            json!("b")
+        );
+        let (r1, r2) = (json!(["urn:a", "urn:b"]), json!("urn:a"));
+        assert_eq!(
+            aggregate_bucket("distinctCount", AggrClass::Relationship, &[&r1, &r2]),
+            json!(2),
+            "distinct targets, an array flattened"
+        );
+    }
+}
