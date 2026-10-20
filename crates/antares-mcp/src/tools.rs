@@ -77,7 +77,7 @@ const QUERY: &[Arg] = &[
     // 4.23 Entity Ordering, local scope only
     opt("orderBy", Kind::Text(1024)),
     opt("count", Kind::Flag),
-    opt("limit", Kind::Int(1, 1000)),
+    opt("limit", Kind::Limit),
     opt("cursor", Kind::Text(crate::cursor::MAX_LEN)),
 ];
 
@@ -96,7 +96,7 @@ const BATCH_QUERY: &[Arg] = &[
     opt("local", Kind::Flag),
     opt("lang", Kind::Text(64)),
     opt("count", Kind::Flag),
-    opt("limit", Kind::Int(1, 1000)),
+    opt("limit", Kind::Limit),
     opt("cursor", Kind::Text(crate::cursor::MAX_LEN)),
 ];
 
@@ -107,7 +107,7 @@ const TEMPORAL_ONE: &[Arg] = &[
     req("timeAt", Kind::Text(64)),
     opt("endTimeAt", Kind::Text(64)),
     opt("timeproperty", Kind::Word(TIMEPROPERTIES)),
-    opt("lastN", Kind::Int(1, 100)),
+    opt("lastN", Kind::LastN),
     opt("aggrMethods", Kind::Text(256)),
     opt("aggrPeriodDuration", Kind::Text(64)),
     opt("format", Kind::Word(TEMPORAL_FORMATS)),
@@ -128,13 +128,13 @@ const TEMPORAL_QUERY: &[Arg] = &[
     req("timeAt", Kind::Text(64)),
     opt("endTimeAt", Kind::Text(64)),
     opt("timeproperty", Kind::Word(TIMEPROPERTIES)),
-    opt("lastN", Kind::Int(1, 100)),
+    opt("lastN", Kind::LastN),
     opt("aggrMethods", Kind::Text(256)),
     opt("aggrPeriodDuration", Kind::Text(64)),
     opt("format", Kind::Word(TEMPORAL_FORMATS)),
     opt("sysAttrs", Kind::Flag),
     opt("count", Kind::Flag),
-    opt("limit", Kind::Int(1, 1000)),
+    opt("limit", Kind::Limit),
     opt("cursor", Kind::Text(crate::cursor::MAX_LEN)),
 ];
 
@@ -153,18 +153,18 @@ const BATCH_TEMPORAL_QUERY: &[Arg] = &[
     req("timeAt", Kind::Text(64)),
     opt("endTimeAt", Kind::Text(64)),
     opt("timeproperty", Kind::Word(TIMEPROPERTIES)),
-    opt("lastN", Kind::Int(1, 100)),
+    opt("lastN", Kind::LastN),
     opt("aggrMethods", Kind::Text(256)),
     opt("aggrPeriodDuration", Kind::Text(64)),
     opt("count", Kind::Flag),
-    opt("limit", Kind::Int(1, 1000)),
+    opt("limit", Kind::Limit),
     opt("cursor", Kind::Text(crate::cursor::MAX_LEN)),
 ];
 
 const ID_ONLY: &[Arg] = &[req("id", Kind::Text(512))];
 const PAGE_ONLY: &[Arg] = &[
     opt("count", Kind::Flag),
-    opt("limit", Kind::Int(1, 1000)),
+    opt("limit", Kind::Limit),
     opt("cursor", Kind::Text(crate::cursor::MAX_LEN)),
 ];
 /// `summarize` (T-4680): one type and the filters of `query_entities`; it

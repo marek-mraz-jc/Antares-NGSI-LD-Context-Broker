@@ -257,12 +257,6 @@ struct Windowed {
     held: std::collections::HashSet<String>,
 }
 
-/// NGSI-LD 6.3.10: the most instances of one Attribute the broker serves in
-/// one response — beyond it the representation is cut and answered "206" with
-/// a Content-Range. The ETSI suite triggers 206 at 20 instances and expects
-/// 200 at <=5, so any limit in (5,20) is spec-valid; 9 keeps margin.
-const TEMPORAL_INSTANCE_LIMIT: usize = 9;
-
 /// The most periods an aggregated `onChange` Attribute answers, rows and held gaps together.
 const MAX_HELD_BUCKETS: usize = 10_000;
 
@@ -289,20 +283,20 @@ const MAX_HELD_BUCKETS: usize = 10_000;
 /// (`cut_served`): it repeats, never skips. One cut to nothing leaves no
 /// offsetN that continues it, and the Link continues by time from the
 /// boundary instead (`interval_links`, T-3613).
-fn truncate(w: &mut Windowed, timeprop: &str, descending: bool) {
-    if w.max_per_attr <= TEMPORAL_INSTANCE_LIMIT {
+fn truncate(w: &mut Windowed, timeprop: &str, descending: bool, limit: usize) {
+    if w.max_per_attr <= limit {
         return;
     }
     w.truncated = true;
     w.more = true;
-    w.max_per_attr = TEMPORAL_INSTANCE_LIMIT;
+    w.max_per_attr = limit;
     let key = |inst: &Value| inst.get(timeprop).and_then(Value::as_str).map(dt_key);
     // the tightest ceiling instant: earliest forwards, latest backwards
     let boundary = w
         .attrs
         .values()
-        .filter(|insts| insts.len() > TEMPORAL_INSTANCE_LIMIT)
-        .filter_map(|insts| insts.get(TEMPORAL_INSTANCE_LIMIT - 1).and_then(key))
+        .filter(|insts| insts.len() > limit)
+        .filter_map(|insts| insts.get(limit.saturating_sub(1)).and_then(key))
         .reduce(|a, b| if (b < a) != descending { b } else { a });
     let (mut ts_min, mut ts_max) = (None::<String>, None::<String>);
     for instances in w.attrs.values_mut() {
@@ -311,7 +305,7 @@ fn truncate(w: &mut Windowed, timeprop: &str, descending: bool) {
             Some(bd) => instances.retain(|inst| {
                 key(inst).is_none_or(|k| if descending { k >= *bd } else { k <= *bd })
             }),
-            None => instances.truncate(TEMPORAL_INSTANCE_LIMIT),
+            None => instances.truncate(limit),
         }
         if instances.len() < before {
             w.cut_served = Some(
@@ -945,17 +939,16 @@ impl InstancePage {
 
     /// The most instances of one Attribute a page holds: N, or the broker's
     /// ceiling when N is above it or absent (6.4.7.3 "whichever is smaller").
-    fn size(&self) -> usize {
-        self.n
-            .map_or(TEMPORAL_INSTANCE_LIMIT, |n| n.min(TEMPORAL_INSTANCE_LIMIT))
+    fn size(&self, limit: usize) -> usize {
+        self.n.map_or(limit, |n| n.min(limit))
     }
 
     /// How far one page moves offsetN: its size, or N itself for an
     /// aggregated representation, which the ceiling never cuts.
-    fn step(&self, aggregated: bool) -> usize {
+    fn step(&self, aggregated: bool, limit: usize) -> usize {
         match (aggregated, self.n) {
             (true, Some(n)) => n,
-            _ => self.size(),
+            _ => self.size(limit),
         }
     }
 
@@ -2765,7 +2758,7 @@ pub(crate) async fn query_temporal_collected(
             crate::history::held_attrs(st, &tenant, d),
         );
         if !trepr.aggregated {
-            truncate(&mut w, &timeprop, page_n.desc);
+            truncate(&mut w, &timeprop, page_n.desc, st.temporal_instance_limit);
         }
         g_trunc |= w.truncated;
         g_more |= w.more;
@@ -2838,7 +2831,7 @@ pub(crate) async fn query_temporal_collected(
             accept,
             page_n,
             g_more,
-            page_n.step(trepr.aggregated),
+            page_n.step(trepr.aggregated, st.temporal_instance_limit),
             g_cut.zip(g_bound.as_deref()),
         ),
     );
@@ -3088,7 +3081,7 @@ async fn retrieve_temporal_inner(
             crate::history::held_attrs(st, &tenant, &doc),
         );
         if !trepr.aggregated {
-            truncate(&mut w, &timeprop, page_n.desc);
+            truncate(&mut w, &timeprop, page_n.desc, st.temporal_instance_limit);
             // after the cut: lastN counts measurements, never versions (DM-119)
             if versions {
                 with_versions(&mut w, &st.temporal.versions(&tenant, id).await?);
@@ -3132,7 +3125,7 @@ async fn retrieve_temporal_inner(
                 accept,
                 page_n,
                 w.more,
-                page_n.step(trepr.aggregated),
+                page_n.step(trepr.aggregated, st.temporal_instance_limit),
                 w.cut_served.zip(cut_boundary(&w, page_n.desc)),
             ),
         );
@@ -4160,6 +4153,10 @@ mod clause_6_3_10 {
     use super::*;
     use serde_json::json;
 
+    /// The ceiling the ETSI suite's brokers run with (ANTARES_TEMPORAL_INSTANCE_LIMIT=9):
+    /// these cases cut 20 instances as its 206 checks do.
+    const ETSI_LIMIT: usize = 9;
+
     /// One attribute with `n` instances, one per minute from 00:00.
     fn evolution(n: usize) -> Value {
         let speed: Vec<Value> = (0..n)
@@ -4190,7 +4187,7 @@ mod clause_6_3_10 {
             "observedAt",
             Default::default(),
         );
-        truncate(&mut w, "observedAt", last_n.is_some());
+        truncate(&mut w, "observedAt", last_n.is_some(), ETSI_LIMIT);
         w
     }
 
@@ -4221,14 +4218,11 @@ mod clause_6_3_10 {
         let doc = evolution(20);
         let q = tq("after", "2019-01-01T00:00:00Z");
         let w = windowed(&doc, Some(&q), None).await;
-        assert_eq!(w.attrs["speed"].len(), TEMPORAL_INSTANCE_LIMIT);
+        assert_eq!(w.attrs["speed"].len(), ETSI_LIMIT);
         assert!(w.truncated);
         let got = observed(&w);
         assert_eq!(got[0], at(0));
-        assert_eq!(
-            got[TEMPORAL_INSTANCE_LIMIT - 1],
-            at(TEMPORAL_INSTANCE_LIMIT - 1)
-        );
+        assert_eq!(got[ETSI_LIMIT - 1], at(ETSI_LIMIT - 1));
         assert!(
             !got.contains(&at(19).as_str()),
             "instances beyond the ceiling must not be served: {got:?}"
@@ -4245,7 +4239,74 @@ mod clause_6_3_10 {
             ),
             Some(format!(
                 "date-time 2019-01-01T00:00:00Z-{}/*",
-                at(TEMPORAL_INSTANCE_LIMIT - 1)
+                at(ETSI_LIMIT - 1)
+            ))
+        );
+    }
+
+    /// 5-minute readings: the i-th instant from 2026-10-12T00:00Z on.
+    fn five_minute(i: usize) -> String {
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-10-12T00:00:00Z").expect("instant");
+        (t0 + chrono::Duration::minutes(5 * i as i64))
+            .to_utc()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+
+    fn windowed_at(n: usize) -> Windowed {
+        let speed: Vec<Value> = (0..n)
+            .map(|i| json!({"type": "Property", "value": i, "observedAt": five_minute(i)}))
+            .collect();
+        let doc = json!({"id": "urn:ngsi-ld:WeatherObserved:1", "type": "WeatherObserved", "speed": speed});
+        let q = tq("after", "2026-10-01T00:00:00Z");
+        let mut w = window(
+            &doc,
+            Some(&q),
+            page(None),
+            None,
+            None,
+            None,
+            "observedAt",
+            Default::default(),
+        );
+        truncate(
+            &mut w,
+            "observedAt",
+            false,
+            crate::bounds::temporal_instance_limit(),
+        );
+        w
+    }
+
+    /// T-4800: with no setting the ceiling is 1,000: 1,000 instances of an
+    /// Attribute answer whole (200), 1,001 are cut at the 1,000th (206).
+    #[test]
+    fn the_default_ceiling_serves_1000_whole_and_cuts_1001() {
+        const CEILING: usize = 1000;
+        assert_eq!(
+            crate::bounds::temporal_instance_limit(),
+            CEILING,
+            "ANTARES_TEMPORAL_INSTANCE_LIMIT is unset in tests"
+        );
+        let q = tq("after", "2026-10-01T00:00:00Z");
+        let w = windowed_at(CEILING);
+        assert!(!w.truncated && !w.more);
+        assert_eq!(w.attrs["speed"].len(), CEILING);
+
+        let w = windowed_at(CEILING + 1);
+        assert!(w.truncated && w.more);
+        assert_eq!(w.attrs["speed"].len(), CEILING);
+        assert_eq!(
+            content_range(
+                w.truncated,
+                w.ts_min.as_deref(),
+                w.ts_max.as_deref(),
+                Some(&q),
+                page(None)
+            ),
+            Some(format!(
+                "date-time 2026-10-01T00:00:00Z-{}/*",
+                five_minute(CEILING - 1)
             ))
         );
     }
@@ -4311,15 +4372,15 @@ mod clause_6_3_10 {
     async fn the_cut_is_one_time_boundary_across_attributes() {
         let w = windowed(&evolution2(21, 31), None, None).await;
         assert!(w.truncated);
-        let end = at(TEMPORAL_INSTANCE_LIMIT - 1);
-        assert_eq!(w.attrs["speed"].len(), TEMPORAL_INSTANCE_LIMIT);
+        let end = at(ETSI_LIMIT - 1);
+        assert_eq!(w.attrs["speed"].len(), ETSI_LIMIT);
         assert_eq!(last_observed(&w, "speed").as_deref(), Some(end.as_str()));
         assert_eq!(
             last_observed(&w, "heading").as_deref(),
             Some(end.as_str()),
             "heading must stop at speed's boundary, not at its own ninth instance"
         );
-        assert_eq!(w.attrs["heading"].len(), TEMPORAL_INSTANCE_LIMIT - 5);
+        assert_eq!(w.attrs["heading"].len(), ETSI_LIMIT - 5);
         assert_eq!(w.ts_max.as_deref(), Some(end.as_str()));
         for inst in w.attrs["heading"].iter().chain(w.attrs["speed"].iter()) {
             assert!(
@@ -4332,12 +4393,9 @@ mod clause_6_3_10 {
         // before that, is empty on this page rather than incoherently present
         let w = windowed(&evolution2(21, 31), None, Some(20)).await;
         assert!(w.truncated);
-        assert_eq!(w.attrs["heading"].len(), TEMPORAL_INSTANCE_LIMIT);
+        assert_eq!(w.attrs["heading"].len(), ETSI_LIMIT);
         assert_eq!(w.attrs["heading"][0]["observedAt"], json!(at(30)));
-        assert_eq!(
-            w.ts_min.as_deref(),
-            Some(at(30 - TEMPORAL_INSTANCE_LIMIT + 1).as_str())
-        );
+        assert_eq!(w.ts_min.as_deref(), Some(at(30 - ETSI_LIMIT + 1).as_str()));
         assert!(
             w.attrs["speed"].is_empty(),
             "speed lies entirely before the page boundary: {:?}",
@@ -4354,14 +4412,11 @@ mod clause_6_3_10 {
     async fn last_n_above_the_ceiling_is_clamped_to_it() {
         let doc = evolution(20);
         let w = windowed(&doc, None, Some(20)).await;
-        assert_eq!(w.attrs["speed"].len(), TEMPORAL_INSTANCE_LIMIT);
+        assert_eq!(w.attrs["speed"].len(), ETSI_LIMIT);
         assert!(w.truncated);
         let got = observed(&w);
         assert_eq!(got[0], at(19), "lastN delivers newest first");
-        assert_eq!(
-            got[TEMPORAL_INSTANCE_LIMIT - 1],
-            at(20 - TEMPORAL_INSTANCE_LIMIT)
-        );
+        assert_eq!(got[ETSI_LIMIT - 1], at(20 - ETSI_LIMIT));
         assert_eq!(
             content_range(
                 w.truncated,
@@ -4370,11 +4425,7 @@ mod clause_6_3_10 {
                 None,
                 page(Some(20))
             ),
-            Some(format!(
-                "date-time {}-{}/20",
-                at(19),
-                at(20 - TEMPORAL_INSTANCE_LIMIT)
-            ))
+            Some(format!("date-time {}-{}/20", at(19), at(20 - ETSI_LIMIT)))
         );
     }
 
@@ -4385,12 +4436,9 @@ mod clause_6_3_10 {
     async fn a_request_with_no_window_is_capped_by_default() {
         let doc = evolution(20);
         let w = windowed(&doc, None, None).await;
-        assert_eq!(w.attrs["speed"].len(), TEMPORAL_INSTANCE_LIMIT);
+        assert_eq!(w.attrs["speed"].len(), ETSI_LIMIT);
         assert!(w.truncated);
-        assert_eq!(
-            w.ts_max.as_deref(),
-            Some(at(TEMPORAL_INSTANCE_LIMIT - 1).as_str())
-        );
+        assert_eq!(w.ts_max.as_deref(), Some(at(ETSI_LIMIT - 1).as_str()));
         assert_eq!(
             content_range(
                 w.truncated,
@@ -4399,11 +4447,7 @@ mod clause_6_3_10 {
                 None,
                 page(None)
             ),
-            Some(format!(
-                "date-time {}-{}/*",
-                at(0),
-                at(TEMPORAL_INSTANCE_LIMIT - 1)
-            ))
+            Some(format!("date-time {}-{}/*", at(0), at(ETSI_LIMIT - 1)))
         );
     }
 
@@ -4411,9 +4455,9 @@ mod clause_6_3_10 {
     /// broker serves in full is a plain 200 with no Content-Range.
     #[tokio::test]
     async fn a_complete_result_is_not_partial_content() {
-        let doc = evolution(TEMPORAL_INSTANCE_LIMIT);
+        let doc = evolution(ETSI_LIMIT);
         let w = windowed(&doc, None, None).await;
-        assert_eq!(w.attrs["speed"].len(), TEMPORAL_INSTANCE_LIMIT);
+        assert_eq!(w.attrs["speed"].len(), ETSI_LIMIT);
         assert!(!w.truncated);
         assert_eq!(
             content_range(

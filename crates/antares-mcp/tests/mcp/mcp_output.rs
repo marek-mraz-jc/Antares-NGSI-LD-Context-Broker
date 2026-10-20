@@ -2,7 +2,7 @@
 //! Result size, paging and the cursor (MCP section 8, D-10; MC5, MC11,
 //! MC20).
 
-use crate::common::{call, fixture, rpc, BIG};
+use crate::common::{call, create, fixture, rpc, send, BIG};
 use serde_json::{json, Value};
 
 /// The structured-content budget a deployment that sets nothing has.
@@ -292,8 +292,9 @@ async fn a_limit_shorter_than_the_list_pages_by_the_count() -> Result<(), String
 #[tokio::test(flavor = "multi_thread")]
 async fn one_history_past_the_budget_names_last_n() -> Result<(), String> {
     let f = fixture().await?;
-    let when =
-        json!({"timerel": "after", "timeAt": "2000-01-01T00:00:00Z", "timeproperty": "modifiedAt"});
+    // lastN asks raw instances: a window over a day would answer averages (T-4800)
+    let when = json!({"timerel": "after", "timeAt": "2000-01-01T00:00:00Z",
+                      "timeproperty": "modifiedAt", "lastN": 1});
     let mut one = when.clone();
     let mut many = when;
     if let (Some(o), Some(m)) = (one.as_object_mut(), many.as_object_mut()) {
@@ -335,5 +336,94 @@ async fn a_unit_code_is_read_back_with_its_label() -> Result<(), String> {
         Some(json!({"type": "Property", "value": 10, "unitCode": "KMH", "unit": "km/h"}))
     );
     assert!(a.text.contains("km/h"), "{}", a.text);
+    Ok(())
+}
+
+/// T-4800: a history the broker cut at its instance ceiling (1,000: 206 +
+/// Content-Range) carries `more` with the window that continues it, and a
+/// `lastN` page with older instances says how to go on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_history_names_the_window_that_continues_it() -> Result<(), String> {
+    let f = fixture().await?;
+    let at = |i: u32| {
+        format!(
+            "2020-01-01T{:02}:{:02}:{:02}Z",
+            i / 3600,
+            i / 60 % 60,
+            i % 60
+        )
+    };
+    let id = "urn:ngsi-ld:Car:t";
+    create(
+        &f.app,
+        "city",
+        &json!({"id": id, "type": "Car",
+                "speed": {"type": "Property", "value": 0, "observedAt": at(0)}}),
+    )
+    .await?;
+    for i in 1..=1000 {
+        let attrs = json!({"speed": {"type": "Property", "value": i % 80, "observedAt": at(i)}});
+        let uri = format!("/ngsi-ld/v1/entities/{id}/attrs");
+        let s = send(&f.app, axum::http::Method::PATCH, &uri, "city", &attrs).await;
+        assert!(s.is_success(), "update {i}: {s}");
+    }
+    // raw values asked by format: a window over a day would answer averages
+    let after = json!({"id": id, "timerel": "after", "timeAt": "2020-01-01T00:00:00Z",
+                       "attrs": ["speed"], "format": "temporalValues"});
+    let a = call(&f.app, "cars", "retrieve_temporal", after.clone()).await;
+    assert!(!a.is_error(), "{}", &a.text[..a.text.len().min(400)]);
+    let more = a.structured().get("more").cloned().unwrap_or_default();
+    assert_eq!(
+        more.get("next"),
+        Some(&json!({"timerel": "after", "timeAt": at(999)}))
+    );
+
+    let mut last = after;
+    if let Some(o) = last.as_object_mut() {
+        o.insert("lastN".into(), json!(3));
+    }
+    let a = call(&f.app, "cars", "retrieve_temporal", last).await;
+    let more = a.structured().get("more").cloned().unwrap_or_default();
+    assert!(
+        more.get("next").is_none()
+            && more
+                .get("hint")
+                .and_then(Value::as_str)
+                .is_some_and(|h| h.contains("before")),
+        "{}",
+        a.text
+    );
+    Ok(())
+}
+
+/// T-4800: a history window over a day that asks no raw values answers
+/// hourly averages and says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_history_window_answers_hourly_averages() -> Result<(), String> {
+    let f = fixture().await?;
+    let now = chrono::Utc::now();
+    let week = |d: i64| {
+        (now - chrono::Duration::days(d))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    };
+    let a = call(
+        &f.app,
+        "cars",
+        "retrieve_temporal",
+        json!({"id": "urn:ngsi-ld:Car:1", "timerel": "between", "timeAt": week(7), "endTimeAt": week(0)}),
+    )
+    .await;
+    assert!(!a.is_error(), "{}", a.text);
+    let note = a
+        .structured()
+        .get("aggregation")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        note.as_str().is_some_and(|n| n.contains("hourly")),
+        "{}",
+        a.text
+    );
     Ok(())
 }

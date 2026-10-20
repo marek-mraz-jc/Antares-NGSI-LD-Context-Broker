@@ -245,6 +245,7 @@ if [ "${WASM:-0}" = 1 ]; then
         -e ANTARES_STORE="$STORE" -e ANTARES_FILE="/data/antares-$port.redb" \
         -e ANTARES_SWEEP_SECS="${ANTARES_SWEEP_SECS:-2}" \
         -e ANTARES_HOST_ALIAS="antares$((port - 9089))" \
+        -e ANTARES_TEMPORAL_INSTANCE_LIMIT=9 \
         -e ANTARES_PUBLIC_URL="http://localhost:$port" \
         -v "$WASM_STORE_DIR:/data" \
         antares-wasm-local:latest "$port" >/dev/null \
@@ -256,6 +257,7 @@ if [ "${WASM:-0}" = 1 ]; then
       ANTARES_STORE="$STORE" ANTARES_FILE="$WASM_STORE_DIR/antares-$port.redb" \
       ANTARES_SWEEP_SECS="${ANTARES_SWEEP_SECS:-2}" \
       ANTARES_HOST_ALIAS="antares$((port - 9089))" \
+      ANTARES_TEMPORAL_INSTANCE_LIMIT=9 \
       ANTARES_PUBLIC_URL="http://localhost:$port" \
         node www/node-shim.mjs "$port" > "$RESULTS/shim-$port.log" 2>&1 &
       WASM_PIDS+=($!)

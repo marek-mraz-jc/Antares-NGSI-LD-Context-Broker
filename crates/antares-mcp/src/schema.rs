@@ -41,6 +41,11 @@ pub(crate) enum Kind {
     Word(&'static [&'static str]),
     /// An integer in this closed range.
     Int(u64, u64),
+    /// A page `limit`: 1 to the broker's Entity page ceiling (`ANTARES_MAX_LIMIT`).
+    Limit,
+    /// `lastN`: 1 to the broker's 6.3.10 instance ceiling
+    /// (`ANTARES_TEMPORAL_INSTANCE_LIMIT`), so the schema says what one call serves.
+    LastN,
     /// `true` or `false`.
     Flag,
     /// A `GeoJSON` `coordinates` array, sent as its JSON text.
@@ -192,6 +197,8 @@ fn schema_of(kind: Kind, names: &Names) -> Value {
         Kind::Text(max) => json!({"type": "string", "maxLength": max}),
         Kind::Word(words) => json!({"type": "string", "enum": words}),
         Kind::Int(min, max) => json!({"type": "integer", "minimum": min, "maximum": max}),
+        Kind::Limit => json!({"type": "integer", "minimum": 1, "maximum": limit_max()}),
+        Kind::LastN => json!({"type": "integer", "minimum": 1, "maximum": last_n_max()}),
         Kind::Flag => json!({"type": "boolean"}),
         Kind::Coordinates => json!({"type": "array", "maxItems": 1000}),
         Kind::Entity => json!({
@@ -357,6 +364,24 @@ pub(crate) enum Checked {
     Json(Value),
 }
 
+/// The `limit` ceiling: the broker's own setting, read where it reads it (T-4800).
+fn limit_max() -> u64 {
+    u64::try_from(*antares_ops::bounds::MAX_LIMIT).unwrap_or(u64::MAX)
+}
+
+/// The `lastN` ceiling: the broker's 6.3.10 setting (T-4800).
+fn last_n_max() -> u64 {
+    u64::try_from(antares_ops::bounds::temporal_instance_limit()).unwrap_or(u64::MAX)
+}
+
+/// An integer `v` in `min..=max`, or the rule it broke.
+fn int(name: &str, v: &Value, min: u64, max: u64) -> Result<Checked, Broken> {
+    let n = v.as_u64().filter(|n| (min..=max).contains(n));
+    Ok(Checked::Int(n.ok_or_else(|| {
+        broken(name, &format!("must be an integer from {min} to {max}"))
+    })?))
+}
+
 fn check(arg: &Arg, v: &Value, names: &Names) -> Result<Checked, Broken> {
     let name = arg.name;
     Ok(match arg.kind {
@@ -426,12 +451,9 @@ fn check(arg: &Arg, v: &Value, names: &Names) -> Result<Checked, Broken> {
                     .to_owned(),
             )
         }
-        Kind::Int(min, max) => {
-            let n = v.as_u64().filter(|n| (min..=max).contains(n));
-            Checked::Int(
-                n.ok_or_else(|| broken(name, &format!("must be an integer from {min} to {max}")))?,
-            )
-        }
+        Kind::Int(min, max) => int(name, v, min, max)?,
+        Kind::Limit => int(name, v, 1, limit_max())?,
+        Kind::LastN => int(name, v, 1, last_n_max())?,
         Kind::Flag => Checked::Flag(
             v.as_bool()
                 .ok_or_else(|| broken(name, "must be true or false"))?,
@@ -636,6 +658,11 @@ mod tests {
         assert!(one(Kind::Text(4), json!("abcde")).is_err());
         assert!(one(Kind::Word(&["flat"]), json!("inline")).is_err());
         assert_eq!(one(Kind::Int(1, 3), json!(3)), Ok(Checked::Int(3)));
+        // T-4800: limit and lastN reach the broker's settings, 1,000 unless set
+        assert_eq!(one(Kind::Limit, json!(1000)), Ok(Checked::Int(1000)));
+        assert!(one(Kind::Limit, json!(1001)).is_err());
+        assert_eq!(one(Kind::LastN, json!(1000)), Ok(Checked::Int(1000)));
+        assert!(one(Kind::LastN, json!(1001)).is_err());
         assert!(one(Kind::Int(1, 3), json!(4)).is_err());
         assert!(one(Kind::Int(1, 3), json!(-1)).is_err());
         assert!(one(Kind::Flag, json!("true")).is_err());

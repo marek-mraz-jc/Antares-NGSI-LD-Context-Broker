@@ -71,25 +71,22 @@ fn served_instants(body: &Value) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn clause_6_3_10_the_advertised_range_covers_every_entity_in_the_body() {
     let st = AppState::new("me".into());
-    // ten instances each, so both evolutions are cut to the nine-instance
-    // ceiling and the whole result is partial
-    let plain: Vec<String> = (0..10)
-        .map(|i| format!("2020-01-01T00:{i:02}:00Z"))
-        .collect();
+    // one instance past the broker's ceiling each (T-4800: whatever it is
+    // set to), so both evolutions are cut and the whole result is partial
+    let n = u32::try_from(antares_api::bounds::temporal_instance_limit()).expect("ceiling") + 1;
+    let at = |i: u32, frac: &str| format!("2020-01-01T{:02}:{:02}:00{frac}Z", i / 60, i % 60);
+    let plain: Vec<String> = (0..n).map(|i| at(i, "")).collect();
     let plain: Vec<&str> = plain.iter().map(String::as_str).collect();
-    let fractional = [
-        "2020-01-01T00:00:00Z",
-        "2020-01-01T00:01:00Z",
-        "2020-01-01T00:02:00Z",
-        "2020-01-01T00:03:00Z",
-        "2020-01-01T00:04:00Z",
-        "2020-01-01T00:05:00Z",
-        "2020-01-01T00:06:00Z",
-        "2020-01-01T00:07:00Z",
-        // the latest instant of the whole result, spelled with a fraction
-        "2020-01-01T00:08:00.500Z",
-        "2020-01-01T00:09:30Z",
-    ];
+    let mut fractional: Vec<String> = (0..n - 2).map(|i| at(i, "")).collect();
+    // the latest instant of the whole result, spelled with a fraction
+    let latest_served = at(n - 2, ".500");
+    fractional.push(latest_served.clone());
+    fractional.push(format!(
+        "2020-01-01T{:02}:{:02}:30Z",
+        (n - 1) / 60,
+        (n - 1) % 60
+    ));
+    let fractional: Vec<&str> = fractional.iter().map(String::as_str).collect();
     post(
         &st,
         "/ngsi-ld/v1/temporal/entities",
@@ -130,7 +127,7 @@ async fn clause_6_3_10_the_advertised_range_covers_every_entity_in_the_body() {
     let instants = served_instants(&body);
     let latest = instants.last().expect("the body carries instances");
     assert_eq!(
-        latest, "2020-01-01T00:08:00.500Z",
+        *latest, latest_served,
         "the fractional instant is the latest one served: {instants:?}"
     );
     // `date-time <start>-<end>/<size>`: both bounds are 4.6.3 DateTimes, so

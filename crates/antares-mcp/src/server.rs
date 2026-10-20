@@ -82,12 +82,17 @@ fn unknown_resource() -> ErrorData {
 }
 
 /// An inner answer, read whole.
+#[derive(Default)]
 struct Answer {
     status: StatusCode,
     /// `NGSILD-Results-Count`, when the broker sent one.
     count: Option<u64>,
     /// The id a `Location` header names, when the broker sent one.
     created: Option<String>,
+    /// A temporal answer's `Content-Range` (6.3.10): the broker cut it there.
+    range: Option<String>,
+    /// The answer Links a next instance page (6.4.7.3).
+    linked: bool,
     body: Value,
 }
 
@@ -164,15 +169,24 @@ impl Server {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.rsplit('/').next())
             .and_then(percent_decoded);
+        let range = response
+            .headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let linked = response
+            .headers()
+            .get_all(header::LINK)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.contains("rel=\"interval"));
         let body = match axum::body::to_bytes(response.into_body(), MAX_INNER_BYTES).await {
             // an empty body (a 204) is no JSON: `null`
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
             Err(_) => {
                 return Answer {
                     status: StatusCode::PAYLOAD_TOO_LARGE,
-                    count: None,
-                    created: None,
-                    body: Value::Null,
+                    ..Answer::default()
                 }
             }
         };
@@ -180,6 +194,8 @@ impl Server {
             status,
             count,
             created,
+            range,
+            linked,
             body,
         }
     }
@@ -408,6 +424,8 @@ impl Server {
         }
         let cursor = args.remove("cursor");
         let digest = cursor::digest(tool.name, &args);
+        // after the digest: an `after` window's span moves with the clock
+        let aggregated = default_aggregation(tool, &mut args, chrono::Utc::now());
         let offset = match cursor {
             Some(Checked::One(c)) => match cursor::decode(&c, tool.name, digest) {
                 Ok(offset) => offset,
@@ -434,12 +452,19 @@ impl Server {
             let out = answer.created.map(|id| json!({ tool.key: id }));
             return CallToolResult::structured(out.unwrap_or_else(|| json!({})));
         }
+        let mut extra = serde_json::Map::new();
+        if let Some(more) = more(&args, answer.range.as_deref(), answer.linked) {
+            extra.insert("more".into(), more);
+        }
+        if let Some(note) = aggregated {
+            extra.insert("aggregation".into(), json!(note));
+        }
         let rows = match answer.body {
             Value::Array(rows) if tool.paged => rows,
-            body => return whole(tool, &body),
+            body => return whole(tool, &body, extra),
         };
-        let (rows, more) = fit(rows);
-        if rows.is_empty() && more {
+        let (rows, fitted) = fit(rows);
+        if rows.is_empty() && fitted {
             return too_large(tool);
         }
         let shown = u64::try_from(rows.len()).unwrap_or(u64::MAX);
@@ -449,12 +474,13 @@ impl Server {
         if let (true, Some(total)) = (counted, answer.count) {
             out.insert("total".into(), json!(total));
         }
-        if more || answer.count.is_some_and(|c| c > next) {
+        if fitted || answer.count.is_some_and(|c| c > next) {
             out.insert(
                 "nextCursor".into(),
                 json!(cursor::encode(tool.name, digest, next)),
             );
         }
+        out.extend(extra);
         CallToolResult::structured(Value::Object(out))
     }
 }
@@ -522,13 +548,151 @@ fn fit(rows: Vec<Value>) -> (Vec<Value>, bool) {
     (kept, more)
 }
 
-/// A whole answer under `tool.key`, or the over-budget refusal.
-fn whole(tool: &ToolDef, body: &Value) -> CallToolResult {
-    let out = json!({ tool.key: body });
+/// A whole answer under `tool.key`, with its `more` and `aggregation`
+/// notes, or the over-budget refusal.
+fn whole(tool: &ToolDef, body: &Value, extra: serde_json::Map<String, Value>) -> CallToolResult {
+    let mut out = serde_json::Map::from_iter([(tool.key.to_owned(), body.clone())]);
+    out.extend(extra);
+    let out = Value::Object(out);
     if out.to_string().len() > budget() {
         return too_large(tool);
     }
     CallToolResult::structured(out)
+}
+
+/// What one call of a read tool serves, from the broker's own settings
+/// (`ANTARES_MAX_LIMIT`, `ANTARES_TEMPORAL_INSTANCE_LIMIT`), so a connector
+/// knows the page before it asks (owner, T-4800).
+fn limits_note(tool: &str) -> Option<String> {
+    let thousands = |n: usize| {
+        let digits = n.to_string();
+        let mut out = String::new();
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && digits.len().saturating_sub(i).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out
+    };
+    match tool {
+        "query_entities" => Some(format!(
+            "At most {} Entities per call (limit); more pages with nextCursor.",
+            thousands(*antares_ops::bounds::MAX_LIMIT)
+        )),
+        "batch_query_temporal" => Some(format!(
+            "At most {} values per Attribute per call; a longer span pages with the returned \
+             `more.next` range or uses aggrMethods (e.g. avg with aggrPeriodDuration PT1H).",
+            thousands(antares_ops::bounds::temporal_instance_limit())
+        )),
+        "query_temporal" | "retrieve_temporal" => Some(format!(
+            "At most {} values per Attribute per call; a longer span pages with the returned \
+             `more.next` range or uses aggrMethods (e.g. avg with aggrPeriodDuration PT1H). \
+             A window over a day answers hourly averages unless format or lastN asks raw values.",
+            thousands(antares_ops::bounds::temporal_instance_limit())
+        )),
+        _ => None,
+    }
+}
+
+/// A history read for a model (owner, T-4800): raw instances up to one day;
+/// a longer window, unless the call asks raw (`format`, `lastN`) or names
+/// its own aggregation, answers hourly averages (a week is 168 per
+/// Attribute), daily past 31 days, so one answer stays a few thousand tokens.
+/// Only a window with two ends is measured: `before` has no start. The note
+/// says what was done and how to ask raw.
+fn default_aggregation(
+    tool: &ToolDef,
+    args: &mut schema::Args,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<&'static str> {
+    let temporal = matches!(
+        tool.op,
+        OperationId::TemporalRetrieve | OperationId::TemporalQuery
+    );
+    if !temporal
+        || ["aggrMethods", "lastN", "format"]
+            .iter()
+            .any(|k| args.contains_key(k))
+    {
+        return None;
+    }
+    let instant = |key: &str| match args.get(key) {
+        Some(Checked::One(t)) => chrono::DateTime::parse_from_rfc3339(t)
+            .ok()
+            .map(|t| t.to_utc()),
+        _ => None,
+    };
+    let span = match args.get("timerel") {
+        Some(Checked::One(rel)) if rel == "between" => {
+            instant("endTimeAt")?.signed_duration_since(instant("timeAt")?)
+        }
+        Some(Checked::One(rel)) if rel == "after" => now.signed_duration_since(instant("timeAt")?),
+        _ => return None,
+    };
+    let (period, note) = if span > chrono::Duration::days(31) {
+        ("P1D", "daily averages over this window of more than 31 days; ask format temporalValues for raw values")
+    } else if span > chrono::Duration::days(1) {
+        ("PT1H", "hourly averages over this window of more than a day; ask format temporalValues for raw values")
+    } else {
+        return None;
+    };
+    for (key, value) in [
+        ("aggrMethods", "avg"),
+        ("aggrPeriodDuration", period),
+        ("format", "aggregatedValues"),
+    ] {
+        args.insert(key, Checked::One(value.to_owned()));
+    }
+    Some(note)
+}
+
+/// What a temporal answer leaves out (T-4800): the broker cut it at its
+/// instance ceiling (206 + `Content-Range`, 6.3.10) or Links an older page
+/// past `lastN` (6.4.7.3). A cut names the window that continues it, the way
+/// the broker's own Link does by time (`after` the range end repeats the
+/// boundary instant, never skips one); a `lastN` page says how to go on.
+/// `None` for a complete answer and for every non-temporal one.
+fn more(args: &schema::Args, range: Option<&str>, linked: bool) -> Option<Value> {
+    let text = |key: &str| match args.get(key) {
+        Some(Checked::One(v)) => Some(v.clone()),
+        _ => None,
+    };
+    let desc = args.contains_key("lastN");
+    let hint = "the broker served part of this history; call again with `next` for the rest, \
+                or ask aggrMethods with aggrPeriodDuration (e.g. avg, PT1H) for a window over a week";
+    let Some(range) = range else {
+        return linked.then(|| {
+            json!({ "hint": "lastN returned the newest instances of each Attribute and older ones \
+                    exist: ask timerel before the oldest instant shown, or aggrMethods with \
+                    aggrPeriodDuration (e.g. avg, PT1H) for the whole window" })
+        });
+    };
+    // `date-time <start>-<end>/<size>`: the served end is where the next page starts
+    let (_, end) = range
+        .strip_prefix("date-time ")
+        .and_then(|r| r.rsplit_once('/'))
+        .map(|(span, _)| span)
+        .and_then(|span| {
+            span.match_indices('-').map(|(i, _)| i).find_map(|i| {
+                let (a, b) = span.split_at(i);
+                let b = b.strip_prefix('-')?;
+                let ok = |t: &str| chrono::DateTime::parse_from_rfc3339(t).is_ok();
+                (ok(a) && ok(b)).then(|| (a.to_owned(), b.to_owned()))
+            })
+        })?;
+    let (rel, at, end_at) = (text("timerel"), text("timeAt"), text("endTimeAt"));
+    let between =
+        |from: String, to: String| json!({"timerel": "between", "timeAt": from, "endTimeAt": to});
+    let next = match (desc, rel.as_deref(), at, end_at) {
+        (false, Some("between"), _, Some(e)) | (false, Some("before"), Some(e), _) => {
+            between(end, e)
+        }
+        (false, ..) => json!({"timerel": "after", "timeAt": end}),
+        (true, Some("between" | "after"), Some(a), _) => between(a, end),
+        (true, ..) => json!({"timerel": "before", "timeAt": end}),
+    };
+    Some(json!({ "range": range, "next": next, "hint": hint }))
 }
 
 /// MC19: what was called and how it ended, never the arguments.
@@ -560,7 +724,7 @@ fn too_large(tool: &ToolDef) -> CallToolResult {
         || tool.op == OperationId::TemporalQuery
         || tool.op == OperationId::TemporalQueryPost
     {
-        "lastN, attrs or a shorter time range"
+        "aggrMethods with aggrPeriodDuration (e.g. avg, PT1H), lastN, attrs or a shorter time range"
     } else {
         "pick or attrs"
     };
@@ -716,12 +880,16 @@ impl ServerHandler for Server {
         let mut tools: Vec<Tool> = offered
             .into_iter()
             .map(|t| {
-                let description: Cow<'static, str> = match &guide {
-                    Some(guide) if matches!(t.name, "query_entities" | "query_temporal") => {
-                        Cow::Owned(format!("{}\n\n{guide}", t.description))
-                    }
-                    _ => Cow::Borrowed(t.description),
-                };
+                let mut description: Cow<'static, str> = Cow::Borrowed(t.description);
+                if let Some(limits) = limits_note(t.name) {
+                    description = Cow::Owned(format!("{description} {limits}"));
+                }
+                if let Some(guide) = guide
+                    .as_ref()
+                    .filter(|_| matches!(t.name, "query_entities" | "query_temporal"))
+                {
+                    description = Cow::Owned(format!("{description}\n\n{guide}"));
+                }
                 Tool::new(
                     t.name,
                     description,
@@ -907,12 +1075,153 @@ mod tests {
         }
     }
 
+    /// T-4800: the prod 206 of a 31-day temperature read (Content-Range of
+    /// 2026-10-20 05:50Z) names the window that continues it.
+    #[test]
+    fn a_cut_temporal_answer_names_the_window_that_continues_it() {
+        let one = |v: &str| Checked::One(v.to_owned());
+        let range = "date-time 2026-10-01T00:00:00Z-2026-10-19T00:58:00Z/*";
+        let after = schema::Args::from([
+            ("timerel", one("after")),
+            ("timeAt", one("2026-10-01T00:00:00Z")),
+        ]);
+        let m = more(&after, Some(range), true).unwrap_or_default();
+        assert_eq!(m.get("range").cloned().unwrap_or_default(), range);
+        assert_eq!(
+            m.get("next").cloned().unwrap_or_default(),
+            json!({"timerel": "after", "timeAt": "2026-10-19T00:58:00Z"})
+        );
+        assert!(m
+            .get("hint")
+            .and_then(Value::as_str)
+            .is_some_and(|h| h.contains("aggrMethods")));
+
+        let between = schema::Args::from([
+            ("timerel", one("between")),
+            ("timeAt", one("2026-10-01T00:00:00Z")),
+            ("endTimeAt", one("2026-11-01T00:00:00Z")),
+        ]);
+        assert_eq!(
+            more(&between, Some(range), true).and_then(|m| m.get("next").cloned()),
+            Some(
+                json!({"timerel": "between", "timeAt": "2026-10-19T00:58:00Z", "endTimeAt": "2026-11-01T00:00:00Z"})
+            )
+        );
+
+        // lastN pages backwards: the next window ends where this one did
+        let mut last = between.clone();
+        last.insert("lastN", Checked::Int(100));
+        let back = "date-time 2026-11-01T00:00:00Z-2026-10-30T12:00:00+02:00/100";
+        assert_eq!(
+            more(&last, Some(back), true).and_then(|m| m.get("next").cloned()),
+            Some(
+                json!({"timerel": "between", "timeAt": "2026-10-01T00:00:00Z", "endTimeAt": "2026-10-30T12:00:00+02:00"})
+            )
+        );
+        // ascending `before`: the rest runs up to the request's own instant
+        let before = schema::Args::from([
+            ("timerel", one("before")),
+            ("timeAt", one("2026-11-01T00:00:00Z")),
+        ]);
+        assert_eq!(
+            more(&before, Some(range), true).and_then(|m| m.get("next").cloned()),
+            Some(
+                json!({"timerel": "between", "timeAt": "2026-10-19T00:58:00Z", "endTimeAt": "2026-11-01T00:00:00Z"})
+            )
+        );
+        // lastN on `before`: further back from the oldest instance served
+        let mut last_before = before.clone();
+        last_before.insert("lastN", Checked::Int(100));
+        assert_eq!(
+            more(&last_before, Some(back), true).and_then(|m| m.get("next").cloned()),
+            Some(json!({"timerel": "before", "timeAt": "2026-10-30T12:00:00+02:00"}))
+        );
+        // a lastN page with older instances Linked: how to go on, no window
+        let m = more(&last, None, true).unwrap_or_default();
+        assert!(m.get("next").is_none());
+        let hint = m.get("hint").and_then(Value::as_str).unwrap_or_default();
+        assert!(hint.contains("before"), "{hint}");
+        // a complete answer, or a range that is no date-time range: nothing
+        assert_eq!(more(&after, None, false), None);
+        assert_eq!(more(&after, Some("bytes 0-9/10"), false), None);
+    }
+
+    /// T-4800: the read tools advertise the broker's own ceilings (1,000
+    /// each unless set), and the temporal ones how to read past them.
+    #[test]
+    fn the_read_tools_advertise_the_broker_ceilings() {
+        for tool in [
+            "query_temporal",
+            "retrieve_temporal",
+            "batch_query_temporal",
+        ] {
+            let note = limits_note(tool).unwrap_or_default();
+            assert!(
+                note.starts_with("At most 1,000 values per Attribute per call"),
+                "{note}"
+            );
+            assert!(note.contains("more.next"), "{note}");
+            assert!(note.contains("aggrMethods"), "{note}");
+        }
+        let note = limits_note("query_entities").unwrap_or_default();
+        assert!(
+            note.starts_with("At most 1,000 Entities per call"),
+            "{note}"
+        );
+        assert_eq!(limits_note("get_entity"), None);
+    }
+
+    /// T-4800: a history window over a day answers hourly averages, over 31
+    /// days daily ones; a day or less, `before`, or a call naming its own
+    /// format, lastN or aggregation stays as asked.
+    #[test]
+    fn a_long_history_window_answers_aggregates_unless_raw_is_asked() {
+        let one = |v: &str| Checked::One(v.to_owned());
+        let retrieve = tools::named("retrieve_temporal").unwrap_or(&TOOLS[0]);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-20T06:00:00Z")
+            .map(|t| t.to_utc())
+            .unwrap_or_default();
+        let window =
+            |rel: &str, at: &str| schema::Args::from([("timerel", one(rel)), ("timeAt", one(at))]);
+        let mut week = window("after", "2026-10-13T06:00:00Z");
+        assert!(default_aggregation(retrieve, &mut week, now).is_some_and(|n| n.contains("hourly")));
+        assert_eq!(week.get("aggrPeriodDuration"), Some(&one("PT1H")));
+        assert_eq!(week.get("aggrMethods"), Some(&one("avg")));
+        assert_eq!(week.get("format"), Some(&one("aggregatedValues")));
+
+        let mut months = window("between", "2026-08-01T00:00:00Z");
+        months.insert("endTimeAt", one("2026-10-01T00:00:00Z"));
+        assert!(
+            default_aggregation(retrieve, &mut months, now).is_some_and(|n| n.contains("daily"))
+        );
+        assert_eq!(months.get("aggrPeriodDuration"), Some(&one("P1D")));
+
+        let mut day = window("after", "2026-10-19T12:00:00Z");
+        assert_eq!(default_aggregation(retrieve, &mut day, now), None);
+        let mut before = window("before", "2026-10-01T00:00:00Z");
+        assert_eq!(default_aggregation(retrieve, &mut before, now), None);
+        let mut raw = window("after", "2026-10-01T00:00:00Z");
+        raw.insert("format", one("temporalValues"));
+        assert_eq!(default_aggregation(retrieve, &mut raw, now), None);
+        assert!(!raw.contains_key("aggrMethods"));
+        let mut odd = window("after", "2026-10-01T00:00:00Z");
+        odd.insert("timeAt", Checked::Int(1));
+        assert_eq!(default_aggregation(retrieve, &mut odd, now), None);
+        let mut bad = window("after", "yesterday");
+        assert_eq!(default_aggregation(retrieve, &mut bad, now), None);
+        let entities = tools::named("query_entities").unwrap_or(&TOOLS[0]);
+        let mut week = window("after", "2026-10-13T06:00:00Z");
+        assert_eq!(default_aggregation(entities, &mut week, now), None);
+    }
+
     #[test]
     fn an_error_says_status_and_title_and_never_the_detail() {
         let a = Answer {
             status: StatusCode::BAD_REQUEST,
             count: None,
             created: None,
+            range: None,
+            linked: false,
             body: json!({"title": "BadRequestData", "detail": "secret speed<80"}),
         };
         let r = failed(&a);

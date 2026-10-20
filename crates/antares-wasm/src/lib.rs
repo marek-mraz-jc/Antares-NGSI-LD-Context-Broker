@@ -85,6 +85,18 @@ impl Broker {
         {
             state.public_url = url;
         }
+        // 6.3.10 ceiling (ANTARES_TEMPORAL_INSTANCE_LIMIT, T-4800): the same
+        // variable off `globalThis`, set before construction; the ETSI cells
+        // set 9 for the suite's 206 cases. Absent → the native default.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(n) =
+            js_sys::Reflect::get(&js_sys::global(), &"ANTARES_TEMPORAL_INSTANCE_LIMIT".into())
+                .ok()
+                .and_then(|v| v.as_f64())
+                .filter(|n| *n >= 1.0)
+        {
+            state.temporal_instance_limit = n as usize;
+        }
         // 4.22 GC: the native broker sweeps on a tokio interval (main.rs,
         // ANTARES_SWEEP_SECS). The browser has no env, so the SAME variable is
         // read off `globalThis.ANTARES_SWEEP_SECS` (seconds, set before

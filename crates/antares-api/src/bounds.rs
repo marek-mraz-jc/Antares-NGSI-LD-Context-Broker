@@ -55,6 +55,38 @@ pub static MAX_BATCH_ITEMS: std::sync::LazyLock<usize> = std::sync::LazyLock::ne
         .filter(|n| *n > 0)
         .unwrap_or(1_000)
 });
+/// Deployment knob (ANTARES_MAX_LIMIT): the most Entities one query page
+/// answers (`limit`, 6.3.9; past it 403 TooManyResults) and the default page
+/// size. 1,000 unless set; read once at first use, and advertised by the MCP
+/// tools as their `limit` maximum (T-4800).
+pub static MAX_LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("ANTARES_MAX_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1_000)
+});
+/// Deployment knob (ANTARES_TEMPORAL_INSTANCE_LIMIT): NGSI-LD 6.3.10, the
+/// most instances of one Attribute a temporal response serves; past it the
+/// representation is cut and answered 206 with a Content-Range. 1,000 unless
+/// set: a week of a 10-minute sensor in one answer (T-4800). The ETSI suite
+/// creates 20 instances and expects the cut, so its brokers run with 9. The
+/// answer stays bounded by [`MAX_ANSWER_BYTES`]; the MCP tools advertise it
+/// as their `lastN` maximum. Read once at first use into
+/// `AppState::temporal_instance_limit`, which a test or the wasm broker
+/// (no process env; it reads `globalThis`) sets per state.
+pub static TEMPORAL_INSTANCE_LIMIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("ANTARES_TEMPORAL_INSTANCE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1_000)
+});
+
+/// [`TEMPORAL_INSTANCE_LIMIT`].
+pub fn temporal_instance_limit() -> usize {
+    *TEMPORAL_INSTANCE_LIMIT
+}
 // Deployment knob (ANTARES_MAX_FED_RESPONSE_BYTES): ceiling on one forwarded
 // (4.3.6) response body. The spec sets no ceiling; an over-cap peer part
 // fails like an unparseable payload (Table 6.3.17-1, warning 111) instead of
@@ -361,6 +393,8 @@ impl LimitStats {
             "maxJsonDepth": MAX_JSON_DEPTH,
             "maxGeoVertices": MAX_GEO_VERTICES,
             "maxBatchItems": *MAX_BATCH_ITEMS,
+            "maxLimit": *MAX_LIMIT,
+            "temporalInstanceLimit": temporal_instance_limit(),
             "maxAnswerBytes": MAX_ANSWER_BYTES,
             "maxFoldDocs": *MAX_FOLD_DOCS,
             "maxFedResponseBytes": *MAX_FED_RESPONSE_BYTES,
@@ -632,6 +666,7 @@ mod tests {
                 "maxInProcessCallDepth",
                 "maxJoinLevel",
                 "maxJsonDepth",
+                "maxLimit",
                 "maxPeerWarnings",
                 "maxQLinkLookups",
                 "maxQNodes",
@@ -643,6 +678,7 @@ mod tests {
                 "rejectedBodyTooDeep",
                 "rejectedBodyTooLarge",
                 "rejectedUriTooLong",
+                "temporalInstanceLimit",
             ],
             "no member beyond the caps, the pipeline ceilings and the counters"
         );

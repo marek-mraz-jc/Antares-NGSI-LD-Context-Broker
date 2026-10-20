@@ -86,6 +86,7 @@ progress). A memory-store broker answers:
     "maxInProcessCallDepth": 8,
     "maxJoinLevel": 10,
     "maxJsonDepth": 64,
+    "maxLimit": 1000,
     "maxPeerWarnings": 8,
     "maxQLinkLookups": 512,
     "maxQNodes": 512,
@@ -96,7 +97,8 @@ progress). A memory-store broker answers:
     "maxUriBytes": 8192,
     "rejectedBodyTooDeep": 0,
     "rejectedBodyTooLarge": 0,
-    "rejectedUriTooLong": 0
+    "rejectedUriTooLong": 0,
+    "temporalInstanceLimit": 1000
   },
   "memory": { "allocatedBytes": 5671592, "residentBytes": 24051712 }
 }

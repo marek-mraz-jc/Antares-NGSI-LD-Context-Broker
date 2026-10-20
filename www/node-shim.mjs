@@ -137,6 +137,10 @@ class FsSyncAccessHandle {
 if (process.env.ANTARES_SWEEP_SECS) {
   globalThis.ANTARES_SWEEP_SECS = Number(process.env.ANTARES_SWEEP_SECS);
 }
+// 6.3.10 ceiling, same globalThis route; the ETSI cells set 9 (T-4800).
+if (process.env.ANTARES_TEMPORAL_INSTANCE_LIMIT) {
+  globalThis.ANTARES_TEMPORAL_INSTANCE_LIMIT = Number(process.env.ANTARES_TEMPORAL_INSTANCE_LIMIT);
+}
 // 5.8.1.4: the callback URL distributed subscriptions hand to remote
 // brokers — same globalThis route (wasm32 has no process env). Without it
 // the portless host-alias default is undialable between local processes.
