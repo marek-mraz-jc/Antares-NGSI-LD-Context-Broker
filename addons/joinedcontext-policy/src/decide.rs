@@ -385,6 +385,11 @@ fn admits(p: &Policy, op: &Operation<'_>, types: &[String]) -> Vec<Admit> {
     if !p.conditions.temporal.is_empty() {
         return Vec::new();
     }
+    // a grant of every type without a condition takes the write whole, a write naming no type
+    // included (5.6.11 names none; a write by id of an absent Entity has no stored type)
+    if p.selectors.is_empty() && !p.is_conditional() {
+        return vec![Admit::Whole];
+    }
     let every_type: Vec<Rule>;
     let selectors = if p.selectors.is_empty() {
         every_type = types
@@ -556,6 +561,42 @@ mod tests {
             Decision::Deny(NOT_GRANTED.into()),
             "another type is not prohibited, nor granted"
         );
+        Ok(())
+    }
+
+    /// T-4855: a grant without information and without a condition admits a write that names
+    /// no type (Upsert Temporal, 5.6.11, names none); a conditional one still refuses it, and a
+    /// prohibition naming no type still wins.
+    #[test]
+    fn a_grant_of_every_type_admits_a_write_naming_none() -> Result<(), String> {
+        let every_type = table(&json!({"information": [], "operations": ["5.6.11", "5.6.16"]}))?;
+        for clause in ["5.6.11", "5.6.16"] {
+            assert_eq!(
+                with(&every_type, clause, &[], &[], None, false),
+                Decision::Allow
+            );
+        }
+        let conditional = table(&json!({"information": [], "operations": ["5.6.11"],
+                                        "q": "speed<100"}))?;
+        assert_eq!(
+            with(&conditional, "5.6.11", &[], &[], None, false),
+            Decision::Deny(NOT_GRANTED.into())
+        );
+        let grant = json!({"id": "all", "assignee": {"kind": "role", "id": "r"},
+                           "operations": ["5.6.11"]});
+        let prohibit = json!({"id": "no", "assignee": {"kind": "role", "id": "r"},
+                              "effect": "prohibit", "operations": ["5.6.11"]});
+        let both = compile(&json!({"policies": [grant, prohibit]}))?;
+        assert_eq!(
+            with(&both, "5.6.11", &[], &[], None, false),
+            Decision::Deny(PROHIBITED.into())
+        );
+        let smuggled = json!({"id": "urn:ngsi-ld:Car:1", "type": "Car",
+                              "acl": {"type": "Property", "value": "x"}});
+        assert!(matches!(
+            with(&every_type, "5.6.11", &[], &[], Some(&smuggled), false),
+            Decision::Deny(_)
+        ));
         Ok(())
     }
 
