@@ -928,9 +928,15 @@ impl PgTemporalStore {
             wheres.push(format!("m.id = ANY(${})", binds.len()));
         }
         if let Some(types) = f.types {
-            // overlap: entity has ANY of the wanted types (flat OR list)
+            // overlap: entity has ANY of the wanted types (flat OR list).
+            // `&&` alone is no index condition under RLS (not leakproof):
+            // the first-type arm and the multi-type arm are (migration 0015),
+            // and they BitmapOr instead of reading the Tenant (T-4852).
             binds.push(B::Arr(super::storable(types)));
-            wheres.push(format!("m.types && ${}", binds.len()));
+            let n = binds.len();
+            wheres.push(format!(
+                "(m.types[1] = ANY(${n}) OR (cardinality(m.types) > 1 AND m.types && ${n}))"
+            ));
         }
         if let Some(attrs) = f.attrs {
             binds.push(B::Arr(super::storable(attrs)));
