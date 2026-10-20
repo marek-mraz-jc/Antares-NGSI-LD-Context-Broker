@@ -17,6 +17,12 @@
 -- `temporal_entities`: the first-type and multi-type indexes `entities`
 -- got in 0013, for the `types[1] = ANY(..)` arms of the temporal query.
 --
+-- `csource_index` (tenant_id, registration_id): the key of its foreign key
+-- to `csource_registrations` and of every registration update's
+-- `DELETE FROM csource_index` (store/pg/doc.rs). Without it each cascaded
+-- or updated registration read the whole table: deleting 22 000
+-- registrations ran past the 30 s statement_timeout.
+--
 -- An index changes no access: RLS and every query's own WHERE are untouched.
 CREATE OR REPLACE FUNCTION geo_cell(g geometry) RETURNS text
 LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
@@ -37,3 +43,5 @@ CREATE INDEX i_entities_location_cell ON entities (tenant_id, location_cell)
 CREATE INDEX i_temporal_entities_first_type ON temporal_entities (tenant_id, (types[1]));
 CREATE INDEX i_temporal_entities_multi_type ON temporal_entities (tenant_id)
   WHERE cardinality(types) > 1;
+
+CREATE INDEX i_csource_index_registration ON csource_index (tenant_id, registration_id);
