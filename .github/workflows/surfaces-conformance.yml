@@ -101,7 +101,9 @@ env:
   # cases for T-4258's format/sysAttrs/orderBy, one commit on top (branch
   # pin/antares-surfaces, same change as conformance main 494cd93), and the
   # describe_type parity case (T-4537, T-4559; conformance main 2594d95)
-  CONFORMANCE_REF: 030a129a27a7fad256624c1256de225f3743d8f8
+  # conformance main d581c6d since T-4879: tests/ws/test_rfc6455.py (RFC 6455
+  # close handshake and protocol-error codes) joins ws-conformance
+  CONFORMANCE_REF: d581c6d242bc35d9afcbc20d0421d76b3d8b76b2
   NIGHTLY: ${{ github.event_name != 'pull_request' && !inputs.fast }}
 
 jobs:
