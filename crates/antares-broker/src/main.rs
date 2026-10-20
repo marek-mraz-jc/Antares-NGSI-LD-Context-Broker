@@ -74,6 +74,10 @@ const KNOWN_KEYS: &[&str] = &[
     // T-4665: the gateway's mesh identity; only it is believed in its
     // provenance headers. Unset, every write is `channel: api`.
     "ANTARES_PROVENANCE_FROM",
+    // T-4875: the mesh identities (l5d-client-id) whose policy subject
+    // headers are believed; from anyone else they are dropped. Unset,
+    // every caller's are, as before.
+    "ANTARES_POLICY_SUBJECT_FROM",
     // 4.22 GC interval (memory/file arm); default 900 s, the ETSI stack runs
     // at 2 s so the transient TPs (422_01) exercise the sweep itself.
     "ANTARES_SWEEP_SECS",
@@ -1209,6 +1213,25 @@ async fn run(
     } else {
         antares_api::ops_router(state)
     };
+    let routed = match subject_from() {
+        Some(from) => {
+            tracing::info!(
+                ?from,
+                "policy subject headers believed from these mesh identities alone"
+            );
+            routed.layer(tower::util::MapRequestLayer::new(
+                move |mut req: axum::extract::Request| {
+                    antares_api::policy::drop_subject_unless_from(
+                        req.headers_mut(),
+                        &antares_api::policy::SUBJECT_HEADERS,
+                        &from,
+                    );
+                    req
+                },
+            ))
+        }
+        None => routed,
+    };
     let app: App = tower::util::MapRequest::new(routed, antares_api::trim_trailing_slash);
 
     // A connection that never finishes its request headers must not hold a
@@ -1363,6 +1386,18 @@ fn accept_backoff(e: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::Interrupted
     )
+}
+
+/// `ANTARES_POLICY_SUBJECT_FROM`, comma-separated mesh identities; `None`
+/// when unset or empty, which believes every caller's subject headers.
+fn subject_from() -> Option<Vec<String>> {
+    let from: Vec<String> = std::env::var("ANTARES_POLICY_SUBJECT_FROM")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!from.is_empty()).then_some(from)
 }
 
 /// The served app: the router under trailing-slash normalization, which

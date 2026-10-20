@@ -1466,6 +1466,27 @@ pub static SUBJECT_HEADERS: LazyLock<Vec<String>> = LazyLock::new(|| {
         .collect()
 });
 
+/// Drops every header in `names` (the subject headers) from a request whose
+/// `l5d-client-id`, the mesh identity the Linkerd proxy in front of the
+/// broker sets from the caller's mTLS certificate, is not in `from`
+/// (`ANTARES_POLICY_SUBJECT_FROM`). Any pod that reaches the broker port can
+/// write `x-jc-subject`; only the mesh identity tells the gateway from it. A
+/// request stripped here names nobody, which the engine treats as the
+/// cluster's own. The binary applies it once, to the request it accepted;
+/// the in-process hops a surface makes carry the outer request's subject.
+pub fn drop_subject_unless_from(headers: &mut HeaderMap, names: &[String], from: &[String]) {
+    let believed = headers
+        .get("l5d-client-id")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|id| from.iter().any(|f| f == id));
+    if believed {
+        return;
+    }
+    for name in names {
+        headers.remove(name.as_str());
+    }
+}
+
 /// Who this request is from, as far as the seam is concerned: the tenant it
 /// addresses and the headers a deployment named. A header the request does
 /// not carry is simply absent — the seam invents nothing.
@@ -2018,6 +2039,42 @@ impl PolicyEngine for Slow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-4875: a subject header is believed from a listed mesh identity
+    /// alone; a forged one from any other pod, or with no identity, is gone.
+    #[test]
+    fn subject_is_dropped_unless_from_a_listed_mesh_identity() {
+        let names = vec!["x-jc-subject".to_owned(), "x-jc-groups".to_owned()];
+        let from = vec![
+            "context-gateway.context-gateway.serviceaccount.identity.linkerd.cluster.local"
+                .to_owned(),
+        ];
+        let request = |id: Option<&str>| {
+            let mut h = HeaderMap::new();
+            h.insert("x-jc-subject", "alice".parse().unwrap());
+            h.append("x-jc-groups", "admins".parse().unwrap());
+            h.insert("x-other", "kept".parse().unwrap());
+            if let Some(id) = id {
+                h.insert("l5d-client-id", id.parse().unwrap());
+            }
+            h
+        };
+        let mut gateway = request(Some(from[0].as_str()));
+        drop_subject_unless_from(&mut gateway, &names, &from);
+        assert_eq!(gateway.get("x-jc-subject").unwrap(), "alice");
+        assert_eq!(gateway.get("x-jc-groups").unwrap(), "admins");
+        for id in [
+            None,
+            Some("default.scratch.serviceaccount.identity.linkerd.cluster.local"),
+            Some(""),
+        ] {
+            let mut h = request(id);
+            drop_subject_unless_from(&mut h, &names, &from);
+            assert!(h.get("x-jc-subject").is_none(), "{id:?}");
+            assert!(h.get("x-jc-groups").is_none(), "{id:?}");
+            assert_eq!(h.get("x-other").unwrap(), "kept");
+        }
+    }
 
     /// `admits` is `shown(..).is_some()` without the set (T-3667).
     #[test]
