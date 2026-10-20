@@ -78,7 +78,9 @@ module's header comment.
 
 | Module | Surface |
 |---|---|
-| `lib.rs` | the router (`/ngsi-ld/v1` nest, `/q/*` admin, `/info`), tenant purge, shared helpers |
+| `lib.rs` | module declarations and re-exports, `spawn`, `wire`, the 5.5.4 document fragment, shared helpers |
+| `router.rs` | router assembly: the `/ngsi-ld/v1` route table (`api_routes`), `router`, `ops_router`, the request layers (tenant existence and echo, CORS, metrics, trailing slash, 405/501/OPTIONS, 404) |
+| `ops.rs` | the `/q/*` operational surface (`Admin`): health, readiness, metrics, tenant list, size and purge, the dead-letter admin |
 | `negotiate.rs` | 6.3.4–6.3.6: tenant, Accept, Content-Type, `@context` resolution, parameter allow-lists (the query set of 6.4.3.2 included) and the RFC 7230 header-syntax checks. Every handler passes through `tenant_from`, `check_params`, `parse_body`, `request_context` |
 | `entities.rs` | 5.6.1–5.6.6, 5.7.1–5.7.2 `/entities`, distributed write fan-out |
 | `paging.rs` | 4.12, 6.3.10 limit/offset/count and the next/prev links, 4.23 ordering and ICU collation, 6.3.17 `NGSILD-Warning`, the query body of 5.2.23 lifted into parameters; every list operation pages through it |
@@ -89,7 +91,7 @@ module's header comment.
 | `temporalq.rs` | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |
 | `types_attrs.rs` | 5.7.5–5.7.10 `/types`, `/attributes` |
 | `subscriptions.rs` | 5.8, 5.11 `/subscriptions`, `/csourceSubscriptions` |
-| `notify.rs` | 5.8.6 matching and delivery, the subscription mirror, interval sweeps, csource notifications |
+| `notify/` | 5.8.6 notifications: `mod.rs` wiring, the change queue and temporal recording; `matching.rs` candidate evaluation; `payload.rs` the body; `throttle.rs` the drain, lanes and delivery slots; `interval.rs` periodic sweeps; `delivery.rs` one send (egress check, headers); `csource.rs` csource notifications; `retry.rs` retries and dead letters |
 | `distsub.rs` | 5.8.1.4 distributed subscriptions, consumer half |
 | `csource.rs` | 5.9, 5.10 registrations, `csource_index` maintenance |
 | `registry.rs` | matching over a registration document: `CsrSpec`, the 4.3.6.1 information match, csf and scope filters, the temporal interval and expiry of a registration, the 5.11.2 subscription match; named by federation, notify, csource and every resource module that forwards |
@@ -128,7 +130,7 @@ the coercion it feeds.
 
 ```
 TCP accept (broker main.rs, TCP_NODELAY)
- → axum router (api lib.rs)
+ → axum router (api router.rs)
  → negotiate: tenant header → TenantId, Accept/Content-Type, params allow-list,
    Link/@context → antares_jsonld::Loader (cache, pinned core context)
  → bounds: body size/depth, URI length (rejects are counted in /q/health)
@@ -155,7 +157,7 @@ store write commits
  → ChangeHook (set at wiring; api role only)
      history.rs: temporal auto-recording, synchronous, same request
      buffer_change → per-request change buffer → change_flush at response
- → notify.rs::wire: bounded mpsc (CHANGE_QUEUE); a full queue drops and
+ → notify/mod.rs::wire: bounded mpsc (CHANGE_QUEUE); a full queue drops and
    counts (antares_notification_changes_dropped_total, warn per thousand)
  → drain task: ONE task, batch → process_changes, the next batch taken
    only once this one's deliveries have all settled (which is what keeps
@@ -488,7 +490,7 @@ Stated so they are not rediscovered. Each is measured, not guessed.
 | Change | Touch | Also |
 |---|---|---|
 | a new query parameter | `negotiate.rs` allow-list, the handler, `antares-ql` if it has grammar | a `docs/spec/` ledger entry, a Robot TP |
-| a new NGSI-LD resource | `<resource>.rs` + route in `lib.rs` | `Kind` in `antares-store` if it is stored |
+| a new NGSI-LD resource | `<resource>.rs` + route in `router.rs` | `Kind` in `antares-store` if it is stored |
 | an error status | `antares-model` `NgsiError` | Table 6.3.2-1 in the doc comment |
 | a cap | `bounds.rs` + env key + `docs/src/configuration.md` | `/q/health` test |
 | a store backend | implement both driver traits in a new crate | a name on `store_shelf()` behind its feature (`examples/plugin-example` is the worked one); a built-in also takes a `StoreMode` value, an `AnyStore` arm and a CI cell |
@@ -497,7 +499,7 @@ Stated so they are not rediscovered. Each is measured, not guessed.
 | a schema change | a new numbered migration; never edit an applied one | RLS policy + `FORCE` on the table |
 | federation behaviour | `federation.rs` (`forward` is the one outbound chokepoint) | 4.3.6 narrowing is spec-mandated; keep it |
 | the bus or roles | `broker/src/wiring.rs` | ADR-0002 |
-| a role's HTTP surface | `lib.rs` router construction by `roles` | a worker must 404 the API |
+| a role's HTTP surface | `router.rs` router construction by `roles` | a worker must 404 the API |
 | another standard's API beside NGSI-LD (SensorThings, OGC API, WFS) | an `ApiSurface` under `/x/…` in its own crate that calls `AppState::call` — the in-process handle over this broker's own router, built once per state on first use | never under `/ngsi-ld/`; every façade request is an NGSI-LD request, so negotiation, bounds and tenancy are not repeated. The handle carries `NGSILD-Tenant`, `NGSILD-Snapshot`, `Link` and the policy subject headers from the caller, so a façade cannot be the way around any of them |
 | an authorization decision | no engine in the broker: `policy.rs` is the seam one attaches to, and the gateway keeps authentication and rate limiting (the broker's one credential of its own is the optional `/q` admin secret, `admin_auth.rs`) (`docs/src/shared-crates.md`, "The PEP boundary") | conformance is asserted against the built-in allow-all engine, the way `surface.rs` refuses a surface under the API root |
 | an NGSI-LD operation | one `policy::gate` call where the request enters its handler, naming the clause | exactly once per request: the shared query engines below a handler (`query_entities_inner`, `query_temporal_inner`) never gate, and `tests/policy_gate_seam.rs` walks every route of `router()` to prove both halves |
@@ -518,5 +520,5 @@ wall, quick ETSI matrix) → `full.yml` (seven store cells, twice weekly)
 
 `docs/src/introduction.md` → this file → `docs/adr/` (0001, 0002, 0004,
 0005, 0013, 0015) → `crates/antares-api/src/negotiate.rs` →
-`entities.rs::create_entity` → `notify.rs::wire` →
+`entities.rs::create_entity` → `notify/mod.rs::wire` →
 `crates/antares-sql/src/store/pg/entity.rs` → `broker/src/wiring.rs`.

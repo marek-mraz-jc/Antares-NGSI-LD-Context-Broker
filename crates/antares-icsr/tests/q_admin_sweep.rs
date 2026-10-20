@@ -256,7 +256,7 @@ fn routes_equals_what_the_sources_mount() {
         "a new module adds /q routes: list its route file below and its routes in ROUTES"
     );
 
-    let api = read("crates/antares-api/src/lib.rs");
+    let api = read("crates/antares-api/src/ops.rs");
     let paths = api
         .split_once("const PATHS:")
         .and_then(|(_, rest)| rest.split_once("];"))
