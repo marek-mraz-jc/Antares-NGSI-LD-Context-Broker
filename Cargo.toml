@@ -124,7 +124,9 @@ tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "json", "chrono", "uuid", "migrate", "macros"] }
 # The JetStream change spine — official client, KV + streams in core
 # (0.50; pre-1.0 pin — upgrade in dedicated PRs)
-async-nats = "0.50"
+# Default features minus "websockets": the bus dials nats:// only, and that
+# transport pulled webpki-roots 0.26 (RUSTSEC-2026-0381) via tokio-websockets.
+async-nats = { version = "0.50", default-features = false, features = ["server_2_10", "server_2_11", "server_2_12", "server_2_14", "service", "ring", "jetstream", "nkeys", "crypto", "object-store", "kv", "nuid"] }
 futures-util = { version = "0.3", default-features = false }
 thiserror = "2"
 tracing = "0.1"
