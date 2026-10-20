@@ -304,11 +304,27 @@ async fn a_type_page_reads_its_type_through_an_index_under_rls() {
     }
     tx.commit().await.expect("seed");
     // autovacuum keeps the visibility map that index-only scans need; a
-    // freshly seeded table has none yet
-    sqlx::query("VACUUM ANALYZE entities")
-        .execute(&pool)
+    // freshly seeded table has none yet. A snapshot another session holds
+    // while VACUUM runs (a parallel test's transaction) keeps the new rows
+    // from being all-visible, and the count then plans bitmap heap scans
+    // (strict run 39362539144): vacuum again until the map covers the table.
+    let mut visible = (0, 0);
+    for _ in 0..60 {
+        sqlx::query("VACUUM ANALYZE entities")
+            .execute(&pool)
+            .await
+            .expect("vacuum");
+        visible = sqlx::query_as::<_, (i32, i32)>(
+            "SELECT relallvisible, relpages FROM pg_class WHERE oid = 'entities'::regclass",
+        )
+        .fetch_one(&pool)
         .await
-        .expect("vacuum");
+        .expect("visibility map");
+        if visible.0 >= visible.1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 
     let w = "tenant_id = 'pgexplain-types' AND (expires_at IS NULL OR expires_at > now())";
     let first = format!("{w} AND types[1] = 'https://x/B'");
@@ -350,7 +366,10 @@ async fn a_type_page_reads_its_type_through_an_index_under_rls() {
                     && l.contains("types[1]")
                     && l.contains("'https://x/B'"))
                 && plan.contains(&format!("{scan} using i_entities_multi_type_id")),
-            "the {what} no longer reads its type through the type indexes — plan:\n{plan}"
+            "the {what} no longer reads its type through the type indexes \
+             ({} of {} pages all-visible) — plan:\n{plan}",
+            visible.0,
+            visible.1
         );
         assert!(
             !plan.contains("entities_pkey") && !plan.contains("Seq Scan"),
