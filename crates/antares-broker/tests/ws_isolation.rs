@@ -161,6 +161,26 @@ async fn subscribe(port: u16, view: &str, extra: &[(&str, &str)], body: Value) -
     .expect("subscribed")
 }
 
+/// The messages the socket gets up to its next notification, the socket
+/// handed back: a write waits for its notification before the next one,
+/// since a notification reads the stored state when it leaves.
+async fn until_notified(socket: Socket) -> (Socket, Vec<Value>) {
+    tokio::task::spawn_blocking(move || {
+        let mut socket = socket;
+        let mut seen = Vec::new();
+        while let Some(m) = socket.next() {
+            let done = m["metadata"]["x-op"] == "x-notification";
+            seen.push(m);
+            if done {
+                break;
+            }
+        }
+        (socket, seen)
+    })
+    .await
+    .expect("read")
+}
+
 /// Every message the socket gets until it falls silent.
 async fn drain(socket: Socket) -> Vec<Value> {
     tokio::task::spawn_blocking(move || {
@@ -246,10 +266,14 @@ async fn ws_two_views_of_one_tenant_each_see_only_their_own_projection() {
 
     let v = "urn:ngsi-ld:Vehicle:iso:1";
     write(&app, tenant, &json!([vehicle(v, 1, "city", 1)])).await;
+    let (public, mut public_seen) = until_notified(public).await;
+    let (full, mut full_seen) = until_notified(full).await;
     // the hidden canary alone: no notification on any socket
     write(&app, tenant, &json!([vehicle(v, 1, "city", 2)])).await;
     // operator alone: the full view only
     write(&app, tenant, &json!([vehicle(v, 1, "private", 2)])).await;
+    let (full, seen) = until_notified(full).await;
+    full_seen.extend(seen);
     // a type no view selects, carrying the canary
     write(
         &app,
@@ -261,7 +285,8 @@ async fn ws_two_views_of_one_tenant_each_see_only_their_own_projection() {
     // the same id in the Tenant beside, with a speed no write here makes
     write(&app, other, &json!([vehicle(v, 999, "other", 3)])).await;
 
-    let messages = drain(public).await;
+    public_seen.extend(drain(public).await);
+    let messages = public_seen;
     let got = notified(&messages);
     assert_eq!(
         got.len(),
@@ -277,7 +302,8 @@ async fn ws_two_views_of_one_tenant_each_see_only_their_own_projection() {
     for leak in [CANARY, CANARY_TYPE, "operator", other] {
         assert!(!wire.contains(leak), "public: {leak} on the wire: {wire}");
     }
-    let messages = drain(full).await;
+    full_seen.extend(drain(full).await);
+    let messages = full_seen;
     let got = notified(&messages);
     assert_eq!(
         got.len(),
