@@ -8,6 +8,7 @@ mod ws_contract;
 mod ws_delivery;
 mod ws_hub;
 mod ws_lease;
+mod ws_protocol;
 mod ws_queue;
 mod ws_resume;
 mod ws_seams;

@@ -109,11 +109,11 @@ async fn ws_an_oversized_or_too_deep_client_message_closes_the_connection() -> R
 
     let mut c = connect(b.addr, ROOT, &[]).await?;
     fragmented(&mut c, 64 * 1024 + 1, 8 * 1024).await?;
-    ends(&mut c).await?;
+    assert_eq!(ends(&mut c).await?, Some(1009), "a message past 64 KiB");
 
     let mut c = connect(b.addr, ROOT, &[]).await?;
     fragmented(&mut c, 16 * 1024 + 1, 32 * 1024).await?;
-    ends(&mut c).await?;
+    assert_eq!(ends(&mut c).await?, Some(1009), "a frame past 16 KiB");
 
     let mut c = connect(b.addr, ROOT, &[]).await?;
     let deep = format!("{}{}", "[".repeat(65), "]".repeat(65));

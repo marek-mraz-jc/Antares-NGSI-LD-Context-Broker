@@ -8,6 +8,7 @@ use crate::hub::{Conn, Hub, Next, Runner};
 use crate::limits::Limits;
 use antares_ops::{Caller, OperationId, OpsRequest};
 use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -30,7 +31,9 @@ tokio::task_local! {
 /// The close codes this surface uses (RFC 6455 7.4.1).
 mod code {
     pub const NORMAL: u16 = 1000;
+    pub const PROTOCOL: u16 = 1002;
     pub const UNSUPPORTED: u16 = 1003;
+    pub const NOT_UTF8: u16 = 1007;
     pub const POLICY: u16 = 1008;
     pub const TOO_BIG: u16 = 1009;
     pub const TRY_AGAIN: u16 = 1013;
@@ -357,6 +360,22 @@ impl Session {
         End::Closed(reason)
     }
 
+    /// A frame that breaks RFC 6455 closes with the code 7.4.1 gives it;
+    /// any other read error, a dropped connection included, means the peer
+    /// is gone.
+    async fn broken(&mut self, e: &WsError) -> End {
+        let (code, reason) = match e {
+            WsError::Protocol(p) if !matches!(p, ProtocolError::ResetWithoutClosingHandshake) => {
+                (code::PROTOCOL, "protocol error")
+            }
+            WsError::Utf8(_) => (code::NOT_UTF8, "text is not UTF-8"),
+            WsError::Capacity(_) => (code::TOO_BIG, "message too big"),
+            _ => return End::Gone,
+        };
+        self.close(code, reason).await;
+        End::Closed(reason)
+    }
+
     /// A frame from the client.
     async fn incoming(&mut self, frame: Option<Result<Message, WsError>>) -> Option<End> {
         let text = match frame {
@@ -371,7 +390,13 @@ impl Session {
                     .await;
                 return Some(End::Closed("binary"));
             }
-            Some(Ok(Message::Close(_)) | Err(_)) | None => return Some(End::Gone),
+            Some(Err(e)) => return Some(self.broken(&e).await),
+            Some(Ok(Message::Close(_))) | None => {
+                // tungstenite queued the answering close frame (RFC 6455
+                // 5.5.1); it reaches the client only when flushed.
+                let _flushed = timeout(self.hub.limits.pong_within, self.socket.flush()).await;
+                return Some(End::Gone);
+            }
         };
         self.heard = Instant::now();
         let first = std::mem::take(&mut self.first);
