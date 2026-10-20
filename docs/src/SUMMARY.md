@@ -35,6 +35,7 @@
 - [OGC API - Features compliance](ogc-compliance.md)
 - [Performance](performance.md)
 - [Performance baseline](perf-baseline.md)
+- [Load on every surface](load-surfaces.md)
 - [Coverage](coverage.md)
 - [Shared crates](shared-crates.md)
 - [API reference](api.md)
