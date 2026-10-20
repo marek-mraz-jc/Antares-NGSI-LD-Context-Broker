@@ -137,7 +137,9 @@ async fn brokers() -> Vec<Broker> {
         }
         Err(_) => eprintln!("SKIP pg: ANTARES_TEST_DATABASE_URL not set"),
     }
-    for b in &out {
+    for b in &mut out {
+        // the ETSI brokers' 6.3.10 ceiling (T-4800): these cases page 20 instances
+        b.st.temporal_instance_limit = 9;
         b.seed().await;
     }
     out

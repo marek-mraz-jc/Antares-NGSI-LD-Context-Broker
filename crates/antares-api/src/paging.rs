@@ -1028,6 +1028,10 @@ mod tests {
     #[test]
     fn limit_above_the_ceiling_is_too_many_results() {
         let st = state();
+        // T-4800: the ceiling is the one setting, 1,000 unless ANTARES_MAX_LIMIT says otherwise
+        assert_eq!((st.max_limit, *crate::bounds::MAX_LIMIT), (1000, 1000));
+        let at_max = st.max_limit.to_string();
+        assert!(paginate(&st, &params(&[("limit", &at_max)]), items(1), "/e").is_ok());
         let over = (st.max_limit + 1).to_string();
         let err = paginate(&st, &params(&[("limit", &over)]), items(1), "/e").unwrap_err();
         assert!(format!("{err:?}").contains("TooManyResults"));

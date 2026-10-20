@@ -290,7 +290,14 @@ pub fn prop(v: &Value) -> Value {
     json!({"type": "Property", "value": v})
 }
 
-async fn send(app: &Router, method: Method, uri: &str, tenant: &str, body: &Value) -> StatusCode {
+/// `body` sent to `uri` as `tenant`; the status.
+pub async fn send(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    tenant: &str,
+    body: &Value,
+) -> StatusCode {
     let bytes = body.to_string();
     let mut req = Request::builder()
         .method(method)

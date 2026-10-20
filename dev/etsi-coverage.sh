@@ -124,6 +124,7 @@ ANTARES_ALLOW_SHARED_LOCAL=1 \
 ANTARES_PUBLIC_URL="http://localhost:$PORT" \
 ANTARES_EGRESS_ALLOW_PRIVATE=true \
 ANTARES_SWEEP_SECS=2 \
+ANTARES_TEMPORAL_INSTANCE_LIMIT=9 \
 "$BIN" > "${TMPDIR:-/tmp}/antares-coverage-$STORE.log" 2>&1 &
 BROKER_PID=$!
 trap 'kill -TERM "$BROKER_PID" 2>/dev/null || true; wait "$BROKER_PID" 2>/dev/null || true' EXIT

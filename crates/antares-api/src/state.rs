@@ -199,6 +199,10 @@ pub struct Shared {
     pub default_limit: usize,
     /// Hard ceiling on limit (TooManyResults guard).
     pub max_limit: usize,
+    /// 6.3.10: the most instances of one Attribute a temporal response
+    /// serves ([`crate::bounds::temporal_instance_limit`]); the ETSI suite's
+    /// brokers and its unit cases run with 9.
+    pub temporal_instance_limit: usize,
     /// The most bytes of one in-process answer a handler buffers
     /// ([`crate::bounds::MAX_ANSWER_BYTES`]).
     pub max_answer_bytes: usize,
@@ -570,8 +574,9 @@ impl AppState {
                 started: Instant::now(),
                 started_at: now_iso(),
                 host_alias,
-                default_limit: 1000,
-                max_limit: 1000,
+                default_limit: *crate::bounds::MAX_LIMIT,
+                max_limit: *crate::bounds::MAX_LIMIT,
+                temporal_instance_limit: crate::bounds::temporal_instance_limit(),
                 max_answer_bytes: crate::bounds::MAX_ANSWER_BYTES,
                 http: http.clone(),
                 fed_http: outbound_client(

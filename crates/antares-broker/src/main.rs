@@ -45,6 +45,11 @@ const KNOWN_KEYS: &[&str] = &[
     // History dedup on append (T-4507): `off` records an instance equal to the
     // newest one again; anything else (default) skips it.
     "ANTARES_TEMPORAL_DEDUP",
+    // 6.3.10 ceiling: instances of one Attribute per temporal response
+    // (default 1000; the ETSI brokers set 9 for the suite's 206 cases), and
+    // the Entities of one query page (default 1000). T-4800.
+    "ANTARES_TEMPORAL_INSTANCE_LIMIT",
+    "ANTARES_MAX_LIMIT",
     "ANTARES_DATA_DIR",
     // Egress: private-range destinations are ALLOWED by default (ADR-0010 —
     // brokers federate inside private networks); a hardened deployment sets
