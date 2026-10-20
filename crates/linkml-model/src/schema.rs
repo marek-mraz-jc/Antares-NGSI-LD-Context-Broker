@@ -281,7 +281,8 @@ pub struct Enum {
     pub permissible_values: BTreeMap<String, PermissibleValue>,
 }
 
-/// One permissible value: `text`, `description`, `meaning`.
+/// One permissible value: `text`, `description`, `meaning` and its `annotations`, such as the
+/// `label` that names it in each language (T-4803).
 ///
 /// ```
 /// let v: linkml_model::PermissibleValue =
@@ -300,4 +301,7 @@ pub struct PermissibleValue {
     /// The IRI or CURIE the value stands for.
     #[serde(default)]
     pub meaning: Option<String>,
+    /// Tagged values, keyed by tag.
+    #[serde(default)]
+    pub annotations: BTreeMap<String, Annotation>,
 }

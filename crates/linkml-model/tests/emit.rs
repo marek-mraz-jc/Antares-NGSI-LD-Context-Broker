@@ -464,3 +464,28 @@ fn without_summary_annotations_the_first_four_shown_slots_are_the_summary() {
         .collect();
     assert_eq!(summary, ["a", "c", "d", "e"]);
 }
+
+/// T-4803: a permissible value keeps its annotations, so a reader of the view's LinkML names it
+/// in the reader's language ("cesta III. triedy"), not by its English description.
+#[test]
+fn a_permissible_value_keeps_its_label_annotation() {
+    let label = r#"{"sk": "cesta III. triedy", "en": "third-class road"}"#;
+    let doc = serde_json::json!({
+        "id": "https://example.org/s",
+        "name": "s",
+        "enums": {"RoadClass": {"permissible_values": {"thirdClass": {
+            "text": "thirdClass",
+            "description": "A third-class road (cesta III. triedy).",
+            "annotations": {"label": {"tag": "label", "value": label}}
+        }}}}
+    });
+    let model = Model::read(doc.to_string().as_bytes(), &LIMITS).unwrap();
+    let yaml = linkml_model::yaml(&model);
+    let value = yaml
+        .split("\"thirdClass\":")
+        .nth(1)
+        .expect("the value is written");
+    assert!(value.contains("\"annotations\":"), "{yaml}");
+    assert!(value.contains("\"tag\": \"label\""), "{yaml}");
+    assert!(value.contains(r#"\"sk\": \"cesta III. triedy\""#), "{yaml}");
+}
