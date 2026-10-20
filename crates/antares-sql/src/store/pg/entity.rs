@@ -329,6 +329,36 @@ fn query_sql(
         format!(" OFFSET ${}", binds.len())
     });
     let arms = arms(wheres, split);
+    // A deep page skips its OFFSET over ids alone, which the type indexes
+    // hand back without a heap visit (0013's INCLUDE), and reads only the
+    // page's documents by primary key (T-4907: page 50 of a 180k-entity
+    // type walked 5 000 jsonb rows for 100).
+    if let Some(p) = page.filter(|p| p.offset > 0) {
+        let ids = match arms.as_slice() {
+            [w] => format!("SELECT id FROM entities WHERE {w} ORDER BY id LIMIT ${lim}{offset}"),
+            _ => {
+                binds.push(Bind::Int(limit.saturating_add(p.offset)));
+                let each = binds.len();
+                let parts: Vec<String> = arms
+                    .iter()
+                    .map(|w| {
+                        format!("(SELECT id FROM entities WHERE {w} ORDER BY id LIMIT ${each})")
+                    })
+                    .collect();
+                format!(
+                    "SELECT id FROM ({}) AS arms ORDER BY id LIMIT ${lim}{offset}",
+                    parts.join(" UNION ALL ")
+                )
+            }
+        };
+        return (
+            format!(
+                "SELECT {select} AS entity FROM entities \
+                 WHERE tenant_id = $1 AND id IN ({ids}) ORDER BY id"
+            ),
+            true,
+        );
+    }
     let sql = match arms.as_slice() {
         [w] => format!(
             "SELECT {select} AS entity FROM entities WHERE {w} ORDER BY id LIMIT ${lim}{offset}"
@@ -1791,10 +1821,29 @@ mod tests {
             &mut binds,
         );
         assert!(paged);
-        assert!(sql.contains("LIMIT $2 OFFSET $3"), "{sql}");
+        assert_eq!(
+            sql,
+            "SELECT entity AS entity FROM entities WHERE tenant_id = $1 AND id IN (\
+             SELECT id FROM entities WHERE tenant_id = $1 ORDER BY id LIMIT $2 OFFSET $3) ORDER BY id"
+        );
         assert!(!sql.contains("OVER"), "{sql}");
         assert!(matches!(binds[1], Bind::Int(11)));
         assert!(matches!(binds[2], Bind::Int(20)));
+        // the first page reads its documents directly
+        let mut binds = vec![Bind::Text("t".to_owned())];
+        let (sql, _) = query_sql(
+            "entity",
+            &wheres(),
+            None,
+            Some(&page(0, 10)),
+            true,
+            &mut binds,
+        );
+        assert!(
+            sql.starts_with("SELECT entity AS entity FROM entities WHERE tenant_id"),
+            "{sql}"
+        );
+        assert!(sql.ends_with("ORDER BY id LIMIT $2 OFFSET $3"), "{sql}");
     }
 
     /// T-4781: one named type reads two leakproof index arms, each in id
@@ -1816,12 +1865,12 @@ mod tests {
         assert!(paged);
         assert_eq!(
             sql,
-            "SELECT entity AS entity FROM (\
-             (SELECT id, entity FROM entities WHERE tenant_id = $1 AND types[1] = $3 \
+            "SELECT entity AS entity FROM entities WHERE tenant_id = $1 AND id IN (SELECT id FROM (\
+             (SELECT id FROM entities WHERE tenant_id = $1 AND types[1] = $3 \
              ORDER BY id LIMIT $7) UNION ALL \
-             (SELECT id, entity FROM entities WHERE tenant_id = $1 AND cardinality(types) > 1 \
-             AND types[1] <> ALL($4) AND (types @> $2) ORDER BY id LIMIT $7)) AS entities \
-             ORDER BY id LIMIT $5 OFFSET $6"
+             (SELECT id FROM entities WHERE tenant_id = $1 AND cardinality(types) > 1 \
+             AND types[1] <> ALL($4) AND (types @> $2) ORDER BY id LIMIT $7)) AS arms \
+             ORDER BY id LIMIT $5 OFFSET $6) ORDER BY id"
         );
         assert!(matches!(binds[4], Bind::Int(11)));
         assert!(matches!(binds[5], Bind::Int(20)));

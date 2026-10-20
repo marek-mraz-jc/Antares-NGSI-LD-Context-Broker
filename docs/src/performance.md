@@ -872,6 +872,52 @@ probe per Entity), so its time follows the instances, before and after.
 The new indexes replace the Tenant read where the planner starts from
 `temporal_entities` instead, which `pg_explain.rs` pins.
 
+## Deep pages, the next cursor and regex filters
+
+T-4907 measured a BBSK `Invoice` page at offset 5000 on dev at 3.8 s p50
+against 0.5 s at offset 0, and `name~="zzz"` at 1.31 s against
+0.39 s for `name=="zzz"`. Three changes in the store and the API:
+
+- **Ids first.** A page past offset 0 skips its OFFSET over ids alone,
+  which `i_entities_first_type_id` and `i_entities_multi_type_id` hand back
+  as an index-only scan (their INCLUDE columns, 0013), then reads only the
+  page's documents through `entities_pkey`. Before, OFFSET walked the
+  jsonb documents it then threw away.
+- **The next cursor.** An Entity query whose page is kept in id order and
+  is not counted (no `count=true`, no `orderBy`, no federation, no
+  `idPattern`) carries `cursor=` on its `rel="next"` Link beside `offset`.
+  The next page then seeks `id >` the last id shown through the same
+  indexes, so page 500 costs what page 1 costs. The cursor is opaque: the
+  hex of the last id plus a SHA-256 tag over the view, the Tenant and every
+  other parameter of the request, so a cursor sent with another view,
+  Tenant, `q`, `limit` or `offset` is a 400 BadRequestData. It is no secret:
+  a forged one only starts the same query at another id. A `prev` Link and
+  a counted page keep plain `offset`, which the ETSI suite compares.
+- **`~=` in Postgres.** A pattern that Postgres `like_regex` and the
+  `regex` crate read the same way compiles into the jsonpath and is
+  decided in SQL. That covers literals, `.`, `^`, `$`, `|`, groups,
+  `*` `+` `?` and positive bracket lists, up to 128 characters. Anything
+  else stays with the evaluator under its program caps: escapes
+  (back-references are what makes Postgres backtrack), `{m,n}`, `[^…]`,
+  POSIX classes, inline flags. `!~=` stays there too, because it needs
+  every array element to miss. `pg_query_parity.rs` checks both arms
+  against the evaluator on stored line breaks. There is no trigram index:
+  `~` and pg_trgm's `%` are not leakproof (`pg_proc.proleakproof = f`), so
+  under forced RLS a trigram index never serves the broker's role. The
+  regex filters the type's rows inside Postgres instead of shipping them
+  to the broker.
+
+Local numbers, same box and seed as the table above (100 000 Entities per
+Tenant, type T1 = 10 000), as `antares_app`, SQL execution time:
+
+| shape | before | after |
+|---|---|---|
+| type page at offset 5000, limit 100 | 12-52 ms (OFFSET over documents) | 2.3 ms (Index Only Scan, 0 heap fetches) |
+| type + `brand~="^zzz"` | 22 ms in SQL, then 10 000 documents decoded and evaluated in the broker | 10.6 ms, nothing shipped |
+
+`pg_explain.rs` `deep_and_keyset_pages_read_ids_from_the_type_index` pins
+both plans under RLS.
+
 ## What the numbers are not
 
 They are one machine, one request shape, one week. A different instance

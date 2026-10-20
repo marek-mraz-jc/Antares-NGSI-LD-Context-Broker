@@ -167,12 +167,15 @@ fn value_or(
         Some((op, v)) => Some(cmp_filter(op, v)?),
         None => None,
     };
-    Some(value_or_filter(
+    // `eval::kind_allows`: a Relationship's object only answers == and !=
+    let objects = !matches!(cmp, Some((CmpOp::Pattern, _)));
+    Some(member_or(
         prefix,
         filter.as_deref(),
         col,
         first,
         binds,
+        objects,
     ))
 }
 
@@ -185,9 +188,22 @@ pub fn value_or_filter(
     first: usize,
     binds: &mut Vec<String>,
 ) -> String {
+    member_or(prefix, filter, col, first, binds, true)
+}
+
+/// `value_or_filter` over every member, or without `object`/`objectList`.
+fn member_or(
+    prefix: &str,
+    filter: Option<&str>,
+    col: &'static str,
+    first: usize,
+    binds: &mut Vec<String>,
+    objects: bool,
+) -> String {
     let mut parts = Vec::with_capacity(ARMS);
     let steps = VALUE_KEYS
         .iter()
+        .filter(|k| objects || !matches!(**k, "object" | "objectList"))
         .map(|k| format!(".\"{k}\""))
         // C.6: a value written as a JSON-LD typed value carries it under
         // `@value`, and `eval::untyped` compares that member — one more
@@ -302,10 +318,18 @@ fn cmp_filter(op: CmpOp, want: &QValue) -> Option<String> {
         CmpOp::Ge => format!(" ? (@ >= {lit})"),
         CmpOp::Lt => format!(" ? (@ < {lit})"),
         CmpOp::Le => format!(" ? (@ <= {lit})"),
-        // ~= / !~= are regexes over strings; jsonpath's like_regex is
-        // POSIX-ish and does not match Rust's `regex` crate on every pattern,
-        // so both are left to the in-memory evaluator.
-        CmpOp::Pattern | CmpOp::NotPattern => return None,
+        // ~= is a regex over strings. jsonpath's `like_regex` is Postgres'
+        // ARE dialect, which reads the `pushable_pattern` subset exactly as
+        // the `regex` crate does (T-4907); anything else stays in memory.
+        // !~= needs every array element to miss (p.92), which lax jsonpath
+        // quantifies existentially, so it always stays in memory.
+        CmpOp::Pattern => match want {
+            QValue::Str(s) if pushable_pattern(s) => {
+                format!(" ? (@ like_regex {})", jsonpath_string(s))
+            }
+            _ => return None,
+        },
+        CmpOp::NotPattern => return None,
     })
 }
 
@@ -341,6 +365,49 @@ fn literal(v: &QValue) -> Option<String> {
         // them (Eq) or declines (everything else) before reaching here
         QValue::List(_) | QValue::Range(..) => return None,
     })
+}
+
+/// Longest `~=` pattern pushed to Postgres; a longer one stays in memory
+/// under the evaluator's own program caps (`crate::regex`).
+const MAX_PUSHED_PATTERN: usize = 128;
+
+/// Whether `~=`'s pattern means the same to Postgres `like_regex` and to the
+/// `regex` crate (T-4907). Literals, `.`, `^`, `$`, `|`, groups, the
+/// quantifiers `*` `+` `?` (lazy too) and positive bracket lists of
+/// literals and ranges. Refused, so evaluated in memory: escapes (`\`:
+/// class shorthands and back-references differ, and a back-reference is
+/// what makes Postgres backtrack), `{m,n}` counts, `[^…]` (in like_regex it
+/// never matches a newline, in Rust it does), POSIX `[:…:]` classes, inline
+/// flags `(?…)`, a NUL, and every pattern Rust itself refuses.
+/// `like_regex` without flags keeps `.` off newlines and `^`/`$` at the
+/// ends of the string, which are the crate's defaults.
+fn pushable_pattern(p: &str) -> bool {
+    if p.is_empty() || p.len() > MAX_PUSHED_PATTERN || crate::regex::compile(p).is_err() {
+        return false;
+    }
+    let mut chars = p.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' | '{' | '}' | '\0' => return false,
+            '(' if chars.peek() == Some(&'?') => return false,
+            '[' => {
+                // a positive list of literals and `a-z` ranges, closed
+                if matches!(chars.peek(), Some('^' | ']' | '[')) {
+                    return false;
+                }
+                loop {
+                    match chars.next() {
+                        Some(']') => break,
+                        Some('[' | '\\' | '\0') | None => return false,
+                        Some(_) => {}
+                    }
+                }
+            }
+            ']' => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// A jsonpath member name: always double-quoted, because attribute keys are
@@ -463,8 +530,10 @@ mod tests {
     fn unsupported_shapes_refuse_instead_of_guessing() {
         // dotted path: sub-attribute vs value navigation is ambiguous
         assert!(c("address.city==\"Bonn\"").is_none());
-        // ~= is a regex dialect mismatch
-        assert!(c("name~=\"^ab\"").is_none());
+        // ~= outside the subset both regex dialects read alike, and !~=
+        assert!(c("name~=\"\\d\"").is_none());
+        assert!(c("name!~=\"^ab\"").is_none());
+        assert!(c("name~=\"^ab\"").is_some());
         // ordering on strings: Rust byte-wise vs database collation
         assert!(c("name>\"m\"").is_none());
         assert!(c("name<=\"m\"").is_none());
@@ -480,14 +549,14 @@ mod tests {
     #[test]
     fn one_refused_member_refuses_the_whole_expression() {
         assert!(
-            c(r#"a==1;b~="x""#).is_none(),
+            c(r#"a==1;b!~="x""#).is_none(),
             "AND must not drop a conjunct"
         );
-        assert!(c(r#"a==1|b~="x""#).is_none(), "OR must not drop a branch");
-        assert!(c(r#"b~="x"|a==1"#).is_none(), "…in either position");
+        assert!(c(r#"a==1|b!~="x""#).is_none(), "OR must not drop a branch");
+        assert!(c(r#"b!~="x"|a==1"#).is_none(), "…in either position");
         assert!(c(r#"(a==1|b!=2);c==3"#).is_none(), "…nor when nested");
         // and the members that DID compile leave no trace behind them
-        assert!(c(r#"a==1;a==2;b~="x""#).is_none());
+        assert!(c(r#"a==1;a==2;b!~="x""#).is_none());
         // an empty junction has no predicate either — `()` would be a syntax
         // error, and this entry point is public
         assert!(compile_q(&QNode::And(Vec::new()), "entity", 1, &ex).is_none());
@@ -563,7 +632,28 @@ mod tests {
         assert!(compile_instance_leaf(Some((CmpOp::Ne, &want)), "qi.data", 1).is_none());
         let s = QValue::Str("m".to_owned());
         assert!(compile_instance_leaf(Some((CmpOp::Lt, &s)), "qi.data", 1).is_none());
-        assert!(compile_instance_leaf(Some((CmpOp::Pattern, &s)), "qi.data", 1).is_none());
+        assert!(compile_instance_leaf(Some((CmpOp::NotPattern, &s)), "qi.data", 1).is_none());
+        let esc = QValue::Str("\\d".to_owned());
+        assert!(compile_instance_leaf(Some((CmpOp::Pattern, &esc)), "qi.data", 1).is_none());
+        // a pattern both dialects read alike compiles, Relationship members left out
+        let got = compile_instance_leaf(Some((CmpOp::Pattern, &s)), "qi.data", 1).expect("pushed");
+        assert!(got.binds.iter().all(|b| !b.contains("object")), "{:?}", got.binds);
+        assert!(got.binds[0].ends_with("? (@ like_regex \"m\")"), "{:?}", got.binds);
+    }
+
+    /// T-4907: only the subset Postgres ARE and the `regex` crate read alike
+    /// is pushed; the rest stays with the evaluator.
+    #[test]
+    fn only_patterns_both_dialects_read_alike_are_pushed() {
+        for p in ["^B", "erl", "^b.*n$", "(a|b)+", "[A-Z]erlin", "x y", "é.", "^[a-c0-9_-]+?$", "a|"] {
+            assert!(pushable_pattern(p), "{p}");
+        }
+        for p in [
+            "", "\\d", "a{2}", "[^a]", "[[:alpha:]]", "(?i)b", "(a)\\1", "[a", "a]", "a\0", "(",
+            &"a".repeat(MAX_PUSHED_PATTERN + 1),
+        ] {
+            assert!(!pushable_pattern(p), "{p}");
+        }
     }
 
     /// A number that cannot round-trip as a JSON literal is not compiled to

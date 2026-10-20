@@ -387,6 +387,58 @@ async fn every_query_shape_reads_an_index_under_rls() {
     );
 }
 
+/// T-4907: a deep page skips its OFFSET over ids read from the type index
+/// and fetches only the page's documents by primary key; a keyset page
+/// (the cursor behind rel=next) seeks the type index past its last id.
+/// Both as antares_app under RLS, the statements `store::pg::entity::query_sql`
+/// builds (its unit tests pin the text).
+#[tokio::test]
+async fn deep_and_keyset_pages_read_ids_from_the_type_index() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    seed_rls(&pool).await;
+    let w = format!("tenant_id = '{RLS_A}' AND (expires_at IS NULL OR expires_at > now())");
+    let t1 = "'https://x/T1'";
+    let arms = [
+        format!("{w} AND types[1] = {t1}"),
+        format!(
+            "{w} AND cardinality(types) > 1 AND types[1] <> ALL(ARRAY[{t1}]) \
+             AND (types @> ARRAY[{t1}])"
+        ),
+    ];
+    let ids = arms
+        .iter()
+        .map(|a| format!("(SELECT id FROM entities WHERE {a} ORDER BY id LIMIT 5101)"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let deep = format!(
+        "SELECT entity AS entity FROM entities WHERE tenant_id = '{RLS_A}' AND id IN (\
+         SELECT id FROM ({ids}) AS arms ORDER BY id LIMIT 101 OFFSET 5000) ORDER BY id"
+    );
+    let plan = plan_of(&pool, RLS_A, &deep).await;
+    assert!(
+        !plan.contains("Seq Scan") && plan.contains("i_entities_first_type_id"),
+        "deep page skips over the type index:\n{plan}"
+    );
+    assert!(
+        plan.contains("using entities_pkey") && plan.contains("(id = "),
+        "the page's documents come by primary key lookup:\n{plan}"
+    );
+    let keyset = type_page(
+        &format!("{w} AND id > 'urn:ngsi-ld:T1:00050001'"),
+        &[&["https://x/T1"]],
+        101,
+    );
+    let plan = plan_of(&pool, RLS_A, &keyset).await;
+    assert!(
+        !plan.contains("Seq Scan")
+            && plan
+                .lines()
+                .any(|l| l.contains("Index Cond") && l.contains("(id > ")),
+        "a keyset page seeks past its last id:\n{plan}"
+    );
+}
+
 /// T-4852 Security: the new arms and the geohash cover isolate Tenants as
 /// the policy does. Both Tenants hold the same ids at the same places; the
 /// broker's role, set to Tenant A, gets only A's rows for a type list, a

@@ -909,11 +909,34 @@ async fn query_entities_inner(
             order_entities(m, spec, params, &ctx)
         })?;
     }
-    let (page, count_hdr, links) = if filtered.paged {
+    let keyset = push_page && crate::paging::keyset_allowed(params);
+    let (page, count_hdr, links) = if keyset && params.contains_key(crate::paging::CURSOR) {
+        // the rows start after the cursor's id, at the client's offset
+        let total = match filtered.paged {
+            true => filtered.total.unwrap_or(matches.len()),
+            false => matches.len(),
+        };
+        matches.truncate(p_limit);
+        let total = p_offset.saturating_add(total);
+        paginate_pre(st, params, matches, "/ngsi-ld/v1/entities", total)?
+    } else if filtered.paged {
         let total = filtered.total.unwrap_or(matches.len());
         paginate_pre(st, params, matches, "/ngsi-ld/v1/entities", total)?
     } else {
         paginate(st, params, matches, "/ngsi-ld/v1/entities")?
+    };
+    let links = match keyset {
+        true => crate::paging::with_next_cursor(
+            links,
+            &crate::paging::view_of(st),
+            tenant.as_str(),
+            params,
+            page.last()
+                .and_then(|d| d.get("id"))
+                .and_then(Value::as_str),
+            p_offset.saturating_add(p_limit),
+        ),
+        false => links,
     };
 
     let mut payload: Vec<Value> = page
@@ -1289,6 +1312,11 @@ pub async fn filter_entities_paged(
     narrow: Option<&crate::repr::Repr>,
 ) -> ApiResult<Filtered> {
     let Pushdown { page, proj } = push;
+    // a keyset cursor (T-4907): the store seeks past its id, so the rows
+    // already start at the client's offset and every page below is counted
+    // from there
+    let after = crate::paging::cursor_after(&crate::paging::view_of(st), tenant.as_str(), params)?;
+    let page = page.map(|(offset, limit)| (if after.is_some() { 0 } else { offset }, limit));
     // a pushed page over local rows cannot be merged with federated
     // candidates — refuse here so no caller can create that page
     let page = if fed.is_empty() { page } else { None };
@@ -1546,7 +1574,7 @@ pub async fn filter_entities_paged(
                     },
                     keep_attrs: keep_attrs.as_deref(),
                     drop_attrs: drop_attrs.as_deref(),
-                    after_id: None,
+                    after_id: after.as_deref(),
                 },
             )
             .await?;

@@ -998,6 +998,8 @@ pub const QUERY_PARAMS: &[&str] = &[
     "collation",
     "entityMapLifetime",
     "splitEntities",
+    // the broker's keyset cursor behind the next Link (`paging::CURSOR`)
+    "cursor",
 ];
 
 #[cfg(test)]
