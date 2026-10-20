@@ -511,18 +511,16 @@ fn fwd_query(params: &HashMap<String, String>, keys: &[&str]) -> Vec<(String, St
         .collect()
 }
 
-/// Attribute IRIs of an expanded fragment (entity meta members excluded).
+/// Attribute IRIs of an expanded fragment: every key but the Entity's own
+/// members (5.2.4, [`antares_model::is_meta`]), so `expiresAt` (4.22) is no
+/// Attribute name. A client `deletedAt` never reaches here: expansion drops
+/// it (5.2.2 "shall ignore").
 pub(crate) fn attr_iris_of(fragment: &Value) -> Vec<String> {
     fragment
         .as_object()
         .map(|o| {
             o.keys()
-                .filter(|k| {
-                    !matches!(
-                        k.as_str(),
-                        "id" | "type" | "scope" | "createdAt" | "modifiedAt"
-                    )
-                })
+                .filter(|k| !antares_model::is_meta(k))
                 .cloned()
                 .collect()
         })

@@ -59,6 +59,9 @@ pub(crate) struct Extracted {
     /// `location IS NULL OR …` guard which forced a sequential scan — and
     /// rows without any geoproperty are excluded in SQL, which is exact.
     location_ambiguous: bool,
+    /// The earliest `expiresAt` of any Attribute instance (4.22), so the
+    /// sweep finds the rows to prune by index instead of reading every doc.
+    attrs_expire: Option<String>,
 }
 
 /// The four members every stored kind extracts the same way: `type` and
@@ -115,7 +118,21 @@ fn extract(doc: &Value) -> Extracted {
         expires: ts("expiresAt"),
         location,
         location_ambiguous,
+        attrs_expire: first_instance_expiry(doc),
     }
+}
+
+/// The earliest instance `expiresAt` of an internal doc's Attributes,
+/// canonicalised for the `::timestamptz` cast; an Entity member never counts.
+fn first_instance_expiry(doc: &Value) -> Option<String> {
+    doc.as_object()?
+        .iter()
+        .filter(|(k, _)| !antares_model::ENTITY_META_KEYS.contains(&k.as_str()))
+        .filter_map(|(_, v)| v.as_array())
+        .flatten()
+        .filter_map(|inst| inst.get("expiresAt").and_then(Value::as_str))
+        .min_by_key(|s| antares_model::dt_key(s))
+        .map(|s| antares_store::filter::canonical_datetime(s).into_owned())
 }
 
 /// The outbox row's event JSON: what the drain turns into a
@@ -362,18 +379,20 @@ impl PgEntityStore {
         let done = sqlx::query(
             "INSERT INTO entities
                (tenant_id, id, entity, types, scopes, created_at, modified_at, expires_at,
-                location, location_ambiguous)
+                location, location_ambiguous, attrs_expire_at)
              VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz, $8::timestamptz,
                      CASE WHEN ST_IsValid(try_geomfromgeojson($9))
                           THEN try_geomfromgeojson($9) END,
                      $10 OR ($9 IS NOT NULL
-                             AND NOT COALESCE(ST_IsValid(try_geomfromgeojson($9)), false)))
+                             AND NOT COALESCE(ST_IsValid(try_geomfromgeojson($9)), false)),
+                     try_timestamptz($11))
              ON CONFLICT (tenant_id, id) DO UPDATE SET
                entity = EXCLUDED.entity, types = EXCLUDED.types,
                scopes = EXCLUDED.scopes, created_at = EXCLUDED.created_at,
                modified_at = EXCLUDED.modified_at, expires_at = EXCLUDED.expires_at,
                location = EXCLUDED.location,
                location_ambiguous = EXCLUDED.location_ambiguous,
+               attrs_expire_at = EXCLUDED.attrs_expire_at,
                version = 1
              WHERE entities.expires_at IS NOT NULL AND entities.expires_at <= now()",
         )
@@ -387,6 +406,7 @@ impl PgEntityStore {
         .bind(&e.expires)
         .bind(&e.location)
         .bind(e.location_ambiguous)
+        .bind(&e.attrs_expire)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1002,6 +1022,7 @@ impl PgEntityStore {
                                        THEN try_geomfromgeojson($8) END,
                        location_ambiguous = $9 OR ($8 IS NOT NULL
                            AND NOT COALESCE(ST_IsValid(try_geomfromgeojson($8)), false)),
+                       attrs_expire_at = try_timestamptz($10),
                        version = version + 1
                      WHERE tenant_id = $1 AND id = $2
                      RETURNING version, created_at::text",
@@ -1015,6 +1036,7 @@ impl PgEntityStore {
                 .bind(&e.expires)
                 .bind(&e.location)
                 .bind(e.location_ambiguous)
+                .bind(&e.attrs_expire)
                 .fetch_one(&mut *tx)
                 .await?;
                 if let Some(before) = &before {
@@ -1067,6 +1089,7 @@ impl PgEntityStore {
                     "id": id, "doc": doc, "types": e.types, "scopes": e.scopes,
                     "created": e.created, "modified": e.modified, "expires": e.expires,
                     "location": e.location, "loc_ambiguous": e.location_ambiguous,
+                    "attrs_expire": e.attrs_expire,
                 }));
             }
         }
@@ -1076,7 +1099,7 @@ impl PgEntityStore {
         let rows = sqlx::query(
             "INSERT INTO entities
                (tenant_id, id, entity, types, scopes, created_at, modified_at, expires_at,
-                location, location_ambiguous)
+                location, location_ambiguous, attrs_expire_at)
              SELECT $1, e->>'id', e->'doc',
                     ARRAY(SELECT jsonb_array_elements_text(e->'types')),
                     CASE WHEN e->'scopes' = 'null'::jsonb THEN NULL
@@ -1087,7 +1110,8 @@ impl PgEntityStore {
                          THEN try_geomfromgeojson(e->>'location') END,
                     COALESCE((e->>'loc_ambiguous')::bool, false)
                       OR (e->>'location' IS NOT NULL
-                          AND NOT COALESCE(ST_IsValid(try_geomfromgeojson(e->>'location')), false))
+                          AND NOT COALESCE(ST_IsValid(try_geomfromgeojson(e->>'location')), false)),
+                    try_timestamptz(e->>'attrs_expire')
              FROM jsonb_array_elements($2::jsonb) AS e
              ON CONFLICT (tenant_id, id) DO UPDATE SET
                     entity = EXCLUDED.entity, types = EXCLUDED.types,
@@ -1095,6 +1119,7 @@ impl PgEntityStore {
                     modified_at = EXCLUDED.modified_at,
                     expires_at = EXCLUDED.expires_at, location = EXCLUDED.location,
                     location_ambiguous = EXCLUDED.location_ambiguous,
+                    attrs_expire_at = EXCLUDED.attrs_expire_at,
                     version = 1
              WHERE entities.expires_at IS NOT NULL AND entities.expires_at <= now()
              RETURNING id",
@@ -1216,6 +1241,7 @@ impl PgEntityStore {
                     "id": id, "doc": doc, "types": e.types, "scopes": e.scopes,
                     "created": e.created, "modified": e.modified, "expires": e.expires,
                     "location": e.location, "loc_ambiguous": e.location_ambiguous,
+                    "attrs_expire": e.attrs_expire,
                 }));
             }
         }
@@ -1245,7 +1271,7 @@ impl PgEntityStore {
         let rows = sqlx::query(
             "INSERT INTO entities
                (tenant_id, id, entity, types, scopes, created_at, modified_at, expires_at,
-                location, location_ambiguous)
+                location, location_ambiguous, attrs_expire_at)
              SELECT $1, e->>'id', e->'doc',
                     ARRAY(SELECT jsonb_array_elements_text(e->'types')),
                     CASE WHEN e->'scopes' = 'null'::jsonb THEN NULL
@@ -1256,13 +1282,15 @@ impl PgEntityStore {
                          THEN try_geomfromgeojson(e->>'location') END,
                     COALESCE((e->>'loc_ambiguous')::bool, false)
                       OR (e->>'location' IS NOT NULL
-                          AND NOT COALESCE(ST_IsValid(try_geomfromgeojson(e->>'location')), false))
+                          AND NOT COALESCE(ST_IsValid(try_geomfromgeojson(e->>'location')), false)),
+                    try_timestamptz(e->>'attrs_expire')
              FROM jsonb_array_elements($2::jsonb) AS e
              ON CONFLICT (tenant_id, id) DO UPDATE SET
                     entity = EXCLUDED.entity, types = EXCLUDED.types,
                     scopes = EXCLUDED.scopes, modified_at = EXCLUDED.modified_at,
                     expires_at = EXCLUDED.expires_at, location = EXCLUDED.location,
                     location_ambiguous = EXCLUDED.location_ambiguous,
+                    attrs_expire_at = EXCLUDED.attrs_expire_at,
                     created_at = CASE WHEN entities.expires_at IS NOT NULL
                                        AND entities.expires_at <= now()
                                       THEN EXCLUDED.created_at
@@ -1391,6 +1419,7 @@ impl PgEntityStore {
                     "scopes": e.scopes, "modified": e.modified,
                     "expires": e.expires, "location": e.location,
                     "loc_ambiguous": e.location_ambiguous,
+                    "attrs_expire": e.attrs_expire,
                 })
             })
             .collect();
@@ -1408,6 +1437,7 @@ impl PgEntityStore {
                     location_ambiguous = COALESCE((e->>'loc_ambiguous')::bool, false)
                       OR (e->>'location' IS NOT NULL
                           AND NOT COALESCE(ST_IsValid(try_geomfromgeojson(e->>'location')), false)),
+                    attrs_expire_at = try_timestamptz(e->>'attrs_expire'),
                     version = t.version + 1
              FROM jsonb_array_elements($2::jsonb) AS e
              WHERE t.tenant_id = $1 AND t.id = e->>'id'
@@ -1464,6 +1494,79 @@ impl PgEntityStore {
         tx.commit().await?;
         Ok(row.map(|r| r.get::<i64, _>(0)))
     }
+}
+
+/// 4.22 for the current state: drop every Attribute instance whose
+/// `expiresAt` passed from the stored docs, at most `batch` of them, inside
+/// the sweep's transaction `tx` (service escape on). The rows come by the
+/// `attrs_expire_at` index; each Tenant's are locked and rewritten under that
+/// Tenant, as 0005 grants the escape no UPDATE. `modified_at` stays: an
+/// expiry is no modification, so no change event is owed either. A row a
+/// writer holds is skipped and taken on the next tick. Returns the rows
+/// rewritten.
+pub(super) async fn prune_expired_current(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    batch: i64,
+) -> Result<u64, sqlx::Error> {
+    let due: Vec<(String, String)> = sqlx::query_as(
+        "SELECT tenant_id, id FROM entities
+          WHERE attrs_expire_at IS NOT NULL AND attrs_expire_at < now()
+          ORDER BY attrs_expire_at LIMIT $1",
+    )
+    .bind(batch)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut by_tenant: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for (tenant, id) in &due {
+        by_tenant.entry(tenant).or_default().push(id);
+    }
+    let mut n = 0u64;
+    for (tenant, ids) in by_tenant {
+        sqlx::query(crate::SET_TENANT_SQL)
+            .bind(tenant)
+            .execute(&mut **tx)
+            .await?;
+        let rows = sqlx::query(
+            "SELECT id, entity,
+                    to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
+               FROM entities
+              WHERE tenant_id = $1 AND id = ANY($2::text[]) AND attrs_expire_at < now()
+              FOR NO KEY UPDATE SKIP LOCKED",
+        )
+        .bind(tenant)
+        .bind(&ids)
+        .fetch_all(&mut **tx)
+        .await?;
+        for r in rows {
+            let id: String = r.get(0);
+            let mut doc: Value = r.get(1);
+            let now: String = r.get(2);
+            crate::store::mem::prune_expired_instances(&mut doc, &now);
+            let e = extract(&doc);
+            let rewritten = sqlx::query(
+                "UPDATE entities SET entity = $3,
+                   location = CASE WHEN ST_IsValid(try_geomfromgeojson($4))
+                                   THEN try_geomfromgeojson($4) END,
+                   location_ambiguous = $5 OR ($4 IS NOT NULL
+                       AND NOT COALESCE(ST_IsValid(try_geomfromgeojson($4)), false)),
+                   attrs_expire_at = try_timestamptz($6),
+                   version = version + 1
+                 WHERE tenant_id = $1 AND id = $2",
+            )
+            .bind(tenant)
+            .bind(&id)
+            .bind(&doc)
+            .bind(&e.location)
+            .bind(e.location_ambiguous)
+            .bind(&e.attrs_expire)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+            n = n.saturating_add(rewritten);
+        }
+    }
+    Ok(n)
 }
 
 #[cfg(test)]

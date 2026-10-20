@@ -71,7 +71,7 @@ fn attribute_names(obj: &serde_json::Map<String, Value>) -> Vec<String> {
 /// Drop attribute instances whose `expiresAt` passed (4.22) from an internal
 /// entity or temporal doc; an attribute whose last instance expired is
 /// removed entirely. Returns whether the doc changed.
-fn prune_expired_instances(doc: &mut Value, now: &str) -> bool {
+pub(crate) fn prune_expired_instances(doc: &mut Value, now: &str) -> bool {
     let Some(obj) = doc.as_object_mut() else {
         return false;
     };
