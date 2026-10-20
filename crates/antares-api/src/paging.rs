@@ -118,7 +118,8 @@ fn cursor_tag(view: &str, tenant: &str, params: &HashMap<String, String>, last: 
         h.update([0]);
     }
     h.update(last.as_bytes());
-    hex(&h.finalize()[..12])
+    let digest = h.finalize();
+    hex(digest.get(..12).unwrap_or(&digest))
 }
 
 fn hex(bytes: &[u8]) -> String {

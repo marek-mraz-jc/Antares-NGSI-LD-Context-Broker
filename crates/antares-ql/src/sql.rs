@@ -169,7 +169,7 @@ fn value_or(
     };
     // `eval::kind_allows`: a Relationship's object only answers == and !=
     let objects = !matches!(cmp, Some((CmpOp::Pattern, _)));
-    Some(member_or(
+    Some(value_or_filter(
         prefix,
         filter.as_deref(),
         col,
@@ -180,19 +180,9 @@ fn value_or(
 }
 
 /// The member-OR with a PRE-BUILT jsonpath filter — shared with the
-/// qprefilter's extension leaves (`!=` as NOT-of-Eq).
+/// qprefilter's extension leaves (`!=` as NOT-of-Eq). `objects = false`
+/// leaves out `object`/`objectList`, the members `~=` never reads.
 pub fn value_or_filter(
-    prefix: &str,
-    filter: Option<&str>,
-    col: &'static str,
-    first: usize,
-    binds: &mut Vec<String>,
-) -> String {
-    member_or(prefix, filter, col, first, binds, true)
-}
-
-/// `value_or_filter` over every member, or without `object`/`objectList`.
-fn member_or(
     prefix: &str,
     filter: Option<&str>,
     col: &'static str,
@@ -637,19 +627,49 @@ mod tests {
         assert!(compile_instance_leaf(Some((CmpOp::Pattern, &esc)), "qi.data", 1).is_none());
         // a pattern both dialects read alike compiles, Relationship members left out
         let got = compile_instance_leaf(Some((CmpOp::Pattern, &s)), "qi.data", 1).expect("pushed");
-        assert!(got.binds.iter().all(|b| !b.contains("object")), "{:?}", got.binds);
-        assert!(got.binds[0].ends_with("? (@ like_regex \"m\")"), "{:?}", got.binds);
+        assert!(
+            got.binds.iter().all(|b| !b.contains("object")),
+            "{:?}",
+            got.binds
+        );
+        assert!(
+            got.binds[0].ends_with("? (@ like_regex \"m\")"),
+            "{:?}",
+            got.binds
+        );
     }
 
     /// T-4907: only the subset Postgres ARE and the `regex` crate read alike
     /// is pushed; the rest stays with the evaluator.
     #[test]
     fn only_patterns_both_dialects_read_alike_are_pushed() {
-        for p in ["^B", "erl", "^b.*n$", "(a|b)+", "[A-Z]erlin", "x y", "é.", "^[a-c0-9_-]+?$", "a|"] {
+        for p in [
+            "^B",
+            "erl",
+            "^b.*n$",
+            "(a|b)+",
+            "[A-Z]erlin",
+            "x y",
+            "é.",
+            "^[a-c0-9_-]+?$",
+            "a|",
+        ] {
             assert!(pushable_pattern(p), "{p}");
         }
         for p in [
-            "", "\\d", "a{2}", "[^a]", "[[:alpha:]]", "(?i)b", "(a)\\1", "[a", "a]", "a\0", "(",
+            "",
+            "\\d",
+            "a{2}",
+            "[^a]",
+            "[[:alpha:]]",
+            "(?i)b",
+            "(a)\\1",
+            "[a",
+            "a]",
+            "[a\\d]",
+            "[a[b]]",
+            "a\0",
+            "(",
             &"a".repeat(MAX_PUSHED_PATTERN + 1),
         ] {
             assert!(!pushable_pattern(p), "{p}");

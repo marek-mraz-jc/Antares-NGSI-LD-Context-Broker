@@ -220,14 +220,14 @@ fn instance_predicate(
             None => member,
         };
         // value_or_filter numbers from `first + binds.len()` itself
-        let members = q::value_or_filter("$", Some(&member_filter), "qi.data", first, binds);
+        let members = q::value_or_filter("$", Some(&member_filter), "qi.data", first, binds, true);
         return Some((format!("({lang} OR {members})"), false));
     }
     if let Some((CmpOp::Ne, v)) = cmp {
         let f = q::eq_filter(v)?;
         // value_or_filter numbers as `first + binds.len()` itself — hand it
         // the leaf's base offset, not an already-advanced one
-        let sql = q::value_or_filter("$", Some(&f), "qi.data", first, binds);
+        let sql = q::value_or_filter("$", Some(&f), "qi.data", first, binds, true);
         return Some((format!("NOT {sql}"), false));
     }
     if let Some(l) = compile_instance_leaf(cmp, "qi.data", first.saturating_add(binds.len())) {
@@ -341,8 +341,8 @@ mod tests {
         assert!(e("speed==10..40"));
         assert!(e(r#"route=="550","551""#));
         // dropped conjunct / refused branch / existence / negation → inexact
-        assert!(!e(r#"speed>25;name~="^x""#), "And drop widens");
-        assert!(!e(r#"speed>25|name~="^x""#), "Or refusal is trivial");
+        assert!(!e(r#"speed>25;name~="\d""#), "And drop widens");
+        assert!(!e(r#"speed>25|name~="\d""#), "Or refusal is trivial");
         assert!(!e("speed"), "existence: deletion semantics differ");
         assert!(!e("!speed"));
         assert!(!e("speed!=10"));
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn and_drops_an_uncompilable_member_or_keeps_both() {
         // pattern leaf is outside the exact subset → dropped, one EXISTS left
-        let c = pf(r#"speed>25;name~="^x""#).expect("compiles");
+        let c = pf(r#"speed>25;name~="\d""#).expect("compiles");
         assert_eq!(c.sql.matches("EXISTS").count(), 1, "{}", c.sql);
         // two compilable members: both EXISTS, AND'd, dense numbering
         let c = pf("speed>25;heading<90").expect("compiles");
@@ -369,7 +369,7 @@ mod tests {
     #[test]
     fn or_with_an_uncompilable_branch_is_trivial() {
         // a TRUE branch absorbs the OR — no prefilter at all
-        assert!(pf(r#"speed>25|name~="^x""#).is_none());
+        assert!(pf(r#"speed>25|name~="\d""#).is_none());
         // both branches compile → OR of EXISTS
         let c = pf("speed>25|heading>100").expect("compiles");
         assert!(c.sql.contains(" OR "), "{}", c.sql);
@@ -380,7 +380,7 @@ mod tests {
     fn shapes_outside_the_exact_subset_are_trivial_not_wrong() {
         for q in [
             "!speed",        // negated existence: not superset-safe per-row
-            r#"name~="^x""#, // regex dialect mismatch
+            r#"name~="\d""#, // regex dialect mismatch
             "a.b==1",        // dotted path ambiguity
         ] {
             assert!(pf(q).is_none(), "{q} must be trivial");
@@ -455,18 +455,18 @@ mod tests {
     /// would keep.
     #[test]
     fn a_refused_disjunction_drops_only_its_own_conjunct() {
-        let c = pf(r#"(speed>25|name~="^x");heading<90"#).expect("compiles");
+        let c = pf(r#"(speed>25|name~="\d");heading<90"#).expect("compiles");
         assert_eq!(c.sql.matches("EXISTS").count(), 1, "{}", c.sql);
         assert_eq!(c.binds[0], ex("heading"), "the surviving conjunct");
         assert_dense(&c, 3);
         let r = between();
         assert!(!prefilter_exact(
-            &parse_q(r#"(speed>25|name~="^x");heading<90"#).expect("parse"),
+            &parse_q(r#"(speed>25|name~="\d");heading<90"#).expect("parse"),
             Some(&r),
             &ex
         ));
         // nothing left to keep → no prefilter at all, never an empty predicate
-        assert!(pf(r#"name~="^x";label!~="^y""#).is_none());
+        assert!(pf(r#"name~="\d";label!~="^y""#).is_none());
     }
 
     /// A conjunction that dropped a member is still a legal OR branch: it
@@ -474,14 +474,14 @@ mod tests {
     /// a superset. It must never be reported exact.
     #[test]
     fn a_widened_conjunction_inside_a_disjunction_still_widens() {
-        let c = pf(r#"(speed>25;name~="^x")|heading>100"#).expect("compiles");
+        let c = pf(r#"(speed>25;name~="\d")|heading>100"#).expect("compiles");
         assert_eq!(c.sql.matches("EXISTS").count(), 2, "{}", c.sql);
         assert!(c.sql.contains(" OR "), "{}", c.sql);
         assert_eq!(c.binds[0], ex("speed"));
         assert_dense(&c, 3);
         let r = between();
         assert!(!prefilter_exact(
-            &parse_q(r#"(speed>25;name~="^x")|heading>100"#).expect("parse"),
+            &parse_q(r#"(speed>25;name~="\d")|heading>100"#).expect("parse"),
             Some(&r),
             &ex
         ));
