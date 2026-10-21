@@ -631,49 +631,114 @@ pub async fn history_overrides(
 /// Drop every weekly partition below the pre-created window that holds no
 /// row, so the disk the retention sweeps freed goes back to the node
 /// (DM-97): rows deleted from a partition that keeps one free nothing, as new
-/// writes land in the current week. One transaction locks the parent, and
-/// with it every partition, `ACCESS EXCLUSIVE` within a 2 s `lock_timeout`
-/// and checks the candidates empty under that lock in one statement held to
-/// a 2 s `statement_timeout`, so a late write into the week either committed
-/// before (the partition stays) or waits and lands in DEFAULT once the week
-/// is gone, and no history read or write waits longer than both bounds; a
-/// lock not had in time, or a check that a week of dead rows slows past its
-/// bound, leaves it all for the next tick. Nothing to drop takes no lock.
+/// writes land in the current week. See [`drop_partitions`].
 async fn drop_emptied_partitions(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
-    const OLD_PARTITIONS: &str = r"SELECT c.relname
+    drop_partitions(pool, &[], &[]).await
+}
+
+/// Retention by partition (T-4906): drop every weekly partition whose rows
+/// all belong to Tenants of `floors` (Tenant, UTC DateTime) and whose upper
+/// bound is at or below that Tenant's floor, the oldest cut any of its rules
+/// keeps. The rows such a partition holds are all ones the row sweep would
+/// delete, so dropping the table replaces millions of row DELETEs, their WAL
+/// and the vacuum after them (dev 2026-10-19: P28D deleted ~2M rows a night
+/// and starved the broker). A partition holding one row of a Tenant without a
+/// floor, or with a floor below its bound, stays for the row sweep.
+pub async fn drop_retained_partitions(
+    pool: &PgPool,
+    floors: &[(String, String)],
+) -> Result<Vec<String>, sqlx::Error> {
+    if floors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (tenants, cuts): (Vec<String>, Vec<String>) = floors
+        .iter()
+        .map(|(t, c)| {
+            (
+                t.clone(),
+                antares_store::filter::canonical_datetime(c).into_owned(),
+            )
+        })
+        .unzip();
+    drop_partitions(pool, &tenants, &cuts).await
+}
+
+/// Whether partition `{p}` may go: every Tenant with a row in it has a floor
+/// in (`$1` Tenants, `$2` cuts) at or above its upper bound `$3`. The
+/// Tenants present are read by a loose scan of the partition's
+/// `(tenant_id, ...)` index, one descent per Tenant, never the rows.
+const DROPPABLE: &str = "WITH RECURSIVE t(id) AS (
+           (SELECT tenant_id FROM {p} ORDER BY tenant_id LIMIT 1)
+           UNION ALL
+           SELECT (SELECT tenant_id FROM {p} WHERE tenant_id > t.id ORDER BY tenant_id LIMIT 1)
+           FROM t WHERE t.id IS NOT NULL)
+         SELECT NOT EXISTS (
+           SELECT 1 FROM t
+           LEFT JOIN unnest($1::text[], $2::timestamptz[]) AS f(tenant, cut) ON f.tenant = t.id
+           WHERE t.id IS NOT NULL AND (f.cut IS NULL OR f.cut < $3::timestamptz))";
+
+/// Drop the past weekly partitions [`DROPPABLE`] admits under (`tenants`,
+/// `cuts`); with none, the empty ones below the pre-created window. One
+/// transaction locks the parent, and with it every partition, `ACCESS
+/// EXCLUSIVE` within a 2 s `lock_timeout` and checks each candidate again
+/// under that lock, each check held to a 2 s `statement_timeout`, so a late
+/// write into the week either committed before (and is counted) or waits and
+/// lands in DEFAULT once the week is gone, and no history read or write
+/// waits longer than both bounds; a lock not had in time leaves it all for
+/// the next tick. Nothing to drop takes no lock.
+async fn drop_partitions(
+    pool: &PgPool,
+    tenants: &[String],
+    cuts: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    // A candidate ends at or below the latest floor, or below the window.
+    const OLD_PARTITIONS: &str = r"SELECT c.relname, b.hi::text AS hi
          FROM pg_inherits i
          JOIN pg_class c ON c.oid = i.inhrelid
          JOIN pg_class p ON p.oid = i.inhparent
+         CROSS JOIN LATERAL (SELECT substring(pg_get_expr(c.relpartbound, c.oid)
+                                    FROM 'TO \(''([^'']+)''\)')::timestamptz AS hi) b
          WHERE p.relname = 'attr_instances'
            AND p.relnamespace = 'public'::regnamespace
            AND pg_get_expr(c.relpartbound, c.oid) LIKE 'FOR VALUES FROM%'
-           AND substring(pg_get_expr(c.relpartbound, c.oid) FROM 'TO \(''([^'']+)''\)')::timestamptz
-               <= date_trunc('week', now()) - interval '1 week'";
+           AND b.hi <= GREATEST((SELECT max(x) FROM unnest($1::timestamptz[]) x),
+                                date_trunc('week', now()) - interval '1 week')
+         ORDER BY b.hi";
     let mut done = Vec::new();
-    // Service role for both reads: a partition read under a tenant's policy
-    // would look empty to a broker that sees none of its rows.
+    // Unlocked first, each check in a transaction of its own: one that held
+    // a partition's lock while waiting on the next deadlocks with another
+    // pod's LOCK below, which takes them all in turn.
     let mut tx = pool.begin().await?;
-    crate::store::pg::set_service(&mut tx).await?;
-    let candidates: Vec<String> = sqlx::query_scalar(OLD_PARTITIONS)
+    let found: Vec<(String, String)> = sqlx::query_as(OLD_PARTITIONS)
+        .bind(cuts)
         .fetch_all(&mut *tx)
         .await?;
-    let mut empty = Vec::new();
-    for name in candidates {
-        let quoted = format!("public.\"{}\"", name.replace('"', "\"\""));
-        let none: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT NOT EXISTS (SELECT 1 FROM {quoted})"
-        )))
-        .fetch_one(&mut *tx)
-        .await?;
-        if none {
-            empty.push((name, quoted));
+    tx.commit().await?;
+    let mut any = false;
+    for (name, hi) in &found {
+        let mut tx = pool.begin().await?;
+        let ok = droppable(&mut tx, name, hi, tenants, cuts).await?;
+        tx.commit().await?;
+        if ok {
+            any = true;
+            break;
         }
     }
-    tx.commit().await?;
-    if empty.is_empty() {
+    if !any {
         return Ok(done);
     }
     let mut tx = pool.begin().await?;
+    // The maintenance claim: one pod drops at a time, and a writer that holds
+    // it (a pass creating a week) never sees its new week dropped while empty.
+    let claimed = sqlx::query(
+        "SELECT name FROM maintenance_jobs WHERE name = 'temporal_partitions'
+         FOR UPDATE SKIP LOCKED",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if claimed.is_none() {
+        return Ok(done);
+    }
     crate::store::pg::set_service(&mut tx).await?;
     sqlx::query("SET LOCAL lock_timeout = '2s'")
         .execute(&mut *tx)
@@ -684,27 +749,40 @@ async fn drop_emptied_partitions(pool: &PgPool) -> Result<Vec<String>, sqlx::Err
     sqlx::query("LOCK TABLE public.attr_instances IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *tx)
         .await?;
-    // The candidates by position, so no name is spelled into the statement twice.
-    let still_sql = empty
-        .iter()
-        .enumerate()
-        .map(|(i, (_, quoted))| format!("SELECT {i} WHERE NOT EXISTS (SELECT 1 FROM {quoted})"))
-        .collect::<Vec<_>>()
-        .join(" UNION ALL ");
-    let still: Vec<i32> = sqlx::query_scalar(sqlx::AssertSqlSafe(still_sql))
+    // Read again under the lock: another pod may have dropped one meanwhile.
+    let found: Vec<(String, String)> = sqlx::query_as(OLD_PARTITIONS)
+        .bind(cuts)
         .fetch_all(&mut *tx)
         .await?;
-    for (name, _) in still
-        .into_iter()
-        .filter_map(|i| usize::try_from(i).ok().and_then(|i| empty.get(i)))
-    {
-        sqlx::query(sqlx::AssertSqlSafe(drop_partition_sql(name)))
-            .execute(&mut *tx)
-            .await?;
-        done.push(format!("dropped emptied partition {name}"));
+    for (name, hi) in found {
+        if droppable(&mut tx, &name, &hi, tenants, cuts).await? {
+            sqlx::query(sqlx::AssertSqlSafe(drop_partition_sql(&name)))
+                .execute(&mut *tx)
+                .await?;
+            done.push(format!("dropped partition {name}"));
+        }
     }
     tx.commit().await?;
     Ok(done)
+}
+
+/// Whether [`DROPPABLE`] admits the partition `name` with upper bound `hi`.
+/// The partition is read directly: it carries no policy of its own, so the
+/// read sees every Tenant's rows whatever the role.
+async fn droppable(
+    tx: &mut sqlx::PgConnection,
+    name: &str,
+    hi: &str,
+    tenants: &[String],
+    cuts: &[String],
+) -> Result<bool, sqlx::Error> {
+    let quoted = format!("public.\"{}\"", name.replace('"', "\"\""));
+    sqlx::query_scalar(sqlx::AssertSqlSafe(DROPPABLE.replace("{p}", &quoted)))
+        .bind(tenants)
+        .bind(cuts)
+        .bind(hi)
+        .fetch_one(tx)
+        .await
 }
 
 /// Drop one partition, named the way the catalog row spells it. The name

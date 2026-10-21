@@ -545,6 +545,155 @@ async fn a_past_partition_the_sweeps_emptied_is_dropped_and_a_held_one_stays() {
     let _ = store.delete(&tenant, "urn:v:held").await;
 }
 
+/// T-4906: retention by partition. A past week whose rows all belong to
+/// Tenants whose floor lies at or above its end goes whole; a week holding a
+/// row of a Tenant that keeps longer (B), or of one without a floor (C),
+/// stays with every row, and what stays reads the same as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_week_every_tenant_in_it_outlived_is_dropped_and_a_longer_rule_keeps_its_week() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    if pg::maintenance::detect_temporal_backend(&pool).await != Ok(TemporalBackend::Partitioned) {
+        eprintln!("SKIP: attr_instances is not natively partitioned here");
+        return;
+    }
+    let weeks = [
+        ("attr_instances_2002w10", "2002-03-04", "2002-03-11"),
+        ("attr_instances_2002w11", "2002-03-11", "2002-03-18"),
+        ("attr_instances_2002w12", "2002-03-18", "2002-03-25"),
+    ];
+    // Hold the maintenance claim while the weeks are made and filled, so a
+    // parallel test's drop of emptied weeks cannot take one while it is empty.
+    let mut claim = pool.begin().await.expect("claim");
+    sqlx::query("SELECT name FROM maintenance_jobs WHERE name = 'temporal_partitions' FOR UPDATE")
+        .fetch_optional(&mut *claim)
+        .await
+        .expect("claim row");
+    for (name, lo, hi) in weeks {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE IF NOT EXISTS {name} PARTITION OF attr_instances FOR VALUES FROM ('{lo}') TO ('{hi}')"
+        )))
+        .execute(&mut *claim)
+        .await
+        .expect("partition");
+    }
+    sqlx::query("DELETE FROM attr_instances WHERE tenant_id IN ('part-a', 'part-b', 'part-c')")
+        .execute(&mut *claim)
+        .await
+        .expect("clean");
+    // A in every week, B in the first two, C in the last.
+    for (tenant, at) in [
+        ("part-a", "2002-03-05"),
+        ("part-a", "2002-03-12"),
+        ("part-a", "2002-03-19"),
+        ("part-b", "2002-03-06"),
+        ("part-b", "2002-03-13"),
+        ("part-c", "2002-03-20"),
+    ] {
+        sqlx::query(
+            "INSERT INTO attr_instances (tenant_id, entity_id, attr_id, instance_id, observed_at,
+                                         created_at, modified_at, data)
+             VALUES ($1, 'urn:v:p', 'https://example.org/speed', 'urn:i:' || $2, $2::timestamptz,
+                     $2::timestamptz, $2::timestamptz, '{\"value\": 1}')",
+        )
+        .bind(tenant)
+        .bind(at)
+        .execute(&mut *claim)
+        .await
+        .expect("row");
+    }
+    claim.commit().await.expect("release");
+    let exists = |name: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1 AND relnamespace = 'public'::regnamespace)",
+            )
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .expect("catalog")
+        }
+    };
+    let rows = |tenant: &'static str| {
+        count(
+            &pool,
+            "SELECT count(*) FROM attr_instances WHERE tenant_id = $1",
+            tenant,
+        )
+    };
+    let floors = [
+        ("part-a".to_owned(), "2002-04-01T00:00:00.000Z".to_owned()),
+        ("part-b".to_owned(), "2002-03-12T00:00:00Z".to_owned()),
+    ];
+    // Another test's maintenance may hold the claim; the drop waits a tick.
+    let mut done = Vec::new();
+    for _ in 0..50 {
+        done.extend(
+            pg::maintenance::drop_retained_partitions(&pool, &floors)
+                .await
+                .expect("drop"),
+        );
+        if !exists("attr_instances_2002w10").await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        done.iter().any(|l| l.ends_with("attr_instances_2002w10")),
+        "A and B outlived the first week: {done:?}"
+    );
+    assert!(
+        exists("attr_instances_2002w11").await,
+        "B keeps rows past its week's end: {done:?}"
+    );
+    assert!(
+        exists("attr_instances_2002w12").await,
+        "C has no floor: {done:?}"
+    );
+    assert_eq!(
+        (
+            rows("part-a").await,
+            rows("part-b").await,
+            rows("part-c").await
+        ),
+        (2, 1, 1),
+        "only the dropped week's rows went"
+    );
+    // Without a floor nothing goes; once B's floor passes, its week goes too.
+    assert_eq!(
+        pg::maintenance::drop_retained_partitions(&pool, &[])
+            .await
+            .expect("no floors"),
+        Vec::<String>::new()
+    );
+    let floors = [
+        ("part-a".to_owned(), "2002-04-01T00:00:00.000Z".to_owned()),
+        ("part-b".to_owned(), "2002-03-18T00:00:00.000Z".to_owned()),
+    ];
+    for _ in 0..50 {
+        pg::maintenance::drop_retained_partitions(&pool, &floors)
+            .await
+            .expect("drop");
+        if !exists("attr_instances_2002w11").await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        !exists("attr_instances_2002w11").await,
+        "B's floor passed its week"
+    );
+    assert!(
+        exists("attr_instances_2002w12").await,
+        "C still has no floor"
+    );
+    sqlx::query("DROP TABLE IF EXISTS attr_instances_2002w12")
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+}
+
 /// DM-97, owner 2026-10-18: an Entity its `expiresAt` ends takes its history
 /// with it; an Entity of the same Tenant without one keeps its own.
 #[tokio::test(flavor = "multi_thread")]

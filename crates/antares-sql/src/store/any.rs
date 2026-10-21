@@ -1846,6 +1846,24 @@ impl antares_store::TemporalDriver for AnyStore {
             .map_err(db),
         }
     }
+    async fn drop_retained_history(
+        &self,
+        floors: &[(String, String)],
+    ) -> Result<Vec<String>, NgsiError> {
+        match self {
+            // memory keeps no partitions
+            AnyStore::Mem(_) => {
+                let _ = floors;
+                Ok(Vec::new())
+            }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                crate::store::pg::maintenance::drop_retained_partitions(p.docs.pool(), floors)
+                    .await
+                    .map_err(db)
+            }
+        }
+    }
     fn version_info(&self) -> Value {
         AnyStore::version_info(self)
     }
