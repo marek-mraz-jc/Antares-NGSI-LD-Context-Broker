@@ -482,3 +482,55 @@ async fn an_old_history_that_fits_one_answer_stays_raw() -> Result<(), String> {
     );
     Ok(())
 }
+
+/// T-5062: a page without `count` asks one row past it instead of the count:
+/// the cursor appears exactly while rows are left, the pages hold every row
+/// once, no page carries a total, and the last full page carries no cursor.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_count_the_cursor_follows_the_rows_left() -> Result<(), String> {
+    let f = fixture().await?;
+    let mut args = json!({"type": ["Car"], "q": "speed<100", "limit": 2});
+    let mut seen = Vec::new();
+    for page in 0..BIG {
+        let a = call(&f.app, "big", "query_entities", args.clone()).await;
+        assert!(!a.is_error(), "page {page}: {}", a.text);
+        let s = a.structured();
+        assert_eq!(s.get("total"), None, "page {page}");
+        let rows = s
+            .get("entities")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        seen.extend(
+            rows.iter()
+                .filter_map(|e| e.get("id")?.as_str().map(str::to_owned)),
+        );
+        match s.get("nextCursor").and_then(Value::as_str) {
+            Some(c) => {
+                assert_eq!(rows.len(), 2, "page {page}: a short page links no next one");
+                if let Some(o) = args.as_object_mut() {
+                    o.insert("cursor".into(), json!(c));
+                }
+            }
+            None => break,
+        }
+    }
+    let mut want: Vec<String> = (0..BIG)
+        .map(|n| format!("urn:ngsi-ld:Car:{n:02}"))
+        .collect();
+    want.sort();
+    seen.sort();
+    assert_eq!(seen, want);
+    // with `count` the total says it instead
+    let a = call(
+        &f.app,
+        "big",
+        "query_entities",
+        json!({"type": ["Car"], "q": "speed<100", "limit": 2, "count": true}),
+    )
+    .await;
+    let s = a.structured();
+    assert_eq!(s.get("total"), Some(&json!(BIG)), "{}", a.text);
+    assert!(s.get("nextCursor").is_some(), "{}", a.text);
+    Ok(())
+}
