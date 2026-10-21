@@ -76,7 +76,29 @@ pub async fn upsert_temporal(
         ))?;
         let expanded = expand_entity(obj, &parsed.ctx, TEMPORAL_OPTS)?;
         let id = antares_jsonld::expanded_id(&expanded)?.to_owned();
-        gate!(st, &tenant, &headers, "5.6.11", ids: &[&id]).await?;
+        // the engine is asked with what 5.6.1 gives it (T-4855): types, Attributes, body
+        let types: Vec<String> = expanded
+            .get("type")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let attrs: Vec<String> = expanded
+            .as_object()
+            .map(|o| o.keys().filter(|k| !is_meta(k)).cloned().collect())
+            .unwrap_or_default();
+        gate!(
+            st, &tenant, &headers, "5.6.11",
+            ids: &[&id],
+            types: &types,
+            attrs: &attrs,
+            body: Some(&expanded),
+        )
+        .await?;
         // 5.6.11.4: exclusive/redirect registrations matching the input are
         // forwarded when "Create or Update Temporal" is supported; proxy
         // modes without it are an error of type Conflict; inclusive ones
@@ -2889,6 +2911,44 @@ async fn retrieve_temporal_outer(
     .await
 }
 
+/// T-4665, ADR-N-054 2.4: `versions=all`, the chain of each measurement, for
+/// a caller the space's Policy granted `readVersions` (the gateway says so).
+/// A platform extension (feature `jc`, T-4854).
+#[cfg(feature = "jc")]
+fn versions_asked(
+    st: &AppState,
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> ApiResult<bool> {
+    let versions = match params.get("versions").map(String::as_str) {
+        None => false,
+        Some("all") => true,
+        Some(other) => {
+            return Err(NgsiError::BadRequestData(format!(
+                "versions takes only `all`, not {other:?}"
+            ))
+            .into())
+        }
+    };
+    if versions && !crate::provenance::may_read_versions(headers, st.provenance_from.as_deref()) {
+        return Err(ApiError::Denied(
+            "versions=all needs readVersions, which the space's Policy grants through the gateway"
+                .into(),
+        ));
+    }
+    Ok(versions)
+}
+
+/// Vanilla: `check_params` already refused `versions` as unknown.
+#[cfg(not(feature = "jc"))]
+fn versions_asked(
+    _st: &AppState,
+    _params: &HashMap<String, String>,
+    _headers: &HeaderMap,
+) -> ApiResult<bool> {
+    Ok(false)
+}
+
 async fn retrieve_temporal_inner(
     st: &AppState,
     id: &str,
@@ -2920,28 +2980,12 @@ async fn retrieve_temporal_inner(
                 "datasetId",
                 "entityMap",
                 "entityMapLifetime",
+                // the platform's extension (T-4854): vanilla refuses it as unknown
+                #[cfg(feature = "jc")]
                 "versions",
             ],
         )?;
-        // T-4665, ADR-N-054 2.4: the chain of each measurement, for a caller
-        // the space's Policy granted `readVersions` (the gateway says so)
-        let versions = match params.get("versions").map(String::as_str) {
-            None => false,
-            Some("all") => true,
-            Some(other) => {
-                return Err(NgsiError::BadRequestData(format!(
-                    "versions takes only `all`, not {other:?}"
-                ))
-                .into())
-            }
-        };
-        if versions && !crate::provenance::may_read_versions(headers, st.provenance_from.as_deref())
-        {
-            return Err(ApiError::Denied(
-                "versions=all needs readVersions, which the space's Policy grants through the gateway"
-                    .into(),
-            ));
-        }
+        let versions = versions_asked(st, params, headers)?;
         let accept = parse_accept(headers)?;
         let ctx = request_context(&st.loader, headers).await?;
         let filter = gate!(st, &tenant, headers, "5.7.3", ids: &[id]).await?;

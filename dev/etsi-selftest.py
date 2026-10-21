@@ -110,7 +110,7 @@ def check_baseline():
         with open(base, "w") as fh:
             json.dump({"tps": tps, "mqtt_tps": tps[1:]}, fh)
 
-        def gate(rows, stores="memory", mqtt_off=""):
+        def gate(rows, stores="memory", mqtt_off="", expected=""):
             cell = f"{tmp}/cells/ETSI-cell-memory"
             os.makedirs(cell, exist_ok=True)
             with open(f"{cell}/tp-status.csv", "w", newline="") as fh:
@@ -120,6 +120,10 @@ def check_baseline():
                     source, name = key.split("::")
                     w.writerow(["Demo", source, name, status])
             env = {**os.environ, "BASELINE": base, "STORES": stores, "MQTT_OFF": mqtt_off}
+            if expected:
+                with open(f"{tmp}/expected", "w") as fh:
+                    fh.write(expected)
+                env["EXPECTED"] = f"{tmp}/expected"
             return subprocess.run([sys.executable, f"{HERE}/etsi-baseline.py", "check",
                                    f"{tmp}/cells"], env=env, capture_output=True, text=True)
 
@@ -139,6 +143,15 @@ def check_baseline():
         assert gate([(tps[1], "PASS")], mqtt_off="memory").returncode != 0
         absent = gate([(t, "PASS") for t in tps], stores="memory file")
         assert absent.returncode != 0 and "file: no tp-status.csv" in absent.stdout, absent.stdout
+        # a policy cell (EXPECTED): a listed refusal is green, the same TP passing is red
+        listed = "# refused by the restricted policy\n002_01  5.6.1 refused\n"
+        refused = gate([(tps[0], "PASS"), (tps[1], "FAIL")], expected=listed)
+        assert refused.returncode == 0, refused.stdout
+        let_through = gate([(t, "PASS") for t in tps], expected=listed)
+        assert let_through.returncode != 0, "a refusal that did not happen must fail the gate"
+        assert "expected to fail and did not: 002_01 (5.6.1 refused)" in let_through.stdout, let_through.stdout
+        other = gate([(tps[0], "FAIL"), (tps[1], "FAIL")], expected=listed)
+        assert other.returncode != 0 and "FAIL: TP/a.robot::001_01 First" in other.stdout, other.stdout
     print("  baseline ok (flip and vanish fail, a new pass asks for a ratchet)")
 
 

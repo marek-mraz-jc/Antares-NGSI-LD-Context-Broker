@@ -140,6 +140,10 @@ const GEO_VALUE: &str = "CASE WHEN jsonb_typeof(e->'data'->'value') = 'object'
 /// Whether the newest stored instance of row `e`'s (attribute, datasetId) is
 /// another instance with the same value (T-4507): one row read by the index
 /// (tenant_id, entity_id, attr_id, observed_at DESC), false when none is stored.
+/// The current and the last week first (T-4906): unbounded, the newest row is
+/// a merge over every weekly partition, one cold index descent each. A row
+/// found there is the newest of all; only an attribute silent for longer
+/// reads the whole history, and COALESCE runs that probe for it alone.
 const NEWEST_REPEATS: &str = "COALESCE((
              SELECT x.instance_id <> e->>'instance_id'
                     AND x.data - ARRAY['instanceId','createdAt','modifiedAt']
@@ -147,7 +151,44 @@ const NEWEST_REPEATS: &str = "COALESCE((
              FROM attr_instances x
              WHERE x.tenant_id = $1 AND x.entity_id = $2 AND x.attr_id = e->>'attr_id'
                AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
+               AND x.observed_at >= date_trunc('week', now()) - interval '1 week'
+             ORDER BY x.observed_at DESC LIMIT 1), (
+             SELECT x.instance_id <> e->>'instance_id'
+                    AND x.data - ARRAY['instanceId','createdAt','modifiedAt']
+                        = (e->'data') - ARRAY['instanceId','createdAt','modifiedAt']
+             FROM attr_instances x
+             WHERE x.tenant_id = $1 AND x.entity_id = $2 AND x.attr_id = e->>'attr_id'
+               AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
              ORDER BY x.observed_at DESC LIMIT 1), false)";
+
+/// The earliest and latest `observed_at` of `rows`, bound beside every probe
+/// that matches a row by its `observed_at` (T-4906). The equality reaches
+/// the partition key only through a join, so a generic plan reads every
+/// weekly partition of the Entity; a bound parameter prunes them to the weeks
+/// the batch writes before the statement runs. A stamp chrono cannot read
+/// leaves the range open, as the cast in the statement judges it.
+fn observed_range(rows: &[Value]) -> (String, String) {
+    let mut range: Option<(
+        chrono::DateTime<chrono::FixedOffset>,
+        chrono::DateTime<chrono::FixedOffset>,
+    )> = None;
+    for r in rows {
+        let Some(t) = r["observed_at"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        else {
+            return ("-infinity".into(), "infinity".into());
+        };
+        range = Some(match range {
+            None => (t, t),
+            Some((lo, hi)) => (lo.min(t), hi.max(t)),
+        });
+    }
+    match range {
+        Some((lo, hi)) => (lo.to_rfc3339(), hi.to_rfc3339()),
+        None => ("-infinity".into(), "infinity".into()),
+    }
+}
 
 /// The rows of one append that are new observations (T-4507): of rows equal
 /// but for their stamps, the first, and of rows with an `observedAt`, one per
@@ -205,6 +246,7 @@ async fn insert_rows(
         .collect();
     in_dataset.sort_unstable();
     in_dataset.dedup();
+    let (lo, hi) = observed_range(&rows);
     // geo_value: extracted per instance when the value LOOKS like a GeoJSON
     // geometry; try_geomfromgeojson (0001_init.sql) maps anything PostGIS rejects to
     // NULL, which the S3 prefilter treats as "reaches the evaluator".
@@ -228,6 +270,7 @@ async fn insert_rows(
          FROM jsonb_array_elements($3::jsonb) AS e
          JOIN attr_instances x ON x.tenant_id = $1 AND x.entity_id = $2
            AND x.attr_id = e->>'attr_id' AND x.observed_at = (e->>'observed_at')::timestamptz
+           AND x.observed_at BETWEEN $5::timestamptz AND $6::timestamptz
          WHERE (x.instance_id = e->>'instance_id'
                 OR ($4 AND e->'data' ? 'observedAt'
                     AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'))
@@ -238,6 +281,8 @@ async fn insert_rows(
     .bind(entity_id)
     .bind(&rows)
     .bind(dedup)
+    .bind(&lo)
+    .bind(&hi)
     .execute(&mut *tx)
     .await?;
     if dedup {
@@ -251,11 +296,14 @@ async fn insert_rows(
              FROM jsonb_array_elements($3::jsonb) AS e
              WHERE x.tenant_id = $1 AND x.entity_id = $2 AND e->'data' ? 'observedAt' AND {same}
                AND x.observed_at = (e->>'observed_at')::timestamptz
+               AND x.observed_at BETWEEN $4::timestamptz AND $5::timestamptz
                AND x.data - {STAMPS} IS DISTINCT FROM (e->'data') - {STAMPS}"
         )))
         .bind(tenant.as_str())
         .bind(entity_id)
         .bind(&rows)
+        .bind(&lo)
+        .bind(&hi)
         .execute(&mut *tx)
         .await?;
     }
@@ -278,7 +326,8 @@ async fn insert_rows(
            WHEN e->'data' ? 'observedAt' THEN EXISTS (
              SELECT 1 FROM attr_instances x
              WHERE x.tenant_id = $1 AND x.entity_id = $2 AND {same}
-               AND x.observed_at = (e->>'observed_at')::timestamptz)
+               AND x.observed_at = (e->>'observed_at')::timestamptz
+               AND x.observed_at BETWEEN $5::timestamptz AND $6::timestamptz)
            ELSE {NEWEST_REPEATS}
          END
          ON CONFLICT (tenant_id, entity_id, attr_id, instance_id, observed_at)
@@ -295,6 +344,8 @@ async fn insert_rows(
     .bind(entity_id)
     .bind(&rows)
     .bind(dedup)
+    .bind(&lo)
+    .bind(&hi)
     .execute(&mut *tx)
     .await?;
     if !in_dataset.is_empty() {
@@ -928,9 +979,15 @@ impl PgTemporalStore {
             wheres.push(format!("m.id = ANY(${})", binds.len()));
         }
         if let Some(types) = f.types {
-            // overlap: entity has ANY of the wanted types (flat OR list)
+            // overlap: entity has ANY of the wanted types (flat OR list).
+            // `&&` alone is no index condition under RLS (not leakproof):
+            // the first-type arm and the multi-type arm are (migration 0015),
+            // and they BitmapOr instead of reading the Tenant (T-4852).
             binds.push(B::Arr(super::storable(types)));
-            wheres.push(format!("m.types && ${}", binds.len()));
+            let n = binds.len();
+            wheres.push(format!(
+                "(m.types[1] = ANY(${n}) OR (cardinality(m.types) > 1 AND m.types && ${n}))"
+            ));
         }
         if let Some(attrs) = f.attrs {
             binds.push(B::Arr(super::storable(attrs)));

@@ -72,7 +72,8 @@ const KNOWN_KEYS: &[&str] = &[
     // (`on`); off keeps NGSI-LD's last-write-wins.
     "ANTARES_HISTORY_BACKFILL",
     // T-4665: the gateway's mesh identity; only it is believed in its
-    // provenance headers. Unset, every write is `channel: api`.
+    // provenance headers. Unset, every write is `channel: api`. Read by the
+    // `jc` build only (T-4854); vanilla ignores it.
     "ANTARES_PROVENANCE_FROM",
     // 4.22 GC interval (memory/file arm); default 900 s, the ETSI stack runs
     // at 2 s so the transient TPs (422_01) exercise the sweep itself.
@@ -964,9 +965,12 @@ async fn run(
         .as_deref()
         .unwrap_or("all")
         .parse()?;
-    state.provenance_from = std::env::var("ANTARES_PROVENANCE_FROM")
-        .ok()
-        .filter(|g| !g.trim().is_empty());
+    #[cfg(feature = "jc")]
+    {
+        state.provenance_from = std::env::var("ANTARES_PROVENANCE_FROM")
+            .ok()
+            .filter(|g| !g.trim().is_empty());
+    }
     // The surfaces mounted beside the NGSI-LD API root, from configuration
     // rather than from a hard-wired list: the selection replaces what the
     // default mounting put there, before the state is shared.

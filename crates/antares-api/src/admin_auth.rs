@@ -86,7 +86,9 @@ impl AdminAuth {
 
     /// `Authorization: Bearer <secret>` (scheme case-insensitive, RFC 9110
     /// 11.1), compared without an early exit on the first differing byte.
-    fn admits(&self, authorization: Option<&[u8]>) -> bool {
+    /// A surface's internal route asks it too (T-4901).
+    #[must_use]
+    pub fn admits(&self, authorization: Option<&[u8]>) -> bool {
         let Some(value) = authorization else {
             return false;
         };

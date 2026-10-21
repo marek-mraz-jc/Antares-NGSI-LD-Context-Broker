@@ -509,6 +509,13 @@ History retention has four levels and the most specific wins (DM-97):
 An Entity removed by its own `expiresAt` (4.22) takes its history with it.
 Weekly history partitions below the pre-created window that the sweeps
 emptied are dropped by the maintenance job, so their disk goes back.
+Before its row deletes, each sweep drops a past weekly partition whole when
+every Tenant with a row in it has a floor at or after the partition's end
+(T-4906). A Tenant's floor is the oldest cut of all its levels. A Tenant
+gets one only when its `*` rule or the platform default covers the rest of
+its types, no type rule of it says `forever`, and every Entity with its own
+`historyRetention` was read. One row of a Tenant without a floor, or with a
+later one, keeps the partition, and the row sweep then deletes inside it.
 
 Every pod sweeps once a minute, each rule in statements of at most 1000 rows
 and at most 50 statements a sweep, logs per Tenant and type the count it

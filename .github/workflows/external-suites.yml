@@ -10,6 +10,8 @@ name: external-suites
 #   - the cross-surface oracle (views, OData, MCP, WebSocket equal the core
 #     answer narrowed by the view), once its test exists (T-3522).
 # The triage of every failure lives in docs/conformance/final-validation.md.
+# Gates (T-4855): (a) must pass dev/etsi-baseline.json whole; (b) fails exactly the TPs of
+# tests/external/etsi/forge-latest-ratchet.txt or fewer (docs/conformance/suite-edits.md).
 # GitHub-hosted runners only: the suites never run on a shared host.
 #
 # A push that touches the harness runs the smoke preset (vanilla, file
@@ -248,6 +250,7 @@ jobs:
           python3 -m http.server 8078 --bind 127.0.0.1 --directory ngsi-ld-test-suite > /dev/null 2>&1 &
           tests/external/etsi/forge-free.sh ngsi-ld-test-suite http://127.0.0.1:8078
       - name: Run the suites
+        id: run
         if: steps.forge.outputs.skip != '1'
         env:
           STORE: ${{ matrix.store }}
@@ -260,8 +263,30 @@ jobs:
           API_SURFACES: ${{ matrix.variant == 'full' && env.FULL_SURFACES || 'admin' }}
         run: |
           [ "$SMOKE" = true ] && export SUITES=Provision
-          ./dev/etsi-pipeline.sh > "$OUT/pipeline.log" 2>&1 || echo "pipeline exit $?" >> "$OUT/pipeline.log"
+          rc=0
+          ./dev/etsi-pipeline.sh > "$OUT/pipeline.log" 2>&1 || rc=$?
+          echo "pipeline exit $rc" >> "$OUT/pipeline.log"
           tail -5 "$OUT/pipeline.log"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+      # (a) is the suite this repository carries: every TP of dev/etsi-baseline.json runs and
+      # passes, and the peak-RSS gate holds (the pipeline's exit). (b) is forge's: it fails
+      # exactly the TPs of the ratchet, or fewer (T-4855).
+      - name: Gate (a) on the baseline
+        if: matrix.suite == 'pinned'
+        env:
+          STORES: ${{ matrix.store }}
+        run: |
+          [ "${{ steps.run.outputs.rc }}" = 0 ] || { echo "pipeline exit ${{ steps.run.outputs.rc }}: $OUT/pipeline.log"; exit 1; }
+          [ "$SMOKE" = true ] && exit 0
+          mkdir -p cells && ln -sfn "$PWD/$OUT" "cells/ETSI-cell-${{ matrix.store }}"
+          ./dev/etsi-baseline.py check cells
+      - name: Gate (b) on the forge ratchet
+        if: matrix.suite == 'latest' && steps.forge.outputs.skip != '1'
+        run: |
+          set -o pipefail
+          partial=""; [ "$SMOKE" = true ] && partial=--partial
+          python3 tests/external/etsi/ratchet.py tests/external/etsi/forge-latest-ratchet.txt "$OUT/tp-status.csv" $partial \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v6
         if: always()
         with:

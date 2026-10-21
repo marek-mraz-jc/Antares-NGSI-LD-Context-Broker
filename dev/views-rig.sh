@@ -6,8 +6,11 @@
 # model; the broker needs ANTARES_SCHEMA_MAX_BYTES), then each Tenant seeded
 # from ci/views/seed/<tenant>.json (Batch Create). Fails on the first refusal.
 # A second argument names another directory of the same layout (ci/views/ogc,
-# the OGC matrix's own Tenant, T-3831).
+# the OGC matrix's own Tenant, T-3831). Each Temporal Representation in
+# history/<tenant>.json (an array) goes through POST /ngsi-ld/v1/temporal/entities
+# after the seed: the earlier instances a SensorThings run reads (T-4878).
 set -euo pipefail
+shopt -s nullglob
 base=${1:?usage: dev/views-rig.sh <broker base URL> [views directory]}
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 views=${2:-$root/ci/views}
@@ -28,5 +31,13 @@ for f in "$views"/seed/*.json; do
   code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
     -H "NGSILD-Tenant: $tenant" --data-binary @"$f" "$base/ngsi-ld/v1/entityOperations/create")
   [[ $code == 201 ]] || { echo "seed $tenant: HTTP $code" >&2; exit 1; }
+done
+for f in "$views"/history/*.json; do
+  tenant=$(basename "$f" .json)
+  while IFS= read -r body; do
+    code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+      -H "NGSILD-Tenant: $tenant" --data-binary "$body" "$base/ngsi-ld/v1/temporal/entities")
+    [[ $code == 201 || $code == 204 ]] || { echo "history $tenant: HTTP $code" >&2; exit 1; }
+  done < <(jq -c '.[]' "$f")
 done
 echo "views and seed loaded into $base"

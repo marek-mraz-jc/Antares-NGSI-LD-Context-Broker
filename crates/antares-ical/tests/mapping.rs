@@ -3,7 +3,7 @@
 
 #![allow(clippy::expect_used, clippy::panic)]
 
-use antares_ical::mapping::{escape, fold, vevent, Outcome, When, Window};
+use antares_ical::mapping::{escape, fold, reason, Outcome, Plan, When, Window};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
@@ -49,6 +49,10 @@ fn feed(extra: &[(&str, Value)]) -> Vec<String> {
     lines(&vevent(&event(extra), &Window::default(), now()))
 }
 
+fn vevent(entity: &Value, window: &Window, now: DateTime<Utc>) -> Outcome {
+    Plan::default().vevent(entity, window, now)
+}
+
 fn has(l: &[String], line: &str) -> bool {
     l.iter().any(|x| x == line)
 }
@@ -85,7 +89,7 @@ fn a_date_start_with_a_time_end_ends_the_day_after_that_time() {
 }
 
 #[test]
-fn an_offset_is_written_in_utc_and_an_end_before_the_start_is_dropped() {
+fn an_offset_is_written_in_utc_and_an_end_before_the_start_skips_the_event() {
     let l = feed(&[
         (
             "startDate",
@@ -93,8 +97,12 @@ fn an_offset_is_written_in_utc_and_an_end_before_the_start_is_dropped() {
         ),
         ("endDate", prop(json!("2026-10-20T17:00:00+02:00"))),
     ]);
+    assert_eq!(l, [format!("Skipped({:?})", reason::END_NOT_AFTER_START)]);
+    let l = feed(&[(
+        "startDate",
+        prop(json!({"@type": "DateTime", "@value": "2026-10-20T18:00:00+02:00"})),
+    )]);
     assert!(has(&l, "DTSTART:20261020T160000Z"), "{l:?}");
-    assert!(!l.iter().any(|x| x.starts_with("DTEND")), "{l:?}");
 }
 
 #[test]
@@ -125,13 +133,22 @@ fn without_start_or_name_there_is_no_event() {
     e.as_object_mut().expect("object").remove("name");
     assert_eq!(
         vevent(&e, &Window::default(), now()),
-        Outcome::Skipped("name")
+        Outcome::Skipped(reason::MISSING_SUMMARY)
     );
     assert_eq!(
         feed(&[("startDate", prop(json!("soon")))]),
-        ["Skipped(\"startDate\")"]
+        [format!("Skipped({:?})", reason::UNPARSABLE_DATE)]
     );
-    assert_eq!(feed(&[("name", prop(json!("  ")))]), ["Skipped(\"name\")"]);
+    let mut e = event(&[]);
+    e.as_object_mut().expect("object").remove("startDate");
+    assert_eq!(
+        vevent(&e, &Window::default(), now()),
+        Outcome::Skipped(reason::MISSING_DTSTART)
+    );
+    assert_eq!(
+        feed(&[("name", prop(json!("  ")))]),
+        [format!("Skipped({:?})", reason::MISSING_SUMMARY)]
+    );
 }
 
 #[test]
@@ -151,7 +168,7 @@ fn the_window_keeps_what_overlaps_it_and_its_last_day_inclusive() {
 }
 
 #[test]
-fn location_geo_and_url_come_from_the_entity_and_a_bad_url_is_left_out() {
+fn location_geo_and_url_come_from_the_entity_and_a_bad_url_skips_it() {
     let l = feed(&[
         (
             "address",
@@ -161,18 +178,20 @@ fn location_geo_and_url_come_from_the_entity_and_a_bad_url_is_left_out() {
             "location",
             json!({"type": "GeoProperty", "value": {"type": "Point", "coordinates": [19.146, 48.736]}}),
         ),
-        ("url", prop(json!("javascript:alert(1)"))),
     ]);
     assert!(
         has(&l, "LOCATION:Námestie SNP 1\\, Banská Bystrica"),
         "{l:?}"
     );
     assert!(has(&l, "GEO:48.736;19.146"), "{l:?}");
-    assert!(!l.iter().any(|x| x.starts_with("URL")), "{l:?}");
+    let skipped = [format!("Skipped({:?})", reason::URL_NOT_HTTP)];
+    assert_eq!(
+        feed(&[("url", prop(json!("javascript:alert(1)")))]),
+        skipped
+    );
     let l = feed(&[("url", prop(json!("http://bb.sk/e/1")))]);
     assert!(has(&l, "URL:http://bb.sk/e/1"), "{l:?}");
-    let l = feed(&[("url", prop(json!("https://bb.sk/a b")))]);
-    assert!(!l.iter().any(|x| x.starts_with("URL")), "{l:?}");
+    assert_eq!(feed(&[("url", prop(json!("https://bb.sk/a b")))]), skipped);
 }
 
 #[test]
@@ -186,14 +205,16 @@ fn an_address_as_text_is_the_location_and_an_empty_one_none() {
 }
 
 #[test]
-fn a_geometry_other_than_a_point_or_off_the_globe_has_no_geo() {
+fn a_geometry_other_than_a_point_has_no_geo_and_one_off_the_globe_skips_it() {
     let line = json!({"type": "GeoProperty", "value": {"type": "LineString", "coordinates": [[19.1, 48.7], [19.2, 48.8]]}});
+    let l = feed(&[("location", line)]);
+    assert!(!l.iter().any(|x| x.starts_with("GEO")), "{l:?}");
     let off =
         json!({"type": "GeoProperty", "value": {"type": "Point", "coordinates": [19.1, 98.7]}});
-    for location in [line, off] {
-        let l = feed(&[("location", location)]);
-        assert!(!l.iter().any(|x| x.starts_with("GEO")), "{l:?}");
-    }
+    assert_eq!(
+        feed(&[("location", off)]),
+        [format!("Skipped({:?})", reason::GEO_OUT_OF_RANGE)]
+    );
 }
 
 #[test]
@@ -218,7 +239,10 @@ fn the_default_instance_and_the_first_language_are_read() {
         json!([{"type": "Property", "value": "jediný", "datasetId": "urn:ngsi-ld:Dataset:x"}]),
     )]);
     assert!(has(&only, "SUMMARY:jediný"), "{only:?}");
-    assert_eq!(feed(&[("name", json!([]))]), ["Skipped(\"name\")"]);
+    assert_eq!(
+        feed(&[("name", json!([]))]),
+        [format!("Skipped({:?})", reason::MISSING_SUMMARY)]
+    );
 }
 
 #[test]

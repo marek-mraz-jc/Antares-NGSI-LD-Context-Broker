@@ -6,7 +6,9 @@ a dedicated-vCPU machine at Hetzner for the run, register it as an
 ephemeral GitHub runner, and delete it afterwards (`perf-janitor` sweeps a
 leaked server or volume by its expiry label). Results land under
 [`/reports/perf/latest/`](https://antaresbroker.joinedcontext.com/reports/perf/latest/)
-with the raw CSVs next to the tables.
+with the raw CSVs next to the tables. One table is the exception:
+[query plans under row-level security](#query-plans-under-row-level-security)
+comes from a local script, named with its box beside it.
 
 | run | box | what it measures | cadence |
 |---|---|---|---|
@@ -772,6 +774,96 @@ folds the newest bundles into `/reports/perf/latest/`.
 If you would rather not rent hardware, disable the two workflows (Actions
 → workflow → *⋯* → *Disable workflow*) so the weekly runs stop going red.
 
+## The perf gate
+
+Two runs fail on a regression against a baseline committed in
+`ci/perf-baseline/` (T-4853). `dev/perf/gate.py` compares; `gate.py
+selftest` checks the comparison itself and runs first in both.
+
+| run | what it measures | baseline | fails when |
+|---|---|---|---|
+| `bench-surfaces`, nightly and weekly on a GitHub runner | `cargo bench -p antares-sql --bench core_paths`: `q`, type, `geoQ` and `scopeQ` parsing, the SQL each compiles to, JSON-LD compaction of a 100-entity page | `bench-core.json`, per CPU model | a case's p50, read as a ratio to a fixed CPU loop measured right before it, is more than 15 % above the baseline's ratio |
+| `perf-weekly`, on the pinned Hetzner box | every row of `shapes.sh`, memory and (with `store: postgres`) PostgreSQL | `shapes.json`, per instance type | a row's p99 is more than 15 % up or its req/s more than 15 % down |
+
+Both fail on a baseline row the run no longer produces. A CPU model or
+instance type with no baseline is reported and not gated: its first run
+prints the rows, and committing them is how a new runner joins the gate.
+The ratio is what makes a shared runner usable for the bench: four runs of
+the same commit on one box moved each case by at most 6.3 %, and a case
+slowed on purpose (a 1 ns sleep in `ql_parse_q`, about 50 µs) failed the
+gate at +6 315 %.
+
+Accepting a change that moves a number is a reviewed commit of the
+baseline:
+
+```bash
+BENCH_JSON=/tmp/core.json cargo bench -p antares-sql --bench core_paths
+python3 dev/perf/gate.py bench /tmp/core.json ci/perf-baseline/bench-core.json --write
+python3 dev/perf/gate.py shapes results/perf/shapes.md ci/perf-baseline/shapes.json --machine ccx33 --write
+```
+
+Each run's tables are committed to the `perf-history` branch by the
+workflow's `history` job (`dev/perf/commit-history.sh`), under
+`runs/<time>-<run>-<commit>/`, so a number this book cites does not expire
+with the Actions artifact. `perf-weekly` stays dispatched by hand: it rents
+the Hetzner box, and its schedule line is commented out until the owner
+turns it on.
+
+## Vanilla against the platform build
+
+The joinedcontext platform runs Antares built with
+`full,jc-policy,linkml,parquet,tabular,ical` and `ANTARES_POLICY=joinedcontext`.
+`dev/perf/platform-overhead.sh` runs the same `shapes.sh` rows three times on
+one machine: the vanilla binary; the platform binary as vanilla runs it
+(`allow-all`, no view); and the platform binary under the policy engine,
+with a rule document of 20 permissions, 12 Endpoint views loaded, and every
+request carrying the `x-jc-subject` and `x-jc-roles` headers the gateway
+sets. The caller's permission names the Vehicle type and its five
+Attributes, so each read is narrowed as a platform read is. 1 000 Vehicles,
+50 clients, five seconds, median of three runs (T-4853):
+
+| store | shape | clients | vanilla req/s, p99 | platform build | change req/s, p99 | + policy and views | change req/s, p99 |
+|---|---|---|---|---|---|---|---|
+| memory | query | c50 | 19474, 28.50 ms | 18054, 12.18 ms | -7%, -57% | 14096, 13.10 ms | -28%, -54% |
+| memory | query-q | c50 | 13269, 30.52 ms | 13198, 23.45 ms | -1%, -23% | 9171, 17.28 ms | -31%, -43% |
+| memory | query-deep | c50 | 14120, 28.78 ms | 14152, 24.29 ms | +0%, -16% | 12615, 12.26 ms | -11%, -57% |
+| memory | query-regex | c50 | 14434, 32.21 ms | 14634, 22.91 ms | +1%, -29% | 7231, 19.95 ms | -50%, -38% |
+| memory | retrieve | c50 | 42385, 18.93 ms | 29588, 7.46 ms | -30%, -61% | 32604, 6.42 ms | -23%, -66% |
+| memory | update | c50 | 16412, 7.44 ms | 14997, 8.15 ms | -9%, +10% | 14030, 8.97 ms | -15%, +21% |
+| memory | hfp | c50 | 4303, 20.07 ms | 4178, 19.87 ms | -3%, -1% | 4245, 19.56 ms | -1%, -3% |
+| postgres | query | c50 | 4369, 25.20 ms | 4116, 31.90 ms | -6%, +27% | 2470, 52.58 ms | -43%, +109% |
+| postgres | query-q | c50 | 2863, 35.96 ms | 2358, 43.40 ms | -18%, +21% | 1631, 54.02 ms | -43%, +50% |
+| postgres | query-deep | c50 | 1276, 65.85 ms | 1178, 75.42 ms | -8%, +15% | 1160, 69.14 ms | -9%, +5% |
+| postgres | query-regex | c50 | 345, 204.06 ms | 330, 340.20 ms | -4%, +67% | 1198, 66.38 ms | +247%, -67% |
+| postgres | retrieve | c50 | 7372, 25.12 ms | 6918, 16.42 ms | -6%, -35% | 7449, 14.78 ms | +1%, -41% |
+| postgres | update | c50 | 4473, 19.84 ms | 4525, 19.80 ms | +1%, -0% | 2705, 36.10 ms | -40%, +82% |
+| postgres | hfp | c50 | 2511, 28.54 ms | 2581, 25.84 ms | +3%, -9% | 2074, 37.47 ms | -17%, +31% |
+
+Measured 2026-10-21 on the shared 16-vCPU AMD EPYC Genoa sandbox, load
+average 20 to 45 from other jobs: read the req/s columns; the p99 columns
+swing by half on that host and decide nothing. What the table shows:
+
+- The build costs little: a request of the NGSI-LD API runs the same code
+  as in vanilla, and most rows move −1 % to −9 % req/s. Memory `retrieve`
+  (−30 %) and PostgreSQL `query-q` (−18 %) are the rows to measure again on
+  the pinned box before reading them as a cost.
+- The policy engine costs reads 23 % to 50 % of req/s on the memory store
+  and 43 % on PostgreSQL `query` and `query-q`: each read is decided, then
+  conjoined with the permission's rule and projected to its Attributes.
+  Writes by id cost 15 % on memory and 17 % to 40 % on PostgreSQL.
+- PostgreSQL `query-regex` runs 3.5 times faster under the policy than in
+  vanilla (1 198 against 345 req/s). This run does not trace why; the
+  vanilla `~=` path is the one T-4907 pushes down to PostgreSQL.
+
+Reproduce:
+
+```bash
+cargo build --release -p antares-broker && cp target/release/antares /tmp/antares-vanilla
+cargo build --release -p antares-broker --features full,jc-policy,linkml,parquet,tabular,ical
+ENTITIES=1000 DATABASE_URL=postgres://… BIN_VANILLA=/tmp/antares-vanilla \
+  BIN_PLATFORM=target/release/antares dev/perf/platform-overhead.sh
+```
+
 ## What a façade costs
 
 A façade for another standard answers by driving this broker's own NGSI-LD
@@ -808,10 +900,117 @@ and maintain a second, typed API surface beside the HTTP one, so that box
 stays closed until a façade measures this as its ceiling rather than as its
 rounding error.
 
+## Query plans under row-level security
+
+The broker connects as a role without BYPASSRLS, so every read runs under
+the tables' forced RLS. Postgres then takes an operator into an index
+condition only when it is leakproof, and no PostGIS operator (`&&`,
+`ST_*`), no jsonb operator (`@?`, `?|`, `@>`) and no array operator (`@>`,
+`&&`) is: the GIST on `location` and the GIN indexes on `entity` and
+`types` never serve the broker, whatever a superuser `EXPLAIN` shows.
+Btree comparisons of text, numbers and timestamps are leakproof. T-4852
+moved every shape the broker pushes down onto those:
+
+- `type=A,B` and `type=A;B` read one `types[1] = T` arm per named type
+  through `i_entities_first_type_id` plus one arm over the multi-type
+  Entities (`i_entities_multi_type_id`), as one named type has since T-4781;
+- a geoquery ANDs a geohash cover of its region (at most eight cells and
+  their prefixes) over `location_cell`, the generated cell of each
+  Entity's bounding box (migration 0015), through
+  `i_entities_location_cell`; the PostGIS predicate still filters and the
+  evaluator still decides;
+- the temporal `type=` reads `types[1] = ANY(...)` and the multi-type
+  Entities through two new `temporal_entities` indexes instead of `&&`.
+
+`q` and `attrs` have no leakproof form: they ride the type arm's index and
+filter the type's rows, so their cost grows with the type, and a `q`
+without `type` still reads the Tenant. The q-equality row below asks for
+`speed == 42`, which no Entity of the type holds: the worst case, all of
+the type's rows read.
+
+`dev/rls-plan-bench.sh <url> <N> [R] [R_BEFORE]` seeds two Tenants of N
+Entities each (the second one is there so that a walk of the table is not
+also a walk of the Tenant), runs each shape R times through `pgbench` as
+`antares_app`, and prints p50, p99 and the plan's scan nodes. The
+statements are the store's own, the "before" rows are their shape before
+T-4852. `crates/antares-sql/tests/pg_explain.rs` asserts the same plans at
+100 000 Entities on every test run. Box: the 16-core sandbox host,
+PostGIS 17.5-3.5 in a container with its defaults (`shared_buffers`
+128 MB, `work_mem` 4 MB), one client, R = 200, R_BEFORE = 20 at 1M.
+
+| shape | form | 10k p50 / p99 ms | 100k p50 / p99 ms | 1M p50 / p99 ms | scan nodes at 1M |
+|---|---|---|---|---|---|
+| id | same | 0.14 / 0.22 | 0.14 / 0.22 | 0.45 / 0.64 | Index Scan entities_pkey |
+| type | same | 0.34 / 0.62 | 0.78 / 0.96 | 5.05 / 14.16 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| type=A,B | before | 0.67 / 0.96 | 6.81 / 9.99 | 319.24 / 339.54 | Index Scan entities_pkey |
+| type=A,B | after | 0.48 / 2.00 | 1.03 / 1.38 | 6.63 / 15.25 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| q-equality | same | 1.04 / 2.35 | 14.48 / 18.29 | 375.89 / 436.12 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| q-range | same | 0.56 / 0.92 | 16.02 / 20.97 | 9.74 / 20.48 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| attrs | same | 0.45 / 1.74 | 17.30 / 23.08 | 7.05 / 12.00 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| geo-near | before | 33.23 / 67.17 | 257.32 / 397.72 | 2823.12 / 2886.87 | Index Scan entities_pkey |
+| geo-near | after | 0.28 / 0.41 | 0.34 / 0.80 | 0.72 / 1.12 | Bitmap Index Scan i_entities_loc_ambiguous, Bitmap Index Scan i_entities_location_cell |
+| geo-within | before | 20.94 / 35.01 | 224.29 / 282.46 | 2005.86 / 2094.93 | Index Scan entities_pkey |
+| geo-within | after | 0.23 / 0.30 | 0.34 / 1.08 | 0.57 / 1.54 | Bitmap Index Scan i_entities_loc_ambiguous, Bitmap Index Scan i_entities_location_cell |
+| temporal-type | before | 17.58 / 78.73 | 21.83 / 25.59 | 22.33 / 38.19 | Index Only Scan attr_instances lookup btree, Index Scan temporal_entities_pkey |
+| temporal-type | after | 14.20 / 68.98 | 21.55 / 30.18 | 22.12 / 32.94 | Index Only Scan attr_instances lookup btree, Index Scan temporal_entities_pkey |
+| temporal-lastN | same | 0.11 / 0.19 | 0.30 / 0.46 | 0.34 / 0.53 | Index Scan attr_instances lookup btree |
+| temporal-between | same | 0.15 / 0.23 | 0.42 / 0.64 | 0.45 / 0.70 | Index Scan Backward attr_instances lookup btree |
+
+The paged temporal query is driven from the Entities that hold
+instances (an index-only scan of `attr_instances`, then one primary-key
+probe per Entity), so its time follows the instances, before and after.
+The new indexes replace the Tenant read where the planner starts from
+`temporal_entities` instead, which `pg_explain.rs` pins.
+
+## Deep pages, the next cursor and regex filters
+
+T-4907 measured a BBSK `Invoice` page at offset 5000 on dev at 3.8 s p50
+against 0.5 s at offset 0, and `name~="zzz"` at 1.31 s against
+0.39 s for `name=="zzz"`. Three changes in the store and the API:
+
+- **Ids first.** A page past offset 0 skips its OFFSET over ids alone,
+  which `i_entities_first_type_id` and `i_entities_multi_type_id` hand back
+  as an index-only scan (their INCLUDE columns, 0013), then reads only the
+  page's documents through `entities_pkey`. Before, OFFSET walked the
+  jsonb documents it then threw away.
+- **The next cursor.** An Entity query whose page is kept in id order and
+  is not counted (no `count=true`, no `orderBy`, no federation, no
+  `idPattern`) carries `cursor=` on its `rel="next"` Link beside `offset`.
+  The next page then seeks `id >` the last id shown through the same
+  indexes, so page 500 costs what page 1 costs. The cursor is opaque: the
+  hex of the last id plus a SHA-256 tag over the view, the Tenant and every
+  other parameter of the request, so a cursor sent with another view,
+  Tenant, `q`, `limit` or `offset` is a 400 BadRequestData. It is no secret:
+  a forged one only starts the same query at another id. A `prev` Link and
+  a counted page keep plain `offset`, which the ETSI suite compares.
+- **`~=` in Postgres.** A pattern that Postgres `like_regex` and the
+  `regex` crate read the same way compiles into the jsonpath and is
+  decided in SQL. That covers literals, `.`, `^`, `$`, `|`, groups,
+  `*` `+` `?` and positive bracket lists, up to 128 characters. Anything
+  else stays with the evaluator under its program caps: escapes
+  (back-references are what makes Postgres backtrack), `{m,n}`, `[^…]`,
+  POSIX classes, inline flags. `!~=` stays there too, because it needs
+  every array element to miss. `pg_query_parity.rs` checks both arms
+  against the evaluator on stored line breaks. There is no trigram index:
+  `~` and pg_trgm's `%` are not leakproof (`pg_proc.proleakproof = f`), so
+  under forced RLS a trigram index never serves the broker's role. The
+  regex filters the type's rows inside Postgres instead of shipping them
+  to the broker.
+
+Local numbers, same box and seed as the table above (100 000 Entities per
+Tenant, type T1 = 10 000), as `antares_app`, SQL execution time:
+
+| shape | before | after |
+|---|---|---|
+| type page at offset 5000, limit 100 | 12-52 ms (OFFSET over documents) | 2.3 ms (Index Only Scan, 0 heap fetches) |
+| type + `brand~="^zzz"` | 22 ms in SQL, then 10 000 documents decoded and evaluated in the broker | 10.6 ms, nothing shipped |
+
+`pg_explain.rs` `deep_and_keyset_pages_read_ids_from_the_type_index` pins
+both plans under RLS.
+
 ## What the numbers are not
 
 They are one machine, one request shape, one week. A different instance
 type invalidates the whole history, which is why both workflows pin one.
-No regression gate exists until the noise profile has ten runs on that
-instance type; until then the runs report, and the report is the
-evidence.
+The gate ([The perf gate](#the-perf-gate)) compares a run with the
+baseline of its own CPU model or instance type, never across them.

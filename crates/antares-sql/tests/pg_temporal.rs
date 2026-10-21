@@ -1130,6 +1130,82 @@ async fn a_comma_seconds_fraction_survives_the_geo_prefilter() {
     }
 }
 
+/// T-4906: the probes read only the weeks that can hold the instance, and
+/// record what they recorded before. A value written this week is compared
+/// with this week's newest, never with an older equal one behind it; one
+/// append whose observedAts lie five weeks apart corrects both in place.
+#[tokio::test(flavor = "multi_thread")]
+async fn bounded_probes_record_what_the_unbounded_ones_did() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let s = PgTemporalStore::new(pool.clone());
+    let t = TenantId::new("pgtempbounded").expect("tenant");
+    let id = "urn:ngsi-ld:Vehicle:bounded";
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let _ = s.delete(&t, id).await;
+    ensure_entity(&pool, &t, id).await;
+    let speed = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+    let name = "https://uri.etsi.org/ngsi-ld/default-context/name";
+    // minutes ago; 50400 is five weeks
+    let at = |minutes: i64| {
+        (chrono::Utc::now() - chrono::Duration::minutes(minutes))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let shell =
+        json!({"id": id, "type": "Vehicle", "createdAt": at(60000), "modifiedAt": at(60000)});
+    let mut n = 0;
+    let mut write = |attrs: serde_json::Value, modified: String| {
+        n += 1;
+        let mut attrs = attrs;
+        for a in attrs.as_object_mut().expect("attrs").values_mut() {
+            for (j, i) in a.as_array_mut().expect("instances").iter_mut().enumerate() {
+                i["instanceId"] = json!(format!("urn:ngsi-ld:Instance:b-{n}-{j}"));
+                i["modifiedAt"] = json!(modified);
+                i["createdAt"] = json!(modified);
+            }
+        }
+        attrs
+    };
+    let values = |attr: &str| {
+        let (pool, attr) = (pool.clone(), attr.to_owned());
+        async move {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT data->'value' FROM attr_instances
+                 WHERE tenant_id = 'pgtempbounded' AND entity_id = $1 AND attr_id = $2
+                 ORDER BY observed_at",
+            )
+            .bind(id)
+            .bind(attr)
+            .fetch_all(&pool)
+            .await
+            .expect("rows")
+        }
+    };
+    // Without observedAt: "a" five weeks ago, then "b", "b", "a" now.
+    for (v, ago) in [("a", 50400), ("b", 3), ("b", 2), ("a", 1)] {
+        let adds = write(json!({name: [{"type": "Property", "value": v}]}), at(ago));
+        s.append(&t, id, &shell, &adds).await.expect("append");
+    }
+    assert_eq!(values(name).await, [json!("a"), json!("b"), json!("a")]);
+    // With observedAt: two weeks in one append, then both corrected at once.
+    let (old, new) = (at(50400), at(0));
+    let pair = |v: i64| {
+        json!({speed: [
+        {"type": "Property", "value": v, "observedAt": old},
+        {"type": "Property", "value": v, "observedAt": new}]})
+    };
+    for v in [1, 1, 2] {
+        let adds = write(pair(v), at(0));
+        s.append(&t, id, &shell, &adds).await.expect("append");
+    }
+    assert_eq!(
+        values(speed).await,
+        [json!(2), json!(2)],
+        "corrected in place"
+    );
+    let _ = s.delete(&t, id).await;
+}
+
 /// T-4507: an auto-recorded append writes a row only for a new observation.
 /// With observedAt: one row per (attribute, datasetId, observedAt), a new
 /// value at the same observedAt corrects that row in place. Without: a row

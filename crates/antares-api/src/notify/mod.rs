@@ -46,10 +46,10 @@ pub use throttle::*;
 const DEFAULT_TRIGGERS: &[&str] = &["attributeCreated", "attributeUpdated"];
 /// Depth of the change→matcher queue, the same ring size the local bus uses.
 /// Held with the other published ceilings so `/q/health` reports it.
-use crate::bounds::{CHANGE_QUEUE, DELIVERY_LANE, DELIVERY_WIDTH};
-// the per-tenant slots of the native delivery pool (`tenant_slots`)
+use crate::bounds::{CHANGE_QUEUE, DELIVERY_WIDTH};
+// the per-tenant slots of the native delivery pool (`tenant_slots`) and its lanes
 #[cfg(not(target_arch = "wasm32"))]
-use crate::bounds::DELIVERY_WIDTH_PER_TENANT;
+use crate::bounds::{DELIVERY_LANE, DELIVERY_WIDTH_PER_TENANT};
 static CHANGES_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TASK_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Hand a batch to the matcher queue: counted as pending on acceptance,

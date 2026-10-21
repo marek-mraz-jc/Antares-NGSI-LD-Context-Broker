@@ -471,7 +471,7 @@ antares-broker v0.3.0
 │   │   │       │       │   │   │   │   └── rustls-pki-types feature "alloc" (*)
 │   │   │       │       │   │   │   ├── zeroize feature "default" (*)
 │   │   │       │       │   │   │   └── rustls-webpki feature "alloc"
-│   │   │       │       │   │   │       ├── rustls-webpki v0.103.15
+│   │   │       │       │   │   │       ├── rustls-webpki v0.103.16
 │   │   │       │       │   │   │       │   ├── ring v0.17.14 (*)
 │   │   │       │       │   │   │       │   ├── rustls-pki-types v1.15.1 (*)
 │   │   │       │       │   │   │       │   └── untrusted feature "default" (*)
@@ -486,7 +486,7 @@ antares-broker v0.3.0
 │   │   │       │       │   │   │       │   ├── rustls-pki-types v1.15.1 (*)
 │   │   │       │       │   │   │       │   └── rustls-pki-types feature "alloc" (*)
 │   │   │       │       │   │   │       └── rustls-webpki feature "std"
-│   │   │       │       │   │   │           ├── rustls-webpki v0.103.15 (*)
+│   │   │       │       │   │   │           ├── rustls-webpki v0.103.16 (*)
 │   │   │       │       │   │   │           ├── rustls-pki-types feature "std" (*)
 │   │   │       │       │   │   │           └── rustls-webpki feature "alloc" (*)
 │   │   │       │       │   │   ├── http feature "default" (*)
@@ -560,7 +560,7 @@ antares-broker v0.3.0
 │   │   │       │       ├── tokio-rustls feature "tls12" (*)
 │   │   │       │       ├── rustls-platform-verifier feature "default"
 │   │   │       │       │   └── rustls-platform-verifier v0.7.0
-│   │   │       │       │       ├── rustls-webpki v0.103.15 (*)
+│   │   │       │       │       ├── rustls-webpki v0.103.16 (*)
 │   │   │       │       │       ├── log feature "default" (*)
 │   │   │       │       │       ├── rustls feature "std" (*)
 │   │   │       │       │       └── rustls-native-certs feature "default"
@@ -819,7 +819,7 @@ antares-broker v0.3.0
 │   │   │       ├── rustls feature "ring"
 │   │   │       │   ├── rustls v0.23.46 (*)
 │   │   │       │   └── rustls-webpki feature "ring"
-│   │   │       │       └── rustls-webpki v0.103.15 (*)
+│   │   │       │       └── rustls-webpki v0.103.16 (*)
 │   │   │       ├── rustls feature "std" (*)
 │   │   │       └── rustls feature "tls12" (*)
 │   │   ├── ngsild-jsonld feature "fetch"
@@ -872,7 +872,7 @@ antares-broker v0.3.0
 │   │           ├── tokio-util feature "default" (*)
 │   │           ├── log feature "default" (*)
 │   │           ├── rustls-webpki feature "default"
-│   │           │   ├── rustls-webpki v0.103.15 (*)
+│   │           │   ├── rustls-webpki v0.103.16 (*)
 │   │           │   └── rustls-webpki feature "std" (*)
 │   │           ├── rustls-native-certs feature "default" (*)
 │   │           ├── fixedbitset feature "default"
@@ -1366,7 +1366,7 @@ antares-broker v0.3.0
 │   │   │   │   │       │   └── hashlink v0.11.1
 │   │   │   │   │       │       └── hashbrown feature "default-hasher" (*)
 │   │   │   │   │       └── webpki-roots feature "default"
-│   │   │   │   │           └── webpki-roots v1.0.9
+│   │   │   │   │           └── webpki-roots v1.0.10
 │   │   │   │   │               └── rustls-pki-types v1.15.1 (*)
 │   │   │   │   ├── sqlx-core feature "migrate"
 │   │   │   │   │   ├── sqlx-core v0.9.0 (*)
@@ -1625,7 +1625,7 @@ antares-broker v0.3.0
 │   │   │   │   │       │       │   │   │   └── rustls-pki-types feature "alloc" (*)
 │   │   │   │   │       │       │   │   ├── zeroize feature "default" (*)
 │   │   │   │   │       │       │   │   └── rustls-webpki feature "alloc"
-│   │   │   │   │       │       │   │       ├── rustls-webpki v0.103.15
+│   │   │   │   │       │       │   │       ├── rustls-webpki v0.103.16
 │   │   │   │   │       │       │   │       │   ├── ring v0.17.14 (*)
 │   │   │   │   │       │       │   │       │   ├── rustls-pki-types v1.15.1 (*)
 │   │   │   │   │       │       │   │       │   └── untrusted feature "default" (*)
@@ -1638,7 +1638,7 @@ antares-broker v0.3.0
 │   │   │   │   │       │       │   │   ├── rustls-pki-types v1.15.1 (*)
 │   │   │   │   │       │       │   │   └── rustls-pki-types feature "alloc" (*)
 │   │   │   │   │       │       │   └── rustls-webpki feature "std"
-│   │   │   │   │       │       │       ├── rustls-webpki v0.103.15 (*)
+│   │   │   │   │       │       │       ├── rustls-webpki v0.103.16 (*)
 │   │   │   │   │       │       │       ├── rustls-pki-types feature "std" (*)
 │   │   │   │   │       │       │       └── rustls-webpki feature "alloc" (*)
 │   │   │   │   │       │       ├── rustls feature "tls12"
@@ -1836,7 +1836,7 @@ antares-broker v0.3.0
 │   │   │   │   │       │       │   └── uuid feature "std"
 │   │   │   │   │       │       │       └── uuid v1.26.1
 │   │   │   │   │       │       └── webpki-roots feature "default"
-│   │   │   │   │       │           └── webpki-roots v1.0.9
+│   │   │   │   │       │           └── webpki-roots v1.0.10
 │   │   │   │   │       │               └── rustls-pki-types v1.15.1 (*)
 │   │   │   │   │       ├── sqlx-core feature "default"
 │   │   │   │   │       │   └── sqlx-core v0.9.0 (*)
@@ -2291,7 +2291,7 @@ antares-broker v0.3.0
 │   │   │                       └── rustls feature "ring"
 │   │   │                           ├── rustls v0.23.46 (*)
 │   │   │                           └── rustls-webpki feature "ring"
-│   │   │                               └── rustls-webpki v0.103.15 (*)
+│   │   │                               └── rustls-webpki v0.103.16 (*)
 │   │   └── sqlx feature "uuid"
 │   │       ├── sqlx v0.9.0 (*)
 │   │       ├── sqlx-core feature "uuid"
@@ -2667,312 +2667,280 @@ antares-broker v0.3.0
 │       ├── tokio feature "sync" (*)
 │       ├── tokio feature "time" (*)
 │       ├── tracing feature "default" (*)
-│       └── async-nats feature "default"
-│           ├── async-nats v0.50.0
-│           │   ├── rustls-webpki v0.103.15 (*)
-│           │   ├── tokio-rustls v0.26.4 (*)
-│           │   ├── serde feature "default" (*)
-│           │   ├── serde feature "derive" (*)
-│           │   ├── portable-atomic feature "default" (*)
-│           │   ├── serde_json feature "default" (*)
-│           │   ├── memchr feature "default" (*)
-│           │   ├── thiserror feature "default" (*)
-│           │   ├── bytes feature "default" (*)
-│           │   ├── bytes feature "serde"
-│           │   │   └── bytes v1.12.1 (*)
-│           │   ├── futures-util feature "sink" (*)
-│           │   ├── futures-util feature "std" (*)
-│           │   ├── tokio feature "default" (*)
-│           │   ├── tokio feature "fs" (*)
-│           │   ├── tokio feature "io-util" (*)
-│           │   ├── tokio feature "macros" (*)
-│           │   ├── tokio feature "net" (*)
-│           │   ├── tokio feature "rt" (*)
-│           │   ├── tokio feature "sync" (*)
-│           │   ├── tokio feature "time" (*)
-│           │   ├── tokio-util feature "default" (*)
-│           │   ├── tracing feature "default" (*)
-│           │   ├── ring feature "default" (*)
-│           │   ├── rustls-pki-types feature "default" (*)
-│           │   ├── rustls-native-certs feature "default" (*)
-│           │   ├── url feature "default" (*)
-│           │   ├── tokio-stream feature "default" (*)
-│           │   ├── rand feature "default"
-│           │   │   ├── rand v0.10.2 (*)
-│           │   │   ├── rand feature "std" (*)
-│           │   │   ├── rand feature "std_rng" (*)
-│           │   │   ├── rand feature "sys_rng" (*)
-│           │   │   └── rand feature "thread_rng" (*)
-│           │   ├── regex feature "default" (*)
-│           │   ├── base64 feature "default"
-│           │   │   ├── base64 v0.22.1
-│           │   │   └── base64 feature "std" (*)
-│           │   ├── nkeys feature "default"
-│           │   │   └── nkeys v0.4.5
-│           │   │       ├── ed25519 v2.2.3
-│           │   │       │   └── signature v2.2.0
-│           │   │       │       └── digest v0.10.7 (*)
-│           │   │       ├── log feature "default" (*)
-│           │   │       ├── data-encoding feature "default"
-│           │   │       │   ├── data-encoding v2.11.1
-│           │   │       │   └── data-encoding feature "std"
-│           │   │       │       ├── data-encoding v2.11.1
-│           │   │       │       └── data-encoding feature "alloc"
-│           │   │       │           └── data-encoding v2.11.1
-│           │   │       ├── ed25519-dalek feature "digest"
-│           │   │       │   ├── ed25519-dalek v2.2.0
-│           │   │       │   │   ├── ed25519 v2.2.3 (*)
-│           │   │       │   │   ├── sha2 v0.10.9 (*)
-│           │   │       │   │   ├── signature v2.2.0 (*)
-│           │   │       │   │   ├── subtle v2.6.1
-│           │   │       │   │   └── curve25519-dalek feature "digest"
-│           │   │       │   │       └── curve25519-dalek v4.1.3
-│           │   │       │   │           ├── digest v0.10.7 (*)
-│           │   │       │   │           ├── subtle v2.6.1
-│           │   │       │   │           ├── cfg-if feature "default" (*)
-│           │   │       │   │           ├── cpufeatures feature "default" (*)
-│           │   │       │   │           └── curve25519-dalek-derive feature "default"
-│           │   │       │   │               └── curve25519-dalek-derive v0.1.1 (proc-macro)
-│           │   │       │   │                   ├── proc-macro2 feature "default" (*)
-│           │   │       │   │                   ├── quote feature "default" (*)
-│           │   │       │   │                   ├── syn feature "default" (*)
-│           │   │       │   │                   └── syn feature "full" (*)
-│           │   │       │   │           [build-dependencies]
-│           │   │       │   │           └── rustc_version feature "default"
-│           │   │       │   │               └── rustc_version v0.4.1
-│           │   │       │   │                   └── semver feature "default"
-│           │   │       │   │                       ├── semver v1.0.28
-│           │   │       │   │                       └── semver feature "std"
-│           │   │       │   │                           └── semver v1.0.28
-│           │   │       │   ├── signature feature "digest"
-│           │   │       │   │   └── signature v2.2.0 (*)
-│           │   │       │   └── ed25519-dalek feature "signature"
-│           │   │       │       └── ed25519-dalek v2.2.0 (*)
-│           │   │       ├── rand feature "default"
-│           │   │       │   ├── rand v0.8.7
-│           │   │       │   │   ├── libc v0.2.189
-│           │   │       │   │   ├── rand_chacha v0.3.1
-│           │   │       │   │   │   ├── ppv-lite86 feature "simd" (*)
-│           │   │       │   │   │   └── rand_core feature "default"
-│           │   │       │   │   │       └── rand_core v0.6.4
-│           │   │       │   │   │           └── getrandom feature "default" (*)
-│           │   │       │   │   └── rand_core feature "default" (*)
-│           │   │       │   ├── rand feature "std"
-│           │   │       │   │   ├── rand v0.8.7 (*)
-│           │   │       │   │   ├── rand feature "alloc"
-│           │   │       │   │   │   ├── rand v0.8.7 (*)
-│           │   │       │   │   │   └── rand_core feature "alloc"
-│           │   │       │   │   │       └── rand_core v0.6.4 (*)
-│           │   │       │   │   ├── rand feature "getrandom"
-│           │   │       │   │   │   ├── rand v0.8.7 (*)
-│           │   │       │   │   │   └── rand_core feature "getrandom"
-│           │   │       │   │   │       └── rand_core v0.6.4 (*)
-│           │   │       │   │   ├── rand feature "libc"
-│           │   │       │   │   │   └── rand v0.8.7 (*)
-│           │   │       │   │   ├── rand feature "rand_chacha"
-│           │   │       │   │   │   └── rand v0.8.7 (*)
-│           │   │       │   │   ├── rand_chacha feature "std"
-│           │   │       │   │   │   ├── rand_chacha v0.3.1 (*)
-│           │   │       │   │   │   └── ppv-lite86 feature "std" (*)
-│           │   │       │   │   └── rand_core feature "std"
-│           │   │       │   │       ├── rand_core v0.6.4 (*)
-│           │   │       │   │       ├── getrandom feature "std"
-│           │   │       │   │       │   └── getrandom v0.2.17 (*)
-│           │   │       │   │       ├── rand_core feature "alloc" (*)
-│           │   │       │   │       └── rand_core feature "getrandom" (*)
-│           │   │       │   └── rand feature "std_rng"
-│           │   │       │       ├── rand v0.8.7 (*)
-│           │   │       │       └── rand feature "rand_chacha" (*)
-│           │   │       └── signatory feature "default"
-│           │   │           ├── signatory v0.27.1
-│           │   │           │   ├── zeroize feature "default" (*)
-│           │   │           │   ├── signature feature "default"
-│           │   │           │   │   └── signature v2.2.0 (*)
-│           │   │           │   ├── rand_core feature "default" (*)
-│           │   │           │   ├── pkcs8 feature "alloc"
-│           │   │           │   │   ├── pkcs8 v0.10.2
-│           │   │           │   │   │   ├── der feature "default"
-│           │   │           │   │   │   │   └── der v0.7.10
-│           │   │           │   │   │   │       ├── zeroize v1.9.0
-│           │   │           │   │   │   │       ├── const-oid feature "default"
-│           │   │           │   │   │   │       │   └── const-oid v0.9.6
-│           │   │           │   │   │   │       ├── pem-rfc7468 feature "alloc"
-│           │   │           │   │   │   │       │   ├── pem-rfc7468 v0.7.0
-│           │   │           │   │   │   │       │   │   └── base64ct feature "default"
-│           │   │           │   │   │   │       │   │       └── base64ct v1.8.3
-│           │   │           │   │   │   │       │   └── base64ct feature "alloc"
-│           │   │           │   │   │   │       │       └── base64ct v1.8.3
-│           │   │           │   │   │   │       └── pem-rfc7468 feature "default"
-│           │   │           │   │   │   │           └── pem-rfc7468 v0.7.0 (*)
-│           │   │           │   │   │   ├── der feature "oid"
-│           │   │           │   │   │   │   └── der v0.7.10 (*)
-│           │   │           │   │   │   └── spki feature "default"
-│           │   │           │   │   │       └── spki v0.7.3
-│           │   │           │   │   │           ├── der feature "default" (*)
-│           │   │           │   │   │           └── der feature "oid" (*)
-│           │   │           │   │   ├── der feature "alloc"
-│           │   │           │   │   │   ├── der v0.7.10 (*)
-│           │   │           │   │   │   └── zeroize feature "alloc" (*)
-│           │   │           │   │   ├── der feature "zeroize"
-│           │   │           │   │   │   └── der v0.7.10 (*)
-│           │   │           │   │   └── spki feature "alloc"
-│           │   │           │   │       ├── spki v0.7.3 (*)
-│           │   │           │   │       └── der feature "alloc" (*)
-│           │   │           │   ├── pkcs8 feature "default"
-│           │   │           │   │   └── pkcs8 v0.10.2 (*)
-│           │   │           │   └── pkcs8 feature "pem"
-│           │   │           │       ├── pkcs8 v0.10.2 (*)
-│           │   │           │       ├── pkcs8 feature "alloc" (*)
-│           │   │           │       ├── der feature "pem"
-│           │   │           │       │   ├── der v0.7.10 (*)
-│           │   │           │       │   ├── der feature "alloc" (*)
-│           │   │           │       │   └── der feature "zeroize" (*)
-│           │   │           │       └── spki feature "pem"
-│           │   │           │           ├── spki v0.7.3 (*)
-│           │   │           │           ├── der feature "pem" (*)
-│           │   │           │           └── spki feature "alloc" (*)
-│           │   │           └── signatory feature "std"
-│           │   │               ├── signatory v0.27.1 (*)
-│           │   │               ├── signature feature "std"
-│           │   │               │   ├── signature v2.2.0 (*)
-│           │   │               │   └── signature feature "alloc"
-│           │   │               │       └── signature v2.2.0 (*)
-│           │   │               ├── rand_core feature "std" (*)
-│           │   │               └── pkcs8 feature "std"
-│           │   │                   ├── pkcs8 v0.10.2 (*)
-│           │   │                   ├── pkcs8 feature "alloc" (*)
-│           │   │                   ├── der feature "std"
-│           │   │                   │   ├── der v0.7.10 (*)
-│           │   │                   │   └── der feature "alloc" (*)
-│           │   │                   └── spki feature "std"
-│           │   │                       ├── spki v0.7.3 (*)
-│           │   │                       ├── der feature "std" (*)
-│           │   │                       └── spki feature "alloc" (*)
-│           │   ├── nuid feature "default"
-│           │   │   └── nuid v0.5.0
-│           │   │       └── rand feature "default" (*)
-│           │   ├── pin-project feature "default"
-│           │   │   └── pin-project v1.1.13
-│           │   │       └── pin-project-internal feature "default"
-│           │   │           └── pin-project-internal v1.1.13 (proc-macro)
-│           │   │               ├── proc-macro2 feature "default" (*)
-│           │   │               ├── quote feature "default" (*)
-│           │   │               ├── syn feature "clone-impls" (*)
-│           │   │               ├── syn feature "full" (*)
-│           │   │               ├── syn feature "parsing" (*)
-│           │   │               ├── syn feature "printing" (*)
-│           │   │               ├── syn feature "proc-macro" (*)
-│           │   │               └── syn feature "visit-mut" (*)
-│           │   ├── serde_nanos feature "default"
-│           │   │   └── serde_nanos v0.1.4
-│           │   │       └── serde feature "default" (*)
-│           │   ├── serde_repr feature "default"
-│           │   │   └── serde_repr v0.1.21 (proc-macro)
-│           │   │       ├── proc-macro2 feature "default" (*)
-│           │   │       ├── quote feature "default" (*)
-│           │   │       └── syn feature "default" (*)
-│           │   ├── time feature "default"
-│           │   │   ├── time v0.3.55
-│           │   │   │   ├── powerfmt v0.2.0
-│           │   │   │   ├── serde_core v1.0.229
-│           │   │   │   ├── deranged feature "default"
-│           │   │   │   │   └── deranged v0.5.8
-│           │   │   │   │       └── serde_core v1.0.229
-│           │   │   │   ├── num-conv feature "default"
-│           │   │   │   │   └── num-conv v0.2.2
-│           │   │   │   └── time-core feature "default"
-│           │   │   │       └── time-core v0.1.9
-│           │   │   └── time feature "std"
-│           │   │       ├── time v0.3.55 (*)
-│           │   │       └── time feature "alloc"
-│           │   │           ├── time v0.3.55 (*)
-│           │   │           └── serde_core feature "alloc" (*)
-│           │   ├── time feature "formatting"
-│           │   │   ├── time v0.3.55 (*)
-│           │   │   └── time feature "std" (*)
-│           │   ├── time feature "parsing"
-│           │   │   └── time v0.3.55 (*)
-│           │   ├── time feature "serde"
-│           │   │   ├── time v0.3.55 (*)
-│           │   │   └── deranged feature "serde"
-│           │   │       └── deranged v0.5.8 (*)
-│           │   ├── time feature "serde-well-known"
-│           │   │   ├── time v0.3.55 (*)
-│           │   │   ├── time feature "formatting" (*)
-│           │   │   ├── time feature "parsing" (*)
-│           │   │   └── time feature "serde" (*)
-│           │   ├── tokio-websockets feature "client"
-│           │   │   ├── tokio-websockets v0.10.1
-│           │   │   │   ├── ring v0.17.14 (*)
-│           │   │   │   ├── tokio-rustls v0.26.4 (*)
-│           │   │   │   ├── webpki-roots v0.26.11
-│           │   │   │   │   └── webpki-roots feature "default" (*)
-│           │   │   │   ├── bytes feature "default" (*)
-│           │   │   │   ├── futures-core feature "default" (*)
-│           │   │   │   ├── futures-sink feature "default" (*)
-│           │   │   │   ├── http feature "std" (*)
-│           │   │   │   ├── tokio feature "default" (*)
-│           │   │   │   ├── tokio-util feature "codec" (*)
-│           │   │   │   ├── tokio-util feature "default" (*)
-│           │   │   │   ├── tokio-util feature "io" (*)
-│           │   │   │   ├── httparse feature "default" (*)
-│           │   │   │   ├── rustls-pki-types feature "default" (*)
-│           │   │   │   ├── base64 feature "default" (*)
-│           │   │   │   ├── rand feature "std" (*)
-│           │   │   │   └── rand feature "std_rng" (*)
-│           │   │   ├── tokio feature "io-util" (*)
-│           │   │   └── tokio feature "net" (*)
-│           │   ├── tokio-websockets feature "rand"
-│           │   │   └── tokio-websockets v0.10.1 (*)
-│           │   ├── tokio-websockets feature "rustls-webpki-roots"
-│           │   │   └── tokio-websockets v0.10.1 (*)
-│           │   └── tryhard feature "default"
-│           │       └── tryhard v0.5.2
-│           │           ├── pin-project-lite feature "default" (*)
-│           │           ├── tokio feature "macros" (*)
-│           │           ├── tokio feature "rt" (*)
-│           │           ├── tokio feature "sync" (*)
-│           │           ├── tokio feature "test-util"
-│           │           │   ├── tokio v1.53.1 (*)
-│           │           │   ├── tokio feature "rt" (*)
-│           │           │   ├── tokio feature "sync" (*)
-│           │           │   └── tokio feature "time" (*)
-│           │           └── tokio feature "time" (*)
-│           ├── async-nats feature "crypto"
-│           │   └── async-nats v0.50.0 (*)
-│           ├── async-nats feature "jetstream"
-│           │   └── async-nats v0.50.0 (*)
-│           ├── async-nats feature "kv"
-│           │   ├── async-nats v0.50.0 (*)
-│           │   └── async-nats feature "jetstream" (*)
-│           ├── async-nats feature "nkeys"
-│           │   └── async-nats v0.50.0 (*)
-│           ├── async-nats feature "nuid"
-│           │   └── async-nats v0.50.0 (*)
-│           ├── async-nats feature "object-store"
-│           │   ├── async-nats v0.50.0 (*)
-│           │   ├── async-nats feature "crypto" (*)
-│           │   └── async-nats feature "jetstream" (*)
-│           ├── async-nats feature "ring"
-│           │   ├── async-nats v0.50.0 (*)
-│           │   ├── tokio-rustls feature "ring"
-│           │   │   ├── tokio-rustls v0.26.4 (*)
-│           │   │   └── rustls feature "ring" (*)
-│           │   └── tokio-websockets feature "ring"
-│           │       ├── tokio-websockets v0.10.1 (*)
-│           │       └── tokio-rustls feature "ring" (*)
-│           ├── async-nats feature "server_2_10"
-│           │   └── async-nats v0.50.0 (*)
-│           ├── async-nats feature "server_2_11"
-│           │   └── async-nats v0.50.0 (*)
-│           ├── async-nats feature "server_2_12"
-│           │   └── async-nats v0.50.0 (*)
-│           ├── async-nats feature "server_2_14"
-│           │   └── async-nats v0.50.0 (*)
-│           ├── async-nats feature "service"
-│           │   └── async-nats v0.50.0 (*)
-│           └── async-nats feature "websockets"
-│               └── async-nats v0.50.0 (*)
+│       ├── async-nats feature "crypto"
+│       │   └── async-nats v0.50.0
+│       │       ├── rustls-webpki v0.103.16 (*)
+│       │       ├── tokio-rustls v0.26.4 (*)
+│       │       ├── serde feature "default" (*)
+│       │       ├── serde feature "derive" (*)
+│       │       ├── portable-atomic feature "default" (*)
+│       │       ├── serde_json feature "default" (*)
+│       │       ├── memchr feature "default" (*)
+│       │       ├── thiserror feature "default" (*)
+│       │       ├── bytes feature "default" (*)
+│       │       ├── bytes feature "serde"
+│       │       │   └── bytes v1.12.1 (*)
+│       │       ├── futures-util feature "sink" (*)
+│       │       ├── futures-util feature "std" (*)
+│       │       ├── tokio feature "default" (*)
+│       │       ├── tokio feature "fs" (*)
+│       │       ├── tokio feature "io-util" (*)
+│       │       ├── tokio feature "macros" (*)
+│       │       ├── tokio feature "net" (*)
+│       │       ├── tokio feature "rt" (*)
+│       │       ├── tokio feature "sync" (*)
+│       │       ├── tokio feature "time" (*)
+│       │       ├── tokio-util feature "default" (*)
+│       │       ├── tracing feature "default" (*)
+│       │       ├── ring feature "default" (*)
+│       │       ├── rustls-pki-types feature "default" (*)
+│       │       ├── rustls-native-certs feature "default" (*)
+│       │       ├── url feature "default" (*)
+│       │       ├── tokio-stream feature "default" (*)
+│       │       ├── rand feature "default"
+│       │       │   ├── rand v0.10.2 (*)
+│       │       │   ├── rand feature "std" (*)
+│       │       │   ├── rand feature "std_rng" (*)
+│       │       │   ├── rand feature "sys_rng" (*)
+│       │       │   └── rand feature "thread_rng" (*)
+│       │       ├── regex feature "default" (*)
+│       │       ├── base64 feature "default"
+│       │       │   ├── base64 v0.22.1
+│       │       │   └── base64 feature "std" (*)
+│       │       ├── nkeys feature "default"
+│       │       │   └── nkeys v0.4.5
+│       │       │       ├── ed25519 v2.2.3
+│       │       │       │   └── signature v2.2.0
+│       │       │       │       └── digest v0.10.7 (*)
+│       │       │       ├── log feature "default" (*)
+│       │       │       ├── data-encoding feature "default"
+│       │       │       │   ├── data-encoding v2.11.1
+│       │       │       │   └── data-encoding feature "std"
+│       │       │       │       ├── data-encoding v2.11.1
+│       │       │       │       └── data-encoding feature "alloc"
+│       │       │       │           └── data-encoding v2.11.1
+│       │       │       ├── ed25519-dalek feature "digest"
+│       │       │       │   ├── ed25519-dalek v2.2.0
+│       │       │       │   │   ├── ed25519 v2.2.3 (*)
+│       │       │       │   │   ├── sha2 v0.10.9 (*)
+│       │       │       │   │   ├── signature v2.2.0 (*)
+│       │       │       │   │   ├── subtle v2.6.1
+│       │       │       │   │   └── curve25519-dalek feature "digest"
+│       │       │       │   │       └── curve25519-dalek v4.1.3
+│       │       │       │   │           ├── digest v0.10.7 (*)
+│       │       │       │   │           ├── subtle v2.6.1
+│       │       │       │   │           ├── cfg-if feature "default" (*)
+│       │       │       │   │           ├── cpufeatures feature "default" (*)
+│       │       │       │   │           └── curve25519-dalek-derive feature "default"
+│       │       │       │   │               └── curve25519-dalek-derive v0.1.1 (proc-macro)
+│       │       │       │   │                   ├── proc-macro2 feature "default" (*)
+│       │       │       │   │                   ├── quote feature "default" (*)
+│       │       │       │   │                   ├── syn feature "default" (*)
+│       │       │       │   │                   └── syn feature "full" (*)
+│       │       │       │   │           [build-dependencies]
+│       │       │       │   │           └── rustc_version feature "default"
+│       │       │       │   │               └── rustc_version v0.4.1
+│       │       │       │   │                   └── semver feature "default"
+│       │       │       │   │                       ├── semver v1.0.28
+│       │       │       │   │                       └── semver feature "std"
+│       │       │       │   │                           └── semver v1.0.28
+│       │       │       │   ├── signature feature "digest"
+│       │       │       │   │   └── signature v2.2.0 (*)
+│       │       │       │   └── ed25519-dalek feature "signature"
+│       │       │       │       └── ed25519-dalek v2.2.0 (*)
+│       │       │       ├── rand feature "default"
+│       │       │       │   ├── rand v0.8.7
+│       │       │       │   │   ├── libc v0.2.189
+│       │       │       │   │   ├── rand_chacha v0.3.1
+│       │       │       │   │   │   ├── ppv-lite86 feature "simd" (*)
+│       │       │       │   │   │   └── rand_core feature "default"
+│       │       │       │   │   │       └── rand_core v0.6.4
+│       │       │       │   │   │           └── getrandom feature "default" (*)
+│       │       │       │   │   └── rand_core feature "default" (*)
+│       │       │       │   ├── rand feature "std"
+│       │       │       │   │   ├── rand v0.8.7 (*)
+│       │       │       │   │   ├── rand feature "alloc"
+│       │       │       │   │   │   ├── rand v0.8.7 (*)
+│       │       │       │   │   │   └── rand_core feature "alloc"
+│       │       │       │   │   │       └── rand_core v0.6.4 (*)
+│       │       │       │   │   ├── rand feature "getrandom"
+│       │       │       │   │   │   ├── rand v0.8.7 (*)
+│       │       │       │   │   │   └── rand_core feature "getrandom"
+│       │       │       │   │   │       └── rand_core v0.6.4 (*)
+│       │       │       │   │   ├── rand feature "libc"
+│       │       │       │   │   │   └── rand v0.8.7 (*)
+│       │       │       │   │   ├── rand feature "rand_chacha"
+│       │       │       │   │   │   └── rand v0.8.7 (*)
+│       │       │       │   │   ├── rand_chacha feature "std"
+│       │       │       │   │   │   ├── rand_chacha v0.3.1 (*)
+│       │       │       │   │   │   └── ppv-lite86 feature "std" (*)
+│       │       │       │   │   └── rand_core feature "std"
+│       │       │       │   │       ├── rand_core v0.6.4 (*)
+│       │       │       │   │       ├── getrandom feature "std"
+│       │       │       │   │       │   └── getrandom v0.2.17 (*)
+│       │       │       │   │       ├── rand_core feature "alloc" (*)
+│       │       │       │   │       └── rand_core feature "getrandom" (*)
+│       │       │       │   └── rand feature "std_rng"
+│       │       │       │       ├── rand v0.8.7 (*)
+│       │       │       │       └── rand feature "rand_chacha" (*)
+│       │       │       └── signatory feature "default"
+│       │       │           ├── signatory v0.27.1
+│       │       │           │   ├── zeroize feature "default" (*)
+│       │       │           │   ├── signature feature "default"
+│       │       │           │   │   └── signature v2.2.0 (*)
+│       │       │           │   ├── rand_core feature "default" (*)
+│       │       │           │   ├── pkcs8 feature "alloc"
+│       │       │           │   │   ├── pkcs8 v0.10.2
+│       │       │           │   │   │   ├── der feature "default"
+│       │       │           │   │   │   │   └── der v0.7.10
+│       │       │           │   │   │   │       ├── zeroize v1.9.0
+│       │       │           │   │   │   │       ├── const-oid feature "default"
+│       │       │           │   │   │   │       │   └── const-oid v0.9.6
+│       │       │           │   │   │   │       ├── pem-rfc7468 feature "alloc"
+│       │       │           │   │   │   │       │   ├── pem-rfc7468 v0.7.0
+│       │       │           │   │   │   │       │   │   └── base64ct feature "default"
+│       │       │           │   │   │   │       │   │       └── base64ct v1.8.3
+│       │       │           │   │   │   │       │   └── base64ct feature "alloc"
+│       │       │           │   │   │   │       │       └── base64ct v1.8.3
+│       │       │           │   │   │   │       └── pem-rfc7468 feature "default"
+│       │       │           │   │   │   │           └── pem-rfc7468 v0.7.0 (*)
+│       │       │           │   │   │   ├── der feature "oid"
+│       │       │           │   │   │   │   └── der v0.7.10 (*)
+│       │       │           │   │   │   └── spki feature "default"
+│       │       │           │   │   │       └── spki v0.7.3
+│       │       │           │   │   │           ├── der feature "default" (*)
+│       │       │           │   │   │           └── der feature "oid" (*)
+│       │       │           │   │   ├── der feature "alloc"
+│       │       │           │   │   │   ├── der v0.7.10 (*)
+│       │       │           │   │   │   └── zeroize feature "alloc" (*)
+│       │       │           │   │   ├── der feature "zeroize"
+│       │       │           │   │   │   └── der v0.7.10 (*)
+│       │       │           │   │   └── spki feature "alloc"
+│       │       │           │   │       ├── spki v0.7.3 (*)
+│       │       │           │   │       └── der feature "alloc" (*)
+│       │       │           │   ├── pkcs8 feature "default"
+│       │       │           │   │   └── pkcs8 v0.10.2 (*)
+│       │       │           │   └── pkcs8 feature "pem"
+│       │       │           │       ├── pkcs8 v0.10.2 (*)
+│       │       │           │       ├── pkcs8 feature "alloc" (*)
+│       │       │           │       ├── der feature "pem"
+│       │       │           │       │   ├── der v0.7.10 (*)
+│       │       │           │       │   ├── der feature "alloc" (*)
+│       │       │           │       │   └── der feature "zeroize" (*)
+│       │       │           │       └── spki feature "pem"
+│       │       │           │           ├── spki v0.7.3 (*)
+│       │       │           │           ├── der feature "pem" (*)
+│       │       │           │           └── spki feature "alloc" (*)
+│       │       │           └── signatory feature "std"
+│       │       │               ├── signatory v0.27.1 (*)
+│       │       │               ├── signature feature "std"
+│       │       │               │   ├── signature v2.2.0 (*)
+│       │       │               │   └── signature feature "alloc"
+│       │       │               │       └── signature v2.2.0 (*)
+│       │       │               ├── rand_core feature "std" (*)
+│       │       │               └── pkcs8 feature "std"
+│       │       │                   ├── pkcs8 v0.10.2 (*)
+│       │       │                   ├── pkcs8 feature "alloc" (*)
+│       │       │                   ├── der feature "std"
+│       │       │                   │   ├── der v0.7.10 (*)
+│       │       │                   │   └── der feature "alloc" (*)
+│       │       │                   └── spki feature "std"
+│       │       │                       ├── spki v0.7.3 (*)
+│       │       │                       ├── der feature "std" (*)
+│       │       │                       └── spki feature "alloc" (*)
+│       │       ├── nuid feature "default"
+│       │       │   └── nuid v0.5.0
+│       │       │       └── rand feature "default" (*)
+│       │       ├── pin-project feature "default"
+│       │       │   └── pin-project v1.1.13
+│       │       │       └── pin-project-internal feature "default"
+│       │       │           └── pin-project-internal v1.1.13 (proc-macro)
+│       │       │               ├── proc-macro2 feature "default" (*)
+│       │       │               ├── quote feature "default" (*)
+│       │       │               ├── syn feature "clone-impls" (*)
+│       │       │               ├── syn feature "full" (*)
+│       │       │               ├── syn feature "parsing" (*)
+│       │       │               ├── syn feature "printing" (*)
+│       │       │               ├── syn feature "proc-macro" (*)
+│       │       │               └── syn feature "visit-mut" (*)
+│       │       ├── serde_nanos feature "default"
+│       │       │   └── serde_nanos v0.1.4
+│       │       │       └── serde feature "default" (*)
+│       │       ├── serde_repr feature "default"
+│       │       │   └── serde_repr v0.1.21 (proc-macro)
+│       │       │       ├── proc-macro2 feature "default" (*)
+│       │       │       ├── quote feature "default" (*)
+│       │       │       └── syn feature "default" (*)
+│       │       ├── time feature "default"
+│       │       │   ├── time v0.3.55
+│       │       │   │   ├── powerfmt v0.2.0
+│       │       │   │   ├── serde_core v1.0.229
+│       │       │   │   ├── deranged feature "default"
+│       │       │   │   │   └── deranged v0.5.8
+│       │       │   │   │       └── serde_core v1.0.229
+│       │       │   │   ├── num-conv feature "default"
+│       │       │   │   │   └── num-conv v0.2.2
+│       │       │   │   └── time-core feature "default"
+│       │       │   │       └── time-core v0.1.9
+│       │       │   └── time feature "std"
+│       │       │       ├── time v0.3.55 (*)
+│       │       │       └── time feature "alloc"
+│       │       │           ├── time v0.3.55 (*)
+│       │       │           └── serde_core feature "alloc" (*)
+│       │       ├── time feature "formatting"
+│       │       │   ├── time v0.3.55 (*)
+│       │       │   └── time feature "std" (*)
+│       │       ├── time feature "parsing"
+│       │       │   └── time v0.3.55 (*)
+│       │       ├── time feature "serde"
+│       │       │   ├── time v0.3.55 (*)
+│       │       │   └── deranged feature "serde"
+│       │       │       └── deranged v0.5.8 (*)
+│       │       ├── time feature "serde-well-known"
+│       │       │   ├── time v0.3.55 (*)
+│       │       │   ├── time feature "formatting" (*)
+│       │       │   ├── time feature "parsing" (*)
+│       │       │   └── time feature "serde" (*)
+│       │       └── tryhard feature "default"
+│       │           └── tryhard v0.5.2
+│       │               ├── pin-project-lite feature "default" (*)
+│       │               ├── tokio feature "macros" (*)
+│       │               ├── tokio feature "rt" (*)
+│       │               ├── tokio feature "sync" (*)
+│       │               ├── tokio feature "test-util"
+│       │               │   ├── tokio v1.53.1 (*)
+│       │               │   ├── tokio feature "rt" (*)
+│       │               │   ├── tokio feature "sync" (*)
+│       │               │   └── tokio feature "time" (*)
+│       │               └── tokio feature "time" (*)
+│       ├── async-nats feature "jetstream"
+│       │   └── async-nats v0.50.0 (*)
+│       ├── async-nats feature "kv"
+│       │   ├── async-nats v0.50.0 (*)
+│       │   └── async-nats feature "jetstream" (*)
+│       ├── async-nats feature "nkeys"
+│       │   └── async-nats v0.50.0 (*)
+│       ├── async-nats feature "nuid"
+│       │   └── async-nats v0.50.0 (*)
+│       ├── async-nats feature "object-store"
+│       │   ├── async-nats v0.50.0 (*)
+│       │   ├── async-nats feature "crypto" (*)
+│       │   └── async-nats feature "jetstream" (*)
+│       ├── async-nats feature "ring"
+│       │   ├── async-nats v0.50.0 (*)
+│       │   └── tokio-rustls feature "ring"
+│       │       ├── tokio-rustls v0.26.4 (*)
+│       │       └── rustls feature "ring" (*)
+│       ├── async-nats feature "server_2_10"
+│       │   └── async-nats v0.50.0 (*)
+│       ├── async-nats feature "server_2_11"
+│       │   └── async-nats v0.50.0 (*)
+│       ├── async-nats feature "server_2_12"
+│       │   └── async-nats v0.50.0 (*)
+│       ├── async-nats feature "server_2_14"
+│       │   └── async-nats v0.50.0 (*)
+│       └── async-nats feature "service"
+│           └── async-nats v0.50.0 (*)
 ├── opentelemetry feature "default"
 │   ├── opentelemetry v0.32.0
 │   │   ├── thiserror v2.0.21 (*)

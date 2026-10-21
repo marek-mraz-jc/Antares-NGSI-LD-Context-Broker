@@ -203,42 +203,100 @@ async fn enqueue_change(
 /// that carries no page (idPattern, federation, orderBy) has at all.
 pub const MAX_UNDECIDED_ROWS: i64 = 10_000;
 
-/// One named type, the selection almost every type page carries: the bind
-/// numbers of the type and of `ARRAY[type]`. `types @> $n` cannot serve it:
-/// `arraycontains` is not leakproof, so under the tables' RLS Postgres keeps
-/// it out of every index condition and pages the whole Tenant through
-/// `entities_pkey` (T-4781: 18 req/s on prod). The split reads two
-/// leakproof index paths instead: the Entities whose first type it is
-/// (`i_entities_first_type_id`), and the few of two or more types that carry
-/// it later (`i_entities_multi_type_id`). Both arms are disjoint and their
-/// union is exactly `types @> ARRAY[type]`.
-#[derive(Clone, Copy)]
-struct OneType {
-    first: usize,
-    all: usize,
+/// Distinct types a type selection may split into arms; a longer list keeps
+/// the plain containment, which reads the Tenant.
+const MAX_TYPE_ARMS: usize = 16;
+
+/// A type selection read as leakproof index arms. `types @> $n` cannot be an
+/// index condition: `arraycontains` is not leakproof, so under the tables'
+/// RLS Postgres keeps it out of every index condition and pages the whole
+/// Tenant through `entities_pkey` (T-4781: 18 req/s on prod; T-4852 the
+/// same for `type=A,B`). The split reads one arm per type the selection
+/// names, the Entities whose first type it is (`i_entities_first_type_id`),
+/// plus one arm for the few of two or more types whose first type is none
+/// of them (`i_entities_multi_type_id`). The arms are disjoint (an Entity
+/// has one first type) and their union is exactly the selection.
+struct TypeSplit {
+    /// Bind of each named type, one first-type arm each.
+    firsts: Vec<usize>,
+    /// Bind of every named type, as an array.
+    named: usize,
+    /// The selection itself, `types @> $g` per AND-group, ORed.
+    selection: String,
+    /// A selection of one type is decided by `types[1] = $t` alone.
+    exact_first: bool,
 }
 
-/// The full WHERE of each arm the statement reads: one, or the two of a
-/// `OneType` split.
-fn arms(wheres: &[String], one: Option<OneType>) -> Vec<String> {
+/// The full WHERE of each arm the statement reads: one, or the arms of a
+/// `TypeSplit`.
+fn arms(wheres: &[String], split: Option<&TypeSplit>) -> Vec<String> {
     let base = wheres.join(" AND ");
-    match one {
-        None => vec![base],
-        Some(OneType { first, all }) => vec![
-            format!("{base} AND types[1] = ${first}"),
-            format!(
-                "{base} AND cardinality(types) > 1 \
-                 AND types[1] IS DISTINCT FROM ${first} AND types @> ${all}"
-            ),
-        ],
+    let Some(s) = split else {
+        return vec![base];
+    };
+    let mut arms: Vec<String> = s
+        .firsts
+        .iter()
+        .map(|n| match s.exact_first {
+            true => format!("{base} AND types[1] = ${n}"),
+            false => format!("{base} AND types[1] = ${n} AND {}", s.selection),
+        })
+        .collect();
+    arms.push(format!(
+        "{base} AND cardinality(types) > 1 AND types[1] <> ALL(${}) AND {}",
+        s.named, s.selection
+    ));
+    arms
+}
+
+/// The type selection's binds and SQL: `Ok(split)` for at most
+/// `MAX_TYPE_ARMS` distinct types, `Err(where)` (the plain containment, or
+/// `false` when no group can match) otherwise. A group naming a type with a
+/// NUL needs a type no entity has.
+fn type_selection(groups: &[Vec<String>], binds: &mut Vec<Bind>) -> Result<TypeSplit, String> {
+    let groups: Vec<&Vec<String>> = groups
+        .iter()
+        .filter(|g| super::storable(g).len() == g.len())
+        .collect();
+    let mut named: Vec<&String> = groups.iter().flat_map(|g| g.iter()).collect();
+    named.sort_unstable();
+    named.dedup();
+    let ors: Vec<String> = groups
+        .iter()
+        .map(|g| {
+            binds.push(Bind::TextArr((*g).clone()));
+            format!("types @> ${}", binds.len())
+        })
+        .collect();
+    if ors.is_empty() {
+        return Err("false".to_owned());
     }
+    let selection = format!("({})", ors.join(" OR "));
+    // an empty group selects every type, which no set of arms can name
+    if named.len() > MAX_TYPE_ARMS || groups.iter().any(|g| g.is_empty()) {
+        return Err(selection);
+    }
+    let firsts = named
+        .iter()
+        .map(|t| {
+            binds.push(Bind::Text((*t).clone()));
+            binds.len()
+        })
+        .collect();
+    binds.push(Bind::TextArr(named.into_iter().cloned().collect()));
+    Ok(TypeSplit {
+        firsts,
+        named: binds.len(),
+        selection,
+        exact_first: matches!(groups.as_slice(), [g] if g.len() == 1),
+    })
 }
 
 /// count=true's total: a count per arm over exactly the page's WHERE, never
 /// a window over the page statement (that kept every matching row, body and
 /// all, until the last one was read).
-fn count_sql(wheres: &[String], one: Option<OneType>) -> String {
-    let counts: Vec<String> = arms(wheres, one)
+fn count_sql(wheres: &[String], split: Option<&TypeSplit>) -> String {
+    let counts: Vec<String> = arms(wheres, split)
         .iter()
         .map(|w| format!("(SELECT count(*) FROM entities WHERE {w})"))
         .collect();
@@ -254,7 +312,7 @@ fn count_sql(wheres: &[String], one: Option<OneType>) -> String {
 fn query_sql(
     select: &str,
     wheres: &[String],
-    one: Option<OneType>,
+    split: Option<&TypeSplit>,
     page: Option<&Page>,
     decided: bool,
     binds: &mut Vec<Bind>,
@@ -270,7 +328,37 @@ fn query_sql(
         binds.push(Bind::Int(p.offset));
         format!(" OFFSET ${}", binds.len())
     });
-    let arms = arms(wheres, one);
+    let arms = arms(wheres, split);
+    // A deep page skips its OFFSET over ids alone, which the type indexes
+    // hand back without a heap visit (0013's INCLUDE), and reads only the
+    // page's documents by primary key (T-4907: page 50 of a 180k-entity
+    // type walked 5 000 jsonb rows for 100).
+    if let Some(p) = page.filter(|p| p.offset > 0) {
+        let ids = match arms.as_slice() {
+            [w] => format!("SELECT id FROM entities WHERE {w} ORDER BY id LIMIT ${lim}{offset}"),
+            _ => {
+                binds.push(Bind::Int(limit.saturating_add(p.offset)));
+                let each = binds.len();
+                let parts: Vec<String> = arms
+                    .iter()
+                    .map(|w| {
+                        format!("(SELECT id FROM entities WHERE {w} ORDER BY id LIMIT ${each})")
+                    })
+                    .collect();
+                format!(
+                    "SELECT id FROM ({}) AS arms ORDER BY id LIMIT ${lim}{offset}",
+                    parts.join(" UNION ALL ")
+                )
+            }
+        };
+        return (
+            format!(
+                "SELECT {select} AS entity FROM entities \
+                 WHERE tenant_id = $1 AND id IN ({ids}) ORDER BY id"
+            ),
+            true,
+        );
+    }
     let sql = match arms.as_slice() {
         [w] => format!(
             "SELECT {select} AS entity FROM entities WHERE {w} ORDER BY id LIMIT ${lim}{offset}"
@@ -701,36 +789,12 @@ impl PgEntityStore {
             }
         }
         // OR of AND-groups, mirroring the Entity Type Selection Language
-        // (4.17) the caller already parsed: `types @> ARRAY[…]` per group.
-        // One group of one type is the `OneType` split instead.
-        let mut one = None;
-        if let Some([g]) = f.types {
-            if let [t] = g.as_slice() {
-                if !t.contains('\0') {
-                    binds.push(Bind::Text(t.clone()));
-                    let first = binds.len();
-                    binds.push(Bind::TextArr(g.clone()));
-                    one = Some(OneType {
-                        first,
-                        all: binds.len(),
-                    });
-                }
-            }
-        }
-        if let Some(groups) = f.types.filter(|_| one.is_none()) {
-            let mut ors = Vec::with_capacity(groups.len());
-            // a group naming a type with a NUL needs a type no entity has
-            for g in groups
-                .iter()
-                .filter(|g| super::storable(g).len() == g.len())
-            {
-                binds.push(Bind::TextArr(g.clone()));
-                ors.push(format!("types @> ${}", binds.len()));
-            }
-            if !ors.is_empty() {
-                wheres.push(format!("({})", ors.join(" OR ")));
-            } else if !groups.is_empty() {
-                wheres.push("false".to_owned());
+        // (4.17) the caller already parsed, read as `TypeSplit` arms.
+        let mut split = None;
+        if let Some(groups) = f.types.filter(|g| !g.is_empty()) {
+            match type_selection(groups, &mut binds) {
+                Ok(s) => split = Some(s),
+                Err(w) => wheres.push(w),
             }
         }
         // `attrs`: the entity carries at least one of them — jsonb `?|`,
@@ -777,10 +841,11 @@ impl PgEntityStore {
                     binds.len().saturating_add(1),
                 ) {
                     wheres.push(c.sql);
-                    // geo binds first, then the numeric ones — the order
-                    // `compile_geo` numbered its placeholders in.
+                    // geo binds first, then the numeric ones, then the cell
+                    // cover — the order `compile_geo` numbered them in.
                     binds.extend(c.geo_binds.into_iter().map(Bind::Text));
                     binds.extend(c.num_binds.into_iter().map(Bind::Num));
+                    binds.extend(c.cell_binds.into_iter().map(Bind::Text));
                 }
             }
         }
@@ -824,7 +889,14 @@ impl PgEntityStore {
         // `scopeQ`, any `georel`, a `q=` shape the compiler declined)
         // materializes the whole tenant into the Vec below.
         let ceiling = MAX_UNDECIDED_ROWS;
-        let (sql, paged) = query_sql(&select, &wheres, one, f.page.as_ref(), decided, &mut binds);
+        let (sql, paged) = query_sql(
+            &select,
+            &wheres,
+            split.as_ref(),
+            f.page.as_ref(),
+            decided,
+            &mut binds,
+        );
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         // sqlx 0.9 makes dynamic SQL opt-in. The assertion holds by
@@ -872,8 +944,11 @@ impl PgEntityStore {
         // count the match set under the same WHERE, binds and transaction
         if counted && total.is_none() {
             // unprepared for the same reason as the statement above
-            let mut cq = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql(&wheres, one)))
-                .persistent(false);
+            let mut cq = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql(
+                &wheres,
+                split.as_ref(),
+            )))
+            .persistent(false);
             // same wheres ⇒ same bind prefix; stop before the
             // projection/page binds, which the count statement lacks
             for b in binds.iter().take(where_binds) {
@@ -1746,10 +1821,29 @@ mod tests {
             &mut binds,
         );
         assert!(paged);
-        assert!(sql.contains("LIMIT $2 OFFSET $3"), "{sql}");
+        assert_eq!(
+            sql,
+            "SELECT entity AS entity FROM entities WHERE tenant_id = $1 AND id IN (\
+             SELECT id FROM entities WHERE tenant_id = $1 ORDER BY id LIMIT $2 OFFSET $3) ORDER BY id"
+        );
         assert!(!sql.contains("OVER"), "{sql}");
         assert!(matches!(binds[1], Bind::Int(11)));
         assert!(matches!(binds[2], Bind::Int(20)));
+        // the first page reads its documents directly
+        let mut binds = vec![Bind::Text("t".to_owned())];
+        let (sql, _) = query_sql(
+            "entity",
+            &wheres(),
+            None,
+            Some(&page(0, 10)),
+            true,
+            &mut binds,
+        );
+        assert!(
+            sql.starts_with("SELECT entity AS entity FROM entities WHERE tenant_id"),
+            "{sql}"
+        );
+        assert!(sql.ends_with("ORDER BY id LIMIT $2 OFFSET $3"), "{sql}");
     }
 
     /// T-4781: one named type reads two leakproof index arms, each in id
@@ -1757,16 +1851,13 @@ mod tests {
     /// (which RLS keeps out of every index condition).
     #[test]
     fn one_type_pages_through_two_bounded_arms() {
-        let mut binds = vec![
-            Bind::Text("t".to_owned()),
-            Bind::Text("T".to_owned()),
-            Bind::TextArr(vec!["T".to_owned()]),
-        ];
-        let one = Some(OneType { first: 2, all: 3 });
+        let mut binds = vec![Bind::Text("t".to_owned())];
+        let split = type_selection(&[vec!["T".to_owned()]], &mut binds).expect("split");
+        assert!(matches!(&binds[2], Bind::Text(t) if t == "T"));
         let (sql, paged) = query_sql(
             "entity",
             &wheres(),
-            one,
+            Some(&split),
             Some(&page(20, 10)),
             true,
             &mut binds,
@@ -1774,25 +1865,69 @@ mod tests {
         assert!(paged);
         assert_eq!(
             sql,
-            "SELECT entity AS entity FROM (\
-             (SELECT id, entity FROM entities WHERE tenant_id = $1 AND types[1] = $2 \
-             ORDER BY id LIMIT $6) UNION ALL \
-             (SELECT id, entity FROM entities WHERE tenant_id = $1 AND cardinality(types) > 1 \
-             AND types[1] IS DISTINCT FROM $2 AND types @> $3 ORDER BY id LIMIT $6)) AS entities \
-             ORDER BY id LIMIT $4 OFFSET $5"
+            "SELECT entity AS entity FROM entities WHERE tenant_id = $1 AND id IN (SELECT id FROM (\
+             (SELECT id FROM entities WHERE tenant_id = $1 AND types[1] = $3 \
+             ORDER BY id LIMIT $7) UNION ALL \
+             (SELECT id FROM entities WHERE tenant_id = $1 AND cardinality(types) > 1 \
+             AND types[1] <> ALL($4) AND (types @> $2) ORDER BY id LIMIT $7)) AS arms \
+             ORDER BY id LIMIT $5 OFFSET $6) ORDER BY id"
         );
-        assert!(matches!(binds[3], Bind::Int(11)));
-        assert!(matches!(binds[4], Bind::Int(20)));
+        assert!(matches!(binds[4], Bind::Int(11)));
+        assert!(matches!(binds[5], Bind::Int(20)));
         assert!(
-            matches!(binds[5], Bind::Int(31)),
+            matches!(binds[6], Bind::Int(31)),
             "each arm: offset + limit + 1"
         );
         // the undecided ceiling bounds each arm and the merge alike
         let mut binds = vec![Bind::Text("t".to_owned())];
-        let (sql, paged) = query_sql("entity", &wheres(), one, None, false, &mut binds);
+        let split = type_selection(&[vec!["T".to_owned()]], &mut binds).expect("split");
+        let (sql, paged) = query_sql("entity", &wheres(), Some(&split), None, false, &mut binds);
         assert!(!paged);
-        assert_eq!(sql.matches("LIMIT $2").count(), 3, "{sql}");
+        assert_eq!(sql.matches("LIMIT $5").count(), 3, "{sql}");
         assert!(!sql.contains("OFFSET"), "{sql}");
+    }
+
+    /// T-4852: `type=A,B` and `type=A;B` read one first-type arm per named
+    /// type, each filtered by the whole selection unless one type decides
+    /// it, plus the multi-type arm; a selection the arms cannot name keeps
+    /// the plain containment.
+    #[test]
+    fn a_type_list_reads_one_arm_per_type() {
+        let t = |s: &str| s.to_owned();
+        let mut binds = vec![Bind::Text(t("t"))];
+        let split = type_selection(&[vec![t("B")], vec![t("A")]], &mut binds).expect("split");
+        let w = arms(&[t("tenant_id = $1")], Some(&split));
+        assert_eq!(
+            w,
+            [
+                "tenant_id = $1 AND types[1] = $4 AND (types @> $2 OR types @> $3)",
+                "tenant_id = $1 AND types[1] = $5 AND (types @> $2 OR types @> $3)",
+                "tenant_id = $1 AND cardinality(types) > 1 AND types[1] <> ALL($6) \
+                 AND (types @> $2 OR types @> $3)",
+            ]
+        );
+        assert!(matches!(&binds[3], Bind::Text(x) if x == "A"), "sorted");
+        assert!(matches!(&binds[5], Bind::TextArr(v) if v == &[t("A"), t("B")]));
+
+        let mut binds = vec![Bind::Text(t("t"))];
+        let split = type_selection(&[vec![t("A"), t("B")]], &mut binds).expect("split");
+        assert!(!split.exact_first, "A;B is not decided by the first type");
+
+        let mut binds = vec![Bind::Text(t("t"))];
+        let many: Vec<Vec<String>> = (0..=MAX_TYPE_ARMS).map(|i| vec![format!("T{i}")]).collect();
+        let w = type_selection(&many, &mut binds)
+            .err()
+            .expect("too many arms");
+        assert!(w.starts_with("(types @> $2 OR"), "{w}");
+        let mut binds = vec![Bind::Text(t("t"))];
+        assert!(type_selection(&[vec![t("A")], vec![]], &mut binds).is_err());
+        let mut binds = vec![Bind::Text(t("t"))];
+        assert_eq!(
+            type_selection(&[vec![t("A\0")]], &mut binds)
+                .err()
+                .as_deref(),
+            Some("false")
+        );
     }
 
     /// count=false never asks for a count; count=true asks only when the
@@ -1827,13 +1962,19 @@ mod tests {
             count_sql(&w, None),
             "SELECT (SELECT count(*) FROM entities WHERE tenant_id = $1 AND entity ?| $4)"
         );
-        let sql = count_sql(&w, Some(OneType { first: 2, all: 3 }));
+        let split = TypeSplit {
+            firsts: vec![2],
+            named: 3,
+            selection: "(types @> $5)".to_owned(),
+            exact_first: true,
+        };
+        let sql = count_sql(&w, Some(&split));
         assert_eq!(
             sql,
             "SELECT (SELECT count(*) FROM entities WHERE tenant_id = $1 AND entity ?| $4 \
              AND types[1] = $2) + (SELECT count(*) FROM entities WHERE tenant_id = $1 \
-             AND entity ?| $4 AND cardinality(types) > 1 AND types[1] IS DISTINCT FROM $2 \
-             AND types @> $3)"
+             AND entity ?| $4 AND cardinality(types) > 1 AND types[1] <> ALL($3) \
+             AND (types @> $5))"
         );
     }
 

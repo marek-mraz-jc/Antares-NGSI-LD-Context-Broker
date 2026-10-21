@@ -31,7 +31,7 @@ the message; a client may add `x-id`, which the answer echoes.
 | server | `x-result` | the operation's answer | `x-status` is the HTTP status the operation answered |
 | server | `x-notification` | the notification | `x-subscription`, `x-seq` from 1, and the same metadata the MQTT binding sends |
 | server | `x-gap` | none | `x-from`..`x-to` were lost (overflow, or past the resume ring) |
-| server | `x-closing` | none | `x-reason` (`overflow`, `lifetime`, `idle`, `view-removed`), then the close frame |
+| server | `x-closing` | none | `x-reason` (`overflow`, `lifetime`, `idle`, `view-removed`, `rate`), then the close frame |
 
 A Subscription made over the socket notifies only that socket: its
 endpoint is minted as `urn:antares:ws:<connection>` and a body naming
@@ -86,6 +86,7 @@ is dropped.
 | past `ANTARES_WS_MAX_CONNECTIONS` or `..._PER_TENANT` | upgrade `503` |
 | a client message past 64 KiB, a frame past 16 KiB, or nesting past 64 | the connection closes (1009 for nesting) |
 | past `ANTARES_WS_MAX_SUBSCRIPTIONS` on one connection | `x-subscribe` answers `400` |
+| more than 100 frames at once, or past 20 a second after that (any frame, Pings and Pongs included) | `x-closing` `rate`, then the connection closes with 1008 |
 | a notification past 1 MiB | not sent; the delivery fails as on HTTP |
 | a binary frame | the connection closes with 1003 |
 

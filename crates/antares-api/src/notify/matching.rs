@@ -192,13 +192,13 @@ where
 }
 
 /// What each Entity of a notification's `data` (and each one it embeds)
-/// shows under the expanded `rules`, read on its stored state now, names
-/// compacted the way `data` is. An Entity the store no longer holds, that
+/// shows under the expanded `rules` (every Attribute without rules), read
+/// on its stored state now, names compacted the way `data` is. An Entity the store no longer holds, that
 /// `reach` does not admit, or that no rule holds for, maps to `None`.
 pub(super) async fn shown_now(
     st: &AppState,
     tenant: &TenantId,
-    rules: &crate::policy::Filter,
+    rules: Option<&crate::policy::Filter>,
     reach: Option<&crate::repr::PolicyReach>,
     data: &Value,
     ctx: &Context,
@@ -227,7 +227,7 @@ pub(super) async fn shown_now(
             }
         }
         let shown = stored
-            .and_then(|d| crate::repr::shown(Some(rules), &d))
+            .and_then(|d| crate::repr::shown(rules, &d))
             .map(|s| s.map_names(|n| ctx.compact_iri(n)));
         out.insert(id.to_owned(), shown);
     }
@@ -372,24 +372,20 @@ pub(super) async fn view_project(
     ctx: &Context,
 ) -> bool {
     let repr = crate::repr::narrowing(view.narrowing());
-    let Some(rules) = repr.policy_types.as_deref() else {
+    let (rules, reach) = (repr.policy_types.as_deref(), repr.policy_reach.as_deref());
+    // the `*` view without a condition (rule 12) shows everything; one with
+    // a q, scopeQ or geoQ reads every Entity it delivers, joined ones too,
+    // under that condition as a GET through it does
+    if rules.is_none() && reach.is_none() {
         return true;
-    };
+    }
     let key_values = matches!(
         sub.get("notification")
             .and_then(|n| n.get("format"))
             .and_then(Value::as_str),
         Some("keyValues" | "simplified")
     );
-    let shown = shown_now(
-        st,
-        tenant,
-        rules,
-        repr.policy_reach.as_deref(),
-        &body["data"],
-        ctx,
-    )
-    .await;
+    let shown = shown_now(st, tenant, rules, reach, &body["data"], ctx).await;
     let Some(arr) = body.get_mut("data").and_then(Value::as_array_mut) else {
         return false;
     };

@@ -40,6 +40,11 @@ A view may select every type and show every Attribute with one form:
 ["*"]}` (ADR-0023 rule 12). Its `q`, `scopeQ`, `geoQ`, `operations` and
 Tenant still apply. `*` anywhere else is refused when the view loads.
 
+A view may carry `representations`, an object keyed by a domain-standard
+surface: today `ical`, the [iCalendar feed](ical.md)'s field mapping. Any
+other key, or a member that is not an object, is refused when the view
+loads; the surface reads its own member.
+
 ## 2. What a client sees
 
 - An Entity is in the view when a rule names its type and the view's `q`,

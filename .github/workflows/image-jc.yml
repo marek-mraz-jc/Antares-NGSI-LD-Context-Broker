@@ -122,3 +122,67 @@ jobs:
             cells/ETSI-cell-file/tp-status.csv
             cells/ETSI-cell-file/**/log.html
           retention-days: 30
+
+  etsi-policy:
+    # T-4855: the same image with the platform's engine deciding (ANTARES_POLICY=joinedcontext),
+    # the suite behind a subject proxy in the context-gateway's place (dev/etsi-pipeline.sh
+    # POLICY=, docs/conformance/suite-edits.md section 5). grant: every clause to the suite in its
+    # fixed tenants, which must equal the baseline but for the TPs grant-all.expected lists.
+    # restricted: Vehicle reads prohibited; exactly the TPs restricted.expected lists fail, and
+    # every refusal is a 403 problem naming no entity.
+    name: ETSI on the jc image (joinedcontext ${{ matrix.cell }}, file)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cell: grant
+            suites: ""
+          - cell: restricted
+            suites: ContextInformation/Consumption
+    env:
+      OUT: cells/ETSI-cell-file
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: antares-image-jc
+      - run: docker load < antares-image.tgz
+      - name: Self-check of the refusal reader
+        run: python3 -m unittest discover -s ci/policy/etsi
+      - name: Run the suites through the subject proxy
+        env:
+          STORE: file
+          RESULTS_DIR: ${{ env.OUT }}
+          SKIP_BUILD: "1"
+          STOP_ON_ERROR: "0"
+          CALLBACK_HOST: localhost
+          API_SURFACES: admin,views,mcp,odata,ws,linkml
+          POLICY: ci/policy/etsi/${{ matrix.cell }}.json
+          SUITES: ${{ matrix.suites }}
+        run: ./dev/etsi-pipeline.sh || true
+      - name: Per-TP baseline, the listed deviations alone (grant)
+        if: matrix.cell == 'grant'
+        env:
+          STORES: file
+          EXPECTED: ci/policy/etsi/grant-all.expected
+        run: ./dev/etsi-baseline.py check cells
+      - name: Exactly the listed refusals, each a 403 naming no entity (restricted)
+        if: matrix.cell == 'restricted'
+        run: |
+          python3 tests/external/etsi/ratchet.py ci/policy/etsi/restricted.expected "$OUT/tp-status.csv"
+          python3 ci/policy/etsi/refusals.py "$OUT"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: ETSI-jc-policy-${{ matrix.cell }}
+          path: |
+            ${{ env.OUT }}/run-summary.md
+            ${{ env.OUT }}/failures.csv
+            ${{ env.OUT }}/tp-status.csv
+            ${{ env.OUT }}/**/log.html
+          retention-days: 30

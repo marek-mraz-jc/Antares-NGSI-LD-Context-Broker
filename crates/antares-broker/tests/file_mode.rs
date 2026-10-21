@@ -145,6 +145,9 @@ fn memory_mode_sigkill_loses_everything_by_contract() {
     broker.kill().expect("SIGKILL");
     broker.wait().expect("reap");
 
+    // A fresh port: only the restarted process can answer, never something
+    // still bound to the old one (train 20261021-0800 read a 200 there once).
+    let port = free_port();
     let _broker = start(port, &dir, "memory");
     wait_healthy(port);
     let resp = http(
@@ -281,6 +284,13 @@ fn double_start_refuses_the_lock_instead_of_corrupting() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The gate's headroom under `cargo llvm-cov`. The instrumented boot measures
+/// 0.4-0.54 s like the plain one when the host is calm, but preflight runs it
+/// beside the debug lane's builds, where it took 3.0 s (train 20261021-1115
+/// preflight-2, T-5021): 4 x 2 s keeps that run green and still fails a boot
+/// that got several times slower.
+const COVERAGE_SLOWDOWN: u32 = 4;
+
 /// Because `file` mode can only ever be recreated (never
 /// rolled), the restart gap IS the downtime — so it has to be bounded rather
 /// than assumed. Boot rebuild scans the redb tables back into the in-memory
@@ -354,9 +364,16 @@ fn restart_gap_stays_under_the_gate() {
         gap,
         SEED as f64 / gap.as_secs_f64()
     );
+    // The plain test lane holds the 2 s gate; `cargo llvm-cov` sets
+    // LLVM_PROFILE_FILE and gets COVERAGE_SLOWDOWN times that.
+    let gate = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        Duration::from_secs(2) * COVERAGE_SLOWDOWN
+    } else {
+        Duration::from_secs(2)
+    };
     assert!(
-        gap < Duration::from_secs(2),
-        "restart gap {gap:?} exceeds the 2 s gate at {SEED} entities"
+        gap < gate,
+        "restart gap {gap:?} exceeds the {gate:?} gate at {SEED} entities"
     );
 
     broker.kill().expect("cleanup kill");

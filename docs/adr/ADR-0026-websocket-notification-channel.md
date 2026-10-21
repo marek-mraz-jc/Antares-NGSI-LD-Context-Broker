@@ -178,7 +178,7 @@ and filter in the gateway (the duplicate filter T-4755 removes).
 | `x-seq` | `x-notification` | per-connection sequence, `u64`, from 1, no gaps on one connection |
 | `x-subscription` | `x-notification` | the Subscription id (also in the body's `subscriptionId`; repeated so a client can route without parsing the body) |
 | `x-gap` | server message | notifications from `x-from` to `x-to` are lost; re-read with Query Entities |
-| `x-closing` | server message | sent before the server closes; `x-reason` is `lifetime`, `overflow`, `view-removed`, `shutdown` or `idle` |
+| `x-closing` | server message | sent before the server closes; `x-reason` is `lifetime`, `overflow`, `view-removed`, `shutdown`, `idle` or `rate` |
 
 Heartbeat is the WebSocket protocol's own Ping/Pong (RFC 6455 5.5.2,
 5.5.3), every 30 s; a connection with no Pong for 60 s is closed. No

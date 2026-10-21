@@ -22,6 +22,15 @@
 #   VIEWS=ci/views/etsi              load every <id>.json there into broker1
 #                                    (PUT /q/views/<id>: API_SURFACES names
 #                                    admin and views) before the suites run
+#   POLICY=ci/policy/etsi/grant-all.json
+#                                    the platform's engine decides: layer
+#                                    docker-compose-policy.yml (ANTARES_POLICY=
+#                                    joinedcontext, a subject proxy on 9090..9094
+#                                    that sets the suite's x-jc-client) and PUT
+#                                    the file's `document` to /q/policy/<t> of
+#                                    every broker for each of its `tenants`
+#                                    (needs a jc-policy image and API_SURFACES
+#                                    naming admin and views; T-4855)
 #   NGSILD_BASE=/ngsi-ld/v1          the root the serial TPs' bodies reach,
 #                                    e.g. /x/views/all/ngsi-ld/v1 (E2, E4 of
 #                                    surfaces-conformance.md 2.3)
@@ -123,6 +132,12 @@ export STORE DB_IMAGE
 COMPOSE=(docker compose -f compose-files/docker-compose-etsi.yml)
 # The HA overlay moves antares1 behind an LB on 9090; with
 # ROLL_DURING_RUN the replicas roll continuously under the running suite.
+if [ -n "${POLICY:-}" ]; then
+  [ "${HA:-0}" = 1 ] || [ "${ROLES_SPLIT:-0}" = 1 ] || [ "${WASM:-0}" = 1 ] \
+    && { echo "POLICY= owns 9090..9094 with its subject proxy: not with HA, ROLES_SPLIT or WASM"; exit 2; }
+  [ -f "$POLICY" ] || { echo "POLICY=$POLICY: no such file"; exit 2; }
+  COMPOSE+=(-f compose-files/docker-compose-policy.yml)
+fi
 if [ "${ROLES_SPLIT:-0}" = 1 ]; then
   [ "${HA:-0}" = 1 ] && { echo "ROLES_SPLIT=1 and HA=1 are exclusive (both own the LB on 9090)"; exit 2; }
   case "$STORE" in
@@ -270,6 +285,24 @@ for port in 9090 9091 9092 9093 9094; do
   for t in $(seq 1 30); do curl -sf "localhost:$port/q/health" >/dev/null && break || sleep 1; done
   curl -sf "localhost:$port/q/health" >/dev/null || { echo "broker on :$port not healthy"; exit 1; }
 done
+if [ -n "${POLICY:-}" ]; then
+  python3 - "$POLICY" <<'PY' || exit 1
+import json, sys, urllib.request
+spec = json.load(open(sys.argv[1]))
+body = json.dumps(spec["document"]).encode()
+for port in range(9090, 9095):
+    for tenant in spec["tenants"]:
+        req = urllib.request.Request(f"http://localhost:{port}/q/policy/{tenant}", body, method="PUT",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            code = urllib.request.urlopen(req, timeout=10).status
+        except urllib.error.HTTPError as e:
+            sys.exit(f"policy {tenant} on :{port}: HTTP {e.code} {e.read()[:300]!r}")
+        if code not in (201, 204):
+            sys.exit(f"policy {tenant} on :{port}: HTTP {code}")
+print(f"policy {sys.argv[1]} loaded for {len(spec['tenants'])} tenants on 5 brokers")
+PY
+fi
 if [ -n "${VIEWS:-}" ]; then
   for f in "$VIEWS"/*.json; do
     id=$(basename "$f" .json)

@@ -25,6 +25,12 @@ ran and is not in the baseline prints "ratchet: update baseline" and passes.
 A cell named in MQTT_OFF runs with MQTT=0 (dev/etsi-pipeline.sh forces it for
 WASM), so the baseline's MQTT-tagged TPs (robot `--exclude '*mqtt*'`) may be
 absent there. BASELINE overrides the baseline path (the selftest uses it).
+
+EXPECTED=<file> (the policy cells of image-jc.yml, T-4855) names the TPs a
+cell must fail, one `<TP id>  <reason>` per line (`#` comments), the id being
+the first word of the test name: such a TP failing is green, and passing is
+red (the refusal it stands for did not happen). Every other TP is checked as
+above.
 """
 import csv
 import glob
@@ -57,8 +63,28 @@ def run_of(d):
     return None if rows is None else {key(r): r["status"] for r in rows}
 
 
+def expected_failures():
+    """{TP id: reason} from the EXPECTED file, or {} without one."""
+    path = os.environ.get("EXPECTED")
+    if not path:
+        return {}
+    out = {}
+    for line in open(path):
+        tp, _, why = line.strip().partition(" ")
+        if tp and not tp.startswith("#"):
+            if not why.strip():
+                raise SystemExit(f"{path}: {tp} has no reason")
+            out[tp] = why.strip()
+    return out
+
+
+def tp_id(k):
+    return (k.split("::", 1)[-1].split() or ["?"])[0]
+
+
 def check(cells_dir):
     baseline = json.load(open(BASELINE))
+    expected = expected_failures()
     red = []
     for st in STORES:
         base = set(baseline["tps"])
@@ -69,12 +95,15 @@ def check(cells_dir):
             red.append(f"{st}: no tp-status.csv")
             continue
         missing = sorted(base - ran.keys())
-        failed = sorted(k for k, v in ran.items() if v != "PASS")
+        failed = sorted(k for k, v in ran.items() if v != "PASS" and tp_id(k) not in expected)
+        refused = {tp_id(k) for k, v in ran.items() if v != "PASS"} & expected.keys()
         new = sorted(k for k in ran.keys() - base if ran[k] == "PASS")
         for k in missing:
             red.append(f"{st}: did not run: {k}")
         for k in failed:
             red.append(f"{st}: {ran[k]}: {k}")
+        for tp in sorted(expected.keys() - refused):
+            red.append(f"{st}: expected to fail and did not: {tp} ({expected[tp]})")
         for k in new:
             print(f"{st}: ratchet: update baseline: {k} passes and is not in it")
         print(f"{st}: {len(ran)} ran, {len(missing)} missing, {len(failed)} not passing, {len(new)} new")

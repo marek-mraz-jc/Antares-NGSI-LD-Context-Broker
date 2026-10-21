@@ -75,10 +75,34 @@ stays within 5 % (−4.6 % to +3.9 %), and so does every PostgreSQL row at
 entities move further: query +5.9 % and upsert +8.3 % in favour of the
 checks, query-q −41.5 % against them (916 against 536 req/s). The same
 query-q at 100 000 entities moves +2.0 %, so the −41.5 % is not the checks'
-cost on a smaller dataset; it is one sample this run cannot explain, and
-the next run either repeats it or not. The workflow keeps measuring the
+cost on a smaller dataset. The workflow keeps measuring the
 cost: its "checks off" binary is built with
 `CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=false`.
+
+The −41.5 % is the order of the runs (T-4853). Both binaries used one
+database, and the "checks on" rows at 1 000 entities ran after the "checks
+off" rows at 100 000. The unseed deleted those 100 000 Vehicles, and the
+plain `VACUUM` after the next seed marks their pages free without
+shrinking the files: on a local repeat the `entities` table held 1 000 rows
+in 75 MB and the `attr_instances` partition 262 MB with no live row.
+`query` stops at its first 20 Vehicles; `query-q` (`speed>100;brand=="Tesla"`
+matches about one Vehicle in 22) reads on through the empty pages to fill
+its page of 20. The same binary, PostgreSQL store, 1 000 entities, before
+and after a 100 000-entity seed and unseed on one database, read as query-q
+over query so the busy host's own swing cancels (local runs on a shared
+16-vCPU AMD EPYC Genoa sandbox, 2026-10-21, `dev/perf/shapes.sh`):
+
+| run | query req/s | query-q req/s | query-q / query |
+|---|---|---|---|
+| plain `VACUUM`: fresh database | 4 213 | 2 857 | 0.68 |
+| plain `VACUUM`: after the 100 000-entity seed and unseed | 1 926 | 725 | 0.38 |
+| fixed rig (`VACUUM FULL` after the unseed): fresh database | 4 484 | 3 008 | 0.67 |
+| fixed rig: after the 100 000-entity seed and unseed | 4 012 | 2 963 | 0.74 |
+| run 38135751509, "checks off" (first) | 1 547 | 916 | 0.59 |
+| run 38135751509, "checks on" (after "checks off" at 100 000) | 1 638 | 536 | 0.33 |
+
+`shapes.sh` now runs `VACUUM (FULL, ANALYZE)` after each PostgreSQL
+unseed, so a run starts from files the size of its own data.
 
 ## 6. The budget for a surface
 

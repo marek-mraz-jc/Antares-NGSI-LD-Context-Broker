@@ -8,6 +8,7 @@ use crate::hub::{Conn, Hub, Next, Runner};
 use crate::limits::Limits;
 use antares_ops::{Caller, OperationId, OpsRequest};
 use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -30,7 +31,9 @@ tokio::task_local! {
 /// The close codes this surface uses (RFC 6455 7.4.1).
 mod code {
     pub const NORMAL: u16 = 1000;
+    pub const PROTOCOL: u16 = 1002;
     pub const UNSUPPORTED: u16 = 1003;
+    pub const NOT_UTF8: u16 = 1007;
     pub const POLICY: u16 = 1008;
     pub const TOO_BIG: u16 = 1009;
     pub const TRY_AGAIN: u16 = 1013;
@@ -315,6 +318,43 @@ struct Session {
     /// When this socket last renewed the connection's leases.
     renewed: Instant,
     first: bool,
+    /// What the client may still send (W9).
+    rate: Rate,
+}
+
+/// A token bucket over the frames a client sends: `burst` at once, then
+/// `per_sec` a second. It runs before a message is parsed, so a flood of
+/// `x-subscribe`, `x-update` or Pings costs one comparison a frame.
+#[derive(Debug)]
+struct Rate {
+    tokens: f64,
+    at: Instant,
+    per_sec: f64,
+    burst: f64,
+}
+
+impl Rate {
+    fn new(limits: &Limits, now: Instant) -> Self {
+        let burst = f64::from(limits.message_burst);
+        Self {
+            tokens: burst,
+            at: now,
+            per_sec: f64::from(limits.messages_per_sec),
+            burst,
+        }
+    }
+
+    /// Whether one more frame at `now` stays within the bound.
+    fn take(&mut self, now: Instant) -> bool {
+        let earned = now.duration_since(self.at).as_secs_f64() * self.per_sec;
+        self.tokens = (self.tokens + earned).min(self.burst);
+        self.at = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
 }
 
 impl Session {
@@ -357,8 +397,28 @@ impl Session {
         End::Closed(reason)
     }
 
+    /// A frame that breaks RFC 6455 closes with the code 7.4.1 gives it;
+    /// any other read error, a dropped connection included, means the peer
+    /// is gone.
+    async fn broken(&mut self, e: &WsError) -> End {
+        let (code, reason) = match e {
+            WsError::Protocol(p) if !matches!(p, ProtocolError::ResetWithoutClosingHandshake) => {
+                (code::PROTOCOL, "protocol error")
+            }
+            WsError::Utf8(_) => (code::NOT_UTF8, "text is not UTF-8"),
+            WsError::Capacity(_) => (code::TOO_BIG, "message too big"),
+            _ => return End::Gone,
+        };
+        self.close(code, reason).await;
+        End::Closed(reason)
+    }
+
     /// A frame from the client.
     async fn incoming(&mut self, frame: Option<Result<Message, WsError>>) -> Option<End> {
+        if matches!(frame, Some(Ok(_))) && !self.rate.take(Instant::now()) {
+            tracing::warn!(connection = %self.conn.id, tenant = %self.conn.tenant, "websocket client past its message rate");
+            return Some(self.closing(code::POLICY, "rate").await);
+        }
         let text = match frame {
             Some(Ok(Message::Text(t))) => t,
             Some(Ok(Message::Pong(_))) => {
@@ -371,7 +431,13 @@ impl Session {
                     .await;
                 return Some(End::Closed("binary"));
             }
-            Some(Ok(Message::Close(_)) | Err(_)) | None => return Some(End::Gone),
+            Some(Err(e)) => return Some(self.broken(&e).await),
+            Some(Ok(Message::Close(_))) | None => {
+                // tungstenite queued the answering close frame (RFC 6455
+                // 5.5.1); it reaches the client only when flushed.
+                let _flushed = timeout(self.hub.limits.pong_within, self.socket.flush()).await;
+                return Some(End::Gone);
+            }
         };
         self.heard = Instant::now();
         let first = std::mem::take(&mut self.first);
@@ -523,6 +589,7 @@ pub(crate) async fn serve(hub: Arc<Hub>, conn: Arc<Conn>, socket: WebSocket) {
         "websocket opened"
     );
     let now = Instant::now();
+    let rate = Rate::new(&hub.limits, now);
     let mut session = Session {
         hub,
         conn,
@@ -532,6 +599,7 @@ pub(crate) async fn serve(hub: Arc<Hub>, conn: Arc<Conn>, socket: WebSocket) {
         ponged: now,
         renewed: now,
         first: true,
+        rate,
     };
     let end = session.run().await;
     let Session {
@@ -582,6 +650,27 @@ fn linger(hub: Arc<Hub>, conn: Arc<Conn>, generation: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W9: the burst passes, the next frame is refused, and the pace earns
+    /// one frame back; nothing past the burst is saved up.
+    #[test]
+    fn the_message_rate_holds_a_burst_then_the_pace() {
+        let limits = Limits {
+            messages_per_sec: 10,
+            message_burst: 3,
+            ..Limits::default()
+        };
+        let start = Instant::now();
+        let mut rate = Rate::new(&limits, start);
+        assert!((0..3).all(|_| rate.take(start)), "the burst");
+        assert!(!rate.take(start), "one past the burst");
+        let later = start + std::time::Duration::from_millis(100);
+        assert!(rate.take(later), "a tenth of a second earns one frame");
+        assert!(!rate.take(later));
+        let idle = later + std::time::Duration::from_secs(60);
+        assert!((0..3).all(|_| rate.take(idle)));
+        assert!(!rate.take(idle), "idle time saves no more than the burst");
+    }
 
     #[test]
     fn a_subscription_id_is_one_path_segment() {

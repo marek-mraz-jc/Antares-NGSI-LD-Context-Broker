@@ -250,7 +250,7 @@ pub(super) async fn deliver_as(
                     let shown = shown_now(
                         st,
                         tenant,
-                        &rules,
+                        Some(&rules),
                         None,
                         body.get("data").unwrap_or(&Value::Null),
                         ctx,
