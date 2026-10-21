@@ -145,6 +145,9 @@ fn memory_mode_sigkill_loses_everything_by_contract() {
     broker.kill().expect("SIGKILL");
     broker.wait().expect("reap");
 
+    // A fresh port: only the restarted process can answer, never something
+    // still bound to the old one (train 20261021-0800 read a 200 there once).
+    let port = free_port();
     let _broker = start(port, &dir, "memory");
     wait_healthy(port);
     let resp = http(
