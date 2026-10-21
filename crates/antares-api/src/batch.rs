@@ -1221,7 +1221,16 @@ async fn batch_write(
                                     "batch member {id} lost its document"
                                 )));
                             };
+                            let before = doc.clone();
                             merge_into(doc, src, &ts);
+                            // a member that only restates the stored state
+                            // (a parked vehicle, a poll that saw nothing
+                            // new) is no change (4.8, 5.8.3): handing the
+                            // store the document unchanged writes no row,
+                            // version, history point or notification
+                            if same_but_stamps(&before, doc) {
+                                *doc = before;
+                            }
                             Ok::<(), NgsiError>(())
                         })
                         .await?;
@@ -2095,6 +2104,42 @@ async fn batch_query_inner(
     Ok(resp)
 }
 
+/// `a` and `b` hold the same Entity apart from the `modifiedAt` stamps a
+/// merge leaves on the Entity and on each Attribute instance it touched.
+/// Only those two levels are skipped: a `modifiedAt` key inside a value
+/// is data and compares like any other.
+fn same_but_stamps(a: &Value, b: &Value) -> bool {
+    fn without(o: &serde_json::Map<String, Value>) -> impl Iterator<Item = (&String, &Value)> {
+        o.iter().filter(|(k, _)| k.as_str() != "modifiedAt")
+    }
+    fn same_obj(
+        a: &serde_json::Map<String, Value>,
+        b: &serde_json::Map<String, Value>,
+        inner: fn(&Value, &Value) -> bool,
+    ) -> bool {
+        without(a).count() == without(b).count()
+            && without(a).all(|(k, v)| b.get(k).is_some_and(|w| inner(v, w)))
+    }
+    fn instances(a: &Value, b: &Value) -> bool {
+        match (a.as_array(), b.as_array()) {
+            (Some(x), Some(y)) => {
+                x.len() == y.len()
+                    && x.iter()
+                        .zip(y)
+                        .all(|(i, j)| match (i.as_object(), j.as_object()) {
+                            (Some(i), Some(j)) => same_obj(i, j, |v, w| v == w),
+                            _ => i == j,
+                        })
+            }
+            _ => a == b,
+        }
+    }
+    match (a.as_object(), b.as_object()) {
+        (Some(a), Some(b)) => same_obj(a, b, instances),
+        _ => a == b,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// T-3531: a remote error status is taken only when it is one.
@@ -2463,6 +2508,55 @@ mod tests {
             doc["brand"]["value"], "acme",
             "update mode keeps attributes not in the payload: {doc}"
         );
+    }
+
+    /// A member that restates what is stored writes nothing (T-5050): its
+    /// `modifiedAt` stays where the last real change left it, and the next
+    /// real change still lands and moves it.
+    #[tokio::test]
+    async fn an_unchanged_upsert_member_writes_nothing() {
+        let app = app();
+        let id = "urn:ngsi-ld:Vehicle:parked";
+        let v = |speed: i64| {
+            json!([{"id": id, "type": "Vehicle",
+                    "speed": {"type": "Property", "value": speed,
+                              "observedAt": "2026-10-21T18:00:00Z"}}])
+        };
+        let uri = "/ngsi-ld/v1/entityOperations/upsert?options=update";
+        assert_eq!(post(&app, uri, v(0)).await.status(), StatusCode::CREATED);
+        let stamp = |d: &Value| d["modifiedAt"].clone();
+        let first = get_entity(&app, &format!("{id}?options=sysAttrs")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert_eq!(post(&app, uri, v(0)).await.status(), StatusCode::NO_CONTENT);
+        let again = get_entity(&app, &format!("{id}?options=sysAttrs")).await;
+        assert_eq!(stamp(&again), stamp(&first), "no change, no write: {again}");
+        assert_eq!(again["speed"]["modifiedAt"], first["speed"]["modifiedAt"]);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert_eq!(post(&app, uri, v(7)).await.status(), StatusCode::NO_CONTENT);
+        let moved = get_entity(&app, &format!("{id}?options=sysAttrs")).await;
+        assert_eq!(moved["speed"]["value"], 7);
+        assert_ne!(
+            stamp(&moved),
+            stamp(&first),
+            "a real change is written: {moved}"
+        );
+    }
+
+    /// Only the Entity's and the instances' own stamps are skipped; a
+    /// `modifiedAt` inside a value is data.
+    #[test]
+    fn same_but_stamps_skips_only_the_merge_stamps() {
+        let doc = |m: &str, inner: &str| {
+            json!({"id": "urn:x", "type": ["T"], "modifiedAt": m,
+                   "p": [{"type": "Property", "modifiedAt": m,
+                          "value": {"modifiedAt": inner}}]})
+        };
+        assert!(super::same_but_stamps(&doc("1", "a"), &doc("2", "a")));
+        assert!(!super::same_but_stamps(&doc("1", "a"), &doc("1", "b")));
+        let mut more = doc("1", "a");
+        more["q"] = json!([{"type": "Property", "value": 1}]);
+        assert!(!super::same_but_stamps(&doc("1", "a"), &more));
+        assert!(!super::same_but_stamps(&more, &doc("1", "a")));
     }
 
     /// 4.22 + 5.6.9.4 end to end. 5.6.9.4 (PDF p.175): "For each of the

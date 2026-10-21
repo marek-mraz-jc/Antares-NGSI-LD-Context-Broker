@@ -61,6 +61,17 @@ async fn req(st: &AppState, method: &str, path: &str, body: Option<Value>) -> (S
 /// answers the values its history recorded.
 async fn recorded(st: &AppState, id: &str, attr: &str, writes: &[(Value, u32)]) -> Vec<Value> {
     let at = |m: u32| format!("2026-10-18T{:02}:{:02}:00Z", 7 + m / 60, m % 60);
+    recorded_at(st, id, attr, writes, at).await
+}
+
+/// [`recorded`] with the instants `at` makes of each write's number.
+async fn recorded_at(
+    st: &AppState,
+    id: &str,
+    attr: &str,
+    writes: &[(Value, u32)],
+    at: impl Fn(u32) -> String,
+) -> Vec<Value> {
     let (first, m0) = &writes[0];
     let (s, b) = req(
         st,
@@ -133,6 +144,26 @@ async fn on_change_records_a_change_and_a_heartbeat_and_nothing_in_between() {
     ];
     let rows = recorded(&st, "urn:ngsi-ld:Spot:status", "status", &writes).await;
     assert_eq!(rows, [json!("free"), json!("occupied"), json!("occupied")]);
+}
+
+/// T-5046's Vehicle rule: a writer of every second whose value moves every
+/// second, under a 30 s heartbeat and a deadband no real move crosses,
+/// leaves one history row per 30 s (T-5050).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_second_writer_records_one_row_per_30_seconds() {
+    let st = state(Some(Recording {
+        default: Some(OnChange {
+            heartbeat: Duration::from_secs(30),
+            deadband: Some(1e6),
+            min_distance: None,
+        }),
+        ..Default::default()
+    }))
+    .await;
+    let writes: Vec<(Value, u32)> = (0..=90).map(|s| (json!(s), s)).collect();
+    let at = |s: u32| format!("2026-10-18T07:{:02}:{:02}Z", s / 60, s % 60);
+    let rows = recorded_at(&st, "urn:ngsi-ld:Spot:speed", "speed", &writes, at).await;
+    assert_eq!(rows, [json!(0), json!(30), json!(60), json!(90)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

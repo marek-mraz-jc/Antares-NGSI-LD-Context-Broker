@@ -46,8 +46,10 @@ apply as on HTTP, and the body is the HTTP sink's for the same change
 
 Each connection has one queue of `ANTARES_WS_QUEUE` notifications. A
 single-entity notification without `showChanges` replaces the queued one
-for the same Subscription and Entity; with `showChanges` every change is
-its own notification. A consumer that falls past the queue gets `x-gap`
+for the same Subscription and Entity, and then says so: its metadata
+carries `x-coalesced`, the number of changes it replaced. A consumer that
+keeps up has nothing queued and receives every change, one notification
+each; with `showChanges` every change is its own notification. A consumer that falls past the queue gets `x-gap`
 and is closed with 1013; a peer that does not take a write within the
 pong window is closed too. Nothing is buffered without bound.
 

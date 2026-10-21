@@ -71,6 +71,8 @@ struct Queued {
     sub: String,
     entity: Option<String>,
     coalescible: bool,
+    /// Earlier notifications this one replaced (`x-coalesced`).
+    merged: u64,
     text: String,
 }
 
@@ -148,13 +150,13 @@ impl Conn {
                     .position(|q| q.coalescible && q.sub == n.subscription && q.entity == n.entity)
             })
             .flatten();
-        let seq = into
-            .and_then(|i| st.queue.get(i))
-            .map_or(st.next_seq.max(1), |q| q.seq);
+        let queued = into.and_then(|i| st.queue.get(i));
+        let seq = queued.map_or(st.next_seq.max(1), |q| q.seq);
+        let merged = queued.map_or(0, |q| q.merged.saturating_add(1));
         // rendered once, with the seq it takes; the cap is judged as if the
         // seq had the most digits a u64 has, so a text at the cap stays
         // under it whatever seq it gets
-        let text = envelope::notification(&n.rendered, seq, &n.subscription);
+        let text = envelope::notification(&n.rendered, seq, &n.subscription, merged);
         if text
             .len()
             .saturating_add(U64_MAX_DIGITS.saturating_sub(digits(seq)))
@@ -164,6 +166,7 @@ impl Conn {
         }
         if let Some(q) = into.and_then(|i| st.queue.get_mut(i)) {
             q.text = text;
+            q.merged = merged;
             return Answer::Queued;
         }
         st.next_seq = seq.saturating_add(1);
@@ -184,6 +187,7 @@ impl Conn {
             sub: n.subscription,
             entity: n.entity,
             coalescible,
+            merged,
             text,
         });
         drop(st);
