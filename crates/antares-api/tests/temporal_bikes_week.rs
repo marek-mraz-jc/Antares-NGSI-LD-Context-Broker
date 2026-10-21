@@ -10,7 +10,7 @@
 //! through the memory store as well costs minutes, since that store scans an
 //! Entity's whole history on each append.
 
-use antares_api::{AppState, OnChange, Recording};
+use antares_api::{AppState, OnChange, RecordMode, Recording};
 use antares_sql::store::any::AnyStore;
 use antares_sql::store::Store;
 use antares_store::TemporalDriver;
@@ -235,11 +235,11 @@ fn held_truth(column: usize, t: DateTime<Utc>) -> Value {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_station_week_on_change_answers_as_every_from_far_fewer_rows() {
-    let hour = Some(OnChange {
+    let hour = Some(RecordMode::OnChange(OnChange {
         heartbeat: std::time::Duration::from_secs(3600),
         deadband: None,
         min_distance: None,
-    });
+    }));
     let (changed, rows) = replayed(Some(Recording {
         default: hour,
         attributes: Default::default(),

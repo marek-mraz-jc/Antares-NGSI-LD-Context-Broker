@@ -58,7 +58,7 @@ fn every_server_message_the_crate_builds_is_described() -> Result<(), String> {
         envelope::result(None, 204, None),
         envelope::result(Some("2"), 400, Some(envelope::bad_request("no"))),
         envelope::result(Some("3"), 404, Some(envelope::not_found())),
-        envelope::notification(&rendered, 1, "urn:ngsi-ld:Subscription:1"),
+        envelope::notification(&rendered, 1, "urn:ngsi-ld:Subscription:1", 0),
         envelope::gap(2, 9),
         // every reason the socket closes with (socket.rs)
         envelope::closing("lifetime"),

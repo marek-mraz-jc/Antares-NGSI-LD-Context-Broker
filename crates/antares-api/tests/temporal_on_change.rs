@@ -4,7 +4,7 @@
 //! writes one when the value moves past its deadband or minimum distance,
 //! when a value of the same instant is corrected, and once per heartbeat.
 
-use antares_api::{AppState, OnChange, Recording};
+use antares_api::{AppState, OnChange, RecordMode, Recording};
 use antares_sql::store::any::AnyStore;
 use antares_sql::store::Store;
 use axum::body::Body;
@@ -61,6 +61,17 @@ async fn req(st: &AppState, method: &str, path: &str, body: Option<Value>) -> (S
 /// answers the values its history recorded.
 async fn recorded(st: &AppState, id: &str, attr: &str, writes: &[(Value, u32)]) -> Vec<Value> {
     let at = |m: u32| format!("2026-10-18T{:02}:{:02}:00Z", 7 + m / 60, m % 60);
+    recorded_at(st, id, attr, writes, at).await
+}
+
+/// [`recorded`] with the instants `at` makes of each write's number.
+async fn recorded_at(
+    st: &AppState,
+    id: &str,
+    attr: &str,
+    writes: &[(Value, u32)],
+    at: impl Fn(u32) -> String,
+) -> Vec<Value> {
     let (first, m0) = &writes[0];
     let (s, b) = req(
         st,
@@ -97,12 +108,12 @@ async fn recorded(st: &AppState, id: &str, attr: &str, writes: &[(Value, u32)]) 
     rows.iter().map(|r| r["value"].clone()).collect()
 }
 
-fn on_change(heartbeat_minutes: u64, deadband: Option<f64>) -> Option<OnChange> {
-    Some(OnChange {
+fn on_change(heartbeat_minutes: u64, deadband: Option<f64>) -> Option<RecordMode> {
+    Some(RecordMode::OnChange(OnChange {
         heartbeat: Duration::from_secs(heartbeat_minutes * 60),
         deadband,
         min_distance: None,
-    })
+    }))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -133,6 +144,26 @@ async fn on_change_records_a_change_and_a_heartbeat_and_nothing_in_between() {
     ];
     let rows = recorded(&st, "urn:ngsi-ld:Spot:status", "status", &writes).await;
     assert_eq!(rows, [json!("free"), json!("occupied"), json!("occupied")]);
+}
+
+/// T-5046's Vehicle rule: a writer of every second whose value moves every
+/// second, under a 30 s heartbeat and a deadband no real move crosses,
+/// leaves one history row per 30 s (T-5050).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_second_writer_records_one_row_per_30_seconds() {
+    let st = state(Some(Recording {
+        default: Some(RecordMode::OnChange(OnChange {
+            heartbeat: Duration::from_secs(30),
+            deadband: Some(1e6),
+            min_distance: None,
+        })),
+        ..Default::default()
+    }))
+    .await;
+    let writes: Vec<(Value, u32)> = (0..=90).map(|s| (json!(s), s)).collect();
+    let at = |s: u32| format!("2026-10-18T07:{:02}:{:02}Z", s / 60, s % 60);
+    let rows = recorded_at(&st, "urn:ngsi-ld:Spot:speed", "speed", &writes, at).await;
+    assert_eq!(rows, [json!(0), json!(30), json!(60), json!(90)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -297,4 +328,56 @@ async fn a_held_attribute_fills_no_period_past_now_and_refuses_too_many() {
         "{doc}"
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// T-5056: under `ANTARES_TEMPORAL_RECORD=ruled` a type no retention rule
+/// opts in keeps no history, and its temporal Entity answers empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn ruled_keeps_no_history_for_a_type_no_rule_opts_in() {
+    let store = Arc::new(AnyStore::Mem(Store::default()));
+    let mut st = AppState::with_drivers("me".into(), store.clone(), store, "memory");
+    // before wire: the write path records through the state wire hands it
+    st.temporal_record = antares_api::TemporalRecord::Ruled;
+    antares_api::wire(&mut st).await;
+    let writes = [(json!(1), 0), (json!(2), 1), (json!(3), 2)];
+    let rows = recorded(&st, "urn:ngsi-ld:Spot:off", "occupancy", &writes).await;
+    assert!(rows.is_empty(), "{rows:?}");
+    let (s, doc) = req(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Spot:none",
+        None,
+    )
+    .await;
+    assert_eq!(s, 404, "an Entity that does not exist stays a 404: {doc}");
+    st.history_off.write().expect("rules").ruled.insert((
+        antares_model::TenantId::default().as_str().to_owned(),
+        format!("{CORE}Spot"),
+    ));
+    let rows = recorded(&st, "urn:ngsi-ld:Spot:on", "occupancy", &writes).await;
+    assert_eq!(
+        rows,
+        [json!(1), json!(2), json!(3)],
+        "a rule's duration opts in"
+    );
+}
+
+/// T-5056: `record: observed` adds a row only for a newer `observedAt`; a
+/// value re-sent or changed under its old `observedAt` adds nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn observed_records_a_row_per_new_observation_only() {
+    let st = state(Some(Recording {
+        default: Some(RecordMode::Observed),
+        ..Default::default()
+    }))
+    .await;
+    let writes = [
+        (json!(5), 0),
+        (json!(5), 0),
+        (json!(6), 0),
+        (json!(6), 1),
+        (json!(7), 1),
+    ];
+    let rows = recorded(&st, "urn:ngsi-ld:Spot:obs", "occupancy", &writes).await;
+    assert_eq!(rows, [json!(5), json!(6)], "one row per observedAt");
 }

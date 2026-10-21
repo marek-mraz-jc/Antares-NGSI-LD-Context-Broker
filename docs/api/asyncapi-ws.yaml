@@ -240,6 +240,10 @@ components:
               x-op: { const: x-notification }
               x-seq: { type: integer, minimum: 1 }
               x-subscription: { type: string, format: uri }
+              x-coalesced:
+                type: integer
+                minimum: 1
+                description: Present when this notification replaced that many queued, unsent ones of the same Entity (back-pressure, ADR-0026 rule 6); the replaced changes are not delivered.
             additionalProperties:
               type: string
           body: { $ref: '#/components/schemas/Notification' }

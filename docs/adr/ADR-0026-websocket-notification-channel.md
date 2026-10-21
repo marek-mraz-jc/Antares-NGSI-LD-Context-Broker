@@ -176,6 +176,7 @@ and filter in the gateway (the duplicate filter T-4755 removes).
 | `x-connection` | `x-welcome` | the connection id, so the client can recognise its endpoint URI |
 | `x-resume-token` | `x-welcome` | 256 random bits; with `x-connection` it is the only way to resume |
 | `x-seq` | `x-notification` | per-connection sequence, `u64`, from 1, no gaps on one connection |
+| `x-coalesced` | `x-notification` | present only on a coalesced notification: how many queued, unsent notifications of the same Entity it replaced (rule 6); those changes are not delivered |
 | `x-subscription` | `x-notification` | the Subscription id (also in the body's `subscriptionId`; repeated so a client can route without parsing the body) |
 | `x-gap` | server message | notifications from `x-from` to `x-to` are lost; re-read with Query Entities |
 | `x-closing` | server message | sent before the server closes; `x-reason` is `lifetime`, `overflow`, `view-removed`, `shutdown`, `idle` or `rate` |
@@ -212,7 +213,11 @@ Not adopted:
 - Coalescing: when a queued, not yet written notification of the same
   Subscription carries exactly one Entity with the same id as the new
   one, and the Subscription has no `showChanges`, the queued one is
-  replaced by the new one. Nothing else is coalesced: `showChanges`
+  replaced by the new one, which carries `x-coalesced` with the count of
+  notifications it replaced (amended 2026-10-21, T-5050: a subscriber of
+  per-second changes must see that it missed some). A consumer that keeps
+  up finds nothing queued and gets every change; coalescing happens only
+  under back-pressure. Nothing else is coalesced: `showChanges`
   makes each `previousValue` meaningful, and a multi-Entity
   notification is not split.
 - Overflow: the queue full after coalescing closes the connection with

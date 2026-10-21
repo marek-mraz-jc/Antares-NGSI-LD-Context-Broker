@@ -4,7 +4,7 @@
 //! (ADR-N-054 2.5), and so does a temporal Scope (4.18, annex C.5.16).
 
 use super::*;
-use crate::state::{OnChange, Recording};
+use crate::state::{OnChange, RecordMode, Recording};
 
 const DEFAULT: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
 
@@ -33,11 +33,11 @@ async fn a_window_takes_its_datasets_and_carries_in_what_held_at_its_start() {
     let mut level = Recording::default();
     level.attributes.insert(
         format!("{DEFAULT}level"),
-        Some(OnChange {
+        Some(RecordMode::OnChange(OnChange {
             heartbeat: std::time::Duration::from_secs(3600),
             deadband: None,
             min_distance: None,
-        }),
+        })),
     );
     st.history_off
         .write()
