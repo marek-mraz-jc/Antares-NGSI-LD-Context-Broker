@@ -339,6 +339,53 @@ mod paging_store {
         }
     }
 
+    /// T-5088: a geoquery the store narrows but cannot decide reads the
+    /// candidates its page needs, in id order, where one flat read took up
+    /// to the store's undecided ceiling for a page of 20; the page is still
+    /// exact.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_geoquery_page_reads_the_candidates_of_its_page() {
+        let Some((mut st, tenant)) = pg_state(1000, "boundedgeo").await else {
+            return;
+        };
+        for i in 1..=12 {
+            let body = json!({"id": format!("urn:ngsi-ld:Vehicle:g{i:02}"), "type": "Vehicle",
+                "location": {"type": "GeoProperty",
+                    "value": {"type": "Point", "coordinates": [f64::from(i) * 0.001, 0.0]}}})
+            .to_string();
+            let (status, _, b) =
+                send_t(&st, &tenant, "POST", "/ngsi-ld/v1/entities", Some(body)).await;
+            assert_eq!(status, StatusCode::CREATED, "{b}");
+        }
+        let spy = Arc::new(Double::passthrough(st.store.clone()));
+        st.store = spy.clone();
+        let (status, _, body) = send_t(
+            &st,
+            &tenant,
+            "GET",
+            "/ngsi-ld/v1/entities?type=Vehicle&georel=near%3BmaxDistance%3D%3D100000\
+             &geometry=Point&coordinates=%5B0,0%5D&limit=2&offset=4",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ids: Vec<&str> = body
+            .as_array()
+            .map(|a| a.iter().filter_map(|e| e["id"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(ids, ["urn:ngsi-ld:Vehicle:g05", "urn:ngsi-ld:Vehicle:g06"]);
+        // the window and one match past it: 7 of the 12 candidates
+        assert_eq!(spy.rows_read(), 7, "the page read every candidate");
+        for doc in st.store.list(&tenant, Kind::Entity).await.expect("list") {
+            if let Some(id) = doc["id"].as_str() {
+                st.store
+                    .delete(&tenant, Kind::Entity, id)
+                    .await
+                    .expect("clean");
+            }
+        }
+    }
+
     /// 5.14.4.4: the candidate ids are the query's matches, and an idPattern
     /// is applied after the store answers — so a chunk can come back with
     /// nothing in it while every match is still waiting behind it.

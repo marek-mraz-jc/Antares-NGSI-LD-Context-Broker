@@ -233,6 +233,16 @@ impl Double {
     }
 
     /// The connection pool gave up before this call could start.
+    /// The pool wall, then the counters a store read moves.
+    fn saw_query(&self, f: &antares_store::filter::EntityFilter<'_>) -> Result<(), NgsiError> {
+        self.pool_wall()?;
+        if f.page.is_none() {
+            self.unpaged_queries.fetch_add(1, Ordering::SeqCst);
+        } else if !f.geo.is_empty() {
+            self.geo_paged.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
     fn pool_wall(&self) -> Result<(), NgsiError> {
         if self.overloaded {
             return Err(NgsiError::InternalError(
@@ -391,13 +401,18 @@ impl CurrentStateDriver for Double {
         tenant: &TenantId,
         f: &antares_store::filter::EntityFilter<'_>,
     ) -> Result<antares_store::filter::QueryOutcome, NgsiError> {
-        self.pool_wall()?;
-        if f.page.is_none() {
-            self.unpaged_queries.fetch_add(1, Ordering::SeqCst);
-        } else if !f.geo.is_empty() {
-            self.geo_paged.fetch_add(1, Ordering::SeqCst);
-        }
+        self.saw_query(f)?;
         let out = self.inner.query_entities(tenant, f).await?;
+        self.rows_read.fetch_add(out.rows.len(), Ordering::SeqCst);
+        Ok(out)
+    }
+    async fn query_candidates(
+        &self,
+        tenant: &TenantId,
+        f: &antares_store::filter::EntityFilter<'_>,
+    ) -> Result<antares_store::filter::QueryOutcome, NgsiError> {
+        self.saw_query(f)?;
+        let out = self.inner.query_candidates(tenant, f).await?;
         self.rows_read.fetch_add(out.rows.len(), Ordering::SeqCst);
         Ok(out)
     }
