@@ -21,6 +21,13 @@ Mount it with `ANTARES_API_SURFACES=admin,views,sta`. The sets are
 and its reasons are `docs/analysis/sta-mapping.md` (T-4462). `HEAD` answers
 like `GET` without the body; every other method is `405` with `Allow`.
 
+The `{id}` of a link is the id as an OData key literal (a quote written
+twice), percent-encoded but for the unreserved characters, `:` and the
+quote: `Datastreams('urn:ngsi-ld:Car:1%2FNO2%23urn:ngsi-ld:Dataset:a')`.
+Every `@iot.selfLink`, `@iot.navigationLink` and `@iot.nextLink` is written
+so; a request may send the key encoded or not, as the path is decoded once
+before the key is read.
+
 ## 1. What a set holds
 
 Every set reads the view's Query Entities, naming the types the view shows,

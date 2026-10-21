@@ -22,6 +22,7 @@ A request names its Tenant once, in `NGSILD-Tenant`, and `antares_api::negotiate
 | CurrentStateDriver | `commit_queue` | tenant-free by design | metric: the group-commit queue depth |
 | CurrentStateDriver | `outbox_ack` | cross-Tenant by design | acks the `seq` values `outbox_peek` handed out; Postgres runs it under the service role; `outbox_retain` and `outbox_event` take the Tenant |
 | CurrentStateDriver | `outbox_peek` | cross-Tenant by design | the outbox relay drains every Tenant; each row is `(seq, tenant, event)` and is dispatched under its own Tenant |
+| CurrentStateDriver | `history_overrides` | cross-Tenant by design | DM-97 retention loop: Entities with a `historyRetention` Property across Tenants, each row with its Tenant (Postgres: service role); no route reaches it (T-5012) |
 | CurrentStateDriver | `ping` | tenant-free by design | readiness probe |
 | CurrentStateDriver | `set_change_hook` | tenant-free by design | installs the change feed at boot; the hook receives `(tenant, before, after)` |
 | CurrentStateDriver | `set_outbox` | tenant-free by design | boot switch |
@@ -30,6 +31,7 @@ A request names its Tenant once, in `NGSILD-Tenant`, and `antares_api::negotiate
 | CurrentStateDriver | `tenant_ids` | cross-Tenant by design | `/q/tenants`, behind the admin secret, names only |
 | CurrentStateDriver | `version_info` | tenant-free by design | `/q/health` versions |
 | TemporalDriver | `close` | tenant-free by design | lifecycle |
+| TemporalDriver | `drop_retained_history` | Tenant inside the argument | T-4906 retention by partition: `floors` are `(tenant, cut)` pairs and a slice holding a row of another Tenant stays; retention loop only (T-5012) |
 | TemporalDriver | `event_list` | Tenant inside the argument | every `TemporalEvent` carries `tenant`; the default fold groups consecutive events by `(tenant, entity_id)`; the isolation contract drains one event as `a` and checks `b`'s history |
 | TemporalDriver | `ping` | tenant-free by design | readiness probe |
 | TemporalDriver | `q_pushdown_exact` | tenant-free by design | a capability question about a `q` expression, reads no row |
@@ -50,6 +52,7 @@ A new driver method without a Tenant turns the invariant red until it is classif
 | `GET /q/tenants/{}` | `tenant_get` | admin secret; the path segment, `TenantId::new` |
 | `DELETE /q/tenants/{}` | `tenant_purge` | the same |
 | `POST /ex/v1/remote-notify` | `distsub::remote_notify` | the broker's own inbound index under the peer's random `subscriptionId` (ADR-0019), never the request |
+| `ANY /x/views/{}/ngsi-ld/v1/{}` | `antares_views::serve` | the view's own Tenant: `ViewOps::run_unmapped` sets it, refuses another or a doubled one with 400, and the inner route reads it with `tenant_from` (`views_decision.rs`, T-5012) |
 
 What cg cannot express: data flow. The statement proves that a route calls the one header reader, not that the value it returns is the one handed to the store, and a route that read the header and then built a second `TenantId` from the body would pass. The driver contract below and the per-route tests in `antares-api` back the property where the graph stops. Work the broker starts itself (the notification sweep, the outbox relay, the mirror hydration) reaches no HTTP route; it takes its Tenant from the rows it walks (`subscription_tenants`, the outbox row), as section 2 lists.
 
