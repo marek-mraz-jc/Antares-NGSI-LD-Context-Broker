@@ -313,13 +313,14 @@ pub(crate) fn records_on_change(st: &AppState, tenant: &TenantId) -> bool {
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .recording
-        .keys()
-        .any(|(t, _)| t == tenant.as_str())
+        .iter()
+        .any(|((t, _), r)| t == tenant.as_str() && r.has_on_change())
 }
 
 /// Gate 4 (T-4665, ADR-N-054 2.2): whether an instance of `attr`, changed
-/// on the Entity `entity` with `types` in `tenant`, writes a row. `every`
-/// (no rule) always does; `onChange` when its value moved past the
+/// on the Entity `entity` with `types` in `tenant`, writes a row. With no
+/// rule the mode is `every`, or `observed` under `ruled` (T-5056). `every`
+/// always does, `never` never; `onChange` when its value moved past the
 /// deadband or minimum distance since the attribute's last row, when it
 /// differs at all from a row of the same `observedAt` (a correction), when
 /// it is older than that row (a backfill), or once the heartbeat passed.
@@ -334,14 +335,16 @@ pub(crate) fn admits_change(
     before: Option<&Value>,
     instance: &Value,
 ) -> bool {
+    let default = if st.temporal_record == crate::state::TemporalRecord::Ruled {
+        RecordMode::Observed
+    } else {
+        RecordMode::Every
+    };
     let mode = {
         let rules = st
             .history_off
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if rules.recording.is_empty() {
-            return true;
-        }
         types.iter().find_map(|t| {
             rules
                 .recording
@@ -349,10 +352,11 @@ pub(crate) fn admits_change(
                 .and_then(|r| r.of(attr))
         })
     };
-    let mode = match mode {
-        None => return true,
-        Some(RecordMode::Observed) => return newly_observed(before, instance),
-        Some(RecordMode::OnChange(mode)) => mode,
+    let mode = match mode.unwrap_or(default) {
+        RecordMode::Every => return true,
+        RecordMode::Never => return false,
+        RecordMode::Observed => return newly_observed(before, instance),
+        RecordMode::OnChange(mode) => mode,
     };
     let at = observed_at(instance).unwrap_or_else(chrono::Utc::now);
     let payload = payload_of(instance);

@@ -384,3 +384,78 @@ fn observed_writes_a_row_only_for_a_newer_observed_at() {
         "an observed attribute is no held level"
     );
 }
+
+/// T-5056 (owner 2026-10-21): under `ruled` an opted-in type records
+/// `observed` unless its rule says otherwise, and `never` records nothing.
+#[test]
+fn ruled_records_observed_by_default_and_never_nothing() {
+    let mut st = state();
+    st.temporal_record = TemporalRecord::Ruled;
+    let tn = "history-ruled-default";
+    let t = TenantId::new(tn).expect("tenant");
+    let ty = ["https://x/Dock"];
+    let old = level(3.0, "2026-01-01T00:00:00Z");
+    let was = json!([old.clone()]);
+    assert!(
+        !admits_change(
+            &st,
+            &t,
+            &ty,
+            "urn:d",
+            LEVEL,
+            Some(&was),
+            &level(4.0, "2026-01-01T00:00:00Z")
+        ),
+        "no rule names a mode: observed, and the observedAt is not new"
+    );
+    assert!(admits_change(
+        &st,
+        &t,
+        &ty,
+        "urn:d",
+        LEVEL,
+        Some(&was),
+        &level(4.0, "2026-01-01T00:01:00Z")
+    ));
+    st.history_off.write().expect("rules").recording.insert(
+        (tn.to_owned(), ty[0].to_owned()),
+        Recording {
+            default: Some(RecordMode::Every),
+            attributes: [("https://x/dateModified".to_owned(), Some(RecordMode::Never))]
+                .into_iter()
+                .collect(),
+        },
+    );
+    assert!(
+        admits_change(
+            &st,
+            &t,
+            &ty,
+            "urn:d",
+            LEVEL,
+            Some(&was),
+            &level(4.0, "2026-01-01T00:00:00Z")
+        ),
+        "every, as the rule says"
+    );
+    assert!(!admits_change(
+        &st,
+        &t,
+        &ty,
+        "urn:d",
+        "https://x/dateModified",
+        None,
+        &level(1.0, "2026-01-01T00:02:00Z")
+    ));
+    assert!(!records_on_change(&st, &t), "no attribute records onChange");
+    st.temporal_record = TemporalRecord::All;
+    assert!(admits_change(
+        &st,
+        &TenantId::new("history-ruled-other").expect("tenant"),
+        &ty,
+        "urn:d",
+        LEVEL,
+        Some(&was),
+        &old
+    ));
+}

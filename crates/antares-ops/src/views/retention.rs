@@ -74,7 +74,8 @@ struct RuleDoc {
     #[serde(default)]
     history: Option<String>,
     /// How the type records history (T-4665, ADR-N-054 2.2): `every`,
-    /// `observed` (T-5056) or `onChange`, with the three settings after it.
+    /// `observed`, `never` (T-5056) or `onChange`, with the three settings
+    /// after it.
     #[serde(default)]
     record: Option<String>,
     #[serde(default)]
@@ -115,8 +116,8 @@ struct RecordDoc {
 }
 
 impl RecordDoc {
-    /// `Ok(None)` for `every`, `Ok(Some)` for `observed` and `onChange`;
-    /// the reason a setting is out of place otherwise.
+    /// `Ok(None)` when unset, the mode it names otherwise; the reason a
+    /// setting is out of place.
     fn parse(&self) -> Result<Option<antares_api::RecordMode>, String> {
         let bound = |name: &str, v: Option<f64>| match v {
             // JSON carries no NaN or infinity, so the sign is the whole check
@@ -135,20 +136,23 @@ impl RecordDoc {
                     min_distance: bound("minDistance", self.min_distance)?,
                 },
             ))),
-            None | Some("every" | "observed") => {
+            None | Some("every" | "observed" | "never") => {
                 if self.heartbeat.is_some()
                     || self.deadband.is_some()
                     || self.min_distance.is_some()
                 {
                     Err("heartbeat, deadband and minDistance belong to record onChange".into())
-                } else if self.record.as_deref() == Some("observed") {
-                    Ok(Some(antares_api::RecordMode::Observed))
                 } else {
-                    Ok(None)
+                    Ok(match self.record.as_deref() {
+                        Some("every") => Some(antares_api::RecordMode::Every),
+                        Some("observed") => Some(antares_api::RecordMode::Observed),
+                        Some("never") => Some(antares_api::RecordMode::Never),
+                        _ => None,
+                    })
                 }
             }
             Some(other) => Err(format!(
-                "record {other:?} is none of every, observed and onChange"
+                "record {other:?} is none of every, observed, never and onChange"
             )),
         }
     }
@@ -242,10 +246,12 @@ pub fn parse(body: &[u8]) -> Result<Vec<Rule>, String> {
                 if !attr.contains(':') || attr.contains(char::is_whitespace) {
                     return Err(format!("attribute {attr:?} is not an expanded IRI"));
                 }
-                recording.attributes.insert(attr.clone(), doc.parse()?);
+                // a setting without `record` takes the type's
+                if let Some(mode) = doc.parse()? {
+                    recording.attributes.insert(attr.clone(), Some(mode));
+                }
             }
-            let records_on_change =
-                recording.default.is_some() || recording.attributes.values().any(Option::is_some);
+            let names_a_mode = recording.default.is_some() || !recording.attributes.is_empty();
             let word = r
                 .history
                 .as_deref()
@@ -260,7 +266,7 @@ pub fn parse(body: &[u8]) -> Result<Vec<Rule>, String> {
                     .transpose()?,
                 history_off: word == Some("off"),
                 history_forever: word == Some("forever"),
-                recording: records_on_change.then_some(recording),
+                recording: names_a_mode.then_some(recording),
                 type_iri: r.type_iri,
             })
         })
@@ -1106,7 +1112,10 @@ mod tests {
             spot.of("https://e.org/status"),
             on_change(3600, Some(1.0), None)
         );
-        assert_eq!(spot.of("https://e.org/count"), None, "every");
+        assert_eq!(
+            spot.of("https://e.org/count"),
+            Some(antares_api::RecordMode::Every)
+        );
         assert_eq!(
             spot.of("https://e.org/location"),
             on_change(900, None, Some(5.0))
@@ -1123,7 +1132,21 @@ mod tests {
             dock.of("https://e.org/free"),
             Some(antares_api::RecordMode::Observed)
         );
-        assert_eq!(dock.of("https://e.org/name"), None, "every");
+        assert_eq!(
+            dock.of("https://e.org/name"),
+            Some(antares_api::RecordMode::Every)
+        );
+        let never = parse(
+            br#"{"rules":[{"type":"https://e.org/Dock","history":"P7D",
+                 "attributes":{"https://e.org/dateModified":{"record":"never"},"https://e.org/x":{}}}]}"#,
+        )
+        .expect("never");
+        let dock = never[0].recording.as_ref().expect("never");
+        assert_eq!(
+            dock.of("https://e.org/dateModified"),
+            Some(antares_api::RecordMode::Never)
+        );
+        assert_eq!(dock.of("https://e.org/x"), None, "unset takes the type's");
         assert!(parse(
             br#"{"rules":[{"type":"https://e.org/V","record":"observed","heartbeat":"PT1H"}]}"#
         )

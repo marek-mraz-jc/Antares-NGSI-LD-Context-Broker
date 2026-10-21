@@ -59,9 +59,10 @@ A type's retention rule may record history `onChange` instead of every
 write ([Retention](admin-api.md#retention)): a row only when the value
 moves past its `deadband` (numbers) or `minDistance` (metres, GeoProperty),
 when a value of the same instant is corrected, and once per `heartbeat`;
-or `observed`: a row only for a newer `observedAt`. With
+or `observed`: a row only for a newer `observedAt`; or `never`. With
 `ANTARES_TEMPORAL_RECORD=ruled` a type records nothing until a retention
-rule gives it a history duration (T-5056).
+rule gives it a history duration, and then `observed` unless the rule names
+another mode (T-5056).
 
 ## Querying
 

@@ -63,10 +63,15 @@ pub struct OnChange {
     pub min_distance: Option<f64>,
 }
 
-/// How an attribute records history other than `every` (a row per changed
-/// instance).
+/// How an attribute records history. Unset, it is `every` (a row per
+/// changed instance), and `observed` under `ANTARES_TEMPORAL_RECORD=ruled`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RecordMode {
+    /// `every`: a row per changed instance.
+    Every,
+    /// `never` (T-5056): no row, for a bookkeeping attribute such as
+    /// `dateModified`.
+    Never,
     /// `onChange` (T-4665): a row when the value moved or the heartbeat passed.
     OnChange(OnChange),
     /// `observed` (T-5056): a row only for an instance whose `observedAt` is
@@ -75,8 +80,8 @@ pub enum RecordMode {
     Observed,
 }
 
-/// How one type records history: `None` is `every` (a row per write with a
-/// new `observedAt`), for the type and per expanded attribute.
+/// How one type records history, for the type and per expanded attribute:
+/// `None` takes the broker's default ([`RecordMode`]).
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Recording {
     pub default: Option<RecordMode>,
@@ -88,6 +93,14 @@ impl Recording {
     #[must_use]
     pub fn of(&self, attr: &str) -> Option<RecordMode> {
         self.attributes.get(attr).copied().unwrap_or(self.default)
+    }
+
+    /// Whether some attribute records `onChange`.
+    #[must_use]
+    pub fn has_on_change(&self) -> bool {
+        std::iter::once(&self.default)
+            .chain(self.attributes.values())
+            .any(|m| matches!(m, Some(RecordMode::OnChange(_))))
     }
 }
 
