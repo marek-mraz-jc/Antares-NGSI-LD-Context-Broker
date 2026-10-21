@@ -265,6 +265,19 @@ impl AnyStore {
         }
     }
 
+    /// Asynchronous commit for the batch writes (ANTARES_PG_BATCH_ASYNC_COMMIT,
+    /// T-5050). The memory arm has no commit to relax.
+    pub fn set_async_batch_commit(
+        &self,
+        #[cfg_attr(not(feature = "postgres"), allow(unused_variables))] on: bool,
+    ) {
+        match self {
+            AnyStore::Mem(_) => {}
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.entities.set_async_batch_commit(on),
+        }
+    }
+
     /// Outbox drain: oldest-first page of pending rows `(seq, tenant, event)`.
     pub async fn outbox_peek(
         &self,

@@ -129,6 +129,8 @@ const KNOWN_KEYS: &[&str] = &[
     // Postgres pool size (max connections); default 20.
     "ANTARES_PG_POOL",
     "ANTARES_PG_STATEMENT_TIMEOUT_MS",
+    // batch writes commit with synchronous_commit = off (T-5050); default off.
+    "ANTARES_PG_BATCH_ASYNC_COMMIT",
     // bus=local over a shared postgres/timescale store is refused — every
     // replica would run its own matcher and fire its own copy of each
     // notification. This opt-in states the deployment runs exactly ONE
@@ -428,6 +430,27 @@ fn parse_pg_statement_timeout(raw: Option<&str>) -> Result<std::time::Duration, 
                 "ANTARES_PG_STATEMENT_TIMEOUT_MS must be a positive integer (got {v:?})"
             )),
         },
+    }
+}
+
+/// ANTARES_PG_BATCH_ASYNC_COMMIT → batch writes commit asynchronously
+/// (T-5050): absent or an off value = no; `1`/`true`/`on`/`yes` = yes;
+/// anything else is fatal, so a typo never silently picks a durability.
+fn parse_pg_batch_async_commit(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None => Ok(false),
+        Some(v) if is_off(v) => Ok(false),
+        Some(v)
+            if v == "1"
+                || ["true", "on", "yes"]
+                    .iter()
+                    .any(|o| v.eq_ignore_ascii_case(o)) =>
+        {
+            Ok(true)
+        }
+        Some(v) => Err(format!(
+            "ANTARES_PG_BATCH_ASYNC_COMMIT must be true or false (got {v:?})"
+        )),
     }
 }
 
@@ -782,6 +805,11 @@ async fn build_builtin(
                     .ok()
                     .as_deref(),
             )?;
+            let async_batch = parse_pg_batch_async_commit(
+                std::env::var("ANTARES_PG_BATCH_ASYNC_COMMIT")
+                    .ok()
+                    .as_deref(),
+            )?;
             // The DB container may still be booting — bounded retry, then die.
             let mut last = String::new();
             for _ in 0..30 {
@@ -859,10 +887,15 @@ async fn build_builtin(
                         // says about the server is captured at startup and
                         // never queried on the request.
                         let version = antares_sql::store::pg::version_info(&pool).await;
-                        return Ok((
-                            AnyStore::Pg(PgBackend::new(pool).with_version(version)),
-                            Some(backend),
-                        ));
+                        let store = AnyStore::Pg(PgBackend::new(pool).with_version(version));
+                        if async_batch {
+                            tracing::info!(
+                                "ANTARES_PG_BATCH_ASYNC_COMMIT: batch writes commit with \
+                                 synchronous_commit = off"
+                            );
+                        }
+                        store.set_async_batch_commit(async_batch);
+                        return Ok((store, Some(backend)));
                     }
                     Err(e) if antares_sql::store::pg::is_schema_mismatch(&e) => {
                         // Waiting cannot make this database match: its
@@ -2085,7 +2118,20 @@ mod policy_shelf_tests {
 
 #[cfg(test)]
 mod pg_pool_tests {
-    use super::{parse_pg_pool, parse_pg_statement_timeout};
+    use super::{parse_pg_batch_async_commit, parse_pg_pool, parse_pg_statement_timeout};
+
+    /// ANTARES_PG_BATCH_ASYNC_COMMIT: off unless asked; a typo is fatal.
+    #[test]
+    fn pg_batch_async_commit_is_off_unless_asked() {
+        assert_eq!(parse_pg_batch_async_commit(None), Ok(false));
+        for off in ["", "0", "false", "OFF", "no"] {
+            assert_eq!(parse_pg_batch_async_commit(Some(off)), Ok(false), "{off}");
+        }
+        for on in ["1", "true", "On", "yes"] {
+            assert_eq!(parse_pg_batch_async_commit(Some(on)), Ok(true), "{on}");
+        }
+        assert!(parse_pg_batch_async_commit(Some("treu")).is_err());
+    }
 
     /// ANTARES_PG_POOL: absent defaults to 20; a value that is not a
     /// positive integer is fatal — misconfiguration must never silently

@@ -226,9 +226,11 @@ pub fn not_found() -> Value {
 }
 
 /// `x-notification`: the TS 104 243 message the MQTT binding would publish
-/// (`rendered`), with `x-seq` and `x-subscription` added to its `metadata`.
+/// (`rendered`), with `x-seq` and `x-subscription` added to its `metadata`,
+/// and `x-coalesced` when it replaced that many queued ones of the same
+/// Entity (back-pressure, ADR-0026 rule 6).
 #[must_use]
-pub fn notification(rendered: &Value, seq: u64, subscription: &str) -> String {
+pub fn notification(rendered: &Value, seq: u64, subscription: &str, coalesced: u64) -> String {
     let mut m = rendered
         .get("metadata")
         .and_then(Value::as_object)
@@ -237,6 +239,9 @@ pub fn notification(rendered: &Value, seq: u64, subscription: &str) -> String {
     m.insert("x-op".into(), "x-notification".into());
     m.insert("x-seq".into(), seq.into());
     m.insert("x-subscription".into(), subscription.into());
+    if coalesced > 0 {
+        m.insert("x-coalesced".into(), coalesced.into());
+    }
     message(m, rendered.get("body").cloned())
 }
 
@@ -368,7 +373,7 @@ mod tests {
         let rendered =
             json!({"metadata": {"Content-Type": "application/json"}, "body": {"id": "n"}});
         assert_eq!(
-            read(notification(&rendered, 3, "s"))?,
+            read(notification(&rendered, 3, "s", 0))?,
             json!({"metadata": {"Content-Type": "application/json", "x-op": "x-notification", "x-seq": 3, "x-subscription": "s"}, "body": {"id": "n"}})
         );
         assert_eq!(

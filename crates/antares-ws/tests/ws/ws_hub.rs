@@ -337,7 +337,7 @@ async fn ws_the_notification_cap_holds_to_the_byte() -> Result<(), String> {
         }
         r
     };
-    let base = antares_ws::envelope::notification(&padded(0), u64::MAX, &sub).len();
+    let base = antares_ws::envelope::notification(&padded(0), u64::MAX, &sub, 0).len();
     let fits = antares_ws::MAX_NOTIFICATION_BYTES
         .checked_sub(base)
         .ok_or("an empty notification is over the cap")?;

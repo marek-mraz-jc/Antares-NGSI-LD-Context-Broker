@@ -24,6 +24,15 @@ pub struct PgEntityStore {
     /// events flow through the in-process hook and undrained rows would only
     /// grow the table. The broker turns this on when `bus = nats`.
     outbox: std::sync::atomic::AtomicBool,
+    /// When on, the batch writes (create, upsert, the batch read-modify-write)
+    /// commit with `synchronous_commit = off`, set LOCAL to their own
+    /// transaction (T-5050): a crash of Postgres loses at most the last
+    /// ~3 x `wal_writer_delay` of committed batches, never their atomicity
+    /// or the order of the WAL. Notifications already sent for a lost batch
+    /// stay sent. Off by default; the broker sets it from
+    /// `ANTARES_PG_BATCH_ASYNC_COMMIT` for a feed that rewrites itself every
+    /// second, where the next batch restores what a crash lost.
+    async_batch: std::sync::atomic::AtomicBool,
 }
 
 // EntityFilter/Page/QueryOutcome live in `store::filter` (pure data,
@@ -434,7 +443,26 @@ impl PgEntityStore {
         Self {
             pool,
             outbox: std::sync::atomic::AtomicBool::new(false),
+            async_batch: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Asynchronous commit for the batch writes (see the field).
+    pub fn set_async_batch_commit(&self, on: bool) {
+        self.async_batch
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A batch write's transaction, with `synchronous_commit = off` set
+    /// LOCAL to it when [`Self::set_async_batch_commit`] is on.
+    async fn begin_batch(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+        let mut tx = super::begin(&self.pool).await?;
+        if self.async_batch.load(std::sync::atomic::Ordering::Relaxed) {
+            sqlx::query("SET LOCAL synchronous_commit = off")
+                .execute(&mut *tx)
+                .await?;
+        }
+        Ok(tx)
     }
 
     /// Outbox producer switch — the broker enables this exactly when `bus=nats`.
@@ -1168,7 +1196,7 @@ impl PgEntityStore {
                 }));
             }
         }
-        let mut tx = super::begin(&self.pool).await?;
+        let mut tx = self.begin_batch().await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         crate::store::pg::claim_tenant(&mut tx, tenant).await?;
         let rows = sqlx::query(
@@ -1320,7 +1348,7 @@ impl PgEntityStore {
                 }));
             }
         }
-        let mut tx = super::begin(&self.pool).await?;
+        let mut tx = self.begin_batch().await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         crate::store::pg::claim_tenant(&mut tx, tenant).await?;
         // lock + before-images in one statement (ordered: stable lock order)
@@ -1431,7 +1459,7 @@ impl PgEntityStore {
         ids: &[String],
         mut f: impl FnMut(&str, &mut Value) -> Result<(), E>,
     ) -> Result<Vec<Option<Result<(), E>>>, sqlx::Error> {
-        let mut tx = super::begin(&self.pool).await?;
+        let mut tx = self.begin_batch().await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         let rows = sqlx::query(
             // 4.22: an expired entity is invalid, so it is not a row this

@@ -112,12 +112,43 @@ async fn ws_coalescing_keeps_the_latest_single_entity_notification() -> Result<(
         "{n}"
     );
     assert_eq!(n.pointer("/metadata/x-seq"), Some(&json!(1)), "{n}");
+    assert_eq!(
+        n.pointer("/metadata/x-coalesced"),
+        Some(&json!(4)),
+        "the coalesced notification says how many changes it replaced: {n}"
+    );
     b.http.speed(None, "urn:ngsi-ld:Car:c", 6).await?;
     assert_eq!(
         speeds(&mut again, 1).await?,
         [json!(6)],
         "the next change after the coalesced one"
     );
+    Ok(())
+}
+
+/// A consumer that keeps up gets every change of a per-second writer as
+/// its own notification, none coalesced and none marked (T-5050).
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_a_consumer_that_keeps_up_gets_every_change() -> Result<(), String> {
+    let b = broker(Limits::default()).await?;
+    b.http.car(None, "urn:ngsi-ld:Car:c", 0).await?;
+    let mut c = connect(b.addr, ROOT, &[]).await?;
+    assert_eq!(status(&c.subscribe(one_car(false)).await?), 201);
+    for v in 1..=5 {
+        b.http.speed(None, "urn:ngsi-ld:Car:c", v).await?;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let mut seen = Vec::new();
+    while seen.len() < 5 {
+        let n = c.notification().await?;
+        assert_eq!(n.pointer("/metadata/x-coalesced"), None, "{n}");
+        seen.push(
+            n.pointer("/body/data/0/speed/value")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+    assert_eq!(seen, [json!(1), json!(2), json!(3), json!(4), json!(5)]);
     Ok(())
 }
 

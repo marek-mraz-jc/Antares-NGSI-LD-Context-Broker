@@ -45,6 +45,8 @@ antares-sql = { workspace = true, features = ["test-kit"] }
 # pushdown is checked against the evaluator over them.
 antares-jsonld = { workspace = true }
 proptest = { workspace = true }
+# T-5050: the batch statements are counted from sqlx's per-statement events.
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "core_paths"
