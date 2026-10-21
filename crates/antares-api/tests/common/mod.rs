@@ -31,6 +31,7 @@ pub struct Double {
     overloaded: bool,
     unpaged_queries: AtomicUsize,
     rows_read: AtomicUsize,
+    geo_queries: AtomicUsize,
 }
 
 impl Double {
@@ -50,6 +51,7 @@ impl Double {
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            geo_queries: AtomicUsize::new(0),
         }
     }
 
@@ -70,6 +72,7 @@ impl Double {
             overloaded: true,
             unpaged_queries: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            geo_queries: AtomicUsize::new(0),
         }
     }
 
@@ -90,6 +93,7 @@ impl Double {
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            geo_queries: AtomicUsize::new(0),
         }
     }
 
@@ -112,6 +116,7 @@ impl Double {
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            geo_queries: AtomicUsize::new(0),
         }
     }
 
@@ -146,6 +151,7 @@ impl Double {
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            geo_queries: AtomicUsize::new(0),
         }
     }
 
@@ -166,6 +172,7 @@ impl Double {
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            geo_queries: AtomicUsize::new(0),
         }
     }
 
@@ -186,6 +193,7 @@ impl Double {
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            geo_queries: AtomicUsize::new(0),
         }
     }
 
@@ -199,6 +207,11 @@ impl Double {
     /// was asked to answer whole, however many rows that is.
     pub fn unpaged_queries(&self) -> usize {
         self.unpaged_queries.load(Ordering::SeqCst)
+    }
+
+    /// How many `query_entities` calls handed the store a geoquery to filter on (T-4920).
+    pub fn geo_queries(&self) -> usize {
+        self.geo_queries.load(Ordering::SeqCst)
     }
 
     /// Entity documents `query_entities` has handed out, whatever the double
@@ -380,6 +393,9 @@ impl CurrentStateDriver for Double {
         self.pool_wall()?;
         if f.page.is_none() {
             self.unpaged_queries.fetch_add(1, Ordering::SeqCst);
+        }
+        if !f.geo.is_empty() {
+            self.geo_queries.fetch_add(1, Ordering::SeqCst);
         }
         let out = self.inner.query_entities(tenant, f).await?;
         self.rows_read.fetch_add(out.rows.len(), Ordering::SeqCst);

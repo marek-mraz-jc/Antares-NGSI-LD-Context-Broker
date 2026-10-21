@@ -1490,3 +1490,72 @@ async fn a_q_on_shown_attributes_is_paged_in_the_store_and_a_hidden_one_is_not()
         "the count under a hidden q read the store unpaged"
     );
 }
+
+/// T-4920: a geoquery on a GeoProperty every rule shows reaches the store, `count=true`
+/// included, as an OGC API Features `bbox` sends it: Postgres then filters and counts in
+/// SQL instead of the broker reading every Entity of the type. On a GeoProperty a rule
+/// hides the geoquery stays on the shown Entity, which holds no location to match.
+#[tokio::test]
+async fn a_geoquery_on_a_shown_location_reaches_the_store_and_a_hidden_one_does_not() {
+    let car = Rule {
+        types: vec![iri("Car")],
+        attributes: vec![iri("speed"), "https://uri.etsi.org/ngsi-ld/location".into()],
+        ..Rule::default()
+    };
+    let mut st = state(Filter {
+        rules: vec![car, rule("User", &["name"])],
+        ..Filter::default()
+    })
+    .await;
+    let point = |lon: f64| json!({"type": "GeoProperty", "value": {"type": "Point", "coordinates": [lon, 48.5]}});
+    for (id, lon) in [("urn:ngsi-ld:Car:1", 19.01), ("urn:ngsi-ld:Car:2", 20.5)] {
+        create(
+            &st,
+            json!({"id": id, "type": "Car", "speed": prop(json!(80)), "location": point(lon)}),
+        )
+        .await;
+    }
+    create(
+        &st,
+        json!({"id": "urn:ngsi-ld:User:1", "type": "User", "name": prop(json!("Ana")),
+               "location": point(19.01)}),
+    )
+    .await;
+    let spy = Arc::new(crate::common::Double::passthrough(st.store.clone()));
+    st.store = spy.clone();
+    let area = "georel=intersects&geometry=Polygon&coordinates=%5B%5B%5B19,48.4%5D,%5B19.1,48.4%5D,%5B19.1,48.6%5D,%5B19,48.6%5D,%5B19,48.4%5D%5D%5D";
+    let (code, body) = send(
+        &st,
+        "GET",
+        &format!("/ngsi-ld/v1/entities?type=Car&{area}&count=true&limit=1"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(
+        members(&body).keys().collect::<Vec<_>>(),
+        ["urn:ngsi-ld:Car:1"]
+    );
+    assert_eq!(
+        spy.geo_queries(),
+        1,
+        "the shown geoquery stayed in the broker"
+    );
+    assert_eq!(spy.unpaged_queries(), 0);
+    // a User's location is hidden by its rule: the store is not asked by area, and the
+    // shown User holds no location inside it
+    let (code, body) = send(
+        &st,
+        "GET",
+        &format!("/ngsi-ld/v1/entities?type=User&{area}&count=true"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body, json!([]));
+    assert_eq!(
+        spy.geo_queries(),
+        1,
+        "the hidden geoquery reached the store"
+    );
+}

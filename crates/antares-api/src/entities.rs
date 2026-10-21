@@ -1099,9 +1099,21 @@ fn reads_only_shown(
     narrow: Option<&crate::repr::Repr>,
     expand: &dyn Fn(&str) -> String,
 ) -> bool {
-    if antares_ql::sql::compile_q(q, "entity", 1, expand).is_none()
-        || !rules.omit_by_type.is_empty()
-    {
+    antares_ql::sql::compile_q(q, "entity", 1, expand).is_some()
+        && shows_alike(&q.attribute_paths(), rules, groups, narrow, expand)
+}
+
+/// Whether every one of `names` is a non-system Attribute that every rule of a type in
+/// `groups` shows and the narrowing's own projection keeps: on those, an Entity of those
+/// types reads alike as stored and as shown.
+fn shows_alike(
+    names: &[&str],
+    rules: &crate::policy::Filter,
+    groups: &[Vec<String>],
+    narrow: Option<&crate::repr::Repr>,
+    expand: &dyn Fn(&str) -> String,
+) -> bool {
+    if !rules.omit_by_type.is_empty() {
         return false;
     }
     // every rule naming a type the request selects
@@ -1124,7 +1136,7 @@ fn reads_only_shown(
         .and_then(|r| heads(&r.policy_omit))
         .unwrap_or_default();
     !selected.is_empty()
-        && q.attribute_paths().into_iter().all(|name| {
+        && names.iter().all(|name| {
             let iri = expand(name);
             antares_ql::is_non_system_attr(name)
                 && !omit.contains(&iri)
@@ -1420,24 +1432,38 @@ pub async fn filter_entities_paged(
     // answer it alike (T-4289: `count=true` with a `q`, which every OGC and
     // OData read sends, read every Entity the policy admits and hit the
     // store's TooManyResults ceiling).
-    let q_alike = shown_attrs.is_none()
-        && shown_geos.is_empty()
-        && by_type
-            .as_ref()
-            .zip(shown_q)
-            .is_some_and(|((f, groups), q)| {
-                reads_only_shown(q, f, groups, narrow, &|t: &str| ctx.expand_key(t))
-            });
+    // A geoquery on an Attribute every rule shows likewise (T-4920: an OGC `items` read with
+    // a `bbox` counted every Entity of its collection in the broker).
+    let alike = shown_attrs.is_none()
+        && by_type.as_ref().is_some_and(|(f, groups)| {
+            let expand = |t: &str| ctx.expand_key(t);
+            let geo_names: Vec<&str> = shown_geos
+                .iter()
+                .map(|g| match g.geoproperty.as_str() {
+                    "" => "location",
+                    name => name,
+                })
+                .collect();
+            shows_alike(&geo_names, f, groups, narrow, &expand)
+                && shown_q.is_none_or(|q| reads_only_shown(q, f, groups, narrow, &expand))
+        });
     let judged = by_type
-        .filter(|_| !reads_shown || q_alike)
+        .filter(|_| !reads_shown || alike)
         .map(|(_, groups)| groups);
     // the client's own `q` (with the engine's, as the parameters carry them)
-    // reaches the store only where it reads the shown Entity alike
-    let q_ast = if judged.is_some() && q_alike {
+    // and geoquery reach the store only where they read the shown Entity alike
+    let pushed = judged.is_some() && alike;
+    let q_ast = if pushed && shown_q.is_some() {
         client_and_engine_q
     } else {
         q_ast
     };
+    let (geos, shown_geos) = if pushed {
+        (own_geo.iter().chain(policy_geo).collect(), Vec::new())
+    } else {
+        (geos, shown_geos)
+    };
+    let reads_shown = shown_attrs.is_some() || !shown_geos.is_empty() || shown_q.is_some();
     let page = if judged.is_some() { client_page } else { page };
     // Otherwise, without `count` the answer needs the matches up to the
     // page's end and one more (whether a next page exists): the store is
