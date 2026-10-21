@@ -75,8 +75,8 @@ pub const TOO_COMPLEX: &str = "the filter is larger than the residual evaluator 
 impl ViewOps {
     /// Query Entities through the view with `residual` applied to what the store answered.
     ///
-    /// Without a residual it is one [`ViewOps::run`] of the pushdown with `limit`, `offset`
-    /// and, for a whole answer, `count`. With one, the scan pushes `orderBy` ending in `id`,
+    /// Without a residual it is [`ViewOps::run`] of the pushdown with `limit`, `offset` and,
+    /// for a whole answer, `count`, in upstream pages of the broker's `max_limit`. With one, the scan pushes `orderBy` ending in `id`,
     /// reads upstream pages of the broker's `max_limit` from `page.start` and keeps the
     /// Entities `residual` holds true for until the page is full, the answer ends or
     /// [`RESIDUAL_SCAN`] Entities were read; `next` is the offset just past the last one
@@ -107,38 +107,59 @@ impl ViewOps {
         }
     }
 
-    /// The pushdown alone: one [`ViewOps::run`].
+    /// The pushdown alone: [`ViewOps::run`] in upstream pages of the broker's `max_limit`
+    /// until the page holds `page.size` or the answer ends; only the first asks for the count.
     async fn direct(
         &self,
         caller: &Caller,
         pushdown: &Pushdown,
         page: Page,
     ) -> Result<Scanned, Refusal> {
-        let count = if page.whole { "&count=true" } else { "" };
         let local = unpicked(pushdown, &[]);
-        let query = format!(
-            "{}{}&limit={}&offset={}{count}",
+        let fixed = format!(
+            "{}{}",
             pushdown.query,
-            params(pushdown, &pushdown.order, &[], false, local.is_none()),
-            page.size,
-            page.start
+            params(pushdown, &pushdown.order, &[], false, local.is_none())
         );
-        let (mut batch, total, truncated) =
-            match read(self, self.query(caller, pushdown, &query).await?).await? {
-                Ok(read) => read,
-                Err(answer) => return Ok(Scanned::Answer(answer)),
+        let upstream = self.inner.state.max_limit.max(1);
+        let (mut entities, mut count, mut truncated) = (Vec::new(), None, false);
+        let mut first = true;
+        loop {
+            let want = page.size.saturating_sub(entities.len());
+            let limit = want.min(upstream);
+            let counted = if page.whole && first {
+                "&count=true"
+            } else {
+                ""
             };
-        for entity in &mut batch {
-            strip(entity, &[], false, local);
+            let offset = page.start.saturating_add(entities.len());
+            let query = format!("{fixed}&limit={limit}&offset={offset}{counted}");
+            let (mut batch, total, cut) =
+                match read(self, self.query(caller, pushdown, &query).await?).await? {
+                    Ok(read) => read,
+                    Err(answer) => return Ok(Scanned::Answer(answer)),
+                };
+            if first {
+                count = total.filter(|_| page.whole);
+                first = false;
+            }
+            truncated |= cut;
+            let ended = batch.len() < limit;
+            for entity in &mut batch {
+                strip(entity, &[], false, local);
+            }
+            entities.append(&mut batch);
+            if ended || limit == want {
+                let next = (!page.whole && !ended && limit > 0)
+                    .then(|| page.start.saturating_add(entities.len()));
+                return Ok(Scanned::Page {
+                    entities,
+                    next,
+                    count,
+                    truncated,
+                });
+            }
         }
-        let next = (!page.whole && batch.len() == page.size && page.size > 0)
-            .then(|| page.start.saturating_add(batch.len()));
-        Ok(Scanned::Page {
-            entities: batch,
-            next,
-            count: total.filter(|_| page.whole),
-            truncated,
-        })
     }
 
     /// The pushdown with `program` applied, upstream pages of `upstream` Entities and at most

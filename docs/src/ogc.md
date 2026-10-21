@@ -65,7 +65,7 @@ while the page and its `next` link are still served.
 
 | Parameter | Meaning |
 |---|---|
-| `limit` | 1 to 10 000, default 10; above 1 000 it is clamped to 1 000 |
+| `limit` | 1 to 10 000, default 10; a page holds up to `limit` Features, read from the store in pages of its `max_limit` |
 | `bbox` | `minx,miny,maxx,maxy` or the 6-number form, CRS84; a box with `minx > maxx` crosses the antimeridian. A `geoQ` `intersects` on the geometry; Features without a geometry are kept (Part 1 Req 24 C), served after the ones inside |
 | `datetime` | an RFC 3339 instant or `start/end`, `..` or empty for an open end; both ends open is `400`. Features without a time are kept |
 | `next` | the token of a `next` link; it is bound to the view, the collection and the query, any other use is `400` |

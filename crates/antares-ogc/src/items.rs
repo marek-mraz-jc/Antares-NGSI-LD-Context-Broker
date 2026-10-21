@@ -16,10 +16,9 @@ use std::fmt::Write as _;
 
 /// Features per page when the request names no `limit` (Part 1 `fc-limit-definition`).
 pub(crate) const DEFAULT_LIMIT: u64 = 10;
-/// The largest page: the broker's default `max_limit` (`limit` above it is clamped, C10).
-pub(crate) const MAX_LIMIT: u64 = 1000;
-/// The largest `limit` Part 1 lets a client name; above it the request is 400.
-const MAX_NAMED_LIMIT: u64 = 10_000;
+/// The largest `limit`, the `maximum` the API definition declares: a page holds up to it,
+/// read from the store in pages of its `max_limit` (C10); above it the request is 400.
+pub(crate) const MAX_LIMIT: u64 = 10_000;
 
 /// The query parameters of `items`, read and checked.
 #[derive(Debug, Default, PartialEq)]
@@ -163,10 +162,10 @@ pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Param
         match name.as_str() {
             "limit" => {
                 let n: u64 = value.parse().map_err(|_| bad("limit is an integer from 1 to 10000"))?;
-                if !(1..=MAX_NAMED_LIMIT).contains(&n) {
+                if !(1..=MAX_LIMIT).contains(&n) {
                     return Err(bad("limit is an integer from 1 to 10000"));
                 }
-                p.limit = n.min(MAX_LIMIT);
+                p.limit = n;
             }
             "bbox" => p.bbox = Some(bbox(value).ok_or_else(|| bad("bbox is 4 or 6 numbers in CRS84: lower corner, upper corner"))?),
             "datetime" => p.datetime = Some(datetime(value).ok_or_else(|| bad("datetime is an RFC 3339 date-time or an interval start/end, '..' or empty for an open end"))?),
@@ -941,7 +940,7 @@ mod tests {
                 .map(|p| p.limit)
                 .ok(),
             Some(MAX_LIMIT),
-            "clamped"
+            "the declared maximum is served whole"
         );
         for bad in [
             vec![("limit", "0")],

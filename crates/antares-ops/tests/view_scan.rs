@@ -656,3 +656,31 @@ async fn a_join_past_the_lookup_budget_is_reported_under_a_residual() {
         "{b}"
     );
 }
+
+/// T-4926: a page larger than the broker's `max_limit` is read in store pages of it and served
+/// whole: the count asked once, nothing twice; `next` just past the last Entity of a page
+/// that is not whole, none on a whole (counted) one, even when it fills `size` exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_past_max_limit_is_read_in_store_pages() {
+    let broker = TestBroker::with_max_limit(4).await.expect("broker");
+    let rig = rig_on(broker).await.expect("rig");
+    let (s, b) = rig.scan((pushdown(), None), "size=10&whole=1").await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(ids(&b), expected(|_| true)[..10]);
+    assert_eq!(
+        (b["count"].clone(), b["next"].clone()),
+        (json!(15), Value::Null)
+    );
+    let (_, b) = rig.scan((pushdown(), None), "size=15&whole=1").await;
+    assert_eq!(ids(&b), expected(|_| true));
+    assert_eq!(
+        (b["count"].clone(), b["next"].clone()),
+        (json!(15), Value::Null)
+    );
+    let (_, b) = rig.scan((pushdown(), None), "start=10&size=100").await;
+    assert_eq!(ids(&b), expected(|_| true)[10..]);
+    assert_eq!(b["next"], Value::Null);
+    let (_, b) = rig.scan((pushdown(), None), "size=8").await;
+    assert_eq!(ids(&b), expected(|_| true)[..8]);
+    assert_eq!(b["next"], 8);
+}

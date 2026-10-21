@@ -96,11 +96,70 @@ async fn limit_default_clamp_and_bounds() -> Result<(), String> {
     assert_eq!(
         all.status,
         StatusCode::OK,
-        "10000 is clamped, not refused: {}",
+        "10000 is the declared maximum: {}",
         all.body
     );
     assert_eq!(all.body.get("numberReturned"), Some(&json!(4)));
     assert!(href(&all.body, "next").is_none());
+    Ok(())
+}
+
+/// T-4926: ETS 1.8 Core `fc-numberMatched` reads the first page, then follows at most four
+/// `next` links with `limit` set to the `maximum` of the API definition (10000). A page of the declared maximum
+/// holds that many Features, read from the store in pages of its `max_limit` (1000), so 4,109
+/// Cars arrive whole, each once, as on prod's Contract collection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_collection_pages_whole_at_the_declared_maximum() -> Result<(), String> {
+    let f = fixture().await?;
+    let total = 4109;
+    let cars: Vec<Value> = (4..total)
+        .map(|n| {
+            json!({"id": format!("urn:ngsi-ld:Car:bulk-{n:05}"), "type": "Car",
+                        "speed": {"type": "Property", "value": n}})
+        })
+        .collect();
+    for chunk in cars.chunks(1000) {
+        let a = send(
+            &f.app,
+            "POST",
+            "/ngsi-ld/v1/entityOperations/create",
+            &Value::from(chunk.to_vec()).to_string(),
+            &[("NGSILD-Tenant", "city")],
+        )
+        .await;
+        assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    }
+    for first in [1, 10, 100] {
+        let a = get(&f.app, &format!("{CARS}?limit={first}")).await;
+        assert_eq!(a.body.get("numberMatched"), Some(&json!(total)));
+        let mut seen = ids(&a.body);
+        let mut next = href(&a.body, "next");
+        for _ in 0..4 {
+            let Some(link) = next else { break };
+            let at = local(&link).replace(&format!("limit={first}"), "limit=10000");
+            let page = get(&f.app, &at).await;
+            assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+            seen.extend(ids(&page.body));
+            next = href(&page.body, "next");
+        }
+        assert!(
+            next.is_none(),
+            "limit={first}: the walk ends with the answer"
+        );
+        let distinct: std::collections::BTreeSet<&String> = seen.iter().collect();
+        assert_eq!(
+            (seen.len(), distinct.len()),
+            (total, total),
+            "limit={first}"
+        );
+    }
+    let whole = get(&f.app, &format!("{CARS}?limit=10000")).await;
+    assert_eq!(whole.body.get("numberReturned"), Some(&json!(total)));
+    assert!(href(&whole.body, "next").is_none());
+    let tail = get(&f.app, &format!("{CARS}?limit=2500")).await;
+    let rest = href(&tail.body, "next").ok_or("a page of 2500 of 4109 links on")?;
+    let rest = get(&f.app, &local(&rest)).await;
+    assert_eq!(rest.body.get("numberReturned"), Some(&json!(total - 2500)));
     Ok(())
 }
 
