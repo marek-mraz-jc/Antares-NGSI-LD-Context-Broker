@@ -5,37 +5,37 @@
 channel = "http"
 role = "provides"
 key = "GET /q/health"
-symbol = "antares_api::health"
+symbol = "antares_api::ops::health"
 
 [[endpoint]]
 channel = "http"
 role = "provides"
 key = "GET /q/ready"
-symbol = "antares_api::ready"
+symbol = "antares_api::ops::ready"
 
 [[endpoint]]
 channel = "http"
 role = "provides"
 key = "GET /q/metrics"
-symbol = "antares_api::metrics_endpoint"
+symbol = "antares_api::ops::metrics_endpoint"
 
 [[endpoint]]
 channel = "http"
 role = "provides"
 key = "GET /q/tenants"
-symbol = "antares_api::tenants_list"
+symbol = "antares_api::ops::tenants_list"
 
 [[endpoint]]
 channel = "http"
 role = "provides"
 key = "GET /q/tenants/{tenant}"
-symbol = "antares_api::tenant_get"
+symbol = "antares_api::ops::tenant_get"
 
 [[endpoint]]
 channel = "http"
 role = "provides"
 key = "DELETE /q/tenants/{tenant}"
-symbol = "antares_api::tenant_purge"
+symbol = "antares_api::ops::tenant_purge"
 
 [[endpoint]]
 channel = "http"
@@ -59,19 +59,19 @@ symbol = "antares_api::tenant_move::import"
 channel = "http"
 role = "provides"
 key = "GET /q/dead-letters"
-symbol = "antares_api::dead_letters_list"
+symbol = "antares_api::ops::dead_letters_list"
 
 [[endpoint]]
 channel = "http"
 role = "provides"
 key = "DELETE /q/dead-letters/{id}"
-symbol = "antares_api::dead_letter_delete"
+symbol = "antares_api::ops::dead_letter_delete"
 
 [[endpoint]]
 channel = "http"
 role = "provides"
 key = "POST /q/dead-letters/{id}/replay"
-symbol = "antares_api::dead_letter_replay"
+symbol = "antares_api::ops::dead_letter_replay"
 
 [[endpoint]]
 channel = "http"
