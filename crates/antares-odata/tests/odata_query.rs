@@ -221,3 +221,51 @@ async fn a_query_body_joins_the_url_options_and_is_bounded() {
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
 }
+
+/// T-5062: a read without `$count` asks the broker one Entity past the page
+/// instead of its count; the next link still appears exactly when Entities
+/// are left, at a server page of 2 and of 3 over the three Cars, and under a
+/// `$top` that ends inside the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_next_link_without_count_follows_the_entities_left() {
+    let engine = Arc::new(Seen::default());
+    let (_b, app) = broker(engine).await.expect("broker");
+    for (page, top, first, linked) in [
+        (2, None, 2, true),
+        (3, None, 3, false),
+        (10, None, 3, false),
+        (1, Some(2), 1, true),
+        (2, Some(2), 2, false),
+    ] {
+        let top = top.map(|t| format!("&$top={t}")).unwrap_or_default();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("{ROOT}/Car?$select=speed{top}"))
+                    .header("NGSILD-Tenant", "city")
+                    .header("Prefer", format!("odata.maxpagesize={page}"))
+                    .body(Body::empty())
+                    .unwrap_or_default(),
+            )
+            .await;
+        let Ok(resp) = resp;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .map(http_body_util::Collected::to_bytes)
+            .unwrap_or_default();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(ids(&body).len(), first, "page {page}{top}: {body}");
+        assert_eq!(
+            body.get("@odata.nextLink").is_some(),
+            linked,
+            "page {page}{top}: {body}"
+        );
+        assert!(
+            body.get("@odata.count").is_none(),
+            "no $count, no count: {body}"
+        );
+    }
+}

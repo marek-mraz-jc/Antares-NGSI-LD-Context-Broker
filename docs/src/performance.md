@@ -1008,6 +1008,84 @@ Tenant, type T1 = 10 000), as `antares_app`, SQL execution time:
 `pg_explain.rs` `deep_and_keyset_pages_read_ids_from_the_type_index` pins
 both plans under RLS.
 
+## 1 000 distinct queries a second
+
+T-5062 asks for 1 000 requests a second for ten minutes, no two alike,
+with p95 under 300 ms and errors under 0.1 %, on the share of the dev node
+the broker and its PostgreSQL get. `tests/perf/distinct-1000/` is the rig;
+`bench.yml` runs it on demand (`workflow_dispatch`, a runner label as
+input).
+
+- `seed.py` writes the 581 000 entities of `dev/perf/k6-surfaces.js`'s
+  data set (ten types, a Point each, `level`, `category`) by COPY through
+  `dev/bulk-load.sh`; `seed-extras.js` puts the view `load`, its LinkML
+  schema and a 30-day pm25 history on 500 entities through the API. The
+  API seed alone wrote 220 entities a second on this PostgreSQL, 45 min
+  for the set.
+- `queries.js` turns request number u into one request of the mix:
+  retrieve 18 %, `q` on two attributes 14 % and on three 10 %, geo `near`
+  10 % and `within` 8 %, a temporal window 8 %, OData `$filter` 10 %, OGC
+  `bbox` 10 %, its CSV export 6 % and MCP `query_entities` 6 %. u rides in
+  an id, a threshold's last digits or a coordinate's, so the 600 000
+  requests of a run are distinct; `node queries.js` checks that.
+- `run.sh` runs PostGIS in a container capped at 2 cores and 2 GiB, the
+  platform binary (`full,jc-policy,linkml,parquet,tabular,ical`) pinned
+  to 4 cores, as `antares_app` without BYPASSRLS (`ANTARES_REQUIRE_RLS=1`)
+  under `ANTARES_POLICY=joinedcontext` with 20 permissions, every request
+  carrying the subject headers the gateway sends. k6 sends from 64 loopback
+  source addresses (`--local-ips`), so a per-address cap in front of the
+  broker would see 64 callers.
+- `distinct.js` is an open model (constant arrival rate) with the task's
+  thresholds; the run writes k6's summary, the broker's and PostgreSQL's
+  CPU and RSS, and the 15 costliest statements of `pg_stat_statements`.
+
+The gateway is not in the rig: its per-caller caps and its PDP time are
+the part T-4754 measures on prod. Box: the 16-core sandbox host, 3-minute
+runs at 1 000 req/s on the seeded set; the generator shares the host.
+
+| build | answered | req/s served | dropped arrivals | broker CPU | PostgreSQL CPU | costliest statement |
+|---|---|---|---|---|---|---|
+| dev `a60ea0d` | 9 % | 261 | 130 464 | 19 % | 194 % of 200 % | OData's `count(*)` per page: 802 calls, 2.4 s each, 80 % of PostgreSQL's time |
+| + the two fixes below | 59 % | 277 | 127 363 | 27 % | 197 % of 200 % | `q` over a type's rows: 10 321 calls, 106 ms each |
+
+The rig does not hold 1 000 distinct requests a second yet, nor 250
+(64 % answered at 250 req/s): PostgreSQL's two cores are the wall, the
+broker idles at a quarter of a core. Fixed so far, each with its own
+before and after:
+
+- **A view's geoquery reads the store's spatial index.** Under a view's
+  rules the client's geoquery was judged on the shown Entity, so the store
+  read every Entity of the type in doubling pages and the broker filtered
+  them: an OGC `bbox`, an NGSI-LD `georel` under `/x/views/…`, an OData or
+  MCP geo read. When every rule of the selected types shows `location`
+  (and no rule hides it), the shown and the stored Entity answer the
+  geoquery alike, so it goes to the store with the page, as T-4289 did for
+  a client `q`. One `bbox` read on 1 666 Entities of a type: 5 statements
+  and 1 620 rows before, 1 statement and the 27 matches after.
+  `policy_filter_by_type.rs`
+  `a_geoquery_on_a_shown_location_is_paged_in_the_store_and_a_hidden_one_is_not`
+  pins both sides.
+- **No count to find the next page.** OData without `$count` and MCP
+  `query_entities` and temporal pages without `count` asked the broker for
+  `count=true` on every page only to learn whether a next page exists.
+  They now ask one Entity past the page; a page at the 1 000 ceiling still
+  counts. At 1 000 req/s the count statements went from 80 % of
+  PostgreSQL's time to none.
+
+What holds the rig below its target, measured in the second run, in
+order:
+
+- **Geoqueries are never decided in SQL.** `near` compares geography in
+  PostGIS and haversine in the evaluator, and `location_ambiguous` rows
+  need the evaluator, so the store drops the page and reads up to
+  `MAX_UNDECIDED_ROWS` of the region: about 1 000 documents and 0.6-1.1 s
+  per statement for a page of 20 in the dense synthetic grid. A geoquery
+  should read candidates in pages until the page holds, as rules
+  that are not by type already do.
+- **`q` has no leakproof index path** ([Query plans under row-level
+  security](#query-plans-under-row-level-security)): `level>=x;level<y`
+  reads the type's rows, 64 000 here, 106-164 ms a statement under load.
+
 ## What the numbers are not
 
 They are one machine, one request shape, one week. A different instance
