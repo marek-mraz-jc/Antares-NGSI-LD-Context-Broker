@@ -10,8 +10,8 @@
 
 use crate::edm::{base_member, Edm, Set, Shape};
 use crate::filter::{
-    compute, computed, inlined, mint, order, program, searched, translate, Refused, SortBy,
-    SortKey, Translated,
+    compute, computed, holds_member, inlined, mint, order, program, searched, translate, Refused,
+    SortBy, SortKey, Translated,
 };
 use antares_ops::residual::{DateTime, Expr as RExpr, Program};
 use antares_ops::{
@@ -895,9 +895,24 @@ fn filtered(
     match &options.orderby {
         Some(keys) => {
             let mut t = translated;
-            order(keys, set, &mut t)
-                .map(|()| t)
-                .map_err(|refused| refusal(refused, version))
+            order(keys, set, &mut t).map_err(|refused| refusal(refused, version))?;
+            // each item pushed one key, in order
+            t.held_keys = keys
+                .iter()
+                .zip(&t.pushed_keys)
+                .filter_map(|(item, key)| match (&item.expr, &key.by) {
+                    (Expr::Member(m), SortBy::Value(term))
+                        if filter
+                            .as_ref()
+                            .zip(m.path.first())
+                            .is_some_and(|(f, name)| holds_member(f, name)) =>
+                    {
+                        Some(term.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            Ok(t)
         }
         None => Ok(translated),
     }
@@ -1543,9 +1558,11 @@ fn projected<'s>(
 }
 
 /// URL 5.1.5 puts null first ascending and last descending; the store puts
-/// an Entity lacking an `orderBy` key after every value either way. One
-/// count of the Entities lacking a key decides: none, and the store's order
-/// is the standard's; any, and the read is sorted on the surface (T-3853).
+/// an Entity lacking an `orderBy` key last ascending and first descending.
+/// One count of the Entities lacking a key decides: none, and the store's
+/// order is the standard's; any, and the read is sorted on the surface
+/// (T-3853). A key the `$filter` holds on every Entity it admits needs no
+/// count, a second scan of the match set (T-4919).
 // ponytail: a sparse key over RESIDUAL_SCAN Entities is 400 TooManyResults;
 // split a single-key sort into "lacks it" and "holds it" reads if that matters
 async fn nulls_first(
@@ -1563,10 +1580,14 @@ async fn nulls_first(
             SortBy::Id | SortBy::System(_) | SortBy::Computed(_) => None,
         })
         .collect();
-    if filter.order.is_none() || terms.is_empty() {
+    let unheld: Vec<&&str> = terms
+        .iter()
+        .filter(|t| !filter.held_keys.iter().any(|h| h == **t))
+        .collect();
+    if filter.order.is_none() || unheld.is_empty() {
         return Ok(());
     }
-    let lacking = terms
+    let lacking = unheld
         .iter()
         .map(|t| format!("!{t}"))
         .collect::<Vec<_>>()
