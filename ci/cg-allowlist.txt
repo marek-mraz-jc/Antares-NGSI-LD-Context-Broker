@@ -2,33 +2,33 @@
 # name | key | reason. An entry without a reason, or one that matches no row, fails the job.
 # Reviewed like code: a new row says why the invariant does not apply there.
 
-routes-without-decision | GET /q/health | antares_api::health | public liveness probe, open even with an admin secret (docs/analysis/operation-matrix.md 7.2, T-3569)
-routes-without-decision | GET /q/ready | antares_api::ready | public readiness probe (docs/analysis/operation-matrix.md 7.2, T-3569)
-routes-without-decision | GET /q/metrics | antares_api::metrics_endpoint | admin secret route layer (admin_auth.rs, ANTARES_ADMIN_METRICS); a layer is not a call (docs/analysis/operation-matrix.md 7.2)
-routes-without-decision | GET /q/tenants | antares_api::tenants_list | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
-routes-without-decision | GET /q/tenants/{} | antares_api::tenant_get | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
-routes-without-decision | DELETE /q/tenants/{} | antares_api::tenant_purge | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | GET /q/health | antares_api::ops::health | public liveness probe, open even with an admin secret (docs/analysis/operation-matrix.md 7.2, T-3569)
+routes-without-decision | GET /q/ready | antares_api::ops::ready | public readiness probe (docs/analysis/operation-matrix.md 7.2, T-3569)
+routes-without-decision | GET /q/metrics | antares_api::ops::metrics_endpoint | admin secret route layer (admin_auth.rs, ANTARES_ADMIN_METRICS); a layer is not a call (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | GET /q/tenants | antares_api::ops::tenants_list | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | GET /q/tenants/{} | antares_api::ops::tenant_get | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | DELETE /q/tenants/{} | antares_api::ops::tenant_purge | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
 routes-without-decision | GET /q/tenants/{}/digest | antares_api::tenant_move::digest | admin secret route layer (admin_auth.rs; ADR-0030 tenant move); every method on it refuses without the secret in crates/antares-icsr/tests/q_admin_sweep.rs (T-3855); pinned in .cg/links/admin.toml by T-3590
 routes-without-decision | GET /q/tenants/{}/export | antares_api::tenant_move::export | admin secret route layer (admin_auth.rs; ADR-0030 tenant move); every method on it refuses without the secret in crates/antares-icsr/tests/q_admin_sweep.rs (T-3855); pinned in .cg/links/admin.toml by T-3590
 routes-without-decision | POST /q/tenants/{}/import | antares_api::tenant_move::import | admin secret route layer (admin_auth.rs; ADR-0030 tenant move); every method on it refuses without the secret in crates/antares-icsr/tests/q_admin_sweep.rs (T-3855); pinned in .cg/links/admin.toml by T-3590
-routes-without-decision | GET /q/dead-letters | antares_api::dead_letters_list | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
-routes-without-decision | DELETE /q/dead-letters/{} | antares_api::dead_letter_delete | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
-routes-without-decision | POST /q/dead-letters/{}/replay | antares_api::dead_letter_replay | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
-routes-without-decision | PATCH /ngsi-ld/v1/entities | antares_api::missing_entity_id | 400 BadRequestData, no store access (docs/analysis/operation-matrix.md 7.2)
-routes-without-decision | PUT /ngsi-ld/v1/entities | antares_api::missing_entity_id | 400 BadRequestData, no store access (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | GET /q/dead-letters | antares_api::ops::dead_letters_list | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | DELETE /q/dead-letters/{} | antares_api::ops::dead_letter_delete | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | POST /q/dead-letters/{}/replay | antares_api::ops::dead_letter_replay | admin secret route layer (admin_auth.rs, T-3569) (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | PATCH /ngsi-ld/v1/entities | antares_api::router::missing_entity_id | 400 BadRequestData, no store access (docs/analysis/operation-matrix.md 7.2)
+routes-without-decision | PUT /ngsi-ld/v1/entities | antares_api::router::missing_entity_id | 400 BadRequestData, no store access (docs/analysis/operation-matrix.md 7.2)
 routes-without-decision | POST /ex/v1/remote-notify | antares_api::distsub::remote_notify | public to peers by key: a per-copy random subscriptionId (ADR-0019, docs/analysis/operation-matrix.md 7.2)
 
 identity-headers | antares_api::negotiate::tenant_from | the one reader of the request's Tenant (5.5.3), validated or 400
 identity-headers | antares_api::negotiate::echo_tenant | echoes the validated Tenant on the answer (5.5.3)
-identity-headers | antares_api::tenant_exists_layer | tenancy layer: refuses a reserved or doubled Tenant (6.3.14) and a read of a non-existing one (5.5.10) before the handler
-identity-headers | antares_api::echo_tenant_layer | tenancy layer: the conditional echo of 5.5.3
-identity-headers | antares_api::cors_layer | lists the header in CORS allow/expose, reads no value
+identity-headers | antares_api::router::tenant_exists_layer | tenancy layer: refuses a reserved or doubled Tenant (6.3.14) and a read of a non-existing one (5.5.10) before the handler
+identity-headers | antares_api::router::echo_tenant_layer | tenancy layer: the conditional echo of 5.5.3
+identity-headers | antares_api::router::cors_layer | lists the header in CORS allow/expose, reads no value
 identity-headers | antares_api::state::PROPAGATED | the internal-call header copy of threat F2: copied only when the internal request sets none (state.rs AppState::call)
 identity-headers | antares_api::csource::check_context_source_info | refuses a Registration's contextSourceInfo that would set the Tenant on forwards
 identity-headers | antares_api::federation::CSI_SKIP | contextSourceInfo pairs never sent on a forward (the Tenant is the registration's)
 identity-headers | antares_api::federation::build_forward | a forward carries the registration's Tenant (5.6, 5.7 distributed operations)
-identity-headers | antares_api::notify::deliver_as | a notification names the Subscription's Tenant (6.3.8, Table 7.2-2)
-identity-headers | antares_api::notify::strip_reserved_markers | drops a subscriber's own Tenant marker from receiverInfo
+identity-headers | antares_api::notify::delivery::deliver_as | a notification names the Subscription's Tenant (6.3.8, Table 7.2-2)
+identity-headers | antares_api::notify::delivery::strip_reserved_markers | drops a subscriber's own Tenant marker from receiverInfo
 identity-headers | antares_api::snapshots::run_temporal_query | the snapshot's internal temporal read in the snapshot's own Tenant
 identity-headers | antares_api::snapshots::scoped | runs a snapshot request in its internal Tenant and restores the caller's on the answer
 identity-headers | crates/antares-api/src/fuzzing.rs | fuzz harness (feature fuzzing), never in a release build
@@ -83,11 +83,11 @@ store-method-without-tenant | TemporalDriver | q_pushdown_exact | a capability q
 store-method-without-tenant | TemporalDriver | supported | capability flag, no row
 store-method-without-tenant | TemporalDriver | version_info | /q/health versions, no row
 
-tenant-not-from-header | DELETE /q/dead-letters/{} | antares_api::dead_letter_delete | admin secret route layer; the Tenant is the operator's ?tenant=, parsed by admin_tenant (TenantId::new, reserved names refused)
-tenant-not-from-header | GET /q/dead-letters | antares_api::dead_letters_list | admin secret route layer; the Tenant is the operator's ?tenant=, parsed by admin_tenant (TenantId::new, reserved names refused)
-tenant-not-from-header | POST /q/dead-letters/{}/replay | antares_api::dead_letter_replay | admin secret route layer; the Tenant is the operator's ?tenant=, parsed by admin_tenant (TenantId::new, reserved names refused)
-tenant-not-from-header | GET /q/tenants/{} | antares_api::tenant_get | admin secret route layer; the Tenant is the path segment, parsed by TenantId::new
-tenant-not-from-header | DELETE /q/tenants/{} | antares_api::tenant_purge | admin secret route layer; the Tenant is the path segment, parsed by TenantId::new
+tenant-not-from-header | DELETE /q/dead-letters/{} | antares_api::ops::dead_letter_delete | admin secret route layer; the Tenant is the operator's ?tenant=, parsed by admin_tenant (TenantId::new, reserved names refused)
+tenant-not-from-header | GET /q/dead-letters | antares_api::ops::dead_letters_list | admin secret route layer; the Tenant is the operator's ?tenant=, parsed by admin_tenant (TenantId::new, reserved names refused)
+tenant-not-from-header | POST /q/dead-letters/{}/replay | antares_api::ops::dead_letter_replay | admin secret route layer; the Tenant is the operator's ?tenant=, parsed by admin_tenant (TenantId::new, reserved names refused)
+tenant-not-from-header | GET /q/tenants/{} | antares_api::ops::tenant_get | admin secret route layer; the Tenant is the path segment, parsed by TenantId::new
+tenant-not-from-header | DELETE /q/tenants/{} | antares_api::ops::tenant_purge | admin secret route layer; the Tenant is the path segment, parsed by TenantId::new
 tenant-not-from-header | GET /q/tenants/{}/digest | antares_api::tenant_move::digest | admin secret route layer; the Tenant is the path segment, parsed by tenant_move::tenant_of (TenantId::new, reserved names refused)
 tenant-not-from-header | GET /q/tenants/{}/export | antares_api::tenant_move::export | admin secret route layer; the Tenant is the path segment, parsed by tenant_move::tenant_of (TenantId::new, reserved names refused)
 tenant-not-from-header | POST /q/tenants/{}/import | antares_api::tenant_move::import | admin secret route layer; the Tenant is the path segment, parsed by tenant_move::tenant_of (TenantId::new, reserved names refused)
