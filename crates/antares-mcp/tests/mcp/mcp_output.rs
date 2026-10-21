@@ -467,15 +467,16 @@ async fn an_old_history_that_fits_one_answer_stays_raw() -> Result<(), String> {
     let s = a.structured();
     assert!(s.get("aggregation").is_none(), "{}", a.text);
     let speed = s.pointer("/entity/speed").cloned().unwrap_or_default();
-    let instances = match speed {
+    let instances: Vec<_> = match speed {
         Value::Array(v) => v,
         one => vec![one],
-    };
-    assert_eq!(instances.len(), 1, "{}", a.text);
-    assert_eq!(instances[0].get("value"), Some(&json!(42)), "{}", a.text);
+    }
+    .into_iter()
+    .map(|i| (i.get("value").cloned(), i.get("observedAt").cloned()))
+    .collect();
     assert_eq!(
-        instances[0].get("observedAt"),
-        Some(&json!("2026-05-01T10:00:00Z")),
+        instances,
+        vec![(Some(json!(42)), Some(json!("2026-05-01T10:00:00Z")))],
         "{}",
         a.text
     );

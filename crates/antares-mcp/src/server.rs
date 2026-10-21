@@ -440,8 +440,9 @@ impl Server {
             .run(tool.op, tools::build(tool, &args, limit, offset))
             .await;
         // averages only for a history the broker cut: a raw answer that fits
-        // is what the NGSI-LD door serves for the same call (T-5028)
-        if aggregated.is_some() && answer.status.is_success() && answer.range.is_some() {
+        // is what the NGSI-LD door serves for the same call (T-5028); only a
+        // 206 carries Content-Range, so a refusal is never retried
+        if aggregated.is_some() && answer.range.is_some() {
             args = averaged;
             answer = self
                 .run(tool.op, tools::build(tool, &args, limit, offset))
