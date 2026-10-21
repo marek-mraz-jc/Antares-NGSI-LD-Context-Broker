@@ -7,7 +7,7 @@ task: T-3548
 
 Coraine is an NGSI-LD broker written in C by Seamware, Apache-2.0, part of FIWARE (incubating). This page compares it with Antares on compliance, architecture, footprint and speed, and security, with the evidence for each claim on both sides, and ends with what Antares takes from it. The owner decided that Antares adopts tests and ideas only, no Coraine code.
 
-Sources: Coraine at `19cff1619816459f269a63a8f54267811d3067ed` (main, 2026-10-10, "Merge pull request #328 from SEAMWARE/release/post-0.5.0"), image `quay.io/seamware/coraine:0.5.0@sha256:a102b7c7992f60e4b9f2885d4bef9099acf73613b489c4254cc5b7a32de93a6e`; the ETSI suite at forge.etsi.org; Antares at the commit this page lands on. Coraine paths below are relative to its repository root.
+Sources: Coraine at `19cff1619816459f269a63a8f54267811d3067ed` (main, 2026-10-10, "Merge pull request #328 from SEAMWARE/release/post-0.5.0"), image `quay.io/seamware/coraine:0.5.0@sha256:a102b7c7992f60e4b9f2885d4bef9099acf73613b489c4254cc5b7a32de93a6e` (SEAMWARE re-pushed the 0.5.0 tag on 2026-10-12 as index `sha256:5e2e519a7d0c9c4bfea6cb75113c8de5e8bc892fc281c06125cd67c4004fcaff` and quay no longer serves the old digest; the workflow pins the new one); the ETSI suite at forge.etsi.org; Antares at the commit this page lands on. Coraine paths below are relative to its repository root.
 
 ## 1. Compliance
 
@@ -162,7 +162,7 @@ The adapter in `tests/external/coraine/` (Apache-2.0 notice kept, nothing vendor
 ```sh
 # the footprint and speed run (section 3), one CPU per broker
 gh workflow run compare-coraine.yml --ref dev     # .github/workflows/compare-coraine.yml
-BIN=target/release/antares CORAINE_IMAGE=quay.io/seamware/coraine:0.5.0@sha256:a102b7c7992f60e4b9f2885d4bef9099acf73613b489c4254cc5b7a32de93a6e \
+BIN=target/release/antares CORAINE_IMAGE=quay.io/seamware/coraine:0.5.0@sha256:5e2e519a7d0c9c4bfea6cb75113c8de5e8bc892fc281c06125cd67c4004fcaff \
   OUT=compare-coraine dev/perf/compare-coraine.sh
 
 # the forge suite, Coraine's branch against develop
