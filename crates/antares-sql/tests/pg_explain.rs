@@ -726,7 +726,6 @@ async fn the_entity_query_is_not_left_prepared() {
 /// Shapes copied from `query_sql`/`count_sql` (their unit tests pin the
 /// text); run as a non-superuser, since a superuser skips RLS and hides it.
 #[tokio::test]
-#[ignore = "flaky on dev: T-4852, run 39600026863"]
 async fn a_type_page_reads_its_type_through_an_index_under_rls() {
     let url = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
@@ -777,6 +776,29 @@ async fn a_type_page_reads_its_type_through_an_index_under_rls() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+
+    // The plan follows the estimate: guessed as independent, the Tenant and
+    // its first type gave 18-204 of the 2000 B rows on a shared table, and
+    // the page then sorted a bitmap of them all (runs 39569761909,
+    // 39590613787). Migration 0016's statistics hold the real frequency.
+    let explained: Vec<String> = sqlx::query_scalar(
+        "EXPLAIN SELECT 1 FROM entities
+          WHERE tenant_id = 'pgexplain-types' AND types[1] = 'https://x/B'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("estimate");
+    let estimate: f64 = explained[0]
+        .split("rows=")
+        .nth(1)
+        .and_then(|r| r.split(' ').next())
+        .and_then(|r| r.parse().ok())
+        .expect("rows= in the plan");
+    assert!(
+        (1000.0..=4000.0).contains(&estimate),
+        "the planner guesses {estimate} of the Tenant's 2000 B Entities, so the page plan \
+         depends on what other Tenants hold — plan: {explained:?}"
+    );
 
     let w = "tenant_id = 'pgexplain-types' AND (expires_at IS NULL OR expires_at > now())";
     let first = format!("{w} AND types[1] = 'https://x/B'");
