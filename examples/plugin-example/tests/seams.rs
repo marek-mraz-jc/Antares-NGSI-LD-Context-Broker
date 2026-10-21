@@ -262,3 +262,44 @@ async fn an_expired_entity_goes_with_its_history() {
         "the other keeps its history"
     );
 }
+
+/// T-4665: `@provenance` rides each instance from the API to the temporal
+/// store, which keeps none of it as data: no read answers it, whether it came
+/// by an append or by a rewrite of the document (a delete's null instance).
+#[tokio::test]
+async fn provenance_is_never_kept_as_history() {
+    use antares_store::TemporalDriver;
+    let store = ExampleStore::new();
+    let t = TenantId::new("pluginprov").expect("tenant");
+    let id = "urn:ngsi-ld:Seam:prov";
+    let doc = json!({"id": id, "type": ["Seam"]});
+    CurrentStateDriver::create(&store, &t, Kind::Entity, id, doc.clone())
+        .await
+        .expect("create");
+    let inst = json!({"type": "Property", "value": 1, "instanceId": "urn:i:1",
+        "@provenance": {"operation": "create"}});
+    store
+        .temporal_append(&t, id, &doc, &json!({"speed": [inst]}))
+        .await
+        .expect("append");
+    TemporalDriver::mutate_boxed(
+        &store,
+        &t,
+        id,
+        Box::new(|d| {
+            let deleted = json!({"type": "Property", "value": "urn:ngsi-ld:null",
+                "instanceId": "urn:i:2", "@provenance": {"operation": "delete"}});
+            d["speed"].as_array_mut().ok_or(())?.push(deleted);
+            Ok(())
+        }),
+    )
+    .await
+    .expect("mutate");
+    let kept = TemporalDriver::get(&store, &t, id).await.expect("get");
+    let kept = kept.expect("history");
+    assert_eq!(kept["speed"].as_array().map(Vec::len), Some(2));
+    assert!(
+        !kept.to_string().contains("@provenance"),
+        "provenance is no attribute member: {kept}"
+    );
+}
