@@ -71,6 +71,11 @@ pub struct Limits {
     pub ping_every: Duration,
     /// A socket with no Pong this long is closed.
     pub pong_within: Duration,
+    /// Frames a client may send a second on average; past
+    /// `message_burst` ahead of that pace the socket closes with 1008 (W9).
+    pub messages_per_sec: u32,
+    /// Frames a client may send at once before `messages_per_sec` applies.
+    pub message_burst: u32,
 }
 
 impl Default for Limits {
@@ -87,6 +92,8 @@ impl Default for Limits {
             idle: Duration::from_secs(60),
             ping_every: Duration::from_secs(30),
             pong_within: Duration::from_secs(60),
+            messages_per_sec: 20,
+            message_burst: 100,
         }
     }
 }
@@ -169,6 +176,8 @@ impl Limits {
             "idleSecs": self.idle.as_secs(),
             "pingSecs": self.ping_every.as_secs(),
             "pongSecs": self.pong_within.as_secs(),
+            "messagesPerSec": self.messages_per_sec,
+            "messageBurst": self.message_burst,
             "maxMessageBytes": crate::envelope::MAX_MESSAGE_BYTES,
             "maxFrameBytes": crate::envelope::MAX_FRAME_BYTES,
             "maxNotificationBytes": MAX_NOTIFICATION_BYTES,
