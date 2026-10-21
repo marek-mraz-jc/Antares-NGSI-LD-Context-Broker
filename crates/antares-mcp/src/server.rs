@@ -422,7 +422,8 @@ impl Server {
         let cursor = args.remove("cursor");
         let digest = cursor::digest(tool.name, &args);
         // after the digest: an `after` window's span moves with the clock
-        let aggregated = default_aggregation(tool, &mut args, chrono::Utc::now());
+        let mut averaged = args.clone();
+        let mut aggregated = default_aggregation(tool, &mut averaged, chrono::Utc::now());
         let offset = match cursor {
             Some(Checked::One(c)) => match cursor::decode(&c, tool.name, digest) {
                 Ok(offset) => offset,
@@ -438,6 +439,16 @@ impl Server {
         let mut answer = self
             .run(tool.op, tools::build(tool, &args, limit, offset))
             .await;
+        // averages only for a history the broker cut: a raw answer that fits
+        // is what the NGSI-LD door serves for the same call (T-5028)
+        if aggregated.is_some() && answer.status.is_success() && answer.range.is_some() {
+            args = averaged;
+            answer = self
+                .run(tool.op, tools::build(tool, &args, limit, offset))
+                .await;
+        } else {
+            aggregated = None;
+        }
         log_call(&self.id, tool, answer.status);
         if !answer.status.is_success() {
             return failed(&answer);
@@ -590,7 +601,7 @@ fn limits_note(tool: &str) -> Option<String> {
         )),
         "batch_query_temporal" => Some(history()),
         "query_temporal" | "retrieve_temporal" => Some(format!(
-            "{} A window over a day answers hourly averages unless format or lastN asks raw values.",
+            "{} A window over a day the broker cuts answers hourly averages unless format or lastN asks raw values.",
             history()
         )),
         _ => None,
@@ -601,6 +612,8 @@ fn limits_note(tool: &str) -> Option<String> {
 /// a longer window, unless the call asks raw (`format`, `lastN`) or names
 /// its own aggregation, answers hourly averages (a week is 168 per
 /// Attribute), daily past 31 days, so one answer stays a few thousand tokens.
+/// The caller sends these arguments only when the raw read came back cut
+/// (T-5028): a history that fits one answer stays raw, as over REST.
 /// Only a window with two ends is measured: `before` has no start. The note
 /// says what was done and how to ask raw.
 fn default_aggregation(

@@ -396,22 +396,37 @@ async fn a_cut_history_names_the_window_that_continues_it() -> Result<(), String
     Ok(())
 }
 
-/// T-4800: a history window over a day that asks no raw values answers
-/// hourly averages and says so.
+/// T-4800, T-5028: a history window over a day that asks no raw values and
+/// that the broker cuts (more than its default 100 instances) answers hourly
+/// averages and says so.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_long_history_window_answers_hourly_averages() -> Result<(), String> {
+async fn a_long_cut_history_window_answers_hourly_averages() -> Result<(), String> {
     let f = fixture().await?;
     let now = chrono::Utc::now();
-    let week = |d: i64| {
-        (now - chrono::Duration::days(d))
+    let ago = |minutes: i64| {
+        (now - chrono::Duration::minutes(minutes))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string()
     };
+    let id = "urn:ngsi-ld:Car:h";
+    create(
+        &f.app,
+        "city",
+        &json!({"id": id, "type": "Car",
+                "speed": {"type": "Property", "value": 0, "observedAt": ago(150)}}),
+    )
+    .await?;
+    for i in (0..150).rev() {
+        let attrs = json!({"speed": {"type": "Property", "value": i % 80, "observedAt": ago(i)}});
+        let uri = format!("/ngsi-ld/v1/entities/{id}/attrs");
+        let s = send(&f.app, axum::http::Method::PATCH, &uri, "city", &attrs).await;
+        assert!(s.is_success(), "update {i}: {s}");
+    }
     let a = call(
         &f.app,
         "cars",
         "retrieve_temporal",
-        json!({"id": "urn:ngsi-ld:Car:1", "timerel": "between", "timeAt": week(7), "endTimeAt": week(0)}),
+        json!({"id": id, "timerel": "between", "timeAt": ago(7 * 24 * 60), "endTimeAt": ago(-1)}),
     )
     .await;
     assert!(!a.is_error(), "{}", a.text);
@@ -422,6 +437,45 @@ async fn a_long_history_window_answers_hourly_averages() -> Result<(), String> {
         .unwrap_or_default();
     assert!(
         note.as_str().is_some_and(|n| n.contains("hourly")),
+        "{}",
+        a.text
+    );
+    Ok(())
+}
+
+/// T-5028: a history older than a day that fits one answer stays raw, the
+/// instances the NGSI-LD door serves for the same call, with no aggregation.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_history_that_fits_one_answer_stays_raw() -> Result<(), String> {
+    let f = fixture().await?;
+    let id = "urn:ngsi-ld:Car:old";
+    create(
+        &f.app,
+        "city",
+        &json!({"id": id, "type": "Car",
+                "speed": {"type": "Property", "value": 42, "observedAt": "2026-05-01T10:00:00Z"}}),
+    )
+    .await?;
+    let a = call(
+        &f.app,
+        "cars",
+        "retrieve_temporal",
+        json!({"id": id, "timerel": "after", "timeAt": "2026-01-01T00:00:00Z", "attrs": ["speed"]}),
+    )
+    .await;
+    assert!(!a.is_error(), "{}", a.text);
+    let s = a.structured();
+    assert!(s.get("aggregation").is_none(), "{}", a.text);
+    let speed = s.pointer("/entity/speed").cloned().unwrap_or_default();
+    let instances = match speed {
+        Value::Array(v) => v,
+        one => vec![one],
+    };
+    assert_eq!(instances.len(), 1, "{}", a.text);
+    assert_eq!(instances[0].get("value"), Some(&json!(42)), "{}", a.text);
+    assert_eq!(
+        instances[0].get("observedAt"),
+        Some(&json!("2026-05-01T10:00:00Z")),
         "{}",
         a.text
     );
