@@ -436,3 +436,157 @@ async fn ws_the_every_view_with_a_q_joins_no_entity_outside_it() {
         );
     }
 }
+
+/// Replaces `view` of `tenant` while its sockets stay open: every `/q/views`
+/// write reloads the table, and each notification is projected under the
+/// view in force when it leaves (T-4874).
+async fn replace_view(app: &Router, tenant: &str, id: &str, view: Value) {
+    let mut view = view;
+    view["id"] = json!(id);
+    view["tenant"] = json!(tenant);
+    view["operations"] = json!(antares_ops::OperationId::ALL
+        .iter()
+        .map(|op| op.id())
+        .collect::<Vec<_>>());
+    let uri = format!("/q/views/{id}");
+    let (status, body) = send(app, "PUT", &uri, &[], Some(&view)).await;
+    assert!(status.is_success(), "{uri}: {status} {body}");
+}
+
+/// T-4874 race: a view narrowed while about 1 000 changes a second flow to
+/// an open socket. Notifications leave in order, so everything from the
+/// first one carrying a marker written after the narrowing on left after
+/// it: none of them carries the removed Attribute, and the socket stays up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_a_view_narrowed_mid_stream_stops_the_removed_attribute_at_once() {
+    let (app, _reload, port) = broker().await;
+    let tenant = "rev-a";
+    let rules = |attributes: &[&str]| {
+        json!({"selector": ["Vehicle"],
+               "rules": [{"types": ["Vehicle"], "attributes": attributes}]})
+    };
+    install(&app, tenant, &[("rev-race", rules(&["speed", "operator"]))]).await;
+    let all = json!({"type": "Subscription", "entities": [{"type": "Vehicle"}]});
+    let (made, socket) = subscribe(port, "rev-race", &[], all).await;
+    assert_eq!(made["metadata"]["x-status"], 201, "{made}");
+    let reader = tokio::spawn(drain(socket));
+    let marker = "urn:ngsi-ld:Vehicle:rev:marker";
+    let batch = |round: i64| {
+        Value::Array(
+            (0..20)
+                .map(|n| vehicle(&format!("urn:ngsi-ld:Vehicle:rev:{n}"), round, "city", 0))
+                .collect(),
+        )
+    };
+    // 20 Entities every 20 ms: 1 000 changes a second.
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    let mut sent = 0;
+    for round in 0..100 {
+        tick.tick().await;
+        if round == 50 {
+            replace_view(&app, tenant, "rev-race", rules(&["speed"])).await;
+            write(&app, tenant, &json!([vehicle(marker, -1, "city", 0)])).await;
+        }
+        write(&app, tenant, &batch(round)).await;
+        sent += 20;
+    }
+    let messages = reader.await.expect("read");
+    let ops: Vec<&Value> = messages.iter().map(|m| &m["metadata"]["x-op"]).collect();
+    assert!(
+        !ops.iter().any(|op| *op == "x-closing" || *op == "x-gap"),
+        "the socket kept up with {sent} changes: {ops:?}"
+    );
+    let got = notified(&messages);
+    let at = got
+        .iter()
+        .position(|e| e["id"] == marker)
+        .expect("the marker reached the socket");
+    assert!(
+        got[..at].iter().any(|e| names(e).contains("operator")),
+        "the wide view delivered operator before the change"
+    );
+    let leaked: Vec<&&Value> = got[at..]
+        .iter()
+        .filter(|e| names(e).contains("operator"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "removed data after the change: {leaked:?}"
+    );
+}
+
+/// T-4874: a Policy grant withdrawn while a socket is open stops its
+/// deliveries with the next change; a view widened while it is open never
+/// reaches past what the Subscription asked for (its type and
+/// `notification.attributes`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_a_revoked_grant_stops_and_a_widened_view_never_widens_a_subscription() {
+    let (app, _reload, port) = broker().await;
+    let tenant = "rev-b";
+    let narrow = json!({"selector": ["Vehicle"],
+                        "rules": [{"types": ["Vehicle"], "attributes": ["speed"]}]});
+    install(&app, tenant, &[("rev-grant", narrow)]).await;
+    let all = json!({"type": "Subscription", "entities": [{"type": "Vehicle"}]});
+    let (made, revoked) = subscribe(port, "rev-grant", &[], all).await;
+    assert_eq!(made["metadata"]["x-status"], 201, "{made}");
+    let speed_only = json!({"type": "Subscription", "entities": [{"type": "Vehicle"}],
+                            "notification": {"attributes": ["speed"]}});
+    let (made, widened) = subscribe(port, "rev-grant", &[], speed_only).await;
+    assert_eq!(made["metadata"]["x-status"], 201, "{made}");
+    write(
+        &app,
+        tenant,
+        &json!([vehicle("urn:ngsi-ld:Vehicle:rev:1", 1, "city", 1)]),
+    )
+    .await;
+    let (revoked, before) = until_notified(revoked).await;
+    assert_eq!(notified(&before).len(), 1, "{before:?}");
+    let (widened, _) = until_notified(widened).await;
+
+    replace_view(
+        &app,
+        tenant,
+        "rev-grant",
+        json!({"selector": ["Vehicle", CANARY_TYPE],
+               "rules": [{"types": ["Vehicle"], "attributes": ["speed", "operator", CANARY]},
+                         {"types": [CANARY_TYPE], "attributes": [CANARY]}]}),
+    )
+    .await;
+    write(
+        &app,
+        tenant,
+        &json!([vehicle("urn:ngsi-ld:Vehicle:rev:1", 2, "bus", 2),
+        {"id": "urn:ngsi-ld:Canary:rev:1", "type": CANARY_TYPE,
+         CANARY: {"type": "Property", "value": 1}}]),
+    )
+    .await;
+    let (widened, after) = until_notified(widened).await;
+    let got = notified(&after);
+    assert!(
+        got.iter()
+            .all(|e| e["type"] == "Vehicle" && names(e) == BTreeSet::from(["speed"])),
+        "past the Subscription: {after:?}"
+    );
+
+    let only_seed = json!({"policies": [
+        {"id": "seed", "assignee": {"kind": "serviceAccount", "id": SEEDER},
+         "operations": ["5.6.1", "5.6.2", "5.6.3", "5.6.8", "5.6.10"]}
+    ]});
+    let uri = format!("/q/policy/{tenant}");
+    let (status, body) = send(&app, "PUT", &uri, &[], Some(&only_seed)).await;
+    assert!(status.is_success(), "{uri}: {status} {body}");
+    write(
+        &app,
+        tenant,
+        &json!([vehicle("urn:ngsi-ld:Vehicle:rev:1", 3, "city", 3)]),
+    )
+    .await;
+    for (name, socket) in [("revoked", revoked), ("widened", widened)] {
+        let messages = drain(socket).await;
+        let got = notified(&messages);
+        assert!(
+            got.iter().all(|e| e["speed"]["value"] != 3),
+            "{name}: delivered after the grant was withdrawn: {messages:?}"
+        );
+    }
+}
