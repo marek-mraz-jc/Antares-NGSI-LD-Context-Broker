@@ -9,7 +9,8 @@
 #   BIN_SURFACES=target/release/antares-full dev/perf/shapes.sh
 #                                               # + ADR-0027 section 6 rows
 #
-# Env: BIN (target/release/antares), BIN_SURFACES (unset: a `full` build,
+# Env: BIN (target/release/antares), SETUP (a command run against PORT once
+#      each broker answers, before its seed), BIN_SURFACES (unset: a `full` build,
 #      whose `query`, `view`, `odata` and `mcp` rows follow the vanilla
 #      ones), SURFACE_VUS (50: their closed-loop clients), OUT
 #      (results/perf), PORT (9471),
@@ -54,26 +55,45 @@ seed() {  # seed <store>: ENTITIES Vehicles into the broker on PORT, settled
   k6 run --quiet -e BROKER_URL="http://127.0.0.1:$PORT" -e SHAPE=seed \
     -e ENTITIES="${ENTITIES:-100}" dev/perf/k6-shapes.js >/dev/null
   # a seed that did not land would measure an empty broker
-  curl -sf -o /dev/null "http://127.0.0.1:$PORT/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:shape:$(( ${ENTITIES:-100} - 1 ))" \
+  curl -sf -o /dev/null ${JC_SUBJECT:+-H "x-jc-subject: $JC_SUBJECT" -H "x-jc-roles: ${JC_ROLES:-}"} \
+    "http://127.0.0.1:$PORT/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:shape:$(( ${ENTITIES:-100} - 1 ))" \
     || { echo "$1: seed missing" >&2; exit 1; }
   if [ "$1" = postgres ]; then
     psql "$DATABASE_URL" -qX -v ON_ERROR_STOP=1 -c 'VACUUM (ANALYZE)' -c 'CHECKPOINT'
   fi
 }
 
-unseed() {  # the seeded Vehicles out again, so a PostgreSQL keeps nothing
+unseed() {  # unseed <store>: the seeded Vehicles out again, so a PostgreSQL keeps nothing
   k6 run --quiet -e BROKER_URL="http://127.0.0.1:$PORT" -e SHAPE=unseed \
     -e ENTITIES="${ENTITIES:-100}" dev/perf/k6-shapes.js >/dev/null
+  # and gives the space back: a plain VACUUM leaves a 100 000-entity seed's
+  # pages in the files, and the next run's 1 000-entity query-q scanned
+  # them (perf-baseline.md section 5, T-4853)
+  if [ "$1" = postgres ]; then
+    psql "$DATABASE_URL" -qX -v ON_ERROR_STOP=1 -c 'VACUUM (FULL, ANALYZE)'
+  fi
 }
 
 {
+  # this block is a subshell (the pipe into tee): it stops its own broker
+  # when a row fails, or the next run's health check reads that broker
+  trap '[ -z "${PID:-}" ] || { kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; }' EXIT
+  if curl -sf -o /dev/null "http://127.0.0.1:$PORT/q/health"; then
+    echo "port $PORT already answers: another broker would be measured" >&2; exit 1
+  fi
   echo "| store | shape | concurrency | req/s | p99 |"
   echo "|---|---|---|---|---|"
   for store in memory ${DATABASE_URL:+postgres}; do
     ANTARES_STORE="$store" ANTARES_DATA_DIR="$DATA" ANTARES_HTTP_PORT="$PORT" \
       ANTARES_DATABASE_URL="${DATABASE_URL:-}" ANTARES_ALLOW_SHARED_LOCAL=1 \
       "$BIN" > "$OUT/shapes-$store.log" 2>&1 & PID=$!
-    until curl -sf -o /dev/null "http://127.0.0.1:$PORT/q/health"; do sleep 0.05; done
+    until curl -sf -o /dev/null "http://127.0.0.1:$PORT/q/health"; do
+      kill -0 "$PID" 2>/dev/null || { echo "broker exited: $OUT/shapes-$store.log" >&2; exit 1; }
+      sleep 0.05
+    done
+    # SETUP: a command that configures the started broker before its seed
+    # (dev/perf/platform-overhead.sh loads views and a policy document)
+    [ -z "${SETUP:-}" ] || PORT="$PORT" $SETUP || { echo "$store: SETUP failed" >&2; exit 1; }
     echo "shapes $store seed" > "$OUT/phase"
     seed "$store"
     IFS=, read -ra specs <<<"${SPECS:-query 50,query 200,retrieve 50}"
@@ -92,7 +112,7 @@ unseed() {  # the seeded Vehicles out again, so a PostgreSQL keeps nothing
       [ -n "${rps:-}" ] || { echo "$store $shape: no number" >&2; exit 1; }
       echo "| $store | $shape | c$vus | $rps | $p99 ms |"
     done
-    unseed
+    unseed "$store"
     kill "$PID"; wait "$PID" 2>/dev/null || true; PID=
   done
   # ADR-0027 section 6 end to end (T-3523): the `full` binary with view
@@ -106,7 +126,10 @@ unseed() {  # the seeded Vehicles out again, so a PostgreSQL keeps nothing
     ANTARES_STORE=memory ANTARES_DATA_DIR="$DATA/surfaces" ANTARES_HTTP_PORT="$PORT" \
       ANTARES_ALLOW_SHARED_LOCAL=1 ANTARES_API_SURFACES=admin,views,odata,mcp \
       ANTARES_SCHEMA_MAX_BYTES=65536 "$BIN_SURFACES" > "$OUT/shapes-surfaces.log" 2>&1 & PID=$!
-    until curl -sf -o /dev/null "http://127.0.0.1:$PORT/q/health"; do sleep 0.05; done
+    until curl -sf -o /dev/null "http://127.0.0.1:$PORT/q/health"; do
+      kill -0 "$PID" 2>/dev/null || { echo "broker exited: $OUT/shapes-surfaces.log" >&2; exit 1; }
+      sleep 0.05
+    done
     put() {  # put <path> <json>: fails the run on a refusal
       curl -sf -o /dev/null -X PUT -H 'Content-Type: application/json' --data "$2" \
         "http://127.0.0.1:$PORT$1" || { echo "PUT $1 refused" >&2; exit 1; }

@@ -46,6 +46,10 @@ antares-sql = { workspace = true, features = ["test-kit"] }
 antares-jsonld = { workspace = true }
 proptest = { workspace = true }
 
+[[bench]]
+name = "core_paths"
+harness = false
+
 [features]
 # The Pg arm is the only part of this crate that cannot cross to wasm32
 # (sqlx needs sockets). Default-on everywhere else; the browser build turns
