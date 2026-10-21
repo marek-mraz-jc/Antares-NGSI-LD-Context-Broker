@@ -923,6 +923,12 @@ mod tests {
             std::collections::HashSet::from(["town".to_owned()])
         );
         assert!(opted.space_off.is_empty());
+        // a `*` rule that names no history opts nothing in, nor out
+        let silent = parse(br#"{"rules":[{"type":"*"}]}"#).unwrap_or_default();
+        assert_eq!(silent.len(), 1);
+        let neither = history_off(&vec![(TenantId::new("town").expect("tenant"), silent)]);
+        assert!(neither.space_on.is_empty());
+        assert!(neither.space_off.is_empty());
         assert_eq!(
             gate.ruled,
             std::collections::HashSet::from([pair("Keep"), pair("Week")])
@@ -1089,19 +1095,21 @@ mod tests {
         )
         .expect("rules");
         let spot = rules[0].recording.as_ref().expect("onChange");
-        let on_change = |attr: &str| match spot.of(attr) {
-            Some(antares_api::RecordMode::OnChange(m)) => Some(m),
-            _ => None,
+        let on_change = |heartbeat, deadband, min_distance| {
+            Some(antares_api::RecordMode::OnChange(antares_api::OnChange {
+                heartbeat: std::time::Duration::from_secs(heartbeat),
+                deadband,
+                min_distance,
+            }))
         };
-        let hour = std::time::Duration::from_secs(3600);
         assert_eq!(
-            on_change("https://e.org/status").map(|m| (m.heartbeat, m.deadband)),
-            Some((hour, Some(1.0)))
+            spot.of("https://e.org/status"),
+            on_change(3600, Some(1.0), None)
         );
         assert_eq!(spot.of("https://e.org/count"), None, "every");
         assert_eq!(
-            on_change("https://e.org/location").and_then(|m| m.min_distance),
-            Some(5.0)
+            spot.of("https://e.org/location"),
+            on_change(900, None, Some(5.0))
         );
         assert!(rules[1].recording.is_none(), "every, the default");
         // T-5056: observed takes no settings, for the type or an attribute
