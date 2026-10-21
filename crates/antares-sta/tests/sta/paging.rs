@@ -137,15 +137,12 @@ async fn a_datastream_inlines_its_observations_under_expand() -> Result<(), Stri
         .cloned()
         .unwrap_or_default();
     assert_eq!(inlined.len(), 1, "{first}");
-    let stream = at(&first, "/@iot.id");
     assert_eq!(
         at(
             &at(&first, "/Observations/0"),
             "/Datastream@iot.navigationLink"
-        )
-        .as_str()
-        .map(|l| l.contains(stream.as_str().unwrap_or("-"))),
-        Some(true)
+        ),
+        at(&first, "/@iot.selfLink")
     );
     let plain = sta(&f.app, "/Datastreams?$top=1").await;
     assert!(at(&plain.body, "/value/0").get("Observations").is_none());

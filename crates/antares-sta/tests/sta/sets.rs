@@ -250,7 +250,7 @@ async fn observations_are_the_current_instants_and_a_datastreams_its_history() -
     let next = at(&page.body, "/@iot.nextLink");
     assert_eq!(
         next,
-        format!("{BASE}/Datastreams('urn:ngsi-ld:Car:1/speed')/Observations?%24top=1&$skip=2")
+        format!("{BASE}/Datastreams('urn:ngsi-ld:Car:1%2Fspeed')/Observations?%24top=1&$skip=2")
     );
     let last = send(&f.app, "GET", &local(next.as_str().unwrap_or_default()), "").await;
     assert_eq!(
@@ -344,5 +344,58 @@ async fn features_of_interest_are_the_point_of_interest_or_the_entitys_own_locat
             "{missing}"
         );
     }
+    Ok(())
+}
+
+/// A client follows the links an answer gives (T-5013): the `#` of a datasetId Datastream id
+/// is encoded in its selfLink and navigationLinks, so the link reads that Datastream, its
+/// Observations and its Thing, never the default instance a raw `#` would cut it down to.
+#[tokio::test]
+async fn links_of_a_dataset_datastream_lead_back_to_it() -> Result<(), String> {
+    let f = fixture().await?;
+    let id = "urn:ngsi-ld:Car:1/NO2#urn:ngsi-ld:Dataset:a";
+    let of = sta(
+        &f.app,
+        "/Things('urn:ngsi-ld:Car:1')/Datastreams?$expand=Observations",
+    )
+    .await;
+    let stream = of
+        .body
+        .get("value")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .find(|s| at(s, "/@iot.id") == id)
+        .cloned()
+        .ok_or_else(|| format!("no {id}: {}", of.body))?;
+    let follow = |link: serde_json::Value| {
+        let link = link.as_str().unwrap_or_default().to_owned();
+        assert!(!link.contains('#'), "{link}");
+        link.strip_prefix(BASE).map(str::to_owned).unwrap_or(link)
+    };
+    let own = sta(&f.app, &follow(at(&stream, "/@iot.selfLink"))).await;
+    assert_eq!(own.status, StatusCode::OK, "{}", own.body);
+    assert_eq!(at(&own.body, "/@iot.id"), id);
+    // NO2 carries no observedAt, so its history is empty: the link reads that Datastream's
+    // series (200), where a raw `#` would leave `Datastreams('…/NO2` (404)
+    let series = sta(
+        &f.app,
+        &follow(at(&stream, "/Observations@iot.navigationLink")),
+    )
+    .await;
+    assert_eq!(series.status, StatusCode::OK, "{}", series.body);
+    let observation = &at(&stream, "/Observations/0");
+    assert_eq!(at(observation, "/result"), json!(16.0), "{stream}");
+    let back = sta(
+        &f.app,
+        &follow(at(observation, "/Datastream@iot.navigationLink")),
+    )
+    .await;
+    assert_eq!(at(&back.body, "/@iot.id"), id);
+    let own_link = sta(&f.app, &follow(at(observation, "/@iot.selfLink"))).await;
+    assert_eq!(own_link.status, StatusCode::OK, "{}", own_link.body);
+    assert_eq!(at(&own_link.body, "/result"), json!(16.0));
+    let thing = sta(&f.app, &follow(at(&stream, "/Thing@iot.navigationLink"))).await;
+    assert_eq!(at(&thing.body, "/@iot.id"), "urn:ngsi-ld:Car:1");
     Ok(())
 }

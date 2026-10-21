@@ -14,10 +14,16 @@ pub const UNCEFACT: &str = "https://vocabulary.uncefact.org/UnitMeasureCode#";
 /// The `observationType` of a numeric measurement.
 const MEASUREMENT: &str = "http://www.opengis.net/def/observationType/OGC-OM/2.0/OM_Measurement";
 
-/// One resource's self link, its id as an OData key literal (a quote written twice).
+/// One resource's self link, its id as an OData key literal (a quote written twice),
+/// percent-encoded but for the unreserved characters, `:` and the quote: no id character ends
+/// the path (`#`, `?`), adds a segment (`/`, so no `..` a client resolves) or escapes (`%`).
+/// The route decodes the path once before it reads the key (T-5013).
 #[must_use]
 pub fn self_link(base: &str, set: &str, id: &str) -> String {
-    format!("{base}/{set}('{}')", id.replace('\'', "''"))
+    let key = antares_ops::percent::encode(&id.replace('\'', "''"))
+        .replace("%3A", ":")
+        .replace("%27", "'");
+    format!("{base}/{set}('{key}')")
 }
 
 /// The last segment of a name an answer spells as an IRI, the name itself otherwise: the term a
@@ -732,6 +738,23 @@ mod tests {
             self_link(BASE, "Things", "urn:a'b"),
             format!("{BASE}/Things('urn:a''b')")
         );
+        for (id, key) in [
+            ("urn:a/NO2#ds", "urn:a%2FNO2%23ds"),
+            ("urn:a?b", "urn:a%3Fb"),
+            ("urn:a b", "urn:a%20b"),
+            ("urn:a%2F", "urn:a%252F"),
+            ("urn:á", "urn:%C3%A1"),
+            ("urn:a')/../x", "urn:a''%29%2F..%2Fx"),
+        ] {
+            let link = self_link(BASE, "Datastreams", id);
+            assert_eq!(link, format!("{BASE}/Datastreams('{key}')"), "{id}");
+            // what the route does with it: decode the path once, then read the key
+            let path = link.strip_prefix(BASE).unwrap_or_default();
+            let decoded = antares_ops::percent::decoded(path).unwrap_or_default();
+            let steps = crate::query::steps(&decoded);
+            let keys: Vec<_> = steps.iter().map(|s| s.key.as_deref()).collect();
+            assert_eq!(keys, [Some(id)], "{id}: {decoded}");
+        }
         assert_eq!(object(&car(), "at"), Some("urn:ngsi-ld:Stop:1"));
         assert_eq!(object(&car(), "home"), None);
     }
