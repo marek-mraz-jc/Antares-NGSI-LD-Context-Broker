@@ -34,7 +34,7 @@ use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
 use axum::Router;
 use mapping::{local, self_link, urn_of};
-use query::{Options, Step};
+use query::{ById, Options, Step};
 use serde_json::{json, Value};
 
 /// Where the broker mounts the surface; the view and `sta/v1.1` follow.
@@ -61,6 +61,9 @@ const CONFORMANCE: [&str; 3] = [
 
 /// The start of every location history a HistoricalLocations page reads.
 const EPOCH: &str = "1970-01-01T00:00:00Z";
+
+/// The most Entities a `$skip` on a set of several resources per Entity walks to find its start.
+const WALK: usize = 10 * query::MAX_TOP;
 
 /// The SensorThings surface.
 #[derive(Debug, Clone, Copy, Default)]
@@ -231,12 +234,17 @@ impl Cx<'_> {
             .unwrap_or_else(|| name.to_owned())
     }
 
-    /// The `&q=` of `$filter`, empty without one.
-    fn filter(&self) -> Result<String, Problem> {
-        match &self.opts.filter {
-            Some(f) => Ok(format!("&q={}", encode(&query::filter_to_q(f)?))),
-            None => Ok(String::new()),
-        }
+    /// `$filter` of an entity set: its id comparisons and the `&q=` of the rest, empty without.
+    fn filter(&self) -> Result<(ById, String), Problem> {
+        let ids = match &self.opts.filter {
+            Some(f) => query::by_id(f)?,
+            None => ById::default(),
+        };
+        let q = ids
+            .q
+            .as_ref()
+            .map_or_else(String::new, |q| format!("&q={}", encode(q)));
+        Ok((ids, q))
     }
 
     /// One Query Entities through the view: the Entities, whether more remain past them, and
@@ -246,8 +254,10 @@ impl Cx<'_> {
         extra: &str,
         page: Page,
     ) -> Result<(Vec<Value>, bool, Option<usize>), Problem> {
+        // `modifiedAt` is the time of a value no sensor observed (STA 1.1 phenomenonTime).
         let pushdown = Pushdown {
             query: format!("{}{extra}", self.selector()),
+            sys_attrs: true,
             ..Pushdown::default()
         };
         match self.view.scan(self.caller, &pushdown, None, page).await {
@@ -332,13 +342,26 @@ impl Cx<'_> {
 
     /// A page of an entity set: one Query Entities of `$top` Entities from `$skip`.
     async fn set(&self, set: &str) -> Done {
-        let extra = self.filter()?;
-        let path = format!("{}/{set}", self.base);
-        if set == "HistoricalLocations" {
-            return self.moves(&extra, &path).await;
-        }
         if !SETS.contains(&set) {
             return Err(not_found());
+        }
+        let (ids, extra) = self.filter()?;
+        let path = format!("{}/{set}", self.base);
+        if let Some(key) = ids.is.first() {
+            if ids.q.is_some() {
+                return Err(Problem(
+                    StatusCode::BAD_REQUEST,
+                    "$filter: id eq takes no comparison beside id ne".into(),
+                ));
+            }
+            let items = self.one(set, key).await?.into_iter().collect();
+            return Ok(self.listed(&path, items, true, &ids));
+        }
+        if set == "HistoricalLocations" {
+            return self.moves(&extra, &path, &ids).await;
+        }
+        if matches!(set, "Datastreams" | "Observations" | "ObservedProperties") {
+            return self.resources(set, &extra, &path, &ids).await;
         }
         let page = Page {
             start: self.opts.skip,
@@ -368,8 +391,89 @@ impl Cx<'_> {
             }
             _ => entities.iter().map(|e| self.items(set, e)).collect(),
         };
-        // Only a Thing is one Entity, so only its count is the operation's.
-        Ok(self.page(&path, groups, more, count.filter(|_| set == "Things")))
+        // Only a Thing is one Entity, so only its count is the operation's, and only while no
+        // id is left out of the page after the read.
+        let count = count.filter(|_| set == "Things" && ids.not.is_empty());
+        Ok(self.page(&path, groups, more, count, &ids))
+    }
+
+    /// A page of a set an Entity holds several resources of: `$top` resources from the start
+    /// [`Cx::resume`] finds, `@iot.nextLink` resuming after the last one served.
+    async fn resources(&self, set: &str, extra: &str, path: &str, ids: &ById) -> Done {
+        let (first, skipped) = self.resume(set, extra).await?;
+        let page = Page {
+            start: first,
+            size: self.opts.top,
+            whole: false,
+        };
+        let (entities, more, _) = self.entities(extra, page).await?;
+        // One group per resource, and where the next page resumes after each.
+        let (mut groups, mut after) = (Vec::new(), Vec::new());
+        for (n, e) in entities.iter().enumerate() {
+            let at = first.saturating_add(n);
+            let items = self.items(set, e);
+            let held = items.len();
+            let from = if n == 0 { skipped } else { 0 };
+            for (i, item) in items.into_iter().enumerate().skip(from) {
+                let done = i.saturating_add(1);
+                after.push(if done == held {
+                    (at.saturating_add(1), 0)
+                } else {
+                    (at, done)
+                });
+                groups.push(vec![item]);
+            }
+        }
+        let read = groups.len();
+        groups.truncate(self.opts.top);
+        let (items, served) = query::fit(groups);
+        let resume = if served < read {
+            after.get(served.saturating_sub(1)).copied()
+        } else {
+            more.then_some((first.saturating_add(entities.len()), 0))
+        };
+        let next = resume.map(|(e, i)| self.link(path, "$skiptoken", &format!("{e}.{i}")));
+        Ok(self.finish(items, next, None, (first, skipped) == (0, 0), ids))
+    }
+
+    /// Where a page of [`Cx::resources`] starts, as an Entity offset and the resources of that
+    /// Entity already served: the `$skiptoken`, else `$skip` resources counted from the first
+    /// Entity, a page of Entities at a time over at most [`WALK`] of them.
+    async fn resume(&self, set: &str, extra: &str) -> Result<(usize, usize), Problem> {
+        if let Some(at) = self.opts.resume {
+            return Ok(at);
+        }
+        let (mut left, mut at) = (self.opts.skip, 0usize);
+        let reads = WALK / query::MAX_TOP;
+        for read in 0..=reads {
+            if left == 0 {
+                return Ok((at, 0));
+            }
+            if read == reads {
+                break;
+            }
+            let page = Page {
+                start: at,
+                size: query::MAX_TOP,
+                whole: false,
+            };
+            let (entities, more, _) = self.entities(extra, page).await?;
+            for e in &entities {
+                let held = self.items(set, e).len();
+                if left < held {
+                    return Ok((at, left));
+                }
+                left = left.saturating_sub(held);
+                at = at.saturating_add(1);
+            }
+            if !more {
+                return Ok((at, 0));
+            }
+        }
+        Err(Problem(
+            StatusCode::BAD_REQUEST,
+            format!("$skip: deeper than {WALK} Entities into this set; follow @iot.nextLink"),
+        ))
     }
 
     /// The resources one Entity holds of a set read from its current state.
@@ -381,7 +485,10 @@ impl Cx<'_> {
                 mapping::thing(base, e, &expand).into_iter().collect()
             }
             "Locations" => mapping::location(base, e).into_iter().collect(),
-            "Datastreams" => mapping::datastreams(base, e),
+            "Datastreams" => {
+                let expand: Vec<&str> = self.opts.expand.iter().map(String::as_str).collect();
+                mapping::datastreams(base, e, &expand)
+            }
             "Observations" => mapping::observations(base, e),
             _ => mapping::observed_properties(base, e),
         }
@@ -414,7 +521,7 @@ impl Cx<'_> {
 
     /// A page of HistoricalLocations: one Query Temporal Evolution of the `location` history of
     /// `$top` Entities from `$skip`.
-    async fn moves(&self, extra: &str, path: &str) -> Done {
+    async fn moves(&self, extra: &str, path: &str, ids: &ById) -> Done {
         let (top, skip) = (self.opts.top, self.opts.skip);
         // ponytail: the last MAX_TOP moves of each Entity; a window per Entity when a client
         // pages a long history through this set rather than through its Thing.
@@ -436,7 +543,7 @@ impl Cx<'_> {
             .iter()
             .map(|e| mapping::historical_locations(&self.base, e))
             .collect();
-        Ok(self.page(path, groups, more, None))
+        Ok(self.page(path, groups, more, None, ids))
     }
 
     /// One resource by id: its Entity read through the view, the resource found among those it
@@ -514,16 +621,23 @@ impl Cx<'_> {
                     "Locations"
                 };
                 let e = self.entity(Some(urn)).await?.ok_or_else(not_found)?;
-                return Ok(self.listed(&path, self.items(set, &e), true));
+                return Ok(self.listed(&path, self.items(set, &e), true, &ById::default()));
             }
             ("Sensors", "Datastreams") => {
                 return self
-                    .where_(&path, "refDevice", key, mapping::datastreams)
+                    .where_(&path, "refDevice", key, |b, e| {
+                        mapping::datastreams(b, e, &[])
+                    })
                     .await
             }
             ("FeaturesOfInterest", "Observations") if key.ends_with("/location") => {
                 let e = self.entity(Some(urn)).await?.ok_or_else(not_found)?;
-                return Ok(self.listed(&path, mapping::observations(&self.base, &e), true));
+                return Ok(self.listed(
+                    &path,
+                    mapping::observations(&self.base, &e),
+                    true,
+                    &ById::default(),
+                ));
             }
             ("FeaturesOfInterest", "Observations") => {
                 return self
@@ -575,7 +689,7 @@ impl Cx<'_> {
         let extra = format!("&q={}", encode(&q));
         let (entities, more, _) = self.entities(&extra, self.paged()).await?;
         let groups = entities.iter().map(|e| make(&self.base, e)).collect();
-        Ok(self.page(path, groups, more, None))
+        Ok(self.page(path, groups, more, None, &ById::default()))
     }
 
     /// A page of the Datastreams measuring one ObservedProperty: those of the Entities that
@@ -586,7 +700,7 @@ impl Cx<'_> {
         let groups = entities
             .iter()
             .map(|e| {
-                mapping::datastreams(&self.base, e)
+                mapping::datastreams(&self.base, e, &[])
                     .into_iter()
                     .filter(|d| {
                         mapping::split_stream(
@@ -597,7 +711,7 @@ impl Cx<'_> {
                     .collect()
             })
             .collect();
-        Ok(self.page(path, groups, more, None))
+        Ok(self.page(path, groups, more, None, &ById::default()))
     }
 
     /// The page of Entities `$skip` and `$top` ask for.
@@ -644,7 +758,7 @@ impl Cx<'_> {
                 (items, whole)
             }
         };
-        Ok(self.listed(path, items, whole))
+        Ok(self.listed(path, items, whole, &ById::default()))
     }
 
     /// The Observations of one Datastream: the history of its Attribute, `$skip` and `$top`
@@ -673,12 +787,12 @@ impl Cx<'_> {
         }
         let whole = items.len() <= ceiling;
         let path = format!("{}/Observations", self_link(&self.base, "Datastreams", key));
-        Ok(self.listed(&path, items, whole))
+        Ok(self.listed(&path, items, whole, &ById::default()))
     }
 
     /// A page of a list read whole, or cut at the ceiling when `whole` is false: `$skip` and
     /// `$top` applied here, each item its own group.
-    fn listed(&self, path: &str, items: Vec<Value>, whole: bool) -> Value {
+    fn listed(&self, path: &str, items: Vec<Value>, whole: bool, ids: &ById) -> Value {
         let total = items.len();
         let groups: Vec<Vec<Value>> = items
             .into_iter()
@@ -687,33 +801,60 @@ impl Cx<'_> {
             .map(|i| vec![i])
             .collect();
         let more = total > self.opts.skip.saturating_add(groups.len());
-        self.page(path, groups, more, whole.then_some(total))
+        self.page(path, groups, more, whole.then_some(total), ids)
     }
 
     /// The collection of a page of groups (one per Entity): cut at the byte budget between
     /// groups, one resource per id, `@iot.nextLink` when the cut or the view left more, and
     /// `@iot.count` when asked for and known: `known`, or the page itself when it is the whole
     /// answer.
-    fn page(&self, path: &str, groups: Vec<Vec<Value>>, more: bool, known: Option<usize>) -> Value {
+    fn page(
+        &self,
+        path: &str,
+        groups: Vec<Vec<Value>>,
+        more: bool,
+        known: Option<usize>,
+        ids: &ById,
+    ) -> Value {
         let read = groups.len();
-        let (mut items, served) = query::fit(groups);
-        let mut seen = BTreeSet::new();
-        items.retain(|i| seen.insert(i.get("@iot.id").map(Value::to_string)));
-        let more = more || served < read;
+        let (items, served) = query::fit(groups);
         let skip = self.opts.skip;
-        let next = more.then(|| {
-            let mut q: Vec<String> = self
-                .pairs
-                .iter()
-                .filter(|(k, _)| k != "$skip")
-                .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
-                .collect();
-            q.push(format!("$skip={}", skip.saturating_add(served)));
-            format!("{path}?{}", q.join("&"))
+        let next = (more || served < read)
+            .then(|| self.link(path, "$skip", &skip.saturating_add(served).to_string()));
+        self.finish(items, next, known, skip == 0, ids)
+    }
+
+    /// The collection of a page's resources: those `ids` admits, each id once, `@iot.count` when
+    /// asked for and `known` or, on a `first` page that is the whole answer, the page's own.
+    fn finish(
+        &self,
+        mut items: Vec<Value>,
+        next: Option<String>,
+        known: Option<usize>,
+        first: bool,
+        ids: &ById,
+    ) -> Value {
+        let mut seen = BTreeSet::new();
+        items.retain(|i| {
+            let id = i.get("@iot.id");
+            ids.admits(id.and_then(Value::as_str)) && seen.insert(id.map(Value::to_string))
         });
-        let derived = (!more && skip == 0).then_some(items.len());
+        let derived = (next.is_none() && first).then_some(items.len());
         let count = self.opts.count.then(|| known.or(derived)).flatten();
         query::collection(items, &self.opts.select, count, next)
+    }
+
+    /// The `@iot.nextLink` of `path`: the request's options, `name` set to `value` in place of
+    /// any `$skip` or `$skiptoken`.
+    fn link(&self, path: &str, name: &str, value: &str) -> String {
+        let mut q: Vec<String> = self
+            .pairs
+            .iter()
+            .filter(|(k, _)| k != "$skip" && k != "$skiptoken")
+            .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
+            .collect();
+        q.push(format!("{name}={value}"));
+        format!("{path}?{}", q.join("&"))
     }
 }
 

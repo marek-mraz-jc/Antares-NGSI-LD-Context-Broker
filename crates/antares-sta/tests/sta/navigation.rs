@@ -101,12 +101,12 @@ async fn a_single_navigation_answers_the_entity_and_a_collection_its_page() -> R
         "/FeaturesOfInterest('urn:ngsi-ld:Stop:1')/Observations",
     )
     .await;
-    assert_eq!(ids(&at_stop.body), ["urn:ngsi-ld:Car:2/speed"]);
-    let feature = sta(
-        &f.app,
-        "/Observations('urn:ngsi-ld:Car:2/speed')/FeatureOfInterest",
-    )
-    .await;
+    // No observedAt: the Observation's time is when the value was set (`modifiedAt`).
+    let Ok([oid]) = <[String; 1]>::try_from(ids(&at_stop.body)) else {
+        return Err(format!("one Observation at Stop:1: {}", at_stop.body));
+    };
+    assert!(oid.starts_with("urn:ngsi-ld:Car:2/speed/"), "{oid}");
+    let feature = sta(&f.app, &format!("/Observations('{oid}')/FeatureOfInterest")).await;
     assert_eq!(at(&feature.body, "/@iot.id"), "urn:ngsi-ld:Stop:1");
     Ok(())
 }

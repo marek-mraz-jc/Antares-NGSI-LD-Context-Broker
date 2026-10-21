@@ -41,6 +41,9 @@ pub struct Options {
     pub newest_first: bool,
     /// `$filter`, as sent.
     pub filter: Option<String>,
+    /// `$skiptoken` of a set whose Entity holds several resources, as its `@iot.nextLink` writes
+    /// it: the Entity offset and how many of that Entity's resources were served.
+    pub resume: Option<(usize, usize)>,
 }
 
 /// The query options of `pairs`.
@@ -56,6 +59,7 @@ pub fn options(pairs: &[(String, String)]) -> Result<Options, Bad> {
         expand: Vec::new(),
         newest_first: false,
         filter: None,
+        resume: None,
     };
     for (name, value) in pairs {
         match name.as_str() {
@@ -70,8 +74,9 @@ pub fn options(pairs: &[(String, String)]) -> Result<Options, Bad> {
                         format!("a path is at most {MAX_EXPAND} deep"),
                     ));
                 }
+                // `Observations($top=1)`: the set before its nested options.
                 out.expand = list(value)
-                    .filter_map(|p| p.split('/').next())
+                    .filter_map(|p| p.split(['/', '(']).next())
                     .map(str::to_owned)
                     .collect();
             }
@@ -83,6 +88,14 @@ pub fn options(pairs: &[(String, String)]) -> Result<Options, Bad> {
                 return Err(Bad("$filter", format!("at most {MAX_FILTER} bytes")));
             }
             "$filter" => out.filter = Some(value.clone()),
+            "$skiptoken" => {
+                let usage = || Bad("$skiptoken", "the value an @iot.nextLink carries".into());
+                let (entity, served) = value.split_once('.').ok_or_else(usage)?;
+                out.resume = Some((
+                    number("$skiptoken", entity, MAX_SKIP)?,
+                    number("$skiptoken", served, MAX_SKIP)?,
+                ));
+            }
             _ => {}
         }
     }
@@ -140,7 +153,7 @@ pub fn filter_to_q(filter: &str) -> Result<String, Bad> {
                 "not is not supported; write the negated comparison instead",
             ));
         } else {
-            out.push_str(&term(token));
+            out.push_str(&term(token)?);
             operand = false;
         }
     }
@@ -180,6 +193,9 @@ fn substring(rest: &mut &str) -> Result<String, Bad> {
     let (needle, attribute) = inner.split_once(',').ok_or_else(usage)?;
     let needle = needle.trim().trim_matches('\'');
     let attribute = attribute.trim();
+    if ID.contains(&attribute) {
+        return Err(bad("id takes eq or ne on the top-level and"));
+    }
     if needle.is_empty() || attribute.is_empty() {
         return Err(usage());
     }
@@ -187,13 +203,75 @@ fn substring(rest: &mut &str) -> Result<String, Bad> {
     Ok(format!("{attribute}~=\".*{needle}.*\""))
 }
 
+/// The names a resource's id goes by: no Attribute, so never a `q` operand.
+const ID: [&str; 2] = ["id", "@iot.id"];
+
 /// An operand: a quoted literal in NGSI-LD's quotes, a path its last segment (NGSI-LD has one
-/// flat Attribute namespace).
-fn term(token: &str) -> String {
-    match token.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
-        Some(text) => format!("\"{text}\""),
-        None => token.rsplit('/').next().unwrap_or(token).to_owned(),
+/// flat Attribute namespace). The id is refused: [`by_id`] reads its top-level comparisons.
+fn term(token: &str) -> Result<String, Bad> {
+    if ID.contains(&token) {
+        return Err(bad("id takes eq or ne on the top-level and"));
     }
+    Ok(
+        match token.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+            Some(text) => format!("\"{text}\""),
+            None => token.rsplit('/').next().unwrap_or(token).to_owned(),
+        },
+    )
+}
+
+/// A set's `$filter` split (T-4928): the resource ids its top-level `and` compares with `eq`
+/// and `ne`, which no `q` can name, and the `q` of the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ById {
+    /// `id eq` literals: the resource is each of them.
+    pub is: Vec<String>,
+    /// `id ne` literals: the resource is none of them.
+    pub not: Vec<String>,
+    /// The NGSI-LD `q` of every other conjunct.
+    pub q: Option<String>,
+}
+
+impl ById {
+    /// Whether the resource of `id` passes the id comparisons.
+    #[must_use]
+    pub fn admits(&self, id: Option<&str>) -> bool {
+        self.is.iter().all(|i| Some(i.as_str()) == id)
+            && !self.not.iter().any(|i| Some(i.as_str()) == id)
+    }
+}
+
+/// The `$filter` of an entity set as [`ById`].
+///
+/// # Errors
+/// [`Bad`] naming the construct: an id compared other than by `eq` or `ne` with a quoted literal,
+/// or anything [`filter_to_q`] refuses.
+pub fn by_id(filter: &str) -> Result<ById, Bad> {
+    let mut out = ById::default();
+    let mut rest = Vec::new();
+    for conjunct in conjuncts(filter) {
+        let mut words = conjunct.splitn(3, ' ');
+        let (first, operator, literal) = (words.next(), words.next(), words.next());
+        if !first.is_some_and(|f| ID.contains(&f)) {
+            rest.push(conjunct);
+            continue;
+        }
+        let literal = literal
+            .map(str::trim)
+            .and_then(|l| l.strip_prefix('\'')?.strip_suffix('\''))
+            .filter(|l| !l.is_empty())
+            .ok_or_else(|| bad("id compares with a quoted literal"))?
+            .replace("''", "'");
+        match operator.map(str::to_ascii_lowercase).as_deref() {
+            Some("eq") => out.is.push(literal),
+            Some("ne") => out.not.push(literal),
+            _ => return Err(bad("id takes eq or ne on the top-level and")),
+        }
+    }
+    if !rest.is_empty() {
+        out.q = Some(filter_to_q(&rest.join(" and "))?);
+    }
+    Ok(out)
 }
 
 /// A series `$filter`: the temporal window from its `phenomenonTime` predicates and the `q` of
@@ -432,8 +510,24 @@ mod tests {
                 expand: vec!["Locations".into(), "Datastreams".into()],
                 newest_first: true,
                 filter: Some("a eq 1".into()),
+                resume: None,
             })
         );
+        let nested = options(&pairs(&[
+            ("$expand", "Observations($top=1)"),
+            ("$skiptoken", "7.2"),
+        ]));
+        assert_eq!(
+            nested.as_ref().map(|o| (o.expand.clone(), o.resume)),
+            Ok((vec!["Observations".to_owned()], Some((7, 2))))
+        );
+        for token in ["7", "x.1", "10001.0", "1.-1"] {
+            assert_eq!(
+                options(&pairs(&[("$skiptoken", token)])).map_err(|b| b.0),
+                Err("$skiptoken"),
+                "{token}"
+            );
+        }
         assert_eq!(options(&pairs(&[("$top", "0")])).map(|o| o.top), Ok(1));
         assert_eq!(
             options(&pairs(&[("$orderby", "name")])).map(|o| o.newest_first),
@@ -453,6 +547,35 @@ mod tests {
             options(&pairs(&[("$filter", &huge)])).map_err(|b| b.0),
             Err("$filter")
         );
+    }
+
+    /// T-4928: a resource id is no Attribute; a `q` naming it scanned the whole store on prod.
+    #[test]
+    fn an_id_comparison_is_read_by_id_and_never_sent_as_q() {
+        assert_eq!(
+            by_id("id eq 'urn:a/x/2026' and speed gt 3 and @iot.id ne 'it''s'"),
+            Ok(ById {
+                is: vec!["urn:a/x/2026".into()],
+                not: vec!["it's".into()],
+                q: Some("speed>3".into()),
+            })
+        );
+        assert_eq!(by_id("speed gt 3").map(|b| b.q), Ok(Some("speed>3".into())));
+        for refused in [
+            "id gt 'a'",
+            "id eq 3",
+            "id eq ''",
+            "(id eq 'a')",
+            "speed gt 3 or id eq 'a'",
+            "substringof('a', id)",
+        ] {
+            assert_eq!(by_id(refused).map_err(|b| b.0), Err("$filter"), "{refused}");
+        }
+        let split = by_id("id eq 'a' and id ne 'b'").unwrap_or_default();
+        assert!(split.admits(Some("a")));
+        assert!(!split.admits(Some("b")));
+        assert!(!split.admits(None));
+        assert!(ById::default().admits(None));
     }
 
     #[test]
