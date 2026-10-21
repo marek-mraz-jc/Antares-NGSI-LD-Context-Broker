@@ -11,7 +11,7 @@
 //! drain is logged and counted (`/q/health` temporalDrainErrors) — it never
 //! changes the response of a write that already committed.
 
-use crate::state::AppState;
+use crate::state::{AppState, RecordMode};
 use antares_model::TenantId;
 use antares_store::{TemporalDriverExt as _, TemporalEvent};
 use serde_json::{Map, Value};
@@ -169,7 +169,7 @@ const GATES: &[fn(&AppState, &TemporalEvent) -> bool] = &[observed_gate];
 fn observed_gate(st: &AppState, ev: &TemporalEvent) -> bool {
     use crate::state::TemporalRecord::*;
     match st.temporal_record {
-        All => true,
+        All | Ruled => true,
         Observed => ev.instance.get("observedAt").is_some(),
         None => false,
     }
@@ -217,7 +217,8 @@ pub fn retention_of(own: &Value) -> Result<OwnRetention, String> {
 /// hand: whether a write of `doc` in `tenant` records history. The most
 /// specific level wins: the Entity's own `historyRetention`, then the rule
 /// of one of its types (any `off` among them records nothing), then the
-/// Tenant's `*` rule.
+/// Tenant's `*` rule. Below them all, `ANTARES_TEMPORAL_RECORD=ruled`
+/// records nothing (T-5056: history is opt-in), any other mode everything.
 pub(crate) fn records_history(st: &AppState, tenant: &TenantId, doc: &Value) -> bool {
     match own_retention(doc) {
         Some(Ok(OwnRetention::Off)) => return false,
@@ -228,7 +229,8 @@ pub(crate) fn records_history(st: &AppState, tenant: &TenantId, doc: &Value) -> 
         .history_off
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if rules.is_empty() {
+    let opt_in = st.temporal_record == crate::state::TemporalRecord::Ruled;
+    if rules.is_empty() && !opt_in {
         return true;
     }
     let tenant = tenant.as_str();
@@ -244,6 +246,9 @@ pub(crate) fn records_history(st: &AppState, tenant: &TenantId, doc: &Value) -> 
     };
     if has(&rules.off) {
         return false;
+    }
+    if opt_in {
+        return has(&rules.ruled) || rules.space_on.contains(tenant);
     }
     has(&rules.ruled) || !rules.space_off.contains(tenant)
 }
@@ -292,7 +297,11 @@ pub(crate) fn held_attrs(
         })
         .collect();
     obj.keys()
-        .filter(|k| recordings.iter().any(|r| r.of(k).is_some()))
+        .filter(|k| {
+            recordings
+                .iter()
+                .any(|r| matches!(r.of(k), Some(RecordMode::OnChange(_))))
+        })
         .cloned()
         .collect()
 }
@@ -314,12 +323,15 @@ pub(crate) fn records_on_change(st: &AppState, tenant: &TenantId) -> bool {
 /// deadband or minimum distance since the attribute's last row, when it
 /// differs at all from a row of the same `observedAt` (a correction), when
 /// it is older than that row (a backfill), or once the heartbeat passed.
+/// `observed` when its `observedAt` is newer than that of the instance it
+/// replaces (`before`, the attribute as the Entity held it).
 pub(crate) fn admits_change(
     st: &AppState,
     tenant: &TenantId,
     types: &[&str],
     entity: &str,
     attr: &str,
+    before: Option<&Value>,
     instance: &Value,
 ) -> bool {
     let mode = {
@@ -337,14 +349,12 @@ pub(crate) fn admits_change(
                 .and_then(|r| r.of(attr))
         })
     };
-    let Some(mode) = mode else { return true };
-    let at = instance
-        .get("observedAt")
-        .and_then(Value::as_str)
-        .and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(&antares_store::filter::canonical_datetime(s)).ok()
-        })
-        .map_or_else(chrono::Utc::now, |t| t.with_timezone(&chrono::Utc));
+    let mode = match mode {
+        None => return true,
+        Some(RecordMode::Observed) => return newly_observed(before, instance),
+        Some(RecordMode::OnChange(mode)) => mode,
+    };
+    let at = observed_at(instance).unwrap_or_else(chrono::Utc::now);
     let payload = payload_of(instance);
     let key = (
         tenant.as_str().to_owned(),
@@ -377,6 +387,29 @@ pub(crate) fn admits_change(
         last.insert(key, (payload, at));
     }
     writes
+}
+
+/// The instant `instance` was observed at, if it says.
+fn observed_at(instance: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = instance.get("observedAt")?.as_str()?;
+    chrono::DateTime::parse_from_rfc3339(&antares_store::filter::canonical_datetime(s))
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// `record: observed`: whether `instance` carries an `observedAt` newer than
+/// the instance of its datasetId in `before` (an array or one instance).
+fn newly_observed(before: Option<&Value>, instance: &Value) -> bool {
+    let Some(now) = observed_at(instance) else {
+        return false;
+    };
+    let ds = |i: &Value| i.get("datasetId").cloned();
+    let was = match before {
+        Some(Value::Array(all)) => all.iter().find(|b| ds(b) == ds(instance)),
+        Some(one) if ds(one) == ds(instance) => Some(one),
+        _ => None,
+    };
+    was.and_then(observed_at).is_none_or(|was| now > was)
 }
 
 /// An instance without its stamps and provenance: what a row records.

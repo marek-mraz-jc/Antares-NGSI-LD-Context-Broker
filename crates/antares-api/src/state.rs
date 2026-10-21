@@ -26,6 +26,11 @@ pub enum TemporalRecord {
     /// what the temporal API was given directly (unlike ANTARES_TEMPORAL=none,
     /// which turns the temporal seam off entirely).
     None,
+    /// `ruled` (T-5056, DM-97): history is opt-in. An Entity records only
+    /// when its own `historyRetention`, the retention rule of one of its
+    /// types or its Tenant's `*` rule gives a duration or `forever`; a type
+    /// no rule names keeps its current state only.
+    Ruled,
 }
 
 impl std::str::FromStr for TemporalRecord {
@@ -35,8 +40,9 @@ impl std::str::FromStr for TemporalRecord {
             "all" => Ok(Self::All),
             "observed" => Ok(Self::Observed),
             "none" => Ok(Self::None),
+            "ruled" => Ok(Self::Ruled),
             other => Err(format!(
-                "ANTARES_TEMPORAL_RECORD: unknown mode {other} (all|observed|none)"
+                "ANTARES_TEMPORAL_RECORD: unknown mode {other} (all|observed|none|ruled)"
             )),
         }
     }
@@ -57,18 +63,30 @@ pub struct OnChange {
     pub min_distance: Option<f64>,
 }
 
+/// How an attribute records history other than `every` (a row per changed
+/// instance).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RecordMode {
+    /// `onChange` (T-4665): a row when the value moved or the heartbeat passed.
+    OnChange(OnChange),
+    /// `observed` (T-5056): a row only for an instance whose `observedAt` is
+    /// newer than the attribute's last row, so a value re-sent with its old
+    /// `observedAt`, or sent with none, adds nothing.
+    Observed,
+}
+
 /// How one type records history: `None` is `every` (a row per write with a
 /// new `observedAt`), for the type and per expanded attribute.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Recording {
-    pub default: Option<OnChange>,
-    pub attributes: std::collections::HashMap<String, Option<OnChange>>,
+    pub default: Option<RecordMode>,
+    pub attributes: std::collections::HashMap<String, Option<RecordMode>>,
 }
 
 impl Recording {
     /// How `attr` records: its own setting, else the type's.
     #[must_use]
-    pub fn of(&self, attr: &str) -> Option<OnChange> {
+    pub fn of(&self, attr: &str) -> Option<RecordMode> {
         self.attributes.get(attr).copied().unwrap_or(self.default)
     }
 }
@@ -84,7 +102,12 @@ pub struct HistoryRules {
     pub ruled: std::collections::HashSet<(String, String)>,
     /// Tenants whose `*` rule says `history: "off"`.
     pub space_off: std::collections::HashSet<String>,
-    /// (Tenant, type) pairs whose rule records some attribute `onChange`.
+    /// Tenants whose `*` rule gives a duration or `forever`: under
+    /// `ANTARES_TEMPORAL_RECORD=ruled` every type without a rule of its own
+    /// records (T-5056).
+    pub space_on: std::collections::HashSet<String>,
+    /// (Tenant, type) pairs whose rule records some attribute other than
+    /// `every`.
     pub recording: std::collections::HashMap<(String, String), Recording>,
 }
 

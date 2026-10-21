@@ -7,7 +7,7 @@ use crate::history::{
     admits_change, held_attrs, own_retention, parse_duration, records_history, records_on_change,
     retention_of, OwnRetention,
 };
-use crate::state::{AppState, OnChange, Recording};
+use crate::state::{AppState, OnChange, RecordMode, Recording, TemporalRecord};
 use antares_model::TenantId;
 use serde_json::json;
 use std::time::Duration;
@@ -118,7 +118,7 @@ fn recording(st: &AppState, tenant: &str, ty: &str, attrs: &[(&str, OnChange)]) 
         default: None,
         attributes: attrs
             .iter()
-            .map(|(a, m)| ((*a).to_owned(), Some(*m)))
+            .map(|(a, m)| ((*a).to_owned(), Some(RecordMode::OnChange(*m))))
             .collect(),
     };
     st.history_off
@@ -147,6 +147,7 @@ fn on_change_writes_a_row_past_the_deadband_or_the_heartbeat() {
             &ty,
             "urn:e",
             LEVEL,
+            None,
             &level(1.0, "2026-01-01T00:00:00Z")
         ),
         "no rule anywhere: every write is a row"
@@ -163,7 +164,7 @@ fn on_change_writes_a_row_past_the_deadband_or_the_heartbeat() {
         &TenantId::new("history-other").expect("tenant")
     ));
 
-    let row = |v, at| admits_change(&st, &t, &ty, "urn:e", LEVEL, &level(v, at));
+    let row = |v, at| admits_change(&st, &t, &ty, "urn:e", LEVEL, None, &level(v, at));
     assert!(
         row(10.0, "2026-01-01T00:00:00Z"),
         "the first value is a row"
@@ -187,6 +188,7 @@ fn on_change_writes_a_row_past_the_deadband_or_the_heartbeat() {
             &ty,
             "urn:e",
             "https://x/other",
+            None,
             &level(1.0, "2026-01-01T02:00:00Z")
         ),
         "an attribute without a rule records every write"
@@ -198,6 +200,7 @@ fn on_change_writes_a_row_past_the_deadband_or_the_heartbeat() {
             &["https://x/Pump"],
             "urn:e",
             LEVEL,
+            None,
             &level(1.0, "2026-01-01T02:00:00Z")
         ),
         "a type without a rule records every write"
@@ -233,7 +236,7 @@ fn on_change_of_a_place_counts_metres_and_of_a_text_any_change() {
         json!({"type": "GeoProperty", "observedAt": when,
                "value": {"type": "Point", "coordinates": [lon, lat]}})
     };
-    let row = |v: serde_json::Value| admits_change(&st, &t, &ty, "urn:b", PLACE, &v);
+    let row = |v: serde_json::Value| admits_change(&st, &t, &ty, "urn:b", PLACE, None, &v);
     assert!(row(at(24.9384, 60.1699, "2026-01-01T00:00:00Z")));
     // 0.0003° of latitude is about 33 m
     assert!(
@@ -251,6 +254,7 @@ fn on_change_of_a_place_counts_metres_and_of_a_text_any_change() {
             &ty,
             "urn:b",
             "https://x/state",
+            None,
             &json!({"type": "Property", "value": v, "observedAt": when}),
         )
     };
@@ -259,5 +263,124 @@ fn on_change_of_a_place_counts_metres_and_of_a_text_any_change() {
     assert!(
         text("riding", "2026-01-01T00:02:00Z"),
         "a value that is no number or point: any change"
+    );
+}
+
+/// T-5056: under `ANTARES_TEMPORAL_RECORD=ruled` only a type a rule gives a
+/// duration records; the other modes keep recording what no rule names.
+#[test]
+fn ruled_records_only_what_a_rule_opts_in() {
+    let mut st = state();
+    st.temporal_record = TemporalRecord::Ruled;
+    let tn = "history-opt-in";
+    let t = TenantId::new(tn).expect("tenant");
+    let doc = |ty: &str| json!({"id": "urn:e", "type": ty});
+    assert!(
+        !records_history(&st, &t, &doc("https://x/Dock")),
+        "no rule at all: no history"
+    );
+    {
+        let mut rules = st.history_off.write().expect("rules");
+        rules
+            .ruled
+            .insert((tn.to_owned(), "https://x/Air".to_owned()));
+        rules
+            .ruled
+            .insert((tn.to_owned(), "https://x/Bus".to_owned()));
+        rules
+            .off
+            .insert((tn.to_owned(), "https://x/Bus".to_owned()));
+    }
+    assert!(
+        records_history(&st, &t, &doc("https://x/Air")),
+        "a duration"
+    );
+    assert!(!records_history(&st, &t, &doc("https://x/Bus")), "off");
+    assert!(
+        !records_history(&st, &t, &doc("https://x/Dock")),
+        "a type without a rule"
+    );
+    let own = json!({"type": "https://x/Dock",
+        antares_store::HISTORY_RETENTION: {"type": "Property", "value": "P1D"}});
+    assert!(records_history(&st, &t, &own), "the Entity's own duration");
+    st.history_off
+        .write()
+        .expect("rules")
+        .space_on
+        .insert(tn.to_owned());
+    assert!(
+        records_history(&st, &t, &doc("https://x/Dock")),
+        "the `*` rule's duration"
+    );
+    assert!(
+        !records_history(&st, &t, &doc("https://x/Bus")),
+        "still off"
+    );
+    st.temporal_record = TemporalRecord::All;
+    let other = TenantId::new("history-opt-in-other").expect("tenant");
+    assert!(
+        records_history(&st, &other, &doc("https://x/Dock")),
+        "`all` records what no rule names"
+    );
+}
+
+/// T-5056: `record: observed` writes a row only for a newer `observedAt`.
+#[test]
+fn observed_writes_a_row_only_for_a_newer_observed_at() {
+    let st = state();
+    let tn = "history-observed";
+    let t = TenantId::new(tn).expect("tenant");
+    let ty = ["https://x/Dock"];
+    st.history_off.write().expect("rules").recording.insert(
+        (tn.to_owned(), ty[0].to_owned()),
+        Recording {
+            default: Some(RecordMode::Observed),
+            ..Default::default()
+        },
+    );
+    let row = |was: Option<serde_json::Value>, now: serde_json::Value| {
+        admits_change(&st, &t, &ty, "urn:d", LEVEL, was.as_ref(), &now)
+    };
+    let old = level(3.0, "2026-01-01T00:00:00Z");
+    assert!(row(None, old.clone()), "the first observation");
+    assert!(
+        !row(
+            Some(json!([old.clone()])),
+            level(4.0, "2026-01-01T00:00:00.000Z")
+        ),
+        "a new value with the old observedAt"
+    );
+    assert!(
+        !row(
+            Some(json!([old.clone()])),
+            json!({"type": "Property", "value": 5})
+        ),
+        "no observedAt"
+    );
+    assert!(
+        !row(Some(old.clone()), level(3.0, "2025-12-31T23:00:00Z")),
+        "an older observedAt"
+    );
+    assert!(
+        row(
+            Some(json!([old.clone()])),
+            level(3.0, "2026-01-01T00:05:00Z")
+        ),
+        "a newer observedAt, even with the same value"
+    );
+    let mut other = level(3.0, "2026-01-01T00:00:00Z");
+    other["datasetId"] = json!("urn:ds:b");
+    assert!(
+        row(Some(json!([old])), other),
+        "another datasetId has no observation yet"
+    );
+    assert!(
+        held_attrs(
+            &st,
+            &t,
+            &json!({"type": ty[0], LEVEL: level(1.0, "2026-01-01T00:00:00Z")})
+        )
+        .is_empty(),
+        "an observed attribute is no held level"
     );
 }

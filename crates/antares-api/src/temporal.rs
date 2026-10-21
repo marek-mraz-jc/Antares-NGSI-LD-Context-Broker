@@ -3036,7 +3036,10 @@ async fn retrieve_temporal_inner(
             .as_ref()
             .map_or("observedAt", |t| t.timeproperty.as_str())
             .to_owned();
-        let local = st.temporal.get_temporal(&tenant, id, &tf).await?;
+        let local = match st.temporal.get_temporal(&tenant, id, &tf).await? {
+            Some(doc) => Some(doc),
+            None => kept_no_history(st, &tenant, id).await?,
+        };
         // 5.7.3.4: forward to matching retrieveTemporal registrations and
         // merge the remote instance data (4.5.5; auxiliary instances only
         // fill timestamps absent elsewhere)
@@ -3283,6 +3286,34 @@ fn merge_temporal_docs(base: &mut Value, add: &Value, aux: bool, timeprop: &str)
 }
 
 // ---------- DELETE /temporal/entities/{id} (5.6.16) ----------
+
+/// The Entity `id` whose retention keeps no history (T-5056: a type no
+/// rule opts in, or `off`), as a Temporal Evolution of no Attribute: it
+/// exists and recorded nothing, which is no 404. The member checks after
+/// the read hold for it as for any other.
+async fn kept_no_history(
+    st: &AppState,
+    tenant: &TenantId,
+    id: &str,
+) -> Result<Option<Value>, ApiError> {
+    let Some(doc) = st
+        .store
+        .get(tenant, antares_store::Kind::Entity, id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if crate::history::records_history(st, tenant, &doc) {
+        return Ok(None);
+    }
+    let mut shell = serde_json::Map::new();
+    for k in ["id", "type", "scope"] {
+        if let Some(v) = doc.get(k) {
+            shell.insert(k.to_owned(), v.clone());
+        }
+    }
+    Ok(Some(Value::Object(shell)))
+}
 
 pub async fn delete_temporal(
     State(st): State<AppState>,
