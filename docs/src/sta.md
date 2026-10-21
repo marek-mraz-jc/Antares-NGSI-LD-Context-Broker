@@ -8,10 +8,8 @@ profile, read only:
 GET /x/views/{view}/sta/v1.1/
 GET /x/views/{view}/sta/v1.1/{Set}
 GET /x/views/{view}/sta/v1.1/{Set}('{id}')
-GET /x/views/{view}/sta/v1.1/Things('{urn}')/Locations
-GET /x/views/{view}/sta/v1.1/Things('{urn}')/Datastreams
-GET /x/views/{view}/sta/v1.1/Things('{urn}')/HistoricalLocations
-GET /x/views/{view}/sta/v1.1/Datastreams('{id}')/Observations
+GET /x/views/{view}/sta/v1.1/{Set}('{id}')/{navigation}
+GET /x/views/{view}/sta/v1.1/{Set}('{id}')/{member}
 OPTIONS any of them
 ```
 
@@ -20,6 +18,19 @@ Mount it with `ANTARES_API_SURFACES=admin,views,sta`. The sets are
 `Observations`, `ObservedProperties` and `FeaturesOfInterest`; the mapping
 and its reasons are `docs/analysis/sta-mapping.md` (T-4462). `HEAD` answers
 like `GET` without the body; every other method is `405` with `Allow`.
+
+Every `@iot.navigationLink` a resource carries answers (SensorThings 1.1
+`req/resource-path`, T-4878): a Thing's `Locations`, `Datastreams` and
+`HistoricalLocations`; a Location's `Things` and `HistoricalLocations`; a
+HistoricalLocation's `Thing` and `Locations`; a Datastream's `Thing`,
+`Sensor`, `ObservedProperty` and `Observations`; an Observation's
+`Datastream` and `FeatureOfInterest`; a Sensor's and an ObservedProperty's
+`Datastreams`; a FeatureOfInterest's `Observations`. A Datastream carries
+`Sensor` only when its Entity has a `refDevice`, and that link is `404`
+when the view hides the Device. A member path such as `Things('{urn}')/name`
+answers `{"name": …}`. `resultTime` is on every Observation, `null` when
+the instance has no `modifiedAt`. A key that is no URI, such as `Sensors(1)`,
+answers `404`.
 
 ## 1. What a set holds
 
@@ -60,3 +71,4 @@ are the OData JSON error body with a fixed message.
 - [Surfaces](surfaces.md)
 - [Endpoint views](views.md)
 - [OGC API - Features endpoint of a view](ogc.md)
+- [SensorThings API compliance](sta-compliance.md)

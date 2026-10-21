@@ -74,6 +74,12 @@ missed it because every fixture Entity was a sensor with `observedAt` on one ins
 - A HistoricalLocations page reads the last 100 moves of each Entity; the history of one Thing pages through its
   own list. The broker's temporal Query pages its candidates before the time filter (a short page is not the end),
   so the set reads a full page as "more" and stops at a short one.
-- An Observation by id is the current instance; a past one is reached through its Datastream.
+- An Observation by id is the current instance, else one of the last 10 000 of its Datastream's history (T-4878).
+- `$filter` applies to a set and to a Datastream's Observations; the other navigation collections (a Thing's or a
+  Location's lists, and since T-4878 a Sensor's or an ObservedProperty's Datastreams and a FeatureOfInterest's
+  Observations) page with `$top` and `$skip` and ignore it.
+- `{member}/$value` is not served.
+- A Thing has one Location, `{urn}/location`, its `location` Attribute: a HistoricalLocation's `Locations` and a
+  Location's `HistoricalLocations` are that one Location and every move of that Attribute.
 - `@iot.count` on a set other than `Things` is omitted past the first page.
 - Out of scope: Tasking (Part 2), MultiDatastream, writes, MQTT.

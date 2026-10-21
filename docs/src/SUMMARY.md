@@ -33,6 +33,7 @@
 - [Conformance](conformance.md)
 - [OData compliance](odata-compliance.md)
 - [OGC API - Features compliance](ogc-compliance.md)
+- [SensorThings API compliance](sta-compliance.md)
 - [Performance](performance.md)
 - [Performance baseline](perf-baseline.md)
 - [Load on every surface](load-surfaces.md)
