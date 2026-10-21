@@ -774,6 +774,96 @@ folds the newest bundles into `/reports/perf/latest/`.
 If you would rather not rent hardware, disable the two workflows (Actions
 → workflow → *⋯* → *Disable workflow*) so the weekly runs stop going red.
 
+## The perf gate
+
+Two runs fail on a regression against a baseline committed in
+`ci/perf-baseline/` (T-4853). `dev/perf/gate.py` compares; `gate.py
+selftest` checks the comparison itself and runs first in both.
+
+| run | what it measures | baseline | fails when |
+|---|---|---|---|
+| `bench-surfaces`, nightly and weekly on a GitHub runner | `cargo bench -p antares-sql --bench core_paths`: `q`, type, `geoQ` and `scopeQ` parsing, the SQL each compiles to, JSON-LD compaction of a 100-entity page | `bench-core.json`, per CPU model | a case's p50, read as a ratio to a fixed CPU loop measured right before it, is more than 15 % above the baseline's ratio |
+| `perf-weekly`, on the pinned Hetzner box | every row of `shapes.sh`, memory and (with `store: postgres`) PostgreSQL | `shapes.json`, per instance type | a row's p99 is more than 15 % up or its req/s more than 15 % down |
+
+Both fail on a baseline row the run no longer produces. A CPU model or
+instance type with no baseline is reported and not gated: its first run
+prints the rows, and committing them is how a new runner joins the gate.
+The ratio is what makes a shared runner usable for the bench: four runs of
+the same commit on one box moved each case by at most 6.3 %, and a case
+slowed on purpose (a 1 ns sleep in `ql_parse_q`, about 50 µs) failed the
+gate at +6 315 %.
+
+Accepting a change that moves a number is a reviewed commit of the
+baseline:
+
+```bash
+BENCH_JSON=/tmp/core.json cargo bench -p antares-sql --bench core_paths
+python3 dev/perf/gate.py bench /tmp/core.json ci/perf-baseline/bench-core.json --write
+python3 dev/perf/gate.py shapes results/perf/shapes.md ci/perf-baseline/shapes.json --machine ccx33 --write
+```
+
+Each run's tables are committed to the `perf-history` branch by the
+workflow's `history` job (`dev/perf/commit-history.sh`), under
+`runs/<time>-<run>-<commit>/`, so a number this book cites does not expire
+with the Actions artifact. `perf-weekly` stays dispatched by hand: it rents
+the Hetzner box, and its schedule line is commented out until the owner
+turns it on.
+
+## Vanilla against the platform build
+
+The joinedcontext platform runs Antares built with
+`full,jc-policy,linkml,parquet,tabular,ical` and `ANTARES_POLICY=joinedcontext`.
+`dev/perf/platform-overhead.sh` runs the same `shapes.sh` rows three times on
+one machine: the vanilla binary; the platform binary as vanilla runs it
+(`allow-all`, no view); and the platform binary under the policy engine,
+with a rule document of 20 permissions, 12 Endpoint views loaded, and every
+request carrying the `x-jc-subject` and `x-jc-roles` headers the gateway
+sets. The caller's permission names the Vehicle type and its five
+Attributes, so each read is narrowed as a platform read is. 1 000 Vehicles,
+50 clients, five seconds, median of three runs (T-4853):
+
+| store | shape | clients | vanilla req/s, p99 | platform build | change req/s, p99 | + policy and views | change req/s, p99 |
+|---|---|---|---|---|---|---|---|
+| memory | query | c50 | 19474, 28.50 ms | 18054, 12.18 ms | -7%, -57% | 14096, 13.10 ms | -28%, -54% |
+| memory | query-q | c50 | 13269, 30.52 ms | 13198, 23.45 ms | -1%, -23% | 9171, 17.28 ms | -31%, -43% |
+| memory | query-deep | c50 | 14120, 28.78 ms | 14152, 24.29 ms | +0%, -16% | 12615, 12.26 ms | -11%, -57% |
+| memory | query-regex | c50 | 14434, 32.21 ms | 14634, 22.91 ms | +1%, -29% | 7231, 19.95 ms | -50%, -38% |
+| memory | retrieve | c50 | 42385, 18.93 ms | 29588, 7.46 ms | -30%, -61% | 32604, 6.42 ms | -23%, -66% |
+| memory | update | c50 | 16412, 7.44 ms | 14997, 8.15 ms | -9%, +10% | 14030, 8.97 ms | -15%, +21% |
+| memory | hfp | c50 | 4303, 20.07 ms | 4178, 19.87 ms | -3%, -1% | 4245, 19.56 ms | -1%, -3% |
+| postgres | query | c50 | 4369, 25.20 ms | 4116, 31.90 ms | -6%, +27% | 2470, 52.58 ms | -43%, +109% |
+| postgres | query-q | c50 | 2863, 35.96 ms | 2358, 43.40 ms | -18%, +21% | 1631, 54.02 ms | -43%, +50% |
+| postgres | query-deep | c50 | 1276, 65.85 ms | 1178, 75.42 ms | -8%, +15% | 1160, 69.14 ms | -9%, +5% |
+| postgres | query-regex | c50 | 345, 204.06 ms | 330, 340.20 ms | -4%, +67% | 1198, 66.38 ms | +247%, -67% |
+| postgres | retrieve | c50 | 7372, 25.12 ms | 6918, 16.42 ms | -6%, -35% | 7449, 14.78 ms | +1%, -41% |
+| postgres | update | c50 | 4473, 19.84 ms | 4525, 19.80 ms | +1%, -0% | 2705, 36.10 ms | -40%, +82% |
+| postgres | hfp | c50 | 2511, 28.54 ms | 2581, 25.84 ms | +3%, -9% | 2074, 37.47 ms | -17%, +31% |
+
+Measured 2026-10-21 on the shared 16-vCPU AMD EPYC Genoa sandbox, load
+average 20 to 45 from other jobs: read the req/s columns; the p99 columns
+swing by half on that host and decide nothing. What the table shows:
+
+- The build costs little: a request of the NGSI-LD API runs the same code
+  as in vanilla, and most rows move −1 % to −9 % req/s. Memory `retrieve`
+  (−30 %) and PostgreSQL `query-q` (−18 %) are the rows to measure again on
+  the pinned box before reading them as a cost.
+- The policy engine costs reads 23 % to 50 % of req/s on the memory store
+  and 43 % on PostgreSQL `query` and `query-q`: each read is decided, then
+  conjoined with the permission's rule and projected to its Attributes.
+  Writes by id cost 15 % on memory and 17 % to 40 % on PostgreSQL.
+- PostgreSQL `query-regex` runs 3.5 times faster under the policy than in
+  vanilla (1 198 against 345 req/s). This run does not trace why; the
+  vanilla `~=` path is the one T-4907 pushes down to PostgreSQL.
+
+Reproduce:
+
+```bash
+cargo build --release -p antares-broker && cp target/release/antares /tmp/antares-vanilla
+cargo build --release -p antares-broker --features full,jc-policy,linkml,parquet,tabular,ical
+ENTITIES=1000 DATABASE_URL=postgres://… BIN_VANILLA=/tmp/antares-vanilla \
+  BIN_PLATFORM=target/release/antares dev/perf/platform-overhead.sh
+```
+
 ## What a façade costs
 
 A façade for another standard answers by driving this broker's own NGSI-LD
@@ -876,6 +966,5 @@ The new indexes replace the Tenant read where the planner starts from
 
 They are one machine, one request shape, one week. A different instance
 type invalidates the whole history, which is why both workflows pin one.
-No regression gate exists until the noise profile has ten runs on that
-instance type; until then the runs report, and the report is the
-evidence.
+The gate ([The perf gate](#the-perf-gate)) compares a run with the
+baseline of its own CPU model or instance type, never across them.

@@ -5,12 +5,12 @@ name: perf-weekly
 # Hetzner dedicated-vCPU machine, registers it as an ephemeral self-hosted
 # runner, benchmarks, and deletes it. perf-janitor.yml sweeps leaks.
 #
-# Report-only by design: NO regression gate exists until the noise profile
-# (repeated same-commit passes on this exact instance type) has been
-# measured and published — a threshold picked before the variance is known
-# is a guess. The gate shape to adopt then: per-benchmark IQR fencing
-# against its own history (fail above Q3 + 3*IQR), plus significance AND a
-# separate noise threshold for micro-benchmarks.
+# Gated (T-4853): every row of the shapes tables against the committed
+# baseline for this instance type (ci/perf-baseline/shapes.json): p99 more
+# than 15 % up or req/s more than 15 % down fails the run
+# (dev/perf/gate.py). A type with no baseline yet is reported, not gated;
+# its first run prints the entry to commit. The tables are committed to the
+# perf-history branch by the history job, so a cited run never expires.
 #
 # The instance type is pinned. CX/CPX/CAX share CPU between co-tenants
 # with burst credits; CCX gives one vCPU = one physical thread (L3, memory
@@ -181,10 +181,24 @@ jobs:
       - name: Fold the tables into one report
         if: always()
         run: python3 dev/perf/report.py results/perf
+      - name: Gate the shapes against the baseline
+        shell: bash
+        run: |
+          python3 dev/perf/gate.py selftest
+          status=0
+          python3 dev/perf/gate.py shapes results/perf/shapes.md ci/perf-baseline/shapes.json \
+            --machine "$SERVER_TYPE" | tee results/perf/gate.md || status=1
+          for d in results/perf/pg-pool*; do
+            [ -f "$d/shapes.md" ] || continue
+            python3 dev/perf/gate.py shapes "$d/shapes.md" ci/perf-baseline/shapes.json \
+              --machine "$SERVER_TYPE-${d##*/}" | tee -a results/perf/gate.md || status=1
+          done
+          exit "$status"
       - name: Summary
         if: always()
         run: |
           {
+            cat results/perf/gate.md 2>/dev/null || true
             echo "## Weekly perf (${{ env.SERVER_TYPE }})"
             echo '```'
             cat results/perf/run-metadata.txt
@@ -207,6 +221,23 @@ jobs:
           name: perf-weekly-results
           path: results/perf
           retention-days: 90
+
+  # The run's tables committed to perf-history (dev/perf/commit-history.sh):
+  # the record a doc cites, where the artifact above expires in 90 days.
+  history:
+    needs: bench
+    if: always() && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: perf-weekly-results
+          path: results/perf
+      - name: Commit the tables
+        run: dev/perf/commit-history.sh results/perf "perf-weekly-${{ inputs.server || 'ccx33' }}"
 
   delete:
     needs: [create, bench]

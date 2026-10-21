@@ -3,6 +3,10 @@
 //           (local=true: the store answers alone, no registration fan-out)
 //   query-q GET /entities?type=Vehicle&q=speed>100;brand=="Tesla"&limit=20&local=true
 //           — the same page with a 4.9 q the store has to evaluate
+//   query-deep  the same query at offset ENTITIES-20, the last page (T-4907)
+//   query-regex GET /entities?type=Vehicle&q=brand~="Tes.*" (T-4907)
+//   hfp     PATCH /entities/{id}/attrs with a new location per request, the
+//           high-frequency position burst (T-4905)
 //   retrieve GET /entities/{id}
 //   upsert  POST /entityOperations/upsert, ten entities per request (5.6.8),
 //           cycling over the seeded ids — Batch Upsert
@@ -60,8 +64,14 @@ const mcpCall = JSON.stringify({
 });
 const N = Number(__ENV.ENTITIES || 100);
 const CHUNK = 500;
-const json = { "Content-Type": "application/json", ...(__ENV.TENANT ? { "NGSILD-Tenant": __ENV.TENANT } : {}) };
-const headers = __ENV.TENANT ? { "NGSILD-Tenant": __ENV.TENANT } : {};
+// JC_SUBJECT and JC_ROLES: the caller the platform's gateway would name
+// (x-jc-subject, x-jc-roles), for a broker under ANTARES_POLICY=joinedcontext
+// (dev/perf/platform-overhead.sh); unset, no such header is sent.
+const headers = {
+  ...(__ENV.TENANT ? { "NGSILD-Tenant": __ENV.TENANT } : {}),
+  ...(__ENV.JC_SUBJECT ? { "x-jc-subject": __ENV.JC_SUBJECT, "x-jc-roles": __ENV.JC_ROLES || "" } : {}),
+};
+const json = { "Content-Type": "application/json", ...headers };
 
 // SHAPE=seed seeds and measures nothing, SHAPE=unseed deletes the seed and
 // measures nothing; SEED=0 skips the seed and leaves it standing, so a run
@@ -150,6 +160,23 @@ export default function () {
   } else if (SHAPE === "query-q") {
     const q = encodeURIComponent('speed>100;brand=="Tesla"');
     r = http.get(`${BASE}/entities?type=Vehicle&q=${q}&limit=20&local=true`, { headers });
+  } else if (SHAPE === "query-deep") {
+    // the last page by offset: what a client paging to the end pays (T-4907)
+    r = http.get(`${BASE}/entities?type=Vehicle&limit=20&offset=${Math.max(N - 20, 0)}&local=true`, { headers });
+  } else if (SHAPE === "query-regex") {
+    const q = encodeURIComponent('brand~="Tes.*"');
+    r = http.get(`${BASE}/entities?type=Vehicle&q=${q}&limit=20&local=true`, { headers });
+  } else if (SHAPE === "hfp") {
+    // a position report per request, as a high-frequency vehicle feed writes
+    // them (T-4905): the location index moves on every write
+    const body = JSON.stringify({
+      location: { type: "GeoProperty", value: { type: "Point", coordinates: [19.1 + (__ITER % 1000) / 1000, 48.7] } },
+    });
+    r = http.patch(`${BASE}/entities/urn:ngsi-ld:Vehicle:shape:${(__VU * 7919 + __ITER) % N}/attrs`, body, {
+      headers: { "Content-Type": "application/json", ...headers },
+    });
+    check(r, { "204": (res) => res.status === 204 });
+    return;
   } else if (SHAPE === "upsert") {
     // 5.6.8 Batch Upsert of ten existing entities: 204 when all were updated
     const first = (__VU * 7919 + __ITER * 10) % N;

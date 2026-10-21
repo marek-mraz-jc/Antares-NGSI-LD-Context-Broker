@@ -50,9 +50,23 @@ jobs:
           OUT: results/bench-surfaces
           WEEKLY: ${{ (github.event.schedule == '41 2 * * 0' || inputs.weekly) && '1' || '' }}
         run: dev/perf/bench-surfaces.sh
+      # The core request paths (T-4853): q/geo/type/scopeQ parse, their SQL
+      # and JSON-LD compaction, each read against the run's own calibration
+      # loop, so this shared runner's speed cancels out. Gated: a case 15 %
+      # over the committed baseline for this CPU fails the run;
+      # docs/src/performance.md says how to accept a change.
+      - name: Core-path bench against its baseline
+        shell: bash
+        run: |
+          python3 dev/perf/gate.py selftest
+          mkdir -p results/bench-surfaces
+          BENCH_JSON=results/bench-surfaces/bench-core.json \
+            cargo bench --locked -q -p antares-sql --bench core_paths
+          python3 dev/perf/gate.py bench results/bench-surfaces/bench-core.json \
+            ci/perf-baseline/bench-core.json | tee results/bench-surfaces/bench-core.md
       - name: The table into the summary
         if: always()
-        run: cat results/bench-surfaces/bench-surfaces.md >> "$GITHUB_STEP_SUMMARY" || true
+        run: cat results/bench-surfaces/bench-surfaces.md results/bench-surfaces/bench-core.md >> "$GITHUB_STEP_SUMMARY" || true
       - uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -66,3 +80,20 @@ jobs:
           title: bench-surfaces went red
           body: A surface bench did not run; the logs are in the bench-surfaces artifact.
           log-file: results/bench-surfaces/bench-surfaces.md
+
+  # The run's tables committed to the perf-history branch, where they stay
+  # after the artifact above expires (T-4853). Scheduled runs on dev only.
+  history:
+    needs: bench-surfaces
+    if: always() && github.event_name == 'schedule' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: bench-surfaces
+          path: results/bench-surfaces
+      - name: Commit the tables
+        run: dev/perf/commit-history.sh results/bench-surfaces bench-surfaces
