@@ -621,13 +621,30 @@ fn query(args: &Args, skip: &[&str], extra: &[(&str, String)]) -> String {
 /// Members a page tool handles itself rather than passing on.
 const PAGING: [&str; 3] = ["count", "limit", "cursor"];
 
-/// The paging members of an inner request: `count=true` always, so the
-/// next cursor knows whether rows are left.
-fn page(limit: u64, offset: u64) -> [(&'static str, String); 3] {
+/// The broker's `limit` ceiling: a page this large cannot ask one row more.
+const MAX_LIMIT: u64 = 1000;
+
+/// Whether a page of `limit` asks one row past it instead of the count: a
+/// call without `count` learns from that row whether rows are left, and the
+/// store counts nothing (T-5062: a count per page held 80 % of PostgreSQL's
+/// time at 1 000 distinct reads a second).
+pub(crate) fn probes(args: &Args, limit: u64) -> bool {
+    !matches!(args.get("count"), Some(Checked::Flag(true))) && limit < MAX_LIMIT
+}
+
+/// The paging members of an inner request: one row past the page when
+/// [`probes`], else `count=true`, so the next cursor knows whether rows are
+/// left.
+fn page(args: &Args, limit: u64, offset: u64) -> [(&'static str, String); 3] {
+    let (limit, count) = if probes(args, limit) {
+        (limit.saturating_add(1), "false")
+    } else {
+        (limit, "true")
+    };
     [
         ("limit", limit.to_string()),
         ("offset", offset.to_string()),
-        ("count", "true".into()),
+        ("count", count.into()),
     ]
 }
 
@@ -699,13 +716,13 @@ pub(crate) fn build(tool: &ToolDef, args: &Args, limit: u64, offset: u64) -> Bui
         )),
         OperationId::QueryEntities => get(format!(
             "{root}/entities{}",
-            query(args, &PAGING, &page(limit, offset))
+            query(args, &PAGING, &page(args, limit, offset))
         )),
         OperationId::QueryEntitiesPost => Built {
             method: Method::POST,
             target: format!(
                 "{root}/entityOperations/query{}",
-                query(&Args::new(), &[], &page(limit, offset))
+                query(&Args::new(), &[], &page(args, limit, offset))
             ),
             body: Some(query_document(args, false)),
         },
@@ -714,7 +731,7 @@ pub(crate) fn build(tool: &ToolDef, args: &Args, limit: u64, offset: u64) -> Bui
         }
         OperationId::QuerySubscriptions => get(format!(
             "{root}/subscriptions{}",
-            query(args, &PAGING, &page(limit, offset))
+            query(args, &PAGING, &page(args, limit, offset))
         )),
         OperationId::RetrieveEntityTypes => get(format!("{root}/types")),
         OperationId::RetrieveEntityTypeDetails => get(format!("{root}/types?details=true")),
@@ -735,14 +752,14 @@ pub(crate) fn build(tool: &ToolDef, args: &Args, limit: u64, offset: u64) -> Bui
             method: Method::POST,
             target: format!(
                 "{root}/temporal/entityOperations/query{}",
-                query(&Args::new(), &[], &page(limit, offset))
+                query(&Args::new(), &[], &page(args, limit, offset))
             ),
             body: Some(query_document(args, true)),
         },
         // TemporalQuery, the only other operation of the table
         _ => get(format!(
             "{root}/temporal/entities{}",
-            query(args, &PAGING, &page(limit, offset))
+            query(args, &PAGING, &page(args, limit, offset))
         )),
     }
 }
@@ -881,8 +898,23 @@ mod tests {
         };
         assert_eq!(
             target("query_entities", &a, 5, 40).unwrap_or_default(),
+            "/ngsi-ld/v1/entities?q=speed%3E1%3Bname%3D%3D%22a%20b%22&type=Car%2CBike&limit=6&offset=40&count=false"
+        );
+        // T-5062: a page asks one row past it, unless the call counts or the
+        // page is already at the broker's limit ceiling
+        let mut counted = a.clone();
+        counted.insert("count", Checked::Flag(true));
+        assert_eq!(
+            target("query_entities", &counted, 5, 40).unwrap_or_default(),
             "/ngsi-ld/v1/entities?q=speed%3E1%3Bname%3D%3D%22a%20b%22&type=Car%2CBike&limit=5&offset=40&count=true"
         );
+        counted.insert("count", Checked::Flag(false));
+        assert!(target("query_entities", &counted, 5, 40)
+            .unwrap_or_default()
+            .ends_with("&limit=6&offset=40&count=false"));
+        assert!(target("query_entities", &a, MAX_LIMIT, 0)
+            .unwrap_or_default()
+            .ends_with("&limit=1000&offset=0&count=true"));
         let one = args(&[("id", Checked::One("urn:ngsi-ld:Car:a/b?c".into()))]);
         assert_eq!(
             target("get_entity", &one, 0, 0).unwrap_or_default(),
@@ -938,7 +970,7 @@ mod tests {
         let q = named("query_entities").map(|t| build(t, &a, 5, 0).target);
         assert_eq!(
             q.as_deref(),
-            Some("/ngsi-ld/v1/entities?format=keyValues&orderBy=speed%3Bdesc&options=sysAttrs&type=Car&limit=5&offset=0&count=true")
+            Some("/ngsi-ld/v1/entities?format=keyValues&orderBy=speed%3Bdesc&options=sysAttrs&type=Car&limit=6&offset=0&count=false")
         );
         let off = args(&[
             ("id", Checked::One("urn:ngsi-ld:Car:1".into())),
@@ -983,7 +1015,7 @@ mod tests {
         let q = named("query_entities").map(|t| build(t, &a, 5, 0).target);
         assert_eq!(
             q.as_deref(),
-            Some("/ngsi-ld/v1/entities?coordinates=%5B1%2C2%5D&joinLevel=2&local=true&type=Car&limit=5&offset=0&count=true")
+            Some("/ngsi-ld/v1/entities?coordinates=%5B1%2C2%5D&joinLevel=2&local=true&type=Car&limit=6&offset=0&count=false")
         );
         let e = named("get_entity").map(|t| build(t, &Args::new(), 0, 0).target);
         assert_eq!(
