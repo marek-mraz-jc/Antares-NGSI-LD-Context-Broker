@@ -26,6 +26,10 @@ name: surfaces-conformance
 #                    Engine image pinned by digest) against view `all` and
 #                    each Endpoint kind of ci/views/ogc, red on any test
 #                    ci/ogc-compliance/<view>.json passes (T-3747, T-3831)
+#   sta-compliance-external  the OGC CITE ets-sta10 1.5 (TEAM Engine image
+#                    pinned by digest) against view `sta` of ci/views/sta,
+#                    red on any test ci/sta-compliance-baseline.json passes
+#                    (T-4878)
 #   ws-conformance   docs/api/asyncapi-ws.yaml validated by @asyncapi/cli
 #                    2.16.0, then joinedcontext-conformance tests/ws: the
 #                    scripted sessions of /x/views/all/ws, every message
@@ -446,6 +450,73 @@ jobs:
         with:
           title: ogc-compliance-external (${{ matrix.view }}) went red
           body: A test the OGC API - Features ETS passed in ci/ogc-compliance/${{ matrix.view }}.json fails now.
+          log-file: gate.md
+
+  sta-compliance-external:
+    name: sta-compliance-external
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The SensorThings view of ci/views/sta (T-4878, docs/src/sta-compliance.md)
+    permissions:
+      contents: read
+      issues: write
+    env:
+      # ets-sta10 1.5, the last release and OGC's only SensorThings ETS (Part 1
+      # Sensing 1.0; none exists for 1.1), its only image tag, pinned by digest
+      TE_IMAGE: ogccite/ets-sta10:1.5-teamengine-6.0.0-RC2@sha256:e1ec8dc3508ea3355f059abee98737f5d2c00434aeffa298d80ea04361c93db3
+      IUT: http://localhost:9090/x/views/sta/sta/v1.1
+      BASELINE: ci/sta-compliance-baseline.json
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: broker-surfaces
+      - name: Start TEAM Engine, the broker and the view
+        run: |
+          chmod +x antares
+          # host network: TEAM Engine on 8080 reaches the broker at localhost:9090
+          docker run -d --name teamengine --network host "$TE_IMAGE"
+          ANTARES_HTTP_PORT=9090 ANTARES_API_SURFACES=admin,views,sta ./antares > broker.log 2>&1 &
+          for _ in $(seq 1 100); do curl -sf -o /dev/null localhost:9090/q/health && break; sleep 0.2; done
+          dev/views-rig.sh http://localhost:9090 ci/views/sta
+          # the image's own public test account (ogctest), not a secret
+          for _ in $(seq 1 60); do
+            curl -fsS -m 5 -u ogctest:ogctest -o /dev/null localhost:8080/teamengine/rest/suites && break
+            sleep 5
+          done
+      - name: The ETS, gated by ci/sta-compliance-baseline.json
+        run: |
+          dev/ogc-compliance/baseline.py --self-test
+          iut=$(jq -rn --arg u "$IUT" '$u|@uri')
+          # ics=3: all three conformance levels
+          curl -sS -m 1500 -u ogctest:ogctest -H 'Accept: application/xml' -o testng-results.xml \
+            "localhost:8080/teamengine/rest/suites/sta10/run?iut=$iut&ics=3" || true
+          set +e
+          dev/ogc-compliance/baseline.py check testng-results.xml "$BASELINE" > gate.md 2>&1
+          rc=$?
+          { echo "## SensorThings ETS (ets-sta10 1.5), view sta"; cat gate.md; } >> "$GITHUB_STEP_SUMMARY"
+          cat gate.md
+          exit $rc
+      - name: TEAM Engine log
+        if: always()
+        run: docker logs teamengine > teamengine.log 2>&1 || true
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: sta-compliance-external
+          path: |
+            testng-results.xml
+            gate.md
+            broker.log
+            teamengine.log
+          retention-days: 14
+      - name: File an issue on nightly failure
+        if: failure() && github.event_name == 'schedule'
+        uses: ./.github/actions/failure-issue
+        with:
+          title: sta-compliance-external went red
+          body: A test the SensorThings ETS passed in ci/sta-compliance-baseline.json fails now.
           log-file: gate.md
 
   ws-conformance:

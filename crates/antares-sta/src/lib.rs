@@ -194,21 +194,12 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
             key: Some(key),
         }] => cx.one(set, key).await?.ok_or_else(not_found),
         [Step {
-            set: thing,
+            set: from,
             key: Some(key),
-        }, Step { set, key: None }]
-            if thing == "Things" =>
-        {
-            cx.of_thing(key, set).await
-        }
-        [Step {
-            set: stream,
-            key: Some(key),
-        }, Step { set, key: None }]
-            if stream == "Datastreams" && set == "Observations" =>
-        {
-            cx.series(key).await
-        }
+        }, Step {
+            set: member,
+            key: None,
+        }] => cx.related(from, key, member).await,
         _ => Err(not_found()),
     }
 }
@@ -304,9 +295,10 @@ impl Cx<'_> {
         Ok(self.entities(&extra, page).await?.0)
     }
 
-    /// One Entity the view shows, by URN.
+    /// One Entity the view shows, by URN. A key that is no URI names no Entity (NGSI-LD 4.5.1):
+    /// it is the 404 of an unknown one, not the view's 400.
     async fn entity(&self, urn: Option<&str>) -> Result<Option<Value>, Problem> {
-        let Some(urn) = urn else {
+        let Some(urn) = urn.filter(|u| mapping::is_uri(u)) else {
             return Ok(None);
         };
         Ok(self.by_ids(&[urn]).await?.into_iter().next())
@@ -559,10 +551,18 @@ impl Cx<'_> {
     async fn one(&self, set: &str, key: &str) -> Result<Option<Value>, Problem> {
         let base = self.base.as_str();
         let found = match set {
-            "Things" | "Locations" | "Datastreams" | "Observations" => self
+            "Things" | "Locations" | "Datastreams" => self
                 .entity(urn_of(key))
                 .await?
                 .and_then(|e| find(self.items(set, &e), key)),
+            // The current Observation, else an earlier one of its Datastream's history.
+            "Observations" => match self.entity(urn_of(key)).await? {
+                None => None,
+                Some(e) => match find(self.items(set, &e), key) {
+                    Some(o) => Some(o),
+                    None => self.earlier(key).await?,
+                },
+            },
             "ObservedProperties" => {
                 let extra = format!("&attrs={}", encode(&antares_ops::core_name(key)));
                 let page = Page {
@@ -601,27 +601,164 @@ impl Cx<'_> {
         Ok(found)
     }
 
-    /// The Locations, Datastreams or HistoricalLocations of one Thing.
-    async fn of_thing(&self, urn: &str, set: &str) -> Done {
-        let path = format!("{}/{set}", self_link(&self.base, "Things", urn));
+    /// A navigation property of one resource, or one of its members as `{name: value}`
+    /// (SensorThings 1.1 req/resource-path): the resource is read first, so an unknown or
+    /// hidden one is the 404 whatever follows it.
+    async fn related(&self, from: &str, key: &str, member: &str) -> Done {
+        let path = format!("{}/{member}", self_link(&self.base, from, key));
+        let source = self.one(from, key).await?.ok_or_else(not_found)?;
+        let urn = urn_of(key).unwrap_or(key);
+        let single = match (from, member) {
+            ("Things", "Locations" | "Datastreams" | "HistoricalLocations") => {
+                return self.of_thing(&path, urn, member).await
+            }
+            ("Locations", "HistoricalLocations") => return self.of_thing(&path, urn, member).await,
+            ("Datastreams", "Observations") => return self.series(key).await,
+            ("Locations", "Things") | ("HistoricalLocations", "Locations") => {
+                let set = if member == "Things" {
+                    "Things"
+                } else {
+                    "Locations"
+                };
+                let e = self.entity(Some(urn)).await?.ok_or_else(not_found)?;
+                return Ok(self.listed(&path, self.items(set, &e), true, &ById::default()));
+            }
+            ("Sensors", "Datastreams") => {
+                return self
+                    .where_(&path, "refDevice", key, |b, e| {
+                        mapping::datastreams(b, e, &[])
+                    })
+                    .await
+            }
+            ("FeaturesOfInterest", "Observations") if key.ends_with("/location") => {
+                let e = self.entity(Some(urn)).await?.ok_or_else(not_found)?;
+                return Ok(self.listed(
+                    &path,
+                    mapping::observations(&self.base, &e),
+                    true,
+                    &ById::default(),
+                ));
+            }
+            ("FeaturesOfInterest", "Observations") => {
+                return self
+                    .where_(&path, "refPointOfInterest", key, mapping::observations)
+                    .await
+            }
+            ("ObservedProperties", "Datastreams") => return self.measuring(&path, key).await,
+            ("Datastreams" | "HistoricalLocations", "Thing") => self.one("Things", urn).await?,
+            ("Datastreams", "Sensor") => {
+                let e = self.entity(Some(urn)).await?.ok_or_else(not_found)?;
+                let device = mapping::object(&e, "refDevice").ok_or_else(not_found)?;
+                self.one("Sensors", device).await?
+            }
+            ("Datastreams", "ObservedProperty") => {
+                let (_, name, _) = mapping::split_stream(key).ok_or_else(not_found)?;
+                let iri = antares_ops::core_iri(&self.attribute(name));
+                self.one("ObservedProperties", &iri).await?
+            }
+            // `one` found the Observation, so its id names a Datastream.
+            ("Observations", "Datastream") => {
+                let stream = mapping::stream_of(key).unwrap_or(key);
+                self.one("Datastreams", stream).await?
+            }
+            ("Observations", "FeatureOfInterest") => {
+                let e = self.entity(Some(urn)).await?.ok_or_else(not_found)?;
+                let pois = self.referenced(std::slice::from_ref(&e), "refPointOfInterest");
+                self.feature_of(&e, &pois.await?)
+            }
+            (_, name) if !name.contains('@') && !name.starts_with('$') => {
+                source.get(name).map(|v| json!({ name: v }))
+            }
+            _ => None,
+        };
+        single.ok_or_else(not_found)
+    }
+
+    /// A page of the resources `make` builds from each Entity whose `relationship` points at
+    /// `target`: a Sensor's Datastreams, a point of interest's Observations.
+    async fn where_(
+        &self,
+        path: &str,
+        relationship: &str,
+        target: &str,
+        make: fn(&str, &Value) -> Vec<Value>,
+    ) -> Done {
+        // `target` is the id of an Entity `one` found: a URI the broker validated at its creation
+        // (antares_model::EntityId::new), so it holds no `"` or `\` to end the q string.
+        let q = format!("{relationship}==\"{target}\"");
+        let extra = format!("&q={}", encode(&q));
+        let (entities, more, _) = self.entities(&extra, self.paged()).await?;
+        let groups = entities.iter().map(|e| make(&self.base, e)).collect();
+        Ok(self.page(path, groups, more, None, &ById::default()))
+    }
+
+    /// A page of the Datastreams measuring one ObservedProperty: those of the Entities that
+    /// hold its Attribute.
+    async fn measuring(&self, path: &str, iri: &str) -> Done {
+        let extra = format!("&attrs={}", encode(&antares_ops::core_name(iri)));
+        let (entities, more, _) = self.entities(&extra, self.paged()).await?;
+        let groups = entities
+            .iter()
+            .map(|e| {
+                mapping::datastreams(&self.base, e, &[])
+                    .into_iter()
+                    .filter(|d| {
+                        mapping::split_stream(
+                            d.get("@iot.id").and_then(Value::as_str).unwrap_or_default(),
+                        )
+                        .is_some_and(|(_, name, _)| antares_ops::core_iri(name) == iri)
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok(self.page(path, groups, more, None, &ById::default()))
+    }
+
+    /// The page of Entities `$skip` and `$top` ask for.
+    fn paged(&self) -> Page {
+        Page {
+            start: self.opts.skip,
+            size: self.opts.top,
+            whole: false,
+        }
+    }
+
+    /// An earlier Observation by id, found in its Datastream's history.
+    async fn earlier(&self, key: &str) -> Result<Option<Value>, Problem> {
+        let Some(stream) = mapping::stream_of(key) else {
+            return Ok(None);
+        };
+        let Some((urn, name, _)) = mapping::split_stream(stream) else {
+            return Ok(None);
+        };
+        let attribute = self.attribute(name);
+        Ok(self
+            .history(urn, &attribute, query::MAX_SKIP, "")
+            .await?
+            .and_then(|e| find(mapping::series(&self.base, &e, &attribute, stream), key)))
+    }
+
+    /// The Locations, Datastreams or HistoricalLocations of one Thing, listed under `path`.
+    async fn of_thing(&self, path: &str, urn: &str, set: &str) -> Done {
         let ceiling = self.opts.skip.saturating_add(self.opts.top);
         let (items, whole) = match set {
             "Locations" | "Datastreams" => {
                 let e = self.entity(Some(urn)).await?.ok_or_else(not_found)?;
                 (self.items(set, &e), true)
             }
-            "HistoricalLocations" => {
+            // `related` calls this for the three sets alone: the rest is HistoricalLocations.
+            _ => {
+                // `related` read the resource first: no `location` history is an empty list.
                 let e = self
                     .history(urn, "location", ceiling.saturating_add(1), "")
                     .await?
-                    .ok_or_else(not_found)?;
+                    .unwrap_or_default();
                 let items = mapping::historical_locations(&self.base, &e);
                 let whole = items.len() <= ceiling;
                 (items, whole)
             }
-            _ => return Err(not_found()),
         };
-        Ok(self.listed(&path, items, whole, &ById::default()))
+        Ok(self.listed(path, items, whole, &ById::default()))
     }
 
     /// The Observations of one Datastream: the history of its Attribute, `$skip` and `$top`
