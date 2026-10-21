@@ -10,7 +10,7 @@ const TEMPLATE_WORDS: &[&str] = &[
     "entity", "scopes", "location", "AND", "OR", "NOT", "EXISTS", "SELECT", "FROM", "unnest",
     "AS", "s", "WHERE", "jsonpath", "geography", "ST_SetSRID", "ST_GeomFromGeoJSON", "ST_DWithin",
     "ST_Distance", "ST_Within", "ST_Contains", "ST_Intersects", "ST_Disjoint", "ST_Overlaps",
-    "ST_Equals", "IS", "NULL", "location_ambiguous", "1", "4326",
+    "ST_Equals", "IS", "NULL", "location_ambiguous", "1", "4326", "location_cell", "ANY", "ARRAY",
 ];
 
 fn assert_template_only(sql: &str) {
@@ -28,7 +28,11 @@ fn assert_template_only(sql: &str) {
             continue;
         }
         let ordering = c == '=' && sql[..sql.len() - tail.len()].ends_with(['>', '<']);
-        assert!(" ()~@?><,:".contains(c) || ordering, "request text {c:?} in {sql}");
+        // the geo cover's cell list, `= ANY(ARRAY[$n, ...])`, and nothing else
+        let cover = (c == '=' && tail.starts_with("= ANY(ARRAY["))
+            || (c == '[' && word == "ARRAY")
+            || (c == ']' && tail.starts_with("])"));
+        assert!(" ()~@?><,:".contains(c) || ordering || cover, "request text {c:?} in {sql}");
         rest = chars.as_str();
     }
     assert!(rest.is_empty() || TEMPLATE_WORDS.contains(&rest), "request text {rest:?} in {sql}");

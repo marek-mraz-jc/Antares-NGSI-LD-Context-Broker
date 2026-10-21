@@ -55,6 +55,9 @@ const TEMPLATE_WORDS: &[&str] = &[
     "location_ambiguous",
     "1",
     "4326",
+    "location_cell",
+    "ANY",
+    "ARRAY",
 ];
 
 /// Whether `sql` is template text alone: placeholders, template words and
@@ -82,10 +85,14 @@ fn template_only(sql: &str) -> bool {
             rest = &chars.as_str()[digits..];
             continue;
         }
-        // `=` only as the second half of `>=` / `<=`: a bare `=` is a
-        // comparison no template writes
+        // `=` only as the second half of `>=` / `<=`, or in the geo cover's
+        // cell list `= ANY(ARRAY[$n, ...])`: a bare `=` is a comparison no
+        // template writes
         let ordering = c == '=' && sql[..sql.len() - tail.len()].ends_with(['>', '<']);
-        if !" ()~@?><,:".contains(c) && !ordering {
+        let cover = (c == '=' && tail.starts_with("= ANY(ARRAY["))
+            || (c == '[' && word == "ARRAY")
+            || (c == ']' && tail.starts_with("])"));
+        if !" ()~@?><,:".contains(c) && !ordering && !cover {
             return false;
         }
         rest = chars.as_str();
@@ -351,4 +358,28 @@ mod against_postgres {
                 .expect("catalog");
         assert_eq!(tables, 1, "the entities table is still there");
     }
+}
+
+/// The fuzz crash of train 20261020-1946 (fuzz/regressions/q_to_sql): a valid
+/// point writes the geo cover over `location_cell`, template text whose cells
+/// travel in binds; a bare `=` or bracket anywhere else still fails.
+#[test]
+fn the_geo_cover_is_template_text() {
+    let coordinates = json!([10.0, 50.0]);
+    let spec = GeoSpec {
+        rel: Rel::Within,
+        geometry: "Point",
+        coordinates: &coordinates,
+        geoproperty_iri: "",
+    };
+    let c = compile_geo(&spec, "location", 1).expect("a point compiles");
+    assert!(
+        c.sql.contains("location_cell = ANY(ARRAY["),
+        "no cover: {}",
+        c.sql
+    );
+    assert!(template_only(&c.sql), "cover wrote {}", c.sql);
+    assert!(!c.cell_binds.is_empty());
+    assert!(!template_only("location_cell = $1"));
+    assert!(!template_only("location[$1]"));
 }

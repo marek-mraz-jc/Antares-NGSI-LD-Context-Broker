@@ -27,6 +27,14 @@
 //!    `minDistance` it narrows — so `near` compiles only for a Point query
 //!    geometry, where the two are the same point by definition.
 //!
+//! 4. **Row-level security.** No PostGIS operator is leakproof, so under the
+//!    tables' RLS the GIST index on `location` is never an index condition
+//!    for the broker's role and every geoquery read its whole Tenant
+//!    (T-4852). Each predicate is therefore ANDed with a geohash cover of its
+//!    region over `location_cell` (migration 0015), btree text comparisons
+//!    that are leakproof; the cover is a superset (`cell_cover`), the PostGIS
+//!    predicate still narrows it, and the evaluator still decides.
+//!
 //! The query geometry travels as bound GeoJSON text (`ST_GeomFromGeoJSON
 //! ($n)`), never as SQL text, and so does every distance.
 
@@ -40,6 +48,9 @@ pub struct CompiledGeo {
     pub geo_binds: Vec<String>,
     /// Distances in metres, in placeholder order (after the geo binds).
     pub num_binds: Vec<f64>,
+    /// Geohash cell bounds of the region's cover, in placeholder order
+    /// (after the numeric binds); empty when no cover narrows the predicate.
+    pub cell_binds: Vec<String>,
 }
 
 pub use antares_store::filter::{GeoSpec, Rel, LOCATION_IRI};
@@ -63,7 +74,20 @@ pub fn compile_geo(
     // over two indexable conditions BitmapOrs (GIST + partial index) instead
     // of forcing a sequential scan.
     let mut c = predicate(spec, col, first_bind)?;
-    c.sql = format!("(({}) OR location_ambiguous)", c.sql);
+    // The cover is the leakproof index path (module docs, point 4); the
+    // PostGIS predicate stays beside it as the narrowing filter.
+    let pred = match cell_cover(spec) {
+        Some(cells) => {
+            let n = first_bind
+                .saturating_add(c.geo_binds.len())
+                .saturating_add(c.num_binds.len());
+            let (cover, binds) = cover_sql(&cells, &format!("{col}_cell"), n);
+            c.cell_binds = binds;
+            format!("{cover} AND ({})", c.sql)
+        }
+        None => c.sql,
+    };
+    c.sql = format!("(({pred}) OR location_ambiguous)");
     Some(c)
 }
 
@@ -145,7 +169,163 @@ fn predicate(spec: &GeoSpec<'_>, col: &str, first_bind: usize) -> Option<Compile
         sql: pred,
         geo_binds,
         num_binds,
+        cell_binds: Vec::new(),
     })
+}
+
+/// Cells a cover may hold. Eight keeps the statement at most 8 range probes
+/// plus one prefix probe; a region wider than eight cells of the coarsest
+/// precision (45° x 45°) gets no cover and reads the Tenant, as before.
+const MAX_COVER_CELLS: f64 = 8.0;
+
+/// Degrees a cover reaches past the region on every side, so a point on the
+/// region's closed edge also lies inside a half-open geohash cell of it.
+const EDGE: f64 = 1e-7;
+
+const BASE32: &[u8; 32] = b"0123456789bcdefghjkmnpqrstuvwxyz";
+
+/// The geohash of a WGS84 point at `chars` characters, the encoding of
+/// PostGIS `ST_GeoHash`: longitude bit first, a coordinate on a split goes
+/// to the upper half.
+pub fn geohash(lon: f64, lat: f64, chars: usize) -> String {
+    let (mut x, mut y) = ((-180.0_f64, 180.0_f64), (-90.0_f64, 90.0_f64));
+    let mut out = String::with_capacity(chars);
+    let mut on_lon = true;
+    while out.len() < chars {
+        let mut ch = 0_usize;
+        for _ in 0..5 {
+            let (r, v) = if on_lon { (&mut x, lon) } else { (&mut y, lat) };
+            let mid = (r.0 + r.1) / 2.0;
+            ch <<= 1;
+            if v >= mid {
+                ch |= 1;
+                r.0 = mid;
+            } else {
+                r.1 = mid;
+            }
+            on_lon = !on_lon;
+        }
+        // five bits: always inside the alphabet
+        if let Some(b) = BASE32.get(ch) {
+            out.push(char::from(*b));
+        }
+    }
+    out
+}
+
+/// The geohash cells of one precision that tile the region's bounding box,
+/// or `None` when no cover can narrow (`disjoint`, `near` without a maximum,
+/// a box across the antimeridian or a pole, more than `MAX_COVER_CELLS`).
+/// A SUPERSET: a stored geometry the predicate can match touches the box,
+/// and its `location_cell` (migration 0015: the cell holding its whole
+/// bounding box, `''` when none does) then either lies inside one of these
+/// cells or is a prefix of one.
+fn cell_cover(spec: &GeoSpec<'_>) -> Option<Vec<String>> {
+    let (x0, y0, x1, y1) = match &spec.rel {
+        Rel::Disjoint | Rel::Near { max: None, .. } => return None,
+        Rel::Near { max: Some(m), .. } => {
+            let [x, y] = spec.coordinates.as_array().map(Vec::as_slice)? else {
+                return None;
+            };
+            let (x, y) = (x.as_f64()?, y.as_f64()?);
+            // the radius `predicate` binds, as an angle on a sphere of
+            // 110 km per degree: shorter than any WGS84 degree of latitude
+            let r = ((m * 1.005 + 1.0) / 110_000.0).to_radians();
+            let lat = y.to_radians();
+            // the circle's widest longitude reach (spherical cap)
+            if !r.is_finite() || r.sin() >= lat.cos() {
+                return None;
+            }
+            let dx = (r.sin() / lat.cos()).asin().to_degrees();
+            let dy = r.to_degrees();
+            (x - dx, y - dy, x + dx, y + dy)
+        }
+        _ => bbox(spec.coordinates)?,
+    };
+    let (x0, y0, x1, y1) = (x0 - EDGE, y0 - EDGE, x1 + EDGE, y1 + EDGE);
+    if !(x0 >= -180.0 && x1 < 180.0 && y0 >= -90.0 && y1 < 90.0) {
+        return None;
+    }
+    // the finest precision whose cells tile the box in at most eight
+    let mut best = None;
+    for chars in 1..=12_u32 {
+        let w = 360.0 / f64::from(1_u32 << (chars.saturating_mul(5).div_ceil(2)).min(31));
+        let h = 180.0 / f64::from(1_u32 << (chars.saturating_mul(5) / 2).min(31));
+        let span =
+            |a: f64, b: f64, o: f64, s: f64| ((b + o) / s).floor() - ((a + o) / s).floor() + 1.0;
+        if span(x0, x1, 180.0, w) * span(y0, y1, 90.0, h) > MAX_COVER_CELLS {
+            break;
+        }
+        best = Some((chars as usize, w, h));
+    }
+    let (chars, w, h) = best?;
+    let (i0, i1) = (((x0 + 180.0) / w).floor(), ((x1 + 180.0) / w).floor());
+    let (j0, j1) = (((y0 + 90.0) / h).floor(), ((y1 + 90.0) / h).floor());
+    let mut cells = Vec::new();
+    let mut i = i0;
+    while i <= i1 {
+        let mut j = j0;
+        while j <= j1 {
+            // each cell by its centre, away from every split
+            cells.push(geohash(
+                -180.0 + (i + 0.5) * w,
+                -90.0 + (j + 0.5) * h,
+                chars,
+            ));
+            j += 1.0;
+        }
+        i += 1.0;
+    }
+    cells.sort_unstable();
+    cells.dedup();
+    Some(cells)
+}
+
+/// The bounding box of a GeoJSON `coordinates` member, any nesting depth.
+fn bbox(v: &Value) -> Option<(f64, f64, f64, f64)> {
+    match v.as_array()?.as_slice() {
+        [x, y, ..] if x.is_number() => {
+            let (x, y) = (x.as_f64()?, y.as_f64()?);
+            Some((x, y, x, y))
+        }
+        parts => parts.iter().try_fold(None, |acc, p| {
+            let b = bbox(p)?;
+            Some(Some(match acc {
+                None => b,
+                Some((a0, b0, a1, b1)) => (b.0.min(a0), b.1.min(b0), b.2.max(a1), b.3.max(b1)),
+            }))
+        })?,
+    }
+}
+
+/// The cover as leakproof btree conditions on `cell_col` (`text COLLATE
+/// "C"`): a stored cell inside a cover cell (`>= c AND < c~`; `~` sorts
+/// after every geohash character), or one that is a prefix of a cover cell
+/// (a geometry too large for a finer cell). Binds numbered from `first`.
+fn cover_sql(cells: &[String], cell_col: &str, first: usize) -> (String, Vec<String>) {
+    let mut binds = Vec::new();
+    let mut ors = Vec::new();
+    for c in cells {
+        let n = first.saturating_add(binds.len());
+        let m = n.saturating_add(1);
+        ors.push(format!("({cell_col} >= ${n} AND {cell_col} < ${m})"));
+        binds.push(c.clone());
+        binds.push(format!("{c}~"));
+    }
+    let mut prefixes: Vec<&str> = cells
+        .iter()
+        .flat_map(|c| (0..c.len()).map(move |k| &c[..k]))
+        .collect();
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    let list: Vec<String> = prefixes
+        .iter()
+        .enumerate()
+        .map(|(k, _)| format!("${}", first.saturating_add(binds.len()).saturating_add(k)))
+        .collect();
+    ors.push(format!("{cell_col} = ANY(ARRAY[{}])", list.join(", ")));
+    binds.extend(prefixes.into_iter().map(str::to_owned));
+    (format!("({})", ors.join(" OR ")), binds)
 }
 
 /// Extract the geometry to store in `entities.location` at write time.
@@ -321,7 +501,13 @@ mod tests {
             "minDistance placeholder: {}",
             c.sql
         );
-        assert!(!c.sql.contains("$4"), "overshoot: {}", c.sql);
+        let past = 4 + c.cell_binds.len();
+        assert!(
+            c.sql.contains("location_cell >= $4"),
+            "cover after: {}",
+            c.sql
+        );
+        assert!(!c.sql.contains(&format!("${past}")), "overshoot: {}", c.sql);
     }
 
     /// `maxDistance`/`minDistance` reach this compiler as `f64`, and `inf`
@@ -366,11 +552,145 @@ mod tests {
         for needle in ["DROP", "TABLE", "--", "'"] {
             assert!(!c.sql.contains(needle), "{needle:?} leaked: {}", c.sql);
         }
-        assert_eq!(
-            c.sql,
-            "((ST_Within(location, ST_SetSRID(ST_GeomFromGeoJSON($1), 4326))) OR location_ambiguous)"
+        assert!(
+            c.sql
+                .starts_with("((((location_cell >= $2 AND location_cell < $3)"),
+            "{}",
+            c.sql
+        );
+        assert!(
+            c.sql.ends_with(
+                " AND (ST_Within(location, ST_SetSRID(ST_GeomFromGeoJSON($1), 4326)))) \
+                 OR location_ambiguous)"
+            ),
+            "{}",
+            c.sql
         );
         assert!(c.geo_binds[0].contains("DROP"), "{}", c.geo_binds[0]);
+    }
+
+    /// The encoding PostGIS `ST_GeoHash` stores (`SELECT ST_GeoHash(
+    /// ST_MakePoint(10, 45))`, PostGIS 3.5), splits going to the upper cell.
+    #[test]
+    fn geohash_matches_postgis() {
+        assert_eq!(geohash(10.0, 45.0, 12), "u0p0581b0bh2");
+        assert_eq!(geohash(11.25, 46.0, 3), "u20");
+        assert_eq!(geohash(11.249_999_9, 46.0, 3), "u0p");
+    }
+
+    /// T-4852: the cover is a superset. Every point the region holds, its
+    /// edges and corners included, has a stored cell (a 12-character
+    /// geohash) inside one cover cell, and a geometry whose cell is a prefix
+    /// of a cover cell is kept by the prefix list.
+    #[test]
+    fn the_cell_cover_keeps_every_point_of_the_region() {
+        let kept = |cells: &[String], stored: &str| {
+            cells
+                .iter()
+                .any(|c| stored.starts_with(c.as_str()) || c.starts_with(stored))
+        };
+        let poly = json!([[
+            [10.0, 45.0],
+            [10.0, 45.05],
+            [10.05, 45.05],
+            [10.05, 45.0],
+            [10.0, 45.0]
+        ]]);
+        let s = spec(Rel::Intersects, "Polygon", &poly, "");
+        let cells = cell_cover(&s).expect("a small box has a cover");
+        assert!(
+            cells.len() <= 8 && cells.iter().all(|c| c.len() == 5),
+            "{cells:?}"
+        );
+        for i in 0..=20 {
+            for j in 0..=20 {
+                let (x, y) = (10.0 + 0.0025 * f64::from(i), 45.0 + 0.0025 * f64::from(j));
+                assert!(
+                    kept(&cells, &geohash(x, y, 12)),
+                    "({x}, {y}) lost: {cells:?}"
+                );
+            }
+        }
+        assert!(kept(&cells, "u0p0") && kept(&cells, ""), "ancestors stay");
+        assert!(!kept(&cells, &geohash(10.2, 45.0, 12)), "the cover narrows");
+
+        // near: every point within the radius, measured on the sphere
+        let centre = json!([16.37, 48.21]);
+        let s = spec(
+            Rel::Near {
+                max: Some(5000.0),
+                min: None,
+            },
+            "Point",
+            &centre,
+            "",
+        );
+        let cells = cell_cover(&s).expect("a 5 km circle has a cover");
+        for k in 0..72 {
+            let a = f64::from(k * 5).to_radians();
+            let (lat, lon, d) = (
+                48.21_f64.to_radians(),
+                16.37_f64.to_radians(),
+                5000.0_f64 / 6_371_008.8,
+            );
+            let y = (lat.sin() * d.cos() + lat.cos() * d.sin() * a.cos()).asin();
+            let x = lon + (a.sin() * d.sin() * lat.cos()).atan2(d.cos() - lat.sin() * y.sin());
+            assert!(
+                kept(&cells, &geohash(x.to_degrees(), y.to_degrees(), 12)),
+                "bearing {k}"
+            );
+        }
+    }
+
+    /// No cover where one cannot narrow or would have to wrap.
+    #[test]
+    fn regions_without_a_cover_keep_the_plain_predicate() {
+        let poly = json!([[[10.0, 45.0], [10.0, 46.0], [11.0, 46.0], [10.0, 45.0]]]);
+        assert!(cell_cover(&spec(Rel::Disjoint, "Polygon", &poly, "")).is_none());
+        let p = json!([179.99, 0.0]);
+        let near = |max| {
+            spec(
+                Rel::Near {
+                    max,
+                    min: Some(1.0),
+                },
+                "Point",
+                &p,
+                "",
+            )
+        };
+        assert!(cell_cover(&near(None)).is_none(), "minDistance alone");
+        assert!(
+            cell_cover(&near(Some(5000.0))).is_none(),
+            "across the antimeridian"
+        );
+        let pole = json!([0.0, 89.99]);
+        let s = spec(
+            Rel::Near {
+                max: Some(5000.0),
+                min: None,
+            },
+            "Point",
+            &pole,
+            "",
+        );
+        assert!(cell_cover(&s).is_none(), "around a pole");
+        let world = json!([[
+            [-170.0, -80.0],
+            [-170.0, 80.0],
+            [170.0, 80.0],
+            [-170.0, -80.0]
+        ]]);
+        assert!(
+            cell_cover(&spec(Rel::Within, "Polygon", &world, "")).is_none(),
+            "too wide"
+        );
+        let c = compile_geo(&spec(Rel::Within, "Polygon", &world, ""), "location", 1).expect("sql");
+        assert!(
+            c.cell_binds.is_empty() && !c.sql.contains("location_cell"),
+            "{}",
+            c.sql
+        );
     }
 
     #[test]

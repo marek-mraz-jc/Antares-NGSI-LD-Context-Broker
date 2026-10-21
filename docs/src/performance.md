@@ -6,7 +6,9 @@ a dedicated-vCPU machine at Hetzner for the run, register it as an
 ephemeral GitHub runner, and delete it afterwards (`perf-janitor` sweeps a
 leaked server or volume by its expiry label). Results land under
 [`/reports/perf/latest/`](https://antaresbroker.joinedcontext.com/reports/perf/latest/)
-with the raw CSVs next to the tables.
+with the raw CSVs next to the tables. One table is the exception:
+[query plans under row-level security](#query-plans-under-row-level-security)
+comes from a local script, named with its box beside it.
 
 | run | box | what it measures | cadence |
 |---|---|---|---|
@@ -807,6 +809,68 @@ Sixty-six microseconds on a hundred-Entity page is not a reason to build
 and maintain a second, typed API surface beside the HTTP one, so that box
 stays closed until a façade measures this as its ceiling rather than as its
 rounding error.
+
+## Query plans under row-level security
+
+The broker connects as a role without BYPASSRLS, so every read runs under
+the tables' forced RLS. Postgres then takes an operator into an index
+condition only when it is leakproof, and no PostGIS operator (`&&`,
+`ST_*`), no jsonb operator (`@?`, `?|`, `@>`) and no array operator (`@>`,
+`&&`) is: the GIST on `location` and the GIN indexes on `entity` and
+`types` never serve the broker, whatever a superuser `EXPLAIN` shows.
+Btree comparisons of text, numbers and timestamps are leakproof. T-4852
+moved every shape the broker pushes down onto those:
+
+- `type=A,B` and `type=A;B` read one `types[1] = T` arm per named type
+  through `i_entities_first_type_id` plus one arm over the multi-type
+  Entities (`i_entities_multi_type_id`), as one named type has since T-4781;
+- a geoquery ANDs a geohash cover of its region (at most eight cells and
+  their prefixes) over `location_cell`, the generated cell of each
+  Entity's bounding box (migration 0015), through
+  `i_entities_location_cell`; the PostGIS predicate still filters and the
+  evaluator still decides;
+- the temporal `type=` reads `types[1] = ANY(...)` and the multi-type
+  Entities through two new `temporal_entities` indexes instead of `&&`.
+
+`q` and `attrs` have no leakproof form: they ride the type arm's index and
+filter the type's rows, so their cost grows with the type, and a `q`
+without `type` still reads the Tenant. The q-equality row below asks for
+`speed == 42`, which no Entity of the type holds: the worst case, all of
+the type's rows read.
+
+`dev/rls-plan-bench.sh <url> <N> [R] [R_BEFORE]` seeds two Tenants of N
+Entities each (the second one is there so that a walk of the table is not
+also a walk of the Tenant), runs each shape R times through `pgbench` as
+`antares_app`, and prints p50, p99 and the plan's scan nodes. The
+statements are the store's own, the "before" rows are their shape before
+T-4852. `crates/antares-sql/tests/pg_explain.rs` asserts the same plans at
+100 000 Entities on every test run. Box: the 16-core sandbox host,
+PostGIS 17.5-3.5 in a container with its defaults (`shared_buffers`
+128 MB, `work_mem` 4 MB), one client, R = 200, R_BEFORE = 20 at 1M.
+
+| shape | form | 10k p50 / p99 ms | 100k p50 / p99 ms | 1M p50 / p99 ms | scan nodes at 1M |
+|---|---|---|---|---|---|
+| id | same | 0.14 / 0.22 | 0.14 / 0.22 | 0.45 / 0.64 | Index Scan entities_pkey |
+| type | same | 0.34 / 0.62 | 0.78 / 0.96 | 5.05 / 14.16 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| type=A,B | before | 0.67 / 0.96 | 6.81 / 9.99 | 319.24 / 339.54 | Index Scan entities_pkey |
+| type=A,B | after | 0.48 / 2.00 | 1.03 / 1.38 | 6.63 / 15.25 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| q-equality | same | 1.04 / 2.35 | 14.48 / 18.29 | 375.89 / 436.12 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| q-range | same | 0.56 / 0.92 | 16.02 / 20.97 | 9.74 / 20.48 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| attrs | same | 0.45 / 1.74 | 17.30 / 23.08 | 7.05 / 12.00 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| geo-near | before | 33.23 / 67.17 | 257.32 / 397.72 | 2823.12 / 2886.87 | Index Scan entities_pkey |
+| geo-near | after | 0.28 / 0.41 | 0.34 / 0.80 | 0.72 / 1.12 | Bitmap Index Scan i_entities_loc_ambiguous, Bitmap Index Scan i_entities_location_cell |
+| geo-within | before | 20.94 / 35.01 | 224.29 / 282.46 | 2005.86 / 2094.93 | Index Scan entities_pkey |
+| geo-within | after | 0.23 / 0.30 | 0.34 / 1.08 | 0.57 / 1.54 | Bitmap Index Scan i_entities_loc_ambiguous, Bitmap Index Scan i_entities_location_cell |
+| temporal-type | before | 17.58 / 78.73 | 21.83 / 25.59 | 22.33 / 38.19 | Index Only Scan attr_instances lookup btree, Index Scan temporal_entities_pkey |
+| temporal-type | after | 14.20 / 68.98 | 21.55 / 30.18 | 22.12 / 32.94 | Index Only Scan attr_instances lookup btree, Index Scan temporal_entities_pkey |
+| temporal-lastN | same | 0.11 / 0.19 | 0.30 / 0.46 | 0.34 / 0.53 | Index Scan attr_instances lookup btree |
+| temporal-between | same | 0.15 / 0.23 | 0.42 / 0.64 | 0.45 / 0.70 | Index Scan Backward attr_instances lookup btree |
+
+The paged temporal query is driven from the Entities that hold
+instances (an index-only scan of `attr_instances`, then one primary-key
+probe per Entity), so its time follows the instances, before and after.
+The new indexes replace the Tenant read where the planner starts from
+`temporal_entities` instead, which `pg_explain.rs` pins.
 
 ## What the numbers are not
 

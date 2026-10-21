@@ -47,7 +47,7 @@ mod tests {
             binds + 1,
         )
         .expect("geo compiles");
-        binds += c.geo_binds.len() + c.num_binds.len();
+        binds += c.geo_binds.len() + c.num_binds.len() + c.cell_binds.len();
         sql.push(c.sql);
 
         let statement = sql.join(" AND ");
