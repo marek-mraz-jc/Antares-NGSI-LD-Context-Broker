@@ -105,7 +105,7 @@ async fn limit_default_clamp_and_bounds() -> Result<(), String> {
 }
 
 /// T-4926: ETS 1.8 Core `fc-numberMatched` reads the first page, then follows at most four
-/// `next` links with `limit` set to the OpenAPI `maximum` (10000). A page of the declared maximum
+/// `next` links with `limit` set to the `maximum` of the API definition (10000). A page of the declared maximum
 /// holds that many Features, read from the store in pages of its `max_limit` (1000), so 4,109
 /// Cars arrive whole, each once, as on prod's Contract collection.
 #[tokio::test(flavor = "multi_thread")]

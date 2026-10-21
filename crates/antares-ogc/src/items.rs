@@ -16,7 +16,7 @@ use std::fmt::Write as _;
 
 /// Features per page when the request names no `limit` (Part 1 `fc-limit-definition`).
 pub(crate) const DEFAULT_LIMIT: u64 = 10;
-/// The largest `limit`, the `maximum` the OpenAPI document declares: a page holds up to it,
+/// The largest `limit`, the `maximum` the API definition declares: a page holds up to it,
 /// read from the store in pages of its `max_limit` (C10); above it the request is 400.
 pub(crate) const MAX_LIMIT: u64 = 10_000;
 
