@@ -537,6 +537,17 @@ pub trait CurrentStateDriver: Send + Sync {
         tenant: &TenantId,
         f: &filter::EntityFilter<'_>,
     ) -> Result<filter::QueryOutcome, NgsiError>;
+    /// `query_entities` for a caller that re-decides every row and walks the
+    /// match set in id-ordered pages: the backend may push `f.page` over the
+    /// candidates it cannot decide (`paged` without `decided`), and never
+    /// counts them. The default reads as `query_entities` does.
+    async fn query_candidates(
+        &self,
+        tenant: &TenantId,
+        f: &filter::EntityFilter<'_>,
+    ) -> Result<filter::QueryOutcome, NgsiError> {
+        self.query_entities(tenant, f).await
+    }
     /// The Entity types the Tenant's live Entities carry (5.7.5), sorted,
     /// read without the documents: `/types` names them, and folding every
     /// Entity for the names read a whole Tenant per call (T-4610). `None`

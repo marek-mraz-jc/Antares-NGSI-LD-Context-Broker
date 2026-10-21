@@ -771,10 +771,36 @@ impl AnyStore {
         tenant: &TenantId,
         f: &crate::store::filter::EntityFilter<'_>,
     ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
+        self.query_paged(tenant, f, false).await
+    }
+
+    /// `Store::query_candidates`: the Pg arm pages the candidates it cannot
+    /// decide; the memory arm answers as `query_entities`.
+    pub async fn query_candidates(
+        &self,
+        tenant: &TenantId,
+        f: &crate::store::filter::EntityFilter<'_>,
+    ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
+        self.query_paged(tenant, f, true).await
+    }
+
+    async fn query_paged(
+        &self,
+        tenant: &TenantId,
+        f: &crate::store::filter::EntityFilter<'_>,
+        candidates: bool,
+    ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
         let mut outcome = match self {
-            AnyStore::Mem(s) => s.query_entities(tenant, f),
+            AnyStore::Mem(s) => {
+                let _ = candidates;
+                s.query_entities(tenant, f)
+            }
             #[cfg(feature = "postgres")]
-            AnyStore::Pg(p) => p.entities.query(tenant, f).await.map_err(db)?,
+            AnyStore::Pg(p) => match candidates {
+                true => p.entities.query_candidates(tenant, f).await,
+                false => p.entities.query(tenant, f).await,
+            }
+            .map_err(db)?,
         };
         // 4.22: the Pg arm already excludes expired ENTITIES in SQL (so
         // paging/totals stay exact); instance stripping — and the whole job
@@ -1573,6 +1599,13 @@ impl antares_store::CurrentStateDriver for AnyStore {
         f: &crate::store::filter::EntityFilter<'_>,
     ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
         AnyStore::query_entities(self, tenant, f).await
+    }
+    async fn query_candidates(
+        &self,
+        tenant: &TenantId,
+        f: &crate::store::filter::EntityFilter<'_>,
+    ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
+        AnyStore::query_candidates(self, tenant, f).await
     }
     async fn entity_type_names(&self, tenant: &TenantId) -> Result<Option<Vec<String>>, NgsiError> {
         AnyStore::entity_type_names(self, tenant).await.map(Some)
