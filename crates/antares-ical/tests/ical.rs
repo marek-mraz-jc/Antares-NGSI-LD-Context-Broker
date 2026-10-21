@@ -16,6 +16,7 @@ use axum::Router;
 use http_body_util::BodyExt;
 use icalendar::{Calendar, CalendarComponent, Component, DatePerhapsTime, EventLike};
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 use tower::ServiceExt;
 
 struct Answer {
@@ -296,13 +297,14 @@ async fn a_view_of_every_type_serves_its_events_alone() {
 }
 
 #[tokio::test]
-async fn an_empty_tenant_is_an_empty_calendar_and_a_refused_read_a_502() {
+async fn an_empty_tenant_is_an_empty_calendar_and_a_view_without_query_entities_none() {
     let (_broker, app) = fixture().await;
     let a = send(&app, "GET", "/x/views/void/ical/v1/events.ics", "").await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     assert!(events(&parse(&a.body)).is_empty(), "{}", a.body);
     let a = send(&app, "GET", "/x/views/writes/ical/v1/events.ics", "").await;
-    assert_eq!(a.status, StatusCode::BAD_GATEWAY, "{}", a.body);
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
+    assert!(a.body.contains("no such calendar"), "{}", a.body);
     let a = send(&app, "OPTIONS", "/x/views/city/ical/v1/events.ics", "").await;
     assert_eq!(a.status, StatusCode::NO_CONTENT);
 }
@@ -342,4 +344,36 @@ async fn a_feed_reads_every_page_and_refuses_past_its_bound() {
     }
     let a = send(&app, "GET", "/x/views/city/ical/v1/events.ics", "").await;
     assert_eq!(a.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", a.body);
+}
+
+/// `DTSTAMP` and `LAST-MODIFIED` hold the time the fixture wrote the Entities.
+fn stamped(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| match line.split_once(':') {
+            Some((name @ ("DTSTAMP" | "LAST-MODIFIED"), rest)) => {
+                format!("{name}:STAMP{}", &rest[16..])
+            }
+            _ => line.to_owned(),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_view_without_a_mapping_serves_what_the_feed_served_before_mappings_byte_for_byte() {
+    // fixtures/sdm-event-default.txt: these three feeds as dev 53ab566e (T-4487) served them
+    let (_broker, app) = fixture().await;
+    let mut all = String::new();
+    for uri in [
+        "/x/views/city/ical/v1/events.ics",
+        "/x/views/every/ical/v1/events.ics",
+        "/x/views/city/ical/v1/events.ics?from=2026-09-11&to=2026-09-11",
+    ] {
+        let a = send(&app, "GET", uri, "").await;
+        writeln!(all, "# {uri} {} {:?}", a.status, a.skipped).expect("a String takes it");
+        all.push_str(&a.body);
+    }
+    assert_eq!(
+        stamped(&all),
+        include_str!("fixtures/sdm-event-default.txt")
+    );
 }

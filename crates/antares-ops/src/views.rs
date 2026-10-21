@@ -125,7 +125,15 @@ pub struct View {
     /// [`crate::mapping::READS`].
     #[serde(default)]
     pub mapping: Option<Value>,
+    /// How a domain-standard surface renders the view's Entities, by
+    /// surface name: [`REPRESENTATIONS`] lists the names, and the surface
+    /// reads its own member (the `ical` field mapping, T-4901).
+    #[serde(default)]
+    pub representations: Option<serde_json::Map<String, Value>>,
 }
+
+/// The surfaces a view's `representations` may name.
+pub const REPRESENTATIONS: &[&str] = &["ical"];
 
 /// One allowlist of a [`View`]: the Entities of `types` for which the
 /// condition holds show `attributes`.
@@ -179,6 +187,8 @@ pub struct Loaded {
     pub mapping: Option<Arc<crate::mapping::Mapping>>,
     /// The view's own `@context`, as written.
     pub context: Option<Arc<serde_json::Map<String, Value>>>,
+    /// The view's `representations`, as written.
+    pub representations: Option<Arc<serde_json::Map<String, Value>>>,
 }
 
 impl View {
@@ -297,6 +307,15 @@ impl View {
                 &operations,
             )?)),
         };
+        if let Some(named) = &self.representations {
+            if let Some((name, _)) = named.iter().find(|(name, member)| {
+                !REPRESENTATIONS.contains(&name.as_str()) || !member.is_object()
+            }) {
+                return Err(format!(
+                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with an object"
+                ));
+            }
+        }
         let view = view.named(&self.id);
         let mut loaded = Loaded {
             view: Arc::new(view),
@@ -305,6 +324,7 @@ impl View {
             notes,
             mapping,
             context: self.context.clone().map(Arc::new),
+            representations: self.representations.clone().map(Arc::new),
         };
         if self.q.is_some()
             && loaded
@@ -482,6 +502,7 @@ fn entry(doc: &Value) -> ViewEntry {
                 .mapping
                 .map(|m| antares_api::views::Attached(m as Arc<dyn std::any::Any + Send + Sync>)),
             context: l.context,
+            representations: l.representations,
         },
         Err(reason) => ViewEntry::Invalid { reason },
     }
@@ -1284,6 +1305,27 @@ mod tests {
             .collect::<Vec<_>>());
         let loaded = load(&v).map(|l| l.operations.len());
         assert_eq!(loaded, Ok(11));
+    }
+
+    #[test]
+    fn a_view_keeps_the_representations_it_names_and_refuses_another_name() {
+        let ical = json!({"ical": {"preset": "sdm-event"}});
+        let loaded = load(&with("representations", ical.clone())).expect("loads");
+        assert_eq!(
+            loaded
+                .representations
+                .as_deref()
+                .cloned()
+                .map(Value::Object),
+            Some(ical)
+        );
+        assert!(load(&base()).is_ok_and(|l| l.representations.is_none()));
+        for bad in [json!({"vcard": {}}), json!({"ical": []}), json!([])] {
+            assert!(
+                load(&with("representations", bad.clone())).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

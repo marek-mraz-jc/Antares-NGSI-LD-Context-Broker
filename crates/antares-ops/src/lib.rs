@@ -140,6 +140,7 @@ pub struct ViewOps {
     /// The core @context with the view's own merged in: what a name a caller
     /// writes in an NGSI-LD parameter means here (`names.rs`).
     names: Arc<antares_jsonld::Context>,
+    representations: Option<Arc<serde_json::Map<String, serde_json::Value>>>,
 }
 
 /// The Entity types a caller may see through a view and the Attributes
@@ -374,6 +375,21 @@ impl Ops {
         self.state.max_answer_bytes
     }
 
+    /// Whether `headers` carry the broker's `/q` admin bearer token: an
+    /// internal route of a surface (the iCalendar preview, T-4901) serves
+    /// the Portal alone. `false` when no admin token is configured, so
+    /// such a route fails closed where `/q` would be open.
+    #[must_use]
+    pub fn admits_admin(&self, headers: &HeaderMap) -> bool {
+        let presented = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .map(HeaderValue::as_bytes);
+        self.state
+            .admin_auth
+            .as_deref()
+            .is_some_and(|auth| auth.admits(presented))
+    }
+
     /// An answer's body read whole, up to the broker's `max_answer_bytes`
     /// ([`bounds::MAX_ANSWER_BYTES`]): the page size bounds the Entities, not the
     /// bytes, and every concurrent request holds its buffer.
@@ -410,6 +426,7 @@ impl Ops {
             operations,
             mapping,
             context,
+            representations,
             ..
         }) = table.get(id)
         else {
@@ -437,6 +454,7 @@ impl Ops {
                 .collect(),
             mapping,
             names: Arc::new(names::of_view(context.as_deref())?),
+            representations: representations.clone(),
         };
         // Only views loaded now stay cached: a removed one goes with the
         // first view served after its removal.
@@ -600,6 +618,14 @@ impl ViewOps {
     #[must_use]
     pub fn tenant(&self) -> &str {
         self.tenant.as_str()
+    }
+
+    /// The view's `representations` member for surface `name` as written
+    /// (`views::REPRESENTATIONS`), for that surface to parse; `None` when
+    /// the view names none.
+    #[must_use]
+    pub fn representation(&self, name: &str) -> Option<&serde_json::Value> {
+        self.representations.as_deref()?.get(name)
     }
 
     /// The `LinkML` schema of the view's Tenant as written to

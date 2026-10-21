@@ -519,6 +519,10 @@ pub enum ViewEntry {
         /// The view's own `@context` as written, which a surface reads the
         /// NGSI-LD names a caller writes under (ADR-0028 rule 6).
         context: Option<Arc<serde_json::Map<String, serde_json::Value>>>,
+        /// The view's domain-standard representations as written
+        /// (`representations`, keyed by surface name), which that surface
+        /// alone reads (T-4901).
+        representations: Option<Arc<serde_json::Map<String, serde_json::Value>>>,
     },
     /// A stored view that failed validation: never served, named in
     /// `/q/health` with the reason.
