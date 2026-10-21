@@ -36,6 +36,12 @@ runs:
         BODY: ${{ inputs.body }}
         LOG: ${{ inputs.log-file }}
       run: |
+        # A fork with issues disabled has nowhere to file: say so in the run
+        # instead of failing a job that is red, or green, on its own merits.
+        if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)" != true ]; then
+          echo "::warning title=$TITLE::issues are disabled on $GITHUB_REPOSITORY, no alarm filed; the run is $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          exit 0
+        fi
         gh issue list --state open --search "\"$TITLE\" in:title" --json number -q '.[0].number' | /usr/bin/grep -q . && exit 0
         gh label create "$LABEL" --color B60205 --description "auto-filed by a red scheduled run" 2>/dev/null || true
         if [ -n "$LOG" ] && [ -f "$LOG" ]; then

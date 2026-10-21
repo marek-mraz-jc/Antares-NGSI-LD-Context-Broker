@@ -446,8 +446,9 @@ impl CurrentStateDriver for ExampleStore {
 
     async fn sweep_expired(&self) -> usize {
         // 4.22: the reads above already hide expired context; this is the
-        // memory the sweep gets back — whole entities past their stamp, and
-        // the expired instances still sitting inside live documents.
+        // memory the sweep gets back — whole entities past their stamp with
+        // their history, and the expired instances still sitting inside live
+        // documents.
         let now = now();
         let entity = slot(Kind::Entity);
         let mut docs = self.write();
@@ -456,10 +457,12 @@ impl CurrentStateDriver for ExampleStore {
             .filter(|((_, k, _), d)| *k == entity && filter::expired_at(d, &now))
             .map(|(k, _)| k.clone())
             .collect();
-        for k in &dead {
-            docs.remove(k);
-        }
         let temporal = slot(Kind::Temporal);
+        for (t, _, id) in &dead {
+            docs.remove(&(t.clone(), entity, id.clone()));
+            // DM-97: the Entity's history goes with it.
+            docs.remove(&(t.clone(), temporal, id.clone()));
+        }
         let mut pruned = 0;
         for ((_, k, _), doc) in docs.iter_mut() {
             if *k != entity && *k != temporal {
