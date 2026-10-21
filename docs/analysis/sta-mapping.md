@@ -30,16 +30,22 @@ view shows whose local name it is.
 
 | Option | Bounds | Handling |
 |---|---|---|
-| `$filter` | at most 4 096 bytes; split on character boundaries only (T-4323) | comparisons, `and`, `or`, parentheses, `substringof` compiled to `q` (the gateway's subset); `not` and any other operator a `400` naming it; on a Datastream's Observations `phenomenonTime` predicates on the top-level `and` become `timerel`/`timeAt`/`endTimeAt` |
-| `$top` | 1 to 100, default 100 | `limit` of the Query Entities; on a Thing's list and on Observations of a Datastream, resources |
-| `$skip` | 0 to 10 000 | `offset`; on Observations of a Datastream it widens `lastN` |
+| `$filter` | at most 4 096 bytes; split on character boundaries only (T-4323) | comparisons, `and`, `or`, parentheses, `substringof` compiled to `q` (the gateway's subset); `not` and any other operator a `400` naming it; on a Datastream's Observations `phenomenonTime` predicates on the top-level `and` become `timerel`/`timeAt`/`endTimeAt`; on a set, `id eq`/`id ne` with a quoted id on the top-level `and` are read by id (`id eq` as the resource by id, `id ne` dropped from the page), never as `q`: an id is no Attribute, and the `q` scanned the whole store (T-4928) |
+| `$top` | 1 to 100, default 100 | resources; on `Things`, `Locations`, `Sensors`, `FeaturesOfInterest` (one per Entity) the `limit` of the Query Entities |
+| `$skip` | 0 to 10 000 | resources: the `offset` on a set of one per Entity; on `Datastreams`, `Observations`, `ObservedProperties` counted from the first Entity over at most 1 000 Entities, past that a `400` naming `@iot.nextLink`, whose `$skiptoken={entity offset}.{resources of it served}` resumes in one read; on Observations of a Datastream it widens `lastN` |
 | `$count` | `true` | `@iot.count`: on `Things` the Query Entities count; on another set only when the page is the whole answer, since an Entity holds several of its resources and the count of those is in no answer |
-| `$expand` | depth at most 2 | `Locations`, `Datastreams` inline on a Thing |
+| `$expand` | depth at most 2 | `Locations`, `Datastreams` inline on a Thing; the current `Observations` on a Datastream (nested options such as `($top=1)` are read past) |
 | `$select` | names | the members each resource keeps |
 | `$orderby` | `phenomenonTime desc` | newest first on Observations of a Datastream; any other ordering leaves the order as read |
 
-A page is cut at 1 MiB between Entities, never inside one; a cut page or a full one carries `@iot.nextLink`, the
-request's options with the next `$skip`. A resource id appears once per page.
+A page is cut at 1 MiB between groups (an Entity, or one resource on a set of several per Entity); a cut page or a
+full one carries `@iot.nextLink`, the request's options with the next `$skip` or `$skiptoken`. A resource id appears
+once per page.
+
+**phenomenonTime** (mandatory in STA 1.1): the instance's `observedAt`, else the Entity's, else the instance's
+`modifiedAt`, else the Entity's (Query Entities reads `options=sysAttrs`). A value no sensor timed, such as the area
+of an `AdministrativeArea`, has the time it was last set; an instance with no time is no Observation (EP-13). CI
+missed it because every fixture Entity was a sensor with `observedAt` on one instance (T-4928).
 
 ## 3. The seven rules and what changed against the gateway
 

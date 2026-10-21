@@ -33,7 +33,7 @@ hidden id answers the `404` an unknown one does.
 | `Locations` | its `location` | `{urn}/location` |
 | `HistoricalLocations` | the timed instances of its `location` history | `{urn}/historicalLocation/{observedAt}` |
 | `Datastreams` | each instance of a numeric Property | `{urn}/{attribute}`, `#{datasetId}` after it for a dataset |
-| `Observations` | the current instance; a Datastream's are its history | `{datastream id}/{observedAt}` |
+| `Observations` | the current instance; a Datastream's are its history | `{datastream id}/{phenomenonTime}` |
 | `ObservedProperties` | each measured Attribute | its expanded IRI |
 | `Sensors` | the `Device` its `refDevice` points at | the Device's URN |
 | `FeaturesOfInterest` | the target of `refPointOfInterest`, else its `location` | the target's URN, else `{urn}/location` |
@@ -42,15 +42,17 @@ hidden id answers the `404` an unknown one does.
 
 | Option | Behaviour |
 |---|---|
-| `$top`, `$skip` | Entities per page, at most 100 (default 100); `$skip` at most 10 000; on a Thing's list and a Datastream's Observations, resources |
+| `$top`, `$skip` | resources per page, at most 100 (default 100); `$skip` at most 10 000; on `Datastreams`, `Observations` and `ObservedProperties` a `$skip` reaching past the first 1 000 Entities is `400`: follow `@iot.nextLink` |
 | `$count=true` | `@iot.count`: the Query Entities count on `Things`, and on any other set only when the page is the whole answer |
-| `$filter` | comparisons, `and`, `or`, parentheses and `substringof` as the NGSI-LD `q`; on a Datastream's Observations `phenomenonTime` predicates on the top-level `and` become the temporal window; at most 4 096 bytes; anything else `400` naming it |
-| `$expand` | `Locations` and `Datastreams` inline on a Thing; a path deeper than 2 is `400` |
+| `$filter` | comparisons, `and`, `or`, parentheses and `substringof` as the NGSI-LD `q`; on a Datastream's Observations `phenomenonTime` predicates on the top-level `and` become the temporal window; `id eq` and `id ne` with a quoted id on the top-level `and` select by id (`id eq` beside another comparison, or `id` elsewhere, is `400`); at most 4 096 bytes; anything else `400` naming it |
+| `$expand` | `Locations` and `Datastreams` inline on a Thing, the current `Observations` on a Datastream; a path deeper than 2 is `400` |
 | `$select` | the members each resource keeps |
 | `$orderby` | `phenomenonTime desc` on a Datastream's Observations |
 
-A page is cut at 1 MiB between Entities, never inside one, and a cut or a
-full page carries `@iot.nextLink` with the request's own options. Errors
+An Observation's `phenomenonTime` is the instance's `observedAt`, else the
+time its value was last set (`modifiedAt`); an instance with neither is no
+Observation. A page is cut at 1 MiB between resources, and a cut or a full
+page carries `@iot.nextLink` with the request's own options. Errors
 are the OData JSON error body with a fixed message.
 
 ## Related
