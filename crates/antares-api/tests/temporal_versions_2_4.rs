@@ -5,7 +5,7 @@
 //! gateway says the space's Policy granted `readVersions`. Versions live in
 //! the Postgres temporal store only, so this file skips loudly without
 //! `ANTARES_TEST_DATABASE_URL` (container recipe in `antares-sql/tests/pg.rs`).
-#![cfg(feature = "postgres")]
+#![cfg(all(feature = "postgres", feature = "jc"))]
 
 use antares_api::AppState;
 use axum::body::Body;

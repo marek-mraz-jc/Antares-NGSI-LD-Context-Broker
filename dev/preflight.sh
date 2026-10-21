@@ -96,6 +96,17 @@ mod preflight_probe {
     }
 }
 RS"
+  # a test only a build without a feature holds runs alone there, not "no test named"
+  probe feature-off-alone "" --no-coverage "sed -i '/^\\[dependencies\\]/i [features]\\nprobe = []\\n' crates/odata-axum/Cargo.toml && cat >> $lib <<'RS'
+
+#[cfg(all(test, not(feature = \"probe\")))]
+mod preflight_probe_off {
+    #[test]
+    fn probe_without_the_feature() {
+        assert_eq!(1 + 1, 2);
+    }
+}
+RS"
   # before the test module: clippy refuses items after it
   probe uncovered-line "coverage odata-axum" "" \
     "perl -0pi -e 's/^#\\[cfg\\(test\\)\\]/\\/\\/\\/ A function no test calls.\\n#[must_use]\\npub fn preflight_probe(n: u8) -> u8 {\\n    n.wrapping_add(1)\\n}\\n\\n#[cfg(test)]/m' $lib"
@@ -210,15 +221,24 @@ crate_of() { # <path>: the package whose manifest dir holds it
   [[ -f $d/Cargo.toml && $d != . ]] && sed -n 's/^name = "\(.*\)"/\1/p' "$d/Cargo.toml" | head -1
 }
 
+# A test behind cfg(not(feature = ...)) is compiled out of --all-features
+# (T-4854, trains 0421 and 0538): the default and the no-default build are
+# asked next, and the test runs in the first build that holds it.
 alone() { # <crate> <fn>: the test by its full path, in a process of its own
-  local list=$work/list-$1.txt full
-  [[ -s $list ]] || cargo test -q --locked -p "$1" --all-features --tests -- --list > "$list" 2> /dev/null
-  full=$(sed -n "s/^\(\(.*::\)\{0,1\}$2\): test$/\1/p" "$list")
-  [[ -n $full ]] || { echo "$1: no test named $2 in --list"; return 1; }
+  local feat list full="" i=0
+  for feat in --all-features "" --no-default-features; do
+    i=$((i + 1)) list=$work/list-$1-$i.txt
+    # shellcheck disable=SC2086 # $feat is one flag or none
+    [[ -s $list ]] || cargo test -q --locked -p "$1" $feat --tests -- --list > "$list" 2> /dev/null
+    full=$(sed -n "s/^\(\(.*::\)\{0,1\}$2\): test$/\1/p" "$list")
+    [[ -n $full ]] && break
+  done
+  [[ -n $full ]] || { echo "$1: no test named $2 in --list (all, default or no default features)"; return 1; }
   local f
   for f in $full; do
-    echo "== $f"
-    cargo test -q --locked -p "$1" --all-features --tests -- --exact "$f" || return 1
+    echo "== $f ${feat:-(default features)}"
+    # shellcheck disable=SC2086
+    cargo test -q --locked -p "$1" $feat --tests -- --exact "$f" || return 1
   done
 }
 

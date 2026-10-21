@@ -8,22 +8,30 @@
 //! `l5d-client-id`, the header the Linkerd proxy in front of the broker sets
 //! from the caller's mTLS certificate. Unset, or from anyone else, a write is
 //! `channel: api` with no actor, whatever its headers say.
+//!
+//! All of that is the platform's (feature `jc`, T-4854): vanilla Antares
+//! reads none of these headers and records every write as `channel: api`.
 
 use axum::http::HeaderMap;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
+#[cfg(feature = "jc")]
 /// The channels a write may name (ADR-N-054 2.3); anything else is `api`.
 const CHANNELS: &[&str] = &["pipeline", "api", "ui", "import", "backfill", "mqtt"];
+#[cfg(feature = "jc")]
 const MAX_ACTOR: usize = 200;
+#[cfg(feature = "jc")]
 const MAX_REASON: usize = 500;
+#[cfg(feature = "jc")]
 const MAX_REQUEST_ID: usize = 128;
 
 /// The provenance of a request with `headers`, the gateway's mesh identity
 /// being `gateway` (None: no caller is believed).
+#[cfg(feature = "jc")]
 pub fn of_request(headers: &HeaderMap, gateway: Option<&str>) -> Value {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let believed = from_gateway(headers, gateway);
-    let mut out = Map::new();
+    let mut out = serde_json::Map::new();
     let channel = header("jc-provenance-channel")
         .filter(|c| believed && CHANNELS.contains(c))
         .unwrap_or("api");
@@ -51,9 +59,16 @@ pub fn of_request(headers: &HeaderMap, gateway: Option<&str>) -> Value {
     Value::Object(out)
 }
 
+/// Vanilla: no header is read, every write is `channel: api`.
+#[cfg(not(feature = "jc"))]
+pub fn of_request(_headers: &HeaderMap, _gateway: Option<&str>) -> Value {
+    json!({"channel": "api"})
+}
+
 /// Whether the request may read `versions=all` (ADR-N-054 2.4): the
 /// gateway grants it with `JC-Read-Versions: true` once the space's Policy
 /// granted the caller `readVersions`; nobody else can.
+#[cfg(feature = "jc")]
 pub fn may_read_versions(headers: &HeaderMap, gateway: Option<&str>) -> bool {
     from_gateway(headers, gateway)
         && headers
@@ -62,6 +77,7 @@ pub fn may_read_versions(headers: &HeaderMap, gateway: Option<&str>) -> bool {
 }
 
 /// Does the request carry the gateway's mesh identity `gateway`?
+#[cfg(feature = "jc")]
 fn from_gateway(headers: &HeaderMap, gateway: Option<&str>) -> bool {
     gateway.is_some_and(|g| {
         headers
@@ -80,11 +96,13 @@ pub fn with_operation(provenance: &Value, operation: &str) -> Value {
 }
 
 /// Non-empty, at most `max` characters, no control character.
+#[cfg(feature = "jc")]
 fn plain(text: &str, max: usize) -> bool {
     !text.trim().is_empty() && text.chars().count() <= max && !text.chars().any(char::is_control)
 }
 
 /// `%XX`-decoded UTF-8; `None` for a broken escape or bytes that are not UTF-8.
+#[cfg(feature = "jc")]
 fn percent_decoded(raw: &str) -> Option<String> {
     let mut out = Vec::with_capacity(raw.len());
     let mut bytes = raw.bytes();
@@ -116,6 +134,28 @@ mod tests {
         h
     }
 
+    #[cfg(not(feature = "jc"))]
+    #[test]
+    fn vanilla_reads_no_platform_header() {
+        let h = headers(&[
+            ("l5d-client-id", GATEWAY),
+            ("jc-provenance-channel", "pipeline"),
+            ("jc-provenance-actor", "pipeline-parking"),
+            ("jc-reason", "stuck"),
+            ("x-request-id", "4f1c-9a07"),
+        ]);
+        assert_eq!(of_request(&h, Some(GATEWAY)), json!({"channel": "api"}));
+    }
+
+    #[test]
+    fn the_operation_is_added() {
+        assert_eq!(
+            with_operation(&json!({"channel": "ui"}), "delete"),
+            json!({"channel": "ui", "operation": "delete"})
+        );
+    }
+
+    #[cfg(feature = "jc")]
     #[test]
     fn the_gateways_headers_are_believed_from_the_gateway_alone() {
         let named = [
@@ -146,6 +186,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "jc")]
     #[test]
     fn versions_are_read_only_where_the_gateway_grants_them() {
         let grant = [("l5d-client-id", GATEWAY), ("jc-read-versions", "true")];
@@ -161,6 +202,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "jc")]
     #[test]
     fn a_value_out_of_shape_is_left_out() {
         let long = "x".repeat(MAX_REASON + 1);
@@ -177,9 +219,5 @@ mod tests {
         assert_eq!(percent_decoded("50%"), None, "an escape cut short");
         assert_eq!(percent_decoded("%C3"), None, "half a character");
         assert_eq!(percent_decoded("N%C3%A1m"), Some("Nám".into()));
-        assert_eq!(
-            with_operation(&json!({"channel": "ui"}), "delete"),
-            json!({"channel": "ui", "operation": "delete"})
-        );
     }
 }

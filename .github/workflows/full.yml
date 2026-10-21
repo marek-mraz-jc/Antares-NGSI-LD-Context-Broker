@@ -459,6 +459,21 @@ jobs:
           PREV=$(git describe --tags --abbrev=0 "$VER^" 2>/dev/null || true)
           git log --no-merges --format='- %s' ${PREV:+$PREV..}"$VER" > notes.md
           [ -s notes.md ] || echo "Antares $VER." > notes.md
+      - name: Compliance statement (T-4854)
+        # The vanilla image this release ships, against the vendored ETSI
+        # suite: its version and tree, the TPs that must pass (the full
+        # matrix above gates the release on them), and every local suite edit.
+        run: |
+          {
+            echo
+            echo "## Compliance"
+            echo
+            jq -r '"`antares-broker` (vanilla, no platform surface or extension) passes all \(.count) test purposes of the ETSI NGSI-LD test suite for \(.suite.spec) (\(.suite.upstream), tree \(.suite.tree)) in every cell of the full matrix; excluded tags: \(.excluded_tags | join(", "))."' dev/etsi-baseline.json
+            echo
+            echo "Local edits to the vendored suite (\`ngsi-ld-test-suite/\`), each justified in its commit:"
+            echo
+            git log --no-merges --format='- %h %s' -- ngsi-ld-test-suite
+          } >> notes.md
       - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
