@@ -481,7 +481,16 @@ with them.
   duration, required) the longest gap between two rows. `deadband` (a
   number) holds back a numeric move no larger than it; `minDistance` (in
   metres) a GeoProperty move no longer than it. A correction of the same
-  instant is always recorded.
+  instant is always recorded. `observed` (T-5056) writes one only when the
+  instance carries an `observedAt` newer than the one it replaces, so a
+  value re-sent or changed under its old `observedAt`, or sent with none,
+  adds no row; `never` writes none, for a bookkeeping Attribute such as
+  `dateModified`. Neither takes settings.
+- Under `ANTARES_TEMPORAL_RECORD=ruled` (T-5056) history is opt-in: only an
+  Entity whose own `historyRetention`, whose type's rule or whose Tenant's
+  `*` rule gives a duration or `forever` records rows, `observed` unless its
+  rule names another `record`; every other type keeps its current state only, and its temporal Entity answers with no
+  Attribute instead of a 404.
 - `attributes`: per expanded Attribute name, its own `record`, `heartbeat`,
   `deadband` and `minDistance`, overriding the type's; `{"record": "every"}`
   keeps a count per interval whole under an `onChange` type. `record` and

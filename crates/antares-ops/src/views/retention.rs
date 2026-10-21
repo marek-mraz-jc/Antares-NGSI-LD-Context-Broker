@@ -73,8 +73,9 @@ struct RuleDoc {
     current: Option<String>,
     #[serde(default)]
     history: Option<String>,
-    /// How the type records history (T-4665, ADR-N-054 2.2): `every` or
-    /// `onChange`, with the three settings after it.
+    /// How the type records history (T-4665, ADR-N-054 2.2): `every`,
+    /// `observed`, `never` (T-5056) or `onChange`, with the three settings
+    /// after it.
     #[serde(default)]
     record: Option<String>,
     #[serde(default)]
@@ -115,35 +116,44 @@ struct RecordDoc {
 }
 
 impl RecordDoc {
-    /// `Ok(None)` for `every`, `Ok(Some)` for `onChange`; the reason a
-    /// setting is out of place otherwise.
-    fn parse(&self) -> Result<Option<antares_api::OnChange>, String> {
+    /// `Ok(None)` when unset, the mode it names otherwise; the reason a
+    /// setting is out of place.
+    fn parse(&self) -> Result<Option<antares_api::RecordMode>, String> {
         let bound = |name: &str, v: Option<f64>| match v {
             // JSON carries no NaN or infinity, so the sign is the whole check
             Some(v) if v < 0.0 => Err(format!("{name} must be a number of at least 0")),
             _ => Ok(v),
         };
         match self.record.as_deref() {
-            Some("onChange") => Ok(Some(antares_api::OnChange {
-                heartbeat: parse_duration(
-                    self.heartbeat
-                        .as_deref()
-                        .ok_or("record onChange needs a heartbeat")?,
-                )?,
-                deadband: bound("deadband", self.deadband)?,
-                min_distance: bound("minDistance", self.min_distance)?,
-            })),
-            None | Some("every") => {
+            Some("onChange") => Ok(Some(antares_api::RecordMode::OnChange(
+                antares_api::OnChange {
+                    heartbeat: parse_duration(
+                        self.heartbeat
+                            .as_deref()
+                            .ok_or("record onChange needs a heartbeat")?,
+                    )?,
+                    deadband: bound("deadband", self.deadband)?,
+                    min_distance: bound("minDistance", self.min_distance)?,
+                },
+            ))),
+            None | Some("every" | "observed" | "never") => {
                 if self.heartbeat.is_some()
                     || self.deadband.is_some()
                     || self.min_distance.is_some()
                 {
                     Err("heartbeat, deadband and minDistance belong to record onChange".into())
                 } else {
-                    Ok(None)
+                    Ok(match self.record.as_deref() {
+                        Some("every") => Some(antares_api::RecordMode::Every),
+                        Some("observed") => Some(antares_api::RecordMode::Observed),
+                        Some("never") => Some(antares_api::RecordMode::Never),
+                        _ => None,
+                    })
                 }
             }
-            Some(other) => Err(format!("record {other:?} is neither every nor onChange")),
+            Some(other) => Err(format!(
+                "record {other:?} is none of every, observed, never and onChange"
+            )),
         }
     }
 }
@@ -169,7 +179,8 @@ pub struct Rule {
     /// `history: "forever"` (DM-97): the type keeps all of it, and no level
     /// below (the Tenant's default, the platform's) reaches it.
     pub history_forever: bool,
-    /// How it records history, when some attribute records `onChange`.
+    /// How it records history, when some attribute records other than
+    /// `every`.
     pub recording: Option<antares_api::Recording>,
 }
 
@@ -235,10 +246,12 @@ pub fn parse(body: &[u8]) -> Result<Vec<Rule>, String> {
                 if !attr.contains(':') || attr.contains(char::is_whitespace) {
                     return Err(format!("attribute {attr:?} is not an expanded IRI"));
                 }
-                recording.attributes.insert(attr.clone(), doc.parse()?);
+                // a setting without `record` takes the type's
+                if let Some(mode) = doc.parse()? {
+                    recording.attributes.insert(attr.clone(), Some(mode));
+                }
             }
-            let records_on_change =
-                recording.default.is_some() || recording.attributes.values().any(Option::is_some);
+            let names_a_mode = recording.default.is_some() || !recording.attributes.is_empty();
             let word = r
                 .history
                 .as_deref()
@@ -253,7 +266,7 @@ pub fn parse(body: &[u8]) -> Result<Vec<Rule>, String> {
                     .transpose()?,
                 history_off: word == Some("off"),
                 history_forever: word == Some("forever"),
-                recording: records_on_change.then_some(recording),
+                recording: names_a_mode.then_some(recording),
                 type_iri: r.type_iri,
             })
         })
@@ -276,6 +289,8 @@ pub(super) fn history_off(rules: &Rules) -> antares_api::HistoryRules {
             if r.type_iri == ANY_TYPE {
                 if r.history_off {
                     out.space_off.insert(tenant);
+                } else if r.rules_history() {
+                    out.space_on.insert(tenant);
                 }
                 continue;
             }
@@ -859,6 +874,7 @@ mod tests {
                 off: std::collections::HashSet::from([pair.clone()]),
                 ruled: std::collections::HashSet::from([pair]),
                 space_off: std::collections::HashSet::new(),
+                space_on: std::collections::HashSet::new(),
                 recording: std::collections::HashMap::new(),
             }
         );
@@ -904,6 +920,21 @@ mod tests {
             std::collections::HashSet::from(["city".to_owned()])
         );
         assert!(gate.off.is_empty());
+        assert!(gate.space_on.is_empty());
+        // T-5056: a `*` duration opts every type of its Tenant in
+        let on = parse(br#"{"rules":[{"type":"*","history":"P30D"}]}"#).unwrap_or_default();
+        let opted = history_off(&vec![(TenantId::new("town").expect("tenant"), on)]);
+        assert_eq!(
+            opted.space_on,
+            std::collections::HashSet::from(["town".to_owned()])
+        );
+        assert!(opted.space_off.is_empty());
+        // a `*` rule that names no history opts nothing in, nor out
+        let silent = parse(br#"{"rules":[{"type":"*"}]}"#).unwrap_or_default();
+        assert_eq!(silent.len(), 1);
+        let neither = history_off(&vec![(TenantId::new("town").expect("tenant"), silent)]);
+        assert!(neither.space_on.is_empty());
+        assert!(neither.space_off.is_empty());
         assert_eq!(
             gate.ruled,
             std::collections::HashSet::from([pair("Keep"), pair("Week")])
@@ -1070,19 +1101,56 @@ mod tests {
         )
         .expect("rules");
         let spot = rules[0].recording.as_ref().expect("onChange");
-        let hour = std::time::Duration::from_secs(3600);
+        let on_change = |heartbeat, deadband, min_distance| {
+            Some(antares_api::RecordMode::OnChange(antares_api::OnChange {
+                heartbeat: std::time::Duration::from_secs(heartbeat),
+                deadband,
+                min_distance,
+            }))
+        };
         assert_eq!(
-            spot.of("https://e.org/status")
-                .map(|m| (m.heartbeat, m.deadband)),
-            Some((hour, Some(1.0)))
+            spot.of("https://e.org/status"),
+            on_change(3600, Some(1.0), None)
         );
-        assert_eq!(spot.of("https://e.org/count"), None, "every");
         assert_eq!(
-            spot.of("https://e.org/location")
-                .and_then(|m| m.min_distance),
-            Some(5.0)
+            spot.of("https://e.org/count"),
+            Some(antares_api::RecordMode::Every)
+        );
+        assert_eq!(
+            spot.of("https://e.org/location"),
+            on_change(900, None, Some(5.0))
         );
         assert!(rules[1].recording.is_none(), "every, the default");
+        // T-5056: observed takes no settings, for the type or an attribute
+        let observed = parse(
+            br#"{"rules":[{"type":"https://e.org/Dock","history":"P7D","record":"observed",
+                 "attributes":{"https://e.org/name":{"record":"every"}}}]}"#,
+        )
+        .expect("observed");
+        let dock = observed[0].recording.as_ref().expect("observed");
+        assert_eq!(
+            dock.of("https://e.org/free"),
+            Some(antares_api::RecordMode::Observed)
+        );
+        assert_eq!(
+            dock.of("https://e.org/name"),
+            Some(antares_api::RecordMode::Every)
+        );
+        let never = parse(
+            br#"{"rules":[{"type":"https://e.org/Dock","history":"P7D",
+                 "attributes":{"https://e.org/dateModified":{"record":"never"},"https://e.org/x":{}}}]}"#,
+        )
+        .expect("never");
+        let dock = never[0].recording.as_ref().expect("never");
+        assert_eq!(
+            dock.of("https://e.org/dateModified"),
+            Some(antares_api::RecordMode::Never)
+        );
+        assert_eq!(dock.of("https://e.org/x"), None, "unset takes the type's");
+        assert!(parse(
+            br#"{"rules":[{"type":"https://e.org/V","record":"observed","heartbeat":"PT1H"}]}"#
+        )
+        .is_err_and(|e| e.contains("belong")));
         let by_attribute = parse(
             br#"{"rules":[{"type":"https://e.org/V","attributes":{"https://e.org/a":{"record":"onChange","heartbeat":"PT1H"}}}]}"#,
         )
@@ -1092,7 +1160,7 @@ mod tests {
         assert_eq!(gate.recording.len(), 1);
         for (bad, says) in [
             (&br#"{"rules":[{"type":"https://e.org/V","record":"onChange"}]}"#[..], "heartbeat"),
-            (br#"{"rules":[{"type":"https://e.org/V","record":"sometimes"}]}"#, "neither"),
+            (br#"{"rules":[{"type":"https://e.org/V","record":"sometimes"}]}"#, "none of"),
             (br#"{"rules":[{"type":"https://e.org/V","deadband":1}]}"#, "belong"),
             (br#"{"rules":[{"type":"https://e.org/V","record":"onChange","heartbeat":"PT1H","deadband":-1}]}"#, "at least 0"),
             (br#"{"rules":[{"type":"https://e.org/V","attributes":{"speed":{"record":"every"}}}]}"#, "expanded IRI"),

@@ -126,7 +126,7 @@ pub use federation::{
 };
 pub use ops::*;
 pub use router::*;
-pub use state::{AppState, HistoryRules, OnChange, Recording, TemporalRecord};
+pub use state::{AppState, HistoryRules, OnChange, RecordMode, Recording, TemporalRecord};
 
 /// Spawn for both targets — tokio natively, the JS microtask queue on
 /// wasm32 (no tokio runtime exists in a browser). Call sites are identical;

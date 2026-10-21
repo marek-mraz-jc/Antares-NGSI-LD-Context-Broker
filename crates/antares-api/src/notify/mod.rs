@@ -391,8 +391,9 @@ pub async fn record_temporal_change(
         } else {
             "update"
         };
-        for mut inst in changed_instances(before.and_then(|b| b.get(&k)), av) {
-            if !crate::history::admits_change(st, tenant, &types, id, &k, &inst) {
+        let was = before.and_then(|b| b.get(&k));
+        for mut inst in changed_instances(was, av) {
+            if !crate::history::admits_change(st, tenant, &types, id, &k, was, &inst) {
                 continue;
             }
             if let Some(o) = inst.as_object_mut() {

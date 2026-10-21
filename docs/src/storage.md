@@ -81,7 +81,8 @@ it (`crates/antares-api/src/history.rs`):
    `observed` keeps only instances carrying `observedAt`, so a write without
    one updates current state and leaves no history; `none` records nothing
    from the entity endpoints while the temporal API itself still stores what
-   it is given.
+   it is given; `ruled` (T-5056) admits what `all` does, but only for an
+   Entity a retention rule opts in with a history duration.
 3. **New observation**, in the Postgres and TimescaleDB stores
    (`ANTARES_TEMPORAL_DEDUP`, default on): an instance with an `observedAt`
    is one row per (Attribute, datasetId, observedAt), and a new value at the
