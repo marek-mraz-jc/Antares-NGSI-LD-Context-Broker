@@ -76,7 +76,29 @@ pub async fn upsert_temporal(
         ))?;
         let expanded = expand_entity(obj, &parsed.ctx, TEMPORAL_OPTS)?;
         let id = antares_jsonld::expanded_id(&expanded)?.to_owned();
-        gate!(st, &tenant, &headers, "5.6.11", ids: &[&id]).await?;
+        // the engine is asked with what 5.6.1 gives it (T-4855): types, Attributes, body
+        let types: Vec<String> = expanded
+            .get("type")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let attrs: Vec<String> = expanded
+            .as_object()
+            .map(|o| o.keys().filter(|k| !is_meta(k)).cloned().collect())
+            .unwrap_or_default();
+        gate!(
+            st, &tenant, &headers, "5.6.11",
+            ids: &[&id],
+            types: &types,
+            attrs: &attrs,
+            body: Some(&expanded),
+        )
+        .await?;
         // 5.6.11.4: exclusive/redirect registrations matching the input are
         // forwarded when "Create or Update Temporal" is supported; proxy
         // modes without it are an error of type Conflict; inclusive ones
