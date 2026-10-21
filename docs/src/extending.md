@@ -134,7 +134,8 @@ refused outright.
 
 Adding one is a struct implementing the trait plus an entry in
 `SURFACE_SHELF` (`crates/antares-broker/src/main.rs`); no core crate
-changes.
+changes. `dev/new-surface.py` generates a read-only one as a crate with its
+tests, docs and wiring ([New surface](new-surface.md)).
 
 ### Policy engines
 
