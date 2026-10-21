@@ -58,6 +58,18 @@ async fn plan_as(pool: &sqlx::PgPool, tenant: &str, service: bool, sql: &str) ->
             .fetch_all(&mut *tx)
             .await
             .expect("explain");
+    let plan = rows.join("\n");
+    if !plan.contains("DeferredChunkAppend") {
+        return plan;
+    }
+    // timescale picks its chunks at run time and EXPLAIN alone prints none of
+    // them: the chunk scans show only in the executed plan (T-5057).
+    let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, FORMAT TEXT) {sql}"
+    )))
+    .fetch_all(&mut *tx)
+    .await
+    .expect("explain analyze");
     rows.join("\n")
 }
 
