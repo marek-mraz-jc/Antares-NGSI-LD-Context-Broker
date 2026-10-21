@@ -1851,7 +1851,11 @@ impl antares_store::TemporalDriver for AnyStore {
         floors: &[(String, String)],
     ) -> Result<Vec<String>, NgsiError> {
         match self {
-            AnyStore::Mem(_) => Ok(Vec::new()),
+            // memory keeps no partitions
+            AnyStore::Mem(_) => {
+                let _ = floors;
+                Ok(Vec::new())
+            }
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 crate::store::pg::maintenance::drop_retained_partitions(p.docs.pool(), floors)
