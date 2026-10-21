@@ -150,7 +150,8 @@ impl ViewOps {
             }
             entities.append(&mut batch);
             if ended || limit == want {
-                let next = (!ended && limit > 0).then(|| page.start.saturating_add(entities.len()));
+                let next = (!page.whole && !ended && limit > 0)
+                    .then(|| page.start.saturating_add(entities.len()));
                 return Ok(Scanned::Page {
                     entities,
                     next,
