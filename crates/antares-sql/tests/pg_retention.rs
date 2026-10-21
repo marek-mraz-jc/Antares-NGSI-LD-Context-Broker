@@ -218,14 +218,23 @@ async fn history_of_one_type_goes_before_the_cut_in_bounded_batches() {
 async fn retention_deletes_as_the_brokers_rls_bound_role() {
     let url = require_db!();
     let admin = pg::connect(&url, 5).await.expect("connect");
+    // The same advisory lock as tests/pg.rs app_role: nextest runs each test in its own process
+    // against one server, and an unlocked GRANT here broke that test's concurrent setup with
+    // "tuple concurrently updated" (train 0538-2 fast 39554291660).
+    let mut tx = admin.begin().await.expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock(4334)")
+        .execute(&mut *tx)
+        .await
+        .expect("advisory lock");
     for stmt in [
         "DO $$ BEGIN CREATE ROLE antares_app LOGIN PASSWORD 'app';
          EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$",
         "GRANT USAGE ON SCHEMA public TO antares_app",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO antares_app",
     ] {
-        sqlx::query(stmt).execute(&admin).await.expect(stmt);
+        sqlx::query(stmt).execute(&mut *tx).await.expect(stmt);
     }
+    tx.commit().await.expect("commit");
     let app_url = url.replace("antares:antares@", "antares_app:app@");
     assert_ne!(
         app_url, url,
