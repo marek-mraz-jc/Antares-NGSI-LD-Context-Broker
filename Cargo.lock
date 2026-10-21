@@ -105,6 +105,7 @@ version = "0.3.0"
 dependencies = [
  "antares-api",
  "antares-bus",
+ "antares-geojson",
  "antares-ical",
  "antares-icsr",
  "antares-linkml",
@@ -167,6 +168,18 @@ dependencies = [
  "parquet",
  "serde_json",
  "zip",
+]
+
+[[package]]
+name = "antares-geojson"
+version = "0.3.0"
+dependencies = [
+ "antares-ops",
+ "axum",
+ "http-body-util",
+ "serde_json",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
