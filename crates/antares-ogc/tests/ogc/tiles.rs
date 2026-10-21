@@ -328,6 +328,17 @@ async fn the_tileset_names_its_matrix_set_and_its_tile_template() -> Result<(), 
         .to_string();
     assert!(classes.contains("ogcapi-tiles-1/1.0/conf/mvt"));
     let api = get(&f.app, &format!("{CITY}/api")).await.body;
+    // Tiles Part 1 /req/oas30/operation-id, Table 11: the ETS looks for these names.
+    let ids = api.to_string();
+    for id in [
+        "Car.collection.vector.getTileSetsList",
+        "Car.collection.vector.getTileSet",
+        "Car.collection.vector.getTile",
+        "getTileMatrixSetsList",
+        "getTileMatrixSet",
+    ] {
+        assert!(ids.contains(&format!("\"{id}\"")), "{id}");
+    }
     assert!(api
         .pointer("/paths/~1collections~1Car~1tiles~1WebMercatorQuad~1{tileMatrix}~1{tileRow}~1{tileCol}/get/responses/204")
         .is_some());

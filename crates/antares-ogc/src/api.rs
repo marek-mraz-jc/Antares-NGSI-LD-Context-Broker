@@ -206,13 +206,13 @@ fn collection_paths(
     }
 }
 
-/// A collection's tilesets, its tileset and its tiles (Tiles Part 1 `/req/oas30`).
+/// A collection's tilesets, its tileset and its tiles (Tiles Part 1 `/req/oas30`), each `operationId` ending in its Table 11 name.
 fn tile_paths(paths: &mut Map<String, Value>, at: &str, id: &str) {
     let tms = crate::tiles::TMS;
     paths.insert(
         format!("{at}/tiles"),
         get(
-            &format!("tilesets-{id}"),
+            &format!("{id}.collection.vector.getTileSetsList"),
             "the vector tilesets",
             "application/json",
             &[],
@@ -221,7 +221,7 @@ fn tile_paths(paths: &mut Map<String, Value>, at: &str, id: &str) {
     paths.insert(
         format!("{at}/tiles/{tms}"),
         get(
-            &format!("tileset-{id}"),
+            &format!("{id}.collection.vector.getTileSet"),
             "the tileset",
             "application/json",
             &[],
@@ -241,7 +241,7 @@ fn tile_paths(paths: &mut Map<String, Value>, at: &str, id: &str) {
         json!({"description": "one Mapbox Vector Tile", "content": {crate::tiles::MVT: {"schema": {"type": "string", "format": "binary"}}}}),
     );
     let tile = json!({"get": {
-        "operationId": format!("tile-{id}"),
+        "operationId": format!("{id}.collection.vector.getTile"),
         "summary": "one Mapbox Vector Tile",
         "parameters": [index("tileMatrix"), index("tileRow"), index("tileCol")],
         "responses": responses,
@@ -325,7 +325,7 @@ pub(crate) fn document(
     paths.insert(
         "/tileMatrixSets".into(),
         get(
-            "tile-matrix-sets",
+            "getTileMatrixSetsList",
             "the tile matrix sets",
             "application/json",
             &[],
@@ -334,7 +334,7 @@ pub(crate) fn document(
     paths.insert(
         format!("/tileMatrixSets/{}", crate::tiles::TMS),
         get(
-            "tile-matrix-set",
+            "getTileMatrixSet",
             "the WebMercatorQuad definition",
             "application/json",
             &[],
