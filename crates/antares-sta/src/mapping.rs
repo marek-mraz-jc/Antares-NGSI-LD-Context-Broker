@@ -90,6 +90,27 @@ pub fn urn_of(id: &str) -> Option<&str> {
     urn.starts_with("urn:").then_some(urn)
 }
 
+/// The Datastream id in front of an Observation id (`{urn}/{attribute}/{time}`): a URN and an
+/// Attribute's local name hold no slash.
+#[must_use]
+pub fn stream_of(observation: &str) -> Option<&str> {
+    let (urn, rest) = observation.split_once('/')?;
+    let name = rest.split_once('/').map_or(rest, |(name, _)| name);
+    observation.get(..urn.len().checked_add(1)?.checked_add(name.len())?)
+}
+
+/// Whether an id is an absolute URI (RFC 3986 section 3.1: a scheme, then `:`), as every
+/// NGSI-LD Entity id is.
+#[must_use]
+pub fn is_uri(id: &str) -> bool {
+    id.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
+}
+
 /// A Datastream id as its Entity URN, its Attribute's local name and its `datasetId`.
 #[must_use]
 pub fn split_stream(id: &str) -> Option<(&str, &str, Option<&str>)> {
@@ -174,13 +195,16 @@ pub fn location(base: &str, entity: &Value) -> Option<Value> {
     let urn = id(entity)?;
     let geometry = geometry(entity.get("location")?)?;
     let lid = format!("{urn}/location");
+    let link = self_link(base, "Locations", &lid);
     Some(json!({
         "@iot.id": lid,
-        "@iot.selfLink": self_link(base, "Locations", &lid),
+        "@iot.selfLink": link,
         "name": "location",
         "description": "The entity's primary GeoProperty",
         "encodingType": "application/geo+json",
         "location": geometry,
+        "Things@iot.navigationLink": format!("{link}/Things"),
+        "HistoricalLocations@iot.navigationLink": format!("{link}/HistoricalLocations"),
     }))
 }
 
@@ -221,6 +245,17 @@ pub fn datastreams(base: &str, entity: &Value) -> Vec<Value> {
                 "Thing@iot.navigationLink".into(),
                 json!(self_link(base, "Things", urn)),
             );
+            out.insert(
+                "ObservedProperty@iot.navigationLink".into(),
+                json!(format!("{link}/ObservedProperty")),
+            );
+            // A Sensor only for an Entity that names its Device (rule 3).
+            if object(entity, "refDevice").is_some() {
+                out.insert(
+                    "Sensor@iot.navigationLink".into(),
+                    json!(format!("{link}/Sensor")),
+                );
+            }
             Value::Object(out)
         })
         .collect()
@@ -265,12 +300,10 @@ fn observation(base: &str, stream: &str, instance: &Value, fallback: Option<&str
         .and_then(Value::as_str)
         .or(fallback);
     let oid = at.map_or_else(|| stream.to_owned(), |at| format!("{stream}/{at}"));
+    let link = self_link(base, "Observations", &oid);
     let mut out = Map::new();
     out.insert("@iot.id".into(), json!(oid));
-    out.insert(
-        "@iot.selfLink".into(),
-        json!(self_link(base, "Observations", &oid)),
-    );
+    out.insert("@iot.selfLink".into(), json!(link));
     out.insert(
         "result".into(),
         instance.get("value").cloned().unwrap_or_default(),
@@ -278,12 +311,16 @@ fn observation(base: &str, stream: &str, instance: &Value, fallback: Option<&str
     if let Some(at) = at {
         out.insert("phenomenonTime".into(), json!(at));
     }
-    if let Some(at) = instance.get("modifiedAt").and_then(Value::as_str) {
-        out.insert("resultTime".into(), json!(at));
-    }
+    // Mandatory, null allowed (SensorThings 1.1 table 11): the instance's `modifiedAt` if known.
+    let modified = instance.get("modifiedAt").and_then(Value::as_str);
+    out.insert("resultTime".into(), json!(modified));
     out.insert(
         "Datastream@iot.navigationLink".into(),
         json!(self_link(base, "Datastreams", stream)),
+    );
+    out.insert(
+        "FeatureOfInterest@iot.navigationLink".into(),
+        json!(format!("{link}/FeatureOfInterest")),
     );
     Value::Object(out)
 }
@@ -298,9 +335,11 @@ pub fn observed_properties(base: &str, entity: &Value) -> Vec<Value> {
         if out.iter().any(|p| p.get("@iot.id") == Some(&json!(iri))) {
             continue;
         }
+        let link = self_link(base, "ObservedProperties", &iri);
         out.push(json!({
             "@iot.id": iri,
-            "@iot.selfLink": self_link(base, "ObservedProperties", &iri),
+            "@iot.selfLink": link,
+            "Datastreams@iot.navigationLink": format!("{link}/Datastreams"),
             "name": local(name),
             "definition": iri,
             "description": format!("Observed property {}", local(name)),
@@ -327,9 +366,11 @@ pub fn sensor(base: &str, device: &Value) -> Option<Value> {
     let metadata = device
         .get("controlledProperty")
         .map(|m| m.get("value").unwrap_or(m));
+    let link = self_link(base, "Sensors", did);
     Some(json!({
         "@iot.id": did,
-        "@iot.selfLink": self_link(base, "Sensors", did),
+        "@iot.selfLink": link,
+        "Datastreams@iot.navigationLink": format!("{link}/Datastreams"),
         "name": text(device, "name").unwrap_or(did),
         "description": text(device, "description").unwrap_or_default(),
         "encodingType": "application/json",
@@ -343,9 +384,11 @@ pub fn sensor(base: &str, device: &Value) -> Option<Value> {
 #[must_use]
 pub fn feature(base: &str, entity: &Value, fid: &str) -> Option<Value> {
     let geometry = geometry(entity.get("location")?)?;
+    let link = self_link(base, "FeaturesOfInterest", fid);
     Some(json!({
         "@iot.id": fid,
-        "@iot.selfLink": self_link(base, "FeaturesOfInterest", fid),
+        "@iot.selfLink": link,
+        "Observations@iot.navigationLink": format!("{link}/Observations"),
         "name": text(entity, "name").unwrap_or(fid),
         "description": text(entity, "description").unwrap_or_default(),
         "encodingType": "application/geo+json",
@@ -368,9 +411,11 @@ pub fn historical_locations(base: &str, entity: &Value) -> Vec<Value> {
         .filter_map(|i| i.get("observedAt").and_then(Value::as_str))
         .map(|time| {
             let hid = format!("{urn}/historicalLocation/{time}");
+            let link = self_link(base, "HistoricalLocations", &hid);
             json!({
                 "@iot.id": hid,
-                "@iot.selfLink": self_link(base, "HistoricalLocations", &hid),
+                "Locations@iot.navigationLink": format!("{link}/Locations"),
+                "@iot.selfLink": link,
                 "time": time,
                 "Thing@iot.navigationLink": self_link(base, "Things", urn),
             })
@@ -622,5 +667,28 @@ mod tests {
         );
         assert_eq!(object(&car(), "at"), Some("urn:ngsi-ld:Stop:1"));
         assert_eq!(object(&car(), "home"), None);
+    }
+
+    #[test]
+    fn an_observation_id_names_its_datastream_and_an_entity_id_is_a_uri() {
+        assert_eq!(
+            stream_of("urn:ngsi-ld:Car:1/speed/2026-01-01T00:00:00Z"),
+            Some("urn:ngsi-ld:Car:1/speed")
+        );
+        assert_eq!(
+            stream_of("urn:ngsi-ld:Car:1/NO2#urn:ngsi-ld:Dataset:a/2026-01-01T00:00:00Z"),
+            Some("urn:ngsi-ld:Car:1/NO2#urn:ngsi-ld:Dataset:a")
+        );
+        assert_eq!(
+            stream_of("urn:ngsi-ld:Car:1/speed"),
+            Some("urn:ngsi-ld:Car:1/speed")
+        );
+        assert_eq!(stream_of("urn:ngsi-ld:Car:1"), None);
+        assert!(is_uri("urn:ngsi-ld:Device:1"));
+        assert!(is_uri("https://example.org/a"));
+        assert!(!is_uri("9223372036854775807"));
+        assert!(!is_uri(":x"));
+        assert!(!is_uri("1a:x"));
+        assert!(!is_uri("a b:x"));
     }
 }
