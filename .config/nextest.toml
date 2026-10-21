@@ -26,10 +26,11 @@ store-failure-output = true
 # drain legitimately destroys — it publishes the rows the sigkill drill and
 # the RLS pentest have just seeded, out from under them. One serial group
 # restores the sequencing `cargo test`'s one-binary-at-a-time execution used
-# to provide. Defined on the default profile; ci inherits.
+# to provide. `ws` is here because its api pods drain the same outbox (T-4916).
+# Defined on the default profile; ci inherits.
 [test-groups]
 db-exclusive = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary(nats_e2e) or binary(pg_rls_pentest) or binary(pg_outbox) or binary(pg_temporal) or binary(pg_doc) or binary(pg_entity) or binary(pg)'
+filter = 'binary(nats_e2e) or binary(pg_rls_pentest) or binary(pg_outbox) or binary(pg_temporal) or binary(pg_doc) or binary(pg_entity) or binary(pg) or binary(ws)'
 test-group = 'db-exclusive'
