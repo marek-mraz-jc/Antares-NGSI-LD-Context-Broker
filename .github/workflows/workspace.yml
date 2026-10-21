@@ -313,6 +313,12 @@ jobs:
         run: |
           python3 dev/check-module-rules.py --self-test
           python3 dev/check-module-rules.py
+      # A new read-only surface is one command (T-5063, docs/src/new-surface.md):
+      # the template is generated into a scratch worktree and must build, pass
+      # its own tests (the Policy deny test among them), lint clean and keep
+      # rule M2, so the generator cannot rot while no new surface is made.
+      - name: New-surface template smoke
+        run: dev/new-surface.test.sh
       # Every STRIDE row of the surfaces threat model names a test, and the
       # test exists once the crate that owns it does (surfaces-test-plan.md
       # section 8, T-3492): a threat cannot lose its test silently. The

@@ -30,6 +30,7 @@ pub struct Double {
     refuse_create: Option<(Kind, String)>,
     overloaded: bool,
     unpaged_queries: AtomicUsize,
+    geo_paged: AtomicUsize,
     rows_read: AtomicUsize,
 }
 
@@ -49,6 +50,7 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
         }
     }
@@ -69,6 +71,7 @@ impl Double {
             refuse_create: None,
             overloaded: true,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
         }
     }
@@ -89,6 +92,7 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
         }
     }
@@ -111,6 +115,7 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
         }
     }
@@ -145,6 +150,7 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
         }
     }
@@ -165,6 +171,7 @@ impl Double {
             refuse_create: None,
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
         }
     }
@@ -185,6 +192,7 @@ impl Double {
             refuse_create: Some((kind, id.to_owned())),
             overloaded: false,
             unpaged_queries: AtomicUsize::new(0),
+            geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
         }
     }
@@ -199,6 +207,12 @@ impl Double {
     /// was asked to answer whole, however many rows that is.
     pub fn unpaged_queries(&self) -> usize {
         self.unpaged_queries.load(Ordering::SeqCst)
+    }
+
+    /// How many `query_entities` calls carried a geoquery and a page: the
+    /// spatial pushdown reached the store (T-5062).
+    pub fn geo_paged(&self) -> usize {
+        self.geo_paged.load(Ordering::SeqCst)
     }
 
     /// Entity documents `query_entities` has handed out, whatever the double
@@ -380,6 +394,8 @@ impl CurrentStateDriver for Double {
         self.pool_wall()?;
         if f.page.is_none() {
             self.unpaged_queries.fetch_add(1, Ordering::SeqCst);
+        } else if !f.geo.is_empty() {
+            self.geo_paged.fetch_add(1, Ordering::SeqCst);
         }
         let out = self.inner.query_entities(tenant, f).await?;
         self.rows_read.fetch_add(out.rows.len(), Ordering::SeqCst);

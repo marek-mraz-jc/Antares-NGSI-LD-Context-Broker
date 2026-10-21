@@ -468,10 +468,14 @@ impl Server {
         if let Some(note) = aggregated {
             extra.insert("aggregation".into(), json!(note));
         }
-        let rows = match answer.body {
+        let mut rows = match answer.body {
             Value::Array(rows) if tool.paged => rows,
             body => return whole(tool, &body, extra),
         };
+        // the row past the page only says that one more is left
+        let past =
+            tools::probes(&args, limit) && u64::try_from(rows.len()).unwrap_or(u64::MAX) > limit;
+        rows.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
         let (rows, fitted) = fit(rows);
         if rows.is_empty() && fitted {
             return too_large(tool);
@@ -483,7 +487,7 @@ impl Server {
         if let (true, Some(total)) = (counted, answer.count) {
             out.insert("total".into(), json!(total));
         }
-        if fitted || answer.count.is_some_and(|c| c > next) {
+        if fitted || past || answer.count.is_some_and(|c| c > next) {
             out.insert(
                 "nextCursor".into(),
                 json!(cursor::encode(tool.name, digest, next)),
