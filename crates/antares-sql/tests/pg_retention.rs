@@ -67,6 +67,25 @@ async fn entity(
     .expect("entity row");
 }
 
+/// Waits out tests/pg_explain.rs's seed and keeps it from starting until the
+/// returned transaction ends. The seed writes 100k rows to `attr_instances`
+/// in one transaction that runs for seconds under load; a partition DDL or
+/// the drop's `LOCK TABLE` behind it runs into the session's 5 s (or the
+/// drop's 2 s) `lock_timeout` on a fresh database (T-5021).
+async fn hold_off_the_explain_seed(
+    pool: &sqlx::PgPool,
+) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.expect("seed guard");
+    for stmt in [
+        "SET LOCAL lock_timeout = 0",
+        "SET LOCAL statement_timeout = 0",
+        "SELECT pg_advisory_xact_lock(48520)",
+    ] {
+        sqlx::query(stmt).execute(&mut *tx).await.expect(stmt);
+    }
+    tx
+}
+
 async fn count(pool: &sqlx::PgPool, sql: &'static str, tenant: &str) -> i64 {
     sqlx::query_scalar(sql)
         .bind(tenant)
@@ -480,6 +499,7 @@ async fn a_past_partition_the_sweeps_emptied_is_dropped_and_a_held_one_stays() {
             .expect("catalog")
         }
     };
+    let seed_guard = hold_off_the_explain_seed(&pool).await;
     let store = PgTemporalStore::new(pool.clone());
     // A row an earlier run left in DEFAULT would block the week's partition.
     let _ = store.delete(&tenant, "urn:v:held").await;
@@ -510,13 +530,14 @@ async fn a_past_partition_the_sweeps_emptied_is_dropped_and_a_held_one_stays() {
         .await
         .expect("create"));
     claim.commit().await.expect("release");
-    // Another test's maintenance may hold the claim; the winner drops.
+    // A pass that loses the claim or the drop's lock leaves the week to the
+    // next tick, as the broker's maintenance loop does: tick again.
     let mut done = String::new();
     for _ in 0..50 {
         done = temporal_maintenance(&pool, TemporalBackend::Partitioned, None)
             .await
             .expect("maintenance");
-        if !done.starts_with("skipped") {
+        if !exists("attr_instances_2001w02").await {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -543,6 +564,7 @@ async fn a_past_partition_the_sweeps_emptied_is_dropped_and_a_held_one_stays() {
     .expect("catalog");
     assert!(window, "the current week stays though it may be empty");
     let _ = store.delete(&tenant, "urn:v:held").await;
+    seed_guard.commit().await.expect("seed guard");
 }
 
 /// T-4906: retention by partition. A past week whose rows all belong to
@@ -562,6 +584,7 @@ async fn a_week_every_tenant_in_it_outlived_is_dropped_and_a_longer_rule_keeps_i
         ("attr_instances_2002w11", "2002-03-11", "2002-03-18"),
         ("attr_instances_2002w12", "2002-03-18", "2002-03-25"),
     ];
+    let seed_guard = hold_off_the_explain_seed(&pool).await;
     // Hold the maintenance claim while the weeks are made and filled, so a
     // parallel test's drop of emptied weeks cannot take one while it is empty.
     let mut claim = pool.begin().await.expect("claim");
@@ -629,11 +652,13 @@ async fn a_week_every_tenant_in_it_outlived_is_dropped_and_a_longer_rule_keeps_i
     // Another test's maintenance may hold the claim; the drop waits a tick.
     let mut done = Vec::new();
     for _ in 0..50 {
-        done.extend(
-            pg::maintenance::drop_retained_partitions(&pool, &floors)
-                .await
-                .expect("drop"),
-        );
+        // A drop that loses its lock, or meets a parallel test's GRANT on
+        // every table ("tuple concurrently updated", XX000), waits for the
+        // next tick in the broker: tick again.
+        match pg::maintenance::drop_retained_partitions(&pool, &floors).await {
+            Ok(lines) => done.extend(lines),
+            Err(e) => done.push(format!("kept ({e})")),
+        }
         if !exists("attr_instances_2002w10").await {
             break;
         }
@@ -672,9 +697,9 @@ async fn a_week_every_tenant_in_it_outlived_is_dropped_and_a_longer_rule_keeps_i
         ("part-b".to_owned(), "2002-03-18T00:00:00.000Z".to_owned()),
     ];
     for _ in 0..50 {
-        pg::maintenance::drop_retained_partitions(&pool, &floors)
-            .await
-            .expect("drop");
+        if let Err(e) = pg::maintenance::drop_retained_partitions(&pool, &floors).await {
+            eprintln!("kept until the next tick: {e}");
+        }
         if !exists("attr_instances_2002w11").await {
             break;
         }
@@ -688,10 +713,17 @@ async fn a_week_every_tenant_in_it_outlived_is_dropped_and_a_longer_rule_keeps_i
         exists("attr_instances_2002w12").await,
         "C still has no floor"
     );
-    sqlx::query("DROP TABLE IF EXISTS attr_instances_2002w12")
-        .execute(&pool)
-        .await
-        .expect("cleanup");
+    // Under the GRANT lock of tests/pg.rs app_role: a DROP beside a GRANT on
+    // every table fails with "tuple concurrently updated" (T-5021).
+    let mut tx = pool.begin().await.expect("cleanup");
+    for stmt in [
+        "SELECT pg_advisory_xact_lock(4334)",
+        "DROP TABLE IF EXISTS attr_instances_2002w12",
+    ] {
+        sqlx::query(stmt).execute(&mut *tx).await.expect(stmt);
+    }
+    tx.commit().await.expect("cleanup");
+    seed_guard.commit().await.expect("seed guard");
 }
 
 /// DM-97, owner 2026-10-18: an Entity its `expiresAt` ends takes its history
