@@ -19,6 +19,7 @@ surface hides, and which CI job proves each surface's conformance.
 | OGC API - Features | `ogc` (adds `views`) | `ogc` | `/x/views/{view}/ogc/features` | [OGC API - Features endpoint of a view](ogc.md) |
 | SensorThings API | `sta` (adds `views`) | `sta` | `/x/views/{view}/sta/v1.1` | [SensorThings API endpoint of a view](sta.md) |
 | iCalendar | `ical` (adds `views`) | `ical` | `/x/views/{view}/ical/v1/events.ics` | [iCalendar feed of a view](ical.md) |
+| GeoJSON of a view | `geojson` (adds `views`) | `geojson` | `/x/views/{view}/geojson/v1/{type}` | [GeoJSON of a view](geojson.md) |
 | WebSocket notifications | `ws` | `ws`, and `ws-views` for a view | `/x/ws/ngsi-ld/v1`, `/x/views/{view}/ws` | [WebSocket notifications](websocket.md) |
 | Internal context sources | `internal-csr` (adds `views`) | none (it serves forwards, not requests) | none | [Internal context sources](internal-context-sources.md) |
 

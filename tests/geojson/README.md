@@ -15,3 +15,9 @@ every generated surface; the standard's own rows follow them.
 | A bad parameter is 400; an empty Tenant is an empty page | TS 104 175 5.5.10 | `bad_parameters_are_400_and_an_empty_tenant_an_empty_page` |
 | A request naming another Tenant than the view's is 400 | ADR-0023, a view serves one Tenant | `a_request_naming_another_tenant_is_refused` |
 | The crate reaches data only through `antares-ops` | module rule M2 | `python3 dev/check-module-rules.py` |
+| The answer is an RFC 7946 `FeatureCollection` of `Feature`s, `application/geo+json` | RFC 7946 3.3, 12 | `a_page_is_an_rfc_7946_feature_collection` |
+| A Feature's `id` is the Entity's, its geometry the `location` value | RFC 7946 3.2 | `a_page_is_an_rfc_7946_feature_collection` |
+| An Entity without `location` has a `null` geometry | RFC 7946 3.2 | `every_attribute_kind_is_a_plain_property_and_no_location_a_null_geometry` |
+| A multi-instance `location` gives its first instance, a valid single geometry | RFC 7946 3.1 | `every_attribute_kind_is_a_plain_property_and_no_location_a_null_geometry` |
+| Properties are plain values: a Relationship's `object`, a LanguageProperty's `languageMap`, each instance of a multi-instance Attribute | TS 104 175 4.5 | `every_attribute_kind_is_a_plain_property_and_no_location_a_null_geometry` |
+| The next page's `offset` is the foreign member `nextOffset`, `null` on the last page | RFC 7946 6.1 | `a_page_is_an_rfc_7946_feature_collection` |

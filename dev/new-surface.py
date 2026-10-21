@@ -7,7 +7,7 @@ docs/src/new-surface.md).
 
 writes crates/antares-NAME (Cargo.toml, src/lib.rs, tests/NAME.rs), docs/src/NAME.md and
 tests/NAME/README.md from dev/new-surface/*.in, and adds the crate to the workspace, the
-broker feature NAME, the SURFACE_SHELF entry, ARCHITECTURE.md, the book's summary and the
+broker feature NAME, the SURFACE_SHELF entry, ARCHITECTURE.md, the book's summary, the surfaces table and the
 vanilla-build gate. The crate depends on antares-ops alone, so it reaches data only through
 the policy seam (module rule M2); its generated tests pass as written. A surface then writes
 its `render` and the standard's rows of the pack. Every edit anchors on one line of the file
@@ -33,6 +33,7 @@ TOUCHED = (
     "crates/antares-broker/src/main.rs",
     "ARCHITECTURE.md",
     "docs/src/SUMMARY.md",
+    "docs/src/surfaces.md",
     "dev/check-no-addon.sh",
 )
 
@@ -99,6 +100,12 @@ def edits(name, struct, title, desc):
         "docs/src/SUMMARY.md": lambda t: before_one(
             t, "- [WebSocket notifications](websocket.md)\n", f"- [{title}]({name}.md)\n"
         ),
+        "docs/src/surfaces.md": lambda t: after_last(
+            t,
+            r"\| [^|]+ \| `[a-z0-9-]+` \(adds `views`\) \| `[a-z0-9-]+` \| `/x/views/\{view\}/",
+            f"| {title} | `{name}` (adds `views`) | `{name}` | `/x/views/{{view}}/{name}/v1/{{type}}` "
+            f"| [{title}]({name}.md) |\n",
+        ),
         "dev/check-no-addon.sh": lambda t: before_one(t, "antares-ops|", f"{crate}|"),
     }
 
@@ -163,6 +170,7 @@ def self_test():
         assert "antares-probe = { workspace = true, optional = true }" in broker
         main = (root / "crates/antares-broker/src/main.rs").read_text()
         assert '("probe", || antares_ops::mount(antares_probe::Probe)),\n    #[cfg(feature = "ws")]' in main
+        assert "| [Probe of a view](probe.md) |\n| WebSocket" in (root / "docs/src/surfaces.md").read_text()
         assert "antares-probe|antares-ops|" in (root / "dev/check-no-addon.sh").read_text()
         lib = (root / "crates/antares-probe/src/lib.rs").read_text()
         assert "@" not in re.sub(r"@context", "", lib), "a placeholder is left"

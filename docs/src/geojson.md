@@ -1,7 +1,7 @@
 # GeoJSON of a view
 
-An `geojson` build (`cargo build -p antares-broker --features geojson`) serves one
-Entity type of a loaded [view](views.md) at a time: the Entities of one type of a view as an RFC 7946 `FeatureCollection`, each `location` its geometry and the other Attributes its properties.
+A build with the `geojson` feature (`cargo build -p antares-broker --features geojson`)
+serves the Entities of one type of a view as an RFC 7946 `FeatureCollection`, each `location` its geometry and the other Attributes its properties.
 
 ```text
 GET /x/views/{view}/geojson/v1/{type}
@@ -15,6 +15,14 @@ Policy and the Tenant decide as they do for an NGSI-LD client, so a type or an
 Attribute the view hides is absent. `q`, `scopeQ` and `lang` mean what they mean
 there; `limit` is 1 to 100 (default 100) and `offset` a whole number. Any other
 parameter, or one given twice, is `400`.
+
+The answer is `application/geo+json`, an RFC 7946 `FeatureCollection`: a
+`Feature` per Entity, its `id` the Entity's, its `geometry` the `location`
+value (the first instance of a multi-instance one, `null` without one) and its
+`properties` the other Attributes as plain values: a Property's `value`, a
+Relationship's `object`, a LanguageProperty's `languageMap`, a list of each
+instance's for a multi-instance Attribute, and `type`. The foreign member
+`nextOffset` is the `offset` of the next page, `null` on the last.
 
 A view that is unknown, does not allow `query_entities` or does not show
 `{type}` answers `404`. A read the Policy refuses answers the NGSI-LD refusal

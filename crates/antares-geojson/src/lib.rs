@@ -24,7 +24,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
 use axum::Router;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -80,16 +80,68 @@ impl Surface for GeoJson {
     }
 }
 
-/// The page as this surface writes it, given the Entities in NGSI-LD normalized form and the
-/// `offset` of the next page when more may remain.
+/// The members of an Attribute that hold its plain value, one per kind (TS 104 175 4.5).
+const VALUE_MEMBERS: [&str; 7] = [
+    "value",
+    "object",
+    "languageMap",
+    "json",
+    "vocab",
+    "valueList",
+    "objectList",
+];
+
+/// The page as an RFC 7946 `FeatureCollection`: a Feature per Entity, its `id` the Entity's,
+/// its geometry the first `location` (`null` without one, RFC 7946 3.2), its properties the
+/// other members as plain values, `type` among them. The foreign member `nextOffset`
+/// (RFC 7946 6.1) is the `offset` of the next page, `null` on the last.
 fn render(entities: &[Value], next: Option<usize>) -> Response {
-    let body = json!({ "entities": entities, "next": next });
+    let features: Vec<Value> = entities.iter().map(feature).collect();
+    let body = json!({ "type": "FeatureCollection", "features": features, "nextOffset": next });
     (
         StatusCode::OK,
-        [(CONTENT_TYPE, "application/json")],
+        [(CONTENT_TYPE, "application/geo+json")],
         body.to_string(),
     )
         .into_response()
+}
+
+/// One Entity as a Feature.
+fn feature(entity: &Value) -> Value {
+    let mut properties = Map::new();
+    let mut geometry = Value::Null;
+    for (name, member) in entity.as_object().into_iter().flatten() {
+        match name.as_str() {
+            "id" | "@context" => {}
+            "location" => geometry = plain(first(member)),
+            _ => {
+                properties.insert(name.clone(), plain(member));
+            }
+        }
+    }
+    json!({ "type": "Feature", "id": entity.get("id"), "geometry": geometry, "properties": properties })
+}
+
+/// The first instance of an Attribute that has several (TS 104 175 4.5.5).
+fn first(attribute: &Value) -> &Value {
+    match attribute {
+        Value::Array(instances) => instances.first().unwrap_or(&Value::Null),
+        one => one,
+    }
+}
+
+/// An Attribute's plain value, each instance in turn when it has several; a member that is no
+/// Attribute (`type`) as it is.
+fn plain(attribute: &Value) -> Value {
+    match attribute {
+        Value::Array(instances) => instances.iter().map(plain).collect(),
+        Value::Object(members) => VALUE_MEMBERS
+            .iter()
+            .find_map(|m| members.get(*m))
+            .cloned()
+            .unwrap_or(Value::Null),
+        other => other.clone(),
+    }
 }
 
 /// A refusal of the surface's own, with a fixed title that never names what a view hides.

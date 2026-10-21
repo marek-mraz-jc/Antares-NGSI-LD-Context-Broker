@@ -36,11 +36,11 @@ Both brokers already cut the broker along the same lines: storage, history, extr
 
 ## 3. A new standard surface as a generated crate
 
-Before T-5063 a new surface meant a crate by hand plus nine edits outside it: the workspace members, the workspace dependency, a release profile, the broker's optional dependency and feature, the `SURFACE_SHELF` entry, the `ARCHITECTURE.md` row, the book summary, the vanilla-build gate (`dev/check-no-addon.sh`), and the tests that prove the view and the Policy decide. `dev/new-surface.py NAME --title … --description …` writes all of it from `dev/new-surface/*.in`:
+Before T-5063 a new surface meant a crate by hand plus ten edits outside it: the workspace members, the workspace dependency, a release profile, the broker's optional dependency and feature, the `SURFACE_SHELF` entry, the `ARCHITECTURE.md` row, the book summary, the feature table in `docs/src/surfaces.md`, the vanilla-build gate (`dev/check-no-addon.sh`), and the tests that prove the view and the Policy decide. `dev/new-surface.py NAME --title … --description …` writes all of it from `dev/new-surface/*.in`:
 
 - `crates/antares-NAME`: `Cargo.toml` with role `surface`, `antares-ops` as the only workspace dependency and the full lint table; `src/lib.rs` serving `GET /x/views/{view}/NAME/v1/{type}` through `ViewOps::scan` with `limit`, `offset`, `q`, `scopeQ` and `lang`, read only, and a `render` function the author replaces; `tests/NAME.rs` with seven tests that hold for any `render`: a hidden Attribute is absent, a request naming another Tenant is 400, a hidden type and a view without `query_entities` are 404, a `PolicyEngine` that denies reads gives 403 with no data, a write is 405 and stores nothing, paging and `q` narrow, bad parameters are 400.
 - `docs/src/NAME.md` and the summary line; `tests/NAME/README.md`, the conformance pack: the template's rows and the place for the standard's own.
-- The nine edits above, each anchored on one line and refused before anything is written when the anchor moved (`dev/new-surface.py --self-test`, run in CI).
+- The ten edits above, each anchored on one line and refused before anything is written when the anchor moved (`dev/new-surface.py --self-test`, run in CI).
 
 Security: the generated crate has no store handle to misuse. Module rule M2 (`dev/check-module-rules.py`) fails the build if it names any workspace crate but `antares-ops`, and `the_policy_decides_every_read` proves each read reaches the policy seam.
 
@@ -52,10 +52,13 @@ The gateway's route for a representation (`crates/context-gateway/src/handlers/o
 
 | Part | Lines |
 |---|---|
-| Generated (`src/lib.rs` + `tests/geojson.rs` + `Cargo.toml`), unchanged | LINES_GENERATED |
-| Hand-written on top (`git diff --stat` of the commit after generation, added + changed) | LINES_HAND |
+| Generated: `src/lib.rs` 176, `tests/geojson.rs` 240, `Cargo.toml` 48 | 464 |
+| Hand-written in `src/lib.rs`: `render`, `feature`, `first`, `plain` (added 57, removed 5) | 57 |
+| Hand-written in `tests/geojson.rs`: the two GeoJSON tests | 68 |
+| Hand-written docs: `docs/src/geojson.md` 10, the pack's six RFC 7946 rows 6 | 16 |
+| **Hand-written in all** | **141** (125 of them Rust) |
 
-Target was under 300 hand-written lines for a read-only surface.
+Counted with `git diff --numstat` between the commit that holds the crate as generated and the next one. The target was under 300 hand-written lines for a read-only surface. The generated part passed its seven tests, `clippy -D warnings`, module rule M2 and the 100 % line and branch coverage gate before a line was written by hand; with `render` added, nine tests and the coverage gate pass (`dev/coverage-gate.py --check antares-geojson`).
 
 ## Related
 

@@ -238,3 +238,71 @@ async fn a_request_naming_another_tenant_is_refused() {
     let resp = app.oneshot(req).await.expect("infallible");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn a_page_is_an_rfc_7946_feature_collection() {
+    let app = fixture().await;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("{PLACES}?limit=1"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("infallible");
+    assert_eq!(resp.headers()["content-type"], "application/geo+json");
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let page: Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(page["type"], "FeatureCollection");
+    assert_eq!(page["nextOffset"], 1);
+    assert_eq!(
+        page["features"],
+        json!([{"type": "Feature", "id": "urn:ngsi-ld:Place:a",
+                "geometry": {"type": "Point", "coordinates": [19.146, 48.736]},
+                "properties": {"type": "Place", "name": "Námestie SNP"}}])
+    );
+    let (_, last) = send(&app, "GET", &format!("{PLACES}?offset=1"), "").await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&last).expect("json")["nextOffset"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn every_attribute_kind_is_a_plain_property_and_no_location_a_null_geometry() {
+    let app = fixture().await;
+    let point = |x: f64| json!({"type": "GeoProperty", "value": {"type": "Point", "coordinates": [x, 48.7]}, "datasetId": format!("urn:ngsi-ld:Dataset:{x}")});
+    let stops = [
+        json!({"id": "urn:ngsi-ld:Stop:1", "type": "Stop",
+               "location": [point(19.0), point(20.0)],
+               "servedBy": {"type": "Relationship", "object": "urn:ngsi-ld:Line:6"},
+               "label": {"type": "LanguageProperty", "languageMap": {"sk": "Zastávka", "en": "Stop"}},
+               "seats": [{"type": "Property", "value": 4, "datasetId": "urn:ngsi-ld:Dataset:a"},
+                         {"type": "Property", "value": 2, "datasetId": "urn:ngsi-ld:Dataset:b"}]}),
+        json!({"id": "urn:ngsi-ld:Stop:2", "type": "Stop", "name": {"type": "Property", "value": "Bez polohy"}}),
+    ];
+    for stop in stops {
+        let (status, body) = send(&app, "POST", "/ngsi-ld/v1/entities", &stop.to_string()).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = send(&app, "GET", "/x/views/every/geojson/v1/Stop", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let page: Value = serde_json::from_str(&body).expect("json");
+    let features = page["features"].as_array().expect("features");
+    let stop = |id: &str| features.iter().find(|f| f["id"] == id).expect(id).clone();
+    let one = stop("urn:ngsi-ld:Stop:1");
+    assert_eq!(one["geometry"]["type"], "Point");
+    let props = &one["properties"];
+    assert_eq!(props["servedBy"], "urn:ngsi-ld:Line:6");
+    assert_eq!(props["label"], json!({"sk": "Zastávka", "en": "Stop"}));
+    let mut seats: Vec<i64> = props["seats"]
+        .as_array()
+        .expect("instances")
+        .iter()
+        .filter_map(Value::as_i64)
+        .collect();
+    seats.sort_unstable();
+    assert_eq!(seats, [2, 4]);
+    assert_eq!(stop("urn:ngsi-ld:Stop:2")["geometry"], Value::Null);
+}

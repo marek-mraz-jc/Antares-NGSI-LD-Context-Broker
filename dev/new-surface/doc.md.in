@@ -1,7 +1,7 @@
 # @TITLE@
 
-An `@NAME@` build (`cargo build -p antares-broker --features @NAME@`) serves one
-Entity type of a loaded [view](views.md) at a time: @DESC@
+A build with the `@NAME@` feature (`cargo build -p antares-broker --features @NAME@`)
+serves @DESC@
 
 ```text
 GET /x/views/{view}/@NAME@/v1/{type}

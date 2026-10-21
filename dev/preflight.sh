@@ -312,6 +312,11 @@ if grep -qE '(^|/)Cargo\.(toml|lock)$|^(crates|fuzz)/' <<< "$changed"; then
     echo "fix: cargo update --manifest-path fuzz/Cargo.toml -p <the new crate>, and commit fuzz/Cargo.lock (never drop --locked)"; exit 1; }' _ "$target"
 fi
 
+# workspace.yml "New-surface template smoke" (T-5063): the template, or the seam its
+# generated crate calls, changed; it builds in the warm target, after cargo's lock
+if grep -qE '^dev/new-surface|^crates/antares-ops/' <<< "$changed"; then
+  lane step 17 new-surface env CARGO_TARGET_DIR="$target" dev/new-surface.test.sh
+fi
 # workspace.yml "cargo fmt --all --check"
 bg step 01 fmt cargo fmt --all --check
 # workspace.yml "cargo-machete"
