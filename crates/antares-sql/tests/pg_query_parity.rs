@@ -35,6 +35,35 @@ use serde_json::{json, Map, Value};
 
 const ATTRS: &[&str] = &["speed", "name", "flag", "tags", "color", "refA", "count"];
 const WORDS: &[&str] = &["a", "b", "Berlin", "berlin", "é", "x y", "10", ""];
+/// Stored strings: the query words plus line breaks, where `.`, `$` and
+/// negated lists of the two regex dialects part (T-4907).
+const VALUES: &[&str] = &[
+    "a", "b", "Berlin", "berlin", "é", "x y", "10", "", "Ber\nlin", "b\n",
+];
+/// `~=` operands: the first 16 are the pushed subset, the rest stay in memory.
+const PATTERNS: &[&str] = &[
+    "^B",
+    "erl",
+    "^b.*n$",
+    "^.$",
+    "B.r",
+    "(a|b)+",
+    "[A-Z]erlin",
+    "^$",
+    "x y",
+    "é",
+    "1+0?",
+    "^[a-c]+$",
+    "n$",
+    "a|",
+    "r.l",
+    "^b.$",
+    "\\d",
+    "[^a]",
+    "e{1,2}",
+    "(?i)^b",
+    "^B[^x]*n$",
+];
 
 struct Db {
     runtime: tokio::runtime::Runtime,
@@ -90,7 +119,7 @@ fn scalar() -> impl Strategy<Value = Value> {
     prop_oneof![
         (-3i64..=3).prop_map(Value::from),
         prop::sample::select(vec![1.5f64, -0.5, 2.25]).prop_map(Value::from),
-        prop::sample::select(WORDS.to_vec()).prop_map(Value::from),
+        prop::sample::select(VALUES.to_vec()).prop_map(Value::from),
         any::<bool>().prop_map(Value::from),
     ]
 }
@@ -205,7 +234,8 @@ fn q_leaf() -> impl Strategy<Value = String> {
             .prop_map(|(t, op, v)| format!("{t}{op}{v}")),
         2 => (q_target(), prop::sample::select(vec!["==", "==", "!="]), q_compound())
             .prop_map(|(t, op, v)| format!("{t}{op}{v}")),
-        1 => q_target().prop_map(|t| format!("{t}~=\"^B\"")),
+        2 => (q_target(), prop::sample::select(PATTERNS.to_vec())).prop_map(|(t, p)| format!("{t}~=\"{p}\"")),
+        1 => (q_target(), prop::sample::select(PATTERNS.to_vec())).prop_map(|(t, p)| format!("{t}!~=\"{p}\"")),
     ]
 }
 
@@ -228,6 +258,7 @@ fn q_compilable() -> impl Strategy<Value = String> {
         2 => (attr(), prop::sample::select(WORDS.to_vec()))
             .prop_map(|(a, w)| format!("{a}==\"{w}\"")),
         1 => (attr(), prop::sample::select(vec!["true", "false"])).prop_map(|(a, b)| format!("{a}=={b}")),
+        2 => (attr(), prop::sample::select(PATTERNS[..16].to_vec())).prop_map(|(a, p)| format!("{a}~=\"{p}\"")),
         1 => (attr(), prop::sample::select(vec!["1,2", "\"a\",\"Berlin\"", "-1..2", "true,3"]))
             .prop_map(|(a, v)| format!("{a}=={v}")),
     ];

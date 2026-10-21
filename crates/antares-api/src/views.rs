@@ -1399,6 +1399,71 @@ mod tests {
         }
     }
 
+    fn next_link(h: &axum::http::HeaderMap) -> Option<String> {
+        h.get_all("Link")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(", <"))
+            .find(|l| l.contains("rel=\"next\""))
+            .and_then(|l| l.trim_start_matches('<').split_once('>'))
+            .map(|(target, _)| target.to_owned())
+    }
+
+    /// T-4907: an uncounted page's next Link carries a keyset cursor beside
+    /// its offset; following it walks every Car of the view exactly once,
+    /// and the cursor is refused on another view, another query, a counted
+    /// or ordered read, or edited.
+    #[tokio::test]
+    async fn the_next_cursor_walks_the_view_and_is_bound_to_it() {
+        let st = seeded(None).await;
+        let view = st.with_view(Arc::new(cars()));
+        for state in [&st, &view] {
+            let (s, body, h) =
+                send(state, "GET", "/ngsi-ld/v1/entities?type=Car&limit=2", None).await;
+            assert_eq!(s, StatusCode::OK, "{body}");
+            let mut seen = ids(&body);
+            let mut next = next_link(&h);
+            let first = next.clone().expect("2 of 5 Cars link the next page");
+            assert!(
+                first.contains("&cursor=") && first.contains("offset=2"),
+                "{first}"
+            );
+            while let Some(path) = next {
+                let (s, page, h) = send(state, "GET", &path, None).await;
+                assert_eq!(s, StatusCode::OK, "{path}: {page}");
+                assert!(ids(&page).len() <= 2, "{page}");
+                seen.extend(ids(&page));
+                next = next_link(&h);
+            }
+            seen.sort();
+            let want: Vec<String> = (0..5).map(|i| format!("urn:ngsi-ld:Car:{i}")).collect();
+            assert_eq!(seen, want);
+            let other = if std::ptr::eq(state, &st) { &view } else { &st };
+            let tampered = first.replace("&cursor=", "&cursor=00");
+            for (to, path) in [
+                (other, first.clone()),
+                (state, first.replace("limit=2", "limit=3")),
+                (state, format!("{first}&q=speed%3E1")),
+                (state, format!("{first}&count=true")),
+                (state, format!("{first}&orderBy=speed")),
+                (state, tampered),
+            ] {
+                let (s, body, _) = send(to, "GET", &path, None).await;
+                assert_eq!(s, StatusCode::BAD_REQUEST, "{path}: {body}");
+            }
+        }
+        // a counted page keeps offset Links only
+        let (_, _, h) = send(
+            &view,
+            "GET",
+            "/ngsi-ld/v1/entities?type=Car&limit=2&count=true",
+            None,
+        )
+        .await;
+        let next = next_link(&h).expect("next");
+        assert!(!next.contains("cursor="), "{next}");
+    }
+
     /// Rule 1: `NGSILD-Results-Count` and the `Link` pages describe the
     /// narrowed set, the Cars, and nothing the view does not select.
     #[tokio::test]

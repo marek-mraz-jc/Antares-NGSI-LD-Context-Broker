@@ -62,6 +62,155 @@ pub fn paginate_pre_accept(
     paginate_impl(st, params, page, path, accept, Some(total))
 }
 
+/// The query parameter carrying the keyset cursor of an Entity query's
+/// rel="next" Link (T-4907). The next page then seeks the primary key past
+/// the last id shown instead of skipping `offset` rows; the Link still
+/// carries `offset`, so the page numbers a client reads stay true.
+pub(crate) const CURSOR: &str = "cursor";
+/// The longest cursor read: an Entity id is at most 256 bytes as hex, plus
+/// the tag.
+const CURSOR_MAX: usize = 1024;
+
+/// Whether an Entity query's next page may be read by keyset: a page the
+/// store keeps in id order whose total nobody asked for (a counted page
+/// still counts the whole set, which the keyset predicate would cut).
+pub(crate) fn keyset_allowed(params: &HashMap<String, String>) -> bool {
+    params.get("count").map(String::as_str) != Some("true") && !params.contains_key("orderBy")
+}
+
+/// The view a cursor is bound to: `view:` and its id, empty for the plain
+/// API (a view never named still differs from it).
+#[cfg(feature = "views")]
+pub(crate) fn view_of(st: &AppState) -> String {
+    st.view
+        .as_deref()
+        .map_or_else(String::new, |v| format!("view:{}", v.id()))
+}
+
+/// The view a cursor is bound to: the plain API.
+#[cfg(not(feature = "views"))]
+pub(crate) fn view_of(_st: &AppState) -> String {
+    String::new()
+}
+
+/// The tag binding a cursor to its view, Tenant, every other parameter of
+/// the request it is sent with, and the id it names. Not a secret: a
+/// forged cursor can only start its own query at another id, which `q` or
+/// `id` already let the caller ask; the tag makes a cursor replayed on
+/// another view, Tenant or query a 400 instead of a silently shifted page.
+fn cursor_tag(view: &str, tenant: &str, params: &HashMap<String, String>, last: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut kv: Vec<(&String, &String)> = params.iter().filter(|(k, _)| *k != CURSOR).collect();
+    kv.sort();
+    let mut h = Sha256::new();
+    for part in [
+        b"antares-cursor-1".as_slice(),
+        view.as_bytes(),
+        tenant.as_bytes(),
+    ] {
+        h.update(part);
+        h.update([0]);
+    }
+    for (k, v) in kv {
+        h.update(k.as_bytes());
+        h.update([0]);
+        h.update(v.as_bytes());
+        h.update([0]);
+    }
+    h.update(last.as_bytes());
+    let digest = h.finalize();
+    hex(digest.get(..12).unwrap_or(&digest))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(
+        String::with_capacity(bytes.len().saturating_mul(2)),
+        |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        },
+    )
+}
+
+/// The cursor of the page after `last` for the request `next` (the
+/// parameters the next Link carries, without the cursor itself).
+pub(crate) fn encode_cursor(
+    view: &str,
+    tenant: &str,
+    next: &HashMap<String, String>,
+    last: &str,
+) -> String {
+    format!(
+        "{}.{}",
+        hex(last.as_bytes()),
+        cursor_tag(view, tenant, next, last)
+    )
+}
+
+/// The id a request's cursor seeks past, `None` without one. A cursor not
+/// made for exactly this view, Tenant and query is BadRequestData.
+pub(crate) fn cursor_after(
+    view: &str,
+    tenant: &str,
+    params: &HashMap<String, String>,
+) -> Result<Option<String>, NgsiError> {
+    let Some(c) = params.get(CURSOR) else {
+        return Ok(None);
+    };
+    let refused = || {
+        NgsiError::BadRequestData(
+            "cursor does not belong to this query; follow the next Link of its first page again"
+                .into(),
+        )
+    };
+    if c.len() > CURSOR_MAX || !keyset_allowed(params) {
+        return Err(refused());
+    }
+    let (id_hex, tag) = c.split_once('.').ok_or_else(refused)?;
+    let bytes = (0..id_hex.len())
+        .step_by(2)
+        .map(|i| {
+            id_hex
+                .get(i..i.saturating_add(2))
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        })
+        .collect::<Option<Vec<u8>>>()
+        .filter(|b| !b.is_empty() && b.len().saturating_mul(2) == id_hex.len())
+        .ok_or_else(refused)?;
+    let last = String::from_utf8(bytes).map_err(|_| refused())?;
+    if cursor_tag(view, tenant, params, &last) != tag {
+        return Err(refused());
+    }
+    Ok(Some(last))
+}
+
+/// The next Link of `links` with the cursor of the page after `last`
+/// added; every other Link unchanged.
+pub(crate) fn with_next_cursor(
+    links: Vec<String>,
+    view: &str,
+    tenant: &str,
+    params: &HashMap<String, String>,
+    last: Option<&str>,
+    next_offset: usize,
+) -> Vec<String> {
+    let Some(last) = last else {
+        return links;
+    };
+    let mut next = params.clone();
+    next.remove(CURSOR);
+    next.insert("offset".into(), next_offset.to_string());
+    let cursor = encode_cursor(view, tenant, &next, last);
+    links
+        .into_iter()
+        .map(|l| match l.split_once(">; rel=\"next\"") {
+            Some((target, rest)) => format!("{target}&{CURSOR}={cursor}>; rel=\"next\"{rest}"),
+            None => l,
+        })
+        .collect()
+}
+
 /// 4.12 Pagination: clients specify a limit (page size), the server defines
 /// a default page size, and a hard ceiling is rejected with TooManyResults
 /// rather than silently clamped. The limit/offset/count triple of 6.3.10,
@@ -165,7 +314,7 @@ fn paginate_impl(
         } else {
             qp = params
                 .iter()
-                .filter(|(k, _)| k.as_str() != "offset")
+                .filter(|(k, _)| !matches!(k.as_str(), "offset" | CURSOR))
                 .map(|(k, v)| format!("{k}={}", query_value(v)))
                 .collect();
             qp.push(format!("offset={off}"));

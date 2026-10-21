@@ -476,9 +476,20 @@ async fn query_pushdown_narrows_without_dropping_matches() {
         ["urn:ngsi-ld:Room:2", "urn:ngsi-ld:Vehicle:2"]
     );
 
-    // q= the compiler REFUSES (dotted path, regex, string ordering): the row
-    // set must widen to everything, never narrow on a guess.
-    for refused in ["address.city==\"Bonn\"", "name~=\"^so\"", "name>\"m\""] {
+    // q=: a regex both dialects read alike is decided in SQL (T-4907)
+    let ast = antares_ql::parse_q("name~=\"^so\"").expect("parse");
+    assert_eq!(
+        q!(&antares_sql::store::pg::entity::EntityFilter {
+            q: Some(&ast),
+            ..base()
+        }),
+        ["urn:ngsi-ld:Vehicle:1"]
+    );
+
+    // q= the compiler REFUSES (dotted path, a regex outside the pushed
+    // subset, string ordering): the row set must widen to everything, never
+    // narrow on a guess.
+    for refused in ["address.city==\"Bonn\"", "name~=\"\\d\"", "name>\"m\""] {
         let ast = antares_ql::parse_q(refused).expect("parse");
         assert_eq!(
             q!(&antares_sql::store::pg::entity::EntityFilter {
