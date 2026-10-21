@@ -1338,6 +1338,20 @@ pub mod test_kit {
             }
         }
 
+        /// [`TestBroker::new`] answering at most `limit` Entities per Query
+        /// Entities page (`max_limit`, 1000 otherwise), so a test pages past it
+        /// without writing thousands of Entities.
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn with_max_limit(limit: usize) -> Result<Self, String> {
+            let mut state = AppState::new("antares-test".into());
+            state.max_limit = limit;
+            antares_api::wire(&mut state).await;
+            let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
+        }
+
         /// [`TestBroker::new`] buffering at most `bytes` of one in-process
         /// answer ([`crate::bounds::MAX_ANSWER_BYTES`] otherwise), set before
         /// the view table is installed so `/q` previews hold it too; a test

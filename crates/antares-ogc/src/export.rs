@@ -101,6 +101,10 @@ mod file {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    /// Features an export reads per `items` page: the broker's default `max_limit`, so an
+    /// export buffers one store page at a time.
+    const EXPORT_PAGE: u64 = 1000;
+
     /// The refusal past the cap of files written at once.
     pub(crate) const BUSY: Problem = Problem(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -309,7 +313,7 @@ mod file {
             pairs: &[(String, String)],
             write: &mut (dyn FnMut(&[Value]) -> Result<(), Error> + Send),
         ) -> Result<usize, Problem> {
-            p.limit = items::MAX_LIMIT;
+            p.limit = EXPORT_PAGE;
             let digest = items::digest(self.id, &c.id, pairs);
             let mut rows = 0usize;
             loop {
