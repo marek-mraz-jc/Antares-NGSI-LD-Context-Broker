@@ -36,7 +36,7 @@ async fn every_navigation_link_of_every_set_answers() -> Result<(), String> {
                 // Car:2 names the hidden Radar:1 as its Device: no Sensor the view shows.
                 let hidden = link
                     .as_str()
-                    .is_some_and(|l| l.contains("Car:2/speed')/Sensor"));
+                    .is_some_and(|l| l.contains("Car:2%2Fspeed')/Sensor"));
                 let want = if hidden {
                     StatusCode::NOT_FOUND
                 } else {
