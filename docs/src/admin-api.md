@@ -534,6 +534,13 @@ deleted, never ids or values, and counts it in
 `antares_retention_deleted_total{tenant,type,kind}` (`kind` is `entity` or
 `history`; `type` is `*` for the Tenant's default, `@entity` for what
 Entities' own retention deleted and `@platform` for the platform default).
+A sweep spends at most 15 s deleting and one statement at most 5 s. The
+rules that waited longest run first, then the shortest retention. A rule
+whose statement fails (the log line `retention sweep failed`) runs again 2,
+4, 8 and at most 30 sweeps later, with half the batch per failure (at least
+100 rows), and each clean sweep doubles its batch back. A rule that holds
+a sweep for a second or more logs `retention sweep step slow` with its
+batch, count and milliseconds.
 `ANTARES_TEMPORAL_RETENTION_DAYS` stays the broker-wide horizon beside it.
 
 ### GET /q/retention/{tenant}

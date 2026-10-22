@@ -618,32 +618,40 @@ async fn retain(
     if !plan.dry_run && !floors.is_empty() {
         dropped(state.temporal.drop_retained_history(&floors).await);
     }
-    if let Some(t) = turns {
-        t.lock()
+    let batches = match turns {
+        Some(t) => t
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .order(&mut steps);
-    }
-    let (out, ran) = run(&steps, budget, plan.dry_run, |step, batch| async move {
-        match step.job.scope() {
-            Ok(scope) => {
-                state
-                    .temporal
-                    .retain_history(&step.tenant, scope, &step.before, batch, plan.dry_run)
-                    .await
+            .order(&mut steps),
+        None => Vec::new(),
+    };
+    let (out, ran, failed) = run(
+        &steps,
+        budget,
+        plan.dry_run,
+        &batches,
+        |step, batch| async move {
+            match step.job.scope() {
+                Ok(scope) => {
+                    state
+                        .temporal
+                        .retain_history(&step.tenant, scope, &step.before, batch, plan.dry_run)
+                        .await
+                }
+                Err(type_iri) => {
+                    state
+                        .store
+                        .retain_current(&step.tenant, type_iri, &step.before, batch, plan.dry_run)
+                        .await
+                }
             }
-            Err(type_iri) => {
-                state
-                    .store
-                    .retain_current(&step.tenant, type_iri, &step.before, batch, plan.dry_run)
-                    .await
-            }
-        }
-    })
+        },
+    )
     .await;
     if let Some(t) = turns {
         t.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .ran(&steps, &ran);
+            .ran(&steps, &ran, &failed);
     }
     out
 }
@@ -653,11 +661,24 @@ async fn retain(
 /// times out on one (Tenant, type), or a budget a backlog spent, delays the
 /// others by one minute at most instead of starving them (on dev a timeout on
 /// Bike docks kept a PT5M Vehicle history from ever being swept).
+///
+/// A step whose statement failed runs again 2, 4, 8 .. [`MAX_REST`] sweeps
+/// later, with half the batch per failure (at least [`MIN_BATCH`]),
+/// one doubling back per sweep it runs clean: on dev 36 timeouts an hour, 5 s
+/// each, spent the budget the Vehicle backlog needed (T-5157 reopened).
 #[derive(Debug, Default)]
 pub(super) struct Turns {
     sweep: u64,
     last: std::collections::HashMap<StepKey, u64>,
+    /// Failures in a row, and the first sweep that may run the step again.
+    strikes: std::collections::HashMap<StepKey, (u32, u64)>,
 }
+
+/// The longest a failing step rests, in sweeps: every step runs at least
+/// twice an hour.
+const MAX_REST: u64 = 30;
+/// The smallest batch a failing step shrinks to.
+const MIN_BATCH: usize = 100;
 
 /// A step's identity across sweeps: Tenant, label and job.
 type StepKey = (String, String, String);
@@ -666,23 +687,46 @@ impl Turns {
     /// Sort `steps`: those that waited longest first, then the latest cut
     /// (the shortest retention); the order changes no step's rows, as no two
     /// steps reach the same row.
-    fn order(&self, steps: &mut [Step]) {
+    /// The batch of each step in the new order; 0 for one that rests.
+    fn order(&self, steps: &mut [Step]) -> Vec<usize> {
+        let next = self.sweep.saturating_add(1);
         steps.sort_by(|a, b| {
             let waited = |s: &Step| self.last.get(&s.key()).copied().unwrap_or_default();
             waited(a)
                 .cmp(&waited(b))
                 .then_with(|| b.before.cmp(&a.before))
         });
+        steps
+            .iter()
+            .map(|s| match self.strikes.get(&s.key()) {
+                Some(&(_, at)) if at > next => 0,
+                Some(&(n, _)) => BATCH.checked_shr(n).unwrap_or_default().max(MIN_BATCH),
+                None => BATCH,
+            })
+            .collect()
     }
 
-    /// Record which of `steps` this sweep started (`ran` by index) and forget
-    /// steps the rules no longer make.
-    fn ran(&mut self, steps: &[Step], ran: &[usize]) {
+    /// Record which of `steps` this sweep started (`ran` by index) and which
+    /// of those failed, and forget steps the rules no longer make.
+    fn ran(&mut self, steps: &[Step], ran: &[usize], failed: &[usize]) {
         self.sweep = self.sweep.saturating_add(1);
         let keys: std::collections::HashSet<StepKey> = steps.iter().map(Step::key).collect();
         self.last.retain(|k, _| keys.contains(k));
-        for s in ran.iter().filter_map(|&i| steps.get(i)) {
-            self.last.insert(s.key(), self.sweep);
+        self.strikes.retain(|k, _| keys.contains(k));
+        for (i, s) in ran.iter().filter_map(|&i| Some((i, steps.get(i)?))) {
+            let key = s.key();
+            self.last.insert(key.clone(), self.sweep);
+            let n = self.strikes.get(&key).map_or(0, |&(n, _)| n);
+            if failed.contains(&i) {
+                let n = n.saturating_add(1);
+                let rest = 1u64.checked_shl(n).unwrap_or(MAX_REST).min(MAX_REST);
+                self.strikes
+                    .insert(key, (n, self.sweep.saturating_add(rest)));
+            } else if n > 1 {
+                self.strikes.insert(key, (n.saturating_sub(1), 0));
+            } else {
+                self.strikes.remove(&key);
+            }
         }
     }
 }
@@ -698,27 +742,33 @@ impl Step {
     }
 }
 
-/// Run `steps` in order, each in rounds of `delete` until a short batch, an
-/// error (logged; the next step goes on) or the spent `budget`; what each
-/// deleted under its label, and the index of every step it started.
+/// Run `steps` in order, each in rounds of `delete` (`batches` rows by
+/// step, [`BATCH`] past its end, none for a 0) until a short batch, an error (logged; the
+/// next step goes on) or the spent `budget`; what each deleted under its
+/// label, the index of every step it started and of every one that failed.
 async fn run<'s, F, Fut>(
     steps: &'s [Step],
     budget: Duration,
     dry_run: bool,
+    batches: &[usize],
     mut delete: F,
-) -> (Vec<Deleted>, Vec<usize>)
+) -> (Vec<Deleted>, Vec<usize>, Vec<usize>)
 where
     F: FnMut(&'s Step, usize) -> Fut,
     Fut: std::future::Future<Output = Result<u64, antares_model::NgsiError>>,
 {
     let started = std::time::Instant::now();
-    let (batch, rounds) = if dry_run {
-        (PREVIEW_CAP, 1)
-    } else {
-        (BATCH, ROUNDS)
-    };
-    let (mut out, mut ran) = (Vec::new(), Vec::new());
+    let (mut out, mut ran, mut failed) = (Vec::new(), Vec::new(), Vec::new());
     for (i, step) in steps.iter().enumerate() {
+        let (batch, rounds) = if dry_run {
+            (PREVIEW_CAP, 1)
+        } else {
+            (batches.get(i).copied().unwrap_or(BATCH), ROUNDS)
+        };
+        if batch == 0 {
+            continue;
+        }
+        let begun = std::time::Instant::now();
         let (tenant, label) = (step.tenant.as_str(), step.label.as_str());
         let kind = if step.job.scope().is_ok() {
             "history"
@@ -743,10 +793,24 @@ where
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(tenant, r#type = label, kind, error = %e, "retention sweep failed");
+                    tracing::warn!(tenant, r#type = label, kind, batch, error = %e, "retention sweep failed");
+                    failed.push(i);
                     break;
                 }
             }
+        }
+        // What the next fix measures: a step that holds the budget a second.
+        let ms = u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if !dry_run && ms >= 1000 {
+            tracing::info!(
+                tenant,
+                r#type = label,
+                kind,
+                batch,
+                count,
+                ms,
+                "retention sweep step slow"
+            );
         }
         if count > 0 {
             out.push(Deleted {
@@ -764,7 +828,7 @@ where
             break;
         }
     }
-    (out, ran)
+    (out, ran, failed)
 }
 
 /// The floor of every Tenant whose whole history `steps` reach (T-4906): the
@@ -1265,7 +1329,7 @@ mod tests {
             history_step("praha", "Bin", "2026-09-21T00:00:00.000Z"),
         ];
         let left = std::sync::Mutex::new(BATCH.saturating_mul(2).saturating_add(7));
-        let (out, ran) = run(&steps, SWEEP_BUDGET, false, |step, batch| {
+        let (out, ran, failed) = run(&steps, SWEEP_BUDGET, false, &[], |step, batch| {
             let slow = step.label == "Dock";
             let n = if step.label == "Vehicle" {
                 let mut left = left.lock().expect("rows");
@@ -1289,6 +1353,7 @@ mod tests {
         let swept: Vec<(&str, u64)> = out.iter().map(|d| (d.type_iri.as_str(), d.count)).collect();
         assert_eq!(swept, [("Vehicle", 2007), ("Bin", 3)]);
         assert_eq!(ran, [0, 1, 2]);
+        assert_eq!(failed, [0]);
     }
 
     /// T-5157: the shortest retention runs first; what a spent budget left
@@ -1304,18 +1369,72 @@ mod tests {
         ];
         turns.order(&mut steps);
         assert_eq!(names(&steps), ["Vehicle", "Bin", "Dock"]);
-        turns.ran(&steps, &[0]);
+        turns.ran(&steps, &[0], &[]);
         turns.order(&mut steps);
         assert_eq!(
             names(&steps),
             ["Bin", "Dock", "Vehicle"],
             "the budget left two"
         );
-        turns.ran(&steps, &[0, 1, 2]);
+        turns.ran(&steps, &[0, 1, 2], &[]);
         turns.order(&mut steps);
         assert_eq!(names(&steps), ["Vehicle", "Bin", "Dock"]);
         steps.retain(|s| s.label != "Dock");
-        turns.ran(&steps, &[]);
+        turns.ran(&steps, &[], &[]);
         assert_eq!(turns.last.len(), 2);
+    }
+
+    /// T-5157 reopened: a step that fails rests 1, 3, 7 sweeps and returns
+    /// with 500, 250, 125 rows a batch; each clean run doubles it back; the
+    /// others keep the full batch, a resting step is never started, and a
+    /// step past a second is logged as slow.
+    #[tokio::test]
+    async fn a_failing_step_rests_longer_and_comes_back_with_a_smaller_batch() {
+        let mut turns = Turns::default();
+        let mut steps = vec![
+            history_step("helsinki", "Dock", "2026-10-14T00:00:00.000Z"),
+            history_step("helsinki", "Vehicle", "2026-10-21T22:55:00.000Z"),
+        ];
+        let sweep = |turns: &mut Turns, steps: &mut [Step], dock_fails: bool| {
+            let batches = turns.order(steps);
+            let dock = steps.iter().position(|s| s.label == "Dock").expect("dock");
+            let dock_batch = batches.get(dock).copied().expect("batch");
+            let ran: Vec<usize> = (0..steps.len())
+                .filter(|&i| batches.get(i) != Some(&0))
+                .collect();
+            let failed: Vec<usize> = ran
+                .iter()
+                .copied()
+                .filter(|&i| dock_fails && i == dock)
+                .collect();
+            turns.ran(steps, &ran, &failed);
+            dock_batch
+        };
+        assert_eq!(sweep(&mut turns, &mut steps, true), 1000);
+        let rests: Vec<usize> = (0..12)
+            .map(|_| sweep(&mut turns, &mut steps, true))
+            .collect();
+        assert_eq!(rests, [0, 500, 0, 0, 0, 250, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(sweep(&mut turns, &mut steps, false), 0);
+        assert_eq!(sweep(&mut turns, &mut steps, false), 125);
+        assert_eq!(sweep(&mut turns, &mut steps, false), 250);
+        assert_eq!(sweep(&mut turns, &mut steps, false), 500);
+        assert_eq!(sweep(&mut turns, &mut steps, false), 1000);
+        assert!(turns.strikes.is_empty());
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let (_, ran, failed) = run(&steps, SWEEP_BUDGET, false, &[0, 250], |step, batch| {
+            seen.lock().expect("seen").push((step.label.clone(), batch));
+            async move {
+                // Past a second: the step is logged as slow.
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                Ok(0)
+            }
+        })
+        .await;
+        assert_eq!((ran, failed), (vec![1], vec![]));
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen.first().map(|(_, b)| *b), Some(250));
     }
 }
