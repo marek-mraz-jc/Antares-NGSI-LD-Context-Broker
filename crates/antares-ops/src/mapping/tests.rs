@@ -330,6 +330,14 @@ fn a_malformed_slot_is_refused_with_its_index() {
             json!({ "target": "x", "kind": "expr" }),
             "carries no expression",
         ),
+        (
+            json!({ "target": "x", "source": "y", "kind": "unitConversion", "factor": 1, "ofset": 2 }),
+            "slot 0: a unitConversion slot has no member \"ofset\"",
+        ),
+        (
+            json!({ "target": "x", "source": "y", "kind": "rename", "forward": {} }),
+            "a rename slot has no member \"forward\"",
+        ),
     ] {
         let e = refused(slot.clone());
         assert!(e.contains(says), "{slot}: {e}");
@@ -942,7 +950,12 @@ fn a_geoquery_names_a_renamed_filterable_slot() {
 #[test]
 fn a_parameter_is_passed_rewritten_or_refused() {
     let m = mapping();
-    let passed: Vec<(&str, &str)> = PASSED.iter().map(|p| (*p, "x")).collect();
+    // `georel` alone adds the target's `location` (its own test)
+    let passed: Vec<(&str, &str)> = PASSED
+        .iter()
+        .filter(|p| **p != "georel")
+        .map(|p| (*p, "x"))
+        .collect();
     let inv = m
         .invert(&pairs(&passed))
         .unwrap_or_else(|e| unreachable!("{e}"));
@@ -988,27 +1001,27 @@ fn retrieve_attribute_value_reads_a_source_attribute_and_rebuilds_it() {
         .unwrap_or_else(|e| unreachable!("{e}"));
     assert_eq!(source, term(&m, "teplota"));
     let mut bare = json!(292.15);
-    m.rebuild_attribute(i, &mut bare);
+    assert!(m.rebuild_attribute(i, &mut bare));
     assert_eq!(bare, json!(19.0));
     let (i, _) = m
         .source_attribute("reliab%69lity")
         .unwrap_or_else(|e| unreachable!("{e}"));
     let mut attribute =
         json!({ "@context": { "jcSrc0": "x" }, "type": "Property", "value": "nizka" });
-    m.rebuild_attribute(i, &mut attribute);
+    assert!(m.rebuild_attribute(i, &mut attribute));
     assert_eq!(
         attribute,
         json!({ "@context": antares_jsonld::CORE_CONTEXT, "type": "Property", "value": "low" })
     );
     let mut plain = json!({ "type": "Property", "value": "nizka" });
-    m.rebuild_attribute(i, &mut plain);
+    assert!(m.rebuild_attribute(i, &mut plain));
     assert_eq!(
         plain,
         json!({ "type": "Property", "value": "low" }),
         "a JSON answer gets no @context"
     );
     let mut untouched = json!({ "type": "Property", "value": 1 });
-    m.rebuild_attribute(99, &mut untouched);
+    assert!(!m.rebuild_attribute(99, &mut untouched));
     assert_eq!(
         untouched,
         json!({ "type": "Property", "value": 1 }),
@@ -1064,11 +1077,15 @@ fn every_representation_and_a_multi_attribute_are_rebuilt() {
         &m,
         &json!({ "id": "urn:x", "type": "jcSrcClass", "s": "four", "o": ["urn:a"] }),
     );
-    assert_eq!(not_a_number["t"], json!("four"));
+    assert_eq!(
+        not_a_number.get("t"),
+        None,
+        "a text is no quantity: not served in the source unit"
+    );
     assert_eq!(
         not_a_number["r"],
-        json!(["urn:a"]),
-        "a list is no table key"
+        json!(["urn:b"]),
+        "a simplified list is translated element by element"
     );
 }
 
@@ -1485,5 +1502,204 @@ fn what_discovery_or_a_history_cannot_name_passes_as_it_is() {
     assert_eq!(
         history.get("temperature"),
         Some(&json!({"type": "Property", "values": [[], [10.0]]}))
+    );
+}
+
+#[test]
+fn a_geoquery_without_geoproperty_filters_the_target_location() {
+    let m = slots(&json!([
+        { "target": "location", "source": "position", "kind": "rename", "filterable": true },
+        { "target": "where", "source": "location", "kind": "rename", "filterable": true }
+    ]));
+    let geo = [
+        ("georel", "near;maxDistance==500"),
+        ("geometry", "Point"),
+        ("coordinates", "[17.1,48.1]"),
+    ];
+    let geoproperties = |list: &[(&str, &str)]| {
+        m.invert(&pairs(list)).map(|i| {
+            i.pairs
+                .into_iter()
+                .filter(|(k, _)| k == "geoproperty" || k == "geometryProperty")
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(
+        geoproperties(&geo),
+        Ok(vec![("geoproperty".to_owned(), term(&m, "position"))]),
+        "the default location is the target's, read from its source"
+    );
+    for name in ["geoproperty", "geometryProperty"] {
+        let mut named = geo.to_vec();
+        named.push((name, "where"));
+        assert_eq!(
+            geoproperties(&named),
+            Ok(vec![(name.to_owned(), term(&m, "location"))]),
+            "{name}"
+        );
+    }
+    for refusing in [
+        slots(
+            &json!([{ "target": "where", "source": "location", "kind": "rename", "filterable": true }]),
+        ),
+        slots(&json!([{ "target": "location", "source": "position", "kind": "rename" }])),
+        slots(
+            &json!([{ "target": "location", "source": "p", "kind": "unitConversion", "factor": 2, "filterable": true }]),
+        ),
+    ] {
+        assert_eq!(refusing.invert(&pairs(&geo)).err(), Some(NOT_FILTERABLE));
+    }
+    assert!(
+        m.invert(&pairs(&[("geometry", "Point")])).is_ok(),
+        "no georel, no geo-query"
+    );
+}
+
+#[test]
+fn each_attribute_kind_is_translated_through_a_mapping() {
+    let m = slots(&json!([
+        { "target": "v", "source": "a", "kind": "valueMappings", "forward": { "x": "y", "urn:p": "urn:q" } },
+        { "target": "l", "source": "b", "kind": "unitConversion", "factor": 10 },
+        { "target": "r", "source": "c", "kind": "valueMappings", "forward": { "urn:p": "urn:q" } },
+        { "target": "m", "source": "d", "kind": "valueMappings", "forward": { "x": "y" } },
+        { "target": "j", "source": "e", "kind": "unitConversion", "factor": 2 },
+        { "target": "n", "source": "f", "kind": "rename" }
+    ]));
+    let normalized = rebuilt(
+        &m,
+        &json!({ "id": "urn:x", "type": "jcSrcClass",
+        "a": { "type": "VocabProperty", "vocab": "x" },
+        "b": { "type": "ListProperty", "valueList": [1, 2] },
+        "c": { "type": "ListRelationship", "objectList": [{ "object": "urn:p" }] },
+        "d": { "type": "LanguageProperty", "languageMap": { "sk": "x" } },
+        "e": { "type": "JsonProperty", "json": { "n": 1 } },
+        "f": { "type": "LanguageProperty", "languageMap": { "sk": "x" } } }),
+    );
+    assert_eq!(
+        normalized["v"],
+        json!({ "type": "VocabProperty", "vocab": "y" })
+    );
+    assert_eq!(
+        normalized["l"],
+        json!({ "type": "ListProperty", "valueList": [10.0, 20.0] })
+    );
+    assert_eq!(
+        normalized["r"],
+        json!({ "type": "ListRelationship", "objectList": [{ "object": "urn:q" }] })
+    );
+    assert_eq!(
+        normalized.get("m"),
+        None,
+        "a language map has no value table"
+    );
+    assert_eq!(normalized.get("j"), None, "a JSON value has no unit");
+    assert_eq!(
+        normalized["n"],
+        json!({ "type": "LanguageProperty", "languageMap": { "sk": "x" } }),
+        "a rename carries every kind"
+    );
+    let concise = rebuilt(
+        &m,
+        &json!({ "id": "urn:x", "type": "jcSrcClass",
+        "a": { "vocab": "x" }, "b": { "valueList": [3] }, "d": { "languageMap": { "sk": "x" } } }),
+    );
+    assert_eq!(concise["v"], json!({ "vocab": "y" }));
+    assert_eq!(concise["l"], json!({ "valueList": [30.0] }));
+    assert_eq!(concise.get("m"), None);
+    let simplified = rebuilt(
+        &m,
+        &json!({ "id": "urn:x", "type": "jcSrcClass",
+        "a": { "vocab": "x" }, "b": [4, 5], "e": { "json": { "n": 1 } } }),
+    );
+    assert_eq!(simplified["v"], json!({ "vocab": "y" }));
+    assert_eq!(simplified["l"], json!([40.0, 50.0]));
+    assert_eq!(simplified.get("j"), None);
+    let mut attribute = json!({ "type": "LanguageProperty", "languageMap": { "sk": "x" } });
+    assert_eq!(
+        m.source_attribute("m")
+            .map(|(i, _)| m.rebuild_attribute(i, &mut attribute)),
+        Ok(false),
+        "Retrieve Attribute Value answers as for an absent Attribute"
+    );
+}
+
+#[test]
+fn history_leaves_out_the_instances_a_mapping_cannot_translate() {
+    let m = slots(&json!([
+        { "target": "t", "source": "s", "kind": "unitConversion", "factor": 2 },
+        { "target": "v", "source": "a", "kind": "valueMappings", "forward": { "x": "y" } }
+    ]));
+    let mut history = answered(
+        &m,
+        &json!({ "id": "urn:x", "type": "jcSrcClass",
+        "s": { "type": "Property", "values": [[1, "2026-10-22T08:00:00Z"], ["n/a", "2026-10-22T09:00:00Z"]] },
+        "a": { "type": "VocabProperty", "vocabs": [["x", "2026-10-22T08:00:00Z"]] } }),
+    );
+    m.rebuild_history(&mut history, &Keep::default());
+    assert_eq!(
+        history["t"]["values"],
+        json!([[2.0, "2026-10-22T08:00:00Z"]])
+    );
+    assert_eq!(
+        history["v"]["vocabs"],
+        json!([["y", "2026-10-22T08:00:00Z"]])
+    );
+    let mut instances = answered(
+        &m,
+        &json!({ "id": "urn:x", "type": "jcSrcClass",
+        "s": [{ "type": "Property", "value": "n/a" }, { "type": "Property", "value": 3 }] }),
+    );
+    m.rebuild_history(&mut instances, &Keep::default());
+    assert_eq!(
+        instances["t"],
+        json!([{ "type": "Property", "value": 6.0 }])
+    );
+    let mut none_left = answered(
+        &m,
+        &json!({ "id": "urn:x", "type": "jcSrcClass",
+        "s": [{ "type": "Property", "value": "n/a" }],
+        "a": { "type": "VocabProperty", "vocabs": ["not a pair", ["x", "2026-10-22T08:00:00Z"]] } }),
+    );
+    m.rebuild_history(&mut none_left, &Keep::default());
+    assert_eq!(none_left.get("t"), None, "no instance left: no attribute");
+    assert_eq!(
+        none_left["v"]["vocabs"],
+        json!(["not a pair", ["y", "2026-10-22T08:00:00Z"]]),
+        "what is no pair passes as it is"
+    );
+}
+
+#[test]
+fn a_table_keyed_by_a_number_translates_the_same_number_stored_as_a_float() {
+    let m = slots(&json!([
+        { "target": "v", "source": "a", "kind": "valueMappings", "forward": { "1": "one", "true": "yes" }, "filterable": true }
+    ]));
+    for (stored, served) in [
+        (json!(1.0), json!("one")),
+        (json!(1), json!("one")),
+        (json!(true), json!("yes")),
+        (json!(2.0), json!(2.0)),
+    ] {
+        let e = rebuilt(
+            &m,
+            &json!({ "id": "urn:x", "type": "jcSrcClass", "a": stored }),
+        );
+        assert_eq!(e["v"], served, "{stored}");
+    }
+    assert_eq!(sent(&m, "v==\"one\""), Ok("a==1,\"one\"".to_owned()));
+}
+
+#[test]
+fn a_slot_whose_source_no_rule_shows_is_listed_as_hidden() {
+    let m = slots(&json!([
+        { "target": "t", "source": "s", "kind": "rename" },
+        { "target": "u", "source": "gone", "kind": "rename" },
+        { "target": "k", "kind": "constant", "value": 1 }
+    ]));
+    let shown = BTreeSet::from([antares_jsonld::core_context().expand_key("s")]);
+    assert_eq!(m.hidden_slots(&shown), vec!["u".to_owned()]);
+    assert_eq!(
+        m.hidden_slots(&BTreeSet::new()),
+        vec!["t".to_owned(), "u".to_owned()]
     );
 }

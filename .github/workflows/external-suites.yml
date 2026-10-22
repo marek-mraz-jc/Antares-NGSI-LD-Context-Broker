@@ -93,14 +93,14 @@ jobs:
     # Coraine's own CI image: the C toolchain corLibs builds corTest's tools
     # with, psql, socat, mosquitto (Coraine's .github/workflows/ci.yml)
     container:
-      image: quay.io/seamware/coraine-ci:2026-09-22-f5a4eb4
+      image: quay.io/seamware/coraine-ci:2026-09-22-f5a4eb4@sha256:dd16d7484b8a6132ff32a4479b4ba1f763a043a76e637560060f504d3773406c
     services:
       db:
         image: timescale/timescaledb-ha:pg17
         env:
           POSTGRES_PASSWORD: postgres
       context-server:
-        image: quay.io/seamware/coraine-ci:mirror-context-server-0.2.0
+        image: quay.io/seamware/coraine-ci:mirror-context-server-0.2.0@sha256:7bf0993751c4f69179b1d959de5f9976a0f8698bb7f041610e6a7e7337178d44
         env:
           MEMORY_ENABLED: "true"
     steps:

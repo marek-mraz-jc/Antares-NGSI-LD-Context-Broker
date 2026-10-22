@@ -80,6 +80,25 @@ const SOURCE_TERM: &str = "jcSrc";
 /// The generated term of the source class.
 const CLASS_TERM: &str = "jcSrcClass";
 
+/// The `GeoProperty` a geo-query filters when it names none (4.10).
+const LOCATION: &str = "location";
+
+/// The members a slot of each kind may carry (DM-52); any other member is
+/// refused, so a misspelt `ofset` is not read as an offset of 0. `inverse`
+/// is the compiler's: the preimage is computed from `forward`.
+const SLOT_MEMBERS: [&str; 4] = ["target", "source", "kind", "filterable"];
+
+fn kind_members(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "unitConversion" => &["factor", "offset"],
+        "valueMappings" => &["forward", "inverse"],
+        "cast" => &["range"],
+        "constant" => &["value"],
+        "expr" => &["expression"],
+        _ => &[],
+    }
+}
+
 /// The members of an Entity that belong to NGSI-LD rather than to a model.
 const STRUCTURAL: [&str; 3] = ["id", "@id", "scope"];
 
@@ -308,6 +327,23 @@ impl Mapping {
         (vec![self.target_class.clone()], slots)
     }
 
+    /// The slots a view showing the source Attributes `shown` (expanded
+    /// IRIs) never serves, because no rule shows what they read: after a
+    /// model change that renamed or removed a source Attribute, or a
+    /// Policy that hides it. Served, they would answer empty.
+    #[must_use]
+    pub fn hidden_slots(&self, shown: &BTreeSet<String>) -> Vec<String> {
+        let (_, served) = self.target_names(shown);
+        let mut hidden: Vec<String> = self
+            .slots
+            .iter()
+            .map(|s| s.term.clone())
+            .filter(|t| !served.contains(t))
+            .collect();
+        hidden.sort();
+        hidden
+    }
+
     /// Read and compile one IR document. Names are expanded through `ctx`
     /// (the view's `@context` over the core); `served` is the view's own
     /// `@context`, which the rebuilt answer carries (the core when `None`).
@@ -456,6 +492,15 @@ impl Mapping {
                 _ => return Err(NOT_SERVED),
             };
             out.pairs.push((name.clone(), rewritten));
+        }
+        // 4.10: a geo-query without `geoproperty` filters `location`, the
+        // target model's, so it is inverted like a named one
+        if seen.contains("georel")
+            && !seen.contains("geoproperty")
+            && !seen.contains("geometryProperty")
+        {
+            let source = self.geo_property(LOCATION).map_err(|_| NOT_FILTERABLE)?;
+            out.pairs.push(("geoproperty".into(), source));
         }
         Ok(out)
     }
@@ -649,17 +694,25 @@ impl Mapping {
     /// Retrieve Attribute Value's answer in the target model: the
     /// Attribute, or its bare value, through the slot's derivation, with
     /// the view's `@context` in place of the inner one.
-    pub fn rebuild_attribute(&self, slot: usize, body: &mut Value) {
-        let Some(s) = self.slots.get(slot) else {
-            return;
+    ///
+    /// `false` when the slot's derivation cannot translate the value: the
+    /// view answers as for an absent Attribute.
+    #[must_use]
+    pub fn rebuild_attribute(&self, slot: usize, body: &mut Value) -> bool {
+        let Some(mut rebuilt) = self
+            .slots
+            .get(slot)
+            .and_then(|s| forward(&s.derivation, body))
+        else {
+            return false;
         };
-        let mut rebuilt = forward(&s.derivation, body);
         if let Some(m) = rebuilt.as_object_mut() {
             if m.contains_key("@context") {
                 m.insert("@context".into(), self.served.clone());
             }
         }
         *body = rebuilt;
+        true
     }
 
     /// A refusal's text with every generated term in it replaced by the
@@ -741,7 +794,7 @@ impl Mapping {
                     .source
                     .as_ref()
                     .and_then(|s| members.get(&s.key))
-                    .map(|a| forward(d, a)),
+                    .and_then(|a| forward(d, a)),
             };
             if let Some(v) = value {
                 out.insert(slot.term.clone(), v);
@@ -1255,59 +1308,114 @@ fn rounded(v: f64) -> f64 {
     }
 }
 
-/// The target value one source attribute becomes.
-fn forward(d: &Derivation, attribute: &Value) -> Value {
+/// The target value one source attribute becomes; `None` when the
+/// derivation cannot translate it (a language map, a JSON value, a
+/// unit conversion of a value that is not a number): a view serves no
+/// source value under a translated name.
+fn forward(d: &Derivation, attribute: &Value) -> Option<Value> {
     match d {
-        Derivation::Rename | Derivation::Constant(_) | Derivation::Expr(_) => attribute.clone(),
+        Derivation::Rename | Derivation::Constant(_) | Derivation::Expr(_) => {
+            Some(attribute.clone())
+        }
         Derivation::UnitConversion { factor, offset } => {
-            map_value(attribute, &|v| match v.as_f64() {
-                Some(n) => finite(n * factor + offset).unwrap_or_else(|| v.clone()),
-                None => v.clone(),
+            map_value(attribute, &|v| match v {
+                // a number past the JSON range keeps its value
+                Value::Number(_) => Some(
+                    v.as_f64()
+                        .and_then(|n| finite(n * factor + offset))
+                        .unwrap_or_else(|| v.clone()),
+                ),
+                // a geometry or a structured value: no scalar to convert
+                Value::Object(_) | Value::Null => Some(v.clone()),
+                // a text or a boolean is no quantity in either unit
+                _ => None,
             })
         }
-        Derivation::ValueMappings(table) => {
-            map_value(attribute, &|v| table.get(&plain(v)).unwrap_or(v).clone())
-        }
-        Derivation::Cast(c) => map_value(attribute, &|v| cast_value(*c, v)),
+        Derivation::ValueMappings(table) => map_value(attribute, &|v| {
+            Some(table_value(table, v).unwrap_or(v).clone())
+        }),
+        Derivation::Cast(c) => map_value(attribute, &|v| Some(cast_value(*c, v))),
     }
 }
 
-/// `transform` on an attribute's value in any representation: normalized
-/// (`value` or `object`), concise, simplified, and each instance of a
-/// multi-attribute.
-fn map_value(attribute: &Value, transform: &dyn Fn(&Value) -> Value) -> Value {
+/// The forward value of `v`: keyed by its text, or, for a number, by any
+/// key holding the same number (`1.0` and `1`).
+fn table_value<'a>(table: &'a BTreeMap<String, Value>, v: &Value) -> Option<&'a Value> {
+    table.get(&plain(v)).or_else(|| {
+        let n = v.as_f64()?;
+        table
+            .iter()
+            .find(|(k, _)| matches!(source_value(k), QValue::Num(m) if m.to_bits() == n.to_bits()))
+            .map(|(_, out)| out)
+    })
+}
+
+/// The members holding an attribute's value (4.5, 4.5.9 for
+/// `temporalValues`), per kind: those the derivation translates, and
+/// those it cannot.
+const VALUE_MEMBERS: [&str; 5] = ["value", "object", "vocab", "valueList", "objectList"];
+const TEMPORAL_MEMBERS: [&str; 5] = ["values", "objects", "vocabs", "valueLists", "objectLists"];
+const OPAQUE_MEMBERS: [&str; 4] = ["languageMap", "json", "languageMaps", "jsons"];
+
+/// `transform` on a value, or on each element of a list.
+fn each(v: &Value, transform: &dyn Fn(&Value) -> Option<Value>) -> Option<Value> {
+    match v {
+        // an `objectList` holds `{"object": …}` members
+        Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                if item.is_object() {
+                    map_value(item, transform)
+                } else {
+                    transform(item)
+                }
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
+        v => transform(v),
+    }
+}
+
+/// `transform` on an attribute's value in any representation and kind:
+/// normalized, concise, simplified, each instance of a multi-attribute,
+/// and the elements of a list. `None` drops what cannot be translated: a
+/// language map or a JSON value, or an instance `transform` refuses.
+fn map_value(attribute: &Value, transform: &dyn Fn(&Value) -> Option<Value>) -> Option<Value> {
     match attribute {
         Value::Array(instances) if instances.iter().all(Value::is_object) => {
-            Value::Array(instances.iter().map(|i| map_value(i, transform)).collect())
+            let kept: Vec<Value> = instances
+                .iter()
+                .filter_map(|i| map_value(i, transform))
+                .collect();
+            (!kept.is_empty() || instances.is_empty()).then_some(Value::Array(kept))
         }
-        Value::Object(m) => match ["value", "object"]
-            .into_iter()
-            .find_map(|k| m.get(k).map(|v| (k, v)))
-        {
-            Some((key, v)) => {
-                let mut out = m.clone();
-                out.insert(key.to_owned(), transform(v));
-                Value::Object(out)
+        Value::Object(m) => {
+            if OPAQUE_MEMBERS.iter().any(|k| m.contains_key(*k)) {
+                return None;
             }
-            // `temporalValues` (4.5.9): `[value, time]` pairs
-            None if ["values", "objects"].iter().any(|k| m.contains_key(*k)) => {
-                let mut out = m.clone();
-                for key in ["values", "objects"] {
-                    if let Some(Value::Array(pairs)) = out.get_mut(key) {
-                        for pair in pairs {
-                            if let Some(v) = pair.get_mut(0) {
-                                *v = transform(v);
-                            }
-                        }
-                    }
+            let mut out = m.clone();
+            if let Some(key) = VALUE_MEMBERS.into_iter().find(|k| m.contains_key(*k)) {
+                let v = m.get(key)?;
+                out.insert(key.to_owned(), each(v, transform)?);
+                return Some(Value::Object(out));
+            }
+            // `temporalValues` (4.5.9): `[value, time]` pairs; a pair whose
+            // value is not translated is left out
+            for key in TEMPORAL_MEMBERS {
+                if let Some(Value::Array(pairs)) = out.get_mut(key) {
+                    pairs.retain_mut(|pair| {
+                        let Some(v) = pair.get_mut(0) else {
+                            return true;
+                        };
+                        each(v, transform).map(|t| *v = t).is_some()
+                    });
                 }
-                Value::Object(out)
             }
-            // a geometry or a language map in the simplified form: no
-            // scalar to translate
-            None => attribute.clone(),
-        },
-        scalar => transform(scalar),
+            // a geometry in the simplified form: no scalar to translate
+            Some(Value::Object(out))
+        }
+        // a simplified ListProperty is the array of its values
+        list => each(list, transform),
     }
 }
 
@@ -1490,6 +1598,12 @@ fn slot(index: usize, entry: &Value, iri: Expand<'_>) -> Result<RawSlot, String>
         )?),
         other => return Err(at(&format!("kind {other:?} is not one this broker runs"))),
     };
+    if let Some(member) = m
+        .keys()
+        .find(|k| !SLOT_MEMBERS.contains(&k.as_str()) && !kind_members(kind).contains(&k.as_str()))
+    {
+        return Err(at(&format!("a {kind} slot has no member {member:?}")));
+    }
     if source.is_none() && !matches!(derivation, Derivation::Constant(_) | Derivation::Expr(_)) {
         return Err(at("names no source"));
     }

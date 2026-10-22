@@ -32,7 +32,7 @@ use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Weak};
 
 mod preview;
@@ -326,6 +326,7 @@ impl View {
             context: self.context.clone().map(Arc::new),
             representations: self.representations.clone().map(Arc::new),
         };
+        loaded.notes.extend(hidden_slots_note(&loaded));
         if self.q.is_some()
             && loaded
                 .operations
@@ -342,6 +343,29 @@ impl View {
         }
         Ok(loaded)
     }
+}
+
+/// The note of a mapped view whose rules hide what some slots read: such a
+/// slot is never served (T-5210).
+fn hidden_slots_note(loaded: &Loaded) -> Option<String> {
+    let mapping = loaded.mapping.as_deref()?;
+    let shown: BTreeSet<String> = loaded
+        .view
+        .narrowing()
+        .rules
+        .iter()
+        .filter(|rule| rule.types.iter().any(|t| t == mapping.source_class()))
+        .flat_map(|rule| rule.attributes.iter().cloned())
+        .collect();
+    let hidden = mapping.hidden_slots(&shown);
+    (!hidden.is_empty()).then(|| {
+        format!(
+            "the mapping serves {} from source Attributes no rule of the view shows: they are \
+             never served (a source Attribute renamed or removed in the model, or hidden by a \
+             Policy)",
+            hidden.join(", ")
+        )
+    })
 }
 
 /// Section 3 and 7: the IR compiles, the view selects its source class
@@ -1372,6 +1396,24 @@ mod tests {
         let mut v = mapped();
         v["mapping"]["version"] = json!(1);
         assert!(load(&v).err().unwrap_or_default().contains("version 1"));
+    }
+
+    #[test]
+    fn a_slot_whose_source_the_rules_do_not_show_is_noted_and_not_served() {
+        assert!(load(&mapped()).is_ok_and(|l| l.notes.is_empty()));
+        // the model renamed `speed`: the rules show the new name only
+        let mut v = mapped();
+        v["rules"] = json!([{"types": ["Car"], "attributes": ["velocityKmh"]}]);
+        let loaded = load(&v).expect("a hidden slot does not refuse the view");
+        assert_eq!(loaded.notes.len(), 1, "{:?}", loaded.notes);
+        assert!(
+            loaded
+                .notes
+                .iter()
+                .any(|n| n.contains("serves velocity from")),
+            "{:?}",
+            loaded.notes
+        );
     }
 
     #[test]

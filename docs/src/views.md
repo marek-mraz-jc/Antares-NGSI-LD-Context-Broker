@@ -31,7 +31,8 @@ Tenant:
 | 10.5.2 to 10.5.6 | Create, Update, Retrieve, Query and Delete Subscription |
 
 A view serves an operation only when its `operations` list names it.
-Purge and the temporal writes are not served through a view. A Batch
+Purge and the temporal writes are not served through a view. A view of
+another model serves the reads only (section 5a). A Batch
 Upsert member that exists out of the view is never overwritten: it takes
 the create half and answers 409, as a create of a taken id does.
 
@@ -159,6 +160,70 @@ them under its own limits, and parses again only when the revision changes. A vi
 document carries no schema of its own: one with a `linkml` member is
 refused with `400` like any unknown member, so the Tenant's schema is the
 one source (T-3658).
+
+## 5a. A view of another model
+
+A view may serve its Entities in another data model than the one the
+Tenant stores, through a `mapping` member: the mapping IR (version 2) that
+Model Tools compiles from a Mapping (DM-52). Example: the Tenant stores
+`MestskySenzor` with `teplota` in kelvin, and the view serves
+`AirQualityObserved` with `temperature` in degrees Celsius. The design,
+with every inversion rule, is [the mapping note](../analysis/view-mapping.md).
+
+```json
+{
+  "id": "air", "tenant": "city", "selector": ["MestskySenzor"],
+  "rules": [{"types": ["MestskySenzor"], "attributes": ["teplota", "location"]}],
+  "operations": ["query_entities", "retrieve_entity"],
+  "mapping": {"version": 2, "sourceClass": "MestskySenzor", "targetClass": "AirQualityObserved",
+    "slots": [
+      {"target": "temperature", "source": "teplota", "kind": "unitConversion",
+       "factor": 1, "offset": -273.15, "filterable": true},
+      {"target": "location", "source": "location", "kind": "rename", "filterable": true}]}
+}
+```
+
+What changes for a client:
+
+- The request is written in the target model: `type`, `attrs`, `q`,
+  `orderBy`, `pick`, `omit` and `geoproperty` name target Attributes; the
+  broker inverts them into the source model and rebuilds the answer.
+- A geo-query without `geoproperty` filters the target model's `location`
+  (4.10), read from the slot that serves it. When no filterable renamed slot
+  serves `location`, the geo-query is refused.
+- Only reads: Retrieve and Query Entities, Retrieve Attribute Value,
+  discovery (10.6.3 to 10.6.8) and the two temporal reads. A write or a
+  subscription operation in `operations` is refused when the view loads.
+- The selector is the mapping's `sourceClass` and nothing else.
+- Each attribute kind is translated per element: `value`, `object`,
+  `vocab`, and each element of `valueList` and `objectList`. A
+  `languageMap` or `json` value has no unit or value table: a slot that
+  converts or translates it serves nothing for that Entity, and Retrieve
+  Attribute Value answers `404`. A `rename` serves every kind.
+- A `unitConversion` of a value that is not a number serves nothing; a
+  `valueMappings` table keyed `"1"` also translates a stored `1.0`.
+- A slot whose source Attribute no rule of the view shows is never served,
+  and the loader says so in the view's `notes` (`/q/health`, `/q/views`):
+  this is what a model change that renames or removes a source Attribute
+  looks like. The mapping never widens what the rules show.
+- A slot member the IR does not define for its kind (a misspelt `ofset`)
+  refuses the view with the slot's index.
+
+A mapped view answers `400` for:
+
+| Detail | When |
+|---|---|
+| the request names an attribute the model this view serves does not define | a target name the mapping lacks |
+| the request filters on an attribute this view computes or translates without an inverse | `q`, `orderBy` or `geoproperty` on such a slot, or a geo-query with no filterable `location` |
+| the request uses a parameter a mapped view does not serve | `lang`, `join`, `datasetId`, `aggregatedValues` and every parameter not in the note's table |
+| the request names a parameter twice | any parameter twice |
+| a mapped view names its attributes by its own @context; send no Link header | a `Link` header |
+| a mapped view answers JSON and JSON-LD, not GeoJSON | `Accept: application/geo+json` |
+| a mapped view filters and orders on whole attributes of its own class only | a member path on a translated slot, any member path in `orderBy` |
+
+OData, OGC API, the WebSocket, GeoJSON and iCalendar surfaces do not serve a
+mapped view: to them its id is unknown (`404`). The cross-view read of
+section 6 includes it.
 
 ## 6. One read across views
 

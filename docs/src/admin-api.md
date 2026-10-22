@@ -302,6 +302,13 @@ No member has a default that serves more: an empty selector, rule list or
 operation list is refused. Bounds: 64 KiB per document, 64 rules, 256 names
 per list, 4096 bytes per `q` or `scopeQ`.
 
+A view of another model also carries `mapping`, the version 2 mapping IR
+([views](views.md#5a-a-view-of-another-model)). The loader refuses an IR of
+another version, a slot member its kind does not define, a selector other
+than the IR's `sourceClass`, and any operation that is not a read. It loads
+the view with a note for each slot whose source Attribute no rule shows:
+such a slot is never served.
+
 ### GET /q/views
 
 The table, as `/q/health` lists it.

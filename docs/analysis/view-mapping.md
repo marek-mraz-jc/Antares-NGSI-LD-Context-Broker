@@ -14,7 +14,9 @@ Decisions:
 - **Read only (S20), refused at load.** A view with a `mapping` whose `operations` name a write, a subscription, or anything outside the reads of section 4.1 is not loaded (section 7).
 - **Tasks:** T-3669 (the interpreter and the entity reads), T-3670 (temporal reads and discovery through a mapped view), T-3671 (the Portal writes the IR into the view and the Endpoint leaves the gateway), T-3672 (defects of the gateway's string rewrite, section 2.6).
 
-## 2. What the gateway does today
+## 2. What the gateway did before T-4547 (historical)
+
+Historical: this section describes the gateway path that T-4547 retired. The gateway's `view_mapping.rs` now only checks the IR version; its line cites below are to code that no longer exists.
 
 ### 2.1 The IR
 
@@ -24,7 +26,7 @@ Decisions:
 |---|---|---|
 | `rename` | the source attribute as is | the name |
 | `unitConversion` | `value * factor + offset` | `(value - offset) / factor` (`:561-582`) |
-| `valueMappings` | a `forward` table; values outside it pass unchanged (`:596-601`) | a precomputed `inverse` table (`:73-78`) |
+| `valueMappings` | a `forward` table; values outside it pass unchanged (`:596-601`) | the preimage under `forward`; the IR's `inverse` table is the compiler's and the broker does not read it |
 | `cast` | Python `int()`, `float()` or `str()` of the value (`:323-331`) | none in the interpreter; the value passes as written (`:580`) |
 | `constant` | a fixed value | none |
 | `expr` | a typed expression tree over the entity's attributes (`:93-128`, evaluated `:193`) | none |
@@ -69,7 +71,7 @@ Each row is a reading of the code above, filed as T-3672 for as long as the gate
 
 ## 3. The Mapping IR in a view
 
-`View` (`crates/antares-ops/src/views.rs:78-101`, `deny_unknown_fields`) gains `mapping: Option<Value>`. At load, `View::load` parses it into the IR types of section 2.1, in a new module `antares-ops/src/mapping.rs`, and refuses the view when:
+`View` (`crates/antares-ops/src/views.rs`, struct `View`, `deny_unknown_fields`) gains `mapping: Option<Value>`. At load, `View::load` parses it into the IR types of section 2.1, in a new module `antares-ops/src/mapping.rs`, and refuses the view when:
 
 - the version is not 2, a slot is malformed or names an unknown kind (the gateway's own refusals, `view_mapping.rs:724-795`);
 - `sourceClass` is not one of the view's `selector` types: the view would select Entities the mapping does not describe;
@@ -82,7 +84,7 @@ Names in the IR are written as the Mapping's compiler wrote them. The writer (T-
 
 ### 4.1 Parameters
 
-The view root (`antares-views`, `serve`, `crates/antares-views/src/lib.rs:121-153`) rewrites the query string before it builds the `OpsRequest`, for the reads a mapped view serves: Retrieve Entity, Query Entities (GET), Retrieve Attribute Value and, since T-3670, Retrieve and Query Temporal Evolution (GET); discovery is section 5.1. Of `negotiate::QUERY_PARAMS` (`crates/antares-api/src/negotiate.rs:947-982`), the ones that name attributes or types:
+The view root (`antares-views`, `serve` in `crates/antares-views/src/lib.rs`) rewrites the query string before it builds the `OpsRequest`, for the reads a mapped view serves: Retrieve Entity, Query Entities (GET), Retrieve Attribute Value and, since T-3670, Retrieve and Query Temporal Evolution (GET); discovery is section 5.1. Of `negotiate::QUERY_PARAMS` (`crates/antares-api/src/negotiate.rs`), the ones that name attributes or types:
 
 | parameter | rewrite |
 |---|---|
@@ -100,7 +102,7 @@ A path segment that names an Attribute (`/entities/{id}/attrs/{attr}/value`) is 
 
 ### 4.2 Terms
 
-`parse_q` gives a `QNode` (`crates/antares-ql/src/lib.rs:78-99`): `And`, `Or`, `Cmp { path, op, value }` and `Exists { path, negated }`. The rewrite walks it and maps each leaf. A leaf names its slot by the path's first segment; a compound member path (`a.b`, `a[b]`) keeps its tail after the renamed first segment. A path with a linked-entity hop (`attr{...}`) is 400: the IR maps one class, and the Entity the hop reaches is of another. The result is rendered with `QNode`'s `Display`, whose round trip `parse_q(&node.to_string()) == node` holds (`crates/antares-ql/src/render.rs:1-12`).
+`parse_q` gives a `QNode` (`crates/antares-ql/src/lib.rs`, enum `QNode`): `And`, `Or`, `Cmp { path, op, value }` and `Exists { path, negated }`. The rewrite walks it and maps each leaf. A leaf names its slot by the path's first segment. A compound member path (`a.b`, `a[b]`) keeps its tail after the renamed first segment on a `rename` slot only; on any other kind it is 400 (`DEEP_PATH`), and `orderBy` refuses every member path, `rename` included. A path with a linked-entity hop (`attr{...}`) is 400: the IR maps one class, and the Entity the hop reaches is of another. The result is rendered with `QNode`'s `Display`, whose round trip `parse_q(&node.to_string()) == node` holds (`crates/antares-ql/src/render.rs:1-12`).
 
 | slot kind | `Exists` | `==`, `!=` (value or list) | `<`, `<=`, `>`, `>=` | `~=` |
 |---|---|---|---|---|
@@ -116,7 +118,7 @@ Every cell that maps also requires the slot to be `filterable`; the compiler's v
 
 The view root rebuilds the answer after `view.run` returns, so after the view and the engine have narrowed it (section 6). The rebuild is `translate_entity` (section 2.3), ported, on every Entity of the body in each representation the read can produce: normalized, concise and simplified (`options=keyValues`). Members the mapping does not derive are dropped. A value outside a `valueMappings` table passes unchanged, as in the gateway, so that the inverse rule of section 4.2 stays true. `NGSILD-Results-Count` stays as the store answered: the mapping changes the shape of each Entity, not which Entities are served.
 
-Headers that name the API root are rebased as they are today (`antares-views/src/lib.rs:206-249`).
+Headers that name the API root are rebased as they are today (`rebase` in `antares-views/src/lib.rs`).
 
 A temporal answer (11.3.2, 11.3.3) is rebuilt instance by instance (`Mapping::rebuild_history`): each instance of a `rename`, `unitConversion`, `valueMappings` or `cast` slot in the normalized form, and each `[value, time]` pair of the `temporalValues` form (4.5.9). A `constant` or `expr` slot has no history and is left out: a constant never changed, and an expression would read instances of several source Attributes that do not share their times. Decided (worker-2, owner may override): left out, because inventing a history for a value nobody stored would be data the store does not hold; options were an instance per source instance with the expression evaluated over the latest value of the others, or one instance at the Entity's `createdAt`.
 
@@ -141,7 +143,7 @@ Two consequences, both inside that bound:
 
 ## 7. Read only (S20)
 
-The broker refuses at load what the gateway refuses per request (section 2.5): a view with a `mapping` may list only `retrieve_entity`, `query_entities`, `retrieve_attribute_value`, the temporal reads `temporal_retrieve` and `temporal_query`, and the six discovery reads (`mapping::READS`, T-3670). A write, a subscription, a batch, the `POST` queries (`query_entities_post`, `temporal_query_post`) whose body would need its own inversion, an Entity Map and a Context Source operation are not loadable. Requests for them reach `refusal` (`antares-views/src/lib.rs:179-204`), which answers 405 with the `Allow` the view serves, the answer S20 asks for. A write through the source model with the view's grant (map S20, last column) cannot happen: the view does not offer it, and the root's own routes are not the view's.
+The broker refuses at load what the gateway refuses per request (section 2.5): a view with a `mapping` may list only `retrieve_entity`, `query_entities`, `retrieve_attribute_value`, the temporal reads `temporal_retrieve` and `temporal_query`, and the six discovery reads (`mapping::READS`, T-3670). A write, a subscription, a batch, the `POST` queries (`query_entities_post`, `temporal_query_post`) whose body would need its own inversion, an Entity Map and a Context Source operation are not loadable. Requests for them reach `refusal` (`refusal` in `antares-views/src/lib.rs`), which answers 405 with the `Allow` the view serves, the answer S20 asks for. A write through the source model with the view's grant (map S20, last column) cannot happen: the view does not offer it, and the root's own routes are not the view's.
 
 ## 8. Tasks
 
@@ -156,7 +158,7 @@ T-3669, T-3670 and T-3671 go into T-3446's and T-3644's `depends-on:`.
 
 ## 9. As built (T-3669)
 
-T-3669 implements sections 3 to 7 in `crates/antares-ops/src/mapping.rs` and `crates/antares-views/src/mapped.rs`. It decides the following beyond the text above, or against it.
+T-3669 implements sections 3 to 7 in `crates/antares-ops/src/mapping.rs` and `crates/antares-ops/src/mapped.rs`. It decides the following beyond the text above, or against it.
 
 - **Names.** IR names are expanded through the view's `@context` over the core at load, and the target model's terms are the view's own. A request to a mapped view that sends a `Link` header is 400.
 - **The inner request.** The inner request runs under an inline `@context` (`OpsRequest::context`) of generated terms (`jcSrc0`, …, `jcSrcClass`), one per source IRI. A `q` name is a 7.2.3.2 name, so no IRI can appear in it. The rebuild reads each source Attribute under the key the broker compacts it to under that context.
@@ -174,3 +176,14 @@ T-3669 implements sections 3 to 7 in `crates/antares-ops/src/mapping.rs` and `cr
   - `mapping/tests.rs` holds the gateway's cases, ported, and every cell of 4.2.
   - `views_mapped.rs` runs the root end to end.
   - `views_mapped_props.rs` is the section 6 property: a mapped view serves no id, value or Attribute the same view without its mapping does not.
+
+## 10. Since T-5210
+
+Found by the mapping validation of 2026-10-22 (`evidence/supervisor-2026-10-22-mapping-validation/coraine-views.md`, B9 to B18).
+
+- **Default geo-query (B9).** A geo-query (`georel`) without `geoproperty` filters the target model's `location` (4.10): `Mapping::invert` adds the `geoproperty` of the filterable `rename` slot that serves `location`, and refuses the request with `NOT_FILTERABLE` when there is none. Before, the inner request filtered the source model's `location`.
+- **Attribute kinds (B10).** The rebuild translates `value`, `object`, `vocab` and each element of `valueList` and `objectList`, in the normalized, concise and simplified forms and in `temporalValues` (`values`, `objects`, `vocabs`, `valueLists`, `objectLists`). A `languageMap` or `json` value under a `unitConversion`, `valueMappings` or `cast` slot is not served: the IR does not say how to translate it. A `rename` serves every kind.
+- **Hidden slots (B11).** The loader notes each slot whose source Attribute no rule of the view shows (`Mapping::hidden_slots`); such a slot was and is never served. Decided (worker-t5210, owner may override): a note, not a refusal, because the Portal writes the rules from the Policies, and a Policy that hides one source Attribute must not take the whole view down; the check never widens a view. The check against the Tenant's stored LinkML schema is not in the broker: `antares-ops` may not depend on `linkml-model` (module rule M2), so it belongs to the Portal reconciler, which holds the model and writes both documents.
+- **Unknown members (B12).** Each slot kind has an allowlist of members (`target`, `source`, `kind`, `filterable`, and `factor`, `offset`; `forward`, `inverse`; `range`; `value`; `expression`). Any other member refuses the view with the slot's index.
+- **Scalars (B13).** A `unitConversion` serves nothing for a text or boolean source value; a number past the JSON range keeps its value, and an object (a geometry) passes. A `valueMappings` table keyed by a number also matches the same number stored as a float (`"1"` and `1.0`).
+- **IR version (B14).** The broker runs version 2 exactly and refuses any other at load. Rule for v2: a new member is a new IR version, since the broker refuses unknown members.

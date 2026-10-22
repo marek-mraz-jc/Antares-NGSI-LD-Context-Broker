@@ -25,6 +25,19 @@ Every case that fails or errors in the Coraine reference cell (vanilla binary, f
 | harness | 18 |
 | total | 335 |
 
+### 2.1 Follow-up of the "Antares bug" cases
+
+Since T-5210 (2026-10-22) each of the 45 cases has a task: `T-5213` (parked in `tasks/later/`), one group per cause.
+Re-run on the current Coraine ref before fixing: this table is the run of 74b72185, and later commits may have fixed a case.
+
+| group | cases | task |
+|---|---:|---|
+| A output form: array reduction, concise multi-instance, Link vs inline `@context` | 9 | T-5213 A |
+| B distributed operations: every `csource-reg-distops-*`, `distop_*`, `entity_*_local_reg_conflict`, `entity_batch_upsert_distops_*`, `linked_entities_objecttype_*`, `troe_timescale_temporal_distop_*` | 19 | T-5213 B |
+| C temporal history: `troe_entity_modifiedat_attr_update` and the other `troe_timescale_*` | 6 | T-5213 C |
+| D input validation: `context_embedded`, `duplicate_id_type_alias_every_level`, `entity_patch_geoproperty_validation`, `expanded_core_terms_input`, `jsonld_json_typed_is_verbatim`, `patch_entity_url_params`, `post_query_errors`, `simplified_input_matrix`, `value_type_subattr` | 9 | T-5213 D |
+| E tenants and subscriptions: `tenant_implicit_create`, `subscription_periodic_other_tenant` | 2 | T-5213 E |
+
 ## 3. Cases
 
 Rows with the same cause and clause share one line; the cases are in alphabetical order.
