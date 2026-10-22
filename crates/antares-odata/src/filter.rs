@@ -1484,6 +1484,7 @@ mod tests {
         };
         let value = |edm, collection| Shape::Value { edm, collection };
         Set {
+            output: None,
             type_iri: "https://e.org/Car".into(),
             identifier: None,
             references: BTreeMap::new(),

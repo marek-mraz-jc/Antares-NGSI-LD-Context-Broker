@@ -7,7 +7,7 @@
 use crate::edm::{Member, Set, Shape};
 use crate::filter::Translated;
 use crate::read::{
-    default_instance, encode, entity_value, key_id, key_segment, member_value, not_found,
+    admitted, default_instance, encode, entity_value, key_segment, member_value, not_found,
     not_implemented, objects, query, resource, run, selected, set_of, Reads, MAX_PAGE,
 };
 use antares_ops::{core_name, Caller, OperationId};
@@ -40,7 +40,7 @@ pub(crate) async fn property(
         .members
         .get(name)
         .ok_or_else(|| not_implemented(version))?;
-    let id = key_id(set, key, options).ok_or_else(|| not_found(version))?;
+    let id = admitted(reads, caller, set, key, options, version).await?;
     let target = format!(
         "/ngsi-ld/v1/entities/{}/attrs/{}",
         encode(&id),
@@ -96,7 +96,7 @@ pub(crate) async fn reference(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
-    let id = key_id(set, key, options).ok_or_else(|| not_found(version))?;
+    let id = admitted(reads, caller, set, key, options, version).await?;
     let target = format!(
         "/ngsi-ld/v1/entities/{}?type={}",
         encode(&id),
@@ -140,7 +140,7 @@ pub(crate) async fn related(
     let set = set_of(reads, set_name, version)?;
     let (iri, target, collection) = nav_of(set, nav);
     let target_set = set_of(reads, target, version)?;
-    let id = key_id(set, key, options).ok_or_else(|| not_found(version))?;
+    let id = admitted(reads, caller, set, key, options, version).await?;
     let none = Translated::default();
     // The whole source: with `attrs` naming only the Relationship, an
     // Entity without it would answer 404 like an absent one.
@@ -306,6 +306,7 @@ mod tests {
             written: crate::edm::Written::Always,
         };
         let set = Set {
+            output: None,
             type_iri: "https://e.org/T".into(),
             identifier: None,
             references: std::collections::BTreeMap::new(),

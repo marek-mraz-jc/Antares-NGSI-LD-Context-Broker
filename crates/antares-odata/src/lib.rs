@@ -251,7 +251,9 @@ async fn query_in_body(req: Request, max: usize) -> Result<Request, ODataErrorRe
 /// The key is compared whole, so two views never share a model by a
 /// collision. ponytail: no engine probe bits yet; section 4's Capabilities
 /// add them to the key when the model reads the engine.
-type ModelKey = (String, edm::Shown, edm::Writable, u64, bool);
+/// The view, what it shows, its writes, the schema revision, CSDL 4.01, and its
+/// `representations.odata` as written.
+type ModelKey = (String, edm::Shown, edm::Writable, u64, bool, String);
 
 /// A built model, its CSDL document and that document's `ETag`.
 type Built = (Arc<edm::Edm>, Arc<odata_csdl::Model>, Option<String>);
@@ -278,6 +280,9 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
         writable,
         revision,
         version == CsdlVersion::V4_01,
+        view.representation("odata")
+            .map(ToString::to_string)
+            .unwrap_or_default(),
     );
     if let Some((hit, _)) = CACHE.get(&key) {
         return Some(hit);
@@ -294,6 +299,11 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
         &viewed
     };
     let edm = edm::build(id, schema, every.as_ref().unwrap_or(&key.1), key.2, version).ok()?;
+    let listed: Vec<_> = antares_ops::outputs::listed(view.representation("odata"), "odata")
+        .into_iter()
+        .filter_map(|(_, o)| o.ok())
+        .collect();
+    let edm = edm::outputs(edm, &listed);
     tracing::debug!(
         view = id,
         schema_revision = revision,

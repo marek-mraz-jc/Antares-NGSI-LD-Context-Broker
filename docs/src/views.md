@@ -42,7 +42,8 @@ Tenant still apply. `*` anywhere else is refused when the view loads.
 
 A view may carry `representations`, an object keyed by a format: `ical`
 ([iCalendar](ical.md)), `feed` (Atom, RSS and JSON Feed), `ogc`
-([OGC API - Features](ogc.md)), `geojson` and `csv` ([GeoJSON](geojson.md)).
+([OGC API - Features](ogc.md)), `geojson` and `csv` ([GeoJSON](geojson.md)),
+`sta` ([SensorThings](sta.md)) and `odata` ([OData](odata.md)).
 Each member is a list of named outputs (docs API/11 EP-159, T-5216): `name`,
 `title` and `description` per language, `version`, `sources` (model classes
 with their role `mapping`), a `filter` (`q`, `scopeQ`, `georel`, `geometry`,

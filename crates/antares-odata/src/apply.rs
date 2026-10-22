@@ -72,7 +72,7 @@ pub(crate) async fn collection(
     for member in set.members.values() {
         mint(&mut t.context, &member.iri);
     }
-    ngsild(&reads.view, options, &mut t, version)?;
+    ngsild(&reads.view, options, &mut t, set, version)?;
     let program = whole(&t, now()).map_err(|refused| refusal(refused, version))?;
     let pushdown = pushdown(set, None, &[], &mut t);
     let cx = Cx {
@@ -711,6 +711,7 @@ fn row_iri(name: &str) -> String {
 /// The rows' names as the members of a set, each a single value of its Edm type.
 fn row_set(names: &[(String, &'static str)]) -> Set {
     Set {
+        output: None,
         type_iri: row_iri("Row"),
         members: names
             .iter()

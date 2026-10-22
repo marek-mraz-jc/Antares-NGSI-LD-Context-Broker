@@ -448,26 +448,6 @@ mod tests {
                 "ogc",
                 "geo-query is the caller's",
             ),
-            (
-                json!({"name": "a", "filter": {"georel": "near;maxDistance==1"}, "sources": [{"type": "E"}]}),
-                "odata",
-                "geo-query is the caller's",
-            ),
-            (
-                json!({"name": "a", "sources": [{"type": "E"}, {"type": "F"}]}),
-                "odata",
-                "1 to 1",
-            ),
-            (
-                source(json!({"type": "E", "mapping": {"properties": "x"}})),
-                "odata",
-                "none of",
-            ),
-            (
-                source(json!({"type": "E", "mapping": {"geometry": "x"}})),
-                "sta",
-                "none of",
-            ),
             (json!({"name": "a", "sources": []}), "geojson", "1 to 10"),
             (
                 json!({"name": "a", "sources": [{"type": "E"}, {"type": "F"}]}),
@@ -511,14 +491,6 @@ mod tests {
             let hit = checked(&output, format).err().map(|e| e.contains(why));
             assert_eq!(hit, Some(true), "{output} {format} {why}");
         }
-        let sta = json!({"name": "air", "filter": {"georel": "near;maxDistance==1", "geometry": "Point",
-            "coordinates": "[17,48]"}, "sources": [{"type": "A", "mapping": {"datastreams": ["pm10"]}},
-            {"type": "B"}]});
-        let o = checked(&sta, "sta").expect("an sta output holds a geo-query and several sources");
-        assert_eq!(
-            o.sources.first().map(|s| s.role("datastreams")),
-            Some(vec!["pm10"])
-        );
         for nothing in [
             json!([{"title": {}}, {"name": 1}, "x"]),
             json!({"name": "a"}),
@@ -526,6 +498,47 @@ mod tests {
             assert_eq!(listed(Some(&nothing), "ogc").len(), 0, "{nothing}");
         }
         assert_eq!(listed(None, "ogc").len(), 0);
+    }
+
+    #[test]
+    fn an_sta_output_maps_its_datastreams_and_an_odata_one_reads_one_class() {
+        let source = |s: Value| json!({"name": "a", "sources": [s]});
+        let near =
+            json!({"georel": "near;maxDistance==1", "geometry": "Point", "coordinates": "[17,48]"});
+        let refused = [
+            (
+                json!({"name": "a", "filter": near, "sources": [{"type": "E"}]}),
+                "odata",
+                "geo-query is the caller's",
+            ),
+            (
+                json!({"name": "a", "sources": [{"type": "E"}, {"type": "F"}]}),
+                "odata",
+                "1 to 1",
+            ),
+            (
+                source(json!({"type": "E", "mapping": {"properties": "x"}})),
+                "odata",
+                "none of",
+            ),
+            (
+                source(json!({"type": "E", "mapping": {"geometry": "x"}})),
+                "sta",
+                "none of",
+            ),
+        ];
+        for (output, format, why) in refused {
+            let hit = checked(&output, format).err().map(|e| e.contains(why));
+            assert_eq!(hit, Some(true), "{output} {format} {why}");
+        }
+        let sta = json!({"name": "air", "filter": near,
+            "sources": [{"type": "A", "mapping": {"datastreams": ["pm10"]}}, {"type": "B"}]});
+        let o = checked(&sta, "sta").expect("an sta output holds a geo-query and several sources");
+        assert_eq!(
+            o.sources.first().map(|s| s.role("datastreams")),
+            Some(vec!["pm10"])
+        );
+        assert!(checked(&json!({"name": "a", "sources": [{"type": "E"}]}), "odata").is_ok());
     }
 
     #[test]
