@@ -72,3 +72,7 @@ note = "generated location_cell column and indexes; Postgres keeps them, nothing
 [0016]
 rollback = "compatible"
 note = "extended planner statistics only"
+
+[0017]
+rollback = "compatible"
+note = "index swap; an older release's ON CONFLICT infers u_attr_instances_time from the same column set, and per-partition {partition}_u_time indexes built before the swap wait for the roll-forward"
