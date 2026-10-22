@@ -87,6 +87,7 @@ pub struct ODataState {
 
 impl ODataState {
     /// The model the URLs resolve against: `url_model`, else `model`.
+    #[must_use]
     pub fn url_model(&self) -> &odata_csdl::Model {
         self.url_model.as_deref().unwrap_or(&self.model)
     }
