@@ -121,6 +121,9 @@ fn point(lon: f64, lat: f64) -> Value {
 
 pub const T1: &str = "2026-01-01T00:00:00Z";
 
+/// [`T1`] as an id and a time carry it (`docs/src/sta.md`, "Resource ids").
+pub const T1_ID: &str = "2026-01-01T00:00:00.000Z";
+
 pub fn entities() -> Vec<Value> {
     vec![
         json!({"id": "urn:ngsi-ld:Car:1", "type": "Car", "name": prop(&json!("Žltá")),

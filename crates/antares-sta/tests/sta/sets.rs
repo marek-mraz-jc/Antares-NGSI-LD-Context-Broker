@@ -2,7 +2,7 @@
 //! One test per entity set of the Sensing profile, read through the `city` view: the ids the
 //! gateway made (rule 2 and the three formerly empty sets changed), and nothing the view hides.
 
-use crate::common::{at, fixture, ids, local, send, sta, T1};
+use crate::common::{at, fixture, ids, local, send, sta, T1_ID};
 use axum::http::StatusCode;
 use serde_json::json;
 
@@ -116,12 +116,12 @@ async fn locations_are_the_entities_location_by_set_by_id_and_by_thing() -> Resu
 async fn historical_locations_come_from_the_location_history() -> Result<(), String> {
     let f = fixture().await?;
     let a = sta(&f.app, "/HistoricalLocations?$count=true").await;
-    let moved = format!("urn:ngsi-ld:Vehicle:1/historicalLocation/{T1}");
+    let moved = format!("urn:ngsi-ld:Vehicle:1/historicalLocation/{T1_ID}");
     assert_eq!(ids(&a.body).len(), 3);
     assert!(ids(&a.body).contains(&moved));
     assert_eq!(at(&a.body, "/@iot.count"), 3);
     let one = sta(&f.app, &format!("/HistoricalLocations('{moved}')")).await;
-    assert_eq!(at(&one.body, "/time"), T1);
+    assert_eq!(at(&one.body, "/time"), T1_ID);
     assert_eq!(
         at(&one.body, "/Thing@iot.navigationLink"),
         format!("{BASE}/Things('urn:ngsi-ld:Vehicle:1')")
@@ -202,8 +202,9 @@ async fn datastreams_are_one_per_measured_instance_and_a_hidden_attribute_has_no
 async fn sensors_are_the_shown_devices_the_entities_point_at() -> Result<(), String> {
     let f = fixture().await?;
     let a = sta(&f.app, "/Sensors").await;
-    assert_eq!(ids(&a.body), ["urn:ngsi-ld:Device:1"]);
-    assert_eq!(at(&a.body, "/value/0/metadata"), json!(["speed"]));
+    // T-5205 finding 7: the Sensor of the Datastreams that name no Device comes first.
+    assert_eq!(ids(&a.body), ["unknown", "urn:ngsi-ld:Device:1"]);
+    assert_eq!(at(&a.body, "/value/1/metadata"), json!(["speed"]));
     let one = sta(&f.app, "/Sensors('urn:ngsi-ld:Device:1')").await;
     assert_eq!(at(&one.body, "/name"), "radar 1");
     assert_eq!(
@@ -214,8 +215,15 @@ async fn sensors_are_the_shown_devices_the_entities_point_at() -> Result<(), Str
         sta(&f.app, "/Sensors('urn:ngsi-ld:Car:1')").await.status,
         StatusCode::NOT_FOUND
     );
+    // T-5205 finding 8: a Sensor's name is no Entity Attribute this surface filters on.
     let none = sta(&f.app, "/Sensors?$filter=name eq 'Hlavná'").await;
-    assert_eq!((none.status, ids(&none.body).len()), (StatusCode::OK, 0));
+    assert_eq!(
+        (none.status, at(&none.body, "/error/message")),
+        (
+            StatusCode::BAD_REQUEST,
+            json!("$filter: name is not a property Sensors are filtered on")
+        )
+    );
     Ok(())
 }
 
@@ -224,7 +232,7 @@ async fn observations_are_the_current_instants_and_a_datastreams_its_history() -
 {
     let f = fixture().await?;
     let a = sta(&f.app, "/Observations").await;
-    let now = format!("urn:ngsi-ld:Car:1/speed/{T1}");
+    let now = format!("urn:ngsi-ld:Car:1/speed/{T1_ID}");
     assert!(ids(&a.body).contains(&now));
     assert!(!ids(&a.body).iter().any(|id| id.contains("secret")));
     assert_eq!(
@@ -240,7 +248,7 @@ async fn observations_are_the_current_instants_and_a_datastreams_its_history() -
     let window = sta(&f.app, "/Datastreams('urn:ngsi-ld:Car:1%2Fspeed')/Observations?$filter=phenomenonTime ge '2025-12-31T00:00:00Z' and phenomenonTime lt '2026-01-01T00:00:00Z'").await;
     assert_eq!(
         ids(&window.body),
-        ["urn:ngsi-ld:Car:1/speed/2025-12-31T00:00:00Z"]
+        ["urn:ngsi-ld:Car:1/speed/2025-12-31T00:00:00.000Z"]
     );
     let page = sta(
         &f.app,
