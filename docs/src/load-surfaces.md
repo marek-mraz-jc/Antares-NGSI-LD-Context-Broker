@@ -50,13 +50,23 @@ per process; the sampler now reads the container's cgroup (`docker stats`).
 | mcp | 50 | n/a (platform only) | 57.25 / 83.0 |  | 11.0 / 119.3 | 200 / 500 | ok |
 | ws-fanout | 200 | n/a (platform only) | 30030 / 30524 |  | 79.6 / 283.8 | 250 / 1000 | breach: p95_ms 30030 > 250; p99_ms 30524 > 1000; errors 77.883 % > 0.1 % |
 
+`odata` (T-4919): each read counted the Entities lacking the `$orderby` key, a second scan of the
+type beside the read itself, though `level ge a` already rules them out; and the store handed the
+broker every match whole (about 1 000 Entities) to sort, read each one's key twice per comparison and
+cloned it once more for the view. Now a key the `$filter` compares to a literal skips that count, the
+sort reads each key once, and an ordered read the store decides takes only the ordering members and
+then reads its page whole by id. Same seeded 100 000 Entities, same host (load average about 40,
+so the absolute numbers are not the runner's): broker CPU 21.0 to 9.2 ms per request; at 50/s
+p95 3 757 to 506 ms (the old build saturated), broker CPU 94 to 50 %, RSS 222 to 112 MB. The row
+above is the run that found it; the next load-surfaces run replaces it.
+
 `ogc-page` asked an `offset` the OGC surface does not define (its paging is the `next` cursor); the
 shape now follows the first page's `next` link, as a GIS client pages; a 2 000-entity recheck answered
 every page (p95 10.8 ms, p99 34.3 ms at 50/s).
 
 ## 3. Breaches
 
-Each breach of this run is a task: `ngsi-near` on the platform build (4.2x vanilla, T-4918, fixed: section 5), `odata` p95 (T-4919),
+Each breach of this run is a task: `ngsi-near` on the platform build (4.2x vanilla, T-4918, fixed: section 5), `odata` p95 (T-4919, fixed: see the note under the table),
 `ogc-items` (bbox with a CQL2 filter on 10 556 AirQualityObserved: 10 s timeouts at 354 % CPU, T-4920; fixed, see below), and
 the WebSocket fan-out (20 % of 300 050 owed notifications delivered within the hold, 30 s behind,
 no `x-gap` sent, T-4921).
