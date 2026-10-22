@@ -25,7 +25,9 @@
 //           OData EntitySet
 //   mcp     POST /x/views/{VIEW}/mcp tools/call query_entities, 20 Vehicles —
 //           the same page as an MCP tool call
-//           The three need a `full` binary with the view and the Tenant's
+//   ogc     GET /x/views/{VIEW}/ogc/features/collections/Vehicle/items?limit=20
+//           — the same page as OGC API - Features GeoJSON
+//           The four need a `full` binary with the view and the Tenant's
 //           schema loaded (shapes.sh does it, BIN_SURFACES); ADR-0027
 //           section 6 prices each against `query` on that binary.
 // Closed model (constant VUs) on purpose here: this measures what the
@@ -36,7 +38,7 @@
 //   k6 run -e SHAPE=query -e VUS=50 -e DURATION=5s dev/perf/k6-shapes.js
 //
 // Env: BROKER_URL, SHAPE (query|query-q|retrieve|update|upsert|subscribe|facade|facade-twin|
-//      view|odata|mcp), VIEW (perf),
+//      view|odata|mcp|ogc), VIEW (perf),
 //      VUS (50), DURATION (5s), TENANT (unset = default tenant), ENTITIES (100: how many
 //      urn:ngsi-ld:Vehicle:shape:<n> are seeded, in upserts of 500).
 
@@ -132,6 +134,8 @@ export default function () {
     r = http.get(`${VIEW}/ngsi-ld/v1/entities?type=Vehicle&limit=20&local=true`, { headers });
   } else if (SHAPE === "odata") {
     r = http.get(`${VIEW}/odata/v4/Vehicle?$top=20`, { headers });
+  } else if (SHAPE === "ogc") {
+    r = http.get(`${VIEW}/ogc/features/collections/Vehicle/items?limit=20`, { headers });
   } else if (SHAPE === "mcp") {
     r = http.post(`${VIEW}/mcp`, mcpCall, {
       headers: {
