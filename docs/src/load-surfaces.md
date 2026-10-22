@@ -19,7 +19,7 @@ broker) load dev at night from joinedcontext-conformance `tests/k6/night.sh`.
 | run | commit | machine | note |
 |---|---|---|---|
 | local, 2026-10-20 22:00Z | `53ab566e` + the T-4889 branch | sandbox, 12 cores, PostGIS 17-3.5 in Docker | one pass, no repetition; the baseline in `ci/perf-baseline/surfaces.json` |
-| local, 2026-10-21 23:10Z | `3c43f323` + the T-4920 branch | sandbox, 16 cores, PostGIS 17-3.5 in Docker | `SHAPES=ogc-items` only, one pass; another machine than the baseline, so not added to it |
+| local, 2026-10-22 00:55Z | dev `a9bd198b` (the fix landed with T-5062) | sandbox, 16 cores, PostGIS 17-3.5 in Docker | `SHAPES=ogc-items` only, one pass; another machine than the baseline, so not added to it |
 
 The first `load-surfaces` run on `ubuntu-latest` adds its run id here and its baseline replaces the
 sandbox one (`surfaces_gate.py baseline --machine github-ubuntu-latest`). The PostgreSQL column of
@@ -41,7 +41,7 @@ per process; the sampler now reads the container's cgroup (`docker stats`).
 | upsert-100 | 5 | 51.63 / 65.89 | 44.04 / 92.94 | 0.9x | 2.8 / 32.6 | 500 / 1000 | ok |
 | view-type | 100 | n/a (platform only) | 7.78 / 10.11 |  | 20.3 / 35.2 | 50 / 150 | ok |
 | odata | 50 | n/a (platform only) | 274.73 / 400.77 |  | 122.7 / 179.4 | 200 / 500 | breach: p95_ms 274.73 > 200 |
-| ogc-items | 50 | n/a (platform only) | 35.88 / 61.54 |  | 62.0 / 265.8 | 200 / 500 | ok (T-4920 rerun; before: p95 9 770 ms, p99 10 001 ms, 1.5 % timeouts, 33 of 50 req/s at 354 % CPU) |
+| ogc-items | 50 | n/a (platform only) | 30.05 / 47.54 |  | 13.3 / 45.0 | 200 / 500 | ok (T-4920 rerun; before: p95 9 770 ms, p99 10 001 ms, 1.5 % timeouts, 33 of 50 req/s at 354 % CPU) |
 | ogc-page | 50 | n/a (platform only) | 1.3 / 2.5 |  | 2.7 / 227.8 | 200 / 500 | breach: errors 100.0 % > 0.1 % |
 | sta-things | 20 | n/a (platform only) | 128.28 / 166.76 |  | 3.9 / 161.8 | 200 / 500 | ok |
 | sta-observations | 50 | n/a (platform only) | 14.73 / 26.24 |  | 8.6 / 131.7 | 200 / 500 | ok |
@@ -64,8 +64,9 @@ no `x-gap` sent, T-4921).
 on the Entity as shown, so the store got no area. Each `bbox` read sends `count=true`, so the
 broker then read the whole type (10 556 rows in pages of 2 049) for every request. A geoquery on a
 GeoProperty that every rule of the selected types shows now reaches the store as T-4289 did for
-`q`; on a hidden GeoProperty it still runs on the shown Entity. One request fell from about 400 ms
-to 60 ms.
+`q` (the code landed with T-5062, `filter_entities_paged`; its test is
+`a_geoquery_on_a_shown_location_is_paged_in_the_store_and_a_hidden_one_is_not`); on a hidden
+GeoProperty it still runs on the shown Entity. One request fell from about 400 ms to 60 ms.
 
 ## 4. Proof the gate goes red
 
