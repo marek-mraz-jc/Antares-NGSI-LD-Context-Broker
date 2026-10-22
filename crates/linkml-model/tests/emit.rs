@@ -489,3 +489,58 @@ fn a_permissible_value_keeps_its_label_annotation() {
     assert!(value.contains("\"tag\": \"label\""), "{yaml}");
     assert!(value.contains(r#"\"sk\": \"cesta III. triedy\""#), "{yaml}");
 }
+
+/// T-5206 finding 3: the `@context` and the JSON Schema follow each NGSI-LD kind before the range
+/// (TS 104 175 5.2.6.4.6 to 5.2.6.4.10), so an Entity in keyValues reads under the context as
+/// stored and validates against the schema.
+#[test]
+fn each_ngsi_ld_kind_shapes_the_context_and_the_json_schema() {
+    let kind = |k: &str| serde_json::json!({"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": k}});
+    let doc = serde_json::json!({
+        "id": "https://e.org/s/", "name": "s",
+        "classes": {"Room": {"slots": ["prop", "rel", "geo", "lang", "vocab", "list", "links",
+                                       "json", "address", "uri_rel"]},
+                    "PostalAddress": {}},
+        "slots": {
+            "prop": {"range": "integer"},
+            "rel": {"range": "Room"},
+            "geo": {"annotations": kind("GeoProperty")},
+            "lang": {"annotations": kind("LanguageProperty")},
+            "vocab": {"annotations": kind("VocabProperty")},
+            "list": {"range": "float", "annotations": kind("ListProperty")},
+            "links": {"range": "Room", "annotations": kind("ListRelationship")},
+            "json": {"annotations": kind("JsonProperty")},
+            "address": {"range": "PostalAddress", "inlined": true, "annotations": kind("Property")},
+            "uri_rel": {"range": "uriorcurie", "annotations": kind("Relationship")}
+        }
+    });
+    let m = Model::read(doc.to_string().as_bytes(), &LIMITS).expect("loads");
+    let c: serde_json::Value = serde_json::from_str(&linkml_model::context(&m)).expect("json");
+    let c = &c["@context"];
+    assert_eq!(c["prop"]["@type"], "http://www.w3.org/2001/XMLSchema#integer");
+    assert_eq!(c["rel"]["@type"], "@id");
+    assert_eq!(c["geo"], "https://e.org/s/geo");
+    assert_eq!(c["lang"]["@container"], "@language");
+    assert_eq!(c["vocab"]["@type"], "@vocab");
+    assert_eq!(c["list"]["@container"], "@list");
+    assert_eq!(c["links"]["@container"], "@list");
+    assert_eq!(c["links"]["@type"], "@id");
+    assert_eq!(c["json"]["@type"], "@json");
+    assert_eq!(c["address"], "https://e.org/s/address", "an inlined object is no IRI");
+    assert_eq!(c["uri_rel"]["@type"], "@id", "a Relationship is an IRI node, not xsd:anyURI");
+
+    let j: serde_json::Value = serde_json::from_str(&linkml_model::json_schema(&m)).expect("json");
+    let p = &j["definitions"]["Room"]["properties"];
+    assert_eq!(p["prop"]["type"], "integer");
+    assert_eq!(p["rel"]["format"], "uri");
+    assert_eq!(p["geo"]["type"], "object");
+    assert_eq!(p["lang"]["type"], "object");
+    assert_eq!(p["lang"]["additionalProperties"]["type"], "string");
+    assert_eq!(p["vocab"]["type"], "string");
+    assert_eq!(p["list"]["type"], "array");
+    assert_eq!(p["list"]["items"]["type"], "number");
+    assert_eq!(p["links"]["type"], "array");
+    assert_eq!(p["json"].get("type"), None, "a JsonProperty holds any JSON");
+    assert_eq!(p["address"]["type"], "object");
+    assert_eq!(p["address"]["x-ngsi-ld-kind"], "Property");
+}

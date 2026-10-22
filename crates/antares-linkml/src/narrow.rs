@@ -9,7 +9,7 @@
 
 use antares_ops::Visible;
 use linkml_model::{
-    Annotation, Builtin, Class, Error, Limits, Model, Range, Schema, Slot, KIND_TAG,
+    Annotation, Builtin, Class, Error, Limits, Model, Prefix, Range, Schema, Slot, KIND_TAG,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,7 +74,10 @@ pub(crate) fn narrow(
         .map(|(n, _)| n.as_str())
         .collect();
 
-    let rewrite = |slot: &Slot| rewrite(source, &kept, &slot_names, slot);
+    // An inlined value whose class is hidden is an open object (LinkML's `linkml:Any`), never
+    // a URI: the stored value is an object (T-5206 finding 2).
+    let any = if kept.contains(ANY) { "LinkmlAny" } else { ANY };
+    let rewrite = |slot: &Slot| rewrite(source, &kept, &slot_names, any, slot);
 
     let mut classes = BTreeMap::new();
     for (name, (class, slots)) in &per_class {
@@ -95,11 +98,19 @@ pub(crate) fn narrow(
                 (refined != rewrite(base)).then(|| (n.clone(), refined))
             })
             .collect();
+        // The IRI the view reads the type by, as the OData surface states it (T-5206 finding 1):
+        // a class shown only by its short name is that name under the core @context.
+        let ty = &typed[name].1;
+        let class_uri = if *ty == source.class_iri(name) {
+            class.class_uri.clone()
+        } else {
+            Some(antares_ops::core_iri(name))
+        };
         classes.insert(
             (*name).to_owned(),
             Class {
                 name: class.name.clone(),
-                class_uri: class.class_uri.clone(),
+                class_uri,
                 is_a,
                 slots: slots.iter().map(|(n, _)| n.clone()).collect(),
                 slot_usage,
@@ -108,9 +119,22 @@ pub(crate) fn narrow(
             },
         );
     }
+    // A slot no kept class shows by its own IRI is shown by its short name: its IRI is that
+    // name under the core @context, the one the Entities and the OData surface use.
+    let by_own_iri = |n: &str| {
+        typed
+            .iter()
+            .any(|(c, (_, ty))| visible.shows_attribute(ty, &source.slot_iri(n)) && per_class[c].1.iter().any(|(k, _)| k == n))
+    };
     let slots: BTreeMap<String, Slot> = slot_names
         .iter()
-        .filter_map(|n| Some(((*n).to_owned(), rewrite(s.slots.get(*n)?))))
+        .filter_map(|n| {
+            let mut slot = rewrite(s.slots.get(*n)?);
+            if !by_own_iri(n) {
+                slot.slot_uri = Some(antares_ops::core_iri(n));
+            }
+            Some(((*n).to_owned(), slot))
+        })
         .collect();
 
     let enums = used_enums(source, &slots, &classes);
@@ -121,6 +145,20 @@ pub(crate) fn narrow(
         || per_class
             .iter()
             .any(|(c, (_, slots))| slots.len() != source.class_slots(c).len());
+    if slots
+        .values()
+        .chain(classes.values().flat_map(|c| c.slot_usage.values()))
+        .any(|slot| slot.range.as_deref() == Some(any))
+    {
+        classes.insert(
+            any.to_owned(),
+            Class {
+                class_uri: Some("linkml:Any".to_owned()),
+                description: Some("Any value: an inlined object whose class this view does not show.".to_owned()),
+                ..Class::default()
+            },
+        );
+    }
     let mut narrowed = Schema {
         id: format!("{}/views/{view}", s.id.trim_end_matches(['/', '#'])),
         name: s.name.clone(),
@@ -138,21 +176,39 @@ pub(crate) fn narrow(
         .filter(|(k, _)| used.contains(k.as_str()))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    if used.contains("linkml") {
+        narrowed
+            .prefixes
+            .entry("linkml".to_owned())
+            .or_insert_with(|| Prefix {
+                prefix_prefix: "linkml".to_owned(),
+                prefix_reference: "https://w3id.org/linkml/".to_owned(),
+            });
+    }
     Ok((Model::new(narrowed, &LIMITS)?, left_out))
 }
 
+/// The class an inlined slot whose class is hidden ranges over.
+const ANY: &str = "Any";
+
 /// `slot` as the narrowed schema states it: a range to a hidden class is
-/// `uriorcurie` with the kind it implied stated (LK1), an `inverse` to a
-/// hidden slot is dropped.
+/// `uriorcurie` with the kind it implied stated (LK1), or `any` (`linkml:Any`)
+/// when the slot holds the object inlined; an `inverse` to a hidden slot is dropped.
 fn rewrite(
     source: &Model,
     kept: &BTreeSet<&str>,
     slot_names: &BTreeSet<&str>,
+    any: &str,
     slot: &Slot,
 ) -> Slot {
     let mut out = slot.clone();
     if let Range::Class(target) = source.range(slot) {
-        if !kept.contains(target) {
+        let link = matches!(source.kind(slot), "Relationship" | "ListRelationship");
+        if !kept.contains(target) && (slot.inlined == Some(true) || !link) {
+            out.range = Some(any.to_owned());
+            out.inlined = Some(true);
+            out.inverse = None;
+        } else if !kept.contains(target) {
             // Still a Relationship (DM-69, an external reference): the
             // kind the class range implied is stated, the class is not.
             let kind = source.kind(slot).to_owned();
@@ -435,9 +491,55 @@ mod tests {
             ["BikeHireDockingStation"]
         );
         assert_eq!(s.slots.keys().collect::<Vec<_>>(), ["status"]);
-        assert_eq!(
-            m.class_iri("BikeHireDockingStation"),
-            "https://smartdatamodels.org/BikeHireDockingStation"
+        // T-5206 finding 1: the IRIs the view reads, the ones the OData surface states.
+        assert_eq!(m.class_iri("BikeHireDockingStation"), core("BikeHireDockingStation"));
+        assert_eq!(m.slot_iri("status"), core("status"));
+        let shown = BTreeMap::from([(
+            core("BikeHireDockingStation"),
+            BTreeSet::from([core("status")]),
+        )]);
+        let odata = source.as_shown(&shown, antares_ops::core_iri);
+        assert_eq!(m.slot_iri("status"), odata.slot_iri("status"));
+        assert_eq!(m.class_iri("BikeHireDockingStation"), odata.class_iri("BikeHireDockingStation"));
+        let context: serde_json::Value =
+            serde_json::from_str(&linkml_model::context(&m)).expect("json");
+        assert_eq!(context["@context"]["status"], core("status"));
+    }
+
+    /// T-5206 finding 2: an inlined object whose class the view hides stays an object of
+    /// `linkml:Any` with its kind, never a `uriorcurie`; a hidden Relationship target still is one.
+    #[test]
+    fn an_inlined_value_of_a_hidden_class_stays_an_object() {
+        let source = model(
+            r#"{"id": "https://e.org/city/", "name": "city",
+              "prefixes": {"city": {"prefix_prefix": "city", "prefix_reference": "https://e.org/city/"}},
+              "default_prefix": "city",
+              "classes": {"Event": {"slots": ["address", "organizer", "venue"]},
+                          "PostalAddress": {"slots": ["street"]}, "Place": {}},
+              "slots": {"address": {"range": "PostalAddress", "inlined": true},
+                        "organizer": {"range": "PostalAddress",
+                                      "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "Property"}}},
+                        "venue": {"range": "Place"}, "street": {}}}"#,
         );
+        let (m, _) = narrow(
+            &source,
+            &visible(&["Event"], &["address", "organizer", "venue"]),
+            "events",
+        )
+        .expect("narrowed");
+        let s = m.schema();
+        for slot in ["address", "organizer"] {
+            assert_eq!(s.slots[slot].range.as_deref(), Some("Any"), "{slot}");
+            assert_eq!(m.kind(&s.slots[slot]), "Property", "{slot}");
+        }
+        assert_eq!(s.slots["venue"].range.as_deref(), Some("uriorcurie"));
+        assert_eq!(m.class_iri("Any"), "https://w3id.org/linkml/Any");
+        assert!(!s.classes.contains_key("PostalAddress"), "LK1");
+        let j: serde_json::Value =
+            serde_json::from_str(&linkml_model::json_schema(&m)).expect("json");
+        assert_eq!(j["definitions"]["Event"]["properties"]["address"]["type"], "object");
+        let c: serde_json::Value = serde_json::from_str(&linkml_model::context(&m)).expect("json");
+        assert_eq!(c["@context"]["address"], "https://e.org/city/address");
+        assert_eq!(c["@context"]["venue"]["@type"], "@id");
     }
 }
