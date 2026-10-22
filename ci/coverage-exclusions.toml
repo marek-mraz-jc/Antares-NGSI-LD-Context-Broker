@@ -64,9 +64,9 @@ reason = "the periodic reload failing on the store, which the built-in store doe
 crate = "antares-ops"
 file = "src/views/retention.rs"
 function = "run"
-lines = 2
+lines = 4
 branches = 0
-reason = "the tracing::info! of a spent budget repeats its field in the `log` fallback, which runs only with no subscriber set; tests/retention.rs a_sweep_past_its_budget_stops_and_the_next_goes_on runs the spent path (T-4084). The failing statement path is views::retention::tests::a_step_that_times_out_leaves_the_others_swept_in_the_same_run (T-5157)"
+reason = "the tracing::info! of a spent budget and of a slow step each repeat its field in the `log` fallback, which runs only with no subscriber set; tests/retention.rs a_sweep_past_its_budget_stops_and_the_next_goes_on runs the spent path (T-4084), views::retention::tests::a_failing_step_rests_longer_and_comes_back_with_a_smaller_batch the slow one. The failing statement path is views::retention::tests::a_step_that_times_out_leaves_the_others_swept_in_the_same_run (T-5157)"
 
 [[exclusion]]
 crate = "antares-ops"

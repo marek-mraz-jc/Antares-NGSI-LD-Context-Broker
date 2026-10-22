@@ -1386,7 +1386,8 @@ mod tests {
 
     /// T-5157 reopened: a step that fails rests 1, 3, 7 sweeps and returns
     /// with 500, 250, 125 rows a batch; each clean run doubles it back; the
-    /// others keep the full batch, and a resting step is never started.
+    /// others keep the full batch, a resting step is never started, and a
+    /// step past a second is logged as slow.
     #[tokio::test]
     async fn a_failing_step_rests_longer_and_comes_back_with_a_smaller_batch() {
         let mut turns = Turns::default();
@@ -1424,7 +1425,11 @@ mod tests {
         let seen = std::sync::Mutex::new(Vec::new());
         let (_, ran, failed) = run(&steps, SWEEP_BUDGET, false, &[0, 250], |step, batch| {
             seen.lock().expect("seen").push((step.label.clone(), batch));
-            async move { Ok(0) }
+            async move {
+                // Past a second: the step is logged as slow.
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                Ok(0)
+            }
         })
         .await;
         assert_eq!((ran, failed), (vec![1], vec![]));
