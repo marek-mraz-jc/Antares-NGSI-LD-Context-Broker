@@ -140,3 +140,62 @@ fn q_metrics_serves_prometheus_text_and_counters_move() {
         "no bucket covers the measured multi-second tail:\n{metrics}"
     );
 }
+
+/// T-5095: with ANTARES_METRICS_PORT set, /q/metrics lives on that listener
+/// alone. The listener answers every other path 404 (no API, no admin), and
+/// the API port answers /q/metrics 404, so a NetworkPolicy can give a
+/// scraper the metrics port without the API.
+#[test]
+fn metrics_port_serves_metrics_only_and_api_port_none() {
+    let port = free_port();
+    let metrics_port = free_port();
+    let _broker = Broker(
+        Command::new(env!("CARGO_BIN_EXE_antares"))
+            .env("ANTARES_HTTP_PORT", port.to_string())
+            .env("ANTARES_METRICS_PORT", metrics_port.to_string())
+            .env("ANTARES_TELEMETRY", "1")
+            .spawn()
+            .expect("spawn antares"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !http(metrics_port, "GET", "/q/metrics", None).starts_with("HTTP/1.1 200") {
+        assert!(Instant::now() < deadline, "metrics listener never answered");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let metrics = http(metrics_port, "GET", "/q/metrics", None);
+    assert!(
+        metrics.contains("# TYPE antares_limit_rejections_total"),
+        "metrics listener serves no Prometheus text:\n{metrics}"
+    );
+    for path in [
+        "/q/health",
+        "/q/tenants",
+        "/q/dead-letters",
+        "/ngsi-ld/v1/entities?type=Sensor",
+        "/ngsi-ld/v1/types",
+        "/",
+    ] {
+        let got = http(metrics_port, "GET", path, None);
+        assert!(
+            got.starts_with("HTTP/1.1 404"),
+            "metrics listener must 404 {path}: {got}"
+        );
+    }
+    let create = http(
+        metrics_port,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        Some(r#"{"id":"urn:ngsi-ld:Sensor:1","type":"Sensor"}"#),
+    );
+    assert!(
+        create.starts_with("HTTP/1.1 404"),
+        "metrics listener must take no write: {create}"
+    );
+    let api_health = http(port, "GET", "/q/health", None);
+    assert!(api_health.starts_with("HTTP/1.1 200"), "{api_health}");
+    let api_metrics = http(port, "GET", "/q/metrics", None);
+    assert!(
+        api_metrics.starts_with("HTTP/1.1 404"),
+        "the API port must not serve /q/metrics: {api_metrics}"
+    );
+}

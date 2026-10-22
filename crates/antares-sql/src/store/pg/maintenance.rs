@@ -237,6 +237,11 @@ pub async fn temporal_maintenance(
         if let Ok(Some(line)) = default_partition_load(pool).await {
             done.push(line);
         }
+        match history_one_index(pool).await {
+            Ok(Some(line)) => done.push(line),
+            Ok(None) => {}
+            Err(e) => done.push(format!("history index build deferred ({e})")),
+        }
     }
     // 4.22 garbage collection, on both backends: reads already refuse expired
     // entities and instances, so these reaps only bound storage — the clause
@@ -480,11 +485,12 @@ async fn retain(
         .execute(&mut *tx)
         .await?;
     if !dry_run {
-        // One batch that outlasts the sweep's budget (15 s, antares-ops
+        // One batch past a third of the sweep's budget (15 s, antares-ops
         // retention) is cancelled rather than holding a connection and the
-        // database for minutes; the sweep logs it and the next minute retries
-        // (T-4084).
-        sqlx::query("SET LOCAL statement_timeout = '15s'")
+        // database for minutes (T-4084); the sweep logs it, goes on with the
+        // other steps and retries it the next minute, so one slow (Tenant,
+        // type) cannot spend the whole budget (T-5157).
+        sqlx::query("SET LOCAL statement_timeout = '5s'")
             .execute(&mut *tx)
             .await?;
     }
@@ -855,6 +861,144 @@ async fn reap_expired_instances(pool: &PgPool) -> Result<u64, sqlx::Error> {
     }
     tx.commit().await?;
     Ok(n)
+}
+
+/// The columns of the one history btree (migration 0017, T-5057).
+const ONE_INDEX_COLUMNS: &str = "(tenant_id, entity_id, attr_id, observed_at, instance_id)";
+
+/// The standalone index [`history_one_index`] builds on partition `part`,
+/// quoted bare (CREATE INDEX puts it in the table's schema) and qualified,
+/// and the partition qualified. A weekly suffix keeps the name under the
+/// 63-byte identifier limit.
+fn one_index_names(part: &str) -> (String, String, String) {
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let index = q(&format!("{part}_u_time"));
+    (
+        index.clone(),
+        format!("public.{index}"),
+        format!("public.{}", q(part)),
+    )
+}
+
+/// The partitions of `attr_instances` without a valid `{partition}_u_time`
+/// index, with whether an invalid one (a build that failed) is in the way.
+const PARTITIONS_WITHOUT_ONE_INDEX: &str = "SELECT c.relname, x.indexrelid IS NOT NULL AS stale
+     FROM pg_inherits i
+     JOIN pg_class c ON c.oid = i.inhrelid
+     LEFT JOIN pg_class ic ON ic.relname = c.relname || '_u_time'
+                          AND ic.relnamespace = 'public'::regnamespace
+     LEFT JOIN pg_index x ON x.indexrelid = ic.oid
+     WHERE i.inhparent = 'public.attr_instances'::regclass
+       AND x.indisvalid IS NOT TRUE
+     ORDER BY pg_relation_size(c.oid)";
+
+/// Move a plain-mode history onto one btree (migration 0017, T-5057), one
+/// step a pass: while `i_attr_instances_lookup` exists, build
+/// `{partition}_u_time` on the smallest partition lacking it with `CREATE
+/// INDEX CONCURRENTLY` (writes go on), and once every partition has its own,
+/// make them the partitions of `u_attr_instances_time` and drop the two old
+/// indexes in one transaction of catalog changes held to a 2 s
+/// `lock_timeout`. Standalone indexes first, never an invalid parent filled
+/// in place: a partition retention drops before its turn would leave such a
+/// parent invalid for good, as PostgreSQL validates it only on an attach.
+/// `None` once done, or while another pod holds the step.
+///
+/// ponytail: the build takes the disk of one more index per partition until
+/// the swap frees two; a timescale hypertable keeps both (no concurrent
+/// unique build there).
+pub async fn history_one_index(pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
+    let pending: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.i_attr_instances_lookup') IS NOT NULL")
+            .fetch_one(pool)
+            .await?;
+    if !pending {
+        return Ok(None);
+    }
+    // CREATE INDEX CONCURRENTLY runs outside a transaction and for as long as
+    // the partition takes, so it gets a connection of its own the pool never
+    // sees again (as the migrations do in `connect_with`).
+    let mut conn = pool.acquire().await?.detach();
+    let held: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext('antares.history_one_index'))")
+            .fetch_one(&mut conn)
+            .await?;
+    if !held {
+        return Ok(None);
+    }
+    let line = one_index_step(&mut conn).await;
+    use sqlx::Connection;
+    // Closing the session releases the advisory lock with it.
+    conn.close().await?;
+    line.map(Some)
+}
+
+async fn one_index_step(conn: &mut sqlx::PgConnection) -> Result<String, sqlx::Error> {
+    use sqlx::Executor;
+    let missing: Vec<(String, bool)> = sqlx::query_as(PARTITIONS_WITHOUT_ONE_INDEX)
+        .fetch_all(&mut *conn)
+        .await?;
+    if let Some((part, stale)) = missing.first() {
+        let (bare, index, table) = one_index_names(part);
+        // A concurrent build waits for older transactions to end: those waits
+        // count against lock_timeout, and one that runs out leaves an invalid
+        // index the next pass drops and builds again.
+        conn.execute("SET statement_timeout = 0; SET lock_timeout = '60s'")
+            .await?;
+        if *stale {
+            conn.execute(sqlx::AssertSqlSafe(format!(
+                "DROP INDEX CONCURRENTLY IF EXISTS {index}"
+            )))
+            .await?;
+        }
+        conn.execute(sqlx::AssertSqlSafe(format!(
+            "CREATE UNIQUE INDEX CONCURRENTLY {bare} ON {table} {ONE_INDEX_COLUMNS}"
+        )))
+        .await?;
+        return Ok(format!("history index built on {part}"));
+    }
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    sqlx::query("SET LOCAL lock_timeout = '2s'")
+        .execute(&mut *tx)
+        .await?;
+    // The partition set is read again under the parent's lock: a week created
+    // since has no index of its own yet, and its turn comes next pass.
+    sqlx::query("LOCK TABLE public.attr_instances IN SHARE MODE")
+        .execute(&mut *tx)
+        .await?;
+    let late: Option<String> = sqlx::query_scalar(PARTITIONS_WITHOUT_ONE_INDEX)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if late.is_some() {
+        tx.rollback().await?;
+        return Ok("history index: a new partition waits for its own".into());
+    }
+    let parts: Vec<String> = sqlx::query_scalar(
+        "SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+         WHERE i.inhparent = 'public.attr_instances'::regclass",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE UNIQUE INDEX u_attr_instances_time ON ONLY public.attr_instances {ONE_INDEX_COLUMNS}"
+    )))
+    .execute(&mut *tx)
+    .await?;
+    for part in &parts {
+        let (_, index, _) = one_index_names(part);
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER INDEX public.u_attr_instances_time ATTACH PARTITION {index}"
+        )))
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("DROP INDEX public.i_attr_instances_lookup, public.u_attr_instances")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(format!(
+        "history on one index: {} partitions swapped",
+        parts.len()
+    ))
 }
 
 #[cfg(test)]

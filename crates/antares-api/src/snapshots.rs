@@ -708,6 +708,7 @@ async fn run_query(
             crate::entities::Pushdown {
                 page: Some((offset, st.max_limit)),
                 proj: None,
+                order_keys: None,
             },
             // a snapshot under a narrowing is refused at its gate
             None,

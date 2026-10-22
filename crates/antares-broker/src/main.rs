@@ -97,6 +97,9 @@ const KNOWN_KEYS: &[&str] = &[
     // and whether /q/metrics answers without it (token | open).
     "ANTARES_ADMIN_TOKEN_FILE",
     "ANTARES_ADMIN_METRICS",
+    // A second listener that serves /q/metrics and nothing else; set, the
+    // API port answers /q/metrics 404 (T-5095). Unset = /q/metrics on the API port.
+    "ANTARES_METRICS_PORT",
     // Drain: the LB notice window, and the ceiling on waiting for
     // in-flight requests once the listener has closed.
     "ANTARES_DRAIN_DELAY_MS",
@@ -258,6 +261,24 @@ fn is_off(v: &str) -> bool {
         || v.eq_ignore_ascii_case("no")
 }
 
+/// ANTARES_METRICS_PORT: unset or empty is no metrics listener; a port is
+/// one that differs from the API port (both binds would fail, the second
+/// one only after the store connected).
+fn parse_metrics_port(raw: Option<&str>, api_port: u16) -> Result<Option<u16>, String> {
+    let Some(raw) = raw.filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    match raw.parse::<u16>() {
+        Ok(p) if p != 0 && p != api_port => Ok(Some(p)),
+        Ok(p) => Err(format!(
+            "ANTARES_METRICS_PORT must be a port 1-65535 other than ANTARES_HTTP_PORT {api_port}, got {p}"
+        )),
+        Err(e) => Err(format!(
+            "ANTARES_METRICS_PORT must be a port number 1-65535, got {raw:?} ({e})"
+        )),
+    }
+}
+
 /// One plain HTTP/1.0 GET of /q/health on the configured port; anything but
 /// a 200 status line is an error, so `HEALTHCHECK` sees exit 1.
 fn health_probe() -> Result<(), Box<dyn std::error::Error>> {
@@ -338,6 +359,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port: u16 = port_raw.parse().map_err(|e| {
         format!("ANTARES_HTTP_PORT must be a port number 0-65535, got {port_raw:?} ({e})")
     })?;
+    let metrics_port =
+        parse_metrics_port(std::env::var("ANTARES_METRICS_PORT").ok().as_deref(), port)?;
     // Every remaining config value is parsed HERE, before the runtime starts,
     // so a garbage window, cadence or switch fails the process instead of
     // silently running at its default.
@@ -410,6 +433,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             drivers.temporal_name,
             drivers.maintenance,
             metrics_render,
+            metrics_port,
             sweep_secs,
             drain_delay,
             drain_deadline,
@@ -959,6 +983,7 @@ async fn run(
         antares_sql::store::pg::maintenance::TemporalBackend,
     )>,
     metrics_render: Option<telemetry::MetricsRender>,
+    metrics_port: Option<u16>,
     sweep_secs: u64,
     drain_delay: std::time::Duration,
     drain_deadline: std::time::Duration,
@@ -1243,6 +1268,14 @@ async fn run(
     // Only the api role serves the NGSI-LD surface — a worker pod
     // exposes health/ready/metrics and nothing else (a subscription created
     // on a worker would bypass the roles.api KV sync and never notify).
+    // ANTARES_METRICS_PORT: the renderer moves to the metrics listener, so
+    // the API port's /q/metrics answers 404 and a scraper needs no path to
+    // the API (T-5095).
+    let metrics_app = metrics_port.map(|p| {
+        let app = antares_api::Admin::metrics_router(state.clone());
+        state.metrics_render = None;
+        (p, app)
+    });
     let routed = if roles.api {
         antares_api::router(state)
     } else {
@@ -1270,6 +1303,15 @@ async fn run(
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!("listening on http://0.0.0.0:{port}");
+    if let Some((p, app)) = metrics_app {
+        let metrics_listener = tokio::net::TcpListener::bind(("0.0.0.0", p)).await?;
+        tracing::info!("serving /q/metrics only on http://0.0.0.0:{p}");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(metrics_listener, app).await {
+                tracing::error!(error = %e, "metrics listener stopped");
+            }
+        });
+    }
     // Count open connections so the drain can wait for them. Incremented
     // before the task is spawned — incrementing inside the task would race the
     // drain's first check and let a just-accepted connection be missed.
@@ -1731,6 +1773,25 @@ mod sweep_secs_tests {
             let err =
                 parse_sweep_secs(Some(bad)).expect_err(&format!("SWEEP_SECS={bad:?} is fatal"));
             assert!(err.contains("ANTARES_SWEEP_SECS"), "{err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod metrics_port_tests {
+    use super::parse_metrics_port;
+
+    /// ANTARES_METRICS_PORT (T-5095): unset or empty is no metrics listener,
+    /// and a value that is no port, port 0 or the API port is fatal.
+    #[test]
+    fn metrics_port_parses_and_rejects() {
+        assert_eq!(parse_metrics_port(None, 9090), Ok(None));
+        assert_eq!(parse_metrics_port(Some(""), 9090), Ok(None));
+        assert_eq!(parse_metrics_port(Some("9464"), 9090), Ok(Some(9464)));
+        for bad in ["0", "9090", "-1", "abc", "70000"] {
+            let err = parse_metrics_port(Some(bad), 9090)
+                .expect_err(&format!("METRICS_PORT={bad:?} is fatal"));
+            assert!(err.contains("ANTARES_METRICS_PORT"), "{err}");
         }
     }
 }

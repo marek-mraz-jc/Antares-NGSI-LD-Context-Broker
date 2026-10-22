@@ -9,7 +9,7 @@
 //! What this buys: the hypertable/partition
 //! machinery acts on the data queries actually read; retention shortens
 //! query results; instance pruning and entity paging run in SQL with the
-//! `(tenant_id, entity_id, attr_id, observed_at DESC)` index.
+//! `(tenant_id, entity_id, attr_id, observed_at, instance_id)` index (0017).
 
 use antares_model::TenantId;
 use serde_json::Value;
@@ -139,7 +139,7 @@ const GEO_VALUE: &str = "CASE WHEN jsonb_typeof(e->'data'->'value') = 'object'
 
 /// Whether the newest stored instance of row `e`'s (attribute, datasetId) is
 /// another instance with the same value (T-4507): one row read by the index
-/// (tenant_id, entity_id, attr_id, observed_at DESC), false when none is stored.
+/// (tenant_id, entity_id, attr_id, observed_at, …) read backwards, false when none is stored.
 /// The current and the last week first (T-4906): unbounded, the newest row is
 /// a merge over every weekly partition, one cold index descent each. A row
 /// found there is the newest of all; only an attribute silent for longer
@@ -309,7 +309,7 @@ async fn insert_rows(
     }
     // `$4` off: today's row per write. On: a row with an observedAt already
     // stored, or without one equal to the newest stored instance, is no new
-    // observation. Both probes ride (tenant_id, entity_id, attr_id, observed_at DESC)
+    // observation. Both probes ride (tenant_id, entity_id, attr_id, observed_at, …)
     // and read one row: the second is NEWEST_REPEATS, never a scan of the
     // attribute's whole history (T-4669: that scan cost ~90 ms a station at a
     // month of history, and a minute's batch of 2,063 stations recorded nothing).
