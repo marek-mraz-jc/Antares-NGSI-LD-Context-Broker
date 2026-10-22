@@ -661,7 +661,7 @@ async fn a_hidden_attribute_filters_as_unknown_and_a_malformed_filter_is_400() -
 }
 
 /// T-5169: an id list selects the same Entities on every surface, a missing id selecting none;
-/// OGC lowers `id IN (…)`, alone or ANDed with a value conjunct, to the NGSI-LD `id` list.
+/// OGC lowers `id IN (…)`, alone or with a value conjunct, to the NGSI-LD `id` list.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_id_list_selects_the_same_on_every_surface() -> Result<(), String> {
     let (_broker, app) = broker().await?;

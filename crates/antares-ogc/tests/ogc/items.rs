@@ -691,7 +691,7 @@ async fn datetime_and_temporal_filters_read_offsets_as_instants() -> Result<(), 
     Ok(())
 }
 
-/// T-5169: `id = '…'` and `id IN (…)`, alone or ANDed, select by the NGSI-LD `id` list, so a
+/// T-5169: `id = '…'` and `id IN (…)`, alone or joined by `AND`, select by the NGSI-LD `id` list, so a
 /// collection larger than the residual's scan budget still answers them, counted exactly.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_id_filter_reads_by_id_past_the_scan_budget() -> Result<(), String> {
@@ -740,7 +740,11 @@ async fn an_id_filter_reads_by_id_past_the_scan_budget() -> Result<(), String> {
         let mut got = ids(&a.body);
         got.sort();
         assert_eq!(got, want, "{filter}");
-        assert_eq!(a.body["numberMatched"], json!(want.len()), "{filter}");
+        assert_eq!(
+            a.body.get("numberMatched"),
+            Some(&json!(want.len())),
+            "{filter}"
+        );
     }
     Ok(())
 }

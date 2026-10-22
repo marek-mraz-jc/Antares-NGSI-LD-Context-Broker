@@ -436,11 +436,7 @@ pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params, f: &Lowered) ->
     } else {
         shape(c, terms, p)
     };
-    let mut base = format!("type={}{projection}", encode(&c.type_iri));
-    if let Some(ids) = &f.ids {
-        let ids: Vec<String> = ids.iter().map(|id| encode(id)).collect();
-        let _ = write!(base, "&id={}", ids.join(","));
-    }
+    let mut base = format!("type={}{}{projection}", encode(&c.type_iri), f.id_param());
     if p.ngsild_geo() {
         for name in ["georel", "geometry", "coordinates", "geoproperty"] {
             if let Some(value) = p.option(name) {

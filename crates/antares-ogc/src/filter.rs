@@ -162,6 +162,19 @@ pub(crate) struct Lowered {
     pub residual: Vec<Expr>,
 }
 
+impl Lowered {
+    /// The NGSI-LD `id` parameter of [`Self::ids`], empty without one.
+    pub(crate) fn id_param(&self) -> String {
+        self.ids.as_ref().map_or_else(String::new, |ids| {
+            let ids: Vec<String> = ids
+                .iter()
+                .map(|id| antares_ops::percent::encode(id))
+                .collect();
+            format!("&id={}", ids.join(","))
+        })
+    }
+}
+
 /// Lowers `filter` for `c` under `terms`; `geo_free` when the request has no other geo query.
 pub(crate) fn lower(
     c: &Collection,
@@ -215,9 +228,7 @@ pub(crate) fn lower(
 fn by_id(e: &Expr) -> Option<Vec<String>> {
     let lits: &[Lit] = match e {
         Expr::Cmp(Cmp::Eq, left, right) => match (left.as_ref(), right.as_ref()) {
-            (Expr::Path(Path::Id), lit @ Expr::Lit(_))
-            | (lit @ Expr::Lit(_), Expr::Path(Path::Id)) => {
-                let Expr::Lit(lit) = lit else { return None };
+            (Expr::Path(Path::Id), Expr::Lit(lit)) | (Expr::Lit(lit), Expr::Path(Path::Id)) => {
                 std::slice::from_ref(lit)
             }
             _ => return None,
@@ -1200,6 +1211,7 @@ mod tests {
         assert_eq!(ids("id IN ('urn:a', 'x y')"), Ok((list(&["urn:a"]), 0, 0)));
         // What the id list cannot say stays the residual's.
         assert_eq!(ids("id = 'urn:a,b'"), Ok((None, 0, 1)));
+        assert_eq!(ids("id IN ('urn:a', 3)"), Ok((None, 0, 1)));
         assert_eq!(ids("id <> 'urn:a'"), Ok((None, 0, 1)));
         assert_eq!(ids("id = 'urn:a' OR pm10 > 3"), Ok((None, 0, 1)));
         assert_eq!(ids("NOT id IN ('urn:a')"), Ok((None, 0, 1)));
