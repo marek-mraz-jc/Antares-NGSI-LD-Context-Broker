@@ -285,3 +285,32 @@ fn an_sdm_iri_names_the_same_attribute_and_modified_at_stamps_the_event() {
     assert!(has(&l, "DTSTAMP:20261018T000000Z"), "{l:?}");
     assert!(!l.iter().any(|x| x.starts_with("LAST-MODIFIED")), "{l:?}");
 }
+
+/// T-5207: a mapping of this contract version is read strictly (an unknown member or an
+/// unknown version is refused, as the Portal's save check refuses it); one of a newer version
+/// degrades to its type over its preset, so the feed still answers.
+#[test]
+fn the_mapping_version_reads_strictly_and_a_newer_one_degrades_to_the_preset() {
+    use antares_ical::mapping::{plan_of, MAPPING_VERSION};
+    assert_eq!(MAPPING_VERSION, 1);
+    let (_, degraded) = plan_of(&json!({"version": 1, "preset": "schema-org"})).expect("v1");
+    assert!(!degraded);
+    let (absent, _) = plan_of(&json!({})).expect("version absent reads as 1");
+    assert_eq!(absent.entity_type(), "Event");
+    for refused in [
+        json!({"version": 1, "rrule": "eventSchedule"}),
+        json!({"version": 0}),
+        json!({"rrule": "eventSchedule"}),
+    ] {
+        assert!(plan_of(&refused).is_err(), "{refused}");
+    }
+    let newer = json!({"version": 2, "type": "CouncilMeeting", "preset": "schema-org",
+        "rrule": "eventSchedule", "mapping": {"SUMMARY": {"attribute": "name", "case": "upper"}}});
+    let (plan, degraded) = plan_of(&newer).expect("a newer mapping degrades");
+    assert!(degraded);
+    assert_eq!(plan.entity_type(), "CouncilMeeting");
+    let concert = event(&[("type", json!("CouncilMeeting"))]);
+    assert!(lines(&plan.vevent(&concert, &Window::default(), now()))
+        .iter()
+        .any(|l| l == "SUMMARY:Koncert"));
+}

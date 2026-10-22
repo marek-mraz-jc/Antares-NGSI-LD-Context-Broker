@@ -18,8 +18,16 @@ The schema stored for the view's Tenant at `/q/schemas/{tenant}`: LinkML
 in its resolved JSON form ([admin API](admin-api.md), T-3628). Every view of
 a Tenant serves the same source, each narrowed by its own rules. The surface
 reads it with the `linkml-model` subset, so a metaslot outside the subset
-(`imports`, for one) closes the LinkML surface and the reason goes to the
-log (LK4). A Tenant without a schema answers `404` on every path, like a
+(`any_of` or `mixins`, for one) closes the LinkML surface and the reason goes to the
+log (LK4). Generator output loads (T-5207): the non-semantic metaslots of
+`linkml_model::NON_SEMANTIC` (`from_schema`, `domain_of`, `owner`, `@type`,
+`metamodel_version`, `source_file`, mappings, `notes`, `examples` and the like) are
+dropped, the merged `linkml:types` copy and a class's induced `attributes` are
+recognised, and a bool or number annotation reads as its string. A slot whose
+`ngsi_ld_kind` names a kind outside the eight of NGSI-LD 1.9 loads; every surface
+serves it as an untyped, read-only, unfiltered value and keeps the rest of the
+schema (mapping-contract rule 4). `dev/gen-linkml-fixtures.sh` regenerates the
+`gen-linkml` fixtures the load test reads. A Tenant without a schema answers `404` on every path, like a
 view that is not loaded; a schema over `ANTARES_SCHEMA_MAX_BYTES` is
 refused with `413` when it is written and never reaches the surface; one
 stored under a bound above 1 MiB closes the surface and goes to the log (LK7).

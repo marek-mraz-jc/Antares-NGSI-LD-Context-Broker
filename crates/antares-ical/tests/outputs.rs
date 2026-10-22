@@ -94,6 +94,8 @@ async fn fixture() -> (TestBroker, Router) {
                "rules": rules}),
         json!({"id": "meetings", "tenant": "town", "selector": ["Event"], "operations": reads,
                "rules": rules, "representations": {"ical": [{"name": "rada", "sources": [{"type": "CouncilMeeting"}]}]}}),
+        json!({"id": "many", "tenant": "town", "selector": ["Event"], "operations": reads, "rules": rules,
+               "representations": {"ical": (0..=20).map(|i| json!({"name": format!("o{i}"), "sources": [{}]})).collect::<Vec<_>>()}}),
         json!({"id": "empty", "tenant": "nobody", "selector": ["Event"], "operations": reads,
                "rules": rules, "representations": {"ical": [{"name": "nic", "sources": [{}]}]}}),
     ] {
@@ -163,6 +165,9 @@ async fn a_view_without_outputs_has_no_calendar() {
         assert_eq!(a.status, StatusCode::NOT_FOUND, "{path}: {}", a.body);
         assert!(a.body.contains("no such calendar"), "{}", a.body);
     }
+    // a 21st output, which the gateway refuses at save, serves nobody
+    let a = send(&app, "GET", "/x/views/many/ical/v1/o0.ics", "", None).await;
+    assert_eq!(a.status, StatusCode::INTERNAL_SERVER_ERROR, "{}", a.body);
 }
 
 #[tokio::test]

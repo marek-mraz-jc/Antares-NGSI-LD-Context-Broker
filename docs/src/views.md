@@ -41,16 +41,17 @@ A view may select every type and show every Attribute with one form:
 Tenant still apply. `*` anywhere else is refused when the view loads.
 
 A view may carry `representations`, an object keyed by a format: `ical`
-([iCalendar](ical.md)), `ogc` ([OGC API - Features](ogc.md)), `geojson` and
-`csv` ([GeoJSON](geojson.md)). Each member is a list of at most 20 named
-outputs (docs API/11 EP-159, T-5216): `name`, `title` and `description` per
-language, `version`, `sources` (model classes with their role `mapping`), a
-`filter` (`q`, `scopeQ`, `georel`, `geometry`, `coordinates`, `geoproperty`)
-that only narrows the view, `lang` and `limit`. Any other key, or a member
-that is not such a list, is refused when the view loads; an output whose
-members do not hold serves nobody while the other outputs of the list still
-serve. The shared contract is `antares_ops::outputs`; the surface reads its
-own member.
+([iCalendar](ical.md)), `feed` (Atom, RSS and JSON Feed), `ogc`
+([OGC API - Features](ogc.md)), `geojson` and `csv` ([GeoJSON](geojson.md)).
+Each member is a list of named outputs (docs API/11 EP-159, T-5216): `name`,
+`title` and `description` per language, `version`, `sources` (model classes
+with their role `mapping`), a `filter` (`q`, `scopeQ`, `georel`, `geometry`,
+`coordinates`, `geoproperty`) that only narrows the view, `lang` and `limit`.
+Any other key, or a member that is not a list, is refused when the view loads.
+A list of more than 20 outputs or with a name twice loads and serves nobody
+(the gateway refuses it when the Endpoint is saved); an output whose members
+do not hold serves nobody while the other outputs of the list still serve. The
+shared contract is `antares_ops::outputs`; the surface reads its own member.
 
 ## 2. What a client sees
 

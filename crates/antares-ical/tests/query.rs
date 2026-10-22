@@ -222,15 +222,12 @@ async fn the_views_mapping_renders_the_feed_and_a_new_mapping_changes_it() {
     assert!(after.contains("SUMMARY:Jarmok"), "{after}");
     assert!(after.contains("LOCATION:Banská Bystrica"), "{after}");
     assert!(!after.contains("Podujatie"), "{after}");
-    // a representation the broker does not know, outputs that are no list or more than 20
-    let many: Vec<Value> = (0..21)
-        .map(|i| json!({"name": format!("o{i}"), "sources": [{}]}))
-        .collect();
+    // a representation the broker does not know, outputs that are no list (more than 20 load
+    // and serve nobody: tests/outputs.rs)
     for bad in [
         json!({"icall": []}),
         json!({"ical": "sdm-event"}),
         json!({"ical": {"preset": "sdm-event"}}),
-        json!({"ical": many}),
     ] {
         let (status, body) = put_view(&app, &view(Some(bad.clone()))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");

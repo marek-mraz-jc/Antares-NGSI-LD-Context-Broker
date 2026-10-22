@@ -537,15 +537,18 @@ async fn the_forms_of_later_rounds_are_501_and_read_only_writes_405() {
         );
         assert_eq!(got.json()["error"]["code"], "NotImplemented", "{uri}");
     }
-    let got = send(
-        &app,
-        Method::GET,
-        &format!("{ROOT}/Car?$schemaversion=*"),
-        None,
-        &[],
-    )
-    .await;
-    assert_eq!(got.status, StatusCode::OK, "{}", got.body);
+    // T-5207: `*` and the version `Core.SchemaVersion` states are served; another is not.
+    for current in ["*", "0.m1"] {
+        let got = send(
+            &app,
+            Method::GET,
+            &format!("{ROOT}/Car?$schemaversion={current}"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::OK, "{current}: {}", got.body);
+    }
     let got = send(&app, Method::POST, &format!("{ROOT}/Car"), Some("{}"), &[]).await;
     assert_eq!(
         got.status,

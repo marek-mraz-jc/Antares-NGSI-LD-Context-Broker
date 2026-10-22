@@ -63,7 +63,9 @@ pub(crate) async fn serve(
             .await
             .unwrap_or_else(IntoResponse::into_response);
     }
-    let (ODataUri::Resource { path, options }, None) = (&request.uri, later(&request.uri)) else {
+    let (ODataUri::Resource { path, options }, None) =
+        (&request.uri, later(&request.uri, &reads.edm.schema_version))
+    else {
         return not_implemented(version).into_response();
     };
     let answer = match path.as_slice() {

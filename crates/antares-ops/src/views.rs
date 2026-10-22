@@ -133,7 +133,7 @@ pub struct View {
 }
 
 /// The surfaces a view's `representations` may name.
-pub const REPRESENTATIONS: &[&str] = &["ical", "ogc", "geojson", "csv"];
+pub const REPRESENTATIONS: &[&str] = &["ical", "feed", "ogc", "geojson", "csv"];
 
 pub use crate::outputs::MAX_OUTPUTS;
 
@@ -311,13 +311,11 @@ impl View {
         };
         if let Some(named) = &self.representations {
             if let Some((name, _)) = named.iter().find(|(name, member)| {
-                !REPRESENTATIONS.contains(&name.as_str())
-                    || member
-                        .as_array()
-                        .is_none_or(|outputs| outputs.len() > MAX_OUTPUTS)
+                // a list past MAX_OUTPUTS loads and serves nobody: the surface refuses it
+                !REPRESENTATIONS.contains(&name.as_str()) || !member.is_array()
             }) {
                 return Err(format!(
-                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with a list of at most {MAX_OUTPUTS} outputs"
+                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with a list of outputs"
                 ));
             }
         }
@@ -1317,7 +1315,7 @@ mod tests {
 
     #[test]
     fn a_view_keeps_the_representations_it_names_and_refuses_another_name() {
-        let ical = json!({"ical": [{"name": "events", "sources": [{"preset": "sdm-event"}]}]});
+        let ical = json!({"ical": [{"name": "events", "sources": [{"preset": "sdm-event"}]}], "feed": [{"name": "news"}]});
         let loaded = load(&with("representations", ical.clone())).expect("loads");
         assert_eq!(
             loaded
@@ -1328,13 +1326,10 @@ mod tests {
             Some(ical)
         );
         assert!(load(&base()).is_ok_and(|l| l.representations.is_none()));
-        let many: Vec<Value> = (0..=MAX_OUTPUTS)
-            .map(|i| json!({"name": format!("o{i}")}))
-            .collect();
         for bad in [
             json!({"vcard": []}),
             json!({"ical": {"preset": "sdm-event"}}),
-            json!({"ical": many}),
+            json!({"feed": {}}),
             json!([]),
         ] {
             assert!(

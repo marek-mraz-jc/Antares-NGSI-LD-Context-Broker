@@ -259,6 +259,9 @@ fn prop(
     let inlined = slot.inlined == Some(true) && matches!(range, Range::Class(_));
     let relationship = !inlined && matches!(kind, "Relationship" | "ListRelationship");
     let one = match (kind, range) {
+        // A kind this mapping does not know: any JSON value, neither sorted nor
+        // filtered (T-5207, mapping-contract rule 4).
+        _ if !linkml_model::known_kind(kind) => json!({}),
         _ if relationship => json!({"type": "string", "format": "uri"}),
         ("GeoProperty", _) => json!({"format": "geometry-any"}),
         ("JsonProperty" | "LanguageProperty", _) | (_, Range::Class(_)) => {
@@ -314,7 +317,7 @@ mod tests {
     /// One slot per NGSI-LD kind and `LinkML` range the surface writes a schema for.
     const KINDS: &str = r#"{"id": "https://e.org/s", "name": "s", "default_prefix": "e",
                 "prefixes": {"e": {"prefix_prefix": "e", "prefix_reference": "https://e.org/"}},
-                "classes": {"A": {"slots": ["i", "f", "b", "d", "dt", "t", "u", "s", "c", "inl", "lr", "rel", "json", "lang", "geo", "vocab", "e", "le"]},
+                "classes": {"A": {"slots": ["i", "f", "b", "d", "dt", "t", "u", "s", "c", "inl", "lr", "rel", "json", "lang", "geo", "vocab", "e", "le", "nk"]},
                             "B": {}},
                 "slots": {"i": {"range": "integer"}, "f": {"range": "double"}, "b": {"range": "boolean"},
                           "d": {"range": "date"}, "dt": {"range": "datetime"}, "t": {"range": "time"},
@@ -327,7 +330,8 @@ mod tests {
                           "geo": {"annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}}},
                           "vocab": {"range": "E", "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "VocabProperty"}}},
                           "e": {"range": "E"},
-                          "le": {"range": "E", "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "ListProperty"}}}},
+                          "le": {"range": "E", "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "ListProperty"}}},
+                          "nk": {"range": "integer", "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "TimeSeriesProperty"}}}},
                 "enums": {"E": {"permissible_values": {"x": {}}}}}"#;
 
     #[test]
@@ -389,6 +393,8 @@ mod tests {
                 Some("B".to_owned()),
             ),
             ("json", json!({"type": "object"}), false, false, None),
+            // T-5207: a kind a later NGSI-LD version adds is any value, never sorted
+            ("nk", json!({}), false, false, None),
             ("lang", json!({"type": "object"}), false, false, None),
             ("geo", json!({"format": "geometry-any"}), false, false, None),
             (

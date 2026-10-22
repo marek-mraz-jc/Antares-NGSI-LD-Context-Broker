@@ -4,7 +4,7 @@
 every one with a Point, 30 days of `pm25` (four instances a day) on 500 AirQualityObserved and 5 000
 Events, then holds one k6 shape at a time at its rate for 30 s (open model,
 `dev/perf/k6-surfaces.js`). The vanilla binary (default features) runs the NGSI-LD shapes; the
-platform binary (`full,jc-policy,linkml,parquet,tabular,ical`) runs them again and adds the view
+platform binary (`full,jc-policy,linkml,parquet,tabular,ical,feed`) runs them again and adds the view
 root, OData, OGC API - Features, SensorThings, iCalendar, MCP and a WebSocket fan-out of 1 000
 subscribers. `dev/perf/surfaces_gate.py` judges each shape against `dev/perf/surfaces-budgets.json`
 (p95, p99, errors, throughput, each with its reason) and against `ci/perf-baseline/surfaces.json`

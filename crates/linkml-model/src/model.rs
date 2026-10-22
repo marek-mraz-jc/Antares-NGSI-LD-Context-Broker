@@ -156,8 +156,10 @@ pub enum Range<'a> {
     Enum(&'a str),
 }
 
-/// The NGSI-LD attribute kinds an `ngsi_ld_kind` annotation may name (DM-05).
-const KINDS: [&str; 8] = [
+/// The NGSI-LD attribute kinds the surfaces map (DM-05). An `ngsi_ld_kind`
+/// naming another kind (one a later NGSI-LD version adds) degrades that slot
+/// alone, see [`known_kind`] (T-5207).
+pub const KINDS: [&str; 8] = [
     "Property",
     "Relationship",
     "GeoProperty",
@@ -167,6 +169,19 @@ const KINDS: [&str; 8] = [
     "ListRelationship",
     "JsonProperty",
 ];
+
+/// Whether the surfaces map `kind` (one of [`KINDS`]). A slot of another kind
+/// is served as an untyped, read-only, unfiltered value with its kind stated,
+/// and the rest of the schema is unaffected (T-5207, mapping-contract rule 4).
+///
+/// ```
+/// assert!(linkml_model::known_kind("VocabProperty"));
+/// assert!(!linkml_model::known_kind("TimeSeriesProperty"));
+/// ```
+#[must_use]
+pub fn known_kind(kind: &str) -> bool {
+    KINDS.contains(&kind)
+}
 
 /// The annotation tag that states a slot's NGSI-LD kind (DM-05).
 pub const KIND_TAG: &str = "ngsi_ld_kind";
@@ -257,7 +272,10 @@ impl Model {
                 max: limits.max_depth,
             });
         }
-        let schema = serde_json::from_slice(json).map_err(|e| {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(json).map_err(|e| Error::Malformed(e.to_string()))?;
+        crate::schema::normalize(&mut value);
+        let schema = serde_json::from_value(value).map_err(|e| {
             // serde names an unknown field this way (`de::Error::unknown_field`)
             // and nothing else; it is LinkML outside the subset, not broken JSON.
             let text = e.to_string();
@@ -747,9 +765,13 @@ fn check_slot(schema: &Schema, what: &str, slot: &Slot) -> Result<(), Error> {
     }
     for (tag, a) in &slot.annotations {
         check_key(&format!("{what} annotation"), tag, Some(&a.tag))?;
-        if tag == KIND_TAG && !KINDS.contains(&a.value.as_str()) {
+        if tag == KIND_TAG
+            && !(known_kind(&a.value)
+                || a.value.starts_with(|c: char| c.is_ascii_uppercase())
+                    && a.value.chars().all(|c| c.is_ascii_alphanumeric()))
+        {
             return malformed(format!(
-                "{what}: {KIND_TAG} {:?} is no NGSI-LD kind",
+                "{what}: {KIND_TAG} {:?} is no NGSI-LD kind name",
                 a.value
             ));
         }

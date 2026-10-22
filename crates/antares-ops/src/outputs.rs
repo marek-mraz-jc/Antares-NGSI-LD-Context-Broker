@@ -279,18 +279,34 @@ impl Output {
 }
 
 /// The outputs `listed` under one format (a view's `representations.<format>`), each by its
-/// name and checked for `format`; an element without a string `name` is skipped.
+/// name and checked for `format`; an element without a string `name` is skipped. A list of
+/// more than [`MAX_OUTPUTS`] or with a name twice, which the gateway refuses at save, serves
+/// nobody.
 #[must_use]
 pub fn listed(listed: Option<&Value>, format: &str) -> Vec<(String, Result<Output, String>)> {
-    listed
+    let all: Vec<&Value> = listed
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .collect();
+    let mut names: Vec<&str> = all
+        .iter()
+        .filter_map(|o| o.get("name").and_then(Value::as_str))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let whole = all.len() <= MAX_OUTPUTS && names.len() == all.len();
+    all.into_iter()
         .filter_map(|o| {
             let name = o.get("name")?.as_str()?.to_owned();
             let output = serde_json::from_value::<Output>(o.clone())
                 .map_err(|e| format!("{name}: {e}"))
-                .and_then(|o| o.check(format));
+                .and_then(|o| o.check(format))
+                .and_then(|o| {
+                    whole.then_some(o).ok_or(format!(
+                        "{name}: the list holds more than {MAX_OUTPUTS} outputs or a name twice"
+                    ))
+                });
             Some((name, output))
         })
         .collect()
@@ -472,6 +488,21 @@ mod tests {
             assert_eq!(listed(Some(&nothing), "ogc").len(), 0, "{nothing}");
         }
         assert_eq!(listed(None, "ogc").len(), 0);
+    }
+
+    #[test]
+    fn a_list_the_gateway_refuses_at_save_serves_nobody() {
+        let one = json!({"name": "a", "sources": [{"type": "E"}]});
+        let many: Vec<Value> = (0..=MAX_OUTPUTS)
+            .map(|i| json!({"name": format!("o{i}"), "sources": [{"type": "E"}]}))
+            .collect();
+        for list in [json!([one, one]), json!(many)] {
+            let served = listed(Some(&list), "csv")
+                .iter()
+                .filter(|(_, o)| o.is_ok())
+                .count();
+            assert_eq!(served, 0, "{list}");
+        }
     }
 
     #[test]
