@@ -267,3 +267,138 @@ async fn corrections_keep_every_stamp() {
     assert_eq!(chain[2]["modifiedAt"], c3);
     clean(&pool, t.as_str()).await;
 }
+
+/// Bytes a row takes, numeric and text separately: avg pg_column_size of
+/// the whole row, of `data` as stored, and of `data` with instanceId put
+/// back (the shape before T-5131).
+async fn row_bytes(pool: &sqlx::PgPool, tenant: &str, numeric: bool) -> (f64, f64, f64) {
+    sqlx::query_as(
+        "SELECT avg(pg_column_size(a.*))::float8, avg(pg_column_size(data))::float8,
+                avg(pg_column_size(data || jsonb_build_object('instanceId', instance_id)))::float8
+         FROM attr_instances a
+         WHERE tenant_id = $1 AND (jsonb_typeof(data -> 'value') = 'number') = $2",
+    )
+    .bind(tenant)
+    .bind(numeric)
+    .fetch_one(pool)
+    .await
+    .expect("row bytes")
+}
+
+/// Every kind of history value (owner 2026-10-22T08:50Z) reads back
+/// byte-identical in both row shapes: instanceId only in its column
+/// (T-5131) and instanceId also in `data` (rows written before). Text up to
+/// 10 KB (TOAST) changed three times keeps every version.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_kind_reads_back_byte_identical_in_both_shapes() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let t = TenantId::new("pgstampsk").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    clean(&pool, t.as_str()).await;
+    let s = PgTemporalStore::new(pool.clone());
+    let id = "urn:ngsi-ld:Vehicle:stamps4";
+    let ms = "2026-10-20T06:00:00.120Z";
+    let at = |m: u32| format!("2026-10-20T06:{m:02}:00Z");
+    let term = |t: &str| format!("https://uri.etsi.org/ngsi-ld/default-context/{t}");
+    let one = |n: u32, body: Value| -> Value {
+        let mut i = json!({"observedAt": at(n), "instanceId": format!("urn:ngsi-ld:Instance:k{n}"),
+                           "createdAt": ms, "modifiedAt": ms});
+        if let (Some(o), Some(b)) = (i.as_object_mut(), body.as_object()) {
+            o.extend(b.clone());
+        }
+        json!([i])
+    };
+    let long = |c: char, n: usize| -> String { std::iter::repeat_n(c, n).collect() };
+    let doc = json!({
+        "id": id, "type": "Vehicle",
+        SPEED: one(1, json!({"type": "Property", "value": 42.5, "unitCode": "KMH"})),
+        term("note"): one(2, json!({"type": "Property", "value": "short text, ľščťžýáíé"})),
+        term("manual"): one(3, json!({"type": "Property", "value": long('m', 2500)})),
+        NAME: one(4, json!({"type": "LanguageProperty", "languageMap": {"sk": "auto", "en": "car"}})),
+        PLACE: one(5, json!({"type": "GeoProperty",
+                             "value": {"type": "Polygon", "coordinates": [[[19.1, 48.7], [19.2, 48.7], [19.2, 48.8], [19.1, 48.7]]]}})),
+        OWNER: one(6, json!({"type": "Relationship", "object": "urn:ngsi-ld:Person:p1", "objectType": "Person"})),
+        term("config"): one(7, json!({"type": "JsonProperty", "json": {"a": [1, {"b": null}], "c": "d"}})),
+        term("category"): one(8, json!({"type": "VocabProperty", "vocab": "https://example.org/vocab#bus"})),
+        term("readings"): one(9, json!({"type": "ListProperty", "valueList": [1, "two", {"three": 3}]})),
+        term("status"): one(10, json!({"type": "Property", "value": "ok",
+            term("reason"): {"type": "Property", "value": "checked", "createdAt": ms, "modifiedAt": ms},
+            term("checkedBy"): {"type": "Relationship", "object": "urn:ngsi-ld:Person:p2",
+                                "createdAt": ms, "modifiedAt": ms}})),
+    });
+    assert!(s.create(&t, id, &doc).await.expect("create"));
+
+    // A 10 KB text changed three times: four versions of the attribute.
+    // An append keeps history only of a live Entity.
+    sqlx::query(
+        "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
+         VALUES ($1, $2, jsonb_build_object('id', $2::text), ARRAY['T'], now(), now())",
+    )
+    .bind(t.as_str())
+    .bind(id)
+    .execute(&pool)
+    .await
+    .expect("entity row");
+    let shell = json!({"id": id, "type": "Vehicle"});
+    let text = term("description");
+    let mut versions = Vec::new();
+    for (n, c) in ['a', 'b', 'c', 'd'].into_iter().enumerate() {
+        let n = u32::try_from(n).expect("small").saturating_add(20);
+        let v = json!({"type": "Property", "value": long(c, 10 * 1024), "observedAt": at(n),
+                       "instanceId": format!("urn:ngsi-ld:Instance:k{n}"),
+                       "createdAt": ms, "modifiedAt": ms});
+        s.append(&t, id, &shell, &json!({text.clone(): [v.clone()]}))
+            .await
+            .expect("text change");
+        versions.push(v);
+    }
+    let mut want = doc.clone();
+    if let Some(o) = want.as_object_mut() {
+        o.insert(text.clone(), Value::Array(versions));
+    }
+    let byte_identical = |got: &Value| {
+        let mut got = got.clone();
+        if let Some(arr) = got[&text].as_array_mut() {
+            arr.sort_by_key(|i| i["observedAt"].as_str().map(str::to_owned));
+        }
+        assert_eq!(
+            serde_json::to_string(&got).expect("json"),
+            serde_json::to_string(&want).expect("json")
+        );
+    };
+
+    // T-5131 shape: no instanceId in data.
+    let rows = stored(&pool, t.as_str()).await;
+    assert_eq!(rows.len(), 14);
+    assert!(rows.iter().all(|r| r.1.is_none()), "{rows:?}");
+    byte_identical(&s.get(&t, id).await.expect("get").expect("present"));
+    let (num_row, num_data, num_old) = row_bytes(&pool, t.as_str(), true).await;
+    // The text rows' third figure is detoasted (the || decompresses), so
+    // only the numeric one compares the two shapes.
+    let (txt_row, txt_data, _) = row_bytes(&pool, t.as_str(), false).await;
+    eprintln!(
+        "bytes a row: numeric row {num_row:.0}, data {num_data:.0} (with instanceId {num_old:.0}); \
+         text and other kinds row {txt_row:.0}, data {txt_data:.0}"
+    );
+    assert!(
+        num_data < num_old,
+        "{num_data} B, before T-5131 {num_old} B"
+    );
+
+    // Shape before T-5131: instanceId also in data. Same answer.
+    sqlx::query(
+        "UPDATE attr_instances SET data = data || jsonb_build_object('instanceId', instance_id)
+         WHERE tenant_id = $1",
+    )
+    .bind(t.as_str())
+    .execute(&pool)
+    .await
+    .expect("old shape");
+    assert!(stored(&pool, t.as_str())
+        .await
+        .iter()
+        .all(|r| r.1.as_deref() == Some(r.0.as_str())));
+    byte_identical(&s.get(&t, id).await.expect("get").expect("present"));
+    clean(&pool, t.as_str()).await;
+}
