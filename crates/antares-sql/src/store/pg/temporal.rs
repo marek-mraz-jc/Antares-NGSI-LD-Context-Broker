@@ -39,6 +39,9 @@ struct Keys {
     /// statement, so a stale entry fails a write (23502) instead of keying a
     /// row by an id that names nothing.
     known: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// Which writes keep short history (T-5249): their rows go to the
+    /// unlogged child of `attr_rows`, whatever the cut-over.
+    short: std::sync::RwLock<std::sync::Arc<antares_store::ShortHistory>>,
 }
 
 /// ponytail: the known set is cleared whole at this size (a few hundred MB of
@@ -120,6 +123,19 @@ impl Keys {
     /// a keyed write that found an IRI gone (another pod's purge).
     fn forget(&self, tenant: &TenantId) {
         self.known().retain(|(t, _)| t != tenant.as_str());
+    }
+
+    /// Whether a write of an Entity of `types` whose current state is
+    /// `shell` keeps short history.
+    fn is_short(&self, tenant: &TenantId, types: &[String], shell: &Value) -> bool {
+        self.short
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_short(
+                tenant.as_str(),
+                types,
+                shell.get(antares_store::HISTORY_RETENTION).is_some(),
+            )
     }
 }
 
@@ -410,6 +426,14 @@ fn unseen(rows: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
+/// How [`insert_rows`] writes one batch: `dedup` records new observations
+/// only, `short` writes every row to the unlogged child (T-5249).
+#[derive(Clone, Copy)]
+struct Route {
+    dedup: bool,
+    short: bool,
+}
+
 /// Multi-row instance upsert inside the caller's transaction. With `dedup`
 /// (the auto-recording append) a row is written only when it is a new
 /// observation (T-4507): an instance with an `observedAt` already stored for
@@ -419,7 +443,8 @@ fn unseen(rows: Vec<Value>) -> Vec<Value> {
 ///
 /// A row observed from the cut-over on goes to `attr_rows` (T-5243), any
 /// earlier one to `attr_instances`, a late write included: one observation
-/// always meets its stored instance in the same parent.
+/// always meets its stored instance in the same parent. Every row of a
+/// `short` write goes to `attr_rows` as `short`, its unlogged child (T-5249).
 async fn insert_rows(
     tx: &mut sqlx::PgConnection,
     keys: &Keys,
@@ -427,7 +452,7 @@ async fn insert_rows(
     tenant: &TenantId,
     entity_id: &str,
     rows: Vec<Value>,
-    dedup: bool,
+    Route { dedup, short }: Route,
 ) -> Result<(), sqlx::Error> {
     let dedup = dedup && temporal_dedup();
     let rows = if dedup { unseen(rows) } else { rows };
@@ -443,9 +468,12 @@ async fn insert_rows(
         .collect();
     in_dataset.sort_unstable();
     in_dataset.dedup();
-    let cutover = keys.cutover(tx).await?;
-    let (keyed, text): (Vec<Value>, Vec<Value>) =
-        rows.into_iter().partition(|r| is_keyed(r, cutover));
+    let (keyed, text): (Vec<Value>, Vec<Value>) = if short {
+        (rows, Vec::new())
+    } else {
+        let cutover = keys.cutover(tx).await?;
+        rows.into_iter().partition(|r| is_keyed(r, cutover))
+    };
     if !text.is_empty() {
         insert_text(tx, tenant, entity_id, text, dedup).await?;
     }
@@ -457,7 +485,7 @@ async fn insert_rows(
                 .filter_map(|r| r["attr_id"].as_str().map(str::to_owned)),
         );
         keys.ensure(tx, tenant, iris, ensured).await?;
-        if let Err(e) = insert_keyed(tx, tenant, entity_id, keyed, dedup).await {
+        if let Err(e) = insert_keyed(tx, tenant, entity_id, keyed, dedup, short).await {
             // an IRI the known set holds is gone: another pod purged the Tenant
             if matches!(&e, sqlx::Error::Database(d) if d.code().as_deref() == Some("23502")) {
                 keys.forget(tenant);
@@ -635,6 +663,7 @@ async fn insert_keyed(
     entity_id: &str,
     mut rows: Vec<Value>,
     dedup: bool,
+    short: bool,
 ) -> Result<(), sqlx::Error> {
     for r in &mut rows {
         let id = r["instance_id"].as_str().unwrap_or_default().to_owned();
@@ -707,12 +736,12 @@ async fn insert_keyed(
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO attr_rows
            (tenant_id, entity_no, attr_no, instance_no, dataset_id, observed_at,
-            created_at, modified_at, deleted_at, data, geo_value, provenance)
+            created_at, modified_at, deleted_at, data, geo_value, provenance, short)
          SELECT $1, iri_no($1, $2), iri_no($1, e->>'attr_id'), (e->>'instance_no')::uuid,
                 e->>'dataset_id',
                 (e->>'observed_at')::timestamptz, (e->>'created_at')::timestamptz,
                 (e->>'modified_at')::timestamptz, (e->>'deleted_at')::timestamptz,
-                e->'data', {GEO_VALUE}, NULLIF(e->'provenance', 'null'::jsonb)
+                e->'data', {GEO_VALUE}, NULLIF(e->'provenance', 'null'::jsonb), $7
          FROM jsonb_array_elements($3::jsonb) AS e
          WHERE NOT $4 OR NOT CASE
            WHEN e->'data' ? 'observedAt' THEN EXISTS (
@@ -722,7 +751,7 @@ async fn insert_keyed(
                AND x.observed_at BETWEEN $5::timestamptz AND $6::timestamptz)
            ELSE {NEWEST_REPEATS}
          END
-         ON CONFLICT (tenant_id, entity_no, attr_no, observed_at, instance_no)
+         ON CONFLICT (tenant_id, entity_no, attr_no, observed_at, instance_no, short)
            DO UPDATE SET data = EXCLUDED.data, modified_at = EXCLUDED.modified_at,
                          dataset_id = EXCLUDED.dataset_id,
                          deleted_at = EXCLUDED.deleted_at,
@@ -738,6 +767,7 @@ async fn insert_keyed(
     .bind(dedup)
     .bind(&lo)
     .bind(&hi)
+    .bind(short)
     .execute(&mut *tx)
     .await?;
     Ok(())
@@ -1090,6 +1120,15 @@ impl PgTemporalStore {
         s
     }
 
+    /// Replaces which writes keep short history (T-5249) with `short`.
+    pub fn set_short_history(&self, short: antares_store::ShortHistory) {
+        *self
+            .keys
+            .short
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(short);
+    }
+
     /// Forgets the dictionary entries of `tenant` after its purge.
     pub fn forget_tenant(&self, tenant: &TenantId) {
         self.keys.forget(tenant);
@@ -1146,7 +1185,20 @@ impl PgTemporalStore {
         .rows_affected();
         if n == 1 {
             let mut ensured = std::collections::HashSet::new();
-            insert_rows(&mut tx, &self.keys, &mut ensured, tenant, id, rows, false).await?;
+            let short = self.keys.is_short(tenant, &types, doc);
+            insert_rows(
+                &mut tx,
+                &self.keys,
+                &mut ensured,
+                tenant,
+                id,
+                rows,
+                Route {
+                    dedup: false,
+                    short,
+                },
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(n == 1)
@@ -1190,10 +1242,13 @@ impl PgTemporalStore {
         }
         let mut tx = super::begin(&self.pool).await?;
         let mut ensured = std::collections::HashSet::new();
-        // After the cut-over, the batch's first sights go in first, in one
-        // order: an Entity at a time, two batches could each wait on an IRI
-        // the other wrote first.
-        if self.keys.cutover(&mut tx).await?.is_some() {
+        // After the cut-over or for a short write, the batch's first sights go
+        // in first, in one order: an Entity at a time, two batches could each
+        // wait on an IRI the other wrote first.
+        let short = appends
+            .iter()
+            .any(|(tenant, _, shell, _)| self.keys.is_short(tenant, &extract(shell).0, shell));
+        if short || self.keys.cutover(&mut tx).await?.is_some() {
             let mut by_tenant: std::collections::BTreeMap<&str, (&TenantId, Vec<String>)> =
                 std::collections::BTreeMap::new();
             for (tenant, id, _, additions) in appends {
@@ -1270,7 +1325,9 @@ impl PgTemporalStore {
         .bind(&modified)
         .execute(&mut **tx)
         .await?;
-        insert_rows(tx, &self.keys, ensured, tenant, id, rows, true).await
+        let short = self.keys.is_short(tenant, &types, shell);
+        let route = Route { dedup: true, short };
+        insert_rows(tx, &self.keys, ensured, tenant, id, rows, route).await
     }
 
     pub async fn get(&self, tenant: &TenantId, id: &str) -> Result<Option<Value>, sqlx::Error> {
@@ -1863,7 +1920,10 @@ impl PgTemporalStore {
                     tenant,
                     id,
                     upserts,
-                    false,
+                    Route {
+                        dedup: false,
+                        short: self.keys.is_short(tenant, &types, &doc),
+                    },
                 )
                 .await?;
                 sqlx::query(

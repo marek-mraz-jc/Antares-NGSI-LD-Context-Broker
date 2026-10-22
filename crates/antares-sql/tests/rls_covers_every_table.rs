@@ -92,6 +92,8 @@ fn named_after(sql: &str, kw: &str) -> Vec<String> {
 /// reached through the parent, which is how the request path reaches it).
 fn live_tables(sql: &str) -> BTreeSet<String> {
     let mut created: BTreeSet<String> = named_after(sql, "create table").into_iter().collect();
+    // 0022: the unlogged short history (T-5249) is a table like any other
+    created.extend(named_after(sql, "create unlogged table"));
     for dropped in named_after(sql, "drop table") {
         created.remove(&dropped);
     }
@@ -143,7 +145,9 @@ fn every_table_the_migrations_create_is_policed_or_exempt() {
     let sql = migration_sql();
     let live = live_tables(&sql);
     assert!(
-        live.contains("entities") && live.contains("dead_letters"),
+        live.contains("entities")
+            && live.contains("dead_letters")
+            && live.contains("attr_rows_short"),
         "the parse found {live:?}, which is not the schema"
     );
     let policed = policed(&sql);

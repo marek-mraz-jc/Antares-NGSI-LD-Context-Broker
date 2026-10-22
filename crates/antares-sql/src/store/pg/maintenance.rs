@@ -319,7 +319,7 @@ async fn plain_retention(pool: &PgPool, days: i64) -> Result<Vec<String>, sqlx::
          FROM pg_inherits i
          JOIN pg_class c ON c.oid = i.inhrelid
          JOIN pg_class p ON p.oid = i.inhparent
-         WHERE p.relname IN ('attr_instances', 'attr_rows')
+         WHERE p.relname IN ('attr_instances', 'attr_rows_long')
            AND p.relnamespace = 'public'::regnamespace",
     )
     .fetch_all(&mut *tx)
@@ -757,7 +757,7 @@ async fn drop_partitions(
          JOIN pg_class p ON p.oid = i.inhparent
          CROSS JOIN LATERAL (SELECT substring(pg_get_expr(c.relpartbound, c.oid)
                                     FROM 'TO \(''([^'']+)''\)')::timestamptz AS hi) b
-         WHERE p.relname IN ('attr_instances', 'attr_rows')
+         WHERE p.relname IN ('attr_instances', 'attr_rows_long')
            AND p.relnamespace = 'public'::regnamespace
            AND pg_get_expr(c.relpartbound, c.oid) LIKE 'FOR VALUES FROM%'
            AND b.hi <= GREATEST((SELECT max(x) FROM unnest($1::timestamptz[]) x),
@@ -856,13 +856,14 @@ fn drop_partition_sql(name: &str) -> String {
     format!("DROP TABLE public.\"{}\"", name.replace('"', "\"\""))
 }
 
-/// One weekly partition, created directly under the parent: `attr_rows`
-/// when `keyed`, else `attr_instances`. Fails while the parent's DEFAULT
+/// One weekly partition, created directly under the parent: `attr_rows_long`,
+/// the logged child of `attr_rows` (0022, T-5249), when `keyed`, else
+/// `attr_instances`. Fails while the parent's DEFAULT
 /// partition still holds a row in `[lo, hi)`.
 fn create_partition_sql(keyed: bool, suffix: &str, lo: &str, hi: &str) -> String {
     if keyed {
         format!(
-            "CREATE TABLE IF NOT EXISTS attr_rows_{suffix} PARTITION OF attr_rows \
+            "CREATE TABLE IF NOT EXISTS attr_rows_{suffix} PARTITION OF attr_rows_long \
              FOR VALUES FROM ('{lo}') TO ('{hi}')"
         )
     } else {
@@ -884,7 +885,7 @@ fn adopt_default_rows_sql(keyed: bool, suffix: &str, lo: &str, hi: &str) -> [Str
         return [
             format!(
                 "CREATE TABLE IF NOT EXISTS attr_rows_{suffix} \
-                 (LIKE attr_rows INCLUDING DEFAULTS INCLUDING CONSTRAINTS)"
+                 (LIKE attr_rows_long INCLUDING DEFAULTS INCLUDING CONSTRAINTS)"
             ),
             format!(
                 "WITH moved AS (DELETE FROM attr_rows_default \
@@ -892,7 +893,7 @@ fn adopt_default_rows_sql(keyed: bool, suffix: &str, lo: &str, hi: &str) -> [Str
                  INSERT INTO attr_rows_{suffix} SELECT * FROM moved"
             ),
             format!(
-                "ALTER TABLE attr_rows ATTACH PARTITION attr_rows_{suffix} \
+                "ALTER TABLE attr_rows_long ATTACH PARTITION attr_rows_{suffix} \
                  FOR VALUES FROM ('{lo}') TO ('{hi}')"
             ),
         ];
@@ -1150,21 +1151,22 @@ mod tests {
     }
 
     /// A week from the cut-over on (T-5200) is a week of `attr_rows`, built,
-    /// moved and attached under that parent only.
+    /// moved and attached under its logged child `attr_rows_long` (0022,
+    /// T-5249) only.
     #[test]
     fn a_keyed_week_goes_to_attr_rows() {
         let sql = create_partition_sql(true, "2026w34", LO, HI);
         assert!(
-            sql.contains("attr_rows_2026w34 PARTITION OF attr_rows "),
+            sql.contains("attr_rows_2026w34 PARTITION OF attr_rows_long "),
             "{sql}"
         );
         let [create, mv, attach] = adopt_default_rows_sql(true, "2026w34", LO, HI);
-        assert!(create.contains("(LIKE attr_rows "), "{create}");
+        assert!(create.contains("(LIKE attr_rows_long "), "{create}");
         assert!(mv.contains("DELETE FROM attr_rows_default"), "{mv}");
         assert!(mv.contains("INSERT INTO attr_rows_2026w34"), "{mv}");
         assert!(mv.contains(&format!("observed_at < '{HI}'")), "{mv}");
         assert!(
-            attach.starts_with("ALTER TABLE attr_rows ATTACH PARTITION attr_rows_2026w34"),
+            attach.starts_with("ALTER TABLE attr_rows_long ATTACH PARTITION attr_rows_2026w34"),
             "{attach}"
         );
         assert!(!format!("{sql}{create}{mv}{attach}").contains("attr_instances"));

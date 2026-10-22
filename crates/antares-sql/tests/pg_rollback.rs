@@ -114,3 +114,46 @@ async fn the_cut_over_is_a_monday_after_the_migration_and_breaking() {
     assert_eq!(kind(20), Some(false), "0020 stays compatible");
     assert_eq!(kind(21), Some(true), "0021 is breaking");
 }
+
+/// T-5249: 0022 puts the short history in an unlogged child of `attr_rows`
+/// (plain mode) and is `breaking`, because its unique key takes `short` and a
+/// 0021 release's ON CONFLICT names a key no index has.
+#[tokio::test(flavor = "multi_thread")]
+async fn short_history_is_unlogged_and_0022_breaking() {
+    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+        return;
+    };
+    let pool = pg::connect(&url, 2).await.expect("connect+migrate");
+    let timescale: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("extension");
+    let kinds: Vec<(String, String)> = sqlx::query_as(
+        "SELECT relname::text, relpersistence::text FROM pg_class
+          WHERE relname IN ('attr_rows_short', 'attr_rows_long')
+            AND relnamespace = 'public'::regnamespace ORDER BY relname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("persistence");
+    let want: Vec<(String, String)> = if timescale {
+        Vec::new()
+    } else {
+        vec![
+            ("attr_rows_long".into(), "p".into()),
+            ("attr_rows_short".into(), "u".into()),
+        ]
+    };
+    assert_eq!(
+        kinds, want,
+        "the short child is unlogged, the long one logged"
+    );
+    let breaking = pg::MIGRATOR
+        .iter()
+        .find(|m| m.version == 22)
+        .map(|m| m.description.starts_with("breaking "));
+    assert_eq!(breaking, Some(true), "0022 is breaking");
+}

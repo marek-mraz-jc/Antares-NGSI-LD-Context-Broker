@@ -988,6 +988,44 @@ pub fn strip_provenance(doc: &mut Value) {
 /// specific level, beside `expiresAt`, which ends the Entity itself.
 pub const HISTORY_RETENTION: &str = "https://uri.etsi.org/ngsi-ld/default-context/historyRetention";
 
+/// The longest history retention whose rows a store may keep unlogged
+/// (T-5249, docs/src/storage.md "Short history"): a crash loses at most the
+/// trail the sweep drops within this span anyway.
+pub const SHORT_HISTORY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Which writes record history of [`SHORT_HISTORY`] or less, from the
+/// Tenants' retention rules (DM-97): a store keeps those rows where a crash
+/// may lose them and writes them no WAL.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ShortHistory {
+    /// (Tenant, expanded type) of every type rule that says something of
+    /// history: `true` when it keeps [`SHORT_HISTORY`] or less.
+    pub types: std::collections::HashMap<(String, String), bool>,
+    /// Tenants whose `*` rule keeps [`SHORT_HISTORY`] or less.
+    pub tenants: std::collections::HashSet<String>,
+}
+
+impl ShortHistory {
+    /// Whether a write of an Entity of `types` in `tenant` keeps short
+    /// history: some type's rule is short and none is longer, or no type has
+    /// a rule and the Tenant's `*` rule is short. An Entity with its own
+    /// [`HISTORY_RETENTION`] (`own`) never is: its level wins over both.
+    #[must_use]
+    pub fn is_short(&self, tenant: &str, types: &[String], own: bool) -> bool {
+        if own || (self.types.is_empty() && self.tenants.is_empty()) {
+            return false;
+        }
+        let mut ruled = types
+            .iter()
+            .filter_map(|t| self.types.get(&(tenant.to_owned(), t.clone())))
+            .peekable();
+        if ruled.peek().is_none() {
+            return self.tenants.contains(tenant);
+        }
+        ruled.all(|short| *short)
+    }
+}
+
 /// The Entities of one Tenant a history retention statement reaches (DM-97).
 #[derive(Debug, Clone, Copy)]
 pub enum HistoryScope<'a> {
@@ -1073,6 +1111,11 @@ pub trait TemporalDriver: Send + Sync {
     ) -> Result<Vec<String>, NgsiError> {
         let _ = floors;
         Ok(Vec::new())
+    }
+    /// The retention rules' [`ShortHistory`], replaced whole on each reload
+    /// of the rules; a driver without unlogged storage ignores it.
+    fn set_short_history(&self, short: ShortHistory) {
+        let _ = short;
     }
     /// Every version of the rows of one Entity's history (T-4665, platform
     /// ADR-N-054 2.4), by expanded Attribute name: each instance with its
@@ -1284,6 +1327,26 @@ impl TemporalDriver for NoTemporal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-5249: a short type rule wins over the Tenant's level, a longer type
+    /// rule among the types or the Entity's own retention keeps it logged.
+    #[test]
+    fn short_history_takes_the_most_specific_level() {
+        let mut s = ShortHistory::default();
+        let ty = |t: &str| vec![t.to_owned()];
+        assert!(!s.is_short("city", &ty("Bus"), false), "no rule, not short");
+        s.types.insert(("city".into(), "Bus".into()), true);
+        s.types.insert(("city".into(), "Stop".into()), false);
+        assert!(s.is_short("city", &ty("Bus"), false));
+        assert!(!s.is_short("city", &ty("Bus"), true), "own retention wins");
+        assert!(!s.is_short("town", &ty("Bus"), false), "another Tenant");
+        let both = vec!["Bus".to_owned(), "Stop".to_owned()];
+        assert!(!s.is_short("city", &both, false), "a longer type keeps it");
+        assert!(!s.is_short("city", &ty("Tram"), false), "no `*` rule");
+        s.tenants.insert("city".into());
+        assert!(s.is_short("city", &ty("Tram"), false), "the `*` rule");
+        assert!(!s.is_short("city", &ty("Stop"), false), "a type rule wins");
+    }
 
     /// The mode list is one source of truth: every variant round-trips
     /// through its name, and the message for an unknown name lists all of

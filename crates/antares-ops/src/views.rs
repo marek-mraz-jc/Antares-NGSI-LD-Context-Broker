@@ -651,6 +651,9 @@ impl Reloader {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             retention::history_off(&retention);
+        self.state
+            .temporal
+            .set_short_history(retention::short_history(&retention));
         *self
             .retention
             .write()

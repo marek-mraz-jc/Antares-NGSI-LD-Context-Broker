@@ -249,6 +249,36 @@ The shape, as it is to be built:
 The keys save about 390 B a row. Getting a dev row under 300 B also needs
 the `data` side; today only TimescaleDB's columnstore gets there (120 B).
 
+### Short history (T-5249)
+
+A type whose retention rule keeps `history` of PT1H or less (or, for a type
+without a history rule, the Tenant's `*` rule) writes its history rows
+UNLOGGED. Migration 0022 makes `attr_rows` a parent partitioned by the column
+`short`: `attr_rows_long` (the range-partitioned table 0020 built, logged)
+holds `short = false`, `attr_rows_short` (UNLOGGED, not range-partitioned)
+holds `short = true`. Every read and delete names `attr_rows`, so the planner
+merges both children in index order (one Merge Append, no extra arm) and the
+retention sweep, the 4.22 reap and a Tenant's delete reach both.
+
+- The store learns the rule set on every reload of the retention documents
+  (`TemporalDriver::set_short_history`). A short write goes to
+  `attr_rows_short` whatever the cut-over; an Entity with its own
+  `historyRetention` never does, and a type with a longer rule among its
+  types keeps the Entity logged.
+- A rule that grows past PT1H sends new rows to the logged side (or to
+  `attr_instances` before the cut-over); the rows already written stay in
+  `attr_rows_short` until the sweep drops them by the rule. A rule that
+  shrinks to PT1H or less does the opposite. Across that one change, an
+  observation already stored on the other side is recorded once more.
+- Durability, the trade: an UNLOGGED table writes no WAL. A Postgres crash
+  (not a clean restart) empties `attr_rows_short`, and a streaming replica
+  or a failover target holds none of it, nor does a WAL-based backup or
+  PITR. What is lost is at most the trail the sweep drops within the hour
+  anyway; current state (`entities`) and every longer history stay logged.
+  A clean broker or Postgres restart keeps the rows.
+- Under TimescaleDB a hypertable can be neither unlogged nor a partition:
+  `attr_rows` only gains the `short` column and every row stays logged.
+
 ## Migrations
 
 `crates/antares-sql/migrations/`, applied by the first process to start
@@ -277,3 +307,4 @@ unless `ANTARES_MIGRATE=0` hands the job to an init container.
 | `0019_drop_entities_jsonb` | Drops `i_entities_jsonb`, the `jsonb_path_ops` GIN over the whole document (T-5193). No jsonb operator is leakproof (`@?`, `@>`, `?|`), so under forced RLS the broker's role never used it as an index condition: as `antares_app`, a q= page of 200,000 Entities read the primary key and filtered 199,998 rows with the GIN in place, while a superuser's plan read the GIN. Every Entity write still paid a GIN entry per path. 1,869 -> 1,754 B an Entity on that synthetic set; a deployment that bypasses RLS loses the GIN path its q= pages used. |
 | `0020_history_integer_keys` | The second history parent of the integer keys (T-5200, "Integer history keys" above): `iri_ids` (per-Tenant dictionary of full expanded IRIs, 0005's per-command RLS, no UPDATE policy), `attr_rows` (partitioned or a hypertable as `attr_instances`, unique key (`tenant_id`, `entity_no`, `attr_no`, `observed_at`, `instance_no`), its RLS and compression as 0001 gives `attr_instances`), the one-row `history_cutover` holding NULL, and the functions `iri_no`, `attr_rows_of` and `attr_rows_at`. Every history read and delete covers both parents; nothing writes `attr_rows` while the cut-over is NULL. |
 | `0021_breaking_history_cutover` | Sets `history_cutover` to the Monday after the migration (T-5243): from it on the store writes each history row observed at or after it to `attr_rows` and every earlier one, a late write included, to `attr_instances`. Breaking: a release before 0020 reads only `attr_instances`. |
+| `0022_breaking_short_history_unlogged` | Short history (T-5249, "Short history" above): `attr_rows` becomes a parent partitioned by the new column `short`, the 0020 table renamed `attr_rows_long` (`short = false`, logged) and the UNLOGGED `attr_rows_short` (`short = true`), each with 0005's per-command RLS; the unique key takes `short`. Under TimescaleDB only the column and the key change. Breaking: a 0021 release's ON CONFLICT names a key no index has. |
