@@ -72,6 +72,26 @@ back, the first with the `x-gap` change alone:
 | `x-gap` only, Entities read one by one | 84 641 | 75 119 | 70.2 % | 20 928 | 57 |
 | T-4921, one read per notification | 197 278 | 19 589 | 33.5 % | 15 618 | 157 |
 
+The PATCH p95 of those two runs is load, not the change: T-4921 does not touch the write path, and a
+delivery still holds at most one of the tenant's 8 slots (`ANTARES_DELIVERY_WIDTH_PER_TENANT`) of the
+20-connection pool. Four more pairs on 2026-10-22 (dev 3c43f32 against T-4921, the same shape, load 40
+to 48) spread PATCH p95 from 45 ms to 4 425 ms for the same binary:
+
+| pass | subscribers | binary | delivered of owed | `x-gap` | fan-out p95 ms | PATCH p95 ms |
+|---|---|---|---|---|---|---|
+| 1 (T-4921 first) | 1 000 | T-4921 | 267 797 of 300 050 | 1 | 8 523 | 45 |
+| 1 | 1 000 | dev | 72 945 of 300 050 | 0 | 25 913 | 140 |
+| 1 | 100 | T-4921 | 30 005 of 30 005 | 0 | 3 137 | 320 |
+| 1 | 100 | dev | 29 870 of 30 005 | 0 | 9 092 | 205 |
+| 2 (dev first) | 1 000 | dev | 31 360 of 299 550 | 0 | 37 860 | 850 |
+| 2 | 1 000 | T-4921 | 31 851 of 269 100 | 58 707 | 40 886 | 4 425 |
+| 2 | 100 | dev | 18 212 of 30 005 | 0 | 25 217 | 360 |
+| 2 | 100 | T-4921 | 30 005 of 30 005 | 0 | 10 485 | 813 |
+
+What repeats is the delivery: T-4921 delivered every notification at 100 subscribers both times, at a
+third of dev's fan-out p95, and dev lost changes without saying so. The write p95 needs an idle machine
+(the load-surfaces lane) to judge.
+
 The shape still breaches its budget: 1 000 subscribers each owed a notification every 250 ms is 4 000
 deliveries a second, each with its own transaction. T-5159 books a drain's deliveries in one statement
 and reads a view's Entities once per drain.
