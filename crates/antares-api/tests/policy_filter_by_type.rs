@@ -1490,3 +1490,51 @@ async fn a_q_on_shown_attributes_is_paged_in_the_store_and_a_hidden_one_is_not()
         "the count under a hidden q read the store unpaged"
     );
 }
+
+/// T-5062: under rules that admit by type alone, a client geoquery on a
+/// `location` every rule shows reaches the store with a page, so Postgres
+/// answers it from its spatial index (an OGC `bbox` or an NGSI-LD `georel`
+/// through a view read every Entity of the type before). A rule that hides
+/// `location` keeps the geoquery on the shown Entity, which has no
+/// `location` to match.
+#[tokio::test]
+async fn a_geoquery_on_a_shown_location_is_paged_in_the_store_and_a_hidden_one_is_not() {
+    let near = "georel=near%3BmaxDistance%3D%3D20000&geometry=Point&coordinates=%5B0.5,0.5%5D";
+    let location = "https://uri.etsi.org/ngsi-ld/location".to_owned();
+    for (attrs, pushed, found) in [
+        (
+            vec![iri("speed"), location],
+            true,
+            vec!["urn:ngsi-ld:Car:a"],
+        ),
+        (vec![iri("speed")], false, vec![]),
+    ] {
+        let rule = Rule {
+            types: vec![iri("Car")],
+            attributes: attrs.clone(),
+            ..Rule::default()
+        };
+        let mut st = state(Filter {
+            rules: vec![rule],
+            ..Filter::default()
+        })
+        .await;
+        seed_zones(&st).await;
+        let spy = Arc::new(crate::common::Double::passthrough(st.store.clone()));
+        st.store = spy.clone();
+        for uri in [
+            format!("/ngsi-ld/v1/entities?type=Car&{near}&limit=5"),
+            format!("/ngsi-ld/v1/entities?type=Car&{near}&q=speed%3E100&count=true&limit=5"),
+        ] {
+            let (code, body) = send(&st, "GET", &uri, None).await;
+            assert_eq!(code, StatusCode::OK, "{body}");
+            assert_eq!(
+                members(&body).keys().collect::<Vec<_>>(),
+                found,
+                "{attrs:?} {uri}"
+            );
+        }
+        assert_eq!(spy.geo_paged() == 2, pushed, "{attrs:?}: geoquery pushdown");
+        assert_eq!(spy.unpaged_queries(), 0, "{attrs:?}: a read was unpaged");
+    }
+}

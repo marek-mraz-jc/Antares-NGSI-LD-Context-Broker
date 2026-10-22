@@ -1099,9 +1099,21 @@ fn reads_only_shown(
     narrow: Option<&crate::repr::Repr>,
     expand: &dyn Fn(&str) -> String,
 ) -> bool {
-    if antares_ql::sql::compile_q(q, "entity", 1, expand).is_none()
-        || !rules.omit_by_type.is_empty()
-    {
+    antares_ql::sql::compile_q(q, "entity", 1, expand).is_some()
+        && shows_alike(q.attribute_paths(), rules, groups, narrow, expand)
+}
+
+/// Whether every rule of a type in `groups` shows each of `names` (terms) and
+/// the narrowing's own projection keeps it: on those Attributes the Entity as
+/// stored and as shown are alike.
+fn shows_alike<'n>(
+    names: impl IntoIterator<Item = &'n str>,
+    rules: &crate::policy::Filter,
+    groups: &[Vec<String>],
+    narrow: Option<&crate::repr::Repr>,
+    expand: &dyn Fn(&str) -> String,
+) -> bool {
+    if !rules.omit_by_type.is_empty() {
         return false;
     }
     // every rule naming a type the request selects
@@ -1124,7 +1136,7 @@ fn reads_only_shown(
         .and_then(|r| heads(&r.policy_omit))
         .unwrap_or_default();
     !selected.is_empty()
-        && q.attribute_paths().into_iter().all(|name| {
+        && names.into_iter().all(|name| {
             let iri = expand(name);
             antares_ql::is_non_system_attr(name)
                 && !omit.contains(&iri)
@@ -1420,8 +1432,25 @@ pub async fn filter_entities_paged(
     // answer it alike (T-4289: `count=true` with a `q`, which every OGC and
     // OData read sends, read every Entity the policy admits and hit the
     // store's TooManyResults ceiling).
-    let q_alike = shown_attrs.is_none()
-        && shown_geos.is_empty()
+    // So too the client's geoquery on the default GeoProperty when every rule
+    // of those types shows it: the store's spatial pushdown answers it as the
+    // shown Entity would (T-5062: an OGC bbox, an OData or MCP geo read under
+    // a view read every Entity of the type in doubling pages).
+    let geos_alike = shown_attrs.is_none()
+        && by_type.as_ref().is_some_and(|(f, groups)| {
+            shown_geos.iter().all(|g| {
+                let name = Some(g.geoproperty.as_str()).filter(|n| !n.is_empty());
+                g.to_sql_spec(ctx).is_some()
+                    && shows_alike(
+                        [name.unwrap_or("location")],
+                        f,
+                        groups,
+                        narrow,
+                        &|t: &str| ctx.expand_key(t),
+                    )
+            })
+        });
+    let q_alike = geos_alike
         && by_type
             .as_ref()
             .zip(shown_q)
@@ -1429,8 +1458,14 @@ pub async fn filter_entities_paged(
                 reads_only_shown(q, f, groups, narrow, &|t: &str| ctx.expand_key(t))
             });
     let judged = by_type
-        .filter(|_| !reads_shown || q_alike)
+        .filter(|_| !reads_shown || (geos_alike && (shown_q.is_none() || q_alike)))
         .map(|(_, groups)| groups);
+    let (geos, shown_geos) = if judged.is_some() && geos_alike {
+        (geos.into_iter().chain(shown_geos).collect(), Vec::new())
+    } else {
+        (geos, shown_geos)
+    };
+    let reads_shown = shown_attrs.is_some() || !shown_geos.is_empty() || shown_q.is_some();
     // the client's own `q` (with the engine's, as the parameters carry them)
     // reaches the store only where it reads the shown Entity alike
     let q_ast = if judged.is_some() && q_alike {
@@ -1453,10 +1488,14 @@ pub async fn filter_entities_paged(
             && judged.is_none()
             && params.get("count").map(String::as_str) == Some("true")
     });
+    // So too a geoquery or a scopeQ the store narrows but cannot decide: it
+    // pages the candidates (`query_candidates`) and the loop below decides
+    // them, where one flat read took up to MAX_UNDECIDED_ROWS for a page of
+    // 20 (T-5088: ~1 000 rows, 0.6-1.1 s a statement).
+    let undecidable = !geos.is_empty() || scope_q.is_some();
     let enough = match client_page {
         Some((offset, limit))
-            if rules.is_some()
-                && judged.is_none()
+            if ((rules.is_some() && judged.is_none()) || undecidable)
                 && params.get("count").map(String::as_str) != Some("true") =>
         {
             offset.checked_add(limit).and_then(|n| n.checked_add(1))
@@ -1534,50 +1573,50 @@ pub async fn filter_entities_paged(
     );
     let mut matched = 0usize;
     'scan: loop {
-        let outcome = st
-            .store
-            .query_entities(
-                tenant,
-                &antares_store::filter::EntityFilter {
-                    ids: ids.as_deref(),
-                    // 5.2.33: id takes precedence over idPattern, so the literal
-                    // narrows only when no id selector was given
-                    id_literal: if ids.is_none() {
-                        params
-                            .get("idPattern")
-                            .and_then(|p| antares_store::filter::id_pattern_literal(p))
-                    } else {
-                        None
-                    },
-                    types: judged.as_deref().or(type_sel.as_deref()),
-                    attrs: if split_agg {
-                        None
-                    } else {
-                        attr_filter.as_deref()
-                    },
-                    q: if split_agg { None } else { q_ast.as_ref() },
-                    scope_q: if split_agg {
-                        None
-                    } else {
-                        scope_q.map(String::as_str)
-                    },
-                    geo: if split_agg { &[] } else { &geo_specs },
-                    expand: &expand,
-                    ctx: Some(ctx),
-                    page: match enough.or(counting.map(|_| 0)) {
-                        Some(_) => Some(store_page(read)),
-                        None => page.map(|(offset, limit)| antares_store::filter::Page {
-                            offset: offset as i64,
-                            limit: limit as i64,
-                            count: params.get("count").map(String::as_str) == Some("true"),
-                        }),
-                    },
-                    keep_attrs: keep_attrs.as_deref(),
-                    drop_attrs: drop_attrs.as_deref(),
-                    after_id: after.as_deref(),
-                },
-            )
-            .await?;
+        let f = antares_store::filter::EntityFilter {
+            ids: ids.as_deref(),
+            // 5.2.33: id takes precedence over idPattern, so the literal
+            // narrows only when no id selector was given
+            id_literal: if ids.is_none() {
+                params
+                    .get("idPattern")
+                    .and_then(|p| antares_store::filter::id_pattern_literal(p))
+            } else {
+                None
+            },
+            types: judged.as_deref().or(type_sel.as_deref()),
+            attrs: if split_agg {
+                None
+            } else {
+                attr_filter.as_deref()
+            },
+            q: if split_agg { None } else { q_ast.as_ref() },
+            scope_q: if split_agg {
+                None
+            } else {
+                scope_q.map(String::as_str)
+            },
+            geo: if split_agg { &[] } else { &geo_specs },
+            expand: &expand,
+            ctx: Some(ctx),
+            page: match enough.or(counting.map(|_| 0)) {
+                Some(_) => Some(store_page(read)),
+                None => page.map(|(offset, limit)| antares_store::filter::Page {
+                    offset: offset as i64,
+                    limit: limit as i64,
+                    count: params.get("count").map(String::as_str) == Some("true"),
+                }),
+            },
+            keep_attrs: keep_attrs.as_deref(),
+            drop_attrs: drop_attrs.as_deref(),
+            after_id: after.as_deref(),
+        };
+        // a walk in pages decides each row itself, so the store may page
+        // what it cannot decide
+        let outcome = match enough.or(counting.map(|_| 0)) {
+            Some(_) => st.store.query_candidates(tenant, &f).await?,
+            None => st.store.query_entities(tenant, &f).await?,
+        };
         let fed = fed_once.take().unwrap_or_default();
         let store_paged = outcome.paged;
         let decided = outcome.decided && fed.is_empty() && !geo_uncompiled;
@@ -1698,9 +1737,10 @@ pub async fn filter_entities_paged(
         if (enough.is_none() && counting.is_none()) || !store_paged || got < read.1 {
             break;
         }
-        if counting.is_some() && rows >= *crate::bounds::MAX_FOLD_DOCS {
+        // a walk over candidates is bounded as the flat read it replaces was
+        if (counting.is_some() || undecidable) && rows >= *crate::bounds::MAX_FOLD_DOCS {
             return Err(NgsiError::TooManyResults(format!(
-                "counting this query read more than {} entities; narrow it",
+                "this query read more than {} entities; narrow it",
                 *crate::bounds::MAX_FOLD_DOCS
             ))
             .into());

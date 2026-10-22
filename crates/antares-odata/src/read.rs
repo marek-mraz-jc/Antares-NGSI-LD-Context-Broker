@@ -510,16 +510,22 @@ async fn pushed(
         skip,
         top,
         page,
+        counted,
         version,
-        ..
     } = window;
-    // Pushed whole: one Query Entities, offset paging, the broker's count.
+    // Pushed whole: one Query Entities, offset paging. `$count` asks the broker's count;
+    // without it one Entity past the page says whether a next page exists, so the store
+    // counts nothing (T-5062: a count per page held 80 % of PostgreSQL's time at 1 000
+    // distinct reads a second). A page at the broker's limit ceiling still counts.
+    let probe = !counted && page < MAX_PAGE;
     let offset = cursor.saturating_add(skip);
     let target = format!(
-        "/ngsi-ld/v1/entities?{}&limit={page}&offset={offset}&count=true",
+        "/ngsi-ld/v1/entities?{}&limit={}&offset={offset}{}",
         query(set, picked, expansions, filter),
+        if probe { page.saturating_add(1) } else { page },
+        if probe { "" } else { "&count=true" },
     );
-    let (docs, total) = run(
+    let (mut docs, total) = run(
         reads,
         caller,
         OperationId::QueryEntities,
@@ -528,13 +534,19 @@ async fn pushed(
         version,
     )
     .await?;
+    let past = probe && u64::try_from(docs.len()).unwrap_or(u64::MAX) > page;
+    docs.truncate(usize::try_from(page).unwrap_or(usize::MAX));
     let served = u64::try_from(docs.len()).unwrap_or(u64::MAX);
     let next = offset.saturating_add(served);
-    let end = top.map_or(total, |top| total.min(offset.saturating_add(top)));
+    let more = if probe {
+        past && top.is_none_or(|top| served < top)
+    } else {
+        next < top.map_or(total, |top| total.min(offset.saturating_add(top)))
+    };
     Ok(Served {
         docs,
         total,
-        next: (served > 0 && next < end)
+        next: (served > 0 && more)
             .then(|| link(next, 0, top.map(|top| top.saturating_sub(served)))),
     })
 }

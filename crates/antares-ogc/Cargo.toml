@@ -1,6 +1,6 @@
 [package]
 name = "antares-ogc"
-description = "The OGC API - Features surface of a view: /x/views/{view}/ogc/features, collections from the Tenant's LinkML schema intersected with the view, Features from its Query and Retrieve Entity answers (T-3744, ADR-0029)."
+description = "The OGC API - Features surface of a view: /x/views/{view}/ogc/features, collections from the Tenant's LinkML schema intersected with the view, Features from its Query and Retrieve Entity answers (T-3744, ADR-0029), and their OGC API - Tiles vector tiles (T-5121)."
 version.workspace = true
 edition.workspace = true
 publish = false

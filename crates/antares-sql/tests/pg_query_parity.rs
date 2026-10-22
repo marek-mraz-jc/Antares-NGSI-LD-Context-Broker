@@ -29,7 +29,7 @@ use antares_model::TenantId;
 use antares_ql::geo::GeoQuery;
 use antares_ql::{eval::eval_q, parse_q, scope::scope_matches};
 use antares_sql::store::pg;
-use antares_sql::store::pg::entity::{EntityFilter, PgEntityStore};
+use antares_sql::store::pg::entity::{EntityFilter, Page, PgEntityStore};
 use proptest::prelude::*;
 use serde_json::{json, Map, Value};
 
@@ -93,6 +93,7 @@ fn db() -> Option<&'static Db> {
             "pgparityscope",
             "pgparitygeo",
             "pgparitygeo2",
+            "pgparitygeowalk",
         ] {
             let tenant = TenantId::new(name).expect("tenant");
             runtime
@@ -446,6 +447,39 @@ proptest! {
         let spec = geo.to_sql_spec(ctx());
         let (got, _) = query(db, &tenant, &EntityFilter { geo: spec.as_slice(), expand: &expand, ..Default::default() });
         prop_assert!(got.is_superset(&want), "geoQ={:?} dropped {:?}", params, want.difference(&got).collect::<Vec<_>>());
+    }
+
+    /// T-5088: a geoquery walked through `query_candidates` in pages of 3,
+    /// each candidate re-decided by the evaluator as the API does, finds
+    /// exactly the evaluator's matches; every page is pushed and none claims
+    /// `decided`.
+    #[test]
+    fn a_geo_candidate_walk_in_pages_finds_every_match(docs in entities(), params in geo_q()) {
+        let Some(db) = db() else { return Ok(()) };
+        let Ok(Some(geo)) = GeoQuery::from_params(&params) else { return Ok(()) };
+        let tenant = TenantId::new("pgparitygeowalk").expect("tenant");
+        let stored = seed(db, &tenant, &docs);
+        let want: BTreeSet<String> = stored
+            .iter()
+            .filter(|doc| geo.matches(doc, ctx()))
+            .filter_map(|doc| doc["id"].as_str().map(str::to_owned))
+            .collect();
+        let spec = geo.to_sql_spec(ctx());
+        let (mut got, mut offset) = (BTreeSet::new(), 0i64);
+        loop {
+            let page = Page { offset, limit: 3, count: true };
+            let f = EntityFilter { geo: spec.as_slice(), page: Some(page), expand: &expand, ..Default::default() };
+            let out = db.runtime.block_on(db.store.query_candidates(&tenant, &f)).expect("candidates");
+            prop_assert!(out.paged && !out.decided, "a candidate page is pushed, never decided");
+            prop_assert_eq!(out.total, None, "candidates are never counted");
+            let n = out.rows.len() as i64;
+            got.extend(out.rows.iter().filter(|d| geo.matches(d, ctx())).filter_map(|d| d["id"].as_str().map(str::to_owned)));
+            if n < 3 {
+                break;
+            }
+            offset += 3;
+        }
+        prop_assert_eq!(&got, &want, "geoQ={:?}", params);
     }
 
     /// ADR-0023 rule 1 (T-3484): two geoqueries in one store query, the
