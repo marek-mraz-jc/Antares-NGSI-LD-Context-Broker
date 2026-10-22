@@ -3,8 +3,10 @@
 //!
 //! Strategy is Scorpio's, proven against the ETSI suite: the predicate
 //! becomes `entity @? $n::jsonpath` over the stored expanded document (the
-//! operator spelling of `jsonb_path_exists`, because only the operator form
-//! matches the GIN `jsonb_path_ops` index). One rule is absolute here — **the
+//! operator spelling of `jsonb_path_exists`; no jsonb operator is leakproof,
+//! so under RLS it filters rows an index on the type, id or location found,
+//! and migration 0019 dropped the GIN that only a role bypassing RLS could
+//! use). One rule is absolute here — **the
 //! jsonpath travels as a bind, never
 //! as SQL text**. Nothing a client typed is ever concatenated into a
 //! statement; the compiler emits `$n` placeholders and hands the paths back
@@ -206,9 +208,7 @@ pub fn value_or_filter(
             Some(f) => format!("{prefix}{step}{f}"),
             None => format!("{prefix}{step}"),
         };
-        // the OPERATOR form of jsonb_path_exists: identical lax semantics,
-        // but the planner can match `@?` against the GIN jsonb_path_ops
-        // index — the function form never uses it
+        // the OPERATOR form of jsonb_path_exists: identical lax semantics
         parts.push(format!(
             "{col} @? ${}::jsonpath",
             first.saturating_add(binds.len())

@@ -45,7 +45,7 @@ INSERT INTO tenants (tenant_id) SELECT DISTINCT tenant_id FROM bulk_stage ON CON
 -- secondary indexes off during the load; PK stays (ON CONFLICT needs it)
 -- exactly the set the migrations leave in place (0005 dropped the scopes
 -- and modified_at indexes as dead weight; do not bring them back)
-DROP INDEX IF EXISTS i_entities_location, i_entities_jsonb, i_entities_types,
+DROP INDEX IF EXISTS i_entities_location, i_entities_types,
   i_entities_loc_ambiguous, i_entities_expires, i_entities_first_type_id,
   i_entities_multi_type_id, i_entities_types_multi;
 
@@ -90,7 +90,6 @@ ON CONFLICT (tenant_id, id) DO NOTHING;
 DROP TABLE bulk_stage;
 
 CREATE INDEX i_entities_location ON entities USING gist (location);
-CREATE INDEX i_entities_jsonb    ON entities USING gin  (entity jsonb_path_ops);
 CREATE INDEX i_entities_types    ON entities USING gin  (tenant_id, types);
 CREATE INDEX i_entities_loc_ambiguous ON entities (tenant_id) WHERE location_ambiguous;
 CREATE INDEX i_entities_expires ON entities (expires_at) WHERE expires_at IS NOT NULL;

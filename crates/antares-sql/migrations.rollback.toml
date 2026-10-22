@@ -76,3 +76,7 @@ note = "extended planner statistics only"
 [0017]
 rollback = "compatible"
 note = "index swap; an older release's ON CONFLICT infers u_attr_instances_time from the same column set, and per-partition {partition}_u_time indexes built before the swap wait for the roll-forward"
+
+[0019]
+rollback = "compatible"
+note = "index drop; an older release names no index in its statements and plans its q= reads without it, as it already did under RLS"
