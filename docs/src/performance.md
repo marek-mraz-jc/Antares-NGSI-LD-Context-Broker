@@ -1039,14 +1039,23 @@ input).
   thresholds; the run writes k6's summary, the broker's and PostgreSQL's
   CPU and RSS, and the 15 costliest statements of `pg_stat_statements`.
 
-The gateway is not in the rig: its per-caller caps and its PDP time are
-the part T-4754 measures on prod. Box: the 16-core sandbox host, 3-minute
+`GATEWAY=1` puts the Context Gateway in front (T-5136): the platform image
+by digest on 2 cores of its own, host network so it sees k6's 64 source
+addresses, a manifest repository of one Context Space, one public Endpoint
+and one Policy granting the role `public` the reads; the data then lives in
+that space's Tenant and k6 asks every surface under
+`/api/endpoint/{slug}/`. The gateway runs without an identity provider, so
+its token check is not measured; its Endpoint lookup, Policy decision,
+per-caller caps and proxying are. Box: the 16-core sandbox host, 3-minute
 runs at 1 000 req/s on the seeded set; the generator shares the host.
 
 | build | answered | req/s served | dropped arrivals | broker CPU | PostgreSQL CPU | costliest statement |
 |---|---|---|---|---|---|---|
 | dev `a60ea0d` | 9 % | 261 | 130 464 | 19 % | 194 % of 200 % | OData's `count(*)` per page: 802 calls, 2.4 s each, 80 % of PostgreSQL's time |
 | + the two fixes below | 59 % | 277 | 127 363 | 27 % | 197 % of 200 % | `q` over a type's rows: 10 321 calls, 106 ms each |
+| dev `5caec28` (T-5088's candidate walk) | 64 % | 259 | 130 706 | 29 % | 197 % of 200 % | the `q` page: 9 479 calls, 106 ms each, 21 rows each |
+| + no parallel workers, 0018 (T-5136) | 80 % | 347 | 115 252 | 81 % | 195 % of 200 % | geo `near`/`within` pages: 28-63 ms each, about 1 000 rows read per page of `bbox` |
+| the same, `GATEWAY=1` | 22 % | 218 | 0 | 74 % (gateway 19 %) | 200 % of 200 % | as above; the gateway answered 78 % with 503 at its 128 requests in flight |
 
 The rig does not hold 1 000 distinct requests a second yet, nor 250
 (64 % answered at 250 req/s): PostgreSQL's two cores are the wall, the
@@ -1071,6 +1080,44 @@ before and after:
   They now ask one Entity past the page; a page at the 1 000 ceiling still
   counts. At 1 000 req/s the count statements went from 80 % of
   PostgreSQL's time to none.
+
+- **No parallel workers for a page** (T-5136). A `q` page of a type
+  plans its `@?` as a filter under RLS (never an index condition) that the
+  planner estimates selective, so it chose a Gather of two workers: two
+  processes started for 21 rows. Idle, 14 ms with the workers and 2.5 ms
+  without; at 1 000 req/s, 106 ms. Every pooled session now sets
+  `max_parallel_workers_per_gather = 0`: the `q` page went to 11.7 ms.
+  `pg_explain.rs` `a_pooled_session_starts_no_parallel_workers`.
+- **A geoquery of one type reads that type's cells** (migration 0018). The
+  cover over `(tenant_id, location_cell)` read every type in the cells and
+  dropped the others after: 17 000-47 000 rows for a page of 20, 0.5-1.4 s
+  a statement under load. `i_entities_type_location_cell` puts the type in
+  the key: 28-63 ms. `pg_explain.rs` "geo near of a type".
+- **`!location` reads only the Entities without a geometry** (0018). An OGC
+  `bbox` page asks a second part for the Features without a geometry (C12);
+  its negated `@?` read the whole type for no row (64 000 rows, 68 ms) on
+  every `bbox` and CSV page. The store ANDs `location IS NULL` to a
+  `!location` every match needs, leakproof and served by the partial
+  `i_entities_type_unlocated`; the `@?` still decides.
+  `pg_query_parity.rs` `a_missing_location_is_decided_exactly`.
+
+Behind the gateway (`GATEWAY=1`) the broker serves what PostgreSQL
+allows and the gateway refuses the rest at once: past 128 requests in
+flight (`JC_GATEWAY_MAX_IN_FLIGHT`, its default) it answers 503 with a
+retry hint in under a millisecond. The answered requests then keep a p95 of
+396 ms where the broker alone queued them to 7.7 s, and the gateway uses a
+fifth of a core at 1 000 req/s offered: the gateway is not the wall,
+PostgreSQL's two cores are.
+
+A side table of `q` keys kept by trigger, or leakproof wrappers, was the
+plan for `q` (T-5088). Measured, the `q` page reads about 20 rows per
+match (`level` spreads over the ids), and its cost was the parallel
+workers, not a walk of the type; a side table would serve a `q` that
+matches almost nothing (the walk then reads the whole type) at a write
+cost on every Entity. Decided (worker-t5136, owner may override): no side
+table now, because the measured cost is gone without one and the wall
+moved to geo pages; options: a trigger-kept `(tenant, type, attr, value)`
+table, LEAKPROOF wrappers (superuser-only on CNPG).
 
 What holds the rig below its target, measured in the second run, in
 order:
