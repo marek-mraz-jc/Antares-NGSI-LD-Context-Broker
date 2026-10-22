@@ -47,7 +47,7 @@ per process; the sampler now reads the container's cgroup (`docker stats`).
 | sta-observations | 50 | n/a (platform only) | 14.73 / 26.24 |  | 8.6 / 131.7 | 200 / 500 | ok |
 | ical | 2 | n/a (platform only) | 665.98 / 710.84 |  | 42.9 / 119.4 | 2000 / 4000 | ok |
 | mcp | 50 | n/a (platform only) | 57.25 / 83.0 |  | 11.0 / 119.3 | 200 / 500 | ok |
-| ws-fanout | 200 | n/a (platform only) | 30030 / 30524 |  | 79.6 / 283.8 | 250 / 1000 | breach: p95_ms 30030 > 250; p99_ms 30524 > 1000; errors 77.883 % > 0.1 % (T-4921: 33.5 % missing, each loss now an `x-gap`; section 3) |
+| ws-fanout | 200 | n/a (platform only) | 30030 / 30524 |  | 79.6 / 283.8 | 250 / 1000 | breach: p95_ms 30030 > 250; p99_ms 30524 > 1000; errors 77.883 % > 0.1 % (T-4921: 33.5 % missing, each loss now an `x-gap`; see the note under the table) |
 
 `odata` (T-4919): each read counted the Entities lacking the `$orderby` key, a second scan of the
 type beside the read itself, though `level ge a` already rules them out; and the store handed the
@@ -62,13 +62,6 @@ above is the run that found it; the next load-surfaces run replaces it.
 `ogc-page` asked an `offset` the OGC surface does not define (its paging is the `next` cursor); the
 shape now follows the first page's `next` link, as a GIS client pages; a 2 000-entity recheck answered
 every page (p95 10.8 ms, p99 34.3 ms at 50/s).
-
-## 3. Breaches
-
-Each breach of this run is a task: `ngsi-near` on the platform build (4.2x vanilla, T-4918, fixed: section 5), `odata` p95 (T-4919, fixed: see the note under the table),
-`ogc-items` (bbox with a CQL2 filter on 10 556 AirQualityObserved: 10 s timeouts at 354 % CPU, T-4920), and
-the WebSocket fan-out (20 % of 300 050 owed notifications delivered within the hold, 30 s behind,
-no `x-gap` sent, T-4921).
 
 T-4921 (2026-10-21, sandbox under load 40 on 12 cores, 20 000 entities, the same shape) found the
 fan-out bound by delivery, not by k6 or the matcher: a notification of one subscription costs a view
@@ -126,6 +119,13 @@ the pool where a deployment needs it; the default stays 8.
 The shape still breaches its budget: 1 000 subscribers each owed a notification every 250 ms is 4 000
 deliveries a second, each with its own transaction. T-5159 books a drain's deliveries in one statement
 and reads a view's Entities once per drain.
+
+## 3. Breaches
+
+Each breach of this run is a task: `ngsi-near` on the platform build (4.2x vanilla, T-4918, fixed: section 5), `odata` p95 (T-4919, fixed: see the note under the table),
+`ogc-items` (bbox with a CQL2 filter on 10 556 AirQualityObserved: 10 s timeouts at 354 % CPU, T-4920), and
+the WebSocket fan-out (20 % of 300 050 owed notifications delivered within the hold, 30 s behind,
+no `x-gap` sent, T-4921).
 
 ## 4. Proof the gate goes red
 
