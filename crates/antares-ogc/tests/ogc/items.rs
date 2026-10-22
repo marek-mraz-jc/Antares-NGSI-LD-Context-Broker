@@ -690,3 +690,57 @@ async fn datetime_and_temporal_filters_read_offsets_as_instants() -> Result<(), 
     }
     Ok(())
 }
+
+/// T-5169: `id = '…'` and `id IN (…)`, alone or ANDed, select by the NGSI-LD `id` list, so a
+/// collection larger than the residual's scan budget still answers them, counted exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_id_filter_reads_by_id_past_the_scan_budget() -> Result<(), String> {
+    let f = fixture().await?;
+    let budget = antares_ops::RESIDUAL_SCAN;
+    let mut next = 0;
+    while next <= budget {
+        let batch: Vec<Value> = (next..(next + 1000).min(budget + 1))
+            .map(|i| json!({"id": format!("urn:ngsi-ld:Car:b{i}"), "type": "Car"}))
+            .collect();
+        next += batch.len();
+        let a = send(
+            &f.app,
+            "POST",
+            "/ngsi-ld/v1/entityOperations/create",
+            &Value::Array(batch).to_string(),
+            &[("NGSILD-Tenant", "city")],
+        )
+        .await;
+        assert!(a.status.is_success(), "{} {}", a.status, a.body);
+    }
+    let last = format!("urn:ngsi-ld:Car:b{budget}");
+    let cases = [
+        (format!("id = '{last}'"), vec![last.clone()]),
+        (format!("'{last}' = id"), vec![last.clone()]),
+        (
+            format!("id IN ('urn:ngsi-ld:Car:b7', '{last}', 'urn:ngsi-ld:Car:none')"),
+            vec![last.clone(), "urn:ngsi-ld:Car:b7".to_owned()],
+        ),
+        (
+            format!("id IN ('urn:ngsi-ld:Car:b7', '{last}') AND id = 'urn:ngsi-ld:Car:b7'"),
+            vec!["urn:ngsi-ld:Car:b7".to_owned()],
+        ),
+        (
+            "id = 'urn:ngsi-ld:Car:b7' AND id = 'urn:ngsi-ld:Car:b8'".to_owned(),
+            Vec::new(),
+        ),
+    ];
+    for (filter, want) in cases {
+        let uri = format!(
+            "{CARS}?filter-lang=cql2-text&filter={}",
+            crate::filter::enc(&filter)
+        );
+        let a = get(&f.app, &uri).await;
+        assert_eq!(a.status, StatusCode::OK, "{filter}: {}", a.body);
+        let mut got = ids(&a.body);
+        got.sort();
+        assert_eq!(got, want, "{filter}");
+        assert_eq!(a.body["numberMatched"], json!(want.len()), "{filter}");
+    }
+    Ok(())
+}
