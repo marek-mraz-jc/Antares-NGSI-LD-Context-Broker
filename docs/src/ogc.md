@@ -119,7 +119,9 @@ collections come as one download from `/collections`: `f=zip` (or
 (and `{collectionId}.parquet` in a build with `parquet` too), a
 `README.md` naming every file and a `provenance.json`. It takes
 `collections` (a comma list of collection ids; one the view does not show
-is `400`), `bbox` and `datetime`, applied to every collection; any other
+is `400`; without it every collection but the `{type}-history` ones of
+section 7, which join only when named), `bbox` and `datetime`, applied to
+every collection; any other
 parameter is `400`. The provenance names the view, the collections, the
 query, the row count, the time of export and the broker version. The
 answer ceiling holds for the whole file: past it, `413`. Every GeoJSON

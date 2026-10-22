@@ -113,6 +113,8 @@ pub(crate) fn of(c: &Collection) -> Collection {
 
 /// One page of a history's Features: Entities read [`BATCH`] at a time from the token's
 /// Entity offset, its Features from the token's Feature offset, until the page holds `limit`.
+/// ponytail: a page that resumes inside an Entity reads its batch again (bounded by MAX_READS x
+/// BATCH x INSTANCES); a token carrying the resume observedAt would cut that for small limits.
 pub(crate) async fn page(
     view: &ViewOps,
     caller: &Caller,
@@ -177,6 +179,7 @@ pub(crate) async fn one(
     let Some((urn, _)) = id.rsplit_once('@') else {
         return Err(missing);
     };
+    options(p)?;
     let terms = Terms::of(c);
     let refs = Refs {
         alternate: false,
@@ -216,11 +219,7 @@ fn window(p: &Params) -> Result<Window, Problem> {
 /// The residual of `bbox` and `filter`, none when the request names neither; a `ngsild.`
 /// option a history does not take is refused.
 fn program(c: &Collection, terms: &Terms, p: &Params) -> Result<Option<Program>, Problem> {
-    if p.ngsild.iter().any(|(n, _)| !OPTIONS.contains(n)) {
-        return Err(bad(
-            "a history collection takes ngsild.q and ngsild.scopeQ of the ngsild. options",
-        ));
-    }
+    options(p)?;
     let mut all = match &p.filter {
         Some(f) => crate::filter::residual(c, terms, f)?,
         None => Vec::new(),
@@ -241,6 +240,16 @@ fn program(c: &Collection, terms: &Terms, p: &Params) -> Result<Option<Program>,
     let now = items::now().ok_or(Problem(StatusCode::INTERNAL_SERVER_ERROR, NO_CLOCK))?;
     let compiled = residual::compile(&Expr::And(all), now);
     compiled.map(Some).map_err(|e| items::refused(&e))
+}
+
+/// A `ngsild.` option other than `q` and `scopeQ` is refused, on a page and on one Feature.
+fn options(p: &Params) -> Result<(), Problem> {
+    if p.ngsild.iter().any(|(n, _)| !OPTIONS.contains(n)) {
+        return Err(bad(
+            "a history collection takes ngsild.q and ngsild.scopeQ of the ngsild. options",
+        ));
+    }
+    Ok(())
 }
 
 /// One Query Temporal Evolution of Entities through the view: [`BATCH`] Entities of the type

@@ -27,7 +27,7 @@ fn moved(lon: f64, lat: f64, t: &str) -> Value {
 }
 
 /// A broker that takes schemas: the bound is read when it starts.
-async fn fresh() -> Result<TestBroker, String> {
+pub(crate) async fn fresh() -> Result<TestBroker, String> {
     schemas_on();
     TestBroker::new().await
 }
@@ -35,7 +35,7 @@ async fn fresh() -> Result<TestBroker, String> {
 /// The fixture, a view `past` that offers the Temporal Query beside Query Entities, and the
 /// histories of Car 1 (speed 10 at T0 and 20 at T2, moved at T1, a hidden `secret` at T0)
 /// Car 2 (speed 60 and its place at T1) and Car 4 (speed 70 at T0, its place never observed).
-async fn past(broker: TestBroker) -> Result<crate::common::Fixture, String> {
+pub(crate) async fn past(broker: TestBroker) -> Result<crate::common::Fixture, String> {
     let f = fixture_with(broker).await?;
     let view = json!({
         "id": "past", "tenant": "city", "selector": ["Car", "Stop"],
@@ -179,6 +179,8 @@ async fn a_history_holds_a_feature_per_observed_at_with_its_interval() -> Result
     )
     .await;
     assert_eq!(none.status, StatusCode::NOT_FOUND);
+    let picked = get(&f.app, &format!("{ITEMS}/{}?ngsild.pick=speed", car(1, T1))).await;
+    assert_eq!(picked.status, StatusCode::BAD_REQUEST, "{}", picked.body);
     Ok(())
 }
 

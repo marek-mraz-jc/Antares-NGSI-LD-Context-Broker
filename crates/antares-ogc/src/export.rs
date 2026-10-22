@@ -386,10 +386,12 @@ mod bundle {
         }
 
         /// The filters every collection takes (`bbox`, `datetime`) and the collections named,
-        /// all of them when `collections` is absent.
+        /// every current-state one when `collections` is absent: a `{type}-history` reads the
+        /// type's whole history, so it joins a bundle only when named (T-5100).
         fn chosen(&self, pairs: &[(String, String)]) -> Result<Chosen<'_>, Problem> {
             let mut filters = Vec::new();
-            let mut chosen: Vec<&Collection> = self.collections.values().collect();
+            let mut chosen: Vec<&Collection> =
+                self.collections.values().filter(|c| !c.history).collect();
             for (name, value) in pairs {
                 match name.as_str() {
                     "bbox" | "datetime" => filters.push((name.clone(), value.clone())),
