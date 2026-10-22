@@ -38,7 +38,7 @@ use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
 use axum::Router;
 use chrono::{DateTime, Utc};
-use output::{local, Entry, Output, Plan, MAX_LIMIT, MAX_OUTPUTS};
+use output::{local, Entry, Plan, MAX_LIMIT, MAX_OUTPUTS};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -54,7 +54,8 @@ pub const SKIPPED: &str = "antares_surface_records_skipped_total";
 /// The header a feed reports how many Entities it left out in.
 pub const SKIPPED_HEADER: &str = "antares-skipped-records";
 
-/// How long a reader may keep a page, in seconds.
+/// How long the reader alone may keep a page, in seconds: `private`, since the Policy decides
+/// per caller and a shared cache would hand one subject's entries to another.
 pub const MAX_AGE: u32 = 300;
 
 /// The Query Entities parameters a feed passes through as they are (TS 104 175 6.4.3.2);
@@ -182,7 +183,7 @@ impl Served {
         let validators = [
             (ETAG, etag),
             (LAST_MODIFIED, modified),
-            (CACHE_CONTROL, format!("max-age={MAX_AGE}")),
+            (CACHE_CONTROL, format!("private, max-age={MAX_AGE}")),
         ];
         if fresh {
             return (StatusCode::NOT_MODIFIED, validators).into_response();
@@ -236,10 +237,7 @@ fn plan(view: &ViewOps, name: &str) -> Result<Plan, Problem> {
         .iter()
         .find(|o| o.get("name").and_then(Value::as_str) == Some(name))
         .ok_or_else(not_found)?;
-    serde_json::from_value::<Output>(written.clone())
-        .map_err(|e| e.to_string())
-        .and_then(Plan::compile)
-        .map_err(|_| broken())
+    Plan::of(written).map(|(p, _)| p).map_err(|_| broken())
 }
 
 /// A request's query string read.

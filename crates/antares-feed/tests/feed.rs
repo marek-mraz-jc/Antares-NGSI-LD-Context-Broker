@@ -193,7 +193,7 @@ async fn three_formats_list_the_same_entries_newest_first_without_what_the_view_
         assert_eq!(status, StatusCode::OK, "{file}: {body}");
         assert_eq!(headers["content-type"], media);
         assert_eq!(headers["antares-skipped-records"], "1", "e3 has no title");
-        assert_eq!(headers["cache-control"], "max-age=300");
+        assert_eq!(headers["cache-control"], "private, max-age=300");
         assert_eq!(headers["last-modified"], "Sat, 03 Oct 2026 10:00:00 GMT");
         assert_eq!(ids(file, &body), want, "{file}: {body}");
         // JSON Feed carries content_text alone, so its text may hold markup as text

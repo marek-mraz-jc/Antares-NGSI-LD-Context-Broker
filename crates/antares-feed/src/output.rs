@@ -266,6 +266,67 @@ fn preset(preset: Preset) -> BTreeMap<Role, Vec<String>> {
 }
 
 impl Plan {
+    /// A written output compiled, and whether it was degraded: an output of a newer contract
+    /// version than [`VERSION`] keeps its name, texts, language, limit, filter and each
+    /// source's type and preset, and drops what this broker cannot read (T-5207 rule 1).
+    /// Its filter still has to read, since serving one without it would widen the output.
+    ///
+    /// # Errors
+    /// As [`Plan::compile`], and a newer output whose filter or presets do not read.
+    pub fn of(written: &Value) -> Result<(Self, bool), String> {
+        let version = written.get("version").and_then(Value::as_u64);
+        if version.is_none_or(|v| v <= u64::from(VERSION)) {
+            let output: Output =
+                serde_json::from_value(written.clone()).map_err(|e| e.to_string())?;
+            return Self::compile(output).map(|p| (p, false));
+        }
+        let field = |name: &str| written.get(name).cloned().unwrap_or(Value::Null);
+        let texts = |name: &str| serde_json::from_value(field(name)).unwrap_or_default();
+        let filter = match written.get("filter") {
+            Some(f) => serde_json::from_value(f.clone()).map_err(|e| format!("filter: {e}"))?,
+            None => Filter::default(),
+        };
+        let sources = written
+            .get("sources")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .map(|s| Source {
+                        ty: s
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        preset: s
+                            .get("preset")
+                            .and_then(|p| serde_json::from_value(p.clone()).ok()),
+                        mapping: BTreeMap::new(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let output = Output {
+            name: written
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            version: None,
+            title: texts("title"),
+            description: texts("description"),
+            sources,
+            filter,
+            lang: written
+                .get("lang")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            limit: serde_json::from_value(field("limit")).unwrap_or_default(),
+            sort: None,
+        };
+        tracing::warn!(version, name = %output.name, "newer feed output: presets served");
+        Self::compile(output).map(|p| (p, true))
+    }
+
     /// The output checked, or the sentence naming what does not hold.
     ///
     /// # Errors
@@ -494,9 +555,33 @@ mod tests {
     use serde_json::json;
 
     fn plan(output: &Value) -> Result<Plan, String> {
-        serde_json::from_value::<Output>(output.clone())
-            .map_err(|e| e.to_string())
-            .and_then(Plan::compile)
+        Plan::of(output).map(|(p, _)| p)
+    }
+
+    #[test]
+    fn a_newer_output_is_served_from_its_presets_and_keeps_its_filter() -> Result<(), String> {
+        let (p, degraded) = Plan::of(&json!({"name": "sport", "version": 2, "limit": 20,
+            "title": {"sk": "Šport"}, "layout": "cards", "filter": {"q": "category==\"sport\""},
+            "sources": [{"type": "Event", "preset": "event", "mapping": {"title": {"next": 1}}}]}))?;
+        assert!(degraded);
+        assert_eq!(p.name, "sport");
+        assert_eq!(p.limit, 20);
+        assert_eq!(p.title.get("sk").map(String::as_str), Some("Šport"));
+        assert_eq!(p.filter.q.as_deref(), Some("category==\"sport\""));
+        assert_eq!(p.types().collect::<Vec<_>>(), ["Event"]);
+        let (_, current) = Plan::of(&json!({"name": "x", "version": 1,
+            "sources": [{"type": "Event", "preset": "event"}]}))?;
+        assert!(!current);
+        for bad in [
+            json!({"name": "x", "version": 2, "filter": {"where": "x"},
+                "sources": [{"type": "Event", "preset": "event"}]}),
+            json!({"name": "x", "version": 2, "sources": [{"type": "Event", "preset": "next"}]}),
+            json!({"name": "x", "version": 2}),
+            json!({"version": 2, "sources": [{"type": "Event", "preset": "event"}]}),
+        ] {
+            assert!(Plan::of(&bad).is_err(), "{bad}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -512,7 +597,7 @@ mod tests {
             json!({"name": "x", "sources": [{"type": "Event", "preset": "event", "mapping": {"title": "a b"}}]}),
             json!({"name": "x", "sources": [{"type": "a b", "preset": "event"}]}),
             json!({"name": "x", "limit": 201, "sources": [{"type": "Event", "preset": "event"}]}),
-            json!({"name": "x", "version": 2, "sources": [{"type": "Event", "preset": "event"}]}),
+            json!({"name": "x", "version": 0, "sources": [{"type": "Event", "preset": "event"}]}),
             json!({"name": "x", "sort": "published", "sources": [{"type": "Event", "preset": "event"}]}),
             json!({"name": "x", "unknown": 1, "sources": [{"type": "Event", "preset": "event"}]}),
             json!({"name": "x", "filter": {"where": "x"}, "sources": [{"type": "Event", "preset": "event"}]}),
