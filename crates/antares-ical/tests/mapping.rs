@@ -300,7 +300,10 @@ fn the_output_version_reads_strictly_and_a_newer_one_degrades_to_the_preset() {
     assert!(CompiledOutput::compile(&output).is_ok());
     let (absent, _) =
         output_of(&json!({"name": "vsetky", "sources": [{}]})).expect("version absent reads as 1");
-    assert_eq!(absent.sources[0].entity_type, "Event");
+    assert_eq!(
+        absent.sources.first().map(|s| s.entity_type.as_str()),
+        Some("Event")
+    );
     for refused in [
         json!({"name": "a", "version": 1, "rrule": "eventSchedule", "sources": [{}]}),
         json!({"name": "a", "sources": [{"rrule": "eventSchedule"}]}),
@@ -312,6 +315,11 @@ fn the_output_version_reads_strictly_and_a_newer_one_degrades_to_the_preset() {
     assert!(
         CompiledOutput::compile(&old).is_err(),
         "version 0 is refused"
+    );
+    let (source, _) = output_of(&json!({"name": "a", "sources": [{"version": 0}]})).expect("reads");
+    assert!(
+        CompiledOutput::compile(&source).is_err(),
+        "a source of version 0 is refused"
     );
     let newer = json!({"name": "koncerty", "version": 2, "rrule": "x",
         "title": {"sk": "Koncerty"}, "lang": "sk", "limit": 50, "sort": "sideways",
@@ -327,9 +335,12 @@ fn the_output_version_reads_strictly_and_a_newer_one_degrades_to_the_preset() {
         (output.limit, output.sort.clone(), output.timezone.clone()),
         (Some(50), None, None)
     );
-    assert_eq!(output.sources[1].entity_type, "Event");
+    assert_eq!(
+        output.sources.get(1).map(|s| s.entity_type.as_str()),
+        Some("Event")
+    );
     let compiled = CompiledOutput::compile(&output).expect("compiles");
-    let plan = &compiled.plans[0];
+    let plan = compiled.plans.first().expect("a plan");
     assert_eq!(plan.entity_type(), "CouncilMeeting");
     let concert = event(&[("type", json!("CouncilMeeting"))]);
     assert!(lines(&plan.vevent(&concert, &Window::default(), now()))
