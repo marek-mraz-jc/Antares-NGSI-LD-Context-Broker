@@ -113,8 +113,8 @@ pub(crate) fn of(c: &Collection) -> Collection {
 
 /// One page of a history's Features: Entities read [`BATCH`] at a time from the token's
 /// Entity offset, its Features from the token's Feature offset, until the page holds `limit`.
-/// ponytail: a page that resumes inside an Entity reads its batch again (bounded by MAX_READS x
-/// BATCH x INSTANCES); a token carrying the resume observedAt would cut that for small limits.
+/// ponytail: a page that resumes inside an Entity reads its batch again (bounded by `MAX_READS` x
+/// `BATCH` x `INSTANCES`); a token carrying the resume `observedAt` would cut that for small limits.
 pub(crate) async fn page(
     view: &ViewOps,
     caller: &Caller,
