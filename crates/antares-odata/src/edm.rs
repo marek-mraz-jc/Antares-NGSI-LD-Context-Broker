@@ -145,6 +145,10 @@ pub struct Member {
     /// The slot is a `JsonProperty`: a [`Shape::Json`] write keeps `json`. Any other
     /// [`Shape::Json`] (an inlined object, P2) is a `Property` (T-5206 finding 4).
     pub json: bool,
+    /// A `Property` of [`Shape::Json`] (`range: Any`, an inlined object): `$filter` compares
+    /// it as `Edm.Untyped` with a null, boolean, number or string literal; a value of another
+    /// JSON type matches only `ne` (T-5333, NGSI-LD 4.9).
+    pub untyped: bool,
     /// When a client may write it (T-3722).
     pub written: Written,
 }
@@ -286,6 +290,7 @@ pub fn build(
                     required.extend(named.then(|| Expr::PropertyPath(member.clone())));
                 }
             }
+            let untyped = schema.kind(&slot) == "Property" && shape == Shape::Json;
             members.insert(
                 member,
                 Member {
@@ -293,6 +298,7 @@ pub fn build(
                     shape,
                     list: schema.kind(&slot).starts_with("List"),
                     json: schema.kind(&slot) == "JsonProperty",
+                    untyped,
                     written: written(&slot),
                 },
             );
@@ -756,7 +762,15 @@ fn capabilities(
                 ("MaxLevels", Expr::Int(1)),
                 (
                     "NonFilterableProperties",
-                    Expr::Collection(unserved.clone()),
+                    Expr::Collection(
+                        unserved
+                            .iter()
+                            .filter(|p| {
+                                !matches!(p, Expr::PropertyPath(n) if members.get(n).is_some_and(|m| m.untyped))
+                            })
+                            .cloned()
+                            .collect(),
+                    ),
                 ),
             ],
         ),

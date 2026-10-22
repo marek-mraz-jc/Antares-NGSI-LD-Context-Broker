@@ -61,7 +61,11 @@ without `inlined: true` is a Relationship: every class of a DM-05 model is an
 Entity type whose identifier is the NGSI-LD `id`, so LinkML's rule (a class
 without an `identifier` slot is inlined) is not applied; mark an embedded
 object `inlined: true`. A Property holding such an object, a JsonProperty and
-an untyped value are `Edm.Untyped`. A GeoProperty is `Edm.Geography`; the
+an untyped value are `Edm.Untyped`. `$filter` compares such a Property (an
+inlined object, `range: Any`) with a number, string or boolean literal by its
+JSON value, as `q` does: a value of another type matches only `ne`, so
+`currentValue ge 8372` skips a KPI that reads `not measured` (T-5333). A
+JsonProperty is never filtered. A GeoProperty is `Edm.Geography`; the
 concrete `Edm.GeographyPoint` and the other subtypes are not built. A slot
 named like a base member (`_types`, `scope`, `createdAt`, `modifiedAt`, or
 `id` without `identifier: true`) is served with its first character escaped

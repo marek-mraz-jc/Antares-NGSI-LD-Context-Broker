@@ -857,6 +857,8 @@ impl<'a> Terms<'a> {
                 edm,
                 collection: false,
             } => *edm,
+            // T-5333: an Untyped Property compares by its JSON value, as `q` does.
+            Shape::Json if member.untyped => "Edm.Untyped",
             Shape::Json => return Err(Refused::Bad),
             _ => return Err(Refused::Later),
         };
@@ -1165,6 +1167,8 @@ impl<'a> Terms<'a> {
                 edm,
                 collection: false,
             } => *edm,
+            // T-5333: an Untyped Property compares by its JSON value, as `q` does.
+            Shape::Json if member.untyped => "Edm.Untyped",
             Shape::Json => return Err(Refused::Bad),
             _ => return Err(Refused::Later),
         };
@@ -1325,6 +1329,11 @@ fn fits(edm: &str, lit: &Literal) -> bool {
                 "Edm.Single" | "Edm.Double" | "Edm.Decimal",
                 Literal::Int(_) | Literal::Decimal(_)
             )
+            // A JSON value: never a date, GUID or geography (T-5333).
+            | (
+                "Edm.Untyped",
+                Literal::Bool(_) | Literal::Int(_) | Literal::Decimal(_) | Literal::String(_)
+            )
     );
     match edm {
         _ if same => true,
@@ -1334,7 +1343,7 @@ fn fits(edm: &str, lit: &Literal) -> bool {
         "Edm.Int32" => range(i32::MIN.into(), i32::MAX.into()),
         "Edm.Int64" => range(i64::MIN, i64::MAX),
         "Edm.String" | "Edm.Boolean" | "Edm.Guid" | "Edm.Date" | "Edm.DateTimeOffset"
-        | "Edm.TimeOfDay" | "Edm.Single" | "Edm.Double" | "Edm.Decimal" => false,
+        | "Edm.TimeOfDay" | "Edm.Single" | "Edm.Double" | "Edm.Decimal" | "Edm.Untyped" => false,
         _ => true,
     }
 }
@@ -1500,6 +1509,7 @@ mod tests {
             shape,
             list: false,
             json: false,
+            untyped: false,
             written: crate::edm::Written::Always,
         };
         let value = |edm, collection| Shape::Value { edm, collection };
@@ -1526,6 +1536,14 @@ mod tests {
                     member("https://e.org/tags", value("Edm.String", true)),
                 ),
                 ("doc".into(), member("https://e.org/doc", Shape::Json)),
+                // T-5333: `range: Any`, a number or the string "not measured"
+                (
+                    "reading".into(),
+                    Member {
+                        untyped: true,
+                        ..member("https://e.org/reading", Shape::Json)
+                    },
+                ),
                 // a type this surface does not check
                 (
                     "span".into(),
@@ -2646,6 +2664,7 @@ mod tests {
                 },
                 list: false,
                 json: false,
+                untyped: false,
                 written: crate::edm::Written::Always,
             },
         );
@@ -2734,6 +2753,45 @@ mod tests {
         }
     }
 
+    /// T-5333: an Untyped Property compares by its JSON value, in `q` and in the residual,
+    /// as NGSI-LD 4.9 does: a value of another type matches only `ne`.
+    #[test]
+    fn an_untyped_property_compares_by_its_json_value() {
+        use residual::Truth::{False, True};
+        use serde_json::json;
+        let reading = |op, r: Literal| cmp(m("reading"), op, lit(r));
+        for (e, want) in [
+            (reading(CompareOp::Ge, Literal::Int(8372)), "(t0>=8372)"),
+            (
+                reading(CompareOp::Lt, Literal::Decimal("0.5".into())),
+                "(t0<0.5)",
+            ),
+            (
+                reading(CompareOp::Eq, Literal::String("not measured".into())),
+                r#"(t0=="not measured")"#,
+            ),
+            (reading(CompareOp::Ne, Literal::Int(1)), "(!t0|t0!=1)"),
+            (reading(CompareOp::Eq, Literal::Null), "(!t0)"),
+        ] {
+            assert_eq!(q(&e).as_deref(), Ok(want), "{e:?}");
+        }
+        let below = Expr::Not(Box::new(reading(CompareOp::Ge, Literal::Int(5))));
+        assert_eq!(evaluated(&below, Some(json!(3))), Some(True));
+        assert_eq!(evaluated(&below, Some(json!(9))), Some(False));
+        assert_eq!(evaluated(&below, Some(json!("not measured"))), Some(True));
+        // a literal no JSON value is, and a member no filter compares
+        for e in [
+            reading(CompareOp::Eq, Literal::Date("2026-10-22".into())),
+            reading(
+                CompareOp::Eq,
+                Literal::Guid("00000000-0000-0000-0000-000000000000".into()),
+            ),
+            cmp(m("doc"), CompareOp::Eq, lit(Literal::Int(1))),
+        ] {
+            assert_eq!(q(&e), Err(Refused::Bad), "{e:?}");
+        }
+    }
+
     #[test]
     fn a_date_and_a_time_of_day_are_residual_values() {
         use residual::Truth::{False, True};
@@ -2750,6 +2808,7 @@ mod tests {
                     },
                     list: false,
                     json: false,
+                    untyped: false,
                     written: crate::edm::Written::Always,
                 },
             );
