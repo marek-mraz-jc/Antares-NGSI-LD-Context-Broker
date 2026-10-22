@@ -459,3 +459,58 @@ fn ruled_records_observed_by_default_and_never_nothing() {
         &old
     ));
 }
+
+/// T-5157: a Vehicle that reports every second under a 30 s heartbeat wrote
+/// one row in 4.5 s on dev, as every instance older than the last row was a
+/// row. A retried batch of seconds behind the last row records nothing, and
+/// a replay of older seconds one row per heartbeat, as live writes do.
+#[test]
+fn late_seconds_record_one_row_per_heartbeat_like_live_ones() {
+    let st = state();
+    let tn = "history-late";
+    let t = TenantId::new(tn).expect("tenant");
+    let ty = ["https://x/Vehicle"];
+    let mode = OnChange {
+        heartbeat: Duration::from_secs(30),
+        deadband: Some(1_000_000.0),
+        min_distance: None,
+    };
+    recording(&st, tn, ty[0], &[(LEVEL, mode)]);
+    let base = chrono::DateTime::parse_from_rfc3339("2026-10-21T22:00:00Z")
+        .expect("instant")
+        .to_utc();
+    let row = |millis: i64| {
+        let at = base
+            .checked_add_signed(chrono::Duration::milliseconds(millis))
+            .expect("instant");
+        let at = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        admits_change(&st, &t, &ty, "urn:v", LEVEL, None, &level(5.0, &at))
+    };
+    let live = (0..=120)
+        .filter(|s: &i64| row(s.saturating_mul(1000)))
+        .count();
+    assert_eq!(live, 5, "0, 30, 60, 90 and 120 s");
+    let retried = (100..120)
+        .filter(|s: &i64| row(s.saturating_mul(1000)))
+        .count();
+    assert_eq!(
+        retried, 0,
+        "a retried batch within a heartbeat of the last row"
+    );
+    let replayed = (0..60)
+        .filter(|s: &i64| row(s.saturating_mul(1000).saturating_add(500)))
+        .count();
+    assert_eq!(replayed, 2, "a replay of a minute: one row per heartbeat");
+    assert!(
+        admits_change(
+            &st,
+            &t,
+            &ty,
+            "urn:v",
+            LEVEL,
+            None,
+            &level(5.0, "2026-10-21T21:00:00Z")
+        ),
+        "a backfill an hour back is a row"
+    );
+}

@@ -900,3 +900,23 @@ async fn a_vehicle_keeps_an_hour_of_track_and_nothing_else_loses_any() {
         assert_eq!(instances(&app, tenant, id).await, left, "{tenant} {id}");
     }
 }
+
+/// T-5157: a sweep deletes only what the rule of the row's own Tenant lets
+/// go: the same type in a second Tenant with a longer history keeps its rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_history_of_one_tenant_leaves_the_same_type_of_another() {
+    let b = TestBroker::new().await.expect("broker");
+    let app = b.serve_mounted(Vec::new()).expect("app");
+    for (tenant, keep) in [("city", "PT5M"), ("town", "P1D")] {
+        let doc = json!({"rules": [{"type": V, "history": keep}]}).to_string();
+        let uri = format!("/q/retention/{tenant}");
+        assert_eq!(
+            send(&app, Method::PUT, &uri, None, Some(doc)).await.0,
+            StatusCode::CREATED
+        );
+        seed_history(&app, tenant, "urn:v:same", V, &[1, 30, 60]).await;
+    }
+    b.sweep_retention(chrono::Utc::now()).await;
+    assert_eq!(instances(&app, "city", "urn:v:same").await, 1);
+    assert_eq!(instances(&app, "town", "urn:v:same").await, 3);
+}
