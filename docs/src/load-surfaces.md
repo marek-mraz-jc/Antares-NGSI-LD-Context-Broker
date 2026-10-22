@@ -46,7 +46,7 @@ per process; the sampler now reads the container's cgroup (`docker stats`).
 | sta-observations | 50 | n/a (platform only) | 14.73 / 26.24 |  | 8.6 / 131.7 | 200 / 500 | ok |
 | ical | 2 | n/a (platform only) | 665.98 / 710.84 |  | 42.9 / 119.4 | 2000 / 4000 | ok |
 | mcp | 50 | n/a (platform only) | 57.25 / 83.0 |  | 11.0 / 119.3 | 200 / 500 | ok |
-| ws-fanout | 200 | n/a (platform only) | 30030 / 30524 |  | 79.6 / 283.8 | 250 / 1000 | breach: p95_ms 30030 > 250; p99_ms 30524 > 1000; errors 77.883 % > 0.1 % |
+| ws-fanout | 200 | n/a (platform only) | 30030 / 30524 |  | 79.6 / 283.8 | 250 / 1000 | breach: p95_ms 30030 > 250; p99_ms 30524 > 1000; errors 77.883 % > 0.1 % (T-4921: 33.5 % missing, each loss now an `x-gap`; section 3) |
 
 `ogc-page` asked an `offset` the OGC surface does not define (its paging is the `next` cursor); the
 shape now follows the first page's `next` link, as a GIS client pages; a 2 000-entity recheck answered
@@ -58,6 +58,23 @@ Each breach of this run is a task: `ngsi-near` on the platform build (4.2x vanil
 `ogc-items` (bbox with a CQL2 filter on 10 556 AirQualityObserved: 10 s timeouts at 354 % CPU, T-4920), and
 the WebSocket fan-out (20 % of 300 050 owed notifications delivered within the hold, 30 s behind,
 no `x-gap` sent, T-4921).
+
+T-4921 (2026-10-21, sandbox under load 40 on 12 cores, 20 000 entities, the same shape) found the
+fan-out bound by delivery, not by k6 or the matcher: a notification of one subscription costs a view
+re-read and a bookkeeping transaction under the tenant's 8 delivery slots, and each folded notification
+re-read its Entities one query each (125 ms of a 210 ms delivery; the rest waited for a pool
+connection). A lane then dropped its groups without a word. Since T-4921 a dropped group reaches the
+socket as an `x-gap` in order, and a notification reads its Entities in one query. Two runs back to
+back, the first with the `x-gap` change alone:
+
+| binary | delivered of ~300 000 owed | `x-gap` messages | missing | p95 ms | PATCH p95 ms |
+|---|---|---|---|---|---|
+| `x-gap` only, Entities read one by one | 84 641 | 75 119 | 70.2 % | 20 928 | 57 |
+| T-4921, one read per notification | 197 278 | 19 589 | 33.5 % | 15 618 | 157 |
+
+The shape still breaches its budget: 1 000 subscribers each owed a notification every 250 ms is 4 000
+deliveries a second, each with its own transaction. T-5159 books a drain's deliveries in one statement
+and reads a view's Entities once per drain.
 
 ## 4. Proof the gate goes red
 

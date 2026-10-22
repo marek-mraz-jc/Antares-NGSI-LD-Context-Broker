@@ -398,6 +398,13 @@ impl NotificationSink for Sink {
         false
     }
 
+    /// The connection writes an `x-gap` over the lost notification.
+    fn lost(&self, uri: &str, tenant: &str, subscription: &str) {
+        if let Some(id) = uri.strip_prefix(ENDPOINT_PREFIX) {
+            let _answer = self.0.lose(id, tenant, subscription);
+        }
+    }
+
     fn deliver<'a>(
         &'a self,
         uri: &'a str,

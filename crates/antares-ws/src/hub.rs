@@ -73,6 +73,9 @@ struct Queued {
     coalescible: bool,
     /// Earlier notifications this one replaced (`x-coalesced`).
     merged: u64,
+    /// An `x-gap` from this seq to `seq`: notifications the broker lost
+    /// before they reached this queue.
+    gap_from: Option<u64>,
     text: String,
 }
 
@@ -82,6 +85,23 @@ pub(crate) enum Next {
     Overflow(u64, u64),
     /// Notifications, in order.
     Send(Vec<String>),
+}
+
+impl State {
+    /// The queue is full: what it holds and `seq` are lost; an attached
+    /// socket writes the `x-gap` and closes.
+    fn overflow(&mut self, seq: u64) {
+        let from = self
+            .queue
+            .front()
+            .map_or(seq, |q| q.gap_from.unwrap_or(q.seq));
+        let from = self.lost.map_or(from, |(f, _)| f.min(from));
+        self.lost = Some((from, seq));
+        self.queue.clear();
+        if self.attached.is_some() {
+            self.overflowed = true;
+        }
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -145,9 +165,15 @@ impl Conn {
         let coalescible = !show && n.entity.is_some() && !n.changes;
         let into = coalescible
             .then(|| {
+                // never past a queued x-gap: a change after a loss leaves
+                // after it, so the consumer reads the gap first
                 st.queue
                     .iter()
-                    .position(|q| q.coalescible && q.sub == n.subscription && q.entity == n.entity)
+                    .rposition(|q| {
+                        q.gap_from.is_some()
+                            || (q.coalescible && q.sub == n.subscription && q.entity == n.entity)
+                    })
+                    .filter(|&i| st.queue.get(i).is_some_and(|q| q.gap_from.is_none()))
             })
             .flatten();
         let queued = into.and_then(|i| st.queue.get(i));
@@ -171,13 +197,7 @@ impl Conn {
         }
         st.next_seq = seq.saturating_add(1);
         if st.queue.len() >= limit {
-            let from = st.queue.front().map_or(seq, |q| q.seq);
-            let from = st.lost.map_or(from, |(f, _)| f.min(from));
-            st.lost = Some((from, seq));
-            st.queue.clear();
-            if st.attached.is_some() {
-                st.overflowed = true;
-            }
+            st.overflow(seq);
             drop(st);
             self.wake.notify_one();
             return Answer::Overflow;
@@ -188,7 +208,46 @@ impl Conn {
             entity: n.entity,
             coalescible,
             merged,
+            gap_from: None,
             text,
+        });
+        drop(st);
+        self.wake.notify_one();
+        Answer::Queued
+    }
+
+    /// A notification of `sub` the broker dropped before offering it (a
+    /// full delivery lane): it takes the next seq and leaves as an `x-gap`
+    /// in its place, so the consumer learns of it in order. Losses in a row
+    /// share one `x-gap`.
+    fn lose(&self, sub: &str, limit: usize) -> Answer {
+        let mut st = lock(&self.state);
+        if !st.subs.contains_key(sub) {
+            return Answer::Unknown;
+        }
+        let seq = st.next_seq.max(1);
+        st.next_seq = seq.saturating_add(1);
+        if let Some(q) = st.queue.back_mut() {
+            if let Some(from) = q.gap_from {
+                q.seq = seq;
+                q.text = envelope::gap(from, seq);
+                return Answer::Queued;
+            }
+        }
+        if st.queue.len() >= limit {
+            st.overflow(seq);
+            drop(st);
+            self.wake.notify_one();
+            return Answer::Overflow;
+        }
+        st.queue.push_back(Queued {
+            seq,
+            sub: sub.to_owned(),
+            entity: None,
+            coalescible: false,
+            merged: 0,
+            gap_from: Some(seq),
+            text: envelope::gap(seq, seq),
         });
         drop(st);
         self.wake.notify_one();
@@ -255,7 +314,7 @@ impl Conn {
         let lost_from = st.lost.map(|(f, _)| f);
         // the first seq the ring or the queue still holds
         let first_kept = oldest
-            .or_else(|| st.queue.front().map(|q| q.seq))
+            .or_else(|| st.queue.front().map(|q| q.gap_from.unwrap_or(q.seq)))
             .or(lost_from)
             .unwrap_or(st.next_seq.max(1));
         if first_kept > after {
@@ -534,6 +593,25 @@ impl Hub {
             return Answer::Unknown;
         }
         let answer = conn.offer(n, self.limits.queue);
+        if answer == Answer::Overflow {
+            self.overflows
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        answer
+    }
+
+    /// Tell the connection `id` this pod holds that a notification of its
+    /// Subscription `sub` was lost before delivery: the socket writes an
+    /// `x-gap` over it. ponytail: a connection another pod holds is not
+    /// told; relay a loss message when `bus = nats` fan-out needs it.
+    pub fn lose(&self, id: &str, tenant: &str, sub: &str) -> Answer {
+        let Some(conn) = self.get(id) else {
+            return Answer::Unknown;
+        };
+        if conn.tenant != tenant {
+            return Answer::Unknown;
+        }
+        let answer = conn.lose(sub, self.limits.queue);
         if answer == Answer::Overflow {
             self.overflows
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

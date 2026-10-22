@@ -539,6 +539,70 @@ mod change_pipeline {
         );
     }
 
+    /// A binding that records the losses it is told of (T-4921).
+    struct Losses(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl antares_notifier::NotificationSink for Losses {
+        fn schemes(&self) -> &'static [&'static str] {
+            &["x-loss"]
+        }
+        fn parse_endpoint(
+            &self,
+            _uri: &str,
+            _notifier_info: &[(&str, &str)],
+        ) -> Result<(), antares_model::NgsiError> {
+            Ok(())
+        }
+        fn deliver<'a>(
+            &'a self,
+            _uri: &'a str,
+            _out: &'a antares_notifier::Outbound,
+            _timeout: std::time::Duration,
+        ) -> antares_notifier::DeliveryFuture<'a> {
+            Box::pin(async { Ok(()) })
+        }
+        fn lost(&self, uri: &str, tenant: &str, subscription: &str) {
+            if let Ok(mut l) = self.0.lock() {
+                l.push(format!("{uri} {tenant} {subscription}"));
+            }
+        }
+    }
+
+    /// T-4921: a group a full lane drops is told to the subscription's
+    /// binding, so a WebSocket consumer gets an `x-gap` instead of silence.
+    /// The lane task does not run before this test yields, so the lane
+    /// takes DELIVERY_LANE groups and drops the next two.
+    #[tokio::test]
+    async fn a_full_lane_tells_the_binding_what_it_lost() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let st =
+            AppState::new("antares-lane-loss".into()).with_sink(Box::new(Losses(seen.clone())));
+        let pending: Arc<AtomicUsize> = Arc::default();
+        let done = Arc::new(BatchDone {
+            pending: pending.clone(),
+            taken: 1,
+        });
+        let sub = Arc::new(json!({
+            "id": "urn:ngsi-ld:Subscription:loss",
+            "isActive": false,
+            "notification": {"endpoint": {"uri": "x-loss:a"}}
+        }));
+        for _ in 0..DELIVERY_LANE + 2 {
+            let group = Matched {
+                tenant: TenantId::new("default").expect("tenant"),
+                sub: sub.clone(),
+                ctx: antares_jsonld::Loader::new().core(),
+                data: vec![json!({})],
+            };
+            to_lane(&st, group, &done);
+        }
+        let seen = seen.lock().map(|l| l.clone()).unwrap_or_default();
+        assert_eq!(
+            seen,
+            vec!["x-loss:a default urn:ngsi-ld:Subscription:loss".to_owned(); 2]
+        );
+    }
+
     /// T-4086: a backed-up lane folds into notifications of at most
     /// CHANGE_BATCH entities; a group that does not fit leads the next one,
     /// and a single group larger than that still leaves whole.

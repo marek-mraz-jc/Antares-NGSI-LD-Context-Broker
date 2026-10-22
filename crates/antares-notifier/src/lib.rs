@@ -364,6 +364,11 @@ pub trait NotificationSink: Send + Sync {
         out: &'a Outbound,
         timeout: Duration,
     ) -> DeliveryFuture<'a>;
+
+    /// A notification of `subscription` the broker dropped before
+    /// `deliver` (a full delivery lane). A binding whose consumer can be
+    /// told of the loss in band tells it; the default has no such channel.
+    fn lost(&self, _uri: &str, _tenant: &str, _subscription: &str) {}
 }
 
 /// Scheme → sink registry; populated by the composition root. Choosing a

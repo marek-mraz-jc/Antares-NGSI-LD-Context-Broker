@@ -217,9 +217,18 @@ pub(super) async fn shown_now(
     }
     let mut wanted = std::collections::BTreeSet::new();
     ids(data, &mut wanted);
+    // one read for every Entity of the notification: one by one, a folded
+    // notification of 256 Entities was 256 round trips under a delivery
+    // slot (T-4921); a failed read shows none of them, as a failed get did
+    let ids: Vec<&str> = wanted.iter().copied().collect();
+    let mut stored_now = st
+        .store
+        .get_entities(tenant, &ids)
+        .await
+        .unwrap_or_default();
     let mut out = HashMap::new();
     for id in wanted {
-        let mut stored = st.store.get(tenant, Kind::Entity, id).await.ok().flatten();
+        let mut stored = stored_now.remove(id);
         if let (Some(d), Some(_)) = (&stored, reach) {
             let ctx = crate::repr::policy_context();
             if !crate::repr::policy_admits(st, tenant, ctx, reach, d).await {
