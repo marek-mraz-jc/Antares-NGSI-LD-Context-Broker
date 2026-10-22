@@ -145,9 +145,10 @@ pub struct Member {
     /// The slot is a `JsonProperty`: a [`Shape::Json`] write keeps `json`. Any other
     /// [`Shape::Json`] (an inlined object, P2) is a `Property` (T-5206 finding 4).
     pub json: bool,
-    /// A `Property` of [`Shape::Json`] (`range: Any`, an inlined object): `$filter` compares
-    /// it as `Edm.Untyped` with a null, boolean, number or string literal; a value of another
-    /// JSON type matches only `ne` (T-5333, NGSI-LD 4.9).
+    /// A `Property` whose range is `linkml:Any` (`range: Any`): `$filter` compares it as
+    /// `Edm.Untyped` with a null, boolean, number or string literal; a value of another JSON
+    /// type matches only `ne` (T-5333, NGSI-LD 4.9). An inlined class of the view (a complex
+    /// value) is never compared.
     pub untyped: bool,
     /// When a client may write it (T-3722).
     pub written: Written,
@@ -661,6 +662,9 @@ fn description(text: &str) -> Annotation {
     Annotation::new("Core.Description", Expr::String(text.to_owned()))
 }
 
+/// The class IRI of LinkML's `Any`, a value of no stated structure.
+const LINKML_ANY: &str = "https://w3id.org/linkml/Any";
+
 /// The [`Member`] a slot of `shape` maps to.
 fn member_of(
     schema: &linkml_model::Model,
@@ -673,7 +677,9 @@ fn member_of(
         iri,
         list: kind.starts_with("List"),
         json: kind == "JsonProperty",
-        untyped: kind == "Property" && shape == Shape::Json,
+        untyped: kind == "Property"
+            && shape == Shape::Json
+            && matches!(schema.range(slot), Range::Class(c) if schema.class_iri(c) == LINKML_ANY),
         shape,
         written: written(slot),
     }

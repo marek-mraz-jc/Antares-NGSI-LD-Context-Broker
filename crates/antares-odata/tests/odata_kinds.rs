@@ -307,8 +307,13 @@ async fn an_untyped_value_reads_at_4_0_and_filters_by_its_json_value() {
             assert_eq!(status, StatusCode::OK, "{version:?} {path}: {body}");
             assert_eq!(ids(&body), want, "{version:?} {path}: {body}");
         }
-        // a literal no JSON value is, and a JsonProperty, still cannot hold
-        for filter in ["reading%20eq%202026-10-22", "notes%20eq%201"] {
+        // a literal no JSON value is, a JsonProperty and a complex value still cannot hold
+        for filter in [
+            "reading%20eq%202026-10-22",
+            "notes%20eq%201",
+            "address%20gt%201",
+            "address%20eq%20'x'",
+        ] {
             let path = format!("Car?$filter={filter}");
             let (status, body) = get(&app, &path, version).await;
             assert_eq!(
@@ -321,7 +326,7 @@ async fn an_untyped_value_reads_at_4_0_and_filters_by_its_json_value() {
     let (status, picked) = get(&app, "Car?$filter=reading%20ge%208372&$select=reading", &[]).await;
     assert_eq!(status, StatusCode::OK, "{picked}");
     assert!(picked.contains("9000"), "{picked}");
-    // $metadata says so: `reading` is filterable, never sortable; `notes` neither
+    // $metadata says so: `reading` is filterable, never sortable; `notes` and `address` neither
     let (_, xml) = get(&app, "$metadata", &[("OData-MaxVersion", "4.01")]).await;
     let section = |term: &str| {
         let at = xml.find(term).unwrap_or_else(|| panic!("{term} in {xml}"));
@@ -333,5 +338,6 @@ async fn an_untyped_value_reads_at_4_0_and_filters_by_its_json_value() {
     let filter = section("Capabilities.FilterRestrictions");
     assert!(!filter.contains(">reading<"), "{filter}");
     assert!(filter.contains(">notes<"), "{filter}");
+    assert!(filter.contains(">address<"), "{filter}");
     assert!(section("Capabilities.SortRestrictions").contains(">reading<"));
 }
