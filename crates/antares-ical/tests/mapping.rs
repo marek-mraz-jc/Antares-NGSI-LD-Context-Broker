@@ -285,3 +285,56 @@ fn an_sdm_iri_names_the_same_attribute_and_modified_at_stamps_the_event() {
     assert!(has(&l, "DTSTAMP:20261018T000000Z"), "{l:?}");
     assert!(!l.iter().any(|x| x.starts_with("LAST-MODIFIED")), "{l:?}");
 }
+
+/// T-5207: an output of this contract version is read strictly (an unknown member or an
+/// unknown version is refused, as the Portal's save check refuses it); one of a newer version
+/// keeps its name, texts, filter and settings and serves each source's type over its preset,
+/// so the calendar still answers.
+#[test]
+fn the_output_version_reads_strictly_and_a_newer_one_degrades_to_the_preset() {
+    use antares_ical::mapping::{output_of, CompiledOutput, MAPPING_VERSION};
+    assert_eq!(MAPPING_VERSION, 1);
+    let v1 = json!({"name": "vsetky", "version": 1, "sources": [{"preset": "schema-org"}]});
+    let (output, degraded) = output_of(&v1).expect("v1");
+    assert!(!degraded);
+    assert!(CompiledOutput::compile(&output).is_ok());
+    let (absent, _) =
+        output_of(&json!({"name": "vsetky", "sources": [{}]})).expect("version absent reads as 1");
+    assert_eq!(absent.sources[0].entity_type, "Event");
+    for refused in [
+        json!({"name": "a", "version": 1, "rrule": "eventSchedule", "sources": [{}]}),
+        json!({"name": "a", "sources": [{"rrule": "eventSchedule"}]}),
+        json!({"name": "a", "version": 3, "filter": {"near": "x"}, "sources": [{}]}),
+    ] {
+        assert!(output_of(&refused).is_err(), "{refused}");
+    }
+    let (old, _) = output_of(&json!({"name": "a", "version": 0, "sources": [{}]})).expect("reads");
+    assert!(
+        CompiledOutput::compile(&old).is_err(),
+        "version 0 is refused"
+    );
+    let newer = json!({"name": "koncerty", "version": 2, "rrule": "x",
+        "title": {"sk": "Koncerty"}, "lang": "sk", "limit": 50, "sort": "sideways",
+        "timezone": "Mars/Olympus", "filter": {"q": "eventCategory==\"hudba\""},
+        "sources": [{"type": "CouncilMeeting", "preset": "schema-org", "rrule": "eventSchedule",
+            "mapping": {"SUMMARY": {"attribute": "name", "case": "upper"}}}, {"type": "x y"}]});
+    let (output, degraded) = output_of(&newer).expect("a newer output degrades");
+    assert!(degraded);
+    assert_eq!(output.name, "koncerty");
+    assert_eq!(output.title.get("sk").map(String::as_str), Some("Koncerty"));
+    assert_eq!(output.filter.q.as_deref(), Some("eventCategory==\"hudba\""));
+    assert_eq!(
+        (output.limit, output.sort.clone(), output.timezone.clone()),
+        (Some(50), None, None)
+    );
+    assert_eq!(output.sources[1].entity_type, "Event");
+    let compiled = CompiledOutput::compile(&output).expect("compiles");
+    let plan = &compiled.plans[0];
+    assert_eq!(plan.entity_type(), "CouncilMeeting");
+    let concert = event(&[("type", json!("CouncilMeeting"))]);
+    assert!(lines(&plan.vevent(&concert, &Window::default(), now()))
+        .iter()
+        .any(|l| l == "SUMMARY:Koncert"));
+    let (bare, _) = output_of(&json!({"version": 2})).expect("degrades");
+    assert!(bare.sources.is_empty() && bare.name.is_empty());
+}

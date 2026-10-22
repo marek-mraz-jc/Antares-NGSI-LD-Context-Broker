@@ -127,10 +127,10 @@ references), T-3737 (one `Content-Length` on `HEAD`), T-3738 (`$entity`
 |---|---:|---:|---:|---:|
 | Minimal | 197 | 76 | 20 | 72.2 % |
 | Intermediate | 266 | 70 | 14 | 79.2 % |
-| Advanced | 304 | 221 | 42 | 57.9 % |
-| **All** (suite summary) | 767 | 367 | 76 | 67.6 % |
+| Advanced | 304 | 225 | 38 | 57.5 % |
+| **All** (suite summary) | 767 | 371 | 72 | 67.4 % |
 
-Measured by surfaces-conformance 39733975692 on `cf3b670` (train 20261022-0621), written by tasks/train.
+Measured by surfaces-conformance 39771040843 on `16ad10b` (train 20261022-1109), written by tasks/train.
 
 One earlier pass was a skip after train 8, by the suite's own rule: `POST with
 nonexistent foreign key` posts a `ProductDescription` whose `ProductID` names

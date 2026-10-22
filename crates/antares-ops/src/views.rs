@@ -133,7 +133,7 @@ pub struct View {
 }
 
 /// The surfaces a view's `representations` may name.
-pub const REPRESENTATIONS: &[&str] = &["ical"];
+pub const REPRESENTATIONS: &[&str] = &["ical", "feed"];
 
 /// The most named outputs one representation lists (owner 2026-10-22T09:30Z).
 pub const MAX_OUTPUTS: usize = 20;
@@ -312,6 +312,7 @@ impl View {
         };
         if let Some(named) = &self.representations {
             if let Some((name, _)) = named.iter().find(|(name, member)| {
+                // each is a list of named outputs: `feed` (T-5202), `ical` (T-5208)
                 !REPRESENTATIONS.contains(&name.as_str())
                     || member
                         .as_array()
@@ -1318,7 +1319,8 @@ mod tests {
 
     #[test]
     fn a_view_keeps_the_representations_it_names_and_refuses_another_name() {
-        let ical = json!({"ical": [{"name": "events", "sources": [{"preset": "sdm-event"}]}]});
+        let ical = json!({"ical": [{"name": "events", "sources": [{"preset": "sdm-event"}]}],
+            "feed": [{"name": "news"}]});
         let loaded = load(&with("representations", ical.clone())).expect("loads");
         assert_eq!(
             loaded
@@ -1336,6 +1338,7 @@ mod tests {
             json!({"vcard": []}),
             json!({"ical": {"preset": "sdm-event"}}),
             json!({"ical": many}),
+            json!({"feed": {}}),
             json!([]),
         ] {
             assert!(
