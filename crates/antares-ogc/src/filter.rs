@@ -199,6 +199,23 @@ pub(crate) fn lower(
     Ok(out)
 }
 
+/// Lowers `filter` for `c` under `terms` to residual conjuncts alone, for a collection the
+/// store cannot query: a history (T-5100) evaluates the whole filter in process.
+pub(crate) fn residual(
+    c: &Collection,
+    terms: &crate::terms::Terms,
+    filter: &Cql,
+) -> Result<Vec<Expr>, Problem> {
+    let mut l = Lower {
+        c,
+        terms,
+        stamps: Vec::new(),
+    };
+    let mut conjuncts = Vec::new();
+    flatten(filter, &mut conjuncts);
+    conjuncts.into_iter().map(|e| l.expr(e).map(fold)).collect()
+}
+
 /// `e` with its constant and repeated operands of `AND`/`OR` folded, which three-valued logic
 /// allows: `TRUE` is the identity of `AND` and absorbs `OR`, `FALSE` the reverse, and `a AND a`
 /// is `a` (an instant is both ends of its period, so `T_EQUALS` of two instants is one `=`).
@@ -949,6 +966,7 @@ mod tests {
 
     fn station() -> Collection {
         Collection {
+            history: false,
             id: "AirQualityObserved".into(),
             description: None,
             type_iri: "https://uri.etsi.org/ngsi-ld/default-context/AirQualityObserved".into(),

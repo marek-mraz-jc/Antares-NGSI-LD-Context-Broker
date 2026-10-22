@@ -243,7 +243,7 @@ pub fn local(href: &str) -> String {
 }
 
 /// An engine that narrows every read to `speed<50`, as a Policy would.
-pub struct SlowOnly(antares_ops::policy::Filter);
+pub struct SlowOnly(pub antares_ops::policy::Filter);
 
 impl PolicyEngine for SlowOnly {
     fn name(&self) -> &'static str {

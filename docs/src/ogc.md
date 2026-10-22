@@ -16,6 +16,7 @@ GET /x/views/{view}/ogc/features/collections/{collectionId}/queryables
 GET /x/views/{view}/ogc/features/functions
 GET /x/views/{view}/ogc/features/collections/{collectionId}/items
 GET /x/views/{view}/ogc/features/collections/{collectionId}/items/{featureId}
+GET /x/views/{view}/ogc/features/collections/{type}-history/items
 POST   /x/views/{view}/ogc/features/collections/{collectionId}/items
 PUT    /x/views/{view}/ogc/features/collections/{collectionId}/items/{featureId}
 PATCH  /x/views/{view}/ogc/features/collections/{collectionId}/items/{featureId}
@@ -213,6 +214,38 @@ read whose `Accept` takes no JSON `406`. An error is `application/problem+json` 
 `detail`: it names no hidden type or Attribute and echoes no request
 value. A view that does not allow `query_entities` refuses `/items` with
 the status the view gives (`405`).
+
+## 7. History collections
+
+A view that offers `temporal_query` serves, beside each collection
+`{type}`, a read-only collection `{type}-history` (T-5100) for desktop GIS
+clients that animate time (QGIS Temporal Controller, the ArcGIS Pro time
+slider), which read neither NGSI-LD temporal answers nor SensorThings:
+
+- one Feature per Entity and stored `observedAt`, its `id`
+  `{entityId}@{observedAt}`;
+- `properties` are the values valid then: each Attribute's latest instance
+  at or before that `observedAt`; `geometry` the location valid then, or
+  the Entity's current location when its history holds none (a station's
+  place written once without `observedAt`);
+- `entityId`, `validFrom` (the `observedAt`) and `validTo` (the Entity's
+  next `observedAt`, `null` for its newest) are added; the queryables mark
+  `validFrom`/`validTo` `primary-interval-start`/`primary-interval-end`;
+- `datetime` keeps the Features valid in the window (`validFrom <= end`
+  and `validTo > start`, an open `validTo` valid to the end of time),
+  `bbox` and `filter` are evaluated in process over each Feature,
+  `ngsild.q` and `ngsild.scopeQ` reach the Temporal Query; `sortby` and the
+  other `ngsild.` options are `400`; `limit` and the `next` link page as
+  in section 2, a page reads at most 100 Entities and ends short with its
+  `next` link past them; no `numberMatched`;
+- the Features come from Query Temporal Evolution of Entities through the
+  view, so the view's rules and the Policy hide in the history what they
+  hide in the current state; every write is `405`, `/api` lists none.
+
+Each Entity's newest 1,000 instances per Attribute are read (the broker's
+default `ANTARES_TEMPORAL_INSTANCE_LIMIT`): an older window answers no
+Feature. A type whose space keeps no history (`ANTARES_TEMPORAL_RECORD=ruled`
+without a rule) has an empty history collection.
 
 ## Related
 

@@ -28,6 +28,8 @@ pub(crate) struct Collection {
     pub time: Option<Time>,
     /// The other Attributes the view shows, in schema order (M5).
     pub properties: Vec<Prop>,
+    /// A `{type}-history` collection (T-5100): read from the temporal history, never written.
+    pub history: bool,
 }
 
 /// One Attribute of a collection besides its geometry.
@@ -123,6 +125,7 @@ pub(crate) fn build(
         out.insert(
             class_name.to_owned(),
             Collection {
+                history: false,
                 id: class_name.to_owned(),
                 description: class.description.clone(),
                 type_iri,

@@ -8,6 +8,7 @@ mod core;
 mod crs;
 mod filter;
 mod geojson;
+mod history;
 mod items;
 mod matrix;
 mod oas30;

@@ -274,7 +274,9 @@ pub(crate) fn document(
         json!({"$ref": "#/components/parameters/crs"}),
     ];
     for c in collections.values() {
-        collection_paths(&mut paths, c, offers, (&items_params, &feature_id));
+        // T-5100: a history offers no write.
+        let read_only = |op| !c.history && offers(op);
+        collection_paths(&mut paths, c, &read_only, (&items_params, &feature_id));
     }
     json!({
         "openapi": "3.0.3",
@@ -292,6 +294,7 @@ mod tests {
     #[test]
     fn every_operation_documents_its_refusals_and_only_shown_collections_appear() {
         let car = Collection {
+            history: false,
             id: "Car".into(),
             description: None,
             type_iri: "https://e.org/Car".into(),

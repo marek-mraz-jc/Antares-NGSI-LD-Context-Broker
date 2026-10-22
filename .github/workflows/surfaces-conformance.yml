@@ -384,11 +384,12 @@ jobs:
     timeout-minutes: 30
     # One run per Endpoint kind (T-3831): `all` is the conformance Tenant's star
     # view; the others read the `ogc` Tenant of ci/views/ogc (public, internal
-    # with the Part 4 writes, filtered by q, star, projection, a data cube).
+    # with the Part 4 writes, filtered by q, star, projection, a data cube, the
+    # history collections of T-5100 over ci/views/ogc/history).
     strategy:
       fail-fast: false
       matrix:
-        view: [all, ogc-public, ogc-internal, ogc-filtered, ogc-star, ogc-projection, ogc-cube]
+        view: [all, ogc-public, ogc-internal, ogc-filtered, ogc-star, ogc-projection, ogc-cube, ogc-history]
     permissions:
       contents: read
       issues: write
