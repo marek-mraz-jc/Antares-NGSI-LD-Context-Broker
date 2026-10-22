@@ -51,7 +51,8 @@ async fn conformance_lists_what_is_served() -> Result<(), String> {
     let a = get(&f.app, &format!("{ROOT}/conformance")).await;
     assert_eq!(a.status, StatusCode::OK);
     let read_only: Vec<&str> = antares_ogc::CONFORMANCE
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|c| !c.contains("ogcapi-features-4"))
         .collect();
     assert_eq!(

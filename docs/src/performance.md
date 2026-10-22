@@ -1075,13 +1075,19 @@ before and after:
 What holds the rig below its target, measured in the second run, in
 order:
 
-- **Geoqueries are never decided in SQL.** `near` compares geography in
-  PostGIS and haversine in the evaluator, and `location_ambiguous` rows
-  need the evaluator, so the store drops the page and reads up to
-  `MAX_UNDECIDED_ROWS` of the region: about 1 000 documents and 0.6-1.1 s
-  per statement for a page of 20 in the dense synthetic grid. A geoquery
-  should read candidates in pages until the page holds, as rules
-  that are not by type already do.
+- **Geoqueries are never decided in SQL** (fixed in T-5088, rig rerun
+  owed). `near` compares geography in PostGIS and haversine in the
+  evaluator, and `location_ambiguous` rows need the evaluator, so the
+  store dropped the page and read up to `MAX_UNDECIDED_ROWS` of the
+  region: about 1 000 documents and 0.6-1.1 s per statement for a page of
+  20 in the dense synthetic grid. A paged geoquery or `scopeQ` without
+  `count` now reads its candidates through `query_candidates`: the store
+  pushes the id-ordered page over what it cannot decide, and the API reads
+  pages of its own, doubling up to 2 048, until the window and one match
+  past it hold, as rules that are not by type already did; a walk past
+  `ANTARES_DISCOVERY_SCAN_MAX` rows is refused. `bounded_reads_5_14_5_16.rs`
+  `a_geoquery_page_reads_the_candidates_of_its_page`: page 3 of 2 reads 7
+  of 12 candidates, where the flat read took all 12.
 - **`q` has no leakproof index path** ([Query plans under row-level
   security](#query-plans-under-row-level-security)): `level>=x;level<y`
   reads the type's rows, 64 000 here, 106-164 ms a statement under load.

@@ -88,7 +88,12 @@ jobs:
           exit-code: "1"
       - name: The image starts and answers one NGSI-LD round trip
         run: |
+          # The surface list the platform deploys (joinedcontext-deployment
+          # components/context-broker/values/broker/base-values.yaml.gotmpl): an unknown or
+          # renamed surface is fatal at start, which is how a chart and an image drift apart.
           docker run -d --name broker -p 9090:9090 -e ANTARES_POLICY=allow-all \
+            -e ANTARES_API_SURFACES=admin,views,mcp,access,ws,ws-views,ogc,linkml,odata,sta,ical \
+            -e ANTARES_SCHEMA_MAX_BYTES=1048576 \
             ${SMOKE_ENV:+-e "$SMOKE_ENV"} antares-local:latest
           for _ in $(seq 30); do curl -sf localhost:9090/q/health >/dev/null && break; sleep 1; done
           fail() { echo "SMOKE: $1"; docker logs broker | tail -40; exit 1; }
@@ -102,7 +107,28 @@ jobs:
             || fail "the created entity does not read back"
           curl -sf localhost:9090/ngsi-ld/v1/types | jq -e 'tostring | contains("Smoke")' >/dev/null \
             || fail "/types does not list the created type"
-          echo "create 201, read back, /types lists Smoke"
+          # The broker-wide WebSocket (T-4048 class: the socket answered 404 or 405, never 101)
+          ws=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+            -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+            -H 'Sec-WebSocket-Protocol: ngsi-ld-ws' localhost:9090/x/ws/ngsi-ld/v1) || true
+          [ "$ws" = 101 ] || fail "WebSocket upgrade answered $ws, not 101"
+          # A LinkML schema and a view over it (the OData compliance fixtures): the schema loads
+          # and becomes an EDM model (the class of the LinkML attribute the broker once refused),
+          # and the view's MCP endpoint lists its tools through the streamable-HTTP framing.
+          tenant=$(jq -r .tenant ci/odata-compliance/view.json); view=$(jq -r .id ci/odata-compliance/view.json)
+          put() {
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "localhost:9090/q/$1" \
+              -H 'Content-Type: application/json' --data-binary "@$2")
+            [ "$code" = 201 ] || fail "PUT /q/$1 answered $code"
+          }
+          put "schemas/$tenant" ci/odata-compliance/schema.json
+          put "views/$view" ci/odata-compliance/view.json
+          curl -sf "localhost:9090/x/views/$view/odata/v4/\$metadata" | grep -q '<edmx:Edmx' \
+            || fail "the view's OData \$metadata is not an EDM document"
+          curl -sf -X POST "localhost:9090/x/views/$view/mcp" -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+            | jq -e '.result.tools | length > 0' >/dev/null || fail "MCP tools/list lists no tool"
+          echo "create 201, read back, /types lists Smoke, WebSocket 101, schema + view, OData \$metadata, MCP tools/list"
         env:
           SMOKE_ENV: ${{ inputs.smoke_env }}
       - uses: sigstore/cosign-installer@v3

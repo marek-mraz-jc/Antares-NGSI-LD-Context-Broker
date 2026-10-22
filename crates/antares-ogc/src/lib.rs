@@ -29,6 +29,7 @@ mod items;
 mod model;
 mod schema;
 mod terms;
+mod tiles;
 mod write;
 
 use antares_ops::{Caller, OperationId, Ops, Surface, ViewOps};
@@ -62,10 +63,10 @@ pub const SCHEMA_LIMITS: linkml_model::Limits = linkml_model::Limits {
 };
 
 /// The conformance classes the surface serves (mapping rows C3, R1 to R5, W1 to W5, S1 to S3,
-/// S5, S7, F1 to F16; Parts 4 and 5 are the drafts OGC 20-002r1 and 23-058r1, Part 3 is
-/// OGC 19-079r2 with CQL2 21-065r2). A view's `/conformance` declares the Part 4 ones only as
+/// S5, S7, F1 to F16, T1 to T6; Parts 4 and 5 are the drafts OGC 20-002r1 and 23-058r1, Part 3
+/// is OGC 19-079r2 with CQL2 21-065r2, Tiles is OGC 20-057 with the matrix sets of 17-083r4). A view's `/conformance` declares the Part 4 ones only as
 /// far as it offers their writes (the `conformance` handler).
-pub const CONFORMANCE: [&str; 32] = [
+pub const CONFORMANCE: &[&str] = &[
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson",
     "http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/oas30",
@@ -98,6 +99,14 @@ pub const CONFORMANCE: [&str; 32] = [
     "http://www.opengis.net/spec/cql2/1.0/conf/property-property",
     "http://www.opengis.net/spec/cql2/1.0/conf/functions",
     "http://www.opengis.net/spec/cql2/1.0/conf/arithmetic",
+    "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/core",
+    "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tileset",
+    "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tilesets-list",
+    "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/geodata-tilesets",
+    "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/mvt",
+    "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/oas30",
+    "http://www.opengis.net/spec/tms/2.0/conf/tilematrixset",
+    "http://www.opengis.net/spec/tms/2.0/conf/json-tilematrixset",
 ];
 
 /// The Part 4 classes and the writes each needs (W1 to W3, W5). `features` names no write of its
@@ -128,7 +137,8 @@ fn conformance(offers: &dyn Fn(OperationId) -> bool) -> Vec<&'static str> {
     let declared = |ops: &[OperationId]| !ops.is_empty() && ops.iter().all(|op| offers(*op));
     let writes = PART_4.iter().any(|(_, ops)| declared(ops));
     CONFORMANCE
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|class| match PART_4.iter().find(|(c, _)| c == class) {
             Some((_, [])) => writes,
             Some((_, ops)) => declared(ops),
@@ -266,12 +276,12 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
     if let Some(reply) = offered(&view, method, item, &collections) {
         return reply;
     }
-    let base = format!(
-        "{}{PREFIX}/{id}/ogc/features",
-        antares_ops::public_base(headers)
-    );
+    let base = endpoint(headers, id);
     if let Some(item) = item.filter(|_| method != Method::GET) {
         return write_to(&view, caller, &collections, &base, parts, item, body).await;
+    }
+    if let Some(reply) = tiling(&view, caller, &collections, (&base, id), parts, &rest).await {
+        return reply;
     }
     let asked = match negotiate(&rest, headers, uri) {
         Ok(asked) => asked,
@@ -485,6 +495,126 @@ fn acceptable(headers: &HeaderMap) -> bool {
         })
 }
 
+/// The endpoint's URI as the client reached it.
+fn endpoint(headers: &HeaderMap, id: &str) -> String {
+    format!(
+        "{}{PREFIX}/{id}/ogc/features",
+        antares_ops::public_base(headers)
+    )
+}
+
+/// T1 to T6: the tile matrix sets, a collection's tilesets and tiles (Tiles Part 1); `None` for
+/// any other path. A collection without a geometry has no tiles.
+async fn tiling(
+    view: &ViewOps,
+    caller: &Caller,
+    collections: &BTreeMap<String, Collection>,
+    (base, id): (&str, &str),
+    parts: &Parts,
+    rest: &[&str],
+) -> Option<Reply> {
+    let mapped = |c: &str| collections.get(c).filter(|c| c.geometry.is_some());
+    if let ["collections", c, "tiles", tiles::TMS, z, row, col] = rest {
+        return Some(match mapped(c) {
+            Some(c) => tile(view, caller, c, (base, id), parts, (z, row, col)).await,
+            None => problem(StatusCode::NOT_FOUND, "no such resource"),
+        });
+    }
+    let doc = match rest {
+        ["tileMatrixSets"] => Some(tiles::schemes(base)),
+        ["tileMatrixSets", tiles::TMS] => Some(tiles::scheme()),
+        ["collections", c, "tiles"] | ["collections", c, "tiles", tiles::TMS] => {
+            let at = mapped(c).map(|c| format!("{base}/collections/{}", c.id));
+            match (at, rest.len()) {
+                (Some(at), 3) => Some(tiles::tilesets(base, &at, c)),
+                (Some(at), _) => Some(tiles::tileset(base, &at, c)),
+                (None, _) => return Some(problem(StatusCode::NOT_FOUND, "no such resource")),
+            }
+        }
+        _ => None,
+    }?;
+    Some(if parts.uri.query().is_some_and(|q| !q.is_empty()) {
+        problem(
+            StatusCode::BAD_REQUEST,
+            "the request names a query parameter this resource does not define",
+        )
+    } else if !acceptable(&parts.headers) {
+        problem(StatusCode::NOT_ACCEPTABLE, "this resource is JSON")
+    } else {
+        document(JSON, &doc)
+    })
+}
+
+/// T1 to T6: one vector tile of `c` (Tiles Part 1 `/req/core`, `/req/mvt`), the `items` page of
+/// the tile's box through the view, so its rules and the Policy narrow it ([`tiles::reply`]).
+async fn tile(
+    view: &ViewOps,
+    caller: &Caller,
+    c: &Collection,
+    (base, id): (&str, &str),
+    parts: &Parts,
+    (z, row, col): (&str, &str, &str),
+) -> Reply {
+    let Some(at) = tiles::Tile::of(z, row, col) else {
+        return problem(
+            StatusCode::NOT_FOUND,
+            "no such tile in WebMercatorQuad 0 to 22",
+        );
+    };
+    if parts.uri.query().is_some_and(|q| !q.is_empty()) {
+        return problem(StatusCode::BAD_REQUEST, "a tile takes no query parameter");
+    }
+    if !takes(&parts.headers, tiles::MVT) {
+        return problem(
+            StatusCode::NOT_ACCEPTABLE,
+            "a tile is application/vnd.mapbox-vector-tile",
+        );
+    }
+    let p = items::Params {
+        limit: tiles::MAX_FEATURES,
+        bbox: Some(at.bbox()),
+        crs: crs::CRS84,
+        ..items::Params::default()
+    };
+    let refs = items::Refs {
+        profile: items::Profile::Key,
+        base,
+        alternate: false,
+    };
+    let digest = items::digest(id, &c.id, &[]);
+    let page = match items::page(view, caller, c, &p, digest, refs).await {
+        Ok(page) => page,
+        Err(refused) => return refused.reply(),
+    };
+    let held: Vec<&str> = parts
+        .headers
+        .get_all(axum::http::header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    let truncated = page.next.is_some();
+    tiles::reply(
+        &c.id,
+        at,
+        &page.features,
+        truncated,
+        &held,
+        tiles::MAX_BYTES,
+    )
+}
+
+/// Whether the request's `Accept` takes `media` (none, `*/*` and `application/*` do).
+fn takes(headers: &HeaderMap, media: &str) -> bool {
+    headers.get_all(ACCEPT).iter().next().is_none()
+        || headers.get_all(ACCEPT).iter().any(|v| {
+            v.to_str().is_ok_and(|v| {
+                v.split(',')
+                    .map(|range| range.split(';').next().unwrap_or_default().trim())
+                    .any(|m| m == media || m == "*/*" || m == "application/*")
+            })
+        })
+}
+
 use antares_ops::percent::decoded as decode;
 
 /// The link object of Part 1 (`rel`, `type`, `href`, Req 29).
@@ -552,6 +682,7 @@ impl Here<'_> {
                 link("conformance", JSON, &format!("{b}/conformance")),
                 link("data", JSON, &format!("{b}/collections")),
                 link(FUNCTIONS_REL, JSON, &format!("{b}/functions")),
+                link(tiles::SCHEMES_REL, JSON, &format!("{b}/tileMatrixSets")),
             ],
         })
     }
@@ -573,13 +704,16 @@ impl Here<'_> {
     /// C7: one collection; no `extent` (M8).
     fn collection(&self, c: &Collection) -> Value {
         let at = format!("{}/collections/{}", self.base, c.id);
-        let links = json!([
+        let mut links = vec![
             link("self", JSON, &at),
             link("items", GEOJSON, &format!("{at}/items")),
             link(SCHEMA_REL, SCHEMA, &format!("{at}/schema")),
             link(SORTABLES_REL, SCHEMA, &format!("{at}/sortables")),
             link(QUERYABLES_REL, SCHEMA, &format!("{at}/queryables")),
-        ]);
+        ];
+        if c.geometry.is_some() {
+            links.push(link(tiles::TILESETS_REL, JSON, &format!("{at}/tiles")));
+        }
         let fields = [
             ("id", Some(Value::from(c.id.as_str()))),
             ("title", Some(Value::from(c.id.as_str()))),
@@ -587,7 +721,7 @@ impl Here<'_> {
             ("itemType", Some(Value::from("feature"))),
             ("crs", Some(json!([crs::CRS84, crs::CRS84H]))),
             ("storageCrs", Some(Value::from(crs::CRS84))),
-            ("links", Some(links)),
+            ("links", Some(Value::from(links))),
         ];
         Value::Object(
             fields

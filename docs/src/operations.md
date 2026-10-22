@@ -429,6 +429,32 @@ accepts. Run it against any two binaries with
 `dev/upgrade-path.sh OLD NEW` (`ANTARES_TEST_DATABASE_URL` adds the postgres
 half).
 
+## Rollback
+
+Migrations are forward-only: no down step ships, and nothing undoes a schema
+change. A rollback starts the previous image on the schema the newer release
+already migrated. `crates/antares-sql/migrations.rollback.toml` states, per
+migration, what that does, and `dev/check-migrations.py` (workspace.yml
+"Migration rollback manifest", preflight step 16) refuses a migration without
+an entry:
+
+- `compatible`: the previous release boots on the newer schema and logs `the
+  database holds migrations [...] of a newer release, all marked compatible:
+  serving it as a rollback`. The entry's `note` names what that release does
+  not maintain while it runs; roll forward again before another schema change.
+- `breaking`: the previous release cannot serve the schema. The file name
+  starts with `breaking_`, the one mark a previous release can read in
+  `_sqlx_migrations`, and its boot stops with `migration <n> is newer than the
+  latest applied migration <m>`; the way back is the backup taken before the
+  release. Prefer expand and contract over two releases to a breaking change.
+
+An unknown applied version at or below the binary's own newest is still a
+history from another release and stops the boot as before. A release built
+before this rule (migrations 0001-0016) refuses every newer migration, so a
+rollback onto it restores the backup. Proven by `tests/pg_rollback.rs`; the
+platform's release runbook (docs `Deployment/16-release-runbook.md`) holds the
+operator's steps.
+
 ## Where the proofs run
 
 | Claim | Workflow |

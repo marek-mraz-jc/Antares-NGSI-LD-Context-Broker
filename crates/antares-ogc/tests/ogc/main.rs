@@ -16,4 +16,5 @@ mod parquet;
 mod scan;
 mod schemas;
 mod tabular;
+mod tiles;
 mod write;

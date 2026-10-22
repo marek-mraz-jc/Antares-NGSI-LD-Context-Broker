@@ -254,11 +254,19 @@ pub(crate) fn records_history(st: &AppState, tenant: &TenantId, doc: &Value) -> 
 }
 
 /// The last row each attribute recorded `onChange` wrote, by (Tenant,
-/// Entity, attribute, datasetId): its payload and its time (T-4665).
-type LastRows = std::collections::HashMap<
-    (String, String, String, String),
-    (Value, chrono::DateTime<chrono::Utc>),
->;
+/// Entity, attribute, datasetId) (T-4665).
+type LastRows = std::collections::HashMap<(String, String, String, String), LastRow>;
+
+/// An attribute's newest row, and the last late row written below it.
+struct LastRow {
+    payload: Value,
+    at: chrono::DateTime<chrono::Utc>,
+    /// A late instance (older than `at`) is judged against the last late row,
+    /// or against `at` before there is one, so a replayed or retried batch
+    /// of older seconds records one row per heartbeat, not one per second
+    /// (T-5157: a Vehicle wrote one row in 4.5 s under a 30 s heartbeat).
+    late: Option<(Value, chrono::DateTime<chrono::Utc>)>,
+}
 static LAST_ROWS: std::sync::LazyLock<std::sync::Mutex<LastRows>> =
     std::sync::LazyLock::new(Default::default);
 /// The most attributes [`LAST_ROWS`] remembers.
@@ -322,8 +330,10 @@ pub(crate) fn records_on_change(st: &AppState, tenant: &TenantId) -> bool {
 /// rule the mode is `every`, or `observed` under `ruled` (T-5056). `every`
 /// always does, `never` never; `onChange` when its value moved past the
 /// deadband or minimum distance since the attribute's last row, when it
-/// differs at all from a row of the same `observedAt` (a correction), when
-/// it is older than that row (a backfill), or once the heartbeat passed.
+/// differs at all from a row of the same `observedAt` (a correction), or
+/// once the heartbeat passed. An instance older than that row (a backfill,
+/// a retried batch) is judged the same way against the nearest row this
+/// process knows below it.
 /// `observed` when its `observedAt` is newer than that of the instance it
 /// replaces (`before`, the attribute as the Entity held it).
 pub(crate) fn admits_change(
@@ -373,24 +383,41 @@ pub(crate) fn admits_change(
     let mut last = LAST_ROWS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let writes = match last.get(&key) {
-        None => true,
-        Some((was, when)) if at == *when => payload != *was,
-        Some((_, when)) if at < *when => return true,
-        Some((was, when)) => {
-            at.signed_duration_since(*when)
-                .to_std()
-                .is_ok_and(|d| d >= mode.heartbeat)
-                || moved(&mode, was, &payload)
+    let admits = |was: &Value, when: chrono::DateTime<chrono::Utc>| {
+        if at == when {
+            return payload != *was;
         }
+        let apart = at.signed_duration_since(when).abs();
+        apart.to_std().is_ok_and(|d| d >= mode.heartbeat) || moved(&mode, was, &payload)
     };
-    if writes {
-        if last.len() >= LAST_ROWS_MAX {
-            last.clear();
+    match last.get_mut(&key) {
+        Some(row) if at < row.at => {
+            let (was, when) = row
+                .late
+                .as_ref()
+                .map_or((&row.payload, row.at), |(p, t)| (p, *t));
+            let writes = admits(was, when);
+            if writes {
+                row.late = Some((payload, at));
+            }
+            writes
         }
-        last.insert(key, (payload, at));
+        Some(row) if !admits(&row.payload, row.at) => false,
+        _ => {
+            if last.len() >= LAST_ROWS_MAX {
+                last.clear();
+            }
+            last.insert(
+                key,
+                LastRow {
+                    payload,
+                    at,
+                    late: None,
+                },
+            );
+            true
+        }
     }
-    writes
 }
 
 /// The instant `instance` was observed at, if it says.
