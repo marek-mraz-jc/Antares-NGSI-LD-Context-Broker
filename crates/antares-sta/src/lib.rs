@@ -7,6 +7,13 @@
 //! view hides is absent from every set, count and id, and a hidden id answers the 404 an
 //! unknown one does.
 //!
+//! A view's `representations.sta` lists named outputs (docs API/11 EP-159, T-5225), each its own
+//! service under `/x/views/{view}/sta/{output}/v1.1`: its Things are the Entities of its source
+//! types its filter selects, the filter a conjunct of every read and of every id looked up, and
+//! its Datastreams the attributes its `datastreams` role names (every numeric Property when not
+//! mapped). A Sensor or a point of interest of a type the output does not list is none of its
+//! resources. A name the list does not hold, or an output that does not hold, answers 404.
+//!
 //! ```
 //! use antares_ops::Surface;
 //! let sta = antares_sta::Sta;
@@ -19,9 +26,10 @@
 pub mod mapping;
 pub mod query;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use antares_ops::outputs::{self, Output};
 use antares_ops::percent::encode;
 use antares_ops::{
     Caller, OperationId, Ops, OpsRequest, Page, Pushdown, Refusal, Scanned, Surface, ViewOps,
@@ -90,7 +98,10 @@ impl Surface for Sta {
         Router::new()
             .route("/{view}/sta/v1.1", handler.clone())
             .route("/{view}/sta/v1.1/", handler.clone())
-            .route("/{view}/sta/v1.1/{*rest}", handler)
+            .route("/{view}/sta/v1.1/{*rest}", handler.clone())
+            .route("/{view}/sta/{output}/v1.1", handler.clone())
+            .route("/{view}/sta/{output}/v1.1/", handler.clone())
+            .route("/{view}/sta/{output}/v1.1/{*rest}", handler)
     }
 }
 
@@ -160,14 +171,21 @@ async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
     .await
 }
 
-/// One request below `/{view}/sta/v1.1`: a view id is `[a-z0-9-]`, so its raw segment is its id.
+/// One request below `/{view}/sta/v1.1` or `/{view}/sta/{output}/v1.1`: a view id and an output
+/// name are `[a-z0-9-]`, so their raw segments are their names.
 async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
     let uri = &req.uri;
     let mut segments = uri.path().split('/').skip(1);
     let id = segments.next().unwrap_or_default();
-    // `sta`, `v1.1`: the route matched them.
-    let rest = segments.skip(2).collect::<Vec<_>>().join("/");
+    // `sta`, then `v1.1` or the output's name and `v1.1`: the route matched them.
+    let named = segments.nth(1).filter(|s| *s != "v1.1");
+    let rest = segments
+        .skip(usize::from(named.is_some()))
+        .collect::<Vec<_>>()
+        .join("/");
     let view = ops.view(id).ok_or_else(not_found)?;
+    let output = named.map(|name| output(&view, name)).transpose()?;
+    let root = named.map_or_else(|| "sta/v1.1".to_owned(), |n| format!("sta/{n}/v1.1"));
     let rest = antares_ops::percent::decoded(&rest).ok_or_else(not_found)?;
     // A list of pairs takes every query string: a name without `=` is a pair with an empty value.
     let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
@@ -176,10 +194,11 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
     let cx = Cx {
         opts: query::options(&pairs)?,
         base: format!(
-            "{}{PREFIX}/{id}/sta/v1.1",
+            "{}{PREFIX}/{id}/{root}",
             antares_ops::public_base(&req.headers)
         ),
         view: &view,
+        output,
         caller,
         pairs,
     };
@@ -204,9 +223,89 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
     }
 }
 
+/// The output `name` of the view's `representations.sta` (T-5225) and the types it reads, as
+/// the view answers them: a name the list does not hold, an output that does not hold, or one
+/// whose sources the view shows none of serves nobody.
+fn output(view: &ViewOps, name: &str) -> Result<Named, Problem> {
+    let (_, found) = outputs::listed(view.representation("sta"), "sta")
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .ok_or_else(not_found)?;
+    let output = found.map_err(|_| not_found())?;
+    let sources = output.sources.iter().map(|s| s.entity_type.as_str());
+    let types: Vec<String> = if view.shows_every_name() {
+        sources.map(str::to_owned).collect()
+    } else {
+        let (shown, _) = view.shown_names();
+        shown
+            .into_iter()
+            .filter(|t| output.sources.iter().any(|s| s.entity_type == local(t)))
+            .collect()
+    };
+    if types.is_empty() {
+        return Err(not_found());
+    }
+    Ok(Named { output, types })
+}
+
+/// A named output and the types it reads.
+struct Named {
+    output: Output,
+    types: Vec<String>,
+}
+
+impl Named {
+    /// Whether Attribute `name` (its local name) is one of the output's Datastreams: one its
+    /// sources' `datastreams` role names, every one when no source maps the role.
+    fn streams(&self, name: &str) -> bool {
+        let named: Vec<&str> = self
+            .output
+            .sources
+            .iter()
+            .flat_map(|s| s.role("datastreams"))
+            .collect();
+        named.is_empty() || named.contains(&local(name))
+    }
+
+    /// The Entity `e` holding as measurements only the output's Datastreams.
+    fn shaped(&self, mut e: Value) -> Value {
+        if let Some(members) = e.as_object_mut() {
+            members.retain(|name, member| {
+                self.streams(name)
+                    || !mapping::instances(member)
+                        .iter()
+                        .any(|i| i.get("value").is_some_and(Value::is_number))
+            });
+        }
+        e
+    }
+
+    /// The query string `query` under the output's filter (EP-159): its `q` and `scopeQ` AND-ed
+    /// with the request's, its geo-query fixed.
+    fn narrowed(&self, query: &str) -> Result<String, Problem> {
+        let mut pairs = BTreeMap::new();
+        for pair in query.split('&').filter(|p| !p.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let v = antares_ops::percent::decoded(v).ok_or_else(not_found)?;
+            pairs.insert(k.to_owned(), v);
+        }
+        self.output
+            .filter
+            .narrow(&mut pairs)
+            .map_err(|why| Problem(StatusCode::BAD_REQUEST, why.into()))?;
+        Ok(pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={}", encode(v)))
+            .collect::<Vec<_>>()
+            .join("&"))
+    }
+}
+
 /// One request's view, caller, base and options.
 struct Cx<'a> {
     view: &'a ViewOps,
+    /// The named output the request reads, `None` for the view's own service.
+    output: Option<Named>,
     caller: &'a Caller,
     base: String,
     opts: Options,
@@ -217,6 +316,10 @@ impl Cx<'_> {
     /// What every Query Entities names: the types the view shows (NGSI-LD 5.7.2 takes no query
     /// without one), or for a view of every type the local store.
     fn selector(&self) -> String {
+        if let Some(named) = &self.output {
+            let types: Vec<String> = named.types.iter().map(|t| encode(t)).collect();
+            return format!("type={}", types.join(","));
+        }
         if self.view.shows_every_name() {
             return "local=true".into();
         }
@@ -256,7 +359,7 @@ impl Cx<'_> {
     ) -> Result<(Vec<Value>, bool, Option<usize>), Problem> {
         // `modifiedAt` is the time of a value no sensor observed (STA 1.1 phenomenonTime).
         let pushdown = Pushdown {
-            query: format!("{}{extra}", self.selector()),
+            query: self.narrowed(&format!("{}{extra}", self.selector()))?,
             sys_attrs: true,
             ..Pushdown::default()
         };
@@ -267,6 +370,10 @@ impl Cx<'_> {
                 count,
                 ..
             }) => {
+                let entities = match &self.output {
+                    Some(named) => entities.into_iter().map(|e| named.shaped(e)).collect(),
+                    None => entities,
+                };
                 let more = next.is_some()
                     || count.is_some_and(|n| page.start.saturating_add(entities.len()) < n);
                 Ok((entities, more, count))
@@ -324,7 +431,16 @@ impl Cx<'_> {
         Ok(Some(serde_json::from_slice(&bytes).unwrap_or_default()))
     }
 
-    /// The temporal evolution of one Entity's `attribute`, its last `last` instances.
+    /// The query string `query` under the named output's filter, as written for the view's own.
+    fn narrowed(&self, query: &str) -> Result<String, Problem> {
+        self.output
+            .as_ref()
+            .map_or_else(|| Ok(query.to_owned()), |named| named.narrowed(query))
+    }
+
+    /// The temporal evolution of one Entity's `attribute`, its last `last` instances. Through a
+    /// named output, none unless its filter selects the Entity now and `attribute` is its
+    /// `location` or one of its Datastreams.
     async fn history(
         &self,
         urn: &str,
@@ -332,6 +448,12 @@ impl Cx<'_> {
         last: usize,
         extra: &str,
     ) -> Result<Option<Value>, Problem> {
+        if let Some(named) = &self.output {
+            let shown = attribute == "location" || named.streams(attribute);
+            if !shown || Box::pin(self.entity(Some(urn))).await?.is_none() {
+                return Ok(None);
+            }
+        }
         let path = format!(
             "/ngsi-ld/v1/temporal/entities/{}?attrs={}&lastN={last}{extra}",
             encode(urn),
@@ -526,9 +648,12 @@ impl Cx<'_> {
         // ponytail: the last MAX_TOP moves of each Entity; a window per Entity when a client
         // pages a long history through this set rather than through its Thing.
         let query = format!(
-            "/ngsi-ld/v1/temporal/entities?{}{extra}&attrs=location&timerel=after&timeAt={EPOCH}&lastN={}&limit={top}&offset={skip}",
-            self.selector(),
-            query::MAX_TOP,
+            "/ngsi-ld/v1/temporal/entities?{}",
+            self.narrowed(&format!(
+                "{}{extra}&attrs=location&timerel=after&timeAt={EPOCH}&lastN={}&limit={top}&offset={skip}",
+                self.selector(),
+                query::MAX_TOP,
+            ))?
         );
         let answer = self.get(OperationId::TemporalQuery, query).await?;
         let entities = answer

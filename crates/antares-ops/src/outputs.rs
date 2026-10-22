@@ -25,6 +25,14 @@ pub const GEO_ROLES: [&str; 5] = ["geometry", "instant", "start", "end", "proper
 /// The role a source of `csv` maps: its `columns` in order (all of them when not mapped).
 pub const CSV_ROLES: [&str; 1] = ["columns"];
 
+/// The role a source of `sta` maps: the attributes that become Datastreams (every numeric
+/// Property when not mapped, T-5225).
+pub const STA_ROLES: [&str; 1] = ["datastreams"];
+
+/// The formats whose output reads one model class, its geo-query the caller's: `ogc` (a
+/// collection) and `odata` (an `EntitySet` of one `EntityType`, T-5225), which maps no role.
+const ONE_CLASS: [&str; 2] = ["ogc", "odata"];
+
 /// The NGSI-LD query an output adds to every read through the view (TS 104 175 6.4.3.2).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -207,16 +215,18 @@ impl Output {
             .map(String::as_str)
     }
 
-    /// The output checked for `format` (`ogc`, `geojson` or `csv`).
+    /// The output checked for `format` (`ogc`, `geojson`, `csv`, `sta` or `odata`).
     ///
     /// # Errors
     /// The first member that does not hold, named.
     pub fn check(self, format: &str) -> Result<Self, String> {
-        let roles: &[&str] = if format == "csv" {
-            &CSV_ROLES
-        } else {
-            &GEO_ROLES
+        let roles: &[&str] = match format {
+            "csv" => &CSV_ROLES,
+            "sta" => &STA_ROLES,
+            "odata" => &[],
+            _ => &GEO_ROLES,
         };
+        let one = ONE_CLASS.contains(&format);
         let texts = self.title.iter().chain(&self.description);
         let checks = [
             (is_output_name(&self.name), "name is 1 to 40 of a-z, 0-9 and -, not preview".to_owned()),
@@ -232,12 +242,12 @@ impl Output {
                 "a filter member is empty, too long or holds control characters".to_owned(),
             ),
             (
-                format != "ogc" || !self.filter.has_geo(),
-                "an ogc output narrows by q and scopeQ; the geo-query is the caller's bbox".to_owned(),
+                !one || !self.filter.has_geo(),
+                format!("an {format} output narrows by q and scopeQ; the geo-query is the caller's"),
             ),
             (
-                (1..=if format == "ogc" { 1 } else { MAX_SOURCES }).contains(&self.sources.len()),
-                format!("sources lists 1 to {} types for {format}", if format == "ogc" { 1 } else { MAX_SOURCES }),
+                (1..=if one { 1 } else { MAX_SOURCES }).contains(&self.sources.len()),
+                format!("sources lists 1 to {} types for {format}", if one { 1 } else { MAX_SOURCES }),
             ),
         ];
         if let Some((_, why)) = checks.into_iter().find(|(ok, _)| !ok) {
@@ -436,7 +446,27 @@ mod tests {
             (
                 json!({"name": "a", "filter": {"georel": "near;maxDistance==1"}, "sources": [{"type": "E"}]}),
                 "ogc",
-                "bbox",
+                "geo-query is the caller's",
+            ),
+            (
+                json!({"name": "a", "filter": {"georel": "near;maxDistance==1"}, "sources": [{"type": "E"}]}),
+                "odata",
+                "geo-query is the caller's",
+            ),
+            (
+                json!({"name": "a", "sources": [{"type": "E"}, {"type": "F"}]}),
+                "odata",
+                "1 to 1",
+            ),
+            (
+                source(json!({"type": "E", "mapping": {"properties": "x"}})),
+                "odata",
+                "none of",
+            ),
+            (
+                source(json!({"type": "E", "mapping": {"geometry": "x"}})),
+                "sta",
+                "none of",
             ),
             (json!({"name": "a", "sources": []}), "geojson", "1 to 10"),
             (
@@ -481,6 +511,14 @@ mod tests {
             let hit = checked(&output, format).err().map(|e| e.contains(why));
             assert_eq!(hit, Some(true), "{output} {format} {why}");
         }
+        let sta = json!({"name": "air", "filter": {"georel": "near;maxDistance==1", "geometry": "Point",
+            "coordinates": "[17,48]"}, "sources": [{"type": "A", "mapping": {"datastreams": ["pm10"]}},
+            {"type": "B"}]});
+        let o = checked(&sta, "sta").expect("an sta output holds a geo-query and several sources");
+        assert_eq!(
+            o.sources.first().map(|s| s.role("datastreams")),
+            Some(vec!["pm10"])
+        );
         for nothing in [
             json!([{"title": {}}, {"name": 1}, "x"]),
             json!({"name": "a"}),
