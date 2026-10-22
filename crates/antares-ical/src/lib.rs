@@ -247,14 +247,7 @@ fn plan(view: &ViewOps) -> Result<Plan, Problem> {
         return Ok(Plan::default());
     };
     mapping::plan_of(written)
-        .map(|(plan, degraded)| {
-            if degraded {
-                tracing::warn!(
-                    "the view's calendar mapping is of a newer version: its preset is served"
-                );
-            }
-            plan
-        })
+        .map(|(plan, _)| plan)
         .map_err(|_| {
             Problem::new(
                 StatusCode::INTERNAL_SERVER_ERROR,

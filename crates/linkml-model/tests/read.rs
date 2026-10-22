@@ -802,7 +802,7 @@ fn non_semantic_metaslots_are_ignored_and_semantic_ones_refused() {
         }
         match load(&bad) {
             Err(Error::NotImplemented(why)) => {
-                assert!(why.contains("unknown field"), "{pointer}: {why}")
+                assert!(why.contains("unknown field"), "{pointer}: {why}");
             }
             other => panic!("{pointer}: {other:?}"),
         }
@@ -819,6 +819,15 @@ fn a_new_ngsi_ld_kind_loads_and_is_not_known() {
     );
     let m = load(&doc).unwrap();
     let kind = m.kind(&m.schema().slots["size"]);
+    // the YAML shorthand of an annotation, and a number, read as `{tag, value}` strings
+    let short = with(
+        "/slots/size/annotations",
+        json!({"ngsi_ld_kind": "GeoProperty", "rank_hint": 3}),
+    );
+    let read = load(&short).unwrap();
+    let size = &read.schema().slots["size"];
+    assert_eq!(read.kind(size), "GeoProperty");
+    assert_eq!(size.annotations["rank_hint"].value, "3");
     assert_eq!(kind, "TimeSeriesProperty");
     assert!(!linkml_model::known_kind(kind));
     let schema: Value = serde_json::from_str(&linkml_model::json_schema(&m)).unwrap();
@@ -830,4 +839,16 @@ fn a_new_ngsi_ld_kind_loads_and_is_not_known() {
         context["@context"]["size"].is_string(),
         "no coercion: {context}"
     );
+}
+
+/// T-5207: a kind value that is no kind name, and a document that is no object, stay malformed.
+#[test]
+fn a_kind_that_is_no_name_and_a_non_object_are_malformed() {
+    let spaced = with(
+        "/slots/size/annotations",
+        json!({"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "Time Series"}}),
+    );
+    for doc in [spaced, json!(["s"])] {
+        assert!(matches!(load(&doc), Err(Error::Malformed(_))), "{doc}");
+    }
 }

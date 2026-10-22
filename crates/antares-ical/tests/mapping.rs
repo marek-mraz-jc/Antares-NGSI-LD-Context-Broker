@@ -286,8 +286,7 @@ fn the_mapping_version_reads_strictly_and_a_newer_one_degrades_to_the_preset() {
     let (plan, degraded) = plan_of(&newer).expect("a newer mapping degrades");
     assert!(degraded);
     assert_eq!(plan.entity_type(), "Concert");
-    let mut concert = event(&[]);
-    concert["type"] = json!("Concert");
+    let concert = event(&[("type", json!("Concert"))]);
     assert!(lines(&plan.vevent(&concert, &Window::default(), now()))
         .iter()
         .any(|l| l == "SUMMARY:Koncert"));

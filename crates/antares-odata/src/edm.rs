@@ -306,11 +306,26 @@ pub fn build(
         sets.insert(name.clone(), set);
     }
     container.annotations = container_capabilities();
-    let mut own = Schema::new(namespace.clone());
+    let (mut own, schema_version) = own_schema(namespace.clone(), schema);
     own.entity_types = types;
     own.entity_container = Some(container);
-    // `$schemaversion` takes unreserved characters alone (OData URL ABNF).
-    let schema_version: String = format!(
+    Ok(Edm {
+        csdl: Model {
+            version,
+            references: references(),
+            schemas: vec![vocabulary(), own],
+        },
+        namespace,
+        sets,
+        schema_version,
+    })
+}
+
+/// The view's own CSDL schema, annotated with its `Core.SchemaVersion` (T-5207), and that
+/// version: the LinkML `version` (`0` without one), `.m` and [`MAPPING_VERSION`];
+/// `$schemaversion` takes unreserved characters alone (OData URL ABNF), so any other becomes `_`.
+fn own_schema(namespace: String, schema: &linkml_model::Model) -> (Schema, String) {
+    let version: String = format!(
         "{}.m{MAPPING_VERSION}",
         schema.schema().version.as_deref().unwrap_or("0")
     )
@@ -323,20 +338,12 @@ pub fn build(
         }
     })
     .collect();
+    let mut own = Schema::new(namespace);
     own.annotations.push(Annotation::new(
         "Core.SchemaVersion",
-        Expr::String(schema_version.clone()),
+        Expr::String(version.clone()),
     ));
-    Ok(Edm {
-        csdl: Model {
-            version,
-            references: references(),
-            schemas: vec![vocabulary(), own],
-        },
-        namespace,
-        sets,
-        schema_version,
-    })
+    (own, version)
 }
 
 /// Row R6: each single-valued navigation of `class` whose slot names a
@@ -1325,7 +1332,7 @@ mod tests {
     /// schema states its version with the mapping's.
     #[test]
     fn a_new_kind_degrades_its_slot_and_the_schema_version_is_stated() {
-        let json = br#"{"id": "https://e.org/s", "name": "s", "version": "2.1.0",
+        let json = br#"{"id": "https://e.org/s", "name": "s", "version": "2.1.0+b7",
           "classes": {"Car": {"slots": ["speed", "trace"]}},
           "slots": {"speed": {"range": "float"},
             "trace": {"range": "float", "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "TimeSeriesProperty"}}}}}"#;
@@ -1354,7 +1361,7 @@ mod tests {
                 collection: false
             }
         );
-        assert_eq!(edm.schema_version, format!("2.1.0.m{MAPPING_VERSION}"));
+        assert_eq!(edm.schema_version, format!("2.1.0_b7.m{MAPPING_VERSION}"));
         let own = &edm.csdl.schemas[1];
         assert!(own
             .annotations

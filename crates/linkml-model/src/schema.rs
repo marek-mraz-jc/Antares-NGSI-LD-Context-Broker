@@ -487,16 +487,17 @@ fn annotations(m: &mut Map<String, Value>) {
         .into_iter()
         .flat_map(|o| o.iter_mut())
     {
-        if !a.is_object() {
-            *a = serde_json::json!({"tag": tag, "value": a.take()});
+        let mut o = match a.take() {
+            Value::Object(o) => o,
+            scalar => Map::from_iter([
+                ("tag".to_owned(), Value::String(tag.clone())),
+                ("value".to_owned(), scalar),
+            ]),
+        };
+        o.remove("@type");
+        if let Some(v @ (Value::Bool(_) | Value::Number(_))) = o.get("value").cloned() {
+            o.insert("value".to_owned(), Value::String(v.to_string()));
         }
-        if let Some(o) = a.as_object_mut() {
-            o.remove("@type");
-            if let Some(v) = o.get_mut("value") {
-                if let Value::Bool(_) | Value::Number(_) = v {
-                    *v = Value::String(v.to_string());
-                }
-            }
-        }
+        *a = Value::Object(o);
     }
 }
