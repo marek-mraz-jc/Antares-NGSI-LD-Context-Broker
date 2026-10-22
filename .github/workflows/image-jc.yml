@@ -131,8 +131,10 @@ jobs:
       matrix:
         include:
           - cell: grant
+            policy: grant-all
             suites: ""
           - cell: restricted
+            policy: restricted
             suites: ContextInformation/Consumption
     env:
       OUT: cells/ETSI-cell-file
@@ -155,7 +157,7 @@ jobs:
           STOP_ON_ERROR: "0"
           CALLBACK_HOST: localhost
           API_SURFACES: admin,views,mcp,odata,ws,linkml
-          POLICY: ci/policy/etsi/${{ matrix.cell }}.json
+          POLICY: ci/policy/etsi/${{ matrix.policy }}.json
           SUITES: ${{ matrix.suites }}
         run: ./dev/etsi-pipeline.sh || true
       - name: Per-TP baseline, the listed deviations alone (grant)
