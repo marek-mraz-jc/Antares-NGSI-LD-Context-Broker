@@ -2775,6 +2775,11 @@ mod tests {
         ] {
             assert_eq!(q(&e).as_deref(), Ok(want), "{e:?}");
         }
+        // a type this surface does not check takes any literal
+        assert_eq!(
+            q(&cmp(m("span"), CompareOp::Eq, lit(Literal::Int(1)))).as_deref(),
+            Ok("(t0==1)")
+        );
         let below = Expr::Not(Box::new(reading(CompareOp::Ge, Literal::Int(5))));
         assert_eq!(evaluated(&below, Some(json!(3))), Some(True));
         assert_eq!(evaluated(&below, Some(json!(9))), Some(False));

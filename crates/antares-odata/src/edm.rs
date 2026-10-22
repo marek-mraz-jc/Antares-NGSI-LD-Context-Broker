@@ -290,18 +290,7 @@ pub fn build(
                     required.extend(named.then(|| Expr::PropertyPath(member.clone())));
                 }
             }
-            let untyped = schema.kind(&slot) == "Property" && shape == Shape::Json;
-            members.insert(
-                member,
-                Member {
-                    iri: slot_iri,
-                    shape,
-                    list: schema.kind(&slot).starts_with("List"),
-                    json: schema.kind(&slot) == "JsonProperty",
-                    untyped,
-                    written: written(&slot),
-                },
-            );
+            members.insert(member, member_of(schema, &slot, slot_iri, shape));
         }
         set.annotations = capabilities(&members, writable, required);
         container.entity_sets.push(set);
@@ -670,6 +659,24 @@ fn narrowed(writable: Writable, class: Option<&linkml_model::Class>) -> Writable
 /// `Core.Description` of a slot or a class (T-3722).
 fn description(text: &str) -> Annotation {
     Annotation::new("Core.Description", Expr::String(text.to_owned()))
+}
+
+/// The [`Member`] a slot of `shape` maps to.
+fn member_of(
+    schema: &linkml_model::Model,
+    slot: &linkml_model::Slot,
+    iri: String,
+    shape: Shape,
+) -> Member {
+    let kind = schema.kind(slot);
+    Member {
+        iri,
+        list: kind.starts_with("List"),
+        json: kind == "JsonProperty",
+        untyped: kind == "Property" && shape == Shape::Json,
+        shape,
+        written: written(slot),
+    }
 }
 
 /// When a client may write the slot's member (T-3722); the model admits
