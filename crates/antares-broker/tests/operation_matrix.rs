@@ -905,7 +905,13 @@ async fn the_mcp_column_is_served_as_the_matrix_states() {
             listed.iter().any(|t| t == "query_entities"),
             "{view}: summarize is listed exactly where query_entities is: {listed:?}"
         );
-        listed.retain(|t| t != "describe_type" && t != "summarize");
+        // `area_overview` is the same row answered per type for one area (T-5279)
+        assert_eq!(
+            listed.iter().any(|t| t == "area_overview"),
+            listed.iter().any(|t| t == "query_entities"),
+            "{view}: area_overview is listed exactly where query_entities is: {listed:?}"
+        );
+        listed.retain(|t| t != "describe_type" && t != "summarize" && t != "area_overview");
         listed.sort();
         let mut want: Vec<String> = rows
             .iter()

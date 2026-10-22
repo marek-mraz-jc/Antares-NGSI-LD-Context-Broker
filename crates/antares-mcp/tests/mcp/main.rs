@@ -8,6 +8,7 @@
 
 mod common;
 mod engines;
+mod mcp_area;
 mod mcp_cache;
 mod mcp_discovery;
 mod mcp_errors;

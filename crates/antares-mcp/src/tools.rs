@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! The tools (MCP 3.5, 33 rows): each is one row of the operation matrix,
+//! The tools (MCP 3.5, 34 rows): each is one row of the operation matrix,
 //! and a call is one NGSI-LD request of that operation, built from checked
 //! arguments only. A write tool runs only after the person confirmed the
 //! call (MCP 3.4, `crate::confirm`).
@@ -179,6 +179,19 @@ const SUMMARIZE: &[Arg] = &[
     opt("geoproperty", Kind::Attr),
     opt("lang", Kind::Text(64)),
 ];
+/// `area_overview` (T-5279): one area, the types to read (every type the view
+/// shows when absent) and how many Entities of each; it reads by itself.
+const AREA: &[Arg] = &[
+    req(
+        "geometry",
+        Kind::Word(&["Point", "LineString", "Polygon", "MultiPolygon"]),
+    ),
+    req("coordinates", Kind::Coordinates),
+    opt("maxDistance", Kind::Int(1, crate::area::MAX_RADIUS_M)),
+    opt("type", Kind::Types),
+    opt("limit", Kind::Int(1, crate::area::MAX_K)),
+    opt("lang", Kind::Text(64)),
+];
 const NONE: &[Arg] = &[];
 const ATTR_VALUE: &[Arg] = &[req("id", Kind::Id), req("attrId", Kind::Attr)];
 const TYPE_ONLY: &[Arg] = &[req("type", Kind::Type)];
@@ -288,7 +301,7 @@ const fn write(
 }
 
 /// Every tool, sorted by name (2026-07-28: a deterministic order).
-pub(crate) const TOOLS: [ToolDef; 33] = [
+pub(crate) const TOOLS: [ToolDef; 34] = [
     write(
         "append_attributes",
         OperationId::AppendAttributes,
@@ -296,6 +309,15 @@ pub(crate) const TOOLS: [ToolDef; 33] = [
         APPEND,
         "result",
     ),
+    ToolDef {
+        name: "area_overview",
+        op: OperationId::QueryEntities,
+        description: "Everything in one area, every Entity type at once: per type its count and the limit nearest (id, name, distance in metres, key Attributes). A Point or a LineString with maxDistance in metres, or a Polygon; at most 5000 m, 1000 positions, 100 km². Use it for \"what is here\".",
+        args: AREA,
+        key: "overview",
+        paged: false,
+        write: false,
+    },
     write(
         "batch_create",
         OperationId::BatchCreate,
@@ -581,7 +603,7 @@ pub(crate) fn encode(s: &str) -> String {
         .collect()
 }
 
-fn text(c: &Checked) -> String {
+pub(crate) fn text(c: &Checked) -> String {
     match c {
         Checked::One(s) => s.clone(),
         Checked::Many(v) => v.join(","),
@@ -851,12 +873,12 @@ mod tests {
         // answers a profile of it; every other tool is its operation's own row.
         let mut ops: Vec<&str> = TOOLS
             .iter()
-            .filter(|t| t.name != "summarize")
+            .filter(|t| t.name != "summarize" && t.name != "area_overview")
             .map(|t| t.op.id())
             .collect();
         ops.sort_unstable();
         ops.dedup();
-        assert_eq!(ops.len(), TOOLS.len().saturating_sub(1));
+        assert_eq!(ops.len(), TOOLS.len().saturating_sub(2));
     }
 
     #[test]
