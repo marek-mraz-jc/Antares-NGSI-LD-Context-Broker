@@ -890,19 +890,40 @@ async fn query_entities_inner(
     let (p_offset, p_limit, _) = page_params(st, params)?;
     let push_page = page_pushdown_allowed(fed.is_empty(), params);
     let push_proj = join.is_none() && accept != Accept::GeoJson;
-    let filtered = filter_entities_paged(
-        st,
-        &tenant,
-        params,
-        &ctx,
-        fed,
-        Pushdown {
-            page: push_page.then_some((p_offset, p_limit)),
-            proj: push_proj.then_some(&repr),
-        },
-        Some(&repr),
-    )
-    .await?;
+    // an ordered read sorts on what its keys read and reads its page whole
+    // afterwards (T-4919)
+    let order_keys = params
+        .get("orderBy")
+        .map(|spec| crate::paging::order_heads(spec, &ctx));
+    let pushdown = Pushdown {
+        page: push_page.then_some((p_offset, p_limit)),
+        proj: push_proj.then_some(&repr),
+        order_keys: order_keys.as_deref(),
+    };
+    let mut filtered =
+        filter_entities_paged(st, &tenant, params, &ctx, fed, pushdown, Some(&repr)).await?;
+    // the page is read back by `id`, a comma-separated list
+    let listable = |d: &Value| {
+        d.get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.contains(','))
+    };
+    if filtered.trimmed && !filtered.docs.iter().all(listable) {
+        filtered = filter_entities_paged(
+            st,
+            &tenant,
+            params,
+            &ctx,
+            Vec::new(),
+            Pushdown {
+                order_keys: None,
+                ..pushdown
+            },
+            Some(&repr),
+        )
+        .await?;
+    }
+    let trimmed = filtered.trimmed;
     let mut matches = filtered.docs;
     if let Some(spec) = params.get("orderBy") {
         crate::repr::order_as_shown(&mut matches, Some(&repr), |m| {
@@ -924,6 +945,10 @@ async fn query_entities_inner(
         paginate_pre(st, params, matches, "/ngsi-ld/v1/entities", total)?
     } else {
         paginate(st, params, matches, "/ngsi-ld/v1/entities")?
+    };
+    let page = match trimmed {
+        true => whole_page(st, &tenant, params, &ctx, &repr, page).await?,
+        false => page,
     };
     let links = match keyset {
         true => crate::paging::with_next_cursor(
@@ -1074,6 +1099,10 @@ pub struct Filtered {
     /// which is what a chunked walk has to step over, since `docs` undercounts
     /// it whenever idPattern (invisible to the store filter) removed rows.
     pub rows: usize,
+    /// The store decided the match set and kept only the core members and
+    /// [`Pushdown::order_keys`] of each document: enough to order and page
+    /// it, and the page is then read whole by id (T-4919).
+    pub trimmed: bool,
 }
 
 /// Whether the store may be asked to project members away. Only when its
@@ -1187,6 +1216,41 @@ fn judged_types<'a>(
             })
             .collect(),
     ))
+}
+
+/// The documents of a page ordered over trimmed ones ([`Filtered::trimmed`]),
+/// read whole by id under the same filter, in the page's order. An Entity
+/// deleted between the two reads drops out of the page.
+async fn whole_page(
+    st: &AppState,
+    tenant: &TenantId,
+    params: &HashMap<String, String>,
+    ctx: &antares_jsonld::Context,
+    repr: &crate::repr::Repr,
+    page: Vec<Value>,
+) -> ApiResult<Vec<Value>> {
+    let ids: Vec<&str> = page.iter().filter_map(|d| d.get("id")?.as_str()).collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut by_id = params.clone();
+    by_id.insert("id".to_owned(), ids.join(","));
+    let whole = filter_entities_paged(
+        st,
+        tenant,
+        &by_id,
+        ctx,
+        Vec::new(),
+        Pushdown::default(),
+        Some(repr),
+    )
+    .await?;
+    let mut found: HashMap<String, Value> = whole
+        .docs
+        .into_iter()
+        .filter_map(|d| Some((d.get("id")?.as_str()?.to_owned(), d)))
+        .collect();
+    Ok(ids.iter().filter_map(|id| found.remove(*id)).collect())
 }
 
 /// Whether the store may be asked to cut the page (ORDER BY id +
@@ -1305,6 +1369,10 @@ impl ReadMembers {
 pub struct Pushdown<'a> {
     pub page: Option<(usize, usize)>,
     pub proj: Option<&'a crate::repr::Repr>,
+    /// The expanded Attributes an `orderBy` reads: an ordered read sorts
+    /// the whole match set, and these alone are what the sort needs
+    /// ([`Filtered::trimmed`]).
+    pub order_keys: Option<&'a [String]>,
 }
 
 /// The full filtering path (5.7.2). `push.page` = (offset, limit) to push into the
@@ -1323,7 +1391,11 @@ pub async fn filter_entities_paged(
     push: Pushdown<'_>,
     narrow: Option<&crate::repr::Repr>,
 ) -> ApiResult<Filtered> {
-    let Pushdown { page, proj } = push;
+    let Pushdown {
+        page,
+        proj,
+        order_keys,
+    } = push;
     // a keyset cursor (T-4907): the store seeks past its id, so the rows
     // already start at the client's offset and every page below is counted
     // from there
@@ -1474,6 +1546,11 @@ pub async fn filter_entities_paged(
         q_ast
     };
     let page = if judged.is_some() { client_page } else { page };
+    // An ordered read sorts every match, so the store keeps only what the
+    // sort reads (T-4919): only where nothing below reads more of the stored
+    // Entity, that is no rules or rules that select by type alone (a client
+    // `q` they leave to the store is decided there), and no federated rows.
+    let order_keys = order_keys.filter(|_| fed.is_empty() && (rules.is_none() || judged.is_some()));
     // Otherwise, without `count` the answer needs the matches up to the
     // page's end and one more (whether a next page exists): the store is
     // read in pages of its own, doubling, until that many held.
@@ -1522,15 +1599,18 @@ pub async fn filter_entities_paged(
     let enough = enough.filter(|_| !geo_uncompiled);
     let counting = counting.filter(|_| !geo_uncompiled);
     let proj = proj.filter(|_| !geo_uncompiled);
+    let order_keys = order_keys.filter(|_| !geo_uncompiled);
     // pick (or attrs) heads to keep / whole-attr omit heads to drop; core
     // members are never SQL-dropped (only `://` IRIs qualify) — repr::apply
     // stays the decider for those.
-    let keep_attrs: Option<Vec<String>> = proj.and_then(|r| {
-        r.pick
-            .as_ref()
-            .map(|nodes| nodes.iter().map(|n| n.iri.clone()).collect())
-            .or_else(|| r.attrs.clone())
-    });
+    let keep_attrs: Option<Vec<String>> = proj
+        .and_then(|r| {
+            r.pick
+                .as_ref()
+                .map(|nodes| nodes.iter().map(|n| n.iri.clone()).collect())
+                .or_else(|| r.attrs.clone())
+        })
+        .or_else(|| order_keys.map(<[String]>::to_vec));
     let drop_attrs: Option<Vec<String>> = proj
         .and_then(|r| {
             r.omit.as_ref().map(|nodes| {
@@ -1556,6 +1636,7 @@ pub async fn filter_entities_paged(
         ids.as_ref().map(|v| v.iter().copied().collect());
     let mut out = Vec::new();
     let (mut paged, mut total): (bool, Option<usize>);
+    let mut trimmed: bool;
     let mut rows = 0usize;
     let mut fed_once = Some(fed);
     // the store page under `enough` or `counting`: (offset, limit), the limit
@@ -1620,6 +1701,7 @@ pub async fn filter_entities_paged(
         let fed = fed_once.take().unwrap_or_default();
         let store_paged = outcome.paged;
         let decided = outcome.decided && fed.is_empty() && !geo_uncompiled;
+        trimmed = order_keys.is_some() && decided;
         paged = store_paged && fed.is_empty() && enough.is_none();
         total = outcome.total.map(|t| t as usize);
         let got = outcome.rows.len();
@@ -1699,7 +1781,9 @@ pub async fn filter_entities_paged(
                     if !shown_geos.iter().all(|g| g.matches(&view, ctx)) {
                         continue;
                     }
-                    if let Some(ast) = shown_q {
+                    // a `q` the store took because it reads the shown Entity
+                    // alike is decided there
+                    if let Some(ast) = shown_q.filter(|_| !(q_alike && decided)) {
                         let narrow = narrow.map(|r| (r, ctx));
                         if !crate::notify::linked_eval(st, tenant, narrow, |l| {
                             eval_q(ast, &view, ctx, l)
@@ -1763,6 +1847,7 @@ pub async fn filter_entities_paged(
             docs: out,
             paged: true,
             rows,
+            trimmed,
         });
     }
     if counting.is_some() {
@@ -1772,6 +1857,7 @@ pub async fn filter_entities_paged(
             paged: true,
             total: Some(matched),
             rows,
+            trimmed,
         });
     }
     Ok(Filtered {
@@ -1779,6 +1865,7 @@ pub async fn filter_entities_paged(
         paged,
         total,
         rows,
+        trimmed,
     })
 }
 
@@ -1999,6 +2086,7 @@ async fn purge_locally(
             Pushdown {
                 page: Some((offset, PURGE_CHUNK)),
                 proj: None,
+                order_keys: None,
             },
             // 5.6.21.4 refuses linked q terms before a purge runs
             None,
@@ -3108,6 +3196,7 @@ pub(crate) async fn build_query_map(
             Pushdown {
                 page: Some((offset, st.max_limit)),
                 proj: None,
+                order_keys: None,
             },
             Some(&narrow),
         )

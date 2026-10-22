@@ -63,6 +63,7 @@ mod notify_join_flat_4_5_23;
 mod notify_linked_q_4_9;
 mod notify_projection_4_21;
 mod notify_seed_failure;
+mod ordered_read_4_23;
 mod pagination_links_6_3_10;
 mod panic_isolation;
 mod pg_query_parity;

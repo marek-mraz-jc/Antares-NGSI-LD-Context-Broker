@@ -393,6 +393,20 @@ fn build_collator(tag: &str) -> Result<icu_collator::CollatorBorrowed<'static>, 
         .map_err(|_| bad(format!("unsupported collation {tag:?} (4.23.3)")))
 }
 
+/// The expanded Attribute each key of an `orderBy` spec reads, as
+/// [`order_entities`] parses it; `id`, `type`, `createdAt` and `modifiedAt`
+/// are core members, no Attribute.
+pub(crate) fn order_heads(spec: &str, ctx: &antares_jsonld::Context) -> Vec<String> {
+    spec.split(',')
+        .filter_map(|part| {
+            let member = part.trim().split(';').next()?.trim();
+            let head = member.split('[').next()?.split('.').next()?;
+            (!matches!(head, "" | "id" | "type" | "createdAt" | "modifiedAt"))
+                .then(|| ctx.expand_key(head))
+        })
+        .collect()
+}
+
 pub fn order_entities(
     docs: &mut [Value],
     spec: &str,
@@ -597,49 +611,58 @@ pub fn order_entities(
             }
         }
     }
-    docs.sort_by(|a, b| {
+    // Each document's ordering values are read once, not twice per comparison:
+    // a comparison sort of n documents compares about n log n pairs, and each
+    // read expands a term and clones a value (T-4919).
+    let distance = |v: &Option<Value>| {
+        refg.as_ref()
+            .zip(v.as_ref())
+            .and_then(|(g, v)| antares_ql::geo::order_distance_m(g, v))
+    };
+    // per key: the value it reads and, under a distance key, the distance
+    type Read = Vec<(Option<Value>, Option<f64>)>;
+    let mut decorated: Vec<(Read, Value)> = docs
+        .iter_mut()
+        .map(|doc| {
+            let read = keys
+                .iter()
+                .map(|k| {
+                    let v = order_value(doc, k, ctx);
+                    let d = match k.dir {
+                        Dir::DistAsc | Dir::DistDesc => distance(&v),
+                        Dir::Asc | Dir::Desc => None,
+                    };
+                    (v, d)
+                })
+                .collect();
+            (read, std::mem::take(doc))
+        })
+        .collect();
+    decorated.sort_by(|(a, _), (b, _)| {
         use std::cmp::Ordering;
-        for k in &keys {
+        for (k, ((va, da), (vb, db))) in keys.iter().zip(a.iter().zip(b)) {
             let o = match k.dir {
                 Dir::Asc | Dir::Desc => {
-                    let va = order_value(a, k, ctx);
-                    let vb = order_value(b, k, ctx);
-                    let mut o = cmp_vals(&va, &vb, collator.as_ref());
+                    let mut o = cmp_vals(va, vb, collator.as_ref());
                     if k.dir == Dir::Desc {
                         o = o.reverse();
                     }
                     o
                 }
-                Dir::DistAsc | Dir::DistDesc => {
-                    // Set whenever a Dist ordering was accepted. Without it
-                    // there is no distance to compare, and every pair being
-                    // equal leaves the previous order untouched.
-                    let Some(refg) = refg.as_ref() else {
-                        return std::cmp::Ordering::Equal;
-                    };
-                    let da = order_value(a, k, ctx)
-                        .and_then(|v| antares_ql::geo::order_distance_m(refg, &v));
-                    let db = order_value(b, k, ctx)
-                        .and_then(|v| antares_ql::geo::order_distance_m(refg, &v));
-                    match (da, db) {
-                        (Some(x), Some(y)) => {
-                            let mut o = x.total_cmp(&y);
-                            if k.dir == Dir::DistDesc {
-                                o = o.reverse();
-                            }
-                            o
+                Dir::DistAsc | Dir::DistDesc => match (da, db) {
+                    (Some(x), Some(y)) => {
+                        let mut o = x.total_cmp(y);
+                        if k.dir == Dir::DistDesc {
+                            o = o.reverse();
                         }
-                        // 4.23.2 distance order: GeoProperties (by distance)
-                        // rank before non-GeoProperties (by value)
-                        (Some(_), None) => Ordering::Less,
-                        (None, Some(_)) => Ordering::Greater,
-                        (None, None) => {
-                            let va = order_value(a, k, ctx);
-                            let vb = order_value(b, k, ctx);
-                            cmp_vals(&va, &vb, collator.as_ref())
-                        }
+                        o
                     }
-                }
+                    // 4.23.2 distance order: GeoProperties (by distance)
+                    // rank before non-GeoProperties (by value)
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => cmp_vals(va, vb, collator.as_ref()),
+                },
             };
             if o != Ordering::Equal {
                 return o;
@@ -647,6 +670,9 @@ pub fn order_entities(
         }
         Ordering::Equal
     });
+    for (slot, (_, doc)) in docs.iter_mut().zip(decorated) {
+        *slot = doc;
+    }
     Ok(())
 }
 
@@ -1271,6 +1297,24 @@ mod tests {
                 "urn:absent"
             ]
         );
+    }
+
+    /// T-4919: each document's ordering value is read once, before the sort;
+    /// the order is the comparison's, and Entities that tie keep the order
+    /// the store gave them.
+    #[test]
+    fn a_tie_keeps_the_store_order_and_desc_reverses_the_values() {
+        let ctx = Loader::new().core();
+        let mut docs: Vec<Value> = (0..200)
+            .map(|n| ent(&format!("urn:{n:03}"), "level", json!(n % 7)))
+            .collect();
+        let mut want: Vec<String> = ids(&docs).into_iter().map(str::to_owned).collect();
+        want.sort_by_key(|id| {
+            let n: i64 = id.trim_start_matches("urn:").parse().unwrap_or(0);
+            std::cmp::Reverse(n % 7)
+        });
+        order_entities(&mut docs, "level;desc", &params(&[]), &ctx).expect("order");
+        assert_eq!(ids(&docs), want);
     }
 
     /// 4.23.3 EXAMPLES 8/9: dist-asc / dist-desc rank by haversine distance

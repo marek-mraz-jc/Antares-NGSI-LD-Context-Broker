@@ -91,6 +91,10 @@ pub(crate) struct Translated {
     /// The keys of a pushed `orderBy`, for a read that finds an Entity
     /// lacking one and sorts on the surface instead (T-3853).
     pub(crate) pushed_keys: Vec<SortKey>,
+    /// The terms of the pushed value keys the `$filter` holds on every
+    /// Entity it admits ([`holds_member`]): no Entity of the answer lacks
+    /// one, so no read counts those that do (T-4919).
+    pub(crate) held_keys: Vec<String>,
     /// The `ngsild.*` parameters pushed beside the rest (`&scopeQ=…`,
     /// `&georel=…`), encoded (ADR-0028 rule 6).
     pub(crate) ngsild: String,
@@ -303,6 +307,23 @@ fn matched(search: &Search, members: &[&str]) -> Expr {
             let (l, r) = both(left, right);
             Expr::Or(l, r)
         }
+    }
+}
+
+/// Whether `filter` holds only on an Entity that has the member `name`: a
+/// conjunct, or each side of a disjunction, compares it with `eq`, `gt`,
+/// `ge`, `lt` or `le` to a literal other than `null`, and none of those
+/// holds on a null (URL 5.1.1.1; `ne` does).
+pub(crate) fn holds_member(filter: &Expr, name: &str) -> bool {
+    let named = |e: &Expr| matches!(e, Expr::Member(MemberPath { variable: None, path }) if path.as_slice() == [name]);
+    let literal = |e: &Expr| matches!(e, Expr::Literal(l) if *l != Literal::Null);
+    match filter {
+        Expr::And(l, r) => holds_member(l, name) || holds_member(r, name),
+        Expr::Or(l, r) => holds_member(l, name) && holds_member(r, name),
+        Expr::Compare(l, op, r) => {
+            !matches!(op, CompareOp::Ne) && (named(l) && literal(r) || literal(l) && named(r))
+        }
+        _ => false,
     }
 }
 
@@ -1533,6 +1554,41 @@ mod tests {
             &[("a".into(), Literal::Int(3))],
         )
         .map(|t| t.q.unwrap_or_default())
+    }
+
+    /// T-4919: a key the filter holds needs no count of the Entities lacking
+    /// it; `ne`, `eq null`, `not`, an alias and a one-sided `or` do not hold it.
+    #[test]
+    fn a_comparison_with_a_literal_holds_its_member() {
+        let and = |l: Expr, r: Expr| Expr::And(Box::new(l), Box::new(r));
+        let or = |l: Expr, r: Expr| Expr::Or(Box::new(l), Box::new(r));
+        let ge = |n: &str| cmp(m(n), CompareOp::Ge, lit(Literal::Int(30)));
+        let range = and(
+            ge("level"),
+            cmp(m("level"), CompareOp::Lt, lit(Literal::Int(40))),
+        );
+        assert!(holds_member(&range, "level"));
+        assert!(!holds_member(&range, "speed"));
+        assert!(holds_member(&and(ge("speed"), ge("level")), "level"));
+        assert!(holds_member(
+            &cmp(lit(Literal::Int(1)), CompareOp::Le, m("level")),
+            "level"
+        ));
+        assert!(holds_member(&or(ge("level"), ge("level")), "level"));
+        assert!(!holds_member(&or(ge("level"), ge("speed")), "level"));
+        assert!(!holds_member(
+            &cmp(m("level"), CompareOp::Ne, lit(Literal::Int(3))),
+            "level"
+        ));
+        assert!(!holds_member(
+            &cmp(m("level"), CompareOp::Eq, lit(Literal::Null)),
+            "level"
+        ));
+        assert!(!holds_member(
+            &cmp(m("level"), CompareOp::Gt, Expr::Alias("a".into())),
+            "level"
+        ));
+        assert!(!holds_member(&Expr::Not(Box::new(ge("level"))), "level"));
     }
 
     #[test]
