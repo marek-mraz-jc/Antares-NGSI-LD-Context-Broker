@@ -7,7 +7,8 @@
 //
 // Env: BASE_URL, RATE (1000), DURATION (10m), VUS (RATE / 2), MAX_VUS (RATE * 2), ENTITIES
 //      (581000), EVENTS (5000), HISTORY_ENTITIES (500), VIEW (load), SUBJECT and ROLES (the
-//      subject headers the gateway would send to a policy build; unset sends none),
+//      subject headers the gateway would send to a policy build; unset sends none), ENDPOINT
+//      (a slug: every request goes to BASE_URL/api/endpoint/<slug>/…, the Context Gateway),
 //      P95_MS (300).
 // Fails (exit 99) when p95 >= P95_MS, errors >= 0.1 % or more than 0.1 % of the arrivals were
 // dropped for want of a free VU.
@@ -26,6 +27,7 @@ const O = {
   events: Number(__ENV.EVENTS || 5000),
   historyEntities: Number(__ENV.HISTORY_ENTITIES || 500),
   view: __ENV.VIEW || "load",
+  endpoint: __ENV.ENDPOINT,
 };
 const HEADERS = { "Content-Type": "application/json", Accept: "application/json" };
 if (__ENV.SUBJECT) HEADERS["x-jc-subject"] = __ENV.SUBJECT;
