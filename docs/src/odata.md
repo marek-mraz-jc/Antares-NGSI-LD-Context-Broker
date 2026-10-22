@@ -74,7 +74,9 @@ platform mints `urn:ngsi-ld:{Class}:{space}:…`, so on its Endpoints use
 Under OData 4.0 (no `OData-MaxVersion: 4.01`, as Power BI and Excel send) a
 type with an `Edm.Untyped` member is `OpenType="true"` and declares no such
 property: the member is read, selected and filtered as a dynamic property
-(CSDL XML 3.4, URL 5.1.3).
+(CSDL XML 3.4, URL 5.1.3). The open type names only those members: URLs
+resolve against the 4.01 model, so a name the model does not hold stays `400`
+in a query option and `404` in a path.
 
 A view without a schema, or with one the build cannot read, has no OData
 endpoint (`404`). Nothing the view hides appears in a document, a name or
