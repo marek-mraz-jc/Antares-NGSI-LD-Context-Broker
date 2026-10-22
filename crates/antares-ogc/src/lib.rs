@@ -97,7 +97,6 @@ pub const CONFORMANCE: &[&str] = &[
     "http://www.opengis.net/spec/cql2/1.0/conf/temporal-functions",
     "http://www.opengis.net/spec/cql2/1.0/conf/array-functions",
     "http://www.opengis.net/spec/cql2/1.0/conf/property-property",
-    "http://www.opengis.net/spec/cql2/1.0/conf/functions",
     "http://www.opengis.net/spec/cql2/1.0/conf/arithmetic",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/core",
     "http://www.opengis.net/spec/ogcapi-tiles-1/1.0/conf/tileset",
@@ -359,9 +358,14 @@ struct Asked {
 /// for an `Accept` this surface writes nothing for.
 fn negotiate(rest: &[&str], headers: &HeaderMap, uri: &axum::http::Uri) -> Result<Asked, Problem> {
     // Form decoding is lossy (an undecodable escape stays as written), so this never fails.
-    let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
+    let mut pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
         .map(|Query(pairs)| pairs)
         .unwrap_or_default();
+    // `f=json` / `f=geojson` ask for the JSON this surface writes anyway, whatever `Accept`
+    // says, as pygeoapi and OGC API Common links send them.
+    let before = pairs.len();
+    pairs.retain(|(n, v)| !(n == "f" && matches!(v.as_str(), "json" | "geojson")));
+    let json = pairs.len() < before;
     let one_type = |(n, v): &(String, String)| n == "f" && export::ONE_TYPE.contains(&v.as_str());
     if matches!(rest, ["collections"]) && pairs.iter().any(one_type) {
         return Err(Problem(
@@ -375,7 +379,7 @@ fn negotiate(rest: &[&str], headers: &HeaderMap, uri: &axum::http::Uri) -> Resul
         ["collections"] => export::asked(headers, pairs, export::BUNDLES),
         _ => Asked { pairs, file: None },
     };
-    if asked.file.is_none() && !acceptable(headers) {
+    if asked.file.is_none() && !json && !acceptable(headers) {
         return Err(Problem(
             StatusCode::NOT_ACCEPTABLE,
             "this surface writes JSON, GeoJSON, JSON Schema, OpenAPI JSON and the files of /api",
