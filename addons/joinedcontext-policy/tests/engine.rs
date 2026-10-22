@@ -769,6 +769,81 @@ async fn a_write_by_id_under_a_condition_is_judged_on_the_stored_entity() -> Res
     Ok(())
 }
 
+/// T-5092: the Helsinki steward's journey grant. The steward reads every
+/// Alert and may create and delete only an Alert whose `category` is
+/// `journey` and which carries no `source`: a create is judged on its body,
+/// a delete on the stored Entity, so a pipeline's Alert (category `traffic`,
+/// with a `source`) is neither creatable nor deletable through it.
+#[tokio::test]
+async fn a_conditional_create_and_delete_grant_binds_beside_an_unconditional_read() -> Res {
+    let steward = |id: &str, ops: &[&str]| {
+        grant(
+            id,
+            "user",
+            "ana@example.org",
+            ops,
+            json!([{"entities": [{"type": "Alert"}]}]),
+        )
+    };
+    let journey = with(
+        steward("steward-row-journey", &["5.6.1", "5.6.6"]),
+        "q",
+        json!("category==\"journey\";!source"),
+    );
+    let (st, _) = broker(doc(&[steward("read", &["5.7.1", "5.7.2"]), journey])).await?;
+    let alert = |n: u32, category: &str, source: bool| {
+        let a = json!({"id": format!("urn:ngsi-ld:Alert:{n}"), "type": "Alert",
+                       "category": prop(json!(category))});
+        if source {
+            with(a, "source", prop(json!("https://example.org/feed")))
+        } else {
+            a
+        }
+    };
+    seed(&st, &[alert(1, "traffic", true)]).await?;
+    for refused in [alert(2, "traffic", false), alert(3, "journey", true)] {
+        let (code, body) = send(&st, "POST", "/ngsi-ld/v1/entities", &ANA, Some(&refused)).await?;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{refused}: {body}");
+    }
+    let (code, body) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        &ANA,
+        Some(&alert(4, "journey", false)),
+    )
+    .await?;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let (code, _) = send(
+        &st,
+        "DELETE",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Alert:1",
+        &ANA,
+        None,
+    )
+    .await?;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    let (code, _) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Alert:1",
+        &ANA,
+        None,
+    )
+    .await?;
+    assert_eq!(code, StatusCode::OK);
+    let (code, _) = send(
+        &st,
+        "DELETE",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Alert:4",
+        &ANA,
+        None,
+    )
+    .await?;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    Ok(())
+}
+
 /// M22: a call carrying no subject reaches the Context Source operations
 /// and nothing else.
 #[tokio::test]
