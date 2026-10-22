@@ -80,7 +80,7 @@ pub(crate) async fn serve(
             count(reads, caller, set, options, version).await
         }
         [Segment::EntitySet(set), Segment::Key(key)] => {
-            entity(reads, caller, &ctx, set, key, options).await
+            entity(reads, caller, &ctx, set, key, options, headers).await
         }
         [Segment::EntitySet(set), Segment::Key(key), Segment::Ref] if only_select(options) => {
             paths::reference(reads, caller, &ctx, (set, key), options).await

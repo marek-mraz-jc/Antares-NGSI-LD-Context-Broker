@@ -98,6 +98,9 @@ pub(crate) struct Translated {
     /// The `ngsild.*` parameters pushed beside the rest (`&scopeQ=…`,
     /// `&georel=…`), encoded (ADR-0028 rule 6).
     pub(crate) ngsild: String,
+    /// `Prefer: odata.include-annotations` names the surface's vocabulary: each member
+    /// carries its `observedAt`, `unitCode` and `datasetId` as instance annotations (T-5206).
+    pub(crate) annotate: bool,
     /// The `$compute` items as residual values, name and value, in the
     /// request's order (Q16).
     pub(crate) computed: Vec<(String, RExpr)>,
@@ -159,12 +162,14 @@ impl SortBy {
 
 /// Translates `filter` against the members of `set` and, through a
 /// navigation, of the `sets` it targets, with the parameter aliases of the
-/// request bound.
+/// request bound. A LanguageProperty is compared in `lang` (`ngsild.lang`, else its `@none`
+/// entry), the text the read serves (T-5206).
 pub(crate) fn translate(
     filter: &Expr,
     set: &Set,
     sets: &BTreeMap<String, Set>,
     aliases: &[(String, Literal)],
+    lang: Option<&str>,
 ) -> Result<Translated, Refused> {
     let mut out = Translated::default();
     let mut terms = Terms {
@@ -175,6 +180,7 @@ pub(crate) fn translate(
         linked: false,
         expand_values: Vec::new(),
         lambdas: Vec::new(),
+        lang: lang.unwrap_or("@none"),
     };
     let mut conjuncts = Vec::new();
     for conjunct in conjuncts_of(filter) {
@@ -341,6 +347,7 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
         linked: false,
         expand_values: Vec::new(),
         lambdas: Vec::new(),
+        lang: "@none",
     };
     let mut keys = Vec::new();
     for item in items {
@@ -426,6 +433,7 @@ pub(crate) fn compute(
         linked: false,
         expand_values: Vec::new(),
         lambdas: Vec::new(),
+        lang: "@none",
     };
     for item in items {
         let (value, edm) = terms.residual_value(&item.expr)?;
@@ -552,6 +560,8 @@ struct Terms<'a> {
     /// The `any`/`all` variables the residual is inside, innermost last,
     /// each with the Edm type of its list's items.
     lambdas: Vec<(String, &'static str)>,
+    /// The LanguageMap entry a LanguageProperty is compared in, as it is read.
+    lang: &'a str,
 }
 
 impl<'a> Terms<'a> {
@@ -720,8 +730,8 @@ impl<'a> Terms<'a> {
         })
     }
 
-    /// F31, F32: `eq` on a LanguageProperty, in any language (7.2.3.4
-    /// conditions 4 and 5: the read asks for no language), or on a
+    /// F31, F32: `eq` on a LanguageProperty, in the language the read serves
+    /// (`ngsild.lang`, else the `@none` entry; T-5206 finding 6), or on a
     /// VocabProperty with its value expanded like the stored one; `None`
     /// when `member` is neither. Any other operator is a later round's.
     fn entry(
@@ -749,7 +759,7 @@ impl<'a> Terms<'a> {
         let term = self.term_of(&m.iri);
         let s = Value::from(s.as_str());
         Ok(Some(if matches!(m.shape, Shape::Language) {
-            format!("{term}[*]=={s}")
+            format!("{term}[{}]=={s}", self.lang)
         } else {
             if !self.expand_values.contains(&term) {
                 self.expand_values.push(term.clone());
@@ -1472,6 +1482,15 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn translate(
+        filter: &Expr,
+        set: &Set,
+        sets: &BTreeMap<String, Set>,
+        aliases: &[(String, Literal)],
+    ) -> Result<Translated, Refused> {
+        super::translate(filter, set, sets, aliases, None)
+    }
     use crate::edm::Member;
     use std::collections::BTreeMap;
 
@@ -1480,6 +1499,7 @@ mod tests {
             iri: iri.into(),
             shape,
             list: false,
+            json: false,
             written: crate::edm::Written::Always,
         };
         let value = |edm, collection| Shape::Value { edm, collection };
@@ -2228,7 +2248,7 @@ mod tests {
     #[test]
     fn language_and_vocab_eq_are_mapped() {
         let eq = |name: &str| cmp(m(name), CompareOp::Eq, lit(Literal::String("s".into())));
-        assert_eq!(q(&eq("label")), Ok(r#"(t0[*]=="s")"#.into()), "F31");
+        assert_eq!(q(&eq("label")), Ok(r#"(t0[@none]=="s")"#.into()), "F31, T-5206: the text the read serves");
         let t = translate(&eq("status"), &set(), &BTreeMap::new(), &[]).unwrap_or_default();
         assert_eq!(
             (t.q.as_deref(), t.expand_values.as_slice()),
@@ -2621,6 +2641,7 @@ mod tests {
                     collection: false,
                 },
                 list: false,
+                json: false,
                 written: crate::edm::Written::Always,
             },
         );
@@ -2724,6 +2745,7 @@ mod tests {
                         collection: false,
                     },
                     list: false,
+                    json: false,
                     written: crate::edm::Written::Always,
                 },
             );

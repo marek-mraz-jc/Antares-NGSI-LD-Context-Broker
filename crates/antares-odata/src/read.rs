@@ -8,7 +8,7 @@
 //! The options and forms of later rounds answer `501` before any operation
 //! runs.
 
-use crate::edm::{base_member, Edm, Set, Shape};
+use crate::edm::{base_member, Edm, Set, Shape, VOCABULARY};
 use crate::filter::{
     compute, computed, holds_member, inlined, mint, order, program, searched, translate, Refused,
     SortBy, SortKey, Translated,
@@ -40,7 +40,8 @@ pub const MAX_PAGE: u64 = 1000;
 
 /// The custom query options a collection read takes (ADR-0028 rule 6, Q27):
 /// each the NGSI-LD Query Entities parameter after the prefix.
-pub const NGSILD_OPTIONS: [&str; 8] = [
+pub const NGSILD_OPTIONS: [&str; 9] = [
+    "ngsild.lang",
     "ngsild.q",
     "ngsild.scopeQ",
     "ngsild.georel",
@@ -97,7 +98,7 @@ pub(crate) async fn dereference(
         }
         Some(Ok(ODataUri::Resource { path, options })) => match path.as_slice() {
             [Segment::EntitySet(set), Segment::Key(key)] => {
-                entity(reads, caller, ctx, set, key, &options).await
+                entity(reads, caller, ctx, set, key, &options, &HeaderMap::new()).await
             }
             _ => Err(not_found(ctx.version)),
         },
@@ -680,6 +681,7 @@ pub(crate) async fn collection(
     let expansions =
         expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
     let mut filter = filtered(set, &reads.edm.sets, options, version)?;
+    filter.annotate = annotated(headers);
     let picked = selected_of(set, options.select.as_ref(), &filter.computed)
         .map_err(|()| not_implemented(version))?;
     let projection = ngsild(&reads.view, options, &mut filter, version)?;
@@ -813,6 +815,7 @@ pub(crate) async fn entity(
     set_name: &str,
     key: &Key,
     options: &QueryOptions,
+    headers: &HeaderMap,
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
@@ -820,7 +823,10 @@ pub(crate) async fn entity(
         return Err(not_implemented(version));
     }
     // `$compute` alone: its values over the one Entity
-    let computing = Translated::default();
+    let computing = Translated {
+        annotate: annotated(headers),
+        ..Translated::default()
+    };
     let computing = match &options.compute {
         Some(items) => computed_over(set, items, options, computing, version)?,
         None => computing,
@@ -886,9 +892,17 @@ fn filtered(
     let items = options.compute.as_deref().unwrap_or_default();
     // a filter on a computed value is one on what it computes (URL 5.1.10)
     let filter = filter.map(|f| inlined(&f, items));
+    let lang = lang_of(options).map_err(|()| {
+        ODataErrorResponse::new(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "ngsild.lang is one language tag, such as sk or en-GB",
+        )
+        .with_version(version)
+    })?;
     let translated = filter.as_ref().map_or_else(
         || Ok(Translated::default()),
-        |f| translate(f, set, sets, &options.aliases),
+        |f| translate(f, set, sets, &options.aliases, lang),
     );
     let translated = translated.map_err(|refused| refusal(refused, version))?;
     let translated = computed_over(set, items, options, translated, version)?;
@@ -1267,7 +1281,19 @@ pub(crate) fn entity_value(
             continue;
         }
         let instance = default_instance(doc.get(key_of(&member.iri, filter)));
-        properties.push((name.clone(), member_value(&member.shape, instance)));
+        let (value, unserved) = served(&member.shape, instance);
+        // Instance annotations precede the property they annotate (JSON Format 4.01 20).
+        if let Some(why) = unserved {
+            properties.push((format!("{name}@{VOCABULARY}.Unserved"), Value::from(why)));
+        }
+        if filter.annotate {
+            for (key, term) in [("observedAt", "observedAt"), ("unitCode", "unitCode")] {
+                if let Some(v) = instance.and_then(|i| i.get(key)) {
+                    properties.push((format!("{name}@{VOCABULARY}.{term}"), v.clone()));
+                }
+            }
+        }
+        properties.push((name.clone(), value));
     }
     for e in expansions {
         let instance = default_instance(doc.get(key_of(e.iri, filter)));
@@ -1383,19 +1409,24 @@ fn visible_types(edm: &Edm, doc: &Value) -> Vec<String> {
         .collect()
 }
 
-/// The instance without a `datasetId` (S3), else the first.
+/// The default instance, the one without a `datasetId` (S3, TS 104 175 5.2.6.4.1); `None` when
+/// every instance is named: a named instance is never served as the member (T-5206 finding 8).
 pub(crate) fn default_instance(attr: Option<&Value>) -> Option<&Value> {
     match attr? {
-        Value::Array(instances) => instances
-            .iter()
-            .find(|i| i.get("datasetId").is_none())
-            .or_else(|| instances.first()),
-        one => Some(one),
+        Value::Array(instances) => instances.iter().find(|i| i.get("datasetId").is_none()),
+        one => one.get("datasetId").is_none().then_some(one),
     }
 }
 
 /// The OData value of one Attribute instance (rows P1 to P7, R5).
 pub(crate) fn member_value(shape: &Shape, instance: Option<&Value>) -> Value {
+    served(shape, instance).0
+}
+
+/// [`member_value`] and, when the stored instance holds what the member cannot serve, why it
+/// reads `null` (T-5206 findings 7 and 13): an array under a single-valued member, an instance
+/// of another kind than the model names, a LanguageProperty without the text asked for.
+pub(crate) fn served(shape: &Shape, instance: Option<&Value>) -> (Value, Option<&'static str>) {
     let member = |names: &[&str]| {
         names
             .iter()
@@ -1417,14 +1448,28 @@ pub(crate) fn member_value(shape: &Shape, instance: Option<&Value>) -> Value {
             ..
         } | Shape::Url { collection: true }
     );
+    let other_kind = instance.is_some_and(|i| i.is_object()) && value.is_none();
     match value {
-        Some(Value::Array(items)) if !collection => items.into_iter().next().unwrap_or(Value::Null),
-        Some(one) if collection && !one.is_array() => Value::Array(vec![one]),
-        Some(v) => v,
-        None if collection => Value::Array(Vec::new()),
-        None => Value::Null,
+        // An Untyped member holds any JSON value, an array too.
+        Some(v) if *shape == Shape::Json => (v, None),
+        Some(Value::Array(items)) if !collection && items.is_empty() => (Value::Null, None),
+        Some(Value::Array(_)) if !collection => (
+            Value::Null,
+            Some("the stored value is an array; this member holds one value"),
+        ),
+        Some(one) if collection && !one.is_array() => (Value::Array(vec![one]), None),
+        Some(v) => (v, None),
+        None if collection => (Value::Array(Vec::new()), other_kind.then_some(KIND_NOTE)),
+        None if *shape == Shape::Language && other_kind => (
+            Value::Null,
+            Some("the LanguageProperty has no text without a language: ask with ngsild.lang"),
+        ),
+        None => (Value::Null, other_kind.then_some(KIND_NOTE)),
     }
 }
+
+/// Why a stored instance of another kind than the model names reads `null`.
+const KIND_NOTE: &str = "the stored Attribute is of another kind than the model names";
 
 /// A typed literal (`{"@type": "DateTime", "@value": …}`) as its value,
 /// item by item in a list.
@@ -1435,6 +1480,24 @@ fn plain(value: Value) -> Value {
         }
         Value::Array(items) => Value::Array(items.into_iter().map(plain).collect()),
         other => other,
+    }
+}
+
+/// `ngsild.lang`: the language a LanguageProperty is read and filtered in (NGSI-LD `lang`,
+/// TS 104 175 4.15), a BCP 47 tag of letters, digits and `-`; `Err` for any other value.
+fn lang_of(options: &QueryOptions) -> Result<Option<&str>, ()> {
+    let Some((_, value)) = options.custom.iter().find(|(n, _)| n == "ngsild.lang") else {
+        return Ok(None);
+    };
+    match value.as_deref() {
+        Some(tag)
+            if (1..=35).contains(&tag.len())
+                && tag.starts_with(|c: char| c.is_ascii_alphabetic())
+                && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') =>
+        {
+            Ok(Some(tag))
+        }
+        _ => Err(()),
     }
 }
 
@@ -1490,6 +1553,11 @@ pub(crate) fn ngsild(
                 filter.ngsild.push_str("&geoproperty=");
                 filter.ngsild.push_str(&encode(&term));
                 geo = true;
+            }
+            // checked by `lang_of`: the broker serves each LanguageProperty in it
+            "ngsild.lang" => {
+                filter.ngsild.push_str("&lang=");
+                filter.ngsild.push_str(value);
             }
             "ngsild.pick" => projection.pick = Some(names(value)?),
             "ngsild.omit" => projection.omit = Some(names(value)?),
@@ -1767,6 +1835,24 @@ pub(crate) fn resource<'r>(
     Resource::new(&reads.state.model, name).ok_or_else(|| not_found(version))
 }
 
+/// Whether `Prefer: odata.include-annotations` (Protocol 4.01 8.2.8.4) asks for an annotation
+/// of the surface's vocabulary: `*`, or a pattern of `Antares.NgsiLd` or its alias.
+fn annotated(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("Prefer")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|p| {
+            let (name, value) = p.trim().split_once('=')?;
+            matches!(name.trim(), "odata.include-annotations" | "include-annotations")
+                .then(|| value.trim().trim_matches('"'))
+        })
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|p| p == "*" || p.starts_with("Antares.NgsiLd.") || p.starts_with("NgsiLd."))
+}
+
 /// `Prefer: odata.maxpagesize`, else [`DEFAULT_PAGE`].
 fn max_page(headers: &HeaderMap, max_len: usize) -> u64 {
     headers
@@ -1844,6 +1930,7 @@ mod tests {
             iri: "https://e.org/m".into(),
             shape,
             list: false,
+            json: false,
             written: crate::edm::Written::Always,
         };
         Set {
@@ -1972,7 +2059,7 @@ mod tests {
                 json!(["a", "b"]),
             ),
             (value(true), json!({"value": "a"}), json!(["a"])),
-            (value(false), json!({"value": ["a", "b"]}), json!("a")),
+            (value(false), json!({"value": ["a", "b"]}), Value::Null),
             (value(false), json!({"value": []}), Value::Null),
             (value(false), json!({"value": {"a": 1}}), json!({"a": 1})),
             (Shape::Url { collection: true }, json!({}), json!([])),
@@ -1991,7 +2078,7 @@ mod tests {
         let many = json!([{"datasetId": "urn:d:1", "value": 1}, {"value": 2}]);
         assert_eq!(default_instance(Some(&many)), Some(&json!({"value": 2})));
         let only_named = json!([{"datasetId": "urn:d:1", "value": 1}]);
-        assert_eq!(default_instance(Some(&only_named)), Some(&only_named[0]));
+        assert_eq!(default_instance(Some(&only_named)), None, "T-5206: never a named one");
         assert_eq!(default_instance(Some(&json!([]))), None);
         assert_eq!(default_instance(None), None);
     }

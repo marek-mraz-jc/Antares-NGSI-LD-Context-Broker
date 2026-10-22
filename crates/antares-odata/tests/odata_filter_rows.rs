@@ -179,16 +179,23 @@ async fn the_mapped_rows_select_what_their_ngsi_ld_query_selects() {
             format!("geo.intersects(location,{polygon})%20and%20speed%20gt%2015"),
             vec![],
         ),
+        // T-5206 finding 6: in the language the read serves, `ngsild.lang` or `@none`
         (
             "F31",
-            "label%20eq%20'%C4%8Derven%C3%A1'".to_owned(),
+            "label%20eq%20'%C4%8Derven%C3%A1'&ngsild.lang=cs".to_owned(),
             vec!["urn:ngsi-ld:Car:1"],
         ),
         (
             "F31",
-            "label%20eq%20'blue'".to_owned(),
+            "label%20eq%20'%C4%8Derven%C3%A1'&ngsild.lang=en".to_owned(),
+            vec![],
+        ),
+        (
+            "F31",
+            "label%20eq%20'blue'&ngsild.lang=en".to_owned(),
             vec!["urn:ngsi-ld:Car:2"],
         ),
+        ("F31", "label%20eq%20'blue'".to_owned(), vec![]),
         ("F32", vocab("Active"), vec!["urn:ngsi-ld:Car:1"]),
         ("F32", vocab("Parked"), vec!["urn:ngsi-ld:Car:2"]),
     ] {
@@ -214,8 +221,7 @@ async fn a_vocab_value_matches_as_the_read_shows_it() {
         None,
     )
     .await;
-    // F31 is not here: the read shows a languageMap only by its `@none`
-    // entry, the filter matches any language (5.2 F31)
+    // F31 is in `a_language_property_reads_and_filters_in_one_language`
     for name in ["status"] {
         let shown = one.get(name).and_then(Value::as_str).unwrap_or_default();
         assert!(!shown.is_empty(), "{name}: {one}");
@@ -422,4 +428,26 @@ async fn an_evaluation_past_the_step_budget_is_too_complex_query() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(ids(&body), ["urn:ngsi-ld:Car:3"]);
+}
+
+/// T-5206 finding 6: `ngsild.lang` picks the text a LanguageProperty reads as, and the filter
+/// matches that text; without it the `@none` entry, and a map without one reads `null` with a note.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_language_property_reads_and_filters_in_one_language() {
+    let (_b, app) = broker().await.expect("broker");
+    let one = "Car('urn:ngsi-ld:Car:1')";
+    // the ngsild options are a collection read's
+    let (status, cs) = send(&app, Method::GET, &format!("{ROOT}/Car?ngsild.lang=cs"), None).await;
+    assert_eq!(status, StatusCode::OK, "{cs}");
+    let car1 = cs["value"]
+        .as_array()
+        .and_then(|v| v.iter().find(|c| c["id"] == "urn:ngsi-ld:Car:1"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(car1["label"], "červená", "{cs}");
+    let (_, none) = send(&app, Method::GET, &format!("{ROOT}/{one}"), None).await;
+    assert_eq!(none["label"], Value::Null, "{none}");
+    assert!(none["label@Antares.NgsiLd.Unserved"].is_string(), "{none}");
+    let (status, bad) = send(&app, Method::GET, &format!("{ROOT}/Car?ngsild.lang=c%3Bs"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
 }

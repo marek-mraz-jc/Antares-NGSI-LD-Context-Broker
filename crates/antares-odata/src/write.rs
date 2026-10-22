@@ -98,7 +98,7 @@ pub(crate) async fn create(
         no_content(version)
     } else {
         // The view reads it as any other Entity: what it hides stays out.
-        let mut read = entity(reads, caller, ctx, set_name, &key, &QueryOptions::default()).await?;
+        let mut read = entity(reads, caller, ctx, set_name, &key, &QueryOptions::default(), headers).await?;
         *read.status_mut() = StatusCode::CREATED;
         read
     };
@@ -153,6 +153,9 @@ pub(crate) async fn change(
     let mut doc = attributes(set, &payload.properties, kind);
     referenced(reads, caller, set, &payload.properties, version).await?;
     bind(reads, caller, set, &payload.binds, &mut doc, version).await?;
+    if kind == WriteKind::Replace {
+        named_instances_kept(reads, caller, set, &id, version).await?;
+    }
     let (op, method) = if kind == WriteKind::Replace {
         doc.insert("id".into(), Value::from(id.as_str()));
         doc.insert("type".into(), Value::from(set.type_iri.as_str()));
@@ -171,6 +174,39 @@ pub(crate) async fn change(
     )
     .await?;
     Ok(no_content(version))
+}
+
+/// A `PUT` replaces the whole Entity, and the surface serves only the default instance of an
+/// Attribute (S3): an Entity that holds an instance with a `datasetId` is `409`, never replaced,
+/// so no instance the caller cannot read here is deleted (T-5206 finding 8). The Entity is read
+/// under the view first; an absent one goes on to the replace's own `404`.
+async fn named_instances_kept(
+    reads: &Reads,
+    caller: &Caller,
+    set: &Set,
+    id: &str,
+    version: ODataVersion,
+) -> Result<(), ODataErrorResponse> {
+    let target = typed(&format!("/ngsi-ld/v1/entities/{}", encode(id)), set);
+    let docs = match run(reads, caller, OperationId::RetrieveEntity, target, &Translated::default(), version).await {
+        Ok((docs, _)) => docs,
+        Err(e) if e.status == StatusCode::NOT_FOUND => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let named = |v: &Value| v.get("datasetId").is_some();
+    let held = docs.iter().filter_map(Value::as_object).flat_map(|o| o.values()).any(|v| match v {
+        Value::Array(instances) => instances.iter().any(named),
+        one => named(one),
+    });
+    if held {
+        return Err(ODataErrorResponse::new(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "the Entity holds Attribute instances with a datasetId, which a PUT would delete: change it with PATCH",
+        )
+        .with_version(version));
+    }
+    Ok(())
 }
 
 /// `DELETE {Set}('{id}')` (W9): Delete Entity of the set's type, `204`.
@@ -229,7 +265,9 @@ pub(crate) fn attribute(member: &Member, value: &Value) -> Option<Value> {
         (Shape::Value { .. }, true) => json!({"type": "ListProperty", "valueList": value}),
         (Shape::Value { .. }, false) => json!({"type": "Property", "value": value}),
         (Shape::Geo, _) => json!({"type": "GeoProperty", "value": value}),
-        (Shape::Json, _) => json!({"type": "JsonProperty", "json": value}),
+        (Shape::Json, _) if member.json => json!({"type": "JsonProperty", "json": value}),
+        // An inlined object or an untyped value keeps the schema's kind (P2, T-5206).
+        (Shape::Json, _) => json!({"type": "Property", "value": value}),
         (Shape::Vocab, _) => json!({"type": "VocabProperty", "vocab": value}),
         (Shape::Language | Shape::Url { .. } | Shape::Nav { .. }, _) => return None,
     })
@@ -415,6 +453,7 @@ mod tests {
             iri: iri.into(),
             shape,
             list: false,
+            json: false,
             written: crate::edm::Written::Always,
         };
         let set = Set {
