@@ -30,7 +30,7 @@ the message; a client may add `x-id`, which the answer echoes.
 | client | `x-resume` | none | take over a connection, see section 3 |
 | server | `x-result` | the operation's answer | `x-status` is the HTTP status the operation answered |
 | server | `x-notification` | the notification | `x-subscription`, `x-seq` from 1, and the same metadata the MQTT binding sends |
-| server | `x-gap` | none | `x-from`..`x-to` were lost (overflow, or past the resume ring) |
+| server | `x-gap` | none | `x-from`..`x-to` were lost (overflow, past the resume ring, or dropped by the broker before the queue) |
 | server | `x-closing` | none | `x-reason` (`overflow`, `lifetime`, `idle`, `view-removed`, `rate`), then the close frame |
 
 A Subscription made over the socket notifies only that socket: its
@@ -51,7 +51,11 @@ carries `x-coalesced`, the number of changes it replaced. A consumer that
 keeps up has nothing queued and receives every change, one notification
 each; with `showChanges` every change is its own notification. A consumer that falls past the queue gets `x-gap`
 and is closed with 1013; a peer that does not take a write within the
-pong window is closed too. Nothing is buffered without bound.
+pong window is closed too. Nothing is buffered without bound. A notification
+the broker drops before it reaches the queue (a Subscription's full delivery
+lane, `antares_notification_lane_dropped_total`) takes its `x-seq` and arrives
+as an `x-gap` in its place, in order, and the connection stays open: the
+consumer re-reads with Query Entities. Losses in a row share one `x-gap`.
 
 In a split fleet (`ANTARES_BUS=nats`) the notifier pod reaches the api pod
 that holds the socket over core NATS request/reply on

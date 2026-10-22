@@ -48,7 +48,7 @@ per process; the sampler now reads the container's cgroup (`docker stats`).
 | sta-observations | 50 | n/a (platform only) | 14.73 / 26.24 |  | 8.6 / 131.7 | 200 / 500 | ok |
 | ical | 2 | n/a (platform only) | 665.98 / 710.84 |  | 42.9 / 119.4 | 2000 / 4000 | ok |
 | mcp | 50 | n/a (platform only) | 57.25 / 83.0 |  | 11.0 / 119.3 | 200 / 500 | ok |
-| ws-fanout | 200 | n/a (platform only) | 30030 / 30524 |  | 79.6 / 283.8 | 250 / 1000 | breach: p95_ms 30030 > 250; p99_ms 30524 > 1000; errors 77.883 % > 0.1 % |
+| ws-fanout | 200 | n/a (platform only) | 30030 / 30524 |  | 79.6 / 283.8 | 250 / 1000 | breach: p95_ms 30030 > 250; p99_ms 30524 > 1000; errors 77.883 % > 0.1 % (T-4921: 33.5 % missing, each loss now an `x-gap`; see the note under the table) |
 
 `odata` (T-4919): each read counted the Entities lacking the `$orderby` key, a second scan of the
 type beside the read itself, though `level ge a` already rules them out; and the store handed the
@@ -63,6 +63,63 @@ above is the run that found it; the next load-surfaces run replaces it.
 `ogc-page` asked an `offset` the OGC surface does not define (its paging is the `next` cursor); the
 shape now follows the first page's `next` link, as a GIS client pages; a 2 000-entity recheck answered
 every page (p95 10.8 ms, p99 34.3 ms at 50/s).
+
+T-4921 (2026-10-21, sandbox under load 40 on 12 cores, 20 000 entities, the same shape) found the
+fan-out bound by delivery, not by k6 or the matcher: a notification of one subscription costs a view
+re-read and a bookkeeping transaction under the tenant's 8 delivery slots, and each folded notification
+re-read its Entities one query each (125 ms of a 210 ms delivery; the rest waited for a pool
+connection). A lane then dropped its groups without a word. Since T-4921 a dropped group reaches the
+socket as an `x-gap` in order, and a notification reads its Entities in one query. Two runs back to
+back, the first with the `x-gap` change alone:
+
+| binary | delivered of ~300 000 owed | `x-gap` messages | missing | p95 ms | PATCH p95 ms |
+|---|---|---|---|---|---|
+| `x-gap` only, Entities read one by one | 84 641 | 75 119 | 70.2 % | 20 928 | 57 |
+| T-4921, one read per notification | 197 278 | 19 589 | 33.5 % | 15 618 | 157 |
+
+The PATCH p95 of those two runs is load, not the change: T-4921 does not touch the write path, and a
+delivery still holds at most one of the tenant's 8 slots (`ANTARES_DELIVERY_WIDTH_PER_TENANT`) of the
+20-connection pool. Four more pairs on 2026-10-22 (dev 3c43f32 against T-4921, the same shape, load 40
+to 48) spread PATCH p95 from 45 ms to 4 425 ms for the same binary:
+
+| pass | subscribers | binary | delivered of owed | `x-gap` | fan-out p95 ms | PATCH p95 ms |
+|---|---|---|---|---|---|---|
+| 1 (T-4921 first) | 1 000 | T-4921 | 267 797 of 300 050 | 1 | 8 523 | 45 |
+| 1 | 1 000 | dev | 72 945 of 300 050 | 0 | 25 913 | 140 |
+| 1 | 100 | T-4921 | 30 005 of 30 005 | 0 | 3 137 | 320 |
+| 1 | 100 | dev | 29 870 of 30 005 | 0 | 9 092 | 205 |
+| 2 (dev first) | 1 000 | dev | 31 360 of 299 550 | 0 | 37 860 | 850 |
+| 2 | 1 000 | T-4921 | 31 851 of 269 100 | 58 707 | 40 886 | 4 425 |
+| 2 | 100 | dev | 18 212 of 30 005 | 0 | 25 217 | 360 |
+| 2 | 100 | T-4921 | 30 005 of 30 005 | 0 | 10 485 | 813 |
+
+What repeats is the delivery: T-4921 delivered every notification at 100 subscribers both times, at a
+third of dev's fan-out p95, and dev lost changes without saying so.
+
+Three more passes on 2026-10-22 03:25-03:56Z on a 16-core host whose load fell from 35 to 10, 1 000
+subscribers, alternating order (pass 2 reversed), with a third arm that halves the tenant's delivery share
+(`ANTARES_DELIVERY_WIDTH_PER_TENANT=4`):
+
+| pass | load | binary | delivered of 300 050 | fan-out p95 ms | PATCH p95 ms | PATCH median ms |
+|---|---|---|---|---|---|---|
+| 1 | 35 | dev | 58 481 | 28 907 | 147 | 50 |
+| 1 | 26 | T-4921 | 273 295 | 8 864 | 33 | 15 |
+| 1 | 19 | T-4921, share 4 | 271 197 | 9 499 | 21 | 12 |
+| 2 | 14 | T-4921, share 4 | 300 045 | 7 572 | 13 | 9 |
+| 2 | 15 | T-4921 | 280 246 | 8 647 | 20 | 13 |
+| 2 | 10 | dev | 198 259 | 10 985 | 16 | 9 |
+| 3 | 10 | dev | 194 112 | 10 226 | 13 | 9 |
+| 3 | 10 | T-4921 | 292 350 | 7 122 | 16 | 10 |
+| 3 | 11 | T-4921, share 4 | 286 897 | 8 626 | 16 | 9 |
+
+At load 10 (passes 2 and 3) the write p95 is 13-16 ms for dev and 16-20 ms for T-4921: at most 4 ms more
+for about 47 % more delivered notifications and a fan-out p95 a quarter lower. A share of 4 holds dev's
+write p95 (13, 16 ms) and delivers as much as the share of 8, so the knob bounds the delivery's cost on
+the pool where a deployment needs it; the default stays 8.
+
+The shape still breaches its budget: 1 000 subscribers each owed a notification every 250 ms is 4 000
+deliveries a second, each with its own transaction. T-5159 books a drain's deliveries in one statement
+and reads a view's Entities once per drain.
 
 ## 3. Breaches
 

@@ -183,6 +183,7 @@ pub(super) async fn deliver_group(st: &AppState, g: Matched) {
     let Ok(_permits) = tokio::time::timeout(STEP_DEADLINE, delivery_permits(&g.tenant)).await
     else {
         note_stall("permits", g.tenant.as_str(), id);
+        tell_lost(st, &g);
         return;
     };
     let delivered = deliver(st, &g.tenant, &g.sub, g.data, &g.ctx);
@@ -342,6 +343,7 @@ pub(super) fn to_lane(st: &AppState, group: Matched, batch: &Arc<BatchDone>) {
         // group, counted and named like a full lane's, and the process keeps
         // its memory (T-4549)
         note_lane_drop(&key, group.data.len());
+        tell_lost(st, &group);
         return;
     };
     let job = LaneJob {
@@ -358,6 +360,7 @@ pub(super) fn to_lane(st: &AppState, group: Matched, batch: &Arc<BatchDone>) {
             Ok(()) => return,
             Err(TrySendError::Full(job)) => {
                 note_lane_drop(&key, job.group.data.len());
+                tell_lost(st, &job.group);
                 return;
             }
             // its task is gone (a panic past the guard): open a new lane
@@ -441,6 +444,20 @@ pub(super) fn fold(job: LaneJob, rx: &mut tokio::sync::mpsc::Receiver<LaneJob>) 
         batches.push((next._batch, next._held));
     }
     (st, group, batches, None)
+}
+
+/// A group this process dropped, told to the subscription's binding, which
+/// says so in band where it can (a WebSocket's `x-gap`, T-4921).
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn tell_lost(st: &AppState, g: &Matched) {
+    if let (Some(uri), Some(id)) = (
+        endpoint_uri(&g.sub),
+        g.sub.get("id").and_then(Value::as_str),
+    ) {
+        if let Some(sink) = st.sinks.sink_for_uri(uri) {
+            sink.lost(uri, g.tenant.as_str(), id);
+        }
+    }
 }
 
 /// Groups a full lane refused: counted by entity, and named by tenant and
@@ -532,4 +549,13 @@ pub(super) fn tenant_slots(tenant: &TenantId) -> Arc<tokio::sync::Semaphore> {
 pub(super) async fn delivery_permits(tenant: &TenantId) -> impl Sized {
     let share = tenant_slots(tenant).acquire_owned().await;
     (share, DELIVERY_SLOTS.acquire().await)
+}
+
+/// `notification.endpoint.uri` of a Subscription.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn endpoint_uri(sub: &Value) -> Option<&str> {
+    sub.get("notification")?
+        .get("endpoint")?
+        .get("uri")?
+        .as_str()
 }
