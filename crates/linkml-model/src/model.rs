@@ -465,7 +465,8 @@ impl Model {
     }
 
     /// The NGSI-LD kind (DM-05): the `ngsi_ld_kind` annotation, else
-    /// `Relationship` for a class range and `Property` for any other.
+    /// `Relationship` for a class range not `inlined` and `Property` for any other: an
+    /// inlined class is an object value, not a link (T-5206).
     ///
     /// ```
     /// # use linkml_model::Slot;
@@ -477,7 +478,9 @@ impl Model {
     pub fn kind<'s>(&self, slot: &'s Slot) -> &'s str {
         match slot.annotations.get(KIND_TAG) {
             Some(a) => &a.value,
-            None if matches!(self.range(slot), Range::Class(_)) => "Relationship",
+            None if matches!(self.range(slot), Range::Class(_)) && slot.inlined != Some(true) => {
+                "Relationship"
+            }
             None => "Property",
         }
     }

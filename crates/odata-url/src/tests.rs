@@ -374,8 +374,8 @@ fn query_option_errors() {
     ] {
         refused(&format!("Buildings?{name}"), feature, 10);
     }
-    // `$deltatoken` and `$apply` need their `$`: without it they are custom options.
-    assert_eq!(options("Buildings?apply=x").custom.len(), 1);
+    // `$deltatoken` needs its `$`: without it it is a custom option.
+    assert_eq!(options("Buildings?deltatoken=x").custom.len(), 1);
 }
 
 #[test]
@@ -1838,8 +1838,11 @@ fn apply_refuses_what_is_no_served_transformation() {
     ] {
         syntax(&format!("Buildings?$apply={query}"), offset);
     }
-    // `apply` without its `$` is a custom option
-    assert_eq!(options("Buildings?apply=x").custom.len(), 1);
+    // Protocol 4.01 11.2.1: names are case-insensitive, the `$` optional (T-5206 finding 17)
+    for q in ["apply=identity", "$APPLY=identity", "Apply=identity"] {
+        let o = options(&format!("Buildings?{q}"));
+        assert!(o.apply.is_some() && o.custom.is_empty(), "{q}");
+    }
     let e = err("Buildings?$apply=identity&$apply=identity");
     assert_eq!(e.kind, UrlErrorKind::DuplicateOption("$apply"));
 }

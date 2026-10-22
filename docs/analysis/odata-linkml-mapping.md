@@ -2,6 +2,30 @@
 
 Sources: Antares-NGSI-LD-Context-Broker `7185e1a` (branch `agent/worker-2/T-3436`; `cg` graph built at `7185e1a100`), joinedcontext-platform `59a8f70` (`cg` graph at `59a8f705b9`), platform docs `4238cf0`, joinedcontext-portal `bd3a68a8` (grep only). ETSI TS 104 175 V1.1.1 and TS 104 176 V1.1.1 (2026-09), one file per clause under `/workspace/etsi-specs/`. OASIS OData Version 4.01 (OASIS Standard): Part 1 Protocol, Part 2 URL Conventions, JSON Format, CSDL XML and CSDL JSON, fetched on 2026-10-10 from `docs.oasis-open.org/odata/...` (`.../odata/v4.01/os/part1-protocol/odata-v4.01-os-part1-protocol.html`, `.../part2-url-conventions/odata-v4.01-os-part2-url-conventions.html`, `.../odata-json-format/v4.01/os/odata-json-format-v4.01-os.html`, `.../odata-csdl-xml/v4.01/os/odata-csdl-xml-v4.01-os.html`, `.../odata-csdl-json/v4.01/os/odata-csdl-json-v4.01-os.html`). OData vocabularies from `github.com/oasis-tcs/odata-vocabularies` at commit `3e36ad2a4930a47feaf7a7cd0b78ed4f2bafcfb2` (the commit `odata-library.md` section 4 pins): `vocabularies/Org.OData.Core.V1.xml`, `Org.OData.Capabilities.V1.xml`, `Org.OData.Measures.V1.xml`, `Org.OData.Validation.V1.xml`. crates.io API and `static.crates.io` tarballs read on 2026-10-10 (grep only, nothing built). Inputs on this branch: `docs/analysis/operation-matrix.yaml` and `.md` (T-3437, the contract this page refines; its row ids are reused), `docs/analysis/cim009-to-ts104175.md`, `docs/analysis/odata-library.md` (T-3448 survey, read and not edited), `docs/analysis/gateway-to-broker-map.md` (T-3436). Nothing was built or run.
 
+**What is built (T-5206, 2026-10-22).** The rows below record the design; where the build
+differs, this list is authoritative and `docs/src/odata.md` describes what is served:
+
+- N1 (b) discovery and (c) sampling are not built: the model comes from (a) alone; a stored
+  instance of another kind reads `null` with `@Antares.NgsiLd.Unserved`.
+- P2 is `Edm.Untyped` (4.01) or a dynamic property of an open type (4.0), never a `ComplexType`;
+  an inlined object written through OData stays a Property.
+- P3 is `Edm.Geography` only; the concrete subtypes are not built.
+- P4 is served in `ngsild.lang` or as the `@none` text, `$filter` compares the same text; the full
+  map is not served.
+- R3: DM-05 does list ListRelationship (`KINDS` in `linkml-model`); the section 12 note is outdated.
+- R4 is an `Edm.String` URL, not a navigation to `NgsiLd.Entity`.
+- S1 and S2 are served as `<prop>@Antares.NgsiLd.observedAt` and `<prop>@Antares.NgsiLd.unitCode`
+  under `Prefer: odata.include-annotations`; there is no `Measures` reference.
+- S3 serves only the instance without `datasetId` (none: `null`); `_datasets` is not built, and a
+  `PUT` of an Entity holding a named instance is `409`.
+- 3.3: a name over 128 characters is dropped without a metric.
+- 3.4: a class range without `inlined: true` stays a Relationship (every class is an Entity type
+  keyed by the NGSI-LD `id`); LinkML's implied `inlined` is not applied.
+- E2a keys `urn:ngsi-ld:{Class}:{v}` only, not the platform's `{space}:` form.
+- C19 states `Minimal`; the measured level is in `docs/src/odata-compliance.md`. C21
+  (`Core.SchemaVersion`) is not built (T-5207).
+- F20 and F22 over `scope` or a complex path answer `400`, not `501`.
+
 ## 1. Scope, reading guide and how decisions are recorded
 
 This page decides how the OData v4.01 surface (`/x/views/{view}/odata/v4`, operation-matrix column `odata`) and the LinkML schema surface (`/x/views/{view}/linkml`, column `linkml`) map onto TS 104 175 operations and the ADR-0020 policy seam. It has the seven numbered decisions of T-3441 (sections 3 to 9), a Security section (10), the list of operation-matrix rows this page changes (11) and the unknowns (12).
