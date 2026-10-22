@@ -154,6 +154,14 @@ async fn a_correction_shows_its_chain_only_to_a_caller_granted_read_versions() {
         "{all}"
     );
     assert_eq!(rows[0]["provenance"]["channel"], "api", "{all}");
+    // The broker stamps when it stored each version (ADR-N-054 2.3, T-5361).
+    for row in &rows {
+        let at = row["provenance"]["writtenAt"].as_str().unwrap_or_default();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(at).is_ok(),
+            "writtenAt {at:?}: {all}"
+        );
+    }
 
     // lastN counts measurements: the latest one, with every version it has.
     let (s, last) = send(

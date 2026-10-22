@@ -103,14 +103,21 @@ pub(crate) fn backfilled(doc: &Value, attr: &str, current: &Value, incoming: &Va
     false
 }
 
-/// The provenance of the request in flight with its `operation`
-/// (T-4665); outside a request, a write of the broker's own: `api`.
+/// The provenance of the request in flight with its `operation` and
+/// `writtenAt`, when the broker stored it (T-4665, T-5361); outside a
+/// request, a write of the broker's own: `api`.
 pub(crate) fn provenance(operation: &str) -> Value {
     #[cfg(not(target_arch = "wasm32"))]
-    if let Ok(p) = PROVENANCE.try_with(|p| crate::provenance::with_operation(p, operation)) {
-        return p;
+    let request = PROVENANCE.try_with(Clone::clone).ok();
+    #[cfg(target_arch = "wasm32")]
+    let request: Option<Value> = None;
+    let base = request.unwrap_or_else(|| serde_json::json!({"channel": "api"}));
+    let mut out = crate::provenance::with_operation(&base, operation);
+    if let Some(o) = out.as_object_mut() {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        o.insert("writtenAt".into(), Value::String(now));
     }
-    crate::provenance::with_operation(&serde_json::json!({"channel": "api"}), operation)
+    out
 }
 
 /// Buffer one entity change for the request in flight so the matcher
