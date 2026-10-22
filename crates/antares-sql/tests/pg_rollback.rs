@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! A rollback boots the previous release on the schema a newer release
 //! migrated (T-5105, docs/src/operations.md). Needs a live PostGIS; skips when
-//! ANTARES_TEST_DATABASE_URL is unset, like tests/pg.rs. One test in its own
-//! binary: it writes rows into `_sqlx_migrations`, which every other pg test
-//! reads at connect.
+//! ANTARES_TEST_DATABASE_URL is unset, like tests/pg.rs. It writes rows into
+//! `_sqlx_migrations`, which every pg test reads at connect, so it runs in a
+//! database of its own: in the shared one a concurrent test's connect met the
+//! seeded rows (VersionTooNew(18, 16), train 20261022-0032 fast 39701518856).
 
 #![cfg(feature = "postgres")]
 
@@ -11,11 +12,25 @@ use antares_sql::store::pg;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_newer_compatible_migration_boots_and_a_breaking_one_stops_the_boot() {
-    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+    let Ok(shared) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
         eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
         return;
     };
-    let pool = pg::connect(&url, 2).await.expect("connect+migrate");
+    let admin = pg::connect(&shared, 2).await.expect("connect+migrate");
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let name = format!("antares_rollback_{run}");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+        .execute(&admin)
+        .await
+        .expect("own database");
+    let (base, _) = shared.rsplit_once('/').expect("a database URL");
+    let url = format!("{base}/{name}");
+    let pool = pg::connect(&url, 2)
+        .await
+        .expect("connect+migrate the own database");
     let newest = pg::MIGRATOR
         .iter()
         .map(|m| m.version)
