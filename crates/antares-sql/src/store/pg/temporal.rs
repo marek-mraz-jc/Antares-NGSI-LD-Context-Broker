@@ -120,16 +120,18 @@ fn decompose(doc: &Value) -> Vec<Value> {
     rows
 }
 
-/// The instance of history row `alias` as the reads return it (T-5131): a
-/// row stores its instanceId in the `instance_id` column only, so `data`
-/// comes back as `[data, instance_id]`, which [`unpack`] turns into the
-/// instance. A row written before T-5131 still holds `instanceId` in `data`
-/// and is returned as stored. The array costs Postgres no more than reading
-/// the old document; adding the member in SQL cost ~35 % more (200k rows).
-fn packed(alias: &str) -> String {
+/// One attribute's instances of history rows `alias`, as the reads group
+/// them (T-5131): a row stores its instanceId in the `instance_id` column
+/// only, so an attribute comes back as `[instances, instance ids]` in one
+/// order, which [`unpack`] zips into the instances. A row written before
+/// T-5131 still holds `instanceId` in `data`, equal to the column. Building
+/// each row in SQL instead (`jsonb_build_array` or `||` per row) cost
+/// Postgres 10-35 % more than reading the old documents (240k rows).
+fn insts_and_ids(alias: &str) -> String {
+    let key = format!("{alias}.created_at, {alias}.observed_at, {alias}.instance_id");
     format!(
-        "(CASE WHEN {alias}.data ? 'instanceId' THEN {alias}.data \
-         ELSE jsonb_build_array({alias}.data, {alias}.instance_id) END)"
+        "jsonb_build_array(jsonb_agg({alias}.data ORDER BY {key}), \
+         to_jsonb(array_agg({alias}.instance_id ORDER BY {key})))"
     )
 }
 
@@ -140,21 +142,29 @@ fn restamp(alias: &str) -> String {
     format!("({alias}.data || jsonb_build_object('instanceId', {alias}.instance_id))")
 }
 
-/// Turns each `[data, instance_id]` that [`packed`] returned back into the
-/// instance.
+/// Turns each attribute's `[instances, instance ids]` that
+/// [`insts_and_ids`] returned back into its instances.
 fn unpack(doc: &mut Value) {
     let Some(o) = doc.as_object_mut() else {
         return;
     };
-    for inst in o.values_mut().filter_map(Value::as_array_mut).flatten() {
-        let Some([data, id]) = inst.as_array_mut().map(Vec::as_mut_slice) else {
+    for attr in o.values_mut() {
+        let Some([insts, ids]) = attr.as_array_mut().map(Vec::as_mut_slice) else {
             continue;
         };
-        let Some(d) = data.as_object_mut() else {
+        let (Some(list), Some(ids)) = (insts.as_array_mut(), ids.as_array_mut()) else {
             continue;
         };
-        d.insert("instanceId".to_owned(), id.take());
-        *inst = data.take();
+        if list.len() != ids.len() || !ids.iter().all(Value::is_string) {
+            continue;
+        }
+        for (inst, id) in list.iter_mut().zip(ids.iter_mut()) {
+            if let Some(i) = inst.as_object_mut() {
+                i.insert("instanceId".to_owned(), id.take());
+            }
+        }
+        let list = insts.take();
+        *attr = list;
     }
 }
 
@@ -462,12 +472,12 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
             });
             format!(
                 "COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (\
-                   SELECT s.attr_id, jsonb_agg({s_data} ORDER BY s.created_at, s.observed_at, s.instance_id) AS insts \
+                   SELECT s.attr_id, {s_insts} AS insts \
                    FROM (SELECT ai.*, rank() OVER (PARTITION BY ai.attr_id, ai.data ->> 'datasetId' \
                              ORDER BY {order_key} {dir}) AS rk \
                          FROM {rows}{range_and}) s \
                    WHERE s.rk <= ${n_bind}::bigint GROUP BY s.attr_id) g), '{{}}'::jsonb)",
-                s_data = packed("s")
+                s_insts = insts_and_ids("s")
             )
         }
         None => {
@@ -481,11 +491,11 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
             }
             format!(
                 "COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (\
-                   SELECT ai.attr_id, jsonb_agg({ai_data} ORDER BY ai.created_at, ai.observed_at, ai.instance_id) AS insts \
+                   SELECT ai.attr_id, {ai_insts} AS insts \
                    FROM attr_instances ai \
                    WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{range_and} \
                    GROUP BY ai.attr_id) g), '{{}}'::jsonb)",
-                ai_data = packed("ai")
+                ai_insts = insts_and_ids("ai")
             )
         }
     };
@@ -1346,11 +1356,11 @@ impl PgTemporalStore {
         let attrs_row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (
                 SELECT ai.attr_id,
-                       jsonb_agg({} ORDER BY ai.created_at, ai.observed_at, ai.instance_id) AS insts
+                       {} AS insts
                 FROM attr_instances ai
                 WHERE ai.tenant_id = $1 AND ai.entity_id = $2
                 GROUP BY ai.attr_id) g), '{{}}'::jsonb)",
-            packed("ai")
+            insts_and_ids("ai")
         )))
         .bind(tenant.as_str())
         .bind(id)
@@ -1472,16 +1482,22 @@ mod tests {
             serde_json::json!({"type": "Property", "value": 1})
         );
         assert_eq!(rows[0]["instance_id"], "urn:ngsi-ld:Instance:1");
+        // a row written before T-5131 keeps its instanceId in data
         let stored = serde_json::json!({"type": "Property", "value": 2, "instanceId": "urn:ngsi-ld:Instance:2"});
         let mut doc = serde_json::json!({
-            "id": "urn:ngsi-ld:V:1", "type": "V", "scope": ["/a"],
-            speed: [[rows[0]["data"].clone(), "urn:ngsi-ld:Instance:1"], stored.clone(), [1, "x"]]
+            "id": "urn:ngsi-ld:V:1", "type": "V", "scope": ["/a", "/b"],
+            speed: [[rows[0]["data"].clone(), stored.clone()],
+                    ["urn:ngsi-ld:Instance:1", "urn:ngsi-ld:Instance:2"]],
+            "short": [[{"value": 1}], ["x", "y"]],
+            "numbers": [[{"value": 1}], [1]]
         });
         unpack(&mut doc);
         assert_eq!(
             doc,
-            serde_json::json!({"id": "urn:ngsi-ld:V:1", "type": "V", "scope": ["/a"],
-                               speed: [inst, stored, [1, "x"]]})
+            serde_json::json!({"id": "urn:ngsi-ld:V:1", "type": "V", "scope": ["/a", "/b"],
+                               speed: [inst, stored],
+                               "short": [[{"value": 1}], ["x", "y"]],
+                               "numbers": [[{"value": 1}], [1]]})
         );
         let mut scalar = serde_json::json!(1);
         unpack(&mut scalar);
