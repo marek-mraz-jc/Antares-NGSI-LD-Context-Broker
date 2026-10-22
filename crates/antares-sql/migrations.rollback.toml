@@ -88,3 +88,7 @@ note = "index drop; an older release names no index in its statements and plans 
 [0020]
 rollback = "compatible"
 note = "new empty iri_ids, attr_rows and history_cutover (NULL): every history row is still written to attr_instances, which an older release reads"
+
+[0021]
+rollback = "breaking"
+note = "sets history_cutover to the Monday after the migration: a release before 0020 reads only attr_instances and misses every row observed from the cut-over on, so the boot stops at 0021 (a 0020 release would read attr_rows, but the mark cannot tell releases apart); the way back is the pre-release backup"

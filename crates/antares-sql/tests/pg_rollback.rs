@@ -84,29 +84,33 @@ async fn a_newer_compatible_migration_boots_and_a_breaking_one_stops_the_boot() 
     );
 }
 
-/// T-5200: migration 0020 is `compatible` because it leaves the cut-over
-/// unset: until a later release sets it, every history row is written to
-/// `attr_instances`, the only parent the release before 0020 reads, so a
-/// rollback across 0020 loses no row.
+/// T-5200: migration 0020 is `compatible`, because it only adds the empty
+/// keyed parent and leaves the cut-over NULL. T-5243: 0021 sets the cut-over
+/// to a Monday after the migration ran and is `breaking`, because a release
+/// before 0020 reads only `attr_instances` and would miss every row observed
+/// from it on.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_integer_keys_migration_leaves_the_cut_over_unset() {
+async fn the_cut_over_is_a_monday_after_the_migration_and_breaking() {
     let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
         eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
         return;
     };
     let pool = pg::connect(&url, 2).await.expect("connect+migrate");
-    let rows: Vec<Option<String>> = sqlx::query_scalar("SELECT at::text FROM history_cutover")
-        .fetch_all(&pool)
-        .await
-        .expect("cut-over");
-    assert_eq!(rows, vec![None], "one row, no cut-over");
-    let m = pg::MIGRATOR
-        .iter()
-        .find(|m| m.version == 20)
-        .expect("migration 0020");
-    assert!(
-        !m.description.starts_with("breaking "),
-        "0020 must stay compatible: {}",
-        m.description
-    );
+    let rows: Vec<(i32, bool)> = sqlx::query_as(
+        "SELECT extract(isodow FROM at)::int, at > (SELECT installed_on FROM _sqlx_migrations
+                                                     WHERE version = 21)
+           FROM history_cutover",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("cut-over");
+    assert_eq!(rows, vec![(1, true)], "one row: a Monday after 0021 ran");
+    let kind = |v: i64| {
+        pg::MIGRATOR
+            .iter()
+            .find(|m| m.version == v)
+            .map(|m| m.description.starts_with("breaking "))
+    };
+    assert_eq!(kind(20), Some(false), "0020 stays compatible");
+    assert_eq!(kind(21), Some(true), "0021 is breaking");
 }

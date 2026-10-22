@@ -1986,7 +1986,9 @@ impl antares_store::TemporalDriver for AnyStore {
                             .await
                             .map_err(db)?;
                     }
-                    tx.commit().await.map_err(db)
+                    tx.commit().await.map_err(db)?;
+                    p.temporal.forget_tenant(tenant);
+                    Ok(())
                 }
                 .await
             }
