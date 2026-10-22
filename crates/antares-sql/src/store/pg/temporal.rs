@@ -99,6 +99,10 @@ fn decompose(doc: &Value) -> Vec<Value> {
                 // Provenance is a column, never data (T-4665).
                 let mut data = i.clone();
                 let provenance = antares_store::take_provenance(&mut data);
+                // the `instance_id` column holds it (T-5131): ~70 B a row
+                if let Some(o) = data.as_object_mut() {
+                    o.remove("instanceId");
+                }
                 rows.push(serde_json::json!({
                     "attr_id": attr,
                     "instance_id": instance_id,
@@ -114,6 +118,54 @@ fn decompose(doc: &Value) -> Vec<Value> {
         }
     }
     rows
+}
+
+/// One attribute's instances of history rows `alias`, as the reads group
+/// them (T-5131): a row stores its instanceId in the `instance_id` column
+/// only, so an attribute comes back as `[instances, instance ids]` in one
+/// order, which [`unpack`] zips into the instances. A row written before
+/// T-5131 still holds `instanceId` in `data`, equal to the column. Building
+/// each row in SQL instead (`jsonb_build_array` or `||` per row) cost
+/// Postgres 10-35 % more than reading the old documents (240k rows).
+fn insts_and_ids(alias: &str) -> String {
+    let key = format!("{alias}.created_at, {alias}.observed_at, {alias}.instance_id");
+    format!(
+        "jsonb_build_array(jsonb_agg({alias}.data ORDER BY {key}), \
+         to_jsonb(array_agg({alias}.instance_id ORDER BY {key})))"
+    )
+}
+
+/// The whole instance document of row `alias`, built in SQL, where a row is
+/// copied (attr_versions keeps whole documents) or read rarely. The column
+/// equals `data`'s own instanceId on a row written before T-5131.
+fn restamp(alias: &str) -> String {
+    format!("({alias}.data || jsonb_build_object('instanceId', {alias}.instance_id))")
+}
+
+/// Turns each attribute's `[instances, instance ids]` that
+/// [`insts_and_ids`] returned back into its instances.
+fn unpack(doc: &mut Value) {
+    let Some(o) = doc.as_object_mut() else {
+        return;
+    };
+    for attr in o.values_mut() {
+        let Some([insts, ids]) = attr.as_array_mut().map(Vec::as_mut_slice) else {
+            continue;
+        };
+        let (Some(list), Some(ids)) = (insts.as_array_mut(), ids.as_array_mut()) else {
+            continue;
+        };
+        if list.len() != ids.len() || !ids.iter().all(Value::is_string) {
+            continue;
+        }
+        for (inst, id) in list.iter_mut().zip(ids.iter_mut()) {
+            if let Some(i) = inst.as_object_mut() {
+                i.insert("instanceId".to_owned(), id.take());
+            }
+        }
+        let list = insts.take();
+        *attr = list;
+    }
 }
 
 /// `ANTARES_TEMPORAL_DEDUP=off` records a row per write again; anything else,
@@ -266,7 +318,7 @@ async fn insert_rows(
         "INSERT INTO attr_versions
            (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at, version, data, provenance)
          SELECT x.tenant_id, x.entity_id, x.attr_id, x.instance_id, x.dataset_id, x.observed_at,
-                x.version, x.data, x.provenance
+                x.version, {x_data}, x.provenance
          FROM jsonb_array_elements($3::jsonb) AS e
          JOIN attr_instances x ON x.tenant_id = $1 AND x.entity_id = $2
            AND x.attr_id = e->>'attr_id' AND x.observed_at = (e->>'observed_at')::timestamptz
@@ -275,7 +327,8 @@ async fn insert_rows(
                 OR ($4 AND e->'data' ? 'observedAt'
                     AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'))
            AND x.data - {STAMPS} IS DISTINCT FROM (e->'data') - {STAMPS}
-         ON CONFLICT DO NOTHING"
+         ON CONFLICT DO NOTHING",
+        x_data = restamp("x")
     )))
     .bind(tenant.as_str())
     .bind(entity_id)
@@ -289,7 +342,7 @@ async fn insert_rows(
         // Same observedAt, another value: that observation was corrected.
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE attr_instances x
-             SET data = jsonb_set(e->'data', '{{instanceId}}', to_jsonb(x.instance_id)),
+             SET data = (e->'data') - 'instanceId',
                  version = x.version + 1, provenance = {CORRECTED},
                  modified_at = (e->>'modified_at')::timestamptz,
                  deleted_at = (e->>'deleted_at')::timestamptz, geo_value = {GEO_VALUE}
@@ -419,11 +472,12 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
             });
             format!(
                 "COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (\
-                   SELECT s.attr_id, jsonb_agg(s.data ORDER BY s.created_at, s.observed_at, s.instance_id) AS insts \
+                   SELECT s.attr_id, {s_insts} AS insts \
                    FROM (SELECT ai.*, rank() OVER (PARTITION BY ai.attr_id, ai.data ->> 'datasetId' \
                              ORDER BY {order_key} {dir}) AS rk \
                          FROM {rows}{range_and}) s \
-                   WHERE s.rk <= ${n_bind}::bigint GROUP BY s.attr_id) g), '{{}}'::jsonb)"
+                   WHERE s.rk <= ${n_bind}::bigint GROUP BY s.attr_id) g), '{{}}'::jsonb)",
+                s_insts = insts_and_ids("s")
             )
         }
         None => {
@@ -437,10 +491,11 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
             }
             format!(
                 "COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (\
-                   SELECT ai.attr_id, jsonb_agg(ai.data ORDER BY ai.created_at, ai.observed_at, ai.instance_id) AS insts \
+                   SELECT ai.attr_id, {ai_insts} AS insts \
                    FROM attr_instances ai \
                    WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{range_and} \
-                   GROUP BY ai.attr_id) g), '{{}}'::jsonb)"
+                   GROUP BY ai.attr_id) g), '{{}}'::jsonb)",
+                ai_insts = insts_and_ids("ai")
             )
         }
     };
@@ -912,17 +967,18 @@ impl PgTemporalStore {
     ) -> Result<serde_json::Map<String, Value>, sqlx::Error> {
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
-        let rows: Vec<(String, Value)> = sqlx::query_as(
+        let rows: Vec<(String, Value)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT attr_id, data || jsonb_build_object('version', version) || jsonb_strip_nulls( \
                  jsonb_build_object('provenance', provenance, 'supersededAt', \
                    to_char(superseded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))) \
              FROM (SELECT attr_id, observed_at, dataset_id, version, data, provenance, superseded_at \
                      FROM attr_versions WHERE tenant_id = $1 AND entity_id = $2 \
                    UNION ALL \
-                   SELECT attr_id, observed_at, dataset_id, version, data, provenance, NULL \
-                     FROM attr_instances WHERE tenant_id = $1 AND entity_id = $2) v \
+                   SELECT ai.attr_id, ai.observed_at, ai.dataset_id, ai.version, {}, ai.provenance, NULL \
+                     FROM attr_instances ai WHERE ai.tenant_id = $1 AND ai.entity_id = $2) v \
              ORDER BY attr_id, observed_at, dataset_id NULLS FIRST, version",
-        )
+            restamp("ai")
+        )))
         .bind(tenant.as_str())
         .bind(id)
         .fetch_all(&mut *tx)
@@ -1190,6 +1246,7 @@ impl PgTemporalStore {
             tx.commit().await?;
             super::entity::check_ceiling(paged, rows.len(), super::entity::MAX_UNDECIDED_ROWS)?;
             let mut docs: Vec<Value> = rows.into_iter().map(|r| r.get::<Value, _>(0)).collect();
+            docs.iter_mut().for_each(unpack);
             if aggregated {
                 for d in &mut docs {
                     let Some(o) = d.as_object_mut() else { continue };
@@ -1255,7 +1312,11 @@ impl PgTemporalStore {
         }
         let row = qy.fetch_optional(&mut *tx).await?;
         tx.commit().await?;
-        Ok(row.map(|r| r.get::<Value, _>(0)))
+        Ok(row.map(|r| {
+            let mut doc = r.get::<Value, _>(0);
+            unpack(&mut doc);
+            doc
+        }))
     }
 
     pub async fn list(&self, tenant: &TenantId) -> Result<Vec<Value>, sqlx::Error> {
@@ -1292,19 +1353,21 @@ impl PgTemporalStore {
         };
         let meta: Value = row.get(0);
         // reconstruct the full doc inside the same transaction
-        let attrs_row = sqlx::query(
+        let attrs_row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (
                 SELECT ai.attr_id,
-                       jsonb_agg(ai.data ORDER BY ai.created_at, ai.observed_at, ai.instance_id) AS insts
+                       {} AS insts
                 FROM attr_instances ai
                 WHERE ai.tenant_id = $1 AND ai.entity_id = $2
-                GROUP BY ai.attr_id) g), '{}'::jsonb)",
-        )
+                GROUP BY ai.attr_id) g), '{{}}'::jsonb)",
+            insts_and_ids("ai")
+        )))
         .bind(tenant.as_str())
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-        let attrs: Value = attrs_row.get(0);
+        let mut attrs: Value = attrs_row.get(0);
+        unpack(&mut attrs);
         let mut doc = meta;
         if let (Some(d), Some(a)) = (doc.as_object_mut(), attrs.as_object()) {
             for (k, v) in a {
@@ -1346,17 +1409,18 @@ impl PgTemporalStore {
                 if !deletes.is_empty() {
                     // 5.6.15 deletes an instance: its last version is kept,
                     // so a deletion is never without a record (T-4665).
-                    sqlx::query(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "INSERT INTO attr_versions
                            (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at,
                             version, data, provenance)
                          SELECT t.tenant_id, t.entity_id, t.attr_id, t.instance_id, t.dataset_id,
-                                t.observed_at, t.version, t.data, t.provenance
+                                t.observed_at, t.version, {}, t.provenance
                          FROM attr_instances t JOIN jsonb_array_elements($3::jsonb) AS e
                            ON t.attr_id = e->>'a' AND t.instance_id = e->>'i'
                          WHERE t.tenant_id = $1 AND t.entity_id = $2
                          ON CONFLICT DO NOTHING",
-                    )
+                        restamp("t")
+                    )))
                     .bind(tenant.as_str())
                     .bind(id)
                     .bind(Value::Array(deletes.clone()))
@@ -1403,6 +1467,42 @@ impl PgTemporalStore {
 mod tests {
     use super::*;
     use crate::compile::temporal::InstanceRange;
+
+    /// T-5131: a row's instanceId lives in its column; `unpack` puts it back
+    /// and leaves stored instances and meta members alone.
+    #[test]
+    fn instance_id_leaves_data_and_unpack_puts_it_back() {
+        let speed = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+        let inst = serde_json::json!({"type": "Property", "value": 1,
+                                      "instanceId": "urn:ngsi-ld:Instance:1"});
+        let rows = decompose(&serde_json::json!({"id": "urn:ngsi-ld:V:1", speed: [inst.clone()]}));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["data"],
+            serde_json::json!({"type": "Property", "value": 1})
+        );
+        assert_eq!(rows[0]["instance_id"], "urn:ngsi-ld:Instance:1");
+        // a row written before T-5131 keeps its instanceId in data
+        let stored = serde_json::json!({"type": "Property", "value": 2, "instanceId": "urn:ngsi-ld:Instance:2"});
+        let mut doc = serde_json::json!({
+            "id": "urn:ngsi-ld:V:1", "type": "V", "scope": ["/a", "/b"],
+            speed: [[rows[0]["data"].clone(), stored.clone()],
+                    ["urn:ngsi-ld:Instance:1", "urn:ngsi-ld:Instance:2"]],
+            "short": [[{"value": 1}], ["x", "y"]],
+            "numbers": [[{"value": 1}], [1]]
+        });
+        unpack(&mut doc);
+        assert_eq!(
+            doc,
+            serde_json::json!({"id": "urn:ngsi-ld:V:1", "type": "V", "scope": ["/a", "/b"],
+                               speed: [inst, stored],
+                               "short": [[{"value": 1}], ["x", "y"]],
+                               "numbers": [[{"value": 1}], [1]]})
+        );
+        let mut scalar = serde_json::json!(1);
+        unpack(&mut scalar);
+        assert_eq!(scalar, serde_json::json!(1));
+    }
 
     /// T-4669: the dedup of an instance without observedAt reads the newest
     /// stored row through the index and nothing older. A correlated max()
