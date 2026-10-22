@@ -527,6 +527,8 @@ struct Reloader {
     retention: std::sync::RwLock<Arc<retention::Rules>>,
     /// What this pod's sweeps deleted since it started, by Tenant, type and kind.
     deleted: std::sync::Mutex<BTreeMap<(String, String, &'static str), u64>>,
+    /// Which sweep last ran each retention step, for the next one's order.
+    turns: std::sync::Mutex<retention::Turns>,
     /// Every Tenant's `maxAge` quality rules, as the last reload found them.
     quality: std::sync::RwLock<Arc<quality::Rules>>,
     /// The platform's history retention for what no Entity, type or Tenant
@@ -737,6 +739,7 @@ pub(crate) async fn install_with(
         schema_max: schema_max(std::env::var(SCHEMA_MAX_ENV).ok())?,
         retention: std::sync::RwLock::default(),
         deleted: std::sync::Mutex::default(),
+        turns: std::sync::Mutex::default(),
         quality: std::sync::RwLock::default(),
         platform_history,
     });
@@ -1475,6 +1478,7 @@ mod tests {
             schema_max: None,
             retention: std::sync::RwLock::default(),
             deleted: std::sync::Mutex::default(),
+            turns: std::sync::Mutex::default(),
             quality: std::sync::RwLock::default(),
             platform_history: None,
         });
@@ -1495,6 +1499,7 @@ mod tests {
             schema_max: None,
             retention: std::sync::RwLock::default(),
             deleted: std::sync::Mutex::default(),
+            turns: std::sync::Mutex::default(),
             quality: std::sync::RwLock::default(),
             platform_history: None,
         };

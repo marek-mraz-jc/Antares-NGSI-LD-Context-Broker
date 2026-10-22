@@ -40,10 +40,8 @@ const ROUNDS: usize = 50;
 /// How long one sweep of one pod may spend deleting: past it the sweep stops
 /// and the next minute goes on, so a backlog takes at most a quarter of each
 /// minute (T-4084: an 8-hour rule over a 117 GB history held Postgres at its
-/// limit and starved every other query of the broker).
-// ponytail: the rules run in the same order every sweep, so a backlog of
-// the first one delays the next until it drains; rotate the start if a
-// second backlog ever waits on a first.
+/// limit and starved every other query of the broker). The steps a spent
+/// budget left run first in the next sweep ([`Turns`]).
 pub const SWEEP_BUDGET: Duration = Duration::from_secs(15);
 /// The most rows a preview counts per rule and kind, in one statement.
 pub const PREVIEW_CAP: usize = 100_000;
@@ -344,7 +342,7 @@ pub(super) async fn sweep_within(
         dry_run: false,
         entities: true,
     };
-    let out = retain(&r.state, &plan, budget).await;
+    let out = retain(&r.state, &plan, budget, Some(&r.turns)).await;
     let mut totals = r
         .deleted
         .lock()
@@ -605,28 +603,168 @@ fn rest(plan: &Plan<'_>, t: &TenantId, list: &[Rule], except_ids: Vec<String>) -
 
 /// What `plan` deletes, or with `dry_run` would delete, step by step: a dry
 /// run counts at most [`PREVIEW_CAP`] rows per step in one statement; a
-/// delete starts no statement once `budget` has passed since it began.
-async fn retain(state: &AppState, plan: &Plan<'_>, budget: Duration) -> Vec<Deleted> {
-    let mut run = Runner {
-        state,
-        started: std::time::Instant::now(),
-        budget,
-        dry_run: plan.dry_run,
-        out: Vec::new(),
-    };
-    let steps = steps(state, plan).await;
+/// delete starts no statement once `budget` has passed since it began, and
+/// takes its order from `turns` and leaves it for the next sweep.
+async fn retain(
+    state: &AppState,
+    plan: &Plan<'_>,
+    budget: Duration,
+    turns: Option<&std::sync::Mutex<Turns>>,
+) -> Vec<Deleted> {
+    let mut steps = steps(state, plan).await;
     // Partitions every Tenant in them outlived go whole, before the row sweep
     // spends its budget on their rows.
     let floors = floors(plan, &steps);
     if !plan.dry_run && !floors.is_empty() {
         dropped(state.temporal.drop_retained_history(&floors).await);
     }
-    for step in steps {
-        if !run.drain(&step).await {
+    if let Some(t) = turns {
+        t.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .order(&mut steps);
+    }
+    let (out, ran) = run(&steps, budget, plan.dry_run, |step, batch| async move {
+        match step.job.scope() {
+            Ok(scope) => {
+                state
+                    .temporal
+                    .retain_history(&step.tenant, scope, &step.before, batch, plan.dry_run)
+                    .await
+            }
+            Err(type_iri) => {
+                state
+                    .store
+                    .retain_current(&step.tenant, type_iri, &step.before, batch, plan.dry_run)
+                    .await
+            }
+        }
+    })
+    .await;
+    if let Some(t) = turns {
+        t.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ran(&steps, &ran);
+    }
+    out
+}
+
+/// Which sweep of this pod last ran each step (T-5157), so the next one runs
+/// first what waited longest, then the shortest retention: a statement that
+/// times out on one (Tenant, type), or a budget a backlog spent, delays the
+/// others by one minute at most instead of starving them (on dev a timeout on
+/// Bike docks kept a PT5M Vehicle history from ever being swept).
+#[derive(Debug, Default)]
+pub(super) struct Turns {
+    sweep: u64,
+    last: std::collections::HashMap<StepKey, u64>,
+}
+
+/// A step's identity across sweeps: Tenant, label and job.
+type StepKey = (String, String, String);
+
+impl Turns {
+    /// Sort `steps`: those that waited longest first, then the latest cut
+    /// (the shortest retention); the order changes no step's rows, as no two
+    /// steps reach the same row.
+    fn order(&self, steps: &mut [Step]) {
+        steps.sort_by(|a, b| {
+            let waited = |s: &Step| self.last.get(&s.key()).copied().unwrap_or_default();
+            waited(a)
+                .cmp(&waited(b))
+                .then_with(|| b.before.cmp(&a.before))
+        });
+    }
+
+    /// Record which of `steps` this sweep started (`ran` by index) and forget
+    /// steps the rules no longer make.
+    fn ran(&mut self, steps: &[Step], ran: &[usize]) {
+        self.sweep = self.sweep.saturating_add(1);
+        let keys: std::collections::HashSet<StepKey> = steps.iter().map(Step::key).collect();
+        self.last.retain(|k, _| keys.contains(k));
+        for s in ran.iter().filter_map(|&i| steps.get(i)) {
+            self.last.insert(s.key(), self.sweep);
+        }
+    }
+}
+
+impl Step {
+    fn key(&self) -> StepKey {
+        let job = match &self.job {
+            Job::Current(_) => "current".to_owned(),
+            Job::Entity(id) => id.clone(),
+            Job::Type { .. } | Job::Rest { .. } => "history".to_owned(),
+        };
+        (self.tenant.as_str().to_owned(), self.label.clone(), job)
+    }
+}
+
+/// Run `steps` in order, each in rounds of `delete` until a short batch, an
+/// error (logged; the next step goes on) or the spent `budget`; what each
+/// deleted under its label, and the index of every step it started.
+async fn run<'s, F, Fut>(
+    steps: &'s [Step],
+    budget: Duration,
+    dry_run: bool,
+    mut delete: F,
+) -> (Vec<Deleted>, Vec<usize>)
+where
+    F: FnMut(&'s Step, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<u64, antares_model::NgsiError>>,
+{
+    let started = std::time::Instant::now();
+    let (batch, rounds) = if dry_run {
+        (PREVIEW_CAP, 1)
+    } else {
+        (BATCH, ROUNDS)
+    };
+    let (mut out, mut ran) = (Vec::new(), Vec::new());
+    for (i, step) in steps.iter().enumerate() {
+        let (tenant, label) = (step.tenant.as_str(), step.label.as_str());
+        let kind = if step.job.scope().is_ok() {
+            "history"
+        } else {
+            "entity"
+        };
+        let mut count = 0u64;
+        let mut spent = false;
+        for round in 0..rounds {
+            if !dry_run && started.elapsed() >= budget {
+                spent = true;
+                break;
+            }
+            if round == 0 {
+                ran.push(i);
+            }
+            match delete(step, batch).await {
+                Ok(n) => {
+                    count = count.saturating_add(n);
+                    if n < batch as u64 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(tenant, r#type = label, kind, error = %e, "retention sweep failed");
+                    break;
+                }
+            }
+        }
+        if count > 0 {
+            out.push(Deleted {
+                tenant: tenant.to_owned(),
+                type_iri: label.to_owned(),
+                kind,
+                count,
+            });
+        }
+        if spent {
+            tracing::info!(
+                budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                "retention sweep budget spent; the next sweep goes on"
+            );
             break;
         }
     }
-    run.out
+    (out, ran)
 }
 
 /// The floor of every Tenant whose whole history `steps` reach (T-4906): the
@@ -673,80 +811,6 @@ fn dropped(result: Result<Vec<String>, antares_model::NgsiError>) {
         Err(e) => {
             tracing::warn!(error = %e, "retention: partitions not dropped; the row sweep goes on");
         }
-    }
-}
-
-/// The rounds of one sweep, against its budget.
-struct Runner<'a> {
-    state: &'a AppState,
-    started: std::time::Instant,
-    budget: Duration,
-    dry_run: bool,
-    out: Vec<Deleted>,
-}
-
-impl Runner<'_> {
-    /// Run `step` in rounds until a short batch, and record what it deleted
-    /// under its label; `false` once the budget is spent.
-    async fn drain(&mut self, step: &Step) -> bool {
-        let (batch, rounds) = if self.dry_run {
-            (PREVIEW_CAP, 1)
-        } else {
-            (BATCH, ROUNDS)
-        };
-        let (t, label, before) = (&step.tenant, step.label.as_str(), step.before.as_str());
-        let tenant = t.as_str();
-        let scope = step.job.scope();
-        let kind = if scope.is_ok() { "history" } else { "entity" };
-        let mut count = 0u64;
-        let mut spent = false;
-        for _ in 0..rounds {
-            if !self.dry_run && self.started.elapsed() >= self.budget {
-                spent = true;
-                break;
-            }
-            let n = match scope {
-                Ok(scope) => {
-                    self.state
-                        .temporal
-                        .retain_history(t, scope, before, batch, self.dry_run)
-                        .await
-                }
-                Err(type_iri) => {
-                    self.state
-                        .store
-                        .retain_current(t, type_iri, before, batch, self.dry_run)
-                        .await
-                }
-            };
-            match n {
-                Ok(n) => {
-                    count = count.saturating_add(n);
-                    if n < batch as u64 {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(tenant, r#type = label, kind, error = %e, "retention sweep failed");
-                    break;
-                }
-            }
-        }
-        if count > 0 {
-            self.out.push(Deleted {
-                tenant: tenant.to_owned(),
-                type_iri: label.to_owned(),
-                kind,
-                count,
-            });
-        }
-        if spent {
-            tracing::info!(
-                budget_ms = u64::try_from(self.budget.as_millis()).unwrap_or(u64::MAX),
-                "retention sweep budget spent; the next sweep goes on"
-            );
-        }
-        !spent
     }
 }
 
@@ -800,7 +864,7 @@ async fn preview(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Respon
         dry_run: true,
         entities: false,
     };
-    let found = retain(&r.state, &plan, SWEEP_BUDGET).await;
+    let found = retain(&r.state, &plan, SWEEP_BUDGET, None).await;
     Ok(counts(
         found.into_iter().map(|d| (d.type_iri, d.kind, d.count)),
     ))
@@ -1176,5 +1240,82 @@ mod tests {
             let err = parse(bad).expect_err("refused");
             assert!(err.contains(says), "{err}");
         }
+    }
+
+    fn history_step(tenant: &str, ty: &str, before: &str) -> Step {
+        Step {
+            tenant: TenantId::new(tenant).expect("tenant"),
+            label: ty.to_owned(),
+            job: Job::Type {
+                type_iri: ty.to_owned(),
+                except_ids: Vec::new(),
+            },
+            before: before.to_owned(),
+        }
+    }
+
+    /// T-5157: a statement that times out on the first (Tenant, type) is
+    /// logged and the other two are still swept in the same run, the second
+    /// past one batch.
+    #[tokio::test]
+    async fn a_step_that_times_out_leaves_the_others_swept_in_the_same_run() {
+        let steps = [
+            history_step("helsinki", "Dock", "2026-09-21T00:00:00.000Z"),
+            history_step("helsinki", "Vehicle", "2026-10-21T22:55:00.000Z"),
+            history_step("praha", "Bin", "2026-09-21T00:00:00.000Z"),
+        ];
+        let left = std::sync::Mutex::new(BATCH.saturating_mul(2).saturating_add(7));
+        let (out, ran) = run(&steps, SWEEP_BUDGET, false, |step, batch| {
+            let slow = step.label == "Dock";
+            let n = if step.label == "Vehicle" {
+                let mut left = left.lock().expect("rows");
+                let n = batch.min(*left);
+                *left = left.saturating_sub(n);
+                n
+            } else {
+                3
+            };
+            async move {
+                if slow {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    return Err(antares_model::NgsiError::InternalError(
+                        "statement timeout".into(),
+                    ));
+                }
+                Ok(n as u64)
+            }
+        })
+        .await;
+        let swept: Vec<(&str, u64)> = out.iter().map(|d| (d.type_iri.as_str(), d.count)).collect();
+        assert_eq!(swept, [("Vehicle", 2007), ("Bin", 3)]);
+        assert_eq!(ran, [0, 1, 2]);
+    }
+
+    /// T-5157: the shortest retention runs first; what a spent budget left
+    /// runs first in the next sweep; a step the rules dropped is forgotten.
+    #[test]
+    fn the_steps_that_waited_run_first_then_the_shortest_retention() {
+        let names = |steps: &[Step]| steps.iter().map(|s| s.label.clone()).collect::<Vec<_>>();
+        let mut turns = Turns::default();
+        let mut steps = vec![
+            history_step("helsinki", "Dock", "2026-09-21T00:00:00.000Z"),
+            history_step("praha", "Bin", "2026-10-14T00:00:00.000Z"),
+            history_step("helsinki", "Vehicle", "2026-10-21T22:55:00.000Z"),
+        ];
+        turns.order(&mut steps);
+        assert_eq!(names(&steps), ["Vehicle", "Bin", "Dock"]);
+        turns.ran(&steps, &[0]);
+        turns.order(&mut steps);
+        assert_eq!(
+            names(&steps),
+            ["Bin", "Dock", "Vehicle"],
+            "the budget left two"
+        );
+        turns.ran(&steps, &[0, 1, 2]);
+        turns.order(&mut steps);
+        assert_eq!(names(&steps), ["Vehicle", "Bin", "Dock"]);
+        steps.retain(|s| s.label != "Dock");
+        turns.ran(&steps, &[]);
+        assert_eq!(turns.last.len(), 2);
     }
 }

@@ -313,6 +313,12 @@ jobs:
         run: |
           python3 dev/check-module-rules.py --self-test
           python3 dev/check-module-rules.py
+      # Every migration states what a rollback of its release does (T-5105,
+      # docs/src/operations.md); the self-test plants each violation once.
+      - name: Migration rollback manifest
+        run: |
+          python3 dev/check-migrations.py --self-test
+          python3 dev/check-migrations.py
       # A new read-only surface is one command (T-5063, docs/src/new-surface.md):
       # the template is generated into a scratch worktree and must build, pass
       # its own tests (the Policy deny test among them), lint clean and keep

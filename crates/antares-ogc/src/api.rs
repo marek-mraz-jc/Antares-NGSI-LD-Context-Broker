@@ -201,6 +201,55 @@ fn collection_paths(
     }
     paths.insert(format!("{at}/items"), Value::Object(items));
     paths.insert(format!("{at}/items/{{featureId}}"), Value::Object(item));
+    if c.geometry.is_some() {
+        tile_paths(paths, &at, &c.id);
+    }
+}
+
+/// A collection's tilesets, its tileset and its tiles (Tiles Part 1 `/req/oas30`), each `operationId` ending in its Table 11 name.
+fn tile_paths(paths: &mut Map<String, Value>, at: &str, id: &str) {
+    let tms = crate::tiles::TMS;
+    paths.insert(
+        format!("{at}/tiles"),
+        get(
+            &format!("{id}.collection.vector.getTileSetsList"),
+            "the vector tilesets",
+            "application/json",
+            &[],
+        ),
+    );
+    paths.insert(
+        format!("{at}/tiles/{tms}"),
+        get(
+            &format!("{id}.collection.vector.getTileSet"),
+            "the tileset",
+            "application/json",
+            &[],
+        ),
+    );
+    let index = |name: &str| json!({"name": name, "in": "path", "required": true, "schema": {"type": "integer", "minimum": 0}});
+    let mut responses = refusals();
+    for (code, text) in [
+        ("204", "no Feature reaches the tile"),
+        ("304", "the tile the client holds by its ETag"),
+        ("413", "the tile is above 4 MiB: ask a deeper tile matrix"),
+    ] {
+        responses.insert(code.into(), json!({"description": text}));
+    }
+    responses.insert(
+        "200".into(),
+        json!({"description": "one Mapbox Vector Tile", "content": {crate::tiles::MVT: {"schema": {"type": "string", "format": "binary"}}}}),
+    );
+    let tile = json!({"get": {
+        "operationId": format!("{id}.collection.vector.getTile"),
+        "summary": "one Mapbox Vector Tile",
+        "parameters": [index("tileMatrix"), index("tileRow"), index("tileCol")],
+        "responses": responses,
+    }});
+    paths.insert(
+        format!("{at}/tiles/{tms}/{{tileMatrix}}/{{tileRow}}/{{tileCol}}"),
+        tile,
+    );
 }
 
 /// The document for the endpoint at `base` serving `collections`, with the writes the view
@@ -273,6 +322,24 @@ pub(crate) fn document(
         json!({"$ref": "#/components/parameters/profile"}),
         json!({"$ref": "#/components/parameters/crs"}),
     ];
+    paths.insert(
+        "/tileMatrixSets".into(),
+        get(
+            "getTileMatrixSetsList",
+            "the tile matrix sets",
+            "application/json",
+            &[],
+        ),
+    );
+    paths.insert(
+        format!("/tileMatrixSets/{}", crate::tiles::TMS),
+        get(
+            "getTileMatrixSet",
+            "the WebMercatorQuad definition",
+            "application/json",
+            &[],
+        ),
+    );
     for c in collections.values() {
         collection_paths(&mut paths, c, offers, (&items_params, &feature_id));
     }
@@ -332,7 +399,9 @@ mod tests {
                 "/collections/Car/schema",
                 "/collections/Car/sortables",
                 "/conformance",
-                "/functions"
+                "/functions",
+                "/tileMatrixSets",
+                "/tileMatrixSets/WebMercatorQuad"
             ]
         );
         for (_, op) in doc

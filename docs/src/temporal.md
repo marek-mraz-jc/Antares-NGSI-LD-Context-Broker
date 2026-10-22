@@ -58,7 +58,10 @@ default), it replaces the current value as NGSI-LD says.
 A type's retention rule may record history `onChange` instead of every
 write ([Retention](admin-api.md#retention)): a row only when the value
 moves past its `deadband` (numbers) or `minDistance` (metres, GeoProperty),
-when a value of the same instant is corrected, and once per `heartbeat`;
+when a value of the same instant is corrected, and once per `heartbeat`.
+A value older than the last row (a retried batch, a replay) is judged the
+same way against the nearest row below it, so it records one row per
+heartbeat too (T-5157);
 or `observed`: a row only for a newer `observedAt`; or `never`. With
 `ANTARES_TEMPORAL_RECORD=ruled` a type records nothing until a retention
 rule gives it a history duration, and then `observed` unless the rule names

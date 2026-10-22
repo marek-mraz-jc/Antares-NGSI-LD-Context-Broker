@@ -43,14 +43,7 @@ impl ApiSurface for Admin {
         let [health_p, ready_p, metrics_p, tenants_p, tenant_p, digest_p, export_p, import_p, dl_p, dl_id_p, replay_p] =
             Self::PATHS;
         let guard = axum::middleware::from_fn_with_state(st.clone(), admin_auth::require);
-        // Prometheus text format. 404 until the broker installs the
-        // renderer — the api crate never depends on an exporter.
-        let metrics = Router::new().route(metrics_p, get(metrics_endpoint));
-        let metrics = if st.admin_auth.as_ref().is_some_and(|a| !a.metrics_open) {
-            metrics.route_layer(guard.clone())
-        } else {
-            metrics
-        };
+        let metrics = Self::metrics_routes(&st, metrics_p);
         let routes = Router::new()
             .route(tenants_p, get(tenants_list))
             .route(tenant_p, get(tenant_get).delete(tenant_purge))
@@ -78,6 +71,35 @@ impl ApiSurface for Admin {
 
     fn version_info(&self) -> serde_json::Value {
         serde_json::json!({"routes": Self::PATHS.len()})
+    }
+}
+
+impl Admin {
+    /// `/q/metrics` alone, under the credential rule of the rest of the
+    /// surface: the admin router mounts it, and so does the metrics listener
+    /// (`metrics_router`, T-5095). Prometheus text format; 404 until the
+    /// broker installs the renderer, the api crate never depends on an
+    /// exporter.
+    fn metrics_routes(st: &AppState, path: &str) -> Router<AppState> {
+        let metrics = Router::new().route(path, get(metrics_endpoint));
+        if st.admin_auth.as_ref().is_some_and(|a| !a.metrics_open) {
+            metrics.route_layer(axum::middleware::from_fn_with_state(
+                st.clone(),
+                admin_auth::require,
+            ))
+        } else {
+            metrics
+        }
+    }
+
+    /// The metrics listener's whole surface (ANTARES_METRICS_PORT, T-5095):
+    /// `/q/metrics` and nothing else, so a NetworkPolicy that opens that
+    /// port to a scraper opens no API or admin path.
+    pub fn metrics_router(state: AppState) -> Router {
+        let [_, _, metrics_p, ..] = Self::PATHS;
+        Router::new()
+            .nest(Admin.prefix(), Self::metrics_routes(&state, metrics_p))
+            .with_state(state)
     }
 }
 

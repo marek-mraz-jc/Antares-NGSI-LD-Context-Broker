@@ -109,6 +109,21 @@ Residual rows answer 501 `NotImplemented` naming the operator until the T-3748 e
 | S6 | `properties` parameter (Part 6 draft, property selection) | `pick` (with `id`, `type` and the geometry always kept) | mapped; a hidden name is 400 like an unknown one; empty keeps no property | `ogc/schemas::properties_pushed_to_pick` | T-3754 |
 | S7 | `feature-references`, `profile-parameter`, `profiles-for-feature-references` (`rel-as-key`, `rel-as-uri`, `rel-as-link`) | none; a Relationship's `object` rendered per profile, `rel-as-link` pointing at `/collections/{T}/items/{urn}` only for a target type the view shows | mapped; `rel-as-key` default; the target collection is the class the slot's range names (never read from the URN, ADR-N-041); `profile` accepts the id, `[ogc-profile:id]` and the `http://www.opengis.net/def/profile/OGC/0/` URI in any case; a response of a collection with references carries a `profile` link | `ogc/schemas::relationship_profiles` | T-3754 |
 
+### OGC API - Tiles Part 1: vector tiles (T-5121)
+
+Each collection with a primary geometry serves one vector tileset in `WebMercatorQuad` (OGC 20-057, tile matrix sets of OGC 17-083r4). A tile is the `items` page of the tile's box, so it is read by the same Query Entities as a page.
+
+| Row | Tiles requirement class | NGSI-LD equivalent | Status | Test | Task |
+|---|---|---|---|---|---|
+| T1 | `core`: `/collections/{c}/tiles/WebMercatorQuad/{tileMatrix}/{tileRow}/{tileCol}` | Query Entities by type with the tile's box plus 64 tile units of buffer as `geoQ` `intersects`, through `ViewOps::scan` | mapped; matrices 0 to 22, a row, column or matrix outside them is 404; any query parameter 400; no Feature in the tile 204; `ETag` (the tile's digest) with `Cache-Control: private, max-age=60`, `If-None-Match` 304 | `ogc/tiles::a_tile_outside_the_set_or_the_caps_is_refused`, `ogc/tiles::a_tile_is_revalidated_by_its_etag` | T-5121 |
+| T2 | `mvt`: Mapbox Vector Tile 2.1, `application/vnd.mapbox-vector-tile` | the Feature as `items` writes it | mapped; one layer named by the collection, extent 4096; the URN is the tag `id`, each shown property a tag (an array or object its JSON text, a null none); lines and rings clipped to the buffered tile, exterior rings clockwise in tile units; a `GeometryCollection` is left out | `tiles::tests` (`antares-ogc` lib), `ogc/tiles::a_tile_keeps_the_shown_attributes_and_never_a_hidden_one` | T-5121 |
+| T3 | `tileset`, `tilesets-list`, `geodata-tilesets` | none | mapped; `/collections/{c}/tiles` lists the tileset, the collection links it as `tilesets-vector`; a collection without geometry has no `tiles` path (404) | `ogc/tiles::the_tileset_names_its_matrix_set_and_its_tile_template` | T-5121 |
+| T4 | TMS 2.0 `tilematrixset`, `json-tilematrixset` | none | mapped; `/tileMatrixSets` and `/tileMatrixSets/WebMercatorQuad` (matrices 0 to 24 as Annex D.1 defines them) | same | T-5121 |
+| T5 | `oas30` | none | mapped; `/api` lists the tile paths of each collection with geometry | same | T-5121 |
+| T6 | size caps | the scan budget | mapped; a tile holds at most 10 000 Features (the first in the store's order; the header `Antares-Tile-Truncated: 10000` says so) and at most 4 MiB, above it 413 | `tiles::tests` | T-5121 |
+
+Decided (worker-t5121, owner may override): the tile is encoded in the surface from the view's scan, not by `ST_AsMVT`, because a surface reaches the store only through Ops (ADR-0027), the view's residual and the Policy run there, and the memory store has no PostGIS. A store-side `ST_AsMVT` pushdown in Ops is the upgrade path once a tile's scan dominates its p95.
+
 ## 7. Security
 
 - The surface never serves more than the view answers. Collections, queryables, sortables and schemas come from `shown_names()` and the LinkML intersected with it, never from the store; Features, counts and links come from `ViewOps::run` as the caller. A hidden collection, Feature or property is a 404 or 400 identical to an absent or misspelled one.
@@ -116,9 +131,11 @@ Residual rows answer 501 `NotImplemented` naming the operator until the T-3748 e
 - The `next` token holds offsets and a hash of the normalised query and view id; the server re-runs the query as the caller, so a forged token reaches nothing the caller could not query directly.
 - A CQL2 filter is ANDed with the view's predicate inside the operation, so it only narrows. Parse depth and size are bounded (F17), the residual is budget-bounded (ADR-0028: 10 000 upstream Entities per request, beyond it 400 `TooManyResults` where an exact answer is required, never a partial answer).
 - Writes reach the store only through `ViewOps::run` and the Policy (W1 to W7). No route serves a write the view does not offer.
+- A vector tile is an `items` page (T1): the view's rules, its `q` and the Policy narrow it, a hidden Attribute is never a tag, and a caller the Policy gives no read gets 403 for every tile. Tiles are `Cache-Control: private`, since two callers may read different tiles at one URL.
 
 ## 8. Unknowns
 
 - Part 4 and Part 5 are drafts (20-002r1, 23-058r1); their requirement ids may change before publication. The slices cite the draft ids and T-3747's ETS run shows what the published test suite checks.
 - Whether `antares-ql` accepts `!attr` combined with a type query on every backend (C12, C14): T-3744's first test proves it on memory and Postgres.
+- Whether the CITE ETS for OGC API - Tiles (`ets-ogcapi-tiles10`) accepts a tileset at collection level only (no dataset tileset); T-5121's CI run decides.
 - Whether the CITE ETS for Part 3 is published as a teamengine image (T-3747 decides from the registry).
