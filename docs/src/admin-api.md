@@ -19,7 +19,9 @@ route except `GET /q/health` and `GET /q/ready` answers `401` with
 `urn:antares:error:Unauthorized` unless the request carries
 `Authorization: Bearer <secret>`; the comparison does not stop at the first
 differing byte. `GET /q/metrics` is guarded too unless
-`ANTARES_ADMIN_METRICS=open`, for a scraper that cannot send a header. The
+`ANTARES_ADMIN_METRICS=open`, for a scraper that cannot send a header.
+`ANTARES_METRICS_PORT` moves `GET /q/metrics` to a listener of its own that
+serves nothing else, so the scraper needs no path to the API port. The
 broker reads the file once at start, refuses to start when it is unreadable
 or too short, and never logs the secret. Unset, `/q/` asks for nothing and
 the broker logs one warning at start saying so.
