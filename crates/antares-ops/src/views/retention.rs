@@ -41,7 +41,7 @@ const ROUNDS: usize = 50;
 /// and the next minute goes on, so a backlog takes at most a quarter of each
 /// minute (T-4084: an 8-hour rule over a 117 GB history held Postgres at its
 /// limit and starved every other query of the broker). The steps a spent
-/// budget left run first in the next sweep ([`Turns`]).
+/// budget left run first in the next sweep (`Turns`).
 pub const SWEEP_BUDGET: Duration = Duration::from_secs(15);
 /// The most rows a preview counts per rule and kind, in one statement.
 pub const PREVIEW_CAP: usize = 100_000;
