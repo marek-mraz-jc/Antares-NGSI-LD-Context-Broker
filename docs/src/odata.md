@@ -56,6 +56,26 @@ intersected with what the view shows:
   `"false"` takes that write from its set (`405`), never adding one the
   view's `operations` lack.
 
+Each slot maps by its NGSI-LD kind (T-5206). A slot whose range is a class
+without `inlined: true` is a Relationship: every class of a DM-05 model is an
+Entity type whose identifier is the NGSI-LD `id`, so LinkML's rule (a class
+without an `identifier` slot is inlined) is not applied; mark an embedded
+object `inlined: true`. A Property holding such an object, a JsonProperty and
+an untyped value are `Edm.Untyped`. A GeoProperty is `Edm.Geography`; the
+concrete `Edm.GeographyPoint` and the other subtypes are not built. A slot
+named like a base member (`_types`, `scope`, `createdAt`, `modifiedAt`, or
+`id` without `identifier: true`) is served with its first character escaped
+(`_x0073_cope`); an `identifier: true` slot named `id` is the NGSI-LD `id`
+itself. A slot name over 128 characters has no member and is dropped without
+a metric. An identifier key `v` names `urn:ngsi-ld:{Class}:{v}` only: the
+platform mints `urn:ngsi-ld:{Class}:{space}:…`, so on its Endpoints use
+`(id='urn:…')`.
+
+Under OData 4.0 (no `OData-MaxVersion: 4.01`, as Power BI and Excel send) a
+type with an `Edm.Untyped` member is `OpenType="true"` and declares no such
+property: the member is read, selected and filtered as a dynamic property
+(CSDL XML 3.4, URL 5.1.3).
+
 A view without a schema, or with one the build cannot read, has no OData
 endpoint (`404`). Nothing the view hides appears in a document, a name or
 an error: a hidden type or Attribute and an unknown one answer alike.
@@ -95,7 +115,21 @@ root.
 | `$expand` | `join=inline&joinLevel=1` (section 5) |
 | `$top`, `$skip`, `Prefer: odata.maxpagesize` | `limit`, `offset`; a page is at most 1000, 100 by default |
 | `$count=true` | `@odata.count` from `NGSILD-Results-Count`, or counted by the surface (section 4) |
-| `ngsild.q`, `ngsild.scopeQ`, `ngsild.georel`, `ngsild.geometry`, `ngsild.coordinates`, `ngsild.geoproperty`, `ngsild.pick`, `ngsild.omit` | the NGSI-LD parameter of that name, ANDed into the query of a `{Set}` or `{Set}/$count` (section 4) |
+| `ngsild.lang`, `ngsild.q`, `ngsild.scopeQ`, `ngsild.georel`, `ngsild.geometry`, `ngsild.coordinates`, `ngsild.geoproperty`, `ngsild.pick`, `ngsild.omit` | the NGSI-LD parameter of that name, ANDed into the query of a `{Set}` or `{Set}/$count` (section 4) |
+
+Only the default instance of an Attribute, the one without a `datasetId`
+(TS 104 175 5.2.6.4.1), is the member's value; an Attribute that holds named
+instances only reads `null`, and the named instances are not served. A
+LanguageProperty reads as its `@none` text, or in the language of
+`ngsild.lang` (one BCP 47 tag; the broker's `lang`), and `$filter` compares
+the same text. A stored value the member cannot hold reads `null`, never cut
+or converted: an array under a single-valued member, an instance of another
+kind than the model names, a LanguageProperty without the text asked for.
+The member then carries the instance annotation
+`<member>@Antares.NgsiLd.Unserved` with the reason. Under
+`Prefer: odata.include-annotations="Antares.NgsiLd.*"` (or `*`) each member
+carries its instance's `observedAt` and `unitCode` as
+`<member>@Antares.NgsiLd.observedAt` and `<member>@Antares.NgsiLd.unitCode`.
 
 Below one Entity only `$select` applies; another option there is `501`. A
 hidden or absent property or single target is `404`, a hidden target of a
@@ -125,7 +159,7 @@ Attribute comes from the model, never from the shape of a value.
 | `POST {Set}` | Create Entity of the set's type, `id` from the body; `201` with the Entity as the view reads it and `Location`, or `204` and `OData-EntityId` under `Prefer: return=minimal` |
 | `nav@odata.bind` (4.0), `nav: {"@id": …}` (4.01) | a Relationship; the target is read first with Retrieve Entity under the view |
 | `PATCH {Set}('{id}')` | Merge Entity `?type=`: a `null` is the NGSI-LD Null and deletes the Attribute; `204` |
-| `PUT {Set}('{id}')` | Replace Entity `?type=`: what the body omits is removed; `204` |
+| `PUT {Set}('{id}')` | Replace Entity `?type=`: what the body omits is removed; `204`. The Entity is read under the view first: one holding an Attribute instance with a `datasetId` is `409` (the surface does not serve those instances, so a replace would delete them unseen; `PATCH` keeps them), and one holding an Attribute the view hides is refused by the view (threat-model D6) (T-5206) |
 | `DELETE {Set}('{id}')` | Delete Entity `?type=`; `204` |
 | `PUT {Set}('{id}')/{prop}` | Replace Attribute `?type=` in the member's kind; `404` when the Entity does not hold it (a `PATCH` of the Entity adds it); `204` |
 | `PATCH {Set}('{id}')/{prop}` | Partial Attribute Update `?type=`; `null` is the NGSI-LD Null; `204` |
@@ -280,6 +314,22 @@ inside a literal; a `$format` media type is read percent-decoded
 (`application%2Fjson%3Bodata.metadata%3Dnone`, T-3742); a write method where it has no meaning (`/`, `$metadata`,
 `$count`, a `POST` to one Entity, a `DELETE` of a set) is `405`, and the
 write forms of later rounds are `501`.
+
+These NGSI-LD features have no OData mapping and are not served (T-5206 finding 16):
+
+- temporal representations and history: the surface reads current state only; a later
+  `{Set}('id')/<prop>/history` bound function would need its own operation row;
+- `deletedAt`, `expiresAt` and `ngsildproof`: system and proof members outside the EDM base type;
+- the full LanguageMap: one text per read (`ngsild.lang` or `@none`); writing a LanguageProperty is `400`;
+- named instances (`datasetId`): only the default instance; no `_datasets` member;
+- adding or removing one ListRelationship object through `$ref`: `501`;
+- `$deltatoken` and change tracking: `501`;
+- `scope` and complex paths (`address/addressLocality`) in `$filter`: `400`;
+- sub-properties of a Property (Property of Property): dropped;
+- `objectType` of a Relationship: not read; a Relationship to a type the view hides is an URL string.
+
+A change of the view's `@context` renames no member (names come from the slot names); a change
+of the schema can, and `@odata.metadataEtag` is then the only signal.
 
 An error is `{"error": {"code", "message"}}` with a fixed message: it
 names no hidden type or Attribute, echoes no literal of the request and

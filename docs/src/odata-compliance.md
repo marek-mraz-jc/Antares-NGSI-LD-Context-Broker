@@ -132,6 +132,12 @@ references), T-3737 (one `Content-Length` on `HEAD`), T-3738 (`$entity`
 
 Measured by surfaces-conformance 39733975692 on `cf3b670` (train 20261022-0621), written by tasks/train.
 
+`$metadata` declares `Capabilities.ConformanceLevel` `Minimal` (row C19). The table above is
+the measured level: the claim is not proven while Minimal stays under 100 %, and each failing
+Minimal test is a known gap listed in `ci/odata-compliance-baseline.json` (T-5206 finding 17).
+T-5206 fixed the 4.01 MUST that system query option names are case-insensitive with an
+optional `$` for `$apply` (`apply=`, `$APPLY=`); the next train run rewrites the table.
+
 One earlier pass was a skip after train 8, by the suite's own rule: `POST with
 nonexistent foreign key` posts a `ProductDescription` whose `ProductID` names
 no `Product` and skips on 201, since referential constraints are a SHOULD
