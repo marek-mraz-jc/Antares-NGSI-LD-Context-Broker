@@ -294,3 +294,46 @@ async fn a_file_past_the_answer_ceiling_is_refused_whole() -> Outcome {
     }
     Ok(())
 }
+
+/// T-5100: a bundle without `collections` holds the current state only; a `{type}-history`
+/// reads the type's whole history and joins the bundle only when named.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_history_joins_a_bundle_only_when_named() -> Outcome {
+    let f = crate::history::past(crate::history::fresh().await?).await?;
+    let all = "/x/views/past/ogc/features/collections";
+    let (status, _, bytes) = raw(&f, &format!("{all}?f=zip"), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let names = members(&bytes)?;
+    assert!(
+        names.contains(&"Car.csv".to_owned()) && !names.iter().any(|n| n.contains("-history")),
+        "{names:?}"
+    );
+    let (status, _, bytes) = raw(&f, &format!("{all}?f=zip&collections=Car-history"), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let names = members(&bytes)?;
+    assert!(
+        names.contains(&"Car-history.csv".to_owned()) && !names.contains(&"Car.csv".to_owned()),
+        "{names:?}"
+    );
+    assert_eq!(
+        csv_ids(&member(&bytes, "Car-history.csv")?),
+        [
+            "urn:ngsi-ld:Car:1@2026-10-01T10:00:00Z",
+            "urn:ngsi-ld:Car:1@2026-10-01T10:05:00Z",
+            "urn:ngsi-ld:Car:1@2026-10-01T10:10:00Z",
+            "urn:ngsi-ld:Car:2@2026-10-01T10:05:00Z",
+            "urn:ngsi-ld:Car:4@2026-10-01T10:00:00Z"
+        ]
+    );
+    Ok(())
+}

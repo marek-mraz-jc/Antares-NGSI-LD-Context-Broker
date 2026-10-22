@@ -126,7 +126,7 @@ fn properties(c: &Collection, text: &str) -> Option<Vec<String>> {
         .collect()
 }
 
-fn bad(detail: &'static str) -> Problem {
+pub(crate) fn bad(detail: &'static str) -> Problem {
     Problem(StatusCode::BAD_REQUEST, detail)
 }
 
@@ -537,11 +537,11 @@ pub(crate) fn digest(view: &str, collection: &str, pairs: &[(String, String)]) -
     hasher.finish()
 }
 
-fn token(part: usize, offset: usize, digest: u64) -> String {
+pub(crate) fn token(part: usize, offset: usize, digest: u64) -> String {
     format!("{part}.{offset}.{digest:016x}")
 }
 
-fn read_token(text: &str, digest: u64, parts: usize) -> Option<(usize, usize)> {
+pub(crate) fn read_token(text: &str, digest: u64, parts: usize) -> Option<(usize, usize)> {
     let mut it = text.split('.');
     let (Some(part), Some(offset), Some(tag), None) = (it.next(), it.next(), it.next(), it.next())
     else {
@@ -572,6 +572,9 @@ pub(crate) async fn page(
     digest: u64,
     refs: Refs<'_>,
 ) -> Result<Page, Problem> {
+    if c.history {
+        return crate::history::page(view, caller, c, p, digest, refs).await;
+    }
     let terms = Terms::of(c);
     // One geoQ per request (4.10): the filter's spatial conjunct is pushed only when neither
     // `bbox` nor an `ngsild.geo*` option holds it.
@@ -671,7 +674,7 @@ pub(crate) async fn page(
 
 /// Why the residual refused the filter: too large (400), a construct it does not read with the
 /// standard's meaning (501), or one no filter of this collection can be (400).
-fn refused(e: &residual::Error) -> Problem {
+pub(crate) fn refused(e: &residual::Error) -> Problem {
     match e {
         residual::Error::TooComplex => bad(antares_ops::TOO_COMPLEX),
         residual::Error::Unsupported(_) => Problem(
@@ -683,7 +686,7 @@ fn refused(e: &residual::Error) -> Problem {
 }
 
 /// The time a residual's `now()` reads.
-fn now() -> Option<residual::DateTime> {
+pub(crate) fn now() -> Option<residual::DateTime> {
     let micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
@@ -721,18 +724,7 @@ fn scanned(answer: Result<Scanned, Refusal>) -> Result<Read, Problem> {
 /// Attribute its value, an Attribute of several instances the `dataset` map by `datasetId`
 /// (`@none` for the default one), as the broker writes it.
 fn simplified(mut doc: Value) -> Value {
-    let one = |attr: &Value| match attr {
-        Value::Object(m) => ["value", "object", "valueList", "objectList"]
-            .into_iter()
-            .find_map(|k| m.get(k).cloned())
-            .or_else(|| {
-                ["languageMap", "json", "vocab"]
-                    .into_iter()
-                    .find_map(|k| m.get(k).map(|v| json!({ k: v })))
-            })
-            .unwrap_or_else(|| attr.clone()),
-        other => other.clone(),
-    };
+    let one = value_of;
     for (name, attr) in doc.as_object_mut().into_iter().flat_map(|m| m.iter_mut()) {
         if matches!(name.as_str(), "id" | "type" | "scope" | "@context") {
             continue;
@@ -756,6 +748,22 @@ fn simplified(mut doc: Value) -> Value {
         *attr = flat;
     }
     doc
+}
+
+/// One normalized Attribute instance's value as the simplified form writes it.
+pub(crate) fn value_of(attr: &Value) -> Value {
+    match attr {
+        Value::Object(m) => ["value", "object", "valueList", "objectList"]
+            .into_iter()
+            .find_map(|k| m.get(k).cloned())
+            .or_else(|| {
+                ["languageMap", "json", "vocab"]
+                    .into_iter()
+                    .find_map(|k| m.get(k).map(|v| json!({ k: v })))
+            })
+            .unwrap_or_else(|| attr.clone()),
+        other => other.clone(),
+    }
 }
 
 /// One Entity of `c` as a `GeoJSON` Feature (M2 to M5): `id` the URN, `geometry` the primary
@@ -866,6 +874,9 @@ pub(crate) async fn one(
     p: &Params,
     refs: Refs<'_>,
 ) -> Result<Map<String, Value>, Problem> {
+    if c.history {
+        return crate::history::one(view, caller, c, id, p, refs).await;
+    }
     let terms = Terms::of(c);
     let pushdown = Pushdown {
         query: format!(
@@ -914,6 +925,7 @@ mod tests {
 
     fn car() -> Collection {
         Collection {
+            history: false,
             id: "Car".into(),
             description: None,
             type_iri: "https://e.org/Car".into(),
@@ -1163,6 +1175,7 @@ mod tests {
     #[test]
     fn core_attributes_keep_their_name_and_others_get_a_context_term() {
         let c = Collection {
+            history: false,
             id: "Car".into(),
             description: None,
             type_iri: "https://e.org/Car".into(),
@@ -1187,6 +1200,7 @@ mod tests {
         assert_eq!(t.context.get("speed"), Some(&json!("https://e.org/speed")));
         assert_eq!(t.context.len(), 4);
         let long = Terms::of(&Collection {
+            history: false,
             properties: vec![prop(&"x".repeat(257), false), prop("1st", false)],
             ..c.clone()
         });
@@ -1196,6 +1210,7 @@ mod tests {
         );
         assert_eq!(long.term("https://e.org/1st"), "p1");
         let only_core = Terms::of(&Collection {
+            history: false,
             properties: Vec::new(),
             ..c
         });

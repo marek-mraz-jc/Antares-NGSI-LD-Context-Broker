@@ -24,6 +24,7 @@ mod api;
 mod crs;
 mod export;
 mod filter;
+mod history;
 mod items;
 mod model;
 mod schema;
@@ -272,7 +273,7 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
         ["collections", c, "items", feature] => Some((*c, Some(*feature))),
         _ => None,
     };
-    if let Some(reply) = offered(&view, method, item) {
+    if let Some(reply) = offered(&view, method, item, &collections) {
         return reply;
     }
     let base = endpoint(headers, id);
@@ -394,7 +395,14 @@ fn negotiate(rest: &[&str], headers: &HeaderMap, uri: &axum::http::Uri) -> Resul
 /// W4: whether the resource offers `method`: its reads, and the writes the view offers on it
 /// (`item`: the collection and the Feature of an `items` path). A method it does not offer is
 /// 405 before the body is read (W1); `OPTIONS` answers the list. `None`: serve it.
-fn offered(view: &ViewOps, method: &Method, item: Option<(&str, Option<&str>)>) -> Option<Reply> {
+/// A history collection's `items` offers no write (T-5100).
+fn offered(
+    view: &ViewOps,
+    method: &Method,
+    item: Option<(&str, Option<&str>)>,
+    collections: &BTreeMap<String, Collection>,
+) -> Option<Reply> {
+    let item = item.filter(|(c, _)| !collections.get(*c).is_some_and(|c| c.history));
     let writes = [
         (Method::POST, "POST"),
         (Method::PUT, "PUT"),
@@ -459,14 +467,20 @@ fn collections(view: &ViewOps) -> Option<BTreeMap<String, Collection>> {
     let (_, bytes) = view.schema()?;
     let schema = linkml_model::Model::read(&bytes, &SCHEMA_LIMITS).ok()?;
     // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
-    if view.shows_every_name() {
-        return Some(model::build(&schema, &schema.slot_iris_by_class()));
+    let mut all = if view.shows_every_name() {
+        model::build(&schema, &schema.slot_iris_by_class())
+    } else {
+        let shown = view.shown_by_type();
+        model::build(&schema.as_shown(&shown, antares_ops::core_iri), &shown)
+    };
+    // T-5100: beside each collection its history, where the view offers the temporal query.
+    if view.allows(OperationId::TemporalQuery) {
+        let past: Vec<Collection> = all.values().map(history::of).collect();
+        for c in past {
+            all.entry(c.id.clone()).or_insert(c);
+        }
     }
-    let shown = view.shown_by_type();
-    Some(model::build(
-        &schema.as_shown(&shown, antares_ops::core_iri),
-        &shown,
-    ))
+    Some(all)
 }
 
 /// No `Accept`, or one that takes some JSON or anything.
