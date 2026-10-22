@@ -98,7 +98,16 @@ pub(crate) async fn create(
         no_content(version)
     } else {
         // The view reads it as any other Entity: what it hides stays out.
-        let mut read = entity(reads, caller, ctx, set_name, &key, &QueryOptions::default(), headers).await?;
+        let mut read = entity(
+            reads,
+            caller,
+            ctx,
+            set_name,
+            &key,
+            &QueryOptions::default(),
+            headers,
+        )
+        .await?;
         *read.status_mut() = StatusCode::CREATED;
         read
     };
@@ -188,16 +197,29 @@ async fn named_instances_kept(
     version: ODataVersion,
 ) -> Result<(), ODataErrorResponse> {
     let target = typed(&format!("/ngsi-ld/v1/entities/{}", encode(id)), set);
-    let docs = match run(reads, caller, OperationId::RetrieveEntity, target, &Translated::default(), version).await {
+    let docs = match run(
+        reads,
+        caller,
+        OperationId::RetrieveEntity,
+        target,
+        &Translated::default(),
+        version,
+    )
+    .await
+    {
         Ok((docs, _)) => docs,
         Err(e) if e.status == StatusCode::NOT_FOUND => return Ok(()),
         Err(e) => return Err(e),
     };
     let named = |v: &Value| v.get("datasetId").is_some();
-    let held = docs.iter().filter_map(Value::as_object).flat_map(|o| o.values()).any(|v| match v {
-        Value::Array(instances) => instances.iter().any(named),
-        one => named(one),
-    });
+    let held = docs
+        .iter()
+        .filter_map(Value::as_object)
+        .flat_map(|o| o.values())
+        .any(|v| match v {
+            Value::Array(instances) => instances.iter().any(named),
+            one => named(one),
+        });
     if held {
         return Err(ODataErrorResponse::new(
             StatusCode::CONFLICT,
@@ -263,11 +285,10 @@ fn attributes(set: &Set, properties: &[(String, Value)], kind: WriteKind) -> Map
 pub(crate) fn attribute(member: &Member, value: &Value) -> Option<Value> {
     Some(match (&member.shape, member.list) {
         (Shape::Value { .. }, true) => json!({"type": "ListProperty", "valueList": value}),
-        (Shape::Value { .. }, false) => json!({"type": "Property", "value": value}),
         (Shape::Geo, _) => json!({"type": "GeoProperty", "value": value}),
         (Shape::Json, _) if member.json => json!({"type": "JsonProperty", "json": value}),
         // An inlined object or an untyped value keeps the schema's kind (P2, T-5206).
-        (Shape::Json, _) => json!({"type": "Property", "value": value}),
+        (Shape::Value { .. } | Shape::Json, _) => json!({"type": "Property", "value": value}),
         (Shape::Vocab, _) => json!({"type": "VocabProperty", "vocab": value}),
         (Shape::Language | Shape::Url { .. } | Shape::Nav { .. }, _) => return None,
     })

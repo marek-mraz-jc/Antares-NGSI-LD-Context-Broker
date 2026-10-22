@@ -921,8 +921,9 @@ async fn odata_bind_keeps_the_engines_refusal_of_its_target() {
 #[tokio::test(flavor = "multi_thread")]
 async fn odata_an_inlined_object_stays_a_property() {
     let (_b, app) = city().await.expect("broker");
-    let created = json!({"id": "urn:ngsi-ld:Car:41", "scope": ["/a"], "address": {"street": "Hlavná 1"}})
-        .to_string();
+    let created =
+        json!({"id": "urn:ngsi-ld:Car:41", "scope": ["/a"], "address": {"street": "Hlavná 1"}})
+            .to_string();
     let (status, body) = odata(&app, Method::POST, "Car", Some(&created)).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let (_, car) = stored(&app, "urn:ngsi-ld:Car:41").await;
@@ -930,8 +931,13 @@ async fn odata_an_inlined_object_stays_a_property() {
     assert_eq!(address["type"], "Property", "{car}");
     assert_eq!(address["value"]["street"], "Hlavná 1", "{car}");
     let patch = json!({"address": {"street": "Dolná 2"}}).to_string();
-    let (status, body) =
-        odata(&app, Method::PATCH, "Car('urn:ngsi-ld:Car:41')", Some(&patch)).await;
+    let (status, body) = odata(
+        &app,
+        Method::PATCH,
+        "Car('urn:ngsi-ld:Car:41')",
+        Some(&patch),
+    )
+    .await;
     assert!(status.is_success(), "{status} {body}");
     let (_, car) = stored(&app, "urn:ngsi-ld:Car:41").await;
     let address = &car[format!("{CITY}address")];

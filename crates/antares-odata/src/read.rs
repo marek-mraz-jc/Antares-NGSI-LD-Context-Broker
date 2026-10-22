@@ -1448,7 +1448,7 @@ pub(crate) fn served(shape: &Shape, instance: Option<&Value>) -> (Value, Option<
             ..
         } | Shape::Url { collection: true }
     );
-    let other_kind = instance.is_some_and(|i| i.is_object()) && value.is_none();
+    let other_kind = instance.is_some_and(Value::is_object) && value.is_none();
     match value {
         // An Untyped member holds any JSON value, an array too.
         Some(v) if *shape == Shape::Json => (v, None),
@@ -1845,8 +1845,11 @@ fn annotated(headers: &HeaderMap) -> bool {
         .flat_map(|v| v.split(','))
         .filter_map(|p| {
             let (name, value) = p.trim().split_once('=')?;
-            matches!(name.trim(), "odata.include-annotations" | "include-annotations")
-                .then(|| value.trim().trim_matches('"'))
+            matches!(
+                name.trim(),
+                "odata.include-annotations" | "include-annotations"
+            )
+            .then(|| value.trim().trim_matches('"'))
         })
         .flat_map(|v| v.split(','))
         .map(str::trim)
@@ -2078,7 +2081,11 @@ mod tests {
         let many = json!([{"datasetId": "urn:d:1", "value": 1}, {"value": 2}]);
         assert_eq!(default_instance(Some(&many)), Some(&json!({"value": 2})));
         let only_named = json!([{"datasetId": "urn:d:1", "value": 1}]);
-        assert_eq!(default_instance(Some(&only_named)), None, "T-5206: never a named one");
+        assert_eq!(
+            default_instance(Some(&only_named)),
+            None,
+            "T-5206: never a named one"
+        );
         assert_eq!(default_instance(Some(&json!([]))), None);
         assert_eq!(default_instance(None), None);
     }

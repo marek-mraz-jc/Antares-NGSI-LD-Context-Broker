@@ -334,10 +334,7 @@ fn slot_schema(model: &Model, slot: &Slot) -> Value {
     } else {
         base
     };
-    out.insert(
-        "x-ngsi-ld-kind".to_owned(),
-        Value::String(kind.to_owned()),
-    );
+    out.insert("x-ngsi-ld-kind".to_owned(), Value::String(kind.to_owned()));
     if let Some(d) = &slot.description {
         out.insert("description".to_owned(), Value::String(d.clone()));
     }

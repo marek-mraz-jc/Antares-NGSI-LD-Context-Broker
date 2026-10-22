@@ -234,17 +234,9 @@ pub fn build(
             let slot_iri = schema.slot_iri(slot_name);
             let Some(member) = attrs
                 .contains(&slot_iri)
-                .then(|| mangle(slot_name))
+                .then(|| member_name(slot_name, &slot))
                 .flatten()
             else {
-                continue;
-            };
-            // T-5206 finding 10: a slot named like a base member never declares it twice. An
-            // identifier slot `id` is the NGSI-LD `id` itself; any other is served escaped.
-            if slot.identifier == Some(true) && member == "id" {
-                continue;
-            }
-            let Some(member) = unreserved(&member) else {
                 continue;
             };
             let shape = shape(schema, &slot, &visible);
@@ -413,6 +405,17 @@ fn key_property(p: Property, key: bool, shape: &Shape) -> Property {
         p.annotations.push(core("ComputedDefaultValue"));
     }
     p
+}
+
+/// The member a shown slot is, `None` for none. T-5206 finding 10: a slot named like a base
+/// member never declares it twice; an identifier slot `id` is the NGSI-LD `id` itself, any
+/// other is served escaped ([`unreserved`]).
+fn member_name(slot_name: &str, slot: &linkml_model::Slot) -> Option<String> {
+    let member = mangle(slot_name)?;
+    if slot.identifier == Some(true) && member == "id" {
+        return None;
+    }
+    unreserved(&member)
 }
 
 /// The members of `NgsiLd.Entity` a slot cannot be named as.
@@ -1210,7 +1213,10 @@ mod tests {
             CsdlVersion::V4_0,
         )
         .unwrap();
-        assert!(edm.sets["Car"].members.contains_key("notes"), "a dynamic property (T-5206)");
+        assert!(
+            edm.sets["Car"].members.contains_key("notes"),
+            "a dynamic property (T-5206)"
+        );
         assert!(!xml(&edm).contains("Edm.Untyped"));
         assert!(xml(&edm).contains(r#"OpenType="true""#));
     }
@@ -1224,14 +1230,21 @@ mod tests {
                 "classes": {"Car": {"slots": ["id", "scope", "createdAt", "speed"]}},
                 "slots": {"id": {"identifier": true, "range": "uriorcurie"}, "scope": {},
                           "createdAt": {"range": "datetime"}, "speed": {"range": "float"}}}"#,
-            &linkml_model::Limits { max_bytes: 4096, max_depth: 8, max_elements: 99 },
+            &linkml_model::Limits {
+                max_bytes: 4096,
+                max_depth: 8,
+                max_elements: 99,
+            },
         )
         .unwrap();
         let shown = s.slot_iris_by_class();
         let edm = build("v", &s, &shown, Writable::default(), CsdlVersion::V4_01).unwrap();
         let members: Vec<&String> = edm.sets["Car"].members.keys().collect();
         assert_eq!(members, ["_x0063_reatedAt", "_x0073_cope", "speed"]);
-        assert!(edm.sets["Car"].identifier.is_none(), "keyed by the NGSI-LD id");
+        assert!(
+            edm.sets["Car"].identifier.is_none(),
+            "keyed by the NGSI-LD id"
+        );
         assert!(odata_csdl::validate(&edm.csdl, &odata_csdl::Limits::strict()).is_ok());
         assert!(xml(&edm).contains(r#"Name="_x0073_cope""#));
     }

@@ -560,7 +560,7 @@ struct Terms<'a> {
     /// The `any`/`all` variables the residual is inside, innermost last,
     /// each with the Edm type of its list's items.
     lambdas: Vec<(String, &'static str)>,
-    /// The LanguageMap entry a LanguageProperty is compared in, as it is read.
+    /// The `LanguageMap` entry a LanguageProperty is compared in, as it is read.
     lang: &'a str,
 }
 
@@ -2248,7 +2248,11 @@ mod tests {
     #[test]
     fn language_and_vocab_eq_are_mapped() {
         let eq = |name: &str| cmp(m(name), CompareOp::Eq, lit(Literal::String("s".into())));
-        assert_eq!(q(&eq("label")), Ok(r#"(t0[@none]=="s")"#.into()), "F31, T-5206: the text the read serves");
+        assert_eq!(
+            q(&eq("label")),
+            Ok(r#"(t0[@none]=="s")"#.into()),
+            "F31, T-5206: the text the read serves"
+        );
         let t = translate(&eq("status"), &set(), &BTreeMap::new(), &[]).unwrap_or_default();
         assert_eq!(
             (t.q.as_deref(), t.expand_values.as_slice()),

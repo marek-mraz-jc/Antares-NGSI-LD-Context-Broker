@@ -437,7 +437,13 @@ async fn a_language_property_reads_and_filters_in_one_language() {
     let (_b, app) = broker().await.expect("broker");
     let one = "Car('urn:ngsi-ld:Car:1')";
     // the ngsild options are a collection read's
-    let (status, cs) = send(&app, Method::GET, &format!("{ROOT}/Car?ngsild.lang=cs"), None).await;
+    let (status, cs) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?ngsild.lang=cs"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{cs}");
     let car1 = cs["value"]
         .as_array()
@@ -448,6 +454,12 @@ async fn a_language_property_reads_and_filters_in_one_language() {
     let (_, none) = send(&app, Method::GET, &format!("{ROOT}/{one}"), None).await;
     assert_eq!(none["label"], Value::Null, "{none}");
     assert!(none["label@Antares.NgsiLd.Unserved"].is_string(), "{none}");
-    let (status, bad) = send(&app, Method::GET, &format!("{ROOT}/Car?ngsild.lang=c%3Bs"), None).await;
+    let (status, bad) = send(
+        &app,
+        Method::GET,
+        &format!("{ROOT}/Car?ngsild.lang=c%3Bs"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
 }

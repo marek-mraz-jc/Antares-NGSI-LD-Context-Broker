@@ -517,7 +517,10 @@ fn each_ngsi_ld_kind_shapes_the_context_and_the_json_schema() {
     let m = Model::read(doc.to_string().as_bytes(), &LIMITS).expect("loads");
     let c: serde_json::Value = serde_json::from_str(&linkml_model::context(&m)).expect("json");
     let c = &c["@context"];
-    assert_eq!(c["prop"]["@type"], "http://www.w3.org/2001/XMLSchema#integer");
+    assert_eq!(
+        c["prop"]["@type"],
+        "http://www.w3.org/2001/XMLSchema#integer"
+    );
     assert_eq!(c["rel"]["@type"], "@id");
     assert_eq!(c["geo"], "https://e.org/s/geo");
     assert_eq!(c["lang"]["@container"], "@language");
@@ -526,8 +529,14 @@ fn each_ngsi_ld_kind_shapes_the_context_and_the_json_schema() {
     assert_eq!(c["links"]["@container"], "@list");
     assert_eq!(c["links"]["@type"], "@id");
     assert_eq!(c["json"]["@type"], "@json");
-    assert_eq!(c["address"], "https://e.org/s/address", "an inlined object is no IRI");
-    assert_eq!(c["uri_rel"]["@type"], "@id", "a Relationship is an IRI node, not xsd:anyURI");
+    assert_eq!(
+        c["address"], "https://e.org/s/address",
+        "an inlined object is no IRI"
+    );
+    assert_eq!(
+        c["uri_rel"]["@type"], "@id",
+        "a Relationship is an IRI node, not xsd:anyURI"
+    );
 
     let j: serde_json::Value = serde_json::from_str(&linkml_model::json_schema(&m)).expect("json");
     let p = &j["definitions"]["Room"]["properties"];

@@ -95,7 +95,9 @@ impl Model for EdmModel<'_> {
         };
         // URL 4.01 5.1.3: an open type also has every undeclared name, as a dynamic property
         // (CSDL XML 3.4: how a 4.0 model serves an `Edm.Untyped` one, T-5206).
-        let dynamic = entity.open.then_some(Member::Primitive { collection: false });
+        let dynamic = entity
+            .open
+            .then_some(Member::Primitive { collection: false });
         // A base-type cycle is a validation error of the model; the walk stops after as many
         // steps as there are entity types.
         let types: usize = self.0.schemas.iter().map(|s| s.entity_types.len()).sum();
@@ -241,7 +243,11 @@ mod tests {
     #[test]
     fn an_open_type_has_dynamic_properties() {
         let mut model = city();
-        for ty in model.schemas.iter_mut().flat_map(|s| s.entity_types.iter_mut()) {
+        for ty in model
+            .schemas
+            .iter_mut()
+            .flat_map(|s| s.entity_types.iter_mut())
+        {
             ty.open = ty.name == "Tower";
         }
         let edm = EdmModel(&model);

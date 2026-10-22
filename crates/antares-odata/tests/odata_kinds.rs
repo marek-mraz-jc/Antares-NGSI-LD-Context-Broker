@@ -48,7 +48,8 @@ async fn create(app: &Router, entity: &Value) {
 }
 
 fn car(n: u32, attrs: &Value) -> Value {
-    let mut car = json!({"id": format!("urn:ngsi-ld:Car:{n}"), "type": format!("{CITY}Car"), "scope": "/a"});
+    let mut car =
+        json!({"id": format!("urn:ngsi-ld:Car:{n}"), "type": format!("{CITY}Car"), "scope": "/a"});
     if let (Some(car), Some(attrs)) = (car.as_object_mut(), attrs.as_object()) {
         for (k, v) in attrs {
             car.insert(format!("{CITY}{k}"), v.clone());
@@ -82,9 +83,16 @@ async fn each_kind_round_trips_under_the_iri_the_metadata_states() {
     let (status, read) = odata(&app, Method::GET, "Car('urn:ngsi-ld:Car:50')", None).await;
     assert_eq!(status, StatusCode::OK, "{read}");
     assert_eq!(read["speed"], 3.5, "{read}");
-    assert_eq!(read["location"]["coordinates"], json!([19.1, 48.7]), "{read}");
+    assert_eq!(
+        read["location"]["coordinates"],
+        json!([19.1, 48.7]),
+        "{read}"
+    );
     assert_eq!(read["notes"], json!({"a": [1, 2]}), "{read}");
-    assert!(read["colour"].as_str().is_some_and(|c| c.ends_with("red")), "{read}");
+    assert!(
+        read["colour"].as_str().is_some_and(|c| c.ends_with("red")),
+        "{read}"
+    );
     assert_eq!(read["tags"], json!(["x", "y"]), "{read}");
     assert_eq!(read["address"], json!({"street": "Hlavná 1"}), "{read}");
 
@@ -104,7 +112,10 @@ async fn each_kind_round_trips_under_the_iri_the_metadata_states() {
     }
     let (_, held) = stored(&app, "urn:ngsi-ld:Car:50").await;
     for name in ["speed", "location", "notes", "colour", "tags", "address"] {
-        assert!(held.get(format!("{CITY}{name}")).is_some(), "{name}: {held}");
+        assert!(
+            held.get(format!("{CITY}{name}")).is_some(),
+            "{name}: {held}"
+        );
     }
 }
 
@@ -115,7 +126,10 @@ async fn a_4_0_client_reads_and_selects_an_untyped_member_as_dynamic() {
     let (_b, app) = city().await.expect("broker");
     create(
         &app,
-        &car(51, &json!({"address": {"type": "Property", "value": {"street": "Dolná 2"}}})),
+        &car(
+            51,
+            &json!({"address": {"type": "Property", "value": {"street": "Dolná 2"}}}),
+        ),
     )
     .await;
     let (status, xml) = get(&app, "$metadata", &[]).await;
@@ -154,12 +168,20 @@ async fn values_a_member_cannot_hold_are_noted_never_cut() {
     .await;
     let (status, read) = odata(&app, Method::GET, "Car('urn:ngsi-ld:Car:52')", None).await;
     assert_eq!(status, StatusCode::OK, "{read}");
-    assert_eq!(read["speed"], Value::Null, "a named instance is not the member: {read}");
+    assert_eq!(
+        read["speed"],
+        Value::Null,
+        "a named instance is not the member: {read}"
+    );
     assert_eq!(read["label"], Value::Null, "never the first item: {read}");
     assert!(read["label@Antares.NgsiLd.Unserved"].is_string(), "{read}");
     assert_eq!(read["colour"], Value::Null, "{read}");
     assert!(read["colour@Antares.NgsiLd.Unserved"].is_string(), "{read}");
-    assert_eq!(read.get("ownerRef@Antares.NgsiLd.observedAt"), None, "not asked: {read}");
+    assert_eq!(
+        read.get("ownerRef@Antares.NgsiLd.observedAt"),
+        None,
+        "not asked: {read}"
+    );
     let (status, annotated) = get(
         &app,
         "Car('urn:ngsi-ld:Car:52')",
@@ -172,11 +194,13 @@ async fn values_a_member_cannot_hold_are_noted_never_cut() {
     assert_eq!(status, StatusCode::OK, "{annotated}");
     let annotated: Value = serde_json::from_str(&annotated).unwrap_or_default();
     assert_eq!(
-        annotated["ownerRef@Antares.NgsiLd.observedAt"],
-        "2026-10-22T08:00:00Z",
+        annotated["ownerRef@Antares.NgsiLd.observedAt"], "2026-10-22T08:00:00Z",
         "{annotated}"
     );
-    assert_eq!(annotated["ownerRef@Antares.NgsiLd.unitCode"], "C62", "{annotated}");
+    assert_eq!(
+        annotated["ownerRef@Antares.NgsiLd.unitCode"], "C62",
+        "{annotated}"
+    );
 }
 
 /// Finding 8 and the task's Security line: a `PUT` never deletes an instance with a
@@ -200,13 +224,25 @@ async fn a_put_never_deletes_named_instances_or_hidden_attributes() {
     let (status, answer) = odata(&app, Method::PUT, "Car('urn:ngsi-ld:Car:53')", Some(&body)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{answer}");
     let (_, held) = stored(&app, "urn:ngsi-ld:Car:53").await;
-    assert_eq!(held[format!("{CITY}speed")].as_array().map(Vec::len), Some(2), "{held}");
+    assert_eq!(
+        held[format!("{CITY}speed")].as_array().map(Vec::len),
+        Some(2),
+        "{held}"
+    );
     let (status, answer) = odata(&app, Method::PUT, "Car('urn:ngsi-ld:Car:54')", Some(&body)).await;
     assert!(status.is_client_error(), "{status} {answer}");
     let (_, held) = stored(&app, "urn:ngsi-ld:Car:54").await;
     assert_eq!(held[format!("{CITY}vin")]["value"], "secret-vin", "{held}");
     let patch = json!({"speed": 3.0}).to_string();
-    let (status, answer) =
-        odata(&app, Method::PATCH, "Car('urn:ngsi-ld:Car:53')", Some(&patch)).await;
-    assert!(status.is_success(), "PATCH keeps the named instance: {status} {answer}");
+    let (status, answer) = odata(
+        &app,
+        Method::PATCH,
+        "Car('urn:ngsi-ld:Car:53')",
+        Some(&patch),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "PATCH keeps the named instance: {status} {answer}"
+    );
 }
