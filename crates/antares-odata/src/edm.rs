@@ -145,6 +145,11 @@ pub struct Member {
     /// The slot is a `JsonProperty`: a [`Shape::Json`] write keeps `json`. Any other
     /// [`Shape::Json`] (an inlined object, P2) is a `Property` (T-5206 finding 4).
     pub json: bool,
+    /// A `Property` whose range is `linkml:Any` (`range: Any`): `$filter` compares it as
+    /// `Edm.Untyped` with a null, boolean, number or string literal; a value of another JSON
+    /// type matches only `ne` (T-5333, NGSI-LD 4.9). An inlined class of the view (a complex
+    /// value) is never compared.
+    pub untyped: bool,
     /// When a client may write it (T-3722).
     pub written: Written,
 }
@@ -286,16 +291,7 @@ pub fn build(
                     required.extend(named.then(|| Expr::PropertyPath(member.clone())));
                 }
             }
-            members.insert(
-                member,
-                Member {
-                    iri: slot_iri,
-                    shape,
-                    list: schema.kind(&slot).starts_with("List"),
-                    json: schema.kind(&slot) == "JsonProperty",
-                    written: written(&slot),
-                },
-            );
+            members.insert(member, member_of(schema, &slot, slot_iri, shape));
         }
         set.annotations = capabilities(&members, writable, required);
         container.entity_sets.push(set);
@@ -666,6 +662,29 @@ fn description(text: &str) -> Annotation {
     Annotation::new("Core.Description", Expr::String(text.to_owned()))
 }
 
+/// The class IRI of LinkML's `Any`, a value of no stated structure.
+const LINKML_ANY: &str = "https://w3id.org/linkml/Any";
+
+/// The [`Member`] a slot of `shape` maps to.
+fn member_of(
+    schema: &linkml_model::Model,
+    slot: &linkml_model::Slot,
+    iri: String,
+    shape: Shape,
+) -> Member {
+    let kind = schema.kind(slot);
+    Member {
+        iri,
+        list: kind.starts_with("List"),
+        json: kind == "JsonProperty",
+        untyped: kind == "Property"
+            && shape == Shape::Json
+            && matches!(schema.range(slot), Range::Class(c) if schema.class_iri(c) == LINKML_ANY),
+        shape,
+        written: written(slot),
+    }
+}
+
 /// When a client may write the slot's member (T-3722); the model admits
 /// only `"true"` and `"false"` as the flags' values. A slot of a kind the
 /// mapping does not know is never written (T-5207).
@@ -756,7 +775,15 @@ fn capabilities(
                 ("MaxLevels", Expr::Int(1)),
                 (
                     "NonFilterableProperties",
-                    Expr::Collection(unserved.clone()),
+                    Expr::Collection(
+                        unserved
+                            .iter()
+                            .filter(|p| {
+                                !matches!(p, Expr::PropertyPath(n) if members.get(n).is_some_and(|m| m.untyped))
+                            })
+                            .cloned()
+                            .collect(),
+                    ),
                 ),
             ],
         ),

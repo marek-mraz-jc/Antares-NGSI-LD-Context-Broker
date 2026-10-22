@@ -257,3 +257,87 @@ async fn a_put_never_deletes_named_instances_or_hidden_attributes() {
         "PATCH keeps the named instance: {status} {answer}"
     );
 }
+
+/// T-5333: a `range: Any` Property (a KPI's `currentValue`: a number, or the string
+/// `not measured`) reads at 4.0 as a dynamic property and filters at 4.0 and 4.01 by its JSON
+/// value, as `q` does: a value of another type matches only `ne`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_untyped_value_reads_at_4_0_and_filters_by_its_json_value() {
+    let (_b, app) = city().await.expect("broker");
+    for (n, value) in [
+        (60, json!(9000)),
+        (61, json!("not measured")),
+        (62, json!(3.5)),
+    ] {
+        create(
+            &app,
+            &car(n, &json!({"reading": {"type": "Property", "value": value}})),
+        )
+        .await;
+    }
+    let ids = |body: &str| -> Vec<String> {
+        let body: Value = serde_json::from_str(body).unwrap_or_default();
+        let mut ids: Vec<String> = body["value"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e["id"].as_str().map(str::to_owned))
+            .collect();
+        ids.sort();
+        ids
+    };
+    let car = |n: u32| format!("urn:ngsi-ld:Car:{n}");
+    let (status, one) = get(&app, "Car('urn:ngsi-ld:Car:61')", &[]).await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    let one: Value = serde_json::from_str(&one).unwrap_or_default();
+    assert_eq!(one["reading"], "not measured", "{one}");
+    for version in [&[][..], &[("OData-MaxVersion", "4.01")][..]] {
+        for (filter, want) in [
+            ("reading%20ge%208372", vec![car(60)]),
+            ("reading%20lt%2010", vec![car(62)]),
+            ("reading%20eq%20'not%20measured'", vec![car(61)]),
+            ("reading%20ne%209000", vec![car(1), car(61), car(62)]),
+            (
+                "not%20(reading%20ge%208372)",
+                vec![car(1), car(61), car(62)],
+            ),
+        ] {
+            let path = format!("Car?$filter={filter}&$select=id,reading");
+            let (status, body) = get(&app, &path, version).await;
+            assert_eq!(status, StatusCode::OK, "{version:?} {path}: {body}");
+            assert_eq!(ids(&body), want, "{version:?} {path}: {body}");
+        }
+        // a literal no JSON value is, a JsonProperty and a complex value still cannot hold
+        for filter in [
+            "reading%20eq%202026-10-22",
+            "notes%20eq%201",
+            "address%20gt%201",
+            "address%20eq%20'x'",
+        ] {
+            let path = format!("Car?$filter={filter}");
+            let (status, body) = get(&app, &path, version).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{version:?} {path}: {body}"
+            );
+        }
+    }
+    let (status, picked) = get(&app, "Car?$filter=reading%20ge%208372&$select=reading", &[]).await;
+    assert_eq!(status, StatusCode::OK, "{picked}");
+    assert!(picked.contains("9000"), "{picked}");
+    // $metadata says so: `reading` is filterable, never sortable; `notes` and `address` neither
+    let (_, xml) = get(&app, "$metadata", &[("OData-MaxVersion", "4.01")]).await;
+    let section = |term: &str| {
+        let at = xml.find(term).unwrap_or_else(|| panic!("{term} in {xml}"));
+        let rest = xml.get(at..).unwrap_or_default();
+        rest.get(..rest.find("</Annotation>").unwrap_or(rest.len()))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let filter = section("Capabilities.FilterRestrictions");
+    assert!(!filter.contains(">reading<"), "{filter}");
+    assert!(filter.contains(">notes<"), "{filter}");
+    assert!(filter.contains(">address<"), "{filter}");
+    assert!(section("Capabilities.SortRestrictions").contains(">reading<"));
+}

@@ -723,6 +723,7 @@ fn row_set(names: &[(String, &'static str)]) -> Set {
                     },
                     list: false,
                     json: false,
+                    untyped: false,
                     written: Written::Never,
                 };
                 (name.clone(), member)
