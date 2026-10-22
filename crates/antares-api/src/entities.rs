@@ -2626,6 +2626,28 @@ fn merge_instance(target: &mut Value, frag: &Value, ts: &str) {
     let (Some(t), Some(f)) = (target.as_object_mut(), frag.as_object()) else {
         return;
     };
+    // An instance of another attribute type (a LanguageProperty sent over a
+    // stored Property) is a new attribute, not a patch of the old one: a key
+    // by key merge kept the Property's value beside the new languageMap,
+    // a shape no NGSI-LD type allows (T-5167). It replaces the instance and
+    // keeps only the instant the attribute was created (4.8).
+    let changes_type = f
+        .get("type")
+        .is_some_and(|ft| t.get("type").is_some_and(|tt| tt != ft));
+    if changes_type {
+        let created = t.get("createdAt").cloned();
+        t.clear();
+        for (k, v) in f {
+            if k != "createdAt" && k != "modifiedAt" && !antares_jsonld::removes_member(v) {
+                t.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(c) = created {
+            t.insert("createdAt".into(), c);
+        }
+        t.insert("modifiedAt".into(), Value::String(ts.to_owned()));
+        return;
+    }
     for (k, v) in f {
         if k == "createdAt" || k == "modifiedAt" {
             continue;
@@ -3210,6 +3232,55 @@ mod tests {
             !doc.to_string().contains("urn:ngsi-ld:null"),
             "the null sentinel must never be stored"
         );
+    }
+
+    /// T-5167: dev's Bridge M1020 kept `value` beside a `languageMap` after a
+    /// writer changed `name` from one attribute type to the other.
+    #[test]
+    fn merge_replaces_an_instance_whose_attribute_type_changes() {
+        let name = "https://schema.org/name";
+        let mut doc = json!({"id": "urn:x", "type": ["T"],
+            name: [{"type": "Property", "value": "M1020",
+                    "createdAt": "2026-10-01T00:00:00Z", "modifiedAt": "2026-10-01T00:00:00Z"}]});
+        merge_into(
+            &mut doc,
+            &json!({name: [{"type": "LanguageProperty", "languageMap": {"sk": "Most"}}]}),
+            "2026-10-22T00:02:58Z",
+        );
+        assert_eq!(
+            doc[name],
+            json!([{"type": "LanguageProperty", "languageMap": {"sk": "Most"},
+                    "createdAt": "2026-10-01T00:00:00Z", "modifiedAt": "2026-10-22T00:02:58Z"}])
+        );
+        merge_into(
+            &mut doc,
+            &json!({name: [{"type": "Property", "value": "M1020"}]}),
+            "2026-10-22T01:00:00Z",
+        );
+        assert_eq!(
+            doc[name],
+            json!([{"type": "Property", "value": "M1020",
+                    "createdAt": "2026-10-01T00:00:00Z", "modifiedAt": "2026-10-22T01:00:00Z"}])
+        );
+    }
+
+    /// The same attribute type still merges key by key (5.5.12).
+    #[test]
+    fn merge_keeps_the_keys_of_an_instance_of_the_same_type() {
+        let name = "https://schema.org/name";
+        let mut doc = json!({"id": "urn:x", "type": ["T"],
+            name: [{"type": "LanguageProperty", "languageMap": {"sk": "Most", "en": "Bridge"},
+                    "observedAt": "2026-10-01T00:00:00Z"}]});
+        merge_into(
+            &mut doc,
+            &json!({name: [{"type": "LanguageProperty", "languageMap": {"sk": "Most M1020"}}]}),
+            "2026-10-22T00:00:00Z",
+        );
+        assert_eq!(
+            doc[name][0]["languageMap"],
+            json!({"sk": "Most M1020", "en": "Bridge"})
+        );
+        assert_eq!(doc[name][0]["observedAt"], "2026-10-01T00:00:00Z");
     }
 
     #[test]
