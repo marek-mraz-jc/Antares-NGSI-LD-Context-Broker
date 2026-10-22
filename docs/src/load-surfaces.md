@@ -89,8 +89,28 @@ to 48) spread PATCH p95 from 45 ms to 4 425 ms for the same binary:
 | 2 | 100 | T-4921 | 30 005 of 30 005 | 0 | 10 485 | 813 |
 
 What repeats is the delivery: T-4921 delivered every notification at 100 subscribers both times, at a
-third of dev's fan-out p95, and dev lost changes without saying so. The write p95 needs an idle machine
-(the load-surfaces lane) to judge.
+third of dev's fan-out p95, and dev lost changes without saying so.
+
+Three more passes on 2026-10-22 03:25-03:56Z on a 16-core host whose load fell from 35 to 10, 1 000
+subscribers, alternating order (pass 2 reversed), with a third arm that halves the tenant's delivery share
+(`ANTARES_DELIVERY_WIDTH_PER_TENANT=4`):
+
+| pass | load | binary | delivered of 300 050 | fan-out p95 ms | PATCH p95 ms | PATCH median ms |
+|---|---|---|---|---|---|---|
+| 1 | 35 | dev | 58 481 | 28 907 | 147 | 50 |
+| 1 | 26 | T-4921 | 273 295 | 8 864 | 33 | 15 |
+| 1 | 19 | T-4921, share 4 | 271 197 | 9 499 | 21 | 12 |
+| 2 | 14 | T-4921, share 4 | 300 045 | 7 572 | 13 | 9 |
+| 2 | 15 | T-4921 | 280 246 | 8 647 | 20 | 13 |
+| 2 | 10 | dev | 198 259 | 10 985 | 16 | 9 |
+| 3 | 10 | dev | 194 112 | 10 226 | 13 | 9 |
+| 3 | 10 | T-4921 | 292 350 | 7 122 | 16 | 10 |
+| 3 | 11 | T-4921, share 4 | 286 897 | 8 626 | 16 | 9 |
+
+At load 10 (passes 2 and 3) the write p95 is 13-16 ms for dev and 16-20 ms for T-4921: at most 4 ms more
+for about 47 % more delivered notifications and a fan-out p95 a quarter lower. A share of 4 holds dev's
+write p95 (13, 16 ms) and delivers as much as the share of 8, so the knob bounds the delivery's cost on
+the pool where a deployment needs it; the default stays 8.
 
 The shape still breaches its budget: 1 000 subscribers each owed a notification every 250 ms is 4 000
 deliveries a second, each with its own transaction. T-5159 books a drain's deliveries in one statement
